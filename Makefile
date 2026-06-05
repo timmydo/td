@@ -22,7 +22,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff oci-diff manifest-diff build test oci manifest-check
+.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff build test oci manifest-check
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -30,7 +30,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff oci-diff manifest-diff build test oci manifest-check
+check: eval diff typed-coverage oci-diff manifest-diff build test oci manifest-check
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
@@ -48,6 +48,15 @@ eval:
 diff:
 	@echo ">> diff: typed front-end lowers to the same store path as the gexp"
 	$(GUIX) repl $(LOAD) tests/typed-diff.scm
+
+# M4 typed coverage (triage #4). Table-driven, derivation-level: every typed
+# field must (A) change the lowered system when given a valid non-default value
+# (proves it is wired, not ignored) and (B) reject an invalid value at
+# construction (proves per-field validation). Where `diff` checks convergence +
+# one perturbation, this sweeps all fields. Run as a repl SCRIPT for honest exit.
+typed-coverage:
+	@echo ">> typed-coverage: every typed field is wired and validated"
+	$(GUIX) repl $(LOAD) tests/typed-coverage.scm
 
 # M5 OCI differential (DESIGN §2.4 step 5/§2.5). Same cheap, derivation-level,
 # self-discriminating shape as `diff`, but the artifact is the Docker/OCI image
