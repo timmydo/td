@@ -68,23 +68,6 @@ tracks *where we are* on it.
       store-path==digest *equivalence* (needs fs-verity); FHS-flattened roots and the
       manifest-driven image-swap model (DESIGN §6 parking lot). Commit: 66494ca.
 
-- [~] **M3+ — positive SSH login control (closes the M3 "denied ≠ usable" gap).**
-      GREEN + verified-red, *awaiting sign-off (§4.3, security-adjacent).* M3 only
-      proved password auth is *not advertised*; it never proved a legitimate login
-      *works*. New assertion in `tests/boot.scm`: a committed throwaway ed25519
-      keypair (`tests/keys/td_test_ed25519{,.pub}`, README marks it test-only) is
-      authorized for an unprivileged `tester` account on a TEST-ONLY OS overlay
-      (`%test-os` = `(inherit td-system)` + user + `modify-services` authorized-keys).
-      The frozen `td-system` and its qcow2/OCI images are UNTOUCHED, so the M4/M5
-      differentials and the shipped image carry no test account/key (no backdoor).
-      The guest copies the (store-0444) privkey out, `chmod 600`, then logs in as
-      non-root over publickey only (root + password both denied per M3), runs a
-      command, and asserts exit 0 AND stdout reached us (sentinel `TD_LOGIN_OK` +
-      `id -un` == `tester`). Boot rung now: 5 expected passes. VERIFIED-RED:
-      authorizing a *different* pubkey → login refused → that one assertion FAILs
-      (4 pass / 1 unexpected failure, builder exits 1, rung exits 2), then reverted.
-      Commit: aa00716.
-
       *Acceptance test (literal — write it, don't vibe it):* the pinned guix
       (520785e) exposes the `docker` image type (verified via
       `guix system image --list-image-types`). Feed an `operating-system` to
@@ -120,6 +103,23 @@ tracks *where we are* on it.
       warm-loop budget; the bit-for-bit `--check` likely belongs on the
       less-frequent rung, with the cheap derivation-level diff (b/c) in the fast
       path. Decide placement when implementing.
+
+- [~] **M3+ — positive SSH login control (closes the M3 "denied ≠ usable" gap).**
+      GREEN + verified-red, *awaiting sign-off (§4.3, security-adjacent).* M3 only
+      proved password auth is *not advertised*; it never proved a legitimate login
+      *works*. New assertion in `tests/boot.scm`: a committed throwaway ed25519
+      keypair (`tests/keys/td_test_ed25519{,.pub}`, README marks it test-only) is
+      authorized for an unprivileged `tester` account on a TEST-ONLY OS overlay
+      (`%test-os` = `(inherit td-system)` + user + `modify-services` authorized-keys).
+      The frozen `td-system` and its qcow2/OCI images are UNTOUCHED, so the M4/M5
+      differentials and the shipped image carry no test account/key (no backdoor).
+      The guest copies the (store-0444) privkey out, `chmod 600`, then logs in as
+      non-root over publickey only (root + password both denied per M3), runs a
+      command, and asserts exit 0 AND stdout reached us (sentinel `TD_LOGIN_OK` +
+      `id -un` == `tester`). Boot rung now: 5 expected passes. VERIFIED-RED:
+      authorizing a *different* pubkey → login refused → that one assertion FAILs
+      (4 pass / 1 unexpected failure, builder exits 1, rung exits 2), then reverted.
+      Commit: aa00716.
 
 ## Loop bedrock fix (pre-M4): the "single command" is now real
 
