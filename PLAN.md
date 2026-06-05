@@ -181,6 +181,51 @@ tracks *where we are* on it.
       a distinct reproducible image identity per manifest, not a persistent
       generation list).
 
+## Triage remediation (post-M6 external review)
+
+An external review of the M6 work raised 6 findings; all triaged as valid and
+fixed, each a small commit with verified-red where applicable. The loop got
+materially more honest (it could previously pass while non-hermetic, while not
+booting the shipped artifact, and with a rung that could not fail).
+
+1. **(High) Loop was not offline/local-only.** Dropping `--network` never isolated
+   the shared HOST daemon (`--share=/var/guix`), which has network + nonguix in its
+   substitute URLs. Fixed: `check.sh` exports `GUIX_BUILD_OPTIONS=--no-substitutes`
+   and every repl rung sets `(set-build-options store #:use-substitutes? #f)`. Full
+   loop verified green with ZERO substitute/download lines. Commit 75e4917.
+   *Open for the human:* drop nonguix from the daemon's substitute config so a cold
+   path cannot even *query* it.
+2. **(High) Reproducible qcow2 was never boot-tested.** The marionette `test`
+   direct-kernel-booted `%test-os`, bypassing GRUB/partition/disk. Added
+   `%test-td-disk-boot` / `make boot-disk`: boots the qcow2 via SeaBIOS→GRUB→kernel.
+   Verified boot log + verified-red (wrong kernel ⇒ fail). Residual: image carries
+   the marionette backdoor (not byte-exact); byte-exact boot would need a
+   serial/ssh harness — documented follow-up. Commit 82a0106.
+3. **(High) `eval` was false-green** (STDIN-piped `guix repl` swallows the exit
+   code). Moved to `tests/eval.scm` run as `guix repl FILE`. Verified-red. Commit
+   2e88b40.
+4. **(Medium) Typed coverage only proved ssh-port.** Added
+   `tests/typed-coverage.scm` / `make typed-coverage`: per-field WIRING sweep (8/8
+   fields diverge the system drv) + VALIDATION sweep (16/16 invalid values
+   rejected). Verified-red at the code level (un-wire a field, drop a check).
+   bootloader-target/root-fs-type are validation-only by design (documented).
+   Commit c9b9cf2.
+5. **(Medium) M6 proved the declaration, not the artifact.** `manifest-diff` (c)
+   only checked `operating-system-packages`; reframed honestly, and
+   `manifest-check` now cracks the built `layer.tar` and asserts
+   `hello/bin/hello` is in the SWAPPED image and absent from the default. Also
+   added `tar`+`gzip` to the sandbox toolchain (the first rung to need them).
+   Verified-red. Commit 56b5c72.
+6. **(Medium) Doc/scope drift.** Reconciled `make check` vs `./check.sh` across
+   CLAUDE.md/DESIGN §1.1/Makefile header; marked M6 IMPLEMENTED in DESIGN §6 +
+   added a §2.4 ladder note (promoting to numbered rungs is the human's spec
+   call). The "M6 entry uncommitted" sub-point was already stale (778512b).
+   Commit a703b0e.
+
+The loop is now **10 rungs**: `eval diff typed-coverage oci-diff manifest-diff
+build test boot-disk oci manifest-check`. All still gated on §4.3 sign-off for
+M4/M5/M3+/M6 (these fixes harden the oracle those milestones are judged against).
+
 ## Loop bedrock fix (pre-M4): the "single command" is now real
 
 DESIGN §1.1 promises ONE pass/fail command, but `make check` alone didn't run —
