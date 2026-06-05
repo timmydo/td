@@ -1,9 +1,12 @@
 # td — the single pass/fail entry point (CLAUDE.md "The loop").
 #
 # `make check` runs, in order and short-circuiting on the first failure:
-#   1. eval   — load the declaration + test modules (fails fast, sub-second)
-#   2. build  — build the bootable image and assert it is reproducible
-#   3. test   — boot the marionette system test and assert the kernel release
+#   1. eval     — load the declaration + test modules (fails fast, sub-second)
+#   2. diff     — typed front-end lowers to the same SYSTEM drv as the gexp (M4)
+#   3. oci-diff — typed front-end lowers to the same OCI image drv as the gexp (M5)
+#   4. build    — build the bootable image and assert it is reproducible
+#   5. test     — boot the marionette system test and assert the kernel release
+#   6. oci      — build the Docker/OCI image and assert it is reproducible (M5)
 #
 # Every guix invocation is pinned to channels.scm via `guix time-machine`, so
 # the reproducibility oracle is honest regardless of the ambient guix version.
@@ -19,7 +22,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff build test
+.PHONY: check container-check eval diff oci-diff build test oci
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -27,7 +30,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff build test
+check: eval diff oci-diff build test oci
 
 # 1. Config eval — load both modules; catches syntax/binding errors in well
 #    under a second, before any expensive build.
@@ -43,6 +46,15 @@ eval:
 diff:
 	@echo ">> diff: typed front-end lowers to the same store path as the gexp"
 	$(GUIX) repl $(LOAD) tests/typed-diff.scm
+
+# M5 OCI differential (DESIGN §2.4 step 5/§2.5). Same cheap, derivation-level,
+# self-discriminating shape as `diff`, but the artifact is the Docker/OCI image
+# derivation: prove the typed front-end drives the OCI image too, and that a
+# changed config diverges. No image is built here — the bit-for-bit repro check
+# is the `oci` rung below. Run as a repl SCRIPT so `(exit)` is the rung's status.
+oci-diff:
+	@echo ">> oci-diff: typed front-end lowers to the same OCI image drv as the gexp"
+	$(GUIX) repl $(LOAD) tests/oci-diff.scm
 
 # 2. Reproducibility oracle — build the image, then rebuild its derivation with
 #    --check (bit-for-bit identical or it is a FAILING test).
@@ -75,3 +87,16 @@ test:
 	test -n "$$drv" || { echo "ERROR: could not lower the test derivation" >&2; exit 1; }; \
 	echo ">> realise test derivation: $$drv"; \
 	$(GUIX) build "$$drv"
+
+# 4. OCI reproducibility oracle (M5) — same shape as `build`, but for the
+#    Docker/OCI image: build it, then rebuild its derivation with --check
+#    (bit-for-bit identical or it is a FAILING test, prime directive 1). The
+#    OS closure is shared with `build`, so --check mostly re-runs the cheap
+#    docker-packing step. The matching declaration also boots as a VM (M1–M4),
+#    closing the north-star "one declaration, store-based + OCI" loop (DESIGN §0).
+oci:
+	@echo ">> oci: $(SYSTEM) image (docker)"
+	$(GUIX) system image $(LOAD) -t docker $(SYSTEM)
+	@echo ">> check: reproducibility of the OCI image derivation"
+	$(GUIX) build --check \
+	  $$($(GUIX) system image $(LOAD) -t docker -d $(SYSTEM))

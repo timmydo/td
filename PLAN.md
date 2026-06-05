@@ -43,7 +43,66 @@ tracks *where we are* on it.
       the STDIN-swallow path). Image derivation unchanged (`a82grxjny…`) — the
       front-end is purely additive. Signed off (§4.3). Commit: 465a6ea
       (bedrock fix: d6a1220).
-- [ ] M5 — extend toward north star.
+- [~] **M5 — OCI image artifact: the declaration also lowers to a reproducible
+      Docker/OCI image with a deterministic digest.** GREEN + verified-discriminating,
+      *awaiting human sign-off before merge (§4.3)* — crosses §2.3 "OCI app model".
+      Pulls the north-star "store path doubles as OCI digest" thread (§0): the SAME
+      `system/td.scm` that boots as a VM (M1–M4) now also lowers to a Docker/OCI
+      image, via `(image-with-os docker-image os)` + `system-image` (exactly what
+      `guix system image -t docker` builds). Two new rungs:
+      • `tests/oci-diff.scm` (`make oci-diff`) — cheap derivation-level differential,
+        self-discriminating like `typed-diff`: (a) the typed `%td-default-config`
+        lowers to the SAME OCI image drv as the frozen `td-system` oracle
+        (`8v1bdz2v…-docker-image.tar.gz.drv`); (b) a perturbed config (ssh-port 2222)
+        lowers to a DIFFERENT drv (`vyz3g46k…`). Verified-red built in.
+      • `make oci` — builds the Docker image and `guix build --check`s it bit-for-bit.
+        VERIFIED reproducible: output `4x2kvsbd8g795l5dgla01gx4xhbha49g-docker-image.tar.gz`
+        (drv `8v1bdz2v68gkbzybbaq4875a5flh2kvp`), `--check` rebuild showed no
+        divergence. That output store-path IS the deterministic digest (accept-test
+        part d), recorded here per the parking-lot kernel-pin convention.
+      Loop wiring: `check: eval diff oci-diff build test oci` (cheap diffs fail fast;
+      OCI build's --check mostly re-runs the docker-packing step since the OS closure
+      is shared with `build`). The qcow2 boot rung (M1–M3) is unchanged — the OCI
+      rung is purely additive, exactly as M4's diff rung was.
+      Out of M5 (later): running the image (`docker run` = OCI *app model*); literal
+      store-path==digest *equivalence* (needs fs-verity); FHS-flattened roots and the
+      manifest-driven image-swap model (DESIGN §6 parking lot). Commit: <pending>.
+
+      *Acceptance test (literal — write it, don't vibe it):* the pinned guix
+      (520785e) exposes the `docker` image type (verified via
+      `guix system image --list-image-types`). Feed an `operating-system` to
+      `system-image` with that type to get a Docker/OCI image derivation. A new
+      build/diff rung (additive, in the `make diff` family — NOT the marionette
+      boot) asserts:
+      (a) **Reproducible:** `guix build --check` on the OCI image derivation
+          passes (bit-identical rebuild). A non-reproducible OCI tarball is a
+          FAILING test (prime directive 1) — fix forward or STOP & report; never
+          disable `--check`. *Risk:* docker tarballs can embed mtimes; if `--check`
+          goes red, that is M5's real work, not a thing to paper over.
+      (b) **Front-end equivalence (oracle, §2.5):** the OCI image built from the
+          typed `%td-default-config` is the SAME derivation/store path as the one
+          built from the FROZEN hand-written `td-system` oracle.
+      (c) **Self-discriminating (verified-red, per M3 lesson):** a perturbed config
+          (e.g. ssh-port 2222) yields a DIFFERENT OCI image derivation — prove the
+          rung distinguishes configs before trusting a green.
+      (d) **Digest determinism:** the OCI image output path (and optionally the
+          manifest sha256) is a deterministic function of the declaration — record
+          the literal digest here once it first builds (cf. parking-lot kernel pin).
+
+      *Explicitly NOT in M5 (later steps, don't pull early):*
+      - **Running** the image — no container runtime / `docker run` behavioral
+        assertion in the loop. That is the OCI *app model* proper; a later milestone.
+      - The literal "store path == OCI digest" *equivalence* — that needs the
+        content-addressed store + fs-verity thread (out of scope); M5 claims only
+        *determinism* of the digest, not that it IS the store path.
+      - Multi-arch / registry push / signing.
+      - The marionette boot rung (M1–M3 assertions) is unchanged; the OCI rung is
+        purely additive, exactly as M4's diff rung was.
+
+      *Loop-latency flag (§1.3):* a full docker system image may exceed the ~60s
+      warm-loop budget; the bit-for-bit `--check` likely belongs on the
+      less-frequent rung, with the cheap derivation-level diff (b/c) in the fast
+      path. Decide placement when implementing.
 
 ## Loop bedrock fix (pre-M4): the "single command" is now real
 

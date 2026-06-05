@@ -304,3 +304,13 @@ expand scope.
   loop latency demands it (§1.5).
 - Decide how Rust components will eventually coexist with the Guile daemon (§5).
 - Revisit trust-agnostic substitution / decentralized build attestation post-v0 (§5).
+- **FHS-like OCI root filesystems (post-v0 direction).** The eventual OCI images
+  should present a traditional **FHS layout** (`/usr/bin`, `/lib`, …) for the root
+  fs, *unlike* stock Guix's `/gnu/store` symlink-farm layout. M5 starts from Guix's
+  native `docker` image (store-based) as the reproducibility oracle; the FHS
+  flattening is a later step layered on top, not part of M5.
+- **No imperative `guix install` workflow (immutable, manifest-driven).** The model
+  is: build a whole image from a declarative manifest and **swap the image
+  wholesale**; there is no per-package imperative install. Rationale: `guix install`
+  accumulates many package versions under `/gnu/store` that are never cleaned up
+  well. Keep the distro image-swap-only — no `guix install`-equivalent surface.
