@@ -22,7 +22,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff oci-diff build test oci
+.PHONY: check container-check eval diff oci-diff manifest-diff build test oci
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -30,7 +30,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff oci-diff build test oci
+check: eval diff oci-diff manifest-diff build test oci
 
 # 1. Config eval — load both modules; catches syntax/binding errors in well
 #    under a second, before any expensive build.
@@ -55,6 +55,18 @@ diff:
 oci-diff:
 	@echo ">> oci-diff: typed front-end lowers to the same OCI image drv as the gexp"
 	$(GUIX) repl $(LOAD) tests/oci-diff.scm
+
+# M6 manifest-swap differential (DESIGN §6: manifest-driven, image-swap-only).
+# Cheap, derivation-level, self-discriminating like `oci-diff`, but the lever is
+# the typed config's `manifest` field: (a) the default manifest converges to the
+# frozen OCI oracle; (b) a manifest that adds one package (hello) lowers to a
+# DIFFERENT OCI image — a wholesale image swap; (c) the added package is in the
+# swapped system's package set and absent from the default's. No image is built
+# here — the bit-for-bit repro of a SWAPPED generation is the `manifest-check`
+# rung below. Run as a repl SCRIPT so `(exit)` is the rung's status.
+manifest-diff:
+	@echo ">> manifest-diff: a changed manifest swaps the whole OCI image"
+	$(GUIX) repl $(LOAD) tests/manifest-diff.scm
 
 # 2. Reproducibility oracle — build the image, then rebuild its derivation with
 #    --check (bit-for-bit identical or it is a FAILING test).
