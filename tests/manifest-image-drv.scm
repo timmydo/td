@@ -24,6 +24,11 @@
              (ice-9 format))
 
 (with-store store
+  ;; Honest offline (triage #1): forbid substitution for this store session. The
+  ;; shared host daemon has network + nonguix in its substitute URLs (check.sh),
+  ;; and `guix repl` does not read GUIX_BUILD_OPTIONS — so set it explicitly here.
+  (set-build-options store #:use-substitutes? #f)
+
   (let* ((swapped-os (td-config->operating-system
                       (td-config #:manifest (cons hello %base-packages))))
          (drv (derivation-file-name

@@ -53,6 +53,13 @@
 (define %swapped-manifest (cons %swap-package %base-packages))
 
 (with-store store
+  ;; Honest offline (triage #1): forbid substitution for this store session. The
+  ;; shared host daemon has network + nonguix in its substitute URLs (check.sh),
+  ;; and `guix repl` does not read GUIX_BUILD_OPTIONS — so set it explicitly here.
+  ;; This is also what stops the graft-driven substitute *queries* this rung's
+  ;; first run made when `hello` was not yet warm.
+  (set-build-options store #:use-substitutes? #f)
+
   ;; Lower an operating-system to the derivation of its Docker/OCI image and
   ;; return the .drv store path — identical to tests/oci-diff.scm. No image is
   ;; built here; this is a pure structural fingerprint of the OCI artifact.

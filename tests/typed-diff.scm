@@ -28,6 +28,11 @@
              (system td-typed))
 
 (with-store store
+  ;; Honest offline (triage #1): forbid substitution for this store session. The
+  ;; shared host daemon has network + nonguix in its substitute URLs (check.sh),
+  ;; and `guix repl` does not read GUIX_BUILD_OPTIONS — so set it explicitly here.
+  (set-build-options store #:use-substitutes? #f)
+
   ;; Lower an operating-system to its system derivation and return the .drv
   ;; store path. No building — this is a pure structural fingerprint of the
   ;; system, computed from the derivation graph.
