@@ -23,7 +23,7 @@ tracks *where we are* on it.
       asserts it offers no password method. Differential VERIFIED: password-auth ON →
       advert `publickey,password` → assertion FAILS (red); OFF → `publickey` only →
       passes. The ssh client is run by absolute /gnu/store path (the VM shares the
-      host store), so the image gains no test-only tools. Committed: <fill>.
+      host store), so the image gains no test-only tools. Committed: cf78c4a.
 
       ⚠️ While doing M3 I discovered the **behavioral rung had been false-green since
       M1** — see "Loop-integrity fixes" below. M1/M2 assertions only began actually
