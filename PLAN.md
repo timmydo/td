@@ -66,7 +66,7 @@ tracks *where we are* on it.
       rung is purely additive, exactly as M4's diff rung was.
       Out of M5 (later): running the image (`docker run` = OCI *app model*); literal
       store-path==digest *equivalence* (needs fs-verity); FHS-flattened roots and the
-      manifest-driven image-swap model (DESIGN §6 parking lot). Commit: <pending>.
+      manifest-driven image-swap model (DESIGN §6 parking lot). Commit: 66494ca.
 
       *Acceptance test (literal — write it, don't vibe it):* the pinned guix
       (520785e) exposes the `docker` image type (verified via
