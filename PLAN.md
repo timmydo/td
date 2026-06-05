@@ -83,7 +83,7 @@ tracks *where we are* on it.
       `id -un` == `tester`). Boot rung now: 5 expected passes. VERIFIED-RED:
       authorizing a *different* pubkey → login refused → that one assertion FAILs
       (4 pass / 1 unexpected failure, builder exits 1, rung exits 2), then reverted.
-      Commit: <pending>.
+      Commit: aa00716.
 
       *Acceptance test (literal — write it, don't vibe it):* the pinned guix
       (520785e) exposes the `docker` image type (verified via
