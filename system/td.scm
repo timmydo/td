@@ -6,8 +6,19 @@
 (define-module (system td)
   #:use-module (gnu)
   #:use-module (gnu bootloader grub)
+  #:use-module (gnu services networking)
+  #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
-  #:export (td-system))
+  #:export (td-system
+            td-ssh-configuration))
+
+(define td-ssh-configuration
+  ;; The v0 network service (DESIGN.md §2.4, milestone 2): OpenSSH. The port is
+  ;; declared explicitly so the behavioral test can derive the asserted port
+  ;; from this declaration — no magic constant to drift — mirroring how the
+  ;; boot test derives the expected kernel release from the declaration.
+  (openssh-configuration
+   (port-number 22)))
 
 (define td-system
   (operating-system
@@ -27,7 +38,14 @@
              (type "ext4"))
            %base-file-systems))
 
-    (services %base-services)))
+    (services
+     (cons* ;; sshd requires 'networking; %base-services provides only
+            ;; 'loopback. dhcpcd brings up the VM's QEMU user-mode NIC and
+            ;; provides 'networking — the same wiring upstream's own ssh system
+            ;; test uses.
+            (service dhcpcd-service-type)
+            (service openssh-service-type td-ssh-configuration)
+            %base-services))))
 
 ;; Allow `guix system build system/td.scm` to pick up the declaration.
 td-system

@@ -9,6 +9,7 @@
   #:use-module (gnu tests)
   #:use-module (gnu system)
   #:use-module (gnu system vm)
+  #:use-module (gnu services ssh)
   #:use-module (guix gexp)
   #:use-module (guix packages)
   #:use-module (system td)
@@ -49,6 +50,21 @@
                 line)
              marionette))
 
+          ;; Milestone 2: a declared service is up and its port listens.
+          (test-assert "ssh-daemon shepherd unit is running"
+            (marionette-eval
+             '(begin
+                (use-modules (gnu services herd))
+                ;; Idempotent: returns the running service (truthy), #f if it
+                ;; cannot be brought up.
+                (start-service 'ssh-daemon))
+             marionette))
+
+          (test-assert "declared sshd port is listening"
+            (wait-for-tcp-port
+             #$(openssh-configuration-port-number td-ssh-configuration)
+             marionette))
+
           (test-end)
           (exit (zero? (test-runner-fail-count (test-runner-current)))))))
 
@@ -58,6 +74,7 @@
   (system-test
    (name "td-boot")
    (description
-    "Boot the td system and assert the running kernel release matches the \
-version pinned in the declaration.")
+    "Boot the td system and assert: the running kernel release matches the \
+version pinned in the declaration, the ssh-daemon shepherd unit is running, and \
+the declared sshd port is listening.")
    (value (run-td-boot-test))))
