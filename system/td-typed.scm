@@ -21,6 +21,8 @@
   #:use-module (gnu services networking)
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
+  #:use-module (guix packages)
+  #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 format)
   #:export (td-config
@@ -35,6 +37,7 @@
             td-config-ssh-port
             td-config-ssh-password-auth?
             td-config-ssh-challenge-response?
+            td-config-manifest
             td-config->operating-system
             %td-default-config))
 
@@ -45,7 +48,8 @@
 (define-record-type <td-config>
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
-                  ssh-port ssh-password-auth? ssh-challenge-response?)
+                  ssh-port ssh-password-auth? ssh-challenge-response?
+                  manifest)
   td-config?
   (host-name              td-config-host-name)
   (timezone               td-config-timezone)
@@ -56,7 +60,14 @@
   (root-fs-type           td-config-root-fs-type)
   (ssh-port               td-config-ssh-port)
   (ssh-password-auth?     td-config-ssh-password-auth?)
-  (ssh-challenge-response? td-config-ssh-challenge-response?))
+  (ssh-challenge-response? td-config-ssh-challenge-response?)
+  ;; M6 — the declarative package manifest that drives image contents. This is
+  ;; the "no imperative `guix install`" lever (DESIGN §6): the ONLY way to change
+  ;; what the image contains is to declare a different manifest and rebuild the
+  ;; whole image — a wholesale swap, never an in-place mutation. A list of
+  ;; <package>; defaults to %base-packages so the default config stays
+  ;; byte-identical to the frozen oracle (which lets the field default).
+  (manifest               td-config-manifest))
 
 ;;;
 ;;; Validation — the "typed" guarantee. Each field is checked; a violation is a
@@ -81,6 +92,12 @@
 ;; type is rejected here rather than failing deep in a build.
 (define %known-fs-types '("ext4" "btrfs" "xfs"))
 
+;; A manifest is a list of <package>. Validated structurally so a bad manifest
+;; (a non-list, or a list with a non-package element) is rejected at
+;; construction time rather than failing deep in an image build.
+(define (package-list? x)
+  (and (list? x) (every package? x)))
+
 ;;;
 ;;; The smart constructor. Keyword-driven with defaults that, taken together,
 ;;; describe EXACTLY the system the hand-written `td-system` declares — so
@@ -97,7 +114,8 @@
                     (root-fs-type "ext4")
                     (ssh-port 22)
                     (ssh-password-auth? #f)
-                    (ssh-challenge-response? #f))
+                    (ssh-challenge-response? #f)
+                    (manifest %base-packages))
   (check non-empty-string? 'host-name host-name "a non-empty string")
   (check non-empty-string? 'timezone timezone "a non-empty string")
   (check non-empty-string? 'locale locale "a non-empty string")
@@ -110,9 +128,11 @@
   (check tcp-port? 'ssh-port ssh-port "an integer in 1..65535")
   (check boolean? 'ssh-password-auth? ssh-password-auth? "a boolean")
   (check boolean? 'ssh-challenge-response? ssh-challenge-response? "a boolean")
+  (check package-list? 'manifest manifest "a list of <package>")
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
-                  ssh-port ssh-password-auth? ssh-challenge-response?))
+                  ssh-port ssh-password-auth? ssh-challenge-response?
+                  manifest))
 
 ;;;
 ;;; The compiler: typed config -> operating-system (a gexp-bearing value).
@@ -137,6 +157,13 @@
              (mount-point (td-config-root-mount c))
              (type (td-config-root-fs-type c)))
            %base-file-systems))
+
+    ;; The declared manifest IS the package set of the image (M6). The default
+    ;; manifest is %base-packages, which is exactly the operating-system field's
+    ;; own default — so the default config lowers byte-for-byte to the frozen
+    ;; oracle (which omits this field). A non-default manifest is a different
+    ;; image: a whole-image swap, never an in-place install.
+    (packages (td-config-manifest c))
 
     (services
      (cons* (service dhcpcd-service-type)
