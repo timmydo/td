@@ -14,16 +14,35 @@ LOAD    := -L .
 SYSTEM  := system/td.scm
 IMGTYPE := qcow2
 
-.PHONY: check eval build test
+# Bare `make` runs the in-sandbox loop, never the sandbox wrapper — guards
+# against `container-check` (which calls ./check.sh) being the default goal and
+# recursing into nested containers.
+.DEFAULT_GOAL := check
 
-check: eval build test
+.PHONY: check container-check eval diff build test
+
+# The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
+# `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
+# `make container-check` (or ./check.sh) sets that sandbox up for you. Prefer it.
+container-check:
+	@./check.sh
+
+check: eval diff build test
 
 # 1. Config eval — load both modules; catches syntax/binding errors in well
 #    under a second, before any expensive build.
 eval:
-	@echo ">> eval: load (system td) and (tests boot)"
-	@echo '(begin (use-modules (system td) (tests boot)) (display "eval ok\n"))' \
+	@echo ">> eval: load (system td), (system td-typed) and (tests boot)"
+	@echo '(begin (use-modules (system td) (system td-typed) (tests boot)) (display "eval ok\n"))' \
 	  | $(GUIX) repl $(LOAD)
+
+# M4 differential (DESIGN §2.4/§2.5). Cheap structural check — lowers systems to
+# derivations, no building — so it runs right after eval and fails fast. Run as
+# a repl SCRIPT (not piped via STDIN) so the script's `(exit)` is the rung's
+# exit status; a piped script would always exit 0 and hide a red (see `test`).
+diff:
+	@echo ">> diff: typed front-end lowers to the same store path as the gexp"
+	$(GUIX) repl $(LOAD) tests/typed-diff.scm
 
 # 2. Reproducibility oracle — build the image, then rebuild its derivation with
 #    --check (bit-for-bit identical or it is a FAILING test).
