@@ -28,9 +28,33 @@ tracks *where we are* on it.
       ⚠️ While doing M3 I discovered the **behavioral rung had been false-green since
       M1** — see "Loop-integrity fixes" below. M1/M2 assertions only began actually
       running once those were fixed (they now pass for real).
-- [ ] M4 — Typed config front-end compiling to gexps; differential test: same store
-      paths as hand-written gexp. *(gates on human sign-off — DESIGN §4.3)*
+- [~] **M4 — Typed config front-end compiling to gexps; differential: same store
+      paths as the hand-written gexp.** GREEN + verified-red, *awaiting human
+      sign-off before merge (DESIGN §4.3).* New `(system td-typed)`: a validated
+      typed record (`td-config`, a smart constructor that rejects bad
+      type/range — port range, fs-type set, booleans — verified rejecting) and a
+      compiler `td-config->operating-system` that independently rebuilds the
+      system. The hand-written `td-system` stays FROZEN as the oracle (§2.5).
+      New `tests/typed-diff.scm` + `make diff` rung is SELF-DISCRIMINATING:
+      (a) `%td-default-config` lowers to the SAME `system.drv` as the oracle
+      (`z96c9kjj…`), and (b) a perturbed config (ssh-port 2222) lowers to a
+      DIFFERENT drv (`l5dpy83m…`). Verified-red: breaking the compiler's default
+      made (a) go #f → rung exits 1 (`guix repl FILE` honors the exit code; not
+      the STDIN-swallow path). Image derivation unchanged (`a82grxjny…`) — the
+      front-end is purely additive. Commit: PENDING sign-off.
 - [ ] M5 — extend toward north star.
+
+## Loop bedrock fix (pre-M4): the "single command" is now real
+
+DESIGN §1.1 promises ONE pass/fail command, but `make check` alone didn't run —
+it needed the ~6-line `guix shell -C --expose/--share … host-guix-on-PATH`
+incantation (PLAN "How to run the loop"), or it went online and pulled
+substitutes from nonguix.org (FSDG + offline violation). Baked that into
+**`check.sh`** (+ `make container-check`). It also adds an **integrity guard**:
+it refuses to run unless the host guix commit == the `channels.scm` pin, so the
+loop can never silently download a different channel instance. `.DEFAULT_GOAL`
+is pinned to `check` so the wrapper can't recurse into nested containers.
+Canonical command is now just: `./check.sh`.
 
 ## Loop-integrity fixes (M3 — the behavioral rung was lying)
 
