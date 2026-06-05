@@ -54,10 +54,14 @@ agent self-corrects by running this and reading output, so it must exist.
 `guix build --check` on the target → the marionette system test. Non-zero exit on any
 failure.
 
-**Answer:** `make check`. A Makefile target that runs, short-circuiting on first
-failure: config eval → `guix build --check` on `system/td.scm` → the `tests/boot.scm`
-marionette test. Exits non-zero on any failure. This is the only command that defines
-green/red.
+**Answer:** `./check.sh` (canonical) → `make check` (the target it runs inside the
+sandbox). `make check` runs, short-circuiting on first failure: config eval → the
+typed/OCI/manifest differentials → `guix build --check` on `system/td.scm` → the
+`tests/boot.scm` marionette test → the manifest-swap reproducibility/artifact rung.
+Exits non-zero on any failure. `./check.sh` wraps it with the hermetic, offline setup
+(fresh `guix shell -C --pure`, store/daemon exposure, host-guix-pin integrity guard,
+**substitutes disabled**); it is the one command that defines green/red. Plain
+`make check` is only correct when already inside that sandbox.
 
 ### 1.2 Rungs committed for v0
 
@@ -185,6 +189,16 @@ does far better climbing a ladder of green bars than holding a monolith in conte
 5. … extend toward the north star.
 One milestone at a time; each is its own passing, reproducible, committed acceptance
 test.
+
+**Implemented continuation of step 5 (pending human sign-off, §4.3).** The "extend"
+slot has so far been realized as two milestones that pull §6 parking-lot threads. Both
+are on `main`, green, with verified-red differentials, but await sign-off before merge
+(they cross into new layers): **M5** — the same declaration also lowers to a
+reproducible Docker/OCI image; **M6** — manifest-driven, image-swap-only: image
+contents are a declarative function of a typed `manifest`, a changed manifest is a whole
+new reproducible image generation, and there is no imperative `guix install` surface.
+See `PLAN.md` for the per-milestone status and digests. Promoting these from "extend"
+into numbered ladder rungs is a spec decision for the human reviewer.
 
 ### 2.5 Replacement order and the oracle for each swap
 
@@ -314,3 +328,8 @@ expand scope.
   wholesale**; there is no per-package imperative install. Rationale: `guix install`
   accumulates many package versions under `/gnu/store` that are never cleaned up
   well. Keep the distro image-swap-only — no `guix install`-equivalent surface.
+  *Status: IMPLEMENTED as M6 (on `main`, pending sign-off §4.3).* The typed config's
+  `manifest` field is the lever; `make manifest-diff` proves a changed manifest is a
+  different whole-image generation and `make manifest-check` proves that generation is
+  reproducible and actually contains the declared package. The remaining parking-lot
+  thread is the FHS-flattened root (above), still future.

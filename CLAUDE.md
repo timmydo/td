@@ -40,19 +40,21 @@ write/change declaration
 Run all of it with the single pass/fail command:
 
 ```
-make check
+./check.sh
 ```
 
-`make check` runs, in order and short-circuiting on the first failure: config eval →
-`guix build --check` on the target → the marionette system test. It exits non-zero on
-any failure.
+`./check.sh` is the canonical hermetic entry point: it sets up the fresh
+`guix shell -C --pure` container (store/cache/daemon-socket exposure, host guix on
+PATH, **substitutes disabled** so the loop is offline), guards that the host guix
+matches the `channels.scm` pin, then runs `make check` inside it. `make check` is the
+underlying target (assumes you are already in that sandbox); it runs, in order and
+short-circuiting on the first failure: config eval → `guix build --check` on the target
+→ the marionette system test (plus the typed/OCI/manifest differential and
+reproducibility rungs added by later milestones). It exits non-zero on any failure.
 
-Run every build/test inside a fresh container so your own environment cannot
-contaminate results:
-
-```
-guix shell -C --pure -- <command>
-```
+Every build/test runs inside that fresh container (`guix shell -C --pure`) so your own
+environment cannot contaminate results; `./check.sh <target>` runs a single Makefile
+target in the same sandbox.
 
 Do not proceed to the next sub-task until the current one is green.
 
@@ -95,11 +97,14 @@ it.
 
 **Directory layout**
 
-- `Makefile` — the single `make check` entry point (config eval → `guix build --check` →
-  marionette test). The only command you need to determine green/red.
+- `check.sh` — the canonical hermetic, offline pass/fail command (`./check.sh`). The
+  only command you need to determine green/red. It builds the sandbox and runs:
+- `Makefile` — the `make check` target it runs inside that sandbox (config eval →
+  differentials → `guix build --check` → marionette test → manifest rungs).
 - `system/` — Guile system declarations. The v0 target image lives at `system/td.scm`.
 - `tests/` — marionette system tests in the `(gnu tests)` style. The v0 boot test lives
-  at `tests/boot.scm`.
+  at `tests/boot.scm`; the differential/coverage rungs (`typed-diff`, `typed-coverage`,
+  `oci-diff`, `manifest-diff`) live alongside it.
 - `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
   deliberately, never silently.
 
@@ -108,7 +113,8 @@ it.
 - Scheme files: lowercase kebab-case (`td.scm`, `boot.scm`). Modules carry a `td`
   prefix.
 - Format Guile with `guix style`; 2-space indentation, no tabs.
-- Run every build/test via `guix shell -C --pure -- <command>` (see "The loop").
+- Run every build/test via `./check.sh` (or `./check.sh <target>`), which enters the
+  `guix shell -C --pure` sandbox for you (see "The loop").
 
 **Free-software posture**
 

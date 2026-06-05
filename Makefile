@@ -1,16 +1,22 @@
 # td — the single pass/fail entry point (CLAUDE.md "The loop").
 #
 # `make check` runs, in order and short-circuiting on the first failure:
-#   1. eval     — load the declaration + test modules (fails fast, sub-second)
-#   2. diff     — typed front-end lowers to the same SYSTEM drv as the gexp (M4)
-#   3. oci-diff — typed front-end lowers to the same OCI image drv as the gexp (M5)
-#   4. build    — build the bootable image and assert it is reproducible
-#   5. test     — boot the marionette system test and assert the kernel release
-#   6. oci      — build the Docker/OCI image and assert it is reproducible (M5)
+#   1. eval           — load declaration + test modules (fails fast, sub-second)
+#   2. diff           — typed front-end lowers to the same SYSTEM drv as the gexp (M4)
+#   3. typed-coverage — every typed field is wired into the system + validated (M4)
+#   4. oci-diff       — typed front-end lowers to the same OCI image drv as the gexp (M5)
+#   5. manifest-diff  — a changed manifest swaps to a different OCI image (M6)
+#   6. build          — build the bootable image and assert it is reproducible
+#   7. test           — boot the marionette system test and assert behaviors
+#   8. oci            — build the Docker/OCI image and assert it is reproducible (M5)
+#   9. manifest-check — build a swapped-manifest image, --check it, and assert the
+#                       declared package is actually in the realized tarball (M6)
 #
 # Every guix invocation is pinned to channels.scm via `guix time-machine`, so
 # the reproducibility oracle is honest regardless of the ambient guix version.
-# Intended to be run hermetically:  guix shell -C --pure -- make check
+# Run it via `./check.sh` (the hermetic, offline wrapper) — NOT a bare
+# `guix shell -C --pure -- make check`, which lacks the store/daemon exposure,
+# host-guix-pin guard, and substitute-disabling that keep the loop offline.
 
 GUIX    := guix time-machine -C channels.scm --
 LOAD    := -L .
