@@ -121,6 +121,66 @@ tracks *where we are* on it.
       (4 pass / 1 unexpected failure, builder exits 1, rung exits 2), then reverted.
       Commit: aa00716.
 
+- [~] **M6 — manifest-driven, image-swap-only (DESIGN §6).** GREEN + verified-red,
+      *awaiting sign-off (§4.3) — extends the OCI layer M5 opened.* Makes image
+      package contents a declarative function of a *manifest* and forbids any
+      imperative `guix install`-style mutation: the only way to change what the
+      image contains is to declare a different manifest and rebuild the WHOLE
+      image — a wholesale swap, never an in-place install. Landed as three small
+      increments, each leaving `make check` green:
+      • **M6.1** (`da1ef9e`) — `(system td-typed)` gains a validated `manifest`
+        field (a list of `<package>`), wired to the operating-system `packages`
+        set. Default = `%base-packages` (the field's own default), so the default
+        config stays byte-identical to the frozen oracle: `make diff` (system drv
+        `z96c9kjj…`) and `make oci-diff` (OCI drv `8v1bdz2v…`) both still converge,
+        unchanged. Validation has teeth (verified): a non-list manifest and a list
+        with a non-`<package>` element are rejected at construction.
+      • **M6.2** (`541875a`) — `tests/manifest-diff.scm` + `make manifest-diff`:
+        self-discriminating differential on the OCI image drv (same shape as M4/M5).
+        (a) default manifest converges to the oracle (`8v1bdz2v…`); (b) a manifest
+        adding one package (GNU `hello`) lowers to a DIFFERENT OCI image
+        (`zmv2j4zr…`) — a new whole-image generation; (c) `hello` is in the swapped
+        system's package set and ABSENT from the default's (the manifest, and only
+        the manifest, drives contents). VERIFIED-RED: a no-op swap (manifest ==
+        default) makes (b)+(c) go `#f` → rung exits 2; reverted.
+      • **M6.3** (`5da580d`) — `tests/manifest-image-drv.scm` + `make manifest-check`:
+        builds the swapped (default + `hello`) OCI image and `guix build --check`s
+        it. VERIFIED reproducible: drv `zmv2j4zr…` → output
+        `1v54qv0jn8kl9jf90n7zkvjhkcmysmpz-docker-image.tar.gz`, `--check` rebuild
+        showed no divergence. That output store-path IS the swapped generation's
+        deterministic digest — a different generation from M5's default image
+        (`4x2kvsbd8g…`), recorded here per the parking-lot digest convention.
+      Loop wiring: `check: eval diff oci-diff manifest-diff build test oci
+      manifest-check` (cheap derivation-level diffs fail fast; the swapped-image
+      `--check` is the last/heaviest rung, §1.3). The qcow2 boot rung and the
+      frozen `td-system` (+ its M5 default image) are UNTOUCHED — M6 is purely
+      additive, like M4/M5 before it.
+
+      ⚠️ **Hermeticity flag (for sign-off, CLAUDE.md §"human-reviewed").** The
+      first reference to the swap package `hello` warmed it into the store. On
+      this host the daemon's substitute-URL list includes `substitutes.nonguix.org`,
+      so every build/diff that touches a not-yet-warm path *queries* nonguix (a
+      pre-existing host artifact, NOT introduced by M6, and present for M1–M5 too).
+      For `hello`: nonguix served NOTHING — the binary came from official
+      `bordeaux.guix.gnu.org`, and `manifest-check` later built `hello` and the
+      image LOCALLY from source. Verified: the swapped image drv AND output closures
+      reference no nonguix paths (`guix gc --references`). Once warm, every M6 rung
+      runs fully offline — the same warm-store/offline property the whole loop
+      already rests on (see check.sh + "How to run the loop"). Open question for
+      the human: whether the daemon's substitute config should drop nonguix entirely
+      so a not-yet-warm path can never even *query* it. Not an M6 regression, but
+      surfaced here because M6 is the first milestone to add a package outside the
+      base system closure.
+
+      *Explicitly NOT in M6 (later, don't pull early):* FHS-flattened OCI roots
+      (DESIGN §6 — the other post-v0 thread; deferred in favour of this one);
+      *running* a swapped image (`docker run` = OCI app model, §2.3); multi-package
+      / specification-string manifests and manifest files on disk (M6 models the
+      manifest as the typed `manifest` field — enough to prove swap semantics);
+      generation history / rollback (the VM is ephemeral, §1.5 — "swap" here means
+      a distinct reproducible image identity per manifest, not a persistent
+      generation list).
+
 ## Loop bedrock fix (pre-M4): the "single command" is now real
 
 DESIGN §1.1 promises ONE pass/fail command, but `make check` alone didn't run —
