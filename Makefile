@@ -22,7 +22,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff oci-diff manifest-diff build test oci
+.PHONY: check container-check eval diff oci-diff manifest-diff build test oci manifest-check
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -30,7 +30,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff oci-diff manifest-diff build test oci
+check: eval diff oci-diff manifest-diff build test oci manifest-check
 
 # 1. Config eval — load both modules; catches syntax/binding errors in well
 #    under a second, before any expensive build.
@@ -112,3 +112,21 @@ oci:
 	@echo ">> check: reproducibility of the OCI image derivation"
 	$(GUIX) build --check \
 	  $$($(GUIX) system image $(LOAD) -t docker -d $(SYSTEM))
+
+# 5. M6 manifest-swap reproducibility — build a SWAPPED-manifest OCI image
+#    generation (default manifest + GNU hello) and `--check` it bit-for-bit.
+#    `manifest-diff` proves a changed manifest is a DIFFERENT image; this proves
+#    that swapped generation is itself reproducible (DESIGN §6 image-swap-only;
+#    prime directive 1 — a non-reproducible swapped image is a FAILING test).
+#    The less-frequent/heavier rung (§1.3): it repacks a second docker tarball,
+#    but hello's closure is tiny and the OS closure is shared with `oci`, so it
+#    stays in budget. Two-step (lower to a drv via repl, then realise+check via
+#    `guix build`) for the same honest-exit-status reason as the `test` rung.
+manifest-check:
+	@echo ">> manifest-check: build a SWAPPED-manifest OCI image and --check it"
+	@drv=`$(GUIX) repl $(LOAD) tests/manifest-image-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the swapped OCI image derivation" >&2; exit 1; }; \
+	echo ">> swapped OCI image derivation: $$drv"; \
+	$(GUIX) build "$$drv"; \
+	echo ">> check: reproducibility of the SWAPPED OCI image derivation"; \
+	$(GUIX) build --check "$$drv"
