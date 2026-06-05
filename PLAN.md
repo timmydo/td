@@ -14,7 +14,7 @@ tracks *where we are* on it.
       sshd's `'networking`); the marionette test boots once and asserts (a) `uname -r`,
       (b) the `ssh-daemon` shepherd unit is running, (c) the declared sshd port (22,
       derived from `td-ssh-configuration`) is listening. Image still reproducible under
-      `guix build --check`. Committed: <fill on commit>.
+      `guix build --check`. Committed: e02ea83.
 - [ ] M3 — Default-deny hardening on that service; test asserts a forbidden op is
       DENIED. *(gates on human sign-off before merge — DESIGN §4.3)*  ← NEXT
 - [ ] M4 — Typed config front-end compiling to gexps; differential test: same store
