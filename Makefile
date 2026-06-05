@@ -32,12 +32,14 @@ container-check:
 
 check: eval diff oci-diff manifest-diff build test oci manifest-check
 
-# 1. Config eval — load both modules; catches syntax/binding errors in well
-#    under a second, before any expensive build.
+# 1. Config eval — load every module; catches syntax/binding errors in well
+#    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
+#    via STDIN: `guix repl` reading from STDIN always exits 0 (swallows the
+#    script's status), which made a broken module pass `eval` green. `guix repl
+#    FILE` honors the exit code, so a load error reddens this rung honestly.
 eval:
 	@echo ">> eval: load (system td), (system td-typed) and (tests boot)"
-	@echo '(begin (use-modules (system td) (system td-typed) (tests boot)) (display "eval ok\n"))' \
-	  | $(GUIX) repl $(LOAD)
+	$(GUIX) repl $(LOAD) tests/eval.scm
 
 # M4 differential (DESIGN §2.4/§2.5). Cheap structural check — lowers systems to
 # derivations, no building — so it runs right after eval and fails fast. Run as
