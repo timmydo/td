@@ -8,8 +8,9 @@
 #   5. manifest-diff  — a changed manifest swaps to a different OCI image (M6)
 #   6. build          — build the bootable image and assert it is reproducible
 #   7. test           — boot the marionette system test and assert behaviors
-#   8. oci            — build the Docker/OCI image and assert it is reproducible (M5)
-#   9. manifest-check — build a swapped-manifest image, --check it, and assert the
+#   8. boot-disk      — boot the qcow2 through GRUB (real bootloader path) + kernel
+#   9. oci            — build the Docker/OCI image and assert it is reproducible (M5)
+#  10. manifest-check — build a swapped-manifest image, --check it, and assert the
 #                       declared package is actually in the realized tarball (M6)
 #
 # Every guix invocation is pinned to channels.scm via `guix time-machine`, so
@@ -28,7 +29,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff build test oci manifest-check
+.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -36,7 +37,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff typed-coverage oci-diff manifest-diff build test oci manifest-check
+check: eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
@@ -116,6 +117,25 @@ test:
 	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the test derivation" >&2; exit 1; }; \
 	echo ">> realise test derivation: $$drv"; \
+	$(GUIX) build "$$drv"
+
+# 3b. Disk-image boot (triage #2) — boot the qcow2 through its GRUB bootloader
+#     (not the direct-kernel VM the `test` rung uses), so the bootloader,
+#     partition table and disk image are actually exercised. Same honest two-step
+#     lower-then-realise as `test`. Heavier (builds a second full image + boots
+#     it), so it runs after the cheap rungs.
+boot-disk:
+	@echo ">> boot-disk: boot the qcow2 disk through GRUB + assert kernel"
+	@drv=`printf '%s\n' \
+	    '(use-modules (guix) (gnu tests) (tests boot))' \
+	    '(with-store store' \
+	    '  (set-build-options store #:use-substitutes? #f)' \
+	    '  (format #t "DRV=~a~%"' \
+	    '          (derivation-file-name' \
+	    '           (run-with-store store (system-test-value %test-td-disk-boot)))))' \
+	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the disk-boot test derivation" >&2; exit 1; }; \
+	echo ">> realise disk-boot test derivation: $$drv"; \
 	$(GUIX) build "$$drv"
 
 # 4. OCI reproducibility oracle (M5) — same shape as `build`, but for the
