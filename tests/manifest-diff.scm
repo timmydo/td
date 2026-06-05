@@ -20,16 +20,20 @@
 ;;       hello) lowers to a DIFFERENT OCI image derivation. A new manifest is a
 ;;       new image generation, with its own identity. If the comparison ever
 ;;       stops distinguishing manifests, (b) fails — the red-run baked in.
-;;   (c) MANIFEST DRIVES CONTENTS — the added package is actually present in the
-;;       swapped system's package set and ABSENT from the default's. This proves
-;;       (b)'s divergence is the manifest doing real work, not an incidental
-;;       hash change, and that the default image is not secretly carrying it.
+;;   (c) MANIFEST DRIVES THE DECLARED PACKAGE SET — the added package is in the
+;;       swapped system's package set (operating-system-packages) and ABSENT
+;;       from the default's. This proves (b)'s divergence is the manifest doing
+;;       real work, not an incidental hash change. NOTE (triage #5): this is a
+;;       DECLARATION-level check — it does not prove the package's files reach
+;;       the realized tarball (an exporter bug could drop them). That stronger
+;;       artifact-level claim is `make manifest-check`, which cracks the built
+;;       layer.tar and asserts hello/bin/hello is actually packed.
 ;;
 ;; (a)+(b) are the load-bearing self-discriminating pair (break the compiler's
 ;; default → (a) red; make the swap a no-op → (b) red). (c) pins the divergence
 ;; to the declared manifest. The bit-for-bit reproducibility of a SWAPPED
-;; generation is proven separately by `make manifest-check` (a real
-;; `guix build --check` on the hello-bearing OCI image).
+;; generation AND its realized contents are proven separately by `make
+;; manifest-check`.
 ;;
 ;; Run as a script so the process exit status is the test result (`guix repl
 ;; FILE` honors `(exit)`, unlike a script piped via STDIN — see typed-diff.scm).
@@ -89,7 +93,7 @@
     (format #t "  swapped manifest (+hello)     : ~a~%" swapped)
     (format #t "~%  (a) converge   (default == oracle)        : ~a~%" converge?)
     (format #t "  (b) swap discriminates (swapped != oracle): ~a~%" discriminate?)
-    (format #t "  (c) manifest drives contents              : ~a~%" drives?)
+    (format #t "  (c) manifest drives declared package set  : ~a~%" drives?)
     (format #t "        hello in swapped pkgs : ~a   hello in default pkgs : ~a~%~%"
             (and in-swapped? #t) (and in-default? #t))
 
@@ -103,11 +107,12 @@ image derivation — the manifest layer is not purely additive.~%")
 NOT change the OCI image derivation. The oracle has lost discriminating power.~%")
       (exit 1))
      ((not drives?)
-      (format #t "FAIL: the manifest does not drive image contents — the added \
-package is not in the swapped system's package set (or leaked into the default).~%")
+      (format #t "FAIL: the manifest does not drive the declared package set — the \
+added package is not in the swapped system's packages (or leaked into the default).~%")
       (exit 1))
      (else
       (format #t "PASS: the default manifest is store-path-identical to the \
 oracle; a swapped manifest yields a DIFFERENT image generation; and the declared \
-manifest — only the manifest — decides what the image contains.~%")
+manifest drives the system's declared package set (artifact-level presence in the \
+realized tarball is proven by `make manifest-check`).~%")
       (exit 0)))))

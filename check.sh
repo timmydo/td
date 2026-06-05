@@ -71,5 +71,5 @@ exec guix shell -C --pure \
   --expose=/gnu/store \
   --share="$HOME/.cache/guix" \
   --share=/var/guix \
-  make bash coreutils sed grep findutils -- \
+  make bash coreutils sed grep findutils tar gzip -- \
   bash -c 'export PATH="'"$hostguix_dir"':$PATH"; export GUIX_BUILD_OPTIONS="--no-substitutes"; exec make "$@"' -- "$@"
