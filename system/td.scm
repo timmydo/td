@@ -17,8 +17,16 @@
   ;; declared explicitly so the behavioral test can derive the asserted port
   ;; from this declaration — no magic constant to drift — mirroring how the
   ;; boot test derives the expected kernel release from the declaration.
+  ;;
+  ;; Milestone 3 (DESIGN.md §2.4): default-deny hardening. Password
+  ;; authentication defaults to #t; disabling it makes the daemon key-only, so a
+  ;; password login — even with the correct password — is refused. challenge-
+  ;; response is pinned off as well so PAM keyboard-interactive cannot smuggle a
+  ;; password back in. (permit-root-login already defaults to #f.)
   (openssh-configuration
-   (port-number 22)))
+   (port-number 22)
+   (password-authentication? #f)
+   (challenge-response-authentication? #f)))
 
 (define td-system
   (operating-system

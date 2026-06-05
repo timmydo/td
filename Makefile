@@ -34,17 +34,25 @@ build:
 	$(GUIX) build --check \
 	  $$($(GUIX) system image $(LOAD) -t $(IMGTYPE) -d $(SYSTEM))
 
-# 3. Boot + behavioral — run the marionette test derivation; its builder exits
-#    non-zero if the assertion (uname -r == declared kernel release) fails, so a
-#    failed test makes `build-derivations` raise and this rung go red.
-#    Driven through `guix repl` because the test value is a monadic value that
-#    must be run against the store (guix build -e cannot lower it directly).
+# 3. Boot + behavioral — realise the marionette test derivation. Its builder
+#    runs the SRFI-64 assertions in/against a booted VM and exits non-zero if any
+#    fail, so a failed assertion makes this rung go red (see the two-step note in
+#    the recipe for why we must NOT pipe the build into `guix repl`).
 test:
-	@echo ">> test: boot marionette + assert kernel release"
-	@printf '%s\n' \
-	  '(use-modules (guix) (gnu tests) (tests boot))' \
-	  '(with-store store' \
-	  '  (let ((drv (run-with-store store (system-test-value %test-td-boot))))' \
-	  '    (build-derivations store (list drv))' \
-	  '    (format #t "test ok: ~a~%" (derivation-file-name drv))))' \
-	  | $(GUIX) repl $(LOAD)
+	@echo ">> test: boot marionette + assert behaviors"
+	@# Two steps on purpose. `guix repl` reading a script from STDIN always
+	@# exits 0 (it swallows the script's exit code), so building the test there
+	@# would make a FAILED test look green. Instead: (1) lower the monadic test
+	@# value to a derivation file name via repl, then (2) realise it with
+	@# `guix build`, whose exit status is honest and which streams the marionette
+	@# log so failures are visible.
+	@drv=`printf '%s\n' \
+	    '(use-modules (guix) (gnu tests) (tests boot))' \
+	    '(with-store store' \
+	    '  (format #t "DRV=~a~%"' \
+	    '          (derivation-file-name' \
+	    '           (run-with-store store (system-test-value %test-td-boot)))))' \
+	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the test derivation" >&2; exit 1; }; \
+	echo ">> realise test derivation: $$drv"; \
+	$(GUIX) build "$$drv"
