@@ -1,4 +1,4 @@
-# CLAUDE.md — <PROJECT_NAME>
+# CLAUDE.md — td
 
 You are building a functional Linux distribution incrementally on top of an existing
 Guix system. You grow the OS *inside* a verification loop: you do not get credit for
@@ -40,8 +40,12 @@ write/change declaration
 Run all of it with the single pass/fail command:
 
 ```
-<FILL IN: e.g. `make check` — must exit non-zero on any failure>
+make check
 ```
+
+`make check` runs, in order and short-circuiting on the first failure: config eval →
+`guix build --check` on the target → the marionette system test. It exits non-zero on
+any failure.
 
 Run every build/test inside a fresh container so your own environment cannot
 contaminate results:
@@ -89,5 +93,37 @@ it.
 
 ## Repo conventions
 
-- *(FILL IN: directory layout, where declarations live, where tests live, naming,
-  formatting/commit conventions)*
+**Directory layout**
+
+- `Makefile` — the single `make check` entry point (config eval → `guix build --check` →
+  marionette test). The only command you need to determine green/red.
+- `system/` — Guile system declarations. The v0 target image lives at `system/td.scm`.
+- `tests/` — marionette system tests in the `(gnu tests)` style. The v0 boot test lives
+  at `tests/boot.scm`.
+- `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
+  deliberately, never silently.
+
+**Naming & formatting**
+
+- Scheme files: lowercase kebab-case (`td.scm`, `boot.scm`). Modules carry a `td`
+  prefix.
+- Format Guile with `guix style`; 2-space indentation, no tabs.
+- Run every build/test via `guix shell -C --pure -- <command>` (see "The loop").
+
+**Free-software posture**
+
+- Strict FSDG (Guix's free-software guidelines). No nonfree firmware, blobs, or crates.
+  Do not add the `nonguix` channel. If a task appears to require nonfree code, STOP and
+  ask.
+
+**State boundary (v0)**
+
+- The VM is **fully ephemeral**: nothing persists across test runs; all writable state is
+  wiped on reset. `/gnu/store` and the system declaration are immutable. Never stash
+  mutable state to make a test pass.
+
+**Commits**
+
+- Small green increments. Each commit message states which test now passes (e.g.
+  "boot test asserts expected kernel via uname -r"). Prefer many small commits over one
+  large change.

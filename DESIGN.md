@@ -1,4 +1,4 @@
-# Design document — <PROJECT_NAME>
+# Design document — td
 
 A functional Linux distribution, built incrementally by an AI coding agent (Claude
 Code) on top of an existing Guix system, growing inside a fast machine-checkable
@@ -32,7 +32,12 @@ spanning build and run, a typed config front-end, and atomic verified generation
 stock Guix — one declaration that builds reproducibly into a bootable image, boots in
 a VM, and passes one behavioral assertion.
 
-**Answer:** *(fill in)*
+**Answer:** Accept the default. *Eventual:* a content-addressed, reproducible, immutable
+distro where the store path doubles as `fs-verity` root and OCI digest, with one Rust
+sandbox stack spanning build and run, a typed config front-end, and atomic verified
+generations. *v0:* the smallest vertical slice that closes the full loop on stock Guix —
+one `system/td.scm` declaration that builds reproducibly into a bootable image, boots in
+a VM, and passes one behavioral assertion (kernel version).
 
 > Everything in this document governs **v0 only** unless explicitly marked as later.
 
@@ -49,7 +54,10 @@ agent self-corrects by running this and reading output, so it must exist.
 `guix build --check` on the target → the marionette system test. Non-zero exit on any
 failure.
 
-**Answer:** *(fill in the exact command)*
+**Answer:** `make check`. A Makefile target that runs, short-circuiting on first
+failure: config eval → `guix build --check` on `system/td.scm` → the `tests/boot.scm`
+marionette test. Exits non-zero on any failure. This is the only command that defines
+green/red.
 
 ### 1.2 Rungs committed for v0
 
@@ -64,7 +72,10 @@ failure.
 - *Deferred to later milestones:* fuzzing/adversarial (sandbox escape corpus),
   real-hardware testing.
 
-**Answer:** *(fill in)*
+**Answer:** Accept the default rungs for v0: hermetic `guix shell -C --pure` env,
+`guix build --check` (with `--rounds=2` where cheap) as the reproducibility oracle, and
+one marionette `(gnu tests)` boot test. Fuzzing/adversarial and real-hardware rungs are
+deferred.
 
 ### 1.3 Loop-latency budget
 
@@ -76,7 +87,9 @@ are too slow, give the agent a prebuilt base image to layer onto, and reserve fu
 `guix system vm` rebuilds for a less-frequent rung. Treat loop latency as a tracked
 metric, not an afterthought.
 
-**Answer:** *(target latency + fast-path decision)*
+**Answer:** Target under ~60s per write→check cycle on a warm store. Fast-path: layer
+changes onto a **prebuilt base image** and reserve full `guix system vm` rebuilds for a
+less-frequent rung. Track loop latency as a metric.
 
 ### 1.4 Agent / container boundary
 
@@ -86,7 +99,8 @@ metric, not an afterthought.
 a **fresh** `guix shell -C` container. This stops the agent's own environment from
 contaminating results and keeps rung 2 (reproducibility) honest.
 
-**Answer:** *(fill in)*
+**Answer:** Accept the default. The Claude Code agent process runs **outside**; every
+build/test command enters a **fresh** `guix shell -C --pure` container.
 
 ### 1.5 VM state reset
 
@@ -95,7 +109,9 @@ contaminating results and keeps rung 2 (reproducibility) honest.
 **Default:** Boot from a fresh image per test at v0 (simple, slow). Upgrade path:
 QEMU `qcow2` overlay snapshots / CoW reset so a test can run many times cheaply.
 
-**Answer:** *(fill in)*
+**Answer:** v0 is **fully ephemeral**: boot from a fresh image per test, nothing persists
+across runs, all writable state is wiped on reset. Upgrade path: QEMU `qcow2` overlay /
+CoW reset for cheap repeated runs.
 
 ---
 
@@ -109,7 +125,11 @@ QEMU `qcow2` overlay snapshots / CoW reset so a test can run many times cheaply.
 passes) into a bootable image; the marionette test boots it, asserts
 `uname -r` / `cat /proc/version` reports the expected kernel, then the harness resets."
 
-**Answer:** *(fill in the literal assertion)*
+**Answer (literal):** The `system/td.scm` declaration builds reproducibly
+(`guix build --check` passes) into a bootable image; the `tests/boot.scm` marionette test
+boots it and asserts that `uname -r` in the guest equals the kernel version pinned by the
+declaration, then the harness resets the ephemeral VM. v0 is done when this passes,
+reproducibly, and is committed.
 
 ### 2.2 Reused vs. built for v0
 
@@ -121,7 +141,9 @@ and building the OS at once is two hard projects fused into one, and it blinds t
 agent's cheapest rung. The typed layer is a later milestone that compiles down to
 gexps.
 
-**Answer:** *(fill in)*
+**Answer:** Accept the default. Keep `guix-daemon`, `/gnu/store`, and Guile + gexps as
+the v0 config language. No typed front-end yet — it is a later milestone that compiles
+down to gexps.
 
 ### 2.3 Explicitly out of scope for v0
 
@@ -132,7 +154,10 @@ stops it boiling the ocean.
 broker; composefs/`fs-verity` verified generations; the OCI app model; the typed config
 front-end; multi-machine tests; real-hardware/driver work.
 
-**Answer:** *(fill in)*
+**Answer:** Accept the default out-of-scope list: the Rust build daemon; the unified
+sandbox/portal broker; composefs/`fs-verity` verified generations; the OCI app model; the
+typed config front-end; multi-machine tests; real-hardware/driver work. Building any of
+these in v0 is a scope violation — STOP and ask first.
 
 ### 2.4 Milestone ladder
 
@@ -149,7 +174,17 @@ does far better climbing a ladder of green bars than holding a monolith in conte
    compiled output yields the same store paths as the hand-written gexp.
 5. … (extend toward the north star)
 
-**Answer:** *(fill in / reorder)*
+**Answer:** Accept the default ladder, in order:
+1. Closed loop on a trivial image (§2.1) — boot + kernel-version assertion.
+2. Add a service to the declaration; behavioral test asserts the unit is up and a port
+   listens.
+3. Default-deny hardening on that service; test asserts a forbidden operation is
+   **denied**.
+4. Introduce the typed config front-end compiling to gexps; differential test: compiled
+   output yields the same store paths as the hand-written gexp.
+5. … extend toward the north star.
+One milestone at a time; each is its own passing, reproducible, committed acceptance
+test.
 
 ### 2.5 Replacement order and the oracle for each swap
 
@@ -161,7 +196,10 @@ same thing both ways and diff the store paths (`diffoscope`); require behavioral
 equivalence on the full target set *before* extending behavior. Never a big-bang
 rewrite.
 
-**Answer:** *(fill in)*
+**Answer:** Accept the default. The existing Guix component is the oracle. For every
+swap, build the same thing both ways and diff store paths with `diffoscope`; require
+behavioral equivalence on the full target set *before* extending behavior. No big-bang
+rewrites.
 
 ---
 
@@ -179,7 +217,11 @@ rewrite.
 - **Definition of done (any task).** A passing test, reproducible, committed as a small
   increment. If "done" is undefined, the agent declares victory early.
 
-**Answer / amendments:** *(fill in; e.g., state-boundary specifics)*
+**Answer / amendments:** Confirm all four invariants. **State boundary (v0):** the VM is
+**fully ephemeral** — nothing persists across test runs and all writable state is wiped
+on reset. `/gnu/store` and the system declaration are declared-and-immutable; there is no
+persistent writable state to protect in v0. The agent must never stash mutable state to
+make a test pass. This is mirrored in `CLAUDE.md`.
 
 ---
 
@@ -191,7 +233,10 @@ rewrite.
 invariants (§3), the definition-of-done, repo conventions, and explicit guardrails. Keep
 it in sync with this document.
 
-**Answer:** *(fill in any project-specific additions)*
+**Answer:** Confirmed. `CLAUDE.md` carries `make check` (§1.1), the four invariants
+(§3), the definition-of-done, the repo layout (`Makefile`, `system/`, `tests/`,
+`channels.scm`), the strict-FSDG posture, and the ephemeral state boundary. Keep §1 and
+§3 of this document in sync with `CLAUDE.md`.
 
 ### 4.2 Task decomposition
 
@@ -201,7 +246,8 @@ acceptance test.
 **Default:** Drive from the milestone ladder (§2.4); one milestone at a time; the agent
 proposes the next sub-task and its test before writing code.
 
-**Answer:** *(fill in)*
+**Answer:** Accept the default. Drive from the §2.4 ladder, one milestone at a time. The
+agent states the sub-task and names/writes its test before writing implementation.
 
 ### 4.3 Human checkpoints
 
@@ -213,7 +259,11 @@ adversarial/security rung, and anything touching real hardware. The agent merges
 green for everything below that ceiling, but opens the milestone for review before
 crossing into a new layer.
 
-**Answer:** *(fill in which milestones gate on sign-off)*
+**Answer:** Accept the default. The human owns spec correctness, the adversarial/security
+rung, and anything touching real hardware. Concretely, **milestone 3 (default-deny
+hardening)** and **milestone 4 (typed config front-end)** gate on sign-off before merge;
+milestones 1–2 merge on green. The agent opens any new-layer milestone for review before
+crossing into it.
 
 ---
 
@@ -231,7 +281,15 @@ crossing into a new layer.
 - **Substitutes / build-farm trust.** *Default:* local builds only at v0; revisit
   trust-agnostic substitution (decentralized build attestation) much later.
 
-**Answer:** *(fill in)*
+**Answer:**
+- **Guile for v0.** Embrace it; typed front-end comes later and compiles to gexps.
+- **Rust coexistence.** Deferred. Document later how Rust components sit alongside the
+  Guile-based daemon when that milestone arrives.
+- **Free-software posture.** **Strict FSDG** — follow Guix's free-software guidelines.
+  No nonfree firmware, blobs, or crates; no `nonguix` channel. If a task appears to
+  require nonfree code, STOP and ask.
+- **Substitutes / build-farm trust.** Local builds only at v0. Revisit trust-agnostic
+  substitution much later.
 
 ---
 
@@ -240,4 +298,9 @@ crossing into a new layer.
 Anything raised that isn't a v0 decision. Keep it here so it isn't lost and doesn't
 expand scope.
 
-- *(add items)*
+- Pin the exact kernel version asserted by `tests/boot.scm` (derived from
+  `channels.scm`) — record it once the first build lands.
+- Upgrade VM reset from fresh-image-per-test to `qcow2` overlay / CoW snapshots once
+  loop latency demands it (§1.5).
+- Decide how Rust components will eventually coexist with the Guile daemon (§5).
+- Revisit trust-agnostic substitution / decentralized build attestation post-v0 (§5).
