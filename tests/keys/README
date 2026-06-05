@@ -1,0 +1,12 @@
+td boot-test SSH key — TEST FIXTURE ONLY.
+
+td_test_ed25519{,.pub} is a throwaway ed25519 keypair used solely by
+tests/boot.scm to prove that key-based SSH login to the td guest works and
+that a remote command's output is captured. It is a committed fixture so the
+build stays reproducible (a key generated at build time would not be).
+
+It is NOT provisioned into the shipped system: the test authorizes it only on
+a test-only operating-system overlay (see tests/boot.scm). The frozen
+`td-system` (and its qcow2/OCI images, the M4/M5 differential oracle) does not
+contain this account or key. The private key grants no access to anything but
+an ephemeral test VM that is wiped on reset. Do not reuse it for anything.
