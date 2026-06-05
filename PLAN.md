@@ -41,7 +41,8 @@ tracks *where we are* on it.
       DIFFERENT drv (`l5dpy83m…`). Verified-red: breaking the compiler's default
       made (a) go #f → rung exits 1 (`guix repl FILE` honors the exit code; not
       the STDIN-swallow path). Image derivation unchanged (`a82grxjny…`) — the
-      front-end is purely additive. Commit: PENDING sign-off.
+      front-end is purely additive. Signed off (§4.3). Commit: 465a6ea
+      (bedrock fix: d6a1220).
 - [ ] M5 — extend toward north star.
 
 ## Loop bedrock fix (pre-M4): the "single command" is now real
