@@ -349,21 +349,26 @@ expand scope.
   sufficient on its own: external review showed a manifest package can still drag
   guix into the closure — directly, via a propagated input, via a plain runtime
   reference, or as a renamed/inherited package — and no static (name/propagation)
-  check in the constructor can catch all of those. So the **real, manifest-agnostic
-  guarantee is a closure-level BUILD GATE** (`(system td-hardening)
-  guix-free-docker-image`): it scans the realized artifact and FAILS the build if
-  any `/bin/guix`/`/bin/guix-daemon` is present, so a hardened image is guix-free
-  *or it does not build*. The constructor's name/propagation check is retained only
-  as a cheap fast-fail pre-filter for the obvious mistakes, explicitly not the
-  guarantee. `make no-guix` proves the guarantee end to end at the ARTIFACT/closure
-  level: it builds the gated hardened image (gate must pass), `--check`s it
+  check in the constructor can catch all of those — and an OPT-IN gate is itself
+  bypassable (a caller can lower the bare operating-system directly). So the **real,
+  manifest-agnostic guarantee is a closure-level BUILD GATE EMBEDDED in the hardened
+  system**: `td-config->operating-system`, for a `#f` config, prepends the
+  `guix-free-marker` (`(system td-hardening)`) — a build-time package whose build
+  FAILS if any `/bin/guix`/`/bin/guix-daemon` is in the (other) packages' closure —
+  to the system's package set. Because it lives in `packages`, EVERY lowering (bare
+  `operating-system`, qcow2, docker, any helper) builds the profile and therefore
+  the marker, so a hardened image is guix-free *or it does not build*, with no opt-in
+  path to skip. The constructor's name/propagation check is retained only as a cheap
+  fast-fail pre-filter for the obvious mistakes, explicitly not the guarantee. `make
+  no-guix` proves the guarantee end to end on the BARE public lowering: it builds the
+  hardened image (the embedded marker must pass), `--check`s the gated artifact
   reproducible, asserts no `/bin/guix`/`/bin/guix-daemon` in its `layer.tar` (0
-  entries) while the #t control still ships them (4), AND proves the gate REFUSES
-  an adversarial hardened manifest that smuggles guix past the pre-filter via a
-  runtime reference (the build fails at the gate with its own diagnostic). A binary
-  absent from the image cannot run, so this is *stronger* than the "negative
-  runtime test" originally envisioned (a literal docker-run `guix install` check
-  needs the OCI app model, §2.3, still deferred). **Two things remain (each a
+  entries) while the #t control still ships them (4), AND proves the bare lowering of
+  an adversarial manifest that smuggles guix past the pre-filter via a runtime
+  reference FAILS at the embedded marker (with its own diagnostic). A binary absent
+  from the image cannot run, so this is *stronger* than the "negative runtime test"
+  originally envisioned (a literal docker-run `guix install` check needs the OCI app
+  model, §2.3, still deferred). **Two things remain (each a
   spec/sign-off call, not yet taken):** (1) `ship-guix?` defaults to `#t`, so the
   *shipped* default still ships guix — flipping the default to `#f` re-baselines the
   §2.5 frozen oracle and is the human's spec decision; M7 proved the construction

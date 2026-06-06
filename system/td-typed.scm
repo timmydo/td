@@ -23,6 +23,7 @@
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
   #:use-module (guix packages)
+  #:use-module (system td-hardening)     ;guix-free-marker (embedded build gate)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 match)
@@ -82,19 +83,21 @@
   ;; `guix`/`guix-daemon`, so an in-image `guix install` is physically possible.
   ;; This boolean is the lever that removes that surface: when #f the compiler
   ;; deletes `guix-service-type` (the service that pulls guix into the BASE system
-  ;; closure). NOTE: deleting the service is necessary but NOT sufficient on its
-  ;; own — a manifest package can still drag guix into the closure (directly,
-  ;; propagated, via a runtime reference, or as a renamed/inherited package). The
-  ;; constructor's cross-field check below is only a CHEAP PRE-FILTER for the
-  ;; obvious cases; the REAL, manifest-agnostic guix-free guarantee is the
-  ;; closure-level BUILD GATE in (system td-hardening) `guix-free-docker-image`,
-  ;; which makes a hardened image guix-free OR refuse to build. Defaults to #t so
-  ;; the default config stays byte-identical to the frozen oracle (§2.5); flipping
-  ;; the SHIPPED default to #f re-baselines the oracle and is a spec decision gated
-  ;; on §4.3 sign-off — M7 proves the construction additively, it does not
-  ;; unilaterally change what td ships. `make no-guix` proves the guarantee end to
-  ;; end: the gated #f image is guix-free (and reproducible), the #t image is not,
-  ;; and a manifest that smuggles guix past the pre-filter is REFUSED at the gate.
+  ;; closure) AND embeds the `guix-free-marker` in the system's package set. NOTE:
+  ;; deleting the service is necessary but NOT sufficient on its own — a manifest
+  ;; package can still drag guix into the closure (directly, propagated, via a
+  ;; runtime reference, or as a renamed/inherited package). The constructor's
+  ;; cross-field check below is only a CHEAP PRE-FILTER for the obvious cases; the
+  ;; REAL, manifest-agnostic guix-free guarantee is the embedded closure-level BUILD
+  ;; GATE (see (system td-hardening) `guix-free-marker`), which lives in `packages`
+  ;; so EVERY lowering builds it — making a hardened image guix-free OR refuse to
+  ;; build, with no opt-in path to bypass. Defaults to #t so the default config
+  ;; stays byte-identical to the frozen oracle (§2.5); flipping the SHIPPED default
+  ;; to #f re-baselines the oracle and is a spec decision gated on §4.3 sign-off —
+  ;; M7 proves the construction additively, it does not unilaterally change what td
+  ;; ships. `make no-guix` proves the guarantee end to end: the bare #f image is
+  ;; guix-free (and reproducible), the #t image is not, and a manifest that smuggles
+  ;; guix past the pre-filter is REFUSED at build time.
   (ship-guix?             td-config-ship-guix?))
 
 ;;;
@@ -188,15 +191,16 @@
   ;; by putting guix into the image's profile. We fast-fail the OBVIOUS cases here
   ;; (sub-second, before an expensive build): a manifest with guix listed directly
   ;; or via a transitively propagated input (`manifest-has-guix?` walks both). But
-  ;; this is fundamentally incomplete — round-3 review showed guix can still reach
-  ;; the closure as a NON-propagated runtime reference, or via a RENAMED package
+  ;; this is fundamentally incomplete — review showed guix can still reach the
+  ;; closure as a NON-propagated runtime reference, or via a RENAMED package
   ;; inheriting guix (its name is not "guix"), neither of which a static name/
   ;; propagation scan can see. So this check is a convenience, NOT a guarantee. The
-  ;; real, manifest-agnostic guarantee is the closure-level BUILD GATE in
-  ;; (system td-hardening): `guix-free-docker-image` scans the realized artifact and
+  ;; real, manifest-agnostic guarantee is the closure-level BUILD GATE embedded by
+  ;; `td-config->operating-system` (the `guix-free-marker` from (system
+  ;; td-hardening)), which scans the realized closure of the hardened profile and
   ;; fails the build if any bin/guix is present, so a hardened image is guix-free or
-  ;; does not build, for ANY manifest. Always build hardened images through that
-  ;; gate; this pre-filter just turns the common mistake into a fast, clear error.
+  ;; does not build, for ANY manifest and ANY lowering path. This pre-filter just
+  ;; turns the common mistake into a fast, clear error before that build.
   (when (and (not ship-guix?) (manifest-has-guix? manifest))
     (error (string-append
             "td-config: ship-guix? #f is incompatible with a manifest that "
@@ -204,8 +208,8 @@
             "via a transitively propagated input) — that would re-introduce the "
             "imperative `guix install` surface the flag removes. Drop guix from "
             "the manifest or set ship-guix? #t. (Note: this is only a pre-filter; "
-            "build hardened images via (system td-hardening) guix-free-docker-image "
-            "for the closure-level guarantee.)")))
+            "the closure-level guarantee is the guix-free-marker embedded in the "
+            "hardened system by td-config->operating-system — see (system td-hardening).)")))
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?
@@ -239,9 +243,20 @@
     ;; manifest is %base-packages, which is exactly the operating-system field's
     ;; own default — so the default config lowers byte-for-byte to the frozen
     ;; oracle (which omits this field). A non-default manifest is a different
-    ;; image: a whole-image swap, not an in-place install (interface property —
-    ;; see the field's doc comment above re: the still-present imperative surface).
-    (packages (td-config-manifest c))
+    ;; image: a whole-image swap, not an in-place install.
+    ;;
+    ;; M7 (F1, embedded gate): for a hardened (#f) config we ALSO prepend the
+    ;; `guix-free-marker` — a build-time package whose build FAILS if guix is
+    ;; anywhere in the (other) packages' closure. Because it lives in `packages`,
+    ;; EVERY lowering of this system (bare operating-system, qcow2, docker, any
+    ;; helper) builds the profile and therefore the marker, so a hardened image is
+    ;; guix-free OR it does not build — by construction, with no bypassable opt-in.
+    ;; For #t (the default/oracle) the package set is the manifest verbatim, so the
+    ;; default config stays byte-identical to the frozen oracle (§2.5).
+    (packages (let ((manifest (td-config-manifest c)))
+                (if (td-config-ship-guix? c)
+                    manifest
+                    (cons (guix-free-marker manifest) manifest))))
 
     ;; M7: when `ship-guix?` is #f, delete `guix-service-type` so the realized
     ;; image carries no `guix`/`guix-daemon` binary — image-swap-only by

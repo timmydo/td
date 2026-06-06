@@ -1,97 +1,85 @@
-;; system/td-hardening.scm — M7 triage F1 (round 3): the REAL guix-free guarantee.
+;; system/td-hardening.scm — M7 triage F1: the guix-free guarantee, EMBEDDED.
 ;;
-;; Earlier rounds tried to make `ship-guix? #f` honest with a STATIC check in the
-;; `td-config` constructor (reject a manifest naming `guix`, then also one
-;; transitively PROPAGATING it). External review round 3 showed that family of
-;; checks is fundamentally incomplete: a package can land `bin/guix` in the image
-;; through paths a name/propagation scan cannot see —
-;;   * a plain RUNTIME REFERENCE to guix (guix in `inputs`/a retained store-path
-;;     string in the output) — not a propagated input, so the profile scan misses it;
-;;   * a RENAMED package inheriting guix (`(package (inherit guix) (name "x"))`) —
-;;     its name is not "guix", so the name scan misses it.
-;; Both put a real `.../bin/guix` in the realized image's store closure.
+;; History (external review, three rounds):
+;;   * Round 1: ship-guix? #f only deleted guix-service-type; a manifest LISTING
+;;     guix still shipped it. Added a constructor name check.
+;;   * Round 2: a manifest package PROPAGATING guix bypassed the name check.
+;;     Extended the constructor to walk transitive propagated inputs.
+;;   * Round 3: any STATIC check is incomplete — guix still reaches the closure via
+;;     a plain RUNTIME REFERENCE or a RENAMED package inheriting guix. Added a
+;;     closure-level build GATE… but only in an OPT-IN docker helper.
+;;   * Round 4 (this module): that helper was bypassable — the public
+;;     `td-config->operating-system` still lowered an UNGATED image, so
+;;     "by construction" was false for any caller using bare `guix system image`.
 ;;
-;; The only honest, manifest-AGNOSTIC guarantee is therefore at the CLOSURE level,
-;; enforced at BUILD time: scan the realized artifact and FAIL the build if any
-;; `bin/guix`/`bin/guix-daemon` is present. `assert-guix-free-image` is that gate;
-;; `guix-free-docker-image` wires it as a build dependency of the image, so the
-;; SUPPORTED way to build a hardened OCI image (`td-config->guix-free-docker-image`)
-;; is guix-free *or it does not build* — for ANY manifest, not just a fixture.
+;; Fix: stop bolting the gate onto one lowering path. EMBED it in the hardened
+;; operating-system's package set as `guix-free-marker`. Because it lives in
+;; `packages`, EVERY lowering of that system — bare `operating-system`, qcow2,
+;; docker, or any helper — builds the profile and therefore builds the marker, so a
+;; hardened image is guix-free OR it does not build. No opt-in, no path a caller can
+;; skip. The marker is closure-level and manifest-agnostic: it scans the realized
+;; closure of the hardened profile and catches guix arriving via a runtime
+;; reference or a renamed/inherited package, which a static name/propagation scan
+;; cannot. The constructor's name/propagation check (in (system td-typed)) is kept
+;; only as a cheap fast-fail PRE-FILTER for the obvious `(list guix)` mistake.
 ;;
-;; The constructor's name/propagation check (see (system td-typed)) is retained
-;; only as a CHEAP PRE-FILTER that fails the obvious `(list guix)` mistake in
-;; sub-second time before an expensive build; it is explicitly NOT the guarantee.
-;; This gate is.
+;; This module deliberately does NOT import (system td-typed): td-typed imports it
+;; (to embed the marker), so the dependency must point one way only.
 (define-module (system td-hardening)
+  #:use-module (guix packages)
   #:use-module (guix gexp)
-  #:use-module (gnu system image)        ;system-image, image-with-os, docker-image
-  #:use-module (gnu packages base)       ;tar, coreutils, grep
-  #:use-module (gnu packages bash)       ;bash
-  #:use-module (gnu packages compression) ;gzip
-  #:use-module (system td-typed)
-  #:export (assert-guix-free-image
-            guix-free-docker-image
-            td-config->guix-free-docker-image))
+  #:use-module (guix build-system trivial)
+  #:use-module ((guix licenses) #:prefix license:)
+  #:export (guix-free-marker))
 
-(define* (assert-guix-free-image image #:key (name "td-guix-free-gate"))
-  "Return a <computed-file> that builds (an empty output) IFF the docker .tar.gz
-file-like IMAGE packs no `bin/guix` or `bin/guix-daemon`; otherwise the build
-FAILS. Because it inspects the realized artifact's packed store closure, it catches
-guix arriving via ANY path — runtime reference, renamed/inherited package, or
-propagation — which the constructor's name-based profile pre-filter cannot. This is
-the closure-level, manifest-agnostic guix-free guarantee for `ship-guix? #f`."
-  (computed-file name
-    (with-imported-modules '((guix build utils))
+(define (guix-free-marker packages)
+  "Return a trivial <package> that builds to an empty output IFF none of PACKAGES'
+runtime closures contains a `bin/guix`/`bin/guix-daemon`; otherwise its build
+FAILS with a clear diagnostic. Add it to a hardened (ship-guix? #f) system's
+package list so EVERY lowering of that system builds the profile and therefore this
+marker — making the guix-free property hold BY CONSTRUCTION for any lowering path,
+not just an opt-in helper. Referencing PACKAGES in the builder forces the build
+sandbox to mount their full closures under /gnu/store, so the `ftw` walk sees
+exactly the hardened profile's closure (verified: a referenced guix yields two
+`bin/guix*` hits)."
+  (package
+    (name "td-guix-free-marker")
+    (version "0")
+    (source #f)
+    (build-system trivial-build-system)
+    (arguments
+     (list
+      #:builder
       #~(begin
-          (use-modules (guix build utils))
-          (setenv "PATH"
-                  (string-join (list #$(file-append tar "/bin")
-                                     #$(file-append gzip "/bin")
-                                     #$(file-append grep "/bin")
-                                     #$(file-append coreutils "/bin"))
-                               ":"))
-          ;; Same probe as the no-guix Makefile rung, but INSIDE the build graph so
-          ;; it gates the artifact: list every path packed in the image's
-          ;; layer.tar(s) and count `.../bin/guix(-daemon)` entries. We use `grep
-          ;; -Ec` (count), NOT `grep -Eq`: -q exits early on the first match, which
-          ;; under `set -o pipefail` makes the upstream `tar` die of SIGPIPE (141)
-          ;; and corrupts the pipeline status precisely in the guix-FOUND case. -c
-          ;; reads all input, so the exit status is honest: 0 == FOUND (≥1 match,
-          ;; gate must fail), 1 == none (ok), and pipefail surfaces any upstream tar
-          ;; read error as a non-zero/non-{0,1} status (fail closed: refuse to
-          ;; certify an unreadable archive guix-free).
-          (let ((status
-                 (status:exit-val
-                  (system* #$(file-append bash "/bin/bash") "-c"
-                           (string-append
-                            "set -o pipefail; "
-                            "tar xzOf " #$image " --wildcards '*/layer.tar' "
-                            "| tar tf - | grep -Ec '/bin/guix(-daemon)?$'")))))
-            (cond
-             ((eqv? status 0)
-              (error "td hardening: ship-guix? #f image STILL contains a \
-guix/guix-daemon binary in its closure — the imperative surface was not removed."))
-             ((eqv? status 1)
-              (mkdir #$output))
-             (else
-              (error "td hardening: could not scan the image archive (corrupt or \
-unreadable); refusing to certify it guix-free." status))))))))
-
-(define* (guix-free-docker-image os #:key (name "td-guix-free-docker-image"))
-  "Return a file-like that builds to OS's docker image, but ONLY if that image is
-guix-free: `assert-guix-free-image` is a build dependency, so a guix-ful hardened
-image FAILS to build rather than silently shipping the imperative surface. Use this
-— not the bare `system-image` — to build a hardened (ship-guix? #f) OCI image."
-  (let ((image (system-image (image-with-os docker-image os))))
-    (computed-file name
-      #~(begin
-          ;; Force the gate: producing this output requires building the gate,
-          ;; which FAILS the build if the image is not guix-free.
-          (let ((_ #$(assert-guix-free-image image))) #t)
-          ;; The certified output IS the image (a symlink keeps it one store item).
-          (symlink #$image #$output)))))
-
-(define* (td-config->guix-free-docker-image c #:key (name "td-guix-free-docker-image"))
-  "The SUPPORTED way to build a hardened OCI image from a typed config: lower C to
-an operating-system and return its build-gated, guix-free-or-fails docker image."
-  (guix-free-docker-image (td-config->operating-system c) #:name name))
+          (use-modules (ice-9 ftw))
+          ;; Force PACKAGES into this derivation's closure: each ungexp records a
+          ;; build input, so guix mounts their requisites under /gnu/store here.
+          (define scanned (list #$@packages))
+          (define (guix-binary? path)
+            (and (member (basename path) '("guix" "guix-daemon"))
+                 (string=? (basename (dirname path)) "bin")))
+          (define hits '())
+          (ftw "/gnu/store"
+               (lambda (filename statinfo flag)
+                 (when (and (eq? flag 'regular) (guix-binary? filename))
+                   (set! hits (cons filename hits)))
+                 #t))
+          ;; Keep the reference live (the inputs matter, not this value).
+          (when (and #f (pair? scanned)) #t)
+          (if (null? hits)
+              (mkdir #$output)
+              (begin
+                (format (current-error-port)
+                        "td hardening: ship-guix? #f system closure STILL contains \
+guix:~%~{  ~a~%~}" hits)
+                (error "td hardening: ship-guix? #f system STILL contains a \
+guix/guix-daemon binary in its closure — the imperative surface was not \
+removed"))))))
+    (synopsis "Build-time guix-free gate embedded in hardened td systems")
+    (description "A zero-content package whose build FAILS if any `bin/guix` or
+`bin/guix-daemon` is present in the closure of the packages it is given. Embedded
+in a ship-guix? #f system's package list so that building the system — by any
+lowering — refuses to proceed if guix is in the closure, making the guix-free
+guarantee hold by construction rather than via an opt-in helper.")
+    (home-page "https://example.invalid/td-guix-free-marker")
+    (license license:gpl3+)))

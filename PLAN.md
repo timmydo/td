@@ -235,9 +235,9 @@ tracks *where we are* on it.
       targets the OCI image, where image-swap-only is the model — the VM keeps the
       daemon it needs to be a normal Guix system in v0).
 
-      **M7 review remediation (post-M7 external review — F1 hardened across three
+      **M7 review remediation (post-M7 external review — F1 hardened across four
       rounds; F2/F3 fixed).**
-      • **F1 (High) — ship-guix? #f was not a real guarantee.** Worked through three
+      • **F1 (High) — ship-guix? #f was not a real guarantee.** Worked through four
         review rounds, each tightening the guarantee:
         – *Round 1:* the compiler only deleted guix-service-type; ship-guix? #f with
           a manifest LISTING `guix` still shipped it via `packages`. Added a
@@ -246,19 +246,27 @@ tracks *where we are* on it.
           the name check. Extended the constructor to walk each package's transitive
           propagated inputs (`manifest-has-guix?`), and added a verified regression
           row (`typed-coverage` now 19/19 rejected).
-        – *Round 3 (current):* review showed any STATIC check is fundamentally
-          incomplete — guix still reaches the closure via a NON-propagated runtime
-          reference, or via a RENAMED package inheriting guix (name ≠ "guix").
-          **Resolution:** the static constructor check is demoted to a documented
-          fast-fail PRE-FILTER, and the real guarantee is now a CLOSURE-LEVEL BUILD
-          GATE — `(system td-hardening) guix-free-docker-image` scans the realized
-          artifact and FAILS the build on any `bin/guix`, so a hardened image is
-          guix-free OR does not build, for ANY manifest. `make no-guix` now builds
-          the gated hardened image (must succeed), `--check`s its reproducibility,
-          contrasts a guix-ful #t control, and proves the gate REFUSES an
-          adversarial manifest that smuggles guix past the pre-filter via a runtime
-          reference (verified-red: fails at the gate with its own diagnostic). The
-          F1 residual is closed: the guarantee is manifest-agnostic, not a name scan.
+        – *Round 3:* review showed any STATIC check is fundamentally incomplete —
+          guix still reaches the closure via a NON-propagated runtime reference, or
+          via a RENAMED package inheriting guix (name ≠ "guix"). Demoted the static
+          check to a fast-fail PRE-FILTER and added a CLOSURE-LEVEL BUILD GATE.
+        – *Round 4 (current):* that gate was an OPT-IN docker helper — the public
+          `td-config->operating-system` still lowered an UNGATED image, so a caller
+          using bare `guix system image` got guix back; "by construction" was still
+          false. **Resolution:** EMBED the gate. `td-config->operating-system`, for a
+          #f config, prepends `guix-free-marker` (`(system td-hardening)`) — a
+          build-time package whose build FAILS if guix is anywhere in the (other)
+          packages' closure — to the system's `packages`. Since it lives in the
+          package set, EVERY lowering (bare operating-system, qcow2, docker, any
+          helper) builds the profile and therefore the marker, so a hardened image is
+          guix-free OR it does not build, with no opt-in to skip. `make no-guix` now
+          proves this on the BARE public path: the hardened image builds + is
+          reproducible (`--check` of the gated artifact, also closing F2-round4 — the
+          reproducibility check now targets the actual gated artifact) + tarball has 0
+          guix; the #t control has guix; and the bare lowering of an adversarial
+          manifest that smuggles guix past the pre-filter via a runtime reference
+          FAILS at the embedded marker (verified-red, asserted against the marker's
+          own diagnostic). F1 closed: manifest-agnostic, closure-level, no bypass.
       • **F2 (Medium) — no-guix required the SHIPPED image to stay guix-enabled.**
         The rung's positive control was the `$(SYSTEM)` image (asserted to contain
         guix), so promoting the shipped default to hardened would have reddened the
