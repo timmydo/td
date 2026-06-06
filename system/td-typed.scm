@@ -25,6 +25,7 @@
   #:use-module (guix packages)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
+  #:use-module (ice-9 match)
   #:use-module (ice-9 format)
   #:export (<td-config>
             td-config
@@ -120,11 +121,29 @@
 (define (package-list? x)
   (and (list? x) (every package? x)))
 
-;; Does a manifest list the `guix` package? Checked by NAME (not object identity)
-;; so a guix variant is caught too. Used to reject the contradictory
-;; ship-guix? #f + guix-in-manifest combination — see the constructor.
+;; Every package a manifest installs into the image's PROFILE: each directly
+;; listed package PLUS its transitively propagated inputs. Propagated inputs are
+;; added to the profile (and so to the image) exactly as if they had been listed
+;; directly — that is the mechanism by which a manifest package "propagating guix"
+;; lands a `bin/guix` in the image even though guix is not itself in the list. We
+;; flatten that closure here so the guix check below sees the same package set the
+;; realized image's profile will. (Inputs can be non-package objects — origins,
+;; file-likes — so we keep only the packages.)
+(define (manifest-profile-packages manifest)
+  (append manifest
+          (filter-map (match-lambda
+                        ((_ (? package? p) _ ...) p)
+                        (_ #f))
+                      (append-map package-transitive-propagated-inputs
+                                  manifest))))
+
+;; Does a manifest install the `guix` package — directly OR via a transitively
+;; propagated input? Checked by NAME (not object identity) so a guix variant is
+;; caught too. Used to reject the contradictory ship-guix? #f + guix-in-profile
+;; combination — see the constructor.
 (define (manifest-has-guix? manifest)
-  (any (lambda (p) (string=? (package-name p) "guix")) manifest))
+  (any (lambda (p) (string=? (package-name p) "guix"))
+       (manifest-profile-packages manifest)))
 
 ;;;
 ;;; The smart constructor. Keyword-driven with defaults that, taken together,
@@ -161,18 +180,25 @@
   (check boolean? 'ship-guix? ship-guix? "a boolean")
   ;; Cross-field (M7, triage F1): ship-guix? #f promises an image with NO
   ;; imperative guix surface. Deleting guix-service-type removes the
-  ;; service-provided guix, but a manifest that LISTS the guix package would
-  ;; re-introduce it through `packages` — so ship-guix? #f + guix-in-manifest is a
-  ;; contradiction that silently ships the surface. Reject it here so ship-guix? #f
-  ;; is an honest guarantee, not just a service toggle. (Residual, documented: a
-  ;; manifest package that PROPAGATES guix transitively is not statically detected
-  ;; here; the `no-guix` artifact rung is the backstop for the configs it builds.)
+  ;; service-provided guix, but a manifest that puts the guix package into the
+  ;; image's profile would re-introduce it through `packages` — so ship-guix? #f +
+  ;; guix-in-profile is a contradiction that silently ships the surface. We reject
+  ;; it here over the FULL profile package set (`manifest-has-guix?` walks each
+  ;; listed package AND its transitively propagated inputs), so a manifest package
+  ;; that merely PROPAGATES guix is caught too, not just a directly-listed guix.
+  ;; That closes the earlier residual (transitive propagation was previously
+  ;; undetected here). Remaining residual, documented: guix reachable only as a
+  ;; NON-propagated runtime reference of some package would still enter the store
+  ;; closure without entering the profile; that path is not statically modeled
+  ;; here and is the `no-guix` artifact rung's job (it greps the realized tarball
+  ;; for any bin/guix, propagated or not, for the configs it builds).
   (when (and (not ship-guix?) (manifest-has-guix? manifest))
     (error (string-append
             "td-config: ship-guix? #f is incompatible with a manifest that "
-            "contains the `guix` package — that would re-introduce the imperative "
-            "`guix install` surface the flag removes. Drop guix from the manifest "
-            "or set ship-guix? #t.")))
+            "puts the `guix` package into the image profile (listed directly or "
+            "via a transitively propagated input) — that would re-introduce the "
+            "imperative `guix install` surface the flag removes. Drop guix from "
+            "the manifest or set ship-guix? #t.")))
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?

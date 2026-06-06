@@ -30,6 +30,7 @@
              (guix monads)
              (gnu)
              (gnu system image)
+             (gnu packages base)        ;hello — non-default manifest probe
              (system td-typed)
              (ice-9 format))
 
@@ -49,7 +50,20 @@
        (lower-object
         (system-image (image-with-os docker-image os))))))
 
-  (let ((hardened (oci-drv (td-config->operating-system (td-config #:ship-guix? #f))))
-        (control  (oci-drv (td-config->operating-system (td-config #:ship-guix? #t)))))
+  ;; The hardened fixture uses a NON-DEFAULT manifest (base packages + hello), not
+  ;; just the default. The earlier rung only built the default-manifest hardened
+  ;; image, so the artifact backstop never actually exercised the manifest path
+  ;; under ship-guix? #f — the exact gap a manifest-driven exploit slipped through.
+  ;; With a custom manifest here, the tarball grep proves a manifest-driven
+  ;; hardened image is genuinely guix-free at the artifact level, complementing the
+  ;; construction-time rejection of guix-propagating manifests in td-typed.scm.
+  ;; hello's closure is tiny and warm (shared with manifest-check), so this stays
+  ;; in budget. The control stays default #t to keep its guix-FUL discriminating
+  ;; power and warm closure.
+  (let* ((hardened-manifest (cons hello %base-packages))
+         (hardened (oci-drv (td-config->operating-system
+                             (td-config #:ship-guix? #f
+                                        #:manifest hardened-manifest))))
+         (control  (oci-drv (td-config->operating-system (td-config #:ship-guix? #t)))))
     (format #t "DRV_HARDENED=~a~%" hardened)
     (format #t "DRV_CONTROL=~a~%" control)))

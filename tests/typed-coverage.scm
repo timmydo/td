@@ -42,6 +42,7 @@
              (gnu system file-systems)  ;file-system-* accessors
              (gnu packages base)        ;hello
              (gnu packages package-management) ;guix (F1 regression)
+             (guix packages)            ;package, this-package (F1 transitive regression)
              (srfi srfi-1)
              (ice-9 format)
              (system td)
@@ -138,7 +139,19 @@
    ;; re-introduce the imperative surface via `packages` (the service deletion
    ;; alone does NOT make the image guix-free). The constructor must reject this
    ;; contradictory combination.
-   (list 'ship-guix? "ship-guix? #f + guix in manifest" (lambda () (td-config #:ship-guix? #f #:manifest (list guix))))))
+   (list 'ship-guix? "ship-guix? #f + guix in manifest" (lambda () (td-config #:ship-guix? #f #:manifest (list guix))))
+   ;; F1 transitive regression (the verification hole): a manifest package that
+   ;; does NOT list guix but PROPAGATES it lands guix in the image profile all the
+   ;; same. The earlier check only matched directly-listed guix and accepted this,
+   ;; so a ship-guix? #f image was built that still shipped four guix binaries.
+   ;; A synthetic propagator (pure, builds nothing) makes the case deterministic;
+   ;; the constructor must now reject it too.
+   (list 'ship-guix? "ship-guix? #f + guix propagated by a manifest package"
+         (lambda ()
+           (td-config #:ship-guix? #f
+                      #:manifest (list (package (inherit hello)
+                                         (name "td-guix-propagator")
+                                         (propagated-inputs (list guix)))))))))
 
 (define (raises? thunk)
   (catch #t (lambda () (thunk) #f) (lambda _ #t)))
