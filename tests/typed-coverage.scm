@@ -28,6 +28,8 @@
              (guix monads)
              (gnu)
              (gnu system)
+             (gnu bootloader)           ;bootloader-configuration-targets
+             (gnu system file-systems)  ;file-system-* accessors
              (gnu packages base)        ;hello
              (srfi srfi-1)
              (ice-9 format)
@@ -39,14 +41,18 @@
 ;; the already-warm base closure — with substitutes off (triage #1) a cold path
 ;; would force a slow from-source build, which is wrong for a cheap, fast rung.
 ;;
-;; Two fields are intentionally NOT in this sweep and are covered by validation
-;; (sweep B) only:
+;; Three fields are NOT probeable by drv-divergence and are instead covered by
+;; the STRUCTURAL sweep (C) below — NOT silently dropped (the earlier gap):
 ;;   * bootloader-target — the install *device* is consumed at image/install
 ;;     time, not baked into `operating-system-derivation`; perturbing it does not
 ;;     change the system drv (verified), so it is not a valid wiring probe here.
 ;;   * root-fs-type — any non-ext4 type pulls its fs-tools (e.g. btrfs-progs),
-;;     which are not in the warm closure; lowering it offline triggers a
-;;     from-source build. Out of scope for a cheap structural rung.
+;;     which are not in the warm closure; lowering it to a DERIVATION offline
+;;     triggers a from-source build. (Lowering to a RECORD, as sweep C does, does
+;;     not — so its wiring is checked there.)
+;;   * root-mount — could change the drv, but it is grouped with the other two
+;;     and checked structurally in (C) so all three root/bootloader fields are
+;;     asserted the same way.
 (define valid-perturbations
   (list
    (cons "host-name"              (td-config #:host-name "other-host"))
@@ -79,6 +85,37 @@
    (cons "manifest non-list"             (lambda () (td-config #:manifest 42)))
    (cons "manifest non-packages"         (lambda () (td-config #:manifest (list 1 2))))))
 
+;; (C) Structural wiring — for the three fields that drv-divergence (A) cannot
+;; probe. Each row is (NAME PERTURBED-CONFIG PREDICATE): we lower the perturbed
+;; config to an operating-system RECORD (no derivation, no fs-tools, no build)
+;; and the predicate asserts the perturbed value actually reached the compiled
+;; field. If the compiler hard-coded or ignored the field, the predicate goes
+;; red — exactly the wiring guarantee (A) gives the other fields.
+(define (root-file-system os)
+  ;; The td root fs is the only one whose device is a <file-system-label>
+  ;; (%base-file-systems use paths / "none"); robust under any perturbation.
+  (find (lambda (fs) (file-system-label? (file-system-device fs)))
+        (operating-system-file-systems os)))
+
+(define structural-wiring
+  (list
+   (list "bootloader-target"
+         (td-config #:bootloader-target "/dev/sdb")
+         (lambda (os)
+           (equal? (bootloader-configuration-targets
+                    (operating-system-bootloader os))
+                   (list "/dev/sdb"))))
+   (list "root-mount"
+         (td-config #:root-mount "/altroot")
+         (lambda (os)
+           (and=> (root-file-system os)
+                  (lambda (fs) (string=? (file-system-mount-point fs) "/altroot")))))
+   (list "root-fs-type"
+         (td-config #:root-fs-type "btrfs")
+         (lambda (os)
+           (and=> (root-file-system os)
+                  (lambda (fs) (string=? (file-system-type fs) "btrfs")))))))
+
 (define (raises? thunk)
   (catch #t (lambda () (thunk) #f) (lambda _ #t)))
 
@@ -107,6 +144,19 @@
          (if ok? failures (cons name failures))))
      '() valid-perturbations))
 
+  ;; (C) structural wiring sweep (the three drv-invisible fields)
+  (format #t "~%  (C) STRUCTURAL WIRING — perturbed value must reach the \
+compiled operating-system:~%")
+  (define structural-failures
+    (fold
+     (lambda (row failures)
+       (let* ((name (first row))
+              (os   (td-config->operating-system (second row)))
+              (ok?  ((third row) os)))
+         (format #t "      ~a ~a~%" (if ok? "ok  " "FAIL") name)
+         (if ok? failures (cons name failures))))
+     '() structural-wiring))
+
   ;; (B) validation sweep
   (format #t "~%  (B) VALIDATION — an invalid value must be rejected:~%")
   (define validation-failures
@@ -119,20 +169,33 @@
      '() invalid-rejections))
 
   (let ((wf (length wiring-failures))
-        (vf (length validation-failures)))
-    (format #t "~%  wiring: ~a/~a diverged   validation: ~a/~a rejected~%"
-            (- (length valid-perturbations) wf) (length valid-perturbations)
+        (sf (length structural-failures))
+        (vf (length validation-failures))
+        ;; total fields actually wiring-checked: drv-divergence (A) + structural (C)
+        (wired-checked (+ (length valid-perturbations) (length structural-wiring))))
+    (format #t "~%  wiring: ~a/~a reached the system (~a via drv-divergence, ~a \
+structural)   validation: ~a/~a rejected~%"
+            (- wired-checked wf sf) wired-checked
+            (- (length valid-perturbations) wf)
+            (- (length structural-wiring) sf)
             (- (length invalid-rejections) vf) (length invalid-rejections))
     (cond
      ((> wf 0)
       (format #t "FAIL: ~a field(s) did NOT change the system when perturbed \
 (ignored by the compiler): ~a~%" wf wiring-failures)
       (exit 1))
+     ((> sf 0)
+      (format #t "FAIL: ~a field(s) did NOT reach the compiled operating-system \
+(ignored by the compiler): ~a~%" sf structural-failures)
+      (exit 1))
      ((> vf 0)
       (format #t "FAIL: ~a invalid value(s) were ACCEPTED (validation missing): \
 ~a~%" vf validation-failures)
       (exit 1))
      (else
-      (format #t "PASS: every field is wired into the lowered system, and every \
-field rejects an invalid value at construction.~%")
+      (format #t "PASS: every field is wired into the lowered system (by \
+drv-divergence or structural assertion), and every field rejects an invalid \
+value at construction. (Note: string fields are type/shape-validated, not \
+checked for semantic existence — e.g. an unknown-but-well-formed timezone or \
+locale is accepted.)~%")
       (exit 0)))))
