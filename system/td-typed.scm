@@ -25,7 +25,8 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 format)
-  #:export (td-config
+  #:export (<td-config>
+            td-config
             td-config?
             td-config-host-name
             td-config-timezone
@@ -61,12 +62,16 @@
   (ssh-port               td-config-ssh-port)
   (ssh-password-auth?     td-config-ssh-password-auth?)
   (ssh-challenge-response? td-config-ssh-challenge-response?)
-  ;; M6 — the declarative package manifest that drives image contents. This is
-  ;; the "no imperative `guix install`" lever (DESIGN §6): the ONLY way to change
-  ;; what the image contains is to declare a different manifest and rebuild the
-  ;; whole image — a wholesale swap, never an in-place mutation. A list of
-  ;; <package>; defaults to %base-packages so the default config stays
-  ;; byte-identical to the frozen oracle (which lets the field default).
+  ;; M6 — the declarative package manifest that drives image contents. It is the
+  ;; manifest-driven, image-swap-only BUILD INTERFACE (DESIGN §6): the intended way
+  ;; to change what the image contains is to declare a different manifest and
+  ;; rebuild the whole image — a wholesale swap, not an in-place edit of a built
+  ;; image. NOTE (triage): this is an interface property only — M6 does NOT remove
+  ;; the imperative `guix install` surface (the built image still ships
+  ;; `guix`/`guix-daemon`); proving that surface absent is a later milestone
+  ;; (DESIGN §6 parking-lot). A list of <package>; defaults to %base-packages so
+  ;; the default config stays byte-identical to the frozen oracle (which lets the
+  ;; field default).
   (manifest               td-config-manifest))
 
 ;;;
@@ -162,7 +167,8 @@
     ;; manifest is %base-packages, which is exactly the operating-system field's
     ;; own default — so the default config lowers byte-for-byte to the frozen
     ;; oracle (which omits this field). A non-default manifest is a different
-    ;; image: a whole-image swap, never an in-place install.
+    ;; image: a whole-image swap, not an in-place install (interface property —
+    ;; see the field's doc comment above re: the still-present imperative surface).
     (packages (td-config-manifest c))
 
     (services

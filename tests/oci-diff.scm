@@ -32,10 +32,13 @@
              (system td-typed))
 
 (with-store store
-  ;; Honest offline (triage #1): forbid substitution for this store session. The
-  ;; shared host daemon has network + nonguix in its substitute URLs (check.sh),
-  ;; and `guix repl` does not read GUIX_BUILD_OPTIONS — so set it explicitly here.
-  (set-build-options store #:use-substitutes? #f)
+  ;; Offline contract (triage): forbid substitutes AND remote offloading for this
+  ;; store session. The shared host daemon has network + a nonguix substitute URL
+  ;; (check.sh), and `guix repl` does not read GUIX_BUILD_OPTIONS — so set both
+  ;; here. This guarantees no binary substitutes and no remote builders; a cold
+  ;; fixed-output SOURCE fetch by the shared daemon is still possible (the narrowed
+  ;; contract — see check.sh / DESIGN §5).
+  (set-build-options store #:use-substitutes? #f #:offload? #f)
 
   ;; Lower an operating-system to the derivation of its Docker/OCI image and
   ;; return the .drv store path. `(image-with-os docker-image os)` is exactly the

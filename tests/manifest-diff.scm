@@ -2,11 +2,13 @@
 ;; image-swap-only; §2.4 step 5+, §2.5).
 ;;
 ;; M6 makes the package contents of the image a declarative function of a
-;; *manifest* (the typed config's `manifest` field), and forbids any imperative
-;; `guix install`-style mutation: the only way to change what the image contains
-;; is to declare a different manifest and rebuild the WHOLE image — a wholesale
-;; swap, never an in-place install. The artifact under test is therefore the
-;; OCI image derivation (the thing you would swap), exactly as in M5.
+;; *manifest* (the typed config's `manifest` field): the intended way to change
+;; what the image contains is to declare a different manifest and rebuild the
+;; WHOLE image — a wholesale swap, not an in-place edit. NOTE (triage): this is a
+;; BUILD-INTERFACE property; M6 does NOT remove the imperative `guix install`
+;; surface (the built image still ships `guix`/`guix-daemon`) — proving that
+;; absent is a later milestone (DESIGN §6 parking-lot). The artifact under test is
+;; the OCI image derivation (the thing you would swap), exactly as in M5.
 ;;
 ;; Same self-discriminating shape as tests/oci-diff.scm (the M3 false-green
 ;; lesson, kept as a permanent guardrail). It asserts THREE things, each able to
@@ -57,12 +59,15 @@
 (define %swapped-manifest (cons %swap-package %base-packages))
 
 (with-store store
-  ;; Honest offline (triage #1): forbid substitution for this store session. The
-  ;; shared host daemon has network + nonguix in its substitute URLs (check.sh),
-  ;; and `guix repl` does not read GUIX_BUILD_OPTIONS — so set it explicitly here.
-  ;; This is also what stops the graft-driven substitute *queries* this rung's
-  ;; first run made when `hello` was not yet warm.
-  (set-build-options store #:use-substitutes? #f)
+  ;; Offline contract (triage): forbid substitutes AND remote offloading for this
+  ;; store session. The shared host daemon has network + a nonguix substitute URL
+  ;; (check.sh), and `guix repl` does not read GUIX_BUILD_OPTIONS — so set both
+  ;; here. This guarantees no binary substitutes and no remote builders; a cold
+  ;; fixed-output SOURCE fetch by the shared daemon is still possible (the narrowed
+  ;; contract — see check.sh / DESIGN §5). #:use-substitutes? #f also stops the
+  ;; graft-driven substitute *queries* this rung's first run made when `hello` was
+  ;; not yet warm.
+  (set-build-options store #:use-substitutes? #f #:offload? #f)
 
   ;; Lower an operating-system to the derivation of its Docker/OCI image and
   ;; return the .drv store path — identical to tests/oci-diff.scm. No image is

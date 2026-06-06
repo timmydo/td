@@ -193,13 +193,26 @@ fixed, each a small commit with verified-red where applicable. The loop got
 materially more honest (it could previously pass while non-hermetic, while not
 booting the shipped artifact, and with a rung that could not fail).
 
+> **Note — refined by later review rounds.** This is the round-1 log. Two findings
+> below were sharpened by subsequent reviews and now read differently in the live
+> code/docs: the offline claim (1) was narrowed to "no substitutes + no remote
+> offloading; cold fixed-output source fetches still possible" and every repl rung
+> now also sets `#:offload? #f` (see check.sh "THE CONTRACT" + the bullet under
+> "How to run the loop"); typed coverage (4) now proves **11/11** record fields
+> (8 via drv-divergence + 3 structural), with the denominator introspected from the
+> `<td-config>` record rather than a hand-kept count. The entries below are left as
+> the historical record of round 1.
+
 1. **(High) Loop was not offline/local-only.** Dropping `--network` never isolated
    the shared HOST daemon (`--share=/var/guix`), which has network + nonguix in its
    substitute URLs. Fixed: `check.sh` exports `GUIX_BUILD_OPTIONS=--no-substitutes`
    and every repl rung sets `(set-build-options store #:use-substitutes? #f)`. Full
    loop verified green with ZERO substitute/download lines. Commit 75e4917.
-   *Open for the human:* drop nonguix from the daemon's substitute config so a cold
-   path cannot even *query* it.
+   *(Later narrowed: the guaranteed-by-construction property is "no substitutes +
+   no remote offloading", not full network isolation — `--no-substitutes` does not
+   stop a cold fixed-output source fetch by the shared daemon; repl rungs also set
+   `#:offload? #f`.) Open for the human:* drop nonguix from the daemon's substitute
+   config, and isolate its network, so a cold path cannot even *query*/fetch.
 2. **(High) Reproducible qcow2 was never boot-tested.** The marionette `test`
    direct-kernel-booted `%test-os`, bypassing GRUB/partition/disk. Added
    `%test-td-disk-boot` / `make boot-disk`: boots the qcow2 via SeaBIOS→GRUB→kernel.
@@ -214,7 +227,11 @@ booting the shipped artifact, and with a rung that could not fail).
    fields diverge the system drv) + VALIDATION sweep (16/16 invalid values
    rejected). Verified-red at the code level (un-wire a field, drop a check).
    bootloader-target/root-fs-type are validation-only by design (documented).
-   Commit c9b9cf2.
+   Commit c9b9cf2. *(Later extended: the three drv-invisible fields
+   (bootloader-target, root-mount, root-fs-type) gained a STRUCTURAL wiring sweep,
+   so coverage is now 11/11 = 8 drv-divergence + 3 structural; and the denominator
+   is introspected from the `<td-config>` record (`record-type-fields`) so a new
+   field with no matching row reddens the rung before any sweep runs.)*
 5. **(Medium) M6 proved the declaration, not the artifact.** `manifest-diff` (c)
    only checked `operating-system-packages`; reframed honestly, and
    `manifest-check` now cracks the built `layer.tar` and asserts
@@ -305,13 +322,20 @@ guix shell -C --pure --no-substitutes --no-offload --expose=/gnu/store \
   no-op that hits the warm store.
 - Do **NOT** add `--network`: it pulls substitutes incl. nonguix.org (FSDG + local-only
   violation). The loop must stay offline.
-- **Offline is now by construction, not by luck of a warm cache (triage #2):**
+- **No substitutes and no remote offloading by construction (triage #2, narrowed):**
   `--no-substitutes --no-offload` are passed to the OUTER `guix shell` itself (not
-  only exported inside it), so even a cold environment build cannot query
-  substitutes or offload to a remote builder. The shared HOST daemon still *has*
-  network and a nonguix substitute URL, so removing that host-side configuration
-  remains a defense-in-depth follow-up (it is now defense-in-depth, not the primary
-  guarantee).
+  only exported inside it), AND every repl rung sets `(set-build-options store
+  #:use-substitutes? #f #:offload? #f)` (guix repl ignores GUIX_BUILD_OPTIONS), so
+  even a cold environment build cannot query substitutes or offload to a remote
+  builder — every realisation is LOCAL and substitute-free. **This is not a fully
+  network-free guarantee:** the shared HOST daemon (`--share=/var/guix`) keeps its
+  network, and `--no-substitutes` does not stop a *fixed-output* source derivation
+  from fetching on a cold path. That residual is permitted by the hermeticity
+  clause (CLAUDE.md prime directive 2: "offline except declared fixed-output
+  fetches") and is suppressed in practice by the warm store + pinned-channel guard.
+  Isolating the host daemon's network (or a pre-populated source closure) and
+  dropping nonguix from its substitute URLs remain defense-in-depth follow-ups, not
+  the primary guarantee.
 
 ## Loop reminder (CLAUDE.md)
 

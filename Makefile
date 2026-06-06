@@ -116,7 +116,7 @@ test:
 	@drv=`printf '%s\n' \
 	    '(use-modules (guix) (gnu tests) (tests boot))' \
 	    '(with-store store' \
-	    '  (set-build-options store #:use-substitutes? #f)' \
+	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
 	    '  (format #t "DRV=~a~%"' \
 	    '          (derivation-file-name' \
 	    '           (run-with-store store (system-test-value %test-td-boot)))))' \
@@ -135,7 +135,7 @@ boot-disk:
 	@drv=`printf '%s\n' \
 	    '(use-modules (guix) (gnu tests) (tests boot))' \
 	    '(with-store store' \
-	    '  (set-build-options store #:use-substitutes? #f)' \
+	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
 	    '  (format #t "DRV=~a~%"' \
 	    '          (derivation-file-name' \
 	    '           (run-with-store store (system-test-value %test-td-disk-boot)))))' \

@@ -194,9 +194,12 @@ test.
 slot has so far been realized as two milestones that pull §6 parking-lot threads. Both
 are on `main`, green, with verified-red differentials, but await sign-off before merge
 (they cross into new layers): **M5** — the same declaration also lowers to a
-reproducible Docker/OCI image; **M6** — manifest-driven, image-swap-only: image
-contents are a declarative function of a typed `manifest`, a changed manifest is a whole
-new reproducible image generation, and there is no imperative `guix install` surface.
+reproducible Docker/OCI image; **M6** — manifest-driven, image-swap-only *build
+interface*: image contents are a declarative function of a typed `manifest`, and a
+changed manifest is a whole new reproducible image generation. (M6 establishes the
+declarative interface only; it does NOT yet remove the imperative `guix install`
+surface — the built image still ships `guix`/`guix-daemon`. Proving that surface
+absent is a distinct future milestone; see the parking-lot note in §6.)
 See `PLAN.md` for the per-milestone status and digests. Promoting these from "extend"
 into numbered ladder rungs is a spec decision for the human reviewer.
 

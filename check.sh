@@ -18,7 +18,7 @@
 #   --share=/var/guix          : daemon socket + writable profiles/GC roots.
 #   host guix first on PATH     : the host *system* guix already IS the pinned
 #                                 commit, so the Makefile's `time-machine` is a
-#                                 no-op that hits the warm store (fully offline).
+#                                 no-op that hits the warm store (no re-fetch).
 #   NO --network               : on purpose. Network => substitutes => nonguix.
 #   guix shell --no-substitutes --no-offload : the daemon we share
 #                                 (--share=/var/guix) runs on the HOST and HAS
@@ -36,14 +36,26 @@
 #                                 cold, could have fetched/offloaded) the toolchain
 #                                 profile. Passing them to `guix shell` forbids
 #                                 substitution/offload for the environment build
-#                                 too, so the loop is offline by construction.
+#                                 too.
 #   GUIX_BUILD_OPTIONS=...      : belt-and-suspenders for the guix build/system
 #                                 calls the Makefile makes INSIDE the shell (the
 #                                 repl-based diff rungs set the same via
-#                                 `set-build-options #:substitutes? #f`, since
-#                                 `guix repl` does not read this variable). The
-#                                 loop is then honestly offline, not
-#                                 offline-by-luck-of-a-warm-cache.
+#                                 `set-build-options #:use-substitutes? #f
+#                                 #:offload? #f`, since `guix repl` does not read
+#                                 this variable).
+#
+# THE CONTRACT (narrowed — honest scope). What the above GUARANTEES by
+# construction is: NO binary substitutes and NO remote build offloading — every
+# realisation is a LOCAL build, and nothing is pulled from a substitute server
+# (incl. nonguix), cold or warm. It does NOT guarantee a fully network-free run:
+# the daemon we share (--share=/var/guix) runs on the HOST and keeps its network,
+# and `--no-substitutes` does not stop a *fixed-output* derivation (a `git`/`url`
+# source fetch) from reaching out on a cold path. That residual is permitted by
+# the hermeticity clause (CLAUDE.md prime directive 2: "offline except declared
+# fixed-output fetches"), and in practice the warm store + pinned-channel guard
+# below means no such fetch fires. Making cold source fetches impossible too
+# would require isolating the host daemon's network or a pre-populated source
+# closure — a defense-in-depth follow-up, not a property this script asserts.
 set -eu
 
 cd "$(dirname "$0")"

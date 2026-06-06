@@ -24,10 +24,13 @@
              (ice-9 format))
 
 (with-store store
-  ;; Honest offline (triage #1): forbid substitution for this store session. The
-  ;; shared host daemon has network + nonguix in its substitute URLs (check.sh),
-  ;; and `guix repl` does not read GUIX_BUILD_OPTIONS — so set it explicitly here.
-  (set-build-options store #:use-substitutes? #f)
+  ;; Offline contract (triage): forbid substitutes AND remote offloading for this
+  ;; store session. The shared host daemon has network + a nonguix substitute URL
+  ;; (check.sh), and `guix repl` does not read GUIX_BUILD_OPTIONS — so set both
+  ;; here. This rung actually BUILDS the swapped image, so #:offload? #f keeps the
+  ;; build local (no remote builder); a cold fixed-output SOURCE fetch by the
+  ;; shared daemon is still possible (the narrowed contract — see check.sh / DESIGN §5).
+  (set-build-options store #:use-substitutes? #f #:offload? #f)
 
   (let* ((swapped-os (td-config->operating-system
                       (td-config #:manifest (cons hello %base-packages))))
