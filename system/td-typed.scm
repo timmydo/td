@@ -81,15 +81,20 @@
   ;; imperative mutation surface in place: the built image still ships
   ;; `guix`/`guix-daemon`, so an in-image `guix install` is physically possible.
   ;; This boolean is the lever that removes that surface: when #f the compiler
-  ;; deletes `guix-service-type` — the only thing pulling the `guix` package into
-  ;; the system closure (verified empirically) — so the realized image carries no
-  ;; `guix`/`guix-daemon` binary at all and cannot be mutated in place. Defaults
-  ;; to #t so the default config stays byte-identical to the frozen oracle (§2.5);
-  ;; flipping the SHIPPED default to #f re-baselines the oracle and is a spec
-  ;; decision gated on §4.3 sign-off — M7 proves the construction additively, it
-  ;; does not unilaterally change what td ships. The negative artifact test
-  ;; (`make no-guix`) proves a #f image is genuinely guix-free while the default
-  ;; #t image is not.
+  ;; deletes `guix-service-type` (the service that pulls guix into the BASE system
+  ;; closure). NOTE: deleting the service is necessary but NOT sufficient on its
+  ;; own — a manifest package can still drag guix into the closure (directly,
+  ;; propagated, via a runtime reference, or as a renamed/inherited package). The
+  ;; constructor's cross-field check below is only a CHEAP PRE-FILTER for the
+  ;; obvious cases; the REAL, manifest-agnostic guix-free guarantee is the
+  ;; closure-level BUILD GATE in (system td-hardening) `guix-free-docker-image`,
+  ;; which makes a hardened image guix-free OR refuse to build. Defaults to #t so
+  ;; the default config stays byte-identical to the frozen oracle (§2.5); flipping
+  ;; the SHIPPED default to #f re-baselines the oracle and is a spec decision gated
+  ;; on §4.3 sign-off — M7 proves the construction additively, it does not
+  ;; unilaterally change what td ships. `make no-guix` proves the guarantee end to
+  ;; end: the gated #f image is guix-free (and reproducible), the #t image is not,
+  ;; and a manifest that smuggles guix past the pre-filter is REFUSED at the gate.
   (ship-guix?             td-config-ship-guix?))
 
 ;;;
@@ -178,27 +183,29 @@
   (check boolean? 'ssh-challenge-response? ssh-challenge-response? "a boolean")
   (check package-list? 'manifest manifest "a list of <package>")
   (check boolean? 'ship-guix? ship-guix? "a boolean")
-  ;; Cross-field (M7, triage F1): ship-guix? #f promises an image with NO
-  ;; imperative guix surface. Deleting guix-service-type removes the
-  ;; service-provided guix, but a manifest that puts the guix package into the
-  ;; image's profile would re-introduce it through `packages` — so ship-guix? #f +
-  ;; guix-in-profile is a contradiction that silently ships the surface. We reject
-  ;; it here over the FULL profile package set (`manifest-has-guix?` walks each
-  ;; listed package AND its transitively propagated inputs), so a manifest package
-  ;; that merely PROPAGATES guix is caught too, not just a directly-listed guix.
-  ;; That closes the earlier residual (transitive propagation was previously
-  ;; undetected here). Remaining residual, documented: guix reachable only as a
-  ;; NON-propagated runtime reference of some package would still enter the store
-  ;; closure without entering the profile; that path is not statically modeled
-  ;; here and is the `no-guix` artifact rung's job (it greps the realized tarball
-  ;; for any bin/guix, propagated or not, for the configs it builds).
+  ;; Cross-field (M7) — CHEAP PRE-FILTER ONLY, not the guarantee. ship-guix? #f
+  ;; promises an image with no imperative guix surface; the manifest can defeat that
+  ;; by putting guix into the image's profile. We fast-fail the OBVIOUS cases here
+  ;; (sub-second, before an expensive build): a manifest with guix listed directly
+  ;; or via a transitively propagated input (`manifest-has-guix?` walks both). But
+  ;; this is fundamentally incomplete — round-3 review showed guix can still reach
+  ;; the closure as a NON-propagated runtime reference, or via a RENAMED package
+  ;; inheriting guix (its name is not "guix"), neither of which a static name/
+  ;; propagation scan can see. So this check is a convenience, NOT a guarantee. The
+  ;; real, manifest-agnostic guarantee is the closure-level BUILD GATE in
+  ;; (system td-hardening): `guix-free-docker-image` scans the realized artifact and
+  ;; fails the build if any bin/guix is present, so a hardened image is guix-free or
+  ;; does not build, for ANY manifest. Always build hardened images through that
+  ;; gate; this pre-filter just turns the common mistake into a fast, clear error.
   (when (and (not ship-guix?) (manifest-has-guix? manifest))
     (error (string-append
             "td-config: ship-guix? #f is incompatible with a manifest that "
             "puts the `guix` package into the image profile (listed directly or "
             "via a transitively propagated input) — that would re-introduce the "
             "imperative `guix install` surface the flag removes. Drop guix from "
-            "the manifest or set ship-guix? #t.")))
+            "the manifest or set ship-guix? #t. (Note: this is only a pre-filter; "
+            "build hardened images via (system td-hardening) guix-free-docker-image "
+            "for the closure-level guarantee.)")))
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?

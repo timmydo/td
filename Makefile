@@ -202,37 +202,53 @@ manifest-check:
 #    M6 made image CONTENTS manifest-driven but left the imperative mutation
 #    surface: the built image still ships `guix`/`guix-daemon`, so an in-image
 #    `guix install` is physically possible. The typed `ship-guix?` field removes
-#    it (deletes guix-service-type). This rung proves that REMOVAL at the artifact
-#    level, self-discriminating like `manifest-check`, against TWO explicit
-#    typed-config fixtures (triage F2 — NOT the shipped `$(SYSTEM)` target, so
-#    promoting the shipped default to hardened never reddens this rung):
-#      • HARDENED = (td-config #:ship-guix? #f): build it, `--check` it bit-for-bit
-#        (a non-reproducible artifact is a FAILING test, prime directive 1), then
-#        crack its layer.tar and assert NO `bin/guix` / `bin/guix-daemon` — the
-#        surface is physically absent.
-#      • CONTROL = (td-config #:ship-guix? #t): assert it DOES contain those
-#        binaries — the verified-RED half baked in: if the probe stopped finding
-#        guix, or the toggle stopped mattering, this side reddens, so a green
-#        proves the rung can tell guix-ful from guix-free.
-#    This is an ARTIFACT-level (binary-absent) claim, which is STRONGER than the
-#    deferred docker-run "guix install fails" runtime check (§2.3 OCI app model):
-#    a binary that is not in the image cannot run. Hardened closure is a subset of
-#    the warm control, so it pulls nothing cold; heaviest rung → runs last (§1.3).
-#    Two-step lower-then-realise (repl → guix build) for honest exit status, as
-#    `test`/`manifest-check`.
+#    it. Round-3 review showed a NAME/PROPAGATION static check cannot guarantee a
+#    guix-free image — guix can still arrive via a runtime reference or a renamed
+#    inherited package — so the real guarantee is a CLOSURE-LEVEL gate enforced at
+#    BUILD time (system/td-hardening.scm `guix-free-docker-image`): a hardened
+#    image is guix-free OR it does not build, for ANY manifest. This rung proves
+#    that, self-discriminating, against explicit typed-config fixtures (triage F2 —
+#    NOT the shipped `$(SYSTEM)` target, so promoting the shipped default to
+#    hardened never reddens this rung):
+#      • HARDENED_IMAGE = (ship-guix? #f, base+hello): `--check` it reproducible
+#        (prime directive 1) and crack its layer.tar — NO `bin/guix`/`bin/guix-daemon`.
+#      • HARDENED_GATE  = the SAME config via `guix-free-docker-image`: it must
+#        BUILD — success == the closure gate certified it guix-free (the guarantee).
+#      • CONTROL = (ship-guix? #t): assert its tarball DOES contain those binaries —
+#        the discriminator: if the probe stopped finding guix, or the toggle stopped
+#        mattering, this reddens, so a green proves the probe tells guix-ful from
+#        guix-free.
+#      • ADVERSARIAL = (ship-guix? #f, manifest with a package that keeps a RUNTIME
+#        REFERENCE to guix) — it BYPASSES the constructor's name/propagation
+#        pre-filter, so guix would enter the closure undetected by any static check.
+#        Its gated build MUST FAIL *at the guix-free gate* (verified-red half): this
+#        is what proves the guarantee is closure-level and manifest-agnostic, not a
+#        name scan. We assert both that the build fails AND that it fails with the
+#        gate's own diagnostic (so an unrelated build error cannot green it).
+#    Artifact/closure-level (binary-absent) is STRONGER than the deferred docker-run
+#    "guix install fails" runtime check (§2.3): a binary not in the image cannot run.
+#    Heaviest rung → runs last (§1.3); closures are warm (base/hello/guix already built).
+#    Two-step lower-then-realise (repl → guix build) for honest exit status.
 no-guix:
-	@echo ">> no-guix: build the HARDENED (guix-free) OCI image and prove the imperative surface is gone"
+	@echo ">> no-guix: prove ship-guix? #f is a closure-level, build-enforced guix-free guarantee"
 	@set -euo pipefail; \
 	drvs=`$(GUIX) repl $(LOAD) tests/imperative-surface.scm 2>/dev/null`; \
-	hardened_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_HARDENED=//p'`; \
+	hardened_img_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_HARDENED_IMAGE=//p'`; \
+	hardened_gate_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_HARDENED_GATE=//p'`; \
 	control_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_CONTROL=//p'`; \
-	test -n "$$hardened_drv" -a -n "$$control_drv" || { echo "ERROR: could not lower the hardened/control OCI image derivations" >&2; exit 1; }; \
-	echo ">> hardened OCI image derivation: $$hardened_drv"; \
-	echo ">> control  OCI image derivation: $$control_drv"; \
-	hardened_img=`$(GUIX) build "$$hardened_drv"`; \
+	adversarial_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_ADVERSARIAL=//p'`; \
+	test -n "$$hardened_img_drv" -a -n "$$hardened_gate_drv" -a -n "$$control_drv" -a -n "$$adversarial_drv" \
+	  || { echo "ERROR: could not lower the no-guix OCI image derivations" >&2; exit 1; }; \
+	echo ">> hardened image derivation: $$hardened_img_drv"; \
+	echo ">> hardened gate  derivation: $$hardened_gate_drv"; \
+	echo ">> control  image derivation: $$control_drv"; \
+	echo ">> adversarial   derivation: $$adversarial_drv"; \
+	echo ">> guarantee: the SUPPORTED gated hardened build must succeed (gate certifies guix-free)"; \
+	$(GUIX) build "$$hardened_gate_drv" >/dev/null; \
+	hardened_img=`$(GUIX) build "$$hardened_img_drv"`; \
 	control_img=`$(GUIX) build "$$control_drv"`; \
-	echo ">> check: reproducibility of the HARDENED OCI image derivation"; \
-	$(GUIX) build --check "$$hardened_drv"; \
+	echo ">> check: reproducibility of the HARDENED image derivation"; \
+	$(GUIX) build --check "$$hardened_img_drv"; \
 	echo ">> artifact check: the imperative guix surface is ABSENT from the hardened image and PRESENT in the control"; \
 	probe() { \
 	  listing=`tar xzOf "$$1" --wildcards '*/layer.tar' | tar tf -` \
@@ -244,4 +260,16 @@ no-guix:
 	echo "   guix/guix-daemon executables — hardened image: $$in_hardened   control image: $$in_control"; \
 	test "$$in_control" -ge 1 || { echo "FAIL: the ship-guix? #t control image has NO guix binary — the probe is broken or the toggle stopped mattering; the test cannot discriminate." >&2; exit 1; }; \
 	test "$$in_hardened" -eq 0 || { echo "FAIL: the hardened (ship-guix? #f) image STILL contains a guix/guix-daemon binary — the imperative surface was not removed." >&2; exit 1; }; \
-	echo "PASS: the hardened image is guix-free (no in-image guix install possible) while the ship-guix? #t control ships the surface — image-swap-only by construction, proven at the artifact level, independent of the shipped target."
+	echo ">> adversarial: a hardened image that bypasses the static pre-filter (runtime ref to guix) must FAIL the closure gate"; \
+	adv_log=`mktemp`; \
+	if $(GUIX) build "$$adversarial_drv" >"$$adv_log" 2>&1; then \
+	  echo "FAIL: the adversarial ship-guix? #f image BUILT — the closure gate did NOT trip; guix entered the closure undetected by both the static pre-filter and the gate." >&2; \
+	  tail -20 "$$adv_log" >&2; rm -f "$$adv_log"; exit 1; \
+	fi; \
+	if ! grep -q "STILL contains a guix" "$$adv_log"; then \
+	  echo "FAIL: the adversarial build failed, but NOT at the guix-free gate (unexpected error) — cannot credit the gate:" >&2; \
+	  tail -20 "$$adv_log" >&2; rm -f "$$adv_log"; exit 1; \
+	fi; \
+	rm -f "$$adv_log"; \
+	echo "   ok: the adversarial hardened image was REJECTED by the closure gate (guix-in-closure detected)"; \
+	echo "PASS: ship-guix? #f is a closure-level, build-enforced guarantee — the gated hardened image is guix-free (and reproducible), the control ships the surface, and an image that smuggles guix past the static pre-filter via a runtime reference is REFUSED at build time (manifest-agnostic, not a name scan)."

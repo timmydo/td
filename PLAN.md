@@ -235,17 +235,30 @@ tracks *where we are* on it.
       targets the OCI image, where image-swap-only is the model — the VM keeps the
       daemon it needs to be a normal Guix system in v0).
 
-      **M7 review remediation (post-M7 external review — 3 findings, all fixed).**
-      • **F1 (High) — ship-guix? #f was not a real guarantee.** The compiler only
-        deleted guix-service-type; a config with ship-guix? #f AND a manifest
-        listing `guix` still shipped guix via `packages` (confirmed: such an OS's
-        operating-system-packages contained guix). Fixed: `td-config` now REJECTS
-        the contradictory ship-guix? #f + guix-in-manifest combination at
-        construction (by package NAME, so a guix variant is caught), so the flag is
-        an honest guarantee. Regression: a verified validation row in
-        `typed-coverage` (now 18/18 rejected). Residual (documented): a manifest
-        package that PROPAGATES guix transitively is not statically detected; the
-        `no-guix` artifact rung is the backstop for the configs it builds.
+      **M7 review remediation (post-M7 external review — F1 hardened across three
+      rounds; F2/F3 fixed).**
+      • **F1 (High) — ship-guix? #f was not a real guarantee.** Worked through three
+        review rounds, each tightening the guarantee:
+        – *Round 1:* the compiler only deleted guix-service-type; ship-guix? #f with
+          a manifest LISTING `guix` still shipped it via `packages`. Added a
+          constructor rejection by package NAME.
+        – *Round 2:* a manifest package that PROPAGATES guix transitively bypassed
+          the name check. Extended the constructor to walk each package's transitive
+          propagated inputs (`manifest-has-guix?`), and added a verified regression
+          row (`typed-coverage` now 19/19 rejected).
+        – *Round 3 (current):* review showed any STATIC check is fundamentally
+          incomplete — guix still reaches the closure via a NON-propagated runtime
+          reference, or via a RENAMED package inheriting guix (name ≠ "guix").
+          **Resolution:** the static constructor check is demoted to a documented
+          fast-fail PRE-FILTER, and the real guarantee is now a CLOSURE-LEVEL BUILD
+          GATE — `(system td-hardening) guix-free-docker-image` scans the realized
+          artifact and FAILS the build on any `bin/guix`, so a hardened image is
+          guix-free OR does not build, for ANY manifest. `make no-guix` now builds
+          the gated hardened image (must succeed), `--check`s its reproducibility,
+          contrasts a guix-ful #t control, and proves the gate REFUSES an
+          adversarial manifest that smuggles guix past the pre-filter via a runtime
+          reference (verified-red: fails at the gate with its own diagnostic). The
+          F1 residual is closed: the guarantee is manifest-agnostic, not a name scan.
       • **F2 (Medium) — no-guix required the SHIPPED image to stay guix-enabled.**
         The rung's positive control was the `$(SYSTEM)` image (asserted to contain
         guix), so promoting the shipped default to hardened would have reddened the

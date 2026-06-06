@@ -10,6 +10,7 @@
 ;; `(error …)` and observing exit 0. Run as a FILE, the identical error exits 1.
 (use-modules (system td)
              (system td-typed)
+             (system td-hardening)
              (tests boot))
 
 (display "eval ok\n")

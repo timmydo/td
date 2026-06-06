@@ -344,15 +344,27 @@ expand scope.
   imperative mutation surface in place — the built OCI artifact shipped `guix` and
   `guix-daemon`, so an in-image `guix install` was physically possible. **M7 makes
   the image guix-free *by construction*:** the typed config gained a `ship-guix?`
-  field that, when `#f`, deletes `guix-service-type` (verified to be the ONLY thing
-  pulling the `guix` package into the system closure). `make no-guix` proves this
-  at the ARTIFACT level — it builds the hardened image, `--check`s it reproducible,
-  and asserts no `/bin/guix` or `/bin/guix-daemon` is in its `layer.tar` (0 entries)
-  while the default image still ships them (4). A binary absent from the image
-  cannot run, so this artifact-level claim is *stronger* than the "negative runtime
-  test" originally envisioned (a literal docker-run `guix install` check needs the
-  OCI app model, §2.3, still deferred). **Two things remain (each a spec/sign-off
-  call, not yet taken):** (1) `ship-guix?` defaults to `#t`, so the *shipped*
-  default still ships guix — flipping the default to `#f` re-baselines the §2.5
-  frozen oracle and is the human's spec decision; M7 proved the construction
+  field that, when `#f`, deletes `guix-service-type` (the service that pulls guix
+  into the BASE system closure). Deleting the service is necessary but NOT
+  sufficient on its own: external review showed a manifest package can still drag
+  guix into the closure — directly, via a propagated input, via a plain runtime
+  reference, or as a renamed/inherited package — and no static (name/propagation)
+  check in the constructor can catch all of those. So the **real, manifest-agnostic
+  guarantee is a closure-level BUILD GATE** (`(system td-hardening)
+  guix-free-docker-image`): it scans the realized artifact and FAILS the build if
+  any `/bin/guix`/`/bin/guix-daemon` is present, so a hardened image is guix-free
+  *or it does not build*. The constructor's name/propagation check is retained only
+  as a cheap fast-fail pre-filter for the obvious mistakes, explicitly not the
+  guarantee. `make no-guix` proves the guarantee end to end at the ARTIFACT/closure
+  level: it builds the gated hardened image (gate must pass), `--check`s it
+  reproducible, asserts no `/bin/guix`/`/bin/guix-daemon` in its `layer.tar` (0
+  entries) while the #t control still ships them (4), AND proves the gate REFUSES
+  an adversarial hardened manifest that smuggles guix past the pre-filter via a
+  runtime reference (the build fails at the gate with its own diagnostic). A binary
+  absent from the image cannot run, so this is *stronger* than the "negative
+  runtime test" originally envisioned (a literal docker-run `guix install` check
+  needs the OCI app model, §2.3, still deferred). **Two things remain (each a
+  spec/sign-off call, not yet taken):** (1) `ship-guix?` defaults to `#t`, so the
+  *shipped* default still ships guix — flipping the default to `#f` re-baselines the
+  §2.5 frozen oracle and is the human's spec decision; M7 proved the construction
   additively without taking it. (2) The FHS-flattened root (above) is still future.
