@@ -336,10 +336,19 @@ expand scope.
   is the lever; `make manifest-diff` proves a changed manifest is a different
   whole-image generation and `make manifest-check` proves that generation is
   reproducible and actually contains the declared package.
-  **Not yet established (triage #4):** M6 does *not* yet PROVE the absence of an
-  imperative mutation surface — the built OCI artifact still ships `guix` and
-  `guix-daemon`, so an in-image `guix install` is still physically possible. Making
-  the distro image-swap-only *by construction* (remove/disable that surface and add
-  a negative runtime test that `guix install` is unavailable/inert) is a distinct
-  future milestone, not part of M6. The other remaining parking-lot thread is the
-  FHS-flattened root (above), still future.
+  *Surface removal — M7 (on `main`, pending sign-off §4.3):* M6 left the
+  imperative mutation surface in place — the built OCI artifact shipped `guix` and
+  `guix-daemon`, so an in-image `guix install` was physically possible. **M7 makes
+  the image guix-free *by construction*:** the typed config gained a `ship-guix?`
+  field that, when `#f`, deletes `guix-service-type` (verified to be the ONLY thing
+  pulling the `guix` package into the system closure). `make no-guix` proves this
+  at the ARTIFACT level — it builds the hardened image, `--check`s it reproducible,
+  and asserts no `/bin/guix` or `/bin/guix-daemon` is in its `layer.tar` (0 entries)
+  while the default image still ships them (4). A binary absent from the image
+  cannot run, so this artifact-level claim is *stronger* than the "negative runtime
+  test" originally envisioned (a literal docker-run `guix install` check needs the
+  OCI app model, §2.3, still deferred). **Two things remain (each a spec/sign-off
+  call, not yet taken):** (1) `ship-guix?` defaults to `#t`, so the *shipped*
+  default still ships guix — flipping the default to `#f` re-baselines the §2.5
+  frozen oracle and is the human's spec decision; M7 proved the construction
+  additively without taking it. (2) The FHS-flattened root (above) is still future.

@@ -186,6 +186,55 @@ tracks *where we are* on it.
       a distinct reproducible image identity per manifest, not a persistent
       generation list).
 
+- [~] **M7 — image-swap-only BY CONSTRUCTION: remove the imperative `guix install`
+      surface (DESIGN §6 parking-lot).** GREEN + verified-red, *awaiting sign-off
+      (§4.3) — extends the immutability layer M6 opened.* M6 made image CONTENTS
+      manifest-driven but explicitly left the imperative mutation surface in place:
+      the built OCI image still shipped `guix`/`guix-daemon`, so an in-image
+      `guix install` was physically possible. M7 removes it by construction.
+      **Feasibility (verified first):** `guix` enters the system closure ONLY via
+      `guix-service-type` (from `%base-services`) — NOT via `%base-packages` or
+      `operating-system-packages` (probed). Deleting that service yields an image
+      with zero guix binaries. Landed as two small increments, each leaving the
+      loop green:
+      • **M7.1** (`f2492b6`) — `(system td-typed)` gains a validated boolean
+        `ship-guix?` field. When #f the compiler deletes `guix-service-type` via
+        `modify-services`. Default = #t, so the default config stays byte-identical
+        to the frozen oracle: `make diff` (system `z96c9kjj…`), `oci-diff` and
+        `manifest-diff` (OCI `8v1bdz2v…`) all still converge, unchanged. `make
+        typed-coverage` now proves 12/12 fields wired (ship-guix? #f diverges the
+        system drv) + 17/17 invalid values rejected; the schema-derived denominator
+        (`record-type-fields`) forced both new rows.
+      • **M7.2** (`797efc0`) — `tests/imperative-surface.scm` + `make no-guix`
+        (loop rung 11): builds the HARDENED image (default + ship-guix? #f),
+        `guix build --check`s it bit-for-bit (drv `67gdky3m…` → output
+        `faiarbq5ay0swizck81qbkh39plj1fbb-docker-image.tar.gz`, reproducible — a
+        new guix-free generation, distinct from M5's default `4x2kvsbd8g…`), then
+        cracks its `layer.tar` and asserts NO `/bin/guix` or `/bin/guix-daemon`
+        (0 entries) while the DEFAULT image DOES ship them (4) — self-discriminating
+        like manifest-check. VERIFIED-RED: flipping the helper to ship-guix? #t
+        makes the "hardened" image the default (4 guix binaries) → the in-hardened
+        ==0 assertion fails → rung exits 2; reverted.
+      The qcow2 boot rung and the frozen `td-system` (+ its M5 default image) are
+      UNTOUCHED — M7 is purely additive, like M4/M5/M6 before it.
+
+      *Honest scope (for sign-off):* M7's claim is ARTIFACT-LEVEL — the guix binary
+      is physically ABSENT from the hardened image, which is strictly stronger than
+      a docker-run "guix install fails" check (a binary not in the image cannot
+      run). Two things are deliberately NOT taken:
+      - **Flipping the shipped default to hardened.** `ship-guix?` defaults to #t so
+        the *default/shipped* image still ships guix and the §2.5 frozen oracle is
+        preserved. Flipping the default to #f re-baselines that oracle (the M4/M5/M6
+        digests change) — a spec decision for the human, not the agent. M7 proves
+        the construction is available and correct; promoting it is sign-off work.
+      - **A literal runtime `guix install` test** (docker-run the image, invoke
+        guix, assert it is inert) — that needs the OCI app model (§2.3), still
+        deferred. Artifact-absence substitutes for it and is stronger.
+      *Explicitly NOT in M7:* FHS-flattened OCI roots (DESIGN §6, the other post-v0
+      thread, still future); disabling guix on the bootable qcow2/VM path (M7
+      targets the OCI image, where image-swap-only is the model — the VM keeps the
+      daemon it needs to be a normal Guix system in v0).
+
 ## Triage remediation (post-M6 external review)
 
 An external review of the M6 work raised 6 findings; all triaged as valid and
@@ -244,9 +293,10 @@ booting the shipped artifact, and with a rung that could not fail).
    call). The "M6 entry uncommitted" sub-point was already stale (778512b).
    Commit a703b0e.
 
-The loop is now **10 rungs**: `eval diff typed-coverage oci-diff manifest-diff
-build test boot-disk oci manifest-check`. All still gated on §4.3 sign-off for
-M4/M5/M3+/M6 (these fixes harden the oracle those milestones are judged against).
+The loop is now **11 rungs** (M7 added `no-guix`): `eval diff typed-coverage
+oci-diff manifest-diff build test boot-disk oci manifest-check no-guix`. All still
+gated on §4.3 sign-off for M4/M5/M3+/M6/M7 (these fixes harden the oracle those
+milestones are judged against).
 
 ## Loop bedrock fix (pre-M4): the "single command" is now real
 
