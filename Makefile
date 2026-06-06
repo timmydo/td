@@ -19,6 +19,12 @@
 # `guix shell -C --pure -- make check`, which lacks the store/daemon exposure,
 # host-guix-pin guard, and substitute-disabling that keep the loop offline.
 
+# Recipes use bash so multi-command recipes can run under `set -euo pipefail`
+# (triage #1): a failure ANYWHERE in a `;`-chained recipe — notably a
+# `guix build --check` reproducibility failure or an unreadable artifact — must
+# abort the rung, never be swallowed so a later command's success greens it.
+SHELL   := bash
+
 GUIX    := guix time-machine -C channels.scm --
 LOAD    := -L .
 SYSTEM  := system/td.scm
@@ -168,7 +174,8 @@ oci:
 #    just the declaration.
 manifest-check:
 	@echo ">> manifest-check: build a SWAPPED-manifest OCI image and --check it"
-	@drv=`$(GUIX) repl $(LOAD) tests/manifest-image-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	@set -euo pipefail; \
+	drv=`$(GUIX) repl $(LOAD) tests/manifest-image-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the swapped OCI image derivation" >&2; exit 1; }; \
 	echo ">> swapped OCI image derivation: $$drv"; \
 	swapped_img=`$(GUIX) build "$$drv"`; \
@@ -176,7 +183,11 @@ manifest-check:
 	$(GUIX) build --check "$$drv"; \
 	echo ">> artifact check: the declared package is actually IN the built tarball"; \
 	default_img=`$(GUIX) system image $(LOAD) -t docker $(SYSTEM)`; \
-	probe() { tar xzOf "$$1" --wildcards '*/layer.tar' | tar tf - | grep -c 'hello-2.12.2/bin/hello' || true; }; \
+	probe() { \
+	  listing=`tar xzOf "$$1" --wildcards '*/layer.tar' | tar tf -` \
+	    || { echo "FAIL: could not read OCI archive $$1 (artifact missing or corrupt)" >&2; exit 1; }; \
+	  printf '%s\n' "$$listing" | grep -c 'hello-2.12.2/bin/hello' || true; \
+	}; \
 	in_swapped=`probe "$$swapped_img"`; \
 	in_default=`probe "$$default_img"`; \
 	echo "   hello/bin/hello entries — swapped image: $$in_swapped   default image: $$in_default"; \
