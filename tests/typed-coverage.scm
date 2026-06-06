@@ -41,6 +41,7 @@
              (gnu bootloader)           ;bootloader-configuration-targets
              (gnu system file-systems)  ;file-system-* accessors
              (gnu packages base)        ;hello
+             (gnu packages package-management) ;guix (F1 regression)
              (srfi srfi-1)
              (ice-9 format)
              (system td)
@@ -132,7 +133,12 @@
    (list 'ssh-challenge-response? "ssh-challenge-response? non-bool" (lambda () (td-config #:ssh-challenge-response? 1)))
    (list 'manifest "manifest non-list"              (lambda () (td-config #:manifest 42)))
    (list 'manifest "manifest non-packages"          (lambda () (td-config #:manifest (list 1 2))))
-   (list 'ship-guix? "ship-guix? non-bool"          (lambda () (td-config #:ship-guix? "yes")))))
+   (list 'ship-guix? "ship-guix? non-bool"          (lambda () (td-config #:ship-guix? "yes")))
+   ;; F1 regression: ship-guix? #f with a manifest that lists guix would
+   ;; re-introduce the imperative surface via `packages` (the service deletion
+   ;; alone does NOT make the image guix-free). The constructor must reject this
+   ;; contradictory combination.
+   (list 'ship-guix? "ship-guix? #f + guix in manifest" (lambda () (td-config #:ship-guix? #f #:manifest (list guix))))))
 
 (define (raises? thunk)
   (catch #t (lambda () (thunk) #f) (lambda _ #t)))

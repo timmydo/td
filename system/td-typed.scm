@@ -120,6 +120,12 @@
 (define (package-list? x)
   (and (list? x) (every package? x)))
 
+;; Does a manifest list the `guix` package? Checked by NAME (not object identity)
+;; so a guix variant is caught too. Used to reject the contradictory
+;; ship-guix? #f + guix-in-manifest combination — see the constructor.
+(define (manifest-has-guix? manifest)
+  (any (lambda (p) (string=? (package-name p) "guix")) manifest))
+
 ;;;
 ;;; The smart constructor. Keyword-driven with defaults that, taken together,
 ;;; describe EXACTLY the system the hand-written `td-system` declares — so
@@ -153,6 +159,20 @@
   (check boolean? 'ssh-challenge-response? ssh-challenge-response? "a boolean")
   (check package-list? 'manifest manifest "a list of <package>")
   (check boolean? 'ship-guix? ship-guix? "a boolean")
+  ;; Cross-field (M7, triage F1): ship-guix? #f promises an image with NO
+  ;; imperative guix surface. Deleting guix-service-type removes the
+  ;; service-provided guix, but a manifest that LISTS the guix package would
+  ;; re-introduce it through `packages` — so ship-guix? #f + guix-in-manifest is a
+  ;; contradiction that silently ships the surface. Reject it here so ship-guix? #f
+  ;; is an honest guarantee, not just a service toggle. (Residual, documented: a
+  ;; manifest package that PROPAGATES guix transitively is not statically detected
+  ;; here; the `no-guix` artifact rung is the backstop for the configs it builds.)
+  (when (and (not ship-guix?) (manifest-has-guix? manifest))
+    (error (string-append
+            "td-config: ship-guix? #f is incompatible with a manifest that "
+            "contains the `guix` package — that would re-introduce the imperative "
+            "`guix install` surface the flag removes. Drop guix from the manifest "
+            "or set ship-guix? #t.")))
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?

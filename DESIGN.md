@@ -191,15 +191,19 @@ One milestone at a time; each is its own passing, reproducible, committed accept
 test.
 
 **Implemented continuation of step 5 (pending human sign-off, §4.3).** The "extend"
-slot has so far been realized as two milestones that pull §6 parking-lot threads. Both
+slot has so far been realized as three milestones that pull §6 parking-lot threads. All
 are on `main`, green, with verified-red differentials, but await sign-off before merge
 (they cross into new layers): **M5** — the same declaration also lowers to a
 reproducible Docker/OCI image; **M6** — manifest-driven, image-swap-only *build
 interface*: image contents are a declarative function of a typed `manifest`, and a
-changed manifest is a whole new reproducible image generation. (M6 establishes the
-declarative interface only; it does NOT yet remove the imperative `guix install`
-surface — the built image still ships `guix`/`guix-daemon`. Proving that surface
-absent is a distinct future milestone; see the parking-lot note in §6.)
+changed manifest is a whole new reproducible image generation; **M7** — image-swap-only
+*by construction*: the typed `ship-guix?` field (when #f) deletes `guix-service-type` so
+the realized OCI image carries no `guix`/`guix-daemon` binary, removing the imperative
+`guix install` surface M6 left in place. (M7's claim is artifact-level — the binary is
+physically absent, proven by `make no-guix`; the field defaults to #t so the *shipped*
+default still ships guix and the §2.5 frozen oracle is preserved. Flipping that default
+to #f re-baselines the oracle and is itself a sign-off decision; a literal docker-run
+runtime check needs the OCI app model, §2.3, still deferred. See the §6 parking-lot note.)
 See `PLAN.md` for the per-milestone status and digests. Promoting these from "extend"
 into numbered ladder rungs is a spec decision for the human reviewer.
 

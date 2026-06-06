@@ -235,6 +235,29 @@ tracks *where we are* on it.
       targets the OCI image, where image-swap-only is the model — the VM keeps the
       daemon it needs to be a normal Guix system in v0).
 
+      **M7 review remediation (post-M7 external review — 3 findings, all fixed).**
+      • **F1 (High) — ship-guix? #f was not a real guarantee.** The compiler only
+        deleted guix-service-type; a config with ship-guix? #f AND a manifest
+        listing `guix` still shipped guix via `packages` (confirmed: such an OS's
+        operating-system-packages contained guix). Fixed: `td-config` now REJECTS
+        the contradictory ship-guix? #f + guix-in-manifest combination at
+        construction (by package NAME, so a guix variant is caught), so the flag is
+        an honest guarantee. Regression: a verified validation row in
+        `typed-coverage` (now 18/18 rejected). Residual (documented): a manifest
+        package that PROPAGATES guix transitively is not statically detected; the
+        `no-guix` artifact rung is the backstop for the configs it builds.
+      • **F2 (Medium) — no-guix required the SHIPPED image to stay guix-enabled.**
+        The rung's positive control was the `$(SYSTEM)` image (asserted to contain
+        guix), so promoting the shipped default to hardened would have reddened the
+        rung. Fixed: the control is now an explicit `(td-config #:ship-guix? #t)`
+        FIXTURE, independent of `$(SYSTEM)` — the rung proves the CONSTRUCTION
+        (ship-guix? toggles the surface) regardless of what td ships, so it never
+        blocks the promotion. Verified-red on the new structure (flip the hardened
+        fixture to #t → 4 binaries → exit 2).
+      • **F3 (Low) — DESIGN self-contradiction.** §2.4 said only M5/M6 implemented
+        and surface removal was future, contradicting §6's "M7 implemented".
+        Reconciled §2.4 to list M7 (artifact-level, default #t, pending sign-off).
+
 ## Triage remediation (post-M6 external review)
 
 An external review of the M6 work raised 6 findings; all triaged as valid and

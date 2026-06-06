@@ -200,43 +200,48 @@ manifest-check:
 
 # 6. M7 imperative-surface removal — image-swap-only BY CONSTRUCTION (DESIGN §6).
 #    M6 made image CONTENTS manifest-driven but left the imperative mutation
-#    surface: the shipped image still ships `guix`/`guix-daemon`, so an in-image
+#    surface: the built image still ships `guix`/`guix-daemon`, so an in-image
 #    `guix install` is physically possible. The typed `ship-guix?` field removes
 #    it (deletes guix-service-type). This rung proves that REMOVAL at the artifact
-#    level, self-discriminating like `manifest-check`:
-#      • build the HARDENED image (default config + ship-guix? #f), `--check` it
-#        bit-for-bit (a non-reproducible artifact is a FAILING test, prime
-#        directive 1), then crack its layer.tar and assert NO `bin/guix` /
-#        `bin/guix-daemon` is present — the surface is physically absent.
-#      • build the DEFAULT (shipped) image and assert it DOES contain those
-#        binaries — this is the verified-RED half baked in: if the probe stopped
-#        finding guix, or the default silently lost it, this side reddens, so a
-#        green proves the rung can tell guix-ful from guix-free.
+#    level, self-discriminating like `manifest-check`, against TWO explicit
+#    typed-config fixtures (triage F2 — NOT the shipped `$(SYSTEM)` target, so
+#    promoting the shipped default to hardened never reddens this rung):
+#      • HARDENED = (td-config #:ship-guix? #f): build it, `--check` it bit-for-bit
+#        (a non-reproducible artifact is a FAILING test, prime directive 1), then
+#        crack its layer.tar and assert NO `bin/guix` / `bin/guix-daemon` — the
+#        surface is physically absent.
+#      • CONTROL = (td-config #:ship-guix? #t): assert it DOES contain those
+#        binaries — the verified-RED half baked in: if the probe stopped finding
+#        guix, or the toggle stopped mattering, this side reddens, so a green
+#        proves the rung can tell guix-ful from guix-free.
 #    This is an ARTIFACT-level (binary-absent) claim, which is STRONGER than the
 #    deferred docker-run "guix install fails" runtime check (§2.3 OCI app model):
 #    a binary that is not in the image cannot run. Hardened closure is a subset of
-#    the warm default, so it pulls nothing cold; heaviest rung → runs last (§1.3).
+#    the warm control, so it pulls nothing cold; heaviest rung → runs last (§1.3).
 #    Two-step lower-then-realise (repl → guix build) for honest exit status, as
 #    `test`/`manifest-check`.
 no-guix:
 	@echo ">> no-guix: build the HARDENED (guix-free) OCI image and prove the imperative surface is gone"
 	@set -euo pipefail; \
-	drv=`$(GUIX) repl $(LOAD) tests/imperative-surface.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
-	test -n "$$drv" || { echo "ERROR: could not lower the hardened OCI image derivation" >&2; exit 1; }; \
-	echo ">> hardened OCI image derivation: $$drv"; \
-	hardened_img=`$(GUIX) build "$$drv"`; \
+	drvs=`$(GUIX) repl $(LOAD) tests/imperative-surface.scm 2>/dev/null`; \
+	hardened_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_HARDENED=//p'`; \
+	control_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_CONTROL=//p'`; \
+	test -n "$$hardened_drv" -a -n "$$control_drv" || { echo "ERROR: could not lower the hardened/control OCI image derivations" >&2; exit 1; }; \
+	echo ">> hardened OCI image derivation: $$hardened_drv"; \
+	echo ">> control  OCI image derivation: $$control_drv"; \
+	hardened_img=`$(GUIX) build "$$hardened_drv"`; \
+	control_img=`$(GUIX) build "$$control_drv"`; \
 	echo ">> check: reproducibility of the HARDENED OCI image derivation"; \
-	$(GUIX) build --check "$$drv"; \
-	echo ">> artifact check: the imperative guix surface is ABSENT from the hardened image and PRESENT in the default"; \
-	default_img=`$(GUIX) system image $(LOAD) -t docker $(SYSTEM)`; \
+	$(GUIX) build --check "$$hardened_drv"; \
+	echo ">> artifact check: the imperative guix surface is ABSENT from the hardened image and PRESENT in the control"; \
 	probe() { \
 	  listing=`tar xzOf "$$1" --wildcards '*/layer.tar' | tar tf -` \
 	    || { echo "FAIL: could not read OCI archive $$1 (artifact missing or corrupt)" >&2; exit 1; }; \
 	  printf '%s\n' "$$listing" | grep -Ec '/bin/guix(-daemon)?$$' || true; \
 	}; \
 	in_hardened=`probe "$$hardened_img"`; \
-	in_default=`probe "$$default_img"`; \
-	echo "   guix/guix-daemon executables — hardened image: $$in_hardened   default image: $$in_default"; \
-	test "$$in_default" -ge 1 || { echo "FAIL: the default image has NO guix binary — the probe is broken or the default unexpectedly lacks the surface; the test cannot discriminate." >&2; exit 1; }; \
+	in_control=`probe "$$control_img"`; \
+	echo "   guix/guix-daemon executables — hardened image: $$in_hardened   control image: $$in_control"; \
+	test "$$in_control" -ge 1 || { echo "FAIL: the ship-guix? #t control image has NO guix binary — the probe is broken or the toggle stopped mattering; the test cannot discriminate." >&2; exit 1; }; \
 	test "$$in_hardened" -eq 0 || { echo "FAIL: the hardened (ship-guix? #f) image STILL contains a guix/guix-daemon binary — the imperative surface was not removed." >&2; exit 1; }; \
-	echo "PASS: the hardened image is guix-free (no in-image guix install possible) while the default image ships the surface — image-swap-only by construction, proven at the artifact level."
+	echo "PASS: the hardened image is guix-free (no in-image guix install possible) while the ship-guix? #t control ships the surface — image-swap-only by construction, proven at the artifact level, independent of the shipped target."
