@@ -77,10 +77,13 @@
    (cons 'ssh-password-auth?    (td-config #:ssh-password-auth? #t))
    (cons 'ssh-challenge-response? (td-config #:ssh-challenge-response? #t))
    (cons 'manifest             (td-config #:manifest (cons hello %base-packages)))
-   ;; M7: ship-guix? #f deletes guix-service-type, shrinking the system closure
-   ;; (a subset — it pulls nothing cold, safe for this substitutes-off rung) and
-   ;; so diverging the system drv from the oracle. Proves the field is wired.
-   (cons 'ship-guix?           (td-config #:ship-guix? #f))))
+   ;; M7: ship-guix? is now #f by default (the oracle is guix-free), so the
+   ;; divergent NON-default value is #t — it keeps guix-service-type and drops the
+   ;; guix-free-marker, GROWING the system closure relative to the guix-free
+   ;; oracle and so diverging the system drv. (It pulls nothing cold — guix is in
+   ;; the warm base closure — so it stays safe for this substitutes-off rung.)
+   ;; Proves the field is wired.
+   (cons 'ship-guix?           (td-config #:ship-guix? #t))))
 
 ;; (C) Structural wiring — for the three fields that drv-divergence (A) cannot
 ;; probe. Each row is (FIELD-SYMBOL PERTURBED-CONFIG PREDICATE): we lower the

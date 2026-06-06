@@ -3,12 +3,21 @@
 ;; This is the smallest operating-system declaration that builds into a bootable
 ;; image (DESIGN.md §2.1). Keep it minimal; later milestones add services and
 ;; harden them on top of this.
+;;
+;; It is also the FROZEN differential oracle (DESIGN §2.5): the typed front-end
+;; (system td-typed) independently reconstructs this system and the M4/M5/M6
+;; differentials prove they converge to the same store paths. As of the M7 sign-off
+;; (2026-06-06, §4.3) td ships guix-free by construction, so this oracle was
+;; re-baselined to the guix-free system (no guix-service-type, guix-free-marker
+;; embedded) — matching the typed default `(td-config)` at its new digest.
 (define-module (system td)
   #:use-module (gnu)
   #:use-module (gnu bootloader grub)
+  #:use-module (gnu services base)       ;guix-service-type (deleted when guix-free)
   #:use-module (gnu services networking)
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
+  #:use-module (system td-hardening)     ;guix-free-marker (embedded build gate)
   #:export (td-system
             td-ssh-configuration))
 
@@ -46,14 +55,36 @@
              (type "ext4"))
            %base-file-systems))
 
+    ;; Guix-free by construction (M7, shipped default signed off 2026-06-06,
+    ;; DESIGN §4.3). td ships an image-swap-only distro: the realized image carries
+    ;; no `guix`/`guix-daemon`, so there is no imperative `guix install` surface.
+    ;; The `guix-free-marker` is a build-time package whose build FAILS if any
+    ;; bin/guix is in %base-packages' closure; because it lives in `packages`,
+    ;; EVERY lowering (qcow2, docker, bare) builds it, so a guix-ful regression
+    ;; refuses to build rather than silently shipping guix. This mirrors EXACTLY
+    ;; what `td-config->operating-system` emits for a `ship-guix? #f` config
+    ;; (the typed default), so the M4/M5/M6 differentials converge on this oracle —
+    ;; and convergence in turn ENFORCES the marker here (drop it and `make diff`
+    ;; reddens). See (system td-hardening).
+    (packages (cons (guix-free-marker %base-packages) %base-packages))
+
+    ;; sshd requires 'networking; %base-services provides only 'loopback. dhcpcd
+    ;; brings up the VM's QEMU user-mode NIC and provides 'networking — the same
+    ;; wiring upstream's own ssh system test uses. `(delete guix-service-type)`
+    ;; removes the guix-daemon (the service that pulls guix into the base closure),
+    ;; completing the guix-free guarantee the marker above enforces on `packages`.
+    ;; `guix-free-privsep-service` restores the sshd privsep dir (/var/empty) that
+    ;; guix-service-type used to set up as a side effect (via the build users whose
+    ;; home is /var/empty) — without it a guix-free sshd aborts every connection
+    ;; ("/var/empty must be owned by root and not group or world-writable"). See
+    ;; (system td-hardening).
     (services
-     (cons* ;; sshd requires 'networking; %base-services provides only
-            ;; 'loopback. dhcpcd brings up the VM's QEMU user-mode NIC and
-            ;; provides 'networking — the same wiring upstream's own ssh system
-            ;; test uses.
-            (service dhcpcd-service-type)
-            (service openssh-service-type td-ssh-configuration)
-            %base-services))))
+     (modify-services
+         (cons* (service dhcpcd-service-type)
+                (service openssh-service-type td-ssh-configuration)
+                guix-free-privsep-service
+                %base-services)
+       (delete guix-service-type)))))
 
 ;; Allow `guix system build system/td.scm` to pick up the declaration.
 td-system

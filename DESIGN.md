@@ -190,22 +190,30 @@ does far better climbing a ladder of green bars than holding a monolith in conte
 One milestone at a time; each is its own passing, reproducible, committed acceptance
 test.
 
-**Implemented continuation of step 5 (pending human sign-off, §4.3).** The "extend"
-slot has so far been realized as three milestones that pull §6 parking-lot threads. All
-are on `main`, green, with verified-red differentials, but await sign-off before merge
-(they cross into new layers): **M5** — the same declaration also lowers to a
-reproducible Docker/OCI image; **M6** — manifest-driven, image-swap-only *build
-interface*: image contents are a declarative function of a typed `manifest`, and a
-changed manifest is a whole new reproducible image generation; **M7** — image-swap-only
-*by construction*: the typed `ship-guix?` field (when #f) deletes `guix-service-type` so
-the realized OCI image carries no `guix`/`guix-daemon` binary, removing the imperative
-`guix install` surface M6 left in place. (M7's claim is artifact-level — the binary is
-physically absent, proven by `make no-guix`; the field defaults to #t so the *shipped*
-default still ships guix and the §2.5 frozen oracle is preserved. Flipping that default
-to #f re-baselines the oracle and is itself a sign-off decision; a literal docker-run
-runtime check needs the OCI app model, §2.3, still deferred. See the §6 parking-lot note.)
-See `PLAN.md` for the per-milestone status and digests. Promoting these from "extend"
-into numbered ladder rungs is a spec decision for the human reviewer.
+**Implemented continuation of step 5 (human-signed-off 2026-06-06, §4.3).** The
+"extend" slot has so far been realized as milestones that pull §6 parking-lot threads,
+all on `main`, green, with verified-red differentials. They were **signed off on
+2026-06-06**: **M5** — the same declaration also lowers to a reproducible Docker/OCI
+image; **M6** — manifest-driven, image-swap-only *build interface*: image contents are a
+declarative function of a typed `manifest`, and a changed manifest is a whole new
+reproducible image generation; **M7** — image-swap-only *by construction*: the typed
+`ship-guix?` field (when #f) deletes `guix-service-type` and embeds a closure-level
+`guix-free-marker`, so the realized image carries no `guix`/`guix-daemon` binary,
+removing the imperative `guix install` surface M6 left in place.
+
+**With that sign-off, the shipped default was flipped to guix-free.** `ship-guix?` now
+defaults to **#f**, so the WHOLE distro td ships — the bootable qcow2/VM *and* the OCI
+image — is guix-free by construction (the single `system/td.scm` declaration lowers to
+both). The §2.5 frozen oracle was re-baselined to the guix-free system accordingly (new
+digests in `PLAN.md`); the three differentials still converge on it. Making the VM
+guix-free surfaced one real dependency `guix-service-type` had been providing as a side
+effect — sshd's privsep directory `/var/empty` (root:root 0755, set up via the build
+users whose home is `/var/empty`); a guix-free system restores it explicitly via
+`guix-free-privsep-service` (see `(system td-hardening)`), without which sshd aborts
+every connection. A literal docker-run runtime check still needs the OCI app model
+(§2.3, deferred). See the §6 parking-lot note. Promoting these from "extend" into
+numbered ladder rungs (M3+ login control included) remains a spec decision for the human
+reviewer; this sign-off is on the *implementations*, not their ladder numbering.
 
 ### 2.5 Replacement order and the oracle for each swap
 
@@ -368,8 +376,14 @@ expand scope.
   reference FAILS at the embedded marker (with its own diagnostic). A binary absent
   from the image cannot run, so this is *stronger* than the "negative runtime test"
   originally envisioned (a literal docker-run `guix install` check needs the OCI app
-  model, §2.3, still deferred). **Two things remain (each a
-  spec/sign-off call, not yet taken):** (1) `ship-guix?` defaults to `#t`, so the
-  *shipped* default still ships guix — flipping the default to `#f` re-baselines the
-  §2.5 frozen oracle and is the human's spec decision; M7 proved the construction
-  additively without taking it. (2) The FHS-flattened root (above) is still future.
+  model, §2.3, still deferred). **Status of the two follow-ups:** (1) **DONE
+  (signed off 2026-06-06).** `ship-guix?` now defaults to `#f`: the shipped default —
+  bootable qcow2/VM *and* OCI image — is guix-free by construction. The §2.5 frozen
+  oracle was re-baselined to the guix-free system (the single declaration was edited to
+  delete `guix-service-type` and embed `guix-free-marker` exactly as the typed `#f` path
+  does, so the three differentials still converge — at new digests recorded in
+  `PLAN.md`). Re-baselining surfaced that `guix-service-type` had been providing sshd's
+  privsep dir `/var/empty` (root:root 0755) as a side effect of its build-user accounts;
+  the guix-free system restores it via `guix-free-privsep-service` (`(system
+  td-hardening)`), proven by the marionette boot rung (key-based SSH login still
+  succeeds). (2) The FHS-flattened root (above) is still future.

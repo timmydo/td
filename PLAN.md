@@ -28,9 +28,9 @@ tracks *where we are* on it.
       ⚠️ While doing M3 I discovered the **behavioral rung had been false-green since
       M1** — see "Loop-integrity fixes" below. M1/M2 assertions only began actually
       running once those were fixed (they now pass for real).
-- [~] **M4 — Typed config front-end compiling to gexps; differential: same store
-      paths as the hand-written gexp.** GREEN + verified-red, *awaiting human
-      sign-off before merge (DESIGN §4.3).* New `(system td-typed)`: a validated
+- [x] **M4 — Typed config front-end compiling to gexps; differential: same store
+      paths as the hand-written gexp.** GREEN + verified-red, **signed off
+      2026-06-06 (DESIGN §4.3).** New `(system td-typed)`: a validated
       typed record (`td-config`, a smart constructor that rejects bad
       type/range — port range, fs-type set, booleans — verified rejecting) and a
       compiler `td-config->operating-system` that independently rebuilds the
@@ -43,9 +43,9 @@ tracks *where we are* on it.
       the STDIN-swallow path). Image derivation unchanged (`a82grxjny…`) — the
       front-end is purely additive. Signed off (§4.3). Commit: 465a6ea
       (bedrock fix: d6a1220).
-- [~] **M5 — OCI image artifact: the declaration also lowers to a reproducible
+- [x] **M5 — OCI image artifact: the declaration also lowers to a reproducible
       Docker/OCI image with a deterministic digest.** GREEN + verified-discriminating,
-      *awaiting human sign-off before merge (§4.3)* — crosses §2.3 "OCI app model".
+      **signed off 2026-06-06 (§4.3)** — crosses §2.3 "OCI app model".
       Pulls the north-star "store path doubles as OCI digest" thread (§0): the SAME
       `system/td.scm` that boots as a VM (M1–M4) now also lowers to a Docker/OCI
       image, via `(image-with-os docker-image os)` + `system-image` (exactly what
@@ -104,8 +104,8 @@ tracks *where we are* on it.
       less-frequent rung, with the cheap derivation-level diff (b/c) in the fast
       path. Decide placement when implementing.
 
-- [~] **M3+ — positive SSH login control (closes the M3 "denied ≠ usable" gap).**
-      GREEN + verified-red, *awaiting sign-off (§4.3, security-adjacent).* M3 only
+- [x] **M3+ — positive SSH login control (closes the M3 "denied ≠ usable" gap).**
+      GREEN + verified-red, **signed off 2026-06-06 (§4.3, security-adjacent).** M3 only
       proved password auth is *not advertised*; it never proved a legitimate login
       *works*. New assertion in `tests/boot.scm`: a committed throwaway ed25519
       keypair (`tests/keys/td_test_ed25519{,.pub}`, README marks it test-only) is
@@ -121,8 +121,8 @@ tracks *where we are* on it.
       (4 pass / 1 unexpected failure, builder exits 1, rung exits 2), then reverted.
       Commit: aa00716.
 
-- [~] **M6 — manifest-driven, image-swap-only INTERFACE (DESIGN §6).** GREEN +
-      verified-red, *awaiting sign-off (§4.3) — extends the OCI layer M5 opened.*
+- [x] **M6 — manifest-driven, image-swap-only INTERFACE (DESIGN §6).** GREEN +
+      verified-red, **signed off 2026-06-06 (§4.3) — extends the OCI layer M5 opened.**
       Makes image package contents a declarative function of a *manifest*: the
       intended way to change what the image contains is to declare a different
       manifest and rebuild the WHOLE image — a wholesale swap, never an in-place
@@ -186,9 +186,10 @@ tracks *where we are* on it.
       a distinct reproducible image identity per manifest, not a persistent
       generation list).
 
-- [~] **M7 — image-swap-only BY CONSTRUCTION: remove the imperative `guix install`
-      surface (DESIGN §6 parking-lot).** GREEN + verified-red, *awaiting sign-off
-      (§4.3) — extends the immutability layer M6 opened.* M6 made image CONTENTS
+- [x] **M7 — image-swap-only BY CONSTRUCTION: remove the imperative `guix install`
+      surface (DESIGN §6 parking-lot).** GREEN + verified-red, **signed off
+      2026-06-06 (§4.3), and the shipped default flipped to guix-free (see "M7
+      promotion" below) — extends the immutability layer M6 opened.** M6 made image CONTENTS
       manifest-driven but explicitly left the imperative mutation surface in place:
       the built OCI image still shipped `guix`/`guix-daemon`, so an in-image
       `guix install` was physically possible. M7 removes it by construction.
@@ -279,6 +280,53 @@ tracks *where we are* on it.
         and surface removal was future, contradicting §6's "M7 implemented".
         Reconciled §2.4 to list M7 (artifact-level, default #t, pending sign-off).
 
+## M7 promotion — shipped default flipped to guix-free (signed off 2026-06-06)
+
+Human sign-off (§4.3) on the whole M4–M7 stack, AND the spec decision to **ship the
+guix-free distro**: `ship-guix?` now defaults to **#f**. Because the single
+`system/td.scm` declaration lowers to BOTH the bootable qcow2/VM and the OCI image, the
+WHOLE distro is now guix-free by construction (the user explicitly chose "whole distro
+guix-free", not OCI-only). All 11 rungs GREEN.
+
+- **The flip.** `td-config`'s `ship-guix?` default #t → #f (`system/td-typed.scm`).
+- **Oracle re-baselined (§2.5).** The frozen hand-written `td-system` (`system/td.scm`)
+  was edited to the guix-free system — `(modify-services … (delete guix-service-type))`
+  plus `(cons (guix-free-marker %base-packages) %base-packages)` — i.e. byte-for-byte
+  what `td-config->operating-system` emits for a `#f` config. So `make diff` /
+  `oci-diff` / `manifest-diff` still CONVERGE, now at guix-free digests. Bonus: the
+  differential now *enforces* the marker on the oracle (drop it → diff reddens).
+- **`typed-coverage` ship-guix? wiring row** flipped #f → #t (the divergent non-default
+  value, since the oracle is now #f). 12/12 wired, 19/19 rejected — unchanged otherwise.
+- **Real discovery (the VM-guix-free hurdle the old M7 note had deferred):** a guix-free
+  Guix `operating-system` breaks inetd sshd — every connection reset at
+  `kex_exchange_identification`. Root cause (from `/var/log/secure`): `sshd[…]: fatal:
+  /var/empty must be owned by root and not group or world-writable.` `guix-service-type`
+  had been creating `/var/empty` as `root:root 0755` as a side effect of its
+  `guixbuilder` accounts (whose home is `/var/empty`); deleting it removed that. Fix:
+  `guix-free-privsep-service` in `(system td-hardening)` (an `activation-service-type`
+  snippet ensuring `/var/empty` root:root 0755), added to the `#f` path of BOTH the
+  oracle and the typed compiler so they still converge. Diagnosed by booting the VM and
+  dumping the guest's privsep user / `/var/empty` / syslog; confirmed against a guix-ful
+  baseline (which passed 5/5) to prove it was the flip, not the environment. (Aside: an
+  `init[1]` guile segfault appears early in every boot, INCLUDING the guix-ful baseline —
+  pre-existing, harmless, in the initrd; not introduced here.)
+- **Re-baselined digests (guix-free), per the parking-lot digest convention:**
+  – system drv (oracle): `rxbyhfc70s7qldkcah0a8rf29z9pij6p-system.drv` (was guix-ful
+    `z96c9kjj…`); perturbed ssh-port 2222 → `pb06pj1rvca71d7j0lb8ssmisgyllrmm`.
+  – default OCI image drv (oracle): `d4fn2m2vf6rhhgvj4cish3023a7kvpp4-docker-image.tar.gz.drv`
+    (was `8v1bdz2v…`); perturbed → `z9f9kjb0rp7y3r7adlr265qiizd5ppd4`.
+  – default qcow2 output: `rgp5cdjpmjcg5jdzqp85gfc5byv8rhi6-image.qcow2` (reproducible).
+  – default docker output: `n3ds4yhw5v49yi53426pc0sbmibc3dl7-docker-image.tar.gz`.
+  – swapped (+hello) / no-guix hardened drv: `vkm5wlx6fl5ly3c11qplvall1ryhxd17-…` →
+    output `z539zlhhj0r35lqj04zqn62z4xcazbr4-docker-image.tar.gz`.
+  – no-guix CONTROL is now the explicit `(td-config #:ship-guix? #t)` fixture, whose OCI
+    drv is the OLD guix-ful default `8v1bdz2v68gkbzybbaq4875a5flh2kvp` (4 guix binaries;
+    hardened ships 0) — the F2-decoupled control, unaffected by the default flip.
+- **Still NOT taken (unchanged):** FHS-flattened OCI roots (DESIGN §6, future); a literal
+  docker-run `guix install` runtime check (needs the OCI app model, §2.3 — artifact
+  absence is strictly stronger); promoting M5/M6/M7/M3+ from "extend" to numbered ladder
+  rungs (DESIGN §2.4 — a separate spec decision, not part of this sign-off).
+
 ## Triage remediation (post-M6 external review)
 
 An external review of the M6 work raised 6 findings; all triaged as valid and
@@ -338,9 +386,10 @@ booting the shipped artifact, and with a rung that could not fail).
    Commit a703b0e.
 
 The loop is now **11 rungs** (M7 added `no-guix`): `eval diff typed-coverage
-oci-diff manifest-diff build test boot-disk oci manifest-check no-guix`. All still
-gated on §4.3 sign-off for M4/M5/M3+/M6/M7 (these fixes harden the oracle those
-milestones are judged against).
+oci-diff manifest-diff build test boot-disk oci manifest-check no-guix`. M4/M5/M3+/M6/M7
+were **signed off 2026-06-06** (§4.3) and the shipped default flipped to guix-free
+(see "M7 promotion" above); these fixes hardened the oracle those milestones were judged
+against.
 
 ## Loop bedrock fix (pre-M4): the "single command" is now real
 

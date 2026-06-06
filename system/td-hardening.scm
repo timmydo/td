@@ -30,7 +30,30 @@
   #:use-module (guix gexp)
   #:use-module (guix build-system trivial)
   #:use-module ((guix licenses) #:prefix license:)
-  #:export (guix-free-marker))
+  #:use-module (gnu services)            ;simple-service, activation-service-type
+  #:export (guix-free-marker
+            guix-free-privsep-service))
+
+;; A guix-free system needs its sshd privilege-separation directory set up
+;; explicitly. On a normal (guix-ful) Guix system, `guix-service-type` declares
+;; the `guixbuilder` build users whose home is `/var/empty`, and creating those
+;; accounts leaves `/var/empty` owned `root:root` mode 0755 — exactly what sshd's
+;; privsep requires. Deleting `guix-service-type` (ship-guix? #f) removes that
+;; side effect, so `/var/empty` ends up with perms sshd rejects ("must be owned by
+;; root and not group or world-writable"), and every per-connection `sshd -i`
+;; child aborts at startup. This activation snippet restores the invariant
+;; directly, so a guix-free td system runs sshd. It is added to the #f path of
+;; BOTH the hand-written oracle (system td) and the typed compiler
+;; (td-config->operating-system), identically, so the M4/M5/M6 differentials keep
+;; converging (cf. `guix-free-marker`). chown/chmod/mkdir/file-exists? are core
+;; Guile, so the snippet needs no extra modules in the activation context.
+(define guix-free-privsep-service
+  (simple-service 'td-sshd-privsep activation-service-type
+                  #~(begin
+                      (unless (file-exists? "/var/empty")
+                        (mkdir "/var/empty"))
+                      (chown "/var/empty" 0 0)
+                      (chmod "/var/empty" #o755))))
 
 (define (guix-free-marker packages)
   "Return a trivial <package> that builds to an empty output IFF none of PACKAGES'

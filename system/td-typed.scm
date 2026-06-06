@@ -23,7 +23,7 @@
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
   #:use-module (guix packages)
-  #:use-module (system td-hardening)     ;guix-free-marker (embedded build gate)
+  #:use-module (system td-hardening)     ;guix-free-marker, guix-free-privsep-service
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 match)
@@ -91,13 +91,16 @@
   ;; REAL, manifest-agnostic guix-free guarantee is the embedded closure-level BUILD
   ;; GATE (see (system td-hardening) `guix-free-marker`), which lives in `packages`
   ;; so EVERY lowering builds it — making a hardened image guix-free OR refuse to
-  ;; build, with no opt-in path to bypass. Defaults to #t so the default config
-  ;; stays byte-identical to the frozen oracle (§2.5); flipping the SHIPPED default
-  ;; to #f re-baselines the oracle and is a spec decision gated on §4.3 sign-off —
-  ;; M7 proves the construction additively, it does not unilaterally change what td
-  ;; ships. `make no-guix` proves the guarantee end to end: the bare #f image is
-  ;; guix-free (and reproducible), the #t image is not, and a manifest that smuggles
-  ;; guix past the pre-filter is REFUSED at build time.
+  ;; build, with no opt-in path to bypass. **Defaults to #f — the shipped default
+  ;; (signed off 2026-06-06, DESIGN §4.3): td ships a guix-free, image-swap-only
+  ;; distro BY CONSTRUCTION, VM and OCI image alike.** The frozen oracle
+  ;; (system td) was re-baselined to match — it now embeds the same marker and
+  ;; deletes guix-service-type — so the M4/M5/M6 differentials still converge, at
+  ;; the new guix-free digests. (Convergence now also ENFORCES the gate on the
+  ;; hand-written oracle: it cannot drop the marker without diverging.) `make
+  ;; no-guix` proves the guarantee end to end on explicit fixtures: the #f image is
+  ;; guix-free (and reproducible), an explicit #t image is not, and a manifest that
+  ;; smuggles guix past the pre-filter is REFUSED at build time.
   (ship-guix?             td-config-ship-guix?))
 
 ;;;
@@ -171,7 +174,7 @@
                     (ssh-password-auth? #f)
                     (ssh-challenge-response? #f)
                     (manifest %base-packages)
-                    (ship-guix? #t))
+                    (ship-guix? #f))
   (check non-empty-string? 'host-name host-name "a non-empty string")
   (check non-empty-string? 'timezone timezone "a non-empty string")
   (check non-empty-string? 'locale locale "a non-empty string")
@@ -241,9 +244,8 @@
 
     ;; The declared manifest IS the package set of the image (M6). The default
     ;; manifest is %base-packages, which is exactly the operating-system field's
-    ;; own default — so the default config lowers byte-for-byte to the frozen
-    ;; oracle (which omits this field). A non-default manifest is a different
-    ;; image: a whole-image swap, not an in-place install.
+    ;; own default. A non-default manifest is a different image: a whole-image
+    ;; swap, not an in-place install.
     ;;
     ;; M7 (F1, embedded gate): for a hardened (#f) config we ALSO prepend the
     ;; `guix-free-marker` — a build-time package whose build FAILS if guix is
@@ -251,31 +253,39 @@
     ;; EVERY lowering of this system (bare operating-system, qcow2, docker, any
     ;; helper) builds the profile and therefore the marker, so a hardened image is
     ;; guix-free OR it does not build — by construction, with no bypassable opt-in.
-    ;; For #t (the default/oracle) the package set is the manifest verbatim, so the
-    ;; default config stays byte-identical to the frozen oracle (§2.5).
+    ;; Since #f is now the SHIPPED default (signed off §4.3), the re-baselined frozen
+    ;; oracle (system td) embeds this same marker, so the default config still lowers
+    ;; byte-for-byte to it (§2.5) — at the new guix-free digest. An explicit #t
+    ;; config takes the manifest verbatim (no marker) and diverges.
     (packages (let ((manifest (td-config-manifest c)))
                 (if (td-config-ship-guix? c)
                     manifest
                     (cons (guix-free-marker manifest) manifest))))
 
-    ;; M7: when `ship-guix?` is #f, delete `guix-service-type` so the realized
-    ;; image carries no `guix`/`guix-daemon` binary — image-swap-only by
-    ;; construction (no in-image `guix install`). When #t (the default) the
-    ;; service list is exactly the frozen oracle's, so the default config stays
-    ;; byte-identical (the M4/M5/M6 differentials keep converging).
+    ;; M7: when `ship-guix?` is #f (now the shipped default), delete
+    ;; `guix-service-type` so the realized image carries no `guix`/`guix-daemon`
+    ;; binary — image-swap-only by construction (no in-image `guix install`) — AND
+    ;; add `guix-free-privsep-service`, which restores the sshd privsep dir
+    ;; (/var/empty) guix-service-type used to set up as a side effect (without it a
+    ;; guix-free sshd aborts every connection). The re-baselined oracle (system td)
+    ;; does both the same way, so the default config stays byte-identical (the
+    ;; M4/M5/M6 differentials keep converging). An explicit #t config keeps
+    ;; guix-service-type (which provides /var/empty) and omits the privsep fix, so
+    ;; it diverges.
     (services
-     (let ((svcs (cons* (service dhcpcd-service-type)
-                        (service openssh-service-type
-                                 (openssh-configuration
-                                  (port-number (td-config-ssh-port c))
-                                  (password-authentication?
-                                   (td-config-ssh-password-auth? c))
-                                  (challenge-response-authentication?
-                                   (td-config-ssh-challenge-response? c))))
-                        %base-services)))
+     (let ((dhcp (service dhcpcd-service-type))
+           (ssh  (service openssh-service-type
+                          (openssh-configuration
+                           (port-number (td-config-ssh-port c))
+                           (password-authentication?
+                            (td-config-ssh-password-auth? c))
+                           (challenge-response-authentication?
+                            (td-config-ssh-challenge-response? c))))))
        (if (td-config-ship-guix? c)
-           svcs
-           (modify-services svcs (delete guix-service-type)))))))
+           (cons* dhcp ssh %base-services)
+           (modify-services
+               (cons* dhcp ssh guix-free-privsep-service %base-services)
+             (delete guix-service-type)))))))
 
 ;; The default typed config — by construction equal in content to `td-system`.
 (define %td-default-config (td-config))
