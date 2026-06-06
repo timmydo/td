@@ -20,20 +20,30 @@
 #                                 commit, so the Makefile's `time-machine` is a
 #                                 no-op that hits the warm store (fully offline).
 #   NO --network               : on purpose. Network => substitutes => nonguix.
-#   GUIX_BUILD_OPTIONS=--no-substitutes : the daemon we share (--share=/var/guix)
-#                                 runs on the HOST and HAS network — container
-#                                 isolation does not isolate it, and it is
-#                                 configured with substitutes.nonguix.org. So
-#                                 dropping --network is NOT enough: a not-yet-warm
-#                                 path would still make the daemon query/fetch
-#                                 substitutes (incl. nonguix), violating the
-#                                 local-build-only + FSDG posture. This forbids
-#                                 substitution for every guix build/system call,
-#                                 forcing local-from-source builds (the repl-based
-#                                 diff rungs set the same via `set-build-options
-#                                 #:substitutes? #f`, since `guix repl` does not
-#                                 read this variable). The loop is then honestly
-#                                 offline, not offline-by-luck-of-a-warm-cache.
+#   guix shell --no-substitutes --no-offload : the daemon we share
+#                                 (--share=/var/guix) runs on the HOST and HAS
+#                                 network — container isolation does not isolate
+#                                 it, and it is configured with
+#                                 substitutes.nonguix.org. So dropping --network
+#                                 is NOT enough: a not-yet-warm path would still
+#                                 make the daemon query/fetch substitutes (incl.
+#                                 nonguix) or offload to a remote builder,
+#                                 violating the local-build-only + FSDG posture.
+#                                 These flags must be on the OUTER `guix shell`
+#                                 itself (triage #2): exporting GUIX_BUILD_OPTIONS
+#                                 *inside* the spawned shell is too late — by then
+#                                 the outer `guix shell` has already resolved (and,
+#                                 cold, could have fetched/offloaded) the toolchain
+#                                 profile. Passing them to `guix shell` forbids
+#                                 substitution/offload for the environment build
+#                                 too, so the loop is offline by construction.
+#   GUIX_BUILD_OPTIONS=...      : belt-and-suspenders for the guix build/system
+#                                 calls the Makefile makes INSIDE the shell (the
+#                                 repl-based diff rungs set the same via
+#                                 `set-build-options #:substitutes? #f`, since
+#                                 `guix repl` does not read this variable). The
+#                                 loop is then honestly offline, not
+#                                 offline-by-luck-of-a-warm-cache.
 set -eu
 
 cd "$(dirname "$0")"
@@ -68,8 +78,9 @@ if [ "$#" -eq 0 ]; then
 fi
 
 exec guix shell -C --pure \
+  --no-substitutes --no-offload \
   --expose=/gnu/store \
   --share="$HOME/.cache/guix" \
   --share=/var/guix \
   make bash coreutils sed grep findutils tar gzip -- \
-  bash -c 'export PATH="'"$hostguix_dir"':$PATH"; export GUIX_BUILD_OPTIONS="--no-substitutes"; exec make "$@"' -- "$@"
+  bash -c 'export PATH="'"$hostguix_dir"':$PATH"; export GUIX_BUILD_OPTIONS="--no-substitutes --no-offload"; exec make "$@"' -- "$@"
