@@ -16,8 +16,9 @@
 ;; operating-system is fully under our control and can be kept byte-identical
 ;; to the oracle — the whole point of the differential.
 (define-module (system td-typed)
-  #:use-module (gnu)
+  #:use-module (gnu)                     ;operating-system, modify-services, delete
   #:use-module (gnu bootloader grub)
+  #:use-module (gnu services base)       ;guix-service-type
   #:use-module (gnu services networking)
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
@@ -39,6 +40,7 @@
             td-config-ssh-password-auth?
             td-config-ssh-challenge-response?
             td-config-manifest
+            td-config-ship-guix?
             td-config->operating-system
             %td-default-config))
 
@@ -50,7 +52,7 @@
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?
-                  manifest)
+                  manifest ship-guix?)
   td-config?
   (host-name              td-config-host-name)
   (timezone               td-config-timezone)
@@ -68,11 +70,26 @@
   ;; rebuild the whole image — a wholesale swap, not an in-place edit of a built
   ;; image. NOTE (triage): this is an interface property only — M6 does NOT remove
   ;; the imperative `guix install` surface (the built image still ships
-  ;; `guix`/`guix-daemon`); proving that surface absent is a later milestone
-  ;; (DESIGN §6 parking-lot). A list of <package>; defaults to %base-packages so
-  ;; the default config stays byte-identical to the frozen oracle (which lets the
-  ;; field default).
-  (manifest               td-config-manifest))
+  ;; `guix`/`guix-daemon`); removing that surface is M7, via the `ship-guix?`
+  ;; field below. A list of <package>; defaults to %base-packages so the default
+  ;; config stays byte-identical to the frozen oracle (which lets the field
+  ;; default).
+  (manifest               td-config-manifest)
+  ;; M7 — image-swap-only BY CONSTRUCTION (DESIGN §6 parking-lot, the documented
+  ;; continuation of M6). M6 made image CONTENTS manifest-driven but left the
+  ;; imperative mutation surface in place: the built image still ships
+  ;; `guix`/`guix-daemon`, so an in-image `guix install` is physically possible.
+  ;; This boolean is the lever that removes that surface: when #f the compiler
+  ;; deletes `guix-service-type` — the only thing pulling the `guix` package into
+  ;; the system closure (verified empirically) — so the realized image carries no
+  ;; `guix`/`guix-daemon` binary at all and cannot be mutated in place. Defaults
+  ;; to #t so the default config stays byte-identical to the frozen oracle (§2.5);
+  ;; flipping the SHIPPED default to #f re-baselines the oracle and is a spec
+  ;; decision gated on §4.3 sign-off — M7 proves the construction additively, it
+  ;; does not unilaterally change what td ships. The negative artifact test
+  ;; (`make no-guix`) proves a #f image is genuinely guix-free while the default
+  ;; #t image is not.
+  (ship-guix?             td-config-ship-guix?))
 
 ;;;
 ;;; Validation — the "typed" guarantee. Each field is checked; a violation is a
@@ -120,7 +137,8 @@
                     (ssh-port 22)
                     (ssh-password-auth? #f)
                     (ssh-challenge-response? #f)
-                    (manifest %base-packages))
+                    (manifest %base-packages)
+                    (ship-guix? #t))
   (check non-empty-string? 'host-name host-name "a non-empty string")
   (check non-empty-string? 'timezone timezone "a non-empty string")
   (check non-empty-string? 'locale locale "a non-empty string")
@@ -134,10 +152,11 @@
   (check boolean? 'ssh-password-auth? ssh-password-auth? "a boolean")
   (check boolean? 'ssh-challenge-response? ssh-challenge-response? "a boolean")
   (check package-list? 'manifest manifest "a list of <package>")
+  (check boolean? 'ship-guix? ship-guix? "a boolean")
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?
-                  manifest))
+                  manifest ship-guix?))
 
 ;;;
 ;;; The compiler: typed config -> operating-system (a gexp-bearing value).
@@ -171,15 +190,24 @@
     ;; see the field's doc comment above re: the still-present imperative surface).
     (packages (td-config-manifest c))
 
+    ;; M7: when `ship-guix?` is #f, delete `guix-service-type` so the realized
+    ;; image carries no `guix`/`guix-daemon` binary — image-swap-only by
+    ;; construction (no in-image `guix install`). When #t (the default) the
+    ;; service list is exactly the frozen oracle's, so the default config stays
+    ;; byte-identical (the M4/M5/M6 differentials keep converging).
     (services
-     (cons* (service dhcpcd-service-type)
-            (service openssh-service-type
-                     (openssh-configuration
-                      (port-number (td-config-ssh-port c))
-                      (password-authentication? (td-config-ssh-password-auth? c))
-                      (challenge-response-authentication?
-                       (td-config-ssh-challenge-response? c))))
-            %base-services))))
+     (let ((svcs (cons* (service dhcpcd-service-type)
+                        (service openssh-service-type
+                                 (openssh-configuration
+                                  (port-number (td-config-ssh-port c))
+                                  (password-authentication?
+                                   (td-config-ssh-password-auth? c))
+                                  (challenge-response-authentication?
+                                   (td-config-ssh-challenge-response? c))))
+                        %base-services)))
+       (if (td-config-ship-guix? c)
+           svcs
+           (modify-services svcs (delete guix-service-type)))))))
 
 ;; The default typed config — by construction equal in content to `td-system`.
 (define %td-default-config (td-config))

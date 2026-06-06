@@ -74,7 +74,11 @@
    (cons 'ssh-port              (td-config #:ssh-port 2222))
    (cons 'ssh-password-auth?    (td-config #:ssh-password-auth? #t))
    (cons 'ssh-challenge-response? (td-config #:ssh-challenge-response? #t))
-   (cons 'manifest             (td-config #:manifest (cons hello %base-packages)))))
+   (cons 'manifest             (td-config #:manifest (cons hello %base-packages)))
+   ;; M7: ship-guix? #f deletes guix-service-type, shrinking the system closure
+   ;; (a subset — it pulls nothing cold, safe for this substitutes-off rung) and
+   ;; so diverging the system drv from the oracle. Proves the field is wired.
+   (cons 'ship-guix?           (td-config #:ship-guix? #f))))
 
 ;; (C) Structural wiring — for the three fields that drv-divergence (A) cannot
 ;; probe. Each row is (FIELD-SYMBOL PERTURBED-CONFIG PREDICATE): we lower the
@@ -127,7 +131,8 @@
    (list 'ssh-password-auth? "ssh-password-auth? non-bool"   (lambda () (td-config #:ssh-password-auth? "yes")))
    (list 'ssh-challenge-response? "ssh-challenge-response? non-bool" (lambda () (td-config #:ssh-challenge-response? 1)))
    (list 'manifest "manifest non-list"              (lambda () (td-config #:manifest 42)))
-   (list 'manifest "manifest non-packages"          (lambda () (td-config #:manifest (list 1 2))))))
+   (list 'manifest "manifest non-packages"          (lambda () (td-config #:manifest (list 1 2))))
+   (list 'ship-guix? "ship-guix? non-bool"          (lambda () (td-config #:ship-guix? "yes")))))
 
 (define (raises? thunk)
   (catch #t (lambda () (thunk) #f) (lambda _ #t)))
