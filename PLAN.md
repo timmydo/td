@@ -121,13 +121,18 @@ tracks *where we are* on it.
       (4 pass / 1 unexpected failure, builder exits 1, rung exits 2), then reverted.
       Commit: aa00716.
 
-- [~] **M6 — manifest-driven, image-swap-only (DESIGN §6).** GREEN + verified-red,
-      *awaiting sign-off (§4.3) — extends the OCI layer M5 opened.* Makes image
-      package contents a declarative function of a *manifest* and forbids any
-      imperative `guix install`-style mutation: the only way to change what the
-      image contains is to declare a different manifest and rebuild the WHOLE
-      image — a wholesale swap, never an in-place install. Landed as three small
-      increments, each leaving `make check` green:
+- [~] **M6 — manifest-driven, image-swap-only INTERFACE (DESIGN §6).** GREEN +
+      verified-red, *awaiting sign-off (§4.3) — extends the OCI layer M5 opened.*
+      Makes image package contents a declarative function of a *manifest*: the
+      intended way to change what the image contains is to declare a different
+      manifest and rebuild the WHOLE image — a wholesale swap, never an in-place
+      install. **Scope honesty (triage #4):** M6 proves the *build interface* is
+      manifest-driven; it does NOT yet PROVE the *absence* of an imperative
+      mutation surface — the built OCI image still ships `guix`/`guix-daemon`, so
+      an in-image `guix install` remains physically possible. Removing/disabling
+      that surface and asserting it with a negative runtime test is deferred to a
+      later milestone (see DESIGN §parking-lot). Landed as three small increments,
+      each leaving `make check` green:
       • **M6.1** (`da1ef9e`) — `(system td-typed)` gains a validated `manifest`
         field (a list of `<package>`), wired to the operating-system `packages`
         set. Default = `%base-packages` (the field's own default), so the default
@@ -278,16 +283,18 @@ discovered in M2:
    **download** it from substitute servers (which on this host include nonguix.org).
    That breaks offline/local-only (DESIGN §5) and the FSDG posture.
 
-**Fix / canonical invocation** (offline, local-only, no downloads, reproducible):
-use the host's *system* guix — which already IS the pinned commit `520785e` (verify
-with `guix describe`) — inside the container, with the full store exposed:
+**Fix / canonical invocation — now `./check.sh` (DONE, triage #6).** The wrapper
+below was the original hand-typed incantation; it is now baked into `check.sh`
+(and `make container-check`), so the single command really is `./check.sh`. The
+snippet is kept as documentation of *why* each flag is there:
 
 ```sh
 HOSTGUIX_DIR=$(dirname "$(readlink -f "$(command -v guix)")")
-guix shell -C --pure --expose=/gnu/store \
+guix shell -C --pure --no-substitutes --no-offload --expose=/gnu/store \
   --share="$HOME/.cache/guix" --share=/var/guix \
-  make bash coreutils sed grep findutils -- \
-  bash -c "export PATH=$HOSTGUIX_DIR:\$PATH; make check"
+  make bash coreutils sed grep findutils tar gzip -- \
+  bash -c "export PATH=$HOSTGUIX_DIR:\$PATH; \
+           export GUIX_BUILD_OPTIONS='--no-substitutes --no-offload'; make check"
 ```
 
 - `--expose=/gnu/store` — `-C` otherwise mounts only the profile closure, hiding the
@@ -295,14 +302,16 @@ guix shell -C --pure --expose=/gnu/store \
 - `--share="$HOME/.cache/guix"` — pinned channel checkout (avoids re-fetch).
 - `--share=/var/guix` — daemon socket + writable profiles/GC roots for time-machine.
 - Putting the host guix (520785e) first on PATH makes the Makefile's `time-machine` a
-  no-op that hits the warm store → fully offline.
+  no-op that hits the warm store.
 - Do **NOT** add `--network`: it pulls substitutes incl. nonguix.org (FSDG + local-only
   violation). The loop must stay offline.
-
-Candidate cleanup (not yet done; would change the contract — leave for a deliberate
-step): bake this invocation into a `make container-check` target or a `check.sh` wrapper
-so "the single command" is self-contained. Deferred to avoid silently restructuring the
-loop mid-milestone.
+- **Offline is now by construction, not by luck of a warm cache (triage #2):**
+  `--no-substitutes --no-offload` are passed to the OUTER `guix shell` itself (not
+  only exported inside it), so even a cold environment build cannot query
+  substitutes or offload to a remote builder. The shared HOST daemon still *has*
+  network and a nonguix substitute URL, so removing that host-side configuration
+  remains a defense-in-depth follow-up (it is now defense-in-depth, not the primary
+  guarantee).
 
 ## Loop reminder (CLAUDE.md)
 

@@ -328,8 +328,15 @@ expand scope.
   wholesale**; there is no per-package imperative install. Rationale: `guix install`
   accumulates many package versions under `/gnu/store` that are never cleaned up
   well. Keep the distro image-swap-only — no `guix install`-equivalent surface.
-  *Status: IMPLEMENTED as M6 (on `main`, pending sign-off §4.3).* The typed config's
-  `manifest` field is the lever; `make manifest-diff` proves a changed manifest is a
-  different whole-image generation and `make manifest-check` proves that generation is
-  reproducible and actually contains the declared package. The remaining parking-lot
-  thread is the FHS-flattened root (above), still future.
+  *Status: the typed image-build INTERFACE is manifest-driven and image-swap-only
+  as of M6 (on `main`, pending sign-off §4.3).* The typed config's `manifest` field
+  is the lever; `make manifest-diff` proves a changed manifest is a different
+  whole-image generation and `make manifest-check` proves that generation is
+  reproducible and actually contains the declared package.
+  **Not yet established (triage #4):** M6 does *not* yet PROVE the absence of an
+  imperative mutation surface — the built OCI artifact still ships `guix` and
+  `guix-daemon`, so an in-image `guix install` is still physically possible. Making
+  the distro image-swap-only *by construction* (remove/disable that surface and add
+  a negative runtime test that `guix install` is unavailable/inert) is a distinct
+  future milestone, not part of M6. The other remaining parking-lot thread is the
+  FHS-flattened root (above), still future.
