@@ -145,10 +145,18 @@
 
 (define (set- a b) (lset-difference eq? a b))
 
+;; Elements that occur more than once in LST (each reported once). Computed by
+;; occurrence count — NOT (set- lst (delete-duplicates lst)), which is always '()
+;; because delete-duplicates retains every distinct element, so the difference
+;; can never surface a repeat.
+(define (duplicates lst)
+  (delete-duplicates
+   (filter (lambda (x) (> (count (lambda (y) (eq? x y)) lst) 1)) lst)))
+
 (let* (;; wiring must cover each field EXACTLY once (no omission, no extra, no dup)
        (wiring-missing   (set- canonical-fields wiring-fields))
        (wiring-unknown   (set- wiring-fields canonical-fields))
-       (wiring-dups      (set- wiring-fields (delete-duplicates wiring-fields)))
+       (wiring-dups      (duplicates wiring-fields))
        ;; validation must cover each field at least once (no omission, no unknown)
        (val-distinct     (delete-duplicates validation-fields))
        (val-missing      (set- canonical-fields val-distinct))
