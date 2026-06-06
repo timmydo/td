@@ -228,22 +228,38 @@ declared sshd port is listening, and the daemon denies password authentication \
     (with-imported-modules '((gnu build marionette))
       #~(begin
           (use-modules (gnu build marionette)
+                       (srfi srfi-1)
+                       (srfi srfi-13)
                        (srfi srfi-64))
 
           ;; No -kernel/-initrd: boot the disk so firmware -> GRUB runs.
           ;; -snapshot keeps the run ephemeral (writable overlay, discarded).
-          (define marionette
-            (make-marionette
-             `(,(string-append #$qemu-minimal "/bin/" #$(qemu-command))
-               "-snapshot"
-               ,@(if (file-exists? "/dev/kvm") '("-enable-kvm") '())
-               "-no-reboot"
-               "-m" "512"
-               "-drive" ,(string-append "file=" #$image
-                                        ",if=virtio,format=qcow2"))))
+          (define qemu-cmd
+            `(,(string-append #$qemu-minimal "/bin/" #$(qemu-command))
+              "-snapshot"
+              ,@(if (file-exists? "/dev/kvm") '("-enable-kvm") '())
+              "-no-reboot"
+              "-m" "512"
+              "-drive" ,(string-append "file=" #$image
+                                       ",if=virtio,format=qcow2")))
+
+          (define marionette (make-marionette qemu-cmd))
 
           (test-runner-current (system-test-runner #$output))
           (test-begin "td-disk-boot")
+
+          ;; Permanent guard (triage #5): assert the boot used the DISK/bootloader
+          ;; path, not direct-kernel. Without this, a regression back to
+          ;; `-kernel`/`-initrd` (or `(virtual-machine os)`) would still satisfy
+          ;; the uname assertion below and stay green. We require the qemu command
+          ;; to carry the qcow2 disk and to carry NO -kernel/-initrd, so a
+          ;; direct-kernel regression reddens here structurally.
+          (test-assert "boots from the qcow2 disk via firmware->GRUB (no direct-kernel)"
+            (and (not (member "-kernel" qemu-cmd))
+                 (not (member "-initrd" qemu-cmd))
+                 (any (lambda (a)
+                        (and (string? a) (string-contains a "format=qcow2")))
+                      qemu-cmd)))
 
           (test-equal "qcow2 disk boots through GRUB; kernel matches declaration"
             #$%expected-kernel-release
