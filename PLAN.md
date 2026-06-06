@@ -267,7 +267,28 @@ tracks *where we are* on it.
           guix; the #t control has guix; and the bare lowering of an adversarial
           manifest that smuggles guix past the pre-filter via a runtime reference
           FAILS at the embedded marker (verified-red, asserted against the marker's
-          own diagnostic). F1 closed: manifest-agnostic, closure-level, no bypass.
+          own diagnostic). (Thought to close F1 — reopened in Round 5.)
+        – *Round 5 (current):* the embedded marker is only a MANIFEST-level gate. It
+          mounts the closure of the PACKAGES it is handed, so its `ftw` walk sees only
+          MANIFEST-injected guix. Guix injected by a SERVICE (`guix-service-type`'s
+          guix-daemon + build users) lives in the system closure but NOT in
+          `operating-system-packages`, so the marker never sees it — meaning
+          `(delete guix-service-type)` was enforced only by differential convergence
+          with the oracle, not by the gate. Reproduced (review): restoring
+          guix-service-type to a #f system built fine and shipped 4 guix binaries.
+          **Resolution:** add `guix-free-system-gate` (`(system td-hardening)`) — a
+          gate derivation over the WHOLE system closure (`operating-system-derivation`,
+          whose references are the real uncompressed store closure, unlike a compressed
+          docker tarball). `make no-guix` now ALSO (a) builds this gate over the actual
+          SHIPPED `td-system` — must pass, so a guix-service regression in
+          system/td.scm reddens at the closure level, not merely via the differential;
+          and (b) builds it over a SERVICE-INJECTION fixture (a hardened system with
+          guix-service-type restored) — must FAIL at the gate's own diagnostic
+          (verified-red). The embedded marker is kept as a cheap manifest-level
+          pre-filter on every bare lowering; the system gate is the whole-system
+          guarantee. F1 closed for real: both the manifest and the service paths are
+          covered, the shipped artifact is gated, and the over-claim ("by construction,
+          every bare lowering, no opt-in") is corrected to its true two-layer scope.
       • **F2 (Medium) — no-guix required the SHIPPED image to stay guix-enabled.**
         The rung's positive control was the `$(SYSTEM)` image (asserted to contain
         guix), so promoting the shipped default to hardened would have reddened the

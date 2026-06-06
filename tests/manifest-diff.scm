@@ -5,10 +5,13 @@
 ;; *manifest* (the typed config's `manifest` field): the intended way to change
 ;; what the image contains is to declare a different manifest and rebuild the
 ;; WHOLE image — a wholesale swap, not an in-place edit. NOTE (triage): this is a
-;; BUILD-INTERFACE property; M6 does NOT remove the imperative `guix install`
-;; surface (the built image still ships `guix`/`guix-daemon`) — proving that
-;; absent is a later milestone (DESIGN §6 parking-lot). The artifact under test is
-;; the OCI image derivation (the thing you would swap), exactly as in M5.
+;; BUILD-INTERFACE property; M6 by itself did NOT remove the imperative `guix
+;; install` surface — that is M7's `ship-guix?`, now the shipped default, so the
+;; default image is guix-free (see `make no-guix`). This differential deliberately
+;; isolates the M6 manifest-swap mechanism and is independent of that flag: both
+;; sides default `ship-guix?` identically, so guix-free-ness is held constant and
+;; only the manifest varies. The artifact under test is the OCI image derivation
+;; (the thing you would swap), exactly as in M5.
 ;;
 ;; Same self-discriminating shape as tests/oci-diff.scm (the M3 false-green
 ;; lesson, kept as a permanent guardrail). It asserts THREE things, each able to

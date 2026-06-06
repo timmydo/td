@@ -14,7 +14,10 @@
 #                       declared package is actually in the realized tarball (M6)
 #  11. no-guix        — build the hardened (ship-guix? #f) image, --check it, and
 #                       assert the imperative guix/guix-daemon surface is absent
-#                       from it but present in the default image (M7)
+#                       from it but present in an explicit ship-guix? #t CONTROL
+#                       image; plus a whole-system gate over the SHIPPED system
+#                       (must build) and over a service-injection fixture (must
+#                       fail at the gate) — review F1 (M7)
 #
 # Every guix invocation is pinned to channels.scm via `guix time-machine`, so
 # the reproducibility oracle is honest regardless of the ambient guix version.
@@ -240,11 +243,16 @@ no-guix:
 	hardened_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_HARDENED=//p'`; \
 	control_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_CONTROL=//p'`; \
 	adversarial_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_ADVERSARIAL=//p'`; \
+	shipped_gate_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_SHIPPED_GATE=//p'`; \
+	svcinj_gate_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_SVCINJ_GATE=//p'`; \
 	test -n "$$hardened_drv" -a -n "$$control_drv" -a -n "$$adversarial_drv" \
-	  || { echo "ERROR: could not lower the no-guix OCI image derivations" >&2; exit 1; }; \
+	     -a -n "$$shipped_gate_drv" -a -n "$$svcinj_gate_drv" \
+	  || { echo "ERROR: could not lower the no-guix derivations" >&2; exit 1; }; \
 	echo ">> hardened (bare, embedded-gate) image derivation: $$hardened_drv"; \
 	echo ">> control  image derivation: $$control_drv"; \
-	echo ">> adversarial   derivation: $$adversarial_drv"; \
+	echo ">> adversarial (manifest) derivation: $$adversarial_drv"; \
+	echo ">> shipped whole-system gate derivation: $$shipped_gate_drv"; \
+	echo ">> service-injection gate derivation: $$svcinj_gate_drv"; \
 	echo ">> guarantee: the BARE hardened lowering must BUILD (the embedded marker certifies it guix-free)"; \
 	hardened_img=`$(GUIX) build "$$hardened_drv"`; \
 	control_img=`$(GUIX) build "$$control_drv"`; \
@@ -273,4 +281,19 @@ no-guix:
 	fi; \
 	rm -f "$$adv_log"; \
 	echo "   ok: the adversarial hardened image was REJECTED at the embedded marker on the bare public path (guix-in-closure detected)"; \
-	echo "PASS: ship-guix? #f is a closure-level, build-enforced guarantee embedded in the system — the bare hardened image is guix-free (and reproducible), the control ships the surface, and a manifest that smuggles guix past the static pre-filter via a runtime reference is REFUSED at build time on the ordinary public lowering (manifest-agnostic, no opt-in to bypass)."
+	echo ">> whole-system gate: the SHIPPED system must pass the closure-level gate (it is guix-free)"; \
+	$(GUIX) build "$$shipped_gate_drv" >/dev/null; \
+	echo "   ok: the shipped td-system passes the whole-system guix-free gate (a guix-service regression in system/td.scm would redden this)"; \
+	echo ">> service-injection: restoring guix-service-type to a hardened system must FAIL the whole-system gate (guix re-enters the SYSTEM closure, invisible to the manifest marker)"; \
+	svc_log=`mktemp`; \
+	if $(GUIX) build "$$svcinj_gate_drv" >"$$svc_log" 2>&1; then \
+	  echo "FAIL: the service-injection system gate BUILT — guix-service-type re-introduced guix into the system closure but the whole-system gate did NOT trip. The gate does not actually scan the folded system closure." >&2; \
+	  tail -20 "$$svc_log" >&2; rm -f "$$svc_log"; exit 1; \
+	fi; \
+	if ! grep -q "system closure STILL contains" "$$svc_log"; then \
+	  echo "FAIL: the service-injection gate failed, but NOT at the whole-system guix-free gate (unexpected error) — cannot credit the gate:" >&2; \
+	  tail -20 "$$svc_log" >&2; rm -f "$$svc_log"; exit 1; \
+	fi; \
+	rm -f "$$svc_log"; \
+	echo "   ok: service-injected guix was REJECTED at the whole-system gate (the hole the manifest-only marker leaves open is closed)"; \
+	echo "PASS: ship-guix? #f is a closure-level, build-enforced guarantee — (1) the embedded MARKER refuses any manifest-injected guix on every bare lowering; (2) the whole-system GATE certifies the shipped td-system guix-free and REJECTS service-injected guix (guix-service-type restored) that the marker cannot see; and the control ships the surface, proving the probes discriminate."
