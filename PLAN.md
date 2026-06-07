@@ -510,9 +510,9 @@ booting the shipped artifact, and with a rung that could not fail).
    call). The "M6 entry uncommitted" sub-point was already stale (778512b).
    Commit a703b0e.
 
-The loop is now **12 rungs** (M7 added `no-guix`; M8 added `run`): `eval diff
-typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix
-run`. M4/M5/M3+/M6/M7 were **signed off 2026-06-06** (§4.3) and the shipped default
+The loop is now **13 rungs** (M7 added `no-guix`; M8 added `run`; M9.2 added
+`container`): `eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci
+manifest-check no-guix run container`. M4/M5/M3+/M6/M7 were **signed off 2026-06-06** (§4.3) and the shipped default
 flipped to guix-free
 (see "M7 promotion" above); these fixes hardened the oracle those milestones were judged
 against.

@@ -27,8 +27,10 @@
 # activation; an unpacked, un-booted image has real executables only under
 # /gnu/store/.../bin. So we exec a shell DISCOVERED at its store path in the
 # image's own rootfs — a genuine ELF from the shipped artifact, run via its own
-# glibc loader. (When M9 gives the image a static FHS layout, this rung gains an
-# /usr/bin exec as the behavioral proof that the flattened paths resolve.)
+# glibc loader. (M9 dropped the static-FHS-on-base idea in favour of a minimal
+# container-HOST base: it ships crun + mounts cgroup2 and runs apps in OCI
+# containers — see tests/container.scm — rather than flattening app paths into the
+# base itself.)
 #
 # Self-discriminating (the M3 lesson — a green rung is only meaningful once seen
 # red): a POSITIVE run must emit a sentinel and exit 0, AND a NEGATIVE control
