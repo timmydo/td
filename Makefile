@@ -66,7 +66,7 @@ check: eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci 
 #    script's status), which made a broken module pass `eval` green. `guix repl
 #    FILE` honors the exit code, so a load error reddens this rung honestly.
 eval:
-	@echo ">> eval: load (system td), (system td-typed) and (tests boot)"
+	@echo ">> eval: load (system td), (system td-typed), (tests boot) and (tests container)"
 	$(GUIX) repl $(LOAD) tests/eval.scm
 
 # M4 differential (DESIGN §2.4/§2.5). Cheap structural check — lowers systems to
@@ -341,11 +341,31 @@ run:
 #    ROOT in the guest (no rootless/userns contortions — that was M8's sandbox-only
 #    concern; M9.1 made the base a host: cgroup2 mounted + crun shipped). Marionette
 #    rung, so it lowers-then-realises like `test`/`boot-disk` for an honest exit
-#    status. Self-discriminating: a POSITIVE run (app prints "Hello, world!", exit
-#    0) and a NEGATIVE control (a bogus entrypoint must fail) — see tests/container.scm.
+#    status. The app runs via the IMAGE'S OWN declared entrypoint (read from its
+#    archive — a bogus #:entry-point fails the positive, F1). First `--check`s the
+#    app image + extracted bundle (every artifact is reproducible — CLAUDE.md), then
+#    runs. Self-discriminating: a POSITIVE run (app prints "Hello, world!", exit 0)
+#    and a NEGATIVE control (a bogus entrypoint must fail) — see tests/container.scm.
 container:
 	@echo ">> container: run an OCI app container on the booted td base (crun)"
-	@drv=`printf '%s\n' \
+	@set -euo pipefail; \
+	arts=`printf '%s\n' \
+	    '(use-modules (guix) (guix monads) (tests container))' \
+	    '(with-store store' \
+	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
+	    '  (let ((img (run-with-store store (td-app-image)))' \
+	    '        (bun (run-with-store store (td-app-bundle))))' \
+	    '    (format #t "IMAGE=~a~%" (derivation-file-name img))' \
+	    '    (format #t "BUNDLE=~a~%" (derivation-file-name bun))))' \
+	  | $(GUIX) repl $(LOAD) 2>/dev/null`; \
+	img=`printf '%s\n' "$$arts" | sed -n 's/^IMAGE=//p'`; \
+	bun=`printf '%s\n' "$$arts" | sed -n 's/^BUNDLE=//p'`; \
+	test -n "$$img" -a -n "$$bun" || { echo "ERROR: could not lower the app artifacts" >&2; exit 1; }; \
+	echo ">> app artifacts: image=$$img bundle=$$bun"; \
+	$(GUIX) build "$$img" "$$bun" >/dev/null; \
+	echo ">> reproducibility: guix build --check the app image + extracted bundle"; \
+	$(GUIX) build --check "$$img" "$$bun" >/dev/null; \
+	drv=`printf '%s\n' \
 	    '(use-modules (guix) (gnu tests) (tests container))' \
 	    '(with-store store' \
 	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \

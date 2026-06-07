@@ -11,6 +11,7 @@
 (use-modules (system td)
              (system td-typed)
              (system td-hardening)
-             (tests boot))
+             (tests boot)
+             (tests container))
 
 (display "eval ok\n")
