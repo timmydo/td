@@ -210,10 +210,23 @@ guix-free surfaced one real dependency `guix-service-type` had been providing as
 effect — sshd's privsep directory `/var/empty` (root:root 0755, set up via the build
 users whose home is `/var/empty`); a guix-free system restores it explicitly via
 `guix-free-privsep-service` (see `(system td-hardening)`), without which sshd aborts
-every connection. A literal docker-run runtime check still needs the OCI app model
-(§2.3, deferred). See the §6 parking-lot note. Promoting these from "extend" into
+every connection. Promoting these from "extend" into
 numbered ladder rungs (M3+ login control included) remains a spec decision for the human
 reviewer; this sign-off is on the *implementations*, not their ladder numbering.
+
+**M8 (human-directed, pending §4.3 sign-off) — RUN the shipped image.** The earlier
+note's "a literal docker-run runtime check still needs the OCI app model (§2.3,
+deferred)" is now partly realised: the `run` rung (12th rung) executes the shipped
+guix-free OCI image as a real **rootless OCI container** via **crun** (the runtime
+podman drives; podman itself was rejected as a 1238-derivation, network-fetching build
+that breaks the offline loop) and asserts its userspace runs — POSITIVE (a store-path
+shell emits a sentinel, exit 0) plus a NEGATIVE control (a bogus exec must fail). This
+crosses into the §2.3 "OCI app model" line, so it is opened for sign-off like M5–M7.
+Scope kept tight: it overrides args like `docker run IMG <cmd>` (the full boot via the
+image entrypoint is already covered by the marionette VM rungs), and it does **not** add
+a `guix install`-inside-a-running-container test (artifact absence from `no-guix` is
+stronger). The NEXT milestone, **M9**, FHS-flattens the OCI root and is verified
+behaviourally by this same run rung. See the §6 parking-lot notes.
 
 ### 2.5 Replacement order and the oracle for each swap
 

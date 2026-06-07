@@ -89,10 +89,23 @@ if [ "$#" -eq 0 ]; then
   set -- check
 fi
 
+#   --expose=/sys/fs/cgroup    : the M8 `run` rung runs the shipped OCI image as a
+#                                rootless crun container. crun probes the host
+#                                cgroup hierarchy at startup; inside `-C` the
+#                                container's /sys/fs/cgroup is plain sysfs, not
+#                                cgroup2, so crun aborts ("invalid file system type
+#                                on /sys/fs/cgroup"). Exposing the host's real
+#                                cgroup2 mount satisfies the probe. It is a
+#                                read-only host-resource exposure (like
+#                                --share=/var/guix), NOT a network/substitute path,
+#                                so it does not weaken the offline contract; crun is
+#                                additionally run with --cgroup-manager=disabled so
+#                                it never writes the hierarchy.
 exec guix shell -C --pure \
   --no-substitutes --no-offload \
   --expose=/gnu/store \
   --share="$HOME/.cache/guix" \
   --share=/var/guix \
-  make bash coreutils sed grep findutils tar gzip -- \
+  --expose=/sys/fs/cgroup \
+  make bash coreutils sed grep findutils tar gzip crun -- \
   bash -c 'export PATH="'"$hostguix_dir"':$PATH"; export GUIX_BUILD_OPTIONS="--no-substitutes --no-offload"; exec make "$@"' -- "$@"

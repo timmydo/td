@@ -301,6 +301,58 @@ tracks *where we are* on it.
         and surface removal was future, contradicting §6's "M7 implemented".
         Reconciled §2.4 to list M7 (artifact-level, default #t, pending sign-off).
 
+- [x] **M8 — RUN the shipped OCI image as a real container (DESIGN §6 "running the
+      image" / OCI app model).** GREEN + verified-red. **Human-directed new-layer
+      milestone (user chose: crun, run-rung first, 2026-06-06); opened for §4.3
+      sign-off — it crosses into the §2.3 "OCI app model" line, like M5/M6/M7.**
+      Every rung M5–M7 proves a PROPERTY of the artifact (reproducible, guix-free,
+      manifest-driven) but none ever RAN it. M8 closes that: the shipped guix-free
+      OCI image is executed as a real, rootless OCI container and its userspace is
+      asserted to run. The full loop is now **12 rungs** (adds `run`); all GREEN.
+      • **Runtime decision (probed, not assumed).** Podman was the first choice but
+        is **1238 derivations + 290 cold source fetches** — it breaks the offline/
+        warm-loop contract. Chose **crun** (the low-level OCI runtime podman drives):
+        **18 derivations**, offline-buildable. bubblewrap (already warm) was the
+        lighter fallback but is not OCI-aware (we'd hand-build the exec); crun runs
+        the image as a real container, a stronger "run what we ship" claim.
+      • **Feasibility gated before building.** Proved nested rootless userns works in
+        `guix shell -C` (`unshare -Ur`, bwrap → uid 0; `max_user_namespaces`
+        unlimited), then proved crun's full pivot_root/mount dance with a trivial
+        bundle (`CRUN_SMOKE_OK`, exit 0). Two environment facts learned: the sandbox
+        grants a **single uid** (`uid_map = 1001 1001 1`) → container uses a
+        single-uid map (containerID 0 → host uid, size 1); and `/sys/fs/cgroup`
+        inside `-C` is plain **sysfs**, not cgroup2, so crun's startup probe aborts
+        ("invalid file system type on /sys/fs/cgroup") — fixed by exposing the host
+        cgroup2 mount.
+      • **Loop wiring.** `check.sh` gains `crun` in the toolchain and
+        `--expose=/sys/fs/cgroup` (a read-only host-resource exposure like
+        `--share=/var/guix`, NOT a network/substitute path — the offline contract
+        holds; crun also runs `--cgroup-manager=disabled` and with an **empty
+        network namespace**, so the container is offline by construction). The `run`
+        rung is **not a derivation** — running a container needs a live userns the
+        build daemon's sandbox forbids — so, exactly like `docker run`, it executes
+        in the loop shell against the freshly built image (`tests/run-image.sh`).
+        Placed last (§1.3): it unpacks the full image rootfs, the heaviest step.
+      • **What it asserts (`tests/run-image.sh`), self-discriminating per the M3
+        lesson.** The image entrypoint is the system **boot-program** (the full boot
+        is already covered by the marionette `test`/`boot-disk` rungs), so we
+        OVERRIDE args like `docker run IMG <cmd>`. **Discovery:** a guix system
+        image's FHS conveniences (`/bin/sh`, `/run/current-system`) are materialised
+        at BOOT by activation — an unpacked, un-booted image has `/bin` EMPTY and
+        real executables only under `/gnu/store/.../bin`. So the rung exec's a shell
+        DISCOVERED at its store path in the image's own rootfs (its own glibc loader)
+        — POSITIVE: sentinel `TD_RUN_OK` + exit 0; NEGATIVE control: a bogus exec
+        (`/gnu/store/td-nonexistent…/bin/sh`) must FAIL, so a green tells a running
+        image from a broken one. VERIFIED-RED (manual, per CLAUDE.md): breaking the
+        positive sentinel (`echo WRONG_SENTINEL…`) reddened the rung (make Error 1,
+        rc 2); reverted. crun + bash warmed into the store (offline thereafter).
+      *Explicitly NOT in M8 (later, don't pull early):* running the full system via
+      its boot-program/activation in a container (the VM rungs cover boot); a
+      literal `guix install`-inside-a-running-container negative test (artifact
+      absence from `no-guix` is stronger and already shipped); the **FHS-flattened
+      root** — that is the NEXT milestone (M9), which M8's run rung will VERIFY
+      behaviourally (exec `/usr/bin/...`, which today does not exist).
+
 ## M7 promotion — shipped default flipped to guix-free (signed off 2026-06-06)
 
 Human sign-off (§4.3) on the whole M4–M7 stack, AND the spec decision to **ship the
@@ -406,9 +458,10 @@ booting the shipped artifact, and with a rung that could not fail).
    call). The "M6 entry uncommitted" sub-point was already stale (778512b).
    Commit a703b0e.
 
-The loop is now **11 rungs** (M7 added `no-guix`): `eval diff typed-coverage
-oci-diff manifest-diff build test boot-disk oci manifest-check no-guix`. M4/M5/M3+/M6/M7
-were **signed off 2026-06-06** (§4.3) and the shipped default flipped to guix-free
+The loop is now **12 rungs** (M7 added `no-guix`; M8 added `run`): `eval diff
+typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix
+run`. M4/M5/M3+/M6/M7 were **signed off 2026-06-06** (§4.3) and the shipped default
+flipped to guix-free
 (see "M7 promotion" above); these fixes hardened the oracle those milestones were judged
 against.
 

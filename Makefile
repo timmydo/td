@@ -18,6 +18,11 @@
 #                       image; plus a whole-system gate over the SHIPPED system
 #                       (must build) and over a service-injection fixture (must
 #                       fail at the gate) — review F1 (M7)
+#  12. run            — execute the SHIPPED OCI image as a real rootless OCI
+#                       container (crun) and assert its userspace runs: a positive
+#                       run (sentinel + exit 0) and a negative control (a bogus
+#                       exec must fail). Closes the gap that every prior rung
+#                       proved a PROPERTY of the artifact but never RAN it (M8)
 #
 # Every guix invocation is pinned to channels.scm via `guix time-machine`, so
 # the reproducibility oracle is honest regardless of the ambient guix version.
@@ -41,7 +46,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix
+.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix run
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -49,7 +54,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix
+check: eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix run
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
@@ -297,3 +302,28 @@ no-guix:
 	rm -f "$$svc_log"; \
 	echo "   ok: service-injected guix was REJECTED at the whole-system gate (the hole the manifest-only marker leaves open is closed)"; \
 	echo "PASS: ship-guix? #f is a closure-level, build-enforced guarantee — (1) the embedded MARKER refuses any manifest-injected guix on every bare lowering; (2) the whole-system GATE certifies the shipped td-system guix-free and REJECTS service-injected guix (guix-service-type restored) that the marker cannot see; and the control ships the surface, proving the probes discriminate."
+
+# 7. M8 run rung — execute the SHIPPED OCI image as a real rootless OCI container
+#    (crun) and assert its userspace runs. Every rung above proves a PROPERTY of
+#    the artifact (reproducible, guix-free, manifest-driven) but none ever RAN it;
+#    this closes that gap. crun is the low-level OCI runtime podman drives (podman
+#    itself is a ~1238-derivation Go tree with cold fetches — it breaks the offline
+#    loop; crun is 18 derivations, offline). NOT a derivation: running a container
+#    needs a live user namespace, which the build daemon's sandbox forbids, so —
+#    exactly like `docker run` — this runs in the loop shell against the freshly
+#    built image (check.sh exposes the host cgroup2 so crun's startup probe passes;
+#    the helper runs crun rootless, --cgroup-manager=disabled, single-uid map,
+#    empty network ns → the container is offline by construction). The image
+#    entrypoint is the system boot-program (the full boot is covered by the
+#    marionette `test`/`boot-disk` rungs); here we OVERRIDE args like
+#    `docker run IMG <cmd>` to drive /bin/sh. Self-discriminating: a positive run
+#    (sentinel + exit 0) AND a negative control (a bogus exec must fail) — see
+#    tests/run-image.sh. Heaviest behavioral rung (it unpacks the full image
+#    rootfs) → runs last (§1.3).
+run:
+	@echo ">> run: execute the shipped OCI image as a real OCI container (crun)"
+	@set -euo pipefail; \
+	img=`$(GUIX) system image $(LOAD) -t docker $(SYSTEM)`; \
+	test -n "$$img" || { echo "ERROR: could not build the shipped OCI image" >&2; exit 1; }; \
+	echo ">> shipped OCI image: $$img"; \
+	sh tests/run-image.sh "$$img"
