@@ -351,9 +351,9 @@ tracks *where we are* on it.
       literal `guix install`-inside-a-running-container negative test (artifact
       absence from `no-guix` is stronger and already shipped).
 
-- [~] **M9 — container host: run an OCI APP container on the booted base
-      (human-directed; SUPERSEDES FHS-on-base).** In progress: **M9.1 GREEN**,
-      M9.2 next.
+- [x] **M9 — container host: run an OCI APP container on the booted base
+      (human-directed; SUPERSEDES FHS-on-base).** GREEN + verified-red (M9.1 +
+      M9.2). The loop is now **13 rungs** (M9.2 added `container`).
       **Direction change (user, 2026-06-07).** FHS-flattening the BASE was dropped:
       in a "minimal base, run everything else in containers" design, FHS is a
       property of the APP container images, not of the base — nothing foreign runs
@@ -382,11 +382,24 @@ tracks *where we are* on it.
         (sysfs ≠ cgroup2fs fails the assertion). Full 12-rung loop GREEN
         (`FULLCHECK_RC=0`); the guix-free `no-guix` rung still passes (crun pulls in
         no guix, so the embedded marker is satisfied).
-      • **M9.2 (next) — the proving rung.** Boot the base and run a Guix-built OCI
-        APP image (`guix pack -f docker` of GNU hello) with crun AS ROOT, honoring
-        the app's own entrypoint: assert exit 0 + the app's sentinel (a),
-        self-discriminating negative control (c), crun resolved from the SHIPPED
-        closure (d). Offline (store-path image, `--network=none`).
+      • **M9.2 (this commit) — the proving rung (`container`, rung 13).** A
+        marionette test (`tests/container.scm`) boots the shipped base and runs a
+        Guix-built OCI APP image (`guix pack -f docker` of GNU hello, expressed in
+        Scheme via `docker-image` + a `profile`) with the SHIPPED crun
+        (`/run/current-system/profile/bin/crun`, claim d) AS ROOT. The app image is
+        unpacked into a runtime-bundle rootfs at BUILD time (hermetic); crun runs
+        that read-only store rootfs directly (`root.path` = the store path) — POSITIVE
+        asserts the app prints `Hello, world!` and exits 0, NEGATIVE control (bogus
+        entrypoint) must FAIL. Offline by construction: the image is a store path (no
+        registry) and the container has an empty network ns. VERIFIED-RED on record:
+        during debugging, a staging bug made the positive assertion go FAIL (the app
+        did not run) while the negative still passed — exactly the discriminator
+        working. Two implementation findings worth keeping: (1) the pack
+        `docker-image` returns a MONADIC value, so it is bound via `mlet` inside the
+        bundle derivation, not a bare `#$`; (2) copying the ~70MB hello closure into
+        the guest `/tmp` overflowed its tmpfs — running crun on the READ-ONLY store
+        rootfs directly (verified: crun tolerates a read-only `root.path`) avoids the
+        copy entirely. Full 13-rung `./check.sh` GREEN.
       *Still NOT in M9:* registry pull / container networking; the Rust sandbox
       (still crun — that swap is later, crun is its oracle §2.5); orchestration /
       multiple containers / persistent volumes (ephemeral VM §1.5); "minimal base"

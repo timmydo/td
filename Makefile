@@ -23,6 +23,10 @@
 #                       run (sentinel + exit 0) and a negative control (a bogus
 #                       exec must fail). Closes the gap that every prior rung
 #                       proved a PROPERTY of the artifact but never RAN it (M8)
+#  13. container      — boot the shipped base and run a Guix-built OCI APP image
+#                       (guix pack -f docker hello) ON it with the shipped crun, as
+#                       root: assert the app prints its output + exits 0, with a
+#                       negative control. Proves td is a working container HOST (M9)
 #
 # Every guix invocation is pinned to channels.scm via `guix time-machine`, so
 # the reproducibility oracle is honest regardless of the ambient guix version.
@@ -46,7 +50,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix run
+.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix run container
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -54,7 +58,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix run
+check: eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci manifest-check no-guix run container
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
@@ -327,3 +331,28 @@ run:
 	test -n "$$img" || { echo "ERROR: could not build the shipped OCI image" >&2; exit 1; }; \
 	echo ">> shipped OCI image: $$img"; \
 	sh tests/run-image.sh "$$img"
+
+# 8. M9.2 container-HOST rung — boot the SHIPPED base and run a Guix-built OCI APP
+#    image on it with the shipped crun, as root. Where `run` (M8) ran the shipped
+#    SYSTEM image's userspace, this runs a SEPARATE app image ON the booted base —
+#    the container-host relationship (DESIGN §2.3 OCI app model). The app is
+#    `guix pack -f docker` of GNU hello (a store path → offline, no registry); it
+#    is unpacked into a runtime-bundle rootfs at build time, then crun runs it AS
+#    ROOT in the guest (no rootless/userns contortions — that was M8's sandbox-only
+#    concern; M9.1 made the base a host: cgroup2 mounted + crun shipped). Marionette
+#    rung, so it lowers-then-realises like `test`/`boot-disk` for an honest exit
+#    status. Self-discriminating: a POSITIVE run (app prints "Hello, world!", exit
+#    0) and a NEGATIVE control (a bogus entrypoint must fail) — see tests/container.scm.
+container:
+	@echo ">> container: run an OCI app container on the booted td base (crun)"
+	@drv=`printf '%s\n' \
+	    '(use-modules (guix) (gnu tests) (tests container))' \
+	    '(with-store store' \
+	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
+	    '  (format #t "DRV=~a~%"' \
+	    '          (derivation-file-name' \
+	    '           (run-with-store store (system-test-value %test-td-container)))))' \
+	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the container test derivation" >&2; exit 1; }; \
+	echo ">> realise container test derivation: $$drv"; \
+	$(GUIX) build "$$drv"
