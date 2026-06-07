@@ -246,10 +246,15 @@
             cgroup2-file-system
             %base-file-systems))
 
-    ;; The declared manifest IS the package set of the image (M6). The default
+    ;; The image's EFFECTIVE package set is layered (M6, made precise by triage
+    ;; F-review #2): effective = fixed base capabilities (crun, below) + the
+    ;; manifest-selected payload + enforcement markers (guix-free-marker, below).
+    ;; The manifest drives ONLY the swappable payload — it is NOT the whole
+    ;; package set, and cannot add or remove a base capability. The default
     ;; manifest is %base-packages, which is exactly the operating-system field's
     ;; own default. A non-default manifest is a different image: a whole-image
-    ;; swap, not an in-place install.
+    ;; swap, not an in-place install. (tests/manifest-diff.scm (c) pins the
+    ;; payload to the manifest; (d) pins crun OUTSIDE it.)
     ;;
     ;; M7 (F1, embedded gate): for a hardened (#f) config we ALSO prepend the
     ;; `guix-free-marker` — a build-time package whose build FAILS if guix is

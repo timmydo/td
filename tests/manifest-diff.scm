@@ -13,6 +13,20 @@
 ;; only the manifest varies. The artifact under test is the OCI image derivation
 ;; (the thing you would swap), exactly as in M5.
 ;;
+;; The package contract (made precise by triage F-review #2): a td system's
+;; EFFECTIVE package set is
+;;
+;;     effective packages = fixed base capabilities   ; crun — container host
+;;                        + manifest-selected payload  ; the td-config manifest
+;;                        + enforcement markers         ; guix-free-marker (#f)
+;;
+;; The manifest controls ONLY the swappable payload — it is NOT the whole
+;; package set. Changing the manifest produces a new image generation (b); it
+;; cannot add or remove a base capability (d). Earlier wording ("the manifest IS
+;; the package set", "only the manifest decides contents") overstated this and is
+;; corrected here: the base capability `crun` is a mandatory platform invariant
+;; the compiler injects regardless of (and absent from) the manifest.
+;;
 ;; Same self-discriminating shape as tests/oci-diff.scm (the M3 false-green
 ;; lesson, kept as a permanent guardrail). It asserts THREE things, each able to
 ;; go red:
@@ -25,20 +39,28 @@
 ;;       hello) lowers to a DIFFERENT OCI image derivation. A new manifest is a
 ;;       new image generation, with its own identity. If the comparison ever
 ;;       stops distinguishing manifests, (b) fails — the red-run baked in.
-;;   (c) MANIFEST DRIVES THE DECLARED PACKAGE SET — the added package is in the
+;;   (c) MANIFEST DRIVES THE SWAPPABLE PAYLOAD — the added package is in the
 ;;       swapped system's package set (operating-system-packages) and ABSENT
-;;       from the default's. This proves (b)'s divergence is the manifest doing
-;;       real work, not an incidental hash change. NOTE (triage #5): this is a
-;;       DECLARATION-level check — it does not prove the package's files reach
-;;       the realized tarball (an exporter bug could drop them). That stronger
-;;       artifact-level claim is `make manifest-check`, which cracks the built
-;;       layer.tar and asserts hello/bin/hello is actually packed.
+;;       from BOTH the default's and an empty-manifest system's. This proves
+;;       (b)'s divergence is the manifest doing real work on the payload, not an
+;;       incidental hash change. NOTE (triage #5): this is a DECLARATION-level
+;;       check — it does not prove the package's files reach the realized
+;;       tarball (an exporter bug could drop them). That stronger artifact-level
+;;       claim is `make manifest-check`, which cracks the built layer.tar and
+;;       asserts hello/bin/hello is actually packed.
+;;   (d) BASE CAPABILITY INVARIANT — `crun` (the container-host capability) is
+;;       in EVERY system's package set — default, swapped, AND empty-manifest —
+;;       yet is in NONE of the supplied manifests. The base capability is a
+;;       mandatory platform invariant the compiler injects, not swappable
+;;       manifest content: the manifest neither added it nor can remove it. This
+;;       is what makes the contract above precise (effective = base + payload +
+;;       markers) rather than the overstated "the manifest IS the package set".
 ;;
 ;; (a)+(b) are the load-bearing self-discriminating pair (break the compiler's
 ;; default → (a) red; make the swap a no-op → (b) red). (c) pins the divergence
-;; to the declared manifest. The bit-for-bit reproducibility of a SWAPPED
-;; generation AND its realized contents are proven separately by `make
-;; manifest-check`.
+;; to the manifest-selected payload; (d) pins the base capability OUTSIDE the
+;; manifest. The bit-for-bit reproducibility of a SWAPPED generation AND its
+;; realized contents are proven separately by `make manifest-check`.
 ;;
 ;; Run as a script so the process exit status is the test result (`guix repl
 ;; FILE` honors `(exit)`, unlike a script piped via STDIN — see typed-diff.scm).
@@ -50,6 +72,7 @@
              (gnu system)
              (gnu system image)
              (gnu packages base)        ;hello
+             (gnu packages containers)  ;crun — the base capability (d)
              (srfi srfi-1)
              (ice-9 format)
              (system td)
@@ -84,16 +107,32 @@
   (define default-os  (td-config->operating-system (td-config)))
   (define swapped-os   (td-config->operating-system
                         (td-config #:manifest %swapped-manifest)))
+  ;; An EMPTY-manifest system — the payload is gone, but the base capability
+  ;; must remain. Used by (c)/(d) to pin crun to the base, not the manifest.
+  (define empty-os     (td-config->operating-system
+                        (td-config #:manifest '())))
 
   (let* ((oracle  (oci-drv td-system))
          (default (oci-drv default-os))
          (swapped (oci-drv swapped-os))
          (converge?     (string=? oracle default))
          (discriminate? (not (string=? oracle swapped)))
-         ;; (c): the manifest, and only the manifest, decides contents.
+         ;; (c): the manifest drives the swappable PAYLOAD — hello appears only
+         ;; in the swapped system, never in the default or empty-manifest ones.
          (in-swapped?   (memq %swap-package (operating-system-packages swapped-os)))
          (in-default?   (memq %swap-package (operating-system-packages default-os)))
-         (drives?       (and in-swapped? (not in-default?))))
+         (in-empty?     (memq %swap-package (operating-system-packages empty-os)))
+         (drives?       (and in-swapped? (not in-default?) (not in-empty?)))
+         ;; (d): the BASE capability invariant — crun is injected by the compiler
+         ;; into every system regardless of the manifest, and is in NONE of the
+         ;; supplied manifests. The manifest neither added it nor can remove it.
+         (crun-in-manifests? (or (memq crun %base-packages)
+                                 (memq crun %swapped-manifest)))
+         (crun-default? (memq crun (operating-system-packages default-os)))
+         (crun-swapped? (memq crun (operating-system-packages swapped-os)))
+         (crun-empty?   (memq crun (operating-system-packages empty-os)))
+         (base-invariant? (and (not crun-in-manifests?)
+                               crun-default? crun-swapped? crun-empty?)))
 
     (format #t "~%== M6 differential: manifest-driven OCI image swap ==~%")
     (format #t "  oracle (system td)            : ~a~%" oracle)
@@ -101,9 +140,13 @@
     (format #t "  swapped manifest (+hello)     : ~a~%" swapped)
     (format #t "~%  (a) converge   (default == oracle)        : ~a~%" converge?)
     (format #t "  (b) swap discriminates (swapped != oracle): ~a~%" discriminate?)
-    (format #t "  (c) manifest drives declared package set  : ~a~%" drives?)
-    (format #t "        hello in swapped pkgs : ~a   hello in default pkgs : ~a~%~%"
-            (and in-swapped? #t) (and in-default? #t))
+    (format #t "  (c) manifest drives swappable payload     : ~a~%" drives?)
+    (format #t "        hello in pkgs — swapped:~a default:~a empty:~a~%"
+            (and in-swapped? #t) (and in-default? #t) (and in-empty? #t))
+    (format #t "  (d) base capability invariant (crun)      : ~a~%" (and base-invariant? #t))
+    (format #t "        crun in pkgs — default:~a swapped:~a empty:~a   in manifests:~a~%~%"
+            (and crun-default? #t) (and crun-swapped? #t) (and crun-empty? #t)
+            (and crun-in-manifests? #t))
 
     (cond
      ((not converge?)
@@ -115,12 +158,20 @@ image derivation — the manifest layer is not purely additive.~%")
 NOT change the OCI image derivation. The oracle has lost discriminating power.~%")
       (exit 1))
      ((not drives?)
-      (format #t "FAIL: the manifest does not drive the declared package set — the \
-added package is not in the swapped system's packages (or leaked into the default).~%")
+      (format #t "FAIL: the manifest does not drive the swappable payload — the \
+added package is not in the swapped system's packages (or leaked into the default \
+or empty-manifest system).~%")
+      (exit 1))
+     ((not base-invariant?)
+      (format #t "FAIL: the base capability invariant is broken — crun must be in \
+every system's packages (default/swapped/empty) and in none of the supplied \
+manifests. Either crun leaked into a manifest or a manifest could drop it; the \
+'effective = base + payload + markers' contract no longer holds.~%")
       (exit 1))
      (else
       (format #t "PASS: the default manifest is store-path-identical to the \
-oracle; a swapped manifest yields a DIFFERENT image generation; and the declared \
-manifest drives the system's declared package set (artifact-level presence in the \
-realized tarball is proven by `make manifest-check`).~%")
+oracle; a swapped manifest yields a DIFFERENT image generation; the manifest \
+drives the swappable payload (hello); and the base capability crun is a manifest- \
+independent invariant (artifact-level presence in the realized tarball is proven \
+by `make manifest-check`).~%")
       (exit 0)))))
