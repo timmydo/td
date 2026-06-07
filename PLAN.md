@@ -400,10 +400,32 @@ tracks *where we are* on it.
         the guest `/tmp` overflowed its tmpfs — running crun on the READ-ONLY store
         rootfs directly (verified: crun tolerates a read-only `root.path`) avoids the
         copy entirely. Full 13-rung `./check.sh` GREEN.
+      • **M9.2 hardening (F-review triage, post-sign-off review).** Three fixes,
+        none weakening a test: (1) the negative control replaced the runtime args
+        directly, which proved the run mechanism discriminates but NOT that image
+        metadata drives execution — added a SECOND app image
+        (`td-app-badentry-image`) whose DECLARED entrypoint is bogus; its bundle's
+        `args.json` carries that path, so the run fails (image metadata drives the
+        run). (2) Replaced the regex entrypoint extraction with a structured JSON
+        parse (guile-json `(json)` via `with-extensions`; guix's own
+        `build/json` source is absent from the time-machine module union, so
+        `with-imported-modules` cannot reach it). (3) `manifest-diff` now asserts
+        the base-capability invariant (crun in default/swapped/empty systems, in no
+        manifest) — see the M6 section. Full 13-rung `./check.sh` GREEN.
       *Still NOT in M9:* registry pull / container networking; the Rust sandbox
       (still crun — that swap is later, crun is its oracle §2.5); orchestration /
       multiple containers / persistent volumes (ephemeral VM §1.5); "minimal base"
       as a measured closure-size rung (separate follow-on).
+      **Cgroup scope boundary (explicit, for §4.3 sign-off):** the `container`
+      rung runs crun with `--cgroup-manager=disabled`, so it proves crun STARTS
+      and RUNS an OCI app container to completion, but does NOT prove cgroup
+      placement, delegation, or resource-limit ENFORCEMENT. Running OCI containers
+      without resource limits is still a valid container-host capability, so this
+      does not block M9. A later **managed-cgroups milestone** should run crun
+      WITHOUT `--cgroup-manager=disabled`, apply a deterministic limit (e.g.
+      `memory.max` or `pids.max`), and inspect the created cgroup to assert the
+      limit took effect. Because M9 runs crun as guest root, delegated-subtree
+      setup is probably unnecessary (that mainly matters for rootless runtimes).
 
 ## M7 promotion — shipped default flipped to guix-free (signed off 2026-06-06)
 

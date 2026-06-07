@@ -35,6 +35,14 @@
 ;;   - RUNTIME-ARG negative: the good rootfs run with a bogus arg path also fails.
 ;; The positive proves bundle setup is sound, so the negatives isolate "did the
 ;; app's DECLARED entrypoint actually run".
+;;
+;; SCOPE (cgroups): crun runs with `--cgroup-manager=disabled`, so this rung
+;; proves crun STARTS and RUNS a container to completion, NOT cgroup placement,
+;; delegation, or resource-limit ENFORCEMENT. Running OCI containers without
+;; resource limits is still a valid container-host capability (so this does not
+;; gate M9). Enforcement is a later managed-cgroups milestone: run crun without
+;; --cgroup-manager=disabled, apply a deterministic limit (memory.max/pids.max),
+;; and inspect the created cgroup. See PLAN.md (M9 cgroup scope boundary).
 (define-module (tests container)
   #:use-module (gnu tests)
   #:use-module (gnu system)
