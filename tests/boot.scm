@@ -179,6 +179,30 @@
                    (string-contains (cadr login) "TD_LOGIN_OK")
                    (string-contains (cadr login) #$%test-user))))
 
+          ;; M9: the booted base is a container host. Two independent claims, each
+          ;; a base change verified HERE: (a) cgroup2 is actually mounted at
+          ;; /sys/fs/cgroup — this proves the DECLARATIVE cgroup2-file-system mounts
+          ;; at boot (the feasibility gate only proved a manual mount), which an OCI
+          ;; runtime's startup probe requires; (b) crun is shipped in the system
+          ;; profile. The strings are checked in the builder (srfi-13), so the guest
+          ;; form only shells out / stats.
+          (let ((cgroup-type
+                 (marionette-eval
+                  '(begin
+                     (use-modules (ice-9 popen) (ice-9 rdelim))
+                     (let* ((p (open-input-pipe "stat -f -c %T /sys/fs/cgroup"))
+                            (o (read-string p)))
+                       (close-pipe p)
+                       o))
+                  marionette))
+                (crun?
+                 (marionette-eval
+                  '(file-exists? "/run/current-system/profile/bin/crun")
+                  marionette)))
+            (test-assert "base is a container host: cgroup2 mounted and crun shipped"
+              (and (string-contains cgroup-type "cgroup2fs")
+                   crun?)))
+
           (test-end)
           (exit (zero? (test-runner-fail-count (test-runner-current)))))))
 

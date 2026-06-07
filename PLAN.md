@@ -349,9 +349,48 @@ tracks *where we are* on it.
       *Explicitly NOT in M8 (later, don't pull early):* running the full system via
       its boot-program/activation in a container (the VM rungs cover boot); a
       literal `guix install`-inside-a-running-container negative test (artifact
-      absence from `no-guix` is stronger and already shipped); the **FHS-flattened
-      root** — that is the NEXT milestone (M9), which M8's run rung will VERIFY
-      behaviourally (exec `/usr/bin/...`, which today does not exist).
+      absence from `no-guix` is stronger and already shipped).
+
+- [~] **M9 — container host: run an OCI APP container on the booted base
+      (human-directed; SUPERSEDES FHS-on-base).** In progress: **M9.1 GREEN**,
+      M9.2 next.
+      **Direction change (user, 2026-06-07).** FHS-flattening the BASE was dropped:
+      in a "minimal base, run everything else in containers" design, FHS is a
+      property of the APP container images, not of the base — nothing foreign runs
+      directly on the base, so flattening it buys ~nothing. The valuable milestone
+      instead: prove the booted td base is a working **OCI container host**. (Static/
+      minimal-base and FHS-for-apps remain open future threads — see §parking-lot.)
+      **Feasibility gated first (as with M8):** a throwaway marionette prototype
+      (not committed) booted the base and ran crun AS ROOT in the guest.
+      Two findings: (1) crun-as-root is the easy case — no rootless/single-uid/
+      cgroup-expose contortions M8 needed in the sandbox; (2) the minimal base did
+      NOT mount cgroup2 (`/sys/fs/cgroup` was plain sysfs), so crun aborted "invalid
+      file system type" — a manual `mount -t cgroup2` fixed it, then a missing `/dev`
+      mount in the bundle was the last gap → `GUEST_CRUN_OK`, exit 0. So being a host
+      needs TWO base changes: mount cgroup2 + ship a runtime.
+      • **M9.1 (this commit) — the base IS a container host.** Shipped `crun` in the
+        base and mount **cgroup2** at `/sys/fs/cgroup`, edited IDENTICALLY in the
+        oracle (`system/td.scm`) and the typed compiler (`system/td-typed.scm`) via a
+        shared `cgroup2-file-system` in `(system td-hardening)` (prevents drift). No
+        test-file digests are hardcoded (the diffs compare oracle-vs-compiled live),
+        so the M4/M5/M6 differentials **self-rebaselined** and still converge at the
+        new crun+cgroup2 digests; `typed-coverage` 12/12 wired, 19/19 rejected. The
+        boot test gained a behavioral assertion — *"base is a container host: cgroup2
+        mounted and crun shipped"* — which also proves the DECLARATIVE cgroup2 mount
+        works at boot (Guix emits a `shepherd-file-system--sys-fs-cgroup` service),
+        not just the gate's manual mount. Verified-red is on record from the gate
+        (sysfs ≠ cgroup2fs fails the assertion). Full 12-rung loop GREEN
+        (`FULLCHECK_RC=0`); the guix-free `no-guix` rung still passes (crun pulls in
+        no guix, so the embedded marker is satisfied).
+      • **M9.2 (next) — the proving rung.** Boot the base and run a Guix-built OCI
+        APP image (`guix pack -f docker` of GNU hello) with crun AS ROOT, honoring
+        the app's own entrypoint: assert exit 0 + the app's sentinel (a),
+        self-discriminating negative control (c), crun resolved from the SHIPPED
+        closure (d). Offline (store-path image, `--network=none`).
+      *Still NOT in M9:* registry pull / container networking; the Rust sandbox
+      (still crun — that swap is later, crun is its oracle §2.5); orchestration /
+      multiple containers / persistent volumes (ephemeral VM §1.5); "minimal base"
+      as a measured closure-size rung (separate follow-on).
 
 ## M7 promotion — shipped default flipped to guix-free (signed off 2026-06-06)
 

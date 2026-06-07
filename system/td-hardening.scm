@@ -52,9 +52,33 @@
   #:use-module ((guix licenses) #:prefix license:)
   #:use-module (gnu services)            ;simple-service, activation-service-type
   #:use-module (gnu system)              ;operating-system-derivation
+  #:use-module (gnu system file-systems) ;file-system (cgroup2 host mount)
   #:export (guix-free-marker
             guix-free-system-gate
-            guix-free-privsep-service))
+            guix-free-privsep-service
+            cgroup2-file-system))
+
+;; M9 — a container host must expose a cgroup2 hierarchy. crun (and every OCI
+;; runtime) probes /sys/fs/cgroup at startup and ABORTS if it is not a
+;; cgroup/cgroup2 mount ("invalid file system type on /sys/fs/cgroup"). The
+;; minimal td base mounts /sys (sysfs) but nothing mounts cgroup2 over it (no
+;; elogind/systemd in this minimal system), so without this the booted base
+;; cannot host containers — verified by the M9 feasibility gate, where a manual
+;; `mount -t cgroup2 none /sys/fs/cgroup` was exactly what made crun run. This
+;; mounts it declaratively at boot. Added to the file-systems of BOTH the oracle
+;; (system td) and the typed compiler (td-config->operating-system), identically,
+;; so the M4/M5/M6 differentials keep converging (cf. guix-free-privsep-service).
+;; create-mount-point? #f — the directory already exists inside the sysfs /sys
+;; mount; needed-for-boot? #f — cgroups are only needed once we run containers,
+;; well after the root filesystem is up.
+(define cgroup2-file-system
+  (file-system
+    (device "none")
+    (mount-point "/sys/fs/cgroup")
+    (type "cgroup2")
+    (check? #f)
+    (create-mount-point? #f)
+    (needed-for-boot? #f)))
 
 ;; A guix-free system needs its sshd privilege-separation directory set up
 ;; explicitly. On a normal (guix-ful) Guix system, `guix-service-type` declares

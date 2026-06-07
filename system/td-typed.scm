@@ -22,8 +22,10 @@
   #:use-module (gnu services networking)
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
+  #:use-module (gnu packages containers) ;crun — shipped in the base (M9)
   #:use-module (guix packages)
-  #:use-module (system td-hardening)     ;guix-free-marker, guix-free-privsep-service
+  ;; guix-free-marker, guix-free-privsep-service, cgroup2-file-system
+  #:use-module (system td-hardening)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 match)
@@ -235,12 +237,14 @@
       (bootloader grub-bootloader)
       (targets (list (td-config-bootloader-target c)))))
 
+    ;; Root fs + the cgroup2 container-host mount (M9), shared with the oracle.
     (file-systems
-     (cons (file-system
-             (device (file-system-label (td-config-root-fs-label c)))
-             (mount-point (td-config-root-mount c))
-             (type (td-config-root-fs-type c)))
-           %base-file-systems))
+     (cons* (file-system
+              (device (file-system-label (td-config-root-fs-label c)))
+              (mount-point (td-config-root-mount c))
+              (type (td-config-root-fs-type c)))
+            cgroup2-file-system
+            %base-file-systems))
 
     ;; The declared manifest IS the package set of the image (M6). The default
     ;; manifest is %base-packages, which is exactly the operating-system field's
@@ -257,10 +261,14 @@
     ;; oracle (system td) embeds this same marker, so the default config still lowers
     ;; byte-for-byte to it (§2.5) — at the new guix-free digest. An explicit #t
     ;; config takes the manifest verbatim (no marker) and diverges.
-    (packages (let ((manifest (td-config-manifest c)))
+    ;; M9: `crun` is shipped in the base regardless of the user manifest — it is a
+    ;; container-host capability, not a swappable manifest entry — so it is prepended
+    ;; here (outside `manifest`), exactly as the oracle conses it onto %base-packages.
+    ;; The guix-free-marker scans this crun-inclusive set (crun pulls in no guix).
+    (packages (let ((pkgs (cons crun (td-config-manifest c))))
                 (if (td-config-ship-guix? c)
-                    manifest
-                    (cons (guix-free-marker manifest) manifest))))
+                    pkgs
+                    (cons (guix-free-marker pkgs) pkgs))))
 
     ;; M7: when `ship-guix?` is #f (now the shipped default), delete
     ;; `guix-service-type` so the realized image carries no `guix`/`guix-daemon`

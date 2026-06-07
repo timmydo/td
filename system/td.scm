@@ -17,7 +17,9 @@
   #:use-module (gnu services networking)
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
-  #:use-module (system td-hardening)     ;guix-free-marker (embedded build gate)
+  #:use-module (gnu packages containers) ;crun — the container runtime td ships
+  ;; guix-free-marker (embedded build gate) + cgroup2-file-system (container host)
+  #:use-module (system td-hardening)
   #:export (td-system
             td-ssh-configuration))
 
@@ -48,12 +50,16 @@
       (bootloader grub-bootloader)
       (targets '("/dev/vda"))))
 
+    ;; The root fs, plus the cgroup2 mount that makes td a container host (M9).
+    ;; cgroup2-file-system is shared with the typed compiler so the two cannot
+    ;; drift (the differentials would catch it, but sharing prevents it).
     (file-systems
-     (cons (file-system
-             (device (file-system-label "td-root"))
-             (mount-point "/")
-             (type "ext4"))
-           %base-file-systems))
+     (cons* (file-system
+              (device (file-system-label "td-root"))
+              (mount-point "/")
+              (type "ext4"))
+            cgroup2-file-system
+            %base-file-systems))
 
     ;; Guix-free by construction (M7, shipped default signed off 2026-06-06,
     ;; DESIGN §4.3). td ships an image-swap-only distro: the realized image carries
@@ -66,7 +72,12 @@
     ;; (the typed default), so the M4/M5/M6 differentials converge on this oracle —
     ;; and convergence in turn ENFORCES the marker here (drop it and `make diff`
     ;; reddens). See (system td-hardening).
-    (packages (cons (guix-free-marker %base-packages) %base-packages))
+    ;; M9: ship `crun` in the base — a container host needs a container runtime.
+    ;; It joins %base-packages in the system profile (so the booted base has crun
+    ;; on PATH), and the guix-free-marker scans this same set (crun pulls in no
+    ;; guix, so the marker still passes). The typed compiler ships crun identically.
+    (packages (let ((pkgs (cons crun %base-packages)))
+                (cons (guix-free-marker pkgs) pkgs)))
 
     ;; sshd requires 'networking; %base-services provides only 'loopback. dhcpcd
     ;; brings up the VM's QEMU user-mode NIC and provides 'networking — the same

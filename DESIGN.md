@@ -225,8 +225,20 @@ crosses into the §2.3 "OCI app model" line, so it is opened for sign-off like M
 Scope kept tight: it overrides args like `docker run IMG <cmd>` (the full boot via the
 image entrypoint is already covered by the marionette VM rungs), and it does **not** add
 a `guix install`-inside-a-running-container test (artifact absence from `no-guix` is
-stronger). The NEXT milestone, **M9**, FHS-flattens the OCI root and is verified
-behaviourally by this same run rung. See the §6 parking-lot notes.
+stronger).
+
+**M9 (human-directed, pending §4.3 sign-off) — the booted base is a container HOST.**
+*Direction change (2026-06-07):* FHS-flattening the base (the earlier M9) was DROPPED.
+In a "minimal base, run everything else in containers" design, FHS is a property of the
+APP container images, not of the base — nothing foreign runs directly on the base, so
+flattening it buys ~nothing. Instead M9 proves the booted, shipped td base is a working
+**OCI container host**: it ships `crun` and mounts cgroup2, and (M9.2) runs a Guix-built
+OCI app image as root, honoring the app's entrypoint. This is the runtime OCI *app
+model* (§2.3) proper, opened for sign-off like M5–M8. Where M8 *ran the shipped system
+image's* userspace, M9 *runs a separate app image ON* the booted base — the container-host
+relationship. The crun→Rust-sandbox swap (north-star "one sandbox stack spanning build
+and run") is a later milestone with crun as its oracle (§2.5). FHS-for-apps and a
+static/minimal micro-base are open future threads (see §6). See the §6 parking-lot notes.
 
 ### 2.5 Replacement order and the oracle for each swap
 
