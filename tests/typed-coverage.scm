@@ -138,11 +138,22 @@
    (list 'ssh-challenge-response? "ssh-challenge-response? non-bool" (lambda () (td-config #:ssh-challenge-response? 1)))
    (list 'manifest "manifest non-list"              (lambda () (td-config #:manifest 42)))
    (list 'manifest "manifest non-packages"          (lambda () (td-config #:manifest (list 1 2))))
-   ;; F-review #2: the manifest is the swappable PAYLOAD only — it must not list a
+   ;; F-review #2/#3: the manifest is the swappable PAYLOAD only — it must not NAME a
    ;; BASE CAPABILITY (crun, the container host the compiler injects into every
-   ;; image). The constructor must reject it, so the contract "the manifest cannot
-   ;; add or remove a base capability" holds by construction, not just by docs.
-   (list 'manifest "manifest lists base capability crun" (lambda () (td-config #:manifest (list crun))))
+   ;; image), directly OR via a propagated input. The constructor's name-based
+   ;; pre-filter rejects both. (This is a hygiene pre-filter, not a closure gate; a
+   ;; RENAMED clone is permitted payload — block (D) below pins that, and pins the
+   ;; real guarantee: injection keeps crun present regardless of the manifest.)
+   (list 'manifest "manifest names base capability crun (direct)" (lambda () (td-config #:manifest (list crun))))
+   ;; F-review #3 propagated regression (mirrors the guix propagated case): a
+   ;; manifest package that does NOT list crun but PROPAGATES it lands crun in the
+   ;; image profile all the same. The pre-filter now walks propagated inputs
+   ;; (manifest-profile-packages), so the constructor rejects this too.
+   (list 'manifest "manifest propagates base capability crun"
+         (lambda ()
+           (td-config #:manifest (list (package (inherit hello)
+                                         (name "td-crun-propagator")
+                                         (propagated-inputs (list crun)))))))
    (list 'ship-guix? "ship-guix? non-bool"          (lambda () (td-config #:ship-guix? "yes")))
    ;; F1 regression: ship-guix? #f with a manifest that lists guix would
    ;; re-introduce the imperative surface via `packages` (the service deletion
@@ -217,6 +228,39 @@
     (exit 1))
   (format #t "  ok: every record field has a wiring row (exactly once) and a \
 validation row.~%"))
+
+;; (D) BASE-CAPABILITY boundary — pin the NARROWED, honest contract (F-review #3).
+;; The name pre-filter rejects a base capability named directly or via propagation
+;; (exercised in (B)). It deliberately does NOT reject a RENAMED clone of crun: a
+;; static name scan cannot see it, and it need not — a clone in the payload cannot
+;; REMOVE the injected capability, only add redundant payload. The real, by-
+;; construction guarantee is INJECTION: %base-capabilities is prepended in
+;; `packages`, so crun is in the effective set for ANY manifest. Assert BOTH halves
+;; here so neither the narrowed contract nor the injection guarantee can silently
+;; drift. Pure record-level checks — no store, no build.
+(let* ((renamed-crun (package (inherit crun) (name "td-renamed-crun")))
+       (cfg-thunk    (lambda () (td-config #:manifest (list renamed-crun))))
+       ;; the clone CONSTRUCTS (is NOT falsely rejected) — the narrowed contract
+       (accepted?    (not (raises? cfg-thunk)))
+       ;; ...and crun is STILL injected alongside it (manifest cannot remove it)
+       (effective    (and accepted?
+                          (operating-system-packages
+                           (td-config->operating-system (cfg-thunk)))))
+       (crun-injected? (and effective
+                            (any (lambda (p) (string=? (package-name p) "crun"))
+                                 effective))))
+  (format #t "~%== M6 base-capability boundary (F-review #3) ==~%")
+  (format #t "  renamed crun clone accepted as payload (not falsely rejected): ~a~%"
+          accepted?)
+  (format #t "  crun still injected in effective set (manifest cannot remove it): ~a~%"
+          crun-injected?)
+  (unless (and accepted? crun-injected?)
+    (format #t "FAIL: base-capability boundary does not match the narrowed contract \
+(pre-filter by name direct+propagated; injection guarantees presence; renamed clone \
+is permitted payload).~%")
+    (exit 1))
+  (format #t "  ok: pre-filter rejects by name (direct+propagated); injection \
+guarantees presence; a renamed clone is permitted payload.~%"))
 
 (with-store store
   ;; Offline contract (triage): no substitutes and no remote offloading for this

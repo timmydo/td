@@ -153,6 +153,19 @@ tracks *where we are* on it.
         pins the base capability `crun` OUTSIDE the manifest: effective = fixed base
         capabilities + manifest payload + enforcement markers). VERIFIED-RED: a no-op swap (manifest ==
         default) makes (b)+(c) go `#f` → rung exits 2; reverted.
+        **F-review #3 (boundary precision).** The earlier comments overclaimed the
+        constructor as catching "renamed/variant" crun "by construction." A probe
+        showed otherwise: direct crun rejected, but a RENAMED clone and a PROPAGATED
+        crun were both accepted. Corrected honestly, mirroring the guix pre-filter:
+        the name check now walks propagated inputs (`manifest-profile-packages`), so
+        direct + propagated crun are rejected (regression added to `typed-coverage`);
+        a RENAMED clone is provably uncatchable by a name scan and is now documented
+        as PERMITTED payload — it cannot REMOVE the injected capability. The real,
+        by-construction guarantee is reframed precisely as INJECTION (`%base-capabilities`
+        prepended in `packages` → crun present for ANY manifest); no closure gate is
+        added (unlike guix, base-capability redundancy is not a security contract).
+        `typed-coverage` block (D) now pins both halves (renamed clone accepted;
+        crun still injected).
       • **M6.3** (`5da580d`) — `tests/manifest-image-drv.scm` + `make manifest-check`:
         builds the swapped (default + `hello`) OCI image and `guix build --check`s
         it. VERIFIED reproducible: drv `zmv2j4zr…` → output

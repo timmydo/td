@@ -161,20 +161,34 @@
 ;; The fixed BASE CAPABILITIES the compiler injects into EVERY image regardless
 ;; of the manifest (M9: crun, the container host). These are a mandatory platform
 ;; invariant — part of "effective = base + payload + markers" — NOT swappable
-;; manifest content. The compiler's `packages` field references this list (single
-;; source of truth), and the constructor rejects a manifest that lists one of
-;; them (below), so the documented contract "the manifest cannot add or remove a
-;; base capability" holds BY CONSTRUCTION, not merely by convention.
-;; tests/manifest-diff.scm (d) asserts the invariant on lowered systems;
-;; tests/typed-coverage.scm asserts the constructor rejection.
+;; manifest content. The compiler's `packages` field PREPENDS this list (single
+;; source of truth) to the payload. That prepend is the by-construction guarantee
+;; for the REMOVE half of the contract: crun is present in every image for ANY
+;; manifest, so the manifest cannot REMOVE a base capability. The ADD half is a
+;; name-based hygiene PRE-FILTER (the constructor rejects a manifest that names a
+;; base capability, directly or via propagation — see below); it is NOT a
+;; closure-complete gate, and (unlike guix) needs none. tests/manifest-diff.scm
+;; (d) asserts the injection invariant on lowered systems; tests/typed-coverage.scm
+;; asserts the pre-filter rejection (direct + propagated) and the narrowed contract.
 (define %base-capabilities (list crun))
 
-;; The base capability a manifest illegally lists, or #f. Matched by NAME (like
-;; the guix check) so a renamed/variant crun is caught too — a base capability is
-;; defined by the role it fills, not object identity.
+;; The base capability a manifest redundantly names, or #f — a hygiene PRE-FILTER,
+;; not the guarantee. Matched by NAME over the manifest's PROFILE packages (direct
+;; entries PLUS transitively-propagated inputs, exactly like `manifest-has-guix?`),
+;; so both a same-named crun and a package that PROPAGATES crun are caught. It does
+;; NOT catch a RENAMED clone (a package inheriting crun under a different name) — a
+;; static name scan provably cannot, just as the guix pre-filter cannot see renamed
+;; guix. That gap is acceptable here (no closure gate needed, unlike guix's
+;; security contract): the real by-construction guarantee is INJECTION —
+;; %base-capabilities is unconditionally prepended in `packages`, so crun is in
+;; EVERY image for ANY manifest and the manifest cannot REMOVE it. A renamed crun
+;; clone in the payload does not remove or weaken that capability; it is merely
+;; redundant payload the contract does not forbid. This pre-filter just turns the
+;; common redundant listing (crun by name, direct or propagated) into a fast error.
 (define (manifest-base-capability manifest)
   (let ((names (map package-name %base-capabilities)))
-    (find (lambda (p) (member (package-name p) names)) manifest)))
+    (find (lambda (p) (member (package-name p) names))
+          (manifest-profile-packages manifest))))
 
 ;;;
 ;;; The smart constructor. Keyword-driven with defaults that, taken together,
@@ -209,18 +223,22 @@
   (check boolean? 'ssh-challenge-response? ssh-challenge-response? "a boolean")
   (check package-list? 'manifest manifest "a list of <package>")
   (check boolean? 'ship-guix? ship-guix? "a boolean")
-  ;; Cross-field — the BASE-CAPABILITY boundary. The manifest is the swappable
-  ;; PAYLOAD only; a base capability (crun, the container host) is a mandatory
-  ;; platform invariant the compiler injects into every image, not manifest
-  ;; content. Listing one is a category error (and would otherwise duplicate it
-  ;; in `packages`), so reject it at construction — keeping the documented
-  ;; contract "the manifest cannot add or remove a base capability" true by
-  ;; construction. (Per DESIGN: we deliberately do NOT expose a user-configurable
-  ;; base-capabilities field — the base set is not optional manifest content.)
+  ;; Cross-field — the BASE-CAPABILITY boundary (hygiene PRE-FILTER). The manifest
+  ;; is the swappable PAYLOAD only; a base capability (crun, the container host) is
+  ;; a mandatory platform invariant the compiler injects into every image, not
+  ;; manifest content. Naming one (directly or via a propagated input) is a
+  ;; category error — and would duplicate it in `packages` — so reject it at
+  ;; construction. This is a fast pre-filter for the common mistake, NOT a closure
+  ;; gate: a RENAMED clone of crun is not caught (a name scan cannot), and need not
+  ;; be — it cannot REMOVE the injected capability, only add redundant payload. The
+  ;; by-construction guarantee is the unconditional prepend of %base-capabilities in
+  ;; `packages` (the manifest cannot remove crun) — see `manifest-base-capability`.
+  ;; (Per DESIGN: we deliberately do NOT expose a user-configurable base-capabilities
+  ;; field — the base set is not optional manifest content.)
   (let ((cap (manifest-base-capability manifest)))
     (when cap
       (error (string-append
-              "td-config: the manifest must not list a base capability ("
+              "td-config: the manifest must not name a base capability ("
               (package-name cap) ") — base capabilities (e.g. crun, the "
               "container host) are a mandatory platform invariant the compiler "
               "injects into every image, not swappable manifest content. The "
@@ -304,9 +322,12 @@
     ;; manifest — they are container-host capabilities, not swappable manifest
     ;; entries — so they are prepended here (outside `manifest`) from the single
     ;; %base-capabilities source the constructor also guards. With %base-capabilities
-    ;; = (list crun), this is exactly the oracle's (cons crun %base-packages). The
-    ;; constructor rejects a manifest that lists a base capability, so there is no
-    ;; duplication. The guix-free-marker scans this set (crun pulls in no guix).
+    ;; = (list crun), this is exactly the oracle's (cons crun %base-packages). This
+    ;; prepend is the by-construction guarantee crun is always present (the manifest
+    ;; cannot remove it); the constructor's name pre-filter rejects a manifest that
+    ;; redundantly names a base capability (direct or propagated) so the common
+    ;; duplication is caught early. The guix-free-marker scans this set (crun pulls
+    ;; in no guix).
     (packages (let ((pkgs (append %base-capabilities (td-config-manifest c))))
                 (if (td-config-ship-guix? c)
                     pkgs
