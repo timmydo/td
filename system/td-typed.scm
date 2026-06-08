@@ -302,7 +302,9 @@
     ;; F-review #2): effective = fixed base capabilities (crun, below) + the
     ;; manifest-selected payload + enforcement markers (guix-free-marker, below).
     ;; The manifest drives ONLY the swappable payload — it is NOT the whole
-    ;; package set, and cannot add or remove a base capability. The default
+    ;; package set, and cannot remove or control the injected canonical base
+    ;; capability (a renamed crun clone in the payload is permitted, but it
+    ;; cannot remove the canonical crun the compiler injects). The default
     ;; manifest is %base-packages, which is exactly the operating-system field's
     ;; own default. A non-default manifest is a different image: a whole-image
     ;; swap, not an in-place install. (tests/manifest-diff.scm (c) pins the

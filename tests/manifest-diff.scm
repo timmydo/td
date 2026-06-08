@@ -22,10 +22,13 @@
 ;;
 ;; The manifest controls ONLY the swappable payload — it is NOT the whole
 ;; package set. Changing the manifest produces a new image generation (b); it
-;; cannot add or remove a base capability (d). Earlier wording ("the manifest IS
-;; the package set", "only the manifest decides contents") overstated this and is
-;; corrected here: the base capability `crun` is a mandatory platform invariant
-;; the compiler injects regardless of (and absent from) the manifest.
+;; cannot remove or control the injected canonical base capability (d) — a
+;; renamed crun clone in the payload is permitted, but it cannot remove the
+;; canonical crun the compiler injects. Earlier wording ("the manifest IS the
+;; package set", "only the manifest decides contents", "cannot add or remove a
+;; base capability") overstated this and is corrected here: the base capability
+;; `crun` is a mandatory platform invariant the compiler injects regardless of
+;; (and absent from) the manifest.
 ;;
 ;; Same self-discriminating shape as tests/oci-diff.scm (the M3 false-green
 ;; lesson, kept as a permanent guardrail). It asserts THREE things, each able to
