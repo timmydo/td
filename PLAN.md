@@ -476,6 +476,9 @@ tracks *where we are* on it.
       (exit 1) → the assertion goes red (3 passes / 1 unexpected failure, rung
       exits 2); reverted. With `cgroupfs` the file is present and reads exactly
       `73`. Loop GREEN at the cgroupfs manager — coreutils warmed into the store.
+      **Triage P2:** the assertion first used `string-contains … "73"`, which would
+      false-green on `173`/`730`; tightened to compare the trimmed output EXACTLY
+      against `(number->string cglimit)`. Still green.
 
 ## M10 forward plan — Native Generation Lifecycle (GATED; agreed 2026-06-07)
 

@@ -332,13 +332,14 @@
 
               ;; M9.3 — MANAGED CGROUPS: crun runs WITH a real cgroup manager
               ;; (cgroupfs, not --cgroup-manager=disabled), creates the container's
-              ;; cgroup, and applies the declared pids.max=73. The container reads
-              ;; its OWN /sys/fs/cgroup/pids.max and prints it. Self-discriminating
-              ;; BY CONSTRUCTION: cgroup2's DEFAULT pids.max is the literal "max",
-              ;; so observing "73" can only happen if crun ENFORCED the declared
-              ;; limit — a crun that ignored linux.resources would print "max".
-              ;; Asserting both (contains "73", NOT "max") proves the limit took
-              ;; effect, not merely that the cgroup file exists.
+              ;; cgroup, and applies the declared pids.max. The container reads its
+              ;; OWN /sys/fs/cgroup/pids.max and prints it. Self-discriminating BY
+              ;; CONSTRUCTION: cgroup2's DEFAULT pids.max is the literal "max", so
+              ;; the EXACT declared value can only appear if crun ENFORCED the
+              ;; limit — a crun that ignored linux.resources prints "max". The
+              ;; trimmed output must equal (number->string cglimit) EXACTLY: a
+              ;; substring check ("contains 73") would false-green on 173/730, so
+              ;; we compare the whole value.
               (let* ((cglimit 73)
                      (cfg (cglimit-config-json cgroup-rootfs-path cgroup-run-args
                                                cglimit "/td-app-cglimit"))
@@ -346,8 +347,8 @@
                 (format #t "CGLIMIT args=~s -> ~s~%" cgroup-run-args res)
                 (test-assert "crun ENFORCES the declared pids.max (managed cgroups)"
                   (and (eqv? 0 (car res))
-                       (string-contains (cdr res) "73")
-                       (not (string-contains (cdr res) "max")))))
+                       (string=? (string-trim-both (cdr res))
+                                 (number->string cglimit)))))
 
               (test-end)
               (exit (zero? (test-runner-fail-count (test-runner-current))))))))))
