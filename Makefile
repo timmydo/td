@@ -26,7 +26,10 @@
 #  13. container      — boot the shipped base and run a Guix-built OCI APP image
 #                       (guix pack -f docker hello) ON it with the shipped crun, as
 #                       root: assert the app prints its output + exits 0, with a
-#                       negative control. Proves td is a working container HOST (M9)
+#                       negative control. Proves td is a working container HOST (M9).
+#                       M9.3 also asserts crun ENFORCES a declared pids.max=73 on a
+#                       coreutils container (cgroupfs manager) — the container reads
+#                       its own /sys/fs/cgroup/pids.max back as 73 (managed cgroups)
 #
 # Every guix invocation is pinned to channels.scm via `guix time-machine`, so
 # the reproducibility oracle is honest regardless of the ambient guix version.
@@ -348,7 +351,11 @@ run:
 #    reproducible (CLAUDE.md), not just the good one. Then runs. Self-discriminating:
 #    a POSITIVE run (app prints "Hello, world!", exit 0) and TWO negative controls (a
 #    second image with a bogus DECLARED entrypoint, and a bogus runtime arg, both must
-#    fail) — see tests/container.scm.
+#    fail) — see tests/container.scm. M9.3 ADDS a managed-cgroups assertion: crun
+#    (cgroupfs manager) applies a declared pids.max=73 to a coreutils container, which
+#    reads its own /sys/fs/cgroup/pids.max back as 73 — resource-limit ENFORCEMENT, not
+#    just that crun starts (self-discriminating: the cgroup2 default is "max"). The
+#    cgroup app image+bundle are --checked for reproducibility alongside the others.
 container:
 	@echo ">> container: run an OCI app container on the booted td base (crun)"
 	@set -euo pipefail; \
@@ -359,22 +366,29 @@ container:
 	    '  (let ((img  (run-with-store store (td-app-image)))' \
 	    '        (bun  (run-with-store store (td-app-bundle)))' \
 	    '        (bimg (run-with-store store (td-app-badentry-image)))' \
-	    '        (bbun (run-with-store store (td-app-badentry-bundle))))' \
+	    '        (bbun (run-with-store store (td-app-badentry-bundle)))' \
+	    '        (cimg (run-with-store store (td-app-cgroup-image)))' \
+	    '        (cbun (run-with-store store (td-app-cgroup-bundle))))' \
 	    '    (format #t "IMAGE=~a~%" (derivation-file-name img))' \
 	    '    (format #t "BUNDLE=~a~%" (derivation-file-name bun))' \
 	    '    (format #t "BADIMAGE=~a~%" (derivation-file-name bimg))' \
-	    '    (format #t "BADBUNDLE=~a~%" (derivation-file-name bbun))))' \
+	    '    (format #t "BADBUNDLE=~a~%" (derivation-file-name bbun))' \
+	    '    (format #t "CGIMAGE=~a~%" (derivation-file-name cimg))' \
+	    '    (format #t "CGBUNDLE=~a~%" (derivation-file-name cbun))))' \
 	  | $(GUIX) repl $(LOAD) 2>/dev/null`; \
 	img=`printf '%s\n' "$$arts" | sed -n 's/^IMAGE=//p'`; \
 	bun=`printf '%s\n' "$$arts" | sed -n 's/^BUNDLE=//p'`; \
 	bimg=`printf '%s\n' "$$arts" | sed -n 's/^BADIMAGE=//p'`; \
 	bbun=`printf '%s\n' "$$arts" | sed -n 's/^BADBUNDLE=//p'`; \
-	test -n "$$img" -a -n "$$bun" -a -n "$$bimg" -a -n "$$bbun" || { echo "ERROR: could not lower the app artifacts" >&2; exit 1; }; \
+	cimg=`printf '%s\n' "$$arts" | sed -n 's/^CGIMAGE=//p'`; \
+	cbun=`printf '%s\n' "$$arts" | sed -n 's/^CGBUNDLE=//p'`; \
+	test -n "$$img" -a -n "$$bun" -a -n "$$bimg" -a -n "$$bbun" -a -n "$$cimg" -a -n "$$cbun" || { echo "ERROR: could not lower the app artifacts" >&2; exit 1; }; \
 	echo ">> app artifacts: image=$$img bundle=$$bun"; \
 	echo ">> negative-control artifacts: badimage=$$bimg badbundle=$$bbun"; \
-	$(GUIX) build "$$img" "$$bun" "$$bimg" "$$bbun" >/dev/null; \
-	echo ">> reproducibility: guix build --check the app images + extracted bundles (good + negative control)"; \
-	$(GUIX) build --check "$$img" "$$bun" "$$bimg" "$$bbun" >/dev/null; \
+	echo ">> cgroup artifacts (M9.3): cgimage=$$cimg cgbundle=$$cbun"; \
+	$(GUIX) build "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun" >/dev/null; \
+	echo ">> reproducibility: guix build --check the app images + extracted bundles (good + negative + cgroup)"; \
+	$(GUIX) build --check "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun" >/dev/null; \
 	drv=`printf '%s\n' \
 	    '(use-modules (guix) (gnu tests) (tests container))' \
 	    '(with-store store' \

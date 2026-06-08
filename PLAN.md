@@ -446,8 +446,9 @@ tracks *where we are* on it.
       limit took effect. Because M9 runs crun as guest root, delegated-subtree
       setup is probably unnecessary (that mainly matters for rootless runtimes).
 
-- [ ] **M9.3 — managed cgroups: prove crun ENFORCES a declared resource limit
-      (M9 hardening; closes the M9 cgroup scope boundary).** IN PROGRESS. M9.2 ran
+- [x] **M9.3 — managed cgroups: prove crun ENFORCES a declared resource limit
+      (M9 hardening; closes the M9 cgroup scope boundary).** GREEN + verified-red.
+      M9.2 ran
       crun with `--cgroup-manager=disabled`, proving crun STARTS/RUNS a container
       but NOT cgroup placement or limit ENFORCEMENT (the explicit M9 scope
       boundary above). M9.3 runs crun WITH a real cgroup manager (`cgroupfs`) on
@@ -469,8 +470,12 @@ tracks *where we are* on it.
       there is no host cgroup exposure (that was M8's sandbox-only concern).
       *Still NOT in M9.3:* memory/io limits; cgroup delegation / sub-tree control;
       the systemd cgroup manager (no systemd in the base — `cgroupfs` is correct);
-      rootless delegated subtrees (M9 runs crun as root). Verified-red on record:
-      <fill after the loop goes green>.
+      rootless delegated subtrees (M9 runs crun as root). VERIFIED-RED on record:
+      flipping the cgroup run from `cgroupfs` to `--cgroup-manager=disabled` makes
+      crun create NO cgroup, so `/sys/fs/cgroup/pids.max` is absent → `cat` fails
+      (exit 1) → the assertion goes red (3 passes / 1 unexpected failure, rung
+      exits 2); reverted. With `cgroupfs` the file is present and reads exactly
+      `73`. Loop GREEN at the cgroupfs manager — coreutils warmed into the store.
 
 ## M10 forward plan — Native Generation Lifecycle (GATED; agreed 2026-06-07)
 

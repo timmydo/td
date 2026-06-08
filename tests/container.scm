@@ -36,13 +36,16 @@
 ;; The positive proves bundle setup is sound, so the negatives isolate "did the
 ;; app's DECLARED entrypoint actually run".
 ;;
-;; SCOPE (cgroups): crun runs with `--cgroup-manager=disabled`, so this rung
-;; proves crun STARTS and RUNS a container to completion, NOT cgroup placement,
-;; delegation, or resource-limit ENFORCEMENT. Running OCI containers without
-;; resource limits is still a valid container-host capability (so this does not
-;; gate M9). Enforcement is a later managed-cgroups milestone: run crun without
-;; --cgroup-manager=disabled, apply a deterministic limit (memory.max/pids.max),
-;; and inspect the created cgroup. See PLAN.md (M9 cgroup scope boundary).
+;; CGROUPS: the M9.2 run/badentry/runtime-arg assertions use
+;; `--cgroup-manager=disabled` (they prove crun STARTS and RUNS a container, not
+;; enforcement). M9.3 adds a MANAGED-cgroups assertion: crun runs WITH the
+;; cgroupfs manager, creates the container's cgroup, applies a declared
+;; pids.max=73, and the container reads its OWN /sys/fs/cgroup/pids.max back —
+;; proving resource-limit ENFORCEMENT, not just that crun starts. Self-
+;; discriminating by construction (cgroup2's default pids.max is "max", so "73"
+;; can only appear if crun enforced the limit). Still out of scope: memory/io
+;; limits, cgroup delegation/sub-tree control, the systemd cgroup manager (no
+;; systemd in the base), rootless delegated subtrees (M9 runs crun as root).
 (define-module (tests container)
   #:use-module (gnu tests)
   #:use-module (gnu system)
@@ -60,6 +63,8 @@
             td-app-bundle
             td-app-badentry-image
             td-app-badentry-bundle
+            td-app-cgroup-image
+            td-app-cgroup-bundle
             %test-td-container))
 
 ;; A minimal OCI APP image: a profile with just GNU hello, packed as a Docker
@@ -86,6 +91,17 @@
 (define (td-app-badentry-image)
   (app-image "td-app-badentry" "bin/td-nonexistent-app-xyz"))
 
+;; M9.3 (managed cgroups). A coreutils app image whose declared entrypoint is
+;; `cat`: the cgroup test runs it as `cat /sys/fs/cgroup/pids.max` so the
+;; container reads its OWN cgroup limit (the one crun just set) and prints it.
+;; A separate profile from `hello` — coreutils gives us `cat`.
+(define cgroup-app-profile
+  (profile (content (packages->manifest (list coreutils)))))
+
+(define (td-app-cgroup-image)
+  (docker-image "td-app-cgroup" cgroup-app-profile
+                #:entry-point "bin/cat" #:localstatedir? #f))
+
 ;; Unpack an app image into a runtime BUNDLE at build time. The output is a
 ;; directory holding:
 ;;   rootfs/    — the image's layer extracted, plus /proc and /dev mountpoints.
@@ -100,7 +116,11 @@
 ;; object as a (key . value) alist and an array as a vector, so we navigate
 ;; manifest[0].Config -> config.config.entrypoint and re-emit it with scm->json.
 ;; mlet binds the (monadic) docker-image to a derivation so #$image references it.
-(define (app-bundle name image)
+;; MOUNTPOINTS are extra empty dirs to pre-create in the (read-only) rootfs so
+;; crun can mount over them — the default app needs /proc and /dev; the cgroup
+;; app also needs /sys/fs/cgroup (crun cannot mkdir a mountpoint in a read-only
+;; rootfs, so we materialise them here at build time).
+(define* (app-bundle name image #:key (mountpoints '("/proc" "/dev")))
   (mlet %store-monad ((image image))
     (gexp->derivation name
       (with-extensions (list guile-json-4)
@@ -120,8 +140,8 @@
                       "-xf" #$image "-C" "extract")
               (let ((layer (car (find-files "extract" "layer\\.tar$"))))
                 (invoke #$(file-append tar "/bin/tar") "-xf" layer "-C" rootfs))
-              (mkdir-p (string-append rootfs "/proc"))
-              (mkdir-p (string-append rootfs "/dev"))
+              (for-each (lambda (m) (mkdir-p (string-append rootfs m)))
+                        '#$mountpoints)
               ;; Read the image's declared entrypoint out of its own config and
               ;; emit it as the OCI process args. manifest.json is a one-element
               ;; array (vector) of objects; manifest[0].Config names the config
@@ -151,9 +171,16 @@
 (define (td-app-badentry-bundle)
   (app-bundle "td-app-badentry-bundle" (td-app-badentry-image)))
 
+;; M9.3 cgroup bundle: also pre-create /sys/fs/cgroup so crun can mount the
+;; container's own (read-only) cgroup2 view over it.
+(define (td-app-cgroup-bundle)
+  (app-bundle "td-app-cgroup-bundle" (td-app-cgroup-image)
+              #:mountpoints '("/proc" "/dev" "/sys/fs/cgroup")))
+
 (define (run-container-test)
   (mlet %store-monad ((bundle          (td-app-bundle))
-                      (badentry-bundle (td-app-badentry-bundle)))
+                      (badentry-bundle (td-app-badentry-bundle))
+                      (cgroup-bundle   (td-app-cgroup-bundle)))
     (let* ((os (marionette-operating-system
                 td-system
                 #:imported-modules '((gnu services herd))))
@@ -181,6 +208,9 @@
               (define badentry-bundle-path #$badentry-bundle)
               (define badentry-rootfs-path
                 (string-append badentry-bundle-path "/rootfs"))
+              (define cgroup-bundle-path #$cgroup-bundle)
+              (define cgroup-rootfs-path
+                (string-append cgroup-bundle-path "/rootfs"))
               (define crun-bin "/run/current-system/profile/bin/crun")
               ;; Each app image's DECLARED entrypoint, read from its own bundle
               ;; (extracted from the image archive at build time). This is what
@@ -190,6 +220,16 @@
                   get-string-all))
               (define image-args    (read-args bundle-path))
               (define badentry-args (read-args badentry-bundle-path))
+              ;; The cgroup app's declared entrypoint is `cat`; append the cgroup
+              ;; file it should read, so the OCI args are
+              ;; ["/gnu/store/…/bin/cat","/sys/fs/cgroup/pids.max"]. Splice the
+              ;; path into the image's own JSON args array (before its closing ]).
+              (define cgroup-entry-args (read-args cgroup-bundle-path))
+              (define cgroup-run-args
+                (string-append
+                 (substring cgroup-entry-args 0
+                            (string-rindex cgroup-entry-args #\]))
+                 ",\"/sys/fs/cgroup/pids.max\"]"))
               ;; An OCI runtime config.json over ROOTFS whose process.args is the
               ;; JSON array ARGS-JSON — same shape the M9 gate proved: real root
               ;; (no userns), cgroups disabled, empty network ns, /proc + tmpfs
@@ -206,6 +246,29 @@
                  "\"strictatime\",\"mode=755\",\"size=65536k\"]}],\"linux\":{"
                  "\"namespaces\":[{\"type\":\"pid\"},{\"type\":\"mount\"},"
                  "{\"type\":\"ipc\"},{\"type\":\"uts\"},{\"type\":\"network\"}]}}"))
+              ;; M9.3: an OCI config that ENABLES cgroups — it declares a
+              ;; pids.max LIMIT (linux.resources.pids.limit) and a cgroupsPath, and
+              ;; adds a `cgroup` namespace + a read-only cgroup2 mount so the
+              ;; container sees its OWN cgroup at /sys/fs/cgroup. Run with crun's
+              ;; cgroupfs manager, crun creates that cgroup and writes the limit
+              ;; into it; the container then reads pids.max back and prints it.
+              (define (cglimit-config-json rootfs args-json limit cgpath)
+                (string-append
+                 "{\"ociVersion\":\"1.0.0\",\"process\":{\"terminal\":false,"
+                 "\"user\":{\"uid\":0,\"gid\":0},\"args\":" args-json ","
+                 "\"env\":[\"PATH=/bin:/usr/bin\",\"HOME=/\",\"TERM=dumb\"],"
+                 "\"cwd\":\"/\"},\"root\":{\"path\":\"" rootfs "\",\"readonly\":true},"
+                 "\"hostname\":\"td-app\",\"mounts\":[{\"destination\":\"/proc\","
+                 "\"type\":\"proc\",\"source\":\"proc\"},{\"destination\":\"/dev\","
+                 "\"type\":\"tmpfs\",\"source\":\"tmpfs\",\"options\":[\"nosuid\","
+                 "\"strictatime\",\"mode=755\",\"size=65536k\"]},"
+                 "{\"destination\":\"/sys/fs/cgroup\",\"type\":\"cgroup\","
+                 "\"source\":\"cgroup\",\"options\":[\"ro\",\"nosuid\",\"noexec\","
+                 "\"nodev\"]}],\"linux\":{\"cgroupsPath\":\"" cgpath "\","
+                 "\"resources\":{\"pids\":{\"limit\":" (number->string limit) "}},"
+                 "\"namespaces\":[{\"type\":\"pid\"},{\"type\":\"mount\"},"
+                 "{\"type\":\"ipc\"},{\"type\":\"uts\"},{\"type\":\"cgroup\"},"
+                 "{\"type\":\"network\"}]}}"))
               ;; POSITIVE execs the image's own declared entrypoint. The
               ;; IMAGE-METADATA negative execs the SECOND image's own (bogus)
               ;; declared entrypoint, from its own rootfs. The RUNTIME-ARG negative
@@ -220,8 +283,11 @@
               (marionette-eval '(mkdir "/tmp/app") marionette)
 
               ;; Run a container with the given config under container-id TAG;
-              ;; return (exit-status . output).
-              (define (run-app config tag)
+              ;; return (exit-status . output). CGMGR selects crun's cgroup
+              ;; manager: "disabled" (the M9.2 run path — no cgroup created) or
+              ;; "cgroupfs" (M9.3 — crun creates the container's cgroup and
+              ;; applies the OCI linux.resources limits to it).
+              (define* (run-app config tag #:optional (cgmgr "disabled"))
                 (marionette-eval
                  `(begin
                     (use-modules (ice-9 popen) (ice-9 rdelim))
@@ -229,7 +295,7 @@
                       (lambda (p) (display ,config p)))
                     (let* ((cmd (string-append
                                  "cd /tmp/app && " ,crun-bin
-                                 " --cgroup-manager=disabled run " ,tag " 2>&1"))
+                                 " --cgroup-manager=" ,cgmgr " run " ,tag " 2>&1"))
                            (port (open-input-pipe cmd))
                            (out (read-string port))
                            (st (close-pipe port)))
@@ -264,6 +330,25 @@
                 (test-assert "a bogus app entrypoint fails (rung discriminates)"
                   (not (eqv? 0 (car neg)))))
 
+              ;; M9.3 — MANAGED CGROUPS: crun runs WITH a real cgroup manager
+              ;; (cgroupfs, not --cgroup-manager=disabled), creates the container's
+              ;; cgroup, and applies the declared pids.max=73. The container reads
+              ;; its OWN /sys/fs/cgroup/pids.max and prints it. Self-discriminating
+              ;; BY CONSTRUCTION: cgroup2's DEFAULT pids.max is the literal "max",
+              ;; so observing "73" can only happen if crun ENFORCED the declared
+              ;; limit — a crun that ignored linux.resources would print "max".
+              ;; Asserting both (contains "73", NOT "max") proves the limit took
+              ;; effect, not merely that the cgroup file exists.
+              (let* ((cglimit 73)
+                     (cfg (cglimit-config-json cgroup-rootfs-path cgroup-run-args
+                                               cglimit "/td-app-cglimit"))
+                     (res (run-app cfg "td-app-cglimit" "cgroupfs")))
+                (format #t "CGLIMIT args=~s -> ~s~%" cgroup-run-args res)
+                (test-assert "crun ENFORCES the declared pids.max (managed cgroups)"
+                  (and (eqv? 0 (car res))
+                       (string-contains (cdr res) "73")
+                       (not (string-contains (cdr res) "max")))))
+
               (test-end)
               (exit (zero? (test-runner-fail-count (test-runner-current))))))))))
 
@@ -275,5 +360,8 @@
 OWN declared entrypoint: assert the app prints its output and exits 0. Two \
 negative controls prove the rung discriminates: a SECOND image whose DECLARED \
 entrypoint is bogus must fail (image metadata drives the run), and a bogus \
-runtime arg must fail.")
+runtime arg must fail. M9.3 adds a MANAGED-cgroups assertion: crun (cgroupfs \
+manager) applies a declared pids.max=73 to a coreutils container, which reads \
+its own /sys/fs/cgroup/pids.max back as 73 — proving resource-limit enforcement \
+(self-discriminating: the cgroup2 default is \"max\").")
    (value (run-container-test))))
