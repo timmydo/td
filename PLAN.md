@@ -446,6 +446,86 @@ tracks *where we are* on it.
       limit took effect. Because M9 runs crun as guest root, delegated-subtree
       setup is probably unnecessary (that mainly matters for rootless runtimes).
 
+- [ ] **M9.3 — managed cgroups: prove crun ENFORCES a declared resource limit
+      (M9 hardening; closes the M9 cgroup scope boundary).** IN PROGRESS. M9.2 ran
+      crun with `--cgroup-manager=disabled`, proving crun STARTS/RUNS a container
+      but NOT cgroup placement or limit ENFORCEMENT (the explicit M9 scope
+      boundary above). M9.3 runs crun WITH a real cgroup manager (`cgroupfs`) on
+      the booted base, applies a deterministic `pids.max` via the OCI config's
+      `linux.resources.pids.limit`, and asserts the limit TOOK EFFECT by having
+      the container read its OWN `/sys/fs/cgroup/pids.max` (a `cgroup` namespace +
+      a read-only cgroup2 mount give it a namespaced view of the very cgroup crun
+      created for it) and print it.
+      *Acceptance test* (extends `tests/container.scm` — reuses the one base boot,
+      §1.3): a coreutils app image (declared entry-point `bin/cat`) is run as root
+      with cgroups ENABLED and `pids.limit = 73`; assert the container prints
+      exactly `73`. **Self-discriminating BY CONSTRUCTION:** cgroup2's default
+      `pids.max` is the literal string `max`, so reading `73` can ONLY happen if
+      crun applied the declared limit — a crun that ignored `resources` yields
+      `max` ≠ `73` → red. The existing `container` rung is unchanged (it still
+      proves the disabled-cgroup run path); M9.3 ADDS the enforcement assertion +
+      the cgroup app image/bundle artifacts (`--check`ed like the others).
+      No `check.sh` change: crun is shipped in the base and runs as guest root, so
+      there is no host cgroup exposure (that was M8's sandbox-only concern).
+      *Still NOT in M9.3:* memory/io limits; cgroup delegation / sub-tree control;
+      the systemd cgroup manager (no systemd in the base — `cgroupfs` is correct);
+      rootless delegated subtrees (M9 runs crun as root). Verified-red on record:
+      <fill after the loop goes green>.
+
+## M10 forward plan — Native Generation Lifecycle (GATED; agreed 2026-06-07)
+
+The north-star "atomic verified generations" thread, scoped after a critique
+round. **Crosses a new layer (DESIGN §2.3 "verified generations"), so it is GATED
+on §4.3 sign-off at M10.0 before any implementation.** Three corrections settled
+in discussion (recorded so they are not relitigated):
+
+1. **State boundary: DEFINE, don't abandon.** "Nothing persists across test runs"
+   (§3) is a TEST-ISOLATION boundary (fresh disk per test, wiped on reset) — it
+   does NOT forbid persistence across reboots WITHIN one test. A lifecycle test
+   stays fully ephemeral: `create fresh disk → boot A → stage B → reboot → verify
+   → destroy disk`. v0 §3 says "no persistent writable state to protect in v0";
+   M10 INTRODUCES guest-persistent state for the first time, so the writable-vs-
+   immutable boundary must be DEFINED (M10.0) — not lifted.
+2. **Oracle split (not `guix system reconfigure`).** The A/B + one-shot +
+   health-commit + rollback model is NEW behavior Guix does not have, so directive
+   #4's "build both ways, diff" does NOT apply to the deployment plane (forcing
+   identical on-disk output would smuggle Guix deployment semantics into the
+   "neutral" contract). Oracle = **Guix builds the artifact** (bundle reproducible,
+   `--check`); the **deployment plane is tested against an explicit lifecycle
+   state machine** (artifact staged correct; active slot unchanged before commit;
+   candidate boots once; healthy → commit; unhealthy → rollback; interrupted
+   staging leaves the active generation bootable). Keep ONE narrow artifact-level
+   equivalence: after native activation, the running generation is bit-identical
+   to the Guix-built one (the stager TRANSPORTS, does not transform/corrupt).
+3. **Integrity ≠ security rung.** Hash-based CORRUPTION detection is ordinary
+   functional behavior (merge-on-green, self-discriminating). Authenticity,
+   signatures, key management, anti-rollback/downgrade, adversarial verification
+   are the human-owned security surface → a separate LATER security milestone.
+
+**Gated sub-ladder:**
+- **M10.0 — scope + feasibility gate (§4.3 sign-off REQUIRED before M10.1).**
+  Approve the new layer; DEFINE persistent vs immutable guest state; PROVE GRUB
+  one-shot boot (`boot_once`/saved-entry) and a multi-boot marionette harness;
+  fix the commit primitive (single atomic op) and the boot-success signal
+  (boot-counter decrement + userspace health agent clearing the one-shot flag);
+  define fast- vs full-loop rung placement (multi-boot = full loop, §1.3).
+- **M10.1 — deterministic generation bundle.** Guix builds it (`generation.json`
+  = metadata + integrity hashes around STANDARD boot artifacts: kernel, initrd,
+  root image, health checks; anchor to an existing boot convention, don't invent
+  a bootloader scheme). Reproducible + `--check`; malformed-bundle NEGATIVE.
+- **M10.2 — guix-free offline staging.** Stage into the inactive A/B slot with no
+  guix/daemon/store-mutation/network. Reject a corrupted bundle (hash). Prove the
+  ACTIVE slot survives interrupted staging (fault injection at named points:
+  mid-write, post-write/pre-commit, mid-commit).
+- **M10.3 — activation + commit.** Boot the candidate ONCE; commit only after
+  health checks pass; assert "active slot unchanged BEFORE commit" as an explicit
+  positive; artifact-fidelity check (running B == Guix-built B).
+- **M10.4 — automatic rollback.** A broken candidate returns to the previous
+  generation; persistent state intact; fresh test env persists only across THAT
+  test's reboots.
+- **Later security milestone** (separate, human-owned): signatures, trusted
+  metadata, anti-rollback policy, runtime integrity enforcement.
+
 ## M7 promotion — shipped default flipped to guix-free (signed off 2026-06-06)
 
 Human sign-off (§4.3) on the whole M4–M7 stack, AND the spec decision to **ship the
