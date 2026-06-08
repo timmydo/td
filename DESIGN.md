@@ -216,7 +216,7 @@ every connection. Promoting these from "extend" into
 numbered ladder rungs (M3+ login control included) remains a spec decision for the human
 reviewer; this sign-off is on the *implementations*, not their ladder numbering.
 
-**M8 (human-directed, pending §4.3 sign-off) — RUN the shipped image.** The earlier
+**M8 (human-directed, signed off 2026-06-07 §4.3) — RUN the shipped image.** The earlier
 note's "a literal docker-run runtime check still needs the OCI app model (§2.3,
 deferred)" is now partly realised: the `run` rung (12th rung) executes the shipped
 guix-free OCI image as a real **rootless OCI container** via **crun** (the runtime
@@ -229,7 +229,7 @@ image entrypoint is already covered by the marionette VM rungs), and it does **n
 a `guix install`-inside-a-running-container test (artifact absence from `no-guix` is
 stronger).
 
-**M9 (human-directed, pending §4.3 sign-off) — the booted base is a container HOST.**
+**M9 (human-directed, signed off 2026-06-07 §4.3) — the booted base is a container HOST.**
 *Direction change (2026-06-07):* FHS-flattening the base (the earlier M9) was DROPPED.
 In a "minimal base, run everything else in containers" design, FHS is a property of the
 APP container images, not of the base — nothing foreign runs directly on the base, so

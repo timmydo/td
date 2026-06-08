@@ -321,8 +321,8 @@ tracks *where we are* on it.
 
 - [x] **M8 — RUN the shipped OCI image as a real container (DESIGN §6 "running the
       image" / OCI app model).** GREEN + verified-red. **Human-directed new-layer
-      milestone (user chose: crun, run-rung first, 2026-06-06); opened for §4.3
-      sign-off — it crosses into the §2.3 "OCI app model" line, like M5/M6/M7.**
+      milestone (user chose: crun, run-rung first, 2026-06-06); signed off
+      2026-06-07 (§4.3) — it crosses into the §2.3 "OCI app model" line, like M5/M6/M7.**
       Every rung M5–M7 proves a PROPERTY of the artifact (reproducible, guix-free,
       manifest-driven) but none ever RAN it. M8 closes that: the shipped guix-free
       OCI image is executed as a real, rootless OCI container and its userspace is
@@ -371,7 +371,8 @@ tracks *where we are* on it.
 
 - [x] **M9 — container host: run an OCI APP container on the booted base
       (human-directed; SUPERSEDES FHS-on-base).** GREEN + verified-red (M9.1 +
-      M9.2). The loop is now **13 rungs** (M9.2 added `container`).
+      M9.2), **signed off 2026-06-07 (§4.3)** — crosses the §2.3 "OCI app model"
+      line like M5–M8. The loop is now **13 rungs** (M9.2 added `container`).
       **Direction change (user, 2026-06-07).** FHS-flattening the BASE was dropped:
       in a "minimal base, run everything else in containers" design, FHS is a
       property of the APP container images, not of the base — nothing foreign runs
