@@ -342,10 +342,13 @@ run:
 #    concern; M9.1 made the base a host: cgroup2 mounted + crun shipped). Marionette
 #    rung, so it lowers-then-realises like `test`/`boot-disk` for an honest exit
 #    status. The app runs via the IMAGE'S OWN declared entrypoint (read from its
-#    archive — a bogus #:entry-point fails the positive, F1). First `--check`s the
-#    app image + extracted bundle (every artifact is reproducible — CLAUDE.md), then
-#    runs. Self-discriminating: a POSITIVE run (app prints "Hello, world!", exit 0)
-#    and a NEGATIVE control (a bogus entrypoint must fail) — see tests/container.scm.
+#    archive — a bogus #:entry-point fails the positive, F1). First `--check`s ALL
+#    FOUR app artifacts — the good image+bundle AND the bad-entrypoint image+bundle
+#    used by the image-metadata negative — so every artifact is permanently proven
+#    reproducible (CLAUDE.md), not just the good one. Then runs. Self-discriminating:
+#    a POSITIVE run (app prints "Hello, world!", exit 0) and TWO negative controls (a
+#    second image with a bogus DECLARED entrypoint, and a bogus runtime arg, both must
+#    fail) — see tests/container.scm.
 container:
 	@echo ">> container: run an OCI app container on the booted td base (crun)"
 	@set -euo pipefail; \
@@ -353,18 +356,25 @@ container:
 	    '(use-modules (guix) (guix monads) (tests container))' \
 	    '(with-store store' \
 	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
-	    '  (let ((img (run-with-store store (td-app-image)))' \
-	    '        (bun (run-with-store store (td-app-bundle))))' \
+	    '  (let ((img  (run-with-store store (td-app-image)))' \
+	    '        (bun  (run-with-store store (td-app-bundle)))' \
+	    '        (bimg (run-with-store store (td-app-badentry-image)))' \
+	    '        (bbun (run-with-store store (td-app-badentry-bundle))))' \
 	    '    (format #t "IMAGE=~a~%" (derivation-file-name img))' \
-	    '    (format #t "BUNDLE=~a~%" (derivation-file-name bun))))' \
+	    '    (format #t "BUNDLE=~a~%" (derivation-file-name bun))' \
+	    '    (format #t "BADIMAGE=~a~%" (derivation-file-name bimg))' \
+	    '    (format #t "BADBUNDLE=~a~%" (derivation-file-name bbun))))' \
 	  | $(GUIX) repl $(LOAD) 2>/dev/null`; \
 	img=`printf '%s\n' "$$arts" | sed -n 's/^IMAGE=//p'`; \
 	bun=`printf '%s\n' "$$arts" | sed -n 's/^BUNDLE=//p'`; \
-	test -n "$$img" -a -n "$$bun" || { echo "ERROR: could not lower the app artifacts" >&2; exit 1; }; \
+	bimg=`printf '%s\n' "$$arts" | sed -n 's/^BADIMAGE=//p'`; \
+	bbun=`printf '%s\n' "$$arts" | sed -n 's/^BADBUNDLE=//p'`; \
+	test -n "$$img" -a -n "$$bun" -a -n "$$bimg" -a -n "$$bbun" || { echo "ERROR: could not lower the app artifacts" >&2; exit 1; }; \
 	echo ">> app artifacts: image=$$img bundle=$$bun"; \
-	$(GUIX) build "$$img" "$$bun" >/dev/null; \
-	echo ">> reproducibility: guix build --check the app image + extracted bundle"; \
-	$(GUIX) build --check "$$img" "$$bun" >/dev/null; \
+	echo ">> negative-control artifacts: badimage=$$bimg badbundle=$$bbun"; \
+	$(GUIX) build "$$img" "$$bun" "$$bimg" "$$bbun" >/dev/null; \
+	echo ">> reproducibility: guix build --check the app images + extracted bundles (good + negative control)"; \
+	$(GUIX) build --check "$$img" "$$bun" "$$bimg" "$$bbun" >/dev/null; \
 	drv=`printf '%s\n' \
 	    '(use-modules (guix) (gnu tests) (tests container))' \
 	    '(with-store store' \

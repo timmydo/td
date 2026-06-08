@@ -41,6 +41,7 @@
              (gnu bootloader)           ;bootloader-configuration-targets
              (gnu system file-systems)  ;file-system-* accessors
              (gnu packages base)        ;hello
+             (gnu packages containers)  ;crun — base capability (F-review #2)
              (gnu packages package-management) ;guix (F1 regression)
              (guix packages)            ;package, this-package (F1 transitive regression)
              (srfi srfi-1)
@@ -137,6 +138,11 @@
    (list 'ssh-challenge-response? "ssh-challenge-response? non-bool" (lambda () (td-config #:ssh-challenge-response? 1)))
    (list 'manifest "manifest non-list"              (lambda () (td-config #:manifest 42)))
    (list 'manifest "manifest non-packages"          (lambda () (td-config #:manifest (list 1 2))))
+   ;; F-review #2: the manifest is the swappable PAYLOAD only — it must not list a
+   ;; BASE CAPABILITY (crun, the container host the compiler injects into every
+   ;; image). The constructor must reject it, so the contract "the manifest cannot
+   ;; add or remove a base capability" holds by construction, not just by docs.
+   (list 'manifest "manifest lists base capability crun" (lambda () (td-config #:manifest (list crun))))
    (list 'ship-guix? "ship-guix? non-bool"          (lambda () (td-config #:ship-guix? "yes")))
    ;; F1 regression: ship-guix? #f with a manifest that lists guix would
    ;; re-introduce the imperative surface via `packages` (the service deletion

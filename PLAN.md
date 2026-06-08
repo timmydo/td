@@ -123,10 +123,13 @@ tracks *where we are* on it.
 
 - [x] **M6 — manifest-driven, image-swap-only INTERFACE (DESIGN §6).** GREEN +
       verified-red, **signed off 2026-06-06 (§4.3) — extends the OCI layer M5 opened.**
-      Makes image package contents a declarative function of a *manifest*: the
-      intended way to change what the image contains is to declare a different
-      manifest and rebuild the WHOLE image — a wholesale swap, never an in-place
-      install. **Scope honesty (triage #4):** M6 proves the *build interface* is
+      Makes the image's swappable package PAYLOAD a declarative function of a
+      *manifest*: the intended way to change what the image's payload contains is
+      to declare a different manifest and rebuild the WHOLE image — a wholesale
+      swap, never an in-place install. (The manifest is not the whole package set:
+      effective = fixed base capabilities, e.g. crun + manifest payload +
+      enforcement markers; the base capabilities are a manifest-independent
+      platform invariant — F-review #2.) **Scope honesty (triage #4):** M6 proves the *build interface* is
       manifest-driven; it does NOT yet PROVE the *absence* of an imperative
       mutation surface — the built OCI image still ships `guix`/`guix-daemon`, so
       an in-image `guix install` remains physically possible. Removing/disabling
@@ -145,8 +148,10 @@ tracks *where we are* on it.
         (a) default manifest converges to the oracle (`8v1bdz2v…`); (b) a manifest
         adding one package (GNU `hello`) lowers to a DIFFERENT OCI image
         (`zmv2j4zr…`) — a new whole-image generation; (c) `hello` is in the swapped
-        system's package set and ABSENT from the default's (the manifest, and only
-        the manifest, drives contents). VERIFIED-RED: a no-op swap (manifest ==
+        system's package set and ABSENT from the default's (the manifest drives the
+        swappable PAYLOAD — not the whole package set; F-review #2 added (d), which
+        pins the base capability `crun` OUTSIDE the manifest: effective = fixed base
+        capabilities + manifest payload + enforcement markers). VERIFIED-RED: a no-op swap (manifest ==
         default) makes (b)+(c) go `#f` → rung exits 2; reverted.
       • **M6.3** (`5da580d`) — `tests/manifest-image-drv.scm` + `make manifest-check`:
         builds the swapped (default + `hello`) OCI image and `guix build --check`s

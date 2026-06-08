@@ -194,8 +194,10 @@ test.
 "extend" slot has so far been realized as milestones that pull §6 parking-lot threads,
 all on `main`, green, with verified-red differentials. They were **signed off on
 2026-06-06**: **M5** — the same declaration also lowers to a reproducible Docker/OCI
-image; **M6** — manifest-driven, image-swap-only *build interface*: image contents are a
-declarative function of a typed `manifest`, and a changed manifest is a whole new
+image; **M6** — manifest-driven, image-swap-only *build interface*: the image's swappable
+package *payload* is a declarative function of a typed `manifest` (effective packages =
+fixed base capabilities + manifest payload + enforcement markers; the base capabilities,
+e.g. crun, are a manifest-independent invariant), and a changed manifest is a whole new
 reproducible image generation; **M7** — image-swap-only *by construction*: the typed
 `ship-guix?` field (when #f) deletes `guix-service-type` and embeds a closure-level
 `guix-free-marker`, so the realized image carries no `guix`/`guix-daemon` binary,

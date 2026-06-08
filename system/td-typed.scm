@@ -158,6 +158,24 @@
   (any (lambda (p) (string=? (package-name p) "guix"))
        (manifest-profile-packages manifest)))
 
+;; The fixed BASE CAPABILITIES the compiler injects into EVERY image regardless
+;; of the manifest (M9: crun, the container host). These are a mandatory platform
+;; invariant — part of "effective = base + payload + markers" — NOT swappable
+;; manifest content. The compiler's `packages` field references this list (single
+;; source of truth), and the constructor rejects a manifest that lists one of
+;; them (below), so the documented contract "the manifest cannot add or remove a
+;; base capability" holds BY CONSTRUCTION, not merely by convention.
+;; tests/manifest-diff.scm (d) asserts the invariant on lowered systems;
+;; tests/typed-coverage.scm asserts the constructor rejection.
+(define %base-capabilities (list crun))
+
+;; The base capability a manifest illegally lists, or #f. Matched by NAME (like
+;; the guix check) so a renamed/variant crun is caught too — a base capability is
+;; defined by the role it fills, not object identity.
+(define (manifest-base-capability manifest)
+  (let ((names (map package-name %base-capabilities)))
+    (find (lambda (p) (member (package-name p) names)) manifest)))
+
 ;;;
 ;;; The smart constructor. Keyword-driven with defaults that, taken together,
 ;;; describe EXACTLY the system the hand-written `td-system` declares — so
@@ -191,6 +209,22 @@
   (check boolean? 'ssh-challenge-response? ssh-challenge-response? "a boolean")
   (check package-list? 'manifest manifest "a list of <package>")
   (check boolean? 'ship-guix? ship-guix? "a boolean")
+  ;; Cross-field — the BASE-CAPABILITY boundary. The manifest is the swappable
+  ;; PAYLOAD only; a base capability (crun, the container host) is a mandatory
+  ;; platform invariant the compiler injects into every image, not manifest
+  ;; content. Listing one is a category error (and would otherwise duplicate it
+  ;; in `packages`), so reject it at construction — keeping the documented
+  ;; contract "the manifest cannot add or remove a base capability" true by
+  ;; construction. (Per DESIGN: we deliberately do NOT expose a user-configurable
+  ;; base-capabilities field — the base set is not optional manifest content.)
+  (let ((cap (manifest-base-capability manifest)))
+    (when cap
+      (error (string-append
+              "td-config: the manifest must not list a base capability ("
+              (package-name cap) ") — base capabilities (e.g. crun, the "
+              "container host) are a mandatory platform invariant the compiler "
+              "injects into every image, not swappable manifest content. The "
+              "manifest drives only the payload; drop it from the manifest."))))
   ;; Cross-field (M7) — CHEAP PRE-FILTER ONLY, not the guarantee. ship-guix? #f
   ;; promises an image with no imperative guix surface; the manifest can defeat that
   ;; by putting guix into the image's profile. We fast-fail the OBVIOUS cases here
@@ -266,11 +300,14 @@
     ;; oracle (system td) embeds this same marker, so the default config still lowers
     ;; byte-for-byte to it (§2.5) — at the new guix-free digest. An explicit #t
     ;; config takes the manifest verbatim (no marker) and diverges.
-    ;; M9: `crun` is shipped in the base regardless of the user manifest — it is a
-    ;; container-host capability, not a swappable manifest entry — so it is prepended
-    ;; here (outside `manifest`), exactly as the oracle conses it onto %base-packages.
-    ;; The guix-free-marker scans this crun-inclusive set (crun pulls in no guix).
-    (packages (let ((pkgs (cons crun (td-config-manifest c))))
+    ;; M9: the base capabilities (`crun`) are shipped regardless of the user
+    ;; manifest — they are container-host capabilities, not swappable manifest
+    ;; entries — so they are prepended here (outside `manifest`) from the single
+    ;; %base-capabilities source the constructor also guards. With %base-capabilities
+    ;; = (list crun), this is exactly the oracle's (cons crun %base-packages). The
+    ;; constructor rejects a manifest that lists a base capability, so there is no
+    ;; duplication. The guix-free-marker scans this set (crun pulls in no guix).
+    (packages (let ((pkgs (append %base-capabilities (td-config-manifest c))))
                 (if (td-config-ship-guix? c)
                     pkgs
                     (cons (guix-free-marker pkgs) pkgs))))
