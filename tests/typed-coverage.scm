@@ -84,7 +84,12 @@
    ;; oracle and so diverging the system drv. (It pulls nothing cold — guix is in
    ;; the warm base closure — so it stays safe for this substitutes-off rung.)
    ;; Proves the field is wired.
-   (cons 'ship-guix?           (td-config #:ship-guix? #t))))
+   (cons 'ship-guix?           (td-config #:ship-guix? #t))
+   ;; M10.1: a generation id derives a distinct per-generation root label
+   ;; (`td-root-gen-1`), which changes the root file-system device and so the
+   ;; system drv — proving the field is wired. (generation-diff.scm proves the
+   ;; CRUX — that distinct generations get distinct, non-shared roots.)
+   (cons 'generation           (td-config #:generation 1))))
 
 ;; (C) Structural wiring — for the three fields that drv-divergence (A) cannot
 ;; probe. Each row is (FIELD-SYMBOL PERTURBED-CONFIG PREDICATE): we lower the
@@ -155,6 +160,11 @@
                                          (name "td-crun-propagator")
                                          (propagated-inputs (list crun)))))))
    (list 'ship-guix? "ship-guix? non-bool"          (lambda () (td-config #:ship-guix? "yes")))
+   ;; M10.1: a generation id must be #f or a positive integer — zero, negative,
+   ;; and non-integer ids are rejected so a generation cannot derive a bogus root.
+   (list 'generation "generation zero"              (lambda () (td-config #:generation 0)))
+   (list 'generation "generation negative"          (lambda () (td-config #:generation -1)))
+   (list 'generation "generation non-integer"       (lambda () (td-config #:generation "1")))
    ;; F1 regression: ship-guix? #f with a manifest that lists guix would
    ;; re-introduce the imperative surface via `packages` (the service deletion
    ;; alone does NOT make the image guix-free). The constructor must reject this

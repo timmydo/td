@@ -45,6 +45,7 @@
             td-config-ssh-challenge-response?
             td-config-manifest
             td-config-ship-guix?
+            td-config-generation
             td-config->operating-system
             %td-default-config))
 
@@ -56,7 +57,7 @@
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?
-                  manifest ship-guix?)
+                  manifest ship-guix? generation)
   td-config?
   (host-name              td-config-host-name)
   (timezone               td-config-timezone)
@@ -103,7 +104,16 @@
   ;; no-guix` proves the guarantee end to end on explicit fixtures: the #f image is
   ;; guix-free (and reproducible), an explicit #t image is not, and a manifest that
   ;; smuggles guix past the pre-filter is REFUSED at build time.
-  (ship-guix?             td-config-ship-guix?))
+  (ship-guix?             td-config-ship-guix?)
+  ;; M10.1 — the generation identifier. A "generation" is a bootc-style bootable
+  ;; image you can place, list in GRUB, and roll back to (M10-design.md). Its
+  ;; whole point is that each generation boots its OWN root, not the shared
+  ;; `td-root`: otherwise every GRUB entry mounts the same filesystem and rollback
+  ;; is a no-op (the P1 crux). So when this is a positive integer the compiler
+  ;; derives a DISTINCT, bootloader-selectable root label (`<root>-gen-<n>`) for
+  ;; this system; when #f (the default) the root stays the plain `root-fs-label`,
+  ;; so the default config still lowers byte-identically to the frozen oracle.
+  (generation             td-config-generation))
 
 ;;;
 ;;; Validation — the "typed" guarantee. Each field is checked; a violation is a
@@ -123,6 +133,12 @@
 
 (define (tcp-port? x)
   (and (integer? x) (exact? x) (<= 1 x 65535)))
+
+;; A generation id is #f (no generation — the plain, shared-root system) or a
+;; positive exact integer. Zero/negative/non-integer ids are rejected so a
+;; malformed generation cannot derive a bogus root label.
+(define (generation-id? x)
+  (or (not x) (and (integer? x) (exact? x) (positive? x))))
 
 ;; The filesystem types we know how to declare. Kept explicit so an unsupported
 ;; type is rejected here rather than failing deep in a build.
@@ -208,7 +224,8 @@
                     (ssh-password-auth? #f)
                     (ssh-challenge-response? #f)
                     (manifest %base-packages)
-                    (ship-guix? #f))
+                    (ship-guix? #f)
+                    (generation #f))
   (check non-empty-string? 'host-name host-name "a non-empty string")
   (check non-empty-string? 'timezone timezone "a non-empty string")
   (check non-empty-string? 'locale locale "a non-empty string")
@@ -223,6 +240,7 @@
   (check boolean? 'ssh-challenge-response? ssh-challenge-response? "a boolean")
   (check package-list? 'manifest manifest "a list of <package>")
   (check boolean? 'ship-guix? ship-guix? "a boolean")
+  (check generation-id? 'generation generation "#f or a positive integer")
   ;; Cross-field — the BASE-CAPABILITY boundary (hygiene PRE-FILTER). The manifest
   ;; is the swappable PAYLOAD only; a base capability (crun, the container host) is
   ;; a mandatory platform invariant the compiler injects into every image, not
@@ -270,13 +288,25 @@
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?
-                  manifest ship-guix?))
+                  manifest ship-guix? generation))
 
 ;;;
 ;;; The compiler: typed config -> operating-system (a gexp-bearing value).
 ;;; This mirrors (system td) field for field. Any drift here shows up as a
 ;;; store-path divergence in tests/typed-diff.scm — that is the test's job.
 ;;;
+
+;; The root filesystem label this config boots. For a generation (positive id)
+;; it is a DISTINCT, bootloader-selectable label `<root>-gen-<n>`, so each
+;; generation mounts its own root and rollback is real (M10.1, M10-design.md
+;; P1). With no generation (#f) it is the plain `root-fs-label`, so the default
+;; config stays byte-identical to the frozen oracle's shared `td-root`.
+(define (td-config-effective-root-label c)
+  (let ((base (td-config-root-fs-label c))
+        (gen  (td-config-generation c)))
+    (if gen
+        (format #f "~a-gen-~a" base gen)
+        base)))
 
 (define (td-config->operating-system c)
   (operating-system
@@ -292,7 +322,7 @@
     ;; Root fs + the cgroup2 container-host mount (M9), shared with the oracle.
     (file-systems
      (cons* (file-system
-              (device (file-system-label (td-config-root-fs-label c)))
+              (device (file-system-label (td-config-effective-root-label c)))
               (mount-point (td-config-root-mount c))
               (type (td-config-root-fs-type c)))
             cgroup2-file-system
