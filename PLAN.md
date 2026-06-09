@@ -124,14 +124,25 @@ Three decisions that still hold from the scoping discussion:
    authenticity, signatures, and anti-rollback are a separate later security milestone.
 
 Sub-ladder (gated):
-- **M10.1** — build a reproducible bootc-style td image, AND define the per-generation
-  root. Checked this session: td's OCI lowering emits userspace only (no kernel/initrd),
-  so a generation bundle is the OCI userspace plus the kernel+initrd the disk-image path
-  already builds — plus its own selectable root. td hardcodes one shared `td-root` label
-  (`system/td.scm:57`); each generation needs a distinct root the GRUB entry/initrd
-  selects, or every entry boots the same filesystem and rollback is a no-op.
-- **M10.2** — guix-free, offline: place a generation and update the GRUB menu (+ prune old
-  entries) on the target.
+- **M10.1 — DONE** (signed off 2026-06-09). Built in two slices:
+  - *Per-generation root* (`generation-diff` rung). The typed `generation` field derives a
+    distinct, bootloader-selectable root label (`<root>-gen-<n>`) per generation, replacing
+    the single shared `td-root` (`system/td.scm:57`). generation #f still converges to the
+    frozen oracle, so the M4/M5/M6 differentials hold. Without this every entry mounts the
+    same filesystem and rollback is a no-op (the P1 crux).
+  - *Bootc-style generation image* (`generation-image` rung, `system/td-generation.scm`).
+    td's OCI lowering emits userspace only; this APPENDS a /boot layer (kernel + initrd from
+    the same OS) to that reproducible image, producing one OCI image carrying a bootable
+    kernel+initrd. The initrd is built from this generation's OS, so it mounts that
+    generation's distinct root. The rung `--check`s reproducibility of two generations and
+    cracks the layers to assert /boot is present (and absent from the plain userspace image).
+  - Open follow-on (not blocking M10.1): the image is structurally a valid 2-layer OCI image
+    but is not yet verified to LOAD into a foreign runtime (podman/docker) — distribution is
+    an M10.2+ concern since we ship our own placer; and the build still uses the daemon, not
+    the rootless user-namespace builder (deferred, its own slice — needs a daemon-vs-rootless
+    store-path differential per prime directive 4).
+- **M10.2** — guix-free, offline: place a generation (extract /boot from the bootc image) and
+  update the GRUB menu (+ prune old entries) on the target.
 - **M10.3** — manual-rollback test: boot generation N, then boot N-1 from the menu, assert.
 
 Deferred: auto-rollback (boot counter + health agent); verified/dedup generations

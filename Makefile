@@ -53,7 +53,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check no-guix run container
+.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check generation-image no-guix run container
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -61,7 +61,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check no-guix run container
+check: eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check generation-image no-guix run container
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
@@ -224,6 +224,53 @@ manifest-check:
 	test "$$in_swapped" -ge 1 || { echo "FAIL: the declared package is NOT in the built swapped tarball — the manifest reached the derivation but the exporter dropped it." >&2; exit 1; }; \
 	test "$$in_default" -eq 0 || { echo "FAIL: the default image's tarball unexpectedly contains the swap package." >&2; exit 1; }; \
 	echo "PASS: the declared package is present in the realized swapped image (not just the declaration) and absent from the default image."
+
+# M10.1 bootc generation image (M10-design.md "What a generation bundle is").
+# td's OCI lowering emits userspace ONLY; this builds the bootc-style image that
+# makes it bootable by APPENDING a /boot layer (kernel + initrd) — see
+# (system td-generation). Heavier rung (builds a system docker image + repacks),
+# so it runs with the other image rungs. Self-discriminating at the artifact
+# level (like manifest-check/no-guix), and it --checks reproducibility (prime
+# directive 1 — this IS the new artifact):
+#   • build the gen-1 + gen-2 bootc images, and `--check` BOTH bit-for-bit;
+#   • crack each image's layers and assert /boot/bzImage AND /boot/initrd.cpio.gz
+#     are PRESENT in the bootc image and ABSENT from the plain userspace image
+#     (DRV_BASE) — the discriminator for the "made bootable" claim;
+#   • assert gen-1 and gen-2 lower to DIFFERENT image derivations — each carries
+#     its own generation's initrd (which mounts that generation's distinct root),
+#     so the bundle is genuinely per-generation, not a shared artifact.
+generation-image:
+	@echo ">> generation-image: build a bootc-style generation image, --check it, crack /boot (M10.1)"
+	@set -euo pipefail; \
+	drvs=`$(GUIX) repl $(LOAD) tests/generation-image-drv.scm 2>/dev/null`; \
+	gen1=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_GEN1=//p'`; \
+	gen2=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_GEN2=//p'`; \
+	base=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_BASE=//p'`; \
+	test -n "$$gen1" -a -n "$$gen2" -a -n "$$base" || { echo "ERROR: could not lower the generation image derivations" >&2; exit 1; }; \
+	echo ">> gen1 image drv: $$gen1"; \
+	echo ">> gen2 image drv: $$gen2"; \
+	echo ">> base userspace drv: $$base"; \
+	gen1_img=`$(GUIX) build "$$gen1"`; \
+	gen2_img=`$(GUIX) build "$$gen2"`; \
+	base_img=`$(GUIX) build "$$base"`; \
+	echo ">> check: reproducibility of BOTH bootc generation images"; \
+	$(GUIX) build --check "$$gen1" "$$gen2"; \
+	echo ">> artifact: the bootc image CARRIES a bootable kernel + initrd under /boot"; \
+	listing() { \
+	  d=`mktemp -d`; \
+	  tar xzf "$$1" -C "$$d" >/dev/null 2>&1 || { echo "FAIL: cannot read OCI image $$1" >&2; exit 1; }; \
+	  for l in "$$d"/*/layer.tar; do [ -f "$$l" ] && tar tf "$$l" 2>/dev/null; done; \
+	  rm -rf "$$d"; \
+	}; \
+	k_gen=`listing "$$gen1_img" | grep -Ec '(^|/)boot/bzImage$$' || true`; \
+	i_gen=`listing "$$gen1_img" | grep -Ec '(^|/)boot/initrd\.cpio\.gz$$' || true`; \
+	k_base=`listing "$$base_img" | grep -Ec '(^|/)boot/bzImage$$' || true`; \
+	echo "   /boot/bzImage entries — bootc image: $$k_gen   base userspace: $$k_base"; \
+	echo "   /boot/initrd.cpio.gz entries — bootc image: $$i_gen"; \
+	test "$$k_gen" -ge 1 -a "$$i_gen" -ge 1 || { echo "FAIL: the bootc image does NOT carry /boot/bzImage + /boot/initrd.cpio.gz — it is not bootable." >&2; exit 1; }; \
+	test "$$k_base" -eq 0 || { echo "FAIL: the plain userspace image already carries /boot — the discriminator is broken (the layer was not the thing that made it bootable)." >&2; exit 1; }; \
+	test "$$gen1" != "$$gen2" || { echo "FAIL: generation 1 and 2 lower to the SAME image derivation — the bundle is not per-generation." >&2; exit 1; }; \
+	echo "PASS: the bootc generation image is reproducible, CARRIES a kernel + initrd under /boot (absent from the plain userspace image), and is distinct per generation."
 
 # 6. M7 imperative-surface removal — image-swap-only BY CONSTRUCTION (DESIGN §6).
 #    M6 made image CONTENTS manifest-driven but left the imperative mutation

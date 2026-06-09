@@ -11,6 +11,7 @@
 (use-modules (system td)
              (system td-typed)
              (system td-hardening)
+             (system td-generation)
              (tests boot)
              (tests container))
 
