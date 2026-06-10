@@ -264,21 +264,28 @@ generation-image:
 
 # M10.2 guix-free placer (M10-design.md step 3, "Place"). The deployment side:
 # a POSIX shell tool (system/td-place.sh) that runs ON THE TARGET — which has NO
-# guix — to extract /boot from a bootc generation image, write a per-generation
-# GRUB menu entry that selects THAT generation's own root, and prune old
-# generations. This rung exercises it hermetically (system/td-place.scm): it
-# builds the per-generation bootc images with Guix (the M10.1 oracle) and runs
-# the placer over them inside a derivation whose builder PATH is ONLY base tools,
-# NO guix — so a successful build PROVES the placer is guix-free by construction
-# (guix is absent from the sandbox, the same "absent → cannot be used" guarantee
+# guix. Driven by the OCI manifest (not a blind layer scan), it: verifies the
+# image's embedded identity (boot/td-identity) matches the --generation/--root-label
+# it is placed as; APPLIES the userspace layers into that generation's own root,
+# staged as roots/td/gen-N/root.tar (so root=LABEL=td-root-gen-N refers to a root
+# that exists — M10.3 turns it into a labeled fs); extracts /boot per-generation;
+# prunes to --keep (>=1); and regenerates a per-generation GRUB menu. Each
+# generation is staged + validated then atomically swapped in, so a corrupt image
+# never destroys the generation already installed. This rung exercises it
+# hermetically (system/td-place.scm): it builds the per-generation bootc images
+# with Guix (the M10.1 oracle) and runs the placer over them inside a derivation
+# whose builder PATH is ONLY base tools, NO guix — so a successful build PROVES the
+# placer is guix-free by construction (the same "absent → cannot be used" guarantee
 # as `no-guix`), and `--check` proves the placed target tree reproducible. The
 # deployment behavior is tested against the artifact (M10-design.md decision 2),
 # not diffed against a Guix component it lacks: tests/place-check.scm cracks the
-# tree and asserts each present generation is placed with its own kernel/initrd
-# and a menu entry selecting its own root, the user grub.cfg preamble survives,
-# and (the prune scenario) the oldest generation's root dir AND menu entry are
-# gone. Two scenarios: PLACE (gens 1,2 keep 10 — no prune) and PRUNE (gens 1,2,3
-# keep 2 — gen 1 dropped). The full boot+rollback is M10.3.
+# tree and asserts each present generation is placed with its own kernel/initrd,
+# its applied root content, and a menuentry that selects its OWN root and no
+# other's (per-entry, not block-wide), the user grub.cfg preamble survives, and
+# (the prune scenario) the oldest generation's boot dir, root content AND menu
+# entry are gone. Two scenarios: PLACE (gens 1,2 keep 10 — no prune) and PRUNE
+# (gens 1,2,3 keep 2 — gen 1 dropped). Creating the labeled fs from the staged
+# root.tar + the full boot+rollback is M10.3.
 place:
 	@echo ">> place: guix-free placer extracts /boot + writes a per-generation GRUB menu, prunes old generations (M10.2)"
 	@set -euo pipefail; \

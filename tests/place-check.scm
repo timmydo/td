@@ -6,19 +6,24 @@
 ;; against the SAME per-generation root labels the typed compiler derives (so the
 ;; assertion cannot drift from the implementation):
 ;;
-;;   (1) PLACED      — each present generation N has boot/td/gen-N/{bzImage,
-;;       initrd.cpio.gz}, both non-empty, plus a root-label file == that
-;;       generation's own label (td-root-gen-N).
-;;   (2) PER-GEN ROOT — present generations' initrds are pairwise DISTINCT (each
-;;       carries its own generation's root — the M10 crux; a shared initrd would
-;;       mean rollback boots the same filesystem).
-;;   (3) MENU         — grub.cfg has the placer's marker-delimited managed block
-;;       with EXACTLY one menuentry per present generation, and gen-N's entry
-;;       points `linux`/`initrd` at THAT generation's placed files and selects
-;;       THAT generation's root (root=LABEL=td-root-gen-N) — distinct per entry.
-;;   (4) PRESERVED    — the user's grub.cfg preamble (outside the markers) survives.
-;;   (5) PRUNED       — each absent generation (TD_ABSENT) has NO per-generation
-;;       root dir AND NO menu reference at all (dir + entry both gone).
+;;   (1a) PLACED       — each present generation N has boot/td/gen-N/{bzImage,
+;;        initrd.cpio.gz}, both non-empty, plus a root-label file == that
+;;        generation's own label (td-root-gen-N).
+;;   (1b) ROOT CONTENT — each present generation's APPLIED userspace root is staged
+;;        at roots/td/gen-N/root.tar, non-empty — so root=LABEL=td-root-gen-N refers
+;;        to a root that actually exists (M10.3 writes it onto a labeled fs).
+;;   (2)  PER-GEN ROOT — present generations' initrds are pairwise DISTINCT (each
+;;        carries its own generation's root — the M10 crux; a shared initrd would
+;;        mean rollback boots the same filesystem).
+;;   (3)  MENU         — grub.cfg has the placer's marker-delimited managed block
+;;        with EXACTLY one menuentry per present generation, and gen-N's directives
+;;        live INSIDE gen-N's OWN entry: that entry loads gen-N's kernel/initrd and
+;;        selects gen-N's root, and contains NO other generation's directives (so
+;;        swapping initrd/root directives BETWEEN entries fails — a block-wide
+;;        substring search would have passed it).
+;;   (4)  PRESERVED    — the user's grub.cfg preamble (outside the markers) survives.
+;;   (5)  PRUNED       — each absent generation (TD_ABSENT) has NO boot dir, NO root
+;;        content dir, AND NO menu reference at all.
 ;;
 ;; Reusable across scenarios via env: TD_PLACED (tree path), TD_PRESENT (space-sep
 ;; generations expected present), TD_ABSENT (space-sep generations expected pruned).
@@ -48,7 +53,9 @@
 (define absent  (gens-of "TD_ABSENT"))
 
 (define (under . parts) (string-join (cons tree parts) "/"))
-(define (gen-dir n) (under "boot" "td" (string-append "gen-" n)))
+(define (gen-dir n)  (under "boot" "td" (string-append "gen-" n)))
+(define (root-dir n) (under "roots" "td" (string-append "gen-" n)))
+(define (root-tar n) (string-append (root-dir n) "/root.tar"))
 (define (slurp f) (call-with-input-file f get-string-all))
 (define (slurp-bytes f) (call-with-input-file f get-bytevector-all))
 
@@ -70,10 +77,32 @@
     (and b e (> e b)
          (substring grub (+ b (string-length begin-mark)) e))))
 
-(define (count-substring hay needle)
-  (let loop ((i 0) (n 0))
-    (let ((hit (string-contains hay needle i)))
-      (if hit (loop (+ hit (string-length needle)) (+ n 1)) n))))
+;; --- parse the managed block into individual menuentries -----------------------
+;; Each entry is `menuentry "td generation N (...)" { ... }`. We split on the entry
+;; header and take each entry's body up to its closing `}`, so a directive can be
+;; attributed to the ONE entry it belongs to (not just "somewhere in the block").
+(define entry-prefix "menuentry \"td generation ")
+
+(define (leading-int s)                 ;the run of digits at the start of S
+  (let loop ((i 0))
+    (if (and (< i (string-length s)) (char-numeric? (string-ref s i)))
+        (loop (+ i 1))
+        (substring s 0 i))))
+
+(define menuentries                     ;list of (gen-string . body-text)
+  (if (not managed-block)
+      '()
+      (let loop ((i 0) (acc '()))
+        (let ((s (string-contains managed-block entry-prefix i)))
+          (if (not s)
+              (reverse acc)
+              (let* ((close (string-contains managed-block "}" s))
+                     (end   (if close (+ close 1) (string-length managed-block)))
+                     (body  (substring managed-block s end))
+                     (g     (leading-int
+                             (substring managed-block
+                                        (+ s (string-length entry-prefix))))))
+                (loop end (cons (cons g body) acc))))))))
 
 (format #t "~%== M10.2 placer artifact validation ==~%")
 (format #t "  tree=~a~%  present=~s  absent=~s~%" tree present absent)
@@ -86,14 +115,13 @@
 (unless managed-block
   (fail "grub.cfg has no well-formed td-place managed block (markers missing/reordered)"))
 
-;; (3) exactly one menuentry per present generation, inside the managed block
+;; (3) exactly one menuentry per present generation
 (when managed-block
-  (let ((n (count-substring managed-block "menuentry \"td generation ")))
-    (unless (= n (length present))
-      (fail "managed block has ~a menuentries, expected ~a (one per present generation)"
-            n (length present)))))
+  (unless (= (length menuentries) (length present))
+    (fail "managed block has ~a menuentries, expected ~a (one per present generation)"
+          (length menuentries) (length present))))
 
-;; (1)(2)(3) per present generation
+;; (1a) per present generation: placed kernel/initrd/root-label
 (for-each
  (lambda (n)
    (let* ((d      (gen-dir n))
@@ -112,18 +140,55 @@
        (let ((recorded (string-trim-right (slurp lf))))
          (unless (string=? recorded label)
            (fail "generation ~a: recorded root-label ~s != expected ~s"
-                 n recorded label)))
-       ;; (3) the menu entry points at THIS generation's files + root
-       (let ((lk (format #f "/td/gen-~a/bzImage" n))
-             (li (format #f "/td/gen-~a/initrd.cpio.gz" n))
-             (lr (format #f "root=LABEL=~a" label)))
-         (when managed-block
-           (unless (string-contains managed-block lk)
-             (fail "generation ~a: menu does not load its kernel (~a)" n lk))
-           (unless (string-contains managed-block li)
-             (fail "generation ~a: menu does not load its initrd (~a)" n li))
-           (unless (string-contains managed-block lr)
-             (fail "generation ~a: menu does not select its own root (~a)" n lr))))))))
+                 n recorded label)))))))
+ present)
+
+;; (1b) per present generation: the applied userspace root CONTENT is staged
+(for-each
+ (lambda (n)
+   (let ((rt (root-tar n)))
+     (cond
+      ((not (file-exists? rt))
+       (fail "generation ~a: no applied root content placed (~a missing)" n rt))
+      ((zero? (stat:size (stat rt)))
+       (fail "generation ~a: applied root content is empty (~a)" n rt)))))
+ present)
+
+;; (3) each generation's directives live INSIDE its OWN menuentry, and no foreign
+;; generation's directives appear there. Root labels are matched with a trailing
+;; space (the menu writes `root=LABEL=<label> quiet`) so gen-1 is not a prefix hit
+;; inside gen-10.
+(for-each
+ (lambda (n)
+   (let ((mine (filter (lambda (e) (string=? (car e) n)) menuentries)))
+     (cond
+      ((not (= (length mine) 1))
+       (fail "generation ~a: expected exactly one menuentry, found ~a" n (length mine)))
+      (else
+       (let ((body  (cdr (car mine)))
+             (lk    (format #f "/td/gen-~a/bzImage" n))
+             (li    (format #f "/td/gen-~a/initrd.cpio.gz" n))
+             (lr    (format #f "root=LABEL=~a " (expected-label n))))
+         (unless (string-contains body lk)
+           (fail "generation ~a: its menuentry does not load its kernel (~a)" n lk))
+         (unless (string-contains body li)
+           (fail "generation ~a: its menuentry does not load its initrd (~a)" n li))
+         (unless (string-contains body lr)
+           (fail "generation ~a: its menuentry does not select its own root (root=LABEL=~a)"
+                 n (expected-label n)))
+         ;; NO OTHER present generation's directives may appear in THIS entry
+         (for-each
+          (lambda (m)
+            (unless (string=? m n)
+              (let ((fk (format #f "/td/gen-~a/" m))
+                    (fr (format #f "root=LABEL=~a " (expected-label m))))
+                (when (string-contains body fk)
+                  (fail "generation ~a's menuentry references generation ~a's files (~a) — directives crossed entries"
+                        n m fk))
+                (when (string-contains body fr)
+                  (fail "generation ~a's menuentry selects generation ~a's root (~a) — directives crossed entries"
+                        n m (expected-label m))))))
+          present))))))
  present)
 
 ;; (2) present generations' initrds are pairwise distinct (per-generation root)
@@ -141,20 +206,23 @@
          (cdr ps))))
     (loop (cdr ps))))
 
-;; (5) pruned generations: no dir, no menu reference
+;; (5) pruned generations: no boot dir, no root content dir, no menu reference
 (for-each
  (lambda (n)
    (when (file-exists? (gen-dir n))
-     (fail "generation ~a was supposed to be pruned but its root dir still exists" n))
+     (fail "generation ~a was supposed to be pruned but its boot dir still exists" n))
+   (when (file-exists? (root-dir n))
+     (fail "generation ~a was supposed to be pruned but its root content dir still exists" n))
    (when (string-contains grub (format #f "/td/gen-~a/" n))
      (fail "generation ~a was supposed to be pruned but a menu entry still references it" n)))
  absent)
 
 (if (zero? failures)
     (begin
-      (format #t "PASS: every present generation is placed with its own kernel/initrd \
-and a menu entry selecting its own root; the user preamble is preserved; \
-pruned generations leave no root dir and no menu entry.~%")
+      (format #t "PASS: every present generation is placed with its own kernel/initrd, \
+its applied root content, and a menuentry that selects its own root and no other's; \
+the user preamble is preserved; pruned generations leave no boot dir, no root \
+content, and no menu entry.~%")
       (exit 0))
     (begin
       (format #t "~a check(s) failed.~%" failures)

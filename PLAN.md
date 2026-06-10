@@ -159,11 +159,27 @@ Sub-ladder (gated):
   no drift), preamble preservation, and that pruned gen 1 leaves no root dir AND no menu
   entry. Verified-red on BOTH crux properties: breaking prune (keep-all) reddens the PRUNE
   scenario; writing a shared `td-root` for every gen reddens the root-selection checks.
+  - **M10.2 review round (2026-06-10).** Addressed 6 findings. P1: (1) the placer now
+    APPLIES the userspace layers and stages each generation's root CONTENT at
+    `roots/td/gen-N/root.tar` — so `root=LABEL=td-root-gen-N` refers to a root that exists
+    (creating the labeled ext4 from it is deferred to M10.3 — signed-off scope split, Option
+    A); (2) each generation is extracted+validated in a staging dir and only ATOMICALLY
+    swapped in, so a corrupt image no longer destroys the generation already installed;
+    (3) `--keep 0` is rejected (it would prune every generation). P2: (4) the bootc image
+    carries `boot/td-identity` (generation + root label) and the placer VERIFIES it against
+    `--generation`/`--root-label`, so a mislabeled image can't be placed; (5) layer selection
+    is MANIFEST-DRIVEN (orphan layers ignored); (6) `place-check.scm` now parses the managed
+    block into PER-MENUENTRY bodies and asserts each generation's directives live in its own
+    entry with no foreign ones (a directive swap between entries now reddens). Verified-red:
+    standalone fake-image harness flips each guard (keep-0, atomic, identity, manifest) to
+    FAIL when mutated out; the per-entry checker flags a swapped block (4 fails) and a missing
+    root.tar, and is gen-1/gen-10 boundary-safe.
 - **M10.3** — manual-rollback test: boot generation N, then boot N-1 from the menu, assert.
-  (Open follow-ons the placer left for M10.3: the menuentry path is GRUB-root-relative
-  `/td/gen-N/...` and root selection is by label — wiring the GRUB `search`/`set root` for
-  the target partition layout, `set default`, and the gnu.system/gnu.load closure path is
-  M10.3's job, as is target-persistent state across boots.)
+  (Open follow-ons the placer left for M10.3: turn each staged `roots/td/gen-N/root.tar` into
+  a live ext4 filesystem LABELED `td-root-gen-N` (`mke2fs -d -L`, reproducible UUID/hash_seed);
+  the menuentry path is GRUB-root-relative `/td/gen-N/...` and root selection is by label —
+  wiring the GRUB `search`/`set root` for the target partition layout, `set default`, and the
+  gnu.system/gnu.load closure path is M10.3's job, as is target-persistent state across boots.)
 
 Deferred: auto-rollback (boot counter + health agent); verified/dedup generations
 (ostree/composefs/fs-verity); registry push/signing. The earlier auto-rollback

@@ -52,6 +52,7 @@
               "image must mount its OWN per-generation root; build it from "
               "(td-config #:generation N)."))))
   (let* ((gen      (td-config-generation config))
+         (label    (td-config-effective-root-label config))
          (os       (td-config->operating-system config))
          (base-img (system-image (image-with-os docker-image os)))
          (kernel   (operating-system-kernel-file os))
@@ -97,12 +98,23 @@
               (invoke tar "--use-compress-program" gzip "-xf" #$base-img "-C" "img")
 
               ;; 2. Stage /boot with THIS generation's kernel + initrd, fixed modes.
+              ;; Also write boot/td-identity — the generation id + root label this
+              ;; image IS — so the M10.2 placer can BIND the image to the
+              ;; --generation/--root-label it is placed as and reject a mismatch
+              ;; (a gen-2 image installed under gen-1 would otherwise produce a menu
+              ;; entry that lies about what it boots). Deterministic (fixed strings),
+              ;; so it does not disturb reproducibility.
               (mkdir-p "stage/boot")
               (copy-file #$kernel "stage/boot/bzImage")
               (copy-file #$initrd "stage/boot/initrd.cpio.gz")
+              (call-with-output-file "stage/boot/td-identity"
+                (lambda (p)
+                  (format p "generation=~a~%root-label=~a~%"
+                          #$(number->string gen) #$label)))
               (chmod "stage/boot" #o755)
               (chmod "stage/boot/bzImage" #o444)
               (chmod "stage/boot/initrd.cpio.gz" #o444)
+              (chmod "stage/boot/td-identity" #o444)
 
               ;; 3. Deterministic boot layer tar; diff_id = sha256(layer.tar).
               (det-tar "stage" "boot" "boot-layer.tar")

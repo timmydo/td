@@ -31,12 +31,14 @@
   #:use-module (system td-generation)
   #:export (td-placed-tree))
 
-;; Build a target /boot tree by PLACING each generation in GENS (in order, into
-;; the same target) with the guix-free placer, pruning to the newest KEEP. The
-;; output is the resulting target tree: boot/td/gen-N/{bzImage,initrd.cpio.gz,
-;; root-label} per kept generation, plus boot/grub/grub.cfg (a user preamble the
-;; placer must preserve + the placer's marker-delimited managed block). Returns a
-;; monadic derivation (suitable for `run-with-store`).
+;; Build a target tree by PLACING each generation in GENS (in order, into the
+;; same target) with the guix-free placer, pruning to the newest KEEP. The output
+;; is the resulting target tree:
+;;   boot/td/gen-N/{bzImage,initrd.cpio.gz,td-identity,root-label}  per kept gen
+;;   roots/td/gen-N/root.tar   — that generation's applied userspace root CONTENT
+;;   boot/grub/grub.cfg        — a user preamble the placer must preserve + the
+;;                               placer's marker-delimited managed block
+;; Returns a monadic derivation (suitable for `run-with-store`).
 (define* (td-placed-tree #:key (gens '(1 2)) (keep 10))
   (mlet %store-monad
       ((images (mapm %store-monad
@@ -68,8 +70,13 @@
 
               (define target   (string-append (getcwd) "/target"))
               (define boot      (string-append target "/boot"))
+              ;; The per-generation root CONTENT (applied userspace layers) lands
+              ;; here — separate from /boot, as on a real target — so the menu's
+              ;; root=LABEL=td-root-gen-N refers to a root that actually exists.
+              (define roots     (string-append target "/roots"))
               (define grub-cfg  (string-append boot "/grub/grub.cfg"))
               (mkdir-p (string-append boot "/grub"))
+              (mkdir-p (string-append roots "/td"))
 
               ;; Seed grub.cfg with a user preamble the placer MUST preserve — it
               ;; may only ever touch its own marker-delimited managed block.
@@ -89,6 +96,7 @@ set timeout=5
                           "--generation" gen
                           "--root-label" label
                           "--boot-dir"   boot
+                          "--root-store" roots
                           "--grub-cfg"   grub-cfg
                           "--keep"       #$(number->string keep))))
                (list #$@jobs))
