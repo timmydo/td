@@ -10,16 +10,24 @@
 ;;       manifest.json's Layers vector AND config.json's rootfs.diff_ids vector.
 ;;       Field-specific: a stray occurrence of the hash elsewhere in the JSON does
 ;;       NOT pass (the earlier whole-file grep would have).
-;;   (2) discriminator — the plain userspace image (TD_BASE_IMG) carries NO /boot.
-;;   (3) correct per-generation ROOT — generation N's initrd embeds its OWN root
-;;       label (computed from the typed compiler so it cannot drift) and NOT any
-;;       other generation's. This proves each bundle SELECTS its own root, not
-;;       merely that the two initrds happen to differ.
+;;   (2) OCI metadata is well-formed — manifest.json's Config and every Layers
+;;       entry name a file that actually exists in the image (a dangling Config or
+;;       layer reference fails).
+;;   (3) discriminator — the plain userspace image (TD_BASE_IMG) carries NO /boot
+;;       AT ALL (any boot/ path in any layer, not just boot/bzImage).
+;;   (4) correct per-generation ROOT — generation N's initrd embeds EXACTLY its own
+;;       root label (computed from the typed compiler so it cannot drift) and NO
+;;       other generation's label. We enumerate every `<base>-gen-<digits>` token
+;;       in the initrd and require the set to equal {its own} — so gen-10 passed as
+;;       gen-1 fails (boundary-aware, not a substring match) and an unexpected
+;;       gen-7 would fail too (forbids ALL other generations, not a fixed list).
 ;;
 ;; Listings are read to EOF via open-pipe* (execs tar directly — no /bin/sh, and
-;; no SIGPIPE/pipefail trap that a `tar | grep -q` pipeline would hit). Env:
-;; TD_GEN1_IMG, TD_GEN2_IMG, TD_BASE_IMG. Run via `guix repl` so (json)/(zlib)/the
-;; rnrs ports are on the load path. Exits non-zero on any failure.
+;; no SIGPIPE/pipefail trap that a `tar | grep -q` pipeline would hit), and we
+;; CHECK tar's exit status so a truncated/corrupt layer hard-fails instead of
+;; silently yielding a short listing. Env: TD_GEN1_IMG, TD_GEN2_IMG, TD_BASE_IMG.
+;; Run via `guix repl` so (json)/(zlib)/the rnrs ports are on the load path. Exits
+;; non-zero on any failure.
 (use-modules (guix build utils)
              (json)
              (zlib)
@@ -42,25 +50,44 @@
   (or (getenv k)
       (begin (format #t "FAIL: env ~a not set~%" k) (exit 1))))
 
+;; Unique per-invocation scratch dir — concurrent validators (the rung may run
+;; alongside others) must not share a path and delete each other's extractions.
 (define scratch
-  (let ((d (string-append (or (getenv "TMPDIR") "/tmp") "/td-genimg-check")))
-    (when (file-exists? d) (system* "rm" "-rf" d))
+  (let ((d (format #f "~a/td-genimg-check-~a-~a"
+                   (or (getenv "TMPDIR") "/tmp") (getpid) (random 1000000))))
     (mkdir-p d)
     d))
 
 ;; Full listing of a tar, drained to EOF. open-pipe* execs tar directly (no shell)
 ;; and we read the whole port, so there is no SIGPIPE that grep -q would induce.
+;; We CHECK the exit status: a truncated/corrupt layer.tar makes `tar -tf` exit
+;; non-zero, and we must NOT trust (or silently accept) its partial listing.
 (define (tar-list path)
   (let* ((p (open-pipe* OPEN_READ "tar" "-tf" path))
-         (s (get-string-all p)))
-    (close-pipe p)
+         (s (get-string-all p))
+         (status (close-pipe p)))
+    (unless (and (integer? status) (zero? (status:exit-val status)))
+      (error (format #f "tar -tf ~a failed (wait status ~s) — cannot trust listing"
+                     path status)))
     s))
+
+(define (normalize-line line)
+  (if (string-prefix? "./" line) (substring line 2) line))
 
 (define (listing-has? listing name)
   (any (lambda (line)
-         (or (string=? line name)
-             (string=? line (string-append "./" name))
-             (string-suffix? (string-append "/" name) line)))
+         (let ((l (normalize-line line)))
+           (or (string=? l name)
+               (string-suffix? (string-append "/" name) l))))
+       (string-split listing #\newline)))
+
+;; Any path under boot/ (boot, boot/, boot/anything) — the discriminator must
+;; reject a base image that carries even a stray /boot/marker, not just bzImage.
+(define (listing-has-boot? listing)
+  (any (lambda (line)
+         (let ((l (normalize-line line)))
+           (or (string=? l "boot") (string=? l "boot/")
+               (string-prefix? "boot/" l))))
        (string-split listing #\newline)))
 
 (define (extract img dest)
@@ -73,27 +100,70 @@
           (or (scandir dest (lambda (n) (not (member n '("." "..")))))
               '())))
 
-;; manifest.json is a 1-element array of objects; return its Layers as a list.
+;; manifest.json is a 1-element array of objects; return its first object.
+(define (manifest0 dest)
+  (vector-ref
+   (call-with-input-file (string-append dest "/manifest.json") json->scm) 0))
+
 (define (manifest-layers dest)
-  (let ((m (call-with-input-file (string-append dest "/manifest.json") json->scm)))
-    (vector->list (assoc-ref (vector-ref m 0) "Layers"))))
+  (vector->list (assoc-ref (manifest0 dest) "Layers")))
 
 (define (config-diff-ids dest)
   (let* ((c (call-with-input-file (string-append dest "/config.json") json->scm))
          (rootfs (assoc-ref c "rootfs")))
     (vector->list (assoc-ref rootfs "diff_ids"))))
 
-;; Decompress an initrd to a latin-1 string (byte<->char 1:1) for substring search.
+;; (2) OCI metadata well-formedness: manifest Config and every Layers entry must
+;; name a file that actually exists in the extracted image. A manifest pointing at
+;; a nonexistent config.json or layer.tar is malformed and must fail.
+(define (check-oci-wellformed label dest)
+  (let* ((m0 (manifest0 dest))
+         (config (assoc-ref m0 "Config"))
+         (layers (vector->list (assoc-ref m0 "Layers"))))
+    (unless (and (string? config)
+                 (file-exists? (string-append dest "/" config)))
+      (fail "~a: manifest Config ~s does not name a file present in the image"
+            label config))
+    (for-each
+     (lambda (ln)
+       (unless (file-exists? (string-append dest "/" ln))
+         (fail "~a: manifest Layers entry ~s does not exist in the image" label ln)))
+     layers)))
+
+;; Decompress an initrd to a latin-1 string (byte<->char 1:1) for token search.
 (define (initrd-text gz)
   (let ((bv (call-with-gzip-input-port (open-input-file gz)
               (lambda (p) (get-bytevector-all p)))))
     (bytevector->string bv (make-transcoder (latin-1-codec)))))
 
-;; Validate one bootc image. EXPECT-LABEL is this generation's root label;
-;; FORBID-LABELS are other generations' labels that must NOT appear in its initrd.
-(define (check-bootc-image label img expect-label forbid-labels)
-  (let* ((dest (string-append scratch "/" label)))
+;; The per-generation labels share a fixed base from the typed compiler; the only
+;; distinguishing part is the trailing integer. Enumerate EVERY distinct
+;; "<base>-gen-<digits>" token in TEXT (consuming the full digit run, so
+;; "<base>-gen-1" is NOT a substring hit inside "<base>-gen-10").
+(define gen-prefix (string-append (td-config-root-fs-label (td-config)) "-gen-"))
+
+(define (embedded-gen-labels text)
+  (let ((plen (string-length gen-prefix))
+        (tlen (string-length text)))
+    (let loop ((i 0) (acc '()))
+      (let ((hit (string-contains text gen-prefix i)))
+        (if (not hit)
+            (reverse acc)
+            (let scan ((j (+ hit plen)))
+              (if (and (< j tlen) (char-numeric? (string-ref text j)))
+                  (scan (+ j 1))
+                  (let ((tok (substring text hit j)))
+                    (loop j
+                          (if (and (> j (+ hit plen))   ;at least one digit
+                                   (not (member tok acc)))
+                              (cons tok acc) acc))))))))))
+
+;; Validate one bootc image. EXPECT-LABEL is this generation's root label; the
+;; initrd must embed EXACTLY it and no other generation's label.
+(define (check-bootc-image label img expect-label)
+  (let ((dest (string-append scratch "/" label)))
     (extract img dest)
+    (check-oci-wellformed label dest)
     (let* ((hexes (layer-hexes dest))
            (boot-hex
             (find (lambda (h)
@@ -119,37 +189,40 @@
                         (config-diff-ids dest))
           (fail "~a: boot layer ~a diff_id is not in config.json rootfs.diff_ids (orphaned layer)"
                 label boot-hex))
-        ;; (3) correct per-generation root embedded in the initrd
+        ;; (4) EXACT per-generation root embedded in the initrd
         (let ((into (string-append dest "/boot-extract")))
           (mkdir-p into)
           (invoke "tar" "xf" (string-append dest "/" boot-hex "/layer.tar")
                   "-C" into)
-          (let ((text (initrd-text (string-append into "/boot/initrd.cpio.gz"))))
-            (unless (string-contains text expect-label)
-              (fail "~a: initrd does NOT embed its own root label ~s — it would not mount this generation's root"
-                    label expect-label))
-            (for-each
-             (lambda (bad)
-               (when (string-contains text bad)
-                 (fail "~a: initrd embeds a FOREIGN root label ~s — wrong/cross root selection"
-                       label bad)))
-             forbid-labels)))
+          (let* ((text  (initrd-text (string-append into "/boot/initrd.cpio.gz")))
+                 (found (embedded-gen-labels text)))
+            (cond
+             ((not (member expect-label found))
+              (fail "~a: initrd does NOT embed its own root label ~s (gen labels found: ~s) — it would not mount this generation's root"
+                    label expect-label found))
+             ((not (equal? found (list expect-label)))
+              (fail "~a: initrd embeds FOREIGN root label(s) ~s — expected only ~s (wrong/cross root selection)"
+                    label
+                    (filter (lambda (x) (not (string=? x expect-label))) found)
+                    expect-label)))))
         (when (zero? failures)
-          (format #t "  ok: ~a carries /boot wired into manifest+config; initrd selects ~s~%"
+          (format #t "  ok: ~a carries /boot wired into manifest+config (well-formed); initrd selects exactly ~s~%"
                   label expect-label)))))))
 
-;; The plain userspace image must carry NO /boot (the discriminator).
+;; The plain userspace image must carry NO /boot AT ALL (the discriminator) — any
+;; boot/ path in any layer, not merely boot/bzImage.
 (define (check-no-boot label img)
   (let ((dest (string-append scratch "/" label)))
     (extract img dest)
     (for-each
      (lambda (h)
-       (when (listing-has? (tar-list (string-append dest "/" h "/layer.tar"))
-                           "boot/bzImage")
-         (fail "~a: the plain userspace image already carries /boot — discriminator broken"
+       (when (listing-has-boot? (tar-list (string-append dest "/" h "/layer.tar")))
+         (fail "~a: the plain userspace image already carries a /boot path — discriminator broken"
                label)))
      (layer-hexes dest))
-    (format #t "  ok: ~a has no /boot (discriminator holds)~%" label)))
+    (when (zero? failures)
+      (format #t "  ok: ~a has no /boot path in any layer (discriminator holds)~%"
+              label))))
 
 ;; Expected per-generation labels — from the SAME compiler logic the images were
 ;; built with, so the assertion cannot drift from the implementation.
@@ -158,15 +231,15 @@
 
 (format #t "~%== M10.1 bootc image artifact validation ==~%")
 (format #t "  gen1 expected root: ~s   gen2 expected root: ~s~%" gen1-label gen2-label)
-(check-bootc-image "gen1" (must "TD_GEN1_IMG") gen1-label (list gen2-label))
-(check-bootc-image "gen2" (must "TD_GEN2_IMG") gen2-label (list gen1-label))
+(check-bootc-image "gen1" (must "TD_GEN1_IMG") gen1-label)
+(check-bootc-image "gen2" (must "TD_GEN2_IMG") gen2-label)
 (check-no-boot "base" (must "TD_BASE_IMG"))
 
 (if (zero? failures)
     (begin
-      (format #t "PASS: both bootc images carry /boot WIRED into their OCI metadata \
-(field-specific), the userspace image has none, and each generation's initrd \
-selects its OWN per-generation root.~%")
+      (format #t "PASS: both bootc images carry /boot WIRED into well-formed OCI \
+metadata (field-specific), the userspace image has none, and each generation's \
+initrd selects EXACTLY its own per-generation root.~%")
       (exit 0))
     (begin
       (format #t "~a check(s) failed.~%" failures)
