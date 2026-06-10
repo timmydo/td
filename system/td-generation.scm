@@ -38,13 +38,25 @@
 ;; docker image plus a /boot layer carrying this generation's kernel + initrd.
 ;; Returns a monadic derivation (like `docker-image`), suitable for `run-with-store`.
 (define* (td-generation-image config)
-  (let* ((os       (td-config->operating-system config))
-         (gen      (td-config-generation config))
+  ;; A generation image is meaningless without a generation: with generation #f
+  ;; the config's root is the shared `td-root`, so the bundle's initrd would mount
+  ;; the SAME filesystem as every other generation and rollback would be a no-op —
+  ;; the very invariant this module exists to provide. Reject it at the API
+  ;; boundary rather than emit a shared-root "generation" (P1). (td-config already
+  ;; validates that a non-#f generation is a positive integer.)
+  (let ((gen (td-config-generation config)))
+    (unless gen
+      (error (string-append
+              "td-generation-image: requires a generation id — the config has "
+              "generation #f, whose root is the shared td-root. A bootc generation "
+              "image must mount its OWN per-generation root; build it from "
+              "(td-config #:generation N)."))))
+  (let* ((gen      (td-config-generation config))
+         (os       (td-config->operating-system config))
          (base-img (system-image (image-with-os docker-image os)))
          (kernel   (operating-system-kernel-file os))
          (initrd   (operating-system-initrd-file os))
-         (name     (string-append "td-generation-image"
-                                  (if gen (format #f "-gen-~a" gen) ""))))
+         (name     (format #f "td-generation-image-gen-~a" gen)))
     (gexp->derivation name
       (with-extensions (list guile-gcrypt guile-json-4)
         (with-imported-modules '((guix build utils))

@@ -31,6 +31,14 @@
   (define (gen-image n)
     (drv (td-generation-image (td-config #:generation n))))
 
+  (define (raises? thunk)
+    (catch #t (lambda () (thunk) #f) (lambda _ #t)))
+
+  ;; P1: a generation image with NO generation id (config root = shared td-root)
+  ;; must be rejected at the API boundary — it would not be per-generation.
+  (format #t "REJECTS_NO_GEN=~a~%"
+          (if (raises? (lambda () (td-generation-image (td-config)))) "yes" "no"))
+
   (define base-userspace
     (drv (lower-object
           (system-image
