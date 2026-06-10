@@ -46,6 +46,7 @@
             td-config-manifest
             td-config-ship-guix?
             td-config-generation
+            td-config-effective-root-label
             td-config->operating-system
             %td-default-config))
 

@@ -258,38 +258,9 @@ generation-image:
 	base_img=`$(GUIX) build "$$base"`; \
 	echo ">> check: reproducibility of BOTH bootc generation images"; \
 	$(GUIX) build --check "$$gen1" "$$gen2"; \
-	echo ">> artifact: each bootc image carries /boot, its boot layer is WIRED into the image metadata, and the two generations' boot payloads DIFFER"; \
-	tmproot=`mktemp -d`; \
-	explode() { d="$$tmproot/`basename $$1`"; rm -rf "$$d"; mkdir -p "$$d"; \
-	  tar xzf "$$1" -C "$$d" >/dev/null 2>&1 || { echo "FAIL: cannot read OCI image $$1" >&2; exit 1; }; echo "$$d"; }; \
-	boot_layer_hex() { for l in "$$1"/*/layer.tar; do \
-	  if tar tf "$$l" 2>/dev/null | grep -qE '(^|/)boot/bzImage$$'; then basename "`dirname "$$l"`"; return 0; fi; \
-	  done; return 0; }; \
-	probe_initrd_sha() { local img="$$1" label="$$2"; \
-	  d=`explode "$$img"`; hex=`boot_layer_hex "$$d"`; \
-	  test -n "$$hex" || { echo "FAIL ($$label): no layer carries /boot/bzImage — image is not bootable." >&2; exit 1; }; \
-	  tar tf "$$d/$$hex/layer.tar" 2>/dev/null | grep -qE '(^|/)boot/initrd\.cpio\.gz$$' \
-	    || { echo "FAIL ($$label): the boot layer is missing /boot/initrd.cpio.gz." >&2; exit 1; }; \
-	  grep -q "$$hex/layer.tar" "$$d/manifest.json" \
-	    || { echo "FAIL ($$label): boot layer $$hex is NOT referenced in manifest.json Layers — orphaned layer, image metadata is broken." >&2; exit 1; }; \
-	  grep -q "sha256:$$hex" "$$d/config.json" \
-	    || { echo "FAIL ($$label): boot layer $$hex diff_id is NOT in config.json rootfs.diff_ids — orphaned layer, image metadata is broken." >&2; exit 1; }; \
-	  tar xf "$$d/$$hex/layer.tar" -C "$$d" 2>/dev/null; \
-	  sha256sum "$$d"/boot/initrd.cpio.gz | cut -d' ' -f1; }; \
-	dbase=`explode "$$base_img"`; \
-	for l in "$$dbase"/*/layer.tar; do \
-	  tar tf "$$l" 2>/dev/null | grep -qE '(^|/)boot/bzImage$$' \
-	    && { echo "FAIL: the plain userspace image already carries /boot — the discriminator is broken (the appended layer was not what made it bootable)." >&2; exit 1; } || true; \
-	done; \
-	echo "   ok: the plain userspace image has no /boot (discriminator holds)"; \
-	g1_initrd=`probe_initrd_sha "$$gen1_img" gen1`; \
-	g2_initrd=`probe_initrd_sha "$$gen2_img" gen2`; \
-	echo "   gen1 initrd sha256: $$g1_initrd"; \
-	echo "   gen2 initrd sha256: $$g2_initrd"; \
-	test -n "$$g1_initrd" -a "$$g1_initrd" != "$$g2_initrd" \
-	  || { echo "FAIL: gen1 and gen2 carry BYTE-IDENTICAL initrds — the bundles are not actually per-generation (each must mount its own root), so rollback would be a no-op. A drv-name difference alone does not prove this." >&2; exit 1; }; \
-	rm -rf "$$tmproot"; \
-	echo "PASS: each bootc image is reproducible, carries /boot wired into its manifest+config (no orphan layer, absent from the userspace image), and the two generations' initrds differ in content — genuinely per-generation."
+	echo ">> validate artifacts (structured: guile-json metadata + guile-zlib initrd)"; \
+	TD_GEN1_IMG="$$gen1_img" TD_GEN2_IMG="$$gen2_img" TD_BASE_IMG="$$base_img" \
+	  $(GUIX) repl $(LOAD) tests/generation-image-check.scm
 
 # 6. M7 imperative-surface removal — image-swap-only BY CONSTRUCTION (DESIGN §6).
 #    M6 made image CONTENTS manifest-driven but left the imperative mutation
