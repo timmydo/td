@@ -141,9 +141,29 @@ Sub-ladder (gated):
     an M10.2+ concern since we ship our own placer; and the build still uses the daemon, not
     the rootless user-namespace builder (deferred, its own slice — needs a daemon-vs-rootless
     store-path differential per prime directive 4).
-- **M10.2** — guix-free, offline: place a generation (extract /boot from the bootc image) and
-  update the GRUB menu (+ prune old entries) on the target.
+- **M10.2 — DONE** (signed off 2026-06-10). Guix-free, offline placer (`place` rung).
+  `system/td-place.sh` is a POSIX shell tool that runs ON THE TARGET (no guix): it cracks
+  a bootc generation image, extracts that generation's kernel+initrd into its OWN
+  per-generation root (`<boot>/td/gen-N/`, recording the gen's root label), prunes the
+  placed generations to the newest `--keep`, and regenerates a marker-delimited managed
+  block of GRUB menuentries — one per kept generation, each `linux`/`initrd` pointing at
+  THAT generation's files and selecting THAT generation's root (`root=LABEL=td-root-gen-N`),
+  newest first; the user's grub.cfg preamble (outside the markers) is preserved.
+  `system/td-place.scm` runs it inside a derivation whose builder PATH is ONLY base tools
+  (NO guix), so a successful build PROVES the placer guix-free BY CONSTRUCTION (guix absent
+  from the sandbox — the same "absent → cannot be used" guarantee as `no-guix`), and the
+  placed target tree is `guix build --check`-reproducible. Behavioral, not diffed against a
+  Guix component it lacks (M10-design.md decision 2): `tests/place-check.scm` cracks two
+  trees — PLACE (gens 1,2 keep 10) and PRUNE (gens 1,2,3 keep 2) — and asserts per-gen
+  placement, distinct initrds, the per-gen menu + root selection (from the typed compiler,
+  no drift), preamble preservation, and that pruned gen 1 leaves no root dir AND no menu
+  entry. Verified-red on BOTH crux properties: breaking prune (keep-all) reddens the PRUNE
+  scenario; writing a shared `td-root` for every gen reddens the root-selection checks.
 - **M10.3** — manual-rollback test: boot generation N, then boot N-1 from the menu, assert.
+  (Open follow-ons the placer left for M10.3: the menuentry path is GRUB-root-relative
+  `/td/gen-N/...` and root selection is by label — wiring the GRUB `search`/`set root` for
+  the target partition layout, `set default`, and the gnu.system/gnu.load closure path is
+  M10.3's job, as is target-persistent state across boots.)
 
 Deferred: auto-rollback (boot counter + health agent); verified/dedup generations
 (ostree/composefs/fs-verity); registry push/signing. The earlier auto-rollback
@@ -207,7 +227,7 @@ key-based login still works.
 
 ## The loop (reminder)
 
-13 rungs: `eval diff typed-coverage oci-diff manifest-diff build test boot-disk oci
-manifest-check no-guix run container`. eval → differentials → `guix build --check` →
-marionette tests, short-circuiting on first failure. Don't advance a sub-task until green.
-Small commits, each stating which test now passes.
+16 rungs: `eval diff typed-coverage oci-diff manifest-diff generation-diff build test
+boot-disk oci manifest-check generation-image place no-guix run container`. eval →
+differentials → `guix build --check` → marionette tests, short-circuiting on first failure.
+Don't advance a sub-task until green. Small commits, each stating which test now passes.

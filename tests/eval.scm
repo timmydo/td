@@ -12,6 +12,7 @@
              (system td-typed)
              (system td-hardening)
              (system td-generation)
+             (system td-place)
              (tests boot)
              (tests container))
 

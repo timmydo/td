@@ -53,7 +53,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check generation-image no-guix run container
+.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check generation-image place no-guix run container
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -61,7 +61,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check generation-image no-guix run container
+check: eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check generation-image place no-guix run container
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
@@ -261,6 +261,43 @@ generation-image:
 	echo ">> validate artifacts (structured: guile-json metadata + guile-zlib initrd)"; \
 	TD_GEN1_IMG="$$gen1_img" TD_GEN2_IMG="$$gen2_img" TD_BASE_IMG="$$base_img" \
 	  $(GUIX) repl $(LOAD) tests/generation-image-check.scm
+
+# M10.2 guix-free placer (M10-design.md step 3, "Place"). The deployment side:
+# a POSIX shell tool (system/td-place.sh) that runs ON THE TARGET — which has NO
+# guix — to extract /boot from a bootc generation image, write a per-generation
+# GRUB menu entry that selects THAT generation's own root, and prune old
+# generations. This rung exercises it hermetically (system/td-place.scm): it
+# builds the per-generation bootc images with Guix (the M10.1 oracle) and runs
+# the placer over them inside a derivation whose builder PATH is ONLY base tools,
+# NO guix — so a successful build PROVES the placer is guix-free by construction
+# (guix is absent from the sandbox, the same "absent → cannot be used" guarantee
+# as `no-guix`), and `--check` proves the placed target tree reproducible. The
+# deployment behavior is tested against the artifact (M10-design.md decision 2),
+# not diffed against a Guix component it lacks: tests/place-check.scm cracks the
+# tree and asserts each present generation is placed with its own kernel/initrd
+# and a menu entry selecting its own root, the user grub.cfg preamble survives,
+# and (the prune scenario) the oldest generation's root dir AND menu entry are
+# gone. Two scenarios: PLACE (gens 1,2 keep 10 — no prune) and PRUNE (gens 1,2,3
+# keep 2 — gen 1 dropped). The full boot+rollback is M10.3.
+place:
+	@echo ">> place: guix-free placer extracts /boot + writes a per-generation GRUB menu, prunes old generations (M10.2)"
+	@set -euo pipefail; \
+	drvs=`$(GUIX) repl $(LOAD) tests/place-drv.scm 2>/dev/null`; \
+	place_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_PLACE=//p'`; \
+	prune_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_PRUNE=//p'`; \
+	test -n "$$place_drv" -a -n "$$prune_drv" || { echo "ERROR: could not lower the placer tree derivations" >&2; exit 1; }; \
+	echo ">> place  tree derivation (gens 1,2 keep 10): $$place_drv"; \
+	echo ">> prune  tree derivation (gens 1,2,3 keep 2): $$prune_drv"; \
+	place_tree=`$(GUIX) build "$$place_drv"`; \
+	prune_tree=`$(GUIX) build "$$prune_drv"`; \
+	echo ">> check: reproducibility of BOTH placed target trees"; \
+	$(GUIX) build --check "$$place_drv" "$$prune_drv"; \
+	echo ">> validate PLACE tree (gens 1,2 present, none pruned)"; \
+	TD_PLACED="$$place_tree" TD_PRESENT="1 2" TD_ABSENT="" \
+	  $(GUIX) repl $(LOAD) tests/place-check.scm; \
+	echo ">> validate PRUNE tree (gens 2,3 present, gen 1 pruned)"; \
+	TD_PLACED="$$prune_tree" TD_PRESENT="2 3" TD_ABSENT="1" \
+	  $(GUIX) repl $(LOAD) tests/place-check.scm
 
 # 6. M7 imperative-surface removal — image-swap-only BY CONSTRUCTION (DESIGN §6).
 #    M6 made image CONTENTS manifest-driven but left the imperative mutation
