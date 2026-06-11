@@ -1,8 +1,10 @@
-;; tests/rollback.scm — M10.3: the manual-rollback acceptance test (DESIGN §7.1).
+;; tests/rollback.scm — the manual-rollback (M10.3) + verified-generations
+;; (M11) acceptance tests (DESIGN §7.1).
 ;;
 ;; From a disk carrying TWO placed generations (built by the guix-free placer,
 ;; assembled by system/td-disk.scm), ONE persistent qcow2 overlay is booted
-;; TWICE through firmware -> GRUB:
+;; THREE times through firmware -> GRUB (boots 1–2 under marionette; boot 3
+;; expects no system to connect to):
 ;;
 ;;   boot 1 — GRUB's default is the newest entry (td-gen-2). Assert the booted
 ;;     identity (M11 shape): /proc/cmdline carries gen-2's RECORDED verity
@@ -25,7 +27,15 @@
 ;;     survived, default.cfg still holds the selection, gen-2's placed
 ;;     kernel/initrd are still on the boot partition, and the menu still lists
 ;;     BOTH generations (rolling back never destroys the newer generation —
-;;     you can roll forward again).
+;;     you can roll forward again). Finally roll FORWARD (default.cfg back to
+;;     td-gen-2) and reboot toward boot 3.
+;;
+;;   boot 3 — M11 §7.1 acceptance: a CORRUPTED root fails CLOSED. One sector
+;;     of gen-2's boot-script data block is corrupted in the overlay (label
+;;     and ext4 superblock intact — only integrity verification can catch
+;;     it); the boot must log the kernel's dm-verity corruption signature on
+;;     the serial console and the system must never assemble (no shepherd —
+;;     a marker boot 2 positively proves on the same serial channel).
 ;;
 ;; THE STATE MODEL (DESIGN §2.6, M10.3 staged scope) is asserted across the same
 ;; two boots: on each boot the declared persistent path (/var/lib/ssh, the
@@ -425,10 +435,23 @@
                 (lambda args #f)))
 
             ;; ---------- boot 2: SAME overlay; GRUB sources default.cfg ------
+            ;; Boot 2's ttyS0 goes to a FILE (instead of the build log) so it
+            ;; can serve as boot 3's POSITIVE CONTROL: a healthy boot must
+            ;; demonstrably print the "shepherd" marker on this exact serial
+            ;; channel, or boot 3's no-shepherd arm would rest on an untested
+            ;; premise.
             (mkdir "m2")
-            (let ((m2 (make-marionette vm-command #:socket-directory "m2")))
+            (let ((m2 (make-marionette (append vm-command
+                                               '("-serial" "file:serial2.log"))
+                                       #:socket-directory "m2")))
               (assert-generation! m2 1 #$(gen-label 1) gen1-roothash
                                   #$gen1-os gen2-roothash)
+
+              (test-assert "positive control: a healthy boot prints shepherd on the serial channel"
+                (let ((txt (and (file-exists? "serial2.log")
+                                (call-with-input-file "serial2.log"
+                                  get-string-all))))
+                  (and txt (string-contains txt "shepherd"))))
 
               ;; §2.6 on gen 1 — both directions of declared persistence, plus
               ;; machine identity:
@@ -557,10 +580,11 @@
                             "/" (basename
                                  (canonicalize-path
                                   (string-append #$gen2-os "/boot")))))
-                     (port (open-input-pipe
-                            (string-append
-                             #$e2fsprogs "/sbin/debugfs -R 'blocks " path "' "
-                             img " 2>/dev/null")))
+                     (port (open-pipe* OPEN_READ
+                                       (string-append #$e2fsprogs
+                                                      "/sbin/debugfs")
+                                       "-R" (string-append "blocks " path)
+                                       img))
                      (out  (get-string-all port)))
                 (close-pipe port)
                 (let ((tokens (filter (lambda (s) (not (string-null? s)))
@@ -597,9 +621,14 @@
             (define boot3-pid
               (let ((pid (primitive-fork)))
                 (if (zero? pid)
-                    (begin
-                      (apply execlp (car boot3-command) boot3-command)
-                      (primitive-exit 127))
+                    ;; Child. execlp RAISES on failure rather than
+                    ;; returning; exit 127 either way so a spawn failure
+                    ;; surfaces as the watcher's timeout, not a hang.
+                    (catch #t
+                      (lambda ()
+                        (apply execlp (car boot3-command) boot3-command)
+                        (primitive-exit 127))
+                      (lambda args (primitive-exit 127)))
                     pid)))
 
             (test-assert "boot 3 FAILS CLOSED: dm-verity reports the corruption and the system never assembles"
@@ -610,12 +639,14 @@
                   (cond ((and txt
                               (string-contains txt "device-mapper: verity")
                               (string-contains txt "corrupted"))
-                         ;; The corruption was detected; give the boot a
-                         ;; moment more, then require the system never
-                         ;; ASSEMBLED: shepherd (PID-1 of a successfully
-                         ;; booted td system, visible on the serial console
-                         ;; in boots 1 and 2) never started.
-                         (sleep 5)
+                         ;; The corruption was detected; now require the
+                         ;; system never ASSEMBLES: shepherd — the marker
+                         ;; boot 2's positive control proved a healthy boot
+                         ;; prints on this serial channel — must not appear
+                         ;; within a generous window (a fail-OPEN regression,
+                         ;; e.g. verity in warn-only mode, would log the
+                         ;; signature and then boot anyway).
+                         (sleep 30)
                          (let ((txt (call-with-input-file boot3-serial
                                       get-string-all)))
                            (not (string-contains txt "shepherd"))))
@@ -644,8 +675,11 @@ partition, tmpfs root, EROFS on an undeclared store write, system path); \
 select the older generation via the placer's manual-rollback hook; reboot \
 the SAME disk overlay and assert the older generation's identity; assert \
 the placed state (sentinel, selection, the newer generation's files and \
-menu entry) persisted across the reboot; and assert the §2.6 state model — \
+menu entry) persisted across the reboot; assert the §2.6 state model — \
 declared paths are backed by td-state and survive the swap, an undeclared \
 write does not, and the SSH host key (machine identity) is unchanged by the \
-rollback.")
+rollback; then roll forward, corrupt one sector of gen-2's boot-script data \
+block, and assert the third boot FAILS CLOSED (the M11 acceptance): the \
+kernel logs the dm-verity corruption signature and the system never \
+assembles.")
    (value (run-td-rollback-test))))
