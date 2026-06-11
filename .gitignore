@@ -1,0 +1,3 @@
+# Scratch of the `rootless` rung (staged store + DB snapshot); kept on a red
+# run for diffing, removed on green.
+.rootless-scratch/

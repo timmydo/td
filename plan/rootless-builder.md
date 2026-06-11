@@ -71,16 +71,25 @@ Mechanics (all inside the check.sh sandbox, offline):
 - [x] **S1 feasibility probes** — rootless daemon + staged store + `--check`
   green on a trivial gexp drv inside the check.sh-style sandbox. Evidence
   above; throwaway scripts under `.probe/` (not committed).
-- [ ] **S2 rung** — `tests/rootless-*.{sh,scm}` driver + `rootless` rung in
-  HEAVY_RUNGS: (a) isolation probe drv reads /proc/self/uid_map in-build and
-  asserts a non-identity single-uid map (proves builds really run in a userns;
-  self-discriminating — a daemon falling back to plain chroot reds it);
-  (b) the differential on the target image drv (the `build` rung's qcow2
-  system image): host-oracle build, rootless `--check`, plus an explicit
-  output-path string equality assert. On mismatch: --keep-failed + print both
-  paths (diffoscope is a cold Python closure — can't build it offline inside
-  the loop; mismatch diagnosis runs it OUTSIDE the loop on the kept
-  `-check` dir; the rung prints the exact command).
+- [x] **S2 rung** — `tests/rootless.sh` + `tests/rootless-drvs.scm` +
+  `rootless` rung in HEAVY_RUNGS: (a) validity guards (oracle output must be
+  valid in the snapshot — else `--check` would BUILD instead of COMPARE, a
+  false green; probe output must be INVALID — else the assertion would read
+  another daemon's map); (b) isolation probe drv reads /proc/self/uid_map
+  in-build; assert = exactly one line with a NON-ZERO first uid ("30001 30001
+  1" at this pin) — rejects both the identity map (no userns) and an inherited
+  "0 uid 1" map (e.g. a chroot-less build), the hole a plain
+  not-identity-grep would leave; (c) the differential on the target image drv
+  (the `build` rung's qcow2 system image): host-oracle build, rootless
+  `--check --keep-failed`, plus an explicit output-path string equality
+  assert. On mismatch the rung prints the kept `-check` path and the exact
+  diffoscope command to run OUTSIDE the loop (diffoscope is a cold Python
+  closure — not buildable offline inside it). GREEN 2026-06-11: image drv
+  gklrdcy...-image.qcow2.drv rebuilt rootlessly, bit-for-bit equal at
+  /gnu/store/m95hwxsa...-image.qcow2. Measured: 36s solo (incl. sandbox
+  setup; bind closure 4536 items ~10s, DB snapshot ~1s, image rebuild ~6s).
+  Sub-agent contract review: no violations; its robustness findings (daemon
+  shutdown race, sqlite busy timeout, set -u guard) are applied.
 - [ ] **S3 verified-red** — (A) cross-builder divergence: a DISTINCT
   env-sensitive drv (reads uid_map; named differently from the green probe so
   its host-built validity never leaks into later snapshots) built by the ROOT
