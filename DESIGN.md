@@ -411,9 +411,18 @@ as the acceptance test stated here is met or strengthened.
   reboots selecting generation N−1 from the GRUB menu, and asserts the older
   identity; placed state persists across the reboot. Detail: `plan/m10.md`.
 - **M11 — verified generations.** A generation's root carries build-time integrity
-  metadata (fs-verity / dm-verity / composefs — mechanism chosen in the track file);
-  booting an intact generation succeeds while a corrupted root fails closed
-  (verified-red by corrupting bytes). Integrity ≠ authenticity: signatures are M12.
+  metadata; booting an intact generation succeeds while a corrupted root fails closed
+  (verified-red by corrupting bytes). Mechanism *(settled 2026-06-10)*: **dm-verity
+  over the per-generation root image**, ChromeOS-style — `veritysetup format` (fixed
+  salt) emits a hash tree + root hash at build; the hash rides the kernel cmdline in
+  the GRUB menuentry, which is exactly what M12 signs. M10.3's ext4 image becomes the
+  verity data device unchanged. fs-verity alone cannot verify a root (per-file only —
+  no directory structure; the needed enumerator is composefs); composefs is re-parked
+  for if/when cross-generation dedup earns its place — it would replace, not extend,
+  the per-generation-image design, and is not in the pinned Guix. Verification
+  boundary at M11: the root below `/boot` — kernel, initrd, and the cmdline carrying
+  the hash stay unverified until M12 moves the boundary down. Integrity ≠
+  authenticity: signatures are M12.
 - **M12 — signed distribution.** A generation image is pushed to and pulled from a
   registry (local/offline inside the loop), its signature verified before placement;
   the placer rejects unsigned or tampered images (verified-red). Identity convention

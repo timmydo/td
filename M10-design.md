@@ -41,8 +41,10 @@ like a normal rootless container build while keeping Guix's reproducibility.
 - **Reuse:** the bootc image *convention* (an OCI image carrying a bootable kernel),
   td's existing OCI lowering, plain GRUB menu entries.
 - **Skip for v0:** ostree and composefs/fs-verity — i.e. cross-generation dedup and
-  integrity verification. That's the "verified generations" north star, already out
-  of scope. We keep a few full roots; dedup earns its place later.
+  integrity verification. We keep a few full roots; dedup earns its place later.
+  (Integrity verification has since been settled as M11 = dm-verity over the
+  per-generation root image — see "Verified generations" below and DESIGN §7.1;
+  dedup remains re-parked.)
 - **Skip:** the bootc binary (Rust crate tree; FSDG vendoring cost, no payoff here).
 
 ## What "a generation bundle" is (checked)
@@ -107,4 +109,20 @@ cannot be sealed, so tmpfs-root and verity are one move, not two.
 - **M10.2** — guix-free place + GRUB menu update + prune, on the target.
 - **M10.3** — manual-rollback test: boot generation N, boot N-1 from the menu, assert.
 
-Verified/dedup (ostree/composefs) and auto-rollback stay deferred.
+Verified generations *(mechanism settled 2026-06-10 — normative in DESIGN §7.1 M11)*:
+**dm-verity over the per-generation root image**. What M10.3 should know now:
+
+- The per-gen ext4 image survives M11 unchanged — it becomes the verity data device,
+  mounted read-only. Build it exactly as planned.
+- Keep root *selection* thin: `root=LABEL=td-root-gen-N` is replaced at M11 by
+  `root=/dev/dm-0 dm-mod.create=…` (root hash on the cmdline), so don't grow label
+  plumbing beyond what the rollback test needs.
+- Nothing may write into the root at first boot — the image must be sealable
+  (the §2.6 "tmpfs-root and verity are one move" point).
+- Cheap first rung when M11 starts: confirm the pinned linux-libre config has
+  `CONFIG_DM_VERITY` (and `CONFIG_DM_INIT` for initrd-less assembly).
+
+Tooling is already in the pin (`veritysetup` via cryptsetup; `erofs-utils` if the
+image format is ever swapped). composefs is **not** in the pin and would replace,
+not extend, the per-generation-image design — re-parked for if/when dedup earns
+its place. Auto-rollback stays deferred.
