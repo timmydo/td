@@ -396,9 +396,15 @@ run concurrently):
 - **rootless-builder** — build the target with a rootless user-namespace builder and
   prove daemon-vs-rootless store-path equality (the prime-directive-4 differential;
   the daemon is the oracle). Deferred from M10.1. `plan/rootless-builder.md`.
-- **offline-isolation** — drop nonguix from the daemon's substitute URLs and isolate
-  the daemon's network; loop stays green isolated, and a deliberate undeclared fetch
-  fails. Standing follow-up from M6. `plan/offline-isolation.md`.
+- **offline-isolation** — CLOSED 2026-06-11, half delivered / half rescoped (human
+  sign-off per §4.3). Delivered: a deliberate undeclared fetch (non-fixed-output
+  network access) demonstrably fails, asserted every loop (the `offline` rung,
+  verified-red). Rescoped: isolating the daemon's network and dropping nonguix from
+  its substitute set is deferred to the era when td runs its OWN builder daemon
+  (rootless-builder and successors) — the shared host daemon is the owner's machine
+  state, needed for the host's own (nonguix) maintenance, and is not td's to
+  isolate. The ready-to-resume assertions, evidence, and netns design are archived
+  in `plan/offline-isolation.md`. Standing follow-up from M6.
 - **oci-load** — verify the generation image loads in a foreign OCI runtime without
   breaking the offline loop (podman already rejected at M8; probe cheap vehicles or
   prove spec conformance structurally). Deferred from M10.1. `plan/oci-load.md`.
