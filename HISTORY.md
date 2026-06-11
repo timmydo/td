@@ -158,6 +158,55 @@ round on 2026-06-10.
     FAIL when mutated out; the per-entry checker flags a swapped block (4 fails) and a missing
     root.tar, and is gen-1/gen-10 boundary-safe.
 
+- [x] **M10.3 — manual rollback** (`rollback` rung; landed 2026-06-11, first roadmap
+  entry under the §7 merge-on-green protocol — no per-milestone sign-off). The DESIGN
+  §7.1 acceptance test, end to end: from a disk carrying two placed generations, boot
+  generation 2 (the GRUB default), assert its identity, select generation 1 via the
+  menu, reboot the SAME disk, assert the older identity, and prove the placed state
+  persisted. What it took:
+  - **Bundle (S1).** The generation image's userspace layer now packs the REAL
+    (non-containerized) system closure (`initialize-root-partition` +
+    `build-docker-image` — the disk-image root as an OCI layer): the stock docker
+    lowering containerizes the OS (dummy kernel, services stripped), which is not
+    honestly bootable. `boot/td-identity` gained `system=` (what the menu must
+    gnu.system=/gnu.load=) and `root-uuid=` (deterministic `operating-system-uuid`);
+    the checker proves system= equals the typed compiler's lowered system path AND
+    exists inside the userspace layer (bootable, not bootable-looking).
+  - **Placer (S2, still guix-free).** Menu entries carry `--id td-gen-N` and
+    gnu.system/gnu.load from the identity; the managed block gained
+    `search --label <boot-label>`, `set default=td-gen-<newest>`, and the
+    MANUAL-ROLLBACK HOOK (`if [ -s /td/default.cfg ]; then source ...; fi` — rollback
+    = write one line there and reboot; the placer never writes it). `--mkfs` turns the
+    staged root.tar into a live ext4 `root.img` labeled `td-root-gen-N` with the
+    identity UUID; `place-check.scm` verifies label/UUID straight from the superblock
+    bytes (offsets 1024+0x38/0x68/0x78 — no tools).
+  - **Disk (S3).** `system/td-disk.scm` assembles the placed tree into a raw MBR/GRUB
+    disk (boot partition = placed `boot/` + GRUB modules, prefix `(hd0,msdos1)/grub`;
+    one partition per generation using the placer's root.img verbatim;
+    genimage + grub-bios-setup, as Guix's own disk images do).
+  - **Test (S4).** One persistent qcow2 overlay booted TWICE through firmware->GRUB;
+    per boot, identity is asserted three independent ways (cmdline root=<label>;
+    st_dev of / == st_rdev of /dev/disk/by-label/<label>; /run/current-system ==
+    that generation's system path). The first in-test guest REBOOT in the loop —
+    persistence within a test is legitimate; isolation is the overlay dying with the
+    build (CLAUDE.md prime directive 6).
+  - **Two traps found by the loop, fixed:** (1) Guix's initrd parses the WHOLE
+    `root=` value as a bare label — the dracut-style `LABEL=` prefix is searched
+    literally and never matches (first disk reached GRUB+kernel, then looped
+    "waiting for partition"); the placer writes `root=<label>`. (2) bare `mke2fs`
+    is NON-deterministic (superblock timestamps + random hash seed) — caught by
+    `guix build --check` going red on the placed tree; td's qcow2 rung never exposed
+    this because partition images are INPUTS to the drv that `--check` re-runs. Fixed
+    with `SOURCE_DATE_EPOCH=1 E2FSPROGS_FAKE_TIME=1` + `hash_seed=<uuid>` + pinned
+    top-dir mtimes; both the mkfs tree and the assembled disk now pass `--check`.
+  - Verified-red: S1 R1–R3 (tampered identity system=/root-uuid=, userspace layer
+    dropped from manifest), S2 R4–R11 (crossed gnu.system between entries, stripped
+    search/default/hook lines, flipped superblock label/uuid/magic bytes, missing
+    root.img/recorded state), S4 variant A (rollback act skipped → boot 2 is gen-2
+    again: all three gen-1 identity asserts + both persistence asserts FAIL) and
+    variant B (gen-2's menuentry vandalized in-guest → "menu still lists BOTH" FAILs).
+    Full evidence in `plan/m10.md`.
+
 ## Key lessons (full narrative — condensed normative versions live in CLAUDE.md)
 
 - **Verified-red discipline.** A green behavioral rung is only meaningful once you've SEEN

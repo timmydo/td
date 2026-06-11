@@ -83,13 +83,26 @@
                    (line (read-line p)))
               (close-pipe p)
               (string->number (car (string-split line #\tab)))))
+          ;; Determinism: copy-recursively re-stamps everything "now", and
+          ;; mke2fs stamps the superblock/journal with the current time and a
+          ;; random hash seed unless pinned (the placer learned this the
+          ;; --check-red way; same medicine here).
+          (define (normalize-mtimes! dir)
+            (for-each (lambda (f) (utime f 1 1))
+                      (find-files dir (const #t) #:directories? #t))
+            (utime dir 1 1))
           (define (mkfs-ext4 dir out label uuid)
             (let* ((kb (du-kb dir))
                    (kb (+ kb (quotient kb 4) 1024)))
+              (setenv "SOURCE_DATE_EPOCH" "1")
+              (setenv "E2FSPROGS_FAKE_TIME" "1")
               (invoke "fakeroot" "mke2fs" "-t" "ext4" "-d" dir
                       "-L" label "-U" uuid
-                      "-E" "root_owner=0:0,lazy_itable_init=1,lazy_journal_init=1"
+                      "-E" (string-append
+                            "root_owner=0:0,lazy_itable_init=1,"
+                            "lazy_journal_init=1,hash_seed=" uuid)
                       out (format #f "~ak" kb))))
+          (normalize-mtimes! bootroot)
           (mkfs-ext4 bootroot "boot.img" #$%td-boot-label #$%td-boot-uuid)
 
           ;; --- 3. genimage: MBR disk; p1 boot (1 MiB offset = GRUB gap),

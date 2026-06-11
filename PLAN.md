@@ -13,8 +13,8 @@ file is the **single source of truth for claim status** (track files don't carry
 
 ## Mainline (serial — one agent drives it at a time)
 
-- [ ] **M10.3 manual rollback + declared persistence** — CLAIMED claude-fable 2026-06-10 — `plan/m10.md`
-- [ ] **M11 verified generations** — blocked on M10.3 — split out of `plan/m10.md` when started
+- [x] **M10.3 manual rollback + declared persistence** — DONE 2026-06-11 (claude-fable) — `plan/m10.md`
+- [ ] **M11 verified generations** — UNCLAIMED (unblocked) — split out of `plan/m10.md` when started
 - [ ] **M12 signed distribution** — blocked on M11
 
 ## Side-tracks (parallel-safe)

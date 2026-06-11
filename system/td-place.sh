@@ -233,11 +233,19 @@ if [ "$mkfs" = yes ]; then
   fsroot="$root_stage/fsroot"
   mkdir -p "$fsroot"
   tar xf "$root_stage/root.tar" -C "$fsroot"
+  # Determinism: the tar gives every entry a fixed mtime, but the top dir was
+  # mkdir'd "now" — pin it; and mke2fs itself stamps the superblock/journal/
+  # root inode with the current time and a RANDOM hash seed unless told
+  # otherwise (found by `guix build --check` going red on the placed tree).
+  # SOURCE_DATE_EPOCH + E2FSPROGS_FAKE_TIME pin the clock; hash_seed pins the
+  # directory-hash seed to the (already deterministic) filesystem UUID.
+  touch -d @1 "$fsroot"
   size_kb=$(du -sk "$fsroot" | cut -f1)
   size_kb=$((size_kb + size_kb / 4 + 1024))
+  SOURCE_DATE_EPOCH=1 E2FSPROGS_FAKE_TIME=1 \
   mke2fs -t ext4 -d "$fsroot" \
          -L "$root_label" -U "$img_uuid" \
-         -E "root_owner=0:0,lazy_itable_init=1,lazy_journal_init=1" \
+         -E "root_owner=0:0,lazy_itable_init=1,lazy_journal_init=1,hash_seed=$img_uuid" \
          "$root_stage/root.img" "${size_kb}k"
   rm -rf "$fsroot"
   [ -s "$root_stage/root.img" ] || {
