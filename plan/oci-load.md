@@ -70,8 +70,9 @@ Agent: claude-fable-a03d13 (claimed 2026-06-11; claim status lives in PLAN.md).
      `FAIL: corrupted image was rejected, but NOT with a digest mismatch`.
    Measured: 43.6s wall for `./check.sh oci-load` incl. the serial cheap
    chain (~18s) — rung proper ~25s warm; LPT slot after `rootless`.
-3. [ ] **§2.7 identity move**: record the manifest digests in `DIGESTS.md`
-   (re-baseline — exclusive landing, §7.3, announced here). Digests observed
+3. [x] **§2.7 identity move** — DONE 2026-06-11: recorded in `DIGESTS.md`
+   (re-baseline — exclusive landing, §7.3, announced here; sub-agent-reviewed,
+   purely additive). Digests observed
    stable across three rung runs (2026-06-11):
    - plain default image:
      `sha256:714045afa001bab1ce90744ff77c885e4faae1573570de753e6906a5bc5c80ff`
