@@ -3,3 +3,4 @@
 # local-file additionally excludes target/ from the derivation so a local
 # `cargo build` can never perturb the reproducibility oracle's input hash.
 /target
+/.cargo

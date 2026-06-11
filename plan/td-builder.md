@@ -73,10 +73,12 @@ equal to the root daemon, so oracle authority transfers).
 
 ## Sub-task ladder (draft — refine as probes land)
 
-- [~] **S1 toolchain probe** — the pinned channel's Rust toolchain (warmed on
+- [x] **S1 toolchain probe** — the pinned channel's Rust toolchain (warmed on
   the host) compiles a hello-world td-builder inside the check.sh sandbox,
   offline. Records closure size and compile time (loop-latency budget, §1.3).
-  IMPLEMENTED, pending a green-loop run on a guix host (see Working state).
+  DONE 2026-06-11: implemented by claude-fable-49b6d6 (PR #2, no guix there);
+  guix-loop validation + review round by claude-fable-a03d13 (see Working
+  state — "S1 guix-loop validation").
 - [ ] **S2 NAR differential** — td's NAR serializer hashes a store item
   bit-for-bit equal to the daemon's recorded hash; verified-red by a
   perturbation (e.g. ordering or padding defect).
@@ -97,7 +99,7 @@ probe) — the prerequisite every later sub-task depends on. Open question 1
 (daemon protocol vs CLI) is NOT yet decided; it does not block S1, which only
 needs the crate to compile and run.
 
-### S1 — toolchain probe (implemented; awaiting a green-loop run)
+### S1 — toolchain probe (implemented by claude-fable-49b6d6; validated below)
 
 What landed in this increment:
 
@@ -139,18 +141,47 @@ guix/guix-daemon — only the rung's *crate-level* legs could be exercised there
   `grep -Eq '^td-builder [0-9.]+ ok$'` assertion fails. RESTORED → green
   (`td-builder 0.1.0 ok`).
 
-STILL OWED on a guix host before S1 is "done" (CLAUDE.md Definition of done):
-run `./check.sh td-builder` and confirm it goes GREEN (including
-`guix build --check` reproducibility); re-confirm RED A/B through the full rung,
-not just `cargo`; then fill the Measurement log below and flip S1 to [x] in
-PLAN.md. The `eval` rung must also be green with the new module loaded.
+### S1 guix-loop validation (claude-fable-a03d13, 2026-06-11 — takeover of PR #2)
 
-### Measurement log (§1.3 — fill from a real run)
+Everything the section above owed, delivered on a guix host:
+
+- **Store warm-in (DESIGN §5):** cargo-build-system pins rust 1.93 (not the
+  channel's default `rust` 1.91) — warmed the exact td-builder closure with
+  `guix build -L . -e '(@ (system td-builder) td-builder)'` pinned to the
+  OFFICIAL substitute servers only (`--substitute-urls="https://bordeaux.guix.gnu.org
+  https://ci.guix.gnu.org"` — never the host daemon's default list, which
+  includes nonguix; FSDG posture). Cold-store lowering fails honestly: the
+  no-substitutes source-build path dies on an upstream boost-patch hash
+  mismatch — the rung's warm-store precondition is real, not cosmetic.
+- **GREEN:** `./check.sh td-builder` passes — lower, offline build,
+  `guix build --check` bit-for-bit, sentinel run. `eval` green with
+  `(system td-builder)` loaded.
+- **RED A through the rung** (not just cargo): `fn broken( {` appended →
+  `make: *** [Makefile:567: td-builder] Error 1` (build leg). RESTORED.
+- **RED B through the rung:** sentinel `ok` → `NOPE` → the defective binary
+  compiles AND passes `--check`, and the rung still reds at the run leg
+  (`FAIL: the compiled td-builder did not print its sentinel`) — the legs
+  discriminate independently. RESTORED.
+- **Review round** (sub-agent, full contract review of dd1ea2f): one
+  should-fix — the `#:select?` substring match admitted an EMPTY `target/`
+  directory into the source nar, so a stray local `cargo build` perturbed the
+  drv hash, contrary to the stated guarantee. Fixed to a basename match and
+  proven by drv differential: clean tree vs tree-with-`target/` lower to the
+  SAME drv (`qlip8v4p…`) under the fix, and to DIFFERENT drvs (`ff7d8071…`)
+  under the old predicate — red and green for the fix itself. Nits applied:
+  `.gitignore` also excludes `.cargo`; run-leg FAIL message mentions the
+  nonzero-exit cause; drv script imports spelled out like its siblings.
+- **S2 reminder (review):** the package sets `#:tests? #f` (legitimate at S1 —
+  empty suite, the rung runs the binary); when S2 adds real unit tests this
+  MUST flip to `#t` or they silently never run.
+
+### Measurement log (§1.3 — from the real loop run, 2026-06-11)
 
 | metric | value | notes |
 |--------|-------|-------|
-| td-builder closure size | _TBD_ | `guix size $out \| tail -n1` (rust runtime closure) |
-| first compile wall-clock | _TBD_ | cold-ish; warm store thereafter |
+| td-builder closure size | 74.5 MiB | `guix size` in-rung (rust runtime closure) |
+| first compile wall-clock | ~1s (crate, warm toolchain) | the `--check` recompile re-runs it every loop |
+| `./check.sh td-builder` wall | ~14s | incl. the ~12s serial cheap chain; rung proper ~2s + --check recompile |
 | crate-level compile (rustup, not the rung) | ~9.3s | local sanity only; NOT the loop number |
 
 Open questions 1–4 (protocol seam, NAR, DB registration, sandbox parity) remain

@@ -4,8 +4,11 @@
 ;; lowering here only PRINTS the drv name; the build — and the rung's honest
 ;; pass/fail — happens in `guix build`, whose exit status is trustworthy (a
 ;; script piped into `guix repl` always exits 0 and would hide a red).
-(use-modules (guix)
+(use-modules (guix store)
+             (guix derivations)
+             (guix gexp)
              (guix monads)
+             (ice-9 format)
              (system td-builder))
 
 (with-store store

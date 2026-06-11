@@ -576,7 +576,7 @@ td-builder:
 	$(GUIX) build --check "$$drv"; \
 	echo ">> run: the compiled binary must print its sentinel"; \
 	"$$out/bin/td-builder" | grep -Eq '^td-builder [0-9.]+ ok$$' \
-	  || { echo "FAIL: the compiled td-builder did not print its sentinel — the toolchain did not produce a working binary." >&2; exit 1; }; \
+	  || { echo "FAIL: the compiled td-builder did not print its sentinel (or exited nonzero) — the toolchain did not produce a working binary." >&2; exit 1; }; \
 	echo ">> closure size:"; $(GUIX) size "$$out" | tail -n1; \
 	echo "   compile wall-clock: $${elapsed}s (first run; warm store thereafter)"; \
 	echo "PASS: the pinned Rust toolchain compiled a reproducible, working td-builder offline (S1)."

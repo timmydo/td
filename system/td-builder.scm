@@ -27,13 +27,17 @@
 ;; relative local-file resolves against THIS file's directory, so it points at
 ;; the repo's top-level builder/. Exclude any local cargo build output (target/,
 ;; a stray .cargo) so a developer who ran cargo by hand cannot perturb the
-;; derivation's hash — only the committed source decides it.
+;; derivation's hash — only the committed source decides it. Match the BASENAME,
+;; not a "/target/" substring: select? sees each directory entry's path WITHOUT
+;; a trailing slash, so a substring match would admit the (then-empty) target/
+;; directory itself into the nar and the hash would differ between a clean tree
+;; and one where cargo ran (review finding; probed against the pinned guix's
+;; (guix serialization) write-file).
 (define %builder-source
   (local-file "../builder" "td-builder-src"
               #:recursive? #t
               #:select? (lambda (file stat)
-                          (not (or (string-contains file "/target/")
-                                   (string-contains file "/.cargo/"))))))
+                          (not (member (basename file) '("target" ".cargo"))))))
 
 (define td-builder
   (package
