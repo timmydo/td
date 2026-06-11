@@ -33,8 +33,11 @@ convenience.
 6. **Respect the state boundary.** The VM is ephemeral per test (fresh state, wiped on
    reset) — that is *test isolation*, not a ban on persistence *within* a test:
    a guest that reboots mid-test and keeps its placed generations (M10) is legitimate
-   behavior under test. `/gnu/store` and the system declaration are immutable. Never
-   stash mutable state outside the declared boundary to make something work.
+   behavior under test. `/gnu/store` and the system declaration are immutable. What
+   may persist on a machine is default-deny and declared (DESIGN §2.6): only
+   allowlisted paths on the `td-state` filesystem survive a generation swap; machine
+   identity (SSH host keys) lives there, never in a generation's root. Never stash
+   mutable state outside the declared boundary to make something work.
 
 ## The loop
 

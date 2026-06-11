@@ -143,6 +143,66 @@ When a Guix component is eventually replaced, the existing Guix component is the
 with `diffoscope`; require behavioral equivalence on the full target set before
 extending behavior. Never a big-bang rewrite.
 
+### 2.6 State model *(settled 2026-06-10)*
+
+What may persist on a td machine across generation swaps, and where. Decided with
+the human 2026-06-10 — that decision is the §4.3 spec review for the state-model
+parts of M10.3/M11. Informed by the production track record: shared-stateful,
+read-only-root designs (ChromeOS, Android, Talos) have held up for a decade-plus;
+every mutable-`/etc` mechanism (ostree's 3-way merge, MicroOS's overlay) is its
+ecosystem's standing regret.
+
+A td disk carries exactly three kinds of content:
+
+- **Generation images** — read-only OS content (store + system closure +
+  kernel/initrd), placed per generation, swapped wholesale, pruned by `--keep`.
+  Never written after placement; M11 seals them, turning read-only from convention
+  into a kernel-enforced property.
+- **`td-state`** — the ONE writable filesystem (label `td-state`); the only
+  traditional read-write filesystem on the disk. It survives every swap and is never
+  touched by the placer or prune.
+- **`/boot`** — placer-owned (M10.2): written only at place time, read-only at
+  runtime by convention.
+
+**The root is assembled, not stored.** Target shape: at boot, `/` is tmpfs; the
+generation's image is mounted read-only (providing `/gnu/store` and the system
+profile); activation materializes `/etc`, `/run`, `/tmp` from the declaration.
+`/etc` is never persistent and never merged — configuration changes by building a
+new generation, full stop. (Staged: M10.3 still boots the per-generation ext4 roots
+M10.2 places; the tmpfs-root assembly lands together with M11's sealing — a root
+the boot path writes to cannot be sealed.)
+
+**Persistence is default-deny and declared.** The typed config carries a
+persistent-paths allowlist; each entry is bind-mounted from `td-state` at boot, and
+nothing else survives a swap. Two tiers, by backing directory:
+
+- **precious** (`td-state/state/…`) — machine identity and anything backup-worthy.
+  SSH host keys are the first entry, relocated explicitly via service configuration
+  (e.g. `HostKey` under `/var/lib/ssh`), not by mount magic.
+- **disposable** (`td-state/cache/…`) — persistent but re-derivable: logs,
+  container images.
+
+`/home` is persistent by definition: it lives on `td-state` (`td-state/home`), the
+partition's user-visible face — not a separate filesystem.
+
+**Machine identity ≠ OS identity.** Rollback swaps the OS, never the machine: a
+rollback must not change SSH host keys.
+
+**Backup / provision contract.** Rebuilding a machine = the typed config (hosted in
+git) + restored `td-state/state` (and `home`). Nothing outside `td-state` is worth
+backing up, by construction.
+
+**Enforcement is staged.** M10.3: convention — the allowlist mounts exist, and the
+rollback test asserts both directions (a declared path written under generation N
+persists into the N−1 boot; an undeclared write does not follow the swap — it
+merely lingers inside that generation's root until pruned). M11: kernel-enforced —
+sealed read-only image + tmpfs root make an undeclared write fail closed (EROFS).
+
+**Oracle scope.** The state model is part of the generation model: the typed
+compiler emits the `td-state` mount and allowlist only when `generation` is set, so
+`generation #f` still converges to the untouched frozen oracle and the M4/M5/M6
+differentials hold with no re-baseline.
+
 ---
 
 ## 3. Invariants *(non-negotiable — these head the agent's instructions)*
@@ -151,10 +211,13 @@ extending behavior. Never a big-bang rewrite.
   non-reproducible build is a failing test, not a warning.
 - **Hermeticity.** No undeclared dependencies. Builds run offline except declared
   fixed-output fetches. Never "fix" a build by reaching outside the container.
-- **State boundary.** In v0 the VM is fully ephemeral — nothing persists across test
-  runs, all writable state is wiped on reset. `/gnu/store` and the declaration are
-  immutable; there is no persistent writable state to protect in v0. Never stash
-  mutable state to make something work.
+- **State boundary.** The VM is ephemeral per test — fresh state per run, wiped on
+  reset; that is *test isolation*, not a ban on persistence within a test.
+  `/gnu/store` and the declaration are immutable. What may persist on a machine is
+  default-deny and declared: only allowlisted paths on `td-state` survive a
+  generation swap (the §2.6 state model; 2026-06-10 — supersedes the v0 wording
+  "there is no persistent writable state"). Never stash mutable state outside the
+  declared boundary to make something work.
 - **Definition of done.** A passing test, reproducible, committed as a small
   increment. If "done" is undefined, the agent declares victory early.
 

@@ -59,6 +59,42 @@ subvolume/directory the initrd mounts — because td today hardcodes one `td-roo
 shared by everything (`system/td.scm:57`). Pinning this is M10.1's core job; without it,
 multiple generations boot the same root and rollback is a no-op.
 
+## State model (added 2026-06-10 — normative version in DESIGN §2.6)
+
+M10.3 is the first time anything persists on the target across a reboot, so the
+state model lands here. The model (decided with the human; track-record rationale
+in DESIGN §2.6): generation images are read-only OS content; one writable
+filesystem, label `td-state`, is the only traditional read-write fs on the disk;
+`/boot` is placer-owned. Persistence is **default-deny**: a typed
+persistent-paths allowlist, each entry bind-mounted from `td-state` at boot,
+tiered **precious** (`td-state/state/…` — identity, backup-worthy) vs
+**disposable** (`td-state/cache/…` — logs, container images). `/home` =
+`td-state/home`. `/etc` is never persistent and never merged.
+
+Mechanics for M10.3:
+
+- The test harness creates the `td-state` filesystem when it builds the
+  two-generation disk; the placer never touches it (place and prune operate only
+  on `/boot` and generation roots).
+- Typed config grows the allowlist field; the compiler emits bind-mount
+  `file-system` entries (device = path on `td-state`, `bind-mount` flag) plus an
+  activation step that creates the backing dirs. Generation-mode only:
+  `generation #f` converges to the frozen oracle unchanged.
+- First entry: SSH host keys, relocated declaratively (openssh `HostKey` under
+  `/var/lib/ssh`) so rollback cannot change machine identity.
+- Acceptance strengthens both ways: a sentinel written under a declared path in
+  gen N survives the rollback reboot into gen N−1; a sentinel under an undeclared
+  path does not appear in N−1. Verified-red on both (drop the bind mount; write
+  the undeclared sentinel into the shared fs instead).
+
+Staging honesty: until M11, "lost on swap" is approximate — an undeclared write
+lingers inside that generation's ext4 root (invisible after a swap, back if you
+roll back into that gen) until pruned. The crisp form — tmpfs `/`, generation
+image mounted read-only, activation assembling `/etc`/`/run`/`/tmp` — lands with
+M11's sealing, which turns default-deny persistence into a kernel-enforced
+fail-closed property (EROFS on undeclared writes). A root the boot path writes to
+cannot be sealed, so tmpfs-root and verity are one move, not two.
+
 ## Still open — answer each when its rung needs it, with a test
 - Unprivileged build: a user-namespace guix-daemon, or build entirely inside the
   container we already use?
