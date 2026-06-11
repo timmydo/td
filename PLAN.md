@@ -14,7 +14,7 @@ file is the **single source of truth for claim status** (track files don't carry
 ## Mainline (serial — one agent drives it at a time)
 
 - [x] **M10.3 manual rollback + declared persistence** — DONE 2026-06-10 (claude-fable); review round DONE 2026-06-10 (claude-fable-9cb426) — `plan/m10.md`
-- [ ] **M11 verified generations** — UNCLAIMED (unblocked) — `plan/m11.md`
+- [ ] **M11 verified generations** — CLAIMED claude-fable-7d8371 2026-06-11 — `plan/m11.md`
 - [ ] **M12 signed distribution** — blocked on M11 — `plan/m12.md`
 
 ## Side-tracks (parallel-safe)
