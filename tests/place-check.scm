@@ -13,8 +13,8 @@
 ;;        td-identity (the on-disk state the menu is regenerated from is bound to
 ;;        the image identity).
 ;;   (1b) ROOT CONTENT — each present generation's APPLIED userspace root is staged
-;;        at roots/td/gen-N/root.tar, non-empty — so root=LABEL=td-root-gen-N refers
-;;        to a root that actually exists.
+;;        at roots/td/gen-N/root.tar, non-empty — so the menu's root=td-root-gen-N
+;;        refers to a root that actually exists.
 ;;   (1c) LIVE ROOT FS — with TD_MKFS=1, roots/td/gen-N/root.img is a real ext4
 ;;        filesystem: superblock magic 0xEF53, volume LABEL == td-root-gen-N and
 ;;        UUID == the identity's deterministic root-uuid, read STRAIGHT FROM THE
@@ -26,7 +26,7 @@
 ;;        with EXACTLY one menuentry per present generation (each carrying its
 ;;        `--id td-gen-N`), and gen-N's directives live INSIDE gen-N's OWN entry:
 ;;        that entry loads gen-N's kernel/initrd, selects gen-N's root
-;;        (root=LABEL=...), and BOOTS gen-N's system (gnu.system=<its identity's
+;;        (bare-label root=...), and BOOTS gen-N's system (gnu.system=<its identity's
 ;;        system path> gnu.load=<that path>/boot) — and contains NO other
 ;;        generation's directives (file paths, root label, or system path).
 ;;   (3b) BOOT WIRING  — the managed block sets `default=td-gen-<newest present>`,
@@ -264,7 +264,7 @@
              (fail "generation ~a: root.img has no ext superblock magic (not a filesystem)" n)))
          (let ((sb-label (bytes->label (superblock-bytes img #x78 16))))
            (unless (string=? sb-label label)
-             (fail "generation ~a: filesystem LABEL ~s != expected ~s — the menu's root=LABEL would not find it"
+             (fail "generation ~a: filesystem LABEL ~s != expected ~s — the menu's root= label would not find it"
                    n sb-label label)))
          (let ((sb-uuid (bytes->uuid-string (superblock-bytes img #x68 16)))
                (id-uuid (assoc-ref (parse-identity
@@ -276,9 +276,11 @@
    present))
 
 ;; (3) each generation's directives live INSIDE its OWN menuentry, and no foreign
-;; generation's directives appear there. Root labels are matched with a trailing
-;; space (the menu writes `root=LABEL=<label> gnu.system=...`) so gen-1 is not a
-;; prefix hit inside gen-10.
+;; generation's directives appear there. The root spec is the BARE label
+;; (`root=<label>` — Guix's initrd parses the whole root= value as a label; the
+;; dracut-style `LABEL=` prefix would be searched for literally and never match,
+;; found the hard way in the disk spike). Labels are matched with a trailing
+;; space (`root=<label> gnu.system=...`) so gen-1 is not a prefix hit in gen-10.
 (for-each
  (lambda (n)
    (let ((mine (filter (lambda (e) (string=? (car e) n)) menuentries)))
@@ -290,7 +292,7 @@
               (sys   (slurp-line (string-append (gen-dir n) "/system")))
               (lk    (format #f "/td/gen-~a/bzImage" n))
               (li    (format #f "/td/gen-~a/initrd.cpio.gz" n))
-              (lr    (format #f "root=LABEL=~a " (expected-label n)))
+              (lr    (format #f "root=~a " (expected-label n)))
               (lid   (format #f "--id td-gen-~a " n))
               (lsys  (format #f "gnu.system=~a " sys))
               (lload (format #f "gnu.load=~a/boot" sys)))
@@ -299,7 +301,7 @@
          (unless (string-contains body li)
            (fail "generation ~a: its menuentry does not load its initrd (~a)" n li))
          (unless (string-contains body lr)
-           (fail "generation ~a: its menuentry does not select its own root (root=LABEL=~a)"
+           (fail "generation ~a: its menuentry does not select its own root (root=~a)"
                  n (expected-label n)))
          (unless (string-contains body lid)
            (fail "generation ~a: its menuentry has no --id td-gen-~a (the default/rollback selector)"
@@ -315,7 +317,7 @@
           (lambda (m)
             (unless (string=? m n)
               (let ((fk (format #f "/td/gen-~a/" m))
-                    (fr (format #f "root=LABEL=~a " (expected-label m)))
+                    (fr (format #f "root=~a " (expected-label m)))
                     (fs (format #f "gnu.system=~a "
                                 (slurp-line (string-append (gen-dir m) "/system")))))
                 (when (string-contains body fk)

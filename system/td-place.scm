@@ -5,7 +5,7 @@
 ;; that runs ON THE TARGET (which has no guix) to extract /boot from a bootc
 ;; generation image, apply the userspace layers as that generation's own root
 ;; (optionally onto a live, labeled ext4 image — --mkfs, M10.3), write a
-;; per-generation GRUB menu that actually boots (root=LABEL + gnu.system/gnu.load
+;; per-generation GRUB menu that actually boots (bare-label root= + gnu.system/gnu.load
 ;; from the image identity), and prune old generations (M10-design.md step 3,
 ;; "Place"). This module exercises it the way the loop demands — hermetically and
 ;; reproducibly:
@@ -99,7 +99,7 @@
               (define boot      (string-append target "/boot"))
               ;; The per-generation root CONTENT (applied userspace layers) lands
               ;; here — separate from /boot, as on a real target — so the menu's
-              ;; root=LABEL=td-root-gen-N refers to a root that actually exists.
+              ;; root=td-root-gen-N (bare-label spec) refers to a root that actually exists.
               (define roots     (string-append target "/roots"))
               (define grub-cfg  (string-append boot "/grub/grub.cfg"))
               (mkdir-p (string-append boot "/grub"))

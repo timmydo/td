@@ -13,8 +13,10 @@
              (system td-hardening)
              (system td-generation)
              (system td-place)
+             (system td-disk)
              (tests boot)
              (tests reset)
-             (tests container))
+             (tests container)
+             (tests rollback))
 
 (display "eval ok\n")

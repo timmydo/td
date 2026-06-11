@@ -44,7 +44,7 @@
 #          NEVER writes that file; it only gives it the last word on `default`.
 #        - one menuentry per kept generation (`--id td-gen-N`), each loading THAT
 #          generation's placed kernel/initrd and selecting THAT generation's root:
-#          root=LABEL=td-root-gen-N gnu.system=<system> gnu.load=<system>/boot
+#          root=td-root-gen-N (the bare-label spec Guix's initrd parses) gnu.system=<system> gnu.load=<system>/boot
 #          (+ per-generation --extra-kernel-args, recorded on disk).
 #      Everything OUTSIDE the markers (the user's grub.cfg preamble) is preserved.
 #
@@ -181,7 +181,7 @@ printf '%s\n' "$extra_kernel_args" > "$boot_stage/kernel-args"
 
 # --- 3b. APPLY the userspace layers into this generation's own root. ------------
 # The result is the per-generation root CONTENT, staged as root.tar — so
-# root=LABEL=td-root-gen-N refers to a root that actually exists (--mkfs below
+# root=td-root-gen-N (the bare-label spec Guix's initrd parses) refers to a root that actually exists (--mkfs below
 # writes it onto a labeled filesystem). Single userspace layer (td's case) is
 # copied byte-for-byte (the applied rootfs == that layer); multiple layers are
 # applied in order with OCI whiteouts, then re-tarred deterministically.
@@ -289,9 +289,9 @@ fi
     extra=$(cat "$gd/kernel-args" 2>/dev/null || true)
     echo "menuentry \"td generation $g (root=$label)\" --id td-gen-$g {"
     if [ -n "$extra" ]; then
-      echo "  linux /td/gen-$g/bzImage root=LABEL=$label gnu.system=$sys gnu.load=$sys/boot $extra"
+      echo "  linux /td/gen-$g/bzImage root=$label gnu.system=$sys gnu.load=$sys/boot $extra"
     else
-      echo "  linux /td/gen-$g/bzImage root=LABEL=$label gnu.system=$sys gnu.load=$sys/boot"
+      echo "  linux /td/gen-$g/bzImage root=$label gnu.system=$sys gnu.load=$sys/boot"
     fi
     echo "  initrd /td/gen-$g/initrd.cpio.gz"
     echo "}"

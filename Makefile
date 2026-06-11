@@ -58,7 +58,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk reset oci manifest-check generation-image place no-guix run container
+.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk reset oci manifest-check generation-image place rollback no-guix run container
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -74,7 +74,7 @@ container-check:
 # is unaffected in SUBSTANCE: the six structural rungs still run first (the
 # dependency chain below), every rung still runs and must pass — only the
 # order among the heavy rungs changes, which encodes no contract.
-check: eval diff typed-coverage oci-diff manifest-diff generation-diff generation-image no-guix manifest-check oci container reset test place build boot-disk run
+check: eval diff typed-coverage oci-diff manifest-diff generation-diff rollback generation-image no-guix manifest-check oci container reset test place build boot-disk run
 
 # Bounded parallelism (loop-latency; measured in plan/loop-latency.md):
 # ./check.sh invokes `make -j2 --output-sync=target check`. The dependency
@@ -93,7 +93,7 @@ typed-coverage:  | diff
 oci-diff:        | typed-coverage
 manifest-diff:   | oci-diff
 generation-diff: | manifest-diff
-build test boot-disk reset oci manifest-check generation-image place no-guix run container: | generation-diff
+build test boot-disk reset oci manifest-check generation-image place rollback no-guix run container: | generation-diff
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
@@ -322,7 +322,7 @@ generation-image:
 # guix. Driven by the OCI manifest (not a blind layer scan), it: verifies the
 # image's embedded identity (boot/td-identity) matches the --generation/--root-label
 # it is placed as; APPLIES the userspace layers into that generation's own root,
-# staged as roots/td/gen-N/root.tar (so root=LABEL=td-root-gen-N refers to a root
+# staged as roots/td/gen-N/root.tar (so the bare-label root=td-root-gen-N refers to a root
 # that exists — M10.3 turns it into a labeled fs); extracts /boot per-generation;
 # prunes to --keep (>=1); and regenerates a per-generation GRUB menu. Each
 # generation is staged + validated then atomically swapped in, so a corrupt image
@@ -360,6 +360,52 @@ place:
 	echo ">> validate PRUNE tree (gens 2,3 present, gen 1 pruned)"; \
 	TD_PLACED="$$prune_tree" TD_PRESENT="2 3" TD_ABSENT="1" \
 	  $(GUIX) repl $(LOAD) tests/place-check.scm
+
+# M10.3 manual rollback (M10-design.md step 5, "Roll back"; the DESIGN §7.1
+# acceptance test). End-to-end: the guix-free placer's output — live labeled
+# per-generation root filesystems (--mkfs) + the managed GRUB menu — is
+# assembled into a real MBR/GRUB disk (system/td-disk.scm), and the marionette
+# test (tests/rollback.scm) boots ONE persistent qcow2 overlay of it TWICE:
+# generation 2 (the GRUB default) is asserted three independent ways (cmdline
+# bare-label root=, mounted-root-IS-the-labeled-filesystem, /run/current-system ==
+# gen-2's system path — the placer's gnu.system wiring), the manual rollback
+# act writes `set default=td-gen-1` into the boot partition's td/default.cfg
+# (the hook the managed block sources) plus a persistence sentinel, the guest
+# reboots cleanly, and generation 1 is asserted the same three ways — with the
+# sentinel, the selection, gen-2's placed files and BOTH menu entries proven to
+# have survived the reboot (persistent placed state; rolling back never
+# destroys the newer generation). Before booting: `--check` both new artifacts
+# (the mkfs tree and the assembled disk — prime directive 1) and validate the
+# tree with tests/place-check.scm in mkfs mode (superblock label/UUID, search
+# line). Two-step lower-then-realise for the marionette derivation, as in
+# `test`/`boot-disk` (honest exit status).
+rollback:
+	@echo ">> rollback: boot gen 2, roll back to gen 1 via the GRUB menu, assert identity + persistence (M10.3)"
+	@set -euo pipefail; \
+	drvs=`$(GUIX) repl $(LOAD) tests/rollback-drv.scm 2>/dev/null`; \
+	tree_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_TREE=//p'`; \
+	disk_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_DISK=//p'`; \
+	test -n "$$tree_drv" -a -n "$$disk_drv" || { echo "ERROR: could not lower the rollback derivations" >&2; exit 1; }; \
+	echo ">> placed tree (mkfs) derivation: $$tree_drv"; \
+	echo ">> rollback disk derivation:      $$disk_drv"; \
+	tree=`$(GUIX) build "$$tree_drv"`; \
+	disk=`$(GUIX) build "$$disk_drv"`; \
+	echo ">> check: reproducibility of the mkfs placed tree AND the assembled disk"; \
+	$(GUIX) build --check "$$tree_drv" "$$disk_drv"; \
+	echo ">> validate the mkfs tree (live labeled roots via superblock, boot wiring, search line)"; \
+	TD_PLACED="$$tree" TD_PRESENT="1 2" TD_ABSENT="" TD_MKFS=1 TD_BOOT_LABEL=td-boot \
+	  $(GUIX) repl $(LOAD) tests/place-check.scm; \
+	drv=`printf '%s\n' \
+	    '(use-modules (guix) (gnu tests) (tests rollback))' \
+	    '(with-store store' \
+	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
+	    '  (format #t "DRV=~a~%"' \
+	    '          (derivation-file-name' \
+	    '           (run-with-store store (system-test-value %test-td-rollback)))))' \
+	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the rollback test derivation" >&2; exit 1; }; \
+	echo ">> realise rollback test derivation: $$drv"; \
+	$(GUIX) build "$$drv"
 
 # 6. M7 imperative-surface removal — image-swap-only BY CONSTRUCTION (DESIGN §6).
 #    M6 made image CONTENTS manifest-driven but left the imperative mutation
