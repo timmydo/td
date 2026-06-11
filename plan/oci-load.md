@@ -10,6 +10,13 @@
 Verify the bootc generation image (and the plain td OCI image) is consumable by an
 independent OCI implementation, not just by our own placer.
 
+This track also carries the DESIGN §2.7 identity end-state: generation identity is
+the digest of the distributed artifact, and the *canonical OCI layout* this track
+introduces is what moves that digest from "sha256 of the docker-archive tarball"
+(today) to the OCI image **manifest** digest (the registry-addressable form M12
+signs). The move is a representation change to record — a `DIGESTS.md` re-baseline
+(exclusive landing, §7.3) — not a change of convention.
+
 ## Acceptance
 
 A rung that loads/validates the image with a foreign tool and asserts success
