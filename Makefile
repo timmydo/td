@@ -53,7 +53,7 @@ endef
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-# The 19 rungs, in the two pools the bounded-parallel loop schedules from.
+# The 20 rungs, in the two pools the bounded-parallel loop schedules from.
 # ADDING A RUNG: put it in exactly ONE pool below — .PHONY, the `check` target,
 # the serial chain, and the heavy gate are all DERIVED from these two
 # variables, so the lists cannot drift apart (review finding: they used to be
