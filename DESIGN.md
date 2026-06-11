@@ -4,12 +4,12 @@ A functional Linux distribution, built incrementally by an AI coding agent (Clau
 Code) on top of an existing Guix system, growing inside a fast, machine-checkable
 verification loop.
 
-This document is the settled contract Claude Code works against. It pins the two
-things the agent can't decide for itself — **the loop it runs to check its work** and
-**the target it's aiming at** — and bounds scope. Everything else the agent may
-propose and iterate on. Section numbers are stable anchors; `CLAUDE.md` and `PLAN.md`
-reference them, so keep them. Everything here governs **v0 only** unless marked as
-later. Keep `CLAUDE.md` in sync with §1 and §3.
+This document is the settled contract the agents work against. It pins the three
+things an agent can't decide for itself — **the loop it runs to check its work**,
+**the target it's aiming at**, and **the scope it may work without sign-off** (the
+§7.1 roadmap). Everything else the agents may propose and iterate on. Section numbers
+are stable anchors; `CLAUDE.md` and `PLAN.md` reference them, so keep them. Keep
+`CLAUDE.md` in sync with §1, §3, and §7.2–7.3.
 
 ---
 
@@ -84,19 +84,24 @@ typed front-end yet — changing the config language and building the OS at once
 hard projects fused into one, and it blinds the agent's cheapest rung. The typed layer
 is a later milestone that compiles down to gexps.
 
-### 2.3 Out of scope for v0
+### 2.3 Scope rule *(redefined 2026-06-10)*
 
-Naming the exclusions is what stops the agent boiling the ocean. Out of scope: the
-Rust build daemon; the unified sandbox/portal broker; composefs/`fs-verity` verified
-generations; the OCI app model; the typed config front-end; multi-machine tests;
-real-hardware/driver work. Building any of these in v0 is a scope violation — STOP and
-ask. (Crossing one deliberately later requires §4.3 sign-off, as M5–M9 did.)
+**In scope = on the approved roadmap (§7.1). Everything else is out of scope — STOP
+and ask; never expand scope on your own.** Naming the boundary is what stops an agent
+boiling the ocean.
+
+(History: the original v0 exclusion list did this job; every crossing was gated on
+§4.3 sign-off, as M4–M10.2 were. Of that list, the typed front-end, the OCI app
+model, and verified generations have since been crossed deliberately or sit on the
+roadmap; the Rust build daemon, the unified sandbox/portal broker, multi-machine
+tests, and real-hardware/driver work remain off-roadmap and therefore out of scope.)
 
 ### 2.4 Milestone ladder
 
-One milestone at a time; each is its own passing, reproducible, committed acceptance
-test. The agent does far better climbing a ladder of green bars than holding a
-monolith in context.
+One **mainline** milestone at a time; each is its own passing, reproducible, committed
+acceptance test. An agent does far better climbing a ladder of green bars than holding
+a monolith in context. (Parallel side-tracks alongside the mainline are governed by
+§7.)
 
 1. Closed loop on a trivial image (§2.1) — boot + kernel-version assertion.
 2. Add a service to the declaration; test asserts the unit is up and a port listens.
@@ -127,7 +132,9 @@ monolith in context.
   its entrypoint. (FHS-flattening the base was dropped — in a "minimal base, apps in
   containers" design, FHS is a property of the app images, not the base.)
 
-The M10 forward plan (native generation lifecycle) lives in `PLAN.md` and is gated.
+M10.1–M10.2 (bootc-style generation image + guix-free placer) are done — record in
+`HISTORY.md`. The forward plan from M10.3 on is the §7.1 roadmap, with per-track
+detail under `plan/`.
 
 ### 2.5 Replacement order and the oracle for each swap
 
@@ -160,23 +167,33 @@ Mirrored in `CLAUDE.md`.
 ### 4.1 CLAUDE.md
 
 `CLAUDE.md` carries the loop command (§1.1), the four invariants (§3), the
-definition-of-done, the repo layout (`Makefile`, `system/`, `tests/`, `channels.scm`),
-the strict-FSDG posture, and the ephemeral state boundary. Keep §1 and §3 of this
+definition-of-done, the parallel-work rules (§7.2–7.4), the repo layout, the
+strict-FSDG posture, and the state boundary. Keep §1, §3, and §7.2–7.3 of this
 document in sync with it.
 
 ### 4.2 Task decomposition
 
-Drive from the §2.4 ladder, one milestone at a time. The agent states the sub-task and
-names or writes its test before writing implementation.
+Drive from the §7.1 roadmap: one agent drives the next mainline milestone; other
+agents take side-tracks in parallel. Every agent states its sub-task and names or
+writes its test before writing implementation.
 
-### 4.3 Human checkpoints
+### 4.3 Human checkpoints *(streamlined 2026-06-10)*
 
-The human owns spec correctness (is the target right?), the adversarial/security rung,
-and anything touching real hardware. The agent merges on green below that ceiling but
-opens any new-layer milestone for review before crossing into it. Concretely:
-milestones 1–2 merged on green; milestone 3 (default-deny hardening) and milestone 4
-(typed front-end) gated on sign-off; M5–M9 were each opened for sign-off as they
-crossed new layers.
+Exactly two things require the human; everything else on the roadmap — including
+security-flavored milestones, `channels.scm` bumps, and oracle re-baselines — merges
+on green via the §7.2 landing protocol:
+
+1. **Roadmap additions.** New tracks or milestones enter §7.1 only with human
+   approval. Approving an entry's acceptance test *is* the spec-correctness review,
+   so it happens once, up front, instead of per-milestone.
+2. **Weakening the loop.** Any change that removes, loosens, skips, or restructures
+   away an existing rung or assertion in `check.sh`, the `Makefile`, or `tests/`
+   requires explicit human sign-off, regardless of justification. Adding or
+   strengthening rungs and assertions is always free.
+
+(History: M1–M2 merged on green; M3–M10.2 were gated per-milestone and signed off —
+dates in `HISTORY.md`. That per-milestone gate is retired in favor of the
+pre-approved roadmap.)
 
 ---
 
@@ -197,8 +214,11 @@ None block v0, but naming them prevents surprises.
 
 ## 6. Parking lot / open questions
 
-Things raised that aren't v0 decisions — kept here so they aren't lost and don't
-expand scope.
+Things raised that aren't current decisions — kept here so they aren't lost and don't
+expand scope. (2026-06-10: several graduated to §7.1 roadmap side-tracks — the qcow2
+overlay/CoW reset is `loop-latency`, FHS-like OCI roots is `fhs-app-images`, and the
+offline-posture follow-up is `offline-isolation`. Their entries below stand as the
+original context.)
 
 - Pin the exact kernel version `tests/boot.scm` asserts (derived from `channels.scm`);
   record it once the first build lands.
@@ -235,3 +255,86 @@ expand scope.
   `guix-service-type` had provided as a side effect — sshd's privsep dir `/var/empty`
   (root:root 0755, via the build-user accounts); the guix-free system restores it with
   `guix-free-privsep-service`, proven by the boot rung (key-based SSH still logs in).
+
+---
+
+## 7. Roadmap and parallel work *(added 2026-06-10)*
+
+This section replaces the per-milestone sign-off gate. It exists so multiple agents
+can work long-running tasks concurrently and validate their own work, with the human
+out of the loop except for the two §4.3 checkpoints.
+
+### 7.1 The approved roadmap
+
+Approved by the human 2026-06-10 — that approval is the §4.3 spec review for every
+entry below. Agents implement these without further sign-off. Status lives in
+`PLAN.md`; per-track working state in `plan/<track>.md`. Adding an entry requires
+human approval; *refining* an entry's design inside its track file does not, so long
+as the acceptance test stated here is met or strengthened.
+
+**Mainline** (serial — each builds on the last; one agent drives it at a time):
+
+- **M10.3 — manual rollback.** From a disk carrying two placed generations, the
+  marionette test boots generation N, asserts its identity (root label / system),
+  reboots selecting generation N−1 from the GRUB menu, and asserts the older
+  identity; placed state persists across the reboot. Detail: `plan/m10.md`.
+- **M11 — verified generations.** A generation's root carries build-time integrity
+  metadata (fs-verity / dm-verity / composefs — mechanism chosen in the track file);
+  booting an intact generation succeeds while a corrupted root fails closed
+  (verified-red by corrupting bytes). Integrity ≠ authenticity: signatures are M12.
+- **M12 — signed distribution.** A generation image is pushed to and pulled from a
+  registry (local/offline inside the loop), its signature verified before placement;
+  the placer rejects unsigned or tampered images (verified-red).
+
+**Side-tracks** (parallel-safe; mostly disjoint from mainline files; any number may
+run concurrently):
+
+- **rootless-builder** — build the target with a rootless user-namespace builder and
+  prove daemon-vs-rootless store-path equality (the prime-directive-4 differential;
+  the daemon is the oracle). Deferred from M10.1. `plan/rootless-builder.md`.
+- **offline-isolation** — drop nonguix from the daemon's substitute URLs and isolate
+  the daemon's network; loop stays green isolated, and a deliberate undeclared fetch
+  fails. Standing follow-up from M6. `plan/offline-isolation.md`.
+- **oci-load** — verify the generation image loads in a foreign OCI runtime without
+  breaking the offline loop (podman already rejected at M8; probe cheap vehicles or
+  prove spec conformance structurally). Deferred from M10.1. `plan/oci-load.md`.
+- **loop-latency** — qcow2 overlay / CoW VM reset (§1.5) and other cycle-time wins;
+  measured improvement with the loop green and per-test ephemerality intact.
+  `plan/loop-latency.md`.
+- **fhs-app-images** — FHS-style root layout for *app* images (the base stays
+  minimal per M9); an FHS app image builds reproducibly and runs on the base host
+  rung. `plan/fhs-app-images.md`.
+
+### 7.2 Landing protocol — merge on green
+
+Each agent works one claimed track in its **own git worktree/branch** — never
+directly on a shared checkout of main. To land:
+
+1. fetch and rebase onto latest `origin/main`;
+2. run the **full** `./check.sh` — it must be green;
+3. fast-forward main to the branch and push;
+4. if main moved while checking, go to 1.
+
+No PRs and no human merge step; the human reviews asynchronously on main and may
+revert. "Validated" means green against the main actually landed on — landing
+without a green full check is a contract violation. Claims: one agent per track,
+recorded on the track's status line in `PLAN.md` (a tiny standalone commit to main).
+
+### 7.3 Exclusive landings
+
+Changes touching the shared spine — `system/td.scm` (the frozen oracle), `check.sh`,
+`Makefile`, `channels.scm`, `DIGESTS.md` — collide with every other agent. Land them
+as small standalone commits, announced in your track file; everyone else rebases.
+Oracle re-baselines (which rewrite `DIGESTS.md`) and channel-pin bumps are the
+canonical cases. These are coordination rules, not sign-off gates — but remember
+§4.3(2): *weakening* anything in the spine still needs the human.
+
+Resource note: every full check boots QEMU VMs; two concurrent checks are fine on
+this host, more may thrash. Stagger landings if loaded.
+
+### 7.4 Files
+
+`PLAN.md` — status index only, one line per track; keep edits tiny so rebases are
+trivial. `plan/<track>.md` — per-track working state, single writer (the claiming
+agent). `HISTORY.md` — completed-milestone record. `DIGESTS.md` — reproducibility
+record (changes only on re-baseline, exclusive landing).

@@ -12,7 +12,7 @@
 #   ./check.sh            # full loop: eval -> build(--check) -> boot test
 #   ./check.sh eval       # a single Makefile target inside the same sandbox
 #
-# Why each piece (learned in M2, see PLAN.md):
+# Why each piece (learned in M2, see HISTORY.md):
 #   --expose=/gnu/store        : -C otherwise hides the host guix binary closure.
 #   --share=$HOME/.cache/guix  : pinned channel checkout — avoids a re-fetch.
 #   --share=/var/guix          : daemon socket + writable profiles/GC roots.
@@ -74,7 +74,7 @@ if [ -z "$pinned" ]; then
 fi
 if [ "$hostcommit" != "$pinned" ]; then
   echo "check.sh: FATAL: host guix ($hostcommit) != pinned channel ($pinned)." >&2
-  echo "  The offline loop assumes they match (see PLAN.md). Refusing to run a" >&2
+  echo "  The offline loop assumes they match (see HISTORY.md). Refusing to run a" >&2
   echo "  check that would silently download substitutes." >&2
   exit 1
 fi
