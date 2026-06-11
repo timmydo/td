@@ -149,8 +149,19 @@
             ;;     strictly stronger than the old mounted-root-by-label
             ;;     check: the label now sits UNDER the verifying layer);
             ;;   * "/" is a tmpfs (the assembled root, §2.6);
-            ;;   * an undeclared write into the store fails closed — the
-            ;;     errno of mkdir on the sealed mount (EROFS expected).
+            ;;   * the store's ext4 SUPERBLOCK mount is itself read-only on
+            ;;     the mapper device, it canNOT be remounted read-write, and
+            ;;     an undeclared write fails closed (EROFS). Three layers
+            ;;     deliberately probed PAST the %immutable-store ro BIND
+            ;;     that %base-file-systems puts on top: that bind is
+            ;;     software convention (guix-daemon remounts through it —
+            ;;     run-with-writable-store), and a naive mkdir probe passes
+            ;;     EVEN ON AN UNSEALED SYSTEM because of it (caught by
+            ;;     variant H going false-green). So the probe first remounts
+            ;;     the top bind rw (allowed — per-mountpoint flag), then
+            ;;     attempts the SUPERBLOCK rw remount — which the kernel
+            ;;     must refuse (the dm-verity device is read-only) — and
+            ;;     only then probes the write.
             (define (guest-identity marionette label)
               (marionette-eval
                `(begin
@@ -192,19 +203,58 @@
                                     ((< i 30) (sleep 1) (loop (+ i 1)))
                                     (else 'no-by-label-node)))))
                          (slave-is-labeled? (equal? slaves (list labeled)))
-                         (root-tmpfs?
+                         (mounts-lines
                           (call-with-input-file "/proc/self/mounts"
                             (lambda (p)
-                              (let loop ()
+                              (let loop ((acc '()))
                                 (let ((line (read-line p)))
-                                  (cond ((eof-object? line) #f)
-                                        ((let ((f (string-split line #\space)))
-                                           (and (>= (length f) 3)
-                                                (string=? (list-ref f 1) "/")
+                                  (if (eof-object? line)
+                                      (reverse acc)
+                                      (loop (cons (string-split line #\space)
+                                                  acc))))))))
+                         (root-tmpfs?
+                          (->bool (find (lambda (f)
+                                          (and (>= (length f) 3)
+                                               (string=? (list-ref f 1) "/")
+                                               (string=? (list-ref f 2)
+                                                         "tmpfs")))
+                                        mounts-lines)))
+                         ;; EVERY ext4 mount entry at /gnu/store must be ro
+                         ;; (snapshot taken BEFORE the remount probes below).
+                         ;; "Every" matters: the %immutable-store ro BIND
+                         ;; shares the path and fstype, so a `find` of one ro
+                         ;; entry would false-green on an unsealed system
+                         ;; whose underlying sb mount says rw.
+                         (store-ext4-ro?
+                          (let ((entries
+                                 (filter (lambda (f)
+                                           (and (>= (length f) 4)
+                                                (string=? (list-ref f 1)
+                                                          "/gnu/store")
                                                 (string=? (list-ref f 2)
-                                                          "tmpfs")))
-                                         #t)
-                                        (else (loop))))))))
+                                                          "ext4")))
+                                         mounts-lines)))
+                            (and (pair? entries)
+                                 (->bool
+                                  (every (lambda (f)
+                                           (member "ro"
+                                                   (string-split
+                                                    (list-ref f 3) #\,)))
+                                         entries)))))
+                         (mount-cmd
+                          "/run/current-system/profile/bin/mount")
+                         ;; Step past the convention layer: make the TOP
+                         ;; bind's per-mountpoint flag rw (always allowed)...
+                         (bind-remount-status
+                          (system* mount-cmd "-o" "remount,bind,rw"
+                                   "/gnu/store"))
+                         ;; ...then attempt the SUPERBLOCK rw remount. On a
+                         ;; sealed generation the kernel must REFUSE it (the
+                         ;; dm-verity device is read-only); on an unsealed
+                         ;; system it succeeds — the discriminator.
+                         (sb-remount-rw-failed?
+                          (not (zero? (system* mount-cmd "-o" "remount,rw"
+                                               "/gnu/store"))))
                          (store-write-errno
                           (catch 'system-error
                             (lambda ()
@@ -212,7 +262,8 @@
                               'write-succeeded!)
                             (lambda args (system-error-errno args)))))
                     (list cmdline current store-on-verity? slave-is-labeled?
-                          root-tmpfs? store-write-errno)))
+                          root-tmpfs? store-write-errno
+                          store-ext4-ro? sb-remount-rw-failed?)))
                marionette))
 
             (define (assert-generation! marionette n label roothash system
@@ -246,6 +297,12 @@
                 (test-equal
                     (format #f "boot ~a: / is a tmpfs — the root is assembled, not stored" n)
                   #t tmpfs-ok)
+                (test-equal
+                    (format #f "boot ~a: every store mount is read-only down to the ext4 superblock" n)
+                  #t (list-ref id 6))
+                (test-equal
+                    (format #f "boot ~a: the store cannot be remounted read-write — sealing is kernel-enforced" n)
+                  #t (list-ref id 7))
                 (test-equal
                     (format #f "boot ~a: an undeclared write into the sealed store fails closed (EROFS)" n)
                   EROFS werrno)
