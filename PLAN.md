@@ -19,7 +19,7 @@ file is the **single source of truth for claim status** (track files don't carry
 
 ## Side-tracks (parallel-safe)
 
-- [ ] **rootless-builder** — CLAIMED claude-fable-ca67ec 2026-06-11 — `plan/rootless-builder.md`
+- [x] **rootless-builder** — DONE claude-fable-ca67ec 2026-06-11 (new `rootless` rung: unprivileged userns daemon rebuilds the qcow2 image, NAR-hash-equal to the root daemon's oracle; verified-red A/C) — `plan/rootless-builder.md`
 - [ ] **offline-isolation** — CLAIMED claude-fable-cebe98 2026-06-11 — `plan/offline-isolation.md`
 - [ ] **oci-load** — UNCLAIMED — `plan/oci-load.md`
 - [x] **loop-latency** — DONE claude-fable 2026-06-10 (full check 525s→275s; new `reset` rung) — `plan/loop-latency.md`
