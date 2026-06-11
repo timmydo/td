@@ -90,12 +90,37 @@ Mechanics (all inside the check.sh sandbox, offline):
   setup; bind closure 4536 items ~10s, DB snapshot ~1s, image rebuild ~6s).
   Sub-agent contract review: no violations; its robustness findings (daemon
   shutdown race, sqlite busy timeout, set -u guard) are applied.
-- [ ] **S3 verified-red** — (A) cross-builder divergence: a DISTINCT
-  env-sensitive drv (reads uid_map; named differently from the green probe so
-  its host-built validity never leaks into later snapshots) built by the ROOT
-  daemon, then rootless `--check` must red "may not be deterministic".
-  (B) comparator: tamper the staged copy of the oracle output, `--check` must
-  red. (C) isolation assert: point it at a root-daemon-built map → red.
+- [x] **S3 verified-red** (all via temporary edits on top of the committed
+  green S2; each reverted after the red was observed; run 2026-06-11):
+  - **(A) cross-builder divergence — RED ✓.** A DISTINCT env-sensitive drv
+    (`td-rootless-divergence-probe`, reads uid_map; named differently from
+    the green probe so its host-built validity never leaks into later
+    snapshots) was built by the ROOT daemon, and the rung's differential was
+    temporarily pointed at it. Red exactly at the differential:
+    `guix build: error: derivation '...-td-rootless-divergence-probe.drv'
+    may not be deterministic: output '...' differs from '...-check'`, the
+    rung's FAIL block printed the kept `-check` path + diffoscope command,
+    exit 2. Contents: oracle build saw `0 0 4294967295` (root daemon, no
+    userns), rootless rebuild saw `30001 30001 1` — a REAL daemon-vs-rootless
+    divergence, caught. Host store cleaned with `guix gc -D` after.
+  - **(B) on-disk tamper — instructive GREEN, not a hole.** Replacing the
+    staged copy of the oracle image with a 4-byte-tampered copy did NOT red
+    the rung. Source check (pinned nix/libstore/build.cc, bmCheck in
+    registerOutputs): `--check` compares the REBUILD's NAR hash against
+    `info.hash` — the hash the ROOT daemon recorded when it built the oracle,
+    carried by the DB snapshot — not against on-disk bytes. So the rung's
+    green run truthfully asserted rebuild == oracle hash; the anchor is
+    tamper-evident BY not being the disk. bmCheck also throws on invalid
+    outputs ("build it normally before using --check"), so build-instead-of-
+    compare cannot silently green either (the rung's validity guard remains
+    as an explicit, actionable precondition). tests/rootless.sh comments and
+    PASS/FAIL wording corrected to say "NAR hash vs recorded oracle hash".
+  - **(C) isolation — RED ✓.** Daemon temporarily started with
+    `--disable-chroot`: the probe recorded `0 1001 1` (the build inherited
+    the caller's namespace) and the uid_map-shape assertion redded with its
+    diagnostic, exit 2. This red also validates the assert's strengthening:
+    the first-draft "not the identity map" grep would have PASSED `0 1001 1`
+    — a false green found by review and closed before commit.
 - [ ] **S4 land** — exclusive-landing note: touches `check.sh` (adds
   `util-linux sqlite` to the sandbox packages) and `Makefile` (new rung in
   HEAVY_RUNGS). Small standalone commits.

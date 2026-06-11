@@ -10,14 +10,21 @@
 # (/gnu/store — required for store-path equality), starts the pinned
 # guix-daemon UNPRIVILEGED (no --build-users-group, so every chroot build gets
 # CLONE_NEWUSER — the rootless user-namespace builder), and runs:
-#   (1) validity guard — the oracle output must be valid in the snapshot,
-#       else `--check` would build instead of compare (a silent false green);
+#   (1) validity guard — the oracle output must be valid in the snapshot.
+#       bmCheck itself refuses invalid outputs ("build it normally before
+#       using --check", nix/libstore/build.cc), so this cannot silently
+#       false-green; the guard makes the precondition explicit and the
+#       diagnostic actionable;
 #   (2) isolation probe — a build whose output records /proc/self/uid_map;
 #       an identity map means the build did NOT run in a user namespace;
 #   (3) the differential — `guix build --check` of the target image drv: the
-#       rootless daemon rebuilds it and compares bit-for-bit against the
-#       root daemon's artifact (the oracle, prime directive 4), plus an
-#       explicit output-path string equality assert.
+#       rootless daemon rebuilds it and compares the rebuild's NAR hash
+#       against the oracle hash the ROOT daemon recorded when it built the
+#       artifact (info.hash in the snapshot DB — bmCheck in
+#       nix/libstore/build.cc; verified: tampering the on-disk staged copy
+#       does NOT fool it, the anchor is the root daemon's recorded hash),
+#       plus an explicit output-path string equality assert. That is the
+#       prime-directive-4 differential with the root daemon as oracle.
 #
 # Store mechanics: every needed closure item (paths.txt, computed by the
 # recipe via `guix gc -R`) is bind-mounted item-by-item into a staged
@@ -80,9 +87,9 @@ export GUIX_DAEMON_SOCKET="unix://$scratch/daemon.sock"
 echo ">> rootless: validity guard — the oracle artifact must be in the snapshot"
 guix gc --references "$img_out" > /dev/null 2>&1 || {
   echo "FAIL: the root-daemon-built image output is NOT valid in the DB" >&2
-  echo "      snapshot — guix build --check would BUILD instead of COMPARE" >&2
-  echo "      (silent false green). The recipe must oracle-build before the" >&2
-  echo "      snapshot is taken." >&2
+  echo "      snapshot, so there is no recorded oracle hash to compare the" >&2
+  echo "      rootless rebuild against. The recipe must oracle-build before" >&2
+  echo "      the snapshot is taken." >&2
   exit 1
 }
 if guix gc --references "$probe_out" > /dev/null 2>&1; then
@@ -136,5 +143,6 @@ test "$checked" = "$img_out" || {
 }
 
 echo "PASS: the rootless user-namespace builder reproduced the target image"
-echo "      bit-for-bit at the same store path ($img_out);"
-echo "      its builds run in a user namespace (non-identity uid_map)."
+echo "      (NAR hash equal to the root daemon's recorded oracle hash) at the"
+echo "      same store path ($img_out);"
+echo "      its builds run in a user namespace (fresh non-zero uid_map)."
