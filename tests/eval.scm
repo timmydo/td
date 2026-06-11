@@ -14,6 +14,7 @@
              (system td-generation)
              (system td-place)
              (system td-disk)
+             (system td-builder)
              (tests boot)
              (tests reset)
              (tests container)

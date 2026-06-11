@@ -53,7 +53,7 @@ endef
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-# The 21 rungs, in the two pools the bounded-parallel loop schedules from.
+# The 22 rungs, in the two pools the bounded-parallel loop schedules from.
 # ADDING A RUNG: put it in exactly ONE pool below — .PHONY, the `check` target,
 # the serial chain, and the heavy gate are all DERIVED from these two
 # variables, so the lists cannot drift apart (review finding: they used to be
@@ -78,15 +78,17 @@ endef
 # `container` on its measured solo run (36s incl. sandbox setup,
 # plan/rootless-builder.md); `oci-load` after `rootless` on its measured solo
 # run (plan/oci-load.md — skopeo passes are seconds; the gunzip/regzip of the
-# negative control dominates). A stale order only costs latency, never
-# correctness.
+# negative control dominates). `td-builder` (S1) is slotted late on judgment,
+# not yet individually measured — its cost is a single warm-store Rust compile
+# plus a --check rebuild; RE-MEASURE and RE-SORT once it has run. A stale order
+# only costs latency, never correctness.
 #
 # NOTHING is removed, loosened, or skipped by the parallelism: all rungs must
 # still pass, and make (run without -k) stops spawning new rungs after a
 # failure — a red still short-circuits the loop. Order-only (|) prerequisites,
 # so a plain serial `make -j1 check` behaves exactly as before.
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
-HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load reset test place build boot-disk run offline
+HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load reset test place build boot-disk td-builder run offline
 
 .PHONY: check container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
@@ -539,6 +541,45 @@ no-guix:
 	rm -f "$$svc_log"; \
 	echo "   ok: service-injected guix was REJECTED at the whole-system gate (the hole the manifest-only marker leaves open is closed)"; \
 	echo "PASS: ship-guix? #f is a closure-level, build-enforced guarantee — (1) the embedded MARKER refuses any manifest-injected guix on every bare lowering; (2) the whole-system GATE certifies the shipped td-system guix-free and REJECTS service-injected guix (guix-service-type restored) that the marker cannot see; and the control ships the surface, proving the probes discriminate."
+
+# td-builder S1 toolchain probe (DESIGN §7.1 side-track; plan/td-builder.md).
+# Before any rung can DEPEND on td's own builder, we must prove the pinned
+# channel's Rust toolchain (warmed on the host store, DESIGN §5) can compile it
+# at all — OFFLINE, inside the check.sh sandbox. This is that proof, the first
+# rung of the first Guix-component replacement (§2.5 discipline). It is
+# self-discriminating and reproducible:
+#   • lower the td-builder package to a drv (tests/td-builder-drv.scm), build it
+#     offline, and `guix build --check` it bit-for-bit (prime directive 1 — a
+#     non-reproducible builder is a FAILING test, and --check re-runs the
+#     compile so a toolchain regression reds this rung on the next loop);
+#   • RUN the compiled binary and assert it prints its sentinel — proves the
+#     toolchain produced a WORKING executable, a stronger claim than "cargo
+#     build exited 0". Verified-red: break ../builder/src/main.rs (a syntax
+#     error reds the build; a wrong/removed sentinel reds the run) — evidence in
+#     plan/td-builder.md;
+#   • record closure size (`guix size`) and wall-clock compile time for the
+#     loop-latency budget (§1.3; plan/td-builder.md "Measurement log").
+# OFFLINE PRECONDITION (DESIGN §5): the pinned Rust closure must be warm in the
+# host store — the loop fetches nothing. Two-step lower-then-realise (repl ->
+# guix build) for an honest exit status, as in the other rungs.
+td-builder:
+	@echo ">> td-builder: the pinned Rust toolchain compiles a reproducible, working td-builder offline (S1)"
+	@set -euo pipefail; \
+	drv=`$(GUIX) repl $(LOAD) tests/td-builder-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the td-builder derivation" >&2; exit 1; }; \
+	echo ">> td-builder derivation: $$drv"; \
+	start=`date +%s`; \
+	out=`$(GUIX) build "$$drv"`; \
+	elapsed=$$(( `date +%s` - start )); \
+	test -n "$$out" || { echo "ERROR: the td-builder build produced no output path" >&2; exit 1; }; \
+	echo ">> check: reproducibility of the td-builder binary"; \
+	$(GUIX) build --check "$$drv"; \
+	echo ">> run: the compiled binary must print its sentinel"; \
+	"$$out/bin/td-builder" | grep -Eq '^td-builder [0-9.]+ ok$$' \
+	  || { echo "FAIL: the compiled td-builder did not print its sentinel — the toolchain did not produce a working binary." >&2; exit 1; }; \
+	echo ">> closure size:"; $(GUIX) size "$$out" | tail -n1; \
+	echo "   compile wall-clock: $${elapsed}s (first run; warm store thereafter)"; \
+	echo "PASS: the pinned Rust toolchain compiled a reproducible, working td-builder offline (S1)."
 
 # 7. M8 run rung — execute the SHIPPED OCI image as a real rootless OCI container
 #    (crun) and assert its userspace runs. Every rung above proves a PROPERTY of
