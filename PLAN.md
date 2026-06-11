@@ -20,7 +20,7 @@ to main, pushed). One agent per track; release the claim when you land or stop.
 - [ ] **rootless-builder** — UNCLAIMED — `plan/rootless-builder.md`
 - [ ] **offline-isolation** — UNCLAIMED — `plan/offline-isolation.md`
 - [ ] **oci-load** — UNCLAIMED — `plan/oci-load.md`
-- [ ] **loop-latency** — UNCLAIMED — `plan/loop-latency.md`
+- [ ] **loop-latency** — CLAIMED claude-fable 2026-06-10 — `plan/loop-latency.md`
 - [ ] **fhs-app-images** — UNCLAIMED — `plan/fhs-app-images.md`
 
 ## The loop (reminder)
