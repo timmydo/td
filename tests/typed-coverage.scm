@@ -111,6 +111,25 @@
            (equal? (bootloader-configuration-targets
                     (operating-system-bootloader os))
                    (list "/dev/sdb"))))
+   ;; M10.3 (§2.6): the allowlist is GENERATION-MODE ONLY (with generation #f
+   ;; nothing is emitted — the oracle-scope rule), so its wiring probe perturbs
+   ;; a generation config and asserts the extra entry reaches the compiled
+   ;; file-systems as a bind mount from its tier directory on td-state. Checked
+   ;; structurally (a record-level lowering): drv-divergence on the DEFAULT
+   ;; config is impossible for a field that is deliberately inert there.
+   (list 'persistent-paths
+         (td-config #:generation 1
+                    #:persistent-paths
+                    '((precious . "/var/lib/ssh")
+                      (disposable . "/var/cache/td-probe")))
+         (lambda (os)
+           (any (lambda (fs)
+                  (and (string=? (file-system-mount-point fs)
+                                 "/var/cache/td-probe")
+                       (equal? (file-system-device fs)
+                               "/td-state/cache/var/cache/td-probe")
+                       (memq 'bind-mount (file-system-flags fs))))
+                (operating-system-file-systems os))))
    (list 'root-mount
          (td-config #:root-mount "/altroot")
          (lambda (os)
@@ -165,6 +184,21 @@
    (list 'generation "generation zero"              (lambda () (td-config #:generation 0)))
    (list 'generation "generation negative"          (lambda () (td-config #:generation -1)))
    (list 'generation "generation non-integer"       (lambda () (td-config #:generation "1")))
+   ;; M10.3 (§2.6): allowlist entries are (precious|disposable . "/abs/path").
+   (list 'persistent-paths "persistent-paths non-list"
+         (lambda () (td-config #:persistent-paths "/var/lib/ssh")))
+   (list 'persistent-paths "persistent-paths bad tier"
+         (lambda () (td-config #:persistent-paths '((shiny . "/var/lib/ssh")))))
+   (list 'persistent-paths "persistent-paths relative path"
+         (lambda () (td-config #:persistent-paths '((precious . "var/lib/ssh")))))
+   (list 'persistent-paths "persistent-paths root path"
+         (lambda () (td-config #:persistent-paths '((precious . "/")))))
+   ;; Cross-field: a GENERATION system must keep the precious /var/lib/ssh
+   ;; entry — dropping it would put the SSH host key (machine identity) back on
+   ;; the per-generation root, where a rollback would swap it (§2.6).
+   (list 'persistent-paths "generation set but ssh identity entry dropped"
+         (lambda () (td-config #:generation 1
+                               #:persistent-paths '((disposable . "/var/log")))))
    ;; F1 regression: ship-guix? #f with a manifest that lists guix would
    ;; re-introduce the imperative surface via `packages` (the service deletion
    ;; alone does NOT make the image guix-free). The constructor must reject this

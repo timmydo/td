@@ -23,6 +23,15 @@
 ;;     menu still lists BOTH generations (rolling back never destroys the newer
 ;;     generation — you can roll forward again).
 ;;
+;; THE STATE MODEL (DESIGN §2.6, M10.3 staged scope) is asserted across the same
+;; two boots: on each boot the declared persistent path (/var/lib/ssh, the
+;; default allowlist's precious entry) is BACKED BY td-state — the one writable
+;; filesystem — not by that generation's root; a sentinel written under the
+;; declared path in gen 2 survives into the gen-1 boot while an UNDECLARED
+;; write does not follow the swap; and the SSH host key minted by gen 2's first
+;; boot is byte-identical under gen 1 — rollback swaps the OS, never the
+;; machine identity.
+;;
 ;; The guest OSes inside the generation bundles are instrumented with the
 ;; marionette backdoor via td-generation-image's #:transform-os — the same
 ;; overlay style as the disk-boot test; the SHIPPED bundles stay untouched.
@@ -70,6 +79,13 @@
     (td-rollback-disk tree #:gens %rollback-gens)))
 
 (define %sentinel "TD-PERSIST-99517")
+
+;; §2.6 state-model sentinels: one under a DECLARED persistent path (must
+;; survive the swap via td-state), one under an UNDECLARED path (must not — it
+;; stays inside gen-2's root).
+(define %declared-sentinel-file "/var/lib/ssh/td-declared-sentinel")
+(define %declared-sentinel "TD-DECLARED-99517")
+(define %undeclared-sentinel-file "/var/td-undeclared-sentinel")
 
 (define (run-td-rollback-test)
   (mlet %store-monad ((disk (td-rollback-disk-value)))
@@ -149,6 +165,33 @@
                     (format #f "boot ~a: /run/current-system is generation ~a's system" n n)
                   system current)))
 
+            ;; §2.6 state probe, one round trip: wait for the declared path's
+            ;; bind mount (shepherd mounts it before user-processes, but the
+            ;; marionette REPL can come up earlier), then report whether the
+            ;; path is backed by td-state (not the generation root), the host
+            ;; key's public half, and the sentinels' state.
+            (define (guest-state marionette)
+              (marionette-eval
+               `(begin
+                  (use-modules (ice-9 rdelim))
+                  (define (dev-of f) (stat:dev (stat f)))
+                  (let loop ((i 0))
+                    (when (and (< i 30)
+                               (or (not (file-exists? "/var/lib/ssh"))
+                                   (= (dev-of "/var/lib/ssh") (dev-of "/"))))
+                      (sleep 1) (loop (+ i 1))))
+                  (let ((slurp (lambda (f)
+                                 (and (file-exists? f)
+                                      (call-with-input-file f read-string)))))
+                    (list (and (file-exists? "/var/lib/ssh")
+                               (not (= (dev-of "/var/lib/ssh") (dev-of "/")))
+                               (= (dev-of "/var/lib/ssh")
+                                  (dev-of ,#$%td-state-mount-point)))
+                          (slurp ,(string-append #$%td-ssh-host-key ".pub"))
+                          (slurp ,#$%declared-sentinel-file)
+                          (file-exists? ,#$%undeclared-sentinel-file))))
+               marionette))
+
             (test-runner-current (system-test-runner #$output))
             (test-begin "td-rollback")
 
@@ -164,10 +207,40 @@
                                (string-contains a "overlay.qcow2")))
                         vm-command)))
 
+            ;; The gen-2 host key, carried across the reboot so boot 2 can
+            ;; prove machine identity survived the OS swap.
+            (define host-key-from-gen-2 #f)
+
             ;; ---------- boot 1: the GRUB default = newest generation (2) ----
             (mkdir "m1")
-            (let ((m1 (make-marionette vm-command #:socket-directory "m1")))
-              (assert-generation! m1 2 #$(gen-label 2) #$gen2-os #$(gen-label 1))
+            (let* ((m1 (make-marionette vm-command #:socket-directory "m1"))
+                   (state-1 (begin
+                              (assert-generation! m1 2 #$(gen-label 2)
+                                                  #$gen2-os #$(gen-label 1))
+                              (guest-state m1)))
+                   (host-key-1 (cadr state-1)))
+              (set! host-key-from-gen-2 host-key-1)
+              ;; §2.6 on gen 2: the declared path is BACKED BY td-state (not
+              ;; this generation's root), and first boot minted the machine's
+              ;; SSH host key there (activation, via the backing path).
+              (test-equal "gen 2: declared path /var/lib/ssh is backed by td-state"
+                #t (car state-1))
+              (test-assert "gen 2: first boot minted the SSH host key on the precious tier"
+                (and (string? host-key-1)
+                     (string-contains host-key-1 "ssh-ed25519")))
+
+              ;; Write the two state-model sentinels: declared (must survive
+              ;; the swap) and undeclared (must stay behind in gen-2's root).
+              (test-assert "gen 2: declared + undeclared sentinels written"
+                (marionette-eval
+                 '(begin
+                    (call-with-output-file #$%declared-sentinel-file
+                      (lambda (p) (display #$%declared-sentinel p)))
+                    (call-with-output-file #$%undeclared-sentinel-file
+                      (lambda (p) (display "should-not-follow-the-swap" p)))
+                    (and (file-exists? #$%declared-sentinel-file)
+                         (file-exists? #$%undeclared-sentinel-file)))
+                 m1))
 
               ;; The manual rollback ACT + a persistence sentinel, written to
               ;; the boot partition through the running gen-2 system.
@@ -205,6 +278,23 @@
             (mkdir "m2")
             (let ((m2 (make-marionette vm-command #:socket-directory "m2")))
               (assert-generation! m2 1 #$(gen-label 1) #$gen1-os #$(gen-label 2))
+
+              ;; §2.6 on gen 1 — both directions of declared persistence, plus
+              ;; machine identity:
+              ;;   * the declared-path sentinel followed the swap (td-state);
+              ;;   * the undeclared write did NOT (it stayed in gen-2's root);
+              ;;   * the SSH host key is byte-identical — rollback swapped the
+              ;;     OS, never the machine.
+              (let ((state-2 (guest-state m2)))
+                (test-equal "gen 1: declared path /var/lib/ssh is backed by td-state"
+                  #t (car state-2))
+                (test-equal "gen 1: the DECLARED-path sentinel survived the swap"
+                  #$%declared-sentinel (caddr state-2))
+                (test-equal "gen 1: the UNDECLARED write did not follow the swap"
+                  #f (cadddr state-2))
+                (test-assert "gen 1: SSH host key identical — rollback never changes machine identity"
+                  (and (string? host-key-from-gen-2)
+                       (equal? (cadr state-2) host-key-from-gen-2))))
 
               ;; Placed state persisted across the reboot: the sentinel and the
               ;; selection survived, gen-2's placed files are intact, and the
@@ -262,5 +352,8 @@ newest generation's identity (root label, mounted root filesystem, system \
 path); select the older generation via the placer's manual-rollback hook; \
 reboot the SAME disk overlay and assert the older generation's identity; \
 assert the placed state (sentinel, selection, the newer generation's files \
-and menu entry) persisted across the reboot.")
+and menu entry) persisted across the reboot; and assert the §2.6 state model \
+— declared paths are backed by td-state and survive the swap, an undeclared \
+write does not, and the SSH host key (machine identity) is unchanged by the \
+rollback.")
    (value (run-td-rollback-test))))

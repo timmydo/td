@@ -190,6 +190,20 @@ round on 2026-06-10.
     that generation's system path). The first in-test guest REBOOT in the loop —
     persistence within a test is legitimate; isolation is the overlay dying with the
     build (CLAUDE.md prime directive 6).
+  - **State model (S5; DESIGN §2.6, landed by the human mid-flight and absorbed at
+    the pre-landing rebase).** Typed `persistent-paths` allowlist
+    ((precious|disposable . path), default = the precious /var/lib/ssh entry, which
+    a generation config must keep — cross-field rule); generation systems mount
+    td-state (needed-for-boot — the initrd mounts it) and bind each entry from its
+    tier directory; activation mints the SSH host key on first boot THROUGH THE
+    BACKING PATH (it runs after the initrd's mounts, before shepherd's — bind
+    sources are not root-prefixed by the initrd, so the binds are shepherd-mounted,
+    and `user-processes`→`file-systems` ordering keeps sshd behind them); sshd
+    HostKey relocated via extra-content. All generation-gated: the default config
+    still lowers byte-identically to the frozen oracle. The rollback test asserts
+    the model both ways across the swap (declared sentinel survives; undeclared
+    write does not; /var/lib/ssh is BACKED by td-state on each boot; the gen-2
+    host key is byte-identical under gen-1 — machine identity ≠ OS identity).
   - **Two traps found by the loop, fixed:** (1) Guix's initrd parses the WHOLE
     `root=` value as a bare label — the dracut-style `LABEL=` prefix is searched
     literally and never matches (first disk reached GRUB+kernel, then looped

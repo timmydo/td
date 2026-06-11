@@ -23,6 +23,8 @@
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
   #:use-module (gnu packages containers) ;crun — shipped in the base (M9)
+  #:use-module (gnu packages ssh)        ;openssh — host-key generation (§2.6)
+  #:use-module (guix gexp)
   #:use-module (guix packages)
   ;; guix-free-marker, guix-free-privsep-service, cgroup2-file-system
   #:use-module (system td-hardening)
@@ -46,9 +48,14 @@
             td-config-manifest
             td-config-ship-guix?
             td-config-generation
+            td-config-persistent-paths
             td-config-effective-root-label
             td-config->operating-system
-            %td-default-config))
+            %td-default-config
+            %td-default-persistent-paths
+            %td-state-label
+            %td-state-mount-point
+            %td-ssh-host-key))
 
 ;;;
 ;;; The typed record.
@@ -58,7 +65,7 @@
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?
-                  manifest ship-guix? generation)
+                  manifest ship-guix? generation persistent-paths)
   td-config?
   (host-name              td-config-host-name)
   (timezone               td-config-timezone)
@@ -114,7 +121,19 @@
   ;; derives a DISTINCT, bootloader-selectable root label (`<root>-gen-<n>`) for
   ;; this system; when #f (the default) the root stays the plain `root-fs-label`,
   ;; so the default config still lowers byte-identically to the frozen oracle.
-  (generation             td-config-generation))
+  (generation             td-config-generation)
+  ;; M10.3 — the DECLARED-PERSISTENCE allowlist (DESIGN §2.6, settled
+  ;; 2026-06-10). Persistence on a td machine is default-deny: ONLY the paths
+  ;; listed here survive a generation swap, each bind-mounted at boot from the
+  ;; machine's single writable filesystem (label `td-state`). Entries are
+  ;; (TIER . ABSOLUTE-PATH) pairs; TIER is 'precious (backed by td-state/state —
+  ;; machine identity, backup-worthy) or 'disposable (td-state/cache —
+  ;; persistent but re-derivable). The default carries the model's first entry:
+  ;; /var/lib/ssh (precious), where the compiler relocates the SSH host key so a
+  ;; rollback swaps the OS but never the machine identity. GENERATION-MODE ONLY
+  ;; (§2.6 "oracle scope"): with generation #f nothing here is emitted, so the
+  ;; default config still lowers byte-identically to the frozen oracle.
+  (persistent-paths       td-config-persistent-paths))
 
 ;;;
 ;;; Validation — the "typed" guarantee. Each field is checked; a violation is a
@@ -140,6 +159,18 @@
 ;; malformed generation cannot derive a bogus root label.
 (define (generation-id? x)
   (or (not x) (and (integer? x) (exact? x) (positive? x))))
+
+;; A persistent-paths entry is (TIER . ABSOLUTE-PATH) with TIER one of
+;; 'precious/'disposable and a non-root absolute path — a malformed entry would
+;; otherwise emit a bogus bind mount deep in the lowering.
+(define (persistent-path-entry? x)
+  (and (pair? x)
+       (memq (car x) '(precious disposable))
+       (absolute-path? (cdr x))
+       (not (string=? (cdr x) "/"))))
+
+(define (persistent-paths? x)
+  (and (list? x) (every persistent-path-entry? x)))
 
 ;; The filesystem types we know how to declare. Kept explicit so an unsupported
 ;; type is rejected here rather than failing deep in a build.
@@ -213,6 +244,20 @@
 ;;; `%td-default-config` lowers to the oracle's store path.
 ;;;
 
+;; The single writable filesystem (§2.6) and where the compiler mounts it.
+(define %td-state-label "td-state")
+(define %td-state-mount-point "/td-state")
+
+;; Where the SSH host key lives — under the model's FIRST allowlist entry, so a
+;; rollback never changes machine identity (§2.6 "machine identity ≠ OS
+;; identity"). Relocated via sshd_config (HostKey), not by mounting over /etc.
+(define %td-ssh-host-key "/var/lib/ssh/ssh_host_ed25519_key")
+
+;; The default allowlist: SSH host keys, precious. (DESIGN §2.6: "SSH host keys
+;; are the first entry".)
+(define %td-default-persistent-paths
+  '((precious . "/var/lib/ssh")))
+
 (define* (td-config #:key
                     (host-name "td")
                     (timezone "UTC")
@@ -226,7 +271,8 @@
                     (ssh-challenge-response? #f)
                     (manifest %base-packages)
                     (ship-guix? #f)
-                    (generation #f))
+                    (generation #f)
+                    (persistent-paths %td-default-persistent-paths))
   (check non-empty-string? 'host-name host-name "a non-empty string")
   (check non-empty-string? 'timezone timezone "a non-empty string")
   (check non-empty-string? 'locale locale "a non-empty string")
@@ -242,6 +288,20 @@
   (check package-list? 'manifest manifest "a list of <package>")
   (check boolean? 'ship-guix? ship-guix? "a boolean")
   (check generation-id? 'generation generation "#f or a positive integer")
+  (check persistent-paths? 'persistent-paths persistent-paths
+         "a list of (precious|disposable . \"/abs/path\") pairs")
+  ;; Cross-field (§2.6): a GENERATION system relocates its SSH host key under
+  ;; /var/lib/ssh — machine identity must live on td-state or a rollback would
+  ;; swap it along with the OS. So when a generation id is set, the allowlist
+  ;; must keep a PRECIOUS entry covering /var/lib/ssh; dropping it would
+  ;; silently put the host key back on the per-generation root.
+  (when (and generation
+             (not (member '(precious . "/var/lib/ssh") persistent-paths)))
+    (error (string-append
+            "td-config: a generation system requires the (precious . \"/var/lib/ssh\") "
+            "persistent-paths entry — the SSH host key is relocated there so that "
+            "machine identity survives a rollback (DESIGN §2.6). Keep that entry "
+            "in the allowlist.")))
   ;; Cross-field — the BASE-CAPABILITY boundary (hygiene PRE-FILTER). The manifest
   ;; is the swappable PAYLOAD only; a base capability (crun, the container host) is
   ;; a mandatory platform invariant the compiler injects into every image, not
@@ -289,7 +349,7 @@
   (make-td-config host-name timezone locale bootloader-target
                   root-fs-label root-mount root-fs-type
                   ssh-port ssh-password-auth? ssh-challenge-response?
-                  manifest ship-guix? generation))
+                  manifest ship-guix? generation persistent-paths))
 
 ;;;
 ;;; The compiler: typed config -> operating-system (a gexp-bearing value).
@@ -309,6 +369,68 @@
         (format #f "~a-gen-~a" base gen)
         base)))
 
+;; The §2.6 state model, compiled (generation mode only). One writable
+;; filesystem — label td-state, mounted needed-for-boot (the initrd mounts it,
+;; so the activation below can already write through its BACKING paths before
+;; shepherd starts anything) — plus one bind mount per allowlist entry, mounted
+;; by shepherd's file-system services (which `user-processes`, and so every
+;; daemon, requires — sshd never starts before its key directory is bound).
+
+(define %td-state-file-system
+  (file-system
+    (device (file-system-label %td-state-label))
+    (mount-point %td-state-mount-point)
+    (type "ext4")
+    (needed-for-boot? #t)))
+
+(define (persistent-path-tier-directory tier)
+  (case tier
+    ((precious)   "state")
+    ((disposable) "cache")))
+
+;; The backing directory on td-state for an allowlist entry — the tier root
+;; plus the entry's own path (state/var/lib/ssh, cache/var/log, ...).
+(define (persistent-path-backing entry)
+  (match entry
+    ((tier . path)
+     (string-append %td-state-mount-point "/"
+                    (persistent-path-tier-directory tier) path))))
+
+;; No `dependencies` on td-state here: a needed-for-boot filesystem has no
+;; shepherd service to depend on — and none is needed, since the initrd mounts
+;; td-state before shepherd (and these binds) exist at all.
+(define (persistent-path-file-system entry)
+  (file-system
+    (device (persistent-path-backing entry))
+    (mount-point (cdr entry))
+    (type "none")
+    (flags '(bind-mount))))
+
+;; Activation: create the tier roots + each entry's backing dir and mount
+;; point (idempotent), then generate the machine's SSH host key — THROUGH THE
+;; BACKING PATH, because activation runs after the initrd mounted td-state but
+;; before shepherd mounts the binds. First boot mints the identity onto
+;; td-state; every later boot (and every rollback) finds it there and leaves it
+;; alone.
+(define (td-state-activation entries)
+  (with-imported-modules '((guix build utils))
+    #~(begin
+        (use-modules (guix build utils))
+        (mkdir-p (string-append #$%td-state-mount-point "/state"))
+        (mkdir-p (string-append #$%td-state-mount-point "/cache"))
+        (mkdir-p (string-append #$%td-state-mount-point "/home"))
+        (for-each (lambda (backing+mount)
+                    (mkdir-p (car backing+mount))
+                    (mkdir-p (cdr backing+mount)))
+                  '#$(map (lambda (e)
+                            (cons (persistent-path-backing e) (cdr e)))
+                          entries))
+        (let ((key (string-append #$%td-state-mount-point "/state"
+                                  #$%td-ssh-host-key)))
+          (unless (file-exists? key)
+            (invoke #$(file-append openssh "/bin/ssh-keygen")
+                    "-q" "-t" "ed25519" "-N" "" "-f" key))))))
+
 (define (td-config->operating-system c)
   (operating-system
     (host-name (td-config-host-name c))
@@ -321,13 +443,25 @@
       (targets (list (td-config-bootloader-target c)))))
 
     ;; Root fs + the cgroup2 container-host mount (M9), shared with the oracle.
+    ;; M10.3 (§2.6): a GENERATION system additionally mounts the single
+    ;; writable filesystem (td-state, needed-for-boot) and bind-mounts each
+    ;; declared persistent path from its tier directory there — default-deny
+    ;; persistence: nothing else survives a generation swap. With generation #f
+    ;; none of this is emitted, so the default config still lowers
+    ;; byte-identically to the frozen oracle.
     (file-systems
-     (cons* (file-system
-              (device (file-system-label (td-config-effective-root-label c)))
-              (mount-point (td-config-root-mount c))
-              (type (td-config-root-fs-type c)))
-            cgroup2-file-system
-            %base-file-systems))
+     (append
+      (cons* (file-system
+               (device (file-system-label (td-config-effective-root-label c)))
+               (mount-point (td-config-root-mount c))
+               (type (td-config-root-fs-type c)))
+             cgroup2-file-system
+             (if (td-config-generation c)
+                 (cons %td-state-file-system
+                       (map persistent-path-file-system
+                            (td-config-persistent-paths c)))
+                 '()))
+      %base-file-systems))
 
     ;; The image's EFFECTIVE package set is layered (M6, made precise by triage
     ;; F-review #2): effective = fixed base capabilities (crun, below) + the
@@ -376,19 +510,40 @@
     ;; M4/M5/M6 differentials keep converging). An explicit #t config keeps
     ;; guix-service-type (which provides /var/empty) and omits the privsep fix, so
     ;; it diverges.
+    ;; M10.3 (§2.6): a GENERATION system relocates the SSH host key onto the
+    ;; precious tier (HostKey under /var/lib/ssh — bind-mounted from
+    ;; td-state/state) so a rollback swaps the OS but never the machine
+    ;; identity, and adds the activation that creates the backing dirs and
+    ;; mints the key on first boot. generate-host-keys? is switched off there —
+    ;; the relocated key IS the host key; /etc/ssh keys would be per-generation
+    ;; noise. All of it generation-gated: the default config's services stay
+    ;; byte-identical to the oracle's.
     (services
-     (let ((dhcp (service dhcpcd-service-type))
-           (ssh  (service openssh-service-type
-                          (openssh-configuration
-                           (port-number (td-config-ssh-port c))
-                           (password-authentication?
-                            (td-config-ssh-password-auth? c))
-                           (challenge-response-authentication?
-                            (td-config-ssh-challenge-response? c))))))
+     (let* ((gen  (td-config-generation c))
+            (dhcp (service dhcpcd-service-type))
+            (ssh  (service openssh-service-type
+                           (openssh-configuration
+                            (port-number (td-config-ssh-port c))
+                            (password-authentication?
+                             (td-config-ssh-password-auth? c))
+                            (challenge-response-authentication?
+                             (td-config-ssh-challenge-response? c))
+                            (generate-host-keys? (not gen))
+                            (extra-content
+                             (if gen
+                                 (string-append "HostKey " %td-ssh-host-key)
+                                 "")))))
+            (state (if gen
+                       (list (simple-service 'td-state-activation
+                                             activation-service-type
+                                             (td-state-activation
+                                              (td-config-persistent-paths c))))
+                       '())))
        (if (td-config-ship-guix? c)
-           (cons* dhcp ssh %base-services)
+           (append (cons* dhcp ssh state) %base-services)
            (modify-services
-               (cons* dhcp ssh guix-free-privsep-service %base-services)
+               (append (cons* dhcp ssh guix-free-privsep-service state)
+                       %base-services)
              (delete guix-service-type)))))))
 
 ;; The default typed config — by construction equal in content to `td-system`.

@@ -12,6 +12,11 @@
 ;;         paths resolve here
 ;;     p2+ one partition PER GENERATION — the placer's root.img files VERBATIM
 ;;         (label td-root-gen-N, identity UUID; the menu's bare-label root= target)
+;;     pN  ext4 "td-state" — the §2.6 state model's ONE writable filesystem,
+;;         created by this harness (the placer never touches it): tier roots
+;;         state/ + cache/ + home/ and the default allowlist's backing dirs are
+;;         pre-created; everything else (the SSH host key, sentinels) is written
+;;         by the GUEST at runtime — that is the point of the partition
 ;;
 ;; GRUB is installed image-side exactly like Guix's own `install-grub-disk-image`
 ;; (grub-mkimage core with biosdisk/part_msdos/ext2 + grub-bios-setup into the
@@ -30,6 +35,7 @@
   #:use-module (guix gexp)
   #:use-module (guix monads)
   #:use-module (guix store)
+  #:use-module (system td-typed)           ;%td-state-label (§2.6)
   #:export (td-rollback-disk
             %td-boot-label))
 
@@ -37,9 +43,11 @@
 ;; `search --label` selects. The placer is told this via --boot-label.
 (define %td-boot-label "td-boot")
 
-;; Fixed, arbitrary UUID for the boot partition filesystem (determinism only;
-;; nothing selects by it — the roots carry their identity-derived UUIDs).
+;; Fixed, arbitrary UUIDs for the boot and state partition filesystems
+;; (determinism only; nothing selects by UUID — boot is found by GRUB's search
+;; label, td-state by its label, the roots by their identity-derived UUIDs).
 (define %td-boot-uuid "1d000000-0000-4000-8000-00000000b007")
+(define %td-state-uuid "1d000000-0000-4000-8000-000000057a7e")
 
 ;; Assemble TREE (a lowerable placed-tree built with #:mkfs? #t and
 ;; #:boot-label %td-boot-label) into a raw bootable disk image carrying the
@@ -91,9 +99,10 @@
             (for-each (lambda (f) (utime f 1 1))
                       (find-files dir (const #t) #:directories? #t))
             (utime dir 1 1))
-          (define (mkfs-ext4 dir out label uuid)
-            (let* ((kb (du-kb dir))
-                   (kb (+ kb (quotient kb 4) 1024)))
+          (define* (mkfs-ext4 dir out label uuid #:optional size-kb)
+            (let* ((kb (or size-kb
+                           (let ((kb (du-kb dir)))
+                             (+ kb (quotient kb 4) 1024)))))
               (setenv "SOURCE_DATE_EPOCH" "1")
               (setenv "E2FSPROGS_FAKE_TIME" "1")
               (invoke "fakeroot" "mke2fs" "-t" "ext4" "-d" dir
@@ -104,6 +113,18 @@
                       out (format #f "~ak" kb))))
           (normalize-mtimes! bootroot)
           (mkfs-ext4 bootroot "boot.img" #$%td-boot-label #$%td-boot-uuid)
+
+          ;; --- 2b. The td-state partition (§2.6): the ONE writable filesystem.
+          ;; The harness creates it — tier roots + the default allowlist's
+          ;; backing dirs pre-made, content written by the GUEST at runtime —
+          ;; with a fixed 64 MiB size (du-sizing an empty tree would leave no
+          ;; room to live in).
+          (define stateroot (string-append (getcwd) "/stateroot"))
+          (for-each (lambda (d) (mkdir-p (string-append stateroot d)))
+                    '("/state/var/lib/ssh" "/cache" "/home"))
+          (normalize-mtimes! stateroot)
+          (mkfs-ext4 stateroot "state.img" #$%td-state-label #$%td-state-uuid
+                     65536)
 
           ;; --- 3. genimage: MBR disk; p1 boot (1 MiB offset = GRUB gap),
           ;; then one partition per generation, the placer's root.img verbatim. -
@@ -126,6 +147,8 @@
                  (format port "  partition gen~aroot {~%    partition-type = 0x83~%    image = \"~a\"~%    bootable = \"false\"~%  }~%"
                          n img))
                '#$gens root-imgs)
+              (format port "  partition tdstate {~%    partition-type = 0x83~%    image = \"~a\"~%    bootable = \"false\"~%  }~%"
+                      (string-append (getcwd) "/state.img"))
               (format port "}~%")))
           (mkdir "root")                ;genimage insists on a root path
           (invoke "genimage" "--config" "genimage.cfg")
