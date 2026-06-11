@@ -14,6 +14,7 @@
              (system td-generation)
              (system td-place)
              (tests boot)
+             (tests reset)
              (tests container))
 
 (display "eval ok\n")

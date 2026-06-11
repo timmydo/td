@@ -25,7 +25,8 @@
   #:use-module (guix packages)
   #:use-module (system td)
   #:export (%test-td-boot
-            %test-td-disk-boot))
+            %test-td-disk-boot
+            %instrumented-disk-os))
 
 (define %expected-kernel-release
   ;; linux-libre reports `uname -r` as "<version>-gnu".
@@ -238,15 +239,21 @@ declared sshd port is listening, and the daemon denies password authentication \
 ;;; backdoor service. A byte-exact boot of the un-instrumented image would need a
 ;;; serial-console/ssh harness instead of the marionette; noted for follow-up.)
 
-(define (run-td-disk-boot-test)
-  (define os
-    (marionette-operating-system
-     td-system
-     #:imported-modules '((gnu services herd))))
+;; The shipped td-system instrumented ONLY with the marionette backdoor, and its
+;; qcow2 disk image built exactly as `guix system image -t qcow2` does. The os
+;; is module-level and exported so the `reset` rung (tests reset) instruments
+;; the SAME system (it derives a non-volatile image variant from it).
+(define %instrumented-disk-os
+  (marionette-operating-system
+   td-system
+   #:imported-modules '((gnu services herd))))
 
-  ;; Build the qcow2 exactly as `guix system image -t qcow2` does.
-  (define image
-    (system-image ((image-type-constructor qcow2-image-type) os)))
+(define %instrumented-disk-image
+  (system-image ((image-type-constructor qcow2-image-type)
+                 %instrumented-disk-os)))
+
+(define (run-td-disk-boot-test)
+  (define image %instrumented-disk-image)
 
   (define test
     (with-imported-modules '((gnu build marionette))

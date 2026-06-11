@@ -9,6 +9,11 @@
 #   6. build          — build the bootable image and assert it is reproducible
 #   7. test           — boot the marionette system test and assert behaviors
 #   8. boot-disk      — boot the qcow2 through GRUB (real bootloader path) + kernel
+#   8b. reset         — per-test ephemerality (DESIGN §1.5): dirtied guest state
+#                       persists across a reboot on the SAME CoW overlay
+#                       (negative control) and is GONE on a fresh overlay over
+#                       the same backing image (the reset). Locks in the
+#                       fresh-state guarantee loop-latency work must preserve.
 #   9. oci            — build the Docker/OCI image and assert it is reproducible (M5)
 #  10. manifest-check — build a swapped-manifest image, --check it, and assert the
 #                       declared package is actually in the realized tarball (M6)
@@ -53,7 +58,7 @@ IMGTYPE := qcow2
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check generation-image place no-guix run container
+.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk reset oci manifest-check generation-image place no-guix run container
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -61,7 +66,7 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk oci manifest-check generation-image place no-guix run container
+check: eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk reset oci manifest-check generation-image place no-guix run container
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
@@ -172,6 +177,29 @@ boot-disk:
 	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the disk-boot test derivation" >&2; exit 1; }; \
 	echo ">> realise disk-boot test derivation: $$drv"; \
+	$(GUIX) build "$$drv"
+
+# 3c. Ephemerality of the CoW reset (loop-latency; DESIGN §1.5). Boots the SAME
+#     instrumented qcow2 derivation as boot-disk (cache hit, no extra image
+#     build) three times on explicit qcow2 overlays: dirt written on overlay A,
+#     dirt STILL THERE on reused overlay A (negative control — writes really
+#     persist without a reset), dirt GONE on fresh overlay B (the reset). Makes
+#     the loop's fresh-state-per-test guarantee an assertion instead of an
+#     implicit property of qemu flags, so any future cycle-time change that
+#     leaks guest state across boots goes red here. Same honest two-step
+#     lower-then-realise as `test`/`boot-disk`.
+reset:
+	@echo ">> reset: CoW overlay reset discards dirtied guest state (ephemerality)"
+	@drv=`printf '%s\n' \
+	    '(use-modules (guix) (gnu tests) (tests reset))' \
+	    '(with-store store' \
+	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
+	    '  (format #t "DRV=~a~%"' \
+	    '          (derivation-file-name' \
+	    '           (run-with-store store (system-test-value %test-td-reset)))))' \
+	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the reset test derivation" >&2; exit 1; }; \
+	echo ">> realise reset test derivation: $$drv"; \
 	$(GUIX) build "$$drv"
 
 # 4. OCI reproducibility oracle (M5) — same shape as `build`, but for the

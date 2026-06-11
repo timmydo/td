@@ -143,3 +143,30 @@ Findings from run B + host probes:
    Expected: marionette set 120s → ~75s; unchanged-tree floor ~534s → ~300s.
 3. Re-measure (runs A'/B' under comparable load), record before/after, land
    per §7.2.
+
+### Sub-task 2 — ephemerality rung: DONE (green, verified red first)
+
+New rung `reset` (tests/reset.scm, %test-td-reset), wired into `make check`
+after `boot-disk`; module loaded by the eval rung.
+
+**Discovery (red-first):** the stock qcow2 image type inherits `<image>`'s
+`volatile-root? #t` DEFAULT — every guest write to / lands on an in-RAM
+overlay, never the disk. First run failed exactly at the persistence control
+("boot 2: dirt persists" → actual-value #f), proving (a) the control is
+non-vacuous and (b) the shipped qcow2 discards root writes by default.
+**Note for M10.3 (mainline):** placed-generation persistence across reboot
+will NOT survive on the image root unless the image sets `volatile-root? #f`
+or persists on a separate filesystem (the CLAUDE.md td-state direction).
+
+The rung therefore boots a NON-volatile variant of the instrumented system
+(`%persistent-instrumented-image`, one extra image derivation): the strictest
+case — a guest that genuinely persists writes, isolated only by the qemu-level
+qcow2 overlay (exactly the §1.5 mechanism).
+
+Verified-red evidence:
+- 2026-06-10 run 1 (stock volatile image): "boot 2 (overlay A reused, NO
+  reset): dirt persists" FAILED — the control catches write-loss/vacuity.
+- 2026-06-10 run 3 (reset deliberately skipped, boot 3 reused dirty overlay
+  A): "boot 3 (fresh overlay B = the reset): dirt is gone" FAILED while boots
+  1–2 passed — the assertion reds precisely when the reset is removed.
+- Final committed version: green (3/3), exit 0.
