@@ -30,3 +30,27 @@ The privsep discovery behind the re-baseline: a guix-free system breaks inetd ss
 `guix-service-type` had created `/var/empty` (root:root 0755) as a side effect of its
 build-user accounts. `guix-free-privsep-service` restores it; the boot rung proves
 key-based login still works.
+
+## Generation identity — OCI manifest digests (§2.7 representation move, 2026-06-11)
+
+The `oci-load` track introduced the canonical OCI layout (skopeo
+`copy docker-archive:… oci:…`, verified by the `oci-load` rung), so generation
+identity moves from "sha256 of the docker-archive tarball" to the **OCI image
+manifest digest** — the registry-addressable `sha256:…` form M12 signs. This is the
+representation change §2.7 staged; the convention (identity = digest of the
+distributed artifact, in its canonical form) is unchanged. Digests below are stable
+across repeated conversions of the reproducible archives (the rung re-derives a
+manifest digest every check; these recorded values are the §2.7 identity record at
+this baseline):
+
+- default OCI image (docker output `h8x2qfskf2qzjv4s3w7ah905b1gw5kc6-docker-image.tar.gz`):
+  manifest digest `sha256:714045afa001bab1ce90744ff77c885e4faae1573570de753e6906a5bc5c80ff`.
+- gen-1 bootc generation image (output `xmgdwy348ik6g6xsczxfiaby23nk0sg6-td-generation-image-gen-1`):
+  manifest digest `sha256:4076bfe633259bf681326516ca6d887b60de849b26796f0bec23b9abfa368a3e`.
+
+Known drift, flagged (not part of this move): the store paths in the section above
+date from the 2026-06-06 guix-free re-baseline and no longer match what the loop
+lowers today (e.g. default docker drv is now `m40hfv6r…`, output `h8x2qfskf…` —
+observed 2026-06-11 via `guix system image -L . -t docker [-d] system/td.scm` at the
+pinned channel).
+Refreshing them is the next deliberate oracle re-baseline owner's call.
