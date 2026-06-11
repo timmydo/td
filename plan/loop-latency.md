@@ -1,6 +1,7 @@
 # Track: loop-latency (side-track)
 
-**Status:** CLAIMED claude-fable 2026-06-10 (worktree `worktree-loop-latency`).
+**Status:** DONE — landed 2026-06-10 (claude-fable). Acceptance met: see
+"Results" at the bottom.
 **Origin:** DESIGN §1.3 (loop latency is a tracked metric) and §1.5 (the named
 upgrade path: qcow2 overlay / CoW reset).
 **Scope authority:** DESIGN §7.1.
@@ -170,3 +171,35 @@ Verified-red evidence:
   A): "boot 3 (fresh overlay B = the reset): dirt is gone" FAILED while boots
   1–2 passed — the assertion reds precisely when the reset is removed.
 - Final committed version: green (3/3), exit 0.
+
+### Sub-task 3 — bounded-parallel check: DONE
+
+Daemon concurrency verified empirically before relying on it: two concurrent
+client `guix build --check` realisations of the place/prune trees overlap
+(17s serial → 10s concurrent). Change: `check.sh` runs `make -j2
+--output-sync=target`; the Makefile chains the six structural rungs serial-
+first via order-only deps and lists the heavy rungs LONGEST-FIRST (LPT
+packing — the naive order left `container` running alone for its full 71s:
+116s → only 94s). Nothing removed/loosened/skipped; a red still stops new
+rungs from spawning.
+
+### Results (acceptance)
+
+All on the warm store, same host, 2026-06-10; before/after on the SAME rung
+set and invocation shape:
+
+- **Marionette rung set** (test+boot-disk+container, test builders
+  invalidated by a no-op datum): **116s serial → 94s** with -j2 in
+  command-line order (the full-check LPT order packs container against
+  test+boot-disk).
+- **Full `./check.sh`, unchanged tree (the steady-state floor): 525s serial
+  (-j1) → 275s parallel — green both ways, all 17 rungs.** 275s is at the
+  two-slot packing bound (total heavy work ÷ 2 ≈ 260s + serial prefix).
+- **Ephemerality intact and now ASSERTED**: the new `reset` rung (see
+  sub-task 2) locks the per-test fresh-state guarantee in, verified red by
+  disabling the reset.
+
+Residual/possible follow-ons (not pursued; floor is now oracle-dominated):
+the four OCI `--check` rungs are ~80% of remaining floor — only a roadmap
+change could touch that; -j3 was not attempted (DESIGN §7.3 thrash bound with
+a second agent's checks running).

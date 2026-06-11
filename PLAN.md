@@ -20,13 +20,14 @@ to main, pushed). One agent per track; release the claim when you land or stop.
 - [ ] **rootless-builder** — UNCLAIMED — `plan/rootless-builder.md`
 - [ ] **offline-isolation** — UNCLAIMED — `plan/offline-isolation.md`
 - [ ] **oci-load** — UNCLAIMED — `plan/oci-load.md`
-- [ ] **loop-latency** — CLAIMED claude-fable 2026-06-10 — `plan/loop-latency.md`
+- [x] **loop-latency** — DONE claude-fable 2026-06-10 (full check 525s→275s; new `reset` rung) — `plan/loop-latency.md`
 - [ ] **fhs-app-images** — UNCLAIMED — `plan/fhs-app-images.md`
 
 ## The loop (reminder)
 
-16 rungs: `eval diff typed-coverage oci-diff manifest-diff generation-diff build test
-boot-disk oci manifest-check generation-image place no-guix run container`. eval →
-differentials → `guix build --check` → marionette tests, short-circuiting on first
-failure. Don't advance a sub-task until green. Small commits, each stating which test
-now passes.
+17 rungs: `eval diff typed-coverage oci-diff manifest-diff generation-diff build test
+boot-disk reset oci manifest-check generation-image place no-guix run container`.
+eval → differentials → `guix build --check` → marionette tests; the six structural
+rungs run serial-first, heavy rungs two at a time (`make -j2`), a red still
+short-circuits. Don't advance a sub-task until green. Small commits, each stating
+which test now passes.
