@@ -8,20 +8,26 @@ This document is the settled contract the agents work against. It pins the three
 things an agent can't decide for itself — **the loop it runs to check its work**,
 **the target it's aiming at**, and **the scope it may work without sign-off** (the
 §7.1 roadmap). Everything else the agents may propose and iterate on. Section numbers
-are stable anchors; `CLAUDE.md` and `PLAN.md` reference them, so keep them. Keep
-`CLAUDE.md` in sync with §1, §3, and §7.2–7.3.
+are stable anchors; `CLAUDE.md` and `PLAN.md` reference them, so keep them.
+
+It states the north star and the standing decisions — **not the history**: how we got
+here lives in `HISTORY.md` and git, and milestone narration does not belong in this
+file. To stay DRY, each volatile fact lives in exactly one place and everything else
+points at it: the rung list in the `Makefile`'s `check:` line, claim status in
+`PLAN.md`, completed milestones in `HISTORY.md`. `CLAUDE.md` mirrors only the stable
+contract (§1, §3, §7.2–7.3). If two statements disagree anyway, **the later-dated
+decision governs**; reconcile the older text on sight.
 
 ---
 
-## 0. North star and v0 scope
+## 0. North star and scope
 
-**Eventual:** a content-addressed, reproducible, immutable distro where the store path
-doubles as `fs-verity` root and OCI digest, with one Rust sandbox stack spanning build
-and run, a typed config front-end, and atomic verified generations.
+**North star:** a content-addressed, reproducible, immutable distro where the store
+path doubles as integrity root and OCI digest, with one Rust sandbox stack spanning
+build and run, a typed config front-end, and atomic verified generations.
 
-**v0:** the smallest vertical slice that closes the full verification loop on top of
-stock Guix — one `system/td.scm` declaration that builds reproducibly into a bootable
-image, boots in a VM, and passes one behavioral assertion (kernel version).
+**Scope at any time = the approved roadmap (§7.1).** The climbed ladder (the v0
+closed loop through M10.2) is recorded in `HISTORY.md`.
 
 ---
 
@@ -32,21 +38,21 @@ image, boots in a VM, and passes one behavioral assertion (kernel version).
 `./check.sh` is the one command that means green or red. It sets up the hermetic,
 offline sandbox (a fresh `guix shell -C --pure`, store and daemon-socket exposure, a
 guard that host guix matches the `channels.scm` pin, substitutes disabled) and runs
-`make check` inside it. `make check` runs, short-circuiting on the first failure:
-config eval → the typed/OCI/manifest differentials → `guix build --check` on
-`system/td.scm` → the `tests/boot.scm` marionette test → the manifest-swap
-reproducibility rung. Plain `make check` is only correct when you're already inside
-that sandbox.
+`make check` inside it. `make check` runs the rung ladder, short-circuiting on the
+first failure; **the `check:` line in the `Makefile` is the authoritative rung
+list** — documents point here instead of restating it. Broad shape: config eval →
+differentials → `guix build --check` → behavioral/marionette tests. Plain
+`make check` is only correct when you're already inside that sandbox.
 
-### 1.2 Rungs committed for v0
+### 1.2 Rung classes
 
 - Hermetic build/dev env: `guix shell -C --pure` (no host leakage).
 - Reproducibility oracle: `guix build --check` (and `--rounds=2` where cheap). A
   non-reproducible output is a failing test.
-- Boot + behavioral: one marionette `(gnu tests)` system test that boots a
-  `guix system vm` and drives the guest from Guile.
+- Boot + behavioral: marionette `(gnu tests)` system tests that boot the image and
+  drive the guest from Guile.
 
-Fuzzing/adversarial and real-hardware rungs are deferred to later milestones.
+Fuzzing/adversarial and real-hardware rungs are deferred (off-roadmap).
 
 ### 1.3 Loop-latency budget
 
@@ -62,27 +68,29 @@ environment can't contaminate results and the reproducibility rung stays honest.
 
 ### 1.5 VM state reset
 
-v0 is **fully ephemeral**: boot from a fresh image per test, nothing persists across
-runs, all writable state is wiped on reset. Upgrade path, when loop latency demands
-it: QEMU `qcow2` overlay / CoW reset for cheap repeated runs.
+The harness is **fully ephemeral per test**: boot from a fresh image, wipe all
+writable state on reset. That is test isolation, not a ban on persistence *within* a
+test (§2.6, §3). Cheaper resets (QEMU `qcow2` overlay / CoW) are the `loop-latency`
+side-track (§7.1).
 
 ---
 
 ## 2. The target
 
-### 2.1 v0 acceptance test
+### 2.1 Base acceptance test
 
-`system/td.scm` builds reproducibly (`guix build --check` passes) into a bootable
-image; `tests/boot.scm` boots it and asserts that `uname -r` in the guest equals the
-kernel version pinned by the declaration; then the harness resets the ephemeral VM. v0
-is done when this passes, reproducibly, and is committed.
+The base of the ladder, still a live rung: `system/td.scm` builds reproducibly
+(`guix build --check` passes) into a bootable image; `tests/boot.scm` boots it and
+asserts that `uname -r` in the guest equals the kernel version pinned by the
+declaration; then the harness resets the ephemeral VM.
 
-### 2.2 Reused vs. built for v0
+### 2.2 Reused vs. built
 
-Keep `guix-daemon`, `/gnu/store`, and Guile + gexps as the v0 config language. No
-typed front-end yet — changing the config language and building the OS at once is two
-hard projects fused into one, and it blinds the agent's cheapest rung. The typed layer
-is a later milestone that compiles down to gexps.
+Reused: `guix-daemon`, `/gnu/store`, and Guile + gexps as the lowering target. Built
+on top: the typed config front-end (`(system td-typed)`) compiles down to gexps, with
+the hand-written `system/td.scm` kept FROZEN as the differential oracle (§2.5).
+Replacing a reused Guix component is off-roadmap until it earns a §7.1 entry, and
+then only under the §2.5 differential discipline.
 
 ### 2.3 Scope rule *(redefined 2026-06-10)*
 
@@ -90,11 +98,8 @@ is a later milestone that compiles down to gexps.
 and ask; never expand scope on your own.** Naming the boundary is what stops an agent
 boiling the ocean.
 
-(History: the original v0 exclusion list did this job; every crossing was gated on
-§4.3 sign-off, as M4–M10.2 were. Of that list, the typed front-end, the OCI app
-model, and verified generations have since been crossed deliberately or sit on the
-roadmap; the Rust build daemon, the unified sandbox/portal broker, multi-machine
-tests, and real-hardware/driver work remain off-roadmap and therefore out of scope.)
+Named as staying out (off-roadmap today): the Rust build daemon, the unified
+sandbox/portal broker, multi-machine tests, real-hardware/driver work.
 
 ### 2.4 Milestone ladder
 
@@ -103,38 +108,9 @@ acceptance test. An agent does far better climbing a ladder of green bars than h
 a monolith in context. (Parallel side-tracks alongside the mainline are governed by
 §7.)
 
-1. Closed loop on a trivial image (§2.1) — boot + kernel-version assertion.
-2. Add a service to the declaration; test asserts the unit is up and a port listens.
-3. Default-deny hardening on that service; test asserts a forbidden operation is denied.
-4. Typed config front-end that compiles to gexps; differential test: compiled output
-   yields the same store paths as the hand-written gexp.
-5. … extend toward the north star.
-
-**Where step 5 has gone so far** (all on `main`, green, signed off under §4.3):
-
-- **M5** (2026-06-06) — the same declaration also lowers to a reproducible Docker/OCI
-  image.
-- **M6** (2026-06-06) — manifest-driven, image-swap-only build interface: the image's
-  swappable package payload is a function of a typed `manifest` (effective packages =
-  fixed base capabilities + manifest payload + enforcement markers), and a changed
-  manifest is a whole new reproducible image generation.
-- **M7** (2026-06-06) — guix-free by construction: the typed `ship-guix?` field, when
-  `#f`, deletes `guix-service-type` and embeds a closure-level `guix-free-marker`, so
-  the realized image carries no `guix`/`guix-daemon` and there's no imperative `guix
-  install` surface. With this sign-off the shipped default flipped to guix-free
-  (`ship-guix?` defaults to `#f`), so the whole distro — bootable qcow2/VM and OCI
-  image both — is guix-free. (Detail in §6.)
-- **M8** (2026-06-07) — run the shipped OCI image as a real rootless OCI container via
-  crun (podman was rejected as a network-fetching, offline-loop-breaking build), with
-  a positive run and a negative control. Crosses the §2.3 "OCI app model" line.
-- **M9** (2026-06-07) — the booted base is an OCI container *host*: it ships crun and
-  mounts cgroup2, and runs a separate Guix-built OCI app image on the base honoring
-  its entrypoint. (FHS-flattening the base was dropped — in a "minimal base, apps in
-  containers" design, FHS is a property of the app images, not the base.)
-
-M10.1–M10.2 (bootc-style generation image + guix-free placer) are done — record in
-`HISTORY.md`. The forward plan from M10.3 on is the §7.1 roadmap, with per-track
-detail under `plan/`.
+The live ladder — mainline M10.3 → M11 → M12 plus the side-tracks — is §7.1, with
+per-track detail under `plan/`. Climbed rungs (v0/M1 through M10.2) are recorded in
+`HISTORY.md`.
 
 ### 2.5 Replacement order and the oracle for each swap
 
@@ -168,9 +144,12 @@ A td disk carries exactly three kinds of content:
 generation's image is mounted read-only (providing `/gnu/store` and the system
 profile); activation materializes `/etc`, `/run`, `/tmp` from the declaration.
 `/etc` is never persistent and never merged — configuration changes by building a
-new generation, full stop. (Staged: M10.3 still boots the per-generation ext4 roots
-M10.2 places; the tmpfs-root assembly lands together with M11's sealing — a root
-the boot path writes to cannot be sealed.)
+new generation, full stop. (Staged: M10.2 stages each generation's root *content* as
+a tarball; M10.3 turns those into per-generation **read-only ext4 images** and boots
+them; the tmpfs-root assembly lands together with M11's sealing — a root the boot
+path writes to cannot be sealed. ext4 here is only the container format for a
+read-only image — and M11's dm-verity data device — not a traditional read-write
+filesystem; `td-state` remains the only one of those on the disk.)
 
 **Persistence is default-deny and declared.** The typed config carries a
 persistent-paths allowlist; each entry is bind-mounted from `td-state` at boot, and
@@ -284,8 +263,7 @@ lesson is that vehicle choice can sink a milestone):
   reset; that is *test isolation*, not a ban on persistence within a test.
   `/gnu/store` and the declaration are immutable. What may persist on a machine is
   default-deny and declared: only allowlisted paths on `td-state` survive a
-  generation swap (the §2.6 state model; 2026-06-10 — supersedes the v0 wording
-  "there is no persistent writable state"). Never stash mutable state outside the
+  generation swap (the §2.6 state model). Never stash mutable state outside the
   declared boundary to make something work.
 - **Definition of done.** A passing test, reproducible, committed as a small
   increment. If "done" is undefined, the agent declares victory early.
@@ -323,23 +301,21 @@ on green via the §7.2 landing protocol:
    requires explicit human sign-off, regardless of justification. Adding or
    strengthening rungs and assertions is always free.
 
-(History: M1–M2 merged on green; M3–M10.2 were gated per-milestone and signed off —
-dates in `HISTORY.md`. That per-milestone gate is retired in favor of the
-pre-approved roadmap.)
+(The retired per-milestone sign-off gate and its dates: `HISTORY.md`.)
 
 ---
 
 ## 5. Guix-specific decisions
 
-None block v0, but naming them prevents surprises.
+Standing posture decisions; naming them prevents surprises.
 
-- **Guile for v0.** Embrace it; the typed front-end comes later and compiles to gexps.
+- **Guile.** Embrace it; the typed front-end compiles down to gexps (§2.2).
 - **Rust coexistence.** Deferred. Document later how Rust components sit alongside the
   Guile-based daemon when that milestone arrives.
 - **Free-software posture.** Strict FSDG — follow Guix's free-software guidelines. No
   nonfree firmware, blobs, or crates; no `nonguix` channel. If a task appears to need
   nonfree code, STOP and ask.
-- **Substitutes / build-farm trust.** Local builds only at v0. Revisit trust-agnostic
+- **Substitutes / build-farm trust.** Local builds only. Revisit trust-agnostic
   substitution (decentralized build attestation) much later.
 
 ---
@@ -347,46 +323,19 @@ None block v0, but naming them prevents surprises.
 ## 6. Parking lot / open questions
 
 Things raised that aren't current decisions — kept here so they aren't lost and don't
-expand scope. (2026-06-10: several graduated to §7.1 roadmap side-tracks — the qcow2
-overlay/CoW reset is `loop-latency`, FHS-like OCI roots is `fhs-app-images`, and the
-offline-posture follow-up is `offline-isolation`. Their entries below stand as the
-original context.)
+expand scope. An item leaves this list by graduating to the §7.1 roadmap (with human
+approval) or by being resolved (record in `HISTORY.md`); it is then deleted here, not
+annotated.
 
-- Pin the exact kernel version `tests/boot.scm` asserts (derived from `channels.scm`);
-  record it once the first build lands.
-- Upgrade VM reset from fresh-image-per-test to `qcow2` overlay / CoW snapshots once
-  loop latency demands it (§1.5).
 - How Rust components will eventually coexist with the Guile daemon (§5).
-- Trust-agnostic substitution / decentralized build attestation, post-v0 (§5).
-- **FHS-like OCI root filesystems (post-v0).** Eventual OCI images should present a
-  traditional FHS layout (`/usr/bin`, `/lib`, …) instead of Guix's `/gnu/store`
-  symlink farm. M5 starts from Guix's native store-based `docker` image as the
-  reproducibility oracle; FHS flattening is a later step on top.
-- **Guix-free enforcement (how M7 actually holds).** The image-swap-only model has no
-  per-package `guix install`; you build a whole image and swap it wholesale. Making
-  that guix-free is enforced in two layers, because deleting `guix-service-type` alone
-  isn't sufficient (a manifest package can still drag guix into the closure directly,
-  via a propagated input, a runtime reference, or a renamed package, and no static
-  name check catches all of those):
-  1. an **embedded build gate** — `td-config->operating-system` prepends the
-     `guix-free-marker` (`(system td-hardening)`), a build-time package that fails if
-     any `/bin/guix` is in the closure of the manifest packages. It builds on every
-     lowering, so manifest-injected guix fails the build. It's manifest-scoped, so it
-     can't see service-injected guix.
-  2. a **whole-system gate** — `guix-free-system-gate` builds a derivation over the
-     entire folded system closure and fails if any `/bin/guix` is anywhere in it,
-     catching service-injected guix. It can't be embedded (it would reference the
-     system containing it), so `make no-guix` applies it over the shipped `td-system`.
-
-  `make no-guix` proves both on the bare public lowering: the hardened image builds,
-  the artifact is reproducible, no `/bin/guix` in its `layer.tar` (the `#t` control
-  still ships it), an adversarial manifest smuggling guix past the pre-filter fails at
-  the embedded marker, and a service-injection fixture fails at the whole-system gate.
-  An absent binary can't run, which is stronger than a negative runtime test.
-  Re-baselining the shipped default to guix-free surfaced one real dependency
-  `guix-service-type` had provided as a side effect — sshd's privsep dir `/var/empty`
-  (root:root 0755, via the build-user accounts); the guix-free system restores it with
-  `guix-free-privsep-service`, proven by the boot rung (key-based SSH still logs in).
+- Trust-agnostic substitution / decentralized build attestation (§5).
+- **composefs** (re-parked from M11): reconsider if/when cross-generation dedup earns
+  its place — it would replace, not extend, the per-generation-image design, and is
+  not in the pinned Guix.
+- **Decoupling image from slot** (§2.7): one image placeable in any slot, root chosen
+  at place time; not needed by M12.
+- **M12 key distribution** (§2.7): how the target gets the verifying public key —
+  decide in `plan/m12.md` when the track starts.
 
 ---
 
@@ -406,10 +355,14 @@ as the acceptance test stated here is met or strengthened.
 
 **Mainline** (serial — each builds on the last; one agent drives it at a time):
 
-- **M10.3 — manual rollback.** From a disk carrying two placed generations, the
-  marionette test boots generation N, asserts its identity (root label / system),
-  reboots selecting generation N−1 from the GRUB menu, and asserts the older
-  identity; placed state persists across the reboot. Detail: `plan/m10.md`.
+- **M10.3 — manual rollback + declared persistence.** From a disk carrying two
+  placed generations, the marionette test boots generation N, asserts its identity
+  (root label / system), reboots selecting generation N−1 from the GRUB menu, and
+  asserts the older identity. Persistence is asserted per the §2.6 state model, in
+  both directions: a declared `td-state` allowlist path written under generation N
+  persists into the N−1 boot; an undeclared write does not follow the swap. (§2.6,
+  settled 2026-06-10, governs over older "placed state persists" wording.) Detail:
+  `plan/m10.md`.
 - **M11 — verified generations.** A generation's root carries build-time integrity
   metadata; booting an intact generation succeeds while a corrupted root fails closed
   (verified-red by corrupting bytes). Mechanism *(settled 2026-06-10)*: **dm-verity
@@ -464,7 +417,9 @@ directly on a shared checkout of main. To land:
 No PRs and no human merge step; the human reviews asynchronously on main and may
 revert. "Validated" means green against the main actually landed on — landing
 without a green full check is a contract violation. Claims: one agent per track,
-recorded on the track's status line in `PLAN.md` (a tiny standalone commit to main).
+recorded on the track's status line in `PLAN.md` (a tiny standalone commit to main)
+under a session-unique handle — `PLAN.md` is the single source of truth for claim
+status; generation mechanics live in `CLAUDE.md` "Parallel work".
 
 ### 7.3 Exclusive landings
 

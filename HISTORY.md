@@ -71,8 +71,13 @@ round on 2026-06-10.
   embedded — it would reference the system containing it). `no-guix` proves both on the
   bare public lowering, with an adversarial-manifest and a service-injection fixture each
   verified-red against the gate's own diagnostic. An absent binary can't run — stronger
-  than a negative runtime test. Landed M7.1 (`f2492b6`), M7.2 (`797efc0`). Detail in
-  `(system td-hardening)`.
+  than a negative runtime test. The `no-guix` proof: hardened image builds, artifact
+  reproducible, no `/bin/guix` in its `layer.tar` (the `ship-guix? #t` control still
+  ships it). Re-baselining the shipped default to guix-free surfaced one real
+  dependency `guix-service-type` had provided as a side effect — sshd's privsep dir
+  `/var/empty` (root:root 0755, via the build-user accounts); restored by
+  `guix-free-privsep-service`, proven by the boot rung (key-based SSH still logs in).
+  Landed M7.1 (`f2492b6`), M7.2 (`797efc0`). Detail in `(system td-hardening)`.
 - [x] **M8 — Run the shipped OCI image as a real container.** M5–M7 prove properties of
   the artifact; none ran it. M8 executes the shipped guix-free image as a rootless OCI
   container and asserts its userspace runs (positive sentinel + negative control). Runtime

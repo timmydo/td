@@ -1,8 +1,9 @@
 # Track: fhs-app-images (side-track)
 
-**Status:** UNCLAIMED.
-**Origin:** DESIGN §6 parking lot; re-scoped by M9 (FHS belongs to *app* images —
-the base stays a minimal store-based container host).
+**Claim status:** see `PLAN.md` (the single source of truth for claims).
+**Origin:** graduated from the DESIGN §6 parking lot to the §7.1 roadmap; re-scoped
+by M9 (FHS belongs to *app* images — the base stays a minimal store-based container
+host).
 **Scope authority:** DESIGN §7.1.
 
 ## Goal

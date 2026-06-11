@@ -1,7 +1,7 @@
 # Track: loop-latency (side-track)
 
-**Status:** DONE — landed 2026-06-10 (claude-fable). Acceptance met: see
-"Results" at the bottom.
+**Status:** DONE — landed 2026-06-10. Acceptance met: see "Results" at the bottom.
+(Claim status lives in `PLAN.md`, the single source of truth for claims.)
 **Origin:** DESIGN §1.3 (loop latency is a tracked metric) and §1.5 (the named
 upgrade path: qcow2 overlay / CoW reset).
 **Scope authority:** DESIGN §7.1.

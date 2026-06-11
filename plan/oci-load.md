@@ -1,6 +1,6 @@
 # Track: oci-load (side-track)
 
-**Status:** UNCLAIMED.
+**Claim status:** see `PLAN.md` (the single source of truth for claims).
 **Origin:** deferred from M10.1 — the generation image is structurally a valid
 2-layer OCI image but was never verified to LOAD into a foreign runtime.
 **Scope authority:** DESIGN §7.1.

@@ -1,6 +1,6 @@
 # Track: offline-isolation (side-track)
 
-**Status:** UNCLAIMED.
+**Claim status:** see `PLAN.md` (the single source of truth for claims).
 **Origin:** standing follow-up first surfaced in M6 (see HISTORY.md "Offline posture").
 **Scope authority:** DESIGN §7.1.
 

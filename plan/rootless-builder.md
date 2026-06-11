@@ -1,6 +1,6 @@
 # Track: rootless-builder (side-track)
 
-**Status:** UNCLAIMED.
+**Claim status:** see `PLAN.md` (the single source of truth for claims).
 **Origin:** deferred from M10.1 (the generation image still builds via the daemon).
 **Scope authority:** DESIGN §7.1.
 

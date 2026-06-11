@@ -7,11 +7,13 @@ state: `plan/<track>.md` (single writer — the claiming agent). Completed miles
 "Parallel work" / DESIGN §7.2–7.4.
 
 Claim a track by putting your handle + date on its line (one tiny standalone commit
-to main, pushed). One agent per track; release the claim when you land or stop.
+to main, pushed). Handles are session-unique — generation mechanics in `CLAUDE.md`
+"Parallel work". One agent per track; release the claim when you land or stop. This
+file is the **single source of truth for claim status** (track files don't carry it).
 
 ## Mainline (serial — one agent drives it at a time)
 
-- [ ] **M10.3 manual rollback** — CLAIMED claude-fable 2026-06-10 — `plan/m10.md`
+- [ ] **M10.3 manual rollback + declared persistence** — CLAIMED claude-fable 2026-06-10 — `plan/m10.md`
 - [ ] **M11 verified generations** — blocked on M10.3 — split out of `plan/m10.md` when started
 - [ ] **M12 signed distribution** — blocked on M11
 
@@ -25,9 +27,7 @@ to main, pushed). One agent per track; release the claim when you land or stop.
 
 ## The loop (reminder)
 
-17 rungs: `eval diff typed-coverage oci-diff manifest-diff generation-diff build test
-boot-disk reset oci manifest-check generation-image place no-guix run container`.
-eval → differentials → `guix build --check` → marionette tests; the six structural
-rungs run serial-first, heavy rungs two at a time (`make -j2`), a red still
-short-circuits. Don't advance a sub-task until green. Small commits, each stating
-which test now passes.
+One command: `./check.sh`. The `check:` line in the `Makefile` is the authoritative
+rung list (don't restate it here); the structural rungs run serial-first, the heavy
+rungs two at a time (`make -j2`), and a red still short-circuits. Don't advance a
+sub-task until green. Small commits, each stating which test now passes.
