@@ -11,9 +11,10 @@ or ostree. We take the convention — a bootable OCI image you extract and boot 
 write our own small placer. We almost certainly don't ship the bootc binary itself.
 
 ## How a generation flows
-1. **Build.** An unprivileged (rootless) Guix builder produces the OS components —
-   kernel, initrd, userspace — and assembles them into a bootc-style OCI image.
-   Reproducible; passes `guix build --check`.
+1. **Build.** Guix builds the OS components — kernel, initrd, userspace — and
+   assembles them into a bootc-style OCI image (today via the daemon; the rootless
+   builder is the deferred `rootless-builder` side-track). Reproducible; passes
+   `guix build --check`.
 2. **Distribute.** It's an ordinary OCI image. Push/pull via any registry.
 3. **Place.** On the target (which has no guix), a small tool unpacks the image into
    its own per-generation root and adds a GRUB menu entry. The entry points at that
@@ -98,25 +99,27 @@ fail-closed property (EROFS on undeclared writes). A root the boot path writes t
 cannot be sealed, so tmpfs-root and verity are one move, not two.
 
 ## Still open — answer each when its rung needs it, with a test
-- Unprivileged build: a user-namespace guix-daemon, or build entirely inside the
-  container we already use?
+- Unprivileged build (user-namespace guix-daemon vs. building inside the container
+  we already use): deferred to the `rootless-builder` side-track —
+  `plan/rootless-builder.md` owns the question now.
 
-## Rough milestones (gated on sign-off)
-- **M10.1** — build a reproducible bootc-style td image (the generation bundle), AND
+## Milestone ladder (all landed — records in `HISTORY.md`)
+- [x] **M10.1** — build a reproducible bootc-style td image (the generation bundle), AND
   define the per-generation root: a distinct root artifact + how the GRUB entry/initrd
   selects it, replacing today's fixed `td-root` label. The boot path must mount *this*
   generation's root, not a shared one — that's what makes rollback real.
-- **M10.2** — guix-free place + GRUB menu update + prune, on the target.
-- **M10.3** — manual-rollback test: boot generation N, boot N-1 from the menu, assert.
+- [x] **M10.2** — guix-free place + GRUB menu update + prune, on the target.
+- [x] **M10.3** — manual-rollback test: boot generation N, boot N-1 from the menu, assert.
 
 Verified generations *(mechanism settled 2026-06-10 — normative in DESIGN §7.1 M11)*:
 **dm-verity over the per-generation root image**. What M10.3 should know now:
 
 - The per-gen ext4 image survives M11 unchanged — it becomes the verity data device,
   mounted read-only. Build it exactly as planned.
-- Keep root *selection* thin: `root=LABEL=td-root-gen-N` is replaced at M11 by
-  `root=/dev/dm-0 dm-mod.create=…` (root hash on the cmdline), so don't grow label
-  plumbing beyond what the rollback test needs.
+- Keep root *selection* thin: `root=td-root-gen-N` (the bare-label spec Guix's
+  initrd parses — the M10.3 spike killed the dracut-style `LABEL=` spelling) is
+  replaced at M11 by `root=/dev/dm-0 dm-mod.create=…` (root hash on the cmdline),
+  so don't grow label plumbing beyond what the rollback test needs.
 - Nothing may write into the root at first boot — the image must be sealable
   (the §2.6 "tmpfs-root and verity are one move" point).
 - Cheap first rung when M11 starts: confirm the pinned linux-libre config has

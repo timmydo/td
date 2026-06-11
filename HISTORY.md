@@ -158,7 +158,7 @@ round on 2026-06-10.
     FAIL when mutated out; the per-entry checker flags a swapped block (4 fails) and a missing
     root.tar, and is gen-1/gen-10 boundary-safe.
 
-- [x] **M10.3 — manual rollback** (`rollback` rung; landed 2026-06-11, first roadmap
+- [x] **M10.3 — manual rollback** (`rollback` rung; landed 2026-06-10, first roadmap
   entry under the §7 merge-on-green protocol — no per-milestone sign-off). The DESIGN
   §7.1 acceptance test, end to end: from a disk carrying two placed generations, boot
   generation 2 (the GRUB default), assert its identity, select generation 1 via the

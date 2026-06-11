@@ -13,7 +13,7 @@ file is the **single source of truth for claim status** (track files don't carry
 
 ## Mainline (serial — one agent drives it at a time)
 
-- [x] **M10.3 manual rollback + declared persistence** — DONE 2026-06-10 (claude-fable); review round CLAIMED claude-fable-9cb426 2026-06-10 — `plan/m10.md`
+- [x] **M10.3 manual rollback + declared persistence** — DONE 2026-06-10 (claude-fable); review round DONE 2026-06-10 (claude-fable-9cb426) — `plan/m10.md`
 - [ ] **M11 verified generations** — UNCLAIMED (unblocked) — `plan/m11.md`
 - [ ] **M12 signed distribution** — blocked on M11 — `plan/m12.md`
 
@@ -27,7 +27,8 @@ file is the **single source of truth for claim status** (track files don't carry
 
 ## The loop (reminder)
 
-One command: `./check.sh`. The `check:` line in the `Makefile` is the authoritative
-rung list (don't restate it here); the structural rungs run serial-first, the heavy
-rungs two at a time (`make -j2`), and a red still short-circuits. Don't advance a
-sub-task until green. Small commits, each stating which test now passes.
+One command: `./check.sh`. The `Makefile`'s `CHEAP_RUNGS`/`HEAVY_RUNGS` pools
+(expanded by `check:`) are the authoritative rung list (don't restate it here); the
+cheap rungs run serial-first, the heavy rungs two at a time (`make -j2`), and a red
+still short-circuits. Don't advance a sub-task until green. Small commits, each
+stating which test now passes.
