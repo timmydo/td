@@ -542,28 +542,32 @@ no-guix:
 	echo "   ok: service-injected guix was REJECTED at the whole-system gate (the hole the manifest-only marker leaves open is closed)"; \
 	echo "PASS: ship-guix? #f is a closure-level, build-enforced guarantee — (1) the embedded MARKER refuses any manifest-injected guix on every bare lowering; (2) the whole-system GATE certifies the shipped td-system guix-free and REJECTS service-injected guix (guix-service-type restored) that the marker cannot see; and the control ships the surface, proving the probes discriminate."
 
-# td-builder S1 toolchain probe (DESIGN §7.1 side-track; plan/td-builder.md).
-# Before any rung can DEPEND on td's own builder, we must prove the pinned
-# channel's Rust toolchain (warmed on the host store, DESIGN §5) can compile it
-# at all — OFFLINE, inside the check.sh sandbox. This is that proof, the first
-# rung of the first Guix-component replacement (§2.5 discipline). It is
-# self-discriminating and reproducible:
-#   • lower the td-builder package to a drv (tests/td-builder-drv.scm), build it
-#     offline, and `guix build --check` it bit-for-bit (prime directive 1 — a
-#     non-reproducible builder is a FAILING test, and --check re-runs the
-#     compile so a toolchain regression reds this rung on the next loop);
-#   • RUN the compiled binary and assert it prints its sentinel — proves the
-#     toolchain produced a WORKING executable, a stronger claim than "cargo
-#     build exited 0". Verified-red: break ../builder/src/main.rs (a syntax
-#     error reds the build; a wrong/removed sentinel reds the run) — evidence in
-#     plan/td-builder.md;
-#   • record closure size (`guix size`) and wall-clock compile time for the
-#     loop-latency budget (§1.3; plan/td-builder.md "Measurement log").
+# td-builder S1 toolchain probe + S2 NAR differential (DESIGN §7.1 side-track;
+# plan/td-builder.md). The growing rung of the first Guix-component replacement
+# (§2.5 discipline) — each sub-task adds a leg, none is ever removed:
+#   • S1: lower the td-builder package to a drv (tests/td-builder-drv.scm),
+#     build it offline, `guix build --check` it bit-for-bit (prime directive 1;
+#     --check re-runs the compile, so a toolchain regression reds the loop),
+#     RUN the binary and assert its sentinel (the toolchain produced a WORKING
+#     executable — stronger than "cargo build exited 0"), and record closure
+#     size + compile wall-clock (§1.3). The crate's unit tests (FIPS SHA-256
+#     vectors, NAR framing/sort) also run inside the build (#:tests? #t).
+#   • S2: NAR DIFFERENTIAL — td-builder's own NAR serializer + SHA-256
+#     (`nar-hash`) must agree with the hash the DAEMON recorded in its DB
+#     (query-path-info via tests/td-builder-nar.scm, printing NAR=<path> <hash>
+#     pairs) for (1) a constructed fixture covering every node type and
+#     framing edge (executable bit, dangling symlink, empty file/dir,
+#     codepoint-order sort stress, pad-to-8 content lengths) and (2)
+#     td-builder's own output. This is open question 2 settled by test: the
+#     serialization the eventual builder registers outputs with is bit-for-bit
+#     the daemon's. Verified-red (driven before this leg may land):
+#     ordering/padding defects in nar.rs each red it — evidence in
+#     plan/td-builder.md.
 # OFFLINE PRECONDITION (DESIGN §5): the pinned Rust closure must be warm in the
 # host store — the loop fetches nothing. Two-step lower-then-realise (repl ->
 # guix build) for an honest exit status, as in the other rungs.
 td-builder:
-	@echo ">> td-builder: the pinned Rust toolchain compiles a reproducible, working td-builder offline (S1)"
+	@echo ">> td-builder: reproducible offline build (S1) + daemon NAR differential (S2)"
 	@set -euo pipefail; \
 	drv=`$(GUIX) repl $(LOAD) tests/td-builder-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the td-builder derivation" >&2; exit 1; }; \
@@ -577,9 +581,25 @@ td-builder:
 	echo ">> run: the compiled binary must print its sentinel"; \
 	"$$out/bin/td-builder" | grep -Eq '^td-builder [0-9.]+ ok$$' \
 	  || { echo "FAIL: the compiled td-builder did not print its sentinel (or exited nonzero) — the toolchain did not produce a working binary." >&2; exit 1; }; \
+	echo ">> S2: NAR differential — td-builder nar-hash vs the daemon's recorded hash"; \
+	pairs=`$(GUIX) repl $(LOAD) tests/td-builder-nar.scm 2>/dev/null | sed -n 's/^NAR=//p'`; \
+	test -n "$$pairs" || { echo "ERROR: could not compute the oracle NAR pairs (tests/td-builder-nar.scm)" >&2; exit 1; }; \
+	n=0; \
+	while read -r p expect; do \
+	  test -n "$$p" -a -n "$$expect" || { echo "ERROR: malformed oracle pair: '$$p $$expect'" >&2; exit 1; }; \
+	  have=`"$$out/bin/td-builder" nar-hash "$$p"` \
+	    || { echo "FAIL: td-builder nar-hash failed on $$p" >&2; exit 1; }; \
+	  test "$$have" = "sha256:$$expect" \
+	    || { echo "FAIL: NAR hash mismatch for $$p" >&2; \
+	         echo "      td-builder: $$have" >&2; \
+	         echo "      daemon    : sha256:$$expect" >&2; exit 1; }; \
+	  echo "   nar ok ($$have): $$p"; \
+	  n=$$((n + 1)); \
+	done <<< "$$pairs"; \
+	test "$$n" -ge 2 || { echo "FAIL: expected at least 2 oracle NAR pairs (fixture + td-builder output), got $$n" >&2; exit 1; }; \
 	echo ">> closure size:"; $(GUIX) size "$$out" | tail -n1; \
 	echo "   compile wall-clock: $${elapsed}s (first run; warm store thereafter)"; \
-	echo "PASS: the pinned Rust toolchain compiled a reproducible, working td-builder offline (S1)."
+	echo "PASS: reproducible offline build (S1); NAR serialization bit-for-bit equal to the daemon's recorded hashes across $$n items (S2)."
 
 # 7. M8 run rung — execute the SHIPPED OCI image as a real rootless OCI container
 #    (crun) and assert its userspace runs. Every rung above proves a PROPERTY of

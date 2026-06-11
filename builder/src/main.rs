@@ -5,21 +5,63 @@
 //! equivalent to the pinned `guix-daemon` (prime directive 4 — the daemon is
 //! the oracle; never replace without a differential).
 //!
-//! This file is the S1 milestone only: the *toolchain probe*. It is a
-//! hello-world skeleton whose sole job is to prove the pinned channel's Rust
-//! toolchain compiles td-builder OFFLINE inside the check.sh sandbox and yields
-//! a working, reproducible executable. The real builder grows here:
-//!   • S2 — a NAR serializer + hasher, bit-for-bit equal to the daemon's;
-//!   • S3 — an ATerm `.drv` parser + a userns build sandbox + store registration;
+//! Grown rung by rung, each with its own daemon differential:
+//!   • S1 — toolchain probe: the bare invocation prints a stable sentinel the
+//!     `td-builder` rung greps (proves the COMPILED BINARY ran — stronger than
+//!     "cargo build exited 0");
+//!   • S2 — `nar-hash PATH`: NAR serializer + SHA-256, bit-for-bit equal to
+//!     the daemon's recorded hash (the rung's S2 leg diffs them);
+//!   • S3 — an ATerm `.drv` parser + a userns build sandbox + store
+//!     registration;
 //!   • S4 — the daemon-vs-td-builder store differential, as a check.sh rung.
-//!
-//! Keeping S1 a genuine hello-world is deliberate: the smallest change that
-//! turns one test (the `td-builder` rung) green (CLAUDE.md "Definition of done").
 
-fn main() {
-    // A stable sentinel the `td-builder` rung greps for. Printing it proves the
-    // COMPILED BINARY ran — a stronger claim than "cargo build exited 0", which
-    // a broken runtime could still satisfy. The version comes from Cargo.toml so
-    // the sentinel tracks the crate as it grows.
-    println!("td-builder {} ok", env!("CARGO_PKG_VERSION"));
+mod nar;
+mod sha256;
+
+use std::path::Path;
+use std::process::ExitCode;
+
+/// Adapter: stream Write into the hasher.
+struct HashWriter(sha256::Sha256);
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn nar_hash(path: &str) -> Result<String, std::io::Error> {
+    let mut w = HashWriter(sha256::Sha256::new());
+    nar::write_nar(&mut w, Path::new(path))?;
+    Ok(format!("sha256:{}", sha256::to_base16(&w.0.finalize())))
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        // S1 sentinel — the rung's run leg greps for this exact line.
+        None => {
+            println!("td-builder {} ok", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Some("nar-hash") if args.len() == 3 => match nar_hash(&args[2]) {
+            Ok(h) => {
+                println!("{h}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("td-builder: nar-hash {}: {e}", args[2]);
+                ExitCode::FAILURE
+            }
+        },
+        _ => {
+            eprintln!("usage: td-builder            # print the S1 sentinel");
+            eprintln!("       td-builder nar-hash PATH");
+            ExitCode::from(2)
+        }
+    }
 }

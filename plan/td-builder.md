@@ -51,13 +51,14 @@ equal to the root daemon, so oracle authority transfers).
 
 ## Open questions (decide here, in order)
 
-1. **Interface seam: daemon protocol vs CLI.** (a) Speak the daemon's socket
-   protocol so the unmodified `guix` client drives td-builder — the strongest
-   single-variable differential, same philosophy as the rootless rung; or
-   (b) a standalone `td-build DRV` CLI — simpler, but the differential then
-   varies builder *and* client path together. Probe (a)'s surface at the pin
-   (nix/libstore/worker-protocol.hh) before choosing; the answer may be
-   staged (CLI first, protocol later) if the protocol surface is large.
+1. **Interface seam: daemon protocol vs CLI.** DECIDED 2026-06-11
+   (claude-fable-a03d13): **staged — CLI first.** Probed
+   `nix/libstore/worker-protocol.hh` at the pin: 34 worker ops; a `guix`
+   client expects the query surface (path info, references, valid paths …) to
+   work, so protocol-first means implementing most of a store before the
+   first build differential can run. The S2–S4 differentials drive td-builder
+   directly (subcommand CLI); protocol compatibility is re-examined when the
+   §6 loop-convergence follow-on graduates.
 2. **NAR serialization + hashing.** Must be bit-for-bit identical to the
    daemon's; deserves its own early differential (the daemon's recorded
    `info.hash` / `guix archive` as oracle) and its own verified-red, before
@@ -141,6 +142,33 @@ guix/guix-daemon — only the rung's *crate-level* legs could be exercised there
   the binary built but printed `td-builder 0.1.0 NOPE`, so the rung's
   `grep -Eq '^td-builder [0-9.]+ ok$'` assertion fails. RESTORED → green
   (`td-builder 0.1.0 ok`).
+
+### S2 — NAR differential (in progress, claude-fable-a03d13, 2026-06-11)
+
+Oracle semantics confirmed at the pin (`guix/serialization.scm`
+`write-file`/`filter/sort-directory-entries`): directory entries sorted
+`string<?` (codepoint order), `.`/`..` removed; strings framed u64-LE length +
+UTF-8 bytes + zero-pad to 8; regular files are `executable` iff
+`mode & 0o100`; symlink target via `readlink`, written verbatim.
+
+Implementation decisions:
+- **Zero-dep stays:** SHA-256 hand-rolled in the crate (`src/sha256.rs`) with
+  FIPS vectors as unit tests — `#:tests?` flips to `#t` (the S1 review
+  reminder). Hashing here is an integrity computation whose correctness the
+  differential itself proves against the daemon; not a security boundary.
+- `src/nar.rs` streams the serialization into the hasher (no buffering of
+  whole files); `td-builder nar-hash PATH` prints `sha256:<base16>`. Bare
+  invocation keeps printing the S1 sentinel (that rung leg is unchanged).
+- **Oracle pairs** come from the daemon's own DB via `query-path-info`
+  (`tests/td-builder-nar.scm` prints `NAR=<path> <base16>`): (a) a constructed
+  fixture (computed-file) covering every node type — regular, empty regular,
+  executable, symlink, nested dir, empty dir — plus sort-stress names
+  (`B` vs `a` vs `a-b`: codepoint order, catches case-insensitive or
+  locale sorts) and a >8-byte/odd-length content for padding; (b) td-builder's
+  own output (a real store item). The rung's S2 leg compares td vs daemon for
+  every pair.
+- Verified-red plan: ordering defect (reverse sort) and padding defect (pad to
+  4) each must red the S2 leg; evidence below when driven.
 
 ### S1 guix-loop validation (claude-fable-a03d13, 2026-06-11 — takeover of PR #2)
 

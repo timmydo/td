@@ -47,19 +47,20 @@
     (build-system cargo-build-system)
     (arguments
      (list
-      ;; No dependencies at S1 — nothing to vendor, so the build is offline by
-      ;; construction. The skeleton has no unit tests yet; the `td-builder` rung
-      ;; provides the behavioral assertion (it RUNS the binary), so skip the
-      ;; cargo test phase rather than assert on an empty suite.
+      ;; No dependencies — nothing to vendor, so the build is offline by
+      ;; construction (S2 keeps it that way: SHA-256 is hand-rolled in the
+      ;; crate). Unit tests are real as of S2 (FIPS vectors, NAR framing/sort)
+      ;; and run in the build — the S1 review round's reminder honored.
       #:cargo-inputs '()
       #:cargo-development-inputs '()
-      #:tests? #f))
-    (synopsis "td's own builder (S1 toolchain probe)")
+      #:tests? #t))
+    (synopsis "td's own builder (S2: NAR serializer + SHA-256)")
     (description
      "td-builder is td's own builder: a Rust binary that will execute a
 @code{.drv} in a user-namespace sandbox and register the output, proven
-behaviorally equivalent to the pinned @code{guix-daemon}.  At the S1 milestone
-it is a hello-world skeleton that proves the pinned channel's Rust toolchain
-compiles td-builder offline and reproducibly inside the check.sh sandbox.")
+behaviorally equivalent to the pinned @code{guix-daemon}.  As of S2 it
+compiles offline and reproducibly inside the check.sh sandbox (S1) and
+serializes store items to NAR with a hash bit-for-bit equal to the daemon's
+recorded one (@code{td-builder nar-hash}, the rung's S2 differential).")
     (home-page "https://github.com/timmydo/td")
     (license license:gpl3+)))
