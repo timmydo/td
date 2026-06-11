@@ -290,11 +290,14 @@ Drive from the §7.1 roadmap: one agent drives the next mainline milestone; othe
 agents take side-tracks in parallel. Every agent states its sub-task and names or
 writes its test before writing implementation.
 
-### 4.3 Human checkpoints *(streamlined 2026-06-10)*
+### 4.3 Human checkpoints *(streamlined 2026-06-10; PR review gate added 2026-06-11)*
 
-Exactly two things require the human; everything else on the roadmap — including
-security-flavored milestones, `channels.scm` bumps, and oracle re-baselines — merges
-on green via the §7.2 landing protocol:
+Two things require human sign-off on a change's *substance*; everything else on the
+roadmap — including security-flavored milestones, `channels.scm` bumps, and oracle
+re-baselines — merges on green via the §7.2 landing protocol. (Since 2026-06-11 that
+protocol routes every landing through a PR with a mandatory human approval — a
+per-landing review of the *diff*, not a return of the retired per-milestone
+spec-approval gate; the two checkpoints below remain the only substance gates):
 
 1. **Roadmap additions.** New tracks or milestones enter §7.1 only with human
    approval. Approving an entry's acceptance test *is* the spec-correctness review,
@@ -456,53 +459,57 @@ run concurrently):
   isolation probe) is the rung's skeleton. Vehicle and toolchain posture: §5.
   Follow-on swaps (td-check, evaluator-as-library, loop convergence) are parked
   in §6 until they earn their own entries. `plan/td-builder.md`.
-- **ci-gate** *(approved 2026-06-11)* — a self-hosted GitHub Actions runner
-  executes the **unmodified** `./check.sh` for every candidate landing and posts
-  the verdict as a commit status; once this track is green, that verdict is the
-  binding landing gate (§7.2 amendment, 2026-06-11). Acceptance: a green
-  candidate branch produces a passing check run and the same SHA fast-forwards
-  onto branch-protected main; a deliberately red candidate (broken assertion on
-  a branch — the verified-red) produces a failing check run and branch
-  protection rejects its fast-forward. CI only: distribution/CD automation
-  waits for M12 and a future entry. Runner-host selection (t5700g excluded —
-  standing immutable-infra rule; its daemon is the owner's machine state, per
-  the offline-isolation rescope), provisioning, and constraints:
-  `plan/ci-gate.md`.
+- **ci-gate** *(approved 2026-06-11; re-decided to PR form later that day)* — a
+  self-hosted GitHub Actions runner executes the **unmodified** `./check.sh`
+  for every PR into branch-protected main and posts the verdict as a check;
+  once the runner is live, that check is required to merge alongside the
+  mandatory human review (§7.2). Acceptance: a green candidate PR shows a
+  passing `check` run and merges (rebase/squash) onto protected main; a
+  deliberately red candidate (broken assertion on a branch — the verified-red)
+  shows a failing `check` run and branch protection blocks its merge. CI only:
+  distribution/CD automation waits for M12 and a future entry. Runner-host
+  selection (t5700g excluded — standing immutable-infra rule; its daemon is
+  the owner's machine state, per the offline-isolation rescope), provisioning,
+  and constraints: `plan/ci-gate.md`.
 
-### 7.2 Landing protocol — merge on green
+### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
 Each agent works one claimed track in its **own git worktree/branch** — never
-directly on a shared checkout of main. To land:
+directly on a shared checkout of main. Main is branch-protected: no direct
+pushes; every landing is a pull request gated on required CI checks and one
+human approval (`.github/BRANCH-PROTECTION.md` is the setup/operations note).
+To land:
 
 1. fetch and rebase onto latest `origin/main`;
 2. run the **full** `./check.sh` — it must be green;
-3. fast-forward main to the branch and push;
-4. if main moved while checking, go to 1.
+3. push the branch and mark its PR ready for review; CI re-runs the gate
+   (hosted `lint` + the full `./check.sh` on the self-hosted runner);
+4. on green CI and human approval, rebase- or squash-merge (merge commits are
+   disabled — history stays linear, as under the old fast-forward rule);
+5. if main moved meanwhile, go to 1.
 
-No PRs and no human merge step; the human reviews asynchronously on main and may
-revert. "Validated" means green against the main actually landed on — landing
-without a green full check is a contract violation.
-
-*Amendment (2026-06-11; binding once the ci-gate side-track's acceptance test is
-green, inert until then):* step 3 becomes gated — push the candidate branch, let
-the self-hosted runner execute the full `./check.sh`, and fast-forward main only
-on a runner-green check. Branch protection on main requires that check on the
-landed SHA, so the runner's verdict completes "validated"; step 2 (the local full
-check) remains required pre-push discipline — runner green never substitutes for
-it. Still no PRs and no human merge. The runner's check counts toward the §7.3
-two-concurrent-checks ceiling only if the runner shares a host with dev checks;
-on its own host, stagger landings as a courtesy.
+The human approval replaces the old "no human merge step; review-after on
+main", and this PR protocol supersedes the same-day no-PR amendment (the human
+re-decided later on 2026-06-11: PRs with mandatory review, not status-gated
+fast-forwards). The runner's `./check.sh` check joins the required checks once
+the ci-gate runner is live (until then `lint` is required and step 2 is the
+only full-loop gate); it counts toward the §7.3 two-concurrent-checks ceiling
+only if the runner shares a host with dev checks — on its own host, stagger
+landings as a courtesy. "Validated" still means green against the main
+actually merged into — opening a ready PR with a locally-red or un-run full
+`./check.sh` is a contract violation (CI verifies the agent's run; it does
+not replace it).
 
 Claims: one agent per track, recorded on the track's status line in `PLAN.md`
-(a tiny standalone commit to main) under a session-unique handle — `PLAN.md` is
-the single source of truth for claim status; generation mechanics live in
-`CLAUDE.md` "Parallel work".
+as the first commit of the track branch, published by opening the PR as a
+draft — claim status is `PLAN.md` on main plus the open PRs' claim edits;
+generation mechanics live in `CLAUDE.md` "Parallel work".
 
 ### 7.3 Exclusive landings
 
 Changes touching the shared spine — `system/td.scm` (the frozen oracle), `check.sh`,
 `Makefile`, `channels.scm`, `DIGESTS.md` — collide with every other agent. Land them
-as small standalone commits, announced in your track file; everyone else rebases.
+as small standalone PRs, announced in your track file; everyone else rebases.
 Oracle re-baselines (which rewrite `DIGESTS.md`) and channel-pin bumps are the
 canonical cases. These are coordination rules, not sign-off gates — but remember
 §4.3(2): *weakening* anything in the spine still needs the human.

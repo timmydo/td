@@ -1,25 +1,28 @@
 # Track: ci-gate (side-track)
 
-**Claim status:** see `PLAN.md` (the single source of truth for claims).
+**Claim status:** see `PLAN.md`.
 **Origin:** roadmap addition approved by the human 2026-06-11 (self-hosted CI
 direction; the CD half — automated signed-image distribution — is deliberately
-deferred to a post-M12 entry).
+deferred to a post-M12 entry). **Re-decided later the same day** (human, in
+the GH-CI-CD session): landings go through **PRs with mandatory human review**,
+superseding the original no-PR/status-gated-fast-forward form; the human
+enabled branch protection on main directly in the GitHub UI that day.
 **Scope authority:** DESIGN §7.1.
 
 ## Goal
 
-A self-hosted GitHub Actions runner executes the **unmodified** `./check.sh` for
-every candidate landing and posts the verdict as a commit status. Once this
-track's acceptance test is green, that verdict is the binding landing gate — the
-§7.2 amendment (2026-06-11) self-arms.
+A self-hosted GitHub Actions runner executes the **unmodified** `./check.sh`
+for every PR into branch-protected main and posts the verdict as the `check`
+check (workflow: `.github/workflows/ci.yml`). Once the runner is live, `check`
+joins `lint` as a required check; merging needs green checks + one approving
+review (DESIGN §7.2).
 
 ## Acceptance
 
-- A green candidate branch produces a passing check run, and the same SHA
-  fast-forwards onto branch-protected main.
+- A green candidate PR shows a passing `check` run and (with approval)
+  rebase/squash-merges onto branch-protected main.
 - **Verified-red:** a deliberately red candidate (e.g. a broken assertion on a
-  branch) produces a failing check run, and branch protection rejects the
-  fast-forward of that SHA.
+  branch) shows a failing `check` run, and branch protection blocks its merge.
 - The runner runs `./check.sh` as-is: hermetic `guix shell -C --pure`,
   substitutes disabled, channels-pin guard intact.
 
@@ -50,14 +53,33 @@ track's acceptance test is green, that verdict is the binding landing gate — t
 
 ## Suggested sub-task ladder
 
-1. Pick and provision the runner host (guix matching the pin; daemon for now).
-2. Register the runner; workflow runs `./check.sh` on pushes to candidate
-   branches and main; green candidate shows a passing check run.
-3. Verified-red: a red branch produces a failing check run.
-4. Enable branch protection on main requiring the check; prove a green SHA
-   fast-forwards and a red SHA is rejected.
-5. Announce here that the gate is armed; agents adopt the gated §7.2 step 3.
+1. Land the workflow (`lint` + self-hosted `check`), the protection setup
+   script, and the §7.2 PR-protocol docs. [DONE — see Working state]
+2. Human: machine account for agent pushes/PRs + `gh auth login`; run
+   `./.github/setup-branch-protection.sh` (lint required).
+3. Pick and provision the runner host (guix matching the pin; daemon for now;
+   NOT t5700g).
+4. Register the runner (labels `guix,kvm`); a green candidate PR shows a
+   passing `check` run.
+5. Verified-red: a red branch produces a failing `check` run and its PR is
+   blocked.
+6. Human: `./.github/setup-branch-protection.sh --require-runner-check`;
+   announce here that the gate is fully armed.
 
 ## Working state
 
-(claiming agent: notes here)
+- 2026-06-11 claude-fable-52ceb1: claimed; this work began in the GH-CI-CD
+  session before the track entry landed, then was reconciled onto it. Landed
+  in this change: `.github/workflows/ci.yml` (hosted `lint` — structural only;
+  self-hosted `check` — unmodified `./check.sh`, labels `guix,kvm`, SHA-pinned
+  checkout), `.github/setup-branch-protection.sh` (protect-main ruleset: PRs
+  only, 1 review, required checks, linear history; `--require-runner-check`
+  flips `check` to required), `.github/BRANCH-PROTECTION.md` (setup guide),
+  and the §7.2/CLAUDE/PLAN PR-protocol reconciliation. Design fork resolved by
+  the human 2026-06-11: PR + mandatory review wins over the no-PR amendment.
+  Verified: full `./check.sh` green pre-push; lint steps dry-run green against
+  the tree. Open: machine account (PR authors can't self-approve), runner host
+  (t5700g excluded), private-repo plan caveat (free plan does not enforce
+  protection on private repos — see BRANCH-PROTECTION.md §1).
+- The track's verified-red (red branch → failing `check` run → blocked PR)
+  needs the live runner; it is step 5 above, not yet run.

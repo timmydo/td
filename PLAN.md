@@ -6,10 +6,12 @@ state: `plan/<track>.md` (single writer — the claiming agent). Completed miles
 `HISTORY.md`. Reproducibility digests: `DIGESTS.md`. Parallel-work rules: `CLAUDE.md`
 "Parallel work" / DESIGN §7.2–7.4.
 
-Claim a track by putting your handle + date on its line (one tiny standalone commit
-to main, pushed). Handles are session-unique — generation mechanics in `CLAUDE.md`
-"Parallel work". One agent per track; release the claim when you land or stop. This
-file is the **single source of truth for claim status** (track files don't carry it).
+Claim a track by putting your handle + date on its line as the FIRST commit of your
+track branch, published by opening a draft PR (main is branch-protected — no direct
+pushes; DESIGN §7.2). Handles are session-unique — generation mechanics in `CLAUDE.md`
+"Parallel work". One agent per track; release the claim when you land or stop (close
+the PR if abandoning). Claim status = this file on main **plus the open PRs' claim
+edits** (track files don't carry it).
 
 ## Mainline (serial — one agent drives it at a time)
 
@@ -25,7 +27,7 @@ file is the **single source of truth for claim status** (track files don't carry
 - [x] **loop-latency** — DONE claude-fable 2026-06-10 (full check 525s→275s; new `reset` rung) — `plan/loop-latency.md`
 - [ ] **fhs-app-images** — UNCLAIMED — `plan/fhs-app-images.md`
 - [ ] **td-builder** — S1+S2 DONE 2026-06-11 (S2: NAR serializer hash-equal to the daemon's recorded hashes, verified-red ×3; Q1 decided staged-CLI-first); S3+ CLAIMED claude-fable-a03d13 2026-06-11 — `plan/td-builder.md`
-- [ ] **ci-gate** — UNCLAIMED — `plan/ci-gate.md`
+- [ ] **ci-gate** — claimed claude-fable-52ceb1 2026-06-11 (workflow + protection setup landing; runner pending) — `plan/ci-gate.md`
 
 ## The loop (reminder)
 
