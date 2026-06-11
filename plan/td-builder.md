@@ -73,9 +73,10 @@ equal to the root daemon, so oracle authority transfers).
 
 ## Sub-task ladder (draft — refine as probes land)
 
-- [ ] **S1 toolchain probe** — the pinned channel's Rust toolchain (warmed on
+- [~] **S1 toolchain probe** — the pinned channel's Rust toolchain (warmed on
   the host) compiles a hello-world td-builder inside the check.sh sandbox,
   offline. Records closure size and compile time (loop-latency budget, §1.3).
+  IMPLEMENTED, pending a green-loop run on a guix host (see Working state).
 - [ ] **S2 NAR differential** — td's NAR serializer hashes a store item
   bit-for-bit equal to the daemon's recorded hash; verified-red by a
   perturbation (e.g. ordering or padding defect).
@@ -91,5 +92,66 @@ equal to the root daemon, so oracle authority transfers).
 
 ## Working state
 
-(unclaimed — first claimant: put your handle in PLAN.md and start with S1 and
-open question 1.)
+**Claimed:** claude-fable-49b6d6, 2026-06-11. Starting with S1 (toolchain
+probe) — the prerequisite every later sub-task depends on. Open question 1
+(daemon protocol vs CLI) is NOT yet decided; it does not block S1, which only
+needs the crate to compile and run.
+
+### S1 — toolchain probe (implemented; awaiting a green-loop run)
+
+What landed in this increment:
+
+- `builder/` — the Rust crate. `src/main.rs` is a hello-world skeleton that
+  prints a stable sentinel `td-builder <version> ok`; `Cargo.toml` declares a
+  zero-dependency binary crate (offline by construction — nothing to vendor);
+  `Cargo.lock` is committed (pinned, deterministic, no resolver network step);
+  `.gitignore` keeps `target/` out of the tree.
+- `system/td-builder.scm` — the `td-builder` Guix package, built with the
+  pinned channel's `cargo-build-system` + rust toolchain. Source is a
+  `local-file` of `../builder` that excludes `target/`/`.cargo/`, so a stray
+  local `cargo build` cannot perturb the derivation hash. `#:cargo-inputs '()`,
+  `#:tests? #f` (the rung supplies the behavioral assertion by RUNNING the
+  binary, not an empty unit suite).
+- `tests/td-builder-drv.scm` — two-step lower-then-realise driver: prints
+  `DRV=…`; the build and honest pass/fail happen in `guix build`.
+- `Makefile` — new `td-builder` rung in `HEAVY_RUNGS` (rung count 21→22): lower
+  → build offline → `guix build --check` (reproducibility; re-runs the compile)
+  → RUN the binary and assert its sentinel → record `guix size` + wall-clock.
+- `tests/eval.scm` — loads `(system td-builder)` so the fast `eval` rung catches
+  a syntax/binding error in the new module sub-second.
+
+Shared-spine note (DESIGN §7.3 exclusive landing): this touches `Makefile` and
+`tests/eval.scm`. Announced here; landing expects others to rebase.
+
+### Verified-red (S1)
+
+The `td-builder` rung has two assertion legs; both were driven red against the
+SAME defects the rung is built to catch. Full guix-loop evidence must be
+captured on a guix-capable host (the implementing container had no
+guix/guix-daemon — only the rung's *crate-level* legs could be exercised there):
+
+- **A — compile leg (syntax defect).** Appended `fn broken( {` to
+  `src/main.rs`; `cargo build --release --offline` failed
+  (`error: this file contains an unclosed delimiter` / `could not compile`).
+  In the rung this is the `guix build "$drv"` step going red. RESTORED → green.
+- **B — run leg (wrong sentinel).** Changed the format string `… ok` → `… NOPE`;
+  the binary built but printed `td-builder 0.1.0 NOPE`, so the rung's
+  `grep -Eq '^td-builder [0-9.]+ ok$'` assertion fails. RESTORED → green
+  (`td-builder 0.1.0 ok`).
+
+STILL OWED on a guix host before S1 is "done" (CLAUDE.md Definition of done):
+run `./check.sh td-builder` and confirm it goes GREEN (including
+`guix build --check` reproducibility); re-confirm RED A/B through the full rung,
+not just `cargo`; then fill the Measurement log below and flip S1 to [x] in
+PLAN.md. The `eval` rung must also be green with the new module loaded.
+
+### Measurement log (§1.3 — fill from a real run)
+
+| metric | value | notes |
+|--------|-------|-------|
+| td-builder closure size | _TBD_ | `guix size $out \| tail -n1` (rust runtime closure) |
+| first compile wall-clock | _TBD_ | cold-ish; warm store thereafter |
+| crate-level compile (rustup, not the rung) | ~9.3s | local sanity only; NOT the loop number |
+
+Open questions 1–4 (protocol seam, NAR, DB registration, sandbox parity) remain
+to decide before S2/S3.

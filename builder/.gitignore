@@ -1,0 +1,5 @@
+# Cargo build output — never committed. The td-builder package's source is the
+# committed tree only (Cargo.toml, Cargo.lock, src/); the (system td-builder)
+# local-file additionally excludes target/ from the derivation so a local
+# `cargo build` can never perturb the reproducibility oracle's input hash.
+/target

@@ -1,0 +1,18 @@
+[package]
+name = "td-builder"
+version = "0.1.0"
+edition = "2021"
+description = "td's own builder — executes a .drv in a user-namespace sandbox and registers the output (DESIGN §7.1)"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "td-builder"
+path = "src/main.rs"
+
+# S1 is the toolchain probe: no dependencies, so the crate compiles OFFLINE in
+# the check.sh sandbox with nothing fetched. Dependencies arrive later (S2+) and
+# must be free crates vendored through the pinned channel (FSDG — plan/td-builder.md).
+
+[profile.release]
+# Keep the release profile explicit and minimal so the reproducibility oracle
+# (`guix build --check`) has a stable target as the binary grows.
