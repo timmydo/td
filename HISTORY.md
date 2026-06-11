@@ -221,6 +221,61 @@ round on 2026-06-10.
     variant B (gen-2's menuentry vandalized in-guest → "menu still lists BOTH" FAILs).
     Full evidence in `plan/m10.md`.
 
+- [x] **M11 — verified generations** (`rollback` rung grown to 36 asserts across
+  THREE boots; landed 2026-06-11). The DESIGN §7.1 acceptance: a generation's root
+  carries build-time integrity metadata; booting an intact generation succeeds while
+  a corrupted root fails closed. Mechanism as settled: **dm-verity over the
+  per-generation root image**, ChromeOS-style, plus the §2.6 tmpfs-root assembly
+  (a root the boot path writes to cannot be sealed). What it took:
+  - **Probes first (S0, the M8 lesson).** Pinned kernel: `CONFIG_DM_VERITY=m`,
+    `CONFIG_BLK_DEV_DM=y`, but `CONFIG_DM_INIT` unset — the `dm-mod.create=`
+    cmdline path is out; the device opens in userspace from the initrd. Guix's
+    `cryptsetup-static` is built `--disable-veritysetup`, so td defines
+    `veritysetup-static` ((system td-verity), 17 modest drvs, offline-buildable).
+  - **Reproducible hash tree (S1).** The placer's `--mkfs` rounds the ext4 data
+    area to whole 4 KiB verity blocks, APPENDS the hash tree (fixed salt
+    "td-verity-salt-v0", the identity's deterministic UUID), self-verifies, and
+    records `verity-roothash`/`verity-hashoffset` beside the boot files — the image
+    cannot carry its own root hash (§2.7 self-reference). place-check (1d) verifies
+    the verity superblock byte-level (magic/version/uuid/algorithm/block
+    sizes/data-blocks/salt) and that the ext4 area covers the data blocks EXACTLY.
+  - **The sealed boot (S2).** Generation systems now declare: `/` = tmpfs (no
+    `root=` on the cmdline at all — activation assembles /etc, /run, /tmp); the
+    generation image (now the gnu/store SUBTREE as ext4) opened in the initrd's
+    pre-mount as `/dev/mapper/td-root` by a td mapped-device kind (static
+    veritysetup; `td.roothash=`/`td.hashoffset=` parsed from the cmdline — written
+    by the placer's menuentry; the data partition still found by the
+    per-generation LABEL, the slot binding, now UNDER the verifying layer) and
+    mounted READ-ONLY at /gnu/store, fail closed by construction (no fallback
+    path). All generation-gated: the default config still lowers byte-identically
+    to the frozen oracle (typed-diff re-proven). The reshaped rollback rung asserts
+    per boot: recorded roothash on the cmdline (not the other generation's), no
+    root=, store IS the verity device whose only slave is the labeled partition,
+    / is tmpfs, every store mount ro down to the ext4 superblock, the rw remount
+    REFUSED by the kernel, undeclared store write EROFS — plus all M10.3
+    state-model/persistence asserts unchanged.
+  - **A false-green caught by verified-red (the discipline paying rent):** the
+    naive EROFS probe passed even on a deliberately UNSEALED variant —
+    %base-file-systems' `%immutable-store` ro BIND (software convention,
+    remountable) sits on /gnu/store of every Guix system. The probe now remounts
+    the top bind rw and asserts the SUPERBLOCK rw remount is refused — only the
+    read-only dm-verity device enforces that — separating §2.6 "enforcement" from
+    "convention" in the test itself.
+  - **Fail-closed acceptance (S3).** Boot 3: roll forward to gen-2, corrupt ONE
+    sector of the first data block of gen-2's gnu.load boot script in the overlay
+    (debugfs-located, guarded inside the verity data area; label and ext4
+    superblock kept INTACT so discovery and mount succeed exactly as on a healthy
+    system — only verification can catch it), boot: the kernel logs the dm-verity
+    corruption signature and the system never assembles (no shepherd — a marker
+    boot 2 positively proves on the same serial channel). First attempt corrupted
+    the superblock instead and failed closed at LABEL DISCOVERY — a failure an
+    unsealed system shares, i.e. not integrity evidence; retargeted.
+  - Verified-red: R12–R23 (S1 byte-level tampers), variant E (swapped expected
+    roothashes → exactly the two cmdline asserts), menu tampers V1–V3, the
+    unsealed variant H (exactly the 12 sealing asserts across both boots),
+    generation-diff (d) read-only-drop, variant I (corruption neutralized →
+    exactly the fail-closed assert). Full evidence in `plan/m11.md`.
+
 ## Key lessons (full narrative — condensed normative versions live in CLAUDE.md)
 
 - **Verified-red discipline.** A green behavioral rung is only meaningful once you've SEEN
