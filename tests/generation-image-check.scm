@@ -21,6 +21,14 @@
 ;;       in the initrd and require the set to equal {its own} — so gen-10 passed as
 ;;       gen-1 fails (boundary-aware, not a substring match) and an unexpected
 ;;       gen-7 would fail too (forbids ALL other generations, not a fixed list).
+;;   (5) identity BINDING (M10.3) — boot/td-identity carries generation=N and
+;;       root-label= (what the placer verifies), system= EQUAL to the typed
+;;       compiler's lowered system path for this generation AND present in the
+;;       image's own USERSPACE layer (so the GRUB entry the placer writes —
+;;       gnu.system=/gnu.load= — names a path that exists in the root it boots:
+;;       the bundle is bootable, not just bootable-looking), and root-uuid= EQUAL
+;;       to the deterministic per-OS UUID (operating-system-uuid 'dce) the placer
+;;       gives the mkfs'd root.
 ;;
 ;; Listings are read to EOF via open-pipe* (execs tar directly — no /bin/sh, and
 ;; no SIGPIPE/pipefail trap that a `tar | grep -q` pipeline would hit), and we
@@ -29,6 +37,10 @@
 ;; Run via `guix repl` so (json)/(zlib)/the rnrs ports are on the load path. Exits
 ;; non-zero on any failure.
 (use-modules (guix build utils)
+             (guix)                     ;with-store, run-with-store, mbegin
+             (guix monads)              ;%store-monad, mbegin
+             (gnu system)               ;operating-system-derivation, -uuid
+             (gnu system uuid)          ;uuid->string
              (json)
              (zlib)
              (rnrs io ports)
@@ -158,9 +170,32 @@
                                    (not (member tok acc)))
                               (cons tok acc) acc))))))))))
 
-;; Validate one bootc image. EXPECT-LABEL is this generation's root label; the
-;; initrd must embed EXACTLY it and no other generation's label.
-(define (check-bootc-image label img expect-label)
+;; Parse boot/td-identity ("key=value" lines) into an alist.
+(define (parse-identity file)
+  (filter-map (lambda (line)
+                (let ((i (string-index line #\=)))
+                  (and i (cons (substring line 0 i) (substring line (+ i 1))))))
+              (string-split (call-with-input-file file get-string-all)
+                            #\newline)))
+
+;; The typed compiler's lowered system path for generation N — what the
+;; identity's system= must equal (and what the placer's menu will boot). Cheap:
+;; derivation computation only, nothing is built. Mirrors the operating-system
+;; gexp compiler exactly (set-guile-for-build first — without it the lowering
+;; yields a DIFFERENT system derivation than the one the image embeds).
+(define (expected-system-path n)
+  (with-store store
+    (set-build-options store #:use-substitutes? #f #:offload? #f)
+    (derivation->output-path
+     (run-with-store store
+       (mbegin %store-monad
+         (set-guile-for-build (default-guile))
+         (operating-system-derivation
+          (td-config->operating-system (td-config #:generation n))))))))
+
+;; Validate one bootc image for generation N. EXPECT-LABEL is this generation's
+;; root label; the initrd must embed EXACTLY it and no other generation's label.
+(define (check-bootc-image label img n expect-label)
   (let ((dest (string-append scratch "/" label)))
     (extract img dest)
     (check-oci-wellformed label dest)
@@ -204,9 +239,56 @@
               (fail "~a: initrd embeds FOREIGN root label(s) ~s — expected only ~s (wrong/cross root selection)"
                     label
                     (filter (lambda (x) (not (string=? x expect-label))) found)
-                    expect-label)))))
+                    expect-label))))
+          ;; (5) identity BINDING — td-identity must say what this image IS
+          ;; (generation/root-label, verified by the placer) and what makes it
+          ;; BOOT (system=/root-uuid=, consumed by the placer's menu + mkfs).
+          (let ((idf (string-append into "/boot/td-identity")))
+            (if (not (file-exists? idf))
+                (fail "~a: boot layer carries no boot/td-identity" label)
+                (let* ((id        (parse-identity idf))
+                       (id-gen    (assoc-ref id "generation"))
+                       (id-label  (assoc-ref id "root-label"))
+                       (id-system (assoc-ref id "system"))
+                       (id-uuid   (assoc-ref id "root-uuid"))
+                       (exp-sys   (expected-system-path n))
+                       (exp-uuid  (uuid->string
+                                   (operating-system-uuid
+                                    (td-config->operating-system
+                                     (td-config #:generation n))
+                                    'dce))))
+                  (unless (equal? id-gen (number->string n))
+                    (fail "~a: identity generation=~s != expected ~a" label id-gen n))
+                  (unless (equal? id-label expect-label)
+                    (fail "~a: identity root-label=~s != expected ~s"
+                          label id-label expect-label))
+                  (unless (equal? id-uuid exp-uuid)
+                    (fail "~a: identity root-uuid=~s != deterministic per-OS uuid ~s"
+                          label id-uuid exp-uuid))
+                  (cond
+                   ((not (equal? id-system exp-sys))
+                    (fail "~a: identity system=~s != the typed compiler's system path ~s"
+                          label id-system exp-sys))
+                   (else
+                    ;; The system the menu will gnu.system=/gnu.load= must EXIST
+                    ;; in the root the menu mounts — i.e. in a USERSPACE layer
+                    ;; (not the boot layer): bootable, not bootable-looking.
+                    (let* ((userspace (remove
+                                       (lambda (lt)
+                                         (string=? lt (string-append
+                                                       boot-hex "/layer.tar")))
+                                       (manifest-layers dest)))
+                           (sys-boot (string-append (substring exp-sys 1)
+                                                    "/boot")))
+                      (unless (any (lambda (lt)
+                                     (listing-has?
+                                      (tar-list (string-append dest "/" lt))
+                                      sys-boot))
+                                   userspace)
+                        (fail "~a: identity system ~s (+ /boot) is NOT in any userspace layer — the GRUB entry would point at a path missing from the root it boots"
+                              label exp-sys)))))))))
         (when (zero? failures)
-          (format #t "  ok: ~a carries /boot wired into manifest+config (well-formed); initrd selects exactly ~s~%"
+          (format #t "  ok: ~a carries /boot wired into manifest+config (well-formed); initrd selects exactly ~s; identity binds gen/label/system/uuid~%"
                   label expect-label)))))))
 
 ;; The plain userspace image must carry NO /boot AT ALL (the discriminator) — any
@@ -231,15 +313,17 @@
 
 (format #t "~%== M10.1 bootc image artifact validation ==~%")
 (format #t "  gen1 expected root: ~s   gen2 expected root: ~s~%" gen1-label gen2-label)
-(check-bootc-image "gen1" (must "TD_GEN1_IMG") gen1-label)
-(check-bootc-image "gen2" (must "TD_GEN2_IMG") gen2-label)
+(check-bootc-image "gen1" (must "TD_GEN1_IMG") 1 gen1-label)
+(check-bootc-image "gen2" (must "TD_GEN2_IMG") 2 gen2-label)
 (check-no-boot "base" (must "TD_BASE_IMG"))
 
 (if (zero? failures)
     (begin
       (format #t "PASS: both bootc images carry /boot WIRED into well-formed OCI \
-metadata (field-specific), the userspace image has none, and each generation's \
-initrd selects EXACTLY its own per-generation root.~%")
+metadata (field-specific), the userspace image has none, each generation's \
+initrd selects EXACTLY its own per-generation root, and each identity binds \
+generation/root-label/system/root-uuid with system= present in the userspace \
+layer the menu will boot.~%")
       (exit 0))
     (begin
       (format #t "~a check(s) failed.~%" failures)
