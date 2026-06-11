@@ -81,9 +81,12 @@ equal to the root daemon, so oracle authority transfers).
   DONE 2026-06-11: implemented by claude-fable-49b6d6 (PR #2, no guix there);
   guix-loop validation + review round by claude-fable-a03d13 (see Working
   state — "S1 guix-loop validation").
-- [ ] **S2 NAR differential** — td's NAR serializer hashes a store item
+- [x] **S2 NAR differential** — td's NAR serializer hashes a store item
   bit-for-bit equal to the daemon's recorded hash; verified-red by a
-  perturbation (e.g. ordering or padding defect).
+  perturbation (e.g. ordering or padding defect). DONE 2026-06-11
+  (claude-fable-a03d13): `nar-hash` agrees with the daemon's DB across the
+  full-coverage fixture + td-builder's own output; verified-red ×3 (ordering,
+  padding, executable-flag — see Working state "S2 — NAR differential").
 - [ ] **S3 drv parse + trivial build** — parse the ATerm `.drv`, execute the
   trivial probe drv in a userns sandbox, register the output; NAR-hash-equal
   to the oracle, at the same store path.
@@ -143,7 +146,7 @@ guix/guix-daemon — only the rung's *crate-level* legs could be exercised there
   `grep -Eq '^td-builder [0-9.]+ ok$'` assertion fails. RESTORED → green
   (`td-builder 0.1.0 ok`).
 
-### S2 — NAR differential (in progress, claude-fable-a03d13, 2026-06-11)
+### S2 — NAR differential (DONE 2026-06-11, claude-fable-a03d13)
 
 Oracle semantics confirmed at the pin (`guix/serialization.scm`
 `write-file`/`filter/sort-directory-entries`): directory entries sorted
@@ -167,8 +170,19 @@ Implementation decisions:
   locale sorts) and a >8-byte/odd-length content for padding; (b) td-builder's
   own output (a real store item). The rung's S2 leg compares td vs daemon for
   every pair.
-- Verified-red plan: ordering defect (reverse sort) and padding defect (pad to
-  4) each must red the S2 leg; evidence below when driven.
+- Verified-red — driven 2026-06-11, all via `./check.sh td-builder`, each
+  exit ≠ 0 (note the layering: the crate's unit tests are a FIRST line that
+  reds the BUILD leg; the differential leg catches what they miss):
+  - **ordering defect** (`entries.reverse()` after sort): rung red at the
+    build leg — the crate's own sort unit test fails inside `guix build`.
+  - **padding defect** (pad-to-4 instead of 8): rung red at the build leg —
+    the framing unit test fails.
+  - **executable-flag defect** (`if false` on the mode test — a defect NO
+    unit test covers): rung red at the S2 DIFFERENTIAL leg itself:
+    `FAIL: NAR hash mismatch for …-td-nar-fixture` —
+    td `sha256:1209ce1a…` vs daemon `sha256:4d21079b…` — proving the
+    daemon-recorded-hash comparison discriminates independently of the unit
+    suite.
 
 ### S1 guix-loop validation (claude-fable-a03d13, 2026-06-11 — takeover of PR #2)
 

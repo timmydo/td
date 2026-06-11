@@ -24,7 +24,7 @@ file is the **single source of truth for claim status** (track files don't carry
 - [x] **oci-load** — DONE claude-fable-a03d13 2026-06-11 (new `oci-load` rung: skopeo foreign-loads the plain + gen-1 images into canonical OCI layouts, rejects a corrupted layer; §2.7 manifest-digest identity recorded in DIGESTS.md; verified-red ×4) — `plan/oci-load.md`
 - [x] **loop-latency** — DONE claude-fable 2026-06-10 (full check 525s→275s; new `reset` rung) — `plan/loop-latency.md`
 - [ ] **fhs-app-images** — UNCLAIMED — `plan/fhs-app-images.md`
-- [ ] **td-builder** — S1 DONE 2026-06-11 (implemented claude-fable-49b6d6/PR #2, guix-loop validated + review round claude-fable-a03d13); S2+ CLAIMED claude-fable-a03d13 2026-06-11 — `plan/td-builder.md`
+- [ ] **td-builder** — S1+S2 DONE 2026-06-11 (S2: NAR serializer hash-equal to the daemon's recorded hashes, verified-red ×3; Q1 decided staged-CLI-first); S3+ CLAIMED claude-fable-a03d13 2026-06-11 — `plan/td-builder.md`
 
 ## The loop (reminder)
 
