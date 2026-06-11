@@ -66,7 +66,34 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-check: eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk reset oci manifest-check generation-image place no-guix run container
+# Heavy rungs are listed LONGEST-FIRST (LPT packing): under -j2, make starts
+# prerequisites in list order, and seeding the slots with the longest rungs
+# (generation-image, no-guix, manifest-check, …) lets the short ones fill the
+# gaps instead of leaving a long rung to run alone at the end (measured: the
+# naive order left `container` solo for its full 71s). Serial `make -j1 check`
+# is unaffected in SUBSTANCE: the six structural rungs still run first (the
+# dependency chain below), every rung still runs and must pass — only the
+# order among the heavy rungs changes, which encodes no contract.
+check: eval diff typed-coverage oci-diff manifest-diff generation-diff generation-image no-guix manifest-check oci container reset test place build boot-disk run
+
+# Bounded parallelism (loop-latency; measured in plan/loop-latency.md):
+# ./check.sh invokes `make -j2 --output-sync=target check`. The dependency
+# graph below — not target listing order — enforces the ordering that matters
+# for fail-fast: the six sub-5s structural rungs run strictly serial and FIRST
+# (a syntax error or differential regression reds the loop before any VM boots
+# or tarball repacks), then the heavy rungs run at most two at a time (the
+# DESIGN §7.3 resource note: more concurrent VMs may thrash; empirically the
+# daemon overlaps two client builds, 17s->10s on the place trees). NOTHING is
+# removed, loosened, or skipped: all rungs must still pass, and make (run
+# without -k) stops spawning new rungs after a failure — a red still
+# short-circuits the loop. Order-only (|) prerequisites, so a plain serial
+# `make check` behaves exactly as before.
+diff:            | eval
+typed-coverage:  | diff
+oci-diff:        | typed-coverage
+manifest-diff:   | oci-diff
+generation-diff: | manifest-diff
+build test boot-disk reset oci manifest-check generation-image place no-guix run container: | generation-diff
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped

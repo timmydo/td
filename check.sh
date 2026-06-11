@@ -89,6 +89,14 @@ if [ "$#" -eq 0 ]; then
   set -- check
 fi
 
+#   make -j2 --output-sync=target : bounded-parallel loop (loop-latency). The
+#                                Makefile's dependency graph keeps the cheap
+#                                fail-fast rungs strictly serial and first;
+#                                heavy rungs then run at most two at a time
+#                                (per the DESIGN §7.3 resource note), with
+#                                per-target output grouping so failures stay
+#                                readable. All rungs still must pass; a red
+#                                stops new rungs from spawning.
 #   --expose=/sys/fs/cgroup    : the M8 `run` rung runs the shipped OCI image as a
 #                                rootless crun container. crun probes the host
 #                                cgroup hierarchy at startup; inside `-C` the
@@ -108,4 +116,4 @@ exec guix shell -C --pure \
   --share=/var/guix \
   --expose=/sys/fs/cgroup \
   make bash coreutils sed grep findutils tar gzip crun -- \
-  bash -c 'export PATH="'"$hostguix_dir"':$PATH"; export GUIX_BUILD_OPTIONS="--no-substitutes --no-offload"; exec make "$@"' -- "$@"
+  bash -c 'export PATH="'"$hostguix_dir"':$PATH"; export GUIX_BUILD_OPTIONS="--no-substitutes --no-offload"; exec make -j2 --output-sync=target "$@"' -- "$@"
