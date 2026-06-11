@@ -159,7 +159,7 @@ Sub-ladder (gated):
   no drift), preamble preservation, and that pruned gen 1 leaves no root dir AND no menu
   entry. Verified-red on BOTH crux properties: breaking prune (keep-all) reddens the PRUNE
   scenario; writing a shared `td-root` for every gen reddens the root-selection checks.
-  - **M10.2 review round (2026-06-10).** Addressed 6 findings. P1: (1) the placer now
+  - **M10.2 review round (2026-06-10) — signed off.** Addressed 6 findings. P1: (1) the placer now
     APPLIES the userspace layers and stages each generation's root CONTENT at
     `roots/td/gen-N/root.tar` — so `root=LABEL=td-root-gen-N` refers to a root that exists
     (creating the labeled ext4 from it is deferred to M10.3 — signed-off scope split, Option
