@@ -41,6 +41,7 @@
 ;; overlay style as the disk-boot test; the SHIPPED bundles stay untouched.
 (define-module (tests rollback)
   #:use-module (gnu tests)
+  #:use-module (gnu packages linux)        ;e2fsprogs — debugfs (boot 3 target)
   #:use-module (gnu packages virtualization)
   #:use-module ((gnu build marionette) #:select (qemu-command))
   #:use-module (guix gexp)
@@ -105,7 +106,10 @@
                          (srfi srfi-13)
                          (srfi srfi-64)
                          (ice-9 format)
-                         (ice-9 rdelim))
+                         (ice-9 popen)
+                         (ice-9 rdelim)
+                         (rnrs bytevectors)
+                         (rnrs io ports))
 
             (define qemu-img
               (string-append #$qemu-minimal "/bin/qemu-img"))
@@ -483,7 +487,146 @@
                   (and (list? persisted)
                        (string? (list-ref persisted 4))
                        (string-contains (list-ref persisted 4) "--id td-gen-1 ")
-                       (string-contains (list-ref persisted 4) "--id td-gen-2 ")))))
+                       (string-contains (list-ref persisted 4) "--id td-gen-2 "))))
+
+              ;; M11 acceptance, the ACT for boot 3: roll FORWARD — select
+              ;; gen-2 again through the same manual hook, so the next boot
+              ;; targets the generation we are about to corrupt.
+              (test-assert "roll-forward selected: default.cfg now boots td-gen-2 again"
+                (marionette-eval
+                 '(begin
+                    (mkdir "/bootmnt2")
+                    (and (zero? (system* "/run/current-system/profile/bin/mount"
+                                         "/dev/vda1" "/bootmnt2"))
+                         (begin
+                           (call-with-output-file "/bootmnt2/td/default.cfg"
+                             (lambda (p) (display "set default=td-gen-2\n" p)))
+                           (zero? (system* "/run/current-system/profile/bin/umount"
+                                           "/bootmnt2")))))
+                 m2))
+              (catch #t
+                (lambda ()
+                  (marionette-eval
+                   '(begin
+                      (sync)
+                      (system* "/run/current-system/profile/sbin/reboot"))
+                   m2))
+                (lambda args #t))
+              (catch #t
+                (lambda () (waitpid (marionette-pid m2)))
+                (lambda args #f)))
+
+            ;; ---------- boot 3 (M11 §7.1 acceptance): a CORRUPTED root ----
+            ;; ---------- fails CLOSED ------------------------------------
+            ;; Corrupt ONE sector of gen-2's verity-protected DATA area in
+            ;; the overlay, then boot again. The target is chosen so that
+            ;; ONLY integrity verification can catch it: the first data
+            ;; block of gen-2's gnu.load boot script (<system>/boot — the
+            ;; very file the initrd loads right after mounting the store).
+            ;; The ext4 superblock and the label stay INTACT, so partition
+            ;; discovery and the mount succeed exactly as on a healthy
+            ;; system — a label-based unsealed boot would run the corrupted
+            ;; bytes without noticing. Here the first READ of the block must
+            ;; fail closed: the kernel logs the dm-verity corruption
+            ;; signature, the load fails, and the system never assembles
+            ;; (shepherd never starts). No marionette — nothing comes up to
+            ;; connect to; the serial log is the witness.
+
+            ;; Partition N's byte offset, from the pristine disk's MBR
+            ;; (entry base #x1be, 16 bytes each, start-LBA u32 LE at +8).
+            (define (partition-start-bytes disk index)
+              (let ((bv (call-with-input-file disk
+                          (lambda (p)
+                            (seek p (+ #x1be (* 16 index) 8) SEEK_SET)
+                            (get-bytevector-n p 4))
+                          #:binary #t)))
+                (* 512 (bytevector-u32-ref bv 0 (endianness little)))))
+
+            ;; vda1=boot, vda2=gen-1, vda3=gen-2 (index 2), vda4=td-state.
+            (define gen2-start (partition-start-bytes #$disk 2))
+
+            ;; The filesystem block (4096-byte units) holding the first data
+            ;; block of gen-2's boot script, from debugfs over the PRISTINE
+            ;; root.img in the placed tree. <system>/boot is a SYMLINK to a
+            ;; separate -boot store item; resolve it on the build side (the
+            ;; system closure is an input) — the image's fs root IS the
+            ;; store content, so the resolved item lives at /<its basename>.
+            (define gen2-boot-script-block
+              (let* ((img  (string-append #$tree "/roots/td/gen-2/root.img"))
+                     (path (string-append
+                            "/" (basename
+                                 (canonicalize-path
+                                  (string-append #$gen2-os "/boot")))))
+                     (port (open-input-pipe
+                            (string-append
+                             #$e2fsprogs "/sbin/debugfs -R 'blocks " path "' "
+                             img " 2>/dev/null")))
+                     (out  (get-string-all port)))
+                (close-pipe port)
+                (let ((tokens (filter (lambda (s) (not (string-null? s)))
+                                      (string-split (string-trim-both out)
+                                                    #\space))))
+                  (and (pair? tokens) (string->number (car tokens))))))
+
+            (define gen2-hashoffset
+              (string->number
+               (call-with-input-file
+                   (string-append #$tree "/boot/td/gen-2/verity-hashoffset")
+                 read-line)))
+
+            ;; Guard: the target block is real and inside the verity DATA
+            ;; area — otherwise this phase would "fail closed" vacuously.
+            (test-assert "corruption target verified: gen-2's boot script block, inside the verity data area"
+              (and gen2-boot-script-block
+                   (> gen2-boot-script-block 0)
+                   (< (* (+ gen2-boot-script-block 1) 4096) gen2-hashoffset)))
+
+            (test-assert "one sector of gen-2's boot-script data block corrupted in the overlay"
+              (zero? (system* (string-append #$qemu-minimal "/bin/qemu-io")
+                              "-f" "qcow2" "-c"
+                              (format #f "write -P 0xff ~a 512"
+                                      (+ gen2-start
+                                         (* gen2-boot-script-block 4096)))
+                              "overlay.qcow2")))
+
+            (define boot3-serial "serial3.log")
+            (define boot3-command
+              (append vm-command
+                      (list "-display" "none"
+                            "-serial" (string-append "file:" boot3-serial))))
+            (define boot3-pid
+              (let ((pid (primitive-fork)))
+                (if (zero? pid)
+                    (begin
+                      (apply execlp (car boot3-command) boot3-command)
+                      (primitive-exit 127))
+                    pid)))
+
+            (test-assert "boot 3 FAILS CLOSED: dm-verity reports the corruption and the system never assembles"
+              (let loop ((i 0))
+                (let ((txt (and (file-exists? boot3-serial)
+                                (call-with-input-file boot3-serial
+                                  get-string-all))))
+                  (cond ((and txt
+                              (string-contains txt "device-mapper: verity")
+                              (string-contains txt "corrupted"))
+                         ;; The corruption was detected; give the boot a
+                         ;; moment more, then require the system never
+                         ;; ASSEMBLED: shepherd (PID-1 of a successfully
+                         ;; booted td system, visible on the serial console
+                         ;; in boots 1 and 2) never started.
+                         (sleep 5)
+                         (let ((txt (call-with-input-file boot3-serial
+                                      get-string-all)))
+                           (not (string-contains txt "shepherd"))))
+                        ((< i 180) (sleep 1) (loop (+ i 1)))
+                        (else
+                         (format #t "boot 3 serial after timeout:~%~a~%" txt)
+                         #f)))))
+            (kill boot3-pid SIGKILL)
+            (catch #t
+              (lambda () (waitpid boot3-pid))
+              (lambda args #f))
 
             (test-end)
             (exit (zero? (test-runner-fail-count (test-runner-current)))))))
