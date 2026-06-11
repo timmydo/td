@@ -113,6 +113,14 @@ fi
 #                                per-target output grouping so failures stay
 #                                readable. All rungs still must pass; a red
 #                                stops new rungs from spawning.
+#   util-linux + sqlite        : the `rootless` rung needs unshare/mount (the
+#                                nested userns + staged-store binds) and
+#                                sqlite3 (a CONSISTENT snapshot of the host
+#                                store DB via sqlite's backup API — a plain cp
+#                                races against the live daemon's writes). Both
+#                                resolve from the warm store (sqlite is in
+#                                guix's own closure), so the offline contract
+#                                is unchanged.
 #   --expose=/sys/fs/cgroup    : the M8 `run` rung runs the shipped OCI image as a
 #                                rootless crun container. crun probes the host
 #                                cgroup hierarchy at startup; inside `-C` the
@@ -131,5 +139,5 @@ exec guix shell -C --pure \
   --share="$HOME/.cache/guix" \
   --share=/var/guix \
   --expose=/sys/fs/cgroup \
-  make bash coreutils sed grep findutils tar gzip crun -- \
+  make bash coreutils sed grep findutils tar gzip crun util-linux sqlite -- \
   bash -c 'export PATH="'"$hostguix_dir"':$PATH"; export GUIX_BUILD_OPTIONS="--no-substitutes --no-offload"; exec make -j2 --output-sync=target "$@"' -- "$@"
