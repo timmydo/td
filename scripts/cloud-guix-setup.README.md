@@ -12,8 +12,34 @@ becomes runnable, **without weakening the loop** — `check.sh` still runs offli
 |------|------|
 | `scripts/cloud-guix-setup.sh` | Idempotent, phased provisioner: install Guix → start daemon → pin host guix to `channels.scm` → (optional) warm store. |
 | `scripts/cloud-guix-warm.sh` | Heavy phase 4: runs the loop ONCE with substitutes on so `/gnu/store` carries every rung's closure; then `check.sh` finds it all locally. |
-| `.claude/hooks/session-start.sh` | SessionStart hook (web only) that runs the provisioner. |
-| `.claude/settings.json` | Registers the hook. |
+| `scripts/session-start.hook.template` | Copy to `.claude/hooks/session-start.sh` to auto-run the provisioner each web session (opt-in — see below). |
+
+## Wiring the hook (opt-in)
+
+Enabling the SessionStart hook makes the provisioner run automatically on every
+web session, so it is left as a template you copy in deliberately:
+
+```sh
+mkdir -p .claude/hooks
+cp scripts/session-start.hook.template .claude/hooks/session-start.sh
+chmod +x .claude/hooks/session-start.sh
+```
+
+Then register it in `.claude/settings.json` (merge if the file already exists):
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command",
+        "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh" } ] }
+    ]
+  }
+}
+```
+
+The container state is cached after the hook completes, so the install + pin cost
+is paid once and reused by later sessions.
 
 ## How check.sh's preconditions are met
 

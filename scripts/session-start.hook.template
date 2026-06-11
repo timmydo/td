@@ -1,0 +1,15 @@
+#!/bin/bash
+# TEMPLATE — copy to .claude/hooks/session-start.sh (and `chmod +x`) to wire the
+# Guix provisioner as a Claude Code on the web SessionStart hook. Kept here as a
+# committable artifact rather than under .claude/ so enabling the hook (which makes
+# it auto-run every session) stays an explicit, opt-in step. See
+# scripts/cloud-guix-setup.README.md ("Wiring the hook").
+set -euo pipefail
+
+# Only meaningful in the remote (web) environment; on a real Guix host the loop
+# already works and this would be wrong to run.
+if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
+  exit 0
+fi
+
+"${CLAUDE_PROJECT_DIR:-$(pwd)}/scripts/cloud-guix-setup.sh"
