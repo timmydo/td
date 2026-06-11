@@ -99,8 +99,8 @@ then only under the §2.5 differential discipline.
 and ask; never expand scope on your own.** Naming the boundary is what stops an agent
 boiling the ocean.
 
-Named as staying out (off-roadmap today): the Rust build daemon, the unified
-sandbox/portal broker, multi-machine tests, real-hardware/driver work.
+Named as staying out (off-roadmap today): the unified sandbox/portal broker,
+multi-machine tests, real-hardware/driver work.
 
 ### 2.4 Milestone ladder
 
@@ -313,13 +313,26 @@ on green via the §7.2 landing protocol:
 Standing posture decisions; naming them prevents surprises.
 
 - **Guile.** Embrace it; the typed front-end compiles down to gexps (§2.2).
-- **Rust coexistence.** Deferred. Document later how Rust components sit alongside the
-  Guile-based daemon when that milestone arrives.
+- **Rust toolchain** *(decided 2026-06-11)*. Rust is the approved vehicle for
+  td-builder (§7.1). Building the toolchain from source is a **non-goal** right
+  now: the host store may be warmed with substitutes for the pinned channel's
+  Rust closure. The loop itself stays offline/no-substitutes as ever — warm
+  store in, nothing fetched inside.
+- **Package collection** *(standing posture, stated with the td-builder
+  approval 2026-06-11)*. The pinned channel's package definitions remain a
+  source-level **input** — Guix as a package-definition corpus pinned by
+  `channels.scm`, not a runtime system dependency once the §6-parked swaps
+  land. Re-deriving a bootstrap chain or package set is a non-goal; revisit
+  only by roadmap addition (§4.3 gate 1).
 - **Free-software posture.** Strict FSDG — follow Guix's free-software guidelines. No
   nonfree firmware, blobs, or crates; no `nonguix` channel. If a task appears to need
   nonfree code, STOP and ask.
-- **Substitutes / build-farm trust.** Local builds only. Revisit trust-agnostic
-  substitution (decentralized build attestation) much later.
+- **Substitutes / build-farm trust.** *(relaxed 2026-06-11)* Local-build purism
+  is not a current goal: the host store may be warmed from the official
+  substitute servers for pinned-channel closures (the Rust toolchain is the
+  motivating case). Inside the loop, substitutes stay disabled and builds stay
+  offline — that rung is untouched. Revisit trust-agnostic substitution
+  (decentralized build attestation) much later.
 
 ---
 
@@ -330,8 +343,19 @@ expand scope. An item leaves this list by graduating to the §7.1 roadmap (with 
 approval) or by being resolved (record in `HISTORY.md`); it is then deleted here, not
 annotated.
 
-- How Rust components will eventually coexist with the Guile daemon (§5).
 - Trust-agnostic substitution / decentralized build attestation (§5).
+- **td-check** (follow-on to td-builder): own the reproducibility oracle —
+  td-builder's rebuild-and-compare replaces `guix build --check` (semantics
+  already pinned by the rootless track: compare against the recorded NAR hash,
+  refuse invalid outputs). Replacing that rung restructures the loop, so §4.3
+  gate 2 applies when this graduates.
+- **Evaluator as a library** (follow-on to td-builder): drive gexp→drv lowering
+  from td code so the `guix` CLI exits the loop; differential = identical
+  `.drv` hashes both ways. Guile and gexps stay (§2.2, §5).
+- **Loop tooling convergence** (follow-on): td-builder's sandbox replaces
+  `guix shell -C` in `check.sh` — the north star's "one sandbox stack spanning
+  build and run" made literal. Restructures the loop, so §4.3 gate 2 applies
+  when it graduates.
 - **composefs** (re-parked from M11): reconsider if/when cross-generation dedup earns
   its place — it would replace, not extend, the per-generation-image design, and is
   not in the pinned Guix.
@@ -414,6 +438,18 @@ run concurrently):
 - **fhs-app-images** — FHS-style root layout for *app* images (the base stays
   minimal per M9); an FHS app image builds reproducibly and runs on the base host
   rung. `plan/fhs-app-images.md`.
+- **td-builder** *(approved 2026-06-11 — the first Guix-component replacement,
+  under the §2.5 discipline)* — td's own builder: a Rust binary that executes a
+  `.drv` in a user-namespace sandbox and registers the output. Acceptance: the
+  daemon-vs-td-builder store differential, run as a self-discriminating rung —
+  the same drvs (a trivial gexp drv, an environment-sensitive divergence probe,
+  and the system image drv) built both ways yield NAR-hash-equal outputs at
+  identical store paths, with `guix-daemon` as the oracle (prime directive 4);
+  verified-red by a deliberate builder defect the rung catches. The
+  rootless-builder harness (DB snapshot, staged store, validity guards,
+  isolation probe) is the rung's skeleton. Vehicle and toolchain posture: §5.
+  Follow-on swaps (td-check, evaluator-as-library, loop convergence) are parked
+  in §6 until they earn their own entries. `plan/td-builder.md`.
 
 ### 7.2 Landing protocol — merge on green
 
