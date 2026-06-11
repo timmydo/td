@@ -36,6 +36,7 @@
   #:use-module (guix store)
   #:use-module (system td-typed)
   #:use-module (system td-generation)
+  #:use-module (system td-verity)         ;veritysetup-static (--mkfs, M11)
   #:export (td-placed-tree))
 
 ;; Build a target tree by PLACING each generation in GENS (in order, into the
@@ -79,9 +80,10 @@
               (define sh #$(file-append bash "/bin/bash"))
 
               ;; Guix-free by construction: ONLY base tools on PATH, no guix.
-              ;; e2fsprogs + fakeroot appear ONLY for --mkfs (mke2fs, run fake-
-              ;; rooted exactly as Guix's own make-ext-image runs it) — still
-              ;; nothing guix-shaped.
+              ;; e2fsprogs + fakeroot + veritysetup appear ONLY for --mkfs
+              ;; (mke2fs run fakerooted exactly as Guix's own make-ext-image
+              ;; runs it; veritysetup for the M11 appended dm-verity hash
+              ;; tree) — still nothing guix-shaped.
               (setenv "PATH"
                       (string-append #$(file-append coreutils "/bin") ":"
                                      #$(file-append tar "/bin") ":"
@@ -92,7 +94,10 @@
                                             (list ":"
                                                   (file-append e2fsprogs "/sbin")
                                                   ":"
-                                                  (file-append fakeroot "/bin"))
+                                                  (file-append fakeroot "/bin")
+                                                  ":"
+                                                  (file-append veritysetup-static
+                                                               "/sbin"))
                                             '())))
 
               (define target   (string-append (getcwd) "/target"))

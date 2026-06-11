@@ -29,7 +29,11 @@
 #      label and the identity's deterministic UUID (mke2fs -d; reproducible — the
 #      M10.3 disk test `guix build --check`s a tree containing it). Run as root,
 #      or under fakeroot so the filesystem gets root-owned files (that is how
-#      Guix's own image builder runs mke2fs);
+#      Guix's own image builder runs mke2fs). M11: a dm-verity hash tree is then
+#      APPENDED to root.img (fixed salt + identity UUID — still reproducible),
+#      self-verified, and the root hash + hash offset are recorded next to the
+#      generation's boot files (verity-roothash, verity-hashoffset) — the
+#      image cannot carry its own root hash (self-reference, DESIGN §2.7);
 #   5. prunes the placed generations down to the newest --keep (removing older
 #      per-generation roots AND boot dirs AND, by regeneration below, their menu
 #      entries);
@@ -59,6 +63,12 @@ set -eu
 # is regenerated on every run; everything else is the user's and is preserved.
 BEGIN_MARK='# >>> td generations (managed by td-place) >>>'
 END_MARK='# <<< td generations (managed by td-place) <<<'
+
+# M11: the dm-verity salt — FIXED ("td-verity-salt-v0", zero-padded to the
+# 32-byte default) so the appended hash tree, and with it root.img, is
+# bit-reproducible; per-image distinctness comes from the identity's
+# deterministic UUID. Kept in sync with tests/place-check.scm.
+VERITY_SALT=74642d7665726974792d73616c742d7630000000000000000000000000000000
 
 img=; gen=; root_label=; boot_dir=; root_store=; grub_cfg=; keep=
 boot_label=; extra_kernel_args=; mkfs=no
@@ -230,6 +240,8 @@ fi
 if [ "$mkfs" = yes ]; then
   command -v mke2fs >/dev/null 2>&1 || {
     echo "td-place: --mkfs requires mke2fs on PATH" >&2; exit 1; }
+  command -v veritysetup >/dev/null 2>&1 || {
+    echo "td-place: --mkfs requires veritysetup on PATH (dm-verity hash tree, M11)" >&2; exit 1; }
   fsroot="$root_stage/fsroot"
   mkdir -p "$fsroot"
   tar xf "$root_stage/root.tar" -C "$fsroot"
@@ -242,6 +254,10 @@ if [ "$mkfs" = yes ]; then
   touch -d @1 "$fsroot"
   size_kb=$(du -sk "$fsroot" | cut -f1)
   size_kb=$((size_kb + size_kb / 4 + 1024))
+  # M11: the ext4 data area must be a whole number of 4096-byte dm-verity
+  # data blocks — round up so --data-blocks below is exact and the appended
+  # hash area starts on a data-block boundary.
+  size_kb=$(( (size_kb + 3) / 4 * 4 ))
   SOURCE_DATE_EPOCH=1 E2FSPROGS_FAKE_TIME=1 \
   mke2fs -t ext4 -d "$fsroot" \
          -L "$root_label" -U "$img_uuid" \
@@ -250,6 +266,33 @@ if [ "$mkfs" = yes ]; then
   rm -rf "$fsroot"
   [ -s "$root_stage/root.img" ] || {
     echo "td-place: mke2fs produced no root.img for gen $gen" >&2; exit 1; }
+
+  # M11: append the dm-verity hash tree (ChromeOS style — data and hash share
+  # root.img; the hash area starts at the end of the data area). FIXED salt +
+  # the identity's deterministic UUID keep root.img bit-reproducible. The
+  # resulting root hash cannot live inside the image (it covers the data the
+  # file carries — self-reference, DESIGN §2.7), so it is RECORDED next to
+  # this generation's boot files. (The menu does not carry it yet — the boot
+  # switch is M11 S2; until then the records are placement metadata only.)
+  data_bytes=$((size_kb * 1024))
+  veritysetup format "$root_stage/root.img" "$root_stage/root.img" \
+      --hash-offset="$data_bytes" --data-blocks=$((data_bytes / 4096)) \
+      --data-block-size=4096 --hash-block-size=4096 \
+      --salt="$VERITY_SALT" --uuid="$img_uuid" > "$work/verity-format.out"
+  roothash=$(sed -n 's/^Root hash:[[:space:]]*//p' "$work/verity-format.out")
+  case "$roothash" in
+    *[!0-9a-f]*|'')
+      echo "td-place: veritysetup format yielded no usable root hash for gen $gen" >&2
+      exit 1 ;;
+  esac
+  # Gate: the recorded hash must verify the image as built — a placement
+  # whose own integrity metadata does not check out is never placed.
+  veritysetup verify "$root_stage/root.img" "$root_stage/root.img" "$roothash" \
+      --hash-offset="$data_bytes" >/dev/null || {
+    echo "td-place: dm-verity self-verification FAILED for gen $gen — refusing to place" >&2
+    exit 1; }
+  printf '%s\n' "$roothash"   > "$boot_stage/verity-roothash"
+  printf '%s\n' "$data_bytes" > "$boot_stage/verity-hashoffset"
 fi
 
 # --- 3d. Atomic swap: only now replace the live generation. ---------------------

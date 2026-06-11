@@ -19,6 +19,13 @@
 ;;        filesystem: superblock magic 0xEF53, volume LABEL == td-root-gen-N and
 ;;        UUID == the identity's deterministic root-uuid, read STRAIGHT FROM THE
 ;;        SUPERBLOCK bytes (offsets 1024+0x38/0x68/0x78) — no tools, no mounting.
+;;   (1d) VERITY (M11) — with TD_MKFS=1, each generation also records its
+;;        dm-verity root hash + hash offset (boot/td/gen-N/verity-roothash,
+;;        verity-hashoffset), and root.img carries the APPENDED hash tree: a
+;;        well-formed verity superblock at the recorded offset (magic, version,
+;;        identity UUID, sha256, 4096-byte blocks, the fixed td salt) whose
+;;        data_blocks cover EXACTLY the ext4 data area — all read straight from
+;;        the bytes, no tools.
 ;;   (2)  PER-GEN ROOT — present generations' initrds are pairwise DISTINCT (each
 ;;        carries its own generation's root — the M10 crux; a shared initrd would
 ;;        mean rollback boots the same filesystem).
@@ -246,6 +253,39 @@
          (nul (or (list-index zero? lst) (length lst))))
     (list->string (map integer->char (take lst nul)))))
 
+;; Raw bytes at an absolute offset of IMG (the superblock helper above is
+;; ext4-superblock-relative; the M11 verity asserts need absolute seeks).
+;; Short or EOF reads (a truncated image) yield #f, so every caller below
+;; reports a FAIL instead of throwing.
+(define (img-bytes img off len)
+  (let ((bv (call-with-input-file img
+              (lambda (p)
+                (seek p off SEEK_SET)
+                (get-bytevector-n p len))
+              #:binary #t)))
+    (and (bytevector? bv) (= (bytevector-length bv) len) bv)))
+
+(define (le-ref img off len)            ;little-endian unsigned int at OFF
+  (let ((bv (img-bytes img off len)))
+    (and bv
+         (let loop ((i (- len 1)) (acc 0))
+           (if (< i 0)
+               acc
+               (loop (- i 1) (+ (* acc 256) (bytevector-u8-ref bv i))))))))
+
+;; M11: the FIXED dm-verity salt — kept in sync with system/td-place.sh
+;; (VERITY_SALT), like the managed-block markers above.
+(define verity-salt
+  "74642d7665726974792d73616c742d7630000000000000000000000000000000")
+
+(define (bytes->hex bv)
+  (string-concatenate
+   (map (lambda (b) (format #f "~2,'0x" b)) (bytevector->u8-list bv))))
+
+(define (hex-string? s)
+  (and (string? s)
+       (string-every (lambda (c) (string-index "0123456789abcdef" c)) s)))
+
 (when mkfs?
   (for-each
    (lambda (n)
@@ -273,6 +313,79 @@
            (unless (equal? sb-uuid id-uuid)
              (fail "generation ~a: filesystem UUID ~s != identity root-uuid ~s"
                    n sb-uuid id-uuid)))))))
+   present)
+
+  ;; M11: the appended dm-verity hash area. Each placed generation records the
+  ;; root hash + hash offset the placer derived (boot/td/gen-N/verity-roothash,
+  ;; verity-hashoffset); root.img must carry a well-formed verity SUPERBLOCK at
+  ;; that offset (struct verity_sb: magic "verity\0\0", version 1, uuid at +16,
+  ;; algorithm at +32, data/hash block size at +64/+68, data_blocks u64 at +72,
+  ;; salt_size u16 at +80, salt at +88) whose parameters are EXACTLY the
+  ;; placer's contract: 4096-byte blocks, the identity's UUID, sha256, the
+  ;; fixed td salt — and the ext4 DATA area must fill the verity data blocks
+  ;; exactly (ext4 size == data_blocks * 4096 == hash offset), so the data the
+  ;; hash tree covers is precisely the filesystem the menu boots.
+  (for-each
+   (lambda (n)
+     (let* ((d    (gen-dir n))
+            (rh-f (string-append d "/verity-roothash"))
+            (ho-f (string-append d "/verity-hashoffset"))
+            (img  (root-img n)))
+       (cond
+        ((not (and (file-exists? rh-f) (file-exists? ho-f)))
+         (fail "generation ~a: no recorded verity-roothash/verity-hashoffset — root.img carries no usable integrity metadata" n))
+        (else
+         (let ((rh (slurp-line rh-f))
+               (ho (string->number (slurp-line ho-f))))
+           (unless (and (hex-string? rh) (= (string-length rh) 64))
+             (fail "generation ~a: recorded verity-roothash ~s is not a sha256 hex digest" n rh))
+           (cond
+            ((not (and ho (positive? ho) (zero? (remainder ho 4096))))
+             (fail "generation ~a: recorded verity-hashoffset ~s is not a positive 4096-multiple" n ho))
+            ((not (file-exists? img)) #f)  ;already failed above
+            ((not (> (stat:size (stat img)) ho))
+             (fail "generation ~a: root.img (~a bytes) has NO appended hash area beyond the recorded offset ~a"
+                   n (stat:size (stat img)) ho))
+            (else
+             (let ((vmagic (img-bytes img ho 8)))
+               (unless (and (bytevector? vmagic)
+                            (equal? (bytevector->u8-list vmagic)
+                                    ;; "verity\0\0"
+                                    '(#x76 #x65 #x72 #x69 #x74 #x79 0 0)))
+                 (fail "generation ~a: no dm-verity superblock magic at the recorded hash offset ~a" n ho)))
+             (unless (equal? (le-ref img (+ ho 8) 4) 1)
+               (fail "generation ~a: verity superblock version != 1" n))
+             (let ((v-uuid (and=> (img-bytes img (+ ho 16) 16)
+                                  bytes->uuid-string))
+                   (id-uuid (assoc-ref (parse-identity
+                                        (string-append d "/td-identity"))
+                                       "root-uuid")))
+               (unless (equal? v-uuid id-uuid)
+                 (fail "generation ~a: verity superblock UUID ~s != identity root-uuid ~s — the hash tree was not derived for THIS image"
+                       n v-uuid id-uuid)))
+             (let ((algo (and=> (img-bytes img (+ ho 32) 32) bytes->label)))
+               (unless (equal? algo "sha256")
+                 (fail "generation ~a: verity hash algorithm ~s != sha256" n algo)))
+             (unless (and (equal? (le-ref img (+ ho 64) 4) 4096)
+                          (equal? (le-ref img (+ ho 68) 4) 4096))
+               (fail "generation ~a: verity data/hash block size != 4096" n))
+             (let ((blocks (le-ref img (+ ho 72) 8)))
+               (unless (equal? (and blocks (* blocks 4096)) ho)
+                 (fail "generation ~a: verity data_blocks ~s * 4096 != hash offset ~a — the hash tree does not cover exactly the data area"
+                       n blocks ho)))
+             (let ((salt-size (le-ref img (+ ho 80) 2)))
+               (unless (equal? salt-size 32)
+                 (fail "generation ~a: verity salt size ~s != 32" n salt-size)))
+             (let ((salt (and=> (img-bytes img (+ ho 88) 32) bytes->hex)))
+               (unless (equal? salt verity-salt)
+                 (fail "generation ~a: verity salt is not the fixed td salt — the hash tree is not reproducible by contract" n)))
+             ;; the ext4 data area fills the verity data blocks EXACTLY
+             (let* ((bs (ash 1024 (or (le-ref img (+ 1024 #x18) 4) 0)))
+                    (blocks (le-ref img (+ 1024 #x4) 4))
+                    (fs-bytes (and blocks (* blocks bs))))
+               (unless (equal? fs-bytes ho)
+                 (fail "generation ~a: ext4 size ~s != hash offset ~a — the filesystem and the verity data area disagree"
+                       n fs-bytes ho))))))))))
    present))
 
 ;; (3) each generation's directives live INSIDE its OWN menuentry, and no foreign
@@ -366,7 +479,7 @@ root and boots its own system (gnu.system/gnu.load) and no other's; the managed 
 block defaults to the newest generation and carries the manual-rollback hook~a; \
 the user preamble is preserved; pruned generations leave no boot dir, no root \
 content, and no menu entry.~%"
-              (if mkfs? " as a LIVE labeled ext4 filesystem (superblock-verified)" "")
+              (if mkfs? " as a LIVE labeled ext4 filesystem (superblock-verified) carrying its appended dm-verity hash tree (verity-superblock-verified, recorded roothash/hashoffset)" "")
               (if boot-label " and the boot-partition search line" ""))
       (exit 0))
     (begin
