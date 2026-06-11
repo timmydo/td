@@ -79,6 +79,22 @@ if [ "$hostcommit" != "$pinned" ]; then
   exit 1
 fi
 
+# --- Offline-isolation control: the netns probe mechanism must discriminate ---
+# The `offline` rung's probes assert "only `lo` in /proc/net/dev" inside
+# builders (tests/offline-drv.scm). That assertion only has teeth if the same
+# mechanism reports a non-loopback interface where network IS present — and the
+# only place this script can observe a network-visible netns is here, on the
+# host, before entering the no-network container. A host with no non-lo
+# interface could not tell an isolated netns from a working one (the probes
+# would be vacuously green): fail loudly instead. Interface lines in
+# /proc/net/dev are "  name: ..."; the two header lines carry no colon.
+if ! sed -n 's/^ *\([^ :|]*\):.*/\1/p' /proc/net/dev | grep -qv '^lo$'; then
+  echo "check.sh: FATAL: the host netns shows no non-loopback interface in" >&2
+  echo "  /proc/net/dev, so the offline rung's loopback-only probes cannot" >&2
+  echo "  discriminate an isolated netns from a working one on this host." >&2
+  exit 1
+fi
+
 hostguix_dir=$(dirname "$(readlink -f "$(command -v guix)")")
 
 # Default to the `check` loop target — NEVER an empty arg list. An empty `make`
