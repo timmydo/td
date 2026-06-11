@@ -22,18 +22,29 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
    repos only under GitHub Pro or a paid org plan. On a free plan the ruleset
    saves but does not enforce — upgrade, move the repo into a paid org, or
    make it public first.
-2. **Authenticate gh** on any machine: `gh auth login` (needs admin on the
-   repo). On the dev box: `guix shell gh -- gh auth login`.
-3. **Apply the gate** (lint required, runner check not yet):
+2. **Create a machine account** for the agents and grant it write access to
+   the repo. This is not optional with mandatory reviews: a PR author cannot
+   approve their own PR, so if agents push and open PRs as your account,
+   every PR deadlocks. Agents authenticate as the machine account (its SSH
+   key for pushes; `gh auth login` as it on the dev box for opening PRs:
+   `guix shell gh -- gh auth login`); your account reviews and approves.
+3. **Apply the gate** (lint required, runner check not yet) with an admin
+   `gh auth`:
 
        ./.github/setup-branch-protection.sh
 
+   If branch protection was already configured by hand in the UI, this
+   codifies it as the `protect-main` ruleset; remove or align the manual rule
+   afterwards so there is one source of truth (Settings → Branches /
+   Settings → Rules).
 4. **Register the self-hosted runner** (the real gate). Requirements are
    exactly check.sh's: a Guix system whose *host* guix is the channels.scm
    pinned commit, a warm /gnu/store, /var/guix daemon socket, /dev/kvm, and
    ~2 cores + ~8 GB free per run (the ladder runs heavy rungs two at a time).
-   GitHub-hosted runners cannot meet this. On the dev host the runner can run
-   as a plain user process (no system reconfiguration):
+   GitHub-hosted runners cannot meet this. **Not t5700g** — the standing
+   immutable-infra rule excludes the dev host (`plan/ci-gate.md`
+   "Constraints"); provision a separate Guix host matching the pin. There the
+   runner can run as a plain user process (no system reconfiguration):
 
        # repo Settings → Actions → Runners → New self-hosted runner,
        # then on the host (inside tmux or similar):
@@ -52,16 +63,14 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
    (Doing this before a runner exists blocks every PR on a check that never
    reports.)
 
-## The review deadlock (read before relying on "mandatory reviews")
+## The review deadlock (why the machine account is mandatory)
 
 GitHub does not let a PR author approve their own PR. If agents push branches
-as the same account that reviews (timmydo), a required review can never be
-satisfied and every PR deadlocks. Pick one:
-
-- **Machine account (recommended):** agents push via a second account's SSH
-  key / token with write access; the human account reviews and approves.
-- **Reviews optional:** set `required_approving_review_count` to 0 in
-  setup-branch-protection.sh — PRs + CI stay mandatory, approval doesn't.
+and open PRs as the same account that reviews (timmydo), a required review can
+never be satisfied and every PR deadlocks. Hence step 2: agents act as a
+machine account with write access; the human account reviews and approves.
+(Mandatory reviews are the decided design — human, 2026-06-11; dropping the
+requirement would need that decision revisited, not just a script edit.)
 
 ## Day-to-day landing (replaces direct pushes)
 
