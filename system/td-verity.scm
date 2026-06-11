@@ -19,12 +19,28 @@
 ;;     open verity devices; this variant re-enables veritysetup and keeps ONLY
 ;;     that binary, mirroring cryptsetup-static's own remove-cruft phase. All
 ;;     static-library inputs are inherited (shared derivations).
+;;
+;;   * `td-verity-mapped-device` — the <mapped-device> a generation system
+;;     boots through (S2): the initrd's pre-mount opens the generation's root
+;;     partition (found by its per-generation LABEL — still the slot-binding
+;;     mechanism) as the dm-verity target `/dev/mapper/td-root`, taking the
+;;     root hash and hash offset from the kernel command line
+;;     (td.roothash=/td.hashoffset=, written by the placer's menuentry).
+;;     FAIL CLOSED by construction: there is no fallback to a plain mount —
+;;     a missing or wrong parameter, or a hash tree that does not match the
+;;     data, leaves the system without its store device and the boot stops.
 (define-module (system td-verity)
   #:use-module (gnu packages cryptsetup)
+  #:use-module (gnu system file-systems) ;file-system-label
+  #:use-module (gnu system mapped-devices)
   #:use-module (guix gexp)
   #:use-module (guix packages)
   #:use-module (guix utils)              ;substitute-keyword-arguments
-  #:export (veritysetup-static))
+  #:use-module (ice-9 match)
+  #:export (veritysetup-static
+            %td-verity-target
+            td-verity-device-mapping
+            td-verity-mapped-device))
 
 (define veritysetup-static
   ;; Statically-linked 'veritysetup' for use in initrds — exactly
@@ -68,3 +84,62 @@
     (description "This package provides the @command{veritysetup} command,
 statically linked, for use in initrds to open dm-verity integrity-verified
 block devices.")))
+
+;;;
+;;; The verity mapped device (M11 S2) — how a generation system reaches its
+;;; sealed store at boot.
+;;;
+
+;; The device-mapper target name; the generation's store file-system mounts
+;; /dev/mapper/<this> read-only at /gnu/store.
+(define %td-verity-target "td-root")
+
+(define (open-td-verity-device source targets)
+  "Return a gexp that opens SOURCE (a <file-system-label> — the
+per-generation root partition's label) as the dm-verity device TARGET. The
+root hash and the hash-area offset come from the kernel command line
+(td.roothash= / td.hashoffset=), placed there by the placer's menuentry —
+the image cannot carry its own root hash (DESIGN §2.7). No fallback path:
+any missing parameter or verification mismatch fails the boot closed."
+  (match targets
+    ((target)
+     (let ((label (if (file-system-label? source)
+                      (file-system-label->string source)
+                      source)))
+       #~(let* ((args     (linux-command-line))
+                (roothash (find-long-option "td.roothash" args))
+                (offset   (find-long-option "td.hashoffset" args)))
+           (unless (and roothash offset)
+             (error "td-verity: td.roothash=/td.hashoffset= missing from the \
+kernel command line — refusing to assemble an unverified root"))
+           ;; The partition may take a moment to appear (same retry as
+           ;; Guix's own LUKS open).
+           (let ((partition
+                  (or (let loop ((tries 0))
+                        (or (find-partition-by-label #$label)
+                            (and (< tries 20)
+                                 (begin (sleep 1) (loop (+ tries 1))))))
+                      (error "td-verity: no partition with label" #$label))))
+             (zero? (system* #$(file-append veritysetup-static
+                                            "/sbin/veritysetup")
+                             "open" partition #$target partition roothash
+                             "--hash-offset" offset))))))))
+
+(define td-verity-device-mapping
+  ;; The type of td's dm-verity mapped devices. No close procedure: a verity
+  ;; target is read-only kernel state with nothing to flush, and a generation
+  ;; system holds its store on it until power-off.
+  (mapped-device-kind
+   (open open-td-verity-device)
+   (modules '(((gnu build linux-boot)
+               #:select (linux-command-line find-long-option))
+              ((gnu build file-systems)
+               #:select (find-partition-by-label))))))
+
+(define (td-verity-mapped-device label)
+  "The <mapped-device> opening the partition labeled LABEL (this
+generation's root, slot-bound by the placer) as /dev/mapper/td-root."
+  (mapped-device
+   (source (file-system-label label))
+   (targets (list %td-verity-target))
+   (type td-verity-device-mapping)))

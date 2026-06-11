@@ -32,10 +32,14 @@
 ;;   (3)  MENU         — grub.cfg has the placer's marker-delimited managed block
 ;;        with EXACTLY one menuentry per present generation (each carrying its
 ;;        `--id td-gen-N`), and gen-N's directives live INSIDE gen-N's OWN entry:
-;;        that entry loads gen-N's kernel/initrd, selects gen-N's root
-;;        (bare-label root=...), and BOOTS gen-N's system (gnu.system=<its identity's
-;;        system path> gnu.load=<that path>/boot) — and contains NO other
-;;        generation's directives (file paths, root label, or system path).
+;;        that entry loads gen-N's kernel/initrd, selects gen-N's root — M11:
+;;        for an mkfs tree, that generation's RECORDED td.roothash=/
+;;        td.hashoffset= and NO root= argument at all (cryptographic root
+;;        selection; "/" is a declared tmpfs); for an mkfs-less tree the
+;;        legacy bare-label root= — and BOOTS gen-N's system
+;;        (gnu.system=<its identity's system path> gnu.load=<that path>/boot)
+;;        — and contains NO other generation's directives (file paths, root
+;;        label, root hash, or system path).
 ;;   (3b) BOOT WIRING  — the managed block sets `default=td-gen-<newest present>`,
 ;;        carries the manual-rollback hook (`if [ -s /td/default.cfg ]; then
 ;;        source /td/default.cfg; fi` — the file the rollback ACT writes), and,
@@ -413,9 +417,32 @@
            (fail "generation ~a: its menuentry does not load its kernel (~a)" n lk))
          (unless (string-contains body li)
            (fail "generation ~a: its menuentry does not load its initrd (~a)" n li))
-         (unless (string-contains body lr)
-           (fail "generation ~a: its menuentry does not select its own root (root=~a)"
-                 n (expected-label n)))
+         ;; Root selection. M11: an mkfs tree's entry carries THIS
+         ;; generation's recorded verity root hash + hash offset and NO
+         ;; root= argument at all ("/" is a declared tmpfs; the hash on the
+         ;; cmdline selects the root cryptographically — a stronger binding
+         ;; than the label string ever was). An mkfs-less tree keeps the
+         ;; legacy bare-label root= spec (those placements have no live
+         ;; root.img and no verity records).
+         (if mkfs?
+             (let ((rh (format #f "td.roothash=~a "
+                               (slurp-line (string-append (gen-dir n)
+                                                          "/verity-roothash"))))
+                   (ho (format #f "td.hashoffset=~a "
+                               (slurp-line (string-append (gen-dir n)
+                                                          "/verity-hashoffset")))))
+               (unless (string-contains body rh)
+                 (fail "generation ~a: its menuentry does not pass its own recorded verity root hash (~a)"
+                       n rh))
+               (unless (string-contains body ho)
+                 (fail "generation ~a: its menuentry does not pass its own recorded verity hash offset (~a)"
+                       n ho))
+               (when (string-contains body " root=")
+                 (fail "generation ~a: its menuentry still passes a root= argument — a verity generation's / is a declared tmpfs; root= would override it"
+                       n)))
+             (unless (string-contains body lr)
+               (fail "generation ~a: its menuentry does not select its own root (root=~a)"
+                     n (expected-label n))))
          (unless (string-contains body lid)
            (fail "generation ~a: its menuentry has no --id td-gen-~a (the default/rollback selector)"
                  n n))
@@ -439,6 +466,17 @@
                 (when (string-contains body fr)
                   (fail "generation ~a's menuentry selects generation ~a's root (~a) — directives crossed entries"
                         n m (expected-label m)))
+                ;; M11: nor may it pass a FOREIGN generation's root hash —
+                ;; that would boot generation N's files over generation M's
+                ;; verified root.
+                (when mkfs?
+                  (let ((frh (format #f "td.roothash=~a "
+                                     (slurp-line
+                                      (string-append (gen-dir m)
+                                                     "/verity-roothash")))))
+                    (when (string-contains body frh)
+                      (fail "generation ~a's menuentry passes generation ~a's verity root hash — directives crossed entries"
+                            n m))))
                 (when (string-contains body fs)
                   (fail "generation ~a's menuentry boots generation ~a's system — directives crossed entries"
                         n m)))))

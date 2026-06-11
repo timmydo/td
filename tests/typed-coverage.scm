@@ -86,7 +86,8 @@
    ;; Proves the field is wired.
    (cons 'ship-guix?           (td-config #:ship-guix? #t))
    ;; M10.1: a generation id derives a distinct per-generation root label
-   ;; (`td-root-gen-1`), which changes the root file-system device and so the
+   ;; (`td-root-gen-1`), which changes the lowered system (M11: the verity
+   ;; mapped device, sealed file-system set, initrd modules) and so the
    ;; system drv — proving the field is wired. (generation-diff.scm proves the
    ;; CRUX — that distinct generations get distinct, non-shared roots.)
    (cons 'generation           (td-config #:generation 1))))

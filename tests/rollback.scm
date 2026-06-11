@@ -5,23 +5,27 @@
 ;; TWICE through firmware -> GRUB:
 ;;
 ;;   boot 1 — GRUB's default is the newest entry (td-gen-2). Assert the booted
-;;     identity THREE independent ways: /proc/cmdline carries gen-2's
-;;     root=<label>, the mounted root device IS the filesystem labeled
-;;     td-root-gen-2 (st_dev of / == st_rdev of /dev/disk/by-label/...), and
-;;     /run/current-system is gen-2's system path (set from the menu's
-;;     gnu.system= — i.e. the placer's wiring, not just the kernel cmdline).
+;;     identity (M11 shape): /proc/cmdline carries gen-2's RECORDED verity
+;;     root hash (td.roothash=, the placer's cryptographic root selection —
+;;     and NOT gen-1's; and NO root= at all), /gnu/store IS the dm-verity
+;;     device /dev/mapper/td-root whose only backing slave is the partition
+;;     labeled td-root-gen-2 (the slot binding, now UNDER the verifying
+;;     layer), "/" is a tmpfs (the assembled root, §2.6), an undeclared
+;;     write into the sealed store fails closed (EROFS — the §2.6
+;;     enforcement stage), and /run/current-system is gen-2's system path
+;;     (the menu's gnu.system wiring, not just the kernel cmdline).
 ;;     Then perform the MANUAL ROLLBACK ACT: mount the boot partition, write
 ;;     `set default=td-gen-1` into /td/default.cfg (the hook the placer's
 ;;     managed block sources), drop a persistence sentinel next to it, unmount,
 ;;     and reboot cleanly (shepherd's reboot; QEMU runs -no-reboot, so it exits).
 ;;
 ;;   boot 2 — SAME overlay. GRUB sources default.cfg and boots td-gen-1. Assert
-;;     gen-1's identity the same three ways (and that gen-2's root label is NOT
-;;     on the cmdline), then assert the placed state PERSISTED across the
-;;     reboot: the sentinel survived, default.cfg still holds the selection,
-;;     gen-2's placed kernel/initrd are still on the boot partition, and the
-;;     menu still lists BOTH generations (rolling back never destroys the newer
-;;     generation — you can roll forward again).
+;;     gen-1's identity the same ways (gen-2's root hash NOT on the cmdline),
+;;     then assert the placed state PERSISTED across the reboot: the sentinel
+;;     survived, default.cfg still holds the selection, gen-2's placed
+;;     kernel/initrd are still on the boot partition, and the menu still lists
+;;     BOTH generations (rolling back never destroys the newer generation —
+;;     you can roll forward again).
 ;;
 ;; THE STATE MODEL (DESIGN §2.6, M10.3 staged scope) is asserted across the same
 ;; two boots: on each boot the declared persistent path (/var/lib/ssh, the
@@ -88,7 +92,8 @@
 (define %undeclared-sentinel-file "/var/td-undeclared-sentinel")
 
 (define (run-td-rollback-test)
-  (mlet %store-monad ((disk (td-rollback-disk-value)))
+  (mlet %store-monad ((tree (td-rollback-tree))
+                      (disk (td-rollback-disk-value)))
     (define gen1-os (gen-os 1))
     (define gen2-os (gen-os 2))
 
@@ -99,10 +104,23 @@
                          (srfi srfi-1)
                          (srfi srfi-13)
                          (srfi srfi-64)
-                         (ice-9 format))
+                         (ice-9 format)
+                         (ice-9 rdelim))
 
             (define qemu-img
               (string-append #$qemu-minimal "/bin/qemu-img"))
+
+            ;; M11: each generation's EXPECTED verity root hash — read from
+            ;; the placed tree's records (the same files the placer's menu
+            ;; passes to the kernel), so the assertion pins the cmdline to
+            ;; the artifact, not to a re-computation that could drift.
+            (define (recorded-roothash n)
+              (call-with-input-file
+                  (string-append #$tree "/boot/td/gen-"
+                                 (number->string n) "/verity-roothash")
+                read-line))
+            (define gen1-roothash (recorded-roothash 1))
+            (define gen2-roothash (recorded-roothash 2))
 
             ;; ONE persistent overlay for the whole test: guest writes survive
             ;; the in-test reboot (the acceptance clause), while the store disk
@@ -120,47 +138,117 @@
                 "-m" "1024"
                 "-drive" "file=overlay.qcow2,if=virtio,format=qcow2"))
 
+            ;; M11 identity probe, one round trip. The facts, per generation:
+            ;;   * kernel cmdline (carries td.roothash=/td.hashoffset= — the
+            ;;     placer's cryptographic root selection — and NO root=);
+            ;;   * /run/current-system (the menu's gnu.system wiring);
+            ;;   * /gnu/store IS the dm-verity device /dev/mapper/td-root
+            ;;     (st_dev of the store == st_rdev of the mapper node);
+            ;;   * that dm device's ONLY backing slave is the partition
+            ;;     LABELED with this generation's label (the slot binding —
+            ;;     strictly stronger than the old mounted-root-by-label
+            ;;     check: the label now sits UNDER the verifying layer);
+            ;;   * "/" is a tmpfs (the assembled root, §2.6);
+            ;;   * an undeclared write into the store fails closed — the
+            ;;     errno of mkdir on the sealed mount (EROFS expected).
             (define (guest-identity marionette label)
-              ;; Three independent identity facts, fetched in one round trip:
-              ;; kernel cmdline, /run/current-system target, and whether the
-              ;; mounted root IS the filesystem carrying this generation's
-              ;; LABEL (st_dev of / vs st_rdev of the by-label device node,
-              ;; which udev may take a moment to create).
               (marionette-eval
                `(begin
-                  (use-modules (ice-9 rdelim))
+                  (use-modules (ice-9 rdelim) (ice-9 ftw) (srfi srfi-1))
+                  (define (firstline f)
+                    (and (file-exists? f)
+                         (call-with-input-file f read-line)))
                   (let* ((cmdline (call-with-input-file "/proc/cmdline"
                                     read-string))
                          (current (readlink "/run/current-system"))
-                         (dev     (string-append "/dev/disk/by-label/" ,label))
-                         (root-is-label?
+                         (mapper  "/dev/mapper/td-root")
+                         (store-on-verity?
                           (let loop ((i 0))
-                            (cond ((file-exists? dev)
-                                   (= (stat:dev (stat "/"))
-                                      (stat:rdev (stat dev))))
+                            (cond ((file-exists? mapper)
+                                   (= (stat:dev (stat "/gnu/store"))
+                                      (stat:rdev (stat mapper))))
                                   ((< i 30) (sleep 1) (loop (+ i 1)))
-                                  (else 'no-by-label-node)))))
-                    (list cmdline current root-is-label?)))
+                                  (else 'no-mapper-node))))
+                         (dm-block
+                          (find (lambda (b)
+                                  (equal? (firstline
+                                           (string-append "/sys/block/" b
+                                                          "/dm/name"))
+                                          "td-root"))
+                                (or (scandir "/sys/block") '())))
+                         (slaves
+                          (and dm-block
+                               (delete "." (delete ".."
+                                 (or (scandir (string-append "/sys/block/"
+                                                             dm-block
+                                                             "/slaves"))
+                                     '())))))
+                         (labeled
+                          (let ((dev (string-append "/dev/disk/by-label/"
+                                                    ,label)))
+                            (let loop ((i 0))
+                              (cond ((file-exists? dev)
+                                     (basename (readlink dev)))
+                                    ((< i 30) (sleep 1) (loop (+ i 1)))
+                                    (else 'no-by-label-node)))))
+                         (slave-is-labeled? (equal? slaves (list labeled)))
+                         (root-tmpfs?
+                          (call-with-input-file "/proc/self/mounts"
+                            (lambda (p)
+                              (let loop ()
+                                (let ((line (read-line p)))
+                                  (cond ((eof-object? line) #f)
+                                        ((let ((f (string-split line #\space)))
+                                           (and (>= (length f) 3)
+                                                (string=? (list-ref f 1) "/")
+                                                (string=? (list-ref f 2)
+                                                          "tmpfs")))
+                                         #t)
+                                        (else (loop))))))))
+                         (store-write-errno
+                          (catch 'system-error
+                            (lambda ()
+                              (mkdir "/gnu/store/td-erofs-probe")
+                              'write-succeeded!)
+                            (lambda args (system-error-errno args)))))
+                    (list cmdline current store-on-verity? slave-is-labeled?
+                          root-tmpfs? store-write-errno)))
                marionette))
 
-            (define (assert-generation! marionette n label system foreign-label)
+            (define (assert-generation! marionette n label roothash system
+                                        foreign-roothash)
               (let* ((id      (guest-identity marionette label))
                      (cmdline (car id))
                      (current (cadr id))
-                     (root-ok (caddr id)))
+                     (store-ok (list-ref id 2))
+                     (slave-ok (list-ref id 3))
+                     (tmpfs-ok (list-ref id 4))
+                     (werrno   (list-ref id 5)))
                 (test-assert
-                    (format #f "boot ~a: cmdline selects ~a (and not ~a)"
-                            n label foreign-label)
-                  ;; Bare-label spec: Guix's initrd parses the whole root=
-                  ;; value as the label (no dracut-style LABEL= prefix).
+                    (format #f "boot ~a: cmdline passes generation ~a's verity root hash (and not the other's)"
+                            n n)
                   (and (string-contains cmdline
-                                        (string-append "root=" label " "))
+                                        (string-append "td.roothash="
+                                                       roothash " "))
                        (not (string-contains
                              cmdline
-                             (string-append "root=" foreign-label " ")))))
+                             (string-append "td.roothash="
+                                            foreign-roothash " ")))))
+                (test-assert
+                    (format #f "boot ~a: cmdline passes NO root= — / is the declared tmpfs" n)
+                  (not (string-contains cmdline " root=")))
                 (test-equal
-                    (format #f "boot ~a: / IS the filesystem labeled ~a" n label)
-                  #t root-ok)
+                    (format #f "boot ~a: /gnu/store IS the dm-verity device /dev/mapper/td-root" n)
+                  #t store-ok)
+                (test-equal
+                    (format #f "boot ~a: the verity data device is the partition labeled ~a" n label)
+                  #t slave-ok)
+                (test-equal
+                    (format #f "boot ~a: / is a tmpfs — the root is assembled, not stored" n)
+                  #t tmpfs-ok)
+                (test-equal
+                    (format #f "boot ~a: an undeclared write into the sealed store fails closed (EROFS)" n)
+                  EROFS werrno)
                 (test-equal
                     (format #f "boot ~a: /run/current-system is generation ~a's system" n n)
                   system current)))
@@ -216,7 +304,8 @@
             (let* ((m1 (make-marionette vm-command #:socket-directory "m1"))
                    (state-1 (begin
                               (assert-generation! m1 2 #$(gen-label 2)
-                                                  #$gen2-os #$(gen-label 1))
+                                                  gen2-roothash #$gen2-os
+                                                  gen1-roothash)
                               (guest-state m1)))
                    (host-key-1 (cadr state-1)))
               (set! host-key-from-gen-2 host-key-1)
@@ -277,7 +366,8 @@
             ;; ---------- boot 2: SAME overlay; GRUB sources default.cfg ------
             (mkdir "m2")
             (let ((m2 (make-marionette vm-command #:socket-directory "m2")))
-              (assert-generation! m2 1 #$(gen-label 1) #$gen1-os #$(gen-label 2))
+              (assert-generation! m2 1 #$(gen-label 1) gen1-roothash
+                                  #$gen1-os gen2-roothash)
 
               ;; §2.6 on gen 1 — both directions of declared persistence, plus
               ;; machine identity:
@@ -348,12 +438,14 @@
    (name "td-rollback")
    (description
     "Boot a disk carrying two placed td generations through GRUB; assert the \
-newest generation's identity (root label, mounted root filesystem, system \
-path); select the older generation via the placer's manual-rollback hook; \
-reboot the SAME disk overlay and assert the older generation's identity; \
-assert the placed state (sentinel, selection, the newer generation's files \
-and menu entry) persisted across the reboot; and assert the §2.6 state model \
-— declared paths are backed by td-state and survive the swap, an undeclared \
+newest generation's identity (recorded verity root hash on the cmdline, \
+store mounted read-only from the dm-verity device backed by the labeled \
+partition, tmpfs root, EROFS on an undeclared store write, system path); \
+select the older generation via the placer's manual-rollback hook; reboot \
+the SAME disk overlay and assert the older generation's identity; assert \
+the placed state (sentinel, selection, the newer generation's files and \
+menu entry) persisted across the reboot; and assert the §2.6 state model — \
+declared paths are backed by td-state and survive the swap, an undeclared \
 write does not, and the SSH host key (machine identity) is unchanged by the \
 rollback.")
    (value (run-td-rollback-test))))

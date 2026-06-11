@@ -28,6 +28,8 @@
   #:use-module (guix packages)
   ;; guix-free-marker, guix-free-privsep-service, cgroup2-file-system
   #:use-module (system td-hardening)
+  ;; %td-verity-target, td-verity-mapped-device (M11 — sealed generations)
+  #:use-module (system td-verity)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 match)
@@ -443,6 +445,13 @@ one tier per path (two entries would bind-mount the same mount point twice)"
                     "-q" "-t" "ed25519" "-N" "" "-f" key))))))
 
 (define (td-config->operating-system c)
+  ;; M11 (§2.6 enforcement stage): the ONE mapped device a generation system
+  ;; boots through — its root partition (slot-bound by label) opened as the
+  ;; dm-verity target, hash-checked on every read.
+  (define gen (td-config-generation c))
+  (define verity-md
+    (and gen (td-verity-mapped-device (td-config-effective-root-label c))))
+
   (operating-system
     (host-name (td-config-host-name c))
     (timezone (td-config-timezone c))
@@ -453,6 +462,18 @@ one tier per path (two entries would bind-mount the same mount point twice)"
       (bootloader grub-bootloader)
       (targets (list (td-config-bootloader-target c)))))
 
+    ;; M11: generation mode boots through the verity device (it must be in
+    ;; this field to reach the initrd — operating-system-boot-mapped-devices
+    ;; collects it via the store file-system's dependencies and its
+    ;; /dev/mapper/td-root device string) and needs the
+    ;; dm-verity module loaded before the initrd's pre-mount opens it. With
+    ;; generation #f both stay the operating-system defaults, byte-identical
+    ;; to the frozen oracle.
+    (mapped-devices (if gen (list verity-md) '()))
+    (initrd-modules (if gen
+                        (cons "dm-verity" %base-initrd-modules)
+                        %base-initrd-modules))
+
     ;; Root fs + the cgroup2 container-host mount (M9), shared with the oracle.
     ;; M10.3 (§2.6): a GENERATION system additionally mounts the single
     ;; writable filesystem (td-state, needed-for-boot) and bind-mounts each
@@ -460,17 +481,44 @@ one tier per path (two entries would bind-mount the same mount point twice)"
     ;; persistence: nothing else survives a generation swap. With generation #f
     ;; none of this is emitted, so the default config still lowers
     ;; byte-identically to the frozen oracle.
+    ;; M11 (§2.6 "the root is assembled, not stored"): a generation's "/" is
+    ;; now a TMPFS the boot path may write — activation materializes /etc,
+    ;; /run, /tmp on it, and nothing on it survives a reboot. The OS content
+    ;; comes from the generation image, opened through dm-verity and mounted
+    ;; READ-ONLY at /gnu/store: an undeclared write into it fails closed
+    ;; (EROFS) and a corrupted block read fails closed (EIO) — read-only by
+    ;; kernel enforcement now, not convention. No fsck on either: tmpfs has
+    ;; none, and for the store dm-verity IS the integrity check (fsck could
+    ;; not write the sealed device anyway). The store image is ext4 by the
+    ;; placer's mkfs contract (a read-only container format — §2.6),
+    ;; independent of the config's root-fs-type.
     (file-systems
      (append
-      (cons* (file-system
-               (device (file-system-label (td-config-effective-root-label c)))
-               (mount-point (td-config-root-mount c))
-               (type (td-config-root-fs-type c)))
+      (cons* (if gen
+                 (file-system
+                   (device "none")
+                   (mount-point (td-config-root-mount c))
+                   (type "tmpfs")
+                   (check? #f)
+                   (needed-for-boot? #t))
+                 (file-system
+                   (device (file-system-label (td-config-effective-root-label c)))
+                   (mount-point (td-config-root-mount c))
+                   (type (td-config-root-fs-type c))))
              cgroup2-file-system
-             (if (td-config-generation c)
-                 (cons %td-state-file-system
-                       (map persistent-path-file-system
-                            (td-config-persistent-paths c)))
+             (if gen
+                 (cons* (file-system
+                          (device (string-append "/dev/mapper/"
+                                                 %td-verity-target))
+                          (mount-point "/gnu/store")
+                          (type "ext4")
+                          (flags '(read-only))
+                          (check? #f)
+                          (needed-for-boot? #t)
+                          (dependencies (list verity-md)))
+                        %td-state-file-system
+                        (map persistent-path-file-system
+                             (td-config-persistent-paths c)))
                  '()))
       %base-file-systems))
 

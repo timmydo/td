@@ -47,8 +47,13 @@
 #          into td/default.cfg on the boot partition and rebooting. The placer
 #          NEVER writes that file; it only gives it the last word on `default`.
 #        - one menuentry per kept generation (`--id td-gen-N`), each loading THAT
-#          generation's placed kernel/initrd and selecting THAT generation's root:
-#          root=td-root-gen-N (the bare-label spec Guix's initrd parses) gnu.system=<system> gnu.load=<system>/boot
+#          generation's placed kernel/initrd and selecting THAT generation's root.
+#          M11: a generation with verity records (placed with --mkfs) gets
+#          `td.roothash=<hash> td.hashoffset=<bytes>` — the initrd opens its
+#          labeled partition as the dm-verity device and mounts it read-only at
+#          /gnu/store ("/" is a declared tmpfs; no root= at all); an mkfs-less
+#          placement keeps the legacy bare-label `root=td-root-gen-N` line.
+#          Both forms carry gnu.system=<system> gnu.load=<system>/boot
 #          (+ per-generation --extra-kernel-args, recorded on disk).
 #      Everything OUTSIDE the markers (the user's grub.cfg preamble) is preserved.
 #
@@ -242,11 +247,21 @@ if [ "$mkfs" = yes ]; then
     echo "td-place: --mkfs requires mke2fs on PATH" >&2; exit 1; }
   command -v veritysetup >/dev/null 2>&1 || {
     echo "td-place: --mkfs requires veritysetup on PATH (dm-verity hash tree, M11)" >&2; exit 1; }
-  fsroot="$root_stage/fsroot"
-  mkdir -p "$fsroot"
-  tar xf "$root_stage/root.tar" -C "$fsroot"
-  # Determinism: the tar gives every entry a fixed mtime, but the top dir was
-  # mkdir'd "now" — pin it; and mke2fs itself stamps the superblock/journal/
+  fsdir="$root_stage/fsroot"
+  mkdir -p "$fsdir"
+  tar xf "$root_stage/root.tar" -C "$fsdir"
+  # M11: the image's filesystem root is the applied root's /gnu/store SUBTREE
+  # — at boot "/" is a tmpfs assembled by activation (DESIGN §2.6 "the root
+  # is assembled, not stored"); the generation image provides exactly the
+  # store (which carries the system closure the menu boots), mounted
+  # read-only through dm-verity. The OCI artifact (root.tar — what M12
+  # signs) still carries the full applied root; only the LIVE image narrows.
+  [ -d "$fsdir/gnu/store" ] || {
+    echo "td-place: applied root carries no /gnu/store — cannot build the generation's store image" >&2
+    exit 1; }
+  fsroot="$fsdir/gnu/store"
+  # Determinism: the tar gives every entry a fixed mtime, but the imaged top
+  # dir's own mtime is fresh — pin it; and mke2fs itself stamps the superblock/journal/
   # root inode with the current time and a RANDOM hash seed unless told
   # otherwise (found by `guix build --check` going red on the placed tree).
   # SOURCE_DATE_EPOCH + E2FSPROGS_FAKE_TIME pin the clock; hash_seed pins the
@@ -263,7 +278,7 @@ if [ "$mkfs" = yes ]; then
          -L "$root_label" -U "$img_uuid" \
          -E "root_owner=0:0,lazy_itable_init=1,lazy_journal_init=1,hash_seed=$img_uuid" \
          "$root_stage/root.img" "${size_kb}k"
-  rm -rf "$fsroot"
+  rm -rf "$fsdir"
   [ -s "$root_stage/root.img" ] || {
     echo "td-place: mke2fs produced no root.img for gen $gen" >&2; exit 1; }
 
@@ -338,11 +353,22 @@ fi
     label=$(cat "$gd/root-label")
     sys=$(cat "$gd/system")
     extra=$(cat "$gd/kernel-args" 2>/dev/null || true)
+    # M11: a generation placed with --mkfs carries verity records — its entry
+    # passes the root hash + hash offset instead of root= (the initrd opens
+    # the labeled partition as /dev/mapper/td-root, verifies every read, and
+    # mounts it at /gnu/store; "/" is a declared tmpfs, so no root= at all).
+    # A generation without records (mkfs-less placement) keeps the legacy
+    # bare-label root= line.
+    if [ -s "$gd/verity-roothash" ] && [ -s "$gd/verity-hashoffset" ]; then
+      rootargs="td.roothash=$(cat "$gd/verity-roothash") td.hashoffset=$(cat "$gd/verity-hashoffset")"
+    else
+      rootargs="root=$label"
+    fi
     echo "menuentry \"td generation $g (root=$label)\" --id td-gen-$g {"
     if [ -n "$extra" ]; then
-      echo "  linux /td/gen-$g/bzImage root=$label gnu.system=$sys gnu.load=$sys/boot $extra"
+      echo "  linux /td/gen-$g/bzImage $rootargs gnu.system=$sys gnu.load=$sys/boot $extra"
     else
-      echo "  linux /td/gen-$g/bzImage root=$label gnu.system=$sys gnu.load=$sys/boot"
+      echo "  linux /td/gen-$g/bzImage $rootargs gnu.system=$sys gnu.load=$sys/boot"
     fi
     echo "  initrd /td/gen-$g/initrd.cpio.gz"
     echo "}"
