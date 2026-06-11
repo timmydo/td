@@ -43,12 +43,27 @@
         (string-contains (object->string args) "requires a generation id"))))
   (format #t "REJECTS_NO_GEN=~a~%" (if (rejected-for-no-gen?) "yes" "no"))
 
+  ;; M11: strip mapped-devices before containerizing. Guix's containerized
+  ;; transform removes the FILE SYSTEMS (a container has no disk) but keeps
+  ;; mapped-devices; with M11 a generation system carries the dm-verity
+  ;; mapped device, which — no longer used by any (removed) boot file
+  ;; system — would be lowered as a shepherd device-mapping service, whose
+  ;; compilation cannot import guix-side modules (%default-imported-modules
+  ;; is only (guix build utils)+(guix build syscalls); the same limitation
+  ;; would hit a non-boot LUKS device). A containerized image has no block
+  ;; devices, so dropping the mapping is the same statement the transform
+  ;; already makes about file systems. The bootc images (DRV_GEN1/2) keep
+  ;; the full sealed declaration — only this no-/boot discriminator fixture
+  ;; narrows.
   (define base-userspace
     (drv (lower-object
           (system-image
            (image-with-os
             docker-image
-            (td-config->operating-system (td-config #:generation 1)))))))
+            (let ((os (td-config->operating-system (td-config #:generation 1))))
+              (operating-system
+                (inherit os)
+                (mapped-devices '()))))))))
 
   (format #t "DRV_GEN1=~a~%" (gen-image 1))
   (format #t "DRV_GEN2=~a~%" (gen-image 2))

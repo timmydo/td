@@ -100,15 +100,36 @@ per-generation root partition's label) as the dm-verity device TARGET. The
 root hash and the hash-area offset come from the kernel command line
 (td.roothash= / td.hashoffset=), placed there by the placer's menuentry —
 the image cannot carry its own root hash (DESIGN §2.7). No fallback path:
-any missing parameter or verification mismatch fails the boot closed."
+any missing parameter or verification mismatch fails the boot closed.
+
+The command-line parsing is INLINE rather than (gnu build linux-boot)'s
+helpers: that module exists only in the initrd's imported closure, and a
+mapped device's open gexp is also compiled into a shepherd service when
+some lowering classifies the device as non-boot (e.g. Guix's containerized
+transform keeps mapped-devices while stripping the file systems that made
+this one boot-classified) — found by the generation-image rung going red.
+Only (gnu build file-systems) is imported, the exact footprint of Guix's
+own LUKS kind, which is proven in both contexts."
   (match targets
     ((target)
      (let ((label (if (file-system-label? source)
                       (file-system-label->string source)
                       source)))
-       #~(let* ((args     (linux-command-line))
-                (roothash (find-long-option "td.roothash" args))
-                (offset   (find-long-option "td.hashoffset" args)))
+       #~(let* ((args (filter (lambda (s) (not (string-null? s)))
+                              (string-split
+                               (call-with-input-file "/proc/cmdline"
+                                 (lambda (p) (or (read-line p) "")))
+                               #\space)))
+                (value (lambda (name)
+                         (let ((prefix (string-append name "=")))
+                           (let loop ((a args))
+                             (cond ((null? a) #f)
+                                   ((string-prefix? prefix (car a))
+                                    (substring (car a)
+                                               (string-length prefix)))
+                                   (else (loop (cdr a))))))))
+                (roothash (value "td.roothash"))
+                (offset   (value "td.hashoffset")))
            (unless (and roothash offset)
              (error "td-verity: td.roothash=/td.hashoffset= missing from the \
 kernel command line — refusing to assemble an unverified root"))
@@ -131,8 +152,7 @@ kernel command line — refusing to assemble an unverified root"))
   ;; system holds its store on it until power-off.
   (mapped-device-kind
    (open open-td-verity-device)
-   (modules '(((gnu build linux-boot)
-               #:select (linux-command-line find-long-option))
+   (modules '((ice-9 rdelim)              ;read-line
               ((gnu build file-systems)
                #:select (find-partition-by-label))))))
 
