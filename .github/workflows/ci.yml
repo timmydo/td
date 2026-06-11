@@ -1,0 +1,83 @@
+# CI gate for PRs into main (DESIGN §7.2 landing protocol).
+#
+# Two jobs, honest about what each can verify:
+#
+#   lint  — GitHub-hosted. Structural checks only: it has no Guix, no warm
+#           /gnu/store, no pinned host daemon, so it CANNOT run the real loop.
+#           It never replaces ./check.sh — it only catches cheap breakage
+#           (shell syntax, an unparseable channel pin, convention drift)
+#           before a human or the heavy runner spends time on the PR.
+#
+#   check — self-hosted runner (labels: self-hosted, guix, kvm). Runs the
+#           canonical ./check.sh, the single pass/fail command. check.sh
+#           itself guards that the runner's host guix matches the channels.scm
+#           pin and refuses to run otherwise, so a misconfigured runner fails
+#           loudly instead of silently going online (CLAUDE.md prime
+#           directives 1–2). The runner must therefore live on a host prepared
+#           like the dev box: pinned system guix, warm store, /dev/kvm.
+#           See .github/BRANCH-PROTECTION.md for runner registration.
+#
+# Nothing here weakens the loop: the rung ladder still lives only in the
+# Makefile, and the merge gate is ./check.sh exactly as before — CI just runs
+# it on a machine instead of trusting the agent ran it (DESIGN §4.3(2) is
+# untouched; this is an added gate, and adding gates is always free).
+
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# One run per ref; a new push to the PR supersedes the old run. Never more
+# than one full check per runner anyway (a runner takes one job at a time),
+# which respects the DESIGN §7.3 resource ceiling.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: shell syntax (check.sh, tests/*.sh)
+        run: |
+          set -eu
+          bash -n check.sh
+          for f in tests/*.sh; do [ -e "$f" ] || continue; bash -n "$f"; done
+      - name: channels.scm carries a parseable 40-hex pin
+        # Same sed check.sh's integrity guard uses; an unparseable pin would
+        # make every runner check fail with a confusing message, so fail it
+        # here with a clear one.
+        run: |
+          set -eu
+          pin=$(sed -n 's/.*(commit *"\([0-9a-f]\{40\}\)").*/\1/p' channels.scm | head -n1)
+          test -n "$pin" || { echo "channels.scm: no parseable pinned commit" >&2; exit 1; }
+          echo "pinned channel commit: $pin"
+      - name: convention — no tabs in Scheme sources
+        # CLAUDE.md repo conventions: hand-formatted 2-space indentation, no
+        # tabs (and never `guix style`).
+        run: |
+          set -eu
+          if grep -rPl '\t' --include='*.scm' .; then
+            echo "tab characters found in .scm files (convention: 2-space, no tabs)" >&2
+            exit 1
+          fi
+          echo "no tabs in Scheme sources"
+
+  check:
+    # The real gate: the full hermetic, offline rung ladder. Needs a
+    # self-hosted runner on a Guix host at the pinned channel commit with a
+    # warm store and KVM — see .github/BRANCH-PROTECTION.md before marking
+    # this check required (a required check with no runner blocks every PR).
+    runs-on: [self-hosted, guix, kvm]
+    timeout-minutes: 120
+    steps:
+      # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: full check (./check.sh)
+        run: ./check.sh
