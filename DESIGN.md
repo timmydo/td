@@ -415,14 +415,17 @@ as the acceptance test stated here is met or strengthened.
   (verified-red by corrupting bytes). Mechanism *(settled 2026-06-10)*: **dm-verity
   over the per-generation root image**, ChromeOS-style — `veritysetup format` (fixed
   salt) emits a hash tree + root hash at build; the hash rides the kernel cmdline in
-  the GRUB menuentry, which is exactly what M12 signs. M10.3's ext4 image becomes the
-  verity data device unchanged. fs-verity alone cannot verify a root (per-file only —
-  no directory structure; the needed enumerator is composefs); composefs is re-parked
-  for if/when cross-generation dedup earns its place — it would replace, not extend,
-  the per-generation-image design, and is not in the pinned Guix. Verification
-  boundary at M11: the root below `/boot` — kernel, initrd, and the cmdline carrying
-  the hash stay unverified until M12 moves the boundary down. Integrity ≠
-  authenticity: signatures are M12.
+  the GRUB menuentry, derived from the image whose digest M12's detached signature
+  covers (§2.7) — transitively signed content, placed by a placer that verified it.
+  M10.3's ext4 image becomes the verity data device unchanged. fs-verity alone cannot
+  verify a root (per-file only — no directory structure; the needed enumerator is
+  composefs); composefs is re-parked for if/when cross-generation dedup earns its
+  place — it would replace, not extend, the per-generation-image design, and is not
+  in the pinned Guix. Verification boundary, stated honestly: at boot, only the root
+  below `/boot` is verified — kernel, initrd, and the cmdline carrying the hash are
+  trusted as placed, not re-verified. M12 adds placement-time authenticity (only
+  signed images get placed); boot-time verification of `/boot` (a signed boot chain)
+  is off-roadmap. Integrity ≠ authenticity: signatures are M12.
 - **M12 — signed distribution.** A generation image is pushed to and pulled from a
   registry (local/offline inside the loop), its signature verified before placement;
   the placer rejects unsigned or tampered images (verified-red). Identity convention
