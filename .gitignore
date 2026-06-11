@@ -1,3 +1,5 @@
-# Scratch of the `rootless` rung (staged store + DB snapshot); kept on a red
-# run for diffing, removed on green.
+# Per-rung scratch dirs (`rootless`: staged store + DB snapshot; `oci-load`:
+# OCI layouts + corrupted-archive control); kept on a red run for triage,
+# removed on green.
 .rootless-scratch/
+.oci-load-scratch/
