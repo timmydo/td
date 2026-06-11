@@ -51,14 +51,36 @@ Agent: claude-fable-a03d13 (claimed 2026-06-11; claim status lives in PLAN.md).
    stack — not Guix's exporter, not our placer), and `skopeo copy
    docker-archive:… oci:…` both foreign-validates the artifact and emits the
    canonical OCI layout §2.7 needs for the manifest digest.
-2. [ ] **`oci-load` rung** (HEAVY pool): skopeo loads the plain td OCI image
-   AND the gen-1 bootc generation image from docker-archive into an OCI
-   layout; asserts a `sha256:` manifest digest from `skopeo inspect`; negative
-   control IN the rung: a copy of the archive with bytes flipped inside the
-   inner layer.tar must be REJECTED. Verified-red for both legs before
-   trusting green.
+2. [x] **`oci-load` rung** (HEAVY pool) — landed as a standalone Makefile
+   commit (shared spine, §7.3): skopeo loads the plain td OCI image AND the
+   gen-1 bootc generation image from docker-archive into an OCI layout;
+   asserts a `sha256:` manifest digest from `skopeo inspect`; negative
+   control IN the rung: a copy of the archive with one byte incremented
+   inside the inner layer.tar must be REJECTED with a digest mismatch.
+   Verified-red 2026-06-11 (all via `./check.sh oci-load`, each exit ≠ 0):
+   - positive leg: skopeo copy failure reds the rung — observed twice during
+     development (`/var/tmp` missing in the `-C` container; fixed with
+     skopeo's global `--tmpdir` — TMPDIR env is NOT honored for big files);
+   - control leg A (skip the corruption, feed the good archive as "bad"):
+     `FAIL: skopeo ACCEPTED a deliberately corrupted image`;
+   - digest leg (inspect `{{.Architecture}}` instead of `{{.Digest}}`):
+     `FAIL: no manifest digest from the plain OCI layout (got: 'amd64')`;
+   - wrong-reason leg (corrupt the outer .gz framing instead of the inner
+     tar): rejected with `gzip: invalid checksum`, rung red with
+     `FAIL: corrupted image was rejected, but NOT with a digest mismatch`.
+   Measured: 43.6s wall for `./check.sh oci-load` incl. the serial cheap
+   chain (~18s) — rung proper ~25s warm; LPT slot after `rootless`.
 3. [ ] **§2.7 identity move**: record the manifest digests in `DIGESTS.md`
-   (re-baseline — exclusive landing, §7.3, announced here).
+   (re-baseline — exclusive landing, §7.3, announced here). Digests observed
+   stable across three rung runs (2026-06-11):
+   - plain default image:
+     `sha256:714045afa001bab1ce90744ff77c885e4faae1573570de753e6906a5bc5c80ff`
+   - gen-1 generation image:
+     `sha256:4076bfe633259bf681326516ca6d887b60de849b26796f0bec23b9abfa368a3e`
+   Note while here: DIGESTS.md's "default docker output" store path
+   (`n3ds4yhw…`) no longer matches what the loop builds today
+   (`h8x2qfskf…-docker-image.tar.gz`) — pre-existing drift, NOT touched by
+   this track; flagged for the next deliberate re-baseline owner.
 
 ### Functional probe evidence (2026-06-11, host store, offline)
 
