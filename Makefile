@@ -53,12 +53,68 @@ LOAD    := -L .
 SYSTEM  := system/td.scm
 IMGTYPE := qcow2
 
+# Canned lower-then-realise for marionette system tests (the `test`,
+# `boot-disk` and `reset` rungs; `container` lowers multiple artifacts and
+# keeps its own block). Two steps on purpose: `guix repl` reading a script
+# from STDIN always exits 0 (it swallows the script's exit code), so building
+# the test there would make a FAILED test look green. Instead: (1) lower the
+# monadic test value to a derivation file name via repl, then (2) realise it
+# with `guix build`, whose exit status is honest and which streams the
+# marionette log so failures are visible.
+#   $(1) = test module, e.g. (tests boot)
+#   $(2) = system-test variable, e.g. %test-td-boot
+#   $(3) = label for messages, e.g. boot
+define realise-system-test
+	@drv=`printf '%s\n' \
+	    '(use-modules (guix) (gnu tests) $(1))' \
+	    '(with-store store' \
+	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
+	    '  (format #t "DRV=~a~%"' \
+	    '          (derivation-file-name' \
+	    '           (run-with-store store (system-test-value $(2))))))' \
+	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the $(3) test derivation" >&2; exit 1; }; \
+	echo ">> realise $(3) test derivation: $$drv"; \
+	$(GUIX) build "$$drv"
+endef
+
 # Bare `make` runs the in-sandbox loop, never the sandbox wrapper — guards
 # against `container-check` (which calls ./check.sh) being the default goal and
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-.PHONY: check container-check eval diff typed-coverage oci-diff manifest-diff generation-diff build test boot-disk reset oci manifest-check generation-image place rollback no-guix run container
+# The 18 rungs, in the two pools the bounded-parallel loop schedules from.
+# ADDING A RUNG: put it in exactly ONE pool below — .PHONY, the `check` target,
+# the serial chain, and the heavy gate are all DERIVED from these two
+# variables, so the lists cannot drift apart (review finding: they used to be
+# three hand-kept copies).
+#
+# CHEAP_RUNGS are the sub-5s structural rungs; their list order IS their
+# strict serial execution order (a generated order-only chain below), so a
+# syntax error or differential regression reds the loop before any VM boots
+# or tarball repacks.
+#
+# HEAVY_RUNGS run at most two at a time under check.sh's `make -j2` (DESIGN
+# §7.3 resource note: more concurrent VMs may thrash; empirically the daemon
+# overlaps two client builds, 17s->10s on the place trees). They are listed
+# LONGEST-FIRST (LPT packing): under -j2 make starts them in list order, and
+# seeding the slots with the longest rungs lets the short ones fill the gaps
+# instead of leaving a long rung to run alone at the end (measured: the naive
+# order left `container` solo for its full 71s). RE-MEASURE AND RE-SORT this
+# list whenever a rung is added or the full-check wall time drifts well past
+# the recorded 341s (-j2 floor with 18 rungs, 2026-06-10; per-rung numbers:
+# plan/loop-latency.md "Measurement log"). `rollback` is seeded first on
+# M10.3's judgment, not yet individually measured. A stale order only costs
+# latency, never correctness.
+#
+# NOTHING is removed, loosened, or skipped by the parallelism: all rungs must
+# still pass, and make (run without -k) stops spawning new rungs after a
+# failure — a red still short-circuits the loop. Order-only (|) prerequisites,
+# so a plain serial `make -j1 check` behaves exactly as before.
+CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
+HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container reset test place build boot-disk run
+
+.PHONY: check container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -66,34 +122,14 @@ IMGTYPE := qcow2
 container-check:
 	@./check.sh
 
-# Heavy rungs are listed LONGEST-FIRST (LPT packing): under -j2, make starts
-# prerequisites in list order, and seeding the slots with the longest rungs
-# (generation-image, no-guix, manifest-check, …) lets the short ones fill the
-# gaps instead of leaving a long rung to run alone at the end (measured: the
-# naive order left `container` solo for its full 71s). Serial `make -j1 check`
-# is unaffected in SUBSTANCE: the six structural rungs still run first (the
-# dependency chain below), every rung still runs and must pass — only the
-# order among the heavy rungs changes, which encodes no contract.
-check: eval diff typed-coverage oci-diff manifest-diff generation-diff rollback generation-image no-guix manifest-check oci container reset test place build boot-disk run
+check: $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
-# Bounded parallelism (loop-latency; measured in plan/loop-latency.md):
-# ./check.sh invokes `make -j2 --output-sync=target check`. The dependency
-# graph below — not target listing order — enforces the ordering that matters
-# for fail-fast: the six sub-5s structural rungs run strictly serial and FIRST
-# (a syntax error or differential regression reds the loop before any VM boots
-# or tarball repacks), then the heavy rungs run at most two at a time (the
-# DESIGN §7.3 resource note: more concurrent VMs may thrash; empirically the
-# daemon overlaps two client builds, 17s->10s on the place trees). NOTHING is
-# removed, loosened, or skipped: all rungs must still pass, and make (run
-# without -k) stops spawning new rungs after a failure — a red still
-# short-circuits the loop. Order-only (|) prerequisites, so a plain serial
-# `make check` behaves exactly as before.
-diff:            | eval
-typed-coverage:  | diff
-oci-diff:        | typed-coverage
-manifest-diff:   | oci-diff
-generation-diff: | manifest-diff
-build test boot-disk reset oci manifest-check generation-image place rollback no-guix run container: | generation-diff
+# Generated ordering graph (do not hand-edit): chain each cheap rung
+# order-only on its predecessor, and gate every heavy rung on the last cheap
+# rung.
+chain-prev :=
+$(foreach r,$(CHEAP_RUNGS),$(eval $(if $(chain-prev),$(r): | $(chain-prev)))$(eval chain-prev := $(r)))
+$(HEAVY_RUNGS): | $(lastword $(CHEAP_RUNGS))
 
 # 1. Config eval — load every module; catches syntax/binding errors in well
 #    under a second, before any expensive build. Run as a repl SCRIPT, NOT piped
@@ -169,23 +205,7 @@ build:
 #    the recipe for why we must NOT pipe the build into `guix repl`).
 test:
 	@echo ">> test: boot marionette + assert behaviors"
-	@# Two steps on purpose. `guix repl` reading a script from STDIN always
-	@# exits 0 (it swallows the script's exit code), so building the test there
-	@# would make a FAILED test look green. Instead: (1) lower the monadic test
-	@# value to a derivation file name via repl, then (2) realise it with
-	@# `guix build`, whose exit status is honest and which streams the marionette
-	@# log so failures are visible.
-	@drv=`printf '%s\n' \
-	    '(use-modules (guix) (gnu tests) (tests boot))' \
-	    '(with-store store' \
-	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
-	    '  (format #t "DRV=~a~%"' \
-	    '          (derivation-file-name' \
-	    '           (run-with-store store (system-test-value %test-td-boot)))))' \
-	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
-	test -n "$$drv" || { echo "ERROR: could not lower the test derivation" >&2; exit 1; }; \
-	echo ">> realise test derivation: $$drv"; \
-	$(GUIX) build "$$drv"
+	$(call realise-system-test,(tests boot),%test-td-boot,boot)
 
 # 3b. Disk-image boot (triage #2) — boot the qcow2 through its GRUB bootloader
 #     (not the direct-kernel VM the `test` rung uses), so the bootloader,
@@ -194,17 +214,7 @@ test:
 #     it), so it runs after the cheap rungs.
 boot-disk:
 	@echo ">> boot-disk: boot the qcow2 disk through GRUB + assert kernel"
-	@drv=`printf '%s\n' \
-	    '(use-modules (guix) (gnu tests) (tests boot))' \
-	    '(with-store store' \
-	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
-	    '  (format #t "DRV=~a~%"' \
-	    '          (derivation-file-name' \
-	    '           (run-with-store store (system-test-value %test-td-disk-boot)))))' \
-	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
-	test -n "$$drv" || { echo "ERROR: could not lower the disk-boot test derivation" >&2; exit 1; }; \
-	echo ">> realise disk-boot test derivation: $$drv"; \
-	$(GUIX) build "$$drv"
+	$(call realise-system-test,(tests boot),%test-td-disk-boot,disk-boot)
 
 # 3c. Ephemerality of the CoW reset (loop-latency; DESIGN §1.5). Boots the SAME
 #     instrumented qcow2 derivation as boot-disk (cache hit, no extra image
@@ -217,17 +227,7 @@ boot-disk:
 #     lower-then-realise as `test`/`boot-disk`.
 reset:
 	@echo ">> reset: CoW overlay reset discards dirtied guest state (ephemerality)"
-	@drv=`printf '%s\n' \
-	    '(use-modules (guix) (gnu tests) (tests reset))' \
-	    '(with-store store' \
-	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
-	    '  (format #t "DRV=~a~%"' \
-	    '          (derivation-file-name' \
-	    '           (run-with-store store (system-test-value %test-td-reset)))))' \
-	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
-	test -n "$$drv" || { echo "ERROR: could not lower the reset test derivation" >&2; exit 1; }; \
-	echo ">> realise reset test derivation: $$drv"; \
-	$(GUIX) build "$$drv"
+	$(call realise-system-test,(tests reset),%test-td-reset,reset)
 
 # 4. OCI reproducibility oracle (M5) — same shape as `build`, but for the
 #    Docker/OCI image: build it, then rebuild its derivation with --check

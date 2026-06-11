@@ -203,3 +203,28 @@ Residual/possible follow-ons (not pursued; floor is now oracle-dominated):
 the four OCI `--check` rungs are ~80% of remaining floor — only a roadmap
 change could touch that; -j3 was not attempted (DESIGN §7.3 thrash bound with
 a second agent's checks running).
+
+### Review round (2026-06-10, post-landing)
+
+7-angle code review of the landed range: no correctness findings; three
+maintainability findings, all applied:
+1. Rung lists were three hand-kept copies (.PHONY / check: / heavy gate) that
+   could drift — now derived from CHEAP_RUNGS/HEAVY_RUNGS variables, with the
+   serial chain and heavy gate generated.
+2. LPT order had no re-measure trigger — comment now names one (re-measure on
+   rung addition or when full-check wall time drifts well past 275s).
+3. The lower-then-realise repl boilerplate existed 3x (test/boot-disk/reset)
+   — factored into the realise-system-test canned recipe (container keeps its
+   multi-artifact block). Dry-run verified the expansion is byte-equivalent
+   in shape and the generated graph matches the hand-written one.
+Landed after rebasing onto M10.3 (which added the `rollback` rung — folded
+into HEAVY_RUNGS first per M10.3's own LPT placement, not yet individually
+measured): full 18-rung `-j2` floor green at 341s. The post-rebase comment
+edit was proven comment-only by diffing `make -np` databases before/after.
+
+Refuted in review (for the record): /tmp collisions (per-derivation sandbox),
+delete-file-after-waitpid race (process reaped first), -j2 not overridable
+(user args follow -j2; ./check.sh -j1 works), reset rung "tests a parallel
+mechanism" (its §1.5 charter and scope are documented in the file header),
+boot.scm/reset.scm qemu-flag duplication (divergence is the point:
+-snapshot vs explicit overlays).
