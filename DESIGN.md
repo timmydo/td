@@ -203,6 +203,75 @@ compiler emits the `td-state` mount and allowlist only when `generation` is set,
 `generation #f` still converges to the untouched frozen oracle and the M4/M5/M6
 differentials hold with no re-baseline.
 
+### 2.7 Generation identity *(settled 2026-06-10 — pinned ahead of M12)*
+
+A generation's identity is the **content digest of its image**. The integer N
+(`gen-N`, `td-root-gen-N`) is a placer-local **install ordinal** — it names the
+slot a generation occupies on one machine, never the generation itself. Two
+machines' "generation 3" need not be the same OS; two placements of the same
+digest are the same OS wherever they sit. M12 signs and verifies digests, not
+ordinals: the signature is over the image's manifest digest, and "verify before
+placement" means digest first, slot second. Pinned now, while M10 is warm, so
+M12 never has to retrofit identity into M10's artifacts.
+
+**Digest definition, staged with the artifact.** The end state is the OCI image
+manifest digest — the registry-addressable `sha256:…` of the image manifest —
+once the generation image has a canonical OCI layout (the `oci-load` track's
+territory). Until then the image is a reproducible docker-archive tarball and
+the digest is the sha256 of that artifact. Moving between the two is a
+representation change to record (a `DIGESTS.md` re-baseline), not a change of
+convention: identity = digest of the distributed artifact, in its canonical
+form.
+
+**Where the digest lives — the self-reference rule.** An image cannot carry its
+own digest (the digest is computed over content that would include the file),
+so the identity record splits:
+
+- **Embedded** `boot/td-identity` (inside the image, M10.2) carries what the
+  image is *for*: `generation=N`, `root-label=…` — build inputs that bind the
+  image to the slot it was built for; the placer rejects a slot mismatch.
+- **Placed** `boot/td/gen-N/td-identity` (written by the placer) additionally
+  carries what the image *is*: `image-digest=sha256:…`, computed by the placer
+  over the artifact it actually unpacked. This line is M12's anchor — verify
+  the signature over the digest, hash the pulled artifact, compare, and only
+  then place; the placed record then states the verified identity. Adding the
+  line is a one-line placer increment, landable under M10.3 or at M12's start.
+
+**Known consequence, accepted.** Today the image is specialized to its slot —
+the per-generation root label is baked into the declaration and initrd
+(M10.1's crux) — so identical OS content placed in two slots yields two
+digests. That is fine: identity attaches to the artifact; slot binding stays a
+separate, local concern enforced by the embedded record. Decoupling image from
+slot (one image placeable in any slot, root chosen at place time) is a possible
+later refinement, off-roadmap, and not needed by M12.
+
+**M12 pre-decisions** (vehicle and policy settled on paper now — the M8 podman
+lesson is that vehicle choice can sink a milestone):
+
+- **Signing vehicle: detached signature over the digest; no sigstore.**
+  cosign and the sigstore world are Go-heavy and network-assuming — likely the
+  next podman. A plain detached ed25519 signature (signify/minisign-style, or
+  guile-gcrypt's ed25519 — already a build dependency of
+  `system/td-generation.scm`) over the manifest digest fits FSDG + offline.
+  The track file states the probe criterion up front, M8-style — offline-
+  buildable from the pinned channel, sane derivation count — before any
+  vehicle is adopted.
+- **Registry: a static layout, not a product.** The OCI distribution API is
+  HTTP over a content-addressed layout; inside the loop, a static `oci-layout`
+  directory plus a trivial local server (or plain file transport) *is* the
+  registry. This satisfies the §7.1 acceptance wording "pushed to and pulled
+  from a registry (local/offline inside the loop)"; no registry product enters
+  the loop.
+- **Downgrade policy: anti-rollback is out of scope.** The placer rejects
+  exactly three things: unsigned, bad signature, digest mismatch. An *old but
+  validly signed* generation is re-placeable by design — manual rollback is
+  the model (M10), so freshness/epoch enforcement is explicitly not a goal.
+  Written down so it isn't invented ad hoc mid-track.
+- **Named open question for the track file:** key distribution — how the
+  target gets the verifying public key (placer flag, well-known path on
+  `td-state`, baked into the placer build). Decide in `plan/m12.md` when the
+  track starts; it does not block the convention above.
+
 ---
 
 ## 3. Invariants *(non-negotiable — these head the agent's instructions)*
@@ -347,7 +416,9 @@ as the acceptance test stated here is met or strengthened.
   (verified-red by corrupting bytes). Integrity ≠ authenticity: signatures are M12.
 - **M12 — signed distribution.** A generation image is pushed to and pulled from a
   registry (local/offline inside the loop), its signature verified before placement;
-  the placer rejects unsigned or tampered images (verified-red).
+  the placer rejects unsigned or tampered images (verified-red). Identity convention
+  and pre-decisions (digest = identity, signing vehicle, registry shape, downgrade
+  policy): §2.7.
 
 **Side-tracks** (parallel-safe; mostly disjoint from mainline files; any number may
 run concurrently):
