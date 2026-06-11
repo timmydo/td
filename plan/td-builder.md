@@ -45,8 +45,9 @@ equal to the root daemon, so oracle authority transfers).
   valid, probe output invalid), uid_map isolation probe, kept-output +
   diffoscope diagnostics — are the rung's skeleton; the rebuild side swaps
   from "pinned daemon, unprivileged" to td-builder.
-- **FSDG:** Rust crates must be free and come through the pinned channel; no
-  vendored nonfree code.
+- **Crate sourcing:** crates come through the pinned channel (hermeticity —
+  pinned inputs, offline loop). Free-ness is no longer required: the FSDG
+  posture was relaxed to a non-goal (human, 2026-06-11 — DESIGN §5).
 
 ## Open questions (decide here, in order)
 
@@ -150,7 +151,8 @@ Everything the section above owed, delivered on a guix host:
   `guix build -L . -e '(@ (system td-builder) td-builder)'` pinned to the
   OFFICIAL substitute servers only (`--substitute-urls="https://bordeaux.guix.gnu.org
   https://ci.guix.gnu.org"` — never the host daemon's default list, which
-  includes nonguix; FSDG posture). Cold-store lowering fails honestly: the
+  includes nonguix; FSDG posture — since relaxed to a non-goal, DESIGN §5).
+  Cold-store lowering fails honestly: the
   no-substitutes source-build path dies on an upstream boost-patch hash
   mismatch — the rung's warm-store precondition is real, not cosmetic.
 - **GREEN:** `./check.sh td-builder` passes — lower, offline build,

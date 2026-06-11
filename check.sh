@@ -3,8 +3,8 @@
 #
 # `make check` is the loop, but it must run *hermetically* (DESIGN §1.4: every
 # build/test enters a fresh `guix shell -C --pure` container) and *offline*
-# (DESIGN §5: local-only; reaching the network pulls substitutes incl.
-# nonguix.org, violating the strict-FSDG posture). Getting that right needs a
+# (DESIGN §5: local-only; reaching the network pulls substitutes — unpinned
+# binaries the loop's results would silently depend on). Getting that right needs a
 # specific incantation (store/cache/daemon-socket exposure + host-guix on PATH);
 # baking it here makes "the single command" real instead of tribal knowledge.
 #
@@ -19,16 +19,16 @@
 #   host guix first on PATH     : the host *system* guix already IS the pinned
 #                                 commit, so the Makefile's `time-machine` is a
 #                                 no-op that hits the warm store (no re-fetch).
-#   NO --network               : on purpose. Network => substitutes => nonguix.
+#   NO --network               : on purpose. Network => substitutes => unpinned bits.
 #   guix shell --no-substitutes --no-offload : the daemon we share
 #                                 (--share=/var/guix) runs on the HOST and HAS
 #                                 network — container isolation does not isolate
 #                                 it, and it is configured with
-#                                 substitutes.nonguix.org. So dropping --network
+#                                 substitute servers. So dropping --network
 #                                 is NOT enough: a not-yet-warm path would still
-#                                 make the daemon query/fetch substitutes (incl.
-#                                 nonguix) or offload to a remote builder,
-#                                 violating the local-build-only + FSDG posture.
+#                                 make the daemon query/fetch substitutes or
+#                                 offload to a remote builder, violating the
+#                                 local-build-only posture.
 #                                 These flags must be on the OUTER `guix shell`
 #                                 itself (triage #2): exporting GUIX_BUILD_OPTIONS
 #                                 *inside* the spawned shell is too late — by then
@@ -46,8 +46,8 @@
 #
 # THE CONTRACT (narrowed — honest scope). What the above GUARANTEES by
 # construction is: NO binary substitutes and NO remote build offloading — every
-# realisation is a LOCAL build, and nothing is pulled from a substitute server
-# (incl. nonguix), cold or warm. It does NOT guarantee a fully network-free run:
+# realisation is a LOCAL build, and nothing is pulled from a substitute server,
+# cold or warm. It does NOT guarantee a fully network-free run:
 # the daemon we share (--share=/var/guix) runs on the HOST and keeps its network,
 # and `--no-substitutes` does not stop a *fixed-output* derivation (a `git`/`url`
 # source fetch) from reaching out on a cold path. That residual is permitted by
@@ -64,7 +64,7 @@ cd "$(dirname "$0")"
 # The offline/no-download property holds ONLY because the host system guix is
 # the exact commit channels.scm pins: time-machine to a *different* commit would
 # recompute the channel-instance derivation, miss the warm store, and try to
-# download it (breaking offline + FSDG). Fail loudly rather than silently going
+# download it (breaking the offline posture). Fail loudly rather than silently going
 # online.
 pinned=$(sed -n 's/.*(commit *"\([0-9a-f]\{40\}\)").*/\1/p' channels.scm | head -n1)
 hostcommit=$(guix describe -f recutils 2>/dev/null | sed -n 's/^commit: *//p' | head -n1)

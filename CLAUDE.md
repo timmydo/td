@@ -179,13 +179,16 @@ it.
   in M2 and mangled the layout; the hand-formatted style is the convention.
 - Run every build/test via `./check.sh` (or `./check.sh <target>`), which enters the
   `guix shell -C --pure` sandbox for you (see "The loop"). Don't add `--network` to
-  it — that pulls substitutes (FSDG + offline violation).
+  it — that pulls substitutes (offline/hermeticity violation).
 
 **Free-software posture**
 
-- Strict FSDG (Guix's free-software guidelines). No nonfree firmware, blobs, or crates.
-  Do not add the `nonguix` channel. If a task appears to require nonfree code, STOP and
-  ask.
+- Relaxed to a **non-goal** (human, 2026-06-11 — DESIGN §5). The pinned channel stays
+  the default source; nonfree inputs (firmware, blobs, crates, the `nonguix` channel)
+  may be adopted when a task needs them, declared and pinned like any other input.
+  Unchanged: the loop stays offline with substitutes disabled — that is a
+  reproducibility rule, not a free-software rule. Mes-style full-source bootstraps
+  are likewise a non-goal (DESIGN §5 "Package collection").
 
 **Commits**
 

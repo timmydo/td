@@ -234,7 +234,7 @@ lesson is that vehicle choice can sink a milestone):
   cosign and the sigstore world are Go-heavy and network-assuming — likely the
   next podman. A plain detached ed25519 signature (signify/minisign-style, or
   guile-gcrypt's ed25519 — already a build dependency of
-  `system/td-generation.scm`) over the manifest digest fits FSDG + offline.
+  `system/td-generation.scm`) over the manifest digest fits the offline loop.
   The track file states the probe criterion up front, M8-style — offline-
   buildable from the pinned channel, sane derivation count — before any
   vehicle is adopted.
@@ -281,8 +281,8 @@ Mirrored in `CLAUDE.md`.
 
 `CLAUDE.md` carries the loop command (§1.1), the four invariants (§3), the
 definition-of-done, the parallel-work rules (§7.2–7.4), the repo layout, the
-strict-FSDG posture, and the state boundary. Keep §1, §3, and §7.2–7.3 of this
-document in sync with it.
+free-software posture (§5 — relaxed to non-goal 2026-06-11), and the state
+boundary. Keep §1, §3, and §7.2–7.3 of this document in sync with it.
 
 ### 4.2 Task decomposition
 
@@ -322,11 +322,17 @@ Standing posture decisions; naming them prevents surprises.
   approval 2026-06-11)*. The pinned channel's package definitions remain a
   source-level **input** — Guix as a package-definition corpus pinned by
   `channels.scm`, not a runtime system dependency once the §6-parked swaps
-  land. Re-deriving a bootstrap chain or package set is a non-goal; revisit
-  only by roadmap addition (§4.3 gate 1).
-- **Free-software posture.** Strict FSDG — follow Guix's free-software guidelines. No
-  nonfree firmware, blobs, or crates; no `nonguix` channel. If a task appears to need
-  nonfree code, STOP and ask.
+  land. Re-deriving a bootstrap chain (a Mes-style full-source bootstrap) or
+  package set is a non-goal — for every toolchain, not just Rust (human,
+  2026-06-11); revisit only by roadmap addition (§4.3 gate 1).
+- **Free-software posture** *(relaxed to non-goal 2026-06-11, human)*. Strict
+  FSDG purity is a **non-goal**. The pinned channel remains the default source
+  (and happens to be FSDG-clean today), but nonfree inputs — firmware, blobs,
+  crates, the `nonguix` channel — may be adopted when hardware or a track needs
+  them, declared and pinned like any other input; the former STOP-and-ask rule
+  for nonfree code is retired. Not implied and unchanged: the loop's
+  hermeticity (offline, substitutes disabled inside, channel-pinned) — that is
+  a reproducibility rule, not a free-software rule.
 - **Substitutes / build-farm trust.** *(relaxed 2026-06-11)* Local-build purism
   is not a current goal: the host store may be warmed from the official
   substitute servers for pinned-channel closures (the Rust toolchain is the

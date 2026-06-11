@@ -24,7 +24,7 @@ assertion proves the FHS property (e.g. the app binary really resolves at
 
 - Guix's native store-based image remains the reproducibility oracle (M5); FHS
   flattening layers on top — diff against it where applicable (§2.5).
-- Strict FSDG, offline loop, as always.
+- Offline loop, as always. (FSDG relaxed to a non-goal 2026-06-11 — DESIGN §5.)
 
 ## Working state
 
