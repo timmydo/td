@@ -25,6 +25,7 @@ file is the **single source of truth for claim status** (track files don't carry
 - [x] **loop-latency** — DONE claude-fable 2026-06-10 (full check 525s→275s; new `reset` rung) — `plan/loop-latency.md`
 - [ ] **fhs-app-images** — UNCLAIMED — `plan/fhs-app-images.md`
 - [ ] **td-builder** — S1+S2 DONE 2026-06-11 (S2: NAR serializer hash-equal to the daemon's recorded hashes, verified-red ×3; Q1 decided staged-CLI-first); S3+ CLAIMED claude-fable-a03d13 2026-06-11 — `plan/td-builder.md`
+- [ ] **ci-gate** — UNCLAIMED — `plan/ci-gate.md`
 
 ## The loop (reminder)
 

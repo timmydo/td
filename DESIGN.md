@@ -456,6 +456,18 @@ run concurrently):
   isolation probe) is the rung's skeleton. Vehicle and toolchain posture: §5.
   Follow-on swaps (td-check, evaluator-as-library, loop convergence) are parked
   in §6 until they earn their own entries. `plan/td-builder.md`.
+- **ci-gate** *(approved 2026-06-11)* — a self-hosted GitHub Actions runner
+  executes the **unmodified** `./check.sh` for every candidate landing and posts
+  the verdict as a commit status; once this track is green, that verdict is the
+  binding landing gate (§7.2 amendment, 2026-06-11). Acceptance: a green
+  candidate branch produces a passing check run and the same SHA fast-forwards
+  onto branch-protected main; a deliberately red candidate (broken assertion on
+  a branch — the verified-red) produces a failing check run and branch
+  protection rejects its fast-forward. CI only: distribution/CD automation
+  waits for M12 and a future entry. Runner-host selection (t5700g excluded —
+  standing immutable-infra rule; its daemon is the owner's machine state, per
+  the offline-isolation rescope), provisioning, and constraints:
+  `plan/ci-gate.md`.
 
 ### 7.2 Landing protocol — merge on green
 
@@ -469,10 +481,22 @@ directly on a shared checkout of main. To land:
 
 No PRs and no human merge step; the human reviews asynchronously on main and may
 revert. "Validated" means green against the main actually landed on — landing
-without a green full check is a contract violation. Claims: one agent per track,
-recorded on the track's status line in `PLAN.md` (a tiny standalone commit to main)
-under a session-unique handle — `PLAN.md` is the single source of truth for claim
-status; generation mechanics live in `CLAUDE.md` "Parallel work".
+without a green full check is a contract violation.
+
+*Amendment (2026-06-11; binding once the ci-gate side-track's acceptance test is
+green, inert until then):* step 3 becomes gated — push the candidate branch, let
+the self-hosted runner execute the full `./check.sh`, and fast-forward main only
+on a runner-green check. Branch protection on main requires that check on the
+landed SHA, so the runner's verdict completes "validated"; step 2 (the local full
+check) remains required pre-push discipline — runner green never substitutes for
+it. Still no PRs and no human merge. The runner's check counts toward the §7.3
+two-concurrent-checks ceiling only if the runner shares a host with dev checks;
+on its own host, stagger landings as a courtesy.
+
+Claims: one agent per track, recorded on the track's status line in `PLAN.md`
+(a tiny standalone commit to main) under a session-unique handle — `PLAN.md` is
+the single source of truth for claim status; generation mechanics live in
+`CLAUDE.md` "Parallel work".
 
 ### 7.3 Exclusive landings
 

@@ -115,7 +115,12 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
 - **Land (merge on green):** (1) fetch + rebase onto latest `origin/main`; (2) run
   the FULL `./check.sh` — must be green; (3) fast-forward main and push; (4) if main
   moved while checking, repeat from (1). No PRs, no human merge. Landing without a
-  green full check is a contract violation.
+  green full check is a contract violation. Once the `ci-gate` side-track is green,
+  step 3 is gated: push the candidate branch, wait for the self-hosted runner's
+  `./check.sh` check to pass, then fast-forward main (branch protection requires
+  that check on the landed SHA) — the runner's verdict is binding, and step 2's
+  local full check stays required pre-push; runner green never substitutes for it
+  (DESIGN §7.2 amendment, 2026-06-11).
 - **Exclusive landings:** changes to the shared spine — `system/td.scm` (frozen
   oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
   everyone. Announce in your track file, land as small standalone commits, expect
