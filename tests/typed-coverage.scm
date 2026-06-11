@@ -193,6 +193,14 @@
          (lambda () (td-config #:persistent-paths '((precious . "var/lib/ssh")))))
    (list 'persistent-paths "persistent-paths root path"
          (lambda () (td-config #:persistent-paths '((precious . "/")))))
+   ;; M10.3 review round: two entries for the SAME path would lower to two bind
+   ;; mounts on one mount point (ambiguous tier; colliding per-mount-point fs
+   ;; services) — a silently-wrong system, exactly what construction-time
+   ;; rejection exists to prevent.
+   (list 'persistent-paths "persistent-paths duplicate path"
+         (lambda () (td-config #:persistent-paths
+                               '((precious . "/var/lib/ssh")
+                                 (disposable . "/var/lib/ssh")))))
    ;; Cross-field: a GENERATION system must keep the precious /var/lib/ssh
    ;; entry — dropping it would put the SSH host key (machine identity) back on
    ;; the per-generation root, where a rollback would swap it (§2.6).

@@ -290,6 +290,17 @@
   (check generation-id? 'generation generation "#f or a positive integer")
   (check persistent-paths? 'persistent-paths persistent-paths
          "a list of (precious|disposable . \"/abs/path\") pairs")
+  ;; No two entries may declare the SAME path: they would lower to two bind
+  ;; mounts on one mount point (ambiguous tier; colliding per-mount-point fs
+  ;; services) — a silently-wrong system, rejected at construction instead.
+  (let* ((paths (map cdr persistent-paths))
+         (dup   (find (lambda (p)
+                        (> (count (lambda (q) (string=? p q)) paths) 1))
+                      paths)))
+    (when dup
+      (error (format #f "td-config: persistent-paths declares ~s more than once — \
+one tier per path (two entries would bind-mount the same mount point twice)"
+                     dup))))
   ;; Cross-field (§2.6): a GENERATION system relocates its SSH host key under
   ;; /var/lib/ssh — machine identity must live on td-state or a rollback would
   ;; swap it along with the OS. So when a generation id is set, the allowlist
