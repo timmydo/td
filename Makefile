@@ -1,40 +1,10 @@
 # td — the single pass/fail entry point (CLAUDE.md "The loop").
 #
-# `make check` runs, in order and short-circuiting on the first failure:
-#   1. eval           — load declaration + test modules (fails fast, sub-second)
-#   2. diff           — typed front-end lowers to the same SYSTEM drv as the gexp (M4)
-#   3. typed-coverage — every typed field is wired into the system + validated (M4)
-#   4. oci-diff       — typed front-end lowers to the same OCI image drv as the gexp (M5)
-#   5. manifest-diff  — a changed manifest swaps to a different OCI image (M6)
-#   6. build          — build the bootable image and assert it is reproducible
-#   7. test           — boot the marionette system test and assert behaviors
-#   8. boot-disk      — boot the qcow2 through GRUB (real bootloader path) + kernel
-#   8b. reset         — per-test ephemerality (DESIGN §1.5): dirtied guest state
-#                       persists across a reboot on the SAME CoW overlay
-#                       (negative control) and is GONE on a fresh overlay over
-#                       the same backing image (the reset). Locks in the
-#                       fresh-state guarantee loop-latency work must preserve.
-#   9. oci            — build the Docker/OCI image and assert it is reproducible (M5)
-#  10. manifest-check — build a swapped-manifest image, --check it, and assert the
-#                       declared package is actually in the realized tarball (M6)
-#  11. no-guix        — build the hardened (ship-guix? #f) image, --check it, and
-#                       assert the imperative guix/guix-daemon surface is absent
-#                       from it but present in an explicit ship-guix? #t CONTROL
-#                       image; plus a whole-system gate over the SHIPPED system
-#                       (must build) and over a service-injection fixture (must
-#                       fail at the gate) — review F1 (M7)
-#  12. run            — execute the SHIPPED OCI image as a real rootless OCI
-#                       container (crun) and assert its userspace runs: a positive
-#                       run (sentinel + exit 0) and a negative control (a bogus
-#                       exec must fail). Closes the gap that every prior rung
-#                       proved a PROPERTY of the artifact but never RAN it (M8)
-#  13. container      — boot the shipped base and run a Guix-built OCI APP image
-#                       (guix pack -f docker hello) ON it with the shipped crun, as
-#                       root: assert the app prints its output + exits 0, with a
-#                       negative control. Proves td is a working container HOST (M9).
-#                       M9.3 also asserts crun ENFORCES a declared pids.max=73 on a
-#                       coreutils container (cgroupfs manager) — the container reads
-#                       its own /sys/fs/cgroup/pids.max back as 73 (managed cgroups)
+# `make check` runs the rung ladder. The authoritative rung list is the
+# CHEAP_RUNGS/HEAVY_RUNGS pools below, which the `check:` target expands
+# (CLAUDE.md "The loop"); per-rung documentation lives as a comment on each
+# rule. Cheap structural rungs run serial-first, heavy rungs two at a time
+# (-j2, LPT order); a red stops new rungs from spawning.
 #
 # Every guix invocation is pinned to channels.scm via `guix time-machine`, so
 # the reproducibility oracle is honest regardless of the ambient guix version.
