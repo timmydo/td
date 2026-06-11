@@ -39,8 +39,9 @@ closed loop through M10.2) is recorded in `HISTORY.md`.
 offline sandbox (a fresh `guix shell -C --pure`, store and daemon-socket exposure, a
 guard that host guix matches the `channels.scm` pin, substitutes disabled) and runs
 `make check` inside it. `make check` runs the rung ladder, short-circuiting on the
-first failure; **the `check:` line in the `Makefile` is the authoritative rung
-list** — documents point here instead of restating it. Broad shape: config eval →
+first failure; **the `Makefile`'s `CHEAP_RUNGS`/`HEAVY_RUNGS` pools (expanded by its
+`check:` target) are the authoritative rung list** — documents point here instead of
+restating it. Broad shape: config eval →
 differentials → `guix build --check` → behavioral/marionette tests. Plain
 `make check` is only correct when you're already inside that sandbox.
 
@@ -70,8 +71,8 @@ environment can't contaminate results and the reproducibility rung stays honest.
 
 The harness is **fully ephemeral per test**: boot from a fresh image, wipe all
 writable state on reset. That is test isolation, not a ban on persistence *within* a
-test (§2.6, §3). Cheaper resets (QEMU `qcow2` overlay / CoW) are the `loop-latency`
-side-track (§7.1).
+test (§2.6, §3). The CoW reset (QEMU `qcow2` overlay) is in place and asserted by
+the `reset` rung (landed 2026-06-10; measurements in `plan/loop-latency.md`).
 
 ---
 
@@ -145,8 +146,10 @@ generation's image is mounted read-only (providing `/gnu/store` and the system
 profile); activation materializes `/etc`, `/run`, `/tmp` from the declaration.
 `/etc` is never persistent and never merged — configuration changes by building a
 new generation, full stop. (Staged: M10.2 stages each generation's root *content* as
-a tarball; M10.3 turns those into per-generation **read-only ext4 images** and boots
-them; the tmpfs-root assembly lands together with M11's sealing — a root the boot
+a tarball; M10.3 turns those into per-generation **ext4 root images** and boots
+them — read-only by convention: the mount stays rw until M11's sealing, which is
+what lets the M10.3 test show an undeclared write lingering in that generation's
+root; the tmpfs-root assembly lands together with M11's sealing — a root the boot
 path writes to cannot be sealed. ext4 here is only the container format for a
 read-only image — and M11's dm-verity data device — not a traditional read-write
 filesystem; `td-state` remains the only one of those on the disk.)
@@ -375,8 +378,10 @@ as the acceptance test stated here is met or strengthened.
   composefs); composefs is re-parked for if/when cross-generation dedup earns its
   place — it would replace, not extend, the per-generation-image design, and is not
   in the pinned Guix. Verification boundary, stated honestly: at boot, only the root
-  below `/boot` is verified — kernel, initrd, and the cmdline carrying the hash are
-  trusted as placed, not re-verified. M12 adds placement-time authenticity (only
+  partition is verified; the contents of `/boot` — kernel, initrd, and the cmdline
+  carrying the hash — are trusted as placed, not re-verified. (Per-generation roots
+  are labeled partitions assembled from the placer's root.img, not files under
+  `/boot`.) M12 adds placement-time authenticity (only
   signed images get placed); boot-time verification of `/boot` (a signed boot chain)
   is off-roadmap. Integrity ≠ authenticity: signatures are M12.
 - **M12 — signed distribution.** A generation image is pushed to and pulled from a
@@ -430,8 +435,10 @@ Oracle re-baselines (which rewrite `DIGESTS.md`) and channel-pin bumps are the
 canonical cases. These are coordination rules, not sign-off gates — but remember
 §4.3(2): *weakening* anything in the spine still needs the human.
 
-Resource note: every full check boots QEMU VMs; two concurrent checks are fine on
-this host, more may thrash. Stagger landings if loaded.
+Resource note: each full check already runs its heavy rungs two at a time (`-j2`);
+two concurrent full checks therefore mean up to four VMs/builds — observed fine on
+this host during the M10.3/loop-latency overlap, but treat that as the ceiling:
+don't add a third check or raise `-j`. Stagger landings if loaded.
 
 ### 7.4 Files
 

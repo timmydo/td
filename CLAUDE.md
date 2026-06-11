@@ -64,8 +64,9 @@ matches the `channels.scm` pin, then runs `make check` inside it. `make check` i
 underlying target (assumes you are already in that sandbox); it runs the rung ladder
 (structural rungs serial-first, heavy rungs two at a time), short-circuiting on the
 first failure, and exits non-zero on any failure.
-The `check:` line in the `Makefile` is the **authoritative rung list** — the one place
-it is written down; never restate it in docs. Broad shape: config eval →
+The `Makefile`'s `CHEAP_RUNGS`/`HEAVY_RUNGS` pools (expanded by its `check:` target)
+are the **authoritative rung list** — the one place it is written down; never restate
+it in docs. Broad shape: config eval →
 differentials → `guix build --check` → behavioral/marionette tests.
 
 Every build/test runs inside that fresh container (`guix shell -C --pure`) so your own
@@ -119,8 +120,9 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
   oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
   everyone. Announce in your track file, land as small standalone commits, expect
   others to rebase. Oracle re-baselines and channel bumps are the canonical cases.
-- **Resources:** each full check boots QEMU VMs; two concurrent checks are fine, more
-  may thrash. Stagger if the host is loaded.
+- **Resources:** each full check already runs its heavy rungs two at a time (`-j2`),
+  so two concurrent checks mean up to four VMs/builds — the observed ceiling. Don't
+  add a third check or raise `-j`; stagger if the host is loaded.
 
 ## Workflow
 
@@ -154,8 +156,9 @@ it.
 
 - `check.sh` — the canonical hermetic, offline pass/fail command (`./check.sh`). The
   only command you need to determine green/red.
-- `Makefile` — the `make check` target it runs inside that sandbox; its `check:` line
-  is the authoritative rung list (the one place it is written down).
+- `Makefile` — the `make check` target it runs inside that sandbox; its `CHEAP_RUNGS`/
+  `HEAVY_RUNGS` pools (expanded by `check:`) are the authoritative rung list (the one
+  place it is written down).
 - `system/` — Guile system declarations. The frozen oracle lives at `system/td.scm`.
 - `tests/` — marionette system tests in the `(gnu tests)` style, plus the
   differential/coverage rungs.
