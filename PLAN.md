@@ -11,7 +11,7 @@ to main, pushed). One agent per track; release the claim when you land or stop.
 
 ## Mainline (serial — one agent drives it at a time)
 
-- [ ] **M10.3 manual rollback** — UNCLAIMED — `plan/m10.md`
+- [ ] **M10.3 manual rollback** — CLAIMED claude-fable 2026-06-10 — `plan/m10.md`
 - [ ] **M11 verified generations** — blocked on M10.3 — split out of `plan/m10.md` when started
 - [ ] **M12 signed distribution** — blocked on M11
 
