@@ -308,3 +308,42 @@ each exiting non-zero at a DISTINCT assert, then restored:
 - (S3a's parser red was organic: the first endOfList transcription turned 5
   unit tests red. S2's NAR reds ×3 cover the serialization leg the
   independent re-hash assert shares.)
+
+### S4 — the system-image differential (claude-fable-8ebb4e, claimed 2026-06-11)
+
+Claim per the PR protocol: PLAN.md edit is the branch's first commit, draft
+PR #5. Exclusive-landing announcement (§7.3): this sub-task touches the
+`Makefile` (the rung grows its S4 leg); landing as part of the track PR,
+everyone else rebases.
+
+Test first (workflow step 2): the S4 leg itself is the test —
+`tests/td-builder-s4-drv.scm` prints the daemon's recorded facts for the
+qcow2 image drv (the `build` rung's subject, `guix system image -t qcow2`),
+and the rung asserts td-builder's rebuild registers the SAME path, NAR hash
+(recorded AND independently re-hashed), size, references, deriver. The first
+run is the expected HONEST RED that tells us which Q4-deferred sandbox
+features the image build actually needs (NEWPID/proc, chroot /dev + /etc,
+canonicalization) — grow sandbox.rs feature by feature off build.cc at the
+pin, never past what the red demands.
+
+Notes-to-date:
+
+- Existence proof: the `rootless` rung already rebuilds this exact image drv
+  under the pinned daemon in an unprivileged userns on this host — so the
+  build is feasible without root; what S4 proves is that TD'S sandbox
+  replicates the contract.
+- Candidate set parity: build.cc scans references against the FULL input
+  closure (computeFSClosure over inputs) + own outputs — main.rs already
+  passes the staged closure + outputs, so the shapes agree; the rung's
+  refs assert is the proof either way.
+- Loop cost: the S4 leg adds one more full image build per check (after
+  `build`'s two and `rootless`'s one). Accepted: acceptance demands the
+  image-drv differential as a self-discriminating rung; loop-latency owns
+  cycle-time follow-ups.
+
+S4 sub-ladder:
+
+- [ ] **S4a** oracle script + rung leg; observe the honest red, record it.
+- [ ] **S4b** sandbox parity growth (build.cc at the pin) until green.
+- [ ] **S4c** rung green: path, NAR hash (recorded + re-hashed), size,
+  references, deriver all daemon-equal for the image drv.
