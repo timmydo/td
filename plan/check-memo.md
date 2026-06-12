@@ -103,3 +103,32 @@ verified-reds below are on record in this file.
 - Relation to parked td-check (§6): td-check replaces the engine that does
   rebuild-and-compare; this track changes only WHEN it runs. If td-check
   graduates later, it inherits this policy and its constraints unchanged.
+- 2026-06-12 claude-fable-580472: claimed (PR #12). **Spine announcement
+  (§7.3):** this track lands edits to `check.sh` and the `Makefile` —
+  exclusive-landing rules apply; siblings rebase.
+- **Baseline (the "before" number):** unchanged-tree full `./check.sh` on the
+  dev host, 24 rungs, warm store — **440s wall (7m20.3s), green** (2026-06-12;
+  measured while a small concurrent rung run was also active, so the quiet
+  floor is slightly lower; reference: 341s at 18 rungs, 2026-06-10).
+- **S1 done (sub-ladder step 1):** `tests/check-memo.sh` (read/check/record
+  helper; misses fail CLOSED into the real `--check`), `tests/check-memo-info.scm`
+  (daemon-DB validity + NAR hash/size query — the constraint-5 assertion),
+  `tests/check-memo-drvs.scm` (fixtures: det, same-name/different-hash det',
+  µs-clock nondet), the permanent `memo` rung (miss/hit/changed-drv/expiry/
+  foreign/tamper/force-full/empty-identity/TTL-cap/nondet legs, every loop),
+  and check.sh's host-side environment identity
+  (`machine-id:store-fs-type:pinned-commit`, EMPTY under CI or when unknown —
+  fail closed) carried in via `--preserve='^TD_CHECK_'`, with
+  `TD_CHECK_FULL=1 ./check.sh` as the constraint-4 knob. `./check.sh memo`
+  green.
+
+### Memoization boundary (constraint 6, decided at S1)
+
+The helper applies ONLY to the pure reproducibility `--check` legs. Two rungs
+keep their direct `guix build --check` calls on purpose and are NOT wired:
+
+- **`offline`** — its `--check` exists to RE-EXECUTE the sandbox probe's
+  behavioral assertions every loop (the rung's own comment); memoizing it
+  would loosen when those assertions run, which is gate-2 territory.
+- **`rootless`** — its `--check` runs inside the rootless daemon and IS the
+  differential under test, not a reproducibility leg of ours.

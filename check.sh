@@ -79,6 +79,37 @@ if [ "$hostcommit" != "$pinned" ]; then
   exit 1
 fi
 
+# --- check-memo: environment identity + force-full knob (plan/check-memo.md) --
+# The --check verdict-memoization helper (tests/check-memo.sh) may green a
+# reproducibility leg only on a verdict recorded in the SAME environment
+# (constraint 2). That identity is computed HERE, on the host — the -C
+# container cannot see /etc/machine-id — and carried in via --preserve below:
+#   machine-id : this host (a verdict never travels between machines)
+#   store fs type : the filesystem under /gnu/store (the 2026-06-12
+#     readdir-order divergence was btrfs-vs-ext4 — environment-dependence the
+#     same-environment keying must preserve detection of)
+#   pinned commit : the channel pin (a bump re-keys every verdict)
+# FAIL CLOSED: if any component is unknown the identity stays EMPTY and the
+# helper never hits and never records — every leg runs the full --check.
+# CI GATE (constraint 2: CI verdict reuse is OFF until gate 2 re-opens): under
+# CI the identity is FORCED empty, so a persistent runner workspace can never
+# accumulate verdicts that would loosen a required check.
+# FORCE-FULL (constraint 4): TD_CHECK_FULL=1 ./check.sh bypasses all verdicts;
+# oracle re-baselines (any DIGESTS.md change) and suspected nondeterminism
+# MUST use it.
+if [ -n "${CI-}" ] || [ -n "${GITHUB_ACTIONS-}" ]; then
+  TD_CHECK_ENV=""
+else
+  machineid=$(cat /etc/machine-id 2>/dev/null || true)
+  storefs=$(stat -f -c %T /gnu/store 2>/dev/null || true)
+  if [ -n "$machineid" ] && [ -n "$storefs" ]; then
+    TD_CHECK_ENV="$machineid:$storefs:$pinned"
+  else
+    TD_CHECK_ENV=""
+  fi
+fi
+export TD_CHECK_ENV
+
 # --- Offline-isolation control: the netns probe mechanism must discriminate ---
 # The `offline` rung's probes assert "only `lo` in /proc/net/dev" inside
 # builders (tests/offline-drv.scm). That assertion only has teeth if the same
@@ -133,8 +164,13 @@ fi
 #                                so it does not weaken the offline contract; crun is
 #                                additionally run with --cgroup-manager=disabled so
 #                                it never writes the hierarchy.
+#   --preserve='^TD_CHECK_'    : the check-memo identity/knobs computed above
+#                                (TD_CHECK_ENV, TD_CHECK_FULL, ...) — --pure
+#                                would otherwise strip them; the `memo` rung
+#                                asserts TD_CHECK_ENV arrives.
 exec guix shell -C --pure \
   --no-substitutes --no-offload \
+  --preserve='^TD_CHECK_' \
   --expose=/gnu/store \
   --share="$HOME/.cache/guix" \
   --share=/var/guix \
