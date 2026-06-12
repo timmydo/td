@@ -10,8 +10,8 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
 - `.github/workflows/ci.yml` — two status checks per PR:
   - `lint` (GitHub-hosted): cheap structural checks only. It has no Guix and
     cannot run the loop; it never substitutes for `./check.sh`.
-  - `check` (self-hosted): the canonical full `./check.sh` on a runner that
-    is prepared like the dev box (below).
+  - `check` (hosted): the canonical full `./check.sh`, run by importing the
+    CI store image (below).
 - `.github/setup-branch-protection.sh` — applies the `protect-main` ruleset:
   PRs only, 1 approving review, required status checks, linear history, no
   force pushes or deletion.
@@ -37,31 +37,47 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
    codifies it as the `protect-main` ruleset; remove or align the manual rule
    afterwards so there is one source of truth (Settings → Branches /
    Settings → Rules).
-4. **Register the self-hosted runner** (the real gate). Requirements are
-   exactly check.sh's: a Guix system whose *host* guix is the channels.scm
-   pinned commit, a warm /gnu/store, /var/guix daemon socket, /dev/kvm, and
-   ~2 cores + ~8 GB free per run (the ladder runs heavy rungs two at a time).
-   GitHub-hosted runners cannot meet this. **Not t5700g** — the standing
-   immutable-infra rule excludes the dev host (`plan/ci-gate.md`
-   "Constraints"); provision a separate Guix host matching the pin. There the
-   runner can run as a plain user process (no system reconfiguration):
+4. **Push the CI store image** (the real gate's fuel). The `check` job runs
+   on GitHub-HOSTED runners by importing a snapshot of the warm build closure
+   the ladder needs — built on a dev box whose guix matches the pin (this
+   sidesteps self-hosted runners entirely, and with them the t5700g
+   immutable-infra exclusion). On the dev box:
 
-       # repo Settings → Actions → Runners → New self-hosted runner,
-       # then on the host (inside tmux or similar):
-       ./config.sh --url https://github.com/timmydo/td --token <TOKEN> \
-                   --labels guix,kvm
-       ./run.sh
+       PUSH=1 ci/build-ci-image.sh /path/with/50G/free
 
-   check.sh refuses to run if the host guix drifts from the pin, so a stale
-   runner fails loudly rather than fetching substitutes (it never goes
-   silently online).
-5. **Make the full check mandatory** once the runner is online and one PR has
-   shown a green `check`:
+   (needs a gh login holding `write:packages`; pushes
+   `ghcr.io/timmydo/td-ci:<pin>` and `:latest`). After the FIRST push, make
+   the package public once — GHCR UI ("td-ci" package → settings →
+   visibility) — so the workflow pulls it anonymously.
+5. **Make the full check mandatory** once one PR has shown a green `check`:
 
        ./.github/setup-branch-protection.sh --require-runner-check
 
-   (Doing this before a runner exists blocks every PR on a check that never
-   reports.)
+   (Doing this before the image exists blocks every PR on a check that
+   cannot pass.)
+
+## CI store image (how the hosted runner runs guix)
+
+`./check.sh` needs a host guix at the pinned commit and a warm /gnu/store —
+a fresh hosted runner has neither, and with substitutes disabled it would
+build the world. The sanctioned move is DESIGN §5's "warm store in, nothing
+fetched inside": `ci/build-ci-image.sh` snapshots the exact build closure of
+every rung (enumerated from the rungs' own lowering scripts —
+`ci/lower-check-drvs.sh`), signs it with the dev box daemon's key, and ships
+it as OCI layers; the workflow imports it (`ci/import-store.sh`) and runs the
+loop unmodified, offline. The loop is never adapted to CI (ci-gate track
+constraint) — the image fixes the HOST.
+
+- **Image tag = channels.scm pin.** The workflow derives the tag from the
+  PR's channels.scm, so a channel-bump PR is red until whoever bumps it runs
+  `PUSH=1 ci/build-ci-image.sh` from the new pin (part of the bump's
+  exclusive-landing duty; the failing pull names the missing tag).
+- **New rungs:** `ci/lower-check-drvs.sh` fails loudly when the Makefile rung
+  pools change, so a rung-adding PR also updates the enumeration and pushes a
+  refreshed image (same tag — push overwrites).
+- **Run budget:** image pull+import ≈ 15–25 min, the ladder ≈ 15–30 min on
+  the 4-vCPU hosted runner (vs ~6 min on the dev box) — well inside the job's
+  240-min timeout.
 
 ## The review deadlock (why the machine account is mandatory)
 

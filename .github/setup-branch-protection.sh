@@ -5,9 +5,9 @@
 #   ./.github/setup-branch-protection.sh [--require-runner-check]
 #
 # By default only the GitHub-hosted `lint` job is a REQUIRED status check.
-# Pass --require-runner-check once a self-hosted runner (labels: guix, kvm)
-# is registered to also require the full `check` job — do NOT pass it before
-# then: a required check that never reports blocks every PR forever.
+# Pass --require-runner-check once the CI store image is published to GHCR
+# (ci/build-ci-image.sh) and one PR has shown a green `check` — do NOT pass
+# it before then: a required check that cannot pass blocks every PR forever.
 #
 # What the ruleset enforces on main:
 #   - no direct pushes: changes land only via pull request;
@@ -85,5 +85,5 @@ gh api -X "$method" "$path" --input - <<EOF >/dev/null
 }
 EOF
 echo "ruleset 'protect-main' applied ($method): PRs only, 1 review, required checks: lint${existing:+ (replaced previous)}"
-[ "${1:-}" = "--require-runner-check" ] && echo "  + required check: check (self-hosted full ./check.sh)"
+[ "${1:-}" = "--require-runner-check" ] && echo "  + required check: check (full ./check.sh via the CI store image)"
 exit 0

@@ -462,17 +462,18 @@ run concurrently):
   Follow-on swaps (td-check, evaluator-as-library, loop convergence) are parked
   in §6 until they earn their own entries. `plan/td-builder.md`.
 - **ci-gate** *(approved 2026-06-11; re-decided to PR form later that day)* — a
-  self-hosted GitHub Actions runner executes the **unmodified** `./check.sh`
-  for every PR into branch-protected main and posts the verdict as a check;
-  once the runner is live, that check is required to merge alongside the
-  mandatory human review (§7.2). Acceptance: a green candidate PR shows a
-  passing `check` run and merges (rebase/squash) onto protected main; a
-  deliberately red candidate (broken assertion on a branch — the verified-red)
-  shows a failing `check` run and branch protection blocks its merge. CI only:
-  distribution/CD automation waits for M12 and a future entry. Runner-host
-  selection (t5700g excluded — standing immutable-infra rule; its daemon is
-  the owner's machine state, per the offline-isolation rescope), provisioning,
-  and constraints: `plan/ci-gate.md`.
+  GitHub Actions runner (hosted, fed by the CI store image —
+  `ci/build-ci-image.sh` snapshots the warm build closure, the job imports it)
+  executes the **unmodified** `./check.sh` for every PR into branch-protected
+  main and posts the verdict as a check; once the image is published, that
+  check is required to merge alongside the mandatory human review (§7.2).
+  Acceptance: a green candidate PR shows a passing `check` run and merges
+  (rebase/squash) onto protected main; a deliberately red candidate (broken
+  assertion on a branch — the verified-red) shows a failing `check` run and
+  branch protection blocks its merge. CI only: distribution/CD automation
+  waits for M12 and a future entry. The hosted-runner design sidesteps the
+  runner-host question (t5700g stays untouched — standing immutable-infra
+  rule); image mechanics and constraints: `plan/ci-gate.md`.
 - **check-memo** *(approved 2026-06-12 — this entry is the §4.3 gate-2
   sign-off: it loosens when an existing assertion runs)* — verdict
   memoization for the `guix build --check` reproducibility legs: skip the
@@ -501,7 +502,7 @@ To land:
 1. fetch and rebase onto latest `origin/main`;
 2. run the **full** `./check.sh` — it must be green;
 3. push the branch and mark its PR ready for review; CI re-runs the gate
-   (hosted `lint` + the full `./check.sh` on the self-hosted runner);
+   (`lint` + the full `./check.sh` on a hosted runner via the CI store image);
 4. on green CI and human approval, rebase- or squash-merge (merge commits are
    disabled — history stays linear, as under the old fast-forward rule);
 5. if main moved meanwhile, go to 1.
