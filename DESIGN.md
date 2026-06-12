@@ -491,6 +491,24 @@ run concurrently):
   the 2026-06-12 hosted-runner readdir-order case) are pinned in
   `plan/check-memo.md`; changing any of them re-opens gate 2.
 
+- **ci-image-pipeline** *(approved 2026-06-12)* — a GitHub workflow builds AND
+  pushes the CI store image; no human-run commands. Bootstrap a hosted runner
+  exactly as the `check` job does (substitutes allowed — image PREP may fetch,
+  §5 "warm store in"; the loop stays offline), run the in-repo generator,
+  push a CANDIDATE tag with the workflow's `GITHUB_TOKEN` to the REPO
+  namespace (`ghcr.io/timmydo/td-ci` — retiring the bot-namespace workaround),
+  then a second job pulls the candidate, runs the full unmodified
+  `./check.sh` against it, and only on green retags to `:<pin>`.
+  Acceptance: a channel-bump (or rung-addition) PR plus one workflow run
+  yields a published `:<pin>` image that a green `check` run consumed, with
+  no command run on a user machine. Design notes: `plan/ci-gate.md`
+  ("pipeline-built CI store image").
+  **Policy (human, 2026-06-12), binding repo-wide:** ALL generated artifacts
+  are produced on pipelines, never on a user's machine; any exception must be
+  documented with explicit human sign-off. (Documented exception under this
+  policy: CI store images v1–v3 were dev-box-built and hand-pushed during
+  ci-gate bring-up — signed off 2026-06-12, retired by this entry.)
+
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
 Each agent works one claimed track in its **own git worktree/branch** — never

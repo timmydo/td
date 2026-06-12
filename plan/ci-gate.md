@@ -299,3 +299,9 @@ Risks / open questions:
 - Trigger: path-filter on channels.scm + Makefile rung pools +
   tests/*-drv(s).scm + ci/, plus workflow_dispatch; concurrency-group it
   so two bumps never race a tag.
+- 2026-06-12 (human sign-off): the pipeline-built-image proposal above is
+  APPROVED as §7.1 entry **ci-image-pipeline**, together with a repo-wide
+  policy: all generated artifacts are produced on pipelines, never on a
+  user's machine; exceptions need documented human sign-off. The dev-box
+  image builds v1–v3 (hand-pushed by the human) are the documented,
+  signed-off exception, retired when ci-image-pipeline lands.
