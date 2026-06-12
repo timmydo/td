@@ -389,4 +389,6 @@ at a DISTINCT assert, S1–S3 green throughout, restored after each
   S4 reaches.
 
 All three restored to the committed green; final `./check.sh td-builder`
-re-run green after restoration (see below).
+re-run green after restoration: exit 0, full PASS line incl. "td-builder
+rebuilds the SYSTEM IMAGE drv itself, daemon-equal on every recorded
+field (S4)".
