@@ -1,6 +1,9 @@
 # Per-rung scratch dirs (`rootless`: staged store + DB snapshot; `oci-load`:
 # OCI layouts + corrupted-archive control; `td-builder`: staged store +
-# registration record); kept on a red run for triage, removed on green.
+# registration record; `generation-image`: validator image extraction; `run`:
+# archive + unpacked rootfs); kept on a red run for triage, removed on green.
 .rootless-scratch/
 .oci-load-scratch/
 .td-builder-scratch/
+.genimg-scratch/
+.run-scratch/

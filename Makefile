@@ -265,7 +265,11 @@ manifest-check:
 # td's OCI lowering emits userspace ONLY; this builds the bootc-style image that
 # makes it bootable by APPENDING a /boot layer (kernel + initrd) — see
 # (system td-generation). Heavier rung (builds a system docker image + repacks),
-# so it runs with the other image rungs. Self-discriminating at the artifact
+# so it runs with the other image rungs. Validator scratch lives in
+# $(CURDIR)/.genimg-scratch — disk, not the sandbox /tmp (the oci-load lesson:
+# that tmpfs is a small RAM fraction and the extraction is multi-GB; it
+# ENOSPC'd on a 16G-RAM CI host); kept on red for triage, removed on green.
+# Self-discriminating at the artifact
 # level (like manifest-check/no-guix), and it --checks reproducibility (prime
 # directive 1 — this IS the new artifact):
 #   • build the gen-1 + gen-2 bootc images, and `--check` BOTH bit-for-bit;
@@ -295,8 +299,11 @@ generation-image:
 	echo ">> check: reproducibility of BOTH bootc generation images"; \
 	$(GUIX) build --check "$$gen1" "$$gen2"; \
 	echo ">> validate artifacts (structured: guile-json metadata + guile-zlib initrd)"; \
+	scratch="$(CURDIR)/.genimg-scratch"; \
+	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	TD_GEN1_IMG="$$gen1_img" TD_GEN2_IMG="$$gen2_img" TD_BASE_IMG="$$base_img" \
-	  $(GUIX) repl $(LOAD) tests/generation-image-check.scm
+	  TMPDIR="$$scratch" $(GUIX) repl $(LOAD) tests/generation-image-check.scm; \
+	rm -rf "$$scratch"
 
 # oci-load (side-track, deferred from M10.1; plan/oci-load.md). The shipped
 # images must be consumable by an INDEPENDENT OCI implementation, not just our
@@ -839,14 +846,20 @@ td-builder:
 #    `docker run IMG <cmd>` to drive /bin/sh. Self-discriminating: a positive run
 #    (sentinel + exit 0) AND a negative control (a bogus exec must fail) — see
 #    tests/run-image.sh. Heaviest behavioral rung (it unpacks the full image
-#    rootfs) → runs last (§1.3).
+#    rootfs) → runs last (§1.3). Its scratch (archive + unpacked rootfs) lives
+#    in $(CURDIR)/.run-scratch — disk, not the sandbox /tmp (same tmpfs-size
+#    lesson as .genimg-scratch above); run-image.sh's own EXIT trap cleans its
+#    subdir either way, the recipe removes the parent on green.
 run:
 	@echo ">> run: execute the shipped OCI image as a real OCI container (crun)"
 	@set -euo pipefail; \
 	img=`$(GUIX) system image $(LOAD) -t docker $(SYSTEM)`; \
 	test -n "$$img" || { echo "ERROR: could not build the shipped OCI image" >&2; exit 1; }; \
 	echo ">> shipped OCI image: $$img"; \
-	sh tests/run-image.sh "$$img"
+	scratch="$(CURDIR)/.run-scratch"; \
+	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
+	TMPDIR="$$scratch" sh tests/run-image.sh "$$img"; \
+	rm -rf "$$scratch"
 
 # 8. M9.2 container-HOST rung — boot the SHIPPED base and run a Guix-built OCI APP
 #    image on it with the shipped crun, as root. Where `run` (M8) ran the shipped
