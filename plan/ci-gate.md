@@ -305,3 +305,19 @@ Risks / open questions:
   user's machine; exceptions need documented human sign-off. The dev-box
   image builds v1–v3 (hand-pushed by the human) are the documented,
   signed-off exception, retired when ci-image-pipeline lands.
+- 2026-06-12 claude-fable-52ceb1 (run #8 + the endgame): rebased twice more
+  (auto-merge protocol + check-memo charter landed); run #8 against the v3
+  image red'ed ONLY on td-placed-tree-mkfs — the directory-aware diagnostic
+  showed root.img + verity records + grub.cfg differing at EQUAL record
+  sizes: settled-state du is still fs-DEPENDENT (btrfs inlines small files;
+  ext4 charges extent metadata) — PR #9 cured the timing flake, not the
+  cross-fs property; run #4's match was luck. Real fix: PR #13 sizes from
+  CONTENT (td-place.sh: tar|wc -c; td-disk.scm: apparent sizes +
+  4KiB/entry); rollback/place/boot-disk green locally; cherry-picked here.
+  The docker-image family (upstream readdir-order defect, run #6/#7 data)
+  is handled by EXCLUSION: build-ci-image.sh now drops those outputs from
+  the export roots (inputs stay; the runner builds the family itself, so
+  its --check is runner-self-consistent). HUMAN SIGN-OFFS (2026-06-12):
+  the exclusion accommodation, and image v4 as one more manual build+push
+  exception under the pipeline-artifact policy (the last before
+  ci-image-pipeline lands).

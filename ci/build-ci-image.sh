@@ -78,7 +78,20 @@ DRVLIST="$work/all-drvs.txt" guix repl ci/drv-outputs.scm \
 channel_out=$(guix repl -L . ci/channel-instance-drv.scm 2>/dev/null \
   | sed -n 's/^CHANNEL_OUT=//p')
 test -n "$channel_out" || { echo "FATAL: no channel instance output" >&2; exit 1; }
-sort -u "$work/check-drvs.txt" "$work/outputs.txt" > "$work/roots.txt"
+# EXCLUDE the docker-image artifact family's OUTPUTS from the export (their
+# drvs and input closures stay, so the runner builds them itself and the
+# --check rungs compare runner-vs-runner). Why: the pinned guix's docker
+# builder packs tars in READDIR ORDER (guix/docker.scm never passes #:tar to
+# tar-base-options, so --sort=name is dropped) — filesystem-dependent bytes
+# (btrfs dev box vs ext4 runner), an UPSTREAM defect td cannot patch without
+# forking the builder (future work; human-signed accommodation 2026-06-12,
+# see plan/ci-gate.md). Everything embedding such a tarball is excluded too:
+# generation images (repack it), the registry (embeds gen-image layouts),
+# placed trees + rollback disk (extract gen images).
+grep -Ev -- '-(docker-image\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rollback-disk)$' \
+  "$work/outputs.txt" > "$work/outputs-kept.txt"
+echo "   excluded $(($(wc -l < "$work/outputs.txt") - $(wc -l < "$work/outputs-kept.txt"))) fs-order-sensitive family outputs (runner rebuilds them)"
+sort -u "$work/check-drvs.txt" "$work/outputs-kept.txt" > "$work/roots.txt"
 printf '%s\n' "$channel_out" >> "$work/roots.txt"
 echo "   $(wc -l < "$work/roots.txt") export roots (channel profile: $channel_out)"
 
