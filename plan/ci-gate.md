@@ -250,3 +250,52 @@ check; merging needs green checks + one approving review (DESIGN §7.2).
   cross-fs property instead of fixing it). Run #7's diagnostic gathers
   the deciding data: tar entry-listing diffs + a runner
   self-consistency probe (two runner rebuilds compared to each other).
+
+## Future work (proposed roadmap entry — needs human sign-off, DESIGN §4.3):
+## pipeline-built CI store image
+
+Goal: a GitHub workflow (`ci-image.yml`) builds AND pushes the CI store
+image, replacing the manual dev-box build + human-run `skopeo` push.
+Written down 2026-06-12 while the manual process was fresh (human asked).
+
+Feasibility — the pieces already exist:
+- The image generator is in-repo (`ci/build-ci-image.sh` + enumeration);
+  the gate workflow already proves a hosted runner can bootstrap an apt
+  daemon, install build users, run the pinned guix, and use KVM.
+- A pipeline run is essentially "warm the store, run the closure builds,
+  export": bootstrap exactly as the check job does (or FROM the previous
+  image when the pin is unchanged — rung additions only build a delta);
+  on a CHANNEL BUMP, warm the new world from substitutes instead —
+  image PREP is allowed to fetch (DESIGN §5 "warm store in"); the LOOP
+  stays offline. The marionette artifact outputs need KVM: present on
+  ubuntu-latest (the check job already relies on it).
+- Push auth: the workflow's GITHUB_TOKEN (permissions: packages: write)
+  can create/push ghcr.io/timmydo/td-ci — repo-owned namespace, package
+  auto-linked to the repo. This RETIRES both the bot-namespace wart
+  (ghcr.io/timmydo-bot/td-ci exists only because the bot PAT cannot
+  create under timmydo) and the manual push (which is also blocked for
+  the agent by its own safety tooling — a human has to babysit it).
+- Signing: the runner daemon generates a fresh key per build; the image
+  ships its own pubkey (meta/signing-key.pub) and the importer
+  authorizes it — trust anchor is the PUSH ACL, exactly as today
+  (documented under "image hosting" above). No secret key material in
+  the repo or in Actions secrets.
+- Verification before publish: re-run `ci/verify-import-local.sh`'s
+  import half on the runner, or better: push to a CANDIDATE tag, have a
+  second job pull it and run the full ./check.sh, and only then retag
+  to :<pin> (the gate's required tag). The bump PR stays red until the
+  retag — same contract as today.
+
+Risks / open questions:
+- 6h job limit vs a cold channel bump (full substitutes fetch + td
+  artifact builds + export of ~41G). Mitigation: stage the build
+  (warm-store job → export job via artifact/cache), or accept that rare
+  bumps need a workflow_dispatch retry.
+- Generator currently guards `guix describe == pin` against the HOST
+  guix; on a runner that becomes the shim/CHANNEL_OUT guix — the guard
+  logic is reusable, the script needs a small host-bootstrap mode.
+- Disk: ~65G staging + 41G store fits current ubuntu-latest (145G seen
+  live), but is image-SKU dependent; keep the existing free-space guard.
+- Trigger: path-filter on channels.scm + Makefile rung pools +
+  tests/*-drv(s).scm + ci/, plus workflow_dispatch; concurrency-group it
+  so two bumps never race a tag.
