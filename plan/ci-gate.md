@@ -197,5 +197,31 @@ check; merging needs green checks + one approving review (DESIGN §7.2).
   and on a red run every "may not be deterministic" drv in the log is
   re-checked with -K and byte-mapped (sizes, first byte, 16MiB buckets,
   tar-vs-gzip-level comparison for .tar.gz).
+- 2026-06-12 claude-fable-52ceb1 (live run #5 → the du root cause): run #5
+  had ZERO ENOSPC (PR #8's scratch fix verified live) and exactly one red:
+  rollback's --check of td-placed-tree-mkfs "may not be deterministic",
+  REPRODUCED by the diagnostic's -K re-check on the quiet runner — real
+  intermittent nondeterminism, not pressure-flake (though the verdicts'
+  earlier ENOSPC correlation now reads as load→slow writeback, same
+  mechanism). Cause: both td-place.sh and td-disk.scm size ext4 images
+  from `du -sk` of a freshly-written tree; du reports st_blocks, and ext4
+  DELAYED ALLOCATION under-counts until writeback settles — a
+  timing-dependent wiggle. The btrfs dev box accounts blocks at write
+  time (probed: st_blocks identical before/after syncfs), so the dev loop
+  can never see it; run #4's bit-for-bit match proves settled-state du
+  agrees across btrfs/ext4 for these trees. Fix: PR #9 (`sync -f` before
+  each du sizing; td-place.sh + td-disk.scm — fix-forward under prime
+  directive 1, not spine files). Verified: rollback + place rungs green
+  with the fix AND the new td-placed-tree-mkfs output is byte-IDENTICAL
+  to the old (output-preserving; no DIGESTS impact). Cherry-picked onto
+  ci-image until #9 lands. Diagnostic gap also fixed: directory outputs
+  (the placed tree) are now walked file-by-file instead of being treated
+  as a flat file (run #5's mapper printed only "4096 vs 4096" — the
+  directory inode).
+- NOTE for landing: main moved (M12 registry/verify-place landed). The
+  rebase will trip ci/lower-check-drvs.sh's KNOWN_RUNGS guard on the new
+  rungs (by design); the enumeration must learn them, the CI store image
+  must be rebuilt + re-pushed (human runs the push — classifier-blocked
+  for the agent), and the full ./check.sh re-run on the rebased branch.
 - The track's verified-red (red branch → failing `check` run → blocked PR)
   needs the published image; it is step 5 above, not yet run.
