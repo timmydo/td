@@ -23,7 +23,9 @@
 #      actually IN that root (the menu must point at a root that boots, not just
 #      one that exists), and extracts kernel + initrd into <boot>/td/gen-N/,
 #      recording root-label/system/root-uuid alongside (so the menu can be
-#      regenerated purely from on-disk state);
+#      regenerated purely from on-disk state); the placed copy of td-identity
+#      gains `image-digest=sha256:<hex>` — the sha256 of the artifact actually
+#      unpacked, which the artifact cannot carry itself (M12, DESIGN §2.7);
 #   4. with --mkfs, turns the staged root content into a LIVE ext4 filesystem
 #      image <root-store>/td/gen-N/root.img, labeled with this generation's root
 #      label and the identity's deterministic UUID (mke2fs -d; reproducible — the
@@ -173,6 +175,13 @@ case "$img_system" in
 esac
 [ -n "$img_uuid" ] || {
   echo "td-place: image identity carries no root-uuid= — cannot create the generation's filesystem deterministically" >&2; exit 1; }
+# M12 (DESIGN §2.7): an image CANNOT carry its own digest (self-reference) —
+# an embedded image-digest= line is necessarily forged and would shadow the
+# line the placer appends below; fail closed.
+if grep -q '^image-digest=' "$work/td-identity"; then
+  echo "td-place: image's embedded identity already carries image-digest= — an image cannot state its own digest (§2.7); refusing to place" >&2
+  exit 1
+fi
 
 # --- 3a. Stage this generation's /boot (kernel + initrd + identity). ------------
 # Extract + validate in a sibling staging dir; the live gen dir is untouched until
@@ -193,6 +202,23 @@ printf '%s\n' "$root_label" > "$boot_stage/root-label"
 printf '%s\n' "$img_system" > "$boot_stage/system"
 printf '%s\n' "$img_uuid"   > "$boot_stage/root-uuid"
 printf '%s\n' "$extra_kernel_args" > "$boot_stage/kernel-args"
+
+# M12 (DESIGN §2.7): the PLACED identity additionally records what the image
+# IS — the sha256 of the artifact actually unpacked. The image cannot carry
+# its own digest (self-reference), so the placer computes and appends it; this
+# line is the anchor M12's signature verification compares against.
+img_digest=$(sha256sum "$img")
+img_digest="sha256:${img_digest%% *}"
+img_hex=${img_digest#sha256:}
+case "$img_hex" in
+  *[!0-9a-f]*|'')
+    echo "td-place: could not compute the image digest for $img" >&2; exit 1 ;;
+esac
+[ "${#img_hex}" -eq 64 ] || {
+  echo "td-place: computed image digest has ${#img_hex} hex chars, expected 64" >&2; exit 1; }
+chmod u+w "$boot_stage/td-identity"          # tar kept the image's 0444
+printf 'image-digest=%s\n' "$img_digest" >> "$boot_stage/td-identity"
+chmod 0444 "$boot_stage/td-identity"
 
 # --- 3b. APPLY the userspace layers into this generation's own root. ------------
 # The result is the per-generation root CONTENT, staged as root.tar — so

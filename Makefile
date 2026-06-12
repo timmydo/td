@@ -373,6 +373,8 @@ oci-load:
 # deployment behavior is tested against the artifact (M10-design.md decision 2),
 # not diffed against a Guix component it lacks: tests/place-check.scm cracks the
 # tree and asserts each present generation is placed with its own kernel/initrd,
+# an identity recording the artifact's sha256 (image-digest=, M12 §2.7 —
+# value-checked against the real artifacts via TD_IMAGES),
 # its applied root content, and a menuentry that selects its OWN root and no
 # other's (per-entry, not block-wide), the user grub.cfg preamble survives, and
 # (the prune scenario) the oldest generation's boot dir, root content AND menu
@@ -385,7 +387,11 @@ place:
 	drvs=`$(GUIX) repl $(LOAD) tests/place-drv.scm 2>/dev/null`; \
 	place_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_PLACE=//p'`; \
 	prune_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_PRUNE=//p'`; \
+	img1=`printf '%s\n' "$$drvs" | sed -n 's/^IMG_1=//p'`; \
+	img2=`printf '%s\n' "$$drvs" | sed -n 's/^IMG_2=//p'`; \
+	img3=`printf '%s\n' "$$drvs" | sed -n 's/^IMG_3=//p'`; \
 	test -n "$$place_drv" -a -n "$$prune_drv" || { echo "ERROR: could not lower the placer tree derivations" >&2; exit 1; }; \
+	test -n "$$img1" -a -n "$$img2" -a -n "$$img3" || { echo "ERROR: could not lower the generation image artifact paths" >&2; exit 1; }; \
 	echo ">> place  tree derivation (gens 1,2 keep 10): $$place_drv"; \
 	echo ">> prune  tree derivation (gens 1,2,3 keep 2): $$prune_drv"; \
 	place_tree=`$(GUIX) build "$$place_drv"`; \
@@ -394,9 +400,11 @@ place:
 	$(GUIX) build --check "$$place_drv" "$$prune_drv"; \
 	echo ">> validate PLACE tree (gens 1,2 present, none pruned)"; \
 	TD_PLACED="$$place_tree" TD_PRESENT="1 2" TD_ABSENT="" \
+	TD_IMAGES="1=$$img1 2=$$img2" \
 	  $(GUIX) repl $(LOAD) tests/place-check.scm; \
 	echo ">> validate PRUNE tree (gens 2,3 present, gen 1 pruned)"; \
 	TD_PLACED="$$prune_tree" TD_PRESENT="2 3" TD_ABSENT="1" \
+	TD_IMAGES="2=$$img2 3=$$img3" \
 	  $(GUIX) repl $(LOAD) tests/place-check.scm
 
 # M10.3 manual rollback (M10-design.md step 5, "Roll back"; the DESIGN §7.1
