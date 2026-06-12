@@ -82,17 +82,23 @@ jobs:
     steps:
       # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: free disk + move /gnu and /var/guix to the big partition
+      - name: free disk + move /gnu, /var/guix and /tmp to the big partition
         # ubuntu-latest: ~14G free on /, ~75G on /mnt. The pulled blobs
         # (~21G) plus the imported store (~40G) both live on /mnt — and the
-        # blobs are deleted right after the import. Preinstalled toolchains
+        # blobs are deleted right after the import. /tmp moves too: the
+        # daemon's build dirs (/tmp/guix-build-*) and the rungs' container
+        # scratch live there, and a 2.8G disk-image build plus a concurrent
+        # multi-GB extraction blew the root partition on live run #3
+        # (ENOSPC in the generation-image rung). Preinstalled toolchains
         # are dropped for headroom on /.
         run: |
           set -eu
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           sudo mkdir -p /mnt/gnu /mnt/var-guix /gnu /var/guix
+          sudo install -d -m 1777 /mnt/tmp
           sudo mount --bind /mnt/gnu /gnu
           sudo mount --bind /mnt/var-guix /var/guix
+          sudo mount --bind /mnt/tmp /tmp
           df -h / /mnt
       - name: install guix daemon + tools
         # The distro daemon only BOOTSTRAPS the import; the check itself runs
@@ -175,3 +181,43 @@ jobs:
           export PATH="$(cat /tmp/host-guix)/bin:$PATH"
           guix describe
           ./check.sh
+      - name: diagnose a differing td-rollback-disk (debug-only, red runs)
+        # TEMPORARY diagnostic, additive-only — gates nothing. Live run #3
+        # red'ed with "td-rollback-disk may not be deterministic": the
+        # runner's rebuild differs from the dev-built output shipped in the
+        # CI store image, i.e. a CROSS-HOST reproducibility defect the
+        # dev-only loop cannot see (each box is self-consistent). The cheap
+        # local theories (du block accounting, mke2fs -d readdir order) are
+        # ruled out, so this maps WHERE the 2.8G image differs to direct the
+        # real fix. Remove once the builder is cross-host deterministic.
+        if: failure()
+        run: |
+          set -eu
+          [ -f /tmp/host-guix ] || { echo "failed before the daemon switch; nothing to diagnose"; exit 0; }
+          export PATH="$(cat /tmp/host-guix)/bin:$PATH"
+          drv=$(guix repl -L . tests/rollback-drv.scm 2>/dev/null | sed -n 's/^DRV_DISK=//p')
+          test -n "$drv" || { echo "could not lower DRV_DISK; nothing to diagnose"; exit 0; }
+          out=$(guix build --no-substitutes --no-offload "$drv")
+          guix build --check -K --no-substitutes --no-offload "$drv" || true
+          chk="$out-check"
+          [ -e "$chk" ] || { echo "no $chk: this rebuild matched (red was elsewhere)"; exit 0; }
+          ls -l "$out" "$chk"
+          off=$(cmp "$out" "$chk" | sed -n 's/.* differ: byte \([0-9]*\).*/\1/p')
+          echo "first differing byte: ${off:-unknown}"
+          if [ -n "${off:-}" ]; then
+            sec=$(( (off - 1) / 512 * 512 ))
+            echo "--- shipped @ $sec:"
+            dd if="$out" bs=512 skip=$((sec / 512)) count=1 2>/dev/null | od -A d -t x1z
+            echo "--- rebuilt @ $sec:"
+            dd if="$chk" bs=512 skip=$((sec / 512)) count=1 2>/dev/null | od -A d -t x1z
+          fi
+          echo "--- 16MiB buckets that differ (of $(stat -c %s "$out") bytes):"
+          bs=16777216; n=$((($(stat -c %s "$out") + bs - 1) / bs)); i=0
+          while [ "$i" -lt "$n" ]; do
+            cmp -s <(dd if="$out" bs=$bs skip=$i count=1 2>/dev/null) \
+                   <(dd if="$chk" bs=$bs skip=$i count=1 2>/dev/null) \
+              || echo "  bucket $i (offset $((i * bs)))"
+            i=$((i + 1))
+          done
+          echo "--- partition table (shipped):"
+          sfdisk -d "$out" || true

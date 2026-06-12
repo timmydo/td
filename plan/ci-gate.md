@@ -153,5 +153,24 @@ check; merging needs green checks + one approving review (DESIGN §7.2).
   `guix describe` = pin, closure 111 items (⊆ the image's channel-instance
   closure), `./check.sh eval` green, `./check.sh rootless` green (PASS, NAR
   hash equal to oracle).
+- 2026-06-12 claude-fable-52ceb1 (live run #3): the shim worked — the run
+  cleared the cheap rungs and went deep into the heavy pool. Two failures:
+  (1) `generation-image` hit ENOSPC: the daemon's build dirs and the rungs'
+  container scratch live in /tmp on the runner's ~14G root partition —
+  addressed by bind-mounting /mnt/tmp over /tmp alongside the /gnu and
+  /var/guix moves (verification = the next live run). (2) `rollback` red'ed with "td-rollback-disk may not be
+  deterministic: output differs" — the runner's rebuild differs from the
+  dev-built output shipped in the image. NOTE the strengthening this
+  reveals: because the image carries dev-built outputs, every `--check`
+  rung on the runner is now a CROSS-HOST reproducibility differential,
+  which the dev-only loop (same box vs itself) cannot see. Treating it as
+  a real defect in the M10 artifact builder until proven environmental:
+  du block accounting (tmpfs vs ext4: equal) and mke2fs -d readdir order
+  (1.47.2 sorts: images identical under permuted creation order) are ruled
+  out locally; a TEMPORARY failure-only workflow step now rebuilds the drv
+  with --check -K on a red run and maps the differing 16MiB regions
+  against the partition table. ENOSPC pressure during the parallel rung is
+  a possible confounder (rollback's verdict landed ~100s before the
+  ENOSPC), so the same next run also decides that.
 - The track's verified-red (red branch → failing `check` run → blocked PR)
   needs the published image; it is step 5 above, not yet run.
