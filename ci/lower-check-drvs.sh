@@ -29,7 +29,16 @@ set -eu
 
 GUIX="guix time-machine -C channels.scm --"
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+trap 'rm -f "$tmp" "$tmp.err"' EXIT
+
+# Run one lowering entry point with an honest exit: stdout to $tmp, stderr
+# surfaced on failure instead of eaten, and the exit status propagating
+# instead of vanishing into a pipe (the old `repl | sed` masking is how the
+# rootless TD_IMAGE_DRV gap stayed silent through the first image build).
+lower() {
+  "$@" > "$tmp" 2> "$tmp.err" \
+    || { echo "ERROR: lowering failed: $*" >&2; tail -5 "$tmp.err" >&2; exit 1; }
+}
 
 # --- Maintenance guard: the rung list this enumeration was written against.
 KNOWN_RUNGS="eval diff typed-coverage oci-diff manifest-diff generation-diff \
@@ -75,20 +84,31 @@ $GUIX build -d $tools skopeo
 # CI store so the in-loop time-machine is the same warm no-op as on a dev box).
 # Each repl output goes through a file, not a pipe: a pipe into sed/grep
 # would mask the repl's exit status and silently drop drvs from the image.
-$GUIX repl -L . ci/channel-instance-drv.scm 2>/dev/null > "$tmp"
+lower $GUIX repl -L . ci/channel-instance-drv.scm
 sed -n 's/^CHANNEL_DRV=//p' "$tmp"
 
-# --- System images (build + oci rungs) — qcow2 and docker, via -d.
-$GUIX system image -L . -t qcow2  -d system/td.scm
+# --- System images (build + oci rungs) — qcow2 and docker, via -d. The
+# qcow2 drv doubles as the rootless rung's target (Makefile sets
+# TD_IMAGE_DRV the same way before running tests/rootless-drvs.scm).
+lower $GUIX system image -L . -t qcow2 -d system/td.scm
+TD_IMAGE_DRV=$(head -n1 "$tmp")
+case "$TD_IMAGE_DRV" in
+  /gnu/store/*.drv) ;;
+  *) echo "ERROR: qcow2 lowering printed no drv path (got: '$TD_IMAGE_DRV')" >&2
+     exit 1;;
+esac
+printf '%s\n' "$TD_IMAGE_DRV"
+export TD_IMAGE_DRV
+# Bare on purpose (no lower()): set -e catches failure, stderr streams live.
 $GUIX system image -L . -t docker -d system/td.scm
 
 # --- Rungs with dedicated lowering scripts (print PREFIX=...drv lines).
 for s in $LOWERING_SCRIPTS; do
   [ -e "$s" ] || { echo "ERROR: $s in LOWERING_SCRIPTS does not exist" >&2; exit 1; }
-  $GUIX repl -L . "$s" 2>/dev/null > "$tmp"
+  lower $GUIX repl -L . "$s"
   sed -n 's/^[A-Z0-9_]*=\(\/gnu\/store\/.*\.drv\)$/\1/p' "$tmp"
 done
 
 # --- Marionette system tests (same two-step lowering as the Makefile recipes).
-$GUIX repl -L . ci/system-test-drvs.scm 2>/dev/null > "$tmp"
+lower $GUIX repl -L . ci/system-test-drvs.scm
 grep '^/gnu/store/.*\.drv$' "$tmp"
