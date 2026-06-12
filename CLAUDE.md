@@ -118,12 +118,16 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
   (2) run the FULL `./check.sh` — must be green; (3) push the branch and mark the PR
   ready — CI re-runs the gate and a human review approves (main is branch-protected:
   required checks + mandatory review, no direct pushes — `.github/BRANCH-PROTECTION.md`);
-  (4) rebase- or squash-merge once green and approved; if main moved, repeat
-  from (1). Opening a PR with a locally-red or un-run `./check.sh` is a contract
-  violation — CI verifies your run, it does not replace it. The self-hosted runner's
-  `./check.sh` check becomes required once the `ci-gate` track's runner is live
-  (DESIGN §7.1); until then `lint` is the required check and step 2 is the only
-  full-loop gate.
+  (4) merge once green and approved — default to arming auto-merge when you mark
+  the PR ready (`gh pr merge --auto --squash`, or `--rebase`) so the human's
+  approval is the last manual step; merge manually instead when the landing must
+  be sequenced (e.g. exclusive landings stacked behind another PR). If main moved
+  before the merge, repeat from (1) — auto-merge does not waive the rebase + full
+  re-check obligation. Opening a PR with a locally-red or un-run `./check.sh` is a
+  contract violation — CI verifies your run, it does not replace it. The
+  self-hosted runner's `./check.sh` check becomes required once the `ci-gate`
+  track's runner is live (DESIGN §7.1); until then `lint` is the required check
+  and step 2 is the only full-loop gate.
 - **Exclusive landings:** changes to the shared spine — `system/td.scm` (frozen
   oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
   everyone. Announce in your track file, land as small standalone PRs, expect
