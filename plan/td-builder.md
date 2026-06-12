@@ -107,13 +107,13 @@ equal to the root daemon, so oracle authority transfers).
   (claude-fable-a03d13): `nar-hash` agrees with the daemon's DB across the
   full-coverage fixture + td-builder's own output; verified-red ×3 (ordering,
   padding, executable-flag — see Working state "S2 — NAR differential").
-- [ ] **S3 drv parse + trivial build** — parse the ATerm `.drv`, execute the
+- [x] **S3 drv parse + trivial build** — parse the ATerm `.drv`, execute the
   trivial probe drv in a userns sandbox, register the output; NAR-hash-equal
   to the oracle, at the same store path.
-- [ ] **S4 the rung** — full acceptance differential including the system
+- [x] **S4 the rung** — full acceptance differential including the system
   image drv, plumbed into HEAVY_RUNGS (exclusive landing: `Makefile`, maybe
   `check.sh` sandbox packages).
-- [ ] **S5 verified-red** — deliberate builder defects (NAR, sandbox,
+- [x] **S5 verified-red** — deliberate builder defects (NAR, sandbox,
   references) each red the rung; evidence recorded here.
 - [ ] **S6 land** — §7.2 protocol; release the claim in `PLAN.md`.
 
@@ -343,7 +343,50 @@ Notes-to-date:
 
 S4 sub-ladder:
 
-- [ ] **S4a** oracle script + rung leg; observe the honest red, record it.
-- [ ] **S4b** sandbox parity growth (build.cc at the pin) until green.
-- [ ] **S4c** rung green: path, NAR hash (recorded + re-hashed), size,
+- [x] **S4a** oracle script + rung leg; observe the honest red, record it.
+- [x] **S4b** sandbox parity growth — NOT NEEDED (finding above): green at S3 parity.
+- [x] **S4c** rung green: path, NAR hash (recorded + re-hashed), size,
   references, deriver all daemon-equal for the image drv.
+
+### S4 working state (claude-fable-8ebb4e)
+
+**S4a landed the leg and it came up GREEN at S3 sandbox parity** — the
+honest red never materialized. td-builder rebuilt the real image drv
+(`image.qcow2.drv`, 4448-item staged closure, full genimage/mke2fs build)
+and registered the daemon's exact facts: path, NAR hash
+(`b6f6caeb…` recorded AND independently re-hashed), NAR size 489328752,
+the full 83-reference set, deriver. So the S4b finding is: **none of the
+Q4-deferred chroot features (NEWPID/proc, /dev set, /etc, canonicalization,
+seccomp) is needed by this subject** — the image builder is a
+self-contained Guile + genimage/mke2fs tree that never touches them. The
+deferred list stays parked (composefs-style) for whenever a future
+differential subject honestly reds on one of them; growing the sandbox now
+would be speculative parity, not the smallest increment.
+
+### Verified-red (S4) — each driven via `./check.sh td-builder`, exit ≠ 0
+at a DISTINCT assert, S1–S3 green throughout, restored after each
+
+- **A — sandbox defect (build leg):** tmpfs mounts capped at 1 MiB in
+  sys.rs (`size=1m` data) — a sandbox that cannot host a real build's
+  scratch space. S3's tiny builds fit; genimage dies (`invoke-error`,
+  exit 1) and the rung reds at
+  `FAIL: td-builder could not build the image drv …image.qcow2.drv`.
+- **B — NAR defect (hash assert):** large-file truncation in nar.rs —
+  contents framed AND streamed capped at 16 MiB (the 32-bit-length bug
+  class), NAR well-formed but wrong. Every S1–S3 subject is smaller (S2
+  pairs, S3's 1048-byte output) so all earlier legs PASS with the defect;
+  the 489 MB image trips it and the rung reds at
+  `FAIL: image NAR hash mismatch — registration 'sha256:1dbe3043…' vs
+  daemon 'sha256:b6f6caeb…'` — the S4 asserts discriminate at a scale the
+  unit suite and S2/S3 differentials never reach.
+- **C — references defect (refs assert):** fixed-size candidate table in
+  scan.rs — only the first 1000 candidates scanned (the capacity-cap bug
+  class). S3's ~468-candidate set fits so S1–S3 PASS; the image's 4449
+  candidates overflow it, td registers only the 18 refs whose hash parts
+  sort early, and the rung reds at `FAIL: image references set mismatch`,
+  printing both sets (daemon's 83 incl. eudev/less/… vs td's truncated 18).
+  This is the refs discriminator S3's C proved, re-proven at the scale only
+  S4 reaches.
+
+All three restored to the committed green; final `./check.sh td-builder`
+re-run green after restoration (see below).
