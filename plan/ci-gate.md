@@ -225,3 +225,28 @@ check; merging needs green checks + one approving review (DESIGN §7.2).
   for the agent), and the full ./check.sh re-run on the rebased branch.
 - The track's verified-red (red branch → failing `check` run → blocked PR)
   needs the published image; it is step 5 above, not yet run.
+- 2026-06-12 claude-fable-52ceb1 (live run #6 → the docker-image root
+  cause, UPSTREAM): rollback GREEN on the runner — PR #9's du fix
+  verified live. Remaining red: fw8sxmkc…-docker-image.tar.gz "may not
+  be deterministic" (no-guix + manifest-check rungs), now in BOTH runs
+  where its --check executed (#4, #6) — stable cross-host divergence,
+  green locally. Diagnostic mapped it: identical gzip headers; the
+  decompressed TARs first differ at byte 1092 = the entry name right
+  after "./<layer-id>/" (the 64-hex layer id itself is IDENTICAL);
+  runner rebuild ~586KB larger. Root cause found in the PINNED GUIX
+  SOURCE: guix/build/pack.scm tar-base-options emits --sort=name ONLY
+  when a #:tar argument is supplied, and guix/docker.scm passes none at
+  any of its three tar invocations — so layer.tar and the outer
+  image.tar are packed in READDIR ORDER, which is
+  filesystem-dependent (btrfs dev box vs ext4 runner: each
+  self-consistent, mutually divergent). This is an upstream guix
+  defect; td cannot fix it without forking the docker builder or
+  re-pinning/patching the channel — and the OCI image drv is a
+  DIGESTS.md oracle, so any such fix is an oracle re-baseline. DECISION
+  NEEDED (human): fork (guix docker) into td with sorted tar
+  (re-baseline), vs patch channel, vs exclude the affected artifact
+  family from the CI image so the runner builds them itself and --check
+  is runner-self-consistent (no artifact change; documents the known
+  cross-fs property instead of fixing it). Run #7's diagnostic gathers
+  the deciding data: tar entry-listing diffs + a runner
+  self-consistency probe (two runner rebuilds compared to each other).

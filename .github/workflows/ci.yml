@@ -235,6 +235,12 @@ jobs:
                 else
                   echo "  decompressed TARs differ too:"
                   cmp <(zcat "$1") <(zcat "$2") || true
+                  # Entry-order evidence: run #6 traced the divergence to
+                  # tar entry ORDER (guix docker.scm omits --sort=name —
+                  # readdir order is filesystem-dependent).
+                  echo "--- entry listing diff (shipped vs rebuilt):"
+                  diff <(zcat "$1" | tar -tvf - 2>/dev/null) \
+                       <(zcat "$2" | tar -tvf - 2>/dev/null) | head -40 || true
                 fi;;
             esac
           }
@@ -246,6 +252,23 @@ jobs:
             guix build --check -K --no-substitutes --no-offload "$drv" </dev/null || true
             chk="$out-check"
             [ -e "$chk" ] || { echo "re-check MATCHED ($out) — transient divergence"; continue; }
+            # Self-consistency probe: is the RUNNER's own build stable?
+            # (Every comparison so far is runner-build vs dev-built shipped
+            # output; this decides whether the divergence is a stable
+            # cross-filesystem property or run-to-run instability.)
+            if [ -f "$chk" ]; then
+              cp "$chk" /tmp/twin1
+              guix build --check -K --no-substitutes --no-offload "$drv" </dev/null || true
+              if [ ! -f "$chk" ]; then
+                echo "--- second runner rebuild MATCHED the shipped output (transient divergence)"
+              elif cmp -s /tmp/twin1 "$chk"; then
+                echo "--- runner SELF-CONSISTENT: two runner rebuilds are identical"
+              else
+                echo "--- runner UNSTABLE: two runner rebuilds differ:"
+                cmp /tmp/twin1 "$chk" || true
+              fi
+              rm -f /tmp/twin1
+            fi
             if [ -d "$out" ]; then
               echo "--- directory output; entry-level differences:"
               diff -rq "$out" "$chk" | head -40 || true
