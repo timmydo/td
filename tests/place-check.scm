@@ -11,7 +11,12 @@
 ;;        initrd.cpio.gz}, both non-empty, plus root-label/system/root-uuid files
 ;;        that match BOTH the expected values and the generation's own placed
 ;;        td-identity (the on-disk state the menu is regenerated from is bound to
-;;        the image identity).
+;;        the image identity). M12 (§2.7): the placed td-identity additionally
+;;        records what the image IS — `image-digest=sha256:<hex>`, computed by
+;;        the placer over the artifact it actually unpacked. The line must be a
+;;        well-formed sha256, and, when TD_IMAGES maps the generation to its
+;;        artifact ("N=/gnu/store/... ..."), must EQUAL that artifact's actual
+;;        sha256 — the placer hashed what it placed, not something else.
 ;;   (1b) ROOT CONTENT — each present generation's APPLIED userspace root is staged
 ;;        at roots/td/gen-N/root.tar, non-empty — so the menu's root=td-root-gen-N
 ;;        refers to a root that actually exists.
@@ -51,7 +56,9 @@
 ;;
 ;; Reusable across scenarios via env: TD_PLACED (tree path), TD_PRESENT (space-sep
 ;; generations expected present), TD_ABSENT (space-sep generations expected pruned),
-;; TD_MKFS (assert live root filesystems), TD_BOOT_LABEL (assert the search line).
+;; TD_MKFS (assert live root filesystems), TD_BOOT_LABEL (assert the search line),
+;; TD_IMAGES (space-sep "N=<artifact>" — assert each recorded image-digest equals
+;; that artifact's sha256; unmapped generations get the well-formedness check only).
 ;; Run via `guix repl` so (system td-typed) is on the load path. Exits non-zero on
 ;; any failure.
 (use-modules (rnrs io ports)
@@ -59,6 +66,8 @@
              (ice-9 format)
              (srfi srfi-1)
              (srfi srfi-13)
+             (gcrypt hash)
+             (gcrypt base16)
              (system td-typed))
 
 (define failures 0)
@@ -78,6 +87,14 @@
 (define absent  (gens-of "TD_ABSENT"))
 (define mkfs?   (equal? (getenv "TD_MKFS") "1"))
 (define boot-label (getenv "TD_BOOT_LABEL"))  ;#f = no search-line assertion
+
+;; TD_IMAGES: "N=<artifact path>" pairs — generation -> the artifact it was
+;; placed from, for the image-digest equality assert. Empty = format-only.
+(define images
+  (filter-map (lambda (s)
+                (let ((i (string-index s #\=)))
+                  (and i (cons (substring s 0 i) (substring s (+ i 1))))))
+              (gens-of "TD_IMAGES")))
 
 (define (under . parts) (string-join (cons tree parts) "/"))
 (define (gen-dir n)  (under "boot" "td" (string-append "gen-" n)))
@@ -99,6 +116,24 @@
                 (let ((i (string-index line #\=)))
                   (and i (cons (substring line 0 i) (substring line (+ i 1))))))
               (string-split (slurp file) #\newline)))
+
+(define (hex-string? s)
+  (and (string? s)
+       (string-every (lambda (c) (string-index "0123456789abcdef" c)) s)))
+
+;; A well-formed §2.7 identity digest: "sha256:" + 64 hex chars.
+(define (well-formed-digest? s)
+  (and (string? s)
+       (string-prefix? "sha256:" s)
+       (= (string-length s) (+ 7 64))
+       (hex-string? (substring s 7))))
+
+;; The §2.7 identity of an artifact file: sha256 over its bytes, as the
+;; placer must have computed it.
+(define (artifact-digest file)
+  (string-append "sha256:"
+                 (bytevector->base16-string
+                  (file-hash (hash-algorithm sha256) file))))
 
 ;; The placer's managed-block markers (kept in sync with system/td-place.sh).
 (define begin-mark "# >>> td generations (managed by td-place) >>>")
@@ -217,7 +252,29 @@
                  n sys id-sys))
          (unless (and (string? id-uuid) (equal? uuid id-uuid))
            (fail "generation ~a: recorded root-uuid ~s != identity root-uuid ~s"
-                 n uuid id-uuid)))))))
+                 n uuid id-uuid))
+         ;; M12 (§2.7): the placed identity states what the image IS — the
+         ;; sha256 of the artifact the placer unpacked. EXACTLY ONE line (a
+         ;; second one — e.g. smuggled in via the embedded identity, which the
+         ;; placer rejects — could shadow the placer's own and feed signature
+         ;; verification a forged digest); format always; VALUE against the
+         ;; actual artifact when TD_IMAGES maps this generation.
+         (let ((digests (filter (lambda (kv) (string=? (car kv) "image-digest"))
+                                id))
+               (digest  (assoc-ref id "image-digest")))
+           (cond
+            ((not (= (length digests) 1))
+             (fail "generation ~a: placed td-identity carries ~a image-digest lines, expected exactly one"
+                   n (length digests)))
+            ((not (well-formed-digest? digest))
+             (fail "generation ~a: placed td-identity carries no well-formed image-digest=sha256:<64-hex> line (got ~s) — the §2.7 identity anchor is missing"
+                   n digest))
+            ((assoc-ref images n)
+             => (lambda (artifact)
+                  (let ((actual (artifact-digest artifact)))
+                    (unless (string=? digest actual)
+                      (fail "generation ~a: recorded image-digest ~s != sha256 of the placed artifact ~a (~a) — the placer did not hash what it unpacked"
+                            n digest artifact actual))))))))))))
  present)
 
 ;; (1b) per present generation: the applied userspace root CONTENT is staged
@@ -285,10 +342,6 @@
 (define (bytes->hex bv)
   (string-concatenate
    (map (lambda (b) (format #f "~2,'0x" b)) (bytevector->u8-list bv))))
-
-(define (hex-string? s)
-  (and (string? s)
-       (string-every (lambda (c) (string-index "0123456789abcdef" c)) s)))
 
 (when mkfs?
   (for-each
@@ -512,11 +565,15 @@
 (if (zero? failures)
     (begin
       (format #t "PASS: every present generation is placed with its own kernel/initrd, \
+an identity recording its artifact's sha256 (image-digest, §2.7~a), \
 its applied root content~a, and a menuentry (--id td-gen-N) that selects its own \
 root and boots its own system (gnu.system/gnu.load) and no other's; the managed \
 block defaults to the newest generation and carries the manual-rollback hook~a; \
 the user preamble is preserved; pruned generations leave no boot dir, no root \
 content, and no menu entry.~%"
+              (if (null? images)
+                  ", format-checked"
+                  ", value-checked against the artifact")
               (if mkfs? " as a LIVE labeled ext4 filesystem (superblock-verified) carrying its appended dm-verity hash tree (verity-superblock-verified, recorded roothash/hashoffset)" "")
               (if boot-label " and the boot-partition search line" ""))
       (exit 0))
