@@ -59,19 +59,36 @@ equal to the root daemon, so oracle authority transfers).
    first build differential can run. The S2–S4 differentials drive td-builder
    directly (subcommand CLI); protocol compatibility is re-examined when the
    §6 loop-convergence follow-on graduates.
-2. **NAR serialization + hashing.** Must be bit-for-bit identical to the
-   daemon's; deserves its own early differential (the daemon's recorded
-   `info.hash` / `guix archive` as oracle) and its own verified-red, before
-   any build is attempted on top of it.
-3. **DB registration.** What td-builder writes — ValidPaths / Refs /
-   DerivationOutputs rows (schema: nix/libstore/schema.sql at the pin) — vs
-   delegating registration to existing tooling. Equality of the recorded NAR
-   hash and references set is part of the differential either way.
-4. **Sandbox parity.** Which of the daemon's build-environment details are
-   hash-visible and must match exactly: chroot layout, build uid/gid, /dev
-   set, env scrubbing, fixed-output network allowance, /proc, hostname,
-   timestamps. The rootless track's in-build uid_map probe pattern
-   generalizes to probing each of these from inside a build.
+2. **NAR serialization + hashing.** RESOLVED by S2 (2026-06-11): own
+   serializer + hand-rolled SHA-256, proven bit-for-bit equal to the daemon's
+   recorded `info.hash`; verified-red ×3.
+3. **DB registration.** DECIDED 2026-06-11 (claude-fable-696a4e): **td-native
+   registration record** — td-builder writes its own v1 record per output
+   (store path, sha256 NAR hash, NAR size, sorted references, deriver), and
+   the rung compares those FIELDS against the daemon's DB
+   (`query-path-info`). Writing the daemon's sqlite rows is deferred until
+   something needs to READ them (Q1's staged-CLI decision means no `guix`
+   client consumes td's registrations yet; revisit at the §6
+   loop-convergence follow-on). Equality of the recorded fields is the
+   differential either way — exactly what Q3 demanded.
+4. **Sandbox parity.** DECIDED for S3 scope 2026-06-11 (claude-fable-696a4e),
+   from `nix/libstore/build.cc` at the pin: replicate the hash-visible
+   contract — env exactly `PATH=/path-not-set`, `HOME=/homeless-shelter`,
+   `NIX_STORE=/gnu/store`, `NIX_BUILD_CORES`, the drv's env, then
+   `NIX_BUILD_TOP`/`TMPDIR`/`TEMPDIR`/`TMP`/`TEMP`/`PWD` all
+   `/tmp/guix-build-<drvname>-0` where `<drvname>` = storePathToName of the
+   DRV path, i.e. it KEEPS the `.drv` suffix (`…/guix-build-foo-1.0.drv-0`),
+   cwd there; userns mapping `30001 <host-uid> 1` / `30000 <host-gid> 1`
+   with `setgroups deny` (defaultGuestUID/GID, initializeUserNamespace).
+   td's replication mechanism (not build.cc facts — guest-visible state is
+   what must match): fresh tmpfs `/tmp`, staged store rbind at `/gnu/store`
+   (the rootless harness's mechanics, per "Settled decisions"). Namespaces at S3:
+   NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS (the immediate-effect set — NEWNET
+   makes non-fixed-output builds offline by construction). Deferred to S4
+   (the system-image drv will honestly red if they matter): NEWPID + fresh
+   /proc, pivot_root full chroot layout (/dev set, /etc), seccomp,
+   fixed-output slirp network, store-file canonicalization (mtime=1, perm
+   stripping — NOT NAR-hash-visible; only the executable bit is).
 
 ## Sub-task ladder (draft — refine as probes land)
 
@@ -228,5 +245,33 @@ Everything the section above owed, delivered on a guix host:
 | `./check.sh td-builder` wall | ~14s | incl. the ~12s serial cheap chain; rung proper ~2s + --check recompile |
 | crate-level compile (rustup, not the rung) | ~9.3s | local sanity only; NOT the loop number |
 
-Open questions 1–4 (protocol seam, NAR, DB registration, sandbox parity) remain
-to decide before S2/S3.
+### S3 — drv parse + trivial build (claude-fable-696a4e, takeover 2026-06-11)
+
+Takeover: a03d13's session ended after landing S2 with no open PR; claim
+republished per the PR protocol (PR #4). Q3 and Q4(S3 scope) decided above.
+
+S3 sub-ladder (each step: verified-red before trusting green, then commit):
+
+- [ ] **S3a parser** — `src/drv.rs`, recursive-descent ATerm
+  `Derive([outputs],[inputDrvs],[inputSrcs],system,builder,[args],[env])`;
+  `td-builder drv-parse FILE` prints a canonical dump; unit tests cover
+  escapes (`\"`, `\\`, `\n`) and a real pinned-channel drv shape.
+- [ ] **S3b sandbox build** — `td-builder build DRV --store STAGED --out DIR`:
+  unshare(NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS) via raw x86_64 syscalls
+  (zero-dep stays — precedent: the hand-rolled SHA-256; the differential
+  proves behavior), uid/gid map per Q4, staged closure rbind at /gnu/store,
+  tmpfs /tmp with the exact build dir, env per Q4, exec the drv's builder.
+  Isolation probe drv (uid_map recorder, the rootless rung's pattern) builds
+  td-side ONLY — its output is namespace-dependent by design so it can never
+  be a differential subject (the track-file caveat).
+- [ ] **S3c registration + differential leg** — reference scanning (search
+  output bytes for candidate store-path hash parts, the daemon's algorithm),
+  v1 registration record per Q3; `tests/td-builder-s3-drvs.scm` prints the
+  daemon-built diff-drv oracle facts (path, recorded NAR hash, references);
+  the rung's S3 leg asserts: store path string-equal, NAR hash equal to the
+  daemon's RECORDED hash, references set equal, probe uid_map a single
+  non-zero-first-entry line.
+
+The differential drv is deterministic and carries a runtime reference (its
+output embeds an input store path) so the references-scan assert can
+discriminate; the probe drv stays separate (see the probe-vs-oracle caveat).
