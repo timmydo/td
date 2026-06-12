@@ -296,8 +296,8 @@ generation-image:
 	gen1_img=`$(GUIX) build "$$gen1"`; \
 	gen2_img=`$(GUIX) build "$$gen2"`; \
 	base_img=`$(GUIX) build "$$base"`; \
-	echo ">> check: reproducibility of BOTH bootc generation images"; \
-	$(GUIX) build --check "$$gen1" "$$gen2"; \
+	echo ">> check: reproducibility of BOTH bootc generation images (verdict-memoized — tests/check-memo.sh; a miss runs the real --check unchanged)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$gen1" "$$gen2"; \
 	echo ">> validate artifacts (structured: guile-json metadata + guile-zlib initrd)"; \
 	scratch="$(CURDIR)/.genimg-scratch"; \
 	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \

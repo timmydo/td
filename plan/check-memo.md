@@ -144,6 +144,45 @@ each (every run also re-proved the wiring assert + earlier legs green first):
 - **(wiring)** `--preserve='^TD_CHECK_'` removed from check.sh → RED:
   "TD_CHECK_ENV is not exported into the sandbox".
 
+### S2 — generation-image wired (2026-06-12); real-leg evidence
+
+The slowest `--check` leg (`generation-image`, both gen images) now routes
+through the helper. Rung timings on the dev host (warm store):
+
+- cold verdicts: `MEMO MISS (no verdict)` ×2 → real `--check` → `MEMO
+  RECORD` ×2 — rung **3m47.9s**, green;
+- fresh verdicts: `MEMO HIT` ×2 (constraint-5 DB assertion passed) — rung
+  **42.7s**, green: the --check legs collapsed; the remainder is the rung's
+  builds + artifact validation.
+
+Real-leg verified-reds (production verdict files in `.check-verdicts/`):
+
+- **(B)** gen-1 verdict aged (`recorded 1`) → `MEMO MISS (expired (20616d
+  old, ttl 7d))`, real `--check` re-ran, re-recorded;
+- **(C)** gen-2 verdict's env rewritten → `MEMO MISS (foreign environment)`,
+  real `--check` re-ran (same run as B — one leg per drv);
+- **(constraint 4)** `TD_CHECK_FULL=1 ./check.sh generation-image` over two
+  FRESH verdicts → `MEMO MISS (forced full)` ×2 — the knob travels
+  host → container → helper;
+- **(A, literal)** input changed in place (gen-2 → gen-3 in
+  tests/generation-image-drv.scm): the moved drv hash took `MEMO MISS (no
+  verdict)` and REALLY rebuilt (real `--check` + `MEMO RECORD`) while the
+  unchanged gen-1 drv HIT beside it; the run then went red (exit 2) at the
+  rung's OWN artifact validator (4 identity checks caught the gen-3
+  mutation) — the existing discriminators are intact downstream of the
+  wiring. Mutation restored. The name-collision direction (same name,
+  different hash) is asserted every loop by the memo rung's same-name
+  fixture; the keying mutation red is on record (S1 evidence);
+- **(red through the wired recipe)** `TD_CHECK_TTL_DAYS=15
+  ./check.sh generation-image` → helper FATAL (gate-2 TTL bound) → rung
+  exit 2: a helper failure reds THIS rung in place;
+- **(D)** asserted every loop by the memo rung's nondet fixture; the
+  exit-honesty mutation red (`|| true` swallow) is on record (S1 evidence).
+
+(The "real `--check`" in the cold run and in B/C is ONE batched
+`guix build --check` of all missed drvs — the same batching the direct line
+used.)
+
 ### Memoization boundary (constraint 6, decided at S1)
 
 The helper applies ONLY to the pure reproducibility `--check` legs. Two rungs
