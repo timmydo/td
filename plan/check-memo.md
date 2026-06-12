@@ -122,6 +122,28 @@ verified-reds below are on record in this file.
   `TD_CHECK_FULL=1 ./check.sh` as the constraint-4 knob. `./check.sh memo`
   green.
 
+### Verified-red evidence — the `memo` rung (S1, 2026-06-12)
+
+Each helper mutation run via `./check.sh memo`; ALL red (make exit 2), each
+caught at the intended leg; helper restored from the committed green after
+each (every run also re-proved the wiring assert + earlier legs green first):
+
+- **(A twin — keying)** verdict key by NAME (`basename | cut -c34-`) + drv
+  field comparison dropped → RED at the hit leg ("the second sight did not
+  HIT"): name-keyed lookup vs path-keyed record diverged — any keying
+  inconsistency reds the rung before the changed-drv leg is even reached.
+- **(B twin — expiry)** TTL comparison dropped (`elif false`) → RED: "an
+  EXPIRED verdict did not miss".
+- **(C twin — identity)** env comparison dropped → RED: "a FOREIGN verdict
+  did not miss".
+- **(constraint 5 — tamper)** verdict/DB comparison dropped → RED: "a
+  TAMPERED verdict did not miss".
+- **(D twin — exit honesty)** `--check` exit swallowed (`|| true`) → RED:
+  "the helper GREENED a deliberately nondeterministic drv on a miss —
+  detection power lost".
+- **(wiring)** `--preserve='^TD_CHECK_'` removed from check.sh → RED:
+  "TD_CHECK_ENV is not exported into the sandbox".
+
 ### Memoization boundary (constraint 6, decided at S1)
 
 The helper applies ONLY to the pure reproducibility `--check` legs. Two rungs
