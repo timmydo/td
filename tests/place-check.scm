@@ -88,8 +88,11 @@
 (define mkfs?   (equal? (getenv "TD_MKFS") "1"))
 (define boot-label (getenv "TD_BOOT_LABEL"))  ;#f = no search-line assertion
 
-;; TD_IMAGES: "N=<artifact path>" pairs — generation -> the artifact it was
-;; placed from, for the image-digest equality assert. Empty = format-only.
+;; TD_IMAGES: "N=<artifact path>" or "N=sha256:<hex>" pairs — generation ->
+;; what the placed image-digest must equal: the sha256 of that artifact file
+;; (legacy --image placement) or that literal digest (verified --registry
+;; placement, where the §2.7 identity is the manifest digest). Empty =
+;; format-only.
 (define images
   (filter-map (lambda (s)
                 (let ((i (string-index s #\=)))
@@ -270,11 +273,13 @@
              (fail "generation ~a: placed td-identity carries no well-formed image-digest=sha256:<64-hex> line (got ~s) — the §2.7 identity anchor is missing"
                    n digest))
             ((assoc-ref images n)
-             => (lambda (artifact)
-                  (let ((actual (artifact-digest artifact)))
+             => (lambda (expected)
+                  (let ((actual (if (string-prefix? "sha256:" expected)
+                                    expected
+                                    (artifact-digest expected))))
                     (unless (string=? digest actual)
-                      (fail "generation ~a: recorded image-digest ~s != sha256 of the placed artifact ~a (~a) — the placer did not hash what it unpacked"
-                            n digest artifact actual))))))))))))
+                      (fail "generation ~a: recorded image-digest ~s != the placed artifact's identity ~a (from ~a) — the placer did not record what it placed"
+                            n digest actual expected))))))))))))
  present)
 
 ;; (1b) per present generation: the applied userspace root CONTENT is staged
