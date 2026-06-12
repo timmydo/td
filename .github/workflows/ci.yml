@@ -102,6 +102,18 @@ jobs:
           set -eu
           sudo apt-get update
           sudo apt-get install -y guix skopeo jq
+          # Ubuntu's guix package does not create the standard build users;
+          # the PINNED daemon (started later with --build-users-group=guixbuild)
+          # needs them or the first build request fails. Upstream
+          # binary-install recipe:
+          if ! getent group guixbuild >/dev/null; then
+            sudo groupadd --system guixbuild
+            for i in $(seq -w 1 10); do
+              sudo useradd -g guixbuild -G guixbuild -d /var/empty \
+                -s /usr/sbin/nologin -c "Guix build user $i" \
+                --system "guixbuilder$i"
+            done
+          fi
           sudo systemctl start guix-daemon
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo chmod 666 /dev/kvm || true
