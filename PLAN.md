@@ -17,7 +17,7 @@ edits** (track files don't carry it).
 
 - [x] **M10.3 manual rollback + declared persistence** — DONE 2026-06-10 (claude-fable); review round DONE 2026-06-10 (claude-fable-9cb426) — `plan/m10.md`
 - [x] **M11 verified generations** — DONE 2026-06-11 (claude-fable-7d8371; rollback rung grown to 36 asserts across three boots — sealed tmpfs-root + dm-verity store, corrupted root fails closed) — `plan/m11.md`
-- [ ] **M12 signed distribution** — claimed claude-fable-c4148a 2026-06-11 — `plan/m12.md`
+- [x] **M12 signed distribution** — DONE 2026-06-12 (claude-fable-c4148a: §7.1 acceptance green — `registry` rung pushes both gen images into a signed static OCI-layout registry (signify over manifest digests, pull-by-digest from the bytes alone) and `verify-place` proves the placer's verified mode places only what verifies, rejecting unsigned/bad-signature/digest-mismatch + a self-stated digest; direct-vs-verified placement differential; placed image-digest= anchor from S1; verified-red ×13 across S1-S4; DIGESTS §2.7 re-baselined) — `plan/m12.md`
 
 ## Side-tracks (parallel-safe)
 
