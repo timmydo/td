@@ -573,11 +573,20 @@ no-guix:
 #     equal; plus the rootless rung's isolation assert on a separate
 #     namespace-sensitive probe drv (built td-side only — its output records
 #     uid_map and can never be a differential subject).
+#   • S4: SYSTEM-IMAGE DIFFERENTIAL — the §7.1 acceptance subject: td-builder
+#     rebuilds the `build` rung's qcow2 image drv itself
+#     (tests/td-builder-s4-drv.scm prints the oracle facts the root daemon
+#     recorded when it built the SAME drv) and must register equal fields at
+#     the same path — store path, NAR hash (recorded AND independently
+#     re-hashed), NAR size, references set (compared even if empty) and
+#     deriver. This is what forces the sandbox past S3's minimum: the image
+#     builder is a real multi-process Guile build (mke2fs/genimage tree) that
+#     honestly reds on any missing piece of the daemon's chroot contract.
 # OFFLINE PRECONDITION (DESIGN §5): the pinned Rust closure must be warm in the
 # host store — the loop fetches nothing. Two-step lower-then-realise (repl ->
 # guix build) for an honest exit status, as in the other rungs.
 td-builder:
-	@echo ">> td-builder: reproducible offline build (S1) + NAR differential (S2) + build differential (S3)"
+	@echo ">> td-builder: reproducible offline build (S1) + NAR differential (S2) + build differential (S3) + system-image differential (S4)"
 	@set -euo pipefail; \
 	drv=`$(GUIX) repl $(LOAD) tests/td-builder-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the td-builder derivation" >&2; exit 1; }; \
@@ -668,10 +677,52 @@ td-builder:
 	test "$$rehash" = "sha256:$$diff_hash" \
 	  || { echo "FAIL: independent re-hash of the on-disk rebuild gives $$rehash, the daemon recorded sha256:$$diff_hash" >&2; exit 1; }; \
 	echo "   rebuild equal: store path, NAR hash (registered + re-hashed), size, references (input + self), deriver"; \
+	echo ">> S4: system-image differential — td-builder rebuilds the build rung's qcow2 drv"; \
+	img_drv=`$(GUIX) system image $(LOAD) -t $(IMGTYPE) -d $(SYSTEM)`; \
+	test -n "$$img_drv" || { echo "ERROR: could not lower the image derivation" >&2; exit 1; }; \
+	echo "   target image drv: $$img_drv"; \
+	img_oracle=`$(GUIX) build "$$img_drv"`; \
+	test -n "$$img_oracle" || { echo "ERROR: the oracle image build produced no output path" >&2; exit 1; }; \
+	TD_IMAGE_DRV="$$img_drv" $(GUIX) repl $(LOAD) tests/td-builder-s4-drv.scm 2>/dev/null > "$$scratch/s4.txt"; \
+	img_out=`sed -n 's/^IMG_OUT=//p' "$$scratch/s4.txt"`; \
+	img_hash=`sed -n 's/^IMG_HASH=//p' "$$scratch/s4.txt"`; \
+	img_narsize=`sed -n 's/^IMG_NARSIZE=//p' "$$scratch/s4.txt"`; \
+	img_deriver=`sed -n 's/^IMG_DERIVER=//p' "$$scratch/s4.txt"`; \
+	test -n "$$img_out" -a -n "$$img_hash" -a -n "$$img_narsize" -a -n "$$img_deriver" \
+	  || { echo "ERROR: could not read the S4 oracle facts (tests/td-builder-s4-drv.scm)" >&2; exit 1; }; \
+	test "$$img_out" = "$$img_oracle" \
+	  || { echo "ERROR: lowered image output ($$img_out) != realized oracle output ($$img_oracle)" >&2; exit 1; }; \
+	{ sed -n 's/^IMG_INPUT=//p' "$$scratch/s4.txt"; printf '%s\n' "$$img_drv"; } \
+	  | xargs $(GUIX) gc -R | sort -u > "$$scratch/s4-paths.txt"; \
+	echo "   staged closure: $$(wc -l < "$$scratch/s4-paths.txt") store items"; \
+	"$$out/bin/td-builder" build "$$img_drv" "$$scratch/s4-paths.txt" "$$scratch/s4" > "$$scratch/s4-build.txt" \
+	  || { echo "FAIL: td-builder could not build the image drv $$img_drv" >&2; exit 1; }; \
+	grep -qx "OUT=out $$img_out" "$$scratch/s4-build.txt" \
+	  || { echo "FAIL: store-path mismatch: td-builder reported '$$(cat "$$scratch/s4-build.txt")', the daemon built $$img_out" >&2; exit 1; }; \
+	s4reg="$$scratch/s4/registration"; \
+	test -s "$$s4reg" || { echo "FAIL: td-builder wrote no registration record for the image" >&2; exit 1; }; \
+	grep -qx "path $$img_out" "$$s4reg" \
+	  || { echo "FAIL: image registration path mismatch (see record below) vs $$img_out" >&2; cat "$$s4reg" >&2; exit 1; }; \
+	grep -qx "nar-hash sha256:$$img_hash" "$$s4reg" \
+	  || { echo "FAIL: image NAR hash mismatch — registration '$$(sed -n 's/^nar-hash //p' "$$s4reg")' vs daemon 'sha256:$$img_hash'" >&2; exit 1; }; \
+	grep -qx "nar-size $$img_narsize" "$$s4reg" \
+	  || { echo "FAIL: image NAR size mismatch — registration '$$(sed -n 's/^nar-size //p' "$$s4reg")' vs daemon '$$img_narsize'" >&2; exit 1; }; \
+	grep -qx "deriver $$img_deriver" "$$s4reg" \
+	  || { echo "FAIL: image deriver mismatch — registration '$$(sed -n 's/^deriver //p' "$$s4reg")' vs daemon '$$img_deriver'" >&2; exit 1; }; \
+	sed -n 's/^IMG_REF=//p' "$$scratch/s4.txt" > "$$scratch/s4-refs.oracle"; \
+	sed -n 's/^reference //p' "$$s4reg" > "$$scratch/s4-refs.td"; \
+	test "$$(cat "$$scratch/s4-refs.oracle")" = "$$(cat "$$scratch/s4-refs.td")" \
+	  || { echo "FAIL: image references set mismatch:" >&2; \
+	       echo "      daemon recorded:" >&2; sed 's/^/        /' "$$scratch/s4-refs.oracle" >&2; \
+	       echo "      td-builder registered:" >&2; sed 's/^/        /' "$$scratch/s4-refs.td" >&2; exit 1; }; \
+	img_rehash=`"$$out/bin/td-builder" nar-hash "$$scratch/s4/newstore/$${img_out#/gnu/store/}"`; \
+	test "$$img_rehash" = "sha256:$$img_hash" \
+	  || { echo "FAIL: independent re-hash of the on-disk image rebuild gives $$img_rehash, the daemon recorded sha256:$$img_hash" >&2; exit 1; }; \
+	echo "   image rebuild equal: store path, NAR hash (registered + re-hashed), size, references, deriver"; \
 	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; \
 	echo ">> closure size:"; $(GUIX) size "$$out" | tail -n1; \
 	echo "   compile wall-clock: $${elapsed}s (first run; warm store thereafter)"; \
-	echo "PASS: reproducible offline build (S1); NAR serialization bit-for-bit equal to the daemon's recorded hashes across $$n items (S2); the userns sandbox rebuild registers the daemon's exact facts at the same store path and builds in a fresh user namespace (S3)."
+	echo "PASS: reproducible offline build (S1); NAR serialization bit-for-bit equal to the daemon's recorded hashes across $$n items (S2); the userns sandbox rebuild registers the daemon's exact facts at the same store path and builds in a fresh user namespace (S3); td-builder rebuilds the SYSTEM IMAGE drv itself, daemon-equal on every recorded field (S4)."
 
 # 7. M8 run rung — execute the SHIPPED OCI image as a real rootless OCI container
 #    (crun) and assert its userspace runs. Every rung above proves a PROPERTY of
