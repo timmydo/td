@@ -46,7 +46,7 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
        PUSH=1 ci/build-ci-image.sh /path/with/50G/free
 
    (needs a gh login holding `write:packages`; pushes
-   `ghcr.io/timmydo/td-ci:<pin>` and `:latest`). After the FIRST push, make
+   `ghcr.io/timmydo-bot/td-ci:<pin>` and `:latest`). After the FIRST push, make
    the package public once — GHCR UI ("td-ci" package → settings →
    visibility) — so the workflow pulls it anonymously.
 5. **Make the full check mandatory** once one PR has shown a green `check`:

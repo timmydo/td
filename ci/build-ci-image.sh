@@ -27,7 +27,7 @@
 # Usage:
 #   ci/build-ci-image.sh [WORKDIR]      build the OCI layout under WORKDIR
 #                                       (default ./.ci-image-work; needs ~50G)
-#   PUSH=1 ci/build-ci-image.sh [...]   also push to ghcr.io/timmydo/td-ci
+#   PUSH=1 ci/build-ci-image.sh [...]   also push to ghcr.io/timmydo-bot/td-ci
 #                                       as :<pin> and :latest (needs a gh
 #                                       login with write:packages)
 #
@@ -149,16 +149,16 @@ rm -rf "$work/stage"
 echo "   OCI layout: $oci ($(du -sh "$oci" | cut -f1))"
 
 if [ "${PUSH:-0}" = "1" ]; then
-  echo ">> push: ghcr.io/timmydo/td-ci:{$pinned,latest}"
+  echo ">> push: ghcr.io/timmydo-bot/td-ci:{$pinned,latest}"
   skopeo=$(guix build skopeo)/bin/skopeo
   token=$(gh auth token)
   for tag in "$pinned" latest; do
     "$skopeo" copy --insecure-policy \
       --dest-creds "timmydo-bot:$token" \
-      "oci:$oci:$pinned" "docker://ghcr.io/timmydo/td-ci:$tag"
+      "oci:$oci:$pinned" "docker://ghcr.io/timmydo-bot/td-ci:$tag"
   done
   echo "   pushed; make the package PUBLIC once (GHCR UI or API) so the"
   echo "   workflow can pull it anonymously"
 else
-  echo "   not pushing (set PUSH=1 to push to ghcr.io/timmydo/td-ci)"
+  echo "   not pushing (set PUSH=1 to push to ghcr.io/timmydo-bot/td-ci)"
 fi

@@ -71,7 +71,7 @@ jobs:
   check:
     # The real gate: the full hermetic, offline rung ladder on a GitHub-HOSTED
     # runner. The runner imports the CI store image — the warm build closure
-    # snapshot a dev box pushed to ghcr.io/timmydo/td-ci (ci/build-ci-image.sh)
+    # snapshot a dev box pushed to ghcr.io/timmydo-bot/td-ci (ci/build-ci-image.sh)
     # — then runs the UNMODIFIED ./check.sh: same pinned guix (the image tag IS
     # the channels.scm pin, so a channel-bump PR stays red until the matching
     # image is pushed), same offline/no-substitutes loop, KVM for the
@@ -114,7 +114,7 @@ jobs:
           # /mnt is root-owned on ubuntu-latest; skopeo runs as the runner user.
           sudo install -d -o "$(id -un)" /mnt/td-ci
           skopeo copy --insecure-policy \
-            "docker://ghcr.io/timmydo/td-ci:$pin" "oci:/mnt/td-ci:$pin"
+            "docker://ghcr.io/timmydo-bot/td-ci:$pin" "oci:/mnt/td-ci:$pin"
       - name: import the store
         run: |
           set -eu
