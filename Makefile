@@ -80,15 +80,17 @@ endef
 # run (plan/oci-load.md — skopeo passes are seconds; the gunzip/regzip of the
 # negative control dominates). `td-builder` (S1) is slotted late on judgment,
 # not yet individually measured — its cost is a single warm-store Rust compile
-# plus a --check rebuild; RE-MEASURE and RE-SORT once it has run. A stale order
-# only costs latency, never correctness.
+# plus a --check rebuild; RE-MEASURE and RE-SORT once it has run. `registry`
+# (M12 S3) is slotted after `oci-load` on judgment — the same skopeo passes
+# plus a --check rebuild and signify signing, all seconds warm; RE-MEASURE
+# once it has run. A stale order only costs latency, never correctness.
 #
 # NOTHING is removed, loosened, or skipped by the parallelism: all rungs must
 # still pass, and make (run without -k) stops spawning new rungs after a
 # failure — a red still short-circuits the loop. Order-only (|) prerequisites,
 # so a plain serial `make -j1 check` behaves exactly as before.
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
-HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load reset test place build boot-disk td-builder run offline
+HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry reset test place build boot-disk td-builder run offline
 
 .PHONY: check container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
@@ -354,6 +356,38 @@ oci-load:
 	       cat "$$work/bad.err" >&2; exit 1; }; \
 	rm -rf "$$work"; \
 	echo "PASS: foreign load green for plain + gen-1 images; corrupted layer rejected (digest mismatch)."
+
+# M12 S3 signed distribution: the static registry (DESIGN §2.7). The registry
+# is a derivation (system/td-registry.scm): both generation images pushed by
+# skopeo into ONE canonical OCI layout (shared content-addressed blob store)
+# plus, per image, a one-line manifest-digest STATEMENT and its detached
+# signify (ed25519) signature by the committed TEST key (tests/keys/README) —
+# sign the digest, never the install ordinal; no sigstore. The rung builds it,
+# `--check`s it (deterministic skopeo conversion + RFC 8032 deterministic
+# signatures), and runs tests/registry-check.sh: per generation the statement
+# equals the manifest digest skopeo (the foreign implementation) re-derives,
+# the signature verifies with the td test pubkey, and pull-by-digest works
+# from the BYTES alone (manifest + every referenced blob re-hashes to its
+# digest — content addressing IS the byte-identity between pushed and pulled);
+# the whole blob store re-hashes honestly; and three negative controls run
+# every loop on scratch copies: unsigned (sigs stripped), tampered (one layer
+# byte flipped), forged (statement rewritten, signature kept) — each must be
+# rejected for its own reason. The verifier exercised here (verify_pull) is
+# the same contract the placer enforces before placing (M12 S4).
+registry:
+	@echo ">> registry: signed static OCI-layout distribution — push, verify statements/signatures/pull-by-digest (M12 S3)"
+	@set -euo pipefail; \
+	drv=`$(GUIX) repl $(LOAD) tests/registry-drv.scm 2>/dev/null | sed -n 's/^DRV_REGISTRY=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the registry derivation" >&2; exit 1; }; \
+	echo ">> registry derivation: $$drv"; \
+	reg=`$(GUIX) build "$$drv"`; \
+	echo ">> check: reproducibility of the registry"; \
+	$(GUIX) build --check "$$drv"; \
+	skopeo=`$(GUIX) build skopeo`/bin/skopeo; \
+	signify=`$(GUIX) build signify`/bin/signify; \
+	TD_REGISTRY="$$reg" SKOPEO="$$skopeo" SIGNIFY="$$signify" \
+	TD_PUBKEY=tests/keys/td_m12_signify.pub TD_GENS="1 2" \
+	  sh tests/registry-check.sh
 
 # M10.2 guix-free placer (M10-design.md step 3, "Place"). The deployment side:
 # a POSIX shell tool (system/td-place.sh) that runs ON THE TARGET — which has NO
