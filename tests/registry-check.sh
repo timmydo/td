@@ -125,11 +125,17 @@ if [ -n "$first_digest" ]; then
     printf '%s\n' "$out"
   fi
 
-  # (n2) TAMPERED: flip one byte mid-way through the LARGEST referenced blob
-  # (a layer, not the manifest) — the pull walk must catch it, as a re-hash
-  # mismatch.
+  # (n2) TAMPERED: flip one byte mid-way through the largest blob THIS
+  # generation's manifest references (a layer, not the manifest) — the gens
+  # share no blobs (each has its own config/userspace/boot, 12 bytes apart on
+  # the userspace layers), so the victim must come from the walked manifest's
+  # OWN refs or a size flip would tamper a blob the walk never visits. The
+  # pull walk must catch it, as a re-hash mismatch.
   cp -r "$reg" "$scratch/tampered"; chmod -R u+w "$scratch/tampered"
-  victim=$(ls -S "$scratch/tampered/oci/blobs/sha256" | head -n 1)
+  walked_refs=$(tr -d ' \n\t' < "$scratch/tampered/oci/blobs/sha256/$hex" \
+    | grep -o '"digest":"sha256:[0-9a-f]\{64\}"' \
+    | sed 's/^.*sha256://; s/"$//')
+  victim=$(cd "$scratch/tampered/oci/blobs/sha256" && ls -S $walked_refs | head -n 1)
   vf="$scratch/tampered/oci/blobs/sha256/$victim"
   off=$(( $(stat -c %s "$vf") / 2 ))
   b=$(od -An -tu1 -j "$off" -N1 "$vf" | tr -d ' ')
