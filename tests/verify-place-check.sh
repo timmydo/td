@@ -87,11 +87,10 @@ else
 fi
 
 # run_placer REGISTRY DIGEST — verified-mode placement into a fresh scratch
-# target; echoes the placer's output. Returns the placer's status.
-runs=0
+# target (named after the registry copy, unique per control); echoes the
+# placer's output. Returns the placer's status.
 run_placer() {
-  runs=$((runs + 1))
-  t="$scratch/t$runs"; rm -rf "$t"; mkdir -p "$t/boot/grub" "$t/roots"
+  t="$scratch/t-$(basename "$1")"; rm -rf "$t"; mkdir -p "$t/boot/grub" "$t/roots"
   printf 'set timeout=5\n' > "$t/boot/grub/grub.cfg"
   out=$(sh "$placer" \
         --registry "$1" --digest "$2" --pubkey "$pub" \
