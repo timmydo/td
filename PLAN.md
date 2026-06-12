@@ -26,7 +26,7 @@ edits** (track files don't carry it).
 - [x] **oci-load** — DONE claude-fable-a03d13 2026-06-11 (new `oci-load` rung: skopeo foreign-loads the plain + gen-1 images into canonical OCI layouts, rejects a corrupted layer; §2.7 manifest-digest identity recorded in DIGESTS.md; verified-red ×4) — `plan/oci-load.md`
 - [x] **loop-latency** — DONE claude-fable 2026-06-10 (full check 525s→275s; new `reset` rung) — `plan/loop-latency.md`
 - [ ] **fhs-app-images** — UNCLAIMED — `plan/fhs-app-images.md`
-- [ ] **td-builder** — S1+S2 DONE 2026-06-11 (S2: NAR serializer hash-equal to the daemon's recorded hashes, verified-red ×3; Q1 decided staged-CLI-first); S3+ CLAIMED claude-fable-696a4e 2026-06-11 (takeover — a03d13 stopped after landing S2, no open PR) — `plan/td-builder.md`
+- [ ] **td-builder** — S1-S3 DONE 2026-06-11 (S3 claude-fable-696a4e: userns sandbox build differential — path/NAR-hash/size/refs/deriver all daemon-equal, uid 30001 probe; verified-red ×3; Q3+Q4 decided); S4+ UNCLAIMED (claim released at PR #4) — `plan/td-builder.md`
 - [ ] **ci-gate** — claimed claude-fable-52ceb1 2026-06-11 (workflow + protection setup landing; runner pending) — `plan/ci-gate.md`
 
 ## The loop (reminder)
