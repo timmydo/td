@@ -11,8 +11,19 @@
 # using only base tools (tar, gzip, coreutils, sed, grep, and — for --mkfs —
 # mke2fs); it never invokes guix and needs no Guile/store. It:
 #
-#   1. cracks the bootc OCI image and — driven by the OCI manifest, not a blind
-#      directory scan — locates the layer carrying /boot AND the userspace layers;
+#   1. obtains the image content. LEGACY mode (--image) cracks a local
+#      docker-archive tarball. VERIFIED mode (--registry --digest --pubkey,
+#      M12, DESIGN §2.7) pulls from a signed static registry instead and
+#      REFUSES to place unless the §2.7 pull contract holds FIRST: a signed
+#      identity statement exists for the demanded manifest digest, its
+#      detached signify signature verifies with --pubkey, the statement states
+#      that digest, the manifest blob re-hashes to it, and every referenced
+#      blob re-hashes to its name (verify before placement: digest first,
+#      slot second; rejects exactly unsigned, bad signature, digest mismatch —
+#      anti-rollback is out of scope by design). Only then are the layers
+#      decompressed and handed to the same placement path. Either way the
+#      manifest — never a blind directory scan — selects the layer carrying
+#      /boot AND the userspace layers;
 #   2. verifies the image's EMBEDDED identity (boot/td-identity) matches the
 #      --generation / --root-label it is being placed as, so a mislabeled image
 #      cannot be installed under the wrong generation/root; the identity also
@@ -79,9 +90,13 @@ VERITY_SALT=74642d7665726974792d73616c742d7630000000000000000000000000000000
 
 img=; gen=; root_label=; boot_dir=; root_store=; grub_cfg=; keep=
 boot_label=; extra_kernel_args=; mkfs=no
+registry=; digest=; pubkey=
 while [ $# -gt 0 ]; do
   case "$1" in
     --image)      img=$2;        shift 2 ;;
+    --registry)   registry=$2;   shift 2 ;;
+    --digest)     digest=$2;     shift 2 ;;
+    --pubkey)     pubkey=$2;     shift 2 ;;
     --generation) gen=$2;        shift 2 ;;
     --root-label) root_label=$2; shift 2 ;;
     --boot-dir)   boot_dir=$2;   shift 2 ;;
@@ -94,7 +109,20 @@ while [ $# -gt 0 ]; do
     *) echo "td-place: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-for pair in image:img generation:gen root-label:root_label \
+# Input mode: exactly one of LEGACY (--image) or VERIFIED (--registry +
+# --digest + --pubkey, all three) — M12, DESIGN §2.7.
+verified=no
+if [ -n "$registry" ] || [ -n "$digest" ] || [ -n "$pubkey" ]; then
+  [ -n "$registry" ] && [ -n "$digest" ] && [ -n "$pubkey" ] || {
+    echo "td-place: verified mode needs ALL of --registry/--digest/--pubkey" >&2; exit 2; }
+  [ -z "$img" ] || {
+    echo "td-place: --image and --registry are mutually exclusive" >&2; exit 2; }
+  verified=yes
+else
+  [ -n "$img" ] || {
+    echo "td-place: missing required --image (or --registry/--digest/--pubkey)" >&2; exit 2; }
+fi
+for pair in generation:gen root-label:root_label \
             boot-dir:boot_dir root-store:root_store grub-cfg:grub_cfg keep:keep; do
   name=${pair%%:*}; var=${pair#*:}
   eval "val=\${$var}"
@@ -118,19 +146,110 @@ det_tar() { # SRC-DIR OUTFILE
   tar --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner -cf "$2" -C "$1" .
 }
 
-# --- 1. Crack the OCI image; select layers by the MANIFEST, not a blind scan. ---
-# A blind `*/layer.tar` scan would also consider ORPHAN layer dirs not referenced
-# by manifest.json; only manifest-referenced layers are part of this image.
-tar xzf "$img" -C "$work"
-[ -f "$work/manifest.json" ] || {
-  echo "td-place: $img has no manifest.json — not an OCI image" >&2; exit 1; }
+# --- 1. Obtain the image content; select layers by the MANIFEST, never a ------
+# --- blind scan (orphan layer dirs are not part of the image). ----------------
+if [ "$verified" = yes ]; then
+  # VERIFIED mode (M12, DESIGN §2.7): enforce the whole pull contract BEFORE
+  # unpacking anything. Reject exactly: unsigned, bad signature, digest
+  # mismatch. Verification needs only base tools + signify (cf. veritysetup
+  # for --mkfs).
+  command -v signify >/dev/null 2>&1 || {
+    echo "td-place: verified mode requires signify on PATH" >&2; exit 1; }
+  case "$digest" in
+    sha256:*) : ;;
+    *) echo "td-place: --digest must be sha256:<hex>: $digest" >&2; exit 2 ;;
+  esac
+  dhex=${digest#sha256:}
+  case "$dhex" in
+    *[!0-9a-f]*|'') echo "td-place: --digest carries non-hex content: $digest" >&2; exit 2 ;;
+  esac
+  [ "${#dhex}" -eq 64 ] || {
+    echo "td-place: --digest must carry 64 hex chars: $digest" >&2; exit 2; }
 
-# Ordered list of manifest-referenced layers ("<hex>/layer.tar", one per line).
-manifest_layers=$(tr -d '\n' < "$work/manifest.json" \
-  | sed -n 's/.*"Layers":\[\([^][]*\)\].*/\1/p' \
-  | tr ',' '\n' | sed -n 's/^[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p')
-[ -n "$manifest_layers" ] || {
-  echo "td-place: manifest.json lists no Layers — malformed image" >&2; exit 1; }
+  # (a) UNSIGNED: a signed identity statement must exist for the demanded digest.
+  stmt="$registry/signatures/$dhex.digest"
+  [ -f "$stmt" ] || {
+    echo "td-place: no identity statement for $digest in $registry — refusing unsigned content" >&2; exit 1; }
+  [ -f "$stmt.sig" ] || {
+    echo "td-place: no signature for $digest in $registry — refusing unsigned content" >&2; exit 1; }
+  # (b) BAD SIGNATURE: the detached signify signature must verify, and the
+  # statement must state the demanded digest.
+  signify -V -q -p "$pubkey" -m "$stmt" -x "$stmt.sig" || {
+    echo "td-place: signature verification failed for $digest — refusing to place" >&2; exit 1; }
+  [ "$(cat "$stmt")" = "$digest" ] || {
+    echo "td-place: signed statement does not state $digest — digest mismatch; refusing to place" >&2; exit 1; }
+  # (c) DIGEST MISMATCH: the manifest blob and EVERY blob it references
+  # (config + layers) must re-hash to their digests — content addressing is
+  # the byte-identity between what was signed and what is about to be placed.
+  mf="$registry/oci/blobs/sha256/$dhex"
+  [ -f "$mf" ] || {
+    echo "td-place: no manifest blob for $digest — digest mismatch; refusing to place" >&2; exit 1; }
+  mh=$(sha256sum "$mf"); mh=${mh%% *}
+  [ "$mh" = "$dhex" ] || {
+    echo "td-place: manifest blob does not re-hash to $digest — digest mismatch; refusing to place" >&2; exit 1; }
+  all_refs=$(tr -d ' \n\t' < "$mf" \
+    | grep -o '"digest":"sha256:[0-9a-f]\{64\}"' \
+    | sed 's/^.*sha256://; s/"$//')
+  [ -n "$all_refs" ] || {
+    echo "td-place: manifest for $digest references no blobs — malformed registry" >&2; exit 1; }
+  for bh in $all_refs; do
+    bf="$registry/oci/blobs/sha256/$bh"
+    [ -f "$bf" ] || {
+      echo "td-place: referenced blob $bh missing from the registry — digest mismatch; refusing to place" >&2; exit 1; }
+    ah=$(sha256sum "$bf"); ah=${ah%% *}
+    [ "$ah" = "$bh" ] || {
+      echo "td-place: blob $bh does not re-hash to its digest — digest mismatch; refusing to place" >&2; exit 1; }
+  done
+
+  # VERIFIED. Stage the ordered LAYERS (the manifest's "layers" array; the
+  # config blob is verified above but not unpacked) into $work as
+  # <hex>/layer.tar — decompressed when gzipped (skopeo writes tar+gzip; the
+  # magic bytes decide, and gzip itself fails closed on a lying magic) — and
+  # hand them to the SAME placement path legacy mode uses below.
+  layer_refs=$(tr -d ' \n\t' < "$mf" \
+    | sed -n 's/.*"layers":\[\([^][]*\)\].*/\1/p' \
+    | grep -o '"digest":"sha256:[0-9a-f]\{64\}"' \
+    | sed 's/^.*sha256://; s/"$//')
+  [ -n "$layer_refs" ] || {
+    echo "td-place: manifest for $digest lists no layers — not a usable image" >&2; exit 1; }
+  manifest_layers=
+  for bh in $layer_refs; do
+    bf="$registry/oci/blobs/sha256/$bh"
+    mkdir -p "$work/$bh"
+    case "$(od -An -tx1 -N2 "$bf" | tr -d ' ')" in
+      1f8b) gzip -dc "$bf" > "$work/$bh/layer.tar" ;;
+      *)    cp "$bf" "$work/$bh/layer.tar" ;;
+    esac
+    manifest_layers="$manifest_layers $bh/layer.tar"
+  done
+  # The placed identity records the VERIFIED manifest digest (§2.7: identity
+  # = digest of the distributed artifact in its canonical form).
+  img_digest=$digest
+else
+  # LEGACY mode: a local docker-archive tarball.
+  tar xzf "$img" -C "$work"
+  [ -f "$work/manifest.json" ] || {
+    echo "td-place: $img has no manifest.json — not an OCI image" >&2; exit 1; }
+
+  # Ordered list of manifest-referenced layers ("<hex>/layer.tar", one per line).
+  manifest_layers=$(tr -d '\n' < "$work/manifest.json" \
+    | sed -n 's/.*"Layers":\[\([^][]*\)\].*/\1/p' \
+    | tr ',' '\n' | sed -n 's/^[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p')
+  [ -n "$manifest_layers" ] || {
+    echo "td-place: manifest.json lists no Layers — malformed image" >&2; exit 1; }
+
+  # The placed identity records the sha256 of the artifact actually unpacked
+  # (§2.7 staged representation for the local-archive path).
+  img_digest=$(sha256sum "$img")
+  img_digest="sha256:${img_digest%% *}"
+  img_hex=${img_digest#sha256:}
+  case "$img_hex" in
+    *[!0-9a-f]*|'')
+      echo "td-place: could not compute the image digest for $img" >&2; exit 1 ;;
+  esac
+  [ "${#img_hex}" -eq 64 ] || {
+    echo "td-place: computed image digest has ${#img_hex} hex chars, expected 64" >&2; exit 1; }
+fi
 
 # Among the manifest layers, the boot layer is the one carrying /boot/bzImage.
 boot_layer=
@@ -204,18 +323,10 @@ printf '%s\n' "$img_uuid"   > "$boot_stage/root-uuid"
 printf '%s\n' "$extra_kernel_args" > "$boot_stage/kernel-args"
 
 # M12 (DESIGN §2.7): the PLACED identity additionally records what the image
-# IS — the sha256 of the artifact actually unpacked. The image cannot carry
-# its own digest (self-reference), so the placer computes and appends it; this
-# line is the anchor M12's signature verification compares against.
-img_digest=$(sha256sum "$img")
-img_digest="sha256:${img_digest%% *}"
-img_hex=${img_digest#sha256:}
-case "$img_hex" in
-  *[!0-9a-f]*|'')
-    echo "td-place: could not compute the image digest for $img" >&2; exit 1 ;;
-esac
-[ "${#img_hex}" -eq 64 ] || {
-  echo "td-place: computed image digest has ${#img_hex} hex chars, expected 64" >&2; exit 1; }
+# IS — $img_digest, set in step 1 per input mode: the VERIFIED manifest digest
+# (registry mode) or the sha256 of the artifact actually unpacked (legacy).
+# The image cannot carry its own digest (self-reference), so the placer
+# appends it here.
 chmod u+w "$boot_stage/td-identity"          # tar kept the image's 0444
 printf 'image-digest=%s\n' "$img_digest" >> "$boot_stage/td-identity"
 chmod 0444 "$boot_stage/td-identity"

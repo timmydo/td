@@ -30,14 +30,17 @@
   #:use-module (gnu packages base)        ;tar, coreutils, sed, grep
   #:use-module (gnu packages bash)        ;bash
   #:use-module (gnu packages compression) ;gzip
+  #:use-module (gnu packages crypto)      ;signify (verified mode, M12)
   #:use-module (gnu packages linux)       ;e2fsprogs, fakeroot (for --mkfs)
   #:use-module (guix gexp)
   #:use-module (guix monads)
   #:use-module (guix store)
   #:use-module (system td-typed)
   #:use-module (system td-generation)
+  #:use-module (system td-registry)       ;td-registry (verified mode, M12)
   #:use-module (system td-verity)         ;veritysetup-static (--mkfs, M11)
-  #:export (td-placed-tree))
+  #:export (td-placed-tree
+            td-registry-placed-tree))
 
 ;; Build a target tree by PLACING each generation in GENS (in order, into the
 ;; same target) with the guix-free placer, pruning to the newest KEEP. The output
@@ -141,6 +144,81 @@ set timeout=5
                                (if bl (list "--boot-label" bl) '()))
                            ,@(let ((ka #$extra-kernel-args))
                                (if ka (list "--extra-kernel-args" ka) '()))))))
+               (list #$@jobs))
+
+              (copy-recursively target #$output)))))))
+
+;; M12 S4: build a target tree by placing each generation from the SIGNED
+;; static registry (system/td-registry.scm) in the placer's VERIFIED mode —
+;; `--registry/--digest/--pubkey` instead of `--image`. DIGESTS maps each
+;; generation in GENS to the manifest digest ("sha256:<hex>") the placer must
+;; demand; the rung obtains those independently (skopeo inspect — the foreign
+;; oracle), so the placer is told what to expect rather than trusting the
+;; registry's own files. The build sandbox PATH is base tools + signify (the
+;; same pattern as veritysetup for --mkfs) and still NO guix — the guix-free-
+;; by-construction guarantee is unchanged. The committed TEST pubkey
+;; (tests/keys/README) is the verification key. Returns a monadic derivation.
+(define* (td-registry-placed-tree #:key (gens '(1 2)) digests (keep 10))
+  (mlet %store-monad
+      ((registry (td-registry #:gens gens)))
+    (let* ((labels (map (lambda (n)
+                          (td-config-effective-root-label (td-config #:generation n)))
+                        gens))
+           ;; One (gen-string digest root-label) job per generation.
+           (jobs   (map (lambda (n label)
+                          (let ((digest (assoc-ref digests n)))
+                            (unless (and (string? digest)
+                                         (string-prefix? "sha256:" digest))
+                              (error "td-registry-placed-tree: no sha256: digest for generation"
+                                     n digest))
+                            #~(list #$(number->string n) #$digest #$label)))
+                        gens labels)))
+      (gexp->derivation "td-registry-placed-tree"
+        (with-imported-modules '((guix build utils))
+          #~(begin
+              (use-modules (guix build utils) (ice-9 match))
+
+              (define placer #$(local-file "td-place.sh"))
+              (define sh #$(file-append bash "/bin/bash"))
+              (define pubkey #$(local-file "../tests/keys/td_m12_signify.pub"))
+
+              ;; Base tools + signify; no guix (see td-placed-tree).
+              (setenv "PATH"
+                      (string-append #$(file-append coreutils "/bin") ":"
+                                     #$(file-append tar "/bin") ":"
+                                     #$(file-append gzip "/bin") ":"
+                                     #$(file-append sed "/bin") ":"
+                                     #$(file-append grep "/bin") ":"
+                                     #$(file-append signify "/bin")))
+
+              (define target   (string-append (getcwd) "/target"))
+              (define boot     (string-append target "/boot"))
+              (define roots    (string-append target "/roots"))
+              (define grub-cfg (string-append boot "/grub/grub.cfg"))
+              (mkdir-p (string-append boot "/grub"))
+              (mkdir-p (string-append roots "/td"))
+
+              ;; The same user preamble contract as td-placed-tree.
+              (call-with-output-file grub-cfg
+                (lambda (p)
+                  (display "\
+# td target grub.cfg — user preamble (must be preserved by td-place)
+set timeout=5
+" p)))
+
+              (for-each
+               (match-lambda
+                 ((gen digest label)
+                  (invoke sh placer
+                          "--registry"   #$registry
+                          "--digest"     digest
+                          "--pubkey"     pubkey
+                          "--generation" gen
+                          "--root-label" label
+                          "--boot-dir"   boot
+                          "--root-store" roots
+                          "--grub-cfg"   grub-cfg
+                          "--keep"       #$(number->string keep))))
                (list #$@jobs))
 
               (copy-recursively target #$output)))))))
