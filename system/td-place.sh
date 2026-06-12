@@ -412,6 +412,16 @@ if [ "$mkfs" = yes ]; then
   # SOURCE_DATE_EPOCH + E2FSPROGS_FAKE_TIME pin the clock; hash_seed pins the
   # directory-hash seed to the (already deterministic) filesystem UUID.
   touch -d @1 "$fsroot"
+  # Settle writeback before sizing: du reports st_blocks, and under ext4
+  # delayed allocation a just-extracted tree reports 0/partial blocks until
+  # writeback completes — a timing-dependent under-count that turned the
+  # hosted CI's cross-host --check red intermittently (the runner rebuilds
+  # against dev-built outputs; placed tree live run #5, rollback disk run
+  # #3) while the settled-state builds observed so far agree across
+  # filesystems (run #4 matched bit-for-bit). syncfs the tree's filesystem
+  # (global sync where -f is unsupported) so du always measures the
+  # settled state.
+  sync -f "$fsroot" 2>/dev/null || sync
   size_kb=$(du -sk "$fsroot" | cut -f1)
   size_kb=$((size_kb + size_kb / 4 + 1024))
   # M11: the ext4 data area must be a whole number of 4096-byte dm-verity

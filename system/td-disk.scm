@@ -87,6 +87,12 @@
           ;; --- 2. Boot partition image (same invocation as the placer's mkfs
           ;; and Guix's make-ext-image — the proven-deterministic recipe). ---
           (define (du-kb dir)
+            ;; Settle writeback first: du reports st_blocks, and under ext4
+            ;; delayed allocation a freshly-written tree under-counts until
+            ;; writeback completes — the timing-dependent wiggle that turned
+            ;; the hosted CI's cross-host --check red intermittently (the
+            ;; same du defect as the placer's; see td-place.sh).
+            (invoke "sync" "-f" dir)
             (let* ((p (open-input-pipe (string-append "du -sk " dir)))
                    (line (read-line p)))
               (close-pipe p)
