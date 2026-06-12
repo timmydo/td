@@ -412,17 +412,17 @@ if [ "$mkfs" = yes ]; then
   # SOURCE_DATE_EPOCH + E2FSPROGS_FAKE_TIME pin the clock; hash_seed pins the
   # directory-hash seed to the (already deterministic) filesystem UUID.
   touch -d @1 "$fsroot"
-  # Settle writeback before sizing: du reports st_blocks, and under ext4
-  # delayed allocation a just-extracted tree reports 0/partial blocks until
-  # writeback completes — a timing-dependent under-count that turned the
-  # hosted CI's cross-host --check red intermittently (the runner rebuilds
-  # against dev-built outputs; placed tree live run #5, rollback disk run
-  # #3) while the settled-state builds observed so far agree across
-  # filesystems (run #4 matched bit-for-bit). syncfs the tree's filesystem
-  # (global sync where -f is unsupported) so du always measures the
-  # settled state.
-  sync -f "$fsroot" 2>/dev/null || sync
-  size_kb=$(du -sk "$fsroot" | cut -f1)
+  # Size from CONTENT, not block accounting: du reports st_blocks, which is
+  # filesystem-dependent even after writeback settles (btrfs inlines small
+  # files; ext4 charges extent metadata) — the hosted CI's cross-host
+  # --check proved it live: dev-built (btrfs) and runner-built (ext4)
+  # root.img sizes diverged (intermittently from delalloc timing in runs
+  # #3/#5, then STABLY once a sync settled the timing half). A tar of the
+  # tree measures bytes the filesystem cannot influence (fixed-width
+  # headers + 512-padded content), and tar is already in this tool's
+  # declared base-tool set; its per-entry overhead (>=512B) more than
+  # covers ext4 inode+dirent costs, before the 25% margin below.
+  size_kb=$(( $(tar -cf - "$fsroot" | wc -c) / 1024 ))
   size_kb=$((size_kb + size_kb / 4 + 1024))
   # M11: the ext4 data area must be a whole number of 4096-byte dm-verity
   # data blocks — round up so --data-blocks below is exact and the appended

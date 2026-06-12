@@ -87,16 +87,22 @@
           ;; --- 2. Boot partition image (same invocation as the placer's mkfs
           ;; and Guix's make-ext-image — the proven-deterministic recipe). ---
           (define (du-kb dir)
-            ;; Settle writeback first: du reports st_blocks, and under ext4
-            ;; delayed allocation a freshly-written tree under-counts until
-            ;; writeback completes — the timing-dependent wiggle that turned
-            ;; the hosted CI's cross-host --check red intermittently (the
-            ;; same du defect as the placer's; see td-place.sh).
-            (invoke "sync" "-f" dir)
-            (let* ((p (open-input-pipe (string-append "du -sk " dir)))
-                   (line (read-line p)))
-              (close-pipe p)
-              (string->number (car (string-split line #\tab)))))
+            ;; Size from CONTENT, not block accounting: st_blocks is
+            ;; filesystem-dependent even settled (btrfs inlines small
+            ;; files; ext4 charges extent metadata) — proven live by the
+            ;; hosted CI's cross-host --check (same defect class as the
+            ;; placer's; see td-place.sh). Apparent bytes + 4KiB per
+            ;; entry (inode + dirent headroom) depend only on the tree.
+            (let ((entries (find-files dir (const #t) #:directories? #t)))
+              (quotient (+ (fold + 0
+                                 (map (lambda (f)
+                                        (let ((st (lstat f)))
+                                          (if (eq? 'regular (stat:type st))
+                                              (stat:size st)
+                                              0)))
+                                      entries))
+                           (* 4096 (+ 1 (length entries))))
+                        1024)))
           ;; Determinism: copy-recursively re-stamps everything "now", and
           ;; mke2fs stamps the superblock/journal with the current time and a
           ;; random hash seed unless pinned (the placer learned this the
