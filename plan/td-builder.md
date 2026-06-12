@@ -266,7 +266,7 @@ S3 sub-ladder (each step: verified-red before trusting green, then commit):
   unit tests red before the fix — the tests discriminate. Dump validated
   against the real td-builder-0.1.0.drv; `./check.sh td-builder` green
   (tests run inside `guix build`, `--check` reproducible).
-- [ ] **S3b sandbox build** — `td-builder build DRV --store STAGED --out DIR`:
+- [x] **S3b sandbox build** — `td-builder build DRV CLOSURE SCRATCH`:
   unshare(NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS) via raw x86_64 syscalls
   (zero-dep stays — precedent: the hand-rolled SHA-256; the differential
   proves behavior), uid/gid map per Q4, staged closure rbind at /gnu/store,
@@ -274,7 +274,7 @@ S3 sub-ladder (each step: verified-red before trusting green, then commit):
   Isolation probe drv (uid_map recorder, the rootless rung's pattern) builds
   td-side ONLY — its output is namespace-dependent by design so it can never
   be a differential subject (the track-file caveat).
-- [ ] **S3c registration + differential leg** — reference scanning (search
+- [x] **S3c registration + differential leg** — reference scanning (search
   output bytes for candidate store-path hash parts, the daemon's algorithm),
   v1 registration record per Q3; `tests/td-builder-s3-drvs.scm` prints the
   daemon-built diff-drv oracle facts (path, recorded NAR hash, references);
@@ -285,3 +285,26 @@ S3 sub-ladder (each step: verified-red before trusting green, then commit):
 The differential drv is deterministic and carries a runtime reference (its
 output embeds an input store path) so the references-scan assert can
 discriminate; the probe drv stays separate (see the probe-vs-oracle caveat).
+
+S3 GREEN 2026-06-11: `./check.sh td-builder` — the userns rebuild of the
+diff drv registers the daemon's exact facts (path, NAR hash recorded AND
+independently re-hashed, size 1048, refs = input + self, deriver) at the
+same store path; probe uid_map `30001 <host> 1`. S2's S1/S2 legs untouched.
+
+Verified-red (S3) — each driven 2026-06-11 via `./check.sh td-builder`,
+each exiting non-zero at a DISTINCT assert, then restored:
+
+- **A — sandbox uid defect** (`GUEST_UID 30001 -> 0` in sandbox.rs): probe
+  leg red — uid_map read `0 1001 1`, FAIL names the expected
+  `30001 <host> 1` shape (the assert pins build.cc's defaultGuestUID after
+  the review-round strengthening; a merely non-zero wrong uid would also
+  red).
+- **B — registration defect** (record `nar-size + 1` in main.rs): FAIL
+  `NAR size mismatch — registration '1049' vs daemon '1048'`.
+- **C — references mis-registration** (outputs dropped from the candidate
+  set in main.rs — the defect Q3's differential exists for): FAIL prints
+  both sets — daemon `{dep, self}`, td `{dep}` — the self-reference is the
+  discriminator.
+- (S3a's parser red was organic: the first endOfList transcription turned 5
+  unit tests red. S2's NAR reds ×3 cover the serialization leg the
+  independent re-hash assert shares.)
