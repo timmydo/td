@@ -252,10 +252,17 @@ republished per the PR protocol (PR #4). Q3 and Q4(S3 scope) decided above.
 
 S3 sub-ladder (each step: verified-red before trusting green, then commit):
 
-- [ ] **S3a parser** — `src/drv.rs`, recursive-descent ATerm
+- [x] **S3a parser** — `src/drv.rs`, recursive-descent ATerm
   `Derive([outputs],[inputDrvs],[inputSrcs],system,builder,[args],[env])`;
   `td-builder drv-parse FILE` prints a canonical dump; unit tests cover
   escapes (`\"`, `\\`, `\n`) and a real pinned-channel drv shape.
+  DONE 2026-06-11: grammar transcribed from parseDerivation/parseString at
+  the pin; fail-closed deviations only (trailing bytes, non-UTF-8 refused).
+  Verified-red ORGANICALLY: the first endOfList transcription (error on a
+  list's first element instead of no-consume-continue) turned 5 of the new
+  unit tests red before the fix — the tests discriminate. Dump validated
+  against the real td-builder-0.1.0.drv; `./check.sh td-builder` green
+  (tests run inside `guix build`, `--check` reproducible).
 - [ ] **S3b sandbox build** — `td-builder build DRV --store STAGED --out DIR`:
   unshare(NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS) via raw x86_64 syscalls
   (zero-dep stays — precedent: the hand-rolled SHA-256; the differential

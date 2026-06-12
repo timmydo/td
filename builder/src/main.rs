@@ -15,6 +15,7 @@
 //!     registration;
 //!   • S4 — the daemon-vs-td-builder store differential, as a check.sh rung.
 
+mod drv;
 mod nar;
 mod sha256;
 
@@ -58,9 +59,27 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // S3a — parse the ATerm drv and print the canonical dump.
+        Some("drv-parse") if args.len() == 3 => match std::fs::read(&args[2]) {
+            Ok(bytes) => match drv::parse(&bytes) {
+                Ok(d) => {
+                    print!("{}", drv::dump(&d));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-parse {}: {e}", args[2]);
+                    ExitCode::FAILURE
+                }
+            },
+            Err(e) => {
+                eprintln!("td-builder: drv-parse {}: {e}", args[2]);
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("usage: td-builder            # print the S1 sentinel");
             eprintln!("       td-builder nar-hash PATH");
+            eprintln!("       td-builder drv-parse FILE.drv");
             ExitCode::from(2)
         }
     }
