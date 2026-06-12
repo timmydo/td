@@ -563,11 +563,21 @@ no-guix:
 #     the daemon's. Verified-red (driven before this leg may land):
 #     ordering/padding defects in nar.rs each red it — evidence in
 #     plan/td-builder.md.
+#   • S3: BUILD DIFFERENTIAL — td-builder parses the ATerm drv, executes its
+#     builder in a fresh user namespace (uid 30001, staged store rbind, the
+#     daemon's env contract — plan/td-builder.md Q4) and registers the output
+#     (v1 record — Q3). Asserted against the daemon, which builds the SAME
+#     deterministic drv (tests/td-builder-s3-drvs.scm): same store path,
+#     NAR hash equal to the daemon's RECORDED hash, NAR size, references set
+#     (an input ref + a self-ref — the scan must find both) and deriver all
+#     equal; plus the rootless rung's isolation assert on a separate
+#     namespace-sensitive probe drv (built td-side only — its output records
+#     uid_map and can never be a differential subject).
 # OFFLINE PRECONDITION (DESIGN §5): the pinned Rust closure must be warm in the
 # host store — the loop fetches nothing. Two-step lower-then-realise (repl ->
 # guix build) for an honest exit status, as in the other rungs.
 td-builder:
-	@echo ">> td-builder: reproducible offline build (S1) + daemon NAR differential (S2)"
+	@echo ">> td-builder: reproducible offline build (S1) + NAR differential (S2) + build differential (S3)"
 	@set -euo pipefail; \
 	drv=`$(GUIX) repl $(LOAD) tests/td-builder-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the td-builder derivation" >&2; exit 1; }; \
@@ -597,9 +607,71 @@ td-builder:
 	  n=$$((n + 1)); \
 	done <<< "$$pairs"; \
 	test "$$n" -ge 2 || { echo "FAIL: expected at least 2 oracle NAR pairs (fixture + td-builder output), got $$n" >&2; exit 1; }; \
+	echo ">> S3: drv parse + sandboxed userns build differential vs the daemon"; \
+	scratch="$(CURDIR)/.td-builder-scratch"; \
+	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
+	$(GUIX) repl $(LOAD) tests/td-builder-s3-drvs.scm 2>/dev/null > "$$scratch/s3.txt"; \
+	diff_drv=`sed -n 's/^DIFF_DRV=//p' "$$scratch/s3.txt"`; \
+	diff_out=`sed -n 's/^DIFF_OUT=//p' "$$scratch/s3.txt"`; \
+	diff_hash=`sed -n 's/^DIFF_HASH=//p' "$$scratch/s3.txt"`; \
+	diff_narsize=`sed -n 's/^DIFF_NARSIZE=//p' "$$scratch/s3.txt"`; \
+	diff_deriver=`sed -n 's/^DIFF_DERIVER=//p' "$$scratch/s3.txt"`; \
+	probe_drv=`sed -n 's/^PROBE_DRV=//p' "$$scratch/s3.txt"`; \
+	probe_out=`sed -n 's/^PROBE_OUT=//p' "$$scratch/s3.txt"`; \
+	test -n "$$diff_drv" -a -n "$$diff_out" -a -n "$$diff_hash" -a -n "$$diff_narsize" \
+	     -a -n "$$diff_deriver" -a -n "$$probe_drv" -a -n "$$probe_out" \
+	  || { echo "ERROR: could not lower the S3 drvs (tests/td-builder-s3-drvs.scm)" >&2; exit 1; }; \
+	{ sed -n 's/^DIFF_INPUT=//p;s/^PROBE_INPUT=//p' "$$scratch/s3.txt"; \
+	  printf '%s\n' "$$diff_drv" "$$probe_drv"; } \
+	  | xargs $(GUIX) gc -R | sort -u > "$$scratch/paths.txt"; \
+	echo "   staged closure: $$(wc -l < "$$scratch/paths.txt") store items"; \
+	"$$out/bin/td-builder" drv-parse "$$diff_drv" > /dev/null \
+	  || { echo "FAIL: td-builder drv-parse rejected the diff drv $$diff_drv" >&2; exit 1; }; \
+	echo "   isolation probe: the build must run in a fresh user namespace"; \
+	"$$out/bin/td-builder" build "$$probe_drv" "$$scratch/paths.txt" "$$scratch/probe" > /dev/null \
+	  || { echo "FAIL: td-builder could not build the isolation probe drv" >&2; exit 1; }; \
+	map="$$scratch/probe/newstore/$${probe_out#/gnu/store/}/uid_map"; \
+	test -s "$$map" || { echo "FAIL: the isolation probe recorded an empty uid_map" >&2; exit 1; }; \
+	echo "   uid_map seen by the td-builder sandbox:"; sed 's/^/     /' "$$map"; \
+	map_lines=`wc -l < "$$map"`; read -r map_first map_rest < "$$map"; \
+	if [ "$$map_lines" -ne 1 ] || [ "$$map_first" != "30001" ]; then \
+	  echo "FAIL: the td-builder build's uid_map is not a fresh per-build user" >&2; \
+	  echo "      namespace mapping with the daemon's guest uid (expected the" >&2; \
+	  echo "      single entry '30001 <host> 1' — build.cc defaultGuestUID; a" >&2; \
+	  echo "      leading 0 means no/inherited namespace, any other uid breaks" >&2; \
+	  echo "      the Q4 contract)." >&2; exit 1; \
+	fi; \
+	echo "   differential: td-builder rebuild vs the daemon's recorded facts"; \
+	"$$out/bin/td-builder" build "$$diff_drv" "$$scratch/paths.txt" "$$scratch/diff" > "$$scratch/diff-build.txt" \
+	  || { echo "FAIL: td-builder could not build the diff drv $$diff_drv" >&2; exit 1; }; \
+	grep -qx "OUT=out $$diff_out" "$$scratch/diff-build.txt" \
+	  || { echo "FAIL: store-path mismatch: td-builder reported '$$(cat "$$scratch/diff-build.txt")', the daemon built $$diff_out" >&2; exit 1; }; \
+	reg="$$scratch/diff/registration"; \
+	test -s "$$reg" || { echo "FAIL: td-builder wrote no registration record" >&2; exit 1; }; \
+	grep -qx "path $$diff_out" "$$reg" \
+	  || { echo "FAIL: registration path mismatch (see record below) vs $$diff_out" >&2; cat "$$reg" >&2; exit 1; }; \
+	grep -qx "nar-hash sha256:$$diff_hash" "$$reg" \
+	  || { echo "FAIL: NAR hash mismatch — registration '$$(sed -n 's/^nar-hash //p' "$$reg")' vs daemon 'sha256:$$diff_hash'" >&2; exit 1; }; \
+	grep -qx "nar-size $$diff_narsize" "$$reg" \
+	  || { echo "FAIL: NAR size mismatch — registration '$$(sed -n 's/^nar-size //p' "$$reg")' vs daemon '$$diff_narsize'" >&2; exit 1; }; \
+	grep -qx "deriver $$diff_deriver" "$$reg" \
+	  || { echo "FAIL: deriver mismatch — registration '$$(sed -n 's/^deriver //p' "$$reg")' vs daemon '$$diff_deriver'" >&2; exit 1; }; \
+	sed -n 's/^DIFF_REF=//p' "$$scratch/s3.txt" > "$$scratch/refs.oracle"; \
+	sed -n 's/^reference //p' "$$reg" > "$$scratch/refs.td"; \
+	test -s "$$scratch/refs.oracle" \
+	  || { echo "ERROR: the oracle recorded NO references for the diff drv — the fixture lost its discriminating refs" >&2; exit 1; }; \
+	test "$$(cat "$$scratch/refs.oracle")" = "$$(cat "$$scratch/refs.td")" \
+	  || { echo "FAIL: references set mismatch:" >&2; \
+	       echo "      daemon recorded:" >&2; sed 's/^/        /' "$$scratch/refs.oracle" >&2; \
+	       echo "      td-builder registered:" >&2; sed 's/^/        /' "$$scratch/refs.td" >&2; exit 1; }; \
+	rehash=`"$$out/bin/td-builder" nar-hash "$$scratch/diff/newstore/$${diff_out#/gnu/store/}"`; \
+	test "$$rehash" = "sha256:$$diff_hash" \
+	  || { echo "FAIL: independent re-hash of the on-disk rebuild gives $$rehash, the daemon recorded sha256:$$diff_hash" >&2; exit 1; }; \
+	echo "   rebuild equal: store path, NAR hash (registered + re-hashed), size, references (input + self), deriver"; \
+	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; \
 	echo ">> closure size:"; $(GUIX) size "$$out" | tail -n1; \
 	echo "   compile wall-clock: $${elapsed}s (first run; warm store thereafter)"; \
-	echo "PASS: reproducible offline build (S1); NAR serialization bit-for-bit equal to the daemon's recorded hashes across $$n items (S2)."
+	echo "PASS: reproducible offline build (S1); NAR serialization bit-for-bit equal to the daemon's recorded hashes across $$n items (S2); the userns sandbox rebuild registers the daemon's exact facts at the same store path and builds in a fresh user namespace (S3)."
 
 # 7. M8 run rung — execute the SHIPPED OCI image as a real rootless OCI container
 #    (crun) and assert its userspace runs. Every rung above proves a PROPERTY of
