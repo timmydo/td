@@ -82,7 +82,10 @@ equal to the root daemon, so oracle authority transfers).
    with `setgroups deny` (defaultGuestUID/GID, initializeUserNamespace).
    td's replication mechanism (not build.cc facts — guest-visible state is
    what must match): fresh tmpfs `/tmp`, staged store rbind at `/gnu/store`
-   (the rootless harness's mechanics, per "Settled decisions"). Namespaces at S3:
+   (the rootless harness's mechanics, per "Settled decisions").
+   `NIX_BUILD_CORES` is fixed at "1" (libstore's default at the pin;
+   client-overridable daemon-side, not hash-visible for the S3 subjects —
+   revisit if a differential subject ever embeds it). Namespaces at S3:
    NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS (the immediate-effect set — NEWNET
    makes non-fixed-output builds offline by construction). Deferred to S4
    (the system-image drv will honestly red if they matter): NEWPID + fresh
