@@ -176,48 +176,68 @@ jobs:
             || { echo "host-guix shim came out malformed: '$host_guix'" >&2; exit 1; }
           echo "$host_guix" > /tmp/host-guix
       - name: run the full check (./check.sh)
+        # pipefail makes the tee transparent to the gate: the step's status
+        # IS ./check.sh's status. The log copy only feeds the failure-only
+        # diagnostic below.
         run: |
-          set -eu
+          set -euo pipefail
           export PATH="$(cat /tmp/host-guix)/bin:$PATH"
           guix describe
-          ./check.sh
-      - name: diagnose a differing td-rollback-disk (debug-only, red runs)
-        # TEMPORARY diagnostic, additive-only — gates nothing. Live run #3
-        # red'ed with "td-rollback-disk may not be deterministic": the
-        # runner's rebuild differs from the dev-built output shipped in the
-        # CI store image, i.e. a CROSS-HOST reproducibility defect the
-        # dev-only loop cannot see (each box is self-consistent). The cheap
-        # local theories (du block accounting, mke2fs -d readdir order) are
-        # ruled out, so this maps WHERE the 2.8G image differs to direct the
-        # real fix. Remove once the builder is cross-host deterministic.
+          ./check.sh 2>&1 | tee /tmp/check.log
+      - name: diagnose non-deterministic rebuilds (debug-only, red runs)
+        # TEMPORARY diagnostic, additive-only — gates nothing (an if-failure
+        # step can never flip a red job green). The --check rungs on this
+        # runner compare a runner rebuild against the dev-built output
+        # shipped in the CI store image — a CROSS-HOST reproducibility
+        # differential the dev-only loop cannot see. Runs #3/#4 each
+        # reported ONE differing artifact (td-rollback-disk, then
+        # docker-image.tar.gz) while a parallel rung was dying of ENOSPC;
+        # both pass --check locally, and run #4's rollback re-check MATCHED
+        # on the same runner — so divergences may be pressure-transient.
+        # For any divergence the log reports, this rebuilds with -K and
+        # maps it: sizes, first differing byte, 16MiB bucket scan, and for
+        # .tar.gz a decompressed comparison (gzip framing vs tar content).
+        # Remove once a clean run greens.
         if: failure()
         run: |
           set -eu
           [ -f /tmp/host-guix ] || { echo "failed before the daemon switch; nothing to diagnose"; exit 0; }
+          [ -f /tmp/check.log ] || { echo "no check log; nothing to diagnose"; exit 0; }
           export PATH="$(cat /tmp/host-guix)/bin:$PATH"
-          drv=$(guix repl -L . tests/rollback-drv.scm 2>/dev/null | sed -n 's/^DRV_DISK=//p')
-          test -n "$drv" || { echo "could not lower DRV_DISK; nothing to diagnose"; exit 0; }
-          out=$(guix build --no-substitutes --no-offload "$drv")
-          guix build --check -K --no-substitutes --no-offload "$drv" || true
-          chk="$out-check"
-          [ -e "$chk" ] || { echo "no $chk: this rebuild matched (red was elsewhere)"; exit 0; }
-          ls -l "$out" "$chk"
-          off=$(cmp "$out" "$chk" | sed -n 's/.* differ: byte \([0-9]*\).*/\1/p')
-          echo "first differing byte: ${off:-unknown}"
-          if [ -n "${off:-}" ]; then
-            sec=$(( (off - 1) / 512 * 512 ))
-            echo "--- shipped @ $sec:"
-            dd if="$out" bs=512 skip=$((sec / 512)) count=1 2>/dev/null | od -A d -t x1z
-            echo "--- rebuilt @ $sec:"
-            dd if="$chk" bs=512 skip=$((sec / 512)) count=1 2>/dev/null | od -A d -t x1z
-          fi
-          echo "--- 16MiB buckets that differ (of $(stat -c %s "$out") bytes):"
-          bs=16777216; n=$((($(stat -c %s "$out") + bs - 1) / bs)); i=0
-          while [ "$i" -lt "$n" ]; do
-            cmp -s <(dd if="$out" bs=$bs skip=$i count=1 2>/dev/null) \
-                   <(dd if="$chk" bs=$bs skip=$i count=1 2>/dev/null) \
-              || echo "  bucket $i (offset $((i * bs)))"
-            i=$((i + 1))
-          done
-          echo "--- partition table (shipped):"
-          sfdisk -d "$out" || true
+          sed -n "s/.*derivation \`\(\/gnu\/store\/[^']*\.drv\)' may not be deterministic: output \`\(\/gnu\/store\/[^']*\)' differs.*/\1 \2/p" \
+            /tmp/check.log | sort -u > /tmp/differs.txt
+          [ -s /tmp/differs.txt ] || { echo "no 'may not be deterministic' verdicts in the log"; exit 0; }
+          while read -r drv out; do
+            echo "=== $drv"
+            guix build --check -K --no-substitutes --no-offload "$drv" </dev/null || true
+            chk="$out-check"
+            [ -e "$chk" ] || { echo "re-check MATCHED ($out) — transient divergence"; continue; }
+            ls -l "$out" "$chk"
+            off=$(cmp "$out" "$chk" | sed -n 's/.* differ: byte \([0-9]*\).*/\1/p')
+            echo "first differing byte: ${off:-unknown}"
+            if [ -n "${off:-}" ]; then
+              sec=$(( (off - 1) / 512 * 512 ))
+              echo "--- shipped @ $sec:"
+              dd if="$out" bs=512 skip=$((sec / 512)) count=1 2>/dev/null | od -A d -t x1z
+              echo "--- rebuilt @ $sec:"
+              dd if="$chk" bs=512 skip=$((sec / 512)) count=1 2>/dev/null | od -A d -t x1z
+            fi
+            echo "--- 16MiB buckets that differ (sizes: $(stat -c %s "$out") vs $(stat -c %s "$chk")):"
+            bs=16777216; n=$((($(stat -c %s "$out") + bs - 1) / bs)); i=0
+            while [ "$i" -lt "$n" ]; do
+              cmp -s <(dd if="$out" bs=$bs skip=$i count=1 2>/dev/null) \
+                     <(dd if="$chk" bs=$bs skip=$i count=1 2>/dev/null) \
+                || echo "  bucket $i (offset $((i * bs)))"
+              i=$((i + 1))
+            done
+            case "$out" in
+              *.tar.gz)
+                echo "--- decompressed comparison:"
+                if cmp -s <(zcat "$out") <(zcat "$chk"); then
+                  echo "  decompressed TARs IDENTICAL — divergence is gzip framing only"
+                else
+                  echo "  decompressed TARs differ too:"
+                  cmp <(zcat "$out") <(zcat "$chk") || true
+                fi;;
+            esac
+          done < /tmp/differs.txt

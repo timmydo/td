@@ -172,5 +172,30 @@ check; merging needs green checks + one approving review (DESIGN §7.2).
   against the partition table. ENOSPC pressure during the parallel rung is
   a possible confounder (rollback's verdict landed ~100s before the
   ENOSPC), so the same next run also decides that.
+- 2026-06-12 claude-fable-52ceb1 (live run #4 + the tmpfs root cause): the
+  /tmp bind was NOT the fix — run #4's runner had 145G root with 71G free
+  after import and generation-image STILL ENOSPC'd. Real cause: the rung's
+  validator extracts multi-GB images into /tmp INSIDE the `guix shell -C`
+  sandbox, which is a tmpfs sized ~10% of RAM (6.3G on the 62G dev box —
+  fits; ~1.6G on the 16G runner — ENOSPC). The repo had already learned
+  this lesson (oci-load's "disk, not the sandbox tmpfs" comment;
+  tests/rootless.sh TMPDIR export); two rungs were stragglers:
+  generation-image (validator) and run (run-image.sh's mktemp -d).
+  EXCLUSIVE LANDING (Makefile): PR #8 moves their scratch to
+  $(CURDIR)/.genimg-scratch / .run-scratch — recipes pass TMPDIR, scripts
+  untouched (both already honor TMPDIR), no assertion changed; both rungs
+  verified green locally with the patch; the red half was the two live
+  ENOSPC runs. Cherry-picked onto ci-image until #8 lands (dedupes at
+  rebase). Also in run #4: rollback's divergence VANISHED (the diagnostic
+  re-checked it on the same runner: MATCHED) — so run #3's "may not be
+  deterministic" was pressure-transient; run #4 instead reported no-guix's
+  docker-image.tar.gz differing, again concurrent with the ENOSPC, and
+  that drv --checks green locally too. Working theory: the divergence
+  verdicts are artifacts of the tmpfs/RAM pressure (mechanism unknown —
+  uncomfortable; do not paper over). The diagnostic step is now GENERIC:
+  the gate tees ./check.sh's log (pipefail keeps the status transparent),
+  and on a red run every "may not be deterministic" drv in the log is
+  re-checked with -K and byte-mapped (sizes, first byte, 16MiB buckets,
+  tar-vs-gzip-level comparison for .tar.gz).
 - The track's verified-red (red branch → failing `check` run → blocked PR)
   needs the published image; it is step 5 above, not yet run.
