@@ -43,7 +43,8 @@ lower() {
 # --- Maintenance guard: the rung list this enumeration was written against.
 KNOWN_RUNGS="eval diff typed-coverage oci-diff manifest-diff generation-diff \
 rollback generation-image no-guix manifest-check oci container rootless \
-oci-load reset test place build boot-disk td-builder run offline"
+oci-load registry verify-place reset test place build boot-disk td-builder \
+run offline"
 current=$(sed -n 's/^CHEAP_RUNGS := //p; s/^HEAVY_RUNGS := //p' Makefile | tr '\n' ' ')
 for r in $current; do
   case " $KNOWN_RUNGS " in
@@ -61,6 +62,7 @@ done
 LOWERING_SCRIPTS="tests/manifest-image-drv.scm tests/generation-image-drv.scm \
 tests/place-drv.scm tests/rollback-drv.scm tests/imperative-surface.scm \
 tests/rootless-drvs.scm tests/td-builder-drv.scm tests/td-builder-s3-drvs.scm \
+tests/td-builder-s4-drv.scm tests/registry-drv.scm tests/verify-place-drv.scm \
 tests/offline-drv.scm"
 for s in tests/*-drv.scm tests/*-drvs.scm; do
   [ -e "$s" ] || continue
@@ -78,7 +80,7 @@ done
 tools=$(sed -n 's/^  \(make bash .*\) -- \\$/\1/p' check.sh)
 test -n "$tools" || { echo "ERROR: could not parse toolchain from check.sh" >&2; exit 1; }
 # shellcheck disable=SC2086
-$GUIX build -d $tools skopeo
+$GUIX build -d $tools skopeo signify
 
 # --- Pinned channel instance (time-machine's target — needed valid in the
 # CI store so the in-loop time-machine is the same warm no-op as on a dev box).
@@ -101,6 +103,24 @@ printf '%s\n' "$TD_IMAGE_DRV"
 export TD_IMAGE_DRV
 # Bare on purpose (no lower()): set -e catches failure, stderr streams live.
 $GUIX system image -L . -t docker -d system/td.scm
+
+# --- verify-place lowers against the REGISTRY's manifest digests (same
+# two-step its Makefile recipe does): build the registry, skopeo-inspect it.
+lower $GUIX repl -L . tests/registry-drv.scm
+reg_drv=$(sed -n 's/^DRV_REGISTRY=//p' "$tmp")
+case "$reg_drv" in
+  /gnu/store/*.drv) ;;
+  *) echo "ERROR: registry lowering printed no drv (got: '$reg_drv')" >&2; exit 1;;
+esac
+reg=$($GUIX build "$reg_drv")
+skopeo_bin=$($GUIX build skopeo)/bin/skopeo
+TD_DIGEST_1=$("$skopeo_bin" inspect --format '{{.Digest}}' "oci:$reg/oci:gen-1")
+TD_DIGEST_2=$("$skopeo_bin" inspect --format '{{.Digest}}' "oci:$reg/oci:gen-2")
+case "$TD_DIGEST_1$TD_DIGEST_2" in
+  *sha256:*sha256:*) ;;
+  *) echo "ERROR: no manifest digests from skopeo for verify-place lowering" >&2; exit 1;;
+esac
+export TD_DIGEST_1 TD_DIGEST_2
 
 # --- Rungs with dedicated lowering scripts (print PREFIX=...drv lines).
 for s in $LOWERING_SCRIPTS; do
