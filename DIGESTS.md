@@ -45,8 +45,21 @@ this baseline):
 
 - default OCI image (docker output `h8x2qfskf2qzjv4s3w7ah905b1gw5kc6-docker-image.tar.gz`):
   manifest digest `sha256:714045afa001bab1ce90744ff77c885e4faae1573570de753e6906a5bc5c80ff`.
-- gen-1 bootc generation image (output `xmgdwy348ik6g6xsczxfiaby23nk0sg6-td-generation-image-gen-1`):
-  manifest digest `sha256:4076bfe633259bf681326516ca6d887b60de849b26796f0bec23b9abfa368a3e`.
+- gen-1 bootc generation image (output `hpv950x5wlvss9gmvgnsgbfv2hl5czkr-td-generation-image-gen-1`):
+  manifest digest `sha256:6e18463da4ded2acb48d2115dfbaa9c1a445042ab4a7988dac1c47831e85884d`.
+- gen-2 bootc generation image (output `wirzy55s1rgf21v5r54nw6q2bn5f8c2x-td-generation-image-gen-2`):
+  manifest digest `sha256:3c6036fc466d0a7e52b1099dc3976d8639742039370b88e64765c8d658dc722a`.
+
+Re-baselined 2026-06-12 (M12 track, deliberate): M11's sealing landings
+(tmpfs-root + dm-verity store) changed the generation images after the digests
+were first recorded on 2026-06-11, leaving the gen-1 record stale. The M12
+`registry` rung — which signs exactly these identities — re-derives both
+generation digests every loop (statement == skopeo-inspected manifest digest);
+gen-2 is recorded for the first time (the registry distributes both placed
+generations). The default (plain) image was NOT changed by M11 (generations
+seal; the default stays plain — see `generation-diff`): its digest re-verified
+unchanged on 2026-06-12. Historical gen-1 value at the oci-load recording:
+`sha256:4076bfe6…` (output `xmgdwy348…`).
 
 Known drift, flagged (not part of this move): the store paths in the section above
 date from the 2026-06-06 guix-free re-baseline and no longer match what the loop
