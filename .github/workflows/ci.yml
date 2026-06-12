@@ -8,14 +8,13 @@
 #           (shell syntax, an unparseable channel pin, convention drift)
 #           before a human or the heavy runner spends time on the PR.
 #
-#   check — self-hosted runner (labels: self-hosted, guix, kvm). Runs the
-#           canonical ./check.sh, the single pass/fail command. check.sh
-#           itself guards that the runner's host guix matches the channels.scm
-#           pin and refuses to run otherwise, so a misconfigured runner fails
-#           loudly instead of silently going online (CLAUDE.md prime
-#           directives 1–2). The runner must therefore live on a host prepared
-#           like the dev box: pinned system guix, warm store, /dev/kvm.
-#           See .github/BRANCH-PROTECTION.md for runner registration.
+#   check — GitHub-hosted runner that imports the CI store image (the warm
+#           build closure a dev box snapshots with ci/build-ci-image.sh) and
+#           runs the canonical ./check.sh, the single pass/fail command.
+#           check.sh itself guards that the guix on PATH matches the
+#           channels.scm pin and refuses to run otherwise, so a stale image
+#           fails loudly instead of silently going online (CLAUDE.md prime
+#           directives 1–2). See .github/BRANCH-PROTECTION.md "CI store image".
 #
 # Nothing here weakens the loop: the rung ladder still lives only in the
 # Makefile, and the merge gate is ./check.sh exactly as before — CI just runs
@@ -70,14 +69,82 @@ jobs:
           echo "no tabs in Scheme sources"
 
   check:
-    # The real gate: the full hermetic, offline rung ladder. Needs a
-    # self-hosted runner on a Guix host at the pinned channel commit with a
-    # warm store and KVM — see .github/BRANCH-PROTECTION.md before marking
-    # this check required (a required check with no runner blocks every PR).
-    runs-on: [self-hosted, guix, kvm]
-    timeout-minutes: 120
+    # The real gate: the full hermetic, offline rung ladder on a GitHub-HOSTED
+    # runner. The runner imports the CI store image — the warm build closure
+    # snapshot a dev box pushed to ghcr.io/timmydo/td-ci (ci/build-ci-image.sh)
+    # — then runs the UNMODIFIED ./check.sh: same pinned guix (the image tag IS
+    # the channels.scm pin, so a channel-bump PR stays red until the matching
+    # image is pushed), same offline/no-substitutes loop, KVM for the
+    # marionette rungs. Setup details: .github/BRANCH-PROTECTION.md
+    # "CI store image".
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
     steps:
       # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: full check (./check.sh)
-        run: ./check.sh
+      - name: free disk + move /gnu and /var/guix to the big partition
+        # ubuntu-latest: ~14G free on /, ~75G on /mnt. The pulled blobs
+        # (~21G) plus the imported store (~40G) both live on /mnt — and the
+        # blobs are deleted right after the import. Preinstalled toolchains
+        # are dropped for headroom on /.
+        run: |
+          set -eu
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo mkdir -p /mnt/gnu /mnt/var-guix /gnu /var/guix
+          sudo mount --bind /mnt/gnu /gnu
+          sudo mount --bind /mnt/var-guix /var/guix
+          df -h / /mnt
+      - name: install guix daemon + tools
+        # The distro daemon only BOOTSTRAPS the import; the check itself runs
+        # the pinned guix from the imported store. Ubuntu 23.10+ restricts
+        # unprivileged user namespaces, which `guix shell -C` needs — lift it.
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y guix skopeo jq
+          sudo systemctl start guix-daemon
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo chmod 666 /dev/kvm || true
+      - name: pull the CI store image for this pin
+        run: |
+          set -eu
+          pin=$(sed -n 's/.*(commit *"\([0-9a-f]\{40\}\)").*/\1/p' channels.scm | head -n1)
+          test -n "$pin" || { echo "channels.scm: no parseable pinned commit" >&2; exit 1; }
+          echo "pin: $pin"
+          # /mnt is root-owned on ubuntu-latest; skopeo runs as the runner user.
+          sudo install -d -o "$(id -un)" /mnt/td-ci
+          skopeo copy --insecure-policy \
+            "docker://ghcr.io/timmydo/td-ci:$pin" "oci:/mnt/td-ci:$pin"
+      - name: import the store
+        run: |
+          set -eu
+          # No pipeline: a pipe to tail would mask an import-store.sh failure.
+          ci/import-store.sh /mnt/td-ci > /tmp/import.out
+          tail -n1 /tmp/import.out > /tmp/channel-out
+          echo "pinned profile: $(cat /tmp/channel-out)"
+          # The blobs (~21G) + the imported store (~41G) nearly fill /mnt;
+          # the layout is spent once imported, so reclaim it before the
+          # check's own builds need room.
+          sudo rm -rf /mnt/td-ci
+          df -h /mnt
+      - name: switch the daemon to the imported pinned guix
+        # The distro daemon (2022-era) only bootstrapped the import; the loop
+        # itself runs against the PINNED daemon, exactly like a dev box whose
+        # system guix is the pin (avoids client/daemon protocol skew).
+        run: |
+          set -eu
+          channel_out=$(cat /tmp/channel-out)
+          sudo systemctl stop guix-daemon
+          sudo nohup "$channel_out/bin/guix-daemon" \
+            --build-users-group=guixbuild >/tmp/daemon.log 2>&1 &
+          for i in $(seq 1 50); do
+            [ -S /var/guix/daemon-socket/socket ] && break; sleep 0.2
+          done
+          [ -S /var/guix/daemon-socket/socket ] \
+            || { echo "pinned daemon never came up:" >&2; cat /tmp/daemon.log >&2; exit 1; }
+      - name: run the full check (./check.sh)
+        run: |
+          set -eu
+          export PATH="$(cat /tmp/channel-out)/bin:$PATH"
+          guix describe
+          ./check.sh
