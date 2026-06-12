@@ -35,8 +35,9 @@
 #      one that exists), and extracts kernel + initrd into <boot>/td/gen-N/,
 #      recording root-label/system/root-uuid alongside (so the menu can be
 #      regenerated purely from on-disk state); the placed copy of td-identity
-#      gains `image-digest=sha256:<hex>` — the sha256 of the artifact actually
-#      unpacked, which the artifact cannot carry itself (M12, DESIGN §2.7);
+#      gains `image-digest=sha256:<hex>` — the §2.7 identity of what was
+#      placed (the VERIFIED manifest digest in registry mode, the artifact's
+#      sha256 in legacy mode), which the image cannot carry itself;
 #   4. with --mkfs, turns the staged root content into a LIVE ext4 filesystem
 #      image <root-store>/td/gen-N/root.img, labeled with this generation's root
 #      label and the identity's deterministic UUID (mke2fs -d; reproducible — the
@@ -122,6 +123,8 @@ else
   [ -n "$img" ] || {
     echo "td-place: missing required --image (or --registry/--digest/--pubkey)" >&2; exit 2; }
 fi
+# What to call the image source in messages, per mode.
+src=${img:-"$registry @ $digest"}
 for pair in generation:gen root-label:root_label \
             boot-dir:boot_dir root-store:root_store grub-cfg:grub_cfg keep:keep; do
   name=${pair%%:*}; var=${pair#*:}
@@ -202,7 +205,12 @@ if [ "$verified" = yes ]; then
   done
 
   # VERIFIED. Stage the ordered LAYERS (the manifest's "layers" array; the
-  # config blob is verified above but not unpacked) into $work as
+  # config blob is verified above but not unpacked) — the sed/grep parse is
+  # safe on this manifest because it was just signature- and hash-verified
+  # (skopeo-produced: one top-level "layers" array, no annotations), and
+  # layer_refs is textually a subset of the re-hash-verified all_refs, so a
+  # parse confusion could only mis-order verified blobs, never admit
+  # unverified bytes — into $work as
   # <hex>/layer.tar — decompressed when gzipped (skopeo writes tar+gzip; the
   # magic bytes decide, and gzip itself fails closed on a lying magic) — and
   # hand them to the SAME placement path legacy mode uses below.
@@ -261,7 +269,7 @@ for lt in $manifest_layers; do
   fi
 done
 [ -n "$boot_layer" ] || {
-  echo "td-place: no manifest-referenced layer carries /boot/bzImage in $img — not a bootc generation image" >&2
+  echo "td-place: no manifest-referenced layer carries /boot/bzImage in $src — not a bootc generation image" >&2
   exit 1
 }
 # The userspace layers are the manifest layers OTHER than the boot layer, in order.
