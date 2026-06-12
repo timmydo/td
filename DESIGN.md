@@ -357,7 +357,9 @@ annotated.
   td-builder's rebuild-and-compare replaces `guix build --check` (semantics
   already pinned by the rootless track: compare against the recorded NAR hash,
   refuse invalid outputs). Replacing that rung restructures the loop, so §4.3
-  gate 2 applies when this graduates.
+  gate 2 applies when this graduates. (The separable WHEN-it-runs question —
+  verdict memoization — was approved 2026-06-12 as the check-memo track,
+  §7.1; td-check inherits that policy and its constraints unchanged.)
 - **Evaluator as a library** (follow-on to td-builder): drive gexp→drv lowering
   from td code so the `guix` CLI exits the loop; differential = identical
   `.drv` hashes both ways. Guile and gexps stay (§2.2, §5).
@@ -471,6 +473,22 @@ run concurrently):
   selection (t5700g excluded — standing immutable-infra rule; its daemon is
   the owner's machine state, per the offline-isolation rescope), provisioning,
   and constraints: `plan/ci-gate.md`.
+- **check-memo** *(approved 2026-06-12 — this entry is the §4.3 gate-2
+  sign-off: it loosens when an existing assertion runs)* — verdict
+  memoization for the `guix build --check` reproducibility legs: skip the
+  rebuild-and-compare when a recorded verdict shows the SAME drv hash already
+  rebuilt bit-identically in the same environment and the verdict is fresh;
+  any miss (changed drv, expired TTL, foreign environment, force-full) runs
+  the real `--check` unchanged. Acceptance: the unchanged-tree `./check.sh`
+  floor drops measurably with all rungs green, a force-full knob runs the
+  original full ladder, and four verified-reds hold (changed drv always
+  rebuilds; expired verdict rebuilds; foreign verdict rejected; injected
+  nondeterminism on a miss still reds). The binding constraints — drv-hash
+  keying, host-local uncommitted verdicts (CI reuse re-opens gate 2),
+  bounded TTL, force-full on oracle re-baselines — and the accepted
+  detection trade (environment-dependent outputs on unchanged drvs, e.g.
+  the 2026-06-12 hosted-runner readdir-order case) are pinned in
+  `plan/check-memo.md`; changing any of them re-opens gate 2.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
