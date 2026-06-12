@@ -130,5 +130,28 @@ check; merging needs green checks + one approving review (DESIGN §7.2).
   ghcr.io/timmydo/td-ci died with create_package denied). Push ACL =
   timmydo-bot's credentials; visibility must be flipped to PUBLIC once
   (UI, logged in as the bot) so runners pull anonymously.
+- 2026-06-12 claude-fable-52ceb1 (first live runner iterations): image pushed
+  to ghcr.io/timmydo-bot/td-ci (the human ran the push and flipped the
+  package PUBLIC). Live `check` run #1 died at check.sh's first command:
+  Ubuntu's apt guix creates no build users, so the pinned daemon
+  (--build-users-group=guixbuild) rejected the first build — the workflow now
+  provisions guixbuild + guixbuilder01..10 (upstream binary-install recipe).
+  Run #2: `guix: command not found` INSIDE the container — the imported
+  channel-instance profile's bin/guix is a symlink to the bare
+  ...-guix-command FILE, so check.sh's dirname(readlink -f $(command -v
+  guix)) collapses to /gnu/store itself; the rootless rung's dirname^2 →
+  `guix gc -R` and its guix-daemon lookup break the same way (pre-commit
+  sub-agent review caught that half before CI could). Fix:
+  ci/host-guix-shim.scm builds on the runner a dev-box-shaped host guix — a
+  store item with REAL bin/guix + bin/guix-daemon copies of the channel
+  instance's scripts — and the workflow puts its bin on PATH. The copies
+  keep their embedded references only because the originals enter as
+  #:sources of a raw (derivation ...): the first attempt (gexp +
+  local-file) re-interned them and produced a shim with an EMPTY reference
+  set, caught locally by `guix gc -R` before it could strand the rootless
+  rung's staged store. Verified locally with the shim as host guix:
+  `guix describe` = pin, closure 111 items (⊆ the image's channel-instance
+  closure), `./check.sh eval` green, `./check.sh rootless` green (PASS, NAR
+  hash equal to oracle).
 - The track's verified-red (red branch → failing `check` run → blocked PR)
   needs the published image; it is step 5 above, not yet run.

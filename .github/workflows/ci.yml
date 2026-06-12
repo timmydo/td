@@ -154,9 +154,24 @@ jobs:
           done
           [ -S /var/guix/daemon-socket/socket ] \
             || { echo "pinned daemon never came up:" >&2; cat /tmp/daemon.log >&2; exit 1; }
+          # The imported profile's bin/guix is a symlink to the bare
+          # ...-guix-command FILE, so check.sh's and the rootless rung's
+          # `dirname (readlink -f (command -v guix))` deriveds collapse to
+          # /gnu/store itself (second live run failed exactly so). Build the
+          # HOST-GUIX SHIM — a store item shaped like a dev box's system guix
+          # package (real bin/guix + bin/guix-daemon with a proper gc
+          # closure) — and put ITS bin on PATH. Built from pieces already in
+          # the imported store; see ci/host-guix-shim.scm.
+          export PATH="$channel_out/bin:$PATH"
+          CHANNEL_OUT="$channel_out" guix repl ci/host-guix-shim.scm \
+            > /tmp/shim.out
+          host_guix=$(sed -n 's/^HOST_GUIX=//p' /tmp/shim.out)
+          test -x "$host_guix/bin/guix" && test -x "$host_guix/bin/guix-daemon" \
+            || { echo "host-guix shim came out malformed: '$host_guix'" >&2; exit 1; }
+          echo "$host_guix" > /tmp/host-guix
       - name: run the full check (./check.sh)
         run: |
           set -eu
-          export PATH="$(cat /tmp/channel-out)/bin:$PATH"
+          export PATH="$(cat /tmp/host-guix)/bin:$PATH"
           guix describe
           ./check.sh
