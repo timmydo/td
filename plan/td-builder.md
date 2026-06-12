@@ -115,7 +115,7 @@ equal to the root daemon, so oracle authority transfers).
   `check.sh` sandbox packages).
 - [x] **S5 verified-red** — deliberate builder defects (NAR, sandbox,
   references) each red the rung; evidence recorded here.
-- [ ] **S6 land** — §7.2 protocol; release the claim in `PLAN.md`.
+- [x] **S6 land** — §7.2 PR protocol (PR #5); claim released in `PLAN.md` 2026-06-11.
 
 ## Working state
 
