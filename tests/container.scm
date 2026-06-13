@@ -65,6 +65,8 @@
             td-app-badentry-bundle
             td-app-cgroup-image
             td-app-cgroup-bundle
+            td-app-fhs-image
+            td-app-fhs-bundle
             %test-td-container))
 
 ;; A minimal OCI APP image: a profile with just GNU hello, packed as a Docker
@@ -143,6 +145,30 @@
    (docker-image "td-app-cgroup-raw" cgroup-app-profile
                  #:entry-point "bin/cat" #:localstatedir? #f)))
 
+;; fhs-app-images side-track (DESIGN §7.1). An FHS-LAYOUT app image: the SAME
+;; hello profile as td-app-image, but with a TRADITIONAL FHS entry point —
+;; /usr/bin/hello — so the app resolves at a conventional FHS path inside the
+;; container, not only under /gnu/store. docker-image's #:symlinks takes
+;; (SOURCE -> TARGET) tuples (pack.scm symlink->directives): SOURCE absolute
+;; in-image, TARGET relative to the profile, and it materialises SOURCE's parent
+;; dir + a symlink SOURCE -> <profile>/TARGET INTO the image layer. So
+;; /usr/bin/hello -> <profile>/bin/hello, and since the profile closure already
+;; rides in the layer, the symlink resolves at runtime. The store-based image
+;; stays the oracle (DESIGN §2.5: M5); FHS layers ON TOP — this is the same
+;; vehicle as `guix pack -S /usr/bin/env=bin/env`. Re-packed deterministically
+;; (deterministic-docker-image) like every other app image so its --check is
+;; reproducible on any filesystem. The declared #:entry-point stays bin/hello
+;; (form-entry-point always prefixes it with the profile path, so it cannot be a
+;; bare FHS path); the FHS *property* is a filesystem-layout fact, exercised in
+;; the test by running the explicit /usr/bin/hello path against this rootfs.
+(define (td-app-fhs-image)
+  (deterministic-docker-image
+   "td-app-fhs.tar.gz"
+   (docker-image "td-app-fhs-raw" app-profile
+                 #:entry-point "bin/hello"
+                 #:symlinks '(("/usr/bin/hello" -> "bin/hello"))
+                 #:localstatedir? #f)))
+
 ;; Unpack an app image into a runtime BUNDLE at build time. The output is a
 ;; directory holding:
 ;;   rootfs/    — the image's layer extracted, plus /proc and /dev mountpoints.
@@ -218,10 +244,22 @@
   (app-bundle "td-app-cgroup-bundle" (td-app-cgroup-image)
               #:mountpoints '("/proc" "/dev" "/sys/fs/cgroup")))
 
+;; fhs-app-images bundle: unpacks the FHS image into a rootfs that carries the
+;; /usr/bin/hello symlink. The FHS scenario runs the explicit FHS path
+;; /usr/bin/hello against THIS rootfs (resolves and runs) and against the PLAIN
+;; store-layout rootfs (td-app-bundle, which has no /usr/bin — fails): same arg,
+;; the rootfs is the only variable, so a green positive + red control proves the
+;; FHS layout is what makes the binary resolvable at /usr/bin. args.json is
+;; unused by that scenario (the FHS claim is a layout property, not an
+;; entrypoint-metadata one).
+(define (td-app-fhs-bundle)
+  (app-bundle "td-app-fhs-bundle" (td-app-fhs-image)))
+
 (define (run-container-test)
   (mlet %store-monad ((bundle          (td-app-bundle))
                       (badentry-bundle (td-app-badentry-bundle))
-                      (cgroup-bundle   (td-app-cgroup-bundle)))
+                      (cgroup-bundle   (td-app-cgroup-bundle))
+                      (fhs-bundle      (td-app-fhs-bundle)))
     (let* ((os (marionette-operating-system
                 td-system
                 #:imported-modules '((gnu services herd))))
@@ -252,6 +290,8 @@
               (define cgroup-bundle-path #$cgroup-bundle)
               (define cgroup-rootfs-path
                 (string-append cgroup-bundle-path "/rootfs"))
+              (define fhs-bundle-path #$fhs-bundle)
+              (define fhs-rootfs-path (string-append fhs-bundle-path "/rootfs"))
               (define crun-bin "/run/current-system/profile/bin/crun")
               ;; Each app image's DECLARED entrypoint, read from its own bundle
               ;; (extracted from the image archive at build time). This is what
@@ -391,6 +431,32 @@
                        (string=? (string-trim-both (cdr res))
                                  (number->string cglimit)))))
 
+              ;; fhs-app-images (DESIGN §7.1) — the app resolves at a TRADITIONAL
+              ;; FHS path inside the container. crun execs the EXPLICIT absolute
+              ;; path /usr/bin/hello (not a store path, not the image's declared
+              ;; entrypoint) against the FHS rootfs: it must resolve (the
+              ;; /usr/bin/hello symlink → <profile>/bin/hello, profile closure in
+              ;; the layer) and print "Hello, world!". Self-discriminating: the
+              ;; SAME /usr/bin/hello arg run against the PLAIN store-layout rootfs
+              ;; (td-app-bundle, no /usr/bin) must FAIL — the rootfs is the ONLY
+              ;; variable, so a green positive + red control proves the FHS layout
+              ;; is what makes the binary resolvable at /usr/bin (not something
+              ;; ambient in the base or the runtime). This is the §7.1 acceptance:
+              ;; "the app binary really resolves at /usr/bin/... inside the
+              ;; container."
+              (let* ((fhs-args "[\"/usr/bin/hello\"]")
+                     (fhs-pos  (run-app (config-json fhs-rootfs-path fhs-args)
+                                        "td-app-fhs"))
+                     (fhs-ctrl (run-app (config-json rootfs-path fhs-args)
+                                        "td-app-fhs-ctrl")))
+                (format #t "FHS-POS  (fhs rootfs)   args=~s -> ~s~%" fhs-args fhs-pos)
+                (format #t "FHS-CTRL (plain rootfs) args=~s -> ~s~%" fhs-args fhs-ctrl)
+                (test-assert "FHS app image: /usr/bin/hello resolves and runs in the container"
+                  (and (eqv? 0 (car fhs-pos))
+                       (string-contains (cdr fhs-pos) "Hello, world!")))
+                (test-assert "the SAME /usr/bin/hello arg fails on the plain store-layout rootfs (FHS discriminates)"
+                  (not (eqv? 0 (car fhs-ctrl)))))
+
               (test-end)
               (exit (zero? (test-runner-fail-count (test-runner-current))))))))))
 
@@ -405,5 +471,9 @@ entrypoint is bogus must fail (image metadata drives the run), and a bogus \
 runtime arg must fail. M9.3 adds a MANAGED-cgroups assertion: crun (cgroupfs \
 manager) applies a declared pids.max=73 to a coreutils container, which reads \
 its own /sys/fs/cgroup/pids.max back as 73 — proving resource-limit enforcement \
-(self-discriminating: the cgroup2 default is \"max\").")
+(self-discriminating: the cgroup2 default is \"max\"). fhs-app-images adds an \
+FHS-LAYOUT app image: crun execs the explicit /usr/bin/hello against the FHS \
+rootfs (resolves via the in-image symlink, prints its output) while the SAME \
+arg fails on the plain store-layout rootfs — proving the binary resolves at a \
+traditional FHS path because of the FHS layout.")
    (value (run-container-test))))

@@ -882,6 +882,10 @@ run:
 #    reads its own /sys/fs/cgroup/pids.max back as 73 — resource-limit ENFORCEMENT, not
 #    just that crun starts (self-discriminating: the cgroup2 default is "max"). The
 #    cgroup app image+bundle are --checked for reproducibility alongside the others.
+#    fhs-app-images ADDS an FHS-LAYOUT app image+bundle (hello with a /usr/bin/hello
+#    symlink, also --checked): crun execs the explicit /usr/bin/hello against the FHS
+#    rootfs (resolves, prints output) while the SAME arg fails on the plain
+#    store-layout rootfs — proving the binary resolves at a traditional FHS path.
 container:
 	@echo ">> container: run an OCI app container on the booted td base (crun)"
 	@set -euo pipefail; \
@@ -894,13 +898,17 @@ container:
 	    '        (bimg (run-with-store store (td-app-badentry-image)))' \
 	    '        (bbun (run-with-store store (td-app-badentry-bundle)))' \
 	    '        (cimg (run-with-store store (td-app-cgroup-image)))' \
-	    '        (cbun (run-with-store store (td-app-cgroup-bundle))))' \
+	    '        (cbun (run-with-store store (td-app-cgroup-bundle)))' \
+	    '        (fimg (run-with-store store (td-app-fhs-image)))' \
+	    '        (fbun (run-with-store store (td-app-fhs-bundle))))' \
 	    '    (format #t "IMAGE=~a~%" (derivation-file-name img))' \
 	    '    (format #t "BUNDLE=~a~%" (derivation-file-name bun))' \
 	    '    (format #t "BADIMAGE=~a~%" (derivation-file-name bimg))' \
 	    '    (format #t "BADBUNDLE=~a~%" (derivation-file-name bbun))' \
 	    '    (format #t "CGIMAGE=~a~%" (derivation-file-name cimg))' \
-	    '    (format #t "CGBUNDLE=~a~%" (derivation-file-name cbun))))' \
+	    '    (format #t "CGBUNDLE=~a~%" (derivation-file-name cbun))' \
+	    '    (format #t "FHSIMAGE=~a~%" (derivation-file-name fimg))' \
+	    '    (format #t "FHSBUNDLE=~a~%" (derivation-file-name fbun))))' \
 	  | $(GUIX) repl $(LOAD) 2>/dev/null`; \
 	img=`printf '%s\n' "$$arts" | sed -n 's/^IMAGE=//p'`; \
 	bun=`printf '%s\n' "$$arts" | sed -n 's/^BUNDLE=//p'`; \
@@ -908,13 +916,16 @@ container:
 	bbun=`printf '%s\n' "$$arts" | sed -n 's/^BADBUNDLE=//p'`; \
 	cimg=`printf '%s\n' "$$arts" | sed -n 's/^CGIMAGE=//p'`; \
 	cbun=`printf '%s\n' "$$arts" | sed -n 's/^CGBUNDLE=//p'`; \
-	test -n "$$img" -a -n "$$bun" -a -n "$$bimg" -a -n "$$bbun" -a -n "$$cimg" -a -n "$$cbun" || { echo "ERROR: could not lower the app artifacts" >&2; exit 1; }; \
+	fimg=`printf '%s\n' "$$arts" | sed -n 's/^FHSIMAGE=//p'`; \
+	fbun=`printf '%s\n' "$$arts" | sed -n 's/^FHSBUNDLE=//p'`; \
+	test -n "$$img" -a -n "$$bun" -a -n "$$bimg" -a -n "$$bbun" -a -n "$$cimg" -a -n "$$cbun" -a -n "$$fimg" -a -n "$$fbun" || { echo "ERROR: could not lower the app artifacts" >&2; exit 1; }; \
 	echo ">> app artifacts: image=$$img bundle=$$bun"; \
 	echo ">> negative-control artifacts: badimage=$$bimg badbundle=$$bbun"; \
 	echo ">> cgroup artifacts (M9.3): cgimage=$$cimg cgbundle=$$cbun"; \
-	$(GUIX) build "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun" >/dev/null; \
-	echo ">> reproducibility: guix build --check the app images + extracted bundles (good + negative + cgroup; verdict-memoized)"; \
-	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun"; \
+	echo ">> fhs artifacts (fhs-app-images): fhsimage=$$fimg fhsbundle=$$fbun"; \
+	$(GUIX) build "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun" "$$fimg" "$$fbun" >/dev/null; \
+	echo ">> reproducibility: guix build --check the app images + extracted bundles (good + negative + cgroup + fhs; verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun" "$$fimg" "$$fbun"; \
 	drv=`printf '%s\n' \
 	    '(use-modules (guix) (gnu tests) (tests container))' \
 	    '(with-store store' \

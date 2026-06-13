@@ -88,4 +88,31 @@ spine touch — land carefully, expect rebases.
 
 ### Verified-red evidence
 
-(record per sub-task as it goes green)
+**S1+S2 (container rung, FHS scenario) — 2026-06-13, claude-fable-aed5c2.**
+
+GREEN baseline: container rung passes 6/6 — `FHS-POS (fhs rootfs) /usr/bin/hello
+-> (0 . "Hello, world!")`, `FHS-CTRL (plain rootfs) /usr/bin/hello -> (1 . not
+found)`; 8-artifact `--check` (incl. td-app-fhs image+bundle) green. Pre-build
+structural check: the FHS bundle's `rootfs/usr/bin/hello` is a symlink →
+`<profile>/bin/hello`, target present in the rootfs.
+
+- **VR#1 (positive depends on the FHS layout):** set `td-app-fhs-image`'s
+  `#:symlinks '()` (no /usr/bin/hello). Result: `FHS-POS -> (1 . "executable file
+  /usr/bin/hello not found")`, assertion *"FHS app image: /usr/bin/hello resolves
+  and runs"* **FAILED** (1 unexpected failure); the control still passed. Reverted.
+  Proves the positive is not a vacuous pass — it requires the symlink.
+- **VR#2 (discriminator really tests the plain rootfs):** pointed `fhs-ctrl` at
+  the FHS rootfs (where /usr/bin/hello exists). Result: `FHS-CTRL -> (0 . "Hello,
+  world!")`, assertion *"the SAME /usr/bin/hello arg fails on the plain
+  store-layout rootfs (FHS discriminates)"* **FAILED**; the positive still passed.
+  Reverted. Proves the discriminator genuinely checks that the plain (store-layout)
+  rootfs lacks /usr/bin/hello.
+
+Both reverts restored the exact green source (no leftover markers; grep clean).
+
+### Status
+
+- **S1+S2 DONE** (acceptance floor met: the §7.1 behavioral assertion green +
+  reproducible). Ready to commit + land.
+- **S3 (foreign-interpreter binary)** — optional strengthening; evaluate after S1+S2
+  lands. S1+S2 is the defensible landing point.
