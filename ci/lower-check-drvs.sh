@@ -44,7 +44,7 @@ lower() {
 KNOWN_RUNGS="eval diff typed-coverage oci-diff manifest-diff generation-diff \
 rollback generation-image no-guix manifest-check oci container rootless \
 oci-load registry verify-place reset test place build boot-disk td-builder \
-run offline"
+run offline memo"
 current=$(sed -n 's/^CHEAP_RUNGS := //p; s/^HEAVY_RUNGS := //p' Makefile | tr '\n' ' ')
 for r in $current; do
   case " $KNOWN_RUNGS " in
@@ -63,7 +63,7 @@ LOWERING_SCRIPTS="tests/manifest-image-drv.scm tests/generation-image-drv.scm \
 tests/place-drv.scm tests/rollback-drv.scm tests/imperative-surface.scm \
 tests/rootless-drvs.scm tests/td-builder-drv.scm tests/td-builder-s3-drvs.scm \
 tests/td-builder-s4-drv.scm tests/registry-drv.scm tests/verify-place-drv.scm \
-tests/offline-drv.scm"
+tests/offline-drv.scm tests/check-memo-drvs.scm"
 for s in tests/*-drv.scm tests/*-drvs.scm; do
   [ -e "$s" ] || continue
   case " $LOWERING_SCRIPTS " in
