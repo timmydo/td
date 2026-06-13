@@ -138,6 +138,17 @@ jobs:
           test -x "$host_guix/bin/guix" && test -x "$host_guix/bin/guix-daemon" \
             || { echo "host-guix shim malformed: '$host_guix'" >&2; exit 1; }
           echo "$host_guix" > /tmp/host-guix
+      - name: generate the daemon's archive signing key
+        # `guix archive --export` (in the generator) SIGNS the nar stream with
+        # /etc/guix/signing-key.sec — a dev box has one, a fresh runner does
+        # not. The importer authorizes the matching .pub shipped in the image's
+        # meta layer (ci/import-store.sh), so a per-run key is self-consistent.
+        # Generate with the pinned guix for format parity with the daemon.
+        run: |
+          set -eu
+          if [ ! -f /etc/guix/signing-key.sec ]; then
+            sudo "$(cat /tmp/channel-out)/bin/guix" archive --generate-key
+          fi
       - name: realize the rung-ladder closure
         # The generator exports POSITIVE outputs, so they must be valid here
         # first; the must-fail negatives contribute only their input closures

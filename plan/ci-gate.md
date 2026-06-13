@@ -381,3 +381,14 @@ Risks / open questions:
     before pushing: 50 drvs → 3 negatives (the kznhh… adversarial, the
     svcinj gate, the daemon probe) → 47 positives; pass 1 returns non-zero,
     pass 2 (all 47 positives) GREEN.
+  * Run 4 (e418bdd): the two-pass realize step PASSED (ran ~19 min, then
+    advanced) — the negatives fix works. New red one stage deeper, in
+    build-ci-image.sh's export: `guix archive: error: getting status of
+    /etc/guix/signing-key.sec: No such file or directory`. guix archive
+    --export SIGNS the nar stream with the daemon's signing key; a dev box
+    has one, a fresh runner does not. Fix: a build-image step runs
+    `guix archive --generate-key` (idempotent guard) before the generator;
+    the importer already authorizes the matching .pub from the image's meta
+    layer, so a per-run key is self-consistent. CI-bootstrap only (not
+    build-ci-image.sh, which also runs on dev boxes that have the key);
+    cannot be tested locally (writes /etc/guix — host infra is immutable).
