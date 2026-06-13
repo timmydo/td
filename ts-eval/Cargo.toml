@@ -1,0 +1,13 @@
+[package]
+name = "td-ts-eval"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "td-ts-eval"
+path = "src/main.rs"
+
+[dependencies]
+boa_engine = "0.20"
+
+[profile.release]

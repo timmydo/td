@@ -118,6 +118,32 @@ A self-discriminating differential rung (modeled on `tests/typed-diff.scm`):
     (ambient globals = the curated boa global). The corpus-handle and
     reuse-vs-add-harness questions belong to sub-tasks 2/4/5, still open.
 
+- **Sub-task 2 — boa evaluator + curated global (`ts-eval` rung): DONE 2026-06-13.**
+  The chartered pure-Rust, in-process boa evaluator. New `ts-eval/` crate
+  (`boa_engine` 0.20) — `src/main.rs` reads JS on stdin, evaluates a
+  CURATED-GLOBAL prelude first (`delete globalThis.Date`; `Math.random` →
+  throw), then the user JS, printing the result. Packaging
+  (`system/td-ts.scm`): `%ts-eval-vendor` is a **fixed-output** `cargo vendor`
+  (network permitted because content-addressed; nss-certs has no bundle so the
+  builder concatenates the hashed certs into one for libcurl), hash-pinned
+  `07kpr4kf…`; `td-ts-eval` builds **offline** against it with rust 1.93.0.
+  `guix build --check td-ts-eval` reproduces bit-for-bit. Rung `ts-eval`
+  (`Makefile` + `HEAVY_RUNGS`, `tests/ts-eval-drv.scm` + `tests/ts-eval-check.sh`)
+  --checks the binary (verdict-memoized) then asserts: `1+2*3⇒7`; `typeof
+  Date⇒undefined`; `Math.random()` denied; `Math.max⇒4` (curation is surgical).
+  GREEN in-sandbox (`./check.sh ts-eval`, 14s warm).
+  - Vendoring approach: **repo-clean** — only `ts-eval/{Cargo.toml,Cargo.lock,src}`
+    are committed (boa pulls ~110 crates / ~53 MB; not committed). The ~50 MB
+    vendor lives hash-pinned in the store via the fixed-output derivation. NOTE
+    for CI/ci-image-pipeline: `%ts-eval-vendor` must be warm in any store the
+    offline loop runs against (image PREP may fetch, §5 "warm store in") — the
+    CI store image needs regenerating to include it (follow-up).
+  - Verified-red ×2 (host cargo, perturbed prelude): drop `delete …Date` →
+    leg (2) reds ("typeof Date = function"); make `Math.random` return 0.42 →
+    leg (3) reds ("ALLOWED ⇒ 0.42"). Restored control green.
+  - Resolved open question: corpus-handle representation is deferred to sub-task 4
+    (no builtins yet); the evaluator boundary is stdin JS → stdout value for now.
+
 ## Sub-task ladder (write the test first; verify red before trusting green)
 
 1. ~~swc~~ **tsc** TS→JS transpile + a **`tsc` type-check rung** (pinned, offline)
@@ -127,7 +153,8 @@ A self-discriminating differential rung (modeled on `tests/typed-diff.scm`):
    ill-typed one (`rootFsType: "ext3"`) FAILS `tsc` — **verified-red** —
    so the types are load-bearing, not decoration.
 2. boa eval of a trivial JS expression returning a known value; curated global in
-   place. (Verify red: leave `Date` present, assert it is gone.)
+   place. (Verify red: leave `Date` present, assert it is gone.) — **DONE**
+   (`ts-eval` rung; see progress log).
 3. Hermetic-eval rung: a spec touching `Math.random`/fs is rejected. (Verified-red
    per acceptance #3.)
 4. `pkg`/`storeRef` builtins; lower a minimal fragment; compare one drv to the

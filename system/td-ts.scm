@@ -22,10 +22,15 @@
 
 (define-module (system td-ts)
   #:use-module (guix packages)
+  #:use-module (guix gexp)
   #:use-module (guix download)
   #:use-module (guix build-system copy)
+  #:use-module (guix build-system gnu)
+  #:use-module (gnu packages rust)
+  #:use-module (gnu packages nss)
   #:use-module ((guix licenses) #:prefix license:)
-  #:export (td-typescript))
+  #:export (td-typescript
+            td-ts-eval))
 
 (define td-typescript
   (package
@@ -58,3 +63,118 @@ and emits the type-stripped JavaScript the boa evaluator runs (DESIGN §7.1
 ts-frontend Phase 1).")
     (home-page "https://www.typescriptlang.org/")
     (license license:asl2.0)))
+
+;;; ---------------------------------------------------------------------------
+;;; td-ts-eval — the boa evaluator (DESIGN §7.1 ts-frontend, sub-task 2).
+;;;
+;;; A small pure-Rust binary (../ts-eval) that evaluates the type-stripped spec
+;;; JS in an embedded boa engine (boa_engine, in-process — the charter's
+;;; "pure-Rust, in-process" evaluator, vendored as a pinned input per the human
+;;; 2026-06-13 decision, since boa is absent from the pinned channel). Before it
+;;; runs user code it evaluates a CURATED-GLOBAL prelude that strips
+;;; language-level nondeterminism (removes Date, denies Math.random); boa has no
+;;; fetch/fs/process/web APIs to begin with, so the global is offline by
+;;; construction (plan/ts-frontend.md "Hermetic eval").
+;;;
+;;; OFFLINE/HERMETIC. boa pulls ~110 crates; rather than committing ~50MB of
+;;; vendored sources, the crate tree is materialised by %ts-eval-vendor, a
+;;; FIXED-OUTPUT derivation (content-addressed by the pinned Cargo.lock) that
+;;; runs `cargo vendor`. Network is permitted ONLY because the output is
+;;; hash-pinned — the same rule that lets url-fetch/git-fetch run; once realised
+;;; it is warm in the store and the loop never re-fetches (substitutes disabled,
+;;; offline). The build itself is fully offline against that vendor. cargo is the
+;;; pinned channel's rust 1.93.0, identical to the host's, so the vendor tree is
+;;; deterministic and the pin is stable across machines.
+
+;; The ts-eval crate source: ../ts-eval (Cargo.toml, Cargo.lock, src/). Exclude
+;; any local build/vendor output so a developer who ran cargo by hand cannot
+;; perturb the derivation hash (the td-builder lesson). Match the BASENAME, not a
+;; substring.
+(define %ts-eval-source
+  (local-file "../ts-eval" "td-ts-eval-src"
+              #:recursive? #t
+              #:select? (lambda (file stat)
+                          (not (member (basename file)
+                                       '("target" "vendor" ".cargo"))))))
+
+;; Fixed-output vendored crate tree for ts-eval's Cargo.lock. The hash is the
+;; nar of the cargo-vendor directory; pin it once (a placeholder build reports
+;; the real hash) and bump it deliberately whenever Cargo.lock changes — exactly
+;; like any other pinned source.
+(define %ts-eval-vendor
+  (computed-file
+   "td-ts-eval-vendor"
+   (with-imported-modules '((guix build utils))
+     #~(begin
+         (use-modules (guix build utils)
+                      (ice-9 textual-ports))
+         (setenv "PATH"
+                 (string-append (ungexp rust) "/bin:"
+                                (ungexp rust "cargo") "/bin"))
+         (setenv "CARGO_HOME" (string-append (getcwd) "/cargo-home"))
+         ;; cargo's libcurl wants a single CA *bundle*; nss-certs ships only the
+         ;; hashed per-cert files, so concatenate them into one and point curl +
+         ;; openssl at it (CURL_CA_BUNDLE is libcurl's CAINFO; SSL_CERT_FILE
+         ;; covers the openssl backend).
+         (let ((bundle (string-append (getcwd) "/ca-bundle.crt")))
+           (call-with-output-file bundle
+             (lambda (out)
+               (for-each
+                (lambda (f)
+                  (put-string out (call-with-input-file f get-string-all)))
+                (find-files (string-append (ungexp nss-certs) "/etc/ssl/certs")
+                            "\\.0$"))))
+           (setenv "CURL_CA_BUNDLE" bundle)
+           (setenv "SSL_CERT_FILE" bundle))
+         ;; A writable copy of the manifest (cargo validates src/ exists).
+         (copy-recursively (ungexp %ts-eval-source) "crate")
+         (for-each make-file-writable
+                   (find-files "crate" #:directories? #t))
+         (chdir "crate")
+         (invoke "cargo" "vendor" "--locked" "--versioned-dirs" (ungexp output))))
+   #:options (list #:hash-algo 'sha256
+                   #:recursive? #t
+                   #:hash (base32 "07kpr4kfxsmf92ddzfja7dwfjkhvvgmmkfj80ryi7zf4xzpcbivh"))))
+
+(define td-ts-eval
+  (package
+    (name "td-ts-eval")
+    (version "0.1.0")
+    (source %ts-eval-source)
+    (build-system gnu-build-system)
+    (native-inputs
+     `(("rust" ,rust)
+       ("rust:cargo" ,rust "cargo")))
+    (arguments
+     (list
+      #:tests? #f
+      #:phases
+      #~(modify-phases %standard-phases
+          (delete 'configure)
+          (delete 'check)
+          (replace 'build
+            (lambda _
+              (setenv "CARGO_HOME" (string-append (getcwd) "/.cargo-home"))
+              ;; Offline build against the pinned vendored crates.
+              (mkdir-p ".cargo")
+              (call-with-output-file ".cargo/config.toml"
+                (lambda (port)
+                  (format port "[source.crates-io]~%\
+replace-with = \"vendored\"~%\
+[source.vendored]~%\
+directory = \"~a\"~%" #$%ts-eval-vendor)))
+              (invoke "cargo" "build" "--release" "--offline" "--locked")))
+          (replace 'install
+            (lambda _
+              (install-file "target/release/td-ts-eval"
+                            (string-append #$output "/bin")))))))
+    (synopsis "td's boa-based hermetic JS evaluator (ts-frontend Phase 1)")
+    (description
+     "td-ts-eval evaluates the type-stripped TypeScript spec JS in an embedded
+@code{boa_engine} (pure-Rust, in-process).  A curated-global prelude strips
+language-level nondeterminism (removes @code{Date}, denies @code{Math.random})
+before user code runs; boa ships no @code{fetch}/@code{fs}/@code{process}/web
+APIs, so evaluation is offline and deterministic by construction (DESIGN §7.1
+ts-frontend Phase 1).")
+    (home-page "https://github.com/timmydo/td")
+    (license license:gpl3+)))
