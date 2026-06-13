@@ -93,7 +93,7 @@ endef
 # failure — a red still short-circuits the loop. Order-only (|) prerequisites,
 # so a plain serial `make -j1 check` behaves exactly as before.
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
-HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo
+HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff
 
 .PHONY: check container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
@@ -170,6 +170,74 @@ manifest-diff:
 generation-diff:
 	@echo ">> generation-diff: each generation gets a distinct, selectable root (M10.1)"
 	$(GUIX) repl $(LOAD) tests/generation-diff.scm
+
+# ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
+# `tsc` (the pinned td-typescript input, run under the packaged node) BOTH
+# type-checks a td system spec and emits its type-stripped JS. Self-discriminating
+# like the `diff`/`oci-diff` rungs (tests/ts-check.sh): the well-typed v0 spec
+# checks clean AND emits a byte-identical golden, while an out-of-union
+# rootFsType ("ext3") is REJECTED with a type error (TS2322) — the always-on
+# negative control proving the types are load-bearing. No image/VM: it builds two
+# warm packages and runs tsc on tiny files (seconds), so it slots late in the
+# heavy LPT order. The pinned channel's swc CLI is a non-functional stub and tsc
+# is unpackaged, so tsc does both jobs (human 2026-06-13; plan/ts-frontend.md).
+ts:
+	@echo ">> ts: TypeScript spec front-end — tsc type-checks + emits the v0 spec (ts-frontend Phase 1)"
+	@set -euo pipefail; \
+	node=`$(GUIX) build node`/bin/node; \
+	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
+	test -n "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / td-typescript" >&2; exit 1; }; \
+	TD_NODE="$$node" TD_TSC="$$tsc" TD_TSDIR="$(CURDIR)/tests/ts" \
+	  sh tests/ts-check.sh
+
+# ts-frontend Phase 1 (DESIGN §7.1, sub-task 2) — the boa evaluator + curated
+# global. Builds td-ts-eval (pure-Rust boa, crates from the hash-pinned
+# %ts-eval-vendor fixed-output, compiled offline) and `--check`s it reproducible
+# (prime directive 1 — it IS a new built artifact, like td-builder), then asserts
+# the hermetic eval via tests/ts-eval-check.sh: a trivial expression evaluates to
+# a known value, `typeof Date === "undefined"` (clock removed), and
+# `Math.random()` is DENIED (the always-on negative control), while Math is
+# otherwise intact. Heavy (a warm-store Rust build + a --check), so it slots late
+# in the LPT order alongside td-builder.
+ts-eval:
+	@echo ">> ts-eval: boa evaluator + curated global (ts-frontend Phase 1, sub-task 2)"
+	@set -euo pipefail; \
+	drv=`$(GUIX) repl $(LOAD) tests/ts-eval-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$drv" || { echo "ERROR: could not lower the td-ts-eval derivation" >&2; exit 1; }; \
+	echo ">> td-ts-eval derivation: $$drv"; \
+	out=`$(GUIX) build "$$drv"`; \
+	test -n "$$out" || { echo "ERROR: the td-ts-eval build produced no output path" >&2; exit 1; }; \
+	echo ">> check: reproducibility of td-ts-eval (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$drv"; \
+	TD_TS_EVAL="$$out/bin/td-ts-eval" sh tests/ts-eval-check.sh
+
+# ts-frontend Phase 1 (DESIGN §7.1, acceptance #1/#2 — the capstone). The full
+# pipeline end to end: the v0 TS spec is transpiled (tsc) and evaluated (boa
+# td-ts-eval), its emitted system() config JSON is mapped to a td-config and
+# lowered (td-config->operating-system), and the resulting system derivation is
+# diffed against the frozen system/td.scm oracle — the SAME convergence
+# tests/typed-diff.scm proves for the Guile typed front-end, now driven from the
+# TypeScript surface. Self-discriminating (tests/ts-diff.scm): the v0 spec
+# CONVERGES (== oracle) and a perturbed spec (sshPort 2222) DISCRIMINATES
+# (!= oracle), so the differential can never rot vacuous. Derivation-level (no
+# image build) but coupled to the td-ts-eval Rust binary, so it slots in the
+# heavy pool next to ts-eval.
+ts-diff:
+	@echo ">> ts-diff: TS v0 spec lowers (tsc->boa->config) to the oracle's system drv; a perturbed spec diverges (ts-frontend acceptance #1/#2)"
+	@set -euo pipefail; \
+	node=`$(GUIX) build node`/bin/node; \
+	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
+	evdrv=`$(GUIX) repl $(LOAD) tests/ts-eval-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$evdrv" || { echo "ERROR: could not lower the td-ts-eval derivation" >&2; exit 1; }; \
+	ev=`$(GUIX) build "$$evdrv"`/bin/td-ts-eval; \
+	test -n "$$node" -a -n "$$tsc" -a -x "$$ev" || { echo "ERROR: could not resolve node / td-typescript / td-ts-eval" >&2; exit 1; }; \
+	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	dj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/spec-v0.ts"`; \
+	pj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/spec-perturbed.ts"`; \
+	test -n "$$dj" -a -n "$$pj" || { echo "ERROR: ts-emit produced no config JSON" >&2; exit 1; }; \
+	echo ">> v0 config        : $$dj"; \
+	echo ">> perturbed config : $$pj"; \
+	TD_TS_DEFAULT_JSON="$$dj" TD_TS_PERTURBED_JSON="$$pj" $(GUIX) repl $(LOAD) tests/ts-diff.scm
 
 # 2. Reproducibility oracle — build the image, then rebuild its derivation with
 #    --check (bit-for-bit identical or it is a FAILING test).
