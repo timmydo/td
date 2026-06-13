@@ -1,0 +1,298 @@
+# ci-image — build, validate, and publish the CI store image from a PIPELINE
+# (DESIGN §7.1 ci-image-pipeline; pipeline-artifact policy, human 2026-06-12:
+# generated artifacts are produced on pipelines, never on a user's machine).
+#
+# Three jobs, fail-closed end to end:
+#
+#   build-image — bootstraps a runner with a guix daemon, seeds the store
+#                 (previous image for this pin if one exists — fast path for
+#                 rung additions; otherwise cold: time-machine + substitutes,
+#                 image PREP may fetch, DESIGN §5 "warm store in"), realizes
+#                 the full rung-ladder closure (ci/lower-check-drvs.sh is the
+#                 same fail-loudly enumeration the generator uses), runs the
+#                 in-repo generator, and pushes a CANDIDATE tag.
+#
+#   validate    — a fresh runner imports the CANDIDATE image and runs the
+#                 full UNMODIFIED ./check.sh against it — the same gate
+#                 ci.yml runs on PRs. A broken image can never be promoted.
+#
+#   promote     — registry-side retag: candidate-<pin> -> :<pin> and :latest.
+#                 ci.yml's check job pulls :<pin>, so a channel-bump PR goes
+#                 green exactly when its image is promoted.
+#
+# Auth: the workflow's GITHUB_TOKEN (packages: write) pushes to the REPO
+# namespace ghcr.io/<owner>/td-ci — no PATs, no manual skopeo (the bot-
+# namespace image ghcr.io/timmydo-bot/td-ci remains only as a seed fallback).
+
+name: ci-image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - channels.scm
+      - ci/**
+  # Pre-merge live test: changes to THIS file run the pipeline from the PR
+  # (build + validate only — promote is main-events-only below), so the
+  # workflow is never merged untested.
+  pull_request:
+    paths:
+      - .github/workflows/ci-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+# One image build at a time; a queued bump waits rather than racing the tag.
+concurrency:
+  group: ci-image
+  cancel-in-progress: false
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: free disk + move /gnu, /var/guix and /tmp to the big partition
+        run: |
+          set -eu
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo mkdir -p /mnt/gnu /mnt/var-guix /gnu /var/guix
+          sudo install -d -m 1777 /mnt/tmp
+          sudo mount --bind /mnt/gnu /gnu
+          sudo mount --bind /mnt/var-guix /var/guix
+          sudo mount --bind /mnt/tmp /tmp
+          df -h / /mnt
+      - name: install guix daemon + tools
+        # Same bootstrap as ci.yml's check job: distro daemon for the import,
+        # standard build users (Ubuntu's package creates none), userns +
+        # KVM for the marionette artifact builds the closure includes.
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y guix skopeo jq
+          if ! getent group guixbuild >/dev/null; then
+            sudo groupadd --system guixbuild
+            for i in $(seq -w 1 10); do
+              sudo useradd -g guixbuild -G guixbuild -d /var/empty \
+                -s /usr/sbin/nologin -c "Guix build user $i" \
+                --system "guixbuilder$i"
+            done
+          fi
+          sudo systemctl start guix-daemon
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo chmod 666 /dev/kvm || true
+      - name: seed the store from the best available image
+        # Fast path: an image already published for this pin (rung-addition
+        # rebuilds). Fallback: the legacy bot-namespace image (same pin).
+        # Neither existing = cold build (a channel bump): the next step's
+        # time-machine fetches the pinned world from substitutes instead.
+        run: |
+          set -eu
+          pin=$(sed -n 's/.*(commit *"\([0-9a-f]\{40\}\)").*/\1/p' channels.scm | head -n1)
+          test -n "$pin" || { echo "channels.scm: no parseable pinned commit" >&2; exit 1; }
+          echo "pin: $pin"; echo "$pin" > /tmp/pin
+          sudo install -d -o "$(id -un)" /mnt/td-ci
+          seeded=no
+          for src in "ghcr.io/${{ github.repository_owner }}/td-ci:$pin" \
+                     "ghcr.io/timmydo-bot/td-ci:$pin"; do
+            if skopeo copy --insecure-policy "docker://$src" "oci:/mnt/td-ci:$pin" 2>/dev/null; then
+              echo "seeded from $src"; seeded=yes; break
+            fi
+          done
+          if [ "$seeded" = yes ]; then
+            ci/import-store.sh /mnt/td-ci > /tmp/import.out
+            tail -n1 /tmp/import.out > /tmp/channel-out
+          else
+            echo "no image for $pin anywhere — cold build via substitutes"
+            : > /tmp/channel-out
+          fi
+          sudo rm -rf /mnt/td-ci
+      - name: pinned guix + host-guix shim
+        # Seeded: switch to the imported pinned daemon (as ci.yml does).
+        # Cold: time-machine under the DISTRO daemon (substitutes on) to
+        # realize the pinned channel instance first, then switch.
+        run: |
+          set -eu
+          if [ ! -s /tmp/channel-out ]; then
+            guix time-machine -C channels.scm -- repl ci/channel-instance-drv.scm \
+              > /tmp/ci.out
+            sed -n 's/^CHANNEL_OUT=//p' /tmp/ci.out > /tmp/channel-out
+            test -s /tmp/channel-out || { echo "cold bootstrap failed" >&2; exit 1; }
+          fi
+          channel_out=$(cat /tmp/channel-out)
+          sudo systemctl stop guix-daemon
+          sudo nohup "$channel_out/bin/guix-daemon" \
+            --build-users-group=guixbuild >/tmp/daemon.log 2>&1 &
+          for i in $(seq 1 50); do
+            [ -S /var/guix/daemon-socket/socket ] && break; sleep 0.2
+          done
+          [ -S /var/guix/daemon-socket/socket ] \
+            || { echo "pinned daemon never came up:" >&2; cat /tmp/daemon.log >&2; exit 1; }
+          export PATH="$channel_out/bin:$PATH"
+          CHANNEL_OUT="$channel_out" guix repl ci/host-guix-shim.scm > /tmp/shim.out
+          host_guix=$(sed -n 's/^HOST_GUIX=//p' /tmp/shim.out)
+          test -x "$host_guix/bin/guix" && test -x "$host_guix/bin/guix-daemon" \
+            || { echo "host-guix shim malformed: '$host_guix'" >&2; exit 1; }
+          echo "$host_guix" > /tmp/host-guix
+      - name: generate the daemon's archive signing key
+        # `guix archive --export` (in the generator) SIGNS the nar stream with
+        # /etc/guix/signing-key.sec — a dev box has one, a fresh runner does
+        # not. The importer authorizes the matching .pub shipped in the image's
+        # meta layer (ci/import-store.sh), so a per-run key is self-consistent.
+        # Generate with the pinned guix for format parity with the daemon.
+        run: |
+          set -eu
+          if [ ! -f /etc/guix/signing-key.sec ]; then
+            sudo "$(cat /tmp/channel-out)/bin/guix" archive --generate-key
+          fi
+      - name: realize the rung-ladder closure
+        # The generator exports POSITIVE outputs, so they must be valid here
+        # first; the must-fail negatives contribute only their input closures
+        # (see below). Image prep may fetch (substitutes stay on for this
+        # daemon) — the LOOP's offline discipline applies to ./check.sh, not
+        # to warming.
+        run: |
+          set -eu
+          export PATH="$(cat /tmp/host-guix)/bin:$PATH"
+          guix describe
+          # Enumerate the closure; tap the must-FAIL-to-build negatives into a
+          # side list (no-guix marker + system gate, offline daemon probe).
+          # Their rungs assert `! guix build`, and the failing builder can sit
+          # DEEP in a negative's input closure (the adversarial's guix-free
+          # marker is embedded in its system), so they cannot just be skipped —
+          # only NOT REQUIRED to build to completion.
+          TD_NEGATIVE_DRVS_OUT=/tmp/neg-drvs.raw \
+            sh ci/lower-check-drvs.sh > /tmp/check-drvs.raw
+          sort -u /tmp/check-drvs.raw > /tmp/check-drvs.txt
+          sort -u /tmp/neg-drvs.raw  > /tmp/neg-drvs.txt
+          comm -23 /tmp/check-drvs.txt /tmp/neg-drvs.txt > /tmp/pos-drvs.txt
+          wc -l /tmp/check-drvs.txt /tmp/neg-drvs.txt /tmp/pos-drvs.txt
+          # Pass 1 — realize EVERYTHING buildable. --keep-going builds each
+          # negative's closure UP TO its asserted failing builder, exactly as
+          # ./check.sh's no-guix/offline rungs do on a dev box, leaving the warm
+          # pre-failure closure the generator exports. The expected non-zero is
+          # tolerated here and pinned down by pass 2.
+          xargs -r -a /tmp/check-drvs.txt guix build --keep-going --max-jobs=4 || true
+          # Pass 2 (backstop) — every POSITIVE must now be valid: a no-op if
+          # pass 1 built it, a hard RED if any positive genuinely failed (so the
+          # `|| true` above can only ever mask the expected negative builder
+          # failures, never a real one).
+          xargs -r -a /tmp/pos-drvs.txt guix build --max-jobs=4
+      - name: build the image (in-repo generator)
+        run: |
+          set -eu
+          export PATH="$(cat /tmp/host-guix)/bin:$PATH"
+          sudo install -d -o "$(id -un)" /mnt/image-work
+          PUSH=0 sh ci/build-ci-image.sh /mnt/image-work
+      - name: push the CANDIDATE tag
+        run: |
+          set -eu
+          pin=$(cat /tmp/pin)
+          owner=$(echo "${{ github.repository_owner }}" | tr 'A-Z' 'a-z')
+          skopeo copy --insecure-policy \
+            --dest-creds "x-access-token:${{ secrets.GITHUB_TOKEN }}" \
+            "oci:/mnt/image-work/oci:$pin" \
+            "docker://ghcr.io/$owner/td-ci:candidate-$pin"
+          # FIRST-EVER push creates the package PRIVATE. The pipeline itself
+          # pulls with creds, but ci.yml's gate pulls anonymously: after the
+          # first promote, a human flips ghcr.io/$owner/td-ci to PUBLIC once
+          # (package settings -> Danger Zone), exactly as for the bot image.
+
+  validate:
+    # A FRESH runner consumes the candidate exactly as ci.yml's check job
+    # consumes :<pin>: import, switch daemon, run the unmodified ./check.sh.
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: free disk + move /gnu, /var/guix and /tmp to the big partition
+        run: |
+          set -eu
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo mkdir -p /mnt/gnu /mnt/var-guix /gnu /var/guix
+          sudo install -d -m 1777 /mnt/tmp
+          sudo mount --bind /mnt/gnu /gnu
+          sudo mount --bind /mnt/var-guix /var/guix
+          sudo mount --bind /mnt/tmp /tmp
+      - name: install guix daemon + tools
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y guix skopeo jq
+          if ! getent group guixbuild >/dev/null; then
+            sudo groupadd --system guixbuild
+            for i in $(seq -w 1 10); do
+              sudo useradd -g guixbuild -G guixbuild -d /var/empty \
+                -s /usr/sbin/nologin -c "Guix build user $i" \
+                --system "guixbuilder$i"
+            done
+          fi
+          sudo systemctl start guix-daemon
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo chmod 666 /dev/kvm || true
+      - name: pull + import the CANDIDATE image
+        run: |
+          set -eu
+          pin=$(sed -n 's/.*(commit *"\([0-9a-f]\{40\}\)").*/\1/p' channels.scm | head -n1)
+          echo "$pin" > /tmp/pin
+          sudo install -d -o "$(id -un)" /mnt/td-ci
+          skopeo copy --insecure-policy \
+            --src-creds "x-access-token:${{ secrets.GITHUB_TOKEN }}" \
+            "docker://ghcr.io/${{ github.repository_owner }}/td-ci:candidate-$pin" \
+            "oci:/mnt/td-ci:$pin"
+          ci/import-store.sh /mnt/td-ci > /tmp/import.out
+          tail -n1 /tmp/import.out > /tmp/channel-out
+          sudo rm -rf /mnt/td-ci
+      - name: switch the daemon to the imported pinned guix
+        run: |
+          set -eu
+          channel_out=$(cat /tmp/channel-out)
+          sudo systemctl stop guix-daemon
+          sudo nohup "$channel_out/bin/guix-daemon" \
+            --build-users-group=guixbuild >/tmp/daemon.log 2>&1 &
+          for i in $(seq 1 50); do
+            [ -S /var/guix/daemon-socket/socket ] && break; sleep 0.2
+          done
+          [ -S /var/guix/daemon-socket/socket ] \
+            || { echo "pinned daemon never came up:" >&2; cat /tmp/daemon.log >&2; exit 1; }
+          export PATH="$channel_out/bin:$PATH"
+          CHANNEL_OUT="$channel_out" guix repl ci/host-guix-shim.scm > /tmp/shim.out
+          host_guix=$(sed -n 's/^HOST_GUIX=//p' /tmp/shim.out)
+          test -x "$host_guix/bin/guix" && test -x "$host_guix/bin/guix-daemon" \
+            || { echo "host-guix shim malformed: '$host_guix'" >&2; exit 1; }
+          echo "$host_guix" > /tmp/host-guix
+      - name: run the full check (./check.sh) against the candidate
+        run: |
+          set -eu
+          export PATH="$(cat /tmp/host-guix)/bin:$PATH"
+          guix describe
+          ./check.sh
+
+  promote:
+    # Registry-side retag — the candidate VERBATIM becomes :<pin> (and
+    # :latest). Promotion happens only after validate's full green check,
+    # and never from a pull_request test run (a PR exercises build+validate;
+    # only main-event runs may move the tag the gate consumes).
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: retag candidate -> pin + latest
+        run: |
+          set -eu
+          pin=$(sed -n 's/.*(commit *"\([0-9a-f]\{40\}\)").*/\1/p' channels.scm | head -n1)
+          for tag in "$pin" latest; do
+            skopeo copy --insecure-policy \
+              --src-creds  "x-access-token:${{ secrets.GITHUB_TOKEN }}" \
+              --dest-creds "x-access-token:${{ secrets.GITHUB_TOKEN }}" \
+              "docker://ghcr.io/${{ github.repository_owner }}/td-ci:candidate-$pin" \
+              "docker://ghcr.io/${{ github.repository_owner }}/td-ci:$tag"
+          done
+          echo "promoted ghcr.io/${{ github.repository_owner }}/td-ci:$pin"

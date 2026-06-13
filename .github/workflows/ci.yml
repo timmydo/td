@@ -131,8 +131,17 @@ jobs:
           echo "pin: $pin"
           # /mnt is root-owned on ubuntu-latest; skopeo runs as the runner user.
           sudo install -d -o "$(id -un)" /mnt/td-ci
-          skopeo copy --insecure-policy \
-            "docker://ghcr.io/timmydo-bot/td-ci:$pin" "oci:/mnt/td-ci:$pin"
+          # Primary: the pipeline-published repo-namespace image (ci-image.yml).
+          # Fallback: the legacy hand-pushed bot-namespace image (ci-gate
+          # bring-up, signed-off exception) until the pipeline first promotes.
+          for src in "ghcr.io/${{ github.repository_owner }}/td-ci:$pin" \
+                     "ghcr.io/timmydo-bot/td-ci:$pin"; do
+            if skopeo copy --insecure-policy "docker://$src" "oci:/mnt/td-ci:$pin"; then
+              echo "pulled $src"; exit 0
+            fi
+          done
+          echo "no CI store image published for pin $pin (run ci-image.yml)" >&2
+          exit 1
       - name: import the store
         run: |
           set -eu

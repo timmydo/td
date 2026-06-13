@@ -43,7 +43,13 @@ PATH="$sigbin:$PATH"; export PATH
 failures=0
 fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 
-scratch=$(mktemp -d)
+# Scratch on DISK (repo root, bind-mounted), NOT the sandbox /tmp tmpfs: the
+# negative controls cp -r the registry/placed trees, which overflow the
+# container tmpfs on a small-RAM host (the PR #8 / oci-load lesson; surfaced on
+# the hosted CI runner). The `verify-place` rung passes no TMPDIR to this
+# script, so it anchors its own scratch under the disk-backed worktree.
+scratch="$PWD/.verify-place-check-scratch"
+rm -rf "$scratch"; mkdir -p "$scratch"
 trap 'rm -rf "$scratch"' EXIT
 
 echo

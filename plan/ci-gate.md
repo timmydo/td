@@ -333,3 +333,169 @@ Risks / open questions:
   acceptance; the workflow's image URL must flip to the repo namespace in
   that track. Every runner-environment fix and diagnostic in this PR stands
   regardless of where the image comes from.
+- 2026-06-13 claude-fable-52ceb1 (ci-image-pipeline, live runs from PR #14
+  via the workflow's pull_request trigger): two reds, both REAL pipeline
+  bugs, both fixed forward — the workflow is now getting the end-to-end test
+  the user asked for, BEFORE merge.
+  * Run 1 (745b043) RED at "realize the rung-ladder closure":
+    lower-check-drvs.sh's KNOWN_RUNGS guard fail-closed on the `memo` rung
+    (check-memo PR #12 had landed on main; the enumerator hadn't learned it).
+    The guard working as designed — it refused to ship an incomplete image.
+    Fix 7ba5b9d: add `memo` to KNOWN_RUNGS and tests/check-memo-drvs.scm to
+    LOWERING_SCRIPTS (its DRV_DET/DRV_DET2/DRV_NONDET fixtures enter the
+    closure). Additive; verified the guards pass + sed captures all three.
+  * Run 2 (7ba5b9d) RED at the same step, now exit 123 (xargs: a `guix build`
+    failed): the closure-realization `xargs guix build` tried to BUILD the
+    must-fail-to-build NEGATIVES the rungs deliberately enumerate — DRV_
+    ADVERSARIAL (no-guix embedded marker: kznhh…docker-image, the exact drv
+    in the log, "STILL contains a guix"), DRV_SVCINJ_GATE (whole-system
+    gate), DRV_DAEMON (offline FO probe in the daemon netns, RED until the
+    host isolates guix-daemon). The dev-box build-ci-image.sh never hit this:
+    it `guix archive --export -r`s input closures, never BUILDS — and the
+    dev box's store was already warm from ./check.sh (whose no-guix/offline
+    rungs build the negatives expecting failure, realizing their inputs).
+    The pipeline's separate online realize step is the only place that
+    builds, and it assumed every enumerated drv builds. VERIFIED-RED: this is
+    the live run's own exit 123 at exactly this drv.
+  * Run 3 RED, same step: my first negatives fix (build the negatives'
+    INPUT closures surgically via `guix gc --references <neg> | guix build`)
+    was insufficient — the must-fail builder for the ADVERSARIAL case is the
+    guix-free MARKER (rzlqdgxy…td-guix-free-marker-0.drv), embedded DEEP in
+    the input closure (docker-image → system → profile → marker). Building
+    the negative's inputs (system.drv) transitively requires the marker, so
+    it trips anyway. You cannot realize the adversarial's inputs without
+    building the marker, because the marker IS one of them. VERIFIED-RED: run
+    3's exit 123 on system.drv via the marker.
+    Final fix (this commit): (1) lower-check-drvs.sh taps the negatives into
+    TD_NEGATIVE_DRVS_OUT (by the prefixes the asserting rungs grep) — stdout
+    still carries them so build-ci-image's export is unchanged — with a
+    seen-all guard that fails loudly if a negative prefix is renamed; (2) the
+    realize step is TWO-PASS: pass 1 `guix build --keep-going` over ALL drvs
+    (builds each negative's closure up to its failing builder WHEREVER it
+    sits, exactly as ./check.sh's rungs do; expected non-zero tolerated),
+    pass 2 hard-builds only the POSITIVES (comm -23) as the backstop so the
+    `|| true` can mask only the expected negative failures, never a real one.
+    Faithfully replicates the dev-box warm-store state. No rung/assertion
+    touched; negatives stay asserted-red by the unchanged no-guix/offline
+    rungs in validate's ./check.sh. Verified LOCALLY against the warm store
+    before pushing: 50 drvs → 3 negatives (the kznhh… adversarial, the
+    svcinj gate, the daemon probe) → 47 positives; pass 1 returns non-zero,
+    pass 2 (all 47 positives) GREEN.
+  * Run 4 (e418bdd): the two-pass realize step PASSED (ran ~19 min, then
+    advanced) — the negatives fix works. New red one stage deeper, in
+    build-ci-image.sh's export: `guix archive: error: getting status of
+    /etc/guix/signing-key.sec: No such file or directory`. guix archive
+    --export SIGNS the nar stream with the daemon's signing key; a dev box
+    has one, a fresh runner does not. Fix: a build-image step runs
+    `guix archive --generate-key` (idempotent guard) before the generator;
+    the importer already authorizes the matching .pub from the image's meta
+    layer, so a per-run key is self-consistent. CI-bootstrap only (not
+    build-ci-image.sh, which also runs on dev boxes that have the key);
+    cannot be tested locally (writes /etc/guix — host infra is immutable).
+  * Run 5 (21dde67): build-image FULLY GREEN — signing-key fix worked, image
+    built and candidate pushed. validate imported it and ran the full offline
+    ./check.sh for ~23 min, reaching the `container` rung before red:
+    `guix build: error: derivation .../td-app-badentry.tar.gz.drv may not be
+    deterministic: output differs`. Root cause: the td-app-* OCI app images
+    (tests/container.scm) are `guix pack -f docker` outputs — the SAME upstream
+    docker.scm readdir-order defect already excluded for docker-image.tar.gz,
+    just not yet in the exclusion regex (it only surfaced now that the
+    pipeline's cross-RUNNER --check replaced the dev-box-warm path; ext4 htree
+    order varies with the per-mkfs hash seed, so two runners diverge). Fix:
+    extend build-ci-image.sh's exclusion to `td-app-[a-z]+\.tar\.gz` (the three
+    app images: hello, badentry, cgroup) — same 2026-06-12 signed-off
+    accommodation, same defect, NOT the app bundles (they extract the tarball
+    to a NAR-sorted tree → order-independent → stay exported). No rung weakened:
+    the container rung still runs --check on the runner, now runner-self-
+    consistent (build then check on one fs) exactly as the docker-image
+    exclusion already makes the oci/manifest-check rungs. Regex verified
+    locally against representative output names.
+  * Run 6 (47415a1): container PASSED (td-app exclusion worked); validate ran
+    ./check.sh ~20 min, now reaching the `rootless` rung before red:
+    `FAIL: the isolation probe's output is already VALID in the host`
+    (tests/rootless.sh:96). The rootless rung REQUIRES td-rootless-isolation-
+    probe's output INVALID in the host store, so the unprivileged userns
+    builder is what produces it (the isolation assertion reads
+    /proc/self/uid_map from THAT build). A dev box never root-builds it (only
+    the userns does) → invalid → the dev-box image never shipped it. The
+    pipeline's warming pass builds ALL enumerated drvs via the root daemon,
+    making probe_out valid → shipped → precondition violated. Fix: exclude
+    td-rootless-isolation-probe from build-ci-image.sh's export (its own
+    distinct reason vs the fs-order families) — the runner finds it absent and
+    builds it fresh in the userns, exactly as the rung wants. ENABLES the
+    rung's assertion (without it the rung can't even run); does NOT weaken it.
+    The probe's INPUT closure stays exported so the userns build is offline.
+    Only "must be invalid in host" precondition in the suite (grep-verified).
+  * Run 7 (ea4306c): rootless + oci-load PASSED; validate reached the
+    `registry` rung (~25 min in) and red'd — but the real error was ENOSPC,
+    not the rung: `cp: error writing '/tmp/tmp.XXX/tampered/...': No space
+    left on device`. registry-check.sh `mktemp -d`s on the sandbox /tmp tmpfs
+    and cp -r's the whole registry THREE times (unsigned/tampered/forged
+    negative controls) — overflows the 16G runner's tmpfs (a dev box's bigger
+    RAM absorbs it). Same class as PR #8 (scratch off tmpfs). EVERY sibling
+    heavy rung's Makefile passes TMPDIR=$(CURDIR)/.X-scratch (disk); the
+    `registry` AND `verify-place` rungs are the two that DON'T, so both their
+    check scripts (registry-check.sh, verify-place-check.sh — both do big
+    cp -r) land scratch on tmpfs. Fix (non-spine, in tests/): both scripts
+    anchor their own scratch under the disk-backed repo root
+    ($PWD/.{registry,verify-place}-check-scratch) instead of mktemp /tmp, so
+    they no longer assume the caller set TMPDIR; gitignored. Verified locally:
+    ./check.sh registry and ./check.sh verify-place both PASS (exit 0) with
+    disk scratch, all negative controls intact.
+  * Run 8 (a72dd9d): registry/verify-place fixed; validate cleared reset,
+    test, build, boot-disk (qcow2 IS cross-runner reproducible — PR #13
+    content-sizing holds), place, run — and red'd at the `td-builder` S3
+    differential: `deriver mismatch — registration '...-td-s3-diff.drv' vs
+    daemon '#f'`. Root cause: the S3/S4 differentials assert the DAEMON's
+    recorded deriver equals td-builder's rebuild, and `guix archive --import`
+    does NOT restore the deriver — an imported output reports deriver=#f. The
+    lowering (td-builder-s3-drvs.scm / s4-drv.scm) build the oracle via the
+    daemon EXPECTING a fresh build that records the deriver, but the warming
+    pass builds + ships these outputs, so on the runner build-derivations is a
+    no-op over the imported (deriver-less) path. Two affected outputs (the
+    only path-info-deriver reads in the suite): td-s3-diff (S3) and
+    image.qcow2 (S4). Fix: exclude both from the export so the daemon builds
+    them fresh and records the deriver (build/boot-disk/rootless rebuild
+    image.qcow2 anyway). nar-hash/size are intrinsic and survive import; only
+    deriver needs the fresh build. Cannot be reproduced locally (needs the
+    import path; dev-box builds are always fresh).
+
+  * Run 9 (38254ba) — GREEN END TO END. Pipeline run 27467579944 on the PR:
+    build-image PASS (1h07m), validate PASS (36m) — the unmodified offline
+    ./check.sh ran against the candidate image and every rung PASSED (run,
+    offline, memo, place/prune, td-builder S3+S4, registry, container,
+    rootless, oci-load, …). promote correctly SKIPPED (PR event; promotion is
+    main-events-only). That is the §7.1 acceptance: a pipeline-built CI store
+    image passing the canonical loop. Eight distinct CI-bootstrap gaps cleared
+    across runs 1–9, all fix-forward, none a weakened rung or assertion (the
+    exclusions change only image CONTENTS / scratch LOCATION / fresh-build
+    behavior; validate runs the unchanged rungs as a fail-closed backstop).
+  * ci.yml `check` job is RED on the PR — EXPECTED, non-blocking. It pulls the
+    PUBLISHED image for the pin and got the legacy hand-pushed bring-up
+    fallback (ghcr.io/timmydo-bot/td-ci:520785e3…), which PREDATES the fs-order
+    exclusions and still ships docker-image.tar.gz; the runner rebuilds it in a
+    different readdir order → cross-host repro diff → red. The corrected
+    candidate (which validate used and passed) excludes that tarball, so it is
+    rebuilt fresh. `check` self-resolves once the corrected image is PROMOTED
+    on the post-merge main push. `check` is NOT a required check yet (only
+    `lint` is, per BRANCH-PROTECTION.md) so it does not block the merge.
+  * Local landing gate: full ./check.sh GREEN on 38254ba (CHECK_EXIT=0, single
+    verify-place block, no nondeterminism verdicts). OPERATIONAL GOTCHA worth
+    recording: `kill`ing ./check.sh's wrapper shell does NOT reap its
+    `guix shell -C` container + `make` children — they orphan and keep running.
+    Launching a second ./check.sh on the SAME worktree then ran two `make
+    check` at once, which collided on the fixed-path verify-place scratch
+    ($PWD/.verify-place-check-scratch — unique under one run, shared across
+    two). A single clean run (the supported one-check-per-worktree model) is
+    immune; verify-place runs exactly once per ./check.sh. Lesson: to abort a
+    check, kill the process GROUP / reap the container, and never run two
+    checks in one worktree.
+  * Auto-merge ARMED on PR #14 (--auto --squash); mergeState BLOCKED only on
+    REVIEW_REQUIRED (timmydo-bot authored; needs timmydo's approval — no
+    self-approve). After squash-merge: the main push triggers ci-image.yml
+    promote → publishes ghcr.io/timmydo/td-ci:<pin> + :latest (the corrected
+    image) → the NEXT PR's `check` goes green → human runs
+    ./.github/setup-branch-protection.sh --require-runner-check to make `check`
+    required (BRANCH-PROTECTION.md step 5). FIRST promote also needs the
+    one-time human step to make the ghcr.io/timmydo/td-ci package PUBLIC (the
+    first GITHUB_TOKEN push creates it PRIVATE).
