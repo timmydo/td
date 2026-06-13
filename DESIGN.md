@@ -388,11 +388,6 @@ annotated.
   gate 2 applies when this graduates. (The separable WHEN-it-runs question —
   verdict memoization — was approved 2026-06-12 as the check-memo track,
   §7.1; td-check inherits that policy and its constraints unchanged.)
-- **Evaluator as a library** (follow-on to td-builder): drive gexp→drv lowering
-  from td code so the `guix` CLI exits the loop; differential = identical
-  `.drv` hashes both ways. (Under the 2026-06-12 §5 goal, Guile/gexps are the
-  migration lowering target driven by the `ts-frontend` surface, not the
-  permanent destination.)
 - **Loop tooling convergence** (follow-on): td-builder's sandbox replaces
   `guix shell -C` in `check.sh` — the north star's "one sandbox stack spanning
   build and run" made literal. Restructures the loop, so §4.3 gate 2 applies
@@ -594,6 +589,28 @@ run concurrently):
   set toward the full target closure (more build systems, packages with inputs), and
   de-Guiling the `.drv` construction itself (the §6 "evaluator as a library", a
   separate charter). Working state + verified-red log: `plan/corpus-independence.md`.
+- **evaluator-as-library** *(approved 2026-06-13 — §4.3 gate-1 roadmap addition,
+  graduated from §6; the §5 move-off-Guile goal, follow-on to corpus-independence's
+  own-builder increment)* — remove Guile from the `.drv` CONSTRUCTION itself. Today
+  `system/td-build.scm` calls Guile's `derivation` to compute the output path,
+  serialize the ATerm, and write the `.drv`; this moves that construction into the
+  td-builder Rust binary (the §6 "drive gexp→drv lowering from td code so the `guix`
+  CLI exits the loop"). The differential is the one §6 named — **identical `.drv`
+  both ways**: td-builder emits a `.drv` byte-identical (same store path AND same
+  bytes) to the one guix's `derivation` produces for the same spec, with guix as the
+  oracle (§2.5 / prime directive 4), run as a self-discriminating rung (a perturbed
+  emitter diverges; verified-red). Vehicle: **Rust** (human, 2026-06-13), reusing the
+  td-builder crate's ATerm parser + SHA-256. Scope boundary: input RESOLUTION (which
+  toolchain/source store paths are inputs) stays Guix's for now — the toolchain is
+  retired last (§5); what moves to Rust is the `.drv` construction (ATerm serialize +
+  `nix-base32`/`make-store-path` + the recursive `hashDerivationModulo` for output
+  paths). Target subject: the `td-build` hello derivation. NOT this entry: replacing
+  the reproducibility oracle (td-check) or `guix shell -C` (loop convergence) — both
+  remain §6 gate-2 items. **DONE 2026-06-13:** the `drv-emit` rung — td-builder
+  re-constructs the `td-build` hello `.drv` byte-identical (store path + content) to
+  guix's, validated over hundreds of real store drvs; a perturbed recipe is a distinct
+  drv it also matches; verified-red ×2. Working state + verified-red log:
+  `plan/evaluator-as-library.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 

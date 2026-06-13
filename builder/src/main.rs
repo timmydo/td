@@ -21,6 +21,7 @@ mod nar;
 mod sandbox;
 mod scan;
 mod sha256;
+mod store;
 mod sys;
 
 use std::path::Path;
@@ -80,6 +81,119 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // evaluator-as-library (sub-task 2): round-trip a `.drv` — parse then
+        // re-serialize — and exit 0 only if byte-identical to the file. Proves the
+        // ATerm serializer matches the daemon's writer on a real derivation.
+        Some("drv-roundtrip") if args.len() == 3 => match std::fs::read(&args[2]) {
+            Ok(bytes) => match drv::parse(&bytes) {
+                Ok(d) => {
+                    let re = drv::serialize(&d);
+                    if re.as_bytes() == bytes.as_slice() {
+                        println!("OK {}", args[2]);
+                        ExitCode::SUCCESS
+                    } else {
+                        eprintln!("DIFFER: re-serialized {} is not byte-identical", args[2]);
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-roundtrip {}: {e}", args[2]);
+                    ExitCode::FAILURE
+                }
+            },
+            Err(e) => {
+                eprintln!("td-builder: drv-roundtrip {}: {e}", args[2]);
+                ExitCode::FAILURE
+            }
+        },
+        // evaluator-as-library (sub-task 3): compute a `.drv`'s OWN store path
+        // from its content + references (inputDrvs ∪ inputSrcs), the daemon's
+        // makeTextPath. Prints the computed path; the rung compares it to the real
+        // one. Proves nix-base32 + make-store-path match guix.
+        Some("drv-path") if args.len() == 3 => {
+            let file = &args[2];
+            let run = || -> Result<String, String> {
+                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let name = store::name_from_store_path(file)
+                    .ok_or_else(|| format!("{file} is not a store path"))?;
+                let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
+                refs.extend(d.input_srcs.iter().cloned());
+                Ok(store::drv_store_path(&name, &bytes, &refs))
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-path {file}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // evaluator-as-library (sub-task 4): compute output `out`'s store path via
+        // the recursive hashDerivationModulo. Prints the computed path; the rung
+        // compares it to the real one. Proves the modulo recursion matches guix.
+        Some("drv-outpath") if args.len() == 3 => {
+            let file = &args[2];
+            let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
+            let run = || -> Result<String, String> {
+                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let drv_name = store::name_from_store_path(file)
+                    .and_then(|n| n.strip_suffix(".drv").map(str::to_string))
+                    .ok_or_else(|| format!("{file} is not a .drv store path"))?;
+                store::output_path(&d, &drv_name, "out", &read)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-outpath {file}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // evaluator-as-library (sub-task 5): CONSTRUCT the `.drv` from its skeleton
+        // — recompute every output path + the `.drv`'s own store path + serialize —
+        // and verify byte-identical (path AND content) to guix's. This is the
+        // §6-named differential: identical `.drv` both ways, with guix the oracle.
+        Some("drv-emit") if args.len() == 3 => {
+            let file = &args[2];
+            let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
+            let run = || -> Result<(), String> {
+                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let drv_name = store::name_from_store_path(file)
+                    .and_then(|n| n.strip_suffix(".drv").map(str::to_string))
+                    .ok_or_else(|| format!("{file} is not a .drv store path"))?;
+                let (path, content) = store::construct_drv(&d, &drv_name, &read)?;
+                let path_ok = path == *file;
+                let content_ok = content.as_bytes() == bytes.as_slice();
+                if path_ok && content_ok {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "DIFFER: store path {} (computed {path}); content {}",
+                        if path_ok { "matches" } else { "MISMATCH" },
+                        if content_ok { "matches" } else { "MISMATCH" },
+                    ))
+                }
+            };
+            match run() {
+                Ok(()) => {
+                    println!("OK {file}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-emit {file}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // S3b/S3c — execute the drv in the userns sandbox and register the
         // outputs. CLOSURE is a file listing every store path the build may
         // see, one per line; writes land under SCRATCH/newstore and the v1
