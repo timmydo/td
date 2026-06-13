@@ -157,6 +157,43 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // evaluator-as-library (sub-task 5): CONSTRUCT the `.drv` from its skeleton
+        // — recompute every output path + the `.drv`'s own store path + serialize —
+        // and verify byte-identical (path AND content) to guix's. This is the
+        // §6-named differential: identical `.drv` both ways, with guix the oracle.
+        Some("drv-emit") if args.len() == 3 => {
+            let file = &args[2];
+            let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
+            let run = || -> Result<(), String> {
+                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let drv_name = store::name_from_store_path(file)
+                    .and_then(|n| n.strip_suffix(".drv").map(str::to_string))
+                    .ok_or_else(|| format!("{file} is not a .drv store path"))?;
+                let (path, content) = store::construct_drv(&d, &drv_name, &read)?;
+                let path_ok = path == *file;
+                let content_ok = content.as_bytes() == bytes.as_slice();
+                if path_ok && content_ok {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "DIFFER: store path {} (computed {path}); content {}",
+                        if path_ok { "matches" } else { "MISMATCH" },
+                        if content_ok { "matches" } else { "MISMATCH" },
+                    ))
+                }
+            };
+            match run() {
+                Ok(()) => {
+                    println!("OK {file}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-emit {file}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // S3b/S3c — execute the drv in the userns sandbox and register the
         // outputs. CLOSURE is a file listing every store path the build may
         // see, one per line; writes land under SCRATCH/newstore and the v1

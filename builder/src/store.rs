@@ -170,13 +170,72 @@ pub fn output_path(
 ) -> Result<String, String> {
     let mut cache = HashMap::new();
     let h = hash_derivation_modulo(d, true, &mut cache, read)?;
-    let hex = sha256::to_base16(&h);
+    Ok(output_path_from_modulo(&sha256::to_base16(&h), drv_name, out_name))
+}
+
+fn output_path_from_modulo(modulo_hex: &str, drv_name: &str, out_name: &str) -> String {
     let name = if out_name == "out" {
         drv_name.to_string()
     } else {
         format!("{drv_name}-{out_name}")
     };
-    Ok(make_store_path(&format!("output:{out_name}"), &hex, &name))
+    make_store_path(&format!("output:{out_name}"), modulo_hex, &name)
+}
+
+/// CONSTRUCT a `.drv` (the evaluator-as-library payload): from the skeleton in `d`
+/// (builder/args/inputs/env, with output paths NOT yet known), compute every
+/// output path via `hashDerivationModulo`, fill them into the outputs AND the
+/// output-named env vars, serialize the ATerm, and compute the `.drv`'s own store
+/// path. Returns `(drv_store_path, content)`. This is what guix's `derivation`
+/// does — now in Rust. (The skeleton's env order / input order are taken as given:
+/// the daemon sorts both; a producer must hand them already sorted.)
+pub fn construct_drv(
+    d: &Derivation,
+    drv_name: &str,
+    read: &impl Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<(String, String), String> {
+    let mut cache = HashMap::new();
+    let modulo_hex = sha256::to_base16(&hash_derivation_modulo(d, true, &mut cache, read)?);
+
+    // The output path for each output (normal drv: empty hash_algo/hash kept).
+    let out_paths: HashMap<String, String> = d
+        .outputs
+        .iter()
+        .map(|o| (o.name.clone(), output_path_from_modulo(&modulo_hex, drv_name, &o.name)))
+        .collect();
+
+    let rebuilt = Derivation {
+        outputs: d
+            .outputs
+            .iter()
+            .map(|o| Output {
+                name: o.name.clone(),
+                path: out_paths[&o.name].clone(),
+                hash_algo: o.hash_algo.clone(),
+                hash: o.hash.clone(),
+            })
+            .collect(),
+        input_drvs: d.input_drvs.clone(),
+        input_srcs: d.input_srcs.clone(),
+        platform: d.platform.clone(),
+        builder: d.builder.clone(),
+        args: d.args.clone(),
+        // Fill each output-named env var with its computed path.
+        env: d
+            .env
+            .iter()
+            .map(|(k, v)| match out_paths.get(k) {
+                Some(p) => (k.clone(), p.clone()),
+                None => (k.clone(), v.clone()),
+            })
+            .collect(),
+    };
+
+    let content = drv::serialize(&rebuilt);
+    let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
+    refs.extend(d.input_srcs.iter().cloned());
+    let path = make_text_path(&format!("{drv_name}.drv"), content.as_bytes(), &refs);
+    Ok((path, content))
 }
 
 #[cfg(test)]
