@@ -26,8 +26,18 @@ spec.ts --swc--> spec.js --boa(curated global)--> config value --lower--> drv
                                        differential vs system/td.scm (NAR-hash-equal)
 ```
 
-- **swc** (Rust) transpiles TS→JS in the inner loop (type-strip only). Full `tsc`
-  type-check is a separate author-time/CI pass, not on every eval.
+- **swc** (Rust) strips types TS→JS for *execution* (boa runs JS, not TS). The
+  types are not wasted — they earn their keep in a separate **`tsc` type-check
+  pass** (author-time + a loop/CI rung), which is where a bad spec is caught
+  *before* it ever runs: `rootFsType: "ext3"`, a missing field, the wrong shape.
+  This is the standard TS split — `tsc` checks, swc emits — with one consequence
+  worth stating: types only buy anything if `tsc` actually runs, so a type-check
+  rung is **first-class here, not optional** (erased types with no checker would
+  be pure decoration). What `tsc` cannot see — values from dynamic computation,
+  cross-field invariants, data parsed at eval time — the lowering builtins still
+  validate at runtime (as `td-config` does today). Types and runtime checks are
+  complementary, not redundant: compile-time catches shape, runtime catches
+  values.
 - **boa** (`boa_engine`, pure-Rust) evaluates the JS in-process, inside
   td-builder's existing user-namespace sandbox.
 - **Lowering builtins** are boa native functions holding the live build graph:
@@ -49,20 +59,6 @@ boa is a tree-walking/bytecode interpreter (no JIT) → deterministic by constru
 once the above are stripped. Resource isolation (CPU/mem) boa lacks built-in: rely
 on td-builder's sandbox (rlimits/seccomp) — the same jail builds run in.
 
-## Why boa over javy (decided with the human 2026-06-12)
-
-td's specs are host-call-heavy (corpus lookup, storeRef capture, closure-gate).
-- **boa**: pure-Rust crate, live synchronous Rust↔JS native fns holding the graph —
-  native fit for "evaluator-as-library with injected builtins"; one Rust toolchain
-  (matches td-builder). Cost: younger/incomplete engine, no built-in CPU/mem
-  isolation. Mitigations: we control the spec dialect (stay in boa's supported
-  subset — Starlark-style restriction), and the sandbox covers resource limits.
-- **javy** (QuickJS-on-wasmtime): mature engine + by-construction capability
-  isolation + deterministic fuel/memory limits + OS-agnostic. But host builtins
-  become marshaled WASM imports (awkward for our call-heavy lowering), and it adds
-  wasmtime + a JS→WASM build step. Revisit javy if specs ever become untrusted or
-  OS-agnostic sandbox portability outranks toolchain simplicity.
-
 ## Acceptance (DESIGN §7.1)
 
 A self-discriminating differential rung (modeled on `tests/typed-diff.scm`):
@@ -73,8 +69,11 @@ A self-discriminating differential rung (modeled on `tests/typed-diff.scm`):
 
 ## Sub-task ladder (write the test first; verify red before trusting green)
 
-1. swc TS→JS transpile step, pinned and offline-buildable; rung asserts a fixed
-   `.ts` → expected `.js`. (Verify red: corrupt the transpile output.)
+1. swc TS→JS transpile + a **`tsc` type-check rung** (both pinned, offline): the
+   transpile rung asserts a fixed `.ts` → expected `.js` (verify red: corrupt the
+   output); the type-check rung asserts a well-typed spec passes and an
+   ill-typed one (e.g. `rootFsType: "ext3"`) FAILS `tsc` — **verified-red** —
+   so the types are load-bearing, not decoration.
 2. boa eval of a trivial JS expression returning a known value; curated global in
    place. (Verify red: leave `Date` present, assert it is gone.)
 3. Hermetic-eval rung: a spec touching `Math.random`/fs is rejected. (Verified-red

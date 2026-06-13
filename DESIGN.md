@@ -565,8 +565,7 @@ run concurrently):
   randomness) is rejected by the hermetic evaluator (verified-red by a probe
   spec that must fail). Scope is the spec *language* only — corpus replacement
   is Phase 2 (§6), and this track keeps reading the pinned corpus underneath.
-  Evaluator rationale (boa vs javy), the curated-global design, and the swc
-  build step: `plan/ts-frontend.md`.
+  The curated-global design and the swc/`tsc` build steps: `plan/ts-frontend.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
