@@ -96,12 +96,35 @@ A self-discriminating differential rung (modeled on `tests/typed-diff.scm`):
 3. A spec attempting I/O (network/fs/clock/randomness) is rejected by the hermetic
    evaluator — **verified-red** by a probe spec that must fail.
 
+## Implementation progress (verified-red log)
+
+- **Sub-task 1 — TS spec front-end (`ts` rung): DONE 2026-06-13.** tsc does both
+  the type-check and the type-stripping emit (transpiler decision above). New
+  files: `system/td-ts.scm` (the pinned `td-typescript` 5.5.4 input — npm tarball
+  url-fetch + sha256, copy-build-system, runs under the packaged `node`),
+  `tests/ts/td-spec.d.ts` (the v0 dialect — ambient globals, mirroring the future
+  boa global), `tests/ts/spec-v0.ts` (well-typed v0 spec), `tests/ts/spec-bad-fstype.ts`
+  (the always-on negative control: `rootFsType: "ext3"`), `tests/ts/spec-v0.expected.js`
+  (golden emit), `tests/ts-check.sh` (driver). Wired: `Makefile` `ts` rung +
+  `HEAVY_RUNGS`; `tests/eval.scm` loads `(system td-ts)`. GREEN in-sandbox
+  (`./check.sh ts`, `./check.sh eval`); `guix build --check td-typescript`
+  reproduces bit-for-bit.
+  - Verified-red ×3 (perturbed COPIES in the job tmp, real fixtures untouched —
+    the "commit before red variants" gotcha): (1) appended garbage to the golden →
+    transpile leg reds; (2) flipped the GOOD spec to `"ext3"` → type-check-good leg
+    reds (TS2322); (3) flipped the BAD control to `"ext4"` → type-check-bad leg reds
+    ("tsc ACCEPTED …"). Real-dir control stays green.
+  - Open-question resolved: the TS dialect lives in `tests/ts/td-spec.d.ts`
+    (ambient globals = the curated boa global). The corpus-handle and
+    reuse-vs-add-harness questions belong to sub-tasks 2/4/5, still open.
+
 ## Sub-task ladder (write the test first; verify red before trusting green)
 
-1. swc TS→JS transpile + a **`tsc` type-check rung** (both pinned, offline): the
-   transpile rung asserts a fixed `.ts` → expected `.js` (verify red: corrupt the
-   output); the type-check rung asserts a well-typed spec passes and an
-   ill-typed one (e.g. `rootFsType: "ext3"`) FAILS `tsc` — **verified-red** —
+1. ~~swc~~ **tsc** TS→JS transpile + a **`tsc` type-check rung** (pinned, offline)
+   — **DONE** (see progress log; tsc does both, swc dropped per the decision log):
+   the transpile leg asserts a fixed `.ts` → golden `.js` (verify red: corrupt the
+   output); the type-check leg asserts a well-typed spec passes and an
+   ill-typed one (`rootFsType: "ext3"`) FAILS `tsc` — **verified-red** —
    so the types are load-bearing, not decoration.
 2. boa eval of a trivial JS expression returning a known value; curated global in
    place. (Verify red: leave `Date` present, assert it is gone.)

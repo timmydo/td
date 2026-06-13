@@ -15,6 +15,7 @@
              (system td-place)
              (system td-disk)
              (system td-builder)
+             (system td-ts)
              (tests boot)
              (tests reset)
              (tests container)
