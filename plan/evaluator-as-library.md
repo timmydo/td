@@ -68,8 +68,40 @@ Touches the shared spine: DESIGN §6/§7.1, PLAN.md, and (later) `Makefile` +
 
 ## Implementation progress
 
-(filled as each sub-task lands.)
+All sub-tasks DONE 2026-06-13. The hard pieces were each validated against guix over
+HUNDREDS of real store `.drv`s before wiring the rung:
+
+- **Sub-task 2 — serializer (`drv.rs::serialize`) + `drv-roundtrip`.** Parser fix: the
+  builder is a plain string, not a path, so fixed-output `builtin:download` drvs parse.
+  Round-trip over 400 real store `.drv`s — OK=400, DIFFER=0.
+- **Sub-task 3 — store-path hashing (`store.rs`: nix-base32, make-store-path,
+  make-text-path) + `drv-path`.** Computed `.drv` store path == the real one for all
+  400 sampled drvs (MATCH=400).
+- **Sub-task 4 — `hashDerivationModulo` + `drv-outpath`.** Computed output `out` path
+  == the real one for all 173 sampled NORMAL drvs (the recursion through the whole
+  toolchain closure), incl. the corpus hello build drv `cs56i9di…`; 127 fixed-output
+  drvs correctly skipped (different formula).
+- **Sub-task 5 — `construct_drv` + `drv-emit` + the `drv-emit` rung.** Byte-identical
+  (store path AND content) construction for the td-build hello derivation and all 173
+  sampled normal drvs (OK=173, DIFFER=0). Rung GREEN: `./check.sh drv-emit` — td
+  re-constructs the guix-lowered hello drv byte-identical, and a perturbed recipe is a
+  distinct drv it also matches.
+
+Scope honestly stated: input RESOLUTION (which toolchain/source store paths are the
+inputs, and the env/input ORDERING the daemon sorts) is taken as the skeleton — that
+stays Guix's for now (toolchain retired last, §5). What moved to Rust is the `.drv`
+CONSTRUCTION: output-path computation, ATerm serialization, and the `.drv` store path.
+Wiring `system/td-build.scm` to actually consume td's emitted `.drv` (rather than
+guix's byte-identical one) is a mechanical follow-on — the differential proves they
+are the same store object.
 
 ## Verified-red log
 
-(filled as each assertion is seen red.)
+`drv-emit` rung, each driven via `./check.sh drv-emit`, restored after:
+- **R1 serializer** — an extra byte in `serialize` (`Derive([ `) ⇒ the serialize
+  round-trip UNIT TESTS fail inside `guix build td-builder` ⇒ rung red at the build
+  (Error 1, exit 2). The serializer is guarded by unit tests first.
+- **R2 modulo** — `fixed:out:` → `fixed:outX:` in `hash_derivation_modulo` (NOT
+  unit-tested) ⇒ td-builder builds fine, but `drv-emit` reds at the DIFFERENTIAL:
+  "DIFFER: store path MISMATCH … content MISMATCH" (exit 2). Proves the byte-identity
+  differential discriminates independently of the unit suite.

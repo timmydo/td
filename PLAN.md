@@ -51,7 +51,10 @@ edits** (track files don't carry it).
   (Rust) emits a `.drv` byte-identical — store path AND bytes — to guix's `derivation`
   for the `td-build` hello spec; guix is the oracle; reuses the crate's ATerm parser +
   SHA-256, adds the serializer + `nix-base32`/`make-store-path` + `hashDerivationModulo`.
-  Input resolution stays Guix's, toolchain retired last) — `plan/evaluator-as-library.md`
+  Input resolution stays Guix's, toolchain retired last. DONE 2026-06-13: the
+  `drv-emit` rung — td constructs the td-build hello `.drv` byte-identical to guix's
+  (validated over hundreds of real drvs), perturbed recipe is a distinct drv it also
+  matches, verified-red ×2) — `plan/evaluator-as-library.md`
 
 ## The loop (reminder)
 

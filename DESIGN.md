@@ -606,7 +606,11 @@ run concurrently):
   `nix-base32`/`make-store-path` + the recursive `hashDerivationModulo` for output
   paths). Target subject: the `td-build` hello derivation. NOT this entry: replacing
   the reproducibility oracle (td-check) or `guix shell -C` (loop convergence) — both
-  remain §6 gate-2 items. Working state + verified-red log: `plan/evaluator-as-library.md`.
+  remain §6 gate-2 items. **DONE 2026-06-13:** the `drv-emit` rung — td-builder
+  re-constructs the `td-build` hello `.drv` byte-identical (store path + content) to
+  guix's, validated over hundreds of real store drvs; a perturbed recipe is a distinct
+  drv it also matches; verified-red ×2. Working state + verified-red log:
+  `plan/evaluator-as-library.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
