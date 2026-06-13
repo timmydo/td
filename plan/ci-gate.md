@@ -459,3 +459,43 @@ Risks / open questions:
     image.qcow2 anyway). nar-hash/size are intrinsic and survive import; only
     deriver needs the fresh build. Cannot be reproduced locally (needs the
     import path; dev-box builds are always fresh).
+
+  * Run 9 (38254ba) — GREEN END TO END. Pipeline run 27467579944 on the PR:
+    build-image PASS (1h07m), validate PASS (36m) — the unmodified offline
+    ./check.sh ran against the candidate image and every rung PASSED (run,
+    offline, memo, place/prune, td-builder S3+S4, registry, container,
+    rootless, oci-load, …). promote correctly SKIPPED (PR event; promotion is
+    main-events-only). That is the §7.1 acceptance: a pipeline-built CI store
+    image passing the canonical loop. Eight distinct CI-bootstrap gaps cleared
+    across runs 1–9, all fix-forward, none a weakened rung or assertion (the
+    exclusions change only image CONTENTS / scratch LOCATION / fresh-build
+    behavior; validate runs the unchanged rungs as a fail-closed backstop).
+  * ci.yml `check` job is RED on the PR — EXPECTED, non-blocking. It pulls the
+    PUBLISHED image for the pin and got the legacy hand-pushed bring-up
+    fallback (ghcr.io/timmydo-bot/td-ci:520785e3…), which PREDATES the fs-order
+    exclusions and still ships docker-image.tar.gz; the runner rebuilds it in a
+    different readdir order → cross-host repro diff → red. The corrected
+    candidate (which validate used and passed) excludes that tarball, so it is
+    rebuilt fresh. `check` self-resolves once the corrected image is PROMOTED
+    on the post-merge main push. `check` is NOT a required check yet (only
+    `lint` is, per BRANCH-PROTECTION.md) so it does not block the merge.
+  * Local landing gate: full ./check.sh GREEN on 38254ba (CHECK_EXIT=0, single
+    verify-place block, no nondeterminism verdicts). OPERATIONAL GOTCHA worth
+    recording: `kill`ing ./check.sh's wrapper shell does NOT reap its
+    `guix shell -C` container + `make` children — they orphan and keep running.
+    Launching a second ./check.sh on the SAME worktree then ran two `make
+    check` at once, which collided on the fixed-path verify-place scratch
+    ($PWD/.verify-place-check-scratch — unique under one run, shared across
+    two). A single clean run (the supported one-check-per-worktree model) is
+    immune; verify-place runs exactly once per ./check.sh. Lesson: to abort a
+    check, kill the process GROUP / reap the container, and never run two
+    checks in one worktree.
+  * Auto-merge ARMED on PR #14 (--auto --squash); mergeState BLOCKED only on
+    REVIEW_REQUIRED (timmydo-bot authored; needs timmydo's approval — no
+    self-approve). After squash-merge: the main push triggers ci-image.yml
+    promote → publishes ghcr.io/timmydo/td-ci:<pin> + :latest (the corrected
+    image) → the NEXT PR's `check` goes green → human runs
+    ./.github/setup-branch-protection.sh --require-runner-check to make `check`
+    required (BRANCH-PROTECTION.md step 5). FIRST promote also needs the
+    one-time human step to make the ghcr.io/timmydo/td-ci package PUBLIC (the
+    first GITHUB_TOKEN push creates it PRIVATE).
