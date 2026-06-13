@@ -61,7 +61,15 @@ pub fn make_store_path(ty: &str, inner_hash_hex: &str, name: &str) -> String {
 pub fn make_text_path(name: &str, content: &[u8], refs: &[String]) -> String {
     let mut refs = refs.to_vec();
     refs.sort();
-    let ty = format!("text:{}", refs.join(":"));
+    // The daemon builds `type = "text"` and appends `":" + ref` per reference
+    // (computeStorePathForText), so the EMPTY-reference set is bare `"text"`, not
+    // `"text:"`. (Not reachable from a real .drv — every one has >=1 input — but
+    // correct for the general case the follow-on wiring will exercise.)
+    let ty = if refs.is_empty() {
+        "text".to_string()
+    } else {
+        format!("text:{}", refs.join(":"))
+    };
     let content_hex = sha256::to_base16(&sha256_bytes(content));
     make_store_path(&ty, &content_hex, name)
 }
@@ -194,6 +202,12 @@ pub fn construct_drv(
     drv_name: &str,
     read: &impl Fn(&str) -> Result<Vec<u8>, String>,
 ) -> Result<(String, String), String> {
+    // A fixed-output drv's output path uses makeFixedOutputPath, not the
+    // makeOutputPath formula below — refuse it loudly rather than emit a wrong
+    // path. (Not produced by td-build; guards the follow-on.)
+    if is_fixed_output(d) {
+        return Err("construct_drv: fixed-output derivations are unsupported".into());
+    }
     let mut cache = HashMap::new();
     let modulo_hex = sha256::to_base16(&hash_derivation_modulo(d, true, &mut cache, read)?);
 
