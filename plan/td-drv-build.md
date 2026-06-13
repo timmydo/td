@@ -60,8 +60,28 @@ is daemon-equal out of the box.
 
 ## Implementation progress
 
-(filled as it lands.)
+- **DONE 2026-06-13.** `td-builder drv-emit-to ORACLE OUT` (write the constructed
+  `.drv`); `sandbox.rs` derives the build-dir name from the output path for a
+  non-store-path `.drv` (store-path inputs — the td-builder rung — unaffected); the
+  build's registered deriver is the `.drv`'s canonical store path (computed for a
+  scratch input). New heavy `td-drv-build` rung GREEN in-sandbox (`./check.sh
+  td-drv-build`): td emits the hello `.drv` byte-identical to guix's (drv-emit
+  verifies — no `cmp`, absent in the sandbox), builds the EMITTED file in the
+  td-builder userns sandbox, and the registration (path, NAR hash `78f8eec8…`, size,
+  deriver) equals the daemon's. Staged closure 1126 items.
+- Gotcha: the check sandbox has NO diffutils — `cmp` is unavailable. Byte-identity is
+  asserted via `td-builder drv-emit` (#22's verify) instead.
 
 ## Verified-red log
 
-(filled as each assertion is seen red.)
+`td-drv-build` rung, each driven via `./check.sh td-drv-build`, restored after:
+- **R1 emit/construct** — `fixed:out:`→`fixed:outX:` in `hash_derivation_modulo`
+  (store.rs) ⇒ the construction diverges ⇒ RED "td's construction is not
+  byte-identical to guix's .drv" (the differential's emit half). exit 2.
+- **R2 executor NAR** — file-contents padding 8→4 in `nar.rs` ⇒ a NAR unit test
+  (`known_nar_of_single_file`) fails inside `guix build td-builder` ⇒ rung red at the
+  build. (The differential-level NAR red — a defect past the unit fixtures — is on the
+  td-builder track's S4, whose `build` this rung reuses.)
+- **R2' executor deriver** — `{}.drv`→`{}X.drv` in the build arm's deriver computation
+  (main.rs, NOT unit-tested) ⇒ td-builder builds fine but the differential reds:
+  "deriver mismatch — td '…hello-2.12.2X.drv' vs daemon '…hello-2.12.2.drv'". exit 2.
