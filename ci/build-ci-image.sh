@@ -95,9 +95,16 @@ test -n "$channel_out" || { echo "FATAL: no channel instance output" >&2; exit 1
 # placed trees + rollback disk (extract gen images). NOT the app BUNDLES:
 # they extract the tarball into a tree, which guix re-serializes NAR-sorted,
 # so they are order-independent and stay exported.
-grep -Ev -- '-(docker-image\.tar\.gz|td-app-[a-z]+\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rollback-disk)$' \
+#
+# ALSO exclude the rootless isolation probe (td-rootless-isolation-probe) — a
+# DIFFERENT reason: the `rootless` rung REQUIRES its output INVALID in the host
+# store so the unprivileged userns builder is what produces it (the isolation
+# assertion reads /proc/self/uid_map from THAT build — tests/rootless.sh). A
+# dev box never root-builds it (only the userns does), but the pipeline's
+# warming pass does, so drop it from the export; the runner builds it fresh.
+grep -Ev -- '-(docker-image\.tar\.gz|td-app-[a-z]+\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rollback-disk|td-rootless-isolation-probe)$' \
   "$work/outputs.txt" > "$work/outputs-kept.txt"
-echo "   excluded $(($(wc -l < "$work/outputs.txt") - $(wc -l < "$work/outputs-kept.txt"))) fs-order-sensitive family outputs (runner rebuilds them)"
+echo "   excluded $(($(wc -l < "$work/outputs.txt") - $(wc -l < "$work/outputs-kept.txt"))) outputs the runner rebuilds itself (fs-order docker-pack families + the rootless isolation probe)"
 sort -u "$work/check-drvs.txt" "$work/outputs-kept.txt" > "$work/roots.txt"
 printf '%s\n' "$channel_out" >> "$work/roots.txt"
 echo "   $(wc -l < "$work/roots.txt") export roots (channel profile: $channel_out)"

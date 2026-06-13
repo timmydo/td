@@ -410,3 +410,19 @@ Risks / open questions:
     consistent (build then check on one fs) exactly as the docker-image
     exclusion already makes the oci/manifest-check rungs. Regex verified
     locally against representative output names.
+  * Run 6 (47415a1): container PASSED (td-app exclusion worked); validate ran
+    ./check.sh ~20 min, now reaching the `rootless` rung before red:
+    `FAIL: the isolation probe's output is already VALID in the host`
+    (tests/rootless.sh:96). The rootless rung REQUIRES td-rootless-isolation-
+    probe's output INVALID in the host store, so the unprivileged userns
+    builder is what produces it (the isolation assertion reads
+    /proc/self/uid_map from THAT build). A dev box never root-builds it (only
+    the userns does) → invalid → the dev-box image never shipped it. The
+    pipeline's warming pass builds ALL enumerated drvs via the root daemon,
+    making probe_out valid → shipped → precondition violated. Fix: exclude
+    td-rootless-isolation-probe from build-ci-image.sh's export (its own
+    distinct reason vs the fs-order families) — the runner finds it absent and
+    builds it fresh in the userns, exactly as the rung wants. ENABLES the
+    rung's assertion (without it the rung can't even run); does NOT weaken it.
+    The probe's INPUT closure stays exported so the userns build is offline.
+    Only "must be invalid in host" precondition in the suite (grep-verified).
