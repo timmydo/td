@@ -84,6 +84,101 @@ pub fn drv_store_path(name: &str, content: &[u8], refs: &[String]) -> String {
     make_text_path(name, content, refs)
 }
 
+use crate::drv::{self, Derivation, Output};
+use std::collections::HashMap;
+
+/// A fixed-output derivation: a single `out` output carrying a hash (the daemon's
+/// `isFixedOutput`). Its modulo-hash is a flat function of the hash, not the ATerm.
+fn is_fixed_output(d: &Derivation) -> bool {
+    d.outputs.len() == 1
+        && d.outputs[0].name == "out"
+        && !d.outputs[0].hash_algo.is_empty()
+        && !d.outputs[0].hash.is_empty()
+}
+
+/// `hashDerivationModulo` (nix/libstore/derivations.cc), recursive: a fixed-output
+/// drv hashes `fixed:out:<algo>:<hash>:<path>`; a normal drv hashes its ATerm with
+/// every inputDrv path replaced by base-16 of ITS modulo-hash (recursed with
+/// outputs UNmasked) and, when `mask_outputs`, its own output paths + output-named
+/// env vars blanked. Memoized by drv path. `read` reads a `.drv` by store path.
+fn hash_derivation_modulo(
+    d: &Derivation,
+    mask_outputs: bool,
+    cache: &mut HashMap<String, [u8; 32]>,
+    read: &impl Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<[u8; 32], String> {
+    if is_fixed_output(d) {
+        let o = &d.outputs[0];
+        let s = format!("fixed:out:{}:{}:{}", o.hash_algo, o.hash, o.path);
+        return Ok(sha256_bytes(s.as_bytes()));
+    }
+    // Replace each inputDrv path with base-16 of its modulo-hash; sort by the hex
+    // (the daemon writes inputs2 as a map keyed on the hash).
+    let mut inputs2: Vec<(String, Vec<String>)> = Vec::with_capacity(d.input_drvs.len());
+    for (path, outs) in &d.input_drvs {
+        let h = match cache.get(path) {
+            Some(c) => *c,
+            None => {
+                let bytes = read(path)?;
+                let dd = drv::parse(&bytes).map_err(|e| format!("{path}: {e}"))?;
+                let hh = hash_derivation_modulo(&dd, false, cache, read)?;
+                cache.insert(path.clone(), hh);
+                hh
+            }
+        };
+        inputs2.push((sha256::to_base16(&h), outs.clone()));
+    }
+    inputs2.sort();
+
+    let output_names: Vec<&str> = d.outputs.iter().map(|o| o.name.as_str()).collect();
+    let masked = Derivation {
+        outputs: d
+            .outputs
+            .iter()
+            .map(|o| Output {
+                name: o.name.clone(),
+                path: if mask_outputs { String::new() } else { o.path.clone() },
+                hash_algo: o.hash_algo.clone(),
+                hash: o.hash.clone(),
+            })
+            .collect(),
+        input_drvs: inputs2,
+        input_srcs: d.input_srcs.clone(),
+        platform: d.platform.clone(),
+        builder: d.builder.clone(),
+        args: d.args.clone(),
+        env: d
+            .env
+            .iter()
+            .map(|(k, v)| {
+                let blank = mask_outputs && output_names.contains(&k.as_str());
+                (k.clone(), if blank { String::new() } else { v.clone() })
+            })
+            .collect(),
+    };
+    Ok(sha256_bytes(drv::serialize(&masked).as_bytes()))
+}
+
+/// Compute the output store path for output `out_name` of a NORMAL derivation
+/// `d` whose name is `drv_name` (the `.drv` basename without the `.drv` suffix):
+/// `make-store-path("output:<name>", hashDerivationModulo(d, mask), drv_name[-name])`.
+pub fn output_path(
+    d: &Derivation,
+    drv_name: &str,
+    out_name: &str,
+    read: &impl Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<String, String> {
+    let mut cache = HashMap::new();
+    let h = hash_derivation_modulo(d, true, &mut cache, read)?;
+    let hex = sha256::to_base16(&h);
+    let name = if out_name == "out" {
+        drv_name.to_string()
+    } else {
+        format!("{drv_name}-{out_name}")
+    };
+    Ok(make_store_path(&format!("output:{out_name}"), &hex, &name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -132,6 +132,31 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // evaluator-as-library (sub-task 4): compute output `out`'s store path via
+        // the recursive hashDerivationModulo. Prints the computed path; the rung
+        // compares it to the real one. Proves the modulo recursion matches guix.
+        Some("drv-outpath") if args.len() == 3 => {
+            let file = &args[2];
+            let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
+            let run = || -> Result<String, String> {
+                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let drv_name = store::name_from_store_path(file)
+                    .and_then(|n| n.strip_suffix(".drv").map(str::to_string))
+                    .ok_or_else(|| format!("{file} is not a .drv store path"))?;
+                store::output_path(&d, &drv_name, "out", &read)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-outpath {file}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // S3b/S3c — execute the drv in the userns sandbox and register the
         // outputs. CLOSURE is a file listing every store path the build may
         // see, one per line; writes land under SCRATCH/newstore and the v1
