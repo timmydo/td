@@ -321,3 +321,15 @@ Risks / open questions:
   the exclusion accommodation, and image v4 as one more manual build+push
   exception under the pipeline-artifact policy (the last before
   ci-image-pipeline lands).
+- 2026-06-12 claude-fable-52ceb1 (wrap-up, human-directed): land PR #6 NOW on
+  lint + review (check is not yet required) and move straight to the
+  ci-image-pipeline track — it is blocking other work. Image v4 (exclusion +
+  content sizing) is BUILT and VERIFIED locally but deliberately NEVER
+  hand-pushed: the pipeline's first GITHUB_TOKEN-published image supersedes
+  it (cleanest outcome under the pipeline-artifact policy — zero manual
+  pushes beyond v1–v3). Consequences: the `check` job stays red/unused until
+  ci-image-pipeline publishes ghcr.io/timmydo/td-ci:<pin>; ladder steps 5
+  (verified-red) and 6 (--require-runner-check) transfer to that track's
+  acceptance; the workflow's image URL must flip to the repo namespace in
+  that track. Every runner-environment fix and diagnostic in this PR stands
+  regardless of where the image comes from.
