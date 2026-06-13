@@ -53,7 +53,7 @@ endef
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-# The 30 rungs, in the two pools the bounded-parallel loop schedules from.
+# The 31 rungs, in the two pools the bounded-parallel loop schedules from.
 # ADDING A RUNG: put it in exactly ONE pool below — .PHONY, the `check` target,
 # the serial chain, and the heavy gate are all DERIVED from these two
 # variables, so the lists cannot drift apart (review finding: they used to be
@@ -93,7 +93,7 @@ endef
 # failure — a red still short-circuits the loop. Order-only (|) prerequisites,
 # so a plain serial `make -j1 check` behaves exactly as before.
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
-HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus td-build
+HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus td-build drv-emit
 
 .PHONY: check container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
@@ -292,6 +292,39 @@ td-build:
 	echo ">> independence: the own-builder artifact is a DISTINCT store object"; \
 	test "$$out" != "$$oracle_out" || { echo "FAIL: the td-built path equals the corpus oracle path — not an independent build." >&2; exit 1; }; \
 	echo "PASS: a TS recipe built by td's OWN Rust builder (builder=$$td_builder, no gnu-build-system) is reproducible and prints byte-identical output to the corpus hello (gnu-build-system), at a distinct store path ($$out != $$oracle_out)."
+
+# evaluator-as-library (DESIGN §7.1; the §5 move-off-Guile goal). The last Guile in
+# hello's build path is the `.drv` CONSTRUCTION — `system/td-build.scm` calls Guile's
+# `derivation` to compute the output path, serialize the ATerm, and write the `.drv`.
+# This rung proves td-builder (Rust) constructs that `.drv` itself, byte-identical to
+# guix's — the §6-named differential, "identical `.drv` both ways", guix the oracle.
+# The subject is the `td-build` hello derivation: guix lowers it (the oracle `.drv`),
+# then `td-builder drv-emit` re-CONSTRUCTS it from its skeleton (recompute every
+# output path via the recursive hashDerivationModulo, the `.drv`'s own store path via
+# nix-base32/make-text-path, and the ATerm via the serializer) and verifies the store
+# path AND the bytes match. Self-discriminating: a perturbed recipe (one wrong byte in
+# the source hash) is a DIFFERENT `.drv` the emitter must also match, and the two must
+# differ — so the differential can never go vacuous. Heavy (a warm-store Rust compile
+# of td-builder + two cheap lowerings), so it slots in the heavy pool by td-builder;
+# RE-MEASURE and RE-SORT once it has run. Input RESOLUTION (which toolchain/source
+# paths are inputs) stays Guix's — the toolchain is retired last (§5); what moved to
+# Rust is the construction.
+drv-emit:
+	@echo ">> drv-emit: td-builder constructs the td-build hello .drv byte-identical to guix's; a perturbed recipe is a distinct .drv it also matches (evaluator-as-library)"
+	@set -euo pipefail; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
+	vars=`$(GUIX) repl $(LOAD) tests/drv-emit-drv.scm 2>/dev/null`; \
+	drv=`printf '%s\n' "$$vars" | sed -n 's/^DRV=//p'`; \
+	drv_pert=`printf '%s\n' "$$vars" | sed -n 's/^DRV_PERT=//p'`; \
+	test -n "$$drv" -a -n "$$drv_pert" || { echo "ERROR: could not lower the td-build derivations" >&2; exit 1; }; \
+	echo ">> oracle .drv (guix-constructed): $$drv"; \
+	echo ">> td-builder re-constructs it (output paths + .drv path + ATerm) and verifies byte-identity:"; \
+	"$$tb" drv-emit "$$drv"; \
+	echo ">> discriminator: a perturbed recipe is a DIFFERENT .drv, also constructed byte-identical:"; \
+	"$$tb" drv-emit "$$drv_pert"; \
+	test "$$drv" != "$$drv_pert" || { echo "FAIL: the perturbed recipe did not change the .drv — the differential is vacuous." >&2; exit 1; }; \
+	echo "PASS: td-builder constructs the .drv byte-identical to guix (path + content) for the td-build hello derivation, and a perturbed recipe yields a distinct .drv it also matches — no guile in the construction."
 
 # ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
 # `tsc` (the pinned td-typescript input, run under the packaged node) BOTH
