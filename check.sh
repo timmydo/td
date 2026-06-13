@@ -11,6 +11,10 @@
 # Usage:
 #   ./check.sh            # full loop: eval -> build(--check) -> boot test
 #   ./check.sh eval       # a single Makefile target inside the same sandbox
+#   TD_CHECK_FULL=1 ./check.sh   # force-full: bypass all memoized --check
+#                                # verdicts (plan/check-memo.md constraint 4 —
+#                                # REQUIRED for oracle re-baselines and any
+#                                # suspected nondeterminism)
 #
 # Why each piece (learned in M2, see HISTORY.md):
 #   --expose=/gnu/store        : -C otherwise hides the host guix binary closure.

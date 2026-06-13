@@ -183,6 +183,31 @@ Real-leg verified-reds (production verdict files in `.check-verdicts/`):
 `guix build --check` of all missed drvs — the same batching the direct line
 used.)
 
+### S3 — full rollout + the acceptance numbers (2026-06-12)
+
+All pure reproducibility `--check` legs now route through the helper —
+`build`, `oci`, `manifest-check`, `generation-image` (S2), `registry`,
+`verify-place`, `place`, `rollback`, `no-guix`, `td-builder`, `container`
+(19 drvs total). `offline` and `rootless` keep their direct calls (boundary
+below). Constraint-4 documentation landed: DIGESTS.md's re-baseline
+procedure now REQUIRES `TD_CHECK_FULL=1 ./check.sh`, and check.sh's usage
+comment states the knob.
+
+**Unchanged-tree full `./check.sh` floor (dev host, warm store, -j2):**
+
+- before (no memoization): **440s** (7m20.3s; loaded-host — quiet floor a
+  bit lower);
+- record pass (cold verdicts, every leg runs the real `--check` + records):
+  **379s** (6m19.0s), green — 17 misses recorded, 2 hits (S2's still-fresh
+  generation-image verdicts);
+- memoized floor (fresh verdicts): **145s** (2m24.9s), green — **19 hits,
+  0 misses**, every hit passing the constraint-5 DB assertion.
+
+The acceptance's "drops measurably": **440s → 145s (−67%)**; the dominant
+`--check` legs collapsed from minutes to seconds while every rung stayed
+green and the `memo` rung re-proves the discipline (including real fixture
+`--check` rebuilds and the nondet red instrument) every loop.
+
 ### Memoization boundary (constraint 6, decided at S1)
 
 The helper applies ONLY to the pure reproducibility `--check` legs. Two rungs

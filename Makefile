@@ -176,8 +176,8 @@ generation-diff:
 build:
 	@echo ">> build: $(SYSTEM) image ($(IMGTYPE))"
 	$(GUIX) system image $(LOAD) -t $(IMGTYPE) $(SYSTEM)
-	@echo ">> check: reproducibility of the image derivation"
-	$(GUIX) build --check \
+	@echo ">> check: reproducibility of the image derivation (verdict-memoized — tests/check-memo.sh)"
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh \
 	  $$($(GUIX) system image $(LOAD) -t $(IMGTYPE) -d $(SYSTEM))
 
 # 3. Boot + behavioral — realise the marionette test derivation. Its builder
@@ -219,8 +219,8 @@ reset:
 oci:
 	@echo ">> oci: $(SYSTEM) image (docker)"
 	$(GUIX) system image $(LOAD) -t docker $(SYSTEM)
-	@echo ">> check: reproducibility of the OCI image derivation"
-	$(GUIX) build --check \
+	@echo ">> check: reproducibility of the OCI image derivation (verdict-memoized — tests/check-memo.sh)"
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh \
 	  $$($(GUIX) system image $(LOAD) -t docker -d $(SYSTEM))
 
 # 5. M6 manifest-swap reproducibility — build a SWAPPED-manifest OCI image
@@ -245,8 +245,8 @@ manifest-check:
 	test -n "$$drv" || { echo "ERROR: could not lower the swapped OCI image derivation" >&2; exit 1; }; \
 	echo ">> swapped OCI image derivation: $$drv"; \
 	swapped_img=`$(GUIX) build "$$drv"`; \
-	echo ">> check: reproducibility of the SWAPPED OCI image derivation"; \
-	$(GUIX) build --check "$$drv"; \
+	echo ">> check: reproducibility of the SWAPPED OCI image derivation (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$drv"; \
 	echo ">> artifact check: the declared package is actually IN the built tarball"; \
 	default_img=`$(GUIX) system image $(LOAD) -t docker $(SYSTEM)`; \
 	probe() { \
@@ -391,8 +391,8 @@ registry:
 	test -n "$$drv" || { echo "ERROR: could not lower the registry derivation" >&2; exit 1; }; \
 	echo ">> registry derivation: $$drv"; \
 	reg=`$(GUIX) build "$$drv"`; \
-	echo ">> check: reproducibility of the registry"; \
-	$(GUIX) build --check "$$drv"; \
+	echo ">> check: reproducibility of the registry (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$drv"; \
 	skopeo=`$(GUIX) build skopeo`/bin/skopeo; \
 	signify=`$(GUIX) build signify`/bin/signify; \
 	TD_REGISTRY="$$reg" SKOPEO="$$skopeo" SIGNIFY="$$signify" \
@@ -440,8 +440,8 @@ verify-place:
 	echo ">> verified placed tree derivation: $$vplace_drv"; \
 	vplace=`$(GUIX) build "$$vplace_drv"`; \
 	direct=`$(GUIX) build "$$direct_drv"`; \
-	echo ">> check: reproducibility of the verified placed tree"; \
-	$(GUIX) build --check "$$vplace_drv"; \
+	echo ">> check: reproducibility of the verified placed tree (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$vplace_drv"; \
 	echo ">> validate the verified tree (digest-form TD_IMAGES: placed identity == verified manifest digest)"; \
 	TD_PLACED="$$vplace" TD_PRESENT="1 2" TD_ABSENT="" \
 	TD_IMAGES="1=$$d1 2=$$d2" \
@@ -494,8 +494,8 @@ place:
 	echo ">> prune  tree derivation (gens 1,2,3 keep 2): $$prune_drv"; \
 	place_tree=`$(GUIX) build "$$place_drv"`; \
 	prune_tree=`$(GUIX) build "$$prune_drv"`; \
-	echo ">> check: reproducibility of BOTH placed target trees"; \
-	$(GUIX) build --check "$$place_drv" "$$prune_drv"; \
+	echo ">> check: reproducibility of BOTH placed target trees (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$place_drv" "$$prune_drv"; \
 	echo ">> validate PLACE tree (gens 1,2 present, none pruned)"; \
 	TD_PLACED="$$place_tree" TD_PRESENT="1 2" TD_ABSENT="" \
 	TD_IMAGES="1=$$img1 2=$$img2" \
@@ -534,8 +534,8 @@ rollback:
 	echo ">> rollback disk derivation:      $$disk_drv"; \
 	tree=`$(GUIX) build "$$tree_drv"`; \
 	disk=`$(GUIX) build "$$disk_drv"`; \
-	echo ">> check: reproducibility of the mkfs placed tree AND the assembled disk"; \
-	$(GUIX) build --check "$$tree_drv" "$$disk_drv"; \
+	echo ">> check: reproducibility of the mkfs placed tree AND the assembled disk (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$tree_drv" "$$disk_drv"; \
 	echo ">> validate the mkfs tree (live labeled roots via superblock, boot wiring, search line)"; \
 	TD_PLACED="$$tree" TD_PRESENT="1 2" TD_ABSENT="" TD_MKFS=1 TD_BOOT_LABEL=td-boot \
 	  $(GUIX) repl $(LOAD) tests/place-check.scm; \
@@ -606,8 +606,8 @@ no-guix:
 	echo ">> guarantee: the BARE hardened lowering must BUILD (the embedded marker certifies it guix-free)"; \
 	hardened_img=`$(GUIX) build "$$hardened_drv"`; \
 	control_img=`$(GUIX) build "$$control_drv"`; \
-	echo ">> check: reproducibility of the HARDENED (gated) artifact"; \
-	$(GUIX) build --check "$$hardened_drv"; \
+	echo ">> check: reproducibility of the HARDENED (gated) artifact (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$hardened_drv"; \
 	echo ">> artifact check: the imperative guix surface is ABSENT from the hardened image and PRESENT in the control"; \
 	probe() { \
 	  listing=`tar xzOf "$$1" --wildcards '*/layer.tar' | tar tf -` \
@@ -701,8 +701,8 @@ td-builder:
 	out=`$(GUIX) build "$$drv"`; \
 	elapsed=$$(( `date +%s` - start )); \
 	test -n "$$out" || { echo "ERROR: the td-builder build produced no output path" >&2; exit 1; }; \
-	echo ">> check: reproducibility of the td-builder binary"; \
-	$(GUIX) build --check "$$drv"; \
+	echo ">> check: reproducibility of the td-builder binary (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$drv"; \
 	echo ">> run: the compiled binary must print its sentinel"; \
 	"$$out/bin/td-builder" | grep -Eq '^td-builder [0-9.]+ ok$$' \
 	  || { echo "FAIL: the compiled td-builder did not print its sentinel (or exited nonzero) — the toolchain did not produce a working binary." >&2; exit 1; }; \
@@ -913,8 +913,8 @@ container:
 	echo ">> negative-control artifacts: badimage=$$bimg badbundle=$$bbun"; \
 	echo ">> cgroup artifacts (M9.3): cgimage=$$cimg cgbundle=$$cbun"; \
 	$(GUIX) build "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun" >/dev/null; \
-	echo ">> reproducibility: guix build --check the app images + extracted bundles (good + negative + cgroup)"; \
-	$(GUIX) build --check "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun" >/dev/null; \
+	echo ">> reproducibility: guix build --check the app images + extracted bundles (good + negative + cgroup; verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun"; \
 	drv=`printf '%s\n' \
 	    '(use-modules (guix) (gnu tests) (tests container))' \
 	    '(with-store store' \
