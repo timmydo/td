@@ -102,7 +102,18 @@ test -n "$channel_out" || { echo "FATAL: no channel instance output" >&2; exit 1
 # assertion reads /proc/self/uid_map from THAT build — tests/rootless.sh). A
 # dev box never root-builds it (only the userns does), but the pipeline's
 # warming pass does, so drop it from the export; the runner builds it fresh.
-grep -Ev -- '-(docker-image\.tar\.gz|td-app-[a-z]+\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rollback-disk|td-rootless-isolation-probe)$' \
+#
+# AND exclude the td-builder differential oracles: td-s3-diff (S3) and the
+# qcow2 system image.qcow2 (S4). A THIRD reason: those rungs assert that the
+# DAEMON's recorded deriver equals the rebuild's, and `guix archive --import`
+# does NOT restore the deriver field — an imported output reports deriver=#f,
+# so the daemon must FRESHLY build them (build-derivations) to record it. The
+# rungs' lowering already builds them expecting that; shipping the outputs
+# short-circuits it. Dropping them makes the daemon build them fresh (the
+# build/boot-disk/rootless rungs rebuild image.qcow2 anyway). NAR hash/size,
+# the other imported facts, ARE intrinsic and survive import — only deriver
+# needs the fresh build.
+grep -Ev -- '-(docker-image\.tar\.gz|td-app-[a-z]+\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rollback-disk|td-rootless-isolation-probe|td-s3-diff|image\.qcow2)$' \
   "$work/outputs.txt" > "$work/outputs-kept.txt"
 echo "   excluded $(($(wc -l < "$work/outputs.txt") - $(wc -l < "$work/outputs-kept.txt"))) outputs the runner rebuilds itself (fs-order docker-pack families + the rootless isolation probe)"
 sort -u "$work/check-drvs.txt" "$work/outputs-kept.txt" > "$work/roots.txt"

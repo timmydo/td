@@ -442,3 +442,20 @@ Risks / open questions:
     they no longer assume the caller set TMPDIR; gitignored. Verified locally:
     ./check.sh registry and ./check.sh verify-place both PASS (exit 0) with
     disk scratch, all negative controls intact.
+  * Run 8 (a72dd9d): registry/verify-place fixed; validate cleared reset,
+    test, build, boot-disk (qcow2 IS cross-runner reproducible — PR #13
+    content-sizing holds), place, run — and red'd at the `td-builder` S3
+    differential: `deriver mismatch — registration '...-td-s3-diff.drv' vs
+    daemon '#f'`. Root cause: the S3/S4 differentials assert the DAEMON's
+    recorded deriver equals td-builder's rebuild, and `guix archive --import`
+    does NOT restore the deriver — an imported output reports deriver=#f. The
+    lowering (td-builder-s3-drvs.scm / s4-drv.scm) build the oracle via the
+    daemon EXPECTING a fresh build that records the deriver, but the warming
+    pass builds + ships these outputs, so on the runner build-derivations is a
+    no-op over the imported (deriver-less) path. Two affected outputs (the
+    only path-info-deriver reads in the suite): td-s3-diff (S3) and
+    image.qcow2 (S4). Fix: exclude both from the export so the daemon builds
+    them fresh and records the deriver (build/boot-disk/rootless rebuild
+    image.qcow2 anyway). nar-hash/size are intrinsic and survive import; only
+    deriver needs the fresh build. Cannot be reproduced locally (needs the
+    import path; dev-box builds are always fresh).
