@@ -223,6 +223,16 @@ are green. An honest red, caught by running the documented procedure
 end-to-end; the 19 real-leg `MEMO MISS (forced full)` lines in the same run
 are the whole-ladder force-full demonstration.
 
+### Acceptance record (final, 2026-06-12 — landing gates on the final tree)
+
+- `TD_CHECK_FULL=1 ./check.sh`: **green, 7m27.8s**, all 19 wired drvs
+  `MEMO MISS (forced full)` → real `--check` — the force-full knob
+  demonstrably runs the original full ladder (§7.1 acceptance clause 2; also
+  the §7.2 landing full-check, strictly stronger than the plain run).
+- `./check.sh` (fresh verdicts): **green, 2m21.9s** — 19 hits, 0 misses.
+- Floor: **440s (before) → 142-145s (memoized)**, all rungs green
+  (clause 1). Verified-reds A-D + extras: on record above (clause 3).
+
 ### Memoization boundary (constraint 6, decided at S1)
 
 The helper applies ONLY to the pure reproducibility `--check` legs. Two rungs
