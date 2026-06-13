@@ -95,7 +95,7 @@ endef
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
 HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus td-build drv-emit
 
-.PHONY: check container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
+.PHONY: check check-fast container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -104,6 +104,17 @@ container-check:
 	@./check.sh
 
 check: $(CHEAP_RUNGS) $(HEAVY_RUNGS)
+
+# The fast tier — the rungs that test td's OWN surface (typed/TS front-end + the
+# Rust builder/evaluator) and need only the toolchain: no `guix system image`,
+# no marionette VM, no QEMU/kernel/bootloader closure. A STRICT SUBSET of
+# `check`, for quick "is td's logic right" feedback and for a light CI job that
+# need not import the full system/boot closure. PURELY ADDITIVE: `check` above
+# is unchanged and remains the gate; nothing here removes, loosens, reorders, or
+# skips a rung. FAST_RUNGS are a subset of HEAVY_RUNGS, so the ordering graph
+# below already gates them on the last cheap rung.
+FAST_RUNGS := ts ts-diff ts-eval corpus td-build drv-emit
+check-fast: $(CHEAP_RUNGS) $(FAST_RUNGS)
 
 # Generated ordering graph (do not hand-edit): chain each cheap rung
 # order-only on its predecessor, and gate every heavy rung on the last cheap
