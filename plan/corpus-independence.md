@@ -160,3 +160,16 @@ manipulated env / copies, real fixtures untouched.
   property as the differential's converge leg (verified-red above); the `--check`
   reproducibility leg reuses `tests/check-memo.sh` (its nondeterminism/expiry/foreign
   reds are verified-red on the check-memo track).
+
+`td-build` rung (own Rust builder), each driven via `./check.sh td-build`, restored after:
+- **R1 behavioral** — a temporary defect in `builder/src/build.rs` corrupts the source
+  greeting (Hello→Goodbye) before configure; the build succeeds and runs, but ⇒ RED
+  "td-built hello printed 'Goodbye, world!', expected 'Hello, world!'" (exit 2). Proves
+  the behavioral differential catches a builder that produces a wrong-behaving binary,
+  not just a missing one.
+- **R2 structural** — `tests/td-build-drv.scm` perturbed to emit the guile-built corpus
+  oracle as the td-build drv ⇒ RED "td-build builder is 'guile', expected the td-builder
+  Rust binary" (exit 2). Proves the "gnu-build-system is gone" check discriminates a
+  Rust-built derivation from a guile-built one.
+- The `--check` reproducibility leg reuses `tests/check-memo.sh` (verified-red on the
+  check-memo track).
