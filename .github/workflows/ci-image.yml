@@ -33,6 +33,12 @@ on:
     paths:
       - channels.scm
       - ci/**
+  # Pre-merge live test: changes to THIS file run the pipeline from the PR
+  # (build + validate only — promote is main-events-only below), so the
+  # workflow is never merged untested.
+  pull_request:
+    paths:
+      - .github/workflows/ci-image.yml
 
 permissions:
   contents: read
@@ -237,7 +243,10 @@ jobs:
 
   promote:
     # Registry-side retag — the candidate VERBATIM becomes :<pin> (and
-    # :latest). Promotion happens only after validate's full green check.
+    # :latest). Promotion happens only after validate's full green check,
+    # and never from a pull_request test run (a PR exercises build+validate;
+    # only main-event runs may move the tag the gate consumes).
+    if: github.event_name != 'pull_request'
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 30
