@@ -34,10 +34,13 @@ edits** (track files don't carry it).
 - [ ] **corpus-independence** — claimed claude-fable-4a2e33 2026-06-13 (Phase 2 of §5
   move-off-Guile, graduated from §6 to §7.1 — human go-ahead 2026-06-13. CORPUS axis:
   td's OWN recipes vs the Guix corpus, Guix as oracle, toolchain/build-system retired
-  last. POC: `system/td-corpus.scm` authors GNU hello from upstream coordinates without
-  importing `(gnu packages …)`; the `corpus-diff` rung proves it lowers store-path-equal
-  to the corpus `hello` while a perturbed recipe diverges; the `corpus` rung builds +
-  `--check`s it NAR-hash-equal to the oracle) — `plan/corpus-independence.md`
+  last — composed with the SURFACE axis so recipes are AUTHORED in TypeScript. POC:
+  `tests/ts/recipe-hello.ts` declares GNU hello from upstream coordinates; the boa
+  evaluator (new `recipe`/`fetchSource` capture globals) emits it as JSON, lowered by a
+  generic Guile bridge `system/td-recipe.scm` (no `(gnu packages …)`); the single
+  TS-driven `corpus` rung proves it lowers store-path-equal to the corpus `hello`, a
+  perturbed `.ts` diverges, and the built artifact is `--check`-reproducible +
+  NAR-hash-equal to the oracle) — `plan/corpus-independence.md`
 
 ## The loop (reminder)
 

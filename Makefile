@@ -53,7 +53,7 @@ endef
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-# The 30 rungs, in the two pools the bounded-parallel loop schedules from.
+# The 29 rungs, in the two pools the bounded-parallel loop schedules from.
 # ADDING A RUNG: put it in exactly ONE pool below — .PHONY, the `check` target,
 # the serial chain, and the heavy gate are all DERIVED from these two
 # variables, so the lists cannot drift apart (review finding: they used to be
@@ -92,7 +92,7 @@ endef
 # still pass, and make (run without -k) stops spawning new rungs after a
 # failure — a red still short-circuits the loop. Order-only (|) prerequisites,
 # so a plain serial `make -j1 check` behaves exactly as before.
-CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff corpus-diff
+CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
 HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus
 
 .PHONY: check container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
@@ -171,59 +171,65 @@ generation-diff:
 	@echo ">> generation-diff: each generation gets a distinct, selectable root (M10.1)"
 	$(GUIX) repl $(LOAD) tests/generation-diff.scm
 
-# corpus-independence (DESIGN §7.1, Phase 2 of the §5 move-off-Guile goal). Cheap,
-# derivation-level, self-discriminating like the diffs above, but on the CORPUS axis
-# (where a package definition comes from) rather than the SURFACE axis: td's OWN
-# recipe (system td-corpus) — GNU hello reconstructed from upstream coordinates,
-# importing no `(gnu packages …)` — is lowered next to the pinned corpus's own
-# `hello` (the §2.5 oracle) and the derivations diffed. (a) td-hello is a distinct
-# object (not the corpus var re-exported), (b) it CONVERGES on the oracle drv, (c) a
-# perturbed recipe (one wrong byte in the upstream source hash) DIVERGES. Compared
-# `#:graft? #f` so it never realises a build — sub-second, fails fast. The matching
-# BUILD + --check is the heavy `corpus` rung. Run as a repl SCRIPT so `(exit)` is
-# the rung's status.
-corpus-diff:
-	@echo ">> corpus-diff: td's own recipe lowers to the same drv as the corpus oracle; a perturbed recipe diverges (corpus-independence)"
-	$(GUIX) repl $(LOAD) tests/corpus-diff.scm
-
-# corpus-independence BUILD leg (DESIGN §7.1, Phase 2). Where `corpus-diff` proves
-# convergence at the derivation level (cheap, build-free), this proves the
-# td-recipe-BUILT package is REPRODUCIBLE (prime directive 1) and NAR-hash-equal to
-# the corpus oracle's build. It builds td's OWN hello recipe (ungrafted, matching
-# corpus-diff — so it --checks hello's actual compile, not just the graft rewrite),
-# `--check`s it bit-for-bit (verdict-memoized — tests/check-memo.sh), and asserts
-# the built store object is path-identical AND NAR-hash-equal to the corpus
-# oracle's. Heavy (a warm-store hello compile + a --check), so it slots in the heavy
-# pool; RE-MEASURE and RE-SORT once it has run (its cost is one hello compile warm).
+# corpus-independence (DESIGN §7.1, Phase 2 of the §5 move-off-Guile goal). The
+# CORPUS axis (where a package definition comes from), driven through the SAME
+# TypeScript front-end as `ts-diff` — now declaring a PACKAGE instead of the
+# system. A recipe AUTHORED in TypeScript (tests/ts/recipe-hello.ts — reconstructed
+# from upstream coordinates, NOT looked up in the Guix corpus) is transpiled (tsc)
+# + evaluated (boa td-ts-eval) to recipe JSON, lowered through the generic Guile
+# recipe bridge (system td-recipe — the retire-last lowering target), and proven
+# equal to the pinned corpus's own `hello` (the §2.5 oracle). Two legs:
+#   (1) differential (tests/ts-recipe-diff.scm) — the TS recipe CONVERGES on the
+#       oracle drv and a perturbed recipe (recipe-perturbed.ts, one wrong byte in
+#       the source hash) DIVERGES; build-free (#:graft? #f), self-discriminating;
+#   (2) build + --check (prime directive 1) — build the bridged recipe, --check it
+#       reproducible (verdict-memoized — tests/check-memo.sh), assert the built
+#       store object is path-identical AND NAR-hash-equal to the corpus oracle's.
+# Heavy (TS toolchain + a warm hello compile + a --check), so it slots in the heavy
+# pool next to the other ts rungs; RE-MEASURE and RE-SORT once it has run.
 corpus:
-	@echo ">> corpus: build td's own hello recipe, --check it, NAR-hash-equal to the corpus oracle (corpus-independence)"
+	@echo ">> corpus: a TypeScript-authored recipe lowers (tsc->boa->bridge) to the corpus oracle's hello; build + --check NAR-hash-equal (corpus-independence Phase 2)"
 	@set -euo pipefail; \
-	vars=`$(GUIX) repl $(LOAD) tests/corpus-drv.scm 2>/dev/null`; \
+	node=`$(GUIX) build node`/bin/node; \
+	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
+	evdrv=`$(GUIX) repl $(LOAD) tests/ts-eval-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	test -n "$$evdrv" || { echo "ERROR: could not lower the td-ts-eval derivation" >&2; exit 1; }; \
+	ev=`$(GUIX) build "$$evdrv"`/bin/td-ts-eval; \
+	test -n "$$node" -a -n "$$tsc" -a -x "$$ev" || { echo "ERROR: could not resolve node / td-typescript / td-ts-eval" >&2; exit 1; }; \
+	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	rj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-hello.ts"`; \
+	pj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-perturbed.ts"`; \
+	test -n "$$rj" -a -n "$$pj" || { echo "ERROR: ts-emit produced no recipe JSON" >&2; exit 1; }; \
+	echo ">> hello recipe JSON     : $$rj"; \
+	echo ">> perturbed recipe JSON : $$pj"; \
+	echo ">> differential: TS recipe converges on the corpus oracle; perturbed diverges"; \
+	TD_RECIPE_JSON="$$rj" TD_RECIPE_PERTURBED_JSON="$$pj" $(GUIX) repl $(LOAD) tests/ts-recipe-diff.scm; \
+	echo ">> build leg: lower the bridged recipe, build, --check, NAR-equal"; \
+	vars=`TD_RECIPE_JSON="$$rj" $(GUIX) repl $(LOAD) tests/ts-recipe-drv.scm 2>/dev/null`; \
 	td_drv=`printf '%s\n' "$$vars" | sed -n 's/^TD_DRV=//p'`; \
 	oracle_drv=`printf '%s\n' "$$vars" | sed -n 's/^ORACLE_DRV=//p'`; \
 	oracle_out=`printf '%s\n' "$$vars" | sed -n 's/^ORACLE_OUT=//p'`; \
 	test -n "$$td_drv" -a -n "$$oracle_drv" -a -n "$$oracle_out" \
-	  || { echo "ERROR: could not lower the corpus derivations" >&2; exit 1; }; \
-	echo ">> td-hello recipe drv : $$td_drv"; \
-	echo ">> corpus oracle  drv  : $$oracle_drv"; \
+	  || { echo "ERROR: could not lower the recipe derivations" >&2; exit 1; }; \
+	echo ">> TS recipe drv     : $$td_drv"; \
+	echo ">> corpus oracle drv : $$oracle_drv"; \
 	test "$$td_drv" = "$$oracle_drv" \
-	  || { echo "FAIL: td's recipe drv != corpus oracle drv — convergence lost at the build-derivation level." >&2; exit 1; }; \
-	echo ">> build td-hello from td's OWN recipe"; \
+	  || { echo "FAIL: TS recipe drv != corpus oracle drv — convergence lost at the build-derivation level." >&2; exit 1; }; \
+	echo ">> build the bridged recipe"; \
 	out=`$(GUIX) build "$$td_drv"`; \
-	test -n "$$out" || { echo "ERROR: building td-hello produced no output path" >&2; exit 1; }; \
-	echo ">> check: reproducibility of td-hello (verdict-memoized)"; \
+	test -n "$$out" || { echo "ERROR: building the recipe produced no output path" >&2; exit 1; }; \
+	echo ">> check: reproducibility (verdict-memoized)"; \
 	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
-	echo ">> assert built output is store-path-identical to the corpus oracle output"; \
 	test "$$out" = "$$oracle_out" \
-	  || { echo "FAIL: td-hello built to $$out but the corpus oracle is $$oracle_out — not the same store object." >&2; exit 1; }; \
+	  || { echo "FAIL: built $$out but the corpus oracle is $$oracle_out — not the same store object." >&2; exit 1; }; \
 	echo ">> NAR-hash-equal (§6 metric)"; \
 	nar_td=`$(GUIX) hash -S nar "$$out"`; \
 	nar_or=`$(GUIX) hash -S nar "$$oracle_out"`; \
-	echo "   td-hello NAR      : $$nar_td"; \
+	echo "   TS recipe NAR     : $$nar_td"; \
 	echo "   corpus oracle NAR : $$nar_or"; \
 	test -n "$$nar_td" -a "$$nar_td" = "$$nar_or" \
-	  || { echo "FAIL: td-hello NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
-	echo "PASS: td's own recipe builds reproducibly to the corpus oracle's exact store object (NAR-hash-equal)."
+	  || { echo "FAIL: TS recipe NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
+	echo "PASS: a TypeScript-authored recipe builds reproducibly to the corpus oracle's exact store object (NAR-hash-equal)."
 
 # ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
 # `tsc` (the pinned td-typescript input, run under the packaged node) BOTH

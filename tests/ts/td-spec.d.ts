@@ -42,3 +42,41 @@ interface SystemSpec {
  *  it to a derivation; at type-check time this only constrains the shape of what
  *  may be declared. */
 declare function system(spec: SystemSpec): void;
+
+// ---------------------------------------------------------------------------
+// corpus-independence (Phase 2 of the §5 move-off-Guile goal, DESIGN §7.1).
+// The CORPUS axis: a package RECIPE authored here in TypeScript — reconstructed
+// from upstream coordinates, not looked up in the Guix corpus — lowered by the
+// generic Guile recipe bridge (system td-recipe) and proven NAR-hash-equal to the
+// pinned corpus's build of the same package (Guix is the oracle). What stays
+// Guile is the bridge (the retire-last lowering target); the recipe DATA lives
+// here, in the TS surface.
+
+/** An upstream source: a URL and its content hash (nix-base32 sha256). The
+ *  evaluator records this as data; the fetch itself is the Guile lowering's
+ *  declared fixed-output `url-fetch` (offline contract unchanged). */
+interface Source {
+  readonly uri: string;
+  readonly sha256: string;
+}
+
+/** Build systems td knows how to lower (mirrors the bridge's dispatch). A value
+ *  outside this union is a compile-time error — like `RootFsType`. v0 is `"gnu"`. */
+declare type BuildSystem = "gnu";
+
+/** A package recipe — the scalar coordinates that determine the build
+ *  derivation: name, version, the upstream source, and the build system. */
+interface Recipe {
+  readonly name: string;
+  readonly version: string;
+  readonly source: Source;
+  readonly buildSystem: BuildSystem;
+}
+
+/** Declare an upstream source by URL + content hash (does not fetch). */
+declare function fetchSource(uri: string, sha256: string): Source;
+
+/** Declare the package to build. The evaluator captures the argument and emits it
+ *  as JSON for the Guile recipe bridge, which reconstructs a package and lowers it
+ *  to a derivation; at type-check time this constrains the shape of the recipe. */
+declare function recipe(r: Recipe): void;
