@@ -40,7 +40,12 @@ edits** (track files don't carry it).
   generic Guile bridge `system/td-recipe.scm` (no `(gnu packages …)`); the single
   TS-driven `corpus` rung proves it lowers store-path-equal to the corpus `hello`, a
   perturbed `.ts` diverges, and the built artifact is `--check`-reproducible +
-  NAR-hash-equal to the oracle) — `plan/corpus-independence.md`
+  NAR-hash-equal to the oracle. OWN-BUILDER increment (human direction 2026-06-13):
+  `system/td-build.scm` + the td-builder crate's `autotools-build` mode build the
+  SAME TS recipe with a td/Rust builder instead of gnu-build-system — the `td-build`
+  rung proves it structurally (builder=`td-builder`, not `guile`), reproducibly
+  (`--check`), and behaviorally (byte-identical to the corpus hello) at a distinct
+  path) — `plan/corpus-independence.md`
 
 ## The loop (reminder)
 
