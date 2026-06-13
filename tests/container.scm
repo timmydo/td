@@ -73,12 +73,51 @@
 (define app-profile
   (profile (content (packages->manifest (list hello)))))
 
+;; Re-pack a Guix docker archive deterministically. WHY this is needed: Guix's
+;; (docker-image) at the pinned commit (520785e) writes the OUTER archive with
+;; `tar -cf image -C dir "."` (guix/docker.scm), and build-docker-image calls
+;; tar-base-options WITHOUT #:tar — so the `--sort=name` flag, which
+;; guix/build/pack.scm gates on #:tar, is DROPPED. The archive's member order then
+;; follows filesystem readdir order, which is non-reproducible across filesystems:
+;; the hosted CI runner caught it (a `guix build --check` divergence on
+;; td-app-badentry.tar.gz), while local stable-readdir filesystems do not. The
+;; inner layer.tar is content-addressed (identical run-to-run — only the outer
+;; member order moved between the shipped and rebuilt archives), so re-packing the
+;; archive with a sorted, canonical layout makes every app image bit-reproducible
+;; everywhere. (The omission is fixed in later upstream Guix; a channel bump would
+;; re-baseline every DIGESTS hash for one fixture, so we canonicalize locally.)
+(define (deterministic-docker-image name image)
+  (mlet %store-monad ((image image))
+    (gexp->derivation name
+      (with-imported-modules '((guix build utils))
+        #~(begin
+            (use-modules (guix build utils))
+            (mkdir "extract")
+            (invoke #$(file-append tar "/bin/tar")
+                    "--use-compress-program" #$(file-append gzip "/bin/gzip")
+                    "-xf" #$image "-C" "extract")
+            ;; --sort=name is THE fix (member order independent of readdir); the
+            ;; rest pins the remaining tar fields, and `gzip -n` drops the
+            ;; timestamp/name from the gzip header, so nothing else can drift.
+            (with-directory-excursion "extract"
+              (invoke #$(file-append tar "/bin/tar")
+                      "--sort=name" "--mtime=@1"
+                      "--owner=0" "--group=0" "--numeric-owner"
+                      "--use-compress-program"
+                      (string-append #$(file-append gzip "/bin/gzip") " -9n")
+                      "-cf" #$output ".")))))))
+
 ;; An app image over the SAME profile but with the given declared entry-point.
 ;; Parameterizing the entry-point lets us build a second image whose declared
 ;; entrypoint is bogus (below) — the negative that proves the run honors the
-;; IMAGE'S metadata, not a host-known path.
+;; IMAGE'S metadata, not a host-known path. The raw Guix archive is re-packed
+;; deterministically (see deterministic-docker-image) so the artifact the
+;; `container` rung --checks is reproducible on any filesystem.
 (define (app-image name entry)
-  (docker-image name app-profile #:entry-point entry #:localstatedir? #f))
+  (deterministic-docker-image
+   (string-append name ".tar.gz")
+   (docker-image (string-append name "-raw") app-profile
+                 #:entry-point entry #:localstatedir? #f)))
 
 ;; Public (the `container` rung --check's this artifact's reproducibility).
 (define (td-app-image)
@@ -99,8 +138,10 @@
   (profile (content (packages->manifest (list coreutils)))))
 
 (define (td-app-cgroup-image)
-  (docker-image "td-app-cgroup" cgroup-app-profile
-                #:entry-point "bin/cat" #:localstatedir? #f))
+  (deterministic-docker-image
+   "td-app-cgroup.tar.gz"
+   (docker-image "td-app-cgroup-raw" cgroup-app-profile
+                 #:entry-point "bin/cat" #:localstatedir? #f)))
 
 ;; Unpack an app image into a runtime BUNDLE at build time. The output is a
 ;; directory holding:
