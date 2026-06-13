@@ -15,6 +15,7 @@
 //!     registration;
 //!   • S4 — the daemon-vs-td-builder store differential, as a check.sh rung.
 
+mod build;
 mod drv;
 mod nar;
 mod sandbox;
@@ -133,11 +134,23 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // corpus-independence: run AS a derivation's builder, executing the
+        // autotools phases in Rust (replaces gnu-build-system). Reads the build
+        // environment from env vars (out, TD_SRC, TD_INPUTS, TD_CONFIGURE_FLAGS)
+        // that system/td-build.scm sets on the derivation.
+        Some("autotools-build") if args.len() == 2 => match build::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: autotools-build: {e}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("usage: td-builder            # print the S1 sentinel");
             eprintln!("       td-builder nar-hash PATH");
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
+            eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)
         }
     }

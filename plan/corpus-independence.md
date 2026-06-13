@@ -122,6 +122,28 @@ landed/DONE). Announced here; others rebase. No other tracks in flight at claim 
   and the `ts-eval`/`ts-diff` rungs are unaffected (system() path + bare-result
   fallback unchanged).
 
+- **Own Rust builder (replace gnu-build-system): DONE 2026-06-13.** Scope fixed by
+  the human 2026-06-13: replace gnu-build-system with a td/Rust builder, KEEP guix
+  for `.drv` construction; differential is BEHAVIORAL (own-builder output has a
+  distinct store path — hello bakes `$out`). New `autotools-build` mode in the
+  td-builder crate (`builder/src/build.rs`) runs the autotools phases in Rust
+  (set-paths from `TD_INPUTS` → tar unpack → `./configure --prefix=$out` → `make` →
+  `make install`), invoked AS the derivation's builder. `system/td-build.scm`
+  constructs that derivation with a raw `derivation` (builder = the td-builder
+  binary, NOT guile; inputs = the source + gcc-toolchain + make/bash/tar/… toolchain,
+  retired last; env = TD_SRC/TD_INPUTS). New `td-build` heavy rung: drives the SAME
+  TS recipe (recipe-hello.ts → tsc → boa → JSON), lowers it through td-build, and
+  asserts (a) STRUCTURAL — the builder basename is `td-builder` while the corpus
+  oracle's is `guile`; (b) REPRODUCIBLE — `guix build --check` (verdict-memoized);
+  (c) BEHAVIORAL — the td-built hello and the corpus hello print byte-identical
+  output (`Hello, world!`); (d) the artifact is a DISTINCT store object. GREEN
+  in-sandbox (`./check.sh td-build`). `eval` loads `(system td-build)`.
+  - Findings: gcc-toolchain-15.2.0 is warm (a different compiler than the corpus's
+    gcc-14.3 — fine for a behavioral diff); the only fix beyond the minimal phases
+    was `make SHELL=<bash>` (the `po/` install rules launch `/bin/sh`, absent in the
+    sandbox); the minimal build is already `--check`-reproducible (SOURCE_DATE_EPOCH=1
+    + deterministic install; no strip/compress-documentation needed).
+
 ## Verified-red log
 
 The "commit before red variants" gotcha (memory): green committed first; reds run on
@@ -138,3 +160,16 @@ manipulated env / copies, real fixtures untouched.
   property as the differential's converge leg (verified-red above); the `--check`
   reproducibility leg reuses `tests/check-memo.sh` (its nondeterminism/expiry/foreign
   reds are verified-red on the check-memo track).
+
+`td-build` rung (own Rust builder), each driven via `./check.sh td-build`, restored after:
+- **R1 behavioral** — a temporary defect in `builder/src/build.rs` corrupts the source
+  greeting (Hello→Goodbye) before configure; the build succeeds and runs, but ⇒ RED
+  "td-built hello printed 'Goodbye, world!', expected 'Hello, world!'" (exit 2). Proves
+  the behavioral differential catches a builder that produces a wrong-behaving binary,
+  not just a missing one.
+- **R2 structural** — `tests/td-build-drv.scm` perturbed to emit the guile-built corpus
+  oracle as the td-build drv ⇒ RED "td-build builder is 'guile', expected the td-builder
+  Rust binary" (exit 2). Proves the "gnu-build-system is gone" check discriminates a
+  Rust-built derivation from a guile-built one.
+- The `--check` reproducibility leg reuses `tests/check-memo.sh` (verified-red on the
+  check-memo track).

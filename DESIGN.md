@@ -580,11 +580,20 @@ run concurrently):
   a self-discriminating rung: the TS recipe CONVERGES on the corpus oracle while a
   perturbed TS recipe DIVERGES (verified-red, never vacuous), and the BUILT artifact
   is reproducible (`guix build --check`) with its output NAR hash equal to the
-  corpus oracle's. Broadening the recipe set toward the full target closure (more
-  build systems, packages with inputs), and the "behaviorally equal where a recipe
-  legitimately differs" case (an own-builder package that diverges in store path but
-  matches behaviorally) are follow-on increments inside this track. Working state +
-  verified-red log: `plan/corpus-independence.md`.
+  corpus oracle's. **Own-builder increment (DONE 2026-06-13):** the "behaviorally
+  equal where a recipe legitimately differs" case — the same TS recipe lowered
+  through `system/td-build` (a raw `derivation` whose BUILDER is the td-builder Rust
+  binary's `autotools-build` mode, builder/src/build.rs) instead of
+  gnu-build-system, so gnu-build-system AND build-time Guile are removed from the
+  build (guix still constructs the .drv — scope fixed by the human 2026-06-13:
+  replace gnu-build-system, keep guix for .drv construction; the toolchain stays
+  Guix's, retired last). The own-builder output has a distinct store path, so the
+  `td-build` rung proves equivalence BEHAVIORALLY (byte-identical program output to
+  the corpus hello) + STRUCTURALLY (the derivation's builder is `td-builder`, not
+  `guile`) + reproducibly (`--check`). Remaining follow-ons: broadening the recipe
+  set toward the full target closure (more build systems, packages with inputs), and
+  de-Guiling the `.drv` construction itself (the §6 "evaluator as a library", a
+  separate charter). Working state + verified-red log: `plan/corpus-independence.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
