@@ -55,6 +55,13 @@ edits** (track files don't carry it).
   `drv-emit` rung — td constructs the td-build hello `.drv` byte-identical to guix's
   (validated over hundreds of real drvs), perturbed recipe is a distinct drv it also
   matches, verified-red ×2) — `plan/evaluator-as-library.md`
+- [ ] **td-drv-build** — claimed claude-fable-4a2e33 2026-06-13 (graduated §6→§7.1,
+  human go-ahead 2026-06-13. Capstone of the move-off-Guile arc: for the `td-build`
+  hello subject, td-builder EMITS the `.drv` (#22) AND EXECUTES it in its own userns
+  sandbox (S3/S4), output NAR-equal to the daemon — construct + execute both td's Rust,
+  builder=`td-builder autotools-build`, NO guile in either; daemon is the oracle only.
+  Input resolution + closure + the daemon building the INPUTS stay Guix's, toolchain
+  retired last) — `plan/td-drv-build.md`
 
 ## The loop (reminder)
 
