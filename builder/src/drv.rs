@@ -175,7 +175,10 @@ pub fn parse(input: &[u8]) -> Result<Derivation, ParseError> {
     p.expect(",")?;
     let platform = p.string()?;
     p.expect(",")?;
-    let builder = p.path()?;
+    // The builder is a plain string, NOT a store path: fixed-output download
+    // derivations use the daemon builtins `builtin:download`/`builtin:fetchurl`
+    // (no leading `/`). parseDerivation reads it with parseString, so do we.
+    let builder = p.string()?;
 
     let mut args = Vec::new();
     p.expect(",[")?;
@@ -247,9 +250,72 @@ pub fn dump(drv: &Derivation) -> String {
     out
 }
 
+/// Serialize a Derivation back to the exact ATerm bytes the daemon writes
+/// (nix/libstore/derivations.cc unparseDerivation, via printString). The inverse
+/// of `parse`: double-quoted strings with the same five escapes as `escape`
+/// (`\\ \" \n \r \t`), comma-separated bracketed lists, NO whitespace anywhere.
+/// Round-trips a real `.drv` byte-identical (the foundation for emitting one).
+pub fn serialize(drv: &Derivation) -> String {
+    fn q(s: &str) -> String {
+        format!("\"{}\"", escape(s))
+    }
+    fn join<T>(items: &[T], f: impl Fn(&T) -> String) -> String {
+        items.iter().map(f).collect::<Vec<_>>().join(",")
+    }
+    let mut o = String::from("Derive([");
+    o.push_str(&join(&drv.outputs, |out| {
+        format!("({},{},{},{})", q(&out.name), q(&out.path), q(&out.hash_algo), q(&out.hash))
+    }));
+    o.push_str("],[");
+    o.push_str(&join(&drv.input_drvs, |(path, names)| {
+        format!("({},[{}])", q(path), join(names, |n| q(n)))
+    }));
+    o.push_str("],[");
+    o.push_str(&join(&drv.input_srcs, |s| q(s)));
+    o.push_str("],");
+    o.push_str(&q(&drv.platform));
+    o.push(',');
+    o.push_str(&q(&drv.builder));
+    o.push_str(",[");
+    o.push_str(&join(&drv.args, |a| q(a)));
+    o.push_str("],[");
+    o.push_str(&join(&drv.env, |(k, v)| format!("({},{})", q(k), q(v))));
+    o.push_str("])");
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialize_is_the_inverse_of_parse() {
+        // The hand-written sample is shaped exactly like the daemon's output,
+        // so serialize(parse(x)) must reproduce x byte-for-byte.
+        let s = sample();
+        assert_eq!(serialize(&parse(s.as_bytes()).unwrap()), s);
+    }
+
+    #[test]
+    fn serialize_round_trips_the_escapes() {
+        let txt = r#"Derive([("out","/gnu/store/aaa-x","","")],[],[],"s","/b",[],[("v","a\nb\rc\td\"e\\f")])"#;
+        assert_eq!(serialize(&parse(txt.as_bytes()).unwrap()), txt);
+    }
+
+    #[test]
+    fn parses_and_round_trips_a_fixed_output_builtin_builder() {
+        // Fixed-output download derivations use `builtin:download` as the builder
+        // (no leading `/`) and carry an (algo,hash) output — round-trip both.
+        let txt = concat!(
+            r#"Derive([("out","/gnu/store/aaa-src","sha256","abc123")],[],[],"#,
+            r#""x86_64-linux","builtin:download",[],[("out","/gnu/store/aaa-src"),"#,
+            r#"("url","https://example/x.tar.gz")])"#
+        );
+        let d = parse(txt.as_bytes()).unwrap();
+        assert_eq!(d.builder, "builtin:download");
+        assert_eq!(d.outputs[0].hash_algo, "sha256");
+        assert_eq!(serialize(&d), txt);
+    }
 
     // A miniature but complete drv exercising every section, shaped like the
     // pinned channel's output (single quotes swapped in for readability).

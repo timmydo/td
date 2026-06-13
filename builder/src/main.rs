@@ -80,6 +80,31 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // evaluator-as-library (sub-task 2): round-trip a `.drv` — parse then
+        // re-serialize — and exit 0 only if byte-identical to the file. Proves the
+        // ATerm serializer matches the daemon's writer on a real derivation.
+        Some("drv-roundtrip") if args.len() == 3 => match std::fs::read(&args[2]) {
+            Ok(bytes) => match drv::parse(&bytes) {
+                Ok(d) => {
+                    let re = drv::serialize(&d);
+                    if re.as_bytes() == bytes.as_slice() {
+                        println!("OK {}", args[2]);
+                        ExitCode::SUCCESS
+                    } else {
+                        eprintln!("DIFFER: re-serialized {} is not byte-identical", args[2]);
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-roundtrip {}: {e}", args[2]);
+                    ExitCode::FAILURE
+                }
+            },
+            Err(e) => {
+                eprintln!("td-builder: drv-roundtrip {}: {e}", args[2]);
+                ExitCode::FAILURE
+            }
+        },
         // S3b/S3c — execute the drv in the userns sandbox and register the
         // outputs. CLOSURE is a file listing every store path the build may
         // see, one per line; writes land under SCRATCH/newstore and the v1
