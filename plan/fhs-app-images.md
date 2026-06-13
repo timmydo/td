@@ -28,4 +28,91 @@ assertion proves the FHS property (e.g. the app binary really resolves at
 
 ## Working state
 
-(claiming agent: notes here)
+**Agent:** claude-fable-aed5c2 (claimed 2026-06-13). Draft PR #17.
+
+### Mechanism (verified against pinned guix `(guix scripts pack)`, commit 520785e)
+
+`docker-image` accepts `#:symlinks` — a list of `(SOURCE -> TARGET)` tuples
+(`->` literal), SOURCE absolute in-image, TARGET relative to the profile. The
+docker path's `symlink->directives` (pack.scm ~561) materializes SOURCE's parent
+dir + a symlink SOURCE → `<profile-store-path>/TARGET` INTO the image layer. So
+`#:symlinks '(("/usr/bin/hello" -> "bin/hello"))` yields `/usr/bin/hello` →
+`<profile>/bin/hello` inside the unpacked rootfs; the profile closure is already
+in the layer, so it resolves. This is the FHS-presentation vehicle (same one
+`guix pack -S /usr/bin/env=bin/env` uses) — store closure + FHS entry points,
+which is what lets foreign software that hardcodes `/usr/bin/...` and
+`/lib64/ld-linux-x86-64.so.2` work.
+
+### Reproducibility dependency on #16 (container-tar-repro)
+
+The FHS image is built by the same `(docker-image)` whose OUTER tar is
+readdir-ordered (non-reproducible cross-filesystem) — the exact bug PR #16 fixes
+with its `deterministic-docker-image` re-pack wrapper in `tests/container.scm`.
+This track MUST build its FHS image through that wrapper. Plan: land on top of
+#16 — rebase onto origin/main after #16 merges, then implement. (#16 is approved
++ auto-merge armed.)
+
+### Approach: extend the `container` rung, do NOT add a new heavy rung
+
+The `container` rung already boots the base ONCE and runs N app images on it
+(positive + 2 negatives + cgroup). The FHS app is "another OCI app image run on
+the booted base" — it belongs in that same boot. Adding a 4th scenario reuses the
+VM (no ~140s second boot) and fits the rung's role. Touches: `tests/container.scm`
+(new FHS image+bundle + scenario) and the `container:` recipe (add the FHS
+artifacts to the `--check` set). The Makefile edit is small but is still a shared-
+spine touch — land carefully, expect rebases.
+
+### Sub-task ladder (each a green commit; verified-red recorded here)
+
+- **S1 — FHS image builds + reproducible.** Add `td-app-fhs-image` (hello, with
+  `#:symlinks '(("/usr/bin/hello" -> "bin/hello"))`, packed via #16's
+  `deterministic-docker-image`) + `td-app-fhs-bundle`. Wire into the `container:`
+  recipe's `--check` set. Test: `guix build --check` reproducible (prime directive
+  1) + an artifact-content assertion that `/usr/bin/hello` is present in the image
+  layer (the manifest-check pattern). Verified-red: drop the symlink → /usr/bin/hello
+  absent → artifact assertion reds.
+- **S2 — FHS path runs on the booted base (the §7.1 acceptance floor).** The FHS
+  image's OWN declared entrypoint is the absolute `/usr/bin/hello`; bundle reads it
+  into args.json; crun execs it on the booted base → prints "Hello, world!", exit
+  0. Self-discriminating: running the SAME `/usr/bin/hello` arg against the PLAIN
+  store-layout rootfs (`td-app-image`, no /usr/bin) FAILS. Same arg, different
+  rootfs, different outcome ⇒ the FHS image specifically provides /usr/bin/hello.
+  Verified-red: point the FHS symlink elsewhere / run plain rootfs → positive reds.
+- **S3 — foreign-interpreter binary works ONLY under FHS (the deeper goal).**
+  Strengthening toward "foreign software/expectations work". A binary whose ELF
+  interpreter is the FHS path `/lib64/ld-linux-x86-64.so.2` runs in the FHS image
+  (loader symlinked from glibc) and FAILS in the plain image (no /lib64/ld-linux).
+  Proves FHS makes foreign-expecting software runnable, not just that we added one
+  symlink. Heavier (needs a gcc-toolchain-built foreign binary derivation) — pursue
+  if it lands cleanly; S2 is the defensible landing point if S3 proves too costly.
+
+### Verified-red evidence
+
+**S1+S2 (container rung, FHS scenario) — 2026-06-13, claude-fable-aed5c2.**
+
+GREEN baseline: container rung passes 6/6 — `FHS-POS (fhs rootfs) /usr/bin/hello
+-> (0 . "Hello, world!")`, `FHS-CTRL (plain rootfs) /usr/bin/hello -> (1 . not
+found)`; 8-artifact `--check` (incl. td-app-fhs image+bundle) green. Pre-build
+structural check: the FHS bundle's `rootfs/usr/bin/hello` is a symlink →
+`<profile>/bin/hello`, target present in the rootfs.
+
+- **VR#1 (positive depends on the FHS layout):** set `td-app-fhs-image`'s
+  `#:symlinks '()` (no /usr/bin/hello). Result: `FHS-POS -> (1 . "executable file
+  /usr/bin/hello not found")`, assertion *"FHS app image: /usr/bin/hello resolves
+  and runs"* **FAILED** (1 unexpected failure); the control still passed. Reverted.
+  Proves the positive is not a vacuous pass — it requires the symlink.
+- **VR#2 (discriminator really tests the plain rootfs):** pointed `fhs-ctrl` at
+  the FHS rootfs (where /usr/bin/hello exists). Result: `FHS-CTRL -> (0 . "Hello,
+  world!")`, assertion *"the SAME /usr/bin/hello arg fails on the plain
+  store-layout rootfs (FHS discriminates)"* **FAILED**; the positive still passed.
+  Reverted. Proves the discriminator genuinely checks that the plain (store-layout)
+  rootfs lacks /usr/bin/hello.
+
+Both reverts restored the exact green source (no leftover markers; grep clean).
+
+### Status
+
+- **S1+S2 DONE** (acceptance floor met: the §7.1 behavioral assertion green +
+  reproducible). Ready to commit + land.
+- **S3 (foreign-interpreter binary)** — optional strengthening; evaluate after S1+S2
+  lands. S1+S2 is the defensible landing point.
