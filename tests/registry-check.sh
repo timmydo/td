@@ -41,7 +41,13 @@ pub=${TD_PUBKEY:?}; gens=${TD_GENS:?}
 failures=0
 fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 
-scratch=$(mktemp -d)
+# Scratch on DISK (repo root, bind-mounted), NOT the sandbox /tmp tmpfs: the
+# negative controls below cp -r the whole registry THREE times, which overflows
+# the container tmpfs on a small-RAM host (the PR #8 / oci-load lesson; surfaced
+# on the hosted CI runner). Unlike its siblings the `registry` rung passes no
+# TMPDIR, so this script anchors its own scratch under the disk-backed worktree.
+scratch="$PWD/.registry-check-scratch"
+rm -rf "$scratch"; mkdir -p "$scratch"
 trap 'rm -rf "$scratch"' EXIT
 
 sha256_of() { # FILE -> hex on stdout

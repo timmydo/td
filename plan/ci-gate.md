@@ -426,3 +426,19 @@ Risks / open questions:
     rung's assertion (without it the rung can't even run); does NOT weaken it.
     The probe's INPUT closure stays exported so the userns build is offline.
     Only "must be invalid in host" precondition in the suite (grep-verified).
+  * Run 7 (ea4306c): rootless + oci-load PASSED; validate reached the
+    `registry` rung (~25 min in) and red'd — but the real error was ENOSPC,
+    not the rung: `cp: error writing '/tmp/tmp.XXX/tampered/...': No space
+    left on device`. registry-check.sh `mktemp -d`s on the sandbox /tmp tmpfs
+    and cp -r's the whole registry THREE times (unsigned/tampered/forged
+    negative controls) — overflows the 16G runner's tmpfs (a dev box's bigger
+    RAM absorbs it). Same class as PR #8 (scratch off tmpfs). EVERY sibling
+    heavy rung's Makefile passes TMPDIR=$(CURDIR)/.X-scratch (disk); the
+    `registry` AND `verify-place` rungs are the two that DON'T, so both their
+    check scripts (registry-check.sh, verify-place-check.sh — both do big
+    cp -r) land scratch on tmpfs. Fix (non-spine, in tests/): both scripts
+    anchor their own scratch under the disk-backed repo root
+    ($PWD/.{registry,verify-place}-check-scratch) instead of mktemp /tmp, so
+    they no longer assume the caller set TMPDIR; gitignored. Verified locally:
+    ./check.sh registry and ./check.sh verify-place both PASS (exit 0) with
+    disk scratch, all negative controls intact.
