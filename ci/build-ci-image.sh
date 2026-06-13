@@ -83,12 +83,19 @@ test -n "$channel_out" || { echo "FATAL: no channel instance output" >&2; exit 1
 # --check rungs compare runner-vs-runner). Why: the pinned guix's docker
 # builder packs tars in READDIR ORDER (guix/docker.scm never passes #:tar to
 # tar-base-options, so --sort=name is dropped) — filesystem-dependent bytes
-# (btrfs dev box vs ext4 runner), an UPSTREAM defect td cannot patch without
-# forking the builder (future work; human-signed accommodation 2026-06-12,
-# see plan/ci-gate.md). Everything embedding such a tarball is excluded too:
+# (ext4's htree order varies with the per-mkfs hash seed, so two runners
+# diverge; btrfs dev box vs ext4 runner likewise), an UPSTREAM defect td
+# cannot patch without forking the builder (future work; human-signed
+# accommodation 2026-06-12, see plan/ci-gate.md). This covers BOTH `guix pack
+# -f docker` shapes: the system `docker-image.tar.gz` AND the `td-app-*`
+# OCI app images (tests/container.scm — same builder, same defect; surfaced
+# 2026-06-13 only once the pipeline's cross-RUNNER --check replaced the
+# dev-box-warm path). Everything embedding such a tarball is excluded too:
 # generation images (repack it), the registry (embeds gen-image layouts),
-# placed trees + rollback disk (extract gen images).
-grep -Ev -- '-(docker-image\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rollback-disk)$' \
+# placed trees + rollback disk (extract gen images). NOT the app BUNDLES:
+# they extract the tarball into a tree, which guix re-serializes NAR-sorted,
+# so they are order-independent and stay exported.
+grep -Ev -- '-(docker-image\.tar\.gz|td-app-[a-z]+\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rollback-disk)$' \
   "$work/outputs.txt" > "$work/outputs-kept.txt"
 echo "   excluded $(($(wc -l < "$work/outputs.txt") - $(wc -l < "$work/outputs-kept.txt"))) fs-order-sensitive family outputs (runner rebuilds them)"
 sort -u "$work/check-drvs.txt" "$work/outputs-kept.txt" > "$work/roots.txt"

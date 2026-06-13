@@ -392,3 +392,21 @@ Risks / open questions:
     layer, so a per-run key is self-consistent. CI-bootstrap only (not
     build-ci-image.sh, which also runs on dev boxes that have the key);
     cannot be tested locally (writes /etc/guix — host infra is immutable).
+  * Run 5 (21dde67): build-image FULLY GREEN — signing-key fix worked, image
+    built and candidate pushed. validate imported it and ran the full offline
+    ./check.sh for ~23 min, reaching the `container` rung before red:
+    `guix build: error: derivation .../td-app-badentry.tar.gz.drv may not be
+    deterministic: output differs`. Root cause: the td-app-* OCI app images
+    (tests/container.scm) are `guix pack -f docker` outputs — the SAME upstream
+    docker.scm readdir-order defect already excluded for docker-image.tar.gz,
+    just not yet in the exclusion regex (it only surfaced now that the
+    pipeline's cross-RUNNER --check replaced the dev-box-warm path; ext4 htree
+    order varies with the per-mkfs hash seed, so two runners diverge). Fix:
+    extend build-ci-image.sh's exclusion to `td-app-[a-z]+\.tar\.gz` (the three
+    app images: hello, badentry, cgroup) — same 2026-06-12 signed-off
+    accommodation, same defect, NOT the app bundles (they extract the tarball
+    to a NAR-sorted tree → order-independent → stay exported). No rung weakened:
+    the container rung still runs --check on the runner, now runner-self-
+    consistent (build then check on one fs) exactly as the docker-image
+    exclusion already makes the oci/manifest-check rungs. Regex verified
+    locally against representative output names.
