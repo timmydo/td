@@ -29,7 +29,7 @@ edits** (track files don't carry it).
 - [x] **td-builder** — DONE 2026-06-11 (S4 claude-fable-8ebb4e: the §7.1 acceptance differential — td-builder rebuilds the system qcow2 image drv daemon-equal on path/NAR-hash/size/83-refs/deriver, GREEN at S3 sandbox parity, no chroot growth needed; verified-red ×3 at distinct S4 asserts; S1-S3 claude-fable-49b6d6/a03d13/696a4e) — `plan/td-builder.md`
 - [x] **ci-gate** — DONE claude-fable-52ceb1 2026-06-12 (hosted-runner gate landed: unmodified ./check.sh fed by the CI store image; 8 live-run iterations fixed build users, host-guix shim, sandbox-tmpfs scratch, du sizing — and exposed the upstream docker readdir-order defect, excluded by sign-off; `check` becomes required when ci-image-pipeline publishes the image and inherits verified-red + --require-runner-check) — `plan/ci-gate.md`
 - [x] **check-memo** — DONE claude-fable-580472 2026-06-12 (verdict memoization live on all 11 reproducibility `--check` legs/19 drvs; unchanged-tree floor 440s→145s; permanent `memo` rung asserts the discipline every loop; verified-reds on record; offline/rootless stay direct per the constraint-6 boundary) — `plan/check-memo.md`
-- [ ] **ci-image-pipeline** — approved 2026-06-12, unclaimed (pipeline builds+pushes the CI store image; repo-wide pipeline-artifact policy) — design notes in `plan/ci-gate.md`
+- [ ] **ci-image-pipeline** — claimed claude-fable-52ceb1 2026-06-13 (workflow builds the image, pushes candidate via GITHUB_TOKEN to the repo namespace, full-check-validates, retags :<pin>) — design notes in `plan/ci-gate.md`
 
 ## The loop (reminder)
 
