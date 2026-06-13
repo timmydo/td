@@ -31,6 +31,13 @@ edits** (track files don't carry it).
 - [x] **check-memo** — DONE claude-fable-580472 2026-06-12 (verdict memoization live on all 11 reproducibility `--check` legs/19 drvs; unchanged-tree floor 440s→145s; permanent `memo` rung asserts the discipline every loop; verified-reds on record; offline/rootless stay direct per the constraint-6 boundary) — `plan/check-memo.md`
 - [x] **ci-image-pipeline** — DONE claude-fable-52ceb1 2026-06-13 (workflow builds the CI store image, pushes a candidate via GITHUB_TOKEN to the repo namespace, validates it with the unmodified offline ./check.sh on a fresh runner, retags :<pin>+:latest on main events only; green end to end on PR #14 run 27467579944 — build-image + validate PASS, promote skipped on the PR; 9 live-run iterations fixed build users, host-guix shim, signing key, tmpfs scratch, du sizing, and excluded the import-incompatible outputs — docker-pack fs-order families (sign-off), the rootless probe, and the deriver oracles — so the runner rebuilds them fresh; post-merge human steps: make the ghcr package public on first promote, then --require-runner-check) — design notes in `plan/ci-gate.md`
 - [x] **ts-frontend** — DONE claude-fable-3ca5dd 2026-06-13 (Phase 1 of §5 move-off-Guile: TypeScript spec surface lowering to the frozen oracle's drvs; charter landed #15. §7.1 ACCEPTANCE MET (3 rungs): `ts` (pinned tsc type-checks + emits v0 spec, vr×3), `ts-eval` (pure-Rust boa evaluator — vendored offline/hash-pinned, --check reproducible, curated global removes Date/denies Math.random + 5 hermetic I/O-rejection probes, vr×3), `ts-diff` (TS v0 spec → tsc→boa→config→td-config lowers store-path-equal to system/td.scm; perturbation diverges, vr×2). Decisions (human 2026-06-13): boa vendored as a pinned input; tsc does the transpile (swc CLI is a stub). pkg/storeRef deferred — not needed for the scalar v0 system) — `plan/ts-frontend.md`
+- [ ] **corpus-independence** — claimed claude-fable-4a2e33 2026-06-13 (Phase 2 of §5
+  move-off-Guile, graduated from §6 to §7.1 — human go-ahead 2026-06-13. CORPUS axis:
+  td's OWN recipes vs the Guix corpus, Guix as oracle, toolchain/build-system retired
+  last. POC: `system/td-corpus.scm` authors GNU hello from upstream coordinates without
+  importing `(gnu packages …)`; the `corpus-diff` rung proves it lowers store-path-equal
+  to the corpus `hello` while a perturbed recipe diverges; the `corpus` rung builds +
+  `--check`s it NAR-hash-equal to the oracle) — `plan/corpus-independence.md`
 
 ## The loop (reminder)
 
