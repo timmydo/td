@@ -315,19 +315,47 @@ spec-approval gate; the two checkpoints below remain the only substance gates):
 
 Standing posture decisions; naming them prevents surprises.
 
-- **Guile.** Embrace it; the typed front-end compiles down to gexps (§2.2).
+- **Spec language — moving off Guile is now a goal** *(decided 2026-06-12,
+  human — §4.3 gate-1 roadmap addition; supersedes the former "embrace
+  Guile").* The destination is a general-purpose, popular surface language —
+  **TypeScript** — for package/system specs, evaluated hermetically and
+  lowering to drvs. Guile/gexps are no longer the destination, only the
+  **migration lowering target and differential oracle**: a TS spec is correct
+  iff it lowers to a store path NAR-hash-equal to the frozen `system/td.scm`
+  (§2.5) — exactly the discipline that already guards `td-typed`. The Guile
+  oracle is retired LAST, after surface and corpus are off it, because it is
+  the equivalence check protecting the migration. Phase 1 is the `ts-frontend`
+  track (§7.1): TS→JS via swc, evaluated by an embedded **boa** engine
+  (pure-Rust, in-process inside td-builder's sandbox), ambient I/O removed and
+  clock/randomness neutered, with lowering builtins (corpus lookup, store-path
+  dependency capture) as Rust native functions. Evaluator rationale (boa vs
+  javy) and the hermetic-eval design: `plan/ts-frontend.md`.
 - **Rust toolchain** *(decided 2026-06-11)*. Rust is the approved vehicle for
   td-builder (§7.1). Building the toolchain from source is a **non-goal** right
   now: the host store may be warmed with substitutes for the pinned channel's
   Rust closure. The loop itself stays offline/no-substitutes as ever — warm
   store in, nothing fetched inside.
-- **Package collection** *(standing posture, stated with the td-builder
-  approval 2026-06-11)*. The pinned channel's package definitions remain a
-  source-level **input** — Guix as a package-definition corpus pinned by
-  `channels.scm`, not a runtime system dependency once the §6-parked swaps
-  land. Re-deriving a bootstrap chain (a Mes-style full-source bootstrap) or
-  package set is a non-goal — for every toolchain, not just Rust (human,
-  2026-06-11); revisit only by roadmap addition (§4.3 gate 1).
+- **Package collection — corpus + runtime independence is now a goal**
+  *(re-decided 2026-06-12, human — the roadmap addition the prior posture
+  invited).* The prior posture (Guix as a pinned corpus input, re-derivation a
+  non-goal) is superseded: td will own its own package/system specs and depend
+  on **no general-purpose Linux distro** (Guix, Nix, Debian, …) at corpus or
+  runtime level. Independence is source-level on *upstream projects*, not from
+  scratch: td writes its own *recipes* pulling upstream *source* (kernel.org,
+  GNU, …) — replacing the distro's packaging, not the software. Two bounds keep
+  this from boiling the ocean and stay **non-goals**:
+  - **General-purpose comprehensiveness.** The corpus is td's *target closure*
+    — an appliance/image OS, Yocto/Buildroot scale (hundreds of packages), NOT
+    a Nixpkgs-scale general distro.
+  - **Full-source bootstrap.** The seed/first toolchain stays **external** —
+    pulled as a pinned fixed-output input (an upstream binary, or even a Guix
+    bootstrap seed, is fine); stage0/Mes-style re-derivation remains out (human,
+    2026-06-12). "No distro dependency" governs what td *builds and runs*, not
+    where the first byte came from.
+
+  Phase 1 (`ts-frontend`, §7.1) replaces the spec *language* and keeps reading
+  the pinned corpus underneath; corpus replacement is Phase 2, separately gated
+  (§6).
 - **Free-software posture** *(relaxed to non-goal 2026-06-11, human)*. Strict
   FSDG purity is a **non-goal**. The pinned channel remains the default source
   (and happens to be FSDG-clean today), but nonfree inputs — firmware, blobs,
@@ -362,7 +390,18 @@ annotated.
   §7.1; td-check inherits that policy and its constraints unchanged.)
 - **Evaluator as a library** (follow-on to td-builder): drive gexp→drv lowering
   from td code so the `guix` CLI exits the loop; differential = identical
-  `.drv` hashes both ways. Guile and gexps stay (§2.2, §5).
+  `.drv` hashes both ways. (Under the 2026-06-12 §5 goal, Guile/gexps are the
+  migration lowering target driven by the `ts-frontend` surface, not the
+  permanent destination.)
+- **Corpus independence** (Phase 2 of the §5 move-off-Guile goal; follow-on to
+  `ts-frontend`): replace the pinned Guix corpus with td's own recipes for its
+  target closure, pulling upstream source directly, so td depends on no
+  general-purpose distro at corpus level. Bounded by the §5 non-goals
+  (appliance-scoped, no full-source bootstrap, seed external). Differential
+  during migration: a td-recipe-built package is NAR-hash-equal (or
+  behaviorally equal where a recipe legitimately differs) to the Guix-built
+  one, Guix as the oracle until it is retired last. Graduates to §7.1 by a
+  separate roadmap addition (§4.3 gate 1) once `ts-frontend` lands.
 - **Loop tooling convergence** (follow-on): td-builder's sandbox replaces
   `guix shell -C` in `check.sh` — the north star's "one sandbox stack spanning
   build and run" made literal. Restructures the loop, so §4.3 gate 2 applies
@@ -508,6 +547,25 @@ run concurrently):
   documented with explicit human sign-off. (Documented exception under this
   policy: CI store images v1–v3 were dev-box-built and hand-pushed during
   ci-gate bring-up — signed off 2026-06-12, retired by this entry.)
+- **ts-frontend** *(approved 2026-06-12 — §4.3 gate-1 roadmap addition; the
+  first step of the §5 move-off-Guile goal)* — Phase 1 of the spec-language
+  migration: a **TypeScript** surface for td's system/package specs, evaluated
+  hermetically and lowering to drvs, with the frozen Guile oracle unchanged as
+  the differential (§2.5). Pipeline: TS→JS via swc, evaluated by an embedded
+  **boa** engine (pure-Rust, in-process, run inside td-builder's existing
+  user-namespace sandbox); the global is stripped to a curated set (no
+  `fetch`/`fs`/`process`, `Date` removed, `Math.random` denied) so eval is
+  deterministic and offline by construction; lowering builtins — corpus package
+  lookup and `storeRef` (the gexp `#$`-style single-source dependency capture:
+  store path + input edge in one Rust fn) — are boa native functions.
+  Acceptance: a TS spec for the v0 system lowers to a system derivation
+  NAR-hash-equal to `system/td.scm` (the same convergence `tests/typed-diff.scm`
+  proves for `td-typed`), run as a self-discriminating rung; a perturbed TS spec
+  diverges (verified-red); and a spec that attempts I/O (network/fs/clock/
+  randomness) is rejected by the hermetic evaluator (verified-red by a probe
+  spec that must fail). Scope is the spec *language* only — corpus replacement
+  is Phase 2 (§6), and this track keeps reading the pinned corpus underneath.
+  The curated-global design and the swc/`tsc` build steps: `plan/ts-frontend.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
