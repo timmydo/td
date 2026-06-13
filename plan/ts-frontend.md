@@ -4,8 +4,11 @@ Track: **ts-frontend** (DESIGN §7.1, approved 2026-06-12 — §4.3 gate-1).
 Claim: claude-fable-3ca5dd, 2026-06-13 (took over from claude-fable-87a496, who
 chartered the track in #15 — now merged — and stopped at "implementation pending";
 no implementation PR was open, so the track was re-claimed cleanly from main).
-Status: **IMPLEMENTING** — charter landed in #15; sub-task 1 (swc transpile) in
-progress. Single writer: the claiming agent.
+Status: **ACCEPTANCE MET** — charter landed in #15; sub-tasks 1-3 + 4/5 done; the
+§7.1 acceptance (TS v0 spec lowers store-path-equal to system/td.scm; perturbation
+diverges; I/O rejected) is green via the `ts`, `ts-eval`, and `ts-diff` rungs.
+`pkg`/`storeRef` deferred (not needed for the scalar v0 system — see progress log).
+Single writer: the claiming agent.
 
 ## Decision log (binding for this track)
 
@@ -155,6 +158,35 @@ A self-discriminating differential rung (modeled on `tests/typed-diff.scm`):
   expression (`1+1`) in the must-fail set reds ("network probe was ALLOWED ⇒ 2").
   GREEN in-sandbox.
 
+- **Sub-tasks 4+5 — the lowering differential (`ts-diff` rung): DONE 2026-06-13.
+  §7.1 ACCEPTANCE #1/#2 MET.** The capstone: the full pipeline end to end. The
+  evaluator gained a `system()` builtin (curated-global prelude) that captures
+  the declared spec; td-ts-eval emits it as JSON (falling back to the bare eval
+  result, so the ts-eval rung's `1+2*3⇒7` still holds). The TS dialect
+  (`tests/ts/td-spec.d.ts`) was widened to the full SCALAR `td-config` field set
+  (camelCase ↔ kebab); `spec-v0.ts` carries the exact td-config defaults and
+  `spec-perturbed.ts` flips sshPort→2222. `tests/ts-emit.sh` transpiles (tsc) +
+  evaluates (boa) a spec to its config JSON; `tests/ts-diff.scm` maps that JSON
+  to a `td-config`, lowers via `td-config->operating-system`, and diffs the
+  system derivation against the frozen `system/td.scm` oracle — the SAME
+  convergence `tests/typed-diff.scm` proves for the Guile typed front-end, now
+  driven from TypeScript. New `ts-diff` rung (Makefile + HEAVY_RUNGS).
+  - GREEN in-sandbox: v0 spec lowers to the oracle's `…-system.drv` exactly;
+    perturbed diverges. Verified-red ×2 via the bridge: a default that does not
+    match the oracle reds the converge leg; an unperturbed perturbation reds the
+    discriminate leg (vacuous). Control green.
+  - This satisfies acceptance #1 (NAR/store-path-equal to `system/td.scm`) and #2
+    (perturbation diverges); #3 (hermetic I/O rejection) is the `ts-eval` rung's
+    section (5). **SCOPE NOTE on `pkg`/`storeRef`:** the charter ladder named
+    boa-native `pkg`/`storeRef` builtins for sub-task 4, but the v0 SYSTEM spec
+    is all scalars — its manifest/generation/persistent-paths default inside
+    `td-config` (Guile), so NO package-graph resolution happens in the TS layer
+    and the acceptance is met without them. `pkg`/`storeRef` become necessary
+    only when the TS spec DRIVES the manifest/packages (a later refinement,
+    still on the §5 path); deferred and noted, not skipped — the §7.1 acceptance
+    as written is fully met. The Guile/gexp layer stays the lowering target, as
+    the charter intends (DESIGN §5).
+
 ## Sub-task ladder (write the test first; verify red before trusting green)
 
 1. ~~swc~~ **tsc** TS→JS transpile + a **`tsc` type-check rung** (pinned, offline)
@@ -169,9 +201,12 @@ A self-discriminating differential rung (modeled on `tests/typed-diff.scm`):
 3. Hermetic-eval rung: a spec touching `Math.random`/fs is rejected. (Verified-red
    per acceptance #3.) — **DONE** (`ts-eval` rung section (5); see progress log).
 4. `pkg`/`storeRef` builtins; lower a minimal fragment; compare one drv to the
-   oracle's.
+   oracle's. — **DEFERRED** (not needed for the v0 SCALAR system spec; see the
+   progress log scope note. The `ts-diff` rung lowers the full v0 system via the
+   config bridge instead.)
 5. Full v0 system spec → NAR-hash-equal to `system/td.scm` (acceptance #1);
-   perturbation diverges (acceptance #2).
+   perturbation diverges (acceptance #2). — **DONE** (`ts-diff` rung; acceptance
+   #1/#2 met, verified-red ×2). #3 (hermetic I/O rejection) DONE in `ts-eval`.
 
 ## Exclusive-landing note
 
