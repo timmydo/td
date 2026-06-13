@@ -92,8 +92,8 @@ endef
 # still pass, and make (run without -k) stops spawning new rungs after a
 # failure — a red still short-circuits the loop. Order-only (|) prerequisites,
 # so a plain serial `make -j1 check` behaves exactly as before.
-CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
-HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff
+CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff corpus-diff
+HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus
 
 .PHONY: check container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
@@ -170,6 +170,21 @@ manifest-diff:
 generation-diff:
 	@echo ">> generation-diff: each generation gets a distinct, selectable root (M10.1)"
 	$(GUIX) repl $(LOAD) tests/generation-diff.scm
+
+# corpus-independence (DESIGN §7.1, Phase 2 of the §5 move-off-Guile goal). Cheap,
+# derivation-level, self-discriminating like the diffs above, but on the CORPUS axis
+# (where a package definition comes from) rather than the SURFACE axis: td's OWN
+# recipe (system td-corpus) — GNU hello reconstructed from upstream coordinates,
+# importing no `(gnu packages …)` — is lowered next to the pinned corpus's own
+# `hello` (the §2.5 oracle) and the derivations diffed. (a) td-hello is a distinct
+# object (not the corpus var re-exported), (b) it CONVERGES on the oracle drv, (c) a
+# perturbed recipe (one wrong byte in the upstream source hash) DIVERGES. Compared
+# `#:graft? #f` so it never realises a build — sub-second, fails fast. The matching
+# BUILD + --check is the heavy `corpus` rung. Run as a repl SCRIPT so `(exit)` is
+# the rung's status.
+corpus-diff:
+	@echo ">> corpus-diff: td's own recipe lowers to the same drv as the corpus oracle; a perturbed recipe diverges (corpus-independence)"
+	$(GUIX) repl $(LOAD) tests/corpus-diff.scm
 
 # ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
 # `tsc` (the pinned td-typescript input, run under the packaged node) BOTH
