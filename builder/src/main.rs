@@ -21,6 +21,7 @@ mod nar;
 mod sandbox;
 mod scan;
 mod sha256;
+mod store;
 mod sys;
 
 use std::path::Path;
@@ -105,6 +106,32 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // evaluator-as-library (sub-task 3): compute a `.drv`'s OWN store path
+        // from its content + references (inputDrvs ∪ inputSrcs), the daemon's
+        // makeTextPath. Prints the computed path; the rung compares it to the real
+        // one. Proves nix-base32 + make-store-path match guix.
+        Some("drv-path") if args.len() == 3 => {
+            let file = &args[2];
+            let run = || -> Result<String, String> {
+                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let name = store::name_from_store_path(file)
+                    .ok_or_else(|| format!("{file} is not a store path"))?;
+                let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
+                refs.extend(d.input_srcs.iter().cloned());
+                Ok(store::drv_store_path(&name, &bytes, &refs))
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-path {file}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // S3b/S3c — execute the drv in the userns sandbox and register the
         // outputs. CLOSURE is a file listing every store path the build may
         // see, one per line; writes land under SCRATCH/newstore and the v1
