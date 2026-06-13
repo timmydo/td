@@ -12,3 +12,6 @@
 # check-memo verdicts (plan/check-memo.md constraint 2): host-local state,
 # NEVER committed — a verdict greens only the environment that recorded it.
 .check-verdicts/
+
+# CI store image staging (ci/build-ci-image.sh default workdir; ~65G).
+.ci-image-work/

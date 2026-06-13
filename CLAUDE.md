@@ -124,10 +124,11 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
   be sequenced (e.g. exclusive landings stacked behind another PR). If main moved
   before the merge, repeat from (1) — auto-merge does not waive the rebase + full
   re-check obligation. Opening a PR with a locally-red or un-run `./check.sh` is a
-  contract violation — CI verifies your run, it does not replace it. The
-  self-hosted runner's `./check.sh` check becomes required once the `ci-gate`
-  track's runner is live (DESIGN §7.1); until then `lint` is the required check
-  and step 2 is the only full-loop gate.
+  contract violation — CI verifies your run, it does not replace it. The hosted
+  runner's full `./check.sh` check (fed by the CI store image —
+  `ci/build-ci-image.sh`) becomes required once the image is published (DESIGN
+  §7.1); until then `lint` is the required check and step 2 is the only
+  full-loop gate.
 - **Exclusive landings:** changes to the shared spine — `system/td.scm` (frozen
   oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
   everyone. Announce in your track file, land as small standalone PRs, expect
