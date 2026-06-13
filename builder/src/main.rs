@@ -194,6 +194,33 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-drv-build (sub-task 2): like drv-emit, but WRITE the constructed `.drv`
+        // to OUT (so the td-builder executor can build it). Prints the computed store
+        // path. The end-to-end rung then builds OUT in the td-builder sandbox.
+        Some("drv-emit-to") if args.len() == 4 => {
+            let (oracle, out_file) = (&args[2], &args[3]);
+            let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
+            let run = || -> Result<String, String> {
+                let bytes = std::fs::read(oracle).map_err(|e| e.to_string())?;
+                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let drv_name = store::name_from_store_path(oracle)
+                    .and_then(|n| n.strip_suffix(".drv").map(str::to_string))
+                    .ok_or_else(|| format!("{oracle} is not a .drv store path"))?;
+                let (path, content) = store::construct_drv(&d, &drv_name, &read)?;
+                std::fs::write(out_file, content.as_bytes()).map_err(|e| e.to_string())?;
+                Ok(path)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-emit-to {oracle}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // S3b/S3c — execute the drv in the userns sandbox and register the
         // outputs. CLOSURE is a file listing every store path the build may
         // see, one per line; writes land under SCRATCH/newstore and the v1
@@ -204,6 +231,28 @@ fn main() -> ExitCode {
             let run = || -> Result<(), String> {
                 let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
                 let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                // The deriver recorded is the .drv's OWN store path. For a
+                // store-path input that is drv_path; for an emitted .drv handed in
+                // from outside the store (td-drv-build builds the file td wrote),
+                // compute its content-addressed store path so the registration
+                // matches the daemon's recorded deriver.
+                let deriver = if drv_path.starts_with(store::STORE_DIR) {
+                    drv_path.to_string()
+                } else {
+                    let out0 = parsed
+                        .outputs
+                        .first()
+                        .ok_or_else(|| "derivation has no outputs".to_string())?;
+                    let drv_name = format!(
+                        "{}.drv",
+                        store::name_from_store_path(&out0.path)
+                            .ok_or_else(|| "output is not a store path".to_string())?
+                    );
+                    let mut refs: Vec<String> =
+                        parsed.input_drvs.iter().map(|(p, _)| p.clone()).collect();
+                    refs.extend(parsed.input_srcs.iter().cloned());
+                    store::drv_store_path(&drv_name, &bytes, &refs)
+                };
                 let closure: Vec<String> = std::fs::read_to_string(closure_file)
                     .map_err(|e| e.to_string())?
                     .lines()
@@ -233,7 +282,7 @@ fn main() -> ExitCode {
                     for r in &refs {
                         record.push_str(&format!("reference {r}\n"));
                     }
-                    record.push_str(&format!("deriver {drv_path}\n\n"));
+                    record.push_str(&format!("deriver {deriver}\n\n"));
                     println!("OUT={name} {store_path}");
                 }
                 std::fs::write(Path::new(scratch).join("registration"), record)
