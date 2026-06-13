@@ -290,24 +290,25 @@ Drive from the §7.1 roadmap: one agent drives the next mainline milestone; othe
 agents take side-tracks in parallel. Every agent states its sub-task and names or
 writes its test before writing implementation.
 
-### 4.3 Human checkpoints *(streamlined 2026-06-10; PR review gate added 2026-06-11)*
+### 4.3 Human checkpoint *(simplified 2026-06-13)*
 
-Two things require human sign-off on a change's *substance*; everything else on the
-roadmap — including security-flavored milestones, `channels.scm` bumps, and oracle
-re-baselines — merges on green via the §7.2 landing protocol. (Since 2026-06-11 that
-protocol routes every landing through a PR with a mandatory human approval — a
-per-landing review of the *diff*, not a return of the retired per-milestone
-spec-approval gate; the two checkpoints below remain the only substance gates):
+This is a one-maintainer project, so the process is one gate: **the PR is the
+proposal, and the human's PR approval is the sign-off.** Every landing already routes
+through a branch-protected PR with a mandatory review of the *diff* (§7.2), and that
+single review approves everything — new work, scope, `channels.scm` bumps, oracle
+re-baselines, and changes that loosen or restructure an existing rung. You do **not**
+need a written proposal, a roadmap entry, or any pre-approval before building: build
+the smallest correct increment on a branch and open the PR.
 
-1. **Roadmap additions.** New tracks or milestones enter §7.1 only with human
-   approval. Approving an entry's acceptance test *is* the spec-correctness review,
-   so it happens once, up front, instead of per-milestone.
-2. **Weakening the loop.** Any change that removes, loosens, skips, or restructures
-   away an existing rung or assertion in `check.sh`, the `Makefile`, or `tests/`
-   requires explicit human sign-off, regardless of justification. Adding or
-   strengthening rungs and assertions is always free.
+The one thing never to do *silently*: remove, loosen, skip, or restructure away an
+existing rung or assertion (in `check.sh`, the `Makefile`, or `tests/`) and slip it
+past review. Call it out plainly in the PR so the human approves it knowingly. Adding
+or strengthening rungs is always free. The correctness directives in CLAUDE.md
+(reproducibility, hermeticity, differential-before-replace, the state boundary) are
+not bureaucracy and still hold.
 
-(The retired per-milestone sign-off gate and its dates: `HISTORY.md`.)
+(The retired per-milestone and roadmap-addition sign-off gates and their dates:
+`HISTORY.md`.)
 
 ---
 
@@ -404,17 +405,15 @@ annotated.
 
 ## 7. Roadmap and parallel work *(added 2026-06-10)*
 
-This section replaces the per-milestone sign-off gate. It exists so multiple agents
-can work long-running tasks concurrently and validate their own work, with the human
-out of the loop except for the two §4.3 checkpoints.
+This section exists so multiple agents can work long-running tasks concurrently and
+validate their own work, with the human's gate being the per-PR review (§4.3).
 
-### 7.1 The approved roadmap
+### 7.1 Roadmap *(descriptive, not a gate)*
 
-Approved by the human 2026-06-10 — that approval is the §4.3 spec review for every
-entry below. Agents implement these without further sign-off. Status lives in
-`PLAN.md`; per-track working state in `plan/<track>.md`. Adding an entry requires
-human approval; *refining* an entry's design inside its track file does not, so long
-as the acceptance test stated here is met or strengthened.
+A running list of in-flight and planned work, kept for coordination — **not** a
+prerequisite. You may build something that isn't listed here; the PR review is the
+approval (§4.3). Status lives in `PLAN.md`; per-track working state in
+`plan/<track>.md`. Add or refine entries freely as work evolves.
 
 **Mainline** (serial — each builds on the last; one agent drives it at a time):
 
