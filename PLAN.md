@@ -46,6 +46,12 @@ edits** (track files don't carry it).
   rung proves it structurally (builder=`td-builder`, not `guile`), reproducibly
   (`--check`), and behaviorally (byte-identical to the corpus hello) at a distinct
   path) — `plan/corpus-independence.md`
+- [ ] **evaluator-as-library** — claimed claude-fable-4a2e33 2026-06-13 (graduated §6→
+  §7.1, human go-ahead 2026-06-13. Remove Guile from `.drv` CONSTRUCTION: td-builder
+  (Rust) emits a `.drv` byte-identical — store path AND bytes — to guix's `derivation`
+  for the `td-build` hello spec; guix is the oracle; reuses the crate's ATerm parser +
+  SHA-256, adds the serializer + `nix-base32`/`make-store-path` + `hashDerivationModulo`.
+  Input resolution stays Guix's, toolchain retired last) — `plan/evaluator-as-library.md`
 
 ## The loop (reminder)
 
