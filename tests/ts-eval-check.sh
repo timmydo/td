@@ -46,4 +46,31 @@ got="$(evaljs 'Math.max(1,4,2)')"
 test "$got" = "4" || { echo "FAIL: Math.max broke (got '$got') — curation over-reached; a vacuous all-throws global would falsely green (3)." >&2; exit 1; }
 echo "   ok: Math.max(1,4,2) => 4"
 
-echo "PASS: boa evaluates JS; the curated global removes the clock and denies randomness while leaving Math otherwise intact (hermetic, deterministic)."
+# --- (5) HERMETIC PROBES (DESIGN §7.1 acceptance #3) --------------------------
+# A spec attempting I/O — network / fs / clock / randomness — must be REJECTED
+# by the evaluator. Each probe MUST fail (the evaluator exits nonzero) AND fail
+# for the right reason (the named global is absent or denied), so an unrelated
+# error cannot green a probe. boa ships no fetch/fs/process/web APIs, and the
+# curated prelude removes the clock + denies randomness; this asserts all of
+# that as one I/O-rejection gate. The positive control is legs (1)/(4) above —
+# benign code DOES evaluate — so this is not the vacuous "everything throws".
+echo ">> (5) hermetic probes: every I/O attempt is rejected (network/fs/clock/randomness)"
+# label | probe JS | substring the failure message must contain
+probes='clock|new Date()|Date is not defined
+randomness|Math.random()|Math.random is denied
+network|fetch("http://example.invalid")|fetch is not defined
+filesystem|require("fs")|require is not defined
+process|process.exit(0)|process is not defined'
+
+printf '%s\n' "$probes" | while IFS='|' read -r label js want; do
+  test -n "$label" || continue
+  if out="$(printf '%s' "$js" | "$TD_TS_EVAL" 2>&1)"; then
+    echo "FAIL: $label probe was ALLOWED — \`$js\` evaluated to '$out'; the evaluator is not hermetic." >&2
+    exit 1
+  fi
+  printf '%s' "$out" | grep -qF "$want" \
+    || { echo "FAIL: $label probe failed, but NOT for the expected reason (wanted '$want'): $out" >&2; exit 1; }
+  echo "   ok: $label rejected (\`$js\`)"
+done || exit 1
+
+echo "PASS: boa evaluates JS; the curated global removes the clock and denies randomness while leaving Math otherwise intact; every I/O attempt (network/fs/clock/randomness) is rejected (hermetic, deterministic)."

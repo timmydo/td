@@ -144,6 +144,17 @@ A self-discriminating differential rung (modeled on `tests/typed-diff.scm`):
   - Resolved open question: corpus-handle representation is deferred to sub-task 4
     (no builtins yet); the evaluator boundary is stdin JS → stdout value for now.
 
+- **Sub-task 3 — hermetic-eval probes (acceptance #3): DONE 2026-06-13.** Folded
+  into the `ts-eval` rung as section (5) of `tests/ts-eval-check.sh`
+  (strengthening, not a new rung): five I/O probes that must each be REJECTED for
+  the right reason — `new Date()` (clock, removed), `Math.random()` (randomness,
+  denied), `fetch(…)` (network, absent), `require("fs")` (fs, absent),
+  `process.exit(0)` (process, absent). boa ships none of fetch/fs/process; the
+  positive control is legs (1)/(4) (benign code DOES evaluate), so it is not the
+  vacuous all-throws. Verified-red: a perturbed driver that puts a benign
+  expression (`1+1`) in the must-fail set reds ("network probe was ALLOWED ⇒ 2").
+  GREEN in-sandbox.
+
 ## Sub-task ladder (write the test first; verify red before trusting green)
 
 1. ~~swc~~ **tsc** TS→JS transpile + a **`tsc` type-check rung** (pinned, offline)
@@ -156,7 +167,7 @@ A self-discriminating differential rung (modeled on `tests/typed-diff.scm`):
    place. (Verify red: leave `Date` present, assert it is gone.) — **DONE**
    (`ts-eval` rung; see progress log).
 3. Hermetic-eval rung: a spec touching `Math.random`/fs is rejected. (Verified-red
-   per acceptance #3.)
+   per acceptance #3.) — **DONE** (`ts-eval` rung section (5); see progress log).
 4. `pkg`/`storeRef` builtins; lower a minimal fragment; compare one drv to the
    oracle's.
 5. Full v0 system spec → NAR-hash-equal to `system/td.scm` (acceptance #1);
