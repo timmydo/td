@@ -122,11 +122,51 @@ case "$TD_DIGEST_1$TD_DIGEST_2" in
 esac
 export TD_DIGEST_1 TD_DIGEST_2
 
+# --- Negative (must-FAIL-to-build) derivations. A few rungs assert that a
+# specific lowering FAILS to build: the closure-level guix-free MARKER and the
+# whole-system GATE (no-guix: DRV_ADVERSARIAL, DRV_SVCINJ_GATE), and the
+# fixed-output daemon-netns probe (offline: DRV_DAEMON — RED until the host
+# wraps guix-daemon in its own netns). Their build CLOSURES still belong in the
+# image (the hosted runner must be able to ATTEMPT them offline and observe the
+# asserted failure), so they stay on stdout like every other drv. But a
+# consumer that BUILDS the enumerated drvs to completion (the image generator's
+# realize step) must NOT REQUIRE these to succeed — the failing builder can sit
+# DEEP in a negative's input closure (the adversarial's guix-free marker is
+# embedded in its system, so even building the negative's inputs trips it), so
+# the generator builds with --keep-going and hard-checks only the positives.
+# When TD_NEGATIVE_DRVS_OUT names a file, tap those drvs into it, selected by
+# the PREFIXES the asserting Makefile rungs grep, so the generator can compute
+# positives = all-drvs minus these. The asserting rungs are the authority for
+# the prefixes; a rename trips the rung's own `could not lower` guard, and the
+# seen-all check below fails loudly here too.
+NEGATIVE_PREFIXES="DRV_ADVERSARIAL DRV_SVCINJ_GATE DRV_DAEMON"
+neg_seen=""
+if [ -n "${TD_NEGATIVE_DRVS_OUT:-}" ]; then : > "$TD_NEGATIVE_DRVS_OUT"; fi
+
 # --- Rungs with dedicated lowering scripts (print PREFIX=...drv lines).
 for s in $LOWERING_SCRIPTS; do
   [ -e "$s" ] || { echo "ERROR: $s in LOWERING_SCRIPTS does not exist" >&2; exit 1; }
   lower $GUIX repl -L . "$s"
   sed -n 's/^[A-Z0-9_]*=\(\/gnu\/store\/.*\.drv\)$/\1/p' "$tmp"
+  for np in $NEGATIVE_PREFIXES; do
+    nd=$(sed -n "s/^$np=\(\/gnu\/store\/.*\.drv\)\$/\1/p" "$tmp")
+    [ -n "$nd" ] || continue
+    neg_seen="$neg_seen $np"
+    if [ -n "${TD_NEGATIVE_DRVS_OUT:-}" ]; then printf '%s\n' "$nd" >> "$TD_NEGATIVE_DRVS_OUT"; fi
+  done
+done
+
+# Fail loudly if a known negative prefix vanished (renamed/removed): a consumer
+# that builds the enumerated drvs would otherwise try to BUILD a must-fail
+# derivation and red.
+for np in $NEGATIVE_PREFIXES; do
+  case " $neg_seen " in
+    *" $np "*) ;;
+    *) echo "ERROR: negative drv prefix '$np' was not emitted by any lowering" >&2
+       echo "  script — update NEGATIVE_PREFIXES (and the generator's realize" >&2
+       echo "  step) so must-fail derivations are still skipped at build time." >&2
+       exit 1;;
+  esac
 done
 
 # --- Marionette system tests (same two-step lowering as the Makefile recipes).

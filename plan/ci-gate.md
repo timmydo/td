@@ -333,3 +333,51 @@ Risks / open questions:
   acceptance; the workflow's image URL must flip to the repo namespace in
   that track. Every runner-environment fix and diagnostic in this PR stands
   regardless of where the image comes from.
+- 2026-06-13 claude-fable-52ceb1 (ci-image-pipeline, live runs from PR #14
+  via the workflow's pull_request trigger): two reds, both REAL pipeline
+  bugs, both fixed forward — the workflow is now getting the end-to-end test
+  the user asked for, BEFORE merge.
+  * Run 1 (745b043) RED at "realize the rung-ladder closure":
+    lower-check-drvs.sh's KNOWN_RUNGS guard fail-closed on the `memo` rung
+    (check-memo PR #12 had landed on main; the enumerator hadn't learned it).
+    The guard working as designed — it refused to ship an incomplete image.
+    Fix 7ba5b9d: add `memo` to KNOWN_RUNGS and tests/check-memo-drvs.scm to
+    LOWERING_SCRIPTS (its DRV_DET/DRV_DET2/DRV_NONDET fixtures enter the
+    closure). Additive; verified the guards pass + sed captures all three.
+  * Run 2 (7ba5b9d) RED at the same step, now exit 123 (xargs: a `guix build`
+    failed): the closure-realization `xargs guix build` tried to BUILD the
+    must-fail-to-build NEGATIVES the rungs deliberately enumerate — DRV_
+    ADVERSARIAL (no-guix embedded marker: kznhh…docker-image, the exact drv
+    in the log, "STILL contains a guix"), DRV_SVCINJ_GATE (whole-system
+    gate), DRV_DAEMON (offline FO probe in the daemon netns, RED until the
+    host isolates guix-daemon). The dev-box build-ci-image.sh never hit this:
+    it `guix archive --export -r`s input closures, never BUILDS — and the
+    dev box's store was already warm from ./check.sh (whose no-guix/offline
+    rungs build the negatives expecting failure, realizing their inputs).
+    The pipeline's separate online realize step is the only place that
+    builds, and it assumed every enumerated drv builds. VERIFIED-RED: this is
+    the live run's own exit 123 at exactly this drv.
+  * Run 3 RED, same step: my first negatives fix (build the negatives'
+    INPUT closures surgically via `guix gc --references <neg> | guix build`)
+    was insufficient — the must-fail builder for the ADVERSARIAL case is the
+    guix-free MARKER (rzlqdgxy…td-guix-free-marker-0.drv), embedded DEEP in
+    the input closure (docker-image → system → profile → marker). Building
+    the negative's inputs (system.drv) transitively requires the marker, so
+    it trips anyway. You cannot realize the adversarial's inputs without
+    building the marker, because the marker IS one of them. VERIFIED-RED: run
+    3's exit 123 on system.drv via the marker.
+    Final fix (this commit): (1) lower-check-drvs.sh taps the negatives into
+    TD_NEGATIVE_DRVS_OUT (by the prefixes the asserting rungs grep) — stdout
+    still carries them so build-ci-image's export is unchanged — with a
+    seen-all guard that fails loudly if a negative prefix is renamed; (2) the
+    realize step is TWO-PASS: pass 1 `guix build --keep-going` over ALL drvs
+    (builds each negative's closure up to its failing builder WHEREVER it
+    sits, exactly as ./check.sh's rungs do; expected non-zero tolerated),
+    pass 2 hard-builds only the POSITIVES (comm -23) as the backstop so the
+    `|| true` can mask only the expected negative failures, never a real one.
+    Faithfully replicates the dev-box warm-store state. No rung/assertion
+    touched; negatives stay asserted-red by the unchanged no-guix/offline
+    rungs in validate's ./check.sh. Verified LOCALLY against the warm store
+    before pushing: 50 drvs → 3 negatives (the kznhh… adversarial, the
+    svcinj gate, the daemon probe) → 47 positives; pass 1 returns non-zero,
+    pass 2 (all 47 positives) GREEN.
