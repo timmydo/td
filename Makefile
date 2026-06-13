@@ -53,7 +53,7 @@ endef
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-# The 24 rungs, in the two pools the bounded-parallel loop schedules from.
+# The 25 rungs, in the two pools the bounded-parallel loop schedules from.
 # ADDING A RUNG: put it in exactly ONE pool below — .PHONY, the `check` target,
 # the serial chain, and the heavy gate are all DERIVED from these two
 # variables, so the lists cannot drift apart (review finding: they used to be
@@ -93,7 +93,7 @@ endef
 # failure — a red still short-circuits the loop. Order-only (|) prerequisites,
 # so a plain serial `make -j1 check` behaves exactly as before.
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
-HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline
+HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo
 
 .PHONY: check container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
@@ -176,8 +176,8 @@ generation-diff:
 build:
 	@echo ">> build: $(SYSTEM) image ($(IMGTYPE))"
 	$(GUIX) system image $(LOAD) -t $(IMGTYPE) $(SYSTEM)
-	@echo ">> check: reproducibility of the image derivation"
-	$(GUIX) build --check \
+	@echo ">> check: reproducibility of the image derivation (verdict-memoized — tests/check-memo.sh)"
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh \
 	  $$($(GUIX) system image $(LOAD) -t $(IMGTYPE) -d $(SYSTEM))
 
 # 3. Boot + behavioral — realise the marionette test derivation. Its builder
@@ -219,8 +219,8 @@ reset:
 oci:
 	@echo ">> oci: $(SYSTEM) image (docker)"
 	$(GUIX) system image $(LOAD) -t docker $(SYSTEM)
-	@echo ">> check: reproducibility of the OCI image derivation"
-	$(GUIX) build --check \
+	@echo ">> check: reproducibility of the OCI image derivation (verdict-memoized — tests/check-memo.sh)"
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh \
 	  $$($(GUIX) system image $(LOAD) -t docker -d $(SYSTEM))
 
 # 5. M6 manifest-swap reproducibility — build a SWAPPED-manifest OCI image
@@ -245,8 +245,8 @@ manifest-check:
 	test -n "$$drv" || { echo "ERROR: could not lower the swapped OCI image derivation" >&2; exit 1; }; \
 	echo ">> swapped OCI image derivation: $$drv"; \
 	swapped_img=`$(GUIX) build "$$drv"`; \
-	echo ">> check: reproducibility of the SWAPPED OCI image derivation"; \
-	$(GUIX) build --check "$$drv"; \
+	echo ">> check: reproducibility of the SWAPPED OCI image derivation (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$drv"; \
 	echo ">> artifact check: the declared package is actually IN the built tarball"; \
 	default_img=`$(GUIX) system image $(LOAD) -t docker $(SYSTEM)`; \
 	probe() { \
@@ -296,8 +296,8 @@ generation-image:
 	gen1_img=`$(GUIX) build "$$gen1"`; \
 	gen2_img=`$(GUIX) build "$$gen2"`; \
 	base_img=`$(GUIX) build "$$base"`; \
-	echo ">> check: reproducibility of BOTH bootc generation images"; \
-	$(GUIX) build --check "$$gen1" "$$gen2"; \
+	echo ">> check: reproducibility of BOTH bootc generation images (verdict-memoized — tests/check-memo.sh; a miss runs the real --check unchanged)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$gen1" "$$gen2"; \
 	echo ">> validate artifacts (structured: guile-json metadata + guile-zlib initrd)"; \
 	scratch="$(CURDIR)/.genimg-scratch"; \
 	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
@@ -391,8 +391,8 @@ registry:
 	test -n "$$drv" || { echo "ERROR: could not lower the registry derivation" >&2; exit 1; }; \
 	echo ">> registry derivation: $$drv"; \
 	reg=`$(GUIX) build "$$drv"`; \
-	echo ">> check: reproducibility of the registry"; \
-	$(GUIX) build --check "$$drv"; \
+	echo ">> check: reproducibility of the registry (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$drv"; \
 	skopeo=`$(GUIX) build skopeo`/bin/skopeo; \
 	signify=`$(GUIX) build signify`/bin/signify; \
 	TD_REGISTRY="$$reg" SKOPEO="$$skopeo" SIGNIFY="$$signify" \
@@ -440,8 +440,8 @@ verify-place:
 	echo ">> verified placed tree derivation: $$vplace_drv"; \
 	vplace=`$(GUIX) build "$$vplace_drv"`; \
 	direct=`$(GUIX) build "$$direct_drv"`; \
-	echo ">> check: reproducibility of the verified placed tree"; \
-	$(GUIX) build --check "$$vplace_drv"; \
+	echo ">> check: reproducibility of the verified placed tree (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$vplace_drv"; \
 	echo ">> validate the verified tree (digest-form TD_IMAGES: placed identity == verified manifest digest)"; \
 	TD_PLACED="$$vplace" TD_PRESENT="1 2" TD_ABSENT="" \
 	TD_IMAGES="1=$$d1 2=$$d2" \
@@ -494,8 +494,8 @@ place:
 	echo ">> prune  tree derivation (gens 1,2,3 keep 2): $$prune_drv"; \
 	place_tree=`$(GUIX) build "$$place_drv"`; \
 	prune_tree=`$(GUIX) build "$$prune_drv"`; \
-	echo ">> check: reproducibility of BOTH placed target trees"; \
-	$(GUIX) build --check "$$place_drv" "$$prune_drv"; \
+	echo ">> check: reproducibility of BOTH placed target trees (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$place_drv" "$$prune_drv"; \
 	echo ">> validate PLACE tree (gens 1,2 present, none pruned)"; \
 	TD_PLACED="$$place_tree" TD_PRESENT="1 2" TD_ABSENT="" \
 	TD_IMAGES="1=$$img1 2=$$img2" \
@@ -534,8 +534,8 @@ rollback:
 	echo ">> rollback disk derivation:      $$disk_drv"; \
 	tree=`$(GUIX) build "$$tree_drv"`; \
 	disk=`$(GUIX) build "$$disk_drv"`; \
-	echo ">> check: reproducibility of the mkfs placed tree AND the assembled disk"; \
-	$(GUIX) build --check "$$tree_drv" "$$disk_drv"; \
+	echo ">> check: reproducibility of the mkfs placed tree AND the assembled disk (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$tree_drv" "$$disk_drv"; \
 	echo ">> validate the mkfs tree (live labeled roots via superblock, boot wiring, search line)"; \
 	TD_PLACED="$$tree" TD_PRESENT="1 2" TD_ABSENT="" TD_MKFS=1 TD_BOOT_LABEL=td-boot \
 	  $(GUIX) repl $(LOAD) tests/place-check.scm; \
@@ -606,8 +606,8 @@ no-guix:
 	echo ">> guarantee: the BARE hardened lowering must BUILD (the embedded marker certifies it guix-free)"; \
 	hardened_img=`$(GUIX) build "$$hardened_drv"`; \
 	control_img=`$(GUIX) build "$$control_drv"`; \
-	echo ">> check: reproducibility of the HARDENED (gated) artifact"; \
-	$(GUIX) build --check "$$hardened_drv"; \
+	echo ">> check: reproducibility of the HARDENED (gated) artifact (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$hardened_drv"; \
 	echo ">> artifact check: the imperative guix surface is ABSENT from the hardened image and PRESENT in the control"; \
 	probe() { \
 	  listing=`tar xzOf "$$1" --wildcards '*/layer.tar' | tar tf -` \
@@ -701,8 +701,8 @@ td-builder:
 	out=`$(GUIX) build "$$drv"`; \
 	elapsed=$$(( `date +%s` - start )); \
 	test -n "$$out" || { echo "ERROR: the td-builder build produced no output path" >&2; exit 1; }; \
-	echo ">> check: reproducibility of the td-builder binary"; \
-	$(GUIX) build --check "$$drv"; \
+	echo ">> check: reproducibility of the td-builder binary (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$drv"; \
 	echo ">> run: the compiled binary must print its sentinel"; \
 	"$$out/bin/td-builder" | grep -Eq '^td-builder [0-9.]+ ok$$' \
 	  || { echo "FAIL: the compiled td-builder did not print its sentinel (or exited nonzero) — the toolchain did not produce a working binary." >&2; exit 1; }; \
@@ -913,8 +913,8 @@ container:
 	echo ">> negative-control artifacts: badimage=$$bimg badbundle=$$bbun"; \
 	echo ">> cgroup artifacts (M9.3): cgimage=$$cimg cgbundle=$$cbun"; \
 	$(GUIX) build "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun" >/dev/null; \
-	echo ">> reproducibility: guix build --check the app images + extracted bundles (good + negative + cgroup)"; \
-	$(GUIX) build --check "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun" >/dev/null; \
+	echo ">> reproducibility: guix build --check the app images + extracted bundles (good + negative + cgroup; verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$img" "$$bun" "$$bimg" "$$bbun" "$$cimg" "$$cbun"; \
 	drv=`printf '%s\n' \
 	    '(use-modules (guix) (gnu tests) (tests container))' \
 	    '(with-store store' \
@@ -955,6 +955,106 @@ offline:
 	echo ">> re-run + reproducibility: --check forces the sandbox probe assertions to re-execute"; \
 	$(GUIX) build --check "$$sandbox_drv"; \
 	echo "PASS: a non-fixed-output builder has no network — loopback-only netns, egress raises (re-checked this run)."
+# check-memo discipline rung (DESIGN §7.1 side-track; plan/check-memo.md — the
+# §4.3 gate-2 charter with the BINDING constraints 1-6). Permanent,
+# self-discriminating exercise of the verdict-memoization helper
+# (tests/check-memo.sh) on TINY fixture drvs, so the charter's constraints are
+# asserted EVERY loop, not only in one-off verified-red runs:
+#   • wiring: TD_CHECK_ENV must be EXPORTED into the sandbox by check.sh
+#     (possibly EMPTY — empty IS the CI gate, constraint 2). The helper is
+#     then driven with SYNTHETIC identities + a scratch verdict dir + PINNED
+#     knobs (every leg sets TD_CHECK_FULL/TD_CHECK_TTL_DAYS itself), so this
+#     rung behaves identically on dev hosts, on CI, and under an ambient
+#     force-full ladder run (TD_CHECK_FULL=1 ./check.sh — caught at S3: an
+#     inherited knob turned the hit leg into a forced miss and red the rung),
+#     and never touches the real .check-verdicts state.
+#   • miss-then-record: first sight of the det fixture runs the real --check
+#     and records a verdict;
+#   • hit: the second run hits — including constraint 5's cheap assertion
+#     (outputs valid in the store DB with the verdict's NAR hashes);
+#   • changed drv (verified-red A's structural twin): a different fixture drv
+#     can never hit the first one's verdict (key = drv store path,
+#     constraint 1);
+#   • expiry (B): a verdict aged past the TTL misses (constraint 3);
+#   • future timestamp: a verdict "recorded in the future" (clock skew or a
+#     hand-edited record) misses as malformed — the TTL bound cannot be
+#     evaded by a timestamp the clock has not reached (constraint 3);
+#   • foreign environment (C): another identity misses (constraint 2);
+#   • tamper (constraint 5): a verdict whose recorded NAR hash is corrupted
+#     misses — a vanished or tampered record cannot green a hit;
+#   • force-full (constraint 4): a fresh valid verdict is BYPASSED;
+#   • empty identity: never hits and never records, even over a fresh valid
+#     verdict — the mechanism check.sh's CI gate relies on;
+#   • TTL cap (constraint 3): a TTL above 14 days is REFUSED outright;
+#   • nondet on a miss (D): a deliberately nondeterministic fixture with no
+#     verdict runs the real --check and goes RED, and no verdict is recorded
+#     — detection power is intact on every miss.
+# Cheap-side heavy rung (a handful of trivial local builds + repl calls) →
+# listed last (LPT). Scratch lives in $(CURDIR)/.memo-scratch — kept on red
+# for triage, removed on green.
+memo:
+	@echo ">> memo: --check verdict memoization — miss/hit/changed-drv/expiry/foreign/tamper/force-full/TTL-cap/nondet discipline"
+	@set -euo pipefail; \
+	test "$${TD_CHECK_ENV+set}" = set \
+	  || { echo "FAIL: TD_CHECK_ENV is not exported into the sandbox — check.sh's environment-identity computation or its --preserve wiring is broken (run via ./check.sh)." >&2; exit 1; }; \
+	drvs=`$(GUIX) repl $(LOAD) tests/check-memo-drvs.scm 2>/dev/null`; \
+	det=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_DET=//p'`; \
+	det2=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_DET2=//p'`; \
+	nondet=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_NONDET=//p'`; \
+	test -n "$$det" -a -n "$$det2" -a -n "$$nondet" || { echo "ERROR: could not lower the memo fixture drvs" >&2; exit 1; }; \
+	echo ">> fixture drvs: det=$$det det2=$$det2 nondet=$$nondet"; \
+	$(GUIX) build "$$det" "$$det2" > /dev/null; \
+	vd="$(CURDIR)/.memo-scratch"; rm -rf "$$vd"; mkdir -p "$$vd"; \
+	vf="$$vd/`basename "$$det"`.verdict"; \
+	echo ">> leg miss+record: first sight runs the real --check and records"; \
+	out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_TTL_DAYS= TD_CHECK_ENV=td-memo-env-one sh tests/check-memo.sh "$$det" 2>&1`; \
+	printf '%s\n' "$$out" | grep -q "MEMO MISS (no verdict)" || { echo "FAIL: first sight of the det fixture did not MISS with 'no verdict':" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	printf '%s\n' "$$out" | grep -q "MEMO RECORD" || { echo "FAIL: the green --check did not record a verdict:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	test -s "$$vf" || { echo "FAIL: no verdict file was written at $$vf" >&2; exit 1; }; \
+	echo ">> leg hit: a fresh same-env verdict skips the rebuild (constraint 5 DB assertion included)"; \
+	out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_TTL_DAYS= TD_CHECK_ENV=td-memo-env-one sh tests/check-memo.sh "$$det" 2>&1`; \
+	printf '%s\n' "$$out" | grep -q "MEMO HIT" || { echo "FAIL: the second sight did not HIT:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	if printf '%s\n' "$$out" | grep -q "MEMO MISS"; then echo "FAIL: the second sight MISSED despite a fresh valid verdict:" >&2; printf '%s\n' "$$out" >&2; exit 1; fi; \
+	echo ">> leg changed-drv (A): a different drv can never hit the recorded verdict"; \
+	out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_TTL_DAYS= TD_CHECK_ENV=td-memo-env-one sh tests/check-memo.sh "$$det2" 2>&1`; \
+	printf '%s\n' "$$out" | grep -q "MEMO MISS (no verdict)" || { echo "FAIL: the CHANGED drv did not miss — verdicts are not keyed by drv store path:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	echo ">> leg expiry (B): a verdict aged past the TTL misses"; \
+	sed -i 's/^recorded .*/recorded 1/' "$$vf"; \
+	out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_TTL_DAYS= TD_CHECK_ENV=td-memo-env-one sh tests/check-memo.sh "$$det" 2>&1`; \
+	printf '%s\n' "$$out" | grep -q "MEMO MISS (expired" || { echo "FAIL: an EXPIRED verdict did not miss:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	echo ">> leg future timestamp: a verdict recorded 'in the future' misses as malformed"; \
+	sed -i 's/^recorded .*/recorded 99999999999/' "$$vf"; \
+	out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_TTL_DAYS= TD_CHECK_ENV=td-memo-env-one sh tests/check-memo.sh "$$det" 2>&1`; \
+	printf '%s\n' "$$out" | grep -q "MEMO MISS (malformed verdict (bad or future timestamp))" || { echo "FAIL: a FUTURE-dated verdict did not miss — the TTL bound can be evaded by clock skew:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	echo ">> leg foreign env (C): a verdict from another environment misses"; \
+	out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_TTL_DAYS= TD_CHECK_ENV=td-memo-env-two sh tests/check-memo.sh "$$det" 2>&1`; \
+	printf '%s\n' "$$out" | grep -q "MEMO MISS (foreign environment)" || { echo "FAIL: a FOREIGN verdict did not miss:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	echo ">> leg tamper (constraint 5): a corrupted recorded NAR hash misses"; \
+	sed -i 's/^\(output out [^ ]* \)[0-9a-f]\{8\}/\1deadbeef/' "$$vf"; \
+	out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_TTL_DAYS= TD_CHECK_ENV=td-memo-env-two sh tests/check-memo.sh "$$det" 2>&1`; \
+	printf '%s\n' "$$out" | grep -q "MEMO MISS (verdict/DB mismatch" || { echo "FAIL: a TAMPERED verdict did not miss:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	echo ">> leg force-full (constraint 4): a fresh valid verdict is bypassed"; \
+	out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_TTL_DAYS= TD_CHECK_ENV=td-memo-env-two TD_CHECK_FULL=1 sh tests/check-memo.sh "$$det" 2>&1`; \
+	printf '%s\n' "$$out" | grep -q "MEMO MISS (forced full)" || { echo "FAIL: TD_CHECK_FULL=1 did not bypass a fresh valid verdict:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	echo ">> leg empty identity: no identity => never hit, never record (the CI gate's mechanism)"; \
+	out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_TTL_DAYS= TD_CHECK_ENV= sh tests/check-memo.sh "$$det" 2>&1`; \
+	printf '%s\n' "$$out" | grep -q "MEMO MISS (no environment identity)" || { echo "FAIL: an EMPTY identity did not force a miss:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	if printf '%s\n' "$$out" | grep -q "MEMO RECORD"; then echo "FAIL: a run with NO identity recorded a verdict:" >&2; printf '%s\n' "$$out" >&2; exit 1; fi; \
+	echo ">> leg TTL cap (constraint 3): a TTL above 14 days is refused"; \
+	if out=`TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_ENV=td-memo-env-two TD_CHECK_TTL_DAYS=15 sh tests/check-memo.sh "$$det" 2>&1`; then \
+	  echo "FAIL: TD_CHECK_TTL_DAYS=15 was ACCEPTED — the gate-2 TTL bound is not enforced:" >&2; printf '%s\n' "$$out" >&2; exit 1; \
+	fi; \
+	printf '%s\n' "$$out" | grep -q "re-opens gate 2" || { echo "FAIL: the TTL refusal did not state its gate-2 reason:" >&2; printf '%s\n' "$$out" >&2; exit 1; }; \
+	echo ">> leg nondet on a miss (D): the real --check still reds, nothing recorded"; \
+	$(GUIX) build "$$nondet" > /dev/null; \
+	if TD_GUIX="$(GUIX)" TD_CHECK_VERDICTS="$$vd" TD_CHECK_FULL= TD_CHECK_TTL_DAYS= TD_CHECK_ENV=td-memo-env-one sh tests/check-memo.sh "$$nondet" > "$$vd/nondet.log" 2>&1; then \
+	  echo "FAIL: the helper GREENED a deliberately nondeterministic drv on a miss — detection power lost:" >&2; cat "$$vd/nondet.log" >&2; exit 1; \
+	fi; \
+	grep -q "MEMO MISS (no verdict)" "$$vd/nondet.log" || { echo "FAIL: the nondet leg did not take the miss path:" >&2; cat "$$vd/nondet.log" >&2; exit 1; }; \
+	test ! -f "$$vd/`basename "$$nondet"`.verdict" || { echo "FAIL: a verdict was recorded for a drv whose --check FAILED" >&2; exit 1; }; \
+	rm -rf "$$vd"; \
+	echo "PASS: memoization discipline holds — miss-then-record, hit with the constraint-5 DB assertion, changed-drv/expiry/future-timestamp/foreign/tamper all miss, force-full bypasses, empty identity never hits or records, TTL>14d refused, and a nondeterministic miss still reds."
+
 # 10. rootless-builder differential (DESIGN §7.1 side-track; prime directive 4).
 #    Build the target with a ROOTLESS USER-NAMESPACE builder and prove
 #    daemon-vs-rootless store-path equality — the root guix-daemon is the

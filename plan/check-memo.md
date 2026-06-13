@@ -103,3 +103,143 @@ verified-reds below are on record in this file.
 - Relation to parked td-check (§6): td-check replaces the engine that does
   rebuild-and-compare; this track changes only WHEN it runs. If td-check
   graduates later, it inherits this policy and its constraints unchanged.
+- 2026-06-12 claude-fable-580472: claimed (PR #12). **Spine announcement
+  (§7.3):** this track lands edits to `check.sh` and the `Makefile` —
+  exclusive-landing rules apply; siblings rebase.
+- **Baseline (the "before" number):** unchanged-tree full `./check.sh` on the
+  dev host, 24 rungs, warm store — **440s wall (7m20.3s), green** (2026-06-12;
+  measured while a small concurrent rung run was also active, so the quiet
+  floor is slightly lower; reference: 341s at 18 rungs, 2026-06-10).
+- **S1 done (sub-ladder step 1):** `tests/check-memo.sh` (read/check/record
+  helper; misses fail CLOSED into the real `--check`), `tests/check-memo-info.scm`
+  (daemon-DB validity + NAR hash/size query — the constraint-5 assertion),
+  `tests/check-memo-drvs.scm` (fixtures: det, same-name/different-hash det',
+  µs-clock nondet), the permanent `memo` rung (miss/hit/changed-drv/expiry/
+  foreign/tamper/force-full/empty-identity/TTL-cap/nondet legs, every loop),
+  and check.sh's host-side environment identity
+  (`machine-id:store-fs-type:pinned-commit`, EMPTY under CI or when unknown —
+  fail closed) carried in via `--preserve='^TD_CHECK_'`, with
+  `TD_CHECK_FULL=1 ./check.sh` as the constraint-4 knob. `./check.sh memo`
+  green.
+
+### Verified-red evidence — the `memo` rung (S1, 2026-06-12)
+
+Each helper mutation run via `./check.sh memo`; ALL red (make exit 2), each
+caught at the intended leg; helper restored from the committed green after
+each (every run also re-proved the wiring assert + earlier legs green first):
+
+- **(A twin — keying)** verdict key by NAME (`basename | cut -c34-`) + drv
+  field comparison dropped → RED at the hit leg ("the second sight did not
+  HIT"): name-keyed lookup vs path-keyed record diverged — any keying
+  inconsistency reds the rung before the changed-drv leg is even reached.
+- **(B twin — expiry)** TTL comparison dropped (`elif false`) → RED: "an
+  EXPIRED verdict did not miss".
+- **(C twin — identity)** env comparison dropped → RED: "a FOREIGN verdict
+  did not miss".
+- **(constraint 5 — tamper)** verdict/DB comparison dropped → RED: "a
+  TAMPERED verdict did not miss".
+- **(D twin — exit honesty)** `--check` exit swallowed (`|| true`) → RED:
+  "the helper GREENED a deliberately nondeterministic drv on a miss —
+  detection power lost".
+- **(wiring)** `--preserve='^TD_CHECK_'` removed from check.sh → RED:
+  "TD_CHECK_ENV is not exported into the sandbox".
+
+### S2 — generation-image wired (2026-06-12); real-leg evidence
+
+The slowest `--check` leg (`generation-image`, both gen images) now routes
+through the helper. Rung timings on the dev host (warm store):
+
+- cold verdicts: `MEMO MISS (no verdict)` ×2 → real `--check` → `MEMO
+  RECORD` ×2 — rung **3m47.9s**, green;
+- fresh verdicts: `MEMO HIT` ×2 (constraint-5 DB assertion passed) — rung
+  **42.7s**, green: the --check legs collapsed; the remainder is the rung's
+  builds + artifact validation.
+
+Real-leg verified-reds (production verdict files in `.check-verdicts/`):
+
+- **(B)** gen-1 verdict aged (`recorded 1`) → `MEMO MISS (expired (20616d
+  old, ttl 7d))`, real `--check` re-ran, re-recorded;
+- **(C)** gen-2 verdict's env rewritten → `MEMO MISS (foreign environment)`,
+  real `--check` re-ran (same run as B — one leg per drv);
+- **(constraint 4)** `TD_CHECK_FULL=1 ./check.sh generation-image` over two
+  FRESH verdicts → `MEMO MISS (forced full)` ×2 — the knob travels
+  host → container → helper;
+- **(A, literal)** input changed in place (gen-2 → gen-3 in
+  tests/generation-image-drv.scm): the moved drv hash took `MEMO MISS (no
+  verdict)` and REALLY rebuilt (real `--check` + `MEMO RECORD`) while the
+  unchanged gen-1 drv HIT beside it; the run then went red (exit 2) at the
+  rung's OWN artifact validator (4 identity checks caught the gen-3
+  mutation) — the existing discriminators are intact downstream of the
+  wiring. Mutation restored. The name-collision direction (same name,
+  different hash) is asserted every loop by the memo rung's same-name
+  fixture; the keying mutation red is on record (S1 evidence);
+- **(red through the wired recipe)** `TD_CHECK_TTL_DAYS=15
+  ./check.sh generation-image` → helper FATAL (gate-2 TTL bound) → rung
+  exit 2: a helper failure reds THIS rung in place;
+- **(D)** asserted every loop by the memo rung's nondet fixture; the
+  exit-honesty mutation red (`|| true` swallow) is on record (S1 evidence).
+
+(The "real `--check`" in the cold run and in B/C is ONE batched
+`guix build --check` of all missed drvs — the same batching the direct line
+used.)
+
+### S3 — full rollout + the acceptance numbers (2026-06-12)
+
+All pure reproducibility `--check` legs now route through the helper —
+`build`, `oci`, `manifest-check`, `generation-image` (S2), `registry`,
+`verify-place`, `place`, `rollback`, `no-guix`, `td-builder`, `container`
+(19 drvs total). `offline` and `rootless` keep their direct calls (boundary
+below). Constraint-4 documentation landed: DIGESTS.md's re-baseline
+procedure now REQUIRES `TD_CHECK_FULL=1 ./check.sh`, and check.sh's usage
+comment states the knob.
+
+**Unchanged-tree full `./check.sh` floor (dev host, warm store, -j2):**
+
+- before (no memoization): **440s** (7m20.3s; loaded-host — quiet floor a
+  bit lower);
+- record pass (cold verdicts, every leg runs the real `--check` + records):
+  **379s** (6m19.0s), green — 17 misses recorded, 2 hits (S2's still-fresh
+  generation-image verdicts);
+- memoized floor (fresh verdicts): **145s** (2m24.9s), green — **19 hits,
+  0 misses**, every hit passing the constraint-5 DB assertion.
+
+The acceptance's "drops measurably": **440s → 145s (−67%)**; the dominant
+`--check` legs collapsed from minutes to seconds while every rung stayed
+green and the `memo` rung re-proves the discipline (including real fixture
+`--check` rebuilds and the nondet red instrument) every loop.
+
+### Landing-gate red + fix: the memo rung under an ambient force-full
+
+The first whole-ladder `TD_CHECK_FULL=1 ./check.sh` (run as the landing
+gate AND the acceptance's "force-full runs the original full ladder" demo)
+went RED (exit 2) at the `memo` rung: the rung's own helper invocations
+inherited the ambient knob (preserved into the sandbox by design for the
+REAL legs), so its first leg saw `MEMO MISS (forced full)` where it asserts
+`MEMO MISS (no verdict)` — the documented force-full procedure could never
+run green. Fix: every memo-rung leg now PINS `TD_CHECK_FULL`/
+`TD_CHECK_TTL_DAYS` itself (synthetic knobs, like the synthetic identities).
+After the fix both `./check.sh memo` and `TD_CHECK_FULL=1 ./check.sh memo`
+are green. An honest red, caught by running the documented procedure
+end-to-end; the 19 real-leg `MEMO MISS (forced full)` lines in the same run
+are the whole-ladder force-full demonstration.
+
+### Acceptance record (final, 2026-06-12 — landing gates on the final tree)
+
+- `TD_CHECK_FULL=1 ./check.sh`: **green, 7m27.8s**, all 19 wired drvs
+  `MEMO MISS (forced full)` → real `--check` — the force-full knob
+  demonstrably runs the original full ladder (§7.1 acceptance clause 2; also
+  the §7.2 landing full-check, strictly stronger than the plain run).
+- `./check.sh` (fresh verdicts): **green, 2m21.9s** — 19 hits, 0 misses.
+- Floor: **440s (before) → 142-145s (memoized)**, all rungs green
+  (clause 1). Verified-reds A-D + extras: on record above (clause 3).
+
+### Memoization boundary (constraint 6, decided at S1)
+
+The helper applies ONLY to the pure reproducibility `--check` legs. Two rungs
+keep their direct `guix build --check` calls on purpose and are NOT wired:
+
+- **`offline`** — its `--check` exists to RE-EXECUTE the sandbox probe's
+  behavioral assertions every loop (the rung's own comment); memoizing it
+  would loosen when those assertions run, which is gate-2 territory.
+- **`rootless`** — its `--check` runs inside the rootless daemon and IS the
+  differential under test, not a reproducibility leg of ours.

@@ -7,3 +7,8 @@
 .td-builder-scratch/
 .genimg-scratch/
 .run-scratch/
+.memo-scratch/
+
+# check-memo verdicts (plan/check-memo.md constraint 2): host-local state,
+# NEVER committed — a verdict greens only the environment that recorded it.
+.check-verdicts/
