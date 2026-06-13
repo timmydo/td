@@ -1,9 +1,38 @@
 # plan/ts-frontend.md — TypeScript spec surface on a boa evaluator (Phase 1)
 
 Track: **ts-frontend** (DESIGN §7.1, approved 2026-06-12 — §4.3 gate-1).
-Claim: claude-fable-87a496, 2026-06-12.
-Status: **CHARTERED** — this PR adds the §5 goal + §7.1/§6 entries; implementation
-not started. Single writer: the claiming agent.
+Claim: claude-fable-3ca5dd, 2026-06-13 (took over from claude-fable-87a496, who
+chartered the track in #15 — now merged — and stopped at "implementation pending";
+no implementation PR was open, so the track was re-claimed cleanly from main).
+Status: **IMPLEMENTING** — charter landed in #15; sub-task 1 (swc transpile) in
+progress. Single writer: the claiming agent.
+
+## Decision log (binding for this track)
+
+- **Evaluator sourcing — boa vendored as a pinned input** *(human, 2026-06-13)*.
+  The §7.1-named evaluator **boa is NOT in the pinned channel** (commit
+  520785e…): there are no `rust-boa*` crates at all, so the plan's earlier
+  "warm store in" assumption (that boa would resolve like `rust-swc`) does not
+  hold. The human chose to stay faithful to the charter rather than swap the
+  engine: bring `boa_engine` + its full transitive crate tree in as a
+  **hash-pinned `cargo vendor` fixed-output** input and build it with
+  `cargo-build-system`, pure-Rust and in-process in the Rust builder as
+  chartered. Mechanics: Guix permits network for fixed-output derivations
+  (output content-addressed), so the vendored-crate fetch happens once via the
+  daemon and the loop stays offline by construction (substitutes disabled, only
+  the DECLARED fixed-output source fetch — same narrowed contract as
+  `tests/typed-diff.scm`). OPEN: the artifact policy (§7.1 ci-image-pipeline,
+  "all generated artifacts on pipelines") — a vendored-crate tarball is closer
+  to a pinned upstream *source* than a build output, but producing the initial
+  pin needs network; resolve when sub-task 2 lands the boa crate (document a
+  pipeline path or a signed-off bring-up exception, as ci-gate did for its v1–v3
+  images).
+- What IS in the pinned channel and builds offline today: `node` 22.14.0,
+  `rust-swc` 1.2.129 (ships the `swc` CLI via `swc_cli`; transitive crates come
+  from Guix's `cargo-inputs 'rust-swc` registry), and the C JS engines
+  `quickjs`/`quickjs-ng`/`duktape`/`mujs`. `typescript`/`tsc` is NOT packaged —
+  the sub-task-1 type-check rung will vendor the `typescript` npm package as a
+  pinned input run under the packaged `node` (small analog of the boa pin).
 
 ## Goal (Phase 1 of the §5 move-off-Guile goal)
 
