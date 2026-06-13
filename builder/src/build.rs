@@ -3,8 +3,9 @@
 //!
 //! This is the REPLACEMENT for gnu-build-system's Guile phase runner. It is
 //! invoked AS the derivation's `builder` by the daemon (system td-build
-//! constructs that derivation with `raw-derivation`, so the .drv construction
-//! stays in guix while the build LOGIC is td's, in Rust). It runs the standard
+//! constructs that derivation with guix's low-level `derivation`, so the .drv
+//! construction stays in guix while the build LOGIC is td's, in Rust). It runs
+//! the standard
 //! autotools phases directly:
 //!
 //!   set-paths -> unpack -> configure (--prefix=$out) -> make -> make install

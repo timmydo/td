@@ -137,7 +137,7 @@ fn main() -> ExitCode {
         // corpus-independence: run AS a derivation's builder, executing the
         // autotools phases in Rust (replaces gnu-build-system). Reads the build
         // environment from env vars (out, TD_SRC, TD_INPUTS, TD_CONFIGURE_FLAGS)
-        // that system/td-build.scm sets on the raw-derivation.
+        // that system/td-build.scm sets on the derivation.
         Some("autotools-build") if args.len() == 2 => match build::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

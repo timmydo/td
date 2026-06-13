@@ -19,7 +19,7 @@
 ;;
 ;; The differential oracle is the corpus `hello` (§2.5 / prime directive 4), but
 ;; an own-builder output has a DIFFERENT store path (different derivation, and
-;; hello bakes $out in), so equivalence is proven BEHAVIORALLY (the `gnu-build`
+;; hello bakes $out in), so equivalence is proven BEHAVIORALLY (the `td-build`
 ;; rung runs it), not by NAR hash — the "behaviorally equal where a recipe
 ;; legitimately differs" case named in the §7.1 corpus-independence entry.
 
