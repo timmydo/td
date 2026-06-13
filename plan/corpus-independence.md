@@ -85,7 +85,41 @@ risk is nil. Landed as one track PR with the charter as the first commit.
 3. `corpus` rung: build + `--check` + NAR-hash-equal to the oracle.
 4. Full `./check.sh` green; PR.
 
+## Implementation progress
+
+- **Sub-task 2 — `corpus-diff` cheap rung: DONE 2026-06-13.** `system/td-corpus.scm`
+  authors GNU hello from upstream coordinates (URL + sha256 + gnu-build-system),
+  importing no `(gnu packages …)`; the source hash is factored into
+  `td-hello/source-sha256` so the differential can perturb the upstream coordinate
+  without duplicating the recipe. `tests/corpus-diff.scm` lowers it next to the
+  corpus `hello` (the §2.5 oracle) with `#:graft? #f` (build-free) and asserts
+  distinct / converge / discriminate. Module added to the `eval` load set; rung in
+  `CHEAP_RUNGS`. GREEN in-sandbox (`./check.sh corpus-diff`): td-hello and the corpus
+  oracle both lower to `2nfg943…-hello-2.12.2.drv`; a wrong-source-hash recipe
+  diverges (`a5nc0x49…`).
+- **Sub-task 3 — `corpus` heavy rung: DONE 2026-06-13.** `tests/corpus-drv.scm`
+  emits the ungrafted td/oracle drvs + oracle output; the rung builds td-hello from
+  td's own recipe, `--check`s it (verdict-memoized — MEMO RECORD on first run), and
+  asserts the built store object is path-identical AND NAR-hash-equal to the corpus
+  oracle's. GREEN in-sandbox (`./check.sh corpus`): built `cs56i9di…-hello-2.12.2`,
+  both NARs `0qhasy0w…`. Rung in `HEAVY_RUNGS`.
+
 ## Verified-red log
 
-(filled as each assertion is seen red on a COPY in the job tmp — the "commit before red
-variants" gotcha: commit the green first, perturb copies, restore.)
+The "commit before red variants" gotcha (memory): the green is committed first; reds
+are run on perturbed COPIES in the job tmp / on the committed module restored via
+`git checkout`, never wiping the uncommitted heavy-rung files.
+
+- **corpus-diff (a) distinct** — copy with `(not (eq? hello hello))` ⇒ RED
+  "td-hello IS the corpus hello object". (exit 1)
+- **corpus-diff (b) converge** — copy whose candidate uses a wrong source hash ⇒ RED
+  "td's own recipe does NOT reproduce the corpus oracle's derivation". (exit 1)
+- **corpus-diff (c) discriminate** — copy whose perturbed variant uses the CORRECT
+  hash ⇒ RED "differential is vacuous". (exit 1)
+- **corpus heavy convergence guard** — emitter copy emitting a perturbed td drv
+  (corpus-diff left green so the chain reaches the heavy rung) ⇒ corpus-diff PASS,
+  then heavy `corpus` RED "td's recipe drv != corpus oracle drv — convergence lost at
+  the build-derivation level" (td drv `f1454wra…` != oracle `2nfg943…`). (exit 2)
+- The heavy rung's `--check` reproducibility leg reuses `tests/check-memo.sh`, whose
+  nondeterminism/expiry/foreign-env reds are verified-red on the check-memo track
+  (plan/check-memo.md); the corpus rung adds no new repro-detection logic.

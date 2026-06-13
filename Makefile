@@ -186,6 +186,45 @@ corpus-diff:
 	@echo ">> corpus-diff: td's own recipe lowers to the same drv as the corpus oracle; a perturbed recipe diverges (corpus-independence)"
 	$(GUIX) repl $(LOAD) tests/corpus-diff.scm
 
+# corpus-independence BUILD leg (DESIGN §7.1, Phase 2). Where `corpus-diff` proves
+# convergence at the derivation level (cheap, build-free), this proves the
+# td-recipe-BUILT package is REPRODUCIBLE (prime directive 1) and NAR-hash-equal to
+# the corpus oracle's build. It builds td's OWN hello recipe (ungrafted, matching
+# corpus-diff — so it --checks hello's actual compile, not just the graft rewrite),
+# `--check`s it bit-for-bit (verdict-memoized — tests/check-memo.sh), and asserts
+# the built store object is path-identical AND NAR-hash-equal to the corpus
+# oracle's. Heavy (a warm-store hello compile + a --check), so it slots in the heavy
+# pool; RE-MEASURE and RE-SORT once it has run (its cost is one hello compile warm).
+corpus:
+	@echo ">> corpus: build td's own hello recipe, --check it, NAR-hash-equal to the corpus oracle (corpus-independence)"
+	@set -euo pipefail; \
+	vars=`$(GUIX) repl $(LOAD) tests/corpus-drv.scm 2>/dev/null`; \
+	td_drv=`printf '%s\n' "$$vars" | sed -n 's/^TD_DRV=//p'`; \
+	oracle_drv=`printf '%s\n' "$$vars" | sed -n 's/^ORACLE_DRV=//p'`; \
+	oracle_out=`printf '%s\n' "$$vars" | sed -n 's/^ORACLE_OUT=//p'`; \
+	test -n "$$td_drv" -a -n "$$oracle_drv" -a -n "$$oracle_out" \
+	  || { echo "ERROR: could not lower the corpus derivations" >&2; exit 1; }; \
+	echo ">> td-hello recipe drv : $$td_drv"; \
+	echo ">> corpus oracle  drv  : $$oracle_drv"; \
+	test "$$td_drv" = "$$oracle_drv" \
+	  || { echo "FAIL: td's recipe drv != corpus oracle drv — convergence lost at the build-derivation level." >&2; exit 1; }; \
+	echo ">> build td-hello from td's OWN recipe"; \
+	out=`$(GUIX) build "$$td_drv"`; \
+	test -n "$$out" || { echo "ERROR: building td-hello produced no output path" >&2; exit 1; }; \
+	echo ">> check: reproducibility of td-hello (verdict-memoized)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
+	echo ">> assert built output is store-path-identical to the corpus oracle output"; \
+	test "$$out" = "$$oracle_out" \
+	  || { echo "FAIL: td-hello built to $$out but the corpus oracle is $$oracle_out — not the same store object." >&2; exit 1; }; \
+	echo ">> NAR-hash-equal (§6 metric)"; \
+	nar_td=`$(GUIX) hash -S nar "$$out"`; \
+	nar_or=`$(GUIX) hash -S nar "$$oracle_out"`; \
+	echo "   td-hello NAR      : $$nar_td"; \
+	echo "   corpus oracle NAR : $$nar_or"; \
+	test -n "$$nar_td" -a "$$nar_td" = "$$nar_or" \
+	  || { echo "FAIL: td-hello NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
+	echo "PASS: td's own recipe builds reproducibly to the corpus oracle's exact store object (NAR-hash-equal)."
+
 # ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
 # `tsc` (the pinned td-typescript input, run under the packaged node) BOTH
 # type-checks a td system spec and emits its type-stripped JS. Self-discriminating
