@@ -393,15 +393,6 @@ annotated.
   `.drv` hashes both ways. (Under the 2026-06-12 §5 goal, Guile/gexps are the
   migration lowering target driven by the `ts-frontend` surface, not the
   permanent destination.)
-- **Corpus independence** (Phase 2 of the §5 move-off-Guile goal; follow-on to
-  `ts-frontend`): replace the pinned Guix corpus with td's own recipes for its
-  target closure, pulling upstream source directly, so td depends on no
-  general-purpose distro at corpus level. Bounded by the §5 non-goals
-  (appliance-scoped, no full-source bootstrap, seed external). Differential
-  during migration: a td-recipe-built package is NAR-hash-equal (or
-  behaviorally equal where a recipe legitimately differs) to the Guix-built
-  one, Guix as the oracle until it is retired last. Graduates to §7.1 by a
-  separate roadmap addition (§4.3 gate 1) once `ts-frontend` lands.
 - **Loop tooling convergence** (follow-on): td-builder's sandbox replaces
   `guix shell -C` in `check.sh` — the north star's "one sandbox stack spanning
   build and run" made literal. Restructures the loop, so §4.3 gate 2 applies
@@ -566,6 +557,34 @@ run concurrently):
   spec that must fail). Scope is the spec *language* only — corpus replacement
   is Phase 2 (§6), and this track keeps reading the pinned corpus underneath.
   The curated-global design and the swc/`tsc` build steps: `plan/ts-frontend.md`.
+- **corpus-independence** *(approved 2026-06-13 — §4.3 gate-1 roadmap addition,
+  graduated from §6; Phase 2 of the §5 move-off-Guile goal, follow-on to
+  `ts-frontend`)* — replace the pinned Guix corpus with td's OWN recipes for the
+  target closure, pulling upstream source directly, so td depends on no
+  general-purpose distro at corpus level. Bounded by the §5 non-goals
+  (appliance-scoped, no full-source bootstrap, seed external) and §2.5/prime-
+  directive-4 (the Guix corpus is the oracle; the migration is proven by
+  differential, never asserted). Axis note: this is the CORPUS axis (where the
+  package definition comes from), distinct from `ts-frontend`'s SURFACE axis (what
+  language a spec is written in) — and the two compose: a recipe is AUTHORED in the
+  TypeScript surface and lowered through the still-present Guile/gexp layer (the
+  sanctioned lowering target, retired LAST), with the toolchain + build-system also
+  Guix's (retired last). What changes is provenance: the recipe is reconstructed
+  from upstream coordinates (source URL + hash + build system), NOT looked up in
+  `(gnu packages …)`. Acceptance (the POC increment): a recipe for one leaf package
+  (GNU `hello`) authored in TypeScript (`tests/ts/recipe-hello.ts`) — transpiled by
+  tsc, evaluated by the boa evaluator (which gains `recipe`/`fetchSource` capture
+  globals), and lowered by a GENERIC Guile recipe bridge (`system/td-recipe.scm`,
+  importing no `(gnu packages …)`) — lowers to a derivation NAR-hash-equal
+  (store-path-equal) to the same package built from the pinned Guix corpus, run as
+  a self-discriminating rung: the TS recipe CONVERGES on the corpus oracle while a
+  perturbed TS recipe DIVERGES (verified-red, never vacuous), and the BUILT artifact
+  is reproducible (`guix build --check`) with its output NAR hash equal to the
+  corpus oracle's. Broadening the recipe set toward the full target closure (more
+  build systems, packages with inputs), and the "behaviorally equal where a recipe
+  legitimately differs" case (an own-builder package that diverges in store path but
+  matches behaviorally) are follow-on increments inside this track. Working state +
+  verified-red log: `plan/corpus-independence.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
