@@ -208,6 +208,21 @@ The acceptance's "drops measurably": **440s → 145s (−67%)**; the dominant
 green and the `memo` rung re-proves the discipline (including real fixture
 `--check` rebuilds and the nondet red instrument) every loop.
 
+### Landing-gate red + fix: the memo rung under an ambient force-full
+
+The first whole-ladder `TD_CHECK_FULL=1 ./check.sh` (run as the landing
+gate AND the acceptance's "force-full runs the original full ladder" demo)
+went RED (exit 2) at the `memo` rung: the rung's own helper invocations
+inherited the ambient knob (preserved into the sandbox by design for the
+REAL legs), so its first leg saw `MEMO MISS (forced full)` where it asserts
+`MEMO MISS (no verdict)` — the documented force-full procedure could never
+run green. Fix: every memo-rung leg now PINS `TD_CHECK_FULL`/
+`TD_CHECK_TTL_DAYS` itself (synthetic knobs, like the synthetic identities).
+After the fix both `./check.sh memo` and `TD_CHECK_FULL=1 ./check.sh memo`
+are green. An honest red, caught by running the documented procedure
+end-to-end; the 19 real-leg `MEMO MISS (forced full)` lines in the same run
+are the whole-ladder force-full demonstration.
+
 ### Memoization boundary (constraint 6, decided at S1)
 
 The helper applies ONLY to the pure reproducibility `--check` legs. Two rungs

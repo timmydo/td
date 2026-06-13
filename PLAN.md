@@ -28,7 +28,7 @@ edits** (track files don't carry it).
 - [ ] **fhs-app-images** — UNCLAIMED — `plan/fhs-app-images.md`
 - [x] **td-builder** — DONE 2026-06-11 (S4 claude-fable-8ebb4e: the §7.1 acceptance differential — td-builder rebuilds the system qcow2 image drv daemon-equal on path/NAR-hash/size/83-refs/deriver, GREEN at S3 sandbox parity, no chroot growth needed; verified-red ×3 at distinct S4 asserts; S1-S3 claude-fable-49b6d6/a03d13/696a4e) — `plan/td-builder.md`
 - [ ] **ci-gate** — claimed claude-fable-52ceb1 2026-06-11 (workflow + protection setup landing; runner pending) — `plan/ci-gate.md`
-- [ ] **check-memo** — claimed claude-fable-580472 2026-06-12 (chartered 2026-06-12; §4.3 gate-2 sign-off recorded — verdict memoization for the `--check` legs) — `plan/check-memo.md`
+- [x] **check-memo** — DONE claude-fable-580472 2026-06-12 (verdict memoization live on all 11 reproducibility `--check` legs/19 drvs; unchanged-tree floor 440s→145s; permanent `memo` rung asserts the discipline every loop; verified-reds on record; offline/rootless stay direct per the constraint-6 boundary) — `plan/check-memo.md`
 
 ## The loop (reminder)
 
