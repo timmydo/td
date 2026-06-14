@@ -316,80 +316,111 @@ fn main() -> ExitCode {
         // uses) AND writes the SQLite file format directly (store_db, zero-dep) — the
         // real replacement of the daemon's libsqlite, no `sqlite3` engine. Usage:
         //   store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB
-        // Writes a store DB at OUT-DB holding STORE-PATH's full registration: its
-        // ValidPaths row (the artifact, fully computed), its Refs, and the
-        // deriver→output mapping. The referenced paths + the deriver are written as
-        // minimal scaffolding rows so the relational joins resolve (a full-closure
-        // registration is a later increment). registrationTime is the daemon's "now"
-        // — a fixed sentinel here, excluded from the differential.
+        // CANDIDATES-FILE is STORE-PATH's full closure (`guix gc -R`). td registers
+        // EVERY path in it — each fully scanned (real hash/size/refs) — plus all the
+        // inter-path Refs and the deriver→output mapping. Only the deriver (a `.drv`,
+        // not a closure member) is a scaffolding row so DerivationOutputs.drv resolves.
+        // STORE-PATH carries its deriver; per-path derivers for the rest are the
+        // daemon's input-resolution (a later increment). registrationTime is the
+        // daemon's "now" — a fixed sentinel here, excluded from the differential.
         Some("store-register") if args.len() == 6 => {
             let (store_path, deriver, candidates_file, out_db) =
                 (&args[2], &args[3], &args[4], &args[5]);
             let run = || -> Result<(), String> {
                 use store_db::{Table, Value};
-                let candidates: Vec<String> = std::fs::read_to_string(candidates_file)
+                // CANDIDATES-FILE is the artifact's full closure (`guix gc -R PATH`):
+                // td registers EVERY path in it, each fully scanned — no placeholders.
+                let closure: Vec<String> = std::fs::read_to_string(candidates_file)
                     .map_err(|e| e.to_string())?
                     .lines()
                     .filter(|l| !l.is_empty())
                     .map(str::to_string)
                     .collect();
-                let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
-                nar::write_nar(&mut scanner, Path::new(store_path)).map_err(|e| e.to_string())?;
-                let (hash, size, refs) = scanner.finish();
+                // Stable ids (= b-tree rowids), assigned ascending: the artifact = 1,
+                // the deriver = 2 (a scaffolding row — a `.drv`, not a closure member,
+                // so DerivationOutputs.drv resolves), then the other closure paths in
+                // file order = 3.. . Every reference is a closure member.
+                let others: Vec<String> = closure
+                    .iter()
+                    .filter(|p| p.as_str() != store_path.as_str())
+                    .cloned()
+                    .collect();
+                let id_of = |p: &str| -> Result<i64, String> {
+                    if p == store_path.as_str() {
+                        Ok(1)
+                    } else if p == deriver.as_str() {
+                        Ok(2)
+                    } else {
+                        others
+                            .iter()
+                            .position(|o| o.as_str() == p)
+                            .map(|i| 3 + i as i64)
+                            .ok_or_else(|| format!("reference `{p}' is not in the closure"))
+                    }
+                };
+                // Scan one path; return its (hash, size, references) — the `build`
+                // machinery, references found among the closure.
+                let scan_path = |p: &str| -> Result<(String, u64, Vec<String>), String> {
+                    let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
+                    nar::write_nar(&mut s, Path::new(p)).map_err(|e| e.to_string())?;
+                    Ok(s.finish())
+                };
 
-                // ValidPaths: the artifact (id 1, fully computed) + the deriver (id 2)
-                // + each non-self reference (ids 3..), the latter as scaffolding rows
-                // (path only) so Refs/DerivationOutputs can join by rowid.
-                let mut valid = vec![(
-                    1i64,
+                // ValidPaths rows in ascending rowid order; Refs accumulated per path.
+                let mut valid: Vec<(i64, Vec<Value>)> = Vec::with_capacity(closure.len() + 1);
+                let mut ref_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+                let mut ref_rowid = 1i64;
+
+                // id 1: the artifact, fully registered, with its deriver.
+                let (a_hash, a_size, a_refs) = scan_path(store_path)?;
+                valid.push((
+                    1,
                     vec![
-                        Value::Null, // id (integer primary key) — the rowid is the id
+                        Value::Null, // id (integer primary key) — rowid is the id
                         Value::Text(store_path.to_string()),
-                        Value::Text(hash),
+                        Value::Text(a_hash),
                         Value::Int(1), // registrationTime (sentinel; excluded)
                         Value::Text(deriver.to_string()),
-                        Value::Int(size as i64),
+                        Value::Int(a_size as i64),
                     ],
-                )];
-                let scaffold = |id: i64, p: &str| {
-                    (
-                        id,
+                ));
+                for r in &a_refs {
+                    ref_rows.push((ref_rowid, vec![Value::Int(1), Value::Int(id_of(r)?)]));
+                    ref_rowid += 1;
+                }
+                // id 2: the deriver scaffolding row (path only).
+                valid.push((
+                    2,
+                    vec![
+                        Value::Null,
+                        Value::Text(deriver.to_string()),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ],
+                ));
+                // ids 3..: the other closure paths, each fully registered (deriver NULL
+                // — per-path derivers are the daemon's input-resolution, a later
+                // increment; the differential is td's computed hash/size/refs).
+                for p in &others {
+                    let (hash, size, refs) = scan_path(p)?;
+                    valid.push((
+                        id_of(p)?,
                         vec![
                             Value::Null,
                             Value::Text(p.to_string()),
+                            Value::Text(hash),
+                            Value::Int(1),
                             Value::Null,
-                            Value::Null,
-                            Value::Null,
-                            Value::Null,
+                            Value::Int(size as i64),
                         ],
-                    )
-                };
-                let id_of = |p: &str, refs: &[String]| -> i64 {
-                    if p == store_path.as_str() {
-                        1
-                    } else {
-                        // deriver = id 2; the non-self refs follow, in scan order.
-                        3 + refs
-                            .iter()
-                            .filter(|r| r.as_str() != store_path.as_str())
-                            .position(|r| r == p)
-                            .unwrap() as i64
-                    }
-                };
-                valid.push(scaffold(2, deriver));
-                let mut next = 3;
-                for r in &refs {
-                    if r.as_str() != store_path.as_str() {
-                        valid.push(scaffold(next, r));
-                        next += 1;
+                    ));
+                    for r in &refs {
+                        ref_rows.push((ref_rowid, vec![Value::Int(id_of(p)?), Value::Int(id_of(r)?)]));
+                        ref_rowid += 1;
                     }
                 }
-                // Refs: the artifact → each scanned reference (incl. the self-ref).
-                let ref_rows: Vec<(i64, Vec<Value>)> = refs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| (i as i64 + 1, vec![Value::Int(1), Value::Int(id_of(r, &refs))]))
-                    .collect();
                 // DerivationOutputs: the deriver (id 2) → "out" → the artifact.
                 let drv_out = vec![(
                     1i64,

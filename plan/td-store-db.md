@@ -58,11 +58,20 @@ Rung `store-register` (differential, daemon = oracle):
 This proves td reproduces the daemon's store-DB authority — writing the actual DB
 bytes — for one artifact.
 
+## Increment 2 (DONE 2026-06-14): full-closure registration
+
+`store-register` now registers EVERY path in the artifact's closure (`guix gc -R`),
+each fully scanned — no placeholder rows except the deriver (a `.drv`, not a closure
+member). The differential asserts, byte-identical to the daemon: (1) every closure
+path's `hash` + `narSize`, (2) the full inter-path `Refs` relation, (3) the artifact's
+deriver + drv→output. Removes increment 1's scaffolding caveat. Per-path derivers of the
+non-artifact members (the daemon's input-resolution) + `registrationTime` excluded.
+
 ## Later increments (sketch — not this PR)
 
-- Register the full closure into a td store DB and have `guix`/a fresh daemon on td's
-  `GUIX_STATE_DIRECTORY` report the artifact VALID (queryable end-to-end), no daemon
-  having written it.
+- Have `guix`/a fresh daemon on td's `GUIX_STATE_DIRECTORY` report the artifact VALID
+  (queryable end-to-end) — needs the exact daemon schema (indexes/trigger/sequence) so
+  the daemon accepts td's hand-written DB.
 - `addToStore` end-to-end in td (write the path + register) into a td store.
 - GC reachability (the daemon's third role).
 - Eventually a td store backend the system can use, daemon retired for the build side.
@@ -100,3 +109,11 @@ row narSize as 282617 ≠ the daemon's 282616 ⇒ the rung's `test "$td_row" =
 "$oracle_row"` fails ⇒ `store-register` red ("td's ValidPaths row … != the daemon's").
 Proves the rung genuinely compares td's WRITTEN DB to the daemon's record (and that
 sqlite3 really parsed td's bytes), not a vacuous pass. Reverted; rung green again.
+
+**R2 the full-closure differential covers EVERY path** (2026-06-14, increment 2).
+Perturbed the `others` loop to write a NON-artifact closure path's `narSize` as
+`size + 1`, rebuilt, ran the per-path differential: all three non-artifact paths
+diverged from the daemon (e.g. bash-static 1887497 ≠ 1887496, glibc 41145793 ≠
+41145792) ⇒ the rung's `test "$td_rows" = "$oracle_rows"` fails ⇒ `store-register` red.
+Proves the closure differential checks every path's registration, not just the
+artifact's (which R1 covered). Reverted; rung green again.
