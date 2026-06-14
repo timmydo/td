@@ -42,18 +42,47 @@ inputs), which is Inc.2.
 
 ## Next increments
 
-- Inc.2 — wire the lock-resolution into `td-build` (replace the live Guile
-  `specification->package` call in the build path with `td-builder resolve` over
-  the pinned lock; differential: same build).
 - Inc.3+ — reconstruct individual input recipes (start retiring the resolver
   itself), the corpus-independence endgame, package-by-package.
+
+## Inc.2 — the SWAP: the build consumes td's resolution (DONE 2026-06-14)
+
+The `td-build` nano build now CONSUMES `td-builder resolve` (over the pinned lock)
+for its declared deps instead of Guile's `specification->package`.
+
+- **`system/td-build.scm`** — `td-build-components`/`td-rust-build-derivation` gain
+  `#:resolved-dep-paths`. When supplied (by `td-builder resolve`, NOT Guile), the
+  recipe's deps enter as td-resolved input-SOURCES (already-realized store paths),
+  so **no `specification->package` runs for the deps**. Default (#f) is the old
+  path (Guile-resolved input-derivations) — so hello + the existing td-drv-* and
+  corpus rungs are untouched. The toolchain stays Guile (retired even later, §5).
+- **Representation note (honest):** deps move from input-DERIVATIONS to
+  input-SOURCES (td only has the out-path from the lock, not a drv), so the nano
+  `.drv` and output PATH differ from the Guile-resolved one — the differential is
+  BEHAVIORAL (byte-identical `--version`) at a distinct path, like `td-build-deps`,
+  not byte-identical `.drv`. A byte-identical-`.drv` swap would need the lock to
+  carry dep DRV paths (`read-derivation-from-file`) — a later refinement.
+- **Rung `td-build-resolved`** (HEAVY_RUNGS; `tests/td-build-resolved-drv.scm`):
+  (a) SWAP — the nano `.drv`'s input-sources are EXACTLY td-builder's resolved dep
+  paths AND ncurses/gettext are NOT input-derivations (Guile did not resolve the
+  deps); (b) REPRODUCIBLE (`--check`); (c) BEHAVIORAL (`--version` == corpus nano),
+  distinct path. `./check.sh td-build-resolved` green, ~47s.
+
+Spike before the rung confirmed: nano built with deps as input-sources runs and is
+`--version` byte-identical to the corpus nano; ncurses/gettext are in
+`derivation-sources`, absent from `derivation-inputs`.
 
 ## Verified-red log
 
 (green committed first per the "commit before red variants" gotcha; restored via
 `git checkout`)
 
-- **R1 lock is load-bearing** — perturb `tests/td-build-inputs.lock` (one wrong
-  byte in ncurses's path) ⇒ `td-builder resolve` returns the perturbed path ⇒ it
-  `!=` Guile's live oracle ⇒ the `resolve` rung reds. Proves td genuinely READS the
-  lock (not hardcoded) and the equivalence is real, not vacuous.
+- **R1 lock is load-bearing** (resolve) — perturb `tests/td-build-inputs.lock` (one
+  wrong byte in ncurses's path) ⇒ `td-builder resolve` returns the perturbed path ⇒
+  it `!=` Guile's live oracle ⇒ the `resolve` rung reds. Proves td genuinely READS
+  the lock (not hardcoded) and the equivalence is real, not vacuous.
+- **R2 the build consumes td's resolution** (td-build-resolved) — perturb
+  `tests/td-build-inputs.lock` (wrong ncurses path) ⇒ `td-builder resolve` feeds the
+  bad path as the nano build's input-SOURCE ⇒ the source is not a valid store path ⇒
+  the build FAILS (daemon rejects the input-source). Proves the swap is real: the
+  build genuinely consumes td's resolution, so a wrong resolution breaks it.
