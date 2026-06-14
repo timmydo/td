@@ -98,9 +98,11 @@ edits** (track files don't carry it).
   then diverge"); td's reader == sqlite3 (same bytes) == the daemon. Inc.4 — `td-builder
   store-add-text` PLACES a path into a td-owned store (the daemon's addToStore, write
   side, flat case): td computes the path, WRITES a canonical 0444 store file, registers
-  it — byte-identical (NAR) to the daemon's own store file (the WAL-free oracle). Daemon
-  is the oracle; td operates its OWN store DB, host daemon stays immutable infra)
-  — `plan/td-store-db.md`
+  it — byte-identical (NAR) to the daemon's own store file (the WAL-free oracle). Inc.5 —
+  `td-builder store-closure` computes GC reachability (the daemon's THIRD role): walks the
+  Refs graph from a root with td's own reader (GC mark/liveness, no daemon) == `guix gc
+  -R`. Daemon is the oracle; td operates its OWN store DB, host daemon stays immutable
+  infra) — `plan/td-store-db.md`
 
 ## The loop (reminder)
 
