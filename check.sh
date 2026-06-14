@@ -172,6 +172,34 @@ fi
 #                                (TD_CHECK_ENV, TD_CHECK_FULL, ...) — --pure
 #                                would otherwise strip them; the `memo` rung
 #                                asserts TD_CHECK_ENV arrives.
+# --- The hermetic container ---------------------------------------------------
+# DEFAULT (gate-2 "Loop tooling convergence", loop-sandbox Step 2): run the loop
+# inside td's OWN sandbox (`td-builder host-sandbox --expose-cwd`) instead of
+# `guix shell -C` — the north star's one Rust sandbox stack spanning build AND
+# run, made literal. td's sandbox provides the same hermetic surface, proven by
+# the loop-sandbox/loop-rung rungs: the WHOLE /gnu/store (ro) + the daemon socket
+# /var/guix + /proc + /dev + /sys/fs/cgroup + the worktree + the guix cache, host
+# guix + the toolchain on PATH, its own loopback-only netns. `guix shell` (no -C)
+# still PROVISIONS the toolchain profile — td replaces the CONTAINER, not guix's
+# profile machinery. Escape hatch: TD_LOOP_GUIX_SHELL=1 runs the original
+# `guix shell -C` path below (the oracle, for differential/triage).
+if [ -z "${TD_LOOP_GUIX_SHELL-}" ]; then
+  tb=$(guix build -L . -e '(@ (system td-builder) td-builder)')/bin/td-builder
+  [ -x "$tb" ] || { echo "check.sh: FATAL: could not build td-builder for the loop sandbox." >&2; exit 1; }
+  # The packages guix shell -C would put on PATH, provisioned as a profile (no
+  # container); --search-paths prints the `export PATH="…"` line we splice in.
+  # The leading non-`$` run is the profile bin:sbin; the trailing
+  # `${PATH:+:}$PATH` (a shell-eval append) is dropped — we set PATH ourselves.
+  toolchain=$(guix shell --no-substitutes --no-offload \
+      make bash coreutils sed grep findutils tar gzip crun util-linux sqlite \
+      --search-paths | sed -n 's/^export PATH="\([^$]*\).*/\1/p' | head -n1)
+  [ -n "$toolchain" ] || { echo "check.sh: FATAL: could not provision the loop toolchain PATH." >&2; exit 1; }
+  exec env \
+    PATH="$hostguix_dir:$toolchain" \
+    GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
+    "$tb" host-sandbox --expose-cwd -- make -j2 --output-sync=target "$@"
+fi
+
 exec guix shell -C --pure \
   --no-substitutes --no-offload \
   --preserve='^TD_CHECK_' \
