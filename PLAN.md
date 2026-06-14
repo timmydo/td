@@ -117,8 +117,11 @@ edits** (track files don't carry it).
   Refs graph from a root with td's own reader (GC mark/liveness, no daemon) == `guix gc
   -R`. Inc.6 — `td-builder store-add-recursive` does the recursive addToStore: computes the
   content-addressed `source` path + CANONICALLY restores a directory TREE (exec bit +
-  symlinks) byte-identical (NAR) to the daemon's interned tree. Daemon is the oracle; td
-  operates its OWN store DB, host daemon stays immutable infra) — `plan/td-store-db.md`
+  symlinks) byte-identical (NAR) to the daemon's interned tree. Inc.7 — `td-builder
+  store-verify` re-hashes registered paths vs the recorded registration (the daemon's
+  `guix gc --verify --check-contents`): verifies hello's closure in /gnu/store == the
+  daemon's hashes, and DETECTS a one-byte corruption. Daemon is the oracle; td operates
+  its OWN store DB, host daemon stays immutable infra) — `plan/td-store-db.md`
 
 ## The loop (reminder)
 

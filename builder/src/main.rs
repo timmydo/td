@@ -780,6 +780,66 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: VERIFY a td store's integrity ourselves — the daemon's
+        // `guix gc --verify --check-contents`, in pure Rust. Reads the recorded
+        // registration from a td store DB (`store_db_read`, #36), re-NAR-hashes each
+        // registered path at STORE-ROOT/<basename>, and reports any path whose content
+        // no longer matches its recorded `hash` (corruption / disk-rot). No daemon.
+        // Usage:
+        //   store-verify DB STORE-ROOT
+        // STORE-ROOT holds the path bytes (e.g. /gnu/store, or a td-owned store dir).
+        // Exit 0 if every registered path verifies; exit 1 (listing the mismatches) if
+        // any content differs from its recorded hash.
+        Some("store-verify") if args.len() == 4 => {
+            let (db_path, store_root) = (&args[2], &args[3]);
+            let run = || -> Result<Vec<String>, String> {
+                use store_db_read::{Db, Value};
+                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+                let db = Db::open(bytes)?;
+                let mut mismatches = Vec::new();
+                let mut checked = 0u64;
+                for (_rowid, cols) in db.table("ValidPaths")? {
+                    // Only paths with a recorded hash (skip scaffolding rows).
+                    let (path, recorded) = match (cols.get(1), cols.get(2)) {
+                        (Some(Value::Text(p)), Some(Value::Text(h))) => (p, h),
+                        _ => continue,
+                    };
+                    let base = path
+                        .rsplit('/')
+                        .next()
+                        .ok_or_else(|| format!("malformed path {path}"))?;
+                    let location = Path::new(store_root).join(base);
+                    let got = nar_hash_path(&location).map_err(|e| format!("{}: {e}", location.display()))?;
+                    checked += 1;
+                    if &got != recorded {
+                        mismatches.push(format!("{path}: recorded {recorded} got {got}"));
+                    }
+                }
+                if checked == 0 {
+                    Err("no registered paths with a recorded hash to verify".to_string())
+                } else if mismatches.is_empty() {
+                    Ok(vec![format!("verified {checked} paths")])
+                } else {
+                    Err(format!(
+                        "{} of {checked} paths FAILED verification:\n{}",
+                        mismatches.len(),
+                        mismatches.join("\n")
+                    ))
+                }
+            };
+            match run() {
+                Ok(lines) => {
+                    for l in lines {
+                        println!("{l}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-verify: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-drv-assemble: ASSEMBLE the `.drv` from a raw SPEC (Guile resolved the
         // inputs and emitted it WITHOUT `(derivation …)`) and REGISTER it via the
         // daemon — so the build derivation enters the store with no guile
@@ -1073,6 +1133,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-closure DB ROOT");
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB");
+            eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)
         }

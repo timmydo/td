@@ -172,6 +172,28 @@ recomputes the oracle path fresh each run — oracle and td always agree on curr
 td now owns the full store WRITE side (flat #38 + recursive) plus read (#36), the DB
 authority (#34/#35), and GC-mark (#39) — daemon as oracle throughout.
 
+## Increment 7 (DONE 2026-06-14): td VERIFIES store integrity — guix gc --verify --check-contents
+
+The daemon's store-integrity check. New `td-builder store-verify DB STORE-ROOT` reads the
+recorded registration from a td store DB (`store_db_read`, #36) and re-NAR-hashes each
+registered path at `STORE-ROOT/<basename>`, flagging (exit 1) any path whose content no
+longer matches its recorded `hash` (corruption / disk-rot). No daemon. Composes the reader
+(#36) + the NAR hasher — closing the loop write-hash (#34/#35) → read-hash (#36) → verify
+content against it.
+
+New `store-verify` rung, two legs: **(A) the daemon differential** — td first proves its
+DB records the DAEMON's hashes for hello's closure (immutable live-DB read), then re-hashes
+each path in the REAL `/gnu/store` and confirms it matches (exit 0): td independently
+verifies the store content against the daemon's record, exactly `--check-contents`. **(B)
+corruption detection** — a flat probe added to a td-owned store verifies OK, then a one-byte
+corruption is DETECTED (verify exits nonzero, naming the path). Verified-red R11 (perturb
+verify to never flag a mismatch ⇒ the corruption goes undetected ⇒ rung red). Boundary: td
+READS `/gnu/store` + the td DB and writes only its own scratch store/DB/probe. (Note: store
+files are `0444`, so injecting the corruption needs a `chmod u+w` first.)
+
+td can now verify the integrity of a store against its registration — a prerequisite for
+trusting a td-owned store backend.
+
 ## Later increments (sketch — not this PR)
 
 - Referenced sources/outputs: the addToStore/path case WITH references (the `output:out`
@@ -291,3 +313,11 @@ not unit-tested, so the binary still built — ran the `store-add-tree` rung: td
 `…mxqj89…` ≠ the daemon's interned `…vwq9xz…` ⇒ the `test "$td_path" = "$src"` assertion
 fails ⇒ `store-add-tree` red. Proves the rung's content-addressed path differential
 against the daemon is live. Reverted; rung green again.
+
+**R11 store-verify's corruption detection is load-bearing — store-verify** (2026-06-14,
+increment 7). Perturbed `store-verify` to never flag a mismatch (`if false && &got !=
+recorded`) — the arm is CLI glue, not unit-tested, so the binary still built — ran the
+`store-verify` rung: the deliberately corrupted probe was NOT detected (verify exited 0) ⇒
+the rung's `if store-verify …; then FAIL "did NOT detect the corrupted probe"` fires ⇒
+`store-verify` red. Proves the integrity check actually compares re-hashed content to the
+record, not a vacuous pass. Reverted; rung green again.
