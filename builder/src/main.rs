@@ -41,10 +41,14 @@ impl std::io::Write for HashWriter {
     }
 }
 
-fn nar_hash(path: &str) -> Result<String, std::io::Error> {
+fn nar_hash_path(path: &Path) -> Result<String, std::io::Error> {
     let mut w = HashWriter(sha256::Sha256::new());
-    nar::write_nar(&mut w, Path::new(path))?;
+    nar::write_nar(&mut w, path)?;
     Ok(format!("sha256:{}", sha256::to_base16(&w.0.finalize())))
+}
+
+fn nar_hash(path: &str) -> Result<String, std::io::Error> {
+    nar_hash_path(Path::new(path))
 }
 
 fn main() -> ExitCode {
@@ -407,6 +411,67 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-check: td OWNS the reproducibility oracle. Execute the SAME .drv
+        // TWICE in two independent userns sandbox runs and compare the per-output
+        // NAR hashes — td's own `guix build --check`, with no daemon in the
+        // verdict. CLOSURE lists every store path the build may see (one per
+        // line); the two builds land under SCRATCH/r1 and SCRATCH/r2. Exits 0 if
+        // every output is bit-for-bit identical across the two builds, 3 if any
+        // output diverges (NON-REPRODUCIBLE — a FAILING test per prime directive 1).
+        Some("check") if args.len() == 5 => {
+            let (drv_path, closure_file, scratch) = (&args[2], &args[3], &args[4]);
+            let run = || -> Result<bool, String> {
+                let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
+                let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let closure: Vec<String> = std::fs::read_to_string(closure_file)
+                    .map_err(|e| e.to_string())?
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let scratch1 = Path::new(scratch).join("r1");
+                let scratch2 = Path::new(scratch).join("r2");
+                // Two independent builds of the same derivation.
+                let out1 = sandbox::build(&parsed, drv_path, &closure, &scratch1)
+                    .map_err(|e| e.to_string())?;
+                let out2 = sandbox::build(&parsed, drv_path, &closure, &scratch2)
+                    .map_err(|e| e.to_string())?;
+                let mut reproducible = true;
+                for (name, host1) in &out1 {
+                    let host2 = &out2
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .ok_or_else(|| format!("output `{name}' missing from the second build"))?
+                        .1;
+                    let store_path = &parsed
+                        .outputs
+                        .iter()
+                        .find(|o| &o.name == name)
+                        .expect("output came from this drv")
+                        .path;
+                    let h1 = nar_hash_path(host1).map_err(|e| e.to_string())?;
+                    let h2 = nar_hash_path(host2).map_err(|e| e.to_string())?;
+                    if h1 == h2 {
+                        println!("CHECK {name} {store_path} {h1} reproducible");
+                    } else {
+                        println!("CHECK {name} {store_path} {h1} != {h2} NON-REPRODUCIBLE");
+                        reproducible = false;
+                    }
+                }
+                Ok(reproducible)
+            };
+            match run() {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => {
+                    eprintln!("td-builder: check {drv_path}: NOT reproducible");
+                    ExitCode::from(3)
+                }
+                Err(e) => {
+                    eprintln!("td-builder: check {drv_path}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // corpus-independence: run AS a derivation's builder, executing the
         // autotools phases in Rust (replaces gnu-build-system). Reads the build
         // environment from env vars (out, TD_SRC, TD_INPUTS, TD_CONFIGURE_FLAGS)
@@ -423,6 +488,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder nar-hash PATH");
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
+            eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)
         }
