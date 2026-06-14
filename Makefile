@@ -668,6 +668,7 @@ store-register:
 	oracle_refs=`sqlite3 "$$live" "$$refsql"`; \
 	oracle_out=`sqlite3 "$$live" "SELECT d.id||':'||d.path FROM DerivationOutputs d JOIN ValidPaths v ON d.drv=v.id WHERE d.path='$$out'"`; \
 	test -n "$$oracle_row" || { echo "FAIL: hello not in the live store DB snapshot (WAL not checkpointed?)" >&2; exit 1; }; \
+	test -n "$$oracle_refs" -a -n "$$oracle_out" || { echo "FAIL: the daemon recorded no refs / drv->output for hello — the refs/output legs would compare vacuously" >&2; exit 1; }; \
 	echo "   daemon: $$oracle_row"; \
 	echo ">> td WRITES it: backup the DB, delete the daemon's hello row, load td's SQL, query back"; \
 	sqlite3 "$$live" ".backup '$$scratch/copy.db'"; \
