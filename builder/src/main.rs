@@ -309,6 +309,56 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: WRITE the store-DB registration for a store path ourselves —
+        // the daemon's `ValidPaths`/`Refs`/`DerivationOutputs` authority, computed in
+        // Rust (NAR hash + size + reference scan, the same machinery `build` uses) and
+        // emitted as SQL (sqlite3 is the engine, like the daemon's libsqlite). Usage:
+        //   store-register STORE-PATH DERIVER CANDIDATES-FILE
+        // CANDIDATES-FILE lists the store paths to scan references against (the
+        // deriver's build closure). registrationTime is the daemon's "now" — a fixed
+        // sentinel here, excluded from the differential.
+        Some("store-register") if args.len() == 5 => {
+            let (store_path, deriver, candidates_file) = (&args[2], &args[3], &args[4]);
+            let run = || -> Result<String, String> {
+                let candidates: Vec<String> = std::fs::read_to_string(candidates_file)
+                    .map_err(|e| e.to_string())?
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+                nar::write_nar(&mut scanner, Path::new(store_path)).map_err(|e| e.to_string())?;
+                let (hash, size, refs) = scanner.finish();
+                // The store paths are a safe charset (no quotes); single-quote literals.
+                let mut sql = String::new();
+                sql.push_str(&format!(
+                    "INSERT INTO ValidPaths (path, hash, registrationTime, deriver, narSize) \
+                     VALUES ('{store_path}', '{hash}', 1, '{deriver}', {size});\n"
+                ));
+                for r in &refs {
+                    sql.push_str(&format!(
+                        "INSERT INTO Refs (referrer, reference) \
+                         SELECT a.id, b.id FROM ValidPaths a, ValidPaths b \
+                         WHERE a.path='{store_path}' AND b.path='{r}';\n"
+                    ));
+                }
+                sql.push_str(&format!(
+                    "INSERT INTO DerivationOutputs (drv, id, path) \
+                     SELECT v.id, 'out', '{store_path}' FROM ValidPaths v WHERE v.path='{deriver}';\n"
+                ));
+                Ok(sql)
+            };
+            match run() {
+                Ok(sql) => {
+                    print!("{sql}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-register {store_path}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-drv-assemble: ASSEMBLE the `.drv` from a raw SPEC (Guile resolved the
         // inputs and emitted it WITHOUT `(derivation …)`) and REGISTER it via the
         // daemon — so the build derivation enters the store with no guile
@@ -597,6 +647,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
+            eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)
         }
