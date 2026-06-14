@@ -13,7 +13,7 @@ are stable anchors; `CLAUDE.md` and `PLAN.md` reference them, so keep them.
 It states the north star and the standing decisions — **not the history**: how we got
 here lives in `HISTORY.md` and git, and milestone narration does not belong in this
 file. To stay DRY, each volatile fact lives in exactly one place and everything else
-points at it: the rung list in the `Makefile`'s `check:` line, claim status in
+points at it: the gate list in the `mk/gates/*.mk` fragments, claim status in
 `PLAN.md`, completed milestones in `HISTORY.md`. `CLAUDE.md` mirrors only the stable
 contract (§1, §3, §7.2–7.3). If two statements disagree anyway, **the later-dated
 decision governs**; reconcile the older text on sight.
@@ -40,10 +40,11 @@ offline sandbox (td's own `td-builder host-sandbox` by default — the loop-sand
 §7.1; `TD_LOOP_GUIX_SHELL=1` selects the original `guix shell -C --pure` oracle — store
 and daemon-socket exposure, a guard that host guix matches the `channels.scm` pin,
 substitutes disabled) and runs
-`make check` inside it. `make check` runs the rung ladder, short-circuiting on the
-first failure; **the `Makefile`'s `CHEAP_RUNGS`/`HEAVY_RUNGS` pools (expanded by its
-`check:` target) are the authoritative rung list** — documents point here instead of
-restating it. Broad shape: config eval →
+`make check` inside it. `make check` runs the gate ladder, short-circuiting on the
+first failure; **the drop-in fragments under `mk/gates/*.mk` (each self-registering
+into the `CHEAP_GATES`/`HEAVY_GATES` pools the `check:` target expands) are the
+authoritative gate list** — documents point here instead of restating it, and a new
+gate is a new fragment file, not an edit to a shared list. Broad shape: config eval →
 differentials → `guix build --check` → behavioral/marionette tests. Plain
 `make check` is only correct when you're already inside that sandbox.
 
