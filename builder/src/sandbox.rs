@@ -153,12 +153,12 @@ pub fn build(
             fs::write("/proc/self/uid_map", format!("{GUEST_UID} {host_uid} 1"))?;
             fs::write("/proc/self/gid_map", format!("{GUEST_GID} {host_gid} 1"))?;
             // Keep every mount below private to this namespace.
-            sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE)?;
+            sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)?;
             for (src, dst) in &binds {
-                sys::mount(Some(src), dst, None, sys::MS_BIND)?;
+                sys::mount(Some(src), dst, None, sys::MS_BIND, None)?;
             }
-            sys::mount(Some(&newstore_c), &store_c, None, sys::MS_BIND | sys::MS_REC)?;
-            sys::mount(Some(&tmpfs_c), &tmp_c, Some(&tmpfs_c), 0)?;
+            sys::mount(Some(&newstore_c), &store_c, None, sys::MS_BIND | sys::MS_REC, None)?;
+            sys::mount(Some(&tmpfs_c), &tmp_c, Some(&tmpfs_c), 0, None)?;
             fs::DirBuilder::new().mode(0o700).create(&build_dir_owned)?;
             std::env::set_current_dir(&build_dir_owned)?;
             Ok(())
@@ -230,6 +230,11 @@ pub fn host_shell(
 
     // Precompute every CString in the parent (the child's pre_exec only does
     // syscalls + fs ops, mirroring `build` above).
+    // tmpfs root/dirs are owned by uid 0 of the new userns by default; with the
+    // identity uid map (below) that is unmapped, so set the owner explicitly to
+    // the host uid/gid via the tmpfs `uid=/gid=` mount data — keeps the dirs
+    // writable while the process stays the (non-root) host uid.
+    let tmpfs_data = CString::new(format!("uid={host_uid},gid={host_gid}")).unwrap();
     let newroot_c = CString::new(newroot.as_os_str().as_encoded_bytes()).unwrap();
     let root_c = CString::new("/").unwrap();
     let tmpfs_c = CString::new("tmpfs").unwrap();
@@ -284,7 +289,14 @@ pub fn host_shell(
     // EPERMs; GUIX_BUILD_OPTIONS carries the loop's --no-substitutes/--no-offload
     // posture (check.sh sets it for the in-loop `guix build`/`system` calls).
     // Harmless, and keeps behaviour identical to the outer shell.
-    for k in ["TERM", "GUIX_LOCPATH", "USER", "LOGNAME", "GUIX_BUILD_OPTIONS"] {
+    for k in [
+        "TERM",
+        "GUIX_LOCPATH",
+        "USER",
+        "LOGNAME",
+        "GUIX_BUILD_OPTIONS",
+        "GUIX_ENVIRONMENT",
+    ] {
         if let Ok(v) = std::env::var(k) {
             command.env(k, v);
         }
@@ -300,39 +312,43 @@ pub fn host_shell(
                     | sys::CLONE_NEWUTS,
             )?;
             fs::write("/proc/self/setgroups", "deny")?;
-            // Standard rootless map: inside-root (uid 0) → the host uid, so the
-            // process owns the fresh tmpfs root/dirs (writable) while the host
-            // daemon's SO_PEERCRED still resolves to the real host user (the
-            // kernel translates inner uid 0 back to the host uid).
-            fs::write("/proc/self/uid_map", format!("0 {host_uid} 1"))?;
-            fs::write("/proc/self/gid_map", format!("0 {host_gid} 1"))?;
+            // IDENTITY map (host uid/gid → itself), exactly like `guix shell -C`:
+            // the process stays the NON-root host uid inside, so file-permission
+            // checks (e.g. sqlite's access(W_OK) on the root-owned store DB)
+            // behave as on the host — a uid-0 map would make root bypass them and
+            // then fail on the real write. tmpfs ownership is handled via the
+            // `uid=/gid=` mount data instead. The daemon's SO_PEERCRED sees the
+            // real host uid either way.
+            fs::write("/proc/self/uid_map", format!("{host_uid} {host_uid} 1"))?;
+            fs::write("/proc/self/gid_map", format!("{host_gid} {host_gid} 1"))?;
             // Own network namespace (offline by construction, like `guix shell
             // -C`); bring its loopback up to match that posture. The daemon
             // socket is a Unix socket on the bound /var/guix, so it stays
             // reachable across the netns boundary.
             sys::bring_loopback_up()?;
             // Everything below private to this namespace.
-            sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE)?;
+            sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)?;
             // A fresh tmpfs is the new root (also makes it a mount point, which
-            // pivot_root requires).
-            sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0)?;
+            // pivot_root requires), owned by the host uid/gid.
+            sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, Some(&tmpfs_data))?;
             // Expose each requested host path (rbind), read-only where asked.
             for (src_c, target_dir, target_c, readonly) in &bind_specs {
                 fs::create_dir_all(target_dir)?;
-                sys::mount(Some(src_c), target_c, None, sys::MS_BIND | sys::MS_REC)?;
+                sys::mount(Some(src_c), target_c, None, sys::MS_BIND | sys::MS_REC, None)?;
                 if *readonly {
                     sys::mount(
                         None,
                         target_c,
                         None,
                         sys::MS_REMOUNT | sys::MS_BIND | sys::MS_REC | sys::MS_RDONLY,
+                        None,
                     )?;
                 }
             }
-            // Writable scratch tmpfs mounts (/tmp, HOME).
+            // Writable scratch tmpfs mounts (/tmp, HOME), owned by the host uid.
             for (target_dir, target_c) in &tmpfs_specs {
                 fs::create_dir_all(target_dir)?;
-                sys::mount(Some(&tmpfs_c), target_c, Some(&tmpfs_c), 0)?;
+                sys::mount(Some(&tmpfs_c), target_c, Some(&tmpfs_c), 0, Some(&tmpfs_data))?;
             }
             // pivot into the new root and drop the old one entirely.
             fs::create_dir_all(&oldroot_rel)?;

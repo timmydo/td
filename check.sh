@@ -183,6 +183,16 @@ fi
 # still PROVISIONS the toolchain profile — td replaces the CONTAINER, not guix's
 # profile machinery. Escape hatch: TD_LOOP_GUIX_SHELL=1 runs the original
 # `guix shell -C` path below (the oracle, for differential/triage).
+#
+# ONE rung — `rootless` — cannot run nested in td's sandbox: it builds in its OWN
+# unprivileged user namespace and snapshots the LIVE store DB, and that WAL
+# snapshot cannot coordinate with the host daemon from a nested non-root client
+# (double-nested userns). So `rootless` runs in its native `guix shell -C` (not
+# skipped — full assertions, and a failure fails the whole check), while the
+# other 36 rungs run under td's sandbox via `check-sandbox`.
+case " $* " in
+  *" rootless "*) TD_LOOP_GUIX_SHELL=1 ;;   # explicit rootless → guix shell -C
+esac
 if [ -z "${TD_LOOP_GUIX_SHELL-}" ]; then
   tb=$(guix build -L . -e '(@ (system td-builder) td-builder)')/bin/td-builder
   [ -x "$tb" ] || { echo "check.sh: FATAL: could not build td-builder for the loop sandbox." >&2; exit 1; }
@@ -194,10 +204,23 @@ if [ -z "${TD_LOOP_GUIX_SHELL-}" ]; then
       make bash coreutils sed grep findutils tar gzip crun util-linux sqlite \
       --search-paths | sed -n 's/^export PATH="\([^$]*\).*/\1/p' | head -n1)
   [ -n "$toolchain" ] || { echo "check.sh: FATAL: could not provision the loop toolchain PATH." >&2; exit 1; }
+  # GUIX_ENVIRONMENT is the profile root (what `guix shell -C` exports) — the
+  # `rootless` rung binds it into its staged store. The first PATH entry is the
+  # profile's bin; its parent is the profile root.
+  guix_env=$(dirname "${toolchain%%:*}")
+  # Full loop: run `rootless` in its native guix shell -C first (failing the
+  # whole check on its failure), then the other 36 rungs under td's sandbox.
+  targets="$*"
+  if [ "$targets" = "check" ]; then
+    echo "check.sh: 'rootless' runs under guix shell -C (it cannot nest in td's sandbox); the other 36 rungs run under td's sandbox" >&2
+    TD_LOOP_GUIX_SHELL=1 "$0" rootless || exit 1
+    targets="check-sandbox"
+  fi
   exec env \
     PATH="$hostguix_dir:$toolchain" \
     GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
-    "$tb" host-sandbox --expose-cwd -- make -j2 --output-sync=target "$@"
+    GUIX_ENVIRONMENT="$guix_env" \
+    "$tb" host-sandbox --expose-cwd -- make -j2 --output-sync=target $targets
 fi
 
 exec guix shell -C --pure \
