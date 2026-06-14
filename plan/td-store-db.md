@@ -38,17 +38,25 @@ the same SQLite engine the daemon uses (libsqlite); the AUTHORITY LOGIC (which r
 with which values) is td's, in Rust. (Hand-rolling the SQLite file format is a possible
 later zero-dep purism; sqlite3 is already a declared input, used by the `rootless` rung.)
 
-Rung `store-register` (differential, daemon = oracle):
-1. Build hello via the daemon (oracle) → the real store path + the daemon's recorded
-   `ValidPaths` row (hash/narSize/deriver) + its `Refs` (referenced paths).
-2. `td-builder build` it in td's staged store → td's path/nar-hash/nar-size/refs/deriver.
-3. `td-builder store-register …` emits the SQL; load it into a FRESH DB (schema-only).
-4. Assert td's DB rows for the artifact **match the daemon's** on every deterministic
-   field: same `hash`, `narSize`, `deriver`, and the same set of referenced PATHS
-   (join `Refs`→`ValidPaths`), and the `DerivationOutputs(drv,"out",path)` mapping.
-   Verify red: perturb a field (wrong hash / a dropped ref) ⇒ the differential diverges.
+**td writes the SQLite FILE FORMAT itself** — not SQL for the `sqlite3` engine. The
+`store_db` module (zero-dep, unit-tested) writes the 100-byte file header, table
+b-tree leaf pages (page type `0x0d`), and the record format (a header of serial-type
+varints + the values), assembling a valid SQLite DB. This is the real replacement of
+the daemon's libsqlite, not a thin SQL emitter.
 
-This proves td reproduces the daemon's store-DB registration authority for one artifact.
+Rung `store-register` (differential, daemon = oracle):
+1. `td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB` scans the
+   artifact (NAR hash + size + refs, the `build` machinery) and WRITES a store DB at
+   OUT-DB in pure Rust (its ValidPaths row fully computed; the references + deriver as
+   minimal scaffolding rows so the joins resolve).
+2. `sqlite3` confirms td's hand-written DB is a structurally valid SQLite file
+   (`PRAGMA integrity_check` = ok) and reads back hello's row, refs, drv→output.
+3. Assert those **match the daemon's** recorded registration (immutable read of the
+   live DB): same `hash`, `narSize`, `deriver`, referenced PATHS, and the
+   `DerivationOutputs(drv,"out",path)` mapping. Verify red: perturb a field ⇒ diverge.
+
+This proves td reproduces the daemon's store-DB authority — writing the actual DB
+bytes — for one artifact.
 
 ## Later increments (sketch — not this PR)
 
@@ -62,25 +70,33 @@ This proves td reproduces the daemon's store-DB registration authority for one a
 ## Sub-task ladder
 
 1. Claim + plan + DESIGN entry. — A.
-2. `store-register` SQL emission + the differential rung. Verify red. — B.
+2. `store_db` SQLite file-format writer (unit-tested) + `store-register` writing a store
+   DB + the differential rung. Verify red. — B.
 3. Full `./check.sh` green; PR. — C.
 
 ## Implementation progress
 
-- **DONE 2026-06-14.** `store-register` subcommand + the `store-register` rung GREEN
-  inside td's own sandbox: for the corpus `hello`, td's emitted registration — loaded
-  into a working copy of the store DB after deleting the daemon's own row — queries
-  back BYTE-IDENTICAL to the daemon's record (hash `sha256:0f28ab…`, narSize 282616,
-  deriver, all 3 referenced paths incl. the self-ref, the drv→output mapping). The
-  candidates for the reference scan must be the output's runtime closure (`guix gc -R
-  $out`), NOT the drv's build closure (`gc -R $drv` — those are drvs/sources, so the
-  scan found zero refs). Reuses the `scan`/`nar` machinery `build` uses.
+- **DONE 2026-06-14.** New `builder/src/store_db.rs` — a zero-dep SQLite FILE-FORMAT
+  writer (the 100-byte header, table b-tree leaf pages `0x0d`, the record/serial-type
+  varint encoding), 4 unit tests. `store-register` scans the artifact (NAR hash + size
+  + refs, the `build` machinery) and WRITES a store DB in pure Rust. The `store-register`
+  rung GREEN inside td's own sandbox: `sqlite3 PRAGMA integrity_check` = ok on td's
+  hand-written DB, and hello's registration reads back BYTE-IDENTICAL to the daemon
+  (hash `sha256:0f28ab…`, narSize 282616, deriver, all 3 referenced paths incl. the
+  self-ref, the drv→output mapping). 30 cargo tests pass. Findings: the reference-scan
+  candidates must be the output's runtime closure (`guix gc -R $out`), NOT the drv's
+  build closure (`gc -R $drv` — those are drvs/sources, scan found zero refs); the
+  references + deriver are written as minimal scaffolding rows so the joins resolve
+  (full-closure rows + the exact daemon schema are later increments). NOTE: this replaced
+  an earlier thin "emit SQL for sqlite3 to run" cut (human: "I don't see much code or
+  tests") — td now writes the actual DB bytes.
 
 ## Verified-red log
 
 **R1 the registration differential is non-vacuous** (2026-06-14). Perturbed
-`store-register` to emit `narSize` as `size + 1`, rebuilt, ran the differential: td's
-row narSize (282617) ≠ the daemon's (282616) ⇒ the rung's `test "$td_row" =
+`store-register` to write the artifact's `narSize` as `size + 1` (`Value::Int(size + 1)`)
+into td's store DB, rebuilt, ran the differential: `sqlite3` reads td's hand-written DB
+row narSize as 282617 ≠ the daemon's 282616 ⇒ the rung's `test "$td_row" =
 "$oracle_row"` fails ⇒ `store-register` red ("td's ValidPaths row … != the daemon's").
-Proves the rung genuinely compares td's written registration to the daemon's, not a
-vacuous pass. Reverted; rung green again.
+Proves the rung genuinely compares td's WRITTEN DB to the daemon's record (and that
+sqlite3 really parsed td's bytes), not a vacuous pass. Reverted; rung green again.

@@ -636,21 +636,24 @@ loop-rung:
 	echo "PASS: a REAL loop rung (eval — loads every system/test module + prints 'eval ok', exit 0) ran with IDENTICAL stdout AND success inside td's OWN full-env sandbox (td-builder host-sandbox --expose-cwd: worktree + toolchain + cache + cgroups exposed) as directly under check.sh's guix shell -C; the Step-1 full-rung differential for the loop-tooling swap — check.sh's entry is still unchanged (Step 2 deferred)."
 
 # store-register (DESIGN §7.1; td-store-db track — begin replacing guix-daemon). td
-# writes the store-DB REGISTRATION itself — the daemon's `ValidPaths`/`Refs`/
-# `DerivationOutputs` authority — instead of the daemon. `td-builder store-register`
-# computes the NAR hash + size + reference scan (the same machinery `build` uses) and
-# emits the registration as SQL; sqlite3 loads it (the engine the daemon's libsqlite
-# is). The differential (daemon = oracle, prime directive 4): for the corpus `hello`,
-# td's emitted registration, loaded into a working copy of the store DB (so the Refs
-# FKs resolve against the real closure) after deleting the daemon's own row, queries
-# back BYTE-IDENTICAL to the daemon's recorded registration — same hash, narSize,
-# deriver, the same set of referenced paths, and the same drv→output mapping.
-# `registrationTime` (the daemon's "now") is the one non-deterministic field, excluded.
-# Boundary: we read the host DB immutably and write only a SCRATCH copy — the host
-# daemon stays immutable infra; td operates its own store DB. Light (a NAR scan of one
-# warm output + sqlite ops), but needs td-builder built, so it slots in the heavy pool.
+# WRITES the store SQLite DB itself — the daemon's `ValidPaths`/`Refs`/
+# `DerivationOutputs` authority. `td-builder store-register` computes the NAR hash +
+# size + reference scan (the same machinery `build` uses) AND writes the SQLite FILE
+# FORMAT directly (the `store_db` module: header + table b-tree leaf pages + the
+# record/varint encoding, zero-dep) — the real replacement of the daemon's libsqlite,
+# with NO `sqlite3` engine writing it. The rung: td writes a store DB; `sqlite3`
+# (a) confirms it is a structurally valid SQLite file (`PRAGMA integrity_check` = ok),
+# and (b) reads back hello's registration. The differential (daemon = oracle, prime
+# directive 4): td's hello row, references, and drv→output read BYTE-IDENTICAL to the
+# daemon's recorded registration (hash, narSize, deriver, the referenced paths, the
+# drv→output mapping). `registrationTime` (the daemon's "now") is the one excluded
+# field; the referenced paths + the deriver are minimal scaffolding rows (full-closure
+# rows + the exact daemon schema — indexes/trigger/autoincrement — are later
+# increments). Boundary: the host DB is read IMMUTABLY only; td writes only its OWN
+# scratch DB — the host daemon stays immutable infra. Needs td-builder built, so it
+# slots in the heavy pool.
 store-register:
-	@echo ">> store-register: td WRITES the store-DB registration (ValidPaths/Refs/DerivationOutputs) itself — byte-identical to the daemon's record"
+	@echo ">> store-register: td WRITES the store SQLite DB itself (pure-Rust file format) — sqlite3 validates it; hello's registration reads back byte-identical to the daemon"
 	@set -euo pipefail; \
 	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
@@ -658,33 +661,27 @@ store-register:
 	test -n "$$out" -a -n "$$drv" || { echo "ERROR: could not realise hello" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.store-register-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	guix gc -R "$$out" | sort -u > "$$scratch/candidates.txt"; \
-	echo ">> td emits the store-DB registration SQL for $$out"; \
-	"$$tb" store-register "$$out" "$$drv" "$$scratch/candidates.txt" > "$$scratch/td.sql"; \
-	test -s "$$scratch/td.sql" || { echo "FAIL: td emitted no registration SQL" >&2; exit 1; }; \
-	live="file:/var/guix/db/db.sqlite?immutable=1"; \
+	echo ">> td WRITES the store SQLite DB at $$scratch/td.db (no sqlite3 engine — td emits the SQLite bytes)"; \
+	"$$tb" store-register "$$out" "$$drv" "$$scratch/candidates.txt" "$$scratch/td.db"; \
+	test -s "$$scratch/td.db" || { echo "FAIL: td wrote no store DB" >&2; exit 1; }; \
+	echo ">> sqlite3 validates td's hand-written DB: $$(sqlite3 "$$scratch/td.db" "PRAGMA integrity_check")"; \
+	test "`sqlite3 "$$scratch/td.db" "PRAGMA integrity_check"`" = "ok" || { echo "FAIL: td's store DB is not a valid SQLite file (integrity_check failed)" >&2; exit 1; }; \
+	rowsql="SELECT hash||'|'||narSize||'|'||deriver FROM ValidPaths WHERE path='$$out'"; \
 	refsql="SELECT b.path FROM Refs r JOIN ValidPaths a ON r.referrer=a.id JOIN ValidPaths b ON r.reference=b.id WHERE a.path='$$out' ORDER BY b.path"; \
-	echo ">> oracle: the daemon's recorded registration (immutable read of the live store DB)"; \
-	oracle_row=`sqlite3 "$$live" "SELECT hash||'|'||narSize||'|'||deriver FROM ValidPaths WHERE path='$$out'"`; \
-	oracle_refs=`sqlite3 "$$live" "$$refsql"`; \
-	oracle_out=`sqlite3 "$$live" "SELECT d.id||':'||d.path FROM DerivationOutputs d JOIN ValidPaths v ON d.drv=v.id WHERE d.path='$$out'"`; \
+	outsql="SELECT d.id||':'||d.path FROM DerivationOutputs d JOIN ValidPaths v ON d.drv=v.id WHERE d.path='$$out'"; \
+	td_row=`sqlite3 "$$scratch/td.db" "$$rowsql"`; td_refs=`sqlite3 "$$scratch/td.db" "$$refsql"`; td_out=`sqlite3 "$$scratch/td.db" "$$outsql"`; \
+	live="file:/var/guix/db/db.sqlite?immutable=1"; \
+	oracle_row=`sqlite3 "$$live" "$$rowsql"`; oracle_refs=`sqlite3 "$$live" "$$refsql"`; oracle_out=`sqlite3 "$$live" "$$outsql"`; \
 	test -n "$$oracle_row" || { echo "FAIL: hello not in the live store DB snapshot (WAL not checkpointed?)" >&2; exit 1; }; \
 	test -n "$$oracle_refs" -a -n "$$oracle_out" || { echo "FAIL: the daemon recorded no refs / drv->output for hello — the refs/output legs would compare vacuously" >&2; exit 1; }; \
 	echo "   daemon: $$oracle_row"; \
-	echo ">> td WRITES it: backup the DB, delete the daemon's hello row, load td's SQL, query back"; \
-	sqlite3 "$$live" ".backup '$$scratch/copy.db'"; \
-	sqlite3 "$$scratch/copy.db" "DELETE FROM Refs WHERE referrer=(SELECT id FROM ValidPaths WHERE path='$$out'); DELETE FROM DerivationOutputs WHERE path='$$out'; DELETE FROM ValidPaths WHERE path='$$out';"; \
-	test -z "`sqlite3 "$$scratch/copy.db" "SELECT 1 FROM ValidPaths WHERE path='$$out'"`" || { echo "FAIL: hello not removed from the working copy" >&2; exit 1; }; \
-	sqlite3 "$$scratch/copy.db" < "$$scratch/td.sql"; \
-	td_row=`sqlite3 "$$scratch/copy.db" "SELECT hash||'|'||narSize||'|'||deriver FROM ValidPaths WHERE path='$$out'"`; \
-	td_refs=`sqlite3 "$$scratch/copy.db" "$$refsql"`; \
-	td_out=`sqlite3 "$$scratch/copy.db" "SELECT d.id||':'||d.path FROM DerivationOutputs d JOIN ValidPaths v ON d.drv=v.id WHERE d.path='$$out'"`; \
 	echo "   td    : $$td_row"; \
 	test "$$td_row" = "$$oracle_row" || { echo "FAIL: td's ValidPaths row ($$td_row) != the daemon's ($$oracle_row)" >&2; exit 1; }; \
 	test "$$td_refs" = "$$oracle_refs" || { echo "FAIL: td's references differ from the daemon's." >&2; echo "  td refs:     $$td_refs" >&2; echo "  daemon refs: $$oracle_refs" >&2; exit 1; }; \
 	test "$$td_out" = "$$oracle_out" || { echo "FAIL: td's drv->output mapping ($$td_out) != the daemon's ($$oracle_out)" >&2; exit 1; }; \
 	echo "   refs ($$(echo "$$td_refs" | wc -l)) + drv->output match the daemon"; \
 	rm -rf "$$scratch"; \
-	echo "PASS: td WROTE the store-DB registration for $$out itself (ValidPaths + Refs + DerivationOutputs, no daemon registerValidPaths) — loaded into a working store DB it queries back BYTE-IDENTICAL to the daemon's record (hash, narSize, deriver, the referenced paths, and the drv->output mapping); the daemon is only the oracle. registrationTime (the daemon's 'now') is the one excluded field."
+	echo "PASS: td WROTE the store SQLite DB for $$out itself, in pure Rust (the store_db file-format writer, no sqlite3 engine) — it passes sqlite3 PRAGMA integrity_check, and its hello registration (ValidPaths row, Refs, drv->output) reads back BYTE-IDENTICAL to the daemon's record (hash, narSize, deriver, referenced paths, drv->output); the daemon is only the oracle. registrationTime excluded; full-closure rows + the exact daemon schema are later increments."
 
 # ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
 # `tsc` (the pinned td-typescript input, run under the packaged node) BOTH

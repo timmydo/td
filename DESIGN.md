@@ -712,12 +712,14 @@ run concurrently):
   the daemon RPC (#27) / `--check`s its own derivations — build execution is td's. What
   is still ONLY the daemon's is the store-DB **authority**: the `ValidPaths`/`Refs`/
   `DerivationOutputs` rows that make a path valid. Increment 1 (the `store-register`
-  rung): `td-builder store-register` WRITES those rows itself (NAR hash + size +
-  reference scan in Rust, emitted as SQL; sqlite3 is the engine) — for `hello`, loaded
-  into a working copy of the store DB after deleting the daemon's own row, it queries
-  back byte-identical to the daemon's record (hash, narSize, deriver, referenced paths,
-  drv→output); `registrationTime` excluded; verified-red. Boundary: the host daemon
-  stays immutable infra (immutable read + scratch copy only); td operates its OWN store
+  rung): `td-builder store-register` WRITES the store SQLite DB ITSELF — a zero-dep
+  SQLite FILE-FORMAT writer in Rust (`builder/src/store_db.rs`: the file header, table
+  b-tree leaf pages, the record/serial-type varint encoding; unit-tested), the real
+  replacement of the daemon's libsqlite (no sqlite3 engine writing it). For `hello`, td
+  writes a store DB whose registration `sqlite3` reads back byte-identical to the
+  daemon's record (hash, narSize, deriver, referenced paths, drv→output) and which
+  passes `PRAGMA integrity_check`; `registrationTime` excluded; verified-red. Boundary:
+  the host daemon stays immutable infra (immutable read only); td operates its OWN store
   DB, daemon = oracle (directive 4). Later: full-closure validity, end-to-end
   `addToStore`, GC. Working state + verified-red log: `plan/td-store-db.md`.
 
