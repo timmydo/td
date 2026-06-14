@@ -58,11 +58,20 @@ Rung `store-register` (differential, daemon = oracle):
 This proves td reproduces the daemon's store-DB authority — writing the actual DB
 bytes — for one artifact.
 
+## Increment 2 (DONE 2026-06-14): full-closure registration
+
+`store-register` now registers EVERY path in the artifact's closure (`guix gc -R`),
+each fully scanned — no placeholder rows except the deriver (a `.drv`, not a closure
+member). The differential asserts, byte-identical to the daemon: (1) every closure
+path's `hash` + `narSize`, (2) the full inter-path `Refs` relation, (3) the artifact's
+deriver + drv→output. Removes increment 1's scaffolding caveat. Per-path derivers of the
+non-artifact members (the daemon's input-resolution) + `registrationTime` excluded.
+
 ## Later increments (sketch — not this PR)
 
-- Register the full closure into a td store DB and have `guix`/a fresh daemon on td's
-  `GUIX_STATE_DIRECTORY` report the artifact VALID (queryable end-to-end), no daemon
-  having written it.
+- Have `guix`/a fresh daemon on td's `GUIX_STATE_DIRECTORY` report the artifact VALID
+  (queryable end-to-end) — needs the exact daemon schema (indexes/trigger/sequence) so
+  the daemon accepts td's hand-written DB.
 - `addToStore` end-to-end in td (write the path + register) into a td store.
 - GC reachability (the daemon's third role).
 - Eventually a td store backend the system can use, daemon retired for the build side.
