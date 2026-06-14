@@ -489,37 +489,85 @@ fn main() -> ExitCode {
         }
         // loop-sandbox: the DEV-SHELL — run a command inside td's own hermetic
         // container (pivot into a fresh root exposing the WHOLE /gnu/store (ro),
-        // the daemon socket /var/guix, and /proc; host-guix on PATH), toward
-        // replacing `guix shell -C`. Usage: `host-sandbox -- CMD ARGS...`.
-        Some("host-sandbox") if args.len() >= 4 && args[2] == "--" => {
-            let cmd = &args[3];
-            let cmd_args: Vec<String> = args[4..].to_vec();
+        // the daemon socket /var/guix, /proc, /dev; host-guix on PATH; its own
+        // loopback-only netns), toward replacing `guix shell -C`. With
+        // `--expose-cwd` it adds the FULL loop env (worktree + cgroups + guix
+        // cache, caller PATH + TD_CHECK_* preserved, chdir into the cwd) so a real
+        // rung runs as under `guix shell -C`. Usage:
+        //   host-sandbox [--expose-cwd] -- CMD ARGS...
+        Some("host-sandbox") if args.len() >= 4 => {
+            let mut i = 2usize;
+            let mut expose_cwd = false;
+            while i < args.len() && args[i] != "--" {
+                match args[i].as_str() {
+                    "--expose-cwd" => expose_cwd = true,
+                    other => {
+                        eprintln!("td-builder: host-sandbox: unknown flag `{other}'");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            if i >= args.len() || i + 1 >= args.len() {
+                eprintln!("usage: td-builder host-sandbox [--expose-cwd] -- CMD ARGS...");
+                return ExitCode::from(2);
+            }
+            let cmd = args[i + 1].clone();
+            let cmd_args: Vec<String> = args[i + 2..].to_vec();
             let run = || -> Result<std::process::ExitStatus, String> {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/home/td".to_string());
-                let guix_bin = host_guix_bin_dir().unwrap_or_default();
-                // The loop exposure set: the whole store (ro), the daemon socket
+                // The base exposure set: the whole store (ro), the daemon socket
                 // + GC roots (rw), /proc, and the host device tree.
-                let binds = vec![
+                let mut binds = vec![
                     sandbox::Bind { src: "/gnu/store".to_string(), readonly: true },
                     sandbox::Bind { src: "/var/guix".to_string(), readonly: false },
                     sandbox::Bind { src: "/proc".to_string(), readonly: false },
-                    // The host device tree (rbind) — tools need /dev/null,
-                    // /dev/urandom, &c. A host-resource exposure like the store
-                    // bind, not a network path; a minimal node-by-node /dev is a
-                    // follow-up.
                     sandbox::Bind { src: "/dev".to_string(), readonly: false },
                 ];
+                let mut tmpfs = vec!["/tmp".to_string()];
+                let mut path_env = String::new();
+                let mut workdir = String::new();
+                let mut extra_env: Vec<(String, String)> = Vec::new();
+                if expose_cwd {
+                    let cwd = std::env::current_dir()
+                        .map_err(|e| e.to_string())?
+                        .to_string_lossy()
+                        .into_owned();
+                    // Worktree (rw, like guix shell -C's shared cwd), the host
+                    // cgroup hierarchy (ro, for crun), and the guix lowering cache
+                    // (rw, check.sh --shares it). HOME is a dir on the writable
+                    // root tmpfs (created by these binds), so no HOME tmpfs.
+                    binds.push(sandbox::Bind { src: cwd.clone(), readonly: false });
+                    if Path::new("/sys/fs/cgroup").is_dir() {
+                        binds.push(sandbox::Bind {
+                            src: "/sys/fs/cgroup".to_string(),
+                            readonly: true,
+                        });
+                    }
+                    let cache = format!("{home}/.cache/guix");
+                    if Path::new(&cache).is_dir() {
+                        binds.push(sandbox::Bind { src: cache, readonly: false });
+                    }
+                    path_env = std::env::var("PATH").unwrap_or_default();
+                    workdir = cwd;
+                    for (k, v) in std::env::vars() {
+                        if k.starts_with("TD_CHECK_") {
+                            extra_env.push((k, v));
+                        }
+                    }
+                } else {
+                    let guix_bin = host_guix_bin_dir().unwrap_or_default();
+                    if !guix_bin.is_empty() {
+                        path_env = format!("{guix_bin}:/run/current-system/profile/bin");
+                    }
+                    tmpfs.push(home.clone());
+                }
                 let scratch = std::env::temp_dir()
                     .join(format!("td-host-sandbox-{}-{}", sys::getuid(), std::process::id()));
                 let _ = std::fs::remove_dir_all(&scratch);
                 std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
                 sandbox::host_shell(
-                    cmd,
-                    &cmd_args,
-                    &binds,
-                    &["/tmp".to_string(), home.clone()],
-                    &guix_bin,
-                    &home,
+                    &cmd, &cmd_args, &binds, &tmpfs, &path_env, &home, &workdir, &extra_env,
                     &scratch,
                 )
                 .map_err(|e| e.to_string())

@@ -202,21 +202,25 @@ pub struct Bind {
 /// The loop-sandbox DEV-SHELL (vs. the build jail above): pivot into a fresh
 /// tmpfs root that exposes ONLY `binds` (rbind, the same path inside) plus a
 /// writable tmpfs at each of `tmpfs_dirs`; the host filesystem is otherwise
-/// gone. `path_prepend` (the host-guix bin dir, itself under the exposed
-/// `/gnu/store`) leads PATH; `home` is HOME (must be one of `tmpfs_dirs`, i.e.
-/// writable). Runs `cmd args` and returns its exit status. Unshares
+/// gone. `path_env` is the full PATH (empty → a default); `home` is HOME;
+/// `workdir` is the cwd to enter after pivot (empty → `/`); `extra_env` is
+/// caller-preserved env (e.g. the check-memo `TD_CHECK_*`). Runs `cmd args` and
+/// returns its exit status. Unshares
 /// NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS; uid/gid are rootless-mapped (inside-0 →
 /// host uid) so the host daemon's peer-cred check still sees the real host uid,
 /// and its own network namespace (loopback brought up) matches `guix shell
 /// -C`'s offline posture — the daemon stays reachable over the Unix socket on
 /// the bound /var/guix.
+#[allow(clippy::too_many_arguments)]
 pub fn host_shell(
     cmd: &str,
     args: &[String],
     binds: &[Bind],
     tmpfs_dirs: &[String],
-    path_prepend: &str,
+    path_env: &str,
     home: &str,
+    workdir: &str,
+    extra_env: &[(String, String)],
     scratch: &Path,
 ) -> io::Result<std::process::ExitStatus> {
     let newroot = scratch.join("root");
@@ -256,25 +260,32 @@ pub fn host_shell(
         ));
     }
 
-    let path_env = if path_prepend.is_empty() {
-        "/run/current-system/profile/bin:/run/current-system/profile/sbin".to_string()
+    let path_env = if path_env.is_empty() {
+        "/run/current-system/profile/bin:/run/current-system/profile/sbin"
     } else {
-        format!("{path_prepend}:/run/current-system/profile/bin")
+        path_env
     };
+    let workdir = if workdir.is_empty() { "/" } else { workdir };
+    let workdir_owned = workdir.to_string();
 
     let mut command = Command::new(cmd);
     command.args(args);
     command.env_clear();
-    command.env("PATH", &path_env);
+    command.env("PATH", path_env);
     command.env("HOME", home);
     command.env("TMPDIR", "/tmp");
-    // guix reads these for locale + terminal; harmless, keeps output identical
-    // to the outer shell.
-    if let Ok(v) = std::env::var("TERM") {
-        command.env("TERM", v);
+    // Caller-preserved env (e.g. the check-memo TD_CHECK_* identity).
+    for (k, v) in extra_env {
+        command.env(k, v);
     }
-    if let Ok(v) = std::env::var("GUIX_LOCPATH") {
-        command.env("GUIX_LOCPATH", v);
+    // guix reads these: TERM/GUIX_LOCPATH for terminal+locale; USER/LOGNAME so it
+    // finds the per-user profile (/var/guix/profiles/per-user/$USER) — without
+    // them `guix time-machine` falls back to the root-owned default profile and
+    // EPERMs. Harmless, and keeps output identical to the outer shell.
+    for k in ["TERM", "GUIX_LOCPATH", "USER", "LOGNAME"] {
+        if let Ok(v) = std::env::var(k) {
+            command.env(k, v);
+        }
     }
 
     unsafe {
@@ -327,6 +338,8 @@ pub fn host_shell(
             std::env::set_current_dir("/")?;
             sys::umount2(&oldroot_abs_c, sys::MNT_DETACH)?;
             let _ = fs::remove_dir("/oldroot");
+            // Enter the requested working directory (e.g. the exposed worktree).
+            std::env::set_current_dir(&workdir_owned)?;
             Ok(())
         });
     }

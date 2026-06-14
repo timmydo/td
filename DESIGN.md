@@ -684,10 +684,15 @@ run concurrently):
   the SAME `.drv` inside td's sandbox as under `guix shell -C` (exposure equivalence,
   guix the oracle); (2) the host worktree is INVISIBLE inside (isolation); (3) td's
   sandbox netns inode DIFFERS from the rung's, loopback-only, daemon reachable across it
-  (net-namespace parity). Done: #30 (exposure + isolation) and the net-parity increment.
-  `check.sh`'s real entry is UNCHANGED (directive 3); the remaining follow-up is the
-  wholesale swap (make `check.sh` launch td's sandbox), which DOES touch `check.sh` (an
-  exclusive landing) and wants a full-rung differential under both.
+  (net-namespace parity). The `loop-rung` rung (Step 1, full-rung differential) proves a
+  REAL rung runs identically: with `host-sandbox --expose-cwd` (the FULL loop env — the
+  worktree + cgroups + the guix cache, caller PATH = the toolchain, `TD_CHECK_*`/`USER`
+  preserved, chdir into the cwd), the `eval` rung's command produces byte-identical
+  output inside td's sandbox as under `guix shell -C`. Done: #30 (exposure + isolation),
+  #31 (net parity), and Step 1 (the full-rung differential). `check.sh`'s real entry is
+  UNCHANGED (directive 3); the remaining follow-up is **Step 2** — the wholesale swap
+  (make `check.sh` launch td's sandbox), which DOES touch `check.sh` (an exclusive
+  landing). Human chose "Step 1 only for now" (2026-06-14) — Step 2 is not yet approved.
   Working state + verified-red log: `plan/loop-sandbox.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
