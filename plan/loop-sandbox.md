@@ -63,6 +63,27 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
    (e.g. /var/guix) ⇒ guix can't reach the daemon ⇒ output diverges ⇒ rung red. — C.
 4. Full `./check.sh` green; PR. — sub-task D.
 
+## Implementation progress
+
+- **DONE 2026-06-13.** `td-builder host-sandbox` (pivot_root dev-shell) + the
+  `loop-sandbox` rung GREEN inside the real `guix shell -C` (nested userns): `guix
+  build -d hello` lowers to the SAME `.drv` (`zx4bn6wq…`) inside td's sandbox as under
+  `guix shell -C`, and the host worktree is invisible while `/gnu/store` + the daemon
+  socket stay exposed. Mechanism findings while building: the rootless uid map must be
+  `0 → host_uid` (identity-mapping the host uid left userns-root-owned tmpfs dirs
+  unwritable); `/dev` must be exposed (tools need `/dev/null`); coreutils are NOT on
+  the sandbox PATH (only the guix bin dir), so probes use bash builtins. `sys.rs` gained
+  `pivot_root`/`umount2` + `MS_RDONLY`/`MS_REMOUNT`/`MNT_DETACH`.
+
 ## Verified-red log
 
-(filled as each assertion is seen red.)
+**R1 the daemon-socket exposure is load-bearing** (2026-06-13). Dropped the `/var/guix`
+bind from the `host-sandbox` exposure set, rebuilt, ran the equivalence command:
+
+    guix build: error: failed to connect to `/var/guix/daemon-socket/socket':
+    No such file or directory   (exit 1)
+
+so `td-builder host-sandbox -- guix build -d hello` produced an error instead of the
+`.drv` path ⇒ `tdout != oracle` ⇒ the rung's exposure-equivalence leg goes red. Proves
+the equivalence is genuine (td's sandbox really must expose the daemon socket; it is not
+a vacuous pass). Reverted the bind; rung green again.
