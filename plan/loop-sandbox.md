@@ -116,6 +116,14 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
   `check.sh` runs `rootless` in its native `guix shell -C` (NOT skipped — full
   assertions, a failure fails the whole check) via the new `check-sandbox` Makefile
   target (= `check` minus `rootless`); the canonical `check` is unchanged.
+  **CI fallback:** the hosted runner's container restricts the namespace/mount ops td's
+  sandbox needs — the outer `host-sandbox` fails there with "Operation not permitted"
+  (the runner permits guix's own `guix shell -C` mechanism but not td's raw
+  `pivot_root`+bind/tmpfs mounts + nested uid-map). So under `CI`/`GITHUB_ACTIONS`
+  check.sh runs the proven `guix shell -C` path; td's sandbox stays the LOCAL default
+  (the load-bearing entry agents run). Making td's sandbox run on the restricted runner
+  is a follow-up (diagnose the runner's specific seccomp/userns restriction). Caught by
+  the #33 CI `check` job, which then went green on the fallback.
 
 ## Verified-red log
 

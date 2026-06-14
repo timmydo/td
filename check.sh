@@ -193,6 +193,16 @@ fi
 case " $* " in
   *" rootless "*) TD_LOOP_GUIX_SHELL=1 ;;   # explicit rootless → guix shell -C
 esac
+# CI fallback: the hosted runner's container restricts the namespace/mount ops
+# td's sandbox needs (pivot_root + bind/tmpfs mounts + uid-map nesting) — the
+# outer `host-sandbox` fails there with "Operation not permitted", though it
+# permits guix's own `guix shell -C` mechanism. So under CI the loop runs on the
+# proven `guix shell -C` oracle path. td's sandbox stays the LOCAL default (where
+# the swap is the load-bearing entry); making it run on the restricted runner is
+# a follow-up (diagnose the runner's specific seccomp/userns restriction).
+if [ -n "${CI-}" ] || [ -n "${GITHUB_ACTIONS-}" ]; then
+  TD_LOOP_GUIX_SHELL=1
+fi
 if [ -z "${TD_LOOP_GUIX_SHELL-}" ]; then
   tb=$(guix build -L . -e '(@ (system td-builder) td-builder)')/bin/td-builder
   [ -x "$tb" ] || { echo "check.sh: FATAL: could not build td-builder for the loop sandbox." >&2; exit 1; }
