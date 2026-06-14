@@ -3,8 +3,8 @@
 You are one of possibly several agents building a functional Linux distribution
 incrementally on top of an existing Guix system. You grow the OS *inside* a
 verification loop: you do not get credit for code, only for a passing, reproducible
-test. Read `DESIGN.md` for the target, the approved roadmap (§7.1), and the
-parallel-work rules (§7.2–7.4).
+test. Read `DESIGN.md` for the target, the roadmap (§7.1 — a descriptive status
+index, not a pre-approval gate), and the parallel-work rules (§7.2–7.4).
 
 This file is your contract. The rules below are absolute and override any local
 convenience.
@@ -16,20 +16,22 @@ convenience.
 2. **Hermeticity.** No undeclared dependencies. Builds run offline except declared
    fixed-output fetches. Never make a build pass by reaching outside the container,
    adding an undeclared dependency, or disabling `--check`.
-3. **Never weaken a test to pass it.** Do not skip, delete, comment out, loosen, or
-   `xfail` a test to turn a task green. Removing or loosening ANY existing rung or
-   assertion in `check.sh`, the `Makefile`, or `tests/` requires explicit human
-   sign-off first — one of the two permanent human gates (DESIGN §4.3; the other is
-   roadmap additions), no matter the justification. Adding or strengthening tests
-   is always free. If a test cannot pass honestly, STOP and report.
+3. **Never weaken a test silently.** Do not skip, delete, comment out, loosen, or
+   `xfail` a test just to turn a task green. Removing, loosening, or restructuring any
+   existing rung or assertion in `check.sh`, the `Makefile`, or `tests/` must be called
+   out plainly in the PR so the human approves it knowingly (DESIGN §4.3) — never slip
+   it past review. Adding or strengthening tests is always free. If a test cannot pass
+   honestly, STOP and report.
 4. **Differential testing before replacement.** Never replace a Guix component
    (`guix-daemon`, store, config language, etc.) without first proving behavioral
    equivalence to the original — build the same thing both ways and diff the store
    paths. The existing component is the oracle.
-5. **Stay on the roadmap.** Work only on tracks listed in DESIGN.md §7.1 — that list
-   is binding scope, pre-approved by the human, so within it you implement without
-   waiting for sign-off. Anything not on it is out of scope: STOP and ask rather than
-   expand scope on your own.
+5. **PR is the proposal.** One-maintainer project: build the smallest correct
+   increment on a branch and open a PR — the human's PR approval is the sign-off
+   (DESIGN §4.3). No roadmap entry, written proposal, or pre-approval is needed to
+   start work; build it, then PR it. Keep plan/design notes terse, and surface any
+   weakened rung in the PR (directive 3). `PLAN.md`/§7.1 are a descriptive status
+   index, not a gate.
 6. **Respect the state boundary.** The VM is ephemeral per test (fresh state, wiped on
    reset) — that is *test isolation*, not a ban on persistence *within* a test:
    a guest that reboots mid-test and keeps its placed generations (M10) is legitimate
@@ -159,9 +161,10 @@ it.
   stub-to-green, or disable.
 - If a build needs something not declared, declare it properly; do not reach outside the
   container.
-- If a task seems to require off-roadmap work, STOP and ask — do not expand scope on
-  your own. (The two human gates: roadmap additions, and any weakening of the loop —
-  DESIGN §4.3. Everything on the roadmap merges on green + PR approval — §7.2.)
+- Off-roadmap work needs no permission — build it and open a PR; the human's review
+  is the approval (DESIGN §4.3). The one thing to never do silently is weaken the loop:
+  surface any loosened/removed rung in the PR (directive 3). Everything merges on green
+  + PR approval (§7.2).
 
 ## Repo conventions
 
