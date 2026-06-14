@@ -59,4 +59,16 @@ Guix's (the toolchain, retired last §5).
 
 ## Verified-red log
 
-(filled as each assertion is seen red.)
+**R1 ordering is load-bearing** (2026-06-13). Perturbed `env.sort()` → `env.reverse()`
+in `store.rs::assemble_drv` so td emits the env in a non-canonical order. Ran
+`td-builder drv-assemble hello.spec` on the host: the daemon VALIDATES the `.drv` on
+`addTextToStore` and REJECTED it —
+
+    daemon error: derivation `/gnu/store/gq7rx5ac…-hello-2.12.2.drv' has incorrect
+    output `/gnu/store/jkbrnpvqf…-hello-2.12.2', should be
+    `/gnu/store/pnka4rj0…-hello-2.12.2'
+
+(`drv-assemble` exits 1 ⇒ rung red). Proves the assembly ordering td imposes in Rust is
+load-bearing: a wrong env order changes the computed output path, the daemon catches it,
+and only the canonical order matches guix's `(derivation …)`. Restored `env.sort()` and
+the rung is green (`nh886097…`).
