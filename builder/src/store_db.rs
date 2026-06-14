@@ -227,6 +227,13 @@ fn write_file_header(page1: &mut [u8; PAGE_SIZE], total_pages: u32) {
     page1[96..100].copy_from_slice(&3_046_000u32.to_be_bytes()); // SQLite version
 }
 
+/// Test-only re-export so the `store_db_read` round-trip tests can encode
+/// varints with the exact writer and assert the reader decodes them.
+#[cfg(test)]
+pub(crate) fn put_varint_for_test(out: &mut Vec<u8>, n: u64) {
+    put_varint(out, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -90,11 +90,14 @@ edits** (track files don't carry it).
   host-only path is invisible (isolation). Net-isolation parity + the check.sh swap are
   later increments) — `plan/loop-sandbox.md`
 - [ ] **td-store-db** — claimed claude-fable-4a2e33 2026-06-14 (begin replacing
-  guix-daemon: td owns the store SQLite DB authority. Increment 1 — `td-builder
-  store-register` writes the `ValidPaths`/`Refs`/`DerivationOutputs` rows for a built
-  artifact itself (emits SQL, sqlite3 is the engine), differential against the daemon's
-  recorded row — same hash/narSize/deriver/refs. Daemon is the oracle; td operates its
-  OWN store DB, host daemon stays immutable infra) — `plan/td-store-db.md`
+  guix-daemon: td owns the store SQLite DB authority. Inc.1/2 — `td-builder
+  store-register` WRITES the `ValidPaths`/`Refs`/`DerivationOutputs` for hello's full
+  closure as the SQLite FILE FORMAT in pure Rust (`store_db.rs`), differential vs the
+  daemon. Inc.3 — `td-builder store-query` READS it back with td's OWN pure-Rust SQLite
+  reader (`store_db_read.rs`), no sqlite3/daemon in td's query path ("own the store,
+  then diverge"); td's reader == sqlite3 (same bytes) == the daemon. Daemon is the
+  oracle; td operates its OWN store DB, host daemon stays immutable infra)
+  — `plan/td-store-db.md`
 
 ## The loop (reminder)
 

@@ -721,10 +721,21 @@ run concurrently):
   the daemon's for EVERY closure path (hash + narSize), the full inter-path Refs
   relation, and the artifact's deriver + drv→output. `registrationTime` + the non-
   artifact per-path derivers (the daemon's input-resolution) excluded; verified-red ×2.
+  Increment 3 — **td READS its own store** (the "own the store, then diverge" pivot,
+  human 2026-06-14): `td-builder store-query` answers store queries (`info` =
+  path/hash/narSize; `references` = the Refs relation) by parsing td's own DB with a
+  zero-dep SQLite *reader* (`builder/src/store_db_read.rs`) — NO sqlite3 engine and NO
+  daemon in td's store-query path. The differential now reads td's DB three ways and
+  asserts they agree: TD'S OWN READER == sqlite3 on the same bytes (the parser oracle)
+  == the daemon's record (the content oracle). td thus WRITES and READS its store DB
+  itself; libsqlite/the daemon are correctness oracles, not the format authority.
   Boundary: the host daemon stays immutable infra (immutable read only); td operates its
-  OWN store DB, daemon = oracle (directive 4). Later: the exact daemon schema
-  (indexes/trigger) so a daemon ACCEPTS td's DB end-to-end, then `addToStore`, GC.
-  Working state + verified-red log: `plan/td-store-db.md`.
+  OWN store DB, daemon = oracle (directive 4). With write+read owned, byte-identity to
+  the daemon's schema becomes OPTIONAL — the differential stays a correctness check, not
+  a compatibility cage. Later (sketch): `addToStore` end-to-end into a td store, GC
+  reachability, then a td store backend the build side can use — and the freedom to
+  diverge the on-disk format once nothing external must read it. Working state +
+  verified-red log: `plan/td-store-db.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
