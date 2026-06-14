@@ -95,7 +95,7 @@ endef
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
 HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus td-build drv-emit td-drv-build td-drv-add td-drv-assemble td-check loop-sandbox loop-rung store-register store-add store-gc
 
-.PHONY: check check-sandbox check-fast container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
+.PHONY: check check-sandbox check-guix-shell check-fast container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -105,17 +105,30 @@ container-check:
 
 check: $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
-# `check` minus `rootless`, for the loop-sandbox swap (./check.sh's default
-# td-sandbox path). `rootless` builds in its OWN unprivileged user namespace and
-# snapshots the LIVE store DB; nesting it inside td's sandbox (itself an
-# unprivileged userns) double-nests and the WAL snapshot cannot coordinate with
-# the host daemon from a nested non-root client. So ./check.sh runs `rootless`
-# separately in its native `guix shell -C` (NOT skipped — it still runs with all
-# its assertions, and a failure fails the whole check) and runs THIS target for
-# the other 36 rungs under td's sandbox. The canonical `check` above is
-# UNCHANGED and still includes `rootless` (used by TD_LOOP_GUIX_SHELL=1 and plain
-# `make check`); this is purely additive.
-check-sandbox: $(CHEAP_RUNGS) $(filter-out rootless,$(HEAVY_RUNGS))
+# ./check.sh's default splits the loop into TWO containers (the loop-sandbox swap):
+# a CARVE-OUT runs in its native `guix shell -C` (`check-guix-shell`), everything
+# else runs under td's sandbox (`check-sandbox`). The carve-out has three members
+# for two DISTINCT reasons:
+#   * `rootless` CANNOT nest in td's sandbox — it builds in its OWN unprivileged
+#     userns and snapshots the LIVE store DB, and that WAL snapshot cannot
+#     coordinate with the host daemon from a nested non-root client (double-nested
+#     userns).
+#   * `loop-sandbox`/`loop-rung` are EQUIVALENCE differentials whose ORACLE is
+#     `guix shell -C` (prime directive 4): each compares a command in td's sandbox
+#     to the SAME command in the AMBIENT container. Run nested under td's sandbox
+#     the ambient container IS td's sandbox, so the differential degenerates to
+#     td-vs-nested-td and proves nothing about `guix shell -C`. They must run with
+#     `guix shell -C` as the ambient oracle (a real defect of the Step-2 swap,
+#     fixed here — see plan/loop-sandbox.md).
+# NOTHING is dropped, loosened, or skipped (prime directive 3): the canonical
+# `check` target above still lists EVERY rung and is what `make check`,
+# TD_LOOP_GUIX_SHELL=1, and CI run. These two targets only REPARTITION which
+# container each rung runs in for the default ./check.sh path — a test-topology
+# change surfaced for knowing approval, not a weakening. Every carve-out rung still
+# runs FULLY; a failure fails the whole check.
+SANDBOX_CARVEOUT := rootless loop-sandbox loop-rung
+check-sandbox: $(CHEAP_RUNGS) $(filter-out $(SANDBOX_CARVEOUT),$(HEAVY_RUNGS))
+check-guix-shell: $(SANDBOX_CARVEOUT)
 
 # The fast tier — the rungs that test td's OWN surface (typed/TS front-end + the
 # Rust builder/evaluator) and need only the toolchain: no `guix system image`,

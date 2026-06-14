@@ -184,22 +184,37 @@ fi
 # profile machinery. Escape hatch: TD_LOOP_GUIX_SHELL=1 runs the original
 # `guix shell -C` path below (the oracle, for differential/triage).
 #
-# ONE rung — `rootless` — cannot run nested in td's sandbox: it builds in its OWN
-# unprivileged user namespace and snapshots the LIVE store DB, and that WAL
-# snapshot cannot coordinate with the host daemon from a nested non-root client
-# (double-nested userns). So `rootless` runs in its native `guix shell -C` (not
-# skipped — full assertions, and a failure fails the whole check), while the
-# other 36 rungs run under td's sandbox via `check-sandbox`.
+# A CARVE-OUT of rungs runs in its native `guix shell -C`, NOT nested under td's
+# sandbox — for two DISTINCT reasons (Makefile `SANDBOX_CARVEOUT`):
+#   * `rootless` CANNOT nest: it builds in its OWN unprivileged user namespace and
+#     snapshots the LIVE store DB, and that WAL snapshot cannot coordinate with the
+#     host daemon from a nested non-root client (double-nested userns).
+#   * `loop-sandbox`/`loop-rung` are EQUIVALENCE differentials whose ORACLE is
+#     `guix shell -C` (prime directive 4): each runs a command in td's sandbox and
+#     compares it to the SAME command in the AMBIENT container. Run nested under
+#     td's sandbox the ambient container IS td's sandbox, so the differential
+#     degenerates to td-vs-nested-td and stops proving equivalence to
+#     `guix shell -C` at all. They MUST run with `guix shell -C` as the ambient
+#     oracle, so they join the carve-out (this was a real defect of the Step-2
+#     swap — see plan/loop-sandbox.md "critique resolution").
+# Nothing is dropped (directive 3): the canonical `check` target still lists every
+# rung; this only repartitions WHICH CONTAINER each runs in for the default path.
 case " $* " in
-  *" rootless "*) TD_LOOP_GUIX_SHELL=1 ;;   # explicit rootless → guix shell -C
+  *" rootless "*|*" loop-sandbox "*|*" loop-rung "*|*" check-guix-shell "*) TD_LOOP_GUIX_SHELL=1 ;;
 esac
-# CI fallback: the hosted runner's container restricts the namespace/mount ops
-# td's sandbox needs (pivot_root + bind/tmpfs mounts + uid-map nesting) — the
-# outer `host-sandbox` fails there with "Operation not permitted", though it
-# permits guix's own `guix shell -C` mechanism. So under CI the loop runs on the
-# proven `guix shell -C` oracle path. td's sandbox stays the LOCAL default (where
-# the swap is the load-bearing entry); making it run on the restricted runner is
-# a follow-up (diagnose the runner's specific seccomp/userns restriction).
+# CI GAP — the single biggest weakness of this swap (plan/loop-sandbox.md "Goal vs.
+# achieved"). The hosted runner's container restricts the namespace/mount ops td's
+# sandbox needs (pivot_root + bind/tmpfs mounts + uid-map nesting): the outer
+# `host-sandbox` fails there with "Operation not permitted", though the runner
+# permits guix's own `guix shell -C`. So under CI the loop runs on `guix shell -C`
+# — which means CI NEVER exercises the td's-sandbox DEFAULT that every local agent
+# now relies on. The host-sandbox MECHANISM is covered (the loop-sandbox/loop-rung
+# rungs test it nested), but the OUTER swap wiring below — toolchain provisioning,
+# env passing, the carve-out split — is invisible to the gate: a regression there
+# is GREEN in CI and only caught by an agent's local run. Per the project creed
+# ("no credit for code, only a passing reproducible test") the load-bearing default
+# currently rests on local runs alone. Closing this (a capable/self-hosted runner,
+# or diagnosing the runner's seccomp/userns restriction) is the TOP follow-up.
 if [ -n "${CI-}" ] || [ -n "${GITHUB_ACTIONS-}" ]; then
   TD_LOOP_GUIX_SHELL=1
 fi
@@ -218,13 +233,25 @@ if [ -z "${TD_LOOP_GUIX_SHELL-}" ]; then
   # `rootless` rung binds it into its staged store. The first PATH entry is the
   # profile's bin; its parent is the profile root.
   guix_env=$(dirname "${toolchain%%:*}")
-  # Full loop: run `rootless` in its native guix shell -C first (failing the
-  # whole check on its failure), then the other 36 rungs under td's sandbox.
+  # Full loop, TWO phases — CHEAP-FIRST preserved. Phase 1: `check-sandbox` (the
+  # cheap fail-fast chain + every td-sandbox-compatible heavy rung) under td's
+  # sandbox, so a structural red still aborts the loop before the carve-out's heavy
+  # builds. Phase 2: the carve-out (`check-guix-shell` = rootless + the
+  # loop-sandbox/loop-rung equivalence rungs) in its native `guix shell -C`.
+  # LATENCY COST (disclosed — plan/loop-sandbox.md "Goal vs. achieved"): the
+  # carve-out is now a SERIAL phase in a SECOND container, no longer overlapped in
+  # the -j2 heavy pool, so its wall time adds to the critical path. Running it
+  # concurrently with phase 1 would push a single check above the -j2 / two-heavy
+  # ceiling (DESIGN §7.3), so it is sequential ON PURPOSE.
   targets="$*"
   if [ "$targets" = "check" ]; then
-    echo "check.sh: 'rootless' runs under guix shell -C (it cannot nest in td's sandbox); the other 36 rungs run under td's sandbox" >&2
-    TD_LOOP_GUIX_SHELL=1 "$0" rootless || exit 1
-    targets="check-sandbox"
+    echo "check.sh: phase 1 — check-sandbox under td's sandbox (cheap-first); phase 2 — rootless + loop-sandbox + loop-rung under guix shell -C (carve-out)" >&2
+    env \
+      PATH="$hostguix_dir:$toolchain" \
+      GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
+      GUIX_ENVIRONMENT="$guix_env" \
+      "$tb" host-sandbox --expose-cwd -- make -j2 --output-sync=target check-sandbox || exit 1
+    exec env TD_LOOP_GUIX_SHELL=1 "$0" check-guix-shell
   fi
   exec env \
     PATH="$hostguix_dir:$toolchain" \
