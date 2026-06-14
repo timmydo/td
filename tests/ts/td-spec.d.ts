@@ -64,13 +64,17 @@ interface Source {
  *  outside this union is a compile-time error — like `RootFsType`. v0 is `"gnu"`. */
 declare type BuildSystem = "gnu";
 
-/** A package recipe — the scalar coordinates that determine the build
- *  derivation: name, version, the upstream source, and the build system. */
+/** A package recipe — the coordinates that determine the build derivation: name,
+ *  version, the upstream source, the build system, and the names of any build
+ *  inputs (dependencies). An input is named by its corpus package name; the
+ *  Guile bridge RESOLVES it from the corpus (input resolution stays Guix's,
+ *  retired LAST — DESIGN §5). Omit `inputs` for a leaf package (e.g. hello). */
 interface Recipe {
   readonly name: string;
   readonly version: string;
   readonly source: Source;
   readonly buildSystem: BuildSystem;
+  readonly inputs?: readonly string[];
 }
 
 /** Declare an upstream source by URL + content hash (does not fetch). */
