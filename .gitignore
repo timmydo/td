@@ -12,6 +12,7 @@
 .verify-place-check-scratch/
 .store-register-scratch/
 .store-add-scratch/
+.store-gc-scratch/
 
 # check-memo verdicts (plan/check-memo.md constraint 2): host-local state,
 # NEVER committed — a verdict greens only the environment that recorded it.

@@ -542,6 +542,32 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: compute the GC-reachable CLOSURE of a path from td's OWN store
+        // DB — the daemon's GC "mark" set (`guix gc -R ROOT`), in pure Rust. Reads the
+        // DB with td's own reader (`store_db_read`) and walks the Refs graph from ROOT;
+        // no daemon. Usage:
+        //   store-closure DB ROOT
+        // Prints the reachable store paths, sorted (ROOT included).
+        Some("store-closure") if args.len() == 4 => {
+            let (db_path, root) = (&args[2], &args[3]);
+            let run = || -> Result<Vec<String>, String> {
+                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+                let db = store_db_read::Db::open(bytes)?;
+                db.closure(root)
+            };
+            match run() {
+                Ok(paths) => {
+                    for p in paths {
+                        println!("{p}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-closure {db_path} {root}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-store-db: ADD a path to a td-OWNED store ourselves — the daemon's
         // addToStore (the WRITE side), in pure Rust. td computes the addTextToStore
         // path (`make_text_path`), WRITES the content into STORE-DIR as a canonical
@@ -920,6 +946,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
             eprintln!("       td-builder store-query DB info|references");
+            eprintln!("       td-builder store-closure DB ROOT");
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)

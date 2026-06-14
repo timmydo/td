@@ -16,6 +16,8 @@
 //! big-endian; lengths are SQLite varints (big-endian base-128, high bit =
 //! continue, up to 9 bytes — the 9th byte contributes a full 8 bits).
 
+use std::collections::{HashMap, HashSet};
+
 const HEADER_LEN: usize = 100;
 const LEAF: u8 = 0x0d; // table b-tree leaf
 const INTERIOR: u8 = 0x05; // table b-tree interior
@@ -66,6 +68,60 @@ impl Db {
         let mut rows = Vec::new();
         self.walk_table(rootpage, &mut rows)?;
         Ok(rows)
+    }
+
+    /// The set of store paths reachable from `root` over the `Refs` graph — the
+    /// GC-reachable closure (the daemon's GC "mark" set; `guix gc -R root`),
+    /// `root` included. Errors if `root` is not a `ValidPaths` entry. Resolves
+    /// `Refs(referrer, reference)` ids to paths via the `ValidPaths` rowid.
+    pub fn closure(&self, root: &str) -> Result<Vec<String>, String> {
+        let mut path_of: HashMap<i64, String> = HashMap::new();
+        let mut id_of: HashMap<String, i64> = HashMap::new();
+        for (rowid, cols) in self.table("ValidPaths")? {
+            if let Some(Value::Text(p)) = cols.get(1) {
+                path_of.insert(rowid, p.clone());
+                id_of.insert(p.clone(), rowid);
+            }
+        }
+        let mut edges: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (_rid, cols) in self.table("Refs")? {
+            if let (Some(Value::Int(a)), Some(Value::Int(b))) = (cols.first(), cols.get(1)) {
+                edges.entry(*a).or_default().push(*b);
+            }
+        }
+        let start = *id_of
+            .get(root)
+            .ok_or_else(|| format!("root `{root}' is not in the store DB"))?;
+        // Iterative DFS over the reference graph; the rowid set dedups (handles
+        // self-references and cycles).
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut stack = vec![start];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            if let Some(neighbors) = edges.get(&n) {
+                for &m in neighbors {
+                    if !seen.contains(&m) {
+                        stack.push(m);
+                    }
+                }
+            }
+        }
+        // Resolve every reached rowid to its path; a reachable Refs id with no
+        // ValidPaths row is a corrupt store DB — error (symmetric with the
+        // `store-query references` resolver), don't silently drop it.
+        let mut out: Vec<String> = Vec::with_capacity(seen.len());
+        for id in &seen {
+            out.push(
+                path_of
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("reachable Refs id {id} has no ValidPaths row"))?,
+            );
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// Find a table's rootpage by scanning the `sqlite_master` b-tree (rooted at
@@ -350,6 +406,38 @@ mod tests {
     #[test]
     fn rejects_non_sqlite() {
         assert!(Db::open(b"not a database".to_vec()).is_err());
+    }
+
+    #[test]
+    fn closure_follows_the_refs_graph() {
+        // /a -> /b -> /c, /a self-ref; /d is unreachable from /a.
+        let vp = |rid: i64, p: &str| {
+            (rid, vec![
+                store_db::Value::Null,
+                store_db::Value::Text(p.to_string()),
+                store_db::Value::Text("sha256:00".to_string()),
+                store_db::Value::Int(1),
+                store_db::Value::Null,
+                store_db::Value::Int(1),
+            ])
+        };
+        let valid = Table {
+            name: "ValidPaths",
+            sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+            rows: vec![vp(1, "/a"), vp(2, "/b"), vp(3, "/c"), vp(4, "/d")],
+        };
+        let edge = |rid: i64, a: i64, b: i64| {
+            (rid, vec![store_db::Value::Int(a), store_db::Value::Int(b)])
+        };
+        let refs = Table {
+            name: "Refs",
+            sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+            rows: vec![edge(1, 1, 1), edge(2, 1, 2), edge(3, 2, 3)],
+        };
+        let db = Db::open(store_db::write_db(&[valid, refs])).unwrap();
+        assert_eq!(db.closure("/a").unwrap(), vec!["/a", "/b", "/c"]);
+        assert_eq!(db.closure("/d").unwrap(), vec!["/d"]); // no out-edges
+        assert!(db.closure("/missing").is_err());
     }
 
     #[test]
