@@ -105,9 +105,14 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
   Changes: `host_shell` switched to the IDENTITY uid map (matches `guix shell -C`'s
   non-root uid; tmpfs ownership via the new `uid=/gid=` mount data — `sys::mount` gained
   a `data` arg) and preserves `GUIX_BUILD_OPTIONS`/`GUIX_ENVIRONMENT`/`USER`/`LOGNAME`;
-  the `loop-rung` rung prefers `$USER`. **Empirical result: the WHOLE loop runs under
-  td's sandbox** — all the VM rungs (`test`/`boot-disk`/`place`/`build`), `run` (crun),
-  the OCI rungs, every `td-*` rung — 36/37, full `./check.sh` green (38 PASS, 0 FAIL).
+  the `loop-rung` rung prefers `$USER`. **Empirical result (Step 2 as first landed):
+  most of the loop runs under td's sandbox** — all the VM rungs
+  (`test`/`boot-disk`/`place`/`build`), `run` (crun), the OCI rungs, every `td-*` rung
+  — full `./check.sh` green (0 FAIL). (Caveat surfaced in review, fixed by the
+  critique-resolution entry below: two of those rungs — `loop-sandbox`/`loop-rung` —
+  are EQUIVALENCE differentials whose oracle is `guix shell -C`; running them nested
+  under td's sandbox silently degraded the differential to td-vs-nested-td. They are
+  now in the `guix shell -C` carve-out.)
   **`rootless` is the one carve-out:** it builds in its OWN unprivileged userns and
   snapshots the LIVE store DB; nesting that inside td's sandbox (another unprivileged
   userns) double-nests and the sqlite WAL snapshot cannot coordinate with the host
@@ -115,7 +120,10 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
   nested client lacks; forcing the db dir RO then breaks the active-WAL case). So
   `check.sh` runs `rootless` in its native `guix shell -C` (NOT skipped — full
   assertions, a failure fails the whole check) via the new `check-sandbox` Makefile
-  target (= `check` minus `rootless`); the canonical `check` is unchanged.
+  target (= `check` minus `rootless`); the canonical `check` *target* is unchanged —
+  though ./check.sh's DEFAULT invocation no longer runs `make check` as ONE graph (it
+  runs the carve-out in a separate container), a real test-topology change the closing
+  section surfaces for knowing approval.
   **CI fallback:** the hosted runner's container restricts the namespace/mount ops td's
   sandbox needs — the outer `host-sandbox` fails there with "Operation not permitted"
   (the runner permits guix's own `guix shell -C` mechanism but not td's raw
@@ -124,6 +132,28 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
   (the load-bearing entry agents run). Making td's sandbox run on the restricted runner
   is a follow-up (diagnose the runner's specific seccomp/userns restriction). Caught by
   the #33 CI `check` job, which then went green on the fallback.
+- **DONE 2026-06-14 (critique resolution — claude-fable-dce88e).** A review of the
+  landed Step-2 swap surfaced two real CODE regressions and several overclaims; this
+  increment fixes the regressions and reconciles the claims (full reconciliation in
+  "Goal vs. achieved" below). NO rung is dropped, loosened, or skipped — the canonical
+  `check` target still lists every rung (directive 3); this only repartitions which
+  container each runs in for the default ./check.sh path.
+  - **Oracle integrity (a differential had silently gone vacuous).** Step 2 ran
+    `check-sandbox` — which then still INCLUDED `loop-sandbox`/`loop-rung` — *inside*
+    td's sandbox. But those two rungs are EQUIVALENCE differentials whose oracle is
+    `guix shell -C` (directive 4): each runs a command in td's sandbox and compares it
+    to the SAME command in the AMBIENT container. With the ambient container now td's
+    sandbox, the differential degenerated to td-vs-nested-td and no longer proved
+    equivalence to `guix shell -C` at all (only CI, forced onto `guix shell -C`, kept
+    the real oracle). FIX: both rungs JOIN the `guix shell -C` carve-out (the new
+    `check-guix-shell` Makefile target); `check-sandbox` is now `check` minus
+    `SANDBOX_CARVEOUT` (= `rootless loop-sandbox loop-rung`). check.sh routes any direct
+    invocation of these rungs to `guix shell -C` too (the `case` guard).
+  - **Cheap-first restored.** Step 2 ran `rootless` as a SERIAL PREFIX *before* any
+    rung, so a cheap structural red no longer aborted before that heavy build —
+    contradicting the cheap-first fail-fast contract. ./check.sh now runs phase 1
+    (`check-sandbox`, cheap-first) under td's sandbox FIRST, then phase 2 (the carve-out)
+    under `guix shell -C`.
 
 ## Verified-red log
 
@@ -179,3 +209,76 @@ red, fixed)** (2026-06-14):
   ("unable to open database file"). Both seen red. This is a FUNDAMENTAL double-nested
   userns limit, not a missing exposure — resolved by the `check-sandbox` carve-out
   (rootless runs in its native `guix shell -C`, fully, never skipped).
+
+## Goal vs. achieved (north-star reconciliation, parity, and known gaps)
+
+The Goal above frames the north star as ONE Rust sandbox stack **equivalent to** and
+**replacing** `guix shell -C`. Stated plainly, what this track achieved is narrower —
+a reader should not have to reconstruct it from the progress log:
+
+**1. Replaced as the LOCAL default, for the td-sandbox-compatible rungs only.**
+./check.sh runs most of the loop (every rung except the carve-out) under td's sandbox
+locally. `guix shell -C` is NOT replaced — it stays load-bearing for:
+(a) the carve-out rungs `rootless` (cannot nest) and `loop-sandbox`/`loop-rung` (their
+differential oracle), on every local run; (b) **100% of CI**; (c) the
+`TD_LOOP_GUIX_SHELL=1` fallback. So `guix shell -C` is now the minority container
+locally and the *sole* container in CI — load-bearing, not retired.
+
+**2. CI never exercises the new default — the single biggest weakness.** check.sh
+forces `TD_LOOP_GUIX_SHELL=1` under CI, so the gate runs the old `guix shell -C` path
+top-to-bottom. The host-sandbox MECHANISM is covered (the loop-sandbox/loop-rung rungs
+exercise it nested, even in CI), but the OUTER swap wiring — toolchain provisioning,
+env passing, the carve-out split, the two-phase orchestration — is invisible to the
+gate. A regression there is GREEN in CI and only caught by an agent's local run. Given
+the project creed ("no credit for code, only a passing reproducible test"), the
+load-bearing local default currently rests on local runs ALONE. This is the **top
+follow-up**, not a minor one: it needs a capable/self-hosted runner, or a diagnosis of
+the runner's specific seccomp/userns restriction that makes `pivot_root` + bind/tmpfs
+mounts + nested uid-map fail with "Operation not permitted".
+
+**3. "Equivalent" was an overclaim — parity matrix.** td's `host_shell`
+(`builder/src/sandbox.rs`) and `guix shell -C` are NOT yet hermetically equivalent:
+
+| property        | guix shell -C              | td host-sandbox             | parity |
+| ---             | ---                        | ---                         | :---:  |
+| user namespace  | yes (identity uid map)     | yes (identity uid map)      | ✓ |
+| mount namespace | yes                        | yes                         | ✓ |
+| net namespace   | own, loopback-only         | own, loopback-only          | ✓ |
+| IPC / UTS ns    | yes                        | yes (NEWIPC \| NEWUTS)      | ✓ |
+| **PID namespace** | yes (the command is PID 1) | **NO — shares host PID ns** | ✗ |
+| **/proc**       | private (own PID view)     | **host /proc, rbind rw**    | ✗ |
+| **/dev**        | minimal / private          | **host /dev, rbind rw**     | ✗ |
+| store + socket  | exposed                    | whole /gnu/store (ro) + socket | ✓ |
+| host filesystem | hidden (shared cwd only)   | hidden (cwd only)           | ✓ |
+
+A full green loop proves **behavioral sufficiency for the loop's current commands**
+(the daemon does the actual building in its own sandbox; the loop steps are
+orchestration that does not depend on PID isolation or a private /proc), NOT hermetic
+equivalence. The PID-ns + private-/proc + private-/dev gaps are a tracked follow-up;
+until they close, the `loop-sandbox`/`loop-rung` equivalence differentials — now run
+against the REAL `guix shell -C` oracle (see the critique-resolution entry) — are the
+standing guard that the surfaces the loop actually uses stay equal both ways.
+
+**4. The default ./check.sh is a real test-topology change.** The Makefile `check`
+*target* is unchanged and still lists every rung (directive 3 satisfied in substance —
+no rung dropped or weakened). But the default ./check.sh invocation no longer runs
+`make check` as one dependency graph in one container: it runs `check-sandbox` under
+td's sandbox, then the carve-out under `guix shell -C` in a separate process. Which
+container each rung runs in — and that `rootless`/`loop-sandbox`/`loop-rung` now run in
+a separate serial phase — is the restructuring directive 3 says to surface for knowing
+approval. It is surfaced here and in the PR, not slipped past review.
+
+**5. Latency cost of the carve-out.** loop-latency cut the full check ~525s→275s by
+overlapping heavy rungs two-at-a-time. The carve-out is a serial phase in a SECOND
+container, no longer overlapped in the -j2 pool, so its wall time (rootless ~36s solo
+per `plan/rootless-builder.md`, plus loop-sandbox/loop-rung paired under -j2) adds to
+the critical path, and a second container is spun up. Running the carve-out
+concurrently with phase 1 would restore the overlap but push a SINGLE check above the
+-j2 / two-heavy ceiling (DESIGN §7.3: two concurrent checks already saturate at four
+VMs), so it is sequential on purpose. Measured on this host (warm, all 40 rungs, both
+green): the two-phase default ran **240s** vs **206s** for the single-container
+`TD_LOOP_GUIX_SHELL=1` layout (every rung in one -j2 pool) — a **+34s (~16%)
+serialization cost**, the price of running the carve-out as a separate sequential phase.
+(A COLD first run is much longer — ~510s here — but that is dominated by the `--check`
+double-builds before the verdict memo warms, NOT the carve-out; the warm-vs-warm delta
+is the honest figure.)

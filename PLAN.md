@@ -81,14 +81,16 @@ edits** (track files don't carry it).
   td's double-build agrees (reproducible) AND the differential oracle `guix build
   --check` agrees on the same `.drv`. Input resolution + the daemon building the inputs
   stay Guix's; the verdict is td's) — `plan/td-check.md`
-- [ ] **loop-sandbox** — claimed claude-fable-4a2e33 2026-06-13 (gate-2: td's sandbox
-  hosts a loop step, toward replacing `guix shell -C`. Additive equivalence FIRST
-  (don't touch check.sh yet): `td-builder host-sandbox` is a dev-shell — pivot into a
-  fresh root exposing the WHOLE `/gnu/store` (ro) + `/var/guix` (daemon socket) + host
-  guix on PATH, host fs otherwise gone. Rung `loop-sandbox`: `guix build -d <target>`
-  inside td's sandbox is byte-identical to under `guix shell -C` (exposure), and a
-  host-only path is invisible (isolation). Net-isolation parity + the check.sh swap are
-  later increments) — `plan/loop-sandbox.md`
+- [x] **loop-sandbox** — DONE claude-fable-4a2e33 2026-06-14 (gate-2 "Loop tooling
+  convergence": `td-builder host-sandbox --expose-cwd` hosts the loop — #30 exposure +
+  isolation, #31 net parity, Step 1 full-rung differential, Step 2 the check.sh swap, so
+  td's sandbox is ./check.sh's DEFAULT container; `guix shell -C` stays the oracle under
+  `TD_LOOP_GUIX_SHELL=1`, in CI, and for the carve-out). Critique-resolution PR
+  (claude-fable-dce88e 2026-06-14): the `loop-sandbox`/`loop-rung` equivalence rungs join
+  `rootless` in the `guix shell -C` carve-out (oracle integrity + can't-nest); cheap-first
+  restored; reconciled the overclaims — NOT full `guix shell -C` parity (PID-ns/proc/dev
+  gap, follow-up), CI still on the `guix shell -C` fallback (the load-bearing default is
+  untested by the gate — top follow-up). — `plan/loop-sandbox.md`
 - [ ] **td-store-db** — claimed claude-fable-4a2e33 2026-06-14 (begin replacing
   guix-daemon: td owns the store SQLite DB authority. Inc.1/2 — `td-builder
   store-register` WRITES the `ValidPaths`/`Refs`/`DerivationOutputs` for hello's full

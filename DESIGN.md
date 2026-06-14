@@ -395,10 +395,10 @@ annotated.
   approved 2026-06-12 as the check-memo track, §7.1; td-check inherits that policy
   and its constraints unchanged.)
 - **Loop tooling convergence / loop-sandbox** — GRADUATED to §7.1 (approved
-  2026-06-13, §4.3 gate-2); see the active entry below. td-builder's sandbox
-  replaces `guix shell -C` in `check.sh` — the north star's "one sandbox stack
-  spanning build and run" made literal. Additive equivalence first; the wholesale
-  `check.sh` swap is a later increment.
+  2026-06-13, §4.3 gate-2); see the active entry below. td-builder's sandbox is
+  ./check.sh's DEFAULT container — the north star's "one sandbox stack spanning build
+  and run" — but `guix shell -C` is NOT fully replaced: it stays load-bearing for the
+  carve-out rungs, all of CI, and the fallback (active entry "Honest scope").
 - **composefs** (re-parked from M11): reconsider if/when cross-generation dedup earns
   its place — it would replace, not extend, the per-generation-image design, and is
   not in the pinned Guix.
@@ -698,14 +698,23 @@ run concurrently):
   (`td-builder host-sandbox --expose-cwd`) BY DEFAULT** — the north-star "one sandbox
   stack spanning build and run" made literal. `guix shell` (no `-C`) still provisions the
   toolchain profile; td replaces the container. `TD_LOOP_GUIX_SHELL=1` keeps the original
-  `guix shell -C` as the oracle/fallback. The WHOLE loop runs under td's sandbox (VMs,
-  crun, OCI, every `td-*` rung) EXCEPT `rootless` — it builds in its own unprivileged
-  userns and snapshots the live store DB, which cannot coordinate with the host daemon
-  when double-nested, so it runs in its native `guix shell -C` via the `check-sandbox`
-  target (= `check` minus `rootless`; rootless still runs fully, never skipped — the
-  canonical `check` is unchanged). Done: #30 (exposure + isolation), #31 (net parity),
-  Step 1 (full-rung differential), Step 2 (the swap). Working state + verified-red log:
-  `plan/loop-sandbox.md`.
+  `guix shell -C` as the oracle/fallback. Most of the loop runs under td's sandbox (VMs,
+  crun, OCI, every `td-*` rung) EXCEPT a CARVE-OUT that runs in its native
+  `guix shell -C`: `rootless` (cannot nest — own unprivileged userns + a live store-DB
+  snapshot that cannot coordinate with the host daemon when double-nested) and the
+  `loop-sandbox`/`loop-rung` EQUIVALENCE rungs (their differential oracle IS
+  `guix shell -C`, so nesting them under td's sandbox makes the differential vacuous).
+  ./check.sh runs `check-sandbox` (cheap-first) under td's sandbox, then `check-guix-shell`
+  (the carve-out) under `guix shell -C`; every carve-out rung still runs FULLY, never
+  skipped. Honest scope (NOT yet a full replacement): the canonical `check` *target* is
+  unchanged (every rung; directive 3), but the default ./check.sh is a test-topology
+  change (two containers, not one graph); td's sandbox is not yet hermetically equivalent
+  to `guix shell -C` (no PID namespace; host /proc + /dev bound — a parity-matrix
+  follow-up); and CI still runs the `guix shell -C` fallback, so the load-bearing local
+  default is untested by the gate (the top follow-up). Done: #30 (exposure + isolation),
+  #31 (net parity), Step 1 (full-rung differential), Step 2 (the swap), critique
+  resolution (oracle carve-out + cheap-first + reconciliation). Working state +
+  verified-red log: `plan/loop-sandbox.md`.
 - **td-store-db** *(approved 2026-06-14 — "what's next" → "Replace the guix-daemon")* —
   begin replacing the **guix-daemon**, the last big reused Guix component on the build
   side (§2.2/§2.5). td-builder already constructs (#22) / executes (#25) / registers via

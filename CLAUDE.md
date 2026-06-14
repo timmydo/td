@@ -59,21 +59,26 @@ Run all of it with the single pass/fail command:
 ./check.sh
 ```
 
-`./check.sh` is the canonical hermetic entry point: it sets up the fresh
-`guix shell -C --pure` container (store/cache/daemon-socket exposure, host guix on
-PATH, **substitutes disabled** so the loop is offline), guards that the host guix
-matches the `channels.scm` pin, then runs `make check` inside it. `make check` is the
-underlying target (assumes you are already in that sandbox); it runs the rung ladder
-(structural rungs serial-first, heavy rungs two at a time), short-circuiting on the
-first failure, and exits non-zero on any failure.
+`./check.sh` is the canonical hermetic entry point: it sets up the fresh hermetic
+sandbox — td's OWN `td-builder host-sandbox --expose-cwd` by default (the loop-sandbox
+swap), or `guix shell -C --pure` under `TD_LOOP_GUIX_SHELL=1`, in CI, and for the
+carve-out rungs (`rootless` plus the `loop-sandbox`/`loop-rung` equivalence
+differentials, whose oracle is `guix shell -C`) — with store/cache/daemon-socket
+exposure, host guix on PATH, **substitutes disabled** so the loop is offline. It guards
+that the host guix matches the `channels.scm` pin, then runs the rung ladder (structural
+rungs serial-first, heavy rungs two at a time), short-circuiting on the first failure
+and exiting non-zero on any failure. (`make check` is the underlying target — it runs
+EVERY rung and assumes you are already in a sandbox; the default ./check.sh path runs
+`check-sandbox` under td's sandbox then the carve-out `check-guix-shell` under
+`guix shell -C`, the two containers covering every rung between them.)
 The `Makefile`'s `CHEAP_RUNGS`/`HEAVY_RUNGS` pools (expanded by its `check:` target)
 are the **authoritative rung list** — the one place it is written down; never restate
 it in docs. Broad shape: config eval →
 differentials → `guix build --check` → behavioral/marionette tests.
 
-Every build/test runs inside that fresh container (`guix shell -C --pure`) so your own
-environment cannot contaminate results; `./check.sh <target>` runs a single Makefile
-target in the same sandbox.
+Every build/test runs inside that fresh sandbox (td's own `host-sandbox`, or
+`guix shell -C --pure`) so your own environment cannot contaminate results;
+`./check.sh <target>` runs a single Makefile target in the same sandbox.
 
 Do not proceed to the next sub-task until the current one is green.
 
@@ -194,7 +199,8 @@ it.
 - Hand-formatted 2-space indentation, no tabs. Do NOT run `guix style` — it was tried
   in M2 and mangled the layout; the hand-formatted style is the convention.
 - Run every build/test via `./check.sh` (or `./check.sh <target>`), which enters the
-  `guix shell -C --pure` sandbox for you (see "The loop"). Don't add `--network` to
+  hermetic sandbox for you (td's own `host-sandbox` by default; `guix shell -C --pure`
+  under `TD_LOOP_GUIX_SHELL=1`/CI/carve-out — see "The loop"). Don't add `--network` to
   it — that pulls substitutes (offline/hermeticity violation).
 
 **Free-software posture**
