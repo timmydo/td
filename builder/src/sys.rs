@@ -74,13 +74,21 @@ pub fn unshare(flags: usize) -> io::Result<()> {
     check(unsafe { syscall5(SYS_UNSHARE, flags, 0, 0, 0, 0) })
 }
 
-/// mount(2). `src`/`fstype` may be None (NULL) — e.g. the MS_REC|MS_PRIVATE
-/// propagation change takes neither. `data` is always NULL here.
-pub fn mount(src: Option<&CStr>, target: &CStr, fstype: Option<&CStr>, flags: usize) -> io::Result<()> {
+/// mount(2). `src`/`fstype`/`data` may be None (NULL) — e.g. the
+/// MS_REC|MS_PRIVATE propagation change takes none of them; `data` carries
+/// fs-specific options like tmpfs `uid=/gid=`.
+pub fn mount(
+    src: Option<&CStr>,
+    target: &CStr,
+    fstype: Option<&CStr>,
+    flags: usize,
+    data: Option<&CStr>,
+) -> io::Result<()> {
     let s = src.map_or(std::ptr::null(), CStr::as_ptr);
     let t = fstype.map_or(std::ptr::null(), CStr::as_ptr);
+    let d = data.map_or(std::ptr::null(), CStr::as_ptr);
     check(unsafe {
-        syscall5(SYS_MOUNT, s as usize, target.as_ptr() as usize, t as usize, flags, 0)
+        syscall5(SYS_MOUNT, s as usize, target.as_ptr() as usize, t as usize, flags, d as usize)
     })
 }
 
@@ -154,7 +162,7 @@ mod tests {
         // Mounting onto a path that does not exist must surface ENOENT, not
         // a bogus success — proves the -errno decoding.
         let target = std::ffi::CString::new("/no/such/td-builder/mount/point").unwrap();
-        let err = mount(None, &target, None, MS_REC | MS_PRIVATE).unwrap_err();
+        let err = mount(None, &target, None, MS_REC | MS_PRIVATE, None).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(2 /* ENOENT */));
     }
 }

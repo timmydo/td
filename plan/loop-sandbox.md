@@ -96,6 +96,34 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
   no tmpfs in this mode (the cwd/cache binds create it on the writable root tmpfs).
   Step 2 (the actual `check.sh` edit) is NOT in this increment (human: "Step 1 only for
   now", 2026-06-14).
+- **DONE 2026-06-14 (Step 2: the check.sh swap — human go-ahead "let's do the second
+  step … make the ships load bearing and meaningful").** `check.sh` now runs the loop
+  inside td's OWN sandbox (`td-builder host-sandbox --expose-cwd -- make …`) BY DEFAULT
+  instead of `guix shell -C`. `guix shell` (no `-C`) still PROVISIONS the toolchain
+  profile (`--search-paths`); td replaces the CONTAINER, not guix's profile machinery.
+  `TD_LOOP_GUIX_SHELL=1` keeps the original `guix shell -C` path as the oracle/fallback.
+  Changes: `host_shell` switched to the IDENTITY uid map (matches `guix shell -C`'s
+  non-root uid; tmpfs ownership via the new `uid=/gid=` mount data — `sys::mount` gained
+  a `data` arg) and preserves `GUIX_BUILD_OPTIONS`/`GUIX_ENVIRONMENT`/`USER`/`LOGNAME`;
+  the `loop-rung` rung prefers `$USER`. **Empirical result: the WHOLE loop runs under
+  td's sandbox** — all the VM rungs (`test`/`boot-disk`/`place`/`build`), `run` (crun),
+  the OCI rungs, every `td-*` rung — 36/37, full `./check.sh` green (38 PASS, 0 FAIL).
+  **`rootless` is the one carve-out:** it builds in its OWN unprivileged userns and
+  snapshots the LIVE store DB; nesting that inside td's sandbox (another unprivileged
+  userns) double-nests and the sqlite WAL snapshot cannot coordinate with the host
+  daemon from a nested non-root client (the `-shm` wal-index needs write access the
+  nested client lacks; forcing the db dir RO then breaks the active-WAL case). So
+  `check.sh` runs `rootless` in its native `guix shell -C` (NOT skipped — full
+  assertions, a failure fails the whole check) via the new `check-sandbox` Makefile
+  target (= `check` minus `rootless`); the canonical `check` is unchanged.
+  **CI fallback:** the hosted runner's container restricts the namespace/mount ops td's
+  sandbox needs — the outer `host-sandbox` fails there with "Operation not permitted"
+  (the runner permits guix's own `guix shell -C` mechanism but not td's raw
+  `pivot_root`+bind/tmpfs mounts + nested uid-map). So under `CI`/`GITHUB_ACTIONS`
+  check.sh runs the proven `guix shell -C` path; td's sandbox stays the LOCAL default
+  (the load-bearing entry agents run). Making td's sandbox run on the restricted runner
+  is a follow-up (diagnose the runner's specific seccomp/userns restriction). Caught by
+  the #33 CI `check` job, which then went green on the fallback.
 
 ## Verified-red log
 
@@ -133,3 +161,21 @@ under the `-j2` parallel loop a concurrent `guix repl` warms the cache between t
 oracle and td runs and the warning SET diverges (caught: the first full `./check.sh`
 went red on exactly that, while the standalone run was green). stdout is the
 deterministic rung signal.
+
+**Step 2 reds (the loop under td's sandbox — each surfaced a missing exposure, watched
+red, fixed)** (2026-06-14):
+- **R4 `GUIX_ENVIRONMENT` is load-bearing.** First full loop under td's sandbox: the
+  `rootless` rung went red — `ERROR: GUIX_ENVIRONMENT is unset` (it binds that profile
+  into its staged store). `guix shell -C` exports it; td's sandbox didn't. Fixed by
+  computing it from the provisioned toolchain profile and preserving it in `host_shell`.
+- **R5 the `loop-rung` `USER` corruption.** Nested under the swap, the rung's
+  `user=$(id -un)` ran inside the outer sandbox where uid 0 has no `/etc/passwd` entry,
+  so `id -un` printed `0` AND exited non-zero → `user="0\nnobody"` → the inner
+  `guix time-machine` tried `mkdir /var/guix/profiles/per-user/0\nnobody` → red. Fixed by
+  preferring the preserved `$USER` (`${USER:-…}`).
+- **R6 `rootless` cannot nest.** Its sqlite store-DB WAL snapshot fails inside td's
+  sandbox: with the `-shm` absent it tries to create it in the root-owned db dir
+  ("readonly database"); binding the db dir RO instead breaks the active-WAL case
+  ("unable to open database file"). Both seen red. This is a FUNDAMENTAL double-nested
+  userns limit, not a missing exposure — resolved by the `check-sandbox` carve-out
+  (rootless runs in its native `guix shell -C`, fully, never skipped).

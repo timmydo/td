@@ -36,8 +36,10 @@ closed loop through M10.2) is recorded in `HISTORY.md`.
 ### 1.1 The single pass/fail command
 
 `./check.sh` is the one command that means green or red. It sets up the hermetic,
-offline sandbox (a fresh `guix shell -C --pure`, store and daemon-socket exposure, a
-guard that host guix matches the `channels.scm` pin, substitutes disabled) and runs
+offline sandbox (td's own `td-builder host-sandbox` by default — the loop-sandbox swap,
+§7.1; `TD_LOOP_GUIX_SHELL=1` selects the original `guix shell -C --pure` oracle — store
+and daemon-socket exposure, a guard that host guix matches the `channels.scm` pin,
+substitutes disabled) and runs
 `make check` inside it. `make check` runs the rung ladder, short-circuiting on the
 first failure; **the `Makefile`'s `CHEAP_RUNGS`/`HEAVY_RUNGS` pools (expanded by its
 `check:` target) are the authoritative rung list** — documents point here instead of
@@ -64,8 +66,11 @@ less-frequent rung. Loop latency is a tracked metric, not an afterthought.
 ### 1.4 Agent / container boundary
 
 The Claude Code agent runs **outside** the container. Every build/test command it
-issues enters a **fresh** `guix shell -C --pure` container, so the agent's own
-environment can't contaminate results and the reproducibility rung stays honest.
+issues enters a **fresh** container — td's own `td-builder host-sandbox` by default
+(the loop-sandbox swap, §7.1), or `guix shell -C --pure` under `TD_LOOP_GUIX_SHELL=1` —
+so the agent's own environment can't contaminate results and the reproducibility rung
+stays honest. (The one rung that cannot nest in td's sandbox, `rootless`, runs in
+`guix shell -C`; see §7.1.)
 
 ### 1.5 VM state reset
 
@@ -688,12 +693,19 @@ run concurrently):
   REAL rung runs identically: with `host-sandbox --expose-cwd` (the FULL loop env — the
   worktree + cgroups + the guix cache, caller PATH = the toolchain, `TD_CHECK_*`/`USER`
   preserved, chdir into the cwd), the `eval` rung's command produces byte-identical
-  output inside td's sandbox as under `guix shell -C`. Done: #30 (exposure + isolation),
-  #31 (net parity), and Step 1 (the full-rung differential). `check.sh`'s real entry is
-  UNCHANGED (directive 3); the remaining follow-up is **Step 2** — the wholesale swap
-  (make `check.sh` launch td's sandbox), which DOES touch `check.sh` (an exclusive
-  landing). Human chose "Step 1 only for now" (2026-06-14) — Step 2 is not yet approved.
-  Working state + verified-red log: `plan/loop-sandbox.md`.
+  output inside td's sandbox as under `guix shell -C`. **Step 2 (the wholesale swap,
+  human go-ahead 2026-06-14): `check.sh` now runs the loop inside td's OWN sandbox
+  (`td-builder host-sandbox --expose-cwd`) BY DEFAULT** — the north-star "one sandbox
+  stack spanning build and run" made literal. `guix shell` (no `-C`) still provisions the
+  toolchain profile; td replaces the container. `TD_LOOP_GUIX_SHELL=1` keeps the original
+  `guix shell -C` as the oracle/fallback. The WHOLE loop runs under td's sandbox (VMs,
+  crun, OCI, every `td-*` rung) EXCEPT `rootless` — it builds in its own unprivileged
+  userns and snapshots the live store DB, which cannot coordinate with the host daemon
+  when double-nested, so it runs in its native `guix shell -C` via the `check-sandbox`
+  target (= `check` minus `rootless`; rootless still runs fully, never skipped — the
+  canonical `check` is unchanged). Done: #30 (exposure + isolation), #31 (net parity),
+  Step 1 (full-rung differential), Step 2 (the swap). Working state + verified-red log:
+  `plan/loop-sandbox.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 

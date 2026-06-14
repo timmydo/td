@@ -95,7 +95,7 @@ endef
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
 HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus td-build drv-emit td-drv-build td-drv-add td-drv-assemble td-check loop-sandbox loop-rung
 
-.PHONY: check check-fast container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
+.PHONY: check check-sandbox check-fast container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -104,6 +104,18 @@ container-check:
 	@./check.sh
 
 check: $(CHEAP_RUNGS) $(HEAVY_RUNGS)
+
+# `check` minus `rootless`, for the loop-sandbox swap (./check.sh's default
+# td-sandbox path). `rootless` builds in its OWN unprivileged user namespace and
+# snapshots the LIVE store DB; nesting it inside td's sandbox (itself an
+# unprivileged userns) double-nests and the WAL snapshot cannot coordinate with
+# the host daemon from a nested non-root client. So ./check.sh runs `rootless`
+# separately in its native `guix shell -C` (NOT skipped — it still runs with all
+# its assertions, and a failure fails the whole check) and runs THIS target for
+# the other 36 rungs under td's sandbox. The canonical `check` above is
+# UNCHANGED and still includes `rootless` (used by TD_LOOP_GUIX_SHELL=1 and plain
+# `make check`); this is purely additive.
+check-sandbox: $(CHEAP_RUNGS) $(filter-out rootless,$(HEAVY_RUNGS))
 
 # The fast tier — the rungs that test td's OWN surface (typed/TS front-end + the
 # Rust builder/evaluator) and need only the toolchain: no `guix system image`,
@@ -606,7 +618,7 @@ loop-rung:
 	@set -euo pipefail; \
 	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
-	user=`id -un 2>/dev/null || echo nobody`; \
+	user="$${USER:-`id -un 2>/dev/null || echo nobody`}"; \
 	scratch="$(CURDIR)/.loop-rung-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	echo ">> oracle: the eval rung's command directly under guix shell -C (stdout compared; the Guile auto-compile warnings on stderr are .go-cache-dependent and excluded)"; \
 	oracle=`$(GUIX) repl $(LOAD) tests/eval.scm 2>"$$scratch/oracle.err"` \
