@@ -39,28 +39,35 @@ pub struct Table {
     pub rows: Vec<(i64, Vec<Value>)>, // (rowid, column values)
 }
 
-/// Append `n` as a SQLite varint (big-endian base-128, max 9 bytes).
+/// Append `n` as a SQLite varint (big-endian base-128, 1..=9 bytes). The 9-byte
+/// form is special: its first 8 bytes carry 7 bits each (high bit = continue)
+/// and the LAST byte carries a full 8 bits — i.e. values needing more than 8
+/// 7-bit groups (>= 2^56) put their low 8 bits in byte 9.
 fn put_varint(out: &mut Vec<u8>, n: u64) {
-    if n == 0 {
-        out.push(0);
-        return;
+    if n < (1u64 << 56) {
+        // 1..=8 bytes: pure 7-bit groups, most-significant first.
+        let mut bytes = [0u8; 9];
+        let mut i = 0;
+        let mut v = n;
+        loop {
+            bytes[i] = (v & 0x7f) as u8;
+            v >>= 7;
+            i += 1;
+            if v == 0 {
+                break;
+            }
+        }
+        for j in (1..i).rev() {
+            out.push(bytes[j] | 0x80);
+        }
+        out.push(bytes[0]);
+    } else {
+        // 9-byte form: 8 groups of 7 bits (with continue) then a final full byte.
+        for k in (0..8).rev() {
+            out.push((((n >> (k * 7 + 8)) & 0x7f) as u8) | 0x80);
+        }
+        out.push((n & 0xff) as u8);
     }
-    // The 9-byte form uses all 8 bits of the last byte; handle the general 1..=9
-    // case by emitting 7-bit groups, most-significant first, with the
-    // continue bit set on all but the last.
-    let mut bytes = [0u8; 10];
-    let mut i = 0;
-    let mut v = n;
-    while v > 0 {
-        bytes[i] = (v & 0x7f) as u8;
-        v >>= 7;
-        i += 1;
-    }
-    // bytes[0..i] are little-endian 7-bit groups; emit reversed with continue bits.
-    for j in (1..i).rev() {
-        out.push(bytes[j] | 0x80);
-    }
-    out.push(bytes[0]);
 }
 
 /// The serial type for a value (SQLite record format) and its serialized body.
@@ -237,6 +244,12 @@ mod tests {
         assert_eq!(varint(127), vec![0x7f]);
         assert_eq!(varint(128), vec![0x81, 0x00]);
         assert_eq!(varint(282616), vec![0x91, 0x9f, 0x78]);
+        // Boundary: (2^56 - 1) is the largest 8-byte varint; 2^56 needs 9; the
+        // 9-byte form's last byte is a FULL 8 bits (not 7) — u64::MAX is all 0xff.
+        // (2^56-1) is 8 groups of 7 bits: 7 continue bytes then a terminal 0x7f.
+        assert_eq!(varint((1u64 << 56) - 1), vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
+        assert_eq!(varint(1u64 << 56).len(), 9);
+        assert_eq!(varint(u64::MAX), vec![0xff; 9]);
     }
 
     #[test]
