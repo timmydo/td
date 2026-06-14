@@ -192,6 +192,139 @@ pub fn build(
     Ok(outputs)
 }
 
+/// A host path to expose inside the loop sandbox (rbind-mounted at the same
+/// path in the new root). `readonly` remounts it read-only after binding.
+pub struct Bind {
+    pub src: String,
+    pub readonly: bool,
+}
+
+/// The loop-sandbox DEV-SHELL (vs. the build jail above): pivot into a fresh
+/// tmpfs root that exposes ONLY `binds` (rbind, the same path inside) plus a
+/// writable tmpfs at each of `tmpfs_dirs`; the host filesystem is otherwise
+/// gone. `path_prepend` (the host-guix bin dir, itself under the exposed
+/// `/gnu/store`) leads PATH; `home` is HOME (must be one of `tmpfs_dirs`, i.e.
+/// writable). Runs `cmd args` and returns its exit status. NEWUSER|NEWNS only
+/// — uid/gid are IDENTITY-mapped so the host daemon's peer-cred check still
+/// sees the real host uid; network-namespace parity with `guix shell -C` is a
+/// deferred follow-up (this runs inside check.sh's offline outer container).
+pub fn host_shell(
+    cmd: &str,
+    args: &[String],
+    binds: &[Bind],
+    tmpfs_dirs: &[String],
+    path_prepend: &str,
+    home: &str,
+    scratch: &Path,
+) -> io::Result<std::process::ExitStatus> {
+    let newroot = scratch.join("root");
+    fs::create_dir_all(&newroot)?;
+    let host_uid = sys::getuid();
+    let host_gid = sys::getgid();
+
+    // Precompute every CString in the parent (the child's pre_exec only does
+    // syscalls + fs ops, mirroring `build` above).
+    let newroot_c = CString::new(newroot.as_os_str().as_encoded_bytes()).unwrap();
+    let root_c = CString::new("/").unwrap();
+    let tmpfs_c = CString::new("tmpfs").unwrap();
+    let oldroot_rel = newroot.join("oldroot");
+    let oldroot_rel_c = CString::new(oldroot_rel.as_os_str().as_encoded_bytes()).unwrap();
+    let oldroot_abs_c = CString::new("/oldroot").unwrap();
+
+    // (src_c, target_dir, target_c, readonly) for each bind.
+    let mut bind_specs: Vec<(CString, PathBuf, CString, bool)> = Vec::with_capacity(binds.len());
+    for b in binds {
+        let target = newroot.join(b.src.strip_prefix('/').unwrap_or(&b.src));
+        bind_specs.push((
+            CString::new(b.src.as_str()).map_err(|_| err(format!("{}: NUL in path", b.src)))?,
+            target.clone(),
+            CString::new(target.as_os_str().as_encoded_bytes())
+                .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
+            b.readonly,
+        ));
+    }
+    // (target_dir, target_c) for each writable tmpfs mount.
+    let mut tmpfs_specs: Vec<(PathBuf, CString)> = Vec::with_capacity(tmpfs_dirs.len());
+    for d in tmpfs_dirs {
+        let target = newroot.join(d.strip_prefix('/').unwrap_or(d));
+        tmpfs_specs.push((
+            target.clone(),
+            CString::new(target.as_os_str().as_encoded_bytes())
+                .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
+        ));
+    }
+
+    let path_env = if path_prepend.is_empty() {
+        "/run/current-system/profile/bin:/run/current-system/profile/sbin".to_string()
+    } else {
+        format!("{path_prepend}:/run/current-system/profile/bin")
+    };
+
+    let mut command = Command::new(cmd);
+    command.args(args);
+    command.env_clear();
+    command.env("PATH", &path_env);
+    command.env("HOME", home);
+    command.env("TMPDIR", "/tmp");
+    // guix reads these for locale + terminal; harmless, keeps output identical
+    // to the outer shell.
+    if let Ok(v) = std::env::var("TERM") {
+        command.env("TERM", v);
+    }
+    if let Ok(v) = std::env::var("GUIX_LOCPATH") {
+        command.env("GUIX_LOCPATH", v);
+    }
+
+    unsafe {
+        command.pre_exec(move || {
+            sys::unshare(
+                sys::CLONE_NEWUSER | sys::CLONE_NEWNS | sys::CLONE_NEWIPC | sys::CLONE_NEWUTS,
+            )?;
+            fs::write("/proc/self/setgroups", "deny")?;
+            // Standard rootless map: inside-root (uid 0) → the host uid, so the
+            // process owns the fresh tmpfs root/dirs (writable) while the host
+            // daemon's SO_PEERCRED still resolves to the real host user (the
+            // kernel translates inner uid 0 back to the host uid).
+            fs::write("/proc/self/uid_map", format!("0 {host_uid} 1"))?;
+            fs::write("/proc/self/gid_map", format!("0 {host_gid} 1"))?;
+            // Everything below private to this namespace.
+            sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE)?;
+            // A fresh tmpfs is the new root (also makes it a mount point, which
+            // pivot_root requires).
+            sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0)?;
+            // Expose each requested host path (rbind), read-only where asked.
+            for (src_c, target_dir, target_c, readonly) in &bind_specs {
+                fs::create_dir_all(target_dir)?;
+                sys::mount(Some(src_c), target_c, None, sys::MS_BIND | sys::MS_REC)?;
+                if *readonly {
+                    sys::mount(
+                        None,
+                        target_c,
+                        None,
+                        sys::MS_REMOUNT | sys::MS_BIND | sys::MS_REC | sys::MS_RDONLY,
+                    )?;
+                }
+            }
+            // Writable scratch tmpfs mounts (/tmp, HOME).
+            for (target_dir, target_c) in &tmpfs_specs {
+                fs::create_dir_all(target_dir)?;
+                sys::mount(Some(&tmpfs_c), target_c, Some(&tmpfs_c), 0)?;
+            }
+            // pivot into the new root and drop the old one entirely.
+            fs::create_dir_all(&oldroot_rel)?;
+            sys::pivot_root(&newroot_c, &oldroot_rel_c)?;
+            std::env::set_current_dir("/")?;
+            sys::umount2(&oldroot_abs_c, sys::MNT_DETACH)?;
+            let _ = fs::remove_dir("/oldroot");
+            Ok(())
+        });
+    }
+
+    command
+        .status()
+        .map_err(|e| err(format!("spawning {cmd} in host-sandbox: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

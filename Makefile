@@ -53,7 +53,7 @@ endef
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-# The 35 rungs, in the two pools the bounded-parallel loop schedules from.
+# The 36 rungs, in the two pools the bounded-parallel loop schedules from.
 # ADDING A RUNG: put it in exactly ONE pool below — .PHONY, the `check` target,
 # the serial chain, and the heavy gate are all DERIVED from these two
 # variables, so the lists cannot drift apart (review finding: they used to be
@@ -93,7 +93,7 @@ endef
 # failure — a red still short-circuits the loop. Order-only (|) prerequisites,
 # so a plain serial `make -j1 check` behaves exactly as before.
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
-HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus td-build drv-emit td-drv-build td-drv-add td-drv-assemble td-check
+HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus td-build drv-emit td-drv-build td-drv-add td-drv-assemble td-check loop-sandbox
 
 .PHONY: check check-fast container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
@@ -533,6 +533,45 @@ td-check:
 	echo "   guix build --check agrees: reproducible"; \
 	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; \
 	echo "PASS: td-builder computed the reproducibility verdict ITSELF — built the td-build hello .drv twice in independent userns sandboxes to a byte-identical NAR (== the daemon's recorded hash) — matching guix build --check on the same .drv; no daemon and no guix build --check in td's verdict, which are only the oracle (input resolution + the daemon building the inputs stay Guix's, §5)."
+
+# loop-sandbox (DESIGN §7.1; gate-2 "Loop tooling convergence"). Toward replacing
+# `guix shell -C` with td's OWN sandbox: `td-builder host-sandbox` is a DEV-SHELL (vs.
+# the build jail) — it pivots into a fresh root exposing ONLY the WHOLE /gnu/store
+# (read-only), the daemon socket /var/guix, /proc and /dev, with host-guix on PATH and
+# the host filesystem otherwise GONE. This rung is the gate-2 OBSERVE step done
+# additively (it does NOT touch check.sh's real `guix shell -C` entry — directive 3):
+# (1) EXPOSURE EQUIVALENCE — plain `guix build -d hello` lowers to the SAME .drv path
+# inside td's host-sandbox as it does directly under check.sh's `guix shell -C` (guix's
+# container is the oracle, directive 4); equal path proves td's sandbox exposes the
+# store + daemon socket + guix the same way. (2) ISOLATION — the host worktree
+# ($(CURDIR)/Makefile, visible in `guix shell -C`'s shared cwd) is INVISIBLE inside
+# td's sandbox, while /gnu/store + the socket remain exposed — proving it is a real
+# container, not a bare userns. Scope (honest, deferred follow-ups like the build jail
+# deferred NEWPID/chroot to S4): network-namespace + loopback parity and the wholesale
+# check.sh swap are LATER increments; this rung runs INSIDE check.sh's offline outer
+# container, which still owns the offline posture. Heavy (a td-builder compile + two
+# nested-sandbox guix lowerings), so it slots in the heavy pool by the other td rungs.
+loop-sandbox:
+	@echo ">> loop-sandbox: td's OWN sandbox hosts a loop step (guix build -d) byte-identical to guix shell -C, and isolates the host filesystem"
+	@set -euo pipefail; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
+	echo ">> exposure equivalence: plain 'guix build -d hello' under guix shell -C vs inside td's host-sandbox"; \
+	oracle=`guix build -d hello`; \
+	test -n "$$oracle" || { echo "ERROR: oracle 'guix build -d hello' produced nothing" >&2; exit 1; }; \
+	tdout=`"$$tb" host-sandbox -- guix build -d hello`; \
+	echo "   guix shell -C  : $$oracle"; \
+	echo "   td host-sandbox: $$tdout"; \
+	test "$$tdout" = "$$oracle" \
+	  || { echo "FAIL: td's sandbox lowered a DIFFERENT .drv than guix shell -C ($$tdout vs $$oracle) — exposure diverged" >&2; exit 1; }; \
+	echo ">> isolation: the host worktree is invisible inside td's sandbox, while the store + socket stay exposed"; \
+	realbash=`readlink -f "$$(command -v bash)"`; \
+	if "$$tb" host-sandbox -- "$$realbash" -c "test -e '$(CURDIR)/Makefile'"; then \
+	  echo "FAIL: the host worktree ($(CURDIR)) leaked into td's sandbox — not isolated" >&2; exit 1; fi; \
+	"$$tb" host-sandbox -- "$$realbash" -c "test -d /gnu/store && test -S /var/guix/daemon-socket/socket" \
+	  || { echo "FAIL: td's sandbox did not expose /gnu/store + the daemon socket" >&2; exit 1; }; \
+	echo "   worktree gone; /gnu/store + daemon socket exposed"; \
+	echo "PASS: td's OWN sandbox (td-builder host-sandbox) hosted 'guix build -d hello' to the SAME .drv as check.sh's guix shell -C (store + daemon socket + guix exposed identically) while ISOLATING the host filesystem (worktree gone); the gate-2 OBSERVE step — check.sh's entry is unchanged, net-namespace parity + the swap are follow-ups."
 
 # ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
 # `tsc` (the pinned td-typescript input, run under the packaged node) BOTH

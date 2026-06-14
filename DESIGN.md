@@ -389,10 +389,11 @@ annotated.
   outputs). (The separable WHEN-it-runs question — verdict memoization — was
   approved 2026-06-12 as the check-memo track, §7.1; td-check inherits that policy
   and its constraints unchanged.)
-- **Loop tooling convergence** (follow-on): td-builder's sandbox replaces
-  `guix shell -C` in `check.sh` — the north star's "one sandbox stack spanning
-  build and run" made literal. Restructures the loop, so §4.3 gate 2 applies
-  when it graduates.
+- **Loop tooling convergence / loop-sandbox** — GRADUATED to §7.1 (approved
+  2026-06-13, §4.3 gate-2); see the active entry below. td-builder's sandbox
+  replaces `guix shell -C` in `check.sh` — the north star's "one sandbox stack
+  spanning build and run" made literal. Additive equivalence first; the wholesale
+  `check.sh` swap is a later increment.
 - **composefs** (re-parked from M11): reconsider if/when cross-generation dedup earns
   its place — it would replace, not extend, the per-generation-image design, and is
   not in the pinned Guix.
