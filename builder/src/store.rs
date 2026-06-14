@@ -252,6 +252,74 @@ pub fn construct_drv(
     Ok((path, content))
 }
 
+/// td-drv-assemble: ASSEMBLE a `.drv` from a raw line-based spec — the last guile
+/// `(derivation …)` removed. Guile resolves the inputs and emits the spec (name /
+/// system / builder / arg / input-drv `<path> <out,..>` / input-src / `env k=v`,
+/// WITHOUT the output paths or the `out` env var); td does the ASSEMBLY that
+/// `(derivation …)` does — add the `out` output + its env var, SORT env by key and
+/// inputs/sources by path (the daemon's canonical order) — then `construct_drv`
+/// computes the output path + serializes. Byte-identical to guix's `(derivation …)`.
+pub fn assemble_drv(
+    spec: &str,
+    read: &impl Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<(String, String), String> {
+    let (mut name, mut system, mut builder) = (String::new(), String::new(), String::new());
+    let mut args: Vec<String> = Vec::new();
+    let mut input_drvs: Vec<(String, Vec<String>)> = Vec::new();
+    let mut input_srcs: Vec<String> = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
+    for line in spec.lines() {
+        if let Some(r) = line.strip_prefix("name ") {
+            name = r.to_string();
+        } else if let Some(r) = line.strip_prefix("system ") {
+            system = r.to_string();
+        } else if let Some(r) = line.strip_prefix("builder ") {
+            builder = r.to_string();
+        } else if let Some(r) = line.strip_prefix("arg ") {
+            args.push(r.to_string());
+        } else if let Some(r) = line.strip_prefix("input-drv ") {
+            let (path, outs) = r.split_once(' ').ok_or("malformed input-drv line")?;
+            let mut o: Vec<String> = outs.split(',').map(String::from).collect();
+            o.sort();
+            input_drvs.push((path.to_string(), o));
+        } else if let Some(r) = line.strip_prefix("input-src ") {
+            input_srcs.push(r.to_string());
+        } else if let Some(r) = line.strip_prefix("env ") {
+            let (k, v) = r.split_once('=').ok_or("malformed env line")?;
+            env.push((k.to_string(), v.to_string()));
+        } else if line.is_empty() {
+        } else {
+            return Err(format!("unknown spec line: {line}"));
+        }
+    }
+    if name.is_empty() || builder.is_empty() || system.is_empty() {
+        return Err("spec missing name/builder/system".to_string());
+    }
+    // A single `out` output (path computed by construct_drv); its env var is added
+    // blank for construct_drv to fill. Then SORT env by key and inputs by path —
+    // exactly the canonical order `(derivation …)`/unparseDerivation impose.
+    let outputs = vec![Output {
+        name: "out".to_string(),
+        path: String::new(),
+        hash_algo: String::new(),
+        hash: String::new(),
+    }];
+    env.push(("out".to_string(), String::new()));
+    env.sort();
+    input_drvs.sort();
+    input_srcs.sort();
+    let d = Derivation {
+        outputs,
+        input_drvs,
+        input_srcs,
+        platform: system,
+        builder,
+        args,
+        env,
+    };
+    construct_drv(&d, &name, read)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

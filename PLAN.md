@@ -68,6 +68,12 @@ edits** (track files don't carry it).
   enters the store with no guile `(derivation …)`. Rung: `drv-add` (daemon returns td's
   computed path), `store-add` (novel-write proof), `guix build` the registered `.drv`
   daemon-equal. Daemon stays the backend) — `plan/td-drv-add.md`
+- [ ] **td-drv-assemble** — claimed claude-fable-4a2e33 2026-06-13 (remove the LAST
+  guile `(derivation …)`: guile resolves inputs + emits a raw SPEC
+  (`write-td-build-spec`, no `(derivation …)`); td-builder `drv-assemble` does the
+  assembly+ordering in Rust (sort env/inputs, add `out`, compute output path, register
+  via the daemon) byte-identical to guix's `(derivation …)`. Input resolution stays
+  Guix's, toolchain retired last) — `plan/td-drv-assemble.md`
 
 ## The loop (reminder)
 

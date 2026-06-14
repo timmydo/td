@@ -645,6 +645,20 @@ run concurrently):
   verified-red. Scope: input RESOLUTION (the skeleton) stays Guix's; the daemon is the
   backend.
   Working state + verified-red log: `plan/td-drv-add.md`.
+- **td-drv-assemble** *(approved 2026-06-13 — §4.3 gate-1; the §5 move-off-Guile arc,
+  follow-on to td-drv-add)* — remove the LAST guile `(derivation …)` from the build
+  path. Guile RESOLVES the inputs (toolchain + source → store paths — input resolution,
+  retired last §5) and emits a raw line-based SPEC (`system/td-build.scm`
+  `write-td-build-spec`: name/system/builder/arg/input-drv/env, no output paths, no
+  `(derivation …)`); td-builder `drv-assemble` does the ASSEMBLY `(derivation …)` did —
+  add the `out` output + env var, SORT env by key and inputs by path (the daemon's
+  canonical order), compute the output path (#22 construct_drv), serialize — and
+  registers it via the daemon (#27). Acceptance: a rung where td's assembled+registered
+  `.drv` is byte-identical to the same recipe lowered through guix's `(derivation …)`
+  (the oracle, equal store path ⇒ equal bytes) and `guix build` builds it to a working
+  hello; verified-red. So nothing guile CONSTRUCTS the build derivation anymore — only
+  input resolution stays Guix's. Working state + verified-red log:
+  `plan/td-drv-assemble.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
