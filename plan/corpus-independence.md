@@ -173,3 +173,53 @@ manipulated env / copies, real fixtures untouched.
   Rust-built derivation from a guile-built one.
 - The `--check` reproducibility leg reuses `tests/check-memo.sh` (verified-red on the
   check-memo track).
+
+## Follow-on: packages WITH inputs (claude-fable-44df36, 2026-06-14)
+
+The named "broaden the recipe set" step (DESIGN §7.1 corpus-independence: "more
+build systems, packages with inputs"). Where `corpus`/`td-build` prove a LEAF
+recipe (hello), this proves a recipe with DEPENDENCIES converges.
+
+- **Subject: GNU nano.** Picked by a cheap convergence probe over candidate
+  packages: it has a clean `url-fetch` source (no patches/snippet), EMPTY package
+  arguments, and two genuine REGULAR inputs (`gettext-minimal`, `ncurses`) — so a
+  plain reconstruction (coordinates + gnu-build-system + resolved inputs) lowers
+  store-path-identical to the corpus oracle. Other clean candidates (sed, datamash:
+  native-input-only; which: no inputs; less: custom origin → diverges) were
+  rejected by the same probe. nano's full build closure was warm except the source
+  tarball (`guix build -S nano`, substitutes — setup outside the loop, §5).
+- **Surface:** `tests/ts/recipe-nano.ts` declares `inputs: ["gettext-minimal",
+  "ncurses"]`. The boa evaluator is UNCHANGED — it `JSON.stringify`s the recipe
+  object as authored, so a new field needs no Rust change. The `Recipe` TS dialect
+  gains optional `inputs?: readonly string[]`.
+- **Bridge:** `system/td-recipe.scm` gains `resolve-inputs` — each declared name →
+  `specification->package` (input resolution stays Guix's, retired LAST — §5; the
+  new-style labels Guix derives are the package names, matching the corpus oracle's,
+  so convergence holds). `inputs` is OPTIONAL: hello (no field) lowers exactly as
+  before, so the `corpus` rung is untouched (re-verified: hello-converge #t).
+- **Rung `corpus-deps`** (heavy; HEAVY_RUNGS, additive — small exclusive Makefile
+  landing). Two legs like `corpus` plus the inputs axis:
+  (a) converge nano==oracle; (b) perturbed source diverges; (c) inputs STRIPPED
+  diverges (load-bearing); (d) ncurses + gettext-minimal are direct
+  derivation-inputs; then build + `--check` (verdict-memoized) NAR-hash-equal to the
+  corpus oracle (`1fkfyjw5…`). `./check.sh corpus-deps` green, ~44s.
+
+Verified-red (green committed first per the "commit before red variants" gotcha;
+each restored via `git checkout`):
+- **R1 convergence load-bearing** — `resolve-inputs` returns `'()` (bridge drops
+  inputs) ⇒ RED at (a): candidate `!=` oracle (exit 1). Proves input resolution is
+  load-bearing for convergence; doubles as the build-leg's convergence-guard red.
+- **R2 deps discriminator** — `strip-inputs` made a no-op (no-inputs == candidate)
+  ⇒ RED at (c): "the declared inputs are NOT load-bearing" (exit 1). Proves leg (c)
+  is not vacuous.
+- **R3 input-edge** — the (d) needle pointed at an absent package (`gettextZZZ`)
+  ⇒ RED at (d): "a declared build input is missing … (gettext=#f)" (exit 1). Proves
+  leg (d) actually verifies presence.
+- The `--check` reproducibility leg reuses `tests/check-memo.sh` (verified-red on
+  the check-memo track); NAR-equality follows from store-path equality.
+
+Note (out of scope here): `ci/lower-check-drvs.sh` `KNOWN_RUNGS`/`LOWERING_SCRIPTS`
+are already stale on main (missing the whole ts/corpus/td-drv/loop arc) — the CI
+`check` job is not yet required (`lint` is), so it does not gate local `./check.sh`.
+`corpus-deps` + its `tests/ts-recipe-nano-*.scm` add to that backlog; a single
+ci-image refresh should reconcile them all (separate `ci/` concern, flagged in PR).

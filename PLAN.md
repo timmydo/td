@@ -45,7 +45,14 @@ edits** (track files don't carry it).
   SAME TS recipe with a td/Rust builder instead of gnu-build-system — the `td-build`
   rung proves it structurally (builder=`td-builder`, not `guile`), reproducibly
   (`--check`), and behaviorally (byte-identical to the corpus hello) at a distinct
-  path) — `plan/corpus-independence.md`
+  path. PACKAGES-WITH-INPUTS follow-on claimed claude-fable-44df36 2026-06-14
+  (the named "broaden the recipe set" step): new `corpus-deps` rung — a recipe
+  WITH build inputs (`tests/ts/recipe-nano.ts`: nano declaring gettext-minimal +
+  ncurses) lowers store-path-equal to the corpus oracle, inputs resolved by the
+  bridge from the corpus (input resolution stays Guix's, retired last); inputs are
+  load-bearing (stripping them diverges) and are direct derivation-inputs; build +
+  `--check` NAR-hash-equal. Touches the Makefile/td-recipe.scm — small exclusive
+  landing, additive) — `plan/corpus-independence.md`
 - [ ] **evaluator-as-library** — claimed claude-fable-4a2e33 2026-06-13 (graduated §6→
   §7.1, human go-ahead 2026-06-13. Remove Guile from `.drv` CONSTRUCTION: td-builder
   (Rust) emits a `.drv` byte-identical — store path AND bytes — to guix's `derivation`
