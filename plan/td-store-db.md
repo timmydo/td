@@ -215,10 +215,31 @@ NEVER touched.
 td now owns BOTH halves of GC — mark (#39) and sweep — plus write (#34/#35), read (#36),
 add (flat #38 + recursive #41), and integrity-verify (#43). Daemon as oracle throughout.
 
+## Increment 9 (DONE 2026-06-14): addToStore WITH references
+
+After the no-reference flat (#38) and recursive (#41) adds, the **with-references** case.
+New `td-builder store-add-referenced NAME CONTENT-FILE REFS-FILE STORE-DIR OUT-DB` computes
+the content-addressed path with the references FOLDED INTO THE TYPE (`make_text_path`:
+`text:<sorted refs>` — the daemon's makeTextPath/makeType), WRITES the content into a
+td-owned store (canonical 0444 file), and REGISTERS the path with its `Refs` to the
+referenced paths (each a scaffolding ValidPaths row so the join resolves). No daemon.
+
+The canonical referenced content-addressed item is a `.drv` (referenced by its input
+drvs/srcs — a real, deterministic fixture; recursive `source` paths WITH references use the
+same `makeType("source", refs)` rule but have no clean interned fixture, so the differential
+runs on the `.drv`). New `store-add-referenced` rung (daemon = oracle, directive 4): for
+hello's `.drv` and its references (`guix gc --references`), td computes the IDENTICAL store
+path (the references folded in — drop one and it diverges), writes a `.drv` byte-identical
+(by NAR hash) to the daemon's own, and registers EXACTLY the daemon's recorded references
+(read back by td's own `store-query references`). Verified-red ×2: R14 (drop a ref from the
+path computation ⇒ path diverges) and R15 (register one fewer ref ⇒ refs differ while the
+path stays correct).
+
+td now owns addToStore for flat (#38), recursive (#41), AND referenced paths — plus the DB
+authority (#34/#35), read (#36), both halves of GC (#39/#47), and integrity-verify (#43).
+
 ## Later increments (sketch — not this PR)
 
-- Referenced sources/outputs: the addToStore/path case WITH references (the `output:out`
-  indirection) — recursive add of a tree that references other store paths.
 - Eventually a td store backend the system can use, daemon retired for the build side.
 - With write+read+add+GC-mark OWNED, deliberately DIVERGE the on-disk store format/schema
   where it buys something (the differential becomes a correctness check on td's chosen
@@ -353,3 +374,17 @@ dead FILES were deleted (survivors == live passed) but the DB still listed all 4
 the `test "$db_paths" = "$live"` assertion fails ⇒ `store-gc-sweep` red. Proves the DB is
 genuinely rewritten to the live set, independently of the file deletion. Reverted; rung
 green again.
+
+**R14 the references are load-bearing in the PATH — store-add-referenced** (2026-06-14,
+increment 9). Perturbed `store-add-referenced` to compute the path from one fewer reference
+(`make_text_path(name, &content, &refs[..refs.len()-1])`), ran the rung: td computed
+`…0qmx7p2…-hello-2.12.2.drv` ≠ the daemon's `…zx4bn6w…` ⇒ the `test "$td_path" = "$drv"`
+assertion fails ⇒ `store-add-referenced` red. Proves the references are folded into the
+content-addressed path (makeTextPath's type). Reverted; rung green again.
+
+**R15 the references are actually REGISTERED — store-add-referenced** (2026-06-14,
+increment 9). Perturbed the registration loop to register one fewer reference
+(`refs.iter().take(refs.len()-1)`) while leaving the path computation on the full set, ran
+the rung: the path matched but td's registered references (8) ≠ the daemon's 9 ⇒ the
+`test "$td_refs" = "$oracle_refs"` assertion fails ⇒ `store-add-referenced` red. Proves the
+Refs registration is load-bearing, independently of the path. Reverted; rung green again.

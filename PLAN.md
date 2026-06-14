@@ -122,8 +122,11 @@ edits** (track files don't carry it).
   `guix gc --verify --check-contents`): verifies hello's closure in /gnu/store == the
   daemon's hashes, and DETECTS a one-byte corruption. Inc.8 — `td-builder store-gc-sweep`
   does the destructive GC sweep: deletes the unreachable from a td-owned store + rewrites
-  the DB to the live set == `guix gc -R glibc` (host /gnu/store never touched). Daemon is
-  the oracle; td operates its OWN store DB, host daemon stays immutable infra)
+  the DB to the live set == `guix gc -R glibc` (host /gnu/store never touched). Inc.9 —
+  `td-builder store-add-referenced` does addToStore WITH references: computes the path with
+  the refs folded into the type + registers the Refs; for hello's .drv, td reproduces the
+  daemon's path, a byte-identical .drv, and exactly its recorded references. Daemon is the
+  oracle; td operates its OWN store DB, host daemon stays immutable infra)
   — `plan/td-store-db.md`
 - [ ] **gates-split** (infra, EXCLUSIVE) — claimed claude-fable-2df2c3 2026-06-14
   (kill the recurring Makefile merge conflict: the single `HEAVY_RUNGS :=` list line +
