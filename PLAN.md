@@ -89,6 +89,12 @@ edits** (track files don't carry it).
   inside td's sandbox is byte-identical to under `guix shell -C` (exposure), and a
   host-only path is invisible (isolation). Net-isolation parity + the check.sh swap are
   later increments) — `plan/loop-sandbox.md`
+- [ ] **td-store-db** — claimed claude-fable-4a2e33 2026-06-14 (begin replacing
+  guix-daemon: td owns the store SQLite DB authority. Increment 1 — `td-builder
+  store-register` writes the `ValidPaths`/`Refs`/`DerivationOutputs` rows for a built
+  artifact itself (emits SQL, sqlite3 is the engine), differential against the daemon's
+  recorded row — same hash/narSize/deriver/refs. Daemon is the oracle; td operates its
+  OWN store DB, host daemon stays immutable infra) — `plan/td-store-db.md`
 
 ## The loop (reminder)
 

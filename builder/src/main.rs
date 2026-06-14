@@ -23,6 +23,7 @@ mod sandbox;
 mod scan;
 mod sha256;
 mod store;
+mod store_db;
 mod sys;
 
 use std::path::Path;
@@ -305,6 +306,123 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: store-add {name}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-store-db: WRITE the store SQLite DB ourselves — the daemon's
+        // `ValidPaths`/`Refs`/`DerivationOutputs` authority. td computes the
+        // registration (NAR hash + size + reference scan, the same machinery `build`
+        // uses) AND writes the SQLite file format directly (store_db, zero-dep) — the
+        // real replacement of the daemon's libsqlite, no `sqlite3` engine. Usage:
+        //   store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB
+        // Writes a store DB at OUT-DB holding STORE-PATH's full registration: its
+        // ValidPaths row (the artifact, fully computed), its Refs, and the
+        // deriver→output mapping. The referenced paths + the deriver are written as
+        // minimal scaffolding rows so the relational joins resolve (a full-closure
+        // registration is a later increment). registrationTime is the daemon's "now"
+        // — a fixed sentinel here, excluded from the differential.
+        Some("store-register") if args.len() == 6 => {
+            let (store_path, deriver, candidates_file, out_db) =
+                (&args[2], &args[3], &args[4], &args[5]);
+            let run = || -> Result<(), String> {
+                use store_db::{Table, Value};
+                let candidates: Vec<String> = std::fs::read_to_string(candidates_file)
+                    .map_err(|e| e.to_string())?
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+                nar::write_nar(&mut scanner, Path::new(store_path)).map_err(|e| e.to_string())?;
+                let (hash, size, refs) = scanner.finish();
+
+                // ValidPaths: the artifact (id 1, fully computed) + the deriver (id 2)
+                // + each non-self reference (ids 3..), the latter as scaffolding rows
+                // (path only) so Refs/DerivationOutputs can join by rowid.
+                let mut valid = vec![(
+                    1i64,
+                    vec![
+                        Value::Null, // id (integer primary key) — the rowid is the id
+                        Value::Text(store_path.to_string()),
+                        Value::Text(hash),
+                        Value::Int(1), // registrationTime (sentinel; excluded)
+                        Value::Text(deriver.to_string()),
+                        Value::Int(size as i64),
+                    ],
+                )];
+                let scaffold = |id: i64, p: &str| {
+                    (
+                        id,
+                        vec![
+                            Value::Null,
+                            Value::Text(p.to_string()),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                        ],
+                    )
+                };
+                let id_of = |p: &str, refs: &[String]| -> i64 {
+                    if p == store_path.as_str() {
+                        1
+                    } else {
+                        // deriver = id 2; the non-self refs follow, in scan order.
+                        3 + refs
+                            .iter()
+                            .filter(|r| r.as_str() != store_path.as_str())
+                            .position(|r| r == p)
+                            .unwrap() as i64
+                    }
+                };
+                valid.push(scaffold(2, deriver));
+                let mut next = 3;
+                for r in &refs {
+                    if r.as_str() != store_path.as_str() {
+                        valid.push(scaffold(next, r));
+                        next += 1;
+                    }
+                }
+                // Refs: the artifact → each scanned reference (incl. the self-ref).
+                let ref_rows: Vec<(i64, Vec<Value>)> = refs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (i as i64 + 1, vec![Value::Int(1), Value::Int(id_of(r, &refs))]))
+                    .collect();
+                // DerivationOutputs: the deriver (id 2) → "out" → the artifact.
+                let drv_out = vec![(
+                    1i64,
+                    vec![
+                        Value::Int(2),
+                        Value::Text("out".to_string()),
+                        Value::Text(store_path.to_string()),
+                    ],
+                )];
+
+                let tables = [
+                    Table {
+                        name: "ValidPaths",
+                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+                        rows: valid,
+                    },
+                    Table {
+                        name: "Refs",
+                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+                        rows: ref_rows,
+                    },
+                    Table {
+                        name: "DerivationOutputs",
+                        sql: "CREATE TABLE DerivationOutputs (drv integer, id text, path text)",
+                        rows: drv_out,
+                    },
+                ];
+                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())
+            };
+            match run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: store-register {store_path}: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -597,6 +715,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
+            eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)
         }
