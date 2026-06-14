@@ -73,13 +73,11 @@ impl Daemon {
             return Err(ioerr(format!("daemon protocol major mismatch (daemon {v:#x})")));
         }
         write_int(&mut sock, PROTOCOL_VERSION)?;
-        let minor = v & 0xff;
-        if minor >= 14 {
-            write_int(&mut sock, 0)?; // cpu-affinity: none
-        }
-        if minor >= 11 {
-            write_int(&mut sock, 0)?; // reserve-space: no
-        }
+        // The daemon reads these optional fields gated on OUR advertised client
+        // minor (PROTOCOL_VERSION & 0xff = 0x63 = 99, always >= 14 and >= 11), not
+        // on its own version — so write both unconditionally.
+        write_int(&mut sock, 0)?; // cpu-affinity: none (client minor >= 14)
+        write_int(&mut sock, 0)?; // reserve-space: no  (client minor >= 11)
         sock.flush()?;
         let mut d = Daemon { sock };
         d.drain_stderr()?; // the handshake's process-stderr loop

@@ -38,7 +38,19 @@ matched. `guix build` the registered `.drv` → `Hello, world!`.
 `drv-emit` (td constructs byte-identical, #22) → `drv-add` (daemon returns td's
 computed path == guix's) → `store-add` a uniquely-named object (NOVEL write: the path
 didn't exist, the daemon wrote td's bytes, read-back matches) → `guix build` the
-td-registered `.drv` (output NAR-equal to the daemon's recorded hash). Heavy.
+td-registered `.drv` (builds to a working hello; NAR-equality follows from the shared
+content-addressed path). Heavy.
+
+**Honesty note (the demonstration's limit).** The skeleton `.drv` the rung reads is
+itself guile-lowered (`tests/td-drv-add-drv.scm` → `td-rust-build-derivation` →
+guile's `(derivation …)`), so guile has ALREADY registered a byte-identical `.drv`
+before td runs. The `drv-add` leg is therefore idempotent (the path pre-exists), and
+`guix build` builds a path that exists regardless of td. What causally proves td's
+OWN registration writes bytes via the protocol is the **novel `store-add` leg** (a
+PID-unique name the store never held). Removing the LAST guile from getting the `.drv`
+into the store needs the skeleton itself produced without `(derivation …)` (input
+resolution / skeleton ordering in Rust) — a follow-on; this track delivers the
+registration client.
 
 ## Sub-task ladder
 
