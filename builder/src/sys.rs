@@ -10,12 +10,22 @@ compile_error!("td-builder's sandbox is x86_64-linux only (the pinned platform)"
 use std::ffi::CStr;
 use std::io;
 
+const SYS_CLOSE: usize = 3;
+const SYS_IOCTL: usize = 16;
+const SYS_SOCKET: usize = 41;
 const SYS_GETUID: usize = 102;
 const SYS_GETGID: usize = 104;
 const SYS_MOUNT: usize = 165;
 const SYS_UMOUNT2: usize = 166;
 const SYS_PIVOT_ROOT: usize = 155;
 const SYS_UNSHARE: usize = 272;
+
+// Bring a loopback interface up via SIOCSIFFLAGS on a dgram socket.
+const AF_INET: usize = 2;
+const SOCK_DGRAM: usize = 2;
+const SIOCGIFFLAGS: usize = 0x8913;
+const SIOCSIFFLAGS: usize = 0x8914;
+const IFF_UP: u16 = 0x1;
 
 pub const CLONE_NEWNS: usize = 0x0002_0000;
 pub const CLONE_NEWUTS: usize = 0x0400_0000;
@@ -85,6 +95,36 @@ pub fn pivot_root(new_root: &CStr, put_old: &CStr) -> io::Result<()> {
 /// umount2(2): unmount `target` with `flags` (e.g. MNT_DETACH).
 pub fn umount2(target: &CStr, flags: usize) -> io::Result<()> {
     check(unsafe { syscall5(SYS_UMOUNT2, target.as_ptr() as usize, flags, 0, 0, 0) })
+}
+
+/// Bring the loopback interface up inside the current network namespace —
+/// SIOCGIFFLAGS|=IFF_UP, SIOCSIFFLAGS on a dgram socket. A fresh netns starts
+/// with `lo` DOWN; `guix shell -C` brings it up, so this matches that posture.
+/// Requires CAP_NET_ADMIN in the netns (held as userns root).
+pub fn bring_loopback_up() -> io::Result<()> {
+    let fd = unsafe { syscall5(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0, 0, 0) };
+    if fd < 0 {
+        return Err(io::Error::from_raw_os_error(-fd as i32));
+    }
+    let fd = fd as usize;
+    // struct ifreq: char ifr_name[16] then a union whose first member is the
+    // short ifr_flags (at offset 16). 40 bytes is the x86_64 size.
+    let mut ifr = [0u8; 40];
+    ifr[0] = b'l';
+    ifr[1] = b'o';
+    let close_fd = || unsafe {
+        syscall5(SYS_CLOSE, fd, 0, 0, 0, 0);
+    };
+    let g = unsafe { syscall5(SYS_IOCTL, fd, SIOCGIFFLAGS, ifr.as_mut_ptr() as usize, 0, 0) };
+    if g < 0 {
+        close_fd();
+        return Err(io::Error::from_raw_os_error(-g as i32));
+    }
+    let flags = u16::from_ne_bytes([ifr[16], ifr[17]]) | IFF_UP;
+    ifr[16..18].copy_from_slice(&flags.to_ne_bytes());
+    let s = unsafe { syscall5(SYS_IOCTL, fd, SIOCSIFFLAGS, ifr.as_mut_ptr() as usize, 0, 0) };
+    close_fd();
+    check(s)
 }
 
 pub fn getuid() -> u32 {
