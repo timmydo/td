@@ -133,7 +133,11 @@ edits** (track files don't carry it).
   perturbed lock diverges. The lock is a pinned artifact regenerated on a channel bump
   (exclusive-landing, like DIGESTS); the RESOLVER that computes it stays Guile, retired
   package-by-package. Later: wire the lock into the build (the swap), then reconstruct
-  individual input recipes) — `plan/input-resolution.md`
+  individual input recipes. Inc.2 DONE 2026-06-14 — the SWAP: new `td-build-resolved`
+  rung, the `td-build` nano build CONSUMES `td-builder resolve` over the lock for its
+  deps (input-sources, NO specification->package), behaviorally identical to the
+  corpus nano at a distinct path; deps move drv→source so it's a behavioral (not
+  byte-identical-.drv) differential) — `plan/input-resolution.md`
 
 ## The loop (reminder)
 

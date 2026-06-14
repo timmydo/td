@@ -57,7 +57,8 @@
 ;; `td-rust-build-derivation` (the guix-`(derivation …)` oracle) and
 ;; `write-td-build-spec` (the td-assembled path) start here, so they resolve
 ;; identical inputs.
-(define* (td-build-components store recipe-alist #:key (configure-flags ""))
+(define* (td-build-components store recipe-alist #:key (configure-flags "")
+                              (resolved-dep-paths #f))
   (let* ((name    (field recipe-alist "name"))
          (version (field recipe-alist "version"))
          (source  (field recipe-alist "source"))
@@ -89,29 +90,43 @@
          ;; untouched).
          (dep-names (let ((v (assoc-ref recipe-alist "inputs")))
                       (if v (vector->list v) '())))
-         (dep-drvs (map (lambda (spec)
-                          (package-derivation store (specification->package spec)
-                                              #:graft? #f))
-                        dep-names))
-         (dep-outs (map derivation->output-path dep-drvs))
+         ;; INPUT-RESOLUTION SWAP (Inc.2): when RESOLVED-DEP-PATHS is supplied — by
+         ;; `td-builder resolve` over the pinned lock, NOT Guile — the recipe's
+         ;; declared deps come from td's resolution as input-SOURCES (already-realized
+         ;; store paths), so NO `specification->package` runs for the deps. Default
+         ;; (#f): resolve from the corpus (Guile, retired LAST §5) as input-derivations.
+         ;; The toolchain stays Guile either way (retired even later).
+         (swap?    (and resolved-dep-paths (pair? resolved-dep-paths)))
+         (dep-drvs (if swap? '()
+                       (map (lambda (spec)
+                              (package-derivation store (specification->package spec)
+                                                  #:graft? #f))
+                            dep-names)))
+         (dep-outs (if swap? resolved-dep-paths (map derivation->output-path dep-drvs)))
+         (dep-srcs (if swap? resolved-dep-paths '()))
          (input-drvs (append (list src-drv tb-drv) tool-drvs dep-drvs)))
     (list (cons 'name full)
           (cons 'system "x86_64-linux")
           (cons 'builder builder)
           (cons 'args (list "autotools-build"))
           (cons 'input-drvs input-drvs)
+          (cons 'input-srcs dep-srcs)
           (cons 'env `(("TD_SRC"             . ,src-path)
                        ("TD_INPUTS"          . ,(string-join (append tool-outs dep-outs) ":"))
                        ("TD_CONFIGURE_FLAGS" . ,configure-flags))))))
 
-(define* (td-rust-build-derivation store recipe-alist #:key (configure-flags ""))
+(define* (td-rust-build-derivation store recipe-alist #:key (configure-flags "")
+                                   (resolved-dep-paths #f))
   "Return a derivation that builds RECIPE-ALIST with `td-builder autotools-build`
-as the builder, via guix's `(derivation …)` — the ORACLE the td-assembled `.drv`
-is diffed against (td-drv-assemble)."
-  (let* ((c (td-build-components store recipe-alist #:configure-flags configure-flags)))
+as the builder, via guix's `(derivation …)`.  With RESOLVED-DEP-PATHS (the
+input-resolution swap, Inc.2) the recipe's deps are td-resolved input-sources
+rather than Guile-resolved input-derivations."
+  (let* ((c (td-build-components store recipe-alist #:configure-flags configure-flags
+                                 #:resolved-dep-paths resolved-dep-paths)))
     (derivation store (assq-ref c 'name) (assq-ref c 'builder) (assq-ref c 'args)
                 #:inputs (map (lambda (d) (derivation-input d '("out")))
                               (assq-ref c 'input-drvs))
+                #:sources (assq-ref c 'input-srcs)
                 #:env-vars (assq-ref c 'env)
                 #:system (assq-ref c 'system))))
 
