@@ -58,6 +58,25 @@ runs into separate scratch trees. `guix build --check` remains the oracle (direc
    would fail too — both agree). — sub-task B.
 3. Full `./check.sh` green; PR. — sub-task C.
 
+## Implementation progress
+
+- **DONE 2026-06-13.** `check` subcommand + the `td-check` rung GREEN in-sandbox: td
+  built the `td-build` hello `.drv` twice in two independent userns sandboxes to a
+  byte-identical NAR (`sha256:492a8b66…`, == the daemon's recorded hash), and
+  `guix build --check` agreed. The `nar_hash_path` factor leaves the existing
+  `nar-hash` subcommand byte-identical; no existing rung touched.
+
 ## Verified-red log
 
-(filled as each assertion is seen red.)
+**R1 the double-build genuinely catches non-reproducibility** (2026-06-13). Injected
+build non-determinism — appended a wall-clock-nanos file to `$out` in
+`build.rs::run` (after `make install`) so each build differs — rebuilt td-builder,
+ran the rung. `td-builder check` reported the two builds DIVERGING and exited 3:
+
+    CHECK out /gnu/store/hag5npns…-hello-2.12.2 sha256:e4113f58… != sha256:5b91e02f… NON-REPRODUCIBLE
+    td-builder: check …-hello-2.12.2.drv: NOT reproducible
+
+⇒ the rung failed at the td-check leg ("FAIL: td-builder check reported
+NON-reproducible") with exit 2. Proves the verdict compares TWO independent builds
+and catches real non-reproducibility — not idempotency, and not a vacuous pass.
+Reverted the injection (`git checkout builder/src/build.rs`); rung green again.
