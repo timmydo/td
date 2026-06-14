@@ -144,10 +144,38 @@ unreached (matching `guix gc -R`, which excludes the `.drv`). +1 in-process unit
 td now owns the conceptual store loop: WRITE the DB (#34/#35), READ it (#36), ADD a path
 (#38), and compute GC liveness (this) — all with the daemon as oracle, not authority.
 
+## Increment 6 (DONE 2026-06-14): recursive addToStore — td restores a directory TREE
+
+The general write side (after the flat `store-add`, #38): td places a DIRECTORY TREE into
+its own store. New `td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB` computes the
+content-addressed `source` path from the tree's recursive NAR sha256
+(`make_store_path("source", …)` — the daemon's makeFixedOutputPath for recursive-sha256,
+no references), CANONICALLY restores the tree with `copy_canonical` (structure + contents
++ the file EXECUTABLE bit + symlinks — the properties NAR captures; dir perms, the
+read/write bits, and mtimes are NAR-irrelevant, so dirs are left writable for cleanup),
+and registers it in a td store DB. No daemon in the write path. (The exec bit keys off
+OWNER-exec `0o100` — exactly what td's own `nar.rs` serializer and the daemon's
+canonicaliser (`S_IXUSR`) use, so a group/other-exec-only file stays non-executable;
+a review-caught fidelity fix, with a `0o654` regression guard in the unit test.)
+
+New `store-add-tree` rung (daemon = oracle, directive 4): the daemon's OWN interned
+`td-builder` source tree (a real directory added via addToStore recursive, no refs —
+lowered with `guix repl … (lower-object %builder-source)`, already in the store so no
+fresh add / no WAL) gives the IDENTICAL content-addressed path, and a tree BYTE-IDENTICAL
+(by NAR hash) to the one td restored; td's registration (read back by TD'S OWN reader)
+records that path + the tree's NAR hash. +1 unit test
+(`copy_canonical_is_nar_identical_with_exec_and_symlink`: a tree with an executable file
++ a symlink — the NAR-relevant cases the rung's source tree lacks), 37 cargo tests.
+(Note: editing `builder/` changes the source's content-addressed hash, so the rung
+recomputes the oracle path fresh each run — oracle and td always agree on current content.)
+
+td now owns the full store WRITE side (flat #38 + recursive) plus read (#36), the DB
+authority (#34/#35), and GC-mark (#39) — daemon as oracle throughout.
+
 ## Later increments (sketch — not this PR)
 
-- Recursive *directory* addToStore (canonical tree restore: recreate the tree with
-  canonical metadata, the exec-bit honored) + references — the general add.
+- Referenced sources/outputs: the addToStore/path case WITH references (the `output:out`
+  indirection) — recursive add of a tree that references other store paths.
 - The destructive GC SWEEP (delete the unreachable) into a td-owned store — the other
   half of GC, on a td store (never the host's).
 - Eventually a td store backend the system can use, daemon retired for the build side.
@@ -247,3 +275,19 @@ the unit tests cover `Db::closure`, not the arm, so the binary still built — r
 the `test "$td_reach" = "$oracle"` assertion fails ⇒ `store-gc` red. Proves the rung's
 comparison against the daemon's `guix gc -R` is live and non-vacuous. Reverted; rung
 green again.
+
+**R9 the canonical tree restore preserves NAR-relevant properties — unit level**
+(2026-06-14, increment 6). Perturbed `copy_canonical` to drop the executable bit (`mode =
+0o444` for exec files too), ran `cargo test`: `copy_canonical_is_nar_identical_with_exec_
+and_symlink` failed — the restored tree's NAR (`sha256:4754ae…`) ≠ the source's
+(`sha256:acd008…`) ⇒ the test red (the build gate runs it). Proves the tree restore's
+exec-bit fidelity — a property NAR captures that the rung's source tree lacks — is
+genuinely tested. Reverted; 37 green.
+
+**R10 the recursive content-addressed path differential is non-vacuous — store-add-tree**
+(2026-06-14, increment 6). Perturbed `store-add-recursive` to compute the path from the
+wrong type string (`make_store_path("sourceX", …)`) — `make_store_path`'s "source" type is
+not unit-tested, so the binary still built — ran the `store-add-tree` rung: td computed
+`…mxqj89…` ≠ the daemon's interned `…vwq9xz…` ⇒ the `test "$td_path" = "$src"` assertion
+fails ⇒ `store-add-tree` red. Proves the rung's content-addressed path differential
+against the daemon is live. Reverted; rung green again.

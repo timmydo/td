@@ -12,6 +12,7 @@
 .verify-place-check-scratch/
 .store-register-scratch/
 .store-add-scratch/
+.store-add-tree-scratch/
 .store-gc-scratch/
 
 # check-memo verdicts (plan/check-memo.md constraint 2): host-local state,

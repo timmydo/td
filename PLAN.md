@@ -108,8 +108,10 @@ edits** (track files don't carry it).
   it — byte-identical (NAR) to the daemon's own store file (the WAL-free oracle). Inc.5 —
   `td-builder store-closure` computes GC reachability (the daemon's THIRD role): walks the
   Refs graph from a root with td's own reader (GC mark/liveness, no daemon) == `guix gc
-  -R`. Daemon is the oracle; td operates its OWN store DB, host daemon stays immutable
-  infra) — `plan/td-store-db.md`
+  -R`. Inc.6 — `td-builder store-add-recursive` does the recursive addToStore: computes the
+  content-addressed `source` path + CANONICALLY restores a directory TREE (exec bit +
+  symlinks) byte-identical (NAR) to the daemon's interned tree. Daemon is the oracle; td
+  operates its OWN store DB, host daemon stays immutable infra) — `plan/td-store-db.md`
 
 ## The loop (reminder)
 
