@@ -95,8 +95,11 @@ edits** (track files don't carry it).
   closure as the SQLite FILE FORMAT in pure Rust (`store_db.rs`), differential vs the
   daemon. Inc.3 — `td-builder store-query` READS it back with td's OWN pure-Rust SQLite
   reader (`store_db_read.rs`), no sqlite3/daemon in td's query path ("own the store,
-  then diverge"); td's reader == sqlite3 (same bytes) == the daemon. Daemon is the
-  oracle; td operates its OWN store DB, host daemon stays immutable infra)
+  then diverge"); td's reader == sqlite3 (same bytes) == the daemon. Inc.4 — `td-builder
+  store-add-text` PLACES a path into a td-owned store (the daemon's addToStore, write
+  side, flat case): td computes the path, WRITES a canonical 0444 store file, registers
+  it — byte-identical (NAR) to the daemon's own store file (the WAL-free oracle). Daemon
+  is the oracle; td operates its OWN store DB, host daemon stays immutable infra)
   — `plan/td-store-db.md`
 
 ## The loop (reminder)

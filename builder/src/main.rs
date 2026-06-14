@@ -542,6 +542,94 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: ADD a path to a td-OWNED store ourselves — the daemon's
+        // addToStore (the WRITE side), in pure Rust. td computes the addTextToStore
+        // path (`make_text_path`), WRITES the content into STORE-DIR as a canonical
+        // store file (a regular, read-only 0444 file), and REGISTERS it in a td store
+        // DB (`store_db`) — no daemon in the write path. NAR (hence the store path's
+        // identity) ignores mtime and the read/write permission bits, so the
+        // registration is metadata-independent. Usage:
+        //   store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB
+        // Prints the store path. Flat/text case, no references — the recursive
+        // directory case (canonical tree restore) is a later increment.
+        Some("store-add-text") if args.len() == 6 => {
+            let (name, content_file, store_dir, out_db) =
+                (&args[2], &args[3], &args[4], &args[5]);
+            let run = || -> Result<String, String> {
+                use std::os::unix::fs::PermissionsExt;
+                use store_db::{Table, Value};
+                let content = std::fs::read(content_file).map_err(|e| e.to_string())?;
+                // td computes the addTextToStore path itself (no references).
+                let path = store::make_text_path(name, &content, &[]);
+                let base = path
+                    .rsplit('/')
+                    .next()
+                    .filter(|_| store::name_from_store_path(&path).is_some())
+                    .ok_or_else(|| format!("computed path {path} is malformed"))?
+                    .to_string();
+                // Write the content into the td-owned store as a canonical store file:
+                // a regular, world-readable, read-only (0444) file.
+                std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+                let disk = Path::new(store_dir).join(&base);
+                std::fs::write(&disk, &content).map_err(|e| e.to_string())?;
+                let mut perm =
+                    std::fs::metadata(&disk).map_err(|e| e.to_string())?.permissions();
+                perm.set_mode(0o444);
+                std::fs::set_permissions(&disk, perm).map_err(|e| e.to_string())?;
+                // Register it: NAR-hash + size of the file td just wrote (the `build`
+                // machinery), references scanned among the single-path closure.
+                let closure = vec![path.clone()];
+                let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
+                nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
+                let (hash, size, refs) = s.finish();
+                let valid = vec![(
+                    1i64,
+                    vec![
+                        Value::Null, // id (integer primary key) — rowid is the id
+                        Value::Text(path.clone()),
+                        Value::Text(hash),
+                        Value::Int(1), // registrationTime (sentinel; excluded)
+                        Value::Null,   // deriver — a source add has none
+                        Value::Int(size as i64),
+                    ],
+                )];
+                // A flat text add references nothing but (possibly) itself.
+                let mut ref_rows = Vec::new();
+                let mut rid = 1i64;
+                for r in &refs {
+                    if r == &path {
+                        ref_rows.push((rid, vec![Value::Int(1), Value::Int(1)]));
+                        rid += 1;
+                    } else {
+                        return Err(format!("unexpected reference {r} in a flat text add"));
+                    }
+                }
+                let tables = [
+                    Table {
+                        name: "ValidPaths",
+                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+                        rows: valid,
+                    },
+                    Table {
+                        name: "Refs",
+                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+                        rows: ref_rows,
+                    },
+                ];
+                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+                Ok(path)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-add-text {name}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-drv-assemble: ASSEMBLE the `.drv` from a raw SPEC (Guile resolved the
         // inputs and emitted it WITHOUT `(derivation …)`) and REGISTER it via the
         // daemon — so the build derivation enters the store with no guile
@@ -832,6 +920,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
             eprintln!("       td-builder store-query DB info|references");
+            eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)
         }

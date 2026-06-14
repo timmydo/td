@@ -732,10 +732,19 @@ run concurrently):
   Boundary: the host daemon stays immutable infra (immutable read only); td operates its
   OWN store DB, daemon = oracle (directive 4). With write+read owned, byte-identity to
   the daemon's schema becomes OPTIONAL — the differential stays a correctness check, not
-  a compatibility cage. Later (sketch): `addToStore` end-to-end into a td store, GC
-  reachability, then a td store backend the build side can use — and the freedom to
-  diverge the on-disk format once nothing external must read it. Working state +
-  verified-red log: `plan/td-store-db.md`.
+  a compatibility cage. Increment 4 — **td PLACES a path into its own store** (the
+  daemon's `addToStore`, write side, flat/text case): `td-builder store-add-text`
+  computes the addTextToStore path (`make_text_path`), WRITES the content into a td-owned
+  store dir as a canonical `0444` store file, and registers it in a td DB — no daemon in
+  the write path. The `store-add` rung's differential uses the daemon's OWN store file as
+  oracle (a freshly-added path is in the daemon's WAL, invisible to an immutable
+  `db.sqlite` read; the on-disk file is the WAL-free, stronger oracle): td's store path,
+  store bytes (by NAR hash), and registration (read back by td's own reader) all match
+  the daemon's. td now owns the flat store loop — write DB, read DB, add a path — with
+  the daemon as oracle. Later (sketch): recursive directory adds (canonical tree restore)
+  + references, GC reachability, then a td store backend the build side can use — and the
+  freedom to diverge the on-disk format once nothing external must read it. Working state
+  + verified-red log: `plan/td-store-db.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
