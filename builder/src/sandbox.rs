@@ -95,7 +95,23 @@ pub fn build(
         ));
     }
 
-    let build_dir = format!("/tmp/guix-build-{}-0", store_path_name(drv_path)?);
+    // The build dir is `guix-build-<drvName>-0`. For a store-path drv that is
+    // storePathToName(drvPath). For an emitted `.drv` handed in from outside the
+    // store (td-drv-build builds the file td WROTE), derive the same name from the
+    // first output's store name + ".drv" (drvName == outName + ".drv" for these
+    // single-output subjects). Store-path inputs (the td-builder rung) are
+    // unaffected — the first branch still wins.
+    let drv_name = match store_path_name(drv_path) {
+        Ok(n) => n.to_string(),
+        Err(_) => {
+            let out0 = drv
+                .outputs
+                .first()
+                .ok_or_else(|| err("derivation has no outputs".into()))?;
+            format!("{}.drv", store_path_name(&out0.path)?)
+        }
+    };
+    let build_dir = format!("/tmp/guix-build-{}-0", drv_name);
     let host_uid = sys::getuid();
     let host_gid = sys::getgid();
 

@@ -610,6 +610,24 @@ run concurrently):
   guix's, validated over hundreds of real store drvs; a perturbed recipe is a distinct
   drv it also matches; verified-red ×2. Working state + verified-red log:
   `plan/evaluator-as-library.md`.
+- **td-drv-build** *(approved 2026-06-13 — §4.3 gate-1 roadmap addition; the capstone
+  of the §5 move-off-Guile arc, follow-on to evaluator-as-library + the own Rust
+  builder + td-builder)* — the end-to-end td-driven build: for the `td-build` hello
+  subject, td-builder EMITS the `.drv` (#22) AND EXECUTES it in its own user-namespace
+  sandbox (the td-builder S3/S4 build path), producing an output NAR-equal to the
+  daemon's build of the same recipe. So construct AND execute are td's Rust — the
+  derivation's builder is `td-builder autotools-build` (#21) run by `td-builder build`,
+  with NO Guile in either; the daemon is ONLY the differential oracle (prime directive
+  4). Acceptance: a rung that (a) has td-builder write the emitted `.drv` (byte-
+  identical to guix's), (b) builds it in the td-builder sandbox, and (c) asserts the
+  registered output — store path, NAR hash, size, deriver — equals the daemon's
+  recorded facts; self-discriminating + verified-red (an emit defect breaks byte-
+  identity; an executor defect breaks the NAR differential). Scope boundary, stated
+  honestly: input RESOLUTION (which toolchain/source paths are inputs) and the input
+  CLOSURE computation stay Guix's, and the daemon still BUILDS the inputs — only the
+  TOP derivation (hello) is td-constructed + td-executed; the toolchain is retired
+  last (§5). Reuses the td-builder S3/S4 harness. Working state + verified-red log:
+  `plan/td-drv-build.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
