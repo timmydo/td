@@ -122,6 +122,18 @@ edits** (track files don't carry it).
   `guix gc --verify --check-contents`): verifies hello's closure in /gnu/store == the
   daemon's hashes, and DETECTS a one-byte corruption. Daemon is the oracle; td operates
   its OWN store DB, host daemon stays immutable infra) — `plan/td-store-db.md`
+- [ ] **input-resolution** — claimed claude-fable-44df36 2026-06-14 (move-off-Guile §5:
+  begin retiring INPUT RESOLUTION — the toolchain layer, retired LAST. Today
+  `system/td-build.scm` resolves a recipe's inputs to store paths via Guile's
+  `specification->package`. Inc.1 (additive equivalence, the loop-sandbox/td-check way):
+  `td-builder resolve` reads a PINNED lock (`tests/td-build-inputs.lock`,
+  name→store-path) with NO Guile; the `resolve` rung proves td's lock resolution is
+  store-path-equal to Guile's LIVE resolution (the oracle, `tests/resolve-lock.scm`) for
+  the nano recipe's declared inputs (ncurses + gettext-minimal), build UNCHANGED,
+  perturbed lock diverges. The lock is a pinned artifact regenerated on a channel bump
+  (exclusive-landing, like DIGESTS); the RESOLVER that computes it stays Guile, retired
+  package-by-package. Later: wire the lock into the build (the swap), then reconstruct
+  individual input recipes) — `plan/input-resolution.md`
 
 ## The loop (reminder)
 
