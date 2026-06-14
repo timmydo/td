@@ -16,6 +16,7 @@
 //!   • S4 — the daemon-vs-td-builder store differential, as a check.sh rung.
 
 mod build;
+mod daemon;
 mod drv;
 mod nar;
 mod sandbox;
@@ -217,6 +218,74 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: drv-emit-to {oracle}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-drv-add: CONSTRUCT the `.drv` (#22) and REGISTER it in the store via
+        // the daemon's addTextToStore — no guile `(derivation …)`. Asserts the
+        // path the daemon returns equals td's own computed path, and prints it.
+        // The socket is TD_DAEMON_SOCKET or the default.
+        Some("drv-add") if args.len() == 3 => {
+            let oracle = &args[2];
+            let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
+            let run = || -> Result<String, String> {
+                let bytes = std::fs::read(oracle).map_err(|e| e.to_string())?;
+                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let name = store::name_from_store_path(oracle)
+                    .ok_or_else(|| format!("{oracle} is not a store path"))?;
+                let drv_name = name
+                    .strip_suffix(".drv")
+                    .ok_or_else(|| format!("{oracle} is not a .drv"))?;
+                let (computed, content) = store::construct_drv(&d, drv_name, &read)?;
+                let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
+                refs.extend(d.input_srcs.iter().cloned());
+                let socket = std::env::var("TD_DAEMON_SOCKET")
+                    .unwrap_or_else(|_| daemon::DEFAULT_SOCKET.to_string());
+                let mut dm = daemon::Daemon::connect(&socket)
+                    .map_err(|e| format!("connect {socket}: {e}"))?;
+                let added = dm
+                    .add_text_to_store(&name, content.as_bytes(), &refs)
+                    .map_err(|e| e.to_string())?;
+                if added != computed {
+                    return Err(format!(
+                        "daemon registered {added} but td computed {computed}"
+                    ));
+                }
+                Ok(added)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-add {oracle}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-drv-add: generic addTextToStore of FILE's bytes under NAME (no
+        // references) — prints the daemon-returned store path. The rung uses it
+        // with a UNIQUE name to prove the daemon actually WRITES td's bytes (a
+        // novel path), not just returns a pre-existing one.
+        Some("store-add") if args.len() == 4 => {
+            let (name, file) = (&args[2], &args[3]);
+            let run = || -> Result<String, String> {
+                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                let socket = std::env::var("TD_DAEMON_SOCKET")
+                    .unwrap_or_else(|_| daemon::DEFAULT_SOCKET.to_string());
+                let mut dm = daemon::Daemon::connect(&socket)
+                    .map_err(|e| format!("connect {socket}: {e}"))?;
+                dm.add_text_to_store(name, &bytes, &[]).map_err(|e| e.to_string())
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-add {name}: {e}");
                     ExitCode::FAILURE
                 }
             }

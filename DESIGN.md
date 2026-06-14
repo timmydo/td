@@ -628,6 +628,23 @@ run concurrently):
   TOP derivation (hello) is td-constructed + td-executed; the toolchain is retired
   last (§5). Reuses the td-builder S3/S4 harness. Working state + verified-red log:
   `plan/td-drv-build.md`.
+- **td-drv-add** *(approved 2026-06-13 — §4.3 gate-1; the §5 move-off-Guile arc,
+  follow-on to evaluator-as-library + td-drv-build)* — wire td's constructed `.drv`
+  INTO the loop: td-builder constructs the `.drv` (#22) and REGISTERS it in the store
+  itself via the daemon's `addTextToStore` RPC — a minimal Rust worker-protocol
+  client (`builder/src/daemon.rs`, transcribed from `(guix store)`/`(guix
+  serialization)` at the pin) — so the `.drv` enters the store with NO guile
+  `(derivation …)`/`add-text-to-store`. The daemon (C++) stays the store/build
+  backend; the GUILE client is what's removed. Acceptance: a rung where (a) `drv-add`
+  registers the hello `.drv` and the daemon returns td's OWN computed path (== guix's,
+  by content addressing), (b) `store-add` of a uniquely-named object proves the daemon
+  actually WRITES td's bytes at a NOVEL path (not idempotent reuse — this is the leg
+  that causally proves td's registration, since the skeleton `.drv` is guile-lowered
+  and thus already present), and (c) `guix build` of the td-registered `.drv` builds it
+  to a working hello (NAR-equality follows from the shared content-addressed path);
+  verified-red. Scope: input RESOLUTION (the skeleton) stays Guix's; the daemon is the
+  backend.
+  Working state + verified-red log: `plan/td-drv-add.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
