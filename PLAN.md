@@ -52,7 +52,14 @@ edits** (track files don't carry it).
   bridge from the corpus (input resolution stays Guix's, retired last); inputs are
   load-bearing (stripping them diverges) and are direct derivation-inputs; build +
   `--check` NAR-hash-equal. Touches the Makefile/td-recipe.scm — small exclusive
-  landing, additive) — `plan/corpus-independence.md`
+  landing, additive). OWN-BUILDER-WITH-INPUTS follow-on claimed claude-fable-44df36
+  2026-06-14 (stacked on the corpus-deps PR): new `td-build-deps` rung — the SAME
+  nano recipe built by td's OWN Rust builder (`system/td-build` resolves the
+  declared inputs from the corpus and feeds their include/lib to the Rust
+  autotools-build via TD_INPUTS, so td's builder links real deps — no
+  gnu-build-system); structural (builder=`td-builder`), input-edge (ncurses +
+  gettext direct inputs), reproducible (`--check`), behavioral (byte-identical
+  `--version` to corpus nano) at a distinct path — `plan/corpus-independence.md`
 - [ ] **evaluator-as-library** — claimed claude-fable-4a2e33 2026-06-13 (graduated §6→
   §7.1, human go-ahead 2026-06-13. Remove Guile from `.drv` CONSTRUCTION: td-builder
   (Rust) emits a `.drv` byte-identical — store path AND bytes — to guix's `derivation`
