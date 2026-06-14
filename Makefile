@@ -53,7 +53,7 @@ endef
 # recursing into nested containers.
 .DEFAULT_GOAL := check
 
-# The 36 rungs, in the two pools the bounded-parallel loop schedules from.
+# The 37 rungs, in the two pools the bounded-parallel loop schedules from.
 # ADDING A RUNG: put it in exactly ONE pool below — .PHONY, the `check` target,
 # the serial chain, and the heavy gate are all DERIVED from these two
 # variables, so the lists cannot drift apart (review finding: they used to be
@@ -93,7 +93,7 @@ endef
 # failure — a red still short-circuits the loop. Order-only (|) prerequisites,
 # so a plain serial `make -j1 check` behaves exactly as before.
 CHEAP_RUNGS := eval diff typed-coverage oci-diff manifest-diff generation-diff
-HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus td-build drv-emit td-drv-build td-drv-add td-drv-assemble td-check loop-sandbox
+HEAVY_RUNGS := rollback generation-image no-guix manifest-check oci container rootless oci-load registry verify-place reset test place build boot-disk td-builder run offline memo ts ts-eval ts-diff corpus td-build drv-emit td-drv-build td-drv-add td-drv-assemble td-check loop-sandbox loop-rung
 
 .PHONY: check check-fast container-check $(CHEAP_RUNGS) $(HEAVY_RUNGS)
 
@@ -587,6 +587,36 @@ loop-sandbox:
 	  || { echo "FAIL: td's sandbox netns is not loopback-only (a non-lo interface is present)" >&2; exit 1; }; \
 	echo "   td entered its own loopback-only netns; the daemon stayed reachable (the equivalence above held across it)"; \
 	echo "PASS: td's OWN sandbox (td-builder host-sandbox) hosted 'guix build -d hello' to the SAME .drv as check.sh's guix shell -C (store + daemon socket + guix exposed identically) while ISOLATING the host filesystem (worktree gone) AND running in its OWN loopback-only network namespace (net parity with guix shell -C; the daemon stays reachable over the Unix socket); the gate-2 OBSERVE step — check.sh's entry is unchanged, the wholesale swap is the remaining follow-up."
+
+# loop-rung (DESIGN §7.1; gate-2 "Loop tooling convergence", Step 1 — the full-rung
+# differential). loop-sandbox (#30/#31) proved td's host-sandbox hosts a single guix
+# operation; this proves it hosts a REAL loop rung. `td-builder host-sandbox
+# --expose-cwd` adds guix shell -C's FULL loop env (the worktree/cwd bound like its
+# shared cwd, the cgroup hierarchy + the guix cache, the caller's PATH — the toolchain,
+# all /gnu/store — and TD_CHECK_*/USER preserved, chdir into the cwd). The differential:
+# the `eval` rung's exact command (`$(GUIX) repl $(LOAD) tests/eval.scm` — loads every
+# system/test module + prints "eval ok") produces BYTE-IDENTICAL combined output inside
+# td's full-env sandbox as it does directly under check.sh's `guix shell -C` (the
+# oracle). Proves a real rung runs identically in td's sandbox — the differential the
+# wholesale check.sh swap (Step 2, deferred) needs. ADDITIVE: check.sh is UNCHANGED.
+# Heavy (a td-builder compile + two guix repl evals), so it slots in the heavy pool by
+# the other loop rungs.
+loop-rung:
+	@echo ">> loop-rung: a REAL rung (eval) runs BYTE-IDENTICALLY inside td's full-env sandbox (--expose-cwd) as under guix shell -C"
+	@set -euo pipefail; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
+	user=`id -un 2>/dev/null || echo nobody`; \
+	echo ">> oracle: the eval rung's command directly under guix shell -C"; \
+	oracle=`$(GUIX) repl $(LOAD) tests/eval.scm 2>&1`; \
+	echo "$$oracle" | sed 's/^/   oracle| /'; \
+	echo ">> td: the SAME command inside td's host-sandbox --expose-cwd (worktree + toolchain + cache exposed, chdir'd in)"; \
+	td=`USER="$$user" "$$tb" host-sandbox --expose-cwd -- $(GUIX) repl $(LOAD) tests/eval.scm 2>&1`; \
+	echo "$$td" | sed 's/^/   td    | /'; \
+	test "$$td" = "$$oracle" \
+	  || { echo "FAIL: the eval rung produced DIFFERENT output inside td's sandbox than under guix shell -C — the full-env exposure diverged" >&2; exit 1; }; \
+	case "$$td" in *"eval ok"*) : ;; *) echo "FAIL: the eval rung did not print 'eval ok' inside td's sandbox (output above) — it did not actually run" >&2; exit 1;; esac; \
+	echo "PASS: a REAL loop rung (eval — loads every system/test module + prints 'eval ok') ran BYTE-IDENTICALLY inside td's OWN full-env sandbox (td-builder host-sandbox --expose-cwd: worktree + toolchain + cache + cgroups exposed) as directly under check.sh's guix shell -C; the Step-1 full-rung differential for the loop-tooling swap — check.sh's entry is still unchanged (Step 2 deferred)."
 
 # ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
 # `tsc` (the pinned td-typescript input, run under the packaged node) BOTH
