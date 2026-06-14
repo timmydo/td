@@ -53,6 +53,14 @@ fn nar_hash(path: &str) -> Result<String, std::io::Error> {
     nar_hash_path(Path::new(path))
 }
 
+/// The `path` column (index 1) of a read `ValidPaths` row, or "" if absent.
+fn path_at(cols: &[store_db_read::Value]) -> &str {
+    match cols.get(1) {
+        Some(store_db_read::Value::Text(p)) => p,
+        _ => "",
+    }
+}
+
 /// Recreate the tree at `src` under `dst` as a canonical store entry — the
 /// daemon's addToStore canonicalization, for the properties NAR (hence the
 /// content-addressed store path) actually captures: the tree STRUCTURE, file
@@ -840,6 +848,129 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: the destructive GC SWEEP — the other half of GC (after the
+        // mark/liveness `store-closure`, #39), in pure Rust. Given a td-owned store DIR,
+        // its DB, and a GC ROOT, td computes the live set (closure of ROOT over Refs),
+        // DELETES every registered content path NOT reachable from ROOT from STORE-DIR,
+        // and rewrites the DB to the live set (ValidPaths + Refs renumbered). No daemon.
+        // Boundary: operates ONLY on the given (td-owned) STORE-DIR/DB — NEVER the host
+        // store. Usage:
+        //   store-gc-sweep STORE-DIR DB ROOT
+        // Prints how many paths were swept / remain.
+        Some("store-gc-sweep") if args.len() == 5 => {
+            let (store_dir, db_path, root) = (&args[2], &args[3], &args[4]);
+            let run = || -> Result<String, String> {
+                use std::collections::{HashMap, HashSet};
+                use store_db::{Table, Value as WV};
+                use store_db_read::Value as RV;
+                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+                let db = store_db_read::Db::open(bytes)?;
+                let live: HashSet<String> = db.closure(root)?.into_iter().collect();
+                let valid = db.table("ValidPaths")?;
+                let refs = db.table("Refs")?;
+                // old rowid -> path (to remap Refs after renumbering).
+                let mut path_of: HashMap<i64, String> = HashMap::new();
+                for (rid, cols) in &valid {
+                    if let Some(RV::Text(p)) = cols.get(1) {
+                        path_of.insert(*rid, p.clone());
+                    }
+                }
+                // A registered content path = a row WITH a recorded hash (skip the
+                // deriver scaffold). Keep the live ones; DELETE the dead ones' files.
+                let mut survivors: Vec<&Vec<RV>> = Vec::new();
+                let mut deleted = 0u64;
+                for (_rid, cols) in &valid {
+                    let path = match (cols.get(1), cols.get(2)) {
+                        (Some(RV::Text(p)), Some(RV::Text(_))) => p,
+                        _ => continue, // no hash -> scaffolding, not a content path
+                    };
+                    if live.contains(path) {
+                        survivors.push(cols);
+                    } else if let Some(base) = path.rsplit('/').next() {
+                        let entry = Path::new(store_dir).join(base);
+                        if entry.exists() {
+                            if entry.is_dir() {
+                                std::fs::remove_dir_all(&entry)
+                                    .map_err(|e| format!("{}: {e}", entry.display()))?;
+                            } else {
+                                std::fs::remove_file(&entry)
+                                    .map_err(|e| format!("{}: {e}", entry.display()))?;
+                            }
+                            deleted += 1;
+                        }
+                    }
+                }
+                // Renumber survivors 1..k by path; remap Refs among them.
+                survivors.sort_by(|a, b| path_at(a).cmp(path_at(b)));
+                let mut newid: HashMap<String, i64> = HashMap::new();
+                let mut vrows: Vec<(i64, Vec<WV>)> = Vec::new();
+                for (i, cols) in survivors.iter().enumerate() {
+                    let nid = i as i64 + 1;
+                    let path = path_at(cols).to_string();
+                    newid.insert(path.clone(), nid);
+                    let conv = |v: Option<&RV>| -> WV {
+                        match v {
+                            Some(RV::Int(n)) => WV::Int(*n),
+                            Some(RV::Text(s)) => WV::Text(s.clone()),
+                            _ => WV::Null,
+                        }
+                    };
+                    vrows.push((
+                        nid,
+                        vec![
+                            WV::Null,
+                            WV::Text(path),
+                            conv(cols.get(2)), // hash
+                            conv(cols.get(3)), // registrationTime
+                            conv(cols.get(4)), // deriver
+                            conv(cols.get(5)), // narSize
+                        ],
+                    ));
+                }
+                let mut rrows: Vec<(i64, Vec<WV>)> = Vec::new();
+                let mut rid = 1i64;
+                for (_r, cols) in &refs {
+                    let (a, b) = match (cols.first(), cols.get(1)) {
+                        (Some(RV::Int(a)), Some(RV::Int(b))) => (*a, *b),
+                        _ => continue,
+                    };
+                    if let (Some(pa), Some(pb)) = (path_of.get(&a), path_of.get(&b)) {
+                        if let (Some(&na), Some(&nb)) = (newid.get(pa), newid.get(pb)) {
+                            rrows.push((rid, vec![WV::Int(na), WV::Int(nb)]));
+                            rid += 1;
+                        }
+                    }
+                }
+                // The swept DB carries the live ValidPaths + Refs only; the deriver
+                // scaffold and DerivationOutputs are intentionally not carried (a swept
+                // store is content + references — the build-derivation mapping is rebuilt
+                // by registration, not GC).
+                let tables = [
+                    Table {
+                        name: "ValidPaths",
+                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+                        rows: vrows,
+                    },
+                    Table {
+                        name: "Refs",
+                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+                        rows: rrows,
+                    },
+                ];
+                std::fs::write(db_path, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+                Ok(format!("swept {deleted} dead paths, {} live remain", newid.len()))
+            };
+            match run() {
+                Ok(msg) => {
+                    println!("{msg}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-gc-sweep: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-drv-assemble: ASSEMBLE the `.drv` from a raw SPEC (Guile resolved the
         // inputs and emitted it WITHOUT `(derivation …)`) and REGISTER it via the
         // daemon — so the build derivation enters the store with no guile
@@ -1190,6 +1321,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB");
             eprintln!("       td-builder store-verify DB STORE-ROOT");
+            eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)

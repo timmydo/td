@@ -194,12 +194,31 @@ files are `0444`, so injecting the corruption needs a `chmod u+w` first.)
 td can now verify the integrity of a store against its registration — a prerequisite for
 trusting a td-owned store backend.
 
+## Increment 8 (DONE 2026-06-14): the destructive GC SWEEP — the other half of GC
+
+After the mark/liveness `store-closure` (#39), the **sweep**. New `td-builder
+store-gc-sweep STORE-DIR DB ROOT` computes the live set (closure of ROOT over the Refs),
+DELETES every registered content path NOT reachable from ROOT from the td-owned STORE-DIR,
+and rewrites the DB to the live set (ValidPaths + Refs renumbered). No daemon.
+
+New `store-gc-sweep` rung (daemon = oracle, directive 4): a td-owned store is built by
+copying hello's full closure (`cp -a`, then `chmod -R u+w` so it's deletable) and
+registering it (`store-register`); after sweeping with ROOT=glibc (whose closure is a
+PROPER subset — hello's closure is the chain hello→gcc-lib→glibc→bash-static), the
+surviving store entries AND the rewritten DB hold EXACTLY `guix gc -R glibc` (the daemon's
+own reachable set), and the dead paths' files are gone. Verified-red ×2: R12 (skip the file
+deletion ⇒ dead files remain ⇒ survivors ≠ live) and R13 (skip the DB rewrite ⇒ the swept
+DB still lists the dead). Boundary: the sweep deletes ONLY from the td-owned scratch
+STORE-DIR (a `cp -a` copy) and rewrites only the scratch DB — the host `/gnu/store` is
+NEVER touched.
+
+td now owns BOTH halves of GC — mark (#39) and sweep — plus write (#34/#35), read (#36),
+add (flat #38 + recursive #41), and integrity-verify (#43). Daemon as oracle throughout.
+
 ## Later increments (sketch — not this PR)
 
 - Referenced sources/outputs: the addToStore/path case WITH references (the `output:out`
   indirection) — recursive add of a tree that references other store paths.
-- The destructive GC SWEEP (delete the unreachable) into a td-owned store — the other
-  half of GC, on a td store (never the host's).
 - Eventually a td store backend the system can use, daemon retired for the build side.
 - With write+read+add+GC-mark OWNED, deliberately DIVERGE the on-disk store format/schema
   where it buys something (the differential becomes a correctness check on td's chosen
@@ -321,3 +340,16 @@ recorded`) — the arm is CLI glue, not unit-tested, so the binary still built �
 the rung's `if store-verify …; then FAIL "did NOT detect the corrupted probe"` fires ⇒
 `store-verify` red. Proves the integrity check actually compares re-hashed content to the
 record, not a vacuous pass. Reverted; rung green again.
+
+**R12 the sweep's DELETION is load-bearing — store-gc-sweep** (2026-06-14, increment 8).
+Perturbed `store-gc-sweep` to skip the file deletion (`if false && entry.exists()`), ran
+the rung: all 4 copied paths survived (`surv`: hello, gcc-lib, glibc, bash-static) ≠ the
+2-path live set ⇒ the `test "$survivors" = "$live"` assertion fails ⇒ `store-gc-sweep` red.
+Proves the destructive deletion actually happens. Reverted; rung green again.
+
+**R13 the swept-DB rewrite is load-bearing — store-gc-sweep** (2026-06-14, increment 8).
+Perturbed the sweep to skip rewriting the DB (left the original on disk), ran the rung: the
+dead FILES were deleted (survivors == live passed) but the DB still listed all 4 paths ⇒
+the `test "$db_paths" = "$live"` assertion fails ⇒ `store-gc-sweep` red. Proves the DB is
+genuinely rewritten to the live set, independently of the file deletion. Reverted; rung
+green again.
