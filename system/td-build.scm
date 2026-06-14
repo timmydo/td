@@ -80,14 +80,28 @@
                                                #:graft? #f))
                          %td-build-tool-names))
          (tool-outs (map derivation->output-path tool-drvs))
-         (input-drvs (cons src-drv (cons tb-drv tool-drvs))))
+         ;; The recipe's declared build INPUTS (dependencies) — resolved from the
+         ;; corpus by name, exactly as system/td-recipe.scm does (input resolution
+         ;; stays Guix's, retired LAST — §5). Their include/lib dirs feed the Rust
+         ;; set-paths phase via TD_INPUTS, so td's own builder can build a package
+         ;; that links real dependencies. Optional: a leaf recipe (hello) declares
+         ;; none and lowers exactly as before (so the hello-based td-drv-* rungs are
+         ;; untouched).
+         (dep-names (let ((v (assoc-ref recipe-alist "inputs")))
+                      (if v (vector->list v) '())))
+         (dep-drvs (map (lambda (spec)
+                          (package-derivation store (specification->package spec)
+                                              #:graft? #f))
+                        dep-names))
+         (dep-outs (map derivation->output-path dep-drvs))
+         (input-drvs (append (list src-drv tb-drv) tool-drvs dep-drvs)))
     (list (cons 'name full)
           (cons 'system "x86_64-linux")
           (cons 'builder builder)
           (cons 'args (list "autotools-build"))
           (cons 'input-drvs input-drvs)
           (cons 'env `(("TD_SRC"             . ,src-path)
-                       ("TD_INPUTS"          . ,(string-join tool-outs ":"))
+                       ("TD_INPUTS"          . ,(string-join (append tool-outs dep-outs) ":"))
                        ("TD_CONFIGURE_FLAGS" . ,configure-flags))))))
 
 (define* (td-rust-build-derivation store recipe-alist #:key (configure-flags ""))
