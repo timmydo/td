@@ -120,8 +120,11 @@ edits** (track files don't carry it).
   symlinks) byte-identical (NAR) to the daemon's interned tree. Inc.7 — `td-builder
   store-verify` re-hashes registered paths vs the recorded registration (the daemon's
   `guix gc --verify --check-contents`): verifies hello's closure in /gnu/store == the
-  daemon's hashes, and DETECTS a one-byte corruption. Daemon is the oracle; td operates
-  its OWN store DB, host daemon stays immutable infra) — `plan/td-store-db.md`
+  daemon's hashes, and DETECTS a one-byte corruption. Inc.8 — `td-builder store-gc-sweep`
+  does the destructive GC sweep: deletes the unreachable from a td-owned store + rewrites
+  the DB to the live set == `guix gc -R glibc` (host /gnu/store never touched). Daemon is
+  the oracle; td operates its OWN store DB, host daemon stays immutable infra)
+  — `plan/td-store-db.md`
 - [ ] **input-resolution** — claimed claude-fable-44df36 2026-06-14 (move-off-Guile §5:
   begin retiring INPUT RESOLUTION — the toolchain layer, retired LAST. Today
   `system/td-build.scm` resolves a recipe's inputs to store paths via Guile's

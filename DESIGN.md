@@ -755,12 +755,17 @@ run concurrently):
   each registered path and flags any whose content no longer matches its recorded `hash`;
   the `store-verify` rung proves td.db records the daemon's hashes then verifies hello's
   closure in the real `/gnu/store` against them (the daemon differential), and DETECTS a
-  one-byte corruption in a td-owned probe. td now owns the full store WRITE side (flat +
-  recursive) + read + DB authority + GC-mark + integrity-verify — daemon as oracle. Later
-  (sketch): referenced sources/outputs (the `output:out` indirection), the destructive GC
-  sweep into a td store, then a td store backend the build side can use — and the freedom to
-  diverge the on-disk format once nothing external must read it. Working state + verified-red
-  log: `plan/td-store-db.md`.
+  one-byte corruption in a td-owned probe. Increment 8 — **the destructive GC sweep** (the
+  other half of GC): `td-builder store-gc-sweep STORE-DIR DB ROOT` deletes every registered
+  content path not reachable from ROOT from a td-owned store and rewrites the DB to the live
+  set; the `store-gc-sweep` rung copies hello's closure into a td store, sweeps with
+  ROOT=glibc, and shows the surviving entries + the rewritten DB hold exactly `guix gc -R
+  glibc` (the host `/gnu/store` never touched). td now owns the full store WRITE side (flat +
+  recursive) + read + DB authority + BOTH halves of GC (mark + sweep) + integrity-verify —
+  daemon as oracle. Later (sketch): referenced sources/outputs (the `output:out`
+  indirection), then a td store backend the build side can use — and the freedom to diverge
+  the on-disk format once nothing external must read it. Working state + verified-red log:
+  `plan/td-store-db.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
