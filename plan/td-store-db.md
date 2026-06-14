@@ -109,3 +109,11 @@ row narSize as 282617 ≠ the daemon's 282616 ⇒ the rung's `test "$td_row" =
 "$oracle_row"` fails ⇒ `store-register` red ("td's ValidPaths row … != the daemon's").
 Proves the rung genuinely compares td's WRITTEN DB to the daemon's record (and that
 sqlite3 really parsed td's bytes), not a vacuous pass. Reverted; rung green again.
+
+**R2 the full-closure differential covers EVERY path** (2026-06-14, increment 2).
+Perturbed the `others` loop to write a NON-artifact closure path's `narSize` as
+`size + 1`, rebuilt, ran the per-path differential: all three non-artifact paths
+diverged from the daemon (e.g. bash-static 1887497 ≠ 1887496, glibc 41145793 ≠
+41145792) ⇒ the rung's `test "$td_rows" = "$oracle_rows"` fails ⇒ `store-register` red.
+Proves the closure differential checks every path's registration, not just the
+artifact's (which R1 covered). Reverted; rung green again.

@@ -715,13 +715,16 @@ run concurrently):
   rung): `td-builder store-register` WRITES the store SQLite DB ITSELF — a zero-dep
   SQLite FILE-FORMAT writer in Rust (`builder/src/store_db.rs`: the file header, table
   b-tree leaf pages, the record/serial-type varint encoding; unit-tested), the real
-  replacement of the daemon's libsqlite (no sqlite3 engine writing it). For `hello`, td
-  writes a store DB whose registration `sqlite3` reads back byte-identical to the
-  daemon's record (hash, narSize, deriver, referenced paths, drv→output) and which
-  passes `PRAGMA integrity_check`; `registrationTime` excluded; verified-red. Boundary:
-  the host daemon stays immutable infra (immutable read only); td operates its OWN store
-  DB, daemon = oracle (directive 4). Later: full-closure validity, end-to-end
-  `addToStore`, GC. Working state + verified-red log: `plan/td-store-db.md`.
+  replacement of the daemon's libsqlite (no sqlite3 engine writing it). Increment 2
+  registers `hello`'s FULL closure (`guix gc -R`): td writes a store DB — passing
+  `PRAGMA integrity_check` — whose registration `sqlite3` reads back byte-identical to
+  the daemon's for EVERY closure path (hash + narSize), the full inter-path Refs
+  relation, and the artifact's deriver + drv→output. `registrationTime` + the non-
+  artifact per-path derivers (the daemon's input-resolution) excluded; verified-red ×2.
+  Boundary: the host daemon stays immutable infra (immutable read only); td operates its
+  OWN store DB, daemon = oracle (directive 4). Later: the exact daemon schema
+  (indexes/trigger) so a daemon ACCEPTS td's DB end-to-end, then `addToStore`, GC.
+  Working state + verified-red log: `plan/td-store-db.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
