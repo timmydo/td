@@ -290,6 +290,47 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-drv-assemble: ASSEMBLE the `.drv` from a raw SPEC (Guile resolved the
+        // inputs and emitted it WITHOUT `(derivation …)`) and REGISTER it via the
+        // daemon — so the build derivation enters the store with no guile
+        // `(derivation …)` at all. Asserts the daemon returns td's own computed
+        // path, and prints it.
+        Some("drv-assemble") if args.len() == 3 => {
+            let spec_file = &args[2];
+            let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
+            let run = || -> Result<String, String> {
+                let spec = std::fs::read_to_string(spec_file).map_err(|e| e.to_string())?;
+                let (computed, content) = store::assemble_drv(&spec, &read)?;
+                let d = drv::parse(content.as_bytes()).map_err(|e| e.to_string())?;
+                let name = store::name_from_store_path(&computed)
+                    .ok_or_else(|| format!("computed path {computed} is malformed"))?;
+                let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
+                refs.extend(d.input_srcs.iter().cloned());
+                let socket = std::env::var("TD_DAEMON_SOCKET")
+                    .unwrap_or_else(|_| daemon::DEFAULT_SOCKET.to_string());
+                let mut dm = daemon::Daemon::connect(&socket)
+                    .map_err(|e| format!("connect {socket}: {e}"))?;
+                let added = dm
+                    .add_text_to_store(&name, content.as_bytes(), &refs)
+                    .map_err(|e| e.to_string())?;
+                if added != computed {
+                    return Err(format!(
+                        "daemon registered {added} but td computed {computed}"
+                    ));
+                }
+                Ok(added)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-assemble {spec_file}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // S3b/S3c — execute the drv in the userns sandbox and register the
         // outputs. CLOSURE is a file listing every store path the build may
         // see, one per line; writes land under SCRATCH/newstore and the v1

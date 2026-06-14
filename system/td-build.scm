@@ -33,8 +33,11 @@
   #:use-module (guix download)
   #:use-module (gnu packages)
   #:use-module (system td-builder)
+  #:use-module (ice-9 format)
   #:export (%td-build-tool-names
-            td-rust-build-derivation))
+            td-rust-build-derivation
+            td-build-components
+            write-td-build-spec))
 
 ;; The build environment: the Guix toolchain (retired last). gcc-toolchain
 ;; bundles gcc + glibc + binutils + ld-wrapper with the bin/include/lib layout
@@ -48,11 +51,13 @@
     (unless p (error "td-build: recipe JSON missing field" key))
     (cdr p)))
 
-(define* (td-rust-build-derivation store recipe-alist #:key (configure-flags ""))
-  "Return a derivation that builds RECIPE-ALIST (a TS-authored recipe: name,
-version, source{uri,sha256}, buildSystem) with `td-builder autotools-build` as the
-builder.  The recipe DATA is the TS surface's; this only wires the source +
-toolchain inputs and hands them to td's Rust build logic."
+;; INPUT RESOLUTION (stays Guix's, retired last — §5): resolve RECIPE-ALIST's
+;; source + the toolchain to their derivations/paths, and return the raw
+;; components of the build derivation — WITHOUT assembling a `.drv`. Both
+;; `td-rust-build-derivation` (the guix-`(derivation …)` oracle) and
+;; `write-td-build-spec` (the td-assembled path) start here, so they resolve
+;; identical inputs.
+(define* (td-build-components store recipe-alist #:key (configure-flags ""))
   (let* ((name    (field recipe-alist "name"))
          (version (field recipe-alist "version"))
          (source  (field recipe-alist "source"))
@@ -76,9 +81,39 @@ toolchain inputs and hands them to td's Rust build logic."
                          %td-build-tool-names))
          (tool-outs (map derivation->output-path tool-drvs))
          (input-drvs (cons src-drv (cons tb-drv tool-drvs))))
-    (derivation store full builder (list "autotools-build")
-                #:inputs (map (lambda (d) (derivation-input d '("out"))) input-drvs)
-                #:env-vars `(("TD_SRC"             . ,src-path)
-                             ("TD_INPUTS"          . ,(string-join tool-outs ":"))
-                             ("TD_CONFIGURE_FLAGS" . ,configure-flags))
-                #:system "x86_64-linux")))
+    (list (cons 'name full)
+          (cons 'system "x86_64-linux")
+          (cons 'builder builder)
+          (cons 'args (list "autotools-build"))
+          (cons 'input-drvs input-drvs)
+          (cons 'env `(("TD_SRC"             . ,src-path)
+                       ("TD_INPUTS"          . ,(string-join tool-outs ":"))
+                       ("TD_CONFIGURE_FLAGS" . ,configure-flags))))))
+
+(define* (td-rust-build-derivation store recipe-alist #:key (configure-flags ""))
+  "Return a derivation that builds RECIPE-ALIST with `td-builder autotools-build`
+as the builder, via guix's `(derivation …)` — the ORACLE the td-assembled `.drv`
+is diffed against (td-drv-assemble)."
+  (let* ((c (td-build-components store recipe-alist #:configure-flags configure-flags)))
+    (derivation store (assq-ref c 'name) (assq-ref c 'builder) (assq-ref c 'args)
+                #:inputs (map (lambda (d) (derivation-input d '("out")))
+                              (assq-ref c 'input-drvs))
+                #:env-vars (assq-ref c 'env)
+                #:system (assq-ref c 'system))))
+
+;; Emit the raw build-derivation SPEC (a line-based format the zero-dep Rust
+;; assembler parses) — the inputs resolved above, WITHOUT calling `(derivation …)`.
+;; td-builder `drv-assemble` turns this into the byte-identical `.drv`, computing
+;; output paths + the ordering itself. This is what removes the last guile
+;; `(derivation …)` from the build path; input RESOLUTION stays here (§5).
+(define* (write-td-build-spec store recipe-alist #:key (configure-flags "")
+                              (port (current-output-port)))
+  (let ((c (td-build-components store recipe-alist #:configure-flags configure-flags)))
+    (format port "name ~a~%" (assq-ref c 'name))
+    (format port "system ~a~%" (assq-ref c 'system))
+    (format port "builder ~a~%" (assq-ref c 'builder))
+    (for-each (lambda (a) (format port "arg ~a~%" a)) (assq-ref c 'args))
+    (for-each (lambda (d) (format port "input-drv ~a out~%" (derivation-file-name d)))
+              (assq-ref c 'input-drvs))
+    (for-each (lambda (kv) (format port "env ~a=~a~%" (car kv) (cdr kv)))
+              (assq-ref c 'env))))
