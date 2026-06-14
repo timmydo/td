@@ -49,8 +49,18 @@ td-registered `.drv` (output NAR-equal to the daemon's recorded hash). Heavy.
 
 ## Implementation progress
 
-(filled as it lands.)
+- **DONE 2026-06-13.** `builder/src/daemon.rs` (the worker-protocol client) +
+  `drv-add`/`store-add` subcommands. New heavy `td-drv-add` rung GREEN in-sandbox
+  (`./check.sh td-drv-add`): the daemon socket is reachable at the default path inside
+  the `guix shell -C` container; td constructs the hello `.drv` byte-identical, the
+  daemon returns td's own computed path, store-add writes a novel object byte-for-byte,
+  and `guix build` of the td-registered `.drv` runs `Hello, world!`.
 
 ## Verified-red log
 
-(filled as each assertion is seen red.)
+`td-drv-add` rung, each via `./check.sh td-drv-add`, restored after:
+- **R1 construct** — `fixed:out:`→`fixed:outX:` in `hash_derivation_modulo` (store.rs)
+  ⇒ RED "td's construction is not byte-identical to guix's .drv" (leg 1). exit 2.
+- **R2 protocol** — string pad-to-8 → pad-to-4 in `daemon.rs::write_bytes` ⇒ the daemon
+  rejects the misframed message: "daemon error: non-zero padding" ⇒ `drv-add` fails ⇒
+  RED (leg 2). exit 2. Proves the worker-protocol framing is load-bearing.
