@@ -74,6 +74,13 @@ edits** (track files don't carry it).
   assembly+ordering in Rust (sort env/inputs, add `out`, compute output path, register
   via the daemon) byte-identical to guix's `(derivation …)`. Input resolution stays
   Guix's, toolchain retired last) — `plan/td-drv-assemble.md`
+- [ ] **td-check** — claimed claude-fable-4a2e33 2026-06-13 (gate-2: td OWNS the
+  reproducibility oracle. `td-builder check DRV CLOSURE SCRATCH` executes the `.drv`
+  TWICE in two independent userns sandbox runs and compares the per-output NAR hashes
+  — td's own `--check` verdict, no daemon, no `guix build --check`. Rung `td-check`:
+  td's double-build agrees (reproducible) AND the differential oracle `guix build
+  --check` agrees on the same `.drv`. Input resolution + the daemon building the inputs
+  stay Guix's; the verdict is td's) — `plan/td-check.md`
 
 ## The loop (reminder)
 

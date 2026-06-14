@@ -382,13 +382,13 @@ approval) or by being resolved (record in `HISTORY.md`); it is then deleted here
 annotated.
 
 - Trust-agnostic substitution / decentralized build attestation (§5).
-- **td-check** (follow-on to td-builder): own the reproducibility oracle —
-  td-builder's rebuild-and-compare replaces `guix build --check` (semantics
-  already pinned by the rootless track: compare against the recorded NAR hash,
-  refuse invalid outputs). Replacing that rung restructures the loop, so §4.3
-  gate 2 applies when this graduates. (The separable WHEN-it-runs question —
-  verdict memoization — was approved 2026-06-12 as the check-memo track,
-  §7.1; td-check inherits that policy and its constraints unchanged.)
+- **td-check** — GRADUATED to §7.1 (approved 2026-06-13, §4.3 gate-2); see the
+  active entry below. Own the reproducibility oracle — td-builder's
+  rebuild-and-compare alongside `guix build --check` (semantics already pinned by
+  the rootless track: compare against the recorded NAR hash, refuse invalid
+  outputs). (The separable WHEN-it-runs question — verdict memoization — was
+  approved 2026-06-12 as the check-memo track, §7.1; td-check inherits that policy
+  and its constraints unchanged.)
 - **Loop tooling convergence** (follow-on): td-builder's sandbox replaces
   `guix shell -C` in `check.sh` — the north star's "one sandbox stack spanning
   build and run" made literal. Restructures the loop, so §4.3 gate 2 applies
@@ -659,6 +659,20 @@ run concurrently):
   hello; verified-red. So nothing guile CONSTRUCTS the build derivation anymore — only
   input resolution stays Guix's. Working state + verified-red log:
   `plan/td-drv-assemble.md`.
+- **td-check** *(approved 2026-06-13 — §4.3 **gate-2**, human go-ahead "then the gate-2
+  items (td-check oracle, loop sandbox)"; graduated from the backlog stub above)* — td
+  OWNS the reproducibility oracle. `td-builder check DRV CLOSURE SCRATCH` executes the
+  `.drv` TWICE in two independent user-namespace sandbox runs (reusing the td-drv-build
+  executor) and compares the per-output NAR hashes (reusing the S2 NAR serializer +
+  SHA-256) — td's own `guix build --check`, with no daemon and no `guix build --check`
+  in the verdict. This is the OBSERVE step of gate 2 done honestly: it does NOT remove
+  `guix build --check` from any existing rung (directive 3); it ADDS the `td-check` rung
+  proving td's verdict EQUALS guix's on the same `.drv` — td's reproducible NAR hash ==
+  the daemon's recorded hash AND `guix build --check` agrees (directive 4, the
+  differential a later replacement needs). Scope: input resolution + the closure
+  (`guix gc -R`) + the daemon building the INPUTS stay Guix's; only the TOP derivation's
+  reproducibility is td's double-build (toolchain retired last, §5).
+  Working state + verified-red log: `plan/td-check.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
