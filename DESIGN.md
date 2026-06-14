@@ -674,6 +674,21 @@ run concurrently):
   (`guix gc -R`) + the daemon building the INPUTS stay Guix's; only the TOP derivation's
   reproducibility is td's double-build (toolchain retired last, §5).
   Working state + verified-red log: `plan/td-check.md`.
+- **loop-sandbox** *(approved 2026-06-13 — §4.3 **gate-2**, human go-ahead "then the
+  gate-2 items (td-check oracle, loop sandbox)"; graduated from the backlog stub above)*
+  — td's OWN sandbox replaces `guix shell -C`. Additive equivalence FIRST (the gate-2
+  OBSERVE step): `td-builder host-sandbox` is a DEV-SHELL (vs. the build jail) — pivots
+  into a fresh root exposing the WHOLE `/gnu/store` (ro) + the daemon socket `/var/guix`
+  + `/proc` + `/dev`, host-guix on PATH, host fs otherwise gone, in its own loopback-only
+  network namespace. The `loop-sandbox` rung proves: (1) `guix build -d hello` lowers to
+  the SAME `.drv` inside td's sandbox as under `guix shell -C` (exposure equivalence,
+  guix the oracle); (2) the host worktree is INVISIBLE inside (isolation); (3) td's
+  sandbox netns inode DIFFERS from the rung's, loopback-only, daemon reachable across it
+  (net-namespace parity). Done: #30 (exposure + isolation) and the net-parity increment.
+  `check.sh`'s real entry is UNCHANGED (directive 3); the remaining follow-up is the
+  wholesale swap (make `check.sh` launch td's sandbox), which DOES touch `check.sh` (an
+  exclusive landing) and wants a full-rung differential under both.
+  Working state + verified-red log: `plan/loop-sandbox.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 

@@ -65,7 +65,7 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
 
 ## Implementation progress
 
-- **DONE 2026-06-13.** `td-builder host-sandbox` (pivot_root dev-shell) + the
+- **DONE 2026-06-13 (#30).** `td-builder host-sandbox` (pivot_root dev-shell) + the
   `loop-sandbox` rung GREEN inside the real `guix shell -C` (nested userns): `guix
   build -d hello` lowers to the SAME `.drv` (`zx4bn6wq…`) inside td's sandbox as under
   `guix shell -C`, and the host worktree is invisible while `/gnu/store` + the daemon
@@ -74,6 +74,15 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
   unwritable); `/dev` must be exposed (tools need `/dev/null`); coreutils are NOT on
   the sandbox PATH (only the guix bin dir), so probes use bash builtins. `sys.rs` gained
   `pivot_root`/`umount2` + `MS_RDONLY`/`MS_REMOUNT`/`MNT_DETACH`.
+- **DONE 2026-06-14 (net-namespace parity).** `host_shell` now unshares `CLONE_NEWNET`
+  and brings loopback up (`sys::bring_loopback_up` via `SIOCSIFFLAGS` — new socket/
+  ioctl/close syscalls), matching `guix shell -C`'s offline posture; the daemon stays
+  reachable across the netns (Unix socket on the bound `/var/guix`). The `loop-sandbox`
+  rung gained a net-parity leg: td's sandbox `/proc/self/ns/net` inode DIFFERS from the
+  rung's (a fresh netns even nested inside `guix shell -C`), loopback-only, and the
+  exposure equivalence holds across it. Finding: `bring_loopback_up` needs an OWNED
+  netns (CAP_NET_ADMIN) — without `NEWNET` it `EPERM`s on the host's `lo`, so the two
+  are coupled. Remaining follow-up: the wholesale `check.sh` swap.
 
 ## Verified-red log
 
@@ -87,3 +96,11 @@ so `td-builder host-sandbox -- guix build -d hello` produced an error instead of
 `.drv` path ⇒ `tdout != oracle` ⇒ the rung's exposure-equivalence leg goes red. Proves
 the equivalence is genuine (td's sandbox really must expose the daemon socket; it is not
 a vacuous pass). Reverted the bind; rung green again.
+
+**R2 the net-namespace isolation is load-bearing** (2026-06-14). Dropped `CLONE_NEWNET`
+(and, since lo-up then `EPERM`s on the host netns, the `bring_loopback_up` call) from
+`host_shell`, rebuilt, ran the net-parity probe: td's sandbox `/proc/self/ns/net` came
+back EQUAL to the rung's (`net:[4026531833]` == parent) ⇒ `test "$td_ns" != "$parent_ns"`
+fails ⇒ the net-parity leg goes red ("did not enter its OWN netns"). Proves `NEWNET`
+genuinely puts td's sandbox in a fresh isolated netns (not a vacuous pass), and that
+lo-up is coupled to owning that netns. Reverted; rung green again.
