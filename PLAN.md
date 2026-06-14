@@ -62,6 +62,12 @@ edits** (track files don't carry it).
   builder=`td-builder autotools-build`, NO guile in either; daemon is the oracle only.
   Input resolution + closure + the daemon building the INPUTS stay Guix's, toolchain
   retired last) — `plan/td-drv-build.md`
+- [ ] **td-drv-add** — claimed claude-fable-4a2e33 2026-06-13 (wire td's `.drv` into the
+  loop: td-builder constructs the `.drv` (#22) and REGISTERS it via the daemon's
+  `addTextToStore` RPC — a Rust worker-protocol client (`builder/src/daemon.rs`) — so it
+  enters the store with no guile `(derivation …)`. Rung: `drv-add` (daemon returns td's
+  computed path), `store-add` (novel-write proof), `guix build` the registered `.drv`
+  daemon-equal. Daemon stays the backend) — `plan/td-drv-add.md`
 
 ## The loop (reminder)
 
