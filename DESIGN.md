@@ -750,12 +750,17 @@ run concurrently):
   (`copy_canonical`: structure + contents + the file exec bit + symlinks — the NAR-relevant
   properties), and registers it; the `store-add-tree` rung shows td's restored tree is
   byte-identical (by NAR hash) to the daemon's own interned `td-builder` source tree and
-  td's path matches the daemon's. td now owns the full store WRITE side (flat + recursive)
-  + read + DB authority + GC-mark — daemon as oracle. Later (sketch): referenced
-  sources/outputs (the `output:out` indirection), the destructive GC sweep into a td store,
-  then a td store backend the build side can use — and the freedom to diverge the on-disk
-  format once nothing external must read it. Working state + verified-red log:
-  `plan/td-store-db.md`.
+  td's path matches the daemon's. Increment 7 — **td verifies store integrity**
+  (`guix gc --verify --check-contents`): `td-builder store-verify DB STORE-ROOT` re-NAR-hashes
+  each registered path and flags any whose content no longer matches its recorded `hash`;
+  the `store-verify` rung proves td.db records the daemon's hashes then verifies hello's
+  closure in the real `/gnu/store` against them (the daemon differential), and DETECTS a
+  one-byte corruption in a td-owned probe. td now owns the full store WRITE side (flat +
+  recursive) + read + DB authority + GC-mark + integrity-verify — daemon as oracle. Later
+  (sketch): referenced sources/outputs (the `output:out` indirection), the destructive GC
+  sweep into a td store, then a td store backend the build side can use — and the freedom to
+  diverge the on-disk format once nothing external must read it. Working state + verified-red
+  log: `plan/td-store-db.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
