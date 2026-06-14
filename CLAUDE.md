@@ -18,7 +18,7 @@ convenience.
    adding an undeclared dependency, or disabling `--check`.
 3. **Never weaken a test silently.** Do not skip, delete, comment out, loosen, or
    `xfail` a test just to turn a task green. Removing, loosening, or restructuring any
-   existing rung or assertion in `check.sh`, the `Makefile`, or `tests/` must be called
+   existing gate or assertion in `check.sh`, the `Makefile`, or `tests/` must be called
    out plainly in the PR so the human approves it knowingly (DESIGN §4.3) — never slip
    it past review. Adding or strengthening tests is always free. If a test cannot pass
    honestly, STOP and report.
@@ -30,7 +30,7 @@ convenience.
    increment on a branch and open a PR — the human's PR approval is the sign-off
    (DESIGN §4.3). No roadmap entry, written proposal, or pre-approval is needed to
    start work; build it, then PR it. Keep plan/design notes terse, and surface any
-   weakened rung in the PR (directive 3). `PLAN.md`/§7.1 are a descriptive status
+   weakened gate in the PR (directive 3). `PLAN.md`/§7.1 are a descriptive status
    index, not a gate.
 6. **Respect the state boundary.** The VM is ephemeral per test (fresh state, wiped on
    reset) — that is *test isolation*, not a ban on persistence *within* a test:
@@ -63,12 +63,15 @@ Run all of it with the single pass/fail command:
 `guix shell -C --pure` container (store/cache/daemon-socket exposure, host guix on
 PATH, **substitutes disabled** so the loop is offline), guards that the host guix
 matches the `channels.scm` pin, then runs `make check` inside it. `make check` is the
-underlying target (assumes you are already in that sandbox); it runs the rung ladder
-(structural rungs serial-first, heavy rungs two at a time), short-circuiting on the
+underlying target (assumes you are already in that sandbox); it runs the gate ladder
+(structural gates serial-first, heavy gates two at a time), short-circuiting on the
 first failure, and exits non-zero on any failure.
-The `Makefile`'s `CHEAP_RUNGS`/`HEAVY_RUNGS` pools (expanded by its `check:` target)
-are the **authoritative rung list** — the one place it is written down; never restate
-it in docs. Broad shape: config eval →
+The gate list is assembled from the drop-in fragments under `mk/gates/*.mk`: each
+fragment registers itself into the `CHEAP_GATES`/`HEAVY_GATES` pool that the `check:`
+target expands. That directory is the **authoritative gate list**, the one place it is
+written down — add a gate by dropping a new `mk/gates/<NNN>-<name>.mk` file, never by
+editing a shared list line (so concurrent gate PRs don't collide). Broad shape:
+config eval →
 differentials → `guix build --check` → behavioral/marionette tests.
 
 Every build/test runs inside that fresh container (`guix shell -C --pure`) so your own
@@ -79,7 +82,7 @@ Do not proceed to the next sub-task until the current one is green.
 
 ## Verified-red discipline
 
-A green behavioral rung is only meaningful once you have SEEN it red. For every new
+A green behavioral gate is only meaningful once you have SEEN it red. For every new
 assertion, deliberately break the thing it checks and watch the test fail before
 trusting the pass; record the verified-red evidence in your track file. (This
 discipline caught a three-defect false-green that survived M1–M3 — full story in
@@ -135,7 +138,10 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
   oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
   everyone. Announce in your track file, land as small standalone PRs, expect
   others to rebase. Oracle re-baselines and channel bumps are the canonical cases.
-- **Resources:** each full check already runs its heavy rungs two at a time (`-j2`),
+  Note: **adding a gate is no longer an exclusive landing** — it's a new
+  `mk/gates/<NNN>-<name>.mk` file, not a `Makefile` edit, so concurrent gate PRs
+  don't collide (the core `Makefile` itself stays exclusive).
+- **Resources:** each full check already runs its heavy gates two at a time (`-j2`),
   so two concurrent checks mean up to four VMs/builds — the observed ceiling. Don't
   add a third check or raise `-j`; stagger if the host is loaded.
 
@@ -147,7 +153,7 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
 3. Make the smallest change that turns that test green; verify red first.
 4. Run the loop. If red, fix forward — never by weakening the test.
 5. Before each commit, spawn a sub-agent to review the diff against this contract —
-   no weakened rungs or assertions, smallest increment, conventions respected — and
+   no weakened gates or assertions, smallest increment, conventions respected — and
    address its findings first.
 6. Commit a small increment on your branch. Land per the protocol when the track's
    acceptance test is green. Update `PLAN.md`'s status line as part of landing.
@@ -163,7 +169,7 @@ it.
   container.
 - Off-roadmap work needs no permission — build it and open a PR; the human's review
   is the approval (DESIGN §4.3). The one thing to never do silently is weaken the loop:
-  surface any loosened/removed rung in the PR (directive 3). Everything merges on green
+  surface any loosened/removed gate in the PR (directive 3). Everything merges on green
   + PR approval (§7.2).
 
 ## Repo conventions
@@ -172,12 +178,18 @@ it.
 
 - `check.sh` — the canonical hermetic, offline pass/fail command (`./check.sh`). The
   only command you need to determine green/red.
-- `Makefile` — the `make check` target it runs inside that sandbox; its `CHEAP_RUNGS`/
-  `HEAVY_RUNGS` pools (expanded by `check:`) are the authoritative rung list (the one
-  place it is written down).
+- `Makefile` — the `make check` target it runs inside that sandbox; it assembles the
+  `CHEAP_GATES`/`HEAVY_GATES` pools from the `mk/gates/*.mk` drop-in fragments and
+  derives `.PHONY`, the `check` targets, and the ordering graph from them.
+- `mk/gates/` — one drop-in fragment per gate (`<NNN>-<name>.mk`: a `CHEAP_GATES`/
+  `HEAVY_GATES +=` self-registration line, the recipe, and its doc comment). This
+  directory IS the authoritative gate list — adding a gate adds a file, so concurrent
+  gate PRs touch different files and don't collide on a shared list line. The `<NNN>`
+  prefix sets order (cheap serial-first, heavy LPT for `-j2`); `make list-gates` prints
+  the assembled pools.
 - `system/` — Guile system declarations. The frozen oracle lives at `system/td.scm`.
 - `tests/` — marionette system tests in the `(gnu tests)` style, plus the
-  differential/coverage rungs.
+  differential/coverage gates.
 - `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
   deliberately (exclusive landing), never silently.
 - `DESIGN.md` — the settled contract: loop, target, invariants, roadmap (§7.1),

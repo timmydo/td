@@ -125,6 +125,15 @@ edits** (track files don't carry it).
   the DB to the live set == `guix gc -R glibc` (host /gnu/store never touched). Daemon is
   the oracle; td operates its OWN store DB, host daemon stays immutable infra)
   — `plan/td-store-db.md`
+- [ ] **gates-split** (infra, EXCLUSIVE) — claimed claude-fable-2df2c3 2026-06-14
+  (kill the recurring Makefile merge conflict: the single `HEAVY_RUNGS :=` list line +
+  shared ordering comment that every gate PR edited become per-gate drop-in fragments
+  under `mk/gates/<NNN>-<name>.mk`, glob-assembled into `CHEAP_GATES`/`HEAVY_GATES`;
+  adding a gate is now a new FILE, not a shared-line edit. Mechanical: gate set +
+  ordering byte-identical (`make list-gates`), no gate removed/loosened (directive 3).
+  Also renames the concept "rung"→"gate" in the Makefile + CLAUDE.md + the doc
+  mechanism pointers, human-chosen 2026-06-14. Exclusive landing — others rebase)
+  — no track file (small infra PR)
 - [ ] **input-resolution** — claimed claude-fable-44df36 2026-06-14 (move-off-Guile §5:
   begin retiring INPUT RESOLUTION — the toolchain layer, retired LAST. Today
   `system/td-build.scm` resolves a recipe's inputs to store paths via Guile's
@@ -144,8 +153,10 @@ edits** (track files don't carry it).
 
 ## The loop (reminder)
 
-One command: `./check.sh`. The `Makefile`'s `CHEAP_RUNGS`/`HEAVY_RUNGS` pools
-(expanded by `check:`) are the authoritative rung list (don't restate it here); the
-cheap rungs run serial-first, the heavy rungs two at a time (`make -j2`), and a red
-still short-circuits. Don't advance a sub-task until green. Small commits, each
-stating which test now passes.
+One command: `./check.sh`. The gate fragments under `mk/gates/*.mk` are the
+authoritative gate list (each self-registers into the `CHEAP_GATES`/`HEAVY_GATES`
+pool the `check:` target expands; `make list-gates` prints them — don't restate them
+here); the cheap gates run serial-first, the heavy gates two at a time (`make -j2`),
+and a red still short-circuits. Adding a gate is a new file, not an edit to a shared
+list. Don't advance a sub-task until green. Small commits, each stating which test
+now passes.
