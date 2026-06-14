@@ -121,7 +121,15 @@ lo-up is coupled to owning that netns. Reverted; rung green again.
 **R3 the worktree exposure is load-bearing** (2026-06-14, `loop-rung`). Dropped the cwd
 (worktree) bind from `--expose-cwd`, rebuilt, ran the eval differential: the sandbox's
 workdir (the cwd) then does not exist inside, so `chdir` fails before exec —
-`td-builder host-sandbox: spawning guix in host-sandbox: No such file or directory` —
-so td's output is the error, not `eval ok`, ⇒ `td != oracle` ⇒ `loop-rung` red. Proves
-the full-env worktree exposure is load-bearing (the rung genuinely runs IN the exposed
+`td-builder host-sandbox: spawning guix in host-sandbox: No such file or directory`,
+exit non-zero ⇒ the rung's td-capture `|| FAIL` fires ⇒ `loop-rung` red. Proves the
+full-env worktree exposure is load-bearing (the rung genuinely runs IN the exposed
 worktree, not a vacuous pass). Reverted; rung green again.
+
+Note: the differential compares the eval command's STDOUT (`eval ok`) + its exit
+status, NOT combined stdout+stderr — the Guile auto-compile warnings ("imported module
+(gnu) overrides core binding") on stderr are emitted only on a `.go`-cache MISS, so
+under the `-j2` parallel loop a concurrent `guix repl` warms the cache between the
+oracle and td runs and the warning SET diverges (caught: the first full `./check.sh`
+went red on exactly that, while the standalone run was green). stdout is the
+deterministic rung signal.

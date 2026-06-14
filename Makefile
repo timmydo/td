@@ -602,21 +602,26 @@ loop-sandbox:
 # Heavy (a td-builder compile + two guix repl evals), so it slots in the heavy pool by
 # the other loop rungs.
 loop-rung:
-	@echo ">> loop-rung: a REAL rung (eval) runs BYTE-IDENTICALLY inside td's full-env sandbox (--expose-cwd) as under guix shell -C"
+	@echo ">> loop-rung: a REAL rung (eval) runs with IDENTICAL output + success inside td's full-env sandbox (--expose-cwd) as under guix shell -C"
 	@set -euo pipefail; \
 	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	user=`id -un 2>/dev/null || echo nobody`; \
-	echo ">> oracle: the eval rung's command directly under guix shell -C"; \
-	oracle=`$(GUIX) repl $(LOAD) tests/eval.scm 2>&1`; \
-	echo "$$oracle" | sed 's/^/   oracle| /'; \
+	scratch="$(CURDIR)/.loop-rung-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
+	echo ">> oracle: the eval rung's command directly under guix shell -C (stdout compared; the Guile auto-compile warnings on stderr are .go-cache-dependent and excluded)"; \
+	oracle=`$(GUIX) repl $(LOAD) tests/eval.scm 2>"$$scratch/oracle.err"` \
+	  || { echo "FAIL: the oracle eval failed under guix shell -C" >&2; cat "$$scratch/oracle.err" >&2; exit 1; }; \
+	echo "   oracle stdout: [$$oracle]"; \
 	echo ">> td: the SAME command inside td's host-sandbox --expose-cwd (worktree + toolchain + cache exposed, chdir'd in)"; \
-	td=`USER="$$user" "$$tb" host-sandbox --expose-cwd -- $(GUIX) repl $(LOAD) tests/eval.scm 2>&1`; \
-	echo "$$td" | sed 's/^/   td    | /'; \
+	td=`USER="$$user" "$$tb" host-sandbox --expose-cwd -- $(GUIX) repl $(LOAD) tests/eval.scm 2>"$$scratch/td.err"` \
+	  || { echo "FAIL: the eval rung FAILED inside td's sandbox (stderr below) — the full-env exposure is incomplete" >&2; cat "$$scratch/td.err" >&2; exit 1; }; \
+	echo "   td stdout    : [$$td]"; \
 	test "$$td" = "$$oracle" \
-	  || { echo "FAIL: the eval rung produced DIFFERENT output inside td's sandbox than under guix shell -C — the full-env exposure diverged" >&2; exit 1; }; \
-	case "$$td" in *"eval ok"*) : ;; *) echo "FAIL: the eval rung did not print 'eval ok' inside td's sandbox (output above) — it did not actually run" >&2; exit 1;; esac; \
-	echo "PASS: a REAL loop rung (eval — loads every system/test module + prints 'eval ok') ran BYTE-IDENTICALLY inside td's OWN full-env sandbox (td-builder host-sandbox --expose-cwd: worktree + toolchain + cache + cgroups exposed) as directly under check.sh's guix shell -C; the Step-1 full-rung differential for the loop-tooling swap — check.sh's entry is still unchanged (Step 2 deferred)."
+	  || { echo "FAIL: the eval rung produced DIFFERENT stdout inside td's sandbox ([$$td]) than under guix shell -C ([$$oracle])" >&2; exit 1; }; \
+	test "$$td" = "eval ok" \
+	  || { echo "FAIL: the eval rung did not print 'eval ok' inside td's sandbox ([$$td]) — it did not actually run" >&2; exit 1; }; \
+	rm -rf "$$scratch"; \
+	echo "PASS: a REAL loop rung (eval — loads every system/test module + prints 'eval ok', exit 0) ran with IDENTICAL stdout AND success inside td's OWN full-env sandbox (td-builder host-sandbox --expose-cwd: worktree + toolchain + cache + cgroups exposed) as directly under check.sh's guix shell -C; the Step-1 full-rung differential for the loop-tooling swap — check.sh's entry is still unchanged (Step 2 deferred)."
 
 # ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
 # `tsc` (the pinned td-typescript input, run under the packaged node) BOTH
