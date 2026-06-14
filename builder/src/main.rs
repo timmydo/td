@@ -51,6 +51,21 @@ fn nar_hash(path: &str) -> Result<String, std::io::Error> {
     nar_hash_path(Path::new(path))
 }
 
+/// Resolve `guix` on the current PATH to its real (symlink-followed) location
+/// and return the directory holding it — the bin dir check.sh prepends to PATH
+/// (under the exposed /gnu/store). None if `guix` is not on PATH.
+fn host_guix_bin_dir() -> Option<String> {
+    let path = std::env::var("PATH").ok()?;
+    for dir in path.split(':').filter(|s| !s.is_empty()) {
+        let cand = Path::new(dir).join("guix");
+        if cand.is_file() {
+            let real = std::fs::canonicalize(&cand).ok()?;
+            return real.parent().map(|p| p.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -468,6 +483,51 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: check {drv_path}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // loop-sandbox: the DEV-SHELL — run a command inside td's own hermetic
+        // container (pivot into a fresh root exposing the WHOLE /gnu/store (ro),
+        // the daemon socket /var/guix, and /proc; host-guix on PATH), toward
+        // replacing `guix shell -C`. Usage: `host-sandbox -- CMD ARGS...`.
+        Some("host-sandbox") if args.len() >= 4 && args[2] == "--" => {
+            let cmd = &args[3];
+            let cmd_args: Vec<String> = args[4..].to_vec();
+            let run = || -> Result<std::process::ExitStatus, String> {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/home/td".to_string());
+                let guix_bin = host_guix_bin_dir().unwrap_or_default();
+                // The loop exposure set: the whole store (ro), the daemon socket
+                // + GC roots (rw), /proc, and the host device tree.
+                let binds = vec![
+                    sandbox::Bind { src: "/gnu/store".to_string(), readonly: true },
+                    sandbox::Bind { src: "/var/guix".to_string(), readonly: false },
+                    sandbox::Bind { src: "/proc".to_string(), readonly: false },
+                    // The host device tree (rbind) — tools need /dev/null,
+                    // /dev/urandom, &c. A host-resource exposure like the store
+                    // bind, not a network path; a minimal node-by-node /dev is a
+                    // follow-up.
+                    sandbox::Bind { src: "/dev".to_string(), readonly: false },
+                ];
+                let scratch = std::env::temp_dir()
+                    .join(format!("td-host-sandbox-{}-{}", sys::getuid(), std::process::id()));
+                let _ = std::fs::remove_dir_all(&scratch);
+                std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+                sandbox::host_shell(
+                    cmd,
+                    &cmd_args,
+                    &binds,
+                    &["/tmp".to_string(), home.clone()],
+                    &guix_bin,
+                    &home,
+                    &scratch,
+                )
+                .map_err(|e| e.to_string())
+            };
+            match run() {
+                Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+                Err(e) => {
+                    eprintln!("td-builder: host-sandbox: {e}");
                     ExitCode::FAILURE
                 }
             }

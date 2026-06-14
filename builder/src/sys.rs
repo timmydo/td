@@ -13,6 +13,8 @@ use std::io;
 const SYS_GETUID: usize = 102;
 const SYS_GETGID: usize = 104;
 const SYS_MOUNT: usize = 165;
+const SYS_UMOUNT2: usize = 166;
+const SYS_PIVOT_ROOT: usize = 155;
 const SYS_UNSHARE: usize = 272;
 
 pub const CLONE_NEWNS: usize = 0x0002_0000;
@@ -21,9 +23,15 @@ pub const CLONE_NEWIPC: usize = 0x0800_0000;
 pub const CLONE_NEWUSER: usize = 0x1000_0000;
 pub const CLONE_NEWNET: usize = 0x4000_0000;
 
+pub const MS_RDONLY: usize = 0x1;
+pub const MS_REMOUNT: usize = 0x20;
 pub const MS_BIND: usize = 0x1000;
 pub const MS_REC: usize = 0x4000;
 pub const MS_PRIVATE: usize = 0x4_0000;
+
+/// umount2(2) flag: detach a busy mount lazily (used to drop the old root
+/// after pivot_root).
+pub const MNT_DETACH: usize = 0x2;
 
 /// x86_64 syscall ABI: number in rax, args in rdi/rsi/rdx/r10/r8; rcx and
 /// r11 are clobbered by the instruction; negative return is -errno.
@@ -64,6 +72,19 @@ pub fn mount(src: Option<&CStr>, target: &CStr, fstype: Option<&CStr>, flags: us
     check(unsafe {
         syscall5(SYS_MOUNT, s as usize, target.as_ptr() as usize, t as usize, flags, 0)
     })
+}
+
+/// pivot_root(2): make `new_root` the process's root and mount the old root at
+/// `put_old`. Both must be directories; `new_root` must be a mount point.
+pub fn pivot_root(new_root: &CStr, put_old: &CStr) -> io::Result<()> {
+    check(unsafe {
+        syscall5(SYS_PIVOT_ROOT, new_root.as_ptr() as usize, put_old.as_ptr() as usize, 0, 0, 0)
+    })
+}
+
+/// umount2(2): unmount `target` with `flags` (e.g. MNT_DETACH).
+pub fn umount2(target: &CStr, flags: usize) -> io::Result<()> {
+    check(unsafe { syscall5(SYS_UMOUNT2, target.as_ptr() as usize, flags, 0, 0, 0) })
 }
 
 pub fn getuid() -> u32 {
