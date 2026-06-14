@@ -53,6 +53,42 @@ fn nar_hash(path: &str) -> Result<String, std::io::Error> {
     nar_hash_path(Path::new(path))
 }
 
+/// Recreate the tree at `src` under `dst` as a canonical store entry — the
+/// daemon's addToStore canonicalization, for the properties NAR (hence the
+/// content-addressed store path) actually captures: the tree STRUCTURE, file
+/// CONTENTS, the file EXECUTABLE bit, and SYMLINK targets. NAR omits directory
+/// permissions, the read/write permission bits, and mtimes, so those are not
+/// reproduced (dirs are left writable so the scratch copy can be cleaned up);
+/// regular files get the canonical `0555`/`0444` by their source exec bit, which
+/// is the one perm NAR encodes. Mirrors `(guix serialization) write-file`.
+fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let md = std::fs::symlink_metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        let target = std::fs::read_link(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        symlink(&target, dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    } else if ft.is_dir() {
+        std::fs::create_dir(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+        for entry in std::fs::read_dir(src).map_err(|e| format!("{}: {e}", src.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            copy_canonical(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        // Regular file: copy contents and set the canonical mode by the source's
+        // executable bit (the only permission NAR distinguishes). Key off OWNER-exec
+        // (`0o100`) — exactly what the daemon's canonicaliser (S_IXUSR) and td's own
+        // NAR serializer (`nar.rs`) use, so the restored tree's NAR matches the source's.
+        let content = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        std::fs::write(dst, &content).map_err(|e| format!("{}: {e}", dst.display()))?;
+        let exec = md.permissions().mode() & 0o100 != 0;
+        let mode = if exec { 0o555 } else { 0o444 };
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("{}: {e}", dst.display()))?;
+    }
+    Ok(())
+}
+
 /// Resolve `guix` on the current PATH to its real (symlink-followed) location
 /// and return the directory holding it — the bin dir check.sh prepends to PATH
 /// (under the exposed /gnu/store). None if `guix` is not on PATH.
@@ -656,6 +692,94 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: ADD a DIRECTORY TREE to a td-OWNED store ourselves — the
+        // RECURSIVE addToStore (the general write side), in pure Rust. td computes the
+        // content-addressed `source` path from the recursive NAR hash
+        // (`make_store_path("source", sha256(NAR), name)` — the daemon's
+        // makeFixedOutputPath for recursive-sha256, no references), CANONICALLY restores
+        // the tree into a td-owned store dir (`copy_canonical`: structure + contents +
+        // exec bit + symlinks, the NAR-relevant properties), and REGISTERS it in a td
+        // store DB (`store_db`). No daemon in the write path. Usage:
+        //   store-add-recursive NAME SRC STORE-DIR OUT-DB
+        // Prints the store path. No-reference sources (this increment); referenced
+        // sources are a later increment.
+        Some("store-add-recursive") if args.len() == 6 => {
+            let (name, src, store_dir, out_db) =
+                (&args[2], &args[3], &args[4], &args[5]);
+            let run = || -> Result<String, String> {
+                use store_db::{Table, Value};
+                // Content-addressed path from the source tree's recursive NAR sha256.
+                let nar = nar_hash(src).map_err(|e| e.to_string())?;
+                let hex = nar
+                    .strip_prefix("sha256:")
+                    .ok_or_else(|| format!("nar-hash returned `{nar}', expected sha256:<hex>"))?;
+                let path = store::make_store_path("source", hex, name);
+                let base = path
+                    .rsplit('/')
+                    .next()
+                    .filter(|_| store::name_from_store_path(&path).is_some())
+                    .ok_or_else(|| format!("computed path {path} is malformed"))?
+                    .to_string();
+                // Canonically restore the tree into the td-owned store.
+                std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+                let disk = Path::new(store_dir).join(&base);
+                copy_canonical(Path::new(src), &disk)?;
+                // Register: NAR hash + size of the tree td restored (the `build`
+                // machinery), references scanned among the single-path closure.
+                let closure = vec![path.clone()];
+                let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
+                nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
+                let (hash, size, refs) = s.finish();
+                if !refs.is_empty() && refs != [path.clone()] {
+                    return Err(format!(
+                        "source {name} has references {refs:?}; referenced sources are a later increment"
+                    ));
+                }
+                let valid = vec![(
+                    1i64,
+                    vec![
+                        Value::Null,
+                        Value::Text(path.clone()),
+                        Value::Text(hash),
+                        Value::Int(1),
+                        Value::Null, // deriver — a source add has none
+                        Value::Int(size as i64),
+                    ],
+                )];
+                let mut ref_rows = Vec::new();
+                let mut rid = 1i64;
+                for r in &refs {
+                    if r == &path {
+                        ref_rows.push((rid, vec![Value::Int(1), Value::Int(1)]));
+                        rid += 1;
+                    }
+                }
+                let tables = [
+                    Table {
+                        name: "ValidPaths",
+                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+                        rows: valid,
+                    },
+                    Table {
+                        name: "Refs",
+                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+                        rows: ref_rows,
+                    },
+                ];
+                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+                Ok(path)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-add-recursive {name}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-drv-assemble: ASSEMBLE the `.drv` from a raw SPEC (Guile resolved the
         // inputs and emitted it WITHOUT `(derivation …)`) and REGISTER it via the
         // daemon — so the build derivation enters the store with no guile
@@ -948,8 +1072,53 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-query DB info|references");
             eprintln!("       td-builder store-closure DB ROOT");
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
+            eprintln!("       td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // `copy_canonical` must reproduce a tree byte-identically by NAR — exercising
+    // the properties NAR captures that the `store-add-tree` rung's source tree does
+    // not have: an EXECUTABLE file and a SYMLINK (plus a subdir + a plain file).
+    #[test]
+    fn copy_canonical_is_nar_identical_with_exec_and_symlink() {
+        let base = std::env::temp_dir().join(format!("td-cc-{}", std::process::id()));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.join("sub/run.sh"), b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(src.join("sub/run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        // A GROUP-exec-only file (0o654): NAR keys off OWNER-exec, so this must be
+        // restored NON-executable — a regression guard for the `& 0o100` (not `0o111`)
+        // exec test, matching nar.rs / the daemon.
+        std::fs::write(src.join("group-exec"), b"data").unwrap();
+        std::fs::set_permissions(src.join("group-exec"), std::fs::Permissions::from_mode(0o654))
+            .unwrap();
+        std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
+
+        copy_canonical(&src, &dst).unwrap();
+
+        // Structure + contents + exec bit + symlink target all preserved ⇒ same NAR.
+        assert_eq!(
+            nar_hash_path(&src).unwrap(),
+            nar_hash_path(&dst).unwrap(),
+            "canonical copy is NAR-identical to the source"
+        );
+        // The executable bit (the one perm NAR distinguishes) is preserved.
+        let mode = std::fs::metadata(dst.join("sub/run.sh")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "exec bit preserved on dst");
+        // The symlink is recreated as a symlink, not followed.
+        assert!(std::fs::symlink_metadata(dst.join("link")).unwrap().file_type().is_symlink());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

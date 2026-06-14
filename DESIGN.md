@@ -744,9 +744,15 @@ run concurrently):
   `td-builder store-closure DB ROOT` walks the `Refs` graph from ROOT with td's own reader
   (GC's mark/liveness phase, no daemon); the `store-gc` rung shows td's reachable set from
   hello's output over its OWN scanned Refs equals `guix gc -R` exactly (the destructive
-  sweep is not done — boundary-safe). td now owns the conceptual store loop — write DB,
-  read DB, add a path, GC-mark — daemon as oracle. Later (sketch): recursive directory
-  adds (canonical tree restore) + references, the destructive GC sweep into a td store,
+  sweep is not done — boundary-safe). Increment 6 — **recursive addToStore** (the general
+  write side): `td-builder store-add-recursive` computes the content-addressed `source`
+  path from a tree's recursive NAR sha256, CANONICALLY restores the tree
+  (`copy_canonical`: structure + contents + the file exec bit + symlinks — the NAR-relevant
+  properties), and registers it; the `store-add-tree` rung shows td's restored tree is
+  byte-identical (by NAR hash) to the daemon's own interned `td-builder` source tree and
+  td's path matches the daemon's. td now owns the full store WRITE side (flat + recursive)
+  + read + DB authority + GC-mark — daemon as oracle. Later (sketch): referenced
+  sources/outputs (the `output:out` indirection), the destructive GC sweep into a td store,
   then a td store backend the build side can use — and the freedom to diverge the on-disk
   format once nothing external must read it. Working state + verified-red log:
   `plan/td-store-db.md`.
