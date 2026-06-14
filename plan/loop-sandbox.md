@@ -83,6 +83,19 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
   exposure equivalence holds across it. Finding: `bring_loopback_up` needs an OWNED
   netns (CAP_NET_ADMIN) — without `NEWNET` it `EPERM`s on the host's `lo`, so the two
   are coupled. Remaining follow-up: the wholesale `check.sh` swap.
+- **DONE 2026-06-14 (Step 1: the full-rung differential).** `host-sandbox` gained
+  `--expose-cwd` — the FULL loop env: the worktree/cwd bound (rw, like `guix shell -C`'s
+  shared cwd), `/sys/fs/cgroup` (ro) + the guix cache (`~/.cache/guix`), the caller's
+  PATH (the toolchain — all `/gnu/store`), `TD_CHECK_*` + `USER`/`LOGNAME` preserved,
+  chdir into the cwd. `host_shell` gained `workdir` + `extra_env` params. New `loop-rung`
+  rung: the `eval` rung's exact command (`$(GUIX) repl $(LOAD) tests/eval.scm` — loads
+  every system/test module, prints `eval ok`) produces BYTE-IDENTICAL combined output
+  inside td's `--expose-cwd` sandbox as directly under `guix shell -C`. Findings:
+  `USER`/`LOGNAME` must be preserved (else `guix time-machine` hits the root-owned
+  `/var/guix/profiles/default` and `EPERM`s instead of the per-user profile); HOME needs
+  no tmpfs in this mode (the cwd/cache binds create it on the writable root tmpfs).
+  Step 2 (the actual `check.sh` edit) is NOT in this increment (human: "Step 1 only for
+  now", 2026-06-14).
 
 ## Verified-red log
 
@@ -104,3 +117,11 @@ back EQUAL to the rung's (`net:[4026531833]` == parent) ⇒ `test "$td_ns" != "$
 fails ⇒ the net-parity leg goes red ("did not enter its OWN netns"). Proves `NEWNET`
 genuinely puts td's sandbox in a fresh isolated netns (not a vacuous pass), and that
 lo-up is coupled to owning that netns. Reverted; rung green again.
+
+**R3 the worktree exposure is load-bearing** (2026-06-14, `loop-rung`). Dropped the cwd
+(worktree) bind from `--expose-cwd`, rebuilt, ran the eval differential: the sandbox's
+workdir (the cwd) then does not exist inside, so `chdir` fails before exec —
+`td-builder host-sandbox: spawning guix in host-sandbox: No such file or directory` —
+so td's output is the error, not `eval ok`, ⇒ `td != oracle` ⇒ `loop-rung` red. Proves
+the full-env worktree exposure is load-bearing (the rung genuinely runs IN the exposed
+worktree, not a vacuous pass). Reverted; rung green again.
