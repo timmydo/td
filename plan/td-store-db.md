@@ -96,13 +96,41 @@ rejection, truncated-input → Err not panic) — 35 cargo tests total. Additive
 the existing rung was removed or loosened (the sqlite3-vs-daemon differential stays); the
 td-reader assertions are new strengthening.
 
+## Increment 4 (DONE 2026-06-14): td PLACES a path into its own store — addToStore (write side)
+
+The daemon's last *store-write* role on the simplest path: `addToStore`. New
+`td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB` — td computes the
+addTextToStore path itself (`store::make_text_path`, already owned), WRITES the content
+into a td-owned store dir as a canonical store file (a regular, read-only `0444` file),
+and REGISTERS it in a td store DB (`store_db`). No daemon in td's write path.
+
+New `store-add` rung (daemon = oracle, directive 4): the same bytes added via the
+daemon's addTextToStore RPC (`store-add`, #27) — which writes the file to `/gnu/store`
+and returns the path — give the IDENTICAL store path, and a store file BYTE-IDENTICAL
+(by NAR hash) to the one td wrote; td's registration, read back with TD'S OWN reader
+(`store-query`, #36), records that path + the NAR hash of what td wrote.
+
+**Oracle choice (the WAL gotcha):** the first cut read the daemon's recorded `hash`/
+`narSize` from the live DB (`?immutable=1`), but a *freshly* added path sits in the
+daemon's WAL — invisible to an immutable `db.sqlite` snapshot (the store-register rung
+only works because hello's closure is old/checkpointed). The daemon's **own store file**
+is the WAL-free oracle and the *stronger* claim: td's store bytes == the daemon's store
+bytes, compared by NAR hash. NAR ignores mtime + the read/write perm bits, so store
+identity is metadata-independent. Boundary: td writes only its OWN scratch store/DB and
+READS the daemon's store file; the daemon RPC adds a GC-able probe path (as the existing
+store-add/drv-add rungs do) purely as the oracle.
+
+td now owns the store loop on the flat path: WRITE the DB (#34/#35), READ the DB (#36),
+and ADD a path with its bytes (this). The daemon is the oracle, not the authority.
+
 ## Later increments (sketch — not this PR)
 
-- `addToStore` end-to-end in td (write the path + register) into a td store.
+- Recursive *directory* addToStore (canonical tree restore: recreate the tree with
+  canonical metadata, the exec-bit honored) + references — the general add.
 - GC reachability (the daemon's third role).
 - Eventually a td store backend the system can use, daemon retired for the build side.
-- With write+read OWNED, deliberately DIVERGE the on-disk store format/schema where it
-  buys something (the differential becomes a correctness check on td's chosen format,
+- With write+read+add OWNED, deliberately DIVERGE the on-disk store format/schema where
+  it buys something (the differential becomes a correctness check on td's chosen format,
   not a guix-compat constraint). Having a daemon accept td's DB is now OPTIONAL, not the
   goal.
 
@@ -164,3 +192,21 @@ tests untouched, so the binary still built), ran the rung: td's reader reported
 `store-register` red. Proves the td-reader assertions are non-vacuous and reader-specific
 — they catch a wrong store-query answer the existing sqlite3-vs-daemon checks do not
 (those stayed green). Reverted; rung green again.
+
+**R5 td actually WRITES the real store bytes — store-add** (2026-06-14, increment 4).
+Perturbed `store-add-text` to append a byte to the content it writes to disk
+(`std::fs::write(&disk, [content.as_slice(), b"X"].concat())`), rebuilt, ran the
+`store-add` rung: the file td wrote NAR-hashed to `sha256:2f298c…` ≠ the daemon's own
+store file `sha256:eb40ea…` ⇒ the `test "$td_file_hash" = "$oracle_hash"` assertion fails
+⇒ `store-add` red. Proves the byte-identity differential is load-bearing — td must place
+store bytes identical to the daemon's, not just compute the right path. (The path
+assertion stayed green: the path is computed from the original content, not the file.)
+Reverted; rung green again.
+
+**R6 the store-path differential is non-vacuous — store-add** (2026-06-14, increment 4).
+Perturbed `store-add-text` to compute the path from the wrong name
+(`make_text_path(&format!("{name}X"), …)`), rebuilt, ran the `store-add` rung: td
+computed `…-td-store-add-probeX` ≠ the daemon's `…-td-store-add-probe` ⇒ the
+`test "$td_path" = "$daemon_path"` assertion fails ⇒ `store-add` red. Proves the headline
+"td computed the SAME store path as the daemon" assertion is non-vacuous. Reverted; rung
+green again.
