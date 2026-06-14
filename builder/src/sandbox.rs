@@ -204,10 +204,12 @@ pub struct Bind {
 /// writable tmpfs at each of `tmpfs_dirs`; the host filesystem is otherwise
 /// gone. `path_prepend` (the host-guix bin dir, itself under the exposed
 /// `/gnu/store`) leads PATH; `home` is HOME (must be one of `tmpfs_dirs`, i.e.
-/// writable). Runs `cmd args` and returns its exit status. NEWUSER|NEWNS only
-/// — uid/gid are IDENTITY-mapped so the host daemon's peer-cred check still
-/// sees the real host uid; network-namespace parity with `guix shell -C` is a
-/// deferred follow-up (this runs inside check.sh's offline outer container).
+/// writable). Runs `cmd args` and returns its exit status. Unshares
+/// NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS; uid/gid are rootless-mapped (inside-0 →
+/// host uid) so the host daemon's peer-cred check still sees the real host uid,
+/// and its own network namespace (loopback brought up) matches `guix shell
+/// -C`'s offline posture — the daemon stays reachable over the Unix socket on
+/// the bound /var/guix.
 pub fn host_shell(
     cmd: &str,
     args: &[String],
@@ -278,7 +280,11 @@ pub fn host_shell(
     unsafe {
         command.pre_exec(move || {
             sys::unshare(
-                sys::CLONE_NEWUSER | sys::CLONE_NEWNS | sys::CLONE_NEWIPC | sys::CLONE_NEWUTS,
+                sys::CLONE_NEWUSER
+                    | sys::CLONE_NEWNS
+                    | sys::CLONE_NEWNET
+                    | sys::CLONE_NEWIPC
+                    | sys::CLONE_NEWUTS,
             )?;
             fs::write("/proc/self/setgroups", "deny")?;
             // Standard rootless map: inside-root (uid 0) → the host uid, so the
@@ -287,6 +293,11 @@ pub fn host_shell(
             // kernel translates inner uid 0 back to the host uid).
             fs::write("/proc/self/uid_map", format!("0 {host_uid} 1"))?;
             fs::write("/proc/self/gid_map", format!("0 {host_gid} 1"))?;
+            // Own network namespace (offline by construction, like `guix shell
+            // -C`); bring its loopback up to match that posture. The daemon
+            // socket is a Unix socket on the bound /var/guix, so it stays
+            // reachable across the netns boundary.
+            sys::bring_loopback_up()?;
             // Everything below private to this namespace.
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE)?;
             // A fresh tmpfs is the new root (also makes it a mount point, which
