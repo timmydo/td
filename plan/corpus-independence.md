@@ -223,3 +223,47 @@ are already stale on main (missing the whole ts/corpus/td-drv/loop arc) — the 
 `check` job is not yet required (`lint` is), so it does not gate local `./check.sh`.
 `corpus-deps` + its `tests/ts-recipe-nano-*.scm` add to that backlog; a single
 ci-image refresh should reconcile them all (separate `ci/` concern, flagged in PR).
+
+## Follow-on: OWN BUILDER, packages WITH inputs (claude-fable-44df36, 2026-06-14)
+
+Composes the two axes: the with-inputs recipe (nano, from the corpus-deps PR)
+built by td's OWN Rust builder (the `td-build`/autotools-build path) instead of
+gnu-build-system — so a package that LINKS real dependencies is built with NO
+gnu-build-system and NO build-side Guile. Stacked on the corpus-deps PR (needs the
+`inputs?` dialect field + `recipe-nano.ts`).
+
+- **`system/td-build.scm`** (`td-build-components`): resolve the recipe's declared
+  `inputs` from the corpus by name (`specification->package` — same input
+  resolution as `td-recipe.scm`, stays Guix's, retired LAST §5) and fold their
+  outputs into `TD_INPUTS` + the derivation's inputs. **No `build.rs` change
+  needed** — the Rust `set-paths` already derives `C_INCLUDE_PATH`/`LIBRARY_PATH`
+  from every `TD_INPUTS` entry, so the deps' headers/libs are found. A leaf recipe
+  (hello, no `inputs`) lowers identically ⇒ the hello-based `td-drv-*` rungs are
+  untouched.
+- **Feasibility spike (before the rung):** built nano via `td-rust-build-derivation`
+  with `inputs ["ncurses" "gettext-minimal"]` → compiled + linked + RAN, byte-
+  identical `--version` to the corpus nano (incl. ncursesw-driven `--enable-utf8`),
+  closure references ncurses. Guix's ncurses ships `curses.h` FLAT in `include/`
+  (no `ncursesw/` subdir), so the minimal `set-paths` suffices — the header-layout
+  risk I flagged in the sketch did not materialise for this subject.
+- **Rung `td-build-deps`** (heavy; HEAVY_RUNGS, additive — exclusive Makefile
+  landing; `tests/td-build-deps-drv.scm`): STRUCTURAL (builder=`td-builder`, not
+  `guile`), INPUT-EDGE (ncurses + gettext are DIRECT inputs of the derivation),
+  REPRODUCIBLE (`--check`, verdict-memoized), BEHAVIORAL (byte-identical `--version`
+  to corpus nano), distinct store path. `./check.sh td-build-deps` green, ~86s.
+
+Verified-red (green committed first; restored via `git checkout`):
+- **R1 inputs load-bearing** — `td-build-components` `dep-names` forced to `'()`
+  (ignore declared inputs). Two observations: (a) `tests/td-build-deps-drv.scm`
+  reports `TD_HAS_NCURSES=no`/`TD_HAS_GETTEXT=no` ⇒ the rung's input-edge assertion
+  reds; (b) the actual td-builder build of nano FAILS (configure/compile can't find
+  the deps, exit 1). Proves the declared inputs are load-bearing for the own-builder
+  build AND that the input-edge check discriminates.
+- **STRUCTURAL** (builder must be `td-builder`) and **BEHAVIORAL** (`--version`
+  string equality) reuse the exact checks the `td-build` rung already verified-red
+  (R2 structural on that track); a `--version` mismatch is a plain string-compare
+  red.
+- The `--check` leg reuses `tests/check-memo.sh` (verified-red on the check-memo
+  track).
+- Same `ci/lower-check-drvs.sh` staleness note applies (`tests/td-build-deps-drv.scm`
+  joins the backlog; CI `check` not yet required).
