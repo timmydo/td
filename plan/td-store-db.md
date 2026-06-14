@@ -67,14 +67,44 @@ path's `hash` + `narSize`, (2) the full inter-path `Refs` relation, (3) the arti
 deriver + drv→output. Removes increment 1's scaffolding caveat. Per-path derivers of the
 non-artifact members (the daemon's input-resolution) + `registrationTime` excluded.
 
+## Increment 3 (DONE 2026-06-14): td READS its own store — "own the store, then diverge"
+
+Direction (human 2026-06-14): "I'm worried we're so caught up with guix compatibility
+that we won't be able to innovate … continue removing guile/guix dependencies." Chosen
+pivot: finish td's store ownership the INDEPENDENCE way — td READS its own store (daemon
+out of the query loop), NOT "make a daemon accept td's DB" (which would deepen the
+compatibility cage). Once td writes+reads its own store, byte-identity to guix becomes
+OPTIONAL and the format can diverge.
+
+New `builder/src/store_db_read.rs` — a zero-dep SQLite *reader*, the inverse of
+`store_db`: it parses the 100-byte file header, the `sqlite_master` schema b-tree (table
+name → rootpage), and a table b-tree (leaf `0x0d`, descending interior `0x05`) into its
+`(rowid, values)` rows, decoding records by the same serial-type/varint rules the writer
+uses. New `td-builder store-query DB info|references` answers store queries off td's OWN
+DB with that reader — NO sqlite3 engine, NO daemon in td's query path.
+
+The `store-register` rung now reads td's DB THREE ways and asserts they agree: **td's own
+reader == sqlite3 on the same bytes (the parser oracle) == the daemon's record (the
+content oracle)** — `info` (every path's hash + narSize) and `references` (the full Refs
+relation). td thus WRITES and READS its store DB itself; libsqlite/the daemon are
+correctness oracles, not the format authority. The reader returns `Err` (never panics)
+on a truncated/corrupt record — varints and value bodies are bounds-checked, overflow and
+index/unknown page types are rejected — so td can read its OWN store defensively. Plus 5
+new in-process unit tests (writer→reader round-trip: varints incl. boundary/​u64::MAX, a
+ValidPaths-like table exercising serial types 3/4, all three store tables, bad-magic
+rejection, truncated-input → Err not panic) — 35 cargo tests total. Additive: nothing in
+the existing rung was removed or loosened (the sqlite3-vs-daemon differential stays); the
+td-reader assertions are new strengthening.
+
 ## Later increments (sketch — not this PR)
 
-- Have `guix`/a fresh daemon on td's `GUIX_STATE_DIRECTORY` report the artifact VALID
-  (queryable end-to-end) — needs the exact daemon schema (indexes/trigger/sequence) so
-  the daemon accepts td's hand-written DB.
 - `addToStore` end-to-end in td (write the path + register) into a td store.
 - GC reachability (the daemon's third role).
 - Eventually a td store backend the system can use, daemon retired for the build side.
+- With write+read OWNED, deliberately DIVERGE the on-disk store format/schema where it
+  buys something (the differential becomes a correctness check on td's chosen format,
+  not a guix-compat constraint). Having a daemon accept td's DB is now OPTIONAL, not the
+  goal.
 
 ## Sub-task ladder
 
@@ -117,3 +147,20 @@ diverged from the daemon (e.g. bash-static 1887497 ≠ 1887496, glibc 41145793 �
 41145792) ⇒ the rung's `test "$td_rows" = "$oracle_rows"` fails ⇒ `store-register` red.
 Proves the closure differential checks every path's registration, not just the
 artifact's (which R1 covered). Reverted; rung green again.
+
+**R3 the reader's parse is non-vacuous — unit level** (2026-06-14, increment 3).
+Perturbed `store_db_read::read_varint` (`result << 7` → `result << 8`), ran `cargo
+test`: `varint_roundtrip` failed (128 decoded as 256) and both table round-trips failed
+("leaf cell payload overruns page" — the corrupted payload-length varint) ⇒ 3 reader
+tests red while the writer/other tests stayed green. Proves the writer→reader round-trip
+tests genuinely exercise td's parser, not a vacuous pass. Reverted; 34 green.
+
+**R4 td's reader is load-bearing in the rung — integration level** (2026-06-14,
+increment 3). Perturbed `store-query info` to read `narSize` from the wrong column
+(`cols[3]` = the registrationTime sentinel = 1, instead of `cols[5]`), rebuilt (unit
+tests untouched, so the binary still built), ran the rung: td's reader reported
+`narSize=1` for every path while sqlite3 on the SAME bytes reported the true sizes
+(1887496, 41145792, …) ⇒ the new `test "$td_read_info" = "$td_rows"` assertion fails ⇒
+`store-register` red. Proves the td-reader assertions are non-vacuous and reader-specific
+— they catch a wrong store-query answer the existing sqlite3-vs-daemon checks do not
+(those stayed green). Reverted; rung green again.

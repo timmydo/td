@@ -636,22 +636,25 @@ loop-rung:
 	echo "PASS: a REAL loop rung (eval — loads every system/test module + prints 'eval ok', exit 0) ran with IDENTICAL stdout AND success inside td's OWN full-env sandbox (td-builder host-sandbox --expose-cwd: worktree + toolchain + cache + cgroups exposed) as directly under check.sh's guix shell -C; the Step-1 full-rung differential for the loop-tooling swap — check.sh's entry is still unchanged (Step 2 deferred)."
 
 # store-register (DESIGN §7.1; td-store-db track — begin replacing guix-daemon). td
-# WRITES the store SQLite DB for an artifact's FULL CLOSURE itself — the daemon's
-# `ValidPaths`/`Refs`/`DerivationOutputs` authority. `td-builder store-register` scans
-# EVERY path in `guix gc -R hello` (NAR hash + size + reference scan, the `build`
-# machinery) and writes the SQLite FILE FORMAT directly (the `store_db` module: header
-# + table b-tree leaf pages + the record/varint encoding, zero-dep) — the real
-# replacement of the daemon's libsqlite, NO `sqlite3` engine writing it. The
-# differential (daemon = oracle, prime directive 4): td writes a store DB that
-# `sqlite3` confirms is structurally valid (`PRAGMA integrity_check` = ok), and whose
-# registration reads back BYTE-IDENTICAL to the daemon's: (1) EVERY closure path's hash
-# + narSize, (2) the FULL inter-path Refs relation (referrer→reference), and (3) the
-# artifact's deriver + drv→output. `registrationTime` (the daemon's "now") and the
-# per-path derivers of the non-artifact closure members (the daemon's input-resolution)
-# are excluded; only the deriver `.drv` is a scaffolding row (it is not a closure
-# member). Boundary: the host DB is read IMMUTABLY only; td writes only its OWN scratch
-# DB — the host daemon stays immutable infra. Needs td-builder built, so it slots in
-# the heavy pool.
+# both WRITES and READS the store SQLite DB for an artifact's FULL CLOSURE itself — the
+# daemon's `ValidPaths`/`Refs`/`DerivationOutputs` authority AND its store-query role,
+# in pure Rust. `td-builder store-register` scans EVERY path in `guix gc -R hello` (NAR
+# hash + size + reference scan, the `build` machinery) and writes the SQLite FILE FORMAT
+# directly (the `store_db` module: header + table b-tree leaf pages + the record/varint
+# encoding, zero-dep) — the real replacement of the daemon's libsqlite, NO `sqlite3`
+# engine writing it. `td-builder store-query` then READS that DB back with td's OWN
+# pure-Rust SQLite reader (`store_db_read`) — NO sqlite3 engine and NO daemon in td's
+# store-query path. The differential (daemon = oracle, prime directive 4): td writes a
+# store DB that `sqlite3` confirms is structurally valid (`PRAGMA integrity_check` = ok),
+# and whose registration — as answered by TD'S OWN READER — reads back BYTE-IDENTICAL
+# both to sqlite3 reading the same bytes (the parser oracle) and to the daemon's record
+# (the content oracle): (1) EVERY closure path's hash + narSize, (2) the FULL inter-path
+# Refs relation (referrer→reference), and (3) the artifact's deriver + drv→output.
+# `registrationTime` (the daemon's "now") and the per-path derivers of the non-artifact
+# closure members (the daemon's input-resolution) are excluded; only the deriver `.drv`
+# is a scaffolding row (it is not a closure member). Boundary: the host DB is read
+# IMMUTABLY only; td writes only its OWN scratch DB — the host daemon stays immutable
+# infra. Needs td-builder built, so it slots in the heavy pool.
 store-register:
 	@echo ">> store-register: td WRITES the store SQLite DB for hello's FULL CLOSURE (pure-Rust file format) — every path's registration reads back byte-identical to the daemon"
 	@set -euo pipefail; \
@@ -688,8 +691,17 @@ store-register:
 	test -n "$$oracle_dout" || { echo "FAIL: the daemon recorded no deriver/drv->output for hello (vacuous)" >&2; exit 1; }; \
 	test "$$td_dout" = "$$oracle_dout" || { echo "FAIL: hello's deriver/drv->output ($$td_dout) != the daemon's ($$oracle_dout)" >&2; exit 1; }; \
 	echo "   hello's deriver + drv->output mapping match the daemon"; \
+	echo ">> td READS its own store DB itself (td-builder store-query — a pure-Rust SQLite reader; NO sqlite3 engine, NO daemon in td's query path):"; \
+	td_read_info=`"$$tb" store-query "$$scratch/td.db" info`; \
+	test "$$td_read_info" = "$$td_rows" || { echo "FAIL: td's reader disagrees with sqlite3 reading the SAME td.db bytes (info)" >&2; echo "$$td_read_info" | sed 's/^/  td-read: /' >&2; echo "$$td_rows" | sed 's/^/  sqlite3: /' >&2; exit 1; }; \
+	test "$$td_read_info" = "$$oracle_rows" || { echo "FAIL: td's reader of its own DB != the daemon's record (info)" >&2; exit 1; }; \
+	echo "   info: td's reader == sqlite3 (same bytes) == the daemon ($$n paths' path|hash|narSize)"; \
+	td_read_refs=`"$$tb" store-query "$$scratch/td.db" references`; \
+	test "$$td_read_refs" = "$$td_refs" || { echo "FAIL: td's reader disagrees with sqlite3 reading the SAME td.db bytes (references)" >&2; exit 1; }; \
+	test "$$td_read_refs" = "$$oracle_refs" || { echo "FAIL: td's reader of its own DB != the daemon's Refs relation" >&2; exit 1; }; \
+	echo "   references: td's reader == sqlite3 == the daemon ($$(echo "$$td_read_refs" | wc -l) edges)"; \
 	rm -rf "$$scratch"; \
-	echo "PASS: td WROTE the store SQLite DB for hello's full $$n-path closure itself, in pure Rust (the store_db file-format writer, no sqlite3 engine) — it passes sqlite3 PRAGMA integrity_check, and EVERY path's hash + narSize, the full inter-path Refs relation, and hello's deriver/drv->output read back BYTE-IDENTICAL to the daemon's record; the daemon is only the oracle. registrationTime + the non-artifact per-path derivers excluded; the exact daemon schema (indexes/trigger) is a later increment."
+	echo "PASS: td WROTE the store SQLite DB for hello's full $$n-path closure itself in pure Rust AND READ it back itself (td-builder store-query — a pure-Rust SQLite reader, no sqlite3 engine and no daemon in td's own store-query path). sqlite3 PRAGMA integrity_check = ok on td's bytes; and EVERY path's hash + narSize and the full inter-path Refs relation, as answered by TD'S OWN READER, are BYTE-IDENTICAL both to sqlite3 reading the same bytes (parser oracle) and to the daemon's record (content oracle); hello's deriver/drv->output also match the daemon. registrationTime + the non-artifact per-path derivers excluded; the exact daemon schema (indexes/trigger) is a later increment."
 
 # ts-frontend Phase 1 (DESIGN §7.1, sub-task 1) — the TypeScript spec front-end.
 # `tsc` (the pinned td-typescript input, run under the packaged node) BOTH

@@ -24,6 +24,7 @@ mod scan;
 mod sha256;
 mod store;
 mod store_db;
+mod store_db_read;
 mod sys;
 
 use std::path::Path;
@@ -458,6 +459,89 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: READ td's own store DB ourselves — the daemon's store-query
+        // role, in pure Rust. `store_db_read` parses the SQLite file format that
+        // `store-register` writes (no `sqlite3` engine, no daemon, in td's own
+        // store-query path). Usage:
+        //   store-query DB info        -> "path|hash|narSize" per fully-registered path
+        //   store-query DB references  -> "referrer|reference" for the full Refs relation
+        // Both sorted, so a set-comparison against the daemon oracle is order-free.
+        Some("store-query") if args.len() == 4 => {
+            let (db_path, mode) = (&args[2], &args[3]);
+            let run = || -> Result<Vec<String>, String> {
+                use store_db_read::{Db, Value};
+                let text = |v: &Value| match v {
+                    Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                };
+                let int = |v: &Value| match v {
+                    Value::Int(i) => Some(*i),
+                    _ => None,
+                };
+                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+                let db = Db::open(bytes)?;
+                let mut out = match mode.as_str() {
+                    // ValidPaths(id, path, hash, registrationTime, deriver, narSize):
+                    // the path|hash|narSize of every fully-registered path (hash NOT NULL;
+                    // a scaffolding row leaves hash/size NULL and is skipped).
+                    "info" => {
+                        let mut lines = Vec::new();
+                        for (_rowid, cols) in db.table("ValidPaths")? {
+                            match (text(&cols[1]), text(&cols[2]), int(&cols[5])) {
+                                (Some(path), Some(hash), Some(size)) => {
+                                    lines.push(format!("{path}|{hash}|{size}"));
+                                }
+                                _ => {}
+                            }
+                        }
+                        lines
+                    }
+                    // Resolve Refs(referrer, reference) ids -> paths via the ValidPaths
+                    // rowid (= the integer-primary-key id).
+                    "references" => {
+                        let mut path_of = std::collections::HashMap::new();
+                        for (rowid, cols) in db.table("ValidPaths")? {
+                            if let Some(p) = text(&cols[1]) {
+                                path_of.insert(rowid, p);
+                            }
+                        }
+                        let resolve = |id: i64| -> Result<String, String> {
+                            path_of
+                                .get(&id)
+                                .cloned()
+                                .ok_or_else(|| format!("Refs id {id} has no ValidPaths row"))
+                        };
+                        let mut lines = Vec::new();
+                        for (_rowid, cols) in db.table("Refs")? {
+                            match (int(&cols[0]), int(&cols[1])) {
+                                (Some(a), Some(b)) => {
+                                    lines.push(format!("{}|{}", resolve(a)?, resolve(b)?));
+                                }
+                                _ => return Err("Refs row has non-integer columns".to_string()),
+                            }
+                        }
+                        lines
+                    }
+                    other => {
+                        return Err(format!("unknown query mode `{other}' (info|references)"))
+                    }
+                };
+                out.sort();
+                Ok(out)
+            };
+            match run() {
+                Ok(lines) => {
+                    for l in lines {
+                        println!("{l}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-query {db_path} {mode}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-drv-assemble: ASSEMBLE the `.drv` from a raw SPEC (Guile resolved the
         // inputs and emitted it WITHOUT `(derivation …)`) and REGISTER it via the
         // daemon — so the build derivation enters the store with no guile
@@ -747,6 +831,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
+            eprintln!("       td-builder store-query DB info|references");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)
         }
