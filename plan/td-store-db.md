@@ -65,6 +65,22 @@ This proves td reproduces the daemon's store-DB registration authority for one a
 2. `store-register` SQL emission + the differential rung. Verify red. — B.
 3. Full `./check.sh` green; PR. — C.
 
+## Implementation progress
+
+- **DONE 2026-06-14.** `store-register` subcommand + the `store-register` rung GREEN
+  inside td's own sandbox: for the corpus `hello`, td's emitted registration — loaded
+  into a working copy of the store DB after deleting the daemon's own row — queries
+  back BYTE-IDENTICAL to the daemon's record (hash `sha256:0f28ab…`, narSize 282616,
+  deriver, all 3 referenced paths incl. the self-ref, the drv→output mapping). The
+  candidates for the reference scan must be the output's runtime closure (`guix gc -R
+  $out`), NOT the drv's build closure (`gc -R $drv` — those are drvs/sources, so the
+  scan found zero refs). Reuses the `scan`/`nar` machinery `build` uses.
+
 ## Verified-red log
 
-(filled as each assertion is seen red.)
+**R1 the registration differential is non-vacuous** (2026-06-14). Perturbed
+`store-register` to emit `narSize` as `size + 1`, rebuilt, ran the differential: td's
+row narSize (282617) ≠ the daemon's (282616) ⇒ the rung's `test "$td_row" =
+"$oracle_row"` fails ⇒ `store-register` red ("td's ValidPaths row … != the daemon's").
+Proves the rung genuinely compares td's written registration to the daemon's, not a
+vacuous pass. Reverted; rung green again.

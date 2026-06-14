@@ -706,6 +706,20 @@ run concurrently):
   canonical `check` is unchanged). Done: #30 (exposure + isolation), #31 (net parity),
   Step 1 (full-rung differential), Step 2 (the swap). Working state + verified-red log:
   `plan/loop-sandbox.md`.
+- **td-store-db** *(approved 2026-06-14 — "what's next" → "Replace the guix-daemon")* —
+  begin replacing the **guix-daemon**, the last big reused Guix component on the build
+  side (§2.2/§2.5). td-builder already constructs (#22) / executes (#25) / registers via
+  the daemon RPC (#27) / `--check`s its own derivations — build execution is td's. What
+  is still ONLY the daemon's is the store-DB **authority**: the `ValidPaths`/`Refs`/
+  `DerivationOutputs` rows that make a path valid. Increment 1 (the `store-register`
+  rung): `td-builder store-register` WRITES those rows itself (NAR hash + size +
+  reference scan in Rust, emitted as SQL; sqlite3 is the engine) — for `hello`, loaded
+  into a working copy of the store DB after deleting the daemon's own row, it queries
+  back byte-identical to the daemon's record (hash, narSize, deriver, referenced paths,
+  drv→output); `registrationTime` excluded; verified-red. Boundary: the host daemon
+  stays immutable infra (immutable read + scratch copy only); td operates its OWN store
+  DB, daemon = oracle (directive 4). Later: full-closure validity, end-to-end
+  `addToStore`, GC. Working state + verified-red log: `plan/td-store-db.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
