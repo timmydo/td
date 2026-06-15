@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # rootless rung driver (see the Makefile's `rootless` rung for the contract).
 #
-# Outer phase (no args beyond the four paths): runs inside the check.sh
-# sandbox (td's own host-sandbox). Snapshots the host store DB by COPYING it (+
-# its WAL) into writable scratch and folding the WAL there — race-free because
-# the rung runs LAST and ALONE (the daemon is idle); a live `.backup` cannot
-# read the root-owned WAL DB as the non-root client (R8). Then re-enters itself
-# under `unshare -m -U -r` for the inner phase.
+# Outer phase (scratch + the four paths + td-builder): runs inside the check.sh
+# sandbox (td's own host-sandbox). CONSTRUCTS the snapshot store DB from the
+# static closure (paths.txt) with `td-builder store-register` — scanning each
+# path's content for its NAR hash + refs, never reading the live /var/guix/db —
+# so it is race-free even against a second concurrent check (DESIGN §7.3). The
+# two daemon-coordinated fixes are blocked for a non-root client (big-lock is
+# 0600 root; a live `.backup` cannot write the root-owned WAL -shm, R8); building
+# from the closure sidesteps both (plan/rootless-snapshot-race.md). Then re-enters
+# itself under `unshare -m -U -r` for the inner phase.
 #
 # Inner phase (--inner): builds a writable view of the store at the SAME path
 # (/gnu/store — required for store-path equality), starts the pinned
@@ -42,33 +45,40 @@
 set -euo pipefail
 
 if [ "${1-}" != "--inner" ]; then
-  scratch=$1; img_drv=$2; img_out=$3; probe_drv=$4; probe_out=$5
+  scratch=$1; img_drv=$2; img_out=$3; probe_drv=$4; probe_out=$5; tb=$6
 
-  echo ">> rootless: snapshot the host store DB (copy + checkpoint)"
+  echo ">> rootless: CONSTRUCT the store DB from the closure (td store-register — no live-DB copy, race-free)"
   mkdir -p "$scratch/state/db" "$scratch/newstore" "$scratch/log" "$scratch/tmp"
-  # A LIVE `sqlite3 .backup` of the host store DB fails as the non-root client:
-  # the DB is in WAL mode, and reading the WAL needs an -shm index (re)created in
-  # the ROOT-owned /var/guix/db — which we cannot write ("attempt to write a
-  # readonly database", plan/loop-sandbox.md R8). Instead COPY the DB (+ its WAL)
-  # into our WRITABLE scratch and fold the WAL there.
-  #
-  # CONCURRENCY (honest scope). WITHIN one check the Makefile order-only gate runs
-  # `rootless` LAST and ALONE, so no sibling gate is building and the on-disk DB is
-  # quiescent. It is NOT, however, race-free against a SECOND concurrent check
-  # (DESIGN §7.3 permits two): that check's heavy build gates drive the shared host
-  # daemon, which can write the store DB while we copy it. The integrity_check
-  # below is the safety net for that case — a torn copy fails LOUDLY here, never a
-  # silent false-green. Making the snapshot race-free across concurrent checks
-  # needs daemon-side coordination (a follow-up); until then, stagger landings that
-  # run rootless if a second full check is in flight (DESIGN §7.3 resource note).
-  cp /var/guix/db/db.sqlite "$scratch/state/db/db.sqlite"
-  if [ -e /var/guix/db/db.sqlite-wal ]; then
-    cp /var/guix/db/db.sqlite-wal "$scratch/state/db/db.sqlite-wal"
-  fi
-  chmod -R u+w "$scratch/state/db"
-  sqlite3 "$scratch/state/db/db.sqlite" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
+  # Build the snapshot DB from the STATIC closure (paths.txt) instead of copying
+  # the LIVE /var/guix/db. Copying the live DB was race-free only WITHIN one check;
+  # a SECOND concurrent check (DESIGN §7.3 permits two) drives the shared host
+  # daemon, which writes the store DB while we copy it -> a torn copy. The two
+  # "proper" fixes are both blocked for a non-root client (big-lock/gc.lock are
+  # 0600 root; the live WAL needs an -shm write into root-owned /var/guix/db).
+  # So instead `td-builder store-register` SCANS each closure path (real NAR hash
+  # + refs, in pure Rust) and writes ValidPaths/Refs/DerivationOutputs from the
+  # fixed path list + path CONTENTS — it never reads the live DB, so a concurrent
+  # bulk-writer has nothing to tear (plan/rootless-snapshot-race.md). img_out is
+  # the artifact (deriver img_drv), so the validity guard + the `--check` oracle
+  # (td's NAR hash == the daemon's recorded hash, proven by the store-register
+  # gate) hold; img_drv is a closure member, registered once (the deriver-in-
+  # closure dedupe).
+  "$tb" store-register "$img_out" "$img_drv" "$scratch/paths.txt" "$scratch/state/db/db.sqlite" \
+    || { echo "FAIL: td-builder store-register could not construct the snapshot DB" >&2; exit 1; }
+  # Add the daemon's schema scaffolding td's data-only DB omits (indexes, the
+  # self-ref delete trigger, the FailedPaths table) so the nested guix-daemon
+  # finds the schema it expects. Deterministic, not racy (it touches only our own
+  # constructed DB). The schema VERSION file matches the daemon's.
+  sqlite3 "$scratch/state/db/db.sqlite" <<'SQL'
+CREATE INDEX IF NOT EXISTS IndexReferrer ON Refs(referrer);
+CREATE INDEX IF NOT EXISTS IndexReference ON Refs(reference);
+CREATE INDEX IF NOT EXISTS IndexDerivationOutputs ON DerivationOutputs(path);
+CREATE TRIGGER IF NOT EXISTS DeleteSelfRefs BEFORE DELETE ON ValidPaths
+  BEGIN DELETE FROM Refs WHERE referrer = old.id AND reference = old.id; END;
+CREATE TABLE IF NOT EXISTS FailedPaths (path text primary key not null, time integer not null);
+SQL
   test "$(sqlite3 "$scratch/state/db/db.sqlite" 'PRAGMA integrity_check;')" = ok \
-    || { echo "FAIL: the copied store-DB snapshot is not consistent (integrity_check failed) — the copy raced the daemon; rootless must run against a quiescent DB" >&2; exit 1; }
+    || { echo "FAIL: the constructed store-DB snapshot is not a valid SQLite file" >&2; exit 1; }
   cp /var/guix/db/schema "$scratch/state/db/schema"
 
   echo ">> rootless: enter the nested user namespace"

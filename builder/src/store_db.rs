@@ -4,11 +4,13 @@
 //! The daemon writes this DB via libsqlite; td writes the SQLite *file format*
 //! itself (td-store-db track: begin replacing guix-daemon). This is the real
 //! replacement of the C++ daemon's store-DB writing — no `sqlite3` engine, no
-//! crate. Scope (this increment): the three store tables with their rows in a
-//! SINGLE leaf b-tree page each (sufficient for an artifact + its references);
-//! the full schema (indexes, the DeleteSelfRefs trigger, sqlite_sequence) and
-//! multi-page b-trees for the whole closure are LATER increments — sqlite3/guix
-//! read the tables we write without them.
+//! crate. Scope: the three store tables, each as a proper table b-tree —
+//! leaf pages (type 0x0d) packed and, when the rows exceed one page, interior
+//! pages (type 0x05) above them, to arbitrary depth — so a whole closure
+//! (thousands of paths, e.g. the rootless image) fits. The schema decorations
+//! the daemon also keeps (indexes, the DeleteSelfRefs trigger, FailedPaths,
+//! sqlite_sequence) are added separately by the caller where needed; sqlite3 and
+//! the guix-daemon read the tables we write either way.
 //!
 //! Format references: the SQLite "Database File Format"
 //! (https://www.sqlite.org/fileformat2.html) — the 100-byte header, table
@@ -23,6 +25,11 @@ const HEADER_LEN: usize = 100;
 // right-most pointer on a leaf), then the cell-pointer array.
 const LEAF: u8 = 0x0d;
 const LEAF_HEADER_LEN: usize = 8;
+// Table b-tree INTERIOR page: type byte 0x05, then a 12-byte page header (the
+// last 4 bytes are the right-most child page number), then the cell-pointer
+// array. Used when a table's rows span more than one leaf page.
+const INTERIOR: u8 = 0x05;
+const INTERIOR_HEADER_LEN: usize = 12;
 
 /// A column value in a row. The store schema uses only integers and UTF-8 text
 /// (and NULL for an `integer primary key` alias column, whose value is the rowid).
@@ -32,7 +39,8 @@ pub enum Value {
     Text(String),
 }
 
-/// One table to materialize as a single leaf-page b-tree at `rootpage`.
+/// One table to materialize as a table b-tree (leaf pages + interior pages as
+/// needed); `write_db` assigns its rootpage.
 pub struct Table {
     pub name: &'static str,
     pub sql: &'static str,
@@ -122,55 +130,150 @@ fn record(values: &[Value]) -> Vec<u8> {
     out
 }
 
-/// Build a single table b-tree leaf page from its rows. Each cell is
-/// (payload-length varint, rowid varint, payload); cells are laid out from the
-/// end of the page downward, with a cell-pointer array (big-endian u16 offsets)
-/// growing from just after the page header. `page_is_first` reserves the 100-byte
-/// file header at the start of page 1. Panics if the rows do not fit one page
-/// (single-page scope — see the module note).
-fn leaf_page(table: &Table, page_is_first: bool) -> [u8; PAGE_SIZE] {
+/// The leaf cell for one row: (payload-length varint, rowid varint, payload).
+fn leaf_cell(rowid: i64, values: &[Value]) -> Vec<u8> {
+    let payload = record(values);
+    let mut cell = Vec::new();
+    put_varint(&mut cell, payload.len() as u64);
+    put_varint(&mut cell, rowid as u64);
+    cell.extend_from_slice(&payload);
+    cell
+}
+
+/// Build a table b-tree LEAF page (type 0x0d) from already-encoded cells. Cells
+/// fill from the page end downward; the cell-pointer array (big-endian u16) grows
+/// from just after the page header. `page_is_first` reserves the 100-byte file
+/// header at the start of page 1. The caller guarantees the cells fit (`pack`).
+fn leaf_page_from_cells(cells: &[Vec<u8>], page_is_first: bool) -> [u8; PAGE_SIZE] {
     let mut page = [0u8; PAGE_SIZE];
     let hdr_off = if page_is_first { HEADER_LEN } else { 0 };
     let mut content_end = PAGE_SIZE; // cells fill downward from the page end
-    let mut pointers: Vec<u16> = Vec::with_capacity(table.rows.len());
-    for (rowid, values) in &table.rows {
-        let payload = record(values);
-        let mut cell = Vec::new();
-        put_varint(&mut cell, payload.len() as u64);
-        put_varint(&mut cell, *rowid as u64);
-        cell.extend_from_slice(&payload);
+    let mut pointers: Vec<u16> = Vec::with_capacity(cells.len());
+    for cell in cells {
         content_end -= cell.len();
-        page[content_end..content_end + cell.len()].copy_from_slice(&cell);
+        page[content_end..content_end + cell.len()].copy_from_slice(cell);
         pointers.push(content_end as u16);
     }
-    // Page header (8 bytes for a leaf), at hdr_off.
     page[hdr_off] = LEAF;
-    // bytes 1..2: first freeblock offset (0 = none)
-    // bytes 3..4: number of cells
-    page[hdr_off + 3..hdr_off + 5].copy_from_slice(&(table.rows.len() as u16).to_be_bytes());
-    // bytes 5..6: cell content area start (0 means 65536; not needed here)
+    page[hdr_off + 3..hdr_off + 5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
     page[hdr_off + 5..hdr_off + 7].copy_from_slice(&(content_end as u16).to_be_bytes());
-    // byte 7: fragmented free bytes (0)
-    // The cell-pointer array follows the header, one big-endian u16 per cell.
     let mut ptr_off = hdr_off + LEAF_HEADER_LEN;
     for p in &pointers {
         page[ptr_off..ptr_off + 2].copy_from_slice(&p.to_be_bytes());
         ptr_off += 2;
     }
-    assert!(
-        ptr_off <= content_end,
-        "table `{}' does not fit in one leaf page (single-page scope)",
-        table.name
-    );
+    assert!(ptr_off <= content_end, "leaf page overflow (a single cell too large?)");
     page
 }
 
+/// Build a table b-tree INTERIOR page (type 0x05). `children` are (child-page,
+/// key) in ascending key order; the LAST is the right-most pointer (carried in
+/// the 12-byte header), the rest are cells of (4-byte left-child page, rowid-key
+/// varint). An interior cell points at the child whose keys are <= the cell key.
+fn interior_page(children: &[(u32, i64)]) -> [u8; PAGE_SIZE] {
+    let mut page = [0u8; PAGE_SIZE];
+    let (rightmost, cell_children) = children.split_last().expect("interior page needs a child");
+    let mut content_end = PAGE_SIZE;
+    let mut pointers: Vec<u16> = Vec::with_capacity(cell_children.len());
+    for (child, key) in cell_children {
+        let mut cell = Vec::new();
+        cell.extend_from_slice(&child.to_be_bytes());
+        put_varint(&mut cell, *key as u64);
+        content_end -= cell.len();
+        page[content_end..content_end + cell.len()].copy_from_slice(&cell);
+        pointers.push(content_end as u16);
+    }
+    page[0] = INTERIOR;
+    page[3..5].copy_from_slice(&(cell_children.len() as u16).to_be_bytes());
+    page[5..7].copy_from_slice(&(content_end as u16).to_be_bytes());
+    page[8..12].copy_from_slice(&rightmost.0.to_be_bytes()); // right-most child
+    let mut ptr_off = INTERIOR_HEADER_LEN;
+    for p in &pointers {
+        page[ptr_off..ptr_off + 2].copy_from_slice(&p.to_be_bytes());
+        ptr_off += 2;
+    }
+    assert!(ptr_off <= content_end, "interior page overflow");
+    page
+}
+
+/// Greedily pack items of the given byte `costs` into contiguous groups that each
+/// fit `avail`; returns the `(start, end)` row ranges. Each item must fit alone
+/// (our store records are far under a page — no overflow pages).
+fn pack(costs: &[usize], avail: usize) -> Vec<(usize, usize)> {
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    let mut used = 0usize;
+    for (i, &c) in costs.iter().enumerate() {
+        assert!(c <= avail, "a single b-tree cell exceeds one page (overflow pages unsupported)");
+        if i > start && used + c > avail {
+            groups.push((start, i));
+            start = i;
+            used = 0;
+        }
+        used += c;
+    }
+    groups.push((start, costs.len()));
+    groups
+}
+
+/// Build a table's b-tree (leaf pages, then interior levels until one root page),
+/// appending each page to `out` in page-number order and returning the rootpage.
+/// `cells`/`rowids` are the rows in ascending-rowid order.
+fn build_btree(cells: &[Vec<u8>], rowids: &[i64], next_page: &mut u32, out: &mut Vec<u8>) -> u32 {
+    // Leaf level: cost = cell bytes + its 2-byte pointer.
+    let leaf_costs: Vec<usize> = cells.iter().map(|c| c.len() + 2).collect();
+    let mut level: Vec<(u32, i64)> = Vec::new(); // (page number, max rowid on/under it)
+    for (s, e) in pack(&leaf_costs, PAGE_SIZE - LEAF_HEADER_LEN) {
+        let pn = *next_page;
+        *next_page += 1;
+        out.extend_from_slice(&leaf_page_from_cells(&cells[s..e], false));
+        // An EMPTY table is one empty leaf page (no rows, no interior level), so
+        // its max key is unused; guard the `e - 1` index (e == 0 here).
+        let max_key = if e > s { rowids[e - 1] } else { 0 };
+        level.push((pn, max_key));
+    }
+    // Interior levels until a single page remains. Cost per child counts a full
+    // cell (4-byte child + key varint + 2-byte pointer) even for the right-most
+    // one (which needs none) — a harmless over-count that only adds pages.
+    while level.len() > 1 {
+        let costs: Vec<usize> = level
+            .iter()
+            .map(|(_, k)| {
+                let mut v = Vec::new();
+                put_varint(&mut v, *k as u64);
+                4 + v.len() + 2
+            })
+            .collect();
+        let mut next_level: Vec<(u32, i64)> = Vec::new();
+        for (s, e) in pack(&costs, PAGE_SIZE - INTERIOR_HEADER_LEN) {
+            let pn = *next_page;
+            *next_page += 1;
+            out.extend_from_slice(&interior_page(&level[s..e]));
+            next_level.push((pn, level[e - 1].1));
+        }
+        level = next_level;
+    }
+    level[0].0
+}
+
 /// Serialize a complete store DB: the 100-byte file header on page 1 (which also
-/// carries the `sqlite_master` schema b-tree), then one data page per table.
-/// `tables[i]` is materialized at rootpage `i + 2`.
+/// carries the `sqlite_master` schema b-tree), then each table's b-tree (one or
+/// more pages, deep enough for the whole closure). `sqlite_master` points each
+/// table at its computed rootpage.
 pub fn write_db(tables: &[Table]) -> Vec<u8> {
-    // sqlite_master rows: (type, name, tbl_name, rootpage, sql). Its rowid is the
-    // ordinal; rootpage points at the table's data page.
+    // Build each table's b-tree first (pages 2..), collecting rootpages.
+    let mut table_pages: Vec<u8> = Vec::new();
+    let mut next_page: u32 = 2;
+    let mut rootpages: Vec<u32> = Vec::with_capacity(tables.len());
+    for t in tables {
+        let cells: Vec<Vec<u8>> = t.rows.iter().map(|(rid, vals)| leaf_cell(*rid, vals)).collect();
+        let rowids: Vec<i64> = t.rows.iter().map(|(rid, _)| *rid).collect();
+        rootpages.push(build_btree(&cells, &rowids, &mut next_page, &mut table_pages));
+    }
+    let total_pages = next_page - 1;
+
+    // sqlite_master rows: (type, name, tbl_name, rootpage, sql) — page 1, single
+    // leaf (a handful of tables). rootpage points at each table's b-tree root.
     let master_rows: Vec<(i64, Vec<Value>)> = tables
         .iter()
         .enumerate()
@@ -181,26 +284,20 @@ pub fn write_db(tables: &[Table]) -> Vec<u8> {
                     Value::Text("table".to_string()),
                     Value::Text(t.name.to_string()),
                     Value::Text(t.name.to_string()),
-                    Value::Int(i as i64 + 2),
+                    Value::Int(rootpages[i] as i64),
                     Value::Text(t.sql.to_string()),
                 ],
             )
         })
         .collect();
-    let master = Table { name: "sqlite_master", sql: "", rows: master_rows };
+    let master_cells: Vec<Vec<u8>> =
+        master_rows.iter().map(|(rid, vals)| leaf_cell(*rid, vals)).collect();
+    let mut page1 = leaf_page_from_cells(&master_cells, true);
+    write_file_header(&mut page1, total_pages);
 
-    let total_pages = 1 + tables.len();
-    let mut db = Vec::with_capacity(total_pages * PAGE_SIZE);
-
-    // Page 1: header (first 100 bytes) + the sqlite_master leaf b-tree.
-    let mut page1 = leaf_page(&master, true);
-    write_file_header(&mut page1, total_pages as u32);
+    let mut db = Vec::with_capacity(total_pages as usize * PAGE_SIZE);
     db.extend_from_slice(&page1);
-
-    // Pages 2..: one leaf b-tree per table.
-    for t in tables {
-        db.extend_from_slice(&leaf_page(t, false));
-    }
+    db.extend_from_slice(&table_pages);
     db
 }
 
@@ -298,5 +395,37 @@ mod tests {
         // page 2 is the ValidPaths leaf with one cell.
         assert_eq!(db[PAGE_SIZE], LEAF);
         assert_eq!(u16::from_be_bytes([db[PAGE_SIZE + 3], db[PAGE_SIZE + 4]]), 1);
+    }
+
+    #[test]
+    fn empty_table_is_one_empty_leaf() {
+        // The flat store-add case: a path with no refs / no deriver-output rows.
+        // An empty table must be a single empty leaf page (not a panic on rowids[-1]).
+        let t = Table { name: "Refs", sql: "CREATE TABLE Refs (referrer integer, reference integer)", rows: vec![] };
+        let db = write_db(&[t]);
+        assert_eq!(db.len(), 2 * PAGE_SIZE); // page 1 (master) + 1 empty leaf
+        assert_eq!(db[PAGE_SIZE], LEAF); // page 2 is a leaf
+        assert_eq!(u16::from_be_bytes([db[PAGE_SIZE + 3], db[PAGE_SIZE + 4]]), 0); // 0 cells
+    }
+
+    #[test]
+    fn many_rows_span_interior_pages() {
+        // Enough rows to overflow one leaf: the table b-tree grows an interior
+        // root (type 0x05) above multiple leaves, and the page count reflects it.
+        let rows: Vec<(i64, Vec<Value>)> = (1..=2000)
+            .map(|i| (i, vec![Value::Null, Value::Text(format!("/gnu/store/{i:0>40}-p"))]))
+            .collect();
+        let t = Table {
+            name: "ValidPaths",
+            sql: "CREATE TABLE ValidPaths (id integer primary key, path text)",
+            rows,
+        };
+        let db = write_db(&[t]);
+        let pages = u32::from_be_bytes([db[28], db[29], db[30], db[31]]) as usize;
+        assert!(pages > 3, "2000 rows must span multiple leaves + an interior page, got {pages}");
+        assert_eq!(db.len(), pages * PAGE_SIZE);
+        // The ValidPaths rootpage (from sqlite_master) must be an INTERIOR page.
+        // It is the last page written (built after its leaves).
+        assert_eq!(db[(pages - 1) * PAGE_SIZE], INTERIOR);
     }
 }

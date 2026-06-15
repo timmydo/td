@@ -8,9 +8,11 @@
 #      • stages a writable /gnu/store view (per-item binds + rbind; overlayfs
 #        is impossible here — the sandbox's per-item profile binds are
 #        MNT_LOCKED in the nested userns and overlay rejects such a lowerdir),
-#        snapshots the host DB via sqlite's backup API, covers /var/guix with
-#        tmpfs (the host daemon is unreachable by construction), and starts the
-#        unprivileged daemon offline (--no-substitutes --no-offload);
+#        CONSTRUCTS the store DB from the closure (td-builder store-register —
+#        race-free, never copies the live /var/guix/db; plan/rootless-snapshot-race.md),
+#        covers /var/guix with tmpfs (the host daemon is unreachable by
+#        construction), and starts the unprivileged daemon offline (--no-substitutes
+#        --no-offload);
 #      • validity guard: the oracle output must be valid in the snapshot —
 #        otherwise `--check` would BUILD instead of COMPARE (false green);
 #      • isolation probe: a deliberately environment-sensitive drv records
@@ -35,6 +37,7 @@ HEAVY_GATES += rootless
 rootless:
 	@echo ">> rootless: unprivileged userns builder vs root daemon — store-path differential"
 	@set -euo pipefail; \
+	! grep -q '/var/guix/db/db.sqlite' tests/rootless.sh || { echo "FAIL: rootless.sh reads the LIVE store db.sqlite — the snapshot must be CONSTRUCTED from the closure (td store-register), not copied; copying races a concurrent check (plan/rootless-snapshot-race.md, the seal)" >&2; exit 1; }; \
 	test -n "$${GUIX_ENVIRONMENT-}" || { echo "ERROR: GUIX_ENVIRONMENT is unset — run via ./check.sh (the sandbox profile must be bound into the staged store)" >&2; exit 1; }; \
 	img_drv=`$(GUIX) system image $(LOAD) -t $(IMGTYPE) -d $(SYSTEM)`; \
 	test -n "$$img_drv" || { echo "ERROR: could not lower the image derivation" >&2; exit 1; }; \
@@ -56,5 +59,7 @@ rootless:
 	  printf '%s\n' "$$img_drv" "$$img_out" "$$probe_drv" "$$guix_pkg" "$$guix_daemon_pkg" "$$GUIX_ENVIRONMENT"; } \
 	  | xargs $(GUIX) gc -R | sort -u > "$$scratch/paths.txt"; \
 	echo ">> bind closure: $$(wc -l < "$$scratch/paths.txt") store items"; \
-	bash tests/rootless.sh "$$scratch" "$$img_drv" "$$img_out" "$$probe_drv" "$$probe_out"; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$tb" || { echo "ERROR: could not build td-builder for the store-DB snapshot" >&2; exit 1; }; \
+	bash tests/rootless.sh "$$scratch" "$$img_drv" "$$img_out" "$$probe_drv" "$$probe_out" "$$tb"; \
 	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"

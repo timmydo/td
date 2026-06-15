@@ -382,12 +382,16 @@ fn main() -> ExitCode {
                     .map(str::to_string)
                     .collect();
                 // Stable ids (= b-tree rowids), assigned ascending: the artifact = 1,
-                // the deriver = 2 (a scaffolding row — a `.drv`, not a closure member,
-                // so DerivationOutputs.drv resolves), then the other closure paths in
-                // file order = 3.. . Every reference is a closure member.
+                // the deriver = 2, then the other closure paths in file order = 3.. .
+                // Every reference is a closure member. The deriver `.drv` is ALWAYS id 2
+                // (so DerivationOutputs.drv resolves); `others` excludes it so it is never
+                // registered twice — the duplicate `ValidPaths` row that occurs when the
+                // deriver IS itself a closure member (e.g. the rootless `img_drv`, which
+                // is in its own `gc -R` set because it is bound into the staged store).
+                let deriver_in_closure = closure.iter().any(|p| p.as_str() == deriver.as_str());
                 let others: Vec<String> = closure
                     .iter()
-                    .filter(|p| p.as_str() != store_path.as_str())
+                    .filter(|p| p.as_str() != store_path.as_str() && p.as_str() != deriver.as_str())
                     .cloned()
                     .collect();
                 let id_of = |p: &str| -> Result<i64, String> {
@@ -433,18 +437,43 @@ fn main() -> ExitCode {
                     ref_rows.push((ref_rowid, vec![Value::Int(1), Value::Int(id_of(r)?)]));
                     ref_rowid += 1;
                 }
-                // id 2: the deriver scaffolding row (path only).
-                valid.push((
-                    2,
-                    vec![
-                        Value::Null,
-                        Value::Text(deriver.to_string()),
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                    ],
-                ));
+                // id 2: the deriver. When it IS a closure member (the rootless case —
+                // `img_drv` is bound into the staged store and the nested daemon reads it
+                // to rebuild it for --check), register it FULLY (real hash/size/refs) so
+                // the daemon accepts it as a valid path. Otherwise a scaffolding row (path
+                // only) that exists solely so DerivationOutputs.drv resolves; the daemon
+                // need not see the `.drv` as a valid built path in that case. Either way
+                // id 2, so DerivationOutputs is unchanged.
+                if deriver_in_closure {
+                    let (d_hash, d_size, d_refs) = scan_path(deriver)?;
+                    valid.push((
+                        2,
+                        vec![
+                            Value::Null,
+                            Value::Text(deriver.to_string()),
+                            Value::Text(d_hash),
+                            Value::Int(1),
+                            Value::Null, // a `.drv` has no deriver of its own
+                            Value::Int(d_size as i64),
+                        ],
+                    ));
+                    for r in &d_refs {
+                        ref_rows.push((ref_rowid, vec![Value::Int(2), Value::Int(id_of(r)?)]));
+                        ref_rowid += 1;
+                    }
+                } else {
+                    valid.push((
+                        2,
+                        vec![
+                            Value::Null,
+                            Value::Text(deriver.to_string()),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                        ],
+                    ));
+                }
                 // ids 3..: the other closure paths, each fully registered (deriver NULL
                 // — per-path derivers are the daemon's input-resolution, a later
                 // increment; the differential is td's computed hash/size/refs).

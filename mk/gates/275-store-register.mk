@@ -64,5 +64,13 @@ store-register:
 	test "$$td_read_refs" = "$$td_refs" || { echo "FAIL: td's reader disagrees with sqlite3 reading the SAME td.db bytes (references)" >&2; exit 1; }; \
 	test "$$td_read_refs" = "$$oracle_refs" || { echo "FAIL: td's reader of its own DB != the daemon's Refs relation" >&2; exit 1; }; \
 	echo "   references: td's reader == sqlite3 == the daemon ($$(echo "$$td_read_refs" | wc -l) edges)"; \
+	echo ">> deriver-in-closure: a DERIVER that is itself a closure member (the rootless img_drv case) is registered ONCE — no duplicate ValidPaths row"; \
+	fakedrv=`sed -n 2p "$$scratch/closure.txt"`; \
+	"$$tb" store-register "$$out" "$$fakedrv" "$$scratch/closure.txt" "$$scratch/td-dic.db"; \
+	test "`sqlite3 "$$scratch/td-dic.db" "PRAGMA integrity_check"`" = "ok" || { echo "FAIL: the deriver-in-closure DB is not valid SQLite" >&2; exit 1; }; \
+	dic_total=`sqlite3 "$$scratch/td-dic.db" "SELECT COUNT(*) FROM ValidPaths"`; \
+	dic_distinct=`sqlite3 "$$scratch/td-dic.db" "SELECT COUNT(DISTINCT path) FROM ValidPaths"`; \
+	test "$$dic_total" = "$$n" -a "$$dic_distinct" = "$$n" || { echo "FAIL: deriver-in-closure produced $$dic_total rows ($$dic_distinct distinct), expected $$n with no duplicate — the closure-member deriver was registered twice" >&2; sqlite3 "$$scratch/td-dic.db" "SELECT path,COUNT(*) c FROM ValidPaths GROUP BY path HAVING c>1" >&2; exit 1; }; \
+	echo "   the closure-member deriver is registered once ($$n rows, no duplicate)"; \
 	rm -rf "$$scratch"; \
 	echo "PASS: td WROTE the store SQLite DB for hello's full $$n-path closure itself in pure Rust AND READ it back itself (td-builder store-query — a pure-Rust SQLite reader, no sqlite3 engine and no daemon in td's own store-query path). sqlite3 PRAGMA integrity_check = ok on td's bytes; and EVERY path's hash + narSize and the full inter-path Refs relation, as answered by TD'S OWN READER, are BYTE-IDENTICAL both to sqlite3 reading the same bytes (parser oracle) and to the daemon's record (content oracle); hello's deriver/drv->output also match the daemon. registrationTime + the non-artifact per-path derivers excluded; the exact daemon schema (indexes/trigger) is a later increment."
