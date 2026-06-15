@@ -238,9 +238,36 @@ path stays correct).
 td now owns addToStore for flat (#38), recursive (#41), AND referenced paths — plus the DB
 authority (#34/#35), read (#36), both halves of GC (#39/#47), and integrity-verify (#43).
 
+## Increment 10 (DONE 2026-06-14): a td store backend for a build output — the capstone
+
+The integrative capstone: a td-owned store that HOLDS and SERVES a real **build output**,
+composing the whole stack with no daemon in any store operation. New `td-builder
+store-add-output OUTPUT DERIVER CLOSURE-FILE STORE-DIR OUT-DB` PLACES the output's tree
+(`copy_canonical`) into a td-owned store at its output path and FULLY REGISTERS it — hash +
+narSize + deriver + the output's references + the `drv->output` mapping (the daemon's
+post-build registration role).
+
+New `store-backend` gate (`mk/gates/310-store-backend.mk`; daemon = oracle, directive 4):
+for hello's output, td places + registers it, then td's OWN tools SERVE it, all matching
+the daemon — (1) the placed tree is NAR-identical to the daemon's built output, (2)
+`store-query info` == the daemon's recorded hash + narSize, (3) `store-query references` ==
+`guix gc --references`, (4) `store-verify` passes by re-hashing td's OWN placed files, and
+(5) the deriver + `drv->output` == the daemon's. Verified-red ×2: R16 (skip the place ⇒ the
+backend doesn't hold the output) and R17 (perturb the registered narSize ⇒ the served record
+diverges).
+
+**td now owns the full store backend** — write/read the DB (#34/#35/#36), add (flat #38 /
+recursive #41 / referenced #48), GC (mark #39 + sweep #47), verify (#43), and back a build
+output end to end (this). The daemon is the oracle throughout, never the authority in a
+store operation. (Note: the gate now registers via the new `mk/gates/*.mk` fragment system,
+not the old shared HEAVY_RUNGS list.)
+
 ## Later increments (sketch — not this PR)
 
-- Eventually a td store backend the system can use, daemon retired for the build side.
+- DIVERGE: with the whole store loop owned (write/read/add/GC/verify/back-a-build), the
+  on-disk format/schema is now td's to evolve — the differential becomes a correctness check
+  on td's chosen format, not a guix-compat constraint (held by the human until the store
+  stack is reconciled).
 - With write+read+add+GC-mark OWNED, deliberately DIVERGE the on-disk store format/schema
   where it buys something (the differential becomes a correctness check on td's chosen
   format, not a guix-compat constraint). Having a daemon accept td's DB is now OPTIONAL,
@@ -388,3 +415,16 @@ increment 9). Perturbed the registration loop to register one fewer reference
 the rung: the path matched but td's registered references (8) ≠ the daemon's 9 ⇒ the
 `test "$td_refs" = "$oracle_refs"` assertion fails ⇒ `store-add-referenced` red. Proves the
 Refs registration is load-bearing, independently of the path. Reverted; rung green again.
+
+**R16 the backend HOLDS the output — store-backend** (2026-06-14, increment 10). Perturbed
+`store-add-output` to skip the place (`copy_canonical`) while scanning the original output so
+registration still succeeds, ran the gate: `STORE-DIR/<base>` was absent ⇒ the
+`test -d "$scratch/store/$base"` assertion fails ("td did not place the output tree") ⇒
+`store-backend` red. Proves the backend genuinely places the build output into its own store.
+Reverted; gate green again.
+
+**R17 the served registration is load-bearing — store-backend** (2026-06-14, increment 10).
+Perturbed the output's registered `narSize` (`size + 1`), ran the gate: td's `store-query
+info` returned narSize 282617 ≠ the daemon's 282616 ⇒ the `test "$td_info" = "$out|$oracle_row"`
+assertion fails ⇒ `store-backend` red. Proves the backend serves the daemon-equal registration
+record, not a vacuous pass. Reverted; gate green again.

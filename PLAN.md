@@ -125,9 +125,12 @@ edits** (track files don't carry it).
   the DB to the live set == `guix gc -R glibc` (host /gnu/store never touched). Inc.9 —
   `td-builder store-add-referenced` does addToStore WITH references: computes the path with
   the refs folded into the type + registers the Refs; for hello's .drv, td reproduces the
-  daemon's path, a byte-identical .drv, and exactly its recorded references. Daemon is the
-  oracle; td operates its OWN store DB, host daemon stays immutable infra)
-  — `plan/td-store-db.md`
+  daemon's path, a byte-identical .drv, and exactly its recorded references. Inc.10 (capstone)
+  — `td-builder store-add-output` PLACES a build output into a td-owned store + fully
+  registers it (hash/deriver/refs/drv→output); the `store-backend` gate shows td's store
+  HOLDS hello's output (NAR-identical) and SERVES it (store-query + store-verify) == the
+  daemon, no daemon in any store op. Daemon is the oracle; td operates its OWN store DB, host
+  daemon stays immutable infra) — `plan/td-store-db.md`
 - [ ] **gates-split** (infra, EXCLUSIVE) — claimed claude-fable-2df2c3 2026-06-14
   (kill the recurring Makefile merge conflict: the single `HEAVY_RUNGS :=` list line +
   shared ordering comment that every gate PR edited become per-gate drop-in fragments

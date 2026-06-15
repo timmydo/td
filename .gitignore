@@ -24,3 +24,4 @@
 
 # CI store image staging (ci/build-ci-image.sh default workdir; ~65G).
 .ci-image-work/
+.store-backend-scratch/
