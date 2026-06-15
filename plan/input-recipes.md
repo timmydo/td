@@ -109,16 +109,71 @@ diverges.
   (e) BUILD + `--check` (verdict-memoized) — the built `out` object is path-identical
       AND NAR-hash-equal to the corpus oracle's.
 
+## Inc.3 — custom build phases (PR #?? — corpus-popt)
+
+The phase frontier: a `phases` field. nano's own inputs patch source files in
+custom `#:phases`, so phases are required to reach them. Key feasibility finding:
+a phases gexp built PROGRAMMATICALLY from structured data is byte-identical to the
+`(modify-phases …)` form the corpus package writes by hand (spike confirmed popt's
+drv `h1n1ndlihs7j2p4kvy0wxq142rmb4v0r` before coding). So phases are DATA in the TS
+surface; `gnu-build-system`/`(guix build utils)` (substitute*/which/modify-phases)
+stay the build-time toolchain (retired LAST), only the phase DATA comes from TS.
+
+Demonstrated byte-identical on **popt** — the cleanest phase package: its ONLY
+non-default argument is one `patch-test` phase (two `substitute*` source patches,
+one literal + one `(which "echo")`, trailing `#t`), nothing else. The minimal
+phase vocabulary this rung lands: `add-{before,after}` an anchor, a `(lambda _ …)`
+body of `substitute*` ops, replacement either a literal string or `{which: PROG}`,
+optional trailing `#t`.
+
+### Pieces
+
+- `tests/ts/td-spec.d.ts` — `Phase`/`Substitution`/`Replacement` types +
+  `Recipe.phases?`.
+- `tests/ts/recipe-popt.ts` — the recipe; `recipe-popt-perturbed.ts` — one wrong
+  source-hash byte (the differential's non-vacuity discriminator).
+- `system/td-recipe.scm` — `recipe-phases`/`phase->gexp`/`substitution->gexp`:
+  lower the phase DATA to the byte-identical `(modify-phases …)` gexp; omitted ⇒ no
+  `#:phases`, so recipes without phases lower unchanged (existing oracles stay green).
+- `tests/ts-recipe-popt-diff.scm` — self-discriminating differential;
+  `tests/ts-recipe-popt-drv.scm` — TD_DRV / ORACLE_DRV / ORACLE_OUT.
+- `mk/gates/315-corpus-popt.mk` — the `corpus-popt` heavy gate.
+
+### Gate `corpus-popt` proves
+
+  (a) CONVERGE — popt (with the phase) lowers to the corpus oracle drv;
+  (b) DISCRIMINATE-src — a perturbed source diverges (not vacuous);
+  (c) phases LOAD-BEARING — stripping `phases` diverges;
+  (d) BUILD + `--check` (verdict-memoized) — the built object is path-identical AND
+      NAR-hash-equal to the corpus popt
+      (`13kvphyxjy7mz3i7lrzyqixi16sa3rc057mbl97kjncf9jm8lx54`).
+
 ## Next increments (the rest of the frontier)
 
-- nano's DIRECT inputs — **ncurses** and **gettext-minimal** — are the remaining
-  heavy ones: each adds `makeFlags` and multiple `#:phases` (file-patching;
-  ncurses also fetches a rollup-patch source) on top of the `doc` output (now
-  supported). Reconstructing them store-path-equal needs the DSL + bridge to express
-  `makeFlags` and (faithfully) phases — the largest follow-on. configureFlags +
-  multi-URI (Inc.1) and multi-output (Inc.2) are the bricks done so far.
+- nano's DIRECT inputs — **ncurses** and **gettext-minimal** — need a RICHER phase
+  vocabulary than popt's minimal substitute*/which set:
+  - gettext-minimal: `makeFlags` (literal `"VERBOSE=yes"`), the `doc` output (done),
+    and TWO phases — `patch-fixed-paths` (pure-literal substitute*, already
+    expressible) and `patch-tests` (a `lambda*` taking `inputs`, `with-fluids`,
+    `find-files` with a regexp, `cons`) — the second needs new phase-body
+    vocabulary (input-keyword lambda, find-files, with-fluids).
+  - ncurses: a custom `configure` replacement, a `post-install` phase, and an
+    `apply-rollup-patch` phase that FETCHES an extra fixed-output source
+    (invisible-mirror.net) — needs phase-level source inputs + invoke.
+  Each is its own follow-on rung; the bricks done so far (configureFlags + multi-URI,
+  multi-output, minimal-phase) are the foundation.
 - Eventually: regenerate the input lock from td's OWN reconstructed recipes (not
   `specification->package`), package-by-package, toolchain LAST.
+
+## Verified-red log (Inc.3, phases — corpus-popt)
+
+- **R4 phases load-bearing** — make `recipe-phases` return `#f` always (ignore the
+  declared phase). The candidate popt drv then lacks `#:phases` ⇒ diverges from the
+  corpus oracle `h1n1ndlihs7j2p4kvy0wxq142rmb4v0r…`; the differential reds at leg (a)
+  CONVERGE (exit 1, "does NOT reproduce the corpus oracle's derivation"). Proves the
+  phase DATA is load-bearing and the generated modify-phases gexp is exactly what
+  makes popt converge. Restored; gate green (`./check.sh corpus-popt`,
+  NAR-hash-equal `13kvphyxjy7mz3i7lrzyqixi16sa3rc057mbl97kjncf9jm8lx54`).
 
 ## Verified-red log
 

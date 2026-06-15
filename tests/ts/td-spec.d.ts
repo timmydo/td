@@ -67,17 +67,45 @@ interface Source {
  *  outside this union is a compile-time error — like `RootFsType`. v0 is `"gnu"`. */
 declare type BuildSystem = "gnu";
 
+/** A `substitute*` replacement: a literal string, or `{ which: PROG }` — the
+ *  `(which PROG)` that resolves a program on PATH at build time (a common patch
+ *  idiom, e.g. replacing `/bin/echo` with the build environment's `echo`). */
+type Replacement = string | { readonly which: string };
+
+/** One `substitute*` on a source file: replace text matching `from` (a regexp,
+ *  exactly as the corpus phase writes it) with `to`. */
+interface Substitution {
+  readonly file: string;
+  readonly from: string;
+  readonly to: Replacement;
+}
+
+/** A custom build phase, added relative to a `%standard-phases` anchor. The body
+ *  is a list of `substitute*` source patches (the dominant patch idiom in corpus
+ *  recipes). `returnTrue` appends a trailing `#t` to the phase body, matching
+ *  packages whose phase ends in `#t`. The bridge lowers this DATA to the same
+ *  `(modify-phases %standard-phases (add-{before,after} 'anchor 'name (lambda _
+ *  …)))` gexp the corpus package writes by hand — so a recipe that declares a
+ *  package's real phase converges on it. */
+interface Phase {
+  readonly position: "before" | "after";
+  readonly anchor: string;
+  readonly name: string;
+  readonly substitutions: readonly Substitution[];
+  readonly returnTrue?: boolean;
+}
+
 /** A package recipe — the coordinates that determine the build derivation: name,
- *  version, the upstream source, the build system, any configure flags, and the
- *  names of any build inputs (dependencies). An input is named by its corpus
- *  package name; the Guile bridge RESOLVES it from the corpus (input resolution
- *  stays Guix's, retired LAST — DESIGN §5). `configureFlags` are the build
- *  system's `#:configure-flags` (they enter the build derivation, so declare them
- *  exactly as the corpus package does). `outputs` are the package's outputs —
- *  declare extra outputs (`"debug"`, `"static"`, `"doc"`) exactly as the corpus
- *  package splits them, since an extra output enters the derivation. Omit
- *  `inputs`/`configureFlags`/`outputs` for a leaf package with default arguments
- *  and a single `"out"` (e.g. hello). */
+ *  version, the upstream source, the build system, any configure flags, any extra
+ *  outputs, any custom build phases, and the names of any build inputs
+ *  (dependencies). An input is named by its corpus package name; the Guile bridge
+ *  RESOLVES it from the corpus (input resolution stays Guix's, retired LAST —
+ *  DESIGN §5). `configureFlags` are the build system's `#:configure-flags`;
+ *  `outputs` are the package's outputs (declare extra `"debug"`/`"static"`/`"doc"`
+ *  exactly as the corpus splits them); `phases` are custom build phases. Each
+ *  enters the build derivation, so declare them exactly as the corpus package
+ *  does. Omit them all for a leaf package with default arguments and a single
+ *  `"out"` (e.g. hello). */
 interface Recipe {
   readonly name: string;
   readonly version: string;
@@ -86,6 +114,7 @@ interface Recipe {
   readonly inputs?: readonly string[];
   readonly configureFlags?: readonly string[];
   readonly outputs?: readonly string[];
+  readonly phases?: readonly Phase[];
 }
 
 /** Declare an upstream source by URL (or mirror-URL list) + content hash (does
