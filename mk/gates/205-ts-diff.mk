@@ -10,7 +10,8 @@
 # image build) but coupled to the td-ts-eval Rust binary, so it slots in the
 # heavy pool next to ts-eval.
 HEAVY_GATES += ts-diff
-FAST_GATES += ts-diff
+# Not FAST_GATES: needs the boa (td-ts-eval) Rust closure — too heavy for the
+# fast CI tier (absent from the small td-ci-fast image). Full check / ./check.sh.
 ts-diff:
 	@echo ">> ts-diff: TS v0 spec lowers (tsc->boa->config) to the oracle's system drv; a perturbed spec diverges (ts-frontend acceptance #1/#2)"
 	@set -euo pipefail; \

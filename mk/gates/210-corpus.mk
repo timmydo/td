@@ -15,7 +15,8 @@
 # Heavy (TS toolchain + a warm hello compile + a --check), so it slots in the heavy
 # pool next to the other ts gates; RE-MEASURE and RE-SORT once it has run.
 HEAVY_GATES += corpus
-FAST_GATES += corpus
+# Not FAST_GATES: TS toolchain + a hello compile + --check — too heavy for the
+# fast CI tier (absent from the small td-ci-fast image). Full check / ./check.sh.
 corpus:
 	@echo ">> corpus: a TypeScript-authored recipe lowers (tsc->boa->bridge) to the corpus oracle's hello; build + --check NAR-hash-equal (corpus-independence Phase 2)"
 	@set -euo pipefail; \

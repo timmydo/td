@@ -17,7 +17,8 @@
 # Heavy (TS front-end + a hello compile + a --check + the oracle build), so it
 # slots in the heavy pool next to `corpus`; RE-MEASURE and RE-SORT once it has run.
 HEAVY_GATES += td-build
-FAST_GATES += td-build
+# Not FAST_GATES: td-builder Rust build + a hello compile + --check — too heavy
+# for the fast CI tier (absent from the small td-ci-fast image). Full check.
 td-build:
 	@echo ">> td-build: a TS recipe built by td's OWN Rust builder (no gnu-build-system) is reproducible and behaves identically to the corpus hello (corpus-independence)"
 	@set -euo pipefail; \

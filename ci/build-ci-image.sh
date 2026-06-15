@@ -38,6 +38,19 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+# --- Tier select (additive; default = the FULL ladder, unchanged). TD_TIER=fast
+# snapshots only the small fast-tier closure (Makefile `check-fast`: cheap gates
+# + ts), enumerated by ci/lower-fast-drvs.sh, pushed to the td-ci-fast repo.
+# The fast image (~4G) backs ci.yml's check-fast gate; the full image (td-ci) is
+# the local ./check.sh's warm store. Cold CI cannot rebuild the full closure
+# (substitute gaps + source rot), so both images are dev-box-built for now.
+tier=${TD_TIER:-full}
+case "$tier" in
+  full) enum="ci/lower-check-drvs.sh"; repo="td-ci";      min_kb=68157440 ;;  # ~65G
+  fast) enum="ci/lower-fast-drvs.sh";  repo="td-ci-fast"; min_kb=12582912 ;;  # ~12G
+  *) echo "FATAL: TD_TIER must be full or fast (got: $tier)" >&2; exit 1 ;;
+esac
+
 # --- Same integrity guard as check.sh: the snapshot is only honest if this
 # host's guix IS the pin (otherwise we would snapshot some other channel's
 # closure and the runner's pin guard would reject it anyway).
@@ -57,15 +70,15 @@ rm -rf "$oci" "$work/stage"
 mkdir -p "$oci/blobs/sha256" "$work/stage"
 
 free_kb=$(df -Pk "$work" | awk 'NR==2 {print $4}')
-if [ "$free_kb" -lt 68157440 ]; then
-  echo "FATAL: $work has <65G free; staging peaks near ~41G of chunks + ~21G of compressed blobs" >&2
+if [ "$free_kb" -lt "$min_kb" ]; then
+  echo "FATAL: $work has < $((min_kb / 1048576))G free (tier=$tier)" >&2
   exit 1
 fi
 
-echo ">> enumerate: every derivation the rung ladder realises"
+echo ">> enumerate: every derivation the $tier tier realises ($enum)"
 # No pipeline: piping into sort would swallow the enumerator's exit status
-# and defeat its KNOWN_RUNGS fail-loudly guard.
-sh ci/lower-check-drvs.sh > "$work/check-drvs.raw"
+# and defeat its fail-loudly guards.
+sh "$enum" > "$work/check-drvs.raw"
 sort -u "$work/check-drvs.raw" > "$work/check-drvs.txt"
 echo "   $(wc -l < "$work/check-drvs.txt") top-level derivations"
 
@@ -187,16 +200,16 @@ rm -rf "$work/stage"
 echo "   OCI layout: $oci ($(du -sh "$oci" | cut -f1))"
 
 if [ "${PUSH:-0}" = "1" ]; then
-  echo ">> push: ghcr.io/timmydo-bot/td-ci:{$pinned,latest}"
+  echo ">> push: ghcr.io/timmydo-bot/$repo:{$pinned,latest}"
   skopeo=$(guix build skopeo)/bin/skopeo
   token=$(gh auth token)
   for tag in "$pinned" latest; do
     "$skopeo" copy --insecure-policy \
       --dest-creds "timmydo-bot:$token" \
-      "oci:$oci:$pinned" "docker://ghcr.io/timmydo-bot/td-ci:$tag"
+      "oci:$oci:$pinned" "docker://ghcr.io/timmydo-bot/$repo:$tag"
   done
   echo "   pushed; make the package PUBLIC once (GHCR UI or API) so the"
   echo "   workflow can pull it anonymously"
 else
-  echo "   not pushing (set PUSH=1 to push to ghcr.io/timmydo-bot/td-ci)"
+  echo "   not pushing (set PUSH=1 to push to ghcr.io/timmydo-bot/$repo)"
 fi
