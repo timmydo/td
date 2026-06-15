@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # rootless rung driver (see the Makefile's `rootless` rung for the contract).
 #
-# Outer phase (no args beyond the four paths): runs inside the check.sh
-# sandbox (td's own host-sandbox). Snapshots the host store DB by COPYING it (+
-# its WAL) into writable scratch and folding the WAL there — race-free because
-# the rung runs LAST and ALONE (the daemon is idle); a live `.backup` cannot
-# read the root-owned WAL DB as the non-root client (R8). Then re-enters itself
-# under `unshare -m -U -r` for the inner phase.
+# Outer phase (scratch + the four paths + td-builder): runs inside the check.sh
+# sandbox (td's own host-sandbox). CONSTRUCTS the snapshot store DB from the
+# static closure (paths.txt) with `td-builder store-register` — scanning each
+# path's content for its NAR hash + refs, never reading the live /var/guix/db —
+# so it is race-free even against a second concurrent check (DESIGN §7.3). The
+# two daemon-coordinated fixes are blocked for a non-root client (big-lock is
+# 0600 root; a live `.backup` cannot write the root-owned WAL -shm, R8); building
+# from the closure sidesteps both (plan/rootless-snapshot-race.md). Then re-enters
+# itself under `unshare -m -U -r` for the inner phase.
 #
 # Inner phase (--inner): builds a writable view of the store at the SAME path
 # (/gnu/store — required for store-path equality), starts the pinned
