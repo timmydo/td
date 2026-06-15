@@ -99,14 +99,30 @@
 ;; `(guix build utils)` (substitute*/which/modify-phases) stay the build-time
 ;; toolchain (retired LAST, §5); only the phase DATA comes from the TS surface.
 ;;
-;; A substitution's replacement is either a literal string or `{which: PROG}`
-;; (the `(which PROG)` that resolves a program on PATH at build time — a common
-;; patch idiom). `returnTrue` appends a trailing `#t` to the phase body, matching
-;; packages whose phase ends in `#t`.
+;; A substitution's replacement is one of:
+;;   • a literal string;
+;;   • `{which: PROG}` → `(which PROG)` (resolve a program on PATH at build time);
+;;   • `{stringAppend: [PART …]}` → `(string-append PART …)`, where a PART is a
+;;     literal string, `{output: NAME}` → `(assoc-ref outputs NAME)`, or
+;;     `{input: NAME}` → `(assoc-ref inputs NAME)`. This is how a phase bakes a
+;;     build-time store path (an output dir, an input's path) into a patched file —
+;;     the dominant non-literal patch idiom.
+;; `returnTrue` appends a trailing `#t` to the phase body (some packages' phases
+;; end in `#t`).
+(define (ref-part->gexp part)
+  (cond
+   ((string? part) part)
+   ((and (pair? part) (assoc "output" part)) #~(assoc-ref outputs #$(assoc-ref part "output")))
+   ((and (pair? part) (assoc "input" part))  #~(assoc-ref inputs  #$(assoc-ref part "input")))
+   (else (error "td-recipe: unsupported string-append part" part))))
+
 (define (subst-replacement->gexp to)
   (cond
    ((string? to) to)
    ((and (pair? to) (assoc "which" to)) #~(which #$(assoc-ref to "which")))
+   ((and (pair? to) (assoc "stringAppend" to))
+    (let ((parts (map ref-part->gexp (vector->list (assoc-ref to "stringAppend")))))
+      #~(string-append #$@parts)))
    (else (error "td-recipe: unsupported substitution replacement" to))))
 
 (define (substitution->gexp s)
@@ -115,14 +131,25 @@
         (to   (subst-replacement->gexp (field s "to"))))
     #~(substitute* #$file ((#$from) #$to))))
 
+;; The phase's procedure. With no declared `lambdaArgs` it is a nullary
+;; `(lambda _ …)`; with `lambdaArgs` (e.g. ["outputs"]) it is a keyword lambda
+;; `(lambda* (#:key outputs #:allow-other-keys) …)` — needed when the body
+;; references the build's outputs/inputs (via a `{output}`/`{input}` part).
+(define (phase-lambda p body)
+  (let ((args (map string->symbol (vector->list (field/default p "lambdaArgs" #())))))
+    (if (null? args)
+        #~(lambda _ #$@body)
+        #~(lambda* (#:key #$@args #:allow-other-keys) #$@body))))
+
 (define (phase->gexp p)
   (let* ((pos    (field p "position"))
          (anchor (string->symbol (field p "anchor")))
          (name   (string->symbol (field p "name")))
          (subs   (map substitution->gexp (vector->list (field p "substitutions"))))
-         (lam    (if (eq? (field/default p "returnTrue" #f) #t)
-                     #~(lambda _ #$@subs #t)
-                     #~(lambda _ #$@subs))))
+         (body   (if (eq? (field/default p "returnTrue" #f) #t)
+                     (append subs (list #t))
+                     subs))
+         (lam    (phase-lambda p body)))
     (cond
      ((string=? pos "before") #~(add-before (quote #$anchor) (quote #$name) #$lam))
      ((string=? pos "after")  #~(add-after  (quote #$anchor) (quote #$name) #$lam))
@@ -137,9 +164,13 @@
 
 (define (recipe-arguments alist)
   (let ((flags  (vector->list (field/default alist "configureFlags" #())))
-        (phases (recipe-phases alist)))
+        (phases (recipe-phases alist))
+        (tests  (field/default alist "tests" #t)))   ;default #t (gnu-build-system default)
+    ;; Argument ORDER does not affect the lowered derivation (gnu-build-system
+    ;; normalizes it — verified), so a fixed assembly order is safe across packages.
     (append
      (if (null? flags) '() (list #:configure-flags #~(quote #$flags)))
+     (if (eq? tests #f) (list #:tests? #f) '())
      (if phases (list #:phases phases) '()))))
 
 ;; A recipe's declared package OUTPUTS (a JSON array of names; guile-json yields a
@@ -158,10 +189,10 @@
   "Reconstruct a Guix package from a TS-authored recipe emitted as JSON by the boa
 evaluator.  Only the build-derivation-determining coordinates come from the
 recipe (name, version, source uri+sha256 — a single URL or a mirror LIST, build
-system, any #:configure-flags, any extra outputs, any custom #:phases, and the
-names of any build inputs); the human-readable metadata is placeholder (it does
-not enter the derivation), so the reconstructed package converges on the corpus
-oracle's build by construction."
+system, any #:configure-flags, any extra outputs, whether tests run (#:tests?),
+any custom #:phases, and the names of any build inputs); the human-readable
+metadata is placeholder (it does not enter the derivation), so the reconstructed
+package converges on the corpus oracle's build by construction."
   (let* ((a      (json-string->scm json-string))
          (name   (field a "name"))
          (version (field a "version"))
