@@ -42,6 +42,7 @@ corpus-libatomic:
 	oracle_out=`printf '%s\n' "$$vars" | sed -n 's/^ORACLE_OUT=//p'`; \
 	test -n "$$td_drv" -a -n "$$oracle_drv" -a -n "$$td_out" -a -n "$$oracle_out" \
 	  || { echo "ERROR: could not lower the recipe derivations" >&2; exit 1; }; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] TS recipe drv == corpus oracle drv"; \
 	echo ">> TS recipe drv     : $$td_drv"; \
 	echo ">> corpus oracle drv : $$oracle_drv"; \
 	test "$$td_drv" = "$$oracle_drv" \
@@ -50,15 +51,19 @@ corpus-libatomic:
 	$(GUIX) build "$$td_drv" >/dev/null || { echo "ERROR: building the recipe failed" >&2; exit 1; }; \
 	test -d "$$td_out" || { echo "ERROR: the out output $$td_out was not realized" >&2; exit 1; }; \
 	echo ">> the recipe's out output : $$td_out"; \
+	echo ">> [DURABLE: structural] the built out has the library + header it exists to ship — no Guix oracle involved"; \
+	test -f "$$td_out/lib/libatomic_ops.a" -a -f "$$td_out/include/atomic_ops.h" \
+	  || { echo "FAIL: the built libatomic-ops out is missing lib/libatomic_ops.a or include/atomic_ops.h — the artifact has the wrong shape." >&2; exit 1; }; \
+	echo "   lib/libatomic_ops.a + include/atomic_ops.h present"; \
+	echo ">> [DURABLE: reproducibility] guix build --check (verdict-memoized; the standing durable replacement is td-check, plan/input-recipes.md)"; \
+	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] the built out == the corpus oracle's out (path + NAR)"; \
 	test "$$td_out" = "$$oracle_out" \
 	  || { echo "FAIL: the recipe's out output $$td_out != the corpus oracle out $$oracle_out — not the same store object." >&2; exit 1; }; \
-	echo ">> check: reproducibility (verdict-memoized)"; \
-	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
-	echo ">> NAR-hash-equal (§6 metric) on the out output"; \
 	nar_td=`$(GUIX) hash -S nar "$$td_out"`; \
 	nar_or=`$(GUIX) hash -S nar "$$oracle_out"`; \
 	echo "   TS recipe NAR     : $$nar_td"; \
 	echo "   corpus oracle NAR : $$nar_or"; \
 	test -n "$$nar_td" -a "$$nar_td" = "$$nar_or" \
 	  || { echo "FAIL: TS recipe NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
-	echo "PASS: a TypeScript-authored MULTI-OUTPUT recipe (libatomic-ops, out + debug) builds reproducibly to the corpus oracle's exact store object (NAR-hash-equal); the extra output is load-bearing."
+	echo "PASS: the built libatomic-ops out ships lib/libatomic_ops.a + include/atomic_ops.h (durable structural merit) and is reproducible; the extra output is load-bearing; and (migration oracle) it is byte-identical to the corpus libatomic-ops."

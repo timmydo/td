@@ -43,6 +43,7 @@ corpus-popt:
 	oracle_out=`printf '%s\n' "$$vars" | sed -n 's/^ORACLE_OUT=//p'`; \
 	test -n "$$td_drv" -a -n "$$oracle_drv" -a -n "$$oracle_out" \
 	  || { echo "ERROR: could not lower the recipe derivations" >&2; exit 1; }; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] TS recipe drv == corpus oracle drv"; \
 	echo ">> TS recipe drv     : $$td_drv"; \
 	echo ">> corpus oracle drv : $$oracle_drv"; \
 	test "$$td_drv" = "$$oracle_drv" \
@@ -50,15 +51,19 @@ corpus-popt:
 	echo ">> build the bridged recipe"; \
 	out=`$(GUIX) build "$$td_drv"`; \
 	test -n "$$out" -a -d "$$out/lib" || { echo "ERROR: building the recipe produced no lib output" >&2; exit 1; }; \
-	echo ">> check: reproducibility (verdict-memoized)"; \
+	echo ">> [DURABLE: structural] the built out ships the shared library + header popt exists to provide — no Guix oracle involved"; \
+	test -f "$$out/lib/libpopt.so" -a -f "$$out/include/popt.h" \
+	  || { echo "FAIL: the built popt out is missing lib/libpopt.so or include/popt.h — the artifact has the wrong shape." >&2; exit 1; }; \
+	echo "   lib/libpopt.so + include/popt.h present"; \
+	echo ">> [DURABLE: reproducibility] guix build --check (verdict-memoized; the standing durable replacement is td-check, plan/input-recipes.md)"; \
 	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] the built out == the corpus oracle's out (path + NAR)"; \
 	test "$$out" = "$$oracle_out" \
 	  || { echo "FAIL: built $$out but the corpus oracle is $$oracle_out — not the same store object." >&2; exit 1; }; \
-	echo ">> NAR-hash-equal (§6 metric)"; \
 	nar_td=`$(GUIX) hash -S nar "$$out"`; \
 	nar_or=`$(GUIX) hash -S nar "$$oracle_out"`; \
 	echo "   TS recipe NAR     : $$nar_td"; \
 	echo "   corpus oracle NAR : $$nar_or"; \
 	test -n "$$nar_td" -a "$$nar_td" = "$$nar_or" \
 	  || { echo "FAIL: TS recipe NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
-	echo "PASS: a TypeScript-authored recipe with a custom build phase (popt) builds reproducibly to the corpus oracle's exact store object (NAR-hash-equal); the phase DATA lowered to the byte-identical modify-phases gexp and is load-bearing."
+	echo "PASS: the built popt ships lib/libpopt.so + include/popt.h (durable structural merit) and is reproducible; the phase DATA lowered to the byte-identical modify-phases gexp and is load-bearing; and (migration oracle) it is byte-identical to the corpus popt."

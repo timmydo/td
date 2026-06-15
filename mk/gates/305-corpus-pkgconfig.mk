@@ -41,6 +41,7 @@ corpus-pkgconfig:
 	oracle_out=`printf '%s\n' "$$vars" | sed -n 's/^ORACLE_OUT=//p'`; \
 	test -n "$$td_drv" -a -n "$$oracle_drv" -a -n "$$oracle_out" \
 	  || { echo "ERROR: could not lower the recipe derivations" >&2; exit 1; }; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] TS recipe drv == corpus oracle drv"; \
 	echo ">> TS recipe drv     : $$td_drv"; \
 	echo ">> corpus oracle drv : $$oracle_drv"; \
 	test "$$td_drv" = "$$oracle_drv" \
@@ -48,15 +49,20 @@ corpus-pkgconfig:
 	echo ">> build the bridged recipe"; \
 	out=`$(GUIX) build "$$td_drv"`; \
 	test -n "$$out" -a -x "$$out/bin/pkg-config" || { echo "ERROR: building the recipe produced no bin/pkg-config" >&2; exit 1; }; \
-	echo ">> check: reproducibility (verdict-memoized)"; \
+	echo ">> [DURABLE: behavioral] the built pkg-config runs and reports its version — no Guix oracle involved"; \
+	ver=`"$$out/bin/pkg-config" --version`; \
+	test "$$ver" = "0.29.2" \
+	  || { echo "FAIL: the built pkg-config --version reported '$$ver', expected 0.29.2 — the artifact does not function." >&2; exit 1; }; \
+	echo "   pkg-config --version -> $$ver"; \
+	echo ">> [DURABLE: reproducibility] guix build --check (verdict-memoized; the standing durable replacement is td-check, plan/input-recipes.md)"; \
 	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] the built out == the corpus oracle's out (path + NAR)"; \
 	test "$$out" = "$$oracle_out" \
 	  || { echo "FAIL: built $$out but the corpus oracle is $$oracle_out — not the same store object." >&2; exit 1; }; \
-	echo ">> NAR-hash-equal (§6 metric)"; \
 	nar_td=`$(GUIX) hash -S nar "$$out"`; \
 	nar_or=`$(GUIX) hash -S nar "$$oracle_out"`; \
 	echo "   TS recipe NAR     : $$nar_td"; \
 	echo "   corpus oracle NAR : $$nar_or"; \
 	test -n "$$nar_td" -a "$$nar_td" = "$$nar_or" \
 	  || { echo "FAIL: TS recipe NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
-	echo "PASS: a TypeScript-authored recipe for an INPUT package (pkg-config, configure-flags + multi-URI) builds reproducibly to the corpus oracle's exact store object (NAR-hash-equal); the configure flags and the multi-URI source are load-bearing."
+	echo "PASS: the built pkg-config runs (--version 0.29.2, durable behavioral merit) and is reproducible; configure flags + multi-URI source are load-bearing; and (migration oracle) it is byte-identical to the corpus pkg-config."

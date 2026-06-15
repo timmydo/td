@@ -7,6 +7,39 @@ corpus-independence endgame, package-by-package").
 Claim: claude-fable-2715d4, 2026-06-14.
 Single writer: the claiming agent.
 
+## Differential + durable test legs (convention, 2026-06-15)
+
+Human concern (2026-06-15): the recipe gates validate Guix *compatibility*
+(byte-identity), so when Guix is retired they'd need rewriting, not deletion.
+Resolution — codified in CLAUDE.md "Differential + durable discipline": every
+reconstruction gate must carry at least one DURABLE assertion (one that holds with
+no Guix oracle), and the Guix byte-identity/NAR legs are the removable "migration
+oracle." Applied to the four recipe gates here:
+
+- `corpus-pkgconfig` — DURABLE behavioral: built `pkg-config --version` → `0.29.2`.
+- `corpus-libatomic` — DURABLE structural: out ships `lib/libatomic_ops.a` +
+  `include/atomic_ops.h`.
+- `corpus-popt` — DURABLE structural: out ships `lib/libpopt.so` + `include/popt.h`.
+- `corpus-gzip` — DURABLE behavioral: built gzip `compress | decompress` round-trip.
+- All four: the drv-equal + NAR-equal legs are now labeled `[MIGRATION ORACLE —
+  removable when Guix is retired]`; the self-discrimination legs were already durable.
+
+Verified-red (durable legs): broke `corpus-gzip`'s behavioral expectation (expect a
+value the round-trip won't produce) ⇒ the gate reds at the `[DURABLE: behavioral]`
+leg ("the built gzip did not round-trip … the artifact does not function", exit 2),
+with NO Guix oracle involved — proving the durable leg is a real, non-vacuous check
+of the artifact. Restored. (The structural `test -f` legs are non-vacuous by
+construction.)
+
+**Next durable step (not done here):** make the recipe gates assert reproducibility
+on td's OWN terms via `td-builder check` (double-build) instead of `guix build
+--check`. The `td-check` gate already proves td owns this oracle for the `td-build`
+subject (builder = `td-builder`); rolling it onto these gates needs td's executor to
+run `gnu-build-system` (guile-builder) drvs — staging the drv's full build closure +
+validating guile builds in td's sandbox. That is its own increment; until then the
+reproducibility leg is `guix build --check` (the property is intrinsic; the
+mechanism is the removable oracle).
+
 ## Where we are
 
 `input-resolution` (DONE, PRs #44/#45) moved the CONSUMPTION of input resolution

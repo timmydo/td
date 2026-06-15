@@ -90,6 +90,31 @@ trusting the pass; record the verified-red evidence in your track file. (This
 discipline caught a three-defect false-green that survived M1–M3 — full story in
 `HISTORY.md`.)
 
+## Differential + durable discipline
+
+The migration is proven by differentials against Guix (directive 4: build it both
+ways, diff the store paths — Guix is the oracle). But a differential is *migration
+scaffolding*: the day Guix is retired it cannot run and stops meaning anything. A
+gate that asserts ONLY "td == Guix, byte-identical" leaves nothing behind — it would
+have to be rewritten, not deleted, when the oracle goes. So:
+
+- **Every reconstruction/replacement gate must carry at least one DURABLE assertion**
+  — one that still holds with no Guix oracle in the room. Durable assertions are:
+  *behavioral* (the artifact actually does its job — the tool runs, the system
+  boots, a round-trip succeeds), *intrinsic-reproducibility* (`td-builder check`'s
+  own double-build, not `guix build --check`), *structural self-consistency* (the
+  output has the expected shape; td writes a store path and reads it back; the
+  closure is complete), and the *self-discrimination* legs (a perturbation diverges;
+  the input is load-bearing).
+- **The Guix byte-identity / NAR-equality legs are the removable "migration
+  oracle."** Label them as such in the gate so that retiring Guix is a *deletion of
+  those lines*, not a test rewrite. Keep them (directive 4 / "own, then diverge" —
+  they are a guardrail, not the whole point), but never let them be a gate's only merit.
+- A gate that is *purely* a Guix differential is a smell to fix, not a finished gate.
+
+This is the test-design corollary of "own, then diverge": once td owns a capability,
+the differential guards it; the durable assertions are what we actually keep.
+
 ## Definition of done (every task)
 
 A task is done only when ALL hold:
