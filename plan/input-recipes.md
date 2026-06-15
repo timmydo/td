@@ -82,6 +82,24 @@ the only diff from a naive reconstruction was the builder's `(quote …)` wrappe
 
 ## Verified-red log
 
-(green committed first per the "commit before red variants" gotcha; restored after.)
+(green committed first — commit `0b1189b` — per the "commit before red variants"
+gotcha; each red was a one-line bridge edit, then `git checkout system/td-recipe.scm`.)
 
-- (to fill in once the gate is green)
+- **R1 configureFlags load-bearing** — make `recipe-arguments` DROP the declared
+  flags (return `'()` always). The candidate pkg-config drv falls back to the
+  no-flags drv `1825487dg29vxghjzs9m0z9r39hlckn3-pkg-config-0.29.2.drv` ≠ the corpus
+  oracle `dgzxhfbbj4lc5kfd8wz8jq2ng1j7q05z…`; the `corpus-pkgconfig` gate reds at leg
+  (a) CONVERGE (`./check.sh corpus-pkgconfig` exit 2; differential exit 1, "does NOT
+  reproduce the corpus oracle's derivation"). Proves the convergence is real and the
+  `#~(quote #$flags)` reconstruction is exactly what makes pkg-config converge — not
+  vacuous.
+- **R2 multi-URI load-bearing** — make `recipe-uri` collapse the declared URL LIST to
+  its first element (`vector-ref u 0`). The source derivation changes, so the
+  candidate drv becomes `1an130fvw33dvmmaw7b2jilrh9q6y0bk-pkg-config-0.29.2.drv` ≠ the
+  oracle; the differential reds at leg (a) CONVERGE (exit 1). Proves the bridge
+  genuinely honours the declared mirror-list shape (a single URL would diverge).
+
+Both restored; tree clean; gate green again (`./check.sh corpus-pkgconfig`,
+NAR-hash-equal to the corpus oracle `127q8jdmd6afiz866ab3wga46dlw65n6r76cm28gikwid544f6g0`).
+The in-gate discriminator legs (perturbed flag, flags-stripped, single-URI) keep this
+self-discriminating every loop.
