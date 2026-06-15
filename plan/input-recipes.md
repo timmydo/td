@@ -45,6 +45,11 @@ Rollout to corpus-pkgconfig/libatomic/popt is the same pattern (each adds ~2
 sandbox builds — un-memoized, the loop-latency cost; weigh per gate). The closure
 staging (`input-output-paths` → `guix gc -R`) is the reusable piece.
 
+Verified-red (R6, td-check leg): stage an EMPTY build closure ⇒ `td-builder check`
+cannot build the drv ⇒ the `[DURABLE: reproducibility]` leg reds ("td-builder check
+reported NON-reproducible (or errored)", exit 2). Proves the leg genuinely runs td's
+double-build against the staged closure — not a no-op. Restored; gate green.
+
 ## Where we are
 
 `input-resolution` (DONE, PRs #44/#45) moved the CONSUMPTION of input resolution
