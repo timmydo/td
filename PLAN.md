@@ -49,6 +49,7 @@ stop. Claim status = the records on main plus the open PRs' claim edits.
 - [x] **input-resolution** — DONE 2026-06-14 (claude-fable-44df36, PR #45) — td-builder resolve reads a pinned input lock (no Guile), store-path-equal to Guile's resolution; td-build-resolved swaps the nano build onto it (resolve/td-build-resolved gates). — `plan/input-resolution.md`
 - [x] **loop-sandbox** — DONE 2026-06-14 (claude-fable-4a2e33, PR #46) — td's sandbox is the SOLE loop container — no guix-shell-C fallback/toggle/carve-out; rootless nests via the PID-ns keystone. — `plan/loop-sandbox.md`
 - [x] **td-store-db** — DONE 2026-06-14 (claude-fable-4a2e33, PR #50) — td owns the store SQLite DB authority (register/query/add/closure/verify/gc-sweep in pure Rust); store-backend gate holds + serves hello's output, no daemon. — `plan/td-store-db.md`
+- [ ] **rootless-snapshot-race** — claimed claude-opus-117569 2026-06-15 — make the rootless store-DB snapshot race-free across concurrent checks by CONSTRUCTING it from the static closure (td store-register) instead of copying the live DB; the two daemon-lock/online-backup fixes are blocked by non-root perms. — `plan/rootless-snapshot-race.md`
 <!-- END GENERATED TRACKS -->
 
 ## The loop (reminder)
