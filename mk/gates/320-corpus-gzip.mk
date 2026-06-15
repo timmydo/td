@@ -10,11 +10,15 @@
 #   (1) differential (tests/ts-recipe-gzip-diff.scm) — gzip CONVERGES on the corpus
 #       oracle drv; a perturbed source DIVERGES; the declared phase is LOAD-BEARING
 #       (stripping `phases` diverges). Build-free, self-discriminating;
-#   (2) build + --check (prime directive 1) — build the bridged recipe, --check it
-#       reproducible (verdict-memoized — tests/check-memo.sh), assert the built
-#       store object is path-identical AND NAR-hash-equal to the corpus oracle's.
-# Heavy (TS toolchain + a gzip build + a --check), so it slots in the heavy pool
-# next to corpus-popt; RE-MEASURE and RE-SORT once it has run.
+#   (2) build + DURABLE legs (no Guix oracle): the built gzip round-trips a file
+#       (behavioral), AND it is reproducible by td's OWN double-build (`td-builder
+#       check` builds the .drv twice in independent userns sandboxes — prime
+#       directive 1 on td's terms, no `guix build --check` in that verdict);
+#   (3) MIGRATION ORACLE (removable when Guix is retired): the drv + out are
+#       byte-identical (path + NAR) to the corpus gzip, and `guix build --check`
+#       agrees the .drv is reproducible.
+# Heavy (TS toolchain + a gzip build + td's double-build), so it slots in the heavy
+# pool next to corpus-popt; RE-MEASURE and RE-SORT once it has run.
 HEAVY_GATES += corpus-gzip
 corpus-gzip:
 	@echo ">> corpus-gzip: a TS-authored recipe whose phase bakes a build store path (gzip, string-append + assoc-ref outputs, #:tests? #f) lowers store-path-equal to the corpus oracle; phase load-bearing; build + --check NAR-hash-equal (input-recipes)"
@@ -53,7 +57,19 @@ corpus-gzip:
 	test "$$rt" = "td-gzip-roundtrip" \
 	  || { echo "FAIL: the built gzip did not round-trip a file (got: '$$rt') — the artifact does not function." >&2; exit 1; }; \
 	echo "   gzip -c | gzip -dc round-trip OK"; \
-	echo ">> [DURABLE: reproducibility] guix build --check (verdict-memoized; the standing durable replacement is td-check, plan/input-recipes.md)"; \
+	echo ">> [DURABLE: reproducibility] td computes the verdict ITSELF — td-builder check builds the recipe .drv TWICE in independent userns sandboxes and compares per-output NAR hashes; no guix build --check in this verdict"; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
+	sc="$(CURDIR)/.corpus-gzip-tdcheck"; chmod -R u+w "$$sc" 2>/dev/null || true; rm -rf "$$sc"; mkdir -p "$$sc"; \
+	{ printf '%s\n' "$$vars" | sed -n 's/^TD_IN=//p'; echo "$$td_drv"; } | xargs $(GUIX) gc -R | sort -u > "$$sc/paths.txt"; \
+	echo "   staged build closure: `wc -l < "$$sc/paths.txt"` store items"; \
+	"$$tb" check "$$td_drv" "$$sc/paths.txt" "$$sc/c" > "$$sc/out.txt" 2>"$$sc/err.txt" \
+	  || { echo "FAIL: td-builder check reported NON-reproducible (or errored):" >&2; cat "$$sc/out.txt" "$$sc/err.txt" >&2; chmod -R u+w "$$sc" 2>/dev/null || true; rm -rf "$$sc"; exit 1; }; \
+	grep -F "$$out" "$$sc/out.txt" | grep -q "reproducible" \
+	  || { echo "FAIL: td-builder check did not report $$out reproducible:" >&2; cat "$$sc/out.txt" >&2; chmod -R u+w "$$sc" 2>/dev/null || true; rm -rf "$$sc"; exit 1; }; \
+	echo "   td double-build agrees: $$out is reproducible (td's OWN verdict, no Guix)"; \
+	chmod -R u+w "$$sc" 2>/dev/null || true; rm -rf "$$sc"; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] guix build --check agrees the .drv is reproducible (verdict-memoized)"; \
 	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
 	echo ">> [MIGRATION ORACLE — removable when Guix is retired] the built out == the corpus oracle's out (path + NAR)"; \
 	test "$$out" = "$$oracle_out" \
@@ -64,4 +80,4 @@ corpus-gzip:
 	echo "   corpus oracle NAR : $$nar_or"; \
 	test -n "$$nar_td" -a "$$nar_td" = "$$nar_or" \
 	  || { echo "FAIL: TS recipe NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
-	echo "PASS: the built gzip round-trips a file (durable behavioral merit) and is reproducible; the store-path-baking phase is load-bearing; and (migration oracle) it is byte-identical to the corpus gzip."
+	echo "PASS: the built gzip round-trips a file (durable behavioral merit) and is reproducible by td's OWN double-build (td-builder check, no Guix in that verdict); the store-path-baking phase is load-bearing; and (migration oracle) it is byte-identical to the corpus gzip and guix build --check agrees."
