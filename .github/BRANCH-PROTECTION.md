@@ -10,8 +10,14 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
 - `.github/workflows/ci.yml` — two status checks per PR:
   - `lint` (GitHub-hosted): cheap structural checks only. It has no Guix and
     cannot run the loop; it never substitutes for `./check.sh`.
-  - `check` (hosted): the canonical full `./check.sh`, run by importing the
-    CI store image (below).
+  - `check-fast` (hosted): `./check.sh check-fast` — the FAST tier (cheap +
+    derivation-level gates + the tsc type-check, Makefile `FAST_GATES`), run by
+    importing the small `td-ci-fast` store image. Since #26 the per-PR runner
+    runs the fast tier ONLY; the full hermetic loop is the dev-machine gate
+    (DESIGN §7.2 step 2) plus the ci-image pipeline's `validate` job (full
+    `./check.sh` against the `td-ci` image, `ci-image.yml`) — NOT a per-PR check.
+    So branch protection requires `check-fast`, never a `check` context (there
+    is no such job).
 - `.github/setup-branch-protection.sh` — applies the `protect-main` ruleset:
   PRs only, 1 approving review, required status checks, linear history, no
   force pushes or deletion.
@@ -37,7 +43,8 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
    codifies it as the `protect-main` ruleset; remove or align the manual rule
    afterwards so there is one source of truth (Settings → Branches /
    Settings → Rules).
-4. **Push the CI store image** (the real gate's fuel). The `check` job runs
+4. **Push the CI store image** (the real gate's fuel). The ci-image pipeline's
+   `validate` job (and, with the fast subset, the per-PR `check-fast` job) runs
    on GitHub-HOSTED runners by importing a snapshot of the warm build closure
    the ladder needs — built on a dev box whose guix matches the pin (this
    sidesteps self-hosted runners entirely, and with them the t5700g
@@ -49,12 +56,14 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
    `ghcr.io/timmydo-bot/td-ci:<pin>` and `:latest`). After the FIRST push, make
    the package public once — GHCR UI ("td-ci" package → settings →
    visibility) — so the workflow pulls it anonymously.
-5. **Make the full check mandatory** once one PR has shown a green `check`:
+5. **Make the runner check mandatory** once one PR has shown a green
+   `check-fast` (the fast tier, against the published `td-ci-fast` image):
 
        ./.github/setup-branch-protection.sh --require-runner-check
 
    (Doing this before the image exists blocks every PR on a check that
-   cannot pass.)
+   cannot pass. This requires the `check-fast` context — not `check`, which
+   #26 removed as a per-PR job.)
 
 ## CI store image (how the hosted runner runs guix)
 
@@ -93,6 +102,6 @@ requirement would need that decision revisited, not just a script edit.)
 1. Rebase your track branch onto latest `origin/main`.
 2. Run the full `./check.sh` locally — must be green (CI verifies, it does
    not replace your own run; "fix forward in CI" wastes the runner).
-3. Push the branch, open the PR (`gh pr create`), wait for `lint` + `check`.
+3. Push the branch, open the PR (`gh pr create`), wait for `lint` + `check-fast`.
 4. Human review + approval, then rebase- or squash-merge. Merge commits are
    disabled (linear history, matching the old fast-forward convention).

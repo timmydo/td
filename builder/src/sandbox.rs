@@ -197,19 +197,22 @@ pub fn build(
 pub struct Bind {
     pub src: String,
     pub readonly: bool,
-    /// When `readonly`, tolerate a FAILED read-only remount (keep the bind
-    /// writable) instead of erroring. Set ONLY for defense-in-depth ro binds the
-    /// kernel may forbid remounting in a child user namespace — e.g.
-    /// `/sys/fs/cgroup` (cgroup2, owned by the host userns: a child userns lacks
-    /// CAP_SYS_ADMIN over it, so MS_REMOUNT|MS_RDONLY → EPERM on some kernels,
-    /// e.g. GitHub's azure runner). NEVER for binds whose read-only is
-    /// load-bearing (the store): those still error on a failed remount.
+    /// When `readonly`, tolerate a FAILED read-only remount by DETACHING the bind
+    /// (fail closed — no host-owned subtree left writable in the sandbox) instead
+    /// of erroring. Set ONLY for defense-in-depth ro binds the kernel may forbid
+    /// remounting in a child user namespace — e.g. `/sys/fs/cgroup` (cgroup2,
+    /// owned by the host userns: a child userns lacks CAP_SYS_ADMIN over it, so
+    /// MS_REMOUNT|MS_RDONLY → EPERM on some kernels, e.g. GitHub's azure runner).
+    /// NEVER for binds whose read-only is load-bearing (the store): those still
+    /// error on a failed remount.
     pub ro_optional: bool,
 }
 
 /// The loop-sandbox DEV-SHELL (vs. the build jail above): pivot into a fresh
-/// tmpfs root that exposes ONLY `binds` (rbind, the same path inside) plus a
-/// writable tmpfs at each of `tmpfs_dirs`; the host filesystem is otherwise
+/// tmpfs root that exposes ONLY `binds` (rbind, the same path inside), a
+/// writable tmpfs at each of `tmpfs_dirs`, and a minimal synthetic `/dev` (the
+/// standard char devices + shm + a private devpts + fd symlinks, matching
+/// `guix shell -C` — NOT the host device tree); the host filesystem is otherwise
 /// gone. `path_env` is the full PATH (empty → a default); `home` is HOME;
 /// `workdir` is the cwd to enter after pivot (empty → `/`); `extra_env` is
 /// caller-preserved env (e.g. the check-memo `TD_CHECK_*`). Runs `cmd args` and
@@ -284,6 +287,46 @@ pub fn host_shell(
         ));
     }
 
+    // Minimal /dev, precomputed. The old exposure rbind-mounted the WHOLE host
+    // /dev read-write, leaking /dev/kmsg (kernel log), /dev/kvm, raw disks, input
+    // devices and GPUs into the "hermetic" sandbox. Instead build a fresh tmpfs
+    // populated with ONLY the device set `guix shell -C` exposes: the standard
+    // char devices (BIND-mounted from the host — a child userns cannot mknod, so
+    // only these named nodes are reachable), /dev/shm, a private devpts, and the
+    // fd symlinks.
+    let dev_dir = newroot.join("dev");
+    let dev_dir_c = CString::new(dev_dir.as_os_str().as_encoded_bytes()).unwrap();
+    let dev_data = CString::new(format!("uid={host_uid},gid={host_gid},mode=0755")).unwrap();
+    let mut dev_node_specs: Vec<(CString, PathBuf, CString)> = Vec::new();
+    for n in ["null", "zero", "full", "random", "urandom", "tty"] {
+        let src = format!("/dev/{n}");
+        if Path::new(&src).exists() {
+            let target = dev_dir.join(n);
+            dev_node_specs.push((
+                CString::new(src).unwrap(),
+                target.clone(),
+                CString::new(target.as_os_str().as_encoded_bytes()).unwrap(),
+            ));
+        }
+    }
+    let dev_shm_dir = dev_dir.join("shm");
+    let dev_shm_c = CString::new(dev_shm_dir.as_os_str().as_encoded_bytes()).unwrap();
+    let dev_shm_data = CString::new(format!("uid={host_uid},gid={host_gid},mode=1777")).unwrap();
+    let dev_pts_dir = dev_dir.join("pts");
+    let dev_pts_c = CString::new(dev_pts_dir.as_os_str().as_encoded_bytes()).unwrap();
+    let devpts_c = CString::new("devpts").unwrap();
+    let devpts_data =
+        CString::new(format!("newinstance,ptmxmode=0666,mode=0620,gid={host_gid}")).unwrap();
+    // (symlink path under <newroot>/dev, its target). /dev/ptmx → the private pts
+    // instance; the std-stream links point into the private /proc mounted below.
+    let dev_symlinks: Vec<(PathBuf, &str)> = vec![
+        (dev_dir.join("ptmx"), "pts/ptmx"),
+        (dev_dir.join("fd"), "/proc/self/fd"),
+        (dev_dir.join("stdin"), "/proc/self/fd/0"),
+        (dev_dir.join("stdout"), "/proc/self/fd/1"),
+        (dev_dir.join("stderr"), "/proc/self/fd/2"),
+    ];
+
     let path_env = if path_env.is_empty() {
         "/run/current-system/profile/bin:/run/current-system/profile/sbin"
     } else {
@@ -323,6 +366,18 @@ pub fn host_shell(
 
     unsafe {
         command.pre_exec(move || {
+            // Arm parent-death reaping BEFORE anything else: if the outer
+            // td-builder is killed (CI cancellation, a timeout, Ctrl-C) during or
+            // after setup, this process is SIGKILLed instead of left running.
+            // Re-checked just after, to close the race where the parent died
+            // between the getppid and the prctl. (This level is still in the
+            // outer PID namespace, so getppid is meaningful here.)
+            let parent = sys::getppid();
+            sys::set_pdeathsig(sys::SIGKILL)
+                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED arming PR_SET_PDEATHSIG\n"); e })?;
+            if sys::getppid() != parent {
+                sys::exit_group(0);
+            }
             // New USER + PID + mount + net + IPC + UTS namespaces. NEWPID is in
             // the SAME unshare as NEWUSER so the new PID namespace is OWNED by the
             // new user namespace (the kernel applies NEWUSER first); the fork
@@ -380,6 +435,13 @@ pub fn host_shell(
                 sys::exit_group(code);
             }
             // --- PID 1 of the new PID namespace, from here on ---
+            // Re-arm parent-death reaping FIRST (fork cleared it): if the
+            // PID-namespace parent — the process waitpid-ing us just above — dies,
+            // we (PID 1) are SIGKILLed, and the kernel then tears down the whole
+            // PID namespace, reaping every descendant build/mount. PDEATHSIG
+            // survives the upcoming execve, so the exec'd command stays covered.
+            sys::set_pdeathsig(sys::SIGKILL)
+                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED re-arming PR_SET_PDEATHSIG in pid 1\n"); e })?;
             // Everything below private to this namespace.
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED at mount(/, MS_REC|MS_PRIVATE)\n"); e })?;
@@ -409,13 +471,52 @@ pub fn host_shell(
                     // — a failed remount is fatal.
                     if let Err(e) = ro {
                         if *ro_optional {
-                            sys::warn(b"td-builder host-sandbox: ro-remount not permitted for an ro_optional bind; kept writable (best-effort)\n");
+                            // Can't make it read-only (a child userns cannot
+                            // remount-ro a mount owned by the host userns, e.g.
+                            // cgroup2 on the azure runner). Rather than leave the
+                            // host subtree WRITABLE inside the "hermetic" sandbox,
+                            // DETACH it — fail closed, nothing host-owned exposed.
+                            // The only ro_optional bind is /sys/fs/cgroup, needed
+                            // solely by the crun gates (run/container) which run
+                            // locally where the ro-remount SUCCEEDS; they never run
+                            // where this branch fires (CI runs only check-fast), so
+                            // the leftover empty dir is harmless.
+                            sys::warn(b"td-builder host-sandbox: ro-remount not permitted for an ro_optional bind; detached (fail-closed, no host exposure)\n");
+                            let _ = sys::umount2(target_c, sys::MNT_DETACH);
                         } else {
                             sys::warn(b"td-builder host-sandbox: FAILED ro-remounting an exposed path\n");
                             return Err(e);
                         }
                     }
                 }
+            }
+            // Minimal /dev (replaces the dropped blanket host /dev bind): a fresh
+            // tmpfs with only the standard char devices (bind-mounted from the
+            // host), /dev/shm, a best-effort private devpts, and the fd symlinks.
+            // Nothing else from the host /dev is reachable.
+            fs::create_dir_all(&dev_dir)?;
+            sys::mount(Some(&tmpfs_c), &dev_dir_c, Some(&tmpfs_c), 0, Some(&dev_data))
+                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED mounting /dev tmpfs\n"); e })?;
+            for (src_c, target, target_c) in &dev_node_specs {
+                fs::File::create(target)?;
+                sys::mount(Some(src_c), target_c, None, sys::MS_BIND, None)
+                    .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED binding a /dev node\n"); e })?;
+            }
+            fs::create_dir_all(&dev_shm_dir)?;
+            sys::mount(Some(&tmpfs_c), &dev_shm_c, Some(&tmpfs_c), 0, Some(&dev_shm_data))
+                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED mounting /dev/shm\n"); e })?;
+            // /dev/pts + /dev/ptmx are best-effort: a new devpts instance needs an
+            // unprivileged-mountable devpts (most kernels allow it; some restrict).
+            // crun sets up its OWN container pts, so a missing /dev/pts only
+            // affects a direct pty user — none in the loop.
+            fs::create_dir_all(&dev_pts_dir)?;
+            if sys::mount(Some(&devpts_c), &dev_pts_c, Some(&devpts_c), 0, Some(&devpts_data))
+                .is_err()
+            {
+                sys::warn(b"td-builder host-sandbox: devpts unavailable; /dev/pts left empty\n");
+            }
+            for (link, dest) in &dev_symlinks {
+                let _ = std::os::unix::fs::symlink(dest, link);
             }
             // A FRESH procfs reflecting THIS PID namespace (we are its PID 1) —
             // NOT the host /proc. Nested containers write /proc/<pid>/setgroups

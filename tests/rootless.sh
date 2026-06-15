@@ -50,11 +50,17 @@ if [ "${1-}" != "--inner" ]; then
   # the DB is in WAL mode, and reading the WAL needs an -shm index (re)created in
   # the ROOT-owned /var/guix/db — which we cannot write ("attempt to write a
   # readonly database", plan/loop-sandbox.md R8). Instead COPY the DB (+ its WAL)
-  # into our WRITABLE scratch and fold the WAL there. This is race-free because
-  # the `rootless` rung runs LAST and ALONE (Makefile order-only gate on every
-  # other heavy rung) — the daemon is idle, so the on-disk DB is stable. If a copy
-  # were ever torn, the integrity_check below fails LOUDLY rather than yielding a
-  # cryptic error or a silent false-green.
+  # into our WRITABLE scratch and fold the WAL there.
+  #
+  # CONCURRENCY (honest scope). WITHIN one check the Makefile order-only gate runs
+  # `rootless` LAST and ALONE, so no sibling gate is building and the on-disk DB is
+  # quiescent. It is NOT, however, race-free against a SECOND concurrent check
+  # (DESIGN §7.3 permits two): that check's heavy build gates drive the shared host
+  # daemon, which can write the store DB while we copy it. The integrity_check
+  # below is the safety net for that case — a torn copy fails LOUDLY here, never a
+  # silent false-green. Making the snapshot race-free across concurrent checks
+  # needs daemon-side coordination (a follow-up); until then, stagger landings that
+  # run rootless if a second full check is in flight (DESIGN §7.3 resource note).
   cp /var/guix/db/db.sqlite "$scratch/state/db/db.sqlite"
   if [ -e /var/guix/db/db.sqlite-wal ]; then
     cp /var/guix/db/db.sqlite-wal "$scratch/state/db/db.sqlite-wal"
