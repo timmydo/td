@@ -108,16 +108,21 @@ If any are missing, the task is not done.
 Multiple agents work this repo concurrently. The unit of work is a **track**
 (DESIGN §7.1 lists them; `PLAN.md` is the status index).
 
-- **Claim** exactly one track: put your handle + date on its status line in `PLAN.md`
-  as the FIRST commit on your track branch, then open a **draft PR** for the branch
-  (main is branch-protected; nothing lands directly). Handles must be
+- **Claim** exactly one track: add (or edit) its record `plan/tracks/<track>.md` with
+  `status: claimed` + your handle + date, run `tools/plan-index.sh` to regenerate
+  PLAN.md's table, and commit BOTH as the FIRST commit on your track branch, then open
+  a **draft PR** (main is branch-protected; nothing lands directly). The record is your
+  OWN file, so concurrent claims never collide on a shared PLAN.md line (the gates-split
+  win, applied to PLAN.md); the `plan-index` gate fails the loop if PLAN.md ever drifts
+  from the records, so flip `status:` to `done`/`closed` (and re-run the renderer) when
+  you land — a merged track can't keep reading "claimed". Handles must be
   **session-unique** — a model name alone collides when two instances run. Generate
   one at session start and reuse it for all claims and notes:
   `echo "claude-fable-$(od -An -N3 -tx1 /dev/urandom | tr -d ' ')"` (e.g.
-  `claude-fable-9af31c`). One agent per track; if a line is claimed and fresh, pick
+  `claude-fable-9af31c`). One agent per track; if a record is claimed and fresh, pick
   another track. Release the claim when you land or stop (close the PR if
-  abandoning). Claim status = `PLAN.md` on main plus the open PRs' claim edits;
-  track files do not carry it.
+  abandoning). Claim status = the records on main (PLAN.md is generated from them) plus
+  the open PRs' claim edits.
 - **Work in your own git worktree/branch** (`git worktree add ../td-<track>`), never
   on a shared checkout of main. Keep running notes, sub-task ladder, and verified-red
   evidence in `plan/<track>.md` — never edit another track's file.
@@ -149,7 +154,8 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
 
 ## Workflow
 
-1. Claim a track; read its `plan/<track>.md` and its DESIGN §7.1 acceptance test.
+1. Claim a track (its `plan/tracks/<track>.md` record + `tools/plan-index.sh`); read
+   its `plan/<track>.md` notes and its DESIGN §7.1 acceptance test.
 2. Before writing implementation, state the sub-task and write (or name) the test that
    will verify it.
 3. Make the smallest change that turns that test green; verify red first.
@@ -158,7 +164,9 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
    no weakened gates or assertions, smallest increment, conventions respected — and
    address its findings first.
 6. Commit a small increment on your branch. Land per the protocol when the track's
-   acceptance test is green. Update `PLAN.md`'s status line as part of landing.
+   acceptance test is green. Flip your `plan/tracks/<track>.md` record to
+   `status: done` and re-run `tools/plan-index.sh` as part of landing (the
+   `plan-index` gate enforces it).
 
 Prefer many small green commits over one large change. If a change spans layers, split
 it.
@@ -196,8 +204,11 @@ it.
   deliberately (exclusive landing), never silently.
 - `DESIGN.md` — the settled contract: loop, target, invariants, roadmap (§7.1),
   parallel-work rules (§7.2–7.4).
-- `PLAN.md` — track status index (one line per track). `plan/<track>.md` — per-track
-  working state, single writer. `M10-design.md` — the M10 design note.
+- `PLAN.md` — track status index (one line per track), GENERATED from the
+  `plan/tracks/<track>.md` records by `tools/plan-index.sh` (don't hand-edit between its
+  markers; the `plan-index` gate enforces sync). `plan/tracks/<track>.md` — one track's
+  status record (the claim source of truth). `plan/<track>.md` — per-track working
+  notes, single writer. `M10-design.md` — the M10 design note.
 - `HISTORY.md` — completed-milestone record. `DIGESTS.md` — reproducibility record
   (changes only on oracle re-baseline; exclusive landing).
 
