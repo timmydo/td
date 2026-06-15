@@ -24,6 +24,13 @@ oracle." Applied to the four recipe gates here:
 - All four: the drv-equal + NAR-equal legs are now labeled `[MIGRATION ORACLE —
   removable when Guix is retired]`; the self-discrimination legs were already durable.
 
+Verified-red (durable legs): broke `corpus-gzip`'s behavioral expectation (expect a
+value the round-trip won't produce) ⇒ the gate reds at the `[DURABLE: behavioral]`
+leg ("the built gzip did not round-trip … the artifact does not function", exit 2),
+with NO Guix oracle involved — proving the durable leg is a real, non-vacuous check
+of the artifact. Restored. (The structural `test -f` legs are non-vacuous by
+construction.)
+
 **Next durable step (not done here):** make the recipe gates assert reproducibility
 on td's OWN terms via `td-builder check` (double-build) instead of `guix build
 --check`. The `td-check` gate already proves td owns this oracle for the `td-build`
