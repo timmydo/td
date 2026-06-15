@@ -52,11 +52,14 @@ declare function system(spec: SystemSpec): void;
 // Guile is the bridge (the retire-last lowering target); the recipe DATA lives
 // here, in the TS surface.
 
-/** An upstream source: a URL and its content hash (nix-base32 sha256). The
- *  evaluator records this as data; the fetch itself is the Guile lowering's
- *  declared fixed-output `url-fetch` (offline contract unchanged). */
+/** An upstream source: a URL (or a LIST of mirror URLs, like pkg-config's) and
+ *  its content hash (nix-base32 sha256). The evaluator records this as data; the
+ *  fetch itself is the Guile lowering's declared fixed-output `url-fetch`
+ *  (offline contract unchanged). A list and a single URL lower to DIFFERENT
+ *  source derivations, so the shape is load-bearing — declare it exactly as
+ *  upstream/corpus does. */
 interface Source {
-  readonly uri: string;
+  readonly uri: string | readonly string[];
   readonly sha256: string;
 }
 
@@ -65,20 +68,25 @@ interface Source {
 declare type BuildSystem = "gnu";
 
 /** A package recipe — the coordinates that determine the build derivation: name,
- *  version, the upstream source, the build system, and the names of any build
- *  inputs (dependencies). An input is named by its corpus package name; the
- *  Guile bridge RESOLVES it from the corpus (input resolution stays Guix's,
- *  retired LAST — DESIGN §5). Omit `inputs` for a leaf package (e.g. hello). */
+ *  version, the upstream source, the build system, any configure flags, and the
+ *  names of any build inputs (dependencies). An input is named by its corpus
+ *  package name; the Guile bridge RESOLVES it from the corpus (input resolution
+ *  stays Guix's, retired LAST — DESIGN §5). `configureFlags` are the build
+ *  system's `#:configure-flags` (they enter the build derivation, so declare them
+ *  exactly as the corpus package does). Omit `inputs`/`configureFlags` for a leaf
+ *  package with default arguments (e.g. hello). */
 interface Recipe {
   readonly name: string;
   readonly version: string;
   readonly source: Source;
   readonly buildSystem: BuildSystem;
   readonly inputs?: readonly string[];
+  readonly configureFlags?: readonly string[];
 }
 
-/** Declare an upstream source by URL + content hash (does not fetch). */
-declare function fetchSource(uri: string, sha256: string): Source;
+/** Declare an upstream source by URL (or mirror-URL list) + content hash (does
+ *  not fetch). */
+declare function fetchSource(uri: string | readonly string[], sha256: string): Source;
 
 /** Declare the package to build. The evaluator captures the argument and emits it
  *  as JSON for the Guile recipe bridge, which reconstructs a package and lowers it
