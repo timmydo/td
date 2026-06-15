@@ -55,20 +55,37 @@ recorded hash stays a valid `--check` oracle.
    `ValidPaths` row. Must dedupe (small store-register change) or feed CANDIDATES without
    the drv and register the drv separately.
 
-## Increment ladder
+## Spike finding (2026-06-15)
 
-1. **Spike (de-risk daemon acceptance).** Build a td `store-register` DB for a SMALL
-   closure with a SEPARATE deriver (e.g. `hello`); stand up an unprivileged guix-daemon
-   on it (the rootless.sh machinery) and assert it sees the path valid
-   (`guix gc --references`). Smallest proof the daemon eats a td-built DB.
-2. **Deriver-in-closure.** Handle `img_drv` ∈ closure (dedupe in store-register, with a
-   differential vs the daemon proving the rows still match).
-3. **Swap.** Replace rootless.sh's `cp`-snapshot with `td-builder store-register` over
-   `paths.txt`; the `rootless` gate green against the constructed DB. Verified-red:
-   perturb the closure (drop a path / corrupt a hash) ⇒ validity guard or `--check` reds.
-4. **Seal.** Remove the live-DB `cp` entirely; structural assertion that rootless never
-   reads `/var/guix/db` (race eliminated by construction, not mitigated).
+A standalone cheap spike is NOT viable. `td-builder store-register` built a valid 16 KB
+DB for hello's 4-path closure (deriver separate, no dup), but standing up an
+unprivileged daemon on it against the REAL (read-only) `/gnu/store` failed at the query:
+
+    guix gc: error: remounting /gnu/store writable: Operation not permitted
+
+`guix gc --references` — the exact validity-guard command — needs a WRITABLE store
+(the daemon remounts `/gnu/store` rw for GC bookkeeping), which is why rootless.sh
+stages a writable per-item store view. So daemon-acceptance can only be proven through
+that staged store ⇒ the proof folds into the `rootless` gate run with the td DB; there
+is no cheaper standalone test. (`./check.sh rootless` runs rootless alone now — #51 —
+so the iteration cost is one rootless gate, not the full check.)
+
+## Increment ladder (refined)
+
+1. **Deriver-in-closure dedupe** in `store-register`: when the DERIVER is also a closure
+   member (rootless: `img_drv` ∈ `paths.txt`), use its closure-id for
+   `DerivationOutputs.drv` and skip the id-2 scaffolding row — no duplicate `ValidPaths`.
+   Guard with a differential vs the daemon (the td-store-db oracle) on a closure that
+   INCLUDES its drv.
+2. **Swap + acceptance proof (one step).** Replace rootless.sh's `cp`-snapshot with
+   `td-builder store-register` over `paths.txt`; run the `rootless` gate. Passing proves
+   the daemon accepts td's DB AND eliminates the live-DB read. Verified-red: perturb the
+   closure (drop a path / corrupt a hash) ⇒ validity guard or `--check` reds.
+3. **Seal.** Remove the live-DB `cp` path; structural assertion that rootless never reads
+   `/var/guix/db` (race eliminated by construction, not mitigated).
 
 ## Status
 
-Claimed + designed 2026-06-15. Spike next.
+Claimed + designed; spike run (2026-06-15) — confirmed the tool builds a valid DB and
+that acceptance must be proven via the rootless gate's staged store. Increment 1
+(deriver dedupe) next.
