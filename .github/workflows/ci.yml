@@ -103,7 +103,10 @@ jobs:
       - name: install guix daemon + tools
         # The distro daemon only BOOTSTRAPS the import; the check runs the pinned
         # guix from the imported store. Ubuntu 23.10+ restricts unprivileged user
-        # namespaces, which `guix shell -C` needs — lift it.
+        # namespaces, which td's own loop sandbox (`td-builder host-sandbox`, the
+        # sole loop container — check.sh runs check-fast inside it too) needs — lift
+        # it. (The fix-the-host policy: the runner runs the unmodified td-sandbox
+        # ./check.sh, no guix-shell-C fallback.)
         run: |
           set -eu
           sudo apt-get update

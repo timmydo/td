@@ -2,7 +2,8 @@
 # check.sh — the single, self-contained pass/fail command for td (DESIGN.md §1.1).
 #
 # `make check` is the loop, but it must run *hermetically* (DESIGN §1.4: every
-# build/test enters a fresh `guix shell -C --pure` container) and *offline*
+# build/test enters a fresh container — td's OWN `td-builder host-sandbox`, the sole
+# loop container; no `guix shell -C` fallback, no toggle) and *offline*
 # (DESIGN §5: local-only; reaching the network pulls substitutes — unpinned
 # binaries the loop's results would silently depend on). Getting that right needs a
 # specific incantation (store/cache/daemon-socket exposure + host-guix on PATH);
@@ -173,72 +174,35 @@ fi
 #                                would otherwise strip them; the `memo` rung
 #                                asserts TD_CHECK_ENV arrives.
 # --- The hermetic container ---------------------------------------------------
-# DEFAULT (gate-2 "Loop tooling convergence", loop-sandbox Step 2): run the loop
-# inside td's OWN sandbox (`td-builder host-sandbox --expose-cwd`) instead of
-# `guix shell -C` — the north star's one Rust sandbox stack spanning build AND
-# run, made literal. td's sandbox provides the same hermetic surface, proven by
-# the loop-sandbox/loop-rung rungs: the WHOLE /gnu/store (ro) + the daemon socket
-# /var/guix + /proc + /dev + /sys/fs/cgroup + the worktree + the guix cache, host
-# guix + the toolchain on PATH, its own loopback-only netns. `guix shell` (no -C)
-# still PROVISIONS the toolchain profile — td replaces the CONTAINER, not guix's
-# profile machinery. Escape hatch: TD_LOOP_GUIX_SHELL=1 runs the original
-# `guix shell -C` path below (the oracle, for differential/triage).
-#
-# ONE rung — `rootless` — cannot run nested in td's sandbox: it builds in its OWN
-# unprivileged user namespace and snapshots the LIVE store DB, and that WAL
-# snapshot cannot coordinate with the host daemon from a nested non-root client
-# (double-nested userns). So `rootless` runs in its native `guix shell -C` (not
-# skipped — full assertions, and a failure fails the whole check), while the
-# other 36 rungs run under td's sandbox via `check-sandbox`.
-case " $* " in
-  *" rootless "*) TD_LOOP_GUIX_SHELL=1 ;;   # explicit rootless → guix shell -C
-esac
-# CI fallback: the hosted runner's container restricts the namespace/mount ops
-# td's sandbox needs (pivot_root + bind/tmpfs mounts + uid-map nesting) — the
-# outer `host-sandbox` fails there with "Operation not permitted", though it
-# permits guix's own `guix shell -C` mechanism. So under CI the loop runs on the
-# proven `guix shell -C` oracle path. td's sandbox stays the LOCAL default (where
-# the swap is the load-bearing entry); making it run on the restricted runner is
-# a follow-up (diagnose the runner's specific seccomp/userns restriction).
-if [ -n "${CI-}" ] || [ -n "${GITHUB_ACTIONS-}" ]; then
-  TD_LOOP_GUIX_SHELL=1
-fi
-if [ -z "${TD_LOOP_GUIX_SHELL-}" ]; then
-  tb=$(guix build -L . -e '(@ (system td-builder) td-builder)')/bin/td-builder
-  [ -x "$tb" ] || { echo "check.sh: FATAL: could not build td-builder for the loop sandbox." >&2; exit 1; }
-  # The packages guix shell -C would put on PATH, provisioned as a profile (no
-  # container); --search-paths prints the `export PATH="…"` line we splice in.
-  # The leading non-`$` run is the profile bin:sbin; the trailing
-  # `${PATH:+:}$PATH` (a shell-eval append) is dropped — we set PATH ourselves.
-  toolchain=$(guix shell --no-substitutes --no-offload \
-      make bash coreutils sed grep findutils tar gzip crun util-linux sqlite \
-      --search-paths | sed -n 's/^export PATH="\([^$]*\).*/\1/p' | head -n1)
-  [ -n "$toolchain" ] || { echo "check.sh: FATAL: could not provision the loop toolchain PATH." >&2; exit 1; }
-  # GUIX_ENVIRONMENT is the profile root (what `guix shell -C` exports) — the
-  # `rootless` rung binds it into its staged store. The first PATH entry is the
-  # profile's bin; its parent is the profile root.
-  guix_env=$(dirname "${toolchain%%:*}")
-  # Full loop: run `rootless` in its native guix shell -C first (failing the
-  # whole check on its failure), then the other 36 rungs under td's sandbox.
-  targets="$*"
-  if [ "$targets" = "check" ]; then
-    echo "check.sh: 'rootless' runs under guix shell -C (it cannot nest in td's sandbox); the other 36 rungs run under td's sandbox" >&2
-    TD_LOOP_GUIX_SHELL=1 "$0" rootless || exit 1
-    targets="check-sandbox"
-  fi
-  exec env \
-    PATH="$hostguix_dir:$toolchain" \
-    GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
-    GUIX_ENVIRONMENT="$guix_env" \
-    "$tb" host-sandbox --expose-cwd -- make -j2 --output-sync=target $targets
-fi
-
-exec guix shell -C --pure \
-  --no-substitutes --no-offload \
-  --preserve='^TD_CHECK_' \
-  --expose=/gnu/store \
-  --share="$HOME/.cache/guix" \
-  --share=/var/guix \
-  --expose=/sys/fs/cgroup \
-  make bash coreutils sed grep findutils tar gzip crun util-linux sqlite -- \
-  bash -c 'export PATH="'"$hostguix_dir"':$PATH"; export GUIX_BUILD_OPTIONS="--no-substitutes --no-offload"; exec make -j2 --output-sync=target "$@"' -- "$@"
+# td's OWN sandbox (`td-builder host-sandbox --expose-cwd`) is THE loop container —
+# the north star's one Rust sandbox stack spanning build AND run, made literal.
+# There is NO `guix shell -C` fallback and NO toggle (human direction 2026-06-14:
+# td is the sole sandbox; no dependency on guix's container, no way to switch
+# back). td's sandbox provides the full hermetic surface — the WHOLE /gnu/store
+# (ro) + the daemon socket /var/guix + a private /proc + /dev + /sys/fs/cgroup +
+# the worktree + the guix cache, host guix + the toolchain on PATH, running as
+# PID 1 of its own PID namespace in its own loopback-only network namespace (full
+# guix-shell-C parity, asserted by the loop-sandbox/loop-rung self-tests). EVERY
+# rung runs here, including `rootless` (its nested unprivileged userns builder now
+# nests cleanly thanks to the PID-ns parity) and the loop self-tests. `guix shell`
+# (no -C) still PROVISIONS the toolchain profile — td replaces the CONTAINER, not
+# guix's profile machinery. See plan/loop-sandbox.md.
+tb=$(guix build -L . -e '(@ (system td-builder) td-builder)')/bin/td-builder
+[ -x "$tb" ] || { echo "check.sh: FATAL: could not build td-builder for the loop sandbox." >&2; exit 1; }
+# The packages guix shell -C would put on PATH, provisioned as a profile (no
+# container); --search-paths prints the `export PATH="…"` line we splice in. The
+# leading non-`$` run is the profile bin:sbin; the trailing `${PATH:+:}$PATH` (a
+# shell-eval append) is dropped — we set PATH ourselves.
+toolchain=$(guix shell --no-substitutes --no-offload \
+    make bash coreutils sed grep findutils tar gzip crun util-linux sqlite \
+    --search-paths | sed -n 's/^export PATH="\([^$]*\).*/\1/p' | head -n1)
+[ -n "$toolchain" ] || { echo "check.sh: FATAL: could not provision the loop toolchain PATH." >&2; exit 1; }
+# GUIX_ENVIRONMENT is the profile root (what `guix shell -C` used to export) — the
+# `rootless` rung binds it into its staged store. The first PATH entry is the
+# profile's bin; its parent is the profile root.
+guix_env=$(dirname "${toolchain%%:*}")
+exec env \
+  PATH="$hostguix_dir:$toolchain" \
+  GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
+  GUIX_ENVIRONMENT="$guix_env" \
+  "$tb" host-sandbox --expose-cwd -- make -j2 --output-sync=target "$@"

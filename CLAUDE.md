@@ -59,13 +59,15 @@ Run all of it with the single pass/fail command:
 ./check.sh
 ```
 
-`./check.sh` is the canonical hermetic entry point: it sets up the fresh
-`guix shell -C --pure` container (store/cache/daemon-socket exposure, host guix on
-PATH, **substitutes disabled** so the loop is offline), guards that the host guix
-matches the `channels.scm` pin, then runs `make check` inside it. `make check` is the
-underlying target (assumes you are already in that sandbox); it runs the gate ladder
-(structural gates serial-first, heavy gates two at a time), short-circuiting on the
-first failure, and exits non-zero on any failure.
+`./check.sh` is the canonical hermetic entry point: it sets up the fresh sandbox —
+**td's OWN `td-builder host-sandbox --expose-cwd`, the sole loop container** (no
+`guix shell -C` fallback, no toggle — DESIGN §7.1): store/cache/daemon-socket exposure,
+host guix + the toolchain on PATH, a private PID namespace + `/proc`, its own
+loopback-only netns, **substitutes disabled** so the loop is offline. It guards that the
+host guix matches the `channels.scm` pin, then runs `make check` inside it. `make check`
+is the underlying target (assumes you are already in that sandbox); it runs the gate
+ladder (structural gates serial-first, heavy gates two at a time), short-circuiting on
+the first failure, and exits non-zero on any failure.
 The gate list is assembled from the drop-in fragments under `mk/gates/*.mk`: each
 fragment registers itself into the `CHEAP_GATES`/`HEAVY_GATES` pool that the `check:`
 target expands. That directory is the **authoritative gate list**, the one place it is
@@ -74,9 +76,9 @@ editing a shared list line (so concurrent gate PRs don't collide). Broad shape:
 config eval →
 differentials → `guix build --check` → behavioral/marionette tests.
 
-Every build/test runs inside that fresh container (`guix shell -C --pure`) so your own
-environment cannot contaminate results; `./check.sh <target>` runs a single Makefile
-target in the same sandbox.
+Every build/test runs inside that fresh td sandbox so your own environment cannot
+contaminate results; `./check.sh <target>` runs a single Makefile target in the same
+sandbox.
 
 Do not proceed to the next sub-task until the current one is green.
 
@@ -205,8 +207,8 @@ it.
   prefix.
 - Hand-formatted 2-space indentation, no tabs. Do NOT run `guix style` — it was tried
   in M2 and mangled the layout; the hand-formatted style is the convention.
-- Run every build/test via `./check.sh` (or `./check.sh <target>`), which enters the
-  `guix shell -C --pure` sandbox for you (see "The loop"). Don't add `--network` to
+- Run every build/test via `./check.sh` (or `./check.sh <target>`), which enters td's
+  own `td-builder host-sandbox` for you (see "The loop"). Don't add `--network` to
   it — that pulls substitutes (offline/hermeticity violation).
 
 **Free-software posture**

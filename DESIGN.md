@@ -36,21 +36,22 @@ closed loop through M10.2) is recorded in `HISTORY.md`.
 ### 1.1 The single pass/fail command
 
 `./check.sh` is the one command that means green or red. It sets up the hermetic,
-offline sandbox (td's own `td-builder host-sandbox` by default — the loop-sandbox swap,
-§7.1; `TD_LOOP_GUIX_SHELL=1` selects the original `guix shell -C --pure` oracle — store
-and daemon-socket exposure, a guard that host guix matches the `channels.scm` pin,
-substitutes disabled) and runs
-`make check` inside it. `make check` runs the gate ladder, short-circuiting on the
-first failure; **the drop-in fragments under `mk/gates/*.mk` (each self-registering
-into the `CHEAP_GATES`/`HEAVY_GATES` pools the `check:` target expands) are the
-authoritative gate list** — documents point here instead of restating it, and a new
-gate is a new fragment file, not an edit to a shared list. Broad shape: config eval →
-differentials → `guix build --check` → behavioral/marionette tests. Plain
+offline sandbox — **td's own `td-builder host-sandbox --expose-cwd`, the sole loop
+container** (no `guix shell -C` fallback, no toggle; §7.1): the whole `/gnu/store` (ro)
++ the daemon socket, a private PID namespace + `/proc`, its own loopback-only netns,
+host guix + the toolchain on PATH, a guard that host guix matches the `channels.scm`
+pin, substitutes disabled — and runs `make check` inside it. `make check` runs the gate
+ladder, short-circuiting on the first failure; **the drop-in fragments under
+`mk/gates/*.mk` (each self-registering into the `CHEAP_GATES`/`HEAVY_GATES` pools the
+`check:` target expands) are the authoritative gate list** — documents point here
+instead of restating it, and a new gate is a new fragment file, not an edit to a shared
+list. Broad shape: config eval → differentials → `guix build --check` →
+behavioral/marionette tests. Plain
 `make check` is only correct when you're already inside that sandbox.
 
 ### 1.2 Rung classes
 
-- Hermetic build/dev env: `guix shell -C --pure` (no host leakage).
+- Hermetic build/dev env: td's own `td-builder host-sandbox` (no host leakage; §7.1).
 - Reproducibility oracle: `guix build --check` (and `--rounds=2` where cheap). A
   non-reproducible output is a failing test.
 - Boot + behavioral: marionette `(gnu tests)` system tests that boot the image and
@@ -67,11 +68,10 @@ less-frequent rung. Loop latency is a tracked metric, not an afterthought.
 ### 1.4 Agent / container boundary
 
 The Claude Code agent runs **outside** the container. Every build/test command it
-issues enters a **fresh** container — td's own `td-builder host-sandbox` by default
-(the loop-sandbox swap, §7.1), or `guix shell -C --pure` under `TD_LOOP_GUIX_SHELL=1` —
-so the agent's own environment can't contaminate results and the reproducibility rung
-stays honest. (The one rung that cannot nest in td's sandbox, `rootless`, runs in
-`guix shell -C`; see §7.1.)
+issues enters a **fresh** container — td's own `td-builder host-sandbox` (the SOLE loop
+container; §7.1) — so the agent's own environment can't contaminate results and the
+reproducibility rung stays honest. Every rung runs there, including `rootless` (its
+nested unprivileged builder nests cleanly given td's PID-namespace parity).
 
 ### 1.5 VM state reset
 
@@ -682,31 +682,26 @@ run concurrently):
   Working state + verified-red log: `plan/td-check.md`.
 - **loop-sandbox** *(approved 2026-06-13 — §4.3 **gate-2**, human go-ahead "then the
   gate-2 items (td-check oracle, loop sandbox)"; graduated from the backlog stub above)*
-  — td's OWN sandbox replaces `guix shell -C`. Additive equivalence FIRST (the gate-2
-  OBSERVE step): `td-builder host-sandbox` is a DEV-SHELL (vs. the build jail) — pivots
-  into a fresh root exposing the WHOLE `/gnu/store` (ro) + the daemon socket `/var/guix`
-  + `/proc` + `/dev`, host-guix on PATH, host fs otherwise gone, in its own loopback-only
-  network namespace. The `loop-sandbox` rung proves: (1) `guix build -d hello` lowers to
-  the SAME `.drv` inside td's sandbox as under `guix shell -C` (exposure equivalence,
-  guix the oracle); (2) the host worktree is INVISIBLE inside (isolation); (3) td's
-  sandbox netns inode DIFFERS from the rung's, loopback-only, daemon reachable across it
-  (net-namespace parity). The `loop-rung` rung (Step 1, full-rung differential) proves a
-  REAL rung runs identically: with `host-sandbox --expose-cwd` (the FULL loop env — the
-  worktree + cgroups + the guix cache, caller PATH = the toolchain, `TD_CHECK_*`/`USER`
-  preserved, chdir into the cwd), the `eval` rung's command produces byte-identical
-  output inside td's sandbox as under `guix shell -C`. **Step 2 (the wholesale swap,
-  human go-ahead 2026-06-14): `check.sh` now runs the loop inside td's OWN sandbox
-  (`td-builder host-sandbox --expose-cwd`) BY DEFAULT** — the north-star "one sandbox
-  stack spanning build and run" made literal. `guix shell` (no `-C`) still provisions the
-  toolchain profile; td replaces the container. `TD_LOOP_GUIX_SHELL=1` keeps the original
-  `guix shell -C` as the oracle/fallback. The WHOLE loop runs under td's sandbox (VMs,
-  crun, OCI, every `td-*` rung) EXCEPT `rootless` — it builds in its own unprivileged
-  userns and snapshots the live store DB, which cannot coordinate with the host daemon
-  when double-nested, so it runs in its native `guix shell -C` via the `check-sandbox`
-  target (= `check` minus `rootless`; rootless still runs fully, never skipped — the
-  canonical `check` is unchanged). Done: #30 (exposure + isolation), #31 (net parity),
-  Step 1 (full-rung differential), Step 2 (the swap). Working state + verified-red log:
-  `plan/loop-sandbox.md`.
+  — td's OWN sandbox is the **SOLE** loop container: `check.sh` runs the whole loop
+  inside `td-builder host-sandbox --expose-cwd`, with NO `guix shell -C` fallback and NO
+  toggle (human direction 2026-06-14: "make td the default, without a dependency on guix
+  or a way to change it back"). td's `host_shell` pivots into a fresh root exposing the
+  WHOLE `/gnu/store` (ro) + the daemon socket `/var/guix` + `/dev` + the worktree + the
+  guix cache, host-guix + the toolchain on PATH, running as **PID 1 of its own PID
+  namespace with a private `/proc`** in its own loopback-only network namespace — full
+  `guix shell -C` parity (user/mount/pid/net/ipc/uts ns). That parity is what lets EVERY
+  rung run nested in td's sandbox, including `rootless` (its nested unprivileged userns
+  builder, which the old shared-`/proc` sandbox could not host) and the loop self-tests.
+  `guix shell` (no `-C`) still provisions the toolchain profile; td replaces the
+  container. The `loop-sandbox`/`loop-rung` rungs are now INTRINSIC self-tests of td's
+  sandbox (store ro + daemon socket + guix, host isolation, PID-1/private-`/proc`,
+  loopback-only netns; and the `--expose-cwd` full env runs a real `eval` rung) — no
+  `guix shell -C` oracle (equivalence was proven over #30–#33; going forward td is
+  self-described, and the build rungs still differential-check against the guix daemon
+  oracle). CI runs the unmodified td-sandbox `./check.sh` (the §7.1 ci-gate "fix the
+  host, never adapt the loop" policy). Done: #30 (exposure + isolation), #31 (net
+  parity), #32/#33 (the swap), then the PID-namespace keystone + carve-out/toggle removal
+  (td is the sole sandbox). Working state + verified-red log: `plan/loop-sandbox.md`.
 - **td-store-db** *(approved 2026-06-14 — "what's next" → "Replace the guix-daemon")* —
   begin replacing the **guix-daemon**, the last big reused Guix component on the build
   side (§2.2/§2.5). td-builder already constructs (#22) / executes (#25) / registers via

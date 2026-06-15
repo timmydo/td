@@ -87,7 +87,7 @@ HEAVY_GATES :=
 FAST_GATES  :=
 include $(sort $(wildcard mk/gates/*.mk))
 
-.PHONY: check check-sandbox check-fast container-check list-gates $(CHEAP_GATES) $(HEAVY_GATES)
+.PHONY: check check-fast container-check list-gates $(CHEAP_GATES) $(HEAVY_GATES)
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -96,18 +96,6 @@ container-check:
 	@./check.sh
 
 check: $(CHEAP_GATES) $(HEAVY_GATES)
-
-# `check` minus `rootless`, for the loop-sandbox swap (./check.sh's default
-# td-sandbox path). `rootless` builds in its OWN unprivileged user namespace and
-# snapshots the LIVE store DB; nesting it inside td's sandbox (itself an
-# unprivileged userns) double-nests and the WAL snapshot cannot coordinate with
-# the host daemon from a nested non-root client. So ./check.sh runs `rootless`
-# separately in its native `guix shell -C` (NOT skipped — it still runs with all
-# its assertions, and a failure fails the whole check) and runs THIS target for
-# the other gates under td's sandbox. The canonical `check` above is UNCHANGED
-# and still includes `rootless` (used by TD_LOOP_GUIX_SHELL=1 and plain
-# `make check`); this is purely additive.
-check-sandbox: $(CHEAP_GATES) $(filter-out rootless,$(HEAVY_GATES))
 
 # The fast tier — the gates that test td's OWN surface (typed/TS front-end + the
 # Rust builder/evaluator) and need only the toolchain: no `guix system image`,
@@ -130,3 +118,12 @@ list-gates:
 chain-prev :=
 $(foreach r,$(CHEAP_GATES),$(eval $(if $(chain-prev),$(r): | $(chain-prev)))$(eval chain-prev := $(r)))
 $(HEAVY_GATES): | $(lastword $(CHEAP_GATES))
+
+# `rootless` runs LAST, alone. It snapshots the LIVE store DB (mk/gates/130 →
+# tests/rootless.sh: copy + wal_checkpoint); a CONCURRENTLY-building gate would
+# leave an active WAL the non-root snapshot cannot read. Gating it order-only on
+# every OTHER heavy gate makes make start it only once they have all finished, so
+# it snapshots a QUIESCENT DB. A scheduling constraint within td's sandbox (td is
+# the sole loop container — there is no guix-shell-C carve-out), not a gate-list
+# edit; cost is rootless's wall time serial at the tail (plan/loop-sandbox.md R8).
+rootless: | $(filter-out rootless,$(HEAVY_GATES))

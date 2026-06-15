@@ -2,9 +2,11 @@
 # rootless rung driver (see the Makefile's `rootless` rung for the contract).
 #
 # Outer phase (no args beyond the four paths): runs inside the check.sh
-# sandbox. Snapshots the host store DB with sqlite's backup API (consistent
-# under sqlite locking even while the host daemon writes — a plain cp races),
-# then re-enters itself under `unshare -m -U -r` for the inner phase.
+# sandbox (td's own host-sandbox). Snapshots the host store DB by COPYING it (+
+# its WAL) into writable scratch and folding the WAL there — race-free because
+# the rung runs LAST and ALONE (the daemon is idle); a live `.backup` cannot
+# read the root-owned WAL DB as the non-root client (R8). Then re-enters itself
+# under `unshare -m -U -r` for the inner phase.
 #
 # Inner phase (--inner): builds a writable view of the store at the SAME path
 # (/gnu/store — required for store-path equality), starts the pinned
@@ -42,10 +44,25 @@ set -euo pipefail
 if [ "${1-}" != "--inner" ]; then
   scratch=$1; img_drv=$2; img_out=$3; probe_drv=$4; probe_out=$5
 
-  echo ">> rootless: snapshot the host store DB (sqlite backup API)"
+  echo ">> rootless: snapshot the host store DB (copy + checkpoint)"
   mkdir -p "$scratch/state/db" "$scratch/newstore" "$scratch/log" "$scratch/tmp"
-  sqlite3 /var/guix/db/db.sqlite \
-    ".timeout 30000" ".backup '$scratch/state/db/db.sqlite'"
+  # A LIVE `sqlite3 .backup` of the host store DB fails as the non-root client:
+  # the DB is in WAL mode, and reading the WAL needs an -shm index (re)created in
+  # the ROOT-owned /var/guix/db — which we cannot write ("attempt to write a
+  # readonly database", plan/loop-sandbox.md R8). Instead COPY the DB (+ its WAL)
+  # into our WRITABLE scratch and fold the WAL there. This is race-free because
+  # the `rootless` rung runs LAST and ALONE (Makefile order-only gate on every
+  # other heavy rung) — the daemon is idle, so the on-disk DB is stable. If a copy
+  # were ever torn, the integrity_check below fails LOUDLY rather than yielding a
+  # cryptic error or a silent false-green.
+  cp /var/guix/db/db.sqlite "$scratch/state/db/db.sqlite"
+  if [ -e /var/guix/db/db.sqlite-wal ]; then
+    cp /var/guix/db/db.sqlite-wal "$scratch/state/db/db.sqlite-wal"
+  fi
+  chmod -R u+w "$scratch/state/db"
+  sqlite3 "$scratch/state/db/db.sqlite" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
+  test "$(sqlite3 "$scratch/state/db/db.sqlite" 'PRAGMA integrity_check;')" = ok \
+    || { echo "FAIL: the copied store-DB snapshot is not consistent (integrity_check failed) — the copy raced the daemon; rootless must run against a quiescent DB" >&2; exit 1; }
   cp /var/guix/db/schema "$scratch/state/db/schema"
 
   echo ">> rootless: enter the nested user namespace"

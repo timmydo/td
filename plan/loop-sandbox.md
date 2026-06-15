@@ -7,6 +7,11 @@ until that lands, then rebased onto main.
 
 ## Goal
 
+**STATUS (2026-06-14): ACHIEVED and then some — td's sandbox is now the SOLE loop
+container; the `guix shell -C` fallback, the `TD_LOOP_GUIX_SHELL` toggle, and the
+carve-out are all GONE (see the last "Implementation progress" entry + R7/R8). The
+narrative below is the original additive-first plan, kept for history.**
+
 `check.sh` enters a fresh `guix shell -C --pure` for every loop step (DESIGN §1.4) —
 the hermetic container that exposes `/gnu/store` + the daemon socket + host-guix on
 PATH while isolating the rest. The north star is ONE Rust sandbox stack spanning build
@@ -124,6 +129,38 @@ container), guix the oracle. Nothing in `check.sh` or any existing rung is chang
   (the load-bearing entry agents run). Making td's sandbox run on the restricted runner
   is a follow-up (diagnose the runner's specific seccomp/userns restriction). Caught by
   the #33 CI `check` job, which then went green on the fallback.
+- **DONE 2026-06-14 (td is the SOLE sandbox — human direction "make td the default,
+  without a dependency on guix or a way to change it back, and implement the features
+  necessary").** Removed the `guix shell -C` fallback, the `TD_LOOP_GUIX_SHELL` toggle,
+  and the `check-sandbox` carve-out entirely. `check.sh` now ALWAYS runs
+  `td-builder host-sandbox --expose-cwd -- make -j2 check` — every rung in td's sandbox,
+  nothing else. The features that made it possible:
+  - **PID-namespace keystone (`builder/src/sandbox.rs`/`sys.rs`).** `host_shell` lacked a
+    PID namespace and bound the host `/proc`, so nested containers tripped over the
+    host's root-owned PID 1 (`/proc/1/setgroups` EPERM) — the real reason `rootless`
+    "couldn't nest" (the R6 "fundamental double-nested userns limit" was a misdiagnosis).
+    `host_shell` now unshares `CLONE_NEWPID` with `NEWUSER`, forks so the command runs as
+    PID 1 of a fresh PID ns, and mounts a private `/proc` reflecting it (host `/proc` bind
+    dropped). Full `guix shell -C` parity (user/mount/pid/net/ipc/uts ns); minimal nested
+    userns+pidns+mount-proc now works, and so does `rootless`.
+  - **`rootless` runs LAST, alone (Makefile ordering).** Its sqlite `.backup` of the LIVE
+    store DB (`tests/rootless.sh`) cannot read an ACTIVE WAL as the non-root client (the
+    root-owned `-shm` is unwritable). That never bit before because `rootless` always ran
+    in a separate phase, never overlapping the `-j2` heavy pool. Gating it order-only on
+    every other heavy rung makes make schedule it after they finish → it snapshots a
+    QUIESCENT DB. A scheduling constraint within td's sandbox, NOT a guix carve-out.
+  - **`loop-sandbox`/`loop-rung` are now INTRINSIC self-tests** (no `guix shell -C`
+    oracle — human's choice): they assert td's sandbox surface directly (store ro +
+    daemon socket + guix via a real `guix build -d hello`; host isolation;
+    PID-1/private-`/proc`; loopback-only netns; and the `--expose-cwd` full env runs a
+    real `eval` rung). Equivalence to `guix shell -C` was proven over #30–#33; going
+    forward td is self-described and the build rungs still differential-check against the
+    guix daemon oracle. This also makes the old #40 oracle-contamination worry moot (no
+    oracle to contaminate). **Directive 3:** the equivalence-vs-guix-shell-C differential
+    is intentionally retired and replaced by self-tests — surfaced here and in the PR.
+  - **CI** runs the unmodified td-sandbox `./check.sh` (the runner already lifts the
+    unprivileged-userns restriction it needs; ci-gate "fix the host, never adapt the
+    loop" policy).
 
 ## Verified-red log
 
@@ -179,3 +216,27 @@ red, fixed)** (2026-06-14):
   ("unable to open database file"). Both seen red. This is a FUNDAMENTAL double-nested
   userns limit, not a missing exposure — resolved by the `check-sandbox` carve-out
   (rootless runs in its native `guix shell -C`, fully, never skipped).
+  *(RETRACTED 2026-06-14 — see R7: it was NOT a fundamental limit. The real cause was
+  the missing PID namespace / private `/proc`; with the keystone, rootless nests fine,
+  and the residual failure was concurrency, not nesting — see R8.)*
+
+**R7 the PID namespace + private `/proc` are load-bearing (the keystone)** (2026-06-14).
+BEFORE adding `CLONE_NEWPID` + a private `/proc` to `host_shell`, inside td's sandbox
+`/proc/1` was the HOST's root-owned shepherd (the sandbox shared the host PID ns and
+bound host `/proc`), so a nested container's `/proc/1/setgroups` write got EPERM —
+`guix shell -C` and the `rootless` daemon could not nest. AFTER the keystone, `/proc/1`
+is the sandbox command (uid 1001), only the sandbox's own PIDs are visible, and minimal
+nested userns+pidns+mount-proc works. The `loop-sandbox` rung's PID-1 assertion
+(`/proc/1/comm` == the command, not the shepherd) goes red without it. This RETRACTS
+R6's "fundamental double-nested userns limit" — it was the missing PID ns, not a kernel
+limit.
+
+**R8 `rootless` cannot snapshot a CONCURRENTLY-written store DB** (2026-06-14). With
+`rootless` moved into the `-j2` heavy pool (no longer a separate phase), the first full
+`./check.sh` went RED at the store-DB snapshot — `Error: attempt to write a readonly
+database` (`tests/rootless.sh` sqlite `.backup`): a concurrently-building rung leaves an
+active WAL whose root-owned `-shm` the non-root snapshot cannot write. DIRECTLY OBSERVED.
+Fixed by gating `rootless` order-only on every other heavy rung so make runs it LAST,
+alone, against a QUIESCENT DB. Proves the constraint is real (the carve-out had masked
+it by never overlapping rootless with a build) and that the fix is a scheduling
+constraint within td's sandbox, not a guix dependency.
