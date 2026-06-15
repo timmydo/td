@@ -761,12 +761,16 @@ run concurrently):
   content path not reachable from ROOT from a td-owned store and rewrites the DB to the live
   set; the `store-gc-sweep` rung copies hello's closure into a td store, sweeps with
   ROOT=glibc, and shows the surviving entries + the rewritten DB hold exactly `guix gc -R
-  glibc` (the host `/gnu/store` never touched). td now owns the full store WRITE side (flat +
-  recursive) + read + DB authority + BOTH halves of GC (mark + sweep) + integrity-verify —
-  daemon as oracle. Later (sketch): referenced sources/outputs (the `output:out`
-  indirection), then a td store backend the build side can use — and the freedom to diverge
-  the on-disk format once nothing external must read it. Working state + verified-red log:
-  `plan/td-store-db.md`.
+  glibc` (the host `/gnu/store` never touched). Increment 9 — **addToStore WITH references**:
+  `td-builder store-add-referenced` computes the content-addressed path with the references
+  folded into the type (`make_text_path` / makeType), writes the content, and registers the
+  path with its `Refs`; the `store-add-referenced` rung shows that for hello's `.drv` and its
+  references, td reproduces the daemon's path (drop a ref and it diverges), a byte-identical
+  `.drv`, and exactly the daemon's recorded references. td now owns addToStore for flat,
+  recursive, AND referenced paths — plus read + DB authority + both halves of GC +
+  integrity-verify — daemon as oracle. Later (sketch): a td store backend the build side can
+  use — and the freedom to diverge the on-disk format once nothing external must read it.
+  Working state + verified-red log: `plan/td-store-db.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 

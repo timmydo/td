@@ -788,6 +788,115 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: ADD a path WITH REFERENCES to a td-owned store — the daemon's
+        // addToStore/addTextToStore WITH a references set, in pure Rust. td computes the
+        // content-addressed path with the references folded into the type
+        // (`make_text_path`: `text:<sorted refs>` — the daemon's makeTextPath/makeType),
+        // WRITES the content into a td-owned store dir (canonical 0444 file), and
+        // REGISTERS it with its `Refs` to the referenced paths (each a scaffolding
+        // ValidPaths row so the join resolves). No daemon. The canonical referenced
+        // content-addressed item is a `.drv` (referenced by its input drvs/srcs). Usage:
+        //   store-add-referenced NAME CONTENT-FILE REFS-FILE STORE-DIR OUT-DB
+        // REFS-FILE lists the references (one store path per line). Prints the store path.
+        Some("store-add-referenced") if args.len() == 7 => {
+            let (name, content_file, refs_file, store_dir, out_db) =
+                (&args[2], &args[3], &args[4], &args[5], &args[6]);
+            let run = || -> Result<String, String> {
+                use std::os::unix::fs::PermissionsExt;
+                use store_db::{Table, Value};
+                let content = std::fs::read(content_file).map_err(|e| e.to_string())?;
+                let mut refs: Vec<String> = std::fs::read_to_string(refs_file)
+                    .map_err(|e| e.to_string())?
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                refs.sort();
+                refs.dedup();
+                // td computes the path with the references in the type (makeTextPath).
+                let path = store::make_text_path(name, &content, &refs);
+                let base = path
+                    .rsplit('/')
+                    .next()
+                    .filter(|_| store::name_from_store_path(&path).is_some())
+                    .ok_or_else(|| format!("computed path {path} is malformed"))?
+                    .to_string();
+                // Write the content as a canonical (0444) store file.
+                std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+                let disk = Path::new(store_dir).join(&base);
+                std::fs::write(&disk, &content).map_err(|e| e.to_string())?;
+                let mut perm =
+                    std::fs::metadata(&disk).map_err(|e| e.to_string())?.permissions();
+                perm.set_mode(0o444);
+                std::fs::set_permissions(&disk, perm).map_err(|e| e.to_string())?;
+                // NAR hash + size of what td wrote (for the registration record).
+                let mut s = scan::Scanner::new(&[path.clone()]).map_err(|e| e.to_string())?;
+                nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
+                let (hash, size, _) = s.finish();
+                // Register: id 1 = the path (full), with its declared references; each
+                // reference is a scaffolding ValidPaths row (path only) so Refs resolves.
+                let mut valid: Vec<(i64, Vec<Value>)> = vec![(
+                    1,
+                    vec![
+                        Value::Null,
+                        Value::Text(path.clone()),
+                        Value::Text(hash),
+                        Value::Int(1),
+                        Value::Null,
+                        Value::Int(size as i64),
+                    ],
+                )];
+                let mut ref_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+                let mut edge = 1i64;
+                let mut next_id = 2i64;
+                for r in &refs {
+                    let target = if r == &path {
+                        1 // a self-reference resolves to id 1
+                    } else {
+                        valid.push((
+                            next_id,
+                            vec![
+                                Value::Null,
+                                Value::Text(r.clone()),
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                            ],
+                        ));
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    };
+                    ref_rows.push((edge, vec![Value::Int(1), Value::Int(target)]));
+                    edge += 1;
+                }
+                let tables = [
+                    Table {
+                        name: "ValidPaths",
+                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+                        rows: valid,
+                    },
+                    Table {
+                        name: "Refs",
+                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+                        rows: ref_rows,
+                    },
+                ];
+                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+                Ok(path)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-add-referenced {name}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-store-db: VERIFY a td store's integrity ourselves — the daemon's
         // `guix gc --verify --check-contents`, in pure Rust. Reads the recorded
         // registration from a td store DB (`store_db_read`, #36), re-NAR-hashes each
@@ -1320,6 +1429,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-closure DB ROOT");
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB");
+            eprintln!("       td-builder store-add-referenced NAME CONTENT-FILE REFS-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
