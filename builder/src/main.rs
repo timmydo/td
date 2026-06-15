@@ -1410,12 +1410,14 @@ fn main() -> ExitCode {
             let run = || -> Result<std::process::ExitStatus, String> {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/home/td".to_string());
                 // The base exposure set: the whole store (ro), the daemon socket
-                // + GC roots (rw), /proc, and the host device tree.
+                // + GC roots (rw), and the host device tree. /proc is NOT bound —
+                // host_shell mounts a FRESH procfs reflecting the sandbox's own
+                // PID namespace (host_shell's doc), so the host /proc never leaks
+                // in and nested containers see a private /proc.
                 let mut binds = vec![
-                    sandbox::Bind { src: "/gnu/store".to_string(), readonly: true },
-                    sandbox::Bind { src: "/var/guix".to_string(), readonly: false },
-                    sandbox::Bind { src: "/proc".to_string(), readonly: false },
-                    sandbox::Bind { src: "/dev".to_string(), readonly: false },
+                    sandbox::Bind { src: "/gnu/store".to_string(), readonly: true, ro_optional: false },
+                    sandbox::Bind { src: "/var/guix".to_string(), readonly: false, ro_optional: false },
+                    sandbox::Bind { src: "/dev".to_string(), readonly: false, ro_optional: false },
                 ];
                 let mut tmpfs = vec!["/tmp".to_string()];
                 let mut path_env = String::new();
@@ -1430,16 +1432,22 @@ fn main() -> ExitCode {
                     // cgroup hierarchy (ro, for crun), and the guix lowering cache
                     // (rw, check.sh --shares it). HOME is a dir on the writable
                     // root tmpfs (created by these binds), so no HOME tmpfs.
-                    binds.push(sandbox::Bind { src: cwd.clone(), readonly: false });
+                    binds.push(sandbox::Bind { src: cwd.clone(), readonly: false, ro_optional: false });
                     if Path::new("/sys/fs/cgroup").is_dir() {
+                        // ro is defense-in-depth (crun probes the hierarchy with
+                        // --cgroup-manager=disabled, never writing it). A child
+                        // userns can't remount-ro the host-owned cgroup2 on some
+                        // kernels (EPERM, e.g. the azure CI runner), so its ro is
+                        // best-effort — kept writable there rather than failing.
                         binds.push(sandbox::Bind {
                             src: "/sys/fs/cgroup".to_string(),
                             readonly: true,
+                            ro_optional: true,
                         });
                     }
                     let cache = format!("{home}/.cache/guix");
                     if Path::new(&cache).is_dir() {
-                        binds.push(sandbox::Bind { src: cache, readonly: false });
+                        binds.push(sandbox::Bind { src: cache, readonly: false, ro_optional: false });
                     }
                     path_env = std::env::var("PATH").unwrap_or_default();
                     workdir = cwd;

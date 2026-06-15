@@ -19,6 +19,10 @@ const SYS_MOUNT: usize = 165;
 const SYS_UMOUNT2: usize = 166;
 const SYS_PIVOT_ROOT: usize = 155;
 const SYS_UNSHARE: usize = 272;
+const SYS_FORK: usize = 57;
+const SYS_WAIT4: usize = 61;
+const SYS_EXIT_GROUP: usize = 231;
+const SYS_WRITE: usize = 1;
 
 // Bring a loopback interface up via SIOCSIFFLAGS on a dgram socket.
 const AF_INET: usize = 2;
@@ -31,6 +35,7 @@ pub const CLONE_NEWNS: usize = 0x0002_0000;
 pub const CLONE_NEWUTS: usize = 0x0400_0000;
 pub const CLONE_NEWIPC: usize = 0x0800_0000;
 pub const CLONE_NEWUSER: usize = 0x1000_0000;
+pub const CLONE_NEWPID: usize = 0x2000_0000;
 pub const CLONE_NEWNET: usize = 0x4000_0000;
 
 pub const MS_RDONLY: usize = 0x1;
@@ -135,6 +140,17 @@ pub fn bring_loopback_up() -> io::Result<()> {
     check(s)
 }
 
+/// Write a diagnostic line to fd 2 (stderr) via the raw write(2) syscall —
+/// async-signal-safe, unlike `eprintln!` whose lock can deadlock in the
+/// post-fork `host_shell` child. Best-effort; a short/failed write is ignored.
+/// Used to label which sandbox setup step failed, since std collapses a
+/// `pre_exec` error into a generic "spawning <cmd>: <errno>".
+pub fn warn(msg: &[u8]) {
+    unsafe {
+        syscall5(SYS_WRITE, 2, msg.as_ptr() as usize, msg.len(), 0, 0);
+    }
+}
+
 pub fn getuid() -> u32 {
     // Cannot fail per the man page.
     unsafe { syscall5(SYS_GETUID, 0, 0, 0, 0, 0) as u32 }
@@ -142,6 +158,47 @@ pub fn getuid() -> u32 {
 
 pub fn getgid() -> u32 {
     unsafe { syscall5(SYS_GETGID, 0, 0, 0, 0, 0) as u32 }
+}
+
+/// fork(2): returns the child PID in the parent and 0 in the child. The
+/// host-sandbox forks AFTER unshare(CLONE_NEWUSER|CLONE_NEWPID) so the child is
+/// PID 1 of the fresh PID namespace (the namespace's first process), which then
+/// mounts a private /proc reflecting that namespace — matching `guix shell -C`'s
+/// child-is-pid1 model so nested containers can create their own PID ns + /proc.
+pub fn fork() -> io::Result<i64> {
+    let ret = unsafe { syscall5(SYS_FORK, 0, 0, 0, 0, 0) };
+    if ret < 0 {
+        Err(io::Error::from_raw_os_error(-ret as i32))
+    } else {
+        Ok(ret as i64)
+    }
+}
+
+/// wait4(2) on a specific PID with no options and no rusage; returns the raw
+/// wait status the kernel fills, decoded by the caller (WIFEXITED/WEXITSTATUS:
+/// `status & 0x7f == 0` means exited with `(status >> 8) & 0xff`).
+pub fn waitpid(pid: i64) -> io::Result<i32> {
+    let mut status: i32 = 0;
+    let ret = unsafe {
+        syscall5(SYS_WAIT4, pid as usize, &mut status as *mut i32 as usize, 0, 0, 0)
+    };
+    if ret < 0 {
+        Err(io::Error::from_raw_os_error(-ret as i32))
+    } else {
+        Ok(status)
+    }
+}
+
+/// exit_group(2): terminate the whole process immediately with `code`. The
+/// host-sandbox's PID-namespace PARENT uses this to propagate its PID-1 child's
+/// exit status WITHOUT returning into std's post-fork exec path — there must be
+/// exactly one exec (the PID-1 child's), and no second sync-pipe write.
+pub fn exit_group(code: i32) -> ! {
+    unsafe {
+        syscall5(SYS_EXIT_GROUP, code as usize, 0, 0, 0, 0);
+    }
+    // exit_group never returns; satisfy the ! type if the kernel ever did.
+    loop {}
 }
 
 #[cfg(test)]
