@@ -766,11 +766,18 @@ run concurrently):
   folded into the type (`make_text_path` / makeType), writes the content, and registers the
   path with its `Refs`; the `store-add-referenced` rung shows that for hello's `.drv` and its
   references, td reproduces the daemon's path (drop a ref and it diverges), a byte-identical
-  `.drv`, and exactly the daemon's recorded references. td now owns addToStore for flat,
-  recursive, AND referenced paths — plus read + DB authority + both halves of GC +
-  integrity-verify — daemon as oracle. Later (sketch): a td store backend the build side can
-  use — and the freedom to diverge the on-disk format once nothing external must read it.
-  Working state + verified-red log: `plan/td-store-db.md`.
+  `.drv`, and exactly the daemon's recorded references. Increment 10 (capstone) — **a td
+  store backend for a build output**: `td-builder store-add-output` PLACES a built output's
+  tree into a td-owned store at its output path and fully registers it (hash + narSize +
+  deriver + references + drv→output); the `store-backend` gate shows td's store HOLDS hello's
+  output (NAR-identical to the daemon's) and SERVES it — `store-query` (registration +
+  references) and `store-verify` (integrity re-hashed against the placed files) all match the
+  daemon, with no daemon in any store operation. td now owns the full store backend: write/read
+  the DB, add (flat/recursive/referenced), GC (mark + sweep), verify, and back a build output
+  end to end — daemon as oracle throughout, never the authority. Next (held by the human until
+  the store stack is reconciled): diverge the on-disk format — the differential becomes a
+  correctness check on td's chosen format, not a guix-compat constraint. Working state +
+  verified-red log: `plan/td-store-db.md`.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 

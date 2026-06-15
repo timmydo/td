@@ -897,6 +897,128 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: a td STORE BACKEND for a BUILD OUTPUT — place a built output's
+        // TREE into a td-owned store at its output path and FULLY REGISTER it (the
+        // daemon's post-build registration: hash + narSize + deriver + the output's
+        // references + the drv->output mapping), in pure Rust, no daemon. The result is
+        // a td-owned store that HOLDS the build result and is served by td's own tools
+        // (store-query / store-verify / store-closure). Usage:
+        //   store-add-output OUTPUT DERIVER CLOSURE-FILE STORE-DIR OUT-DB
+        // CLOSURE-FILE is OUTPUT's runtime closure (`guix gc -R`), used to scan
+        // references. The output's tree is placed; its references are scaffolding rows.
+        Some("store-add-output") if args.len() == 7 => {
+            let (output, deriver, closure_file, store_dir, out_db) =
+                (&args[2], &args[3], &args[4], &args[5], &args[6]);
+            let run = || -> Result<String, String> {
+                use store_db::{Table, Value};
+                let closure: Vec<String> = std::fs::read_to_string(closure_file)
+                    .map_err(|e| e.to_string())?
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let base = output
+                    .rsplit('/')
+                    .next()
+                    .filter(|_| store::name_from_store_path(output).is_some())
+                    .ok_or_else(|| format!("output {output} is not a store path"))?
+                    .to_string();
+                // Place the output TREE canonically into the td-owned store.
+                std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+                let disk = Path::new(store_dir).join(&base);
+                copy_canonical(Path::new(output), &disk)?;
+                // Scan the PLACED tree for its registration (hash + size + references
+                // among the closure) — the `build` machinery.
+                let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
+                nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
+                let (hash, size, refs) = s.finish();
+                // Register: id 1 = the OUTPUT (full, with its deriver); id 2 = the
+                // deriver scaffold (so DerivationOutputs.drv resolves); ids 3.. = the
+                // references (scaffold, path only). Refs: output -> each reference.
+                let mut valid: Vec<(i64, Vec<Value>)> = vec![
+                    (
+                        1,
+                        vec![
+                            Value::Null,
+                            Value::Text(output.to_string()),
+                            Value::Text(hash),
+                            Value::Int(1),
+                            Value::Text(deriver.to_string()),
+                            Value::Int(size as i64),
+                        ],
+                    ),
+                    (
+                        2,
+                        vec![
+                            Value::Null,
+                            Value::Text(deriver.to_string()),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                        ],
+                    ),
+                ];
+                let mut ref_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+                let mut edge = 1i64;
+                let mut next_id = 3i64;
+                for r in &refs {
+                    let target = if r == output {
+                        1 // self-reference -> id 1
+                    } else {
+                        valid.push((
+                            next_id,
+                            vec![
+                                Value::Null,
+                                Value::Text(r.clone()),
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                            ],
+                        ));
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    };
+                    ref_rows.push((edge, vec![Value::Int(1), Value::Int(target)]));
+                    edge += 1;
+                }
+                let drv_out = vec![(
+                    1i64,
+                    vec![Value::Int(2), Value::Text("out".to_string()), Value::Text(output.to_string())],
+                )];
+                let tables = [
+                    Table {
+                        name: "ValidPaths",
+                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+                        rows: valid,
+                    },
+                    Table {
+                        name: "Refs",
+                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+                        rows: ref_rows,
+                    },
+                    Table {
+                        name: "DerivationOutputs",
+                        sql: "CREATE TABLE DerivationOutputs (drv integer, id text, path text)",
+                        rows: drv_out,
+                    },
+                ];
+                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+                Ok(output.to_string())
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-add-output {output}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-store-db: VERIFY a td store's integrity ourselves — the daemon's
         // `guix gc --verify --check-contents`, in pure Rust. Reads the recorded
         // registration from a td store DB (`store_db_read`, #36), re-NAR-hashes each
@@ -1430,6 +1552,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-referenced NAME CONTENT-FILE REFS-FILE STORE-DIR OUT-DB");
+            eprintln!("       td-builder store-add-output OUTPUT DERIVER CLOSURE-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
