@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: rootless-snapshot-race
 handle: claude-opus-117569
 date: 2026-06-15

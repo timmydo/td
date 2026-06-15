@@ -84,8 +84,43 @@ so the iteration cost is one rootless gate, not the full check.)
 3. **Seal.** Remove the live-DB `cp` path; structural assertion that rootless never reads
    `/var/guix/db` (race eliminated by construction, not mitigated).
 
+## Discovered prerequisite: multi-page b-trees
+
+`store-register` panicked constructing the DB (index underflow): the `store_db`
+writer was SINGLE-leaf-page per table (fine for hello's 4-path closure — all the
+td-store-db gates use hello), but the rootless bind closure is **4547 paths**, far
+over one 4 KB page. Added proper table b-trees to `store_db.rs`: leaf pages are packed
+and, when rows exceed one page, interior pages (type 0x05) are built above them to
+arbitrary depth. Single-page DBs (hello) stay byte-identical (rootpages 2.. unchanged),
+so the existing store-db gates are untouched; validated fast against sqlite3 (a 114-path
+closure → an 11-page DB, `integrity_check` ok, every row + ref intact).
+
+## Daemon acceptance: PROVEN
+
+An unprivileged guix-daemon reads td's hand-built DB without complaint. At this pin
+guix's `ValidPaths` is exactly `(id, path, hash, registrationTime, deriver, narSize)` —
+matching td's schema (no `ultimate`/`sigs`/`ca`); the index/trigger/FailedPaths
+decorations td omits are added with sqlite3 on the constructed DB (deterministic, not
+racy). The `rootless` gate is GREEN with the constructed DB: validity guard passes,
+`--check` rebuilds the image and matches td's recorded NAR hash oracle.
+
+## Verified-red log
+
+**R1 store-register dedupe** (2026-06-15). The pre-fix binary, given a closure-member
+deriver (glibc), wrote a DUPLICATE `ValidPaths` row (total = n+1, distinct = n-1 vs n);
+the fix writes exactly n with no duplicate. The store-register gate's new
+deriver-in-closure assertion reds on the duplicate.
+
+**R2 the constructed DB is load-bearing** (2026-06-15). Dropped the oracle output from
+the constructed DB (`DELETE FROM ValidPaths WHERE path=img_out`) and ran the rootless
+gate: it RED at the validity guard — "the root-daemon-built image output is NOT valid in
+the DB" (CHECKEXIT=2). Proves the rootless differential genuinely runs against td's
+constructed DB (not a vacuous pass). Reverted; gate green again.
+
 ## Status
 
-Claimed + designed; spike run (2026-06-15) — confirmed the tool builds a valid DB and
-that acceptance must be proven via the rootless gate's staged store. Increment 1
-(deriver dedupe) next.
+DONE 2026-06-15. All three increments landed: (1) store-register deriver-in-closure
+dedupe; (2) rootless constructs the snapshot DB from the closure (race-free) — green
+end to end, daemon-acceptance proven, plus the `store_db` multi-page-b-tree
+prerequisite; (3) seal — the gate fails if rootless.sh ever reads the live `db.sqlite`
+again. The cross-check snapshot race is eliminated by construction, not mitigated.
