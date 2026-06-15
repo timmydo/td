@@ -5,9 +5,13 @@
 #   ./.github/setup-branch-protection.sh [--require-runner-check]
 #
 # By default only the GitHub-hosted `lint` job is a REQUIRED status check.
-# Pass --require-runner-check once the CI store image is published to GHCR
-# (ci/build-ci-image.sh) and one PR has shown a green `check` — do NOT pass
-# it before then: a required check that cannot pass blocks every PR forever.
+# Pass --require-runner-check once the td-ci-fast store image is published to
+# GHCR (ci/build-ci-image.sh) and one PR has shown a green `check-fast` — do NOT
+# pass it before then: a required check that cannot pass blocks every PR forever.
+# (Since #26 CI runs the FAST tier only — `./check.sh check-fast`. The full
+# hermetic loop is the dev-machine gate, DESIGN §7.2 step 2, plus the image
+# pipeline's validate job; it is NOT a per-PR status check, so this requires the
+# `check-fast` context — there is no `check` job.)
 #
 # What the ruleset enforces on main:
 #   - no direct pushes: changes land only via pull request;
@@ -29,7 +33,7 @@ set -eu
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 checks='{"context": "lint"}'
 if [ "${1:-}" = "--require-runner-check" ]; then
-  checks='{"context": "lint"}, {"context": "check"}'
+  checks='{"context": "lint"}, {"context": "check-fast"}'
 fi
 
 # Prefer rebase/squash merges; merge commits would break the linear-history
@@ -85,5 +89,5 @@ gh api -X "$method" "$path" --input - <<EOF >/dev/null
 }
 EOF
 echo "ruleset 'protect-main' applied ($method): PRs only, 1 review, required checks: lint${existing:+ (replaced previous)}"
-[ "${1:-}" = "--require-runner-check" ] && echo "  + required check: check (full ./check.sh via the CI store image)"
+[ "${1:-}" = "--require-runner-check" ] && echo "  + required check: check-fast (./check.sh check-fast via the td-ci-fast store image)"
 exit 0
