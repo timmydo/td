@@ -1,0 +1,35 @@
+;; tests/ts-recipe-gzip-drv.scm — lower the derivations the `corpus-gzip` gate
+;; builds + --checks (DESIGN §7.1 input-recipes: reconstruct individual recipes,
+;; the move-off-Guile §5 phase frontier). The gzip counterpart of
+;; tests/ts-recipe-popt-drv.scm.
+;;
+;; Emits, for the shell gate to consume:
+;;   TD_DRV     — the TS-authored recipe (recipe-gzip.ts, lowered through the Guile
+;;                recipe bridge system td-recipe), ungrafted .drv
+;;   ORACLE_DRV — the pinned corpus `gzip` (the §2.5 oracle), ungrafted .drv
+;;   ORACLE_OUT — the corpus oracle's ungrafted output store path
+;;
+;; The recipe JSON arrives via TD_RECIPE_GZIP_JSON (tsc -> boa -> recipe()).
+(use-modules (guix store)
+             (guix packages)
+             (guix derivations)
+             (ice-9 format)
+             (gnu packages)                 ;the ORACLE (specification->package gzip)
+             (system td-recipe))
+
+(define (env-json name)
+  (let ((v (getenv name)))
+    (when (or (not v) (string=? v ""))
+      (format (current-error-port)
+              "ts-recipe-gzip-drv: ~a not set (need the emitted recipe JSON)~%" name)
+      (exit 2))
+    v))
+
+(with-store store
+  (set-build-options store #:use-substitutes? #f #:offload? #f)
+  (let ((td     (package-derivation store
+                  (json-recipe->package (env-json "TD_RECIPE_GZIP_JSON")) #:graft? #f))
+        (oracle (package-derivation store (specification->package "gzip") #:graft? #f)))
+    (format #t "TD_DRV=~a~%" (derivation-file-name td))
+    (format #t "ORACLE_DRV=~a~%" (derivation-file-name oracle))
+    (format #t "ORACLE_OUT=~a~%" (derivation->output-path oracle))))

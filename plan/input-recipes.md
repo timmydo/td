@@ -148,22 +148,64 @@ optional trailing `#t`.
       NAR-hash-equal to the corpus popt
       (`13kvphyxjy7mz3i7lrzyqixi16sa3rc057mbl97kjncf9jm8lx54`).
 
+## Inc.4 — phases that bake a build store path; `tests?` (PR #?? — corpus-gzip)
+
+The next phase-vocabulary bricks: a substitution replacement can be a
+`string-append` of literal strings + build store paths (`{output: NAME}` →
+`(assoc-ref outputs NAME)`, `{input: NAME}` → `(assoc-ref inputs NAME)`), lowered
+through a `(lambda* (#:key outputs/inputs …) …)`; and a `tests` field
+(`#:tests? #f`). This is the idiom nano's DIRECT inputs use to inject store paths
+in their phases. Demonstrated byte-identical on **gzip** — its
+`use-absolute-name-of-gzip` phase rewrites `exec 'gzip'` to
+`exec <out>/bin/gzip` and it builds with `#:tests? #f`. Build-free spikes confirmed
+first: arg ORDER is irrelevant (gnu-build-system normalizes it) and the
+bridge-generated `string-append`/`lambda*` gexp lowers to the oracle drv
+`6pajp3gyq2sr4s6j12zw36qnbk8l023q`.
+
+### Pieces
+
+- `tests/ts/td-spec.d.ts` — `RefPart`, `Replacement.stringAppend`,
+  `Phase.lambdaArgs?`, `Recipe.tests?`.
+- `tests/ts/recipe-gzip.ts` (+ `-perturbed.ts` — wrong source-hash byte).
+- `system/td-recipe.scm` — `ref-part->gexp` + `subst-replacement->gexp`
+  (stringAppend), `phase-lambda` (`lambda*` formals), `recipe-arguments` (`#:tests?`).
+- `tests/ts-recipe-gzip-{diff,drv}.scm`; `mk/gates/320-corpus-gzip.mk`.
+
+### Gate `corpus-gzip` proves
+
+  (a) CONVERGE — gzip (path-ref phase + `#:tests? #f`) lowers to the corpus oracle drv;
+  (b) DISCRIMINATE-src — a perturbed source diverges;
+  (c) phase LOAD-BEARING — stripping `phases` diverges;
+  (d) BUILD + `--check` — path-identical AND NAR-hash-equal to the corpus gzip
+      (`0qhr884lpk7yl67ckyjmx89g0wn10mh5331plz9z4hpgq7wf5dls`).
+
 ## Next increments (the rest of the frontier)
 
-- nano's DIRECT inputs — **ncurses** and **gettext-minimal** — need a RICHER phase
-  vocabulary than popt's minimal substitute*/which set:
-  - gettext-minimal: `makeFlags` (literal `"VERBOSE=yes"`), the `doc` output (done),
-    and TWO phases — `patch-fixed-paths` (pure-literal substitute*, already
-    expressible) and `patch-tests` (a `lambda*` taking `inputs`, `with-fluids`,
-    `find-files` with a regexp, `cons`) — the second needs new phase-body
-    vocabulary (input-keyword lambda, find-files, with-fluids).
+- nano's DIRECT inputs — **ncurses** and **gettext-minimal** — still need more:
+  - gettext-minimal: `makeFlags` (literal `"VERBOSE=yes"`) + the `doc` output (done)
+    + configureFlags (done) + TWO phases — `patch-fixed-paths` (pure-literal
+    substitute*, expressible NOW) and `patch-tests` (a `lambda*` w/ `inputs`,
+    `with-fluids`, `find-files` with a regexp, `cons`) — the second needs new
+    phase-body vocabulary (find-files file args, with-fluids).
   - ncurses: a custom `configure` replacement, a `post-install` phase, and an
-    `apply-rollup-patch` phase that FETCHES an extra fixed-output source
-    (invisible-mirror.net) — needs phase-level source inputs + invoke.
-  Each is its own follow-on rung; the bricks done so far (configureFlags + multi-URI,
-  multi-output, minimal-phase) are the foundation.
+    `apply-rollup-patch` phase that FETCHES an extra fixed-output source — needs
+    phase-level source inputs + `invoke`.
+  Done so far: configureFlags + multi-URI, multi-output, minimal-phase
+  (substitute*/which), store-path-baking phase + `tests?`. Remaining phase
+  vocabulary: `makeFlags`, find-files, with-fluids, invoke, phase-level fetched
+  sources.
 - Eventually: regenerate the input lock from td's OWN reconstructed recipes (not
   `specification->package`), package-by-package, toolchain LAST.
+
+## Verified-red log (Inc.4, store-path-baking phase + tests? — corpus-gzip)
+
+- **R5 store-path phase load-bearing** — make `recipe-phases` return `#f` always
+  (ignore gzip's phase). The candidate gzip drv then lacks the
+  `use-absolute-name-of-gzip` phase ⇒ diverges from the corpus oracle
+  `6pajp3gyq2sr4s6j12zw36qnbk8l023q…`; the differential reds at leg (a) CONVERGE
+  (exit 1). Proves the generated `string-append`/`assoc-ref outputs`/`lambda*` gexp
+  is exactly what makes gzip converge. Restored; gate green (`./check.sh
+  corpus-gzip`, NAR-hash-equal `0qhr884lpk7yl67ckyjmx89g0wn10mh5331plz9z4hpgq7wf5dls`).
 
 ## Verified-red log (Inc.3, phases — corpus-popt)
 

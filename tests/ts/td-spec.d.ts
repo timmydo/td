@@ -67,10 +67,20 @@ interface Source {
  *  outside this union is a compile-time error — like `RootFsType`. v0 is `"gnu"`. */
 declare type BuildSystem = "gnu";
 
-/** A `substitute*` replacement: a literal string, or `{ which: PROG }` — the
- *  `(which PROG)` that resolves a program on PATH at build time (a common patch
- *  idiom, e.g. replacing `/bin/echo` with the build environment's `echo`). */
-type Replacement = string | { readonly which: string };
+/** A part of a `string-append` replacement: a literal string, or a build-time
+ *  store path — `{ output: NAME }` → `(assoc-ref outputs NAME)` (an output dir),
+ *  `{ input: NAME }` → `(assoc-ref inputs NAME)` (a build input's path). */
+type RefPart = string | { readonly output: string } | { readonly input: string };
+
+/** A `substitute*` replacement:
+ *  - a literal string;
+ *  - `{ which: PROG }` → `(which PROG)` (resolve a program on PATH at build time);
+ *  - `{ stringAppend: PART[] }` → `(string-append PART …)`, the idiom that bakes a
+ *    build-time store path (an output dir, an input's path) into a patched file. */
+type Replacement =
+  | string
+  | { readonly which: string }
+  | { readonly stringAppend: readonly RefPart[] };
 
 /** One `substitute*` on a source file: replace text matching `from` (a regexp,
  *  exactly as the corpus phase writes it) with `to`. */
@@ -82,16 +92,20 @@ interface Substitution {
 
 /** A custom build phase, added relative to a `%standard-phases` anchor. The body
  *  is a list of `substitute*` source patches (the dominant patch idiom in corpus
- *  recipes). `returnTrue` appends a trailing `#t` to the phase body, matching
- *  packages whose phase ends in `#t`. The bridge lowers this DATA to the same
- *  `(modify-phases %standard-phases (add-{before,after} 'anchor 'name (lambda _
- *  …)))` gexp the corpus package writes by hand — so a recipe that declares a
- *  package's real phase converges on it. */
+ *  recipes). `lambdaArgs` are the keyword parameters the phase procedure takes —
+ *  omit for a nullary `(lambda _ …)`, or e.g. `["outputs"]` for a
+ *  `(lambda* (#:key outputs #:allow-other-keys) …)` (needed when a substitution
+ *  references the build's `outputs`/`inputs`). `returnTrue` appends a trailing
+ *  `#t` to the phase body, matching packages whose phase ends in `#t`. The bridge
+ *  lowers this DATA to the same `(modify-phases %standard-phases (add-{before,
+ *  after} 'anchor 'name …))` gexp the corpus package writes by hand — so a recipe
+ *  that declares a package's real phase converges on it. */
 interface Phase {
   readonly position: "before" | "after";
   readonly anchor: string;
   readonly name: string;
   readonly substitutions: readonly Substitution[];
+  readonly lambdaArgs?: readonly ("inputs" | "outputs")[];
   readonly returnTrue?: boolean;
 }
 
@@ -102,10 +116,11 @@ interface Phase {
  *  RESOLVES it from the corpus (input resolution stays Guix's, retired LAST —
  *  DESIGN §5). `configureFlags` are the build system's `#:configure-flags`;
  *  `outputs` are the package's outputs (declare extra `"debug"`/`"static"`/`"doc"`
- *  exactly as the corpus splits them); `phases` are custom build phases. Each
- *  enters the build derivation, so declare them exactly as the corpus package
- *  does. Omit them all for a leaf package with default arguments and a single
- *  `"out"` (e.g. hello). */
+ *  exactly as the corpus splits them); `phases` are custom build phases; `tests`
+ *  is whether to run the test suite (`#:tests?`, default `true` — set `false` for
+ *  a package the corpus builds with tests off). Each enters the build derivation,
+ *  so declare them exactly as the corpus package does. Omit them all for a leaf
+ *  package with default arguments and a single `"out"` (e.g. hello). */
 interface Recipe {
   readonly name: string;
   readonly version: string;
@@ -115,6 +130,7 @@ interface Recipe {
   readonly configureFlags?: readonly string[];
   readonly outputs?: readonly string[];
   readonly phases?: readonly Phase[];
+  readonly tests?: boolean;
 }
 
 /** Declare an upstream source by URL (or mirror-URL list) + content hash (does
