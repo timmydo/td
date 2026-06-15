@@ -8,7 +8,8 @@
 # otherwise intact. Heavy (a warm-store Rust build + a --check), so it slots late
 # in the LPT order alongside td-builder.
 HEAVY_GATES += ts-eval
-FAST_GATES += ts-eval
+# Not FAST_GATES: boa Rust build + --check — too heavy for the fast CI tier
+# (and absent from the small td-ci-fast image). Runs in full check / local ./check.sh.
 ts-eval:
 	@echo ">> ts-eval: boa evaluator + curated global (ts-frontend Phase 1, sub-task 2)"
 	@set -euo pipefail; \

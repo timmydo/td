@@ -15,7 +15,8 @@
 # paths are inputs) stays Guix's — the toolchain is retired last (§5); what moved to
 # Rust is the construction.
 HEAVY_GATES += drv-emit
-FAST_GATES += drv-emit
+# Not FAST_GATES: td-builder Rust build — too heavy for the fast CI tier
+# (absent from the small td-ci-fast image). Full check / local ./check.sh.
 drv-emit:
 	@echo ">> drv-emit: td-builder constructs the td-build hello .drv byte-identical to guix's; a perturbed recipe is a distinct .drv it also matches (evaluator-as-library)"
 	@set -euo pipefail; \
