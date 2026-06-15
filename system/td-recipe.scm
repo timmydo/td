@@ -89,11 +89,58 @@
 ;; arguments — byte-identical to specifying none — so a recipe that declares no
 ;; flags (hello, nano) lowers unchanged (the `corpus`/`corpus-deps` oracles are
 ;; untouched, directive 3).
+;; A recipe's declared build PHASES (DESIGN §7.1 move-off-Guile §5; the phase
+;; frontier for nano's own inputs, whose recipes patch source files in custom
+;; phases). A phase is structured DATA in the TS surface — position/anchor/name +
+;; a list of `substitute*` substitutions — that the bridge LOWERS to the same
+;; `(modify-phases %standard-phases …)` gexp the corpus package writes by hand;
+;; building it programmatically yields the byte-identical build expression (so the
+;; reconstructed package converges on the corpus oracle). `gnu-build-system` /
+;; `(guix build utils)` (substitute*/which/modify-phases) stay the build-time
+;; toolchain (retired LAST, §5); only the phase DATA comes from the TS surface.
+;;
+;; A substitution's replacement is either a literal string or `{which: PROG}`
+;; (the `(which PROG)` that resolves a program on PATH at build time — a common
+;; patch idiom). `returnTrue` appends a trailing `#t` to the phase body, matching
+;; packages whose phase ends in `#t`.
+(define (subst-replacement->gexp to)
+  (cond
+   ((string? to) to)
+   ((and (pair? to) (assoc "which" to)) #~(which #$(assoc-ref to "which")))
+   (else (error "td-recipe: unsupported substitution replacement" to))))
+
+(define (substitution->gexp s)
+  (let ((file (field s "file"))
+        (from (field s "from"))
+        (to   (subst-replacement->gexp (field s "to"))))
+    #~(substitute* #$file ((#$from) #$to))))
+
+(define (phase->gexp p)
+  (let* ((pos    (field p "position"))
+         (anchor (string->symbol (field p "anchor")))
+         (name   (string->symbol (field p "name")))
+         (subs   (map substitution->gexp (vector->list (field p "substitutions"))))
+         (lam    (if (eq? (field/default p "returnTrue" #f) #t)
+                     #~(lambda _ #$@subs #t)
+                     #~(lambda _ #$@subs))))
+    (cond
+     ((string=? pos "before") #~(add-before (quote #$anchor) (quote #$name) #$lam))
+     ((string=? pos "after")  #~(add-after  (quote #$anchor) (quote #$name) #$lam))
+     (else (error "td-recipe: phase position must be \"before\" or \"after\"" pos)))))
+
+;; The recipe's #:phases gexp, or #f when none are declared (so a recipe without
+;; phases lowers exactly as before — the existing oracles are untouched).
+(define (recipe-phases alist)
+  (let ((ps (vector->list (field/default alist "phases" #()))))
+    (and (pair? ps)
+         #~(modify-phases %standard-phases #$@(map phase->gexp ps)))))
+
 (define (recipe-arguments alist)
-  (let ((flags (vector->list (field/default alist "configureFlags" #()))))
-    (if (null? flags)
-        '()
-        (list #:configure-flags #~(quote #$flags)))))
+  (let ((flags  (vector->list (field/default alist "configureFlags" #())))
+        (phases (recipe-phases alist)))
+    (append
+     (if (null? flags) '() (list #:configure-flags #~(quote #$flags)))
+     (if phases (list #:phases phases) '()))))
 
 ;; A recipe's declared package OUTPUTS (a JSON array of names; guile-json yields a
 ;; vector). Many corpus packages split off extra outputs — `debug`, `static`,
@@ -111,10 +158,10 @@
   "Reconstruct a Guix package from a TS-authored recipe emitted as JSON by the boa
 evaluator.  Only the build-derivation-determining coordinates come from the
 recipe (name, version, source uri+sha256 — a single URL or a mirror LIST, build
-system, any #:configure-flags, any extra outputs, and the names of any build
-inputs); the human-readable metadata is placeholder (it does not enter the
-derivation), so the reconstructed package converges on the corpus oracle's build
-by construction."
+system, any #:configure-flags, any extra outputs, any custom #:phases, and the
+names of any build inputs); the human-readable metadata is placeholder (it does
+not enter the derivation), so the reconstructed package converges on the corpus
+oracle's build by construction."
   (let* ((a      (json-string->scm json-string))
          (name   (field a "name"))
          (version (field a "version"))
