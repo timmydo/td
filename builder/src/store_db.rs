@@ -227,7 +227,10 @@ fn build_btree(cells: &[Vec<u8>], rowids: &[i64], next_page: &mut u32, out: &mut
         let pn = *next_page;
         *next_page += 1;
         out.extend_from_slice(&leaf_page_from_cells(&cells[s..e], false));
-        level.push((pn, rowids[e - 1]));
+        // An EMPTY table is one empty leaf page (no rows, no interior level), so
+        // its max key is unused; guard the `e - 1` index (e == 0 here).
+        let max_key = if e > s { rowids[e - 1] } else { 0 };
+        level.push((pn, max_key));
     }
     // Interior levels until a single page remains. Cost per child counts a full
     // cell (4-byte child + key varint + 2-byte pointer) even for the right-most
@@ -392,5 +395,37 @@ mod tests {
         // page 2 is the ValidPaths leaf with one cell.
         assert_eq!(db[PAGE_SIZE], LEAF);
         assert_eq!(u16::from_be_bytes([db[PAGE_SIZE + 3], db[PAGE_SIZE + 4]]), 1);
+    }
+
+    #[test]
+    fn empty_table_is_one_empty_leaf() {
+        // The flat store-add case: a path with no refs / no deriver-output rows.
+        // An empty table must be a single empty leaf page (not a panic on rowids[-1]).
+        let t = Table { name: "Refs", sql: "CREATE TABLE Refs (referrer integer, reference integer)", rows: vec![] };
+        let db = write_db(&[t]);
+        assert_eq!(db.len(), 2 * PAGE_SIZE); // page 1 (master) + 1 empty leaf
+        assert_eq!(db[PAGE_SIZE], LEAF); // page 2 is a leaf
+        assert_eq!(u16::from_be_bytes([db[PAGE_SIZE + 3], db[PAGE_SIZE + 4]]), 0); // 0 cells
+    }
+
+    #[test]
+    fn many_rows_span_interior_pages() {
+        // Enough rows to overflow one leaf: the table b-tree grows an interior
+        // root (type 0x05) above multiple leaves, and the page count reflects it.
+        let rows: Vec<(i64, Vec<Value>)> = (1..=2000)
+            .map(|i| (i, vec![Value::Null, Value::Text(format!("/gnu/store/{i:0>40}-p"))]))
+            .collect();
+        let t = Table {
+            name: "ValidPaths",
+            sql: "CREATE TABLE ValidPaths (id integer primary key, path text)",
+            rows,
+        };
+        let db = write_db(&[t]);
+        let pages = u32::from_be_bytes([db[28], db[29], db[30], db[31]]) as usize;
+        assert!(pages > 3, "2000 rows must span multiple leaves + an interior page, got {pages}");
+        assert_eq!(db.len(), pages * PAGE_SIZE);
+        // The ValidPaths rootpage (from sqlite_master) must be an INTERIOR page.
+        // It is the last page written (built after its leaves).
+        assert_eq!(db[(pages - 1) * PAGE_SIZE], INTERIOR);
     }
 }
