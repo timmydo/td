@@ -73,8 +73,11 @@ declare type BuildSystem = "gnu";
  *  package name; the Guile bridge RESOLVES it from the corpus (input resolution
  *  stays Guix's, retired LAST — DESIGN §5). `configureFlags` are the build
  *  system's `#:configure-flags` (they enter the build derivation, so declare them
- *  exactly as the corpus package does). Omit `inputs`/`configureFlags` for a leaf
- *  package with default arguments (e.g. hello). */
+ *  exactly as the corpus package does). `outputs` are the package's outputs —
+ *  declare extra outputs (`"debug"`, `"static"`, `"doc"`) exactly as the corpus
+ *  package splits them, since an extra output enters the derivation. Omit
+ *  `inputs`/`configureFlags`/`outputs` for a leaf package with default arguments
+ *  and a single `"out"` (e.g. hello). */
 interface Recipe {
   readonly name: string;
   readonly version: string;
@@ -82,6 +85,7 @@ interface Recipe {
   readonly buildSystem: BuildSystem;
   readonly inputs?: readonly string[];
   readonly configureFlags?: readonly string[];
+  readonly outputs?: readonly string[];
 }
 
 /** Declare an upstream source by URL (or mirror-URL list) + content hash (does
