@@ -27,6 +27,7 @@
 (define-module (system td-recipe)
   #:use-module (guix packages)
   #:use-module (guix download)
+  #:use-module (guix gexp)               ;#:configure-flags is a G-EXPRESSION
   #:use-module (guix build-system gnu)
   #:use-module ((guix licenses) #:prefix license:)
   #:use-module (gnu packages)            ;input resolution only (specification->package)
@@ -67,18 +68,44 @@
          (specification->package n))
        (vector->list names)))
 
+;; A recipe's declared upstream URI is either a single URL string or — for a
+;; package with mirror fallbacks, like pkg-config — a JSON array of URLs
+;; (guile-json yields a vector). `url-fetch` accepts a string OR a list of
+;; strings; the source derivation (hence the package's whole derivation) is
+;; byte-identical to the corpus oracle only when the URI SHAPE matches, so a
+;; declared list passes through as a list (a single string is unchanged, so
+;; hello/nano lower exactly as before).
+(define (recipe-uri source)
+  (let ((u (field source "uri")))
+    (if (vector? u) (vector->list u) u)))
+
+;; A recipe's declared #:configure-flags (a JSON array of literal strings;
+;; guile-json yields a vector). `gnu-build-system` reads #:configure-flags as a
+;; G-EXPRESSION wrapping a quoted list (the corpus packages write
+;; `#:configure-flags #~'( … )`), and that quoted list is spliced verbatim into
+;; the build expression — so to converge on a corpus package that sets flags the
+;; bridge must reconstruct exactly that gexp shape (`#~(quote #$flags)`). Omitted
+;; or empty ⇒ the EMPTY argument list, i.e. the default `gnu-build-system`
+;; arguments — byte-identical to specifying none — so a recipe that declares no
+;; flags (hello, nano) lowers unchanged (the `corpus`/`corpus-deps` oracles are
+;; untouched, directive 3).
+(define (recipe-arguments alist)
+  (let ((flags (vector->list (field/default alist "configureFlags" #()))))
+    (if (null? flags)
+        '()
+        (list #:configure-flags #~(quote #$flags)))))
+
 (define (json-recipe->package json-string)
   "Reconstruct a Guix package from a TS-authored recipe emitted as JSON by the boa
 evaluator.  Only the build-derivation-determining coordinates come from the
-recipe (name, version, source uri+sha256, build system, and the names of any
-build inputs); the human-readable metadata is placeholder (it does not enter the
-derivation), so the reconstructed package converges on the corpus oracle's build
-by construction."
+recipe (name, version, source uri+sha256 — a single URL or a mirror LIST, build
+system, any #:configure-flags, and the names of any build inputs); the
+human-readable metadata is placeholder (it does not enter the derivation), so the
+reconstructed package converges on the corpus oracle's build by construction."
   (let* ((a      (json-string->scm json-string))
          (name   (field a "name"))
          (version (field a "version"))
          (source (field a "source"))
-         (uri    (field source "uri"))
          (hash   (field source "sha256"))
          (bs     (field a "buildSystem"))
          (inputs (field/default a "inputs" #())))
@@ -87,9 +114,10 @@ by construction."
       (version version)
       (source (origin
                 (method url-fetch)
-                (uri uri)
+                (uri (recipe-uri source))
                 (sha256 (base32 hash))))
       (build-system (build-system-for bs))
+      (arguments (recipe-arguments a))
       (inputs (resolve-inputs inputs))
       ;; Metadata does not enter the derivation (proven by convergence on the
       ;; oracle); kept minimal and recipe-derived.
