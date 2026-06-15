@@ -1409,15 +1409,17 @@ fn main() -> ExitCode {
             let cmd_args: Vec<String> = args[i + 2..].to_vec();
             let run = || -> Result<std::process::ExitStatus, String> {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/home/td".to_string());
-                // The base exposure set: the whole store (ro), the daemon socket
-                // + GC roots (rw), and the host device tree. /proc is NOT bound —
+                // The base exposure set: the whole store (ro) and the daemon
+                // socket + GC roots (rw). /dev is NOT bound — host_shell builds a
+                // minimal synthetic /dev (standard char devices + shm + pts + fd
+                // links, like `guix shell -C`) instead of leaking the host device
+                // tree (kmsg/kvm/disks/input/GPUs). /proc is NOT bound either —
                 // host_shell mounts a FRESH procfs reflecting the sandbox's own
-                // PID namespace (host_shell's doc), so the host /proc never leaks
-                // in and nested containers see a private /proc.
+                // PID namespace, so the host /proc never leaks in and nested
+                // containers see a private /proc.
                 let mut binds = vec![
                     sandbox::Bind { src: "/gnu/store".to_string(), readonly: true, ro_optional: false },
                     sandbox::Bind { src: "/var/guix".to_string(), readonly: false, ro_optional: false },
-                    sandbox::Bind { src: "/dev".to_string(), readonly: false, ro_optional: false },
                 ];
                 let mut tmpfs = vec!["/tmp".to_string()];
                 let mut path_env = String::new();
@@ -1437,8 +1439,10 @@ fn main() -> ExitCode {
                         // ro is defense-in-depth (crun probes the hierarchy with
                         // --cgroup-manager=disabled, never writing it). A child
                         // userns can't remount-ro the host-owned cgroup2 on some
-                        // kernels (EPERM, e.g. the azure CI runner), so its ro is
-                        // best-effort — kept writable there rather than failing.
+                        // kernels (EPERM, e.g. the azure CI runner); there the bind
+                        // is DETACHED (fail-closed), never left writable — see
+                        // Bind::ro_optional. The crun gates that need it run only
+                        // locally, where the ro-remount succeeds.
                         binds.push(sandbox::Bind {
                             src: "/sys/fs/cgroup".to_string(),
                             readonly: true,
@@ -1467,11 +1471,16 @@ fn main() -> ExitCode {
                     .join(format!("td-host-sandbox-{}-{}", sys::getuid(), std::process::id()));
                 let _ = std::fs::remove_dir_all(&scratch);
                 std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
-                sandbox::host_shell(
+                let result = sandbox::host_shell(
                     &cmd, &cmd_args, &binds, &tmpfs, &path_env, &home, &workdir, &extra_env,
                     &scratch,
                 )
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+                // Remove the scratch tree (the sandbox's mounts lived in the
+                // child's now-gone mount namespace, so only an empty dir remains
+                // here). Previously leaked one dir per run.
+                let _ = std::fs::remove_dir_all(&scratch);
+                result
             };
             match run() {
                 Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),

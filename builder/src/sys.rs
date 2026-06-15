@@ -23,6 +23,13 @@ const SYS_FORK: usize = 57;
 const SYS_WAIT4: usize = 61;
 const SYS_EXIT_GROUP: usize = 231;
 const SYS_WRITE: usize = 1;
+const SYS_PRCTL: usize = 157;
+const SYS_GETPPID: usize = 110;
+
+const PR_SET_PDEATHSIG: usize = 1;
+/// SIGKILL — the parent-death signal the host-sandbox arms (uncatchable, so a
+/// wedged inner build cannot ignore it).
+pub const SIGKILL: usize = 9;
 
 // Bring a loopback interface up via SIOCSIFFLAGS on a dgram socket.
 const AF_INET: usize = 2;
@@ -154,6 +161,26 @@ pub fn warn(msg: &[u8]) {
 pub fn getuid() -> u32 {
     // Cannot fail per the man page.
     unsafe { syscall5(SYS_GETUID, 0, 0, 0, 0, 0) as u32 }
+}
+
+/// getppid(2) — the parent PID. Used to close the PR_SET_PDEATHSIG race: if the
+/// parent already died before set_pdeathsig ran, getppid() reports the reaper
+/// (1 or a subreaper) instead of the expected parent, so the child can bail
+/// rather than run orphaned. (Meaningful only in the SAME pid namespace as the
+/// parent; across a pid-ns boundary the kernel reports 0.)
+pub fn getppid() -> i64 {
+    unsafe { syscall5(SYS_GETPPID, 0, 0, 0, 0, 0) as i64 }
+}
+
+/// prctl(PR_SET_PDEATHSIG, sig): ask the kernel to deliver `sig` to THIS process
+/// when its parent dies. The host-sandbox arms SIGKILL at every fork level so a
+/// killed td-builder (CI cancellation, a timeout, Ctrl-C) cascades: the
+/// PID-namespace parent dies → the PID-1 child is SIGKILLed → the kernel tears
+/// the whole PID namespace down, reaping every descendant. Without it the inner
+/// build + its mounts are orphaned and keep running. NB the flag is RESET to 0
+/// across fork(2), so each forked level must re-arm it.
+pub fn set_pdeathsig(sig: usize) -> io::Result<()> {
+    check(unsafe { syscall5(SYS_PRCTL, PR_SET_PDEATHSIG, sig, 0, 0, 0) })
 }
 
 pub fn getgid() -> u32 {
