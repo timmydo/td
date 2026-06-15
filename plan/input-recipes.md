@@ -70,13 +70,53 @@ the only diff from a naive reconstruction was the builder's `(quote …)` wrappe
   (e) BUILD + `--check` (prime directive 1, verdict-memoized) — the built object is
       path-identical AND NAR-hash-equal to the corpus oracle's.
 
+## Inc.2 — multi-output recipes (PR #?? — corpus-libatomic)
+
+The next recipe-DSL brick: an `outputs` field. Many corpus packages split off a
+`debug`/`static`/`doc` output, and an extra output enters the build derivation —
+nano's DIRECT inputs ncurses + gettext-minimal BOTH carry a `doc` output, so
+multi-output is a prerequisite for reconstructing them. Demonstrated byte-identical
+on **libatomic-ops** — the cleanest multi-output package: it sets NO configure-flags
+and NO custom phases, so the extra output (`debug`) is the ONLY thing beyond a leaf
+recipe (the capability is isolated for a clean verified-red). Not in nano's direct
+graph, but the capability it adds is exactly what ncurses/gettext need.
+
+Build-free spike (host guix == pin) confirmed byte-identity first: reconstructing
+libatomic-ops with `(outputs '("out" "debug"))` lowers to the corpus oracle drv
+`h11sba49rynr607zml6vls57dpafjwbv-libatomic-ops-7.8.2.drv`; a single `("out")`
+diverges.
+
+### Pieces
+
+- `tests/ts/td-spec.d.ts` — `Recipe.outputs?: readonly string[]`.
+- `tests/ts/recipe-libatomic-ops.ts` — the recipe (`outputs: ["out","debug"]`);
+  `recipe-libatomic-ops-perturbed.ts` — one wrong source-hash byte (the
+  differential's non-vacuity discriminator).
+- `system/td-recipe.scm` — `recipe-outputs`: declared outputs (vector→list) become
+  the package's `(outputs …)`; omitted ⇒ `("out")`, byte-identical to specifying
+  none, so hello/nano/pkg-config lower unchanged (verified — those oracles stay
+  green).
+- `tests/ts-recipe-libatomic-diff.scm` — self-discriminating differential;
+  `tests/ts-recipe-libatomic-drv.scm` — TD_DRV / ORACLE_DRV / TD_OUT / ORACLE_OUT.
+- `mk/gates/310-corpus-libatomic.mk` — the `corpus-libatomic` heavy gate.
+
+### Gate `corpus-libatomic` proves
+
+  (a) CONVERGE — libatomic-ops (out + debug) lowers to the corpus oracle drv;
+  (b) DISCRIMINATE-src — a perturbed source diverges (not vacuous);
+  (c) outputs LOAD-BEARING — stripping `outputs` (→ single `out`) diverges;
+  (d) OUTPUT-SET — the lowered derivation declares BOTH outputs (out + debug);
+  (e) BUILD + `--check` (verdict-memoized) — the built `out` object is path-identical
+      AND NAR-hash-equal to the corpus oracle's.
+
 ## Next increments (the rest of the frontier)
 
-- nano's DIRECT inputs — **ncurses** and **gettext-minimal** — are heavier: each has
-  multiple `#:phases` (file-patching; ncurses also fetches a rollup-patch source) +
-  a `doc` output + make-flags. Reconstructing them store-path-equal needs the DSL +
-  bridge to express multi-output, `makeFlags`, and (faithfully) phases — a larger
-  follow-on. pkg-config establishes the configureFlags + multi-URI rung first.
+- nano's DIRECT inputs — **ncurses** and **gettext-minimal** — are the remaining
+  heavy ones: each adds `makeFlags` and multiple `#:phases` (file-patching;
+  ncurses also fetches a rollup-patch source) on top of the `doc` output (now
+  supported). Reconstructing them store-path-equal needs the DSL + bridge to express
+  `makeFlags` and (faithfully) phases — the largest follow-on. configureFlags +
+  multi-URI (Inc.1) and multi-output (Inc.2) are the bricks done so far.
 - Eventually: regenerate the input lock from td's OWN reconstructed recipes (not
   `specification->package`), package-by-package, toolchain LAST.
 
@@ -103,3 +143,17 @@ Both restored; tree clean; gate green again (`./check.sh corpus-pkgconfig`,
 NAR-hash-equal to the corpus oracle `127q8jdmd6afiz866ab3wga46dlw65n6r76cm28gikwid544f6g0`).
 The in-gate discriminator legs (perturbed flag, flags-stripped, single-URI) keep this
 self-discriminating every loop.
+
+### Inc.2 (multi-output, corpus-libatomic)
+
+- **R3 outputs load-bearing** — make `recipe-outputs` IGNORE the declared outputs
+  (return `'("out")` always). The candidate libatomic-ops drv falls back to the
+  single-output drv `8r1vzpyyq5wh95536c8yw7dafjr8kkjp-libatomic-ops-7.8.2.drv` ≠ the
+  corpus oracle `h11sba49rynr607zml6vls57dpafjwbv…`; the differential reds at leg (a)
+  CONVERGE (exit 1, "does NOT reproduce the corpus oracle's derivation"). Proves the
+  `outputs` field is load-bearing — declaring the `debug` output is exactly what makes
+  libatomic-ops converge.
+
+Restored; tree clean; gate green (`./check.sh corpus-libatomic`, NAR-hash-equal on the
+out output `1xz2xsb7ay7cpxdl2qdxv1d2m6mxhmx2nbn992bgp9dqwxyv4v74`). The in-gate legs
+(perturbed source, outputs-stripped, output-set) keep it self-discriminating.

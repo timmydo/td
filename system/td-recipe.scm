@@ -95,13 +95,26 @@
         '()
         (list #:configure-flags #~(quote #$flags)))))
 
+;; A recipe's declared package OUTPUTS (a JSON array of names; guile-json yields a
+;; vector). Many corpus packages split off extra outputs — `debug`, `static`,
+;; `doc` (e.g. nano's own inputs ncurses + gettext-minimal carry a `doc`) — and an
+;; extra output enters the build derivation (the output list + the build
+;; expression's strip/debug handling), so to converge on such a package the bridge
+;; must declare the same outputs. Omitted ⇒ the default `("out")`, byte-identical
+;; to specifying no outputs, so a single-output recipe (hello, nano, pkg-config)
+;; lowers unchanged (those oracles are untouched, directive 3).
+(define (recipe-outputs alist)
+  (let ((outs (vector->list (field/default alist "outputs" #("out")))))
+    (if (null? outs) '("out") outs)))
+
 (define (json-recipe->package json-string)
   "Reconstruct a Guix package from a TS-authored recipe emitted as JSON by the boa
 evaluator.  Only the build-derivation-determining coordinates come from the
 recipe (name, version, source uri+sha256 — a single URL or a mirror LIST, build
-system, any #:configure-flags, and the names of any build inputs); the
-human-readable metadata is placeholder (it does not enter the derivation), so the
-reconstructed package converges on the corpus oracle's build by construction."
+system, any #:configure-flags, any extra outputs, and the names of any build
+inputs); the human-readable metadata is placeholder (it does not enter the
+derivation), so the reconstructed package converges on the corpus oracle's build
+by construction."
   (let* ((a      (json-string->scm json-string))
          (name   (field a "name"))
          (version (field a "version"))
@@ -118,6 +131,7 @@ reconstructed package converges on the corpus oracle's build by construction."
                 (sha256 (base32 hash))))
       (build-system (build-system-for bs))
       (arguments (recipe-arguments a))
+      (outputs (recipe-outputs a))
       (inputs (resolve-inputs inputs))
       ;; Metadata does not enter the derivation (proven by convergence on the
       ;; oracle); kept minimal and recipe-derived.
