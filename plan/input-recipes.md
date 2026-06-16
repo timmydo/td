@@ -349,3 +349,28 @@ out output `1xz2xsb7ay7cpxdl2qdxv1d2m6mxhmx2nbn992bgp9dqwxyv4v74`). The in-gate 
   (find-files / with-fluids / match vars / let-which / cons / format) are exactly
   what make gettext converge, not decorative. Restored; gate green. (The td-check
   leg is covered by R6 — the shared `td-check-repro.sh` helper.)
+
+## Step (a) toward retiring td-recipe.scm: td's builder runs recipe phases in Rust (PR #?? — td-build-phases)
+
+The endgame (`how do we get rid of td-recipe.scm and use our own tooling for .drv`)
+needs td's OWN builder to run a recipe's custom phases, not gnu-build-system's
+Guile. This lands that: `td-builder autotools-build` gains a phase interpreter
+(`builder/src/json.rs` — a zero-dep JSON reader; `build.rs` — applies the recipe's
+`substitute*` phases after unpack via the toolchain's `sed`/`find`, descending
+`letWhich`/`with-fluids`, resolving `{var}`/`{output}`/`{which}`/`{format}`/match-vars,
+file lists/`find-files`/`cons`). No regex crate — the toolchain's sed/find do the
+matching (the toolchain is retired LAST anyway). `system/td-build.scm` passes the
+recipe's `phases` as JSON via `TD_PHASES`; both the flat `substitutions` form
+(gzip/popt) and the nested `body` form (gettext) are handled.
+
+Demonstrated by `td-build-phases`: gzip is built by td's OWN builder applying its
+`use-absolute-name-of-gzip` phase in Rust — STRUCTURAL (builder = `td-builder`, not
+`guile`), DURABLE behavioral (the installed gunzip execs the absolute
+`<out>/bin/gzip`, i.e. td's runner applied the phase; gzip round-trips), DURABLE
+reproducibility (`td-builder check` double-build), at a DISTINCT path from the
+corpus gzip. zero new crate deps (cargo-test gate stays green); 3 new json unit tests.
+
+This is the first of the steps to retire td-recipe.scm: the OWN-builder path can now
+run phases. Remaining: route the corpus recipes through this path (dropping
+byte-identity for behavioral+reproducible, per "own then diverge"), then input
+resolution off Guile, toolchain LAST.

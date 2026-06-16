@@ -34,6 +34,7 @@
   #:use-module (gnu packages)
   #:use-module (system td-builder)
   #:use-module (ice-9 format)
+  #:use-module (json)                    ;re-serialize the recipe's phases for TD_PHASES
   #:export (%td-build-tool-names
             td-rust-build-derivation
             td-build-components
@@ -104,7 +105,13 @@
                             dep-names)))
          (dep-outs (if swap? resolved-dep-paths (map derivation->output-path dep-drvs)))
          (dep-srcs (if swap? resolved-dep-paths '()))
-         (input-drvs (append (list src-drv tb-drv) tool-drvs dep-drvs)))
+         (input-drvs (append (list src-drv tb-drv) tool-drvs dep-drvs))
+         ;; The recipe's custom build PHASES, re-serialized to JSON for td's OWN
+         ;; phase runner (builder/src/build.rs applies them after unpack — no
+         ;; gnu-build-system, no Guile in the build). Empty when the recipe
+         ;; declares none, so leaf recipes (hello/nano) are unchanged.
+         (phases   (let ((p (assoc-ref recipe-alist "phases")))
+                     (if p (scm->json-string p) ""))))
     (list (cons 'name full)
           (cons 'system "x86_64-linux")
           (cons 'builder builder)
@@ -113,7 +120,8 @@
           (cons 'input-srcs dep-srcs)
           (cons 'env `(("TD_SRC"             . ,src-path)
                        ("TD_INPUTS"          . ,(string-join (append tool-outs dep-outs) ":"))
-                       ("TD_CONFIGURE_FLAGS" . ,configure-flags))))))
+                       ("TD_CONFIGURE_FLAGS" . ,configure-flags)
+                       ("TD_PHASES"          . ,phases))))))
 
 (define* (td-rust-build-derivation store recipe-alist #:key (configure-flags "")
                                    (resolved-dep-paths #f))

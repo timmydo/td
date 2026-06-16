@@ -18,6 +18,7 @@
 mod build;
 mod daemon;
 mod drv;
+mod json;
 mod nar;
 mod sandbox;
 mod scan;

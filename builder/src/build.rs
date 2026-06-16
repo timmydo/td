@@ -20,10 +20,17 @@
 //!   TD_SRC             the source tarball (a fixed-output url-fetch)
 //!   TD_INPUTS          ':'-joined store paths of the build inputs
 //!   TD_CONFIGURE_FLAGS extra ./configure flags (space-separated; may be empty)
+//!   TD_PHASES          the recipe's custom build PHASES as JSON (may be empty) —
+//!                      td's own interpreter (below) applies them after unpack,
+//!                      the way gnu-build-system runs a recipe's `#:phases`. This
+//!                      is what lets the OWN-builder path build a package with
+//!                      real source-patch phases (e.g. gettext-minimal) with NO
+//!                      Guile/gnu-build-system in the build.
 
+use crate::json::Json;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Find an executable `name` in a ':'-joined search path; return its abs path.
@@ -72,6 +79,253 @@ fn run_cmd(prog: &str, args: &[&str], cwd: &str, envs: &[(String, String)]) -> R
     } else {
         Err(format!("{prog} {} failed: {status}", args.join(" ")))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase interpreter — td's own runner for a recipe's custom build phases (the
+// move-off-Guile §5 step toward td owning .drv creation: td's builder runs the
+// phases, not gnu-build-system's Guile). The recipe's phase DATA arrives as JSON
+// in TD_PHASES; we apply each `substitute*` with the toolchain's `sed`/`find`.
+// Scope: this is the OWN-builder (behavioral) path — the output has a distinct
+// store path, so the substitutions need to produce the right EFFECT, not a
+// byte-identical edit. `let`-`which` bindings + `with-fluids` wrappers are
+// descended; their `{var}` references resolve to the bound program path.
+
+use std::collections::BTreeMap;
+
+/// Escape a LITERAL string for the replacement side of `sed s|…|…|`: `\` and `&`
+/// are special there, and a newline would terminate the `s` command (so it
+/// becomes the `\n` sed understands as "insert a newline").
+fn escape_sed_repl(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '&' => o.push_str("\\&"),
+            '\n' => o.push_str("\\n"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
+/// One `RefPart`/replacement atom → its sed-replacement text. `bindings` maps a
+/// `let`-`which` name to the resolved program path; a `{var}` not in it is a
+/// match variable (the whole match → `&`).
+fn resolve_part(p: &Json, bindings: &BTreeMap<String, String>, search_path: &str) -> Result<String, String> {
+    if let Some(s) = p.as_str() {
+        return Ok(escape_sed_repl(s));
+    }
+    if let Some(n) = p.get("var").and_then(Json::as_str) {
+        return Ok(match bindings.get(n) {
+            Some(v) => escape_sed_repl(v),
+            None => "&".to_string(), // match variable: the whole match
+        });
+    }
+    if let Some(n) = p.get("output").and_then(Json::as_str) {
+        let v = env::var(n).map_err(|_| format!("phase references output `{n}' which is not set"))?;
+        return Ok(escape_sed_repl(&v));
+    }
+    if let Some(n) = p.get("input").and_then(Json::as_str) {
+        return Ok(escape_sed_repl(bindings.get(n).map(String::as_str).unwrap_or(n)));
+    }
+    if let Some(prog) = p.get("which").and_then(Json::as_str) {
+        let abs = find_in_path(search_path, prog)
+            .ok_or_else(|| format!("phase `which {prog}': not found in TD_INPUTS"))?;
+        return Ok(escape_sed_repl(&abs));
+    }
+    Err(format!("unsupported replacement/part: {p:?}"))
+}
+
+/// A substitution's `to` → its sed-replacement text.
+fn resolve_to(to: &Json, bindings: &BTreeMap<String, String>, search_path: &str) -> Result<String, String> {
+    if let Some(parts) = to.get("stringAppend").and_then(Json::as_arr) {
+        let mut o = String::new();
+        for p in parts {
+            o.push_str(&resolve_part(p, bindings, search_path)?);
+        }
+        return Ok(o);
+    }
+    if let Some(fmtargs) = to.get("format").and_then(Json::as_arr) {
+        // (format #f FMT ARG…): substitute each `~a` in FMT with the next ARG.
+        let fmt = fmtargs.first().and_then(Json::as_str).ok_or("format: missing format string")?;
+        let mut o = String::new();
+        let mut args = fmtargs[1..].iter();
+        let mut rest = fmt;
+        while let Some(pos) = rest.find("~a") {
+            o.push_str(&escape_sed_repl(&rest[..pos]));
+            let a = args.next().ok_or("format: too few arguments for ~a")?;
+            o.push_str(&resolve_part(a, bindings, search_path)?);
+            rest = &rest[pos + 2..];
+        }
+        o.push_str(&escape_sed_repl(rest));
+        return Ok(o);
+    }
+    // string | {var} | {which} | {output} | {input}
+    resolve_part(to, bindings, search_path)
+}
+
+/// Resolve a `substitute*` FILE argument to the concrete file paths to edit,
+/// relative to the unpacked `srcdir`.
+fn resolve_files(fa: &Json, srcdir: &str, search_path: &str) -> Result<Vec<PathBuf>, String> {
+    if let Some(s) = fa.as_str() {
+        return Ok(vec![Path::new(srcdir).join(s)]);
+    }
+    if let Some(list) = fa.get("list").and_then(Json::as_arr) {
+        return list.iter()
+            .map(|f| f.as_str().map(|s| Path::new(srcdir).join(s)).ok_or("file list entry is not a string".to_string()))
+            .collect();
+    }
+    if let Some(ff) = fa.get("findFiles").and_then(Json::as_arr) {
+        let dir = ff.first().and_then(Json::as_str).ok_or("findFiles: missing dir")?;
+        let re = ff.get(1).and_then(Json::as_str).ok_or("findFiles: missing regex")?;
+        return find_files(srcdir, dir, re, search_path);
+    }
+    if let Some(c) = fa.get("cons").and_then(Json::as_arr) {
+        let mut v = resolve_files(c.first().ok_or("cons: missing head")?, srcdir, search_path)?;
+        v.extend(resolve_files(c.get(1).ok_or("cons: missing tail")?, srcdir, search_path)?);
+        return Ok(v);
+    }
+    Err(format!("unsupported substitute* file argument: {fa:?}"))
+}
+
+/// `(find-files DIR REGEX)` — files under `srcdir/DIR` whose BASENAME matches the
+/// POSIX-ERE `regex` (`find` + `grep -E`, the toolchain's regex). Missing dir →
+/// empty (these phases patch test files, absent in some trees — a no-op).
+fn find_files(srcdir: &str, dir: &str, regex: &str, search_path: &str) -> Result<Vec<PathBuf>, String> {
+    let full = Path::new(srcdir).join(dir);
+    if !full.is_dir() {
+        return Ok(Vec::new());
+    }
+    let bash = find_in_path(search_path, "bash").ok_or("bash not found for find-files")?;
+    // List files; keep those whose basename matches the regex. Single-quote the
+    // regex (the corpus find-files regexes contain none); PATH carries find/grep.
+    let script = format!(
+        "set -e; export PATH={path}; find {full} -type f | while IFS= read -r p; do \
+         printf '%s\\n' \"${{p##*/}}\" | grep -qE -- '{regex}' && printf '%s\\n' \"$p\"; done",
+        path = search_path,
+        full = full.display(),
+        regex = regex,
+    );
+    let outp = Command::new(&bash)
+        .args(["-c", &script])
+        .output()
+        .map_err(|e| format!("find-files spawn: {e}"))?;
+    if !outp.status.success() {
+        return Err(format!("find-files in {} failed", full.display()));
+    }
+    Ok(String::from_utf8_lossy(&outp.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect())
+}
+
+/// Apply one `substitute*` (file argument + clauses) via `sed -E -i`.
+fn apply_substitute(
+    fa: &Json,
+    clauses: &[Json],
+    srcdir: &str,
+    sed: &str,
+    bindings: &BTreeMap<String, String>,
+    search_path: &str,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    let files = resolve_files(fa, srcdir, search_path)?;
+    // Build a sed `s` script per clause, with a control-char delimiter (\x01) the
+    // corpus patterns never contain, so `/` in paths needs no escaping.
+    let mut exprs: Vec<String> = Vec::new();
+    for c in clauses {
+        let from = c.get("from").and_then(Json::as_str).ok_or("clause: missing from")?;
+        let to = resolve_to(c.get("to").ok_or("clause: missing to")?, bindings, search_path)?;
+        exprs.push(format!("s\u{1}{from}\u{1}{to}\u{1}g"));
+    }
+    for f in &files {
+        if !f.exists() {
+            return Err(format!("substitute* target does not exist: {}", f.display()));
+        }
+        let mut args: Vec<String> = vec!["-E".into(), "-i".into()];
+        for e in &exprs {
+            args.push("-e".into());
+            args.push(e.clone());
+        }
+        args.push(f.to_string_lossy().into_owned());
+        let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Run from the build root: resolve_files / find_files yield paths already
+        // joined to `srcdir` (which is relative to the build root, e.g.
+        // `./gzip-1.14/gunzip.in`), so the cwd must be `.`, not `srcdir`.
+        run_cmd(sed, &argrefs, ".", envs)?;
+    }
+    Ok(())
+}
+
+/// Recurse a phase body, applying each statement. `let`-`which` extends the
+/// bindings; `with-fluids` (byte-encoding) is transparent to `sed`.
+fn apply_body(
+    stmts: &[Json],
+    srcdir: &str,
+    sed: &str,
+    bindings: &BTreeMap<String, String>,
+    search_path: &str,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    for s in stmts {
+        if let Some(fa) = s.get("substitute") {
+            let clauses = s.get("clauses").and_then(Json::as_arr).ok_or("substitute: no clauses")?;
+            apply_substitute(fa, clauses, srcdir, sed, bindings, search_path, envs)?;
+        } else if let Some(binds) = s.get("letWhich").and_then(Json::as_arr) {
+            let mut extended = bindings.clone();
+            for b in binds {
+                let name = b.get("name").and_then(Json::as_str).ok_or("letWhich: no name")?;
+                let prog = b.get("prog").and_then(Json::as_str).ok_or("letWhich: no prog")?;
+                let abs = find_in_path(search_path, prog)
+                    .ok_or_else(|| format!("letWhich `{prog}': not found in TD_INPUTS"))?;
+                extended.insert(name.to_string(), abs);
+            }
+            let body = s.get("body").and_then(Json::as_arr).ok_or("letWhich: no body")?;
+            apply_body(body, srcdir, sed, &extended, search_path, envs)?;
+        } else if s.get("withDefaultPortEncodingFalse").map(Json::is_true).unwrap_or(false) {
+            let body = s.get("body").and_then(Json::as_arr).ok_or("withFluids: no body")?;
+            apply_body(body, srcdir, sed, bindings, search_path, envs)?;
+        } else {
+            return Err(format!("unsupported phase-body statement: {s:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Apply the recipe's TD_PHASES (a JSON array of phases) in `srcdir`, after unpack.
+fn apply_phases(srcdir: &str, search_path: &str, envs: &[(String, String)]) -> Result<(), String> {
+    let spec = env::var("TD_PHASES").unwrap_or_default();
+    if spec.trim().is_empty() {
+        return Ok(());
+    }
+    let sed = find_in_path(search_path, "sed").ok_or("sed not found in TD_INPUTS")?;
+    let j = crate::json::parse(&spec).map_err(|e| format!("TD_PHASES JSON: {e}"))?;
+    let phases = j.as_arr().ok_or("TD_PHASES is not a JSON array")?;
+    let bindings: BTreeMap<String, String> = BTreeMap::new();
+    for phase in phases {
+        let name = phase.get("name").and_then(Json::as_str).unwrap_or("<phase>");
+        println!(">> td-build: phase `{name}' (td's own runner)");
+        if let Some(body) = phase.get("body").and_then(Json::as_arr) {
+            // Rich nested body (gettext-minimal et al.).
+            apply_body(body, srcdir, &sed, &bindings, search_path, envs)?;
+        } else if let Some(subs) = phase.get("substitutions").and_then(Json::as_arr) {
+            // Flat form: each entry is a single-clause substitute* {file, from, to}.
+            for sub in subs {
+                let fa = sub.get("file").ok_or("substitution: missing file")?;
+                let from = sub.get("from").cloned().ok_or("substitution: missing from")?;
+                let to = sub.get("to").cloned().ok_or("substitution: missing to")?;
+                let mut clause = std::collections::BTreeMap::new();
+                clause.insert("from".to_string(), from);
+                clause.insert("to".to_string(), to);
+                apply_substitute(fa, &[Json::Obj(clause)], srcdir, &sed, &bindings, search_path, envs)?;
+            }
+        } else {
+            return Err(format!("phase `{name}' has neither body nor substitutions"));
+        }
+    }
+    Ok(())
 }
 
 pub fn run() -> Result<(), String> {
@@ -126,6 +380,10 @@ pub fn run() -> Result<(), String> {
     // unpack -> the single source tree.
     run_cmd(&tar, &["xf", &src], ".", &envs)?;
     let srcdir = single_subdir(".")?;
+
+    // The recipe's custom PHASES (td's own runner) — gnu-build-system applies
+    // these via Guile `#:phases`; here td applies them in Rust, after unpack.
+    apply_phases(&srcdir, &path, &envs)?;
 
     // configure --prefix=$out [extra flags].
     let prefix = format!("--prefix={out}");
