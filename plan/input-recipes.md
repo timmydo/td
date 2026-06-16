@@ -414,8 +414,37 @@ Deferred (gnu-build-system fidelity, the remaining bulk):
 - **pkg-config** — `--with-internal-glib` compiles a bundled glib that hits a
   C-standard error under td's build env (`goption.c: expected identifier before
   'bool'`) that gnu-build-system's env avoids; needs CFLAGS/standard-phase fidelity.
-- **gettext-minimal** — fails via td's minimal phase set (needs more standard
-  gnu-build-system phases, e.g. patch-source-shebangs).
 - Multi-OUTPUT splitting (debug/doc/static) — td builds a single `out`; faithful
   multi-output (strip→debug, doc separation) is later work.
 - Input resolution + toolchain — retired LAST (§5).
+
+## Step (c) toward retiring td-recipe.scm: gettext-minimal through td's builder (PR #67 — td-build-gettext)
+
+Routed nano's MOST elaborate input — gettext-minimal (build inputs
+libunistring/libxml2/ncurses, configure flags, a makeFlag, and TWO custom phases
+exercising the FULL phase-body vocabulary: findFiles, cons, letWhich, withFluids,
+format, stringAppend) — through `system/td-build` (builder = td-builder, phases in
+Rust, no gnu-build-system). New gate `td-build-gettext` (350): STRUCTURAL (builder =
+td-builder) + DURABLE behavioral (msgfmt + xgettext `--version` report 0.23.1) +
+DURABLE reproducibility (`td-builder check`) + INDEPENDENCE (distinct path, single
+`out` where the corpus splits `doc`). No Guix byte-identity leg — all durable.
+
+Turned out the blocker was NOT a missing standard phase (the deferred note guessed
+`patch-source-shebangs`): td runs `bash ./configure` explicitly and passes
+`SHELL=bash` to make, and the recipe's own phases handle the relevant `/bin/sh`
+references, so configure/make/install completed unaided. The real gap was a BUG in
+td's `find_files` (builder/src/build.rs): its `find … | while …; do … grep -qE && …; done`
+helper, under `set -e`, left the pipeline at grep's exit 1 whenever the LAST file in
+the tree did NOT match the regex — a spurious "find-files failed". gettext's
+`(find-files "gettext-tools/tests" "^(lang-sh|msg…)")`, where most files don't match,
+hit it on the first real own-builder run (gzip/popt/libatomic never use findFiles, so
+it stayed latent). Fix: `if … then … fi` body (a non-match no longer fails the loop)
++ `set -eo pipefail` (a genuine `find` failure stays fatal).
+
+Verified-red (R10, find_files load-bearing): with the original `grep -qE && printf`
+body, building gettext-minimal via td's own builder reds in-phase — "td-builder:
+autotools-build: find-files in …/gettext-tools/tests failed", build exit 1 — BEFORE
+configure. Proves the find_files fix is load-bearing for gettext's build (and thus
+the gate's durable behavioral leg). A hermetic Rust unit test is impractical
+(find_files shells out to find/grep, absent in the cargo-test toolchain), so the
+gettext own-builder build IS the regression guard. Fixed; build completes + tools run.
