@@ -374,3 +374,11 @@ This is the first of the steps to retire td-recipe.scm: the OWN-builder path can
 run phases. Remaining: route the corpus recipes through this path (dropping
 byte-identity for behavioral+reproducible, per "own then diverge"), then input
 resolution off Guile, toolchain LAST.
+
+Verified-red (R8, td's phase runner): make `apply_phases` a no-op (skip applying
+the recipe's phases) ⇒ td's builder no longer patches gunzip.in ⇒ the installed
+gunzip still execs `'gzip'` (not `<out>/bin/gzip`) ⇒ the `td-build-phases` gate reds
+at the `[DURABLE: behavioral]` leg ("the installed gunzip does not exec …/bin/gzip —
+td's phase runner did not apply the phase", exit 2). Proves the behavioral leg
+genuinely verifies td's OWN runner applied the phase — not a no-op, no Guix involved.
+Restored; gate green.
