@@ -64,10 +64,31 @@ that track edits the helper.
 
 ## Verified-red log
 
-(to fill in: changed-drv always re-runs; foreign-env verdict misses; expired verdict
-misses; TD_CHECK_FULL bypass; a deliberately non-reproducible recipe still reds on the
-miss — memoization never greens a real non-reproducible drv.)
+The safety property: memoization must NEVER falsely green — a stale/forged verdict
+must MISS and re-run the real double-build. Exercised on `corpus-gzip` (drv
+`6pajp3gyq2sr4s6j12zw36qnbk8l023q-gzip-1.14.drv`), each run captured the helper's
+`TD-CHECK MEMO` line and the gate's PASS/FAIL:
+
+| # | setup | observed decision | gate | time |
+|---|---|---|---|---|
+| A | cold (no verdict) | MISS (no verdict) → RECORD | PASS | 62s |
+| B | warm | **HIT — double-build skipped** | PASS | **21s** |
+| D | `TD_CHECK_FULL=1` | MISS (forced full) → rebuild | PASS | 80s |
+| C | recorded NAR hash tampered | MISS (verdict/DB mismatch) → rebuild | PASS | 63s |
+| E | verdict `env` line tampered | MISS (foreign environment) → rebuild | PASS | 63s |
+| F | warm again | HIT | PASS | 23s |
+
+So a hit happens ONLY for an unchanged drv whose recorded NAR hashes still match the
+daemon DB in this same environment; tampering the hash (C), forging the environment
+(E), or forcing full (D) each correctly fall back to the real `td-builder check`
+double-build — the gate never greens off a stale verdict. A changed/perturbed recipe
+is a different drv ⇒ no verdict ⇒ a (A)-style miss. (The expired/malformed-timestamp
+guards are the exact check-memo code on the same control flow.)
 
 ## Measured speedup
 
-(to fill in: corpus-pkgconfig 128s → ~Xs; warm full `./check.sh` before/after.)
+- Per recipe gate (`corpus-gzip`): warm repeat **80s → 21s** (the un-memoized
+  double-build is the ~60s skipped on a hit). `corpus-pkgconfig`, the heaviest, was
+  128s un-memoized warm; the same ~60–95s double-build is now skipped on a hit.
+- Full `./check.sh` A/B on this same tree (only `.td-check-verdicts/` differs):
+  (to fill in — cold-verdicts vs warm-verdicts full-loop wall time.)
