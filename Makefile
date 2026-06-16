@@ -119,21 +119,16 @@ chain-prev :=
 $(foreach r,$(CHEAP_GATES),$(eval $(if $(chain-prev),$(r): | $(chain-prev)))$(eval chain-prev := $(r)))
 $(HEAVY_GATES): | $(lastword $(CHEAP_GATES))
 
-# `rootless` runs LAST, alone, IN A FULL CHECK. It snapshots the LIVE store DB
-# (mk/gates/130 → tests/rootless.sh: copy + wal_checkpoint); a CONCURRENTLY-
-# building gate would leave an active WAL the non-root snapshot cannot read.
-# Gating it order-only on every OTHER heavy gate makes make start it only once
-# they have all finished, so it snapshots a QUIESCENT DB. A scheduling constraint
-# within td's sandbox (td is the sole loop container — there is no guix-shell-C
-# carve-out), not a gate-list edit; cost is rootless's wall time serial at the
-# tail (plan/loop-sandbox.md R8).
-#
-# But ONLY when rootless is part of a larger goal. When it is the SOLE explicit
-# goal (`make rootless` / `./check.sh rootless`) the order-only prereqs would drag
-# in the whole heavy ladder, breaking the single-target contract (CLAUDE.md
-# "./check.sh <target> runs a single Makefile target"). Suppress the ordering in
-# that case so an explicit `rootless` runs alone — it is already quiescent when
-# nothing else is building.
-ifneq ($(MAKECMDGOALS),rootless)
-rootless: | $(filter-out rootless,$(HEAVY_GATES))
-endif
+# `rootless` needs NO special scheduling — it runs as an ordinary heavy gate
+# under -j2 (its only prereq is the generic last-cheap-gate one above). It USED to
+# be serialized alone at the tail because it SNAPSHOTTED the live store DB by
+# copying /var/guix/db: a concurrently-building gate's active WAL could tear the
+# non-root copy. Since the rootless-snapshot-race fix (PR #53) the gate instead
+# CONSTRUCTS its snapshot DB from the static closure (`td-builder store-register`
+# — mk/gates/130-rootless.mk / tests/rootless.sh, sealed against any live-DB
+# read), so the cross-check race is eliminated BY CONSTRUCTION, not mitigated by
+# ordering. Dropping the old `rootless: | $(filter-out rootless,$(HEAVY_GATES))`
+# constraint removes dead-weight tail latency (rootless is the single longest
+# heavy gate, so running it alone last was doubly wasteful) and weakens no gate:
+# rootless's validity guard, the daemon-oracle differential, and the live-DB-read
+# seal all still run and must pass.
