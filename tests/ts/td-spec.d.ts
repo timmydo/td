@@ -67,46 +67,84 @@ interface Source {
  *  outside this union is a compile-time error — like `RootFsType`. v0 is `"gnu"`. */
 declare type BuildSystem = "gnu";
 
-/** A part of a `string-append` replacement: a literal string, or a build-time
- *  store path — `{ output: NAME }` → `(assoc-ref outputs NAME)` (an output dir),
- *  `{ input: NAME }` → `(assoc-ref inputs NAME)` (a build input's path). */
-type RefPart = string | { readonly output: string } | { readonly input: string };
+/** A part of a `string-append`/`format` replacement: a literal string, a
+ *  build-time store path (`{ output: NAME }` → `(assoc-ref outputs NAME)`,
+ *  `{ input: NAME }` → `(assoc-ref inputs NAME)`), or `{ var: NAME }` — a value
+ *  bound earlier in the phase body (a `let`-`which` binding, or a `substitute*`
+ *  match variable). */
+type RefPart =
+  | string
+  | { readonly output: string }
+  | { readonly input: string }
+  | { readonly var: string };
 
 /** A `substitute*` replacement:
  *  - a literal string;
+ *  - `{ var: NAME }` → the bare bound symbol NAME;
  *  - `{ which: PROG }` → `(which PROG)` (resolve a program on PATH at build time);
- *  - `{ stringAppend: PART[] }` → `(string-append PART …)`, the idiom that bakes a
- *    build-time store path (an output dir, an input's path) into a patched file. */
+ *  - `{ stringAppend: PART[] }` → `(string-append PART …)`;
+ *  - `{ format: [FMT, PART…] }` → `(format #f FMT PART …)`. */
 type Replacement =
   | string
+  | { readonly var: string }
   | { readonly which: string }
-  | { readonly stringAppend: readonly RefPart[] };
+  | { readonly stringAppend: readonly RefPart[] }
+  | { readonly format: readonly [string, ...RefPart[]] };
+
+/** A `substitute*` FILE argument: a literal filename, `{ list: [...] }` → a quoted
+ *  file LIST, `{ findFiles: [DIR, REGEX] }` → `(find-files DIR REGEX)`, or
+ *  `{ cons: [A, B] }` → `(cons A B)` (prepend a file to a find-files result). */
+type FileArg =
+  | string
+  | { readonly list: readonly string[] }
+  | { readonly findFiles: readonly [string, string] }
+  | { readonly cons: readonly [FileArg, FileArg] };
+
+/** One `substitute*` clause `((FROM MATCH-VAR…) TO)`. `match` (optional) names the
+ *  regexp submatch variables `TO` may reference via `{ var: … }`. */
+interface Clause {
+  readonly from: string;
+  readonly match?: readonly string[];
+  readonly to: Replacement;
+}
+
+/** A phase-body STATEMENT — the nested forms a real package phase is built from:
+ *  - `{ substitute: FILEARG, clauses: [...] }` → `(substitute* FILEARG CLAUSE…)`;
+ *  - `{ letWhich: [{name,prog}…], body: [...] }` → `(let* ((name (which prog))…) …)`;
+ *  - `{ withDefaultPortEncodingFalse: true, body: [...] }`
+ *      → `(with-fluids ((%default-port-encoding #f)) …)` (preserve byte encoding
+ *        while patching ISO-8859-1 files). */
+type Stmt =
+  | { readonly substitute: FileArg; readonly clauses: readonly Clause[] }
+  | { readonly letWhich: readonly { readonly name: string; readonly prog: string }[]; readonly body: readonly Stmt[] }
+  | { readonly withDefaultPortEncodingFalse: true; readonly body: readonly Stmt[] };
 
 /** One `substitute*` on a source file: replace text matching `from` (a regexp,
- *  exactly as the corpus phase writes it) with `to`. */
+ *  exactly as the corpus phase writes it) with `to`. The flat form for a simple
+ *  phase; richer phases use `Phase.body` instead. */
 interface Substitution {
   readonly file: string;
   readonly from: string;
   readonly to: Replacement;
 }
 
-/** A custom build phase, added relative to a `%standard-phases` anchor. The body
- *  is a list of `substitute*` source patches (the dominant patch idiom in corpus
- *  recipes). `lambdaArgs` are the keyword parameters the phase procedure takes —
- *  omit for a nullary `(lambda _ …)`, or e.g. `["outputs"]` for a
- *  `(lambda* (#:key outputs #:allow-other-keys) …)` (needed when a substitution
- *  references the build's `outputs`/`inputs`). `returnTrue` appends a trailing
- *  `#t` to the phase body, matching packages whose phase ends in `#t`. The bridge
- *  lowers this DATA to the same `(modify-phases %standard-phases (add-{before,
- *  after} 'anchor 'name …))` gexp the corpus package writes by hand — so a recipe
- *  that declares a package's real phase converges on it. */
+/** A custom build phase, added relative to a `%standard-phases` anchor.
+ *  `lambdaArgs` are the keyword parameters the phase procedure takes — omit for a
+ *  nullary `(lambda _ …)`, or e.g. `["inputs"]` for a
+ *  `(lambda* (#:key inputs #:allow-other-keys) …)`. The phase body is EITHER the
+ *  flat `substitutions` (one `substitute*` each, with `returnTrue` for a trailing
+ *  `#t`) OR the rich `body` (a nested statement list — file lists, match vars,
+ *  find-files, let/with-fluids — for packages like gettext-minimal). The bridge
+ *  lowers this DATA to the byte-identical `(modify-phases %standard-phases …)`
+ *  gexp the corpus package writes by hand. */
 interface Phase {
   readonly position: "before" | "after";
   readonly anchor: string;
   readonly name: string;
-  readonly substitutions: readonly Substitution[];
   readonly lambdaArgs?: readonly ("inputs" | "outputs")[];
+  readonly substitutions?: readonly Substitution[];
   readonly returnTrue?: boolean;
+  readonly body?: readonly Stmt[];
 }
 
 /** A package recipe — the coordinates that determine the build derivation: name,
@@ -118,9 +156,10 @@ interface Phase {
  *  `outputs` are the package's outputs (declare extra `"debug"`/`"static"`/`"doc"`
  *  exactly as the corpus splits them); `phases` are custom build phases; `tests`
  *  is whether to run the test suite (`#:tests?`, default `true` — set `false` for
- *  a package the corpus builds with tests off). Each enters the build derivation,
- *  so declare them exactly as the corpus package does. Omit them all for a leaf
- *  package with default arguments and a single `"out"` (e.g. hello). */
+ *  a package the corpus builds with tests off); `makeFlags` are the build system's
+ *  `#:make-flags`. Each enters the build derivation, so declare them exactly as the
+ *  corpus package does. Omit them all for a leaf package with default arguments and
+ *  a single `"out"` (e.g. hello). */
 interface Recipe {
   readonly name: string;
   readonly version: string;
@@ -128,6 +167,7 @@ interface Recipe {
   readonly buildSystem: BuildSystem;
   readonly inputs?: readonly string[];
   readonly configureFlags?: readonly string[];
+  readonly makeFlags?: readonly string[];
   readonly outputs?: readonly string[];
   readonly phases?: readonly Phase[];
   readonly tests?: boolean;

@@ -29,6 +29,14 @@ tb="$1"; drv="$2"; infile="$3"; sc="$4"
 chmod -R u+w "$sc" 2>/dev/null || true; rm -rf "$sc"; mkdir -p "$sc"
 cleanup() { chmod -R u+w "$sc" 2>/dev/null || true; rm -rf "$sc"; }
 
+# Realize the drv's build inputs first. A fixed-output SOURCE may have been GC'd
+# (its output dropped once the package was built), which would make the closure
+# walk below fail and starve td's rebuild of the source. Re-realizing the input
+# derivations re-fetches it (a permitted offline fixed-output fetch); deps already
+# in the store are returned from cache (fast).
+$TD_GUIX gc --references "$drv" 2>/dev/null | grep '\.drv$' \
+  | xargs -r $TD_GUIX build >/dev/null 2>&1 || true
+
 { cat "$infile"; echo "$drv"; } | xargs $TD_GUIX gc -R | sort -u > "$sc/paths.txt"
 echo "   staged build closure: $(wc -l < "$sc/paths.txt") store items"
 
