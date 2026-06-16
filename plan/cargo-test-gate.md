@@ -42,10 +42,27 @@ sub-20s feedback on that logic.
 3. [ ] sub-agent diff review against CLAUDE.md.
 4. [ ] full `./check.sh` green; land per §7.2.
 
-## Verified-red evidence
+## Verified-red evidence (2026-06-15)
 
-(to fill in)
+The gate has two teeth; both seen RED, isolated from check.sh's own td-builder
+package build (which also runs these tests via `#:tests? #t` and would abort
+check.sh first). Exercised the recipe's core logic directly via the same
+`guix shell rust rust:cargo gcc-toolchain -- cargo test --frozen` invocation:
+
+1. **pipefail tooth** — broke `sha256::tests::fips_abc` (wrong expected hash):
+   `cargo test` exits 101, propagates through `| tee` under `set -o pipefail`,
+   recipe aborts before the green line. Observed exit 101 (RED). Restored via
+   `git checkout builder/src/sha256.rs`.
+2. **anti-vacuous grep tooth** — ran with a filter matching 0 tests
+   (`cargo test … __no_such_test__`): cargo exits 0 with
+   `test result: ok. 0 passed … 39 filtered out`, but the
+   `test result: ok. [1-9][0-9]* passed` grep fails → recipe exits 1 (RED). So a
+   build that silently runs no tests cannot green the gate.
+
+Green baseline: 39 tests pass; `./check.sh cargo-test` exits 0.
 
 ## Measurement
 
-(record `./check.sh cargo-test` wall time here)
+`./check.sh cargo-test` (cheap gates + guix-shell realization + cold cargo
+compile + 39 tests): **~16.5s** warm store. The tests run in ~0.04s; the cost is
+the cold compile + shell provisioning.
