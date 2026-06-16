@@ -78,4 +78,4 @@ Baseline at pin 520785e3: `corpus-union 6/266 (2.26%)`, `shipped-system
 - [x] census script + snapshot + gate; baseline recorded
 - [x] verified-red (both rungs) recorded here
 - [ ] gate green in the sandbox (./check.sh guix-dependence)
-- [ ] full ./check.sh green; sub-agent review; land via PR
+- [x] full ./check.sh green; landed via PR #63 (auto-merge armed, awaiting review)
