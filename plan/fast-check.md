@@ -43,9 +43,10 @@ Make the shared helper `tests/td-check-repro.sh` verdict-memoized, mirroring
   `.check-verdicts/` to avoid the `$(basename drv).verdict` filename collision),
   host-local, gitignored, NEVER committed.
 
-Single-place change: all 4 recipe gates (pkgconfig/libatomic/popt/gzip) call this one
-helper, and every future recipe gate the input-recipes track adds gets memoization for
-free with no extra wiring.
+Single-place change: all recipe gates (pkgconfig/libatomic/popt/gzip — and now
+gettext, which landed via #61 during this work and picked up memoization on rebase
+with zero extra wiring) call this one helper, so every future recipe gate the
+input-recipes track adds gets memoization for free.
 
 ## Loosening disclosure (directive 3 / DESIGN §4.3 gate-2)
 
@@ -59,8 +60,11 @@ full double-build unconditionally.
 
 `tests/td-check-repro.sh` is shared by the input-recipes track's recipe gates. This PR
 only ADDS memo behavior (same interface: `td-check-repro.sh TB DRV INFILE SCRATCH`), so
-a new recipe gate keeps working unchanged and gains memoization automatically. Rebase if
-that track edits the helper.
+a new recipe gate keeps working unchanged and gains memoization automatically. Confirmed
+on rebase: #61 (corpus-gettext) both ADDED a 5th gate using the helper AND edited the
+helper's miss-path (re-realize the drv's build inputs before the closure walk); the
+rebase merged cleanly — that input-realization sits in the double-build body that runs
+only on a miss, below the memo decision.
 
 ## Verified-red log
 
@@ -90,5 +94,14 @@ guards are the exact check-memo code on the same control flow.)
 - Per recipe gate (`corpus-gzip`): warm repeat **80s → 21s** (the un-memoized
   double-build is the ~60s skipped on a hit). `corpus-pkgconfig`, the heaviest, was
   128s un-memoized warm; the same ~60–95s double-build is now skipped on a hit.
-- Full `./check.sh` A/B on this same tree (only `.td-check-verdicts/` differs):
-  (to fill in — cold-verdicts vs warm-verdicts full-loop wall time.)
+- Full `./check.sh` A/B on this same rebased tree (5 recipe gates incl. gettext;
+  only `.td-check-verdicts/` differs, guix-`--check` memo warm in both — so the
+  delta is purely the td-builder double-build):
+  - **T_before** (td-check cold = exactly what origin/main does on EVERY warm run,
+    since it has no td-check memo): GREEN, **1458s**, 5 td-check misses.
+  - **T_after** (memoized, warm): GREEN, **236s**, 5 td-check hits.
+  - **6.2× faster warm inner loop (~20 min saved per run).** The recent durable
+    `td-builder check` legs (#58/#61) had pushed the warm loop to ~24 min by
+    recompiling each recipe package twice every run; this recovers it to ~4 min.
+  Both the all-miss and all-hit full runs are GREEN ⇒ the gates are correct whether
+  the memo hits or misses.
