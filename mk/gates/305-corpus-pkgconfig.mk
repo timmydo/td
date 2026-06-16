@@ -54,7 +54,13 @@ corpus-pkgconfig:
 	test "$$ver" = "0.29.2" \
 	  || { echo "FAIL: the built pkg-config --version reported '$$ver', expected 0.29.2 — the artifact does not function." >&2; exit 1; }; \
 	echo "   pkg-config --version -> $$ver"; \
-	echo ">> [DURABLE: reproducibility] guix build --check (verdict-memoized; the standing durable replacement is td-check, plan/input-recipes.md)"; \
+	echo ">> [DURABLE: reproducibility] td computes the verdict ITSELF — td-builder check double-builds the recipe .drv in independent userns sandboxes (no guix build --check)"; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
+	printf '%s\n' "$$vars" | sed -n 's/^TD_IN=//p' > "$(CURDIR)/.tdck-pkgconfig.in"; \
+	TD_GUIX="$(GUIX)" sh tests/td-check-repro.sh "$$tb" "$$td_drv" "$(CURDIR)/.tdck-pkgconfig.in" "$(CURDIR)/.tdck-pkgconfig"; \
+	rm -f "$(CURDIR)/.tdck-pkgconfig.in"; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] guix build --check agrees the .drv is reproducible (verdict-memoized)"; \
 	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
 	echo ">> [MIGRATION ORACLE — removable when Guix is retired] the built out == the corpus oracle's out (path + NAR)"; \
 	test "$$out" = "$$oracle_out" \
@@ -65,4 +71,4 @@ corpus-pkgconfig:
 	echo "   corpus oracle NAR : $$nar_or"; \
 	test -n "$$nar_td" -a "$$nar_td" = "$$nar_or" \
 	  || { echo "FAIL: TS recipe NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
-	echo "PASS: the built pkg-config runs (--version 0.29.2, durable behavioral merit) and is reproducible; configure flags + multi-URI source are load-bearing; and (migration oracle) it is byte-identical to the corpus pkg-config."
+	echo "PASS: the built pkg-config runs (--version 0.29.2, durable behavioral merit) and is reproducible by td's OWN double-build (td-builder check, no Guix in that verdict); configure flags + multi-URI source are load-bearing; and (migration oracle) it is byte-identical to the corpus pkg-config and guix build --check agrees."

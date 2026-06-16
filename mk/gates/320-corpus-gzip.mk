@@ -57,18 +57,12 @@ corpus-gzip:
 	test "$$rt" = "td-gzip-roundtrip" \
 	  || { echo "FAIL: the built gzip did not round-trip a file (got: '$$rt') — the artifact does not function." >&2; exit 1; }; \
 	echo "   gzip -c | gzip -dc round-trip OK"; \
-	echo ">> [DURABLE: reproducibility] td computes the verdict ITSELF — td-builder check builds the recipe .drv TWICE in independent userns sandboxes and compares per-output NAR hashes; no guix build --check in this verdict"; \
+	echo ">> [DURABLE: reproducibility] td computes the verdict ITSELF — td-builder check double-builds the recipe .drv in independent userns sandboxes (no guix build --check)"; \
 	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
-	sc="$(CURDIR)/.corpus-gzip-tdcheck"; chmod -R u+w "$$sc" 2>/dev/null || true; rm -rf "$$sc"; mkdir -p "$$sc"; \
-	{ printf '%s\n' "$$vars" | sed -n 's/^TD_IN=//p'; echo "$$td_drv"; } | xargs $(GUIX) gc -R | sort -u > "$$sc/paths.txt"; \
-	echo "   staged build closure: `wc -l < "$$sc/paths.txt"` store items"; \
-	"$$tb" check "$$td_drv" "$$sc/paths.txt" "$$sc/c" > "$$sc/out.txt" 2>"$$sc/err.txt" \
-	  || { echo "FAIL: td-builder check reported NON-reproducible (or errored):" >&2; cat "$$sc/out.txt" "$$sc/err.txt" >&2; chmod -R u+w "$$sc" 2>/dev/null || true; rm -rf "$$sc"; exit 1; }; \
-	grep -F "$$out" "$$sc/out.txt" | grep -q "reproducible" \
-	  || { echo "FAIL: td-builder check did not report $$out reproducible:" >&2; cat "$$sc/out.txt" >&2; chmod -R u+w "$$sc" 2>/dev/null || true; rm -rf "$$sc"; exit 1; }; \
-	echo "   td double-build agrees: $$out is reproducible (td's OWN verdict, no Guix)"; \
-	chmod -R u+w "$$sc" 2>/dev/null || true; rm -rf "$$sc"; \
+	printf '%s\n' "$$vars" | sed -n 's/^TD_IN=//p' > "$(CURDIR)/.tdck-gzip.in"; \
+	TD_GUIX="$(GUIX)" sh tests/td-check-repro.sh "$$tb" "$$td_drv" "$(CURDIR)/.tdck-gzip.in" "$(CURDIR)/.tdck-gzip"; \
+	rm -f "$(CURDIR)/.tdck-gzip.in"; \
 	echo ">> [MIGRATION ORACLE — removable when Guix is retired] guix build --check agrees the .drv is reproducible (verdict-memoized)"; \
 	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
 	echo ">> [MIGRATION ORACLE — removable when Guix is retired] the built out == the corpus oracle's out (path + NAR)"; \

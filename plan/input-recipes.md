@@ -41,9 +41,14 @@ direct-input output paths, emitted as `TD_IN=` by tests/ts-recipe-gzip-drv.scm).
 `guix build --check` is kept as a MIGRATION-ORACLE cross-check (memoized), mirroring
 the `td-check` gate's structure. So gzip is reproducible on td's terms today.
 
-Rollout to corpus-pkgconfig/libatomic/popt is the same pattern (each adds ~2
-sandbox builds — un-memoized, the loop-latency cost; weigh per gate). The closure
-staging (`input-output-paths` → `guix gc -R`) is the reusable piece.
+Rolled out to ALL four recipe gates (human direction 2026-06-15: do it everywhere,
+no piecemeal). The leg is the shared `tests/td-check-repro.sh` (stages the build
+closure via `input-output-paths` → `guix gc -R`, runs `td-builder check`); each
+recipe `*-drv.scm` emits the closure seed as `TD_IN=`. libatomic-ops (multi-output)
+verified reproducible on BOTH outputs. `guix build --check` stays as a memoized
+MIGRATION-ORACLE cross-check in each gate. Cost: each gate adds ~2 un-memoized
+sandbox builds (the loop-latency trade the human accepted for uniformity); a future
+memoization of the td-check verdict would recover it.
 
 Verified-red (R6, td-check leg): stage an EMPTY build closure ⇒ `td-builder check`
 cannot build the drv ⇒ the `[DURABLE: reproducibility]` leg reds ("td-builder check

@@ -55,7 +55,13 @@ corpus-popt:
 	test -f "$$out/lib/libpopt.so" -a -f "$$out/include/popt.h" \
 	  || { echo "FAIL: the built popt out is missing lib/libpopt.so or include/popt.h — the artifact has the wrong shape." >&2; exit 1; }; \
 	echo "   lib/libpopt.so + include/popt.h present"; \
-	echo ">> [DURABLE: reproducibility] guix build --check (verdict-memoized; the standing durable replacement is td-check, plan/input-recipes.md)"; \
+	echo ">> [DURABLE: reproducibility] td computes the verdict ITSELF — td-builder check double-builds the recipe .drv in independent userns sandboxes (no guix build --check)"; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
+	printf '%s\n' "$$vars" | sed -n 's/^TD_IN=//p' > "$(CURDIR)/.tdck-popt.in"; \
+	TD_GUIX="$(GUIX)" sh tests/td-check-repro.sh "$$tb" "$$td_drv" "$(CURDIR)/.tdck-popt.in" "$(CURDIR)/.tdck-popt"; \
+	rm -f "$(CURDIR)/.tdck-popt.in"; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] guix build --check agrees the .drv is reproducible (verdict-memoized)"; \
 	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
 	echo ">> [MIGRATION ORACLE — removable when Guix is retired] the built out == the corpus oracle's out (path + NAR)"; \
 	test "$$out" = "$$oracle_out" \
@@ -66,4 +72,4 @@ corpus-popt:
 	echo "   corpus oracle NAR : $$nar_or"; \
 	test -n "$$nar_td" -a "$$nar_td" = "$$nar_or" \
 	  || { echo "FAIL: TS recipe NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
-	echo "PASS: the built popt ships lib/libpopt.so + include/popt.h (durable structural merit) and is reproducible; the phase DATA lowered to the byte-identical modify-phases gexp and is load-bearing; and (migration oracle) it is byte-identical to the corpus popt."
+	echo "PASS: the built popt ships lib/libpopt.so + include/popt.h (durable structural merit) and is reproducible by td's OWN double-build (td-builder check, no Guix in that verdict); the phase DATA lowered to the byte-identical modify-phases gexp and is load-bearing; and (migration oracle) it is byte-identical to the corpus popt and guix build --check agrees."

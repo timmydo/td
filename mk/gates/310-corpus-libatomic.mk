@@ -55,7 +55,13 @@ corpus-libatomic:
 	test -f "$$td_out/lib/libatomic_ops.a" -a -f "$$td_out/include/atomic_ops.h" \
 	  || { echo "FAIL: the built libatomic-ops out is missing lib/libatomic_ops.a or include/atomic_ops.h — the artifact has the wrong shape." >&2; exit 1; }; \
 	echo "   lib/libatomic_ops.a + include/atomic_ops.h present"; \
-	echo ">> [DURABLE: reproducibility] guix build --check (verdict-memoized; the standing durable replacement is td-check, plan/input-recipes.md)"; \
+	echo ">> [DURABLE: reproducibility] td computes the verdict ITSELF — td-builder check double-builds the recipe .drv in independent userns sandboxes (both outputs out + debug; no guix build --check)"; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
+	printf '%s\n' "$$vars" | sed -n 's/^TD_IN=//p' > "$(CURDIR)/.tdck-libatomic.in"; \
+	TD_GUIX="$(GUIX)" sh tests/td-check-repro.sh "$$tb" "$$td_drv" "$(CURDIR)/.tdck-libatomic.in" "$(CURDIR)/.tdck-libatomic"; \
+	rm -f "$(CURDIR)/.tdck-libatomic.in"; \
+	echo ">> [MIGRATION ORACLE — removable when Guix is retired] guix build --check agrees the .drv is reproducible (verdict-memoized)"; \
 	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$td_drv"; \
 	echo ">> [MIGRATION ORACLE — removable when Guix is retired] the built out == the corpus oracle's out (path + NAR)"; \
 	test "$$td_out" = "$$oracle_out" \
@@ -66,4 +72,4 @@ corpus-libatomic:
 	echo "   corpus oracle NAR : $$nar_or"; \
 	test -n "$$nar_td" -a "$$nar_td" = "$$nar_or" \
 	  || { echo "FAIL: TS recipe NAR hash != corpus oracle NAR hash." >&2; exit 1; }; \
-	echo "PASS: the built libatomic-ops out ships lib/libatomic_ops.a + include/atomic_ops.h (durable structural merit) and is reproducible; the extra output is load-bearing; and (migration oracle) it is byte-identical to the corpus libatomic-ops."
+	echo "PASS: the built libatomic-ops out ships lib/libatomic_ops.a + include/atomic_ops.h (durable structural merit) and is reproducible by td's OWN double-build (td-builder check, both outputs, no Guix in that verdict); the extra output is load-bearing; and (migration oracle) it is byte-identical to the corpus libatomic-ops and guix build --check agrees."

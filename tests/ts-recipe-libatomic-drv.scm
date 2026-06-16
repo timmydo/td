@@ -18,6 +18,7 @@
              (guix packages)
              (guix derivations)
              (ice-9 format)
+             (srfi srfi-1)
              (gnu packages)                 ;the ORACLE (specification->package libatomic-ops)
              (system td-recipe))
 
@@ -28,6 +29,16 @@
               "ts-recipe-libatomic-drv: ~a not set (need the emitted recipe JSON)~%" name)
       (exit 2))
     v))
+
+;; The realized output path of every direct input of DRV — the build-closure seed
+;; the `corpus-libatomic` gate stages for `td-builder check` (the durable
+;; reproducibility leg). Mirrors tests/td-drv-build-drv.scm's input-output-paths.
+(define (input-output-paths drv)
+  (append-map (lambda (i)
+                (let ((d (derivation-input-derivation i)))
+                  (map (lambda (o) (derivation->output-path d o))
+                       (derivation-input-sub-derivations i))))
+              (derivation-inputs drv)))
 
 (with-store store
   (set-build-options store #:use-substitutes? #f #:offload? #f)
@@ -40,4 +51,5 @@
     ;; so the gate compares the OUT objects rather than `guix build`'s multi-line
     ;; output. With convergence (TD_DRV == ORACLE_DRV) TD_OUT == ORACLE_OUT.
     (format #t "TD_OUT=~a~%" (derivation->output-path td))
-    (format #t "ORACLE_OUT=~a~%" (derivation->output-path oracle))))
+    (format #t "ORACLE_OUT=~a~%" (derivation->output-path oracle))
+    (for-each (lambda (p) (format #t "TD_IN=~a~%" p)) (input-output-paths td))))
