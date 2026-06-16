@@ -7,6 +7,22 @@ corpus-independence endgame, package-by-package").
 Claim: claude-fable-2715d4, 2026-06-14.
 Single writer: the claiming agent.
 
+## Step (d): RETIRE system/td-recipe.scm + the byte-identity oracle (PR #68)
+
+Human (2026-06-16): "retire the scm files" → "drop the byte-identity oracle
+wholesale." Deleted `system/td-recipe.scm` (the gnu-build-system bridge), the 7
+`corpus-*` byte-identity gates, and their 14 `ts-recipe-*-{drv,diff}.scm` (+ removed
+the `(system td-recipe)` import from `eval.scm`). The durable own-builder gates
+(`td-build`/`-deps`/`-resolved`/`-phases`/`-corpus`/`-gettext`) remain and cover
+hello, nano, gzip, popt, libatomic-ops, gettext behaviorally + reproducibly.
+pkg-config LOSES coverage (its only gate was byte-identity; the own builder can't
+build it — glib C-standard wall) — accepted by the human; excluded from the
+guix-dependence census (6 td-built, was 7). Exercises the "removable migration
+oracle" clause of CLAUDE.md's durable discipline AHEAD of Guix retirement, per
+explicit direction; surviving gates stay all-durable. Follow-ups: own-builder
+pkg-config (glib fix), and re-add perturbed-diverges/phases-load-bearing
+self-discrimination legs to the td-build-* gates (lost with the corpus diff gates).
+
 ## Differential + durable test legs (convention, 2026-06-15)
 
 Human concern (2026-06-15): the recipe gates validate Guix *compatibility*

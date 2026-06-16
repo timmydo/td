@@ -16,7 +16,6 @@
              (system td-disk)
              (system td-builder)
              (system td-ts)
-             (system td-recipe)
              (system td-build)
              (tests boot)
              (tests reset)
