@@ -57,14 +57,25 @@ Baseline at pin 520785e3: `corpus-union 6/266 (2.26%)`, `shipped-system
   td's *ownership ratio* and catches drift in it. It does not re-prove
   reproducibility (the corpus gates do).
 
-## Verified-red ladder
+## Verified-red ladder (SEEN red 2026-06-15)
 
-1. perturb the snapshot count → census mismatch reds. (comparison has teeth)
-2. hide a recipe-\*.ts → owned set + counts drop → mismatch reds. (metric
-   actually tracks ownership, not a constant)
+1. perturb the snapshot count (266→265) → exit 1, FAIL "census drifted".
+   Comparison has teeth. Restored → PASS.
+2. hide tests/ts/recipe-gzip.ts → recomputed `owned-recipes (5)`,
+   `corpus-union 5/265 (1.89%)`, `shipped-system 2/1405 (0.14%)` (gzip dropped
+   from both present-lists but still counted in the system TOTAL as a
+   guix-supplied dep) → mismatch, exit 1. The metric tracks ownership, not a
+   constant. Restored → PASS.
+
+## Baseline (pin 520785e3)
+
+    owned-recipes (6): gzip hello libatomic-ops nano pkg-config popt
+    corpus-union: td-reproducible 6 / 266 (2.26%) [all 6]
+    shipped-system: td-reproducible 3 / 1405 (0.21%) [gzip nano pkg-config]
 
 ## Sub-task ladder
 
-- [ ] census script + snapshot + gate; baseline recorded
-- [ ] verified-red (both rungs) recorded here
-- [ ] full ./check.sh green; land via PR
+- [x] census script + snapshot + gate; baseline recorded
+- [x] verified-red (both rungs) recorded here
+- [ ] gate green in the sandbox (./check.sh guix-dependence)
+- [ ] full ./check.sh green; sub-agent review; land via PR
