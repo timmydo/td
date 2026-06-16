@@ -63,7 +63,12 @@
   (let* ((name    (field recipe-alist "name"))
          (version (field recipe-alist "version"))
          (source  (field recipe-alist "source"))
-         (uri     (field source "uri"))
+         ;; The upstream URI is a single URL or — for a mirror-list source like
+         ;; pkg-config's — a JSON array (guile-json yields a vector). url-fetch
+         ;; accepts a string OR a list; convert a vector to a list (same as
+         ;; system/td-recipe.scm's recipe-uri).
+         (uri     (let ((u (field source "uri")))
+                    (if (vector? u) (vector->list u) u)))
          (hash    (field source "sha256"))
          (full    (string-append name "-" version))
          ;; The upstream source — a declared fixed-output url-fetch, same offline
