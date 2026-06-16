@@ -1,7 +1,7 @@
 ;; ci/system-test-drvs.scm — lower every marionette system test and every
 ;; container-rung app artifact to its derivation file name, one per line.
-;; Mirrors the Makefile recipes' inline repl expressions (see `test`,
-;; `boot-disk`, `reset`, `rollback`, `container`); used by
+;; Mirrors the Makefile recipes' inline repl expressions (see `boot-disk`,
+;; `reset`, `rollback`, `container`); used by
 ;; ci/lower-check-drvs.sh to enumerate the CI store image contents.
 (use-modules (guix) (gnu tests)
              (tests boot) (tests reset) (tests rollback) (tests container))
@@ -12,7 +12,7 @@
               (format #t "~a~%"
                       (derivation-file-name
                        (run-with-store store (system-test-value t)))))
-            (list %test-td-boot %test-td-disk-boot %test-td-reset
+            (list %test-td-disk-boot %test-td-reset
                   %test-td-rollback %test-td-container))
   (for-each (lambda (m)
               (format #t "~a~%"

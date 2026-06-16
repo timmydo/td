@@ -24,8 +24,7 @@
   #:use-module (guix gexp)
   #:use-module (guix packages)
   #:use-module (system td)
-  #:export (%test-td-boot
-            %test-td-disk-boot
+  #:export (%test-td-disk-boot
             %instrumented-disk-os))
 
 (define %expected-kernel-release
@@ -52,46 +51,120 @@
                   (home-directory (string-append "/home/" %test-user)))
                  (operating-system-users td-system)))
     (services
-     (modify-services (operating-system-user-services td-system)
-       (openssh-service-type config =>
-         (openssh-configuration
-          (inherit config)
-          (authorized-keys
-           (list (list %test-user
-                       (local-file "keys/td_test_ed25519.pub"))))))))))
+     (cons
+      ;; The disk-boot test boots a STANDALONE qcow2 (no shared host store —
+      ;; unlike the old direct-kernel `(virtual-machine os)`), so the test
+      ;; private key's /gnu/store path is ABSENT in the guest. Bake it into the
+      ;; image at /td_test_key (0600, ssh-usable) at activation so the
+      ;; in-guest ssh client (the M3+ key-login positive control) can use it.
+      (simple-service 'td-test-privkey activation-service-type
+        #~(begin
+            (copy-file #$(local-file "keys/td_test_ed25519") "/td_test_key")
+            (chmod "/td_test_key" #o600)))
+      (modify-services (operating-system-user-services td-system)
+        (openssh-service-type config =>
+          (openssh-configuration
+           (inherit config)
+           (authorized-keys
+            (list (list %test-user
+                        (local-file "keys/td_test_ed25519.pub")))))))))))
 
-(define (run-td-boot-test)
-  (define os
-    (marionette-operating-system
-     %test-os
-     #:imported-modules '((gnu services herd))))
+;;;
+;;; Disk-image boot test: boot the qcow2 through its BOOTLOADER, then run the
+;;; full behavioral assertion suite (M1 kernel, M2 sshd, M3 default-deny, M3+
+;;; key-login, M9 container-host) ON that realistic boot.
+;;;
+;;; This is the SOLE boot test. The former `%test-td-boot` direct-kernel boot
+;;; (`(virtual-machine os)` — qemu -kernel/-initrd, which never exercises GRUB,
+;;; the partition table, or the disk image, and is NOT how td ships) was removed
+;;; (track amortize-vm-boots): its behavioral asserts moved HERE so they are now
+;;; verified on the real firmware->GRUB->kernel->init path, eliminating one full
+;;; VM boot per check. This test boots the qcow2 DISK image the way `make build`
+;;; builds and reproducibility-checks it: SeaBIOS -> GRUB (installed on the
+;;; image's /dev/vda) -> kernel -> init.
+;;;
+;;; The booted OS is %instrumented-disk-os = %test-os (the shipped `td-system`
+;;; plus the marionette backdoor AND the test SSH user/key needed by the M3+
+;;; key-login positive control); the bootloader-configuration, file-systems and
+;;; image type are exactly the shipped image's. A structural guard below asserts
+;;; the boot used the disk/GRUB path (no -kernel/-initrd) so a regression to
+;;; direct-kernel reddens here rather than passing silently.
+;;;
+;;; (Residual: this is not byte-identical to the shipped qcow2 — it carries the
+;;; backdoor service + the test user. A byte-exact boot of the un-instrumented
+;;; image would need a serial-console/ssh harness instead of the marionette;
+;;; noted for follow-up.)
 
-  (define vm (virtual-machine os))
+;; The shipped td-system as a TEST image: instrumented with the marionette
+;; backdoor AND carrying the test SSH user/key (%test-os) so the key-based login
+;; positive control can authenticate. Its qcow2 is built exactly as `guix system
+;; image -t qcow2` does. The os is module-level and exported so the `reset` rung
+;; (tests reset) instruments the SAME system (it derives a non-volatile image
+;; variant from it); the extra account is immutable system state, inert to
+;; reset's ephemerality assertions. The SHIPPED td-system/qcow2 oracle (the M4/M5
+;; differentials) is a DIFFERENT, un-overlaid object and stays untouched.
+(define %instrumented-disk-os
+  (marionette-operating-system
+   %test-os
+   #:imported-modules '((gnu services herd))))
+
+(define %instrumented-disk-image
+  (system-image ((image-type-constructor qcow2-image-type)
+                 %instrumented-disk-os)))
+
+(define (run-td-disk-boot-test)
+  (define image %instrumented-disk-image)
 
   (define test
     (with-imported-modules '((gnu build marionette))
       #~(begin
           (use-modules (gnu build marionette)
-                       (srfi srfi-64)
+                       (srfi srfi-1)
                        (srfi srfi-13)
+                       (srfi srfi-64)
                        (ice-9 popen)
                        (ice-9 rdelim))
 
-          (define marionette (make-marionette (list #$vm)))
+          ;; No -kernel/-initrd: boot the disk so firmware -> GRUB runs.
+          ;; -snapshot keeps the run ephemeral (writable overlay, discarded).
+          (define qemu-cmd
+            `(,(string-append #$qemu-minimal "/bin/" #$(qemu-command))
+              "-snapshot"
+              ,@(if (file-exists? "/dev/kvm") '("-enable-kvm") '())
+              "-no-reboot"
+              ;; Headroom for sshd + an in-guest ssh client (the behavioral
+              ;; asserts moved here from the former direct-kernel boot test).
+              "-m" "1024"
+              "-drive" ,(string-append "file=" #$image
+                                       ",if=virtio,format=qcow2")))
 
-          ;; system-test-runner writes the SRFI-64 log into #$output, so the
-          ;; builder produces its output path and the process exit status
-          ;; reflects the test result. (The previous `node-test-runner` was an
-          ;; unbound variable, so this builder never actually ran — see the
-          ;; commit message.)
+          (define marionette (make-marionette qemu-cmd))
+
           (test-runner-current (system-test-runner #$output))
-          (test-begin "td-boot")
+          (test-begin "td-disk-boot")
 
-          ;; M1: the running kernel matches the declaration. Use Guile's
-          ;; built-in `uname` (no subprocess / no reliance on the guest PATH).
-          (test-equal "running kernel matches the declared kernel"
+          ;; Permanent guard (triage #5): assert the boot used the DISK/bootloader
+          ;; path, not direct-kernel. Without this, a regression back to
+          ;; `-kernel`/`-initrd` (or `(virtual-machine os)`) would still satisfy
+          ;; the uname assertion below and stay green. We require the qemu command
+          ;; to carry the qcow2 disk and to carry NO -kernel/-initrd, so a
+          ;; direct-kernel regression reddens here structurally.
+          (test-assert "boots from the qcow2 disk via firmware->GRUB (no direct-kernel)"
+            (and (not (member "-kernel" qemu-cmd))
+                 (not (member "-initrd" qemu-cmd))
+                 (any (lambda (a)
+                        (and (string? a) (string-contains a "format=qcow2")))
+                      qemu-cmd)))
+
+          (test-equal "qcow2 disk boots through GRUB; kernel matches declaration"
             #$%expected-kernel-release
             (marionette-eval '(utsname:release (uname)) marionette))
+
+          ;; The behavioral asserts below were the direct-kernel `%test-td-boot`
+          ;; test; they now run on THIS realistic firmware->GRUB boot (one fewer
+          ;; VM boot per check — see plan/amortize-vm-boots.md). The booted OS is
+          ;; %test-os (td-system + the test SSH user/key) so the key-login
+          ;; positive control can authenticate.
 
           ;; M2: the declared service is up and its port listens.
           (test-assert "ssh-daemon shepherd unit is running"
@@ -142,9 +215,10 @@
                    (not (string-contains advert "keyboard-interactive")))))
 
           ;; M3+ positive control: a provisioned key-based login SUCCEEDS and we
-          ;; capture the output of a command run over that session. The store
-          ;; copy of the private key is 0444 (world-readable) so ssh would refuse
-          ;; it ("permissions too open"); copy it out and chmod 0600 first. We
+          ;; capture the output of a command run over that session. The private
+          ;; key is baked into THIS image at /td_test_key (0600) by %test-os's
+          ;; activation service — the standalone disk guest has no
+          ;; shared host store to copy it out of (the direct-kernel VM did). We
           ;; log in as the non-root %test-user over publickey only (root login
           ;; and password auth are both off per M3), run a small command, and
           ;; assert BOTH the exit status is 0 AND its stdout reached us —
@@ -154,9 +228,7 @@
                  (marionette-eval
                   '(begin
                      (use-modules (ice-9 popen) (ice-9 rdelim))
-                     (let ((kf "/root/td_test_key"))
-                       (copy-file #$(local-file "keys/td_test_ed25519") kf)
-                       (chmod kf #o600)
+                     (let ((kf "/td_test_key"))
                        (let* ((cmd (string-append
                                     #$(file-append openssh "/bin/ssh")
                                     " -i " kf
@@ -207,98 +279,6 @@
           (test-end)
           (exit (zero? (test-runner-fail-count (test-runner-current)))))))
 
-  (gexp->derivation "td-boot-test" test))
-
-(define %test-td-boot
-  (system-test
-   (name "td-boot")
-   (description
-    "Boot the td system and assert: the running kernel release matches the \
-version pinned in the declaration, the ssh-daemon shepherd unit is running, the \
-declared sshd port is listening, and the daemon denies password authentication \
-(default-deny hardening).")
-   (value (run-td-boot-test))))
-
-;;;
-;;; Disk-image boot test (triage #2): boot the qcow2 through its BOOTLOADER.
-;;;
-;;; The %test-td-boot above uses `(virtual-machine os)`, which direct-kernel-boots
-;;; (qemu -kernel/-initrd) — it never exercises GRUB, the partition table, or the
-;;; disk image, so a broken bootloader/disk could still pass. This test boots the
-;;; qcow2 DISK image the way `make build` builds and reproducibility-checks it:
-;;; SeaBIOS -> GRUB (installed on the image's /dev/vda) -> kernel -> init.
-;;;
-;;; The booted OS is the shipped `td-system` instrumented ONLY with the marionette
-;;; backdoor (so we can drive it) — the same kind of test-only overlay as
-;;; %test-os, and crucially the bootloader-configuration, file-systems and image
-;;; type are exactly the shipped image's. Reaching a live guest at all proves the
-;;; whole disk-boot chain worked; we assert the kernel release as the concrete
-;;; oracle, now via the real bootloader path rather than direct-kernel.
-;;;
-;;; (Residual: this is not byte-identical to the shipped qcow2 — it carries the
-;;; backdoor service. A byte-exact boot of the un-instrumented image would need a
-;;; serial-console/ssh harness instead of the marionette; noted for follow-up.)
-
-;; The shipped td-system instrumented ONLY with the marionette backdoor, and its
-;; qcow2 disk image built exactly as `guix system image -t qcow2` does. The os
-;; is module-level and exported so the `reset` rung (tests reset) instruments
-;; the SAME system (it derives a non-volatile image variant from it).
-(define %instrumented-disk-os
-  (marionette-operating-system
-   td-system
-   #:imported-modules '((gnu services herd))))
-
-(define %instrumented-disk-image
-  (system-image ((image-type-constructor qcow2-image-type)
-                 %instrumented-disk-os)))
-
-(define (run-td-disk-boot-test)
-  (define image %instrumented-disk-image)
-
-  (define test
-    (with-imported-modules '((gnu build marionette))
-      #~(begin
-          (use-modules (gnu build marionette)
-                       (srfi srfi-1)
-                       (srfi srfi-13)
-                       (srfi srfi-64))
-
-          ;; No -kernel/-initrd: boot the disk so firmware -> GRUB runs.
-          ;; -snapshot keeps the run ephemeral (writable overlay, discarded).
-          (define qemu-cmd
-            `(,(string-append #$qemu-minimal "/bin/" #$(qemu-command))
-              "-snapshot"
-              ,@(if (file-exists? "/dev/kvm") '("-enable-kvm") '())
-              "-no-reboot"
-              "-m" "512"
-              "-drive" ,(string-append "file=" #$image
-                                       ",if=virtio,format=qcow2")))
-
-          (define marionette (make-marionette qemu-cmd))
-
-          (test-runner-current (system-test-runner #$output))
-          (test-begin "td-disk-boot")
-
-          ;; Permanent guard (triage #5): assert the boot used the DISK/bootloader
-          ;; path, not direct-kernel. Without this, a regression back to
-          ;; `-kernel`/`-initrd` (or `(virtual-machine os)`) would still satisfy
-          ;; the uname assertion below and stay green. We require the qemu command
-          ;; to carry the qcow2 disk and to carry NO -kernel/-initrd, so a
-          ;; direct-kernel regression reddens here structurally.
-          (test-assert "boots from the qcow2 disk via firmware->GRUB (no direct-kernel)"
-            (and (not (member "-kernel" qemu-cmd))
-                 (not (member "-initrd" qemu-cmd))
-                 (any (lambda (a)
-                        (and (string? a) (string-contains a "format=qcow2")))
-                      qemu-cmd)))
-
-          (test-equal "qcow2 disk boots through GRUB; kernel matches declaration"
-            #$%expected-kernel-release
-            (marionette-eval '(utsname:release (uname)) marionette))
-
-          (test-end)
-          (exit (zero? (test-runner-fail-count (test-runner-current)))))))
-
   (gexp->derivation "td-disk-boot-test" test))
 
 (define %test-td-disk-boot
@@ -306,6 +286,9 @@ declared sshd port is listening, and the daemon denies password authentication \
    (name "td-disk-boot")
    (description
     "Boot the qcow2 disk image through its GRUB bootloader (not a direct-kernel \
-VM) and assert the running kernel matches the declaration — exercising the \
-bootloader, partition table and disk image that the direct-kernel boot skips.")
+VM) — exercising the bootloader, partition table and disk image — then assert \
+the full behavioral suite on that realistic boot: the running kernel matches the \
+declaration, the ssh-daemon unit is up and its port listens, the daemon denies \
+password authentication (default-deny), a key-based login succeeds, and the base \
+is a container host (cgroup2 mounted, crun shipped).")
    (value (run-td-disk-boot-test))))
