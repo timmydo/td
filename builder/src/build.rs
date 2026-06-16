@@ -200,9 +200,14 @@ fn find_files(srcdir: &str, dir: &str, regex: &str, search_path: &str) -> Result
     let bash = find_in_path(search_path, "bash").ok_or("bash not found for find-files")?;
     // List files; keep those whose basename matches the regex. Single-quote the
     // regex (the corpus find-files regexes contain none); PATH carries find/grep.
+    // The match test is an `if` (not `grep && printf`): a NON-matching last file
+    // would otherwise leave the `while` loop — and thus the pipeline — with grep's
+    // exit 1, which `set -e` turns into a spurious "find-files failed" (gettext's
+    // gettext-tools/tests dir, where most files don't match, hit exactly this).
+    // `pipefail` keeps a genuine `find` failure fatal.
     let script = format!(
-        "set -e; export PATH={path}; find {full} -type f | while IFS= read -r p; do \
-         printf '%s\\n' \"${{p##*/}}\" | grep -qE -- '{regex}' && printf '%s\\n' \"$p\"; done",
+        "set -eo pipefail; export PATH={path}; find {full} -type f | while IFS= read -r p; do \
+         if printf '%s\\n' \"${{p##*/}}\" | grep -qE -- '{regex}'; then printf '%s\\n' \"$p\"; fi; done",
         path = search_path,
         full = full.display(),
         regex = regex,
