@@ -18,6 +18,7 @@
              (guix packages)
              (guix derivations)
              (ice-9 format)
+             (srfi srfi-1)
              (gnu packages)                 ;the ORACLE (specification->package popt)
              (system td-recipe))
 
@@ -29,6 +30,16 @@
       (exit 2))
     v))
 
+;; The realized output path of every direct input of DRV — the build-closure seed
+;; the `corpus-popt` gate stages for `td-builder check` (the durable reproducibility
+;; leg). Mirrors tests/td-drv-build-drv.scm's input-output-paths.
+(define (input-output-paths drv)
+  (append-map (lambda (i)
+                (let ((d (derivation-input-derivation i)))
+                  (map (lambda (o) (derivation->output-path d o))
+                       (derivation-input-sub-derivations i))))
+              (derivation-inputs drv)))
+
 (with-store store
   (set-build-options store #:use-substitutes? #f #:offload? #f)
   (let ((td     (package-derivation store
@@ -36,4 +47,5 @@
         (oracle (package-derivation store (specification->package "popt") #:graft? #f)))
     (format #t "TD_DRV=~a~%" (derivation-file-name td))
     (format #t "ORACLE_DRV=~a~%" (derivation-file-name oracle))
-    (format #t "ORACLE_OUT=~a~%" (derivation->output-path oracle))))
+    (format #t "ORACLE_OUT=~a~%" (derivation->output-path oracle))
+    (for-each (lambda (p) (format #t "TD_IN=~a~%" p)) (input-output-paths td))))

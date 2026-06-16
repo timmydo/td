@@ -31,14 +31,29 @@ with NO Guix oracle involved — proving the durable leg is a real, non-vacuous 
 of the artifact. Restored. (The structural `test -f` legs are non-vacuous by
 construction.)
 
-**Next durable step (not done here):** make the recipe gates assert reproducibility
-on td's OWN terms via `td-builder check` (double-build) instead of `guix build
---check`. The `td-check` gate already proves td owns this oracle for the `td-build`
-subject (builder = `td-builder`); rolling it onto these gates needs td's executor to
-run `gnu-build-system` (guile-builder) drvs — staging the drv's full build closure +
-validating guile builds in td's sandbox. That is its own increment; until then the
-reproducibility leg is `guix build --check` (the property is intrinsic; the
-mechanism is the removable oracle).
+**Durable reproducibility via td-check (DONE for corpus-gzip):** `corpus-gzip`'s
+reproducibility leg is now td's OWN double-build — `td-builder check` builds the
+recipe `.drv` TWICE in independent userns sandboxes and compares per-output NAR
+hashes (no `guix build --check` in that verdict). A spike confirmed td's executor
+runs a `gnu-build-system` (guile-builder) recipe drv unchanged (it execs `drv.builder`
+generically; the gate stages the build closure via `guix gc -R` over the drv's
+direct-input output paths, emitted as `TD_IN=` by tests/ts-recipe-gzip-drv.scm).
+`guix build --check` is kept as a MIGRATION-ORACLE cross-check (memoized), mirroring
+the `td-check` gate's structure. So gzip is reproducible on td's terms today.
+
+Rolled out to ALL four recipe gates (human direction 2026-06-15: do it everywhere,
+no piecemeal). The leg is the shared `tests/td-check-repro.sh` (stages the build
+closure via `input-output-paths` → `guix gc -R`, runs `td-builder check`); each
+recipe `*-drv.scm` emits the closure seed as `TD_IN=`. libatomic-ops (multi-output)
+verified reproducible on BOTH outputs. `guix build --check` stays as a memoized
+MIGRATION-ORACLE cross-check in each gate. Cost: each gate adds ~2 un-memoized
+sandbox builds (the loop-latency trade the human accepted for uniformity); a future
+memoization of the td-check verdict would recover it.
+
+Verified-red (R6, td-check leg): stage an EMPTY build closure ⇒ `td-builder check`
+cannot build the drv ⇒ the `[DURABLE: reproducibility]` leg reds ("td-builder check
+reported NON-reproducible (or errored)", exit 2). Proves the leg genuinely runs td's
+double-build against the staged closure — not a no-op. Restored; gate green.
 
 ## Where we are
 
