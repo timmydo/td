@@ -53,10 +53,38 @@ system + its differentials are untouched.
 5. [ ] `./check.sh reset` green (shared image still boots).
 6. [ ] sub-agent diff review; full `./check.sh` green; land per §7.2.
 
-## Verified-red evidence
+## Verified-red evidence (2026-06-15)
 
-(to fill in)
+- **Key-login (the genuinely new machinery — key baked into the standalone disk
+  image).** With `authorized-keys` emptied (`(list)`), boot-disk shows exactly
+  ONE failure — "key-based SSH login succeeds and command output is captured" —
+  while the other 6 asserts PASS (6 passes / 1 unexpected failure; gate reds with
+  Error 1). So the login assert genuinely verifies authorized login on the GRUB
+  boot, and the other asserts discriminate independently. Restored.
+- **Relocated marionette-eval assert (password-deny).** With
+  `password-authentication? #t` on `%test-os`'s openssh config, boot-disk shows
+  exactly ONE failure — "daemon denies password authentication (default-deny)" —
+  the other 6 PASS. So a relocated `marionette-eval` ssh-probe assert is
+  load-bearing on the GRUB boot too (addresses the review nit). Restored.
+- **The relocation is non-vacuous.** The green run's SRFI-64 log shows every
+  moved assert with `result-kind: pass` and a REAL actual-value (the running
+  ssh-daemon service record, the cgroup2fs type string, etc.) — they execute and
+  check real guest state, not vacuously. (They are verbatim relocations of asserts
+  already verified-red historically in the direct-kernel test; the new risk was
+  whether they RUN on the disk boot + the key availability, both confirmed.)
+- **Debug trail:** first run failed the login with `car` on `#f` — the standalone
+  disk guest has no shared store, so `copy-file` from the key's /gnu/store path
+  threw. Baking the key via an activation service to `/root/td_test_key` still
+  failed (`/root` absent at activation); placing it at `/td_test_key` (filesystem
+  root) works → login PASS.
+- **reset still green:** all 3 ephemerality asserts pass with the test user/key
+  now in the shared `%instrumented-disk-os` (immutable system state, inert to the
+  dirt/reset assertions), as predicted.
 
 ## Measurement
 
-(record boot-disk before/after wall time + full-check delta)
+- `./check.sh boot-disk` warm: ~25s (test drv cache hit / ~boot+7 asserts).
+- Net: removes the entire `test` gate (one direct-kernel `(virtual-machine os)`
+  boot, ~30s historically); boot-disk now runs 7 asserts instead of 2 (a few
+  extra seconds for sshd+login) but there is ONE fewer full VM boot per check.
+- Full-check wall delta: recorded after the landing full run.
