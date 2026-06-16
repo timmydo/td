@@ -338,3 +338,14 @@ self-discriminating every loop.
 Restored; tree clean; gate green (`./check.sh corpus-libatomic`, NAR-hash-equal on the
 out output `1xz2xsb7ay7cpxdl2qdxv1d2m6mxhmx2nbn992bgp9dqwxyv4v74`). The in-gate legs
 (perturbed source, outputs-stripped, output-set) keep it self-discriminating.
+
+## Verified-red log (Inc.5, full phase-body DSL — corpus-gettext)
+
+- **R7 phase-body constructs load-bearing** — break one construct in the bridge
+  (`filearg->gexp` emits the bare `dir` string instead of `(find-files dir regex)`)
+  ⇒ gettext-minimal's generated phase-body gexp differs ⇒ it DIVERGES from the
+  corpus oracle (the `corpus-gettext` differential reds at leg (a) CONVERGE: "does
+  NOT reproduce the corpus oracle's derivation"). Proves the phase-body constructs
+  (find-files / with-fluids / match vars / let-which / cons / format) are exactly
+  what make gettext converge, not decorative. Restored; gate green. (The td-check
+  leg is covered by R6 — the shared `td-check-repro.sh` helper.)
