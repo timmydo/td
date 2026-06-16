@@ -382,3 +382,40 @@ at the `[DURABLE: behavioral]` leg ("the installed gunzip does not exec …/bin/
 td's phase runner did not apply the phase", exit 2). Proves the behavioral leg
 genuinely verifies td's OWN runner applied the phase — not a no-op, no Guix involved.
 Restored; gate green.
+
+## Step (b) toward retiring td-recipe.scm: route the corpus recipes through td's builder (PR #66 — td-build-corpus)
+
+With td's builder running phases (step a), the reconstructed recipes can be built by
+td's OWN builder instead of gnu-build-system / td-recipe. This routes them:
+`td-build-corpus` builds **popt** (a substitute*/which phase) and **libatomic-ops**
+(a multi-output recipe → td builds a single `out`) through `system/td-build` —
+builder = `td-builder`, configure-flags + phases applied in Rust — each STRUCTURAL
+(builder = td-builder), DURABLE behavioral (ships its lib/header), DURABLE
+reproducibility (`td-builder check`), at a DISTINCT path from the corpus build (own
+builder → own path, per "own then diverge"). gzip is the sibling `td-build-phases`
+gate. So gzip + popt + libatomic-ops now build with NO gnu-build-system / Guile —
+td-recipe.scm is replaceable for them.
+
+Also fixed: `system/td-build.scm` now converts a mirror-LIST source URI (vector →
+list) like td-recipe.scm, so multi-URI recipes lower through the own-builder path
+(pkg-config now LOWERS via td-build).
+
+Verified-red (R9, STRUCTURAL leg — the gate's headline claim): point
+`td-build-components`'s builder at `…/bin/td-builderXX` (NOT td-builder) ⇒ the
+derivation's `(basename (derivation-builder drv))` is no longer `td-builder` ⇒ the
+`[STRUCTURAL]` leg reds ("FAIL: popt builder is 'td-builderXX', expected
+td-builder", exit 2) BEFORE any build. Proves the structural assertion genuinely
+verifies td's OWN Rust binary is the derivation's builder — i.e. that "no
+gnu-build-system / no Guile in the build" is a checked fact, not a vacuous label.
+(The phase-runner + behavioral build pipeline is R8; the td-check repro leg is R6 —
+both shared with the sibling gates.) Restored; gate green.
+
+Deferred (gnu-build-system fidelity, the remaining bulk):
+- **pkg-config** — `--with-internal-glib` compiles a bundled glib that hits a
+  C-standard error under td's build env (`goption.c: expected identifier before
+  'bool'`) that gnu-build-system's env avoids; needs CFLAGS/standard-phase fidelity.
+- **gettext-minimal** — fails via td's minimal phase set (needs more standard
+  gnu-build-system phases, e.g. patch-source-shebangs).
+- Multi-OUTPUT splitting (debug/doc/static) — td builds a single `out`; faithful
+  multi-output (strip→debug, doc separation) is later work.
+- Input resolution + toolchain — retired LAST (§5).
