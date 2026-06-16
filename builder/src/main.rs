@@ -113,6 +113,66 @@ fn host_guix_bin_dir() -> Option<String> {
     None
 }
 
+/// Execute DRV in a userns sandbox against CLOSURE (the staged input store paths,
+/// one per line) and write a registration record — `path` / `nar-hash` /
+/// `nar-size` / `reference`* / `deriver` per output — to SCRATCH/registration,
+/// printing `OUT=<name> <path>` per output. The reference candidates are the
+/// closure plus the drv's own outputs (self-references), the daemon's candidate
+/// shape. Shared by `build` (CLOSURE handed in as a file) and `realize` (CLOSURE
+/// computed by td itself from the store DB's Refs graph).
+fn build_and_register(drv_path: &str, closure: &[String], scratch: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
+    let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
+    // The deriver recorded is the .drv's OWN store path. For a store-path input
+    // that is drv_path; for an emitted .drv handed in from outside the store,
+    // compute its content-addressed store path so the registration matches the
+    // daemon's recorded deriver.
+    let deriver = if drv_path.starts_with(store::STORE_DIR) {
+        drv_path.to_string()
+    } else {
+        let out0 = parsed
+            .outputs
+            .first()
+            .ok_or_else(|| "derivation has no outputs".to_string())?;
+        let drv_name = format!(
+            "{}.drv",
+            store::name_from_store_path(&out0.path)
+                .ok_or_else(|| "output is not a store path".to_string())?
+        );
+        let mut refs: Vec<String> = parsed.input_drvs.iter().map(|(p, _)| p.clone()).collect();
+        refs.extend(parsed.input_srcs.iter().cloned());
+        store::drv_store_path(&drv_name, &bytes, &refs)
+    };
+    let outputs =
+        sandbox::build(&parsed, drv_path, closure, scratch).map_err(|e| e.to_string())?;
+    // Reference candidates: the staged closure plus the drv's own outputs
+    // (self-references), the daemon's candidate shape.
+    let mut candidates = closure.to_vec();
+    candidates.extend(parsed.outputs.iter().map(|o| o.path.clone()));
+    let mut record = String::new();
+    for (name, host) in &outputs {
+        let store_path = &parsed
+            .outputs
+            .iter()
+            .find(|o| &o.name == name)
+            .expect("output came from this drv")
+            .path;
+        let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+        nar::write_nar(&mut scanner, host).map_err(|e| e.to_string())?;
+        let (hash, size, refs) = scanner.finish();
+        record.push_str(&format!("path {store_path}\n"));
+        record.push_str(&format!("nar-hash {hash}\n"));
+        record.push_str(&format!("nar-size {size}\n"));
+        for r in &refs {
+            record.push_str(&format!("reference {r}\n"));
+        }
+        record.push_str(&format!("deriver {deriver}\n\n"));
+        println!("OUT={name} {store_path}");
+    }
+    std::fs::write(scratch.join("registration"), record).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -1281,70 +1341,86 @@ fn main() -> ExitCode {
         Some("build") if args.len() == 5 => {
             let (drv_path, closure_file, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
-                let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
-                let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
-                // The deriver recorded is the .drv's OWN store path. For a
-                // store-path input that is drv_path; for an emitted .drv handed in
-                // from outside the store (td-drv-build builds the file td wrote),
-                // compute its content-addressed store path so the registration
-                // matches the daemon's recorded deriver.
-                let deriver = if drv_path.starts_with(store::STORE_DIR) {
-                    drv_path.to_string()
-                } else {
-                    let out0 = parsed
-                        .outputs
-                        .first()
-                        .ok_or_else(|| "derivation has no outputs".to_string())?;
-                    let drv_name = format!(
-                        "{}.drv",
-                        store::name_from_store_path(&out0.path)
-                            .ok_or_else(|| "output is not a store path".to_string())?
-                    );
-                    let mut refs: Vec<String> =
-                        parsed.input_drvs.iter().map(|(p, _)| p.clone()).collect();
-                    refs.extend(parsed.input_srcs.iter().cloned());
-                    store::drv_store_path(&drv_name, &bytes, &refs)
-                };
                 let closure: Vec<String> = std::fs::read_to_string(closure_file)
                     .map_err(|e| e.to_string())?
                     .lines()
                     .filter(|l| !l.is_empty())
                     .map(str::to_string)
                     .collect();
-                let outputs = sandbox::build(&parsed, drv_path, &closure, Path::new(scratch))
-                    .map_err(|e| e.to_string())?;
-                // Reference candidates: the staged closure plus the drv's own
-                // outputs (self-references), the daemon's candidate shape.
-                let mut candidates = closure.clone();
-                candidates.extend(parsed.outputs.iter().map(|o| o.path.clone()));
-                let mut record = String::new();
-                for (name, host) in &outputs {
-                    let store_path = &parsed
-                        .outputs
-                        .iter()
-                        .find(|o| &o.name == name)
-                        .expect("output came from this drv")
-                        .path;
-                    let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
-                    nar::write_nar(&mut scanner, host).map_err(|e| e.to_string())?;
-                    let (hash, size, refs) = scanner.finish();
-                    record.push_str(&format!("path {store_path}\n"));
-                    record.push_str(&format!("nar-hash {hash}\n"));
-                    record.push_str(&format!("nar-size {size}\n"));
-                    for r in &refs {
-                        record.push_str(&format!("reference {r}\n"));
-                    }
-                    record.push_str(&format!("deriver {deriver}\n\n"));
-                    println!("OUT={name} {store_path}");
-                }
-                std::fs::write(Path::new(scratch).join("registration"), record)
-                    .map_err(|e| e.to_string())?;
-                Ok(())
+                build_and_register(drv_path, &closure, Path::new(scratch))
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build {drv_path}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-builder realize: REALIZE a derivation with NO guix-daemon in the path.
+        // td computes the build's input closure ITSELF — its own SQLite reader
+        // (store_db_read) over the store DB's `Refs` graph, the job `guix gc -R`
+        // (the daemon) used to do (gate td-drv-build, line "stage the input
+        // closure"). It then executes the build in its userns sandbox and writes
+        // the registration record (via build_and_register). STORE-DB supplies the
+        // reference graph of the already-realized inputs — the Guix toolchain,
+        // retired LAST (§5) — so td realizes only the TOP derivation; reading guix's
+        // live /var/guix/db/db.sqlite with td's OWN reader is "own, then diverge"
+        // (the store is shared; the reader is td's, no daemon process). The
+        // guix-daemon is no longer in the realize path — it is only the differential
+        // oracle (prime directive 4). Usage:
+        //   realize DRV STORE-DB SCRATCH
+        Some("realize") if args.len() == 5 => {
+            let (drv_path, store_db, scratch) = (&args[2], &args[3], &args[4]);
+            let run = || -> Result<(), String> {
+                let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
+                let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                // Input ROOTS: the drv's source inputs, plus each input
+                // derivation's requested output paths (resolved by reading that
+                // input .drv — its outputs carry the realized store paths).
+                let mut roots: Vec<String> = parsed.input_srcs.clone();
+                for (idrv, outnames) in &parsed.input_drvs {
+                    let ib =
+                        std::fs::read(idrv).map_err(|e| format!("read input drv {idrv}: {e}"))?;
+                    let ip =
+                        drv::parse(&ib).map_err(|e| format!("parse input drv {idrv}: {e}"))?;
+                    for on in outnames {
+                        let o = ip
+                            .outputs
+                            .iter()
+                            .find(|o| &o.name == on)
+                            .ok_or_else(|| format!("input drv {idrv} has no output `{on}'"))?;
+                        roots.push(o.path.clone());
+                    }
+                }
+                // td's OWN closure of the roots over the store DB's Refs graph — the
+                // `guix gc -R` the daemon used to compute, here in td's reader.
+                let db = store_db_read::Db::open(
+                    std::fs::read(store_db)
+                        .map_err(|e| format!("read store db {store_db}: {e}"))?,
+                )?;
+                let mut closure: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for r in &roots {
+                    for p in db.closure(r)? {
+                        closure.insert(p);
+                    }
+                }
+                let closure: Vec<String> = closure.into_iter().collect();
+                eprintln!(
+                    "td-builder: realize computed the input closure ITSELF — {} paths from {} (its own reader, no guix gc / no daemon)",
+                    closure.len(),
+                    store_db
+                );
+                std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+                std::fs::write(Path::new(scratch).join("closure.txt"), closure.join("\n"))
+                    .map_err(|e| e.to_string())?;
+                build_and_register(drv_path, &closure, Path::new(scratch))
+            };
+            match run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: realize {drv_path}: {e}");
                     ExitCode::FAILURE
                 }
             }

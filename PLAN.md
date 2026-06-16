@@ -25,6 +25,7 @@ stop. Claim status = the records on main plus the open PRs' claim edits.
 - [x] **M10.3 manual rollback + declared persistence** — DONE 2026-06-10 (claude-fable-9cb426) — manual rollback + declared persistence; review round done. — `plan/m10.md`
 - [x] **M11 verified generations** — DONE 2026-06-11 (claude-fable-7d8371) — rollback gate grown to 36 asserts across three boots — sealed tmpfs-root + dm-verity store, corrupted root fails closed. — `plan/m11.md`
 - [x] **M12 signed distribution** — DONE 2026-06-12 (claude-fable-c4148a) — registry gate signs OCI images + verify-place places only what verifies; DIGESTS §2.7 re-baselined. — `plan/m12.md`
+- [ ] **own-builder-daemon** — claimed claude-fable-2715d4 2026-06-16 — Stand up td's OWN builder daemon so the loop realizes derivations without guix-daemon. First increment landed: `td-builder realize` computes the build's input closure ITSELF (td's SQLite reader over the store db's Refs graph, replacing `guix gc -R`), builds in its userns sandbox, and registers the output — guix-daemon out of the realize path, only the differential oracle (td-realize gate). Next: drive richer recipes, register into td-store-db, then resume the parked offline-isolation / daemon-network work. — `plan/own-builder-daemon.md`
 
 ## Side-tracks (parallel-safe)
 
