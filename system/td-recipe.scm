@@ -114,17 +114,77 @@
    ((string? part) part)
    ((and (pair? part) (assoc "output" part)) #~(assoc-ref outputs #$(assoc-ref part "output")))
    ((and (pair? part) (assoc "input" part))  #~(assoc-ref inputs  #$(assoc-ref part "input")))
-   (else (error "td-recipe: unsupported string-append part" part))))
+   ;; `{var: NAME}` → the bare symbol NAME, a value bound earlier in the phase body
+   ;; (a `let`-`which` binding, or a substitute* match variable).
+   ((and (pair? part) (assoc "var" part)) (string->symbol (assoc-ref part "var")))
+   (else (error "td-recipe: unsupported string-append/format part" part))))
 
 (define (subst-replacement->gexp to)
   (cond
    ((string? to) to)
+   ((and (pair? to) (assoc "var" to)) (string->symbol (assoc-ref to "var")))
    ((and (pair? to) (assoc "which" to)) #~(which #$(assoc-ref to "which")))
    ((and (pair? to) (assoc "stringAppend" to))
     (let ((parts (map ref-part->gexp (vector->list (assoc-ref to "stringAppend")))))
       #~(string-append #$@parts)))
+   ;; `{format: [FMT, PART …]}` → `(format #f FMT PART …)` (the patch idiom that
+   ;; splices a bound value, e.g. a resolved program path, into a shebang line).
+   ((and (pair? to) (assoc "format" to))
+    (let ((fl (vector->list (assoc-ref to "format"))))
+      #~(format #f #$(car fl) #$@(map ref-part->gexp (cdr fl)))))
    (else (error "td-recipe: unsupported substitution replacement" to))))
 
+;; A substitute* FILE argument: a literal filename string, `{list: [...]}` →
+;; `(quote (f …))` (a file LIST), `{findFiles: [DIR, REGEX]}` → `(find-files DIR
+;; REGEX)` (the files matching REGEX under DIR at build time), or `{cons: [A, B]}`
+;; → `(cons A B)` (prepend a file to a find-files result).
+(define (filearg->gexp fa)
+  (cond
+   ((string? fa) fa)
+   ((and (pair? fa) (assoc "list" fa)) #~(quote #$(vector->list (assoc-ref fa "list"))))
+   ((and (pair? fa) (assoc "findFiles" fa))
+    (let ((ff (vector->list (assoc-ref fa "findFiles"))))
+      #~(find-files #$(car ff) #$(cadr ff))))
+   ((and (pair? fa) (assoc "cons" fa))
+    (let ((c (vector->list (assoc-ref fa "cons"))))
+      #~(cons #$(filearg->gexp (car c)) #$(filearg->gexp (cadr c)))))
+   (else (error "td-recipe: unsupported substitute* file argument" fa))))
+
+;; A substitute* CLAUSE: `((FROM MATCH-VAR …) TO)`. MATCH-VARs (optional) bind the
+;; regexp submatches so TO can reference them (`{var: …}`); the simple case has none.
+(define (clause->gexp c)
+  (let ((from  (field c "from"))
+        (mvars (map string->symbol (vector->list (field/default c "match" #()))))
+        (to    (subst-replacement->gexp (field c "to"))))
+    #~((#$from #$@mvars) #$to)))
+
+;; A phase-body STATEMENT — the nested forms a real package phase is built from:
+;;   {substitute: FILEARG, clauses: [CLAUSE …]}        → (substitute* FILEARG CLAUSE …)
+;;   {letWhich: [{name,prog} …], body: [STMT …]}       → (let* ((name (which prog)) …) STMT …)
+;;   {withDefaultPortEncodingFalse: true, body: [STMT …]}
+;;                                                      → (with-fluids ((%default-port-encoding #f)) STMT …)
+;; This is the recipe DATA for a package's custom build logic (e.g. gettext's
+;; patch-tests); `gnu-build-system`/`(guix build utils)` remain the build-time
+;; toolchain (retired LAST, §5).
+(define (stmt->gexp s)
+  (cond
+   ((assoc "substitute" s)
+    #~(substitute* #$(filearg->gexp (assoc-ref s "substitute"))
+        #$@(map clause->gexp (vector->list (assoc-ref s "clauses")))))
+   ((assoc "letWhich" s)
+    (let ((binds (map (lambda (b)
+                        #~(#$(string->symbol (assoc-ref b "name"))
+                           (which #$(assoc-ref b "prog"))))
+                      (vector->list (assoc-ref s "letWhich")))))
+      #~(let* #$binds #$@(map stmt->gexp (vector->list (assoc-ref s "body"))))))
+   ((assoc "withDefaultPortEncodingFalse" s)
+    #~(with-fluids ((%default-port-encoding #f))
+        #$@(map stmt->gexp (vector->list (assoc-ref s "body")))))
+   (else (error "td-recipe: unsupported phase-body statement" s))))
+
+;; A simple substitution (the flat `substitutions` form: one substitute*, one
+;; literal-FROM clause). The richer `body` form (above) supersedes it for phases
+;; that need file lists, match vars, find-files, let/with-fluids, etc.
 (define (substitution->gexp s)
   (let ((file (field s "file"))
         (from (field s "from"))
@@ -145,10 +205,17 @@
   (let* ((pos    (field p "position"))
          (anchor (string->symbol (field p "anchor")))
          (name   (string->symbol (field p "name")))
-         (subs   (map substitution->gexp (vector->list (field p "substitutions"))))
-         (body   (if (eq? (field/default p "returnTrue" #f) #t)
-                     (append subs (list #t))
-                     subs))
+         ;; Rich `body` (a list of phase-body statements) supersedes the flat
+         ;; `substitutions` form; a phase declares one or the other.
+         (body   (cond
+                  ((assoc "body" p)
+                   (map stmt->gexp (vector->list (assoc-ref p "body"))))
+                  (else
+                   (let ((subs (map substitution->gexp
+                                    (vector->list (field p "substitutions")))))
+                     (if (eq? (field/default p "returnTrue" #f) #t)
+                         (append subs (list #t))
+                         subs)))))
          (lam    (phase-lambda p body)))
     (cond
      ((string=? pos "before") #~(add-before (quote #$anchor) (quote #$name) #$lam))
@@ -163,15 +230,19 @@
          #~(modify-phases %standard-phases #$@(map phase->gexp ps)))))
 
 (define (recipe-arguments alist)
-  (let ((flags  (vector->list (field/default alist "configureFlags" #())))
-        (phases (recipe-phases alist))
-        (tests  (field/default alist "tests" #t)))   ;default #t (gnu-build-system default)
+  (let ((flags   (vector->list (field/default alist "configureFlags" #())))
+        (mflags  (vector->list (field/default alist "makeFlags" #())))
+        (phases  (recipe-phases alist))
+        (tests   (field/default alist "tests" #t)))  ;default #t (gnu-build-system default)
     ;; Argument ORDER does not affect the lowered derivation (gnu-build-system
     ;; normalizes it — verified), so a fixed assembly order is safe across packages.
+    ;; #:make-flags is a G-EXPRESSION wrapping a quoted list, same shape as
+    ;; #:configure-flags.
     (append
      (if (null? flags) '() (list #:configure-flags #~(quote #$flags)))
      (if (eq? tests #f) (list #:tests? #f) '())
-     (if phases (list #:phases phases) '()))))
+     (if phases (list #:phases phases) '())
+     (if (null? mflags) '() (list #:make-flags #~(quote #$mflags))))))
 
 ;; A recipe's declared package OUTPUTS (a JSON array of names; guile-json yields a
 ;; vector). Many corpus packages split off extra outputs — `debug`, `static`,

@@ -227,23 +227,59 @@ bridge-generated `string-append`/`lambda*` gexp lowers to the oracle drv
   (d) BUILD + `--check` — path-identical AND NAR-hash-equal to the corpus gzip
       (`0qhr884lpk7yl67ckyjmx89g0wn10mh5331plz9z4hpgq7wf5dls`).
 
+## Inc.5 — reconstruct gettext-minimal: the full phase-body DSL (PR #?? — corpus-gettext)
+
+**nano's first direct input reconstructed.** gettext-minimal needs everything: a
+`doc` output (done), configureFlags (done), `makeFlags` (NEW — literal, same gexp
+shape as configureFlags), build inputs (libunistring/libxml2/ncurses, resolved by
+the bridge), and TWO custom phases — `patch-fixed-paths` (literal substitute* over
+file LISTS) and `patch-tests` (the full vocabulary). Build-free spike confirmed
+byte-identity FIRST (oracle `q6s49zzqb2vcs49sj6n59j25w7209nwx`), then the bridge
+generated it programmatically from JSON, byte-identical.
+
+New bridge/DSL — a recursive phase-body AST (`Phase.body`):
+- FileArg: `{list}` (quoted file list), `{findFiles: [dir, regex]}` →
+  `(find-files …)`, `{cons: [a, b]}` → `(cons …)`.
+- Clause: optional `match` vars `((from var…) to)` so `to` can reference a submatch.
+- Replacement: `{var}` (bare bound symbol), `{format: [fmt, part…]}` →
+  `(format #f …)`, plus the existing string/which/stringAppend.
+- Stmt: `{substitute, clauses}`, `{letWhich: [{name,prog}], body}` →
+  `(let* ((name (which prog))) …)`, `{withDefaultPortEncodingFalse, body}` →
+  `(with-fluids ((%default-port-encoding #f)) …)`.
+- `Recipe.makeFlags` → `#:make-flags #~(quote …)`.
+
+### Pieces
+- `system/td-recipe.scm` — `filearg->gexp`/`clause->gexp`/`stmt->gexp` + `body`
+  wiring in `phase->gexp`; `{var}`/`{format}` in the replacement; `makeFlags`.
+- `tests/ts/td-spec.d.ts` — `FileArg`/`Clause`/`Stmt`/recursive `body`, `RefPart`
+  +`{var}`, `Replacement` +`{var}`/`{format}`, `Recipe.makeFlags`.
+- `tests/ts/recipe-gettext-minimal.ts` (+ `-perturbed.ts`).
+- `tests/ts-recipe-gettext-{diff,drv}.scm`; `mk/gates/325-corpus-gettext.mk`.
+- `tests/td-check-repro.sh` — re-realize the drv's build inputs before staging (a
+  GC'd fixed-output SOURCE is re-fetched — permitted offline; needed because
+  gettext's source had been dropped after its output was built).
+
+### Gate `corpus-gettext` proves
+  (a) CONVERGE — gettext-minimal lowers to the corpus oracle drv;
+  (b) DISCRIMINATE-src — a perturbed source diverges;
+  (c) phases LOAD-BEARING — stripping `phases` diverges;
+  (d) DURABLE behavioral — the built `msgfmt --version` runs (0.23.1);
+  (e) DURABLE reproducibility — td-builder check double-build (no Guix);
+  (f) MIGRATION ORACLE — byte-identical out (path + NAR) + guix build --check agrees.
+
 ## Next increments (the rest of the frontier)
 
-- nano's DIRECT inputs — **ncurses** and **gettext-minimal** — still need more:
-  - gettext-minimal: `makeFlags` (literal `"VERBOSE=yes"`) + the `doc` output (done)
-    + configureFlags (done) + TWO phases — `patch-fixed-paths` (pure-literal
-    substitute*, expressible NOW) and `patch-tests` (a `lambda*` w/ `inputs`,
-    `with-fluids`, `find-files` with a regexp, `cons`) — the second needs new
-    phase-body vocabulary (find-files file args, with-fluids).
-  - ncurses: a custom `configure` replacement, a `post-install` phase, and an
-    `apply-rollup-patch` phase that FETCHES an extra fixed-output source — needs
-    phase-level source inputs + `invoke`.
-  Done so far: configureFlags + multi-URI, multi-output, minimal-phase
-  (substitute*/which), store-path-baking phase + `tests?`. Remaining phase
-  vocabulary: `makeFlags`, find-files, with-fluids, invoke, phase-level fetched
-  sources.
-- Eventually: regenerate the input lock from td's OWN reconstructed recipes (not
-  `specification->package`), package-by-package, toolchain LAST.
+- nano's OTHER direct input, **ncurses**, remains — the hardest: a custom
+  `configure` REPLACEMENT phase, a `post-install` phase, and an `apply-rollup-patch`
+  phase that FETCHES an extra fixed-output source (invisible-mirror.net) + `invoke`.
+  Needs new phase-body vocabulary: `replace`-a-phase, phase-level fetched sources,
+  `invoke`, `patch-makefile-SHELL`/`for-each`. Its own (large) increment.
+- Then: nano's two direct inputs are both off `specification->package` →
+  regenerate the input lock (Inc.1/2) from td's OWN reconstructed recipes,
+  package-by-package, toolchain LAST.
+- Phase vocabulary DONE: configureFlags + multi-URI, multi-output, makeFlags,
+  tests?, and the phase-body AST (substitute*/which/stringAppend/format, file
+  lists, find-files, cons, match vars, let-which, with-fluids).
 
 ## Verified-red log (Inc.4, store-path-baking phase + tests? — corpus-gzip)
 
