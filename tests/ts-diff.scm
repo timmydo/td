@@ -49,9 +49,14 @@ config JSON (tsc -> boa -> system()).~%" name)
   (if (and (number? x) (not (exact? x))) (inexact->exact x) x))
 
 ;; Map the TS spec's emitted JSON (camelCase) onto td-config (the kebab-case
-;; Guile lowering target). v0 carries only the scalar fields; manifest /
-;; generation / persistent-paths are left to default, so the default spec lowers
-;; byte-identically to the frozen oracle.
+;; Guile lowering target). The structured fields (persistent-paths, generation)
+;; are now carried from the TS surface too; manifest stays defaulted (the package
+;; set is the recipe layer, not the config surface). The default spec's values are
+;; the td-config defaults, so it lowers byte-identically to the frozen oracle.
+(define (json->persistent-paths v)
+  ;; guile-json yields a vector of {tier,path} alists -> ((tier . "/abs") …).
+  (map (lambda (e) (cons (string->symbol (ref e "tier")) (ref e "path")))
+       (vector->list v)))
 (define (json->td-config a)
   (td-config
    #:host-name             (ref a "hostName")
@@ -64,7 +69,11 @@ config JSON (tsc -> boa -> system()).~%" name)
    #:ssh-port              (exact-int (ref a "sshPort"))
    #:ssh-password-auth?    (ref a "sshPasswordAuth")
    #:ssh-challenge-response? (ref a "sshChallengeResponse")
-   #:ship-guix?            (ref a "shipGuix")))
+   #:ship-guix?            (ref a "shipGuix")
+   #:persistent-paths      (json->persistent-paths (ref a "persistentPaths"))
+   ;; JSON null (non-generation system) -> #f; a positive integer -> that gen.
+   #:generation            (let ((g (ref a "generation")))
+                             (if (number? g) (exact-int g) #f))))
 
 (with-store store
   (set-build-options store #:use-substitutes? #f #:offload? #f)
@@ -80,15 +89,25 @@ config JSON (tsc -> boa -> system()).~%" name)
          (perturbed (system-drv
                      (td-config->operating-system
                       (json->td-config (env-json "TD_TS_PERTURBED_JSON")))))
+         ;; A generation system authored in TS — exercises the structured fields
+         ;; (generation + persistent-paths) now on the surface. It must DIVERGE
+         ;; from the (generation #f) oracle, proving the bridge maps those fields
+         ;; rather than ignoring them (else authoring them would be cosmetic).
+         (gen       (system-drv
+                     (td-config->operating-system
+                      (json->td-config (env-json "TD_TS_GEN_JSON")))))
          (converge?     (string=? oracle compiled))
-         (discriminate? (not (string=? oracle perturbed))))
+         (discriminate? (not (string=? oracle perturbed)))
+         (gen-wired?    (not (string=? oracle gen))))
 
     (format #t "~%== ts-frontend differential: TS spec (tsc -> boa -> config) vs. frozen oracle ==~%")
     (format #t "  oracle (system td)          : ~a~%" oracle)
     (format #t "  compiled (TS v0 spec)       : ~a~%" compiled)
     (format #t "  perturbed (TS sshPort 2222) : ~a~%" perturbed)
-    (format #t "~%  (a) converge  (compiled == oracle)      : ~a~%" converge?)
-    (format #t "  (b) discriminate (perturbed != oracle)  : ~a~%~%" discriminate?)
+    (format #t "  generation (TS generation 1): ~a~%" gen)
+    (format #t "~%  (a) converge      (compiled == oracle)     : ~a~%" converge?)
+    (format #t "  (b) discriminate  (perturbed != oracle)    : ~a~%" discriminate?)
+    (format #t "  (c) gen wired     (generation != oracle)   : ~a~%~%" gen-wired?)
 
     (cond
      ((not converge?)
@@ -99,7 +118,13 @@ derivation — the TS surface diverged from the frozen oracle.~%")
       (format #t "FAIL: differential is vacuous — a perturbed TS spec did NOT \
 change the derivation. The differential has lost discriminating power.~%")
       (exit 1))
+     ((not gen-wired?)
+      (format #t "FAIL: a TS generation-1 spec lowered to the SAME derivation as \
+the (generation #f) oracle — the bridge is ignoring the generation/persistent-paths \
+fields (authoring them would be cosmetic).~%")
+      (exit 1))
      (else
       (format #t "PASS: the TS v0 spec lowers store-path-identical to the frozen \
-oracle, and a perturbed spec diverges.~%")
+oracle, a perturbed spec diverges, and a TS generation-1 spec diverges (the \
+generation + persistent-paths fields are wired from the TS surface).~%")
       (exit 0)))))
