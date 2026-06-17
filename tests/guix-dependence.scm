@@ -3,14 +3,15 @@
 ;; "until td can build all those packages itself, we're just testing guix").
 ;;
 ;; A derivation is "td-reproducible" iff td BUILDS it with its OWN Rust builder —
-;; i.e. a non-perturbed `tests/ts/recipe-<spec>.ts` exists AND the `corpus-no-guix`
-;; gate proves it builds via `td-builder build-recipe` (behaviorally + reproducibly,
-;; with no guix/Guile in the build path). The byte-identity `corpus-*` gates that used
-;; to ground this were RETIRED when system/td-recipe.scm was dropped (move-off-Guile
-;; §5: own, then diverge — the own-builder path is all-durable, no Guix byte-identity
-;; oracle). (The census grounds ownership on the recipe files and asserts each resolves
-;; to a real corpus package; it does NOT re-lower the TS recipes here — that proof is
-;; the corpus-no-guix gate's job.)
+;; i.e. a non-perturbed `tests/ts/recipe-<spec>.ts` exists AND a sibling gate proves
+;; it builds via `td-builder build-recipe` (behaviorally + reproducibly, no guix/Guile
+;; in the build path): corpus-no-guix for the corpus packages, toolchain-no-guix for
+;; the reconstructed toolchain leaves (make/sed/grep — lever 4). The byte-identity
+;; `corpus-*` gates that used to ground this were RETIRED when system/td-recipe.scm was
+;; dropped (move-off-Guile §5: own, then diverge — the own-builder path is all-durable,
+;; no Guix byte-identity oracle). (The census grounds ownership on the recipe files and
+;; asserts each resolves to a real corpus package; it does NOT re-lower the TS recipes
+;; here — that proof is the build-recipe gates' job.)
 ;;
 ;; EXCLUDED: pkg-config has an authored recipe but no own-builder build yet — its
 ;; bundled glib hits a C-standard wall under td's build env — so it is NOT counted
