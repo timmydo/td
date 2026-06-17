@@ -113,14 +113,115 @@ fn host_guix_bin_dir() -> Option<String> {
     None
 }
 
+/// One built output's post-build registration facts — the daemon's per-path
+/// record (the `build`/`realize` NAR scan computes these).
+struct OutputReg {
+    store_path: String,
+    nar_hash: String,
+    nar_size: u64,
+    refs: Vec<String>,
+    deriver: String,
+}
+
+/// Write a td store-db (the daemon's `ValidPaths`/`Refs` authority, via the
+/// zero-dep `store_db` writer) registering the just-built OUTPUTS — td OWNS the
+/// store record of its own build, not just a text file. Each output is fully
+/// registered (path/hash/registrationTime/deriver/narSize) with ids 1..N; its
+/// references resolve to another output's id or to a scaffolding `ValidPaths` row
+/// (path only) — the same shape `store-add-referenced` writes. registrationTime is
+/// a fixed sentinel (excluded from the daemon differential, as in `store-register`).
+fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    use store_db::{Table, Value};
+    let out_id: BTreeMap<&str, i64> = regs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.store_path.as_str(), i as i64 + 1))
+        .collect();
+    // External references (not themselves outputs) get ids after the outputs, in
+    // first-seen order — stable, so the db is deterministic.
+    let mut ext_order: Vec<String> = Vec::new();
+    let mut ext_id: BTreeMap<String, i64> = BTreeMap::new();
+    let mut next = regs.len() as i64 + 1;
+    for r in regs {
+        for rf in &r.refs {
+            if !out_id.contains_key(rf.as_str()) && !ext_id.contains_key(rf) {
+                ext_id.insert(rf.clone(), next);
+                ext_order.push(rf.clone());
+                next += 1;
+            }
+        }
+    }
+    let id_of = |p: &str| -> i64 {
+        *out_id
+            .get(p)
+            .or_else(|| ext_id.get(p))
+            .expect("reference id assigned above")
+    };
+    let mut valid: Vec<(i64, Vec<Value>)> = Vec::new();
+    for (i, r) in regs.iter().enumerate() {
+        valid.push((
+            i as i64 + 1,
+            vec![
+                Value::Null, // id (integer primary key) — rowid is the id
+                Value::Text(r.store_path.clone()),
+                Value::Text(r.nar_hash.clone()),
+                Value::Int(1), // registrationTime (sentinel; excluded from diffs)
+                Value::Text(r.deriver.clone()),
+                Value::Int(r.nar_size as i64),
+            ],
+        ));
+    }
+    for p in &ext_order {
+        valid.push((
+            ext_id[p],
+            vec![
+                Value::Null,
+                Value::Text(p.clone()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ));
+    }
+    let mut ref_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+    let mut rid = 1i64;
+    for (i, r) in regs.iter().enumerate() {
+        for rf in &r.refs {
+            ref_rows.push((rid, vec![Value::Int(i as i64 + 1), Value::Int(id_of(rf))]));
+            rid += 1;
+        }
+    }
+    let tables = [
+        Table {
+            name: "ValidPaths",
+            sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+            rows: valid,
+        },
+        Table {
+            name: "Refs",
+            sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+            rows: ref_rows,
+        },
+    ];
+    std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Execute DRV in a userns sandbox against CLOSURE (the staged input store paths,
 /// one per line) and write a registration record — `path` / `nar-hash` /
 /// `nar-size` / `reference`* / `deriver` per output — to SCRATCH/registration,
 /// printing `OUT=<name> <path>` per output. The reference candidates are the
 /// closure plus the drv's own outputs (self-references), the daemon's candidate
-/// shape. Shared by `build` (CLOSURE handed in as a file) and `realize` (CLOSURE
-/// computed by td itself from the store DB's Refs graph).
-fn build_and_register(drv_path: &str, closure: &[String], scratch: &Path) -> Result<(), String> {
+/// shape. Returns the per-output registration facts (for `realize` to write a td
+/// store-db). Shared by `build` (CLOSURE handed in as a file) and `realize`
+/// (CLOSURE computed by td itself from the store DB's Refs graph).
+fn build_and_register(
+    drv_path: &str,
+    closure: &[String],
+    scratch: &Path,
+) -> Result<Vec<OutputReg>, String> {
     let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
     let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
     // The deriver recorded is the .drv's OWN store path. For a store-path input
@@ -150,6 +251,7 @@ fn build_and_register(drv_path: &str, closure: &[String], scratch: &Path) -> Res
     let mut candidates = closure.to_vec();
     candidates.extend(parsed.outputs.iter().map(|o| o.path.clone()));
     let mut record = String::new();
+    let mut regs: Vec<OutputReg> = Vec::new();
     for (name, host) in &outputs {
         let store_path = &parsed
             .outputs
@@ -168,9 +270,16 @@ fn build_and_register(drv_path: &str, closure: &[String], scratch: &Path) -> Res
         }
         record.push_str(&format!("deriver {deriver}\n\n"));
         println!("OUT={name} {store_path}");
+        regs.push(OutputReg {
+            store_path: store_path.clone(),
+            nar_hash: hash,
+            nar_size: size,
+            refs,
+            deriver: deriver.clone(),
+        });
     }
     std::fs::write(scratch.join("registration"), record).map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(regs)
 }
 
 fn main() -> ExitCode {
@@ -1347,7 +1456,7 @@ fn main() -> ExitCode {
                     .filter(|l| !l.is_empty())
                     .map(str::to_string)
                     .collect();
-                build_and_register(drv_path, &closure, Path::new(scratch))
+                build_and_register(drv_path, &closure, Path::new(scratch)).map(|_| ())
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -1415,7 +1524,18 @@ fn main() -> ExitCode {
                 std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
                 std::fs::write(Path::new(scratch).join("closure.txt"), closure.join("\n"))
                     .map_err(|e| e.to_string())?;
-                build_and_register(drv_path, &closure, Path::new(scratch))
+                let regs = build_and_register(drv_path, &closure, Path::new(scratch))?;
+                // td OWNS the store record of its build: write a td store-db
+                // registering the realized output(s) — the daemon's post-build
+                // registration, in pure Rust (no daemon).
+                let db_path = Path::new(scratch).join("td.db");
+                write_output_db(&regs, &db_path)?;
+                eprintln!(
+                    "td-builder: realize registered {} output(s) into td's store-db {}",
+                    regs.len(),
+                    db_path.display()
+                );
+                Ok(())
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
