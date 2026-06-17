@@ -44,6 +44,59 @@ impl Json {
     pub fn is_true(&self) -> bool {
         matches!(self, Json::Bool(true))
     }
+    /// Serialize back to a compact JSON string (objects in sorted-key order, so the
+    /// output is deterministic). Round-trips through `parse`; used to re-emit a
+    /// recipe's `phases` sub-tree for TD_PHASES with no Guile.
+    pub fn to_json_string(&self) -> String {
+        let mut s = String::new();
+        self.write_json(&mut s);
+        s
+    }
+    fn write_json(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Num(n) => out.push_str(&n.to_string()),
+            Json::Str(s) => Self::write_str(s, out),
+            Json::Arr(v) => {
+                out.push('[');
+                for (i, e) in v.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    e.write_json(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(m) => {
+                out.push('{');
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    Self::write_str(k, out);
+                    out.push(':');
+                    v.write_json(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+    fn write_str(s: &str, out: &mut String) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
 }
 
 struct Parser<'a> {
