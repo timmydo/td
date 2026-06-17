@@ -282,6 +282,143 @@ fn build_and_register(
     Ok(regs)
 }
 
+/// Realize DRV with NO guix-daemon: compute the input closure ITSELF (td's SQLite
+/// reader over STORE-DB's Refs graph — the `guix gc -R` the daemon did), build it in
+/// the userns sandbox (build_and_register), and register the output(s) into a td
+/// store-db at SCRATCH/td.db. Returns the per-output records. Shared by `realize` and
+/// `build-recipe`.
+fn realize_drv(drv_path: &str, store_db: &str, scratch: &Path) -> Result<Vec<OutputReg>, String> {
+    let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
+    let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
+    // Input ROOTS: the drv's source inputs, plus each input derivation's requested
+    // output paths (resolved by reading that input .drv).
+    let mut roots: Vec<String> = parsed.input_srcs.clone();
+    for (idrv, outnames) in &parsed.input_drvs {
+        let ib = std::fs::read(idrv).map_err(|e| format!("read input drv {idrv}: {e}"))?;
+        let ip = drv::parse(&ib).map_err(|e| format!("parse input drv {idrv}: {e}"))?;
+        for on in outnames {
+            let o = ip
+                .outputs
+                .iter()
+                .find(|o| &o.name == on)
+                .ok_or_else(|| format!("input drv {idrv} has no output `{on}'"))?;
+            roots.push(o.path.clone());
+        }
+    }
+    let db = store_db_read::Db::open(
+        std::fs::read(store_db).map_err(|e| format!("read store db {store_db}: {e}"))?,
+    )?;
+    let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for r in &roots {
+        for p in db.closure(r)? {
+            closure.insert(p);
+        }
+    }
+    let closure: Vec<String> = closure.into_iter().collect();
+    eprintln!(
+        "td-builder: realize computed the input closure ITSELF — {} paths from {} (its own reader, no guix gc / no daemon)",
+        closure.len(),
+        store_db
+    );
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    std::fs::write(scratch.join("closure.txt"), closure.join("\n")).map_err(|e| e.to_string())?;
+    let regs = build_and_register(drv_path, &closure, scratch)?;
+    // td OWNS the store record of its build: write a td store-db registering the
+    // realized output(s) — the daemon's post-build registration, in pure Rust.
+    write_output_db(&regs, &scratch.join("td.db"))?;
+    eprintln!(
+        "td-builder: realize registered {} output(s) into td's store-db {}",
+        regs.len(),
+        scratch.join("td.db").display()
+    );
+    Ok(regs)
+}
+
+/// The td-builder store path of the RUNNING binary (…/td-builder-<v>), stripped of
+/// the trailing `/bin/td-builder` — so a recipe built by td references the very
+/// builder that built it, with no Guile resolution.
+fn self_store_path() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let s = exe.to_string_lossy();
+    let bin = s
+        .strip_suffix("/bin/td-builder")
+        .ok_or_else(|| format!("td-builder is not at <store>/bin/td-builder: {s}"))?;
+    Ok(bin.to_string())
+}
+
+/// build-recipe: build a TS-authored recipe with NO Guile and NO guix-daemon in the
+/// path. Reads the recipe JSON (produced Guile-free by ts-eval), resolves EVERY input
+/// from LOCK (`NAME <path>`, no specification->package) — the source is keyed
+/// `<name>-source`, the td-builder builder is the running binary, every other lock
+/// entry is a build input — assembles the `.drv` itself (store::assemble_drv, the
+/// inputs as input-SOURCES), and realizes it (realize_drv over STORE-DB). The
+/// toolchain + lock are the guix-built SEED (§5, retired last); nothing in nano's
+/// build path is guix/Guile. Usage: build-recipe RECIPE-JSON LOCK SCRATCH STORE-DB
+fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &str) -> Result<Vec<OutputReg>, String> {
+    let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
+    let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
+    let version = alist.get("version").and_then(json::Json::as_str).ok_or("recipe: no version")?;
+    let full = format!("{name}-{version}");
+    // configure flags (optional) -> space-joined; phases (optional) -> JSON string.
+    let cflags = match alist.get("configureFlags").and_then(json::Json::as_arr) {
+        Some(a) => a.iter().filter_map(json::Json::as_str).collect::<Vec<_>>().join(" "),
+        None => String::new(),
+    };
+    let phases = match alist.get("phases") {
+        Some(p) => p.to_json_string(),
+        None => String::new(),
+    };
+    // Resolve EVERY input from the lock (no Guile). The `<name>-source` entry is the
+    // source (TD_SRC); every other entry is a build input (TD_INPUTS + an input-src).
+    let lock = std::fs::read_to_string(lock_file).map_err(|e| format!("read lock {lock_file}: {e}"))?;
+    let src_key = format!("{name}-source");
+    let mut source = String::new();
+    let mut inputs: Vec<String> = Vec::new();
+    for line in lock.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (k, path) = line.split_once(' ').ok_or_else(|| format!("malformed lock line: {line}"))?;
+        if k == src_key {
+            source = path.to_string();
+        } else {
+            inputs.push(path.to_string());
+        }
+    }
+    if source.is_empty() {
+        return Err(format!("lock has no `{src_key}' entry (the recipe source)"));
+    }
+    inputs.sort();
+    let builder_store = self_store_path()?;
+    let builder = format!("{builder_store}/bin/td-builder");
+    // Assemble the .drv spec: inputs as input-SOURCES (already-realized seed paths,
+    // no input-derivations — so this diverges from guix's nano, by design).
+    let mut spec = String::new();
+    spec.push_str(&format!("name {full}\n"));
+    spec.push_str("system x86_64-linux\n");
+    spec.push_str(&format!("builder {builder}\n"));
+    spec.push_str("arg autotools-build\n");
+    spec.push_str(&format!("input-src {source}\n"));
+    spec.push_str(&format!("input-src {builder_store}\n"));
+    for p in &inputs {
+        spec.push_str(&format!("input-src {p}\n"));
+    }
+    spec.push_str(&format!("env TD_SRC={source}\n"));
+    spec.push_str(&format!("env TD_INPUTS={}\n", inputs.join(":")));
+    spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
+    spec.push_str(&format!("env TD_PHASES={phases}\n"));
+    // td assembles the .drv (pure Rust, no guix (derivation …), no daemon).
+    let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
+    let (drv_path, content) = store::assemble_drv(&spec, &read)?;
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let drv_file = scratch.join(format!("{full}.drv"));
+    std::fs::write(&drv_file, &content).map_err(|e| e.to_string())?;
+    eprintln!("td-builder: build-recipe assembled {drv_path} (no guix (derivation), no Guile)");
+    // td realizes it (no guix-daemon).
+    realize_drv(&drv_file.to_string_lossy(), store_db, scratch)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -1482,65 +1619,34 @@ fn main() -> ExitCode {
         Some("realize") if args.len() == 5 => {
             let (drv_path, store_db, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
-                let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
-                let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
-                // Input ROOTS: the drv's source inputs, plus each input
-                // derivation's requested output paths (resolved by reading that
-                // input .drv — its outputs carry the realized store paths).
-                let mut roots: Vec<String> = parsed.input_srcs.clone();
-                for (idrv, outnames) in &parsed.input_drvs {
-                    let ib =
-                        std::fs::read(idrv).map_err(|e| format!("read input drv {idrv}: {e}"))?;
-                    let ip =
-                        drv::parse(&ib).map_err(|e| format!("parse input drv {idrv}: {e}"))?;
-                    for on in outnames {
-                        let o = ip
-                            .outputs
-                            .iter()
-                            .find(|o| &o.name == on)
-                            .ok_or_else(|| format!("input drv {idrv} has no output `{on}'"))?;
-                        roots.push(o.path.clone());
-                    }
-                }
-                // td's OWN closure of the roots over the store DB's Refs graph — the
-                // `guix gc -R` the daemon used to compute, here in td's reader.
-                let db = store_db_read::Db::open(
-                    std::fs::read(store_db)
-                        .map_err(|e| format!("read store db {store_db}: {e}"))?,
-                )?;
-                let mut closure: std::collections::BTreeSet<String> =
-                    std::collections::BTreeSet::new();
-                for r in &roots {
-                    for p in db.closure(r)? {
-                        closure.insert(p);
-                    }
-                }
-                let closure: Vec<String> = closure.into_iter().collect();
-                eprintln!(
-                    "td-builder: realize computed the input closure ITSELF — {} paths from {} (its own reader, no guix gc / no daemon)",
-                    closure.len(),
-                    store_db
-                );
-                std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
-                std::fs::write(Path::new(scratch).join("closure.txt"), closure.join("\n"))
-                    .map_err(|e| e.to_string())?;
-                let regs = build_and_register(drv_path, &closure, Path::new(scratch))?;
-                // td OWNS the store record of its build: write a td store-db
-                // registering the realized output(s) — the daemon's post-build
-                // registration, in pure Rust (no daemon).
-                let db_path = Path::new(scratch).join("td.db");
-                write_output_db(&regs, &db_path)?;
-                eprintln!(
-                    "td-builder: realize registered {} output(s) into td's store-db {}",
-                    regs.len(),
-                    db_path.display()
-                );
-                Ok(())
+                realize_drv(drv_path, store_db, Path::new(scratch)).map(|_| ())
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: realize {drv_path}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-builder build-recipe — build a TS recipe with NO Guile and NO
+        // guix-daemon in the path: read the recipe JSON (ts-eval produced it,
+        // Guile-free), resolve every input from the pinned LOCK (no
+        // specification->package), assemble the .drv itself, and realize it. The
+        // toolchain + lock are the guix-built SEED (§5, retired last). Usage:
+        //   build-recipe RECIPE-JSON-FILE LOCK SCRATCH STORE-DB
+        Some("build-recipe") if args.len() == 6 => {
+            let (recipe_file, lock, scratch, store_db) =
+                (&args[2], &args[3], &args[4], &args[5]);
+            let run = || -> Result<(), String> {
+                let recipe_json =
+                    std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
+                build_recipe(&recipe_json, lock, Path::new(scratch), store_db).map(|_| ())
+            };
+            match run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: build-recipe {recipe_file}: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -1799,6 +1905,8 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
+            eprintln!("       td-builder realize FILE.drv STORE-DB SCRATCH-DIR");
+            eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DB");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             ExitCode::from(2)
         }

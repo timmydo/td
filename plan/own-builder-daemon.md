@@ -77,8 +77,30 @@ Gate-only (realize already does the work — this proves the loop USES it). Load
 the path-under-scratch check distinguishes td's output from /gnu/store; the NAR oracle is
 a value comparison.
 
+## Capstone (PR #74 — nano-no-guix): nano builds with NO guix/Guile in its build path
+
+The convergence of this track + retire-resolver, on a human directive ("build nano with
+no guix dependencies, 1 PR"). New Rust `td-builder build-recipe RECIPE-JSON LOCK SCRATCH
+STORE-DB` (builder/src/main.rs) + a JSON serializer (json.rs `to_json_string`): reads the
+recipe JSON (ts-eval/boa produces it Guile-free), resolves EVERY input from the pinned
+lock (tests/nano-no-guix.lock — toolchain + deps + source, no specification->package),
+assembles the .drv itself (store::assemble_drv, inputs as input-SOURCES — so it diverges
+from guix's nano), and realizes it (realize_drv, no guix-daemon). `realize_drv` +
+`self_store_path` extracted/added; the `realize` arm now calls `realize_drv`.
+
+Gate `nano-no-guix` (380): PREP (guix realizes the SEED — toolchain+deps+source from the
+lock, retired last); BUILD runs with **guix/Guile SCRUBBED FROM PATH** (the structural
+proof the path needs neither) → STRUCTURAL; nano runs 8.7.1 from td's own output →
+DURABLE; guix's nano runs 8.7.1 at a DISTINCT path → MIGRATION ORACLE (own, then
+diverge). Verified: with guix/Guile off PATH the build SUCCEEDS (positive proof); a
+guix-shelling build would red there; a wrong/missing lock entry reds resolution.
+
+The bar (human-aligned): no guix/Guile in nano's BUILD PATH; the toolchain + lock are the
+guix-built SEED (bootstrapping the toolchain is §5 retired-LAST, a separate effort).
+
 ## Next
 
 - A persistent daemon mode the loop invokes by default instead of guix-daemon.
 - A network-present daemon harness → fully differential offline-isolation.
+- Reconstruct nano's deps (ncurses) → fewer seed entries are guix-package paths.
 - Toolchain retired LAST (§5).
