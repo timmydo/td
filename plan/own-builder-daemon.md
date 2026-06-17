@@ -63,6 +63,20 @@ Verified-red / load-bearing: the round-trip reds on an empty/missing db (store-q
 finds no record), and the daemon differential is a value comparison that reds on a
 wrong hash/size — both new assertions are non-vacuous.
 
+## Increment 4 (PR #72 — td-loop-build): the loop CONSUMES td's build
+
+"A builder the loop uses instead of guix-daemon." The realize gates so far built via td
+then ran the daemon's byte-identical /gnu/store copy; `td-loop-build` (370) has the loop
+RUN the artifact FROM td's OWN store output (the realize scratch store) — the consumed
+binary is td's build, not guix-daemon's. Subject = gettext-minimal (real deps): the loop
+runs `msgfmt` from `…/newstore/<out>/bin/msgfmt` (a path under td's scratch store, NOT
+/gnu/store; DURABLE) → 0.23.1. MIGRATION ORACLE: td's own-store output is NAR-identical
+to the daemon's build of the same drv. guix-daemon builds only the inputs (toolchain,
+retired last) + the oracle copy; td builds + serves the recipe the loop consumes.
+Gate-only (realize already does the work — this proves the loop USES it). Load-bearing:
+the path-under-scratch check distinguishes td's output from /gnu/store; the NAR oracle is
+a value comparison.
+
 ## Next
 
 - A persistent daemon mode the loop invokes by default instead of guix-daemon.
