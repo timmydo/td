@@ -6,6 +6,6 @@
 # Build closure = the derivation prerequisite graph (lowering only, no build).
 # Deterministic given the pinned channel; a pin bump re-baselines this snapshot.
 pin: 520785e315eddbe47199ac557e88e60eca3ae97c
-owned-recipes (6): gettext-minimal gzip hello libatomic-ops nano popt
-corpus-union: td-reproducible 6 / 266 (2.26%) [gettext-minimal gzip hello libatomic-ops nano popt]
-shipped-system: td-reproducible 3 / 1405 (0.21%) [gettext-minimal gzip nano]
+owned-recipes (9): gettext-minimal grep gzip hello libatomic-ops make nano popt sed
+corpus-union: td-reproducible 9 / 296 (3.04%) [gettext-minimal grep gzip hello libatomic-ops make nano popt sed]
+shipped-system: td-reproducible 5 / 1405 (0.36%) [gettext-minimal grep gzip nano sed]
