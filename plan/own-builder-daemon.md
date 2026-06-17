@@ -29,10 +29,27 @@ errors ("not a SQLite 3 database") — it genuinely reads the db, not a no-op; (
 directory") — the userns sandbox RESTRICTS to the staged closure, so computing it
 correctly matters. Both confirm the realize path is not vacuous.
 
+## Increment 2 (PR #70 — td-offline): offline-isolation for td's builder
+
+The parked **offline-isolation** work (rescoped 2026-06-11 to "the own-builder era")
+resumed. `offline` (185) proves a non-fixed-output build can't reach the network under
+GUIX-DAEMON; `td-offline` (360) proves td's OWN builder does the same. `td-builder
+realize` runs the existing DRV_SANDBOX probe (tests/offline-drv.scm) in td's
+userns+NEWNET sandbox — realize SUCCEEDING ⇒ the build saw only `lo` and egress failed
+(DURABLE, the probe asserts it; no guix oracle). Discrimination control: a
+userns+netns given a dummy non-lo interface, where the same /proc/net/dev check DOES
+see it (lo,dummy0) — so the isolation assertion is load-bearing, not vacuous (the probe
+would red the build if td's builder ever leaked an interface). All-durable.
+
+Note: inside the offline loop the OUTER loop-sandbox netns is already loopback-only, so
+this gate guards td's builder END-TO-END (it produces lo-only builds) + that the check
+discriminates; a fully differential "td's NEWNET strips a parent interface" proof waits
+for a network-present daemon harness.
+
 ## Next
 
 - Drive `realize` for richer recipes (gettext) and register into td-store-db (not
   just a registration file) so td owns the store side of realize.
 - A persistent daemon mode the loop invokes by default instead of guix-daemon.
-- Resume offline-isolation / daemon-network (the parked work).
+- A network-present daemon harness → fully differential offline-isolation.
 - Toolchain retired LAST (§5).
