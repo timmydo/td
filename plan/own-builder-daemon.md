@@ -46,10 +46,25 @@ this gate guards td's builder END-TO-END (it produces lo-only builds) + that the
 discriminates; a fully differential "td's NEWNET strips a parent interface" proof waits
 for a network-present daemon harness.
 
+## Increment 3 (PR #71 — td-realize-store): realize a real recipe + own the store record
+
+`realize` is now a COMPLETE daemon op — build AND own the store record — on a
+REAL-dependency recipe. builder/src/main.rs: `build_and_register` returns per-output
+records; `realize` writes a td store-db (new `write_output_db`, store_db / pure Rust)
+registering the built output (the daemon's post-build registration, no daemon).
+Subject = gettext-minimal (inputs libunistring/libxml2/ncurses + flags + makeFlag +
+two phases — a real dep graph, not just the toolchain). Gate `td-realize-store` (365):
+DURABLE behavioral — the realized gettext-tools run (msgfmt + xgettext); DURABLE
+structural — store-query reads the output record back from td's db (write → read
+round-trip); MIGRATION ORACLE — that record (path|hash|narSize) equals the daemon's
+ValidPaths row.
+
+Verified-red / load-bearing: the round-trip reds on an empty/missing db (store-query
+finds no record), and the daemon differential is a value comparison that reds on a
+wrong hash/size — both new assertions are non-vacuous.
+
 ## Next
 
-- Drive `realize` for richer recipes (gettext) and register into td-store-db (not
-  just a registration file) so td owns the store side of realize.
 - A persistent daemon mode the loop invokes by default instead of guix-daemon.
 - A network-present daemon harness → fully differential offline-isolation.
 - Toolchain retired LAST (§5).
