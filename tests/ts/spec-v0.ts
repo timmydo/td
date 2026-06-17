@@ -17,6 +17,8 @@ const spec: SystemSpec = {
   sshPasswordAuth: false,
   sshChallengeResponse: false,
   shipGuix: false,
+  persistentPaths: [{ tier: "precious", path: "/var/lib/ssh" }],
+  generation: null,
 };
 
 system(spec);

@@ -24,7 +24,9 @@ ts-diff:
 	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	dj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/spec-v0.ts"`; \
 	pj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/spec-perturbed.ts"`; \
-	test -n "$$dj" -a -n "$$pj" || { echo "ERROR: ts-emit produced no config JSON" >&2; exit 1; }; \
-	echo ">> v0 config        : $$dj"; \
-	echo ">> perturbed config : $$pj"; \
-	TD_TS_DEFAULT_JSON="$$dj" TD_TS_PERTURBED_JSON="$$pj" $(GUIX) repl $(LOAD) tests/ts-diff.scm
+	gj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/spec-gen1.ts"`; \
+	test -n "$$dj" -a -n "$$pj" -a -n "$$gj" || { echo "ERROR: ts-emit produced no config JSON" >&2; exit 1; }; \
+	echo ">> v0 config         : $$dj"; \
+	echo ">> perturbed config  : $$pj"; \
+	echo ">> generation config : $$gj"; \
+	TD_TS_DEFAULT_JSON="$$dj" TD_TS_PERTURBED_JSON="$$pj" TD_TS_GEN_JSON="$$gj" $(GUIX) repl $(LOAD) tests/ts-diff.scm

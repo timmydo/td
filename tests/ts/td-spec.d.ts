@@ -18,11 +18,21 @@
  *  "ext3") is a compile-time error. */
 declare type RootFsType = "ext4" | "btrfs" | "xfs";
 
-/** The v0 system spec shape — the scalar `td-config` fields. `readonly` so a
- *  spec cannot mutate it after declaration: eval is a pure description, not a
- *  program with state. (Manifest / generation / persistent-paths are NOT in v0:
- *  they default in `td-config`, so the default spec lowers byte-identically to
- *  the frozen oracle. Driving them from TS is later work — see plan/ts-frontend.md.) */
+/** Persistence tier (mirrors `td-config`'s persistent-paths pair car): a path
+ *  that survives a generation swap (`precious`) or is reset each swap
+ *  (`disposable`). A value outside this union is a compile-time error. */
+declare type PersistenceTier = "precious" | "disposable";
+
+/** One allowlisted persistent path (mirrors a `(tier . "/abs/path")` pair). */
+interface PersistentPath {
+  readonly tier: PersistenceTier;
+  readonly path: string;
+}
+
+/** The system spec shape — the `td-config` fields. `readonly` so a spec cannot
+ *  mutate it after declaration: eval is a pure description, not a program with
+ *  state. (Manifest is still defaulted in the lowering — the package set is the
+ *  recipe layer, not the config surface.) */
 interface SystemSpec {
   readonly hostName: string;
   readonly timezone: string;
@@ -35,6 +45,11 @@ interface SystemSpec {
   readonly sshPasswordAuth: boolean;
   readonly sshChallengeResponse: boolean;
   readonly shipGuix: boolean;
+  /** The default-deny persistence allowlist (DESIGN §2.6). */
+  readonly persistentPaths: readonly PersistentPath[];
+  /** Generation id: `null` for the default (non-generation) system, or a
+   *  positive integer for a placed generation (M10/M11). */
+  readonly generation: number | null;
 }
 
 /** Declare the system to build. The evaluator captures the argument and emits it
