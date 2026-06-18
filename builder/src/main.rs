@@ -384,11 +384,16 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
         None => String::new(),
     };
     // Resolve EVERY input from the lock (no Guile). The `<name>-source` entry is the
-    // source (TD_SRC); every other entry is a build input (TD_INPUTS + an input-src).
+    // source (TD_SRC); a `*.crate` entry is a vendored Rust dependency (TD_VENDOR_CRATES);
+    // every other entry is a toolchain build input (TD_INPUTS). Each is also an input-src.
     let lock = std::fs::read_to_string(lock_file).map_err(|e| format!("read lock {lock_file}: {e}"))?;
     let src_key = format!("{name}-source");
     let mut source = String::new();
     let mut inputs: Vec<String> = Vec::new();
+    // Vendored Rust deps: lock entries whose NAME ends `.crate` are the dependency
+    // closure (from Cargo.lock), handed to the rust phase runner as TD_VENDOR_CRATES
+    // rather than as toolchain inputs. A gnu recipe has none, so its spec is unchanged.
+    let mut vendor: Vec<String> = Vec::new();
     for line in lock.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -397,6 +402,8 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
         let (k, path) = line.split_once(' ').ok_or_else(|| format!("malformed lock line: {line}"))?;
         if k == src_key {
             source = path.to_string();
+        } else if k.ends_with(".crate") {
+            vendor.push(path.to_string());
         } else {
             inputs.push(path.to_string());
         }
@@ -405,6 +412,7 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
         return Err(format!("lock has no `{src_key}' entry (the recipe source)"));
     }
     inputs.sort();
+    vendor.sort();
     let builder_store = self_store_path()?;
     let builder = format!("{builder_store}/bin/td-builder");
     // Assemble the .drv spec: inputs as input-SOURCES (already-realized seed paths,
@@ -419,6 +427,11 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
     for p in &inputs {
         spec.push_str(&format!("input-src {p}\n"));
     }
+    // Vendored crates are also staged into the build (input-srcs); a gnu recipe has
+    // none, so this adds nothing to its spec.
+    for p in &vendor {
+        spec.push_str(&format!("input-src {p}\n"));
+    }
     spec.push_str(&format!("env TD_SRC={source}\n"));
     spec.push_str(&format!("env TD_INPUTS={}\n", inputs.join(":")));
     match build_system {
@@ -427,7 +440,8 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
             spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
             spec.push_str(&format!("env TD_PHASES={phases}\n"));
         }
-        // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS).
+        // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS) and,
+        // if any vendored deps were locked, resolves them offline (TD_VENDOR_CRATES).
         "rust" => {
             let bins: Vec<&str> = alist
                 .get("bins")
@@ -438,6 +452,9 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
                 return Err("recipe: buildSystem \"rust\" requires a non-empty `bins'".into());
             }
             spec.push_str(&format!("env TD_RUST_BINS={}\n", bins.join(" ")));
+            if !vendor.is_empty() {
+                spec.push_str(&format!("env TD_VENDOR_CRATES={}\n", vendor.join(":")));
+            }
         }
         _ => unreachable!("buildSystem already validated"),
     }

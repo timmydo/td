@@ -61,12 +61,13 @@
 ;; from the td-reproducible census so it does not overstate independence.
 (define not-yet-td-built '("pkg-config"))
 
-;; td's OWN programs, authored as recipes for the SELF-HOST (buildSystem "rust"),
-;; not guix-corpus reconstructions — they have no `specification->package` oracle
-;; by design, so they don't fit this corpus closure census (which is rooted in guix
-;; package derivations). Their own-builder proof is the rust-build gate (td builds
-;; td-builder itself, reproducibly), not a corpus differential.
-(define self-host-specs '("td-builder"))
+;; td's OWN Rust programs, authored as recipes for buildSystem "rust" (the
+;; self-host td-builder + the vendored-deps demo), not guix-corpus reconstructions —
+;; they have no `specification->package` oracle by design, so they don't fit this
+;; corpus closure census (which is rooted in guix package derivations). Their
+;; own-builder proof is the rust-build / rust-vendor gates (td builds them itself,
+;; reproducibly), not a corpus differential.
+(define self-host-specs '("td-builder" "td-vendor-demo"))
 
 (define owned-specs
   (sort
