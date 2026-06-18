@@ -42,11 +42,22 @@ proves the cargo-vendor dependency path; Increment 3 (a uutils tool) rides on it
 
 ## Sub-task ladder
 1. [x] de-risk vendor mechanism on host (itoa: fetch .crate, minimal checksum, offline build)
-2. [ ] claim + plan-index
-3. [ ] demo crate (itoa + ryu) + warm/pin the dep FODs
-4. [ ] run_rust vendoring + build_recipe *.crate routing
-5. [ ] gate 335-rust-vendor + verified-red
+2. [x] claim + plan-index
+3. [x] demo crate (itoa + ryu) + warm/pin the dep FODs
+4. [x] run_rust vendoring + build_recipe *.crate routing
+5. [x] gate 335-rust-vendor + verified-red
 6. [ ] full ./check.sh green; review; ready + auto-merge
 
 ## Verified-red evidence
-(to fill)
+- GREEN: `./check.sh rust-vendor` → td built td-vendor-demo from vendored itoa+ryu
+  with guix/Guile off PATH; the .drv carries TD_VENDOR_CRATES (2 deps); the binary
+  prints `2026 3.14159` (both deps exercised); td-builder check double-build
+  reproducible.
+- RED (teeth): corrupting the `.cargo-checksum.json` `package` sha that run_rust
+  writes (`dead…`) reds the gate (CHECK_EXIT=2): cargo `error: checksum for
+  'itoa v1.0.18' changed between lock files … unable to verify` → build fails. Proves
+  the vendored checksum is load-bearing (cargo verifies it) and the build genuinely
+  flows through vendored-sources. Reverted → green.
+- (Two earlier red attempts were INVALID and discarded: commenting a lock line made
+  PREP's `grep ' /gnu/store/'` feed the comment to `guix build`; deleting a line
+  tripped the gate's own `ncrate>=2` guard — neither tested the vendoring itself.)
