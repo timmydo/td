@@ -14,7 +14,13 @@ HEAVY_GATES += boot-disk-native
 boot-disk-native:
 	@echo ">> boot-disk-native: boot the td qcow2 under qemu + full behavioral suite over SSH (td's own harness, no marionette/Guile in guest)"
 	@set -euo pipefail; \
-	out=`$(GUIX) repl $(LOAD) tests/boot-native-drv.scm 2>/dev/null`; \
+	out=`printf '%s\n' \
+	    '(use-modules (guix) (guix gexp) (gnu image) (gnu system image) (tests boot))' \
+	    '(with-store store' \
+	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
+	    '  (format #t "DRV=~a~%" (derivation-file-name (run-with-store store (lower-object %native-disk-image))))' \
+	    '  (format #t "KERNEL=~a~%" %expected-kernel-release))' \
+	  | $(GUIX) repl $(LOAD) 2>/dev/null`; \
 	drv=`printf '%s\n' "$$out" | sed -n 's/^DRV=//p'`; \
 	k=`printf '%s\n' "$$out" | sed -n 's/^KERNEL=//p'`; \
 	test -n "$$drv" -a -n "$$k" || { echo "ERROR: could not lower the native qcow2 drv / kernel" >&2; exit 1; }; \

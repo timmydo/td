@@ -6,9 +6,9 @@
 ;;
 ;; NOTE (move-off-Guile §5, lever 3): the disk-boot and reset tests were moved to
 ;; td's OWN SSH-driven VM harness (gates boot-disk-native / reset-native), which
-;; have NO (gnu tests) system-test drv — they build a qcow2 image via
-;; tests/boot-native-drv.scm / tests/reset-native-drv.scm and need qemu-minimal +
-;; openssh + nss-wrapper at run time. Staging those into the CI store image is a
+;; have NO (gnu tests) system-test drv — they lower a qcow2 image
+;; (%native-disk-image / %native-reset-image in (tests boot)) and need qemu-minimal
+;; + openssh + nss-wrapper at run time. Staging those into the CI store image is a
 ;; ci-image-pipeline follow-up (the full-ci check is not yet a required gate; the
 ;; dev-machine ./check.sh covers them today).
 (use-modules (guix) (gnu tests)

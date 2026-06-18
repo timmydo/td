@@ -10,7 +10,12 @@ HEAVY_GATES += reset-native
 reset-native:
 	@echo ">> reset-native: CoW-reset ephemerality over SSH (td's own harness, no marionette/Guile in guest)"
 	@set -euo pipefail; \
-	drv=`$(GUIX) repl $(LOAD) tests/reset-native-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	drv=`printf '%s\n' \
+	    '(use-modules (guix) (guix gexp) (gnu image) (gnu system image) (tests boot))' \
+	    '(with-store store' \
+	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
+	    '  (format #t "DRV=~a~%" (derivation-file-name (run-with-store store (lower-object %native-reset-image)))))' \
+	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the native reset qcow2 drv" >&2; exit 1; }; \
 	echo ">> native non-volatile qcow2 drv: $$drv"; \
 	img=`$(GUIX) build "$$drv"`; \
