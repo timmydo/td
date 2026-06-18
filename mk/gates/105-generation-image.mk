@@ -16,7 +16,7 @@
 #   • assert gen-1 and gen-2 lower to DIFFERENT image derivations — each carries
 #     its own generation's initrd (which mounts that generation's distinct root),
 #     so the bundle is genuinely per-generation, not a shared artifact.
-HEAVY_GATES += generation-image
+SYSTEM_GATES += generation-image
 generation-image:
 	@echo ">> generation-image: build a bootc-style generation image, --check it, crack /boot (M10.1)"
 	@set -euo pipefail; \

@@ -10,7 +10,7 @@
 # (the config/toolchain layer, retired last §5); only the TEST HARNESS moves here.
 # Reusable primitives live in tests/vm-lib.sh; this gate's assertions in
 # tests/boot-native.sh. Runs after the cheap gates (boots a full VM).
-HEAVY_GATES += boot-disk-native
+SYSTEM_GATES += boot-disk-native
 boot-disk-native:
 	@echo ">> boot-disk-native: boot the td qcow2 under qemu + full behavioral suite over SSH (td's own harness, no marionette/Guile in guest)"
 	@set -euo pipefail; \

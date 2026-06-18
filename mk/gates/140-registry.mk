@@ -15,7 +15,7 @@
 # byte flipped), forged (statement rewritten, signature kept) — each must be
 # rejected for its own reason. The verifier exercised here (verify_pull) is
 # the same contract the placer enforces before placing (M12 S4).
-HEAVY_GATES += registry
+SYSTEM_GATES += registry
 registry:
 	@echo ">> registry: signed static OCI-layout distribution — push, verify statements/signatures/pull-by-digest (M12 S3)"
 	@set -euo pipefail; \

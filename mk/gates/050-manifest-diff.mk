@@ -6,7 +6,7 @@
 # swapped system's package set and absent from the default's. No image is built
 # here — the bit-for-bit repro of a SWAPPED generation is the `manifest-check`
 # gate below. Run as a repl SCRIPT so `(exit)` is the gate's status.
-CHEAP_GATES += manifest-diff
+SYSTEM_GATES += manifest-diff
 manifest-diff:
 	@echo ">> manifest-diff: a changed manifest swaps the whole OCI image"
 	$(GUIX) repl $(LOAD) tests/manifest-diff.scm

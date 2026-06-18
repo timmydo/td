@@ -6,7 +6,7 @@
 # generation's root is not the shared td-root. Without this each generation would
 # boot the same filesystem and rollback would be a no-op. The full boot+rollback
 # is M10.3. Run as a repl SCRIPT so `(exit)` is the gate's status.
-CHEAP_GATES += generation-diff
+SYSTEM_GATES += generation-diff
 generation-diff:
 	@echo ">> generation-diff: each generation gets a distinct, selectable root (M10.1)"
 	$(GUIX) repl $(LOAD) tests/generation-diff.scm

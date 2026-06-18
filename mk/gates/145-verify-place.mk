@@ -16,7 +16,7 @@
 # (each for its own §2.7 reason, placing nothing), and a crafted legacy image
 # whose embedded identity states its own digest rejected by the
 # self-reference guard.
-HEAVY_GATES += verify-place
+SYSTEM_GATES += verify-place
 verify-place:
 	@echo ">> verify-place: placer verifies signature+digest before placing; rejects unsigned/tampered (M12 S4)"
 	@set -euo pipefail; \
