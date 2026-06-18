@@ -25,7 +25,9 @@
   #:use-module (guix packages)
   #:use-module (system td)
   #:export (%test-td-disk-boot
-            %instrumented-disk-os))
+            %instrumented-disk-os
+            %test-os
+            %expected-kernel-release))
 
 (define %expected-kernel-release
   ;; linux-libre reports `uname -r` as "<version>-gnu".
