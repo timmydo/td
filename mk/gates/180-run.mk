@@ -18,7 +18,7 @@
 #    in $(CURDIR)/.run-scratch — disk, not the sandbox /tmp (same tmpfs-size
 #    lesson as .genimg-scratch above); run-image.sh's own EXIT trap cleans its
 #    subdir either way, the recipe removes the parent on green.
-HEAVY_GATES += run
+SYSTEM_GATES += run
 run:
 	@echo ">> run: execute the shipped OCI image as a real OCI container (crun)"
 	@set -euo pipefail; \

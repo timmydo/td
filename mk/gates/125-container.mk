@@ -23,7 +23,7 @@
 #    symlink, also --checked): crun execs the explicit /usr/bin/hello against the FHS
 #    rootfs (resolves, prints output) while the SAME arg fails on the plain
 #    store-layout rootfs — proving the binary resolves at a traditional FHS path.
-HEAVY_GATES += container
+SYSTEM_GATES += container
 container:
 	@echo ">> container: run an OCI app container on the booted td base (crun)"
 	@set -euo pipefail; \

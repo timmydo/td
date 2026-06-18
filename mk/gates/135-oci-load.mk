@@ -22,7 +22,7 @@
 # $(CURDIR)/.oci-load-scratch (disk, not the sandbox tmpfs — the rootless
 # lesson: layouts + the decompressed archive are several GB); kept on red for
 # triage, removed on green.
-HEAVY_GATES += oci-load
+SYSTEM_GATES += oci-load
 oci-load:
 	@echo ">> oci-load: foreign OCI implementation (skopeo) loads the shipped images"
 	@set -euo pipefail; \

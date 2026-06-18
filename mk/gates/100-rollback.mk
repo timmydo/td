@@ -16,7 +16,7 @@
 # tree with tests/place-check.scm in mkfs mode (superblock label/UUID, search
 # line). Two-step lower-then-realise for the marionette derivation, as in
 # `test`/`boot-disk` (honest exit status).
-HEAVY_GATES += rollback
+SYSTEM_GATES += rollback
 rollback:
 	@echo ">> rollback: boot gen 2, roll back to gen 1 via the GRUB menu, assert identity + persistence (M10.3)"
 	@set -euo pipefail; \

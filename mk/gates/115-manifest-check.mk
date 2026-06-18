@@ -13,7 +13,7 @@
 #    open the built layer.tar and assert hello/bin/hello is actually present in
 #    the SWAPPED image and ABSENT from the default image — artifact contents, not
 #    just the declaration.
-HEAVY_GATES += manifest-check
+SYSTEM_GATES += manifest-check
 manifest-check:
 	@echo ">> manifest-check: build a SWAPPED-manifest OCI image and --check it"
 	@set -euo pipefail; \

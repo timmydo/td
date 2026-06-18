@@ -24,7 +24,7 @@
 # entry are gone. Two scenarios: PLACE (gens 1,2 keep 10 — no prune) and PRUNE
 # (gens 1,2,3 keep 2 — gen 1 dropped). Creating the labeled fs from the staged
 # root.tar + the full boot+rollback is M10.3.
-HEAVY_GATES += place
+SYSTEM_GATES += place
 place:
 	@echo ">> place: guix-free placer extracts /boot + writes a per-generation GRUB menu, prunes old generations (M10.2)"
 	@set -euo pipefail; \

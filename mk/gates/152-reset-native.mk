@@ -6,7 +6,7 @@
 # gone on a fresh overlay over the same read-only backing image (the reset).
 # Locks in the fresh-state-per-test guarantee §1.5 names. DURABLE (no Guix oracle).
 # Reusable primitives in tests/vm-lib.sh; assertions in tests/reset-native.sh.
-HEAVY_GATES += reset-native
+SYSTEM_GATES += reset-native
 reset-native:
 	@echo ">> reset-native: CoW-reset ephemerality over SSH (td's own harness, no marionette/Guile in guest)"
 	@set -euo pipefail; \

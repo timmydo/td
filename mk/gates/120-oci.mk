@@ -4,7 +4,7 @@
 #    OS closure is shared with `build`, so --check mostly re-runs the cheap
 #    docker-packing step. The matching declaration also boots as a VM (M1–M4),
 #    closing the north-star "one declaration, store-based + OCI" loop (DESIGN §0).
-HEAVY_GATES += oci
+SYSTEM_GATES += oci
 oci:
 	@echo ">> oci: $(SYSTEM) image (docker)"
 	$(GUIX) system image $(LOAD) -t docker $(SYSTEM)

@@ -85,9 +85,10 @@ endef
 CHEAP_GATES :=
 HEAVY_GATES :=
 FAST_GATES  :=
+SYSTEM_GATES :=
 include $(sort $(wildcard mk/gates/*.mk))
 
-.PHONY: check check-fast container-check list-gates $(CHEAP_GATES) $(HEAVY_GATES)
+.PHONY: check check-fast check-system container-check list-gates $(CHEAP_GATES) $(HEAVY_GATES) $(SYSTEM_GATES)
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -106,18 +107,33 @@ check: $(CHEAP_GATES) $(HEAVY_GATES)
 # remains the gate; nothing here removes, loosens, reorders, or skips a gate.
 check-fast: $(CHEAP_GATES) $(FAST_GATES)
 
+# The `guix system` / whole-OS tier — gates that boot a VM (QEMU/marionette/
+# SSH-harness), build/realize a full system or OCI *image*, or diff the system
+# image / generation roots. DELIBERATELY PARKED out of the default `check` while
+# td's focus is the user-space PACKAGE MANAGER (build/realize/store/recipes) — not
+# `guix system`. This is a human-directed scope decision (DESIGN §4.3 / directive
+# 3): the gates are NOT deleted or weakened, only moved to an on-demand tier; the
+# package-manager loop (`check`) keeps its OWN behavioral coverage (built tools
+# run, link-tests, the guix per-PACKAGE differential). Re-fold these back into
+# `check` when the OS becomes the focus. Run them on demand: `./check.sh check-system`.
+check-system: $(CHEAP_GATES) $(SYSTEM_GATES)
+
 # Print the assembled gate pools — the one-screen overview the single-file list
 # used to give. (`make list-gates`, no build.)
 list-gates:
-	@echo "cheap ($(words $(CHEAP_GATES))): $(CHEAP_GATES)"
-	@echo "heavy ($(words $(HEAVY_GATES))): $(HEAVY_GATES)"
-	@echo "fast  ($(words $(FAST_GATES))): $(FAST_GATES)"
+	@echo "cheap  ($(words $(CHEAP_GATES))): $(CHEAP_GATES)"
+	@echo "heavy  ($(words $(HEAVY_GATES))): $(HEAVY_GATES)"
+	@echo "fast   ($(words $(FAST_GATES))): $(FAST_GATES)"
+	@echo "system ($(words $(SYSTEM_GATES))): $(SYSTEM_GATES)"
 
 # Generated ordering graph (do not hand-edit): chain each cheap gate order-only
 # on its predecessor, and gate every heavy gate on the last cheap gate.
 chain-prev :=
 $(foreach r,$(CHEAP_GATES),$(eval $(if $(chain-prev),$(r): | $(chain-prev)))$(eval chain-prev := $(r)))
 $(HEAVY_GATES): | $(lastword $(CHEAP_GATES))
+# System-tier gates (on-demand `check-system`) gate on the last cheap gate too, so
+# the structural gates run serial-first there exactly as in `check`.
+$(SYSTEM_GATES): | $(lastword $(CHEAP_GATES))
 
 # `rootless` needs NO special scheduling — it runs as an ordinary heavy gate
 # under -j2 (its only prereq is the generic last-cheap-gate one above). It USED to
