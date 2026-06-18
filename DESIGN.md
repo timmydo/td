@@ -796,10 +796,11 @@ To land:
 The human approval replaces the old "no human merge step; review-after on
 main", and this PR protocol supersedes the same-day no-PR amendment (the human
 re-decided later on 2026-06-11: PRs with mandatory review, not status-gated
-fast-forwards). The runner's `check-fast` check joins the required checks once
-the `td-ci-fast` image is published (until then `lint` is required and step 2 —
-the dev-machine full `./check.sh` — is the only full-loop gate; the per-PR
-runner never runs the full loop, by #26). The fast check is cheap and does not
+fast-forwards). The runner's `check-fast` check is now a required check
+alongside `lint` (the `td-ci-fast` image is published and check-fast has been
+green on recent PRs — 2026-06-18); step 2 — the dev-machine full `./check.sh` —
+remains the only FULL-loop gate, since the per-PR runner runs the fast tier
+only, by #26. The fast check is cheap and does not
 meaningfully count toward the §7.3 two-concurrent-checks ceiling; the full loop
 that does count runs on the dev machine. "Validated" still means green against the main
 actually merged into — opening a ready PR with a locally-red or un-run full
