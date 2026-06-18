@@ -21,7 +21,12 @@
   #:use-module (guix gexp)
   #:use-module (guix build-system cargo)
   #:use-module ((guix licenses) #:prefix license:)
-  #:export (td-builder))
+  #:export (td-builder
+            ;; Exported so (system td-build) can build td-builder via td's OWN
+            ;; rust-build runner from the SAME source the cargo-build-system
+            ;; package uses — the self-hosting rust-build differential builds one
+            ;; source two ways (guix cargo-build-system vs td's cargo runner).
+            %builder-source))
 
 ;; The crate source: the ../builder tree (Cargo.toml, Cargo.lock, src/). A
 ;; relative local-file resolves against THIS file's directory, so it points at

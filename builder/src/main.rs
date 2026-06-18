@@ -1892,6 +1892,17 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // td's OWN Rust/cargo build system (the cargo-build-system replacement):
+        // builds the TD_SRC crate with `cargo build --offline` and installs
+        // TD_RUST_BINS into $out/bin. Sibling of autotools-build; same
+        // env-driven derivation-builder contract (system/td-build.scm).
+        Some("rust-build") if args.len() == 2 => match build::run_rust() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: rust-build: {e}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("usage: td-builder            # print the S1 sentinel");
             eprintln!("       td-builder nar-hash PATH");
@@ -1911,6 +1922,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder realize FILE.drv STORE-DB SCRATCH-DIR");
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DB");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
+            eprintln!("       td-builder rust-build        # as a derivation builder (cargo)");
             ExitCode::from(2)
         }
     }

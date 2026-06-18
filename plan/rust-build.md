@@ -45,13 +45,47 @@ external (§5, retired last). See [[td-youki-postponed]], [[td-shipped-package-r
   keep it as a labeled migration-oracle leg only.
 
 ## Sub-task ladder
-1. [ ] claim + plan-index → draft PR
-2. [ ] buildSystem dispatch (ts-eval → recipe JSON → td-build.scm → build.rs)
-3. [ ] cargo phase runner in build.rs; rust toolchain inputs
-4. [ ] self-host recipe + gate; verified-red
-5. [ ] vendored-deps increment
-6. [ ] uutils increment (or document as next)
-7. [ ] full ./check.sh green; sub-agent review; ready + auto-merge
+1. [x] claim + plan-index → draft PR #81
+2. [x] cargo phase runner `run_rust` in build.rs (+ `rust-build` dispatch in main.rs)
+3. [x] `td-rust-selfhost-derivation` in td-build.scm (rust+cargo+gcc seed inputs);
+       `%builder-source` exported from td-builder.scm
+4. [~] self-host gate (330-rust-build.mk) + tests/rust-build-drv.scm — gate run in progress
+5. [ ] verified-red on the gate
+6. [ ] vendored-deps increment (Inc.2) — assess after Inc.1 green
+7. [ ] uutils increment (Inc.3) — assess / may be follow-up
+8. [ ] full ./check.sh green; sub-agent review; ready + auto-merge
+
+## Findings (de-risk, all on host before wiring)
+- cargo builds td-builder OFFLINE from the store toolchain (rust + rust:cargo +
+  gcc-toolchain + coreutils + bash); ~4s. ✓
+- REPRODUCIBLE: two builds at DIFFERENT build-dir paths → byte-identical binary
+  (`7f80f5a2…`) via `--remap-path-prefix` + SOURCE_DATE_EPOCH=1. ✓
+- Linking via gcc-toolchain's gcc (ld-wrapper) injects RUNPATH → gcc-toolchain/lib
+  (libc + libgcc_s) + glibc interpreter → the output runs on the guix system. ✓
+- GOTCHA: a derivation-input's multiple sub-outputs MUST be in SORTED order
+  (`'("cargo" "out")`, not `'("out" "cargo")`) or the daemon recomputes a
+  different drv hash → "has incorrect output" rejection.
+- GOTCHA: `%builder-source` (local-file) lowers to a store PATH (interned), not a
+  derivation → it is an input-SOURCE (`#:sources`), not an input-derivation.
+- End-to-end: `guix build` of the self-host drv ran `td-builder rust-build` →
+  cargo build offline → installed `7xrm…/bin/td-builder`, distinct from guix's
+  `fspw8…/bin/td-builder`. ✓
 
 ## Verified-red evidence
-(to fill in)
+- GREEN: `./check.sh rust-build` passes — [STRUCTURAL] builder=td-builder arg
+  rust-build; [DURABLE behavioral] td-built td-builder RUNS (nar-hash
+  sha256:4a4cff56…) and agrees with the guix-built one; [DURABLE repro]
+  td-builder check double-build agrees reproducible (1097-item closure);
+  [MIGRATION ORACLE] distinct from guix's `fspw8…-td-builder`.
+- RED (teeth): with `run_rust` installing a non-working file (Cargo.toml) as the
+  binary, the gate FAILS (`GATE_EXIT=2`): "rust-build produced no td-builder
+  binary" — the installed file is not an executable. Restored → green. Proves the
+  gate gates on rust-build producing a real working binary, not just `cargo`
+  exiting 0.
+
+## Scope decision (increments 2/3)
+Increment 1 is a complete, green milestone (td-builder owns a Rust-from-source
+build path; self-hosting; reproducible by its own double-build). Increments 2
+(vendored deps) and 3 (a uutils tool) are each milestone-sized (cargo-vendor
+plumbing; a 150+-crate graph) — better as FOLLOW-UP PRs on this track than one
+sprawling, hard-to-review change. Recommend landing Inc.1, then Inc.2, then Inc.3.
