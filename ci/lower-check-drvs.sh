@@ -75,9 +75,10 @@ for s in tests/*-drv.scm tests/*-drvs.scm; do
   esac
 done
 
-# --- Sandbox toolchain: parse the package list off check.sh's guix shell
-# line so it cannot drift. skopeo is built by the oci-load rung itself.
-tools=$(sed -n 's/^  \(make bash .*\) -- \\$/\1/p' check.sh)
+# --- Sandbox toolchain: parse the package list off check.sh's `guix shell
+# --search-paths` line that provisions the loop toolchain profile, so it cannot
+# drift. skopeo is built by the oci-load rung itself.
+tools=$(sed -n 's/^    \(make bash [a-z0-9 .+-]*\) \\$/\1/p' check.sh)
 test -n "$tools" || { echo "ERROR: could not parse toolchain from check.sh" >&2; exit 1; }
 # shellcheck disable=SC2086
 $GUIX build -d $tools skopeo signify
