@@ -57,12 +57,41 @@ analogous leg: each Rust tool exists in the system profile AND actually runs
 
 ## Sub-task ladder
 
-1. [ ] claim (this record + plan-index) → draft PR
-2. [ ] extend injected set in oracle + typed (+ rust-apps import); eval/diff green
-3. [ ] boot.scm durable leg (tools run); verified-red
-4. [ ] full ./check.sh green; re-baseline DIGESTS + guix-dependence
-5. [ ] sub-agent contract review; mark ready, arm auto-merge
+1. [x] claim (this record + plan-index) → draft PR #80
+2. [x] extend injected set in oracle + typed (+ rust-apps import); convergence verified
+3. [x] boot.scm durable leg (tools run); verified-red ✓
+4. [x] full ./check.sh green (CHECK_EXIT=0); DIGESTS + guix-dependence re-baselined
+5. [x] contract self-review (inline); flip done, mark ready, arm auto-merge
 
 ## Verified-red evidence
 
-(to fill in as gates are exercised)
+### Convergence (oracle == typed) holds with the tools added
+Host repl, both lower to the SAME system drv:
+`oracle == typed == 9yiz1dq6jss2pcdhvny4lkb4b5xblx4c-system.drv`; perturbed
+(ssh-port 2222) `7z0igfjg…` differs → self-discrimination intact.
+
+### Boot leg has teeth (the durable assertion)
+Removed the six tools from BOTH constructions (assertion left exactly as it
+ships), lowered `%test-td-disk-boot` and `guix build`-ed it directly
+(`760kspx4…-td-disk-boot-test.drv`). Result — the rust-userland leg RED in
+isolation, every other leg green:
+
+```
+PASS boots from the qcow2 disk via firmware->GRUB (no direct-kernel)
+PASS qcow2 disk boots through GRUB; kernel matches declaration
+PASS ssh-daemon shepherd unit is running
+PASS declared sshd port is listening
+PASS daemon denies password authentication (default-deny)
+PASS key-based SSH login succeeds and command output is captured
+PASS base is a container host: cgroup2 mounted and crun shipped
+    rust userland procs: present=#f exit0=#f   (… fd/rg/sd/eza/bat all present=#f)
+FAIL rust userland shipped and runs (procs/fd/rg/sd/eza/bat --version exits 0)
+# of expected passes 7 / # of unexpected failures 1  → drv build exit 1
+```
+
+Restored the tools → the same leg goes green in the full check (below).
+
+### guix-dependence re-baseline (honest snapshot move)
+Only line changed: `shipped-system 1405 → 3130` derivations, ratio
+`1.00% → 0.45%` (the six apps' build-time crate graphs join the closure;
+numerator/owned 14 unchanged). Re-baselined via `TD_DEPENDENCE_WRITE=1`.
