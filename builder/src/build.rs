@@ -506,6 +506,113 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// rust-build — td's OWN Rust/cargo build "system" (sibling of `run`, the
+/// autotools runner). The REPLACEMENT for Guix's `cargo-build-system`: here the
+/// build LOGIC is td's Rust; only the rustc/cargo/gcc seed is the external
+/// toolchain (§5, retired last). Phases: set-paths -> materialize a WRITABLE
+/// source tree (TD_SRC is a store DIRECTORY — e.g. self-hosting the builder — or
+/// a source tarball) -> `cargo build --release --offline --frozen` (no network,
+/// Cargo.lock honored) -> install the named bins to $out/bin.
+///
+/// Determinism (the durable repro oracle is `td-builder check`'s double-build):
+/// SOURCE_DATE_EPOCH=1 plus `--remap-path-prefix` strip the (varying) build-dir
+/// and CARGO_HOME absolute paths so the binary does not embed them; linking
+/// through gcc-toolchain's gcc (Guix's ld-wrapper) injects the RUNPATH to the
+/// toolchain libs, so the output runs on a guix system and both double-build runs
+/// share the same RUNPATH.
+///
+/// Inputs (env, set by `system td-build`):
+///   out          the output store path.
+///   TD_SRC       the crate source (a store directory or a source tarball).
+///   TD_INPUTS    ':'-joined input store paths (rustc, cargo, gcc-toolchain,
+///                coreutils, bash) — their bin/ dirs build PATH, lib/ build
+///                LIBRARY_PATH.
+///   TD_RUST_BINS space-separated binary names to install into $out/bin.
+pub fn run_rust() -> Result<(), String> {
+    let out = env::var("out").map_err(|_| "out not set".to_string())?;
+    let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
+    let inputs = env::var("TD_INPUTS").unwrap_or_default();
+    let bins_spec = env::var("TD_RUST_BINS").map_err(|_| "TD_RUST_BINS not set".to_string())?;
+    let bins: Vec<&str> = bins_spec.split_whitespace().collect();
+    if bins.is_empty() {
+        return Err("TD_RUST_BINS is empty (no binaries to install)".into());
+    }
+
+    // set-paths: PATH from inputs' bin/ dirs; LIBRARY_PATH from lib/lib64 so the
+    // ld-wrapper finds (and RUNPATHs) the toolchain libs at link time.
+    let mut path: Vec<String> = Vec::new();
+    let mut lib: Vec<String> = Vec::new();
+    for p in inputs.split(':').filter(|s| !s.is_empty()) {
+        let bin = format!("{p}/bin");
+        if Path::new(&bin).is_dir() {
+            path.push(bin);
+        }
+        for sub in ["lib", "lib64"] {
+            let d = format!("{p}/{sub}");
+            if Path::new(&d).is_dir() {
+                lib.push(d);
+            }
+        }
+    }
+    let path = path.join(":");
+    let cargo = find_in_path(&path, "cargo").ok_or("cargo not found in TD_INPUTS")?;
+    find_in_path(&path, "rustc").ok_or("rustc not found in TD_INPUTS")?;
+    let cp = find_in_path(&path, "cp").ok_or("cp not found in TD_INPUTS")?;
+    let chmod = find_in_path(&path, "chmod").ok_or("chmod not found in TD_INPUTS")?;
+    let gcc = find_in_path(&path, "gcc").ok_or("gcc not found in TD_INPUTS (linker)")?;
+
+    // Materialize a WRITABLE source tree (cargo writes target/). A store directory
+    // (self-host) is copied; a tarball is unpacked, then its single subdir copied.
+    let path_env = vec![("PATH".to_string(), path.clone())];
+    let build_dir = "td-rust-build";
+    if Path::new(&src).is_dir() {
+        run_cmd(&cp, &["-aT", &src, build_dir], ".", &path_env)?;
+    } else {
+        let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS")?;
+        run_cmd(&tar, &["xf", &src], ".", &path_env)?;
+        let sub = single_subdir(".")?;
+        run_cmd(&cp, &["-aT", &sub, build_dir], ".", &path_env)?;
+    }
+    // store copies are read-only; make the tree writable for cargo's target/.
+    run_cmd(&chmod, &["-R", "u+w", build_dir], ".", &path_env)?;
+
+    let cwd = env::current_dir().map_err(|e| e.to_string())?;
+    let build_abs = cwd.join(build_dir);
+    let build_abs = build_abs.to_str().ok_or("non-utf8 build path")?.to_string();
+    let cargo_home = cwd.join("td-cargo-home");
+    let cargo_home = cargo_home.to_str().ok_or("non-utf8 cargo-home")?.to_string();
+    // Reproducibility: remap the (varying) build dir + CARGO_HOME so file!()/debug
+    // paths don't leak into the binary; link via gcc (ld-wrapper) so the output
+    // gets a RUNPATH to the toolchain libs.
+    let rustflags = format!(
+        "--remap-path-prefix={build_abs}=/td-build --remap-path-prefix={cargo_home}=/td-cargo -Clinker={gcc}"
+    );
+    let envs: Vec<(String, String)> = vec![
+        ("out".into(), out.clone()),
+        ("PATH".into(), path.clone()),
+        ("LIBRARY_PATH".into(), lib.join(":")),
+        ("HOME".into(), "/homeless-shelter".into()),
+        ("CARGO_HOME".into(), cargo_home),
+        ("SOURCE_DATE_EPOCH".into(), "1".into()),
+        ("RUSTFLAGS".into(), rustflags),
+    ];
+
+    // build (offline, frozen, release) in the writable tree.
+    run_cmd(&cargo, &["build", "--release", "--offline", "--frozen"], build_dir, &envs)?;
+
+    // install the named binaries to $out/bin.
+    let bindir = format!("{out}/bin");
+    fs::create_dir_all(&bindir).map_err(|e| format!("mkdir {bindir}: {e}"))?;
+    for b in &bins {
+        let from = format!("{build_dir}/target/release/{b}");
+        if !Path::new(&from).is_file() {
+            return Err(format!("cargo did not produce expected binary `{b}' at {from}"));
+        }
+        run_cmd(&cp, &["-p", &from, &format!("{bindir}/{b}")], ".", &path_env)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
