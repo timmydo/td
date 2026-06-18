@@ -18,7 +18,6 @@
              (system td-ts)
              (system td-build)
              (tests boot)
-             (tests reset)
              (tests container)
              (tests rollback))
 
