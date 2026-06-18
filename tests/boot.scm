@@ -276,6 +276,40 @@
               (and (string-contains cgroup-type "cgroup2fs")
                    crun?)))
 
+          ;; rust-userland (2026-06-17): the Rust-native base userland is shipped
+          ;; AND actually runs. For each tool we check it is on PATH in the system
+          ;; profile and that invoking it (`--version`) exits 0 with non-empty
+          ;; output IN THE GUEST. This is the DURABLE behavioral leg — it holds
+          ;; with no Guix oracle in the room (the tool does its job: it executes),
+          ;; unlike the differential gates that only assert td==oracle store paths.
+          ;; One guest round-trip runs all six and returns per-tool (bin present?
+          ;; exit0? out-len); the builder (srfi-1 `every`) asserts every leg. The
+          ;; command name differs from the package for ripgrep (binary `rg`).
+          (let ((ran
+                 (marionette-eval
+                  '(begin
+                     (use-modules (ice-9 popen) (ice-9 rdelim))
+                     (map (lambda (bin)
+                            (let* ((path (string-append
+                                          "/run/current-system/profile/bin/" bin))
+                                   (p (open-input-pipe
+                                       (string-append path " --version 2>&1")))
+                                   (out (read-string p))
+                                   (st (close-pipe p)))
+                              (list bin
+                                    (file-exists? path)
+                                    (eqv? 0 (status:exit-val st))
+                                    (string-length out))))
+                          '("procs" "fd" "rg" "sd" "eza" "bat")))
+                  marionette)))
+            (for-each
+             (lambda (r)
+               (format #t "    rust userland ~a: present=~a exit0=~a out-len=~a~%"
+                       (car r) (cadr r) (caddr r) (cadddr r)))
+             ran)
+            (test-assert "rust userland shipped and runs (procs/fd/rg/sd/eza/bat --version exits 0)"
+              (every (lambda (r) (and (cadr r) (caddr r) (> (cadddr r) 0))) ran)))
+
           (test-end)
           (exit (zero? (test-runner-fail-count (test-runner-current)))))))
 
