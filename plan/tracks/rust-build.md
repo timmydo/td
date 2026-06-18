@@ -1,7 +1,8 @@
 section: side
-status: claimed
+status: done
 title: rust-build
 handle: claude-fable-a00773
 date: 2026-06-17
+pr: 81
 notes: plan/rust-build.md
-summary: give td-builder its OWN Rust-from-source build path (buildSystem:"rust", a cargo phase runner mirroring autotools-build) so td builds Rust crates with no gnu-build-system and no Guix cargo-build-system — rustc/gcc seed external (§5). Proven self-hosting (td-builder builds td-builder), then vendored-deps, then a uutils tool. Durable legs: binary runs + td's own double-build; guix cargo-build-system is the removable migration oracle.
+summary: td-builder gained its OWN cargo build path (run_rust + the `rust-build` subcommand) — proven by SELF-HOSTING: td builds td-builder itself from source with no gnu-build-system / no Guix cargo-build-system in the build logic (rustc/gcc seed external, §5). Gate 330-rust-build: structural + durable behavioral (runs, agrees with guix) + durable repro (td double-build) + removable migration oracle; verified-red. Full ./check.sh green. Inc.1 of the track; vendored-deps + a uutils tool are follow-ups.
