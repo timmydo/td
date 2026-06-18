@@ -79,8 +79,10 @@ interface Source {
 }
 
 /** Build systems td knows how to lower (mirrors the bridge's dispatch). A value
- *  outside this union is a compile-time error — like `RootFsType`. v0 is `"gnu"`. */
-declare type BuildSystem = "gnu";
+ *  outside this union is a compile-time error — like `RootFsType`. `"gnu"` is the
+ *  autotools path; `"rust"` is the cargo path (`td-builder build-recipe` runs
+ *  `rust-build`, installing the recipe's `bins`) — td-builder self-hosts on it. */
+declare type BuildSystem = "gnu" | "rust";
 
 /** A part of a `string-append`/`format` replacement: a literal string, a
  *  build-time store path (`{ output: NAME }` → `(assoc-ref outputs NAME)`,
@@ -178,7 +180,11 @@ interface Phase {
 interface Recipe {
   readonly name: string;
   readonly version: string;
-  readonly source: Source;
+  /** The upstream source. Omitted only when the build supplies its own source
+   *  through the build lock instead of an upstream fetch — e.g. a `"rust"`
+   *  self-host whose source is the in-tree crate (keyed `<name>-source` in the
+   *  lock). Every `"gnu"` recipe declares it. */
+  readonly source?: Source;
   readonly buildSystem: BuildSystem;
   readonly inputs?: readonly string[];
   readonly configureFlags?: readonly string[];
@@ -186,6 +192,9 @@ interface Recipe {
   readonly outputs?: readonly string[];
   readonly phases?: readonly Phase[];
   readonly tests?: boolean;
+  /** Binaries to install into `$out/bin` — required by `buildSystem: "rust"`
+   *  (the cargo phase runner's `TD_RUST_BINS`); ignored by `"gnu"`. */
+  readonly bins?: readonly string[];
 }
 
 /** Declare an upstream source by URL (or mirror-URL list) + content hash (does

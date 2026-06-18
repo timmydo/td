@@ -38,8 +38,7 @@
   #:export (%td-build-tool-names
             td-rust-build-derivation
             td-build-components
-            write-td-build-spec
-            td-rust-selfhost-derivation))
+            write-td-build-spec))
 
 ;; The build environment: the Guix toolchain (retired last). gcc-toolchain
 ;; bundles gcc + glibc + binutils + ld-wrapper with the bin/include/lib layout
@@ -161,57 +160,9 @@ rather than Guile-resolved input-derivations."
     (for-each (lambda (kv) (format port "env ~a=~a~%" (car kv) (cdr kv)))
               (assq-ref c 'env))))
 
-;;;
-;;; rust-build — td's OWN cargo build path (the cargo-build-system replacement),
-;;; proven by SELF-HOSTING: build td-builder ITSELF with td's `rust-build` runner
-;;; (builder/src/build.rs `run_rust`). The build LOGIC is td's Rust — no
-;;; gnu-build-system, no Guix cargo-build-system in the build — and the rustc/
-;;; cargo/gcc seed stays EXTERNAL (§5, retired last), exactly as the autotools
-;;; path keeps gcc-toolchain external. The SAME %builder-source the
-;;; cargo-build-system `td-builder` package uses is built here a SECOND way, so
-;;; one source lowers two ways: the durable legs (the output runs; td-builder
-;;; check's double-build agrees it is reproducible) are what we keep; guix's
-;;; cargo-build-system build is the removable migration oracle (it legitimately
-;;; lands at a DIFFERENT path — different flags — so equivalence is BEHAVIORAL).
-;;;
-
-;; The Rust build seed: rust supplies rustc (its `out`) + cargo (its `cargo`
-;; output); gcc-toolchain is the linker (Guix's ld-wrapper → RUNPATH) + libc;
-;; coreutils/bash are the shell tools `run_rust` invokes (cp/chmod, run_cmd's
-;; bash). Retired LAST (§5), same posture as %td-build-tool-names.
-(define %td-rust-seed-names '("gcc-toolchain" "coreutils" "bash"))
-
-(define (td-rust-selfhost-derivation store)
-  "Return a derivation that builds td-builder from %builder-source via td's OWN
-`rust-build` runner.  Its builder is the guix-built td-builder binary (the
-bootstrap builder); its output is a td-built td-builder.  Input RESOLUTION (the
-rust seed) stays Guix's, retired last (§5)."
-  (let* (;; %builder-source is a local-file — it lowers to an interned store PATH
-         ;; (added directly, not built), so it is an input-SOURCE, not an
-         ;; input-derivation (cf. the url-fetch ORIGIN in td-build-components,
-         ;; which DOES lower to a fixed-output derivation).
-         (src-path  (run-with-store store (lower-object %builder-source)))
-         (tb-drv    (package-derivation store td-builder #:graft? #f))
-         (builder   (string-append (derivation->output-path tb-drv) "/bin/td-builder"))
-         (rust-drv  (package-derivation store (specification->package "rust") #:graft? #f))
-         (rustc-out (derivation->output-path rust-drv "out"))
-         (cargo-out (derivation->output-path rust-drv "cargo"))
-         (seed-drvs (map (lambda (s)
-                           (package-derivation store (specification->package s) #:graft? #f))
-                         %td-rust-seed-names))
-         (seed-outs (map derivation->output-path seed-drvs))
-         (inputs    (string-join (append (list rustc-out cargo-out) seed-outs) ":")))
-    (derivation store (string-append "td-builder-rust-" (package-version td-builder))
-                builder (list "rust-build")
-                #:inputs (cons* (derivation-input tb-drv '("out"))
-                                ;; rust contributes BOTH outputs: rustc (out) + cargo.
-                                ;; Sub-derivation outputs MUST be in canonical SORTED
-                                ;; order ("cargo" < "out") or the daemon recomputes a
-                                ;; different drv hash and rejects it ("incorrect output").
-                                (derivation-input rust-drv '("cargo" "out"))
-                                (map (lambda (d) (derivation-input d '("out"))) seed-drvs))
-                #:sources (list src-path)
-                #:env-vars `(("TD_SRC"       . ,src-path)
-                             ("TD_INPUTS"    . ,inputs)
-                             ("TD_RUST_BINS" . "td-builder"))
-                #:system "x86_64-linux")))
+;; The Rust self-host (td-builder building td-builder via its OWN `rust-build`
+;; cargo runner) no longer lowers through a Guile `(derivation …)` here: it is
+;; routed onto the `td-builder build-recipe` rail (buildSystem "rust") — the .drv
+;; is assembled by td (store::assemble_drv) and realized daemon-free (realize_drv),
+;; off Guile-construction and the daemon. See mk/gates/330-rust-build.mk +
+;; tests/ts/recipe-td-builder.ts. The rustc/cargo/gcc seed stays external (§5).
