@@ -46,9 +46,27 @@ self-host through `build-recipe`.
 2. [x] `build_recipe` buildSystem dispatch (cargo check clean)
 3. [x] td-spec.d.ts + recipe-td-builder.ts + lock + source helper
 4. [x] gate 330 rewritten; delete the Guile path
-5. [ ] `./check.sh rust-build` green
-6. [ ] verified-red on the new gate
-7. [ ] full `./check.sh` green; sub-agent review; ready + auto-merge
+5. [x] `./check.sh rust-build` green — all four legs pass (structural off-PATH,
+       durable behavioral runs+agrees, durable repro double-build, migration oracle)
+6. [x] verified-red on the new gate
+7. [ ] full `./check.sh` green; review; ready + auto-merge
 
 ## Verified-red evidence
-(to fill: break buildSystem dispatch / the off-PATH structural leg, watch red)
+- GREEN: `./check.sh rust-build` → td assembled + realized the .drv with guix/Guile
+  off PATH (/gnu/store/j2z7wcg…-td-builder-0.1.0); nar-hash sha256:4a4cff56… runs +
+  agrees with the guix-built builder; td-builder check double-build reproducible;
+  distinct from guix's cargo-build-system td-builder (/gnu/store/9iclrqx…).
+- RED (teeth): with the buildSystem dispatch broken (`"rust" => "autotools-build"`
+  in build_recipe), the gate FAILS (CHECK_EXIT=2): `autotools-build: tar not found
+  in TD_INPUTS` → builder failed. Proves the buildSystem:"rust"→rust-build dispatch
+  is load-bearing (the recipe's build system actually selects the phase runner), and
+  that the rail runs even there: "build-recipe assembled …drv (no guix (derivation),
+  no Guile)" + "realize computed the input closure ITSELF — 58 paths … no daemon".
+  Reverted → green.
+
+## Census interaction (surfaced for the PR)
+The self-host recipe has NO `specification->package` oracle (td-builder is td's own
+program, not a guix corpus package). tests/guix-dependence.scm now excludes it from
+the CORPUS census (new `self-host-specs`); owned-recipes count (18) + the report stay
+byte-identical, so the .expected snapshot does not move. The rust-build gate is the
+self-host's own reproducibility proof.
