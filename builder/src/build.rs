@@ -19,7 +19,9 @@
 //!   out                output prefix (the daemon sets this)
 //!   TD_SRC             the source tarball (a fixed-output url-fetch)
 //!   TD_INPUTS          ':'-joined store paths of the build inputs
-//!   TD_CONFIGURE_FLAGS extra ./configure flags (space-separated; may be empty)
+//!   TD_CONFIGURE_FLAGS extra ./configure flags as a JSON array of strings (may be
+//!                      empty/absent); each element is ONE argument, so a flag may
+//!                      carry internal whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`)
 //!   TD_PHASES          the recipe's custom build PHASES as JSON (may be empty) —
 //!                      td's own interpreter (below) applies them after unpack,
 //!                      the way gnu-build-system runs a recipe's `#:phases`. This
@@ -42,6 +44,85 @@ fn find_in_path(path: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// patch-source-shebangs (in Rust) — gnu-build-system rewrites `#!/bin/sh` (and
+/// friends) across the unpacked tree to a real interpreter, because the pure
+/// build sandbox has no /bin/sh. td does the same: any file whose shebang names
+/// an absolute `sh`/`bash` NOT already under /gnu/store is rewritten to the seed
+/// bash (sh-compatible). This is what lets a package's OWN build scripts execute
+/// in the sandbox — e.g. gawk's `build-aux/install-sh`, run directly by its
+/// install rule, whose `#!/bin/sh` would otherwise fail with "required file not
+/// found". Deterministic (the bash path is pinned), so it stays reproducible.
+fn patch_shebangs(dir: &Path, bash: &str) -> Result<(), String> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let rd = match fs::read_dir(&d) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in rd {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let ft = entry.file_type().map_err(|e| e.to_string())?;
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                patch_one_shebang(&entry.path(), bash)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite one file's shebang iff it names an absolute sh/bash outside the store.
+/// Peeks two bytes first, so non-scripts (incl. big binaries) are not slurped.
+fn patch_one_shebang(path: &Path, bash: &str) -> Result<(), String> {
+    use std::io::Read;
+    let mut head = [0u8; 2];
+    match fs::File::open(path).and_then(|mut f| f.read(&mut head)) {
+        Ok(2) if &head == b"#!" => {}
+        _ => return Ok(()), // unreadable, empty, or not a script — leave it
+    }
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let nl = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+    let line = match std::str::from_utf8(&bytes[..nl]) {
+        Ok(s) => s,
+        Err(_) => return Ok(()), // binary first line — skip
+    };
+    // "#!  /bin/sh -e"  ->  interp="/bin/sh", trailing=" -e"
+    let after = line[2..].trim_start();
+    let mut it = after.splitn(2, char::is_whitespace);
+    let interp = it.next().unwrap_or("");
+    let trailing = it.next().map(|s| format!(" {s}")).unwrap_or_default();
+    if !interp.starts_with('/') || interp.starts_with("/gnu/store/") {
+        return Ok(()); // relative, or already a store interpreter
+    }
+    match interp.rsplit('/').next() {
+        Some("sh") | Some("bash") => {} // only the toolchain shell
+        _ => return Ok(()),
+    }
+    // Preserve the file's timestamps across the rewrite: autotools' generated
+    // files (configure, aclocal.m4, Makefile.in) are shipped NEWER than their
+    // sources so `make` does NOT try a maintainer-mode regeneration. Bumping an
+    // mtime to "now" inverts that order and make then runs aclocal/autoconf —
+    // absent from the seed — failing with exit 127 (coreutils hit this). A
+    // shebang fix must be invisible to make's timestamp dependency graph.
+    let times = fs::metadata(path).ok();
+    // File::create truncates but keeps the existing mode (exec bit survives).
+    let mut out = format!("#!{bash}{trailing}").into_bytes();
+    out.extend_from_slice(&bytes[nl..]);
+    fs::write(path, &out).map_err(|e| format!("patch-shebang {}: {e}", path.display()))?;
+    if let Some(meta) = times {
+        if let (Ok(accessed), Ok(modified)) = (meta.accessed(), meta.modified()) {
+            if let Ok(f) = fs::File::options().write(true).open(path) {
+                let _ = f.set_times(fs::FileTimes::new().set_accessed(accessed).set_modified(modified));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The single sub-directory of `dir` (an unpacked source tree). Errors unless
@@ -337,7 +418,21 @@ pub fn run() -> Result<(), String> {
     let out = env::var("out").map_err(|_| "out not set".to_string())?;
     let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
     let inputs = env::var("TD_INPUTS").unwrap_or_default();
-    let configure_flags = env::var("TD_CONFIGURE_FLAGS").unwrap_or_default();
+    // TD_CONFIGURE_FLAGS is a JSON array of strings (may be empty/absent); each
+    // element is ONE ./configure argument so flags with internal whitespace (e.g.
+    // `CFLAGS=-O2 -g -Wno-incompatible-pointer-types`) survive intact.
+    let configure_flags_json = env::var("TD_CONFIGURE_FLAGS").unwrap_or_default();
+    let configure_flags: Vec<String> = if configure_flags_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        crate::json::parse(&configure_flags_json)
+            .map_err(|e| format!("TD_CONFIGURE_FLAGS JSON: {e}"))?
+            .as_arr()
+            .ok_or("TD_CONFIGURE_FLAGS is not a JSON array")?
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect()
+    };
 
     // set-paths phase (in Rust): derive PATH / C_INCLUDE_PATH /
     // CPLUS_INCLUDE_PATH / LIBRARY_PATH from the inputs' bin/include/lib dirs.
@@ -386,6 +481,11 @@ pub fn run() -> Result<(), String> {
     run_cmd(&tar, &["xf", &src], ".", &envs)?;
     let srcdir = single_subdir(".")?;
 
+    // patch-source-shebangs — rewrite `#!/bin/sh` build scripts to the seed bash
+    // (no /bin/sh in the sandbox), the way gnu-build-system does, before anything
+    // runs them.
+    patch_shebangs(Path::new(&srcdir), &bash)?;
+
     // The recipe's custom PHASES (td's own runner) — gnu-build-system applies
     // these via Guile `#:phases`; here td applies them in Rust, after unpack.
     apply_phases(&srcdir, &path, &envs)?;
@@ -393,7 +493,7 @@ pub fn run() -> Result<(), String> {
     // configure --prefix=$out [extra flags].
     let prefix = format!("--prefix={out}");
     let mut conf: Vec<&str> = vec!["./configure", &prefix];
-    conf.extend(configure_flags.split_whitespace());
+    conf.extend(configure_flags.iter().map(String::as_str));
     run_cmd(&bash, &conf, &srcdir, &envs)?;
 
     // build + install. Pass SHELL=<bash> as a make OVERRIDE (not just env): make
@@ -404,4 +504,58 @@ pub fn run() -> Result<(), String> {
     run_cmd(&make, &[&shell], &srcdir, &envs)?;
     run_cmd(&make, &[&shell, "install"], &srcdir, &envs)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn patch_shebangs_rewrites_only_bin_sh_bash_keeping_exec_and_args() {
+        let base = std::env::temp_dir().join(format!("td-shebang-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        let bash = "/gnu/store/zzz-bash-5.2.37/bin/bash";
+
+        // `#!/bin/sh -e` with the exec bit: rewritten to the seed bash, keeping
+        // the trailing args AND the exec bit (install-sh is run as a program).
+        let sh = base.join("install-sh");
+        fs::write(&sh, b"#!/bin/sh -e\necho install\n").unwrap();
+        fs::set_permissions(&sh, fs::Permissions::from_mode(0o755)).unwrap();
+        // Pin an OLD mtime: the rewrite must preserve it (else autotools sees
+        // generated files as stale and runs aclocal — absent — failing 127).
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&sh)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(old).set_modified(old))
+            .unwrap();
+        // `#! /bin/bash` (leading space) -> rewritten.
+        let bsh = base.join("sub/cfg");
+        fs::write(&bsh, b"#! /bin/bash\nexit 0\n").unwrap();
+        // already a store interpreter -> untouched.
+        let store = base.join("already");
+        let store_orig = format!("#!{bash}\nx\n");
+        fs::write(&store, store_orig.as_bytes()).unwrap();
+        // a non-shell interpreter -> untouched.
+        let perl = base.join("p.pl");
+        fs::write(&perl, b"#!/usr/bin/perl\nprint 1;\n").unwrap();
+        // not a script -> untouched (and not slurped as text).
+        let data = base.join("data");
+        fs::write(&data, b"\x7fELF\x00bytes").unwrap();
+
+        patch_shebangs(&base, bash).unwrap();
+
+        assert_eq!(fs::read_to_string(&sh).unwrap(), format!("#!{bash} -e\necho install\n"));
+        assert_eq!(fs::metadata(&sh).unwrap().permissions().mode() & 0o111, 0o111);
+        assert_eq!(fs::metadata(&sh).unwrap().modified().unwrap(), old, "mtime preserved");
+        assert_eq!(fs::read_to_string(&bsh).unwrap(), format!("#!{bash}\nexit 0\n"));
+        assert_eq!(fs::read_to_string(&store).unwrap(), store_orig);
+        assert_eq!(fs::read_to_string(&perl).unwrap(), "#!/usr/bin/perl\nprint 1;\n");
+        assert_eq!(fs::read(&data).unwrap(), b"\x7fELF\x00bytes");
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

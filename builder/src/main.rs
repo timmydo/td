@@ -359,9 +359,12 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
     let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
     let version = alist.get("version").and_then(json::Json::as_str).ok_or("recipe: no version")?;
     let full = format!("{name}-{version}");
-    // configure flags (optional) -> space-joined; phases (optional) -> JSON string.
-    let cflags = match alist.get("configureFlags").and_then(json::Json::as_arr) {
-        Some(a) => a.iter().filter_map(json::Json::as_str).collect::<Vec<_>>().join(" "),
+    // configure flags + phases (both optional) -> JSON array string. A configure
+    // flag may itself contain whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`), so the
+    // list is carried as JSON — each element stays ONE ./configure argument — the
+    // same drv-safe encoding TD_PHASES uses. (Space-joining shattered such flags.)
+    let cflags = match alist.get("configureFlags") {
+        Some(c) => c.to_json_string(),
         None => String::new(),
     };
     let phases = match alist.get("phases") {

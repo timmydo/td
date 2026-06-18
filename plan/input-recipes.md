@@ -464,3 +464,30 @@ configure. Proves the find_files fix is load-bearing for gettext's build (and th
 the gate's durable behavioral leg). A hermetic Rust unit test is impractical
 (find_files shells out to find/grep, absent in the cargo-test toolchain), so the
 gettext own-builder build IS the regression guard. Fixed; build completes + tools run.
+
+## Lever 4 batch 2: 6 more toolchain leaves via td's own builder (branch lever4-toolchain-batch2)
+
+Reconstructed xz, diffutils, patch, file, coreutils, gawk as td recipes built via
+`td-builder build-recipe`; toolchain-no-guix (222) now covers 9 leaves
+(make/sed/grep + these 6). Census re-baselined: owned 9→15, shipped-system
+td-reproducible 5→11 (0.36%→0.78%). Two builder capabilities this needed:
+
+- configureFlags now travel as a JSON array (each element = one ./configure arg),
+  so a flag with internal whitespace survives the drv round-trip (same encoding as
+  TD_PHASES). gawk needs `CFLAGS=-O2 -g -Wno-incompatible-pointer-types` for the
+  seed's gcc-15.
+- patch-source-shebangs (in Rust), mtime-PRESERVING: rewrite `#!/bin/sh` build
+  scripts to the seed bash (the #67 notes guessed this; gawk's build-aux/install-sh,
+  run directly by its install rule, is the case that finally needs it). Preserving
+  mtime is load-bearing — see R-red below.
+
+Verified-red (all observed before the green):
+- gawk, no CFLAGS: io.c `(ssize_t(*)())read` cast → gcc-15 -Wincompatible-pointer-types
+  hard error, build exit 1. Proves the configureFlags-whitespace fix is load-bearing.
+- gawk, with CFLAGS but no patch-shebangs: build-aux/install-sh `#!/bin/sh` → "required
+  file not found", install exit 127. Proves patch-shebangs is load-bearing.
+- coreutils, naive patch-shebangs (mtime bumped to now): aclocal.m4 seen stale →
+  maintainer-mode rebuild → `aclocal-1.16: command not found`, make exit 127
+  (fullcheck run 1). Proves the mtime-PRESERVATION is load-bearing. Plus a Rust unit
+  test (build::tests) asserting the rewrite touches only abs sh/bash outside the
+  store, keeps the exec bit + trailing args, and preserves mtime.
