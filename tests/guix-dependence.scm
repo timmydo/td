@@ -7,7 +7,8 @@
 ;; it builds via `td-builder build-recipe` (behaviorally + reproducibly, no guix/Guile
 ;; in the build path): corpus-no-guix for the corpus packages, toolchain-no-guix for
 ;; the reconstructed toolchain leaves (make/sed/grep/xz/diffutils/patch/file/
-;; coreutils/gawk/tar/findutils/bash — lever 4). The byte-identity
+;; coreutils/gawk/tar/findutils/bash), corpus-deps-no-guix for the library deps
+;; (libsigsegv/libunistring/pcre2 — lever 4). The byte-identity
 ;; `corpus-*` gates that used to ground this were RETIRED when system/td-recipe.scm was
 ;; dropped (move-off-Guile §5: own, then diverge — the own-builder path is all-durable,
 ;; no Guix byte-identity oracle). (The census grounds ownership on the recipe files and
