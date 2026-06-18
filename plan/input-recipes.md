@@ -491,3 +491,24 @@ Verified-red (all observed before the green):
   (fullcheck run 1). Proves the mtime-PRESERVATION is load-bearing. Plus a Rust unit
   test (build::tests) asserting the rewrite touches only abs sh/bash outside the
   store, keeps the exec bit + trailing args, and preserves mtime.
+
+## Lever 4 batch 3: tar, findutils, bash — the snippet/patch-source leaves (branch lever4-toolchain-batch3, PR pending)
+
+toolchain-no-guix (222) now covers 12 leaves (+ tar, findutils, bash). These
+three carry a guix source snippet (and bash's 37 upstream patches), so their
+guix origin lowers to a patch-and-repacked .tar.zst, not the raw upstream
+tarball — bash's "5.2.37" exists ONLY in the repack (bash-5.2.tar.gz is 5.2.0).
+td uses that exact guix-prepared source from the pinned lock (faithful) and the
+seed `tar` unpacks .tar.zst by auto-detecting the pinned `zstd` build input. No
+builder change needed — batch 2's configureFlags + patch-shebangs suffice. bash
+also pins readline + ncurses. Census re-baselined: owned 15→18, shipped-system
+td-reproducible 11→14 (0.78%→1.00%).
+
+Verified-red:
+- bash, no CFLAGS: mkbuiltins.c K&R `xmalloc()` calls → gcc-15 C23 "too many
+  arguments to function 'xmalloc'; expected 0, have 1", build exit 1. Proves the
+  `CFLAGS=-O2 -g -std=gnu17` (restores K&R unspecified-args) is load-bearing —
+  another whitespace-bearing configureFlags consumer.
+
+Still deferred: bzip2 — non-autotools (custom Makefile, no ./configure). Needs a
+make-only build path in td's builder; its own PR.

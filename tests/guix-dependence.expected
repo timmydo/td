@@ -7,6 +7,6 @@
 # Build closure = the derivation prerequisite graph (lowering only, no build).
 # Deterministic given the pinned channel; a pin bump re-baselines this snapshot.
 pin: 520785e315eddbe47199ac557e88e60eca3ae97c
-owned-recipes (15): coreutils diffutils file gawk gettext-minimal grep gzip hello libatomic-ops make nano patch popt sed xz
-corpus-union: td-reproducible 15 / 316 (4.75%) [coreutils diffutils file gawk gettext-minimal grep gzip hello libatomic-ops make nano patch popt sed xz]
-shipped-system: td-reproducible 11 / 1405 (0.78%) [coreutils diffutils file gawk gettext-minimal grep gzip nano patch sed xz]
+owned-recipes (18): bash coreutils diffutils file findutils gawk gettext-minimal grep gzip hello libatomic-ops make nano patch popt sed tar xz
+corpus-union: td-reproducible 18 / 320 (5.63%) [bash coreutils diffutils file findutils gawk gettext-minimal grep gzip hello libatomic-ops make nano patch popt sed tar xz]
+shipped-system: td-reproducible 14 / 1405 (1.00%) [bash coreutils diffutils file findutils gawk gettext-minimal grep gzip nano patch sed tar xz]

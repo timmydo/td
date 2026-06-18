@@ -1,12 +1,15 @@
 # toolchain-no-guix — td builds its toolchain's LEAF tools with its OWN builder
 # (DESIGN §7.1 move-off-Guile §5, lever 4: retire the Guix toolchain
 # package-by-package, leaves first). The build environment's non-compiler tools —
-# make, sed, grep, xz, diffutils, patch, file, coreutils, gawk — come today from
-# guix packages (specification->package); this reconstructs each as a td recipe
-# (tests/ts/recipe-<t>.ts) built via `td-builder build-recipe`, so they are
-# td-built, not guix-resolved. make is built guile-free (one fewer Guile dep);
-# gawk needs -Wno-incompatible-pointer-types for the seed's gcc-15, carried as a
-# whitespace-bearing CFLAGS through the recipe DSL's JSON-encoded configureFlags.
+# make, sed, grep, xz, diffutils, patch, file, coreutils, gawk, tar, findutils,
+# bash — come today from guix packages (specification->package); this
+# reconstructs each as a td recipe (tests/ts/recipe-<t>.ts) built via `td-builder
+# build-recipe`, so they are td-built, not guix-resolved. make is built guile-free
+# (one fewer Guile dep); gawk/bash need a gcc-15/C23 CFLAGS workaround
+# (-Wno-incompatible-pointer-types / -std=gnu17), carried as a whitespace-bearing
+# CFLAGS through the recipe DSL's JSON-encoded configureFlags. tar/findutils/bash
+# carry a guix source snippet (and bash's 37 patches), so their source is guix's
+# patch-and-repacked .tar.zst, which the seed `tar` unpacks via the pinned `zstd`.
 # The irreducible compiler seed (gcc-toolchain/glibc/binutils) stays external
 # (§5, retired last). Per tool: STRUCTURAL (built with guix/Guile off PATH),
 # DURABLE behavioral (the tool runs --version), DURABLE reproducibility (td-builder
@@ -14,7 +17,7 @@
 # own, then diverge). Locks are the guix-built seed.
 HEAVY_GATES += toolchain-no-guix
 toolchain-no-guix:
-	@echo ">> toolchain-no-guix: td builds make + sed + grep + xz + diffutils + patch + file + coreutils + gawk via build-recipe (no guix/Guile in the build path); each runs, reproducible, distinct from guix; gcc/glibc/binutils seed stays external (§5)"
+	@echo ">> toolchain-no-guix: td builds make + sed + grep + xz + diffutils + patch + file + coreutils + gawk + tar + findutils + bash via build-recipe (no guix/Guile in the build path); each runs, reproducible, distinct from guix; gcc/glibc/binutils seed stays external (§5)"
 	@set -euo pipefail; \
 	node=`$(GUIX) build node`/bin/node; \
 	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
@@ -27,7 +30,7 @@ toolchain-no-guix:
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 	scratch="$(CURDIR)/.toolchain-no-guix-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
-	for spec in make sed grep xz diffutils patch file coreutils gawk; do \
+	for spec in make sed grep xz diffutils patch file coreutils gawk tar findutils bash; do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \
 	  test -s "$$lock" || { echo "ERROR: no lock $$lock" >&2; exit 1; }; \
@@ -49,6 +52,9 @@ toolchain-no-guix:
 	    file)      bin=file;  nver="file-5.46" ;; \
 	    coreutils) bin=ls;    nver="(GNU coreutils) 9.1" ;; \
 	    gawk)      bin=gawk;  nver="GNU Awk 5.3.0" ;; \
+	    tar)       bin=tar;   nver="(GNU tar) 1.35" ;; \
+	    findutils) bin=find;  nver="(GNU findutils) 4.10.0" ;; \
+	    bash)      bin=bash;  nver="GNU bash, version 5.2.37" ;; \
 	    *) echo "FAIL: no behavioral check defined for $$spec" >&2; exit 1 ;; \
 	  esac; \
 	  LD_LIBRARY_PATH="$$L" "$$ns/bin/$$bin" --version | grep -q "$$nver" || { echo "FAIL: $$spec ($$bin --version lacks '$$nver')" >&2; exit 1; }; \
@@ -61,4 +67,4 @@ toolchain-no-guix:
 	  chmod -R u+w "$$sd" 2>/dev/null || true; rm -rf "$$sd"; \
 	done; \
 	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; \
-	echo "PASS: td built its toolchain leaf tools — make (guile-free), sed, grep, xz, diffutils, patch, file, coreutils, gawk — via td-builder build-recipe, every input resolved from a pinned lock (no specification->package), the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; each runs --version (durable), is reproducible by td's own double-build (durable), and lands at a distinct store path from guix's build (own, then diverge). The compiler seed (gcc-toolchain/glibc/binutils) stays external (§5, retired last)."
+	echo "PASS: td built its toolchain leaf tools — make (guile-free), sed, grep, xz, diffutils, patch, file, coreutils, gawk, tar, findutils, bash — via td-builder build-recipe, every input resolved from a pinned lock (no specification->package), the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; each runs --version (durable), is reproducible by td's own double-build (durable), and lands at a distinct store path from guix's build (own, then diverge). The compiler seed (gcc-toolchain/glibc/binutils) stays external (§5, retired last)."
