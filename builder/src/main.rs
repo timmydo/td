@@ -352,13 +352,25 @@ fn self_store_path() -> Result<String, String> {
 /// `<name>-source`, the td-builder builder is the running binary, every other lock
 /// entry is a build input — assembles the `.drv` itself (store::assemble_drv, the
 /// inputs as input-SOURCES), and realizes it (realize_drv over STORE-DB). The
-/// toolchain + lock are the guix-built SEED (§5, retired last); nothing in nano's
-/// build path is guix/Guile. Usage: build-recipe RECIPE-JSON LOCK SCRATCH STORE-DB
+/// toolchain + lock are the guix-built SEED (§5, retired last); nothing in the
+/// build path is guix/Guile. The recipe's `buildSystem` selects the phase runner —
+/// `"gnu"` → `autotools-build` (configureFlags/phases), `"rust"` → `rust-build`
+/// (cargo; installs the recipe's `bins`). Usage: build-recipe RECIPE-JSON LOCK
+/// SCRATCH STORE-DB
 fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &str) -> Result<Vec<OutputReg>, String> {
     let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
     let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
     let version = alist.get("version").and_then(json::Json::as_str).ok_or("recipe: no version")?;
     let full = format!("{name}-{version}");
+    // The build system selects the td-builder phase runner. "gnu" (default) is the
+    // autotools path; "rust" is the cargo path (build::run_rust), used to SELF-HOST
+    // td-builder itself off Guile-construction + the daemon.
+    let build_system = alist.get("buildSystem").and_then(json::Json::as_str).unwrap_or("gnu");
+    let phase_runner = match build_system {
+        "gnu" => "autotools-build",
+        "rust" => "rust-build",
+        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust)")),
+    };
     // configure flags + phases (both optional) -> JSON array string. A configure
     // flag may itself contain whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`), so the
     // list is carried as JSON — each element stays ONE ./configure argument — the
@@ -401,7 +413,7 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
     spec.push_str(&format!("name {full}\n"));
     spec.push_str("system x86_64-linux\n");
     spec.push_str(&format!("builder {builder}\n"));
-    spec.push_str("arg autotools-build\n");
+    spec.push_str(&format!("arg {phase_runner}\n"));
     spec.push_str(&format!("input-src {source}\n"));
     spec.push_str(&format!("input-src {builder_store}\n"));
     for p in &inputs {
@@ -409,8 +421,26 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
     }
     spec.push_str(&format!("env TD_SRC={source}\n"));
     spec.push_str(&format!("env TD_INPUTS={}\n", inputs.join(":")));
-    spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
-    spec.push_str(&format!("env TD_PHASES={phases}\n"));
+    match build_system {
+        // gnu: the autotools phase runner reads the configure flags + custom phases.
+        "gnu" => {
+            spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
+            spec.push_str(&format!("env TD_PHASES={phases}\n"));
+        }
+        // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS).
+        "rust" => {
+            let bins: Vec<&str> = alist
+                .get("bins")
+                .and_then(json::Json::as_arr)
+                .map(|a| a.iter().filter_map(json::Json::as_str).collect())
+                .unwrap_or_default();
+            if bins.is_empty() {
+                return Err("recipe: buildSystem \"rust\" requires a non-empty `bins'".into());
+            }
+            spec.push_str(&format!("env TD_RUST_BINS={}\n", bins.join(" ")));
+        }
+        _ => unreachable!("buildSystem already validated"),
+    }
     // td assembles the .drv (pure Rust, no guix (derivation …), no daemon).
     let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
     let (drv_path, content) = store::assemble_drv(&spec, &read)?;
