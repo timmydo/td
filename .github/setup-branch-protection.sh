@@ -2,12 +2,12 @@
 # Apply the main-branch protection ruleset for td (DESIGN §7.2: PR-gated
 # landings). Run by a repo admin with an authenticated `gh` (gh auth login).
 #
-#   ./.github/setup-branch-protection.sh [--require-runner-check]
+#   ./.github/setup-branch-protection.sh
 #
-# By default only the GitHub-hosted `lint` job is a REQUIRED status check.
-# Pass --require-runner-check once the td-ci-fast store image is published to
-# GHCR (ci/build-ci-image.sh) and one PR has shown a green `check-fast` — do NOT
-# pass it before then: a required check that cannot pass blocks every PR forever.
+# Both GitHub-hosted jobs are REQUIRED status checks: `lint` and `check-fast`.
+# The td-ci-fast store image is published to GHCR (ci/build-ci-image.sh) and
+# `check-fast` has been green on recent PRs, so it is now mandatory — a PR is
+# not mergeable until it passes.
 # (Since #26 CI runs the FAST tier only — `./check.sh check-fast`. The full
 # hermetic loop is the dev-machine gate, DESIGN §7.2 step 2, plus the image
 # pipeline's validate job; it is NOT a per-PR status check, so this requires the
@@ -15,7 +15,8 @@
 #
 # What the ruleset enforces on main:
 #   - no direct pushes: changes land only via pull request;
-#   - 1 approving review, stale approvals dismissed on new pushes;
+#   - 1 approving review, NOT dismissed on new pushes (so the bot's rebases /
+#     force-pushes don't drop the human approval — #82, dismiss_stale=false);
 #   - required status checks (strict: branch must be current with main);
 #   - linear history (rebase/squash merges only — matches the repo's
 #     fast-forward convention);
@@ -31,10 +32,7 @@
 set -eu
 
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-checks='{"context": "lint"}'
-if [ "${1:-}" = "--require-runner-check" ]; then
-  checks='{"context": "lint"}, {"context": "check-fast"}'
-fi
+checks='{"context": "lint"}, {"context": "check-fast"}'
 
 # Prefer rebase/squash merges; merge commits would break the linear-history
 # rule below.
@@ -70,7 +68,7 @@ gh api -X "$method" "$path" --input - <<EOF >/dev/null
       "type": "pull_request",
       "parameters": {
         "required_approving_review_count": 1,
-        "dismiss_stale_reviews_on_push": true,
+        "dismiss_stale_reviews_on_push": false,
         "require_code_owner_review": false,
         "require_last_push_approval": false,
         "required_review_thread_resolution": false,
@@ -88,6 +86,5 @@ gh api -X "$method" "$path" --input - <<EOF >/dev/null
   "bypass_actors": []
 }
 EOF
-echo "ruleset 'protect-main' applied ($method): PRs only, 1 review, required checks: lint${existing:+ (replaced previous)}"
-[ "${1:-}" = "--require-runner-check" ] && echo "  + required check: check-fast (./check.sh check-fast via the td-ci-fast store image)"
+echo "ruleset 'protect-main' applied ($method): PRs only, 1 review (not dismissed on push), required checks: lint + check-fast${existing:+ (replaced previous)}"
 exit 0

@@ -34,7 +34,7 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
    every PR deadlocks. Agents authenticate as the machine account (its SSH
    key for pushes; `gh auth login` as it on the dev box for opening PRs:
    `guix shell gh -- gh auth login`); your account reviews and approves.
-3. **Apply the gate** (lint required, runner check not yet) with an admin
+3. **Apply the gate** (lint + check-fast required) with an admin
    `gh auth`:
 
        ./.github/setup-branch-protection.sh
@@ -56,14 +56,13 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
    `ghcr.io/timmydo-bot/td-ci:<pin>` and `:latest`). After the FIRST push, make
    the package public once — GHCR UI ("td-ci" package → settings →
    visibility) — so the workflow pulls it anonymously.
-5. **Make the runner check mandatory** once one PR has shown a green
-   `check-fast` (the fast tier, against the published `td-ci-fast` image):
-
-       ./.github/setup-branch-protection.sh --require-runner-check
-
-   (Doing this before the image exists blocks every PR on a check that
-   cannot pass. This requires the `check-fast` context — not `check`, which
-   #26 removed as a per-PR job.)
+5. **The runner check is mandatory.** As of 2026-06-18 the `td-ci-fast` image
+   is published and `check-fast` has been green on recent PRs, so
+   `setup-branch-protection.sh` requires it by default (step 3) — there is no
+   longer a separate opt-in flag. Only make `check-fast` required while the
+   image exists and the job is passing: requiring a check that cannot pass
+   blocks every PR. (This requires the `check-fast` context — not `check`,
+   which #26 removed as a per-PR job.)
 
 ## CI store image (how the hosted runner runs guix)
 
