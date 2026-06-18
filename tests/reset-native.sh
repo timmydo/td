@@ -4,19 +4,23 @@
 # marionette test, with NO Guile in the guest and NO (gnu tests)/marionette.
 # Three boots of a NON-volatile qcow2 ($1) on explicit CoW overlays over the
 # read-only backing image (so /gnu/store is never written):
-#   boot 1, overlay A : guest dirties state (/home/tester/td-dirt) and syncs it.
+#   boot 1, overlay A : guest dirties state (/root/td-dirt, as root) and syncs it.
 #   boot 2, overlay A : NO reset — the dirt MUST persist (committed negative
 #                       control: proves writes genuinely land, so boot 3's
 #                       cleanliness is a property of the RESET, not write-loss).
 #   boot 3, overlay B : the reset under test — fresh overlay, same backing image,
 #                       state MUST be pristine (dirt gone).
-# Dirt lives in the test user's home (ssh logs in as the non-root test user); it
-# is on the persistent root, so the overlay swap is what makes it vanish. All
-# legs DURABLE (no Guix oracle). Verified-red: see plan/ts-frontend.md.
+# Dirt lives on the persistent root fs, so the overlay swap is what makes it
+# vanish. All legs DURABLE (no Guix oracle). Verified-red: see plan/ts-frontend.md.
 set -eu
 
 IMAGE="${1:?usage: reset-native.sh NONVOLATILE-QCOW2}"
-DIRT="/home/tester/td-dirt"
+# Log in as root (the reset image authorizes the test key for root): the guix root
+# fs is ≈full and only root may use ext4's reserved blocks for the tiny dirt write
+# — the same reason the marionette test ran in-guest as root. /root persists on the
+# overlay just like any root-fs path.
+VM_USER=root
+DIRT="/root/td-dirt"
 
 VM_MEM=512
 VM_WORK="$(mktemp -d)"

@@ -11,13 +11,35 @@
 (use-modules (guix)
              (guix gexp)
              (gnu image)
+             (gnu system)
+             (gnu services)
+             (gnu services ssh)
              (gnu system image)
              (tests boot))             ;%test-os
+
+;; The reset test writes a tiny dirt file and checks its persistence/absence. The
+;; guix root fs is sized tight (≈full); a NON-root user hits ENOSPC, but root can
+;; use ext4's reserved blocks — exactly what the marionette test relied on (it
+;; ran in-guest as root). So this TEST image authorizes the committed test key for
+;; ROOT and permits key-only root login (overriding %test-os's M3 hardening — this
+;; image tests CoW ephemerality, not ssh hardening, and is never shipped). The
+;; native harness then logs in as root, as the marionette did.
+(define %reset-os
+  (operating-system
+    (inherit %test-os)
+    (services
+     (modify-services (operating-system-user-services %test-os)
+       (openssh-service-type config =>
+         (openssh-configuration
+          (inherit config)
+          (permit-root-login 'prohibit-password)
+          (authorized-keys
+           (list (list "root" (local-file "keys/td_test_ed25519.pub"))))))))))
 
 (define %native-reset-image
   (system-image
    (image
-    (inherit ((image-type-constructor qcow2-image-type) %test-os))
+    (inherit ((image-type-constructor qcow2-image-type) %reset-os))
     (volatile-root? #f))))
 
 (with-store store
