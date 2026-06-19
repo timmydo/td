@@ -248,8 +248,13 @@ fn build_and_register(
     let outputs =
         sandbox::build(&parsed, drv_path, closure, scratch).map_err(|e| e.to_string())?;
     // Reference candidates: the staged closure plus the drv's own outputs
-    // (self-references), the daemon's candidate shape.
-    let mut candidates = closure.to_vec();
+    // (self-references), the daemon's candidate shape. A closure entry may carry an
+    // on-disk override (`CANONICAL\tON-DISK`); reference scanning matches the
+    // CANONICAL store paths, so take the canonical half.
+    let mut candidates: Vec<String> = closure
+        .iter()
+        .map(|e| sandbox::split_closure_entry(e).0.to_string())
+        .collect();
     candidates.extend(parsed.outputs.iter().map(|o| o.path.clone()));
     let mut record = String::new();
     let mut regs: Vec<OutputReg> = Vec::new();
@@ -354,12 +359,30 @@ fn cached_realization(
     Ok(Some(out))
 }
 
+/// A td-OWNED source store handed to `realize`/`build-recipe`: the `canonical`
+/// source path is NOT in the daemon DB (td interned it itself, gate 285's
+/// store-add-recursive), so its no-reference closure is read from the td `db`, and
+/// it is staged by binding from `on_disk` (the td store dir) rather than its
+/// canonical `/gnu/store/<base>` (which the daemon never created). Retires the
+/// `guix repl … lower-object %builder-source` source PREP (move-off-Guile §5).
+struct SrcOverride {
+    canonical: String,
+    on_disk: String,
+    db: String,
+}
+
 /// Realize DRV with NO guix-daemon: compute the input closure ITSELF (td's SQLite
 /// reader over STORE-DB's Refs graph — the `guix gc -R` the daemon did), build it in
 /// the userns sandbox (build_and_register), and register the output(s) into a td
 /// store-db at SCRATCH/td.db. Returns the per-output records. Shared by `realize` and
-/// `build-recipe`.
-fn realize_drv(drv_path: &str, store_db: &str, scratch: &Path) -> Result<Vec<OutputReg>, String> {
+/// `build-recipe`. SRC_OVERRIDE, when set, supplies the recipe source from a td-owned
+/// store instead of the daemon store (no `guix repl` interning).
+fn realize_drv(
+    drv_path: &str,
+    store_db: &str,
+    scratch: &Path,
+    src_override: Option<&SrcOverride>,
+) -> Result<Vec<OutputReg>, String> {
     let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
     let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
     // Input ROOTS: the drv's source inputs, plus each input derivation's requested
@@ -380,10 +403,33 @@ fn realize_drv(drv_path: &str, store_db: &str, scratch: &Path) -> Result<Vec<Out
     let db = store_db_read::Db::open(
         std::fs::read(store_db).map_err(|e| format!("read store db {store_db}: {e}"))?,
     )?;
+    // The td-owned source has its own DB (the daemon DB has no row for it).
+    let src_db = match src_override {
+        Some(ov) => Some(store_db_read::Db::open(
+            std::fs::read(&ov.db).map_err(|e| format!("read source db {}: {e}", ov.db))?,
+        )?),
+        None => None,
+    };
     let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for r in &roots {
-        for p in db.closure(r)? {
-            closure.insert(p);
+        match (src_override, &src_db) {
+            // The td-interned source: closure from the td DB (no-ref → itself), and
+            // the entry carries the on-disk location to bind FROM (canonical\ton-disk).
+            (Some(ov), Some(sdb)) if r == &ov.canonical => {
+                for p in sdb.closure(r)? {
+                    let entry = if p == ov.canonical {
+                        format!("{p}\t{}", ov.on_disk)
+                    } else {
+                        p
+                    };
+                    closure.insert(entry);
+                }
+            }
+            _ => {
+                for p in db.closure(r)? {
+                    closure.insert(p);
+                }
+            }
         }
     }
     let closure: Vec<String> = closure.into_iter().collect();
@@ -428,8 +474,20 @@ fn self_store_path() -> Result<String, String> {
 /// build path is guix/Guile. The recipe's `buildSystem` selects the phase runner —
 /// `"gnu"` → `autotools-build` (configureFlags/phases), `"rust"` → `rust-build`
 /// (cargo; installs the recipe's `bins`). Usage: build-recipe RECIPE-JSON LOCK
-/// SCRATCH STORE-DB
-fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &str) -> Result<Vec<OutputReg>, String> {
+/// SCRATCH STORE-DB [SRC-STORE-DIR SRC-DB]
+///
+/// SRC-STORE-DIR + SRC-DB (optional) make the `<name>-source` a td-OWNED source: td
+/// interned the tree ITSELF (store-add-recursive) into SRC-STORE-DIR + SRC-DB, so the
+/// source is staged from there and its closure read from SRC-DB — no `guix repl …
+/// lower-object` daemon interning in the source PREP (move-off-Guile §5). Omitted →
+/// the source is a daemon-resident store path, exactly as before.
+fn build_recipe(
+    recipe_json: &str,
+    lock_file: &str,
+    scratch: &Path,
+    store_db: &str,
+    src_store: Option<(&str, &str)>,
+) -> Result<Vec<OutputReg>, String> {
     let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
     let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
     let version = alist.get("version").and_then(json::Json::as_str).ok_or("recipe: no version")?;
@@ -483,6 +541,18 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
     if source.is_empty() {
         return Err(format!("lock has no `{src_key}' entry (the recipe source)"));
     }
+    // A td-OWNED source store (optional): the `<name>-source` path was interned by td
+    // itself into SRC-STORE-DIR + SRC-DB, so realize stages it from there + reads its
+    // closure from SRC-DB — no daemon interning. The on-disk tree is the canonical
+    // basename under SRC-STORE-DIR (store-add-recursive restored it there).
+    let src_override = src_store.map(|(store_dir, db)| {
+        let base = source.rsplit('/').next().unwrap_or(&source);
+        SrcOverride {
+            canonical: source.clone(),
+            on_disk: format!("{store_dir}/{base}"),
+            db: db.to_string(),
+        }
+    });
     inputs.sort();
     vendor.sort();
     let builder_store = self_store_path()?;
@@ -554,8 +624,9 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
         return Ok(regs);
     }
     eprintln!("td-builder: build-recipe assembled {drv_path} (no guix (derivation), no Guile)");
-    // td realizes it (no guix-daemon).
-    let regs = realize_drv(&drv_file.to_string_lossy(), store_db, scratch)?;
+    // td realizes it (no guix-daemon). With a td-owned source store, the source is
+    // staged from td's own store + closure read from the td DB (no daemon interning).
+    let regs = realize_drv(&drv_file.to_string_lossy(), store_db, scratch, src_override.as_ref())?;
     println!("CACHE=miss");
     Ok(regs)
 }
@@ -1760,7 +1831,7 @@ fn main() -> ExitCode {
         Some("realize") if args.len() == 5 => {
             let (drv_path, store_db, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
-                realize_drv(drv_path, store_db, Path::new(scratch)).map(|_| ())
+                realize_drv(drv_path, store_db, Path::new(scratch), None).map(|_| ())
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -1774,15 +1845,24 @@ fn main() -> ExitCode {
         // guix-daemon in the path: read the recipe JSON (ts-eval produced it,
         // Guile-free), resolve every input from the pinned LOCK (no
         // specification->package), assemble the .drv itself, and realize it. The
-        // toolchain + lock are the guix-built SEED (§5, retired last). Usage:
-        //   build-recipe RECIPE-JSON-FILE LOCK SCRATCH STORE-DB
-        Some("build-recipe") if args.len() == 6 => {
+        // toolchain + lock are the guix-built SEED (§5, retired last). The optional
+        // trailing SRC-STORE-DIR + SRC-DB make the `<name>-source` a td-OWNED source
+        // (interned by td's store-add-recursive, no `guix repl`); omitted → a
+        // daemon-resident source path, as before. Usage:
+        //   build-recipe RECIPE-JSON-FILE LOCK SCRATCH STORE-DB [SRC-STORE-DIR SRC-DB]
+        Some("build-recipe") if args.len() == 6 || args.len() == 8 => {
             let (recipe_file, lock, scratch, store_db) =
                 (&args[2], &args[3], &args[4], &args[5]);
+            let src_store = if args.len() == 8 {
+                Some((args[6].as_str(), args[7].as_str()))
+            } else {
+                None
+            };
             let run = || -> Result<(), String> {
                 let recipe_json =
                     std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
-                build_recipe(&recipe_json, lock, Path::new(scratch), store_db).map(|_| ())
+                build_recipe(&recipe_json, lock, Path::new(scratch), store_db, src_store)
+                    .map(|_| ())
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -2058,7 +2138,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
             eprintln!("       td-builder realize FILE.drv STORE-DB SCRATCH-DIR");
-            eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DB");
+            eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DB [SRC-STORE-DIR SRC-DB]");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             eprintln!("       td-builder rust-build        # as a derivation builder (cargo)");
             ExitCode::from(2)
