@@ -53,13 +53,27 @@ the OTHER gates' ts-emit (using the td-built td-ts-eval) is Brick 4b.
 
 ### Sub-task ladder
 
-1. [ ] Generator → `tests/td-ts-eval.lock` (toolchain seed + 128 boa crates); realize them.
-2. [ ] `tests/ts/recipe-td-ts-eval.ts` (buildSystem rust, bins td-ts-eval).
-3. [ ] `mk/gates/350-rust-ts-eval.mk` — build via stage0, run (evaluate a probe), repro,
-       oracle, structural; verified-red.
-4. [ ] `./check.sh rust-ts-eval` green; verified-red.
-5. [ ] Full/affected landing check; PR.
+1. [x] Generator → `tests/td-ts-eval.lock` (toolchain seed + 128 boa crates); realized
+       all 128 (guile url-fetch realizer, hex→nix-base32; one-time network prep).
+2. [x] `tests/ts/recipe-td-ts-eval.ts` (buildSystem rust, bins td-ts-eval).
+3. [x] `mk/gates/350-rust-ts-eval.mk` — build via stage0, evaluate a probe, repro,
+       oracle, structural.
+4. [x] `./check.sh rust-ts-eval` GREEN; verified-red.
+5. [ ] Affected/landing check; PR.
 
 ### Status / evidence
 
-- (in progress) — crate-fetch mechanism probed green (autocfg).
+- `./check.sh rust-ts-eval`: GREEN. td built td-ts-eval (boa, 128 vendored crates) with
+  stage0; the td-built td-ts-eval EVALUATES a TS spec (the hello recipe → the expected
+  JSON — boa runs), IDENTICALLY to the guix-built td-ts-eval, reproducible (double-build),
+  at a DISTINCT path (`fwyf5h9…` is guix's). drv builder == stage0 (cargo→stage0→td-ts-eval).
+- Census fix: `td-ts-eval` added to `guix-dependence.scm` self-host-specs (a seed tool
+  with no `(gnu packages)` oracle, like td-builder/cat/td-russh-demo); census output
+  UNCHANGED (23 owned recipes, matches .expected — no re-baseline). Flagged in the PR.
+- **Verified-red (behavioral/oracle is load-bearing):** pointed the behavioral run at the
+  stage0 td-builder (not an evaluator) → its output (`td-builder 0.1.0 ok`) DIVERGED from
+  guix's JSON → `DISAGREE` FAIL (exit 2). The leg genuinely requires the td-built
+  td-ts-eval to evaluate correctly. Reverted. (The structural/override leg's causal red
+  is gate 365 / Brick 3b.)
+- Bootstrap circularity honest: guix-built td-ts-eval is the SEED (evaluates the recipe)
+  + oracle; Brick 4b swaps the OTHER gates' ts-emit onto the td-built evaluator.
