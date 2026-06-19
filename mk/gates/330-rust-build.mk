@@ -13,8 +13,11 @@
 # `(derivation …)` lowering.
 #
 # The source is the LIVE builder/ tree (it changes every edit), so the gate interns
-# the CURRENT tree (guix builds the exported %builder-source — seed prep, not a
-# specification->package) and appends it to the committed seed lock.
+# the CURRENT tree with td's OWN recursive addToStore (tests/intern-src.sh →
+# `td-builder store-add-recursive`, the gate-285 primitive) into a td-owned store dir +
+# db — NO `guix repl … lower-object` daemon interning (move-off-Guile §5) — and appends
+# the content-addressed path to the committed seed lock. build-recipe is handed that
+# store dir + db so it stages the source from there + reads its closure from the td db.
 # Per the differential+durable discipline:
 #   [STRUCTURAL] the build runs with guix/Guile off PATH and produces td-builder.
 #   [DURABLE behavioral] the td-built td-builder RUNS (nar-hash) and agrees with the
@@ -46,15 +49,16 @@ rust-build:
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 	scratch="$(CURDIR)/.td-build-cache/rust-build"; mkdir -p "$$scratch/tmp" "$$scratch/b"; rm -f "$$scratch/b/"*.drv; \
 	grep ' /gnu/store/' "$$lock0" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the rust seed (regenerate the lock on a channel bump)" >&2; exit 1; }; \
-	src=`$(GUIX) repl $(LOAD) tests/td-builder-source.scm 2>/dev/null | sed -n 's/^SRC=//p'`; \
-	test -n "$$src" -a -d "$$src" || { echo "ERROR: could not intern the current builder tree (%builder-source)" >&2; exit 1; }; \
-	echo ">> interned the CURRENT builder tree: $$src"; \
+	srcinfo=`sh tests/intern-src.sh "$$tb" td-builder-src "$(CURDIR)/builder" "$$scratch" target .cargo` || { echo "ERROR: td could not intern the current builder tree (store-add-recursive)" >&2; exit 1; }; \
+	eval "$$srcinfo"; \
+	test -n "$$src" -a -d "$$srcstore/`basename "$$src"`" || { echo "ERROR: td interned no source tree (store-add-recursive)" >&2; exit 1; }; \
+	echo ">> td interned the CURRENT builder tree (recursive addToStore, no guix repl / no daemon): $$src"; \
 	lock="$$scratch/td-builder-rust.lock"; { cat "$$lock0"; echo "td-builder-source $$src"; } > "$$lock"; \
 	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-builder.ts" > "$$scratch/td-builder.json"; \
 	test -s "$$scratch/td-builder.json" || { echo "ERROR: ts-emit produced no JSON for td-builder" >&2; exit 1; }; \
 	grep -q '"buildSystem":"rust"' "$$scratch/td-builder.json" || { echo "FAIL: recipe JSON is not buildSystem rust" >&2; cat "$$scratch/td-builder.json" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/td-builder.json" "$$lock" "$$sd" /var/guix/db/db.sqlite > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe self-host (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/td-builder.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe self-host (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; grep -q 'no guix (derivation), no Guile' "$$scratch/err" || { echo "FAIL: build-recipe did not assemble the .drv itself" >&2; cat "$$scratch/err" >&2; exit 1; }; fi; \

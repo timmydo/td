@@ -60,8 +60,12 @@ the `check` double-build) to stage a no-reference source from td's OWN store.
 5. [ ] `tests/intern-src.sh` helper.
 6. [ ] Gate 330 (rust-build): swap guix repl → intern-src.sh + build-recipe src args.
 7. [ ] Gate 335 (rust-vendor): same.
-8. [ ] Delete tests/td-builder-source.scm + td-vendor-demo-source.scm; fix the lock
-       comment references.
+8. [ ] Gate 345 (rust-russh): same (#94 landed a THIRD identical helper — caught in
+       the sweep; retiring it too makes this a complete "retire ALL tree-interning"
+       milestone rather than leaving a straggler).
+9. [ ] Delete tests/td-builder-source.scm + td-vendor-demo-source.scm +
+       td-russh-demo-source.scm. (gate 285 keeps its OWN inline %builder-source oracle;
+       boot/image lowering at gates 152/172 is the retired-last config layer.)
 
 ## Verified-red evidence
 
