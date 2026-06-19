@@ -42,6 +42,7 @@ rust-build:
 	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
 	test -x "$$ev" -a -x "$$tb" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval / td-builder" >&2; exit 1; }; \
 	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; \
 	lock0="$(CURDIR)/tests/td-builder-rust.lock"; \
 	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
@@ -49,7 +50,7 @@ rust-build:
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 	scratch="$(CURDIR)/.td-build-cache/rust-build"; mkdir -p "$$scratch/tmp" "$$scratch/b"; rm -f "$$scratch/b/"*.drv; \
 	grep ' /gnu/store/' "$$lock0" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the rust seed (regenerate the lock on a channel bump)" >&2; exit 1; }; \
-	srcinfo=`sh tests/intern-src.sh "$$tb" td-builder-src "$(CURDIR)/builder" "$$scratch" target .cargo` || { echo "ERROR: td could not intern the current builder tree (store-add-recursive)" >&2; exit 1; }; \
+	srcinfo=`sh tests/intern-src.sh "$$TB" td-builder-src "$(CURDIR)/builder" "$$scratch" target .cargo` || { echo "ERROR: td could not intern the current builder tree (store-add-recursive)" >&2; exit 1; }; \
 	eval "$$srcinfo"; \
 	test -n "$$src" -a -d "$$srcstore/`basename "$$src"`" || { echo "ERROR: td interned no source tree (store-add-recursive)" >&2; exit 1; }; \
 	echo ">> td interned the CURRENT builder tree (recursive addToStore, no guix repl / no daemon): $$src"; \
@@ -58,12 +59,15 @@ rust-build:
 	test -s "$$scratch/td-builder.json" || { echo "ERROR: ts-emit produced no JSON for td-builder" >&2; exit 1; }; \
 	grep -q '"buildSystem":"rust"' "$$scratch/td-builder.json" || { echo "FAIL: recipe JSON is not buildSystem rust" >&2; cat "$$scratch/td-builder.json" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/td-builder.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe self-host (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$TB" build-recipe "$$scratch/td-builder.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe self-host (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; grep -q 'no guix (derivation), no Guile' "$$scratch/err" || { echo "FAIL: build-recipe did not assemble the .drv itself" >&2; cat "$$scratch/err" >&2; exit 1; }; fi; \
 	ns="$$sd/newstore/`basename "$$out"`"; \
 	test -x "$$ns/bin/td-builder" || { echo "FAIL: self-host produced no td-builder binary at $$ns/bin/td-builder" >&2; exit 1; }; \
+	test -n "$$TD_BUILDER_PATH" || { echo "FAIL: TD_BUILDER_PATH unset — load_stage0 did not place a stage0 builder" >&2; exit 1; }; \
+	grep -qF "$$TD_BUILDER_PATH/bin/td-builder" "$$sd"/*.drv || { echo "FAIL: the self-host .drv builder is not the stage0 $$TD_BUILDER_PATH — built by the wrong td-builder?" >&2; exit 1; }; \
+	echo "  [DURABLE structural] the self-host .drv builder is the td-bootstrapped stage0 ($$TD_BUILDER_PATH) — cargo→stage0→td-builder, no guix-built td-builder in the build (brick 3b)"; \
 	if [ -n "$$hit" ]; then echo "  [STRUCTURAL] CACHE HIT — builder source unchanged, reused td's prior self-host build (no rebuild): $$out"; else echo "  [STRUCTURAL] td assembled + realized the .drv with guix/Guile off PATH: $$out"; fi; \
 	printf 'td rust-build behavioral probe\n' > "$$scratch/probe"; \
 	h_td=`"$$ns/bin/td-builder" nar-hash "$$scratch/probe"`; \
@@ -75,7 +79,7 @@ rust-build:
 	if [ -n "$$hit" ] && [ -f "$$sd/verified-reproducible" ]; then \
 	  echo "  [DURABLE repro] CACHED: builder source unchanged + previously verified reproducible — td-builder check skipped (verdict memoized)"; \
 	else \
-	  rm -rf "$$scratch/chk"; "$$tb" check "$$sd"/*.drv "$$sd/closure.txt" "$$scratch/chk" > "$$scratch/checkout.txt" 2>"$$scratch/chk.err" \
+	  rm -rf "$$scratch/chk"; "$$TB" check "$$sd"/*.drv "$$sd/closure.txt" "$$scratch/chk" > "$$scratch/checkout.txt" 2>"$$scratch/chk.err" \
 	    || { echo "FAIL: rust-build NOT reproducible (td-builder check):" >&2; cat "$$scratch/checkout.txt" "$$scratch/chk.err" >&2; exit 1; }; \
 	  grep -qE "^CHECK out $$out sha256:[0-9a-f]+ reproducible$$" "$$scratch/checkout.txt" \
 	    || { echo "FAIL: td-builder check did not confirm $$out reproducible:" >&2; cat "$$scratch/checkout.txt" >&2; exit 1; }; \
