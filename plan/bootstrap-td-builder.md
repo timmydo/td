@@ -83,3 +83,89 @@ sandboxed td build).
   intrinsic-reproducibility leg ("two stage0 builds differ … NOT reproducible", exit 2);
   reverted.
 - Full `./check.sh`: GREEN (see commit).
+
+## Brick 2 (claude-fable-300f35): the loop BUILDS with stage0 as the in-store builder
+
+**Goal / acceptance.** A real package (`hello`) builds in the loop where the
+**builder-of-record is the td-bootstrapped stage0**, not the `guix build`-produced
+td-builder — guix NEVER produced the binary that ran the build. Today `build_recipe`
+sets `builder = self_store_path()/bin/td-builder` from `current_exe()` (the running,
+guix-built binary), so every td build is run by a guix-produced builder. This brick
+lets td place stage0 into its OWN store and assemble+realize a recipe whose `builder`
+is that td path.
+
+### The obstacle, restated
+
+`build_recipe` references the builder by store path (the assembled drv's `builder`
+field + an `input-src`), and `sandbox::build` bind-mounts every closure item from its
+canonical `/gnu/store/<base>`. stage0 lives in a scratch dir, not `/gnu/store`, and is
+byte-distinct from guix-tb (so it has NO `/gnu/store` path the daemon ever created).
+`store-add-recursive` (gate 285) places a tree content-addressed into a td store dir —
+but its no-ref guard REJECTS a tree with external references, and stage0 references
+glibc + gcc-lib (its ELF interp + RUNPATH, brick-1 hygiene leg). So the primitive must
+*scan and record* those refs.
+
+### Design — a `BuilderOverride`, the exact mirror of `SrcOverride` (#97)
+
+1. **`td-builder store-add-builder NAME TREE STORE-DIR OUT-DB SEED-DB`** (new arm,
+   builder/src/main.rs). Like `store-add-recursive` but for a tree WITH references:
+   - content-addressed path `C_b = make_store_path("source", recursiveNAR(TREE), NAME)`;
+   - canonically restore TREE → `STORE-DIR/<base>` (`copy_canonical`);
+   - scan TREE's NAR for references against the **seed closure** (candidates = the
+     ValidPaths of SEED-DB, i.e. `/var/guix/db/db.sqlite`) → stage0's refs
+     (glibc, gcc-lib + whatever it links); register `C_b` + those refs in OUT-DB
+     (reusing the ValidPaths/Refs writer, refs as external rows);
+   - print `C_b`. (No daemon, no guix — the seed db is read with td's own reader.)
+
+2. **`BuilderOverride { canonical, on_disk, db }`** threaded through `build_recipe` →
+   `realize_drv`, mirroring `SrcOverride`. When set:
+   - `build_recipe`: `builder_store = canonical`; `builder = {canonical}/bin/td-builder`;
+     the `input-src {builder_store}` line uses it (instead of `self_store_path()`).
+   - `realize_drv`: for the builder root `C_b`, read its closure from a **db SET** —
+     `C_b` + its direct refs from OUT-DB (td's builder db), and each ref's TRANSITIVE
+     closure from the seed db (glibc/gcc-lib live there). The `C_b` entry is encoded
+     `C_b\t{on_disk}` so the sandbox binds stage0 from the td store dir; every ref is a
+     bare `/gnu/store` path (daemon-resident → bound from there). No multi-db helper
+     needed beyond "this root's refs come from OUT-DB, their closures from the seed db"
+     — a small targeted spanning, not build-plan's general `closure_multi`.
+   - CLI surface: extend `build-recipe` with an OPTIONAL trailing pair after the
+     (optional) `SRC-STORE-DIR SRC-DB` — keep arity backward-compatible (every existing
+     gate's invocation unchanged). Likely cleaner as a `TD_BUILDER_STORE` / `TD_BUILDER_DB`
+     env pair (cf. `TD_STORE`), decided when wiring the gate.
+
+3. **Gate `mk/gates/175-bootstrap-build.mk`** (after `170-bootstrap`), subject `hello`:
+   - PREP: `guix build` realizes hello's SEED (toolchain + source from the lock) — the
+     retired-last seed, as the other corpus gates do.
+   - bootstrap stage0 (tools/bootstrap-td-builder.sh) with guix/Guile OFF PATH; place it
+     via `store-add-builder` into a td store dir + builder.db.
+   - `build-recipe` hello with the builder override + guix/Guile scrubbed from PATH.
+   - [STRUCTURAL] hello's assembled `.drv` `builder` field is the **stage0 td path
+     `C_b`**, NOT any `…-td-builder-0.1.0` guix output path; the build ran guix-free.
+   - [DURABLE behavioral] the loop RUNS hello from td's own output → `Hello, world!`.
+   - [DURABLE intrinsic-reproducibility] `td-builder check` double-build of the
+     stage0-built hello agrees (no guix --check).
+   - [DURABLE self-discrimination] drop the builder override → build falls back to the
+     guix-tb builder and the drv's `builder` is guix's td-builder path (verified-red:
+     the structural assert flips).
+   - [MIGRATION ORACLE, removable] stage0-built hello is behaviorally == guix's hello
+     (same program output) at a DISTINCT output path (own, then diverge — different
+     builder path ⇒ different drv ⇒ different out path, identical behavior).
+
+### Sub-task ladder
+
+1. [ ] Rust: `store-add-builder` arm + a unit test (content-addressed path stable;
+       refs scanned == expected toolchain paths on a fixture).
+2. [ ] Rust: `BuilderOverride` struct + `realize_drv` spans OUT-DB (direct refs) ∪
+       seed db (transitive); unit test the closure spans both. Verified-red: limit to
+       OUT-DB only ⇒ the build can't see glibc ⇒ fails.
+3. [ ] Rust: `build_recipe` honours the builder override (builder field + input-src +
+       closure root); CLI/env surface, backward-compatible.
+4. [ ] `cargo test` green (the affected-checks fast leg).
+5. [ ] Gate `175-bootstrap-build.mk`; `./check.sh bootstrap-build` green.
+6. [ ] Verified-red ×2 (drop the override → drv.builder is guix's; break the ref
+       spanning → build fails). Record evidence here.
+7. [ ] Full landing check (`tools/affected-checks.sh --committed-only --run`); PR.
+
+### Status / evidence (brick 2)
+
+- (in progress)
