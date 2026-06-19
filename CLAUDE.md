@@ -180,25 +180,31 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
 - **Work in your own git worktree/branch** (`git worktree add ../td-<track>`), never
   on a shared checkout of main. Keep running notes, sub-task ladder, and verified-red
   evidence in `plan/<track>.md` — never edit another track's file.
-- **Land (merge on green, via PR):** (1) fetch + rebase onto latest `origin/main`;
-  (2) run `tools/affected-checks.sh --committed-only --run`; if it waives the full
-  loop, record the waiver in the PR body; if it escalates, it runs the FULL
-  `./check.sh` before returning success, so record the escalation and full result
-  instead; (3) push the branch and mark the PR ready — CI re-runs the required hosted
-  gate and a human review approves (main is branch-protected:
-  required checks + mandatory review, no direct pushes — `.github/BRANCH-PROTECTION.md`);
-  (4) merge once green and approved — default to arming auto-merge when you mark
-  the PR ready (`gh pr merge --auto --squash`, or `--rebase`) so the human's
+- **Land (optimistic merge on green, via PR):** main is **non-strict** (DESIGN
+  §7.2, human 2026-06-19) — a PR merges on **its own** green checks; main moving
+  under you no longer forces a rebase-onto-tip + re-run. So: (1) validate against
+  your own base — run `tools/affected-checks.sh --committed-only --run`; if it
+  waives the full loop, record the waiver in the PR body; if it escalates, it
+  runs the FULL `./check.sh` before returning success, so record the escalation
+  and full result instead; (2) push the branch and mark the PR ready — CI runs
+  the required hosted gate and a human review approves (main is branch-protected:
+  required checks + mandatory review, no direct pushes —
+  `.github/BRANCH-PROTECTION.md`); (3) merge once green and approved — default to
+  arming auto-merge (`gh pr merge --auto --squash`, or `--rebase`) so the human's
   approval is the last manual step; merge manually instead when the landing must
-  be sequenced (e.g. exclusive landings stacked behind another PR). If main moved
-  before the merge, repeat from (1) — auto-merge does not waive the rebase + affected
-  check/full-escalation obligation. Marking a PR ready with a locally-red or un-run
-  affected-checks gate, or without the full run when affected-checks escalates, is a
-  contract violation — CI verifies your run, it does not replace it. The hosted
-  runner's full `./check.sh` check (fed by the CI store image —
-  `ci/build-ci-image.sh`) becomes required once the image is published (DESIGN
-  §7.1); until then `lint` is the required check and step 2 is the local readiness
-  gate.
+  be sequenced (e.g. exclusive landings stacked behind another PR).
+  **Do NOT rebase-onto-tip + re-run just because main moved** — that is the toil
+  we deliberately dropped. Rebase only when GitHub reports a real git conflict
+  (or for an exclusive-landing sequence). The rare broken combination
+  (green(A)+green(B) ≠ green(A∪B)) is the heal net's job, not yours: a red
+  `check-fast` on main auto-opens a revert PR for the suspect squash commit
+  (`.github/workflows/heal-main.yml`). A heavy-only break (boot/VM/repro, not
+  seen by the fast tier) is NOT auto-caught — it surfaces on the next manual full
+  `./check.sh`; this is an accepted gap of the velocity trade. Marking a PR ready
+  with a locally-red or un-run affected-checks gate, or without the full run when
+  affected-checks escalates, is still a contract violation — CI verifies your
+  run, it does not replace it. `lint` + `check-fast` are the required checks; the
+  full `./check.sh` stays the dev-machine gate (step 1).
 - **Exclusive landings:** changes to the shared spine — `system/td.scm` (frozen
   oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
   everyone. Announce in your track file, land as small standalone PRs, expect

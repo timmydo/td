@@ -26,19 +26,28 @@ what makes the heal clean: one commit per merge → an unambiguous revert.
 
 ## Plan / sub-tasks
 
-1. [ ] Ruleset: `strict_required_status_checks_policy` → false in
+1. [x] Ruleset: `strict_required_status_checks_policy` → false in
    `.github/setup-branch-protection.sh` (+ comment). Keep lint+check-fast
    required, linear history, squash. (Human applies; bot lacks admin.)
-2. [ ] Contract rewrite: DESIGN §7.2 + CLAUDE.md "Parallel work" landing
+2. [x] Contract rewrite: DESIGN §7.2 + CLAUDE.md "Parallel work" landing
    protocol → "green against your base → merge; rebase only on real git
    conflict"; document the optimistic-merge + auto-revert-heal model and the
    accepted heavy-only-break gap.
-3. [ ] Heal primitive: `ci/revert-suspect.sh` — given main's HEAD, form the
-   revert (locally testable kernel; verify-red its suspect-selection).
-4. [ ] Heal workflow: `.github/workflows/heal-main.yml` — on `check-fast` red on
-   main, run the script to open an auto-revert PR.
-5. [ ] Gate: a cheap structural gate asserting the heal script picks the right
-   suspect (verified-red).
+3. [x] Heal primitive: `ci/revert-suspect.sh` — reverts the suspect on a
+   `heal/revert-<sha>` branch (based on current main), loop-guard refuses to
+   revert a revert (exit 3), `--open-pr` pushes + opens an auto-merge PR.
+4. [x] Heal workflow: `.github/workflows/heal-main.yml` — on the `ci` run
+   (check-fast) failing on a push to main, runs the script with `--open-pr`.
+5. [x] Behavioral test: `tests/heal-revert.sh`. NOTE: git is NOT in the loop
+   sandbox (like diffutils/awk), so this can't be a `./check.sh` gate — wired
+   into CI's `lint` job (hosted, has git) in `ci.yml` instead.
+
+## Finding: no git in the loop sandbox
+
+`./check.sh heal-revert` failed with `git: command not found` — the td-builder
+host-sandbox toolchain has no git (same class as the known no-diffutils/no-awk
+gotcha). A git-driven test therefore cannot be a hermetic loop gate; the heal
+primitive's behavioral test runs in CI `lint` (GitHub-hosted) where git exists.
 
 ## Human-side actions (call out in PR — can't be done by the bot)
 
@@ -50,4 +59,10 @@ what makes the heal clean: one commit per merge → an unambiguous revert.
 
 ## Verified-red evidence
 
-(to fill in)
+`tests/heal-revert.sh`, both legs (2026-06-19, locally — git present):
+- Leg A (revert reverses the suspect): neutered the `git revert` line to an
+  empty commit → `FAIL: revert did not restore good content (got 'BROKEN')`,
+  exit 1. Restored → PASS.
+- Leg B (loop guard): neutered the `exit 3` guard → `FAIL: loop guard did not
+  fire on a revert commit (rc=0, want 3)`, exit 1. Restored → PASS.
+Both restored to green after.

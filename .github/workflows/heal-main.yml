@@ -1,0 +1,65 @@
+# heal-main — the optimistic-merge heal net (DESIGN §7.2).
+#
+# Main is NON-strict: a PR merges on its own green checks, so two
+# independently-green PRs can squash-merge into a red main (green(A)+green(B) !=
+# green(A∪B)). We accept that and heal AFTER the fact instead of forcing every
+# PR to rebase-onto-tip + re-run. When the `ci` workflow's check-fast goes red on
+# a push to main, this opens a revert PR for the suspect squash commit
+# (ci/revert-suspect.sh) so main returns to green with no human rebase toil.
+#
+# The fast tier is the ONLY auto-net: a heavy-only break (boot/VM/marionette/
+# reproducibility, invisible to check-fast) is not caught here — it surfaces on
+# the next manual full ./check.sh (DESIGN §7.2, accepted gap). Running the full
+# loop per-merge in CI isn't feasible (cold hosted runners can't rebuild td's
+# closure; the ci-image is keyed by channel pin, not main commit).
+#
+# Token: a PR opened by the default GITHUB_TOKEN does NOT trigger the required
+# check runs (GitHub's recursion guard), so it could never become mergeable —
+# the revert PR is opened with the bot PAT `secrets.HEAL_PAT` instead. The bot
+# cannot approve its own PR, so the revert PR still needs the human's approval
+# unless the heal bot is added as a ruleset bypass actor (a human posture
+# decision — see .github/BRANCH-PROTECTION.md). Auto-merge is armed so it lands
+# the instant it is green + approved.
+
+name: heal-main
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  revert:
+    # Only a FAILED ci run that came from a push to main (never from a PR).
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          fetch-depth: 0
+          # PAT, not GITHUB_TOKEN — see header. Without it the revert PR would
+          # never run its checks and could not auto-merge.
+          token: ${{ secrets.HEAL_PAT }}
+      - name: open a revert PR for the suspect
+        env:
+          GH_TOKEN: ${{ secrets.HEAL_PAT }}
+        run: |
+          set -eu
+          test -n "${GH_TOKEN:-}" || {
+            echo "secrets.HEAL_PAT is not set — the heal net cannot open a revert PR" >&2
+            echo "(GITHUB_TOKEN-opened PRs don't trigger required checks; see workflow header)" >&2
+            exit 1
+          }
+          git config user.name  "td-heal-bot"
+          git config user.email "heal@td.local"
+          ci/revert-suspect.sh --ref "${{ github.event.workflow_run.head_sha }}" --open-pr

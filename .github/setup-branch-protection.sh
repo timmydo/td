@@ -17,9 +17,15 @@
 #   - no direct pushes: changes land only via pull request;
 #   - 1 approving review, NOT dismissed on new pushes (so the bot's rebases /
 #     force-pushes don't drop the human approval — #82, dismiss_stale=false);
-#   - required status checks (strict: branch must be current with main);
+#   - required status checks, NON-strict: a PR merges on its own green checks
+#     WITHOUT being forced current with main first (DESIGN §7.2, optimistic
+#     merge, human 2026-06-19). Dropping strict is the velocity change: main
+#     moving no longer re-arms a rebase + full re-run. The rare broken
+#     combination (green(A)+green(B) ≠ green(A∪B)) is caught after the fact and
+#     auto-reverted — see .github/workflows/heal-main.yml;
 #   - linear history (rebase/squash merges only — matches the repo's
-#     fast-forward convention);
+#     fast-forward convention; squash is also what makes the heal's revert a
+#     single unambiguous commit);
 #   - no force pushes, no branch deletion.
 #
 # NOTE (enforcement): GitHub only enforces rulesets on PRIVATE repos under
@@ -78,7 +84,7 @@ gh api -X "$method" "$path" --input - <<EOF >/dev/null
     {
       "type": "required_status_checks",
       "parameters": {
-        "strict_required_status_checks_policy": true,
+        "strict_required_status_checks_policy": false,
         "required_status_checks": [ $checks ]
       }
     }
