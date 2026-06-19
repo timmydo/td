@@ -42,8 +42,16 @@ crates-io tarball, so this increment is **pure recipe + lock + gate**:
 2. [x] claim + plan-index
 3. [x] warm 140 FODs; generate tests/cat-uutils.lock
 4. [x] recipe-cat.ts + gate 340-rust-uutils + census exclusion
-5. [ ] ./check.sh rust-uutils green + verified-red
+5. [x] ./check.sh rust-uutils green + verified-red
 6. [ ] full ./check.sh green; review; ready + auto-merge
 
 ## Verified-red evidence
-(to fill)
+- GREEN: `./check.sh rust-uutils` → td built `cat` (uu_cat 0.9.0) off PATH with the
+  .drv carrying TD_VENDOR_CRATES (139 deps); the binary round-trips a file AND a stdin
+  pipe; td-builder check double-build reproducible across the whole 139-crate graph.
+  Output path /gnu/store/p1i34aqy…-cat-0.9.0.
+- RED (teeth): deleting the `uucore` dep line from the lock reds the gate — cargo
+  `error: no matching package found, searched package name: 'uucore', location
+  searched: directory source '…/td-rust-vendor'` → build fails (exit 101). Proves the
+  vendored closure is load-bearing and the build resolves deps from td's assembled
+  vendor dir (not network/store). Reverted → green.
