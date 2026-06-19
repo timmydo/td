@@ -308,13 +308,28 @@ guix-tb oracle still holds. Verified-red: drop the override → the build either
 
 ### Sub-task ladder (3b)
 
-1. [ ] rust-vendor: load_stage0; intern/build/check on stage0; structural leg; drop guix-tb.
-2. [ ] rust-uutils: same.
-3. [ ] rust-russh: same.
-4. [ ] rust-build: load_stage0 for the build tool; keep guix-tb as oracle only; structural leg.
-5. [ ] `./check.sh rust-vendor rust-build` (and uutils/russh) green; verified-red.
+1. [x] rust-vendor: load_stage0; `tb="$TB"`; TD_BUILDER_* in env -i; structural leg; drop guix-tb.
+2. [x] rust-uutils: same.
+3. [x] rust-russh: same.
+4. [x] rust-build: load_stage0 for the build tool (`$TB`); keep guix-tb (`$tb`) as oracle
+       only (h_gx + gtb); structural leg.
+5. [x] All four GREEN on stage0; verified-red on the override.
 6. [ ] Full landing check; PR.
 
 ### Status / evidence (3b)
 
-- (in progress)
+- All four rust gates GREEN building on stage0 (`p0nvh66…-td-builder-0.1.0`), each with
+  the new DURABLE structural leg ("drv builder is stage0"):
+  - `rust-vendor` (itoa+ryu) — runs `2026 3.14159`, reproducible.
+  - `rust-build` (self-host) — cargo→stage0→td-builder; the h_gx oracle still holds (the
+    stage0-self-hosted td-builder's nar-hash == guix-tb's), and gtb is a distinct path
+    (`8x2bl12…`, guix's cargo-build-system td-builder) — guix-tb DEMOTED to oracle-only.
+  - `rust-uutils` (139-crate `cat`) — file+stdin round-trip, reproducible.
+  - `rust-russh` (188-crate SSH, aws-lc) — full handshake/auth/exec round-trip, reproducible.
+- **Verified-red (override load-bearing):** dropped TD_BUILDER_* from rust-vendor's
+  `env -i` → build-recipe fell back to `self_store_path` on the OUT-OF-STORE stage0 →
+  `root '…/.td-build-cache/stage0/store/…-td-builder-0.1.0' is not in the store DB`
+  (exit 2). The rust gates can't build without the override, and (no longer resolving
+  guix-tb) don't silently fall back to it. Reverted.
+- guix-tb as the BUILD tool is now gone from EVERY build gate. It survives only as an
+  ORACLE: rust-build (h_gx + gtb), gate 175 (td-builder), gate 365 (bootstrap-build).
