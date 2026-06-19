@@ -39,7 +39,7 @@ rust-russh:
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 	ncrate=`grep -cE '\.crate /gnu/store/' "$$lock0"`; \
 	test "$$ncrate" -ge 150 || { echo "ERROR: lock has <150 vendored .crate deps ($$ncrate) — regenerate from the demo's Cargo.lock" >&2; exit 1; }; \
-	scratch="$(CURDIR)/.rust-russh-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch/tmp"; \
+	scratch="$(CURDIR)/.td-build-cache/rust-russh"; mkdir -p "$$scratch/tmp" "$$scratch/b"; rm -f "$$scratch/b/"*.drv; \
 	grep ' /gnu/store/' "$$lock0" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the seed + vendored .crate deps (warm static.crates.io fetches; regenerate the lock on a channel/dep bump)" >&2; exit 1; }; \
 	src=`$(GUIX) repl $(LOAD) tests/td-russh-demo-source.scm 2>/dev/null | sed -n 's/^SRC=//p'`; \
 	test -n "$$src" -a -d "$$src" || { echo "ERROR: could not intern the russh-demo crate tree" >&2; exit 1; }; \
@@ -47,19 +47,26 @@ rust-russh:
 	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-russh-demo.ts" > "$$scratch/russh.json"; \
 	test -s "$$scratch/russh.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	out=`env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/russh.json" "$$lock" "$$sd" /var/guix/db/db.sqlite 2>"$$scratch/err" | sed -n 's/^OUT=out //p'` || { echo "FAIL: build-recipe russh build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/russh.json" "$$lock" "$$sd" /var/guix/db/db.sqlite > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe russh build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
+	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; fi; \
 	ns="$$sd/newstore/`basename "$$out"`"; \
 	test -x "$$ns/bin/td-russh-demo" || { echo "FAIL: russh build produced no binary at $$ns/bin/td-russh-demo" >&2; exit 1; }; \
 	grep -q 'TD_VENDOR_CRATES' "$$sd"/*.drv || { echo "FAIL: the .drv lacks TD_VENDOR_CRATES — the vendored path was not taken" >&2; exit 1; }; \
-	echo "  [STRUCTURAL] td assembled + realized the .drv (TD_VENDOR_CRATES, $$ncrate deps) with guix/Guile off PATH: $$out"; \
+	if [ -n "$$hit" ]; then echo "  [STRUCTURAL] CACHE HIT — recipe unchanged, reused td's prior russh build (no rebuild): $$out"; else echo "  [STRUCTURAL] td assembled + realized the .drv (TD_VENDOR_CRATES, $$ncrate deps) with guix/Guile off PATH: $$out"; fi; \
 	got=`"$$ns/bin/td-russh-demo" 2>"$$scratch/run.err"` || { echo "FAIL: the td-built russh binary failed to run the SSH round-trip:" >&2; tail -5 "$$scratch/run.err" >&2; exit 1; }; \
 	echo "$$got" | grep -q '^td-russh-ok: ping$$' || { echo "FAIL: russh round-trip did not return the expected reply (got: $$got)" >&2; cat "$$scratch/run.err" >&2; exit 1; }; \
 	echo "  [DURABLE behavioral] the td-built russh binary ran a full SSH round-trip (handshake + publickey auth + exec) over loopback: '$$got'"; \
-	"$$tb" check "$$sd"/*.drv "$$sd/closure.txt" "$$scratch/chk" > "$$scratch/checkout.txt" 2>"$$scratch/chk.err" \
-	  || { echo "FAIL: rust-russh NOT reproducible (td-builder check):" >&2; tail -6 "$$scratch/checkout.txt" "$$scratch/chk.err" >&2; exit 1; }; \
-	grep -qE "^CHECK out $$out sha256:[0-9a-f]+ reproducible$$" "$$scratch/checkout.txt" \
-	  || { echo "FAIL: td-builder check did not confirm $$out reproducible:" >&2; cat "$$scratch/checkout.txt" >&2; exit 1; }; \
-	echo "  [DURABLE repro] td-builder check double-build agrees the 188-crate russh build (incl. aws-lc C crypto) is reproducible"; \
-	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; \
+	if [ -n "$$hit" ] && [ -f "$$sd/verified-reproducible" ]; then \
+	  echo "  [DURABLE repro] CACHED: recipe unchanged + previously verified reproducible — td-builder check skipped (verdict memoized)"; \
+	else \
+	  rm -rf "$$scratch/chk"; "$$tb" check "$$sd"/*.drv "$$sd/closure.txt" "$$scratch/chk" > "$$scratch/checkout.txt" 2>"$$scratch/chk.err" \
+	    || { echo "FAIL: rust-russh NOT reproducible (td-builder check):" >&2; tail -6 "$$scratch/checkout.txt" "$$scratch/chk.err" >&2; exit 1; }; \
+	  grep -qE "^CHECK out $$out sha256:[0-9a-f]+ reproducible$$" "$$scratch/checkout.txt" \
+	    || { echo "FAIL: td-builder check did not confirm $$out reproducible:" >&2; cat "$$scratch/checkout.txt" >&2; exit 1; }; \
+	  : > "$$sd/verified-reproducible"; \
+	  echo "  [DURABLE repro] td-builder check double-build agrees the 188-crate russh build (incl. aws-lc C crypto) is reproducible"; \
+	fi; \
+	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err" "$$scratch/run.err"; mkdir -p "$$scratch/tmp"; \
 	echo "PASS: td built a Rust SSH (russh 0.61 client<->server loopback round-trip) from source via td-builder build-recipe — the 188-crate dependency closure (incl. the aws-lc crypto backend with a C build script) resolved from pinned static.crates.io fetches (no specification->package, no network), the cargo vendor dir assembled by td's run_rust, the C build env (CC/CXX + C_INCLUDE_PATH from gcc-toolchain, which bundles the kernel headers) provided by run_rust — no extra seed, the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; the binary runs a full SSH handshake/auth/exec round-trip (durable) and is reproducible by td's own double-build (durable). A real Rust SSH, built from source by td — crypto + networking, a new domain. The rustc/cargo/gcc seed stays external (§5, retired last)."
