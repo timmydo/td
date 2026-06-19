@@ -19,6 +19,10 @@
 #   [DURABLE repro] td-builder check's double-build agrees the build is reproducible
 #     across the whole 139-crate graph (proc-macros, build scripts, fluent locales).
 HEAVY_GATES += rust-uutils
+# Ordered AFTER the parallel build-recipes phase (its 139-crate cargo build would
+# otherwise oversubscribe cores against build-recipes' fan-out). Not in BUILD_SPECS —
+# its lock (tests/cat-uutils.lock) is self-contained, so the gate builds it itself.
+BUILD_GATES += rust-uutils
 rust-uutils:
 	@echo ">> rust-uutils: td builds the uutils 'cat' (uu_cat 0.9.0, 139 vendored deps) from source via build-recipe (offline, guix/Guile off PATH); it works as cat + is reproducible"
 	@set -euo pipefail; \

@@ -22,6 +22,10 @@
 #   [DURABLE repro] td-builder check's double-build agrees the build is reproducible
 #     across the whole 188-crate graph incl. the aws-lc C crypto build.
 HEAVY_GATES += rust-russh
+# Ordered AFTER the parallel build-recipes phase (its 188-crate cargo build, incl. the
+# aws-lc C crypto, would otherwise oversubscribe cores against build-recipes' fan-out).
+# Not in BUILD_SPECS — the source is interned at gate time, so the gate is self-contained.
+BUILD_GATES += rust-russh
 rust-russh:
 	@echo ">> rust-russh: td builds a russh client<->server SSH round-trip (188 vendored deps incl. aws-lc crypto) from source via build-recipe (offline, guix/Guile off PATH); the SSH session works + is reproducible"
 	@set -euo pipefail; \

@@ -19,6 +19,10 @@
 #     int, ryu the float, so BOTH vendored deps are exercised.
 #   [DURABLE repro] td-builder check's double-build agrees the output is reproducible.
 HEAVY_GATES += rust-vendor
+# Ordered AFTER the parallel build-recipes phase (its cargo build would otherwise
+# oversubscribe cores against build-recipes' fan-out). Not in BUILD_SPECS — the source
+# is interned at gate time, so the gate is self-contained.
+BUILD_GATES += rust-vendor
 rust-vendor:
 	@echo ">> rust-vendor: td builds td-vendor-demo (depends on itoa + ryu) via build-recipe with VENDORED deps (offline, guix/Guile off PATH); it runs + is reproducible"
 	@set -euo pipefail; \
