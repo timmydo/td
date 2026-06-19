@@ -277,8 +277,44 @@ gone from build-recipes + the package gates (a per-loop guix-call-count drop).
   cache-lib + build-pkg.sh: `grep 'system td-builder) td-builder'` → none). Retained as
   ORACLE only in gates 175 (td-builder) and 365 (bootstrap-build).
 
-### Brick 3b (follow-up): the rust-* gates
+## Brick 3b (claude-fable-300f35): the rust-* gates build on stage0 too
 
-`rust-build`/`-vendor`/`-uutils`/`-russh` call `"$tb" build-recipe` directly (not via
-cache-lib) and `rust-build` uses guix-tb as a self-host oracle. Routing them through
-stage0 is a clean separate increment (more nuance: the self-host subject + oracle).
+**Goal.** The four rust gates (`rust-build`/`-vendor`/`-uutils`/`-russh`) build with
+stage0, not the guix-built td-builder — finishing the removal of `guix build -e
+'(@ (system td-builder) td-builder)'` as the BUILD tool from every build gate. These
+gates call `"$tb" build-recipe` DIRECTLY (not via cache-lib), each resolving
+`tb=guix-tb`; they use it to (a) `intern-src.sh` the crate source, (b) run
+`build-recipe`, (c) `td-builder check`. `rust-build` additionally uses guix-tb as an
+ORACLE (`h_gx`: the td-built td-builder's nar-hash == guix-tb's; and `gtb`: a distinct
+store path).
+
+**Design.** Per gate: `. tests/cache-lib.sh; export TD_STAGE0_BASE=…; load_stage0` to
+get `TB`=stage0 + the `TD_BUILDER_*` override (reuses build-recipes' placement — the
+rust gates are BUILD_GATES, ordered after it). Then:
+- intern-src / build-recipe / check run on `$TB` (stage0); the `env -i … build-recipe`
+  invocation gains `TD_BUILDER_PATH/STORE/DB` so the drv's builder is the stage0 path.
+- ADD a DURABLE structural leg: the assembled `.drv`'s builder is the stage0 path
+  (`grep -F "$TD_BUILDER_PATH/bin/td-builder"`, guarded by `test -n`).
+- **rust-vendor/-uutils/-russh:** drop `tb=guix-tb` entirely (no oracle uses it).
+- **rust-build:** KEEP a `tb=guix-tb` resolution but ONLY for the oracle legs
+  (`h_gx` behavioral + `gtb` path) — guix-tb DEMOTED to oracle-only. Now the chain is
+  cargo→stage0→(build-recipe rust)→td-builder, and the oracle asserts stage0's
+  self-hosted td-builder behaves like guix's.
+
+**Acceptance.** Each rust gate green with stage0 as the builder-of-record (new
+structural leg); the durable behavioral + reproducibility legs unchanged; rust-build's
+guix-tb oracle still holds. Verified-red: drop the override → the build either fails
+(out-of-store stage0 self_store_path) or the structural leg fires.
+
+### Sub-task ladder (3b)
+
+1. [ ] rust-vendor: load_stage0; intern/build/check on stage0; structural leg; drop guix-tb.
+2. [ ] rust-uutils: same.
+3. [ ] rust-russh: same.
+4. [ ] rust-build: load_stage0 for the build tool; keep guix-tb as oracle only; structural leg.
+5. [ ] `./check.sh rust-vendor rust-build` (and uutils/russh) green; verified-red.
+6. [ ] Full landing check; PR.
+
+### Status / evidence (3b)
+
+- (in progress)
