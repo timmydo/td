@@ -371,17 +371,36 @@ struct SrcOverride {
     db: String,
 }
 
+/// A td-OWNED builder handed to `build-recipe` (bootstrap brick 2): the `canonical`
+/// builder path is NOT in the daemon DB — td placed a stage0 td-builder there itself
+/// (store-add-builder), a binary guix NEVER produced. Unlike `SrcOverride` the builder
+/// HAS references (the glibc/gcc-lib it links), so its closure spans two DBs: its
+/// DIRECT refs come from the builder `db` (store-add-builder registered them), and each
+/// such ref's TRANSITIVE closure from the daemon/seed `store_db` (the pinned toolchain
+/// lives there). The `canonical` entry is staged by binding from `on_disk` (the td
+/// store dir). Lets the loop BUILD with stage0 as the builder-of-record (move-off-Guile
+/// §5 "build the seed with td").
+struct BuilderOverride {
+    canonical: String,
+    on_disk: String,
+    db: String,
+}
+
 /// Realize DRV with NO guix-daemon: compute the input closure ITSELF (td's SQLite
 /// reader over STORE-DB's Refs graph — the `guix gc -R` the daemon did), build it in
 /// the userns sandbox (build_and_register), and register the output(s) into a td
 /// store-db at SCRATCH/td.db. Returns the per-output records. Shared by `realize` and
 /// `build-recipe`. SRC_OVERRIDE, when set, supplies the recipe source from a td-owned
-/// store instead of the daemon store (no `guix repl` interning).
+/// store instead of the daemon store (no `guix repl` interning). BUILDER_OVERRIDE, when
+/// set, supplies the drv's `builder` from a td-owned store (a td-bootstrapped stage0,
+/// not the guix-built td-builder) — its closure spans the builder DB (direct refs) ∪
+/// STORE-DB (those refs' transitive closures).
 fn realize_drv(
     drv_path: &str,
     store_db: &str,
     scratch: &Path,
     src_override: Option<&SrcOverride>,
+    builder_override: Option<&BuilderOverride>,
 ) -> Result<Vec<OutputReg>, String> {
     let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
     let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
@@ -410,6 +429,14 @@ fn realize_drv(
         )?),
         None => None,
     };
+    // The td-owned builder likewise has its own DB (store-add-builder wrote the builder
+    // + its DIRECT refs there); the daemon DB has no row for the builder itself.
+    let builder_db = match builder_override {
+        Some(ov) => Some(store_db_read::Db::open(
+            std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?,
+        )?),
+        None => None,
+    };
     let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for r in &roots {
         match (src_override, &src_db) {
@@ -425,11 +452,28 @@ fn realize_drv(
                     closure.insert(entry);
                 }
             }
-            _ => {
-                for p in db.closure(r)? {
-                    closure.insert(p);
+            _ => match (builder_override, &builder_db) {
+                // The td-placed builder: builder DB gives {builder} ∪ its DIRECT refs;
+                // the builder entry binds from on_disk (canonical\ton-disk), and each
+                // direct ref's TRANSITIVE closure is read from the daemon/seed DB (the
+                // pinned toolchain lives there — glibc/gcc-lib + their deps).
+                (Some(ov), Some(bdb)) if r == &ov.canonical => {
+                    for p in bdb.closure(r)? {
+                        if p == ov.canonical {
+                            closure.insert(format!("{p}\t{}", ov.on_disk));
+                        } else {
+                            for q in db.closure(&p)? {
+                                closure.insert(q);
+                            }
+                        }
+                    }
                 }
-            }
+                _ => {
+                    for p in db.closure(r)? {
+                        closure.insert(p);
+                    }
+                }
+            },
         }
     }
     let closure: Vec<String> = closure.into_iter().collect();
@@ -481,12 +525,19 @@ fn self_store_path() -> Result<String, String> {
 /// source is staged from there and its closure read from SRC-DB — no `guix repl …
 /// lower-object` daemon interning in the source PREP (move-off-Guile §5). Omitted →
 /// the source is a daemon-resident store path, exactly as before.
+///
+/// BUILDER_STORE (optional, `(canonical, store_dir, db)`) makes the drv's `builder` a
+/// td-OWNED stage0 td-builder (store-add-builder placed it at `canonical`, restored
+/// under `store_dir`, refs in `db`) instead of the running guix-built binary — the
+/// loop then BUILDS with a binary guix never produced (bootstrap brick 2). Omitted →
+/// the builder is `self_store_path()` (the guix-built td-builder), exactly as before.
 fn build_recipe(
     recipe_json: &str,
     lock_file: &str,
     scratch: &Path,
     store_db: &str,
     src_store: Option<(&str, &str)>,
+    builder_store: Option<(&str, &str, &str)>,
 ) -> Result<Vec<OutputReg>, String> {
     let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
     let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
@@ -553,10 +604,27 @@ fn build_recipe(
             db: db.to_string(),
         }
     });
+    // A td-OWNED builder (optional, bootstrap brick 2): the drv's `builder` is a stage0
+    // td-builder td placed at `canonical` (store-add-builder), restored under store_dir,
+    // refs in db — a binary guix never produced. The on-disk tree is the canonical
+    // basename under store_dir. Omitted → the running guix-built binary.
+    let builder_override = builder_store.map(|(canonical, store_dir, db)| {
+        let base = canonical.rsplit('/').next().unwrap_or(canonical);
+        BuilderOverride {
+            canonical: canonical.to_string(),
+            on_disk: format!("{store_dir}/{base}"),
+            db: db.to_string(),
+        }
+    });
     inputs.sort();
     vendor.sort();
-    let builder_store = self_store_path()?;
-    let builder = format!("{builder_store}/bin/td-builder");
+    // The builder store path: the td-placed stage0 (override) or, by default, the
+    // running binary (self_store_path — the guix-built td-builder).
+    let builder_path = match &builder_override {
+        Some(ov) => ov.canonical.clone(),
+        None => self_store_path()?,
+    };
+    let builder = format!("{builder_path}/bin/td-builder");
     // Assemble the .drv spec: inputs as input-SOURCES (already-realized seed paths,
     // no input-derivations — so this diverges from guix's nano, by design).
     let mut spec = String::new();
@@ -565,7 +633,7 @@ fn build_recipe(
     spec.push_str(&format!("builder {builder}\n"));
     spec.push_str(&format!("arg {phase_runner}\n"));
     spec.push_str(&format!("input-src {source}\n"));
-    spec.push_str(&format!("input-src {builder_store}\n"));
+    spec.push_str(&format!("input-src {builder_path}\n"));
     for p in &inputs {
         spec.push_str(&format!("input-src {p}\n"));
     }
@@ -625,8 +693,16 @@ fn build_recipe(
     }
     eprintln!("td-builder: build-recipe assembled {drv_path} (no guix (derivation), no Guile)");
     // td realizes it (no guix-daemon). With a td-owned source store, the source is
-    // staged from td's own store + closure read from the td DB (no daemon interning).
-    let regs = realize_drv(&drv_file.to_string_lossy(), store_db, scratch, src_override.as_ref())?;
+    // staged from td's own store + closure read from the td DB (no daemon interning);
+    // with a td-owned builder, the drv's builder is staged from td's store + its
+    // closure spans the builder DB ∪ the seed DB (no guix-built builder, brick 2).
+    let regs = realize_drv(
+        &drv_file.to_string_lossy(),
+        store_db,
+        scratch,
+        src_override.as_ref(),
+        builder_override.as_ref(),
+    )?;
     println!("CACHE=miss");
     Ok(regs)
 }
@@ -1336,6 +1412,127 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // bootstrap brick 2: PLACE a tree WITH references into a td-owned store,
+        // content-addressed — the builder analog of store-add-recursive (which REFUSES a
+        // referenced tree). td restores the tree into STORE-DIR, computes its
+        // content-addressed `source` path from the recursive NAR, SCANS its references
+        // against the SEED db's ValidPaths (the pinned toolchain — the glibc/gcc-lib the
+        // stage0 builder links), and registers the path + those refs in OUT-DB (each ref a
+        // scaffolding ValidPaths row so the Refs join resolves — store-add-referenced's
+        // external-ref shape). This lets the loop use a td-BOOTSTRAPPED builder (stage0,
+        // NEVER produced by guix) as a recipe's builder-of-record: build-recipe reads its
+        // closure as OUT-DB.closure(path) (the builder + its DIRECT refs) ∪ the seed db
+        // (those refs' transitive closures). No daemon, no guix. Usage:
+        //   store-add-builder NAME TREE STORE-DIR OUT-DB SEED-DB    (prints the store path)
+        Some("store-add-builder") if args.len() == 7 => {
+            let (name, tree, store_dir, out_db, seed_db) =
+                (&args[2], &args[3], &args[4], &args[5], &args[6]);
+            let run = || -> Result<String, String> {
+                use store_db::{Table, Value};
+                // Content-addressed path from the tree's recursive NAR sha256 (same as
+                // store-add-recursive — a `source`-type path).
+                let nar = nar_hash(tree).map_err(|e| e.to_string())?;
+                let hex = nar
+                    .strip_prefix("sha256:")
+                    .ok_or_else(|| format!("nar-hash returned `{nar}', expected sha256:<hex>"))?;
+                let path = store::make_store_path("source", hex, name);
+                let base = path
+                    .rsplit('/')
+                    .next()
+                    .filter(|_| store::name_from_store_path(&path).is_some())
+                    .ok_or_else(|| format!("computed path {path} is malformed"))?
+                    .to_string();
+                // Canonically restore the tree into the td-owned store.
+                std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+                let disk = Path::new(store_dir).join(&base);
+                copy_canonical(Path::new(tree), &disk)?;
+                // Scan the restored tree for references AGAINST the seed db's valid paths
+                // (the pinned toolchain closure) — the builder's actual store deps. The
+                // path itself is a candidate so a self-reference is detected. Extra
+                // never-matching candidates cannot add references (scan.rs candidate note).
+                let seed = store_db_read::Db::open(
+                    std::fs::read(seed_db).map_err(|e| format!("read seed db {seed_db}: {e}"))?,
+                )?;
+                let mut candidates: Vec<String> = seed
+                    .table("ValidPaths")?
+                    .into_iter()
+                    .filter_map(|(_, cols)| match cols.get(1) {
+                        Some(store_db_read::Value::Text(p)) => Some(p.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                candidates.push(path.clone());
+                let mut s = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+                nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
+                let (hash, size, mut refs) = s.finish();
+                refs.sort();
+                refs.dedup();
+                // Register: id 1 = the builder (full record), each external reference a
+                // scaffolding ValidPaths row (path only) so the Refs ids resolve. So
+                // OUT-DB.closure(path) returns the builder + its DIRECT refs; realize then
+                // spans those refs' transitive closures from the seed db.
+                let mut valid: Vec<(i64, Vec<Value>)> = vec![(
+                    1,
+                    vec![
+                        Value::Null,
+                        Value::Text(path.clone()),
+                        Value::Text(hash),
+                        Value::Int(1),
+                        Value::Null,
+                        Value::Int(size as i64),
+                    ],
+                )];
+                let mut ref_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+                let mut edge = 1i64;
+                let mut next_id = 2i64;
+                for r in &refs {
+                    let target = if r == &path {
+                        1 // a self-reference resolves to id 1
+                    } else {
+                        valid.push((
+                            next_id,
+                            vec![
+                                Value::Null,
+                                Value::Text(r.clone()),
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                            ],
+                        ));
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    };
+                    ref_rows.push((edge, vec![Value::Int(1), Value::Int(target)]));
+                    edge += 1;
+                }
+                let tables = [
+                    Table {
+                        name: "ValidPaths",
+                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+                        rows: valid,
+                    },
+                    Table {
+                        name: "Refs",
+                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+                        rows: ref_rows,
+                    },
+                ];
+                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+                Ok(path)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-add-builder {name}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-store-db: ADD a path WITH REFERENCES to a td-owned store — the daemon's
         // addToStore/addTextToStore WITH a references set, in pure Rust. td computes the
         // content-addressed path with the references folded into the type
@@ -1831,7 +2028,7 @@ fn main() -> ExitCode {
         Some("realize") if args.len() == 5 => {
             let (drv_path, store_db, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
-                realize_drv(drv_path, store_db, Path::new(scratch), None).map(|_| ())
+                realize_drv(drv_path, store_db, Path::new(scratch), None, None).map(|_| ())
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -1858,11 +2055,36 @@ fn main() -> ExitCode {
             } else {
                 None
             };
+            // Optional td-OWNED builder (bootstrap brick 2): all three env vars set
+            // together → the drv's builder is a td-placed stage0 (store-add-builder),
+            // not the running guix-built binary. TD_BUILDER_PATH is its canonical store
+            // path, TD_BUILDER_STORE the td store dir it was restored under, and
+            // TD_BUILDER_DB the db registering it + its direct refs.
+            let bp = std::env::var("TD_BUILDER_PATH").ok();
+            let bs = std::env::var("TD_BUILDER_STORE").ok();
+            let bd = std::env::var("TD_BUILDER_DB").ok();
             let run = || -> Result<(), String> {
+                let builder_store = match (&bp, &bs, &bd) {
+                    (Some(p), Some(s), Some(d)) => Some((p.as_str(), s.as_str(), d.as_str())),
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(
+                            "TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together"
+                                .into(),
+                        )
+                    }
+                };
                 let recipe_json =
                     std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
-                build_recipe(&recipe_json, lock, Path::new(scratch), store_db, src_store)
-                    .map(|_| ())
+                build_recipe(
+                    &recipe_json,
+                    lock,
+                    Path::new(scratch),
+                    store_db,
+                    src_store,
+                    builder_store,
+                )
+                .map(|_| ())
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
