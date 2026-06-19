@@ -23,13 +23,12 @@ corpus-no-guix:
 	node=`$(GUIX) build node`/bin/node; \
 	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
 	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
-	test -x "$$ev" -a -x "$$tb" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval / td-builder" >&2; exit 1; }; \
+	test -x "$$ev" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval" >&2; exit 1; }; \
 	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/hello-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
-	. tests/cache-lib.sh; TB="$$tb"; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
 	for spec in $(corpus_SPECS); do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \

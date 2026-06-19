@@ -34,8 +34,7 @@ corpus-deps-no-guix:
 	node=`$(GUIX) build node`/bin/node; \
 	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
 	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
-	test -x "$$ev" -a -x "$$tb" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval / td-builder" >&2; exit 1; }; \
+	test -x "$$ev" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval" >&2; exit 1; }; \
 	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/pcre2-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
@@ -46,7 +45,7 @@ corpus-deps-no-guix:
 	test -n "$$lkh" || { echo "ERROR: could not resolve linux-libre-headers for the link-test" >&2; exit 1; }; \
 	ncs=`for p in $$($(GUIX) build ncurses 2>/dev/null); do [ -f "$$p/lib/libncurses.so" ] && echo "$$p/lib" && break; done`; \
 	test -n "$$ncs" || { echo "ERROR: could not resolve ncurses for readline's termcap link-test" >&2; exit 1; }; \
-	. tests/cache-lib.sh; TB="$$tb"; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
 	for spec in $(deps_SPECS); do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \

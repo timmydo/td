@@ -124,13 +124,16 @@ build-recipes:
 	node=`$(GUIX) build node`/bin/node; \
 	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
 	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
-	test -x "$$ev" -a -x "$$tb" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval / td-builder" >&2; exit 1; }; \
+	test -x "$$ev" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval" >&2; exit 1; }; \
 	for s in $(BUILD_SPECS); do grep ' /gnu/store/' "tests/$$s-no-guix.lock"; done \
 	  | sed 's/^[^ ]* //' | sort -u | xargs $(GUIX) build >/dev/null \
 	  || { echo "ERROR: could not realize the build seed (regenerate locks on a channel bump)" >&2; exit 1; }; \
+	grep ' /gnu/store/' tests/td-builder-rust.lock | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null \
+	  || { echo "ERROR: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }; \
 	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
-	export TB="$$tb" CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	export CACHE="$(CURDIR)/.td-build-cache/pkg" TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; mkdir -p "$$CACHE"; \
+	. tests/cache-lib.sh; load_stage0; \
+	echo ">> builds run on the td-bootstrapped stage0 td-builder ($$TD_BUILDER_PATH) — NO guix-built td-builder (move-off-Guile §5 brick 3)"; \
 	jobs=$${TD_BUILD_JOBS:-$$(nproc)}; \
 	echo ">> building $(words $(BUILD_SPECS)) recipes across $$jobs cores (single-threaded each) ..."; \
 	printf '%s\n' $(BUILD_SPECS) | xargs -P "$$jobs" -n1 sh tests/build-pkg.sh; \
