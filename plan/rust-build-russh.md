@@ -17,12 +17,15 @@ sshd.
 - russh 0.61 + tokio + anyhow → **188 vendored deps**. Builds offline + REPRODUCIBLE
   (built twice at different paths → byte-identical, incl. the aws-lc C crypto build).
 - **The C build env was the crux**: russh's crypto backend `aws-lc-sys` compiles C that
-  needs (a) a tool literally named for `CC` — gcc-toolchain ships `gcc`, so the `cc`
-  crate needs `CC=gcc`; (b) **kernel headers** (`linux/random.h`, `linux/limits.h`) on
-  `C_INCLUDE_PATH` (gcc-toolchain has glibc headers, not linux-libre-headers); (c)
-  `cmake`. So: `run_rust` now sets `CC`/`CXX` + `C_INCLUDE_PATH`/`CPLUS_INCLUDE_PATH`
-  from the inputs' `include/` dirs (mirroring the autotools path), and the seed adds
-  `cmake-minimal` + `linux-libre-headers`.
+  needs (a) a tool for `CC` — gcc-toolchain ships `gcc`, not `cc`, so the `cc` crate
+  needs `CC=gcc`; (b) the **kernel headers** (`linux/random.h`, `linux/limits.h`) on
+  `C_INCLUDE_PATH`. So `run_rust` now sets `CC`/`CXX` + `C_INCLUDE_PATH`/`CPLUS_INCLUDE_PATH`
+  from the inputs' `include/` dirs (mirroring the autotools path). **No extra seed**:
+  gcc-toolchain's own `include/` already bundles the kernel headers (verified:
+  `gcc-toolchain/include/linux/random.h` exists), and aws-lc-sys uses its `cc` build
+  path — NOT cmake. (An earlier draft added `cmake-minimal` + `linux-libre-headers` to
+  the seed; both proved redundant once run_rust set `C_INCLUDE_PATH=gcc-toolchain/include`,
+  so they were dropped — the base toolchain seed suffices.)
 - **Fixed test key** (embedded ed25519 OpenSSH key, loaded via `from_openssh`) instead
   of `PrivateKey::random` — sidesteps a rand_core version skew AND makes the build/run
   deterministic. The round-trip prints `td-russh-ok: ping`.

@@ -6,11 +6,13 @@
 # handshake (curve25519 kex + the aws-lc crypto backend), no external sshd. Built
 # via `td-builder build-recipe` (buildSystem "rust") with its 188-crate dependency
 # closure vendored (static.crates.io fixed-output fetches, Cargo.lock-pinned). The
-# crypto backend (aws-lc-sys) has a C build script, so the seed adds cmake +
-# linux-libre-headers and run_rust's C set-paths provides CC/CXX + C_INCLUDE_PATH.
+# crypto backend (aws-lc-sys) has a C build script; run_rust's C set-paths provides
+# CC/CXX + C_INCLUDE_PATH from gcc-toolchain/include, which already bundles the
+# kernel headers (linux/*.h) aws-lc compiles against — so NO extra seed is needed
+# (the base toolchain seed suffices; aws-lc-sys uses its cc build path, not cmake).
 # The .drv is assembled by td (no guix (derivation …)) and realized daemon-free
-# (no guix-daemon), with guix/Guile SCRUBBED FROM PATH. The rustc/cargo/gcc/cmake/
-# headers seed is external (§5, retired last).
+# (no guix-daemon), with guix/Guile SCRUBBED FROM PATH. The rustc/cargo/gcc seed is
+# external (§5, retired last).
 #
 # ALL-DURABLE (no guix oracle): no guix build of this crate to diff against —
 #   [STRUCTURAL] the build runs guix/Guile off PATH, produces the binary, and the
@@ -60,4 +62,4 @@ rust-russh:
 	  || { echo "FAIL: td-builder check did not confirm $$out reproducible:" >&2; cat "$$scratch/checkout.txt" >&2; exit 1; }; \
 	echo "  [DURABLE repro] td-builder check double-build agrees the 188-crate russh build (incl. aws-lc C crypto) is reproducible"; \
 	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; \
-	echo "PASS: td built a Rust SSH (russh 0.61 client<->server loopback round-trip) from source via td-builder build-recipe — the 188-crate dependency closure (incl. the aws-lc crypto backend with a C build script) resolved from pinned static.crates.io fetches (no specification->package, no network), the cargo vendor dir assembled by td's run_rust, the C build env (CC/CXX + kernel headers + cmake) provided by run_rust + the seed, the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; the binary runs a full SSH handshake/auth/exec round-trip (durable) and is reproducible by td's own double-build (durable). A real Rust SSH, built from source by td — crypto + networking, a new domain. The rustc/cargo/gcc/cmake/headers seed stays external (§5, retired last)."
+	echo "PASS: td built a Rust SSH (russh 0.61 client<->server loopback round-trip) from source via td-builder build-recipe — the 188-crate dependency closure (incl. the aws-lc crypto backend with a C build script) resolved from pinned static.crates.io fetches (no specification->package, no network), the cargo vendor dir assembled by td's run_rust, the C build env (CC/CXX + C_INCLUDE_PATH from gcc-toolchain, which bundles the kernel headers) provided by run_rust — no extra seed, the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; the binary runs a full SSH handshake/auth/exec round-trip (durable) and is reproducible by td's own double-build (durable). A real Rust SSH, built from source by td — crypto + networking, a new domain. The rustc/cargo/gcc seed stays external (§5, retired last)."

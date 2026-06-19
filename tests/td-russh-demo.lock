@@ -7,7 +7,8 @@
 # toolchain; run_rust sets CC/CXX + C_INCLUDE_PATH from these. Regenerate the seed on
 # a channel bump; regenerate the deps from the demo's Cargo.lock on a dep bump.
 # The crate source is interned at gate time (appended) — it is the live tree.
-# Toolchain + C build-env seed:
+# Toolchain seed (the C build-env is provided by run_rust: CC/CXX + C_INCLUDE_PATH
+# from gcc-toolchain/include, which already bundles the kernel headers -- no extra seed):
 kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0 /gnu/store/kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0
 z7kjjjv2k1aniv8lndhb5q1p3639631q-rust-1.93.0-cargo /gnu/store/z7kjjjv2k1aniv8lndhb5q1p3639631q-rust-1.93.0-cargo
 z78xpbjrl0g6238acy238fibgzckqgak-gcc-toolchain-15.2.0 /gnu/store/z78xpbjrl0g6238acy238fibgzckqgak-gcc-toolchain-15.2.0
@@ -15,8 +16,6 @@ bwfxzfsm742izbqrx63ica0jq0sbnmrp-coreutils-9.1 /gnu/store/bwfxzfsm742izbqrx63ica
 p5dap5q3wfdy0h3m31q5hbj3gpbkmrxv-bash-5.2.37 /gnu/store/p5dap5q3wfdy0h3m31q5hbj3gpbkmrxv-bash-5.2.37
 vlx3kkamd502jahyyn03qq9dxa63h3cz-tar-1.35 /gnu/store/vlx3kkamd502jahyyn03qq9dxa63h3cz-tar-1.35
 ch4v61a0lw0f1hkm5adai5z42qpyf20k-gzip-1.14 /gnu/store/ch4v61a0lw0f1hkm5adai5z42qpyf20k-gzip-1.14
-pq8b5vd3k4g3kyxxd4406sy32lcd40pr-linux-libre-headers-6.19.5 /gnu/store/pq8b5vd3k4g3kyxxd4406sy32lcd40pr-linux-libre-headers-6.19.5
-g78vbq1prvfpal1l7ly41f14rc07jsd8-cmake-minimal-3.31.10 /gnu/store/g78vbq1prvfpal1l7ly41f14rc07jsd8-cmake-minimal-3.31.10
 # Vendored dependency closure (static.crates.io fixed-output fetches):
 adler2-2.0.1.crate /gnu/store/dikyd6abcmxwqiail913a4pd5srgyk9g-adler2-2.0.1.crate
 aead-0.6.1.crate /gnu/store/swyp3dpk4rhjb6y0v2ykvhymrqbidgf8-aead-0.6.1.crate
