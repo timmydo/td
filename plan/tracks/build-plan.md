@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: build-plan
 handle: claude-fable-ca5b4f
 date: 2026-06-18
