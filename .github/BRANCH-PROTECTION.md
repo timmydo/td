@@ -18,9 +18,14 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
     `./check.sh` against the `td-ci` image, `ci-image.yml`) — NOT a per-PR check.
     So branch protection requires `check-fast`, never a `check` context (there
     is no such job).
+- `.github/workflows/heal-main.yml` — the optimistic-merge heal net. When the
+  `ci` run (its `check-fast`) fails on a push to main, it opens an auto-revert
+  PR for the suspect squash commit (`ci/revert-suspect.sh`). See "Heal net" below.
 - `.github/setup-branch-protection.sh` — applies the `protect-main` ruleset:
-  PRs only, 1 approving review, required status checks, linear history, no
-  force pushes or deletion.
+  PRs only, 1 approving review, required status checks (**NON-strict** since
+  2026-06-19 — a PR merges on its own green checks, NOT forced current with main
+  first; DESIGN §7.2 optimistic merge), linear history, no force pushes or
+  deletion.
 
 ## One-time setup (repo admin)
 
@@ -87,6 +92,31 @@ constraint) — the image fixes the HOST.
   the 4-vCPU hosted runner (vs ~6 min on the dev box) — well inside the job's
   240-min timeout.
 
+## Heal net (optimistic merge — DESIGN §7.2)
+
+Main is non-strict, so two independently-green PRs can squash-merge into a red
+main. We accept that and heal after the fact instead of forcing every PR to
+rebase-onto-tip + re-run. `heal-main.yml` reacts to a red `check-fast` on main
+by opening a revert PR for the suspect squash commit. Setup:
+
+1. **`HEAL_PAT` secret (required for the net to function).** A PR opened by the
+   default `GITHUB_TOKEN` does NOT trigger the required check runs (GitHub's
+   recursion guard), so such a revert PR could never become mergeable. Provision
+   a machine-account PAT with `repo` scope as the `HEAL_PAT` repository secret;
+   the workflow opens the revert PR with it so `check-fast` runs and auto-merge
+   can arm. Without it the workflow fails loudly (by design).
+2. **Approval (a posture choice).** The bot cannot approve its own PR, so a
+   revert PR waits for the human's approval unless you add the heal bot (or the
+   workflow's token actor) as a **bypass actor** on the `protect-main` ruleset —
+   that gives true zero-latency healing at the cost of an unreviewed merge path.
+   Auto-merge is armed either way, so it lands the instant it is green + approved.
+3. **Scope.** Only the FAST tier is auto-healed. A heavy-only break (boot/VM/
+   marionette/reproducibility, invisible to `check-fast`) is not auto-reverted —
+   it surfaces on the next manual full `./check.sh` and is fixed forward. Running
+   the full loop per-merge in CI isn't feasible (cold hosted runners can't
+   rebuild td's closure; the ci-image is keyed by channel pin, not main commit),
+   so a dev-box periodic full-loop heal is the deferred heavy net.
+
 ## The review deadlock (why the machine account is mandatory)
 
 GitHub does not let a PR author approve their own PR. If agents push branches
@@ -98,9 +128,15 @@ requirement would need that decision revisited, not just a script edit.)
 
 ## Day-to-day landing (replaces direct pushes)
 
-1. Rebase your track branch onto latest `origin/main`.
-2. Run the full `./check.sh` locally — must be green (CI verifies, it does
-   not replace your own run; "fix forward in CI" wastes the runner).
-3. Push the branch, open the PR (`gh pr create`), wait for `lint` + `check-fast`.
-4. Human review + approval, then rebase- or squash-merge. Merge commits are
-   disabled (linear history, matching the old fast-forward convention).
+Optimistic merge (non-strict since 2026-06-19): validate against your **own
+base**, not the latest tip.
+
+1. Run the loop green locally — `./check.sh`, or
+   `tools/affected-checks.sh --committed-only --run` (waives or escalates to the
+   full loop per the diff). CI verifies your run; it does not replace it.
+2. Push the branch, open the PR (`gh pr create`), wait for `lint` + `check-fast`.
+3. Human review + approval, then squash- or rebase-merge (merge commits
+   disabled — linear history). **Do not rebase-onto-tip + re-run just because
+   main moved** — that toil is what non-strict drops. Rebase only on a real git
+   conflict, or to sequence an exclusive landing. A broken combination is the
+   heal net's job (above).
