@@ -57,6 +57,15 @@ primitive's behavioral test runs in CI `lint` (GitHub-hosted) where git exists.
   check-fast run + auto-merge. Decide whether revert PRs may merge without a
   human review (true zero-latency heal) or wait for approval.
 
+## Full ./check.sh runs
+
+- Run 1 (TD_BUILD_JOBS=4): RED on the `no-guix` gate — `Could not find build
+  log for …docker-image.tar.gz.drv`, build failed. Host at the time: 62Gi RAM,
+  54Gi used, **0 swap**, 5.3Gi free → the documented no-swap OOM kill (see
+  td-full-check-oom memory). The gate is untouched by this diff (docs/CI/shell
+  only), so this is environmental, not a real red. Re-running under lower
+  memory pressure / parallelism.
+
 ## Verified-red evidence
 
 `tests/heal-revert.sh`, both legs (2026-06-19, locally — git present):

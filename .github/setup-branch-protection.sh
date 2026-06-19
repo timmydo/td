@@ -41,13 +41,16 @@ repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 checks='{"context": "lint"}, {"context": "check-fast"}'
 
 # Prefer rebase/squash merges; merge commits would break the linear-history
-# rule below.
+# rule below. allow_auto_merge is required by both the default landing flow
+# (`gh pr merge --auto --squash`) and the heal net's auto-revert PR
+# (heal-main.yml) — codify it here rather than relying on a manual UI toggle.
 gh api -X PATCH "repos/$repo" \
   -F allow_merge_commit=false \
   -F allow_rebase_merge=true \
   -F allow_squash_merge=true \
+  -F allow_auto_merge=true \
   -F delete_branch_on_merge=true >/dev/null
-echo "repo merge settings: rebase/squash only, auto-delete merged branches"
+echo "repo merge settings: rebase/squash only, auto-merge on, auto-delete merged branches"
 
 # Replace any previous version of the ruleset (idempotent re-runs).
 existing=$(gh api "repos/$repo/rulesets" -q '.[] | select(.name == "protect-main") | .id' | head -n1 || true)
