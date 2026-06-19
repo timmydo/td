@@ -67,6 +67,41 @@ the `check` double-build) to stage a no-reference source from td's OWN store.
        td-russh-demo-source.scm. (gate 285 keeps its OWN inline %builder-source oracle;
        boot/image lowering at gates 152/172 is the retired-last config layer.)
 
+## Landing protocol (post-rebase note)
+
+Rebased onto origin/main `ac80c87` (affected-checks waives full loop for classified
+diffs — new approval mechanism). Landing step 2 is now
+`tools/affected-checks.sh --committed-only --run`, NOT a bare full `./check.sh`. For
+this diff it ESCALATES to the full loop (records: "No mapping for tests/intern-src.sh"
+— and the builder/src + sandbox.rs changes are broad, touching every sandboxed build),
+so `--run` runs the selected checks AND the full `./check.sh`. Record the escalation +
+full result in the PR body (PR #97, draft until green).
+
 ## Verified-red evidence
 
-(to fill — perturb the on-disk staging / src-db closure and watch 330/335 go red)
+Plan: after the full run is GREEN (corpus cache warm), perturb the on-disk staging —
+edit tests/intern-src.sh to drop the restored tree (`rm -rf "$store"/*` before the
+echo) so the source's on_disk location is absent — clear `.td-build-cache/rust-build`
+and re-run `./check.sh rust-build`. Expect RED: `closure item <canonical> (on disk
+<srcstore>/<base>): No such file` from sandbox::build — proving the td store dir is
+load-bearing (the source is staged from td's OWN store, not /gnu/store). Restore via
+`git checkout tests/intern-src.sh` (all green edits are committed — safe). Then re-run
+→ GREEN.
+
+DONE — green + two reds:
+
+- GREEN: `affected-checks.sh --committed-only --run` escalated to the full `./check.sh`
+  (intern-src.sh unmapped + broad builder change) → EXIT=0. rust-build (self-host),
+  rust-vendor (itoa+ryu), rust-uutils (139-crate cat), rust-russh (188-crate SSH
+  round-trip `td-russh-ok: ping`, reproducible) all PASS with td interning, guix/Guile
+  off PATH. (First attempt OOM-killed mid-ladder on a no-swap box under concurrent
+  load; re-ran with TD_BUILD_JOBS=4.)
+- RED #1 (gate guard): perturb intern-src.sh to drop the restored tree → gate errors
+  `ERROR: td interned no source tree (store-add-recursive)`, EXIT=2. The gate's `-d`
+  guard refuses to proceed without a real interned tree.
+- RED #2 (staging — the load-bearing one): perturb build_recipe's on_disk to a bogus
+  path (gate guard passes, tree present) → `closure item /gnu/store/…-td-builder-src
+  (on disk /nonexistent-td-srcstore/…): No such file or directory`, EXIT=2. Proves
+  sandbox::build stages the source FROM td's own store dir (on_disk), not /gnu/store —
+  so the td store dir is genuinely load-bearing (rules out /gnu/store contamination).
+  Reverted; cargo clean.
