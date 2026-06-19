@@ -1,0 +1,14 @@
+# td chained input edges — the declared recipe inputs td WIRES to its OWN build
+# outputs via `td-builder build-plan` (a `td-recipe-output` lock entry), instead of
+# consuming guix's store path. ONE source of truth, read by two consumers:
+#   * the build-plan gates (mk/gates/365 grep, 366 nano) — PROVE each chain builds:
+#     the downstream .drv references td's dep output, NOT guix's; it runs; reproducible.
+#   * the guix-dependence census (tests/guix-dependence.scm) — CREDITS a recipe as
+#     EDGE-OWNED only when every one of its declared input edges that is itself an
+#     owned recipe appears here (point 1: "owned only when dependency edges use
+#     td-built outputs"). Build-tool / non-owned inputs are the external seed (exempt).
+#
+# Format: `<recipe> <dep>...` — names are recipe specs (recipe-<spec>.ts), pin-
+# independent (no store paths). A dep MUST be an owned recipe (its own recipe-*.ts).
+grep pcre2
+nano gettext-minimal ncurses

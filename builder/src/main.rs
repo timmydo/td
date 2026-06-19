@@ -19,6 +19,7 @@ mod build;
 mod daemon;
 mod drv;
 mod json;
+mod lock;
 mod nar;
 mod sandbox;
 mod scan;
@@ -391,16 +392,22 @@ struct BuilderOverride {
 /// the userns sandbox (build_and_register), and register the output(s) into a td
 /// store-db at SCRATCH/td.db. Returns the per-output records. Shared by `realize` and
 /// `build-recipe`. SRC_OVERRIDE, when set, supplies the recipe source from a td-owned
-/// store instead of the daemon store (no `guix repl` interning). BUILDER_OVERRIDE, when
-/// set, supplies the drv's `builder` from a td-owned store (a td-bootstrapped stage0,
-/// not the guix-built td-builder) — its closure spans the builder DB (direct refs) ∪
-/// STORE-DB (those refs' transitive closures).
+/// store instead of the daemon store (no `guix repl` interning). STORE_DBS is the set of
+/// store-dbs the closure is computed over (a single guix db for `realize`/`build-recipe`;
+/// build-plan passes [guix-db, …prior steps' td.dbs] so a downstream build's closure spans
+/// both). BUILDER_OVERRIDE, when set, supplies the drv's `builder` from a td-owned store (a
+/// td-bootstrapped stage0, not the guix-built td-builder) — the builder entry binds from the
+/// builder DB and its direct refs' TRANSITIVE closures come from STORE_DBS. TD_STORE, when
+/// set, names td's own store dir holding td-BUILT deps: a closure path whose tree lives
+/// under TD_STORE/<base> is emitted `canonical\ton-disk` so the sandbox binds it FROM THERE
+/// (the build-plan chaining edge) — the same on-disk encoding SRC_OVERRIDE uses.
 fn realize_drv(
     drv_path: &str,
-    store_db: &str,
+    store_dbs: &[String],
     scratch: &Path,
     src_override: Option<&SrcOverride>,
     builder_override: Option<&BuilderOverride>,
+    td_store: Option<&Path>,
 ) -> Result<Vec<OutputReg>, String> {
     let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
     let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
@@ -419,9 +426,22 @@ fn realize_drv(
             roots.push(o.path.clone());
         }
     }
-    let db = store_db_read::Db::open(
-        std::fs::read(store_db).map_err(|e| format!("read store db {store_db}: {e}"))?,
-    )?;
+    // Compute the input closure over the MERGED graph of every store-db (td's own
+    // dbs for td-built deps + guix's db for the transitive seeds). With a single db
+    // this is exactly `db.closure`; build-plan passes [guix-db, …td.dbs] so a
+    // downstream build's closure spans both.
+    if store_dbs.is_empty() {
+        return Err("realize: no store DB given".to_string());
+    }
+    let datas: Vec<Vec<u8>> = store_dbs
+        .iter()
+        .map(|p| std::fs::read(p).map_err(|e| format!("read store db {p}: {e}")))
+        .collect::<Result<_, _>>()?;
+    let dbs: Vec<store_db_read::Db> = datas
+        .into_iter()
+        .map(store_db_read::Db::open)
+        .collect::<Result<_, _>>()?;
+    let db_refs: Vec<&store_db_read::Db> = dbs.iter().collect();
     // The td-owned source has its own DB (the daemon DB has no row for it).
     let src_db = match src_override {
         Some(ov) => Some(store_db_read::Db::open(
@@ -452,35 +472,60 @@ fn realize_drv(
                     closure.insert(entry);
                 }
             }
+            // The td-placed builder gets its closure from the builder DB; every other
+            // root from the MERGED multi-db graph.
             _ => match (builder_override, &builder_db) {
                 // The td-placed builder: builder DB gives {builder} ∪ its DIRECT refs;
                 // the builder entry binds from on_disk (canonical\ton-disk), and each
-                // direct ref's TRANSITIVE closure is read from the daemon/seed DB (the
-                // pinned toolchain lives there — glibc/gcc-lib + their deps).
+                // direct ref's TRANSITIVE closure is read from the merged store-db graph
+                // (the pinned toolchain lives there — glibc/gcc-lib + their deps).
                 (Some(ov), Some(bdb)) if r == &ov.canonical => {
                     for p in bdb.closure(r)? {
                         if p == ov.canonical {
                             closure.insert(format!("{p}\t{}", ov.on_disk));
                         } else {
-                            for q in db.closure(&p)? {
+                            for q in store_db_read::closure_multi(&db_refs, &p)? {
                                 closure.insert(q);
                             }
                         }
                     }
                 }
                 _ => {
-                    for p in db.closure(r)? {
+                    for p in store_db_read::closure_multi(&db_refs, r)? {
                         closure.insert(p);
                     }
                 }
             },
         }
     }
-    let closure: Vec<String> = closure.into_iter().collect();
+    // A td-BUILT dep's files live under TD_STORE/<base>, not /gnu/store. Re-key those
+    // closure entries to `canonical\ton-disk` so the sandbox binds them FROM td's store
+    // (split_closure_entry) — the build-plan chaining edge, the same on-disk encoding
+    // SRC_OVERRIDE uses. Bare guix-seed entries and already-overridden entries (the
+    // SRC_OVERRIDE source) pass through unchanged. The on-disk half rides through
+    // closure.txt, so a later `td-builder check` of this drv stages the dep with no
+    // extra argument.
+    let closure: Vec<String> = closure
+        .into_iter()
+        .map(|e| {
+            if e.contains('\t') {
+                return e;
+            }
+            if let Some(ts) = td_store {
+                if let Some(base) = e.strip_prefix(store::STORE_DIR).and_then(|s| s.strip_prefix('/')) {
+                    let on_disk = ts.join(base);
+                    if on_disk.exists() {
+                        return format!("{e}\t{}", on_disk.display());
+                    }
+                }
+            }
+            e
+        })
+        .collect();
     eprintln!(
-        "td-builder: realize computed the input closure ITSELF — {} paths from {} (its own reader, no guix gc / no daemon)",
+        "td-builder: realize computed the input closure ITSELF — {} paths from {} store-db(s) (its own reader, no guix gc / no daemon)",
         closure.len(),
-        store_db
+        store_dbs.len()
     );
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     std::fs::write(scratch.join("closure.txt"), closure.join("\n")).map_err(|e| e.to_string())?;
@@ -531,13 +576,18 @@ fn self_store_path() -> Result<String, String> {
 /// under `store_dir`, refs in `db`) instead of the running guix-built binary — the
 /// loop then BUILDS with a binary guix never produced (bootstrap brick 2). Omitted →
 /// the builder is `self_store_path()` (the guix-built td-builder), exactly as before.
+///
+/// STORE_DBS (the closure's store-db set) and TD_STORE (td's own store dir for td-BUILT
+/// deps) thread straight through to realize_drv — build-plan passes the multi-db set +
+/// td-store so a downstream step consumes an upstream step's td-built output.
 fn build_recipe(
     recipe_json: &str,
     lock_file: &str,
     scratch: &Path,
-    store_db: &str,
+    store_dbs: &[String],
     src_store: Option<(&str, &str)>,
     builder_store: Option<(&str, &str, &str)>,
+    td_store: Option<&Path>,
 ) -> Result<Vec<OutputReg>, String> {
     let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
     let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
@@ -564,29 +614,29 @@ fn build_recipe(
         Some(p) => p.to_json_string(),
         None => String::new(),
     };
-    // Resolve EVERY input from the lock (no Guile). The `<name>-source` entry is the
-    // source (TD_SRC); a `*.crate` entry is a vendored Rust dependency (TD_VENDOR_CRATES);
-    // every other entry is a toolchain build input (TD_INPUTS). Each is also an input-src.
-    let lock = std::fs::read_to_string(lock_file).map_err(|e| format!("read lock {lock_file}: {e}"))?;
+    // Resolve EVERY input from the lock (no Guile), via the typed lock parser
+    // (`NAME PATH [CLASS]`, backward-compatible with 2-field locks). The `source`
+    // entry is TD_SRC; a `crate` entry is a vendored Rust dependency
+    // (TD_VENDOR_CRATES); a `seed` or `td-recipe-output` entry is a build input
+    // (TD_INPUTS). Each input is also an input-src. A `td-recipe-output` entry's
+    // PATH is td's own dep build when build-plan substituted it, or the guix
+    // oracle when this lock is consumed standalone — either way it is just an
+    // input here.
+    let lock_text =
+        std::fs::read_to_string(lock_file).map_err(|e| format!("read lock {lock_file}: {e}"))?;
     let src_key = format!("{name}-source");
+    let entries = lock::parse(&lock_text, &src_key)?;
     let mut source = String::new();
     let mut inputs: Vec<String> = Vec::new();
-    // Vendored Rust deps: lock entries whose NAME ends `.crate` are the dependency
-    // closure (from Cargo.lock), handed to the rust phase runner as TD_VENDOR_CRATES
-    // rather than as toolchain inputs. A gnu recipe has none, so its spec is unchanged.
+    // Vendored Rust deps: `crate`-class entries are the dependency closure (from
+    // Cargo.lock), handed to the rust phase runner as TD_VENDOR_CRATES rather than
+    // as toolchain inputs. A gnu recipe has none, so its spec is unchanged.
     let mut vendor: Vec<String> = Vec::new();
-    for line in lock.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (k, path) = line.split_once(' ').ok_or_else(|| format!("malformed lock line: {line}"))?;
-        if k == src_key {
-            source = path.to_string();
-        } else if k.ends_with(".crate") {
-            vendor.push(path.to_string());
-        } else {
-            inputs.push(path.to_string());
+    for e in &entries {
+        match e.class {
+            lock::Class::Source => source = e.path.clone(),
+            lock::Class::Crate => vendor.push(e.path.clone()),
+            lock::Class::Seed | lock::Class::TdRecipeOutput => inputs.push(e.path.clone()),
         }
     }
     if source.is_empty() {
@@ -688,6 +738,10 @@ fn build_recipe(
         for (o, r) in parsed.outputs.iter().zip(&regs) {
             println!("OUT={} {}", o.name, r.store_path);
         }
+        // Re-write the td store-db even on a hit (deterministic from regs): a
+        // downstream build-plan step reads this step's td.db to resolve the closure
+        // of a td-built dependency, so it must exist whether or not we rebuilt.
+        write_output_db(&regs, &scratch.join("td.db"))?;
         println!("CACHE=hit");
         return Ok(regs);
     }
@@ -695,16 +749,143 @@ fn build_recipe(
     // td realizes it (no guix-daemon). With a td-owned source store, the source is
     // staged from td's own store + closure read from the td DB (no daemon interning);
     // with a td-owned builder, the drv's builder is staged from td's store + its
-    // closure spans the builder DB ∪ the seed DB (no guix-built builder, brick 2).
+    // closure spans the builder DB ∪ the seed DB (no guix-built builder, brick 2);
+    // td_store carries any td-BUILT deps (build-plan) for the multi-db closure's staging.
     let regs = realize_drv(
         &drv_file.to_string_lossy(),
-        store_db,
+        store_dbs,
         scratch,
         src_override.as_ref(),
         builder_override.as_ref(),
+        td_store,
     )?;
     println!("CACHE=miss");
     Ok(regs)
+}
+
+/// build-plan: realize a TOPO-ordered chain of recipes where a downstream step
+/// consumes an UPSTREAM step's td-BUILT output instead of a guix store path. This
+/// is the edge the per-package locks could not express: `corpus-no-guix` builds
+/// grep's own derivation Guile-free but still links GUIX's pcre2; here grep links
+/// the pcre2 td just built.
+///
+/// PLAN is line-based — `step RECIPE-JSON LOCK` per step, in dependency order. For
+/// each step: any `td-recipe-output` lock entry is SUBSTITUTED with the matching
+/// earlier step's output path (matched by the entry NAME == the producing recipe's
+/// `name`); the recipe is built with `build_recipe` over a closure that spans
+/// GUIX-DB (the transitive seeds) ∪ every prior step's `td.db` (the td-built deps),
+/// staging those deps from a shared TD-STORE the steps populate. The output of each
+/// step is copied into TD-STORE and its store path recorded for downstream steps.
+///
+/// Usage: build-plan PLAN GUIX-DB SCRATCH
+fn build_plan(plan_file: &str, guix_db: &str, scratch: &Path) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    let plan = std::fs::read_to_string(plan_file)
+        .map_err(|e| format!("read plan {plan_file}: {e}"))?;
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    // The shared td-store: each step copies its output here, and a downstream step
+    // stages a td-built dep FROM here — realize_drv re-keys a closure entry whose tree
+    // lives under <tdstore>/<base> to `canonical\ton-disk`, so the sandbox binds it from
+    // td's store (split_closure_entry) instead of the daemon's /gnu/store. The on-disk
+    // half rides through closure.txt, so a later `td-builder check` needs no extra state.
+    let tdstore = scratch.join("tdstore");
+    std::fs::create_dir_all(&tdstore).map_err(|e| e.to_string())?;
+
+    // recipe name -> its (single) output store path; and each step's td.db, fed
+    // into the closure of later steps so a td-built dep resolves.
+    let mut built: BTreeMap<String, String> = BTreeMap::new();
+    let mut td_dbs: Vec<String> = Vec::new();
+
+    for raw in plan.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let (recipe_json, lock_file) = match toks.as_slice() {
+            ["step", r, l] => (*r, *l),
+            _ => return Err(format!("malformed plan line (want `step RECIPE-JSON LOCK'): {line}")),
+        };
+        let recipe_text = std::fs::read_to_string(recipe_json)
+            .map_err(|e| format!("read recipe {recipe_json}: {e}"))?;
+        let alist = json::parse(&recipe_text).map_err(|e| format!("recipe JSON {recipe_json}: {e}"))?;
+        let name = alist
+            .get("name")
+            .and_then(json::Json::as_str)
+            .ok_or_else(|| format!("recipe {recipe_json}: no name"))?;
+        let step_scratch = scratch.join(name);
+        std::fs::create_dir_all(&step_scratch).map_err(|e| e.to_string())?;
+
+        // Substitute td-recipe-output entries with the producing step's output.
+        let src_key = format!("{name}-source");
+        let lock_text = std::fs::read_to_string(lock_file)
+            .map_err(|e| format!("read lock {lock_file}: {e}"))?;
+        let entries = lock::parse(&lock_text, &src_key)?;
+        let mut resolved = String::new();
+        let mut substituted: Vec<String> = Vec::new();
+        for e in &entries {
+            let path = if e.class == lock::Class::TdRecipeOutput {
+                let p = built.get(&e.name).ok_or_else(|| {
+                    format!("step `{name}': lock entry `{}' is td-recipe-output but no earlier step built it (plan out of topo order?)", e.name)
+                })?;
+                substituted.push(format!("{}={}", e.name, p));
+                p.clone()
+            } else {
+                e.path.clone()
+            };
+            // Re-emit 2-field; build_recipe re-infers the class. A substituted td
+            // path infers `seed` → an input-src, exactly the intent (it IS now a
+            // realized input — just td's, not guix's).
+            resolved.push_str(&format!("{} {}\n", e.name, path));
+        }
+        let resolved_lock = step_scratch.join("resolved.lock");
+        std::fs::write(&resolved_lock, &resolved).map_err(|e| e.to_string())?;
+        if substituted.is_empty() {
+            eprintln!("td-builder: build-plan step `{name}': no td-built deps to substitute");
+        } else {
+            eprintln!("td-builder: build-plan step `{name}': substituted td outputs -> {}", substituted.join(" "));
+        }
+
+        // Closure spans guix's db (seeds) + every prior step's td.db (td deps).
+        let mut dbs: Vec<String> = Vec::with_capacity(td_dbs.len() + 1);
+        dbs.push(guix_db.to_string());
+        dbs.extend(td_dbs.iter().cloned());
+        let regs = build_recipe(
+            &recipe_text,
+            &resolved_lock.to_string_lossy(),
+            &step_scratch,
+            &dbs,
+            None,            // src_store: build-plan locks carry resolved paths
+            None,            // builder_store: build-plan uses the guix-built builder
+            Some(&tdstore),  // td_store: stage td-built deps from the shared td-store
+        )?;
+        // Single-output recipes (the gnu corpus): the dep is regs[0].
+        let out = regs
+            .first()
+            .ok_or_else(|| format!("step `{name}': build produced no output"))?;
+        let base = out
+            .store_path
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| format!("step `{name}': output is not a store path"))?;
+        // Copy the step's output into the shared td-store so a downstream step can
+        // stage it (a real dir — sandbox::build bind-mounts it, so no symlink).
+        let physical = step_scratch.join("newstore").join(base);
+        let dest = tdstore.join(base);
+        if !dest.exists() {
+            copy_canonical(&physical, &dest)?;
+        }
+        built.insert(name.to_string(), out.store_path.clone());
+        td_dbs.push(step_scratch.join("td.db").to_string_lossy().into_owned());
+        println!("STEP {name} {}", out.store_path);
+        eprintln!(
+            "td-builder: build-plan step `{name}': out {} (staged into td-store {})",
+            out.store_path,
+            tdstore.display()
+        );
+    }
+    eprintln!("td-builder: build-plan complete — {} step(s)", built.len());
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -2028,7 +2209,8 @@ fn main() -> ExitCode {
         Some("realize") if args.len() == 5 => {
             let (drv_path, store_db, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
-                realize_drv(drv_path, store_db, Path::new(scratch), None, None).map(|_| ())
+                realize_drv(drv_path, std::slice::from_ref(store_db), Path::new(scratch), None, None, None)
+                    .map(|_| ())
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -2080,9 +2262,10 @@ fn main() -> ExitCode {
                     &recipe_json,
                     lock,
                     Path::new(scratch),
-                    store_db,
+                    std::slice::from_ref(store_db),
                     src_store,
                     builder_store,
+                    None,
                 )
                 .map(|_| ())
             };
@@ -2090,6 +2273,22 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build-recipe {recipe_file}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-builder build-plan — realize a TOPO chain of recipes where a
+        // downstream step consumes an UPSTREAM step's td-BUILT output instead of a
+        // guix store path (a `td-recipe-output` lock entry). PLAN is `step
+        // RECIPE-JSON LOCK` per line, in dependency order; the closure of each step
+        // spans GUIX-DB ∪ the prior steps' td.dbs, staged from a shared td-store.
+        // Usage: build-plan PLAN GUIX-DB SCRATCH
+        Some("build-plan") if args.len() == 5 => {
+            let (plan_file, guix_db, scratch) = (&args[2], &args[3], &args[4]);
+            match build_plan(plan_file, guix_db, Path::new(scratch)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: build-plan {plan_file}: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -2361,6 +2560,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder resolve LOCKFILE NAME...");
             eprintln!("       td-builder realize FILE.drv STORE-DB SCRATCH-DIR");
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DB [SRC-STORE-DIR SRC-DB]");
+            eprintln!("       td-builder build-plan PLAN GUIX-DB SCRATCH-DIR");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             eprintln!("       td-builder rust-build        # as a derivation builder (cargo)");
             ExitCode::from(2)

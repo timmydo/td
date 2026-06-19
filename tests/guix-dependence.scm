@@ -83,6 +83,76 @@
                     '())))
    string<?))
 
+;; --- edge ownership (proposal point 1) --------------------------------------
+;; td "builds the recipe" (td-reproducible) is necessary but NOT sufficient to own
+;; it: the recipe is still guix-dependent if its declared input EDGES are satisfied
+;; by guix's store paths. A recipe is EDGE-OWNED only when every declared input
+;; (recipe-<spec>.ts `inputs: [...]`) that is itself an owned recipe is WIRED to a td
+;; build output — listed for that recipe in tests/td-chained-edges.txt, the manifest
+;; the build-plan gates PROVE (td's dep output appears in the downstream .drv, not
+;; guix's). Build-tool / non-owned inputs are the agreed external seed (exempt). This
+;; is the stricter "td builds it FROM td inputs" the build-plan track makes possible.
+(define edges-file "tests/td-chained-edges.txt")
+
+(define (recipe-declared-inputs spec)
+  (let* ((file (string-append recipe-dir "/recipe-" spec ".ts"))
+         (text (if (file-exists? file)
+                   (call-with-input-file file get-string-all) ""))
+         (m (string-match "inputs:[ \t]*\\[([^]]*)\\]" text)))
+    (if (not m) '()
+        (filter (lambda (s) (> (string-length s) 0))
+                (map (lambda (s)
+                       (string-trim-both
+                        s (lambda (c) (or (char=? c #\space) (char=? c #\")
+                                          (char=? c #\tab)))))
+                     (string-split (match:substring m 1) #\,))))))
+
+(define chained-edges
+  ;; recipe -> list of dep names wired to td outputs (from the manifest)
+  (if (file-exists? edges-file)
+      (filter-map
+       (lambda (line)
+         (let ((toks (filter (lambda (t) (> (string-length t) 0))
+                             (string-split line #\space))))
+           (and (pair? toks)
+                (not (string-prefix? "#" (car toks)))
+                (cons (car toks) (cdr toks)))))
+       (string-split (call-with-input-file edges-file get-string-all) #\newline))
+      '()))
+
+(define (td-wired-edges spec) (or (assoc-ref chained-edges spec) '()))
+
+(define (owned-input-edges spec)
+  (filter (lambda (i) (member i owned-specs)) (recipe-declared-inputs spec)))
+
+(define (edge-owned? spec)
+  (every (lambda (e) (member e (td-wired-edges spec))) (owned-input-edges spec)))
+
+;; A manifest edge must name a real owned recipe whose declared inputs include the
+;; wired dep (and the dep must itself be an owned recipe) — else the manifest would
+;; credit an edge that isn't real. Fail loudly rather than overstate independence.
+(define (validate-edges!)
+  (for-each
+   (lambda (entry)
+     (let ((recipe (car entry)) (wired (cdr entry)))
+       (unless (member recipe owned-specs)
+         (format (current-error-port)
+                 "guix-dependence: chained-edge recipe ~s is not an owned recipe~%" recipe)
+         (exit 2))
+       (for-each
+        (lambda (dep)
+          (unless (member dep owned-specs)
+            (format (current-error-port)
+                    "guix-dependence: chained edge ~s -> ~s: dep is not an owned recipe~%" recipe dep)
+            (exit 2))
+          (unless (member dep (recipe-declared-inputs recipe))
+            (format (current-error-port)
+                    "guix-dependence: chained edge ~s -> ~s: dep is not a declared input of ~s~%"
+                    recipe dep recipe)
+            (exit 2)))
+        wired)))
+   chained-edges))
+
 (define pinned-commit
   (let* ((m (string-match "\"([0-9a-f]{40})\""
                           (call-with-input-file channels-file get-string-all))))
@@ -96,6 +166,8 @@
             "guix-dependence: no owned recipes found under ~a — refusing to record a vacuous census~%"
             recipe-dir)
     (exit 2))
+
+  (validate-edges!)
 
   ;; spec -> the .drv td reconstructs (assert each is a real corpus package).
   (define spec+drv
@@ -143,6 +215,27 @@
         (format #f "~a: td-reproducible ~a / ~a (~,2f%) [~a]~%"
                 label k n (* 100.0 (/ k n)) (string-join specs " ")))))
 
+  (define edge-report
+    (let* ((eo (filter edge-owned? owned-specs))
+           (unwired
+            (filter-map
+             (lambda (s)
+               (let ((miss (lset-difference string=?
+                                            (owned-input-edges s)
+                                            (td-wired-edges s))))
+                 (and (pair? miss)
+                      (format #f "  ~a -> ~a" s
+                              (string-join (sort miss string<?) " ")))))
+             owned-specs)))
+      (string-append
+       (format #f "edge-owned (declared input edges all wired to td outputs): ~a / ~a [~a]~%"
+               (length eo) (length owned-specs) (string-join eo " "))
+       (if (null? unwired) ""
+           (string-append
+            "guix-wired input edges (build-plan can close these):\n"
+            (string-join (sort unwired string<?) "\n")
+            "\n")))))
+
   (define report
     (string-append
      "# td build-time guix-dependence census — generated by tests/guix-dependence.scm\n"
@@ -152,12 +245,17 @@
      "# byte-identity corpus-* gates were retired with system/td-recipe.scm. pkg-config\n"
      "# is authored but not yet td-built (not in corpus-no-guix) and is excluded.\n"
      "# Build closure = the derivation prerequisite graph (lowering only, no build).\n"
+     "# edge-owned (point 1) = td builds the recipe AND every declared input edge that\n"
+     "# is itself an owned recipe is wired to a td OUTPUT (tests/td-chained-edges.txt,\n"
+     "# proven by the build-plan gates); the rest are guix-wired edges build-plan can\n"
+     "# close. Build-tool / non-owned inputs are the external seed (exempt).\n"
      "# Deterministic given the pinned channel; a pin bump re-baselines this snapshot.\n"
      (format #f "pin: ~a~%" pinned-commit)
      (format #f "owned-recipes (~a): ~a~%"
              (length owned-specs) (string-join owned-specs " "))
      (target-line "corpus-union" corpus-union)
-     (target-line "shipped-system" system-closure)))
+     (target-line "shipped-system" system-closure)
+     edge-report))
 
   (cond
    ((getenv "TD_DEPENDENCE_WRITE")
