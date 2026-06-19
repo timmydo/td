@@ -65,6 +65,9 @@ primitive's behavioral test runs in CI `lint` (GitHub-hosted) where git exists.
   td-full-check-oom memory). The gate is untouched by this diff (docs/CI/shell
   only), so this is environmental, not a real red. Re-running under lower
   memory pressure / parallelism.
+- Run 2 (TD_BUILD_JOBS=3, after killing run 1 + waiting out memory pressure):
+  **GREEN — EXIT=0**, 39 gate PASSes, no Error/FAIL/OOM, through the final
+  rust-russh gate. This is the affected-checks full-loop escalation, satisfied.
 
 ## Verified-red evidence
 
