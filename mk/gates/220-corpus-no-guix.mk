@@ -12,6 +12,11 @@
 # the guix-built SEED (§5, retired last). Replaces td-build/-deps/-resolved/-phases/
 # -corpus/-gettext + td-realize-store/td-loop-build/nano-no-guix and their *-drv.scm.
 HEAVY_GATES += corpus-no-guix
+# Built up front by the parallel `build-recipes` phase (into the shared cache); this
+# gate then cache-hits + memo-skips and only asserts behavior/oracle.
+corpus_SPECS := hello gzip popt libatomic-ops gettext-minimal nano
+BUILD_SPECS  += $(corpus_SPECS)
+BUILD_GATES  += corpus-no-guix
 corpus-no-guix:
 	@echo ">> corpus-no-guix: hello/gzip/popt/libatomic-ops/gettext-minimal/nano all build via td-builder build-recipe (no guix/Guile in the path), run, reproducible (td-builder check), distinct from guix"
 	@set -euo pipefail; \
@@ -25,8 +30,8 @@ corpus-no-guix:
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/hello-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
-	. tests/cache-lib.sh; TB="$$tb"; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/corpus"; mkdir -p "$$CACHE"; \
-	for spec in hello gzip popt libatomic-ops gettext-minimal nano; do \
+	. tests/cache-lib.sh; TB="$$tb"; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	for spec in $(corpus_SPECS); do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \
 	  test -s "$$lock" || { echo "ERROR: no lock $$lock" >&2; exit 1; }; \

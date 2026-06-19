@@ -86,9 +86,16 @@ CHEAP_GATES :=
 HEAVY_GATES :=
 FAST_GATES  :=
 SYSTEM_GATES :=
+# BUILD_SPECS — every package recipe the parallel `build-recipes` phase realizes +
+# reproducibility-checks up front (the corpus, toolchain leaves and library deps). Each
+# package-build gate fragment appends its OWN spec list (so the list lives next to the
+# gate that asserts on it — no drift, no shared line to collide on). BUILD_GATES — the
+# gates that consume that warm cache; they get an order-only dep on `build-recipes`.
+BUILD_SPECS :=
+BUILD_GATES :=
 include $(sort $(wildcard mk/gates/*.mk))
 
-.PHONY: check check-fast check-system container-check list-gates $(CHEAP_GATES) $(HEAVY_GATES) $(SYSTEM_GATES)
+.PHONY: check check-fast check-system container-check list-gates build-recipes $(CHEAP_GATES) $(HEAVY_GATES) $(SYSTEM_GATES)
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -96,7 +103,39 @@ include $(sort $(wildcard mk/gates/*.mk))
 container-check:
 	@./check.sh
 
-check: $(CHEAP_GATES) $(HEAVY_GATES)
+check: $(CHEAP_GATES) build-recipes $(HEAVY_GATES)
+
+# build-recipes — the PARALLEL build phase (DESIGN §7.1 move-off-Guile §5). Separates
+# "build everything" from "the checks": realize + reproducibility-check EVERY package
+# recipe ($(BUILD_SPECS) — the corpus, toolchain leaves and library deps) up front,
+# fanned out across cores, into the shared content-addressed cache (.td-build-cache/pkg).
+# The package build gates then cache-HIT the build and memo-skip the repro double-build,
+# so they only run their durable behavioral + migration-oracle assertions. Each build is
+# single-threaded (the builder runs make serially, NIX_BUILD_CORES=1), so the fan-out is
+# ~nproc wide with no internal oversubscription — overridable with TD_BUILD_JOBS. This is
+# the heavy lifting that USED to run serial-within-gate under -j2; the cache makes the
+# gates' re-build a no-op, so NOTHING is weakened — the same .drv is assembled, realized
+# and double-built, just once and in parallel. Listed first among `check`'s heavy
+# prerequisites (after the cheap serial chain) so make starts it right after the
+# fail-fast structural gates; the build gates wait on it via the order-only dep below.
+build-recipes:
+	@echo ">> build-recipes: realize + reproducibility-check $(words $(BUILD_SPECS)) recipes in parallel into .td-build-cache/pkg ($(BUILD_SPECS))"
+	@set -euo pipefail; \
+	node=`$(GUIX) build node`/bin/node; \
+	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
+	evdrv=`$(GUIX) repl $(LOAD) tests/ts-eval-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	ev=`$(GUIX) build "$$evdrv"`/bin/td-ts-eval; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$ev" -a -x "$$tb" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval / td-builder" >&2; exit 1; }; \
+	for s in $(BUILD_SPECS); do grep ' /gnu/store/' "tests/$$s-no-guix.lock"; done \
+	  | sed 's/^[^ ]* //' | sort -u | xargs $(GUIX) build >/dev/null \
+	  || { echo "ERROR: could not realize the build seed (regenerate locks on a channel bump)" >&2; exit 1; }; \
+	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	export TB="$$tb" CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	jobs=$${TD_BUILD_JOBS:-$$(nproc)}; \
+	echo ">> building $(words $(BUILD_SPECS)) recipes across $$jobs cores (single-threaded each) ..."; \
+	printf '%s\n' $(BUILD_SPECS) | xargs -P "$$jobs" -n1 sh tests/build-pkg.sh; \
+	echo "PASS: build-recipes — all $(words $(BUILD_SPECS)) package recipes realized + reproducible in the shared cache (.td-build-cache/pkg); the build gates now cache-hit + memo-skip the double-build and only assert behavior/oracle."
 
 # The fast tier — the gates that test td's OWN surface (typed/TS front-end + the
 # Rust builder/evaluator) and need only the toolchain: no `guix system image`,
@@ -134,6 +173,13 @@ $(HEAVY_GATES): | $(lastword $(CHEAP_GATES))
 # System-tier gates (on-demand `check-system`) gate on the last cheap gate too, so
 # the structural gates run serial-first there exactly as in `check`.
 $(SYSTEM_GATES): | $(lastword $(CHEAP_GATES))
+# The parallel build phase runs after the fail-fast cheap gates; the package build
+# gates (BUILD_GATES) then wait on it, so by the time they run the cache is warm — they
+# cache-hit + memo-skip and only assert behavior/oracle. The dep is on the build gates
+# (not all heavy gates), so the light tiers stay light: `check-fast` (cheap + ts) and
+# `check-system` never trigger build-recipes.
+build-recipes: | $(lastword $(CHEAP_GATES))
+$(BUILD_GATES): | build-recipes
 
 # `rootless` needs NO special scheduling — it runs as an ordinary heavy gate
 # under -j2 (its only prereq is the generic last-cheap-gate one above). It USED to

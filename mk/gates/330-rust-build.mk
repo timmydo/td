@@ -26,6 +26,10 @@
 # Heavy (a bootstrap td-builder compile + a cargo self-host build + a double-build
 # check), so it slots in the heavy pool with the other td gates.
 HEAVY_GATES += rust-build
+# Ordered AFTER the parallel build phase (its cargo self-host build would otherwise use
+# all cores concurrently with build-recipes' fan-out). td-builder is NOT in BUILD_SPECS
+# — its lock is extended with the freshly-interned source, so it stays self-contained.
+BUILD_GATES += rust-build
 rust-build:
 	@echo ">> rust-build: td self-hosts td-builder via build-recipe (buildSystem rust) — .drv assembled + realized by td, guix/Guile off PATH; it runs, is reproducible, distinct from guix's build"
 	@set -euo pipefail; \

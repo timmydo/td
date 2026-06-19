@@ -16,6 +16,11 @@
 # check double-build), MIGRATION ORACLE (distinct store path from guix's build —
 # own, then diverge). Locks are the guix-built seed.
 HEAVY_GATES += toolchain-no-guix
+# Built up front by the parallel `build-recipes` phase (into the shared cache); this
+# gate then cache-hits + memo-skips and only asserts behavior/oracle.
+toolchain_SPECS := make sed grep xz diffutils patch file coreutils gawk tar findutils bash
+BUILD_SPECS     += $(toolchain_SPECS)
+BUILD_GATES     += toolchain-no-guix
 toolchain-no-guix:
 	@echo ">> toolchain-no-guix: td builds make + sed + grep + xz + diffutils + patch + file + coreutils + gawk + tar + findutils + bash via build-recipe (no guix/Guile in the build path); each runs, reproducible, distinct from guix; gcc/glibc/binutils seed stays external (§5)"
 	@set -euo pipefail; \
@@ -29,8 +34,8 @@ toolchain-no-guix:
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/make-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
-	. tests/cache-lib.sh; TB="$$tb"; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/toolchain"; mkdir -p "$$CACHE"; \
-	for spec in make sed grep xz diffutils patch file coreutils gawk tar findutils bash; do \
+	. tests/cache-lib.sh; TB="$$tb"; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	for spec in $(toolchain_SPECS); do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \
 	  test -s "$$lock" || { echo "ERROR: no lock $$lock" >&2; exit 1; }; \
