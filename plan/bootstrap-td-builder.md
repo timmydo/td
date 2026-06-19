@@ -245,16 +245,40 @@ gone from build-recipes + the package gates (a per-loop guix-call-count drop).
 
 ### Sub-task ladder
 
-1. [ ] `tests/stage0-builder.sh` (bootstrap + stage0-self store-add-builder; idempotent).
-2. [ ] `cache-lib.sh`: `load_stage0`; `cached_build` passes TD_BUILDER_* + asserts the
-       drv builder is stage0; `cached_check` uses stage0.
-3. [ ] `Makefile` build-recipes: place stage0 once, export env, realize the tb seed
-       (exclusive landing — announce).
-4. [ ] Drop `tb=guix build (system td-builder)` from the package gates.
-5. [ ] `./check.sh corpus-no-guix` green (exercises build-recipes → stage0), then the
-       rest; verified-red on the cache-lib structural leg.
-6. [ ] Full landing check; PR (note the Makefile exclusive landing).
+1. [x] `tests/stage0-builder.sh` (bootstrap + stage0-self store-add-builder; memoized on
+       the builder-source fingerprint).
+2. [x] `cache-lib.sh`: `load_stage0`; `cached_build` passes TD_BUILDER_* + asserts the
+       drv builder is stage0 (non-vacuous via a `test -n TD_BUILDER_PATH` guard);
+       `cached_check` uses stage0.
+3. [x] `Makefile` build-recipes: place stage0 once before the fan-out, export env,
+       realize the tb seed (EXCLUSIVE landing).
+4. [x] Dropped `tb=guix build (system td-builder)` from corpus/toolchain/corpus-deps.
+       (rust-* gates call build-recipe directly, not via cache-lib — Brick 3b follow-up.)
+5. [x] `./check.sh corpus-no-guix` then `toolchain-no-guix corpus-deps-no-guix` GREEN.
+6. [ ] Full landing check; PR.
 
 ### Status / evidence (brick 3)
 
-- (in progress)
+- `./check.sh corpus-no-guix`: GREEN. build-recipes built + reproduced ALL 23 recipes on
+  the stage0 td-builder (`p0nvh66…-td-builder-0.1.0` — "NO guix-built td-builder"), and
+  the corpus gate cache-hit the stage0-keyed drvs (the new cache-lib structural leg —
+  "drv builder is stage0" — ran on each). `s23z3h7c…-hello` matches gate 365's stage0
+  hello (consistent stage0). `toolchain-no-guix corpus-deps-no-guix`: GREEN (the 12
+  toolchain leaves + the 5 library deps, all on stage0). guix-dependence census
+  unchanged (it lowers, doesn't build).
+- **Verified-red (stage0 wiring is load-bearing):** no-op'd `load_stage0` → `build-recipes`
+  fails CLOSED — `TD_BUILDER_PATH: unbound variable` (exit 2) — it does NOT silently fall
+  back to the guix-built td-builder; the gnu build path requires the stage0 wiring.
+  Reverted (shell-only perturbation — no td-builder rebuild, corpus cache untouched).
+- The *causal* "drv builder must be the stage0 (not guix-tb)" assertion — the same check
+  this brick generalises into cache-lib — was verified-red in gate 365 (#98, Red #1:
+  dropping the override flipped the builder to guix-tb).
+- guix-tb removed from the gnu build path entirely (build-recipes + the 3 gates +
+  cache-lib + build-pkg.sh: `grep 'system td-builder) td-builder'` → none). Retained as
+  ORACLE only in gates 175 (td-builder) and 365 (bootstrap-build).
+
+### Brick 3b (follow-up): the rust-* gates
+
+`rust-build`/`-vendor`/`-uutils`/`-russh` call `"$tb" build-recipe` directly (not via
+cache-lib) and `rust-build` uses guix-tb as a self-host oracle. Routing them through
+stage0 is a clean separate increment (more nuance: the self-host subject + oracle).
