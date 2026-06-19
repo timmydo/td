@@ -179,9 +179,17 @@ map_path() {
       fi ;;
 
     builder/Cargo.toml|builder/Cargo.lock|builder/src/*)
+      # The td-builder build engine (realize_drv/build_recipe/sandbox/store/drv/nar …)
+      # is the spine of EVERY recipe-building gate — corpus-*, the source-interning and
+      # bootstrap gates, rust-build/vendor/russh/uutils, build-plan, td-check. cargo-test
+      # + the single td-builder gate cannot prove a closure/drv/NAR change is safe across
+      # that whole set (e.g. the src_override + multi-db closure path lives only in the
+      # source-interning gate). So an engine edit is loop-spine: keep cargo-test for fast
+      # feedback but require the full loop — drift-proof as new engine-consuming gates land.
       add_preflight cargo-test
       add_target cargo-test
-      add_target td-builder ;;
+      add_target td-builder
+      require_full "$p is the td-builder build engine (spine of every recipe-building gate); affected-checks cannot waive the full loop." ;;
 
     ts-eval/*|ts-eval/src/*|ts-eval/Cargo.toml|ts-eval/Cargo.lock)
       add_target ts-eval
@@ -429,6 +437,12 @@ run_self_test() {
   assert_target tests/ts/recipe-perturbed.ts drv-emit
   assert_target builder/src/sandbox.rs cargo-test
   assert_target builder/src/sandbox.rs td-builder
+  # The td-builder build engine is the spine of EVERY recipe-building gate (corpus,
+  # source-interning, bootstrap, rust-build, build-plan): a change there cannot be
+  # locally waived on the strength of cargo-test + td-builder alone.
+  assert_branch_policy builder/src/main.rs "full ./check.sh would be required"
+  assert_branch_policy builder/src/sandbox.rs "full ./check.sh would be required"
+  assert_branch_policy builder/Cargo.toml "full ./check.sh would be required"
   assert_target system/td.scm check-system
   assert_branch_policy check.sh "full ./check.sh would be required"
   assert_branch_policy channels.scm "full ./check.sh would be required"
