@@ -61,13 +61,14 @@
 ;; from the td-reproducible census so it does not overstate independence.
 (define not-yet-td-built '("pkg-config"))
 
-;; td's OWN Rust programs, authored as recipes for buildSystem "rust" (the
-;; self-host td-builder + the vendored-deps demo), not guix-corpus reconstructions —
-;; they have no `specification->package` oracle by design, so they don't fit this
-;; corpus closure census (which is rooted in guix package derivations). Their
-;; own-builder proof is the rust-build / rust-vendor gates (td builds them itself,
-;; reproducibly), not a corpus differential.
-(define self-host-specs '("td-builder" "td-vendor-demo"))
+;; Rust programs td builds via its OWN cargo path (buildSystem "rust"): the
+;; self-host td-builder, the vendored-deps demo, and a real uutils tool (`cat` =
+;; uu_cat). These are NOT guix-corpus reconstructions — they have no
+;; `specification->package` oracle by design (the channel has no per-crate
+;; packages), so they don't fit this corpus closure census (which is rooted in guix
+;; package derivations). Their own-builder proof is the rust-build / rust-vendor /
+;; rust-uutils gates (td builds them itself, reproducibly), not a corpus differential.
+(define self-host-specs '("td-builder" "td-vendor-demo" "cat"))
 
 (define owned-specs
   (sort
