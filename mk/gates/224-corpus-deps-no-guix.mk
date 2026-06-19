@@ -21,6 +21,11 @@
 # different drv ⇒ cache miss ⇒ full build + check. Reproducibility/behavior unweakened:
 # the first build still double-builds, and every run re-NAR-verifies the cached output.
 HEAVY_GATES += corpus-deps-no-guix
+# Built up front by the parallel `build-recipes` phase (into the shared cache); this
+# gate then cache-hits + memo-skips and only asserts behavior/oracle.
+deps_SPECS  := libsigsegv libunistring pcre2
+BUILD_SPECS += $(deps_SPECS)
+BUILD_GATES += corpus-deps-no-guix
 corpus-deps-no-guix:
 	@echo ">> corpus-deps-no-guix: td builds libsigsegv + libunistring + pcre2 via build-recipe (no guix/Guile in the build path); each links+runs from td's own output, reproducible, distinct from guix"
 	@set -euo pipefail; \
@@ -38,8 +43,8 @@ corpus-deps-no-guix:
 	test -n "$$gtbin" || { echo "ERROR: could not resolve gcc-toolchain for the link-test" >&2; exit 1; }; \
 	lkh=`for p in $$($(GUIX) build linux-libre-headers 2>/dev/null); do [ -f "$$p/include/linux/limits.h" ] && echo "$$p/include" && break; done`; \
 	test -n "$$lkh" || { echo "ERROR: could not resolve linux-libre-headers for the link-test" >&2; exit 1; }; \
-	. tests/cache-lib.sh; TB="$$tb"; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/corpus-deps"; mkdir -p "$$CACHE"; \
-	for spec in libsigsegv libunistring pcre2; do \
+	. tests/cache-lib.sh; TB="$$tb"; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	for spec in $(deps_SPECS); do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \
 	  test -s "$$lock" || { echo "ERROR: no lock $$lock" >&2; exit 1; }; \
