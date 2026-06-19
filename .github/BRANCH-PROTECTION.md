@@ -18,9 +18,10 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
     `./check.sh` against the `td-ci` image, `ci-image.yml`) — NOT a per-PR check.
     So branch protection requires `check-fast`, never a `check` context (there
     is no such job).
-- `.github/workflows/heal-main.yml` — the optimistic-merge heal net. When the
-  `ci` run (its `check-fast`) fails on a push to main, it opens an auto-revert
-  PR for the suspect squash commit (`ci/revert-suspect.sh`). See "Heal net" below.
+- `ci/revert-suspect.sh` — the optimistic-merge heal primitive. Healing is an
+  AGENT DUTY (not an automated workflow): when an agent sees `check-fast` red on
+  main, it runs this to open a revert PR for the suspect squash commit. See
+  "Heal net" below.
 - `.github/setup-branch-protection.sh` — applies the `protect-main` ruleset:
   PRs only, 1 approving review, required status checks (**NON-strict** since
   2026-06-19 — a PR merges on its own green checks, NOT forced current with main
@@ -96,26 +97,30 @@ constraint) — the image fixes the HOST.
 
 Main is non-strict, so two independently-green PRs can squash-merge into a red
 main. We accept that and heal after the fact instead of forcing every PR to
-rebase-onto-tip + re-run. `heal-main.yml` reacts to a red `check-fast` on main
-by opening a revert PR for the suspect squash commit. Setup:
+rebase-onto-tip + re-run. Healing is an **AGENT DUTY, not an automated workflow**
+(human 2026-06-19) — no `HEAL_PAT` secret, no ruleset bypass, nothing to
+provision.
 
-1. **`HEAL_PAT` secret (required for the net to function).** A PR opened by the
-   default `GITHUB_TOKEN` does NOT trigger the required check runs (GitHub's
-   recursion guard), so such a revert PR could never become mergeable. Provision
-   a machine-account PAT with `repo` scope as the `HEAL_PAT` repository secret;
-   the workflow opens the revert PR with it so `check-fast` runs and auto-merge
-   can arm. Without it the workflow fails loudly (by design).
-2. **Approval (a posture choice).** The bot cannot approve its own PR, so a
-   revert PR waits for the human's approval unless you add the heal bot (or the
-   workflow's token actor) as a **bypass actor** on the `protect-main` ruleset —
-   that gives true zero-latency healing at the cost of an unreviewed merge path.
-   Auto-merge is armed either way, so it lands the instant it is green + approved.
-3. **Scope.** Only the FAST tier is auto-healed. A heavy-only break (boot/VM/
-   marionette/reproducibility, invisible to `check-fast`) is not auto-reverted —
-   it surfaces on the next manual full `./check.sh` and is fixed forward. Running
-   the full loop per-merge in CI isn't feasible (cold hosted runners can't
-   rebuild td's closure; the ci-image is keyed by channel pin, not main commit),
-   so a dev-box periodic full-loop heal is the deferred heavy net.
+1. **The duty.** Whenever an agent fetches main (to start a track or to land),
+   it checks main's latest `check-fast`:
+
+       gh run list --branch main --workflow ci.yml -L 1
+       # or: gh api repos/<owner>/td/commits/main/check-runs
+
+   If it is red, the agent runs `ci/revert-suspect.sh --open-pr` to open a revert
+   PR for the suspect squash commit (main's HEAD) before continuing. The agent
+   opens it with its own bot credentials (the same `~/.local/bin/gh` it uses for
+   every PR), so the revert PR triggers the required checks normally and is
+   reviewed/merged like any other PR — no `GITHUB_TOKEN` recursion-guard problem,
+   so no machine PAT is needed. The script's loop guard refuses to revert a
+   revert (no storms).
+2. **Scope.** Only the FAST tier is covered — `check-fast` is what an agent
+   watches. A heavy-only break (boot/VM/marionette/reproducibility, invisible to
+   `check-fast`) is not caught; it surfaces on the next manual full `./check.sh`
+   and is fixed forward. Running the full loop per-merge in CI isn't feasible
+   (cold hosted runners can't rebuild td's closure; the ci-image is keyed by
+   channel pin, not main commit), so a periodic dev-box full-loop heal is the
+   deferred heavy net.
 
 ## The review deadlock (why the machine account is mandatory)
 
@@ -138,5 +143,6 @@ base**, not the latest tip.
 3. Human review + approval, then squash- or rebase-merge (merge commits
    disabled — linear history). **Do not rebase-onto-tip + re-run just because
    main moved** — that toil is what non-strict drops. Rebase only on a real git
-   conflict, or to sequence an exclusive landing. A broken combination is the
-   heal net's job (above).
+   conflict, or to sequence an exclusive landing. A broken combination is healed
+   by the next agent as a duty (above): before you start or land, if main's
+   `check-fast` is red, open the revert first.

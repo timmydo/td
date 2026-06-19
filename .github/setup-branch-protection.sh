@@ -22,7 +22,7 @@
 #     merge, human 2026-06-19). Dropping strict is the velocity change: main
 #     moving no longer re-arms a rebase + full re-run. The rare broken
 #     combination (green(A)+green(B) ≠ green(A∪B)) is caught after the fact and
-#     auto-reverted — see .github/workflows/heal-main.yml;
+#     reverted by the next agent as a duty (DESIGN §7.2; ci/revert-suspect.sh);
 #   - linear history (rebase/squash merges only — matches the repo's
 #     fast-forward convention; squash is also what makes the heal's revert a
 #     single unambiguous commit);
@@ -41,9 +41,9 @@ repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 checks='{"context": "lint"}, {"context": "check-fast"}'
 
 # Prefer rebase/squash merges; merge commits would break the linear-history
-# rule below. allow_auto_merge is required by both the default landing flow
-# (`gh pr merge --auto --squash`) and the heal net's auto-revert PR
-# (heal-main.yml) — codify it here rather than relying on a manual UI toggle.
+# rule below. allow_auto_merge is required by the default landing flow
+# (`gh pr merge --auto --squash`, including an agent's revert PR) — codify it
+# here rather than relying on a manual UI toggle.
 gh api -X PATCH "repos/$repo" \
   -F allow_merge_commit=false \
   -F allow_rebase_merge=true \

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # revert-suspect.sh — form the revert of the commit that broke main.
 #
-# The optimistic-merge heal net (DESIGN §7.2). Main is NON-strict, so two
+# The optimistic-merge heal primitive (DESIGN §7.2). Main is NON-strict, so two
 # independently-green PRs can squash-merge into a red main (green(A)+green(B) !=
-# green(A∪B)). When check-fast goes red on main, this prepares the revert of the
-# suspect — the squash commit that just landed — so main returns to green for
-# everyone with no human rebase toil. Squash (one commit per merge) is what
-# makes the suspect unambiguous and the revert atomic; this script is invoked by
-# .github/workflows/heal-main.yml.
+# green(A∪B)). Healing is an AGENT DUTY, not an automated workflow: when an agent
+# sees check-fast red on main, it runs this to revert the suspect — the squash
+# commit at main's HEAD — so main returns to green with no human rebase toil.
+# Squash (one commit per merge) is what makes the suspect unambiguous and the
+# revert atomic. The agent runs it with its own bot gh credentials (so --open-pr
+# opens a normal, check-triggering PR — no machine PAT needed).
 #
 #   ci/revert-suspect.sh                 # revert HEAD on a new heal/revert-<sha> branch
 #   ci/revert-suspect.sh --ref <sha>     # revert a specific commit

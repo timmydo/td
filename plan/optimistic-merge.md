@@ -36,8 +36,12 @@ what makes the heal clean: one commit per merge → an unambiguous revert.
 3. [x] Heal primitive: `ci/revert-suspect.sh` — reverts the suspect on a
    `heal/revert-<sha>` branch (based on current main), loop-guard refuses to
    revert a revert (exit 3), `--open-pr` pushes + opens an auto-merge PR.
-4. [x] Heal workflow: `.github/workflows/heal-main.yml` — on the `ci` run
-   (check-fast) failing on a push to main, runs the script with `--open-pr`.
+4. [x] Heal = AGENT DUTY (human pivot 2026-06-19, mid-#103): dropped the
+   automated `.github/workflows/heal-main.yml` + the whole `HEAL_PAT`/bypass
+   story. Instead an agent, when it sees `check-fast` red on main (fetch to
+   start/land), runs `ci/revert-suspect.sh --open-pr` with its own bot gh creds
+   (so the revert PR triggers checks normally — no machine PAT needed). Wired
+   into the §7.2 landing duty in CLAUDE.md / DESIGN / BRANCH-PROTECTION.
 5. [x] Behavioral test: `tests/heal-revert.sh`. NOTE: git is NOT in the loop
    sandbox (like diffutils/awk), so this can't be a `./check.sh` gate — wired
    into CI's `lint` job (hosted, has git) in `ci.yml` instead.

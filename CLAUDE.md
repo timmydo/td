@@ -196,11 +196,17 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
   **Do NOT rebase-onto-tip + re-run just because main moved** — that is the toil
   we deliberately dropped. Rebase only when GitHub reports a real git conflict
   (or for an exclusive-landing sequence). The rare broken combination
-  (green(A)+green(B) ≠ green(A∪B)) is the heal net's job, not yours: a red
-  `check-fast` on main auto-opens a revert PR for the suspect squash commit
-  (`.github/workflows/heal-main.yml`). A heavy-only break (boot/VM/repro, not
-  seen by the fast tier) is NOT auto-caught — it surfaces on the next manual full
-  `./check.sh`; this is an accepted gap of the velocity trade. Marking a PR ready
+  (green(A)+green(B) ≠ green(A∪B)) is healed by an agent, not a bot:
+  **whenever you fetch main — to start a track or to land — check its latest
+  `check-fast`; if it is red, run `ci/revert-suspect.sh --open-pr` to open a
+  revert PR for the suspect squash commit (main's HEAD) before continuing.**
+  Squash makes the suspect atomic; the script's loop guard refuses to revert a
+  revert. There is no automated revert workflow — the duty is the next agent's
+  (check with `gh run list --branch main --workflow ci.yml -L1` or
+  `gh api repos/<owner>/td/commits/main/check-runs`). A heavy-only break
+  (boot/VM/repro, not seen by the fast tier) is NOT caught by check-fast either —
+  it surfaces on the next manual full `./check.sh`; this is an accepted gap of
+  the velocity trade. Marking a PR ready
   with a locally-red or un-run affected-checks gate, or without the full run when
   affected-checks escalates, is still a contract violation — CI verifies your
   run, it does not replace it. `lint` + `check-fast` are the required checks; the

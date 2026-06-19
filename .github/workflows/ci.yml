@@ -54,7 +54,8 @@ jobs:
             for f in "$d"/*.sh; do [ -e "$f" ] || continue; bash -n "$f"; done
           done
       - name: heal-revert primitive (ci/revert-suspect.sh)
-        # The optimistic-merge heal net's revert primitive is git-driven, and the
+        # The optimistic-merge heal primitive (an agent runs it on red main) is
+        # git-driven, and the
         # loop sandbox has no git (like no diffutils/awk), so its DURABLE
         # behavioral test runs HERE — the hosted lint runner has git. It asserts
         # the revert reverses the suspect and the loop guard refuses to revert a

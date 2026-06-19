@@ -804,13 +804,17 @@ contract violation (CI verifies the agent's run; it does not replace it).
 
 The price is that `green(A) + green(B) ≠ green(A∪B)`: two independently-green
 PRs can combine into a red main. That is **accepted and healed after the fact,
-not prevented**. A red `check-fast` on main auto-opens a revert PR for the
-suspect squash commit (`.github/workflows/heal-main.yml`); squash makes the
-suspect a single, atomically-revertable commit (this is the merge-strategy
-reason to keep squash). The net is **the fast tier only** — a heavy-only break
-(boot/VM/marionette/reproducibility, invisible to `check-fast`) is not
-auto-reverted; it surfaces on the next manual full `./check.sh` and is fixed
-forward. Closing that gap by re-running the full loop in CI per-merge is not
+not prevented**, and healing is an **agent duty, not an automated workflow**
+(human 2026-06-19): whenever an agent fetches main — to start or to land — it
+checks main's latest `check-fast`, and if red runs `ci/revert-suspect.sh
+--open-pr` to open a revert PR for the suspect squash commit (main's HEAD).
+Squash makes the suspect a single, atomically-revertable commit (the
+merge-strategy reason to keep squash); the script's loop guard refuses to revert
+a revert. An agent opens the revert PR with its own bot credentials, so it
+triggers the required checks and needs no machine PAT or ruleset bypass. The net
+is **the fast tier only** — a heavy-only break (boot/VM/marionette/
+reproducibility, invisible to `check-fast`) is not caught; it surfaces on the
+next manual full `./check.sh` and is fixed forward. Closing that gap by re-running the full loop in CI per-merge is not
 feasible (cold hosted runners can't rebuild td's closure; the ci-image is keyed
 by channel pin, not main commit), so a dev-box periodic full-loop heal is the
 deferred heavy net. The fast check is cheap and does not meaningfully count
