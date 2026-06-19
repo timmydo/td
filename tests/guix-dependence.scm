@@ -68,7 +68,7 @@
 ;; packages), so they don't fit this corpus closure census (which is rooted in guix
 ;; package derivations). Their own-builder proof is the rust-build / rust-vendor /
 ;; rust-uutils gates (td builds them itself, reproducibly), not a corpus differential.
-(define self-host-specs '("td-builder" "td-vendor-demo" "cat"))
+(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo"))
 
 (define owned-specs
   (sort
