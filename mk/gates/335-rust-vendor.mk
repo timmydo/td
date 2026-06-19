@@ -21,7 +21,8 @@
 HEAVY_GATES += rust-vendor
 # Ordered AFTER the parallel build-recipes phase (its cargo build would otherwise
 # oversubscribe cores against build-recipes' fan-out). Not in BUILD_SPECS — the source
-# is interned at gate time, so the gate is self-contained.
+# is interned at gate time by td's OWN recursive addToStore (tests/intern-src.sh →
+# store-add-recursive, no `guix repl`; move-off-Guile §5), so the gate is self-contained.
 BUILD_GATES += rust-vendor
 rust-vendor:
 	@echo ">> rust-vendor: td builds td-vendor-demo (depends on itoa + ryu) via build-recipe with VENDORED deps (offline, guix/Guile off PATH); it runs + is reproducible"
@@ -41,13 +42,14 @@ rust-vendor:
 	test "$$ncrate" -ge 2 || { echo "ERROR: lock has <2 vendored .crate deps ($$ncrate)" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.td-build-cache/rust-vendor"; mkdir -p "$$scratch/tmp" "$$scratch/b"; rm -f "$$scratch/b/"*.drv; \
 	grep ' /gnu/store/' "$$lock0" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the seed + vendored .crate deps (warm static.crates.io fetches; regenerate the lock on a channel/dep bump)" >&2; exit 1; }; \
-	src=`$(GUIX) repl $(LOAD) tests/td-vendor-demo-source.scm 2>/dev/null | sed -n 's/^SRC=//p'`; \
-	test -n "$$src" -a -d "$$src" || { echo "ERROR: could not intern the vendor-demo crate tree" >&2; exit 1; }; \
+	srcinfo=`sh tests/intern-src.sh "$$tb" td-vendor-demo-src "$(CURDIR)/tests/vendor-demo" "$$scratch" target .cargo` || { echo "ERROR: td could not intern the vendor-demo crate tree (store-add-recursive)" >&2; exit 1; }; \
+	eval "$$srcinfo"; \
+	test -n "$$src" -a -d "$$srcstore/`basename "$$src"`" || { echo "ERROR: td interned no vendor-demo source tree (store-add-recursive)" >&2; exit 1; }; \
 	lock="$$scratch/td-vendor-demo.lock"; { cat "$$lock0"; echo "td-vendor-demo-source $$src"; } > "$$lock"; \
 	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-vendor-demo.ts" > "$$scratch/td-vendor-demo.json"; \
 	test -s "$$scratch/td-vendor-demo.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/td-vendor-demo.json" "$$lock" "$$sd" /var/guix/db/db.sqlite > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe vendored build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/td-vendor-demo.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe vendored build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; fi; \

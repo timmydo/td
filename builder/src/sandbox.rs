@@ -36,6 +36,20 @@ fn err(what: String) -> io::Error {
     io::Error::new(io::ErrorKind::Other, what)
 }
 
+/// A closure entry is either a bare CANONICAL store path or `CANONICAL\tON-DISK`.
+/// The canonical half is the `/gnu/store/<base>` path the build must SEE; the
+/// on-disk half is where the tree physically lives on the host to bind FROM. They
+/// differ only for a td-interned item (e.g. a source td restored into its OWN store
+/// dir, never registered with the daemon) — every daemon-resident item is a bare
+/// path, so on-disk defaults to canonical. This keeps a td-owned store reachable by
+/// the sandbox with no extra argument, the encoding riding through `closure.txt`.
+pub fn split_closure_entry(entry: &str) -> (&str, &str) {
+    match entry.split_once('\t') {
+        Some((canonical, on_disk)) => (canonical, on_disk),
+        None => (entry, entry),
+    }
+}
+
 /// build.cc storePathToName: strip the store dir and the 32-char base32
 /// hash + dash. For a drv path the result KEEPS the .drv suffix.
 pub fn store_path_name(path: &str) -> io::Result<&str> {
@@ -72,12 +86,16 @@ pub fn build(
     let newstore = scratch.join("newstore");
     fs::create_dir_all(&newstore)?;
     let mut binds: Vec<(CString, CString)> = Vec::with_capacity(closure.len());
-    for p in closure {
-        let meta = fs::symlink_metadata(p)
-            .map_err(|e| err(format!("closure item {p}: {e}")))?;
+    for entry in closure {
+        // CANONICAL is the store path the build SEES; ON-DISK is where to bind FROM
+        // (== canonical for daemon-resident items, a td store dir for td-interned ones).
+        let (canonical, on_disk) = split_closure_entry(entry);
+        let meta = fs::symlink_metadata(on_disk)
+            .map_err(|e| err(format!("closure item {canonical} (on disk {on_disk}): {e}")))?;
         let target = newstore.join(
-            p.strip_prefix(STORE)
-                .ok_or_else(|| err(format!("closure item {p}: not a store path")))?,
+            canonical
+                .strip_prefix(STORE)
+                .ok_or_else(|| err(format!("closure item {canonical}: not a store path")))?,
         );
         if meta.is_dir() {
             fs::create_dir_all(&target)?;
@@ -86,10 +104,10 @@ pub fn build(
         } else {
             // A symlink cannot be bind-mounted; no pinned-channel closure
             // has top-level symlink store items — refuse rather than guess.
-            return Err(err(format!("closure item {p}: unsupported file type")));
+            return Err(err(format!("closure item {canonical}: unsupported file type")));
         }
         binds.push((
-            CString::new(p.as_str()).map_err(|_| err(format!("{p}: NUL in path")))?,
+            CString::new(on_disk).map_err(|_| err(format!("{on_disk}: NUL in path")))?,
             CString::new(target.as_os_str().as_encoded_bytes())
                 .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
         ));
@@ -568,5 +586,18 @@ mod tests {
             "/gnu/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-td-builder-0.1.0/bin/td-builder"
         )
         .is_err());
+    }
+
+    #[test]
+    fn closure_entry_splits_canonical_from_on_disk() {
+        // A bare entry binds from its canonical path (the daemon-resident case).
+        let bare = "/gnu/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-td-builder-src";
+        assert_eq!(split_closure_entry(bare), (bare, bare));
+        // A `CANONICAL\tON-DISK` entry binds from the td store dir but the build
+        // still SEES the canonical path (the td-interned source case).
+        let canonical = "/gnu/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-td-builder-src";
+        let on_disk = "/scratch/srcstore/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-td-builder-src";
+        let entry = format!("{canonical}\t{on_disk}");
+        assert_eq!(split_closure_entry(&entry), (canonical, on_disk));
     }
 }

@@ -24,7 +24,9 @@
 HEAVY_GATES += rust-russh
 # Ordered AFTER the parallel build-recipes phase (its 188-crate cargo build, incl. the
 # aws-lc C crypto, would otherwise oversubscribe cores against build-recipes' fan-out).
-# Not in BUILD_SPECS — the source is interned at gate time, so the gate is self-contained.
+# Not in BUILD_SPECS — the source is interned at gate time by td's OWN recursive
+# addToStore (tests/intern-src.sh → store-add-recursive, no `guix repl`; move-off-Guile
+# §5), so the gate is self-contained.
 BUILD_GATES += rust-russh
 rust-russh:
 	@echo ">> rust-russh: td builds a russh client<->server SSH round-trip (188 vendored deps incl. aws-lc crypto) from source via build-recipe (offline, guix/Guile off PATH); the SSH session works + is reproducible"
@@ -44,13 +46,14 @@ rust-russh:
 	test "$$ncrate" -ge 150 || { echo "ERROR: lock has <150 vendored .crate deps ($$ncrate) — regenerate from the demo's Cargo.lock" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.td-build-cache/rust-russh"; mkdir -p "$$scratch/tmp" "$$scratch/b"; rm -f "$$scratch/b/"*.drv; \
 	grep ' /gnu/store/' "$$lock0" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the seed + vendored .crate deps (warm static.crates.io fetches; regenerate the lock on a channel/dep bump)" >&2; exit 1; }; \
-	src=`$(GUIX) repl $(LOAD) tests/td-russh-demo-source.scm 2>/dev/null | sed -n 's/^SRC=//p'`; \
-	test -n "$$src" -a -d "$$src" || { echo "ERROR: could not intern the russh-demo crate tree" >&2; exit 1; }; \
+	srcinfo=`sh tests/intern-src.sh "$$tb" td-russh-demo-src "$(CURDIR)/tests/russh-demo" "$$scratch" target .cargo` || { echo "ERROR: td could not intern the russh-demo crate tree (store-add-recursive)" >&2; exit 1; }; \
+	eval "$$srcinfo"; \
+	test -n "$$src" -a -d "$$srcstore/`basename "$$src"`" || { echo "ERROR: td interned no russh-demo source tree (store-add-recursive)" >&2; exit 1; }; \
 	lock="$$scratch/td-russh-demo.lock"; { cat "$$lock0"; echo "td-russh-demo-source $$src"; } > "$$lock"; \
 	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-russh-demo.ts" > "$$scratch/russh.json"; \
 	test -s "$$scratch/russh.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/russh.json" "$$lock" "$$sd" /var/guix/db/db.sqlite > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe russh build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/russh.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe russh build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; fi; \
