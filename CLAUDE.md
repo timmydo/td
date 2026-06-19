@@ -82,6 +82,35 @@ sandbox.
 
 Do not proceed to the next sub-task until the current one is green.
 
+### Diff-sized local check and waiver
+
+Use the affected-check dispatcher for the fast inner loop and for local PR
+readiness when a full run would stall progress:
+
+```
+tools/affected-checks.sh        # show changed paths and selected checks
+tools/affected-checks.sh --run  # run the selected preflights and ./check.sh targets
+```
+
+It compares the branch to `origin/main` (falling back to `main`) and includes dirty,
+staged, and untracked files by default. Use `--committed-only` before push/PR review
+when you want the committed branch diff only, or `--path FILE` to inspect the mapping
+for a specific file.
+
+After rebasing for PR readiness, run:
+
+```
+tools/affected-checks.sh --committed-only --run
+```
+
+If it prints `Waiver: full ./check.sh waived by affected-checks for this diff`,
+that is the local waiver for the full loop; record the selected checks and waiver
+line in the PR body. If it prints `Waiver: full ./check.sh required before
+marking ready`, `--run` executes the selected checks and then the full `./check.sh`
+before it can exit successfully. Full-loop escalation is mandatory for changes the
+dispatcher cannot classify, changes to the loop spine (`check.sh`, `Makefile`,
+`system/td.scm`, `DIGESTS.md`), CI/runner gating, and channel pin changes.
+
 ## Verified-red discipline
 
 A green behavioral gate is only meaningful once you have SEEN it red. For every new
@@ -152,20 +181,24 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
   on a shared checkout of main. Keep running notes, sub-task ladder, and verified-red
   evidence in `plan/<track>.md` — never edit another track's file.
 - **Land (merge on green, via PR):** (1) fetch + rebase onto latest `origin/main`;
-  (2) run the FULL `./check.sh` — must be green; (3) push the branch and mark the PR
-  ready — CI re-runs the gate and a human review approves (main is branch-protected:
+  (2) run `tools/affected-checks.sh --committed-only --run`; if it waives the full
+  loop, record the waiver in the PR body; if it escalates, it runs the FULL
+  `./check.sh` before returning success, so record the escalation and full result
+  instead; (3) push the branch and mark the PR ready — CI re-runs the required hosted
+  gate and a human review approves (main is branch-protected:
   required checks + mandatory review, no direct pushes — `.github/BRANCH-PROTECTION.md`);
   (4) merge once green and approved — default to arming auto-merge when you mark
   the PR ready (`gh pr merge --auto --squash`, or `--rebase`) so the human's
   approval is the last manual step; merge manually instead when the landing must
   be sequenced (e.g. exclusive landings stacked behind another PR). If main moved
-  before the merge, repeat from (1) — auto-merge does not waive the rebase + full
-  re-check obligation. Opening a PR with a locally-red or un-run `./check.sh` is a
+  before the merge, repeat from (1) — auto-merge does not waive the rebase + affected
+  check/full-escalation obligation. Marking a PR ready with a locally-red or un-run
+  affected-checks gate, or without the full run when affected-checks escalates, is a
   contract violation — CI verifies your run, it does not replace it. The hosted
   runner's full `./check.sh` check (fed by the CI store image —
   `ci/build-ci-image.sh`) becomes required once the image is published (DESIGN
-  §7.1); until then `lint` is the required check and step 2 is the only
-  full-loop gate.
+  §7.1); until then `lint` is the required check and step 2 is the local readiness
+  gate.
 - **Exclusive landings:** changes to the shared spine — `system/td.scm` (frozen
   oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
   everyone. Announce in your track file, land as small standalone PRs, expect
@@ -234,6 +267,12 @@ it.
   markers; the `plan-index` gate enforces sync). `plan/tracks/<track>.md` — one track's
   status record (the claim source of truth). `plan/<track>.md` — per-track working
   notes, single writer. `M10-design.md` — the M10 design note.
+- `tools/affected-checks.sh` — diff-to-check dispatcher for local iteration and PR
+  readiness. Run it first to see the selected checks, then
+  `tools/affected-checks.sh --run` to execute them. Its waiver line decides whether
+  the local full `./check.sh` run is waived or still required; `--run` enforces
+  escalation by running the full loop when required. Its own mapping guard is
+  `tools/affected-checks.sh --self-test`.
 - `HISTORY.md` — completed-milestone record. `DIGESTS.md` — reproducibility record
   (changes only on oracle re-baseline; exclusive landing).
 
@@ -261,5 +300,5 @@ it.
 - Small green increments. Each commit message states which test now passes (e.g.
   "boot test asserts expected kernel via uname -r"). Prefer many small commits over one
   large change. Every commit is sub-agent-reviewed first (Workflow step 5). Land on
-  main only via the §7.2 protocol (rebase → full green check → PR → CI green +
-  human approval → rebase/squash-merge).
+  main only via the §7.2 protocol (rebase → affected-checks waiver or full escalation
+  → PR → CI green + human approval → rebase/squash-merge).
