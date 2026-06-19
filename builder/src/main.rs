@@ -19,6 +19,7 @@ mod build;
 mod daemon;
 mod drv;
 mod json;
+mod lock;
 mod nar;
 mod sandbox;
 mod scan;
@@ -564,29 +565,29 @@ fn build_recipe(
         Some(p) => p.to_json_string(),
         None => String::new(),
     };
-    // Resolve EVERY input from the lock (no Guile). The `<name>-source` entry is the
-    // source (TD_SRC); a `*.crate` entry is a vendored Rust dependency (TD_VENDOR_CRATES);
-    // every other entry is a toolchain build input (TD_INPUTS). Each is also an input-src.
-    let lock = std::fs::read_to_string(lock_file).map_err(|e| format!("read lock {lock_file}: {e}"))?;
+    // Resolve EVERY input from the lock (no Guile), via the typed lock parser
+    // (`NAME PATH [CLASS]`, backward-compatible with 2-field locks). The `source`
+    // entry is TD_SRC; a `crate` entry is a vendored Rust dependency
+    // (TD_VENDOR_CRATES); a `seed` or `td-recipe-output` entry is a build input
+    // (TD_INPUTS). Each input is also an input-src. A `td-recipe-output` entry's
+    // PATH is td's own dep build when build-plan substituted it, or the guix
+    // oracle when this lock is consumed standalone — either way it is just an
+    // input here.
+    let lock_text =
+        std::fs::read_to_string(lock_file).map_err(|e| format!("read lock {lock_file}: {e}"))?;
     let src_key = format!("{name}-source");
+    let entries = lock::parse(&lock_text, &src_key)?;
     let mut source = String::new();
     let mut inputs: Vec<String> = Vec::new();
-    // Vendored Rust deps: lock entries whose NAME ends `.crate` are the dependency
-    // closure (from Cargo.lock), handed to the rust phase runner as TD_VENDOR_CRATES
-    // rather than as toolchain inputs. A gnu recipe has none, so its spec is unchanged.
+    // Vendored Rust deps: `crate`-class entries are the dependency closure (from
+    // Cargo.lock), handed to the rust phase runner as TD_VENDOR_CRATES rather than
+    // as toolchain inputs. A gnu recipe has none, so its spec is unchanged.
     let mut vendor: Vec<String> = Vec::new();
-    for line in lock.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (k, path) = line.split_once(' ').ok_or_else(|| format!("malformed lock line: {line}"))?;
-        if k == src_key {
-            source = path.to_string();
-        } else if k.ends_with(".crate") {
-            vendor.push(path.to_string());
-        } else {
-            inputs.push(path.to_string());
+    for e in &entries {
+        match e.class {
+            lock::Class::Source => source = e.path.clone(),
+            lock::Class::Crate => vendor.push(e.path.clone()),
+            lock::Class::Seed | lock::Class::TdRecipeOutput => inputs.push(e.path.clone()),
         }
     }
     if source.is_empty() {
