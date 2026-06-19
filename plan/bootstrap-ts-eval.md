@@ -77,3 +77,42 @@ the OTHER gates' ts-emit (using the td-built td-ts-eval) is Brick 4b.
   is gate 365 / Brick 3b.)
 - Bootstrap circularity honest: guix-built td-ts-eval is the SEED (evaluates the recipe)
   + oracle; Brick 4b swaps the OTHER gates' ts-emit onto the td-built evaluator.
+
+## Brick 4b (claude-fable-300f35): the gnu gates evaluate with td's own td-ts-eval
+
+**Goal.** The gnu-recipe build path (build-recipes phase + corpus/toolchain/corpus-deps
+gates) evaluates its recipes with the td-BUILT td-ts-eval, not the guix-built one —
+removing `guix build (system td-ts) td-ts-eval` from those gates. The td-built evaluator
+produces byte-identical JSON to guix's (same source, rust-ts-eval oracle), so NO build
+output changes — the swap changes WHO evaluates, not WHAT'S built. node + tsc stay guix
+(ts-emit's transpile step); 4b removes only the evaluate-step invocation.
+
+**The prelude is fixed, not a per-loop cost.** td-ts-eval is built ONCE via the shared
+`tests/ts-eval-tool.sh` (the rust-ts-eval gate's build logic, extracted) into a
+content-addressed cache; warm reruns REFERENCE the cached binary instantly (like guix
+references its substituted one). The cold build is one more td-built artifact, same model
+as the corpus/toolchain — and SHARED: build-recipes builds it once, the rust-ts-eval gate
+then cache-hits it (no double-build).
+
+**Design.**
+- `tests/ts-eval-tool.sh` — extract the rust-ts-eval build (intern ts-eval/, ts-emit
+  recipe-td-ts-eval.ts with the SEED, build-recipe with stage0, memoized); print the
+  td-built binary path + write a sentinel.
+- `mk/gates/350-rust-ts-eval.mk` — refactor to call ts-eval-tool.sh for the build, then
+  run its asserts (behavioral/repro/oracle/structural) on the result.
+- `tests/cache-lib.sh load_ts_eval` — read the sentinel → export TD_TS_EVAL=<td-built>.
+- `Makefile build-recipes` (EXCLUSIVE) — resolve the SEED + node/tsc + load_stage0, build
+  td-ts-eval via ts-eval-tool.sh (the prelude, cached), export TD_TS_EVAL=<td-built>.
+- gnu gates — drop `ev=guix build (system td-ts) td-ts-eval`; `load_ts_eval` provides
+  TD_TS_EVAL (reads the sentinel build-recipes wrote). Add a DURABLE structural leg: the
+  gate's TD_TS_EVAL is the td-built path (under .td-build-cache), NOT guix's /gnu/store.
+
+**Acceptance.** corpus/toolchain/corpus-deps green with TD_TS_EVAL = the td-built
+evaluator (structural leg); outputs unchanged (cache-hit); census unchanged. Verified-red:
+force load_ts_eval to the guix seed → the structural leg fires. The
+`guix build (system td-ts) td-ts-eval` invocation is gone from the gnu gates (only the
+build-recipes prelude resolves the seed, once, to BUILD td-ts-eval).
+
+### Status / evidence (4b)
+
+- (in progress)
