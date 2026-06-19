@@ -17,9 +17,15 @@
 #   - no direct pushes: changes land only via pull request;
 #   - 1 approving review, NOT dismissed on new pushes (so the bot's rebases /
 #     force-pushes don't drop the human approval — #82, dismiss_stale=false);
-#   - required status checks (strict: branch must be current with main);
+#   - required status checks, NON-strict: a PR merges on its own green checks
+#     WITHOUT being forced current with main first (DESIGN §7.2, optimistic
+#     merge, human 2026-06-19). Dropping strict is the velocity change: main
+#     moving no longer re-arms a rebase + full re-run. The rare broken
+#     combination (green(A)+green(B) ≠ green(A∪B)) is caught after the fact and
+#     reverted by the next agent as a duty (DESIGN §7.2; ci/revert-suspect.sh);
 #   - linear history (rebase/squash merges only — matches the repo's
-#     fast-forward convention);
+#     fast-forward convention; squash is also what makes the heal's revert a
+#     single unambiguous commit);
 #   - no force pushes, no branch deletion.
 #
 # NOTE (enforcement): GitHub only enforces rulesets on PRIVATE repos under
@@ -35,13 +41,16 @@ repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 checks='{"context": "lint"}, {"context": "check-fast"}'
 
 # Prefer rebase/squash merges; merge commits would break the linear-history
-# rule below.
+# rule below. allow_auto_merge is required by the default landing flow
+# (`gh pr merge --auto --squash`, including an agent's revert PR) — codify it
+# here rather than relying on a manual UI toggle.
 gh api -X PATCH "repos/$repo" \
   -F allow_merge_commit=false \
   -F allow_rebase_merge=true \
   -F allow_squash_merge=true \
+  -F allow_auto_merge=true \
   -F delete_branch_on_merge=true >/dev/null
-echo "repo merge settings: rebase/squash only, auto-delete merged branches"
+echo "repo merge settings: rebase/squash only, auto-merge on, auto-delete merged branches"
 
 # Replace any previous version of the ruleset (idempotent re-runs).
 existing=$(gh api "repos/$repo/rulesets" -q '.[] | select(.name == "protect-main") | .id' | head -n1 || true)
@@ -78,7 +87,7 @@ gh api -X "$method" "$path" --input - <<EOF >/dev/null
     {
       "type": "required_status_checks",
       "parameters": {
-        "strict_required_status_checks_policy": true,
+        "strict_required_status_checks_policy": false,
         "required_status_checks": [ $checks ]
       }
     }

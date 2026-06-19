@@ -780,32 +780,49 @@ Each agent works one claimed track in its **own git worktree/branch** — never
 directly on a shared checkout of main. Main is branch-protected: no direct
 pushes; every landing is a pull request gated on required CI checks and one
 human approval (`.github/BRANCH-PROTECTION.md` is the setup/operations note).
-To land:
+To land (**optimistic merge** — main is non-strict since 2026-06-19):
 
-1. fetch and rebase onto latest `origin/main`;
-2. run the **full** `./check.sh` — it must be green;
-3. push the branch and mark its PR ready for review; CI re-runs the cheap gate
-   (`lint` + `check-fast` — the fast tier `./check.sh check-fast` on a hosted
-   runner via the small `td-ci-fast` store image; since #26 CI runs the fast
-   tier ONLY, the full hermetic loop stays on the dev machine in step 2 plus the
-   ci-image pipeline's `validate` job);
-4. on green CI and human approval, rebase- or squash-merge (merge commits are
-   disabled — history stays linear, as under the old fast-forward rule);
-5. if main moved meanwhile, go to 1.
+1. validate against your **own base**: run the loop green — `./check.sh`, or
+   `tools/affected-checks.sh --committed-only --run` (which waives the full loop
+   or escalates to it per the diff);
+2. push the branch and mark its PR ready; CI runs `lint` + `check-fast` (the
+   fast tier `./check.sh check-fast` on a hosted runner via the small
+   `td-ci-fast` store image — since #26 CI runs the fast tier ONLY; the full
+   loop stays the dev-machine gate in step 1 plus the ci-image pipeline's
+   `validate` job);
+3. on green CI and one human approval, squash- or rebase-merge (merge commits
+   disabled — history stays linear).
 
-The human approval replaces the old "no human merge step; review-after on
-main", and this PR protocol supersedes the same-day no-PR amendment (the human
-re-decided later on 2026-06-11: PRs with mandatory review, not status-gated
-fast-forwards). The runner's `check-fast` check is now a required check
-alongside `lint` (the `td-ci-fast` image is published and check-fast has been
-green on recent PRs — 2026-06-18); step 2 — the dev-machine full `./check.sh` —
-remains the only FULL-loop gate, since the per-PR runner runs the fast tier
-only, by #26. The fast check is cheap and does not
-meaningfully count toward the §7.3 two-concurrent-checks ceiling; the full loop
-that does count runs on the dev machine. "Validated" still means green against the main
-actually merged into — opening a ready PR with a locally-red or un-run full
-`./check.sh` is a contract violation (CI verifies the agent's run; it does
-not replace it).
+Main is **non-strict** (`strict_required_status_checks_policy: false`): a PR
+merges on its **own** green checks; **main moving under you no longer forces a
+rebase-onto-tip + re-run**. Dropping that requirement is the velocity change
+(human 2026-06-19) — and it supersedes the old step "if main moved, go to 1".
+Rebase only when GitHub reports a real git conflict, or to sequence an exclusive
+landing (§7.3) — not merely because main advanced. "Validated" means green
+against your base — a ready PR on a locally-red or un-run loop is still a
+contract violation (CI verifies the agent's run; it does not replace it).
+
+The price is that `green(A) + green(B) ≠ green(A∪B)`: two independently-green
+PRs can combine into a red main. That is **accepted and healed after the fact,
+not prevented**, and healing is an **agent duty, not an automated workflow**
+(human 2026-06-19): whenever an agent fetches main — to start or to land — it
+checks main's latest `check-fast`, and if red runs `ci/revert-suspect.sh
+--open-pr` to open a revert PR for the suspect squash commit (main's HEAD).
+Squash makes the suspect a single, atomically-revertable commit (the
+merge-strategy reason to keep squash); the script's loop guard refuses to revert
+a revert. An agent opens the revert PR with its own bot credentials, so it
+triggers the required checks and needs no machine PAT or ruleset bypass. The net
+is **the fast tier only** — a heavy-only break (boot/VM/marionette/
+reproducibility, invisible to `check-fast`) is not caught; it surfaces on the
+next manual full `./check.sh` and is fixed forward. Closing that gap by re-running the full loop in CI per-merge is not
+feasible (cold hosted runners can't rebuild td's closure; the ci-image is keyed
+by channel pin, not main commit), so a dev-box periodic full-loop heal is the
+deferred heavy net. The fast check is cheap and does not meaningfully count
+toward the §7.3 two-concurrent-checks ceiling; the full loop that does runs on
+the dev machine.
+
+The human approval (here since 2026-06-11) replaced the original "no human merge
+step; review-after on main".
 
 Claims: one agent per track, recorded in the track's own record
 `plan/tracks/<track>.md` (`status: claimed` + handle + date) with PLAN.md's table

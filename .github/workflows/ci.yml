@@ -46,11 +46,21 @@ jobs:
     steps:
       # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: shell syntax (check.sh, tests/*.sh)
+      - name: shell syntax (check.sh, tests/*.sh, ci/*.sh, .github/*.sh)
         run: |
           set -eu
           bash -n check.sh
-          for f in tests/*.sh; do [ -e "$f" ] || continue; bash -n "$f"; done
+          for d in tests ci .github; do
+            for f in "$d"/*.sh; do [ -e "$f" ] || continue; bash -n "$f"; done
+          done
+      - name: heal-revert primitive (ci/revert-suspect.sh)
+        # The optimistic-merge heal primitive (an agent runs it on red main) is
+        # git-driven, and the
+        # loop sandbox has no git (like no diffutils/awk), so its DURABLE
+        # behavioral test runs HERE — the hosted lint runner has git. It asserts
+        # the revert reverses the suspect and the loop guard refuses to revert a
+        # revert (DESIGN §7.2; tests/heal-revert.sh).
+        run: bash tests/heal-revert.sh
       - name: channels.scm carries a parseable 40-hex pin
         # Same sed check.sh's integrity guard uses; an unparseable pin would
         # make every runner check fail with a confusing message, so fail it

@@ -18,9 +18,15 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
     `./check.sh` against the `td-ci` image, `ci-image.yml`) — NOT a per-PR check.
     So branch protection requires `check-fast`, never a `check` context (there
     is no such job).
+- `ci/revert-suspect.sh` — the optimistic-merge heal primitive. Healing is an
+  AGENT DUTY (not an automated workflow): when an agent sees `check-fast` red on
+  main, it runs this to open a revert PR for the suspect squash commit. See
+  "Heal net" below.
 - `.github/setup-branch-protection.sh` — applies the `protect-main` ruleset:
-  PRs only, 1 approving review, required status checks, linear history, no
-  force pushes or deletion.
+  PRs only, 1 approving review, required status checks (**NON-strict** since
+  2026-06-19 — a PR merges on its own green checks, NOT forced current with main
+  first; DESIGN §7.2 optimistic merge), linear history, no force pushes or
+  deletion.
 
 ## One-time setup (repo admin)
 
@@ -87,6 +93,35 @@ constraint) — the image fixes the HOST.
   the 4-vCPU hosted runner (vs ~6 min on the dev box) — well inside the job's
   240-min timeout.
 
+## Heal net (optimistic merge — DESIGN §7.2)
+
+Main is non-strict, so two independently-green PRs can squash-merge into a red
+main. We accept that and heal after the fact instead of forcing every PR to
+rebase-onto-tip + re-run. Healing is an **AGENT DUTY, not an automated workflow**
+(human 2026-06-19) — no `HEAL_PAT` secret, no ruleset bypass, nothing to
+provision.
+
+1. **The duty.** Whenever an agent fetches main (to start a track or to land),
+   it checks main's latest `check-fast`:
+
+       gh run list --branch main --workflow ci.yml -L 1
+       # or: gh api repos/<owner>/td/commits/main/check-runs
+
+   If it is red, the agent runs `ci/revert-suspect.sh --open-pr` to open a revert
+   PR for the suspect squash commit (main's HEAD) before continuing. The agent
+   opens it with its own bot credentials (the same `~/.local/bin/gh` it uses for
+   every PR), so the revert PR triggers the required checks normally and is
+   reviewed/merged like any other PR — no `GITHUB_TOKEN` recursion-guard problem,
+   so no machine PAT is needed. The script's loop guard refuses to revert a
+   revert (no storms).
+2. **Scope.** Only the FAST tier is covered — `check-fast` is what an agent
+   watches. A heavy-only break (boot/VM/marionette/reproducibility, invisible to
+   `check-fast`) is not caught; it surfaces on the next manual full `./check.sh`
+   and is fixed forward. Running the full loop per-merge in CI isn't feasible
+   (cold hosted runners can't rebuild td's closure; the ci-image is keyed by
+   channel pin, not main commit), so a periodic dev-box full-loop heal is the
+   deferred heavy net.
+
 ## The review deadlock (why the machine account is mandatory)
 
 GitHub does not let a PR author approve their own PR. If agents push branches
@@ -98,9 +133,16 @@ requirement would need that decision revisited, not just a script edit.)
 
 ## Day-to-day landing (replaces direct pushes)
 
-1. Rebase your track branch onto latest `origin/main`.
-2. Run the full `./check.sh` locally — must be green (CI verifies, it does
-   not replace your own run; "fix forward in CI" wastes the runner).
-3. Push the branch, open the PR (`gh pr create`), wait for `lint` + `check-fast`.
-4. Human review + approval, then rebase- or squash-merge. Merge commits are
-   disabled (linear history, matching the old fast-forward convention).
+Optimistic merge (non-strict since 2026-06-19): validate against your **own
+base**, not the latest tip.
+
+1. Run the loop green locally — `./check.sh`, or
+   `tools/affected-checks.sh --committed-only --run` (waives or escalates to the
+   full loop per the diff). CI verifies your run; it does not replace it.
+2. Push the branch, open the PR (`gh pr create`), wait for `lint` + `check-fast`.
+3. Human review + approval, then squash- or rebase-merge (merge commits
+   disabled — linear history). **Do not rebase-onto-tip + re-run just because
+   main moved** — that toil is what non-strict drops. Rebase only on a real git
+   conflict, or to sequence an exclusive landing. A broken combination is healed
+   by the next agent as a duty (above): before you start or land, if main's
+   `check-fast` is red, open the revert first.

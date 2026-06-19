@@ -296,6 +296,13 @@ map_path() {
       add_preflight shell-syntax
       add_preflight affected-self-test ;;
 
+    tests/heal-revert.sh)
+      # CI-lint-only behavioral test of ci/revert-suspect.sh (the heal
+      # primitive). git is absent from the loop sandbox, so it is NOT a
+      # ./check.sh gate — it runs in ci.yml's lint job. Shell-syntax suffices
+      # for local readiness; the lint job runs the test itself.
+      add_preflight shell-syntax ;;
+
     ci/build-ci-image.sh|ci/import-store.sh|ci/lower-*.sh|.github/setup-branch-protection.sh|.github/workflows/*)
       add_preflight shell-syntax
       require_full "$p affects CI or runner gating; affected-checks cannot waive the full local loop."
