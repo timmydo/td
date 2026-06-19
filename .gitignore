@@ -32,3 +32,6 @@
 # CI store image staging (ci/build-ci-image.sh default workdir; ~65G).
 .ci-image-work/
 .store-backend-scratch/
+
+# Persistent content-addressed build-recipe cache (skip-if-already-realized).
+.td-build-cache/

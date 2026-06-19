@@ -115,6 +115,7 @@ fn host_guix_bin_dir() -> Option<String> {
 
 /// One built output's post-build registration facts — the daemon's per-path
 /// record (the `build`/`realize` NAR scan computes these).
+#[derive(Clone)]
 struct OutputReg {
     store_path: String,
     nar_hash: String,
@@ -280,6 +281,77 @@ fn build_and_register(
     }
     std::fs::write(scratch.join("registration"), record).map_err(|e| e.to_string())?;
     Ok(regs)
+}
+
+/// Content-addressed build cache. The assembled `.drv` path is DETERMINISTIC (its
+/// hash covers the inputs + builder + env), so if every output of PARSED is already
+/// present under SCRATCH/newstore AND recorded in SCRATCH/registration with a NAR
+/// hash that RE-VERIFIES, the build was already done — same drv ⇒ same result, the
+/// guix-daemon valid-path skip. Returns the recorded outputs to reuse, or None to
+/// (re)build. Re-hashing the cached output (cheap vs a rebuild) guards a corrupted /
+/// partially-deleted entry. This is consulted ONLY by `build-recipe`; the
+/// reproducibility `check` is a separate command that force-rebuilds, so reuse here
+/// never weakens the repro proof.
+fn cached_realization(
+    parsed: &drv::Derivation,
+    scratch: &Path,
+) -> Result<Option<Vec<OutputReg>>, String> {
+    let reg = match std::fs::read_to_string(scratch.join("registration")) {
+        Ok(s) => s,
+        Err(_) => return Ok(None), // never built here
+    };
+    // Parse the registration blocks (`path`/`nar-hash`/`nar-size`/`reference`*/`deriver`).
+    let mut recs: std::collections::HashMap<String, OutputReg> = std::collections::HashMap::new();
+    let mut cur: Option<OutputReg> = None;
+    let commit = |cur: &mut Option<OutputReg>,
+                  recs: &mut std::collections::HashMap<String, OutputReg>| {
+        if let Some(r) = cur.take() {
+            recs.insert(r.store_path.clone(), r);
+        }
+    };
+    for line in reg.lines() {
+        if let Some(p) = line.strip_prefix("path ") {
+            commit(&mut cur, &mut recs);
+            cur = Some(OutputReg {
+                store_path: p.to_string(),
+                nar_hash: String::new(),
+                nar_size: 0,
+                refs: Vec::new(),
+                deriver: String::new(),
+            });
+        } else if let (Some(r), Some(h)) = (cur.as_mut(), line.strip_prefix("nar-hash ")) {
+            r.nar_hash = h.to_string();
+        } else if let (Some(r), Some(s)) = (cur.as_mut(), line.strip_prefix("nar-size ")) {
+            r.nar_size = s.parse().unwrap_or(0);
+        } else if let (Some(r), Some(rf)) = (cur.as_mut(), line.strip_prefix("reference ")) {
+            r.refs.push(rf.to_string());
+        } else if let (Some(r), Some(d)) = (cur.as_mut(), line.strip_prefix("deriver ")) {
+            r.deriver = d.to_string();
+        }
+    }
+    commit(&mut cur, &mut recs);
+
+    let newstore = scratch.join("newstore");
+    let mut out: Vec<OutputReg> = Vec::with_capacity(parsed.outputs.len());
+    for o in &parsed.outputs {
+        let rec = match recs.get(&o.path) {
+            Some(r) if !r.nar_hash.is_empty() => r.clone(),
+            _ => return Ok(None),
+        };
+        let base = o.path.rsplit('/').next().unwrap_or("");
+        let physical = newstore.join(base);
+        if !physical.exists() {
+            return Ok(None);
+        }
+        let mut scanner = scan::Scanner::new(&rec.refs).map_err(|e| e.to_string())?;
+        nar::write_nar(&mut scanner, &physical).map_err(|e| e.to_string())?;
+        let (hash, _, _) = scanner.finish();
+        if hash != rec.nar_hash {
+            return Ok(None); // corrupt/partial cache entry — rebuild
+        }
+        out.push(rec);
+    }
+    Ok(Some(out))
 }
 
 /// Realize DRV with NO guix-daemon: compute the input closure ITSELF (td's SQLite
@@ -461,12 +533,31 @@ fn build_recipe(recipe_json: &str, lock_file: &str, scratch: &Path, store_db: &s
     // td assembles the .drv (pure Rust, no guix (derivation …), no daemon).
     let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
     let (drv_path, content) = store::assemble_drv(&spec, &read)?;
+    let parsed = drv::parse(content.as_bytes()).map_err(|e| format!("parse assembled drv: {e}"))?;
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let drv_file = scratch.join(format!("{full}.drv"));
     std::fs::write(&drv_file, &content).map_err(|e| e.to_string())?;
+    // Content-addressed build cache: if SCRATCH already holds a valid realization of
+    // this exact (deterministic) drv, reuse it — skip the build. The gate points
+    // SCRATCH at a persistent cache, so an unchanged recipe is a cache HIT and only a
+    // CHANGED recipe (⇒ different drv hash ⇒ different output path, a miss) rebuilds.
+    if let Some(regs) = cached_realization(&parsed, scratch)? {
+        eprintln!(
+            "td-builder: build-recipe CACHE HIT for {drv_path} — {} output(s) already realized + NAR-verified under {}; skipping the build",
+            regs.len(),
+            scratch.display()
+        );
+        for (o, r) in parsed.outputs.iter().zip(&regs) {
+            println!("OUT={} {}", o.name, r.store_path);
+        }
+        println!("CACHE=hit");
+        return Ok(regs);
+    }
     eprintln!("td-builder: build-recipe assembled {drv_path} (no guix (derivation), no Guile)");
     // td realizes it (no guix-daemon).
-    realize_drv(&drv_file.to_string_lossy(), store_db, scratch)
+    let regs = realize_drv(&drv_file.to_string_lossy(), store_db, scratch)?;
+    println!("CACHE=miss");
+    Ok(regs)
 }
 
 fn main() -> ExitCode {
@@ -1979,6 +2070,65 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // The build cache hits only on a present + NAR-verified output, and misses on a
+    // corrupted, deleted, or never-recorded one — so a CHANGED recipe (different drv ⇒
+    // different output path, never recorded) always rebuilds, and a corrupted cache
+    // entry rebuilds rather than serving garbage.
+    #[test]
+    fn cached_realization_hits_only_on_a_present_and_nar_verified_output() {
+        let base = std::env::temp_dir().join(format!("td-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let scratch = base.join("b");
+        let store_path = "/gnu/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-thing-1.0";
+        let outdir = scratch.join("newstore").join("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-thing-1.0");
+        std::fs::create_dir_all(&outdir).unwrap();
+        std::fs::write(outdir.join("data"), b"hello cache").unwrap();
+        // Real NAR hash of the output (same scan/nar the registration is written with).
+        let mut sc = scan::Scanner::new(&[]).unwrap();
+        nar::write_nar(&mut sc, &outdir).unwrap();
+        let (hash, size, _) = sc.finish();
+        let drv = drv::Derivation {
+            outputs: vec![drv::Output {
+                name: "out".into(),
+                path: store_path.into(),
+                hash_algo: String::new(),
+                hash: String::new(),
+            }],
+            input_drvs: vec![],
+            input_srcs: vec![],
+            platform: String::new(),
+            builder: String::new(),
+            args: vec![],
+            env: vec![],
+        };
+        let write_reg = |h: &str| {
+            std::fs::write(
+                scratch.join("registration"),
+                format!("path {store_path}\nnar-hash {h}\nnar-size {size}\nderiver x.drv\n\n"),
+            )
+            .unwrap();
+        };
+
+        // (a) present + matching hash recorded -> HIT.
+        write_reg(&hash);
+        assert!(cached_realization(&drv, &scratch).unwrap().is_some(), "valid entry must hit");
+
+        // (b) recorded hash wrong (output content changed under us) -> MISS.
+        write_reg("sha256:deadbeef");
+        assert!(cached_realization(&drv, &scratch).unwrap().is_none(), "hash mismatch must miss");
+
+        // (c) output directory gone -> MISS.
+        write_reg(&hash);
+        std::fs::remove_dir_all(&outdir).unwrap();
+        assert!(cached_realization(&drv, &scratch).unwrap().is_none(), "absent output must miss");
+
+        // (d) never built here (no registration) -> MISS.
+        std::fs::remove_file(scratch.join("registration")).unwrap();
+        assert!(cached_realization(&drv, &scratch).unwrap().is_none(), "no registration must miss");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     // `copy_canonical` must reproduce a tree byte-identically by NAR — exercising
     // the properties NAR captures that the `store-add-tree` rung's source tree does

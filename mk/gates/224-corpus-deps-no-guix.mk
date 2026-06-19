@@ -12,6 +12,14 @@
 # (distinct store path from guix's build — own, then diverge). The link-test gcc is
 # guix's gcc-toolchain (the compiler seed, retired last §5). gmp/ncurses/readline
 # deferred (gmp's configure rejects the seed compiler at its long-long run-test).
+#
+# CONTENT-ADDRESSED CACHE: build-recipe's .drv path is deterministic, so a persistent
+# cache (.td-build-cache/, gitignored) lets td SKIP the build when an unchanged recipe
+# already has a NAR-verified output (build-recipe prints CACHE=hit). On a verified hit
+# the reproducibility double-build is also skipped (verdict memoized, like check-memo)
+# — so only the package whose recipe/inputs CHANGED rebuilds. A changed recipe ⇒
+# different drv ⇒ cache miss ⇒ full build + check. Reproducibility/behavior unweakened:
+# the first build still double-builds, and every run re-NAR-verifies the cached output.
 HEAVY_GATES += corpus-deps-no-guix
 corpus-deps-no-guix:
 	@echo ">> corpus-deps-no-guix: td builds libsigsegv + libunistring + pcre2 via build-recipe (no guix/Guile in the build path); each links+runs from td's own output, reproducible, distinct from guix"
@@ -30,19 +38,14 @@ corpus-deps-no-guix:
 	test -n "$$gtbin" || { echo "ERROR: could not resolve gcc-toolchain for the link-test" >&2; exit 1; }; \
 	lkh=`for p in $$($(GUIX) build linux-libre-headers 2>/dev/null); do [ -f "$$p/include/linux/limits.h" ] && echo "$$p/include" && break; done`; \
 	test -n "$$lkh" || { echo "ERROR: could not resolve linux-libre-headers for the link-test" >&2; exit 1; }; \
-	scratch="$(CURDIR)/.corpus-deps-no-guix-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
+	. tests/cache-lib.sh; TB="$$tb"; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/corpus-deps"; mkdir -p "$$CACHE"; \
 	for spec in libsigsegv libunistring pcre2; do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \
 	  test -s "$$lock" || { echo "ERROR: no lock $$lock" >&2; exit 1; }; \
 	  grep ' /gnu/store/' "$$lock" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the seed for $$spec" >&2; exit 1; }; \
-	  sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-$$spec.ts" > "$$scratch/$$spec.json"; \
-	  test -s "$$scratch/$$spec.json" || { echo "ERROR: ts-emit produced no JSON for $$spec" >&2; exit 1; }; \
-	  sd="$$scratch/$$spec"; mkdir -p "$$sd/tmp"; \
-	  out=`env -i HOME="$$sd" TMPDIR="$$sd/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/$$spec.json" "$$lock" "$$sd/b" /var/guix/db/db.sqlite 2>"$$sd/err" | sed -n 's/^OUT=out //p'` || { echo "FAIL: build-recipe $$spec (guix/Guile off PATH):" >&2; tail -20 "$$sd/err" >&2; exit 1; }; \
-	  test -n "$$out" || { echo "FAIL: build-recipe produced no output for $$spec" >&2; cat "$$sd/err" >&2; exit 1; }; \
-	  echo "  [STRUCTURAL] built with guix/Guile off PATH: $$out"; \
-	  ns="$$sd/b/newstore/`basename "$$out"`"; \
+	  cached_build "$$spec" "$$lock" || exit 1; \
+	  if [ -n "$$hit" ]; then echo "  [STRUCTURAL] CACHE HIT — drv unchanged, reused td's prior output (no rebuild): $$out"; else echo "  [STRUCTURAL] built with guix/Guile off PATH: $$out"; fi; \
 	  case "$$spec" in \
 	    libsigsegv)   hdr=sigsegv.h;  lib=sigsegv;    pre="" ;; \
 	    libunistring) hdr=unistr.h;   lib=unistring;  pre="" ;; \
@@ -57,12 +60,10 @@ corpus-deps-no-guix:
 	    LD_LIBRARY_PATH="$$ns/lib" "$$ns/bin/pcre2test" --version | grep -q '10.42' || { echo "FAIL: pcre2test --version != 10.42" >&2; exit 1; }; \
 	    echo "  [DURABLE behavioral] pcre2test --version reports 10.42"; \
 	  fi; \
-	  "$$tb" check "$$sd/b/"*.drv "$$sd/b/closure.txt" "$$sd/chk" >/dev/null 2>"$$sd/chkerr" || { echo "FAIL: $$spec NOT reproducible (td-builder check):" >&2; tail -6 "$$sd/chkerr" >&2; exit 1; }; \
-	  echo "  [DURABLE repro] td-builder check double-build agrees $$spec is reproducible"; \
+	  cached_check "$$spec" || exit 1; \
 	  g=`$(GUIX) build "$$spec" 2>/dev/null | grep -v -- '-debug\|-doc\|-static' | head -1 || true`; \
 	  if [ -n "$$g" ] && [ "$$out" = "$$g" ]; then echo "FAIL: td's $$spec path equals guix's — expected a distinct own-builder path" >&2; exit 1; fi; \
 	  echo "  [MIGRATION ORACLE] distinct from guix's $$spec"; \
-	  chmod -R u+w "$$sd" 2>/dev/null || true; rm -rf "$$sd"; \
+	  cached_clean; \
 	done; \
-	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; \
 	echo "PASS: td built corpus/toolchain library deps — libsigsegv, libunistring, pcre2 — via td-builder build-recipe, every input resolved from a pinned lock (no specification->package), the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; each links+runs from td's own output (durable), is reproducible by td's own double-build (durable), and lands at a distinct store path from guix's build (own, then diverge). The compiler seed (gcc-toolchain) stays external (§5, retired last)."
