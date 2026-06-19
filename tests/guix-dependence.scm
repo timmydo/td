@@ -62,13 +62,15 @@
 (define not-yet-td-built '("pkg-config"))
 
 ;; Rust programs td builds via its OWN cargo path (buildSystem "rust"): the
-;; self-host td-builder, the vendored-deps demo, and a real uutils tool (`cat` =
-;; uu_cat). These are NOT guix-corpus reconstructions — they have no
-;; `specification->package` oracle by design (the channel has no per-crate
-;; packages), so they don't fit this corpus closure census (which is rooted in guix
-;; package derivations). Their own-builder proof is the rust-build / rust-vendor /
-;; rust-uutils gates (td builds them itself, reproducibly), not a corpus differential.
-(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo"))
+;; self-host td-builder, the vendored-deps demo, a real uutils tool (`cat` =
+;; uu_cat), the russh SSH demo, and the boa-based SEED TOOL td-ts-eval. These are
+;; NOT guix-corpus reconstructions — they have no `specification->package` oracle by
+;; design (the channel has no per-crate packages; td-ts-eval's oracle is `(system
+;; td-ts) td-ts-eval`, not a corpus package), so they don't fit this corpus closure
+;; census (which is rooted in guix package derivations). Their own-builder proof is
+;; the rust-build / rust-vendor / rust-uutils / rust-russh / rust-ts-eval gates (td
+;; builds them itself, reproducibly), not a corpus differential.
+(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval"))
 
 (define owned-specs
   (sort
