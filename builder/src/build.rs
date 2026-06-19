@@ -528,6 +528,11 @@ pub fn run() -> Result<(), String> {
 ///                coreutils, bash) — their bin/ dirs build PATH, lib/ build
 ///                LIBRARY_PATH.
 ///   TD_RUST_BINS space-separated binary names to install into $out/bin.
+///   TD_VENDOR_CRATES optional ':'-joined `.crate` paths (the dependency closure
+///                pinned by Cargo.lock, each a fixed-output fetch). When set, a
+///                cargo `vendored-sources` directory is assembled from them so
+///                `cargo build --offline` resolves dependencies from it instead of
+///                the network; unset ⇒ a dependency-free build (the self-host path).
 pub fn run_rust() -> Result<(), String> {
     let out = env::var("out").map_err(|_| "out not set".to_string())?;
     let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
@@ -592,10 +597,52 @@ pub fn run_rust() -> Result<(), String> {
         ("PATH".into(), path.clone()),
         ("LIBRARY_PATH".into(), lib.join(":")),
         ("HOME".into(), "/homeless-shelter".into()),
-        ("CARGO_HOME".into(), cargo_home),
+        ("CARGO_HOME".into(), cargo_home.clone()),
         ("SOURCE_DATE_EPOCH".into(), "1".into()),
         ("RUSTFLAGS".into(), rustflags),
     ];
+
+    // vendored deps: if TD_VENDOR_CRATES is set, assemble a cargo `vendored-sources`
+    // directory from each `.crate` (untar -> `<name>-<version>/`, plus a minimal
+    // `.cargo-checksum.json` whose `package` is the crate's sha256 — cargo verifies
+    // only that against Cargo.lock, not the per-file map) and point CARGO_HOME's
+    // config at it, so `cargo build --offline` resolves deps from the vendor dir
+    // instead of the network. Unset ⇒ the dependency-free self-host path, unchanged.
+    fs::create_dir_all(&cargo_home).map_err(|e| format!("mkdir CARGO_HOME {cargo_home}: {e}"))?;
+    let vendor_crates = env::var("TD_VENDOR_CRATES").unwrap_or_default();
+    let vendor_list: Vec<&str> = vendor_crates.split(':').filter(|s| !s.is_empty()).collect();
+    if !vendor_list.is_empty() {
+        let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS (vendor)")?;
+        let vendor_dir = cwd.join("td-rust-vendor");
+        fs::create_dir_all(&vendor_dir).map_err(|e| format!("mkdir vendor: {e}"))?;
+        let vendor_abs = vendor_dir.to_str().ok_or("non-utf8 vendor path")?.to_string();
+        for c in &vendor_list {
+            // <name>-<version> from the store name (drops the leading store hash);
+            // a cargo `.crate` tarball unpacks to exactly this single top dir.
+            let nv_crate = crate::store::name_from_store_path(c)
+                .ok_or_else(|| format!("vendor crate not a store path: {c}"))?;
+            let nv = nv_crate.strip_suffix(".crate").unwrap_or(&nv_crate).to_string();
+            run_cmd(&tar, &["xf", c, "-C", &vendor_abs], ".", &path_env)?;
+            let cdir = vendor_dir.join(&nv);
+            if !cdir.is_dir() {
+                return Err(format!("crate {c} did not unpack to {}/", cdir.display()));
+            }
+            // cargo keys the vendored checksum on the crate's sha256 (= its
+            // Cargo.lock checksum, = the fixed-output content hash).
+            let bytes = fs::read(c).map_err(|e| format!("read crate {c}: {e}"))?;
+            let mut h = crate::sha256::Sha256::new();
+            h.update(&bytes);
+            let sha = crate::sha256::to_base16(&h.finalize());
+            fs::write(cdir.join(".cargo-checksum.json"), format!("{{\"files\":{{}},\"package\":\"{sha}\"}}"))
+                .map_err(|e| format!("write checksum for {nv}: {e}"))?;
+        }
+        // CARGO_HOME config: replace crates-io with the assembled vendor dir.
+        fs::write(
+            format!("{cargo_home}/config.toml"),
+            format!("[source.crates-io]\nreplace-with = \"vendored-sources\"\n[source.vendored-sources]\ndirectory = \"{vendor_abs}\"\n"),
+        )
+        .map_err(|e| format!("write cargo config: {e}"))?;
+    }
 
     // build (offline, frozen, release) in the writable tree.
     run_cmd(&cargo, &["build", "--release", "--offline", "--frozen"], build_dir, &envs)?;

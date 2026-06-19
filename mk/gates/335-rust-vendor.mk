@@ -1,0 +1,62 @@
+# rust-vendor — td builds a Rust crate WITH dependencies via its own builder
+# (rust-build Inc.2; move-off-Guile §5). The self-host (gate rust-build) builds a
+# zero-dep crate; this proves the DEPENDENCY path: the td-vendor-demo crate depends
+# on itoa + ryu, whose `.crate`s are fixed-output fetches from static.crates.io
+# (sha256 == their Cargo.lock checksum), pinned in tests/td-vendor-demo.lock.
+# `td-builder build-recipe` routes the `*.crate` entries to TD_VENDOR_CRATES;
+# run_rust assembles a cargo `vendored-sources` dir from them and builds `cargo
+# --offline --frozen` against it (no network). The whole BUILD runs with guix/Guile
+# SCRUBBED FROM PATH; the .drv is assembled by td (no guix (derivation …)) and
+# realized daemon-free (no guix-daemon). The rustc/cargo/gcc seed + the locked deps
+# are the external SEED (§5, retired last).
+#
+# ALL-DURABLE (no guix oracle): there is no guix cargo-build-system build of this
+# crate to diff against — by design (it is a new capability, not a corpus
+# reconstruction), so every leg stands with no Guix in the room:
+#   [STRUCTURAL] the build runs guix/Guile off PATH and produces the binary, AND the
+#     .drv carries TD_VENDOR_CRATES (the vendored path was taken, not a dep-free build).
+#   [DURABLE behavioral] the binary runs and prints "2026 3.14159" — itoa formats the
+#     int, ryu the float, so BOTH vendored deps are exercised.
+#   [DURABLE repro] td-builder check's double-build agrees the output is reproducible.
+HEAVY_GATES += rust-vendor
+rust-vendor:
+	@echo ">> rust-vendor: td builds td-vendor-demo (depends on itoa + ryu) via build-recipe with VENDORED deps (offline, guix/Guile off PATH); it runs + is reproducible"
+	@set -euo pipefail; \
+	node=`$(GUIX) build node`/bin/node; \
+	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
+	evdrv=`$(GUIX) repl $(LOAD) tests/ts-eval-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	ev=`$(GUIX) build "$$evdrv"`/bin/td-ts-eval; \
+	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	test -x "$$ev" -a -x "$$tb" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval / td-builder" >&2; exit 1; }; \
+	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	lock0="$(CURDIR)/tests/td-vendor-demo.lock"; \
+	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
+	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
+	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
+	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
+	ncrate=`grep -cE '\.crate /gnu/store/' "$$lock0"`; \
+	test "$$ncrate" -ge 2 || { echo "ERROR: lock has <2 vendored .crate deps ($$ncrate)" >&2; exit 1; }; \
+	scratch="$(CURDIR)/.rust-vendor-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch/tmp"; \
+	grep ' /gnu/store/' "$$lock0" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the seed + vendored .crate deps (warm static.crates.io fetches; regenerate the lock on a channel/dep bump)" >&2; exit 1; }; \
+	src=`$(GUIX) repl $(LOAD) tests/td-vendor-demo-source.scm 2>/dev/null | sed -n 's/^SRC=//p'`; \
+	test -n "$$src" -a -d "$$src" || { echo "ERROR: could not intern the vendor-demo crate tree" >&2; exit 1; }; \
+	lock="$$scratch/td-vendor-demo.lock"; { cat "$$lock0"; echo "td-vendor-demo-source $$src"; } > "$$lock"; \
+	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-vendor-demo.ts" > "$$scratch/td-vendor-demo.json"; \
+	test -s "$$scratch/td-vendor-demo.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
+	sd="$$scratch/b"; mkdir -p "$$sd"; \
+	out=`env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/td-vendor-demo.json" "$$lock" "$$sd" /var/guix/db/db.sqlite 2>"$$scratch/err" | sed -n 's/^OUT=out //p'` || { echo "FAIL: build-recipe vendored build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
+	ns="$$sd/newstore/`basename "$$out"`"; \
+	test -x "$$ns/bin/td-vendor-demo" || { echo "FAIL: vendored build produced no binary at $$ns/bin/td-vendor-demo" >&2; exit 1; }; \
+	grep -q 'TD_VENDOR_CRATES' "$$sd"/*.drv || { echo "FAIL: the .drv lacks TD_VENDOR_CRATES — the vendored path was not taken" >&2; exit 1; }; \
+	echo "  [STRUCTURAL] td assembled + realized the .drv (TD_VENDOR_CRATES, $$ncrate deps) with guix/Guile off PATH: $$out"; \
+	got=`"$$ns/bin/td-vendor-demo"`; \
+	test "$$got" = "2026 3.14159" || { echo "FAIL: td-vendor-demo printed '$$got', expected '2026 3.14159' (itoa + ryu must both work)" >&2; exit 1; }; \
+	echo "  [DURABLE behavioral] the vendored binary RUNS and prints '$$got' (itoa formats the int, ryu the float — both deps exercised)"; \
+	"$$tb" check "$$sd"/*.drv "$$sd/closure.txt" "$$scratch/chk" > "$$scratch/checkout.txt" 2>"$$scratch/chk.err" \
+	  || { echo "FAIL: rust-vendor NOT reproducible (td-builder check):" >&2; tail -6 "$$scratch/checkout.txt" "$$scratch/chk.err" >&2; exit 1; }; \
+	grep -qE "^CHECK out $$out sha256:[0-9a-f]+ reproducible$$" "$$scratch/checkout.txt" \
+	  || { echo "FAIL: td-builder check did not confirm $$out reproducible:" >&2; cat "$$scratch/checkout.txt" >&2; exit 1; }; \
+	echo "  [DURABLE repro] td-builder check double-build agrees the vendored build is reproducible"; \
+	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; \
+	echo "PASS: td built td-vendor-demo (a crate WITH deps: itoa + ryu) via td-builder build-recipe — the dependency closure resolved from pinned vendored .crate fetches (no specification->package, no network), the cargo vendor dir assembled by td's run_rust, the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; the binary runs + exercises both deps (durable) and is reproducible by td's own double-build (durable). The rustc/cargo/gcc seed + locked deps stay external (§5, retired last)."

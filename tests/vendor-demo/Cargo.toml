@@ -1,0 +1,16 @@
+# tests/vendor-demo — a minimal binary crate WITH dependencies, used by the
+# rust-vendor gate to prove td-builder builds a crate that has a real dependency
+# graph (offline, from vendored .crate fetches). itoa + ryu are real crates-io
+# crates with NO transitive deps, so the pinned closure is exactly the two.
+[package]
+name = "td-vendor-demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+itoa = "1"
+ryu = "1"
+
+[[bin]]
+name = "td-vendor-demo"
+path = "src/main.rs"
