@@ -153,19 +153,47 @@ glibc + gcc-lib (its ELF interp + RUNPATH, brick-1 hygiene leg). So the primitiv
 
 ### Sub-task ladder
 
-1. [ ] Rust: `store-add-builder` arm + a unit test (content-addressed path stable;
-       refs scanned == expected toolchain paths on a fixture).
-2. [ ] Rust: `BuilderOverride` struct + `realize_drv` spans OUT-DB (direct refs) ∪
-       seed db (transitive); unit test the closure spans both. Verified-red: limit to
-       OUT-DB only ⇒ the build can't see glibc ⇒ fails.
-3. [ ] Rust: `build_recipe` honours the builder override (builder field + input-src +
-       closure root); CLI/env surface, backward-compatible.
+1. [x] Rust: `store-add-builder NAME TREE STORE-DIR OUT-DB SEED-DB` arm — content-addressed
+       tree placement (store-add-recursive) + scanned external refs vs the seed db's
+       ValidPaths (store-add-referenced's ref shape). Follows the inline-arm convention of
+       the other `store-add-*` ops (tested via the gate, not a unit test).
+2. [x] Rust: `BuilderOverride` struct + `realize_drv` builder branch — closure = builder
+       db (builder + direct refs) ∪ seed db (transitive), the builder entry encoded
+       canonical\ton-disk.
+3. [x] Rust: `build_recipe` honours the override (builder field + input-src + closure
+       root); opt-in via TD_BUILDER_PATH/STORE/DB env, backward-compatible.
 4. [ ] `cargo test` green (the affected-checks fast leg).
-5. [ ] Gate `175-bootstrap-build.mk`; `./check.sh bootstrap-build` green.
-6. [ ] Verified-red ×2 (drop the override → drv.builder is guix's; break the ref
-       spanning → build fails). Record evidence here.
-7. [ ] Full landing check (`tools/affected-checks.sh --committed-only --run`); PR.
+5. [x] Gate `mk/gates/365-bootstrap-build.mk` (175 was taken by td-builder);
+       `./check.sh bootstrap-build` GREEN — all four legs pass.
+6. [x] Verified-red ×2. Record below.
+7. [ ] Full landing check (`tools/affected-checks.sh --committed-only --run`); PR ready.
 
 ### Status / evidence (brick 2)
 
-- (in progress)
+- `./check.sh bootstrap-build`: GREEN. Stage0 placed at a td content-addressed path
+  (`…-td-builder-0.1.0`) DISTINCT from the guix-built td-builder; hello built with that
+  stage0 as `builder`, greets, reproducible (td check double-build), distinct from guix's
+  hello (same greeting). The builder is staged from td's own store (canonical\ton-disk).
+- **Honesty finding (seed-db span):** the first planned Red #2 — "limit realize's closure
+  to the builder db only ⇒ build can't see glibc ⇒ fails" — did NOT go red: the build
+  stayed GREEN. hello's OWN toolchain inputs (its lock) already supply glibc/gcc-lib, so
+  the builder's ref-span is redundant-but-correct (defense-in-depth) for this subject,
+  NOT independently load-bearing. So it is NOT claimed as a verified-red leg; the span is
+  kept because a builder's closure should be self-contained regardless of recipe inputs.
+- **Verified-red #1 (override is load-bearing):** dropped TD_BUILDER_* from the gate's
+  build-recipe call → build-recipe fell back to the guix-built td-builder → `FAIL: hello's
+  .drv does not name the stage0 builder …` (exit 2). The STRUCTURAL leg flips. Reverted.
+- **Verified-red #2 (td-store staging is load-bearing):** corrupted the builder's on-disk
+  staging path (`canonical\t/nonexistent-td-builderstore/…`) → `closure item … (on disk
+  /nonexistent-td-builderstore/…): No such file or directory` (exit 2) — proving stage0 is
+  genuinely fed into the build FROM td's own store, not /gnu/store. Reverted (builder/src
+  perturbation busts the corpus drv-cache while applied; reverted before the landing
+  check, all green edits committed first — [[td-full-check-oom-and-exit-masking]],
+  [[td-commit-before-red-variants]]).
+
+### Next bricks (after this)
+
+- Brick 3: demote the guix-built td-builder to ORACLE-ONLY across the package gates —
+  route corpus/toolchain build-recipe calls through a stage0 placed once per loop
+  (the override generalised), guix-tb kept only as the migration differential.
+- Reconstruct the toolchain seed itself (retired LAST, §5).

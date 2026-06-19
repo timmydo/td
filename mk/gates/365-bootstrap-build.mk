@@ -4,10 +4,14 @@
 # loop can USE that stage0 to build: td places the cargo-built stage0 into its OWN
 # content-addressed store (store-add-builder — restore the tree, scan its toolchain refs
 # against the daemon db's ValidPaths, register path+refs), then `build-recipe` assembles
-# hello's .drv with the stage0 path as `builder` and realizes it daemon-free, its closure
-# spanning the td builder db (the builder + its direct refs) ∪ the daemon seed db (those
-# refs' transitive glibc/gcc-lib closures). So a real artifact is built by a binary guix
-# NEVER produced. The toolchain seed is the guix-built pin (§5, retired last).
+# hello's .drv with the stage0 path as `builder` and realizes it daemon-free, the
+# builder STAGED from td's own store (canonical\ton-disk) and its closure self-contained
+# by spanning the td builder db (the builder + its direct refs) ∪ the daemon seed db
+# (those refs' transitive glibc/gcc-lib closures). So a real artifact is built by a binary
+# guix NEVER produced. The toolchain seed is the guix-built pin (§5, retired last).
+# (The seed-db span makes the builder's closure self-contained; for this subject it is
+# defense-in-depth — hello's own toolchain inputs already supply glibc/gcc-lib — so it is
+# correct but not independently load-bearing here, hence not a verified-red leg.)
 #
 # Per the differential+durable discipline:
 #   [STRUCTURAL] hello's assembled .drv names the STAGE0 td path as its builder, NOT the
@@ -21,11 +25,12 @@
 #     path ⇒ a different drv ⇒ a different output path, identical behavior). Delete this
 #     leg when guix retires; the durable legs above still stand.
 #
-# Self-discrimination (verified-red, recorded in plan/bootstrap-td-builder.md): dropping
-# the builder override makes build-recipe fall back to the guix-built td-builder and the
-# .drv's `builder` becomes guix's path (the STRUCTURAL assert flips); limiting realize's
-# closure to the builder db only (no seed-db span) drops glibc/gcc-lib so the staged
-# builder cannot exec — the build fails.
+# Self-discrimination (verified-red, recorded in plan/bootstrap-td-builder.md): (1)
+# dropping the builder override makes build-recipe fall back to the guix-built td-builder
+# and hello's .drv `builder` becomes guix's path — the STRUCTURAL assert flips (exit 2);
+# (2) corrupting the builder's on-disk staging path (canonical\t<bogus>) makes the staged
+# builder unreachable — `closure item … (on disk …): No such file`, the build fails —
+# proving stage0 is genuinely fed into the build FROM td's own store, not /gnu/store.
 HEAVY_GATES += bootstrap-build
 bootstrap-build:
 	@echo ">> bootstrap-build: td places its stage0 builder into its OWN store and the loop BUILDS hello with it (the builder-of-record is a binary guix never produced) — runs, reproducible, distinct from guix"
