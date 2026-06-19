@@ -34,6 +34,12 @@ system/retire-last list.
 
 ## Status / evidence
 
-- `guix build -d -e '(@ (system td-ts) td-ts-eval)'` == ts-eval-drv.scm `DRV=` output (verified).
-- Per-gate spot checks (`./check.sh ts-eval`, `./check.sh ts-diff`): TODO.
-- Full `./check.sh`: TODO.
+- `guix build -d -e '(@ (system td-ts) td-ts-eval)'` == ts-eval-drv.scm `DRV=` output, and
+  `guix build -d -e '(@ (system td-builder) td-builder)'` == td-builder-drv.scm output
+  (both verified byte-identical before deleting the bridges).
+- scm count 52 → 50 (deleted ts-eval-drv.scm + td-builder-drv.scm); 0 stale references.
+- Full `./check.sh`: GREEN (exit 0). The `td-builder` S1–S4 daemon differential passed
+  with the S1 drv now from `guix build -d -e`; ts-eval / ts-diff / corpus / toolchain /
+  corpus-deps / rust-build / rust-vendor / rust-uutils all green with `td-ts-eval`
+  resolved directly via `guix build -e`. Resolution-equivalent: no behavior change, so
+  the green run is the test (no new assertion ⇒ no verified-red).

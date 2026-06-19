@@ -1,8 +1,9 @@
 # td-builder S1 toolchain probe + S2 NAR differential (DESIGN §7.1 side-track;
 # plan/td-builder.md). The growing gate of the first Guix-component replacement
 # (§2.5 discipline) — each sub-task adds a leg, none is ever removed:
-#   • S1: lower the td-builder package to a drv (tests/td-builder-drv.scm),
-#     build it offline, `guix build --check` it bit-for-bit (prime directive 1;
+#   • S1: lower the td-builder package to a drv (`guix build -d -e '(@ (system
+#     td-builder) td-builder)'`), build it offline, `guix build --check` it
+#     bit-for-bit (prime directive 1;
 #     --check re-runs the compile, so a toolchain regression reds the loop),
 #     RUN the binary and assert its sentinel (the toolchain produced a WORKING
 #     executable — stronger than "cargo build exited 0"), and record closure
@@ -45,7 +46,7 @@ HEAVY_GATES += td-builder
 td-builder:
 	@echo ">> td-builder: reproducible offline build (S1) + NAR differential (S2) + build differential (S3) + system-image differential (S4)"
 	@set -euo pipefail; \
-	drv=`$(GUIX) repl $(LOAD) tests/td-builder-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	drv=`$(GUIX) build -d $(LOAD) -e '(@ (system td-builder) td-builder)'`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the td-builder derivation" >&2; exit 1; }; \
 	echo ">> td-builder derivation: $$drv"; \
 	start=`date +%s`; \
