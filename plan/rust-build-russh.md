@@ -45,8 +45,19 @@ sshd.
 2. [x] de-risk: author the client<->server round-trip; it runs (`td-russh-ok: ping`)
 3. [x] run_rust C set-paths; demo crate + 188-dep lock + recipe + source helper + gate
 4. [x] claim + plan-index
-5. [ ] ./check.sh rust-russh green + verified-red
+5. [x] ./check.sh rust-russh green + verified-red
 6. [ ] full ./check.sh green; review; ready + auto-merge
 
 ## Verified-red evidence
-(to fill)
+- GREEN: `./check.sh rust-russh` (slim seed) → td built td-russh-demo off PATH with the
+  .drv carrying TD_VENDOR_CRATES (188 deps); the binary ran a full SSH round-trip
+  (`td-russh-ok: ping`); td-builder check double-build reproducible across all 188
+  crates incl. the aws-lc C crypto.
+- RED (teeth): removing run_rust's `CC` env reds the gate — aws-lc-sys's build:
+  `ToolNotFound: failed to find tool "cc"` (the seed ships `gcc`, not `cc`) →
+  `Failed to compile memcmp_invalid_stripped_check` → build fails. Proves run_rust
+  setting `CC` is load-bearing for the crypto C build. Reverted → green.
+- (A first red attempt — removing `linux-libre-headers` from the seed — was VACUOUS:
+  the gate still passed, because gcc-toolchain's own `include/` bundles the kernel
+  headers and run_rust adds it to C_INCLUDE_PATH. That, plus a host check showing
+  aws-lc-sys uses its cc path not cmake, is why both extra seed inputs were dropped.)
