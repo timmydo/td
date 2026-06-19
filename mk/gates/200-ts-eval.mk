@@ -13,7 +13,7 @@ HEAVY_GATES += ts-eval
 ts-eval:
 	@echo ">> ts-eval: boa evaluator + curated global (ts-frontend Phase 1, sub-task 2)"
 	@set -euo pipefail; \
-	drv=`$(GUIX) repl $(LOAD) tests/ts-eval-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
+	drv=`$(GUIX) build -d $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the td-ts-eval derivation" >&2; exit 1; }; \
 	echo ">> td-ts-eval derivation: $$drv"; \
 	out=`$(GUIX) build "$$drv"`; \
