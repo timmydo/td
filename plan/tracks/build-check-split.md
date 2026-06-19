@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: build-check-split
 handle: claude-fable-2715d4
 date: 2026-06-18
