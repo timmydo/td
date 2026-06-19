@@ -145,3 +145,28 @@ route through `closure_multi` (no stale singular `db`). #100 (the engine→full-
 escalation, surfaced BY this track) now correctly forces this diff's landing to the
 full `./check.sh`; ran it green (40 gates), incl. the bootstrap gate that exercises the
 reconciled `builder_override` path.
+
+## Edge-aware census + a real chained package (proposal point 1, "close the loop")
+
+The build-plan machinery proves a downstream build CAN consume td-built deps, but the
+`guix-dependence` census only counted "td builds the recipe" — it didn't credit
+whether the dependency EDGES use td outputs. Point 1: a recipe is **edge-owned** only
+when every declared input (`recipe-<spec>.ts inputs:[...]`) that is itself an owned
+recipe is WIRED to a td output. The wiring is declared once in
+`tests/td-chained-edges.txt` (the manifest), read by two consumers:
+
+- **census** (`tests/guix-dependence.scm`) — credits edge-ownership; `validate-edges!`
+  rejects a manifest entry that isn't a real declared owned input. New report lines:
+  `edge-owned 20 / 23` (18 leaves + grep + nano) and the honest remaining
+  `guix-wired input edges` (bash→ncurses readline, gettext-minimal→libunistring
+  ncurses, readline→ncurses).
+- **build-plan gates** — PROVE each manifest edge builds: 365 (pcre2→grep, existing)
+  and 366 (**ncurses + gettext-minimal → nano**, new): nano's `.drv` references td's
+  ncurses + gettext-minimal and NOT guix's; `nano --version` 8.7.1 runs loading td's
+  ncurses; `td-builder check` double-builds it; distinct path from guix's nano.
+
+Verified-red: (1) drop `ncurses` from nano's manifest line → census edge-owned 20→19,
+nano moves to guix-wired, census exits 1. (2) drop the `td-recipe-output` marking in
+366 → nano builds with guix's gettext-minimal → `FAIL: nano's .drv does NOT reference
+td's gettext-minimal`, exit 2. Both reverted. The Guix legs (corpus byte counts) stay
+the removable migration oracle; edge-owned is durable (td's own recipes + manifest).

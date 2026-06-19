@@ -5,8 +5,17 @@
 # byte-identity corpus-* gates were retired with system/td-recipe.scm. pkg-config
 # is authored but not yet td-built (not in corpus-no-guix) and is excluded.
 # Build closure = the derivation prerequisite graph (lowering only, no build).
+# edge-owned (point 1) = td builds the recipe AND every declared input edge that
+# is itself an owned recipe is wired to a td OUTPUT (tests/td-chained-edges.txt,
+# proven by the build-plan gates); the rest are guix-wired edges build-plan can
+# close. Build-tool / non-owned inputs are the external seed (exempt).
 # Deterministic given the pinned channel; a pin bump re-baselines this snapshot.
 pin: 520785e315eddbe47199ac557e88e60eca3ae97c
 owned-recipes (23): bash coreutils diffutils file findutils gawk gettext-minimal grep gzip hello libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt readline sed tar xz
 corpus-union: td-reproducible 23 / 320 (7.19%) [bash coreutils diffutils file findutils gawk gettext-minimal grep gzip hello libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt readline sed tar xz]
 shipped-system: td-reproducible 19 / 3130 (0.61%) [bash coreutils diffutils file findutils gawk gettext-minimal grep gzip libsigsegv libunistring nano ncurses patch pcre2 readline sed tar xz]
+edge-owned (declared input edges all wired to td outputs): 20 / 23 [coreutils diffutils file findutils gawk grep gzip hello libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt sed tar xz]
+guix-wired input edges (build-plan can close these):
+  bash -> ncurses readline
+  gettext-minimal -> libunistring ncurses
+  readline -> ncurses
