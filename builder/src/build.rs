@@ -544,9 +544,12 @@ pub fn run_rust() -> Result<(), String> {
     }
 
     // set-paths: PATH from inputs' bin/ dirs; LIBRARY_PATH from lib/lib64 so the
-    // ld-wrapper finds (and RUNPATHs) the toolchain libs at link time.
+    // ld-wrapper finds (and RUNPATHs) the toolchain libs at link time; C_INCLUDE_PATH
+    // from include/ so a crate's C build script (e.g. the crypto backend's `cc`
+    // build) finds the seed's headers — incl. the kernel headers (linux/*.h).
     let mut path: Vec<String> = Vec::new();
     let mut lib: Vec<String> = Vec::new();
+    let mut cinc: Vec<String> = Vec::new();
     for p in inputs.split(':').filter(|s| !s.is_empty()) {
         let bin = format!("{p}/bin");
         if Path::new(&bin).is_dir() {
@@ -558,6 +561,10 @@ pub fn run_rust() -> Result<(), String> {
                 lib.push(d);
             }
         }
+        let inc = format!("{p}/include");
+        if Path::new(&inc).is_dir() {
+            cinc.push(inc);
+        }
     }
     let path = path.join(":");
     let cargo = find_in_path(&path, "cargo").ok_or("cargo not found in TD_INPUTS")?;
@@ -565,6 +572,9 @@ pub fn run_rust() -> Result<(), String> {
     let cp = find_in_path(&path, "cp").ok_or("cp not found in TD_INPUTS")?;
     let chmod = find_in_path(&path, "chmod").ok_or("chmod not found in TD_INPUTS")?;
     let gcc = find_in_path(&path, "gcc").ok_or("gcc not found in TD_INPUTS (linker)")?;
+    // Optional C/C++ compiler for crates with C build scripts (the `cc` crate honors
+    // CC/CXX). Absent for pure-Rust builds — harmless, since no C is compiled then.
+    let gpp = find_in_path(&path, "g++");
 
     // Materialize a WRITABLE source tree (cargo writes target/). A store directory
     // (self-host) is copied; a tarball is unpacked, then its single subdir copied.
@@ -592,15 +602,21 @@ pub fn run_rust() -> Result<(), String> {
     let rustflags = format!(
         "--remap-path-prefix={build_abs}=/td-build --remap-path-prefix={cargo_home}=/td-cargo -Clinker={gcc}"
     );
-    let envs: Vec<(String, String)> = vec![
+    let mut envs: Vec<(String, String)> = vec![
         ("out".into(), out.clone()),
         ("PATH".into(), path.clone()),
         ("LIBRARY_PATH".into(), lib.join(":")),
+        ("C_INCLUDE_PATH".into(), cinc.join(":")),
+        ("CPLUS_INCLUDE_PATH".into(), cinc.join(":")),
+        ("CC".into(), gcc.clone()),
         ("HOME".into(), "/homeless-shelter".into()),
         ("CARGO_HOME".into(), cargo_home.clone()),
         ("SOURCE_DATE_EPOCH".into(), "1".into()),
         ("RUSTFLAGS".into(), rustflags),
     ];
+    if let Some(gpp) = gpp {
+        envs.push(("CXX".into(), gpp));
+    }
 
     // vendored deps: if TD_VENDOR_CRATES is set, assemble a cargo `vendored-sources`
     // directory from each `.crate` (untar -> `<name>-<version>/`, plus a minimal
