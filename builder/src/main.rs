@@ -30,7 +30,7 @@ mod store_db_read;
 mod sys;
 
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 /// Adapter: stream Write into the hasher.
 struct HashWriter(sha256::Sha256);
@@ -1043,6 +1043,92 @@ fn build_plan_auto(
     let plan_path = scratch.join("auto.plan");
     std::fs::write(&plan_path, &plan).map_err(|e| e.to_string())?;
     build_plan(&plan_path.to_string_lossy(), guix_db, scratch)
+}
+
+/// td-builder shell — td's own `guix shell`: bring one or more package outputs
+/// into a command's environment, then run the command. This is the "own, then
+/// diverge" split: the name→derivation→output PACKAGE layer stays on guix for v1
+/// (`guix build PKG` — the same resolution guix shell does, the move-off-Guile §5
+/// layer retired LAST), but the ENVIRONMENT COMPOSITION + exec is td's own — we
+/// prepend each resolved output's `bin`/`sbin` to PATH ourselves and run the
+/// command directly, with no guix process in the exec path. The DURABLE behavior
+/// (the command runs with the package on PATH) survives the oracle's retirement;
+/// swapping the one `guix build` block for a td package db is all that is left.
+///
+/// Usage: shell PKG... [-- CMD ARGS...]
+///   PKG...      package specs to bring in (each resolved via `guix build`)
+///   -- CMD...   the command to run in the composed env; omitted → interactive $SHELL
+fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
+    // Everything before the first `--` is a package spec; after it, the command.
+    let sep = rest.iter().position(|a| a == "--");
+    let (pkgs, cmd): (&[String], &[String]) = match sep {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, &[]),
+    };
+
+    // Resolve each package spec to its store output(s) via the guix package
+    // oracle, collecting the bin/sbin dirs to put on PATH. This is the ONLY guix
+    // dependency in the command; the rest is td's own. (Swap this loop for a
+    // td-native package db and `shell` is guix-free — the move-off-Guile §5 step
+    // for the package layer, retired last.)
+    let mut prefix_dirs: Vec<String> = Vec::new();
+    for pkg in pkgs {
+        let out = Command::new("guix")
+            .args(["build", pkg])
+            .output()
+            .map_err(|e| format!("resolve `{pkg}': spawn guix build: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "resolve `{pkg}': guix build failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let mut found = false;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let path = line.trim();
+            if !path.starts_with("/gnu/store/") {
+                continue;
+            }
+            for sub in ["bin", "sbin"] {
+                let dir = format!("{path}/{sub}");
+                if Path::new(&dir).is_dir() {
+                    prefix_dirs.push(dir);
+                }
+            }
+            found = true;
+        }
+        if !found {
+            return Err(format!("resolve `{pkg}': guix build printed no store path"));
+        }
+    }
+
+    // Compose the child PATH ourselves: the resolved package bins FIRST (so the
+    // package's binary wins — the package is load-bearing), then the inherited
+    // PATH (guix shell's non-pure default). td builds this string; no guix
+    // process is between us and the command.
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let mut path = prefix_dirs.join(":");
+    if !inherited.is_empty() {
+        if !path.is_empty() {
+            path.push(':');
+        }
+        path.push_str(&inherited);
+    }
+
+    // Explicit `-- CMD…`, else drop into an interactive $SHELL (fallback /bin/sh).
+    let shell;
+    let (prog, prog_args): (&str, &[String]) = if let Some((first, args)) = cmd.split_first() {
+        (first.as_str(), args)
+    } else {
+        shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        (shell.as_str(), &[])
+    };
+
+    Command::new(prog)
+        .args(prog_args)
+        .env("PATH", &path)
+        .status()
+        .map_err(|e| format!("run `{prog}': {e}"))
 }
 
 fn main() -> ExitCode {
@@ -2527,6 +2613,20 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-builder shell — td's own `guix shell` (NOT a container; the default,
+        // non-`-C` form): resolve the named packages, compose the command's PATH
+        // from their outputs, run it. Resolution stays on the guix package oracle
+        // for v1; the env composition + exec are td's own (see run_shell). The
+        // durable assertion is behavioral — the command actually runs with the
+        // package on PATH. Usage:
+        //   shell PKG... [-- CMD ARGS...]
+        Some("shell") => match run_shell(&args[2..]) {
+            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+            Err(e) => {
+                eprintln!("td-builder: shell: {e}");
+                ExitCode::FAILURE
+            }
+        },
         // loop-sandbox: the DEV-SHELL — run a command inside td's own hermetic
         // container (pivot into a fresh root exposing the WHOLE /gnu/store (ro),
         // the daemon socket /var/guix, /proc, /dev; host-guix on PATH; its own
