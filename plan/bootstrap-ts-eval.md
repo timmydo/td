@@ -115,4 +115,18 @@ build-recipes prelude resolves the seed, once, to BUILD td-ts-eval).
 
 ### Status / evidence (4b)
 
-- (in progress)
+- `./check.sh corpus-no-guix`: GREEN — build-recipes built td-ts-eval ONCE (prelude
+  cache-HIT, `Compiling boa`=0: warm = reference, the latency fix holds), then the whole
+  corpus built + ran with td's OWN td-ts-eval evaluating the recipes
+  (`…/.td-build-cache/rust-ts-eval/…/td-ts-eval`); outputs unchanged (cache-hit), census
+  unchanged. New DURABLE structural leg fired ("recipes evaluate with td's OWN td-ts-eval").
+- **Verified-red:** perturbed `load_ts_eval` to a `/gnu/store` path (simulating guix's
+  evaluator) → the gnu gate's structural assert fired: `FAIL: TD_TS_EVAL is not td's own
+  build (/gnu/store/perturb-…)` (exit 2). The assert genuinely catches a guix evaluator.
+  Reverted.
+- **OOM note (environmental, not a 4b bug):** the first run got SIGKILL'd mid-build under
+  peak multi-agent contention (load 22-41, no-swap host — [[td-full-check-oom-and-exit-masking]]);
+  the drv had assembled fine from td's JSON. Re-ran when memory freed → green.
+- `guix build (system td-ts) td-ts-eval` is gone from the gnu gates (only the
+  build-recipes prelude resolves the seed, once, to BUILD td-ts-eval). node + tsc stay
+  guix on the transpile (retired-late). rust gates' ts-emit swap is a follow-up (4c).
