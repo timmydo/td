@@ -33,22 +33,22 @@ echo ">> warm-tsgo: $path is cold — fetching with td-fetch (host PREP) ..." >&
 # plain host cargo build (cached). Either is just a binary to drive the fetch — the
 # hermetic stage0 build is proven by the rust-fetch gate, not needed here.
 tdf=$(ls "$root"/.td-build-cache/rust-fetch/b/newstore/*/bin/td-fetch 2>/dev/null | head -1 || true)
-if [ -z "$tdf" ] || [ ! -x "$tdf" ]; then
+if { [ -z "$tdf" ] || [ ! -x "$tdf" ]; } && command -v cargo >/dev/null 2>&1; then
   echo ">> warm-tsgo: building td-fetch via host cargo (one-time) ..." >&2
   ( cd "$root/fetch" && cargo build --release --quiet )
   tdf="$root/fetch/target/release/td-fetch"
 fi
-test -x "$tdf" || { echo "warm-tsgo: no td-fetch binary" >&2; exit 1; }
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/warm-tsgo.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
-"$tdf" fetch "$url" "$sha" "$tmp/blob" >&2
-
-# The guix DAEMON stores the td-fetched + verified bytes (it is the store, not the
-# fetcher). name = the FOD basename minus its hash prefix; add-to-store with that name +
-# flat sha256 reproduces the origin's FOD path.
-name=$(basename "$path" | sed 's/^[a-z0-9]*-//')
-added=$(guix repl -- /dev/stdin "$tmp/blob" "$name" <<'SCM'
+if [ -n "$tdf" ] && [ -x "$tdf" ]; then
+  # td OWNS the fetch (the dev-loop path): td-fetch fetches + verifies, then the guix
+  # DAEMON stores the verified bytes (it is the store, not the fetcher). name = the FOD
+  # basename minus its hash prefix; add-to-store with that name + flat sha256 reproduces
+  # the origin's FOD path.
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/warm-tsgo.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT
+  "$tdf" fetch "$url" "$sha" "$tmp/blob" >&2
+  name=$(basename "$path" | sed 's/^[a-z0-9]*-//')
+  added=$(guix repl -- /dev/stdin "$tmp/blob" "$name" <<'SCM'
 (use-modules (guix store) (ice-9 match))
 (match (command-line)
   ((_ file name)
@@ -57,5 +57,17 @@ added=$(guix repl -- /dev/stdin "$tmp/blob" "$name" <<'SCM'
      (newline))))
 SCM
 )
-test "$added" = "$path" || { echo "warm-tsgo: add-to-store landed at $added, not the pin $path — bump tests/td-tsgo.lock" >&2; exit 1; }
-echo ">> warm-tsgo: warmed $path (td-fetched, daemon-stored)" >&2
+  test "$added" = "$path" || { echo "warm-tsgo: add-to-store landed at $added, not the pin $path — bump tests/td-tsgo.lock" >&2; exit 1; }
+  echo ">> warm-tsgo: warmed $path (td-fetched, daemon-stored)" >&2
+else
+  # No cargo to build td-fetch (e.g. the cargo-less CI fast runner, where rust is not in
+  # the image). Fall back to the daemon realizing the pinned FOD origin — the SAME bytes,
+  # SAME path. This is PREP, not a loop gate (the 15 in-loop sites stay guix-free); the
+  # dev loop always takes the td-fetch path above. The fast-image carries the FOD path
+  # once ci/lower-fast-drvs.sh's td-tsgo-tarball root lands in a rebuild, after which this
+  # branch is a warm no-op on the runner too.
+  echo ">> warm-tsgo: no cargo for td-fetch — daemon-realizing the pinned FOD (PREP fallback) ..." >&2
+  op=$( cd "$root" && guix build -L . -e '(@ (system td-ts) td-tsgo-tarball)' )
+  test "$op" = "$path" || { echo "warm-tsgo: guix FOD $op != pin $path — bump tests/td-tsgo.lock" >&2; exit 1; }
+  echo ">> warm-tsgo: warmed $path (daemon FOD fallback)" >&2
+fi

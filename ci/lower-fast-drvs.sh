@@ -10,7 +10,8 @@
 # FULL ladder). It emits, reusing the rungs' own lowering entry points:
 #   - the pinned channel instance (every rung's time-machine target)
 #   - the check.sh sandbox toolchain (so the offline `guix shell -C` has it)
-#   - node + the td-typescript (tsc) package (the `ts` rung)
+#   - the pinned tsgo tarball FOD (the `ts` rung's native compiler seed = the
+#     tests/td-tsgo.lock pin path; node + td-typescript retired in #111)
 #   - the SYSTEM and OCI-image derivations the cheap rungs lower
 #     (ci/lower-fast-drvs.scm — mirrors typed-diff/typed-coverage/oci-diff/
 #     manifest-diff/generation-diff)
@@ -44,9 +45,12 @@ $GUIX build -d $tools
 lower $GUIX repl -L . ci/channel-instance-drv.scm
 sed -n 's/^CHANNEL_DRV=//p' "$tmp"
 
-# --- The `ts` rung's packages: node and the td-typescript (tsc) package.
-$GUIX build -d node
-$GUIX build -L . -d -e '(@ (system td-ts) td-typescript)'
+# --- The `ts` rung's seed: the pinned tsgo tarball (the native TypeScript 7 compiler).
+# Lowering the origin puts its FOD output (= the tests/td-tsgo.lock pin path) into the
+# fast-image closure, so a rebuilt image carries it WARM and check-fast's host
+# warm-tsgo.sh no-ops on the runner (move-off-Guile §5 consumer-swap). node + the JS
+# td-typescript were retired in #111 (tsgo-migrate) — no longer in the fast tier.
+$GUIX build -L . -d -e '(@ (system td-ts) td-tsgo-tarball)'
 
 # --- The SYSTEM and OCI-image derivations the cheap rungs lower.
 lower $GUIX repl -L . ci/lower-fast-drvs.scm
