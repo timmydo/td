@@ -20,7 +20,8 @@ HEAVY_GATES += drv-emit
 drv-emit:
 	@echo ">> drv-emit: td-builder constructs the td-build hello .drv byte-identical to guix's; a perturbed recipe is a distinct .drv it also matches (evaluator-as-library)"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	vars=`$(GUIX) repl $(LOAD) tests/drv-emit-drv.scm 2>/dev/null`; \
 	drv=`printf '%s\n' "$$vars" | sed -n 's/^DRV=//p'`; \
