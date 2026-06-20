@@ -896,6 +896,155 @@ fn build_plan(plan_file: &str, guix_db: &str, scratch: &Path) -> Result<(), Stri
     Ok(())
 }
 
+/// A recipe's declared inputs — the JSON `inputs` array (absent → none).
+fn auto_inputs(recipe_dir: &str, name: &str) -> Result<Vec<String>, String> {
+    let p = format!("{recipe_dir}/{name}.json");
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
+    let alist = json::parse(&text).map_err(|e| format!("recipe JSON {p}: {e}"))?;
+    Ok(alist
+        .get("inputs")
+        .and_then(json::Json::as_arr)
+        .map(|a| a.iter().filter_map(json::Json::as_str).map(str::to_string).collect())
+        .unwrap_or_default())
+}
+
+/// An input is OWNED (td reconstructs it) iff both its recipe JSON and base lock exist;
+/// otherwise it is an external seed (the toolchain, retired last) and stays guix-supplied.
+fn auto_is_owned(recipe_dir: &str, lock_dir: &str, name: &str) -> bool {
+    Path::new(&format!("{recipe_dir}/{name}.json")).exists()
+        && Path::new(&format!("{lock_dir}/{name}-no-guix.lock")).exists()
+}
+
+/// Post-order DFS over the OWNED-input subgraph: appends each recipe AFTER its owned
+/// deps → a topo order (deps first). Cycles error.
+fn auto_topo(
+    recipe_dir: &str,
+    lock_dir: &str,
+    name: &str,
+    order: &mut Vec<String>,
+    seen: &mut std::collections::BTreeSet<String>,
+    stack: &mut Vec<String>,
+) -> Result<(), String> {
+    if seen.contains(name) {
+        return Ok(());
+    }
+    if stack.iter().any(|s| s == name) {
+        return Err(format!("--auto: dependency cycle through `{name}'"));
+    }
+    stack.push(name.to_string());
+    for inp in auto_inputs(recipe_dir, name)? {
+        if auto_is_owned(recipe_dir, lock_dir, &inp) {
+            auto_topo(recipe_dir, lock_dir, &inp, order, seen, stack)?;
+        }
+    }
+    stack.pop();
+    seen.insert(name.to_string());
+    order.push(name.to_string());
+    Ok(())
+}
+
+/// A lock entry (first field + store path) names dep D iff the field is bare `D` or the
+/// path basename is `<hash>-D-<version>` (32-char base32 hash + `-`). Handles both lock
+/// conventions: declared inputs written bare (grep's `pcre2`) and hash-named entries.
+fn auto_entry_is_dep(first: &str, path: &str, dep: &str) -> bool {
+    if first == dep {
+        return true;
+    }
+    let base = path.rsplit('/').next().unwrap_or(path);
+    if base.len() > 33 && base.as_bytes().get(32) == Some(&b'-') {
+        let rest = &base[33..];
+        return rest == dep || rest.starts_with(&format!("{dep}-"));
+    }
+    false
+}
+
+/// Derive a chained lock from BASE_LOCK_TEXT by re-keying each OWNED-input dep to
+/// `D <path> td-recipe-output` (so build_plan substitutes td's build of D); non-owned
+/// lines pass through. Every owned dep must appear in the lock — else the recipe
+/// declares an input its lock doesn't carry, and we refuse rather than drop the edge.
+fn auto_chained_lock(base_lock_text: &str, owned_deps: &[String]) -> Result<String, String> {
+    let mut out = String::new();
+    let mut marked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in base_lock_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let mut toks = trimmed.split_whitespace();
+        let first = toks.next().unwrap_or("");
+        let path = toks.next().unwrap_or("");
+        match owned_deps.iter().find(|d| auto_entry_is_dep(first, path, d)) {
+            Some(d) => {
+                out.push_str(&format!("{d} {path} td-recipe-output\n"));
+                marked.insert(d.clone());
+            }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for d in owned_deps {
+        if !marked.contains(d) {
+            return Err(format!("--auto: owned input `{d}' not found in the lock"));
+        }
+    }
+    Ok(out)
+}
+
+/// build-plan --auto: GENERATE the plan from the recipe GRAPH, then run it. Given a
+/// TARGET recipe spec, recursively resolve every declared input that is itself an owned
+/// recipe (RECIPE-DIR/<name>.json + LOCK-DIR/<name>-no-guix.lock both exist), topo-sort,
+/// emit a per-recipe chained lock marking those owned deps `td-recipe-output`, and feed
+/// the generated plan to build_plan. No hand-written plan or manifest — a recipe's edges
+/// chain automatically as the owned set grows.
+///
+/// Usage: build-plan --auto TARGET RECIPE-DIR LOCK-DIR GUIX-DB SCRATCH
+fn build_plan_auto(
+    target: &str,
+    recipe_dir: &str,
+    lock_dir: &str,
+    guix_db: &str,
+    scratch: &Path,
+) -> Result<(), String> {
+    if !auto_is_owned(recipe_dir, lock_dir, target) {
+        return Err(format!(
+            "--auto target `{target}': need {recipe_dir}/{target}.json and {lock_dir}/{target}-no-guix.lock"
+        ));
+    }
+    std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let mut order: Vec<String> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack: Vec<String> = Vec::new();
+    auto_topo(recipe_dir, lock_dir, target, &mut order, &mut seen, &mut stack)?;
+    eprintln!(
+        "td-builder: build-plan --auto {target}: derived a {}-step plan from the recipe graph: {}",
+        order.len(),
+        order.join(" -> ")
+    );
+    let mut plan = String::new();
+    for name in &order {
+        let owned: Vec<String> = auto_inputs(recipe_dir, name)?
+            .into_iter()
+            .filter(|i| auto_is_owned(recipe_dir, lock_dir, i))
+            .collect();
+        let base = std::fs::read_to_string(format!("{lock_dir}/{name}-no-guix.lock"))
+            .map_err(|e| format!("read lock for {name}: {e}"))?;
+        let chained = auto_chained_lock(&base, &owned)?;
+        let lock_path = scratch.join(format!("{name}-auto.lock"));
+        std::fs::write(&lock_path, &chained).map_err(|e| e.to_string())?;
+        plan.push_str(&format!(
+            "step {recipe_dir}/{name}.json {}\n",
+            lock_path.to_string_lossy()
+        ));
+    }
+    let plan_path = scratch.join("auto.plan");
+    std::fs::write(&plan_path, &plan).map_err(|e| e.to_string())?;
+    build_plan(&plan_path.to_string_lossy(), guix_db, scratch)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -2301,6 +2450,22 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-builder build-plan --auto — GENERATE the plan from the recipe GRAPH (no
+        // hand-written plan/manifest): topo-sort TARGET's owned-input closure, mark each
+        // owned-input dep `td-recipe-output`, and run it. An input is owned iff
+        // RECIPE-DIR/<name>.json and LOCK-DIR/<name>-no-guix.lock both exist.
+        // Usage: build-plan --auto TARGET RECIPE-DIR LOCK-DIR GUIX-DB SCRATCH
+        Some("build-plan") if args.len() == 8 && args[2] == "--auto" => {
+            let (target, recipe_dir, lock_dir, guix_db, scratch) =
+                (&args[3], &args[4], &args[5], &args[6], &args[7]);
+            match build_plan_auto(target, recipe_dir, lock_dir, guix_db, Path::new(scratch)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: build-plan --auto {target}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-check: td OWNS the reproducibility oracle. Execute the SAME .drv
         // TWICE in two independent userns sandbox runs and compare the per-output
         // NAR hashes — td's own `guix build --check`, with no daemon in the
@@ -2592,6 +2757,83 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // --auto: a lock entry names a dep whether it's written bare (declared inputs like
+    // grep's `pcre2`) or hash-named (`<hash>-D-<version>`); a non-matching toolchain
+    // entry and a near-miss (`ncursesw` vs `ncurses`) do NOT match.
+    #[test]
+    fn auto_entry_is_dep_matches_bare_and_hash_forms() {
+        let h = "agdqkcaybihqgjiwq9s9kz5mqsxwdjdv"; // 32-char base32 hash
+        assert!(auto_entry_is_dep("pcre2", "/gnu/store/x-pcre2-10.42", "pcre2")); // bare
+        assert!(auto_entry_is_dep(
+            &format!("{h}-ncurses-6.2"),
+            &format!("/gnu/store/{h}-ncurses-6.2"),
+            "ncurses"
+        )); // hash-named
+        assert!(auto_entry_is_dep(
+            &format!("{h}-gettext-minimal-0.23.1"),
+            &format!("/gnu/store/{h}-gettext-minimal-0.23.1"),
+            "gettext-minimal"
+        )); // dep name contains a dash
+        assert!(!auto_entry_is_dep(
+            &format!("{h}-ncursesw-6.2"),
+            &format!("/gnu/store/{h}-ncursesw-6.2"),
+            "ncurses"
+        )); // near-miss must NOT match
+        assert!(!auto_entry_is_dep(
+            &format!("{h}-coreutils-9.1"),
+            &format!("/gnu/store/{h}-coreutils-9.1"),
+            "ncurses"
+        )); // toolchain entry
+    }
+
+    // --auto: topo-sort follows the recipe JSONs' `inputs`, ordering deps before
+    // dependents, recursing only through OWNED inputs (those with a recipe JSON + lock);
+    // a non-owned input (toolchain seed) is not a node.
+    #[test]
+    fn auto_topo_orders_deps_before_dependents() {
+        let d = std::env::temp_dir().join(format!("td-auto-topo-{}", std::process::id()));
+        let rj = d.join("rj");
+        let ld = d.join("ld");
+        std::fs::create_dir_all(&rj).unwrap();
+        std::fs::create_dir_all(&ld).unwrap();
+        let put = |name: &str, json: &str| {
+            std::fs::write(rj.join(format!("{name}.json")), json).unwrap();
+            std::fs::write(ld.join(format!("{name}-no-guix.lock")), "x\n").unwrap();
+        };
+        put("bash", r#"{"name":"bash","inputs":["readline","ncurses","gcc-toolchain"]}"#);
+        put("readline", r#"{"name":"readline","inputs":["ncurses"]}"#);
+        put("ncurses", r#"{"name":"ncurses"}"#);
+        // gcc-toolchain has no recipe JSON / lock → not owned → not a node.
+        let (rjs, lds) = (rj.to_string_lossy().to_string(), ld.to_string_lossy().to_string());
+        let mut order = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = Vec::new();
+        auto_topo(&rjs, &lds, "bash", &mut order, &mut seen, &mut stack).unwrap();
+        assert_eq!(order, vec!["ncurses", "readline", "bash"]);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // --auto: deriving the chained lock re-keys each owned dep to bare-name +
+    // td-recipe-output (so build_plan substitutes by recipe name), passes every other
+    // line through unchanged, and errors if a declared owned dep isn't in the lock.
+    #[test]
+    fn auto_chained_lock_marks_owned_deps_only() {
+        let h = "agdqkcaybihqgjiwq9s9kz5mqsxwdjdv"; // 32-char base32 store hash
+        let base = format!(
+            "{h}-coreutils-9.1 /gnu/store/{h}-coreutils-9.1\n\
+             {h}-ncurses-6.2 /gnu/store/{h}-ncurses-6.2\n\
+             pcre2 /gnu/store/{h}-pcre2-10.42\n\
+             bash-source /gnu/store/{h}-bash-5.2.tar.gz\n"
+        );
+        let got = auto_chained_lock(&base, &["ncurses".into(), "pcre2".into()]).unwrap();
+        assert!(got.contains(&format!("ncurses /gnu/store/{h}-ncurses-6.2 td-recipe-output")));
+        assert!(got.contains(&format!("pcre2 /gnu/store/{h}-pcre2-10.42 td-recipe-output")));
+        assert!(got.contains(&format!("{h}-coreutils-9.1 /gnu/store/{h}-coreutils-9.1\n"))); // seed untouched
+        assert!(got.contains(&format!("bash-source /gnu/store/{h}-bash-5.2.tar.gz\n"))); // source untouched
+        // a declared owned dep absent from the lock is an error (don't drop the edge).
+        assert!(auto_chained_lock(&base, &["readline".into()]).is_err());
+    }
 
     // The build cache hits only on a present + NAR-verified output, and misses on a
     // corrupted, deleted, or never-recorded one — so a CHANGED recipe (different drv ⇒
