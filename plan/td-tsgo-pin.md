@@ -32,12 +32,22 @@ store (own-then-diverge; retired last). The guix origin stays as the pin/oracle.
 
 ## Sub-task ladder
 
-1. [ ] tests/td-tsgo.lock + tools/warm-tsgo.sh; warm lands at the FOD path.
-2. [ ] rewrite tests/tsgo.sh (pin-based); swap the 15 sites.
-3. [ ] check.sh host-prelude warm; `./check.sh ts` green with NO `guix build -e td-tsgo-tarball`.
-4. [ ] ci/build-ci-image.sh root; build fast-image locally, check-fast offline green.
-5. [ ] guix-surface/affected-checks updates; verified-red; land.
+1. [x] tests/td-tsgo.lock + tools/warm-tsgo.sh; add-to-store lands at the FOD path
+   (proven: `add-to-store(name,sha256-flat) == /gnu/store/iy52hn6…tgz` == the origin FOD).
+2. [x] rewrite tests/tsgo.sh (pin-based); swap the 15 sites (14 uniform + 348 compiler).
+3. [x] check.sh host-prelude warm; `./check.sh ts` + `tsgo-pin` green, NO `guix build -e
+   td-tsgo-tarball` in the gates.
+4. [x] CI: ci/lower-fast-drvs.sh lowers td-tsgo-tarball (the pin FOD) instead of the stale
+   node/td-typescript → a rebuilt fast-image carries the path; warm-tsgo.sh daemon-FOD
+   fallback keeps the cargo-less runner green until then. **Human step: `PUSH=1
+   TD_TIER=fast ci/build-ci-image.sh` to bake the path into the deployed image.**
+5. [~] affected-checks mapped; verified-red recorded; full ./check.sh running; then land.
 
 ## Verified-red
 
-(to record)
+- tsgo-pin content check has teeth: corrupting `tests/td-tsgo.lock` sha256
+  (`4689c7e8…` → `0000dead…`) reds tsgo-pin at `FAIL: warm tarball sha256 … != pin …`
+  (exit 1). Reverted to green. So the pin can't silently point at the wrong content.
+- Bootstrap-circularity note: building td-fetch (rust-fetch gate) needs tsgo, but warming
+  tsgo needs td-fetch — broken by warm-tsgo.sh's HOST `cargo build` (no tsgo), with the
+  hermetic stage0 build proven separately by the rust-fetch gate.
