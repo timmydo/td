@@ -20,7 +20,7 @@
 #
 # Per the differential + durable discipline:
 #   [STRUCTURAL] the build runs with guix/Guile off PATH and produces the binary, AND
-#     the .drv selected the cmake phase runner (`arg cmake-build`).
+#     the .drv selected the cmake phase runner (builder args `["cmake-build"]`).
 #   [DURABLE behavioral] the cmake-built binary RUNS and prints "td cmake-build hello".
 #   [DURABLE repro] td-builder check's double-build agrees the output is reproducible
 #     (td's own oracle, not guix build --check).
@@ -63,10 +63,10 @@ cmake:
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; grep -q 'no guix (derivation), no Guile' "$$scratch/err" || { echo "FAIL: build-recipe did not assemble the .drv itself" >&2; cat "$$scratch/err" >&2; exit 1; }; fi; \
-	grep -q 'arg cmake-build' "$$sd"/*.drv || { echo "FAIL: the .drv did not select the cmake-build phase runner" >&2; exit 1; }; \
+	grep -qE '\["cmake-build"\]' "$$sd"/*.drv || { echo "FAIL: the .drv did not select the cmake-build phase runner (builder args != [\"cmake-build\"])" >&2; exit 1; }; \
 	ns="$$sd/newstore/`basename "$$out"`"; \
 	test -x "$$ns/bin/td-cmake-hello" || { echo "FAIL: cmake build produced no binary at $$ns/bin/td-cmake-hello" >&2; exit 1; }; \
-	if [ -n "$$hit" ]; then echo "  [STRUCTURAL] CACHE HIT — cmake-demo source unchanged, reused td's prior build (no rebuild): $$out"; else echo "  [STRUCTURAL] td assembled + realized the .drv (arg cmake-build) with guix/Guile off PATH: $$out"; fi; \
+	if [ -n "$$hit" ]; then echo "  [STRUCTURAL] CACHE HIT — cmake-demo source unchanged, reused td's prior build (no rebuild): $$out"; else echo "  [STRUCTURAL] td assembled + realized the .drv (builder args [\"cmake-build\"]) with guix/Guile off PATH: $$out"; fi; \
 	got=`"$$ns/bin/td-cmake-hello"`; \
 	test "$$got" = "td cmake-build hello" || { echo "FAIL: td-cmake-hello printed '$$got', expected 'td cmake-build hello'" >&2; exit 1; }; \
 	echo "  [DURABLE behavioral] the cmake-built binary RUNS and prints '$$got'"; \
@@ -87,8 +87,8 @@ cmake:
 	  echo "  (build-system cmake-build-system) (arguments (list #:tests? #f))"; \
 	  echo "  (synopsis \"o\") (description \"cmake-build-system oracle.\") (home-page \"https://example.invalid\") (license license:gpl3+))"; } > "$$oracle"; \
 	gdrv=`$(GUIX) build -d -f "$$oracle" 2>/dev/null` || { echo "ERROR: could not compute the guix cmake-build-system oracle derivation (warm its closure on a channel bump)" >&2; exit 1; }; \
-	gout=`printf '(use-modules (guix derivations))\n(for-each (lambda (o) (display (derivation-output-path (cdr o))) (newline)) (derivation-outputs (read-derivation-from-file "%s")))\n' "$$gdrv" | $(GUIX) repl 2>/dev/null | head -1`; \
-	test -n "$$gout" || { echo "ERROR: could not read the guix oracle output path from $$gdrv" >&2; exit 1; }; \
+	gout=`printf '(use-modules (guix derivations))\n(for-each (lambda (o) (display (derivation-output-path (cdr o))) (newline)) (derivation-outputs (read-derivation-from-file "%s")))\n' "$$gdrv" | $(GUIX) repl 2>/dev/null | grep -oE '/gnu/store/[a-z0-9]+-td-cmake-demo-guix-[^ ]+' | head -1` || true; \
+	test -n "$$gout" || { echo "ERROR: could not read the guix oracle output path from $$gdrv (guix repl)" >&2; exit 1; }; \
 	if [ "$$out" = "$$gout" ]; then echo "FAIL: td's cmake-build path equals guix's cmake-build-system path — expected a distinct own-builder path" >&2; exit 1; fi; \
 	echo "  [MIGRATION ORACLE, removable] distinct from guix's cmake-build-system build ($$gout)"; \
 	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err" "$$oracle"; mkdir -p "$$scratch/tmp"; \
