@@ -40,6 +40,15 @@ convenience.
    allowlisted paths on the `td-state` filesystem survive a generation swap; machine
    identity (SSH host keys) lives there, never in a generation's root. Never stash
    mutable state outside the declared boundary to make something work.
+7. **No new guix-as-packager surface (move-off-Guile §5).** A new tool/seed is
+   provisioned td-native — a pinned fixed-output fetch the loop realizes + td's own
+   placement (`store-add-recursive`) — never a guix `(build-system …)` package built by
+   resolving `(@ (system M) pkg)` via `guix build -e` (or `specification->package`).
+   Adding one is a move-off-Guile regression: it requires a `tests/guix-surface.expected`
+   entry, called out in the PR for sign-off (directive 3). The `guix-surface` gate
+   ratchets this surface — it may only shrink. The existing seed packages
+   (`td-builder`/`td-ts-eval`/`td-typescript`) are the snapshotted baseline, retired by
+   their own tracks; this just stops NEW ones (author in TS, build/place with td).
 
 ## The loop
 

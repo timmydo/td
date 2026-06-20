@@ -267,6 +267,10 @@ map_path() {
     tests/guix-dependence.*)
       add_target guix-dependence ;;
 
+    tests/guix-surface.*)
+      add_preflight shell-syntax
+      add_target guix-surface ;;
+
     tests/ts-emit.sh|tests/ts-check.sh)
       add_preflight shell-syntax
       add_target ts
@@ -450,6 +454,8 @@ run_self_test() {
   assert_target tests/td-cmake-demo.lock cmake
   assert_target tests/cmake-demo/CMakeLists.txt cmake
   assert_target tests/ts/recipe-perturbed.ts drv-emit
+  assert_target tests/guix-surface.sh guix-surface
+  assert_target tests/guix-surface.expected guix-surface
   assert_target builder/src/sandbox.rs cargo-test
   assert_target builder/src/sandbox.rs td-builder
   # The td-builder build engine is the spine of EVERY recipe-building gate (corpus,

@@ -369,6 +369,15 @@ Standing posture decisions; naming them prevents surprises.
   Phase 1 (`ts-frontend`, §7.1) replaces the spec *language* and keeps reading
   the pinned corpus underneath; corpus replacement is Phase 2, separately gated
   (§6).
+- **New seeds are td-placed fetches, not guix packages** *(move-off-Guile
+  enforcement)*. An external seed/tool is a pinned fixed-output FETCH the loop
+  realizes + td PLACES (`store-add-recursive`), never a guix `(build-system …)`
+  package built via `guix build -e '(@ (system M) pkg)'` / `specification->package`.
+  The `guix-surface` gate (`tests/guix-surface.sh`, snapshot
+  `tests/guix-surface.expected`) ratchets that "guix-as-packager" surface one-way —
+  it may only shrink; growing it is a regression needing a deliberate snapshot edit
+  + sign-off (CLAUDE.md directive 7). The existing seed packages (`td-builder`,
+  `td-ts-eval`, `td-typescript`) are the baseline, retired by their own tracks.
 - **Free-software posture** *(relaxed to non-goal 2026-06-11, human)*. Strict
   FSDG purity is a **non-goal**. The pinned channel remains the default source
   (and happens to be FSDG-clean today), but nonfree inputs — firmware, blobs,
