@@ -37,9 +37,22 @@ Ship td's coreutils in `system/td.scm` (the userland becomes td-built Rust). Nee
 mechanism to reference a td-built store path as a system package — distinct from this
 capability PR.
 
+## Result (build green)
+
+Gate `rust-coreutils` (343) PASSES: td built `uutils-0.9.0` (multicall `coreutils` binary)
+at `/gnu/store/788c34…` from the 507-crate vendored closure — structural (.drv carries
+TD_VENDOR_CRATES + stage0 builder + td's own ts-eval), behavioral (mkdir/cp/cat/ls/mv/rm
+round-trip through the ONE binary), repro (td-builder check double-build agrees over the
+507-crate graph). The binary is a genuine multicall: **79 utilities**, 13M, links only
+libc/libm/libgcc_s.
+
 ## Verified-red
 
-- (to fill) gate behavioral: break a multicall assertion / drop a vendored crate → build
-  or behavior reds.
-- census: `uutils` must be in self-host-specs (else the census expects a gnu oracle and
-  errors).
+- **Behavioral is load-bearing** (confirmed): the ONE binary has distinct per-util
+  semantics — `coreutils true` → exit 0, `coreutils false` → exit 1, `coreutils echo` →
+  output — so dispatch is real, not a stub that always succeeds. The gate's mv/rm legs
+  assert the NEGATIVE (the source file is GONE after mv, the file is GONE after rm), so a
+  no-op multicall reds them.
+- **census**: `uutils` must be in self-host-specs — else the census globs recipe-uutils.ts,
+  tries `specification->package "uutils"`, and (no such package) errors. With it excluded,
+  the census is unchanged (owned-recipes still 26) — confirmed PASS.
