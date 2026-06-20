@@ -15,7 +15,8 @@ HEAVY_GATES += store-verify
 store-verify:
 	@echo ">> store-verify: td VERIFIES store integrity (re-hash registered paths vs the recorded registration) — the daemon's guix gc --verify --check-contents, pure Rust, no daemon"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	out=`guix build hello`; drv=`guix build -d hello`; \
 	test -n "$$out" -a -n "$$drv" || { echo "ERROR: could not realise hello" >&2; exit 1; }; \

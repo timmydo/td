@@ -18,7 +18,8 @@ HEAVY_GATES += store-add-tree
 store-add-tree:
 	@echo ">> store-add-tree: td CANONICALLY restores a directory tree into its OWN store + registers it (recursive addToStore, pure Rust, no daemon) — differential vs the daemon's interned source tree"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.store-add-tree-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch/store"; \
 	printf '%s\n' \

@@ -20,7 +20,8 @@ HEAVY_GATES += store-add
 store-add:
 	@echo ">> store-add: td PLACES a text path into its OWN store + registers it (pure Rust, no daemon in the write path) — differential vs the daemon's addToStore"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.store-add-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch/store"; \
 	printf 'td store-add test payload\n' > "$$scratch/content"; \
