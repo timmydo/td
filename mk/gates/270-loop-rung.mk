@@ -13,7 +13,8 @@ HEAVY_GATES += loop-rung
 loop-rung:
 	@echo ">> loop-rung: a REAL gate (eval) runs + prints 'eval ok' inside td's full-env sandbox (--expose-cwd) — intrinsic, no guix shell -C oracle"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	user="$${USER:-`id -un 2>/dev/null || echo nobody`}"; \
 	scratch="$(CURDIR)/.loop-rung-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
