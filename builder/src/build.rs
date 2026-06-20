@@ -110,17 +110,33 @@ fn patch_one_shebang(path: &Path, bash: &str) -> Result<(), String> {
     // mtime to "now" inverts that order and make then runs aclocal/autoconf —
     // absent from the seed — failing with exit 127 (coreutils hit this). A
     // shebang fix must be invisible to make's timestamp dependency graph.
-    let times = fs::metadata(path).ok();
+    let meta = fs::metadata(path).ok();
+    // Some tarballs ship build scripts read-only (e.g. less's mkinstalldirs is
+    // 0444); both fs::write and the mtime-restore reopen below would then fail
+    // EACCES. Temporarily grant owner-write, rewrite, and restore the ORIGINAL
+    // mode so the on-disk tree differs only in the shebang line — $out file
+    // modes come from `make install`, not the source tree, so this stays
+    // reproducibility-safe.
+    use std::os::unix::fs::PermissionsExt;
+    let orig_mode = meta.as_ref().map(|m| m.permissions().mode());
+    if let Some(mode) = orig_mode {
+        if mode & 0o200 == 0 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o200));
+        }
+    }
     // File::create truncates but keeps the existing mode (exec bit survives).
     let mut out = format!("#!{bash}{trailing}").into_bytes();
     out.extend_from_slice(&bytes[nl..]);
     fs::write(path, &out).map_err(|e| format!("patch-shebang {}: {e}", path.display()))?;
-    if let Some(meta) = times {
+    if let Some(meta) = meta.as_ref() {
         if let (Ok(accessed), Ok(modified)) = (meta.accessed(), meta.modified()) {
             if let Ok(f) = fs::File::options().write(true).open(path) {
                 let _ = f.set_times(fs::FileTimes::new().set_accessed(accessed).set_modified(modified));
             }
         }
+    }
+    if let Some(mode) = orig_mode {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
     }
     Ok(())
 }
@@ -855,6 +871,30 @@ mod tests {
         assert_eq!(fs::read_to_string(&perl).unwrap(), "#!/usr/bin/perl\nprint 1;\n");
         assert_eq!(fs::read(&data).unwrap(), b"\x7fELF\x00bytes");
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn patch_shebangs_rewrites_a_read_only_script_and_restores_its_mode() {
+        // less's mkinstalldirs ships 0444 — fs::write would EACCES. The rewrite
+        // must succeed (grant write temporarily) and leave the original mode.
+        let base = std::env::temp_dir().join(format!("td-shebang-ro-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let bash = "/gnu/store/zzz-bash-5.2.37/bin/bash";
+
+        let ro = base.join("mkinstalldirs");
+        fs::write(&ro, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o444)).unwrap();
+
+        patch_shebangs(&base, bash).unwrap();
+
+        assert_eq!(fs::read_to_string(&ro).unwrap(), format!("#!{bash}\nexit 0\n"));
+        assert_eq!(
+            fs::metadata(&ro).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "original read-only mode restored"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }
