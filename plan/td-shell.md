@@ -39,13 +39,24 @@ cargo-compiled from the current builder/ source) → **no new `guix build -e
   `td shell` byte-equals `guix shell` — the guix differential, DELETED (not
   rewritten) when guix retires; A–C are what remain.
 
-## Verified-red (record evidence here)
+## Verified-red (2026-06-20)
 
-- [pending] break PATH composition (don't prepend pkg bins) → Leg A reds.
-- [pending] resolve to a fixed wrong path → Leg D reds.
-- [pending] make a bogus package "succeed" (ignore guix exit) → Leg C reds.
+- VR1 — Leg A behavioral: dropped the package bins from the composed PATH
+  (`path = String::new()` instead of `prefix_dirs.join(":")`) → `td shell hello --
+  hello` exits nonzero ("td shell hello -- hello exited nonzero"). Reverted.
+- VR2 — Leg C discrimination: swallowed `guix build`'s non-zero exit (`continue`
+  instead of returning Err) → `td shell no-such-package-xyzzy` succeeds, gate reds
+  ("resolution is a no-op"). Reverted.
+- VR3 — Leg D oracle: perturbed the expected path to `$oracle/bin/WRONG` → the
+  equality assertion fires and reds (non-vacuous). Reverted.
+
+Note: rapid back-to-back stage0 recompiles into the dedicated
+`.td-build-cache/td-shell` base can leave a half-written placement; `rm -rf` it
+and re-run if stage0-builder reports "could not place a stage0 td-builder".
 
 ## Status
 
-- Implementation + gate green via `./check.sh td-shell` (2026-06-20).
-- Verified-red pending, then commit + draft PR.
+- Implementation + gate green via `./check.sh td-shell` and direct
+  `sh tests/td-shell.sh` (2026-06-20). Verified-red done (VR1–VR3 above).
+- Next: landing readiness (`tools/affected-checks.sh --committed-only --run`),
+  draft PR, flip the record to `done` on land.
