@@ -74,7 +74,9 @@
 ;; proving td's own cmake build path — it has no `specification->package` corpus
 ;; oracle by design (it is a new capability, not a corpus reconstruction); its
 ;; own-builder proof is the `cmake` gate, not a corpus differential.
-(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval" "td-cmake-demo"))
+;; td-fetch joins them: td's own seed fetcher (buildSystem "rust"), a new capability
+;; with no corpus oracle; its own-builder proof is the `rust-fetch` gate.
+(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval" "td-cmake-demo" "td-fetch"))
 
 (define owned-specs
   (sort

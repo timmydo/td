@@ -141,6 +141,8 @@ map_recipe_spec() {
       add_target cmake ;;
     cat)
       add_target rust-uutils ;;
+    td-fetch)
+      add_target rust-fetch ;;
     perturbed)
       add_target drv-emit ;;
     pkg-config)
@@ -197,6 +199,9 @@ map_path() {
       add_target ts-eval
       add_target ts-diff ;;
 
+    fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock)
+      add_target rust-fetch ;;
+
     tests/ts/recipe-*-perturbed.ts)
       spec=${p##*/recipe-}
       spec=${spec%-perturbed.ts}
@@ -230,6 +235,9 @@ map_path() {
 
     tests/cat-uutils.lock)
       add_target rust-uutils ;;
+
+    tests/td-fetch.lock)
+      add_target rust-fetch ;;
 
     tests/build-pkg.sh|tests/cache-lib.sh)
       add_preflight shell-syntax
