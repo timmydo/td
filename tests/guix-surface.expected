@@ -5,7 +5,7 @@
 # growing it needs a deliberate edit here, called out in the PR (directive 3).
 # Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB>(system <mod>) <name>
-packager-sites: 34
+packager-sites: 26
 Makefile	(system td-ts) td-ts-eval
 mk/gates/130-rootless.mk	(system td-builder) td-builder
 mk/gates/170-bootstrap.mk	(system td-builder) td-builder
@@ -21,14 +21,6 @@ mk/gates/255-resolve.mk	(system td-builder) td-builder
 mk/gates/265-loop-sandbox.mk	(system td-builder) td-builder
 mk/gates/270-loop-rung.mk	(system td-builder) td-builder
 mk/gates/272-sandbox-hardening.mk	(system td-builder) td-builder
-mk/gates/275-store-register.mk	(system td-builder) td-builder
-mk/gates/280-store-add.mk	(system td-builder) td-builder
-mk/gates/285-store-add-tree.mk	(system td-builder) td-builder
-mk/gates/290-store-gc.mk	(system td-builder) td-builder
-mk/gates/295-store-verify.mk	(system td-builder) td-builder
-mk/gates/300-store-gc-sweep.mk	(system td-builder) td-builder
-mk/gates/305-store-add-referenced.mk	(system td-builder) td-builder
-mk/gates/310-store-backend.mk	(system td-builder) td-builder
 mk/gates/330-rust-build.mk	(system td-builder) td-builder
 mk/gates/350-rust-ts-eval.mk	(system td-ts) td-ts-eval
 mk/gates/352-cmake.mk	(system td-builder) td-builder

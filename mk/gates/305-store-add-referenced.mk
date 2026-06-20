@@ -17,7 +17,8 @@ HEAVY_GATES += store-add-referenced
 store-add-referenced:
 	@echo ">> store-add-referenced: td ADDS a path WITH references (hello's .drv) to its OWN store + registers the references (pure Rust, no daemon) — differential vs the daemon"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	drv=`guix build -d hello`; \
 	test -n "$$drv" -a -f "$$drv" || { echo "ERROR: could not realise hello's .drv" >&2; exit 1; }; \
