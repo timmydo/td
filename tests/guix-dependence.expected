@@ -14,8 +14,4 @@ pin: 520785e315eddbe47199ac557e88e60eca3ae97c
 owned-recipes (23): bash coreutils diffutils file findutils gawk gettext-minimal grep gzip hello libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt readline sed tar xz
 corpus-union: td-reproducible 23 / 320 (7.19%) [bash coreutils diffutils file findutils gawk gettext-minimal grep gzip hello libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt readline sed tar xz]
 shipped-system: td-reproducible 19 / 3130 (0.61%) [bash coreutils diffutils file findutils gawk gettext-minimal grep gzip libsigsegv libunistring nano ncurses patch pcre2 readline sed tar xz]
-edge-owned (declared input edges all wired to td outputs): 20 / 23 [coreutils diffutils file findutils gawk grep gzip hello libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt sed tar xz]
-guix-wired input edges (build-plan can close these):
-  bash -> ncurses readline
-  gettext-minimal -> libunistring ncurses
-  readline -> ncurses
+edge-owned (declared input edges all wired to td outputs): 23 / 23 [bash coreutils diffutils file findutils gawk gettext-minimal grep gzip hello libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt readline sed tar xz]
