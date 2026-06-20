@@ -35,13 +35,18 @@ assertions then prove stage0's td-builder does the op correctly.
 
 ## PR plan (step 2 = several PRs)
 
-- **PR 1 (this): store-backend family** — 275/280/285/290/295/300/305/310 (8 gates).
-  Count 34→26. Each store gate uses `$$tb` for td's own store op AND the daemon-oracle
-  RPC (store-add); stage0's td-builder is the same binary, so the differential is
-  unchanged. Re-baselined `tests/guix-surface.expected` (26).
-- Follow-on: drv-* (230/235/240/245), loop-* (265/270), td-check 250, resolve 255,
-  rootless 130, sandbox-hardening 272, td-realize 355, td-offline 360,
-  build-hermetic 356; then the td-ts-eval routing (step 3) → toward the oracle floor.
+- **PR 1 (DONE, #117): store-backend family** — 275/280/285/290/295/300/305/310 (8
+  gates). Count 34→26. Each store gate uses `$$tb` for td's own store op AND the
+  daemon-oracle RPC (store-add); stage0's td-builder is the same binary, so the
+  differential is unchanged.
+- **PR 2 (this): drv-* family** — 230-drv-emit / 235-td-drv-build / 240-td-drv-add /
+  245-td-drv-assemble (4 gates). Count 26→22. The drv gates use `$$tb` for
+  drv-emit/build/drv-add/drv-assemble; their oracle is the guix DAEMON + `guix repl`/
+  `guix build` (lowering), NOT the td-builder binary — stage0 is the same source so the
+  emitted/assembled .drv is byte-identical. Re-baselined `tests/guix-surface.expected` (22).
+- Follow-on: loop-* (265/270), td-check 250, resolve 255, rootless 130,
+  sandbox-hardening 272, td-realize 355, td-offline 360, build-hermetic 356; then the
+  td-ts-eval routing (step 3) → toward the ~11 oracle floor.
 
 ## Verified-red
 

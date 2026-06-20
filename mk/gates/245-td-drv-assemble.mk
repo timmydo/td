@@ -16,7 +16,8 @@ HEAVY_GATES += td-drv-assemble
 td-drv-assemble:
 	@echo ">> td-drv-assemble: td ASSEMBLES the build .drv from a guile-resolved spec (no (derivation …)) and registers it — byte-identical to guix's (derivation …)"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.td-drv-assemble-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	oracle=`TD_SPEC_OUT="$$scratch/hello.spec" $(GUIX) repl $(LOAD) tests/td-drv-assemble-drv.scm 2>/dev/null | sed -n 's/^ORACLE=//p'`; \

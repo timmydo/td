@@ -16,7 +16,8 @@ HEAVY_GATES += td-drv-add
 td-drv-add:
 	@echo ">> td-drv-add: td-builder REGISTERS its constructed .drv via the daemon (addTextToStore) — no guile (derivation …); the loop builds td's registration"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.td-drv-add-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	drv=`$(GUIX) repl $(LOAD) tests/td-drv-add-drv.scm 2>/dev/null | sed -n 's/^DRV=//p'`; \
