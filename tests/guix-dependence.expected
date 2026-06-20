@@ -11,8 +11,8 @@
 # Build-tool / non-owned inputs are the external seed (exempt).
 # Deterministic given the pinned channel; a pin bump re-baselines this snapshot.
 pin: 520785e315eddbe47199ac557e88e60eca3ae97c
-owned-recipes (25): bash coreutils diffutils file findutils gawk gettext-minimal gperf grep gzip hello libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt readline sed tar which xz
-corpus-union: td-reproducible 25 / 324 (7.72%) [bash coreutils diffutils file findutils gawk gettext-minimal gperf grep gzip hello libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt readline sed tar which xz]
-shipped-system: td-reproducible 21 / 3130 (0.67%) [bash coreutils diffutils file findutils gawk gettext-minimal gperf grep gzip libsigsegv libunistring nano ncurses patch pcre2 readline sed tar which xz]
-edge-owned (every owned-input edge built from a td output, proven by mk/gates/365 build-plan): 25 / 25
-chained (recipes with owned input edges): bash gettext-minimal grep nano readline
+owned-recipes (26): bash coreutils diffutils file findutils gawk gettext-minimal gperf grep gzip hello less libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt readline sed tar which xz
+corpus-union: td-reproducible 26 / 327 (7.95%) [bash coreutils diffutils file findutils gawk gettext-minimal gperf grep gzip hello less libatomic-ops libsigsegv libunistring make nano ncurses patch pcre2 popt readline sed tar which xz]
+shipped-system: td-reproducible 22 / 3130 (0.70%) [bash coreutils diffutils file findutils gawk gettext-minimal gperf grep gzip less libsigsegv libunistring nano ncurses patch pcre2 readline sed tar which xz]
+edge-owned (every owned-input edge built from a td output, proven by mk/gates/365 build-plan): 26 / 26
+chained (recipes with owned input edges): bash gettext-minimal grep less nano readline
