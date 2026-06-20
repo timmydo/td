@@ -46,8 +46,13 @@ ladder, short-circuiting on the first failure; **the drop-in fragments under
 `check:` target expands) are the authoritative gate list** — documents point here
 instead of restating it, and a new gate is a new fragment file, not an edit to a shared
 list. Broad shape: config eval → differentials → `guix build --check` →
-behavioral/marionette tests. Plain
-`make check` is only correct when you're already inside that sandbox.
+package-manager behavioral/oracle tests (built tools run, link tests, the
+per-package guix differential). The whole-OS boot tier — marionette `(gnu tests)`
+system tests and `guix system image` builds — is **parked out of the default
+`check` into the on-demand `check-system`** while td's focus is the user-space
+package manager (a human-directed scope call: Makefile `check-system`, DESIGN §4.3);
+`check-fast` is the cheap + typed-front-end subset CI runs. Plain `make check` is
+only correct when you're already inside that sandbox.
 
 ### 1.2 Rung classes
 
@@ -55,7 +60,8 @@ behavioral/marionette tests. Plain
 - Reproducibility oracle: `guix build --check` (and `--rounds=2` where cheap). A
   non-reproducible output is a failing test.
 - Boot + behavioral: marionette `(gnu tests)` system tests that boot the image and
-  drive the guest from Guile.
+  drive the guest from Guile — run in the on-demand `check-system` tier, parked out
+  of the default `check` (§1.1).
 
 Fuzzing/adversarial and real-hardware rungs are deferred (off-roadmap).
 
