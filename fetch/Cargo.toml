@@ -1,0 +1,15 @@
+[package]
+name = "td-fetch"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "td-fetch"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "2", default-features = false, features = ["tls"] }
+sha2 = "0.10"
+
+[profile.release]
+strip = true
