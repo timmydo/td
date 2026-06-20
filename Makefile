@@ -123,17 +123,23 @@ build-recipes:
 	@set -euo pipefail; \
 	node=`$(GUIX) build node`/bin/node; \
 	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
-	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
-	test -x "$$ev" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval" >&2; exit 1; }; \
+	seedev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
+	test -x "$$seedev" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / td-ts-eval seed" >&2; exit 1; }; \
 	for s in $(BUILD_SPECS); do grep ' /gnu/store/' "tests/$$s-no-guix.lock"; done \
 	  | sed 's/^[^ ]* //' | sort -u | xargs $(GUIX) build >/dev/null \
 	  || { echo "ERROR: could not realize the build seed (regenerate locks on a channel bump)" >&2; exit 1; }; \
 	grep ' /gnu/store/' tests/td-builder-rust.lock | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null \
 	  || { echo "ERROR: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }; \
-	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	grep ' /gnu/store/' tests/td-ts-eval.lock | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null \
+	  || { echo "ERROR: could not realize the td-ts-eval seed + crates (regenerate tests/td-ts-eval.lock on a boa bump)" >&2; exit 1; }; \
+	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	export CACHE="$(CURDIR)/.td-build-cache/pkg" TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; mkdir -p "$$CACHE"; \
 	. tests/cache-lib.sh; load_stage0; \
 	echo ">> builds run on the td-bootstrapped stage0 td-builder ($$TD_BUILDER_PATH) — NO guix-built td-builder (move-off-Guile §5 brick 3)"; \
+	tdeval=`TD_TS_EVAL="$$seedev" sh tests/ts-eval-tool.sh "$(CURDIR)/.td-build-cache/rust-ts-eval"`; \
+	test -x "$$tdeval" || { echo "ERROR: could not build the td-ts-eval evaluator (brick 4b prelude)" >&2; exit 1; }; \
+	export TD_TS_EVAL="$$tdeval"; \
+	echo ">> recipes EVALUATE with td's OWN td-ts-eval ($$tdeval) — not the guix-built one (move-off-Guile §5 brick 4b)"; \
 	jobs=$${TD_BUILD_JOBS:-$$(nproc)}; \
 	echo ">> building $(words $(BUILD_SPECS)) recipes across $$jobs cores (single-threaded each) ..."; \
 	printf '%s\n' $(BUILD_SPECS) | xargs -P "$$jobs" -n1 sh tests/build-pkg.sh; \

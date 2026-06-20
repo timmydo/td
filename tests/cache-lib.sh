@@ -35,6 +35,21 @@ load_stage0() {
   test -x "$TB" || { echo "FAIL: stage0 td-builder not executable at $TB" >&2; return 1; }
 }
 
+# load_ts_eval — export TD_TS_EVAL = the td-BUILT td-ts-eval, so the gnu gates EVALUATE
+# their recipes with td's OWN boa evaluator instead of `guix build (system td-ts)
+# td-ts-eval` (move-off-Guile §5 brick 4b). td-ts-eval is built ONCE by the build-recipes
+# prelude (tests/ts-eval-tool.sh, content-addressed cached) which writes the sentinel this
+# reads. The td-built evaluator produces byte-identical JSON to guix's (rust-ts-eval
+# oracle), so outputs are unchanged — only WHO evaluates changes. Only the prelude
+# resolves the guix SEED (to build td-ts-eval); the gnu gates no longer touch it.
+load_ts_eval() {
+  _tse="${TD_TSEVAL_BASE:-$(pwd)/.td-build-cache/rust-ts-eval}/tseval-path"
+  test -s "$_tse" || { echo "FAIL: no td-built td-ts-eval sentinel ($_tse) — the build-recipes ts-eval prelude must run first" >&2; return 1; }
+  TD_TS_EVAL=`cat "$_tse"`
+  export TD_TS_EVAL
+  test -x "$TD_TS_EVAL" || { echo "FAIL: td-built td-ts-eval not executable at $TD_TS_EVAL" >&2; return 1; }
+}
+
 # cached_build SPEC LOCK  — emit the recipe, build via build-recipe with caching.
 # Sets sd, out, ns, hit. Returns non-zero (with a FAIL message) on a real failure.
 cached_build() {
