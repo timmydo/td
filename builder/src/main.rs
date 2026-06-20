@@ -600,7 +600,10 @@ fn build_recipe(
     let phase_runner = match build_system {
         "gnu" => "autotools-build",
         "rust" => "rust-build",
-        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust)")),
+        // cmake: td's own cmake phase runner (build::run_cmake), the cmake-build-system
+        // replacement — out-of-source cmake configure -> make -> make install in Rust.
+        "cmake" => "cmake-build",
+        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake)")),
     };
     // configure flags + phases (both optional) -> JSON array string. A configure
     // flag may itself contain whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`), so the
@@ -699,6 +702,11 @@ fn build_recipe(
         "gnu" => {
             spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
             spec.push_str(&format!("env TD_PHASES={phases}\n"));
+        }
+        // cmake: the cmake phase runner reads the extra `cmake` flags (TD_CONFIGURE_FLAGS);
+        // the autotools `substitute*` phase interpreter (TD_PHASES) does not apply here.
+        "cmake" => {
+            spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
         }
         // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS) and,
         // if any vendored deps were locked, resolves them offline (TD_VENDOR_CRATES).
@@ -2542,6 +2550,17 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // td's OWN cmake build system (the cmake-build-system replacement): runs an
+        // out-of-source `cmake` configure -> make -> make install over the TD_SRC
+        // tree, installing into $out. Sibling of autotools-build/rust-build; same
+        // env-driven derivation-builder contract (system/td-build.scm).
+        Some("cmake-build") if args.len() == 2 => match build::run_cmake() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: cmake-build: {e}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("usage: td-builder            # print the S1 sentinel");
             eprintln!("       td-builder nar-hash PATH");
@@ -2563,6 +2582,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder build-plan PLAN GUIX-DB SCRATCH-DIR");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             eprintln!("       td-builder rust-build        # as a derivation builder (cargo)");
+            eprintln!("       td-builder cmake-build       # as a derivation builder (cmake)");
             ExitCode::from(2)
         }
     }

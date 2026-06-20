@@ -70,7 +70,11 @@
 ;; census (which is rooted in guix package derivations). Their own-builder proof is
 ;; the rust-build / rust-vendor / rust-uutils / rust-russh / rust-ts-eval gates (td
 ;; builds them itself, reproducibly), not a corpus differential.
-(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval"))
+;; td-cmake-demo joins them: a from-scratch cmake demonstrator (buildSystem "cmake")
+;; proving td's own cmake build path — it has no `specification->package` corpus
+;; oracle by design (it is a new capability, not a corpus reconstruction); its
+;; own-builder proof is the `cmake` gate, not a corpus differential.
+(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval" "td-cmake-demo"))
 
 (define owned-specs
   (sort

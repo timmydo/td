@@ -137,6 +137,8 @@ map_recipe_spec() {
       add_target rust-vendor ;;
     td-russh-demo)
       add_target rust-russh ;;
+    td-cmake-demo)
+      add_target cmake ;;
     cat)
       add_target rust-uutils ;;
     perturbed)
@@ -222,6 +224,9 @@ map_path() {
 
     tests/td-russh-demo.lock|tests/td-russh-demo-source.scm)
       add_target rust-russh ;;
+
+    tests/td-cmake-demo.lock|tests/cmake-demo/*)
+      add_target cmake ;;
 
     tests/cat-uutils.lock)
       add_target rust-uutils ;;
@@ -441,6 +446,9 @@ run_self_test() {
   assert_branch_policy tools/affected-checks.sh "full ./check.sh would be waived"
   assert_target tests/ts/recipe-td-russh-demo.ts rust-russh
   assert_target tests/td-russh-demo.lock rust-russh
+  assert_target tests/ts/recipe-td-cmake-demo.ts cmake
+  assert_target tests/td-cmake-demo.lock cmake
+  assert_target tests/cmake-demo/CMakeLists.txt cmake
   assert_target tests/ts/recipe-perturbed.ts drv-emit
   assert_target builder/src/sandbox.rs cargo-test
   assert_target builder/src/sandbox.rs td-builder
