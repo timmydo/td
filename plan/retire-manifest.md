@@ -35,10 +35,12 @@ now derived. The invariant "every owned recipe builds FROM td inputs" is gate-en
 
 ## Verified-red
 
-- Census: a recipe with an owned input edge whose dep isn't actually owned would not be
-  counted — but by construction owned-input-edges filters to owned recipes, so the metric
-  tracks the graph; the GATE is the build proof (365 reds if a chain doesn't build, as
-  shown when gettext needed ncurses --with-shared, #107).
-- Gate 365: break the `--auto` td-recipe-output marking (in td-builder) → a subject builds
-  with guix's dep → structural red (the substitution VR from #107/#110 applies; `--auto`'s
-  generation is unit-VR'd in #110).
+- Census graph-derivation (confirmed): perturb `owned-input-edges` → `()` → the `chained`
+  list empties → census output differs from the expected snapshot → exit 1. So the
+  derived `chained` list is load-bearing (edge-owned stays N/N — robust by construction;
+  the `chained` list is the discriminating part).
+- Gate 365 (build proof): the structural assertion (a subject's `.drv` references td's
+  edge outputs, NOT guix's) depends on `--auto`'s substitution, which is unit-VR'd in
+  #110 (`auto_chained_lock`) and was VR'd at the gate level in #107 (break the marking →
+  the subject builds guix's dep → structural red). 365 reds if any owned-input edge
+  can't chain (as gettext did before ncurses `--with-shared`, #107).
