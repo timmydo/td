@@ -98,9 +98,47 @@ guix-shelling build would red there; a wrong/missing lock entry reds resolution.
 The bar (human-aligned): no guix/Guile in nano's BUILD PATH; the toolchain + lock are the
 guix-built SEED (bootstrapping the toolchain is §5 retired-LAST, a separate effort).
 
+## Increment 5 (self-hermetic build sandbox — reassigned to claude-fable-9e6e71)
+
+Track reassigned from the dormant claude-fable-2715d4 (no PR since the #74 capstone;
+record last touched #69) with the maintainer's go-ahead.
+
+`sandbox::build` unshared NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS and overlaid
+newstore→/gnu/store + a tmpfs /tmp, but did NOT pivot_root — so the build inherited
+the INVOKING root (/etc, /home, /usr, /var/guix … all visible) and was hermetic ONLY
+because the outer host-sandbox had already hidden the host. That hidden precondition
+("build is only hermetic inside the loop container") bites the own-builder-daemon
+direction, where build runs without the outer wrapper.
+
+Now build pivot_roots into a MINIMAL fresh-tmpfs root: staged /gnu/store (rbind, so the
+per-item input binds + the output dir ride through), a writable /tmp with the build dir,
+/dev + /proc rbind'd from the invoking namespace, and a minimal /etc (passwd+group for
+getpwuid/getgrgid) — nothing else of the host fs.
+
+- /dev is rbind'd WHOLE, not rebuilt node-by-node: re-binding a device onto a fresh
+  unprivileged-userns tmpfs strips device access (the first attempt red'd td-realize with
+  `/dev/null: Permission denied` in hello's configure). The rbind preserves host_shell's
+  already-minimal /dev in the loop. A standalone daemon (no outer host_shell) will want
+  its own minimal-/dev builder — noted in Next.
+- NEWPID + a fresh /proc reflecting the build's own pid namespace stay parity work; /proc
+  is rbind'd for now (filesystem hermeticity, the finding's concern, doesn't need it).
+
+Gate `build-hermetic` (356): a probe drv whose guile builder ERRORS if /var/guix (the
+daemon db/socket/gc-roots — bound rw into the loop container, never wanted in a build) is
+reachable; `td-builder realize` succeeds ONLY because build pivots it away. DURABLE /
+behavioral, no guix oracle leg (it asserts the daemon state is ABSENT from the build).
+
+Verified-red (recorded): with `sandbox::build` reverted to the no-pivot main version,
+`./check.sh build-hermetic` FAILS — `LEAK: /var/guix reachable inside td's build sandbox`
+→ the probe builder exits 1 → realize errors → gate red (exit 2). So the gate is
+non-vacuous and the pivot is load-bearing. Restored → green. td-realize still PASSES
+byte-identically to the daemon (55-path closure), proving the minimal root is sufficient
+and the minimal /etc does not perturb output.
+
 ## Next
 
+- NEWPID + a fresh /proc reflecting the build's own pid namespace (S4 parity).
+- A minimal-/dev builder for the standalone (no outer host_shell) daemon case.
 - A persistent daemon mode the loop invokes by default instead of guix-daemon.
 - A network-present daemon harness → fully differential offline-isolation.
-- Reconstruct nano's deps (ncurses) → fewer seed entries are guix-package paths.
 - Toolchain retired LAST (§5).

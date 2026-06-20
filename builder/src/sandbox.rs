@@ -2,14 +2,21 @@
 //! replicating the pinned daemon's guest-visible contract (read off
 //! nix/libstore/build.cc and recorded in plan/td-builder.md Q4):
 //!   - namespaces: NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS (the immediate-effect
-//!     set; NEWNET makes the build offline by construction — NEWPID/proc and
-//!     the full chroot layout are S4 parity work);
+//!     set; NEWNET makes the build offline by construction). NEWPID + a fresh
+//!     /proc reflecting the build's OWN pid namespace remain S4 parity work; for
+//!     now /proc is rbind'd from the invoking namespace;
 //!   - uid/gid: guest 30001/30000 mapped over the invoking user, setgroups
 //!     denied (build.cc defaultGuestUID/GID, initializeUserNamespace);
+//!   - chroot: the build pivot_roots into a MINIMAL fresh-tmpfs root holding only
+//!     the staged /gnu/store, a writable /tmp, /dev + /proc rbind'd from the
+//!     invoking namespace, and a minimal /etc — nothing else of the host
+//!     filesystem. So `build` is SELF-hermetic, not dependent on the outer
+//!     host-sandbox to hide /etc, /home, /usr, /var/guix … from the builder
+//!     (own-builder-daemon: self-hermetic build sandbox);
 //!   - store: every closure item bind-mounted into a staged directory which
-//!     is then rbind-mounted over /gnu/store, so the builder sees real store
-//!     paths while writes land in the scratch directory (the rootless rung's
-//!     mechanics) and the bound inputs stay protected by their host-root
+//!     is then rbind-mounted over the new root's /gnu/store, so the builder sees
+//!     real store paths while writes land in the scratch directory (the rootless
+//!     rung's mechanics) and the bound inputs stay protected by their host-root
 //!     ownership;
 //!   - build dir: a fresh tmpfs /tmp with /tmp/guix-build-<drvname>-0 (0700,
 //!     <drvname> keeps the .drv suffix), cwd there;
@@ -133,11 +140,51 @@ pub fn build(
     let host_uid = sys::getuid();
     let host_gid = sys::getgid();
 
-    let newstore_c = CString::new(newstore.as_os_str().as_encoded_bytes()).unwrap();
+    // A fresh tmpfs becomes the build's MINIMAL root: the staged /gnu/store, a
+    // writable /tmp, a minimal /dev, /proc and a minimal /etc — and NOTHING ELSE
+    // of the host filesystem. Without this pivot the build inherited the invoking
+    // root (only /gnu/store + /tmp overlaid), so /etc, /home, /usr … leaked in and
+    // the build was hermetic ONLY when wrapped in the outer host-sandbox. Pivoting
+    // here makes `build` SELF-hermetic (own-builder-daemon track). NEWPID + a
+    // fresh /proc reflecting the build's own pid namespace remain later parity work
+    // (the header's S4 note); /proc is rbind'd from the invoking namespace for now.
+    let newroot = scratch.join("buildroot");
+    fs::create_dir_all(&newroot)?;
+    let cstr = |p: &Path| CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let newstore_c = cstr(&newstore);
     let root_c = CString::new("/").unwrap();
-    let store_c = CString::new("/gnu/store").unwrap();
-    let tmp_c = CString::new("/tmp").unwrap();
     let tmpfs_c = CString::new("tmpfs").unwrap();
+    let proc_src_c = CString::new("/proc").unwrap();
+    let newroot_c = cstr(&newroot);
+    let store_dir = newroot.join("gnu/store");
+    let store_dir_c = cstr(&store_dir);
+    let tmp_dir = newroot.join("tmp");
+    let tmp_dir_c = cstr(&tmp_dir);
+    let dev_dir = newroot.join("dev");
+    let dev_dir_c = cstr(&dev_dir);
+    let proc_dir = newroot.join("proc");
+    let proc_dir_c = cstr(&proc_dir);
+    let etc_dir = newroot.join("etc");
+    let etc_passwd = etc_dir.join("passwd");
+    let etc_group = etc_dir.join("group");
+    let oldroot_rel = newroot.join("oldroot");
+    let oldroot_rel_c = cstr(&oldroot_rel);
+    let oldroot_abs_c = CString::new("/oldroot").unwrap();
+    // /dev is rbind'd whole from the invoking namespace rather than rebuilt node by
+    // node: re-binding a device node onto a fresh unprivileged-userns tmpfs strips
+    // device access (the re-bound /dev/null returns EACCES on write), whereas an
+    // rbind preserves the source mount's working device binds. In the loop the
+    // source is host_shell's ALREADY-minimal /dev (null/zero/…/shm/pts, no host
+    // device tree); a future standalone daemon would reuse that minimal-/dev builder.
+    let dev_src_c = CString::new("/dev").unwrap();
+    // Minimal /etc (daemon build-chroot parity): passwd + group so getpwuid/getgrgid
+    // resolve the build user, with NO host /etc reachable.
+    let passwd_body = format!(
+        "root:x:0:0:System administrator:/:/noshell\n\
+         nixbld:x:{GUEST_UID}:{GUEST_GID}:Build user:/build-top:/noshell\n\
+         nobody:x:65534:65534:Nobody:/:/noshell\n"
+    );
+    let group_body = format!("root:x:0:\nnixbld:x:{GUEST_GID}:\nnogroup:x:65534:\n");
     let build_dir_owned = build_dir.clone();
 
     let mut cmd = Command::new(&drv.builder);
@@ -172,11 +219,37 @@ pub fn build(
             fs::write("/proc/self/gid_map", format!("{GUEST_GID} {host_gid} 1"))?;
             // Keep every mount below private to this namespace.
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)?;
+            // Stage each closure item into newstore (host scratch, OUTSIDE the new
+            // root), then rbind newstore over the new root's /gnu/store below.
             for (src, dst) in &binds {
                 sys::mount(Some(src), dst, None, sys::MS_BIND, None)?;
             }
-            sys::mount(Some(&newstore_c), &store_c, None, sys::MS_BIND | sys::MS_REC, None)?;
-            sys::mount(Some(&tmpfs_c), &tmp_c, Some(&tmpfs_c), 0, None)?;
+            // The fresh minimal root, then its skeleton dirs.
+            sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, None)?;
+            fs::create_dir_all(&store_dir)?;
+            fs::create_dir_all(&tmp_dir)?;
+            fs::create_dir_all(&dev_dir)?;
+            fs::create_dir_all(&proc_dir)?;
+            fs::create_dir_all(&etc_dir)?;
+            fs::create_dir_all(&oldroot_rel)?;
+            // Staged store → /gnu/store (rbind carries the per-item binds); outputs
+            // the build writes under /gnu/store land in newstore on the host.
+            sys::mount(Some(&newstore_c), &store_dir_c, None, sys::MS_BIND | sys::MS_REC, None)?;
+            // Writable build tmpfs.
+            sys::mount(Some(&tmpfs_c), &tmp_dir_c, Some(&tmpfs_c), 0, None)?;
+            // /dev rbind'd whole (preserves working device binds; see note above).
+            sys::mount(Some(&dev_src_c), &dev_dir_c, None, sys::MS_BIND | sys::MS_REC, None)?;
+            // /proc rbind'd from the invoking namespace (build has no own pid ns yet).
+            sys::mount(Some(&proc_src_c), &proc_dir_c, None, sys::MS_BIND | sys::MS_REC, None)?;
+            // Minimal /etc.
+            fs::write(&etc_passwd, &passwd_body)?;
+            fs::write(&etc_group, &group_body)?;
+            // Pivot into the minimal root and drop the host root entirely.
+            sys::pivot_root(&newroot_c, &oldroot_rel_c)?;
+            std::env::set_current_dir("/")?;
+            sys::umount2(&oldroot_abs_c, sys::MNT_DETACH)?;
+            let _ = fs::remove_dir("/oldroot");
+            // The build dir lives on the fresh /tmp tmpfs.
             fs::DirBuilder::new().mode(0o700).create(&build_dir_owned)?;
             std::env::set_current_dir(&build_dir_owned)?;
             Ok(())
