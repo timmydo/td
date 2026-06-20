@@ -676,6 +676,135 @@ pub fn run_rust() -> Result<(), String> {
     Ok(())
 }
 
+/// cmake-build — td's OWN minimal cmake build "system", in Rust (sibling of `run`,
+/// the autotools runner; move-off-Guile §5). The REPLACEMENT for Guix's
+/// `cmake-build-system`'s Guile phase runner: here the build LOGIC is td's Rust;
+/// only cmake/gcc/make are the external Guix toolchain SEED (retired LAST, §5),
+/// exactly as the autotools path uses make/gcc. It runs the standard cmake phases
+/// directly, OUT OF SOURCE (cmake's idiom):
+///
+///   set-paths -> unpack -> configure (cmake <src> -DCMAKE_INSTALL_PREFIX=$out) ->
+///   make -> make install
+///
+/// No Guile runs in the build. The environment is derived from the inputs the same
+/// way `run`'s set-paths phase does (PATH / C_INCLUDE_PATH / CPLUS_INCLUDE_PATH /
+/// LIBRARY_PATH from the inputs' bin/include/lib dirs).
+///
+/// Inputs (env, set by `build-recipe` via system td-build's derivation):
+///   out                output prefix (the daemon sets this).
+///   TD_SRC             the source (a source tarball, or a store DIRECTORY).
+///   TD_INPUTS          ':'-joined store paths of the build inputs (cmake,
+///                      gcc-toolchain, make, coreutils, bash, tar, gzip).
+///   TD_CONFIGURE_FLAGS extra `cmake` flags as a JSON array of strings (may be
+///                      empty/absent); each element is ONE argument, so a flag may
+///                      carry internal whitespace, the same drv-safe encoding the
+///                      autotools path uses.
+///
+/// Determinism: the configure pins CMAKE_BUILD_TYPE=Release and the build dir is a
+/// fixed relative path, and SOURCE_DATE_EPOCH=1 / HOME=/homeless-shelter mirror the
+/// autotools path — so `td-builder check`'s double-build (the durable repro oracle)
+/// gets the same output both times.
+pub fn run_cmake() -> Result<(), String> {
+    let out = env::var("out").map_err(|_| "out not set".to_string())?;
+    let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
+    let inputs = env::var("TD_INPUTS").unwrap_or_default();
+    // Extra `cmake` flags as a JSON array of strings (may be empty/absent); each
+    // element stays ONE cmake argument so a flag with internal whitespace survives.
+    let configure_flags_json = env::var("TD_CONFIGURE_FLAGS").unwrap_or_default();
+    let configure_flags: Vec<String> = if configure_flags_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        crate::json::parse(&configure_flags_json)
+            .map_err(|e| format!("TD_CONFIGURE_FLAGS JSON: {e}"))?
+            .as_arr()
+            .ok_or("TD_CONFIGURE_FLAGS is not a JSON array")?
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect()
+    };
+
+    // set-paths phase (in Rust): derive PATH / C_INCLUDE_PATH / CPLUS_INCLUDE_PATH /
+    // LIBRARY_PATH from the inputs' bin/include/lib dirs (same as the autotools path).
+    let (mut path, mut cinc, mut cxxinc, mut lib): (
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+    ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for p in inputs.split(':').filter(|s| !s.is_empty()) {
+        let push_if_dir = |sub: &str, dst: &mut Vec<String>| {
+            let d = format!("{p}/{sub}");
+            if Path::new(&d).is_dir() {
+                dst.push(d);
+            }
+        };
+        push_if_dir("bin", &mut path);
+        push_if_dir("include", &mut cinc);
+        push_if_dir("lib", &mut lib);
+        push_if_dir("lib64", &mut lib);
+        push_if_dir("include/c++", &mut cxxinc);
+        push_if_dir("include", &mut cxxinc);
+    }
+    let path = path.join(":");
+
+    let bash = find_in_path(&path, "bash").ok_or("bash not found in TD_INPUTS")?;
+    let cmake = find_in_path(&path, "cmake").ok_or("cmake not found in TD_INPUTS")?;
+    let make = find_in_path(&path, "make").ok_or("make not found in TD_INPUTS")?;
+
+    // The build environment, the same shape `run` (autotools) sets up.
+    let envs: Vec<(String, String)> = vec![
+        ("out".into(), out.clone()),
+        ("PATH".into(), path.clone()),
+        ("C_INCLUDE_PATH".into(), cinc.join(":")),
+        ("CPLUS_INCLUDE_PATH".into(), cxxinc.join(":")),
+        ("LIBRARY_PATH".into(), lib.join(":")),
+        // cmake / make sub-shells use bash (no /bin/sh in the sandbox).
+        ("CONFIG_SHELL".into(), bash.clone()),
+        ("SHELL".into(), bash.clone()),
+        ("SOURCE_DATE_EPOCH".into(), "1".into()),
+        ("HOME".into(), "/homeless-shelter".into()),
+    ];
+
+    // unpack -> the single source tree. TD_SRC may be a store DIRECTORY (interned
+    // tree) or a source tarball; resolve to an absolute srcdir either way.
+    let srcdir = if Path::new(&src).is_dir() {
+        // an absolute store path already; cmake reads it read-only (out-of-source).
+        src.clone()
+    } else {
+        let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS")?;
+        run_cmd(&tar, &["xf", &src], ".", &envs)?;
+        let rel = single_subdir(".")?;
+        // make it absolute so the cmake invocation (run from the build dir) resolves it.
+        let cwd = env::current_dir().map_err(|e| e.to_string())?;
+        cwd.join(rel).to_string_lossy().into_owned()
+    };
+
+    // patch-source-shebangs — rewrite `#!/bin/sh` build scripts to the seed bash
+    // (no /bin/sh in the sandbox), as `run` does. Skipped for a read-only store
+    // source dir (an interned tree's store path is immutable; cmake reads it
+    // out-of-source so there is nothing to patch in place).
+    if !Path::new(&src).is_dir() {
+        patch_shebangs(Path::new(&srcdir), &bash)?;
+    }
+
+    // configure: out-of-source. cmake <srcdir> -DCMAKE_INSTALL_PREFIX=$out from a
+    // fresh build dir (cmake's idiom; keeps the source tree pristine).
+    let build_dir = "td-cmake-build";
+    fs::create_dir_all(build_dir).map_err(|e| format!("mkdir {build_dir}: {e}"))?;
+    let prefix = format!("-DCMAKE_INSTALL_PREFIX={out}");
+    let mut conf: Vec<&str> = vec![&srcdir, &prefix, "-DCMAKE_BUILD_TYPE=Release"];
+    conf.extend(configure_flags.iter().map(String::as_str));
+    run_cmd(&cmake, &conf, build_dir, &envs)?;
+
+    // build + install. Pass SHELL=<bash> as a make OVERRIDE (not just env), as `run`
+    // does: make launches recipe shells via the SHELL make-variable, defaulting to
+    // /bin/sh, which does not exist in the sandbox.
+    let shell = format!("SHELL={bash}");
+    run_cmd(&make, &[&shell], build_dir, &envs)?;
+    run_cmd(&make, &[&shell, "install"], build_dir, &envs)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

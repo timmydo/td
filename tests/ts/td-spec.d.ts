@@ -81,8 +81,10 @@ interface Source {
 /** Build systems td knows how to lower (mirrors the bridge's dispatch). A value
  *  outside this union is a compile-time error — like `RootFsType`. `"gnu"` is the
  *  autotools path; `"rust"` is the cargo path (`td-builder build-recipe` runs
- *  `rust-build`, installing the recipe's `bins`) — td-builder self-hosts on it. */
-declare type BuildSystem = "gnu" | "rust";
+ *  `rust-build`, installing the recipe's `bins`) — td-builder self-hosts on it;
+ *  `"cmake"` is td's own cmake path (`build-recipe` runs `cmake-build`: an
+ *  out-of-source `cmake` configure -> make -> make install, no gnu-build-system). */
+declare type BuildSystem = "gnu" | "rust" | "cmake";
 
 /** A part of a `string-append`/`format` replacement: a literal string, a
  *  build-time store path (`{ output: NAME }` → `(assoc-ref outputs NAME)`,
