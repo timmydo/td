@@ -156,4 +156,14 @@ build, under .td-build-cache). Outputs unchanged (byte-identical JSON).
 
 ### Status / evidence (4c)
 
-- (in progress)
+- `./check.sh rust-vendor`: GREEN — ts-emit evaluates with td's OWN td-ts-eval
+  (`…/.td-build-cache/rust-ts-eval/…/td-ts-eval`, the 4c structural leg fired), the build
+  CACHE-HITS (td's JSON byte-identical to guix's), the binary runs. rust-build/-uutils/
+  -russh use the identical pattern (covered by the landing check).
+- **Verified-red:** perturbed `load_ts_eval` to a `/gnu/store` path → the rust gate's
+  structural assert fired `FAIL: TD_TS_EVAL is not td's own build (/gnu/store/perturb-…)`
+  (exit 2). Reverted.
+- `guix build (system td-ts) td-ts-eval` is gone from the four rust BUILD gates; only
+  rust-ts-eval keeps it (it BUILDS td-ts-eval + uses it as the behavioral oracle). No
+  Makefile edit → affected-checks WAIVES the full loop (rust gate .mk files only).
+- node + tsc (ts-emit transpile) stay guix, retired-late.
