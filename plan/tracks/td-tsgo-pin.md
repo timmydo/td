@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: td-tsgo-pin
 handle: claude-fable-5caf33
 date: 2026-06-20
