@@ -1,15 +1,17 @@
 //! The S3 build sandbox: execute a parsed `.drv` in a fresh user namespace,
 //! replicating the pinned daemon's guest-visible contract (read off
 //! nix/libstore/build.cc and recorded in plan/td-builder.md Q4):
-//!   - namespaces: NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS (the immediate-effect
-//!     set; NEWNET makes the build offline by construction). NEWPID + a fresh
-//!     /proc reflecting the build's OWN pid namespace remain S4 parity work; for
-//!     now /proc is rbind'd from the invoking namespace;
+//!   - namespaces: NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS. NEWNET makes the
+//!     build offline by construction; NEWPID (in the same unshare as NEWUSER, so
+//!     the PID ns is owned by the new user ns) forks the builder to PID 1 of its
+//!     own pid namespace with a FRESH procfs — the build sees only its own process
+//!     tree, not the host's (the daemon, other concurrent builds, their
+//!     /proc/<pid>/environ), full parity with host_shell / `guix shell -C`;
 //!   - uid/gid: guest 30001/30000 mapped over the invoking user, setgroups
 //!     denied (build.cc defaultGuestUID/GID, initializeUserNamespace);
 //!   - chroot: the build pivot_roots into a MINIMAL fresh-tmpfs root holding only
-//!     the staged /gnu/store, a writable /tmp, /dev + /proc rbind'd from the
-//!     invoking namespace, and a minimal /etc — nothing else of the host
+//!     the staged /gnu/store, a writable /tmp, /dev rbind'd from the invoking
+//!     namespace, a fresh /proc, and a minimal /etc — nothing else of the host
 //!     filesystem. So `build` is SELF-hermetic, not dependent on the outer
 //!     host-sandbox to hide /etc, /home, /usr, /var/guix … from the builder
 //!     (own-builder-daemon: self-hermetic build sandbox);
@@ -141,20 +143,21 @@ pub fn build(
     let host_gid = sys::getgid();
 
     // A fresh tmpfs becomes the build's MINIMAL root: the staged /gnu/store, a
-    // writable /tmp, a minimal /dev, /proc and a minimal /etc — and NOTHING ELSE
-    // of the host filesystem. Without this pivot the build inherited the invoking
-    // root (only /gnu/store + /tmp overlaid), so /etc, /home, /usr … leaked in and
-    // the build was hermetic ONLY when wrapped in the outer host-sandbox. Pivoting
-    // here makes `build` SELF-hermetic (own-builder-daemon track). NEWPID + a
-    // fresh /proc reflecting the build's own pid namespace remain later parity work
-    // (the header's S4 note); /proc is rbind'd from the invoking namespace for now.
+    // writable /tmp, a minimal /dev, a fresh /proc and a minimal /etc — and
+    // NOTHING ELSE of the host filesystem. Without this pivot the build inherited
+    // the invoking root (only /gnu/store + /tmp overlaid), so /etc, /home, /usr …
+    // leaked in and the build was hermetic ONLY when wrapped in the outer
+    // host-sandbox. Pivoting here makes `build` SELF-hermetic (own-builder-daemon
+    // track). The build now also unshares NEWPID and forks the builder to PID 1 of
+    // its own pid namespace; the /proc mounted below is a FRESH procfs reflecting
+    // that namespace, not the invoking one.
     let newroot = scratch.join("buildroot");
     fs::create_dir_all(&newroot)?;
     let cstr = |p: &Path| CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
     let newstore_c = cstr(&newstore);
     let root_c = CString::new("/").unwrap();
     let tmpfs_c = CString::new("tmpfs").unwrap();
-    let proc_src_c = CString::new("/proc").unwrap();
+    let procfs_c = CString::new("proc").unwrap();
     let newroot_c = cstr(&newroot);
     let store_dir = newroot.join("gnu/store");
     let store_dir_c = cstr(&store_dir);
@@ -205,9 +208,25 @@ pub fn build(
 
     unsafe {
         cmd.pre_exec(move || {
+            // Arm parent-death reaping before anything else: if the outer
+            // td-builder dies during setup, this process is SIGKILLed rather than
+            // left running. (Still in the outer PID namespace here, so getppid is
+            // meaningful; the re-check closes the parent-died-mid-setup race.)
+            let parent = sys::getppid();
+            sys::set_pdeathsig(sys::SIGKILL)?;
+            if sys::getppid() != parent {
+                sys::exit_group(0);
+            }
+            // New USER + PID + mount + net + IPC + UTS namespaces. NEWPID rides in
+            // the SAME unshare as NEWUSER so the new PID namespace is owned by the
+            // new user namespace; the fork below then lands the builder at PID 1 of
+            // that namespace, where a fresh /proc reflects only the build's own
+            // process tree — the host's processes (the daemon, other concurrent
+            // builds, their /proc/<pid>/environ) are no longer visible or signalable.
             sys::unshare(
                 sys::CLONE_NEWUSER
                     | sys::CLONE_NEWNS
+                    | sys::CLONE_NEWPID
                     | sys::CLONE_NEWNET
                     | sys::CLONE_NEWIPC
                     | sys::CLONE_NEWUTS,
@@ -217,6 +236,26 @@ pub fn build(
             fs::write("/proc/self/setgroups", "deny")?;
             fs::write("/proc/self/uid_map", format!("{GUEST_UID} {host_uid} 1"))?;
             fs::write("/proc/self/gid_map", format!("{GUEST_GID} {host_gid} 1"))?;
+            // Fork: the child is PID 1 of the new PID namespace and does the mount
+            // setup + (via std) exec of the builder; THIS process (the PID-ns
+            // parent, still in the outer PID ns) only waits for it and propagates
+            // its exit. It must NOT fall through to std's exec path — the builder is
+            // exec'd exactly once, as PID 1. Stdio is inherited, so output streams.
+            let pid = sys::fork()?;
+            if pid != 0 {
+                let status = sys::waitpid(pid)?;
+                let code = if status & 0x7f == 0 {
+                    (status >> 8) & 0xff
+                } else {
+                    128 + (status & 0x7f)
+                };
+                sys::exit_group(code);
+            }
+            // --- PID 1 of the new PID namespace from here on ---
+            // Re-arm parent-death reaping (fork cleared it): if the PID-ns parent
+            // waiting above dies, PID 1 is SIGKILLed and the kernel tears down the
+            // whole namespace, reaping the build. PDEATHSIG survives the execve.
+            sys::set_pdeathsig(sys::SIGKILL)?;
             // Keep every mount below private to this namespace.
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)?;
             // Stage each closure item into newstore (host scratch, OUTSIDE the new
@@ -239,8 +278,9 @@ pub fn build(
             sys::mount(Some(&tmpfs_c), &tmp_dir_c, Some(&tmpfs_c), 0, None)?;
             // /dev rbind'd whole (preserves working device binds; see note above).
             sys::mount(Some(&dev_src_c), &dev_dir_c, None, sys::MS_BIND | sys::MS_REC, None)?;
-            // /proc rbind'd from the invoking namespace (build has no own pid ns yet).
-            sys::mount(Some(&proc_src_c), &proc_dir_c, None, sys::MS_BIND | sys::MS_REC, None)?;
+            // A FRESH procfs reflecting the build's OWN pid namespace (we are PID 1),
+            // not the invoking namespace's /proc.
+            sys::mount(Some(&procfs_c), &proc_dir_c, Some(&procfs_c), 0, None)?;
             // Minimal /etc.
             fs::write(&etc_passwd, &passwd_body)?;
             fs::write(&etc_group, &group_body)?;
