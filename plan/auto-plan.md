@@ -38,9 +38,16 @@ and the census derive from the recipe graph too — is a natural follow-up now t
 
 ## Verified-red
 
-- Unit: `auto_entry_is_dep` matches bare (`pcre2`) + hash-named (`<hash>-ncurses-…`)
-  deps, rejects near-miss (`ncursesw`) + toolchain entries; `auto_chained_lock` marks
-  only owned deps (bare-keyed + `td-recipe-output`), passes seeds/source through, and
-  errors when a declared owned dep is absent from the lock.
-- Gate 367: break the marking → bash builds with guix's ncurses → structural red
-  (recorded with the gate's verified-red run).
+Unit (confirmed: perturb each of the 3 new fns → its test fails; restore → 54 green):
+- `auto_entry_is_dep` matches bare (`pcre2`) + hash-named (`<hash>-ncurses-…`) deps,
+  rejects near-miss (`ncursesw`) + toolchain entries.
+- `auto_chained_lock` marks only owned deps (bare-keyed + `td-recipe-output`), passes
+  seeds/source through, errors when a declared owned dep is absent from the lock.
+- `auto_topo` orders deps before dependents (ncurses → readline → bash), recursing only
+  through owned inputs.
+
+The gate (367) proves `--auto` end-to-end (derived the 3-step DAG; bash's .drv
+references td's readline + ncurses, not guix's; bash runs). The build_plan SUBSTITUTION
+the gate relies on was itself verified-red in #107 (break the marking → downstream
+builds guix's dep → structural red); `--auto` only changes the plan GENERATION, which
+the unit VR above covers.
