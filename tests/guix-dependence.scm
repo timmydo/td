@@ -76,7 +76,10 @@
 ;; own-builder proof is the `cmake` gate, not a corpus differential.
 ;; td-fetch joins them: td's own seed fetcher (buildSystem "rust"), a new capability
 ;; with no corpus oracle; its own-builder proof is the `rust-fetch` gate.
-(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval" "td-cmake-demo" "td-fetch"))
+;; uutils joins them: the FULL uutils coreutils multicall (crate `coreutils` 0.9.0),
+;; td-built from source — named "uutils" NOT "coreutils" precisely so it does not
+;; resolve to GNU coreutils' oracle; its own-builder proof is the `rust-coreutils` gate.
+(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval" "td-cmake-demo" "td-fetch" "uutils"))
 
 (define owned-specs
   (sort
