@@ -30,7 +30,7 @@ BUILD_GATES += rust-ts-eval
 rust-ts-eval:
 	@echo ">> rust-ts-eval: td builds td-ts-eval (boa evaluator, 128 vendored crates) from source via build-recipe + stage0 (guix/Guile off PATH); it evaluates a TS spec + is reproducible"
 	@set -euo pipefail; \
-	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
+	tsgo=`sh tests/tsgo.sh`; \
 	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
 	test -x "$$ev" -a -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo / td-ts-eval (the seed+oracle)" >&2; exit 1; }; \
 	export TD_TSGO="$$tsgo" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \

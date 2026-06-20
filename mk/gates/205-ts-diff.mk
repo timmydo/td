@@ -15,7 +15,7 @@ HEAVY_GATES += ts-diff
 ts-diff:
 	@echo ">> ts-diff: TS v0 spec lowers (tsc->boa->config) to the oracle's system drv; a perturbed spec diverges (ts-frontend acceptance #1/#2)"
 	@set -euo pipefail; \
-	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
+	tsgo=`sh tests/tsgo.sh`; \
 	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
 	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" -a -x "$$ev" || { echo "ERROR: could not resolve td-tsgo / td-ts-eval" >&2; exit 1; }; \
 	export TD_TSGO="$$tsgo" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \

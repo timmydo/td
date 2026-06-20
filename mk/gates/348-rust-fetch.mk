@@ -29,8 +29,9 @@ BUILD_GATES += rust-fetch
 rust-fetch:
 	@echo ">> rust-fetch: td builds td-fetch (its own seed fetcher, 73 vendored deps incl. ring TLS) from source via build-recipe (offline, guix/Guile off PATH); it round-trips + verifies the real tsgo tarball over loopback + is reproducible"
 	@set -euo pipefail; \
-	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" -a -s "$$tgz" || { echo "ERROR: could not resolve td-tsgo / the tsgo tarball" >&2; exit 1; }; \
+	tsgo=`sh tests/tsgo.sh`; \
+	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; \
+	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" -a -s "$$tgz" || { echo "ERROR: could not resolve td-tsgo (pin) / the tsgo tarball (oracle)" >&2; exit 1; }; \
 	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; tb="$$TB"; \
 	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
