@@ -19,7 +19,8 @@ HEAVY_GATES += loop-sandbox
 loop-sandbox:
 	@echo ">> loop-sandbox: td's OWN sandbox provides the hermetic loop surface (store ro + daemon socket + guix, host isolation, own PID + net namespaces) — intrinsic, no guix shell -C oracle"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	realbash=`readlink -f "$$(command -v bash)"`; \
 	realreadlink=`readlink -f "$$(command -v readlink)"`; \
