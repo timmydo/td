@@ -11,7 +11,8 @@ HEAVY_GATES += build-hermetic
 build-hermetic:
 	@echo ">> build-hermetic: a td-realized build cannot see /var/guix (the daemon state the loop exposes) — sandbox::build pivot_roots into a minimal root"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: no td-builder" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.build-hermetic-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	$(GUIX) repl $(LOAD) tests/build-hermetic-drv.scm 2>"$$scratch/repl.err" > "$$scratch/facts.txt" \

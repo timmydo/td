@@ -43,13 +43,16 @@ assertions then prove stage0's td-builder does the op correctly.
   245-td-drv-assemble (4 gates). Count 26→22. Their oracle is the guix DAEMON +
   `guix repl`/`guix build`, NOT the td-builder binary — stage0 is the same source so the
   emitted/assembled .drv is byte-identical.
-- **PR 3 (this): loop-* family** — 265-loop-sandbox / 270-loop-rung (2 gates). Count
-  22→20. These INTRINSIC self-tests run `$$tb host-sandbox` to nest td's own sandbox;
-  stage0 provides the same host-sandbox, so routing them validates the stage0 sandbox
-  (the one the loop actually runs on). Re-baselined `tests/guix-surface.expected` (20).
-- Follow-on: td-check 250, resolve 255, rootless 130, sandbox-hardening 272,
-  td-realize 355, td-offline 360, build-hermetic 356; then the td-ts-eval routing
-  (step 3) → toward the ~11 oracle floor.
+- **PR 3 (DONE, #120): loop-* family** — 265-loop-sandbox / 270-loop-rung (2 gates).
+  Count 22→20. INTRINSIC self-tests; stage0 provides the same host-sandbox.
+- **PR 4 (this): the singles** — td-check 250 / resolve 255 / rootless 130 /
+  sandbox-hardening 272 / td-realize 355 / td-offline 360 / build-hermetic 356 (7
+  gates). Count 20→13. All clean tool-use (oracle = guix daemon / `guix repl` /
+  `guix build --check`, not the td-builder binary). Re-baselined (13).
+- After PR 4, td-builder's remaining 6 sites = **3 confirmed oracle** (170-bootstrap
+  `gtb`, 175 the package gate, 330-rust-build `gtb`) + **3 build gates** (352-cmake,
+  365-bootstrap-build, 365-build-plan) needing per-gate oracle-vs-tool analysis like 330
+  (PR 5). Then step 3 = td-ts-eval ×7 → the oracle floor.
 
 ## Verified-red
 

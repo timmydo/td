@@ -13,6 +13,7 @@ HEAVY_GATES += sandbox-hardening
 sandbox-hardening:
 	@echo ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak) and reaps its inner tree when killed"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	bash tests/sandbox-hardening.sh "$$tb"
