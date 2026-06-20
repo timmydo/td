@@ -272,6 +272,10 @@ map_path() {
       add_preflight shell-syntax
       add_target sandbox-hardening ;;
 
+    tests/td-shell.sh)
+      add_preflight shell-syntax
+      add_target td-shell ;;
+
     tests/guix-dependence.*)
       add_target guix-dependence ;;
 
