@@ -11,10 +11,9 @@
 HEAVY_GATES += ts
 FAST_GATES += ts
 ts:
-	@echo ">> ts: TypeScript spec front-end — tsc type-checks + emits the v0 spec (ts-frontend Phase 1)"
+	@echo ">> ts: TypeScript spec front-end — the NATIVE tsc (td-tsgo) type-checks + emits the v0 spec, NO node (ts-frontend Phase 1; tsgo migration)"
 	@set -euo pipefail; \
-	node=`$(GUIX) build node`/bin/node; \
-	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
-	test -n "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / td-typescript" >&2; exit 1; }; \
-	TD_NODE="$$node" TD_TSC="$$tsc" TD_TSDIR="$(CURDIR)/tests/ts" \
+	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
+	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo (native compiler)" >&2; exit 1; }; \
+	TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" \
 	  sh tests/ts-check.sh

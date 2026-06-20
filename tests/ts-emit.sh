@@ -5,12 +5,14 @@
 # printing the captured `system()` config as one line of JSON — the input the
 # Guile lowering bridge (tests/ts-diff.scm) turns into a td-config + derivation.
 #
-# Inputs (env): TD_NODE, TD_TSC (td-typescript dir), TD_TS_EVAL (the binary),
-# TD_TSDIR (the dialect dir). Arg 1: the spec `.ts` path. JSON goes to stdout;
-# tsc chatter (none on success) and errors go to stderr.
+# Inputs (env): TD_TSGO (td-tsgo dir; native tsc at $TD_TSGO/lib/tsc, NO node),
+# TD_TS_EVAL (the boa evaluator binary), TD_TSDIR (the dialect dir). Arg 1: the spec
+# `.ts` path. JSON goes to stdout; tsc chatter (none on success) + errors to stderr.
+# tsgo migration (2026-06-20): the transpile is the TypeScript 7 NATIVE compiler — a
+# static Go binary — so this step needs NO node/V8; emit is byte-identical to node-tsc.
 set -eu
 
-: "${TD_NODE:?}"; : "${TD_TSC:?}"; : "${TD_TS_EVAL:?}"; : "${TD_TSDIR:?}"
+: "${TD_TSGO:?}"; : "${TD_TS_EVAL:?}"; : "${TD_TSDIR:?}"
 spec="${1:?usage: ts-emit.sh SPEC.ts}"
 
 work="$(mktemp -d)"
@@ -18,7 +20,7 @@ trap 'rm -rf "$work"' EXIT INT TERM
 
 # Same pinned flags as the `ts` rung's transpile, so the JS the differential
 # evaluates is exactly the golden-checked emit.
-"$TD_NODE" "$TD_TSC/bin/tsc" --strict --target es2020 --lib es2020 \
+"$TD_TSGO/lib/tsc" --strict --target es2020 --lib es2020 \
   --newLine lf --removeComments --outDir "$work" \
   "$TD_TSDIR/td-spec.d.ts" "$spec" >&2
 

@@ -30,7 +30,28 @@
   #:use-module (gnu packages nss)
   #:use-module ((guix licenses) #:prefix license:)
   #:export (td-typescript
+            td-tsgo-tarball
             td-ts-eval))
+
+;; td-tsgo-tarball — the TypeScript 7 NATIVE compiler (the Go rewrite), pinned from
+;; the `@typescript/typescript-linux-x64` npm package (the per-platform native binary
+;; `typescript@7.0.1-rc` dispatches to). This is ONLY the fixed-output FETCH — an
+;; `origin`, i.e. guix-as-FETCHER (the accepted "warm store in" seed layer, exactly
+;; like the pinned crate `.crate` fetches), NOT a guix `(build-system …)` package: td
+;; UNPACKS it ITSELF (no copy-build-system) — `tests/tsgo.sh` extracts `package/lib/`
+;; (the STATICALLY-LINKED Go `tsc` binary + its lib.*.d.ts siblings) so the TS spec
+;; front-end runs `<extracted>/lib/tsc` with NO node/V8. Proven drop-in for node+tsc:
+;; type-checks identically (TS2322 on an out-of-union value — the `ts` gate control)
+;; + emits byte-identical JS. x86_64-linux (td's loop target). Bump: see
+;; [[td-tsgo-native-typescript]].
+(define td-tsgo-tarball
+  (origin
+    (method url-fetch)
+    (uri (string-append "https://registry.npmjs.org/@typescript/typescript-linux-x64/"
+                        "-/typescript-linux-x64-7.0.1-rc.tgz"))
+    (sha256
+     (base32 "0m3x2q991qngixkmxnp4fr6d55ia4h30046x0sl85vpvs3lcg2a6"))
+    (file-name "typescript-linux-x64-7.0.1-rc.tgz")))
 
 (define td-typescript
   (package
