@@ -5,7 +5,7 @@
 # growing it needs a deliberate edit here, called out in the PR (directive 3).
 # Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB>(system <mod>) <name>
-packager-sites: 47
+packager-sites: 48
 Makefile	(system td-ts) td-ts-eval
 Makefile	(system td-ts) td-typescript
 mk/gates/130-rootless.mk	(system td-builder) td-builder
@@ -46,6 +46,7 @@ mk/gates/352-cmake.mk	(system td-builder) td-builder
 mk/gates/352-cmake.mk	(system td-ts) td-ts-eval
 mk/gates/352-cmake.mk	(system td-ts) td-typescript
 mk/gates/355-td-realize.mk	(system td-builder) td-builder
+mk/gates/356-build-hermetic.mk	(system td-builder) td-builder
 mk/gates/360-td-offline.mk	(system td-builder) td-builder
 mk/gates/365-bootstrap-build.mk	(system td-builder) td-builder
 mk/gates/365-bootstrap-build.mk	(system td-ts) td-ts-eval

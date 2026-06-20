@@ -28,8 +28,11 @@ so they can only go DOWN.
   (grew), PASS when the set only shrinks (+ a re-baseline nudge). Also prints a compact
   informational census (packager / oracle / lowerer / gc) — only the packager set is
   ratcheted.
-- **`tests/guix-surface.expected`** — baseline snapshot: **47 packager sites**
-  (td-builder ×N, td-typescript ×N, td-ts-eval ×N across the gates + Makefile).
+- **`tests/guix-surface.expected`** — baseline snapshot: **48 packager sites**
+  (td-builder ×27, td-typescript ×14, td-ts-eval ×7 across the gates + Makefile).
+  (Started at 47; rebasing onto #112 added `mk/gates/356-build-hermetic.mk`'s
+  td-builder site — the gate FLAGGED it as a grow, absorbed into the baseline since
+  #112 landed first. It's a step-2 routing target.)
 - **`mk/gates/072-guix-surface.mk`** — drop-in cheap gate (registers
   `CHEAP_GATES += guix-surface`; no Makefile edit → parallel-safe). `make list-gates`
   shows it in the cheap pool.
