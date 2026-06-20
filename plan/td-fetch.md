@@ -54,11 +54,19 @@ td-warmed path is the follow-on, since the cold external warm is a host-network 
 ## Sub-task ladder
 
 1. [x] claim track; td-fetch crate (fetch/) builds; modes confirmed host-side.
-2. [ ] generate tests/td-fetch.lock (74 crate FODs + toolchain seed; network prep).
-3. [ ] recipe-td-fetch.ts; build td-fetch via build-recipe + stage0 (guix/Guile off PATH).
-4. [ ] rust-fetch gate: loopback round-trip + self-discrimination + oracle + repro.
+2. [x] generate tests/td-fetch.lock (73 crate FODs + toolchain seed; network prep via
+   gen-fetch-lock.scm).
+3. [x] recipe-td-fetch.ts; td-fetch excluded from the guix-dependence census
+   (self-host-specs) — a seed tool with no corpus oracle (its proof is the gate).
+4. [x] rust-fetch gate (mk/gates/348): loopback round-trip + self-discrimination +
+   oracle + repro. Runs green via `./check.sh rust-fetch`.
 5. [ ] verified-red evidence; land.
 
 ## Verified-red
 
-(to record as each assertion is broken and seen red)
+- Census enrollment caught honestly: the FIRST `./check.sh rust-fetch` short-circuited at
+  gate 070 (`guix repl: error: td-fetch: unknown package`) because recipe-td-fetch.ts
+  auto-enrolled in the guix-dependence census; fixed by adding "td-fetch" to
+  self-host-specs (the seed-tool exclusion). Census `.expected` UNCHANGED.
+- [planned] break td-fetch's sha256 check (accept any hash) → rebuild → the gate's
+  SELF-DISCRIMINATION leg must red ("td-fetch selftest ACCEPTED a wrong sha256").
