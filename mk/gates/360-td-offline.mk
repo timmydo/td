@@ -14,7 +14,8 @@ HEAVY_GATES += td-offline
 td-offline:
 	@echo ">> td-offline: td's OWN builder network-isolates a non-fixed-output build (realize the DRV_SANDBOX probe: only lo + egress fails); the dummy-interface control proves the check is load-bearing"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: no td-builder" >&2; exit 1; }; \
 	sdrv=`$(GUIX) repl $(LOAD) tests/offline-drv.scm 2>/dev/null | sed -n 's/^DRV_SANDBOX=//p'`; \
 	test -n "$$sdrv" || { echo "ERROR: could not lower the DRV_SANDBOX probe" >&2; exit 1; }; \

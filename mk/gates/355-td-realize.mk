@@ -10,7 +10,8 @@ HEAVY_GATES += td-realize
 td-realize:
 	@echo ">> td-realize: td realizes the hello drv with no guix-daemon — computes the input closure itself (its SQLite reader, no guix gc), builds in its userns sandbox, registers; output matches the daemon (oracle)"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: no td-builder" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.td-realize-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	$(GUIX) repl $(LOAD) tests/td-drv-build-drv.scm 2>/dev/null > "$$scratch/facts.txt"; \

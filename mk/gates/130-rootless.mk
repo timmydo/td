@@ -59,7 +59,8 @@ rootless:
 	  printf '%s\n' "$$img_drv" "$$img_out" "$$probe_drv" "$$guix_pkg" "$$guix_daemon_pkg" "$$GUIX_ENVIRONMENT"; } \
 	  | xargs $(GUIX) gc -R | sort -u > "$$scratch/paths.txt"; \
 	echo ">> bind closure: $$(wc -l < "$$scratch/paths.txt") store items"; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder for the store-DB snapshot" >&2; exit 1; }; \
 	bash tests/rootless.sh "$$scratch" "$$img_drv" "$$img_out" "$$probe_drv" "$$probe_out" "$$tb"; \
 	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"

@@ -14,7 +14,8 @@ HEAVY_GATES += resolve
 resolve:
 	@echo ">> resolve: td-builder resolves recipe inputs from a pinned lock, store-path-equal to Guile's live specification->package resolution (input-resolution; additive, build unchanged)"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	names="ncurses gettext-minimal"; \
 	echo ">> the nano recipe's declared inputs: $$names"; \
