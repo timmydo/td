@@ -170,6 +170,21 @@ td-without-NEWPID.
 DURABLE / behavioral, no guix oracle leg (it asserts the loop's process tree is
 ABSENT from the build).
 
+Verified-red (recorded, 2026-06-20):
+- Minimal perturbation (drop only `| sys::CLONE_NEWPID`, keep the fresh-procfs
+  mount): `./check.sh build-hermetic` FAILS at the procfs mount itself —
+  `spawning builder …/guile: Operation not permitted` — because a fresh procfs
+  cannot be mounted for a pid namespace whose owning user namespace isn't the
+  build's. Proves NEWPID and the fresh /proc are coupled and load-bearing, but it
+  errors BEFORE the probe runs.
+- Clean perturbation (revert sandbox.rs to the pre-increment-6 state: no NEWPID +
+  /proc rbind'd, via `git checkout origin/main -- builder/src/sandbox.rs`): the
+  build RUNS and the probe itself reds — `LEAK: the launching td-builder is visible
+  in /proc … comms= ("make" "td-builder" "guile" "bash")`. So the new assertion is
+  non-vacuous and the pid-ns isolation is load-bearing. Note only 4 loop processes
+  were visible — a /proc pid-count threshold would have been unreliable; the
+  launcher-name discriminator is correct. Restored → green (both legs pass).
+
 ## Next
 
 - A minimal-/dev builder for the standalone (no outer host_shell) daemon case.
