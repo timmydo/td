@@ -37,12 +37,11 @@ BUILD_GATES += cmake
 cmake:
 	@echo ">> cmake: td builds td-cmake-demo (a cmake C project) via build-recipe (buildSystem cmake) — .drv assembled + realized by td, guix/Guile off PATH; it runs, is reproducible, distinct from guix's cmake-build-system"
 	@set -euo pipefail; \
-	node=`$(GUIX) build node`/bin/node; \
-	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
+	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
 	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
 	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
-	test -x "$$ev" -a -x "$$tb" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / ts-eval / td-builder" >&2; exit 1; }; \
-	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	test -x "$$ev" -a -x "$$tb" -a -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo / ts-eval / td-builder" >&2; exit 1; }; \
+	export TD_TSGO="$$tsgo" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	lock0="$(CURDIR)/tests/td-cmake-demo.lock"; \
 	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \

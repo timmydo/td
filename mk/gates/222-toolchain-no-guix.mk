@@ -24,10 +24,9 @@ BUILD_GATES     += toolchain-no-guix
 toolchain-no-guix:
 	@echo ">> toolchain-no-guix: td builds make + sed + grep + xz + diffutils + patch + file + coreutils + gawk + tar + findutils + bash via build-recipe (no guix/Guile in the build path); each runs, reproducible, distinct from guix; gcc/glibc/binutils seed stays external (§5)"
 	@set -euo pipefail; \
-	node=`$(GUIX) build node`/bin/node; \
-	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
-	test -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc" >&2; exit 1; }; \
-	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
+	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }; \
+	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/make-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \

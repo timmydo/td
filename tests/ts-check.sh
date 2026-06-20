@@ -20,20 +20,22 @@
 # Makefile rung resolves the pinned `node` and `td-typescript` and passes them in
 # so this script never calls guix.
 #
+# tsgo migration (2026-06-20): the transpiler is now the TypeScript 7 NATIVE
+# compiler (td-tsgo, `lib/tsc` — a static Go binary), so the check + emit run with
+# NO node/V8. Proven drop-in: identical TS2322 on the bad spec + byte-identical emit.
+#
 # Inputs (env, set by the Makefile `ts` rung):
-#   TD_NODE   — the `node` binary (pinned).
-#   TD_TSC    — the td-typescript output dir (tsc at $TD_TSC/bin/tsc).
+#   TD_TSGO   — the td-tsgo output dir (native tsc at $TD_TSGO/lib/tsc).
 #   TD_TSDIR  — the tests/ts fixture dir.
 #
 # No `diff`/`cmp`: the check.sh sandbox has no diffutils (a recorded gotcha), so
 # the golden compare is sha256 over the bytes, falling back to a string compare.
 set -eu
 
-: "${TD_NODE:?TD_NODE (the pinned node binary) must be set}"
-: "${TD_TSC:?TD_TSC (the td-typescript output dir) must be set}"
+: "${TD_TSGO:?TD_TSGO (the td-tsgo native compiler dir) must be set}"
 : "${TD_TSDIR:?TD_TSDIR (the tests/ts fixture dir) must be set}"
 
-tsc_bin="$TD_TSC/bin/tsc"
+tsc_bin="$TD_TSGO/lib/tsc"
 dialect="$TD_TSDIR/td-spec.d.ts"
 good="$TD_TSDIR/spec-v0.ts"
 bad="$TD_TSDIR/spec-bad-fstype.ts"
@@ -46,7 +48,7 @@ done
 # Pinned tsc flags. Shared check/emit knobs make the run deterministic and
 # hermetic (a fixed lib, no ambient @types pulled — there is no node_modules):
 common="--strict --target es2020 --lib es2020"
-tsc() { "$TD_NODE" "$tsc_bin" $common "$@"; }
+tsc() { "$tsc_bin" $common "$@"; }   # native tsgo binary — no node
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM

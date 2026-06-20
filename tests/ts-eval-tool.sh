@@ -11,14 +11,15 @@
 # recipes with it. The bootstrap circularity is honest: the guix-built SEED ($TD_TS_EVAL
 # in) evaluates td-ts-eval's OWN recipe here; only this prelude resolves the seed.
 #
-# Env in (resolved by the caller, which has guix): TD_NODE, TD_TSC, TD_TSDIR (the ts-emit
-# transpile), TD_TS_EVAL (the guix-built SEED), TB + TD_BUILDER_PATH/STORE/DB (stage0, from
-# cache-lib load_stage0). The td-ts-eval.lock seed+crates must already be realized by the
-# caller (`guix build`). Prints the td-built binary path; writes BASEDIR/tseval-path.
+# Env in (resolved by the caller, which has guix): TD_TSGO, TD_TSDIR (the ts-emit
+# transpile — native tsc, no node), TD_TS_EVAL (the guix-built SEED), TB +
+# TD_BUILDER_PATH/STORE/DB (stage0, from cache-lib load_stage0). The td-ts-eval.lock
+# seed+crates must already be realized by the caller (`guix build`). Prints the td-built
+# binary path; writes BASEDIR/tseval-path.
 set -eu
 
 base="${1:?usage: ts-eval-tool.sh BASEDIR}"
-: "${TD_NODE:?}"; : "${TD_TSC:?}"; : "${TD_TSDIR:?}"; : "${TD_TS_EVAL:?}"
+: "${TD_TSGO:?}"; : "${TD_TSDIR:?}"; : "${TD_TS_EVAL:?}"
 : "${TB:?}"; : "${TD_BUILDER_PATH:?}"; : "${TD_BUILDER_STORE:?}"; : "${TD_BUILDER_DB:?}"
 
 lock0="tests/td-ts-eval.lock"

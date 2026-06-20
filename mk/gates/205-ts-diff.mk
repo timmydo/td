@@ -15,11 +15,10 @@ HEAVY_GATES += ts-diff
 ts-diff:
 	@echo ">> ts-diff: TS v0 spec lowers (tsc->boa->config) to the oracle's system drv; a perturbed spec diverges (ts-frontend acceptance #1/#2)"
 	@set -euo pipefail; \
-	node=`$(GUIX) build node`/bin/node; \
-	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
+	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
 	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
-	test -n "$$node" -a -n "$$tsc" -a -x "$$ev" || { echo "ERROR: could not resolve node / td-typescript / td-ts-eval" >&2; exit 1; }; \
-	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" -a -x "$$ev" || { echo "ERROR: could not resolve td-tsgo / td-ts-eval" >&2; exit 1; }; \
+	export TD_TSGO="$$tsgo" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	dj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/spec-v0.ts"`; \
 	pj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/spec-perturbed.ts"`; \
 	gj=`sh tests/ts-emit.sh "$(CURDIR)/tests/ts/spec-gen1.ts"`; \

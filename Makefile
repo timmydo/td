@@ -121,10 +121,9 @@ check: $(CHEAP_GATES) build-recipes $(HEAVY_GATES)
 build-recipes:
 	@echo ">> build-recipes: realize + reproducibility-check $(words $(BUILD_SPECS)) recipes in parallel into .td-build-cache/pkg ($(BUILD_SPECS))"
 	@set -euo pipefail; \
-	node=`$(GUIX) build node`/bin/node; \
-	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
+	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
 	seedev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
-	test -x "$$seedev" -a -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc / td-ts-eval seed" >&2; exit 1; }; \
+	test -x "$$seedev" -a -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo / td-ts-eval seed" >&2; exit 1; }; \
 	for s in $(BUILD_SPECS); do grep ' /gnu/store/' "tests/$$s-no-guix.lock"; done \
 	  | sed 's/^[^ ]* //' | sort -u | xargs $(GUIX) build >/dev/null \
 	  || { echo "ERROR: could not realize the build seed (regenerate locks on a channel bump)" >&2; exit 1; }; \
@@ -132,7 +131,7 @@ build-recipes:
 	  || { echo "ERROR: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }; \
 	grep ' /gnu/store/' tests/td-ts-eval.lock | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null \
 	  || { echo "ERROR: could not realize the td-ts-eval seed + crates (regenerate tests/td-ts-eval.lock on a boa bump)" >&2; exit 1; }; \
-	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	export CACHE="$(CURDIR)/.td-build-cache/pkg" TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; mkdir -p "$$CACHE"; \
 	. tests/cache-lib.sh; load_stage0; \
 	echo ">> builds run on the td-bootstrapped stage0 td-builder ($$TD_BUILDER_PATH) — NO guix-built td-builder (move-off-Guile §5 brick 3)"; \

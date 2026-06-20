@@ -26,10 +26,9 @@ BUILD_GATES += rust-uutils
 rust-uutils:
 	@echo ">> rust-uutils: td builds the uutils 'cat' (uu_cat 0.9.0, 139 vendored deps) from source via build-recipe (offline, guix/Guile off PATH); it works as cat + is reproducible"
 	@set -euo pipefail; \
-	node=`$(GUIX) build node`/bin/node; \
-	tsc=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-typescript)'`; \
-	test -x "$$node" -a -n "$$tsc" || { echo "ERROR: could not resolve node / tsc" >&2; exit 1; }; \
-	export TD_NODE="$$node" TD_TSC="$$tsc" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
+	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }; \
+	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; tb="$$TB"; \
 	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
 	echo "  [DURABLE structural] ts-emit evaluates with td's OWN td-ts-eval ($$TD_TS_EVAL) — not the guix-built one (brick 4c)"; \
