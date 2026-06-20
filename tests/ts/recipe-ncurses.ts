@@ -10,6 +10,13 @@
 // bash/nano (they link the C library). --enable-overwrite: install curses.h et al
 // into include/ directly (autotools defaults to include/ncurses/ when --prefix is
 // set), where consumers expect them.
+//
+// --with-shared: build PIC shared libs (libncurses.so) in addition to the static
+// archives. ncurses defaults to static-only; a non-PIC libncurses.a cannot be linked
+// into a SHARED object — gettext's libtextstyle does exactly that and failed with
+// `ld: relocation R_X86_64_32 … recompile with -fPIC`. Shared libs let the gettext
+// edge chain td's ncurses (build-plan); executable consumers (bash, nano) link the
+// shared lib too (resolved at runtime from the dep's lib dir).
 recipe({
   name: "ncurses",
   version: "6.2",
@@ -17,5 +24,5 @@ recipe({
     "mirror://gnu/ncurses/ncurses-6.2.tar.gz",
     "17bcm2z1rdx5gmzj5fb8cp7f28aw5b4g2z4qvvqg3yg0fq66wc1h"),
   buildSystem: "gnu",
-  configureFlags: ["--without-cxx-binding", "--enable-overwrite"],
+  configureFlags: ["--without-cxx-binding", "--enable-overwrite", "--with-shared"],
 });
