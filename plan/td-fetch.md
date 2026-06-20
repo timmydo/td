@@ -60,7 +60,7 @@ td-warmed path is the follow-on, since the cold external warm is a host-network 
    (self-host-specs) — a seed tool with no corpus oracle (its proof is the gate).
 4. [x] rust-fetch gate (mk/gates/348): loopback round-trip + self-discrimination +
    oracle + repro. Runs green via `./check.sh rust-fetch`.
-5. [ ] verified-red evidence; land.
+5. [x] verified-red evidence recorded; ready to land.
 
 ## Verified-red
 
@@ -68,5 +68,10 @@ td-warmed path is the follow-on, since the cold external warm is a host-network 
   gate 070 (`guix repl: error: td-fetch: unknown package`) because recipe-td-fetch.ts
   auto-enrolled in the guix-dependence census; fixed by adding "td-fetch" to
   self-host-specs (the seed-tool exclusion). Census `.expected` UNCHANGED.
-- [planned] break td-fetch's sha256 check (accept any hash) → rebuild → the gate's
-  SELF-DISCRIMINATION leg must red ("td-fetch selftest ACCEPTED a wrong sha256").
+- SELF-DISCRIMINATION leg has teeth: disabled td-fetch's sha256 check (`if false && got
+  != want`), rebuilt via the gate (the perturbed source re-interned → real rebuild, no
+  vacuous cache hit), and the gate RED at exactly the right leg:
+  `FAIL: td-fetch selftest ACCEPTED a wrong sha256 (000…000) — the verification is not
+  load-bearing` (exit 1). The behavioral round-trip still passed (loopback body matches),
+  so the leg that fired is specifically the verification control. Reverted to green
+  (`git checkout fetch/src/main.rs`); the green gate re-runs PASS.
