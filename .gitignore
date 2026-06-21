@@ -18,6 +18,7 @@
 .store-verify-scratch/
 .store-add-referenced-scratch/
 .build-hermetic-scratch/
+.build-daemon-scratch/
 # cargo-test: scratch CARGO_HOME + CARGO_TARGET_DIR (clean compile each run).
 .cargo-test-scratch/
 

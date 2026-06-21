@@ -185,9 +185,43 @@ Verified-red (recorded, 2026-06-20):
   were visible — a /proc pid-count threshold would have been unreliable; the
   launcher-name discriminator is correct. Restored → green (both legs pass).
 
+## Increment 7 (the persistent build daemon — the track's end-goal capability)
+
+`td-builder daemon SOCKET STORE-DB SCRATCH` (new `build_daemon::serve`) is a
+long-running process that realizes derivations served over a Unix socket — the
+loop's builder instead of guix-daemon. It wraps the EXACT `realize_drv` path (same
+userns sandbox + NEWPID from increment 6, daemon-free); the daemon only adds
+persistence + a line protocol (`<drv>\n` → `OK <canonical> <host-out>\n` | `ERR
+…\n`, `SHUTDOWN\n` for a clean stop). `td-builder daemon-request SOCKET DRV`
+(`build_daemon::request`) is the in-process client, so a gate needs no nc/socat
+(absent from the loop sandbox — as are awk and seq; the gate is pure shell + grep
++ sed + a counter loop). Serial accept loop, fresh per-request scratch dir.
+
+Gate `build-daemon` (358): one long-running daemon serves TWO DISTINCT realize
+requests (probes a + b) over a single socket — persistence, the property a
+one-shot `realize` lacks — each producing td's OWN output (under the scratch store,
+NOT /gnu/store) with the expected marker, the realize daemon-free. All-DURABLE
+behavioral, no guix oracle leg.
+
+Why minimal-/dev was deferred (it was the listed "next"): the minimal-/dev builder
+only runs when /dev is a real devtmpfs (a standalone daemon, no outer host_shell);
+every gate runs INSIDE host_shell, which already presents a minimal tmpfs /dev, so
+that path never executes in the loop and there is no red to see — untestable until
+a standalone/daemon harness exists. The maintainer chose the persistent daemon as
+the next increment instead; it becomes that standalone context.
+
+Verified-red (recorded, 2026-06-21): add `break;` after the first request's
+response in `build_daemon::serve` (serve exactly one request). `./check.sh
+build-daemon`: request A succeeds (realize, OUT=probe-a, registered), request B
+reds — `daemon-request: connect …/sock: Connection refused (os error 111)` →
+`FAIL: request B (PERSISTENCE …)` → gate red. So the "one daemon serves multiple
+requests" assertion is non-vacuous and persistence is load-bearing. Restored → green.
+
 ## Next
 
-- A minimal-/dev builder for the standalone (no outer host_shell) daemon case.
-- A persistent daemon mode the loop invokes by default instead of guix-daemon.
+- A minimal-/dev builder for the standalone (no outer host_shell) daemon case
+  (now has a context — the daemon — to be tested in).
+- The loop CONSUMING the daemon by default (a daemon the realize gates talk to,
+  instead of each spawning a one-shot realize) — the consumer swap.
 - A network-present daemon harness → fully differential offline-isolation.
 - Toolchain retired LAST (§5).
