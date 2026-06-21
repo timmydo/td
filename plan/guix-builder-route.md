@@ -49,10 +49,22 @@ assertions then prove stage0's td-builder does the op correctly.
   sandbox-hardening 272 / td-realize 355 / td-offline 360 / build-hermetic 356 (7
   gates). Count 20→13. All clean tool-use (oracle = guix daemon / `guix repl` /
   `guix build --check`, not the td-builder binary). Re-baselined (13).
-- After PR 4, td-builder's remaining 6 sites = **3 confirmed oracle** (170-bootstrap
-  `gtb`, 175 the package gate, 330-rust-build `gtb`) + **3 build gates** (352-cmake,
-  365-bootstrap-build, 365-build-plan) needing per-gate oracle-vs-tool analysis like 330
-  (PR 5). Then step 3 = td-ts-eval ×7 → the oracle floor.
+- **PR 5 (this): 352-cmake** (the td-builder ref). Count 13→12. More involved than the
+  singles: besides the `tb`→stage0 swap, the build runs under `env -i` so
+  `TD_BUILDER_PATH/STORE/DB` must be threaded through (the canonical stage0 path the
+  assembled .drv names as its builder), + a `grep -qF "$$TD_BUILDER_PATH/bin/td-builder"
+  *.drv` structural leg. Verified GREEN on stage0.
+- **365-build-plan: DEFERRED (needs a builder/src change).** Attempted the same routing
+  but `td-builder build-plan --auto` validates the builder ROOT against the daemon db it
+  is passed (`/var/guix/db`) and does NOT consult `TD_BUILDER_DB` where stage0 is
+  registered → `build-plan --auto bash: root <stage0> is not in any store DB`. Unlike
+  `build-recipe` (cmake, which uses `TD_BUILDER_STORE/DB` for the builder closure),
+  build-plan's root-validation needs an engine fix to accept the td-placed builder. Out
+  of scope for a gate-routing PR (builder/src = loop spine). Reverted; build-plan stays
+  on guix-built td-builder for now.
+- After PR 5, remaining 5 td-builder sites = 4 own-then-diverge ORACLE/bootstrap legs
+  (170 `gtb`, 175 the package gate, 330 `gtb`, 365-bootstrap-build `gtb`) + 365-build-plan
+  (deferred). Next lever: step 3 = td-ts-eval ×7 (load_ts_eval).
 
 ## Verified-red
 

@@ -39,7 +39,8 @@ cmake:
 	@set -euo pipefail; \
 	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
 	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$ev" -a -x "$$tb" -a -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo / ts-eval / td-builder" >&2; exit 1; }; \
 	export TD_TSGO="$$tsgo" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	lock0="$(CURDIR)/tests/td-cmake-demo.lock"; \
@@ -58,11 +59,12 @@ cmake:
 	test -s "$$scratch/td-cmake-demo.json" || { echo "ERROR: ts-emit produced no JSON for td-cmake-demo" >&2; exit 1; }; \
 	grep -q '"buildSystem":"cmake"' "$$scratch/td-cmake-demo.json" || { echo "FAIL: recipe JSON is not buildSystem cmake" >&2; cat "$$scratch/td-cmake-demo.json" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" "$$tb" build-recipe "$$scratch/td-cmake-demo.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe cmake build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/td-cmake-demo.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe cmake build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; grep -q 'no guix (derivation), no Guile' "$$scratch/err" || { echo "FAIL: build-recipe did not assemble the .drv itself" >&2; cat "$$scratch/err" >&2; exit 1; }; fi; \
 	grep -qE '\["cmake-build"\]' "$$sd"/*.drv || { echo "FAIL: the .drv did not select the cmake-build phase runner (builder args != [\"cmake-build\"])" >&2; exit 1; }; \
+	grep -qF "$$TD_BUILDER_PATH/bin/td-builder" "$$sd"/*.drv || { echo "FAIL: the cmake .drv builder is not the bootstrapped stage0 $$TD_BUILDER_PATH — built by the wrong td-builder?" >&2; exit 1; }; \
 	ns="$$sd/newstore/`basename "$$out"`"; \
 	test -x "$$ns/bin/td-cmake-hello" || { echo "FAIL: cmake build produced no binary at $$ns/bin/td-cmake-hello" >&2; exit 1; }; \
 	if [ -n "$$hit" ]; then echo "  [STRUCTURAL] CACHE HIT — cmake-demo source unchanged, reused td's prior build (no rebuild): $$out"; else echo "  [STRUCTURAL] td assembled + realized the .drv (builder args [\"cmake-build\"]) with guix/Guile off PATH: $$out"; fi; \
