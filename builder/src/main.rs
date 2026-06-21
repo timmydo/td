@@ -2838,6 +2838,14 @@ fn main() -> ExitCode {
             let bp = std::env::var("TD_BUILDER_PATH").ok();
             let bs = std::env::var("TD_BUILDER_STORE").ok();
             let bd = std::env::var("TD_BUILDER_DB").ok();
+            // North-Star step 2: build from the UNPACKED SEED, not a host guix. With
+            // TD_SEED_STORE + TD_SEED_DB set (a `td-builder seed-unpack` output), the input
+            // closure is computed from the seed DB and every seed input binds from the
+            // unpacked store (TD_SEED_STORE/<base>) — so STORE-DB (/var/guix) and the live
+            // /gnu/store are out of the build path. Set together; the build is otherwise
+            // identical (same drv, same output).
+            let seed_store = std::env::var("TD_SEED_STORE").ok();
+            let seed_db = std::env::var("TD_SEED_DB").ok();
             let run = || -> Result<(), String> {
                 let builder_store = match (&bp, &bs, &bd) {
                     (Some(p), Some(s), Some(d)) => Some((p.as_str(), s.as_str(), d.as_str())),
@@ -2849,16 +2857,22 @@ fn main() -> ExitCode {
                         )
                     }
                 };
+                let (store_dbs, td_store): (Vec<String>, Option<&Path>) =
+                    match (&seed_store, &seed_db) {
+                        (Some(s), Some(d)) => (vec![d.clone()], Some(Path::new(s))),
+                        (None, None) => (vec![store_db.clone()], None),
+                        _ => return Err("TD_SEED_STORE/TD_SEED_DB must be set together".into()),
+                    };
                 let recipe_json =
                     std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
                 build_recipe(
                     &recipe_json,
                     lock,
                     Path::new(scratch),
-                    std::slice::from_ref(store_db),
+                    &store_dbs,
                     src_store,
                     builder_store,
-                    None,
+                    td_store,
                 )
                 .map(|_| ())
             };
