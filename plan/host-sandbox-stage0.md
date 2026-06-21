@@ -48,17 +48,74 @@ the bootstrap fails with "pinned seed not present". Plan: confirm they're in the
 channel closure; if a cold host can miss them, add a minimal warm (realize the lock's
 toolchain paths — a fixed-input realize like warm-tsgo, NOT a packager `-e`).
 
-## Sub-task ladder
+## Plan — RUST IN THE SEED (human decision 2026-06-21)
 
-1. [ ] Confirm the toolchain-lock paths are present at prelude time (or add a warm).
-2. [ ] Swap `check.sh:190` to call `tools/bootstrap-td-builder.sh` into a cached dir;
-       point the host-sandbox `tb` at the stage0 binary.
-3. [ ] `./check.sh` green end-to-end (the durable proof — the loop runs on a stage0-built
-       host-sandbox).
-4. [ ] Verified-red: break the bootstrap path (e.g. point at a bad lock) and watch the
-       prelude fail closed (no silent guix fallback).
-5. [ ] guix-surface / guix-dependence unaffected (spine site isn't in the ratchet's
-       scanned set — confirm, don't assume).
+The blocker below (bootstrap needs rust; fast image is rust-free) is resolved by
+putting the rust toolchain IN the frozen seed and building td-builder FROM the seed.
+The host-sandbox builder is a Rust binary, so "build the engine from a rust-bearing
+seed, guix-free" is BOTH "rust in the seed" AND "line-190 off guix".
+
+### Increment 1 — the "rust in the seed" gate (additive; this PR)
+
+Compose the existing PR3 primitives for the Rust engine instead of hello/C:
+- `recipe-td-builder.ts` (#84) builds td-builder from source via `build-recipe`
+  (buildSystem rust); `tests/td-builder-rust.lock` is its toolchain+source lock.
+- `tools/build-seed-tarball.sh ROOTS…` captures a closure → tarball+manifest.
+- `td-builder seed-unpack` restores it into a fresh td store + DB, no daemon.
+- `build-recipe` with `TD_SEED_STORE`/`TD_SEED_DB` stages inputs from the unpacked
+  seed (bound at canonical /gnu/store INSIDE the sandbox, so rust's hardcoded ELF
+  interpreters resolve).
+
+New gate (e.g. `mk/gates/378-rust-seed.mk` + `tests/rust-seed.sh`):
+1. [ ] Capture roots = the td-builder-rust.lock toolchain paths (rust/cargo/
+       gcc-toolchain/coreutils/bash) + the interned builder source; union closure.
+2. [ ] `seed-unpack` into a fresh td store.
+3. [ ] `build-recipe` td-builder from the seed as its ONLY store DB (guix off PATH,
+       /var/guix + live /gnu/store out of the build path).
+4. [ ] Legs: [DURABLE behavioral] the seed-built td-builder RUNS (e.g. `--version` /
+       a subcommand); [DURABLE repro] `td-builder check` double-build; [DURABLE
+       structural] inputs staged from the unpacked seed (closure binds under
+       DEST-STORE, none bare-/gnu/store); [REMOVABLE oracle] same store path as the
+       guix-seed build. Driver = stage0 (load_stage0), as PR3 used it.
+5. [ ] Verified-red: drop a rust path from the captured seed → build fails (seed not
+       self-sufficient; no guix fallback). Record evidence.
+
+### Increment 2 — the spine swap (later PR, builds on inc.1)
+
+`check.sh` prelude warms+unpacks the rust-bearing seed (host PREP, like warm-tsgo)
+and provisions stage0 + the sandbox toolchain from it; CI fast image ships the seed
+tarball (pinned `tests/td-seed.lock`). Retires check.sh:190 AND :196 together. Open:
+host-DIRECT rust execution (cargo before any sandbox) needs the toolchain at canonical
+paths or relocatable — resolve as part of inc.2. Exclusive landing on check.sh;
+sequence with the seed-tarball agent.
+
+## BLOCKER found in analysis (2026-06-21) — fast-image rust dependency
+
+`tools/bootstrap-td-builder.sh` ALWAYS compiles stage0 from `builder/` source, so it
+always needs the rust toolchain (rust-1.93.0 / cargo / gcc-toolchain) present + runnable.
+The fast CI image **deliberately omits rust**:
+- `ci/lower-fast-drvs.sh` enumerates only the check.sh:196 sandbox toolchain
+  (`make bash coreutils …`), the channel instance, the tsgo FOD, and the cheap rungs'
+  system/OCI drvs. No `(system td-builder)`, no rust.
+- Gate comments are explicit: `325-cargo-test.mk` / `230-rust gates` are "Not FAST_GATES:
+  … the rust toolchain, which the small td-ci-fast [image lacks]".
+
+check.sh's whole prelude (incl. line 190) runs for `./check.sh check-fast` too. Today
+line 190 is a cached-output LOOKUP (`guix build -e` → existing output, no rebuild → no
+rust). Compiling stage0 is NEVER a no-op → ALWAYS needs rust → fails offline in the
+rust-free fast image. So the swap is not CI-safe as-is.
+
+Resolutions (none is a "small increment"):
+1. Ship rust in the fast image — bloats the deliberately-small tier + image-rot/timeout
+   risk ([[td-ci-fast-tier-image]]). Likely undesirable.
+2. Inject a PREBUILT stage0 binary into the fast image via the pipeline (build-ci-image.sh
+   runs on a rust-capable box); check.sh uses it offline, else compiles. No guix, no rust
+   in the image — but spans check.sh + ci/build-ci-image.sh + the enumerator + a gate
+   (CI-pipeline change, sensitive). The clean end-state, but a medium PR.
+3. Descope line 190; take a cleaner guix-removal target (e.g. check.sh:75 `guix describe`
+   → read the pin from channels.scm; or a non-spine site).
+
+Reported to the human for a steer (the resolution is a CI-image-policy design decision).
 
 ## Verified-red log
 
