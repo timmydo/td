@@ -42,7 +42,26 @@ operating-system` instantiates td's coreutils .drv (the helper) and folds the ou
 profile. Re-baseline the `system/td.scm` oracle + the ts-diff/typed differential. The booted
 PATH then has td-built `coreutils`. Reusable for every Rust tool td builds.
 
-## Verified-red
+## Result (green)
 
-- (to fill) gate: perturb the builder (use the stage0, daemon-invalid) → daemon build fails
-  ("not in the store"); or break a multicall assertion.
+Gate `daemon-td-drv` PASSES: td assembled uu_cat's .drv with the guix-built (daemon-valid)
+td-builder, the helper instantiated it into the daemon store, and the DAEMON realized it →
+daemon-VALID `cat` at `/gnu/store/qwjwj…-cat-0.9.0` — the SAME path td's own daemon-free
+realize produced (the .drv is realizer-independent) — that round-trips file + stdin.
+
+## guix-surface (directive 3 — called out for sign-off)
+
++1 packager site: `mk/gates/358-daemon-td-drv.mk (system td-builder) td-builder` (12→13).
+The daemon needs a daemon-VALID builder; the stage0 isn't, the guix-built td-builder is — so
+A' inherently re-uses it as the BUILDER SEED (retired when td has its own builder daemon).
+ts-eval uses `load_ts_eval` (td's own — no site). Re-baselined `tests/guix-surface.expected`.
+
+## Verified-red (confirmed)
+
+- **Daemon-valid builder is load-bearing**: running the helper on the cached STAGE0-builder
+  .drv (builder `j30c…-td-builder`, NOT daemon-valid) → the daemon build FAILS (`build of …
+  uutils-0.9.0.drv failed`). So the bridge genuinely depends on the guix-built daemon-valid
+  builder; the gate's pass is not vacuous.
+- **realizer-independence is load-bearing**: the gate asserts the daemon-built path EQUALS
+  td's daemon-free path — if td's .drv assembly diverged from guix's path algorithm, the
+  daemon would compute a different output and the equality reds.
