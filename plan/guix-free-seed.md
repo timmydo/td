@@ -16,16 +16,18 @@ bootstrap is a non-goal" framing (DESIGN §5).
 
 ## Priority ladder
 
-1. **No `guix` process in user-facing commands / build paths.** First target:
-   `td shell` (PR #119 shipped resolving via `guix build PKG` — rejected by the human
-   as "a guix connection"). Rework: `td shell PKG -- CMD` resolves PKG to a **td-built**
-   output (PKG's recipe → `td-builder build-recipe`/`build-plan --auto`,
-   **build-on-demand, cached** under `.td-build-cache`), composes PATH from the td store
-   path, execs — no `guix` process anywhere. Unknown package → error ("no td recipe for
-   PKG"), NO guix fallback. Works for the owned corpus (hello, coreutils, bash, grep,
-   nano, … — ~25 recipes today). Boundary while step 2 is pending: the *build* still
-   links the guix-built toolchain seed from the pinned lock (no guix *process*, but
-   guix-built bytes) — closed by step 2.
+1. **No `guix` process in user-facing commands / build paths.** ✅ DONE (this PR, step 1):
+   `td shell` (PR #119 shipped resolving via `guix build PKG` — rejected by the human as
+   "a guix connection") now resolves PKG to a **td-built** output — PKG's recipe → emit
+   JSON with td's tsgo + td-ts-eval → `td-builder build-recipe` (content-addressed cache
+   ⇒ **build-on-demand, cached**) — composes PATH from the td store path, execs. No
+   `guix` process anywhere; the `td-shell` gate proves it by running with guix/Guile
+   SCRUBBED FROM PATH. Unknown package → error ("no td recipe for PKG"), NO guix fallback.
+   The hello it runs is td's own build at a td store path distinct from guix's. Leaf
+   recipes today (hello); chained recipes (bash<-readline<-ncurses, needing
+   `build-plan --auto` + runtime LD_LIBRARY_PATH for td deps) are the step-1b follow-on.
+   Boundary while step 2 is pending: the *build* still links the guix-built toolchain seed
+   from the pinned lock (no guix *process*, but guix-built bytes) — closed by step 2.
 2. **Serve the toolchain seed from the tarball, not a host guix.** Capture the seed
    closure (the lock's toolchain inputs: gcc/glibc/binutils/coreutils/… + stage0 inputs)
    into a pinned tarball + a manifest (name → store path). A `td seed` step unpacks it
@@ -39,7 +41,7 @@ bootstrap is a non-goal" framing (DESIGN §5).
    lowering). These are the migration scaffolding; delete the differential legs when the
    oracle goes (per CLAUDE.md "Differential + durable discipline").
 
-## This PR (direction only)
+## This PR (direction + step 1)
 
 - CLAUDE.md "North star" section (the contract statement).
 - DESIGN §5 reframe: "Seed toolchain — a frozen binary tarball, NOT a live guix
@@ -47,10 +49,19 @@ bootstrap is a non-goal" framing (DESIGN §5).
   bullet points at the seed tarball.
 - PLAN.md preamble north-star callout.
 - This track claim + roadmap.
+- **Step 1 implemented**: `td-builder shell` reworked to build & run td's OWN package
+  with no guix process (`run_shell`/`emit_recipe_json` in `builder/src/main.rs`); the
+  `td-shell` gate (`tests/td-shell.sh`, BUILD_GATES + HEAVY_GATES) asserts it guix-free.
 
-No code/gates yet — the ladder lands as follow-on PRs, smallest first (step 1: `td shell`).
+### Verified-red (step 1)
+- VR1 — reintroduced a `guix build` call in `run_shell` → with guix scrubbed from PATH
+  the behavioral leg reds (proves the gate catches any guix process). Reverted.
+- VR3 — made an unknown package silently fall through instead of erroring → the
+  load-bearing leg reds ("SUCCEEDED — must error, no guix fallback"). Reverted.
 
 ## Status
 
-- 2026-06-20: direction PR (this). Next: implement step 1 (`td shell` on td-built
-  packages, build-on-demand cached).
+- 2026-06-20: direction + step 1 (this PR). `td shell` builds/runs td packages,
+  guix-free (leaf recipes; hello green + verified-red).
+- Next: step 1b (chained recipes via `build-plan --auto` + runtime dep PATHs), then
+  step 2 (the frozen seed tarball — `tools/build-seed-tarball.sh` + `td seed`).
