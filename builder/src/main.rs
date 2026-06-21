@@ -1046,64 +1046,169 @@ fn build_plan_auto(
     build_plan(&plan_path.to_string_lossy(), guix_db, scratch)
 }
 
-/// td-builder shell — td's own `guix shell`: bring one or more package outputs
-/// into a command's environment, then run the command. This is the "own, then
-/// diverge" split: the name→derivation→output PACKAGE layer stays on guix for v1
-/// (`guix build PKG` — the same resolution guix shell does, the move-off-Guile §5
-/// layer retired LAST), but the ENVIRONMENT COMPOSITION + exec is td's own — we
-/// prepend each resolved output's `bin`/`sbin` to PATH ourselves and run the
-/// command directly, with no guix process in the exec path. The DURABLE behavior
-/// (the command runs with the package on PATH) survives the oracle's retirement;
-/// swapping the one `guix build` block for a td package db is all that is left.
+/// Emit a recipe's JSON from its `.ts` with td's OWN TS front-end — `tsgo` (the
+/// native TypeScript compiler, NO node) transpiles TS→JS, `td-ts-eval` (the boa
+/// evaluator) evaluates it to the recipe JSON. No guix, no Guile — the same two
+/// steps as `tests/ts-emit.sh`. Tools come from the env (td-built, placed by the
+/// caller): TD_TSGO (dir holding `lib/tsc`), TD_TS_EVAL (the binary), TD_TSDIR (the
+/// dialect dir holding `td-spec.d.ts`).
+fn emit_recipe_json(recipe_ts: &str) -> Result<String, String> {
+    let tsgo = std::env::var("TD_TSGO")
+        .map_err(|_| "TD_TSGO must point at td's tsgo dir (with lib/tsc) to emit a recipe".to_string())?;
+    let ts_eval = std::env::var("TD_TS_EVAL")
+        .map_err(|_| "TD_TS_EVAL must point at td's td-ts-eval binary".to_string())?;
+    let tsdir = std::env::var("TD_TSDIR").unwrap_or_else(|_| "tests/ts".to_string());
+    let work = std::env::temp_dir().join(format!("td-shell-emit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    // tsgo transpile — same pinned flags as tests/ts-emit.sh, so the JS is the golden emit.
+    let tsc = format!("{tsgo}/lib/tsc");
+    let ok = Command::new(&tsc)
+        .args(["--strict", "--target", "es2020", "--lib", "es2020", "--newLine", "lf", "--removeComments", "--outDir"])
+        .arg(&work)
+        .arg(format!("{tsdir}/td-spec.d.ts"))
+        .arg(recipe_ts)
+        .status()
+        .map_err(|e| format!("spawn {tsc}: {e}"))?
+        .success();
+    if !ok {
+        return Err(format!("tsgo tsc failed transpiling {recipe_ts}"));
+    }
+    let stem = Path::new(recipe_ts)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("bad recipe path {recipe_ts}"))?;
+    let js = work.join(format!("{stem}.js"));
+    let js_bytes = std::fs::read(&js).map_err(|e| format!("tsc produced no JS ({}): {e}", js.display()))?;
+    // td-ts-eval: evaluate the JS to the recipe JSON on stdout.
+    let mut child = Command::new(&ts_eval)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn td-ts-eval ({ts_eval}): {e}"))?;
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .ok_or("td-ts-eval stdin")?
+        .write_all(&js_bytes)
+        .map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(&work);
+    if !out.status.success() {
+        return Err(format!(
+            "td-ts-eval failed on {recipe_ts}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("td-ts-eval output not UTF-8: {e}"))
+}
+
+/// td-builder shell — run a command with td-BUILT packages on PATH. td's own
+/// `guix shell`, but with NO guix anywhere: each PKG is resolved to a td RECIPE and
+/// BUILT by td-builder itself (the recipe → `td-builder build-recipe`, whose
+/// content-addressed cache makes this build-on-demand + cached), then td composes
+/// the command's PATH from the td store OUTPUT and execs. There is no `guix`
+/// process in the resolve/build/exec path; an unknown package errors ("no td recipe
+/// for PKG"), it does NOT fall back to guix. The package that lands on PATH is td's
+/// own build at td's own store path. (Boundary, North Star step 1: the build still
+/// links the pinned toolchain SEED from the lock — guix-built today, the frozen seed
+/// tarball next, CLAUDE.md "North star" step 2 — but no guix runs here.)
+///
+/// Config (env): TD_SHELL_RECIPES (dir of `recipe-<pkg>.ts`, default `tests/ts`),
+/// TD_SHELL_LOCKS (dir of `<pkg>-no-guix.lock`, default `tests`), TD_TSGO/TD_TS_EVAL/
+/// TD_TSDIR (td's TS front-end, to emit the recipe), TD_SHELL_STORE_DB (store DB for
+/// closure staging, default `/var/guix/db/db.sqlite`), TD_SHELL_CACHE (build cache
+/// root, default `$HOME/.cache/td-shell`), TD_BUILDER_PATH/STORE/DB (optional stage0
+/// builder override, so the build's builder is td-placed too).
 ///
 /// Usage: shell PKG... [-- CMD ARGS...]
-///   PKG...      package specs to bring in (each resolved via `guix build`)
+///   PKG...      td package names (a recipe must exist; no guix fallback)
 ///   -- CMD...   the command to run in the composed env; omitted → interactive $SHELL
 fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
-    // Everything before the first `--` is a package spec; after it, the command.
+    // Everything before the first `--` is a package name; after it, the command.
     let sep = rest.iter().position(|a| a == "--");
     let (pkgs, cmd): (&[String], &[String]) = match sep {
         Some(i) => (&rest[..i], &rest[i + 1..]),
         None => (rest, &[]),
     };
 
-    // Resolve each package spec to its store output(s) via the guix package
-    // oracle, collecting the bin/sbin dirs to put on PATH. This is the ONLY guix
-    // dependency in the command; the rest is td's own. (Swap this loop for a
-    // td-native package db and `shell` is guix-free — the move-off-Guile §5 step
-    // for the package layer, retired last.)
+    let env_or = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let recipe_dir = env_or("TD_SHELL_RECIPES", "tests/ts");
+    let lock_dir = env_or("TD_SHELL_LOCKS", "tests");
+    let store_db = env_or("TD_SHELL_STORE_DB", "/var/guix/db/db.sqlite");
+    let cache = match std::env::var("TD_SHELL_CACHE") {
+        Ok(c) => c,
+        Err(_) => format!(
+            "{}/.cache/td-shell",
+            std::env::var("HOME").map_err(|_| "set TD_SHELL_CACHE or HOME".to_string())?
+        ),
+    };
+    let self_exe = std::env::current_exe()
+        .map_err(|e| format!("locate td-builder: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+
+    // Build each named package with td-builder itself — no guix — and collect the
+    // td store output's bin/sbin dirs to put on PATH.
     let mut prefix_dirs: Vec<String> = Vec::new();
     for pkg in pkgs {
-        let out = Command::new("guix")
-            .args(["build", pkg])
+        // Resolve PKG to a td recipe. No recipe ⇒ loud error, NOT a guix fallback.
+        let recipe_ts = format!("{recipe_dir}/recipe-{pkg}.ts");
+        if !Path::new(&recipe_ts).is_file() {
+            return Err(format!(
+                "no td recipe for `{pkg}' ({recipe_ts} not found) — td shell builds td packages, it does not fall back to guix"
+            ));
+        }
+        let lock = format!("{lock_dir}/{pkg}-no-guix.lock");
+        if !Path::new(&lock).is_file() {
+            return Err(format!("no lock for `{pkg}' ({lock} not found)"));
+        }
+        // Emit the recipe JSON (td's tsgo + td-ts-eval — no guix), stage it in the
+        // per-package cache dir that build-recipe also keys its build cache on.
+        let recipe_json = emit_recipe_json(&recipe_ts)?;
+        let sd = format!("{cache}/{pkg}");
+        std::fs::create_dir_all(&sd).map_err(|e| e.to_string())?;
+        let json_file = format!("{sd}/recipe.json");
+        std::fs::write(&json_file, &recipe_json).map_err(|e| e.to_string())?;
+        // BUILD it via the build-recipe subcommand (its content-addressed cache makes
+        // an unchanged recipe a HIT — build-on-demand + cached). A subprocess keeps the
+        // build's chatter off the command's stdout, and rides the inherited
+        // TD_BUILDER_* override so the builder is the td-placed stage0 too.
+        let out = Command::new(&self_exe)
+            .args(["build-recipe", &json_file, &lock, &sd, &store_db])
             .output()
-            .map_err(|e| format!("resolve `{pkg}': spawn guix build: {e}"))?;
+            .map_err(|e| format!("build `{pkg}': spawn td-builder build-recipe: {e}"))?;
         if !out.status.success() {
             return Err(format!(
-                "resolve `{pkg}': guix build failed: {}",
+                "build `{pkg}' failed:\n{}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        let mut found = false;
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let path = line.trim();
-            if !path.starts_with("/gnu/store/") {
-                continue;
+        // build-recipe prints `OUT=out <canonical-store-path>`; the realized tree is
+        // staged at <sd>/newstore/<basename> (a td path distinct from guix's).
+        let outline = String::from_utf8_lossy(&out.stdout);
+        let canonical = outline
+            .lines()
+            .find_map(|l| l.strip_prefix("OUT=out "))
+            .ok_or_else(|| format!("build `{pkg}': build-recipe reported no `out' output"))?
+            .trim();
+        let base = canonical.rsplit('/').next().unwrap_or(canonical);
+        let outdir = format!("{sd}/newstore/{base}");
+        let mut any = false;
+        for sub in ["bin", "sbin"] {
+            let dir = format!("{outdir}/{sub}");
+            if Path::new(&dir).is_dir() {
+                prefix_dirs.push(dir);
+                any = true;
             }
-            for sub in ["bin", "sbin"] {
-                let dir = format!("{path}/{sub}");
-                if Path::new(&dir).is_dir() {
-                    prefix_dirs.push(dir);
-                }
-            }
-            found = true;
         }
-        if !found {
-            return Err(format!("resolve `{pkg}': guix build printed no store path"));
+        if !any {
+            return Err(format!("build `{pkg}': td output {outdir} has no bin/sbin"));
         }
     }
 
-    // Compose the child PATH ourselves: the resolved package bins FIRST (so the
+    // Compose the child PATH ourselves: the td package bins FIRST (so the
     // package's binary wins — the package is load-bearing), then the inherited
     // PATH (guix shell's non-pure default). td builds this string; no guix
     // process is between us and the command.
