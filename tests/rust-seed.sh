@@ -9,9 +9,9 @@
 #   - load_stage0 places the cargo-built stage0 td-builder (the build DRIVER); load_ts_eval
 #     gives td's own td-ts-eval; the source is the LIVE builder/ tree interned by td's own
 #     store-add-recursive (tests/intern-src.sh) — NOT frozen (it changes every edit).
-#   - tools/build-seed-tarball.sh captures the RUST TOOLCHAIN closure (tests/td-builder-rust.lock
-#     roots ∪ stage0's runtime refs) into a frozen tarball + manifest; `seed-unpack` restores
-#     it into a FRESH td store + DB, no daemon, no /gnu/store write.
+#   - tools/warm-seed.sh captures + unpacks the RUST TOOLCHAIN closure (tests/td-builder-rust.lock
+#     roots ∪ stage0's runtime refs) ONCE into a reusable content-addressed cache (the #135
+#     warm-seed rail — no 2GB re-capture per run), no daemon, no /gnu/store write.
 #   - `build-recipe` builds td-builder (recipe-td-builder.ts, buildSystem rust) with the
 #     unpacked seed as its store DB (TD_SEED_STORE/TD_SEED_DB) and the interned tree as the
 #     source override — so /var/guix and the live /gnu/store TOOLCHAIN paths are out of the
@@ -65,19 +65,22 @@ test -n "$src" -a -d "$srcstore/`basename "$src"`" || fail "td interned no sourc
 lock="$scratch/td-builder-rust.lock"; { cat "$lock0"; echo "td-builder-source $src"; } > "$lock"
 echo ">> interned the CURRENT builder tree (recursive addToStore, no guix repl / no daemon): $src"
 
-# --- CAPTURE the RUST TOOLCHAIN into a frozen seed, then UNPACK into a fresh td store ---
-# Roots: the rust lock's toolchain store paths (rust/cargo/gcc-toolchain/coreutils/bash)
-# + the stage0 builder's runtime refs (so the seed covers the in-sandbox builder too).
+# --- WARM the RUST TOOLCHAIN seed (capture + unpack ONCE into a reusable content-addressed
+#     cache — the #135 warm-seed rail; no 2GB re-capture per run). Roots: the rust lock's
+#     toolchain store paths (rust/cargo/gcc-toolchain/coreutils/bash) + the stage0 builder's
+#     runtime refs (so the seed covers the in-sandbox builder too).
 grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | sort -u > "$work/roots"
 "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$work/roots" || true
 sort -u "$work/roots" -o "$work/roots"
 xargs guix build < "$work/roots" >/dev/null || fail "could not realize the rust toolchain seed closure"
-TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/build-seed-tarball.sh "$work/cap" `cat "$work/roots"` >/dev/null \
-  || fail "build-seed-tarball (rust toolchain) failed"
-ns=`grep -c . "$work/cap/seed.manifest"`
-"$TB" seed-unpack "$work/cap/seed.tar" "$work/cap/seed.manifest" "$work/store" "$work/seed.db" >/dev/null \
-  || fail "seed-unpack failed"
-echo "   captured + unpacked the RUST TOOLCHAIN seed: $ns paths (`du -h "$work/cap/seed.tar" | cut -f1`)"
+seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$root/.td-build-cache/seed" $(cat "$work/roots")` \
+  || fail "warm-seed (rust toolchain) failed"
+SEED_STORE=`echo "$seedline" | cut -d' ' -f1`
+SEED_DB=`echo "$seedline" | cut -d' ' -f2`
+SEED_MANIFEST=`echo "$seedline" | cut -d' ' -f3`
+test -d "$SEED_STORE" -a -s "$SEED_DB" -a -s "$SEED_MANIFEST" || fail "warm-seed produced no usable rust seed"
+ns=`grep -c . "$SEED_MANIFEST"`
+echo "   warmed the RUST TOOLCHAIN seed: $ns paths, cached at $SEED_STORE (no per-run re-capture)"
 
 # --- ts-emit the td-builder recipe (buildSystem rust), Guile-free ---------------------
 sh tests/ts-emit.sh "$root/tests/ts/recipe-td-builder.ts" > "$scratch/td-builder.json" || fail "ts-emit td-builder"
@@ -90,8 +93,8 @@ grep -q '"buildSystem":"rust"' "$scratch/td-builder.json" || fail "recipe JSON i
 sd="$scratch/b"
 env -i HOME="$scratch" TMPDIR="$scratch/tmp" PATH="$cu/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-  TD_SEED_STORE="$work/store/gnu/store" TD_SEED_DB="$work/seed.db" \
-  "$TB" build-recipe "$scratch/td-builder.json" "$lock" "$sd" "$work/seed.db" "$srcstore" "$srcdb" \
+  TD_SEED_STORE="$SEED_STORE" TD_SEED_DB="$SEED_DB" \
+  "$TB" build-recipe "$scratch/td-builder.json" "$lock" "$sd" "$SEED_DB" "$srcstore" "$srcdb" \
   > "$scratch/bout" 2>"$scratch/err" \
   || { tail -30 "$scratch/err" >&2; fail "build td-builder from the unpacked RUST SEED FAILED (seed not self-sufficient?)"; }
 out=`sed -n 's/^OUT=out //p' "$scratch/bout"`
@@ -101,8 +104,8 @@ test -x "$nsd/bin/td-builder" || fail "seed-built td-builder missing at $nsd/bin
 
 # --- Leg A: DURABLE structural — staged from the seed, builder is stage0 ---------------
 test -s "$sd/closure.txt" || fail "no closure.txt from the build"
-grep -q "	$work/store/gnu/store/" "$sd/closure.txt" \
-  || fail "the build staged no input from the unpacked seed store ($work/store)"
+grep -q "	$SEED_STORE/" "$sd/closure.txt" \
+  || fail "the build staged no input from the warmed seed store ($SEED_STORE)"
 bare=`grep -v '	' "$sd/closure.txt" | grep '^/gnu/store/' | grep -v "^$out$" | head -1 || true`
 test -z "$bare" || fail "an input staged from the live /gnu/store, not the seed: $bare"
 test -n "$TD_BUILDER_PATH" || fail "TD_BUILDER_PATH unset — load_stage0 did not place a stage0 builder"
