@@ -290,6 +290,10 @@ map_path() {
       add_preflight shell-syntax
       add_target seed-tarball ;;
 
+    tests/seed-unpack.sh)
+      add_preflight shell-syntax
+      add_target seed-unpack ;;
+
     tests/guix-dependence.*)
       add_target guix-dependence ;;
 
