@@ -246,6 +246,9 @@ map_path() {
     tests/uutils-coreutils.lock)
       add_target rust-coreutils ;;
 
+    tests/td-daemon-instantiate.scm)
+      add_target daemon-td-drv ;;
+
     tests/td-fetch.lock)
       add_target rust-fetch ;;
 
@@ -476,6 +479,7 @@ run_self_test() {
   assert_target tests/td-cmake-demo.lock cmake
   assert_target tests/ts/recipe-uutils.ts rust-coreutils
   assert_target tests/uutils-coreutils.lock rust-coreutils
+  assert_target tests/td-daemon-instantiate.scm daemon-td-drv
   assert_target tests/cmake-demo/CMakeLists.txt cmake
   assert_target tests/ts/recipe-perturbed.ts drv-emit
   assert_target tests/guix-surface.sh guix-surface
