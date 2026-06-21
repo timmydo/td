@@ -51,6 +51,11 @@ the guix-built seed from the lock and stage it out of the live `/gnu/store`).
   tar round-trip; complete; td closure == `guix gc -R`. No Rust change (reuses
   store-closure + nar-hash). Verified-red: VR-A (drop a captured path → "incomplete
   capture" reds), VR-B (corrupt a manifest hash → "NAR mismatch after round-trip" reds).
-- Next: PR2 — `td-builder seed-unpack` (restore into a td store + register from the
-  manifest, no daemon) → build hello from the unpacked seed with `/var/guix` + the live
-  seed paths out of the path (the "no guix install" demo).
+- 2026-06-21: PR2 (unpack) green — `td-builder seed-manifest` (richer manifest: path,
+  nar-hash, nar-size, refs) + `td-builder seed-unpack` (extract + NAR-verify + register
+  DEST-DB from the manifest, no daemon, no /gnu/store write); new `seed-unpack` gate. td's
+  own store-closure reads the COMPLETE closure back out of the unpacked DB. Verified-red:
+  VR1 (corrupt a manifest hash → seed-unpack rejects "NAR mismatch after restore"), VR2
+  (skip Refs → "incomplete registration"). PR1 capture gate updated for the 4-field manifest.
+- Next: PR3 — build hello from the unpacked seed (build_recipe staging from DEST-STORE +
+  DEST-DB) with `/var/guix` + the live seed paths out of the path — the "no guix install" demo.
