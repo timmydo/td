@@ -1262,6 +1262,63 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         .map_err(|e| format!("run `{prog}': {e}"))
 }
 
+/// td-builder profile — build a PROFILE: a symlink tree unioning the `bin`/`sbin` of a
+/// set of installed package outputs, the user-package-manager profile layer (like a guix
+/// profile / nix env). PROFILE-DIR is rebuilt fresh; for each PKG-OUT (a store output dir,
+/// e.g. `~/.td/store/<hash>-hello`), every entry under `bin`/`sbin` is symlinked into
+/// PROFILE-DIR/{bin,sbin}, pointing at the absolute store path. A user puts PROFILE-DIR/bin
+/// on PATH (or symlinks `~/bin/<tool>` → PROFILE-DIR/bin/<tool>). A name provided by two
+/// packages is a COLLISION (error — explicit, like guix). The symlinks resolve to the
+/// store, so the profile is a thin, GC-friendly view that swaps atomically when rebuilt.
+///
+/// Usage: profile PROFILE-DIR PKG-OUT...
+fn build_profile(profile_dir: &str, pkgs: &[String]) -> Result<usize, String> {
+    use std::os::unix::fs::symlink;
+    let pdir = Path::new(profile_dir);
+    // Rebuild fresh (idempotent) — a profile is a derived view, not state.
+    if pdir.exists() {
+        std::fs::remove_dir_all(pdir).map_err(|e| format!("clear {profile_dir}: {e}"))?;
+    }
+    std::fs::create_dir_all(pdir).map_err(|e| e.to_string())?;
+    let mut linked = 0usize;
+    for pkg in pkgs {
+        let pkgp = Path::new(pkg);
+        if !pkgp.is_dir() {
+            return Err(format!("package output `{pkg}' is not a directory"));
+        }
+        for sub in ["bin", "sbin"] {
+            let src_dir = pkgp.join(sub);
+            if !src_dir.is_dir() {
+                continue;
+            }
+            let dst_dir = pdir.join(sub);
+            std::fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
+            let mut entries: Vec<_> = std::fs::read_dir(&src_dir)
+                .map_err(|e| format!("read {}: {e}", src_dir.display()))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?;
+            entries.sort_by_key(|e| e.file_name());
+            for ent in entries {
+                let dst = dst_dir.join(ent.file_name());
+                if dst.exists() {
+                    return Err(format!(
+                        "profile collision: `{sub}/{}' is provided by more than one package (last: {pkg})",
+                        ent.file_name().to_string_lossy()
+                    ));
+                }
+                // Absolute symlink INTO the store (so the profile is a thin view).
+                symlink(ent.path(), &dst)
+                    .map_err(|e| format!("symlink {} -> {}: {e}", dst.display(), ent.path().display()))?;
+                linked += 1;
+            }
+        }
+    }
+    if linked == 0 {
+        return Err("no bin/sbin entries in any package — refusing to write an empty profile".into());
+    }
+    Ok(linked)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -2988,6 +3045,20 @@ fn main() -> ExitCode {
             Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
             Err(e) => {
                 eprintln!("td-builder: shell: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        // td-builder profile — build a profile symlink tree (the user-package-manager
+        // profile layer): union the bin/sbin of the given package outputs into PROFILE-DIR.
+        // See build_profile. Usage: profile PROFILE-DIR PKG-OUT...
+        Some("profile") if args.len() >= 4 => match build_profile(&args[2], &args[3..]) {
+            Ok(n) => {
+                eprintln!("td-builder: profile {} — linked {n} entr{}", args[2], if n == 1 { "y" } else { "ies" });
+                println!("{}", args[2]);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("td-builder: profile: {e}");
                 ExitCode::FAILURE
             }
         },
