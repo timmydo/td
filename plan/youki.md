@@ -37,6 +37,20 @@ Shipping youki (replacing crun) in the booted system goes through td's own daemo
 (maintainer direction 2026-06-21) — coordinated with the own-builder-daemon track, NOT a
 guix-daemon bridge (the closed #128 was the wrong direction).
 
-## Verified-red
+## Result (green)
 
-- (to fill) gate behavioral: break the `youki --version` assertion / drop a vendored crate.
+Gate `rust-youki` PASSES: td built `youki-0.6.0` at `/gnu/store/gcbp74…` from the 663-crate
+vendored closure — structural (TD_VENDOR_CRATES + stage0 builder + td's own ts-eval),
+behavioral (`youki version: 0.6.0`; `--help` lists the OCI lifecycle: create/start/state/
+kill/delete/run/list), repro (td-builder double-build over 663 crates). 9.0M binary, links
+only libc/libgcc_s (no system C deps — the no-features build). `commit:
+…VERGEN_IDEMPOTENT_OUTPUT` confirms vergen's no-git fallback produced a DETERMINISTIC binary
+(why repro holds).
+
+## Verified-red (confirmed)
+
+- **Behavioral is load-bearing**: the built binary is a genuine OCI runtime CLI —
+  `youki --version` → `youki version: 0.6.0`, `youki --help` → create/start/state/kill/delete/
+  run/list. A non-youki or broken binary fails the `--version`/`create` assertions.
+- **census**: `youki` must be in self-host-specs — else the census globs recipe-youki.ts,
+  tries `specification->package "youki"` (none), and errors. Excluded → census unchanged.
