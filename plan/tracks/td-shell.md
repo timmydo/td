@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: td-shell
 handle: claude-fable-db65ca
 date: 2026-06-20
