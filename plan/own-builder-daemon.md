@@ -135,9 +135,58 @@ non-vacuous and the pivot is load-bearing. Restored → green. td-realize still 
 byte-identically to the daemon (55-path closure), proving the minimal root is sufficient
 and the minimal /etc does not perturb output.
 
+## Increment 6 (build pid-namespace parity — folded into the build-hermetic gate)
+
+`sandbox::build` unshared NEWUSER|NEWNS|NEWNET|NEWIPC|NEWUTS but NOT NEWPID, and
+rbind'd /proc from the invoking namespace — so a build saw the loop's whole process
+tree (the guix daemon, other concurrent builds, their /proc/<pid>/environ) and could
+signal it. Now build reaches full host_shell / `guix shell -C` parity: NEWPID rides
+in the SAME unshare as NEWUSER (so the PID ns is owned by the new user ns), then a
+fork lands the builder at PID 1 of its own pid namespace and a FRESH procfs is
+mounted reflecting THAT namespace. Two-level PDEATHSIG (spawned-child + PID 1)
+reaps an orphaned build if the realize process dies, and the kernel tears down the
+whole ns when PID 1 exits. Mirrors the proven host_shell mechanism.
+
+Test: rather than a new gate (which would add a `guix build -e (system td-builder)`
+packager site — wait, 356 builds via stage0, so a NEW gate copying that pattern grew
+the surface; folding avoids it entirely) the pid-ns assertion is FOLDED into the
+existing `build-hermetic` probe/gate (356), which already builds td-builder via the
+stage0 bootstrap (rebuilt from builder/src on a fingerprint change, so my change is
+exercised). The probe now asserts BOTH (a) /var/guix absent (fs hermeticity, needs
+pivot_root — increment 5) and (b) the launching `td-builder' process is INVISIBLE in
+/proc (pid-ns isolation, needs NEWPID — increment 6). Adding an assertion strengthens
+the gate (free); no new gate, no surface growth.
+
+Discriminator choice: `(getpid)==1` is NOT usable — under guix-daemon's own build
+chroot the builder runs as PID ~18 (the `separate-from-pid1` phase), so the probe's
+guix-daemon materialization build would fail it. A /proc pid-COUNT threshold is also
+unreliable: the loop runs inside host_shell's own pid ns, so without NEWPID a
+standalone build sees only ~6 loop processes — too close to any threshold. The
+robust signal is the LAUNCHER's visibility: the `td-builder' realize process is in
+/proc iff the build shares the loop's pid namespace; absent iff the build has its
+own. Holds under guix-daemon (no td-builder there) and td-with-NEWPID; fails under
+td-without-NEWPID.
+
+DURABLE / behavioral, no guix oracle leg (it asserts the loop's process tree is
+ABSENT from the build).
+
+Verified-red (recorded, 2026-06-20):
+- Minimal perturbation (drop only `| sys::CLONE_NEWPID`, keep the fresh-procfs
+  mount): `./check.sh build-hermetic` FAILS at the procfs mount itself —
+  `spawning builder …/guile: Operation not permitted` — because a fresh procfs
+  cannot be mounted for a pid namespace whose owning user namespace isn't the
+  build's. Proves NEWPID and the fresh /proc are coupled and load-bearing, but it
+  errors BEFORE the probe runs.
+- Clean perturbation (revert sandbox.rs to the pre-increment-6 state: no NEWPID +
+  /proc rbind'd, via `git checkout origin/main -- builder/src/sandbox.rs`): the
+  build RUNS and the probe itself reds — `LEAK: the launching td-builder is visible
+  in /proc … comms= ("make" "td-builder" "guile" "bash")`. So the new assertion is
+  non-vacuous and the pid-ns isolation is load-bearing. Note only 4 loop processes
+  were visible — a /proc pid-count threshold would have been unreliable; the
+  launcher-name discriminator is correct. Restored → green (both legs pass).
+
 ## Next
 
-- NEWPID + a fresh /proc reflecting the build's own pid namespace (S4 parity).
 - A minimal-/dev builder for the standalone (no outer host_shell) daemon case.
 - A persistent daemon mode the loop invokes by default instead of guix-daemon.
 - A network-present daemon harness → fully differential offline-isolation.
