@@ -65,8 +65,11 @@ Mes-style — is the alternative, bigger.)
   no RUNPATH, so it sidesteps relocation) at `/td/store/<base>`, enter the store-ns, run it, and
   assert **`/gnu/store` is ABSENT** inside (isolated from the guix install). Proves the
   `/td/store` own-root works and is unmixed from guix — the scaffolding everything else runs in.
-- **Phase 1 — `STORE_DIR` configurable** (`TD_STORE_DIR`, default `/gnu/store`): the small,
-  additive enabler so builds can target `/td/store`.
+- **Phase 1 — `STORE_DIR` configurable** [DONE]: `store::store_dir()` reads `TD_STORE_DIR`
+  (default `/gnu/store`); the prefix is threaded into the hash (`make_store_path_in`) + the
+  recognise sites (`main.rs`). Re-prefixing **re-hashes** — `/td/store` is a DISTINCT store,
+  not a rename (unit test `re_prefix_changes_the_path_and_the_hash`). Default unchanged, so
+  every existing gate is untouched. The additive enabler builds target `/td/store` through.
 - **Phase 2 — seed relocation to `/td/store`** (the hard core): a `td seed-relocate` that turns
   the `/gnu/store` seed into a `/td/store` seed (re-hash + patch). Then a *dynamic* binary runs
   from `/td/store` — and a build with `TD_STORE_DIR=/td/store` produces native `/td/store` content.

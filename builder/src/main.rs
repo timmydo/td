@@ -256,7 +256,7 @@ fn build_and_register(
     // that is drv_path; for an emitted .drv handed in from outside the store,
     // compute its content-addressed store path so the registration matches the
     // daemon's recorded deriver.
-    let deriver = if drv_path.starts_with(store::STORE_DIR) {
+    let deriver = if drv_path.starts_with(store::store_dir().as_str()) {
         drv_path.to_string()
     } else {
         let out0 = parsed
@@ -538,7 +538,7 @@ fn realize_drv(
                 return e;
             }
             if let Some(ts) = td_store {
-                if let Some(base) = e.strip_prefix(store::STORE_DIR).and_then(|s| s.strip_prefix('/')) {
+                if let Some(base) = e.strip_prefix(store::store_dir().as_str()).and_then(|s| s.strip_prefix('/')) {
                     let on_disk = ts.join(base);
                     if on_disk.exists() {
                         return format!("{e}\t{}", on_disk.display());
