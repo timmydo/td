@@ -3100,8 +3100,8 @@ fn main() -> ExitCode {
                 // PID namespace, so the host /proc never leaks in and nested
                 // containers see a private /proc.
                 let mut binds = vec![
-                    sandbox::Bind { src: "/gnu/store".to_string(), readonly: true, ro_optional: false },
-                    sandbox::Bind { src: "/var/guix".to_string(), readonly: false, ro_optional: false },
+                    sandbox::Bind { src: "/gnu/store".to_string(), dest: None, readonly: true, ro_optional: false },
+                    sandbox::Bind { src: "/var/guix".to_string(), dest: None, readonly: false, ro_optional: false },
                 ];
                 let mut tmpfs = vec!["/tmp".to_string()];
                 let mut path_env = String::new();
@@ -3116,7 +3116,7 @@ fn main() -> ExitCode {
                     // cgroup hierarchy (ro, for crun), and the guix lowering cache
                     // (rw, check.sh --shares it). HOME is a dir on the writable
                     // root tmpfs (created by these binds), so no HOME tmpfs.
-                    binds.push(sandbox::Bind { src: cwd.clone(), readonly: false, ro_optional: false });
+                    binds.push(sandbox::Bind { src: cwd.clone(), dest: None, readonly: false, ro_optional: false });
                     if Path::new("/sys/fs/cgroup").is_dir() {
                         // ro is defense-in-depth (crun probes the hierarchy with
                         // --cgroup-manager=disabled, never writing it). A child
@@ -3127,13 +3127,14 @@ fn main() -> ExitCode {
                         // locally, where the ro-remount succeeds.
                         binds.push(sandbox::Bind {
                             src: "/sys/fs/cgroup".to_string(),
+                            dest: None,
                             readonly: true,
                             ro_optional: true,
                         });
                     }
                     let cache = format!("{home}/.cache/guix");
                     if Path::new(&cache).is_dir() {
-                        binds.push(sandbox::Bind { src: cache, readonly: false, ro_optional: false });
+                        binds.push(sandbox::Bind { src: cache, dest: None, readonly: false, ro_optional: false });
                     }
                     path_env = std::env::var("PATH").unwrap_or_default();
                     workdir = cwd;
@@ -3168,6 +3169,52 @@ fn main() -> ExitCode {
                 Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
                 Err(e) => {
                     eprintln!("td-builder: host-sandbox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-builder store-ns — OWN ROOT, td's OWN store at /td/store, NO guix (user-pm
+        // Phase 0; human 2026-06-21: break from guix's /gnu/store, not mixed with the local
+        // guix install). Enter a user namespace pivoted into a minimal td-owned root
+        // (host_shell's fresh-tmpfs root + minimal /dev + private /proc), bind STORE-DIR at
+        // `/td/store`, and bind NOTHING from /gnu/store or /var/guix — so inside, `/td/store`
+        // IS the store (= STORE-DIR) and the host `/gnu/store` + guix install are ABSENT. A
+        // static binary in STORE-DIR runs by absolute path; dynamic content needs the seed
+        // relocated to /td/store (Phase 2). Rootless (no daemon, no root), unmixed from guix.
+        //   store-ns STORE-DIR -- CMD ARGS...
+        Some("store-ns") if args.len() >= 5 && args[3] == "--" => {
+            let store_dir = args[2].clone();
+            let cmd = args[4].clone();
+            let cmd_args: Vec<String> = args[5..].to_vec();
+            let run = || -> Result<std::process::ExitStatus, String> {
+                if !Path::new(&store_dir).is_dir() {
+                    return Err(format!("store dir `{store_dir}' does not exist"));
+                }
+                // The ONLY bind: the user store at td's prefix. No /gnu/store, no /var/guix.
+                let binds = vec![sandbox::Bind {
+                    src: store_dir,
+                    dest: Some("/td/store".to_string()),
+                    readonly: true,
+                    ro_optional: false,
+                }];
+                let tmpfs = vec!["/tmp".to_string()];
+                let home = "/tmp".to_string();
+                let path_env = "/td/store/bin".to_string();
+                let scratch = std::env::temp_dir()
+                    .join(format!("td-store-ns-{}-{}", sys::getuid(), std::process::id()));
+                let _ = std::fs::remove_dir_all(&scratch);
+                std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+                let result = sandbox::host_shell(
+                    &cmd, &cmd_args, &binds, &tmpfs, &path_env, &home, "", &[], &scratch,
+                )
+                .map_err(|e| e.to_string());
+                let _ = std::fs::remove_dir_all(&scratch);
+                result
+            };
+            match run() {
+                Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+                Err(e) => {
+                    eprintln!("td-builder: store-ns: {e}");
                     ExitCode::FAILURE
                 }
             }
