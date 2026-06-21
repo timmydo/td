@@ -302,6 +302,10 @@ map_path() {
       add_preflight shell-syntax
       add_target seed-build ;;
 
+    tests/corpus-seed.sh)
+      add_preflight shell-syntax
+      add_target corpus-seed ;;
+
     tests/guix-dependence.*)
       add_target guix-dependence ;;
 

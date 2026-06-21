@@ -70,11 +70,17 @@ the guix-built seed from the lock and stage it out of the live `/gnu/store`).
   pins hello's seed manifest hash and the seed-build gate asserts the warmed seed matches it
   (DURABLE repro: the toolchain seed is reproducible + channel-anchored). Verified-red: a
   corrupted pin reds the repro leg.
-- 2026-06-21: `td shell` routed onto the seed — the user-facing payoff. With a warmed seed
-  (TD_SEED_STORE/TD_SEED_DB) `td shell hello -- hello` builds td's hello from the frozen seed
-  as its ONLY store DB; new `td-shell-seed` gate proves no guix process AND no /var/guix. No
-  code change (run_shell's build-recipe child inherits the #133 seed-store override).
+- 2026-06-21: `td shell` routed onto the seed (#136) — the user-facing payoff. With a warmed
+  seed (TD_SEED_STORE/TD_SEED_DB) `td shell hello -- hello` builds td's hello from the frozen
+  seed as its ONLY store DB; the `td-shell-seed` gate proves no guix process AND no /var/guix.
+  No code change (run_shell's build-recipe child inherits the #133 seed-store override).
   Verified-red: dropping TD_SEED_* (build from /var/guix) reds the "every input from the seed
   store" structural leg.
-- Remaining for full guix independence (later): route the CORPUS build gates onto the warmed
-  seed (so the WHOLE loop builds with no guix install); retire the guix oracle/lowering (step 3).
+- 2026-06-21: corpus-seed — ONE warmed seed builds MULTIPLE corpus packages. New `corpus-seed`
+  gate warms one shared seed (union of the packages' closures) and builds two different leaf
+  corpus tools (hello + which) from source, each with the seed as its only store DB (no guix
+  install); the seed scales to the corpus (one seed, many builds). No code change (build-recipe
+  seed mode). Verified-red: building `which` from hello's seed (missing which-source) fails.
+- Remaining for full guix independence (later): CHAINED corpus packages need `build-plan` seed
+  support (intricate: the seed must unpack into the shared tdstore the chaining stages from) —
+  the next, more careful step; then retire the guix oracle/lowering (step 3, last).
