@@ -119,7 +119,24 @@ Reported to the human for a steer (the resolution is a CI-image-policy design de
 
 ## Verified-red log
 
-(to be filled)
+### Increment 1 — rust-seed gate (2026-06-21)
+
+- **Green** (`8c2091f`): `./check.sh rust-seed` EXIT=0. Captured + unpacked the rust
+  toolchain seed (54 paths / 2.0G); seed-built td-builder staged every input from the
+  unpacked seed (none bare /gnu/store), runs + matches stage0, reproducible (td-builder
+  check double-build), and lands at the same path as the guix-seed build.
+- **Verified-red** (perturbation: after seed-unpack, `rm -rf` the rust-1.93.0 tree from
+  the unpacked seed store): `./check.sh rust-seed` EXIT=2 — the build escaped to the live
+  `/gnu/store` for the missing rust, and the STRUCTURAL leg caught it:
+  `FAIL: an input staged from the live /gnu/store, not the seed: …-rust-1.93.0`.
+  Proves the structural "none-bare-/gnu/store" assertion is load-bearing and non-vacuous
+  (an incomplete seed cannot silently pass by using the live store). Reverted; tree clean.
+  Note: the rust tree was removed from the store but left in seed.db, so the build still
+  ran (rust present at the canonical /gnu/store on the dev host) — the structural leg is
+  the durable guard. On a true no-/gnu/store host the build would also fail outright.
+
+Increment 1 sub-tasks 1–5 DONE (capture → unpack → build-from-seed; durable
+structural/behavioral/repro + removable oracle; verified-red recorded).
 
 ## Notes
 

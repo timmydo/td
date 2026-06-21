@@ -26,7 +26,8 @@
 #                         binds on-disk under DEST-STORE, none bare-/gnu/store); the .drv
 #                         builder is the td-bootstrapped stage0.
 #   [DURABLE behavioral]  the seed-built td-builder RUNS (nar-hash) and agrees with the
-#                         guix-built one.
+#                         stage0 td-builder (both td-built — no guix-built oracle, so the
+#                         guix-surface ratchet does not grow).
 #   [DURABLE repro]       td-builder check's double-build agrees the output is reproducible.
 #   [REMOVABLE oracle]    the seed-built td-builder == the guix-seed build (same drv —
 #                         own, then diverge: provenance changed, output didn't).
