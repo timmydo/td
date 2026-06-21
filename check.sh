@@ -201,6 +201,13 @@ toolchain=$(guix shell --no-substitutes --no-offload \
 # `rootless` rung binds it into its staged store. The first PATH entry is the
 # profile's bin; its parent is the profile root.
 guix_env=$(dirname "${toolchain%%:*}")
+# --- Seed warm: td OWNS fetching the tsgo tarball (move-off-Guile §5) -----------
+# The offline loop's gates read the pinned tsgo tarball (tests/td-tsgo.lock) instead of
+# `guix build -e '(@ (system td-ts) td-tsgo-tarball)'`. The blob is fetched by td's OWN
+# fetcher (td-fetch) here on the HOST (network), exactly where the daemon also fetches
+# fixed-output seeds — the in-sandbox loop never egresses. Idempotent + near-instant once
+# the store path is warm; only a cold machine pays the one-time fetch (+ td-fetch build).
+sh tools/warm-tsgo.sh || { echo "check.sh: FATAL: could not warm the tsgo tarball (tools/warm-tsgo.sh)." >&2; exit 1; }
 exec env \
   PATH="$hostguix_dir:$toolchain" \
   GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \

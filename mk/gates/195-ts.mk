@@ -13,7 +13,7 @@ FAST_GATES += ts
 ts:
 	@echo ">> ts: TypeScript spec front-end — the NATIVE tsc (td-tsgo) type-checks + emits the v0 spec, NO node (ts-frontend Phase 1; tsgo migration)"
 	@set -euo pipefail; \
-	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
+	tsgo=`sh tests/tsgo.sh`; \
 	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo (native compiler)" >&2; exit 1; }; \
 	TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" \
 	  sh tests/ts-check.sh

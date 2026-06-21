@@ -31,7 +31,7 @@ BUILD_GATES += corpus-deps-no-guix
 corpus-deps-no-guix:
 	@echo ">> corpus-deps-no-guix: td builds libsigsegv + libunistring + pcre2 + ncurses + readline via build-recipe (no guix/Guile in the build path); each links+runs from td's own output, reproducible, distinct from guix"
 	@set -euo pipefail; \
-	tgz=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-tsgo-tarball)'`; tsgo=`sh tests/tsgo.sh "$$tgz"`; \
+	tsgo=`sh tests/tsgo.sh`; \
 	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }; \
 	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/pcre2-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \

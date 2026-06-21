@@ -204,6 +204,11 @@ map_path() {
     fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock)
       add_target rust-fetch ;;
 
+    tests/td-tsgo.lock|tests/tsgo.sh|tools/warm-tsgo.sh)
+      add_preflight shell-syntax
+      add_target tsgo-pin
+      add_target ts ;;
+
     tests/ts/recipe-*-perturbed.ts)
       spec=${p##*/recipe-}
       spec=${spec%-perturbed.ts}
