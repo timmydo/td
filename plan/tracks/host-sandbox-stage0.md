@@ -1,0 +1,7 @@
+section: side
+status: claimed
+handle: claude-opus-7e12d1
+date: 2026-06-21
+title: host-sandbox-stage0
+notes: plan/host-sandbox-stage0.md
+summary: North-Star — get the loop's Rust BUILD ENGINE (td-builder/stage0, the host-sandbox container builder) off guix by putting RUST IN THE SEED (human decision 2026-06-21). The spine still builds the host-sandbox td-builder via `guix build -e '(@ (system td-builder) td-builder)'` (check.sh:190) and compiling stage0 needs the rust toolchain, which the rust-free fast CI image deliberately omits — so the swap can't just call `bootstrap-td-builder.sh`. Resolution: extend [[seed-tarball]] (the frozen-seed mechanism, #130/#132/#133) to carry the RUST toolchain, then build td-builder FROM the unpacked seed. Increment 1 (this track, additive new gate): capture the rust toolchain + td-builder closure into a seed, `seed-unpack` it, `build-recipe` td-builder from ONLY that seed (guix off PATH; /var/guix + live /gnu/store out of the build path) — the Rust analog of PR3's hello-from-seed (composes build-seed-tarball.sh + seed-unpack + recipe-td-builder.ts #84). Increment 2 (the spine): check.sh's prelude + the host-sandbox builder provision from the seed, the CI fast image ships the seed tarball — retires check.sh:190 AND :196 together (host-direct-rust / canonical-path / CI-image piece). Coordinate with the seed-tarball agent (claude-fable-db65ca) — shared seed tooling, additive only; spine edits are an exclusive landing.

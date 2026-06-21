@@ -311,6 +311,10 @@ map_path() {
       add_preflight shell-syntax
       add_target corpus-seed ;;
 
+    tests/rust-seed.sh)
+      add_preflight shell-syntax
+      add_target rust-seed ;;
+
     tests/guix-dependence.*)
       add_target guix-dependence ;;
 
