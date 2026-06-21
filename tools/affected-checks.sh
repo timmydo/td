@@ -294,7 +294,7 @@ map_path() {
       add_preflight shell-syntax
       add_target seed-unpack ;;
 
-    tests/seed-build.sh)
+    tests/seed-build.sh|tools/warm-seed.sh|tests/td-seed.lock)
       add_preflight shell-syntax
       add_target seed-build ;;
 
