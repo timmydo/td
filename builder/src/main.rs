@@ -56,6 +56,31 @@ fn nar_hash(path: &str) -> Result<String, std::io::Error> {
     nar_hash_path(Path::new(path))
 }
 
+/// Adapter: hash AND count the NAR bytes in one serialization pass (the seed
+/// manifest needs both the NAR hash and the NAR size — the daemon's `narSize`).
+struct HashSizeWriter {
+    hasher: sha256::Sha256,
+    size: u64,
+}
+
+impl std::io::Write for HashSizeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        self.size += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The (NAR hash, NAR size) of a path — one serialization pass.
+fn nar_hash_size_path(path: &Path) -> Result<(String, u64), std::io::Error> {
+    let mut w = HashSizeWriter { hasher: sha256::Sha256::new(), size: 0 };
+    nar::write_nar(&mut w, path)?;
+    Ok((format!("sha256:{}", sha256::to_base16(&w.hasher.finalize())), w.size))
+}
+
 /// The `path` column (index 1) of a read `ValidPaths` row, or "" if absent.
 fn path_at(cols: &[store_db_read::Value]) -> &str {
     match cols.get(1) {
@@ -1762,6 +1787,176 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: store-closure {db_path} {root}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // seed-manifest: emit the MANIFEST for a seed closure — the capture half of the
+        // frozen seed tarball (North-Star step 2). For the GC closure of ROOT… over DB's
+        // Refs graph, print one line per member: `<path> <nar-hash> <nar-size> <ref,ref,…>`
+        // (direct refs sorted; `-` if none), all from td's OWN reader + NAR serializer (no
+        // daemon). The capture tool tars the same closure; `seed-unpack` restores + registers
+        // from this manifest. Usage: seed-manifest DB ROOT...
+        Some("seed-manifest") if args.len() >= 4 => {
+            let db_path = &args[2];
+            let roots = &args[3..];
+            let run = || -> Result<Vec<String>, String> {
+                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+                let db = store_db_read::Db::open(bytes)?;
+                let mut closure = std::collections::BTreeSet::new();
+                for r in roots {
+                    for p in db.closure(r)? {
+                        closure.insert(p);
+                    }
+                }
+                let refs = db.refs_by_path()?;
+                let mut lines = Vec::new();
+                for p in &closure {
+                    let (hash, size) =
+                        nar_hash_size_path(Path::new(p)).map_err(|e| format!("nar of {p}: {e}"))?;
+                    let mut rs: Vec<String> = refs.get(p).cloned().unwrap_or_default();
+                    rs.sort();
+                    rs.dedup();
+                    let refstr = if rs.is_empty() { "-".to_string() } else { rs.join(",") };
+                    lines.push(format!("{p} {hash} {size} {refstr}"));
+                }
+                Ok(lines)
+            };
+            match run() {
+                Ok(lines) => {
+                    for l in lines {
+                        println!("{l}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: seed-manifest: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // seed-unpack: RESTORE a frozen seed tarball into a td-owned store + register it
+        // from the manifest — North-Star step 2, so the loop has the toolchain seed with NO
+        // guix install. Extracts TARBALL into DEST-STORE (the canonical `/gnu/store/<base>`
+        // trees land at `DEST-STORE/gnu/store/<base>`), VERIFIES each restored tree's NAR
+        // hash equals the manifest (the seed survived the tarball, byte-for-byte), and writes
+        // DEST-DB (ValidPaths + Refs) FROM the manifest — no re-scan (the live /gnu/store is
+        // read-only in the loop), no daemon. Usage:
+        //   seed-unpack TARBALL MANIFEST DEST-STORE DEST-DB
+        Some("seed-unpack") if args.len() == 6 => {
+            let (tarball, manifest, dest_store, dest_db) =
+                (&args[2], &args[3], &args[4], &args[5]);
+            let run = || -> Result<usize, String> {
+                use store_db::{Table, Value};
+                // Parse the manifest: `<path> <nar-hash> <nar-size> <ref,ref,…>`.
+                let text = std::fs::read_to_string(manifest)
+                    .map_err(|e| format!("read manifest {manifest}: {e}"))?;
+                struct Entry {
+                    path: String,
+                    hash: String,
+                    size: u64,
+                    refs: Vec<String>,
+                }
+                let mut entries: Vec<Entry> = Vec::new();
+                for (i, line) in text.lines().enumerate() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let f: Vec<&str> = line.split(' ').collect();
+                    if f.len() != 4 {
+                        return Err(format!("manifest:{}: want `PATH HASH SIZE REFS', got `{line}'", i + 1));
+                    }
+                    let refs = if f[3] == "-" {
+                        Vec::new()
+                    } else {
+                        f[3].split(',').map(str::to_string).collect()
+                    };
+                    entries.push(Entry {
+                        path: f[0].to_string(),
+                        hash: f[1].to_string(),
+                        size: f[2].parse().map_err(|_| format!("manifest:{}: bad size", i + 1))?,
+                        refs,
+                    });
+                }
+                if entries.is_empty() {
+                    return Err("manifest is empty".into());
+                }
+                // Extract the tar into DEST-STORE (its members are `gnu/store/<base>`).
+                std::fs::create_dir_all(dest_store).map_err(|e| e.to_string())?;
+                let ok = Command::new("tar")
+                    .args(["xf", tarball, "-C", dest_store])
+                    .status()
+                    .map_err(|e| format!("spawn tar: {e}"))?
+                    .success();
+                if !ok {
+                    return Err(format!("tar xf {tarball} -C {dest_store} failed"));
+                }
+                // Verify every restored tree is NAR-identical to the manifest.
+                for e in &entries {
+                    let on_disk = format!("{dest_store}{}", e.path); // DEST-STORE + /gnu/store/<base>
+                    let got = nar_hash_path(Path::new(&on_disk))
+                        .map_err(|err| format!("nar-hash {on_disk}: {err}"))?;
+                    if got != e.hash {
+                        return Err(format!(
+                            "NAR mismatch after restore for {} (restored={got} manifest={})",
+                            e.path, e.hash
+                        ));
+                    }
+                }
+                // Register DEST-DB from the manifest: rowids in manifest order, Refs by id.
+                let id_of: std::collections::HashMap<&str, i64> = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (e.path.as_str(), i as i64 + 1))
+                    .collect();
+                let mut valid: Vec<(i64, Vec<Value>)> = Vec::with_capacity(entries.len());
+                let mut ref_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+                let mut ref_rowid = 1i64;
+                for e in &entries {
+                    let id = id_of[e.path.as_str()];
+                    valid.push((
+                        id,
+                        vec![
+                            Value::Null,
+                            Value::Text(e.path.clone()),
+                            Value::Text(e.hash.clone()),
+                            Value::Int(1), // registrationTime sentinel
+                            Value::Null,   // deriver: a seed has none
+                            Value::Int(e.size as i64),
+                        ],
+                    ));
+                    for r in &e.refs {
+                        let rid = *id_of.get(r.as_str()).ok_or_else(|| {
+                            format!("reference `{r}' of {} is not in the manifest", e.path)
+                        })?;
+                        ref_rows.push((ref_rowid, vec![Value::Int(id), Value::Int(rid)]));
+                        ref_rowid += 1;
+                    }
+                }
+                let tables = [
+                    Table {
+                        name: "ValidPaths",
+                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+                        rows: valid,
+                    },
+                    Table {
+                        name: "Refs",
+                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+                        rows: ref_rows,
+                    },
+                ];
+                std::fs::write(dest_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+                Ok(entries.len())
+            };
+            match run() {
+                Ok(n) => {
+                    eprintln!("td-builder: seed-unpack restored + registered {n} seed paths (NAR-verified, no daemon)");
+                    println!("{n}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: seed-unpack: {e}");
                     ExitCode::FAILURE
                 }
             }

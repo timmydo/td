@@ -23,24 +23,18 @@ tb="${TB:-td-builder}"
 test -x "$tb" || command -v "$tb" >/dev/null 2>&1 || { echo "build-seed-tarball: no td-builder ($tb)" >&2; exit 1; }
 mkdir -p "$out"
 
-# 1. closure of every ROOT over the Refs graph (td's own reader), unioned + sorted.
-: > "$out/closure.txt"
 for r in "$@"; do
   case "$r" in /gnu/store/*) : ;; *) echo "build-seed-tarball: ROOT '$r' is not a store path" >&2; exit 2 ;; esac
-  "$tb" store-closure "$db" "$r" >> "$out/closure.txt" \
-    || { echo "build-seed-tarball: store-closure failed for $r" >&2; exit 1; }
 done
-sort -u "$out/closure.txt" -o "$out/closure.txt"
-n=`grep -c . "$out/closure.txt" || true`
-test "$n" -ge 1 || { echo "build-seed-tarball: empty closure" >&2; exit 1; }
 
-# 2. manifest: each member's NAR hash (td's own serializer).
-: > "$out/seed.manifest"
-while IFS= read -r p; do
-  [ -n "$p" ] || continue
-  h=`"$tb" nar-hash "$p"` || { echo "build-seed-tarball: nar-hash failed for $p" >&2; exit 1; }
-  printf '%s %s\n' "$p" "$h" >> "$out/seed.manifest"
-done < "$out/closure.txt"
+# 1+2. manifest: `<path> <nar-hash> <nar-size> <ref,…>` per closure member — td's own
+#      store-closure + NAR serializer + Refs reader (no daemon). seed-unpack consumes it.
+"$tb" seed-manifest "$db" "$@" > "$out/seed.manifest" \
+  || { echo "build-seed-tarball: seed-manifest failed" >&2; exit 1; }
+n=`grep -c . "$out/seed.manifest" || true`
+test "$n" -ge 1 || { echo "build-seed-tarball: empty closure" >&2; exit 1; }
+# The tar file-list is column 1 of the manifest (the closure members, sorted).
+cut -d' ' -f1 "$out/seed.manifest" > "$out/closure.txt"
 
 # 3. tar every member's tree (absolute /gnu/store/<base> paths; extract with `-C DEST`).
 tar cf "$out/seed.tar" --files-from="$out/closure.txt" \

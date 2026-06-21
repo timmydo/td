@@ -52,7 +52,7 @@ echo "   [DURABLE structural] manifest covers the complete closure ($n == $exp p
 mkdir -p "$work/dest"
 tar xf "$work/cap/seed.tar" -C "$work/dest" || fail "could not extract seed.tar"
 checked=0
-while read -r p h; do
+while read -r p h _size _refs; do
   [ -n "$p" ] || continue
   rebased="$work/dest$p"
   test -e "$rebased" || fail "seed.tar is missing $p"
