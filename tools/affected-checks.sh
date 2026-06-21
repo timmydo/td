@@ -143,6 +143,8 @@ map_recipe_spec() {
       add_target rust-uutils ;;
     uutils)
       add_target rust-coreutils ;;
+    youki)
+      add_target rust-youki ;;
     td-fetch)
       add_target rust-fetch ;;
     perturbed)
@@ -245,6 +247,9 @@ map_path() {
 
     tests/uutils-coreutils.lock)
       add_target rust-coreutils ;;
+
+    tests/youki.lock)
+      add_target rust-youki ;;
 
     tests/td-fetch.lock)
       add_target rust-fetch ;;
@@ -496,6 +501,8 @@ run_self_test() {
   assert_target tests/td-cmake-demo.lock cmake
   assert_target tests/ts/recipe-uutils.ts rust-coreutils
   assert_target tests/uutils-coreutils.lock rust-coreutils
+  assert_target tests/ts/recipe-youki.ts rust-youki
+  assert_target tests/youki.lock rust-youki
   assert_target tests/cmake-demo/CMakeLists.txt cmake
   assert_target tests/ts/recipe-perturbed.ts drv-emit
   assert_target tests/guix-surface.sh guix-surface

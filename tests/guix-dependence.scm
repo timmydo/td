@@ -79,7 +79,9 @@
 ;; uutils joins them: the FULL uutils coreutils multicall (crate `coreutils` 0.9.0),
 ;; td-built from source — named "uutils" NOT "coreutils" precisely so it does not
 ;; resolve to GNU coreutils' oracle; its own-builder proof is the `rust-coreutils` gate.
-(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval" "td-cmake-demo" "td-fetch" "uutils"))
+;; youki joins them: the Rust OCI container runtime (crate `youki` 0.6.0), td-built from
+;; source — a new capability with no corpus oracle; its proof is the `rust-youki` gate.
+(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval" "td-cmake-demo" "td-fetch" "uutils" "youki"))
 
 (define owned-specs
   (sort
