@@ -16,6 +16,7 @@
 //!   • S4 — the daemon-vs-td-builder store differential, as a check.sh rung.
 
 mod build;
+mod build_daemon;
 mod daemon;
 mod drv;
 mod json;
@@ -2459,6 +2460,55 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: realize {drv_path}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-builder daemon — td's OWN persistent build daemon: a long-running
+        // process that realizes derivations served over a Unix socket, instead of
+        // guix-daemon (own-builder-daemon track). Each request realizes via the
+        // exact `realize_drv` path (same sandbox/NEWPID, daemon-free) into a fresh
+        // per-request scratch dir; the response carries the realized output's
+        // canonical store path + its host-side path under that scratch. Usage:
+        //   daemon SOCKET STORE-DB SCRATCH-BASE
+        Some("daemon") if args.len() == 5 => {
+            let (socket, store_db, scratch) = (&args[2], &args[3], &args[4]);
+            let realize = |drv: &str, scr: &Path| -> Result<(String, String), String> {
+                let regs =
+                    realize_drv(drv, std::slice::from_ref(store_db), scr, None, None, None)?;
+                let first = regs.first().ok_or_else(|| "realize produced no outputs".to_string())?;
+                let canon = first.store_path.clone();
+                let base = canon
+                    .strip_prefix("/gnu/store/")
+                    .ok_or_else(|| format!("{canon}: not a store path"))?;
+                let host = scr.join("newstore").join(base);
+                Ok((canon, host.to_string_lossy().into_owned()))
+            };
+            match build_daemon::serve(socket, realize, Path::new(scratch)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: daemon: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-builder daemon-request — the in-process client for `daemon` (so a
+        // caller needs no nc/socat): connect to SOCKET, send DRV, print the daemon's
+        // single-line response and exit 0 only on "OK …". Usage:
+        //   daemon-request SOCKET DRV
+        Some("daemon-request") if args.len() == 4 => {
+            let (socket, drv) = (&args[2], &args[3]);
+            match build_daemon::request(socket, drv) {
+                Ok(resp) => {
+                    println!("{resp}");
+                    if resp.starts_with("OK ") {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => {
+                    eprintln!("td-builder: daemon-request: {e}");
                     ExitCode::FAILURE
                 }
             }
