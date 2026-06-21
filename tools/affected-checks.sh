@@ -286,6 +286,10 @@ map_path() {
       add_preflight shell-syntax
       add_target td-shell ;;
 
+    tests/seed-tarball.sh|tools/build-seed-tarball.sh)
+      add_preflight shell-syntax
+      add_target seed-tarball ;;
+
     tests/guix-dependence.*)
       add_target guix-dependence ;;
 
