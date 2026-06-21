@@ -42,21 +42,33 @@ sort -u "$work/roots" -o "$work/roots"
 grep ' /gnu/store/' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | sort -u | xargs guix build >/dev/null \
   || fail "could not realize hello's seed closure"
 
-# CAPTURE -> tar + manifest, then UNPACK into a fresh td store (no daemon).
-TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/build-seed-tarball.sh "$work/cap" `cat "$work/roots"` >/dev/null \
-  || fail "build-seed-tarball failed"
-ns=`grep -c . "$work/cap/seed.manifest"`
-"$TB" seed-unpack "$work/cap/seed.tar" "$work/cap/seed.manifest" "$work/store" "$work/seed.db" >/dev/null \
-  || fail "seed-unpack failed"
-echo "   captured + unpacked hello's full seed: $ns paths (`du -h "$work/cap/seed.tar" | cut -f1`)"
+# WARM the seed: capture + unpack ONCE into a reusable content-addressed cache (no 660M
+# re-capture per run). Prints `<TD_SEED_STORE> <TD_SEED_DB> <MANIFEST>`.
+seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$(pwd)/.td-build-cache/seed" $(cat "$work/roots")` \
+  || fail "warm-seed failed"
+SEED_STORE=`echo "$seedline" | cut -d' ' -f1`
+SEED_DB=`echo "$seedline" | cut -d' ' -f2`
+SEED_MANIFEST=`echo "$seedline" | cut -d' ' -f3`
+test -d "$SEED_STORE" -a -s "$SEED_DB" -a -s "$SEED_MANIFEST" || fail "warm-seed produced no usable seed"
+ns=`grep -c . "$SEED_MANIFEST"`
+echo "   warmed seed: $ns paths (`du -sh "$SEED_STORE/.." 2>/dev/null | cut -f1`), cached at $SEED_STORE"
 
-# --- Leg A: DURABLE behavioral — build hello from the unpacked seed ONLY -------
+# [DURABLE repro] the seed manifest hash matches the pin — the seed is REPRODUCIBLE +
+# channel-anchored (a channel bump changes it ⇒ re-pin: TD_SEED_WRITE=1 ./check.sh seed-build).
+seedhash=`sha256sum < "$SEED_MANIFEST" | cut -d' ' -f1`
+if [ -n "${TD_SEED_WRITE:-}" ]; then printf '%s\n' "$seedhash" > tests/td-seed.lock; echo "   WROTE pin tests/td-seed.lock = $seedhash"; fi
+test -s tests/td-seed.lock || fail "tests/td-seed.lock missing — baseline first: TD_SEED_WRITE=1 ./check.sh seed-build"
+pin=`cat tests/td-seed.lock`
+test "$seedhash" = "$pin" || fail "seed manifest hash $seedhash != pinned $pin (toolchain seed drifted; re-pin with TD_SEED_WRITE=1 on a deliberate channel bump)"
+echo "   [DURABLE repro] seed manifest hash matches the pin (reproducible, channel-anchored)"
+
+# --- Leg A: DURABLE behavioral — build hello from the warmed seed ONLY ---------
 sh tests/ts-emit.sh tests/ts/recipe-hello.ts > "$work/hello.json" || fail "ts-emit hello"
 mkdir -p "$work/b"
 env -i HOME="$work" TMPDIR="$work" PATH="$cu/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-  TD_SEED_STORE="$work/store/gnu/store" TD_SEED_DB="$work/seed.db" \
-  "$TB" build-recipe "$work/hello.json" tests/hello-no-guix.lock "$work/b" "$work/seed.db" \
+  TD_SEED_STORE="$SEED_STORE" TD_SEED_DB="$SEED_DB" \
+  "$TB" build-recipe "$work/hello.json" tests/hello-no-guix.lock "$work/b" "$SEED_DB" \
   > "$work/out" 2>"$work/err" \
   || { tail -20 "$work/err" >&2; fail "build hello from the unpacked seed FAILED (seed not self-sufficient?)"; }
 out=`sed -n 's/^OUT=out //p' "$work/out"`
@@ -68,8 +80,8 @@ echo "   [DURABLE behavioral] hello BUILT from the unpacked seed (store DB = the
 
 # --- Leg B: DURABLE structural — the build staged inputs FROM the unpacked store
 test -s "$work/b/closure.txt" || fail "no closure.txt from the build"
-grep -q "	$work/store/gnu/store/" "$work/b/closure.txt" \
-  || fail "the build did not stage any input from the unpacked seed store ($work/store)"
+grep -q "	$SEED_STORE/" "$work/b/closure.txt" \
+  || fail "the build did not stage any input from the warmed seed store ($SEED_STORE)"
 # and NO bare seed input was left pointing at the live /gnu/store with no on-disk override
 bare=`grep -v '	' "$work/b/closure.txt" | grep '^/gnu/store/' | grep -v "^$out$" | head -1 || true`
 test -z "$bare" || fail "an input was staged from the live /gnu/store, not the seed: $bare"

@@ -65,6 +65,11 @@ the guix-built seed from the lock and stage it out of the live `/gnu/store`).
   seed-built hello == the guix-seed build (same drv). Verified-red: VR1 — build from an
   incomplete seed FAILS (no guix fallback; the build is bounded by the seed).
   **Step 2 demo complete: td builds with no guix install.**
-- Remaining for full guix independence (later tracks): wire the locks/cache-lib to resolve
-  the seed from a PINNED tarball (`tests/td-seed.lock` + a `warm-seed.sh`) so the WHOLE loop
-  builds from it; route `td shell` onto the seed; retire the guix oracle/lowering (step 3).
+- 2026-06-21: warm + pin — `tools/warm-seed.sh` captures + seed-unpacks the seed ONCE into a
+  content-addressed cache and reuses it (no 660M re-capture per run); `tests/td-seed.lock`
+  pins hello's seed manifest hash and the seed-build gate asserts the warmed seed matches it
+  (DURABLE repro: the toolchain seed is reproducible + channel-anchored). Verified-red: a
+  corrupted pin reds the repro leg.
+- Remaining for full guix independence (later): route `td shell` + the corpus build onto the
+  warmed seed (so the WHOLE loop builds with no guix install); retire the guix oracle/lowering
+  (step 3, last).
