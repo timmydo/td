@@ -141,6 +141,8 @@ map_recipe_spec() {
       add_target cmake ;;
     cat)
       add_target rust-uutils ;;
+    uutils)
+      add_target rust-coreutils ;;
     td-fetch)
       add_target rust-fetch ;;
     perturbed)
@@ -235,6 +237,9 @@ map_path() {
 
     tests/cat-uutils.lock)
       add_target rust-uutils ;;
+
+    tests/uutils-coreutils.lock)
+      add_target rust-coreutils ;;
 
     tests/td-fetch.lock)
       add_target rust-fetch ;;
@@ -464,6 +469,8 @@ run_self_test() {
   assert_target tests/td-russh-demo.lock rust-russh
   assert_target tests/ts/recipe-td-cmake-demo.ts cmake
   assert_target tests/td-cmake-demo.lock cmake
+  assert_target tests/ts/recipe-uutils.ts rust-coreutils
+  assert_target tests/uutils-coreutils.lock rust-coreutils
   assert_target tests/cmake-demo/CMakeLists.txt cmake
   assert_target tests/ts/recipe-perturbed.ts drv-emit
   assert_target tests/guix-surface.sh guix-surface
