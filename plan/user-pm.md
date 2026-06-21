@@ -91,7 +91,10 @@ Mes-style — is the alternative, bigger.)
   Phase 0 (own-root `store-ns`) in progress on `td-store-ns`. Phases 1–3 (configurable prefix,
   seed relocation, corpus at /td/store) are the foundational break; the UX layer follows.
 
-## Verified-red (#138 profile)
+## Verified-red
 
-- VR1 — `build_profile` symlinks to a WRONG target → "profile/bin/hello did not greet". Reverted.
-- VR2 — drop the collision check → "collision not reported as a collision". Reverted.
+- profile (#138): VR1 — `build_profile` symlinks to a WRONG target → "profile/bin/hello did
+  not greet"; VR2 — drop the collision check → "collision not reported". Reverted.
+- store-ns (Phase 0): VR — make store-ns ALSO bind `/gnu/store` → "GNU-PRESENT" → the
+  "/gnu/store is PRESENT — mixed with the guix install!" leg reds (the unmixed-from-guix
+  assertion is real, not just /gnu/store happening to be absent). Reverted.

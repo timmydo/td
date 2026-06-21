@@ -299,6 +299,10 @@ map_path() {
       add_preflight shell-syntax
       add_target profile ;;
 
+    tests/store-ns.sh)
+      add_preflight shell-syntax
+      add_target store-ns ;;
+
     tests/seed-tarball.sh|tools/build-seed-tarball.sh)
       add_preflight shell-syntax
       add_target seed-tarball ;;
