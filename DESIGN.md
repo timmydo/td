@@ -343,11 +343,13 @@ Standing posture decisions; naming them prevents surprises.
   clock/randomness neutered, with lowering builtins (corpus lookup, store-path
   dependency capture) as Rust native functions. Evaluator rationale (boa vs
   javy) and the hermetic-eval design: `plan/ts-frontend.md`.
-- **Rust toolchain** *(decided 2026-06-11)*. Rust is the approved vehicle for
-  td-builder (§7.1). Building the toolchain from source is a **non-goal** right
-  now: the host store may be warmed with substitutes for the pinned channel's
-  Rust closure. The loop itself stays offline/no-substitutes as ever — warm
-  store in, nothing fetched inside.
+- **Rust toolchain** *(decided 2026-06-11; seed tarball 2026-06-20)*. Rust is the
+  approved vehicle for td-builder (§7.1). Building the rustc/gcc toolchain *from
+  source* is not required — but it is part of the **seed** that the North Star
+  freezes into the pinned binary **seed tarball** (so it stops being a live guix
+  dependency). Until that lands, the host store is warmed with the pinned
+  channel's Rust closure; either way the loop stays offline/no-substitutes — warm
+  store (eventually: the seed tarball) in, nothing fetched inside.
 - **Package collection — corpus + runtime independence is now a goal**
   *(re-decided 2026-06-12, human — the roadmap addition the prior posture
   invited).* The prior posture (Guix as a pinned corpus input, re-derivation a
@@ -356,15 +358,23 @@ Standing posture decisions; naming them prevents surprises.
   runtime level. Independence is source-level on *upstream projects*, not from
   scratch: td writes its own *recipes* pulling upstream *source* (kernel.org,
   GNU, …) — replacing the distro's packaging, not the software. Two bounds keep
-  this from boiling the ocean and stay **non-goals**:
-  - **General-purpose comprehensiveness.** The corpus is td's *target closure*
+  this from boiling the ocean:
+  - **General-purpose comprehensiveness** *(still a non-goal)*. The corpus is td's *target closure*
     — an appliance/image OS, Yocto/Buildroot scale (hundreds of packages), NOT
     a Nixpkgs-scale general distro.
-  - **Full-source bootstrap.** The seed/first toolchain stays **external** —
-    pulled as a pinned fixed-output input (an upstream binary, or even a Guix
-    bootstrap seed, is fine); stage0/Mes-style re-derivation remains out (human,
-    2026-06-12). "No distro dependency" governs what td *builds and runs*, not
-    where the first byte came from.
+  - **Seed toolchain — a frozen binary tarball, NOT a live guix dependency**
+    *(re-decided 2026-06-20, human — supersedes the 2026-06-12 "seed stays
+    external, full-source bootstrap out").* Full guix independence is now the goal
+    (CLAUDE.md "North star"): td must depend on **no guix process and no guix
+    install**. The first toolchain (gcc/glibc/binutils + the few build tools td
+    cannot yet self-build) is captured **once** into a pinned, content-addressed
+    **seed tarball** — it may be *generated from* a local guix install, but td then
+    depends on the tarball, never on a live guix, and regenerates it deliberately
+    (like a channel bump). "No distro dependency" now governs the **build/loop
+    itself**, not only what td builds and runs. A Mes-style full-source
+    re-derivation of the seed is *optional, later* — a refinement of where the
+    first bytes came from, no longer a non-goal and never a blocker for guix
+    independence.
 
   Phase 1 (`ts-frontend`, §7.1) replaces the spec *language* and keeps reading
   the pinned corpus underneath; corpus replacement is Phase 2, separately gated

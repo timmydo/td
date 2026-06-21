@@ -1,12 +1,19 @@
-# td-shell — `td-builder shell` is td's own `guix shell`: bring named packages
-# into a command's env and run it. The package layer stays on the guix oracle for
-# v1 (`guix build PKG`, retired last §5); the env composition + exec are td's own,
-# so the merit is DURABLE — the command runs with the package on PATH. tests/td-shell.sh
-# builds the td-builder under test as a guix-free STAGE0 (no packager site, so
-# guix-surface stays put) and asserts: behavioral (hello greets), structural (a
-# real store hello on the composed PATH), load-bearing (no package -> fail), and a
-# REMOVABLE guix-shell differential. Heavy (a stage0 compile), in the heavy pool.
+# td-shell — `td-builder shell` is td's own `guix shell`, with NO guix: `td shell
+# PKG -- CMD` resolves PKG to a td RECIPE and BUILDS it with td-builder itself
+# (build-recipe, content-addressed cache → build-on-demand + cached), composes the
+# command's PATH from the td store OUTPUT, and execs. No `guix` process in the
+# resolve/build/exec path; an unknown package errors, it does NOT fall back to guix.
+# This is North-Star step 1 (CLAUDE.md): td shell runs guix-free; the package it
+# runs is td's OWN build at td's OWN store path (distinct from guix's). The build
+# still links the pinned toolchain SEED from the lock (guix-built today, the frozen
+# seed tarball next — step 2). tests/td-shell.sh runs `td shell` with guix/Guile
+# SCRUBBED FROM PATH (proving no guix process) and asserts: behavioral (hello
+# greets), td-built (a real /gnu/store td hello under the cache, NOT guix's path),
+# load-bearing (unknown package -> error, no guix fallback); a REMOVABLE guix
+# differential (distinct store path, same greeting). Build gate (stage0 + td-ts-eval
+# via the build-recipes prelude) → BUILD_GATES + HEAVY_GATES.
 HEAVY_GATES += td-shell
+BUILD_GATES += td-shell
 td-shell:
-	@echo ">> td-shell: td-builder shell brings a package into a command's env and runs it (td's own guix shell; durable behavioral + load-bearing, removable guix-shell oracle)"
+	@echo ">> td-shell: td-builder shell builds a td package (no guix) and runs a command with it on PATH (North-Star step 1; durable behavioral + td-built + load-bearing, removable guix differential)"
 	sh tests/td-shell.sh
