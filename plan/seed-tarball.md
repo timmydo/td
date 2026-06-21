@@ -57,5 +57,14 @@ the guix-built seed from the lock and stage it out of the live `/gnu/store`).
   own store-closure reads the COMPLETE closure back out of the unpacked DB. Verified-red:
   VR1 (corrupt a manifest hash → seed-unpack rejects "NAR mismatch after restore"), VR2
   (skip Refs → "incomplete registration"). PR1 capture gate updated for the 4-field manifest.
-- Next: PR3 — build hello from the unpacked seed (build_recipe staging from DEST-STORE +
-  DEST-DB) with `/var/guix` + the live seed paths out of the path — the "no guix install" demo.
+- 2026-06-21: PR3 (build-from-seed) GREEN — the payoff. `build-recipe` gains a seed-store
+  override (TD_SEED_STORE + TD_SEED_DB); the new `seed-build` gate captures hello's full
+  build closure (54 paths, 660M), seed-unpacks it, and builds hello passing the seed DB as
+  its ONLY store DB — hello builds + RUNS "Hello, world!" with /var/guix + the live
+  /gnu/store out of the build path; every input stages from the unpacked store; the
+  seed-built hello == the guix-seed build (same drv). Verified-red: VR1 — build from an
+  incomplete seed FAILS (no guix fallback; the build is bounded by the seed).
+  **Step 2 demo complete: td builds with no guix install.**
+- Remaining for full guix independence (later tracks): wire the locks/cache-lib to resolve
+  the seed from a PINNED tarball (`tests/td-seed.lock` + a `warm-seed.sh`) so the WHOLE loop
+  builds from it; route `td shell` onto the seed; retire the guix oracle/lowering (step 3).
