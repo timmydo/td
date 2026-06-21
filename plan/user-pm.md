@@ -34,7 +34,9 @@ PROFILE layer + the install UX.
 - 2026-06-21: profile subcommand + gate green. Verified-red pending below.
 - Next: step 2 (persistent store relocation) — the one piece with real design weight.
 
-## Verified-red (record here)
+## Verified-red (2026-06-21)
 
-- [pending] symlink to a wrong target → "run through the profile" reds.
-- [pending] drop the collision check → the collision leg reds.
+- VR1 — `build_profile` symlinks to a WRONG target → "profile/bin/hello did not greet"
+  (the behavioral leg reds; the symlink is load-bearing). Reverted.
+- VR2 — drop the collision check (`if false && dst.exists()`) → "collision not reported as
+  a collision" (the discriminate leg reds). Reverted.
