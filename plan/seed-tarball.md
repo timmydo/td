@@ -46,4 +46,11 @@ the guix-built seed from the lock and stage it out of the live `/gnu/store`).
 
 ## Status
 
-- 2026-06-21: claimed; PR1 in progress (capture tool + seed-unpack + round-trip gate).
+- 2026-06-21: PR1 (capture) green — `tools/build-seed-tarball.sh` + the `seed-tarball`
+  gate. Captured bash's 6-path closure (incl. glibc, 92M tar); NAR-identical after a
+  tar round-trip; complete; td closure == `guix gc -R`. No Rust change (reuses
+  store-closure + nar-hash). Verified-red: VR-A (drop a captured path → "incomplete
+  capture" reds), VR-B (corrupt a manifest hash → "NAR mismatch after round-trip" reds).
+- Next: PR2 — `td-builder seed-unpack` (restore into a td store + register from the
+  manifest, no daemon) → build hello from the unpacked seed with `/var/guix` + the live
+  seed paths out of the path (the "no guix install" demo).
