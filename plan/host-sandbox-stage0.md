@@ -138,6 +138,25 @@ Reported to the human for a steer (the resolution is a CI-image-policy design de
 Increment 1 sub-tasks 1–5 DONE (capture → unpack → build-from-seed; durable
 structural/behavioral/repro + removable oracle; verified-red recorded).
 
+### Rebase onto #135/#136/#137 (2026-06-21)
+
+Main landed the warm-seed infra (#135 `tools/warm-seed.sh` + a pinned seed) and gates
+378-td-shell-seed / 382-corpus-seed. Adapted (commit e9c6985): renumbered the gate
+378→384 (378 now taken); reworked the capture+unpack onto `tools/warm-seed.sh` (the
+#135 content-addressed cache rail — no 2GB re-capture per run); mapped tests/rust-seed.sh
+→ the rust-seed gate in affected-checks.sh. Same legs/assertions.
+
+- **Re-green** (warm-seed): `./check.sh rust-seed` EXIT=0 — 54-path rust seed warmed
+  into `.td-build-cache/seed/<key>/`, all durable legs + removable oracle pass.
+- **Re-verified-red** (warm-seed): removed the rust tree from the warm-seed cache entry →
+  `./check.sh rust-seed` EXIT=2, structural leg red: "an input staged from the live
+  /gnu/store, not the seed: …-rust-1.93.0". Healed the cache (deleted the entry → re-warms
+  cleanly). The structural guard is load-bearing under the warm-seed rail too.
+
+Landing: affected-checks WAIVES the full ./check.sh for this diff (rust-seed.sh mapped;
+affected-checks.sh → self-test; no spine files). Selected: plan-index --check, bash -n,
+affected-checks --self-test, ./check.sh rust-seed.
+
 ## Notes
 
 - Exclusive landing: `check.sh` is the shared spine. Announce + sequence with the
