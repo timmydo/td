@@ -9,6 +9,32 @@ index, not a pre-approval gate), and the parallel-work rules (§7.2–7.4).
 This file is your contract. The rules below are absolute and override any local
 convenience.
 
+## North star: full guix independence (human, 2026-06-20)
+
+**The goal is to remove guix entirely — no guix *process* AND no guix *install*
+dependency.** Today the loop runs on a host Guix (the toolchain seed, the
+differential oracle, the Guile lowering). The target end state: td builds and runs
+its whole userland with **zero dependency on a guix installation**.
+
+The mechanism is a **frozen seed-binary tarball**, NOT a Mes-style full-source
+bootstrap. The first toolchain (gcc/glibc/binutils + the few build tools td can't
+yet build itself) is captured **once** into a pinned, content-addressed tarball — it
+may be *generated from* a local guix install, but once captured td depends on the
+**tarball**, never on a live guix. The tarball is a normal fixed-output seed (like
+any pinned fetch); regenerate it deliberately, like a channel bump. From that seed td
+builds everything else with no guix in the path.
+
+This **supersedes** the older framing where "guix is the permanent seed, retired
+last" and "full-source bootstrap is a non-goal" (DESIGN §5). Removing the guix
+dependency is now THE objective; the binary seed tarball is the accepted path to it.
+A full-source (Mes-style) re-derivation of the seed remains *optional, later* — a
+refinement of where the seed's bytes came from, never a blocker for guix independence.
+Concretely, in priority order: (1) no `guix` process in any user-facing command or
+build path (e.g. `td shell` resolves td-built packages, never `guix build`); (2) the
+toolchain seed served from the tarball, not a host guix; (3) the loop's oracle/lowering
+(`guix build --check`, `guix repl`/`system`) retired last. PLAN tracks this; DESIGN §5
+carries the detail.
+
 ## Prime directives (never violate)
 
 1. **Reproducibility is a test.** Every artifact must pass `guix build --check`. A
@@ -313,8 +339,10 @@ it.
   the default source; nonfree inputs (firmware, blobs, crates, the `nonguix` channel)
   may be adopted when a task needs them, declared and pinned like any other input.
   Unchanged: the loop stays offline with substitutes disabled — that is a
-  reproducibility rule, not a free-software rule. Mes-style full-source bootstraps
-  are likewise a non-goal (DESIGN §5 "Package collection").
+  reproducibility rule, not a free-software rule. A Mes-style full-source bootstrap
+  is *not required* (the North Star's frozen seed-binary tarball is the path to guix
+  independence); a source re-derivation of the seed is an optional later refinement,
+  not a goal in itself.
 
 **Commits**
 
