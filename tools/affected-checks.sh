@@ -141,6 +141,8 @@ map_recipe_spec() {
       add_target cmake ;;
     cat)
       add_target rust-uutils ;;
+    fd)
+      add_target rust-fd ;;
     uutils)
       add_target rust-coreutils ;;
     youki)
@@ -246,6 +248,9 @@ map_path() {
 
     tests/cat-uutils.lock)
       add_target rust-uutils ;;
+
+    tests/fd.lock)
+      add_target rust-fd ;;
 
     tests/uutils-coreutils.lock)
       add_target rust-coreutils ;;
