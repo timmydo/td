@@ -143,6 +143,8 @@ map_recipe_spec() {
       add_target rust-uutils ;;
     fd)
       add_target rust-fd ;;
+    ripgrep)
+      add_target rust-ripgrep ;;
     uutils)
       add_target rust-coreutils ;;
     youki)
@@ -251,6 +253,8 @@ map_path() {
 
     tests/fd.lock)
       add_target rust-fd ;;
+    tests/ripgrep.lock)
+      add_target rust-ripgrep ;;
 
     tests/uutils-coreutils.lock)
       add_target rust-coreutils ;;
