@@ -184,3 +184,27 @@ jobs:
           export PATH="$(cat /tmp/host-guix)/bin:$PATH"
           guix describe
           ./check.sh check-fast
+
+  cargo-test:
+    # The td-native build ENGINE gate — drv parse/emit, store-path hashing, NAR
+    # framing, the SQLite store-db reader, ref-scan, and the userns sandbox helpers
+    # (builder/src/*.rs #[test]s). This is the heart of td (the thing replacing guix),
+    # yet it was in NO required CI check: `check-fast` runs the small td-ci-fast store
+    # image, which carries NO rust toolchain (no rust/boa), so it cannot `cargo test`.
+    # This job closes that gap WITHOUT growing the image: the builder crate is
+    # dependency-free (builder/Cargo.toml has no [dependencies]), so the runner's
+    # pre-installed Rust runs `cargo test --frozen` (= --locked --offline) with no
+    # network, no guix, no store image — the same unit tests the dev-machine
+    # `cargo-test`/`check-engine` gate runs, now gated on every PR. (Add to the
+    # branch-protection required checks to make it blocking — see BRANCH-PROTECTION.md.)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: cargo test (td-builder engine unit tests — offline, no deps)
+        run: |
+          set -euo pipefail
+          cargo test --frozen --manifest-path builder/Cargo.toml 2>&1 | tee /tmp/cargo-test.log
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/cargo-test.log \
+            || { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }

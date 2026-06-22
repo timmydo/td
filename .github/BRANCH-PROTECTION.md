@@ -7,7 +7,7 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
 
 ## What enforces what
 
-- `.github/workflows/ci.yml` — two status checks per PR:
+- `.github/workflows/ci.yml` — three status checks per PR:
   - `lint` (GitHub-hosted): cheap structural checks only. It has no Guix and
     cannot run the loop; it never substitutes for `./check.sh`.
   - `check-fast` (hosted): `./check.sh check-fast` — the FAST tier (cheap +
@@ -18,6 +18,14 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
     `./check.sh` against the `td-ci` image, `ci-image.yml`) — NOT a per-PR check.
     So branch protection requires `check-fast`, never a `check` context (there
     is no such job).
+  - `cargo-test` (GitHub-hosted): the td-native build ENGINE unit tests
+    (`cargo test --frozen`, builder/src/*.rs). The `td-ci-fast` image carries no
+    rust, so `check-fast` cannot run these — yet the engine is the heart of td.
+    The builder crate is dependency-free, so this runs on the runner's stock Rust
+    with no image, no guix, no network. **TODO (admin): add `cargo-test` to the
+    required-checks set** so the engine is gated on every PR (the bot lacks admin;
+    a human runs `.github/setup-branch-protection.sh` with it added, or edits the
+    ruleset in the UI).
 - `ci/revert-suspect.sh` — the optimistic-merge heal primitive. Healing is an
   AGENT DUTY (not an automated workflow): when an agent sees `check-fast` red on
   main, it runs this to open a revert PR for the suspect squash commit. See
