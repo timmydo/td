@@ -43,9 +43,14 @@ The irreducible seed is a tiny hand-auditable binary (stage0-posix `hex0`, a few
 bytes) — NOT guix-built. Vendor it + the stage sources into the repo (offline loop), build
 upward:
 
-0. **seed + harness** — vendor the `hex0` seed (pinned by sha256) + stage0-posix sources;
-   a gate runs the seed in td's sandbox to assemble the first stage at `/td/store`,
-   byte-reproducibly, with NO `/gnu/store` and NO guix binary among the inputs.
+0. **seed + harness** — ✅ DONE (2026-06-22, kaem port). Vendored stage0-posix-x86 `3b9c2bb`'s
+   229-byte `hex0-seed` + 618-byte `kaem-optional-seed` + hex sources + the seed kaem script
+   into `seed/stage0/`. The `bootstrap-seed` gate (`mk/gates/360`) runs `kaem-optional-seed`
+   over `mescc-tools-seed-kaem.kaem` with guix/Guile off env → a full `hex0` + `kaem-0`,
+   ALL-DURABLE: seeds match pins (no-guix/auditable), self-reproduce from their hex source,
+   the built hex0 works as an assembler, and two runs are byte-identical. (`/td/store` placement
+   is deferred to the bricks that produce the dynamic toolchain; the stage0 assemblers are
+   static, no store paths.) Next: brick 1 drives `kaem-0` over the rest of the chain.
 1. **stage0-posix → M2** — `hex0`→`hex1`→`hex2`→`M0`→`cc_*`/`M2-Planet`: a minimal C
    compiler, all at `/td/store`.
 2. **mes + mescc-tools** — GNU Mes (Scheme) + `mescc` build a richer C environment.
