@@ -165,18 +165,15 @@ check-fast: $(CHEAP_GATES) $(FAST_GATES)
 # `check` when the OS becomes the focus. Run them on demand: `./check.sh check-system`.
 check-system: $(CHEAP_GATES) $(SYSTEM_GATES)
 
-# The build-ENGINE smoke tier — a representative slice of the heavy tier that exercises
-# each DISTINCT td-builder code path once, for a build-engine change (builder/src/*) to
-# land WITHOUT rebuilding the whole corpus. The full heavy+system suite is no longer a
-# per-PR blocking gate (DESIGN §7.2, human 2026-06-21: it runs DAILY as an agent-driven
-# backstop); an engine diff validates locally on `check-engine` instead. The set is tagged
-# inside the relevant heavy fragments (`ENGINE_GATES += <name>`) and is STANDALONE — none
-# is a BUILD_GATE, so this never triggers `build-recipes` (the full corpus). Coverage:
-# cargo-test (unit: drv/store/NAR/scan), td-builder (drv->sandbox build->register),
-# td-check (reproducibility double-build), bootstrap-build (stage0 td-builder as
-# builder-of-record + a package built FROM SOURCE + repro double-build — the corpus build
-# path, standalone), build-plan (multi-db closure + td-built-dep src-override).
-# PURELY ADDITIVE: `check` above is unchanged. Run it: `./check.sh check-engine`.
+# The build-ENGINE smoke tier — a TRUE smoke: "does it compile, lint, and pass unit tests",
+# targeting ~2 min so a build-engine change (builder/src/*) lands fast WITHOUT the full
+# corpus. It is the cheap structural gates + `cargo-test` (compile the engine + run its
+# drv/store/NAR/scan/sandbox unit tests) — and NOTHING that builds a package from source.
+# Anything heavier (bootstrap-build/build-plan/td-check/corpus/repro/system) is NOT smoke;
+# it stays in the full `check`, run DAILY by the agent-driven backstop (DESIGN §7.2, human
+# 2026-06-21) — no longer a per-PR gate. (`lint`, the structural shell/convention checks,
+# runs in CI on every PR.) PURELY ADDITIVE: `check` above is unchanged. Run it:
+# `./check.sh check-engine`.
 check-engine: $(CHEAP_GATES) $(ENGINE_GATES)
 
 # Print the assembled gate pools — the one-screen overview the single-file list

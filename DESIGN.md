@@ -850,10 +850,12 @@ full loop that does runs on the dev machine.
 changes** *(human 2026-06-21 — "I don't want to block PRs to main on running the
 whole suite")*. A `builder/src/*` diff is the spine of every recipe-building gate,
 so it used to force the whole corpus locally — the dominant agility cost. It now
-validates on the **`check-engine` smoke tier** (`make check-engine`: cheap gates +
-`cargo-test`/`td-builder`/`td-check`/`bootstrap-build`/`build-plan` — each distinct
-engine code path once, no full corpus), and `affected-checks` waives the full loop
-for it. The full heavy **and** system suite instead runs **once daily** on fresh
+validates on the **`check-engine` smoke tier** (`make check-engine`: a TRUE ~2-min
+smoke — cheap structural gates + `cargo-test` (compile the engine + its unit tests),
+and NOTHING that builds a package from source — `lint` runs in CI), and
+`affected-checks` waives the full loop for it. The end-to-end build coverage
+(`bootstrap-build`/`build-plan`/`td-check`/corpus/repro) stays in the full `check`,
+run by the daily backstop. The full heavy **and** system suite instead runs **once daily** on fresh
 main via `ci/daily-full-suite.sh`, driven by a scheduled agent that, on a
 regression, **opens a fix-or-revert PR (no auto-merge — a human merges)** and
 records the last all-green commit (`.td-last-green`, the seed of a future "stable"

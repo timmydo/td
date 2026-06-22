@@ -32,7 +32,6 @@
 # builder unreachable — `closure item … (on disk …): No such file`, the build fails —
 # proving stage0 is genuinely fed into the build FROM td's own store, not /gnu/store.
 HEAVY_GATES += bootstrap-build
-ENGINE_GATES += bootstrap-build   # build-engine smoke (check-engine): stage0 builder + a package from source + repro
 bootstrap-build:
 	@echo ">> bootstrap-build: td places its stage0 builder into its OWN store and the loop BUILDS hello with it (the builder-of-record is a binary guix never produced) — runs, reproducible, distinct from guix"
 	@set -euo pipefail; \

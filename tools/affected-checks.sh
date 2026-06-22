@@ -191,16 +191,15 @@ map_path() {
       # the spine of every recipe-building gate. The full heavy+system suite is NO LONGER a
       # per-PR blocking gate (DESIGN §7.2, human 2026-06-21: it runs DAILY as an
       # agent-driven backstop that opens a fix-or-revert PR on regression). So an engine
-      # diff validates locally on the `check-engine` SMOKE tier — cargo-test (unit) +
-      # td-builder (build->register) + td-check (repro double-build) + bootstrap-build (a
-      # package FROM SOURCE via the stage0 builder) + build-plan (multi-db/src-override) —
-      # which exercises each distinct engine code path once WITHOUT rebuilding the whole
-      # corpus. cargo-test also runs as a host preflight for sub-20s fast-fail. A
-      # corpus/rust package-specific regression the smoke misses is caught by the daily
-      # backstop, not blocked here (the accepted velocity trade).
+      # diff validates locally on the `check-engine` SMOKE tier — a TRUE ~2-min smoke:
+      # cheap structural gates + `cargo-test` (compile the engine + its drv/store/NAR/scan/
+      # sandbox unit tests), and NOTHING that builds a package from source. The end-to-end
+      # build coverage (bootstrap-build/build-plan/td-check/corpus/repro) is the DAILY
+      # backstop, not blocked here (the accepted velocity trade). cargo-test also runs as a
+      # host preflight for fast-fail.
       add_preflight cargo-test
       add_target check-engine
-      add_note "$p is the td-builder build engine: validated by the check-engine smoke tier; the full heavy+system corpus is the DAILY backstop (DESIGN §7.2), not a per-PR gate." ;;
+      add_note "$p is the td-builder build engine: validated by the ~2-min check-engine smoke (compile + unit tests); the from-source build coverage is the DAILY backstop (DESIGN §7.2), not a per-PR gate." ;;
 
     ts-eval/*|ts-eval/src/*|ts-eval/Cargo.toml|ts-eval/Cargo.lock)
       add_target ts-eval

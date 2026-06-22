@@ -15,7 +15,6 @@
 # hello builds + a --check), so it slots in the heavy pool by the other td gates.
 # Scratch on disk (two staged build trees), kept on red for triage, removed on green.
 HEAVY_GATES += td-check
-ENGINE_GATES += td-check   # build-engine smoke (check-engine): reproducibility double-build oracle
 td-check:
 	@echo ">> td-check: td computes the reproducibility verdict ITSELF — builds the td-build hello .drv TWICE (independent userns sandboxes), NAR-equal, matching guix build --check"
 	@set -euo pipefail; \

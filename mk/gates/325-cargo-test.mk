@@ -20,7 +20,11 @@
 #
 # Scope: builder/ only — ts-eval has no #[test]s and vendors boa, out of scope.
 HEAVY_GATES += cargo-test
-ENGINE_GATES += cargo-test   # build-engine smoke (check-engine): unit drv/store/NAR/scan
+# The build-engine smoke tier (`check-engine`) is JUST this — compile the engine + run its
+# unit tests (drv/store/NAR/scan/sandbox), ~2 min, no from-source builds. Anything that
+# builds a package (bootstrap-build/build-plan/td-check/corpus/…) is NOT smoke; it stays in
+# the full `check` / daily backstop. Keeping smoke = "compiles + unit tests" is the point.
+ENGINE_GATES += cargo-test
 # Not FAST_GATES: cargo test needs the rust toolchain, which the small td-ci-fast
 # image does NOT carry (ci/lower-fast-drvs.sh ships node+tsc+cheap-rung closures
 # only), so tagging it FAST would red the required offline `check-fast`. It runs

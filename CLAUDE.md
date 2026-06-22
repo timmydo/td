@@ -148,8 +148,8 @@ dispatcher cannot classify, changes to the loop spine (`check.sh`, `Makefile`,
 
 **Build-engine changes (`builder/src/*`) are the exception (human 2026-06-21):** they
 no longer escalate to the full loop — they validate on the **`check-engine` smoke tier**
-(`./check.sh check-engine`: cheap gates + `cargo-test`/`td-builder`/`td-check`/
-`bootstrap-build`/`build-plan`, each distinct engine path once, no full corpus) and
+(`./check.sh check-engine`: a TRUE ~2-min smoke — cheap structural gates + `cargo-test`
+(compile the engine + its unit tests), and NOTHING that builds a package from source) and
 `affected-checks` waives the full loop for them. The full heavy+system suite is no longer
 a per-PR gate; it runs **once daily** on fresh main via `ci/daily-full-suite.sh`, driven
 by a scheduled agent that opens a **fix-or-revert PR (no auto-merge)** on any regression
