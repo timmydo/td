@@ -676,8 +676,23 @@ pub fn run_rust() -> Result<(), String> {
         .map_err(|e| format!("write cargo config: {e}"))?;
     }
 
-    // build (offline, frozen, release) in the writable tree.
-    run_cmd(&cargo, &["build", "--release", "--offline", "--frozen"], build_dir, &envs)?;
+    // build (offline, frozen, release) in the writable tree. Optional cargo feature
+    // selection from the recipe: TD_CARGO_NO_DEFAULT=1 ⇒ --no-default-features (drop the
+    // crate's defaults, e.g. a C-building jemalloc), TD_CARGO_FEATURES=a,b ⇒ --features a,b.
+    // Absent ⇒ the plain default build, unchanged.
+    let mut cargo_args: Vec<String> =
+        ["build", "--release", "--offline", "--frozen"].iter().map(|s| s.to_string()).collect();
+    if env::var("TD_CARGO_NO_DEFAULT").is_ok() {
+        cargo_args.push("--no-default-features".into());
+    }
+    if let Ok(feats) = env::var("TD_CARGO_FEATURES") {
+        if !feats.is_empty() {
+            cargo_args.push("--features".into());
+            cargo_args.push(feats);
+        }
+    }
+    let cargo_argv: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
+    run_cmd(&cargo, &cargo_argv, build_dir, &envs)?;
 
     // install the named binaries to $out/bin.
     let bindir = format!("{out}/bin");
