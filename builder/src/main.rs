@@ -809,6 +809,20 @@ fn assemble_recipe_drv(
             if !vendor.is_empty() {
                 spec.push_str(&format!("env TD_VENDOR_CRATES={}\n", vendor.join(":")));
             }
+            // Optional cargo feature selection (both default-absent ⇒ a plain
+            // `cargo build` with the crate's defaults, unchanged). `noDefaultFeatures`
+            // drops the crate's default features — e.g. fd's `use-jemalloc`, whose
+            // jemalloc-sys runs a C ./configure the scrubbed build-env can't satisfy;
+            // `features` adds back the wanted ones (e.g. "completions").
+            if alist.get("noDefaultFeatures").is_some_and(json::Json::is_true) {
+                spec.push_str("env TD_CARGO_NO_DEFAULT=1\n");
+            }
+            if let Some(feats) = alist.get("features").and_then(json::Json::as_arr) {
+                let fl: Vec<&str> = feats.iter().filter_map(json::Json::as_str).collect();
+                if !fl.is_empty() {
+                    spec.push_str(&format!("env TD_CARGO_FEATURES={}\n", fl.join(",")));
+                }
+            }
         }
         _ => unreachable!("buildSystem already validated"),
     }

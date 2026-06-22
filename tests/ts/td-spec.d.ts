@@ -197,6 +197,12 @@ interface Recipe {
   /** Binaries to install into `$out/bin` — required by `buildSystem: "rust"`
    *  (the cargo phase runner's `TD_RUST_BINS`); ignored by `"gnu"`. */
   readonly bins?: readonly string[];
+  /** `buildSystem: "rust"` only — cargo feature selection. `noDefaultFeatures`
+   *  drops the crate's default features (e.g. fd's `use-jemalloc`, whose
+   *  jemalloc-sys runs a C build the offline build-env can't satisfy);
+   *  `features` adds the wanted ones back. Absent ⇒ a plain default build. */
+  readonly noDefaultFeatures?: boolean;
+  readonly features?: readonly string[];
 }
 
 /** Declare an upstream source by URL (or mirror-URL list) + content hash (does
