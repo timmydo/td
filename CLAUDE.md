@@ -146,6 +146,16 @@ before it can exit successfully. Full-loop escalation is mandatory for changes t
 dispatcher cannot classify, changes to the loop spine (`check.sh`, `Makefile`,
 `system/td.scm`, `DIGESTS.md`), CI/runner gating, and channel pin changes.
 
+**Build-engine changes (`builder/src/*`) are the exception (human 2026-06-21):** they
+no longer escalate to the full loop — they validate on the **`check-engine` smoke tier**
+(`./check.sh check-engine`: cheap gates + `cargo-test`/`td-builder`/`td-check`/
+`bootstrap-build`/`build-plan`, each distinct engine path once, no full corpus) and
+`affected-checks` waives the full loop for them. The full heavy+system suite is no longer
+a per-PR gate; it runs **once daily** on fresh main via `ci/daily-full-suite.sh`, driven
+by a scheduled agent that opens a **fix-or-revert PR (no auto-merge)** on any regression
+(DESIGN §7.2). A corpus/system regression the smoke misses is healed within a day, not
+blocked per-PR — the accepted velocity trade.
+
 ## Verified-red discipline
 
 A green behavioral gate is only meaningful once you have SEEN it red. For every new
