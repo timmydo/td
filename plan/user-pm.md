@@ -70,9 +70,15 @@ Mes-style — is the alternative, bigger.)
   recognise sites (`main.rs`). Re-prefixing **re-hashes** — `/td/store` is a DISTINCT store,
   not a rename (unit test `re_prefix_changes_the_path_and_the_hash`). Default unchanged, so
   every existing gate is untouched. The additive enabler builds target `/td/store` through.
-- **Phase 2 — seed relocation to `/td/store`** (the hard core): a `td seed-relocate` that turns
-  the `/gnu/store` seed into a `/td/store` seed (re-hash + patch). Then a *dynamic* binary runs
-  from `/td/store` — and a build with `TD_STORE_DIR=/td/store` produces native `/td/store` content.
+- **Phase 2 — seed relocation to `/td/store`** (the hard core) [STARTED]: `td-builder
+  store-relocate STORE-DB ROOT DEST` copies ROOT's closure into DEST and rewrites every
+  `/gnu/store` → `/td//store` — the **length-preserving** (10→10), kernel-collapsed form of
+  `/td/store`, so RUNPATH/interp/.rodata/scripts are all handled by ONE binary-safe byte
+  substitution (no patchelf, no re-hash needed — the seed keeps guix's content-addressed
+  basenames, just relocated). The `store-relocate` gate relocates hello's closure and runs the
+  DYNAMIC binary from `/td/store` with `/gnu/store` ABSENT (verified-red: skipping the rewrite
+  → it fails). Remaining Phase-2 work: relocate the FULL toolchain seed (scale the same op),
+  then build td packages with `TD_STORE_DIR=/td/store` against the relocated seed (Phase 3).
 - **Phase 3 — build the corpus at `/td/store`** from the relocated seed (td's content natively
   `/td/store`, no guix anywhere).
 - **Phase 4+ — the user-PM UX** on top: persistent `/td/store`, profile (done), `td

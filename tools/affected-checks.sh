@@ -303,6 +303,10 @@ map_path() {
       add_preflight shell-syntax
       add_target store-ns ;;
 
+    tests/store-relocate.sh)
+      add_preflight shell-syntax
+      add_target store-relocate ;;
+
     tests/seed-tarball.sh|tools/build-seed-tarball.sh)
       add_preflight shell-syntax
       add_target seed-tarball ;;
