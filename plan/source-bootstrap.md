@@ -51,8 +51,14 @@ upward:
    the built hex0 works as an assembler, and two runs are byte-identical. (`/td/store` placement
    is deferred to the bricks that produce the dynamic toolchain; the stage0 assemblers are
    static, no store paths.) Next: brick 1 drives `kaem-0` over the rest of the chain.
-1. **stage0-posix → M2** — `hex0`→`hex1`→`hex2`→`M0`→`cc_*`/`M2-Planet`: a minimal C
-   compiler, all at `/td/store`.
+1. **stage0-posix → M2-Planet** — ✅ DONE (2026-06-22). From brick 0's `kaem-0`, the
+   `bootstrap-cc` gate (`mk/gates/362`) drives `mescc-tools-mini-kaem.kaem` over the minimal
+   vendored source set (51 hex/C/M1 files: M2libc + M2-Planet + mescc-tools, in `seed/stage0/`)
+   to **M2-Planet (a minimal C compiler)** + the core mescc-tools (M1/hex2/kaem) — guix off env.
+   ALL-DURABLE: no-guix (no `/gnu/store` in M2-Planet), behavioral (M2-Planet COMPILES a C
+   program, M1+hex2 link it, the ELF RUNS returning 7 — a real working toolchain), repro
+   (byte-identical M2-Planet across two runs). Verified-red on the runtime value. Next: brick 2
+   drives these tools over mes / tinycc.
 2. **mes + mescc-tools** — GNU Mes (Scheme) + `mescc` build a richer C environment.
 3. **tinycc** — bootstrap TinyCC from Mes; the first self-respecting C compiler.
 4. **gcc (old) → gcc (modern)** — staged gcc builds, `--prefix=/td/store`.

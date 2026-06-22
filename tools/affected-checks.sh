@@ -329,9 +329,18 @@ map_path() {
       add_preflight shell-syntax
       add_target profile ;;
 
-    tests/bootstrap-seed.sh|seed/stage0/*)
+    tests/bootstrap-seed.sh)
       add_preflight shell-syntax
       add_target bootstrap-seed ;;
+
+    tests/bootstrap-cc.sh)
+      add_preflight shell-syntax
+      add_target bootstrap-cc ;;
+
+    seed/stage0/*)
+      add_preflight shell-syntax
+      add_target bootstrap-seed
+      add_target bootstrap-cc ;;
 
     tests/store-ns.sh)
       add_preflight shell-syntax
