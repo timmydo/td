@@ -143,6 +143,8 @@ map_recipe_spec() {
       add_target rust-uutils ;;
     sd)
       add_target rust-sd ;;
+    procs)
+      add_target rust-procs ;;
     fd)
       add_target rust-fd ;;
     ripgrep)
@@ -255,6 +257,8 @@ map_path() {
 
     tests/sd.lock)
       add_target rust-sd ;;
+    tests/procs.lock)
+      add_target rust-procs ;;
 
     tests/fd.lock)
       add_target rust-fd ;;
