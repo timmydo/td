@@ -1,0 +1,71 @@
+# ripgrep.lock — pinned inputs for building `ripgrep` (14.1.1, binary rg) WITH its full
+# dependency closure via `td-builder build-recipe` (buildSystem "rust", recipe-ripgrep.ts).
+# GENERATED from ripgrep's Cargo.lock: ripgrep-source is the upstream crate tarball; every
+# `*.crate` is a fixed-output static.crates.io fetch (sha256 == its Cargo.lock checksum).
+# Pure Rust at default features (jemalloc musl-only, pcre2 non-default). The rust/cargo/
+# gcc-toolchain + coreutils/bash/tar/gzip lines are the shared Rust seed (== cat-uutils.lock).
+kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0 /gnu/store/kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0
+z7kjjjv2k1aniv8lndhb5q1p3639631q-rust-1.93.0-cargo /gnu/store/z7kjjjv2k1aniv8lndhb5q1p3639631q-rust-1.93.0-cargo
+z78xpbjrl0g6238acy238fibgzckqgak-gcc-toolchain-15.2.0 /gnu/store/z78xpbjrl0g6238acy238fibgzckqgak-gcc-toolchain-15.2.0
+bwfxzfsm742izbqrx63ica0jq0sbnmrp-coreutils-9.1 /gnu/store/bwfxzfsm742izbqrx63ica0jq0sbnmrp-coreutils-9.1
+p5dap5q3wfdy0h3m31q5hbj3gpbkmrxv-bash-5.2.37 /gnu/store/p5dap5q3wfdy0h3m31q5hbj3gpbkmrxv-bash-5.2.37
+vlx3kkamd502jahyyn03qq9dxa63h3cz-tar-1.35 /gnu/store/vlx3kkamd502jahyyn03qq9dxa63h3cz-tar-1.35
+ch4v61a0lw0f1hkm5adai5z42qpyf20k-gzip-1.14 /gnu/store/ch4v61a0lw0f1hkm5adai5z42qpyf20k-gzip-1.14
+ripgrep-source /gnu/store/hm28xzzhfpv1qmi1fkslkrx0sclrnxj4-ripgrep-14.1.1.crate
+aho-corasick-1.1.3.crate /gnu/store/f3lpjam7ckjchvlzn91zkk7sfjslvjyh-aho-corasick-1.1.3.crate
+anyhow-1.0.87.crate /gnu/store/rlsyp1k7fgrgfpx456lnsqlba66zn9ln-anyhow-1.0.87.crate
+bstr-1.10.0.crate /gnu/store/gx6zkzl9b1ma1bv4851pgf3qac92gvkv-bstr-1.10.0.crate
+cc-1.1.18.crate /gnu/store/z01fglpfzc088nnjq2ldb3cwxcfip74f-cc-1.1.18.crate
+cfg-if-1.0.0.crate /gnu/store/md43mvn1vy69sq3cnpb6b4h6xf04s0yk-cfg-if-1.0.0.crate
+crossbeam-deque-0.8.5.crate /gnu/store/hij1lqw2k3nnllxh5i9p0n5lp9rklxpy-crossbeam-deque-0.8.5.crate
+crossbeam-epoch-0.9.18.crate /gnu/store/9zf4wyvq3jv66p5g66iga4g93rd138ix-crossbeam-epoch-0.9.18.crate
+crossbeam-utils-0.8.20.crate /gnu/store/s32nwacbg3jcmcl10qrf283nybqalyq5-crossbeam-utils-0.8.20.crate
+encoding_rs-0.8.34.crate /gnu/store/83m3w82alg593fhya4vp21k6ijyc0k17-encoding_rs-0.8.34.crate
+encoding_rs_io-0.1.7.crate /gnu/store/yahjhxsi1bs5vkxrmk8c9cgqhh6zfi8q-encoding_rs_io-0.1.7.crate
+globset-0.4.15.crate /gnu/store/390qxsnx55lbyi2pn7jfc662192m8mvk-globset-0.4.15.crate
+grep-0.3.2.crate /gnu/store/6zw1dlaym9wbdgv3qrla980kc7g1ikp4-grep-0.3.2.crate
+grep-cli-0.1.11.crate /gnu/store/bpp4x3w8zsj1csy5hyjh1cicw4vqq617-grep-cli-0.1.11.crate
+grep-matcher-0.1.7.crate /gnu/store/v6r61mdzdx0lnp2dslcjh9y9p7n1ricm-grep-matcher-0.1.7.crate
+grep-pcre2-0.1.8.crate /gnu/store/gkgxcysb9frw8nk48b2qhi2q3mascakj-grep-pcre2-0.1.8.crate
+grep-printer-0.2.2.crate /gnu/store/3vs831sklgbjxdfzk42cmjcmaklrj5z7-grep-printer-0.2.2.crate
+grep-regex-0.1.13.crate /gnu/store/4djcyvk11nllp0p8wclib129rv2r2ifj-grep-regex-0.1.13.crate
+grep-searcher-0.1.14.crate /gnu/store/0il500rin3ihwpwh2d4bynzmy4ganz5n-grep-searcher-0.1.14.crate
+ignore-0.4.23.crate /gnu/store/8n5ym35zkwvrs5jyakwpsjscwa0msgg4-ignore-0.4.23.crate
+itoa-1.0.11.crate /gnu/store/av4ir6l7amkpbbr6fx7bmx9p8zikainx-itoa-1.0.11.crate
+jemallocator-0.5.4.crate /gnu/store/jdw1pv0brc4nxf6c1xa2h53964vcx9gp-jemallocator-0.5.4.crate
+jemalloc-sys-0.5.4+5.3.0-patched.crate /gnu/store/s202m3ip7f6z8dw4ph2afynlgjq2n55l-jemalloc-sys-0.5.4+5.3.0-patched.crate
+jobserver-0.1.32.crate /gnu/store/qrqcz400ixw11l3gaqi7prhskbxdrm4j-jobserver-0.1.32.crate
+lexopt-0.3.0.crate /gnu/store/hdd0mdah0qgn3l9sv1sw9pwlq2b6jvys-lexopt-0.3.0.crate
+libc-0.2.158.crate /gnu/store/1hw6cyjch3m4vlwwsi28rp5lzwmsa4gv-libc-0.2.158.crate
+log-0.4.22.crate /gnu/store/zvyxiwa322mvpbbyl62x4f9b2d4mvbc6-log-0.4.22.crate
+memchr-2.7.4.crate /gnu/store/wgz7i2zf32g6wh7v9hcq98p9r80q619v-memchr-2.7.4.crate
+memmap2-0.9.4.crate /gnu/store/xn33ajyj33q3f30b700ilycf9haj4g5n-memmap2-0.9.4.crate
+pcre2-0.2.9.crate /gnu/store/4hykcjr0h8l20n65kf7j6nbrvxrvkbai-pcre2-0.2.9.crate
+pcre2-sys-0.2.9.crate /gnu/store/h8i998swgdwyqh7z9i2h3bk6ff8qqg15-pcre2-sys-0.2.9.crate
+pkg-config-0.3.30.crate /gnu/store/k45l1505hzpcqvyxi81kf2bj741k8dhg-pkg-config-0.3.30.crate
+proc-macro2-1.0.86.crate /gnu/store/3wyni47w7wp4dqyzhb1faryq3lp9plp3-proc-macro2-1.0.86.crate
+quote-1.0.37.crate /gnu/store/9ap1jn99ab4r9v9ii3z82vwrlh30l5nx-quote-1.0.37.crate
+regex-automata-0.4.7.crate /gnu/store/2mq4xmyr4hywzkivppmwwlbvvjcbgv55-regex-automata-0.4.7.crate
+regex-syntax-0.8.4.crate /gnu/store/cmx6vq5z2b04i92l8i37ixh229yxqc2c-regex-syntax-0.8.4.crate
+ryu-1.0.18.crate /gnu/store/nahq1fqlj0kmff97jfnbz7alq9z18m8f-ryu-1.0.18.crate
+same-file-1.0.6.crate /gnu/store/55kpbrak1xn2bbnp2fmdpzfnypvm0sc1-same-file-1.0.6.crate
+serde-1.0.210.crate /gnu/store/wz0kj47kgdl6im8fsi6cc1qnfmjavbav-serde-1.0.210.crate
+serde_derive-1.0.210.crate /gnu/store/g1ngsksd3kbn0a12zbrfrx2hc6lsv3ix-serde_derive-1.0.210.crate
+serde_json-1.0.128.crate /gnu/store/27xvppb3c746wz4zk5c4kjy998w4hx53-serde_json-1.0.128.crate
+shlex-1.3.0.crate /gnu/store/c7c1gbrj2k3j28684a08fvfp2qds0fg4-shlex-1.3.0.crate
+syn-2.0.77.crate /gnu/store/8xj518460x3a16633s6acjza0il5m02s-syn-2.0.77.crate
+termcolor-1.4.1.crate /gnu/store/dii5pvlwd0mdyf0hhqxayjkl98ac6yq7-termcolor-1.4.1.crate
+textwrap-0.16.1.crate /gnu/store/cfwnzc33bpjx2c3fv9zjvb5ddhhcvf55-textwrap-0.16.1.crate
+unicode-ident-1.0.12.crate /gnu/store/x9ycwpv0ak2bbpc5gbq380rxd551ldlm-unicode-ident-1.0.12.crate
+walkdir-2.5.0.crate /gnu/store/zm27z0yl373yddi1rax0ifcxa29dgscn-walkdir-2.5.0.crate
+winapi-util-0.1.9.crate /gnu/store/y3d725badgigfxkm8di788h67qhp5xz2-winapi-util-0.1.9.crate
+windows_aarch64_gnullvm-0.52.6.crate /gnu/store/rg4ry72h729l3giv9qs401rfrzyw0708-windows_aarch64_gnullvm-0.52.6.crate
+windows_aarch64_msvc-0.52.6.crate /gnu/store/jvxzk87cgpmnmx4x292avjfkk3a5bg3w-windows_aarch64_msvc-0.52.6.crate
+windows_i686_gnu-0.52.6.crate /gnu/store/aq9fcaz2ngzymq5zh7h9vfgjq13dyrc0-windows_i686_gnu-0.52.6.crate
+windows_i686_gnullvm-0.52.6.crate /gnu/store/0yhp6a28by3gx19jsblz1xywzgmyzik4-windows_i686_gnullvm-0.52.6.crate
+windows_i686_msvc-0.52.6.crate /gnu/store/rk7nhshmacjrba8x72mpy2bg0amhp0lh-windows_i686_msvc-0.52.6.crate
+windows-sys-0.59.0.crate /gnu/store/15lg2yn57fd2z03w1a8wa2xr4hczxmp8-windows-sys-0.59.0.crate
+windows-targets-0.52.6.crate /gnu/store/343niy8jfi87m8gzmiv5rviff3ik0bim-windows-targets-0.52.6.crate
+windows_x86_64_gnu-0.52.6.crate /gnu/store/0jkfmb8dyr6dlalprh8j91c7hm7p5dj1-windows_x86_64_gnu-0.52.6.crate
+windows_x86_64_gnullvm-0.52.6.crate /gnu/store/0lz4q364rg6jl360nv0kk7dxa0z34mv0-windows_x86_64_gnullvm-0.52.6.crate
+windows_x86_64_msvc-0.52.6.crate /gnu/store/m05bpzmqgnns551qba3vqhlll32i0y3s-windows_x86_64_msvc-0.52.6.crate
