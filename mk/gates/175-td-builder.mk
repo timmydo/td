@@ -43,6 +43,7 @@
 # host store — the loop fetches nothing. Two-step lower-then-realise (repl ->
 # guix build) for an honest exit status, as in the other gates.
 HEAVY_GATES += td-builder
+ENGINE_GATES += td-builder   # build-engine smoke (check-engine): drv parse -> sandbox build -> register
 td-builder:
 	@echo ">> td-builder: reproducible offline build (S1) + NAR differential (S2) + build differential (S3) + system-image differential (S4)"
 	@set -euo pipefail; \

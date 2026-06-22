@@ -20,6 +20,7 @@
 #
 # Scope: builder/ only — ts-eval has no #[test]s and vendors boa, out of scope.
 HEAVY_GATES += cargo-test
+ENGINE_GATES += cargo-test   # build-engine smoke (check-engine): unit drv/store/NAR/scan
 # Not FAST_GATES: cargo test needs the rust toolchain, which the small td-ci-fast
 # image does NOT carry (ci/lower-fast-drvs.sh ships node+tsc+cheap-rung closures
 # only), so tagging it FAST would red the required offline `check-fast`. It runs

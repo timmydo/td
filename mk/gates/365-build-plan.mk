@@ -11,6 +11,7 @@
 # MIGRATION ORACLE (distinct path). guix/Guile SCRUBBED FROM PATH; toolchain + locks are
 # the guix-built seed (§5, retired last).
 HEAVY_GATES += build-plan
+ENGINE_GATES += build-plan   # build-engine smoke (check-engine): multi-db closure + src-override (td-recipe-output chain)
 build-plan:
 	@echo ">> build-plan: --auto chains td-built deps into downstream builds (subjects DERIVED from the recipe graph, no manifest) — each subject's .drv references td's deps (NOT guix's), runs, reproducibly, at distinct paths"
 	@set -euo pipefail; \
