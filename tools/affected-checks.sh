@@ -141,6 +141,8 @@ map_recipe_spec() {
       add_target cmake ;;
     cat)
       add_target rust-uutils ;;
+    eza)
+      add_target rust-eza ;;
     fd)
       add_target rust-fd ;;
     ripgrep)
@@ -250,6 +252,9 @@ map_path() {
 
     tests/cat-uutils.lock)
       add_target rust-uutils ;;
+
+    tests/eza.lock)
+      add_target rust-eza ;;
 
     tests/fd.lock)
       add_target rust-fd ;;
