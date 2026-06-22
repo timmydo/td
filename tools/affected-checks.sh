@@ -295,6 +295,10 @@ map_path() {
       add_preflight shell-syntax
       add_target td-shell-seed ;;
 
+    tests/profile.sh)
+      add_preflight shell-syntax
+      add_target profile ;;
+
     tests/seed-tarball.sh|tools/build-seed-tarball.sh)
       add_preflight shell-syntax
       add_target seed-tarball ;;
