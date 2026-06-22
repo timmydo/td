@@ -141,14 +141,17 @@ if [ "$#" -eq 0 ]; then
   set -- check
 fi
 
-#   make -j2 --output-sync=target : bounded-parallel loop (loop-latency). The
+#   make -jN --output-sync=target : bounded-parallel loop (loop-latency). The
 #                                Makefile's dependency graph keeps the cheap
 #                                fail-fast rungs strictly serial and first;
 #                                heavy rungs then run at most two at a time
-#                                (per the DESIGN §7.3 resource note), with
-#                                per-target output grouping so failures stay
-#                                readable. All rungs still must pass; a red
-#                                stops new rungs from spawning.
+#                                (N=2, per the DESIGN §7.3 resource note) — except
+#                                the VM-free `check-engine` smoke tier, which runs
+#                                hot (N=$(nproc), TD_CHECK_JOBS) since it spawns no
+#                                VMs (see the -j selection below). Per-target output
+#                                grouping
+#                                keeps failures readable. All rungs still must pass;
+#                                a red stops new rungs from spawning.
 #   util-linux + sqlite        : the `rootless` rung needs unshare/mount (the
 #                                nested userns + staged-store binds) and
 #                                sqlite3 (a CONSISTENT snapshot of the host
@@ -208,8 +211,19 @@ guix_env=$(dirname "${toolchain%%:*}")
 # fixed-output seeds — the in-sandbox loop never egresses. Idempotent + near-instant once
 # the store path is warm; only a cold machine pays the one-time fetch (+ td-fetch build).
 sh tools/warm-tsgo.sh || { echo "check.sh: FATAL: could not warm the tsgo tarball (tools/warm-tsgo.sh)." >&2; exit 1; }
+# make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
+# two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only
+# single-threaded builds (NIX_BUILD_CORES=1), so -j2 idles most of the box; run it HOT at
+# $(nproc) — matching `build-recipes`' TD_BUILD_JOBS default, and auto-scaling as engine
+# gates are added (make caps at the runnable-gate count anyway). Override with TD_CHECK_JOBS
+# to throttle on a loaded shared host. Every other target keeps the safe -j2 (the VM ceiling
+# is load-bearing there).
+case " $* " in
+  *" check-engine "*) jobs=${TD_CHECK_JOBS:-$(nproc)} ;;
+  *) jobs=${TD_CHECK_JOBS:-2} ;;
+esac
 exec env \
   PATH="$hostguix_dir:$toolchain" \
   GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
   GUIX_ENVIRONMENT="$guix_env" \
-  "$tb" host-sandbox --expose-cwd -- make -j2 --output-sync=target "$@"
+  "$tb" host-sandbox --expose-cwd -- make -j"$jobs" --output-sync=target "$@"

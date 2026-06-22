@@ -187,17 +187,19 @@ map_path() {
       fi ;;
 
     builder/Cargo.toml|builder/Cargo.lock|builder/src/*)
-      # The td-builder build engine (realize_drv/build_recipe/sandbox/store/drv/nar …)
-      # is the spine of EVERY recipe-building gate — corpus-*, the source-interning and
-      # bootstrap gates, rust-build/vendor/russh/uutils, build-plan, td-check. cargo-test
-      # + the single td-builder gate cannot prove a closure/drv/NAR change is safe across
-      # that whole set (e.g. the src_override + multi-db closure path lives only in the
-      # source-interning gate). So an engine edit is loop-spine: keep cargo-test for fast
-      # feedback but require the full loop — drift-proof as new engine-consuming gates land.
+      # The td-builder build engine (realize_drv/build_recipe/sandbox/store/drv/nar …) is
+      # the spine of every recipe-building gate. The full heavy+system suite is NO LONGER a
+      # per-PR blocking gate (DESIGN §7.2, human 2026-06-21: it runs DAILY as an
+      # agent-driven backstop that opens a fix-or-revert PR on regression). So an engine
+      # diff validates locally on the `check-engine` SMOKE tier — a TRUE ~2-min smoke:
+      # cheap structural gates + `cargo-test` (compile the engine + its drv/store/NAR/scan/
+      # sandbox unit tests), and NOTHING that builds a package from source. The end-to-end
+      # build coverage (bootstrap-build/build-plan/td-check/corpus/repro) is the DAILY
+      # backstop, not blocked here (the accepted velocity trade). cargo-test also runs as a
+      # host preflight for fast-fail.
       add_preflight cargo-test
-      add_target cargo-test
-      add_target td-builder
-      require_full "$p is the td-builder build engine (spine of every recipe-building gate); affected-checks cannot waive the full loop." ;;
+      add_target check-engine
+      add_note "$p is the td-builder build engine: validated by the ~2-min check-engine smoke (compile + unit tests); the from-source build coverage is the DAILY backstop (DESIGN §7.2), not a per-PR gate." ;;
 
     ts-eval/*|ts-eval/src/*|ts-eval/Cargo.toml|ts-eval/Cargo.lock)
       add_target ts-eval
@@ -523,14 +525,12 @@ run_self_test() {
   assert_target tests/ts/recipe-perturbed.ts drv-emit
   assert_target tests/guix-surface.sh guix-surface
   assert_target tests/guix-surface.expected guix-surface
-  assert_target builder/src/sandbox.rs cargo-test
-  assert_target builder/src/sandbox.rs td-builder
-  # The td-builder build engine is the spine of EVERY recipe-building gate (corpus,
-  # source-interning, bootstrap, rust-build, build-plan): a change there cannot be
-  # locally waived on the strength of cargo-test + td-builder alone.
-  assert_branch_policy builder/src/main.rs "full ./check.sh would be required"
-  assert_branch_policy builder/src/sandbox.rs "full ./check.sh would be required"
-  assert_branch_policy builder/Cargo.toml "full ./check.sh would be required"
+  # The td-builder build engine validates on the check-engine SMOKE tier (Option B,
+  # DESIGN §7.2): the full heavy+system corpus is the DAILY backstop, not a per-PR gate.
+  assert_target builder/src/sandbox.rs check-engine
+  assert_branch_policy builder/src/main.rs "full ./check.sh would be waived"
+  assert_branch_policy builder/src/sandbox.rs "full ./check.sh would be waived"
+  assert_branch_policy builder/Cargo.toml "full ./check.sh would be waived"
   assert_target system/td.scm check-system
   assert_branch_policy check.sh "full ./check.sh would be required"
   assert_branch_policy channels.scm "full ./check.sh would be required"

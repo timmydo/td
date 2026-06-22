@@ -841,10 +841,28 @@ is **the fast tier only** — a heavy-only break (boot/VM/marionette/
 reproducibility, invisible to `check-fast`) is not caught; it surfaces on the
 next manual full `./check.sh` and is fixed forward. Closing that gap by re-running the full loop in CI per-merge is not
 feasible (cold hosted runners can't rebuild td's closure; the ci-image is keyed
-by channel pin, not main commit), so a dev-box periodic full-loop heal is the
-deferred heavy net. The fast check is cheap and does not meaningfully count
-toward the §7.3 two-concurrent-checks ceiling; the full loop that does runs on
-the dev machine.
+by channel pin, not main commit), so a **dev-box DAILY full-loop heal is that
+heavy net** (human 2026-06-21, formerly "deferred"). The fast check is cheap and
+does not meaningfully count toward the §7.3 two-concurrent-checks ceiling; the
+full loop that does runs on the dev machine.
+
+**The full `./check.sh` is no longer a per-PR blocking gate for build-engine
+changes** *(human 2026-06-21 — "I don't want to block PRs to main on running the
+whole suite")*. A `builder/src/*` diff is the spine of every recipe-building gate,
+so it used to force the whole corpus locally — the dominant agility cost. It now
+validates on the **`check-engine` smoke tier** (`make check-engine`: a TRUE ~2-min
+smoke — cheap structural gates + `cargo-test` (compile the engine + its unit tests),
+and NOTHING that builds a package from source — `lint` runs in CI), and
+`affected-checks` waives the full loop for it. The end-to-end build coverage
+(`bootstrap-build`/`build-plan`/`td-check`/corpus/repro) stays in the full `check`,
+run by the daily backstop. The full heavy **and** system suite instead runs **once daily** on fresh
+main via `ci/daily-full-suite.sh`, driven by a scheduled agent that, on a
+regression, **opens a fix-or-revert PR (no auto-merge — a human merges)** and
+records the last all-green commit (`.td-last-green`, the seed of a future "stable"
+marker). The accepted trade: a corpus/system regression the smoke misses lands and
+is healed within a day, not blocked per-PR. The rarer spine files (`channels.scm`,
+`check.sh`, `Makefile`, `system/td.scm`, `DIGESTS.md`) still run the full loop
+before landing (§7.3); only the frequent engine case is decoupled here.
 
 The human approval (here since 2026-06-11) replaced the original "no human merge
 step; review-after on main".

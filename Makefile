@@ -86,6 +86,7 @@ CHEAP_GATES :=
 HEAVY_GATES :=
 FAST_GATES  :=
 SYSTEM_GATES :=
+ENGINE_GATES :=
 # BUILD_SPECS — every package recipe the parallel `build-recipes` phase realizes +
 # reproducibility-checks up front (the corpus, toolchain leaves and library deps). Each
 # package-build gate fragment appends its OWN spec list (so the list lives next to the
@@ -95,7 +96,7 @@ BUILD_SPECS :=
 BUILD_GATES :=
 include $(sort $(wildcard mk/gates/*.mk))
 
-.PHONY: check check-fast check-system container-check list-gates build-recipes $(CHEAP_GATES) $(HEAVY_GATES) $(SYSTEM_GATES)
+.PHONY: check check-fast check-system check-engine container-check list-gates build-recipes $(CHEAP_GATES) $(HEAVY_GATES) $(SYSTEM_GATES)
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -164,6 +165,17 @@ check-fast: $(CHEAP_GATES) $(FAST_GATES)
 # `check` when the OS becomes the focus. Run them on demand: `./check.sh check-system`.
 check-system: $(CHEAP_GATES) $(SYSTEM_GATES)
 
+# The build-ENGINE smoke tier — a TRUE smoke: "does it compile, lint, and pass unit tests",
+# targeting ~2 min so a build-engine change (builder/src/*) lands fast WITHOUT the full
+# corpus. It is the cheap structural gates + `cargo-test` (compile the engine + run its
+# drv/store/NAR/scan/sandbox unit tests) — and NOTHING that builds a package from source.
+# Anything heavier (bootstrap-build/build-plan/td-check/corpus/repro/system) is NOT smoke;
+# it stays in the full `check`, run DAILY by the agent-driven backstop (DESIGN §7.2, human
+# 2026-06-21) — no longer a per-PR gate. (`lint`, the structural shell/convention checks,
+# runs in CI on every PR.) PURELY ADDITIVE: `check` above is unchanged. Run it:
+# `./check.sh check-engine`.
+check-engine: $(CHEAP_GATES) $(ENGINE_GATES)
+
 # Print the assembled gate pools — the one-screen overview the single-file list
 # used to give. (`make list-gates`, no build.)
 list-gates:
@@ -171,6 +183,7 @@ list-gates:
 	@echo "heavy  ($(words $(HEAVY_GATES))): $(HEAVY_GATES)"
 	@echo "fast   ($(words $(FAST_GATES))): $(FAST_GATES)"
 	@echo "system ($(words $(SYSTEM_GATES))): $(SYSTEM_GATES)"
+	@echo "engine ($(words $(ENGINE_GATES))): $(ENGINE_GATES)"
 
 # Generated ordering graph (do not hand-edit): chain each cheap gate order-only
 # on its predecessor, and gate every heavy gate on the last cheap gate.
@@ -180,6 +193,9 @@ $(HEAVY_GATES): | $(lastword $(CHEAP_GATES))
 # System-tier gates (on-demand `check-system`) gate on the last cheap gate too, so
 # the structural gates run serial-first there exactly as in `check`.
 $(SYSTEM_GATES): | $(lastword $(CHEAP_GATES))
+# Engine-smoke gates (on-demand `check-engine`) gate on the last cheap gate too. They are
+# all STANDALONE (not BUILD_GATES), so `check-engine` never pulls in `build-recipes`.
+$(ENGINE_GATES): | $(lastword $(CHEAP_GATES))
 # The parallel build phase runs after the fail-fast cheap gates; the package build
 # gates (BUILD_GATES) then wait on it, so by the time they run the cache is warm — they
 # cache-hit + memo-skip and only assert behavior/oracle. The dep is on the build gates
