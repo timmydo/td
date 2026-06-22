@@ -327,6 +327,11 @@ pub fn build(
 /// path in the new root). `readonly` remounts it read-only after binding.
 pub struct Bind {
     pub src: String,
+    /// Mount `src` at this absolute path inside the new root instead of at `src`
+    /// (None ⇒ same path). Lets the user store at a host path (e.g. `~/.td/store`)
+    /// appear at td's store prefix (`/td/store`) inside the sandbox — the
+    /// own-root/store-ns case, breaking from guix's `/gnu/store`.
+    pub dest: Option<String>,
     pub readonly: bool,
     /// When `readonly`, tolerate a FAILED read-only remount by DETACHING the bind
     /// (fail closed — no host-owned subtree left writable in the sandbox) instead
@@ -397,7 +402,9 @@ pub fn host_shell(
     let mut bind_specs: Vec<(CString, PathBuf, CString, bool, bool)> =
         Vec::with_capacity(binds.len());
     for b in binds {
-        let target = newroot.join(b.src.strip_prefix('/').unwrap_or(&b.src));
+        // Bind `src` at `dest` inside the new root (dest defaults to src).
+        let inside = b.dest.as_deref().unwrap_or(&b.src);
+        let target = newroot.join(inside.strip_prefix('/').unwrap_or(inside));
         bind_specs.push((
             CString::new(b.src.as_str()).map_err(|_| err(format!("{}: NUL in path", b.src)))?,
             target.clone(),

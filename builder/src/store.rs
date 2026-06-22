@@ -6,8 +6,21 @@
 
 use crate::sha256::{self, Sha256};
 
-/// Guix's store directory (the daemon's `storeDir`).
+/// The DEFAULT store directory — guix's (the daemon's `storeDir`). td's own store
+/// prefix is `/td/store` when `TD_STORE_DIR` is set (user-pm Phase 1, the break from
+/// guix): the prefix is part of every content hash, so `/td/store` paths are a
+/// distinct store from guix's `/gnu/store`.
 pub const STORE_DIR: &str = "/gnu/store";
+
+/// The active store prefix: `$TD_STORE_DIR` (e.g. `/td/store`) or the default
+/// `/gnu/store`. Read where a store path is computed or recognized so a single env
+/// var re-prefixes the whole store (like nix's `NIX_STORE_DIR`).
+pub fn store_dir() -> String {
+    match std::env::var("TD_STORE_DIR") {
+        Ok(d) if !d.is_empty() => d,
+        _ => STORE_DIR.to_string(),
+    }
+}
 
 /// The nix store-path base-32 alphabet (omits e, o, u, t).
 const BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
@@ -50,9 +63,16 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
 /// `type:sha256:<hex>:<storeDir>:<name>`, hashed and compressed to 20 bytes, then
 /// base-32 — the store path's digest part.
 pub fn make_store_path(ty: &str, inner_hash_hex: &str, name: &str) -> String {
-    let fingerprint = format!("{ty}:sha256:{inner_hash_hex}:{STORE_DIR}:{name}");
+    make_store_path_in(&store_dir(), ty, inner_hash_hex, name)
+}
+
+/// makeStorePath with an EXPLICIT store prefix — the prefix is in the fingerprint, so
+/// re-prefixing (`/gnu/store` → `/td/store`) re-hashes the path (a distinct store).
+/// `make_store_path` is this with the active `store_dir()`.
+pub fn make_store_path_in(store_dir: &str, ty: &str, inner_hash_hex: &str, name: &str) -> String {
+    let fingerprint = format!("{ty}:sha256:{inner_hash_hex}:{store_dir}:{name}");
     let compressed = compress_hash(&sha256_bytes(fingerprint.as_bytes()), 20);
-    format!("{STORE_DIR}/{}-{}", base32(&compressed), name)
+    format!("{store_dir}/{}-{}", base32(&compressed), name)
 }
 
 /// makeTextPath: a `.drv` (or any addTextToStore item) is content-addressed with
@@ -339,5 +359,26 @@ mod tests {
         // A 20-byte (compressed) hash encodes to 32 base-32 chars — store-path width.
         assert_eq!(base32(&[0u8; 20]).len(), 32);
         assert_eq!(base32(&[0u8; 20]), "0".repeat(32));
+    }
+
+    #[test]
+    fn re_prefix_changes_the_path_and_the_hash() {
+        // user-pm Phase 1: the store prefix is configurable. /td/store paths share the
+        // 32-char digest WIDTH but are a DISTINCT store — the prefix is in the fingerprint,
+        // so the digest differs from /gnu/store's for the same content. (Break from guix.)
+        let (ty, h, name) = ("source", "abc123", "hello-2.12.2");
+        let guix = make_store_path_in("/gnu/store", ty, h, name);
+        let td = make_store_path_in("/td/store", ty, h, name);
+        assert!(guix.starts_with("/gnu/store/") && guix.ends_with("-hello-2.12.2"));
+        assert!(td.starts_with("/td/store/") && td.ends_with("-hello-2.12.2"));
+        // Same name, same 32-char digest width — but a DIFFERENT digest (the prefix is hashed).
+        assert_eq!(name_from_store_path(&guix).unwrap(), name_from_store_path(&td).unwrap());
+        assert_ne!(
+            guix.rsplit('/').next().unwrap(),
+            td.rsplit('/').next().unwrap(),
+            "re-prefixing must re-hash — /td/store is a distinct store, not a rename"
+        );
+        // `make_store_path` follows TD_STORE_DIR (default /gnu/store when unset).
+        assert!(make_store_path(ty, h, name).starts_with(&format!("{}/", store_dir())));
     }
 }
