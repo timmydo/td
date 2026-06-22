@@ -256,7 +256,7 @@ map_path() {
     tests/td-fetch.lock)
       add_target rust-fetch ;;
 
-    tests/build-pkg.sh|tests/cache-lib.sh)
+    tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh)
       add_preflight shell-syntax
       add_build_gate_targets ;;
 
