@@ -13,10 +13,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
 /// Accept-loop over a Unix socket at `socket`. For each connection, read one
-/// request line and realize it via `realize` into a fresh per-request scratch dir
-/// under `scratch_base`, then write the response. Serves requests until a
-/// "SHUTDOWN" line (or the socket errors). `realize(drv, scratch)` returns
-/// (canonical store path, host-side output path).
+/// request line and realize it via `realize`, passing the daemon's persistent
+/// `scratch_base`, then write the response. The `realize` callback owns where
+/// under `scratch_base` it builds (the daemon arm keys a CONTENT-ADDRESSED
+/// per-drv subdir, so a repeat request for the same drv reuses + reads back a
+/// valid prior realization instead of rebuilding — guix-daemon parity). Serves
+/// requests until a "SHUTDOWN" line (or the socket errors). `realize(drv,
+/// scratch_base)` returns (canonical store path, host-side output path).
 pub fn serve(
     socket: &str,
     realize: impl Fn(&str, &Path) -> Result<(String, String), String>,
@@ -26,7 +29,6 @@ pub fn serve(
     let _ = std::fs::remove_file(socket);
     std::fs::create_dir_all(scratch_base).map_err(|e| e.to_string())?;
     let listener = UnixListener::bind(socket).map_err(|e| format!("bind {socket}: {e}"))?;
-    let mut n: u64 = 0;
     for conn in listener.incoming() {
         let conn = conn.map_err(|e| format!("accept: {e}"))?;
         // Read the request line; scope the reader's borrow before writing back.
@@ -41,9 +43,7 @@ pub fn serve(
             let _ = (&conn).write_all(b"OK shutdown\n");
             break;
         }
-        n += 1;
-        let scratch = scratch_base.join(format!("req-{n}"));
-        let resp = match realize(&req, &scratch) {
+        let resp = match realize(&req, scratch_base) {
             Ok((canon, host)) => format!("OK {canon} {host}\n"),
             // Keep the response a single line — a realize error can be multi-line.
             Err(e) => format!("ERR {}\n", e.replace('\n', " ")),

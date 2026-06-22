@@ -615,6 +615,96 @@ fn build_recipe(
     builder_store: Option<(&str, &str, &str)>,
     td_store: Option<&Path>,
 ) -> Result<Vec<OutputReg>, String> {
+    // A td-OWNED builder (optional, bootstrap brick 2): the drv's `builder` is a stage0
+    // td-builder td placed at `canonical` (store-add-builder), restored under store_dir,
+    // refs in db — a binary guix never produced. The on-disk tree is the canonical
+    // basename under store_dir. Omitted → the running guix-built binary.
+    let builder_override = builder_store.map(|(canonical, store_dir, db)| {
+        let base = canonical.rsplit('/').next().unwrap_or(canonical);
+        BuilderOverride {
+            canonical: canonical.to_string(),
+            on_disk: format!("{store_dir}/{base}"),
+            db: db.to_string(),
+        }
+    });
+    // The builder store path: the td-placed stage0 (override) or, by default, the
+    // running binary (self_store_path — the guix-built td-builder).
+    let builder_path = match &builder_override {
+        Some(ov) => ov.canonical.clone(),
+        None => self_store_path()?,
+    };
+    // td assembles the .drv ITSELF (pure Rust, no guix (derivation …), no Guile, no
+    // daemon) and writes it to SCRATCH — the SAME assembly `assemble-recipe` uses, so a
+    // separate process (the build daemon) realizes a byte-identical td-assembled drv.
+    let (drv_path, drv_file, parsed, source) =
+        assemble_recipe_drv(recipe_json, lock_file, scratch, &builder_path)?;
+    // A td-OWNED source store (optional): the `<name>-source` path was interned by td
+    // itself into SRC-STORE-DIR + SRC-DB, so realize stages it from there + reads its
+    // closure from SRC-DB — no daemon interning. The on-disk tree is the canonical
+    // basename under SRC-STORE-DIR (store-add-recursive restored it there).
+    let src_override = src_store.map(|(store_dir, db)| {
+        let base = source.rsplit('/').next().unwrap_or(&source);
+        SrcOverride {
+            canonical: source.clone(),
+            on_disk: format!("{store_dir}/{base}"),
+            db: db.to_string(),
+        }
+    });
+    // Content-addressed build cache: if SCRATCH already holds a valid realization of
+    // this exact (deterministic) drv, reuse it — skip the build. The gate points
+    // SCRATCH at a persistent cache, so an unchanged recipe is a cache HIT and only a
+    // CHANGED recipe (⇒ different drv hash ⇒ different output path, a miss) rebuilds.
+    if let Some(regs) = cached_realization(&parsed, scratch)? {
+        eprintln!(
+            "td-builder: build-recipe CACHE HIT for {drv_path} — {} output(s) already realized + NAR-verified under {}; skipping the build",
+            regs.len(),
+            scratch.display()
+        );
+        for (o, r) in parsed.outputs.iter().zip(&regs) {
+            println!("OUT={} {}", o.name, r.store_path);
+        }
+        // Re-write the td store-db even on a hit (deterministic from regs): a
+        // downstream build-plan step reads this step's td.db to resolve the closure
+        // of a td-built dependency, so it must exist whether or not we rebuilt.
+        write_output_db(&regs, &scratch.join("td.db"))?;
+        println!("CACHE=hit");
+        return Ok(regs);
+    }
+    eprintln!("td-builder: build-recipe assembled {drv_path} (no guix (derivation), no Guile)");
+    // td realizes it (no guix-daemon). With a td-owned source store, the source is
+    // staged from td's own store + closure read from the td DB (no daemon interning);
+    // with a td-owned builder, the drv's builder is staged from td's store + its
+    // closure spans the builder DB ∪ the seed DB (no guix-built builder, brick 2);
+    // td_store carries any td-BUILT deps (build-plan) for the multi-db closure's staging.
+    let regs = realize_drv(
+        &drv_file.to_string_lossy(),
+        store_dbs,
+        scratch,
+        src_override.as_ref(),
+        builder_override.as_ref(),
+        td_store,
+    )?;
+    println!("CACHE=miss");
+    Ok(regs)
+}
+
+/// Assemble a recipe's `.drv` with NO Guile and NO realize. Parses RECIPE-JSON, resolves
+/// every input from LOCK (no specification->package), builds the drv spec (inputs as
+/// input-SOURCES; BUILDER_PATH's `/bin/td-builder` is the drv's builder), assembles it
+/// with `store::assemble_drv` (pure Rust, no guix (derivation …)), and writes it to
+/// SCRATCH/<name>-<version>.drv — WITHOUT building it. Returns (canonical drv store path,
+/// the written `.drv` file, the parsed derivation, the `<name>-source` path).
+///
+/// Shared by `build-recipe` (which then realizes it daemon-free) and `assemble-recipe`
+/// (assemble-only, so a SEPARATE process — the build daemon — realizes the td-assembled
+/// drv). Splitting assembly from realization is what lets td's own daemon, not a `guix
+/// repl`-emitted drv, be the build's input (own-builder-daemon §5).
+fn assemble_recipe_drv(
+    recipe_json: &str,
+    lock_file: &str,
+    scratch: &Path,
+    builder_path: &str,
+) -> Result<(String, std::path::PathBuf, drv::Derivation, String), String> {
     let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
     let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
     let version = alist.get("version").and_then(json::Json::as_str).ok_or("recipe: no version")?;
@@ -671,38 +761,8 @@ fn build_recipe(
     if source.is_empty() {
         return Err(format!("lock has no `{src_key}' entry (the recipe source)"));
     }
-    // A td-OWNED source store (optional): the `<name>-source` path was interned by td
-    // itself into SRC-STORE-DIR + SRC-DB, so realize stages it from there + reads its
-    // closure from SRC-DB — no daemon interning. The on-disk tree is the canonical
-    // basename under SRC-STORE-DIR (store-add-recursive restored it there).
-    let src_override = src_store.map(|(store_dir, db)| {
-        let base = source.rsplit('/').next().unwrap_or(&source);
-        SrcOverride {
-            canonical: source.clone(),
-            on_disk: format!("{store_dir}/{base}"),
-            db: db.to_string(),
-        }
-    });
-    // A td-OWNED builder (optional, bootstrap brick 2): the drv's `builder` is a stage0
-    // td-builder td placed at `canonical` (store-add-builder), restored under store_dir,
-    // refs in db — a binary guix never produced. The on-disk tree is the canonical
-    // basename under store_dir. Omitted → the running guix-built binary.
-    let builder_override = builder_store.map(|(canonical, store_dir, db)| {
-        let base = canonical.rsplit('/').next().unwrap_or(canonical);
-        BuilderOverride {
-            canonical: canonical.to_string(),
-            on_disk: format!("{store_dir}/{base}"),
-            db: db.to_string(),
-        }
-    });
     inputs.sort();
     vendor.sort();
-    // The builder store path: the td-placed stage0 (override) or, by default, the
-    // running binary (self_store_path — the guix-built td-builder).
-    let builder_path = match &builder_override {
-        Some(ov) => ov.canonical.clone(),
-        None => self_store_path()?,
-    };
     let builder = format!("{builder_path}/bin/td-builder");
     // Assemble the .drv spec: inputs as input-SOURCES (already-realized seed paths,
     // no input-derivations — so this diverges from guix's nano, by design).
@@ -759,42 +819,7 @@ fn build_recipe(
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let drv_file = scratch.join(format!("{full}.drv"));
     std::fs::write(&drv_file, &content).map_err(|e| e.to_string())?;
-    // Content-addressed build cache: if SCRATCH already holds a valid realization of
-    // this exact (deterministic) drv, reuse it — skip the build. The gate points
-    // SCRATCH at a persistent cache, so an unchanged recipe is a cache HIT and only a
-    // CHANGED recipe (⇒ different drv hash ⇒ different output path, a miss) rebuilds.
-    if let Some(regs) = cached_realization(&parsed, scratch)? {
-        eprintln!(
-            "td-builder: build-recipe CACHE HIT for {drv_path} — {} output(s) already realized + NAR-verified under {}; skipping the build",
-            regs.len(),
-            scratch.display()
-        );
-        for (o, r) in parsed.outputs.iter().zip(&regs) {
-            println!("OUT={} {}", o.name, r.store_path);
-        }
-        // Re-write the td store-db even on a hit (deterministic from regs): a
-        // downstream build-plan step reads this step's td.db to resolve the closure
-        // of a td-built dependency, so it must exist whether or not we rebuilt.
-        write_output_db(&regs, &scratch.join("td.db"))?;
-        println!("CACHE=hit");
-        return Ok(regs);
-    }
-    eprintln!("td-builder: build-recipe assembled {drv_path} (no guix (derivation), no Guile)");
-    // td realizes it (no guix-daemon). With a td-owned source store, the source is
-    // staged from td's own store + closure read from the td DB (no daemon interning);
-    // with a td-owned builder, the drv's builder is staged from td's store + its
-    // closure spans the builder DB ∪ the seed DB (no guix-built builder, brick 2);
-    // td_store carries any td-BUILT deps (build-plan) for the multi-db closure's staging.
-    let regs = realize_drv(
-        &drv_file.to_string_lossy(),
-        store_dbs,
-        scratch,
-        src_override.as_ref(),
-        builder_override.as_ref(),
-        td_store,
-    )?;
-    println!("CACHE=miss");
-    Ok(regs)
+    Ok((drv_path, drv_file, parsed, source))
 }
 
 /// build-plan: realize a TOPO-ordered chain of recipes where a downstream step
@@ -2910,22 +2935,89 @@ fn main() -> ExitCode {
         // td-builder daemon — td's OWN persistent build daemon: a long-running
         // process that realizes derivations served over a Unix socket, instead of
         // guix-daemon (own-builder-daemon track). Each request realizes via the
-        // exact `realize_drv` path (same sandbox/NEWPID, daemon-free) into a fresh
-        // per-request scratch dir; the response carries the realized output's
-        // canonical store path + its host-side path under that scratch. Usage:
-        //   daemon SOCKET STORE-DB SCRATCH-BASE
+        // exact `realize_drv` path (same sandbox/NEWPID, daemon-free) into a
+        // CONTENT-ADDRESSED per-drv scratch dir under SCRATCH-BASE — keyed by the
+        // drv's (content-addressed) output basename, so a repeat request for the
+        // SAME drv reuses + NAR-verifies a valid prior realization (cached_realization)
+        // instead of rebuilding (guix-daemon parity: a valid path is not rebuilt).
+        // The response carries the realized output's canonical store path + its
+        // host-side path under that scratch.
+        //
+        // Optional td-OWNED builder (same convention as build-recipe, bootstrap brick 2):
+        // with TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB set together, a drv whose
+        // builder is td's stage0 td-builder (a binary guix never produced) is realized by
+        // staging that builder from TD_BUILDER_STORE with its direct refs from
+        // TD_BUILDER_DB — so the daemon builds with td's OWN builder, not the guix-built
+        // one, and needs no new `guix build -e' packager site. The override is matched by
+        // PATH (only the drv root equal to its canonical is re-keyed), so it is a harmless
+        // no-op for a drv that does not name the stage0 (e.g. the guile probes of gate 358).
+        // Usage:  daemon SOCKET STORE-DB SCRATCH-BASE
         Some("daemon") if args.len() == 5 => {
             let (socket, store_db, scratch) = (&args[2], &args[3], &args[4]);
-            let realize = |drv: &str, scr: &Path| -> Result<(String, String), String> {
-                let regs =
-                    realize_drv(drv, std::slice::from_ref(store_db), scr, None, None, None)?;
-                let first = regs.first().ok_or_else(|| "realize produced no outputs".to_string())?;
-                let canon = first.store_path.clone();
-                let base = canon
-                    .strip_prefix("/gnu/store/")
-                    .ok_or_else(|| format!("{canon}: not a store path"))?;
-                let host = scr.join("newstore").join(base);
-                Ok((canon, host.to_string_lossy().into_owned()))
+            let bp = std::env::var("TD_BUILDER_PATH").ok();
+            let bs = std::env::var("TD_BUILDER_STORE").ok();
+            let bd = std::env::var("TD_BUILDER_DB").ok();
+            let builder_override = match (&bp, &bs, &bd) {
+                (Some(canonical), Some(store_dir), Some(db)) => {
+                    let base = canonical.rsplit('/').next().unwrap_or(canonical);
+                    Some(BuilderOverride {
+                        canonical: canonical.clone(),
+                        on_disk: format!("{store_dir}/{base}"),
+                        db: db.clone(),
+                    })
+                }
+                (None, None, None) => None,
+                _ => {
+                    eprintln!(
+                        "td-builder: daemon: TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let realize = |drv: &str, scr_base: &Path| -> Result<(String, String), String> {
+                // Parse the drv so its (content-addressed) first-output basename can
+                // key a STABLE per-drv scratch — the same drv always lands in the same
+                // dir, so a prior valid realization there is a cache HIT.
+                let content = std::fs::read(drv).map_err(|e| format!("read {drv}: {e}"))?;
+                let parsed =
+                    drv::parse(&content).map_err(|e| format!("parse drv {drv}: {e}"))?;
+                let first_out = parsed
+                    .outputs
+                    .first()
+                    .ok_or_else(|| format!("{drv}: derivation has no outputs"))?;
+                let key = first_out
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .ok_or_else(|| format!("{}: not a store path", first_out.path))?;
+                let scr = scr_base.join(key);
+                let mk = |regs: &[OutputReg]| -> Result<(String, String), String> {
+                    let first =
+                        regs.first().ok_or_else(|| "realize produced no outputs".to_string())?;
+                    let canon = first.store_path.clone();
+                    let base = canon
+                        .strip_prefix("/gnu/store/")
+                        .ok_or_else(|| format!("{canon}: not a store path"))?;
+                    let host = scr.join("newstore").join(base);
+                    Ok((canon, host.to_string_lossy().into_owned()))
+                };
+                // guix-daemon parity: don't rebuild a valid output. If this exact drv
+                // was already realized here AND its output is still present + NAR-verifies,
+                // serve it from cache.
+                if let Some(regs) = cached_realization(&parsed, &scr)? {
+                    eprintln!("td-builder: daemon CACHE HIT for {drv} — output already valid under {}, not rebuilding", scr.display());
+                    return mk(&regs);
+                }
+                eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
+                let regs = realize_drv(
+                    drv,
+                    std::slice::from_ref(store_db),
+                    &scr,
+                    None,
+                    builder_override.as_ref(),
+                    None,
+                )?;
+                mk(&regs)
             };
             match build_daemon::serve(socket, realize, Path::new(scratch)) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -2952,6 +3044,43 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: daemon-request: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-builder assemble-recipe — ASSEMBLE a recipe's `.drv` with NO Guile and
+        // NO realize (own-builder-daemon §5): read RECIPE-JSON + LOCK and assemble the
+        // `.drv` (store::assemble_drv) to SCRATCH/<name>-<version>.drv, WITHOUT building
+        // it — so a SEPARATE process (the persistent build daemon) realizes the
+        // td-assembled drv. The drv's builder is td's stage0 td-builder when
+        // TD_BUILDER_PATH is set (matching the daemon's TD_BUILDER_* override), else the
+        // running binary (self_store_path). Prints `DRV=<file>` then one
+        // `OUT=<name> <store-path>` per output. Usage:
+        //   assemble-recipe RECIPE-JSON-FILE LOCK SCRATCH
+        Some("assemble-recipe") if args.len() == 5 => {
+            let (recipe_file, lock, scratch) = (&args[2], &args[3], &args[4]);
+            let run = || -> Result<(), String> {
+                let recipe_json =
+                    std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
+                let builder_path = match std::env::var("TD_BUILDER_PATH").ok() {
+                    Some(p) => p,
+                    None => self_store_path()?,
+                };
+                let (drv_path, drv_file, parsed, _source) =
+                    assemble_recipe_drv(&recipe_json, lock, Path::new(scratch), &builder_path)?;
+                eprintln!(
+                    "td-builder: assemble-recipe assembled {drv_path} (no guix (derivation), no Guile, no realize)"
+                );
+                println!("DRV={}", drv_file.display());
+                for o in &parsed.outputs {
+                    println!("OUT={} {}", o.name, o.path);
+                }
+                Ok(())
+            };
+            match run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: assemble-recipe {recipe_file}: {e}");
                     ExitCode::FAILURE
                 }
             }
