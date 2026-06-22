@@ -26,13 +26,28 @@ test -s "$lock" || { echo "stage0-builder: no toolchain lock $lock" >&2; exit 1;
 # Fingerprint the builder source the stage0 is compiled from — reuse only if unchanged.
 fp=`find builder/src builder/Cargo.toml builder/Cargo.lock -type f -exec sha256sum {} + \
      | sort | sha256sum | cut -d' ' -f1`
-if [ -f "$meta" ]; then
+# A valid memo: the fingerprint matches AND the placement + db are present. Sets $cb.
+memo_hit() {
+  [ -f "$meta" ] || return 1
   oldfp=`sed -n 1p "$meta"`
   cb=`sed -n 2p "$meta"`
-  if [ "$oldfp" = "$fp" ] && [ -n "$cb" ] && [ -x "$store/`basename "$cb"`/bin/td-builder" ] && [ -s "$db" ]; then
-    echo "$cb"; exit 0
-  fi
-fi
+  [ "$oldfp" = "$fp" ] && [ -n "$cb" ] \
+    && [ -x "$store/`basename "$cb"`/bin/td-builder" ] && [ -s "$db" ]
+}
+# Fast path: a valid memo needs no lock (warm loops skip the compile AND the flock).
+if memo_hit; then echo "$cb"; exit 0; fi
+
+# Slow path: serialize build+place across concurrent gates sharing this BASEDIR. The
+# check-engine smoke tier runs several stage0-using gates with NO build-recipes to place
+# stage0 first, so they all re-place the SAME shared stage0 at once; without this lock their
+# concurrent `store-add-builder` collide ("File exists (os error 17)"). flock is from
+# util-linux (exposed by check.sh); the lock releases when fd 9 closes on exit.
+mkdir -p "$base"
+exec 9>"$base/.stage0.lock"
+flock 9
+# Double-checked: a gate that waited for the lock may now find the holder's fresh memo —
+# reuse it rather than rebuild+re-place into the same store.
+if memo_hit; then echo "$cb"; exit 0; fi
 
 work=`mktemp -d`
 trap 'rm -rf "$work"' EXIT INT TERM
