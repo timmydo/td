@@ -37,7 +37,15 @@ use std::process::Command;
 use crate::drv::Derivation;
 use crate::sys;
 
-const STORE: &str = "/gnu/store/";
+/// The store prefix WITH a trailing slash (e.g. `/gnu/store/`, or `/td/store/` when
+/// `TD_STORE_DIR` selects td's own store). Every store-path operation strips/joins this
+/// so a build targeting `/td/store` stages its inputs and writes its outputs there
+/// NATIVELY — no post-hoc `/gnu/store -> /td/store` byte rewrite. The prefix is part of
+/// the content hash (`store::make_store_path_in`), so a `/td/store` build is a distinct,
+/// guix-independent store, not a relabel of a `/gnu/store` one.
+fn store_prefix() -> String {
+    format!("{}/", crate::store::store_dir())
+}
 const GUEST_UID: u32 = 30001;
 const GUEST_GID: u32 = 30000;
 
@@ -61,15 +69,22 @@ pub fn split_closure_entry(entry: &str) -> (&str, &str) {
 
 /// build.cc storePathToName: strip the store dir and the 32-char base32
 /// hash + dash. For a drv path the result KEEPS the .drv suffix.
-pub fn store_path_name(path: &str) -> io::Result<&str> {
+/// Pure core: `prefix` is the store dir WITH trailing slash, so this is testable for
+/// any store (`/gnu/store/` or `/td/store/`) without touching process env.
+fn store_path_name_in<'a>(prefix: &str, path: &'a str) -> io::Result<&'a str> {
     let base = path
-        .strip_prefix(STORE)
+        .strip_prefix(prefix)
         .ok_or_else(|| err(format!("{path}: not a store path")))?;
     if base.len() > 33 && base.as_bytes()[32] == b'-' && !base.contains('/') {
         Ok(&base[33..])
     } else {
         Err(err(format!("{path}: malformed store path basename")))
     }
+}
+
+/// Strip the active store dir + hash, yielding the path name (`store::store_dir()`-aware).
+pub fn store_path_name(path: &str) -> io::Result<&str> {
+    store_path_name_in(&store_prefix(), path)
 }
 
 /// Run the drv's builder inside the namespace sandbox. `closure` lists every
@@ -90,6 +105,12 @@ pub fn build(
         )));
     }
 
+    // The active store dir (default /gnu/store; /td/store under TD_STORE_DIR). Every
+    // closure path the build SEES is under this prefix, the new root mounts its store
+    // here, and NIX_STORE points at it — so a /td/store build is native, not rewritten.
+    let store_dir_str = crate::store::store_dir();
+    let store_prefix = format!("{store_dir_str}/");
+
     // Stage the bind targets in the parent (plain file ops on our scratch);
     // the mounts themselves happen in the child's namespace.
     let newstore = scratch.join("newstore");
@@ -103,7 +124,7 @@ pub fn build(
             .map_err(|e| err(format!("closure item {canonical} (on disk {on_disk}): {e}")))?;
         let target = newstore.join(
             canonical
-                .strip_prefix(STORE)
+                .strip_prefix(&store_prefix)
                 .ok_or_else(|| err(format!("closure item {canonical}: not a store path")))?,
         );
         if meta.is_dir() {
@@ -159,7 +180,9 @@ pub fn build(
     let tmpfs_c = CString::new("tmpfs").unwrap();
     let procfs_c = CString::new("proc").unwrap();
     let newroot_c = cstr(&newroot);
-    let store_dir = newroot.join("gnu/store");
+    // The store dir INSIDE the new root, e.g. <newroot>/gnu/store or <newroot>/td/store
+    // (store_dir_str is absolute; strip the leading '/' to make it root-relative).
+    let store_dir = newroot.join(store_dir_str.trim_start_matches('/'));
     let store_dir_c = cstr(&store_dir);
     let tmp_dir = newroot.join("tmp");
     let tmp_dir_c = cstr(&tmp_dir);
@@ -197,7 +220,7 @@ pub fn build(
     // override semantics (later set wins).
     cmd.env("PATH", "/path-not-set");
     cmd.env("HOME", "/homeless-shelter");
-    cmd.env("NIX_STORE", "/gnu/store");
+    cmd.env("NIX_STORE", &store_dir_str);
     cmd.env("NIX_BUILD_CORES", "1");
     for (k, v) in &drv.env {
         cmd.env(k, v);
@@ -309,7 +332,7 @@ pub fn build(
     for o in &drv.outputs {
         let host = newstore.join(
             o.path
-                .strip_prefix(STORE)
+                .strip_prefix(&store_prefix)
                 .ok_or_else(|| err(format!("output {}: not a store path", o.path)))?,
         );
         fs::symlink_metadata(&host).map_err(|_| {
@@ -704,6 +727,26 @@ mod tests {
         // A slash after the hash means a path INSIDE an item, not an item.
         assert!(store_path_name(
             "/gnu/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-td-builder-0.1.0/bin/td-builder"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn store_path_name_honors_the_active_prefix() {
+        // The pure core strips whichever store dir is active — proving a /td/store build
+        // recognises its OWN paths natively (no /gnu/store assumption baked in).
+        assert_eq!(
+            store_path_name_in(
+                "/td/store/",
+                "/td/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-hello-2.12.1"
+            )
+            .unwrap(),
+            "hello-2.12.1"
+        );
+        // A /gnu/store path is NOT a /td/store path — the prefix is load-bearing.
+        assert!(store_path_name_in(
+            "/td/store/",
+            "/gnu/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-hello-2.12.1"
         )
         .is_err());
     }

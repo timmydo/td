@@ -96,9 +96,18 @@ Mes-style — is the alternative, bigger.)
 
 ## Status
 
-- 2026-06-21: step 1 (profile) done (#138). The store moves to `/td/store` (human decision);
-  Phase 0 (own-root `store-ns`) in progress on `td-store-ns`. Phases 1–3 (configurable prefix,
-  seed relocation, corpus at /td/store) are the foundational break; the UX layer follows.
+- 2026-06-21: step 1 (profile) done (#138); Phase 0 (own-root `store-ns`, #139) + Phase 1
+  (configurable prefix, #139) + the relocate primitive (#140) landed. The native `/td/store`
+  build path (Phase 3 engine) is wired + validated (branch `td-native-store`).
+- **2026-06-21 PIVOT (human — "source bootstrap first, no guix seed ever"):** Phase 2 (seed
+  *relocation*) and the relocated-seed half of Phase 3 are **SUPERSEDED**. A guix-captured
+  seed keeps guix-built bytes (a static `bash` embeds 11 `/gnu/store` strings; a rewrite only
+  relabels them), failing the "no guix *bytes*" north star. The toolchain is now built **from
+  source at `/td/store`** — see [[source-bootstrap]] (`plan/source-bootstrap.md`), the new
+  FOUNDATION track. `store-relocate` (#140) is demoted to a removable differential oracle.
+  What survives here: the **native build engine** (inputs+`NIX_STORE`+output at `store_dir()`,
+  re-hashed, rewrite-free) and the **user-PM UX layer** (profile/install/home/generations),
+  which rests on the source-bootstrapped `/td/store` toolchain once it exists.
 
 ## Verified-red
 

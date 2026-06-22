@@ -362,19 +362,27 @@ Standing posture decisions; naming them prevents surprises.
   - **General-purpose comprehensiveness** *(still a non-goal)*. The corpus is td's *target closure*
     — an appliance/image OS, Yocto/Buildroot scale (hundreds of packages), NOT
     a Nixpkgs-scale general distro.
-  - **Seed toolchain — a frozen binary tarball, NOT a live guix dependency**
-    *(re-decided 2026-06-20, human — supersedes the 2026-06-12 "seed stays
-    external, full-source bootstrap out").* Full guix independence is now the goal
-    (CLAUDE.md "North star"): td must depend on **no guix process and no guix
-    install**. The first toolchain (gcc/glibc/binutils + the few build tools td
-    cannot yet self-build) is captured **once** into a pinned, content-addressed
-    **seed tarball** — it may be *generated from* a local guix install, but td then
-    depends on the tarball, never on a live guix, and regenerates it deliberately
-    (like a channel bump). "No distro dependency" now governs the **build/loop
-    itself**, not only what td builds and runs. A Mes-style full-source
-    re-derivation of the seed is *optional, later* — a refinement of where the
-    first bytes came from, no longer a non-goal and never a blocker for guix
-    independence.
+  - **Seed toolchain — a FULL-SOURCE BOOTSTRAP at `/td/store`, no guix bytes ever**
+    *(re-decided 2026-06-21, human — supersedes the 2026-06-20 "frozen guix-captured
+    seed tarball").* The north star is **no guix process AND no guix-built bytes**.
+    A guix-captured seed — *even a static one* — fails the "no bytes" half: a static
+    `bash` still embeds `/gnu/store` strings (measured: 11, incl. glibc
+    locale/gconv/zoneinfo + a bare `/gnu/store`) and its provenance is guix. Removing
+    those by a `/gnu/store→/td/store` byte rewrite (relocation) leaves guix-*built*
+    bytes, just relabeled. So a guix seed is rejected as the foundation. Instead td's
+    toolchain is **built from source at `/td/store`** from a tiny auditable seed — the
+    well-trodden bootstrappable-builds chain (stage0-posix `hex0` → `M2`/`mes` →
+    `mescc-tools` → `tinycc` → `gcc` → `glibc` → binutils/coreutils/bash/make/…),
+    every stage configured `--prefix=/td/store`. No `/gnu/store`, no guix process, no
+    guix bytes — in strings or in provenance. This is the FOUNDATION, built **first**,
+    before the user-PM/corpus layering rests on it. It is a *port* of an existing,
+    reproducible bootstrap (guix's own Full-Source Bootstrap, live-bootstrap), not
+    research. Track: `plan/tracks/source-bootstrap.md` (the staged brick ladder).
+    The build engine it targets — `td-builder build` staging inputs + `NIX_STORE` at
+    the active `store::store_dir()` (`/td/store`), so a `/td/store` build is *native*,
+    re-hashed and rewrite-free — already exists (user-pm Phase 1/3, `TD_STORE_DIR`).
+    guix may still appear ONLY as a removable differential oracle (build the same
+    source both ways, diff the trees — directive 4), never as a build input.
 
   Phase 1 (`ts-frontend`, §7.1) replaces the spec *language* and keeps reading
   the pinned corpus underneath; corpus replacement is Phase 2, separately gated
