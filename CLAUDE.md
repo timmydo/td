@@ -9,31 +9,34 @@ index, not a pre-approval gate), and the parallel-work rules (§7.2–7.4).
 This file is your contract. The rules below are absolute and override any local
 convenience.
 
-## North star: full guix independence (human, 2026-06-20)
+## North star: full guix independence (human, 2026-06-20; sharpened 2026-06-21)
 
-**The goal is to remove guix entirely — no guix *process* AND no guix *install*
-dependency.** Today the loop runs on a host Guix (the toolchain seed, the
-differential oracle, the Guile lowering). The target end state: td builds and runs
-its whole userland with **zero dependency on a guix installation**.
+**The goal is to remove guix entirely — no guix *process* AND no guix-built *bytes*.**
+Today the loop runs on a host Guix (the toolchain seed, the differential oracle, the
+Guile lowering). The target end state: td builds and runs its whole userland with
+**zero guix bytes in its store** — not in a binary, not even as an embedded string.
 
-The mechanism is a **frozen seed-binary tarball**, NOT a Mes-style full-source
-bootstrap. The first toolchain (gcc/glibc/binutils + the few build tools td can't
-yet build itself) is captured **once** into a pinned, content-addressed tarball — it
-may be *generated from* a local guix install, but once captured td depends on the
-**tarball**, never on a live guix. The tarball is a normal fixed-output seed (like
-any pinned fetch); regenerate it deliberately, like a channel bump. From that seed td
-builds everything else with no guix in the path.
+The mechanism is a **full-source bootstrap at `/td/store`**, NOT a frozen guix-captured
+seed *(2026-06-21, human — supersedes the 2026-06-20 "binary seed tarball")*. A
+guix-captured seed fails the "no guix *bytes*" half even when static: a static `bash`
+still embeds `/gnu/store` strings (measured: 11) and is guix-*built*; a
+`/gnu/store→/td/store` rewrite only relabels guix bytes. So td's toolchain is **built
+from source at `/td/store`** from a tiny auditable seed — the bootstrappable-builds
+chain (stage0-posix `hex0` → `mes` → `mescc-tools` → `tinycc` → `gcc` → `glibc` →
+binutils/coreutils/bash/make/…), every stage `--prefix=/td/store`. No `/gnu/store`, no
+guix process, no guix bytes. This is a *port* of an existing reproducible bootstrap
+(guix's own Full-Source Bootstrap, live-bootstrap), built **first**, as the foundation
+the corpus/user-PM rests on. Track: `plan/tracks/source-bootstrap.md`.
 
-This **supersedes** the older framing where "guix is the permanent seed, retired
-last" and "full-source bootstrap is a non-goal" (DESIGN §5). Removing the guix
-dependency is now THE objective; the binary seed tarball is the accepted path to it.
-A full-source (Mes-style) re-derivation of the seed remains *optional, later* — a
-refinement of where the seed's bytes came from, never a blocker for guix independence.
-Concretely, in priority order: (1) no `guix` process in any user-facing command or
-build path (e.g. `td shell` resolves td-built packages, never `guix build`); (2) the
-toolchain seed served from the tarball, not a host guix; (3) the loop's oracle/lowering
-(`guix build --check`, `guix repl`/`system`) retired last. PLAN tracks this; DESIGN §5
-carries the detail.
+The build engine it targets already exists: `td-builder build` stages inputs and sets
+`NIX_STORE` at the active `store::store_dir()`, so a `TD_STORE_DIR=/td/store` build is
+**native** — re-hashed at `/td/store`, no post-hoc rewrite (user-pm Phase 1/3). guix may
+still appear ONLY as a removable differential oracle (build the same source both ways,
+diff — directive 4), never as a build input. Priority order: (1) no `guix` process in any
+user-facing command/build path (`td shell` resolves td-built packages, never `guix
+build`) — DONE for the shell; (2) the `/td/store` source bootstrap replaces the guix
+toolchain seed; (3) the loop's oracle/lowering (`guix build --check`, `guix repl`/`system`)
+retired last. PLAN tracks this; DESIGN §5 carries the detail.
 
 ## Prime directives (never violate)
 
@@ -349,10 +352,11 @@ it.
   the default source; nonfree inputs (firmware, blobs, crates, the `nonguix` channel)
   may be adopted when a task needs them, declared and pinned like any other input.
   Unchanged: the loop stays offline with substitutes disabled — that is a
-  reproducibility rule, not a free-software rule. A Mes-style full-source bootstrap
-  is *not required* (the North Star's frozen seed-binary tarball is the path to guix
-  independence); a source re-derivation of the seed is an optional later refinement,
-  not a goal in itself.
+  reproducibility rule, not a free-software rule. Note: a full-source bootstrap of the
+  toolchain at `/td/store` **is** now a goal (the North Star, sharpened 2026-06-21 — no
+  guix *bytes*, so a guix-captured seed is rejected and the toolchain is built from
+  source), but it is pursued for *guix independence*, not FSDG purity; nonfree inputs
+  stay adoptable where a task needs them.
 
 **Commits**
 
