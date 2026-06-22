@@ -217,8 +217,66 @@ reds — `daemon-request: connect …/sock: Connection refused (os error 111)` �
 `FAIL: request B (PERSISTENCE …)` → gate red. So the "one daemon serves multiple
 requests" assertion is non-vacuous and persistence is load-bearing. Restored → green.
 
+## Increment 8 (PR #144 — daemon-recipe): the daemon realizes a TD-ASSEMBLED real recipe into td's OWN store
+
+The maintainer's 2026-06-21 direction, made real. Context: PR #128
+("daemon-td-drv") was CLOSED as wrong-direction — it bridged a td-built artifact
+into the GUIX daemon's store so a guix-built system image could reference it. The
+steer: **shipping goes through td's OWN daemon/store**, not the guix daemon. This
+increment is that, done right.
+
+Gate 358 (build-daemon) emitted its probe drvs via `guix repl tests/daemon-drv.scm`
+— Guile in the daemon's INPUT path — and the probes were marker-only. Increment 8
+removes both gaps: the drv handed to the daemon is td-NATIVE end to end, and the
+subject is a REAL artifact.
+
+New `td-builder assemble-recipe RECIPE-JSON LOCK SCRATCH` (builder/src/main.rs): the
+assembly half of `build_recipe`, refactored into the shared `assemble_recipe_drv`
+(parse recipe → resolve lock → spec → `store::assemble_drv` → write `.drv`), now run
+WITHOUT realizing. Splitting assembly from realization is what lets the daemon, not a
+`guix repl`-emitted drv, be the build's input. The drv's builder is td's stage0
+td-builder (TD_BUILDER_PATH), so NO new `guix build -e' packager site (guix-surface
+stayed 12).
+
+The daemon (builder/src/main.rs + build_daemon.rs): now keys a CONTENT-ADDRESSED
+per-drv scratch (the drv's first-output basename) and reuses a valid prior realization
+(`cached_realization`) instead of rebuilding — guix-daemon parity, a valid output is
+not rebuilt. It accepts the stage0 builder via TD_BUILDER_* (same convention as
+build-recipe); the override is matched by PATH so it is a harmless no-op for a drv that
+does not name the stage0 (gate 358's guile probes — confirmed 358 still green in the
+full cheap+heavy run).
+
+Gate `daemon-recipe` (359, ALL-DURABLE, no guix oracle leg): td ASSEMBLES the hello
+drv with guix/Guile off PATH (builder = stage0) → the persistent daemon REALIZES it
+over a Unix socket into td's OWN scratch store → the hello runs → a 2nd request for the
+same drv is a CACHE HIT.
+- [STRUCTURAL move-off-Guile] td assembled the drv (no guix repl/Guile), builder = stage0.
+- [DURABLE structural] output under td's OWN scratch store (`…/d/<out>/newstore/…`), NOT /gnu/store.
+- [DURABLE behavioral] the daemon-built hello greets.
+- [DURABLE guix-daemon parity] the 2nd request is a cache HIT (no rebuild).
+
+Subject is `hello` (gnu, fast) so the gate is standalone + cheap and verified-red is
+cheap; the recipe JSON is a given input (the TS→JSON lowering is corpus-no-guix's
+concern — this gate's novelty is the assemble/realize SPLIT across the daemon). The
+mechanism is recipe-agnostic: shipping the heavier Rust userland (cat/coreutils) is the
+same path with a different recipe+lock (next).
+
+Verified-red (recorded, 2026-06-21):
+- CACHE leg: bypass the daemon's `cached_realization` (`if let Some(regs) =
+  None::<…>`) → both requests log `CACHE MISS … realizing`, the 2nd rebuilds, and the
+  gate reds: `FAIL: the 2nd request was not a cache HIT — the daemon rebuilt a valid
+  output`. So the guix-daemon-parity caching is load-bearing. Restored → green.
+- ASSEMBLE leg: write a TRUNCATED (empty) `.drv` from `assemble_recipe_drv` → the
+  td-assembled drv handed to the daemon is invalid, and the gate reds: `FAIL: the
+  td-assembled .drv builder is not the stage0`. So the assemble output is the
+  load-bearing input the daemon builds. Restored → green.
+
 ## Next
 
+- Ship the heavier Rust userland (uutils cat/coreutils) through the daemon-recipe
+  path — same mechanism (assemble-recipe → daemon realize into td's store), just a
+  Rust recipe+lock; the gate-cost is one cargo build, so a persistent daemon scratch
+  (cross-run cache HIT) earns its keep there.
 - A minimal-/dev builder for the standalone (no outer host_shell) daemon case
   (now has a context — the daemon — to be tested in).
 - The loop CONSUMING the daemon by default (a daemon the realize gates talk to,
