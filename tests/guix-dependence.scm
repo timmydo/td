@@ -61,32 +61,25 @@
 ;; from the td-reproducible census so it does not overstate independence.
 (define not-yet-td-built '("pkg-config"))
 
-;; Rust programs td builds via its OWN cargo path (buildSystem "rust"): the
-;; self-host td-builder, the vendored-deps demo, a real uutils tool (`cat` =
-;; uu_cat), the russh SSH demo, and the boa-based SEED TOOL td-ts-eval. These are
-;; NOT guix-corpus reconstructions — they have no `specification->package` oracle by
-;; design (the channel has no per-crate packages; td-ts-eval's oracle is `(system
-;; td-ts) td-ts-eval`, not a corpus package), so they don't fit this corpus closure
-;; census (which is rooted in guix package derivations). Their own-builder proof is
-;; the rust-build / rust-vendor / rust-uutils / rust-russh / rust-ts-eval gates (td
-;; builds them itself, reproducibly), not a corpus differential.
-;; td-cmake-demo joins them: a from-scratch cmake demonstrator (buildSystem "cmake")
-;; proving td's own cmake build path — it has no `specification->package` corpus
-;; oracle by design (it is a new capability, not a corpus reconstruction); its
-;; own-builder proof is the `cmake` gate, not a corpus differential.
-;; td-fetch joins them: td's own seed fetcher (buildSystem "rust"), a new capability
-;; with no corpus oracle; its own-builder proof is the `rust-fetch` gate.
-;; uutils joins them: the FULL uutils coreutils multicall (crate `coreutils` 0.9.0),
-;; td-built from source — named "uutils" NOT "coreutils" precisely so it does not
-;; resolve to GNU coreutils' oracle; its own-builder proof is the `rust-coreutils` gate.
-;; youki joins them: the Rust OCI container runtime (crate `youki` 0.6.0), td-built from
-;; source — a new capability with no corpus oracle; its proof is the `rust-youki` gate.
-(define self-host-specs '("td-builder" "td-vendor-demo" "cat" "td-russh-demo" "td-ts-eval" "td-cmake-demo" "td-fetch" "uutils" "youki" "fd"))
+;; SELF-HOSTED, auto-classified by `buildSystem`. A `"rust"` or `"cmake"` recipe is a
+;; td-built-from-source tool (the cargo/cmake path), NOT a guix-corpus reconstruction:
+;; it has no `specification->package` oracle by design (the channel has no per-crate
+;; packages), so it does not belong in this corpus-closure census — its own-builder
+;; proof is its own `rust-*` / `cmake` gate (it builds + is reproducible there), not a
+;; corpus differential. ONLY `"gnu"` recipes (gnu-build-system reconstructions) are
+;; owned-specs. Classifying by buildSystem instead of a hand-maintained name list means
+;; every future from-source tool is excluded automatically — no enrollment, no drift.
+(define (recipe-build-system spec)
+  (let* ((file (string-append recipe-dir "/recipe-" spec ".ts"))
+         (text (if (file-exists? file)
+                   (call-with-input-file file get-string-all) ""))
+         (m (string-match "buildSystem:[ \t]*\"([a-z]+)\"" text)))
+    (if m (match:substring m 1) "gnu")))
 
 (define owned-specs
   (sort
-   (filter (lambda (s) (not (or (member s not-yet-td-built)
-                                (member s self-host-specs))))
+   (filter (lambda (s) (and (not (member s not-yet-td-built))
+                            (string=? (recipe-build-system s) "gnu")))
            (map recipe-file->spec
                 (or (scandir recipe-dir
                              (lambda (n)
