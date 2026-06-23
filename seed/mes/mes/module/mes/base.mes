@@ -1,0 +1,156 @@
+;;; -*-scheme-*-
+
+;;; GNU Mes --- Maxwell Equations of Software
+;;; Copyright © 2016,2017,2018,2019 Jan (janneke) Nieuwenhuizen <janneke@gnu.org>
+;;; Copyright © 2023 Timothy Sample <samplet@ngyro.com>
+;;;
+;;; This file is part of GNU Mes.
+;;;
+;;; GNU Mes is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3 of the License, or (at
+;;; your option) any later version.
+;;;
+;;; GNU Mes is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;;; GNU General Public License for more details.
+;;;
+;;; You should have received a copy of the GNU General Public License
+;;; along with GNU Mes.  If not, see <http://www.gnu.org/licenses/>.
+
+
+;;; Commentary:
+
+;;; base.mes is being loaded after base-0.mes.  It provides the minimal
+;;; set of scheme primitives to run lib/test.mes.  It is safe to be
+;;; run by Guile.
+
+;;; Code:
+
+(define (caar x) (car (car x)))
+(define (cadr x) (car (cdr x)))
+(define (cdar x) (cdr (car x)))
+(define (cddr x) (cdr (cdr x)))
+
+
+(define (caaar x) (car (car (car x))))
+(define (caadr x) (car (car (cdr x))))
+(define (cadar x) (car (cdr (car x))))
+(define (caddr x) (car (cdr (cdr x))))
+
+(define (cdaar x) (cdr (car (car x))))
+(define (cdadr x) (cdr (car (cdr x))))
+(define (cddar x) (cdr (cdr (car x))))
+(define (cdddr x) (cdr (cdr (cdr x))))
+
+
+
+(define (caaaar x) (car (car (car (car x)))))
+(define (caaadr x) (car (car (car (cdr x)))))
+(define (caadar x) (car (car (cdr (car x)))))
+(define (caaddr x) (car (car (cdr (cdr x)))))
+
+(define (cadaar x) (car (cdr (car (car x)))))
+(define (cadadr x) (car (cdr (car (cdr x)))))
+(define (caddar x) (car (cdr (cdr (car x)))))
+(define (cadddr x) (car (cdr (cdr (cdr x)))))
+
+
+(define (cdaaar x) (cdr (car (car (car x)))))
+(define (cdaadr x) (cdr (car (car (cdr x)))))
+(define (cdadar x) (cdr (car (cdr (car x)))))
+(define (cdaddr x) (cdr (car (cdr (cdr x)))))
+
+(define (cddaar x) (cdr (cdr (car (car x)))))
+(define (cddadr x) (cdr (cdr (car (cdr x)))))
+(define (cdddar x) (cdr (cdr (cdr (car x)))))
+(define (cddddr x) (cdr (cdr (cdr (cdr x)))))
+
+
+
+(define (identity x) x)
+(define call/cc call-with-current-continuation)
+
+(define (command-line) %argv)
+(define (read) (read-env (current-environment)))
+
+(define-macro (and . x)
+  (if (null? x) #t
+      (if (null? (cdr x)) (car x)
+          (list 'if (car x) (cons 'and (cdr x))
+                #f))))
+
+(define-macro (or . x)
+  (if (null? x) #f
+      (if (null? (cdr x)) (car x)
+          (list (list 'lambda (list 'r)
+                      (list 'if 'r 'r
+                            (cons 'or (cdr x))))
+                (car x)))))
+
+(define (and=> value procedure) (and value (procedure value)))
+(define eqv? eq?)
+
+(define (equal? . x)
+  (if (or (null? x) (null? (cdr x))) #t
+      (if (null? (cddr x)) (equal2? (car x) (cadr x))
+          (and (equal2? (car x) (cadr x))
+               (apply equal? (cdr x))))))
+
+(define (list? x)
+  (or (null? x)
+      (and (pair? x) (list? (cdr x)))))
+
+(define-macro (cond . clauses)
+  (list 'if (pair? clauses)
+        (list (cons
+               'lambda
+               (cons
+                '(test)
+                (list (list 'if 'test
+                            (if (pair? (cdr (car clauses)))
+                                (if (eq? (car (cdr (car clauses))) '=>)
+                                    (append2 (cdr (cdr (car clauses))) '(test))
+                                    (list (cons 'lambda (cons '() (cons 'test (cdr (car clauses)))))))
+                                (list (cons 'lambda (cons '() (cons 'test (cdr (car clauses)))))))
+                            (if (pair? (cdr clauses))
+                                (cons 'cond (cdr clauses)))))))
+              (car (car clauses)))))
+
+(define else #t)
+
+(define (map2 f l1 l2)
+  (define (loop l1 l2 acc)
+    (if (or (null? l1) (null? l2))
+        (core:reverse! acc (list))
+        (loop (cdr l1) (cdr l2)
+              (cons (f (car l1) (car l2)) acc))))
+  (loop l1 l2 (list)))
+
+(define (map3 f l1 l2 l3)
+  (define (loop l1 l2 l3 acc)
+    (if (or (null? l1) (null? l2) (null? l3))
+        (core:reverse! acc (list))
+        (loop (cdr l1) (cdr l2) (cdr l3)
+              (cons (f (car l1) (car l2) (car l3)) acc))))
+  (loop l1 l2 l3 (list)))
+
+(define (map4 f l1 l2 l3 l4)
+  (define (loop l1 l2 l3 l4 acc)
+    (if (or (null? l1) (null? l2) (null? l3) (null? l4))
+        (core:reverse! acc (list))
+        (loop (cdr l1) (cdr l2) (cdr l3) (cdr l4)
+              (cons (f (car l1) (car l2) (car l3) (car l4)) acc))))
+  (loop l1 l2 l3 l4 (list)))
+
+(define (map f h . t)
+  (if (null? t)
+      (map1 f h)
+      (if (null? (cdr t))
+          (map2 f h (car t))
+          (if (null? (cddr t))
+              (map3 f h (car t) (cadr t))
+              (if (null? (cdddr t))
+                  (map4 f h (car t) (cadr t) (caddr t))
+                  (error 'unsupported (cons* "map 5:" f h t)))))))

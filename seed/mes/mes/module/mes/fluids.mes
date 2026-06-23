@@ -1,0 +1,113 @@
+;;; -*-scheme-*-
+
+;;; GNU Mes --- Maxwell Equations of Software
+;;; Copyright © 2016,2018,2024 Janneke Nieuwenhuizen <janneke@gnu.org>
+;;; Copyright © 2022,2023 Timothy Sample <samplet@ngyro.com>
+;;;
+;;; This file is part of GNU Mes.
+;;;
+;;; GNU Mes is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3 of the License, or (at
+;;; your option) any later version.
+;;;
+;;; GNU Mes is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;;; GNU General Public License for more details.
+;;;
+;;; You should have received a copy of the GNU General Public License
+;;; along with GNU Mes.  If not, see <http://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;;; Code:
+
+(mes-use-module (mes scm))
+
+;; Hide the fluid table in a lexical binding.
+(let ((fluids (make-hash-table)))
+
+  (define (make-fluid . default)
+    (let ((fluid (symbol-append 'fld: (gensym))))
+      (hashq-set! fluids fluid (and (pair? default) (car default)))
+      fluid))
+
+  (define (fluid? fluid)
+    (and (hashq-get-handle fluids fluid) #t))
+
+  (define (fluid-ref fluid)
+    (let ((handle (hashq-get-handle fluids fluid)))
+      (if handle (cdr handle)
+          (error "invalid fluid" fluid))))
+
+  (define (fluid-set! fluid value)
+    (let ((handle (hashq-get-handle fluids fluid)))
+      (if handle (set-cdr! handle value)
+          (error "invalid fluid" fluid))))
+
+  (hashq-set! (initial-module) 'make-fluid (make-variable make-fluid))
+  (hashq-set! (initial-module) 'fluid? (make-variable fluid?))
+  (hashq-set! (initial-module) 'fluid-ref (make-variable fluid-ref))
+  (hashq-set! (initial-module) 'fluid-set! (make-variable fluid-set!)))
+
+(define (with-fluid* fluid value thunk)
+  (let ((outer-value #f)
+        (inner-value value))
+    (dynamic-wind
+      (lambda ()
+        (set! outer-value (fluid-ref fluid))
+        (fluid-set! fluid inner-value))
+      thunk
+      (lambda ()
+        (set! inner-value (fluid-ref fluid))
+        (fluid-set! fluid outer-value)))))
+
+;; (define-macro (with-fluids*-macro fluids values thunk)
+;;   `(begin
+;;      ,@(map (lambda (f v) (list 'set! f v)) fluids values)
+;;      (,thunk)))
+
+;; (define (with-fluids*-next fluids values thunk)
+;;   `(with-fluids*-macro ,fluids ,values ,thunk))
+
+;; (define (with-fluids* fluids values thunk)
+;;   (primitive-eval (with-fluids*-next fluids values thunk)))
+
+(define-macro (with-fluids bindings . bodies)
+  (let loop ((bindings (reverse bindings))
+             (initializations '())
+             (save-outers '())
+             (set-inners '())
+             (save-inners '())
+             (set-outers '()))
+    (cond
+     ((pair? bindings)
+      (let ((fluid (caar bindings))
+            (value (cadar bindings))
+            (inner-sym (gensym))
+            (outer-sym (gensym)))
+        (loop (cdr bindings)
+              (cons `(,outer-sym #f)
+                    (cons `(,inner-sym ,value)
+                          initializations))
+              (cons `(set! ,outer-sym (fluid-ref ,fluid)) save-outers)
+              (cons `(fluid-set! ,fluid ,inner-sym) set-inners)
+              (cons `(set! ,inner-sym (fluid-ref ,fluid)) save-inners)
+              (cons `(fluid-set! ,fluid ,outer-sym) set-outers))))
+     (else
+      `(let ,initializations
+         (dynamic-wind
+           (lambda ()
+             ,@save-outers
+             ,@set-inners)
+           (lambda () ,@bodies)
+           (lambda ()
+             ,@save-inners
+             ,@set-outers)))))))
+
+(define (with-fluids* fluids values thunk)
+  (if (null? fluids) (thunk)
+      (with-fluid* (car fluids) (car values)
+                   (lambda _
+                     (with-fluids* (cdr fluids) (cdr values) thunk)))))

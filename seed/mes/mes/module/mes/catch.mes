@@ -1,0 +1,98 @@
+;;; -*-scheme-*-
+
+;;; GNU Mes --- Maxwell Equations of Software
+;;; Copyright © 2016,2018,2020 Jan (janneke) Nieuwenhuizen <janneke@gnu.org>
+;;; Copyright © 2023 Timothy Sample <samplet@ngyro.com>
+;;;
+;;; This file is part of GNU Mes.
+;;;
+;;; GNU Mes is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3 of the License, or (at
+;;; your option) any later version.
+;;;
+;;; GNU Mes is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;;; GNU General Public License for more details.
+;;;
+;;; You should have received a copy of the GNU General Public License
+;;; along with GNU Mes.  If not, see <http://www.gnu.org/licenses/>.
+
+(mes-use-module (mes let))
+(mes-use-module (mes fluids))
+
+(define %eh (make-fluid
+             (lambda (key . args)
+               (core:display-error "unhandled exception: ")
+               (core:display-error key)
+               (core:display-error ": ")
+               (core:write-error args)
+               (core:display-error "\n")
+               (core:display-error "Backtrace:\n")
+               (display-backtrace (make-stack) (current-error-port))
+               (abort))))
+
+(define (catch key thunk handler)
+  ;; XXX: The use of mutation here should not be necessary, but trying
+  ;; to call a thunk returned directly via a continuation triggers a bug
+  ;; in Mes.  Setting the local variable first and then calling it
+  ;; avoids that bug.
+  (let ((return #t))
+
+    (define (make-eh set-return!)
+      (lambda (k . args)
+        (set-return!
+         (lambda ()
+           (let ((handler* (if (or (eq? key #t) (eq? key k))
+                               handler
+                               (fluid-ref %eh))))
+             (apply handler* k args))))))
+
+    (set! return
+          (call/cc
+           (lambda (set-return!)
+             (with-fluid* %eh (make-eh set-return!)
+                          (lambda ()
+                            (let ((result (thunk)))
+                              (lambda () result)))))))
+
+    (return)))
+
+(define (throw key . args)
+  (let ((handler (fluid-ref %eh)))
+    (apply handler (cons key args))))
+
+(define with-throw-handler catch) ; FIXME: hack for Nyacc 0.75
+
+(define (frame-procedure frame)
+  (let ((f (struct-ref frame 3)))
+    (or (builtin? f)
+        (closure? f))))
+
+(define (display-frame frame port)
+  (core:display-error "  ")
+  (let ((f (struct-ref frame 3)))
+    (cond ((builtin? f)
+           (core:display-error "[b] ")
+           (core:display-error "(")
+           (core:display-error (struct-ref f 3))
+           (for-each (lambda (i) (core:display-error " _")) (iota (struct-ref f 4)))
+           (core:display-error ")"))
+          ((closure? f)
+           (core:display-error "[c] ")
+           (let* ((circ (core:car (core:cdr f)))
+                  (name (core:car (core:car (core:cdr circ))))
+                  (args (core:car (core:cdr (core:cdr f)))))
+             (core:display-error (cons name args))))
+          (else
+           (core:display-error "[u] ")
+           (core:display-error f))))
+  (core:display-error "\n"))
+
+(define (display-backtrace stack port . rest)
+  (let* ((frames (map (lambda (i) (stack-ref stack i)) (iota (stack-length stack))))
+         (call-frames (filter frame-procedure frames))
+         (trace-frames (reverse call-frames))
+         (display-frames (cdr trace-frames)))
+    (for-each (lambda (f) (display-frame f port)) display-frames)))

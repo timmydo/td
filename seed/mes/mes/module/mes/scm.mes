@@ -1,0 +1,574 @@
+;;; -*-scheme-*-
+
+;;; GNU Mes --- Maxwell Equations of Software
+;;; Copyright © 2016,2017,2018,2019,2022 Janneke Nieuwenhuizen <janneke@gnu.org>
+;;; Copyright © 2023 Ekaitz Zarraga <ekaitz@elenq.tech>
+;;; Copyright © 2022,2023 Timothy Sample <samplet@ngyro.com>
+;;;
+;;; This file is part of GNU Mes.
+;;;
+;;; GNU Mes is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3 of the License, or (at
+;;; your option) any later version.
+;;;
+;;; GNU Mes is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;;; GNU General Public License for more details.
+;;;
+;;; You should have received a copy of the GNU General Public License
+;;; along with GNU Mes.  If not, see <http://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;;; scm.mes is loaded after base, quasiquote and let.  It provides
+;;; basic Scheme functions bringing Mes close to basic RRS Scheme (no
+;;; labels, processes, fluids or throw/catch).
+
+;;; Code:
+
+(mes-use-module (mes let))
+
+(define (cadddr x) (car (cdddr x)))
+
+(define-macro (case val . args)
+  (if (null? args) #f
+      (let ((clause (car args)))
+        (let ((pred (car clause)))
+          (let ((body (cdr clause)))
+           (if (pair? pred) `(if ,(if (null? (cdr pred))
+                                      `(eq? ,val ',(car pred))
+                                      `(member ,val ',pred))
+                                 (begin ,@body)
+                                 (case ,val ,@(cdr args)))
+               `(begin ,@body)))))))
+
+(define-macro (when expr . body)
+  `(if ,expr
+       ((lambda () ,@body))))
+
+(define-macro (unless expr . body)
+  `(if (not ,expr)
+       ((lambda () ,@body))))
+
+(define-macro (do init test . body)
+  `(let loop ((,(caar init) ,(cadar init)))
+     (when (not ,@test)
+       ,@body
+       (loop ,@(cddar init)))))
+
+(define (for-each f l . xr)
+  (if (and (pair? l)
+           (or (null? xr)
+               (pair? (car xr))))
+      (if (null? xr) (begin (f (car l)) (for-each f (cdr l)))
+          (if (null? (cdr xr)) (begin (f (car l) (caar xr)) (for-each f (cdr l) (cdar xr)))))))
+
+(define core:error error)
+
+(define (error who . rest)
+  (display "error:" (current-error-port))
+  (display who (current-error-port))
+  (display ":" (current-error-port))
+  (display rest (current-error-port))
+  (newline (current-error-port))
+  (display "exiting...\n" (current-error-port))
+  (core:error (if (symbol? who) who 'error) (cons who rest)))
+
+(define (syntax-error message . rest)
+  (display "syntax-error:" (current-error-port))
+  (display message (current-error-port))
+  (display ":" (current-error-port))
+  (display rest (current-error-port))
+  (newline (current-error-port))
+  (core:error 'syntax-error (cons message rest)))
+
+
+(define integer? number?)
+
+(define (read . port)
+  (if (null? port) (read-env (current-environment))
+      (let* ((prev (set-current-input-port (car port)))
+             (result (read-env (current-environment))))
+        result)))
+
+(if (not (defined? 'peek-char))
+    (define (peek-char)
+      (integer->char (peek-byte))))
+
+(if (not (defined? 'read-char))
+    (define (read-char)
+      (integer->char (read-byte))))
+
+(if (not (defined? 'unread-char))
+    (define (unread-char c)
+      (integer->char (unread-byte (char->integer c)))))
+
+(define (assq-set! alist key val)
+  (let ((entry (assq key alist)))
+    (if (not entry) (acons key val alist)
+        (let ((entry (set-cdr! entry val)))
+          alist))))
+
+(define (assq-ref alist key)
+  (and alist
+       (let ((entry (assq key alist)))
+         (if entry (cdr entry)
+             #f))))
+
+(define assv assq)
+(define assv-ref assq-ref)
+
+(define (assoc-ref alist key)
+  (and (pair? alist)
+       (let ((entry (assoc key alist)))
+         (if entry (cdr entry)
+             #f))))
+
+(define (assoc-set! alist key value)
+  (let ((entry (assoc key alist)))
+    (if (not entry) (acons key value alist)
+        (let ((entry (set-cdr! entry value)))
+          alist))))
+
+(define memv memq)
+
+(define (member x lst)
+  (if (null? lst) #f
+      (if (equal? x (car lst)) lst
+          (member x (cdr lst)))))
+
+
+;;; Lists
+(define (make-list n . x)
+  (let ((fill (if (pair? x) (car x) *unspecified*)))
+    (let loop ((n n))
+      (if (= 0 n) '()
+          (cons fill (loop (- n 1)))))))
+
+(define (list-ref lst k)
+  (let loop ((lst lst) (k k))
+    (if (= 0 k) (car lst)
+        (loop (cdr lst) (- k 1)))))
+
+(define (list-set! lst k v)
+  (let loop ((lst lst) (k k))
+    (if (= 0 k) (set-car! lst v)
+        (loop (cdr lst) (- k 1)))))
+
+(define (list-head x n)
+  (define (loop lst n acc)
+    (if (= 0 n)
+        (core:reverse! acc (list))
+        (loop (cdr lst) (- n 1) (cons (car lst) acc))))
+  (loop x n (list)))
+
+(define (list-tail x n)
+  (if (= 0 n) x
+      (list-tail (cdr x) (- n 1))))
+
+(define (iota n)
+  (cond
+    ((< n 0) (throw 'wrong-type-arg n))
+    ((= n 0) '())
+    (else (append2 (iota (- n 1)) (list (- n 1))))))
+
+(define (reverse lst)
+  (let loop ((lst lst) (r '()))
+    (if (null? lst) r
+        (loop (cdr lst) (cons (car lst) r)))))
+
+(define (filter pred lst)
+  (let loop ((lst lst) (acc (list)))
+    (if (null? lst)
+        (core:reverse! acc (list))
+        (loop (cdr lst)
+              (if (pred (car lst))
+                  (cons (car lst) acc)
+                  acc)))))
+
+(define (delete x lst)
+  (filter (lambda (e) (not (equal? e x))) lst))
+
+(define (delq x lst)
+  (filter (lambda (e) (not (eq? e x))) lst))
+
+(define (compose proc . rest)
+  (if (null? rest) proc
+      (lambda args
+        (proc (apply (apply compose rest) args)))))
+
+
+;; Hash
+
+(define (hashq-ref table key . rest)
+  (core:hashq-ref table key (and (pair? rest) (car rest))))
+
+(define (hash-ref table key . rest)
+  (core:hash-ref table key (and (pair? rest) (car rest))))
+
+(define (hash-map->list proc table)
+  (let ((buckets (hash-buckets table)))
+    (let loop ((i 0) (acc '()))
+      (if (>= i (vector-length buckets)) (reverse! acc)
+          (let ((alist (vector-ref buckets i)))
+            (loop (+ i 1)
+                  (if (eq? alist *unspecified*) acc
+                      (append-reverse (map (lambda (handle)
+                                             (proc (car handle)
+                                                   (cdr handle)))
+                                           alist)
+                                      acc))))))))
+
+(define (hash-fold proc init table)
+  (let loop ((handles (hash-map->list cons table)) (acc init))
+    (if (null? handles) acc
+        (loop (cdr handles)
+              (proc (caar handles) (cdar handles) acc)))))
+
+(define (hash-for-each proc table)
+  (hash-map->list proc table)
+  ;;(hash-fold (lambda (key value x) (proc key value)) #f table)
+  *unspecified*)
+
+
+;; Variable
+(define (make-undefined-variable)
+  (make-variable *undefined*))
+
+;; This should be 'variable-defined?', but this is Guile's name.
+(define (variable-bound? var)
+  (not (eq? (variable-ref var) *undefined*)))
+
+
+;; Vector
+(define (vector . rest) (list->vector rest))
+
+(define (vector-copy x)
+  (list->vector (vector->list x)))
+
+
+;;; Bytevectors
+(define bytevector? bytes?)
+
+(define (bytevector-length bv)
+  (if (bytevector? bv)
+      (core:car bv)
+      (core:error "bytevector-length: Wrong type" bv)))
+
+
+;;; Strings/srfi-13
+(define (make-string n . fill)
+  (list->string (apply make-list n fill)))
+
+(define (substring s start . rest)
+  (let* ((end (if (pair? rest) (car rest) (string-length s)))
+         (lst (list-tail (string->list s) start)))
+    (list->string (if (not end) lst
+                      (list-head lst (- end start))))))
+
+(define (string-prefix? prefix string . rest)
+  (let* ((start (if (pair? rest) (car rest) 0))
+         (rest  (if (pair? rest) (cdr rest) '()))
+         (end   (if (pair? rest) (car rest) (string-length prefix)))
+         (length (string-length string))
+         (prefix-length (- end start)))
+    (and
+     (>= length prefix-length)
+     (equal? (substring string 0 prefix-length)
+             (substring prefix start end)))))
+
+(define (string-suffix? suffix string . rest)
+  (let* ((start (if (pair? rest) (car rest) 0))
+         (rest  (if (pair? rest) (cdr rest) '()))
+         (end   (if (pair? rest) (car rest) (string-length suffix)))
+         (length (string-length string))
+         (suffix-length (- end start)))
+    (and
+     (>= length suffix-length)
+     (equal? (substring string (- length suffix-length))
+             (substring suffix start end)))))
+
+(define (string->number s . rest)
+  (if (string-prefix? "#x" s) (string->number (string-drop s 2) 16)
+      (let ((lst (string->list s)))
+        (and (pair? lst)
+             (let* ((radix (if (null? rest) 10 (car rest)))
+                    (sign (if (and (pair? lst) (char=? (car lst) #\-)) -1 1))
+                    (lst (if (= sign -1) (cdr lst) lst)))
+               (let loop ((lst lst) (n 0))
+                 (if (null? lst) (* sign n)
+                     (let ((i (char->integer (car lst))))
+                       (cond ((and (>= i (char->integer #\0))
+                                   (<= i (char->integer #\9)))
+                              (let ((d (char->integer #\0)))
+                                (loop (cdr lst) (+ (* n radix) (- i d)))))
+                             ((and (= radix 16)
+                                   (>= i (char->integer #\a))
+                                   (<= i (char->integer #\f)))
+                              (let ((d (char->integer #\a)))
+                                (loop (cdr lst) (+ (* n radix) (- i (- d 10))))))
+                             ((and (= radix 16)
+                                   (>= i (char->integer #\A))
+                                   (<= i (char->integer #\F)))
+                              (let ((d (char->integer #\A)))
+                                (loop (cdr lst) (+ (* n radix) (- i (- d 10))))))
+                             ((= i (char->integer #\.)) ; minimal FLOAT support
+                              (let ((fraction (cdr lst)))
+                                (if (null? fraction) n
+                                    (let ((fraction ((compose string->number list->string) fraction)))
+                                      (and fraction n))))) ; FLOAT as integer
+                             (else #f))))))))))
+
+(define inexact->exact identity)
+
+(define (number->string n . rest)
+  (let* ((radix (if (null? rest) 10 (car rest)))
+         (sign (if (< n 0) '(#\-) '())))
+    (let loop ((n (abs n)) (lst '()))
+      (let* ((i (abs (remainder n radix)))
+             (lst (cons (integer->char (+ i (if (< i 10) (char->integer #\0)
+                                                (- (char->integer #\a) 10)))) lst))
+             (n (quotient n radix)))
+        (if (= 0 n) (list->string (append sign lst))
+            (loop n lst))))))
+
+
+;;; Symbols
+(define (symbol-prefix? prefix symbol)
+  (string-prefix? (symbol->string prefix) (symbol->string symbol)))
+
+(define (symbol-append . rest)
+  (string->symbol (apply string-append (map symbol->string rest))))
+
+(define gensym
+  (let ((counter 0))
+    (lambda (. rest)
+      (let ((value (number->string counter)))
+        (set! counter (+ counter 1))
+        (string->symbol (string-append "g" value))))))
+
+
+;;; Keywords
+(define (keyword->symbol s)
+  (string->symbol (keyword->string s)))
+
+
+;;; Characters
+(define (char=? x y)
+  (and (char? x) (char? y)
+       (eq? x y)))
+
+(define (char<? a b) (< (char->integer a) (char->integer b)))
+(define (char>? a b) (> (char->integer a) (char->integer b)))
+(define (char<=? a b) (<= (char->integer a) (char->integer b)))
+(define (char>=? a b) (>= (char->integer a) (char->integer b)))
+
+(define (char-alphabetic? x)
+  (and (char? x)
+       (let ((i (char->integer x)))
+        (or (and (>= i (char->integer #\A)) (<= i (char->integer #\Z)))
+            (and (>= i (char->integer #\a)) (<= i (char->integer #\z)))))))
+
+(define (char-numeric? x)
+  (and (char? x)
+       (let ((i (char->integer x)))
+         (and (>= i (char->integer #\0)) (<= i (char->integer #\9))))))
+
+
+;;; Math
+(define quotient /)
+
+(define <= #f)
+(define >= #f)
+
+(let ()
+  (define (every-two pred lst)
+    (or (null? lst)
+        (let loop ((lst lst))
+          (or (null? (cdr lst))
+              (and (pred (car lst) (cadr lst))
+                   (loop (cdr lst)))))))
+  (set! <= (lambda args
+             (every-two (lambda (a b) (or (= a b) (< a b)))
+                        args)))
+  (set! >= (lambda args
+             (every-two (lambda (a b) (or (= a b) (> a b)))
+                        args))))
+
+(define (remainder x y)
+  (- x (* (quotient x y) y)))
+
+(define (even? x)
+  (= 0 (remainder x 2)))
+
+(define (odd? x)
+  (= 1 (remainder x 2)))
+
+(define (negative? x)
+  (< x 0))
+
+(define (positive? x)
+  (> x 0))
+
+(define (zero? x)
+  (= x 0))
+
+(define (1+ x)
+  (+ x 1))
+
+(define (1- x)
+  (- x 1))
+
+(define (abs x)
+  (if (>= x 0) x (- x)))
+
+(define (expt x y)
+  (let loop ((s 1) (count y))
+    (if (= 0 count) s
+        (loop (* s x) (- count 1)))))
+
+(define (max x . rest)
+  (if (null? rest) x
+      (let ((y (car rest)))
+        (let ((z (if (> x y) x y)))
+          (apply max (cons z (cdr rest)))))))
+
+(define (min x . rest)
+  (if (null? rest) x
+      (let ((y (car rest)))
+        (let ((z (if (< x y) x y)))
+          (apply min (cons z (cdr rest)))))))
+
+(define (negate proc)
+  (lambda args
+    (not (apply proc args))))
+
+(define ceil identity)
+(define floor identity)
+(define round identity)
+(define inexact->exact identity)
+(define exact->inexact identity)
+
+(define (const . rest)
+  (lambda (. _)
+    (car rest)))
+
+
+;;; Dynamic winding
+
+;; This is a Scheme-level implementation of 'dynamic-wind'.  It assumes
+;; that the only way to manipulate the call stack (besides procedure
+;; application) is 'call-with-current-continuation' ('call/cc').  It
+;; works by wrapping 'call/cc' so that it produces continuations that
+;; know how to unwind and rewind the stack.  Then, when those
+;; continuations are used, all of the guards setup by calls to
+;; 'dynamic-wind' will be invoked as expected.
+;;
+;; N.B., it would be smarter to support this deeper down in the C code.
+;; For instance, since Mes already has a very explicit stack it wouldn't
+;; be too hard to add something like continuation marks to it
+;; <https://srfi.schemers.org/srfi-157/srfi-157.html>.  However, I
+;; already had this code lying around; it will work for now.
+
+(let ((%call/cc call-with-current-continuation))
+
+  ;; This is where we will store the dynamic stack.
+  (define dynamic-stack '())
+
+  ;; Create a frame for the dynamic stack.  The thunk BEFORE will be
+  ;; run whenever the dynamic stack is wound past this frame, and the
+  ;; thunk AFTER will be run whenever the dynamic stack is unwound
+  ;; past this frame.
+  (define (make-frame before after)
+    (cons (+ (dynamic-stack-length dynamic-stack) 1)
+          (cons before after)))
+
+  ;; Return the lengh of the dynamic stack STACK.
+  (define (dynamic-stack-length stack)
+    (if (null? stack) 0 (caar stack)))
+
+  ;; Push FRAME onto the dynamic stack and run its 'before' thunk.
+  (define (dynamic-stack-push! frame)
+    ((cadr frame))
+    (set! dynamic-stack (cons frame dynamic-stack)))
+
+  ;; Pop a frame off of the dynamic stack and run its 'after' thunk.
+  (define (dynamic-stack-pop!)
+    (let ((frame (car dynamic-stack)))
+      ((cddr frame))
+      (set! dynamic-stack (cdr dynamic-stack))))
+
+  ;; Unwind the dynamic stack back to the state TARGET, running the
+  ;; 'after' thunks of any frames removed from the stack.
+  (define (unwind-stack! target)
+    (let loop ((target target) (acc '()))
+      (if (eq? target dynamic-stack)
+          ;; The two stacks are equal.  Return all the frames removed
+          ;; from the target stack in reverse order (that will make
+          ;; winding easy).
+          acc
+          ;; The two stacks are different.  Try to unify them.
+          (let ((t-len (dynamic-stack-length target))
+                (d-len (dynamic-stack-length dynamic-stack)))
+            (if (= t-len d-len)
+                ;; The two stacks are different but have equal length.
+                ;; Remove a frame from both of them.
+                (begin
+                  (dynamic-stack-pop!)
+                  (loop (cdr target) (cons (car target) acc)))
+                (if (< t-len d-len)
+                    ;; The target stack is shorter.  Remove a frame
+                    ;; the current dynamic stack.
+                    (begin
+                      (dynamic-stack-pop!)
+                      (loop target acc))
+                    ;; The target stack is longer.  Remove a frame
+                    ;; from the target stack.
+                    (loop (cdr target) (cons (car target) acc))))))))
+
+  ;; Push each frame in FRAMES onto the dynamic stack, running their
+  ;; 'before' thunks in order.
+  (define (wind-stack! frames)
+    (if (null? frames)
+        #t
+        (begin
+          (dynamic-stack-push! (car frames))
+          (wind-stack! (cdr frames)))))
+
+  ;; A unique object for identifying continuations that perform
+  ;; dynamic winding.
+  (define continuation-tag (list 'continuation-tag))
+
+  ;; Convert RAW-CONT to a continuation that performs dynamic winding.
+  ;;
+  ;; TODO: Use a record type.
+  (define (make-continuation raw-cont)
+    (list continuation-tag raw-cont dynamic-stack))
+
+  (define continuation-cont cadr)
+  (define continuation-stack caddr)
+
+  ;; Continue the continuation CONT with value VAL.
+  (define (apply-continuation cont val)
+    ;; Check the type of CONT.
+    (wind-stack! (unwind-stack! (continuation-stack cont)))
+    ((continuation-cont cont) val))
+
+  (define (dynamic-wind before thunk after)
+    (dynamic-stack-push! (make-frame before after))
+    (let ((result (thunk)))
+      (dynamic-stack-pop!)
+      result))
+
+  (define (call/cc proc)
+    (%call/cc (lambda (raw-cont)
+                (let ((cont (make-continuation raw-cont)))
+                  (proc (lambda (val)
+                          (apply-continuation cont val)))))))
+
+  (hashq-set! (initial-module) 'dynamic-wind (make-variable dynamic-wind))
+  (hashq-set! (initial-module) 'call-with-current-continuation
+              (make-variable call/cc))
+  (hashq-set! (initial-module) 'call/cc (make-variable call/cc)))
