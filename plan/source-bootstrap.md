@@ -116,7 +116,18 @@ upward:
      arena → `./tcc`. The mescc script's `-L` dir (`share/guile/site/2.2`) must be populated with the
      mes modules (install leaves it empty; GUILE_LOAD_PATH=nyacc only — putting mes modules there
      crashes gash, per the parallel-agent finding).
-5. **gcc (old) → gcc (modern)** — staged gcc builds, `--prefix=/td/store`.
+5. **gcc toolchain (make → binutils → gcc)** — 🚧 first rung DONE (2026-06-23). A staged chain,
+   landed rung by rung, mirroring guix's mesboot:
+   - **make** ✅ — the `bootstrap-make` gate (`mk/gates/370`) builds seed → Mes → MesCC → tcc (bricks
+     0-4), then tcc (`CC=tcc`) compiles **GNU Make 3.80** (`seed/sources/make-*.lock`) — tcc's first
+     substantial real-program build (guix's make-mesboot0). DURABLE: pinned-input, no-guix (no
+     gcc/guile/guix; no `/gnu/store` in make), behavioral (32-bit ELF, `GNU Make 3.80` runs), repro.
+     Setup learned: brick-4 tcc has `crtprefix=.` so crt1.o/crti.o/crtn.o/libc.a are copied into the
+     build dir; `-static` avoids the `/lib/mes-loader` interpreter (no root on host); mes `include`
+     dirs feed `CPP=tcc -E`. make embeds its build path → repro builds at the same dir.
+   - **binutils-mesboot0** (as/ld) — next, built with tcc + make.
+   - **gcc-core-mesboot0** (gcc 2.95.3) — then gcc-mesboot1 (4.6.4) → gcc-mesboot (4.7.4),
+     `--prefix=/td/store`. (The hardest rungs; guix carries many patches.)
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
