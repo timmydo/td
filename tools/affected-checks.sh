@@ -353,21 +353,32 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-mes ;;
 
-    tests/bootstrap-mescc.sh|seed/sources/nyacc-*.lock)
+    tests/bootstrap-mescc.sh)
       add_preflight shell-syntax
       add_target bootstrap-mescc ;;
+
+    tests/bootstrap-tcc.sh|seed/sources/tcc-*.lock)
+      add_preflight shell-syntax
+      add_target bootstrap-tcc ;;
+
+    seed/sources/nyacc-*.lock)
+      add_preflight shell-syntax
+      add_target bootstrap-mescc
+      add_target bootstrap-tcc ;;
 
     seed/sources/mes-*.lock|tools/warm-bootstrap-sources.sh)
       add_preflight shell-syntax
       add_target bootstrap-mes
-      add_target bootstrap-mescc ;;
+      add_target bootstrap-mescc
+      add_target bootstrap-tcc ;;
 
     seed/stage0/*)
       add_preflight shell-syntax
       add_target bootstrap-seed
       add_target bootstrap-cc
       add_target bootstrap-mes
-      add_target bootstrap-mescc ;;
+      add_target bootstrap-mescc
+      add_target bootstrap-tcc ;;
 
     tests/store-ns.sh)
       add_preflight shell-syntax
