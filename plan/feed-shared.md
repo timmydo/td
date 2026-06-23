@@ -59,10 +59,12 @@ many agents/worktrees, so those downloads happen ONCE into a shared store.
 ## Brick status
 - Inc1a sidecar serve/warm — DONE (td-feed gate green).
 - Inc1b feed-ensure + feed-shared gate — DONE (feed-shared gate green).
-- Inc2 wiring — IN PROGRESS. Plan: wire `tools/warm-bootstrap-sources.sh` to source each
-  bootstrap tarball via the SHARED feed (feed-ensure + `td-feed warm` into ~/.td/feed +
-  copy out), with a fallback to today's direct td-fetch. This shares the bootstrap
-  sources (today per-worktree in .td-build-cache/sources/) across worktrees WITHOUT a
-  check.sh spine edit (each warm script self-bootstraps the daemon via feed-ensure's
-  flock). tsgo is already /gnu/store-shared, so lower value there. Index extended to
-  catalog the bootstrap sources (gen-feed-index.sh scans seed/sources/*.lock).
+- Inc2 wiring — DONE. `tools/warm-bootstrap-sources.sh` routes each bootstrap tarball
+  through the shared feed: feed-ensure → `td-feed warm` into ~/.td/feed (egress only if
+  cold) → `td-fetch` reads it via TD_FEED_BASE (offline), with a direct-td-fetch fallback.
+  No check.sh spine edit (the warm script self-bootstraps the daemon via feed-ensure).
+  **Validated** (`./check.sh td-feed feed-shared bootstrap-mes bootstrap-mescc
+  bootstrap-tcc` all GREEN, full loop waived): the gate prelude warmed mes/nyacc/tcc via
+  the shared feed (~/.td/feed) and the bootstrap chain built mes/mescc/tcc from them.
+  Host-validated the sharing: a 2nd worktree (cold sources, warm feed) got all three
+  OFFLINE from the shared feed; the cold feed egresses once, then shares.
