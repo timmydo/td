@@ -40,6 +40,24 @@ fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Reroute through the td-feed mirror when `TD_FEED_BASE` is set: rewrite an upstream
+/// `https://HOST/PATH` (or `http://…`) to `$TD_FEED_BASE/HOST/PATH` — the feed's URL-path
+/// mirror layout (feed/, td-feed). Verification is unchanged: the sha256 still pins the
+/// content, and the feed re-verifies on serve, so routing through it is safe. Unset (or a
+/// non-http URL) ⇒ the URL is returned as-is. This is how td-native fetchers' web requests
+/// are served through the feed (the offline loop points TD_FEED_BASE at the warm feed).
+fn feed_url(url: &str) -> String {
+    match std::env::var("TD_FEED_BASE") {
+        Ok(base) if !base.is_empty() => {
+            match url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+                Some(rest) => format!("{}/{}", base.trim_end_matches('/'), rest),
+                None => url.to_string(),
+            }
+        }
+        _ => url.to_string(),
+    }
+}
+
 /// Fetch `url`, verify its sha256 == `want`; exit(1) on mismatch. Returns the bytes.
 fn fetch_verified(url: &str, want: &str) -> Vec<u8> {
     let body = get_body(url);
@@ -70,9 +88,16 @@ fn main() {
     match a.get(1).map(String::as_str) {
         Some("fetch") if a.len() == 5 => {
             let (url, want, out) = (&a[2], a[3].to_lowercase(), &a[4]);
-            let body = fetch_verified(url, &want);
+            // Reroute through the td-feed mirror if TD_FEED_BASE is set; verify either way.
+            let effective = feed_url(url);
+            let body = fetch_verified(&effective, &want);
             std::fs::write(out, &body).expect("write out");
-            println!("td-fetch: {} bytes, sha256 {} -> {}", body.len(), want, out);
+            let via = if effective != *url {
+                format!(" (via feed {effective})")
+            } else {
+                String::new()
+            };
+            println!("td-fetch: {} bytes, sha256 {} -> {}{}", body.len(), want, out, via);
         }
         Some("selftest") if a.len() == 4 => {
             let (file, want) = (a[2].clone(), a[3].to_lowercase());
