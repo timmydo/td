@@ -46,4 +46,17 @@ PATH / td store / no daemon / no `guix build`). Surface this directive-4 refinem
   crate entries (drop /gnu/store crate strings); regen from Cargo.lock.
 
 ## Verified-red evidence
-(record per brick)
+
+### B1 (2026-06-23, commit 01526f5)
+`collect_vendor_crates` unit test (`cargo test`, check-engine tier), perturbed:
+- drop the `.crate` extension filter → `README.txt` leaks into the set → `assert_eq` fails.
+- don't strip the `.crate` suffix → nv is `adler2-2.0.0.crate` not `adler2-2.0.0` → fails.
+Restored → 58/58 builder tests green.
+
+## Brick status
+- B1 run_rust TD_VENDOR_DIR — DONE (commit 01526f5, verified-red, 58 tests green).
+- B2 build-recipe exposes an interned vendor tree + sets TD_VENDOR_DIR — NEXT (engine work:
+  store-add-recursive the crate set, pass its td store/db to build-recipe like srcstore/srcdb,
+  add a lock class for the vendor dir; the closure machinery already spans multiple dbs).
+- B3 guix-free gate (td-fetch PoC) — after B2.
+- B4 scale + lock cleanup — after B3.
