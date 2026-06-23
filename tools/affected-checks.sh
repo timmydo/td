@@ -296,6 +296,10 @@ map_path() {
       add_preflight shell-syntax
       add_target td-feed ;;
 
+    tools/feed-ensure.sh)
+      add_preflight shell-syntax
+      add_target feed-shared ;;
+
     tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh)
       add_preflight shell-syntax
       add_build_gate_targets ;;
@@ -597,6 +601,7 @@ run_self_test() {
   assert_target tests/ts/recipe-td-feed.ts td-feed
   assert_target tests/td-feed.lock td-feed
   assert_target tests/td-feed.index td-feed
+  assert_target tools/feed-ensure.sh feed-shared
   assert_target feed/src/main.rs td-feed
   assert_target tests/ts/recipe-td-cmake-demo.ts cmake
   assert_target tests/td-cmake-demo.lock cmake
