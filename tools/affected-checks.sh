@@ -159,6 +159,8 @@ map_recipe_spec() {
       add_target rust-youki ;;
     td-fetch)
       add_target rust-fetch ;;
+    td-feed)
+      add_target td-feed ;;
     perturbed)
       add_target drv-emit ;;
     pkg-config)
@@ -219,6 +221,9 @@ map_path() {
 
     fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock)
       add_target rust-fetch ;;
+
+    feed/*|feed/src/*|feed/Cargo.toml|feed/Cargo.lock)
+      add_target td-feed ;;
 
     tests/td-tsgo.lock|tests/tsgo.sh|tools/warm-tsgo.sh)
       add_preflight shell-syntax
@@ -283,6 +288,13 @@ map_path() {
 
     tests/td-fetch.lock)
       add_target rust-fetch ;;
+
+    tests/td-feed.lock|tests/td-feed.index)
+      add_target td-feed ;;
+
+    tools/gen-feed-index.sh)
+      add_preflight shell-syntax
+      add_target td-feed ;;
 
     tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh)
       add_preflight shell-syntax
@@ -571,6 +583,10 @@ run_self_test() {
   assert_branch_policy tools/affected-checks.sh "full ./check.sh would be waived"
   assert_target tests/ts/recipe-td-russh-demo.ts rust-russh
   assert_target tests/td-russh-demo.lock rust-russh
+  assert_target tests/ts/recipe-td-feed.ts td-feed
+  assert_target tests/td-feed.lock td-feed
+  assert_target tests/td-feed.index td-feed
+  assert_target feed/src/main.rs td-feed
   assert_target tests/ts/recipe-td-cmake-demo.ts cmake
   assert_target tests/td-cmake-demo.lock cmake
   assert_target tests/ts/recipe-uutils.ts rust-coreutils

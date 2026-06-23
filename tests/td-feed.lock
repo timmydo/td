@@ -1,0 +1,87 @@
+# td-feed.lock — pinned inputs for building td-feed (feed/, td's local HTTP mirror)
+# FROM SOURCE via td-builder build-recipe (buildSystem "rust"). td-feed has the SAME
+# dependency closure as td-fetch (ureq + rustls/ring + sha2, 73 crates — only the bin
+# name differs), so this reuses tests/td-fetch.lock's toolchain seed + vendored .crate
+# deps verbatim. The feed/ SOURCE tree is interned at gate time by td's OWN recursive
+# addToStore (tests/intern-src.sh), keyed td-feed-source. Regenerate alongside
+# tests/td-fetch.lock on a channel/dep bump.
+kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0 /gnu/store/kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0
+z7kjjjv2k1aniv8lndhb5q1p3639631q-rust-1.93.0-cargo /gnu/store/z7kjjjv2k1aniv8lndhb5q1p3639631q-rust-1.93.0-cargo
+z78xpbjrl0g6238acy238fibgzckqgak-gcc-toolchain-15.2.0 /gnu/store/z78xpbjrl0g6238acy238fibgzckqgak-gcc-toolchain-15.2.0
+bwfxzfsm742izbqrx63ica0jq0sbnmrp-coreutils-9.1 /gnu/store/bwfxzfsm742izbqrx63ica0jq0sbnmrp-coreutils-9.1
+p5dap5q3wfdy0h3m31q5hbj3gpbkmrxv-bash-5.2.37 /gnu/store/p5dap5q3wfdy0h3m31q5hbj3gpbkmrxv-bash-5.2.37
+vlx3kkamd502jahyyn03qq9dxa63h3cz-tar-1.35 /gnu/store/vlx3kkamd502jahyyn03qq9dxa63h3cz-tar-1.35
+ch4v61a0lw0f1hkm5adai5z42qpyf20k-gzip-1.14 /gnu/store/ch4v61a0lw0f1hkm5adai5z42qpyf20k-gzip-1.14
+base64-0.22.1.crate /gnu/store/b7vr12ccmrl1fdw516slz20y1pmgdqf8-base64-0.22.1.crate
+block-buffer-0.10.4.crate /gnu/store/7b3aawyy9v73lw66av9937l26wx3rca6-block-buffer-0.10.4.crate
+cc-1.2.65.crate /gnu/store/x3qnpyf7lvp7zdnha27i9f63c0p3lhql-cc-1.2.65.crate
+cfg-if-1.0.4.crate /gnu/store/3qkldk98fx04kxj7pp72ynmxvibrk63d-cfg-if-1.0.4.crate
+cpufeatures-0.2.17.crate /gnu/store/mqf3zhsxjni52n9lka35x6wylzqjjq4p-cpufeatures-0.2.17.crate
+crypto-common-0.1.7.crate /gnu/store/vsgz8xqrmsp8kq4b6fgivpxkwd731pgy-crypto-common-0.1.7.crate
+digest-0.10.7.crate /gnu/store/mq4h6yzn79r00fd53zv324zcml4ai8kv-digest-0.10.7.crate
+displaydoc-0.2.6.crate /gnu/store/ak9f8mj8rd4x2hpw1cc020bdk7fjz4g8-displaydoc-0.2.6.crate
+find-msvc-tools-0.1.9.crate /gnu/store/kdrkkakcjbmrjxja9rjz8gsmzpn2q445-find-msvc-tools-0.1.9.crate
+form_urlencoded-1.2.2.crate /gnu/store/lbfaz4saxhsc2gg3aiwadxf58b5wk5z5-form_urlencoded-1.2.2.crate
+generic-array-0.14.7.crate /gnu/store/8agqx6gkpanyp70sk2g52slq10jd77nx-generic-array-0.14.7.crate
+getrandom-0.2.17.crate /gnu/store/7dmx4r8h5d4js46bswsk41fx5ymiqc2w-getrandom-0.2.17.crate
+icu_collections-2.2.0.crate /gnu/store/9rgg21bifw4dy6zhr6npxdk6rd66qp3n-icu_collections-2.2.0.crate
+icu_locale_core-2.2.0.crate /gnu/store/14xidwn2rd0lmww7z90zpgg5hm3xqmg5-icu_locale_core-2.2.0.crate
+icu_normalizer-2.2.0.crate /gnu/store/8v4vvk5gpz2lfjfzb4qillfp8apbwq1j-icu_normalizer-2.2.0.crate
+icu_normalizer_data-2.2.0.crate /gnu/store/2bn610v21kc9pkxcwz0wljfcf892j0f4-icu_normalizer_data-2.2.0.crate
+icu_properties-2.2.0.crate /gnu/store/j1zpjdg34ykw08an0y7xdqn6h9475x8k-icu_properties-2.2.0.crate
+icu_properties_data-2.2.0.crate /gnu/store/jlry002813p2j2c5icznq76nw4q1df1y-icu_properties_data-2.2.0.crate
+icu_provider-2.2.0.crate /gnu/store/y2z20wjlfv5k3kgj2lym9wdqza8h4w8q-icu_provider-2.2.0.crate
+idna-1.1.0.crate /gnu/store/6hrbs7zccp9wdd9c376ahad29db7kn2j-idna-1.1.0.crate
+idna_adapter-1.2.2.crate /gnu/store/85xyva6asp82kzl1m3pz0p8ivhh2sjn4-idna_adapter-1.2.2.crate
+libc-0.2.186.crate /gnu/store/6z23zikr51l5f1dv8ggwb1sas5c2pvk0-libc-0.2.186.crate
+litemap-0.8.2.crate /gnu/store/0pmddcvwfmrj9724cc4rbgf1ryz4z3kz-litemap-0.8.2.crate
+log-0.4.32.crate /gnu/store/5w3zsxalrkwlybwwjaxq5s1z7mpdv5ha-log-0.4.32.crate
+once_cell-1.21.4.crate /gnu/store/pv264x1nj4xvz8nwlbn3ka0h8xdk4n4b-once_cell-1.21.4.crate
+percent-encoding-2.3.2.crate /gnu/store/3nrw9ps401firi4k6pljyj3gjydns838-percent-encoding-2.3.2.crate
+potential_utf-0.1.5.crate /gnu/store/ji78bzilkj3dcfk5f8d6n128mzk0iycn-potential_utf-0.1.5.crate
+proc-macro2-1.0.106.crate /gnu/store/klw2pvqcrlici7n0rxvxidj12kd0fr8v-proc-macro2-1.0.106.crate
+quote-1.0.45.crate /gnu/store/m3ssfwbs4hjb3q5wh22l1n3853chgvh0-quote-1.0.45.crate
+ring-0.17.14.crate /gnu/store/2cpvrffjjmxfjrdrwz2mpji5yzl8z5d5-ring-0.17.14.crate
+rustls-0.23.40.crate /gnu/store/yja0h3q39k2wb12vi4wjhvxpps4x4lzw-rustls-0.23.40.crate
+rustls-pki-types-1.14.1.crate /gnu/store/j1r6jwhjzaz7iyf3wvdjriq7p5lqgfrq-rustls-pki-types-1.14.1.crate
+rustls-webpki-0.103.13.crate /gnu/store/a09a7jf0rimx4339b7bdc23zl2g9dg4r-rustls-webpki-0.103.13.crate
+serde-1.0.228.crate /gnu/store/8p7dng2jrns0fln47aiv0imj1wna6fyc-serde-1.0.228.crate
+serde_core-1.0.228.crate /gnu/store/iam1jbf61sldmn1zxvx3i2ibm68zgyfa-serde_core-1.0.228.crate
+serde_derive-1.0.228.crate /gnu/store/39gbq3hzbnsnssbgb2q5blqds6irh1mc-serde_derive-1.0.228.crate
+sha2-0.10.9.crate /gnu/store/5si3wwnssnxxjwqq4dn7jq63786393pb-sha2-0.10.9.crate
+shlex-2.0.1.crate /gnu/store/7kdf9igdcdajypsrmp3f45clwd87s70d-shlex-2.0.1.crate
+smallvec-1.15.2.crate /gnu/store/055ms9779mkm36ssq9611hfg1grl7d7l-smallvec-1.15.2.crate
+stable_deref_trait-1.2.1.crate /gnu/store/21p983904fkc3ayyhri90zi60fm5xnwb-stable_deref_trait-1.2.1.crate
+subtle-2.6.1.crate /gnu/store/hqxszw9pkgg47qn794aa0x5jkmpp556j-subtle-2.6.1.crate
+syn-2.0.118.crate /gnu/store/hi4xjw3fq64imgsm0wm6wyjhr3398l5q-syn-2.0.118.crate
+synstructure-0.13.2.crate /gnu/store/akmwb1k5nzpv9c25p8b6q0dx42r0ji6j-synstructure-0.13.2.crate
+tinystr-0.8.3.crate /gnu/store/h9m86q36m21fmr5vpvm756a8dgxncmq1-tinystr-0.8.3.crate
+typenum-1.20.1.crate /gnu/store/ax1xlyzb7gvw0vxvs3g2wffxjd2gswav-typenum-1.20.1.crate
+unicode-ident-1.0.24.crate /gnu/store/kd162djh3hq59zk00hlzkrsxvc2gkwlh-unicode-ident-1.0.24.crate
+untrusted-0.9.0.crate /gnu/store/9wiz47zf5fwkd8szd1fn1vla3y0aj81b-untrusted-0.9.0.crate
+ureq-2.12.1.crate /gnu/store/7ifz44pycb4amzbx97c102q104zaj4nz-ureq-2.12.1.crate
+url-2.5.8.crate /gnu/store/dw9gkn10rdpczmgmvccchmd9n3jcyxgv-url-2.5.8.crate
+utf8_iter-1.0.4.crate /gnu/store/48v86aqicmdmpwgznf2dfxkf8b1vxl4w-utf8_iter-1.0.4.crate
+version_check-0.9.5.crate /gnu/store/l0fqvn5p9rkng1f287ymykbp8y3hk4a2-version_check-0.9.5.crate
+wasi-0.11.1+wasi-snapshot-preview1.crate /gnu/store/pzgrwdgywqd6ckc5gxv60igq5d7js4kk-wasi-0.11.1+wasi-snapshot-preview1.crate
+webpki-roots-0.26.11.crate /gnu/store/4q5hmn9qa75f0yc67337wgidzqwxg8m1-webpki-roots-0.26.11.crate
+webpki-roots-1.0.8.crate /gnu/store/zhys4x8a3kkfzbs6p3asfpyqxx2jmklq-webpki-roots-1.0.8.crate
+windows_aarch64_gnullvm-0.52.6.crate /gnu/store/rg4ry72h729l3giv9qs401rfrzyw0708-windows_aarch64_gnullvm-0.52.6.crate
+windows_aarch64_msvc-0.52.6.crate /gnu/store/jvxzk87cgpmnmx4x292avjfkk3a5bg3w-windows_aarch64_msvc-0.52.6.crate
+windows_i686_gnu-0.52.6.crate /gnu/store/aq9fcaz2ngzymq5zh7h9vfgjq13dyrc0-windows_i686_gnu-0.52.6.crate
+windows_i686_gnullvm-0.52.6.crate /gnu/store/0yhp6a28by3gx19jsblz1xywzgmyzik4-windows_i686_gnullvm-0.52.6.crate
+windows_i686_msvc-0.52.6.crate /gnu/store/rk7nhshmacjrba8x72mpy2bg0amhp0lh-windows_i686_msvc-0.52.6.crate
+windows-sys-0.52.0.crate /gnu/store/q9f2kviin05prrj0igx94nxsgsv3km55-windows-sys-0.52.0.crate
+windows-targets-0.52.6.crate /gnu/store/343niy8jfi87m8gzmiv5rviff3ik0bim-windows-targets-0.52.6.crate
+windows_x86_64_gnu-0.52.6.crate /gnu/store/0jkfmb8dyr6dlalprh8j91c7hm7p5dj1-windows_x86_64_gnu-0.52.6.crate
+windows_x86_64_gnullvm-0.52.6.crate /gnu/store/0lz4q364rg6jl360nv0kk7dxa0z34mv0-windows_x86_64_gnullvm-0.52.6.crate
+windows_x86_64_msvc-0.52.6.crate /gnu/store/m05bpzmqgnns551qba3vqhlll32i0y3s-windows_x86_64_msvc-0.52.6.crate
+writeable-0.6.3.crate /gnu/store/f5f0w1jrhlwf80n72vp7fzb6bda3wkbz-writeable-0.6.3.crate
+yoke-0.8.3.crate /gnu/store/gcbvhdh3xxk4ax01iac9qa2xrgp6iy36-yoke-0.8.3.crate
+yoke-derive-0.8.2.crate /gnu/store/lm10480pyzf0ismsn2yby844d1r0lawv-yoke-derive-0.8.2.crate
+zerofrom-0.1.8.crate /gnu/store/7rya4zhb4rn1qwnlrzlsh210xrfdhix1-zerofrom-0.1.8.crate
+zerofrom-derive-0.1.7.crate /gnu/store/1sncfsa58bdkgrqzyq8xxy2c9kjryynf-zerofrom-derive-0.1.7.crate
+zeroize-1.9.0.crate /gnu/store/h0j34dvh0zbhalkviwkhwzfcnc1y25cq-zeroize-1.9.0.crate
+zerotrie-0.2.4.crate /gnu/store/0b1whj7jaaf6n5w07flb34s1jvkphz4f-zerotrie-0.2.4.crate
+zerovec-0.11.6.crate /gnu/store/0bb5lb2yp9cvpbpb19mqn125whbwj9ja-zerovec-0.11.6.crate
+zerovec-derive-0.11.3.crate /gnu/store/nvfngvbdzbzi48xwmy50rlwf9wjyq1k7-zerovec-derive-0.11.3.crate
