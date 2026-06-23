@@ -72,7 +72,30 @@ upward:
    Verified-red: truncating a runtime module reds the behavioral leg. The td-fetch tarball pattern
    (`warm-bootstrap-sources.sh` + a per-source lock, no further check.sh touch) is the template
    for bricks 3-5. Next: brick 3 bootstraps tinycc from mes (`mescc`).
-3. **tinycc** — bootstrap TinyCC from Mes; the first self-respecting C compiler.
+3. **MesCC self-host (mes-mescc)** — ✅ DONE (2026-06-23). After mes-m2, Mes's own C compiler
+   **MesCC** (`module/mescc`, Scheme, parsing C with **nyacc**) compiles Mes's libc + rebuilds mes
+   as `mes-mescc`, and emits **`libc+tcc.a`** (the TinyCC library, → brick 4). The `bootstrap-mescc`
+   gate (`mk/gates/366`) drives it from brick-1's seed toolchain + the td-fetched mes-0.27.1 +
+   nyacc-1.00.2 tarballs (181 files, 0 failures). ALL-DURABLE: pinned-input (both tarballs == lock
+   sha256), no-guix (no gcc/guile/guix on the build PATH; no `/gnu/store` in mes-mescc), behavioral
+   (mes-mescc EVALUATES Scheme — `MesCC-self-host!`, `(* 6 7)`→42 — and libc+tcc.a defines the
+   compiled libc strlen/malloc/memcpy + tcc's abtod), repro (byte-identical mes-mescc). Verified-red:
+   wrong lock sha reds pinned-input; the build/archive legs were seen red during dev.
+   - **THE KEY: build i686 (32-bit), not x86_64.** guix's `mes-boot` ALWAYS builds
+     `--host=i686-linux-gnu` even on x86-64 — it never builds x86_64 mes-boot; the whole Mes/TinyCC
+     layer is i686 and gcc later cross-builds to 64-bit. x86_64 MesCC self-host is the immature path
+     and fails mid-libc (this cost a long detour misdiagnosed as a mes-m2 `system*` bug). The amd64
+     stage0 tools (M2-Planet/M1/hex2) target i686 fine via `--architecture`/defs — so **NO brick 0/1
+     rework**: configure with `--host=i686-linux-gnu` → `mes_cpu=x86, mes_bits=32`.
+   - **nyacc-1.00.2** — second source pin (same `seed/sources/*.lock` + `warm-bootstrap-sources.sh`
+     pattern as brick 2): `https://download.savannah.nongnu.org/releases/nyacc/nyacc-1.00.2.tar.gz`,
+     sha256 `f36e4fb7dd524dc3f4b354d3d5313f69e7ce5a6ae93711e8cf6d51eaa8d2b318`.
+   - Build recipe: `configure.sh --host=i686-linux-gnu` with `GUILE=true CC= MES_FOR_BUILD=mes` (force
+     the mescc path; host gcc/guile must not be picked up), `M1/HEX2/BLOOD_ELF/KAEM`=absolute seed
+     tools, `GUILE_LOAD_PATH`=nyacc+mes modules, `MES_PREFIX`; Mes's own `mesar` archives (no binutils
+     `ar`). Then `sh bootstrap.sh` → `bin/mes-mescc` + `mescc-lib/x86-mes/libc+tcc.a`.
+   - Remaining for the gate: curated guix-scrubbed-but-build-tools env in the sandbox, reproducibility
+     leg, verified-red. tinycc (brick 4) builds on `libc+tcc.a` next.
 4. **gcc (old) → gcc (modern)** — staged gcc builds, `--prefix=/td/store`.
 5. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 6. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's

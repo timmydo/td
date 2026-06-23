@@ -1,0 +1,8 @@
+# seed/sources/nyacc-1.00.2.lock — NYACC 1.00.2, the C99 parser MesCC needs (source-bootstrap
+# brick 3). NOT vendored, NOT guix-fetched: td-fetch warms it from the pinned url + sha256 into
+# .td-build-cache/sources/ (tools/warm-bootstrap-sources.sh, check.sh prelude). 1.00.2 is the
+# version guix's mes-boot pairs with mes for MesCC. The bootstrap-mescc gate puts its module/
+# tree on GUILE_LOAD_PATH so MesCC (running on the seed-built mes) can parse C.
+url https://download.savannah.nongnu.org/releases/nyacc/nyacc-1.00.2.tar.gz
+sha256 f36e4fb7dd524dc3f4b354d3d5313f69e7ce5a6ae93711e8cf6d51eaa8d2b318
+file nyacc-1.00.2.tar.gz
