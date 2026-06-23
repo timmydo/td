@@ -1,0 +1,7 @@
+section: side
+status: claimed
+handle: claude-fable-65585b
+date: 2026-06-23
+title: td-feed
+notes: plan/td-feed.md
+summary: td feed — a local pure-Rust HTTP mirror (feed/, a sibling of fetch/) that indexes EVERY network-downloaded artifact in the repo (the td-fetch seed blobs, the url-fetch source tarballs, and all ~1830 static.crates.io `.crate` deps) and serves them content-verified over loopback. Run model (human 2026-06-23): the feed `warm`s its persistent store from a pinned `<path> <url> <sha256>` index during the network-permitted HOST PREP (egress allowed), then `serve`s the OFFLINE loop over 127.0.0.1 as a URL-PATH mirror (`GET /<host>/<path>`, verify-on-serve against the indexed sha256) — no in-loop egress, so hermeticity directive 2 holds. Reroute scope (human 2026-06-23): td-NATIVE fetchers only (td-fetch, tools/warm-*.sh, future user-pm) point at the feed via a TD_FEED_BASE URL rewrite; the guix daemon keeps its own fetching (retired last §5). Gate builds td-feed FROM SOURCE via td-builder build-recipe (the rust-fetch template) and proves a loopback warm->serve->fetch round-trip with DURABLE assertions: behavioral (the round-trip succeeds + sha256-verifies), self-discrimination (a perturbed artifact / wrong hash reds), structural (the index is self-consistent; a missing path 404s; verify-on-serve catches store corruption), intrinsic-repro (td-builder check double-build). Brick ladder in plan/td-feed.md.
