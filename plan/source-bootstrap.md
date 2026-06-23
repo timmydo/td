@@ -59,7 +59,15 @@ upward:
    program, M1+hex2 link it, the ELF RUNS returning 7 — a real working toolchain), repro
    (byte-identical M2-Planet across two runs). Verified-red on the runtime value. Next: brick 2
    drives these tools over mes / tinycc.
-2. **mes + mescc-tools** — GNU Mes (Scheme) + `mescc` build a richer C environment.
+2. **GNU Mes (mes-m2)** — ✅ DONE (2026-06-23). From brick 1's seed-built M2-Planet +
+   mescc-tools, the `bootstrap-mes` gate (`mk/gates/364`) drives the vendored GNU Mes source
+   (`seed/mes`, pinned mes `f244b141` / 0.27.1 — master, *version-matched* to stage0-posix
+   `3b9c2bb`: the 0.27 release defs lack the `xor_eax,eax` vocabulary the stage0 M2-Planet emits)
+   to a working **GNU Mes Scheme interpreter** (`mes-m2`) — guix off env. ALL-DURABLE: no-guix
+   (no `/gnu/store` in mes-m2), behavioral (mes-m2 EVALUATES Scheme — `(display 'Hello,M2-mes!)`
+   →`Hello,M2-mes!`, `(+ 1 2 3 4)`→`10` — from its own vendored module tree), repro (byte-identical
+   mes-m2 across two builds). Verified-red: truncating a runtime module (boot-5.scm) reds the
+   behavioral leg. Next: brick 3 bootstraps tinycc from mes (`mescc`).
 3. **tinycc** — bootstrap TinyCC from Mes; the first self-respecting C compiler.
 4. **gcc (old) → gcc (modern)** — staged gcc builds, `--prefix=/td/store`.
 5. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.

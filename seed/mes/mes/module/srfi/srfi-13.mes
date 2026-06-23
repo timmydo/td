@@ -1,0 +1,298 @@
+;;; -*-scheme-*-
+
+;;; GNU Mes --- Maxwell Equations of Software
+;;; Copyright © 2016,2017,2018,2024 Janneke Nieuwenhuizen <janneke@gnu.org>
+;;; Copyright © 2022,2023 Timothy Sample <samplet@ngyro.com>
+;;;
+;;; This file is part of GNU Mes.
+;;;
+;;; GNU Mes is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3 of the License, or (at
+;;; your option) any later version.
+;;;
+;;; GNU Mes is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;;; GNU General Public License for more details.
+;;;
+;;; You should have received a copy of the GNU General Public License
+;;; along with GNU Mes.  If not, see <http://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;;; srfi-13.mes is the minimal srfi-13
+
+;;; Code:
+
+(mes-use-module (srfi srfi-14))
+
+(define (string-join lst . delimiter+grammar)
+  (let ((delimiter (or (and (pair? delimiter+grammar) (car delimiter+grammar))
+                       " "))
+        (grammar (or (and (pair? delimiter+grammar) (pair? (cdr delimiter+grammar)) (cadr delimiter+grammar))
+                     'infix)))
+    (if (null? lst) ""
+        (case grammar
+         ((infix) (if (null? (cdr lst)) (car lst)
+                                   (string-append (car lst) delimiter (string-join (cdr lst) delimiter))))
+         ((prefix) (string-append delimiter (car lst) (apply string-join (cdr lst) delimiter+grammar)))
+         ((suffix) (string-append (car lst) delimiter (apply string-join (cdr lst) delimiter+grammar)))))))
+
+(define (string-copy s)
+  (list->string (string->list s)))
+
+(define (string= a b . rest)
+  (if (null? rest)
+      (string=? a b)
+      (let* ((start1 (car rest))
+             (rest   (cdr rest))
+             (end1   (if (pair? rest) (car rest) (string-length a)))
+             (rest   (if (pair? rest) (cdr rest) '()))
+             (start2 (if (pair? rest) (car rest) 0))
+             (rest   (if (pair? rest) (cdr rest) '()))
+             (end2   (if (pair? rest) (car rest) (string-length b))))
+        (and (= (- end1 start1) (- end2 start2))
+             (let loop ((i1 start1) (i2 start2))
+               (or (>= i1 end1)
+                   (and (< i1 end1)
+                        (eq? (string-ref a i1)
+                             (string-ref b i2))
+                        (loop (+ i1 1) (+ i2 1)))))))))
+
+(define (string< s1 s2 . rest)
+  (let* ((start1 (if (pair? rest) (car rest) 0))
+         (rest   (if (pair? rest) (cdr rest) '()))
+         (end1   (if (pair? rest) (car rest) (string-length s1)))
+         (rest   (if (pair? rest) (cdr rest) '()))
+         (start2 (if (pair? rest) (car rest) 0))
+         (rest   (if (pair? rest) (cdr rest) '()))
+         (end2   (if (pair? rest) (car rest) (string-length s2))))
+    (let loop ((i1 start1) (i2 start2))
+      ;; If we run past the end of S2, we have S2 <= S1.
+      (and (< i2 end2)
+           ;; Otherwise, if we run past the end of S1, we have S1 < S2.
+           (or (>= i1 end1)
+               (let ((c1 (string-ref s1 i1))
+                     (c2 (string-ref s2 i2)))
+                 (or (char<? c1 c2)
+                     (and (eq? c1 c2)
+                          (loop (+ i1 1) (+ i2 1))))))))))
+
+(define (string> s1 s2 . rest)
+  (let* ((start1 (if (pair? rest) (car rest) 0))
+         (rest   (if (pair? rest) (cdr rest) '()))
+         (end1   (if (pair? rest) (car rest) (string-length s1)))
+         (rest   (if (pair? rest) (cdr rest) '()))
+         (start2 (if (pair? rest) (car rest) 0))
+         (rest   (if (pair? rest) (cdr rest) '()))
+         (end2   (if (pair? rest) (car rest) (string-length s2))))
+    (let loop ((i1 start1) (i2 start2))
+      ;; If we run past the end of S1, we have S1 <= S2.
+      (and (< i1 end1)
+           ;; Otherwise, if we run past the end of S2, we have S2 < S1.
+           (or (>= i2 end2)
+               (let ((c1 (string-ref s1 i1))
+                     (c2 (string-ref s2 i2)))
+                 (or (char>? c1 c2)
+                     (and (eq? c1 c2)
+                          (loop (+ i1 1) (+ i2 1))))))))))
+
+(define (string-split s c)
+  (let loop ((lst (string->list s)) (result '()))
+    (let ((rest (memq c lst)))
+      (if (not rest) (append result (list (list->string lst)))
+          (loop (cdr rest)
+                (append result
+                        (list (list->string (list-head lst (- (length lst) (length rest)))))))))))
+
+(define (string-take s n)
+  (cond ((zero? n) s)
+        ((> n 0) (list->string (list-head (string->list s) n)))
+        (else (error "string-take: not supported: n=" n))))
+
+(define (string-drop s n)
+  (cond ((zero? n) s)
+        ((> n 0) (list->string (list-tail (string->list s) n)))
+        (else s (error "string-drop: not supported: (n s)=" (cons n s)))))
+
+(define (drop-right lst n)
+  (list-head lst (- (length lst) n)))
+
+(define (string-drop-right s n)
+  (cond ((zero? n) s)
+        ((> n 0) ((compose list->string (lambda (o) (drop-right o n)) string->list) s))
+        (else (error "string-drop-right: not supported: n=" n))))
+
+(define (string-delete char-pred s)
+  (let ((pred (negate (char-pred->pred char-pred))))
+    (list->string (filter pred (string->list s)))))
+
+(define (string-index s char-pred . rest)
+  (let* ((start (if (pair? rest) (car rest) 0))
+         (rest  (if (pair? rest) (cdr rest) '()))
+         (end   (if (pair? rest) (car rest) (string-length s)))
+         (pred  (char-pred->pred char-pred)))
+    (let loop ((lst (string->list s)) (i 0))
+      (cond
+       ((>= i end) #f)
+       ((null? lst) #f)
+       ((< i start) (loop (cdr lst) (1+ i)))
+       ((pred (car lst)) i)
+       (else (loop (cdr lst) (1+ i)))))))
+
+(define (string-rindex s pred . rest)
+  (let* ((start (if (pair? rest) (car rest) 0))
+         (rest  (if (pair? rest) (cdr rest) '()))
+         (end   (if (pair? rest) (car rest) (string-length s)))
+         (pred  (if (char? pred) (lambda (c) (eq? c pred)) pred)))
+    (let loop ((lst (reverse (string->list s))) (i (1- (string-length s))))
+      (cond
+       ((< i start) #f)
+       ((null? lst) #f)
+       ((>= i end) (loop (cdr lst) (1- i)))
+       ((pred (car lst)) i)
+       (else (loop (cdr lst) (1- i)))))))
+
+(define reverse-list->string (compose list->string reverse))
+
+(define substring/copy substring)
+(define substring/shared substring)
+
+(define string-null? (compose null? string->list))
+
+(define (string-fold kons knil s . rest)
+  (let* ((start (or (and (pair? rest) (car rest)) 0))
+         (end (or (and (pair? rest) (pair? (cdr rest)) (cadr rest))
+                  (string-length s))))
+    (let loop ((k start) (acc knil))
+      (if (>= k end) acc
+          (loop (+ k 1) (kons (string-ref s k) acc))))))
+
+(define (string-fold-right cons' nil' s . rest)
+  (let* ((start (and (pair? rest) (car rest)))
+         (end (and start (pair? (cdr rest)) (cadr rest))))
+    (if start (error "string-fold-right: not supported: start=" start))
+    (if end (error "string-fold-right: not supported: end=" end))
+    (let loop ((lst (reverse (string->list s))) (prev nil'))
+      (if (null? lst) prev
+          (loop (cdr lst) (cons' (car lst) prev))))))
+
+(define (string-contains string needle . rest)
+  (let* ((start1 (if (pair? rest) (car rest) 0))
+         (rest   (if (pair? rest) (cdr rest) '()))
+         (end1   (if (pair? rest) (car rest) (string-length string)))
+         (rest   (if (pair? rest) (cdr rest) '()))
+         (start2 (if (pair? rest) (car rest) 0))
+         (rest   (if (pair? rest) (cdr rest) '()))
+         (end2   (if (pair? rest) (car rest) (string-length needle))))
+    (let loop ((i1 start1) (j1 (+ start1 (- end2 start2))))
+      (and (<= j1 end1)
+           (if (string= string needle i1 j1 start2 end2)
+               i1
+               (loop (+ i1 1) (+ j1 1)))))))
+
+(define (char-pred->pred char-pred)
+  (cond
+   ((procedure? char-pred) char-pred)
+   ((char? char-pred) (lambda (c) (eq? c char-pred)))
+   ((char-set? char-pred) (lambda (c) (char-set-contains? char-pred c)))
+   (else (error "unsupported character predicate" char-pred))))
+
+(define (string-trim string . rest)
+  (let* ((char-pred (if (pair? rest) (car rest) char-whitespace?))
+         (pred (char-pred->pred char-pred))
+         (start (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) 0))
+         (end (if (and (pair? rest) (pair? (cdr rest)) (pair? (cddr rest)))
+                  (caddr rest)
+                  (string-length string))))
+    (let ((i (string-index string (negate pred) start end)))
+      (if i (substring string i end) ""))))
+
+(define (string-trim-right string . rest)
+  (let* ((char-pred (if (pair? rest) (car rest) char-whitespace?))
+         (pred (char-pred->pred char-pred))
+         (start (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) 0))
+         (end (if (and (pair? rest) (pair? (cdr rest)) (pair? (cddr rest)))
+                  (caddr rest)
+                  (string-length string))))
+    (let ((i (string-rindex string (negate pred) start end)))
+      (if i (substring string start (+ i 1)) ""))))
+
+(define (string-trim-both string . rest)
+  (let ((char-pred (if (pair? rest) (car rest) char-whitespace?)))
+    (string-trim (apply string-trim-right string rest) char-pred)))
+
+(define (string-map f string)
+  (list->string (map f (string->list string))))
+
+(define (string-filter f string)
+  (list->string (filter f (string->list string))))
+
+(define (string-replace string replace . rest)
+  (let* ((start1 (and (pair? rest) (car rest)))
+         (end1 (and start1 (pair? (cdr rest)) (cadr rest)))
+         (start2 (and end1 (pair? (cddr rest)) (caddr rest)))
+         (end2 (and start2 (pair? (cdddr rest)) (cadddr rest))))
+    (if start2 (error "string-replace: not supported: START2=" start2))
+    (if end2 (error "string-replace: not supported: END2=" end2))
+    (list->string
+     (append
+      (string->list (string-take string (or start1 0)))
+      (string->list replace)
+      (string->list (string-drop string (or end1 (string-length string))))))))
+
+(define (string-downcase string)
+  (string-map char-downcase string))
+
+(define (string-upcase string)
+  (string-map char-upcase string))
+
+(define (string-tokenize string char-set)
+  (let loop ((lst (string->list string)) (result '()))
+    (if (null? lst) (reverse result)
+        (let match ((lst lst) (found '()))
+          (if (null? lst) (loop lst (if (null? found) (reverse result)
+                                        (cons (list->string (reverse found)) result)))
+              (let ((c (car lst)))
+                (if (not (char-set-contains? char-set c)) (loop (cdr lst)
+                                                                (if (null? found) result
+                                                                    (cons (list->string (reverse found)) result)))
+                    (match (cdr lst) (cons c found)))))))))
+
+(define (string-count string char-pred . rest)
+  (let* ((start (if (pair? rest) (car rest) 0))
+         (rest  (if (pair? rest) (cdr rest) '()))
+         (end   (if (pair? rest) (car rest) (string-length string)))
+         (pred (char-pred->pred char-pred)))
+    (let loop ((i start) (acc 0))
+      (if (>= i end)
+          acc
+          (loop (+ i 1)
+                (+ acc (if (pred (string-ref string i)) 1 0)))))))
+
+(define (string-concatenate-reverse lst)
+  (apply string-append (reverse lst)))
+
+(define (string-pad s len . rest)
+  (let* ((chr (if (null? rest) #\space (car rest)))
+         (slen (string-length s))
+         (delta (- len slen)))
+    (cond
+     ((positive? delta) (string-append (make-string delta chr) s))
+     ((negative? delta) (substring s (- slen len) slen))
+     (else s))))
+
+(define (string-pad-right s len . rest)
+  (let* ((chr (if (null? rest) #\space (car rest)))
+         (delta (- len (string-length s))))
+    (cond
+     ((positive? delta) (string-append s (make-string delta chr)))
+     ((negative? delta) (substring s 0 len))
+     (else s))))
+
+(define (string-every chr str)
+  (let loop ((k 0))
+    (or (>= k (string-length str)) #t
+        (and (char=? (string-ref str k) chr)
+             (loop (1+ k))))))

@@ -1,0 +1,213 @@
+;;; -*-scheme-*-
+
+;;; GNU Mes --- Maxwell Equations of Software
+;;; Copyright © 2016,2017,2018,2019,2024 Janneke Nieuwenhuizen <janneke@gnu.org>
+;;; Copyright © 2023 Timothy Sample <samplet@ngyro.com>
+;;;
+;;; This file is part of GNU Mes.
+;;;
+;;; GNU Mes is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3 of the License, or (at
+;;; your option) any later version.
+;;;
+;;; GNU Mes is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;;; GNU General Public License for more details.
+;;;
+;;; You should have received a copy of the GNU General Public License
+;;; along with GNU Mes.  If not, see <http://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;;; Code:
+
+(define-macro (cond-expand-provide . rest) #t)
+
+(define-macro (include-from-path file)
+  (let loop ((path (cons* %moduledir "module" (string-split (or (getenv "GUILE_LOAD_PATH") "") #\:))))
+    (cond ((and=> (getenv "MES_DEBUG") (compose (lambda (o) (> o 2)) string->number))
+           (core:display-error (string-append "include-from-path: " file " [PATH:" (string-join path ":") "]\n")))
+          ((and=> (getenv "MES_DEBUG") (compose (lambda (o) (> o 1)) string->number))
+           (core:display-error (string-append "include-from-path: " file "\n"))))
+    (if (null? path) (error "include-from-path: not found: " file)
+        (let ((file (string-append (car path) "/" file)))
+          (if (access? file R_OK) `(load ,file)
+              (loop (cdr path)))))))
+
+(define-macro (define-module module . rest)
+  `(if ,(and (pair? module)
+             (= 1 (length module))
+             (symbol? (car module)))
+       (define (,(car module) . arguments) (main (command-line)))))
+
+(define-macro (defmacro name args . body)
+  `(define-macro ,(cons name args) ,@body))
+
+(define-macro (set-procedure-property! proc key value)
+  proc)
+
+(define-macro (use-modules . rest) #t)
+
+(define (effective-version) %version)
+
+(mes-use-module (srfi srfi-13))
+(mes-use-module (mes catch))
+(mes-use-module (mes posix))
+(mes-use-module (srfi srfi-16))
+(mes-use-module (mes display))
+(mes-use-module (mes simple-format))
+
+(define %host-type (string-append %arch "-linux-gnu"))
+(define %load-path (or (and=> (getenv "GUILE_LOAD_PATH") (lambda (x) (string-split x #\:))) '()))
+
+(define (drain-input port) (read-string))
+
+(define (object->string x . rest)
+  (with-output-to-string
+    (lambda () ((if (pair? rest) (car rest) write) x))))
+
+(define (port-filename p) "<stdin>")
+(define (port-line p) 0)
+
+(define (with-input-from-port port thunk)
+  (let ((outer-port #f)
+        (inner-port port))
+    (dynamic-wind
+      (lambda ()
+        (set! outer-port (current-input-port))
+        (set-current-input-port inner-port))
+      thunk
+      (lambda ()
+        (set! inner-port (current-input-port))
+        (set-current-input-port outer-port)))))
+
+(define (with-output-to-port port thunk)
+  (let ((outer-port #f)
+        (inner-port port))
+    (dynamic-wind
+      (lambda ()
+        (set! outer-port (current-output-port))
+        (set-current-output-port inner-port))
+      thunk
+      (lambda ()
+        (set! inner-port (current-output-port))
+        (set-current-output-port outer-port)))))
+
+(define (with-error-to-port port thunk)
+  (let ((outer-port #f)
+        (inner-port port))
+    (dynamic-wind
+      (lambda ()
+        (set! outer-port (current-error-port))
+        (set-current-error-port inner-port))
+      thunk
+      (lambda ()
+        (set! inner-port (current-error-port))
+        (set-current-error-port outer-port)))))
+
+(define (with-input-from-string string thunk)
+  (with-input-from-port (open-input-string string) thunk))
+
+(define (with-input-from-file file thunk)
+  (let ((port (open-input-file file)))
+    (if (= port -1)
+        (error 'no-such-file file)
+        (with-input-from-port port thunk))))
+
+(define (with-output-to-file file thunk)
+  (let ((port (open-output-file file)))
+    (if (= port -1)
+        (error 'cannot-open file)
+        (with-output-to-port port thunk))))
+
+(define (with-error-to-file file thunk)
+  (let ((port (open-output-file file)))
+    (if (= port -1)
+        (error 'cannot-open file)
+        (with-error-to-port port thunk))))
+
+(define (call-with-port port proc)
+  (call-with-values (lambda () (proc port))
+    (lambda results
+      (close-port port)
+      (apply values results))))
+
+(define (call-with-input-file file proc)
+  (call-with-port (open-input-file file) proc))
+
+(define (call-with-input-string str proc)
+  (call-with-port (open-input-string str) proc))
+
+(define (call-with-output-file file proc)
+  (call-with-port (open-output-file file) proc))
+
+(define core:open-input-file open-input-file)
+(define (open-input-file file)
+  (let ((port (core:open-input-file file))
+        (debug (and=> (getenv "MES_DEBUG") string->number)))
+    (when (and debug (> debug 1))
+      (core:display-error (string-append "open-input-file: `" file "'"))
+      (when (> debug 3)
+        (core:display-error " port=")
+        (core:display-error port))
+      (core:display-error "\n"))
+    port))
+
+(define (dirname file-name)
+  (let* ((lst (string-split file-name #\/))
+         (lst (filter (negate string-null?) lst)))
+    (if (null? lst) (if (string-prefix? "/" file-name) "/" ".")
+        (let ((dir (string-join (list-head lst (1- (length lst))) "/")))
+          (if (string-prefix? "/" file-name) (string-append "/" dir)
+              (if (string-null? dir) "."
+                  dir))))))
+
+(define (file-exists? o)
+  (access? o R_OK))
+
+
+;;;
+;;; Nyacc 1.04.0, 1.08.0
+;;;
+(define (close-port port)
+  #t)
+
+(define (export . rest)
+  #t)
+
+(define (noop . rest)
+  (and (pair? rest)
+       (car rest)))
+
+
+;;;
+;;; Source-property stubs for Nyacc-1.08.1
+;;;
+(define (supports-source-properties? o)
+  #f)
+
+(define (close-port port)
+  #t)
+
+(define (export . rest)
+  #t)
+
+(define (set-source-property! o key datum)
+  #f)
+
+(define (set-source-properties! o alist)
+  #f)
+
+(define (source-properties o)
+  '())
+
+(define (source-property o key)
+  #f)
+
+(define (cons-source xorig car cdr)
+  (cons car cdr))
+
+(define (set-port-filename! port file-name)
+  #t)

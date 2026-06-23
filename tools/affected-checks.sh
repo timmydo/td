@@ -337,10 +337,19 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-cc ;;
 
+    tests/bootstrap-mes.sh)
+      add_preflight shell-syntax
+      add_target bootstrap-mes ;;
+
     seed/stage0/*)
       add_preflight shell-syntax
       add_target bootstrap-seed
-      add_target bootstrap-cc ;;
+      add_target bootstrap-cc
+      add_target bootstrap-mes ;;
+
+    seed/mes/*)
+      add_preflight shell-syntax
+      add_target bootstrap-mes ;;
 
     tests/store-ns.sh)
       add_preflight shell-syntax

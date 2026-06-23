@@ -1,0 +1,52 @@
+;;; -*-scheme-*-
+
+;;; GNU Mes --- Maxwell Equations of Software
+;;; Copyright © 2017,2018 Jan (janneke) Nieuwenhuizen <janneke@gnu.org>
+;;; Copyright © 2023 Timothy Sample <samplet@ngyro.com>
+;;;
+;;; This file is part of GNU Mes.
+;;;
+;;; GNU Mes is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3 of the License, or (at
+;;; your option) any later version.
+;;;
+;;; GNU Mes is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;;; GNU General Public License for more details.
+;;;
+;;; You should have received a copy of the GNU General Public License
+;;; along with GNU Mes.  If not, see <http://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;;; srfi-9.mes - GNU immutable records.
+
+(define-macro (define-immutable-record-type type constructor+parameters predicate . fields)
+  `(begin
+     (define-record-type ,type
+       ,constructor+parameters
+       ,predicate
+       ,@(map (lambda (f) (list-head f 2)) fields))
+     ,@(let loop ((fields fields) (definitions '()))
+         (if (null? fields) (reverse definitions)
+             (loop (cdr fields)
+                   (let ((field (car fields)))
+                     (if (<= (length field) 2) definitions
+                         (let ((getter (cadr field))
+                               (setter (caddr field)))
+                           (cons `(define (,setter record value)
+                                    (set-field record (,getter) value))
+                                 definitions)))))))))
+
+(define-macro (set-field o getters value)
+  `(let ((getter ,(car getters)))
+     (let ((type (record-type-descriptor ,o))
+           (set (getter ,o #t)))
+       (define (field->value field)
+         (if (eq? set field) ,value
+             ((record-accessor type field) ,o)))
+       (let* ((fields (record-type-fields type))
+              (values (map field->value fields)))
+         (apply (record-constructor type fields) values)))))
