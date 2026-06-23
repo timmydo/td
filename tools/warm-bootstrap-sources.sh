@@ -24,11 +24,26 @@ mkdir -p "$dest"
 
 sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
-# Locate or build td-fetch once (reused across locks): prefer the rust-fetch gate's stage0 build,
-# else a plain host cargo build of fetch/ (cached). Either is just a binary to drive the fetch.
+# Locate the fetcher (td-fetch) and the SHARED mirror (td-feed), reused across locks: prefer
+# each gate's td-built binary, else a host cargo build (cached). Either is just a binary.
 tdf=$(ls "$root"/.td-build-cache/rust-fetch/b/newstore/*/bin/td-fetch 2>/dev/null | head -1 || true)
 if { [ -z "$tdf" ] || [ ! -x "$tdf" ]; } && command -v cargo >/dev/null 2>&1; then
   ( cd "$root/fetch" && cargo build --release --quiet ) && tdf="$root/fetch/target/release/td-fetch" || tdf=""
+fi
+tdfeed=$(ls "$root"/.td-build-cache/td-feed/b/newstore/*/bin/td-feed 2>/dev/null | head -1 || true)
+if { [ -z "$tdfeed" ] || [ ! -x "$tdfeed" ]; } && command -v cargo >/dev/null 2>&1; then
+  ( cd "$root/feed" && cargo build --release --quiet ) && tdfeed="$root/feed/target/release/td-feed" || tdfeed=""
+fi
+
+# Start/reuse the ONE shared td-feed daemon and route fetches through it, so the bootstrap
+# sources are SHARED across worktrees + served offline once warm (tools/feed-ensure.sh). The
+# FIRST worktree egresses (td-feed warm populates the shared store); the rest read it offline
+# over loopback. Best-effort: any failure falls back to a direct td-fetch below.
+feedstore="${TD_FEED_DIR:-$HOME/.td/feed}/store"
+faddr=""
+if [ -n "$tdfeed" ] && [ -x "$tdfeed" ]; then
+  faddr=$(TD_FEED_BIN="$tdfeed" sh "$root/tools/feed-ensure.sh" 2>/dev/null || true)
+  [ -n "$faddr" ] && echo ">> warm-bootstrap-sources: using the shared feed at http://$faddr (store $feedstore)" >&2
 fi
 
 rc=0
@@ -45,15 +60,33 @@ for lock in "$srcdir"/*.lock; do
     echo ">> warm-bootstrap-sources: $file is cold and no td-fetch (build fetch/ with cargo to warm it) — skipping (PREP best-effort)" >&2
     rc=1; continue
   fi
-  echo ">> warm-bootstrap-sources: fetching $file with td-fetch (host PREP) ..." >&2
-  if "$tdf" fetch "$url" "$sha" "$out.tmp" >&2 && [ "$(sha_of "$out.tmp")" = "$sha" ]; then
-    mv -f "$out.tmp" "$out"
-    echo ">> warm-bootstrap-sources: warmed $out (td-fetched, sha256 verified)" >&2
-  else
-    rm -f "$out.tmp"
-    echo ">> warm-bootstrap-sources: could not td-fetch/verify $file — skipping (the bootstrap gate will report if it runs)" >&2
-    rc=1
+
+  got=""
+  # Preferred: through the SHARED feed. Populate it (td-feed warm egresses only if the shared
+  # store is cold — another worktree may already hold it), then td-fetch FROM the feed
+  # (TD_FEED_BASE, offline). So the egress happens ONCE across all worktrees.
+  if [ -n "$faddr" ] && [ -n "$tdfeed" ]; then
+    path=$(printf '%s' "$url" | sed -E 's,^https?://,,')
+    idx=$(mktemp); printf '%s %s %s\n' "$path" "$url" "$sha" > "$idx"
+    "$tdfeed" warm "$idx" "$feedstore" >&2 || true
+    rm -f "$idx"
+    if TD_FEED_BASE="http://$faddr" "$tdf" fetch "$url" "$sha" "$out.tmp" >&2 && [ "$(sha_of "$out.tmp")" = "$sha" ]; then
+      mv -f "$out.tmp" "$out"; got="the shared feed (http://$faddr)"
+    else
+      rm -f "$out.tmp"
+    fi
   fi
+  # Fallback: a direct td-fetch (feed unavailable, or a cold-feed miss) — the prior behavior.
+  if [ -z "$got" ]; then
+    if "$tdf" fetch "$url" "$sha" "$out.tmp" >&2 && [ "$(sha_of "$out.tmp")" = "$sha" ]; then
+      mv -f "$out.tmp" "$out"; got="a direct td-fetch"
+    else
+      rm -f "$out.tmp"
+      echo ">> warm-bootstrap-sources: could not warm $file (feed + direct both failed) — skipping (the bootstrap gate will report if it runs)" >&2
+      rc=1; continue
+    fi
+  fi
+  echo ">> warm-bootstrap-sources: warmed $out via $got (sha256 verified)" >&2
 done
 # PREP is best-effort: never fail check.sh here (the heavy bootstrap-* gates enforce presence).
 exit 0

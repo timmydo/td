@@ -1,40 +1,27 @@
-// td-feed — td's OWN local HTTP mirror of every artifact this repo downloads over the
-// network (the td-fetch seed blobs, the url-fetch source tarballs, and all
-// static.crates.io `.crate` deps). It is a sibling of fetch/ (td-fetch) and reuses the
-// same pure-Rust HTTP(S)+sha256 stack (ureq + rustls/ring + sha2); the mirror server
-// itself uses only std::net, so it adds no crate to the vendored closure.
+// td-feed — td's OWN local HTTP mirror of the artifacts this repo downloads over the
+// network. A sibling of fetch/ (td-fetch) reusing the same pure-Rust HTTP(S)+sha256 stack
+// (ureq + rustls/ring + sha2); the mirror server uses only std::net (no extra crate).
 //
-// The INDEX is a pinned table, one artifact per line:
+// It is run as a SHARED, persistent host daemon (tools/feed-ensure.sh) serving a shared
+// store across worktrees, so a td-native download happens ONCE. Two verification layers:
 //
-//     <path>  <url>  <sha256-hex>
+//   - warm = the SUPPLY-CHAIN gate. `td-feed warm INDEX STORE` (host PREP, egress) GETs
+//     each pinned `<path> <url> <sha256>` entry, verifies the bytes against the PINNED
+//     index sha256, and writes STORE/<path> PLUS a STORE/<path>.sha256 sidecar (the
+//     verified hash). Idempotent: an entry already present + matching is skipped.
 //
-// where <path> is the mirror path the feed serves (the upstream `<host>/<path>`, so
-// different hosts never collide) and <url> is where `warm` fetches it from. Three modes:
+//   - serve = the INTEGRITY gate, and INDEX-FREE. `td-feed serve STORE ADDR` answers
+//     `GET /<path>` by reading STORE/<path> + its .sha256 sidecar, RE-VERIFYING the file
+//     against the sidecar (store corruption 500s), and streaming it. Because each artifact
+//     is self-describing, a persistent daemon serves whatever any branch has warmed into
+//     the shared store with no index coupling. Missing path/sidecar 404/500. No egress.
 //
-//   td-feed warm INDEX STORE           HOST PREP (network egress ALLOWED): for every
-//                                      index entry, GET <url>, verify its sha256 ==
-//                                      <sha256>, and write it to STORE/<path>. Entries
-//                                      already warm + matching are skipped. This is the
-//                                      ONE egress point; it runs on the host, never in
-//                                      the offline loop.
-//
-//   td-feed serve STORE INDEX ADDR     OFFLINE loopback mirror: serve STORE over HTTP on
-//                                      ADDR (e.g. 127.0.0.1:8787). `GET /<path>` looks
-//                                      <path> up in INDEX, reads STORE/<path>, RE-VERIFIES
-//                                      its sha256 against the index (verify-on-serve —
-//                                      store corruption 500s), and streams it. Unknown
-//                                      paths 404. std::net only, no egress.
-//
-//   td-feed selftest                   Self-contained LOOPBACK round-trip (offline, like
-//                                      td-fetch's selftest): stand up an ORIGIN server on
-//                                      127.0.0.1, `warm` a one-entry index from it into a
-//                                      temp store, `serve` the store on a 2nd loopback
-//                                      port, then fetch the artifact back THROUGH the feed
-//                                      and verify it. Also asserts the verification is
-//                                      load-bearing: a wrong index hash reds `warm`, and a
-//                                      corrupted store byte reds `serve` (verify-on-serve).
+//   td-feed selftest   Self-contained LOOPBACK round-trip (offline): an ORIGIN server on
+//                      127.0.0.1, `warm` a one-entry index from it, `serve` the store on a
+//                      2nd port, fetch the artifact back THROUGH the feed and verify it.
+//                      Also asserts both gates are load-bearing: a wrong pinned hash reds
+//                      warm, a corrupted store byte reds serve (sidecar mismatch).
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -73,18 +60,33 @@ fn parse_index(text: &str) -> Result<Vec<Entry>, String> {
 }
 
 /// Map a mirror path to a store file, rejecting traversal / absolute components so a
-/// crafted index path can never escape STORE.
+/// crafted index path or request can never escape STORE.
 fn store_path(store: &Path, rel: &str) -> Option<PathBuf> {
     if rel.is_empty() || rel.starts_with('/') {
         return None;
     }
-    if rel
-        .split('/')
-        .any(|c| c.is_empty() || c == "." || c == "..")
-    {
+    if rel.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
         return None;
     }
     Some(store.join(rel))
+}
+
+/// The integrity sidecar path for a store file: `<file>.sha256` (append, not replace, so
+/// `x.crate` -> `x.crate.sha256`).
+fn sidecar_path(dst: &Path) -> PathBuf {
+    let mut s = dst.as_os_str().to_os_string();
+    s.push(".sha256");
+    PathBuf::from(s)
+}
+
+/// Write `bytes` to `dst` atomically (pid-unique temp + rename), so a concurrent serve /
+/// another warming agent never sees a partial file.
+fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut t = dst.as_os_str().to_os_string();
+    t.push(format!(".{}.td-feed-tmp", std::process::id()));
+    let tmp = PathBuf::from(t);
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dst).map_err(|e| format!("rename {}: {e}", dst.display()))
 }
 
 /// GET `url` (http/https), returning the body or an error string.
@@ -97,12 +99,20 @@ fn try_get(url: &str) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
-/// Warm one entry into `store`; returns Ok(true) if it was fetched, Ok(false) if it was
-/// already warm and verified. Never egresses for an entry already present + matching.
+/// Warm one entry into `store` (+ its sidecar); Ok(true) if fetched, Ok(false) if already
+/// warm + verified. Never egresses for an entry already present + matching.
 fn warm_one(e: &Entry, store: &Path) -> Result<bool, String> {
     let dst = store_path(store, &e.path).ok_or_else(|| format!("unsafe index path {:?}", e.path))?;
+    let side = sidecar_path(&dst);
     if let Ok(have) = std::fs::read(&dst) {
         if hex_sha256(&have) == e.sha256 {
+            // File is warm; make sure the integrity sidecar is present + correct.
+            let ok = std::fs::read_to_string(&side)
+                .map(|s| s.trim() == e.sha256)
+                .unwrap_or(false);
+            if !ok {
+                write_atomic(&side, format!("{}\n", e.sha256).as_bytes())?;
+            }
             return Ok(false);
         }
     }
@@ -117,10 +127,8 @@ fn warm_one(e: &Entry, store: &Path) -> Result<bool, String> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("mkdir {}: {err}", parent.display()))?;
     }
-    // Write via a temp + rename so a serve reading concurrently never sees a partial file.
-    let tmp = dst.with_extension("td-feed-tmp");
-    std::fs::write(&tmp, &body).map_err(|err| format!("write {}: {err}", tmp.display()))?;
-    std::fs::rename(&tmp, &dst).map_err(|err| format!("rename {}: {err}", dst.display()))?;
+    write_atomic(&dst, &body)?;
+    write_atomic(&side, format!("{got}\n").as_bytes())?;
     Ok(true)
 }
 
@@ -149,12 +157,8 @@ fn respond(conn: &mut TcpStream, code: u16, reason: &str, body: &[u8]) -> io::Re
     conn.flush()
 }
 
-/// Handle one request: route a `GET /<path>` against the index, verify-on-serve, stream.
-fn handle_conn(
-    mut conn: TcpStream,
-    store: &Path,
-    map: &HashMap<String, String>,
-) -> io::Result<()> {
+/// Handle one request: route `GET /<path>`, verify the file against its sidecar, stream.
+fn handle_conn(mut conn: TcpStream, store: &Path) -> io::Result<()> {
     let mut reader = BufReader::new(conn.try_clone()?);
     let mut req_line = String::new();
     reader.read_line(&mut req_line)?;
@@ -173,10 +177,10 @@ fn handle_conn(
         return respond(&mut conn, 405, "Method Not Allowed", b"method not allowed\n");
     }
     let path = target.trim_start_matches('/');
-    let want = match map.get(path) {
-        Some(h) => h,
-        None => return respond(&mut conn, 404, "Not Found", b"not in index\n"),
-    };
+    // The integrity sidecars are internal — never serve them.
+    if path.ends_with(".sha256") {
+        return respond(&mut conn, 404, "Not Found", b"not served\n");
+    }
     let full = match store_path(store, path) {
         Some(p) => p,
         None => return respond(&mut conn, 400, "Bad Request", b"bad path\n"),
@@ -185,26 +189,27 @@ fn handle_conn(
         Ok(b) => b,
         Err(_) => return respond(&mut conn, 404, "Not Found", b"not warmed\n"),
     };
-    if &hex_sha256(&bytes) != want {
-        // verify-on-serve: the store has drifted from the pinned hash — refuse to serve.
+    let want = match std::fs::read_to_string(sidecar_path(&full)) {
+        Ok(s) => s.trim().to_string(),
+        // No sidecar ⇒ the artifact was not placed by `warm`; refuse to serve unverified.
+        Err(_) => return respond(&mut conn, 500, "No Integrity Sidecar", b"no sidecar\n"),
+    };
+    if hex_sha256(&bytes) != want {
+        // verify-on-serve: the store drifted from the warmed hash — refuse to serve.
         return respond(&mut conn, 500, "Integrity Failure", b"store sha256 mismatch\n");
     }
     respond(&mut conn, 200, "OK", &bytes)
 }
 
-/// Run the mirror server forever on `listener`.
-fn serve_loop(listener: TcpListener, store: Arc<PathBuf>, map: Arc<HashMap<String, String>>) {
+/// Run the mirror server forever on `listener` (one thread per connection).
+fn serve_loop(listener: TcpListener, store: Arc<PathBuf>) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let (store, map) = (Arc::clone(&store), Arc::clone(&map));
+        let store = Arc::clone(&store);
         std::thread::spawn(move || {
-            let _ = handle_conn(conn, &store, &map);
+            let _ = handle_conn(conn, &store);
         });
     }
-}
-
-fn index_map(index: &[Entry]) -> HashMap<String, String> {
-    index.iter().map(|e| (e.path.clone(), e.sha256.clone())).collect()
 }
 
 fn die(msg: String) -> ! {
@@ -250,7 +255,7 @@ fn selftest() {
         sha256: want.clone(),
     }];
 
-    // 3. Warm into a fresh temp store.
+    // 3. Warm into a fresh temp store (writes the file + its sidecar).
     let store = std::env::temp_dir().join(format!("td-feed-selftest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&store);
     let (fetched, _) = warm(&index, &store).unwrap_or_else(|e| die(format!("warm: {e}")));
@@ -261,15 +266,16 @@ fn selftest() {
     if hex_sha256(&std::fs::read(&stored).expect("read stored")) != want {
         die("warmed store artifact does not match its pinned sha256".into());
     }
+    if !sidecar_path(&stored).exists() {
+        die("warm did not write the integrity sidecar".into());
+    }
 
-    // 4. Serve the store on a 2nd loopback port.
+    // 4. Serve the store on a 2nd loopback port (index-free — sidecars carry the hashes).
     let feed = TcpListener::bind("127.0.0.1:0").expect("bind feed");
     let feed_port = feed.local_addr().expect("addr").port();
-    let map = Arc::new(index_map(&index));
-    let store_arc = Arc::new(store.clone());
     {
-        let (s, m) = (Arc::clone(&store_arc), Arc::clone(&map));
-        std::thread::spawn(move || serve_loop(feed, s, m));
+        let s = Arc::new(store.clone());
+        std::thread::spawn(move || serve_loop(feed, s));
     }
 
     // 5. Fetch the artifact back THROUGH the feed; bytes + sha256 must match the origin.
@@ -282,7 +288,7 @@ fn selftest() {
         die("feed-served sha256 differs from the pin".into());
     }
 
-    // 6. SELF-DISCRIMINATION (warm): a wrong index hash must red `warm`.
+    // 6. SELF-DISCRIMINATION (warm): a wrong pinned hash must red `warm`.
     let bad_index = vec![Entry {
         path: "origin.invalid/blob-bad".to_string(),
         url: format!("http://127.0.0.1:{origin_port}/blob"),
@@ -299,16 +305,15 @@ fn selftest() {
     let mut corrupt = std::fs::read(&stored).expect("read stored");
     corrupt[0] ^= 0xff;
     std::fs::write(&stored, &corrupt).expect("corrupt stored");
-    match try_get(&feed_url) {
-        Ok(_) => die("feed SERVED a corrupted store artifact — verify-on-serve is not load-bearing".into()),
-        Err(_) => {}
+    if try_get(&feed_url).is_ok() {
+        die("feed SERVED a corrupted store artifact — verify-on-serve is not load-bearing".into());
     }
 
     let _ = std::fs::remove_dir_all(&store);
     println!(
         "td-feed: selftest OK — warmed + served + fetched {} bytes (sha256 {}) over loopback \
-         (origin 127.0.0.1:{}, feed 127.0.0.1:{}); a wrong index hash reds warm and a corrupted \
-         store byte reds serve",
+         (origin 127.0.0.1:{}, feed 127.0.0.1:{}); a wrong pinned hash reds warm and a corrupted \
+         store byte reds serve (sidecar integrity)",
         blob.len(),
         want,
         origin_port,
@@ -331,25 +336,19 @@ fn main() {
                 Err(e) => die(e),
             }
         }
-        Some("serve") if a.len() == 5 => {
-            let (store, index, addr) = (PathBuf::from(&a[2]), &a[3], &a[4]);
-            let entries = read_index(index);
-            let listener = TcpListener::bind(addr.as_str())
-                .unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
+        Some("serve") if a.len() == 4 => {
+            let (store, addr) = (PathBuf::from(&a[2]), &a[3]);
+            let listener =
+                TcpListener::bind(addr.as_str()).unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
             let bound = listener.local_addr().unwrap_or_else(|e| die(format!("local_addr: {e}")));
-            println!(
-                "td-feed: serving {} artifacts from {} on http://{}/",
-                entries.len(),
-                store.display(),
-                bound
-            );
+            println!("td-feed: serving {} on http://{}/", store.display(), bound);
             let _ = io::stdout().flush();
-            serve_loop(listener, Arc::new(store), Arc::new(index_map(&entries)));
+            serve_loop(listener, Arc::new(store));
         }
         Some("selftest") if a.len() == 2 => selftest(),
         _ => {
             eprintln!(
-                "usage:\n  td-feed warm INDEX STORE\n  td-feed serve STORE INDEX ADDR\n  td-feed selftest"
+                "usage:\n  td-feed warm INDEX STORE\n  td-feed serve STORE ADDR\n  td-feed selftest"
             );
             std::process::exit(2);
         }

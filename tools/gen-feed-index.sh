@@ -46,8 +46,12 @@ done
 test "$nmiss" -eq 0 || { echo "gen-feed-index: $nmiss crate(s) not realized — run the warm prep" >&2; exit 1; }
 
 # --- explicit-URL seed blobs: locks that carry `url` + `sha256` -------------------------
+# These are the td-NATIVE fetch artifacts (tsgo tarball in tests/, the bootstrap source
+# tarballs in seed/sources/) — what td-fetch / tools/warm-*.sh request and what the SHARED
+# feed actually warms+serves (the crates above stay catalog-only, daemon-served).
 nblob=0
-for lock in "$root"/tests/*.lock; do
+for lock in "$root"/tests/*.lock "$root"/seed/sources/*.lock; do
+  test -e "$lock" || continue
   url=$(sed -n 's/^url //p' "$lock" | head -1)
   sha=$(sed -n 's/^sha256 //p' "$lock" | head -1)
   test -n "$url" -a -n "$sha" || continue
