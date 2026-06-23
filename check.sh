@@ -211,6 +211,11 @@ guix_env=$(dirname "${toolchain%%:*}")
 # fixed-output seeds — the in-sandbox loop never egresses. Idempotent + near-instant once
 # the store path is warm; only a cold machine pays the one-time fetch (+ td-fetch build).
 sh tools/warm-tsgo.sh || { echo "check.sh: FATAL: could not warm the tsgo tarball (tools/warm-tsgo.sh)." >&2; exit 1; }
+# --- Bootstrap-source warm: td OWNS fetching the source-bootstrap tarballs (GNU Mes, later -----
+# tinycc/gcc/glibc) the same way — td-fetch on the HOST, sha256-pinned per seed/sources/*.lock,
+# into .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates. BEST-EFFORT (those
+# gates are not in the fast tier): a runner that cannot warm them is fine, the gate enforces.
+sh tools/warm-bootstrap-sources.sh || true
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only
 # single-threaded builds (NIX_BUILD_CORES=1), so -j2 idles most of the box; run it HOT at
