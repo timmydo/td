@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 handle: claude-fable-65585b
 date: 2026-06-23
 title: td-feed
