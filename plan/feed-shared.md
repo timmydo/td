@@ -47,4 +47,22 @@ many agents/worktrees, so those downloads happen ONCE into a shared store.
 
 ## Verified-red evidence
 
-(record per brick)
+### Inc1 (2026-06-23, commit d835e27 — both gates GREEN via ./check.sh)
+- **td-feed gate** (rebuilt from the sidecar source): `selftest` passes; verified-red built
+  into the binary — wrong pinned hash reds warm, corrupted store byte reds serve (sidecar).
+- **feed-shared gate**: one shared daemon (feed-ensure); two consumers in different cwds
+  fetched the same blob through it offline; a 2nd ensure reused the same addr+pid;
+  SELF-DISCRIMINATION — corrupting the shared store reds the consumer (serve sidecar), a
+  cold path 404s. Host-validated the same legs first; the bug found+fixed: the detached
+  daemon inherited the flock fd and deadlocked later ensures (now `9>&-`).
+
+## Brick status
+- Inc1a sidecar serve/warm — DONE (td-feed gate green).
+- Inc1b feed-ensure + feed-shared gate — DONE (feed-shared gate green).
+- Inc2 wiring — IN PROGRESS. Plan: wire `tools/warm-bootstrap-sources.sh` to source each
+  bootstrap tarball via the SHARED feed (feed-ensure + `td-feed warm` into ~/.td/feed +
+  copy out), with a fallback to today's direct td-fetch. This shares the bootstrap
+  sources (today per-worktree in .td-build-cache/sources/) across worktrees WITHOUT a
+  check.sh spine edit (each warm script self-bootstraps the daemon via feed-ensure's
+  flock). tsgo is already /gnu/store-shared, so lower value there. Index extended to
+  catalog the bootstrap sources (gen-feed-index.sh scans seed/sources/*.lock).
