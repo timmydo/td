@@ -96,11 +96,31 @@ upward:
      `ar`). Then `sh bootstrap.sh` → `bin/mes-mescc` + `mescc-lib/x86-mes/libc+tcc.a`.
    - Remaining for the gate: curated guix-scrubbed-but-build-tools env in the sandbox, reproducibility
      leg, verified-red. tinycc (brick 4) builds on `libc+tcc.a` next.
-4. **gcc (old) → gcc (modern)** — staged gcc builds, `--prefix=/td/store`.
-5. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
-6. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
+4. **TinyCC (tcc) from MesCC** — ✅ DONE (2026-06-23). MesCC + `libc+tcc.a` (brick 3) compile the
+   mes-patched TinyCC (`tcc-0.9.26-1149-g46a75d0c`, the 30-patch fork MesCC can build, td-fetched
+   `seed/sources/tcc-*.lock`, sha256 `f4f6ce12…`) — exactly guix's tcc-boot0 — to **`tcc`, the first
+   real C compiler** in the chain. The `bootstrap-tcc` gate (`mk/gates/368`) builds seed → Mes (i686,
+   installed) → MesCC → tcc. ALL-DURABLE: pinned-input (3 tarballs == locks), no-guix (no
+   gcc/guile/guix on PATH; no `/gnu/store` in tcc), behavioral (tcc compiles+links a C program that
+   RUNS returning 42; tcc 0.9.27, 32-bit i386 ELF), repro (byte-identical tcc).
+   - **THE BUG (a long detour): `MES_ARENA`.** mescc crashed (segfault / `unbound-variable` /
+     `eval/apply unknown continuation`) compiling tcc.c — misdiagnosed across shell (gash, refuted),
+     interpreter (mes-m2 vs mes-mescc, both crash), flags, and even a mes-version realign (built
+     stage0-posix 1.6.0 + mes 0.25.1 — guix's pair — which ALSO crashed). The real cause: mes's arena
+     is in **cells**, the Mes/tcc layer is **32-bit (i686)**, and a "big" `MES_ARENA` (200M–2e9 cells)
+     **overflows the 32-bit address space** → segfault. The guix DEFAULT (`MES_ARENA=20000000`, 20M
+     cells ≈ 240MB) fits and compiles tcc.c. **No realign needed** — mes 0.27.1 (bricks 0-3) builds tcc
+     fine with the sane arena. Lesson: match guix's env (incl. the *default* arena), don't crank knobs.
+   - tcc-boot0 recipe: `configure --cc=mescc --elfinterp=/lib/mes-loader --crtprefix=. --tccdir=.`
+     (host=i686, ONE_SOURCE=1, `volatile`→`` in conftest.c), then `sh bootstrap.sh` at the default
+     arena → `./tcc`. The mescc script's `-L` dir (`share/guile/site/2.2`) must be populated with the
+     mes modules (install leaves it empty; GUILE_LOAD_PATH=nyacc only — putting mes modules there
+     crashes gash, per the parallel-agent finding).
+5. **gcc (old) → gcc (modern)** — staged gcc builds, `--prefix=/td/store`.
+6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
+7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
-7. **retire the guix seed** — the corpus locks (`hello-no-guix.lock`, …) point at the
+8. **retire the guix seed** — the corpus locks (`hello-no-guix.lock`, …) point at the
    `/td/store` toolchain; the guix toolchain seed is removed from every build's inputs;
    guix remains only as the removable `guix build --check` oracle (retired last, §5).
 
