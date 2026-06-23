@@ -337,7 +337,7 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-cc ;;
 
-    tests/bootstrap-mes.sh)
+    tests/bootstrap-mes.sh|seed/sources/mes-*.lock|tools/warm-bootstrap-sources.sh)
       add_preflight shell-syntax
       add_target bootstrap-mes ;;
 
@@ -345,10 +345,6 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-seed
       add_target bootstrap-cc
-      add_target bootstrap-mes ;;
-
-    seed/mes/*)
-      add_preflight shell-syntax
       add_target bootstrap-mes ;;
 
     tests/store-ns.sh)
