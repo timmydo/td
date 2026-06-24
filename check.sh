@@ -216,6 +216,11 @@ sh tools/warm-tsgo.sh || { echo "check.sh: FATAL: could not warm the tsgo tarbal
 # into .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates. BEST-EFFORT (those
 # gates are not in the fast tier): a runner that cannot warm them is fine, the gate enforces.
 sh tools/warm-bootstrap-sources.sh || true
+# --- Crate-guix-free warm: td OWNS fetching td-fetch's crate closure (no guix daemon FOD) -----
+# td-fetch each `.crate` from static.crates.io, pinned by fetch/Cargo.lock (upstream hash), into
+# .td-build-cache/crate-vendor/ for the offline `rust-fetch-crate-free` gate (which interns it as
+# a vendor tree + builds td-fetch guix-free). BEST-EFFORT (heavy gate, not the fast tier).
+sh tools/warm-td-fetch-crates.sh || true
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only
 # single-threaded builds (NIX_BUILD_CORES=1), so -j2 idles most of the box; run it HOT at
