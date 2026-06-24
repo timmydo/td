@@ -522,6 +522,45 @@ pub fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Collect the `(crate-file-path, name-version)` pairs to vendor, from TD_VENDOR_CRATES
+/// (':'-joined `.crate` STORE paths — nv via the store-path basename) and/or TD_VENDOR_DIR
+/// (an interned DIRECTORY of `*.crate` files — nv = the crate filename, so NO `/gnu/store`
+/// path is needed; this is td's OWN guix-free crate set). Pure given the env strings + a
+/// directory listing, so it is unit-testable.
+fn collect_vendor_crates(
+    vendor_crates: &str,
+    vendor_dir: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for c in vendor_crates.split(':').filter(|s| !s.is_empty()) {
+        let nv_crate = crate::store::name_from_store_path(c)
+            .ok_or_else(|| format!("vendor crate not a store path: {c}"))?;
+        let nv = nv_crate.strip_suffix(".crate").unwrap_or(&nv_crate).to_string();
+        out.push((c.to_string(), nv));
+    }
+    if !vendor_dir.is_empty() {
+        let mut entries: Vec<PathBuf> = fs::read_dir(vendor_dir)
+            .map_err(|e| format!("read TD_VENDOR_DIR {vendor_dir}: {e}"))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "crate").unwrap_or(false))
+            .collect();
+        entries.sort();
+        for p in entries {
+            let path = p
+                .to_str()
+                .ok_or_else(|| format!("non-utf8 crate path in {vendor_dir}"))?
+                .to_string();
+            let base = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| format!("non-utf8 crate name in {vendor_dir}"))?;
+            let nv = base.strip_suffix(".crate").unwrap_or(base).to_string();
+            out.push((path, nv));
+        }
+    }
+    Ok(out)
+}
+
 /// rust-build — td's OWN Rust/cargo build "system" (sibling of `run`, the
 /// autotools runner). The REPLACEMENT for Guix's `cargo-build-system`: here the
 /// build LOGIC is td's Rust; only the rustc/cargo/gcc seed is the external
@@ -544,11 +583,15 @@ pub fn run() -> Result<(), String> {
 ///                coreutils, bash) — their bin/ dirs build PATH, lib/ build
 ///                LIBRARY_PATH.
 ///   TD_RUST_BINS space-separated binary names to install into $out/bin.
-///   TD_VENDOR_CRATES optional ':'-joined `.crate` paths (the dependency closure
-///                pinned by Cargo.lock, each a fixed-output fetch). When set, a
-///                cargo `vendored-sources` directory is assembled from them so
-///                `cargo build --offline` resolves dependencies from it instead of
-///                the network; unset ⇒ a dependency-free build (the self-host path).
+///   TD_VENDOR_CRATES optional ':'-joined `.crate` STORE paths (the dependency closure
+///                pinned by Cargo.lock; nv from the store-path basename). The guix-realized
+///                FOD inputs.
+///   TD_VENDOR_DIR optional path to a single interned DIRECTORY of `*.crate` files (nv =
+///                the crate filename) — td's OWN guix-free crate set (td-feed-warmed +
+///                interned by store-add-recursive; NO `/gnu/store` crate path). When either
+///                is set, a cargo `vendored-sources` dir is assembled so `cargo build
+///                --offline` resolves deps from it instead of the network; neither ⇒ a
+///                dependency-free build (the self-host path).
 pub fn run_rust() -> Result<(), String> {
     let out = env::var("out").map_err(|_| "out not set".to_string())?;
     let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
@@ -641,21 +684,19 @@ pub fn run_rust() -> Result<(), String> {
     // config at it, so `cargo build --offline` resolves deps from the vendor dir
     // instead of the network. Unset ⇒ the dependency-free self-host path, unchanged.
     fs::create_dir_all(&cargo_home).map_err(|e| format!("mkdir CARGO_HOME {cargo_home}: {e}"))?;
-    let vendor_crates = env::var("TD_VENDOR_CRATES").unwrap_or_default();
-    let vendor_list: Vec<&str> = vendor_crates.split(':').filter(|s| !s.is_empty()).collect();
-    if !vendor_list.is_empty() {
+    let crate_files = collect_vendor_crates(
+        &env::var("TD_VENDOR_CRATES").unwrap_or_default(),
+        &env::var("TD_VENDOR_DIR").unwrap_or_default(),
+    )?;
+    if !crate_files.is_empty() {
         let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS (vendor)")?;
         let vendor_dir = cwd.join("td-rust-vendor");
         fs::create_dir_all(&vendor_dir).map_err(|e| format!("mkdir vendor: {e}"))?;
         let vendor_abs = vendor_dir.to_str().ok_or("non-utf8 vendor path")?.to_string();
-        for c in &vendor_list {
-            // <name>-<version> from the store name (drops the leading store hash);
-            // a cargo `.crate` tarball unpacks to exactly this single top dir.
-            let nv_crate = crate::store::name_from_store_path(c)
-                .ok_or_else(|| format!("vendor crate not a store path: {c}"))?;
-            let nv = nv_crate.strip_suffix(".crate").unwrap_or(&nv_crate).to_string();
-            run_cmd(&tar, &["xf", c, "-C", &vendor_abs], ".", &path_env)?;
-            let cdir = vendor_dir.join(&nv);
+        for (c, nv) in &crate_files {
+            // a cargo `.crate` tarball unpacks to exactly the single `<name>-<version>/` dir.
+            run_cmd(&tar, &["xf", c.as_str(), "-C", &vendor_abs], ".", &path_env)?;
+            let cdir = vendor_dir.join(nv);
             if !cdir.is_dir() {
                 return Err(format!("crate {c} did not unpack to {}/", cdir.display()));
             }
@@ -840,6 +881,26 @@ pub fn run_cmake() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn vendor_dir_collects_crates_by_filename_guix_free() {
+        // TD_VENDOR_DIR: every *.crate is collected, nv = the filename (no /gnu/store path),
+        // sorted, non-.crate files ignored — this is td's guix-free crate set.
+        let tmp = std::env::temp_dir().join(format!("td-vendor-dir-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("aho-corasick-1.1.2.crate"), b"y").unwrap();
+        fs::write(tmp.join("adler2-2.0.0.crate"), b"x").unwrap();
+        fs::write(tmp.join("README.txt"), b"ignored").unwrap();
+        let got = collect_vendor_crates("", tmp.to_str().unwrap()).unwrap();
+        let nvs: Vec<&str> = got.iter().map(|(_, nv)| nv.as_str()).collect();
+        assert_eq!(nvs, vec!["adler2-2.0.0", "aho-corasick-1.1.2"]);
+        // the collected path is the real crate file (so vendoring can untar + sha it).
+        assert!(got.iter().all(|(p, _)| p.ends_with(".crate") && Path::new(p).exists()));
+        // neither source set ⇒ empty (the dependency-free self-host path).
+        assert!(collect_vendor_crates("", "").unwrap().is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn patch_shebangs_rewrites_only_bin_sh_bash_keeping_exec_and_args() {

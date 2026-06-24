@@ -66,6 +66,10 @@ td-feed:
 	echo "$$st" | grep -q '^td-feed: selftest OK' || { echo "FAIL: td-feed selftest did not report OK (got: $$st)" >&2; cat "$$scratch/run.err" >&2; exit 1; }; \
 	echo "  [DURABLE behavioral] the td-built td-feed warmed + served + fetched a blob over loopback (verify-on-warm + verify-on-serve): '$$st'"; \
 	echo "  [SELF-DISCRIMINATION] that selftest also reds a wrong index hash (warm) and a corrupted store byte (serve) — verification is load-bearing on both sides"; \
+	cps=`"$$ns/bin/td-feed" cargo-proxy-selftest 2>"$$scratch/cps.err"` || { echo "FAIL: the td-built td-feed cargo-proxy selftest failed:" >&2; tail -8 "$$scratch/cps.err" >&2; exit 1; }; \
+	echo "$$cps" | grep -q '^td-feed: cargo-proxy selftest OK' || { echo "FAIL: cargo-proxy selftest did not report OK (got: $$cps)" >&2; cat "$$scratch/cps.err" >&2; exit 1; }; \
+	echo "  [DURABLE behavioral] the td-built td-feed cargo-proxy fetched + verified a crate THROUGH the proxy over loopback (cargo's sparse protocol): '$$cps'"; \
+	echo "  [SELF-DISCRIMINATION] the cargo-proxy refuses a crate whose bytes mismatch its index cksum — the verifying egress is load-bearing"; \
 	idx="$(CURDIR)/tests/td-feed.index"; \
 	test -s "$$idx" || { echo "ERROR: no index $$idx" >&2; exit 1; }; \
 	bad3=`grep -v '^#' "$$idx" | grep -vcE '^[^ ]+ [^ ]+ [^ ]+$$' || true`; \
