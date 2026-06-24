@@ -76,11 +76,12 @@ runs), intrinsic-repro (`td-builder check` double-build), structural (guix off P
   (prints OUT=/NS=); each gate is thin — warm-check + `crate-free-build.sh NAME CRATEDIR LOCK
   SOURCEKEY RECIPE` + its package-specific behavioral leg. warm-cargo-proxy.sh grew an optional
   DEST arg (crates.io name != recipe name: `fd-find`->fd, `coreutils`->uutils).
-- B3 scale — sd (111 crates, name matches) + fd (113 crates, name DIFFERS: crate `fd-find`) added
-  as `rust-sd-crate-free` / `rust-fd-crate-free`. Remaining: procs(297)/eza(233)/bat(207)/
-  uutils-cat+coreutils(507)/youki(663)/russh(188, LOCAL demo source — not a crates.io pkg, needs
-  a different source path). Each a heavy from-source build; the warm + helper are generic, so each
-  is ~10 lines of gate + 1 prelude warm line.
+- B3 scale — the WHOLE shipped Rust userland (procs/fd/ripgrep/sd/eza/bat) now has a green
+  crate-free gate: ripgrep(57)/sd(111)/fd(113)/procs(297)/eza(233)/bat(207). Each `rust-<p>-crate-free`
+  is ~10 lines of gate (warm-check + crate-free-build.sh + behavioral) + 1 prelude warm line.
+  Remaining corpus: uutils-cat+coreutils(507)/youki(663)/russh(188, LOCAL demo source — not a
+  crates.io pkg, needs a source-from-disk path, not the proxy throwaway-fetch). Each a heavy
+  from-source build; the warm + helper are generic.
 - DIVERGE (Phase 2, follow-on): these `-crate-free` gates are ADDITIVE — the guix-path gates
   (347/349/346/...) stay as the differential oracle while the corpus is being OWNED guix-free
   ("own, then diverge"). Once the whole corpus has a green crate-free gate, retire the guix-path
