@@ -321,6 +321,226 @@ fn selftest() {
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// cargo-proxy: a cargo SPARSE registry mirror. `cargo fetch`/`cargo build` fetch their WHOLE
+// crate closure THROUGH td (fetch-then-save + verify), so cargo does the dependency
+// resolution + fetching and td owns the verifying, caching, shareable egress — the generic,
+// guix-free crate provisioning. Point cargo at `sparse+http://<addr>/` (source replacement).
+// Three request kinds (cargo's sparse protocol):
+//   GET /config.json                    -> {"dl":"http://<addr>/dl","api":"http://<addr>"}
+//   GET /<idx-path>                     -> proxy+cache index.crates.io/<idx-path> (newline
+//                                          JSON version metadata incl. each cksum)
+//   GET /dl/<crate>/<version>/download  -> fetch static.crates.io, VERIFY sha256 == the index
+//                                          cksum, cache, serve (the .crate tarball)
+// Cache under STORE: index/<idx-path>, crates/<crate>-<version>.crate (the vendor set,
+// shareable). (cargo `vendor` bypasses source replacement; cargo `fetch` honors it.)
+
+/// Upstream bases (env-overridable for the hermetic selftest): the sparse index + `.crate` CDN.
+fn index_base() -> String {
+    std::env::var("TD_INDEX_BASE").unwrap_or_else(|_| "https://index.crates.io".into())
+}
+fn crates_base() -> String {
+    std::env::var("TD_CRATES_BASE").unwrap_or_else(|_| "https://static.crates.io".into())
+}
+
+/// The sparse-registry index path for a crate name (lowercased): `1/{n}`, `2/{n}`,
+/// `3/{c}/{n}`, else `{n[0:2]}/{n[2:4]}/{n}`.
+fn index_path(name: &str) -> String {
+    let n = name.to_lowercase();
+    match n.len() {
+        0 => n,
+        1 => format!("1/{n}"),
+        2 => format!("2/{n}"),
+        3 => format!("3/{}/{n}", &n[0..1]),
+        _ => format!("{}/{}/{n}", &n[0..2], &n[2..4]),
+    }
+}
+
+/// Extract the sha256 `cksum` for `version` from a sparse-index document (newline JSON).
+fn cksum_for(index_text: &str, version: &str) -> Option<String> {
+    let needle = format!("\"vers\":\"{version}\"");
+    for line in index_text.lines() {
+        if line.contains(&needle) {
+            let k = "\"cksum\":\"";
+            let i = line.find(k)? + k.len();
+            let j = line[i..].find('"')?;
+            return Some(line[i..i + j].to_string());
+        }
+    }
+    None
+}
+
+/// Serve (cache-or-proxy) a sparse-index document from index.crates.io.
+fn serve_index(store: &Path, idxpath: &str) -> Result<Vec<u8>, String> {
+    let cache = store_path(&store.join("index"), idxpath).ok_or("unsafe index path")?;
+    if let Ok(b) = std::fs::read(&cache) {
+        return Ok(b);
+    }
+    let body = try_get(&format!("{}/{idxpath}", index_base()))?;
+    if let Some(p) = cache.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
+    }
+    write_atomic(&cache, &body)?;
+    Ok(body)
+}
+
+/// Serve (cache-or-fetch+verify) a `.crate` from static.crates.io, verified against the
+/// index cksum — the td-owned, verifying egress.
+fn serve_crate(store: &Path, cr: &str, ver: &str) -> Result<Vec<u8>, String> {
+    let cache = store_path(&store.join("crates"), &format!("{cr}-{ver}.crate"))
+        .ok_or("unsafe crate name")?;
+    if let Ok(b) = std::fs::read(&cache) {
+        return Ok(b);
+    }
+    let idx = serve_index(store, &index_path(cr))?;
+    let cksum = cksum_for(&String::from_utf8_lossy(&idx), ver)
+        .ok_or_else(|| format!("no cksum for {cr} {ver} in the index"))?;
+    let url = format!("{}/crates/{cr}/{cr}-{ver}.crate", crates_base());
+    let body = try_get(&url)?;
+    if hex_sha256(&body) != cksum {
+        return Err(format!("sha256 mismatch for {cr} {ver}: index cksum {cksum}"));
+    }
+    if let Some(p) = cache.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
+    }
+    write_atomic(&cache, &body)?;
+    Ok(body)
+}
+
+/// Route one cargo sparse-registry request. `base` is HOST:PORT for the config URLs.
+fn cargo_route(store: &Path, base: &str, path: &str) -> Result<Vec<u8>, String> {
+    if path == "/config.json" {
+        return Ok(format!("{{\"dl\":\"http://{base}/dl\",\"api\":\"http://{base}\"}}").into_bytes());
+    }
+    if let Some(rest) = path.strip_prefix("/dl/") {
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() != 3 || parts[2] != "download" || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(format!("bad download path {path}"));
+        }
+        return serve_crate(store, parts[0], parts[1]);
+    }
+    serve_index(store, path.trim_start_matches('/'))
+}
+
+/// Handle one cargo request: parse `GET /<path>`, route, stream.
+fn handle_cargo_conn(mut conn: TcpStream, store: &Path, base: &str) -> io::Result<()> {
+    let mut reader = BufReader::new(conn.try_clone()?);
+    let mut req_line = String::new();
+    reader.read_line(&mut req_line)?;
+    loop {
+        let mut h = String::new();
+        let n = reader.read_line(&mut h)?;
+        if n == 0 || h == "\r\n" || h == "\n" {
+            break;
+        }
+    }
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    if method != "GET" {
+        return respond(&mut conn, 405, "Method Not Allowed", b"method not allowed\n");
+    }
+    match cargo_route(store, base, target) {
+        Ok(bytes) => respond(&mut conn, 200, "OK", &bytes),
+        Err(e) => {
+            eprintln!("td-feed cargo-proxy: {target}: {e}");
+            let code = if e.starts_with("no cksum") || e.starts_with("bad download") {
+                404
+            } else {
+                502
+            };
+            respond(&mut conn, code, "Error", e.as_bytes())
+        }
+    }
+}
+
+/// Run the cargo-proxy forever on `listener` (one thread per connection).
+fn cargo_proxy_loop(listener: TcpListener, store: Arc<PathBuf>, base: String) {
+    for conn in listener.incoming() {
+        let Ok(conn) = conn else { continue };
+        let (store, base) = (Arc::clone(&store), base.clone());
+        std::thread::spawn(move || {
+            let _ = handle_cargo_conn(conn, &store, &base);
+        });
+    }
+}
+
+/// Hermetic loopback selftest of the cargo-proxy: a mock index/static.crates.io on 127.0.0.1
+/// (TD_INDEX_BASE/TD_CRATES_BASE), the proxy fetches a `.crate` THROUGH it and verifies it
+/// against the index cksum; a crate whose bytes mismatch its index cksum is refused (the
+/// verifying egress is load-bearing). Offline (std::net only).
+fn cargo_proxy_selftest() {
+    let cbytes: Vec<u8> = (0u16..2048).map(|x| (x % 251) as u8).collect();
+    let cksum = hex_sha256(&cbytes);
+    let badbytes = b"corrupt-upstream-bytes".to_vec();
+    let badcksum = "0".repeat(64); // the index claims this; the served bytes won't match
+
+    let up = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let uport = up.local_addr().unwrap().port();
+    let (cb, bb, ck) = (cbytes.clone(), badbytes.clone(), cksum.clone());
+    std::thread::spawn(move || loop {
+        match up.accept() {
+            Ok((mut c, _)) => {
+                let mut buf = [0u8; 1024];
+                let n = c.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("");
+                let body: Vec<u8> = match path {
+                    "/un/ar/unarray" => format!(
+                        "{{\"name\":\"unarray\",\"vers\":\"0.1.0\",\"deps\":[],\"cksum\":\"{ck}\",\"features\":{{}},\"yanked\":false}}\n"
+                    ).into_bytes(),
+                    "/3/b/bad" => format!(
+                        "{{\"name\":\"bad\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{badcksum}\",\"features\":{{}},\"yanked\":false}}\n"
+                    ).into_bytes(),
+                    "/crates/unarray/unarray-0.1.0.crate" => cb.clone(),
+                    "/crates/bad/bad-1.0.0.crate" => bb.clone(),
+                    _ => Vec::new(),
+                };
+                // Respond directly: the request was already read above; serve_once would
+                // re-read and block, since the client is now awaiting the response.
+                let _ = respond(&mut c, 200, "OK", &body);
+            }
+            Err(_) => break,
+        }
+    });
+    let ubase = format!("http://127.0.0.1:{uport}");
+    std::env::set_var("TD_INDEX_BASE", &ubase);
+    std::env::set_var("TD_CRATES_BASE", &ubase);
+
+    let store = std::env::temp_dir().join(format!("td-cargo-proxy-selftest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store);
+    std::fs::create_dir_all(&store).expect("mkdir store");
+    let plist = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let pport = plist.local_addr().unwrap().port();
+    {
+        let (s, b) = (Arc::new(store.clone()), format!("127.0.0.1:{pport}"));
+        std::thread::spawn(move || cargo_proxy_loop(plist, s, b));
+    }
+    let proxy = format!("http://127.0.0.1:{pport}");
+
+    let cfg = try_get(&format!("{proxy}/config.json")).unwrap_or_else(|e| die(format!("config.json: {e}")));
+    if !String::from_utf8_lossy(&cfg).contains("\"dl\"") {
+        die("config.json missing dl".into());
+    }
+    let got = try_get(&format!("{proxy}/dl/unarray/0.1.0/download"))
+        .unwrap_or_else(|e| die(format!("dl unarray: {e}")));
+    if got != cbytes || hex_sha256(&got) != cksum {
+        die("proxy-served crate differs from upstream / its index cksum".into());
+    }
+    if !store.join("crates/unarray-0.1.0.crate").exists() {
+        die("proxy did not cache the fetched crate".into());
+    }
+    if try_get(&format!("{proxy}/dl/bad/1.0.0/download")).is_ok() {
+        die("proxy SERVED a crate whose bytes mismatch the index cksum — verify-on-fetch is not load-bearing".into());
+    }
+    let _ = std::fs::remove_dir_all(&store);
+    println!(
+        "td-feed: cargo-proxy selftest OK — fetched + verified a crate through the proxy (upstream \
+         127.0.0.1:{uport}, proxy 127.0.0.1:{pport}, cached); a crate whose bytes mismatch its index \
+         cksum is refused"
+    );
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a.get(1).map(String::as_str) {
@@ -345,10 +565,20 @@ fn main() {
             let _ = io::stdout().flush();
             serve_loop(listener, Arc::new(store));
         }
+        Some("cargo-proxy") if a.len() == 4 => {
+            let (store, addr) = (PathBuf::from(&a[2]), &a[3]);
+            let listener =
+                TcpListener::bind(addr.as_str()).unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
+            let bound = listener.local_addr().unwrap_or_else(|e| die(format!("local_addr: {e}")));
+            println!("td-feed: cargo-proxy on http://{bound}/ (store {})", store.display());
+            let _ = io::stdout().flush();
+            cargo_proxy_loop(listener, Arc::new(store), bound.to_string());
+        }
         Some("selftest") if a.len() == 2 => selftest(),
+        Some("cargo-proxy-selftest") if a.len() == 2 => cargo_proxy_selftest(),
         _ => {
             eprintln!(
-                "usage:\n  td-feed warm INDEX STORE\n  td-feed serve STORE ADDR\n  td-feed selftest"
+                "usage:\n  td-feed warm INDEX STORE\n  td-feed serve STORE ADDR\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  td-feed cargo-proxy-selftest"
             );
             std::process::exit(2);
         }
