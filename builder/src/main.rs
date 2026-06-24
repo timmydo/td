@@ -431,7 +431,7 @@ fn realize_drv(
     drv_path: &str,
     store_dbs: &[String],
     scratch: &Path,
-    src_override: Option<&SrcOverride>,
+    src_overrides: &[SrcOverride],
     builder_override: Option<&BuilderOverride>,
     td_store: Option<&Path>,
 ) -> Result<Vec<OutputReg>, String> {
@@ -468,13 +468,18 @@ fn realize_drv(
         .map(store_db_read::Db::open)
         .collect::<Result<_, _>>()?;
     let db_refs: Vec<&store_db_read::Db> = dbs.iter().collect();
-    // The td-owned source has its own DB (the daemon DB has no row for it).
-    let src_db = match src_override {
-        Some(ov) => Some(store_db_read::Db::open(
-            std::fs::read(&ov.db).map_err(|e| format!("read source db {}: {e}", ov.db))?,
-        )?),
-        None => None,
-    };
+    // Each td-OWNED interned tree (the recipe source AND the vendored-crate tree) has its
+    // own DB — the daemon DB has no row for it. Open them paired with their override so a
+    // root can be matched to its store + db. Both are no-reference content-addressed trees
+    // (store-add-recursive), so they share the SrcOverride handling.
+    let src_dbs: Vec<(&SrcOverride, store_db_read::Db)> = src_overrides
+        .iter()
+        .map(|ov| {
+            let data =
+                std::fs::read(&ov.db).map_err(|e| format!("read source db {}: {e}", ov.db))?;
+            Ok::<_, String>((ov, store_db_read::Db::open(data)?))
+        })
+        .collect::<Result<_, _>>()?;
     // The td-owned builder likewise has its own DB (store-add-builder wrote the builder
     // + its DIRECT refs there); the daemon DB has no row for the builder itself.
     let builder_db = match builder_override {
@@ -485,43 +490,43 @@ fn realize_drv(
     };
     let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for r in &roots {
-        match (src_override, &src_db) {
-            // The td-interned source: closure from the td DB (no-ref → itself), and
-            // the entry carries the on-disk location to bind FROM (canonical\ton-disk).
-            (Some(ov), Some(sdb)) if r == &ov.canonical => {
-                for p in sdb.closure(r)? {
-                    let entry = if p == ov.canonical {
-                        format!("{p}\t{}", ov.on_disk)
-                    } else {
-                        p
-                    };
-                    closure.insert(entry);
-                }
+        // A td-interned tree (the recipe source OR the vendored-crate tree): no-ref
+        // closure from its OWN db, the entry bound FROM on_disk (canonical\ton-disk).
+        if let Some(entry) = src_dbs.iter().find(|e| r == &e.0.canonical) {
+            let (ov, sdb) = (entry.0, &entry.1);
+            for p in sdb.closure(r)? {
+                let line = if p == ov.canonical {
+                    format!("{p}\t{}", ov.on_disk)
+                } else {
+                    p
+                };
+                closure.insert(line);
             }
-            // The td-placed builder gets its closure from the builder DB; every other
-            // root from the MERGED multi-db graph.
-            _ => match (builder_override, &builder_db) {
-                // The td-placed builder: builder DB gives {builder} ∪ its DIRECT refs;
-                // the builder entry binds from on_disk (canonical\ton-disk), and each
-                // direct ref's TRANSITIVE closure is read from the merged store-db graph
-                // (the pinned toolchain lives there — glibc/gcc-lib + their deps).
-                (Some(ov), Some(bdb)) if r == &ov.canonical => {
-                    for p in bdb.closure(r)? {
-                        if p == ov.canonical {
-                            closure.insert(format!("{p}\t{}", ov.on_disk));
-                        } else {
-                            for q in store_db_read::closure_multi(&db_refs, &p)? {
-                                closure.insert(q);
-                            }
+            continue;
+        }
+        // The td-placed builder gets its closure from the builder DB; every other
+        // root from the MERGED multi-db graph.
+        match (builder_override, &builder_db) {
+            // The td-placed builder: builder DB gives {builder} ∪ its DIRECT refs;
+            // the builder entry binds from on_disk (canonical\ton-disk), and each
+            // direct ref's TRANSITIVE closure is read from the merged store-db graph
+            // (the pinned toolchain lives there — glibc/gcc-lib + their deps).
+            (Some(ov), Some(bdb)) if r == &ov.canonical => {
+                for p in bdb.closure(r)? {
+                    if p == ov.canonical {
+                        closure.insert(format!("{p}\t{}", ov.on_disk));
+                    } else {
+                        for q in store_db_read::closure_multi(&db_refs, &p)? {
+                            closure.insert(q);
                         }
                     }
                 }
-                _ => {
-                    for p in store_db_read::closure_multi(&db_refs, r)? {
-                        closure.insert(p);
-                    }
+            }
+            _ => {
+                for p in store_db_read::closure_multi(&db_refs, r)? {
+                    closure.insert(p);
                 }
-            },
+            }
         }
     }
     // A td-BUILT dep's files live under TD_STORE/<base>, not /gnu/store. Re-key those
@@ -612,6 +617,7 @@ fn build_recipe(
     scratch: &Path,
     store_dbs: &[String],
     src_store: Option<(&str, &str)>,
+    vendor_store: Option<(&str, &str, &str)>,
     builder_store: Option<(&str, &str, &str)>,
     td_store: Option<&Path>,
 ) -> Result<Vec<OutputReg>, String> {
@@ -636,8 +642,13 @@ fn build_recipe(
     // td assembles the .drv ITSELF (pure Rust, no guix (derivation …), no Guile, no
     // daemon) and writes it to SCRATCH — the SAME assembly `assemble-recipe` uses, so a
     // separate process (the build daemon) realizes a byte-identical td-assembled drv.
-    let (drv_path, drv_file, parsed, source) =
-        assemble_recipe_drv(recipe_json, lock_file, scratch, &builder_path)?;
+    let (drv_path, drv_file, parsed, source) = assemble_recipe_drv(
+        recipe_json,
+        lock_file,
+        scratch,
+        &builder_path,
+        vendor_store.map(|(canonical, _, _)| canonical),
+    )?;
     // A td-OWNED source store (optional): the `<name>-source` path was interned by td
     // itself into SRC-STORE-DIR + SRC-DB, so realize stages it from there + reads its
     // closure from SRC-DB — no daemon interning. The on-disk tree is the canonical
@@ -650,6 +661,21 @@ fn build_recipe(
             db: db.to_string(),
         }
     });
+    // A td-OWNED vendored-crate tree (optional, the guix-free crate path): td interned the
+    // crate SET itself (store-add-recursive) into VENDOR-STORE-DIR + VENDOR-DB — a no-ref
+    // content-addressed tree, staged + its closure read from there exactly like the source,
+    // with NO daemon and NO `/gnu/store` crate path. run_rust vendors from it (TD_VENDOR_DIR).
+    let vendor_override = vendor_store.map(|(canonical, store_dir, db)| {
+        let base = canonical.rsplit('/').next().unwrap_or(canonical);
+        SrcOverride {
+            canonical: canonical.to_string(),
+            on_disk: format!("{store_dir}/{base}"),
+            db: db.to_string(),
+        }
+    });
+    // Both no-ref td-interned trees go to realize_drv as src-overrides.
+    let src_overrides: Vec<SrcOverride> =
+        src_override.into_iter().chain(vendor_override).collect();
     // Content-addressed build cache: if SCRATCH already holds a valid realization of
     // this exact (deterministic) drv, reuse it — skip the build. The gate points
     // SCRATCH at a persistent cache, so an unchanged recipe is a cache HIT and only a
@@ -680,7 +706,7 @@ fn build_recipe(
         &drv_file.to_string_lossy(),
         store_dbs,
         scratch,
-        src_override.as_ref(),
+        &src_overrides,
         builder_override.as_ref(),
         td_store,
     )?;
@@ -704,6 +730,7 @@ fn assemble_recipe_drv(
     lock_file: &str,
     scratch: &Path,
     builder_path: &str,
+    vendor_dir: Option<&str>,
 ) -> Result<(String, std::path::PathBuf, drv::Derivation, String), String> {
     let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
     let name = alist.get("name").and_then(json::Json::as_str).ok_or("recipe: no name")?;
@@ -781,6 +808,11 @@ fn assemble_recipe_drv(
     for p in &vendor {
         spec.push_str(&format!("input-src {p}\n"));
     }
+    // The td-OWNED vendored-crate TREE (guix-free crate path): one interned dir of
+    // `*.crate`, staged as an input-src; run_rust vendors from it (TD_VENDOR_DIR set below).
+    if let Some(vd) = vendor_dir {
+        spec.push_str(&format!("input-src {vd}\n"));
+    }
     spec.push_str(&format!("env TD_SRC={source}\n"));
     spec.push_str(&format!("env TD_INPUTS={}\n", inputs.join(":")));
     match build_system {
@@ -808,6 +840,11 @@ fn assemble_recipe_drv(
             spec.push_str(&format!("env TD_RUST_BINS={}\n", bins.join(" ")));
             if !vendor.is_empty() {
                 spec.push_str(&format!("env TD_VENDOR_CRATES={}\n", vendor.join(":")));
+            }
+            // td's OWN guix-free crate set: one interned dir of `*.crate` (run_rust reads
+            // every crate from it). No `/gnu/store` crate path, no guix-daemon FOD.
+            if let Some(vd) = vendor_dir {
+                spec.push_str(&format!("env TD_VENDOR_DIR={vd}\n"));
             }
             // Optional cargo feature selection (both default-absent ⇒ a plain
             // `cargo build` with the crate's defaults, unchanged). `noDefaultFeatures`
@@ -929,6 +966,7 @@ fn build_plan(plan_file: &str, guix_db: &str, scratch: &Path) -> Result<(), Stri
             &step_scratch,
             &dbs,
             None,            // src_store: build-plan locks carry resolved paths
+            None,            // vendor_store: build-plan deps are not vendored-crate trees
             None,            // builder_store: build-plan uses the guix-built builder
             Some(&tdstore),  // td_store: stage td-built deps from the shared td-store
         )?;
@@ -2935,7 +2973,7 @@ fn main() -> ExitCode {
         Some("realize") if args.len() == 5 => {
             let (drv_path, store_db, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
-                realize_drv(drv_path, std::slice::from_ref(store_db), Path::new(scratch), None, None, None)
+                realize_drv(drv_path, std::slice::from_ref(store_db), Path::new(scratch), &[], None, None)
                     .map(|_| ())
             };
             match run() {
@@ -3027,7 +3065,7 @@ fn main() -> ExitCode {
                     drv,
                     std::slice::from_ref(store_db),
                     &scr,
-                    None,
+                    &[],
                     builder_override.as_ref(),
                     None,
                 )?;
@@ -3081,7 +3119,7 @@ fn main() -> ExitCode {
                     None => self_store_path()?,
                 };
                 let (drv_path, drv_file, parsed, _source) =
-                    assemble_recipe_drv(&recipe_json, lock, Path::new(scratch), &builder_path)?;
+                    assemble_recipe_drv(&recipe_json, lock, Path::new(scratch), &builder_path, None)?;
                 eprintln!(
                     "td-builder: assemble-recipe assembled {drv_path} (no guix (derivation), no Guile, no realize)"
                 );
@@ -3108,11 +3146,21 @@ fn main() -> ExitCode {
         // (interned by td's store-add-recursive, no `guix repl`); omitted → a
         // daemon-resident source path, as before. Usage:
         //   build-recipe RECIPE-JSON-FILE LOCK SCRATCH STORE-DB [SRC-STORE-DIR SRC-DB]
-        Some("build-recipe") if args.len() == 6 || args.len() == 8 => {
+        Some("build-recipe") if args.len() == 6 || args.len() == 8 || args.len() == 11 => {
             let (recipe_file, lock, scratch, store_db) =
                 (&args[2], &args[3], &args[4], &args[5]);
-            let src_store = if args.len() == 8 {
+            let src_store = if args.len() >= 8 {
                 Some((args[6].as_str(), args[7].as_str()))
+            } else {
+                None
+            };
+            // Optional td-OWNED vendored-crate tree (the guix-free crate path): td interned
+            // the crate SET itself (store-add-recursive). VENDOR-CANONICAL is its store path,
+            // VENDOR-STORE the td store dir, VENDOR-DB its db. run_rust vendors from it
+            // (TD_VENDOR_DIR) — no `/gnu/store` crate, no guix-daemon FOD.
+            //   build-recipe RECIPE LOCK SCRATCH STORE-DB [SRC-STORE SRC-DB [VENDOR-CANONICAL VENDOR-STORE VENDOR-DB]]
+            let vendor_store = if args.len() == 11 {
+                Some((args[8].as_str(), args[9].as_str(), args[10].as_str()))
             } else {
                 None
             };
@@ -3157,6 +3205,7 @@ fn main() -> ExitCode {
                     Path::new(scratch),
                     &store_dbs,
                     src_store,
+                    vendor_store,
                     builder_store,
                     td_store,
                 )
