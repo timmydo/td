@@ -131,11 +131,22 @@ upward:
      compiles+runs C → 33). Neither needs make. Setup: unset host `C_INCLUDE_PATH` (it leaks
      unparseable glibc headers; guix sets it to the mes includes); tcc-boot needs a configure pass
      for config.h + its own libtcc1.a to link programs.
-   - **patch + binutils-mesboot0** — next (both make-driven). NOTE: the tcc-built make 3.80
-     **segfaults in the loop sandbox** building patch's recursive makefile (works on the host;
-     `SHELL=<sh>` did not fix it) — a sandbox-make issue to resolve once, since binutils needs make
-     too. patch 2.5.9 (sha256 `ecb5c646…`) is de-risked on the host.
-   - **binutils-mesboot0** (as/ld, 2.20.1a + `binutils-boot-2.20.1a.patch`) — built with tcc-0.9.27 + make.
+   - **patch (make-driven)** ✅ — the `bootstrap-patch` gate (`mk/gates/374`): the tcc-built GNU Make
+     compiles **GNU patch 2.5.9** IN the loop sandbox. This clears the make-in-sandbox blocker. The
+     old note misdiagnosed it ("recursive makefile" — patch 2.5.9 is a flat build). TWO real causes,
+     both env, neither a make bug: (1) make's `SHELL` makefile-variable defaults to `/bin/sh` (absent
+     in the sandbox) and make **ignores the `SHELL` env var**, so recipes can't find a shell — fix:
+     the make *variable* override `make SHELL=<curated sh>` (guix gets `/bin/sh` free from gash).
+     (2) THE SEGFAULT: the gate runs INSIDE the loop's outer `make -j2 --output-sync=target`, which
+     exports `MAKEFLAGS` (the **jobserver fds** + `--output-sync`) and `MAKELEVEL`; the minimal
+     mes-libc make segfaults trying to honor an inherited jobserver — fix: clear
+     `MAKEFLAGS/MFLAGS/GNUMAKEFLAGS/MAKELEVEL` for the nested serial make. ("Works on the host" = no
+     outer make there; bootstrap-make passed because it builds make via `sh build.sh`, never running
+     a nested make.) Plus guix's pch.c "avoid another segfault" workaround. Serial (guix
+     `#:parallel-build? #f`). patch 2.5.9 sha256 `ecb5c646…`.
+   - **binutils-mesboot0** (as/ld, 2.20.1a + `binutils-boot-2.20.1a.patch`, applied with the new patch)
+     — next, built with tcc + make. guix env: `CONFIG_SHELL=<sh>`, `CPPFLAGS=-D __GLIBC_MINOR__=6 -D
+     MES_BOOTSTRAP=1`, `AR=tcc -ar`, `CXX=false`, `RANLIB=true`, `CC=tcc` + cppflags, serial.
    - **gcc-core-mesboot0** (gcc 2.95.3) — then gcc-mesboot1 (4.6.4) → gcc-mesboot (4.7.4),
      `--prefix=/td/store`. (The hardest rungs; guix carries many patches.)
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
