@@ -373,23 +373,30 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-tools ;;
 
+    tests/bootstrap-patch.sh|seed/sources/patch-*.lock)
+      add_preflight shell-syntax
+      add_target bootstrap-patch ;;
+
     seed/sources/make-*.lock)
       add_preflight shell-syntax
       add_target bootstrap-make
-      add_target bootstrap-tools ;;
+      add_target bootstrap-tools
+      add_target bootstrap-patch ;;
 
     seed/sources/tcc-0.9.26*.lock)
       add_preflight shell-syntax
       add_target bootstrap-tcc
       add_target bootstrap-make
-      add_target bootstrap-tools ;;
+      add_target bootstrap-tools
+      add_target bootstrap-patch ;;
 
     seed/sources/nyacc-*.lock)
       add_preflight shell-syntax
       add_target bootstrap-mescc
       add_target bootstrap-tcc
       add_target bootstrap-make
-      add_target bootstrap-tools ;;
+      add_target bootstrap-tools
+      add_target bootstrap-patch ;;
 
     seed/sources/mes-*.lock|tools/warm-bootstrap-sources.sh)
       add_preflight shell-syntax
@@ -397,7 +404,8 @@ map_path() {
       add_target bootstrap-mescc
       add_target bootstrap-tcc
       add_target bootstrap-make
-      add_target bootstrap-tools ;;
+      add_target bootstrap-tools
+      add_target bootstrap-patch ;;
 
     seed/stage0/*)
       add_preflight shell-syntax
@@ -407,7 +415,8 @@ map_path() {
       add_target bootstrap-mescc
       add_target bootstrap-tcc
       add_target bootstrap-make
-      add_target bootstrap-tools ;;
+      add_target bootstrap-tools
+      add_target bootstrap-patch ;;
 
     tests/store-ns.sh)
       add_preflight shell-syntax
