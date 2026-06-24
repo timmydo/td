@@ -412,12 +412,17 @@ fn cargo_route(store: &Path, base: &str, path: &str) -> Result<Vec<u8>, String> 
     if path == "/config.json" {
         return Ok(format!("{{\"dl\":\"http://{base}/dl\",\"api\":\"http://{base}\"}}").into_bytes());
     }
+    // The download endpoint is `/dl/<crate>/<version>/download`. A crate whose name starts with
+    // "dl" has a sparse-index path that ALSO starts with `dl/` (e.g. `dlv-list` -> `dl/v-/dlv-list`),
+    // so `/dl/` alone is ambiguous. It is only a download when the shape matches exactly (3 parts,
+    // last == "download"); no index path can be `/dl/XX/download` (that needs a crate named
+    // "download", whose index path is `do/wn/download`, not `dl/...`). Anything else under `/dl/`
+    // is such an index path — fall through to serve_index, don't 404 it.
     if let Some(rest) = path.strip_prefix("/dl/") {
         let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() != 3 || parts[2] != "download" || parts[0].is_empty() || parts[1].is_empty() {
-            return Err(format!("bad download path {path}"));
+        if parts.len() == 3 && parts[2] == "download" && !parts[0].is_empty() && !parts[1].is_empty() {
+            return serve_crate(store, parts[0], parts[1]);
         }
-        return serve_crate(store, parts[0], parts[1]);
     }
     serve_index(store, path.trim_start_matches('/'))
 }
@@ -492,6 +497,11 @@ fn cargo_proxy_selftest() {
                     "/3/b/bad" => format!(
                         "{{\"name\":\"bad\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{badcksum}\",\"features\":{{}},\"yanked\":false}}\n"
                     ).into_bytes(),
+                    // a crate whose name starts with "dl": its sparse-index path is `dl/te/dltest`,
+                    // which collides with the `/dl/` download prefix (the dlv-list bug regression).
+                    "/dl/te/dltest" => format!(
+                        "{{\"name\":\"dltest\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{ck}\",\"features\":{{}},\"yanked\":false}}\n"
+                    ).into_bytes(),
                     "/crates/unarray/unarray-0.1.0.crate" => cb.clone(),
                     "/crates/bad/bad-1.0.0.crate" => bb.clone(),
                     _ => Vec::new(),
@@ -532,6 +542,14 @@ fn cargo_proxy_selftest() {
     }
     if try_get(&format!("{proxy}/dl/bad/1.0.0/download")).is_ok() {
         die("proxy SERVED a crate whose bytes mismatch the index cksum — verify-on-fetch is not load-bearing".into());
+    }
+    // Regression (the dlv-list bug): a crate whose name starts with "dl" has a sparse-index path
+    // starting with `dl/` (dltest -> /dl/te/dltest). The proxy must serve it as an INDEX, not
+    // mis-route it to the `/dl/<crate>/<version>/download` handler and 404 it.
+    let idx = try_get(&format!("{proxy}/dl/te/dltest"))
+        .unwrap_or_else(|e| die(format!("dl-prefixed sparse-index path failed (the dlv-list collision): {e}")));
+    if !String::from_utf8_lossy(&idx).contains("\"name\":\"dltest\"") {
+        die("proxy did not serve the dl-prefixed path as a sparse index (download/index route collision)".into());
     }
     let _ = std::fs::remove_dir_all(&store);
     println!(

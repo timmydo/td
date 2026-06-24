@@ -311,7 +311,9 @@ map_path() {
       add_target rust-fd-crate-free
       add_target rust-procs-crate-free
       add_target rust-eza-crate-free
-      add_target rust-bat-crate-free ;;
+      add_target rust-bat-crate-free
+      add_target rust-coreutils-crate-free
+      add_target rust-youki-crate-free ;;
 
     tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh)
       add_preflight shell-syntax
