@@ -393,22 +393,30 @@ map_path() {
       add_target bootstrap-patch
       add_target bootstrap-binutils
       add_target bootstrap-gcc
-      add_target bootstrap-glibc ;;
+      add_target bootstrap-glibc
+      add_target bootstrap-gcc-mesboot0 ;;
 
     tests/bootstrap-binutils.sh|seed/sources/binutils-*.lock|seed/patches/binutils-boot-*.patch)
       add_preflight shell-syntax
       add_target bootstrap-binutils
       add_target bootstrap-gcc
-      add_target bootstrap-glibc ;;
+      add_target bootstrap-glibc
+      add_target bootstrap-gcc-mesboot0 ;;
 
     tests/bootstrap-gcc.sh|seed/sources/gcc-core-*.lock|seed/patches/gcc-boot-*.patch)
       add_preflight shell-syntax
       add_target bootstrap-gcc
-      add_target bootstrap-glibc ;;
+      add_target bootstrap-glibc
+      add_target bootstrap-gcc-mesboot0 ;;
 
     tests/bootstrap-glibc.sh|seed/sources/glibc-*.lock|seed/sources/linux-*.lock|seed/patches/glibc-*.patch|tools/warm-kernel-headers.sh)
       add_preflight shell-syntax
-      add_target bootstrap-glibc ;;
+      add_target bootstrap-glibc
+      add_target bootstrap-gcc-mesboot0 ;;
+
+    tests/bootstrap-gcc-mesboot0.sh)
+      add_preflight shell-syntax
+      add_target bootstrap-gcc-mesboot0 ;;
 
     seed/sources/make-*.lock)
       add_preflight shell-syntax
@@ -417,7 +425,8 @@ map_path() {
       add_target bootstrap-patch
       add_target bootstrap-binutils
       add_target bootstrap-gcc
-      add_target bootstrap-glibc ;;
+      add_target bootstrap-glibc
+      add_target bootstrap-gcc-mesboot0 ;;
 
     seed/sources/tcc-0.9.26*.lock)
       add_preflight shell-syntax
@@ -427,7 +436,8 @@ map_path() {
       add_target bootstrap-patch
       add_target bootstrap-binutils
       add_target bootstrap-gcc
-      add_target bootstrap-glibc ;;
+      add_target bootstrap-glibc
+      add_target bootstrap-gcc-mesboot0 ;;
 
     seed/sources/nyacc-*.lock)
       add_preflight shell-syntax
@@ -438,7 +448,8 @@ map_path() {
       add_target bootstrap-patch
       add_target bootstrap-binutils
       add_target bootstrap-gcc
-      add_target bootstrap-glibc ;;
+      add_target bootstrap-glibc
+      add_target bootstrap-gcc-mesboot0 ;;
 
     seed/sources/mes-*.lock|tools/warm-bootstrap-sources.sh)
       add_preflight shell-syntax
@@ -450,7 +461,8 @@ map_path() {
       add_target bootstrap-patch
       add_target bootstrap-binutils
       add_target bootstrap-gcc
-      add_target bootstrap-glibc ;;
+      add_target bootstrap-glibc
+      add_target bootstrap-gcc-mesboot0 ;;
 
     seed/stage0/*)
       add_preflight shell-syntax
@@ -464,7 +476,8 @@ map_path() {
       add_target bootstrap-patch
       add_target bootstrap-binutils
       add_target bootstrap-gcc
-      add_target bootstrap-glibc ;;
+      add_target bootstrap-glibc
+      add_target bootstrap-gcc-mesboot0 ;;
 
     tests/store-ns.sh)
       add_preflight shell-syntax
