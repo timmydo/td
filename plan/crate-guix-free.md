@@ -71,5 +71,22 @@ Restored → 58/58 builder tests green.
   /gnu/store crate path in the .drv), behavioral (runs), repro (td-builder check double-build).
   Verified-red: corrupt a crate → its sha not in Cargo.lock → supply-chain reds (isolated).
   NOTE: editing check.sh escalates landing to the FULL loop (heavy).
-- B4 scale (the corpus rust locks bat/fd/ripgrep/… → content-addressed crate entries, drop
-  /gnu/store crate strings; the rust-* gates switch to the vendor-tree path) — after B3.
+- **cargo-proxy — the generic B4 mechanism (human steer 2026-06-23: "build a proxy so cargo
+  does the heavy lifting"). DONE + validated (commit 8e69f5f).** `td-feed cargo-proxy STORE
+  ADDR` is a cargo SPARSE registry mirror: cargo (source replacement `sparse+http://ADDR/`)
+  fetches its WHOLE closure THROUGH td — serve /config.json + proxy/cache the index + on
+  /dl/CRATE/VERSION/download fetch static.crates.io, VERIFY sha256==index cksum, cache
+  crates/NV.crate. So cargo does the resolution+fetch; td owns the verifying egress; the
+  proxy's crates/ cache IS the vendor set B1/B2 intern. **GOTCHA: cargo `vendor` IGNORES
+  source replacement (vendors canonical sources); cargo `fetch`/`build` HONOR it.** Hermetic
+  selftest (mock upstream, verified-red) wired into the td-feed gate. Validated: cargo fetch
+  through the proxy pulled all 73 of td-fetch's crates.
+- B4 scale — NOW GENERIC via the proxy: PREP = start the proxy + `cargo fetch` the package
+  through it (cargo resolves+fetches, any package, no per-package Cargo.lock work) → the
+  proxy's crates/ cache → intern (B2) → build (B1). Remaining: a generic warm script + run the
+  corpus rust gates (bat/fd/ripgrep/sd/eza/uutils/youki/russh) through it (each still a heavy
+  from-source build to validate) + drop their /gnu/store crate strings. The proxy makes the
+  WARM generic; the per-gate heavy validation is the remaining cost.
+- LESSON (re-learned, [[td-commit-before-red-variants]]): `git checkout -- file` to revert a
+  red perturbation WIPED the uncommitted cargo-proxy code (it was never committed). Commit
+  green BEFORE perturbing for verified-red.
