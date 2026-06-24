@@ -66,23 +66,22 @@ registry = "sparse+http://$addr/"
 EOF
 }
 
-# 1) Grab the SOURCE crate through the proxy via a throwaway project. Its fresh-resolution deps
-#    are discarded (we want the package's OWN pinned closure, not a fresh resolve); only the
-#    source `.crate` the proxy verified + cached is kept.
-ch1="$work/ch-src"; cargo_home "$ch1"
-proj="$work/srcfetch"; rm -rf "$proj"; mkdir -p "$proj/src"
-cat > "$proj/Cargo.toml" <<EOF
-[package]
-name = "td-src-fetch"
-version = "0.0.0"
-edition = "2021"
-[dependencies]
-$crate = "=$ver"
-EOF
-echo 'fn main(){}' > "$proj/src/main.rs"
-( cd "$proj" && CARGO_HOME="$ch1" cargo fetch >/dev/null 2>&1 ) || { echo "warm-cargo-proxy: source fetch failed for $crate=$ver" >&2; exit 0; }
-srccrate="$work/proxy-store/crates/$crate-$ver.crate"
-[ -f "$srccrate" ] || { echo "warm-cargo-proxy: proxy did not cache the source crate $crate-$ver" >&2; exit 0; }
+# 1) Grab the SOURCE crate through the proxy's VERIFYING /dl endpoint (a plain GET — the proxy
+#    fetches static.crates.io, verifies sha256 == the crates.io index cksum, caches, serves). NO
+#    dep resolution: a throwaway `cargo fetch` would FRESH-resolve the package's deps just to get
+#    the source crate, and that can FAIL where the shipped Cargo.lock's exact pins resolve (e.g.
+#    coreutils 0.9.0: a fresh ordered-multimap picks a dlv-list that isn't there). The /dl GET
+#    sidesteps resolution entirely — the deps come later from the source's OWN lock (step 3).
+srccrate="$work/$crate-$ver.crate"
+dlurl="http://$addr/dl/$crate/$ver/download"
+if command -v curl >/dev/null 2>&1; then
+  curl -fsS "$dlurl" -o "$srccrate.tmp" 2>/dev/null && mv -f "$srccrate.tmp" "$srccrate" || { rm -f "$srccrate.tmp"; echo "warm-cargo-proxy: source fetch failed for $crate-$ver (curl $dlurl)" >&2; exit 0; }
+elif command -v wget >/dev/null 2>&1; then
+  wget -qO "$srccrate.tmp" "$dlurl" && mv -f "$srccrate.tmp" "$srccrate" || { rm -f "$srccrate.tmp"; echo "warm-cargo-proxy: source fetch failed for $crate-$ver (wget $dlurl)" >&2; exit 0; }
+else
+  echo "warm-cargo-proxy: no curl/wget for the source-crate GET — skipping $crate-$ver" >&2; exit 0
+fi
+[ -s "$srccrate" ] || { echo "warm-cargo-proxy: empty source crate $crate-$ver from the proxy" >&2; exit 0; }
 
 # 2) Extract the source crate -> the source tree.
 rm -rf "$srcparent"; mkdir -p "$srcparent"
