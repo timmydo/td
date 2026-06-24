@@ -304,6 +304,15 @@ map_path() {
       add_preflight shell-syntax
       add_target rust-fetch-crate-free ;;
 
+    tools/warm-cargo-proxy.sh|tests/crate-free-build.sh)
+      add_preflight shell-syntax
+      add_target rust-ripgrep-crate-free
+      add_target rust-sd-crate-free
+      add_target rust-fd-crate-free
+      add_target rust-procs-crate-free
+      add_target rust-eza-crate-free
+      add_target rust-bat-crate-free ;;
+
     tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh)
       add_preflight shell-syntax
       add_build_gate_targets ;;
@@ -662,6 +671,7 @@ run_self_test() {
   assert_target tests/td-feed.index td-feed
   assert_target tools/feed-ensure.sh feed-shared
   assert_target tools/warm-td-fetch-crates.sh rust-fetch-crate-free
+  assert_target tools/warm-cargo-proxy.sh rust-ripgrep-crate-free
   assert_target feed/src/main.rs td-feed
   assert_target tests/ts/recipe-td-cmake-demo.ts cmake
   assert_target tests/td-cmake-demo.lock cmake
