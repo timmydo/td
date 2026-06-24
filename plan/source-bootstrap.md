@@ -125,7 +125,17 @@ upward:
      Setup learned: brick-4 tcc has `crtprefix=.` so crt1.o/crti.o/crtn.o/libc.a are copied into the
      build dir; `-static` avoids the `/lib/mes-loader` interpreter (no root on host); mes `include`
      dirs feed `CPP=tcc -E`. make embeds its build path → repro builds at the same dir.
-   - **binutils-mesboot0** (as/ld) — next, built with tcc + make.
+   - **mesboot tools (gzip + tcc-boot)** ✅ — the `bootstrap-tools` gate (`mk/gates/372`) has the
+     seed-built tcc compile guix's gzip-mesboot (**gzip 1.2.4**, a scripted tcc build) and tcc-boot
+     (**pristine tcc 0.9.27** — the brick-4 0.9.26 mes-fork compiles pristine 0.9.27, which then
+     compiles+runs C → 33). Neither needs make. Setup: unset host `C_INCLUDE_PATH` (it leaks
+     unparseable glibc headers; guix sets it to the mes includes); tcc-boot needs a configure pass
+     for config.h + its own libtcc1.a to link programs.
+   - **patch + binutils-mesboot0** — next (both make-driven). NOTE: the tcc-built make 3.80
+     **segfaults in the loop sandbox** building patch's recursive makefile (works on the host;
+     `SHELL=<sh>` did not fix it) — a sandbox-make issue to resolve once, since binutils needs make
+     too. patch 2.5.9 (sha256 `ecb5c646…`) is de-risked on the host.
+   - **binutils-mesboot0** (as/ld, 2.20.1a + `binutils-boot-2.20.1a.patch`) — built with tcc-0.9.27 + make.
    - **gcc-core-mesboot0** (gcc 2.95.3) — then gcc-mesboot1 (4.6.4) → gcc-mesboot (4.7.4),
      `--prefix=/td/store`. (The hardest rungs; guix carries many patches.)
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
