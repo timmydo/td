@@ -1,0 +1,6 @@
+section: mainline
+status: claimed
+handle: claude-fable-65585b
+date: 2026-06-24
+title: corpus-crate-free-diverge
+summary: Phase 2b (the "diverge" of own-then-diverge) — now that the whole crates.io corpus rust userland is OWNED guix-free (#166 ripgrep/sd/fd/procs/eza/bat, #167 uutils/youki), DROP the /gnu/store crate strings from the corpus locks and RETIRE the guix-path crate FODs. Mechanism (migrate-in-place): each guix-path gate (rust-ripgrep/sd/fd/procs/eza/bat/coreutils/youki) is OVERWRITTEN with the crate-free body (so the canonical `rust-<P>` target now builds its crate closure guix-free via the cargo-proxy), the now-duplicate `rust-<P>-crate-free` gate is DELETED, and tests/<P>.lock is stripped to the toolchain SEED only (rust/cargo/gcc/coreutils/bash/tar/gzip — no .crate dep FODs, no source .crate FOD). Net: ONE canonical gate per package, guix-free, no /gnu/store crate strings; the guix-daemon is no longer a crate fetcher for the corpus. Out of scope (no crate-free replacement / seed): td-fetch (rust-fetch + rust-fetch-crate-free both kept), russh (local demo source), rust-vendor/rust-ts-eval (seed/demo). Toolchain seed stays guix-built (retired last by source-bootstrap). CALLED OUT (directive 3): removes/restructures 8 gates + strips 8 locks. Notes in plan/corpus-crate-free-diverge.md.
