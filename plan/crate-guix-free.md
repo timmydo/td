@@ -55,8 +55,19 @@ Restored → 58/58 builder tests green.
 
 ## Brick status
 - B1 run_rust TD_VENDOR_DIR — DONE (commit 01526f5, verified-red, 58 tests green).
-- B2 build-recipe exposes an interned vendor tree + sets TD_VENDOR_DIR — NEXT (engine work:
-  store-add-recursive the crate set, pass its td store/db to build-recipe like srcstore/srcdb,
-  add a lock class for the vendor dir; the closure machinery already spans multiple dbs).
-- B3 guix-free gate (td-fetch PoC) — after B2.
-- B4 scale + lock cleanup — after B3.
+- B2 build-recipe exposes an interned vendor tree + sets TD_VENDOR_DIR — DONE (commit
+  4a03da2, 58 tests). realize_drv's single src_override generalized to a slice of no-ref
+  td-interned trees (source + vendor); build_recipe/assemble_recipe_drv take an optional
+  vendor_store; the build-recipe subcommand grows [VENDOR-CANONICAL VENDOR-STORE VENDOR-DB].
+  **PROVEN end-to-end** (throwaway `cgf` gate, now removed): stage0 rebuilt from this source,
+  td store-add-recursive-interned td-fetch's 73-crate set and **built td-fetch from it via
+  TD_VENDOR_DIR** — the .drv sets TD_VENDOR_DIR and references **NO /gnu/store crate path**
+  (crates Cargo.lock-pinned), built by stage0 with guix off PATH, binary runs. The engine
+  CAN now provision crates guix-free.
+- B3 — productionize into a COMMITTED gate. The remaining piece is guix-free crate SOURCING:
+  the cgf proof sourced crate bytes from the realized crates (verified vs fetch/Cargo.lock);
+  a committed guix-free gate must fetch them via td-feed (a host-PREP warm of td-fetch's
+  Cargo.lock-derived crate index into a vendor dir), then intern + build + assert
+  (supply-chain pin / behavioral / repro / structural) with no guix in the gate. Verified-red.
+- B4 scale (the corpus rust locks → content-addressed crate entries, drop /gnu/store crate
+  strings; the rust-* gates switch to the vendor-tree path) — after B3.
