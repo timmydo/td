@@ -159,8 +159,17 @@ upward:
      `AR=tcc -ar`, `CXX=false`, `RANLIB=true`, serial, `--with-sysroot=/`. Build-time host tools
      (bzip2/awk/flex/bison) are scaffolding only — the `[no-guix]` leg verifies as/ld carry no
      `/gnu/store` bytes. Behavioral: as+ld assemble+link a tiny i386 program that runs → 42.
-   - **gcc-core-mesboot0** (gcc 2.95.3) — then gcc-mesboot1 (4.6.4) → gcc-mesboot (4.7.4),
-     `--prefix=/td/store`. (The hardest rungs; guix carries many patches.)
+   - **gcc-core-mesboot0** ✅ (gcc 2.95.3) — **THE milestone**: the `bootstrap-gcc` gate (`mk/gates/378`)
+     has the tcc-built make + binutils build a real **C compiler** from the seed (guix's
+     gcc-core-mesboot0). The td-built patch applies guix's vendored `gcc-boot-2.95.3.patch` (disables
+     DOC, avoids fixproto, fixes the libgcc archive trickery); the build uses binutils' `as`/`ld`/`ar`
+     (`AR=ar`), a `config.cache` float-format hint, `CC="tcc -D __GLIBC_MINOR__=6"`, `LANGUAGES=c`, a
+     `remove-info` step (no makeinfo) and an `install2` step that assembles `libgcc.a` + `libc.a` into
+     gcc-lib. NEW blocker found+fixed (via the cached-chain-through-binutils dev harness): gcc's
+     Makefiles exec helper scripts (`move-if-change`, `mkinstalldirs`, …) DIRECTLY via their
+     `#!/bin/sh` shebang — absent in the sandbox; rewrite all such shebangs to the curated sh after
+     configure. Behavioral: gcc reports 2.95.3 and **compiles+links+runs a C program → 42**. Then
+     gcc-mesboot1 (4.6.4) → gcc-mesboot (4.7.4), `--prefix=/td/store`.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
