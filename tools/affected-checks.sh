@@ -376,18 +376,25 @@ map_path() {
     tests/bootstrap-patch.sh|seed/sources/patch-*.lock)
       add_preflight shell-syntax
       add_target bootstrap-patch
-      add_target bootstrap-binutils ;;
+      add_target bootstrap-binutils
+      add_target bootstrap-gcc ;;
 
     tests/bootstrap-binutils.sh|seed/sources/binutils-*.lock|seed/patches/binutils-boot-*.patch)
       add_preflight shell-syntax
-      add_target bootstrap-binutils ;;
+      add_target bootstrap-binutils
+      add_target bootstrap-gcc ;;
+
+    tests/bootstrap-gcc.sh|seed/sources/gcc-core-*.lock|seed/patches/gcc-boot-*.patch)
+      add_preflight shell-syntax
+      add_target bootstrap-gcc ;;
 
     seed/sources/make-*.lock)
       add_preflight shell-syntax
       add_target bootstrap-make
       add_target bootstrap-tools
       add_target bootstrap-patch
-      add_target bootstrap-binutils ;;
+      add_target bootstrap-binutils
+      add_target bootstrap-gcc ;;
 
     seed/sources/tcc-0.9.26*.lock)
       add_preflight shell-syntax
@@ -395,7 +402,8 @@ map_path() {
       add_target bootstrap-make
       add_target bootstrap-tools
       add_target bootstrap-patch
-      add_target bootstrap-binutils ;;
+      add_target bootstrap-binutils
+      add_target bootstrap-gcc ;;
 
     seed/sources/nyacc-*.lock)
       add_preflight shell-syntax
@@ -404,7 +412,8 @@ map_path() {
       add_target bootstrap-make
       add_target bootstrap-tools
       add_target bootstrap-patch
-      add_target bootstrap-binutils ;;
+      add_target bootstrap-binutils
+      add_target bootstrap-gcc ;;
 
     seed/sources/mes-*.lock|tools/warm-bootstrap-sources.sh)
       add_preflight shell-syntax
@@ -414,7 +423,8 @@ map_path() {
       add_target bootstrap-make
       add_target bootstrap-tools
       add_target bootstrap-patch
-      add_target bootstrap-binutils ;;
+      add_target bootstrap-binutils
+      add_target bootstrap-gcc ;;
 
     seed/stage0/*)
       add_preflight shell-syntax
@@ -426,7 +436,8 @@ map_path() {
       add_target bootstrap-make
       add_target bootstrap-tools
       add_target bootstrap-patch
-      add_target bootstrap-binutils ;;
+      add_target bootstrap-binutils
+      add_target bootstrap-gcc ;;
 
     tests/store-ns.sh)
       add_preflight shell-syntax
