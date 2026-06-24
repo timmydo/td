@@ -64,10 +64,12 @@ Restored → 58/58 builder tests green.
   TD_VENDOR_DIR** — the .drv sets TD_VENDOR_DIR and references **NO /gnu/store crate path**
   (crates Cargo.lock-pinned), built by stage0 with guix off PATH, binary runs. The engine
   CAN now provision crates guix-free.
-- B3 — productionize into a COMMITTED gate. The remaining piece is guix-free crate SOURCING:
-  the cgf proof sourced crate bytes from the realized crates (verified vs fetch/Cargo.lock);
-  a committed guix-free gate must fetch them via td-feed (a host-PREP warm of td-fetch's
-  Cargo.lock-derived crate index into a vendor dir), then intern + build + assert
-  (supply-chain pin / behavioral / repro / structural) with no guix in the gate. Verified-red.
-- B4 scale (the corpus rust locks → content-addressed crate entries, drop /gnu/store crate
-  strings; the rust-* gates switch to the vendor-tree path) — after B3.
+- B3 — DONE (commit 58d890d, `./check.sh rust-fetch-crate-free` GREEN). tools/warm-td-fetch-crates.sh
+  (host PREP, wired into check.sh's prelude) td-fetches td-fetch's 73 crates from static.crates.io
+  (Cargo.lock-pinned), the gate interns them as a vendor tree + builds td-fetch via TD_VENDOR_DIR.
+  Durable legs all green: supply-chain (sha == Cargo.lock pin), structural (TD_VENDOR_DIR, NO
+  /gnu/store crate path in the .drv), behavioral (runs), repro (td-builder check double-build).
+  Verified-red: corrupt a crate → its sha not in Cargo.lock → supply-chain reds (isolated).
+  NOTE: editing check.sh escalates landing to the FULL loop (heavy).
+- B4 scale (the corpus rust locks bat/fd/ripgrep/… → content-addressed crate entries, drop
+  /gnu/store crate strings; the rust-* gates switch to the vendor-tree path) — after B3.
