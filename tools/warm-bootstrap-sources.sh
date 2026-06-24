@@ -88,5 +88,8 @@ for lock in "$srcdir"/*.lock; do
   fi
   echo ">> warm-bootstrap-sources: warmed $out via $got (sha256 verified)" >&2
 done
+# Derived input: the sanitized Linux UAPI headers for glibc-mesboot0, produced FROM the pinned linux
+# source via `make headers_install` on the host (the sandbox can't run the kernel build). Best-effort.
+sh "$root/tools/warm-kernel-headers.sh" || true
 # PREP is best-effort: never fail check.sh here (the heavy bootstrap-* gates enforce presence).
 exit 0
