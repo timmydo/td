@@ -58,7 +58,34 @@ runs), intrinsic-repro (`td-builder check` double-build), structural (guix off P
   the heavy-validation cost is the remaining work; the warm is generic.)
 
 ## Brick status
-- (starting) B1 generic warm script — IN PROGRESS.
+- B1 generic warm script `tools/warm-cargo-proxy.sh` — DONE. Validated on ripgrep: throwaway
+  project `cargo fetch` grabs the source crate THROUGH the proxy; extract; clear the proxy
+  cache + a FRESH cargo home; `cargo fetch --locked` in the source pulls the full 57-crate
+  closure THROUGH the proxy (the fresh cargo home is essential — a reused one cache-hits 9
+  crates and they never reach the proxy → an incomplete vendor set). Source + 57 `.crate` left
+  in `.td-build-cache/crate-vendor/ripgrep/{src,vendor}`.
+- B2 ripgrep PoC gate `355-rust-ripgrep-crate-free.mk` — DONE, `./check.sh
+  rust-ripgrep-crate-free` GREEN. All durable legs: supply-chain (57 vendored sha ∈ ripgrep's
+  shipped Cargo.lock == crates.io cksum), structural (interned source+vendor, .drv has
+  TD_VENDOR_DIR + NO /gnu/store crate path), behavioral (rg greps a needle, not the unrelated
+  file), repro (td-builder check double-build). Warmed via the check.sh prelude
+  (`warm-cargo-proxy.sh ripgrep 14.1.1`). NOTE: editing check.sh escalates landing to the FULL
+  loop (heavy).
+- B3 scale to the rest — NEXT (sd/fd/procs/eza/bat/uutils-cat/coreutils/youki/russh): one
+  gate + one prelude warm line each, same generic script.
 
 ## Verified-red evidence
-(to fill as bricks land)
+
+### B2 ripgrep PoC (2026-06-24)
+- **supply-chain** — append a byte to a vendored `.crate` → its sha256 no longer ∈ ripgrep's
+  Cargo.lock → the gate's exact loop reds (`miss=1`). The leg catches a crate whose bytes are
+  not the upstream pin.
+- **structural / TD_VENDOR_DIR required** — ran `grep -q TD_VENDOR_DIR` against the GUIX-PATH
+  ripgrep `.drv` (`.td-build-cache/rust-ripgrep/b/ripgrep-14.1.1.drv`, which uses
+  TD_VENDOR_CRATES): RED (it lacks TD_VENDOR_DIR). The leg discriminates the guix-free build.
+- **structural / no /gnu/store crate path** — ran the gate's
+  `grep -oqE '/gnu/store/...\.crate'` against the same guix-path `.drv`: RED (it HAS
+  `/gnu/store/...grep-searcher-0.1.14.crate` etc.). The guix-free assertion has teeth — it
+  separates the guix FOD path from the proxy/vendor path.
+- **behavioral + repro** — same logic as rust-ripgrep (347), verified-red there (needle match
+  + over-match guard; td-builder check double-build).

@@ -221,6 +221,12 @@ sh tools/warm-bootstrap-sources.sh || true
 # .td-build-cache/crate-vendor/ for the offline `rust-fetch-crate-free` gate (which interns it as
 # a vendor tree + builds td-fetch guix-free). BEST-EFFORT (heavy gate, not the fast tier).
 sh tools/warm-td-fetch-crates.sh || true
+# --- Corpus crate-guix-free warm: cargo resolves+fetches a rust package's WHOLE crate closure
+# THROUGH td's OWN cargo-proxy (td-feed cargo-proxy), the proxy verifying each .crate sha256 ==
+# the crates.io index cksum (upstream pin). Leaves source + vendor tree in .td-build-cache/
+# crate-vendor/<name>/ for the offline `rust-<name>-crate-free` gates (intern + build via
+# TD_VENDOR_DIR, guix-free). BEST-EFFORT (heavy gates, not the fast tier).
+sh tools/warm-cargo-proxy.sh ripgrep 14.1.1 || true
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only
 # single-threaded builds (NIX_BUILD_CORES=1), so -j2 idles most of the box; run it HOT at
