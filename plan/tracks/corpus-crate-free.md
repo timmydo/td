@@ -1,0 +1,6 @@
+section: mainline
+status: claimed
+handle: claude-fable-65585b
+date: 2026-06-24
+title: corpus-crate-free
+summary: Scale the GUIX-FREE crate path (engine + cargo-proxy landed #163) to the corpus rust gates (ripgrep/sd/fd/procs/eza/bat/uutils-cat/coreutils/youki/russh) — so the shipped Rust userland builds with crates provisioned guix-free, and their locks DROP the /gnu/store crate strings. Generic mechanism (the cargo-proxy from #163): a host PREP starts `td-feed cargo-proxy`, fetches the package SOURCE crate via the proxy /dl (verified vs the crates.io index cksum) + extracts it, then `cargo fetch` (source replacement sparse+http://proxy/) pulls the WHOLE dep closure THROUGH the proxy (cargo does the resolution; td verifies+caches each .crate) — the proxy's crates/ cache = the vendor set; intern source + vendor tree (store-add-recursive) → build-recipe with TD_VENDOR_DIR (B1/B2), guix off PATH. No per-package Cargo.lock parsing, no guix build, no /gnu/store crate FOD, no oracle (content-address = the upstream pin). Each gate is a heavy from-source build (bat 207 crates, coreutils 507) validated individually + reproducible. Toolchain seed retired last. Start: ripgrep (57 crates) as the PoC, then scale. Brick ladder in plan/corpus-crate-free.md.
