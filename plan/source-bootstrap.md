@@ -144,9 +144,21 @@ upward:
      outer make there; bootstrap-make passed because it builds make via `sh build.sh`, never running
      a nested make.) Plus guix's pch.c "avoid another segfault" workaround. Serial (guix
      `#:parallel-build? #f`). patch 2.5.9 sha256 `ecb5c646…`.
-   - **binutils-mesboot0** (as/ld, 2.20.1a + `binutils-boot-2.20.1a.patch`, applied with the new patch)
-     — next, built with tcc + make. guix env: `CONFIG_SHELL=<sh>`, `CPPFLAGS=-D __GLIBC_MINOR__=6 -D
-     MES_BOOTSTRAP=1`, `AR=tcc -ar`, `CXX=false`, `RANLIB=true`, `CC=tcc` + cppflags, serial.
+   - **binutils-mesboot0** ✅ — the `bootstrap-binutils` gate (`mk/gates/376`): the td-built `patch`
+     applies guix's vendored boot patch (`seed/patches/binutils-boot-2.20.1a.patch` — drops C99isms,
+     fixes malloc proto) and the tcc-built make drives tcc over **Binutils 2.20.1a** → `as` + `ld`.
+     First RECURSIVE-make build (bfd/gas/ld/…). Three NEW blockers found+fixed (all env, via the
+     cached-chain dev loop): (a) **awk** — `config.status` assembles the top Makefile with awk (absent
+     on the sandbox PATH → empty Makefile → "No targets"); glob gawk from the store. (b) **crt across
+     subdirs** — tcc's `crtprefix` is searched, NOT `LIBRARY_PATH` (proven via `tcc -vvv`), so crt must
+     sit in tcc's absolute `out/lib`; libc via `LIBRARY_PATH`, headers via `C_INCLUDE_PATH` — guix's
+     tcc-boot0 search-path setup. Without it, recursive sub-configures fail the link test →
+     `GCC_NO_EXECUTABLES`. (c) **flex/bison** — `configure-binutils`'s AC_PROG_LEX/YACC (parsers are
+     pre-generated+patched, maintainer-mode off → make never regenerates; flex/bison only satisfy
+     configure); glob from the store. guix env: `CPPFLAGS=-D __GLIBC_MINOR__=6 -D MES_BOOTSTRAP=1`,
+     `AR=tcc -ar`, `CXX=false`, `RANLIB=true`, serial, `--with-sysroot=/`. Build-time host tools
+     (bzip2/awk/flex/bison) are scaffolding only — the `[no-guix]` leg verifies as/ld carry no
+     `/gnu/store` bytes. Behavioral: as+ld assemble+link a tiny i386 program that runs → 42.
    - **gcc-core-mesboot0** (gcc 2.95.3) — then gcc-mesboot1 (4.6.4) → gcc-mesboot (4.7.4),
      `--prefix=/td/store`. (The hardest rungs; guix carries many patches.)
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
