@@ -1,0 +1,7 @@
+# seed/sources/binutils-2.20.1a.lock — GNU Binutils 2.20.1a, the mesboot assembler+linker
+# (guix's binutils-mesboot0). The tcc-built GNU Make drives the seed tcc over binutils (patched with
+# seed/patches/binutils-boot-2.20.1a.patch to build under tcc + Mes libc) to produce `as` + `ld` —
+# the first real assembler/linker in the /td/store toolchain, which gcc-mesboot needs. td-fetched.
+url https://ftp.gnu.org/gnu/binutils/binutils-2.20.1a.tar.bz2
+sha256 71d37c96451333c5c0b84b170169fdcb138bbb27397dc06281905d9717c8ed64
+file binutils-2.20.1a.tar.bz2
