@@ -29,8 +29,27 @@ PHASE 2b (the stated end goal) — once the whole corpus is owned guix-free, DRO
 - prelude warms + affected-checks mappings for both.
 
 ## Brick status
-- (starting) warm uutils + youki kicked off (host PREP).
+- PROXY FIX (prereq): coreutils/youki need crates whose names start with "dl" (dlv-list via
+  rust-ini->ordered-multimap). The cargo-proxy's `/dl/` download prefix COLLIDED with their
+  sparse-index path `dl/v-/dlv-list` → 404. Fixed cargo_route (only `/dl/X/Y/download` is a
+  download; else serve_index) + a selftest regression leg (verified-red). ALSO switched
+  warm-cargo-proxy.sh's source-crate grab from a throwaway `cargo fetch` (which FRESH-resolves
+  deps and fails on coreutils) to a direct proxy /dl GET (curl/wget — no resolution). Commit
+  e8d6b0b. ripgrep still warms (57); coreutils warms (507), youki (663).
+- B1 uutils — DONE. `./check.sh rust-coreutils-crate-free` GREEN: 507 crates, all durable legs
+  (supply-chain ∈ Cargo.lock, structural TD_VENDOR_DIR + no /gnu/store crate, behavioral the
+  multicall dispatches mkdir/cp/cat/ls/mv/rm, repro double-build).
+- B2 youki — DONE. `./check.sh rust-youki-crate-free` GREEN: 663 crates, all durable legs
+  (behavioral --version reports youki + --help lists the OCI `create` subcommand, repro).
+- The crates.io corpus rust packages now ALL build guix-free (8 total: #166's six +
+  uutils + youki). russh (td-russh-demo, LOCAL source) + Phase 2b (drop the /gnu/store crate
+  strings) remain.
 
 ## Verified-red evidence
-(shared-helper legs were verified-red in #166 via ripgrep — corruption + cross-path; these
-gates reuse the identical helper. Behavioral legs inherited from the guix-path gates 343/344.)
+- **proxy dl-collision** (this PR): reverted cargo_route to the old erroring behavior → the
+  cargo-proxy-selftest's new `dl`-prefixed-index leg reds (`/dl/te/dltest: bad download path` →
+  404 → exit 1). Restored → selftest OK.
+- supply-chain + structural legs are the SHARED tests/crate-free-build.sh, verified-red in #166
+  via ripgrep (corruption + cross-path against the guix .drv); uutils/youki reuse it.
+- behavioral legs inherited verbatim from the guix-path gates 343 (multicall dispatch) / 344
+  (youki --version/--help); both binaries demonstrably do the behavior in the green run.
