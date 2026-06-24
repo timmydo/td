@@ -227,6 +227,8 @@ sh tools/warm-td-fetch-crates.sh || true
 # crate-vendor/<name>/ for the offline `rust-<name>-crate-free` gates (intern + build via
 # TD_VENDOR_DIR, guix-free). BEST-EFFORT (heavy gates, not the fast tier).
 sh tools/warm-cargo-proxy.sh ripgrep 14.1.1 || true
+sh tools/warm-cargo-proxy.sh sd 1.0.0 || true
+sh tools/warm-cargo-proxy.sh fd-find 10.2.0 fd || true
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only
 # single-threaded builds (NIX_BUILD_CORES=1), so -j2 idles most of the box; run it HOT at

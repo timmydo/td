@@ -304,9 +304,11 @@ map_path() {
       add_preflight shell-syntax
       add_target rust-fetch-crate-free ;;
 
-    tools/warm-cargo-proxy.sh)
+    tools/warm-cargo-proxy.sh|tests/crate-free-build.sh)
       add_preflight shell-syntax
-      add_target rust-ripgrep-crate-free ;;
+      add_target rust-ripgrep-crate-free
+      add_target rust-sd-crate-free
+      add_target rust-fd-crate-free ;;
 
     tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh)
       add_preflight shell-syntax

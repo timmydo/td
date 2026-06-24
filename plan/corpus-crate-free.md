@@ -71,8 +71,20 @@ runs), intrinsic-repro (`td-builder check` double-build), structural (guix off P
   file), repro (td-builder check double-build). Warmed via the check.sh prelude
   (`warm-cargo-proxy.sh ripgrep 14.1.1`). NOTE: editing check.sh escalates landing to the FULL
   loop (heavy).
-- B3 scale to the rest — NEXT (sd/fd/procs/eza/bat/uutils-cat/coreutils/youki/russh): one
-  gate + one prelude warm line each, same generic script.
+- REFACTOR (for scale): the shared guix-free build+assert (supply-chain, intern source+vendor,
+  build-recipe via TD_VENDOR_DIR, structural, repro) is now ONE helper `tests/crate-free-build.sh`
+  (prints OUT=/NS=); each gate is thin — warm-check + `crate-free-build.sh NAME CRATEDIR LOCK
+  SOURCEKEY RECIPE` + its package-specific behavioral leg. warm-cargo-proxy.sh grew an optional
+  DEST arg (crates.io name != recipe name: `fd-find`->fd, `coreutils`->uutils).
+- B3 scale — sd (111 crates, name matches) + fd (113 crates, name DIFFERS: crate `fd-find`) added
+  as `rust-sd-crate-free` / `rust-fd-crate-free`. Remaining: procs(297)/eza(233)/bat(207)/
+  uutils-cat+coreutils(507)/youki(663)/russh(188, LOCAL demo source — not a crates.io pkg, needs
+  a different source path). Each a heavy from-source build; the warm + helper are generic, so each
+  is ~10 lines of gate + 1 prelude warm line.
+- DIVERGE (Phase 2, follow-on): these `-crate-free` gates are ADDITIVE — the guix-path gates
+  (347/349/346/...) stay as the differential oracle while the corpus is being OWNED guix-free
+  ("own, then diverge"). Once the whole corpus has a green crate-free gate, retire the guix-path
+  crate FODs + DROP the /gnu/store crate strings from the locks (the stated end goal).
 
 ## Verified-red evidence
 
@@ -89,3 +101,16 @@ runs), intrinsic-repro (`td-builder check` double-build), structural (guix off P
   separates the guix FOD path from the proxy/vendor path.
 - **behavioral + repro** — same logic as rust-ripgrep (347), verified-red there (needle match
   + over-match guard; td-builder check double-build).
+
+### B3 sd + fd (2026-06-24)
+- The supply-chain + structural + repro legs are now in the SHARED `tests/crate-free-build.sh`,
+  verified-red via the ripgrep PoC above (corruption + cross-path against the guix `.drv`) —
+  sd/fd run the identical code, so those legs are covered for them.
+- behavioral legs are copied verbatim from rust-sd (349) / rust-fd (346), verified-red in their
+  history (sd replace + non-match-unchanged; fd find + pattern-not-leaked). Both binaries
+  demonstrably DO the behavior in the green run.
+- All three green: `./check.sh rust-ripgrep-crate-free` (57), `rust-sd-crate-free` (111),
+  `rust-fd-crate-free` (113) — each exit 0, binary built, all 5 durable legs printed.
+- NOTE on running them: `make check` runs every heavy gate (they're prereqs of the ONE `check`
+  goal). A manual `./check.sh A B C` with MULTIPLE goals only runs the first under
+  `-j2 --output-sync` — validate crate-free gates one target per `./check.sh` invocation.
