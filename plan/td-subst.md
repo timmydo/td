@@ -69,9 +69,22 @@ nar.rs's header comment. Needed by the consumer to unpack a fetched substitute.
       key, then re-checks the nar's sha256 == NarHash. `selftest` is a self-contained
       loopback round-trip with three self-discrimination legs (tampered narinfo, corrupted
       nar, wrong key all red the fetch). Builds offline + selftest green. Verified-red below.
-- [ ] **Inc4** — td-builder consumer hook (substitute-or-build before
-      build_and_register, OFF for the loop) + the durable fetch-instead-of-build gate
-      `mk/gates/<NNN>-td-subst.mk`.
+- [x] **Inc4a** — td-builder substitute-or-build consumer hook. `build-recipe`, after the
+      cache-hit check, calls `try_substitute`: shells out to `td-subst fetch` (td-builder is
+      dep-free), then `restore_substitute` (nar::read_nar + re-verify NarHash) + registers,
+      writing the same registration + td.db a build writes → `CACHE=subst`. OFF unless
+      `TD_SUBST_URL` is set (loop never sets it → directive 1 preserved). Verified-red below.
+- [ ] **Inc4b** — the durable end-to-end gate `mk/gates/<NNN>-td-subst.mk` + a
+      `tests/td-subst.lock` (subst's vendored closure, == td-feed's) + a pinned
+      `tests/td-subst.pub`: build a real recipe → `subst-export` its td.db closure → `sign`
+      → `serve` on loopback → re-run `build-recipe` with `TD_SUBST_URL` in a FRESH scratch →
+      assert `CACHE=subst` + the substituted output == the built output byte-identical + a
+      tool from it runs; self-discrimination (tampered narinfo / wrong key → fall back to
+      building). The heavy piece (builds subst from source like td-feed).
+      GOTCHA: `subst-export`'s `physical = STORE+path` follows the SEED-UNPACK convention
+      (`STORE/gnu/store/<base>`), NOT store-add-text's flat `STORE/<base>` — the gate must
+      lay the re-rooted store out as `STORE/gnu/store/<base>` (seed-unpack/seed-manifest
+      style) or use the live store with `STORE=""`.
 
 ## Verified-red evidence
 (record per-increment here)
@@ -108,3 +121,12 @@ Both reverted via `git checkout`; reconfirmed green.
   leg ("fetch ACCEPTED a corrupted nar — the NarHash check is not load-bearing", rc=1).
 (The wrong-key leg rides the same `verify_msg` path as the signature leg.)
 Both reverted via `git checkout`; reconfirmed `selftest OK` rc=0.
+
+### Inc4a (2026-06-24; perturb restore_substitute, revert, reconfirm green 63/63)
+Test: `restore_substitute_round_trips_and_rejects_corruption` (corruption hits the file
+CONTENTS, structure intact, so read_nar still parses → the NarHash check is the sole guard).
+- **NarHash equality** — `if false && hash != want_hash` (skip the check) → the test red
+  ("restore accepted a nar whose contents do not match the signed NarHash"); the happy-path
+  legs stayed green, so the guard is isolated. Reverted via `git checkout`; reconfirmed green.
+(Loop-safety — `TD_SUBST_URL` unset → `try_substitute` returns None immediately — is covered
+by the full builder suite still passing 63/63 with the env unset, the loop's actual state.)

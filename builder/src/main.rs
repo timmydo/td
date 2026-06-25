@@ -447,6 +447,131 @@ fn cached_realization(
     Ok(Some(out))
 }
 
+/// Read a `Key: value` field from a td-native narinfo body.
+fn narinfo_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix(": ")))
+}
+
+/// Restore a SUBSTITUTE output from a fetched (already signature-verified) narinfo + NAR:
+/// unpack the NAR into NEWSTORE/<base> (nar::read_nar), then re-serialize it and require
+/// the NAR hash to equal the narinfo's NarHash. That equality is the DURABLE leg — a
+/// substitute is only accepted if the bytes it restores to are the bytes the publisher
+/// signed (and, since td builds are reproducible, those are the bytes a local build would
+/// produce). Returns the output's registration record (refs detected by the same scanner
+/// build_and_register uses, so the store-db registration is identical to a real build's).
+fn restore_substitute(
+    narinfo: &str,
+    narfile: &Path,
+    output_path: &str,
+    newstore: &Path,
+    deriver: &str,
+) -> Result<OutputReg, String> {
+    let want_hash = narinfo_field(narinfo, "NarHash").ok_or("narinfo: no NarHash")?;
+    // References are recorded as basenames; rebase onto the active store dir for scanning.
+    let store_dir = store::store_dir();
+    let full_refs: Vec<String> = narinfo_field(narinfo, "References")
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|b| format!("{store_dir}/{b}"))
+        .collect();
+    let base = output_path.rsplit('/').next().unwrap_or(output_path);
+    let dest = newstore.join(base);
+    let _ = std::fs::remove_dir_all(&dest);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut r = std::io::BufReader::new(
+        std::fs::File::open(narfile).map_err(|e| format!("open {}: {e}", narfile.display()))?,
+    );
+    nar::read_nar(&mut r, &dest).map_err(|e| format!("restore nar -> {}: {e}", dest.display()))?;
+    // Re-serialize the restored tree exactly as build_and_register does (scanner over the
+    // reference candidates), and require the hash to match what the publisher signed.
+    let mut scanner = scan::Scanner::new(&full_refs).map_err(|e| e.to_string())?;
+    nar::write_nar(&mut scanner, &dest).map_err(|e| e.to_string())?;
+    let (hash, size, refs) = scanner.finish();
+    if hash != want_hash {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(format!(
+            "restored substitute NAR hash != signed NarHash for {output_path}\n  want {want_hash}\n  got  {hash}"
+        ));
+    }
+    Ok(OutputReg {
+        store_path: output_path.to_string(),
+        nar_hash: hash,
+        nar_size: size,
+        refs,
+        deriver: deriver.to_string(),
+    })
+}
+
+/// SUBSTITUTE-OR-BUILD: before realizing DRV, try to fetch every output from a configured
+/// substitute server instead of building it. Returns Some(regs) only if EVERY output is
+/// fetched + signature-verified + restores to its signed NarHash; otherwise None (→ build).
+///
+/// OFF unless `TD_SUBST_URL` is set — the verification loop never sets it, so the loop's
+/// behavior is unchanged (directive 1: the loop always builds from source + --check). It
+/// is opt-in for `td install` / CI image prep / a cold worktree. td-builder is
+/// dependency-free, so the network + ed25519 work is shelled out to the `td-subst` binary
+/// (`TD_SUBST_BIN`, default `td-subst`); td-builder only restores (nar::read_nar) + verifies
+/// the hash + registers.
+fn try_substitute(
+    parsed: &drv::Derivation,
+    drv_path: &str,
+    scratch: &Path,
+) -> Result<Option<Vec<OutputReg>>, String> {
+    let url = match std::env::var("TD_SUBST_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => return Ok(None),
+    };
+    let pubkey = std::env::var("TD_SUBST_PUBKEY")
+        .map_err(|_| "TD_SUBST_URL is set but TD_SUBST_PUBKEY is not".to_string())?;
+    let subst_bin = std::env::var("TD_SUBST_BIN").unwrap_or_else(|_| "td-subst".to_string());
+    let newstore = scratch.join("newstore");
+    std::fs::create_dir_all(&newstore).map_err(|e| e.to_string())?;
+    let fetchdir = scratch.join("subst-fetch");
+    let _ = std::fs::remove_dir_all(&fetchdir);
+    std::fs::create_dir_all(&fetchdir).map_err(|e| e.to_string())?;
+
+    let mut record = String::new();
+    let mut regs: Vec<OutputReg> = Vec::new();
+    for o in &parsed.outputs {
+        let base = o.path.rsplit('/').next().unwrap_or(&o.path);
+        // Shell out: td-subst fetch URL NAME OUTDIR PUBKEY — verifies the signature +
+        // NarHash and writes <base>.narinfo + the nar into fetchdir, or exits non-zero.
+        let out = std::process::Command::new(&subst_bin)
+            .args(["fetch", &url, base, &fetchdir.to_string_lossy(), &pubkey])
+            .output()
+            .map_err(|e| format!("spawn {subst_bin}: {e}"))?;
+        if !out.status.success() {
+            // Not available / failed verification → fall back to building (NOT an error).
+            eprintln!(
+                "td-builder: no verified substitute for {base} ({}); building",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return Ok(None);
+        }
+        let narinfo = std::fs::read_to_string(fetchdir.join(format!("{base}.narinfo")))
+            .map_err(|e| format!("read fetched narinfo for {base}: {e}"))?;
+        let narfile = narinfo_field(&narinfo, "NarFile").ok_or("fetched narinfo: no NarFile")?;
+        let reg = restore_substitute(&narinfo, &fetchdir.join(narfile), &o.path, &newstore, drv_path)?;
+        record.push_str(&format!("path {}\n", reg.store_path));
+        record.push_str(&format!("nar-hash {}\n", reg.nar_hash));
+        record.push_str(&format!("nar-size {}\n", reg.nar_size));
+        for r in &reg.refs {
+            record.push_str(&format!("reference {r}\n"));
+        }
+        record.push_str(&format!("deriver {}\n\n", reg.deriver));
+        println!("OUT={} {}", o.name, reg.store_path);
+        regs.push(reg);
+    }
+    // Same registration + td.db a real build writes, so a later cached_realization hits and
+    // a downstream build-plan step can resolve this output's closure.
+    std::fs::write(scratch.join("registration"), record).map_err(|e| e.to_string())?;
+    write_output_db(&regs, &scratch.join("td.db"))?;
+    Ok(Some(regs))
+}
+
 /// A td-OWNED source store handed to `realize`/`build-recipe`: the `canonical`
 /// source path is NOT in the daemon DB (td interned it itself, gate 285's
 /// store-add-recursive), so its no-reference closure is read from the td `db`, and
@@ -755,6 +880,17 @@ fn build_recipe(
         // of a td-built dependency, so it must exist whether or not we rebuilt.
         write_output_db(&regs, &scratch.join("td.db"))?;
         println!("CACHE=hit");
+        return Ok(regs);
+    }
+    // SUBSTITUTE-OR-BUILD (opt-in, TD_SUBST_URL): fetch the outputs from a substitute
+    // server instead of building. OFF for the verification loop — it never sets the env,
+    // so this is a no-op there (directive 1: the loop always builds from source + --check).
+    if let Some(regs) = try_substitute(&parsed, &drv_path, scratch)? {
+        eprintln!(
+            "td-builder: build-recipe SUBSTITUTED {} output(s) for {drv_path} (verified signature + NarHash); skipping the build",
+            regs.len()
+        );
+        println!("CACHE=subst");
         return Ok(regs);
     }
     eprintln!("td-builder: build-recipe assembled {drv_path} (no guix (derivation), no Guile)");
@@ -3887,6 +4023,47 @@ mod tests {
         let mut r = std::io::BufReader::new(std::fs::File::open(outdir.join(narfile)).unwrap());
         nar::read_nar(&mut r, &restored).unwrap();
         assert_eq!(std::fs::read(restored.join("run")).unwrap(), b"app\n");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    // restore_substitute: a fetched narinfo + nar (as subst-export produces) restores to
+    // the original tree, the OutputReg's NarHash equals the signed one, and a corrupted nar
+    // is REJECTED (the durable equality leg — a substitute is only accepted if it restores
+    // to the bytes the publisher signed). The consumer's core, no network/DB.
+    #[test]
+    fn restore_substitute_round_trips_and_rejects_corruption() {
+        let base = std::env::temp_dir().join(format!("td-subst-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store_path = "/gnu/store/cccccccccccccccccccccccccccccccc-app";
+        let app_base = "cccccccccccccccccccccccccccccccc-app";
+        let phys = base.join("phys/app");
+        std::fs::create_dir_all(&phys).unwrap();
+        std::fs::write(phys.join("run"), b"app payload\n").unwrap();
+
+        // Export it (the server side) → a narinfo + nar, exactly what `fetch` would write.
+        let served = base.join("served");
+        subst_export(&served, &[SubstMember { store_path: store_path.into(), physical: phys.clone(), refs: vec![] }]).unwrap();
+        let ni = std::fs::read_to_string(served.join(format!("{app_base}.narinfo"))).unwrap();
+        let narfile = served.join(narinfo_field(&ni, "NarFile").unwrap());
+
+        // Restore it (the consumer side) into a fresh newstore.
+        let newstore = base.join("newstore");
+        let reg = restore_substitute(&ni, &narfile, store_path, &newstore, "x.drv").unwrap();
+        assert_eq!(reg.store_path, store_path);
+        assert_eq!(reg.nar_hash, narinfo_field(&ni, "NarHash").unwrap());
+        assert_eq!(std::fs::read(newstore.join(app_base).join("run")).unwrap(), b"app payload\n");
+
+        // Self-discrimination: corrupt the nar's file CONTENTS (structure intact, so
+        // read_nar still parses) → restore must reject on the NarHash check specifically.
+        let mut bytes = std::fs::read(&narfile).unwrap();
+        let pos = bytes.windows(3).position(|w| w == b"app").expect("payload in nar");
+        bytes[pos] ^= 0xff;
+        std::fs::write(&narfile, &bytes).unwrap();
+        assert!(
+            restore_substitute(&ni, &narfile, store_path, &newstore, "x.drv").is_err(),
+            "restore accepted a nar whose contents do not match the signed NarHash"
+        );
 
         std::fs::remove_dir_all(&base).unwrap();
     }
