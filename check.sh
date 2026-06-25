@@ -141,6 +141,22 @@ if [ "$#" -eq 0 ]; then
   set -- check
 fi
 
+# Heavy-gate source/crate warm prelude: ON by default, OFF for the LIGHT tiers.
+# `check-fast` (cheap gates + ts) and `check-engine` (engine smoke) run NONE of the
+# heavy/bootstrap/rust gates, so they must not warm — or HANG warming — those gates'
+# inputs: the source-bootstrap tarballs (now 17, incl. the ~100MB linux + gcc seeds) and
+# the rust corpus crate closures (~2200 crates across 8 cargo-proxy warms). That host-side
+# warm has no per-fetch timeout, so a single slow/unresponsive mirror could block the fast
+# tier past the CI timeout (it tipped over when #178 added the gcc-mesboot1 seeds). Only
+# warm-tsgo stays unconditional below — the fast tier's `ts`/`tsgo-pin` gates need it.
+heavy_warm=0
+for _goal in "$@"; do
+  case "$_goal" in
+    check-fast|check-engine) : ;;   # light tier — owns no heavy gate, needs no heavy warm
+    *) heavy_warm=1 ;;              # the `check` loop or a targeted heavy gate — warm it
+  esac
+done
+
 #   make -jN --output-sync=target : bounded-parallel loop (loop-latency). The
 #                                Makefile's dependency graph keeps the cheap
 #                                fail-fast rungs strictly serial and first;
@@ -215,25 +231,27 @@ sh tools/warm-tsgo.sh || { echo "check.sh: FATAL: could not warm the tsgo tarbal
 # tinycc/gcc/glibc) the same way — td-fetch on the HOST, sha256-pinned per seed/sources/*.lock,
 # into .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates. BEST-EFFORT (those
 # gates are not in the fast tier): a runner that cannot warm them is fine, the gate enforces.
-sh tools/warm-bootstrap-sources.sh || true
-# --- Crate-guix-free warm: td OWNS fetching td-fetch's crate closure (no guix daemon FOD) -----
-# td-fetch each `.crate` from static.crates.io, pinned by fetch/Cargo.lock (upstream hash), into
-# .td-build-cache/crate-vendor/ for the offline `rust-fetch` gate (which interns it as
-# a vendor tree + builds td-fetch guix-free). BEST-EFFORT (heavy gate, not the fast tier).
-sh tools/warm-td-fetch-crates.sh || true
-# --- Corpus crate-guix-free warm: cargo resolves+fetches a rust package's WHOLE crate closure
-# THROUGH td's OWN cargo-proxy (td-feed cargo-proxy), the proxy verifying each .crate sha256 ==
-# the crates.io index cksum (upstream pin). Leaves source + vendor tree in .td-build-cache/
-# crate-vendor/<name>/ for the offline `rust-<name>-crate-free` gates (intern + build via
-# TD_VENDOR_DIR, guix-free). BEST-EFFORT (heavy gates, not the fast tier).
-sh tools/warm-cargo-proxy.sh ripgrep 14.1.1 || true
-sh tools/warm-cargo-proxy.sh sd 1.0.0 || true
-sh tools/warm-cargo-proxy.sh fd-find 10.2.0 fd || true
-sh tools/warm-cargo-proxy.sh procs 0.14.10 || true
-sh tools/warm-cargo-proxy.sh eza 0.21.6 || true
-sh tools/warm-cargo-proxy.sh bat 0.25.0 || true
-sh tools/warm-cargo-proxy.sh coreutils 0.9.0 uutils || true
-sh tools/warm-cargo-proxy.sh youki 0.6.0 || true
+if [ "$heavy_warm" = 1 ]; then
+  sh tools/warm-bootstrap-sources.sh || true
+  # --- Crate-guix-free warm: td OWNS fetching td-fetch's crate closure (no guix daemon FOD) -----
+  # td-fetch each `.crate` from static.crates.io, pinned by fetch/Cargo.lock (upstream hash), into
+  # .td-build-cache/crate-vendor/ for the offline `rust-fetch` gate (which interns it as
+  # a vendor tree + builds td-fetch guix-free). BEST-EFFORT (heavy gate, not the fast tier).
+  sh tools/warm-td-fetch-crates.sh || true
+  # --- Corpus crate-guix-free warm: cargo resolves+fetches a rust package's WHOLE crate closure
+  # THROUGH td's OWN cargo-proxy (td-feed cargo-proxy), the proxy verifying each .crate sha256 ==
+  # the crates.io index cksum (upstream pin). Leaves source + vendor tree in .td-build-cache/
+  # crate-vendor/<name>/ for the offline `rust-<name>-crate-free` gates (intern + build via
+  # TD_VENDOR_DIR, guix-free). BEST-EFFORT (heavy gates, not the fast tier).
+  sh tools/warm-cargo-proxy.sh ripgrep 14.1.1 || true
+  sh tools/warm-cargo-proxy.sh sd 1.0.0 || true
+  sh tools/warm-cargo-proxy.sh fd-find 10.2.0 fd || true
+  sh tools/warm-cargo-proxy.sh procs 0.14.10 || true
+  sh tools/warm-cargo-proxy.sh eza 0.21.6 || true
+  sh tools/warm-cargo-proxy.sh bat 0.25.0 || true
+  sh tools/warm-cargo-proxy.sh coreutils 0.9.0 uutils || true
+  sh tools/warm-cargo-proxy.sh youki 0.6.0 || true
+fi
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only
 # single-threaded builds (NIX_BUILD_CORES=1), so -j2 idles most of the box; run it HOT at
