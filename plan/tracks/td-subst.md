@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: td-subst
 handle: claude-opus-6fda3a
 date: 2026-06-24
