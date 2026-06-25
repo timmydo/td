@@ -179,12 +179,19 @@ upward:
      the FIRST gcc rebuilds GCC 2.95.3 with `CC=<gcc>` (not tcc) now resolving headers/libs to **glibc**
      instead of mes libc (guix's gcc-mesboot0) — the toolchain re-baseline. `RANLIB=true`, `LANGUAGES=c`,
      simpler install2. Behavioral: the glibc-based gcc compiles+links+runs C → 42.
-   - **binutils-mesboot1** 🚧 (binutils 2.20.1a rebuilt) — the `bootstrap-binutils-mesboot1` gate
+   - **binutils-mesboot1** ✅ (binutils 2.20.1a rebuilt, #173) — the `bootstrap-binutils-mesboot1` gate
      (`mk/gates/384`): gcc-mesboot0 rebuilds binutils against glibc (guix's binutils-mesboot1). guix
      drops binutils-mesboot0's overrides for a **plain** configure: `CC=<gcc-mesboot0>`, the real
      `ar`/`ranlib`, glibc as libc; the boot patch's `MES_BOOTSTRAP` #ifdefs compile the real-glibc side.
-     Behavioral: the gcc-built, glibc-linked `as`+`ld` assemble+link+run C → 42. Then make-mesboot 3.82 →
-     gcc-mesboot1 (4.6.4, needs gmp/mpfr/mpc) → gcc-mesboot (4.7.4), `--prefix=/td/store`.
+     Two gotchas: NO `-B<glibc>/lib` (gcc's "never used" `-E` warning → autoconf marks `HAVE_LIMITS_H`=no
+     → fibheap `LONG_MIN`; crt via `LIBRARY_PATH`) + PURE kernel UAPI headers (not the mes-merged set).
+     Behavioral: the gcc-built, glibc-linked `as`+`ld` assemble+link+run C → 42.
+   - **make-mesboot** 🚧 (GNU Make 3.82, guix's make-mesboot) — the `bootstrap-make-mesboot` gate
+     (`mk/gates/386`): make-mesboot0 (the tcc-built make 3.80) rebuilds GNU Make 3.82 with gcc-mesboot0
+     + glibc + binutils-mesboot0 — a glibc-linked make for the gcc-mesboot1 arc. Plain configure +
+     `LIBS=-lc -lnss_files -lnss_dns -lresolv` (static glibc nss). Behavioral: make 3.82 parses a
+     Makefile + runs a recipe → BUILT. Then gcc-mesboot1 (4.6.4, needs gmp/mpfr/mpc) → gcc-mesboot
+     (4.7.4), `--prefix=/td/store`.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
