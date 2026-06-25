@@ -142,6 +142,50 @@ fn subst_export(outdir: &Path, members: &[SubstMember]) -> std::io::Result<Vec<S
     Ok(written)
 }
 
+/// Build the `SubstMember` list to export for ROOTS — paths + their direct refs read from DB,
+/// each member's bytes taken from `STORE_DIR/<basename>`. With `walk_closure`, ROOTS expands to
+/// its full closure over DB's Refs graph (a whole-closure mirror). Without, EXACTLY the roots
+/// are exported — the per-output granularity the substitute consumer uses: `try_substitute`
+/// fetches a drv's own outputs one at a time (their deps assumed already present), so a
+/// publisher of a single build output need not stage that output's whole closure into STORE_DIR
+/// (its external refs live elsewhere). The narinfo still lists each path's refs as basenames
+/// either way, so the consumer can scan-verify the restored bytes.
+fn subst_export_members(
+    db: &store_db_read::Db,
+    store_dir: &str,
+    roots: &[String],
+    walk_closure: bool,
+) -> Result<Vec<SubstMember>, String> {
+    let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for r in roots {
+        // db.closure errors if the root is not in the DB; in paths-only mode we keep that
+        // existence check but take only the root itself (not its refs).
+        let c = db.closure(r)?;
+        if walk_closure {
+            for p in c {
+                paths.insert(p);
+            }
+        } else {
+            paths.insert(r.clone());
+        }
+    }
+    let refs = db.refs_by_path()?;
+    Ok(paths
+        .iter()
+        .map(|p| {
+            let mut rs = refs.get(p).cloned().unwrap_or_default();
+            rs.sort();
+            rs.dedup();
+            let base = p.rsplit('/').next().unwrap_or(p);
+            SubstMember {
+                store_path: p.clone(),
+                physical: Path::new(store_dir).join(base),
+                refs: rs,
+            }
+        })
+        .collect())
+}
+
 /// The `path` column (index 1) of a read `ValidPaths` row, or "" if absent.
 fn path_at(cols: &[store_db_read::Value]) -> &str {
     match cols.get(1) {
@@ -1726,32 +1770,19 @@ fn main() -> ExitCode {
         // write). The networked subst/ binary signs + serves OUTDIR. Usage:
         //   subst-export DB STORE-DIR OUTDIR ROOT...
         Some("subst-export") if args.len() >= 6 => {
-            let (db_path, store_dir, outdir) = (&args[2], &args[3], &args[4]);
-            let roots = &args[5..];
+            // Optional leading `--paths`: export EXACTLY the roots (no closure walk) — the
+            // per-output granularity the substitute consumer fetches. Default = whole closure.
+            let paths_only = args.get(2).map(|s| s.as_str()) == Some("--paths");
+            let off = if paths_only { 3 } else { 2 };
             let run = || -> Result<Vec<String>, String> {
+                if args.len() < off + 4 {
+                    return Err("usage: subst-export [--paths] DB STORE-DIR OUTDIR ROOT...".into());
+                }
+                let (db_path, store_dir, outdir) = (&args[off], &args[off + 1], &args[off + 2]);
+                let roots = &args[off + 3..];
                 let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
                 let db = store_db_read::Db::open(bytes)?;
-                let mut closure = std::collections::BTreeSet::new();
-                for r in roots {
-                    for p in db.closure(r)? {
-                        closure.insert(p);
-                    }
-                }
-                let refs = db.refs_by_path()?;
-                let members: Vec<SubstMember> = closure
-                    .iter()
-                    .map(|p| {
-                        let mut rs = refs.get(p).cloned().unwrap_or_default();
-                        rs.sort();
-                        rs.dedup();
-                        let base = p.rsplit('/').next().unwrap_or(p);
-                        SubstMember {
-                            store_path: p.clone(),
-                            physical: Path::new(store_dir).join(base),
-                            refs: rs,
-                        }
-                    })
-                    .collect();
+                let members = subst_export_members(&db, store_dir, roots, !paths_only)?;
                 subst_export(Path::new(outdir), &members).map_err(|e| e.to_string())
             };
             match run() {
@@ -1759,7 +1790,7 @@ fn main() -> ExitCode {
                     println!(
                         "td-builder: subst-export wrote {} narinfo(s) + nars -> {}",
                         written.len(),
-                        outdir
+                        args.get(off + 2).map(|s| s.as_str()).unwrap_or("")
                     );
                     ExitCode::SUCCESS
                 }
@@ -4026,6 +4057,49 @@ mod tests {
         assert_eq!(std::fs::read(restored.join("run")).unwrap(), b"app\n");
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    // subst-export `--paths` exports EXACTLY the named roots (no closure walk) — the
+    // per-output granularity the substitute consumer fetches — while the default closure
+    // mode pulls in the external refs. A build output's refs (glibc, …) are recorded in the
+    // build db but NOT staged in its newstore, so a per-output publish must skip them.
+    #[test]
+    fn subst_export_members_paths_only_exports_roots_not_their_closure() {
+        let dir = std::env::temp_dir().join(format!("td-subst-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = "/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app".to_string();
+        let lib = "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-lib".to_string();
+        // app references lib (an external dep: in the build db with a null hash, not staged).
+        let regs = vec![OutputReg {
+            store_path: app.clone(),
+            nar_hash: "sha256:00".into(),
+            nar_size: 1,
+            refs: vec![lib.clone()],
+            deriver: String::new(),
+        }];
+        let db_path = dir.join("td.db");
+        write_output_db(&regs, &db_path).unwrap();
+        let db = store_db_read::Db::open(std::fs::read(&db_path).unwrap()).unwrap();
+        let roots = vec![app.clone()];
+
+        // Default (closure) mode pulls in the external ref — a whole-closure mirror.
+        let full = subst_export_members(&db, "/store", &roots, true).unwrap();
+        let fp: std::collections::BTreeSet<&str> =
+            full.iter().map(|m| m.store_path.as_str()).collect();
+        assert!(
+            fp.contains(app.as_str()) && fp.contains(lib.as_str()),
+            "closure mode must include the external ref: {fp:?}"
+        );
+
+        // Paths-only exports EXACTLY the root, but still lists its refs in the narinfo so the
+        // consumer can scan-verify the restored bytes (deps assumed already present).
+        let only = subst_export_members(&db, "/store", &roots, false).unwrap();
+        assert_eq!(only.len(), 1, "paths-only must not pull in the closure");
+        assert_eq!(only[0].store_path, app);
+        assert_eq!(only[0].refs, vec![lib.clone()]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // restore_substitute: a fetched narinfo + nar (as subst-export produces) restores to
