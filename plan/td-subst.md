@@ -74,7 +74,14 @@ nar.rs's header comment. Needed by the consumer to unpack a fetched substitute.
       dep-free), then `restore_substitute` (nar::read_nar + re-verify NarHash) + registers,
       writing the same registration + td.db a build writes → `CACHE=subst`. OFF unless
       `TD_SUBST_URL` is set (loop never sets it → directive 1 preserved). Verified-red below.
-- [ ] **Inc4b** — the durable end-to-end gate `mk/gates/<NNN>-td-subst.mk` + a
+- [~] **Inc4b** — WRITTEN + committed (mk/gates/358-td-subst.mk + tests/td-subst.lock +
+      recipe-td-subst.ts + subst/Cargo.lock pinned to td-feed's versions). The end-to-end
+      demo logic is PROVEN locally with the real binaries (e2e: store-add-text → subst-export
+      → sign → serve → fetch → nar-restore byte-identical + tamper-reject), and the
+      from-source build half mirrors the proven td-feed gate. NOT yet seen green in-sandbox:
+      `./check.sh td-subst` on a cold worktree rebuilds the whole corpus first (multi-hour) —
+      CI on the warm image is the authoritative confirmation. Spec below.
+- [ ] **Inc4b (spec)** — the durable end-to-end gate `mk/gates/<NNN>-td-subst.mk` + a
       `tests/td-subst.lock` (subst's vendored closure, == td-feed's) + a pinned
       `tests/td-subst.pub`: build a real recipe → `subst-export` its td.db closure → `sign`
       → `serve` on loopback → re-run `build-recipe` with `TD_SUBST_URL` in a FRESH scratch →
