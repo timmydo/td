@@ -161,6 +161,8 @@ map_recipe_spec() {
       add_target rust-fetch ;;
     td-feed)
       add_target td-feed ;;
+    td-subst)
+      add_target td-subst ;;
     perturbed)
       add_target drv-emit ;;
     pkg-config)
@@ -224,6 +226,9 @@ map_path() {
 
     feed/*|feed/src/*|feed/Cargo.toml|feed/Cargo.lock)
       add_target td-feed ;;
+
+    subst/*|subst/src/*|subst/Cargo.toml|subst/Cargo.lock)
+      add_target td-subst ;;
 
     tests/td-tsgo.lock|tests/tsgo.sh|tools/warm-tsgo.sh)
       add_preflight shell-syntax
@@ -291,6 +296,9 @@ map_path() {
 
     tests/td-feed.lock|tests/td-feed.index)
       add_target td-feed ;;
+
+    tests/td-subst.lock)
+      add_target td-subst ;;
 
     tools/gen-feed-index.sh)
       add_preflight shell-syntax
@@ -726,6 +734,9 @@ run_self_test() {
   assert_target tools/warm-td-fetch-crates.sh rust-fetch
   assert_target tools/warm-cargo-proxy.sh rust-ripgrep
   assert_target feed/src/main.rs td-feed
+  assert_target tests/ts/recipe-td-subst.ts td-subst
+  assert_target tests/td-subst.lock td-subst
+  assert_target subst/src/main.rs td-subst
   assert_target tests/ts/recipe-td-cmake-demo.ts cmake
   assert_target tests/td-cmake-demo.lock cmake
   assert_target tests/ts/recipe-uutils.ts rust-coreutils
