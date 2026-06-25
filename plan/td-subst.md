@@ -81,10 +81,12 @@ nar.rs's header comment. Needed by the consumer to unpack a fetched substitute.
       assert `CACHE=subst` + the substituted output == the built output byte-identical + a
       tool from it runs; self-discrimination (tampered narinfo / wrong key → fall back to
       building). The heavy piece (builds subst from source like td-feed).
-      GOTCHA: `subst-export`'s `physical = STORE+path` follows the SEED-UNPACK convention
-      (`STORE/gnu/store/<base>`), NOT store-add-text's flat `STORE/<base>` — the gate must
-      lay the re-rooted store out as `STORE/gnu/store/<base>` (seed-unpack/seed-manifest
-      style) or use the live store with `STORE=""`.
+      NOTE: `subst-export DB STORE-DIR OUTDIR ROOT...` takes STORE-DIR as the directory
+      holding each path FLAT as `<basename>` — `/gnu/store` for the live store, or a build's
+      `newstore` (the same flat layout build_and_register / store-add-text write). PROVEN
+      end-to-end locally: store-add-text → subst-export → sign → serve → fetch → nar-restore
+      round-trips byte-identical + a tampered narinfo reds the fetch (logic for the gate's
+      behavioral assertions).
 
 ## Verified-red evidence
 (record per-increment here)

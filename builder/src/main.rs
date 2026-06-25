@@ -1720,13 +1720,13 @@ fn main() -> ExitCode {
         }
         // subst-export: write a serve-able substitute directory for the closure of ROOT…
         // over DB's Refs graph — a `<basename>.narinfo` + `nar/<narhash>.nar` per member —
-        // the store-coupled, dependency-free half of the substitute server. STORE is the
-        // physical store root prefix (use "" for the live /gnu/store; a re-rooted dir maps
-        // /gnu/store/<base> -> STORE/gnu/store/<base>, the seed-unpack convention). The
-        // networked subst/ binary signs + serves OUTDIR. Usage:
-        //   subst-export DB STORE OUTDIR ROOT...
+        // the store-coupled, dependency-free half of the substitute server. STORE-DIR is the
+        // directory holding each path FLAT as `<basename>` — `/gnu/store` for the live store,
+        // or a build's `newstore` (the same flat layout build_and_register / store-add-text
+        // write). The networked subst/ binary signs + serves OUTDIR. Usage:
+        //   subst-export DB STORE-DIR OUTDIR ROOT...
         Some("subst-export") if args.len() >= 6 => {
-            let (db_path, store, outdir) = (&args[2], &args[3], &args[4]);
+            let (db_path, store_dir, outdir) = (&args[2], &args[3], &args[4]);
             let roots = &args[5..];
             let run = || -> Result<Vec<String>, String> {
                 let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
@@ -1744,9 +1744,10 @@ fn main() -> ExitCode {
                         let mut rs = refs.get(p).cloned().unwrap_or_default();
                         rs.sort();
                         rs.dedup();
+                        let base = p.rsplit('/').next().unwrap_or(p);
                         SubstMember {
                             store_path: p.clone(),
-                            physical: std::path::PathBuf::from(format!("{store}{p}")),
+                            physical: Path::new(store_dir).join(base),
                             refs: rs,
                         }
                     })
@@ -3878,7 +3879,7 @@ fn main() -> ExitCode {
             eprintln!("usage: td-builder            # print the S1 sentinel");
             eprintln!("       td-builder nar-hash PATH");
             eprintln!("       td-builder nar-restore NARFILE DEST");
-            eprintln!("       td-builder subst-export DB STORE OUTDIR ROOT...");
+            eprintln!("       td-builder subst-export DB STORE-DIR OUTDIR ROOT...");
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
