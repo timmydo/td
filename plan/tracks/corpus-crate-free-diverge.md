@@ -1,5 +1,5 @@
 section: mainline
-status: claimed
+status: done
 handle: claude-fable-65585b
 date: 2026-06-24
 title: corpus-crate-free-diverge
