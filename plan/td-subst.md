@@ -32,6 +32,26 @@ daemon" — the primitives already exist in td-builder.
   selftest-with-self-discrimination pattern to copy.
 - `ring` is already vendored (rustls in fetch/feed) → ed25519 is free.
 
+## Architecture refinement (2026-06-24) — the dependency boundary
+`td-builder` has **zero crate dependencies** (pure std — the cargo-test gate relies on it;
+adding `ring` would bloat its from-source closure ~40 crates and break `--frozen` with no
+deps). ed25519 signing needs `ring`. So split along that boundary, the same way the repo
+already splits the pure-std store engine from the networked `fetch`/`feed`:
+- **td-builder (no new deps)** owns the *store-coupled* half — it already has nar
+  (read+write), store_db_read, store-closure, store::output_path. New: `subst-export`
+  produces a serve-able directory from a store path + its closure: a td-native
+  `<pathhash>.narinfo` per path (StorePath/NarHash/NarSize/References) + `nar/<narhash>.nar`.
+  Plus the `nar-restore` consumer primitive (Inc1, done).
+- **a separate `subst/` binary** (shares feed/fetch's `ureq+rustls/ring+sha2` closure)
+  owns the *network+crypto* half: `sign` the narinfos (ed25519), `serve` the dir
+  (std::net, verify-on-serve), `fetch` (verify sig + nar hash, then hand to
+  `td-builder nar-restore` + store-register). This is the piece with a heavy from-source
+  BUILD_GATE (like td-feed); td-builder's half rides the existing stage0 build.
+
+This keeps the loop's verification engine dependency-free and confines the crypto/HTTP
+surface to the networked tool — and makes Inc2 (subst-export) unit-testable with NO
+network and NO new deps.
+
 ## The one substantial new primitive
 `nar::read_nar` — the inverse of `write_nar`. Restores a NAR stream to a path on disk
 (regular/executable file, symlink, directory tree). Format is fully specified in
@@ -40,8 +60,11 @@ nar.rs's header comment. Needed by the consumer to unpack a fetched substitute.
 ## Increment ladder
 - [x] **Inc1** — `nar::read_nar` (inverse of write_nar) + `nar-restore NARFILE DEST`
       CLI (the read side, wired so it isn't dead code) + 3 verified-red unit tests.
-- [ ] **Inc2** — `subst/` binary: `publish` / `serve` / `selftest`, loopback green
-      (publish a tiny path → serve → fetch → read_nar unpack → byte-identical).
+- [x] **Inc2** — `td-builder subst-export DB STORE OUTDIR ROOT...`: the store-coupled,
+      dependency-free half — writes `<basename>.narinfo` + `nar/<narhash>.nar` per closure
+      member (reuses nar::write_nar + store_db_read + Refs closure). Verified-red below.
+- [ ] **Inc2b** — `subst/` binary: `serve` / `fetch` / `selftest`, loopback green
+      (serve an exported dir → fetch → read_nar unpack → byte-identical). Networked half.
 - [ ] **Inc3** — ed25519 signing of the metadata + pinned-key verify on the consumer;
       self-discrimination legs (corrupt NAR, bad signature, tampered narhash all red).
 - [ ] **Inc4** — td-builder consumer hook (substitute-or-build before
@@ -63,3 +86,14 @@ Three targeted single-point perturbations, each isolating exactly one new assert
   valid body behind a wrong magic restored); other 5 green.
 Each reverted via `git checkout -- builder/src/nar.rs` (Inc1 was committed first, so the
 revert restored the green state without losing work). Re-confirmed green after each.
+
+### Inc2 (2026-06-24; perturb subst_export, revert, reconfirm green 62/62)
+Test: `subst_export_writes_narinfos_and_restorable_nars`.
+- **References basenames** — record refs as full `/gnu/store/...` paths instead of
+  basenames → the `References: <basename>` assertion red (printed the full path).
+- **NarHash truth + round-trip** — record `sha256:deadbeef` instead of the real nar hash
+  → the `assert_eq!(narhash, real)` leg red (`deadbeef` != the true hash).
+  (A first attempt — serialize a *different* path's nar — was discarded: pointing
+  write_nar at the nar output dir is self-referential and HANGS rather than failing
+  cleanly; the constant-wrong-hash perturbation is the clean equivalent.)
+Both reverted via `git checkout`; reconfirmed green.

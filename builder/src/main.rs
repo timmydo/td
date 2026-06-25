@@ -81,6 +81,67 @@ fn nar_hash_size_path(path: &Path) -> Result<(String, u64), std::io::Error> {
     Ok((format!("sha256:{}", sha256::to_base16(&w.hasher.finalize())), w.size))
 }
 
+// --- substitute server: export half (store-coupled, dependency-free) ---
+// Write a serve-able directory for a store closure: a td-native `<basename>.narinfo` per
+// member + `nar/<narhash-hex>.nar`. This is the dual of `seed-manifest`/`seed-unpack` —
+// the seed pair captures a closure into ONE tarball + manifest; the substitute export
+// serves each path on its OWN, addressable by basename, so a consumer can fetch just the
+// paths it lacks. The networked `subst/` binary signs + serves this dir and the consumer
+// verifies + restores it (with `nar-restore`); this half stays in the dependency-free
+// engine because it needs the store DB + NAR serializer, not crypto/HTTP. Same reader +
+// `write_nar` as seed-manifest, so the served bytes match the daemon's.
+
+/// One member of a substitute export.
+struct SubstMember {
+    store_path: String,           // logical path, e.g. /gnu/store/<hash>-name
+    physical: std::path::PathBuf, // where to read it on disk (== store_path on live store)
+    refs: Vec<String>,            // direct references (logical store paths)
+}
+
+/// The basename (`<hash>-name`) of a store path.
+fn store_basename(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
+}
+
+/// Render a td-native narinfo (minimal, line-oriented). References are recorded as
+/// basenames so the record is store-location independent; the consumer rebases them onto
+/// its own store dir. The signature line (`Sig:`) is appended later by the signer.
+fn narinfo_text(
+    store_path: &str,
+    narhash: &str,
+    narsize: u64,
+    narfile: &str,
+    ref_basenames: &[String],
+) -> String {
+    format!(
+        "StorePath: {store_path}\nNarHash: {narhash}\nNarSize: {narsize}\nNarFile: {narfile}\nReferences: {}\n",
+        ref_basenames.join(" ")
+    )
+}
+
+/// Write a serve-able substitute directory for MEMBERS into OUTDIR. Returns the basenames
+/// written. Each member yields `OUTDIR/<basename>.narinfo` + `OUTDIR/nar/<narhash>.nar`.
+fn subst_export(outdir: &Path, members: &[SubstMember]) -> std::io::Result<Vec<String>> {
+    let nardir = outdir.join("nar");
+    std::fs::create_dir_all(&nardir)?;
+    let mut written = Vec::new();
+    for m in members {
+        let (narhash, narsize) = nar_hash_size_path(&m.physical)?;
+        let hex = narhash.strip_prefix("sha256:").unwrap_or(&narhash);
+        let narfile = format!("nar/{hex}.nar");
+        let mut f = std::fs::File::create(nardir.join(format!("{hex}.nar")))?;
+        nar::write_nar(&mut f, &m.physical)?;
+        drop(f);
+        let base = store_basename(&m.store_path);
+        let refbases: Vec<String> =
+            m.refs.iter().map(|r| store_basename(r).to_string()).collect();
+        let text = narinfo_text(&m.store_path, &narhash, narsize, &narfile, &refbases);
+        std::fs::write(outdir.join(format!("{base}.narinfo")), text)?;
+        written.push(base.to_string());
+    }
+    Ok(written)
+}
+
 /// The `path` column (index 1) of a read `ValidPaths` row, or "" if absent.
 fn path_at(cols: &[store_db_read::Value]) -> &str {
     match cols.get(1) {
@@ -1517,6 +1578,56 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: nar-restore {narfile} {dest}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // subst-export: write a serve-able substitute directory for the closure of ROOT…
+        // over DB's Refs graph — a `<basename>.narinfo` + `nar/<narhash>.nar` per member —
+        // the store-coupled, dependency-free half of the substitute server. STORE is the
+        // physical store root prefix (use "" for the live /gnu/store; a re-rooted dir maps
+        // /gnu/store/<base> -> STORE/gnu/store/<base>, the seed-unpack convention). The
+        // networked subst/ binary signs + serves OUTDIR. Usage:
+        //   subst-export DB STORE OUTDIR ROOT...
+        Some("subst-export") if args.len() >= 6 => {
+            let (db_path, store, outdir) = (&args[2], &args[3], &args[4]);
+            let roots = &args[5..];
+            let run = || -> Result<Vec<String>, String> {
+                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+                let db = store_db_read::Db::open(bytes)?;
+                let mut closure = std::collections::BTreeSet::new();
+                for r in roots {
+                    for p in db.closure(r)? {
+                        closure.insert(p);
+                    }
+                }
+                let refs = db.refs_by_path()?;
+                let members: Vec<SubstMember> = closure
+                    .iter()
+                    .map(|p| {
+                        let mut rs = refs.get(p).cloned().unwrap_or_default();
+                        rs.sort();
+                        rs.dedup();
+                        SubstMember {
+                            store_path: p.clone(),
+                            physical: std::path::PathBuf::from(format!("{store}{p}")),
+                            refs: rs,
+                        }
+                    })
+                    .collect();
+                subst_export(Path::new(outdir), &members).map_err(|e| e.to_string())
+            };
+            match run() {
+                Ok(written) => {
+                    println!(
+                        "td-builder: subst-export wrote {} narinfo(s) + nars -> {}",
+                        written.len(),
+                        outdir
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: subst-export: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -3631,6 +3742,7 @@ fn main() -> ExitCode {
             eprintln!("usage: td-builder            # print the S1 sentinel");
             eprintln!("       td-builder nar-hash PATH");
             eprintln!("       td-builder nar-restore NARFILE DEST");
+            eprintln!("       td-builder subst-export DB STORE OUTDIR ROOT...");
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
@@ -3735,6 +3847,48 @@ mod tests {
         assert!(got.contains(&format!("bash-source /gnu/store/{h}-bash-5.2.tar.gz\n"))); // source untouched
         // a declared owned dep absent from the lock is an error (don't drop the edge).
         assert!(auto_chained_lock(&base, &["readline".into()]).is_err());
+    }
+
+    // subst-export writes, for each member, a narinfo with the right StorePath/References
+    // and a nar that RESTORES (read_nar) to the original tree with the recorded NarHash —
+    // the durable round-trip of the substitute server's store-coupled half, no DB/network.
+    #[test]
+    fn subst_export_writes_narinfos_and_restorable_nars() {
+        let base = std::env::temp_dir().join(format!("td-subst-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // Two synthetic store paths; "app" references "lib".
+        let lib = "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-lib";
+        let app = "/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app";
+        let phys_lib = base.join("phys/lib");
+        std::fs::create_dir_all(&phys_lib).unwrap();
+        std::fs::write(phys_lib.join("libfoo"), b"lib bytes\n").unwrap();
+        let phys_app = base.join("phys/app");
+        std::fs::create_dir_all(&phys_app).unwrap();
+        std::fs::write(phys_app.join("run"), b"app\n").unwrap();
+
+        let members = vec![
+            SubstMember { store_path: lib.into(), physical: phys_lib.clone(), refs: vec![] },
+            SubstMember { store_path: app.into(), physical: phys_app.clone(), refs: vec![lib.into()] },
+        ];
+        let outdir = base.join("out");
+        let written = subst_export(&outdir, &members).unwrap();
+        assert_eq!(written.len(), 2);
+
+        // The app narinfo carries the right StorePath and records the ref as a BASENAME.
+        let ni = std::fs::read_to_string(outdir.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app.narinfo")).unwrap();
+        assert!(ni.contains(&format!("StorePath: {app}\n")), "narinfo: {ni}");
+        assert!(ni.contains("References: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-lib\n"), "narinfo: {ni}");
+        let narhash = ni.lines().find_map(|l| l.strip_prefix("NarHash: ")).unwrap();
+        let narfile = ni.lines().find_map(|l| l.strip_prefix("NarFile: ")).unwrap();
+        // The recorded NarHash is the TRUE nar hash of the source path.
+        assert_eq!(narhash, nar_hash_size_path(&phys_app).unwrap().0);
+        // The served nar RESTORES to the original tree (durable round-trip).
+        let restored = base.join("restored-app");
+        let mut r = std::io::BufReader::new(std::fs::File::open(outdir.join(narfile)).unwrap());
+        nar::read_nar(&mut r, &restored).unwrap();
+        assert_eq!(std::fs::read(restored.join("run")).unwrap(), b"app\n");
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     // The build cache hits only on a present + NAR-verified output, and misses on a
