@@ -26,7 +26,7 @@ HEAVY_GATES += td-subst
 # prelude builds. Not in BUILD_SPECS — the source is interned at gate time.
 BUILD_GATES += td-subst
 td-subst:
-	@echo ">> td-subst: td builds td-subst (its own substitute server) from source via build-recipe (offline, guix/Guile off PATH); it selftests the signed serve/fetch over loopback, proves fetch-don't-build end-to-end byte-identical, and is reproducible"
+	@echo ">> td-subst: td builds td-subst (its own substitute server) from source via build-recipe (offline, guix/Guile off PATH); it selftests the signed serve/fetch over loopback, proves fetch-don't-build end-to-end byte-identical, proves the build-recipe CONSUMER HOOK substitutes (CACHE=subst) instead of rebuilding, and is reproducible"
 	@set -euo pipefail; \
 	tsgo=`sh tests/tsgo.sh`; \
 	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo (the TS front-end compiler)" >&2; exit 1; }; \
@@ -89,6 +89,30 @@ td-subst:
 	if "$$ts" fetch "http://127.0.0.1:$$port" "$$base" "$$e2e/fetch2" "$$e2e/pub" >/dev/null 2>&1; then echo "FAIL: fetch ACCEPTED a tampered narinfo — the signature is not load-bearing" >&2; exit 1; fi; \
 	echo "  [SELF-DISCRIMINATION] a tampered narinfo reds the fetch (the consumer falls back to building)"; \
 	kill $$spid 2>/dev/null || true; trap - EXIT; \
+	obase=`basename "$$out"`; \
+	csrv="$$scratch/consumer-served"; csd="$$scratch/consumer-build"; rm -rf "$$csrv" "$$csd"; mkdir -p "$$csrv" "$$csd/tmp"; \
+	env -i PATH="$$cu/bin" "$$tb" subst-export --paths "$$sd/td.db" "$$sd/newstore" "$$csrv" "$$out" >/dev/null || { echo "FAIL: subst-export --paths the td-subst output" >&2; exit 1; }; \
+	test -f "$$csrv/$$obase.narinfo" || { echo "FAIL: no narinfo for the td-subst output $$obase" >&2; exit 1; }; \
+	"$$ts" sign "$$csrv" "$$e2e/priv" >/dev/null; \
+	"$$ts" serve "$$csrv" 127.0.0.1:0 > "$$scratch/csrv.log" 2>&1 & cspid=$$!; \
+	trap 'kill $$cspid 2>/dev/null || true' EXIT; \
+	cport=""; for i in `seq 1 100`; do cport=`sed -n 's#.*http://127.0.0.1:\([0-9]*\)/.*#\1#p' "$$scratch/csrv.log" 2>/dev/null`; [ -n "$$cport" ] && break; sleep 0.1; done; \
+	test -n "$$cport" || { echo "FAIL: consumer-leg serve never bound a port" >&2; cat "$$scratch/csrv.log" >&2; exit 1; }; \
+	env -i HOME="$$csd" TMPDIR="$$csd/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" TD_SUBST_URL="http://127.0.0.1:$$cport" TD_SUBST_PUBKEY="$$e2e/pub" TD_SUBST_BIN="$$ts" "$$tb" build-recipe "$$scratch/subst.json" "$$lock" "$$csd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$csd/bout" 2>"$$csd/cerr" || { echo "FAIL: build-recipe with TD_SUBST_URL (consumer hook):" >&2; tail -20 "$$csd/cerr" >&2; exit 1; }; \
+	grep -qx 'CACHE=subst' "$$csd/bout" || { echo "FAIL: build-recipe did NOT substitute (no CACHE=subst) though a valid signed substitute was served" >&2; cat "$$csd/bout" >&2; tail -5 "$$csd/cerr" >&2; exit 1; }; \
+	cout=`sed -n 's/^OUT=out //p' "$$csd/bout"`; \
+	test "x$$cout" = "x$$out" || { echo "FAIL: substituted output path ($$cout) != the built output ($$out)" >&2; exit 1; }; \
+	cns="$$csd/newstore/$$obase"; test -x "$$cns/bin/td-subst" || { echo "FAIL: the substituted output has no td-subst binary at $$cns/bin/td-subst" >&2; exit 1; }; \
+	bh=`"$$tb" nar-hash "$$ns"`; sh2=`"$$tb" nar-hash "$$cns"`; \
+	test -n "$$bh" -a "x$$bh" = "x$$sh2" || { echo "FAIL: the SUBSTITUTED output differs from the built output (NAR $$sh2 != built $$bh)" >&2; exit 1; }; \
+	env -i PATH="$$cu/bin" "$$cns/bin/td-subst" keygen "$$csd/runprobe.priv" "$$csd/runprobe.pub" >/dev/null 2>&1 || { echo "FAIL: the substituted td-subst binary does not run (keygen)" >&2; exit 1; }; \
+	echo "  [DURABLE behavioral] CONSUMER HOOK: build-recipe with TD_SUBST_URL FETCHED td-subst's own output into a FRESH store (CACHE=subst) instead of rebuilding it — substituted == built byte-identical, and the substituted binary runs"; \
+	"$$ts" keygen "$$scratch/wrong.priv" "$$scratch/wrong.pub" >/dev/null; \
+	if env -i PATH="$$cu/bin" "$$ts" fetch "http://127.0.0.1:$$cport" "$$obase" "$$scratch/wrongfetch" "$$scratch/wrong.pub" >/dev/null 2>&1; then echo "FAIL: the consumer's fetch step ACCEPTED a wrong public key — the signature is not load-bearing in the consumer path" >&2; exit 1; fi; \
+	echo "  [SELF-DISCRIMINATION] a wrong public key reds the consumer's fetch step (the exact command try_substitute shells) -> it returns None -> build-recipe falls back to building"; \
+	echo "  [SELF-DISCRIMINATION] TD_SUBST_URL is load-bearing: the from-source build above ran with NO url; only this run (url set) yielded CACHE=subst without rebuilding"; \
+	kill $$cspid 2>/dev/null || true; trap - EXIT; \
+	rm -rf "$$csrv" "$$csd" "$$scratch/wrong.priv" "$$scratch/wrong.pub" "$$scratch/wrongfetch" "$$scratch/csrv.log"; \
 	if [ -n "$$hit" ] && [ -f "$$sd/verified-reproducible" ]; then \
 	  echo "  [DURABLE repro] CACHED: recipe unchanged + previously verified reproducible — td-builder check skipped"; \
 	else \
@@ -100,4 +124,4 @@ td-subst:
 	  echo "  [DURABLE repro] td-builder check double-build agrees the td-subst build is reproducible"; \
 	fi; \
 	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err" "$$scratch/run.err" "$$e2e"; mkdir -p "$$scratch/tmp"; \
-	echo "PASS: td built td-subst (its own substitute server) from source via td-builder build-recipe — the closure resolved from pinned static.crates.io fetches (no specification->package, no network), the .drv assembled + realized by td with its BUILDER the td-bootstrapped stage0 and guix/Guile SCRUBBED FROM PATH; the td-built td-subst signs+serves+fetches+verifies over loopback and reds on a tampered narinfo / corrupted nar / wrong key (durable behavioral + self-discrimination, offline); it proves FETCH-DON'T-BUILD end-to-end (td placed a path, td-subst served it signed, td fetched+restored it BYTE-IDENTICAL without building it); and the build is reproducible by td's own double-build (durable). td now OWNS a substitute server for its built outputs; the external fetch of seeds runs in the network PREP (§5)."
+	echo "PASS: td built td-subst (its own substitute server) from source via td-builder build-recipe — the closure resolved from pinned static.crates.io fetches (no specification->package, no network), the .drv assembled + realized by td with its BUILDER the td-bootstrapped stage0 and guix/Guile SCRUBBED FROM PATH; the td-built td-subst signs+serves+fetches+verifies over loopback and reds on a tampered narinfo / corrupted nar / wrong key (durable behavioral + self-discrimination, offline); it proves FETCH-DON'T-BUILD end-to-end (td placed a path, td-subst served it signed, td fetched+restored it BYTE-IDENTICAL without building it); the td-builder CONSUMER HOOK (build-recipe with TD_SUBST_URL) FETCHES a built output (CACHE=subst, byte-identical, runs) into a fresh store instead of rebuilding it and falls back to building on a wrong key (durable behavioral + self-discrimination); and the build is reproducible by td's own double-build (durable). td now OWNS a substitute server for its built outputs AND a consumer that uses it; the external fetch of seeds runs in the network PREP (§5)."
