@@ -82,7 +82,8 @@ td-subst:
 	"$$ts" fetch "http://127.0.0.1:$$port" "$$base" "$$e2e/fetch" "$$e2e/pub" >/dev/null || { echo "FAIL: td-subst fetch (verify) failed" >&2; cat "$$e2e/serve.log" >&2; exit 1; }; \
 	narfile=`grep '^NarFile: ' "$$e2e/fetch/$$base.narinfo" | cut -d' ' -f2`; \
 	env -i PATH="$$cu/bin" "$$tb" nar-restore "$$e2e/fetch/$$narfile" "$$e2e/restored/$$base" >/dev/null || { echo "FAIL: nar-restore the fetched substitute" >&2; exit 1; }; \
-	cmp -s "$$e2e/content" "$$e2e/restored/$$base" || { echo "FAIL: the FETCHED+restored path differs from the original (not byte-identical)" >&2; exit 1; }; \
+	oh=`"$$tb" nar-hash "$$e2e/content"`; rh=`"$$tb" nar-hash "$$e2e/restored/$$base"`; \
+		test -n "$$oh" -a "x$$oh" = "x$$rh" || { echo "FAIL: the FETCHED+restored path differs from the original (NAR $$rh != original $$oh)" >&2; exit 1; }; \
 	echo "  [DURABLE behavioral] FETCH-DON'T-BUILD: td placed $$base, the td-built td-subst signed+served it, and td fetched+restored it BYTE-IDENTICAL over loopback — a path obtained without building it"; \
 	sed -i 's/td-subst-e2e/td-subst-XXXX/' "$$e2e/served/$$base.narinfo"; \
 	if "$$ts" fetch "http://127.0.0.1:$$port" "$$base" "$$e2e/fetch2" "$$e2e/pub" >/dev/null 2>&1; then echo "FAIL: fetch ACCEPTED a tampered narinfo — the signature is not load-bearing" >&2; exit 1; fi; \
