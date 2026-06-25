@@ -191,13 +191,17 @@ upward:
      + glibc + binutils-mesboot0 — a glibc-linked make for the gcc-mesboot1 arc. Plain configure +
      `LIBS=-lc -lnss_files -lnss_dns -lresolv` (static glibc nss). Behavioral: make 3.82 parses a
      Makefile + runs a recipe → BUILT.
-   - **gcc-core-mesboot1** 🚧 (GCC 4.6.4, C — guix's gcc-core-mesboot1) — the `bootstrap-gcc-core-mesboot1`
-     gate (`mk/gates/388`): the FIRST modern modular gcc, built by gcc-mesboot0 + binutils-mesboot1 +
+   - **gcc-core-mesboot1** ✅ (GCC 4.6.4, C, #176) — the `bootstrap-gcc-core-mesboot1` gate
+     (`mk/gates/388`): the FIRST modern modular gcc, built by gcc-mesboot0 + binutils-mesboot1 +
      make-mesboot against glibc, with gmp 4.3.2 / mpfr 2.4.2 / mpc 1.0.3 unpacked **in-tree**. td's
      glibc is static-only, so (unlike guix's `-dynamic-linker`) td builds it STATIC (`LDFLAGS=-static
-     -B<glibc>/lib`, link-only so no autoconf `-E` regression); `MAKEINFO=true` skips the texinfo docs
-     (the host makeinfo rejects gcc 4.6.4's old `.texi`). Behavioral: gcc 4.6.4 compiles+links+runs C →
-     42. Then gcc-mesboot1 (adds c++) → gcc-mesboot (4.7.4) → final toolchain, `--prefix=/td/store`.
+     -B<glibc>/lib`, link-only so no autoconf `-E` regression); `MAKEINFO=true` skips the texinfo docs;
+     `cmp`/`diff` linked from the store (move-if-change in `make install`). Behavioral: gcc 4.6.4 → C → 42.
+   - **gcc-mesboot1** 🚧 (GCC 4.6.4, C AND C++ — guix's gcc-mesboot1) — the `bootstrap-gcc-mesboot1` gate
+     (`mk/gates/390`): overlays the gcc-g++-4.6.4 front-end + `--enable-languages=c,c++` (cc1plus + a
+     static libstdc++) — the c++ compiler the next gcc (gcc-mesboot 4.7.4, itself C++) needs. Behavioral:
+     gcc runs C → 42 AND g++ runs a C++ program (templates+classes) → 42. Repro: gcc+g++ drivers byte-
+     identical + both emit identical assembly. Then gcc-mesboot (4.7.4) → final toolchain, `--prefix=/td/store`.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
