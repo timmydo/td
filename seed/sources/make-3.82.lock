@@ -1,0 +1,9 @@
+# seed/sources/make-3.82.lock — GNU Make 3.82, the source-bootstrap brick 5 (gcc-toolchain) rung
+# AFTER binutils-mesboot1: GNU Make REBUILT by gcc-mesboot0 against glibc (guix's make-mesboot). The
+# tcc-built make-mesboot0 (make 3.80, mes libc) drives this build; the result is a real glibc-linked
+# make — the make the gcc-mesboot1 (4.6.4) arc needs. td-fetched, not vendored
+# (tools/warm-bootstrap-sources.sh, check.sh prelude). nix-base32 cross-checks guix's pin
+# 1rs2f9hmvy3q6zkl15jnlmnpgffm0bhw5ax0h5c7q604wqrip69x.
+url https://ftp.gnu.org/gnu/make/make-3.82.tar.gz
+sha256 3d991b33e604187c5881a0abc2e102d5b9776da5569640e73778f85d617242e7
+file make-3.82.tar.gz
