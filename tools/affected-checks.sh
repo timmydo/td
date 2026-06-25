@@ -310,7 +310,8 @@ map_path() {
 
     tools/warm-td-fetch-crates.sh)
       add_preflight shell-syntax
-      add_target rust-fetch ;;
+      add_target rust-fetch
+      add_target td-feed ;;
 
     tools/warm-cargo-proxy.sh|tests/crate-free-build.sh)
       add_preflight shell-syntax
@@ -775,6 +776,7 @@ run_self_test() {
   assert_target tests/td-feed.index td-feed
   assert_target tools/feed-ensure.sh feed-shared
   assert_target tools/warm-td-fetch-crates.sh rust-fetch
+  assert_target tools/warm-td-fetch-crates.sh td-feed
   assert_target tools/warm-cargo-proxy.sh rust-ripgrep
   assert_target feed/src/main.rs td-feed
   assert_target tests/ts/recipe-td-subst.ts td-subst
