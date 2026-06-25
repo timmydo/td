@@ -1,70 +1,31 @@
-# rust-bat — td builds `bat` (a `cat` clone with syntax highlighting) FROM SOURCE, the LAST of
-# the shipped Rust userland (procs/fd/ripgrep/sd/eza/bat, PR #80) to move from guix-packaged to
-# td-built (the uutils-`cat` pattern; move-off-Guile §5). `bat` 0.25.0 is built via `td-builder
-# build-recipe` (buildSystem "rust", noDefaultFeatures + selected features) with its FULL
-# 207-crate closure vendored as fixed-output static.crates.io fetches (sha256 == each Cargo.lock
-# checksum), pinned in tests/bat.lock. bat's default pulls git2 AND oniguruma (regex-onig) C
-# builds; the recipe builds --no-default-features with clap/etcetera/paging/wild + regex-fancy
-# (syntect's pure-Rust regex), so NO C build. The .drv is td-assembled (no guix (derivation …))
-# + realized daemon-free (no guix-daemon), guix/Guile SCRUBBED FROM PATH. Seed external (§5).
+# rust-bat — td builds `bat` (the cat replacement, 0.25.0, no git/onig C) with its WHOLE crate
+# closure (source + 207 deps) provisioned GUIX-FREE through td's OWN cargo-proxy (cargo
+# resolved + fetched it, the proxy verifying each `.crate` sha256 == the crates.io index
+# cksum); source + deps interned by store-add-recursive, vendored via TD_VENDOR_DIR. No
+# guix oracle: content-address (Cargo.lock pin == index cksum) is the oracle. Shared
+# build+assert in tests/crate-free-build.sh. The rust/gcc toolchain seed stays guix-built
+# (retired last). This completes the shipped Rust userland (procs/fd/ripgrep/sd/eza/bat) built
+# guix-free.
 #
-# ALL-DURABLE (no guix oracle): each leg stands with no Guix in the room:
-#   [STRUCTURAL] the build runs guix/Guile off PATH, the .drv carries TD_VENDOR_CRATES and its
-#     builder is the td-bootstrapped stage0.
-#   [DURABLE behavioral] the built `bat` prints a file's contents (plain style) — real cat
-#     behavior, not just --version.
-#   [DURABLE repro] td-builder check's double-build agrees the build is reproducible across the
-#     whole 207-crate graph.
+#   [DURABLE supply-chain] every vendored crate's sha256 ∈ bat's shipped Cargo.lock.
+#   [DURABLE structural] the .drv sets TD_VENDOR_DIR + references NO /gnu/store crate path.
+#   [DURABLE behavioral] the td-built `bat` prints a file's contents (plain style).
+#   [DURABLE repro] td-builder check double-build agrees the 207-crate build is reproducible.
 HEAVY_GATES += rust-bat
-# Self-contained lock (tests/bat.lock) — built by the gate itself; ordered after build-recipes
-# (a BUILD_GATE) so its cargo build doesn't oversubscribe the corpus fan-out.
 BUILD_GATES += rust-bat
 rust-bat:
-	@echo ">> rust-bat: td builds 'bat' (0.25.0, 207 vendored deps, no git/onig C) from source via build-recipe (offline, guix/Guile off PATH); it prints a file + is reproducible"
+	@echo ">> rust-bat: td builds 'bat' (0.25.0, 207 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); bat prints a file; reproducible; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; tb="$$TB"; \
-	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
-	echo "  [DURABLE structural] ts-emit evaluates with td's OWN td-ts-eval ($$TD_TS_EVAL) — not the guix-built one (brick 4c)"; \
-	lock="$(CURDIR)/tests/bat.lock"; \
-	test -s "$$lock" || { echo "ERROR: no lock $$lock" >&2; exit 1; }; \
-	cu=`grep -- '-coreutils-' "$$lock" | sed 's/^[^ ]* //' | head -1`; \
-	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
-	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
-	ncrate=`grep -cE '\.crate /gnu/store/' "$$lock"`; \
-	test "$$ncrate" -ge 150 || { echo "ERROR: lock has <150 vendored .crate deps ($$ncrate) — regenerate from bat's Cargo.lock" >&2; exit 1; }; \
-	scratch="$(CURDIR)/.td-build-cache/rust-bat"; mkdir -p "$$scratch/tmp" "$$scratch/b"; rm -f "$$scratch/b/"*.drv; \
-	grep ' /gnu/store/' "$$lock" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the seed + source + vendored .crate deps (warm static.crates.io fetches; regenerate the lock on a channel/dep bump)" >&2; exit 1; }; \
-	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-bat.ts" > "$$scratch/bat.json"; \
-	test -s "$$scratch/bat.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
-	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/bat.json" "$$lock" "$$sd" /var/guix/db/db.sqlite > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe bat build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
-	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
-	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
-	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; fi; \
-	ns="$$sd/newstore/`basename "$$out"`"; \
-	test -x "$$ns/bin/bat" || { echo "FAIL: bat build produced no 'bat' binary at $$ns/bin/bat" >&2; exit 1; }; \
-	grep -q 'TD_VENDOR_CRATES' "$$sd"/*.drv || { echo "FAIL: the .drv lacks TD_VENDOR_CRATES — the vendored path was not taken" >&2; exit 1; }; \
-	test -n "$$TD_BUILDER_PATH" || { echo "FAIL: TD_BUILDER_PATH unset — load_stage0 did not place a stage0 builder" >&2; exit 1; }; \
-	grep -qF "$$TD_BUILDER_PATH/bin/td-builder" "$$sd"/*.drv || { echo "FAIL: the .drv builder is not the stage0 $$TD_BUILDER_PATH — built by the wrong td-builder?" >&2; exit 1; }; \
-	echo "  [DURABLE structural] the .drv builder is the td-bootstrapped stage0 ($$TD_BUILDER_PATH) — not the guix-built td-builder (brick 3b)"; \
-	if [ -n "$$hit" ]; then echo "  [STRUCTURAL] CACHE HIT — recipe unchanged, reused td's prior bat build (no rebuild): $$out"; else echo "  [STRUCTURAL] td assembled + realized the .drv (TD_VENDOR_CRATES, $$ncrate deps) with guix/Guile off PATH: $$out"; fi; \
-	printf 'hello from td-built bat\nsecond line\n' > "$$scratch/sample.txt"; \
-	got=`"$$ns/bin/bat" --style=plain --paging=never --color=never "$$scratch/sample.txt"`; \
+	tsgo=`sh tests/tsgo.sh`; test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
+	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
+	nsout=`sh tests/crate-free-build.sh bat bat-0.25.0 tests/bat.lock bat-source tests/ts/recipe-bat.ts` || exit 1; \
+	eval "$$nsout"; ns="$$NS"; \
+	test -x "$$ns/bin/bat" || { echo "FAIL: no bat binary at $$ns/bin/bat" >&2; exit 1; }; \
+	btmp="$(CURDIR)/.td-build-cache/bat-crate-free/btmp"; rm -rf "$$btmp"; mkdir -p "$$btmp"; \
+	printf 'hello from td-built bat\nsecond line\n' > "$$btmp/sample.txt"; \
+	got=`"$$ns/bin/bat" --style=plain --paging=never --color=never "$$btmp/sample.txt"`; \
 	echo "$$got" | grep -q 'hello from td-built bat' && echo "$$got" | grep -q 'second line' || { echo "FAIL: td-built bat did not print the file contents (got: $$got)" >&2; exit 1; }; \
-	echo "  [DURABLE behavioral] the td-built 'bat' printed the file's contents (plain style) — it works as cat"; \
-	rm -f "$$scratch/sample.txt"; \
-	if [ -n "$$hit" ] && [ -f "$$sd/verified-reproducible" ]; then \
-	  echo "  [DURABLE repro] CACHED: recipe unchanged + previously verified reproducible — td-builder check skipped (verdict memoized)"; \
-	else \
-	  rm -rf "$$scratch/chk"; "$$tb" check "$$sd"/*.drv "$$sd/closure.txt" "$$scratch/chk" > "$$scratch/checkout.txt" 2>"$$scratch/chk.err" \
-	    || { echo "FAIL: rust-bat NOT reproducible (td-builder check):" >&2; tail -6 "$$scratch/checkout.txt" "$$scratch/chk.err" >&2; exit 1; }; \
-	  grep -qE "^CHECK out $$out sha256:[0-9a-f]+ reproducible$$" "$$scratch/checkout.txt" \
-	    || { echo "FAIL: td-builder check did not confirm $$out reproducible:" >&2; cat "$$scratch/checkout.txt" >&2; exit 1; }; \
-	  : > "$$sd/verified-reproducible"; \
-	  echo "  [DURABLE repro] td-builder check double-build agrees the 207-crate bat build is reproducible"; \
-	fi; \
-	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err"; mkdir -p "$$scratch/tmp"; \
-	echo "PASS: td built 'bat' (0.25.0, no git/onig C) from source via td-builder build-recipe — the full 207-crate dependency closure + the crate source resolved from pinned static.crates.io fetches (no specification->package, no network), the cargo vendor dir assembled by td's run_rust, the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; the binary works as bat (prints a file, durable) and is reproducible by td's own double-build across the whole graph (durable). The shipped Rust userland is now COMPLETE from source. The rustc/cargo/gcc seed + locked deps stay external (§5, retired last)."
+	echo "  [DURABLE behavioral] the td-built 'bat' (guix-free crates) printed the file's contents (plain style) — it works as cat"; \
+	rm -rf "$$btmp"; \
+	echo "PASS: rust-bat — bat (0.25.0) built with its 207-crate closure provisioned GUIX-FREE via td's cargo-proxy (Cargo.lock-pinned, sha == crates.io cksum, no guix build / no /gnu/store FOD), source+vendor interned by store-add-recursive, built via TD_VENDOR_DIR with guix off PATH; bat prints a file; reproducible — the shipped Rust userland (procs/fd/ripgrep/sd/eza/bat) now builds guix-free. NO oracle (content-address = the upstream pin). Toolchain seed retired last."
