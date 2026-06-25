@@ -1500,6 +1500,27 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // The inverse of nar-hash's serializer: restore NARFILE onto DEST (which must
+        // not already exist). The read side of the codec the substitute consumer uses to
+        // unpack a fetched NAR; strict — a truncated/garbled archive errors, never a
+        // partial tree.
+        Some("nar-restore") if args.len() == 4 => {
+            let (narfile, dest) = (&args[2], &args[3]);
+            let run = || -> std::io::Result<()> {
+                let mut r = std::io::BufReader::new(std::fs::File::open(narfile)?);
+                nar::read_nar(&mut r, Path::new(dest))
+            };
+            match run() {
+                Ok(()) => {
+                    println!("td-builder: restored {narfile} -> {dest}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: nar-restore {narfile} {dest}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // S3a — parse the ATerm drv and print the canonical dump.
         Some("drv-parse") if args.len() == 3 => match std::fs::read(&args[2]) {
             Ok(bytes) => match drv::parse(&bytes) {
@@ -3609,6 +3630,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("usage: td-builder            # print the S1 sentinel");
             eprintln!("       td-builder nar-hash PATH");
+            eprintln!("       td-builder nar-restore NARFILE DEST");
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");

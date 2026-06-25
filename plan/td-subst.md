@@ -38,9 +38,8 @@ daemon" — the primitives already exist in td-builder.
 nar.rs's header comment. Needed by the consumer to unpack a fetched substitute.
 
 ## Increment ladder
-- [ ] **Inc1** — `nar::read_nar` + a verified-red round-trip test
-      (write_nar(dir) → read_nar → identical tree; + a self-discrimination control:
-      a truncated/garbled NAR errors). VERIFY RED FIRST.
+- [x] **Inc1** — `nar::read_nar` (inverse of write_nar) + `nar-restore NARFILE DEST`
+      CLI (the read side, wired so it isn't dead code) + 3 verified-red unit tests.
 - [ ] **Inc2** — `subst/` binary: `publish` / `serve` / `selftest`, loopback green
       (publish a tiny path → serve → fetch → read_nar unpack → byte-identical).
 - [ ] **Inc3** — ed25519 signing of the metadata + pinned-key verify on the consumer;
@@ -52,5 +51,15 @@ nar.rs's header comment. Needed by the consumer to unpack a fetched substitute.
 ## Verified-red evidence
 (record per-increment here)
 
-### Inc1
-- (pending)
+### Inc1 (2026-06-24, all reverted after observing red; final state green 61/61)
+Three targeted single-point perturbations, each isolating exactly one new assertion:
+- **read_nar_round_trips_a_tree** — set the restored mode to 0o644 always (ignore the
+  executable bit) → the re-serialized NAR drops the "executable" token → ONLY this test
+  red (panicked at the exec-bit assertion); other 5 green.
+- **read_nar_rejects_a_truncated_archive** — `let _ = read_node(..); Ok(())` (tolerate a
+  partial restore) → ONLY this test red (read_nar returned Ok on a truncated stream);
+  other 5 green.
+- **read_nar_rejects_bad_magic** — skip the magic-token check → ONLY this test red (a
+  valid body behind a wrong magic restored); other 5 green.
+Each reverted via `git checkout -- builder/src/nar.rs` (Inc1 was committed first, so the
+revert restored the green state without losing work). Re-confirmed green after each.
