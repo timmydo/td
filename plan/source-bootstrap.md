@@ -201,12 +201,22 @@ upward:
      (`mk/gates/390`): overlays the gcc-g++-4.6.4 front-end + `--enable-languages=c,c++` (cc1plus + a
      static libstdc++) — the c++ compiler the next gcc (gcc-mesboot, GCC 4.9, itself C++) needs.
      Behavioral: gcc runs C → 42 AND g++ runs a C++ program → 42; repro gcc+g++ drivers + output.
-   - **binutils-mesboot + gawk-mesboot** 🚧 — the `bootstrap-binutils-gawk-mesboot` gate (`mk/gates/392`):
-     the gcc-mesboot1 (c++) toolchain rebuilds binutils 2.20.1a (guix's binutils-mesboot) AND builds GNU
-     awk 3.1.8 (guix's gawk-mesboot) — the two tools glibc-mesboot 2.16.0 needs (its versions.awk is too
-     complex for the seed's gash awk). Behavioral: as+ld assemble+link+run C → 42; gawk processes text
-     (`'{print $2}'` → beta) + sums 10+20+12 → 42. Repro: byte-identical as+ld+gawk. Then glibc-mesboot
-     (2.16.0) → gcc-mesboot (GCC 4.9, the final mesboot gcc) → final toolchain, `--prefix=/td/store`.
+   - **binutils-mesboot + gawk-mesboot** ✅ (#179) — the `bootstrap-binutils-gawk-mesboot` gate
+     (`mk/gates/392`): the gcc-mesboot1 (c++) toolchain rebuilds binutils 2.20.1a (guix's binutils-mesboot)
+     AND builds GNU awk 3.1.8 (guix's gawk-mesboot) — the two tools glibc-mesboot 2.16.0 needs. Behavioral:
+     as+ld → C → 42; gawk `'{print $2}'` → beta + sums → 42. Repro: byte-identical as+ld+gawk.
+   - **glibc-mesboot** ✅ DONE (2026-06-25, #183) (GNU libc 2.16.0, guix's glibc-mesboot) — the `bootstrap-glibc-mesboot` gate
+     (`mk/gates/394`): the MODERN, nptl-threaded C library, built by gcc-mesboot1 + binutils-mesboot +
+     gawk-mesboot in two stages (bootstrap headers → full nptl library). td builds it STATIC (guix shared:
+     a shared build made the new libnsl.so leak the old static glibc-mesboot0's non-TLS errno); the BUILD
+     tools get glibc-mesboot0+kernel headers via C_INCLUDE_PATH (target objects use -nostdinc). Library-only:
+     drop the nscd program + texinfo `manual` (don't link/run statically), empty soversions.mk for install.
+     Behavioral (green): a C program AND a pthread (nptl) program link statically + run → 42; repro: crt
+     objects + a linked nptl program byte-identical across two builds. Two sandbox-only gotchas the cached
+     dev harness can't see: the lock is named `glibc-mesboot-2.16.0.lock` so `glibc-*.lock|head -1` still
+     resolves the chain's 2.2.5; Makeconfig's `SHELL := /bin/sh` + ~14 script shebangs are sed'd to the
+     curated `sh` (the loop sandbox has no `/bin/sh`). Then gcc-mesboot (GCC 4.9,
+     the final mesboot gcc) → final toolchain, `--prefix=/td/store`.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
