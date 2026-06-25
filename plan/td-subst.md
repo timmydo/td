@@ -74,13 +74,19 @@ nar.rs's header comment. Needed by the consumer to unpack a fetched substitute.
       dep-free), then `restore_substitute` (nar::read_nar + re-verify NarHash) + registers,
       writing the same registration + td.db a build writes → `CACHE=subst`. OFF unless
       `TD_SUBST_URL` is set (loop never sets it → directive 1 preserved). Verified-red below.
-- [~] **Inc4b** — WRITTEN + committed (mk/gates/358-td-subst.mk + tests/td-subst.lock +
-      recipe-td-subst.ts + subst/Cargo.lock pinned to td-feed's versions). The end-to-end
-      demo logic is PROVEN locally with the real binaries (e2e: store-add-text → subst-export
-      → sign → serve → fetch → nar-restore byte-identical + tamper-reject), and the
-      from-source build half mirrors the proven td-feed gate. NOT yet seen green in-sandbox:
-      `./check.sh td-subst` on a cold worktree rebuilds the whole corpus first (multi-hour) —
-      CI on the warm image is the authoritative confirmation. Spec below.
+- [x] **Inc4b** — GREEN in-sandbox (2026-06-25). `./check.sh td-subst` passes end-to-end:
+      td builds td-subst from source (cache-hit on the warm corpus), `selftest` round-trips
+      over loopback with all three self-discrimination legs red, the FETCH-DON'T-BUILD demo
+      restores byte-identical, the tampered-narinfo leg reds the fetch, and `td-builder check`
+      double-build agrees it is reproducible. Files: mk/gates/358-td-subst.mk +
+      tests/td-subst.lock + recipe-td-subst.ts + subst/Cargo.lock (pinned to td-feed's
+      versions). One in-sandbox fix during validation: the byte-identity check used `cmp`
+      (diffutils, NOT on the loop sandbox PATH → `cmp: command not found`) — replaced with
+      `td-builder nar-hash` equality (td's OWN serializer, always present, durable). Spec below.
+      Affected-checks mappings for subst/* + tests/td-subst.lock + the td-subst recipe added
+      so a subst-only diff classifies to check-engine + the td-subst gate and waives the full
+      loop. Rebased clean onto origin/main (#169/#172/#173 crate-free-diverge — feed.lock not
+      yet diverged, so td-subst.lock mirroring it at 80 /gnu/store strings stays consistent).
 - [ ] **Inc4b (spec)** — the durable end-to-end gate `mk/gates/<NNN>-td-subst.mk` + a
       `tests/td-subst.lock` (subst's vendored closure, == td-feed's) + a pinned
       `tests/td-subst.pub`: build a real recipe → `subst-export` its td.db closure → `sign`
@@ -139,3 +145,12 @@ CONTENTS, structure intact, so read_nar still parses → the NarHash check is th
   legs stayed green, so the guard is isolated. Reverted via `git checkout`; reconfirmed green.
 (Loop-safety — `TD_SUBST_URL` unset → `try_substitute` returns None immediately — is covered
 by the full builder suite still passing 63/63 with the env unset, the loop's actual state.)
+
+### Inc4b in-sandbox byte-identity leg (2026-06-25; perturb the gate, revert, reconfirm green)
+The FETCH-DON'T-BUILD leg asserts the fetched+restored path == the original. `cmp` is not in
+the loop sandbox (no diffutils) → swapped to `td-builder nar-hash` equality. Verified-red:
+appended `VERIFIED-RED-PERTURBATION` to the restored path just before the comparison →
+`./check.sh td-subst` red at exactly that line — `FAIL: the FETCHED+restored path differs
+from the original (NAR sha256:378e1494… != original sha256:34eb8bb7…)`, make Error 1, no PASS
+line. Reverted via `git checkout` (the nar-hash fix was committed first); reconfirmed the
+gate green end-to-end in-sandbox. The nar-hash equality leg is load-bearing, not vacuous.
