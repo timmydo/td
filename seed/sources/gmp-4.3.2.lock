@@ -1,0 +1,7 @@
+# seed/sources/gmp-4.3.2.lock — GNU MP 4.3.2, a math-library dependency of GCC 4.6.4
+# (gcc-core-mesboot1). Unpacked INTO the gcc source tree and built in-tree (guix's gmp-boot), so the
+# bootstrap needs no pre-built GMP. td-fetched. nix-base32 cross-checks guix's pin
+# 15rwq54fi3s11izas6g985y9jklm3xprfsmym3v1g6xr84bavqvv.
+url https://ftp.gnu.org/gnu/gmp/gmp-4.3.2.tar.gz
+sha256 7be3ad1641b99b17f6a8be6a976f1f954e997c41e919ad7e0c418fe848c13c97
+file gmp-4.3.2.tar.gz
