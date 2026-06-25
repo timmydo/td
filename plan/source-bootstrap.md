@@ -197,11 +197,16 @@ upward:
      glibc is static-only, so (unlike guix's `-dynamic-linker`) td builds it STATIC (`LDFLAGS=-static
      -B<glibc>/lib`, link-only so no autoconf `-E` regression); `MAKEINFO=true` skips the texinfo docs;
      `cmp`/`diff` linked from the store (move-if-change in `make install`). Behavioral: gcc 4.6.4 → C → 42.
-   - **gcc-mesboot1** 🚧 (GCC 4.6.4, C AND C++ — guix's gcc-mesboot1) — the `bootstrap-gcc-mesboot1` gate
+   - **gcc-mesboot1** ✅ (GCC 4.6.4, C AND C++, #178) — the `bootstrap-gcc-mesboot1` gate
      (`mk/gates/390`): overlays the gcc-g++-4.6.4 front-end + `--enable-languages=c,c++` (cc1plus + a
-     static libstdc++) — the c++ compiler the next gcc (gcc-mesboot 4.7.4, itself C++) needs. Behavioral:
-     gcc runs C → 42 AND g++ runs a C++ program (templates+classes) → 42. Repro: gcc+g++ drivers byte-
-     identical + both emit identical assembly. Then gcc-mesboot (4.7.4) → final toolchain, `--prefix=/td/store`.
+     static libstdc++) — the c++ compiler the next gcc (gcc-mesboot, GCC 4.9, itself C++) needs.
+     Behavioral: gcc runs C → 42 AND g++ runs a C++ program → 42; repro gcc+g++ drivers + output.
+   - **binutils-mesboot + gawk-mesboot** 🚧 — the `bootstrap-binutils-gawk-mesboot` gate (`mk/gates/392`):
+     the gcc-mesboot1 (c++) toolchain rebuilds binutils 2.20.1a (guix's binutils-mesboot) AND builds GNU
+     awk 3.1.8 (guix's gawk-mesboot) — the two tools glibc-mesboot 2.16.0 needs (its versions.awk is too
+     complex for the seed's gash awk). Behavioral: as+ld assemble+link+run C → 42; gawk processes text
+     (`'{print $2}'` → beta) + sums 10+20+12 → 42. Repro: byte-identical as+ld+gawk. Then glibc-mesboot
+     (2.16.0) → gcc-mesboot (GCC 4.9, the final mesboot gcc) → final toolchain, `--prefix=/td/store`.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
