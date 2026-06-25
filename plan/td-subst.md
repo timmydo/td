@@ -100,6 +100,23 @@ nar.rs's header comment. Needed by the consumer to unpack a fetched substitute.
       end-to-end locally: store-add-text → subst-export → sign → serve → fetch → nar-restore
       round-trips byte-identical + a tampered narinfo reds the fetch (logic for the gate's
       behavioral assertions).
+- [x] **Inc5** — the CONSUMER HOOK end-to-end (2026-06-25). #171 proved the server + `td-subst
+      fetch` + `nar-restore`, but never the production path: `build-recipe` with `TD_SUBST_URL`
+      FETCHING a built output instead of rebuilding it (the original Inc4 acceptance criterion;
+      the hook was only unit-tested). Two parts: (a) **engine** — `subst-export --paths`
+      (per-output export, NO closure walk; refactored into `subst_export_members(walk_closure)`)
+      because a build output's external refs (glibc, gcc-toolchain) are recorded in the build
+      td.db but NOT staged in its newstore, so closure-mode export of a build output fails — and
+      the consumer fetches per-output anyway (deps assumed present). Unit-tested both modes +
+      verified-red. (b) **gate leg** — subst-export --paths the td-subst output → sign+serve on
+      loopback → re-run build-recipe for the SAME recipe in a FRESH scratch with TD_SUBST_URL →
+      assert `CACHE=subst` + substituted == built byte-identical (`nar-hash`) + the substituted
+      binary runs; self-discrimination: a wrong public key reds the consumer fetch, and
+      TD_SUBST_URL is load-bearing (the from-source build above ran with no url). Validated via a
+      cached-chain dev harness (the --paths binary + warm #171 subst artifacts, no corpus
+      rebuild): all consumer assertions pass; empty-server verified-red shows build-recipe falls
+      back to building (no CACHE=subst). Full in-sandbox `./check.sh td-subst` rebuilds the corpus
+      (builder fingerprint flip) — running for landing authority.
 
 ## Verified-red evidence
 (record per-increment here)
@@ -154,3 +171,17 @@ appended `VERIFIED-RED-PERTURBATION` to the restored path just before the compar
 from the original (NAR sha256:378e1494… != original sha256:34eb8bb7…)`, make Error 1, no PASS
 line. Reverted via `git checkout` (the nar-hash fix was committed first); reconfirmed the
 gate green end-to-end in-sandbox. The nar-hash equality leg is load-bearing, not vacuous.
+
+### Inc5 (2026-06-25; subst-export --paths + the consumer hook)
+- **engine** — `subst_export_members_paths_only_exports_roots_not_their_closure`: perturbed the
+  helper to ignore `walk_closure` (always walk) → paths-only returned 2 paths not 1 → the test
+  red (`left: 2, right: 1`). Committed green first, reverted via `git checkout`. The `--paths`
+  flag is load-bearing.
+- **gate consumer leg** — validated via a cached-chain dev harness (the cargo-built --paths
+  binary + the warm #171 subst artifacts + the old stage0 as TD_BUILDER_PATH, so the assembled
+  drv's output == the served `$out`): positive run printed `CACHE=subst` + `OUT=out <$out>`,
+  substituted == built byte-identical (`sha256:e8796d…`), the substituted binary runs, and a
+  wrong public key reds the consumer fetch. Verified-red (the load-bearing `CACHE=subst`): an
+  EMPTY served dir → `td-subst fetch` 404 → `try_substitute` returns None → build-recipe printed
+  NO `CACHE=subst` and fell back ("no verified substitute for … (status code 404); building" →
+  "build-recipe assembled …drv"). The gate leg mirrors this exact flow in-sandbox.
