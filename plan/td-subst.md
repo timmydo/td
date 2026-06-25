@@ -63,10 +63,12 @@ nar.rs's header comment. Needed by the consumer to unpack a fetched substitute.
 - [x] **Inc2** — `td-builder subst-export DB STORE OUTDIR ROOT...`: the store-coupled,
       dependency-free half — writes `<basename>.narinfo` + `nar/<narhash>.nar` per closure
       member (reuses nar::write_nar + store_db_read + Refs closure). Verified-red below.
-- [ ] **Inc2b** — `subst/` binary: `serve` / `fetch` / `selftest`, loopback green
-      (serve an exported dir → fetch → read_nar unpack → byte-identical). Networked half.
-- [ ] **Inc3** — ed25519 signing of the metadata + pinned-key verify on the consumer;
-      self-discrimination legs (corrupt NAR, bad signature, tampered narhash all red).
+- [x] **Inc2b+Inc3** — `subst/` binary (the networked + crypto half, shares feed's
+      ureq+rustls/ring+sha2 closure): `keygen` / `sign` / `serve` / `fetch` / `selftest`.
+      ed25519 (ring) signs each narinfo; `fetch` verifies the Sig against a pinned public
+      key, then re-checks the nar's sha256 == NarHash. `selftest` is a self-contained
+      loopback round-trip with three self-discrimination legs (tampered narinfo, corrupted
+      nar, wrong key all red the fetch). Builds offline + selftest green. Verified-red below.
 - [ ] **Inc4** — td-builder consumer hook (substitute-or-build before
       build_and_register, OFF for the loop) + the durable fetch-instead-of-build gate
       `mk/gates/<NNN>-td-subst.mk`.
@@ -97,3 +99,12 @@ Test: `subst_export_writes_narinfos_and_restorable_nars`.
   write_nar at the nar output dir is self-referential and HANGS rather than failing
   cleanly; the constant-wrong-hash perturbation is the clean equivalent.)
 Both reverted via `git checkout`; reconfirmed green.
+
+### Inc2b+Inc3 (2026-06-24; perturb `subst/`, revert, reconfirm `selftest` OK)
+`td-subst selftest` over loopback. Its three self-discrimination legs are load-bearing:
+- **signature** — `verify_msg` returns `true` always → selftest died at the tampered-narinfo
+  leg ("fetch ACCEPTED a tampered narinfo — the signature is not load-bearing", rc=1).
+- **NarHash** — skip the `got != want` sha256 check → selftest died at the corrupted-nar
+  leg ("fetch ACCEPTED a corrupted nar — the NarHash check is not load-bearing", rc=1).
+(The wrong-key leg rides the same `verify_msg` path as the signature leg.)
+Both reverted via `git checkout`; reconfirmed `selftest OK` rc=0.
