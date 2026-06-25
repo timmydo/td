@@ -104,6 +104,157 @@ pub fn write_nar(out: &mut impl Write, path: &Path) -> io::Result<()> {
     write_node(out, path)
 }
 
+// ---- read side: restore a NAR stream back onto disk (the inverse of write_nar) ----
+// Used by the substitute consumer to unpack a fetched NAR into the store. The reader is
+// the exact mirror of the writer above: same little-endian length + zero-pad framing,
+// same node grammar. It is strict on purpose — a truncated or garbled archive (a
+// corrupted download) must ERROR, never restore a partial tree, so the caller can fall
+// back to building. The NAR hash is verified by the caller against the signed metadata
+// before this runs; the bounds here are defence-in-depth against a malformed stream.
+
+/// Cap on a framed token/name/symlink-target read (file contents stream separately, so
+/// they are never bound by this): a larger frame means a corrupt or hostile archive.
+const MAX_NAR_TOKEN: u64 = 1 << 20;
+
+fn invalid(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+fn read_u64(input: &mut impl Read) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    input.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// Consume the zero padding that follows a `len`-byte frame, asserting it is zero (a
+/// non-zero pad is a malformed archive).
+fn read_padding(input: &mut impl Read, len: u64) -> io::Result<()> {
+    let pad = (8 - (len % 8) as usize) % 8;
+    if pad > 0 {
+        let mut b = [0u8; 8];
+        input.read_exact(&mut b[..pad])?;
+        if b[..pad].iter().any(|&x| x != 0) {
+            return Err(invalid("non-zero NAR frame padding"));
+        }
+    }
+    Ok(())
+}
+
+/// Read one framed token/name/target (small, capped). EOF mid-frame errors.
+fn read_framed(input: &mut impl Read) -> io::Result<Vec<u8>> {
+    let len = read_u64(input)?;
+    if len > MAX_NAR_TOKEN {
+        return Err(invalid(format!("NAR token of {len} bytes exceeds cap")));
+    }
+    let mut buf = vec![0u8; len as usize];
+    input.read_exact(&mut buf)?;
+    read_padding(input, len)?;
+    Ok(buf)
+}
+
+/// Read a framed token and require it to equal WANT.
+fn expect(input: &mut impl Read, want: &str) -> io::Result<()> {
+    let got = read_framed(input)?;
+    if got != want.as_bytes() {
+        return Err(invalid(format!(
+            "expected NAR token {want:?}, got {:?}",
+            String::from_utf8_lossy(&got)
+        )));
+    }
+    Ok(())
+}
+
+/// Stream exactly `n` bytes from INPUT to OUT (read_exact in chunks: a short read at EOF
+/// errors, so a truncated contents frame can never be restored as a partial file).
+fn copy_n(input: &mut impl Read, out: &mut impl Write, mut n: u64) -> io::Result<()> {
+    let mut buf = [0u8; 65536];
+    while n > 0 {
+        let want = n.min(buf.len() as u64) as usize;
+        input.read_exact(&mut buf[..want])?;
+        out.write_all(&buf[..want])?;
+        n -= want as u64;
+    }
+    Ok(())
+}
+
+fn read_node(input: &mut impl Read, path: &Path) -> io::Result<()> {
+    expect(input, "(")?;
+    expect(input, "type")?;
+    match read_framed(input)?.as_slice() {
+        b"regular" => {
+            // Optional ["executable", ""] precedes "contents".
+            let mut tok = read_framed(input)?;
+            let exec = tok == b"executable";
+            if exec {
+                if !read_framed(input)?.is_empty() {
+                    return Err(invalid("NAR 'executable' not followed by empty token"));
+                }
+                tok = read_framed(input)?;
+            }
+            if tok != b"contents" {
+                return Err(invalid("expected NAR 'contents' token"));
+            }
+            let len = read_u64(input)?;
+            let mut f = fs::File::create(path)?;
+            copy_n(input, &mut f, len)?;
+            read_padding(input, len)?;
+            drop(f);
+            // Restore only what NAR encodes: the executable bit (mode & 0o100).
+            let mode = if exec { 0o755 } else { 0o644 };
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+            expect(input, ")")
+        }
+        b"symlink" => {
+            expect(input, "target")?;
+            let target = read_framed(input)?;
+            // OsStr round-trip keeps a non-UTF-8 target intact (mirror of write_node).
+            let target = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&target) };
+            std::os::unix::fs::symlink(target, path)?;
+            expect(input, ")")
+        }
+        b"directory" => {
+            fs::create_dir(path)?;
+            loop {
+                match read_framed(input)?.as_slice() {
+                    b")" => return Ok(()),
+                    b"entry" => {}
+                    other => {
+                        return Err(invalid(format!(
+                            "expected NAR 'entry' or ')', got {:?}",
+                            String::from_utf8_lossy(other)
+                        )))
+                    }
+                }
+                expect(input, "(")?;
+                expect(input, "name")?;
+                let name = read_framed(input)?;
+                // Reject any name that could escape the directory.
+                if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+                    return Err(invalid("unsafe NAR entry name"));
+                }
+                expect(input, "node")?;
+                let child = path.join(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&name) });
+                read_node(input, &child)?;
+                expect(input, ")")?;
+            }
+        }
+        other => Err(invalid(format!(
+            "unknown NAR node type {:?}",
+            String::from_utf8_lossy(other)
+        ))),
+    }
+}
+
+/// Restore a NAR stream from INPUT onto DEST (which must not already exist). The inverse
+/// of `write_nar`: `write_nar(.., p)` then `read_nar(.., q)` reconstructs the tree at `p`
+/// under `q` (same contents, executable bits, symlink targets, directory structure).
+pub fn read_nar(input: &mut impl Read, dest: &Path) -> io::Result<()> {
+    if read_framed(input)? != b"nix-archive-1" {
+        return Err(invalid("not a NAR (bad magic)"));
+    }
+    read_node(input, dest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +296,89 @@ mod tests {
         want.extend(framed(b")"));
         assert_eq!(got, want);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Build a small but type-complete tree under DIR: a plain file, an executable
+    /// file, a symlink, and a nested directory with its own file.
+    fn build_tree(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("a"), b"plain\n").unwrap();
+        let run = dir.join("run");
+        fs::write(&run, b"#!/bin/sh\necho hi\n").unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("a", dir.join("lnk")).unwrap();
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("nested"), b"deep\n").unwrap();
+    }
+
+    #[test]
+    fn read_nar_round_trips_a_tree() {
+        // write_nar(tree) -> read_nar -> the reconstruction re-serializes to the SAME
+        // NAR. This is the durable inverse-property check: no Guix oracle in the room.
+        let base = std::env::temp_dir().join(format!("td-nar-rt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        build_tree(&src);
+
+        let mut nar = Vec::new();
+        write_nar(&mut nar, &src).unwrap();
+
+        let dst = base.join("dst");
+        read_nar(&mut nar.as_slice(), &dst).unwrap();
+
+        let mut nar2 = Vec::new();
+        write_nar(&mut nar2, &dst).unwrap();
+        assert_eq!(nar, nar2, "restored tree did not re-serialize identically");
+
+        // Durable behavioral legs the byte-compare also implies, asserted directly:
+        assert_eq!(fs::read(dst.join("a")).unwrap(), b"plain\n");
+        assert_eq!(fs::read(dst.join("sub").join("nested")).unwrap(), b"deep\n");
+        assert_eq!(fs::read_link(dst.join("lnk")).unwrap(), Path::new("a"));
+        let run_mode = fs::symlink_metadata(dst.join("run")).unwrap().permissions().mode();
+        assert!(run_mode & 0o100 != 0, "executable bit lost on restore");
+        let a_mode = fs::symlink_metadata(dst.join("a")).unwrap().permissions().mode();
+        assert!(a_mode & 0o100 == 0, "plain file restored executable");
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn read_nar_rejects_a_truncated_archive() {
+        // A corrupted/short download must error, never restore a partial tree — so the
+        // consumer can fall back to building. (Self-discrimination: the read is strict.)
+        let base = std::env::temp_dir().join(format!("td-nar-trunc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        build_tree(&src);
+        let mut nar = Vec::new();
+        write_nar(&mut nar, &src).unwrap();
+        nar.truncate(nar.len() - 24); // cut mid-stream
+
+        let dst = base.join("dst");
+        assert!(
+            read_nar(&mut nar.as_slice(), &dst).is_err(),
+            "read_nar accepted a truncated NAR"
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn read_nar_rejects_bad_magic() {
+        // A fully valid NAR whose ONLY defect is the magic token — so the magic check is
+        // the only thing that can reject it (the body would otherwise restore fine).
+        let base = std::env::temp_dir().join(format!("td-nar-magic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("x"), b"hi\n").unwrap();
+        let mut nar = Vec::new();
+        write_nar(&mut nar, &src).unwrap();
+        // "nix-archive-1" sits at bytes [8..21]; flip the trailing '1' to '2'.
+        assert_eq!(&nar[8..21], b"nix-archive-1");
+        nar[20] = b'2';
+        assert!(read_nar(&mut nar.as_slice(), &base.join("dst")).is_err());
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
