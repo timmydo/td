@@ -2,7 +2,7 @@
 # warm-td-fetch-crates.sh — host-side NETWORK PREP that fetches td-fetch's crate closure
 # GUIX-FREE: td's OWN fetcher (td-fetch) GETs each `.crate` from static.crates.io, pinned by
 # the UPSTREAM `fetch/Cargo.lock` checksum (NOT a guix artifact), into a flat vendor dir that
-# the `rust-fetch-crate-free` gate interns (store-add-recursive) and builds td-fetch from
+# the `rust-fetch` gate interns (store-add-recursive) and builds td-fetch from
 # (TD_VENDOR_DIR). NO guix-daemon, NO `guix build`, NO `/gnu/store` crate FOD — the crate path
 # is guix-free; only the rust/gcc toolchain seed stays guix (retired last). td-fetch honors
 # TD_FEED_BASE, so when the shared feed is up these reads route through it (shared offline).
