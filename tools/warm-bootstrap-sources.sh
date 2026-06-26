@@ -30,7 +30,7 @@ tdf=$(ls "$root"/.td-build-cache/rust-fetch/b/newstore/*/bin/td-fetch 2>/dev/nul
 if { [ -z "$tdf" ] || [ ! -x "$tdf" ]; } && command -v cargo >/dev/null 2>&1; then
   ( cd "$root/fetch" && cargo build --release --quiet ) && tdf="$root/fetch/target/release/td-fetch" || tdf=""
 fi
-tdfeed=$(ls "$root"/.td-build-cache/td-feed/b/newstore/*/bin/td-feed 2>/dev/null | head -1 || true)
+tdfeed=$(ls "$root"/.td-build-cache/td-feed/sd/newstore/*/bin/td-feed 2>/dev/null | head -1 || true)
 if { [ -z "$tdfeed" ] || [ ! -x "$tdfeed" ]; } && command -v cargo >/dev/null 2>&1; then
   ( cd "$root/feed" && cargo build --release --quiet ) && tdfeed="$root/feed/target/release/td-feed" || tdfeed=""
 fi

@@ -17,7 +17,7 @@ HEAVY_GATES += feed-shared
 feed-shared: td-feed
 	@echo ">> feed-shared: a persistent SHARED td-feed daemon serves a warmed artifact to consumers on different worktrees, offline over loopback; reused not restarted; reds on corruption/cold"
 	@set -euo pipefail; \
-	tdfeed=`ls $(CURDIR)/.td-build-cache/td-feed/b/newstore/*/bin/td-feed 2>/dev/null | head -1 || true`; \
+	tdfeed=`ls $(CURDIR)/.td-build-cache/td-feed/sd/newstore/*/bin/td-feed 2>/dev/null | head -1 || true`; \
 	test -x "$$tdfeed" || { echo "ERROR: no td-built td-feed binary (the td-feed gate must build it first)" >&2; exit 1; }; \
 	echo "  [DURABLE structural] using the td-built td-feed: $$tdfeed"; \
 	base="$(CURDIR)/.td-build-cache/feed-shared"; \

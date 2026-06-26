@@ -25,7 +25,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 # Locate a td-feed binary: explicit override, else the gate's td-built one, else host cargo.
 tdfeed=${TD_FEED_BIN:-}
 if [ -z "$tdfeed" ] || [ ! -x "$tdfeed" ]; then
-  tdfeed=$(ls "$root"/.td-build-cache/td-feed/b/newstore/*/bin/td-feed 2>/dev/null | head -1 || true)
+  tdfeed=$(ls "$root"/.td-build-cache/td-feed/sd/newstore/*/bin/td-feed 2>/dev/null | head -1 || true)
 fi
 if { [ -z "$tdfeed" ] || [ ! -x "$tdfeed" ]; } && command -v cargo >/dev/null 2>&1; then
   ( cd "$root/feed" && cargo build --release --quiet ) >&2 && tdfeed="$root/feed/target/release/td-feed"
