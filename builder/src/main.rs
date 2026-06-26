@@ -511,6 +511,17 @@ fn restore_substitute(
     newstore: &Path,
     deriver: &str,
 ) -> Result<OutputReg, String> {
+    // The narinfo signature attests only that the publisher signed THIS StorePath — not
+    // that it is the output we asked for. A validly-signed narinfo for some OTHER path,
+    // served under this output's basename, must NOT be accepted as this output (it would
+    // register another path's bytes as our derivation's result). Bind the signed StorePath
+    // to the requested output_path before trusting any of its bytes.
+    let signed_path = narinfo_field(narinfo, "StorePath").ok_or("narinfo: no StorePath")?;
+    if signed_path != output_path {
+        return Err(format!(
+            "substitute StorePath does not match the requested output\n  want {output_path}\n  got  {signed_path}"
+        ));
+    }
     let want_hash = narinfo_field(narinfo, "NarHash").ok_or("narinfo: no NarHash")?;
     // References are recorded as basenames; rebase onto the active store dir for scanning.
     let store_dir = store::store_dir();
@@ -4128,6 +4139,16 @@ mod tests {
         assert_eq!(reg.store_path, store_path);
         assert_eq!(reg.nar_hash, narinfo_field(&ni, "NarHash").unwrap());
         assert_eq!(std::fs::read(newstore.join(app_base).join("run")).unwrap(), b"app payload\n");
+
+        // Self-discrimination (wrong output): the narinfo is a perfectly valid,
+        // hash-consistent export of `store_path`, but we ask restore to treat it as a
+        // DIFFERENT output. A signed narinfo for one path must not be accepted as
+        // another (the StorePath-binding check) even though every byte verifies.
+        let other_path = "/gnu/store/dddddddddddddddddddddddddddddddd-other";
+        assert!(
+            restore_substitute(&ni, &narfile, other_path, &newstore, "x.drv").is_err(),
+            "restore accepted a narinfo whose signed StorePath != the requested output"
+        );
 
         // Self-discrimination: corrupt the nar's file CONTENTS (structure intact, so
         // read_nar still parses) → restore must reject on the NarHash check specifically.
