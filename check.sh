@@ -252,6 +252,9 @@ if [ "$heavy_warm" = 1 ]; then
   sh tools/warm-cargo-proxy.sh coreutils 0.9.0 uutils || true
   sh tools/warm-cargo-proxy.sh youki 0.6.0 || true
   sh tools/warm-cargo-proxy.sh uu_cat 0.9.0 cat || true
+  # Local-source variant: the russh demo's source is the in-tree tests/russh-demo (NOT a
+  # crates.io crate), so only its 188-crate DEP closure is cargo-fetched through the proxy.
+  sh tools/warm-cargo-proxy-local.sh tests/russh-demo russh || true
 fi
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only

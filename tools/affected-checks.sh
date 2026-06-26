@@ -260,7 +260,7 @@ map_path() {
     tests/td-vendor-demo.lock|tests/td-vendor-demo-source.scm|tests/vendor-demo/*|tests/vendor-demo/src/*)
       add_target rust-vendor ;;
 
-    tests/td-russh-demo.lock|tests/td-russh-demo-source.scm)
+    tests/td-russh-demo.lock|tests/td-russh-demo-source.scm|tests/russh-demo/*)
       add_target rust-russh ;;
 
     tests/td-cmake-demo.lock|tests/cmake-demo/*)
@@ -324,6 +324,10 @@ map_path() {
       add_target rust-coreutils
       add_target rust-uutils
       add_target rust-youki ;;
+
+    tools/warm-cargo-proxy-local.sh)
+      add_preflight shell-syntax
+      add_target rust-russh ;;
 
     tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh)
       add_preflight shell-syntax
@@ -822,6 +826,8 @@ run_self_test() {
   assert_branch_policy tools/affected-checks.sh "full ./check.sh would be waived"
   assert_target tests/ts/recipe-td-russh-demo.ts rust-russh
   assert_target tests/td-russh-demo.lock rust-russh
+  assert_target tests/russh-demo/Cargo.lock rust-russh
+  assert_target tools/warm-cargo-proxy-local.sh rust-russh
   assert_target tests/ts/recipe-td-feed.ts td-feed
   assert_target tests/td-feed.lock td-feed
   assert_target tests/td-feed.index td-feed
