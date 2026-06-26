@@ -239,8 +239,19 @@ upward:
      (compiles+runs from `/td/store` → 42), structural (`/td/store` is the store, `/gnu/store` absent). This
      is the registered `/td/store` path **td-subst** can serve (chain-caching), and the unmixed base the
      userland builds on. Proven on the cached-chain dev harness via `tools/check-rung.sh` (3 fast in-sandbox
-     iterations). Next: each rung consumes the prior `/td/store` rung; then the dynamic glibc/userland with
-     `/td/store` RUNPATH (brick 6).
+     iterations). Next: the DYNAMIC toolchain at `/td/store` (below).
+   - **dynamic toolchain at /td/store** 🚧 (brick 6 first rung) — the `bootstrap-glibc-shared-store-native`
+     gate (`mk/gates/400`): from the seed, build the chain → gcc-mesboot1 + binutils-mesboot → a SHARED glibc
+     2.16.0 (`libc.so.6` + `ld-linux.so.2`), intern it + gcc-mesboot1 + binutils content-addressed into
+     `/td/store`, and in the store-ns own-root (`/gnu/store` ABSENT) link a DYNAMIC C program whose
+     interpreter + RUNPATH are `/td/store`, and RUN it → 42. First time `/td/store` is baked into a running
+     dynamic binary, unmixed from guix. The shared glibc was the hard part: guix-as-oracle (build guix's REAL
+     `glibc-mesboot`, diff the artifacts) revealed it ships NO `libnsl.so` → SKIP the `nis` subdir (where the
+     shared link pulls `clnt_gen.o` from the non-TLS glibc-mesboot0 → errno-TLS clash); plus glibc RELOCATION
+     (libc.so/libpthread.so ld-scripts → bare names so `ld` resolves via `-L` the `/td/store` lib). Proven on
+     the dev harness via `tools/check-rung.sh`. DURABLE: no-guix, content-addr, behavioral (interp=/td/store,
+     runs → 42), structural (/td/store is the store, /gnu/store absent). Next: the final toolchain (newer
+     binutils → gcc) builds DYNAMIC against this shared glibc via a gcc-mesboot-wrapper.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
