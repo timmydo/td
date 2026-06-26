@@ -228,8 +228,19 @@ upward:
      4.9.4 compiles+links a C program AND a C++ (libstdc++) program → 42. Repro: gcc/cpp drivers byte-identical
      + `gcc -S` output deterministic (cc1 carries a benign stabs stamp). Sandbox-only fix the host harness
      can't see: gcc-4.9.4 is `.tar.bz2` + no `bzip2` in the sandbox → store-bzip2 piped to `tar` (like
-     binutils). The Mes full-source bootstrap now reaches a modern GCC; the toolchain at `--prefix=/td/store`
-     (brick 6) is next.
+     binutils). The Mes full-source bootstrap now reaches a modern GCC; the toolchain at `/td/store`
+     (the store-native step below) is next.
+   - **toolchain at /td/store** 🚧 (first `/td/store`-native step) — the `bootstrap-toolchain-store-native`
+     gate (`mk/gates/398`): the seed-built toolchain is already STATIC + guix-free (the `[no-guix]` legs), so
+     it needs NO relocation — the guix-free stage0 td-builder `store-add-recursive`s gcc-mesboot + binutils-
+     mesboot + glibc-mesboot **content-addressed into `/td/store`** (`/td/store/<nar-hash>-<name>`), and
+     `store-ns` runs gcc-mesboot THERE to compile+link a static C program that returns 42 — in td's own root
+     where `/td/store` IS the store and `/gnu/store` is ABSENT. DURABLE: no-guix, content-addr, behavioral
+     (compiles+runs from `/td/store` → 42), structural (`/td/store` is the store, `/gnu/store` absent). This
+     is the registered `/td/store` path **td-subst** can serve (chain-caching), and the unmixed base the
+     userland builds on. Proven on the cached-chain dev harness via `tools/check-rung.sh` (3 fast in-sandbox
+     iterations). Next: each rung consumes the prior `/td/store` rung; then the dynamic glibc/userland with
+     `/td/store` RUNPATH (brick 6).
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
