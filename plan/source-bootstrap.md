@@ -216,7 +216,7 @@ upward:
      dev harness can't see: the lock is named `glibc-mesboot-2.16.0.lock` so `glibc-*.lock|head -1` still
      resolves the chain's 2.2.5; Makeconfig's `SHELL := /bin/sh` + ~14 script shebangs are sed'd to the
      curated `sh` (the loop sandbox has no `/bin/sh`).
-   - **gcc-mesboot** 🚧 (GCC 4.9.4, guix's gcc-mesboot — the FINAL mesboot gcc) — the `bootstrap-gcc-mesboot`
+   - **gcc-mesboot** ✅ DONE (2026-06-26, #185) (GCC 4.9.4, guix's gcc-mesboot — the FINAL mesboot gcc) — the `bootstrap-gcc-mesboot`
      gate (`mk/gates/396`): gcc-mesboot1 (4.6.4) + binutils-mesboot build GCC 4.9.4 against the static glibc
      2.16.0, from one pristine tarball (gmp/mpfr/mpc in-tree; no modular g++, no boot patch — the 7 guix
      origin patches all touch DISABLED components). td builds it STATIC (guix --enable-shared via the
@@ -224,15 +224,34 @@ upward:
      unwinder can't link dynamically, so every compile-and-run test links static — done with LINK-ONLY flags
      that keep CC clean (LDFLAGS=`-static -B<glibc>/lib` for host link tests, CC_FOR_BUILD=`<gcc> -static`
      for the in-tree gmp/mpfr/mpc build tools), so autoconf header tests aren't polluted by a `-B` warning
-     (the binutils-mesboot1 lesson). Dev harness GREEN in 3 iterations: gcc (GCC) 4.9.4 compiles+links a C
-     program AND a C++ (libstdc++) program → 42. Repro: gcc/cpp drivers byte-identical + `gcc -S` output
-     deterministic (cc1 carries a benign stabs stamp). Then the modern toolchain at `--prefix=/td/store`.
+     (the binutils-mesboot1 lesson). Dev harness GREEN in 3 iterations, authoritative gate GREEN: gcc (GCC)
+     4.9.4 compiles+links a C program AND a C++ (libstdc++) program → 42. Repro: gcc/cpp drivers byte-identical
+     + `gcc -S` output deterministic (cc1 carries a benign stabs stamp). Sandbox-only fix the host harness
+     can't see: gcc-4.9.4 is `.tar.bz2` + no `bzip2` in the sandbox → store-bzip2 piped to `tar` (like
+     binutils). The Mes full-source bootstrap now reaches a modern GCC; the toolchain at `--prefix=/td/store`
+     (brick 6) is next.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
 8. **retire the guix seed** — the corpus locks (`hello-no-guix.lock`, …) point at the
    `/td/store` toolchain; the guix toolchain seed is removed from every build's inputs;
    guix remains only as the removable `guix build --check` oracle (retired last, §5).
+
+## Iteration speed: `/td/store`-native unlocks td-subst chain-caching (2026-06-26)
+
+Each mesboot rung today builds the WHOLE chain (stage0 → … → glibc 2.16.0) into `mktemp` dirs before
+the rung under test, so the authoritative gate is a ~40-min from-the-seed rebuild and a sandbox-only
+bug (no `bzip2`, no `/bin/sh`) costs a full round-trip to find. Two speedups, on a deliberate split:
+- **Now (dev only):** `tools/check-rung.sh <harness>` runs a cached-chain dev harness *inside* the loop
+  sandbox (same `td-builder host-sandbox`, same toolchain — no bzip2), so sandbox-only bugs surface in
+  minutes against `.td-build-cache/`, not a 40-min gate. The gate is unchanged.
+- **The td-subst payoff (gated on brick 6):** once each rung builds `/td/store`-native (via
+  `build-recipe`/`store-register`, not `mktemp`), its output is a content-addressed td store path that
+  **td-subst** can serve as signed NAR — so a cold worktree / another agent fetches the chain prefix
+  instead of rebuilding it, with td-subst's repro-equality leg guaranteeing fetched == from-source.
+  This stays OFF for the verification loop (directive 1 — the loop always builds from the seed +
+  `--check`); it only accelerates dev + CI-image-prep. So `/td/store`-native is the keystone: it serves
+  the North Star (no guix bytes) AND makes the chain cacheable. See [[td-subst-track]].
 
 ## Durable vs oracle
 
