@@ -251,6 +251,7 @@ if [ "$heavy_warm" = 1 ]; then
   sh tools/warm-cargo-proxy.sh bat 0.25.0 || true
   sh tools/warm-cargo-proxy.sh coreutils 0.9.0 uutils || true
   sh tools/warm-cargo-proxy.sh youki 0.6.0 || true
+  sh tools/warm-cargo-proxy.sh uu_cat 0.9.0 cat || true
 fi
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only

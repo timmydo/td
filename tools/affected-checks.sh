@@ -321,6 +321,7 @@ map_path() {
       add_target rust-eza
       add_target rust-bat
       add_target rust-coreutils
+      add_target rust-uutils
       add_target rust-youki ;;
 
     tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh)
@@ -783,6 +784,7 @@ run_self_test() {
   assert_target tests/td-cmake-demo.lock cmake
   assert_target tests/ts/recipe-uutils.ts rust-coreutils
   assert_target tests/uutils-coreutils.lock rust-coreutils
+  assert_target tests/cat-uutils.lock rust-uutils
   assert_target tests/ts/recipe-youki.ts rust-youki
   assert_target tests/youki.lock rust-youki
   assert_target tests/cmake-demo/CMakeLists.txt cmake
