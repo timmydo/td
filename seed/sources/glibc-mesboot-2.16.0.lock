@@ -1,0 +1,9 @@
+# seed/sources/glibc-2.16.0.lock — GNU C Library 2.16.0, the source-bootstrap brick 5 (gcc-toolchain)
+# rung AFTER binutils-mesboot + gawk-mesboot: the MODERN glibc — guix's glibc-mesboot. Built by
+# gcc-mesboot1 (GCC 4.6.4, C++) + binutils-mesboot + gawk-mesboot, headers-first then the full library
+# (nptl add-on). The C library gcc-mesboot (GCC 4.9, the final mesboot gcc) is built against. Supersedes
+# the bootstrap glibc-mesboot0 (2.2.5). td-fetched (tools/warm-bootstrap-sources.sh). nix-base32
+# cross-checks guix's pin 0vlz4x6cgz7h54qq4528q526qlhnsjzbsvgc4iizn76cb0bfanx7.
+url https://ftp.gnu.org/gnu/glibc/glibc-2.16.0.tar.gz
+sha256 a75be51658cc1cfb6324ec6dbdbed416526c44c14814823129f0fcc74c279f6e
+file glibc-2.16.0.tar.gz
