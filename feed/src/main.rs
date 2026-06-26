@@ -385,16 +385,23 @@ fn serve_index(store: &Path, idxpath: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Serve (cache-or-fetch+verify) a `.crate` from static.crates.io, verified against the
-/// index cksum — the td-owned, verifying egress.
+/// index cksum — the td-owned, verifying egress. The cache is NOT trusted blindly: a cache
+/// hit is re-verified against the index cksum on every serve, and a corrupted/stale entry
+/// is discarded and refetched. So the sha256==index-cksum guarantee holds for cached hits,
+/// not just fresh downloads (the integrity tools/warm-cargo-proxy.sh relies on).
 fn serve_crate(store: &Path, cr: &str, ver: &str) -> Result<Vec<u8>, String> {
     let cache = store_path(&store.join("crates"), &format!("{cr}-{ver}.crate"))
         .ok_or("unsafe crate name")?;
-    if let Ok(b) = std::fs::read(&cache) {
-        return Ok(b);
-    }
     let idx = serve_index(store, &index_path(cr))?;
     let cksum = cksum_for(&String::from_utf8_lossy(&idx), ver)
         .ok_or_else(|| format!("no cksum for {cr} {ver} in the index"))?;
+    if let Ok(b) = std::fs::read(&cache) {
+        if hex_sha256(&b) == cksum {
+            return Ok(b);
+        }
+        // Corrupted/stale cache entry — drop it and refetch rather than serve bad bytes.
+        let _ = std::fs::remove_file(&cache);
+    }
     let url = format!("{}/crates/{cr}/{cr}-{ver}.crate", crates_base());
     let body = try_get(&url)?;
     if hex_sha256(&body) != cksum {
@@ -540,6 +547,19 @@ fn cargo_proxy_selftest() {
     if !store.join("crates/unarray-0.1.0.crate").exists() {
         die("proxy did not cache the fetched crate".into());
     }
+    // Cache-integrity: a CACHE HIT is re-verified against the index cksum, not trusted
+    // blindly. Corrupt the cached crate, then fetch again — the proxy must reject the bad
+    // cached bytes, refetch from upstream, serve the correct bytes, and heal the cache.
+    std::fs::write(store.join("crates/unarray-0.1.0.crate"), b"corrupted-cache-bytes")
+        .unwrap_or_else(|e| die(format!("corrupt cache: {e}")));
+    let healed = try_get(&format!("{proxy}/dl/unarray/0.1.0/download"))
+        .unwrap_or_else(|e| die(format!("dl unarray after cache corruption: {e}")));
+    if healed != cbytes {
+        die("proxy SERVED a corrupted cache entry — a cache hit is trusted without re-verifying its index cksum".into());
+    }
+    if std::fs::read(store.join("crates/unarray-0.1.0.crate")).unwrap_or_default() != cbytes {
+        die("proxy did not heal the corrupted cache entry after refetch".into());
+    }
     if try_get(&format!("{proxy}/dl/bad/1.0.0/download")).is_ok() {
         die("proxy SERVED a crate whose bytes mismatch the index cksum — verify-on-fetch is not load-bearing".into());
     }
@@ -555,7 +575,7 @@ fn cargo_proxy_selftest() {
     println!(
         "td-feed: cargo-proxy selftest OK — fetched + verified a crate through the proxy (upstream \
          127.0.0.1:{uport}, proxy 127.0.0.1:{pport}, cached); a crate whose bytes mismatch its index \
-         cksum is refused"
+         cksum is refused; a corrupted cache hit is re-verified, refetched, and healed"
     );
 }
 
