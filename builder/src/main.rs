@@ -4121,7 +4121,7 @@ mod tests {
     fn restore_substitute_round_trips_and_rejects_corruption() {
         let base = std::env::temp_dir().join(format!("td-subst-restore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let store_path = "/gnu/store/cccccccccccccccccccccccccccccccc-app";
+        let store_path = "/td/store/cccccccccccccccccccccccccccccccc-app";
         let app_base = "cccccccccccccccccccccccccccccccc-app";
         let phys = base.join("phys/app");
         std::fs::create_dir_all(&phys).unwrap();
@@ -4144,7 +4144,7 @@ mod tests {
         // hash-consistent export of `store_path`, but we ask restore to treat it as a
         // DIFFERENT output. A signed narinfo for one path must not be accepted as
         // another (the StorePath-binding check) even though every byte verifies.
-        let other_path = "/gnu/store/dddddddddddddddddddddddddddddddd-other";
+        let other_path = "/td/store/dddddddddddddddddddddddddddddddd-other";
         assert!(
             restore_substitute(&ni, &narfile, other_path, &newstore, "x.drv").is_err(),
             "restore accepted a narinfo whose signed StorePath != the requested output"
