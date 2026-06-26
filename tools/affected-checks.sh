@@ -411,7 +411,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     tests/bootstrap-binutils.sh|seed/sources/binutils-*.lock|seed/patches/binutils-boot-*.patch)
       add_preflight shell-syntax
@@ -425,7 +426,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     tests/bootstrap-gcc.sh|seed/sources/gcc-core-2.95.3.lock|seed/patches/gcc-boot-2.95.3.patch)
       add_preflight shell-syntax
@@ -438,7 +440,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     tests/bootstrap-glibc.sh|seed/sources/glibc-2.2.5.lock|seed/sources/linux-*.lock|seed/patches/glibc-boot-2.2.5.patch|seed/patches/glibc-bootstrap-system-2.2.5.patch|tools/warm-kernel-headers.sh)
       add_preflight shell-syntax
@@ -450,7 +453,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     tests/bootstrap-gcc-mesboot0.sh)
       add_preflight shell-syntax
@@ -470,29 +474,38 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     tests/bootstrap-gcc-mesboot1.sh|seed/sources/gcc-g++-4.6.4.lock)
       add_preflight shell-syntax
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     tests/bootstrap-binutils-gawk-mesboot.sh|seed/sources/gawk-*.lock)
       add_preflight shell-syntax
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     tests/bootstrap-glibc-mesboot.sh|seed/sources/glibc-mesboot-2.16.0.lock|seed/patches/glibc-boot-2.16.0.patch|seed/patches/glibc-bootstrap-system-2.16.0.patch)
       add_preflight shell-syntax
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     tests/bootstrap-gcc-mesboot.sh|seed/sources/gcc-4.9.4.lock)
       add_preflight shell-syntax
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
+
+    tests/bootstrap-toolchain-store-native.sh)
+      add_preflight shell-syntax
+      add_target bootstrap-toolchain-store-native ;;
 
     seed/sources/make-*.lock)
       add_preflight shell-syntax
@@ -509,7 +522,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     seed/sources/tcc-0.9.26*.lock)
       add_preflight shell-syntax
@@ -527,7 +541,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     seed/sources/nyacc-*.lock)
       add_preflight shell-syntax
@@ -546,7 +561,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     seed/sources/mes-*.lock|tools/warm-bootstrap-sources.sh)
       add_preflight shell-syntax
@@ -566,7 +582,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     seed/stage0/*)
       add_preflight shell-syntax
@@ -588,7 +605,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot1
       add_target bootstrap-binutils-gawk-mesboot
       add_target bootstrap-glibc-mesboot
-      add_target bootstrap-gcc-mesboot ;;
+      add_target bootstrap-gcc-mesboot
+      add_target bootstrap-toolchain-store-native ;;
 
     tests/store-ns.sh)
       add_preflight shell-syntax
