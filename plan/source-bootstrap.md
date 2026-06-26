@@ -215,8 +215,18 @@ upward:
      objects + a linked nptl program byte-identical across two builds. Two sandbox-only gotchas the cached
      dev harness can't see: the lock is named `glibc-mesboot-2.16.0.lock` so `glibc-*.lock|head -1` still
      resolves the chain's 2.2.5; Makeconfig's `SHELL := /bin/sh` + ~14 script shebangs are sed'd to the
-     curated `sh` (the loop sandbox has no `/bin/sh`). Then gcc-mesboot (GCC 4.9,
-     the final mesboot gcc) → final toolchain, `--prefix=/td/store`.
+     curated `sh` (the loop sandbox has no `/bin/sh`).
+   - **gcc-mesboot** 🚧 (GCC 4.9.4, guix's gcc-mesboot — the FINAL mesboot gcc) — the `bootstrap-gcc-mesboot`
+     gate (`mk/gates/396`): gcc-mesboot1 (4.6.4) + binutils-mesboot build GCC 4.9.4 against the static glibc
+     2.16.0, from one pristine tarball (gmp/mpfr/mpc in-tree; no modular g++, no boot patch — the 7 guix
+     origin patches all touch DISABLED components). td builds it STATIC (guix --enable-shared via the
+     gcc-mesboot1-wrapper's dynamic linker): the static-only glibc means libgcc's `dl_iterate_phdr`-using
+     unwinder can't link dynamically, so every compile-and-run test links static — done with LINK-ONLY flags
+     that keep CC clean (LDFLAGS=`-static -B<glibc>/lib` for host link tests, CC_FOR_BUILD=`<gcc> -static`
+     for the in-tree gmp/mpfr/mpc build tools), so autoconf header tests aren't polluted by a `-B` warning
+     (the binutils-mesboot1 lesson). Dev harness GREEN in 3 iterations: gcc (GCC) 4.9.4 compiles+links a C
+     program AND a C++ (libstdc++) program → 42. Repro: gcc/cpp drivers byte-identical + `gcc -S` output
+     deterministic (cc1 carries a benign stabs stamp). Then the modern toolchain at `--prefix=/td/store`.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
