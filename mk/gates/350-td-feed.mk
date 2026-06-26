@@ -1,11 +1,20 @@
 # td-feed — td builds td-feed (its OWN local HTTP mirror of every network-downloaded
 # artifact, feed/) FROM SOURCE via `td-builder build-recipe` (buildSystem "rust") by the
-# td-bootstrapped stage0 (move-off-Guile §5), then proves the mirror works offline. td-feed
-# shares td-fetch's vendored closure exactly (ureq + rustls/ring + sha2, 73 crates — only
-# the bin name differs), so it reuses tests/td-feed.lock (== td-fetch's seed + .crate deps).
-# The .drv is assembled by td (no guix (derivation …)) and realized daemon-free, guix/Guile
-# SCRUBBED FROM PATH. The rustc/cargo/gcc seed is external (§5, retired last).
+# td-bootstrapped stage0 (move-off-Guile §5), then proves the mirror works offline — with
+# its crate closure provisioned GUIX-FREE. td-feed shares td-fetch's vendored closure
+# exactly (ureq + rustls/ring + sha2, 73 crates — only the bin name differs), so it reuses
+# td-fetch's td-fetched vendor tree (.td-build-cache/crate-vendor/td-fetch, warmed GUIX-FREE
+# by tools/warm-td-fetch-crates.sh in the check.sh prelude — NO guix build, NO /gnu/store
+# crate FOD), interned by td's OWN store-add-recursive and vendored via TD_VENDOR_DIR. The
+# crate correctness oracle is the UPSTREAM feed/Cargo.lock checksum, NOT a guix differential
+# (human 2026-06-23, "no new guix dependencies, even an oracle"). The .drv is assembled by td
+# (no guix (derivation …)) and realized daemon-free, guix/Guile SCRUBBED FROM PATH. The
+# rustc/cargo/gcc seed is external (§5, retired last).
 #
+#   [DURABLE supply-chain] every vendored crate's sha256 is a checksum pinned in
+#     feed/Cargo.lock (the upstream crates.io hash) — the guix-free equivalence oracle.
+#   [DURABLE structural] the .drv sets TD_VENDOR_DIR and references NO `/gnu/store` crate
+#     path; the vendor tree is td-interned (store-add-recursive); guix/Guile off PATH.
 #   [DURABLE behavioral] the td-built td-feed `selftest` warms a one-entry index from a
 #     loopback ORIGIN, serves it on a 2nd loopback port, and fetches it back THROUGH the
 #     feed + sha256-verifies — the full warm->serve->fetch path, offline (std::net).
@@ -14,10 +23,9 @@
 #     load-bearing on BOTH the warm and the serve side.
 #   [DURABLE structural] tests/td-feed.index is self-consistent: every line is
 #     <path> <url> <sha256>, each sha256 is 64-hex, and no path repeats.
-#   [DURABLE structural] the index is TRUTHFUL against the realized closure: for every
-#     crate td-feed itself vendors (tests/td-feed.lock), the index's recorded sha256 equals
-#     the realized .crate's content sha256 — the mirror would serve the daemon-verified FOD
-#     bytes.
+#   [DURABLE structural] the index is TRUTHFUL against the vendored closure: for every crate
+#     td-feed vendors, the index's recorded sha256 equals the vendored .crate's content
+#     sha256 — the mirror would serve the same content-addressed bytes td built against.
 #   [DURABLE structural] the .drv builder is the td-bootstrapped stage0 (not the guix-built
 #     td-builder); ts-emit ran under td's OWN td-ts-eval.
 #   [DURABLE repro] td-builder check double-build agrees the build is reproducible.
@@ -27,8 +35,14 @@ HEAVY_GATES += td-feed
 # build-recipes' prelude builds. Not in BUILD_SPECS — the source is interned at gate time.
 BUILD_GATES += td-feed
 td-feed:
-	@echo ">> td-feed: td builds td-feed (its own local HTTP mirror, 73 vendored deps) from source via build-recipe (offline, guix/Guile off PATH); it warms+serves+fetches over loopback + is reproducible, and tests/td-feed.index is self-consistent + truthful"
+	@echo ">> td-feed: td builds td-feed (its own local HTTP mirror, 73 vendored deps) from source via build-recipe with crates provisioned GUIX-FREE (td-fetched + interned vendor tree, TD_VENDOR_DIR); it warms+serves+fetches over loopback + is reproducible, and tests/td-feed.index is self-consistent + truthful; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
+	vendor="$(CURDIR)/.td-build-cache/crate-vendor/td-fetch"; \
+	ncrate=`ls "$$vendor"/*.crate 2>/dev/null | wc -l`; \
+	test "$$ncrate" -ge 70 || { echo "ERROR: vendor dir $$vendor has <70 crates ($$ncrate) — the HOST PREP tools/warm-td-fetch-crates.sh (check.sh prelude) must td-fetch them first (offline gate cannot egress); td-feed shares td-fetch's closure" >&2; exit 1; }; \
+	miss=0; for c in "$$vendor"/*.crate; do sha=`sha256sum "$$c" | cut -d' ' -f1`; grep -qF "$$sha" "$(CURDIR)/feed/Cargo.lock" || { echo "FAIL: crate `basename $$c` sha $$sha is NOT pinned in feed/Cargo.lock" >&2; miss=$$((miss + 1)); }; done; \
+	test "$$miss" -eq 0 || { echo "FAIL: $$miss vendored crate(s) not pinned by feed/Cargo.lock" >&2; exit 1; }; \
+	echo "  [DURABLE supply-chain] all $$ncrate vendored crates' sha256 are checksums pinned in feed/Cargo.lock (upstream crates.io hash — the guix-free oracle; td-feed shares td-fetch's closure exactly)"; \
 	tsgo=`sh tests/tsgo.sh`; \
 	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo (the TS front-end compiler)" >&2; exit 1; }; \
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; tb="$$TB"; \
@@ -40,28 +54,31 @@ td-feed:
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
-	ncrate=`grep -cE '\.crate /gnu/store/' "$$lock0"`; \
-	test "$$ncrate" -ge 70 || { echo "ERROR: lock has <70 vendored .crate deps ($$ncrate)" >&2; exit 1; }; \
-	scratch="$(CURDIR)/.td-build-cache/td-feed"; mkdir -p "$$scratch/tmp" "$$scratch/b"; rm -f "$$scratch/b/"*.drv; \
-	grep ' /gnu/store/' "$$lock0" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the seed + vendored .crate deps" >&2; exit 1; }; \
-	srcinfo=`sh tests/intern-src.sh "$$tb" td-feed-src "$(CURDIR)/feed" "$$scratch" target vendor .cargo` || { echo "ERROR: td could not intern the feed crate tree" >&2; exit 1; }; \
+	scratch="$(CURDIR)/.td-build-cache/td-feed"; rm -rf "$$scratch"; mkdir -p "$$scratch/tmp" "$$scratch/sd"; \
+	grep -v '\.crate ' "$$lock0" | grep ' /gnu/store/' | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the toolchain seed" >&2; exit 1; }; \
+	srcinfo=`sh tests/intern-src.sh "$$tb" td-feed-src "$(CURDIR)/feed" "$$scratch/src" target vendor .cargo` || { echo "ERROR: td could not intern the feed crate tree" >&2; exit 1; }; \
 	eval "$$srcinfo"; \
 	test -n "$$src" -a -d "$$srcstore/`basename "$$src"`" || { echo "ERROR: td interned no feed source tree" >&2; exit 1; }; \
-	lock="$$scratch/td-feed.lock"; { cat "$$lock0"; echo "td-feed-source $$src"; } > "$$lock"; \
+	vinfo=`sh tests/intern-src.sh "$$tb" td-feed-vendor "$$vendor" "$$scratch/vendor"` || { echo "ERROR: intern vendor tree failed" >&2; exit 1; }; \
+	vsrc=`echo "$$vinfo" | sed -n "s/^src='\(.*\)'/\1/p"`; \
+	vstore=`echo "$$vinfo" | sed -n "s/^srcstore='\(.*\)'/\1/p"`; \
+	vdb=`echo "$$vinfo" | sed -n "s/^srcdb='\(.*\)'/\1/p"`; \
+	test -n "$$vsrc" -a -n "$$vstore" -a -n "$$vdb" || { echo "ERROR: vendor intern produced no path" >&2; exit 1; }; \
+	echo "  [DURABLE structural] td interned the feed source + the crate set as content-addressed trees (store-add-recursive, no daemon): vendor $$vsrc"; \
+	lock="$$scratch/seed.lock"; { grep -v '\.crate ' "$$lock0" | grep ' /gnu/store/'; echo "td-feed-source $$src"; } > "$$lock"; \
 	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-feed.ts" > "$$scratch/feed.json"; \
 	test -s "$$scratch/feed.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
-	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/feed.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe td-feed build:" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	sd="$$scratch/sd"; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/feed.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" "$$vsrc" "$$vstore" "$$vdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe td-feed build (guix-free crates):" >&2; tail -40 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
-	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; fi; \
 	ns="$$sd/newstore/`basename "$$out"`"; \
 	test -x "$$ns/bin/td-feed" || { echo "FAIL: td-feed build produced no binary at $$ns/bin/td-feed" >&2; exit 1; }; \
-	grep -q 'TD_VENDOR_CRATES' "$$sd"/*.drv || { echo "FAIL: the .drv lacks TD_VENDOR_CRATES" >&2; exit 1; }; \
+	grep -q 'TD_VENDOR_DIR' "$$sd"/*.drv || { echo "FAIL: the .drv lacks TD_VENDOR_DIR" >&2; exit 1; }; \
+	if grep -oqE '/gnu/store/[a-z0-9]+-[^ /]+\.crate' "$$sd"/*.drv; then echo "FAIL: the .drv references a /gnu/store crate path (not guix-free)" >&2; exit 1; fi; \
 	test -n "$$TD_BUILDER_PATH" || { echo "FAIL: TD_BUILDER_PATH unset" >&2; exit 1; }; \
 	grep -qF "$$TD_BUILDER_PATH/bin/td-builder" "$$sd"/*.drv || { echo "FAIL: the .drv builder is not the stage0 $$TD_BUILDER_PATH" >&2; exit 1; }; \
-	echo "  [DURABLE structural] the .drv builder is the td-bootstrapped stage0 ($$TD_BUILDER_PATH)"; \
-	if [ -n "$$hit" ]; then echo "  [STRUCTURAL] CACHE HIT — reused td's prior td-feed build: $$out"; else echo "  [STRUCTURAL] td assembled + realized the .drv ($$ncrate deps) with guix/Guile off PATH: $$out"; fi; \
+	echo "  [DURABLE structural] the .drv sets TD_VENDOR_DIR + NO /gnu/store crate path, and its builder is the td-bootstrapped stage0 ($$TD_BUILDER_PATH): $$out"; \
 	st=`"$$ns/bin/td-feed" selftest 2>"$$scratch/run.err"` || { echo "FAIL: the td-built td-feed failed its loopback warm->serve->fetch selftest:" >&2; tail -8 "$$scratch/run.err" >&2; exit 1; }; \
 	echo "$$st" | grep -q '^td-feed: selftest OK' || { echo "FAIL: td-feed selftest did not report OK (got: $$st)" >&2; cat "$$scratch/run.err" >&2; exit 1; }; \
 	echo "  [DURABLE behavioral] the td-built td-feed warmed + served + fetched a blob over loopback (verify-on-warm + verify-on-serve): '$$st'"; \
@@ -81,24 +98,19 @@ td-feed:
 	nidx=`grep -cv '^#' "$$idx"`; \
 	echo "  [DURABLE structural] tests/td-feed.index self-consistent: $$nidx lines, all <path> <url> <sha256>, all sha256 64-hex, no duplicate path"; \
 	checked=0; \
-	for p in `grep -E '\.crate /gnu/store/' "$$lock0" | sed 's/^[^ ]* //'`; do \
-	  nv=`basename "$$p" | sed -E 's/^[a-z0-9]+-//; s/\.crate$$//'`; \
+	for c in "$$vendor"/*.crate; do \
+	  nv=`basename "$$c" | sed -E 's/\.crate$$//'`; \
 	  isha=`grep -F "/$$nv.crate " "$$idx" | head -1 | cut -d' ' -f3`; \
 	  test -n "$$isha" || { echo "FAIL: vendored crate $$nv is not in the index" >&2; exit 1; }; \
-	  csha=`sha256sum "$$p" | cut -d' ' -f1`; \
-	  test "$$isha" = "$$csha" || { echo "FAIL: index sha256 for $$nv ($$isha) != realized content ($$csha)" >&2; exit 1; }; \
+	  csha=`sha256sum "$$c" | cut -d' ' -f1`; \
+	  test "$$isha" = "$$csha" || { echo "FAIL: index sha256 for $$nv ($$isha) != vendored content ($$csha)" >&2; exit 1; }; \
 	  checked=$$((checked+1)); \
 	done; \
-	echo "  [DURABLE structural] index is TRUTHFUL: all $$checked vendored crates' recorded sha256 == their realized .crate content (the mirror serves the daemon-verified FOD bytes)"; \
-	if [ -n "$$hit" ] && [ -f "$$sd/verified-reproducible" ]; then \
-	  echo "  [DURABLE repro] CACHED: recipe unchanged + previously verified reproducible — td-builder check skipped"; \
-	else \
-	  rm -rf "$$scratch/chk"; "$$tb" check "$$sd"/*.drv "$$sd/closure.txt" "$$scratch/chk" > "$$scratch/checkout.txt" 2>"$$scratch/chk.err" \
-	    || { echo "FAIL: td-feed NOT reproducible (td-builder check):" >&2; tail -6 "$$scratch/checkout.txt" "$$scratch/chk.err" >&2; exit 1; }; \
-	  grep -qE "^CHECK out $$out sha256:[0-9a-f]+ reproducible$$" "$$scratch/checkout.txt" \
-	    || { echo "FAIL: td-builder check did not confirm $$out reproducible:" >&2; cat "$$scratch/checkout.txt" >&2; exit 1; }; \
-	  : > "$$sd/verified-reproducible"; \
-	  echo "  [DURABLE repro] td-builder check double-build agrees the td-feed build is reproducible"; \
-	fi; \
-	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err" "$$scratch/run.err"; mkdir -p "$$scratch/tmp"; \
-	echo "PASS: td built td-feed (its own local HTTP mirror) from source via td-builder build-recipe — the closure resolved from pinned static.crates.io fetches (no specification->package, no network), the .drv assembled + realized by td with its BUILDER the td-bootstrapped stage0 and guix/Guile SCRUBBED FROM PATH; the td-built td-feed warms+serves+fetches a blob over loopback and reds on a wrong/corrupted hash on BOTH the warm and serve side (durable behavioral + self-discrimination, offline); tests/td-feed.index is self-consistent and truthful against the realized closure (durable structural); and the build is reproducible by td's own double-build (durable). td now OWNS the mirror of its seeds; the external fetch runs in the network PREP (§5 warm-store-in)."
+	echo "  [DURABLE structural] index is TRUTHFUL: all $$checked vendored crates' recorded sha256 == their td-fetched .crate content (the mirror serves the same content-addressed bytes td built against)"; \
+	rm -rf "$$scratch/chk"; "$$tb" check "$$sd"/*.drv "$$sd/closure.txt" "$$scratch/chk" > "$$scratch/checkout.txt" 2>"$$scratch/chk.err" \
+	  || { echo "FAIL: td-feed NOT reproducible (td-builder check):" >&2; tail -6 "$$scratch/checkout.txt" "$$scratch/chk.err" >&2; exit 1; }; \
+	grep -qE "^CHECK out $$out sha256:[0-9a-f]+ reproducible$$" "$$scratch/checkout.txt" \
+	  || { echo "FAIL: td-builder check did not confirm $$out reproducible:" >&2; cat "$$scratch/checkout.txt" >&2; exit 1; }; \
+	echo "  [DURABLE repro] td-builder check double-build agrees the guix-free-crate td-feed build is reproducible"; \
+	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err" "$$scratch/run.err" "$$scratch/cps.err"; \
+	echo "PASS: td built td-feed (its own local HTTP mirror) from source via td-builder build-recipe with its 73-crate closure provisioned GUIX-FREE (td-fetched from static.crates.io, Cargo.lock-pinned, no guix build / no /gnu/store FOD), interned as a content-addressed vendor tree by store-add-recursive, vendored via TD_VENDOR_DIR, with its BUILDER the td-bootstrapped stage0 and guix/Guile SCRUBBED FROM PATH; the td-built td-feed warms+serves+fetches a blob over loopback and reds on a wrong/corrupted hash on BOTH the warm and serve side (durable behavioral + self-discrimination, offline); tests/td-feed.index is self-consistent and truthful against the vendored closure (durable structural); and the build is reproducible by td's own double-build (durable). td now OWNS the mirror of its seeds AND its crate path is guix-free with NO oracle (content-address = the upstream Cargo.lock pin). Toolchain seed retired last."
