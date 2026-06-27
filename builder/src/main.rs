@@ -19,6 +19,7 @@ mod build;
 mod build_daemon;
 mod daemon;
 mod drv;
+mod elf;
 mod json;
 mod lock;
 mod nar;
@@ -3667,6 +3668,34 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: store-relocate: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // elf-interp FILE — print FILE's program interpreter (PT_INTERP), or nothing for a
+        // shared object. td's OWN ELF reader (no patchelf / no guix tool).
+        Some("elf-interp") if args.len() == 3 => match elf::read_interp(Path::new(&args[2])) {
+            Ok(Some(i)) => {
+                println!("{i}");
+                ExitCode::SUCCESS
+            }
+            Ok(None) => ExitCode::SUCCESS, // no interpreter (e.g. a .so)
+            Err(e) => {
+                eprintln!("td-builder: elf-interp {}: {e}", args[2]);
+                ExitCode::FAILURE
+            }
+        },
+        // elf-set-interp FILE NEW — rewrite FILE's PT_INTERP to NEW in place (must fit the
+        // existing slot). The one patchelf feature the rust-store-native relink needs,
+        // owned by td in Rust so the build path adds NO guix tool.
+        Some("elf-set-interp") if args.len() == 4 => {
+            match elf::set_interp(Path::new(&args[2]), &args[3]) {
+                Ok(()) => {
+                    eprintln!("td-builder: elf-set-interp {} -> {}", args[2], args[3]);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: elf-set-interp {}: {e}", args[2]);
                     ExitCode::FAILURE
                 }
             }
