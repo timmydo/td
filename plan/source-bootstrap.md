@@ -250,8 +250,16 @@ upward:
      shared link pulls `clnt_gen.o` from the non-TLS glibc-mesboot0 → errno-TLS clash); plus glibc RELOCATION
      (libc.so/libpthread.so ld-scripts → bare names so `ld` resolves via `-L` the `/td/store` lib). Proven on
      the dev harness via `tools/check-rung.sh`. DURABLE: no-guix, content-addr, behavioral (interp=/td/store,
-     runs → 42), structural (/td/store is the store, /gnu/store absent). Next: the final toolchain (newer
-     binutils → gcc) builds DYNAMIC against this shared glibc via a gcc-mesboot-wrapper.
+     runs → 42), structural (/td/store is the store, /gnu/store absent). Next: the gcc-mesboot-wrapper (below).
+   - **gcc-mesboot-wrapper at /td/store** 🚧 (brick 6 rung 2; the modern-toolchain enabler) — the
+     `bootstrap-gcc-mesboot-wrapper` gate (`mk/gates/402`): generate a wrapper `gcc` at `/td/store` so a
+     PLAIN invocation (no flags — as a real `configure`/`make` calls it) produces a DYNAMIC `/td/store`
+     binary (interp + RUNPATH = `/td/store`; glibc headers/crt/libc baked in, since gcc-mesboot1's OWN baked
+     paths are the defunct build-time dirs). Proven in the store-ns own-root (`/gnu/store` ABSENT): the plain
+     wrapped gcc compiles a single-file AND a 2-TU program → both dynamic, interp=/td/store, run → 42. This
+     is guix's gcc-mesboot-wrapper made td-native — what lets the mesboot userland (bash/coreutils/…) and the
+     final modern toolchain build with UNMODIFIED build systems. Next: the mesboot userland, then the final
+     toolchain (newer binutils → gcc → modern dynamic glibc) built DYNAMIC against the `/td/store` glibc.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
