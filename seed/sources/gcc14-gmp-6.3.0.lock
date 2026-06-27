@@ -1,0 +1,6 @@
+# seed/sources/gcc14-gmp-6.3.0.lock — GMP 6.3.0, gcc 14.3.0's in-tree prerequisite (gcc's own
+# contrib/download_prerequisites pin). Named gcc14-* so the chain gates' `ls gmp-*.lock` glob (old gmp 4.3.2)
+# does NOT match it. td-fetched.
+url https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
+sha256 a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898
+file gmp-6.3.0.tar.xz

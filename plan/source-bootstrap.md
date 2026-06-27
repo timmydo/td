@@ -291,9 +291,22 @@ upward:
      interp=/td/store, run → 42. **C++ at /td/store** is the new capability (the compiler gcc-boot0 will use).
      4.9.4 built STATIC vs static glibc 2.16.0 (#185 recipe); wrapper links DYNAMIC vs the shared glibc 2.16.0.
      DURABLE: pinned-input, no-guix, content-addr, behavioral (C AND C++ dynamic /td/store → 42), structural.
-     Next: `gcc-boot0` = **gcc 14.3.0** built by this 4.9.4 wrapper (the big one; gmp/mpfr/mpc +
-     libstdc++-boot0; OPEN: 4.9.4's partial C++14 vs gcc 14, or own-then-diverge to an easier modern gcc —
-     the human's call), then glibc/binutils/gcc-final, then retire the guix toolchain seed.
+   - **MODERN GCC 14.3.0 at /td/store** ✅ DONE (2026-06-27) (brick 6/7 — final toolchain, rung B; human chose
+     gcc 14 "match guix") — the `bootstrap-gcc-14-store-native` gate (`mk/gates/410`): with the 4.9.4 bridge,
+     td builds a **current GCC 14.3.0 (c,c++)** against the `/td/store` glibc 2.16.0 (gmp-6.3.0/mpfr-4.2.1/
+     mpc-1.3.1 in-tree), interns it + the shared glibc at `/td/store`, and a gcc/g++ WRAPPER there compiles
+     PLAINLY a DYNAMIC C AND C++ (libstdc++ `<vector>`) program → both interp=/td/store, run in the own-root →
+     42, `/gnu/store` ABSENT. **A modern gcc at /td/store** — guix's gcc-boot0/gcc-final version. CONFIRMED
+     guix jumps 4.9.4 → 14.3.0 directly (gcc-mesboot-wrapper wraps 4.9.4, builds gcc-boot0=14.3.0); td
+     own-then-diverges from guix's gcc-boot0(--without-headers)→glibc-final→gcc-final 3-stage dance and builds
+     a USABLE gcc 14 directly vs glibc 2.16.0 in ONE rung. Built STATIC (gcc 14's xgcc runs in the sandbox);
+     wrapper links DYNAMIC vs the shared glibc. 3 build blockers cracked: in-tree gmp `CC_FOR_BUILD` (gcc
+     derives it from CC on native + strips flags → CC is a -static wrapper SCRIPT); fixincludes doubled header
+     path (`--with-build-sysroot=<glibc>` + `--with-native-system-header-dir=/include`, not both absolute).
+     DURABLE: pinned-input, no-guix (no /gnu/store in gcc 14's gcc/g++/cpp/cc1 NOR libc.so.6), content-addr,
+     behavioral (C AND C++/libstdc++ dynamic /td/store → 42), structural. Next: glibc-final (a MODERN glibc,
+     which unblocks the [[td-rust-store-native-track]] Rust userland that needs glibc ≥ 2.17), then
+     binutils-final, then brick 8 — retire the guix toolchain seed.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
