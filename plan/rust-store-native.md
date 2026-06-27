@@ -29,6 +29,26 @@ Running an upstream rustc from `/td/store` needs **glibc ≥ 2.17** there (rustc
   `glibc-final`** — marked explicitly, never faked. It flips green with a one-line
   relink-target swap once `glibc-final` lands.
 
+## Progress
+
+- **1a — DONE & verified (commit: pin + warm).** `tests/rust-upstream.lock` (rust 1.84.0,
+  official sha256, content-addressed path) + `tools/warm-rust-upstream.sh`. Warm ran green:
+  td-fetch pulled 343814532 bytes, sha matched, daemon-stored at the pinned path. ELF
+  inspection of the fetched rustc/cargo/std: ZERO `/gnu/store` bytes, interp
+  `/lib64/ld-linux-x86-64.so.2`, RUNPATH `$ORIGIN/../lib` (relative).
+- **2a — DONE & verified (commit: td-owned ELF rewriter).** `builder/src/elf.rs` +
+  `elf-interp`/`elf-set-interp` subcommands. NO patchelf (host patchelf is guix-provided —
+  human direction 2026-06-26: build the feature in td first). Minimal ELF64-LE PT_INTERP
+  reader/writer (size-bounded, errors on a too-long interp rather than truncating). 4 unit
+  tests pass on cargo-test; validated on the REAL rustc: interp retargeted
+  `/lib64/ld-linux-x86-64.so.2` -> `/td/store/ld`, confirmed by readelf, in-place, valid
+  ELF, zero `/gnu/store`. RUNPATH needs no rewrite (already relative), so this one feature
+  covers the relink.
+- **Next — 2b/2c:** the relink RECIPE (`store-add-recursive` the rust tree into `/td/store`,
+  `elf-set-interp` rustc/cargo, populate the tree's `lib/` with the `/td/store` glibc+libgcc_s
+  so `$ORIGIN/../lib` resolves) + the structural gate (interp ∈ `/td/store`, no `/gnu/store`,
+  closure-complete) + supply-chain leg + verified-red. Runtime leg PENDING `glibc-final`.
+
 ## Brick ladder
 
 1. **rust-upstream-fetch** — pin the upstream Rust release tarball (version + sha256) and
