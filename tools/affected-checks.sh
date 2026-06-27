@@ -402,6 +402,10 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-tools ;;
 
+    tests/rust-store-native.sh|seed/sources/rust-*.lock)
+      add_preflight shell-syntax
+      add_target rust-store-native ;;
+
     tests/bootstrap-patch.sh|seed/sources/patch-*.lock)
       add_preflight shell-syntax
       add_target bootstrap-patch
