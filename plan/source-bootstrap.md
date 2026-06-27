@@ -268,9 +268,20 @@ upward:
      is a DYNAMIC ELF interp=/td/store, interned at `/td/store`, and RUN in the store-ns own-root
      (`/gnu/store` ABSENT) → "Hello, world!". First from-source GNU userland program built + run from
      `/td/store`, unmixed from guix. DURABLE: pinned-input, no-guix (no `/gnu/store` bytes in `libc.so.6`
-     NOR in the built `hello`), content-addr, behavioral (hello runs → "Hello, world!"), structural. Next:
-     more mesboot userland (make/sed/coreutils/bash), then the final toolchain (newer binutils → gcc →
-     modern dynamic glibc) built DYNAMIC against the `/td/store` glibc.
+     NOR in the built `hello`), content-addr, behavioral (hello runs → "Hello, world!"), structural.
+   - **modern binutils 2.44** ✅ DONE (2026-06-27) (brick 6/7 — the FINAL modern toolchain, rung A; human
+     picked this direction after #192) — the `bootstrap-binutils-244-store-native` gate (`mk/gates/406`): the
+     `/td/store` toolchain (gcc-mesboot1 4.6.4 + binutils-mesboot + shared glibc 2.16.0) builds **MODERN GNU
+     Binutils 2.44** from source (unmodified `./configure && make`) — the `binutils-boot0` of guix's
+     final-toolchain ladder, td-native. The as/ld/ar are DYNAMIC (interp=/td/store), interned at `/td/store`,
+     and RUN in the own-root: they report 2.44 AND assemble+link a program → 42, `/gnu/store` ABSENT. Built via
+     TWO build-wrappers (CC bakes /td/store interp for target as/ld; CC_FOR_BUILD bakes the live build-dir
+     interp for in-tree build tools like `chew`), `-std=gnu99` (binutils 2.44 is C99+; gcc 4.6.4 default is
+     gnu89), cross-style, `--disable-gold` (gold is C++; ld.bfd is td's linker — own-then-diverge). KEY
+     DERISK: gcc-mesboot1 **4.6.4** builds binutils 2.44 — no need to bridge to gcc-mesboot 4.9.4 first.
+     DURABLE: pinned-input, no-guix (no `/gnu/store` in `libc.so.6` NOR `ld`), content-addr, behavioral
+     (modern as/ld 2.44 run+link → 42), structural. Next: `gcc-boot0` (the current gcc, the big one;
+     gmp/mpfr/mpc + libstdc++-boot0), then glibc/binutils/gcc-final, then retire the guix toolchain seed.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
