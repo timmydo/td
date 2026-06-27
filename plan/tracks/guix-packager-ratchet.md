@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: guix-packager-ratchet
 handle: claude-fable-a94246
 date: 2026-06-20
