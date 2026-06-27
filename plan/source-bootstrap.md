@@ -304,9 +304,20 @@ upward:
      derives it from CC on native + strips flags → CC is a -static wrapper SCRIPT); fixincludes doubled header
      path (`--with-build-sysroot=<glibc>` + `--with-native-system-header-dir=/include`, not both absolute).
      DURABLE: pinned-input, no-guix (no /gnu/store in gcc 14's gcc/g++/cpp/cc1 NOR libc.so.6), content-addr,
-     behavioral (C AND C++/libstdc++ dynamic /td/store → 42), structural. Next: glibc-final (a MODERN glibc,
-     which unblocks the [[td-rust-store-native-track]] Rust userland that needs glibc ≥ 2.17), then
-     binutils-final, then brick 8 — retire the guix toolchain seed.
+     behavioral (C AND C++/libstdc++ dynamic /td/store → 42), structural.
+   - **MODERN glibc 2.41 at /td/store** ✅ DONE (2026-06-27) (brick 6/7 — final toolchain, rung C; the FULL
+     modern toolchain) — the `bootstrap-glibc-241-store-native` gate (`mk/gates/412`): from the seed, td builds
+     the chain → GCC 4.9.4 → GCC 14.3.0 + a sandbox-runnable **binutils 2.44**, then with them builds **MODERN
+     glibc 2.41** (guix's glibc-final, a SHARED libc) against the kernel headers. 2.41 is interned at `/td/store`
+     and gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++) program against the NEW glibc 2.41 (interp=/td/store
+     glibc 2.41) that runs in the own-root → 42, `/gnu/store` ABSENT. **The full modern toolchain (gcc 14.3.0 +
+     binutils 2.44 + glibc 2.41) now lives at `/td/store`, all from the seed** — and this unblocks
+     [[td-rust-store-native-track]] (#196, needs glibc ≥ 2.17). glibc 2.41 builds smoothly with the modern gcc
+     (2 fixes vs glibc 2.16.0's 7); glibc-2.41-specific: needs modern binutils 2.44 (2.20.1a too old) built
+     SANDBOX-runnable (build-dir interp), `gawk` by name, and it FORBIDS DT_RPATH *and* DT_RUNPATH in libc.so.6
+     → bake no -rpath, give the build tools glibc 2.16.0 via LD_LIBRARY_PATH. DURABLE: pinned-input, no-guix,
+     content-addr, behavioral (C AND C++ vs glibc 2.41 → 42 from /td/store), structural. Next: binutils-final
+     (optional — binutils 2.44 already at /td/store), then brick 8 — retire the guix toolchain seed.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
