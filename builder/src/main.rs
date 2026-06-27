@@ -785,7 +785,12 @@ fn realize_drv(
                 return e;
             }
             if let Some(ts) = td_store {
-                if let Some(base) = e.strip_prefix(store::store_dir().as_str()).and_then(|s| s.strip_prefix('/')) {
+                // Re-key by BASENAME (store hashes are unique), so a seed staging-store that holds BOTH
+                // /gnu/store deps AND /td/store td-built deps (e.g. a chained /td/store toolchain, brick 8)
+                // binds every input from the seed regardless of its canonical prefix — not only paths under
+                // the active store_dir(). Bare entries whose basename isn't in the seed pass through.
+                let base = e.rsplit('/').next().unwrap_or(e.as_str());
+                if !base.is_empty() {
                     let on_disk = ts.join(base);
                     if on_disk.exists() {
                         return format!("{e}\t{}", on_disk.display());
@@ -3503,12 +3508,23 @@ fn main() -> ExitCode {
                         )
                     }
                 };
-                let (store_dbs, td_store): (Vec<String>, Option<&Path>) =
+                let (mut store_dbs, td_store): (Vec<String>, Option<&Path>) =
                     match (&seed_store, &seed_db) {
                         (Some(s), Some(d)) => (vec![d.clone()], Some(Path::new(s))),
                         (None, None) => (vec![store_db.clone()], None),
                         _ => return Err("TD_SEED_STORE/TD_SEED_DB must be set together".into()),
                     };
+                // TD_EXTRA_DBS (colon-separated) merges ADDITIONAL store DBs alongside the primary
+                // one via closure_multi — e.g. a td-BUILT toolchain's own db (its /td/store outputs +
+                // refs) chained beside the guix seed, so a corpus recipe builds with the /td/store
+                // toolchain (brick 8). The dep's FILES are staged from td_store/<base> like any td dep;
+                // this only ADDS its closure edges, leaving the seed db's refs intact (store-add into
+                // the seed db would truncate them). Empty/unset → unchanged single-db behavior.
+                if let Ok(extra) = std::env::var("TD_EXTRA_DBS") {
+                    for d in extra.split(':').filter(|s| !s.is_empty()) {
+                        store_dbs.push(d.to_string());
+                    }
+                }
                 let recipe_json =
                     std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
                 build_recipe(

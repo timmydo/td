@@ -12,23 +12,15 @@
 //! add-a-LOAD-segment dance; if that is ever required, `set_interp` errors loudly rather
 //! than corrupting the file — a deliberate, visible boundary, not a silent truncation.
 //!
-//! Scope: 64-bit little-endian ELF (x86-64), the only class td produces/consumes. Any
+//! Scope: 32- and 64-bit little-endian ELF (i686 + x86-64) — the bootstrap toolchain is i686. Any
 //! other class/endianness is rejected.
 
 use std::path::Path;
 
-// ELF64 header field offsets (little-endian).
+// ELF identification (class-independent).
 const EI_MAG: &[u8] = b"\x7fELF";
-const EI_CLASS: usize = 4; // 2 = ELFCLASS64
+const EI_CLASS: usize = 4; // 1 = ELFCLASS32, 2 = ELFCLASS64
 const EI_DATA: usize = 5; // 1 = ELFDATA2LSB
-const E_PHOFF: usize = 0x20; // u64
-const E_PHENTSIZE: usize = 0x36; // u16
-const E_PHNUM: usize = 0x38; // u16
-
-// Program-header (ELF64) field offsets within one entry.
-const P_TYPE: usize = 0x00; // u32
-const P_OFFSET: usize = 0x08; // u64
-const P_FILESZ: usize = 0x20; // u64
 const PT_INTERP: u32 = 3;
 
 fn u16le(b: &[u8], off: usize) -> Result<u16, String> {
@@ -50,26 +42,37 @@ fn u64le(b: &[u8], off: usize) -> Result<u64, String> {
 /// Locate the PT_INTERP program header and return `(file_offset, filesz)` of its
 /// interpreter string, or `None` if the ELF has no interpreter (e.g. a shared object).
 fn interp_slot(b: &[u8]) -> Result<Option<(usize, usize)>, String> {
-    if b.len() < 64 || &b[0..4] != EI_MAG {
+    if b.len() < 52 || &b[0..4] != EI_MAG {
         return Err("not an ELF file (bad magic)".into());
     }
-    if b[EI_CLASS] != 2 {
-        return Err("not ELFCLASS64 (only 64-bit ELF is supported)".into());
-    }
+    // Both classes are supported: ELFCLASS32 (i686 — the bootstrap toolchain) and ELFCLASS64
+    // (x86-64). The header + program-header field offsets differ by class; PT_INTERP is the same.
+    let is64 = match b[EI_CLASS] {
+        1 => false,
+        2 => true,
+        c => return Err(format!("unknown ELF class {c} (only ELFCLASS32/64 supported)")),
+    };
     if b[EI_DATA] != 1 {
         return Err("not ELFDATA2LSB (only little-endian ELF is supported)".into());
     }
-    let phoff = u64le(b, E_PHOFF)? as usize;
-    let phentsize = u16le(b, E_PHENTSIZE)? as usize;
-    let phnum = u16le(b, E_PHNUM)? as usize;
-    if phentsize < 0x38 {
+    // (e_phoff, e_phentsize, e_phnum) and the min plausible phentsize, per class.
+    let (phoff, phentsize, phnum, min_phentsize) = if is64 {
+        (u64le(b, 0x20)? as usize, u16le(b, 0x36)? as usize, u16le(b, 0x38)? as usize, 0x38)
+    } else {
+        (u32le(b, 0x1C)? as usize, u16le(b, 0x2A)? as usize, u16le(b, 0x2C)? as usize, 0x20)
+    };
+    if phentsize < min_phentsize {
         return Err(format!("implausible e_phentsize {phentsize}"));
     }
     for i in 0..phnum {
         let ph = phoff + i * phentsize;
-        if u32le(b, ph + P_TYPE)? == PT_INTERP {
-            let off = u64le(b, ph + P_OFFSET)? as usize;
-            let sz = u64le(b, ph + P_FILESZ)? as usize;
+        if u32le(b, ph)? == PT_INTERP {
+            // p_offset / p_filesz: u64 at +0x08/+0x20 (ELF64) vs u32 at +0x04/+0x10 (ELF32).
+            let (off, sz) = if is64 {
+                (u64le(b, ph + 0x08)? as usize, u64le(b, ph + 0x20)? as usize)
+            } else {
+                (u32le(b, ph + 0x04)? as usize, u32le(b, ph + 0x10)? as usize)
+            };
             if off + sz > b.len() {
                 return Err("PT_INTERP string runs past end of file".into());
             }
@@ -137,13 +140,34 @@ mod tests {
         b[0..4].copy_from_slice(EI_MAG);
         b[EI_CLASS] = 2; // ELFCLASS64
         b[EI_DATA] = 1; // little-endian
-        b[E_PHOFF..E_PHOFF + 8].copy_from_slice(&(phoff as u64).to_le_bytes());
-        b[E_PHENTSIZE..E_PHENTSIZE + 2].copy_from_slice(&(phentsize as u16).to_le_bytes());
-        b[E_PHNUM..E_PHNUM + 2].copy_from_slice(&1u16.to_le_bytes());
-        // the single program header: PT_INTERP, p_offset, p_filesz
-        b[phoff + P_TYPE..phoff + P_TYPE + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
-        b[phoff + P_OFFSET..phoff + P_OFFSET + 8].copy_from_slice(&(interp_off as u64).to_le_bytes());
-        b[phoff + P_FILESZ..phoff + P_FILESZ + 8].copy_from_slice(&(slot as u64).to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&(phoff as u64).to_le_bytes()); // e_phoff
+        b[0x36..0x38].copy_from_slice(&(phentsize as u16).to_le_bytes()); // e_phentsize
+        b[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        // the single program header: PT_INTERP, p_offset (+0x08), p_filesz (+0x20)
+        b[phoff..phoff + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+        b[phoff + 0x08..phoff + 0x10].copy_from_slice(&(interp_off as u64).to_le_bytes());
+        b[phoff + 0x20..phoff + 0x28].copy_from_slice(&(slot as u64).to_le_bytes());
+        b[interp_off..interp_off + interp.len()].copy_from_slice(interp.as_bytes());
+        b
+    }
+
+    // The 32-bit (i686) analogue — the class the bootstrap toolchain (cc1/as/ld) actually is.
+    fn synth_elf32(interp: &str) -> Vec<u8> {
+        let phoff = 52usize; // ELF32 header is 52 bytes
+        let phentsize = 32usize; // ELF32 program-header entry
+        let interp_off = phoff + phentsize;
+        let slot = interp.len() + 1;
+        let mut b = vec![0u8; interp_off + slot];
+        b[0..4].copy_from_slice(EI_MAG);
+        b[EI_CLASS] = 1; // ELFCLASS32
+        b[EI_DATA] = 1; // little-endian
+        b[0x1c..0x20].copy_from_slice(&(phoff as u32).to_le_bytes()); // e_phoff (u32)
+        b[0x2a..0x2c].copy_from_slice(&(phentsize as u16).to_le_bytes()); // e_phentsize
+        b[0x2c..0x2e].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        // the single program header: PT_INTERP, p_offset (+0x04), p_filesz (+0x10) — all u32
+        b[phoff..phoff + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+        b[phoff + 0x04..phoff + 0x08].copy_from_slice(&(interp_off as u32).to_le_bytes());
+        b[phoff + 0x10..phoff + 0x14].copy_from_slice(&(slot as u32).to_le_bytes());
         b[interp_off..interp_off + interp.len()].copy_from_slice(interp.as_bytes());
         b
     }
@@ -186,6 +210,19 @@ mod tests {
         assert!(err.contains("does not fit"), "unexpected error: {err}");
         // and the file is unchanged
         assert_eq!(read_interp(&f).unwrap().as_deref(), Some("/lib64/ld.so"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reads_and_sets_interp_elf32() {
+        // i686 PT_INTERP round-trip: read, then rewrite in place to a shorter path.
+        let dir = std::env::temp_dir().join(format!("elf-test-32-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a");
+        std::fs::write(&f, synth_elf32("/lib/ld-linux.so.2")).unwrap();
+        assert_eq!(read_interp(&f).unwrap().as_deref(), Some("/lib/ld-linux.so.2"));
+        set_interp(&f, "/td/store/ld").unwrap();
+        assert_eq!(read_interp(&f).unwrap().as_deref(), Some("/td/store/ld"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
