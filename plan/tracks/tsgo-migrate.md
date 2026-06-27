@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: tsgo-migrate
 handle: claude-fable-300f35
 date: 2026-06-20

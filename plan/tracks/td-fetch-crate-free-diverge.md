@@ -1,6 +1,6 @@
 section: mainline
-status: claimed
+status: done
 handle: claude-fable-65585b
-date: 2026-06-24
+date: 2026-06-25
 title: td-fetch-crate-free-diverge
 summary: Phase-2b follow-up — apply the corpus diverge (#169) to td-fetch, the one package that already had BOTH a guix-path gate (rust-fetch, 348) AND a crate-free twin (rust-fetch-crate-free, 354) but was left out of #169's scope. Migrate-in-place: overwrite 348 with 354's body (so the canonical `rust-fetch` target builds td-fetch's 73-crate closure GUIX-FREE — td-fetch's OWN fetcher gets each crate from static.crates.io via warm-td-fetch-crates.sh, interned as a vendor tree, TD_VENDOR_DIR), DELETE the now-duplicate 354, and strip tests/td-fetch.lock to the toolchain SEED only (0 crate FODs, 7 toolchain lines). td-fetch's source is the LOCAL fetch/ dir (not a crates.io crate), so no source FOD to drop. Net: ONE canonical rust-fetch gate, guix-free; td-fetch.lock loses its 73 /gnu/store crate strings. CALLED OUT (directive 3): restructures 1 gate (body replaced) + deletes 1 gate + strips 1 lock + a stale-comment fix in check.sh/warm-td-fetch-crates.sh. Toolchain seed stays guix-built (retired last). Remaining guix-crate surface after this: cat-uutils(139)/td-feed(73)/russh(188, local src)/td-ts-eval(128)/td-vendor-demo(3). Notes in plan/td-fetch-crate-free-diverge.md.
