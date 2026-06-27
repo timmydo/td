@@ -1,0 +1,16 @@
+# seed/sources/rust-1.96.0.lock — the UPSTREAM Rust 1.96.0 release tarball (rustc + cargo +
+# std for x86_64-unknown-linux-gnu), the GUIX-FREE seed for td's /td/store Rust toolchain
+# (rust-store-native track). These bytes come from the Rust project's OWN CDN
+# (static.rust-lang.org), NOT from a guix build — verified: the rustc/cargo/std ELFs carry
+# ZERO /gnu/store strings and no guix provenance. The rust-store-native gate RELINKS this
+# binary tarball to /td/store (td's own ELF PT_INTERP rewriter, no patchelf), eliminating
+# guix at the source rather than relabeling it (NOT the demoted store-relocate of a guix
+# binary). The sha256 content-address IS the oracle (no guix origin / no differential).
+#
+# Warmed guix-free by tools/warm-bootstrap-sources.sh (HOST prep, td-fetch + the shared
+# td-feed) into .td-build-cache/sources/<file>; the gate reads it offline and re-verifies the
+# sha256 itself. Dropping this lock needs NO check.sh edit (the warm is manifest-driven).
+# Bump url + sha256 + file together; sha256 is the value published at <url>.sha256.
+url https://static.rust-lang.org/dist/rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz
+sha256 c1130e4f7976f230766ab062b105b1fb050d6a78177db2246a5878fd6a589680
+file rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz
