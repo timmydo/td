@@ -778,6 +778,10 @@ map_path() {
       add_preflight shell-syntax
       add_target store-relocate ;;
 
+    tests/store-native-profile.sh)
+      add_preflight shell-syntax
+      add_target store-native-profile ;;
+
     tests/seed-tarball.sh|tools/build-seed-tarball.sh)
       add_preflight shell-syntax
       add_target seed-tarball ;;
