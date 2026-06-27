@@ -230,7 +230,7 @@ upward:
      can't see: gcc-4.9.4 is `.tar.bz2` + no `bzip2` in the sandbox → store-bzip2 piped to `tar` (like
      binutils). The Mes full-source bootstrap now reaches a modern GCC; the toolchain at `/td/store`
      (the store-native step below) is next.
-   - **toolchain at /td/store** 🚧 (first `/td/store`-native step) — the `bootstrap-toolchain-store-native`
+   - **toolchain at /td/store** ✅ DONE (2026-06-26, #188) (first `/td/store`-native step) — the `bootstrap-toolchain-store-native`
      gate (`mk/gates/398`): the seed-built toolchain is already STATIC + guix-free (the `[no-guix]` legs), so
      it needs NO relocation — the guix-free stage0 td-builder `store-add-recursive`s gcc-mesboot + binutils-
      mesboot + glibc-mesboot **content-addressed into `/td/store`** (`/td/store/<nar-hash>-<name>`), and
@@ -240,7 +240,7 @@ upward:
      is the registered `/td/store` path **td-subst** can serve (chain-caching), and the unmixed base the
      userland builds on. Proven on the cached-chain dev harness via `tools/check-rung.sh` (3 fast in-sandbox
      iterations). Next: the DYNAMIC toolchain at `/td/store` (below).
-   - **dynamic toolchain at /td/store** 🚧 (brick 6 first rung) — the `bootstrap-glibc-shared-store-native`
+   - **dynamic toolchain at /td/store** ✅ DONE (2026-06-26, #190) (brick 6 first rung) — the `bootstrap-glibc-shared-store-native`
      gate (`mk/gates/400`): from the seed, build the chain → gcc-mesboot1 + binutils-mesboot → a SHARED glibc
      2.16.0 (`libc.so.6` + `ld-linux.so.2`), intern it + gcc-mesboot1 + binutils content-addressed into
      `/td/store`, and in the store-ns own-root (`/gnu/store` ABSENT) link a DYNAMIC C program whose
@@ -251,15 +251,26 @@ upward:
      (libc.so/libpthread.so ld-scripts → bare names so `ld` resolves via `-L` the `/td/store` lib). Proven on
      the dev harness via `tools/check-rung.sh`. DURABLE: no-guix, content-addr, behavioral (interp=/td/store,
      runs → 42), structural (/td/store is the store, /gnu/store absent). Next: the gcc-mesboot-wrapper (below).
-   - **gcc-mesboot-wrapper at /td/store** 🚧 (brick 6 rung 2; the modern-toolchain enabler) — the
+   - **gcc-mesboot-wrapper at /td/store** ✅ DONE (2026-06-26, #191) (brick 6 rung 2; the modern-toolchain enabler) — the
      `bootstrap-gcc-mesboot-wrapper` gate (`mk/gates/402`): generate a wrapper `gcc` at `/td/store` so a
      PLAIN invocation (no flags — as a real `configure`/`make` calls it) produces a DYNAMIC `/td/store`
      binary (interp + RUNPATH = `/td/store`; glibc headers/crt/libc baked in, since gcc-mesboot1's OWN baked
      paths are the defunct build-time dirs). Proven in the store-ns own-root (`/gnu/store` ABSENT): the plain
      wrapped gcc compiles a single-file AND a 2-TU program → both dynamic, interp=/td/store, run → 42. This
      is guix's gcc-mesboot-wrapper made td-native — what lets the mesboot userland (bash/coreutils/…) and the
-     final modern toolchain build with UNMODIFIED build systems. Next: the mesboot userland, then the final
-     toolchain (newer binutils → gcc → modern dynamic glibc) built DYNAMIC against the `/td/store` glibc.
+     final modern toolchain build with UNMODIFIED build systems.
+   - **GNU hello userland** ✅ DONE (2026-06-26) (brick 6 rung 3; first real package) — the
+     `bootstrap-hello-userland` gate (`mk/gates/404`): the `/td/store` toolchain (gcc-mesboot1 + binutils-
+     mesboot + shared glibc 2.16.0) compiles a REAL autotools package — GNU hello 2.10 — from source (an
+     unmodified `./configure && make`). The build runs in the loop sandbox via a build-wrapper gcc (real
+     `-isystem/-B/-L` at the live build-dir toolchain, `/td/store` interp + RUNPATH baked as header strings)
+     and CROSS-style (`--build != --host`, so configure never runs a target binary); the resulting `hello`
+     is a DYNAMIC ELF interp=/td/store, interned at `/td/store`, and RUN in the store-ns own-root
+     (`/gnu/store` ABSENT) → "Hello, world!". First from-source GNU userland program built + run from
+     `/td/store`, unmixed from guix. DURABLE: pinned-input, no-guix (no `/gnu/store` bytes in `libc.so.6`
+     NOR in the built `hello`), content-addr, behavioral (hello runs → "Hello, world!"), structural. Next:
+     more mesboot userland (make/sed/coreutils/bash), then the final toolchain (newer binutils → gcc →
+     modern dynamic glibc) built DYNAMIC against the `/td/store` glibc.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.

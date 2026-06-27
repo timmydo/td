@@ -1,0 +1,8 @@
+# seed/sources/hello-2.10.lock — GNU hello 2.10, the first userland package built from source by the
+# DYNAMIC /td/store toolchain (source-bootstrap brick 6 userland). The canonical minimal autotools package
+# (guix's hello-mesboot uses 2.10 too — it builds cleanly with the old mesboot gcc; newer hello needs a
+# Gnulib that breaks on the bootstrap limits.h). td-fetched (tools/warm-bootstrap-sources.sh). nix-base32
+# cross-checks guix's pin 0ssi1wpaf7plaswqqjwigppsg5fyh99vdlb9kzl7c9lng89ndq1i.
+url https://ftp.gnu.org/gnu/hello/hello-2.10.tar.gz
+sha256 31e066137a962676e89f69d1b65382de95a7ef7d914b8cb956f41ea72e0f516b
+file hello-2.10.tar.gz
