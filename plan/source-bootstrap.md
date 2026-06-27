@@ -280,8 +280,20 @@ upward:
      gnu89), cross-style, `--disable-gold` (gold is C++; ld.bfd is td's linker — own-then-diverge). KEY
      DERISK: gcc-mesboot1 **4.6.4** builds binutils 2.44 — no need to bridge to gcc-mesboot 4.9.4 first.
      DURABLE: pinned-input, no-guix (no `/gnu/store` in `libc.so.6` NOR `ld`), content-addr, behavioral
-     (modern as/ld 2.44 run+link → 42), structural. Next: `gcc-boot0` (the current gcc, the big one;
-     gmp/mpfr/mpc + libstdc++-boot0), then glibc/binutils/gcc-final, then retire the guix toolchain seed.
+     (modern as/ld 2.44 run+link → 42), structural.
+   - **gcc-mesboot 4.9.4 + C++ wrapper at /td/store** ✅ DONE (2026-06-27) (brick 6/7 — final toolchain, rung
+     B0, the bridge) — the `bootstrap-gcc-mesboot-494-store-native` gate (`mk/gates/408`): the 4.6.4 `/td/store`
+     wrapper builds C (binutils 2.44, rung A) but modern `gcc-boot0` = **gcc 14.3.0** needs C++14, so this
+     bridges `/td/store` to **GCC 4.9.4** (the FINAL mesboot gcc, full C++11). From the seed: chain →
+     gcc-mesboot1 + binutils-mesboot + glibc 2.16.0 (STATIC, to build 4.9.4) → GCC 4.9.4, AND a SHARED glibc
+     2.16.0 (the wrapper runtime); interns 4.9.4 + the shared glibc at `/td/store` + a gcc/g++ WRAPPER. Proven
+     in the own-root (`/gnu/store` ABSENT): the wrapped gcc AND g++ compile a DYNAMIC C and C++ program →
+     interp=/td/store, run → 42. **C++ at /td/store** is the new capability (the compiler gcc-boot0 will use).
+     4.9.4 built STATIC vs static glibc 2.16.0 (#185 recipe); wrapper links DYNAMIC vs the shared glibc 2.16.0.
+     DURABLE: pinned-input, no-guix, content-addr, behavioral (C AND C++ dynamic /td/store → 42), structural.
+     Next: `gcc-boot0` = **gcc 14.3.0** built by this 4.9.4 wrapper (the big one; gmp/mpfr/mpc +
+     libstdc++-boot0; OPEN: 4.9.4's partial C++14 vs gcc 14, or own-then-diverge to an easier modern gcc —
+     the human's call), then glibc/binutils/gcc-final, then retire the guix toolchain seed.
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
