@@ -45,10 +45,19 @@ Running an upstream rustc from `/td/store` needs **glibc ≥ 2.17** there (rustc
   `/lib64/ld-linux-x86-64.so.2` -> `/td/store/ld`, confirmed by readelf, in-place, valid
   ELF, zero `/gnu/store`. RUNPATH needs no rewrite (already relative), so this one feature
   covers the relink.
-- **Next — 2b/2c:** the relink RECIPE (`store-add-recursive` the rust tree into `/td/store`,
-  `elf-set-interp` rustc/cargo, populate the tree's `lib/` with the `/td/store` glibc+libgcc_s
-  so `$ORIGIN/../lib` resolves) + the structural gate (interp ∈ `/td/store`, no `/gnu/store`,
-  closure-complete) + supply-chain leg + verified-red. Runtime leg PENDING `glibc-final`.
+- **2b/2c — DONE & verified (commit: relink + structural gate).** `mk/gates/410-rust-store-native.mk`
+  + `tests/rust-store-native.sh`: the guix-free stage0 td-builder relinks the upstream
+  rustc/cargo interp -> `/td/store` (`elf-set-interp`) and interns the tree guix-free
+  (`store-add-recursive`, `TD_STORE_DIR=/td/store`). GATE GREEN under `./check.sh
+  rust-store-native`: [supply-chain] sha==pin, [provenance] zero /gnu/store, [structural]
+  interp relinked to /td/store + interned content-addressed at
+  `/td/store/<hash>-rust-1.96.0-store-native` with zero /gnu/store. Pin migrated to
+  `seed/sources/rust-1.96.0.lock` (manifest-warmed, no check.sh edit). The runtime leg is
+  the explicit `[PENDING glibc-final]` echo, not faked.
+- **Next:** when `glibc-final` (>=2.17) lands at `/td/store`, populate the interned tree's
+  `lib/` with the `/td/store` glibc loader + libc + libgcc_s and flip the runtime leg green
+  (RUN rustc from the `store-ns` own-root, `/gnu/store` absent). Then rung 3/4: build the
+  Rust userland tools with the store-native rustc + assemble via `td-builder profile`.
 
 ## Brick ladder
 
@@ -76,8 +85,11 @@ Running an upstream rustc from `/td/store` needs **glibc ≥ 2.17** there (rustc
 ## Verified-red plan
 
 - rust-upstream-fetch: corrupt the pinned sha → fetch verification fails (red).
-- rust-relink structural: skip the interp/RUNPATH patch on one binary → the
-  "no /gnu/store" / "interp→/td/store" assertion finds a residual `/gnu/store` (red).
+- rust-relink structural — DONE 2026-06-26: skipped the `elf-set-interp` loop and re-ran
+  `./check.sh rust-store-native` → the gate REDDENED exactly at the structural leg:
+  `FAIL: interp of rustc not relinked to /td/store (got: /lib64/ld-linux-x86-64.so.2)`.
+  Restored the green script (committed first, per [[td-commit-before-red-variants]]). So the
+  structural assertion is load-bearing — the relink is the thing it checks.
 
 ## Parallel-safety
 
