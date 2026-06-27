@@ -1602,7 +1602,17 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
 /// store, so the profile is a thin, GC-friendly view that swaps atomically when rebuilt.
 ///
 /// Usage: profile PROFILE-DIR PKG-OUT...
-fn build_profile(profile_dir: &str, pkgs: &[String]) -> Result<usize, String> {
+/// Union the bin/sbin of each package output into a symlink-tree profile. When
+/// `store_native_prefix` is `Some(prefix)`, the symlink TARGETS are the LOGICAL store paths
+/// (`<prefix>/<basename(pkg)>/<sub>/<entry>`) rather than the physical PKG-OUT path passed in
+/// — so the profile resolves inside a store-ns own-root where `prefix` (e.g. `/td/store`) is
+/// the bound store but the physical scratch dir is absent. `None` keeps the thin-view behavior
+/// (link straight at PKG-OUT as given). Enumeration always reads the physical PKG-OUT dir.
+fn build_profile(
+    profile_dir: &str,
+    pkgs: &[String],
+    store_native_prefix: Option<&str>,
+) -> Result<usize, String> {
     use std::os::unix::fs::symlink;
     let pdir = Path::new(profile_dir);
     // Rebuild fresh (idempotent) — a profile is a derived view, not state.
@@ -1630,15 +1640,28 @@ fn build_profile(profile_dir: &str, pkgs: &[String]) -> Result<usize, String> {
             entries.sort_by_key(|e| e.file_name());
             for ent in entries {
                 let dst = dst_dir.join(ent.file_name());
-                if dst.exists() {
+                // symlink_metadata (lexists), not exists(): a store-native link is a LOGICAL
+                // path that dangles on the host, so exists() would follow it and miss the clash.
+                if dst.symlink_metadata().is_ok() {
                     return Err(format!(
                         "profile collision: `{sub}/{}' is provided by more than one package (last: {pkg})",
                         ent.file_name().to_string_lossy()
                     ));
                 }
-                // Absolute symlink INTO the store (so the profile is a thin view).
-                symlink(ent.path(), &dst)
-                    .map_err(|e| format!("symlink {} -> {}: {e}", dst.display(), ent.path().display()))?;
+                // Absolute symlink INTO the store (so the profile is a thin view). In
+                // store-native mode, retarget to the LOGICAL store path so it resolves in
+                // the own-root; otherwise link straight at the physical PKG-OUT entry.
+                let target = match store_native_prefix {
+                    Some(prefix) => {
+                        let base = pkgp
+                            .file_name()
+                            .ok_or_else(|| format!("package `{pkg}' has no basename"))?;
+                        Path::new(prefix).join(base).join(sub).join(ent.file_name())
+                    }
+                    None => ent.path(),
+                };
+                symlink(&target, &dst)
+                    .map_err(|e| format!("symlink {} -> {}: {e}", dst.display(), target.display()))?;
                 linked += 1;
             }
         }
@@ -3641,17 +3664,39 @@ fn main() -> ExitCode {
         // td-builder profile — build a profile symlink tree (the user-package-manager
         // profile layer): union the bin/sbin of the given package outputs into PROFILE-DIR.
         // See build_profile. Usage: profile PROFILE-DIR PKG-OUT...
-        Some("profile") if args.len() >= 4 => match build_profile(&args[2], &args[3..]) {
-            Ok(n) => {
-                eprintln!("td-builder: profile {} — linked {n} entr{}", args[2], if n == 1 { "y" } else { "ies" });
-                println!("{}", args[2]);
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("td-builder: profile: {e}");
+        // profile [--store-native] PROFILE-DIR PKG-OUT… — union the packages' bin/sbin into a
+        // symlink-tree profile. With --store-native the links target the LOGICAL store
+        // (store::store_dir(), e.g. /td/store) so the profile resolves in a store-ns own-root.
+        Some("profile") if args.len() >= 4 => {
+            let (store_native, rest): (bool, &[String]) = if args[2] == "--store-native" {
+                (true, &args[3..])
+            } else {
+                (false, &args[2..])
+            };
+            if rest.len() < 2 {
+                eprintln!("usage: td-builder profile [--store-native] PROFILE-DIR PKG-OUT...");
                 ExitCode::FAILURE
+            } else {
+                let sd = store::store_dir();
+                let prefix = if store_native { Some(sd.as_str()) } else { None };
+                match build_profile(&rest[0], &rest[1..], prefix) {
+                    Ok(n) => {
+                        eprintln!(
+                            "td-builder: profile {} — linked {n} entr{}{}",
+                            rest[0],
+                            if n == 1 { "y" } else { "ies" },
+                            if store_native { " (store-native)" } else { "" }
+                        );
+                        println!("{}", rest[0]);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("td-builder: profile: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
             }
-        },
+        }
         // td-builder store-relocate — relocate ROOT's closure from guix's /gnu/store into
         // DEST-DIR as a td /td/store seed (size-preserving /gnu/store -> /td//store rewrite;
         // see relocate_closure). user-pm Phase 2: the one-time break from guix. Usage:
@@ -3979,6 +4024,61 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // build_profile --store-native: enumerate the PHYSICAL package dir but point the
+    // symlinks at the LOGICAL store path, so the profile resolves in a store-ns own-root.
+    #[test]
+    fn profile_store_native_links_logical_paths() {
+        let dir = std::env::temp_dir().join(format!("prof-sn-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let pkg = dir.join("aaaa-hello");
+        std::fs::create_dir_all(pkg.join("bin")).unwrap();
+        std::fs::write(pkg.join("bin").join("hello"), b"#!/x\n").unwrap();
+        let prof = dir.join("profile");
+
+        // store-native: link target is <prefix>/<basename(pkg)>/bin/hello, NOT the physical pkg.
+        let n = build_profile(
+            prof.to_str().unwrap(),
+            std::slice::from_ref(&pkg.to_string_lossy().into_owned()),
+            Some("/td/store"),
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let link = std::fs::read_link(prof.join("bin").join("hello")).unwrap();
+        assert_eq!(link, Path::new("/td/store/aaaa-hello/bin/hello"));
+
+        // default (None): link straight at the physical PKG-OUT entry.
+        let n2 = build_profile(
+            prof.to_str().unwrap(),
+            std::slice::from_ref(&pkg.to_string_lossy().into_owned()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(n2, 1);
+        let link2 = std::fs::read_link(prof.join("bin").join("hello")).unwrap();
+        assert_eq!(link2, pkg.join("bin").join("hello"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // build_profile still refuses a name collision across packages (store-native or not).
+    #[test]
+    fn profile_rejects_collision() {
+        let dir = std::env::temp_dir().join(format!("prof-col-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        for p in ["aaaa-a", "bbbb-b"] {
+            std::fs::create_dir_all(dir.join(p).join("bin")).unwrap();
+            std::fs::write(dir.join(p).join("bin").join("dup"), b"x").unwrap();
+        }
+        let pkgs = vec![
+            dir.join("aaaa-a").to_string_lossy().into_owned(),
+            dir.join("bbbb-b").to_string_lossy().into_owned(),
+        ];
+        let err = build_profile(dir.join("profile").to_str().unwrap(), &pkgs, Some("/td/store"))
+            .unwrap_err();
+        assert!(err.contains("collision"), "unexpected: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // --auto: a lock entry names a dep whether it's written bare (declared inputs like
     // grep's `pcre2`) or hash-named (`<hash>-D-<version>`); a non-matching toolchain
