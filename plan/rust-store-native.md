@@ -31,9 +31,10 @@ Running an upstream rustc from `/td/store` needs **glibc ≥ 2.17** there (rustc
 
 ## Progress
 
-- **1a — DONE & verified (commit: pin + warm).** `tests/rust-upstream.lock` (rust 1.84.0,
-  official sha256, content-addressed path) + `tools/warm-rust-upstream.sh`. Warm ran green:
-  td-fetch pulled 343814532 bytes, sha matched, daemon-stored at the pinned path. ELF
+- **1a — DONE & verified (commit: pin + warm).** `tests/rust-upstream.lock` (rust 1.96.0
+  — the latest stable, human 2026-06-26; official sha256, content-addressed path) +
+  `tools/warm-rust-upstream.sh`. Warm ran green: td-fetch pulled 377083597 bytes, sha
+  matched, daemon-stored at the pinned path. ELF
   inspection of the fetched rustc/cargo/std: ZERO `/gnu/store` bytes, interp
   `/lib64/ld-linux-x86-64.so.2`, RUNPATH `$ORIGIN/../lib` (relative).
 - **2a — DONE & verified (commit: td-owned ELF rewriter).** `builder/src/elf.rs` +
