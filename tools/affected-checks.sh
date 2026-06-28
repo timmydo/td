@@ -408,7 +408,12 @@ map_path() {
 
     tests/rust-store-native.sh|seed/sources/rust-*.lock)
       add_preflight shell-syntax
-      add_target rust-store-native ;;
+      add_target rust-store-native
+      add_target rust-x86_64-runtime-store-native ;;
+
+    tests/rust-x86_64-runtime-store-native.sh|seed/sources/zlib-*.lock|mk/gates/416-rust-x86_64-runtime-store-native.mk)
+      add_preflight shell-syntax
+      add_target rust-x86_64-runtime-store-native ;;
 
     tests/bootstrap-patch.sh|seed/sources/patch-*.lock)
       add_preflight shell-syntax
