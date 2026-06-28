@@ -33,11 +33,14 @@ _xbin() {
 }
 
 # _mk_static_wrapper <gcc14> <glibc216-static> <gcc|g++> <out> — a single-token, -static i686 gcc-14
-# wrapper SCRIPT. build_gcc_14's CC_FOR_BUILD trick: gcc strips trailing flags from a plain
-# CC_FOR_BUILD on a native build, so the build CC must be ONE token (a script survives the munging).
+# wrapper SCRIPT for compiling the BUILD/host (i686) parts of the cross builds. build_gcc_14's
+# CC_FOR_BUILD trick: gcc strips trailing flags from a plain CC_FOR_BUILD on a native build, so the
+# build CC must be ONE token (a script survives the munging — and -isystem/-B hide inside it). The
+# glibc 2.16 headers (-isystem) + libs/crt (-B) are the i686 libc the host conftest/programs need
+# (else `fatal error: stdio.h`); gcc's own headers + libstdc++ come from gcc14 automatically.
 _mk_static_wrapper() {
   g14=$1; gst=$2; which=$3; dst=$4; csh=`command -v bash 2>/dev/null || command -v sh`
-  printf '#!%s\nexec "%s/bin/%s" -static -B%s/lib "$@"\n' "$csh" "$g14" "$which" "$gst" > "$dst"
+  printf '#!%s\nexec "%s/bin/%s" -static -isystem %s/include -B%s/lib "$@"\n' "$csh" "$g14" "$which" "$gst" "$gst" > "$dst"
   chmod 0555 "$dst"
 }
 
