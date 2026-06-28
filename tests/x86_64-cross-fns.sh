@@ -141,7 +141,7 @@ build_glibc_x86_64() {
         "$csh" ../configure --prefix=/td/store/glibc-2.41-x86_64 \
         --build=i686-pc-linux-gnu --host=$XTARGET \
         --with-headers="$sysroot/usr/include" --enable-kernel=3.2.0 --disable-werror --disable-nscd \
-        --with-binutils="$xbu/bin" libc_cv_slibdir=/td/store/glibc-2.41-x86_64/lib >cfg.log 2>&1 \
+        --with-binutils="$xbu/$XTARGET/bin" libc_cv_slibdir=/td/store/glibc-2.41-x86_64/lib >cfg.log 2>&1 \
       || { echo "x86_64 glibc configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xglibc-cfg.log" 2>/dev/null||true; cp config.log "$ROOT/.td-build-cache/_xglibc-config.log" 2>/dev/null||true; tail -30 cfg.log >&2; return 1; }
     env PATH="$xgccbin:$xbu/bin:$tb:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" \
         make $X86_MAKE_J >build.log 2>&1 \
