@@ -39,7 +39,7 @@ command -v cargo >/dev/null 2>&1 || { echo "warm-cargo-proxy: no cargo — skipp
 command -v tar >/dev/null 2>&1 || { echo "warm-cargo-proxy: no tar — skipping $crate-$ver" >&2; exit 0; }
 
 # Locate or build td-feed (the cargo-proxy binary).
-feed=$(ls "$root"/.td-build-cache/rust-feed/b/newstore/*/bin/td-feed 2>/dev/null | head -1 || true)
+feed=$(ls "$root"/.td-build-cache/td-feed/sd/newstore/*/bin/td-feed 2>/dev/null | head -1 || true)
 if [ -z "$feed" ] || [ ! -x "$feed" ]; then
   ( cd "$root/feed" && cargo build --release --quiet ) && feed="$root/feed/target/release/td-feed" || feed=""
 fi
