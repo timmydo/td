@@ -141,7 +141,7 @@ build_glibc_x86_64() {
         --build=i686-pc-linux-gnu --host=$XTARGET \
         --with-headers="$sysroot/usr/include" --enable-kernel=3.2.0 --disable-werror --disable-nscd \
         --with-binutils="$xbu/bin" libc_cv_slibdir=/td/store/glibc-2.41-x86_64/lib >cfg.log 2>&1 \
-      || { echo "x86_64 glibc configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xglibc-cfg.log" 2>/dev/null||true; tail -30 cfg.log >&2; return 1; }
+      || { echo "x86_64 glibc configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xglibc-cfg.log" 2>/dev/null||true; cp config.log "$ROOT/.td-build-cache/_xglibc-config.log" 2>/dev/null||true; tail -30 cfg.log >&2; return 1; }
     env PATH="$xgccbin:$xbu/bin:$tb:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" \
         make $X86_MAKE_J >build.log 2>&1 \
       || { echo "x86_64 glibc make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xglibc-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
@@ -214,13 +214,28 @@ build_gcc_x86_64_stage2() {
 run_x86_64_cross() {
   cpath=$1; gcc14=$2; gst=$3; gshared=$4; bu_i686=$5; kh=$6
   work=`mktemp -d`/x86; mkdir -p "$work"
-  sysroot="$work/sysroot"; mkdir -p "$sysroot/usr/include"
+  # X86_RUNG_CACHE (dev harness only): reuse the cross binutils + gcc stage1 (the unchanging early rungs)
+  # across runs, with a STABLE sysroot, so glibc/stage2 iterations skip ~20 min. The from-seed GATE
+  # leaves it UNSET → every rung builds fresh in $work (directive 1).
+  rc="${X86_RUNG_CACHE:-}"
+  if [ -n "$rc" ]; then sysroot="$rc/x-sysroot"; else sysroot="$work/sysroot"; fi
+  rm -rf "$sysroot"; mkdir -p "$sysroot/usr/include"
   tar -xzf "$kh" -C "$sysroot/usr/include" || { echo "x86_64 kernel headers unpack failed" >&2; return 1; }
 
   echo ">> [x1] cross binutils 2.44 (--target=$XTARGET)"
-  XBU="$work/binutils"; build_binutils_x86_64 "$cpath" "$gcc14" "$gst" "$bu_i686" "$sysroot" "$XBU" || return 1
+  if [ -n "$rc" ] && [ -x "$rc/x-binutils/bin/$XTARGET-as" ]; then
+    XBU="$rc/x-binutils"; echo "   (reusing cached cross binutils)"
+  else
+    if [ -n "$rc" ]; then XBU="$rc/x-binutils"; else XBU="$work/binutils"; fi
+    build_binutils_x86_64 "$cpath" "$gcc14" "$gst" "$bu_i686" "$sysroot" "$XBU" || return 1
+  fi
   echo ">> [x2] cross gcc 14.3.0 stage1 (C, no libc)"
-  XGCC1="$work/gcc1"; build_gcc_x86_64_stage1 "$cpath" "$gcc14" "$gst" "$bu_i686" "$XBU" "$sysroot" "$XGCC1" || return 1
+  if [ -n "$rc" ] && [ -x "$rc/x-gcc1/stage/td/store/gcc-14.3.0-x86_64/bin/$XTARGET-gcc" ]; then
+    XGCC1="$rc/x-gcc1"; echo "   (reusing cached cross gcc stage1)"
+  else
+    if [ -n "$rc" ]; then XGCC1="$rc/x-gcc1"; else XGCC1="$work/gcc1"; fi
+    build_gcc_x86_64_stage1 "$cpath" "$gcc14" "$gst" "$bu_i686" "$XBU" "$sysroot" "$XGCC1" || return 1
+  fi
   echo ">> [x3] x86_64 glibc 2.41 (built by the stage1 cross-gcc)"
   XGLIBCB="$work/glibc"; build_glibc_x86_64 "$cpath" "$gcc14" "$gst" "$XBU" "$XGCC1" "$sysroot" "$kh" "$XGLIBCB" || return 1
   echo ">> [x4] cross gcc 14.3.0 stage2 (c,c++ + shared libgcc_s)"
