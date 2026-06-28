@@ -3761,6 +3761,35 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // elf-rpath FILE — print FILE's run-path (DT_RUNPATH, else legacy DT_RPATH), or
+        // nothing for a static binary / one with no run-path. td's OWN ELF reader.
+        Some("elf-rpath") if args.len() == 3 => match elf::read_rpath(Path::new(&args[2])) {
+            Ok(Some(r)) => {
+                println!("{r}");
+                ExitCode::SUCCESS
+            }
+            Ok(None) => ExitCode::SUCCESS, // no run-path
+            Err(e) => {
+                eprintln!("td-builder: elf-rpath {}: {e}", args[2]);
+                ExitCode::FAILURE
+            }
+        },
+        // elf-set-rpath FILE NEW — rewrite FILE's DT_RPATH/DT_RUNPATH to NEW in place (must
+        // fit the existing .dynstr slot). Makes a toolchain binary self-sufficient — bake an
+        // absolute /td/store run-path so it finds its shared libc with no LD_LIBRARY_PATH
+        // wrapper. The second patchelf feature td owns in Rust (no guix tool on the path).
+        Some("elf-set-rpath") if args.len() == 4 => {
+            match elf::set_rpath(Path::new(&args[2]), &args[3]) {
+                Ok(()) => {
+                    eprintln!("td-builder: elf-set-rpath {} -> {}", args[2], args[3]);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: elf-set-rpath {}: {e}", args[2]);
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // loop-sandbox: the DEV-SHELL — run a command inside td's own hermetic
         // container (pivot into a fresh root exposing the WHOLE /gnu/store (ro),
         // the daemon socket /var/guix, /proc, /dev; host-guix on PATH; its own
