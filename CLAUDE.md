@@ -234,7 +234,10 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
   your own base — run `tools/affected-checks.sh --committed-only --run`; if it
   waives the full loop, record the waiver in the PR body; if it escalates, it
   runs the FULL `./check.sh` before returning success, so record the escalation
-  and full result instead; (2) push the branch and mark the PR ready — CI runs
+  and full result instead; (2) get a code review of the full branch diff and
+  address its findings (Workflow step 6 — MANDATORY for AI agents, via
+  `/code-review` or a reviewer sub-agent), then push the branch and mark the PR
+  ready — CI runs
   the required hosted gate and a human review approves (main is branch-protected:
   required checks + mandatory review, no direct pushes —
   `.github/BRANCH-PROTECTION.md`); (3) merge once green and approved — default to
@@ -281,7 +284,14 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
 5. Before each commit, spawn a sub-agent to review the diff against this contract —
    no weakened gates or assertions, smallest increment, conventions respected — and
    address its findings first.
-6. Commit a small increment on your branch. Land per the protocol when the track's
+6. **Before the PR goes up for human review, get a code review of the FULL branch
+   diff — MANDATORY for AI agents.** Run `/code-review` (or spawn a reviewer
+   sub-agent) over the whole branch against this contract — correctness bugs AND the
+   step-5 checklist (no weakened gates/assertions, smallest increment, conventions
+   respected) — and address its findings BEFORE opening the PR or marking it ready.
+   Step 5 guards each commit; this guards the whole increment a human is asked to
+   approve. It PRECEDES, never replaces, the human's PR review (DESIGN §4.3).
+7. Commit a small increment on your branch. Land per the protocol when the track's
    acceptance test is green. Flip your `plan/tracks/<track>.md` record to
    `status: done` and re-run `tools/plan-index.sh` as part of landing (the
    `plan-index` gate enforces it).
