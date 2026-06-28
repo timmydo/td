@@ -100,6 +100,7 @@ build_gcc_x86_64_stage1() {
     env PATH="$bp" CONFIG_SHELL="$csh" CC="$wb/cc" CXX="$wb/cxx" CPP="$wb/cc -E" CC_FOR_BUILD="$wb/cc" CXX_FOR_BUILD="$wb/cxx" \
         "$csh" ../configure --build=i686-pc-linux-gnu --host=i686-pc-linux-gnu --target=$XTARGET \
         --prefix=/td/store/gcc-14.3.0-x86_64 --with-sysroot="$sysroot" \
+        --with-as="$xbu/bin/$XTARGET-as" --with-ld="$xbu/bin/$XTARGET-ld" \
         --enable-languages=c --without-headers --with-newlib --with-glibc-version=2.41 \
         --disable-bootstrap --disable-multilib --disable-shared --disable-threads \
         --disable-libssp --disable-libgomp --disable-libquadmath --disable-libatomic \
@@ -189,6 +190,7 @@ build_gcc_x86_64_stage2() {
     env PATH="$bp" CONFIG_SHELL="$csh" CC="$wb/cc" CXX="$wb/cxx" CPP="$wb/cc -E" CC_FOR_BUILD="$wb/cc" CXX_FOR_BUILD="$wb/cxx" \
         "$csh" ../configure --build=i686-pc-linux-gnu --host=i686-pc-linux-gnu --target=$XTARGET \
         --prefix=/td/store/gcc-14.3.0-x86_64 --with-sysroot="$sysroot" \
+        --with-as="$xbu/bin/$XTARGET-as" --with-ld="$xbu/bin/$XTARGET-ld" \
         --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-c99 --with-glibc-version=2.41 \
         --disable-bootstrap --disable-multilib --disable-libssp --disable-libgomp \
         --disable-libquadmath --disable-libvtv --disable-libitm --disable-libcc1 \
