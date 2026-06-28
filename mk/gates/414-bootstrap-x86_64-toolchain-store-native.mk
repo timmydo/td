@@ -9,10 +9,18 @@
 # against it (interp = /td/store x86_64 ld-linux-x86-64.so.2) that runs in the own-root → 42, /gnu/store ABSENT.
 # DURABLE: pinned-input, no-guix (no /gnu/store in the x86_64 libc.so.6 NOR the cross gcc/cc1), content-addr,
 # behavioral (an ELF 64-bit C + C++ program runs vs the x86_64 glibc 2.41 from /td/store → 42), structural,
-# input-addressed (x64-toolchain-subst PR2: the x86_64 glibc is ALSO interned at the LOCK-KEYED path from
+# input-addressed (x64-toolchain-subst: the x86_64 glibc is ALSO interned at the LOCK-KEYED path from
 # tests/td-toolchain-x86_64.lock — the stable path a consumer fetches as a signed substitute, not a
-# content-addressed throwaway — and a program whose interp IS that path runs in the own-root → 42).
-# NOT a BUILD_GATE. The cross rungs live in tests/x86_64-cross-fns.sh.
+# content-addressed throwaway — and a program whose interp IS that path runs in the own-root → 42), and
+# subst FETCH (x64-toolchain-subst, human 2026-06-28: the loop builds td-subst from source, PUBLISHES that
+# real x86_64 glibc at its lock-keyed path as a SIGNED substitute, then a consumer FETCHES it via
+# tools/resolve-toolchain.sh — ed25519 sig + StorePath == the lock path + NarHash verified — and RUNS the
+# fetched-not-rebuilt bytes in the own-root → 42, with cold-store/wrong-key/wrong-StorePath self-discrimination;
+# DELIBERATE directive-1 relaxation, human-approved). This gate still BUILDS from seed AND fetches — it proves the
+# consumer CAPABILITY (the loop can obtain the real x86_64 toolchain by fetching); the actual per-PR build-SKIP
+# needs the whole-toolchain closure fetch + a populated persistent store and is the PR3b follow-up (see
+# plan/x64-toolchain-subst.md). The subst round-trip lives in tests/x86_64-subst-lib.sh. NOT a BUILD_GATE. The
+# cross rungs live in tests/x86_64-cross-fns.sh.
 HEAVY_GATES += bootstrap-x86_64-toolchain-store-native
 bootstrap-x86_64-toolchain-store-native:
 	@echo ">> bootstrap-x86_64-toolchain-store-native: cross the i686 bootstrap up to a native x86_64 toolchain at /td/store — cross binutils 2.44 + cross gcc 14.3.0 + MODERN x86_64 glibc 2.41 (libgcc_s.so.1); a DYNAMIC x86_64 C AND C++ program runs in the own-root → 42, /gnu/store ABSENT (unblocks the x86_64 Rust runtime leg)"

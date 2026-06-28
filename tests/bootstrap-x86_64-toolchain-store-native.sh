@@ -1013,13 +1013,33 @@ run_x86_64_cross "$cpath" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB"
 # glibc/gcc; intern the x86_64 glibc 2.41 at /td/store; build x86_64 C/C++ programs vs it (interp =
 # /td/store x86_64 ld-linux-x86-64.so.2) and RUN them in the store-ns own-root → 42, /gnu/store ABSENT.
 . tests/cache-lib.sh
+. tests/x86_64-subst-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 export TD_STORE_DIR=/td/store
 snwork=`mktemp -d`
 verify_x86_64_ownroot "$cpath" "$snwork" || fail "the x86_64 own-root verify failed"
 
+# --- FETCH short-circuit (x64-toolchain-subst, human 2026-06-28): publish the REAL cross-built
+# x86_64 toolchain at its lock-keyed path as a SIGNED substitute, then prove a consumer FETCHES it
+# (resolve-toolchain.sh — ed25519 sig + StorePath == the lock-computed path + NarHash verified) and
+# RUNS the fetched-not-rebuilt bytes in the own-root → 42, plus the MISS/wrong-key/wrong-StorePath
+# self-discrimination legs. The per-PR loop can thus obtain the x86_64 toolchain WITHOUT the ~98-min
+# from-seed rebuild (DELIBERATE directive-1 relaxation, human-approved: the daily full suite stays
+# the sole from-seed authoritative build AND the publisher of the signed substitute).
+load_ts_eval || fail "could not load the ts-eval sentinel (needed to build td-subst)"
+tsgo=`sh tests/tsgo.sh`; test -n "$tsgo" -a -x "$tsgo/lib/tsc" || fail "could not resolve td-tsgo"
+export TD_TSGO="$tsgo" TD_TSDIR="`pwd`/tests/ts"
+tdsubst=`build_td_subst_for_x86_64 "$(pwd)/.td-build-cache/x86_64-subst"` || fail "could not build td-subst from source"
+echo "   [subst/build] td-built td-subst from source (move-off-Guile §5): $tdsubst"
+x86_64_subst_roundtrip "$tdsubst" tests/td-toolchain-x86_64.lock glibc-2.41-x86_64 \
+  "$X86_IAGL" "$X86_OWNROOT_STORE" "$X86_OWNROOT_DB" "$X86_PROGIA_REL" "$X86_BASH_BASE" \
+  || fail "the x86_64 toolchain publish→fetch→run-from-fetched round-trip failed"
+
 echo "PASS: x86_64-toolchain — from the 229-byte seed, td built the i686 chain → gcc 14.3.0, then CROSSED UP to"
 echo "      an x86_64 toolchain (cross binutils 2.44 + cross gcc 14.3.0 + MODERN x86_64 glibc 2.41 with"
 echo "      libgcc_s.so.1). The cross gcc links a DYNAMIC x86_64 C AND C++ program against the /td/store x86_64"
 echo "      glibc 2.41 (interp = ld-linux-x86-64.so.2) that runs in the own-root → 42, /gnu/store ABSENT."
+echo "      Then the loop PUBLISHED that real x86_64 glibc at its lock-keyed path as a signed substitute,"
+echo "      FETCHED it back (sig + StorePath + NarHash verified) and RAN the fetched-not-rebuilt bytes in the"
+echo "      own-root → 42 — the consumer can obtain the real x86_64 toolchain by fetching, not only by building."
