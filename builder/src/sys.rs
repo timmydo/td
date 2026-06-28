@@ -27,9 +27,27 @@ const SYS_PRCTL: usize = 157;
 const SYS_GETPPID: usize = 110;
 const SYS_SETPRIORITY: usize = 141;
 const SYS_GETPRIORITY: usize = 140;
+const SYS_PRLIMIT64: usize = 302;
+const SYS_MMAP: usize = 9;
 
 /// setpriority/getpriority `which`: act on a single process by PID (0 = self).
 const PRIO_PROCESS: usize = 0;
+
+/// RLIMIT_DATA (the data segment: heap + brk + private writable anonymous
+/// mmap on Linux ≥ 4.7). The per-build memory backstop caps THIS — it blocks
+/// the bulk of a compiler's allocation without counting the large *virtual*
+/// address-space reservations Go/Rust make (so it false-trips far less than
+/// RLIMIT_AS would). Scope of the resource arg to prlimit64(2).
+pub const RLIMIT_DATA: usize = 2;
+
+/// prlimit64 sentinel for "leave this limit unchanged" — RLIM64_INFINITY is
+/// only used as a comparison value here; a cap is always finite.
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// mmap(2) prot/flags for a private anonymous read/write mapping — what the
+/// rlimit behavioral test allocates to prove the cap is load-bearing.
+const PROT_READ_WRITE: usize = 0x1 | 0x2;
+const MAP_PRIVATE_ANON: usize = 0x2 | 0x20;
 
 const PR_SET_PDEATHSIG: usize = 1;
 /// SIGKILL — the parent-death signal the host-sandbox arms (uncatchable, so a
@@ -72,6 +90,36 @@ unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usi
         in("rdx") a3,
         in("r10") a4,
         in("r8") a5,
+        out("rcx") _,
+        out("r11") _,
+        options(nostack)
+    );
+    ret
+}
+
+/// Six-argument variant (adds the 6th arg in r9) — needed by mmap(2), whose
+/// last arg is the file offset. x86_64 `sys_mmap` rejects a non-page-aligned
+/// offset with EINVAL even for an anonymous mapping, so the offset register
+/// must be set explicitly (syscall5 would leave r9 holding garbage).
+unsafe fn syscall6(
+    n: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") n as isize => ret,
+        in("rdi") a1,
+        in("rsi") a2,
+        in("rdx") a3,
+        in("r10") a4,
+        in("r8") a5,
+        in("r9") a6,
         out("rcx") _,
         out("r11") _,
         options(nostack)
@@ -246,6 +294,43 @@ pub fn get_self_priority() -> io::Result<i32> {
     }
 }
 
+/// prlimit64(2) on the calling process (`pid=0`) for `resource`, reading the
+/// current (soft, hard) pair. Always available (the modern resource-limit
+/// syscall), so no setrlimit/getrlimit split.
+pub fn get_rlimit(resource: usize) -> io::Result<(u64, u64)> {
+    let mut old: [u64; 2] = [0, 0];
+    check(unsafe {
+        syscall5(SYS_PRLIMIT64, 0, resource, 0, old.as_mut_ptr() as usize, 0)
+    })?;
+    Ok((old[0], old[1]))
+}
+
+/// prlimit64(2): set the calling process's (soft, hard) limit for `resource`.
+/// An unprivileged caller may LOWER the hard limit (and set soft ≤ hard) but
+/// not raise the hard limit — callers cap, so that direction is the norm. The
+/// limit is inherited across fork(2) and execve(2), so setting it on the build
+/// child before it forks the PID-1 builder caps the whole build tree.
+/// Purely a resource ceiling — build OUTPUT is unaffected, so reproducibility
+/// is intact (a build over the cap FAILS, it does not produce different bytes).
+pub fn set_rlimit(resource: usize, soft: u64, hard: u64) -> io::Result<()> {
+    let new: [u64; 2] = [soft, hard];
+    check(unsafe {
+        syscall5(SYS_PRLIMIT64, 0, resource, new.as_ptr() as usize, 0, 0)
+    })
+}
+
+/// mmap(2) a private anonymous read/write region of `len` bytes. Returns the
+/// raw syscall result: a valid address (≥ 0 as isize) on success, or `-errno`
+/// (e.g. `-ENOMEM` when an rlimit blocks the mapping) on failure. Offset is
+/// passed as 0 (x86_64 `sys_mmap` EINVALs a non-page-aligned offset even for an
+/// anonymous mapping, so it cannot be left as register garbage — syscall6).
+/// Async-signal-safe (no allocator), which is why the rlimit behavioral test
+/// probes the cap with this rather than a heap allocation in a forked child.
+pub fn mmap_anon(len: usize) -> isize {
+    // fd = -1 (usize::MAX) for an anonymous mapping; offset 0.
+    unsafe { syscall6(SYS_MMAP, 0, len, PROT_READ_WRITE, MAP_PRIVATE_ANON, usize::MAX, 0) }
+}
+
 pub fn exit_group(code: i32) -> ! {
     unsafe {
         syscall5(SYS_EXIT_GROUP, code as usize, 0, 0, 0, 0);
@@ -274,6 +359,55 @@ mod tests {
         let target = std::ffi::CString::new("/no/such/td-builder/mount/point").unwrap();
         let err = mount(None, &target, None, MS_REC | MS_PRIVATE, None).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(2 /* ENOENT */));
+    }
+
+    #[test]
+    fn set_rlimit_data_round_trips() {
+        // Lower the SOFT data limit to a finite value below the (typically
+        // infinite) hard limit and read it back. Proves prlimit64 set+get are
+        // real syscalls, not stubs — a no-op would leave the original soft
+        // limit, which we assert against. Lowering only the soft limit and only
+        // for THIS test process is harmless: RLIMIT_DATA blocks future heap
+        // GROWTH, and 1 GiB is far above the test's footprint.
+        let (_, hard) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
+        let target = 1u64 << 30; // 1 GiB, comfortably under the hard limit
+        assert!(hard == RLIM_INFINITY || hard >= target, "hard limit too low for the test");
+        set_rlimit(RLIMIT_DATA, target, hard).expect("lowering the soft data limit must succeed");
+        let (soft_after, hard_after) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
+        assert_eq!(soft_after, target, "soft data limit should be exactly the set value");
+        assert_eq!(hard_after, hard, "hard limit must be unchanged");
+    }
+
+    #[test]
+    fn rlimit_data_caps_anon_mmap() {
+        // The cap is load-bearing: a child with a small RLIMIT_DATA cannot map a
+        // large private-anon region, while an uncapped child can. Done in forked
+        // children so the limit and the (async-signal-safe) mmap stay isolated
+        // from the test harness — no allocator runs in the child, so there is no
+        // fork-in-a-threaded-program malloc hazard.
+        const BIG: usize = 256 * 1024 * 1024; // 256 MiB
+        let run = |cap: Option<u64>| -> i32 {
+            let pid = fork().expect("fork");
+            if pid == 0 {
+                if let Some(c) = cap {
+                    // Cap both soft and hard well below BIG; ignore the result —
+                    // failing to cap would just make the assertion below catch it.
+                    let _ = set_rlimit(RLIMIT_DATA, c, c);
+                }
+                let r = mmap_anon(BIG);
+                // exit 0 = mapping SUCCEEDED, 1 = mapping FAILED (capped).
+                exit_group(if r >= 0 { 0 } else { 1 });
+            }
+            let status = waitpid(pid).expect("waitpid");
+            assert_eq!(status & 0x7f, 0, "child should exit normally, not be signalled");
+            (status >> 8) & 0xff
+        };
+        assert_eq!(run(None), 0, "an uncapped child must be able to map {BIG} bytes");
+        assert_eq!(
+            run(Some(32 * 1024 * 1024)),
+            1,
+            "a child capped at 32 MiB RLIMIT_DATA must fail to map {BIG} bytes"
+        );
     }
 
     #[test]
