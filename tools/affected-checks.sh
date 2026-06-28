@@ -629,6 +629,15 @@ map_path() {
       add_target bootstrap-glibc-241-store-native
       add_target bootstrap-hello-corpus-store-native ;;
 
+    tests/repro-lib.sh)
+      # shared reproducibility normalization (strip debug + deterministic archives + drop .la)
+      # sourced by the modern store-native rungs — exercise the rungs that use/adopt it.
+      add_preflight shell-syntax
+      add_target bootstrap-binutils-244-store-native
+      add_target bootstrap-gcc-mesboot-494-store-native
+      add_target bootstrap-gcc-14-store-native
+      add_target bootstrap-glibc-241-store-native ;;
+
     tests/bootstrap-binutils-244-store-native.sh|seed/sources/binutils-2.44.lock)
       add_preflight shell-syntax
       add_target bootstrap-binutils-244-store-native
@@ -1020,6 +1029,8 @@ run_self_test() {
 
   assert_preflight tools/affected-checks.sh "tools/affected-checks.sh --self-test"
   assert_branch_policy tools/affected-checks.sh "full ./check.sh would be waived"
+  assert_target tests/repro-lib.sh bootstrap-binutils-244-store-native
+  assert_branch_policy tests/repro-lib.sh "full ./check.sh would be waived"
   assert_target tests/ts/recipe-td-russh-demo.ts rust-russh
   assert_target tests/td-russh-demo.lock rust-russh
   assert_target tests/russh-demo/Cargo.lock rust-russh
