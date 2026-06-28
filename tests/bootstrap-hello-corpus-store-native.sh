@@ -1,24 +1,25 @@
 #!/bin/sh
-# tests/bootstrap-gcc-14-store-native.sh — source-bootstrap BRICK 6/7 (the FINAL modern toolchain, rung B):
-# a MODERN GCC 14.3.0 (c,c++) at the dynamic /td/store — guix's gcc-boot0/gcc-final version, td-native. From
-# the 229-byte seed, td builds the whole chain → gcc-mesboot1 + binutils-mesboot + glibc 2.16.0 (static AND
-# shared) → GCC 4.9.4 (the bridge, rung B0), then with 4.9.4 builds GCC 14.3.0 against glibc 2.16.0, with
-# gmp-6.3.0/mpfr-4.2.1/mpc-1.3.1 (gcc 14's own prereq versions) unpacked in-tree. 14.3.0 + the shared glibc
-# are interned content-addressed into /td/store, and a gcc/g++ WRAPPER there compiles PLAINLY a DYNAMIC C AND
-# C++ (libstdc++ <vector>) program → both interp=/td/store, run in the own-root → 42, /gnu/store ABSENT.
+# tests/bootstrap-hello-corpus-store-native.sh — source-bootstrap BRICK 8 (retire the guix toolchain seed,
+# a MODERN glibc 2.41 (guix's glibc-final) at the dynamic /td/store — the FULL modern toolchain from the seed.
+# From the 229-byte seed, td builds the whole chain → gcc-mesboot1 + binutils-mesboot + glibc 2.16.0 → GCC
+# 4.9.4 → MODERN GCC 14.3.0, AND a sandbox-runnable MODERN binutils 2.44; then with gcc 14.3.0 + binutils 2.44
+# it builds MODERN glibc 2.41 (a SHARED libc) against the linux kernel headers. glibc 2.41 is interned
+# content-addressed into /td/store, and gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++ <vector>) program
+# against the NEW glibc 2.41 (interp = /td/store glibc 2.41) that runs in the own-root → 42, /gnu/store ABSENT.
+# With this, the full modern toolchain (gcc 14.3.0 + binutils 2.44 + glibc 2.41) lives at /td/store.
 #
-# guix does gcc-mesboot 4.9.4 → gcc-boot0 (gcc 14.3.0, --without-headers) → glibc-final → gcc-final (a 3-stage
-# dance). td OWN-THEN-DIVERGES: it already has glibc 2.16.0 at /td/store, so it builds a USABLE gcc 14.3.0
-# directly against glibc 2.16.0 in one rung. Built STATIC (like 4.9.4) so gcc 14's own xgcc/cc1 run in the
-# sandbox; the wrapper links DYNAMIC against the shared glibc 2.16.0. i686, serial. all sources td-fetched.
-# (gcc 14 from 4.9.4 is exactly guix's jump — confirmed: gcc-mesboot-wrapper wraps 4.9.4, builds gcc-boot0=14.3.0.)
+# glibc 2.41 builds smoothly with the modern gcc 14.3.0 (vs the mesboot-era glibc 2.16.0's many iterations).
+# glibc-2.41-specific: it needs a modern binutils (2.44; 2.20.1a is too old) built SANDBOX-runnable (build-dir
+# interp), `gawk` by name, and it FORBIDS DT_RPATH *and* DT_RUNPATH in the base libc.so.6 → the build CC bakes
+# NO -rpath (only the interp); the build tools find glibc 2.16.0 via LD_LIBRARY_PATH. The verify programs are
+# built in the sandbox (build-wrapper) then RUN standalone in the own-root. i686, serial. all sources td-fetched.
 #
 # Legs (DURABLE — no guix oracle in any):
-#   [pinned-input] chain tarballs + boot patches + gcc-4.9.4 + gcc-14.3.0 + gmp/mpfr/mpc match sha256.
-#   [no-guix]      built with gcc/g++/cc/guile/guix DENIED; no /gnu/store in gcc 14's gcc/g++/cpp/cc1 NOR libc.so.6.
+#   [pinned-input] chain tarballs + boot patches + gcc-4.9.4 + gcc-14.3.0 + gmp/mpfr/mpc + binutils-2.44 + glibc-2.41 match sha256.
+#   [no-guix]      built with gcc/g++/cc/guile/guix DENIED; no /gnu/store in glibc 2.41's libc.so.6 NOR gcc/cc1.
 #   [content-addr] the interned paths are /td/store/<nar-hash>-<name>.
-#   [behavioral]   the /td/store gcc-14.3.0 wrapper, called PLAINLY, compiles a DYNAMIC C AND C++ (libstdc++)
-#                  program (interp = /td/store ld-linux.so.2); both RUN in the own-root → 42 — a MODERN gcc.
+#   [behavioral]   gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++) program against the MODERN glibc 2.41
+#                  (interp = /td/store glibc 2.41 ld-linux.so.2); both RUN in the own-root → 42.
 #   [structural]   inside the own-root /td/store IS the store AND /gnu/store is ABSENT.
 set -eu
 
@@ -823,6 +824,14 @@ for pair in "$GCC14_TB:`lf "$GCC14_LOCK" sha256`" "$GMP63_TB:`lf "$GMP63_LOCK" s
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 echo "   [pinned-input] + gcc-14.3.0/gmp-6.3.0/mpfr-4.2.1/mpc-1.3.1 (the modern gcc prereqs) match their pins"
+BU244_LOCK=`ls seed/sources/binutils-2.44.lock`; BU244_TB=".td-build-cache/sources/`lf "$BU244_LOCK" file`"
+GLIBC241_LOCK=`ls seed/sources/glibc-2.41.lock`; GLIBC241_TB=".td-build-cache/sources/`lf "$GLIBC241_LOCK" file`"
+for pair in "$BU244_TB:`lf "$BU244_LOCK" sha256`" "$GLIBC241_TB:`lf "$GLIBC241_LOCK" sha256`"; do
+  f=${pair%:*}; want=${pair##*:}
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
+done
+echo "   [pinned-input] + binutils-2.44/glibc-2.41 (the modern toolchain final pieces) match their pins"
 
 # build_gcc_14 — MODERN GCC 14.3.0 (guix's gcc-boot0/gcc-final version) built by gcc-mesboot 4.9.4 against
 # the static glibc 2.16.0, with gmp-6.3.0/mpfr-4.2.1/mpc-1.3.1 (gcc 14's contrib/download_prerequisites
@@ -883,6 +892,75 @@ build_gcc_14() {
   test -x "$out/stage/td/store/gcc-14.3.0/bin/gcc" -a -x "$out/stage/td/store/gcc-14.3.0/bin/g++" || { echo "no gcc/g++ 14.3.0 produced" >&2; return 1; }
 }
 
+# build_binutils_244 — MODERN GNU Binutils 2.44 built SANDBOX-RUNNABLE (build-dir glibc 2.16.0 interp, so its
+# as/ld run during the sandbox glibc build) by gcc-mesboot1 (4.6.4) — glibc 2.41 needs a modern binutils
+# (2.20.1a is "too old"). Same build as the binutils-244 gate but CC bakes the LIVE build-dir interp, not
+# /td/store. -std=gnu99 (binutils 2.44 is C99+; gcc 4.6.4 default gnu89), cross-style, --disable-gold, MAKEINFO=true.
+build_binutils_244() {
+  cpath=$1; gm1=$2; gls=$3; bmb=$4; out=$5
+  rm -rf "$out"; mkdir -p "$out"
+  gm1dir="$gm1/lib/gcc/i686-unknown-linux-gnu/4.6.4"
+  xzb=`command -v xz 2>/dev/null || ls /gnu/store/*'xz-'*/bin/xz 2>/dev/null | sort | head -1`
+  test -n "$xzb" || { echo "no xz" >&2; return 1; }
+  sh=`command -v bash 2>/dev/null || command -v sh`
+  tb=`mktemp -d`/tb; mkdir -p "$tb"
+  for tool in awk:gawk flex:flex bison:bison cmp:diffutils diff:diffutils; do
+    n=${tool%%:*}; pk=${tool##*:}; b=`command -v "$n" 2>/dev/null || ls /gnu/store/*$pk*/bin/$n 2>/dev/null | sort | head -1`
+    test -n "$b" && ln -sf "$b" "$tb/$n" || true; done
+  ln -sf "$tb/flex" "$tb/lex" 2>/dev/null||true; ln -sf "$tb/bison" "$tb/yacc" 2>/dev/null||true
+  wb=`mktemp -d`/wb; mkdir -p "$wb"
+  printf '#!%s\nexec "%s/bin/gcc" -std=gnu99 -isystem "%s/include" -B"%s/lib" -L"%s/lib" -L"%s" -Wl,--dynamic-linker -Wl,%s/lib/ld-linux.so.2 -Wl,-rpath -Wl,%s/lib "$@"\n' \
+    "$sh" "$gm1" "$gls" "$gls" "$gls" "$gm1dir" "$gls" "$gls" > "$wb/gcc"
+  chmod 0555 "$wb/gcc"
+  src=`mktemp -d`/binutils; mkdir -p "$src"
+  "$xzb" -dc "$BU244_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "binutils-2.44 unpack failed" >&2; return 1; }
+  ( cd "$src"; bp="$bmb/bin:$tb:$cpath"
+    env PATH="$bp" CONFIG_SHELL="$sh" SHELL="$sh" CC="$wb/gcc" CC_FOR_BUILD="$wb/gcc" AR="$bmb/bin/ar" RANLIB="$bmb/bin/ranlib" \
+      "$sh" ./configure --build=i686-pc-linux-gnu --host=i686-unknown-linux-gnu --prefix=/td/store/binutils-2.44 \
+      --disable-nls --disable-gold --disable-werror --enable-deterministic-archives --disable-plugins --disable-gprofng >cfg.log 2>&1 \
+      || { echo "binutils-2.44 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_bu244sb-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$sh" SHELL="$sh" make -j"$BJOBS" MAKEINFO=true >build.log 2>&1 \
+      || { echo "binutils-2.44 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_bu244sb-build.log" 2>/dev/null||true; tail -30 build.log >&2; return 1; }
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$sh" SHELL="$sh" make MAKEINFO=true install prefix="$out" >inst.log 2>&1 \
+      || { echo "binutils-2.44 install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
+  test -x "$out/bin/as" -a -x "$out/bin/ld" || { echo "no as/ld produced" >&2; return 1; }
+}
+# build_glibc_241 — MODERN glibc 2.41 (guix's glibc-final) built by gcc 14.3.0 + binutils 2.44 against the
+# linux kernel headers — a SHARED libc. CC bakes only the build-dir glibc 2.16.0 INTERP (NO -rpath: glibc 2.41
+# forbids DT_RPATH AND DT_RUNPATH in libc.so.6); the build tools find glibc 2.16.0 via LD_LIBRARY_PATH. Install
+# via DESTDIR (prefix /td/store/glibc-2.41 is unwritable).
+build_glibc_241() {
+  cpath=$1; gcc14=$2; gls=$3; bu244=$4; out=$5
+  rm -rf "$out"; mkdir -p "$out"
+  xzb=`command -v xz 2>/dev/null || ls /gnu/store/*'xz-'*/bin/xz 2>/dev/null | sort | head -1`
+  csh=`command -v bash 2>/dev/null || command -v sh`
+  kh=`mktemp -d`/kh; mkdir -p "$kh"; tar -xzf "$KH_TB" -C "$kh" || { echo "kernel headers unpack failed" >&2; return 1; }
+  src=`mktemp -d`/glibc; mkdir -p "$src/bin"
+  "$xzb" -dc "$GLIBC241_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "glibc-2.41 unpack failed" >&2; return 1; }
+  for t in "$bu244"/bin/*; do ln -sf "$t" "$src/bin/`basename "$t"`"; done
+  for tool in awk:gawk gawk:gawk sed:sed grep:grep make:make m4:m4 bison:bison flex:flex msgfmt:gettext makeinfo:texinfo python3:python gzip:gzip; do
+    n=${tool%%:*}; pk=${tool##*:}; b=`command -v "$n" 2>/dev/null || ls /gnu/store/*$pk*/bin/$n 2>/dev/null | sort | head -1`
+    test -n "$b" && ln -sf "$b" "$src/bin/$n" || true; done
+  wb=`mktemp -d`/wb; mkdir -p "$wb"
+  printf '#!%s\nexec "%s/bin/gcc" -B%s/lib -L%s/lib -isystem %s/include -static-libgcc -Wl,--dynamic-linker -Wl,%s/lib/ld-linux.so.2 "$@"\n' \
+    "$csh" "$gcc14" "$gls" "$gls" "$gls" "$gls" > "$wb/gcc"
+  chmod 0555 "$wb/gcc"
+  ( cd "$src"
+    for f in `grep -rl '^#! */bin/sh' . 2>/dev/null`; do sed -i "1s,^#! *[^ ]*/bin/sh,#!$csh," "$f" 2>/dev/null || true; done
+    sed -i "s,^SHELL := /bin/sh,SHELL := $csh," Makeconfig 2>/dev/null || true
+    rm -rf bld; mkdir bld; cd bld
+    env PATH="$src/bin:$cpath" CONFIG_SHELL="$csh" SHELL="$csh" CC="$wb/gcc" LD_LIBRARY_PATH="$gls/lib" \
+      "$csh" ../configure --prefix=/td/store/glibc-2.41 --build=i686-pc-linux-gnu --host=i686-unknown-linux-gnu \
+      --with-headers="$kh" --enable-kernel=3.2.0 --disable-werror --disable-nscd --with-binutils="$bu244/bin" \
+      libc_cv_slibdir=/td/store/glibc-2.41/lib >cfg.log 2>&1 \
+      || { echo "glibc-2.41 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_glibc241-cfg.log" 2>/dev/null||true; tail -30 cfg.log >&2; return 1; }
+    env PATH="$src/bin:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" LD_LIBRARY_PATH="$gls/lib" make -j"$BJOBS" >build.log 2>&1 \
+      || { echo "glibc-2.41 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_glibc241-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
+    env PATH="$src/bin:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" LD_LIBRARY_PATH="$gls/lib" make install DESTDIR="$out/stage" >inst.log 2>&1 \
+      || { echo "glibc-2.41 install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
+  test -e "$out/stage/td/store/glibc-2.41/lib/libc.so.6" -a -e "$out/stage/td/store/glibc-2.41/lib/ld-linux.so.2" || { echo "no libc.so.6/ld.so produced" >&2; return 1; }
+}
+
 cpath=`make_curated_path`
 for bad in gcc g++ cc guile guix; do test ! -e "$cpath/$bad" || fail "curated PATH still exposes '$bad'"; done
 tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
@@ -904,93 +982,170 @@ GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$cpath" "$GM1" "$BMB" "
 GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$cpath" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
 GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
 GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
-trap 'rm -rf "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$cpath"`"' EXIT INT TERM
+BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
+GLIBC241B=`mktemp -d`/glibc241build; build_glibc_241 "$cpath" "$GCC14B/stage/td/store/gcc-14.3.0" "$GSH/out" "$BMB244SB" "$GLIBC241B" || fail "the toolchain did not build the modern glibc 2.41"
+trap 'rm -rf "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$GLIBC241B"`" "`dirname "$cpath"`"' EXIT INT TERM
 
 GCC14="$GCC14B/stage/td/store/gcc-14.3.0"
+GLIBC241="$GLIBC241B/stage/td/store/glibc-2.41"
 CC1=`ls "$GCC14"/libexec/gcc/i686-unknown-linux-gnu/14.3.0/cc1 2>/dev/null || true`
 
-# --- [no-guix] the MODERN gcc 14.3.0 carries no guix bytes --------------------------------------
-test -x "$GCC14/bin/gcc" -a -x "$GCC14/bin/g++" -a -x "$GCC14/bin/cpp" || fail "gcc 14.3.0 missing gcc/g++/cpp"
-for b in "$GCC14/bin/gcc" "$GCC14/bin/g++" "$GCC14/bin/cpp" "$CC1"; do
-  test -n "$b" -a -f "$b" || fail "gcc 14.3.0 output missing ($b)"
+# --- [no-guix] the modern glibc 2.41 + gcc 14 carry no guix bytes -----------------------------------
+test -e "$GLIBC241/lib/libc.so.6" -a -e "$GLIBC241/lib/ld-linux.so.2" || fail "glibc 2.41 missing libc.so.6/ld-linux.so.2"
+for b in "$GLIBC241/lib/libc.so.6" "$GCC14/bin/gcc" "$CC1"; do
+  test -n "$b" -a -e "$b" || fail "output missing ($b)"
   if grep -q -a '/gnu/store' "$b"; then fail "$b contains /gnu/store bytes"; fi
 done
-echo "   [no-guix] seed → … → glibc 2.16.0 → GCC 4.9.4 → MODERN GCC 14.3.0 built with no gcc/g++/cc/guile/guix on PATH; no /gnu/store in gcc/g++/cpp/cc1"
-
-GLS="$GSH/out"
-test -e "$GLS/lib/libc.so.6" -a -e "$GLS/lib/ld-linux.so.2" || fail "shared glibc missing libc.so.6/ld-linux.so.2"
-if grep -q -a '/gnu/store' "$GLS/lib/libc.so.6"; then fail "shared libc.so.6 contains /gnu/store bytes"; fi
-echo "   [no-guix] + SHARED glibc 2.16.0 (libc.so.6/ld-linux.so.2); no /gnu/store bytes"
-for so in "$GLS/lib/"*.so; do
-  if head -c20 "$so" 2>/dev/null | grep -q 'GNU ld script' 2>/dev/null; then sed -i "s,$GLS/lib/,,g" "$so"; fi
+echo "   [no-guix] seed → … → gcc 14.3.0 + binutils 2.44 → MODERN glibc 2.41; no /gnu/store in libc.so.6 / gcc / cc1"
+# relocate glibc 2.41's ld scripts: strip the configure PREFIX path to bare names (ld finds them via -L).
+for so in "$GLIBC241/lib/"*.so; do
+  if head -c20 "$so" 2>/dev/null | grep -q 'GNU ld script' 2>/dev/null; then sed -i "s,/td/store/glibc-2.41/lib/,,g; s,$GLIBC241/lib/,,g" "$so"; fi
 done
+# BRICK 8: glibc's headers `#include <linux/*>`/`<asm/*>` (kernel UAPI) — add the SAME pure kernel headers the
+# glibc build used into glibc 2.41's include dir so a --sysroot corpus build finds them (else bits/local_lim.h
+# → "linux/limits.h: No such file"). Harmless for the C/C++ verify above (it includes no kernel headers).
+khb8=`mktemp -d`; tar -xzf "$KH_TB" -C "$khb8" || fail "brick8: kernel headers unpack failed"
+for kd in linux asm asm-generic mtd rdma scsi sound video xen drm misc; do test -d "$khb8/$kd" && cp -rn "$khb8/$kd" "$GLIBC241/include/" 2>/dev/null || true; done
+test -e "$GLIBC241/include/linux/limits.h" || fail "brick8: kernel headers not added to glibc include"
 
 . tests/cache-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 export TD_STORE_DIR=/td/store
-GLP=`"$TB" store-add-recursive glibc-shared "$GLS" "$store" "$sndb"` || fail "store-add glibc-shared failed"
-GCP=`"$TB" store-add-recursive gcc-14.3.0 "$GCC14" "$store" "$sndb"` || fail "store-add gcc-14.3.0 failed"
-BUP=`"$TB" store-add-recursive binutils-mesboot "$BMB/out" "$store" "$sndb"` || fail "store-add binutils-mesboot failed"
-case "$GCP" in /td/store/*-gcc-14.3.0) ;; *) fail "gcc-14.3.0 not content-addressed at /td/store: $GCP" ;; esac
-glrel=${GLP#/td/store/}; gcrel=${GCP#/td/store/}; burel=${BUP#/td/store/}
-echo "   [content-addr] interned $GCP + glibc-shared + binutils-mesboot, content-addressed in /td/store"
+GLP=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$store" "$sndb"` || fail "store-add glibc-2.41 failed"
+case "$GLP" in /td/store/*-glibc-2.41) ;; *) fail "glibc-2.41 not content-addressed at /td/store: $GLP" ;; esac
+glrel=${GLP#/td/store/}
+echo "   [content-addr] interned $GLP in /td/store"
 
-# static bash for the own-root probe (build scaffolding from the corpus closure).
+# Build the test C/C++ programs IN THE SANDBOX (the userland build-wrapper trick): real -B/-L/-isystem at the
+# live glibc 2.41 build dir, the /td/store glibc 2.41 interp+RUNPATH baked; sandbox binutils 2.44 for as/ld.
+# Then RUN the artifacts standalone in the own-root (no binutils needed there). gcc 14's static libstdc++
+# (built vs glibc 2.16.0) runs on glibc 2.41 (backward-compatible). C++ exercises <vector>.
+csh=`command -v bash 2>/dev/null || command -v sh`
+bw=`mktemp -d`/bw; mkdir -p "$bw" "$snwork/w"
+printf 'int main(){return 42;}\n' > "$snwork/w/c.c"
+printf '#include <vector>\nint main(){std::vector<int> v; for(int i=0;i<43;i++) v.push_back(i); return v[42];}\n' > "$snwork/w/cpp.cc"
+for cc in gcc g++; do
+  printf '#!%s\nexec "%s/bin/%s" -isystem "%s/include" -B"%s/lib" -L"%s/lib" -L"%s/lib/gcc/i686-unknown-linux-gnu/14.3.0" -static-libgcc -static-libstdc++ -Wl,--dynamic-linker -Wl,/td/store/%s/lib/ld-linux.so.2 -Wl,--enable-new-dtags -Wl,-rpath -Wl,/td/store/%s/lib "$@"\n' \
+    "$csh" "$GCC14" "$cc" "$GLIBC241" "$GLIBC241" "$GLIBC241" "$GCC14" "$glrel" "$glrel" > "$bw/$cc"
+done
+chmod 0555 "$bw/gcc" "$bw/g++"
+( cd "$snwork/w" && env PATH="$BMB244SB/bin:$cpath" "$bw/gcc" -o c.out c.c ) || fail "gcc 14.3.0 did not compile a C program vs glibc 2.41"
+( cd "$snwork/w" && env PATH="$BMB244SB/bin:$cpath" "$bw/g++" -O2 -o cpp.out cpp.cc ) || fail "g++ 14.3.0 did not compile a C++ program vs glibc 2.41"
+ci=`"$BMB244SB/bin/readelf" -l "$snwork/w/c.out" 2>/dev/null | grep -o "/td/store/$glrel/lib/ld-linux.so.2" | head -1`
+test -n "$ci" || fail "the C program interp is not the /td/store glibc 2.41 ld-linux"
+if grep -q -a '/gnu/store' "$snwork/w/c.out"; then fail "the C program contains /gnu/store bytes"; fi
+echo "   built C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
+mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
+WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || fail "store-add prog failed"; wprel=${WP#/td/store/}
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
 bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
-test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash to drive the own-root probe"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
-mkdir -p "$store/work"
-printf 'int main(){return 42;}\n' > "$store/work/c.c"
-printf '#include <vector>\nint main(){std::vector<int> v; for(int i=0;i<43;i++) v.push_back(i); return v[42];}\n' > "$store/work/cpp.cc"
-
-# The /td/store gcc-14.3.0 wrapper: PLAIN gcc/g++ baking the /td/store dynamic build (headers, crt -B,
-# libc/libgcc -L, dynamic-linker + rpath). libstdc++/libgcc link STATIC (gcc 14 is built static) so the
-# program needs only the /td/store glibc at runtime.
-mkdir -p "$store/wrapper"
-for cc in gcc g++; do
-cat > "$store/wrapper/$cc" <<WRAP
-#!/td/store/$bbase/bin/bash
-exec /td/store/$gcrel/bin/$cc \\
-  -isystem /td/store/$glrel/include \\
-  -B/td/store/$glrel/lib -L/td/store/$glrel/lib -L/td/store/$gcrel/lib/gcc/i686-unknown-linux-gnu/14.3.0 \\
-  -static-libgcc -static-libstdc++ \\
-  -Wl,--dynamic-linker -Wl,/td/store/$glrel/lib/ld-linux.so.2 -Wl,-rpath -Wl,/td/store/$glrel/lib \\
-  "\$@"
-WRAP
-done
-chmod 0555 "$store/wrapper/gcc" "$store/wrapper/g++"; chmod -R u+w "$store" 2>/dev/null || true
-echo "   generated the gcc-14.3.0 wrapper (gcc + g++) at /td/store/wrapper"
-
-# own-root: the wrapper, called PLAINLY, builds a DYNAMIC C AND C++ (libstdc++ <vector>) program → 42.
-snscript='
-set -e
-export PATH=/td/store/'"$burel"'/bin
-[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
-/td/store/wrapper/gcc -o /tmp/c /td/store/work/c.c && echo C-COMPILED
-re=$(/td/store/'"$burel"'/bin/readelf -l /tmp/c); case "$re" in *"/td/store/'"$glrel"'/lib/ld-linux.so.2"*) echo C-INTERP-TDSTORE;; esac
-set +e; /tmp/c; echo "CRC=$?"; set -e
-/td/store/wrapper/g++ -O2 -o /tmp/cpp /td/store/work/cpp.cc && echo CPP-COMPILED
-re=$(/td/store/'"$burel"'/bin/readelf -l /tmp/cpp); case "$re" in *"/td/store/'"$glrel"'/lib/ld-linux.so.2"*) echo CPP-INTERP-TDSTORE;; esac
-set +e; /tmp/cpp; echo "CPPRC=$?"; set -e
-'
-snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | sed 's/^/     /' >&2; fail "store-ns gcc-14 wrapper probe exited nonzero"; }
+snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
+/td/store/'"$wprel"'/bin/c; echo "CRC=$?"
+/td/store/'"$wprel"'/bin/cpp; echo "CPPRC=$?"'
+snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | sed 's/^/     /' >&2; fail "store-ns glibc-2.41 probe exited nonzero"; }
 printf '%s\n' "$snout" | sed 's/^/     /' >&2
-echo "$snout" | grep -q '^C-COMPILED$'         || fail "the /td/store gcc-14 wrapper did not compile a C program"
-echo "$snout" | grep -q '^C-INTERP-TDSTORE$'   || fail "the C program interpreter is not /td/store"
-echo "$snout" | grep -q '^CRC=42$'             || fail "the C program did not return 42"
-echo "$snout" | grep -q '^CPP-COMPILED$'       || fail "the /td/store gcc-14 wrapper did not compile a C++ (libstdc++) program"
-echo "$snout" | grep -q '^CPP-INTERP-TDSTORE$' || fail "the C++ program interpreter is not /td/store"
-echo "$snout" | grep -q '^CPPRC=42$'           || fail "the C++ (libstdc++ vector) program did not return 42"
-echo "   [behavioral] the /td/store gcc-14.3.0 wrapper, called PLAINLY, built a DYNAMIC C AND C++ (libstdc++ <vector>) program (interp=/td/store ld-linux.so.2), both ran → 42 — a MODERN gcc at /td/store"
+echo "$snout" | grep -q '^CRC=42$'   || fail "the C program (vs glibc 2.41) did not return 42 in the own-root"
+echo "$snout" | grep -q '^CPPRC=42$' || fail "the C++ program (vs glibc 2.41) did not return 42 in the own-root"
+echo "   [behavioral] gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++) program against the MODERN glibc 2.41; both run in the own-root → 42"
 echo "$snout" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root — mixed with guix"
 echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT (unmixed from guix)"
 
-echo "PASS: source-bootstrap brick 6/7 (final toolchain, rung B — MODERN gcc) — from the 229-byte seed, td"
-echo "      built the chain → gcc-mesboot1 + binutils-mesboot + glibc 2.16.0 (static AND shared) → GCC 4.9.4,"
-echo "      and with 4.9.4 built MODERN GCC 14.3.0 (c,c++) against glibc 2.16.0. 14.3.0 + the shared glibc are"
-echo "      interned at /td/store, and a gcc/g++ WRAPPER there compiles PLAINLY a DYNAMIC C AND C++ (libstdc++)"
-echo "      program that runs in the own-root → 42, /gnu/store ABSENT. A current gcc at /td/store — guix's"
-echo "      gcc-boot0/gcc-final, td-native (own-then-diverge: built vs glibc 2.16.0, not guix's 3-stage dance)."
+# =====================================================================================================
+# BRICK 8: the corpus is built by the /td/store toolchain, NOT guix's gcc-toolchain. `td-builder build-recipe`
+# builds a REAL corpus package — GNU hello 2.12.2 (the exact version hello-no-guix.lock builds with guix's
+# gcc-toolchain-15.2.0) — with the /td/store MODERN toolchain (gcc 14.3.0 + binutils 2.44 + glibc 2.41)
+# substituted for guix's gcc-toolchain. Chained via the engine's closure_multi (TD_EXTRA_DBS) + multi-prefix
+# sandbox staging. The hello binary links the /td/store glibc 2.41, references NO guix gcc-toolchain, and runs.
+echo "   --- brick 8: build-recipe builds corpus GNU hello 2.12.2 with the /td/store toolchain ---"
+b8=`mktemp -d`; bstore="$b8/seed-store"; bgdb="$b8/glibc.db"; btdb="$b8/toolchain.db"; mkdir -p "$bstore"
+BMB="$BMB244SB"
+BUILDBASH=`grep -- '-bash-5.2.37 ' tests/hello-no-guix.lock | grep -v -e static -e minimal | sed 's/^[^ ]* //' | head -1`/bin/bash
+case "$BUILDBASH" in /gnu/store/*-bash-*/bin/bash) ;; *) fail "brick8: could not resolve the lock's bash" ;; esac
+GLP8=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$bstore" "$bgdb"` || fail "brick8: store-add glibc-2.41 failed"
+# Assemble a guix-gcc-toolchain-SHAPED /td/store toolchain: gcc 14 WRAPPER (--sysroot glibc 2.41 so gcc-internal
+# headers precede glibc's; interp/RUNPATH baked; link flags only when LINKING; C_INCLUDE_PATH unset) + binutils
+# 2.44. Every dynamic bin's PT_INTERP → glibc 2.41 (i686, via td's own elf-set-interp). ar/ranlib/… are wrapped
+# to set LD_LIBRARY_PATH because make invokes them directly (not via the gcc wrapper).
+tc="$b8/gcc-toolchain"; mkdir -p "$tc/bin" "$tc/gcc"
+cp -a "$GCC14/." "$tc/gcc/"; cp -a "$GLIBC241/lib" "$tc/lib"; cp -a "$GCC14/lib/gcc" "$tc/lib/gcc"
+for t in "$BMB"/bin/*; do cp -a "$t" "$tc/bin/`basename "$t"`"; done
+for cc in gcc g++; do
+cat > "$tc/bin/$cc" <<WRAP
+#!$BUILDBASH
+self=\$(command -v "\$0" 2>/dev/null || echo "\$0")
+d=\$(cd "\$(dirname "\$(readlink -f "\$self")")/.." && pwd)
+export LD_LIBRARY_PATH="$GLP8/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+unset C_INCLUDE_PATH CPLUS_INCLUDE_PATH
+case " \$* " in
+  *" -E "*|*" -c "*|*" -S "*|*" -M "*|*" -MM "*) set -- --sysroot=$GLP8 -B$GLP8/lib "\$@" ;;
+  *) set -- --sysroot=$GLP8 -B$GLP8/lib -L$GLP8/lib -L"\$d/gcc/lib/gcc/i686-unknown-linux-gnu/14.3.0" -static-libgcc -Wl,--dynamic-linker -Wl,$GLP8/lib/ld-linux.so.2 -Wl,--enable-new-dtags -Wl,-rpath -Wl,$GLP8/lib "\$@" ;;
+esac
+exec "\$d/gcc/bin/$cc" "\$@"
+WRAP
+done
+chmod 0555 "$tc/bin/gcc" "$tc/bin/g++"
+find "$tc" -type f | while read -r t; do
+  if "$TB" elf-interp "$t" >/dev/null 2>&1; then "$TB" elf-set-interp "$t" "$GLP8/lib/ld-linux.so.2" >/dev/null 2>&1 || true; fi
+done
+mkdir -p "$tc/bin/.real"
+for tool in ar ranlib nm strip objcopy objdump; do
+  if [ -f "$tc/bin/$tool" ] && [ ! -L "$tc/bin/$tool" ]; then
+    mv "$tc/bin/$tool" "$tc/bin/.real/$tool"
+    cat > "$tc/bin/$tool" <<AWRAP
+#!$BUILDBASH
+export LD_LIBRARY_PATH="$GLP8/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+exec "\$(cd "\$(dirname "\$(readlink -f "\$0")")" && pwd)/.real/$tool" "\$@"
+AWRAP
+    chmod 0555 "$tc/bin/$tool"
+  fi
+done
+TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$btdb"` || fail "brick8: store-add gcc-toolchain failed"
+echo "   [brick8] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
+# Substitute the gcc-toolchain entry in hello's lock; glibc 2.41 stays in the closure via the toolchain's ref.
+oldtc=`awk '/-gcc-toolchain-/{print $2}' tests/hello-no-guix.lock | head -1`
+test -n "$oldtc" || fail "brick8: no gcc-toolchain in hello-no-guix.lock"
+newlock="$b8/hello.lock"
+awk -v tc="$TCP" -v gl="$GLP8" '/-gcc-toolchain-/ { print "gcc-toolchain " tc " seed"; print "glibc-2.41 " gl " seed"; next } { print }' tests/hello-no-guix.lock > "$newlock"
+grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
+"$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
+sort -u "$b8/roots" -o "$b8/roots"
+xargs guix build < "$b8/roots" >/dev/null 2>&1 || fail "brick8: could not realize the guix seed closure"
+seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-b8" $(cat "$b8/roots")` || fail "brick8: warm-seed failed"
+WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
+for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done
+chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
+# emit the hello recipe (td-ts-eval is provided by the build-recipes prelude), then build it.
+TD_TSGO=`sh tests/tsgo.sh`; export TD_TSGO TD_TSDIR="$ROOT/tests/ts"; load_ts_eval || fail "brick8: no td-ts-eval"
+sh tests/ts-emit.sh tests/ts/recipe-hello.ts > "$b8/hello.json" || fail "brick8: ts-emit hello"
+mkdir -p "$b8/hb" "$b8/tmp"; cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
+env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
+  TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
+  TD_SEED_STORE="$WSTORE" TD_SEED_DB="$WDB" TD_EXTRA_DBS="$bgdb:$btdb" \
+  "$TB" build-recipe "$b8/hello.json" "$newlock" "$b8/hb" "$WDB" >"$b8/hb.out" 2>"$b8/hb.err" \
+  || { tail -25 "$b8/hb.err" >&2; fail "brick8: build-recipe hello with the /td/store toolchain"; }
+o=`sed -n 's/^OUT=out //p' "$b8/hb.out"`; test -n "$o" || fail "brick8: hello produced no output"
+hdir="$b8/hb/newstore/`basename "$o"`"; hbin="$hdir/bin/hello"; test -x "$hbin" || fail "brick8: no hello binary"
+# (a) the /td/store toolchain linked it: interp is the /td/store glibc 2.41.
+hi=`"$BMB/bin/readelf" -l "$hbin" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
+test -n "$hi" || fail "brick8: hello not linked vs the /td/store glibc 2.41"
+# (b) [no-guix-toolchain] NO reference to guix's gcc-toolchain (the substituted-OUT compiler).
+if grep -q -a -- "$oldtc" "$hbin"; then fail "brick8: hello references the guix gcc-toolchain $oldtc"; fi
+echo "   [brick8 no-guix-toolchain] build-recipe built hello 2.12.2 with the /td/store toolchain; interp=$hi; no guix gcc-toolchain ref"
+# (c) [DURABLE behavioral] hello runs in an own-root holding the /td/store glibc 2.41 + a static bash.
+vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`; hb2=`basename "$o"`
+cp -a "$bstore/$glb" "$vs/$glb"; cp -a "$hdir" "$vs/$hb2"
+bs8=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bb8=`basename "$bs8"`; cp -a "$bs8" "$vs/$bb8"; chmod -R u+w "$vs"
+g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "/td/store/$hb2/bin/hello" 2>&1` || { echo "$g8" | sed 's/^/     /' >&2; fail "brick8: store-ns hello run rc"; }
+case "$g8" in *"Hello, world!"*) ;; *) fail "brick8: hello did not greet: $g8" ;; esac
+echo "   [brick8 DURABLE behavioral] corpus hello runs from /td/store → $g8"
+rm -rf "$ROOT/.td-build-cache/seed-b8" 2>/dev/null || true
+
+echo "PASS: source-bootstrap brick 8 — from the 229-byte seed, td built the chain → GCC 4.9.4 → MODERN GCC"
+echo "      14.3.0 + binutils 2.44 → MODERN glibc 2.41 (the full /td/store toolchain), then with that toolchain"
+echo "      (NOT guix's gcc-toolchain-15.2.0) td-builder build-recipe built a REAL corpus package, GNU hello"
+echo "      2.12.2: it links the /td/store glibc 2.41, references no guix gcc-toolchain, and runs in the"
+echo "      own-root → \"Hello, world!\", /gnu/store ABSENT. The corpus is built by td's OWN toolchain."

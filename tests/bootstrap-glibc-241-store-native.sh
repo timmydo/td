@@ -25,6 +25,9 @@ set -eu
 
 ROOT=$(pwd)
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# Parallelism for the MODERN rungs (gcc 14 / glibc 2.41 / binutils 2.44 — robust guix make with MAKEFLAGS
+# cleared, so -j gets a FRESH jobserver). The early mesboot rungs (tcc-built mes-libc make) stay serial.
+BJOBS=${TD_BUILD_CORES:-$(nproc 2>/dev/null || echo 4)}
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 STAGE0=seed/stage0
 A=AMD64
@@ -880,7 +883,7 @@ build_gcc_14() {
       || { echo "gcc-14.3.0 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_gcc1430-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
         C_INCLUDE_PATH="$CIP" CPLUS_INCLUDE_PATH="$CIP" LIBRARY_PATH="$LP" \
-        make SHELL="$csh" CONFIG_SHELL="$csh" MAKEINFO=true "LDFLAGS=$ldf" "LDFLAGS_FOR_TARGET=$ldf" >build.log 2>&1 \
+        make -j"$BJOBS" SHELL="$csh" CONFIG_SHELL="$csh" MAKEINFO=true "LDFLAGS=$ldf" "LDFLAGS_FOR_TARGET=$ldf" >build.log 2>&1 \
       || { echo "gcc-14.3.0 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_gcc1430-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
         C_INCLUDE_PATH="$CIP" CPLUS_INCLUDE_PATH="$CIP" LIBRARY_PATH="$LP" \
@@ -916,7 +919,7 @@ build_binutils_244() {
       "$sh" ./configure --build=i686-pc-linux-gnu --host=i686-unknown-linux-gnu --prefix=/td/store/binutils-2.44 \
       --disable-nls --disable-gold --disable-werror --enable-deterministic-archives --disable-plugins --disable-gprofng >cfg.log 2>&1 \
       || { echo "binutils-2.44 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_bu244sb-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
-    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$sh" SHELL="$sh" make MAKEINFO=true >build.log 2>&1 \
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$sh" SHELL="$sh" make -j"$BJOBS" MAKEINFO=true >build.log 2>&1 \
       || { echo "binutils-2.44 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_bu244sb-build.log" 2>/dev/null||true; tail -30 build.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$sh" SHELL="$sh" make MAKEINFO=true install prefix="$out" >inst.log 2>&1 \
       || { echo "binutils-2.44 install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
@@ -951,7 +954,7 @@ build_glibc_241() {
       --with-headers="$kh" --enable-kernel=3.2.0 --disable-werror --disable-nscd --with-binutils="$bu244/bin" \
       libc_cv_slibdir=/td/store/glibc-2.41/lib >cfg.log 2>&1 \
       || { echo "glibc-2.41 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_glibc241-cfg.log" 2>/dev/null||true; tail -30 cfg.log >&2; return 1; }
-    env PATH="$src/bin:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" LD_LIBRARY_PATH="$gls/lib" make >build.log 2>&1 \
+    env PATH="$src/bin:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" LD_LIBRARY_PATH="$gls/lib" make -j"$BJOBS" >build.log 2>&1 \
       || { echo "glibc-2.41 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_glibc241-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
     env PATH="$src/bin:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" LD_LIBRARY_PATH="$gls/lib" make install DESTDIR="$out/stage" >inst.log 2>&1 \
       || { echo "glibc-2.41 install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
