@@ -33,17 +33,25 @@ NOT an earlier gcc-4.x split.
 
 ## Ladder
 
-- **PR1 (this PR) — REAL x86_64 bytes at the lock-keyed path.** Gate 414 (`x86_64-cross-fns.sh`)
-  now interns the REAL cross-built x86_64 glibc 2.41 at the input-addressed path computed from
-  `tests/td-toolchain-x86_64.lock` (#219's lock) and RUNS a dynamic x86_64 binary whose interp
-  IS that path → 42, /gnu/store absent. Closes the fixture gap gate 418 leaves: real bytes at a
-  predictable, fetchable path. (Folded into the real from-seed gate per the substantial-PR steer
-  — no thin standalone gate.)
+- **PR1 (LANDED #215) — REAL x86_64 bytes at the lock-keyed path.** Gate 414 interns the REAL
+  cross-built x86_64 glibc 2.41 at the input-addressed path from `tests/td-toolchain-x86_64.lock`
+  (#219's lock) and RUNS a dynamic x86_64 binary whose interp IS that path → 42, /gnu/store absent.
 - **PR2 (DONE upstream by #213)** — publisher wired into `ci/daily-full-suite.sh` + persistent
-  `~/.td/subst` store + gate 412 substitute export.
-- **PR3 — consume by default.** Wire `resolve-toolchain.sh` into the x86_64 toolchain-consuming
-  gates (fetch the lock-keyed x86_64 toolchain by default, fall back to from-seed on miss) — the
-  payoff of PR1's real-bytes-at-a-stable-path + #213's publisher.
+  `~/.td/subst` store + gate 412 substitute export (i686).
+- **PR3 (THIS PR — human picked the FULL fetch short-circuit).** Gate 414 builds `td-subst` from
+  source, PUBLISHES the real x86_64 glibc at its lock-keyed path as a SIGNED substitute, then a
+  consumer FETCHES it through `tools/resolve-toolchain.sh` (ed25519 sig + StorePath == the lock
+  path + NarHash verified) and RUNS the fetched-not-rebuilt bytes in the own-root → 42, with
+  cold-store / wrong-key / wrong-StorePath self-discrimination (`tests/x86_64-subst-lib.sh`). This
+  proves the per-PR loop can OBTAIN the real x86_64 toolchain by fetching, not only by building
+  (the consumer capability on real bytes) — a DELIBERATE directive-1 relaxation, human-approved.
+  KEY FINDING: fetch-instead-of-build was wired for NO arch (gate 359 = fixture mechanism proof
+  only; gates 412/414 always built from seed).
+- **PR3b (FOLLOW-UP) — the per-PR full-build SKIP.** Actually skip the ~98-min build on a HIT.
+  Needs the whole-toolchain CLOSURE fetch: the cross gcc is an i686 binary that needs the i686
+  glibc runtime to compile the verify program, so skipping the build means fetching gcc + binutils
+  + the i686 runtime closure, not just the glibc runtime. Plus `ci/daily-full-suite.sh` publishing
+  the x86_64 export + `check.sh` host-prep exposing the persistent `~/.td/subst` to the per-PR loop.
 - **PR4 — x86_64 userland + i686 demotion.** Build the corpus userland (hello/sed/…) x86_64;
   stop publishing/consuming the i686 final toolchain — keep it only as the cross intermediate.
 
@@ -64,3 +72,15 @@ are fail-closed (`IAGL` is always a real interned path or the call errors red, s
 `test "$IAGL" = "$WANTGL"` can't pass vacuously) and reuse gate 414's already-verified-red
 store-ns own-root mechanism ("drop the baked interp → can't run in own-root"). Exercised
 end-to-end by the from-seed `./check.sh bootstrap-x86_64-toolchain-store-native` run.
+
+## Verified-red — PR3 subst round-trip (`tests/x86_64-subst-lib.sh`)
+
+- `[subst/run-from-fetched]` (a program runs from the FETCHED-not-rebuilt glibc → 42): the red is
+  the same own-root mechanism as PR1 — if the fetched bytes aren't placed at the lock path, or the
+  fetch returns wrong/empty, the program's baked interp is missing → no `FRC=42`. The fetch result
+  is also fail-closed: `resolve-toolchain.sh` prints a path ONLY on a verified HIT (else exit 1).
+- `[subst/fallback]`, `[subst/self-discrimination]` (cold store / wrong key / wrong StorePath):
+  these legs ARE the red — each asserts the resolver REJECTS a bad substitute (exit 1). They were
+  proven red-equivalent for i686 in gate 359 (the resolver code is arch-agnostic); a resolver that
+  wrongly ACCEPTED any of them reds the leg. Exercised end-to-end by the from-seed run on the REAL
+  x86_64 bytes.
