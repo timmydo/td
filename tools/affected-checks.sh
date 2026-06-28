@@ -245,7 +245,7 @@ map_path() {
       add_target toolchain-input-addressed
       add_target toolchain-subst-default ;;
 
-    tests/toolchain-subst-default.sh|tools/resolve-toolchain.sh|tests/td-subst.pub)
+    tests/toolchain-subst-default.sh|tools/resolve-toolchain.sh|tools/publish-toolchain-subst.sh|tests/td-subst.pub)
       add_preflight shell-syntax
       add_target toolchain-subst-default ;;
 
@@ -1047,6 +1047,7 @@ run_self_test() {
   assert_target subst/src/main.rs td-subst
   assert_target tests/toolchain-subst-default.sh toolchain-subst-default
   assert_target tools/resolve-toolchain.sh toolchain-subst-default
+  assert_target tools/publish-toolchain-subst.sh toolchain-subst-default
   assert_target tests/td-subst.pub toolchain-subst-default
   assert_target tests/td-toolchain.lock toolchain-subst-default
   assert_target tests/td-toolchain.lock toolchain-input-addressed

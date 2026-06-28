@@ -2,8 +2,10 @@
 # (tools/resolve-toolchain.sh) instead of rebuilding the ~18-rung from-seed chain (~90 min).
 # "Loop substitutes too" (human, 2026-06-28). Builds on the stable input-addressed key (#204)
 # and the lock-keyed publish->fetch leg (#207); the new bits are a PERSISTENT signed
-# substitute store keyed by tests/td-toolchain.lock + the consumer-DEFAULT resolver a real
-# bootstrap gate sources (fetch-by-default, FALL BACK to from-seed on any miss).
+# substitute store keyed by tests/td-toolchain.lock, the consumer-DEFAULT resolver a real
+# bootstrap gate sources (tools/resolve-toolchain.sh: fetch-by-default, FALL BACK to from-seed
+# on any miss), and the daily-suite PUBLISHER (tools/publish-toolchain-subst.sh: export + sign
+# the lock-keyed toolchain into that store).
 #
 # DELIBERATE directive-1 relaxation (human-approved, surfaced in the gate body + the PR): with
 # the resolver the per-PR/local loop no longer builds the toolchain from source; the DAILY

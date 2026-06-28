@@ -75,11 +75,13 @@ W="$scratch/ia"; rm -rf "$W"; mkdir -p "$W/phys" "$W/store" "$W/dest"
 path=$(env -i PATH="$cu/bin" TD_STORE_DIR=/td/store "$tb" store-add-input-addressed glibc-2.41 "$key" "$fixt" "$W/phys" "$W/td.db")
 base=$(basename "$path")
 case "$path" in /td/store/*-glibc-2.41) : ;; *) echo "FAIL: not input-addressed at /td/store: $path" >&2; exit 1 ;; esac
-env -i PATH="$cu/bin" "$tb" subst-export "$W/td.db" "$W/phys" "$W/store" "$path" >/dev/null
-test -f "$W/store/$base.narinfo" || { echo "FAIL: no narinfo exported for $base" >&2; exit 1; }
-"$ts" keygen "$W/priv" "$W/pub" >/dev/null
-"$ts" sign "$W/store" "$W/priv" >/dev/null
-grep -q '^Sig: ' "$W/store/$base.narinfo" || { echo "FAIL: sign did not sign the narinfo" >&2; exit 1; }
+"$ts" keygen "$W/priv" "$W/pub" >/dev/null   # ephemeral pair (CI has no production private secret)
+env -i PATH="$cu/bin" TD_BUILDER="$tb" TD_SUBST_BIN="$ts" TD_SUBST_PRIVKEY="$W/priv" TD_STORE_DIR=/td/store \
+  sh tools/publish-toolchain-subst.sh "$ttl" glibc-2.41 "$W/td.db" "$W/phys" "$W/store" >/dev/null \
+  || { echo "FAIL: publish-toolchain-subst.sh (producer)" >&2; exit 1; }
+test -f "$W/store/$base.narinfo" || { echo "FAIL: publisher wrote no narinfo for $base" >&2; exit 1; }
+grep -q '^Sig: ' "$W/store/$base.narinfo" || { echo "FAIL: publisher did not sign the narinfo" >&2; exit 1; }
+echo "  [DURABLE behavioral] PUBLISHER: publish-toolchain-subst.sh exported + signed the lock-keyed toolchain into the persistent substitute store"
 
 # --- [DURABLE behavioral] DEFAULT FETCH: the resolver fetches+verifies+restores, no build ---
 got=$(env -i PATH="$cu/bin" TD_SUBST_BIN="$ts" TD_BUILDER="$tb" TD_SUBST_STORE="$W/store" \

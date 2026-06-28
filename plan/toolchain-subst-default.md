@@ -44,12 +44,20 @@ byte-reproducible; repro-equality is task 3, separate).
 ## Sub-task ladder (each green before the next)
 
 - [ ] **0** Track claim + draft PR (this commit).
-- [ ] **1** `resolve-toolchain.sh` + pinned-key verify + a gate that proves DEFAULT fetch
-      (warm store → fetch, skip build) AND FALLBACK (cold/tampered store → from-seed),
-      validated end-to-end on a fixture (the #207 static-bash-at-the-lock-path pattern).
-      Verified-red: drop the pinned-key check → a wrong-key substitute is accepted.
-- [ ] **2** `publish-toolchain-subst.sh` + the gate-412 input-addressed/subst-export swap;
-      wire it into `ci/daily-full-suite.sh` as the post-build publisher.
+- [x] **1** `resolve-toolchain.sh` + pinned `tests/td-subst.pub` + gate
+      `toolchain-subst-default` (mk/gates/359) proving DEFAULT fetch (warm store → fetch +
+      verify + restore + RUN, no build) AND fall-back (cold store / wrong key / wrong
+      StorePath → MISS exit 1 → from-seed). affected-checks maps the new paths (+
+      td-toolchain.lock now keys both gates). **Committed `6570a39`.** Validated end-to-end
+      via host smoke (cargo-built td-builder+td-subst, signed with the REAL pinned key —
+      all five legs green). The full in-sandbox gate run (builds td-subst, corpus prelude)
+      defers like #207.
+- [~] **2** `publish-toolchain-subst.sh` DONE + gate-covered (the gate's producer leg calls
+      it; full publish→resolve round-trip with the REAL pinned keypair green in host smoke).
+      REMAINING (from-seed-dependent, daily-suite / warm-source work — NOT validatable
+      per-PR with cold sources, the #207 deferral): the gate-412 `store-add-recursive` →
+      `store-add-input-addressed` + `subst-export` swap, and the `ci/daily-full-suite.sh`
+      post-build publisher call. These touch the heavy/exclusive spine → land as a follow-up.
 - [ ] **3** Adopt the resolver in the real bootstrap toolchain gate(s) with from-seed
       fallback; surface the directive-1 relaxation in the gate header.
 
@@ -61,4 +69,14 @@ in the DAILY suite (cold sources off the per-PR path; the #207-accepted deferral
 
 ## Verified-red evidence
 
-(to be recorded as each leg lands)
+### Sub-task 1 (2026-06-28; perturb resolve-toolchain.sh, revert, reconfirm green)
+- **fall-back signal** (the resolver's most load-bearing property): `miss() … exit 0`
+  instead of `exit 1` → the host smoke's MISS-cold leg flipped to `FAIL: resolver returned
+  0 on a COLD store (should MISS)`. Reverted via `git checkout` (green committed first);
+  reconfirmed `ALL SMOKE LEGS GREEN`. A miss MUST signal fall-back, not silently succeed.
+- **StorePath==lock-path check** — INCONCLUSIVE as a sole-guard verified-red: disabling it
+  (`x$fsp = x$fsp`) still MISSed the wrong-path leg, because `td-subst fetch` independently
+  rejects a basename mismatch (the smoke's tamper changed the whole StorePath incl. the
+  hash). So that check is DEFENSE-IN-DEPTH (catches a prefix-only tamper fetch would pass),
+  not the sole guard. The signature + NarHash + basename guards are td-subst's, already
+  verified-red in gate 358 (the wrong-key leg here re-exercises the signature guard).
