@@ -162,3 +162,51 @@ affected-checks --self-test, ./check.sh rust-seed.
 - Exclusive landing: `check.sh` is the shared spine. Announce + sequence with the
   seed-tarball agent (also edits check.sh for the `:196` toolchain seed).
 - Full-loop escalation is mandatory for check.sh changes (affected-checks: loop spine).
+
+---
+
+## Increment 2a — harness-seed gate (claude-opus-5354e1, 2026-06-28)
+
+Re-took the (stale) track after the human's path-B steer: make ci/daily-full-suite.sh
+runnable on a cloud VM with NO guix installed. inc2a is the keystone PROOF before any
+check.sh spine edit — the loop CONTAINER stands up from a seed alone.
+
+**What landed (this PR):**
+- `builder/src/main.rs` host-sandbox: two additive flags — `--store-from DIR` (bind an
+  unpacked seed store AT /gnu/store instead of the host store) and `--no-daemon` (drop the
+  /var/guix bind). Default binds are byte-identical to before (store_from None → same
+  /gnu/store bind; no_daemon false → /var/guix bind). Validated on `check-engine` smoke
+  for the builder change; the new gate proves the behavior.
+- `mk/gates/385-harness-seed.mk` + `tests/harness-seed.sh`: capture the loop toolchain
+  (make/bash/coreutils/sed/grep/findutils/tar/gzip/crun/util-linux/sqlite) into a seed via
+  the warm-seed rail, then `td-builder host-sandbox --store-from <seed> --no-daemon` and
+  run the toolchain inside. guix is only the one-time capture SOURCE (run on a guix host,
+  exactly like rust-seed/warm-seed); the consume half touches no guix.
+
+**Closes rust-seed's gap:** rust-seed ran on a guix host where /gnu/store was present, so
+it never proved the store resolves when the host store is ABSENT. harness-seed binds ONLY
+the seed at /gnu/store and asserts a host-only path (guix itself) is INVISIBLE inside.
+
+**Verified-red log:**
+- **Green** standalone (`sh tests/harness-seed.sh`, host) and NESTED (the gate's
+  host-sandbox inside check.sh's outer host-sandbox — the real daily-suite path): the
+  46-path seed container runs make/tar/sed/grep/gzip/find; SENTINEL-PRESENT,
+  HOSTONLY-ABSENT, GUIX-ABSENT, VARGUIX-ABSENT.
+- **VR-A (structural discriminator non-vacuous):** re-ran the probe with the HOST
+  /gnu/store + daemon bound (default host-sandbox) → `HOSTONLY-PRESENT` and
+  `VARGUIX-PRESENT` (flipped). Proves the seed run's `*-ABSENT` lines actually discriminate
+  the seed store from the host store, not vacuously pass.
+- **VR-B (behavioral self-sufficiency — no host fallback):** warmed a seed with `tar`
+  DROPPED but kept `tar` on PATH, then `--store-from` that reduced seed → inner
+  `tar --version` failed (RC=7, `TOOL-FAIL tar`). Proves the seed is the ONLY source — a
+  missing tool does NOT silently resolve from the host /gnu/store. This run also CAUGHT a
+  false-green in the probe itself (`v=$(cmd | head -1)` takes head's exit, always 0,
+  masking a missing tool); fixed to `v=$(cmd) && [ -n "$v" ]` + a `TOOL-FAIL` guard in the
+  gate, then re-confirmed green.
+
+**Next (inc2b/2c):** check.sh reads the pin from channels.scm (not `guix describe`) and
+provisions td-builder + the toolchain from the seed when guix is absent (guix-OPTIONAL, so
+the rust-free fast CI image — which HAS guix — is untouched, dissolving the old inc2
+blocker); then a guix-free `check-noguix` tier + daily-full-suite wiring (ship a
+pre-captured pinned seed so the VM skips the capture). Exclusive landing on check.sh,
+sequenced last.

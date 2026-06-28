@@ -4010,14 +4010,38 @@ fn main() -> ExitCode {
         // loopback-only netns), toward replacing `guix shell -C`. With
         // `--expose-cwd` it adds the FULL loop env (worktree + cgroups + guix
         // cache, caller PATH + TD_CHECK_* preserved, chdir into the cwd) so a real
-        // rung runs as under `guix shell -C`. Usage:
-        //   host-sandbox [--expose-cwd] -- CMD ARGS...
+        // rung runs as under `guix shell -C`.
+        //
+        // GUIX-LESS provisioning (host-sandbox-stage0 inc2 — the daily-suite VM):
+        //   --store-from DIR : bind DIR (an UNPACKED SEED store, e.g.
+        //                      <seed>/store/gnu/store) at /gnu/store INSIDE the
+        //                      sandbox instead of the host /gnu/store, so the loop
+        //                      toolchain resolves from the seed and the host store
+        //                      is absent — the substrate for a VM with no guix.
+        //   --no-daemon      : do NOT bind /var/guix (no guix-daemon socket/GC
+        //                      roots). The build path uses td-builder's own build
+        //                      jail (its own newstore), not the daemon, so the
+        //                      shell needs no /var/guix.
+        // Without these flags the binds are byte-identical to before.
+        // Usage:
+        //   host-sandbox [--expose-cwd] [--store-from DIR] [--no-daemon] -- CMD ARGS...
         Some("host-sandbox") if args.len() >= 4 => {
             let mut i = 2usize;
             let mut expose_cwd = false;
+            let mut store_from: Option<String> = None;
+            let mut no_daemon = false;
             while i < args.len() && args[i] != "--" {
                 match args[i].as_str() {
                     "--expose-cwd" => expose_cwd = true,
+                    "--no-daemon" => no_daemon = true,
+                    "--store-from" => {
+                        i += 1;
+                        if i >= args.len() || args[i] == "--" {
+                            eprintln!("td-builder: host-sandbox: --store-from needs a DIR");
+                            return ExitCode::from(2);
+                        }
+                        store_from = Some(args[i].clone());
+                    }
                     other => {
                         eprintln!("td-builder: host-sandbox: unknown flag `{other}'");
                         return ExitCode::from(2);
@@ -4026,7 +4050,7 @@ fn main() -> ExitCode {
                 i += 1;
             }
             if i >= args.len() || i + 1 >= args.len() {
-                eprintln!("usage: td-builder host-sandbox [--expose-cwd] -- CMD ARGS...");
+                eprintln!("usage: td-builder host-sandbox [--expose-cwd] [--store-from DIR] [--no-daemon] -- CMD ARGS...");
                 return ExitCode::from(2);
             }
             let cmd = args[i + 1].clone();
@@ -4041,10 +4065,35 @@ fn main() -> ExitCode {
                 // host_shell mounts a FRESH procfs reflecting the sandbox's own
                 // PID namespace, so the host /proc never leaks in and nested
                 // containers see a private /proc.
-                let mut binds = vec![
-                    sandbox::Bind { src: "/gnu/store".to_string(), dest: None, readonly: true, ro_optional: false },
-                    sandbox::Bind { src: "/var/guix".to_string(), dest: None, readonly: false, ro_optional: false },
-                ];
+                //
+                // The store bind: by default the host /gnu/store; with
+                // --store-from DIR the UNPACKED SEED store DIR, mounted AT
+                // /gnu/store so seed binaries' hardcoded interpreters resolve
+                // (the host store is then absent — the guix-less VM substrate).
+                // --no-daemon drops the /var/guix bind entirely.
+                let mut binds = Vec::new();
+                match store_from.as_deref() {
+                    Some(dir) => binds.push(sandbox::Bind {
+                        src: dir.to_string(),
+                        dest: Some("/gnu/store".to_string()),
+                        readonly: true,
+                        ro_optional: false,
+                    }),
+                    None => binds.push(sandbox::Bind {
+                        src: "/gnu/store".to_string(),
+                        dest: None,
+                        readonly: true,
+                        ro_optional: false,
+                    }),
+                }
+                if !no_daemon {
+                    binds.push(sandbox::Bind {
+                        src: "/var/guix".to_string(),
+                        dest: None,
+                        readonly: false,
+                        ro_optional: false,
+                    });
+                }
                 let mut tmpfs = vec!["/tmp".to_string()];
                 let mut path_env = String::new();
                 let mut workdir = String::new();

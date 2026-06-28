@@ -872,6 +872,10 @@ map_path() {
       add_preflight shell-syntax
       add_target rust-seed ;;
 
+    tests/harness-seed.sh)
+      add_preflight shell-syntax
+      add_target harness-seed ;;
+
     tests/guix-dependence.*)
       add_target guix-dependence ;;
 
