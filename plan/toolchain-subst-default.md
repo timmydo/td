@@ -52,14 +52,20 @@ byte-reproducible; repro-equality is task 3, separate).
       via host smoke (cargo-built td-builder+td-subst, signed with the REAL pinned key —
       all five legs green). The full in-sandbox gate run (builds td-subst, corpus prelude)
       defers like #207.
-- [~] **2** `publish-toolchain-subst.sh` DONE + gate-covered (the gate's producer leg calls
-      it; full publish→resolve round-trip with the REAL pinned keypair green in host smoke).
-      REMAINING (from-seed-dependent, daily-suite / warm-source work — NOT validatable
-      per-PR with cold sources, the #207 deferral): the gate-412 `store-add-recursive` →
-      `store-add-input-addressed` + `subst-export` swap, and the `ci/daily-full-suite.sh`
-      post-build publisher call. These touch the heavy/exclusive spine → land as a follow-up.
-- [ ] **3** Adopt the resolver in the real bootstrap toolchain gate(s) with from-seed
-      fallback; surface the directive-1 relaxation in the gate header.
+- [x] **2** `publish-toolchain-subst.sh` (#209) + the SWITCH-ON producer (branch
+      worktree-toolchain-subst-switchon): gate 412 interns glibc-2.41 INPUT-ADDRESSED
+      (store-add-input-addressed @ toolchain-key) and adds a real-bytes subst leg (subst-export
+      → nar-restore → run the prebuilt program against the FETCHED libc in the own-root → 42;
+      export persisted at .td-build-cache/toolchain-subst-export). `ci/daily-full-suite.sh`
+      signs + publishes that export to the loop's substitute store on a green run (guarded by
+      TD_SUBST_PRIVKEY/BIN). Validated: export→restore round-trip + gate-412 export→daily-publish
+      →resolver-fetch chain (host smokes, real pinned key); gate 412's ~90-min from-seed run
+      validates the REAL glibc-2.41 bytes end-to-end (in progress).
+- [~] **3** Consumer-gate adoption: the resolver (#209) is landed + proven AND the daily suite
+      now publishes the REAL toolchain, so any consumer calling `resolve-toolchain.sh` gets the
+      toolchain by fetch. Wiring it into a specific downstream heavy gate (hello-corpus / rust /
+      a fast check-rung path) as fetch-or-build is the remaining incremental step (each needs its
+      own ~90-min validation) — follow-up.
 
 ## Validation
 
