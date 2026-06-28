@@ -50,13 +50,13 @@ while read -r kind shaval file; do
     input)
       want=`srcsha "$file"` || fail "[pinned-sync] no seed/sources/*.lock declares file `$file`"
       [ "$shaval" = "$want" ] || fail "[pinned-sync] $file: lock pin $shaval != seed pin $want"
-      nin=`expr $nin + 1` ;;
+      nin=$((nin + 1)) ;;
     patch)
       pf="seed/patches/$file"
       test -f "$pf" || fail "[pinned-sync] vendored patch missing: $pf"
       got=`sha "$pf"`
       [ "$shaval" = "$got" ] || fail "[pinned-sync] $file: lock pin $shaval != file sha $got"
-      npatch=`expr $npatch + 1` ;;
+      npatch=$((npatch + 1)) ;;
   esac
 done <<EOF
 `grep -E '^(input|patch) ' "$LOCK"`
@@ -99,8 +99,10 @@ test -n "$HA" -a -n "$HB" || fail "[content-indep] input-addressed adds did not 
 echo "   [content-indep] same key+different bytes -> same path $IA1 (content-addressed would split: $CA1 vs $CA2)"
 
 # --- [load-bearing] perturbing one input pin moves the path ----------------------------------
+# (sed, not awk — the loop sandbox has no awk; zero out the glibc-2.41 source pin.)
 pert="$work/perturbed.lock"
-awk 'BEGIN{done=0} /^input / && !done {sub($2,"0000000000000000000000000000000000000000000000000000000000000000"); done=1} {print}' "$LOCK" > "$pert"
+sed 's/^input [0-9a-f]* glibc-2.41.tar.xz$/input 0000000000000000000000000000000000000000000000000000000000000000 glibc-2.41.tar.xz/' "$LOCK" > "$pert"
+grep -q '^input 0000000000000000000000000000000000000000000000000000000000000000 glibc-2.41.tar.xz$' "$pert" || fail "[load-bearing] could not perturb the lock (glibc-2.41 input line not found)"
 GLP_P=`"$TB" toolchain-path "$pert" glibc-2.41`
 [ "$GLP_P" != "$GLP" ] || fail "[load-bearing] perturbing an input pin did NOT change the path"
 echo "   [load-bearing] flipping one declared input pin moves glibc-2.41's path ($GLP -> $GLP_P)"
