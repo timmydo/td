@@ -44,15 +44,35 @@ cap** and records the scheduler as the wanted next step in DESIGN.
 
 ## Sub-task ladder
 
-1. [ ] sys.rs: `prlimit64` → `set_rlimit`/`get_rlimit`; `mmap_anon` (for the
-   behavioral test). Unit test: rlimit set/get round-trips.
-2. [ ] sys.rs: behavioral — forked child with a small RLIMIT_DATA fails a large
-   anon mmap; an uncapped child succeeds (the cap is load-bearing). VERIFY RED.
-3. [ ] sandbox.rs: `parse_mem_max` + unit tests; cgroup leaf setup helper.
-4. [ ] sandbox.rs: wire rlimit + cgroup join into `build`'s pre_exec; cleanup.
-5. [ ] DESIGN.md: forward note on the global admission scheduler.
-6. [ ] `./check.sh check-engine` green (cheap gates + cargo-test).
+1. [x] sys.rs: `prlimit64` → `set_rlimit`/`get_rlimit`; `mmap_anon` (via a new
+   `syscall6`). Unit test `set_rlimit_data_round_trips`. (commit 1)
+2. [x] sys.rs: behavioral `rlimit_data_caps_anon_mmap` — forked child capped at
+   32 MiB RLIMIT_DATA fails a 256 MiB anon mmap; uncapped child succeeds.
+   VERIFIED RED (below). (commit 1)
+3. [x] sandbox.rs: `parse_mem_max` + unit tests; `setup_build_cgroup` helper. (commit 2)
+4. [x] sandbox.rs: wire rlimit + cgroup join into `build`'s pre_exec; leaf
+   cleanup after status. (commit 2)
+5. [x] DESIGN.md §6: forward note on the global admission scheduler. (commit 2)
+6. [ ] `./check.sh check-engine` green (cheap gates + cargo-test). affected-checks
+   waives the full loop for this diff.
 
 ## Verified-red evidence
 
-(fill in as each assertion is seen red)
+- **`rlimit_data_caps_anon_mmap` (the cap is load-bearing).** First seen red by
+  a *real bug it caught*: the uncapped child also failed to map 256 MiB because
+  `mmap_anon` used `syscall5`, leaving the offset register garbage → x86_64
+  `sys_mmap` EINVALs a non-page-aligned offset even for an anon map. Fixed with
+  `syscall6` (offset 0). Then verified red *for the cap specifically*: neutering
+  the `set_rlimit` call made the "capped" child map 256 MiB successfully
+  (`left: 0, right: 1` — "a child capped at 32 MiB RLIMIT_DATA must fail to map
+  268435456 bytes"); restoring the call returns it to green.
+- `parse_mem_max_*` and `set_rlimit_data_round_trips` are explicit-value
+  assertions over pure/syscall mappings (a stub fails the Some/None cases).
+
+## Scope boundary (stated honestly)
+
+The cap is per-build (one runaway build can't OOM the host). It is NOT a global
+scheduler — there is no admission/bin-packing across concurrent builds, because
+no single arbiter sees all in-flight builds today (the build daemon is serial +
+not the only path; `make -j2` and concurrent agent checks spawn builds directly).
+That follow-on is parked in DESIGN §6 per the human's note.
