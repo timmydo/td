@@ -966,6 +966,13 @@ KH_X86_64_TB=".td-build-cache/sources/linux-headers-$KH_VER-x86_64.tar.gz"
 test -f "$KH_X86_64_TB" || fail "x86_64 kernel headers not warm ($KH_X86_64_TB) — run 'sh tools/warm-kernel-headers-x86_64.sh'"
 echo "   [pinned-input] + the x86_64 Linux UAPI headers (derived from the pinned linux-$KH_VER source)"
 
+# --- sourced as a FUNCTION LIBRARY (TD_X86_64_LIB=1): the build_* rung functions are now
+# defined and the pinned-input checks (incl. the x86_64 kernel headers) have run, so a consumer
+# (tests/rust-x86_64-runtime-store-native.sh) can drive the rungs itself and add its own legs
+# without copying the ~800-line chain. Return BEFORE the build driver. Behavior-preserving when
+# executed normally: TD_X86_64_LIB is unset → the guard is false → the driver below runs as-is.
+[ "${TD_X86_64_LIB:-0}" = 1 ] && return 0
+
 # ============================================================================================
 # Build the i686 base FROM THE SEED (the 21-rung chain → gcc 14.3.0 + glibc 2.16 static/shared +
 # binutils 2.44), then CROSS UP to x86_64. Directive 1: from the 229-byte seed, no cache, offline.

@@ -54,10 +54,45 @@ Running an upstream rustc from `/td/store` needs **glibc ≥ 2.17** there (rustc
   `/td/store/<hash>-rust-1.96.0-store-native` with zero /gnu/store. Pin migrated to
   `seed/sources/rust-1.96.0.lock` (manifest-warmed, no check.sh edit). The runtime leg is
   the explicit `[PENDING glibc-final]` echo, not faked.
-- **Next:** when `glibc-final` (>=2.17) lands at `/td/store`, populate the interned tree's
-  `lib/` with the `/td/store` glibc loader + libc + libgcc_s and flip the runtime leg green
-  (RUN rustc from the `store-ns` own-root, `/gnu/store` absent). Then rung 3/4: build the
-  Rust userland tools with the store-native rustc + assemble via `td-builder profile`.
+- **RUNTIME LEG — GREEN from-seed + verified-red (2026-06-28, claude-opus-5cd532).** Both blockers are now
+  resolved on main: glibc 2.41 (#199) AND — decisively — the **x86_64 toolchain (#201)**.
+  The earlier "one-line relink-target swap" claim was WRONG: it ignored ARCHITECTURE. The
+  whole `/td/store` toolchain was i686 (`ld-linux.so.2`); the rust pin is **x86_64**, so an
+  x86_64 rustc could never run against the i686 glibc 2.41. #201 crosses up to a native
+  x86_64 toolchain at `/td/store` (x86_64 glibc 2.41 + `libgcc_s.so.1`) and factored its
+  **cross rungs** into a *sourceable* helper (`tests/x86_64-cross-fns.sh`), handing off
+  step 8 = "[rust] flip the runtime leg green" to this track. New gate
+  **`mk/gates/416-rust-x86_64-runtime-store-native.mk`** + `tests/rust-x86_64-runtime-store-native.sh`:
+  - **REUSES the #201 chain without copying it** — sources the x86_64 gate as a function
+    library via a one-line `TD_X86_64_LIB=1` guard (behavior-preserving; exposes the 21
+    `build_*` rungs + verified pinned-input vars, returns before its build driver). The
+    only cross-track edit; no 5th inline copy of the ~800-line base.
+  - **Runtime closure (measured, not assumed):** rustc/cargo NEED only the x86_64 glibc
+    2.41 libs + `libgcc_s.so.1` + **`libz.so.1`** (libLLVM links zlib dynamically). The
+    toolchain provides glibc + libgcc; zlib it does NOT — so the gate **builds x86_64 zlib
+    1.3.1 FROM SOURCE** with the cross gcc (new pin `seed/sources/zlib-1.3.1.lock`).
+  - **Relink = interp only.** `librustc_driver`'s RUNPATH is already `$ORIGIN/../lib`, and
+    glibc's loader resolves the transitive `libz` (via libLLVM, no RUNPATH) from that same
+    dir — verified with `env -i` + `--inhibit-cache` (own-root conditions). So the gate
+    co-locates the full closure in the tree's `lib/` and relinks **only the interp** →
+    `/td/store/ld` (short, fits the original slot in-place; td's own `elf-set-interp`, no
+    patchelf; no rpath growth — the in-place rewriter can't grow it).
+  - **Own-root run:** intern the self-contained tree at `/td/store`, place the x86_64 loader
+    at `/td/store/ld`, RUN `rustc -vV` + `cargo --version` under `store-ns` → rustc/cargo
+    1.96.0, `/gnu/store` ABSENT. Durable legs: supply-chain, provenance, no-guix, structural
+    (complete lib closure + interp ∈ /td/store), behavioral.
+  - **Validated on the host first** (prototype): the full closure runs with a custom interp +
+    all libs co-located; libz/libgcc are load-bearing (closure fails without them →
+    verified-red material). zlib `configure --shared` + `make libz.so.1.3.1` confirmed.
+  - HEAVY (~90 min from-seed; directive 1). **Authoritative from-seed run GREEN (2026-06-28):** built
+    the i686 chain → gcc 14.3.0, crossed up to the x86_64 toolchain (glibc 2.41 + libgcc_s), built
+    x86_64 zlib, relinked + interned the upstream Rust 1.96.0 toolchain at
+    `/td/store/1fifhn8zk0i6x86n7x64b8dzc99yrm2h-rust-1.96.0-x86_64-store-native` (zero /gnu/store), and
+    RAN `rustc -vV` + `cargo --version` from `/td/store` in the store-ns own-root → rustc/cargo 1.96.0
+    (LLVM 22.1.2), `GNU-ABSENT`.
+- **Then** rung 3 (the relinked rustc compiles a Rust program → a `/td/store`-linked binary
+  that runs in the own-root) and rung 4 (build the Rust userland + assemble via `td-builder
+  profile --store-native`).
 
 ## Brick ladder
 
@@ -90,6 +125,14 @@ Running an upstream rustc from `/td/store` needs **glibc ≥ 2.17** there (rustc
   `FAIL: interp of rustc not relinked to /td/store (got: /lib64/ld-linux-x86-64.so.2)`.
   Restored the green script (committed first, per [[td-commit-before-red-variants]]). So the
   structural assertion is load-bearing — the relink is the thing it checks.
+- rust-x86_64-runtime behavioral + closure-completeness — DONE 2026-06-28: re-ran the gate's exact tail
+  (relink interp via td's `elf-set-interp` → co-locate the closure → `store-add-recursive` at /td/store →
+  run `rustc -vV` under `store-ns`) on the host with a real working x86_64 closure (host glibc 2.39 +
+  libgcc_s + libz stand-ins; the assertion is arch/abi-identical). GREEN: rustc 1.96.0 ran in the own-root
+  (LLVM 22.1.2 loaded). Then dropped `libz.so.1` from the interned closure and re-ran → **RED**: `rustc:
+  error while loading shared libraries: libz.so.1: cannot open shared object file`. So the behavioral +
+  closure-completeness legs are load-bearing — `libz` (the libLLVM transitive dep I initially mis-read as
+  absent) is exactly the thing the own-root run depends on, and removing any closure member reds it.
 
 ## Parallel-safety
 

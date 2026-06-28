@@ -1,0 +1,15 @@
+# seed/sources/zlib-1.3.1.lock — UPSTREAM zlib 1.3.1 source (madler/zlib release), the
+# GUIX-FREE source for the x86_64 libz.so.1 that the /td/store Rust runtime needs. The
+# upstream Rust toolchain's libLLVM.so.22.1 dynamically NEEDs libz.so.1 (LLVM compresses
+# with zlib), but the /td/store x86_64 toolchain (glibc 2.41 + cross gcc 14.3.0) provides
+# no zlib — so the rust-x86_64-runtime gate builds zlib 1.3.1 FROM SOURCE with the cross
+# gcc, against the /td/store x86_64 glibc, and co-locates the resulting libz.so.1 in the
+# relinked rustc tree. Built from source (not a guix package, not a binary) → no guix bytes.
+#
+# Warmed guix-free by tools/warm-bootstrap-sources.sh (HOST prep, td-fetch + the shared
+# td-feed) into .td-build-cache/sources/<file>; the gate reads it offline and re-verifies
+# the sha256 itself. The sha256 content-address IS the oracle. Bump url + sha256 + file
+# together (sha256 is the value madler publishes for the release tarball).
+url https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+sha256 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
+file zlib-1.3.1.tar.gz
