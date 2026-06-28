@@ -22,6 +22,10 @@
 #   [pinned-input] chain tarballs + boot patches + glibc-2.16.0 + binutils-2.44 match sha256.
 #   [no-guix]      no /gnu/store bytes in the shared libc.so.6 NOR in the built `ld`.
 #   [content-addr] the interned paths are /td/store/<nar-hash>-<name>.
+#   [repro]        binutils 2.44 is BYTE-REPRODUCIBLE: two independent from-source builds (different build
+#                  dirs), canonicalized by tests/repro-lib.sh (strip the build-path-bearing DWARF + deter-
+#                  ministic archives + drop libtool .la), land on the SAME content-addressed /td/store path
+#                  — a stable key for td-subst. Intrinsic double-build reproducibility, no guix oracle.
 #   [behavioral]   the /td/store toolchain builds modern binutils 2.44 from source (configure + make); the
 #                  as/ld are DYNAMIC (interp = the /td/store ld-linux.so.2), RUN in the own-root, report
 #                  version 2.44, AND assemble+link a program that returns 42. (A modern toolchain component,
@@ -701,6 +705,7 @@ for so in "$GLS/lib/"*.so; do
 done
 
 . tests/cache-lib.sh
+. tests/repro-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
@@ -748,26 +753,50 @@ exec "$GM1/out/bin/gcc" -std=gnu99 -isystem "$GLS/include" -B"$GLS/lib" -L"$GLS/
 WRAPB
 chmod 0555 "$wrap/gcc" "$wrapb/gcc"
 
-bsrc=`mktemp -d`/binutils; mkdir -p "$bsrc"
-"$xzb" -dc "$BU244_TB" | tar -xf - -C "$bsrc" --strip-components=1 || fail "binutils-2.44 unpack failed"
-( cd "$bsrc"; bp="$BMB/out/bin:$toolbin:$PATH"
-  env PATH="$bp" CONFIG_SHELL="$SH" SHELL="$SH" \
-    CC="$wrap/gcc" CC_FOR_BUILD="$wrapb/gcc" AR="$BMB/out/bin/ar" RANLIB="$BMB/out/bin/ranlib" \
-    "$SH" ./configure --build=i686-pc-linux-gnu --host=i686-unknown-linux-gnu \
-    --prefix=/td/store/binutils-2.44 --disable-nls --disable-gold --disable-werror \
-    --enable-deterministic-archives --disable-plugins --disable-gprofng >cfg.log 2>&1 \
-    || { echo "binutils-2.44 configure failed:" >&2; cp cfg.log "$ROOT/.td-build-cache/_bu244-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; exit 1; }
-  env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$SH" SHELL="$SH" make MAKEINFO=true >mk.log 2>&1 \
-    || { echo "binutils-2.44 make failed:" >&2; cp mk.log "$ROOT/.td-build-cache/_bu244-mk.log" 2>/dev/null||true; tail -30 mk.log >&2; exit 1; }
-  env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$SH" SHELL="$SH" make MAKEINFO=true install prefix="$bsrc/out" >inst.log 2>&1 \
-    || { echo "binutils-2.44 install failed:" >&2; tail -20 inst.log >&2; exit 1; } ) \
-  || fail "modern binutils 2.44 did not build with the /td/store toolchain"
-BO="$bsrc/out"
+# build_bu244 — one independent from-source build of binutils 2.44 into a fresh dir (the
+# gate's recipe verbatim); echoes the install dir. Called twice for the [repro] leg below.
+build_bu244() {
+  _bs=`mktemp -d`/binutils; mkdir -p "$_bs"
+  "$xzb" -dc "$BU244_TB" | tar -xf - -C "$_bs" --strip-components=1 || { echo "binutils-2.44 unpack failed" >&2; return 1; }
+  ( cd "$_bs"; bp="$BMB/out/bin:$toolbin:$PATH"
+    env PATH="$bp" CONFIG_SHELL="$SH" SHELL="$SH" \
+      CC="$wrap/gcc" CC_FOR_BUILD="$wrapb/gcc" AR="$BMB/out/bin/ar" RANLIB="$BMB/out/bin/ranlib" \
+      "$SH" ./configure --build=i686-pc-linux-gnu --host=i686-unknown-linux-gnu \
+      --prefix=/td/store/binutils-2.44 --disable-nls --disable-gold --disable-werror \
+      --enable-deterministic-archives --disable-plugins --disable-gprofng >cfg.log 2>&1 \
+      || { echo "binutils-2.44 configure failed:" >&2; cp cfg.log "$ROOT/.td-build-cache/_bu244-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; exit 1; }
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$SH" SHELL="$SH" make MAKEINFO=true >mk.log 2>&1 \
+      || { echo "binutils-2.44 make failed:" >&2; cp mk.log "$ROOT/.td-build-cache/_bu244-mk.log" 2>/dev/null||true; tail -30 mk.log >&2; exit 1; }
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$SH" SHELL="$SH" make MAKEINFO=true install prefix="$_bs/out" >inst.log 2>&1 \
+      || { echo "binutils-2.44 install failed:" >&2; tail -20 inst.log >&2; exit 1; } ) \
+    || return 1
+  echo "$_bs/out"
+}
+
+# Build A, then canonicalize for byte-reproducibility: strip the build-path-bearing DWARF +
+# deterministic archives + drop libtool .la (tests/repro-lib.sh). strip is the freshly-built
+# modern binutils strip, run via the /td/store glibc loader (its baked interp is absent here).
+BO=`build_bu244` || fail "modern binutils 2.44 did not build with the /td/store toolchain"
 for t in as ld ar nm objcopy strip; do test -x "$BO/bin/$t" || fail "binutils 2.44 install missing bin/$t"; done
+repro_normalize_tree "$BO" "$BO/bin/strip" "$GLS/lib/ld-linux.so.2" "$GLS/lib" || fail "binutils-2.44 normalization failed"
 if grep -q -a '/gnu/store' "$BO/bin/ld"; then fail "the built ld contains /gnu/store bytes"; fi
 li=`"$BMB/out/bin/readelf" -l "$BO/bin/ld" 2>/dev/null | grep -o "/td/store/$glrel/lib/ld-linux.so.2" | head -1`
 test -n "$li" || fail "the built ld is not dynamic against the /td/store ld-linux.so.2"
 echo "   [no-guix] the /td/store toolchain built modern binutils 2.44 from source → dynamic ELF, interp=$li, no /gnu/store bytes in ld"
+
+# --- [repro] a second independent build, normalized the same way, is BYTE-IDENTICAL --------------
+# Durable intrinsic-reproducibility (no guix oracle): two from-source builds in different mktemp
+# build dirs land on the SAME content-addressed /td/store path, so the modern toolchain has a
+# stable key — the prerequisite for td-subst chaining + consumer fetch. Verified-red (measured in
+# the dev harness): the RAW un-normalized double-build differs in 35 files — the random build path
+# leaks into every ELF's DWARF (.debug_*), archive member mtimes, and the libtool .la files.
+BO2=`build_bu244` || fail "the second (repro) binutils-2.44 build did not run"
+repro_normalize_tree "$BO2" "$BO2/bin/strip" "$GLS/lib/ld-linux.so.2" "$GLS/lib" || fail "second binutils-2.44 normalization failed"
+h1=`"$TB" nar-hash "$BO"` || fail "nar-hash of build A failed"
+h2=`"$TB" nar-hash "$BO2"` || fail "nar-hash of build B failed"
+test "$h1" = "$h2" || fail "binutils 2.44 is NOT byte-reproducible — buildA=$h1 buildB=$h2"
+rm -rf "`dirname "$BO2"`"
+echo "   [repro] two independent from-source builds of binutils 2.44, normalized, are byte-identical (nar-hash $h1) — a STABLE content-addressed /td/store path (durable: intrinsic double-build reproducibility, no guix oracle)"
 
 # Intern modern binutils 2.44 at /td/store.
 BUP244=`"$TB" store-add-recursive binutils-2.44 "$BO" "$store" "$sndb"` || fail "store-add-recursive binutils-2.44 failed"

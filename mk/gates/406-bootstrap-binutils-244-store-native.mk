@@ -8,7 +8,10 @@
 # of guix's final-toolchain ladder, td-native (gcc-boot0 next). Build via two build-wrappers (CC bakes
 # /td/store interp for the target as/ld; CC_FOR_BUILD bakes the live build-dir interp for in-tree build tools
 # like chew), -std=gnu99 (binutils 2.44 is C99+, gcc 4.6.4 default is gnu89), cross-style, --disable-gold.
-# DURABLE: pinned-input, no-guix (no /gnu/store in libc.so.6 NOR ld), content-addr, behavioral (modern as/ld
+# BYTE-REPRODUCIBLE: two independent from-source builds, canonicalized by tests/repro-lib.sh (strip the
+# build-path-bearing DWARF + deterministic archives + drop libtool .la), land on the SAME content-addressed
+# /td/store path — a stable key for td-subst chaining/fetch. DURABLE: pinned-input, no-guix (no /gnu/store in
+# libc.so.6 NOR ld), content-addr, repro (intrinsic double-build, no guix oracle), behavioral (modern as/ld
 # 2.44 run+link → 42 from /td/store), structural (/td/store is the store, /gnu/store ABSENT). NOT a BUILD_GATE.
 HEAVY_GATES += bootstrap-binutils-244-store-native
 bootstrap-binutils-244-store-native:
