@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: toolchain-input-addressed
 handle: claude-opus-b3b7ea
 date: 2026-06-27
