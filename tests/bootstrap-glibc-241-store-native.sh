@@ -1023,6 +1023,17 @@ test "x$GLP" = "x$IAP" || fail "interned glibc-2.41 path ($GLP) != the lock-comp
 case "$GLP" in /td/store/*-glibc-2.41) ;; *) fail "glibc-2.41 not input-addressed at /td/store: $GLP" ;; esac
 glrel=${GLP#/td/store/}
 echo "   [input-addr] interned glibc-2.41 at the LOCK-KEYED path $GLP (substitutable by tests/td-toolchain.lock)"
+# toolchain-subst-default (#209): subst-export glibc-2.41 NOW — the stage0 store db is rewritten
+# single-entry by each store-add (it does not accumulate), so export while glibc-2.41 is the
+# registered root, BEFORE the test-program intern below. The export FILES persist on disk and are
+# read by the restore-and-run leg at the end + signed/published by the daily suite.
+sx="$ROOT/.td-build-cache/toolchain-subst-export"; rm -rf "$sx"; mkdir -p "$sx"
+glbase=`basename "$GLP"`
+"$TB" subst-export "$sndb" "$store" "$sx" "$GLP" >/dev/null || fail "subst-export glibc-2.41 failed"
+test -f "$sx/$glbase.narinfo" || fail "subst-export wrote no narinfo for $glbase"
+esp=`grep '^StorePath: ' "$sx/$glbase.narinfo" | cut -d' ' -f2`
+test "x$esp" = "x$GLP" || fail "exported StorePath ($esp) != the lock-keyed path ($GLP)"
+echo "   [subst] subst-exported the lock-keyed glibc-2.41 (td-builder only, no subst binary); persisted at $sx for the daily-suite publisher"
 
 # Build the test C/C++ programs IN THE SANDBOX (the userland build-wrapper trick): real -B/-L/-isystem at the
 # live glibc 2.41 build dir, the /td/store glibc 2.41 interp+RUNPATH baked; sandbox binutils 2.44 for as/ld.
@@ -1059,19 +1070,13 @@ echo "   [behavioral] gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++) program a
 echo "$snout" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root — mixed with guix"
 echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT (unmixed from guix)"
 
-# --- toolchain-subst-default (#209): the REAL glibc-2.41 flows through the substitute machinery ---
-# subst-export the lock-keyed glibc-2.41 (td-builder only — NO subst binary, NO network), prove it
-# round-trips byte-identically AND the prebuilt program RUNS against the FETCHED-not-rebuilt libc in the
-# own-root → 42 — the toolchain artifact obtained by FETCH, not the ~90-min from-seed rebuild. The export
-# is PERSISTED under .td-build-cache so the daily suite (ci/daily-full-suite.sh) signs + publishes it with
-# the real key; the loop's resolver (tools/resolve-toolchain.sh, #209) then fetches it. Deliberate
-# directive-1 relaxation: the daily full suite is the sole from-seed authoritative build + the publisher.
-sx="$ROOT/.td-build-cache/toolchain-subst-export"; rm -rf "$sx"; mkdir -p "$sx"
-glbase=`basename "$GLP"`
-"$TB" subst-export "$sndb" "$store" "$sx" "$GLP" >/dev/null || fail "subst-export glibc-2.41 failed"
-test -f "$sx/$glbase.narinfo" || fail "subst-export wrote no narinfo for $glbase"
-esp=`grep '^StorePath: ' "$sx/$glbase.narinfo" | cut -d' ' -f2`
-test "x$esp" = "x$GLP" || fail "exported StorePath ($esp) != the lock-keyed path ($GLP)"
+# --- toolchain-subst-default (#209): the REAL glibc-2.41 is obtained by FETCH, not rebuild ---
+# Restore the lock-keyed glibc-2.41 from the subst-export written above (td-builder only — NO subst
+# binary, NO network), prove it round-trips byte-identically AND the prebuilt programs RUN against the
+# FETCHED-not-rebuilt libc in a fresh own-root → 42 — the toolchain artifact obtained by FETCH, not the
+# ~90-min from-seed rebuild. The export is persisted so the daily suite (ci/daily-full-suite.sh) signs +
+# publishes it with the real key; the loop's resolver (tools/resolve-toolchain.sh, #209) then fetches it.
+# Deliberate directive-1 relaxation: the daily full suite is the sole from-seed authoritative build + publisher.
 rstore="$snwork/rstore"; mkdir -p "$rstore"
 narf=`grep '^NarFile: ' "$sx/$glbase.narinfo" | cut -d' ' -f2`
 "$TB" nar-restore "$sx/$narf" "$rstore/$glbase" >/dev/null || fail "nar-restore glibc-2.41 from the export failed"
