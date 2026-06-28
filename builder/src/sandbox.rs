@@ -122,11 +122,17 @@ pub fn build(
         let (canonical, on_disk) = split_closure_entry(entry);
         let meta = fs::symlink_metadata(on_disk)
             .map_err(|e| err(format!("closure item {canonical} (on disk {on_disk}): {e}")))?;
-        let target = newstore.join(
-            canonical
-                .strip_prefix(&store_prefix)
-                .ok_or_else(|| err(format!("closure item {canonical}: not a store path")))?,
-        );
+        // BASENAME-keyed: a closure can span MULTIPLE store prefixes (/gnu/store deps +
+        // /td/store td-built deps, e.g. a chained toolchain — brick 8). Each item is staged
+        // flat under newstore/<base> (store hashes are unique); newstore is then mounted at
+        // EVERY prefix the closure spans below, so /gnu/store/<b> and /td/store/<b> both
+        // resolve to their item. For a single-prefix closure this is exactly the old layout.
+        let base = canonical
+            .rsplit('/')
+            .next()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| err(format!("closure item {canonical}: not a store path")))?;
+        let target = newstore.join(base);
         if meta.is_dir() {
             fs::create_dir_all(&target)?;
         } else if meta.is_file() {
@@ -196,6 +202,23 @@ pub fn build(
     let oldroot_rel = newroot.join("oldroot");
     let oldroot_rel_c = cstr(&oldroot_rel);
     let oldroot_abs_c = CString::new("/oldroot").unwrap();
+    // EXTRA store prefixes the closure spans beyond the active one (e.g. /td/store toolchain
+    // inputs in a /gnu/store-native corpus build — brick 8). newstore is rbind'd at each of
+    // these too, so those inputs are visible at their canonical prefix. Empty for the common
+    // single-store build → the mount sequence below is unchanged.
+    let mut extra_prefixes: Vec<String> = closure
+        .iter()
+        .map(|e| split_closure_entry(e).0)
+        .filter_map(|c| c.rsplit_once('/').map(|(d, _)| d.to_string()))
+        .filter(|d| *d != store_dir_str)
+        .collect();
+    extra_prefixes.sort();
+    extra_prefixes.dedup();
+    let extra_store_dirs: Vec<PathBuf> = extra_prefixes
+        .iter()
+        .map(|p| newroot.join(p.trim_start_matches('/')))
+        .collect();
+    let extra_store_cs: Vec<CString> = extra_store_dirs.iter().map(|d| cstr(d)).collect();
     // /dev is rbind'd whole from the invoking namespace rather than rebuilt node by
     // node: re-binding a device node onto a fresh unprivileged-userns tmpfs strips
     // device access (the re-bound /dev/null returns EACCES on write), whereas an
@@ -297,6 +320,13 @@ pub fn build(
             // Staged store → /gnu/store (rbind carries the per-item binds); outputs
             // the build writes under /gnu/store land in newstore on the host.
             sys::mount(Some(&newstore_c), &store_dir_c, None, sys::MS_BIND | sys::MS_REC, None)?;
+            // … and at every EXTRA prefix the closure spans (e.g. /td/store toolchain inputs):
+            // the SAME newstore (basename-keyed) rbind'd there too, so those canonical paths
+            // resolve. Empty for a single-store build, so this is a no-op in the common case.
+            for (i, dst) in extra_store_cs.iter().enumerate() {
+                fs::create_dir_all(&extra_store_dirs[i])?;
+                sys::mount(Some(&newstore_c), dst, None, sys::MS_BIND | sys::MS_REC, None)?;
+            }
             // Writable build tmpfs.
             sys::mount(Some(&tmpfs_c), &tmp_dir_c, Some(&tmpfs_c), 0, None)?;
             // /dev rbind'd whole (preserves working device binds; see note above).
