@@ -46,11 +46,32 @@ so its gettext `po/` uses `SHELL=@SHELL@` (no hardcoded /bin/sh) and the engine 
 guix seed closure (real bash/make/…), so the "no /bin/sh in the sandbox" class that bit the mesboot
 wrapper does not recur.
 
-## Verified-red (plan)
+## Verified-red (CONFIRMED via the cached-toolchain harness, 2026-06-28)
 
-- Break the own-root substitution (`s/zzz/bar/` so it can't match `foo`) → the behavioral leg reds
-  ("sed did not substitute foo->bar from /td/store"): proves the substitution is load-bearing.
+- **behavioral leg**: break the own-root substitution (`s/zzz/bar/` so it can't match `foo`) → the
+  own-root sed output is just `foo` (no `bar`) → `FAIL: brick8: sed did not substitute foo->bar from
+  /td/store: foo` (exit 1). The substitution leg is load-bearing.
 - The interp + no-guix-toolchain legs are the brick-8 template's, already exercised by the hello gate.
+
+Both green and red were run on a cached modern toolchain (the harness reuses `seddev2/chain.env`), so
+each brick-8 iteration is ~2 min instead of a ~90-min from-seed toolchain rebuild.
+
+## check-rung vs check.sh — the brick-8 environment gaps (dev-harness only)
+
+The brick-8 engine path needs three things the real `./check.sh` provides but `tools/check-rung.sh`
+does not, so a bare `check-rung` harness can't run brick8 (these are NOT gate bugs):
+
+1. **awk** — not in the declared loop toolchain; it reaches the gate only via check.sh's
+   `$hostguix_dir` on PATH. FIXED in the gate itself: the two gcc-toolchain lock rewrites now use
+   `grep`/`sed` (declared toolchain) — hermetic, and the harness no longer needs awk.
+2. **guix** — `xargs guix build` (realize the guix build-env seed closure) needs the `guix` binary,
+   on PATH via `$hostguix_dir` under check.sh. The dev harness adds it (`run-guix.sh` mirrors check.sh's
+   `PATH=$hostguix_dir:$toolchain`). Inherent to the brick-8 pattern (the build env stays guix, §5).
+3. **td-ts-eval sentinel** — written by the `build-recipes` prelude; `./check.sh <single-heavy-target>`
+   does NOT trigger build-recipes. Warm it first (run `./check.sh build-recipes`, which writes
+   `.td-build-cache/rust-ts-eval/tseval-path`), then the gate's `load_ts_eval` finds it. Same
+   requirement as the hello-corpus gate. The authoritative run is `./check.sh build-recipes
+   bootstrap-sed-corpus-store-native` (or build-recipes once, then the gate).
 
 ## Notes / gotchas
 
