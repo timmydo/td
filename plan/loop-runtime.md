@@ -83,6 +83,13 @@ Design choices:
   recipe under bash and returns its true exit code (this wraps the loop spine).
 - Opt-out: `TD_GATE_TIMING=0` disables the `.SHELLFLAGS` override entirely; the
   override also only engages when `tools/gate-time.sh` exists (`$(wildcard)`).
+- Dependency posture (no NEW dependency): `gate-time.sh`'s own body is POSIX; it
+  runs each recipe via the SAME `bash` the Makefile's `SHELL := bash` already used
+  (recipes are bash — `set -euo pipefail`), so it adds nothing. `gate-timing-report.sh`
+  is pure POSIX sh (no bash, no awk — a sort-by-gate-then-time single pass instead
+  of associative arrays; newest-log via command substitution, not process
+  substitution), invoked via `sh`. bash is required only where the gate recipes
+  already require it.
 
 Verified-red / safety evidence (2026-06-28):
 - Exit-code transparency: `gate-time.sh failgate -c 'exit 7'` returns 7 (and

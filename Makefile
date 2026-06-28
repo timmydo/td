@@ -118,7 +118,7 @@ container-check:
 	@./check.sh
 
 check: $(CHEAP_GATES) build-recipes $(HEAVY_GATES)
-	@TD_HEAVY_GATES='$(HEAVY_GATES)' bash tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt" || true
+	@TD_HEAVY_GATES='$(HEAVY_GATES)' sh tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt" || true
 
 # build-recipes — the PARALLEL build phase (DESIGN §7.1 move-off-Guile §5). Separates
 # "build everything" from "the checks": realize + reproducibility-check EVERY package
@@ -178,7 +178,7 @@ check-fast: $(CHEAP_GATES) $(FAST_GATES)
 # run, link-tests, the guix per-PACKAGE differential). Re-fold these back into
 # `check` when the OS becomes the focus. Run them on demand: `./check.sh check-system`.
 check-system: $(CHEAP_GATES) $(SYSTEM_GATES)
-	@TD_HEAVY_GATES='$(SYSTEM_GATES)' bash tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt" || true
+	@TD_HEAVY_GATES='$(SYSTEM_GATES)' sh tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt" || true
 
 # The build-ENGINE smoke tier — a TRUE smoke: "does it compile, lint, and pass unit tests",
 # targeting ~2 min so a build-engine change (builder/src/*) lands fast WITHOUT the full
@@ -241,7 +241,7 @@ endif
 # fire) or to inspect a `check-system`/`check-fast` run. `check` runs it
 # automatically on a green loop (its recipe above).
 gate-timing-report:
-	@TD_HEAVY_GATES='$(HEAVY_GATES)' bash tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt"
+	@TD_HEAVY_GATES='$(HEAVY_GATES)' sh tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt"
 
 # `rootless` needs NO special scheduling — it runs as an ordinary heavy gate
 # under -j2 (its only prereq is the generic last-cheap-gate one above). It USED to
