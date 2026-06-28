@@ -291,7 +291,8 @@ run_x86_64_cross() {
 # the interned /td/store x86_64 ld-linux-x86-64.so.2, -static-libgcc -static-libstdc++ so the own-root
 # needs only the interned glibc), and RUNS them in the store-ns own-root → 42 with /gnu/store ABSENT.
 # Requires: $TB (caller load_stage0'd), TD_STORE_DIR=/td/store, and the run_x86_64_cross exports
-# (XGLIBC XGCC2 XBU). Legs: [no-guix] [content-addr] [behavioral] [structural].
+# (XGLIBC XGCC2 XBU). Legs: [no-guix] [content-addr] [behavioral] [structural] [input-addressed]
+# (the lock-keyed path a consumer fetches as a substitute — x64-toolchain-subst PR2).
 verify_x86_64_ownroot() {
   cpath=$1; snwork=$2; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
   xcc1=`find "$XGCC2" -name cc1 | head -1`
@@ -337,4 +338,41 @@ verify_x86_64_ownroot() {
   echo "   [behavioral] cross gcc 14.3.0 links a DYNAMIC x86_64 C AND C++ program vs MODERN x86_64 glibc 2.41; both run in the own-root → 42"
   echo "$snout" | grep -q '^GNU-ABSENT$' || { echo "/gnu/store is PRESENT in the own-root" >&2; return 1; }
   echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT"
+
+  # --- [input-addressed] (x64-toolchain-subst) intern the REAL x86_64 glibc 2.41 at the
+  # LOCK-KEYED path so a consumer can NAME it and FETCH it as a signed substitute (the path
+  # td-subst / resolve-toolchain.sh compute from tests/td-toolchain-x86_64.lock) instead of the
+  # ~90-min cross rebuild — real x86_64 bytes at a stable, predictable /td/store path, not a
+  # content-addressed throwaway. Then RUN a DYNAMIC x86_64 program whose interp IS that
+  # input-addressed glibc. Gate 418 (toolchain-x86_64-input-addressed, #219) keys the path with a
+  # static-bash FIXTURE; this leg ties the path to the REAL cross-built x86_64 toolchain bytes.
+  XLOCK=tests/td-toolchain-x86_64.lock
+  test -f "$XLOCK" || { echo "missing $XLOCK" >&2; return 1; }
+  XK=`"$TB" toolchain-key "$XLOCK"` || { echo "toolchain-key $XLOCK failed" >&2; return 1; }
+  IAGL=`"$TB" store-add-input-addressed glibc-2.41-x86_64 "$XK" "$XGLIBC" "$store" "$sndb"` \
+    || { echo "store-add-input-addressed x86_64 glibc failed" >&2; return 1; }
+  WANTGL=`"$TB" toolchain-path "$XLOCK" glibc-2.41-x86_64`
+  test "$IAGL" = "$WANTGL" || { echo "input-addressed glibc path $IAGL != lock-computed $WANTGL (consumer can't predict it)" >&2; return 1; }
+  # x64 focus: the x86_64 toolchain must NOT share a /td/store path with the i686 bootstrap
+  # intermediate, or a published x86_64 substitute could be confused for i686.
+  ILGL=`"$TB" toolchain-path tests/td-toolchain.lock glibc-2.41`
+  test -n "$ILGL" -a "$IAGL" != "$ILGL" || { echo "x86_64 glibc path $IAGL collides with the i686 glibc path $ILGL" >&2; return 1; }
+  echo "   [distinct-arch] the x86_64 lock-keyed path differs from the i686 toolchain's — no cross-arch store collision"
+  iarel=${IAGL#/td/store/}
+  echo "   [input-addressed] interned the REAL x86_64 glibc 2.41 at the lock-keyed path $IAGL (== toolchain-path $XLOCK glibc-2.41-x86_64)"
+  printf '#!%s\nexec "%s/bin/%s-gcc" -isystem "%s/include" -B"%s/lib" -L"%s/lib" -static-libgcc -static-libstdc++ -Wl,--dynamic-linker -Wl,/td/store/%s/lib/ld-linux-x86-64.so.2 -Wl,--enable-new-dtags -Wl,-rpath -Wl,/td/store/%s/lib "$@"\n' \
+    "$csh" "$XGCC2" "$XTARGET" "$XGLIBC" "$XGLIBC" "$XGLIBC" "$iarel" "$iarel" > "$bw/gcc-ia"
+  chmod 0555 "$bw/gcc-ia"
+  ( cd "$snwork/w" && env PATH="$XBU/bin:$cpath" "$bw/gcc-ia" -o cia.out c.c ) \
+    || { echo "could not build an x86_64 C program vs the input-addressed glibc" >&2; return 1; }
+  iaci=`"$XBU/bin/$XTARGET-readelf" -l "$snwork/w/cia.out" 2>/dev/null | grep -o "/td/store/$iarel/lib/ld-linux-x86-64.so.2" | head -1`
+  test -n "$iaci" || { echo "input-addressed program interp not the lock-keyed /td/store x86_64 ld" >&2; return 1; }
+  mkdir -p "$store/progia/bin"; cp "$snwork/w/cia.out" "$store/progia/bin/c"; chmod -R u+w "$store"
+  WPIA=`"$TB" store-add-recursive progia "$store/progia" "$store" "$sndb"` || { echo "store-add progia failed" >&2; return 1; }; wpiarel=${WPIA#/td/store/}
+  snia='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
+/td/store/'"$wpiarel"'/bin/c; echo "IARC=$?"'
+  snoia=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snia" 2>&1` \
+    || { printf '%s\n' "$snoia" | sed 's/^/     /' >&2; echo "store-ns input-addressed x86_64 probe exited nonzero" >&2; return 1; }
+  echo "$snoia" | grep -q '^IARC=42$' || { printf '%s\n' "$snoia" | sed 's/^/     /' >&2; echo "x86_64 program vs the input-addressed glibc did not return 42 in the own-root" >&2; return 1; }
+  echo "   [behavioral/input-addressed] a DYNAMIC x86_64 program whose interp IS the lock-keyed /td/store glibc runs in the own-root → 42 — real x86_64 bytes at a predictable, fetchable path"
 }
