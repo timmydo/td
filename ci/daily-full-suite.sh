@@ -57,6 +57,26 @@ rc=0
 if [ $rc -eq 0 ]; then
   echo "$main" > .td-last-green   # seed of the future `stable` marker
   echo ">> daily backstop: ALL GREEN at $main (recorded .td-last-green)"
+  # toolchain-subst-default (#209): the heavy suite (incl. gate 412) is green, so the
+  # lock-keyed toolchain export gate 412 persisted is the authoritative from-seed build.
+  # Sign + publish it to the loop's substitute store so the resolver (tools/resolve-toolchain.sh)
+  # FETCHES it instead of the ~90-min rebuild. Guarded: a no-op (clear message) unless the daily
+  # runner provides the signing key + a td-subst binary. Trust anchor = tests/td-subst.pub.
+  _exp=.td-build-cache/toolchain-subst-export
+  _store=${TD_SUBST_STORE:-$HOME/.td/subst}
+  _sb=${TD_SUBST_BIN:-$(command -v td-subst 2>/dev/null || true)}
+  if ! ls "$_exp"/*.narinfo >/dev/null 2>&1; then
+    echo ">> publish-toolchain-subst: SKIP — no export at $_exp (gate 412 persisted none this run)"
+  elif [ -z "${TD_SUBST_PRIVKEY:-}" ]; then
+    echo ">> publish-toolchain-subst: SKIP — TD_SUBST_PRIVKEY unset (set the daily-runner signing secret to publish)"
+  elif [ -z "$_sb" ] || [ ! -x "$_sb" ]; then
+    echo ">> publish-toolchain-subst: SKIP — no td-subst binary (set TD_SUBST_BIN)"
+  elif "$_sb" sign "$_exp" "$TD_SUBST_PRIVKEY" >/dev/null 2>&1; then
+    mkdir -p "$_store"; cp -a "$_exp"/. "$_store"/
+    echo ">> publish-toolchain-subst: signed + published the lock-keyed toolchain to $_store (the loop resolver fetches it; trust = tests/td-subst.pub)"
+  else
+    echo ">> publish-toolchain-subst: WARN — td-subst sign failed; not published"
+  fi
 else
   echo ">> daily backstop: RED (heavy_rc=$heavy_rc system_rc=$system_rc) — agent: triage \`git log <last-green>..$main\`, reproduce the failing gate, open a FIX-OR-REVERT PR (no auto-merge). Suspect-revert helper: ci/revert-suspect.sh --ref <sha> --open-pr"
 fi
