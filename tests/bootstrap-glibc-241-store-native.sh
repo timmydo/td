@@ -17,9 +17,14 @@
 # Legs (DURABLE — no guix oracle in any):
 #   [pinned-input] chain tarballs + boot patches + gcc-4.9.4 + gcc-14.3.0 + gmp/mpfr/mpc + binutils-2.44 + glibc-2.41 match sha256.
 #   [no-guix]      built with gcc/g++/cc/guile/guix DENIED; no /gnu/store in glibc 2.41's libc.so.6 NOR gcc/cc1.
-#   [content-addr] the interned paths are /td/store/<nar-hash>-<name>.
+#   [input-addr]   glibc-2.41 is interned at the LOCK-KEYED path /td/store/<toolchain-key>-glibc-2.41
+#                  (tests/td-toolchain.lock; #209 — was content-addressed, but the toolchain is not
+#                  byte-reproducible so that digest varied build-to-build).
 #   [behavioral]   gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++) program against the MODERN glibc 2.41
 #                  (interp = /td/store glibc 2.41 ld-linux.so.2); both RUN in the own-root → 42.
+#   [subst]        the REAL glibc-2.41 subst-exports + nar-restores byte-identical, and the prebuilt
+#                  program RUNS against the FETCHED-not-rebuilt libc in the own-root → 42 (toolchain by
+#                  FETCH); the export is persisted for the daily-suite publisher (toolchain-subst-default).
 #   [structural]   inside the own-root /td/store IS the store AND /gnu/store is ABSENT.
 set -eu
 
@@ -1007,10 +1012,17 @@ export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 export TD_STORE_DIR=/td/store
-GLP=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$store" "$sndb"` || fail "store-add glibc-2.41 failed"
-case "$GLP" in /td/store/*-glibc-2.41) ;; *) fail "glibc-2.41 not content-addressed at /td/store: $GLP" ;; esac
+# toolchain-subst-default (#209): intern glibc-2.41 INPUT-ADDRESSED at the stable lock-keyed
+# path (was content-addressed via store-add-recursive — surfaced in the PR; the toolchain is
+# not byte-reproducible so its content-addressed path varied build-to-build, which is exactly
+# why 2a introduced the input-addressed key). The own-root behavioral probe below is unchanged.
+IAKEY=`"$TB" toolchain-key tests/td-toolchain.lock` || fail "toolchain-key failed"
+GLP=`"$TB" store-add-input-addressed glibc-2.41 "$IAKEY" "$GLIBC241" "$store" "$sndb"` || fail "store-add-input-addressed glibc-2.41 failed"
+IAP=`"$TB" toolchain-path tests/td-toolchain.lock glibc-2.41`
+test "x$GLP" = "x$IAP" || fail "interned glibc-2.41 path ($GLP) != the lock-computed path ($IAP)"
+case "$GLP" in /td/store/*-glibc-2.41) ;; *) fail "glibc-2.41 not input-addressed at /td/store: $GLP" ;; esac
 glrel=${GLP#/td/store/}
-echo "   [content-addr] interned $GLP in /td/store"
+echo "   [input-addr] interned glibc-2.41 at the LOCK-KEYED path $GLP (substitutable by tests/td-toolchain.lock)"
 
 # Build the test C/C++ programs IN THE SANDBOX (the userland build-wrapper trick): real -B/-L/-isystem at the
 # live glibc 2.41 build dir, the /td/store glibc 2.41 interp+RUNPATH baked; sandbox binutils 2.44 for as/ld.
@@ -1046,6 +1058,32 @@ echo "$snout" | grep -q '^CPPRC=42$' || fail "the C++ program (vs glibc 2.41) di
 echo "   [behavioral] gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++) program against the MODERN glibc 2.41; both run in the own-root → 42"
 echo "$snout" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root — mixed with guix"
 echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT (unmixed from guix)"
+
+# --- toolchain-subst-default (#209): the REAL glibc-2.41 flows through the substitute machinery ---
+# subst-export the lock-keyed glibc-2.41 (td-builder only — NO subst binary, NO network), prove it
+# round-trips byte-identically AND the prebuilt program RUNS against the FETCHED-not-rebuilt libc in the
+# own-root → 42 — the toolchain artifact obtained by FETCH, not the ~90-min from-seed rebuild. The export
+# is PERSISTED under .td-build-cache so the daily suite (ci/daily-full-suite.sh) signs + publishes it with
+# the real key; the loop's resolver (tools/resolve-toolchain.sh, #209) then fetches it. Deliberate
+# directive-1 relaxation: the daily full suite is the sole from-seed authoritative build + the publisher.
+sx="$ROOT/.td-build-cache/toolchain-subst-export"; rm -rf "$sx"; mkdir -p "$sx"
+glbase=`basename "$GLP"`
+"$TB" subst-export "$sndb" "$store" "$sx" "$GLP" >/dev/null || fail "subst-export glibc-2.41 failed"
+test -f "$sx/$glbase.narinfo" || fail "subst-export wrote no narinfo for $glbase"
+esp=`grep '^StorePath: ' "$sx/$glbase.narinfo" | cut -d' ' -f2`
+test "x$esp" = "x$GLP" || fail "exported StorePath ($esp) != the lock-keyed path ($GLP)"
+rstore="$snwork/rstore"; mkdir -p "$rstore"
+narf=`grep '^NarFile: ' "$sx/$glbase.narinfo" | cut -d' ' -f2`
+"$TB" nar-restore "$sx/$narf" "$rstore/$glbase" >/dev/null || fail "nar-restore glibc-2.41 from the export failed"
+oh=`"$TB" nar-hash "$store/$glbase"`; rh=`"$TB" nar-hash "$rstore/$glbase"`
+test -n "$oh" -a "x$oh" = "x$rh" || fail "restored glibc-2.41 nar-hash ($rh) != the interned bytes ($oh)"
+# run the SAME prebuilt program (interp = /td/store/$glrel) against the RESTORED libc in a fresh own-root
+cp -a "$store/$wprel" "$rstore/$wprel"; cp -a "$store/$bbase" "$rstore/$bbase"; chmod -R u+w "$rstore"
+rsnout=`"$TB" store-ns "$rstore" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$rsnout" | sed 's/^/     /' >&2; fail "store-ns probe against the FETCHED glibc-2.41 exited nonzero"; }
+echo "$rsnout" | grep -q '^CRC=42$'   || fail "C program vs the FETCHED glibc 2.41 did not return 42"
+echo "$rsnout" | grep -q '^CPPRC=42$' || fail "C++ program vs the FETCHED glibc 2.41 did not return 42"
+echo "   [DURABLE behavioral] toolchain-subst-default: the REAL glibc-2.41 subst-exports + round-trips byte-identical ($rh); the prebuilt C+C++ programs RUN against the FETCHED-not-rebuilt libc in the own-root → 42 — the toolchain obtained by FETCH, not the from-seed rebuild"
+echo "   [migration-oracle, removable] the export narinfo StorePath == the lock-computed path (the input-addressed name is load-bearing); export persisted at $sx for the daily-suite publisher"
 
 echo "PASS: source-bootstrap brick 6/7 (final toolchain, rung C — MODERN glibc) — from the 229-byte seed, td"
 echo "      built the chain → GCC 4.9.4 → MODERN GCC 14.3.0 + a sandbox binutils 2.44, and with them built"
