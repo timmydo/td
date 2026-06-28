@@ -708,6 +708,10 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-hello-corpus-store-native ;;
 
+    tests/bootstrap-sed-corpus-store-native.sh)
+      add_preflight shell-syntax
+      add_target bootstrap-sed-corpus-store-native ;;
+
     tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|tools/warm-kernel-headers-x86_64.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk)
       add_preflight shell-syntax
       add_target bootstrap-x86_64-toolchain-store-native ;;
