@@ -235,6 +235,10 @@ map_path() {
       add_target tsgo-pin
       add_target ts ;;
 
+    tests/toolchain-input-addressed.sh|tests/td-toolchain.lock)
+      add_preflight shell-syntax
+      add_target toolchain-input-addressed ;;
+
     tests/ts/recipe-*-perturbed.ts)
       spec=${p##*/recipe-}
       spec=${spec%-perturbed.ts}

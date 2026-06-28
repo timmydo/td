@@ -1,0 +1,55 @@
+# tests/td-toolchain.lock — the MODERN /td/store toolchain's stable INPUT-ADDRESSED key
+# (gcc-14.3.0 + binutils-2.44 + glibc-2.41), built from the 229-byte seed by gate
+# bootstrap-glibc-241-store-native (mk/gates/412). It declares the COMPLETE pinned input
+# set the toolchain build consumes — every source tarball + vendored boot patch in the
+# bootstrap chain — so its key (sha256 over these, order-independent; `td-builder
+# toolchain-key`) changes iff a declared input changes. The toolchain's store path is then
+# INPUT-ADDRESSED (`td-builder toolchain-path .../td-toolchain.lock <component>`):
+# /td/store/<key-digest>-<component>, a pure function of the inputs — so it is STABLE across
+# the toolchain's non-byte-reproducible rebuilds (cc1 stamp, ar/install mtimes), where
+# `store-add-recursive`'s content-addressed path VARIES build-to-build. That stable key is
+# the prereq for td-subst chain-caching: a consumer computes the path from this lock and
+# fetches it instead of the ~90-min rebuild. See plan/toolchain-input-addressed.md.
+#
+# The `input`/`patch` pins MIRROR seed/sources/*.lock + seed/patches/*; the
+# toolchain-input-addressed gate asserts they stay in SYNC (a wrong pin is caught). Bump
+# `recipe-rev` whenever the toolchain's build RECIPE changes without an input pin change
+# (a build-script edit), so a recipe change still re-keys the toolchain.
+name td-toolchain
+recipe-rev 1
+component binutils-2.44
+component gcc-14.3.0
+component glibc-2.41
+# --- pinned sources (mirror seed/sources/*.lock) ---
+input 183a40ea47ea49f8a1e3bd1b9d12e676374d64d63bc79e7bc1ae7d673dfdf25d mes-0.27.1.tar.gz
+input f36e4fb7dd524dc3f4b354d3d5313f69e7ce5a6ae93711e8cf6d51eaa8d2b318 nyacc-1.00.2.tar.gz
+input f4f6ce121ac631a234af080753fb9d645d2334d20160b37abbe75b574a1e1d19 tcc-0.9.26-1149-g46a75d0c.tar.gz
+input 64b30b41fde2ebf669e6af489883fb1df6a06ac30555a96cfa3c39ecce7267dd make-3.80.tar.gz
+input 3d991b33e604187c5881a0abc2e102d5b9776da5569640e73778f85d617242e7 make-3.82.tar.gz
+input ecb5c6469d732bcf01d6ec1afe9e64f1668caba5bfdb103c28d7f537ba3cdb8a patch-2.5.9.tar.gz
+input 71d37c96451333c5c0b84b170169fdcb138bbb27397dc06281905d9717c8ed64 binutils-2.20.1a.tar.bz2
+input ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237 binutils-2.44.tar.xz
+input 56811ee60990b4660d54c2a66f5e0253a487e330ee53b499d8a565882ff16ef7 gcc-core-2.95.3.tar.gz
+input e534a5cb05ab839d7cf7b2496fd5df42e76352926c1cf0d94de76184c26a739c gcc-core-4.6.4.tar.gz
+input 690a5d4f664180640db28079e3461468192c484c37d6f671dde4b53a7f9918bb gcc-g++-4.6.4.tar.gz
+input 6c11d292cd01b294f9f84c9a59c230d80e9e4a47e5c6355f046bb36d4f358092 gcc-4.9.4.tar.bz2
+input e0dc77297625631ac8e50fa92fffefe899a4eb702592da5c32ef04e2293aca3a gcc-14.3.0.tar.xz
+input 7be3ad1641b99b17f6a8be6a976f1f954e997c41e919ad7e0c418fe848c13c97 gmp-4.3.2.tar.gz
+input a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898 gmp-6.3.0.tar.xz
+input 246d7e184048b1fc48d3696dd302c9774e24e921204221540745e5464022b637 mpfr-2.4.2.tar.gz
+input 277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2 mpfr-4.2.1.tar.xz
+input 617decc6ea09889fb08ede330917a00b16809b8db88c29c31bfbb49cbf88ecc3 mpc-1.0.3.tar.gz
+input ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8 mpc-1.3.1.tar.gz
+input 2146b3cc7a2d2b16a9457e73f14a3cb51a4292575425ed8f16f7e0a5e4f1a50d gawk-3.1.8.tar.gz
+input 58dc8df59aed1e4d9d50eef9e4c4c0789fa283b50f7a093932d0f467424484ee glibc-2.2.5.tar.gz
+input a75be51658cc1cfb6324ec6dbdbed416526c44c14814823129f0fcc74c279f6e glibc-2.16.0.tar.gz
+input a5a26b22f545d6b7d7b3dd828e11e428f24f4fac43c934fb071b6a7d0828e901 glibc-2.41.tar.xz
+input 3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba linux-4.14.67.tar.xz
+# --- vendored boot patches (mirror seed/patches/*) ---
+patch f6be78a06f2c9905e019ade08f701e5468386cf1934aa27757a64c619571da20 binutils-boot-2.20.1a.patch
+patch 3c42f413b78b341cc064adc505a64445aa4b8c9fc6ce4f7a35a719c8ba92830e gcc-boot-2.95.3.patch
+patch 0dfcb1813ca54eafad0d3bbec17b423d6e50ab76d730b35eb6df7018ed43edff gcc-boot-4.6.4.patch
+patch a8de80055076ce1915faed6d9f4380fcf67ee8dad2b4e739c74c9f977213dfdb glibc-boot-2.2.5.patch
+patch 3de61d25fff5924723ec8fb0a57d37305f8e25b9e65d3d67a6535dbe08ac0e88 glibc-boot-2.16.0.patch
+patch a8a214f78c96723fee3d9d26b59249029e617bc720880ca2789a66ed73e2c7d0 glibc-bootstrap-system-2.2.5.patch
+patch 061cf1269b9d497962389c8b0c52659f8294ae16e0963d146b6599f096bb50ff glibc-bootstrap-system-2.16.0.patch
