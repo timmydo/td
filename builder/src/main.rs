@@ -537,21 +537,36 @@ fn restore_substitute(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut r = std::io::BufReader::new(
-        std::fs::File::open(narfile).map_err(|e| format!("open {}: {e}", narfile.display()))?,
-    );
-    nar::read_nar(&mut r, &dest).map_err(|e| format!("restore nar -> {}: {e}", dest.display()))?;
-    // Re-serialize the restored tree exactly as build_and_register does (scanner over the
-    // reference candidates), and require the hash to match what the publisher signed.
-    let mut scanner = scan::Scanner::new(&full_refs).map_err(|e| e.to_string())?;
-    nar::write_nar(&mut scanner, &dest).map_err(|e| e.to_string())?;
-    let (hash, size, refs) = scanner.finish();
-    if hash != want_hash {
-        let _ = std::fs::remove_dir_all(&dest);
-        return Err(format!(
-            "restored substitute NAR hash != signed NarHash for {output_path}\n  want {want_hash}\n  got  {hash}"
-        ));
-    }
+    // Restore + verify inside a closure so that ANY failure — a NAR parse/write error part
+    // way through `read_nar`, or a NarHash that does not match the signed one — removes the
+    // partially-written tree before returning. A half-restored output left under newstore
+    // would otherwise contaminate the build fallback (which writes its fresh outputs there)
+    // or a later restore attempt.
+    let restored = (|| -> Result<(String, u64, Vec<String>), String> {
+        let mut r = std::io::BufReader::new(
+            std::fs::File::open(narfile).map_err(|e| format!("open {}: {e}", narfile.display()))?,
+        );
+        nar::read_nar(&mut r, &dest)
+            .map_err(|e| format!("restore nar -> {}: {e}", dest.display()))?;
+        // Re-serialize the restored tree exactly as build_and_register does (scanner over the
+        // reference candidates), and require the hash to match what the publisher signed.
+        let mut scanner = scan::Scanner::new(&full_refs).map_err(|e| e.to_string())?;
+        nar::write_nar(&mut scanner, &dest).map_err(|e| e.to_string())?;
+        let (hash, size, refs) = scanner.finish();
+        if hash != want_hash {
+            return Err(format!(
+                "restored substitute NAR hash != signed NarHash for {output_path}\n  want {want_hash}\n  got  {hash}"
+            ));
+        }
+        Ok((hash, size, refs))
+    })();
+    let (hash, size, refs) = match restored {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err(e);
+        }
+    };
     Ok(OutputReg {
         store_path: output_path.to_string(),
         nar_hash: hash,
@@ -589,6 +604,17 @@ fn try_substitute(
     let _ = std::fs::remove_dir_all(&fetchdir);
     std::fs::create_dir_all(&fetchdir).map_err(|e| e.to_string())?;
 
+    // Substitution is ALL-OR-NOTHING across the drv's outputs: a later output that misses or
+    // fails to verify must leave NO restored tree behind, because the build fallback writes its
+    // fresh outputs into the SAME newstore (a multi-output drv would otherwise build on top of a
+    // half-substituted sibling). Track every base we restore so we can roll the whole set back.
+    let mut restored_bases: Vec<String> = Vec::new();
+    let rollback = |bases: &[String]| {
+        for b in bases {
+            let _ = std::fs::remove_dir_all(newstore.join(b));
+        }
+    };
+
     let mut record = String::new();
     let mut regs: Vec<OutputReg> = Vec::new();
     for o in &parsed.outputs {
@@ -605,12 +631,45 @@ fn try_substitute(
                 "td-builder: no verified substitute for {base} ({}); building",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
+            rollback(&restored_bases);
             return Ok(None);
         }
-        let narinfo = std::fs::read_to_string(fetchdir.join(format!("{base}.narinfo")))
-            .map_err(|e| format!("read fetched narinfo for {base}: {e}"))?;
-        let narfile = narinfo_field(&narinfo, "NarFile").ok_or("fetched narinfo: no NarFile")?;
-        let reg = restore_substitute(&narinfo, &fetchdir.join(narfile), &o.path, &newstore, drv_path)?;
+        let narinfo = match std::fs::read_to_string(fetchdir.join(format!("{base}.narinfo"))) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("td-builder: substitute narinfo for {base} unreadable ({e}); building");
+                rollback(&restored_bases);
+                return Ok(None);
+            }
+        };
+        let narfile = match narinfo_field(&narinfo, "NarFile") {
+            Some(f) => f,
+            None => {
+                eprintln!("td-builder: substitute narinfo for {base} has no NarFile; building");
+                rollback(&restored_bases);
+                return Ok(None);
+            }
+        };
+        // A restore failure (StorePath mismatch, NAR parse error, or NarHash != the signed one)
+        // means this substitute is not trustworthy — but that is NOT a hard error: fall back to
+        // building from source (directive 1: a source build is always available, so a flaky or
+        // hostile substitute server can never BREAK a build that would otherwise succeed).
+        // restore_substitute cleans its own partial tree; we roll back the earlier outputs.
+        let reg = match restore_substitute(
+            &narinfo,
+            &fetchdir.join(narfile),
+            &o.path,
+            &newstore,
+            drv_path,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("td-builder: substitute for {base} failed verification ({e}); building");
+                rollback(&restored_bases);
+                return Ok(None);
+            }
+        };
+        restored_bases.push(base.to_string());
         record.push_str(&format!("path {}\n", reg.store_path));
         record.push_str(&format!("nar-hash {}\n", reg.nar_hash));
         record.push_str(&format!("nar-size {}\n", reg.nar_size));
@@ -618,11 +677,15 @@ fn try_substitute(
             record.push_str(&format!("reference {r}\n"));
         }
         record.push_str(&format!("deriver {}\n\n", reg.deriver));
-        println!("OUT={} {}", o.name, reg.store_path);
         regs.push(reg);
     }
-    // Same registration + td.db a real build writes, so a later cached_realization hits and
-    // a downstream build-plan step can resolve this output's closure.
+    // All outputs restored + verified: only NOW emit the OUT= lines (a mid-loop fallback must
+    // not print OUT= for an output the build will re-emit), then write the same registration +
+    // td.db a real build writes, so a later cached_realization hits and a downstream build-plan
+    // step can resolve this output's closure.
+    for (o, reg) in parsed.outputs.iter().zip(&regs) {
+        println!("OUT={} {}", o.name, reg.store_path);
+    }
     std::fs::write(scratch.join("registration"), record).map_err(|e| e.to_string())?;
     write_output_db(&regs, &scratch.join("td.db"))?;
     Ok(Some(regs))
@@ -4461,6 +4524,46 @@ mod tests {
         assert!(
             restore_substitute(&ni, &narfile, store_path, &newstore, "x.drv").is_err(),
             "restore accepted a nar whose contents do not match the signed NarHash"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    // A substitute whose NAR is structurally TRUNCATED (read_nar creates the dest dir + starts
+    // the file, then hits EOF mid-contents) must be rejected AND leave NO partial tree under
+    // newstore. This is the cleanup-on-failure leg: a half-restored output left behind would let
+    // the build fallback write its fresh outputs on top of it (contaminating a multi-output drv).
+    // The old code only cleaned on a NarHash mismatch, not on a parse/write error.
+    #[test]
+    fn restore_substitute_cleans_partial_tree_on_parse_error() {
+        let base = std::env::temp_dir().join(format!("td-subst-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store_path = "/td/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-app";
+        let app_base = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-app";
+        let phys = base.join("phys/app");
+        std::fs::create_dir_all(&phys).unwrap();
+        std::fs::write(phys.join("run"), b"app payload\n").unwrap();
+
+        let served = base.join("served");
+        subst_export(&served, &[SubstMember { store_path: store_path.into(), physical: phys.clone(), refs: vec![] }]).unwrap();
+        let ni = std::fs::read_to_string(served.join(format!("{app_base}.narinfo"))).unwrap();
+        let narfile = served.join(narinfo_field(&ni, "NarFile").unwrap());
+
+        // Truncate inside the file contents: read_nar creates dest + the `run` file, then EOFs
+        // part way through copy_n — a partial tree exists at the moment the error is returned.
+        let bytes = std::fs::read(&narfile).unwrap();
+        let pos = bytes.windows(3).position(|w| w == b"app").expect("payload in nar");
+        let truncated = base.join("truncated.nar");
+        std::fs::write(&truncated, &bytes[..pos + 4]).unwrap();
+
+        let newstore = base.join("newstore");
+        assert!(
+            restore_substitute(&ni, &truncated, store_path, &newstore, "x.drv").is_err(),
+            "a truncated NAR must be rejected"
+        );
+        assert!(
+            !newstore.join(app_base).exists(),
+            "a rejected (parse-error) substitute must leave no partial tree under newstore"
         );
 
         std::fs::remove_dir_all(&base).unwrap();

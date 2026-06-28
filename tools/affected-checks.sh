@@ -442,7 +442,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-binutils.sh|seed/sources/binutils-2.20*.lock|seed/patches/binutils-boot-*.patch)
       add_preflight shell-syntax
@@ -465,7 +466,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-gcc.sh|seed/sources/gcc-core-2.95.3.lock|seed/patches/gcc-boot-2.95.3.patch)
       add_preflight shell-syntax
@@ -487,7 +489,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-glibc.sh|seed/sources/glibc-2.2.5.lock|seed/sources/linux-*.lock|seed/patches/glibc-boot-2.2.5.patch|seed/patches/glibc-bootstrap-system-2.2.5.patch|tools/warm-kernel-headers.sh)
       add_preflight shell-syntax
@@ -508,7 +511,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-gcc-mesboot0.sh)
       add_preflight shell-syntax
@@ -537,7 +541,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-gcc-mesboot1.sh|seed/sources/gcc-g++-4.6.4.lock)
       add_preflight shell-syntax
@@ -553,7 +558,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-binutils-gawk-mesboot.sh|seed/sources/gawk-*.lock)
       add_preflight shell-syntax
@@ -568,7 +574,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-glibc-mesboot.sh|seed/sources/glibc-mesboot-2.16.0.lock|seed/patches/glibc-boot-2.16.0.patch|seed/patches/glibc-bootstrap-system-2.16.0.patch)
       add_preflight shell-syntax
@@ -582,7 +589,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-gcc-mesboot.sh|seed/sources/gcc-4.9.4.lock)
       add_preflight shell-syntax
@@ -595,7 +603,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-toolchain-store-native.sh)
       add_preflight shell-syntax
@@ -654,7 +663,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-gcc-mesboot-494-store-native.sh)
       add_preflight shell-syntax
@@ -667,12 +677,14 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-glibc-241-store-native.sh|seed/sources/glibc-2.41.lock)
       add_preflight shell-syntax
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/bootstrap-hello-corpus-store-native.sh|seed/sources/hello-2.12.2.lock)
       add_preflight shell-syntax
@@ -706,7 +718,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     seed/sources/tcc-0.9.26*.lock)
       add_preflight shell-syntax
@@ -733,7 +746,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     seed/sources/nyacc-*.lock)
       add_preflight shell-syntax
@@ -761,7 +775,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     seed/sources/mes-*.lock|tools/warm-bootstrap-sources.sh)
       add_preflight shell-syntax
@@ -790,7 +805,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     seed/stage0/*)
       add_preflight shell-syntax
@@ -821,7 +837,8 @@ map_path() {
       add_target bootstrap-gcc-mesboot-494-store-native
       add_target bootstrap-gcc-14-store-native
       add_target bootstrap-glibc-241-store-native
-      add_target bootstrap-hello-corpus-store-native ;;
+      add_target bootstrap-hello-corpus-store-native
+      add_target bootstrap-x86_64-toolchain-store-native ;;
 
     tests/store-ns.sh)
       add_preflight shell-syntax
