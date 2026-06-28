@@ -28,6 +28,19 @@ LOAD    := -L .
 SYSTEM  := system/td.scm
 IMGTYPE := qcow2
 
+# --- Per-gate wall-clock instrumentation (task L1, plan/loop-latency.md) -------
+# Every TIMED gate (see the .SHELLFLAGS block after the gate pools) runs its
+# recipe through tools/gate-time.sh, which logs a START/END event per recipe
+# line to a per-run log; tools/gate-timing-report.sh reduces each gate's
+# min(START)/max(END) into a wall-clock span so latency regressions are visible
+# and the heavy-gate LPT order is renumbered from DATA, not the hand-run numbers
+# in plan/loop-latency.md. The log is integer-nanosecond timestamps (the sandbox
+# has no awk). One log per make invocation (TD_GATE_RUN keeps concurrent runs in
+# the same worktree from clobbering each other); the report keeps the newest 10.
+TD_GATE_TIMING_DIR := $(CURDIR)/.td-build-cache/gate-timing
+TD_GATE_RUN := $(shell date +%s%N)
+export TD_GATE_TIMING_LOG := $(TD_GATE_TIMING_DIR)/run-$(TD_GATE_RUN).log
+
 # Canned lower-then-realise for marionette system tests (the `test`,
 # `boot-disk` and `reset` gates; `container` lowers multiple artifacts and
 # keeps its own block). Two steps on purpose: `guix repl` reading a script
@@ -96,7 +109,7 @@ BUILD_SPECS :=
 BUILD_GATES :=
 include $(sort $(wildcard mk/gates/*.mk))
 
-.PHONY: check check-fast check-system check-engine container-check list-gates build-recipes $(CHEAP_GATES) $(HEAVY_GATES) $(SYSTEM_GATES)
+.PHONY: check check-fast check-system check-engine container-check list-gates build-recipes gate-timing-report $(CHEAP_GATES) $(HEAVY_GATES) $(SYSTEM_GATES)
 
 # The hermetic, offline, self-contained entry point (DESIGN §1.1/§1.4). Plain
 # `make check` assumes you are ALREADY inside the right `guix shell -C` sandbox;
@@ -105,6 +118,7 @@ container-check:
 	@./check.sh
 
 check: $(CHEAP_GATES) build-recipes $(HEAVY_GATES)
+	@TD_HEAVY_GATES='$(HEAVY_GATES)' bash tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt" || true
 
 # build-recipes — the PARALLEL build phase (DESIGN §7.1 move-off-Guile §5). Separates
 # "build everything" from "the checks": realize + reproducibility-check EVERY package
@@ -164,6 +178,7 @@ check-fast: $(CHEAP_GATES) $(FAST_GATES)
 # run, link-tests, the guix per-PACKAGE differential). Re-fold these back into
 # `check` when the OS becomes the focus. Run them on demand: `./check.sh check-system`.
 check-system: $(CHEAP_GATES) $(SYSTEM_GATES)
+	@TD_HEAVY_GATES='$(SYSTEM_GATES)' bash tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt" || true
 
 # The build-ENGINE smoke tier — a TRUE smoke: "does it compile, lint, and pass unit tests",
 # targeting ~2 min so a build-engine change (builder/src/*) lands fast WITHOUT the full
@@ -203,6 +218,30 @@ $(ENGINE_GATES): | $(lastword $(CHEAP_GATES))
 # `check-system` never trigger build-recipes.
 build-recipes: | $(lastword $(CHEAP_GATES))
 $(BUILD_GATES): | build-recipes
+
+# --- Per-gate wall-clock instrumentation wiring (task L1) ----------------------
+# Route every TIMED gate's recipe through tools/gate-time.sh by overriding ONLY
+# its `.SHELLFLAGS` (SHELL stays plain bash): make then invokes each recipe line
+# as `bash tools/gate-time.sh <gate> -c '<recipe>'`. A non-default .SHELLFLAGS
+# also disables make's direct-exec fast path, so every line is wrapped. This is
+# scoped strictly to the gate targets — `check`, helper, and report targets keep
+# the default shell. Fail-safe and opt-out: it engages only when the wrapper
+# file exists (`$(wildcard)`) and TD_GATE_TIMING is not 0, and the wrapper itself
+# never alters a gate's exit status (see tools/gate-time.sh). The build phase
+# (build-recipes) is timed too — it is the loop's single largest cost.
+TIMED_GATES := $(CHEAP_GATES) $(HEAVY_GATES) $(SYSTEM_GATES) $(ENGINE_GATES) build-recipes
+ifneq ($(wildcard tools/gate-time.sh),)
+ifneq ($(TD_GATE_TIMING),0)
+$(TIMED_GATES): .SHELLFLAGS = $(CURDIR)/tools/gate-time.sh $@ -c
+endif
+endif
+
+# Standalone report (`make gate-timing-report`): re-print the most recent run's
+# per-gate table for when a gate failed (so `check`'s end-of-run report did not
+# fire) or to inspect a `check-system`/`check-fast` run. `check` runs it
+# automatically on a green loop (its recipe above).
+gate-timing-report:
+	@TD_HEAVY_GATES='$(HEAVY_GATES)' bash tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt"
 
 # `rootless` needs NO special scheduling — it runs as an ordinary heavy gate
 # under -j2 (its only prereq is the generic last-cheap-gate one above). It USED to
