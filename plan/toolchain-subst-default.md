@@ -69,6 +69,17 @@ in the DAILY suite (cold sources off the per-PR path; the #207-accepted deferral
 
 ## Verified-red evidence
 
+### In-sandbox gate GREEN (2026-06-28, `./check.sh toolchain-subst-default` RC=0)
+All legs pass in the loop sandbox: td-built subst from source → publisher signs the
+lock-keyed toolchain → resolver default-fetch RUNs the fetched-not-built binary
+(RAN-FETCHED) → fall-back on a cold store → reds on a wrong key / wrong StorePath →
+structural anchor. Two in-sandbox-ONLY gate-harness bugs caught + fixed (resolver logic
+unaffected; host smoke already proved it): (1) `xargs $(GUIX) build` — a Makefile var copied
+into a standalone shell script (→ `guix=${GUIX:-guix}`); (2) helper scripts invoked under
+`env -i PATH="$cu/bin"` (coreutils has no `sh`) → added `shdir=$(dirname "$(command -v sh)")`
+to the five scrubbed PATHs. LESSON (mirrors [[td-toolchain-input-addressed]]'s no-awk): a
+host smoke with cargo binaries misses sandbox-PATH/make-var bugs — run the real gate.
+
 ### Sub-task 1 (2026-06-28; perturb resolve-toolchain.sh, revert, reconfirm green)
 - **fall-back signal** (the resolver's most load-bearing property): `miss() … exit 0`
   instead of `exit 1` → the host smoke's MISS-cold leg flipped to `FAIL: resolver returned
