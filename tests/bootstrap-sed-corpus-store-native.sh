@@ -1108,10 +1108,13 @@ done
 TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$btdb"` || fail "brick8: store-add gcc-toolchain failed"
 echo "   [brick8] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
 # Substitute the gcc-toolchain entry in sed's lock; glibc 2.41 stays in the closure via the toolchain's ref.
-oldtc=`awk '/-gcc-toolchain-/{print $2}' tests/sed-no-guix.lock | head -1`
+# Use grep/sed (both in the declared loop toolchain) rather than awk — awk/gawk is NOT in the loop profile
+# (it is only on PATH via the host guix dir, an undeclared dependency), so grep/sed keeps this hermetic.
+oldtc=`grep -- '-gcc-toolchain-' tests/sed-no-guix.lock | head -1 | sed 's/^[^ ]* //'`
 test -n "$oldtc" || fail "brick8: no gcc-toolchain in sed-no-guix.lock"
 newlock="$b8/sed.lock"
-awk -v tc="$TCP" -v gl="$GLP8" '/-gcc-toolchain-/ { print "gcc-toolchain " tc " seed"; print "glibc-2.41 " gl " seed"; next } { print }' tests/sed-no-guix.lock > "$newlock"
+# rewrite the lone gcc-toolchain line into the /td/store toolchain ref + glibc 2.41 (paths are /td/store/<base32>-…, no sed-special chars; | delimiter avoids the path slashes).
+sed "s|^[^ ]*-gcc-toolchain-[^ ]* .*|gcc-toolchain $TCP seed\nglibc-2.41 $GLP8 seed|" tests/sed-no-guix.lock > "$newlock"
 grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
 "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
 sort -u "$b8/roots" -o "$b8/roots"
