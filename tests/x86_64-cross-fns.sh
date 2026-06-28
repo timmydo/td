@@ -125,11 +125,11 @@ build_glibc_x86_64() {
     sed -i "s,^SHELL := /bin/sh,SHELL := $csh," Makeconfig 2>/dev/null || true
     rm -rf bld; mkdir bld; cd bld
     env PATH="$xgccbin:$xbu/bin:$tb:$cpath" CONFIG_SHELL="$csh" SHELL="$csh" \
-        CC="$XTARGET-gcc" CXX="$XTARGET-g++" BUILD_CC="$bwb/cc" \
+        CC="$XTARGET-gcc" BUILD_CC="$bwb/cc" \
         AR="$XTARGET-ar" RANLIB="$XTARGET-ranlib" \
         "$csh" ../configure --prefix=/td/store/glibc-2.41-x86_64 \
         --build=i686-pc-linux-gnu --host=$XTARGET \
-        --with-headers="$kh" --enable-kernel=3.2.0 --disable-werror --disable-nscd \
+        --with-headers="$sysroot/usr/include" --enable-kernel=3.2.0 --disable-werror --disable-nscd \
         --with-binutils="$xbu/bin" libc_cv_slibdir=/td/store/glibc-2.41-x86_64/lib >cfg.log 2>&1 \
       || { echo "x86_64 glibc configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xglibc-cfg.log" 2>/dev/null||true; tail -30 cfg.log >&2; return 1; }
     env PATH="$xgccbin:$xbu/bin:$tb:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" \
@@ -146,10 +146,13 @@ build_glibc_x86_64() {
       sed -i "s,/td/store/glibc-2.41-x86_64/lib/,,g" "$so"
     fi
   done
-  # populate the sysroot so the stage2 cross-gcc finds the x86_64 glibc at build time.
-  mkdir -p "$sysroot/usr"
-  rm -rf "$sysroot/usr/include" "$sysroot/usr/lib" "$sysroot/lib" 2>/dev/null || true
-  cp -a "$gl/include" "$sysroot/usr/include"; cp -a "$gl/lib" "$sysroot/usr/lib"; ln -sf usr/lib "$sysroot/lib"
+  # populate the sysroot so the stage2 cross-gcc finds the x86_64 glibc at build time. MERGE the glibc
+  # headers INTO the existing kernel headers ($sysroot/usr/include — glibc headers #include <linux/…>,
+  # <asm/…>), and copy the glibc libs + crt + loader. ld scripts already relocated to bare names above.
+  mkdir -p "$sysroot/usr/include" "$sysroot/usr/lib"
+  cp -a "$gl/include/." "$sysroot/usr/include/"
+  cp -a "$gl/lib/." "$sysroot/usr/lib/"
+  rm -f "$sysroot/lib"; ln -sf usr/lib "$sysroot/lib"
 }
 
 # ---------------------------------------------------------------------------------------------------
