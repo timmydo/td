@@ -239,11 +239,17 @@ map_path() {
       add_preflight shell-syntax
       add_target toolchain-input-addressed ;;
 
+    tests/toolchain-x86_64-input-addressed.sh|tests/td-toolchain-x86_64.lock|mk/gates/418-toolchain-x86_64-input-addressed.mk)
+      add_preflight shell-syntax
+      add_target toolchain-x86_64-input-addressed ;;
+
     tests/td-toolchain.lock)
-      # the lock keys BOTH the input-addressed path (2a) and the default substitute (this track)
+      # the lock keys BOTH the input-addressed path (2a) and the default substitute (this track);
+      # the x86_64 gate also reads it for its arch-parity (same source set) leg.
       add_preflight shell-syntax
       add_target toolchain-input-addressed
-      add_target toolchain-subst-default ;;
+      add_target toolchain-subst-default
+      add_target toolchain-x86_64-input-addressed ;;
 
     tests/toolchain-subst-default.sh|tools/resolve-toolchain.sh|tools/publish-toolchain-subst.sh|tests/td-subst.pub)
       add_preflight shell-syntax
@@ -1083,6 +1089,10 @@ run_self_test() {
   assert_target tests/td-subst.pub toolchain-subst-default
   assert_target tests/td-toolchain.lock toolchain-subst-default
   assert_target tests/td-toolchain.lock toolchain-input-addressed
+  assert_target tests/td-toolchain.lock toolchain-x86_64-input-addressed
+  assert_target tests/td-toolchain-x86_64.lock toolchain-x86_64-input-addressed
+  assert_target tests/toolchain-x86_64-input-addressed.sh toolchain-x86_64-input-addressed
+  assert_target mk/gates/418-toolchain-x86_64-input-addressed.mk toolchain-x86_64-input-addressed
   assert_target tests/ts/recipe-td-cmake-demo.ts cmake
   assert_target tests/td-cmake-demo.lock cmake
   assert_target tests/ts/recipe-uutils.ts rust-coreutils
