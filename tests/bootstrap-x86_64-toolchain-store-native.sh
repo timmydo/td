@@ -1002,64 +1002,15 @@ echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils
 run_x86_64_cross "$cpath" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
 # run_x86_64_cross exports: XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU X86_WORK
 
-# --- [no-guix] the x86_64 glibc 2.41 + the cross gcc carry no guix bytes -----------------------------
-XCC1=`find "$XGCC2" -name cc1 | head -1`
-for b in "$XGLIBC/lib/libc.so.6" "$XGCC2/bin/$XTARGET-gcc" "$XCC1"; do
-  test -n "$b" -a -e "$b" || fail "x86_64 output missing ($b)"
-  if grep -q -a '/gnu/store' "$b"; then fail "$b contains /gnu/store bytes"; fi
-done
-echo "   [no-guix] seed → i686 gcc 14.3.0 → CROSS → x86_64 glibc 2.41 + cross gcc; no /gnu/store in libc.so.6 / x86_64-gcc / cc1"
-
-# --- intern the x86_64 glibc 2.41 GUIX-FREE into /td/store (content-addressed) ----------------------
+# --- DURABLE own-root verify (shared verify_x86_64_ownroot): [no-guix] no /gnu/store in the x86_64
+# glibc/gcc; intern the x86_64 glibc 2.41 at /td/store; build x86_64 C/C++ programs vs it (interp =
+# /td/store x86_64 ld-linux-x86-64.so.2) and RUN them in the store-ns own-root → 42, /gnu/store ABSENT.
 . tests/cache-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 export TD_STORE_DIR=/td/store
-GLP=`"$TB" store-add-recursive glibc-2.41-x86_64 "$XGLIBC" "$store" "$sndb"` || fail "store-add x86_64 glibc failed"
-case "$GLP" in /td/store/*-glibc-2.41-x86_64) ;; *) fail "x86_64 glibc not content-addressed at /td/store: $GLP" ;; esac
-glrel=${GLP#/td/store/}
-echo "   [content-addr] interned $GLP in /td/store"
-
-# --- build the x86_64 C/C++ verify programs vs the /td/store x86_64 glibc 2.41 (build-wrapper trick) -
-# Real -B/-L/-isystem at the live x86_64 glibc 2.41 dir + the /td/store x86_64 glibc interp/RUNPATH
-# baked; -static-libgcc -static-libstdc++ so the own-root run needs only the interned glibc. Then RUN
-# the artifacts in the store-ns own-root (x86_64 binaries run on the x86_64 host kernel).
-csh=`command -v bash 2>/dev/null || command -v sh`
-mkdir -p "$snwork/w"
-printf 'int main(){return 42;}\n' > "$snwork/w/c.c"
-printf '#include <vector>\nint main(){std::vector<int> v; for(int i=0;i<43;i++) v.push_back(i); return v[42];}\n' > "$snwork/w/cpp.cc"
-bw=`mktemp -d`/bw; mkdir -p "$bw"
-for cc in gcc g++; do
-  printf '#!%s\nexec "%s/bin/%s-%s" -isystem "%s/include" -B"%s/lib" -L"%s/lib" -static-libgcc -static-libstdc++ -Wl,--dynamic-linker -Wl,/td/store/%s/lib/ld-linux-x86-64.so.2 -Wl,--enable-new-dtags -Wl,-rpath -Wl,/td/store/%s/lib "$@"\n' \
-    "$csh" "$XGCC2" "$XTARGET" "$cc" "$XGLIBC" "$XGLIBC" "$XGLIBC" "$glrel" "$glrel" > "$bw/$cc"
-done
-chmod 0555 "$bw/gcc" "$bw/g++"
-( cd "$snwork/w" && env PATH="$XBU/bin:$cpath" "$bw/gcc" -o c.out c.c ) || fail "the cross gcc did not compile an x86_64 C program vs glibc 2.41"
-( cd "$snwork/w" && env PATH="$XBU/bin:$cpath" "$bw/g++" -O2 -o cpp.out cpp.cc ) || fail "the cross g++ did not compile an x86_64 C++ program vs glibc 2.41"
-cls=`"$XBU/bin/$XTARGET-readelf" -h "$snwork/w/c.out" 2>/dev/null | grep -i 'class:' | grep -o 'ELF64'`
-test "$cls" = ELF64 || fail "the verify program is not ELF 64-bit (x86_64); got '$cls' — wrong arch"
-ci=`"$XBU/bin/$XTARGET-readelf" -l "$snwork/w/c.out" 2>/dev/null | grep -o "/td/store/$glrel/lib/ld-linux-x86-64.so.2" | head -1`
-test -n "$ci" || fail "the C program interp is not the /td/store x86_64 glibc 2.41 ld-linux-x86-64.so.2"
-if grep -q -a '/gnu/store' "$snwork/w/c.out"; then fail "the x86_64 C program contains /gnu/store bytes"; fi
-echo "   built x86_64 (ELF 64-bit) C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
-
-# --- intern the verify programs + run them in the store-ns own-root ---------------------------------
-mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
-WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || fail "store-add prog failed"; wprel=${WP#/td/store/}
-bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
-bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
-snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
-/td/store/'"$wprel"'/bin/c; echo "CRC=$?"
-/td/store/'"$wprel"'/bin/cpp; echo "CPPRC=$?"'
-snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | sed 's/^/     /' >&2; fail "store-ns x86_64 probe exited nonzero"; }
-printf '%s\n' "$snout" | sed 's/^/     /' >&2
-echo "$snout" | grep -q '^CRC=42$'   || fail "the x86_64 C program did not return 42 in the own-root"
-echo "$snout" | grep -q '^CPPRC=42$' || fail "the x86_64 C++ program did not return 42 in the own-root"
-echo "   [behavioral] the cross gcc 14.3.0 links a DYNAMIC x86_64 C AND C++ program against the MODERN x86_64 glibc 2.41; both run in the own-root → 42"
-echo "$snout" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root — mixed with guix"
-echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT (unmixed from guix)"
+snwork=`mktemp -d`
+verify_x86_64_ownroot "$cpath" "$snwork" || fail "the x86_64 own-root verify failed"
 
 echo "PASS: x86_64-toolchain — from the 229-byte seed, td built the i686 chain → gcc 14.3.0, then CROSSED UP to"
 echo "      an x86_64 toolchain (cross binutils 2.44 + cross gcc 14.3.0 + MODERN x86_64 glibc 2.41 with"
