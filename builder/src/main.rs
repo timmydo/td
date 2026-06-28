@@ -1826,8 +1826,31 @@ fn relocate_closure(store_db: &str, root: &str, dest: &str) -> Result<(usize, us
     Ok((closure.len(), files))
 }
 
+/// The nice value build work runs at, from `TD_BUILD_NICE` (default 10). Parsed
+/// from the raw env value so the policy is unit-testable without touching real
+/// process state. Clamped to the kernel's -20..=19 range; a missing/garbage value
+/// falls back to the default.
+fn parse_build_nice(raw: Option<String>) -> i32 {
+    raw.and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(10).clamp(-20, 19)
+}
+
+/// Raise THIS process's niceness so the compilers/`make` it spawns (which inherit
+/// the value at fork) yield CPU to anything interactive sharing the host — a
+/// desktop/compositor stays responsive during a build storm. Best-effort and
+/// increase-only: the kernel rejects an unprivileged DEcrease with EPERM, which
+/// just means we were already at least this nice, so we ignore the result. Purely
+/// a scheduling knob — build OUTPUT (and thus reproducibility) is unaffected.
+fn nice_self_for_builds() {
+    let _ = sys::set_self_priority(parse_build_nice(std::env::var("TD_BUILD_NICE").ok()));
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    // Builds run nicer than the loop's other work so a shared desktop stays smooth.
+    // Scope to the build-executing subcommands; their spawned compilers inherit it.
+    if matches!(args.get(1).map(String::as_str), Some("build" | "realize" | "autotools-build")) {
+        nice_self_for_builds();
+    }
     match args.get(1).map(String::as_str) {
         // S1 sentinel — the rung's run leg greps for this exact line.
         None => {
@@ -4260,6 +4283,19 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // TD_BUILD_NICE policy: default 10 when unset/garbage, honor a valid value,
+    // clamp to the kernel's -20..=19 nice range. Pure parse, no process state.
+    #[test]
+    fn build_nice_target_parses_and_clamps() {
+        assert_eq!(parse_build_nice(None), 10, "unset -> default 10");
+        assert_eq!(parse_build_nice(Some("garbage".into())), 10, "garbage -> default");
+        assert_eq!(parse_build_nice(Some("".into())), 10, "empty -> default");
+        assert_eq!(parse_build_nice(Some(" 15 ".into())), 15, "trimmed valid value");
+        assert_eq!(parse_build_nice(Some("0".into())), 0, "0 is honored (opt out)");
+        assert_eq!(parse_build_nice(Some("99".into())), 19, "clamp above max");
+        assert_eq!(parse_build_nice(Some("-99".into())), -20, "clamp below min");
+    }
 
     // build_profile --store-native: enumerate the PHYSICAL package dir but point the
     // symlinks at the LOGICAL store path, so the profile resolves in a store-ns own-root.
