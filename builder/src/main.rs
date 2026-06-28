@@ -2697,6 +2697,83 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // INPUT-ADDRESSED add: like store-add-recursive, but the store path's digest is
+        // KEY (a hash of the artifact's DECLARED INPUTS — `toolchain-key`), NOT the tree's
+        // recursive NAR hash. So a NON-byte-reproducible tree (the modern toolchain: cc1
+        // stamp, ar/install mtimes) lands at a STABLE path: identical across rebuilds, and
+        // computable from the lock BEFORE the build (the prereq for td-subst chain-caching).
+        // The tree is still REGISTERED with its real NAR hash + size (naming and content-
+        // integrity are orthogonal — the daemon's `output:` semantics), so closure/verify
+        // are unchanged. Usage:
+        //   store-add-input-addressed NAME KEY SRC STORE-DIR OUT-DB    (prints the path)
+        Some("store-add-input-addressed") if args.len() == 7 => {
+            let (name, key, src, store_dir, out_db) =
+                (&args[2], &args[3], &args[4], &args[5], &args[6]);
+            let run = || -> Result<String, String> {
+                use store_db::{Table, Value};
+                // Input-addressed path: digest = KEY (declared inputs), not the content.
+                let path = store::input_addressed_path(key, name);
+                let base = path
+                    .rsplit('/')
+                    .next()
+                    .filter(|_| store::name_from_store_path(&path).is_some())
+                    .ok_or_else(|| format!("computed path {path} is malformed (bad KEY/NAME?)"))?
+                    .to_string();
+                // Canonically restore the tree into the td-owned store.
+                std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+                let disk = Path::new(store_dir).join(&base);
+                copy_canonical(Path::new(src), &disk)?;
+                // Register the REAL NAR hash + size of the placed tree (self-references
+                // among the single-path closure — the store-add-recursive registration).
+                let closure = vec![path.clone()];
+                let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
+                nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
+                let (hash, size, refs) = s.finish();
+                let valid = vec![(
+                    1i64,
+                    vec![
+                        Value::Null,
+                        Value::Text(path.clone()),
+                        Value::Text(hash),
+                        Value::Int(1),
+                        Value::Null, // deriver — set by the producer's drv when there is one
+                        Value::Int(size as i64),
+                    ],
+                )];
+                let mut ref_rows = Vec::new();
+                let mut rid = 1i64;
+                for r in &refs {
+                    if r == &path {
+                        ref_rows.push((rid, vec![Value::Int(1), Value::Int(1)]));
+                        rid += 1;
+                    }
+                }
+                let tables = [
+                    Table {
+                        name: "ValidPaths",
+                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+                        rows: valid,
+                    },
+                    Table {
+                        name: "Refs",
+                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+                        rows: ref_rows,
+                    },
+                ];
+                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+                Ok(path)
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-add-input-addressed {name}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // bootstrap brick 2: PLACE a tree WITH references into a td-owned store,
         // content-addressed — the builder analog of store-add-recursive (which REFUSES a
         // referenced tree). td restores the tree into STORE-DIR, computes its
@@ -3045,6 +3122,57 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: store-add-output {output}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // toolchain stable key: print the INPUT key of a td-toolchain.lock — sha256 over
+        // its declared inputs (sources + patches + name + recipe-rev), order-independent.
+        // The input-addressed toolchain path (toolchain-path) is named by this key, so it
+        // is stable across non-reproducible rebuilds. Usage: toolchain-key LOCK
+        Some("toolchain-key") if args.len() == 3 => {
+            match std::fs::read_to_string(&args[2])
+                .map_err(|e| e.to_string())
+                .and_then(|c| store::ToolchainLock::parse(&c))
+            {
+                Ok(lock) => {
+                    println!("{}", lock.key());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: toolchain-key {}: {e}", args[2]);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // toolchain stable path: print the INPUT-ADDRESSED store path for a component of
+        // the toolchain (or the toolchain itself when NAME is omitted), under the active
+        // store_dir() (set TD_STORE_DIR=/td/store for the /td/store path). This is the
+        // path the producer interns the built tree at (store-add-input-addressed) and the
+        // path a td-subst consumer computes from the lock BEFORE fetching — the 2a stable key.
+        // Usage: toolchain-path LOCK [NAME]
+        Some("toolchain-path") if args.len() == 3 || args.len() == 4 => {
+            let name = args.get(3).map(String::as_str);
+            match std::fs::read_to_string(&args[2])
+                .map_err(|e| e.to_string())
+                .and_then(|c| store::ToolchainLock::parse(&c))
+            {
+                Ok(lock) => {
+                    if let Some(n) = name {
+                        if !lock.components.iter().any(|c| c == n) && n != lock.name {
+                            eprintln!(
+                                "td-builder: toolchain-path: `{n}` is not a component of {} (have: {})",
+                                lock.name,
+                                lock.components.join(", ")
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    println!("{}", lock.path_for(name));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: toolchain-path {}: {e}", args[2]);
                     ExitCode::FAILURE
                 }
             }
@@ -3757,6 +3885,35 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: elf-set-interp {}: {e}", args[2]);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // elf-rpath FILE — print FILE's run-path (DT_RUNPATH, else legacy DT_RPATH), or
+        // nothing for a static binary / one with no run-path. td's OWN ELF reader.
+        Some("elf-rpath") if args.len() == 3 => match elf::read_rpath(Path::new(&args[2])) {
+            Ok(Some(r)) => {
+                println!("{r}");
+                ExitCode::SUCCESS
+            }
+            Ok(None) => ExitCode::SUCCESS, // no run-path
+            Err(e) => {
+                eprintln!("td-builder: elf-rpath {}: {e}", args[2]);
+                ExitCode::FAILURE
+            }
+        },
+        // elf-set-rpath FILE NEW — rewrite FILE's DT_RPATH/DT_RUNPATH to NEW in place (must
+        // fit the existing .dynstr slot). Makes a toolchain binary self-sufficient — bake an
+        // absolute /td/store run-path so it finds its shared libc with no LD_LIBRARY_PATH
+        // wrapper. The second patchelf feature td owns in Rust (no guix tool on the path).
+        Some("elf-set-rpath") if args.len() == 4 => {
+            match elf::set_rpath(Path::new(&args[2]), &args[3]) {
+                Ok(()) => {
+                    eprintln!("td-builder: elf-set-rpath {} -> {}", args[2], args[3]);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: elf-set-rpath {}: {e}", args[2]);
                     ExitCode::FAILURE
                 }
             }

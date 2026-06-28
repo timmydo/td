@@ -210,6 +210,123 @@ fn output_path_from_modulo(modulo_hex: &str, drv_name: &str, out_name: &str) -> 
     make_store_path(&format!("output:{out_name}"), modulo_hex, &name)
 }
 
+/// An INPUT-ADDRESSED store path: the digest is `key_hex` (a hash of the artifact's
+/// DECLARED INPUTS, not of its built content), named like a normal derivation `out`
+/// output (`make-store-path("output:out", key, name)`). This is the stable key the
+/// toolchain needs — `store-add-recursive` content-addresses by the recursive NAR
+/// hash, so a non-byte-reproducible tree (the modern toolchain's cc1 stamp / ar
+/// mtimes) lands at a path that VARIES build-to-build; an input-addressed path is a
+/// pure function of the inputs, so it is identical across rebuilds and a td-subst
+/// consumer can compute it from the lock BEFORE fetching. The placed bytes are still
+/// registered with their REAL NAR hash (the daemon's `output:` semantics — naming and
+/// content-integrity are orthogonal), so the closure/verify machinery is unchanged.
+pub fn input_addressed_path(key_hex: &str, name: &str) -> String {
+    output_path_from_modulo(key_hex, name, "out")
+}
+
+/// The parsed `td-toolchain.lock` — the toolchain's declared INPUT set, the source of
+/// truth for its stable input-addressed key. The lock is line-based (`field value`,
+/// like the seed/source locks): one `name`, one `recipe-rev`, one or more `component`
+/// (the toolchain's parts, e.g. gcc-14.3.0), and the pinned `input`/`patch`
+/// `<sha256> <file>` lines (mirrors of seed/sources/*.lock + the vendored boot
+/// patches — the gate asserts they stay in sync). The KEY hashes ALL of these, so the
+/// input-addressed path changes iff a declared input changes (load-bearing) and is
+/// content-independent (stable across non-reproducible rebuilds).
+pub struct ToolchainLock {
+    pub name: String,
+    pub recipe_rev: String,
+    pub components: Vec<String>,
+    /// Canonical `"<sha256> <file>"` lines for sources.
+    pub inputs: Vec<String>,
+    /// Canonical `"<sha256> <file>"` lines for vendored patches.
+    pub patches: Vec<String>,
+}
+
+impl ToolchainLock {
+    pub fn parse(content: &str) -> Result<ToolchainLock, String> {
+        let (mut name, mut recipe_rev) = (String::new(), String::new());
+        let (mut components, mut inputs, mut patches) = (Vec::new(), Vec::new(), Vec::new());
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, val) = line.split_once(' ').map(|(k, v)| (k, v.trim())).unwrap_or((line, ""));
+            match key {
+                "name" => {
+                    if !name.is_empty() {
+                        return Err("td-toolchain.lock: duplicate `name`".into());
+                    }
+                    name = val.to_string();
+                }
+                "recipe-rev" => {
+                    if !recipe_rev.is_empty() {
+                        return Err("td-toolchain.lock: duplicate `recipe-rev`".into());
+                    }
+                    recipe_rev = val.to_string();
+                }
+                "component" => components.push(val.to_string()),
+                "input" | "patch" => {
+                    let (sha, file) = val.split_once(' ').ok_or_else(|| {
+                        format!("td-toolchain.lock: malformed `{key}` line (want `<sha256> <file>`): {val}")
+                    })?;
+                    let canon = format!("{} {}", sha.trim(), file.trim());
+                    if key == "input" {
+                        inputs.push(canon);
+                    } else {
+                        patches.push(canon);
+                    }
+                }
+                _ => return Err(format!("td-toolchain.lock: unknown field `{key}`")),
+            }
+        }
+        if name.is_empty() {
+            return Err("td-toolchain.lock: missing `name`".into());
+        }
+        if recipe_rev.is_empty() {
+            return Err("td-toolchain.lock: missing `recipe-rev`".into());
+        }
+        if components.is_empty() {
+            return Err("td-toolchain.lock: needs at least one `component`".into());
+        }
+        if inputs.is_empty() {
+            return Err("td-toolchain.lock: needs at least one `input`".into());
+        }
+        Ok(ToolchainLock { name, recipe_rev, components, inputs, patches })
+    }
+
+    /// The toolchain's stable INPUT key: sha256 (base-16) over a canonical, ORDER-
+    /// INDEPENDENT serialization of every declared input. Sorting the multi-valued
+    /// fields means the key depends on the SET of inputs, not the lock's line order.
+    pub fn key(&self) -> String {
+        let mut components = self.components.clone();
+        components.sort();
+        let mut inputs = self.inputs.clone();
+        inputs.sort();
+        let mut patches = self.patches.clone();
+        patches.sort();
+        let mut canon = String::new();
+        canon.push_str(&format!("name={}\n", self.name));
+        canon.push_str(&format!("recipe-rev={}\n", self.recipe_rev));
+        for c in &components {
+            canon.push_str(&format!("component={c}\n"));
+        }
+        for i in &inputs {
+            canon.push_str(&format!("input={i}\n"));
+        }
+        for p in &patches {
+            canon.push_str(&format!("patch={p}\n"));
+        }
+        sha256::to_base16(&sha256_bytes(canon.as_bytes()))
+    }
+
+    /// The input-addressed store path for `name` (a component, or the toolchain's own
+    /// `name` when `None`) under the active `store_dir()`.
+    pub fn path_for(&self, name: Option<&str>) -> String {
+        input_addressed_path(&self.key(), name.unwrap_or(&self.name))
+    }
+}
+
 /// CONSTRUCT a `.drv` (the evaluator-as-library payload): from the skeleton in `d`
 /// (builder/args/inputs/env, with output paths NOT yet known), compute every
 /// output path via `hashDerivationModulo`, fill them into the outputs AND the
@@ -380,5 +497,65 @@ mod tests {
         );
         // `make_store_path` follows TD_STORE_DIR (default /gnu/store when unset).
         assert!(make_store_path(ty, h, name).starts_with(&format!("{}/", store_dir())));
+    }
+
+    #[test]
+    fn input_addressed_path_is_a_function_of_key_and_name_only() {
+        // The whole point: the path is content-INDEPENDENT. Same (key, name) ⇒ same
+        // path; a different key ⇒ a different path (the inputs are load-bearing).
+        let a = input_addressed_path("deadbeef", "td-toolchain");
+        let b = input_addressed_path("deadbeef", "td-toolchain");
+        assert_eq!(a, b, "same key+name must yield the same input-addressed path");
+        assert!(a.ends_with("-td-toolchain"));
+        assert_ne!(
+            a,
+            input_addressed_path("cafef00d", "td-toolchain"),
+            "a different key must move the path (inputs are load-bearing)"
+        );
+        assert_ne!(
+            a,
+            input_addressed_path("deadbeef", "glibc-2.41"),
+            "a different name must move the path"
+        );
+    }
+
+    #[test]
+    fn toolchain_lock_key_is_order_independent_and_load_bearing() {
+        let l1 = ToolchainLock::parse(
+            "name td-toolchain\nrecipe-rev 1\ncomponent gcc-14.3.0\ncomponent glibc-2.41\n\
+             input aaaa gcc-14.3.0.tar.xz\ninput bbbb glibc-2.41.tar.xz\npatch cccc boot.patch\n",
+        )
+        .unwrap();
+        // Same SET of inputs, different LINE ORDER ⇒ identical key (it hashes the set).
+        let l2 = ToolchainLock::parse(
+            "name td-toolchain\nrecipe-rev 1\ncomponent glibc-2.41\ncomponent gcc-14.3.0\n\
+             input bbbb glibc-2.41.tar.xz\ninput aaaa gcc-14.3.0.tar.xz\npatch cccc boot.patch\n",
+        )
+        .unwrap();
+        assert_eq!(l1.key(), l2.key(), "key must be order-independent");
+        // Perturb one pin ⇒ the key (and so the path) changes — self-discrimination.
+        let l3 = ToolchainLock::parse(
+            "name td-toolchain\nrecipe-rev 1\ncomponent gcc-14.3.0\ncomponent glibc-2.41\n\
+             input aaaa gcc-14.3.0.tar.xz\ninput bbbX glibc-2.41.tar.xz\npatch cccc boot.patch\n",
+        )
+        .unwrap();
+        assert_ne!(l1.key(), l3.key(), "perturbing a pin must change the key");
+        // recipe-rev is part of the key too (a recipe change with unchanged inputs re-keys).
+        let l4 = ToolchainLock::parse(
+            "name td-toolchain\nrecipe-rev 2\ncomponent gcc-14.3.0\ncomponent glibc-2.41\n\
+             input aaaa gcc-14.3.0.tar.xz\ninput bbbb glibc-2.41.tar.xz\npatch cccc boot.patch\n",
+        )
+        .unwrap();
+        assert_ne!(l1.key(), l4.key(), "bumping recipe-rev must change the key");
+    }
+
+    #[test]
+    fn toolchain_lock_rejects_malformed() {
+        assert!(ToolchainLock::parse("recipe-rev 1\ncomponent x\ninput a f\n").is_err()); // no name
+        assert!(ToolchainLock::parse("name x\ncomponent y\ninput a f\n").is_err()); // no recipe-rev
+        assert!(ToolchainLock::parse("name x\nrecipe-rev 1\ninput a f\n").is_err()); // no component
+        assert!(ToolchainLock::parse("name x\nrecipe-rev 1\ncomponent y\n").is_err()); // no input
+        assert!(ToolchainLock::parse("name x\nrecipe-rev 1\ncomponent y\ninput a f\nbogus z\n").is_err());
+        assert!(ToolchainLock::parse("name x\nrecipe-rev 1\ncomponent y\ninput nosha\n").is_err());
     }
 }
