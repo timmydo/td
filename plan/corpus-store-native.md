@@ -4,6 +4,22 @@ Goal (task 4 of the post-glibc-2.41 plan): build MORE real corpus packages with 
 toolchain, each a leaf gate, extending the BRICK 8 pattern past GNU hello. This drives the guix
 gcc-toolchain out of the corpus baseline — the userland is built by td's toolchain, not guix's.
 
+## Shared chain library (dedup, 2026-06-28 — human-directed)
+
+The ~850-line seed→…→gcc-14.3.0+binutils-2.44+glibc-2.41 chain was copy-pasted across 10
+bootstrap-*-store-native gates. Human asked to stop duplicating it. The merged toolchain-subst work
+(#204/#207/#209/#213) makes the toolchain *fetchable* (tools/resolve-toolchain.sh + the input-addressed
+td-toolchain.lock + a daily publisher) but does NOT yet let a corpus gate be thin: only `glibc-2.41` is
+published as a substitute (the last rung; gcc-14/binutils-2.44 are not), the substitute store is
+populated only by the daily suite (per-PR/local MISSes → from-seed), and there is no shared from-seed
+builder. So the fix is to EXTRACT the chain: **`tests/bootstrap-chain.sh`** now holds the chain VERBATIM
+(helpers + every `build_*` function + a `bootstrap_modern_toolchain` orchestrator that builds + verifies
+the toolchain and sets the globals GCC14/GLIBC241/BMB244SB/CC1/cpath/KH_TB). The sed gate sources it and
+drops from 1163 → ~185 lines. Pure code move (behavior-preserving). The other 9 gates can migrate to the
+lib later (each needs its own from-seed re-validation; tracked as follow-up). When ALL toolchain
+components become substitutable, the lib's `bootstrap_modern_toolchain` becomes the single place to add
+a fetch-by-default + from-seed-fallback.
+
 ## Approach — the converged BRICK 8 / toolchain-subst engine path (NOT the mesboot wrapper)
 
 The human chose (2026-06-28) the engine approach over the gate-404 hello-userland mesboot wrapper:
@@ -11,8 +27,8 @@ build the corpus package via `td-builder build-recipe` with the MODERN /td/store
 substituted for guix's gcc-toolchain. The template is `tests/bootstrap-hello-corpus-store-native.sh`
 (gate 414, [[toolchain-subst]]). Each package gate:
 
-1. Build the full modern toolchain from the seed (chain → gcc 4.9.4 → gcc 14.3.0 + binutils 2.44 →
-   glibc 2.41). This block is copied VERBATIM from the hello-corpus gate (not a new failure surface).
+1. `bootstrap_modern_toolchain` (from `tests/bootstrap-chain.sh`) builds the full modern toolchain from
+   the seed (chain → gcc 4.9.4 → gcc 14.3.0 + binutils 2.44 → glibc 2.41). Shared lib; not re-inlined.
 2. Re-check the toolchain: link + run a C and a C++ program → 42 (durable toolchain leg).
 3. Assemble a guix-gcc-toolchain-shaped /td/store toolchain: gcc/g++ WRAPPER (--sysroot glibc 2.41,
    interp/RUNPATH baked, link flags only when linking) + binutils 2.44 + ar/ranlib LD_LIBRARY_PATH
