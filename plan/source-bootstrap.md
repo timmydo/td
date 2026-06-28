@@ -321,9 +321,23 @@ upward:
 6. **glibc + binutils** — the C library + linker/assembler, native `/td/store` RUNPATH.
 7. **coreutils / bash / make / sed / grep / tar / gzip / …** — the build userland td's
    recipes already assume, now from the `/td/store` source toolchain.
-8. **retire the guix seed** — the corpus locks (`hello-no-guix.lock`, …) point at the
-   `/td/store` toolchain; the guix toolchain seed is removed from every build's inputs;
-   guix remains only as the removable `guix build --check` oracle (retired last, §5).
+8. **retire the guix seed** — the corpus is built by the `/td/store` toolchain, not guix's
+   `gcc-toolchain-15.2.0`; the guix toolchain seed leaves every build's inputs; guix remains
+   only as the removable `guix build --check` oracle (retired last, §5).
+   - **step 1 ✅** (gate `bootstrap-hello-corpus-store-native`, mk 414): from the seed td builds
+     the full modern toolchain (gcc 14.3.0 + binutils 2.44 + glibc 2.41), then with it (substituted
+     for guix's gcc-toolchain) `build-recipe` builds a REAL corpus package — GNU hello 2.12.2 (the
+     version `hello-no-guix.lock` builds the guix way). hello links the `/td/store` glibc 2.41,
+     references NO guix gcc-toolchain, runs in the own-root → "Hello, world!", `/gnu/store` ABSENT.
+     Enabled by 4 backward-compatible engine changes: 32-bit (i686) ELF interp rewriting
+     (`elf.rs`), `TD_EXTRA_DBS` multi-db `closure_multi` merge + basename closure re-key
+     (`main.rs`), and multi-prefix sandbox staging (`sandbox.rs`) — a corpus build can now span
+     `/gnu/store` deps + a `/td/store` td-built toolchain. The toolchain is assembled
+     guix-gcc-toolchain-shaped (gcc 14 wrapper: `--sysroot` glibc 2.41 so gcc-internal headers
+     precede glibc's, interp/RUNPATH baked, link flags only when linking, kernel UAPI headers added;
+     ar/ranlib wrapped for LD_LIBRARY_PATH since make invokes them directly).
+   - **next** — substitute the toolchain for more corpus leaves (sed/grep/make/…), then drop the
+     guix gcc-toolchain from the lock baseline entirely; td-subst chain-caching (below) for speed.
 
 ## Iteration speed: `/td/store`-native unlocks td-subst chain-caching (2026-06-26)
 
