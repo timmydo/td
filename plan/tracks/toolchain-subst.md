@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 title: toolchain-subst
 handle: claude-opus-b3b7ea
 date: 2026-06-28
