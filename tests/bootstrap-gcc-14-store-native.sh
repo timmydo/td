@@ -24,6 +24,9 @@ set -eu
 
 ROOT=$(pwd)
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# Parallelism for the MODERN rungs (gcc 14 / glibc 2.41 / binutils 2.44 — robust guix make with MAKEFLAGS
+# cleared, so -j gets a FRESH jobserver). The early mesboot rungs (tcc-built mes-libc make) stay serial.
+BJOBS=${TD_BUILD_CORES:-$(nproc 2>/dev/null || echo 4)}
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 STAGE0=seed/stage0
 A=AMD64
@@ -871,7 +874,7 @@ build_gcc_14() {
       || { echo "gcc-14.3.0 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_gcc1430-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
         C_INCLUDE_PATH="$CIP" CPLUS_INCLUDE_PATH="$CIP" LIBRARY_PATH="$LP" \
-        make SHELL="$csh" CONFIG_SHELL="$csh" MAKEINFO=true "LDFLAGS=$ldf" "LDFLAGS_FOR_TARGET=$ldf" >build.log 2>&1 \
+        make -j"$BJOBS" SHELL="$csh" CONFIG_SHELL="$csh" MAKEINFO=true "LDFLAGS=$ldf" "LDFLAGS_FOR_TARGET=$ldf" >build.log 2>&1 \
       || { echo "gcc-14.3.0 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_gcc1430-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
         C_INCLUDE_PATH="$CIP" CPLUS_INCLUDE_PATH="$CIP" LIBRARY_PATH="$LP" \
