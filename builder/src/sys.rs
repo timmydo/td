@@ -25,6 +25,11 @@ const SYS_EXIT_GROUP: usize = 231;
 const SYS_WRITE: usize = 1;
 const SYS_PRCTL: usize = 157;
 const SYS_GETPPID: usize = 110;
+const SYS_SETPRIORITY: usize = 141;
+const SYS_GETPRIORITY: usize = 140;
+
+/// setpriority/getpriority `which`: act on a single process by PID (0 = self).
+const PRIO_PROCESS: usize = 0;
 
 const PR_SET_PDEATHSIG: usize = 1;
 /// SIGKILL — the parent-death signal the host-sandbox arms (uncatchable, so a
@@ -220,6 +225,27 @@ pub fn waitpid(pid: i64) -> io::Result<i32> {
 /// host-sandbox's PID-namespace PARENT uses this to propagate its PID-1 child's
 /// exit status WITHOUT returning into std's post-fork exec path — there must be
 /// exactly one exec (the PID-1 child's), and no second sync-pipe write.
+/// setpriority(2) on the calling process (`which=PRIO_PROCESS, who=0`). `prio` is
+/// the absolute nice value (-20..=19); larger = lower scheduling priority. An
+/// unprivileged caller may only RAISE niceness — trying to lower it fails with
+/// EPERM/EACCES, which callers treat as "already nice enough". Scheduling-only:
+/// build OUTPUT is unaffected, so reproducibility is intact.
+pub fn set_self_priority(prio: i32) -> io::Result<()> {
+    check(unsafe { syscall5(SYS_SETPRIORITY, PRIO_PROCESS, 0, prio as isize as usize, 0, 0) })
+}
+
+/// getpriority(2) for the calling process, as the nice value (-20..=19). The raw
+/// syscall returns `20 - nice` to keep the success range non-negative (a real
+/// error is the usual `-errno`); we undo that bias.
+pub fn get_self_priority() -> io::Result<i32> {
+    let ret = unsafe { syscall5(SYS_GETPRIORITY, PRIO_PROCESS, 0, 0, 0, 0) };
+    if ret < 0 {
+        Err(io::Error::from_raw_os_error(-ret as i32))
+    } else {
+        Ok(20 - ret as i32)
+    }
+}
+
 pub fn exit_group(code: i32) -> ! {
     unsafe {
         syscall5(SYS_EXIT_GROUP, code as usize, 0, 0, 0, 0);
@@ -248,5 +274,18 @@ mod tests {
         let target = std::ffi::CString::new("/no/such/td-builder/mount/point").unwrap();
         let err = mount(None, &target, None, MS_REC | MS_PRIVATE, None).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(2 /* ENOENT */));
+    }
+
+    #[test]
+    fn set_self_priority_raises_niceness() {
+        // Raising niceness is always permitted for the calling user, so a +2 bump
+        // must actually move the value the kernel reports. Proves both syscalls
+        // (the round-trip would pass on a no-op stub only if `before == after`,
+        // which the +2 request rules out unless we were already pinned at 19).
+        let before = get_self_priority().expect("getpriority");
+        let target = (before + 2).min(19);
+        set_self_priority(target).expect("raising niceness must succeed");
+        let after = get_self_priority().expect("getpriority");
+        assert_eq!(after, target, "niceness should be exactly the raised target");
     }
 }
