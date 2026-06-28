@@ -55,7 +55,16 @@ is byte-identical. This is an intrinsic double-build reproducibility assertion (
       - [x] FROM-SEED gate GREEN: [repro] two builds normalized → byte-identical
             (nar-hash sha256:2ddda173…); [behavioral] stripped as/ld link → 42; [structural]
             /gnu/store absent. Verified-red: RAW double-build differs in 35 files.
-- [ ] inc2 (follow-up): glibc-2.41 adopts the helper + repro leg.
+- [~] inc2: glibc-2.41 adopts the helper + repro leg (rung C).
+      - [x] chain+diag harness (.td-build-cache/_repro/glibc-chain-diag.sh): snapshot the
+            gcc-14/glibc-shared/binutils-244-sb chain, build glibc-2.41 twice, normalize, compare.
+      - [x] DIAG RESULT: RAW double-build differs in 310 files; NORMALIZED → byte-identical
+            (nar-hash sha256:f0f7abd8…). The build-id risk was MOOT: glibc-2.41's libc.so.6
+            here carries NO .note.gnu.build-id (gcc-14 not configured to emit one), so the
+            helper (strip-debug + deterministic-archives + drop .la) suffices — no
+            -ffile-prefix-map / fixed-path needed. strip = $BMB244SB/bin/strip (native, no loader).
+      - [x] wire repro_normalize_tree + the double-build repro leg into the glibc-241 gate.
+      - [ ] FROM-SEED gate validation (~2.5 h) → PR.
 - [ ] inc3 (follow-up): gcc-14 adopts the helper + repro leg (expensive double-build).
 
 ## Nuance for follow-ups (cross-run stability)

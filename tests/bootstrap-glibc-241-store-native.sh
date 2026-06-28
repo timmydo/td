@@ -18,8 +18,11 @@
 #   [pinned-input] chain tarballs + boot patches + gcc-4.9.4 + gcc-14.3.0 + gmp/mpfr/mpc + binutils-2.44 + glibc-2.41 match sha256.
 #   [no-guix]      built with gcc/g++/cc/guile/guix DENIED; no /gnu/store in glibc 2.41's libc.so.6 NOR gcc/cc1.
 #   [input-addr]   glibc-2.41 is interned at the LOCK-KEYED path /td/store/<toolchain-key>-glibc-2.41
-#                  (tests/td-toolchain.lock; #209 — was content-addressed, but the toolchain is not
-#                  byte-reproducible so that digest varied build-to-build).
+#                  (tests/td-toolchain.lock; #209 — the td-subst key, independent of the output digest).
+#   [repro]        glibc 2.41 is BYTE-REPRODUCIBLE: two independent from-source builds (different build
+#                  dirs), canonicalized by tests/repro-lib.sh (strip the build-path-bearing DWARF +
+#                  deterministic archives + drop libtool .la), are byte-identical — so the subst NARs are
+#                  stable build-to-build. Intrinsic double-build, no guix oracle.
 #   [behavioral]   gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++) program against the MODERN glibc 2.41
 #                  (interp = /td/store glibc 2.41 ld-linux.so.2); both RUN in the own-root → 42.
 #   [subst]        the REAL glibc-2.41 subst-exports + nar-restores byte-identical, and the prebuilt
@@ -1008,14 +1011,38 @@ for so in "$GLIBC241/lib/"*.so; do
 done
 
 . tests/cache-lib.sh
+. tests/repro-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 export TD_STORE_DIR=/td/store
-# toolchain-subst-default (#209): intern glibc-2.41 INPUT-ADDRESSED at the stable lock-keyed
-# path (was content-addressed via store-add-recursive — surfaced in the PR; the toolchain is
-# not byte-reproducible so its content-addressed path varied build-to-build, which is exactly
-# why 2a introduced the input-addressed key). The own-root behavioral probe below is unchanged.
+# Canonicalize glibc 2.41 for byte-reproducibility BEFORE interning (strip the build-path-bearing
+# DWARF + deterministic archives + drop libtool .la — tests/repro-lib.sh). strip is the
+# sandbox-runnable binutils 2.44 (native build-dir interp, so no explicit loader needed). This makes
+# the interned + subst-exported glibc-2.41 byte-identical build-to-build.
+repro_normalize_tree "$GLIBC241" "$BMB244SB/bin/strip" || fail "glibc-2.41 normalization failed"
+
+# --- [repro] a second independent build, normalized the same way, is BYTE-IDENTICAL --------------
+# Durable intrinsic-reproducibility (no guix oracle): two from-source builds of glibc 2.41 in
+# different mktemp build dirs are byte-identical after normalization, so the lock-keyed path's
+# subst-exported NARs are stable build-to-build. Verified-red (dev harness): the RAW un-normalized
+# double-build differs in 310 files (build path in every ELF's DWARF + archive member mtimes).
+GLIBC241B2=`mktemp -d`/glibc241build2
+build_glibc_241 "$cpath" "$GCC14" "$GSH/out" "$BMB244SB" "$GLIBC241B2" || fail "the second (repro) glibc-2.41 build did not run"
+GLIBC241_2="$GLIBC241B2/stage/td/store/glibc-2.41"
+for so in "$GLIBC241_2/lib/"*.so; do
+  if head -c20 "$so" 2>/dev/null | grep -q 'GNU ld script' 2>/dev/null; then sed -i "s,/td/store/glibc-2.41/lib/,,g; s,$GLIBC241_2/lib/,,g" "$so"; fi
+done
+repro_normalize_tree "$GLIBC241_2" "$BMB244SB/bin/strip" || fail "second glibc-2.41 normalization failed"
+gh1=`"$TB" nar-hash "$GLIBC241"` || fail "nar-hash of glibc-2.41 build A failed"
+gh2=`"$TB" nar-hash "$GLIBC241_2"` || fail "nar-hash of glibc-2.41 build B failed"
+test "$gh1" = "$gh2" || fail "glibc 2.41 is NOT byte-reproducible — buildA=$gh1 buildB=$gh2"
+rm -rf "`dirname "$GLIBC241B2"`"
+echo "   [repro] two independent from-source builds of glibc 2.41, normalized, are byte-identical (nar-hash $gh1) — durable intrinsic double-build reproducibility, no guix oracle"
+
+# toolchain-subst-default (#209): intern the NORMALIZED glibc-2.41 INPUT-ADDRESSED at the stable
+# lock-keyed path (tests/td-toolchain.lock). Input-addressing is the td-subst key; the [repro] leg
+# above now also makes the OUTPUT byte-reproducible, so the exported NARs are identical build-to-build.
 IAKEY=`"$TB" toolchain-key tests/td-toolchain.lock` || fail "toolchain-key failed"
 GLP=`"$TB" store-add-input-addressed glibc-2.41 "$IAKEY" "$GLIBC241" "$store" "$sndb"` || fail "store-add-input-addressed glibc-2.41 failed"
 IAP=`"$TB" toolchain-path tests/td-toolchain.lock glibc-2.41`
