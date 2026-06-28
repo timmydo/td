@@ -15,6 +15,9 @@
 # build tools). Requires globals the chain defines: GCC14_TB GMP63_TB MPFR421_TB MPC131_TB BU244_TB
 # GLIBC241_TB ROOT + fail().
 XTARGET=x86_64-pc-linux-gnu
+# The MODERN cross builds (binutils 2.44 / gcc 14 / glibc 2.41) parallelize safely — PLAN task #1
+# endorses -j for exactly these (keep the mesboot base serial). Override with X86_MAKE_J= for serial.
+: "${X86_MAKE_J:=-j4}"
 
 # _store_tool <name> <guix-pkg> — a build-time scaffolding tool, from PATH or the exposed /gnu/store
 _store_tool() { command -v "$1" 2>/dev/null || ls /gnu/store/*"$2"*/bin/"$1" 2>/dev/null | sort | head -1; }
@@ -58,7 +61,7 @@ build_binutils_x86_64() {
       --disable-nls --disable-gold --disable-werror --enable-deterministic-archives \
       --disable-plugins --disable-gprofng --disable-multilib >cfg.log 2>&1 \
       || { echo "x86_64 binutils configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xbu-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
-    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" make MAKEINFO=true >build.log 2>&1 \
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" make $X86_MAKE_J MAKEINFO=true >build.log 2>&1 \
       || { echo "x86_64 binutils make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xbu-build.log" 2>/dev/null||true; tail -30 build.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" make MAKEINFO=true install prefix="$out" >inst.log 2>&1 \
       || { echo "x86_64 binutils install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
@@ -90,14 +93,14 @@ build_gcc_x86_64_stage1() {
     env PATH="$bp" CONFIG_SHELL="$csh" CC="$wb/cc" CXX="$wb/cxx" CPP="$wb/cc -E" CC_FOR_BUILD="$wb/cc" CXX_FOR_BUILD="$wb/cxx" \
         "$csh" ../configure --build=i686-pc-linux-gnu --host=i686-pc-linux-gnu --target=$XTARGET \
         --prefix=/td/store/gcc-14.3.0-x86_64 --with-sysroot="$sysroot" \
-        --enable-languages=c --without-headers --with-newlib \
+        --enable-languages=c --without-headers --with-newlib --with-glibc-version=2.41 \
         --disable-bootstrap --disable-multilib --disable-shared --disable-threads \
         --disable-libssp --disable-libgomp --disable-libquadmath --disable-libatomic \
         --disable-libvtv --disable-libitm --disable-libstdcxx --disable-libcc1 \
         --disable-lto --disable-plugin --disable-decimal-float --disable-werror >cfg.log 2>&1 \
       || { echo "x86_64 gcc stage1 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xgcc1-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
-        make SHELL="$csh" MAKEINFO=true all-gcc all-target-libgcc >build.log 2>&1 \
+        make $X86_MAKE_J SHELL="$csh" MAKEINFO=true all-gcc all-target-libgcc >build.log 2>&1 \
       || { echo "x86_64 gcc stage1 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xgcc1-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
         make SHELL="$csh" MAKEINFO=true install-gcc install-target-libgcc DESTDIR="$out/stage" >inst.log 2>&1 \
@@ -133,7 +136,7 @@ build_glibc_x86_64() {
         --with-binutils="$xbu/bin" libc_cv_slibdir=/td/store/glibc-2.41-x86_64/lib >cfg.log 2>&1 \
       || { echo "x86_64 glibc configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xglibc-cfg.log" 2>/dev/null||true; tail -30 cfg.log >&2; return 1; }
     env PATH="$xgccbin:$xbu/bin:$tb:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" \
-        make >build.log 2>&1 \
+        make $X86_MAKE_J >build.log 2>&1 \
       || { echo "x86_64 glibc make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xglibc-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
     env PATH="$xgccbin:$xbu/bin:$tb:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" \
         make install DESTDIR="$out/stage" >inst.log 2>&1 \
@@ -179,14 +182,14 @@ build_gcc_x86_64_stage2() {
     env PATH="$bp" CONFIG_SHELL="$csh" CC="$wb/cc" CXX="$wb/cxx" CPP="$wb/cc -E" CC_FOR_BUILD="$wb/cc" CXX_FOR_BUILD="$wb/cxx" \
         "$csh" ../configure --build=i686-pc-linux-gnu --host=i686-pc-linux-gnu --target=$XTARGET \
         --prefix=/td/store/gcc-14.3.0-x86_64 --with-sysroot="$sysroot" \
-        --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-c99 \
+        --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-c99 --with-glibc-version=2.41 \
         --disable-bootstrap --disable-multilib --disable-libssp --disable-libgomp \
         --disable-libquadmath --disable-libvtv --disable-libitm --disable-libcc1 \
         --disable-libsanitizer --disable-lto --disable-plugin --disable-decimal-float \
         --disable-libstdcxx-pch --disable-werror >cfg.log 2>&1 \
       || { echo "x86_64 gcc stage2 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xgcc2-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
-        make SHELL="$csh" MAKEINFO=true >build.log 2>&1 \
+        make $X86_MAKE_J SHELL="$csh" MAKEINFO=true >build.log 2>&1 \
       || { echo "x86_64 gcc stage2 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xgcc2-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
         make SHELL="$csh" MAKEINFO=true install DESTDIR="$out/stage" >inst.log 2>&1 \
