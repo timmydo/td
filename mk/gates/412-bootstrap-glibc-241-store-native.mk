@@ -7,8 +7,11 @@
 # 14.3.0 + binutils 2.44 + glibc 2.41) now lives at /td/store, all from the seed — unblocks the Rust userland
 # (needs glibc >= 2.17) and the retirement of the guix toolchain seed. glibc-2.41-specific: needs modern
 # binutils 2.44 (2.20.1a too old), `gawk` by name, and forbids DT_RPATH/DT_RUNPATH in libc.so.6 (bake no
-# -rpath; LD_LIBRARY_PATH for the build tools). DURABLE: pinned-input, no-guix (no /gnu/store in libc.so.6 NOR
-# gcc/cc1), content-addr, behavioral (C + C++ vs glibc 2.41 → 42 from /td/store), structural. NOT a BUILD_GATE.
+# -rpath; LD_LIBRARY_PATH for the build tools). BYTE-REPRODUCIBLE: two independent from-source builds,
+# canonicalized by tests/repro-lib.sh (strip the build-path-bearing DWARF + deterministic archives + drop
+# libtool .la), land on the SAME content-addressed /td/store path — a stable key for td-subst. DURABLE:
+# pinned-input, no-guix (no /gnu/store in libc.so.6 NOR gcc/cc1), content-addr, repro (intrinsic double-build,
+# no guix oracle), behavioral (C + C++ vs glibc 2.41 → 42 from /td/store), structural. NOT a BUILD_GATE.
 HEAVY_GATES += bootstrap-glibc-241-store-native
 bootstrap-glibc-241-store-native:
 	@echo ">> bootstrap-glibc-241-store-native: a MODERN glibc 2.41 at /td/store — built from the seed by gcc 14.3.0 + binutils 2.44; gcc 14.3.0 links a DYNAMIC C AND C++ program against it that runs → 42, /gnu/store ABSENT (source-bootstrap brick 6/7, final-toolchain rung C — the full modern toolchain)"
