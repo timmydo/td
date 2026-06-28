@@ -45,12 +45,28 @@ is byte-identical. This is an intrinsic double-build reproducibility assertion (
 
 ## Ladder
 
-- [ ] inc1: binutils-2.44 (rung A, cheapest) reproducible + tests/repro-lib.sh helper.
+- [x] inc1: binutils-2.44 (rung A, cheapest) reproducible + tests/repro-lib.sh helper. LANDED-READY.
       - [x] diag harness: build chain once (snapshot) + binutils-2.44 twice, confirm RAW
-            CA paths differ, identify the differing files, confirm normalized CA paths match.
-      - [ ] wire repro_normalize_tree + the double-build repro leg into the gate.
+            CA paths differ (35 files: 26 ELF + 6 .a + 3 .la), confirm normalized CA paths match.
+      - [x] fix 2 surprises the diag surfaced: strip SIGBUSes on its own in-tree binary
+            (run strip from a copy outside the tree); libtool .la leak the build path via
+            relink_command (drop them).
+      - [x] wire repro_normalize_tree + the double-build repro leg into the gate.
+      - [x] FROM-SEED gate GREEN: [repro] two builds normalized → byte-identical
+            (nar-hash sha256:2ddda173…); [behavioral] stripped as/ld link → 42; [structural]
+            /gnu/store absent. Verified-red: RAW double-build differs in 35 files.
 - [ ] inc2 (follow-up): glibc-2.41 adopts the helper + repro leg.
 - [ ] inc3 (follow-up): gcc-14 adopts the helper + repro leg (expensive double-build).
+
+## Nuance for follow-ups (cross-run stability)
+
+The [repro] leg proves binutils-2.44's BUILD is deterministic: two builds against the SAME
+chain → identical /td/store path. The path observed differs run-to-run only because its INPUT
+(the chain's glibc-shared CA hash, baked as the interp/RUNPATH string) differs — the chain
+rungs (gcc-mesboot / glibc-mesboot) are NOT yet normalized, so the full closure is not yet
+cross-machine stable. Fully stable cross-machine paths (what td-subst consumer-fetch needs)
+require the same repro_normalize_tree treatment on the upstream chain rungs + glibc-2.41 /
+gcc-14. This PR delivers the reusable mechanism + the binutils-2.44 layer.
 
 ## Dev harnesses (not gates)
 
