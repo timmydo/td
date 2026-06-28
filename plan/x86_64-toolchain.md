@@ -105,5 +105,25 @@ colliding). builder/src changes (if any) validate on `check-engine`.
 ## Progress
 
 - 2026-06-27 — track claimed; ladder designed; the i686/x86_64 arch finding surfaced and
-  the stale rust records corrected. Next: write the x86_64 cross-build functions + the
-  x86_64 kernel-headers warm, iterate in the dev harness from the i686 base.
+  the stale rust records corrected.
+- 2026-06-28 — **rung X1 GREEN in the dev harness** (cached i686 base). All four cross rungs
+  build + the own-root verify passes:
+  `cross binutils 2.44 → cross gcc 14 stage1 → x86_64 glibc 2.41 → cross gcc 14 stage2
+  (libgcc_s.so.1)`, then an x86_64 (ELF64) C **and** C++ program runs in the store-ns
+  own-root → `CRC=42 CPPRC=42 GNU-ABSENT`, interned at
+  `/td/store/<hash>-glibc-2.41-x86_64`, no `/gnu/store`. The cross bugs found+fixed
+  (each verified-red before the fix):
+  1. cross build wrapper needed `-idirafter <glibc216>/include` (NOT `-isystem`) so
+     libstdc++'s `<cstdlib>` `#include_next <stdlib.h>` resolves.
+  2. split cross toolchain → bake `--with-as`/`--with-ld` into the cross gcc (else it execs
+     a plain `as`).
+  3. glibc `--with-binutils` must point at the **plain-named** cross tooldir
+     (`$xbu/$XTARGET/bin`) so `OBJCOPY` resolves to the x86_64 binutils.
+  Dev-harness-only fixes (the from-seed gate is unaffected): a shim recreating the cached
+  binutils-2.44 `as`/`ld` baked interp path; rung caching (`X86_RUNG_CACHE`).
+- **Verified-red (arch leg):** the `ELF64` assertion REJECTS an i686 binary
+  (`dbg-vred`: compile c.c with the i686 gcc14 → readelf class != ELF64 → red). The whole
+  point of the track (x86_64, not i686) is load-bearing.
+- Next: the authoritative from-seed gate (`./check.sh bootstrap-x86_64-toolchain-store-native`,
+  no cache — directive 1); then land. Then rung X2 (native x86_64 gcc) + the rust x86_64
+  runtime/userland.
