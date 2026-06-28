@@ -634,6 +634,10 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-glibc-241-store-native ;;
 
+    tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tools/warm-kernel-headers-x86_64.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk)
+      add_preflight shell-syntax
+      add_target bootstrap-x86_64-toolchain-store-native ;;
+
     seed/sources/make-*.lock)
       add_preflight shell-syntax
       add_target bootstrap-make

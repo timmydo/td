@@ -91,5 +91,7 @@ done
 # Derived input: the sanitized Linux UAPI headers for glibc-mesboot0, produced FROM the pinned linux
 # source via `make headers_install` on the host (the sandbox can't run the kernel build). Best-effort.
 sh "$root/tools/warm-kernel-headers.sh" || true
+# ARCH=x86_64 sibling headers for the x86_64-toolchain cross-glibc rung (same pinned linux source).
+sh "$root/tools/warm-kernel-headers-x86_64.sh" || true
 # PREP is best-effort: never fail check.sh here (the heavy bootstrap-* gates enforce presence).
 exit 0
