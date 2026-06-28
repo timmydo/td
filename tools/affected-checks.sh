@@ -239,7 +239,14 @@ map_path() {
       add_preflight shell-syntax
       add_target toolchain-input-addressed ;;
 
-    tests/toolchain-x86_64-input-addressed.sh|tests/td-toolchain-x86_64.lock|mk/gates/418-toolchain-x86_64-input-addressed.mk)
+    tests/td-toolchain-x86_64.lock)
+      # the x86_64 toolchain's input-addressed key feeds BOTH the addressing gate (418, #219)
+      # and gate 414, which interns the real x86_64 bytes at this lock's path and runs from it.
+      add_preflight shell-syntax
+      add_target toolchain-x86_64-input-addressed
+      add_target bootstrap-x86_64-toolchain-store-native ;;
+
+    tests/toolchain-x86_64-input-addressed.sh|mk/gates/418-toolchain-x86_64-input-addressed.mk)
       add_preflight shell-syntax
       add_target toolchain-x86_64-input-addressed ;;
 
@@ -1096,6 +1103,7 @@ run_self_test() {
   assert_target tests/td-toolchain.lock toolchain-input-addressed
   assert_target tests/td-toolchain.lock toolchain-x86_64-input-addressed
   assert_target tests/td-toolchain-x86_64.lock toolchain-x86_64-input-addressed
+  assert_target tests/td-toolchain-x86_64.lock bootstrap-x86_64-toolchain-store-native
   assert_target tests/toolchain-x86_64-input-addressed.sh toolchain-x86_64-input-addressed
   assert_target mk/gates/418-toolchain-x86_64-input-addressed.mk toolchain-x86_64-input-addressed
   assert_target tests/ts/recipe-td-cmake-demo.ts cmake
