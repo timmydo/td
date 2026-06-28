@@ -38,12 +38,14 @@ load_stage0; load_ts_eval; tb="$TB"
 export TD_TSGO="$tsgo" TD_TSDIR="$(pwd)/tests/ts"
 
 # --- build td-subst from source (its own cache dir; CACHE=hit on reruns) ---
+guix=${GUIX:-guix}                              # standalone script: host guix is on PATH (not the make $(GUIX))
 lock0="$(pwd)/tests/td-subst.lock"
 test -s "$lock0" || { echo "ERROR: no $lock0" >&2; exit 1; }
 cu=$(grep -- '-coreutils-' "$lock0" | sed 's/^[^ ]* //' | head -1)
 test -n "$cu" || { echo "ERROR: no coreutils in the lock" >&2; exit 1; }
+shdir=$(dirname "$(command -v sh)")   # the helper scripts are shell scripts: coreutils $cu has no `sh`
 scratch="$(pwd)/.td-build-cache/toolchain-subst-default"; mkdir -p "$scratch/tmp" "$scratch/b"; rm -f "$scratch/b/"*.drv
-grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null \
+grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs "$guix" build >/dev/null \
   || { echo "ERROR: could not realize the seed + vendored .crate deps" >&2; exit 1; }
 srcinfo=$(sh tests/intern-src.sh "$tb" td-subst-src "$(pwd)/subst" "$scratch" target vendor .cargo) \
   || { echo "ERROR: could not intern the subst crate tree" >&2; exit 1; }
@@ -76,7 +78,7 @@ path=$(env -i PATH="$cu/bin" TD_STORE_DIR=/td/store "$tb" store-add-input-addres
 base=$(basename "$path")
 case "$path" in /td/store/*-glibc-2.41) : ;; *) echo "FAIL: not input-addressed at /td/store: $path" >&2; exit 1 ;; esac
 "$ts" keygen "$W/priv" "$W/pub" >/dev/null   # ephemeral pair (CI has no production private secret)
-env -i PATH="$cu/bin" TD_BUILDER="$tb" TD_SUBST_BIN="$ts" TD_SUBST_PRIVKEY="$W/priv" TD_STORE_DIR=/td/store \
+env -i PATH="$cu/bin:$shdir" TD_BUILDER="$tb" TD_SUBST_BIN="$ts" TD_SUBST_PRIVKEY="$W/priv" TD_STORE_DIR=/td/store \
   sh tools/publish-toolchain-subst.sh "$ttl" glibc-2.41 "$W/td.db" "$W/phys" "$W/store" >/dev/null \
   || { echo "FAIL: publish-toolchain-subst.sh (producer)" >&2; exit 1; }
 test -f "$W/store/$base.narinfo" || { echo "FAIL: publisher wrote no narinfo for $base" >&2; exit 1; }
@@ -84,7 +86,7 @@ grep -q '^Sig: ' "$W/store/$base.narinfo" || { echo "FAIL: publisher did not sig
 echo "  [DURABLE behavioral] PUBLISHER: publish-toolchain-subst.sh exported + signed the lock-keyed toolchain into the persistent substitute store"
 
 # --- [DURABLE behavioral] DEFAULT FETCH: the resolver fetches+verifies+restores, no build ---
-got=$(env -i PATH="$cu/bin" TD_SUBST_BIN="$ts" TD_BUILDER="$tb" TD_SUBST_STORE="$W/store" \
+got=$(env -i PATH="$cu/bin:$shdir" TD_SUBST_BIN="$ts" TD_BUILDER="$tb" TD_SUBST_STORE="$W/store" \
       TD_SUBST_PUBKEY="$W/pub" TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$ttl" glibc-2.41 "$W/dest")
 test "x$got" = "x$W/dest/$base" || { echo "FAIL: resolver did not print the restored path (got '$got')" >&2; exit 1; }
 ran=$(env -i "$got/bin/bash" -c 'echo RAN-FETCHED')
@@ -93,7 +95,7 @@ echo "  [DURABLE behavioral] DEFAULT FETCH: the resolver computed the lock-keyed
 
 # --- [DURABLE behavioral] FALL BACK on a cold store ---
 mkdir -p "$W/empty"
-if env -i PATH="$cu/bin" TD_SUBST_BIN="$ts" TD_BUILDER="$tb" TD_SUBST_STORE="$W/empty" \
+if env -i PATH="$cu/bin:$shdir" TD_SUBST_BIN="$ts" TD_BUILDER="$tb" TD_SUBST_STORE="$W/empty" \
    TD_SUBST_PUBKEY="$W/pub" TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$ttl" glibc-2.41 "$W/d2" >/dev/null 2>&1; then
   echo "FAIL: resolver returned 0 on a COLD store (should MISS -> fall back)" >&2; exit 1
 fi
@@ -101,7 +103,7 @@ echo "  [DURABLE behavioral] FALL BACK: a cold store -> the resolver MISSES (exi
 
 # --- [SELF-DISCRIMINATION] a WRONG pinned key -> rejected -> MISS ---
 "$ts" keygen "$W/wrong.priv" "$W/wrong.pub" >/dev/null
-if env -i PATH="$cu/bin" TD_SUBST_BIN="$ts" TD_BUILDER="$tb" TD_SUBST_STORE="$W/store" \
+if env -i PATH="$cu/bin:$shdir" TD_SUBST_BIN="$ts" TD_BUILDER="$tb" TD_SUBST_STORE="$W/store" \
    TD_SUBST_PUBKEY="$W/wrong.pub" TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$ttl" glibc-2.41 "$W/d3" >/dev/null 2>&1; then
   echo "FAIL: resolver ACCEPTED a substitute under a WRONG pinned key (signature not load-bearing)" >&2; exit 1
 fi
@@ -113,7 +115,7 @@ echo "  [SELF-DISCRIMINATION] a wrong pinned key -> the resolver's fetch is reje
 cp -r "$W/store" "$W/store2"
 sed -i 's#^StorePath: .*#StorePath: /td/store/00000000000000000000000000000000-glibc-2.41#' "$W/store2/$base.narinfo"
 "$ts" sign "$W/store2" "$W/priv" >/dev/null
-if env -i PATH="$cu/bin" TD_SUBST_BIN="$ts" TD_BUILDER="$tb" TD_SUBST_STORE="$W/store2" \
+if env -i PATH="$cu/bin:$shdir" TD_SUBST_BIN="$ts" TD_BUILDER="$tb" TD_SUBST_STORE="$W/store2" \
    TD_SUBST_PUBKEY="$W/pub" TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$ttl" glibc-2.41 "$W/d4" >/dev/null 2>&1; then
   echo "FAIL: resolver ACCEPTED a validly-signed substitute whose StorePath != the lock-computed path" >&2; exit 1
 fi
