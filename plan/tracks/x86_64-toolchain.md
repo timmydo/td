@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 handle: claude-opus-d5df49
 date: 2026-06-27
 title: x86_64-toolchain
