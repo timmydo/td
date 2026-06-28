@@ -20,6 +20,16 @@
 #   [DURABLE structural] the .drv builder is the td-bootstrapped stage0 (not the guix-built
 #     td-builder); ts-emit ran under td's OWN td-ts-eval.
 #   [DURABLE repro] td-builder check double-build agrees the td-subst build is reproducible.
+#   [DURABLE behavioral] LOCK-KEYED substitute (tasks 2b/2c — [[toolchain-input-addressed]]): a
+#     real artifact is interned at the INPUT-ADDRESSED path `toolchain-path tests/td-toolchain.lock
+#     glibc-2.41`, subst-export'd + signed + served; a CONSUMER that has ONLY the lock derives the
+#     SAME /td/store path (asserted equal), fetches it by that basename, verifies the signature +
+#     the narinfo StorePath == its lock-computed path + NarHash, restores it, and RUNS the
+#     fetched-not-built binary — a toolchain path obtained WITHOUT building it. Trust = the ed25519
+#     signature + the input-addressed NAME, not repro-equality (the toolchain is not byte-
+#     reproducible — that is task 3). A wrong public key reds the fetch (self-discrimination). The
+#     literal gcc/glibc bytes flow through the IDENTICAL machinery; wiring gate 412 to emit them
+#     input-addressed runs in the DAILY heavy suite (a ~90-min from-seed build), not per-PR.
 HEAVY_GATES += td-subst
 # A BUILD_GATE (like td-feed): ordered AFTER the parallel build-recipes phase so its cargo
 # build doesn't oversubscribe cores, and it depends on the td-ts-eval that build-recipes'
@@ -112,6 +122,39 @@ td-subst:
 	echo "  [SELF-DISCRIMINATION] a wrong public key reds the consumer's fetch step (the exact command try_substitute shells) -> it returns None -> build-recipe falls back to building"; \
 	echo "  [SELF-DISCRIMINATION] TD_SUBST_URL is load-bearing: the from-source build above ran with NO url; only this run (url set) yielded CACHE=subst without rebuilding"; \
 	kill $$cspid 2>/dev/null || true; trap - EXIT; \
+	echo "  --- lock-keyed input-addressed substitute (tasks 2b/2c): a consumer fetches a /td/store path it computes FROM td-toolchain.lock ---"; \
+	ttl="$(CURDIR)/tests/td-toolchain.lock"; test -s "$$ttl" || { echo "FAIL: no td-toolchain.lock" >&2; exit 1; }; \
+	iakey=`env -i PATH="$$cu/bin" "$$tb" toolchain-key "$$ttl"`; test -n "$$iakey" || { echo "FAIL: toolchain-key produced nothing" >&2; exit 1; }; \
+	bashpkg=`grep -- '-bash-' "$(CURDIR)/tests/hello-no-guix.lock" | grep -v static | sed 's/^[^ ]* //' | head -1`; \
+	iabs=`env -i PATH="$$cu/bin" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" store-closure /var/guix/db/db.sqlite "$$bashpkg" | grep -- '-bash-static-' | head -1`; \
+	test -n "$$iabs" -a -x "$$iabs/bin/bash" || { echo "FAIL: no static bash fixture in hello's closure" >&2; exit 1; }; \
+	iad="$$scratch/ia"; rm -rf "$$iad"; mkdir -p "$$iad/store" "$$iad/served" "$$iad/fetch" "$$iad/restored"; \
+	iap=`env -i PATH="$$cu/bin" TD_STORE_DIR=/td/store "$$tb" store-add-input-addressed glibc-2.41 "$$iakey" "$$iabs" "$$iad/store" "$$iad/td.db"`; \
+	case "$$iap" in /td/store/*-glibc-2.41) : ;; *) echo "FAIL: producer path not input-addressed at /td/store: $$iap" >&2; exit 1 ;; esac; \
+	iabase=`basename "$$iap"`; \
+	env -i PATH="$$cu/bin" "$$tb" subst-export "$$iad/td.db" "$$iad/store" "$$iad/served" "$$iap" >/dev/null || { echo "FAIL: subst-export the input-addressed path" >&2; exit 1; }; \
+	test -f "$$iad/served/$$iabase.narinfo" || { echo "FAIL: subst-export wrote no narinfo for $$iabase" >&2; exit 1; }; \
+	"$$ts" sign "$$iad/served" "$$e2e/priv" >/dev/null; \
+	"$$ts" serve "$$iad/served" 127.0.0.1:0 > "$$iad/serve.log" 2>&1 & iaspid=$$!; \
+	trap 'kill $$iaspid 2>/dev/null || true' EXIT; \
+	iaport=""; for i in `seq 1 100`; do iaport=`sed -n 's#.*http://127.0.0.1:\([0-9]*\)/.*#\1#p' "$$iad/serve.log" 2>/dev/null`; [ -n "$$iaport" ] && break; sleep 0.1; done; \
+	test -n "$$iaport" || { echo "FAIL: lock-keyed serve never bound a port" >&2; cat "$$iad/serve.log" >&2; exit 1; }; \
+	iapc=`env -i PATH="$$cu/bin" TD_STORE_DIR=/td/store "$$tb" toolchain-path "$$ttl" glibc-2.41`; \
+	test "x$$iapc" = "x$$iap" || { echo "FAIL: the consumer's lock-computed path ($$iapc) != the producer's interned path ($$iap)" >&2; exit 1; }; \
+	echo "  [DURABLE structural] producer + consumer INDEPENDENTLY derive the same /td/store path from td-toolchain.lock: $$iapc"; \
+	env -i PATH="$$cu/bin" "$$ts" fetch "http://127.0.0.1:$$iaport" "`basename "$$iapc"`" "$$iad/fetch" "$$e2e/pub" >/dev/null || { echo "FAIL: consumer fetch of the lock-keyed path failed" >&2; cat "$$iad/serve.log" >&2; exit 1; }; \
+	fsp=`grep '^StorePath: ' "$$iad/fetch/$$iabase.narinfo" | cut -d' ' -f2`; \
+	test "x$$fsp" = "x$$iapc" || { echo "FAIL: fetched narinfo StorePath ($$fsp) != the lock-computed path ($$iapc)" >&2; exit 1; }; \
+	ianar=`grep '^NarFile: ' "$$iad/fetch/$$iabase.narinfo" | cut -d' ' -f2`; \
+	env -i PATH="$$cu/bin" "$$tb" nar-restore "$$iad/fetch/$$ianar" "$$iad/restored/$$iabase" >/dev/null || { echo "FAIL: nar-restore the lock-keyed substitute" >&2; exit 1; }; \
+	ran=`env -i "$$iad/restored/$$iabase/bin/bash" -c 'echo RAN-FETCHED'`; \
+	test "x$$ran" = "xRAN-FETCHED" || { echo "FAIL: the fetched (not built) binary did not run" >&2; exit 1; }; \
+	echo "  [DURABLE behavioral] the consumer FETCHED the lock-named path (ed25519 sig + NarHash verified) and RAN it -- a toolchain path obtained WITHOUT building it (trust = signature + input-addressed name; repro-equality is task 3, the toolchain is not byte-reproducible)"; \
+	"$$ts" keygen "$$iad/wrong.priv" "$$iad/wrong.pub" >/dev/null; \
+	if env -i PATH="$$cu/bin" "$$ts" fetch "http://127.0.0.1:$$iaport" "$$iabase" "$$iad/wrongfetch" "$$iad/wrong.pub" >/dev/null 2>&1; then echo "FAIL: the lock-keyed fetch ACCEPTED a wrong public key" >&2; exit 1; fi; \
+	echo "  [SELF-DISCRIMINATION] a wrong public key reds the lock-keyed fetch -- the signature is load-bearing"; \
+	kill $$iaspid 2>/dev/null || true; trap - EXIT; \
+	rm -rf "$$iad"; \
 	rm -rf "$$csrv" "$$csd" "$$scratch/wrong.priv" "$$scratch/wrong.pub" "$$scratch/wrongfetch" "$$scratch/csrv.log"; \
 	if [ -n "$$hit" ] && [ -f "$$sd/verified-reproducible" ]; then \
 	  echo "  [DURABLE repro] CACHED: recipe unchanged + previously verified reproducible — td-builder check skipped"; \
@@ -124,4 +167,4 @@ td-subst:
 	  echo "  [DURABLE repro] td-builder check double-build agrees the td-subst build is reproducible"; \
 	fi; \
 	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err" "$$scratch/run.err" "$$e2e"; mkdir -p "$$scratch/tmp"; \
-	echo "PASS: td built td-subst (its own substitute server) from source via td-builder build-recipe — the closure resolved from pinned static.crates.io fetches (no specification->package, no network), the .drv assembled + realized by td with its BUILDER the td-bootstrapped stage0 and guix/Guile SCRUBBED FROM PATH; the td-built td-subst signs+serves+fetches+verifies over loopback and reds on a tampered narinfo / corrupted nar / wrong key (durable behavioral + self-discrimination, offline); it proves FETCH-DON'T-BUILD end-to-end (td placed a path, td-subst served it signed, td fetched+restored it BYTE-IDENTICAL without building it); the td-builder CONSUMER HOOK (build-recipe with TD_SUBST_URL) FETCHES a built output (CACHE=subst, byte-identical, runs) into a fresh store instead of rebuilding it and falls back to building on a wrong key (durable behavioral + self-discrimination); and the build is reproducible by td's own double-build (durable). td now OWNS a substitute server for its built outputs AND a consumer that uses it; the external fetch of seeds runs in the network PREP (§5)."
+	echo "PASS: td built td-subst (its own substitute server) from source via td-builder build-recipe — the closure resolved from pinned static.crates.io fetches (no specification->package, no network), the .drv assembled + realized by td with its BUILDER the td-bootstrapped stage0 and guix/Guile SCRUBBED FROM PATH; the td-built td-subst signs+serves+fetches+verifies over loopback and reds on a tampered narinfo / corrupted nar / wrong key (durable behavioral + self-discrimination, offline); it proves FETCH-DON'T-BUILD end-to-end (td placed a path, td-subst served it signed, td fetched+restored it BYTE-IDENTICAL without building it); the td-builder CONSUMER HOOK (build-recipe with TD_SUBST_URL) FETCHES a built output (CACHE=subst, byte-identical, runs) into a fresh store instead of rebuilding it and falls back to building on a wrong key (durable behavioral + self-discrimination); and the build is reproducible by td's own double-build (durable). It also proves the LOCK-KEYED substitute (tasks 2b/2c): a consumer that has ONLY td-toolchain.lock independently computes the toolchain's INPUT-ADDRESSED /td/store path, fetches it (signature + StorePath + NarHash verified), and RUNS the fetched-not-built binary — signature-trusted (the toolchain is not byte-reproducible; repro-equality is task 3) — and a wrong key reds the fetch. td now OWNS a substitute server for its built outputs AND a consumer that uses it; the external fetch of seeds runs in the network PREP (§5)."
