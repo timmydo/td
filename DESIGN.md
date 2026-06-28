@@ -440,6 +440,17 @@ annotated.
   at place time; not needed by M12.
 - **M12 key distribution** (§2.7): how the target gets the verifying public key —
   decide in `plan/m12.md` when the track starts.
+- **Build admission scheduler — "kubernetes-lite"** *(wanted next; human 2026-06-28)*.
+  The per-build resource cap landed (`build-resource-caps`: opt-in `TD_BUILD_MEM_MAX`
+  → a `setrlimit(RLIMIT_DATA)` backstop + a delegated-cgroup `memory.max` RSS cap on
+  each build's sandbox child, scoped like the `nice` knob #212) contains ONE runaway
+  build so it can't OOM the host. The wanted follow-on is a real scheduler: per-build
+  memory *requests* + admission/bin-packing across ALL in-flight builds, so the loop
+  never over-commits the host in the first place. That needs what doesn't exist today
+  — a single arbiter every build flows through (the build daemon is serial AND not the
+  only path; `make -j2` and concurrent agent checks spawn builds directly) plus a
+  per-derivation resource-request field (guix `.drv`s carry none). A larger
+  architectural change; parked here so the direction isn't lost.
 
 ---
 

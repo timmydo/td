@@ -33,6 +33,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::drv::Derivation;
 use crate::sys;
@@ -85,6 +86,66 @@ fn store_path_name_in<'a>(prefix: &str, path: &'a str) -> io::Result<&'a str> {
 /// Strip the active store dir + hash, yielding the path name (`store::store_dir()`-aware).
 pub fn store_path_name(path: &str) -> io::Result<&str> {
     store_path_name_in(&store_prefix(), path)
+}
+
+/// Per-build leaf-cgroup names are unique within this process via a counter
+/// alongside the pid (the build daemon realizes drvs serially in one process).
+static CGROUP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Parse `TD_BUILD_MEM_MAX` into a per-build byte cap. Accepts a bare integer
+/// (bytes) or an integer with a `K`/`M`/`G` suffix (1024-based, case-insensitive,
+/// optional space). An absent, empty, zero, or unparseable value yields None —
+/// the cap is **OFF by default**, so the loop can never go spuriously red. A cap
+/// is reproducibility-safe like `nice`: a build that exceeds it FAILS, it never
+/// produces different bytes.
+fn parse_mem_max(raw: Option<String>) -> Option<u64> {
+    let s = raw?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = match s.chars().last().map(|c| c.to_ascii_uppercase()) {
+        Some('K') => (&s[..s.len() - 1], 1024_u64),
+        Some('M') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('G') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    let bytes = num.trim().parse::<u64>().ok()?.checked_mul(mult)?;
+    (bytes != 0).then_some(bytes)
+}
+
+/// Best-effort true-RSS cap. When the operator delegates a writable cgroup2 dir
+/// via `TD_BUILD_CGROUP`, create a per-build leaf cgroup with `memory.max = cap`
+/// and return it; the build child joins it before unsharing and the parent
+/// removes it afterward. td uses a DELEGATED cgroup the way a kubelet hands a
+/// container its own — it does not try to conjure one inside the read-only,
+/// rootless loop sandbox, where this returns None and the `setrlimit` backstop
+/// alone applies. Any failure (no delegation, RO cgroupfs, EBUSY, missing
+/// controller) warns and degrades to that backstop.
+fn setup_build_cgroup(cap: u64) -> Option<PathBuf> {
+    let base = std::env::var("TD_BUILD_CGROUP").ok().filter(|s| !s.is_empty())?;
+    let base = PathBuf::from(base);
+    if !base.is_dir() {
+        sys::warn(b"td-builder: TD_BUILD_CGROUP is not a directory; memory cap uses the rlimit backstop\n");
+        return None;
+    }
+    // The memory controller must be delegated to children for the leaf's
+    // memory.max to bind; harmless if already enabled (an empty delegated base).
+    let _ = fs::write(base.join("cgroup.subtree_control"), "+memory");
+    let seq = CGROUP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let leaf = base.join(format!("td-build-{}-{}", std::process::id(), seq));
+    if let Err(e) = fs::create_dir(&leaf) {
+        if e.kind() != io::ErrorKind::AlreadyExists {
+            sys::warn(b"td-builder: could not create build cgroup; memory cap uses the rlimit backstop\n");
+            return None;
+        }
+    }
+    if fs::write(leaf.join("memory.max"), cap.to_string()).is_err() {
+        sys::warn(b"td-builder: could not set cgroup memory.max; memory cap uses the rlimit backstop\n");
+        let _ = fs::remove_dir(&leaf);
+        return None;
+    }
+    Some(leaf)
 }
 
 /// Run the drv's builder inside the namespace sandbox. `closure` lists every
@@ -236,6 +297,14 @@ pub fn build(
     let group_body = format!("root:x:0:\nnixbld:x:{GUEST_GID}:\nnogroup:x:65534:\n");
     let build_dir_owned = build_dir.clone();
 
+    // Per-build resource caps (opt-in via TD_BUILD_MEM_MAX; OFF by default).
+    // The cgroup leaf — when an operator delegates one via TD_BUILD_CGROUP — is
+    // a true RSS cap; the setrlimit(RLIMIT_DATA) backstop applied in pre_exec
+    // works everywhere (rootless, CI). Both are inherited onto the PID-1 builder.
+    let mem_cap = parse_mem_max(std::env::var("TD_BUILD_MEM_MAX").ok());
+    let cgroup_leaf = mem_cap.and_then(setup_build_cgroup);
+    let cgroup_procs = cgroup_leaf.as_ref().map(|d| d.join("cgroup.procs"));
+
     let mut cmd = Command::new(&drv.builder);
     cmd.args(&drv.args);
     cmd.env_clear();
@@ -262,6 +331,24 @@ pub fn build(
             sys::set_pdeathsig(sys::SIGKILL)?;
             if sys::getppid() != parent {
                 sys::exit_group(0);
+            }
+            // Per-build memory caps, applied BEFORE the unshare (host cgroupfs is
+            // still writable as the invoking user) and BEFORE the fork (so the
+            // PID-1 builder and its whole tree inherit them). Best-effort: a cap
+            // can only make a build FAIL, so a setup hiccup warns and continues
+            // rather than killing the build — never silently weakens isolation.
+            if let Some(cap) = mem_cap {
+                // True RSS cap: join the delegated leaf cgroup (memory.max set in
+                // the parent). cgroup membership survives the unshare+fork below.
+                if let Some(procs) = &cgroup_procs {
+                    if fs::write(procs, format!("{}\n", std::process::id())).is_err() {
+                        sys::warn(b"td-builder: could not join build cgroup; rlimit backstop only\n");
+                    }
+                }
+                // Portable backstop (rootless, CI): cap the data segment.
+                if sys::set_rlimit(sys::RLIMIT_DATA, cap, cap).is_err() {
+                    sys::warn(b"td-builder: could not set RLIMIT_DATA build memory cap\n");
+                }
             }
             // New USER + PID + mount + net + IPC + UTS namespaces. NEWPID rides in
             // the SAME unshare as NEWUSER so the new PID namespace is owned by the
@@ -352,6 +439,11 @@ pub fn build(
     let status = cmd
         .status()
         .map_err(|e| err(format!("spawning builder {}: {e}", drv.builder)))?;
+    // The build tree has exited, so the leaf cgroup is empty — tear it down
+    // (best-effort) whether the build passed or failed, before any early return.
+    if let Some(leaf) = &cgroup_leaf {
+        let _ = fs::remove_dir(leaf);
+    }
     if !status.success() {
         return Err(err(format!(
             "builder for {drv_path} failed: {status}"
@@ -744,6 +836,24 @@ pub fn host_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_mem_max_handles_suffixes_and_off_by_default() {
+        // OFF by default — the whole point of the safe default (no spurious loop reds).
+        assert_eq!(parse_mem_max(None), None, "unset -> no cap");
+        assert_eq!(parse_mem_max(Some("".into())), None, "empty -> no cap");
+        assert_eq!(parse_mem_max(Some("   ".into())), None, "blank -> no cap");
+        assert_eq!(parse_mem_max(Some("garbage".into())), None, "garbage -> no cap");
+        assert_eq!(parse_mem_max(Some("0".into())), None, "0 -> no cap (opt out)");
+        // Bare bytes and 1024-based suffixes (case-insensitive, optional space).
+        assert_eq!(parse_mem_max(Some("4096".into())), Some(4096));
+        assert_eq!(parse_mem_max(Some(" 512K ".into())), Some(512 * 1024));
+        assert_eq!(parse_mem_max(Some("2m".into())), Some(2 * 1024 * 1024));
+        assert_eq!(parse_mem_max(Some("8G".into())), Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(parse_mem_max(Some("4 G".into())), Some(4 * 1024 * 1024 * 1024));
+        // Overflow on the multiply degrades to "no cap" rather than a wrap.
+        assert_eq!(parse_mem_max(Some("999999999999G".into())), None);
+    }
 
     #[test]
     fn store_path_name_strips_hash() {
