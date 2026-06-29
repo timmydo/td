@@ -35,19 +35,19 @@ load_stage0() {
   test -x "$TB" || { echo "FAIL: stage0 td-builder not executable at $TB" >&2; return 1; }
 }
 
-# load_ts_eval — export TD_TS_EVAL = the td-BUILT td-ts-eval, so the gnu gates EVALUATE
-# their recipes with td's OWN boa evaluator instead of `guix build (system td-ts)
-# td-ts-eval` (move-off-Guile §5 brick 4b). td-ts-eval is built ONCE by the build-recipes
-# prelude (tests/ts-eval-tool.sh, content-addressed cached) which writes the sentinel this
-# reads. The td-built evaluator produces byte-identical JSON to guix's (rust-ts-eval
-# oracle), so outputs are unchanged — only WHO evaluates changes. Only the prelude
-# resolves the guix SEED (to build td-ts-eval); the gnu gates no longer touch it.
-load_ts_eval() {
-  _tse="${TD_TSEVAL_BASE:-$(pwd)/.td-build-cache/rust-ts-eval}/tseval-path"
-  test -s "$_tse" || { echo "FAIL: no td-built td-ts-eval sentinel ($_tse) — the build-recipes ts-eval prelude must run first" >&2; return 1; }
-  TD_TS_EVAL=`cat "$_tse"`
-  export TD_TS_EVAL
-  test -x "$TD_TS_EVAL" || { echo "FAIL: td-built td-ts-eval not executable at $TD_TS_EVAL" >&2; return 1; }
+# load_recipe_eval — export TD_RECIPE_EVAL = td's OWN recipe/spec evaluator (the
+# dependency-free Rust `td-recipe` crate, recipes/), built ONCE by the build-recipes
+# prelude (tests/recipe-eval-tool.sh) into .td-build-cache/recipe-eval, whose
+# sentinel this reads. This REPLACES the boa td-recipe-eval on the build path
+# (rust-recipe-surface): recipes/specs are declared in Rust now, so the loop emits
+# their JSON with td-recipe-eval (the SAME JSON boa produced — proven canon-equal by
+# recipe-rs) instead of transpiling+evaluating `.ts` through tsgo+boa.
+load_recipe_eval() {
+  _re="${TD_RECIPE_EVAL_BASE:-$(pwd)/.td-build-cache/recipe-eval}/recipe-eval-path"
+  test -s "$_re" || { echo "FAIL: no td-recipe-eval sentinel ($_re) — the build-recipes prelude must run first" >&2; return 1; }
+  TD_RECIPE_EVAL=`cat "$_re"`
+  export TD_RECIPE_EVAL
+  test -x "$TD_RECIPE_EVAL" || { echo "FAIL: td-recipe-eval not executable at $TD_RECIPE_EVAL" >&2; return 1; }
 }
 
 # cached_build SPEC LOCK  — emit the recipe, build via build-recipe with caching.
@@ -55,9 +55,10 @@ load_ts_eval() {
 cached_build() {
   _spec="$1"; _lock="$2"
   sd="$CACHE/$_spec"; mkdir -p "$sd/b" "$sd/tmp"
-  sh tests/ts-emit.sh "tests/ts/recipe-$_spec.ts" > "$sd/recipe.json" \
-    || { echo "FAIL: ts-emit $_spec" >&2; return 1; }
-  test -s "$sd/recipe.json" || { echo "ERROR: ts-emit produced no JSON for $_spec" >&2; return 1; }
+  : "${TD_RECIPE_EVAL:?load_recipe_eval must run before cached_build (TD_RECIPE_EVAL unset)}"
+  "$TD_RECIPE_EVAL" emit "$_spec" > "$sd/recipe.json" \
+    || { echo "FAIL: td-recipe-eval emit $_spec" >&2; return 1; }
+  test -s "$sd/recipe.json" || { echo "ERROR: td-recipe-eval produced no JSON for $_spec" >&2; return 1; }
   rm -f "$sd/b/"*.drv                       # drop any stale drv; build-recipe rewrites the current one
   # Build with the STAGE0 builder override (brick 3): TD_BUILDER_* (set by load_stage0)
   # ride through `env -i` so the assembled drv's builder is the td-bootstrapped stage0,

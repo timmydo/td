@@ -27,12 +27,9 @@ BUILD_GATES += rust-vendor
 rust-vendor:
 	@echo ">> rust-vendor: td builds td-vendor-demo (depends on itoa + ryu) via build-recipe with VENDORED deps (offline, guix/Guile off PATH); it runs + is reproducible"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; tb="$$TB"; \
-	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
-	echo "  [DURABLE structural] ts-emit evaluates with td's OWN td-ts-eval ($$TD_TS_EVAL) — not the guix-built one (brick 4c)"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; tb="$$TB"; \
+	case "$$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($$TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
+	echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($$TD_RECIPE_EVAL) — not the guix-built one (brick 4c)"; \
 	lock0="$(CURDIR)/tests/td-vendor-demo.lock"; \
 	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
@@ -46,7 +43,7 @@ rust-vendor:
 	eval "$$srcinfo"; \
 	test -n "$$src" -a -d "$$srcstore/`basename "$$src"`" || { echo "ERROR: td interned no vendor-demo source tree (store-add-recursive)" >&2; exit 1; }; \
 	lock="$$scratch/td-vendor-demo.lock"; { cat "$$lock0"; echo "td-vendor-demo-source $$src"; } > "$$lock"; \
-	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-vendor-demo.ts" > "$$scratch/td-vendor-demo.json"; \
+	sh tests/recipe-emit.sh td-vendor-demo > "$$scratch/td-vendor-demo.json"; \
 	test -s "$$scratch/td-vendor-demo.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
 	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/td-vendor-demo.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe vendored build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \

@@ -18,10 +18,9 @@ BUILD_GATES += rust-youki
 rust-youki:
 	@echo ">> rust-youki: td builds 'youki' (0.6.0, 663 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); youki runs as an OCI runtime CLI; reproducible; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
-	nsout=`sh tests/crate-free-build.sh youki youki-0.6.0 tests/youki.lock youki-source tests/ts/recipe-youki.ts` || exit 1; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
+	export GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
+	nsout=`sh tests/crate-free-build.sh youki youki-0.6.0 tests/youki.lock youki-source youki` || exit 1; \
 	eval "$$nsout"; ns="$$NS"; \
 	test -x "$$ns/bin/youki" || { echo "FAIL: no youki binary at $$ns/bin/youki" >&2; exit 1; }; \
 	"$$ns/bin/youki" --version 2>&1 | grep -qi 'youki' || { echo "FAIL: youki --version did not report youki" >&2; "$$ns/bin/youki" --version >&2 || true; exit 1; }; \

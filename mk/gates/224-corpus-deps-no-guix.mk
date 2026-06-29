@@ -31,9 +31,6 @@ BUILD_GATES += corpus-deps-no-guix
 corpus-deps-no-guix:
 	@echo ">> corpus-deps-no-guix: td builds libsigsegv + libunistring + pcre2 + ncurses + readline via build-recipe (no guix/Guile in the build path); each links+runs from td's own output, reproducible, distinct from guix"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/pcre2-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
@@ -43,9 +40,9 @@ corpus-deps-no-guix:
 	test -n "$$lkh" || { echo "ERROR: could not resolve linux-libre-headers for the link-test" >&2; exit 1; }; \
 	ncs=`for p in $$($(GUIX) build ncurses 2>/dev/null); do [ -f "$$p/lib/libncurses.so" ] && echo "$$p/lib" && break; done`; \
 	test -n "$$ncs" || { echo "ERROR: could not resolve ncurses for readline's termcap link-test" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
-	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
-	echo "  [DURABLE structural] recipes evaluate with td's OWN td-ts-eval ($$TD_TS_EVAL) — not the guix-built one (brick 4b)"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	case "$$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($$TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
+	echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($$TD_RECIPE_EVAL) — not the guix-built one (brick 4b)"; \
 	for spec in $(deps_SPECS); do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \

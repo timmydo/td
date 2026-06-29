@@ -430,6 +430,11 @@ impl Recipe {
         self
     }
 
+    /// The build system as its JSON/lowering token ("gnu"/"rust"/"cmake").
+    pub fn build_system_name(&self) -> &'static str {
+        self.build_system.as_str()
+    }
+
     pub fn to_json(&self) -> Json {
         let mut o = vec![
             ("name".into(), Json::Str(self.name.clone())),

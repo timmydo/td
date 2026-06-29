@@ -1117,9 +1117,8 @@ seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$ROO
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
 for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done
 chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
-# emit the hello recipe (td-ts-eval is provided by the build-recipes prelude), then build it.
-TD_TSGO=`sh tests/tsgo.sh`; export TD_TSGO TD_TSDIR="$ROOT/tests/ts"; load_ts_eval || fail "brick8: no td-ts-eval"
-sh tests/ts-emit.sh tests/ts/recipe-hello.ts > "$b8/hello.json" || fail "brick8: ts-emit hello"
+# emit the hello recipe (td-recipe-eval is provided by the build-recipes prelude), then build it.
+sh tests/recipe-emit.sh hello > "$b8/hello.json" || fail "brick8: ts-emit hello"
 mkdir -p "$b8/hb" "$b8/tmp"; cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
 env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \

@@ -36,11 +36,9 @@ bootstrap-build:
 	@echo ">> bootstrap-build: td places its stage0 builder into its OWN store and the loop BUILDS hello with it (the builder-of-record is a binary guix never produced) — runs, reproducible, distinct from guix"
 	@set -euo pipefail; \
 	scratch="$(CURDIR)/.td-build-cache/bootstrap-build"; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
-	tsgo=`sh tests/tsgo.sh`; \
-	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
 	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
-	test -x "$$ev" -a -x "$$tb" -a -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo / ts-eval / td-builder" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	TD_RECIPE_EVAL=`TD_GUIX="$(GUIX)" sh tests/recipe-eval-tool.sh "$(CURDIR)/.td-build-cache/recipe-eval"`; export TD_RECIPE_EVAL; \
+	test -x "$$tb" -a -x "$$TD_RECIPE_EVAL" || { echo "ERROR: could not resolve td-builder / td-recipe-eval" >&2; exit 1; }; \
 	lock="$(CURDIR)/tests/hello-no-guix.lock"; \
 	test -s "$$lock" || { echo "ERROR: no lock $$lock" >&2; exit 1; }; \
 	grep ' /gnu/store/' "$$lock" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize hello's seed (regenerate locks on a channel bump)" >&2; exit 1; }; \
@@ -65,8 +63,8 @@ bootstrap-build:
 	echo "  td placed stage0 at $$Cb (distinct from guix-tb $$gtb)"; \
 	echo ">> build hello with the STAGE0 builder override, guix/Guile scrubbed from PATH"; \
 	b="$$scratch/b"; mkdir -p "$$b" "$$scratch/tmp"; \
-	sh tests/ts-emit.sh "tests/ts/recipe-hello.ts" > "$$scratch/recipe.json" || { echo "FAIL: ts-emit hello" >&2; exit 1; }; \
-	test -s "$$scratch/recipe.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
+	sh tests/recipe-emit.sh hello > "$$scratch/recipe.json" || { echo "FAIL: recipe-emit hello" >&2; exit 1; }; \
+	test -s "$$scratch/recipe.json" || { echo "ERROR: recipe-emit produced no JSON" >&2; exit 1; }; \
 	if env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" \
 	     TD_BUILDER_PATH="$$Cb" TD_BUILDER_STORE="$$tdstore" TD_BUILDER_DB="$$bdb" \
 	     "$$tb" build-recipe "$$scratch/recipe.json" "$$lock" "$$b" /var/guix/db/db.sqlite > "$$scratch/bout" 2>"$$scratch/err"; then :; \

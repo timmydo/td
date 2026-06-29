@@ -10,7 +10,7 @@
 # SCRUBBED FROM PATH (proving no guix process) and asserts: behavioral (hello
 # greets), td-built (a real /gnu/store td hello under the cache, NOT guix's path),
 # load-bearing (unknown package -> error, no guix fallback); a REMOVABLE guix
-# differential (distinct store path, same greeting). Build gate (stage0 + td-ts-eval
+# differential (distinct store path, same greeting). Build gate (stage0 + td-recipe-eval
 # via the build-recipes prelude) → BUILD_GATES + HEAVY_GATES.
 HEAVY_GATES += td-shell
 BUILD_GATES += td-shell

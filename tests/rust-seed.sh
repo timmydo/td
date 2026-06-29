@@ -6,8 +6,8 @@
 # the toolchain td can't self-build (no rust-from-source; "it takes rust to build rust").
 #
 # Flow (composes the existing primitives — no builder code change):
-#   - load_stage0 places the cargo-built stage0 td-builder (the build DRIVER); load_ts_eval
-#     gives td's own td-ts-eval; the source is the LIVE builder/ tree interned by td's own
+#   - load_stage0 places the cargo-built stage0 td-builder (the build DRIVER); load_recipe_eval
+#     gives td's own td-recipe-eval; the source is the LIVE builder/ tree interned by td's own
 #     store-add-recursive (tests/intern-src.sh) — NOT frozen (it changes every edit).
 #   - tools/warm-seed.sh captures + unpacks the RUST TOOLCHAIN closure (tests/td-builder-rust.lock
 #     roots ∪ stage0's runtime refs) ONCE into a reusable content-addressed cache (the #135
@@ -36,16 +36,14 @@ set -eu
 fail() { echo "FAIL: $*" >&2; exit 1; }
 root=$(pwd)
 
-tsgo=`sh tests/tsgo.sh` || fail "could not resolve td-tsgo"
-test -n "$tsgo" -a -x "$tsgo/lib/tsc" || fail "td-tsgo not usable ($tsgo)"
-export TD_TSGO="$tsgo" TD_TSDIR="$root/tests/ts"
+export 
 
 . tests/cache-lib.sh
 export TD_STAGE0_BASE="$root/.td-build-cache/stage0"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-load_ts_eval || fail "no td-built td-ts-eval (the build-recipes prelude must run first)"
-case "$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) fail "TD_TS_EVAL is not td's own build ($TD_TS_EVAL)" ;; esac
-echo ">> td tools (guix-free): stage0=$TB  ts-eval=$TD_TS_EVAL"
+load_recipe_eval || fail "no td-built td-recipe-eval (the build-recipes prelude must run first)"
+case "$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) fail "TD_RECIPE_EVAL is not td's own build ($TD_RECIPE_EVAL)" ;; esac
+echo ">> td tools (guix-free): stage0=$TB  ts-eval=$TD_RECIPE_EVAL"
 
 lock0="$root/tests/td-builder-rust.lock"
 test -s "$lock0" || fail "no rust lock $lock0"
@@ -83,7 +81,7 @@ ns=`grep -c . "$SEED_MANIFEST"`
 echo "   warmed the RUST TOOLCHAIN seed: $ns paths, cached at $SEED_STORE (no per-run re-capture)"
 
 # --- ts-emit the td-builder recipe (buildSystem rust), Guile-free ---------------------
-sh tests/ts-emit.sh "$root/tests/ts/recipe-td-builder.ts" > "$scratch/td-builder.json" || fail "ts-emit td-builder"
+sh tests/recipe-emit.sh td-builder > "$scratch/td-builder.json" || fail "ts-emit td-builder"
 grep -q '"buildSystem":"rust"' "$scratch/td-builder.json" || fail "recipe JSON is not buildSystem rust"
 
 # --- Build td-builder from the UNPACKED SEED ONLY (toolchain) + the interned source ----

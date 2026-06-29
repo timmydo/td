@@ -3,7 +3,7 @@
 # (move-off-Guile §5 enforcement; sibling to tests/guix-dependence.scm).
 #
 # move-off-Guile (§5) removes guix from td's BUILD path: the build TOOL
-# (td-builder->stage0), the EVALUATOR (td-ts-eval), the transpiler (node->td-tsgo).
+# (td-builder->stage0), the EVALUATOR (td-recipe-eval), the transpiler (node->td-tsgo).
 # The principle behind every step: an external seed is a pinned FIXED-OUTPUT FETCH
 # the loop realises and td PLACES (store-add-recursive) — NOT a guix
 # `(build-system ...)` package td asks the guix daemon to build via

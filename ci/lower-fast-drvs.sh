@@ -45,12 +45,8 @@ $GUIX build -d $tools
 lower $GUIX repl -L . ci/channel-instance-drv.scm
 sed -n 's/^CHANNEL_DRV=//p' "$tmp"
 
-# --- The `ts` rung's seed: the pinned tsgo tarball (the native TypeScript 7 compiler).
-# Lowering the origin puts its FOD output (= the tests/td-tsgo.lock pin path) into the
-# fast-image closure, so a rebuilt image carries it WARM and check-fast's host
-# warm-tsgo.sh no-ops on the runner (move-off-Guile §5 consumer-swap). node + the JS
-# td-typescript were retired in #111 (tsgo-migrate) — no longer in the fast tier.
-$GUIX build -L . -d -e '(@ (system td-ts) td-tsgo-tarball)'
+# (The `ts`/tsgo seed is gone: the TypeScript surface was retired — recipes/specs
+# are declared in Rust now (rust-recipe-surface), so check-fast carries no tsgo.)
 
 # --- The SYSTEM and OCI-image derivations the cheap rungs lower.
 lower $GUIX repl -L . ci/lower-fast-drvs.scm

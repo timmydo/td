@@ -16,10 +16,9 @@ BUILD_GATES += rust-coreutils
 rust-coreutils:
 	@echo ">> rust-coreutils: td builds uutils-coreutils (coreutils 0.9.0, 507 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); the multicall binary dispatches util subcommands; reproducible; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
-	nsout=`sh tests/crate-free-build.sh uutils coreutils-0.9.0 tests/uutils-coreutils.lock uutils-source tests/ts/recipe-uutils.ts` || exit 1; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
+	export GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
+	nsout=`sh tests/crate-free-build.sh uutils coreutils-0.9.0 tests/uutils-coreutils.lock uutils-source uutils` || exit 1; \
 	eval "$$nsout"; ns="$$NS"; \
 	bin="$$ns/bin/coreutils"; \
 	test -x "$$bin" || { echo "FAIL: no coreutils multicall binary at $$bin" >&2; exit 1; }; \

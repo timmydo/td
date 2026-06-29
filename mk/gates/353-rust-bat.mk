@@ -16,10 +16,9 @@ BUILD_GATES += rust-bat
 rust-bat:
 	@echo ">> rust-bat: td builds 'bat' (0.25.0, 207 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); bat prints a file; reproducible; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
-	nsout=`sh tests/crate-free-build.sh bat bat-0.25.0 tests/bat.lock bat-source tests/ts/recipe-bat.ts` || exit 1; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
+	export GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
+	nsout=`sh tests/crate-free-build.sh bat bat-0.25.0 tests/bat.lock bat-source bat` || exit 1; \
 	eval "$$nsout"; ns="$$NS"; \
 	test -x "$$ns/bin/bat" || { echo "FAIL: no bat binary at $$ns/bin/bat" >&2; exit 1; }; \
 	btmp="$(CURDIR)/.td-build-cache/bat-crate-free/btmp"; rm -rf "$$btmp"; mkdir -p "$$btmp"; \

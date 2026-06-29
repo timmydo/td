@@ -17,10 +17,9 @@ BUILD_GATES += rust-sd
 rust-sd:
 	@echo ">> rust-sd: td builds 'sd' (1.0.0, 111 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); sd find-and-replaces; reproducible; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
-	nsout=`sh tests/crate-free-build.sh sd sd-1.0.0 tests/sd.lock sd-source tests/ts/recipe-sd.ts` || exit 1; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
+	export GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
+	nsout=`sh tests/crate-free-build.sh sd sd-1.0.0 tests/sd.lock sd-source sd` || exit 1; \
 	eval "$$nsout"; ns="$$NS"; \
 	test -x "$$ns/bin/sd" || { echo "FAIL: no sd binary at $$ns/bin/sd" >&2; exit 1; }; \
 	got=`printf 'hello world\n' | "$$ns/bin/sd" 'world' 'there'`; \

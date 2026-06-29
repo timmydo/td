@@ -27,11 +27,11 @@
 #     td-feed vendors, the index's recorded sha256 equals the vendored .crate's content
 #     sha256 — the mirror would serve the same content-addressed bytes td built against.
 #   [DURABLE structural] the .drv builder is the td-bootstrapped stage0 (not the guix-built
-#     td-builder); ts-emit ran under td's OWN td-ts-eval.
+#     td-builder); ts-emit ran under td's OWN td-recipe-eval.
 #   [DURABLE repro] td-builder check double-build agrees the build is reproducible.
 HEAVY_GATES += td-feed
 # A BUILD_GATE (like rust-fetch): ordered AFTER the parallel build-recipes phase so its
-# 73-crate cargo build doesn't oversubscribe cores, and it depends on the td-ts-eval that
+# 73-crate cargo build doesn't oversubscribe cores, and it depends on the td-recipe-eval that
 # build-recipes' prelude builds. Not in BUILD_SPECS — the source is interned at gate time.
 BUILD_GATES += td-feed
 td-feed:
@@ -43,12 +43,9 @@ td-feed:
 	miss=0; for c in "$$vendor"/*.crate; do sha=`sha256sum "$$c" | cut -d' ' -f1`; grep -qF "$$sha" "$(CURDIR)/feed/Cargo.lock" || { echo "FAIL: crate `basename $$c` sha $$sha is NOT pinned in feed/Cargo.lock" >&2; miss=$$((miss + 1)); }; done; \
 	test "$$miss" -eq 0 || { echo "FAIL: $$miss vendored crate(s) not pinned by feed/Cargo.lock" >&2; exit 1; }; \
 	echo "  [DURABLE supply-chain] all $$ncrate vendored crates' sha256 are checksums pinned in feed/Cargo.lock (upstream crates.io hash — the guix-free oracle; td-feed shares td-fetch's closure exactly)"; \
-	tsgo=`sh tests/tsgo.sh`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo (the TS front-end compiler)" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; tb="$$TB"; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
-	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
-	echo "  [DURABLE structural] ts-emit evaluates with td's OWN td-ts-eval ($$TD_TS_EVAL)"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; tb="$$TB"; \
+	case "$$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($$TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
+	echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($$TD_RECIPE_EVAL)"; \
 	lock0="$(CURDIR)/tests/td-feed.lock"; \
 	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
@@ -66,7 +63,7 @@ td-feed:
 	test -n "$$vsrc" -a -n "$$vstore" -a -n "$$vdb" || { echo "ERROR: vendor intern produced no path" >&2; exit 1; }; \
 	echo "  [DURABLE structural] td interned the feed source + the crate set as content-addressed trees (store-add-recursive, no daemon): vendor $$vsrc"; \
 	lock="$$scratch/seed.lock"; { grep -v '\.crate ' "$$lock0" | grep ' /gnu/store/'; echo "td-feed-source $$src"; } > "$$lock"; \
-	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-feed.ts" > "$$scratch/feed.json"; \
+	sh tests/recipe-emit.sh td-feed > "$$scratch/feed.json"; \
 	test -s "$$scratch/feed.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/sd"; \
 	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/feed.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" "$$vsrc" "$$vstore" "$$vdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe td-feed build (guix-free crates):" >&2; tail -40 "$$scratch/err" >&2; exit 1; }; \

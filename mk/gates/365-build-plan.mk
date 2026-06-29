@@ -14,33 +14,30 @@ HEAVY_GATES += build-plan
 build-plan:
 	@echo ">> build-plan: --auto chains td-built deps into downstream builds (subjects DERIVED from the recipe graph, no manifest) — each subject's .drv references td's deps (NOT guix's), runs, reproducibly, at distinct paths"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
-	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
 	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
-	test -x "$$ev" -a -x "$$tb" -a -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo / ts-eval / td-builder" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	TD_RECIPE_EVAL=`TD_GUIX="$(GUIX)" sh tests/recipe-eval-tool.sh "$(CURDIR)/.td-build-cache/recipe-eval"`; export TD_RECIPE_EVAL; \
+	test -x "$$tb" -a -x "$$TD_RECIPE_EVAL" || { echo "ERROR: could not resolve td-builder / td-recipe-eval" >&2; exit 1; }; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/grep-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 	root="$(CURDIR)/.td-build-cache/build-plan"; jd="$$root/json"; mkdir -p "$$jd" "$$root/tmp"; \
 	owned=""; \
-	for f in tests/ts/recipe-*.ts; do \
-	  case "$$f" in *perturbed*) continue;; esac; \
-	  s=`basename "$$f" .ts`; s=$${s#recipe-}; \
+	for s in `"$$TD_RECIPE_EVAL" list`; do \
+	  case "$$s" in *perturbed*) continue;; esac; \
 	  test -f "$(CURDIR)/tests/$$s-no-guix.lock" || continue; \
-	  sh tests/ts-emit.sh "$$f" > "$$jd/$$s.json"; \
-	  test -s "$$jd/$$s.json" || { echo "ERROR: ts-emit produced no JSON for $$s" >&2; exit 1; }; \
+	  sh tests/recipe-emit.sh "$$s" > "$$jd/$$s.json"; \
+	  test -s "$$jd/$$s.json" || { echo "ERROR: recipe-emit produced no JSON for $$s" >&2; exit 1; }; \
 	  owned="$$owned $$s"; \
 	done; \
 	subjects=""; \
 	for s in $$owned; do \
-	  inp=`grep -oE 'inputs:[[:space:]]*\[[^]]*\]' "$(CURDIR)/tests/ts/recipe-$$s.ts" | grep -oE '"[^"]*"' | tr -d '"' || true`; \
+	  inp=`grep -oE '"inputs":\[[^]]*\]' "$$jd/$$s.json" | sed 's/^"inputs"://' | grep -oE '"[^"]*"' | tr -d '"' || true`; \
 	  for i in $$inp; do if echo " $$owned " | grep -q " $$i "; then subjects="$$subjects $$s"; break; fi; done; \
 	done; \
 	test -n "$$subjects" || { echo "ERROR: derived no build-plan subjects from the recipe graph" >&2; exit 1; }; \
 	echo "  subjects derived from the recipe graph:$$subjects"; \
 	for S in $$subjects; do \
-	  edges=`grep -oE 'inputs:[[:space:]]*\[[^]]*\]' "$(CURDIR)/tests/ts/recipe-$$S.ts" | grep -oE '"[^"]*"' | tr -d '"' | while read i; do echo " $$owned " | grep -q " $$i " && echo "$$i"; done`; \
+	  edges=`grep -oE '"inputs":\[[^]]*\]' "$$jd/$$S.json" | sed 's/^"inputs"://' | grep -oE '"[^"]*"' | tr -d '"' | while read i; do echo " $$owned " | grep -q " $$i " && echo "$$i"; done`; \
 	  { grep ' /gnu/store/' "$(CURDIR)/tests/$$S-no-guix.lock" | grep -v 'td-recipe-output'; for d in $$edges; do grep ' /gnu/store/' "$(CURDIR)/tests/$$d-no-guix.lock" 2>/dev/null; done; } | sed 's/^[^ ]* //' | sort -u | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize guix seeds for $$S" >&2; exit 1; }; \
 	  env -i HOME="$$root" TMPDIR="$$root/tmp" PATH="$$cu/bin" "$$tb" build-plan --auto "$$S" "$$jd" "$(CURDIR)/tests" /var/guix/db/db.sqlite "$$root" > "$$root/out-$$S" 2>"$$root/err-$$S" || { echo "FAIL: build-plan --auto $$S (guix/Guile off PATH):" >&2; tail -30 "$$root/err-$$S" >&2; exit 1; }; \
 	  td_S=`sed -n "s/^STEP $$S //p" "$$root/out-$$S"`; \

@@ -85,17 +85,17 @@ config JSON (tsc -> boa -> system()).~%" name)
   (let* ((oracle    (system-drv td-system))
          (compiled  (system-drv
                      (td-config->operating-system
-                      (json->td-config (env-json "TD_TS_DEFAULT_JSON")))))
+                      (json->td-config (env-json "TD_SPEC_DEFAULT_JSON")))))
          (perturbed (system-drv
                      (td-config->operating-system
-                      (json->td-config (env-json "TD_TS_PERTURBED_JSON")))))
+                      (json->td-config (env-json "TD_SPEC_PERTURBED_JSON")))))
          ;; A generation system authored in TS — exercises the structured fields
          ;; (generation + persistent-paths) now on the surface. It must DIVERGE
          ;; from the (generation #f) oracle, proving the bridge maps those fields
          ;; rather than ignoring them (else authoring them would be cosmetic).
          (gen       (system-drv
                      (td-config->operating-system
-                      (json->td-config (env-json "TD_TS_GEN_JSON")))))
+                      (json->td-config (env-json "TD_SPEC_GEN_JSON")))))
          (converge?     (string=? oracle compiled))
          (discriminate? (not (string=? oracle perturbed)))
          (gen-wired?    (not (string=? oracle gen))))

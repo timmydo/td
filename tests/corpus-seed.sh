@@ -17,11 +17,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 . tests/cache-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-load_ts_eval || fail "no td-built td-ts-eval (the build-recipes prelude must run first)"
-TD_TSGO=`sh tests/tsgo.sh` || fail "could not resolve td-tsgo"
+load_recipe_eval || fail "no td-built td-recipe-eval (the build-recipes prelude must run first)"
 TD_TSDIR=tests/ts
-export TD_TSGO TD_TSDIR
-echo ">> td tools (guix-free): stage0=$TB  ts-eval=$TD_TS_EVAL"
+echo ">> td tools (guix-free): stage0=$TB  ts-eval=$TD_RECIPE_EVAL"
 
 work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
@@ -46,11 +44,11 @@ echo "   one shared warmed seed (`grep -c . "$work/roots"` roots): $SEED_STORE"
 # Build a leaf corpus spec from the shared seed; print its output dir.
 build_from_seed() {
   _s="$1"
-  sh tests/ts-emit.sh "tests/ts/recipe-$_s.ts" > "$work/$_s.json" || fail "ts-emit $_s"
+  sh tests/recipe-emit.sh $_s > "$work/$_s.json" || fail "ts-emit $_s"
   mkdir -p "$work/$_s-b"
   env -i HOME="$work" TMPDIR="$work/tmp" PATH="$cu/bin:$sh_/bin" \
     TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-    TD_TSGO="$TD_TSGO" TD_TS_EVAL="$TD_TS_EVAL" TD_TSDIR="$TD_TSDIR" \
+    TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
     TD_SEED_STORE="$SEED_STORE" TD_SEED_DB="$SEED_DB" \
     "$TB" build-recipe "$work/$_s.json" "tests/$_s-no-guix.lock" "$work/$_s-b" "$SEED_DB" \
     > "$work/$_s.out" 2>"$work/$_s.err" || { tail -15 "$work/$_s.err" >&2; fail "build $_s from the seed"; }

@@ -21,10 +21,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 . tests/cache-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-load_ts_eval || fail "no td-built td-ts-eval (the build-recipes prelude must run first)"
-TD_TSGO=`sh tests/tsgo.sh` || fail "could not resolve td-tsgo"
+load_recipe_eval || fail "no td-built td-recipe-eval (the build-recipes prelude must run first)"
 TD_TSDIR=tests/ts
-export TD_TSGO TD_TSDIR
 echo ">> td-builder under test (stage0, guix-free): $TB"
 
 work=`mktemp -d`
@@ -35,11 +33,11 @@ cu=`grep -- '-coreutils-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1
 # Build a leaf recipe with td-builder (no guix process); print its td store output dir.
 build_pkg() {
   _s="$1"
-  sh tests/ts-emit.sh "tests/ts/recipe-$_s.ts" > "$work/$_s.json" || fail "ts-emit $_s"
+  sh tests/recipe-emit.sh $_s > "$work/$_s.json" || fail "ts-emit $_s"
   mkdir -p "$work/$_s-b"
   env -i HOME="$work" TMPDIR="$work/tmp" PATH="$cu/bin" \
     TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-    TD_TSGO="$TD_TSGO" TD_TS_EVAL="$TD_TS_EVAL" TD_TSDIR="$TD_TSDIR" \
+    TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
     "$TB" build-recipe "$work/$_s.json" "tests/$_s-no-guix.lock" "$work/$_s-b" /var/guix/db/db.sqlite \
     > "$work/$_s.out" 2>"$work/$_s.err" || { tail -15 "$work/$_s.err" >&2; fail "build $_s"; }
   _o=`sed -n 's/^OUT=out //p' "$work/$_s.out"`

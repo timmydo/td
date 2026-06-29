@@ -1,7 +1,7 @@
 # guix-surface — ratchet td's guix-as-PACKAGER seed surface toward zero
 # (move-off-Guile §5 ENFORCEMENT; sibling to the guix-dependence census 070).
 # move-off-Guile removes guix from td's BUILD path: the build tool
-# (td-builder->stage0), the evaluator (td-ts-eval), the transpiler (node->td-tsgo).
+# (td-builder->stage0), the evaluator (td-recipe-eval), the transpiler (node->td-tsgo).
 # The standing rule it makes enforceable: a new external seed is a pinned
 # fixed-output FETCH the loop realises + td PLACES (store-add-recursive), NEVER a
 # guix (build-system ...) package td asks the daemon to build by resolving

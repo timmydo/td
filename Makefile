@@ -136,24 +136,18 @@ check: $(CHEAP_GATES) build-recipes $(HEAVY_GATES)
 build-recipes:
 	@echo ">> build-recipes: realize + reproducibility-check $(words $(BUILD_SPECS)) recipes in parallel into .td-build-cache/pkg ($(BUILD_SPECS))"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
-	seedev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
-	test -x "$$seedev" -a -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo / td-ts-eval seed" >&2; exit 1; }; \
 	for s in $(BUILD_SPECS); do grep ' /gnu/store/' "tests/$$s-no-guix.lock"; done \
 	  | sed 's/^[^ ]* //' | sort -u | xargs $(GUIX) build >/dev/null \
 	  || { echo "ERROR: could not realize the build seed (regenerate locks on a channel bump)" >&2; exit 1; }; \
 	grep ' /gnu/store/' tests/td-builder-rust.lock | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null \
 	  || { echo "ERROR: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }; \
-	grep ' /gnu/store/' tests/td-ts-eval.lock | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null \
-	  || { echo "ERROR: could not realize the td-ts-eval seed + crates (regenerate tests/td-ts-eval.lock on a boa bump)" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	export CACHE="$(CURDIR)/.td-build-cache/pkg" TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; mkdir -p "$$CACHE"; \
 	. tests/cache-lib.sh; load_stage0; \
 	echo ">> builds run on the td-bootstrapped stage0 td-builder ($$TD_BUILDER_PATH) — NO guix-built td-builder (move-off-Guile §5 brick 3)"; \
-	tdeval=`TD_TS_EVAL="$$seedev" sh tests/ts-eval-tool.sh "$(CURDIR)/.td-build-cache/rust-ts-eval"`; \
-	test -x "$$tdeval" || { echo "ERROR: could not build the td-ts-eval evaluator (brick 4b prelude)" >&2; exit 1; }; \
-	export TD_TS_EVAL="$$tdeval"; \
-	echo ">> recipes EVALUATE with td's OWN td-ts-eval ($$tdeval) — not the guix-built one (move-off-Guile §5 brick 4b)"; \
+	TD_GUIX="$(GUIX)" sh tests/recipe-eval-tool.sh "$(CURDIR)/.td-build-cache/recipe-eval" >/dev/null \
+	  || { echo "ERROR: could not build td's Rust recipe evaluator (recipes/ crate)" >&2; exit 1; }; \
+	load_recipe_eval; \
+	echo ">> recipes EVALUATE with td's OWN Rust td-recipe-eval ($$TD_RECIPE_EVAL) — boa retired (rust-recipe-surface)"; \
 	jobs=$${TD_BUILD_JOBS:-$$(nproc)}; \
 	echo ">> building $(words $(BUILD_SPECS)) recipes across $$jobs cores (single-threaded each) ..."; \
 	printf '%s\n' $(BUILD_SPECS) | xargs -P "$$jobs" -n1 sh tests/build-pkg.sh; \

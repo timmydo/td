@@ -30,15 +30,12 @@ BUILD_GATES  += corpus-no-guix
 corpus-no-guix:
 	@echo ">> corpus-no-guix: hello/gzip/popt/libatomic-ops/gettext-minimal/nano/which/gperf all build via td-builder build-recipe (no guix/Guile in the path), run, reproducible (td-builder check), distinct from guix"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/hello-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
-	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
-	echo "  [DURABLE structural] recipes evaluate with td's OWN td-ts-eval ($$TD_TS_EVAL) — not the guix-built one (brick 4b)"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	case "$$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($$TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
+	echo "  [DURABLE structural] recipes evaluate with td's OWN Rust td-recipe-eval ($$TD_RECIPE_EVAL) — boa retired (rust-recipe-surface)"; \
 	for spec in $(corpus_SPECS); do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \
@@ -67,7 +64,7 @@ corpus-no-guix:
 	    rdrv=`grep -hoE '/gnu/store/[a-z0-9]+-'"$$spec"'-[^ ]+\.drv' "$$sd/err" "$$sd/bout" 2>/dev/null | head -1`; \
 	    test -n "$$rdrv" || { echo "FAIL: could not read the real $$spec .drv store path (self-discrimination leg)" >&2; exit 1; }; \
 	    pdir="$$sd/perturbed"; rm -rf "$$pdir"; mkdir -p "$$pdir/b" "$$pdir/tmp"; \
-	    sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-$$spec-perturbed.ts" > "$$pdir/recipe.json" || { echo "FAIL: ts-emit $$spec-perturbed" >&2; exit 1; }; \
+	    sh tests/recipe-emit.sh $$spec-perturbed > "$$pdir/recipe.json" || { echo "FAIL: ts-emit $$spec-perturbed" >&2; exit 1; }; \
 	    : "$${TB:?}"; \
 	    env -i HOME="$$pdir" TMPDIR="$$pdir/tmp" PATH="$$CU/bin" \
 	      TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" \

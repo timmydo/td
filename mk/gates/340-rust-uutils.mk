@@ -16,10 +16,9 @@ BUILD_GATES += rust-uutils
 rust-uutils:
 	@echo ">> rust-uutils: td builds the uutils 'cat' (uu_cat 0.9.0, 139 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); it works as cat (file + stdin); reproducible; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
-	nsout=`sh tests/crate-free-build.sh cat uu_cat-0.9.0 tests/cat-uutils.lock cat-source tests/ts/recipe-cat.ts` || exit 1; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
+	export GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
+	nsout=`sh tests/crate-free-build.sh cat uu_cat-0.9.0 tests/cat-uutils.lock cat-source cat` || exit 1; \
 	eval "$$nsout"; ns="$$NS"; \
 	bin="$$ns/bin/cat"; \
 	test -x "$$bin" || { echo "FAIL: no uu_cat 'cat' binary at $$bin" >&2; exit 1; }; \

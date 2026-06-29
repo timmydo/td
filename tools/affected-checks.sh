@@ -217,16 +217,17 @@ map_path() {
       add_target check-engine
       add_note "$p is the td-builder build engine: validated by the ~2-min check-engine smoke (compile + unit tests); the from-source build coverage is the DAILY backstop (DESIGN §7.2), not a per-PR gate." ;;
 
-    ts-eval/*|ts-eval/src/*|ts-eval/Cargo.toml|ts-eval/Cargo.lock)
-      add_target ts-eval
-      add_target ts-diff ;;
-
-    recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock)
-      # The td-recipe crate (the package surface declared in Rust) is consumed
-      # ONLY by the recipe-rs gate today — boa stays the corpus oracle until the
-      # A3 consumer cutover (plan/rust-migration.md), at which point this mapping
-      # must expand to the corpus build gates.
-      add_target recipe-rs ;;
+    recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipes-meta.json|tests/recipe-emit.sh|tests/recipe-eval-tool.sh)
+      # The td-recipe crate IS the package + system-spec surface (boa/TS retired).
+      # It feeds the corpus build path (cache-lib emits via td-recipe-eval), the spec
+      # differential, and the guix-dependence census manifest — so a catalog change
+      # can affect ANY built package. Run recipe-rs (self-consistency + manifest
+      # sync), spec-diff, the census, and the package build gates.
+      add_preflight shell-syntax
+      add_target recipe-rs
+      add_target spec-diff
+      add_target guix-dependence
+      add_build_gate_targets ;;
 
     fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock)
       add_target rust-fetch ;;
@@ -236,11 +237,6 @@ map_path() {
 
     subst/*|subst/src/*|subst/Cargo.toml|subst/Cargo.lock)
       add_target td-subst ;;
-
-    tests/td-tsgo.lock|tests/tsgo.sh|tools/warm-tsgo.sh)
-      add_preflight shell-syntax
-      add_target tsgo-pin
-      add_target ts ;;
 
     tests/toolchain-input-addressed.sh)
       add_preflight shell-syntax
@@ -268,28 +264,6 @@ map_path() {
     tests/toolchain-subst-default.sh|tools/resolve-toolchain.sh|tools/publish-toolchain-subst.sh|tests/td-subst.pub)
       add_preflight shell-syntax
       add_target toolchain-subst-default ;;
-
-    tests/ts/recipe-*-perturbed.ts)
-      spec=${p##*/recipe-}
-      spec=${spec%-perturbed.ts}
-      map_recipe_spec "$spec"
-      # recipe-rs proves the Rust catalog == boa(.ts); a .ts recipe edit that
-      # diverges from recipes/src/catalog.rs must red recipe-rs at PR time, not
-      # only on the daily suite (it is HEAVY, absent from the required check-fast).
-      add_target recipe-rs ;;
-
-    tests/ts/recipe-*.ts)
-      spec=${p##*/recipe-}
-      spec=${spec%.ts}
-      map_recipe_spec "$spec"
-      add_target recipe-rs ;;
-
-    tests/ts/spec-*.ts|tests/ts/td-spec.d.ts|tests/ts/spec-v0.expected.js)
-      add_target ts
-      add_target ts-diff
-      # td-spec.d.ts is the shared recipe/spec vocabulary boa validates against;
-      # a shape change there can move what boa emits, so re-run recipe-rs too.
-      add_target recipe-rs ;;
 
     tests/*-no-guix.lock)
       spec=${p##tests/}
@@ -916,27 +890,16 @@ map_path() {
       add_preflight shell-syntax
       add_target guix-surface ;;
 
-    tests/ts-emit.sh|tests/ts-check.sh)
-      add_preflight shell-syntax
-      add_target ts
-      add_target ts-diff ;;
-
-    tests/ts-eval-check.sh)
-      add_preflight shell-syntax
-      add_target ts-eval ;;
-
     tests/recipe-rs.sh)
       add_preflight shell-syntax
       add_target recipe-rs ;;
 
+    tests/spec-diff.scm)
+      add_target spec-diff ;;
+
     system/td-builder.scm)
       add_target td-builder
       add_target rust-build ;;
-
-    system/td-ts.scm)
-      add_target ts
-      add_target ts-eval
-      add_target ts-diff ;;
 
     system/td.scm)
       add_preflight shell-syntax
@@ -1086,9 +1049,6 @@ run_self_test() {
     [ -n "$gate" ] || continue
     specs=$(sed -n 's/^[A-Za-z0-9_-]*_SPECS[[:space:]]*:=[[:space:]]*//p' "$file")
     for spec in $specs; do
-      if [ -f "tests/ts/recipe-$spec.ts" ]; then
-        assert_target "tests/ts/recipe-$spec.ts" "$gate"
-      fi
       if [ -f "tests/$spec-no-guix.lock" ]; then
         assert_target "tests/$spec-no-guix.lock" "$gate"
       fi
@@ -1099,11 +1059,9 @@ run_self_test() {
   assert_branch_policy tools/affected-checks.sh "full ./check.sh would be waived"
   assert_target tests/repro-lib.sh bootstrap-binutils-244-store-native
   assert_branch_policy tests/repro-lib.sh "full ./check.sh would be waived"
-  assert_target tests/ts/recipe-td-russh-demo.ts rust-russh
   assert_target tests/td-russh-demo.lock rust-russh
   assert_target tests/russh-demo/Cargo.lock rust-russh
   assert_target tools/warm-cargo-proxy-local.sh rust-russh
-  assert_target tests/ts/recipe-td-feed.ts td-feed
   assert_target tests/td-feed.lock td-feed
   assert_target tests/td-feed.index td-feed
   assert_target tools/feed-ensure.sh feed-shared
@@ -1111,7 +1069,6 @@ run_self_test() {
   assert_target tools/warm-td-fetch-crates.sh td-feed
   assert_target tools/warm-cargo-proxy.sh rust-ripgrep
   assert_target feed/src/main.rs td-feed
-  assert_target tests/ts/recipe-td-subst.ts td-subst
   assert_target tests/td-subst.lock td-subst
   assert_target subst/src/main.rs td-subst
   assert_target tests/toolchain-subst-default.sh toolchain-subst-default
@@ -1126,28 +1083,23 @@ run_self_test() {
   assert_target tests/x86_64-subst-lib.sh bootstrap-x86_64-toolchain-store-native
   assert_target tests/toolchain-x86_64-input-addressed.sh toolchain-x86_64-input-addressed
   assert_target mk/gates/418-toolchain-x86_64-input-addressed.mk toolchain-x86_64-input-addressed
-  assert_target tests/ts/recipe-td-cmake-demo.ts cmake
   assert_target tests/td-cmake-demo.lock cmake
-  assert_target tests/ts/recipe-uutils.ts rust-coreutils
   assert_target tests/uutils-coreutils.lock rust-coreutils
   assert_target tests/cat-uutils.lock rust-uutils
-  assert_target tests/ts/recipe-youki.ts rust-youki
   assert_target tests/youki.lock rust-youki
   assert_target tests/cmake-demo/CMakeLists.txt cmake
-  assert_target tests/ts/recipe-perturbed.ts drv-emit
   assert_target tests/guix-surface.sh guix-surface
   assert_target tests/guix-surface.expected guix-surface
-  # The Rust package surface (td-recipe crate) maps to the recipe-rs gate and
-  # waives the full loop (boa stays the corpus oracle until the A3 cutover).
+  # The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
+  # catalog edit runs recipe-rs, spec-diff, the census, and the package build gates.
   assert_target recipes/src/catalog.rs recipe-rs
+  assert_target recipes/src/catalog.rs spec-diff
+  assert_target recipes/src/catalog.rs guix-dependence
+  assert_target recipes/src/catalog.rs corpus-no-guix
   assert_target recipes/Cargo.toml recipe-rs
   assert_target tests/recipe-rs.sh recipe-rs
-  assert_branch_policy recipes/src/catalog.rs "full ./check.sh would be waived"
-  # A .ts recipe edit must ALSO route to recipe-rs (catch a .ts/catalog divergence
-  # at PR time), in addition to its per-package build gate.
-  assert_target tests/ts/recipe-hello.ts recipe-rs
-  assert_target tests/ts/recipe-gzip-perturbed.ts recipe-rs
-  assert_target tests/ts/td-spec.d.ts recipe-rs
+  assert_target tests/recipes-meta.json recipe-rs
+  assert_target tests/spec-diff.scm spec-diff
   # The td-builder build engine validates on the check-engine SMOKE tier (Option B,
   # DESIGN §7.2): the full heavy+system corpus is the DAILY backstop, not a per-PR gate.
   assert_target builder/src/sandbox.rs check-engine

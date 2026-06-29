@@ -19,7 +19,7 @@
 #   LOCK       tests/<x>.lock (its /gnu/store lines are the toolchain seed; .crate lines unused).
 #   SOURCEKEY  the lock's source key (ripgrep-source, sd-source, fd-source).
 #   RECIPE     tests/ts/recipe-<x>.ts.
-# Reads env: TB TD_TSGO TD_TSDIR TD_TS_EVAL TD_BUILDER_PATH TD_BUILDER_STORE TD_BUILDER_DB
+# Reads env: TB TD_RECIPE_EVAL TD_BUILDER_PATH TD_BUILDER_STORE TD_BUILDER_DB
 #            GUIX(=guix) ROOT(=pwd).
 set -eu
 
@@ -63,8 +63,8 @@ test -n "$vsrc" -a -n "$vstore" -a -n "$vdb" || { echo "ERROR: vendor intern pro
 echo "  [DURABLE structural] td interned the source + the $ncrate-crate set as content-addressed trees (store-add-recursive, no daemon): vendor $vsrc" >&2
 
 seedlock="$scratch/seed.lock"; { grep -v '\.crate ' "$lock" | grep -v "^$sourcekey "; echo "$sourcekey $src"; } > "$seedlock"
-sh tests/ts-emit.sh "$root/$recipe" > "$scratch/recipe.json"
-test -s "$scratch/recipe.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }
+_st=$(basename "$recipe" .ts); _st=${_st#recipe-}; sh tests/recipe-emit.sh "$_st" > "$scratch/recipe.json"
+test -s "$scratch/recipe.json" || { echo "ERROR: recipe-emit produced no JSON" >&2; exit 1; }
 sd="$scratch/sd"
 env -i HOME="$scratch" TMPDIR="$scratch/tmp" PATH="$cu/bin" TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" "$TB" build-recipe "$scratch/recipe.json" "$seedlock" "$sd" /var/guix/db/db.sqlite "$srcstore" "$srcdb" "$vsrc" "$vstore" "$vdb" > "$scratch/bout" 2>"$scratch/err" || { echo "FAIL: build-recipe (guix-free crates):" >&2; tail -40 "$scratch/err" >&2; exit 1; }
 out=$(sed -n 's/^OUT=out //p' "$scratch/bout")
