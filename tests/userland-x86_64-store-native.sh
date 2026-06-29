@@ -20,7 +20,8 @@
 #   [provenance]   the built busybox/make carry zero /gnu/store bytes.
 #   [no-guix]      the interned /td/store set (bins + td-built glibc/libgcc) has zero
 #                  /gnu/store anywhere; the relinked interp is /td/store/ld.
-#   [structural]   the tree's lib/ closure is complete (every NEEDED soname present).
+#   [structural]   the tree's lib/ carries the key runtime sonames (libc/libm/libgcc_s);
+#                  full closure completeness is proven by the behavioral own-root run.
 #   [behavioral]   busybox sh runs + `make --version` runs from /td/store in the store-ns
 #                  own-root → the real version strings.
 #   [structural]   inside the own-root /td/store IS the store AND /gnu/store is ABSENT.
@@ -133,7 +134,7 @@ load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builde
 export TD_STORE_DIR=/td/store
 snwork=`mktemp -d`
 MKX="$snwork/makex"; BBX="$snwork/bbx"
-trap 'rm -rf "$snwork"' EXIT INT TERM    # the build branch re-traps to also clean its chain temps
+trap 'rm -rf "$snwork"; [ -n "${binsh_made:-}" ] && rm -f /bin/sh' EXIT INT TERM    # the build branch re-traps to also clean its chain temps
 cstore="$snwork/closure-store"; cdb="$snwork/closure.db"; mkdir -p "$cstore"
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
 bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
@@ -168,7 +169,7 @@ else
   GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
   GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
   BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
-  trap 'rm -rf "$snwork" "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$cpath"`"' EXIT INT TERM
+  trap 'rm -rf "$snwork" "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$cpath"`"; [ -n "${binsh_made:-}" ] && rm -f /bin/sh' EXIT INT TERM
   GCC14="$GCC14B/stage/td/store/gcc-14.3.0"; GST="$GOUT/out"
   echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils 2.44"
   run_x86_64_cross "$cpath" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
@@ -209,10 +210,12 @@ export KHINC
 # --- /bin/sh for popen()/system(): busybox's compiled split-include calls
 # popen("find ...") and glibc's popen hardcodes /bin/sh, which the sandbox lacks (the same
 # /bin/sh gap, but from a compiled libc call — no shebang to sed). The dev-shell root is a
-# writable ephemeral tmpfs, so point /bin/sh at the curated shell: namespace-local, vanishes
-# with the sandbox, NEVER touches the host (the host root was pivoted away).
+# writable ephemeral tmpfs, so point /bin/sh at the curated shell: namespace-local, NEVER
+# touches the host (the host root was pivoted away). The loop's gates share ONE outer
+# host-sandbox, so if WE create it the EXIT trap removes it (else it would leak to later gates).
 csh0=`command -v bash 2>/dev/null || command -v sh`
-[ -e /bin/sh ] || { mkdir -p /bin 2>/dev/null && ln -sf "$csh0" /bin/sh; }
+binsh_made=
+[ -e /bin/sh ] || { mkdir -p /bin 2>/dev/null && ln -sf "$csh0" /bin/sh && binsh_made=1; }
 test -e /bin/sh || fail "could not provide /bin/sh for popen() in the sandbox (root not writable?)"
 
 # --- build the C userland (busybox + make) dynamic vs the x86_64 glibc 2.41 -----------------
@@ -261,7 +264,8 @@ export PATH=/td/store/$rel/bin    # the busybox applet symlinks (sh/sed/head/…
 [ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 busybox echo BUSYBOX-RAN
 sed --version 2>/dev/null | head -1
-make --version | head -1 && echo MAKE-RAN
+make --version > /tmp/mv 2>&1 && echo MAKE-RAN   # MAKE-RAN reflects make's OWN exit (not head's)
+head -1 /tmp/mv
 PROBE
 out2=`"$TB" store-ns "$ustore" -- "/td/store/$rel/bin/busybox" sh /td/store/probe.sh 2>&1` \
   || { printf '%s\n' "$out2" | sed 's/^/     /' >&2; fail "store-ns userland run exited nonzero"; }
