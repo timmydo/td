@@ -15,6 +15,7 @@
 //!     registration;
 //!   • S4 — the daemon-vs-td-builder store differential, as a check.sh rung.
 
+mod affected;
 mod build;
 mod build_daemon;
 mod daemon;
@@ -1857,6 +1858,10 @@ fn main() -> ExitCode {
             println!("td-builder {} ok", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        // affected-checks — port of tools/affected-checks.sh (rust-migration C1):
+        // map the branch diff to a right-sized check set + the waive/escalate
+        // decision. Run from the repo root. See builder/src/affected.rs.
+        Some("affected-checks") => affected::main(&args[2..]),
         Some("nar-hash") if args.len() == 3 => match nar_hash(&args[2]) {
             Ok(h) => {
                 println!("{h}");
