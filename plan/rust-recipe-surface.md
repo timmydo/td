@@ -43,11 +43,13 @@ plus its crate closure leaves the loop.
 
 ## Verified-red ladder
 
-- [ ] crate builds offline (no network, no non-vendored deps)
-- [ ] `emit hello` matches boa's `ts-emit recipe-hello.ts` (canon) — break the
-      version, watch `verify` go red
-- [ ] gettext-minimal (phases vocabulary) matches boa — the hardest recipe
-- [ ] self-discrimination: `verify hello <gzip.json>` fails
-- [ ] full `recipe-rs` gate green over all migrated recipes
+- [x] crate builds offline (zero deps; `cargo test --frozen` → 8 unit tests pass)
+- [x] all 53 recipes canon-equal boa's `ts-emit` (oracle leg D, 53/53)
+- [x] gettext-minimal (full phases/Stmt/FileArg vocabulary) matches boa
+- [x] self-discrimination: `verify hello <gzip.json>` FAILS (leg C)
+- [x] full `recipe-rs` gate green over all 53 recipes (legs A–D)
+- [x] VERIFIED-RED: corrupt hello's version → leg D reds ("diverges from boa");
+      drop a catalog entry → leg A reds ("only in .ts: youki"); both reverted
 
-## Follow-ups → plan/rust-migration.md
+## Follow-ups → plan/rust-migration.md (A2 specs, A3 cutover, A4 delete boa,
+## B gates→Rust, C scripts→Rust, A2-final drop the Guile lowering)
