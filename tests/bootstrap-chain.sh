@@ -868,6 +868,16 @@ build_glibc_241() {
 # bootstrap_modern_toolchain — verify the pinned inputs, then build the full chain from the seed and
 # finalize the modern toolchain (no /gnu/store, relocated glibc ld-scripts, kernel headers in glibc).
 bootstrap_modern_toolchain() {
+# brick8's elf-set-interp rewrites PT_INTERP IN PLACE (shrink-or-equal; td's elf.rs has no patchelf-style
+# grow). The toolchain binaries' build-time interp lives under TMPDIR (…/glibcsharedbuild/out/lib/ld-linux.so.2)
+# and MUST be >= the /td/store target interp (/td/store/<32-char-hash>-glibc-2.41/lib/ld-linux.so.2, 71 chars),
+# or the rewrite silently no-ops (|| true) and ld/as keep a build-dir interp that does NOT exist in
+# build-recipe's /td/store-only pivot sandbox → "C compiler cannot create executables". check.sh's default
+# TMPDIR=/tmp is too short (build interp ~58 < 71); pin a deliberately-long TMPDIR under the worktree's
+# .td-build-cache and HARD-ASSERT it stays long enough (so this can never silently regress).
+TMPDIR="$ROOT/.td-build-cache/chain-build-tmp-keep-interp-paths-long-for-elf-set-interp"; mkdir -p "$TMPDIR"; export TMPDIR
+_ip="$TMPDIR/tmp.XXXXXXXX/glibcsharedbuild/out/lib/ld-linux.so.2"
+test ${#_ip} -ge 75 || fail "TMPDIR too short ($TMPDIR): build-dir interp ${#_ip}<75 chars would break elf-set-interp's in-place PT_INTERP rewrite to the /td/store glibc (71 chars)"
 # --- [pinned-input] all source tarballs + the vendored boot patch match their pins ----------------
 lf() { sed -n "s/^$2 //p" "$1" | head -1; }
 MES_LOCK=`ls seed/sources/mes-*.lock | head -1`;       NYACC_LOCK=`ls seed/sources/nyacc-*.lock | head -1`
