@@ -272,16 +272,24 @@ map_path() {
     tests/ts/recipe-*-perturbed.ts)
       spec=${p##*/recipe-}
       spec=${spec%-perturbed.ts}
-      map_recipe_spec "$spec" ;;
+      map_recipe_spec "$spec"
+      # recipe-rs proves the Rust catalog == boa(.ts); a .ts recipe edit that
+      # diverges from recipes/src/catalog.rs must red recipe-rs at PR time, not
+      # only on the daily suite (it is HEAVY, absent from the required check-fast).
+      add_target recipe-rs ;;
 
     tests/ts/recipe-*.ts)
       spec=${p##*/recipe-}
       spec=${spec%.ts}
-      map_recipe_spec "$spec" ;;
+      map_recipe_spec "$spec"
+      add_target recipe-rs ;;
 
     tests/ts/spec-*.ts|tests/ts/td-spec.d.ts|tests/ts/spec-v0.expected.js)
       add_target ts
-      add_target ts-diff ;;
+      add_target ts-diff
+      # td-spec.d.ts is the shared recipe/spec vocabulary boa validates against;
+      # a shape change there can move what boa emits, so re-run recipe-rs too.
+      add_target recipe-rs ;;
 
     tests/*-no-guix.lock)
       spec=${p##tests/}
@@ -1135,6 +1143,11 @@ run_self_test() {
   assert_target recipes/Cargo.toml recipe-rs
   assert_target tests/recipe-rs.sh recipe-rs
   assert_branch_policy recipes/src/catalog.rs "full ./check.sh would be waived"
+  # A .ts recipe edit must ALSO route to recipe-rs (catch a .ts/catalog divergence
+  # at PR time), in addition to its per-package build gate.
+  assert_target tests/ts/recipe-hello.ts recipe-rs
+  assert_target tests/ts/recipe-gzip-perturbed.ts recipe-rs
+  assert_target tests/ts/td-spec.d.ts recipe-rs
   # The td-builder build engine validates on the check-engine SMOKE tier (Option B,
   # DESIGN §7.2): the full heavy+system corpus is the DAILY backstop, not a per-PR gate.
   assert_target builder/src/sandbox.rs check-engine
