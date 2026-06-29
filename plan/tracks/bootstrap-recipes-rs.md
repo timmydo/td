@@ -1,5 +1,5 @@
 section: side
-status: claimed
+status: done
 handle: claude-opus-046b70
 date: 2026-06-28
 title: bootstrap-recipes-rs
