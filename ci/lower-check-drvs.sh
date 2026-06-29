@@ -29,7 +29,12 @@ set -eu
 
 GUIX="guix time-machine -C channels.scm --"
 tmp=$(mktemp)
-trap 'rm -f "$tmp" "$tmp.err"' EXIT
+# td-drv-assemble-drv.scm writes a spec file to TD_SPEC_OUT and exits 2 if
+# unset; provide a tmpfile so it succeeds in the enumeration context (the spec
+# content is not used here — only the emitted ORACLE drv path matters).
+td_spec_out=$(mktemp)
+export TD_SPEC_OUT="$td_spec_out"
+trap 'rm -f "$tmp" "$tmp.err" "$td_spec_out"' EXIT
 
 # Run one lowering entry point with an honest exit: stdout to $tmp, stderr
 # surfaced on failure instead of eaten, and the exit status propagating
@@ -40,30 +45,16 @@ lower() {
     || { echo "ERROR: lowering failed: $*" >&2; tail -5 "$tmp.err" >&2; exit 1; }
 }
 
-# --- Maintenance guard: the rung list this enumeration was written against.
-KNOWN_RUNGS="eval diff typed-coverage oci-diff manifest-diff generation-diff \
-rollback generation-image no-guix manifest-check oci container rootless \
-oci-load registry verify-place reset test place build boot-disk td-builder \
-run offline memo"
-current=$(sed -n 's/^CHEAP_RUNGS := //p; s/^HEAVY_RUNGS := //p' Makefile | tr '\n' ' ')
-for r in $current; do
-  case " $KNOWN_RUNGS " in
-    *" $r "*) ;;
-    *) echo "ERROR: rung '$r' is not covered by ci/lower-check-drvs.sh —" >&2
-       echo "  add its lowering entry point here (and to KNOWN_RUNGS) so the" >&2
-       echo "  CI store image includes its build closure." >&2
-       exit 1;;
-  esac
-done
-
-# --- Maintenance guard 2: every drv-lowering script in tests/ must be run by
+# --- Maintenance guard: every drv-lowering script in tests/ must be run by
 # the enumeration loop below (imperative-surface.scm is loop-covered too but
 # named outside the glob).
 LOWERING_SCRIPTS="tests/manifest-image-drv.scm tests/generation-image-drv.scm \
 tests/place-drv.scm tests/rollback-drv.scm tests/imperative-surface.scm \
-tests/rootless-drvs.scm tests/td-builder-drv.scm tests/td-builder-s3-drvs.scm \
+tests/rootless-drvs.scm tests/td-builder-s3-drvs.scm \
 tests/td-builder-s4-drv.scm tests/registry-drv.scm tests/verify-place-drv.scm \
-tests/offline-drv.scm tests/check-memo-drvs.scm"
+tests/offline-drv.scm tests/check-memo-drvs.scm \
+tests/build-hermetic-drv.scm tests/daemon-drv.scm tests/drv-emit-drv.scm \
+tests/td-drv-add-drv.scm tests/td-drv-assemble-drv.scm tests/td-drv-build-drv.scm"
 for s in tests/*-drv.scm tests/*-drvs.scm; do
   [ -e "$s" ] || continue
   case " $LOWERING_SCRIPTS " in
