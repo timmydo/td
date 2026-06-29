@@ -183,10 +183,12 @@ echo "   x86_64 toolchain ready (XGCC2=$XGCC2)"
 # unsorted pick grabbed a gawk that SIGFPEs in the sandbox). Build-drivers; no output bytes.
 XBIN="$snwork/xbin"; _xbin "$XBIN"; export XBIN
 test -x "$XBIN/awk" || fail "_xbin produced no awk for the build scaffolding"
-# busybox's Kbuild scripts (e.g. scripts/basic/split-include) call find/xargs, which _xbin
-# doesn't carry — add them (build-drivers, no output bytes; _store_tool is sorted/deterministic).
-for t in find:findutils xargs:findutils; do
-  b=`_store_tool "${t%%:*}" "${t##*:}"`; test -n "$b" && ln -sf "$b" "$XBIN/${t%%:*}" || true
+# busybox's Kbuild (scripts/gen_build_files.sh) calls find/xargs, which _xbin doesn't carry.
+# Use an EXPLICIT, bound /gnu/store findutils (sorted/deterministic) — _store_tool's `command -v`
+# is unreliable here and yielded a broken `find` symlink. Build-drivers; no output bytes.
+for t in find xargs; do
+  b=`ls /gnu/store/*-findutils-*/bin/"$t" 2>/dev/null | sort | head -1`
+  test -n "$b" -a -x "$b" && ln -sf "$b" "$XBIN/$t" || true
 done
 test -x "$XBIN/find" || fail "no find for the busybox Kbuild scaffolding"
 
