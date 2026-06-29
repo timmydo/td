@@ -74,7 +74,7 @@ build_make_x86_64() {
   # would otherwise fail "No such file or directory"), and rewrite any #!/bin/sh helper shebangs.
   find "$src" -type f -exec sed -i "1s|^#! */bin/sh\b|#!$csh|" {} + 2>/dev/null || true
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
-  ( cd "$src"; awkb=`ls /gnu/store/*-gawk-*/bin/awk 2>/dev/null | head -1 | xargs -r dirname`; bp="$xb/bin:$mc${awkb:+:$awkb}"; export LD_LIBRARY_PATH="$xgl/lib:$xlg"   # build-time: test/host binaries find the build-dir glibc (RUNPATH is $ORIGIN/../lib); awk (config.status) from the exposed store — a build-driver, no output bytes
+  ( cd "$src"; bp="$xb/bin:$XBIN:$mc"; export LD_LIBRARY_PATH="$xgl/lib:$xlg"   # build-time: test/host binaries find the build-dir glibc (RUNPATH is $ORIGIN/../lib); $XBIN = the cross-fns _xbin scaffolding (awk/m4/bison/flex/cmp/... — build-drivers, no output bytes)
     env PATH="$bp" CC="$wb/cc" CPP="$wb/cc -E" CONFIG_SHELL="$csh" SHELL="$csh" "$csh" ./configure --build="$XTARGET" --host="$XTARGET" --disable-dependency-tracking >cfg.log 2>&1 \
       || { echo "make configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_makex-cfg.log" 2>/dev/null||true; cp config.log "$ROOT/.td-build-cache/_makex-config.log" 2>/dev/null||true; echo "--- config.log CPP/conftest tail ---" >&2; grep -iE 'cpp|conftest|preprocess|cc1|No such|error|cannot' config.log 2>/dev/null | tail -30 >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= make SHELL="$csh" CONFIG_SHELL="$csh" >build.log 2>&1 \
@@ -98,7 +98,7 @@ build_busybox_x86_64() {
   # shebangs to the curated shell and pass SHELL/CONFIG_SHELL to every make so recipes use it too.
   find "$src" -type f -exec sed -i "1s|^#! */bin/sh\b|#!$csh|" {} + 2>/dev/null || true
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
-  ( cd "$src"; awkb=`ls /gnu/store/*-gawk-*/bin/awk 2>/dev/null | head -1 | xargs -r dirname`; bp="$xb/bin:$mc${awkb:+:$awkb}"; export LD_LIBRARY_PATH="$xgl/lib:$xlg"   # build-time: test/host binaries find the build-dir glibc (RUNPATH is $ORIGIN/../lib); awk (config.status) from the exposed store — a build-driver, no output bytes
+  ( cd "$src"; bp="$xb/bin:$XBIN:$mc"; export LD_LIBRARY_PATH="$xgl/lib:$xlg"   # build-time: test/host binaries find the build-dir glibc (RUNPATH is $ORIGIN/../lib); $XBIN = the cross-fns _xbin scaffolding (awk/m4/bison/flex/cmp/... — build-drivers, no output bytes)
     env PATH="$bp" make CC="$wb/cc" HOSTCC="$wb/cc" SHELL="$csh" CONFIG_SHELL="$csh" defconfig >cfg.log 2>&1 \
       || { echo "busybox defconfig failed" >&2; tail -20 cfg.log >&2; return 1; }
     # dynamic (not CONFIG_STATIC), non-PIE, point the linker at the build-dir glibc archives.
@@ -170,6 +170,12 @@ else
 fi
 x86_64_verify_closure "$cpath" "$cstore" "$cdb" "$bbase" || fail "the x86_64 closure toolchain did not compile+run an x86_64 program → 42"
 echo "   x86_64 toolchain ready (XGCC2=$XGCC2)"
+
+# --- autoconf/recursive-make scaffolding (awk/m4/bison/flex/cmp/...) via the cross-fns _xbin:
+# the SORTED, sandbox-tested build-tool set gate 414 uses (NOT an ad-hoc gawk glob — an
+# unsorted pick grabbed a gawk that SIGFPEs in the sandbox). Build-drivers; no output bytes.
+XBIN="$snwork/xbin"; _xbin "$XBIN"; export XBIN
+test -x "$XBIN/awk" || fail "_xbin produced no awk for the build scaffolding"
 
 # --- the x86_64 Linux UAPI headers (warm, pinned) for the cc wrapper's -idirafter (glibc's
 # headers #include <linux/*>; the glibc component doesn't carry them) ------------------------
