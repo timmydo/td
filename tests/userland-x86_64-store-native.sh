@@ -192,6 +192,12 @@ for t in find:findutils xargs:findutils bzip2:bzip2; do
   test -n "$b" -a -x "$b" && ln -sf "$b" "$XBIN/$n" || true
 done
 test -x "$XBIN/find" -a -x "$XBIN/bzip2" || fail "missing find/bzip2 for the busybox Kbuild scaffolding"
+# busybox calls binutils by PLAIN name (AR=ar etc.; CROSS_COMPILE empty, host==target) — give it
+# the cross binutils tools (x86_64; same arch as the host) under their unprefixed names.
+for t in ar nm ranlib objcopy objdump strip size strings; do
+  test -x "$XBU/bin/x86_64-pc-linux-gnu-$t" && ln -sf "$XBU/bin/x86_64-pc-linux-gnu-$t" "$XBIN/$t" || true
+done
+test -x "$XBIN/ar" || fail "no ar for the busybox build"
 
 # --- the x86_64 Linux UAPI headers (warm, pinned) for the cc wrapper's -idirafter (glibc's
 # headers #include <linux/*>; the glibc component doesn't carry them) ------------------------
