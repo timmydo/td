@@ -37,10 +37,13 @@ trap 'rm -rf "$work"' EXIT INT TERM
 echo ">> (A) coverage: the Rust catalog and tests/ts/recipe-*.ts are 1:1"
 "$TD_RECIPE_EVAL" list | sort > "$work/rust-stems"
 ls "$tsdir"/recipe-*.ts | sed 's#.*/recipe-##; s#\.ts$##' | sort > "$work/ts-stems"
-if ! cmp -s "$work/rust-stems" "$work/ts-stems"; then
+# comm, not cmp/diff: the loop sandbox has coreutils but NOT diffutils (no cmp).
+only_rust=$(comm -23 "$work/rust-stems" "$work/ts-stems")
+only_ts=$(comm -13 "$work/rust-stems" "$work/ts-stems")
+if [ -n "$only_rust" ] || [ -n "$only_ts" ]; then
   echo "FAIL: the Rust catalog and the .ts recipe set differ:" >&2
-  echo "  only in Rust:" $(comm -23 "$work/rust-stems" "$work/ts-stems") >&2
-  echo "  only in .ts :" $(comm -13 "$work/rust-stems" "$work/ts-stems") >&2
+  echo "  only in Rust: $only_rust" >&2
+  echo "  only in .ts : $only_ts" >&2
   exit 1
 fi
 n=$(wc -l < "$work/rust-stems" | tr -d ' ')
