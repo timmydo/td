@@ -24,6 +24,7 @@ mod elf;
 mod json;
 mod lock;
 mod nar;
+mod oci;
 mod sandbox;
 mod scan;
 mod sha256;
@@ -1889,6 +1890,45 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: nar-restore {narfile} {dest}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // oci-image: pack a PREPARED rootfs directory into a deterministic, uncompressed
+        // docker-archive (OCI image) — td-native, no guix/Guile (system-image-native brick
+        // 1). CONFIG-JSON is {"repoTag","env":[],"entrypoint":[],"cmd":[]} (all optional but
+        // repoTag). Usage: oci-image ROOTFS-DIR CONFIG-JSON OUT.tar
+        Some("oci-image") if args.len() == 5 => {
+            let (rootfs, config_file, out_file) = (&args[2], &args[3], &args[4]);
+            let run = || -> Result<(), String> {
+                let cfg_text = std::fs::read_to_string(config_file)
+                    .map_err(|e| format!("read {config_file}: {e}"))?;
+                let cj = json::parse(&cfg_text).map_err(|e| format!("config JSON: {e}"))?;
+                let strs = |key: &str| -> Vec<String> {
+                    cj.get(key)
+                        .and_then(json::Json::as_arr)
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default()
+                };
+                let cfg = oci::ImageConfig {
+                    repo_tag: cj.get("repoTag").and_then(json::Json::as_str).unwrap_or("td:latest").to_string(),
+                    env: strs("env"),
+                    entrypoint: strs("entrypoint"),
+                    cmd: strs("cmd"),
+                };
+                let mut w =
+                    std::fs::File::create(out_file).map_err(|e| format!("create {out_file}: {e}"))?;
+                oci::write_docker_archive(&mut w, Path::new(rootfs), &cfg)
+                    .map_err(|e| format!("write docker-archive: {e}"))?;
+                Ok(())
+            };
+            match run() {
+                Ok(()) => {
+                    println!("{out_file}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: oci-image: {e}");
                     ExitCode::FAILURE
                 }
             }
