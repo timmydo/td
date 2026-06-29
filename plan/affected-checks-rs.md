@@ -47,12 +47,23 @@ the lib takes an explicit `root` so tests are CWD-independent.
   sandbox's `guix shell` may not put bash on PATH); it DOES run in the required CI
   `cargo-test` job (plain ubuntu) on every PR. Deletable the day the shell goes.
 
-## Verified-red
+## Verified-red (recorded 2026-06-28)
 
-Before trusting green: (1) perturb one `map_path` arm (e.g. drop `add_target
-rust-russh`) → the self-test reds on `tests/td-russh-demo.lock`; (2) perturb the
-renderer (e.g. change the Waiver wording) → the differential oracle reds. Recorded
-below once run.
+- **A (mapping)**: dropped `require_full` from the catch-all arm → BOTH
+  `self_test_passes_against_repo` AND `matches_shell_oracle_byte_for_byte` FAILED;
+  the diff showed SHELL "full ./check.sh would be required" + bullet vs perturbed
+  RUST "would be waived" for `new/unmapped.file` / `totally/unmapped/path.xyz`.
+  Restored → green.
+- **B (renderer)**: changed `Changed paths:` → `Changed paths::` (one char) →
+  `matches_shell_oracle_byte_for_byte` FAILED on **227** corpus paths while
+  `self_test_passes_against_repo` stayed GREEN — demonstrating the differential
+  oracle catches byte-level formatting the substring self-test cannot. Restored →
+  green.
+
+Green: `cargo test --frozen` 89 passed (4 affected legs incl. the live-shell
+differential, which RAN — not skipped). Binary smoke vs the shell oracle:
+`--self-test` PASS; `--path`, bare branch dry-run, and `--committed-only` all
+byte-IDENTICAL; error/`--help` exit codes (2/2/2/0) match.
 
 ## Scope / cutover
 
