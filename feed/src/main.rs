@@ -1259,7 +1259,14 @@ fn main() {
                 Some("sources") if a.len() == 3 => warm_sources(&root),
                 Some("kernel-headers") if a.len() == 4 => warm_kernel_headers(&root, &a[3]),
                 // Legacy: `warm INDEX STORE` (a[2] is an index path, not an action keyword).
-                Some(kw) if a.len() == 4 && kw != "kernel-headers" => warm_index(&a[2], &a[3]),
+                // Exclude every action keyword so a mis-argc'd action (e.g. `warm crate X`)
+                // reports usage instead of being misread as an index path.
+                Some(kw)
+                    if a.len() == 4
+                        && !matches!(kw, "index" | "crate" | "crate-local" | "sources" | "kernel-headers") =>
+                {
+                    warm_index(&a[2], &a[3])
+                }
                 _ => warm_usage(),
             }
         }
