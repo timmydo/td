@@ -1043,6 +1043,9 @@ echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils
   # in the x86_64 libc/gcc, content-addr, the input-addressed glibc at its lock path, distinct-arch),
   # then intern the FULL closure {binutils,gcc,glibc} into the closure store + subst-export it.
   verify_x86_64_ownroot "$cpath" "$snwork" || fail "the x86_64 own-root verify failed"
+  # Make the cross gcc self-contained BEFORE interning: bundle plain as/ld into its tooldir so the
+  # PUBLISHED nar carries them (a fetched gcc's build-time --with-as scratch path is gone). x64-toolchain-subst.
+  x86_64_bundle_tooldir "$XGCC2" || fail "could not bundle as/ld into the cross gcc tooldir"
   x86_64_build_closure "`pwd`/.td-build-cache/x86_64-closure-export" "$cstore" "$cdb" || fail "could not intern + subst-export the x86_64 toolchain closure"
 fi
 

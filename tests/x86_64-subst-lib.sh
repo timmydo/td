@@ -84,6 +84,24 @@ x86_64_resolve_closure() {
   return 0
 }
 
+# x86_64_bundle_tooldir GCCTREE — make the cross gcc SELF-CONTAINED for the FETCH path. The cross gcc is
+# configured --with-as/--with-ld at the build-time binutils SCRATCH dir (a mktemp path); after a cold
+# fetch that path is gone, and the closure binutils ships only the target-PREFIXED x86_64-pc-linux-gnu-
+# {as,ld} (no plain as/ld), so gcc's PATH fallback finds nothing → "could not compile". Fix: install
+# plain as/ld into gcc's OWN tooldir ($GCCTREE/$XTARGET/bin) — the dir gcc searches for the assembler/
+# linker relative to argv[0] (`gcc -print-prog-name=as`). RELATIVE symlinks to the SIBLING binutils lock
+# path, so they resolve in EVERY context the closure is unpacked as siblings: the host-side verify compile
+# ($cstore), the store-ns own-root (/td/store bind), and a fetched consumer. MUST run BEFORE the gcc tree
+# is interned so the links land in the published nar (td's nar preserves symlinks). Idempotent.
+x86_64_bundle_tooldir() {
+  _gcc=$1
+  _bubase=`basename "$("$TB" toolchain-path "$X86_LOCK" binutils-2.44-x86_64)"` \
+    || { echo "bundle_tooldir: could not compute the binutils lock path" >&2; return 1; }
+  mkdir -p "$_gcc/$XTARGET/bin"
+  ln -sf "../../../$_bubase/bin/$XTARGET-as" "$_gcc/$XTARGET/bin/as"
+  ln -sf "../../../$_bubase/bin/$XTARGET-ld" "$_gcc/$XTARGET/bin/ld"
+}
+
 # x86_64_verify_closure CPATH STORE DB BASHBASE — compile a DYNAMIC x86_64 C program with the
 # closure's cross gcc (XGCC2/XBU) against its glibc (XGLIBC), bake interp/RUNPATH = the glibc lock
 # path, intern the program, and RUN it in the store-ns own-root (STORE bound at /td/store) -> 42,
@@ -101,6 +119,15 @@ x86_64_verify_closure() {
     if grep -q -a '/gnu/store' "$_b"; then echo "verify_closure: [no-guix] $_b contains /gnu/store bytes" >&2; return 1; fi
   done
   echo "   [no-guix] the closure libc.so.6 + cross gcc/cc1 carry no /gnu/store bytes"
+  # [self-contained] DURABLE (no guix oracle): the cross gcc must carry plain as/ld in its OWN tooldir
+  # ($XTARGET/bin) so a FETCHED gcc (whose build-time --with-as scratch path is gone) finds the assembler/
+  # linker relative to argv[0]. A regression that drops x86_64_bundle_tooldir reds HERE on BOTH paths — so
+  # the build path (where the lingering scratch dir would still satisfy --with-as) can't mask a fetch-only
+  # break. The compile below is the behavioral proof they WORK; this pins WHY (the bundled tooldir).
+  for _t in as ld; do
+    test -e "$XGCC2/$XTARGET/bin/$_t" || { echo "verify_closure: cross gcc tooldir missing '$_t' ($XGCC2/$XTARGET/bin/$_t) — not self-contained for fetch" >&2; return 1; }
+  done
+  echo "   [self-contained] cross gcc bundles as/ld in its own tooldir ($XTARGET/bin) — resolves them relative to argv[0], no --with-as scratch path"
   glrel=`basename "$XGLIBC"`
   csh=`command -v bash 2>/dev/null || command -v sh`
   w=`mktemp -d`; printf 'int main(){return 42;}\n' > "$w/c.c"
