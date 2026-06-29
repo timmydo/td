@@ -244,6 +244,15 @@ else
   warm() { "$@"; }   # no coreutils timeout: run unbounded (best-effort)
 fi
 warm sh tools/warm-tsgo.sh || { echo "check.sh: FATAL: could not warm the tsgo tarball (tools/warm-tsgo.sh) within ${warm_timeout}s." >&2; exit 1; }
+# --- Substitute store warm (x64-toolchain-subst): if a prior DAILY populated a persistent signed
+# substitute store (~/.td/subst: a stashed td-subst + the published lock-keyed closure), EXPOSE it by
+# exporting TD_SUBST_* — host-sandbox binds ~/.td/subst ro + preserves TD_SUBST_* (builder/src/main.rs),
+# so the toolchain gates FETCH the closure instead of rebuilding ~98 min from seed. No-op on a cold
+# machine (echoes nothing) → the gate builds from seed (the substitute is an optimization, never a
+# correctness dependency). NEVER builds td-subst here (the daily does). TD_SUBST_FORCE_BUILD=1 (set by
+# ci/daily for its AUTHORITATIVE run) suppresses the exposure so the daily always builds from seed +
+# republishes — otherwise a persistent store would starve the daily of its own from-seed build.
+[ "${TD_SUBST_FORCE_BUILD:-0}" = 1 ] || eval "$(sh tools/warm-subst.sh)"
 # --- Bootstrap-source warm: td OWNS fetching the source-bootstrap tarballs (GNU Mes, later -----
 # tinycc/gcc/glibc) the same way — td-fetch on the HOST, sha256-pinned per seed/sources/*.lock,
 # into .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates. BEST-EFFORT (those
