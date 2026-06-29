@@ -1,6 +1,6 @@
 #!/bin/sh
 # tests/check-memo.sh — verdict memoization for the `guix build --check`
-# reproducibility legs (plan/check-memo.md; DESIGN §7.1 check-memo — the
+# reproducibility legs (DESIGN §7.1 check-memo — the
 # §4.3 gate-2 sign-off and the BINDING constraints 1-6 live in that file).
 #
 # usage: check-memo.sh DRV [DRV...]
@@ -47,7 +47,7 @@ case "$ttl" in
 esac
 if [ "$ttl" -lt 1 ] || [ "$ttl" -gt 14 ]; then
   echo "check-memo: FATAL: TTL ${ttl}d is outside 1..14 — loosening the verdict" >&2
-  echo "  TTL beyond 14 days re-opens gate 2 (plan/check-memo.md constraint 3)." >&2
+  echo "  TTL beyond 14 days re-opens gate 2 (constraint 3)." >&2
   exit 1
 fi
 vdir=${TD_CHECK_VERDICTS:-.check-verdicts}

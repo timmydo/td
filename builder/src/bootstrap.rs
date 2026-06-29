@@ -1,6 +1,6 @@
 //! Structured source-bootstrap recipes — the `tests/bootstrap-*.sh` drivers as
 //! TYPED Rust data + one shared leg runner (rust-migration C2,
-//! `plan/rust-migration.md` "C. Scripts → Rust"; sibling of C1 `affected.rs`).
+//! "C. Scripts → Rust"; sibling of C1 `affected.rs`).
 //!
 //! Every `tests/bootstrap-*.sh` is the SAME leg skeleton:
 //!

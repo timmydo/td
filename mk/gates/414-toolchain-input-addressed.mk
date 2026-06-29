@@ -10,8 +10,7 @@
 # bytes -> same path, vs content-addressed which splits), load-bearing (a pin moves the
 # path), behavioral+structural (a real binary at an input-addressed path runs in the
 # store-ns own-root, /gnu/store absent). Heavy: builds the guix-free stage0 td-builder +
-# runs a rootless userns (like store-native-profile). NOT a BUILD_GATE. See
-# plan/toolchain-input-addressed.md.
+# runs a rootless userns (like store-native-profile). NOT a BUILD_GATE.
 HEAVY_GATES += toolchain-input-addressed
 toolchain-input-addressed:
 	@echo ">> toolchain-input-addressed: the /td/store modern toolchain gets a STABLE input-addressed key (td-toolchain.lock + toolchain-key/path) — identical across non-reproducible rebuilds, predictable from the lock; a real binary placed there runs, /gnu/store absent (task 2a — td-subst chain-caching prereq)"

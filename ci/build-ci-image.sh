@@ -99,7 +99,7 @@ test -n "$channel_out" || { echo "FATAL: no channel instance output" >&2; exit 1
 # (ext4's htree order varies with the per-mkfs hash seed, so two runners
 # diverge; btrfs dev box vs ext4 runner likewise), an UPSTREAM defect td
 # cannot patch without forking the builder (future work; human-signed
-# accommodation 2026-06-12, see plan/ci-gate.md). This covers BOTH `guix pack
+# accommodation 2026-06-12). This covers BOTH `guix pack
 # -f docker` shapes: the system `docker-image.tar.gz` AND the `td-app-*`
 # OCI app images (tests/container.scm — same builder, same defect; surfaced
 # 2026-06-13 only once the pipeline's cross-RUNNER --check replaced the

@@ -1,5 +1,5 @@
 //! autotools-build — td's own minimal build "system", in Rust (DESIGN §7.1
-//! corpus-independence; plan/corpus-independence.md "own Rust builder").
+//! corpus-independence; td's "own Rust builder").
 //!
 //! This is the REPLACEMENT for gnu-build-system's Guile phase runner. It is
 //! invoked AS the derivation's `builder` by the daemon (system td-build

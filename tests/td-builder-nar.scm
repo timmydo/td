@@ -1,5 +1,5 @@
 ;; tests/td-builder-nar.scm — S2 oracle pairs for the td-builder rung's NAR
-;; differential (plan/td-builder.md). Prints one line per store item:
+;; differential. Prints one line per store item:
 ;;
 ;;   NAR=<store path> <base16 sha256 of its NAR>
 ;;

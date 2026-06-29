@@ -15,7 +15,7 @@
 # Durable: DEFAULT-FETCH (a path obtained without building it, runs), FALL-BACK (cold store ->
 # from-seed), self-discrimination (wrong pinned key -> reject), structural (the pinned anchor is
 # well-formed). A BUILD_GATE like td-subst: builds td-subst from source, ordered after the
-# build-recipes phase. See plan/toolchain-subst-default.md.
+# build-recipes phase.
 HEAVY_GATES += toolchain-subst-default
 BUILD_GATES += toolchain-subst-default
 toolchain-subst-default:

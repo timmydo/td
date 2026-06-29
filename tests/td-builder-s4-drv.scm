@@ -1,5 +1,5 @@
 ;; tests/td-builder-s4-drv.scm — S4 oracle facts for the td-builder rung's
-;; system-image differential (plan/td-builder.md S4). Run via `guix repl`
+;; system-image differential (S4). Run via `guix repl`
 ;; with TD_IMAGE_DRV naming the qcow2 image drv (the `build` rung's subject),
 ;; AFTER the recipe has realized it through the root daemon, so
 ;; query-path-info returns the facts the ORACLE recorded in its own DB.

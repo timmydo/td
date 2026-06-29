@@ -1,4 +1,4 @@
-# oci-load (side-track, deferred from M10.1; plan/oci-load.md). The shipped
+# oci-load (side-track, deferred from M10.1). The shipped
 # images must be consumable by an INDEPENDENT OCI implementation, not just our
 # own placer (`place`) and runtime (`run`). Vehicle: skopeo, chosen by the M8
 # probe discipline — 0 drvs to build on the warm store vs umoci 113 and podman

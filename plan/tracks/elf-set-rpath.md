@@ -1,8 +1,0 @@
-section: side
-status: done
-handle: claude-fable-389410
-date: 2026-06-27
-pr: 202
-title: elf-set-rpath
-notes: plan/elf-set-rpath.md
-summary: Symmetric companion to elf.rs's PT_INTERP rewriter (#196, #200) — add td's OWN in-place DT_RPATH/DT_RUNPATH reader+writer (`elf::read_rpath`/`set_rpath`, CLI `elf-rpath`/`elf-set-rpath`), the second of the two patchelf features the store-native relink/cleanup needs, with NO guix tool on the path. Makes a toolchain/userland binary self-sufficient by baking an absolute `/td/store/...lib` run-path so it finds its shared libc with no `LD_LIBRARY_PATH` wrapper — the reusable capability for dropping those `ar`/`ranlib` crutches. BOTH-CLASS: ELFCLASS32 (i686 — the bootstrap toolchain ar/ranlib) AND ELFCLASS64 (x86-64 — rust/userland [[rust-store-native]]), unifying #200's class dispatch into one `Elf` accessor that both the interp and run-path paths share. In-place only (mirrors set_interp's discipline): the new string must fit the existing .dynstr slot, else it errors loudly rather than corrupting the file; ADDING a run-path where none exists, or growing one, is the out-of-scope add-a-segment/grow-.dynstr dance. Tested by the cargo-test smoke gate (5 new unit tests over synthesized 32- AND 64-bit dynamic ELFs: read RUNPATH+legacy RPATH, set-shorter round-trip+pad, refuse-too-long leaves file intact, absent→None+set errors, i686 round-trip), verified-red on the read/write/fit-check/class-dispatch legs; also differential-checked against `readelf -d` on a real x86_64 ELF (read byte-equal, rewrite round-trips, oracle agrees). builder/src only → validates on the ~2-min check-engine smoke tier (DESIGN §7.2), no spine edit.

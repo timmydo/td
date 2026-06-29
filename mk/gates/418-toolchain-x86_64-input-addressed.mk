@@ -13,8 +13,7 @@
 # component paths), load-bearing (recipe-rev + a pin move the addressing), behavioral (a real
 # binary placed at the x86_64-keyed path runs in the store-ns own-root, /gnu/store absent).
 # Heavy: builds the guix-free stage0 td-builder + runs a rootless userns (like #204) — NOT a
-# ~90-min toolchain build, NOT a BUILD_GATE. See plan/toolchain-input-addressed.md (#204) and
-# plan/td-subst.md (#207).
+# ~90-min toolchain build, NOT a BUILD_GATE.
 HEAVY_GATES += toolchain-x86_64-input-addressed
 toolchain-x86_64-input-addressed:
 	@echo ">> toolchain-x86_64-input-addressed: the x86_64 /td/store toolchain gets a STABLE input-addressed key (td-toolchain-x86_64.lock + toolchain-key/path) — sharing i686's source set with ARCH as the sole discriminator, predictable from the lock across non-reproducible rebuilds; a real binary placed there runs, /gnu/store absent (the x86_64 parallel of #204 — the x86_64 td-subst chain-caching prereq)"

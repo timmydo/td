@@ -1,4 +1,4 @@
-//! td-builder — td's own builder (DESIGN §7.1 side-track; plan/td-builder.md).
+//! td-builder — td's own builder (DESIGN §7.1 side-track).
 //!
 //! Goal of the track: a td-owned Rust binary that executes a `.drv` in a
 //! user-namespace sandbox and registers the output, proven behaviorally
@@ -3499,7 +3499,7 @@ fn main() -> ExitCode {
         // S3b/S3c — execute the drv in the userns sandbox and register the
         // outputs. CLOSURE is a file listing every store path the build may
         // see, one per line; writes land under SCRATCH/newstore and the v1
-        // registration record (plan/td-builder.md Q3) under
+        // registration record under
         // SCRATCH/registration.
         Some("build") if args.len() == 5 => {
             let (drv_path, closure_file, scratch) = (&args[2], &args[3], &args[4]);
@@ -3810,7 +3810,7 @@ fn main() -> ExitCode {
             }
         }
         // td-builder build-plan --auto — GENERATE the plan from the recipe GRAPH (no
-        // hand-written plan/manifest): topo-sort TARGET's owned-input closure, mark each
+        // hand-written plan or manifest): topo-sort TARGET's owned-input closure, mark each
         // owned-input dep `td-recipe-output`, and run it. An input is owned iff
         // RECIPE-DIR/<name>.json and LOCK-DIR/<name>-no-guix.lock both exist.
         // Usage: build-plan --auto TARGET RECIPE-DIR LOCK-DIR GUIX-DB SCRATCH

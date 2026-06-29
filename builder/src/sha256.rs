@@ -1,5 +1,5 @@
 //! SHA-256 (FIPS 180-4), hand-rolled to keep the crate zero-dependency
-//! (plan/td-builder.md S2: offline by construction; correctness is proven two
+//! (S2: offline by construction; correctness is proven two
 //! ways — the FIPS test vectors below, and the S2 rung differential against
 //! the daemon's recorded NAR hashes).
 

@@ -1,6 +1,6 @@
 //! Minimal raw x86_64-linux syscall layer: unshare(2), mount(2), getuid(2),
 //! getgid(2) — exactly what the build sandbox needs. Hand-rolled to keep the
-//! crate zero-dependency (plan/td-builder.md Q4: precedent is the
+//! crate zero-dependency (precedent is the
 //! hand-rolled SHA-256; the rung's differential proves behavior, and the drv
 //! platform field is checked to be x86_64-linux before any of this runs).
 

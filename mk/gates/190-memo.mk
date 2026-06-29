@@ -1,4 +1,4 @@
-# check-memo discipline gate (DESIGN §7.1 side-track; plan/check-memo.md — the
+# check-memo discipline gate (DESIGN §7.1 side-track — the
 # §4.3 gate-2 charter with the BINDING constraints 1-6). Permanent,
 # self-discriminating exercise of the verdict-memoization helper
 # (tests/check-memo.sh) on TINY fixture drvs, so the charter's constraints are

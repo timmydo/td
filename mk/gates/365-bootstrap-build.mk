@@ -25,7 +25,7 @@
 #     path ⇒ a different drv ⇒ a different output path, identical behavior). Delete this
 #     leg when guix retires; the durable legs above still stand.
 #
-# Self-discrimination (verified-red, recorded in plan/bootstrap-td-builder.md): (1)
+# Self-discrimination (verified-red): (1)
 # dropping the builder override makes build-recipe fall back to the guix-built td-builder
 # and hello's .drv `builder` becomes guix's path — the STRUCTURAL assert flips (exit 2);
 # (2) corrupting the builder's on-disk staging path (canonical\t<bogus>) makes the staged

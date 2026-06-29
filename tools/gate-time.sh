@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# gate-time.sh — the per-gate wall-clock SHELL wrapper for `make check` (task L1,
-# plan/loop-latency.md). The Makefile points the TIMED gate targets'
+# gate-time.sh — the per-gate wall-clock SHELL wrapper for `make check` (task L1). The Makefile points the TIMED gate targets'
 # `.SHELLFLAGS` at this script, so make runs each gate recipe line as
 #   bash tools/gate-time.sh <gate-name> -c '<recipe>'
 # (a non-default .SHELLFLAGS also disables make's direct-exec fast path, so

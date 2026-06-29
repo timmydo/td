@@ -1,5 +1,5 @@
 ;; tests/check-memo-info.scm — daemon-DB facts for the check-memo helper
-;; (plan/check-memo.md constraint 5: a hit is a cheap assertion, not a
+;; (constraint 5: a hit is a cheap assertion, not a
 ;; no-op). TD_DRVS holds space-separated .drv store paths; for each output
 ;; of each drv this prints ONE line:
 ;;

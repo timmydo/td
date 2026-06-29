@@ -6,7 +6,7 @@
 //! is the stable key. `recipe-rs` proves each entry equals its boa-evaluated
 //! `.ts` twin (the removable migration oracle).
 //!
-//! NOTE (follow-up, plan/rust-migration.md): a `build.rs` glob over
+//! NOTE (follow-up): a `build.rs` glob over
 //! `src/recipes/*.rs` would let each recipe live in its own self-registering file
 //! (the mk/gates "one file, no shared line" property). PR1 keeps a single central
 //! table for reviewability; splitting it is mechanical and changes no behavior.

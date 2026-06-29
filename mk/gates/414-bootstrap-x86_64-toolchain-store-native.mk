@@ -18,8 +18,7 @@
 # fetched-not-rebuilt bytes in the own-root → 42, with cold-store/wrong-key/wrong-StorePath self-discrimination;
 # DELIBERATE directive-1 relaxation, human-approved). This gate still BUILDS from seed AND fetches — it proves the
 # consumer CAPABILITY (the loop can obtain the real x86_64 toolchain by fetching); the actual per-PR build-SKIP
-# needs the whole-toolchain closure fetch + a populated persistent store and is the PR3b follow-up (see
-# plan/x64-toolchain-subst.md). The subst round-trip lives in tests/x86_64-subst-lib.sh. NOT a BUILD_GATE. The
+# needs the whole-toolchain closure fetch + a populated persistent store and is the PR3b follow-up. The subst round-trip lives in tests/x86_64-subst-lib.sh. NOT a BUILD_GATE. The
 # cross rungs live in tests/x86_64-cross-fns.sh.
 HEAVY_GATES += bootstrap-x86_64-toolchain-store-native
 bootstrap-x86_64-toolchain-store-native:

@@ -28,13 +28,13 @@ LOAD    := -L .
 SYSTEM  := system/td.scm
 IMGTYPE := qcow2
 
-# --- Per-gate wall-clock instrumentation (task L1, plan/loop-latency.md) -------
+# --- Per-gate wall-clock instrumentation (task L1) -------
 # Every TIMED gate (see the .SHELLFLAGS block after the gate pools) runs its
 # recipe through tools/gate-time.sh, which logs a START/END event per recipe
 # line to a per-run log; tools/gate-timing-report.sh reduces each gate's
 # min(START)/max(END) into a wall-clock span so latency regressions are visible
-# and the heavy-gate LPT order is renumbered from DATA, not the hand-run numbers
-# in plan/loop-latency.md. The log is integer-nanosecond timestamps (the sandbox
+# and the heavy-gate LPT order is renumbered from DATA, not the hand-run numbers.
+# The log is integer-nanosecond timestamps (the sandbox
 # has no awk). One log per make invocation (TD_GATE_RUN keeps concurrent runs in
 # the same worktree from clobbering each other); the report keeps the newest 10.
 TD_GATE_TIMING_DIR := $(CURDIR)/.td-build-cache/gate-timing
@@ -89,7 +89,7 @@ endef
 # longest gates lets the short ones fill the gaps instead of leaving a long gate
 # to run alone at the end. RE-MEASURE AND RE-SORT (renumber the fragments)
 # whenever the full-check wall time drifts; per-gate cost notes live in the
-# fragment headers and plan/loop-latency.md. A stale order only costs latency.
+# fragment headers. A stale order only costs latency.
 #
 # NOTHING is removed, loosened, or skipped by the parallelism: all gates must
 # still pass, and make (run without -k) stops spawning new gates after a failure

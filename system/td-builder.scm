@@ -14,7 +14,7 @@
 ;; crate; this package definition carries them with no structural change.
 ;;
 ;; FSDG: the crate has NO dependencies at S1, so nothing is vendored; any future
-;; crate must be free and come through the pinned channel (plan/td-builder.md).
+;; crate must be free and come through the pinned channel.
 
 (define-module (system td-builder)
   #:use-module (guix packages)

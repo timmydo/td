@@ -1,6 +1,6 @@
 //! ATerm `.drv` parser, matching the pinned daemon's grammar exactly
 //! (nix/libstore/derivations.cc parseDerivation + nix/libutil/util.cc
-//! parseString, read off the pin and recorded in plan/td-builder.md):
+//! parseString, read off the pin):
 //!   - Derive([outputs],[inputDrvs],[inputSrcs],system,builder,[args],[env]);
 //!   - an output is (name,path,hashAlgo,hash); an input drv is (path,[names]);
 //!   - strings are double-quoted; after a backslash, `n`/`r`/`t` decode to

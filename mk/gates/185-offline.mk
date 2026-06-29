@@ -1,4 +1,4 @@
-# 9. offline-isolation sandbox probe (plan/offline-isolation.md S1). The
+# 9. offline-isolation sandbox probe (S1). The
 #    hermeticity clause says an UNDECLARED fetch — network access from a
 #    non-fixed-output builder — must be impossible; until now that was an
 #    assumed property of guix-daemon's sandbox, never an asserted gate. This
@@ -12,8 +12,8 @@
 #    contexts: check.sh's host-side control proves the SAME /proc/net/dev
 #    mechanism reports non-lo interfaces where network IS present, and the
 #    fixed-output twin (DRV_DAEMON, wired in at S2) is the same builder body
-#    failing red in a network-visible netns (verified-red evidence in
-#    plan/offline-isolation.md). Cheapest heavy gate (one tiny local build) →
+#    failing red in a network-visible netns (verified-red evidence).
+#    Cheapest heavy gate (one tiny local build) →
 #    listed last (LPT).
 HEAVY_GATES += offline
 offline:
