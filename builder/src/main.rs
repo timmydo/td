@@ -4127,10 +4127,22 @@ fn main() -> ExitCode {
                     if Path::new(&cache).is_dir() {
                         binds.push(sandbox::Bind { src: cache, dest: None, readonly: false, ro_optional: false });
                     }
+                    // The persistent signed substitute store (~/.td/subst, populated by the daily) —
+                    // READ-ONLY: the loop FETCHES the lock-keyed toolchain closure from it
+                    // (x64-toolchain-subst) over its own loopback netns instead of rebuilding ~98 min
+                    // from seed, and never writes it. Like the host /gnu/store + guix cache, it is a
+                    // declared, exposed input — no network egress (resolve-toolchain serves loopback).
+                    let subst = format!("{home}/.td/subst");
+                    if Path::new(&subst).is_dir() {
+                        binds.push(sandbox::Bind { src: subst, dest: None, readonly: true, ro_optional: false });
+                    }
                     path_env = std::env::var("PATH").unwrap_or_default();
                     workdir = cwd;
                     for (k, v) in std::env::vars() {
-                        if k.starts_with("TD_CHECK_") {
+                        // TD_CHECK_* = the check-memo identity; TD_SUBST_* = the host-provisioned
+                        // substitute resolver knobs (TD_SUBST_BIN/STORE/PUBKEY) the toolchain gates
+                        // read to FETCH the lock-keyed closure instead of building from seed.
+                        if k.starts_with("TD_CHECK_") || k.starts_with("TD_SUBST_") {
                             extra_env.push((k, v));
                         }
                     }
