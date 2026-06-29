@@ -46,7 +46,37 @@ NOT an earlier gcc-4.x split.
   proves the per-PR loop can OBTAIN the real x86_64 toolchain by fetching, not only by building
   (the consumer capability on real bytes) — a DELIBERATE directive-1 relaxation, human-approved.
   KEY FINDING: fetch-instead-of-build was wired for NO arch (gate 359 = fixture mechanism proof
-  only; gates 412/414 always built from seed).
+  only; gates 412/414 always built from seed). **#223 was INSUFFICIENT** (human 2026-06-28): it
+  fetches IN ADDITION to building — proves the capability but does NOT skip the ~98-min build.
+
+## The REAL skip — locked design (human 2026-06-28, the 5 points)
+
+Goal: a per-PR toolchain gate SKIPS the ~98-min from-seed build by FETCHING the toolchain
+CLOSURE from a persistent `~/.td/subst` exposed into the sandbox; falls back to from-seed on MISS.
+
+- **Closure = the 3 `td-toolchain-x86_64.lock` components** {binutils-2.44-x86_64, gcc-14.3.0-x86_64,
+  glibc-2.41-x86_64}. FINDING: the cross gcc/binutils are built `-static` (`_mk_static_wrapper` →
+  `gcc-14 -static`, used as stage2 `CC`), so they are static i686 binaries that DO NOT need the
+  i686 glibc-2.16 runtime — the closure is just the 3 x86_64 components, each already lock-keyed.
+  (If validation ever shows the cross gcc isn't fully static, add the i686 runtime; the `-static`
+  wrapper says it is.)
+- **td-subst provisioning (resolves the ts-eval cascade):** the per-PR gate must NOT build td-subst
+  (gate 414 isn't a BUILD_GATE → no ts-eval sentinel → `ts-emit` fails; making it a BUILD_GATE drags
+  in the whole corpus). Instead the **DAILY** (full `./check.sh`, has td-subst via build-recipes)
+  builds the closure from seed, publishes the signed closure to `~/.td/subst`, AND stashes the
+  `td-subst` binary there. `check.sh` host-prep (a `tools/warm-subst.sh`, feed-shared pattern)
+  exposes `TD_SUBST_BIN`/`TD_SUBST_STORE`/`TD_SUBST_PUBKEY` into the sandbox. Per-PR gate CONSUMES.
+- **Gate restructure (the actual skip):** move `load_stage0` + a resolve step to the TOP of gate 414
+  (before the i686 base build). If `TD_SUBST_BIN`+`STORE` set AND resolve HITs all 3 → place at
+  /td/store, set XBU/XGCC2/XGLIBC to fetched, SKIP `build_*`+`run_x86_64_cross`; else build from seed
+  + intern all 3. `verify_x86_64_ownroot` then compiles+runs from whichever toolchain (fetched/built).
+- **Daily publisher** (`ci/daily-full-suite.sh`): publish all 3 closure components (signed) + stash td-subst.
+- Revert #223's in-gate td-subst/round-trip (the ts-eval dead-end) — td-subst now comes from host-prep.
+
+Increment order: (A) gate: intern all 3 + resolve-first SKIP branch using env td-subst, verify from
+either; (B) check.sh host-prep warm-subst.sh (EXCLUSIVE); (C) daily publisher closure+stash. Skip is
+testable only against a populated store (manual: build once → publish → re-run → HIT). Multi-hour,
+multiple ~98-min validations.
 - **PR3b (FOLLOW-UP) — the per-PR full-build SKIP.** Actually skip the ~98-min build on a HIT.
   Needs the whole-toolchain CLOSURE fetch: the cross gcc is an i686 binary that needs the i686
   glibc runtime to compile the verify program, so skipping the build means fetching gcc + binutils
