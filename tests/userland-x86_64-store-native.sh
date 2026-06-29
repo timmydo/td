@@ -76,6 +76,10 @@ build_make_x86_64() {
   # The sandbox has NO /bin/sh: run configure THROUGH the curated shell (its #!/bin/sh shebang
   # would otherwise fail "No such file or directory"), and rewrite any #!/bin/sh helper shebangs.
   find "$src" -type f -exec sed -i "1s|^#! */bin/sh\b|#!$csh|" {} + 2>/dev/null || true
+  # Tarball mtime ordering makes `make` try to re-run automake/autoconf (absent → Error 127).
+  # Pin all autotools build-system files to ONE mtime so none is strictly newer than another
+  # (a target is only rebuilt when a prerequisite is *strictly* newer) → no regeneration.
+  find "$src" -type f \( -name '*.in' -o -name '*.am' -o -name '*.ac' -o -name '*.m4' -o -name configure \) -exec touch -t 202601010101 {} + 2>/dev/null || true
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
   ( cd "$src"; bp="$xb/bin:$XBIN:$mc"   # $XBIN = the cross-fns _xbin scaffolding (awk/m4/bison/flex/cmp/...); target binaries find glibc via the absolute build-dir rpath the cc wrapper bakes (NO LD_LIBRARY_PATH — it would poison the host gawk)
     env PATH="$bp" CC="$wb/cc" CPP="$wb/cc -E" CONFIG_SHELL="$csh" SHELL="$csh" "$csh" ./configure --build="$XTARGET" --host="$XTARGET" --disable-dependency-tracking >cfg.log 2>&1 \
