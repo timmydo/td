@@ -30,7 +30,7 @@ test -n "$LOCK" || fail "no seed/sources/rust-*.lock pin"
 SHA=`sed -n 's/^sha256 //p' "$LOCK" | head -1`
 FILE=`sed -n 's/^file //p' "$LOCK" | head -1`
 TARBALL=".td-build-cache/sources/$FILE"
-test -f "$TARBALL" || fail "warmed $TARBALL absent — run tools/warm-bootstrap-sources.sh (host PREP)"
+test -f "$TARBALL" || fail "warmed $TARBALL absent — run td-feed warm sources (host PREP)"
 test "`sha "$TARBALL"`" = "$SHA" || fail "warmed $TARBALL sha256 != lock pin ($SHA) — corrupt fetch or stale lock"
 echo "   [supply-chain] $FILE matches the lock sha256 ($SHA) — upstream Rust bytes, not guix"
 

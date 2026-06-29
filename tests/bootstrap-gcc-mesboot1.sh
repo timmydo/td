@@ -13,7 +13,7 @@
 # move-if-change, which the loop sandbox's diffutils-free PATH otherwise can't run). CPLUS_INCLUDE_PATH
 # mirrors C_INCLUDE_PATH so the C headers are found while libstdc++ is compiled (guix's setenv).
 #
-# KERNEL HEADERS: produced FROM the pinned linux-4.14.67 source on the HOST (tools/warm-kernel-headers.sh,
+# KERNEL HEADERS: produced FROM the pinned linux-4.14.67 source on the HOST (td-feed warm kernel-headers i386,
 # check.sh's prelude); this gate CONSUMES them (guix's %bootstrap-linux-libre-headers is a rejected blob).
 #
 # i686, static, serial. mes/…/gcc-4.6.4/gcc-g++-4.6.4/gmp/mpfr/mpc are td-fetched; the 5 guix boot patches
@@ -55,14 +55,14 @@ TCC_TB=".td-build-cache/sources/`lf "$TCC_LOCK" file`";     MAKE_TB=".td-build-c
 PATCH_TB=".td-build-cache/sources/`lf "$PATCH_LOCK" file`"; BU_TB=".td-build-cache/sources/`lf "$BU_LOCK" file`"
 GCC_TB=".td-build-cache/sources/`lf "$GCC_LOCK" file`";     GLIBC_TB=".td-build-cache/sources/`lf "$GLIBC_LOCK" file`"
 LINUX_TB=".td-build-cache/sources/`lf "$LINUX_LOCK" file`"
-# the host-produced kernel-headers tarball (warm-kernel-headers.sh; derived from the pinned linux src)
+# the host-produced kernel-headers tarball (td-feed warm kernel-headers i386; derived from the pinned linux src)
 KH_VER=`printf '%s' "\`lf "$LINUX_LOCK" file\`" | sed -n 's/^linux-\(.*\)\.tar\..*$/\1/p'`
 KH_TB=".td-build-cache/sources/linux-headers-$KH_VER-i386.tar.gz"
 for pair in "$MES_TB:`lf "$MES_LOCK" sha256`" "$NYACC_TB:`lf "$NYACC_LOCK" sha256`" "$TCC_TB:`lf "$TCC_LOCK" sha256`" \
             "$MAKE_TB:`lf "$MAKE_LOCK" sha256`" "$PATCH_TB:`lf "$PATCH_LOCK" sha256`" "$BU_TB:`lf "$BU_LOCK" sha256`" \
             "$GCC_TB:`lf "$GCC_LOCK" sha256`" "$GLIBC_TB:`lf "$GLIBC_LOCK" sha256`" "$LINUX_TB:`lf "$LINUX_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 for pp in "$BOOT_PATCH:$BOOT_PATCH_SHA" "$GCC_PATCH:$GCC_PATCH_SHA" "$GLIBC_P1:$GLIBC_P1_SHA" "$GLIBC_P2:$GLIBC_P2_SHA"; do
@@ -260,13 +260,13 @@ build_gcc() {
   ) || return 1
   test -x "$gd/out/bin/gcc" || { echo "no gcc produced" >&2; return 1; }
 }
-# --- mesboot-headers: install the host-produced Linux UAPI headers (warm-kernel-headers.sh) + the mes
+# --- mesboot-headers: install the host-produced Linux UAPI headers (td-feed warm kernel-headers i386) + the mes
 # includes (guix's mesboot-headers merges both). The sandbox can't run the kernel build; the headers
 # tarball is produced on the host from the pinned linux source. Returns the headers dir.
 build_headers() {
   mesp=$1; hd=$2
   rm -rf "$hd"; mkdir -p "$hd/include"
-  test -f "$KH_TB" || { echo "kernel headers tarball not produced ($KH_TB) — run tools/warm-kernel-headers.sh" >&2; return 1; }
+  test -f "$KH_TB" || { echo "kernel headers tarball not produced ($KH_TB) — run td-feed warm kernel-headers i386" >&2; return 1; }
   tar -xzf "$KH_TB" -C "$hd/include" || { echo "kernel headers unpack failed" >&2; return 1; }
   cp -a "$mesp/include/." "$hd/include/" 2>/dev/null || true
   test -f "$hd/include/linux/version.h" -a -f "$hd/include/asm/unistd.h" || { echo "kernel headers incomplete (no version.h/unistd.h)" >&2; return 1; }
@@ -487,7 +487,7 @@ GCC464_PATCH_SHA=0dfcb1813ca54eafad0d3bbec17b423d6e50ab76d730b35eb6df7018ed43edf
 for pair in "$MAKE382_TB:`lf "$MAKE382_LOCK" sha256`" "$GCC464_TB:`lf "$GCC464_LOCK" sha256`" "$GPP464_TB:`lf "$GPP464_LOCK" sha256`" \
             "$GMP_TB:`lf "$GMP_LOCK" sha256`" "$MPFR_TB:`lf "$MPFR_LOCK" sha256`" "$MPC_TB:`lf "$MPC_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 test -f "$GCC464_PATCH" || fail "vendored patch missing ($GCC464_PATCH)"

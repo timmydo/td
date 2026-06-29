@@ -3,7 +3,7 @@
 # coreutils/bash/tar/gzip lines are the shared Rust seed (retired last by source-bootstrap).
 #
 # Phase 2b: the crate closure + the source crate are NO LONGER pinned here as /gnu/store
-# FODs. They are provisioned GUIX-FREE through td's cargo-proxy (tools/warm-cargo-proxy.sh,
+# FODs. They are provisioned GUIX-FREE through td's cargo-proxy (td-feed warm crate,
 # Cargo.lock-pinned, sha256 == the crates.io index cksum) and interned by the rust-eza
 # gate (no guix build, no /gnu/store crate FOD, no oracle).
 kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0 /gnu/store/kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0

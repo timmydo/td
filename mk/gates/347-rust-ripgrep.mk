@@ -1,6 +1,6 @@
 # rust-ripgrep — td builds `ripgrep` (rg 14.1.1) with its WHOLE crate closure (source + 57
 # deps) provisioned GUIX-FREE through td's OWN cargo-proxy: cargo resolved + fetched it
-# through `td-feed cargo-proxy` (tools/warm-cargo-proxy.sh, host PREP), the proxy verifying
+# through `td-feed cargo-proxy` (td-feed warm crate, host PREP), the proxy verifying
 # each `.crate` sha256 == the crates.io sparse-index cksum (the UPSTREAM pin, NOT a guix
 # artifact); source + deps are interned by td's OWN store-add-recursive and build-recipe
 # vendors from them (TD_VENDOR_DIR). No guix oracle (human 2026-06-23): content-address

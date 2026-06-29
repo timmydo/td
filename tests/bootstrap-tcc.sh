@@ -6,7 +6,7 @@
 #
 # Built i686 (32-bit), as guix's tcc-boot0 does. The mes-patched tcc (0.9.26-1149, the 30-patch
 # fork MesCC can compile) + mes-0.27.1 + nyacc-1.00.2 are td-fetched, not vendored
-# (seed/sources/*.lock, warmed by tools/warm-bootstrap-sources.sh in check.sh's prelude).
+# (seed/sources/*.lock, warmed by td-feed warm sources in check.sh's prelude).
 # CRITICAL: mescc runs with MES_ARENA at the guix default (20M cells) — a huge arena overflows the
 # 32-bit address space and segfaults; the default fits and compiles tcc.c.
 #
@@ -35,7 +35,7 @@ NYACC_TB=".td-build-cache/sources/`lf "$NYACC_LOCK" file`"
 TCC_TB=".td-build-cache/sources/`lf "$TCC_LOCK" file`"
 for pair in "$MES_TB:`lf "$MES_LOCK" sha256`" "$NYACC_TB:`lf "$NYACC_LOCK" sha256`" "$TCC_TB:`lf "$TCC_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh' (check.sh's prelude does this)"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources' (check.sh's prelude does this)"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 echo "   [pinned-input] td-fetched mes + nyacc + tcc tarballs match their lock sha256 — building from the pinned upstream bytes"

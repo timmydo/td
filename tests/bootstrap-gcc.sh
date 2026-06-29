@@ -52,7 +52,7 @@ for pair in "$MES_TB:`lf "$MES_LOCK" sha256`" "$NYACC_TB:`lf "$NYACC_LOCK" sha25
             "$MAKE_TB:`lf "$MAKE_LOCK" sha256`" "$PATCH_TB:`lf "$PATCH_LOCK" sha256`" "$BU_TB:`lf "$BU_LOCK" sha256`" \
             "$GCC_TB:`lf "$GCC_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 test -f "$BOOT_PATCH" || fail "vendored binutils boot patch missing ($BOOT_PATCH)"

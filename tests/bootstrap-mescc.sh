@@ -10,7 +10,7 @@
 # (M2-Planet/M1/hex2) target i686 via --architecture/defs, so no brick-0/1 rework is needed.
 #
 # Sources are td-fetched, not vendored (seed/sources/{mes,nyacc}-*.lock, warmed by
-# tools/warm-bootstrap-sources.sh in check.sh's prelude). The build driver is an auto-curated
+# td-feed warm sources in check.sh's prelude). The build driver is an auto-curated
 # PATH with gcc/g++/cc/guile/guix DENIED, so MesCC — not a guix compiler/interpreter — does the
 # compiling; coreutils/bash/sed/grep remain the §5 toolchain seed (retired last).
 #
@@ -36,7 +36,7 @@ MES_TB=".td-build-cache/sources/`lock_field "$MES_LOCK" file`"
 NYACC_TB=".td-build-cache/sources/`lock_field "$NYACC_LOCK" file`"
 for pair in "$MES_TB:`lock_field "$MES_LOCK" sha256`" "$NYACC_TB:`lock_field "$NYACC_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh' (check.sh's prelude does this)"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources' (check.sh's prelude does this)"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 echo "   [pinned-input] td-fetched mes + nyacc tarballs match their lock sha256 — building from the pinned upstream bytes"

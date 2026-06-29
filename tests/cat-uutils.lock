@@ -5,7 +5,7 @@
 #
 # Phase 2b: the 139-crate closure + the uu_cat source crate are NO LONGER pinned here as
 # /gnu/store FODs. They are provisioned GUIX-FREE through td's cargo-proxy
-# (tools/warm-cargo-proxy.sh uu_cat 0.9.0 cat, Cargo.lock-pinned, sha256 == the crates.io
+# (td-feed warm crate uu_cat 0.9.0 cat, Cargo.lock-pinned, sha256 == the crates.io
 # index cksum) and interned by the rust-uutils gate (no guix build, no /gnu/store crate
 # FOD, no oracle — content-address is the upstream pin).
 kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0 /gnu/store/kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0

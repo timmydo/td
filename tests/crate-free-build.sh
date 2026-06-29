@@ -1,7 +1,7 @@
 #!/bin/sh
 # crate-free-build.sh — the shared GUIX-FREE rust build for the corpus `rust-<pkg>-crate-free`
 # gates. The package's source tree + its FULL dep closure were warmed by
-# tools/warm-cargo-proxy.sh (cargo resolved + fetched them THROUGH td's cargo-proxy, each
+# td-feed warm crate (cargo resolved + fetched them THROUGH td's cargo-proxy, each
 # `.crate` sha256 == the crates.io index cksum). This script then, with NO guix in the crate
 # path and NO oracle (content-address = the Cargo.lock pin is the oracle):
 #   - [supply-chain] asserts every vendored crate's sha256 ∈ the package's shipped Cargo.lock
@@ -32,10 +32,10 @@ srctree="$dest/src/$cratedir"
 vendor="$dest/vendor"
 cargolock="$srctree/Cargo.lock"
 
-test -f "$srctree/Cargo.toml" || { echo "ERROR: no source tree at $srctree — the HOST PREP tools/warm-cargo-proxy.sh (check.sh prelude) must provision it first (offline gate cannot egress)" >&2; exit 1; }
+test -f "$srctree/Cargo.toml" || { echo "ERROR: no source tree at $srctree — the HOST PREP td-feed warm crate (check.sh prelude) must provision it first (offline gate cannot egress)" >&2; exit 1; }
 test -f "$cargolock" || { echo "ERROR: source $srctree ships no Cargo.lock" >&2; exit 1; }
 ncrate=$(ls "$vendor"/*.crate 2>/dev/null | wc -l)
-test "$ncrate" -ge 30 || { echo "ERROR: vendor dir $vendor has <30 crates ($ncrate) — re-run tools/warm-cargo-proxy.sh" >&2; exit 1; }
+test "$ncrate" -ge 30 || { echo "ERROR: vendor dir $vendor has <30 crates ($ncrate) — re-run td-feed warm crate" >&2; exit 1; }
 
 miss=0
 for c in "$vendor"/*.crate; do

@@ -1,7 +1,7 @@
 # rust-coreutils — td builds uutils-coreutils (the Rust coreutils, crate `coreutils` 0.9.0,
 # the ONE multicall `coreutils` binary) with its WHOLE crate closure (source + 507 deps)
 # provisioned GUIX-FREE through td's OWN cargo-proxy: cargo resolved + fetched it through `td-
-# feed cargo-proxy` (tools/warm-cargo-proxy.sh coreutils 0.9.0 uutils, host PREP), the proxy
+# feed cargo-proxy` (td-feed warm crate coreutils 0.9.0 uutils, host PREP), the proxy
 # verifying each `.crate` sha256 == the crates.io index cksum; source + deps interned by
 # store-add-recursive, vendored via TD_VENDOR_DIR. No guix oracle: content-address
 # (Cargo.lock pin == index cksum) is the oracle. Shared build+assert in tests/crate-free-

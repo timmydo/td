@@ -7,7 +7,7 @@
 #
 # Phase 2b: the 188-crate closure is NO LONGER pinned here as /gnu/store FODs. It is provisioned
 # GUIX-FREE through td's cargo-proxy from the IN-TREE tests/russh-demo/Cargo.lock
-# (tools/warm-cargo-proxy-local.sh tests/russh-demo russh — the source is local, so only the deps
+# (td-feed warm crate-local tests/russh-demo russh — the source is local, so only the deps
 # are fetched, each sha256 == the crates.io index cksum) and interned by the rust-russh gate (no
 # guix build, no /gnu/store crate FOD, no oracle — content-address is the upstream pin). The
 # td-russh-demo source is the live in-repo tree, interned at gate time (keyed td-russh-demo-source).

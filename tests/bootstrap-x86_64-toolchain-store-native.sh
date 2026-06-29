@@ -14,7 +14,7 @@
 # content-addressed into /td/store, and the cross gcc links a DYNAMIC x86_64 C AND C++ program against
 # it (interp = /td/store x86_64 ld-linux-x86-64.so.2) that runs in the own-root → 42, /gnu/store ABSENT.
 # The cross rungs live in tests/x86_64-cross-fns.sh (sourced). x86_64 kernel headers: host warm-prep
-# (tools/warm-kernel-headers-x86_64.sh — the i386 set is wrong arch). serial. all sources td-fetched.
+# (td-feed warm kernel-headers x86_64 — the i386 set is wrong arch). serial. all sources td-fetched.
 #
 # Legs (DURABLE — no guix oracle in any):
 #   [pinned-input] chain tarballs + boot patches + gcc-14.3.0 + gmp/mpfr/mpc + binutils-2.44 + glibc-2.41 + x86_64 kernel headers match sha256.
@@ -52,14 +52,14 @@ TCC_TB=".td-build-cache/sources/`lf "$TCC_LOCK" file`";     MAKE_TB=".td-build-c
 PATCH_TB=".td-build-cache/sources/`lf "$PATCH_LOCK" file`"; BU_TB=".td-build-cache/sources/`lf "$BU_LOCK" file`"
 GCC_TB=".td-build-cache/sources/`lf "$GCC_LOCK" file`";     GLIBC_TB=".td-build-cache/sources/`lf "$GLIBC_LOCK" file`"
 LINUX_TB=".td-build-cache/sources/`lf "$LINUX_LOCK" file`"
-# the host-produced kernel-headers tarball (warm-kernel-headers.sh; derived from the pinned linux src)
+# the host-produced kernel-headers tarball (td-feed warm kernel-headers i386; derived from the pinned linux src)
 KH_VER=`printf '%s' "\`lf "$LINUX_LOCK" file\`" | sed -n 's/^linux-\(.*\)\.tar\..*$/\1/p'`
 KH_TB=".td-build-cache/sources/linux-headers-$KH_VER-i386.tar.gz"
 for pair in "$MES_TB:`lf "$MES_LOCK" sha256`" "$NYACC_TB:`lf "$NYACC_LOCK" sha256`" "$TCC_TB:`lf "$TCC_LOCK" sha256`" \
             "$MAKE_TB:`lf "$MAKE_LOCK" sha256`" "$PATCH_TB:`lf "$PATCH_LOCK" sha256`" "$BU_TB:`lf "$BU_LOCK" sha256`" \
             "$GCC_TB:`lf "$GCC_LOCK" sha256`" "$GLIBC_TB:`lf "$GLIBC_LOCK" sha256`" "$LINUX_TB:`lf "$LINUX_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 for pp in "$BOOT_PATCH:$BOOT_PATCH_SHA" "$GCC_PATCH:$GCC_PATCH_SHA" "$GLIBC_P1:$GLIBC_P1_SHA" "$GLIBC_P2:$GLIBC_P2_SHA"; do
@@ -257,13 +257,13 @@ build_gcc() {
   ) || return 1
   test -x "$gd/out/bin/gcc" || { echo "no gcc produced" >&2; return 1; }
 }
-# --- mesboot-headers: install the host-produced Linux UAPI headers (warm-kernel-headers.sh) + the mes
+# --- mesboot-headers: install the host-produced Linux UAPI headers (td-feed warm kernel-headers i386) + the mes
 # includes (guix's mesboot-headers merges both). The sandbox can't run the kernel build; the headers
 # tarball is produced on the host from the pinned linux source. Returns the headers dir.
 build_headers() {
   mesp=$1; hd=$2
   rm -rf "$hd"; mkdir -p "$hd/include"
-  test -f "$KH_TB" || { echo "kernel headers tarball not produced ($KH_TB) — run tools/warm-kernel-headers.sh" >&2; return 1; }
+  test -f "$KH_TB" || { echo "kernel headers tarball not produced ($KH_TB) — run td-feed warm kernel-headers i386" >&2; return 1; }
   tar -xzf "$KH_TB" -C "$hd/include" || { echo "kernel headers unpack failed" >&2; return 1; }
   cp -a "$mesp/include/." "$hd/include/" 2>/dev/null || true
   test -f "$hd/include/linux/version.h" -a -f "$hd/include/asm/unistd.h" || { echo "kernel headers incomplete (no version.h/unistd.h)" >&2; return 1; }
@@ -806,7 +806,7 @@ for pair in "$MAKE382_TB:`lf "$MAKE382_LOCK" sha256`" "$GCC464_TB:`lf "$GCC464_L
             "$GMP_TB:`lf "$GMP_LOCK" sha256`" "$MPFR_TB:`lf "$MPFR_LOCK" sha256`" "$MPC_TB:`lf "$MPC_LOCK" sha256`" \
             "$GAWK_TB:`lf "$GAWK_LOCK" sha256`" "$GLIBC216_TB:`lf "$GLIBC216_LOCK" sha256`" "$GCC494_TB:`lf "$GCC494_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 for pp in "$GCC464_PATCH:$GCC464_PATCH_SHA" "$GLIBC216_P1:$GLIBC216_P1_SHA" "$GLIBC216_P2:$GLIBC216_P2_SHA"; do
@@ -819,7 +819,7 @@ MPFR421_LOCK=`ls seed/sources/gcc14-mpfr-*.lock`; MPFR421_TB=".td-build-cache/so
 MPC131_LOCK=`ls seed/sources/gcc14-mpc-*.lock`; MPC131_TB=".td-build-cache/sources/`lf "$MPC131_LOCK" file`"
 for pair in "$GCC14_TB:`lf "$GCC14_LOCK" sha256`" "$GMP63_TB:`lf "$GMP63_LOCK" sha256`" "$MPFR421_TB:`lf "$MPFR421_LOCK" sha256`" "$MPC131_TB:`lf "$MPC131_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 echo "   [pinned-input] + gcc-14.3.0/gmp-6.3.0/mpfr-4.2.1/mpc-1.3.1 (the modern gcc prereqs) match their pins"
@@ -827,7 +827,7 @@ BU244_LOCK=`ls seed/sources/binutils-2.44.lock`; BU244_TB=".td-build-cache/sourc
 GLIBC241_LOCK=`ls seed/sources/glibc-2.41.lock`; GLIBC241_TB=".td-build-cache/sources/`lf "$GLIBC241_LOCK" file`"
 for pair in "$BU244_TB:`lf "$BU244_LOCK" sha256`" "$GLIBC241_TB:`lf "$GLIBC241_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 echo "   [pinned-input] + binutils-2.44/glibc-2.41 (the modern toolchain final pieces) match their pins"
@@ -963,7 +963,7 @@ build_glibc_241() {
 
 # --- [pinned-input] the x86_64 kernel headers (host warm-prep) -------------------------------------
 KH_X86_64_TB=".td-build-cache/sources/linux-headers-$KH_VER-x86_64.tar.gz"
-test -f "$KH_X86_64_TB" || fail "x86_64 kernel headers not warm ($KH_X86_64_TB) — run 'sh tools/warm-kernel-headers-x86_64.sh'"
+test -f "$KH_X86_64_TB" || fail "x86_64 kernel headers not warm ($KH_X86_64_TB) — run 'td-feed warm kernel-headers x86_64'"
 echo "   [pinned-input] + the x86_64 Linux UAPI headers (derived from the pinned linux-$KH_VER source)"
 
 # --- sourced as a FUNCTION LIBRARY (TD_X86_64_LIB=1): the build_* rung functions are now
