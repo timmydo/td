@@ -1,0 +1,186 @@
+#!/bin/sh
+# tests/bootstrap-sed-corpus-store-native.sh — source-bootstrap BRICK 8 (retire the guix toolchain seed): a
+# SECOND real corpus package built by td's OWN /td/store toolchain, after GNU hello — the same BRICK 8 engine
+# path (bootstrap-hello-corpus-store-native), applied to GNU sed. "More corpus on the /td/store toolchain":
+# drives the guix gcc-toolchain out of the corpus baseline. From the 229-byte seed td builds the whole chain →
+# gcc-mesboot1 + binutils-mesboot + glibc 2.16.0 → GCC 4.9.4 → MODERN GCC 14.3.0 + a sandbox-runnable MODERN
+# binutils 2.44 → MODERN glibc 2.41 (the full /td/store toolchain). Then, with THAT toolchain substituted for
+# guix's gcc-toolchain-15.2.0, `td-builder build-recipe` builds a REAL corpus package — GNU sed 4.9, the exact
+# version sed-no-guix.lock builds with guix's gcc-toolchain — chained via the engine's closure_multi
+# (TD_EXTRA_DBS) + multi-prefix sandbox staging + 32-bit ELF interp rewriting. The sed binary links the
+# /td/store glibc 2.41, references NO guix gcc-toolchain, and RUNS in the own-root, performing a real text
+# substitution (foo→bar), /gnu/store ABSENT. A non-trivial GNU text processor (not a hello print) built by
+# td's OWN toolchain — the substitution that retires the guix toolchain seed, extended to a 2nd package.
+#
+# The ~850-line seed→…→gcc-14.3.0+binutils-2.44+glibc-2.41 chain lives in the SHARED library
+# tests/bootstrap-chain.sh (`bootstrap_modern_toolchain`); this gate sources it, so it carries ONLY the corpus
+# step. The gate also re-checks the toolchain by linking + running a C and a C++ program → 42 before the sed build.
+# i686, serial. all sources td-fetched; sed 4.9 + its build deps come from sed-no-guix.lock (guix-realized).
+#
+# Legs (DURABLE — no guix oracle in any):
+#   [pinned-input] chain tarballs + boot patches + gcc-4.9.4 + gcc-14.3.0 + gmp/mpfr/mpc + binutils-2.44 + glibc-2.41 match sha256.
+#   [no-guix]      built with gcc/g++/cc/guile/guix DENIED; no /gnu/store in glibc 2.41's libc.so.6 NOR gcc/cc1.
+#   [content-addr] the interned paths are /td/store/<nar-hash>-<name>.
+#   [behavioral]   the /td/store toolchain links a C+C++ program → 42, AND build-recipe builds GNU sed 4.9 with
+#                  it; the sed binary (interp = /td/store glibc 2.41) RUNS in the own-root → substitutes foo→bar.
+#   [no-guix-toolchain] the built sed references NO guix gcc-toolchain (the substituted-out compiler).
+#   [structural]   inside the own-root /td/store IS the store AND /gnu/store is ABSENT.
+set -eu
+
+ROOT=$(pwd)
+# The ~850-line seed→…→gcc-14.3.0+binutils-2.44+glibc-2.41 chain lives in the shared library
+# tests/bootstrap-chain.sh (extracted; all bootstrap-*-store-native gates can source it). This gate
+# adds ONLY the corpus step: build GNU sed 4.9 with that toolchain via td-builder build-recipe.
+. tests/bootstrap-chain.sh
+bootstrap_modern_toolchain   # from the seed: builds + verifies the toolchain; sets GCC14/GLIBC241/BMB244SB/CC1/cpath/KH_TB
+
+. tests/cache-lib.sh
+export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
+load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
+snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
+export TD_STORE_DIR=/td/store
+GLP=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$store" "$sndb"` || fail "store-add glibc-2.41 failed"
+case "$GLP" in /td/store/*-glibc-2.41) ;; *) fail "glibc-2.41 not content-addressed at /td/store: $GLP" ;; esac
+glrel=${GLP#/td/store/}
+echo "   [content-addr] interned $GLP in /td/store"
+
+# Build the test C/C++ programs IN THE SANDBOX (the userland build-wrapper trick): real -B/-L/-isystem at the
+# live glibc 2.41 build dir, the /td/store glibc 2.41 interp+RUNPATH baked; sandbox binutils 2.44 for as/ld.
+# Then RUN the artifacts standalone in the own-root (no binutils needed there). gcc 14's static libstdc++
+# (built vs glibc 2.16.0) runs on glibc 2.41 (backward-compatible). C++ exercises <vector>.
+csh=`command -v bash 2>/dev/null || command -v sh`
+bw=`mktemp -d`/bw; mkdir -p "$bw" "$snwork/w"
+printf 'int main(){return 42;}\n' > "$snwork/w/c.c"
+printf '#include <vector>\nint main(){std::vector<int> v; for(int i=0;i<43;i++) v.push_back(i); return v[42];}\n' > "$snwork/w/cpp.cc"
+for cc in gcc g++; do
+  printf '#!%s\nexec "%s/bin/%s" -isystem "%s/include" -B"%s/lib" -L"%s/lib" -L"%s/lib/gcc/i686-unknown-linux-gnu/14.3.0" -static-libgcc -static-libstdc++ -Wl,--dynamic-linker -Wl,/td/store/%s/lib/ld-linux.so.2 -Wl,--enable-new-dtags -Wl,-rpath -Wl,/td/store/%s/lib "$@"\n' \
+    "$csh" "$GCC14" "$cc" "$GLIBC241" "$GLIBC241" "$GLIBC241" "$GCC14" "$glrel" "$glrel" > "$bw/$cc"
+done
+chmod 0555 "$bw/gcc" "$bw/g++"
+( cd "$snwork/w" && env PATH="$BMB244SB/bin:$cpath" "$bw/gcc" -o c.out c.c ) || fail "gcc 14.3.0 did not compile a C program vs glibc 2.41"
+( cd "$snwork/w" && env PATH="$BMB244SB/bin:$cpath" "$bw/g++" -O2 -o cpp.out cpp.cc ) || fail "g++ 14.3.0 did not compile a C++ program vs glibc 2.41"
+ci=`"$BMB244SB/bin/readelf" -l "$snwork/w/c.out" 2>/dev/null | grep -o "/td/store/$glrel/lib/ld-linux.so.2" | head -1`
+test -n "$ci" || fail "the C program interp is not the /td/store glibc 2.41 ld-linux"
+if grep -q -a '/gnu/store' "$snwork/w/c.out"; then fail "the C program contains /gnu/store bytes"; fi
+echo "   built C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
+mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
+WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || fail "store-add prog failed"; wprel=${WP#/td/store/}
+bashlock=`grep -- '-bash-' tests/sed-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
+bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
+snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
+/td/store/'"$wprel"'/bin/c; echo "CRC=$?"
+/td/store/'"$wprel"'/bin/cpp; echo "CPPRC=$?"'
+snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | sed 's/^/     /' >&2; fail "store-ns glibc-2.41 probe exited nonzero"; }
+printf '%s\n' "$snout" | sed 's/^/     /' >&2
+echo "$snout" | grep -q '^CRC=42$'   || fail "the C program (vs glibc 2.41) did not return 42 in the own-root"
+echo "$snout" | grep -q '^CPPRC=42$' || fail "the C++ program (vs glibc 2.41) did not return 42 in the own-root"
+echo "   [behavioral] gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++) program against the MODERN glibc 2.41; both run in the own-root → 42"
+echo "$snout" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root — mixed with guix"
+echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT (unmixed from guix)"
+
+# =====================================================================================================
+# BRICK 8: the corpus is built by the /td/store toolchain, NOT guix's gcc-toolchain. `td-builder build-recipe`
+# builds a REAL corpus package — GNU sed 4.9 (the exact version sed-no-guix.lock builds with guix's
+# gcc-toolchain-15.2.0) — with the /td/store MODERN toolchain (gcc 14.3.0 + binutils 2.44 + glibc 2.41)
+# substituted for guix's gcc-toolchain. Chained via the engine's closure_multi (TD_EXTRA_DBS) + multi-prefix
+# sandbox staging. The sed binary links the /td/store glibc 2.41, references NO guix gcc-toolchain, and runs.
+echo "   --- brick 8: build-recipe builds corpus GNU sed 4.9 with the /td/store toolchain ---"
+b8=`mktemp -d`; bstore="$b8/seed-store"; bgdb="$b8/glibc.db"; btdb="$b8/toolchain.db"; mkdir -p "$bstore"
+BMB="$BMB244SB"
+BUILDBASH=`grep -- '-bash-5.2.37 ' tests/sed-no-guix.lock | grep -v -e static -e minimal | sed 's/^[^ ]* //' | head -1`/bin/bash
+case "$BUILDBASH" in /gnu/store/*-bash-*/bin/bash) ;; *) fail "brick8: could not resolve the lock's bash" ;; esac
+GLP8=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$bstore" "$bgdb"` || fail "brick8: store-add glibc-2.41 failed"
+# Assemble a guix-gcc-toolchain-SHAPED /td/store toolchain: gcc 14 WRAPPER (--sysroot glibc 2.41 so gcc-internal
+# headers precede glibc's; interp/RUNPATH baked; link flags only when LINKING; C_INCLUDE_PATH unset) + binutils
+# 2.44. Every dynamic bin's PT_INTERP → glibc 2.41 (i686, via td's own elf-set-interp). ar/ranlib/… are wrapped
+# to set LD_LIBRARY_PATH because make invokes them directly (not via the gcc wrapper).
+tc="$b8/gcc-toolchain"; mkdir -p "$tc/bin" "$tc/gcc"
+cp -a "$GCC14/." "$tc/gcc/"; cp -a "$GLIBC241/lib" "$tc/lib"; cp -a "$GCC14/lib/gcc" "$tc/lib/gcc"
+for t in "$BMB"/bin/*; do cp -a "$t" "$tc/bin/`basename "$t"`"; done
+for cc in gcc g++; do
+cat > "$tc/bin/$cc" <<WRAP
+#!$BUILDBASH
+self=\$(command -v "\$0" 2>/dev/null || echo "\$0")
+d=\$(cd "\$(dirname "\$(readlink -f "\$self")")/.." && pwd)
+export LD_LIBRARY_PATH="$GLP8/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+unset C_INCLUDE_PATH CPLUS_INCLUDE_PATH
+case " \$* " in
+  *" -E "*|*" -c "*|*" -S "*|*" -M "*|*" -MM "*) set -- --sysroot=$GLP8 -B$GLP8/lib "\$@" ;;
+  *) set -- --sysroot=$GLP8 -B$GLP8/lib -L$GLP8/lib -L"\$d/gcc/lib/gcc/i686-unknown-linux-gnu/14.3.0" -static-libgcc -Wl,--dynamic-linker -Wl,$GLP8/lib/ld-linux.so.2 -Wl,--enable-new-dtags -Wl,-rpath -Wl,$GLP8/lib "\$@" ;;
+esac
+exec "\$d/gcc/bin/$cc" "\$@"
+WRAP
+done
+chmod 0555 "$tc/bin/gcc" "$tc/bin/g++"
+find "$tc" -type f | while read -r t; do
+  if "$TB" elf-interp "$t" >/dev/null 2>&1; then "$TB" elf-set-interp "$t" "$GLP8/lib/ld-linux.so.2" >/dev/null 2>&1 || true; fi
+done
+mkdir -p "$tc/bin/.real"
+for tool in ar ranlib nm strip objcopy objdump; do
+  if [ -f "$tc/bin/$tool" ] && [ ! -L "$tc/bin/$tool" ]; then
+    mv "$tc/bin/$tool" "$tc/bin/.real/$tool"
+    cat > "$tc/bin/$tool" <<AWRAP
+#!$BUILDBASH
+export LD_LIBRARY_PATH="$GLP8/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+exec "\$(cd "\$(dirname "\$(readlink -f "\$0")")" && pwd)/.real/$tool" "\$@"
+AWRAP
+    chmod 0555 "$tc/bin/$tool"
+  fi
+done
+TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$btdb"` || fail "brick8: store-add gcc-toolchain failed"
+echo "   [brick8] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
+# Substitute the gcc-toolchain entry in sed's lock; glibc 2.41 stays in the closure via the toolchain's ref.
+# Use grep/sed (both in the declared loop toolchain) rather than awk — awk/gawk is NOT in the loop profile
+# (it is only on PATH via the host guix dir, an undeclared dependency), so grep/sed keeps this hermetic.
+oldtc=`grep -- '-gcc-toolchain-' tests/sed-no-guix.lock | head -1 | sed 's/^[^ ]* //'`
+test -n "$oldtc" || fail "brick8: no gcc-toolchain in sed-no-guix.lock"
+newlock="$b8/sed.lock"
+# rewrite the lone gcc-toolchain line into the /td/store toolchain ref + glibc 2.41 (paths are /td/store/<base32>-…, no sed-special chars; | delimiter avoids the path slashes).
+sed "s|^[^ ]*-gcc-toolchain-[^ ]* .*|gcc-toolchain $TCP seed\nglibc-2.41 $GLP8 seed|" tests/sed-no-guix.lock > "$newlock"
+grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
+"$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
+sort -u "$b8/roots" -o "$b8/roots"
+xargs guix build < "$b8/roots" >/dev/null 2>&1 || fail "brick8: could not realize the guix seed closure"
+seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-b8" $(cat "$b8/roots")` || fail "brick8: warm-seed failed"
+WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
+for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done
+chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
+# emit the sed recipe (td-ts-eval is provided by the build-recipes prelude), then build it.
+TD_TSGO=`sh tests/tsgo.sh`; export TD_TSGO TD_TSDIR="$ROOT/tests/ts"; load_ts_eval || fail "brick8: no td-ts-eval"
+sh tests/ts-emit.sh tests/ts/recipe-sed.ts > "$b8/sed.json" || fail "brick8: ts-emit sed"
+mkdir -p "$b8/sb" "$b8/tmp"; cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
+env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
+  TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
+  TD_SEED_STORE="$WSTORE" TD_SEED_DB="$WDB" TD_EXTRA_DBS="$bgdb:$btdb" \
+  "$TB" build-recipe "$b8/sed.json" "$newlock" "$b8/sb" "$WDB" >"$b8/sb.out" 2>"$b8/sb.err" \
+  || { tail -25 "$b8/sb.err" >&2; fail "brick8: build-recipe sed with the /td/store toolchain"; }
+o=`sed -n 's/^OUT=out //p' "$b8/sb.out"`; test -n "$o" || fail "brick8: sed produced no output"
+sdir="$b8/sb/newstore/`basename "$o"`"; sbin="$sdir/bin/sed"; test -x "$sbin" || fail "brick8: no sed binary"
+# (a) the /td/store toolchain linked it: interp is the /td/store glibc 2.41.
+si=`"$BMB/bin/readelf" -l "$sbin" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
+test -n "$si" || fail "brick8: sed not linked vs the /td/store glibc 2.41"
+# (b) [no-guix-toolchain] NO reference to guix's gcc-toolchain (the substituted-OUT compiler).
+if grep -q -a -- "$oldtc" "$sbin"; then fail "brick8: sed references the guix gcc-toolchain $oldtc"; fi
+echo "   [brick8 no-guix-toolchain] build-recipe built sed 4.9 with the /td/store toolchain; interp=$si; no guix gcc-toolchain ref"
+# (c) [DURABLE behavioral] sed runs in an own-root holding the /td/store glibc 2.41 + a static bash, and
+# performs a real text substitution: s/foo/bar/ on "foo\nbaz" must yield "bar\nbaz" (a transform, not a print).
+vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`; sb2=`basename "$o"`
+cp -a "$bstore/$glb" "$vs/$glb"; cp -a "$sdir" "$vs/$sb2"
+bs8=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bb8=`basename "$bs8"`; cp -a "$bs8" "$vs/$bb8"; chmod -R u+w "$vs"
+sedrun='printf "foo\nbaz\n" | /td/store/'"$sb2"'/bin/sed "s/foo/bar/"'
+g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "$sedrun" 2>&1` || { echo "$g8" | sed 's/^/     /' >&2; fail "brick8: store-ns sed run rc"; }
+printf '%s\n' "$g8" | sed 's/^/     /' >&2
+echo "$g8" | grep -q '^bar$' || fail "brick8: sed did not substitute foo->bar from /td/store: $g8"
+echo "$g8" | grep -q '^baz$' || fail "brick8: sed dropped the unmatched line from /td/store: $g8"
+if echo "$g8" | grep -q '^foo$'; then fail "brick8: sed left its input unchanged (no substitution) from /td/store: $g8"; fi
+echo "   [brick8 DURABLE behavioral] corpus sed runs from /td/store and transforms foo->bar (a real text substitution)"
+rm -rf "$ROOT/.td-build-cache/seed-b8" 2>/dev/null || true
+
+echo "PASS: source-bootstrap brick 8 (2nd corpus package, after hello) — from the 229-byte seed, td built the"
+echo "      chain → GCC 4.9.4 → MODERN GCC 14.3.0 + binutils 2.44 → MODERN glibc 2.41 (the full /td/store"
+echo "      toolchain), then with that toolchain (NOT guix's gcc-toolchain-15.2.0) td-builder build-recipe built"
+echo "      a REAL corpus package, GNU sed 4.9: it links the /td/store glibc 2.41, references no guix"
+echo "      gcc-toolchain, and runs in the own-root, substituting foo→bar, /gnu/store ABSENT. The corpus is"
+echo "      built by td's OWN toolchain."

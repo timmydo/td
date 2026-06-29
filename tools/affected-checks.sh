@@ -708,6 +708,13 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-hello-corpus-store-native ;;
 
+    tests/bootstrap-sed-corpus-store-native.sh|tests/bootstrap-chain.sh)
+      # tests/bootstrap-chain.sh is the SHARED from-seed toolchain chain; the sed corpus gate is its
+      # only consumer today (other bootstrap-*-store-native gates can migrate to it later, each adding
+      # itself here). A change to either re-runs the from-seed sed corpus build.
+      add_preflight shell-syntax
+      add_target bootstrap-sed-corpus-store-native ;;
+
     tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|tools/warm-kernel-headers-x86_64.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk)
       add_preflight shell-syntax
       add_target bootstrap-x86_64-toolchain-store-native ;;
