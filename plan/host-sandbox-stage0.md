@@ -210,3 +210,90 @@ the rust-free fast CI image — which HAS guix — is untouched, dissolving the 
 blocker); then a guix-free `check-noguix` tier + daily-full-suite wiring (ship a
 pre-captured pinned seed so the VM skips the capture). Exclusive landing on check.sh,
 sequenced last.
+
+---
+
+## inc2 fast-iteration via td-subst (plan, 2026-06-28) — "loop substitutes too" for x86_64
+
+The userland gate (and rust-x86_64) rebuild the ~18-rung /td/store toolchain from seed every
+run (~90 min). The td-subst toolchain mechanism already exists and is LOCK-PARAMETERIZED, so
+it works for the x86_64 toolchain — only the x86_64 publishing + consumer wiring is missing.
+
+Mechanism (traced): build td-subst → `td-builder store-add-input-addressed NAME KEY SRC STORE DB`
+(KEY = `toolchain-key LOCK`) interns at the lock-keyed /td/store path → `tools/publish-toolchain-subst.sh
+LOCK NAME DB STORE OUT_STORE` exports+signs into the persistent store → `tools/resolve-toolchain.sh
+LOCK NAME DEST` fetches (sig+StorePath+NarHash) or exits 1 to fall back to from-seed. The
+daily suite signs `.td-build-cache/toolchain-subst-export` + copies to `$TD_SUBST_STORE`
+(~/.td/subst). Pinned pub key = tests/td-subst.pub. Reference impls: gate 412
+(tests/bootstrap-glibc-241-store-native.sh ~L1046-1063, the i686 producer) and
+tests/toolchain-subst-default.sh (the consumer + publisher round-trip).
+
+Build-out (each piece = a 90-min from-seed validation):
+1. PRODUCER (x86_64): after `run_x86_64_cross` (XGLIBC/XGCC2/XBU/XLIBGCCDIR), for EACH of
+   glibc-2.41-x86_64, gcc-14.3.0-x86_64, binutils-2.44-x86_64: `IAKEY=toolchain-key
+   tests/td-toolchain-x86_64.lock`; `store-add-input-addressed <name> $IAKEY <component-tree>
+   $store $db`; `subst-export` → `.td-build-cache/toolchain-subst-export`. NOTE: the stage0
+   store db is single-entry per store-add (gate 412 comment) → export each component
+   IMMEDIATELY after interning it, before the next. Components need NOT be byte-reproducible
+   (trust = signature + input-addressed name, not repro — that's task 3). First confirm the
+   exact install-tree roots XGLIBC/XGCC2/XBU/XLIBGCCDIR point at (x86_64-cross-fns.sh) so the
+   interned tree == what `toolchain-path` names + what build_busybox/make consume.
+2. CONSUMER: a shared helper (or inline) — before the from-seed build, build td-subst (as
+   toolchain-subst-default does) and `resolve-toolchain.sh tests/td-toolchain-x86_64.lock
+   <component> <dest>` for the 3 components; ALL HIT → set XGLIBC/XGCC2/XBU/XLIBGCCDIR to the
+   fetched trees + SKIP the from-seed cross-up; ANY MISS → from-seed (current code). Wire into
+   tests/userland-x86_64-store-native.sh AND tests/rust-x86_64-runtime-store-native.sh.
+3. DAILY-SUITE: the publish step already signs+copies `.td-build-cache/toolchain-subst-export`;
+   it just needs the x86_64 export present (from step 1 running in the heavy suite). Confirm it
+   publishes ALL narinfos in the dir (i686 + x86_64), not one.
+4. ONE-TIME populate (for local iteration): run the from-seed build once with a local
+   TD_SUBST_PRIVKEY + TD_SUBST_STORE to publish the x86_64 toolchain; thereafter the userland
+   gate FETCHES it (~minutes/iteration).
+
+Directive-1: the AUTHORITATIVE from-seed build stays (daily suite = sole from-seed build +
+publisher); the resolver is the per-PR/local optimization, fall-back-on-miss (never silent).
+
+### SUPERSEDED by PR #223 (2026-06-28) — defer the toolchain-subst producer/publish
+
+PR #223 (worktree-x64-subst-fetch, x64-toolchain-subst track, plan/x64-toolchain-subst.md)
+is building the x86_64 toolchain fetch path: gate 414 interns the real x86_64 glibc at its
+lock-keyed path, builds td-subst, publishes + fetches + runs it via resolve-toolchain.sh.
+The per-PR BUILD-SKIP (the speedup) is its PR3b follow-up — and #223 found my step-1/2 plan
+above is INCOMPLETE: the skip needs the WHOLE-toolchain CLOSURE fetch (gcc + binutils + the
+i686 runtime, since the cross gcc is i686 and needs the i686 glibc to compile), not just the
+3 x86_64 components, plus daily publishing + check.sh exposing the persistent store.
+
+So this track does NOT build the producer/publish (avoid duplicating/colliding with #223 —
+it owns gate 414 / x86_64-cross-fns.sh / bootstrap-x86_64-toolchain-store-native.sh). Instead:
+- KEEP the userland layer (gate 420, busybox+make captured set) — the new thing #223 doesn't do.
+- It builds the toolchain from seed for now; once #223 + PR3b land the closure-fetch, retarget
+  the userland gate's toolchain provisioning to resolve-toolchain.sh (fetch, fall back to seed)
+  — a small change then, not the producer build-out planned above.
+
+### GREEN — gate 420 userland-x86_64-store-native (2026-06-28, after #223 merged)
+
+The userland captured set is DONE. After #223 merged, the gate FETCHES the x86_64 toolchain
+closure {binutils-2.44, gcc-14.3.0, glibc-2.41} via `x86_64_resolve_closure` (#223's subst
+machinery, signed + lock-keyed) and falls back to a from-seed build + `x86_64_build_closure`
+(directive 1). On the fetch path each iteration is ~15 min, not ~90 — that unlocked debugging
+the busybox/make build inside the loop sandbox. busybox 1.37.0 + GNU make 4.4.1 build from
+upstream source (td-fetch, sha-pinned) with that toolchain, DYNAMIC vs /td/store glibc 2.41,
+intern at /td/store, and RUN in the store-ns own-root → GNU Make 4.4.1, /gnu/store ABSENT, zero
+guix bytes. Verified-red: interp → bogus /td/store path ⇒ behavioral leg reds ("store-ns:
+spawning busybox: No such file or directory") — the interp relink is load-bearing.
+
+Sandbox-build lessons (busybox surfaces these as loud failures — the point of choosing it):
+- no /bin/sh: configure/Kbuild #!/bin/sh shebangs sed'd to the curated shell; AND glibc's
+  popen()/system() hardcode /bin/sh (busybox split-include) — a COMPILED libc call, no shebang
+  to sed → symlink /bin/sh in the dev-shell's writable ephemeral tmpfs root (namespace-local).
+- build-vs-run interp/rpath: bake the ABSOLUTE build-dir glibc rpath so test binaries run at
+  build with NO LD_LIBRARY_PATH (a global LD_LIBRARY_PATH=<x86_64 glibc> poisons the host gawk →
+  SIGFPE), then relink interp→/td/store/ld AND rpath→$ORIGIN/../lib at assemble (elf-set-rpath).
+- glibc component lacks the Linux UAPI headers (they live in the build sysroot) → -idirafter the
+  warm KH_X86_64_TB so glibc's bits/local_lim.h finds <linux/limits.h>.
+- scaffolding (no output bytes): awk/m4/bison/... via cross-fns _xbin (sorted/deterministic —
+  an ad-hoc gawk pick SIGFPE'd); find/xargs/bzip2 + plain-name binutils (ar/nm/...) for Kbuild;
+  CPP=<cross gcc -E> (no /lib/cpp); pin make's autotools mtimes (no automake re-run).
+
+NEXT (inc2c): wire gate 420 into a guix-free check tier + daily-full-suite; the toolchain
+fetch already works headless on a populated ~/.td/subst (the daily publishes it).

@@ -383,6 +383,14 @@ Standing posture decisions; naming them prevents surprises.
     re-hashed and rewrite-free — already exists (user-pm Phase 1/3, `TD_STORE_DIR`).
     guix may still appear ONLY as a removable differential oracle (build the same
     source both ways, diff the trees — directive 4), never as a build input.
+    The detailed provenance model this rests on — *no guix process* vs *no guix
+    bytes* as two independent properties, what contributes bytes to an artifact
+    (source + compiler + libc) vs the build-driver tools (which leave none), the
+    operational (`grep /gnu/store`) vs provenance tests, and the per-artifact
+    status of the daily-suite captured set (busybox/make guix-byte-free via
+    td-fetch + the `/td/store` toolchain, dynamic vs the shared `/td/store` glibc;
+    td-builder on upstream rust) — is written up in
+    [`plan/provenance.md`](plan/provenance.md).
 
   Phase 1 (`ts-frontend`, §7.1) replaces the spec *language* and keeps reading
   the pinned corpus underneath; corpus replacement is Phase 2, separately gated
