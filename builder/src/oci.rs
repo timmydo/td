@@ -19,14 +19,17 @@
 //!   <id>/layer.tar  the rootfs as a tar
 //!   repositories    {"td":{"latest":"<id>"}}
 //!
-//! Determinism (prime directive 1): every entry is emitted in a fixed order with
-//! normalized metadata (mtime=1 = SOURCE_DATE_EPOCH, uid/gid=0, empty uname/gname),
-//! so the same rootfs always packs to byte-identical bytes. NO guix/Guile is involved.
+//! Determinism (prime directive 1): every entry is emitted in a fixed order (sorted
+//! names) with normalized metadata — mtime=1 (SOURCE_DATE_EPOCH), uid/gid=0, empty
+//! uname/gname, and a normalized file mode (base 0644/0755 by exec bit, PRESERVING
+//! setuid/setgid/sticky) — so the same rootfs always packs to byte-identical bytes. NO
+//! guix/Guile is involved. Sizes use ustar octal, with GNU base-256 for fields a value
+//! overflows (a >=8 GiB layer.tar / rootfs file — real OS closures), and GNU `@LongLink`
+//! ('L'/'K') for names and symlink targets over 100 bytes (store paths and their
+//! absolute-path link targets). A non-UTF8 name/target is an error, not a lossy mangle.
 //!
 //! Scope (brick 1): pack a PREPARED rootfs directory into the archive. Laying a store
 //! CLOSURE into the rootfs (brick 2) and the load/run/oracle gate (brick 3) come next.
-//! Per-file sizes use ustar octal (the GNU base-256 large-size encoding for a
-//! >8 GiB layer.tar lands in brick 2, with real OS closures).
 
 use crate::sha256::Sha256;
 use std::fs;
@@ -55,17 +58,31 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
 
 // ---- deterministic ustar writer -------------------------------------------------
 
-/// Write VALUE as a zero-padded, NUL-terminated octal field filling `buf` (the ustar
-/// numeric convention: `buf.len()-1` octal digits then a NUL).
-fn octal_field(buf: &mut [u8], value: u64) {
-    let w = buf.len() - 1;
-    let s = format!("{value:0w$o}");
-    let b = s.as_bytes();
-    // A value that overflows the field is a brick-2 concern (base-256); refuse loudly.
-    let start = b.len().saturating_sub(w);
-    let digits = &b[start..];
-    buf[..digits.len()].copy_from_slice(digits);
-    buf[digits.len()] = 0;
+/// Write VALUE into the ustar numeric field `buf`. Small values use the classic
+/// zero-padded, NUL-terminated octal form (`buf.len()-1` digits then NUL). A value too
+/// large for octal (a `layer.tar` or rootfs file >= 8 GiB in the 12-byte size field —
+/// real OS closures hit this) uses the GNU **base-256** encoding: the field holds the
+/// number big-endian across all bytes with the high bit of byte 0 set as the marker
+/// (Go's `archive/tar` and GNU tar both read it). This is what makes large images
+/// correct instead of silently truncated — the earlier octal-only version dropped the
+/// high digits and desynced the tar stream.
+fn numeric_field(buf: &mut [u8], value: u64) {
+    let w = buf.len();
+    // Octal fits when value < 8^(w-1) (w-1 digits + a NUL). w is 8 or 12 here.
+    let octal_fits = (w - 1) >= 22 || (value as u128) < (1u128 << (3 * (w - 1)));
+    if octal_fits {
+        let s = format!("{value:0width$o}", width = w - 1);
+        buf[..w - 1].copy_from_slice(s.as_bytes());
+        buf[w - 1] = 0;
+    } else {
+        buf.fill(0);
+        let mut v = value;
+        for slot in buf.iter_mut().rev() {
+            *slot = (v & 0xff) as u8;
+            v >>= 8;
+        }
+        buf[0] |= 0x80; // base-256 marker
+    }
 }
 
 fn pad_to_block(out: &mut Vec<u8>) {
@@ -81,11 +98,11 @@ fn write_header(out: &mut Vec<u8>, name: &str, typeflag: u8, mode: u32, size: u6
     let nb = name.as_bytes();
     let nlen = nb.len().min(100);
     h[..nlen].copy_from_slice(&nb[..nlen]);
-    octal_field(&mut h[100..108], (mode & 0o7777) as u64);
-    octal_field(&mut h[108..116], 0); // uid
-    octal_field(&mut h[116..124], 0); // gid
-    octal_field(&mut h[124..136], size);
-    octal_field(&mut h[136..148], NORMAL_MTIME);
+    numeric_field(&mut h[100..108], (mode & 0o7777) as u64);
+    numeric_field(&mut h[108..116], 0); // uid
+    numeric_field(&mut h[116..124], 0); // gid
+    numeric_field(&mut h[124..136], size);
+    numeric_field(&mut h[136..148], NORMAL_MTIME);
     h[156] = typeflag;
     let lb = link.as_bytes();
     let llen = lb.len().min(100);
@@ -102,9 +119,18 @@ fn write_header(out: &mut Vec<u8>, name: &str, typeflag: u8, mode: u32, size: u6
     out.extend_from_slice(&h);
 }
 
-/// Append one tar entry (header + body, each block-padded), emitting a GNU '@LongLink'
-/// pseudo-entry first when NAME exceeds the 100-byte ustar name field (store paths do).
+/// Append one tar entry (header + body, each block-padded), emitting GNU '@LongLink'
+/// pseudo-entries first when the NAME (>100 bytes — store paths) or the symlink LINK
+/// target (>100 bytes — absolute store-path targets) exceed the 100-byte ustar fields.
+/// Without the 'K' entry a long symlink target is silently truncated to a wrong path.
 fn tar_entry(out: &mut Vec<u8>, name: &str, typeflag: u8, mode: u32, body: &[u8], link: &str) {
+    if link.len() > 100 {
+        let mut lbytes = link.as_bytes().to_vec();
+        lbytes.push(0);
+        write_header(out, "././@LongLink", b'K', 0o644, lbytes.len() as u64, "");
+        out.extend_from_slice(&lbytes);
+        pad_to_block(out);
+    }
     if name.len() > 100 {
         let mut nbytes = name.as_bytes().to_vec();
         nbytes.push(0);
@@ -131,8 +157,17 @@ fn append_tree(out: &mut Vec<u8>, root: &Path) -> io::Result<()> {
             if !rel.is_empty() {
                 tar_entry(out, &format!("{rel}/"), b'5', 0o755, &[], "");
             }
+            // Sort on the raw filename and ERROR on non-UTF8 (a lossy conversion would
+            // silently archive a mangled name): a store rootfs is UTF-8 by construction.
             let mut names: Vec<String> = fs::read_dir(&path)?
-                .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+                .map(|e| {
+                    e?.file_name().into_string().map_err(|n| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("non-UTF8 filename in layer: {}", n.to_string_lossy()),
+                        )
+                    })
+                })
                 .collect::<io::Result<_>>()?;
             names.sort();
             for n in names {
@@ -141,10 +176,17 @@ fn append_tree(out: &mut Vec<u8>, root: &Path) -> io::Result<()> {
             }
         } else if ft.is_symlink() {
             let target = fs::read_link(&path)?;
-            tar_entry(out, rel, b'2', 0o777, &[], &target.to_string_lossy());
+            let target = target.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 symlink target in layer")
+            })?;
+            tar_entry(out, rel, b'2', 0o777, &[], target);
         } else if ft.is_file() {
             let body = fs::read(&path)?;
-            let mode = if meta.permissions().mode() & 0o100 != 0 { 0o755 } else { 0o644 };
+            // Normalize mode but PRESERVE setuid/setgid/sticky (0o7000) and base exec on
+            // any exec bit — a collapse to 0o755/0o644 alone would drop a suid binary's
+            // bit.
+            let m = meta.permissions().mode();
+            let mode = (m & 0o7000) | if m & 0o111 != 0 { 0o755 } else { 0o644 };
             tar_entry(out, rel, b'0', mode, &body, "");
         } else {
             return Err(io::Error::new(
@@ -191,13 +233,16 @@ fn json_str_array(items: &[String]) -> String {
 }
 
 fn build_config_json(diff_hex: &str, cfg: &ImageConfig) -> String {
+    // PascalCase keys per the OCI/docker image-config spec (Env/Entrypoint/Cmd). Go
+    // consumers tolerate lowercase via case-insensitive matching, but a strict/non-Go
+    // consumer would drop the entrypoint+env entirely.
     let mut config_obj = format!(
-        "\"env\":{},\"entrypoint\":{}",
+        "\"Env\":{},\"Entrypoint\":{}",
         json_str_array(&cfg.env),
         json_str_array(&cfg.entrypoint)
     );
     if !cfg.cmd.is_empty() {
-        config_obj.push_str(&format!(",\"cmd\":{}", json_str_array(&cfg.cmd)));
+        config_obj.push_str(&format!(",\"Cmd\":{}", json_str_array(&cfg.cmd)));
     }
     format!(
         "{{\"architecture\":\"amd64\",\"comment\":\"Generated by td-builder\",\
@@ -257,49 +302,82 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    /// Minimal ustar reader for the tests: walk 512-blocks, honour GNU '@LongLink',
-    /// return (name, typeflag, body) per entry until the zero-block EOF. Doubles as a
-    /// validator that headers are block-aligned and checksums are well-formed.
-    fn read_tar(archive: &[u8]) -> Vec<(String, u8, Vec<u8>)> {
+    struct Entry {
+        name: String,
+        typeflag: u8,
+        mode: u32,
+        link: String,
+        body: Vec<u8>,
+    }
+
+    fn octal_at(field: &[u8]) -> u64 {
+        let s: String = field.iter().take_while(|&&b| b != 0 && b != b' ').map(|&b| b as char).collect();
+        u64::from_str_radix(s.trim(), 8).unwrap_or(0)
+    }
+
+    /// Minimal ustar reader for the tests: walk 512-blocks, decode base-256 sizes, honour
+    /// GNU '@LongLink' ('L' name, 'K' linkname), and return one Entry per real member
+    /// until the zero-block EOF. Doubles as a validator that headers are block-aligned
+    /// and checksums well-formed.
+    fn read_tar(archive: &[u8]) -> Vec<Entry> {
         let mut entries = Vec::new();
         let mut pos = 0usize;
-        let mut pending_long: Option<String> = None;
+        let mut pending_name: Option<String> = None;
+        let mut pending_link: Option<String> = None;
         while pos + BLOCK <= archive.len() {
             let h = &archive[pos..pos + BLOCK];
             if h.iter().all(|&b| b == 0) {
                 break;
             }
-            // verify checksum
-            let stored: u32 = {
-                let f = &h[148..156];
-                let s: String = f.iter().take_while(|&&b| b != 0 && b != b' ')
-                    .map(|&b| b as char).collect();
-                u32::from_str_radix(s.trim(), 8).unwrap()
-            };
+            let stored = octal_at(&h[148..156]) as u32;
             let mut hh = [0u8; BLOCK];
             hh.copy_from_slice(h);
             hh[148..156].fill(b' ');
             let sum: u32 = hh.iter().map(|&b| b as u32).sum();
             assert_eq!(sum, stored, "tar header checksum mismatch at block {}", pos / BLOCK);
-            let name_field: String = h[..100].iter().take_while(|&&b| b != 0)
-                .map(|&b| b as char).collect();
+            let name_field: String = h[..100].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            let mode = octal_at(&h[100..108]) as u32;
             let typeflag = h[156];
-            let size = {
-                let s: String = h[124..136].iter().take_while(|&&b| b != 0 && b != b' ')
-                    .map(|&b| b as char).collect();
-                u64::from_str_radix(s.trim(), 8).unwrap_or(0) as usize
+            let link_field: String = h[157..257].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            // size: GNU base-256 when the high bit of byte 0 is set, else octal.
+            let sz = &h[124..136];
+            let size = if sz[0] & 0x80 != 0 {
+                let mut v: u128 = (sz[0] & 0x7f) as u128;
+                for &b in &sz[1..] {
+                    v = (v << 8) | b as u128;
+                }
+                v as usize
+            } else {
+                octal_at(sz) as usize
             };
             pos += BLOCK;
             let body = archive[pos..pos + size].to_vec();
             pos += size.div_ceil(BLOCK) * BLOCK;
-            if typeflag == b'L' {
-                let mut s = String::from_utf8(body).unwrap();
-                if s.ends_with('\0') { s.pop(); }
-                pending_long = Some(s);
-                continue;
+            let mut detok = |b: Vec<u8>| {
+                let mut s = String::from_utf8(b).unwrap();
+                if s.ends_with('\0') {
+                    s.pop();
+                }
+                s
+            };
+            match typeflag {
+                b'L' => {
+                    pending_name = Some(detok(body));
+                    continue;
+                }
+                b'K' => {
+                    pending_link = Some(detok(body));
+                    continue;
+                }
+                _ => {}
             }
-            let name = pending_long.take().unwrap_or(name_field);
-            entries.push((name, typeflag, body));
+            entries.push(Entry {
+                name: pending_name.take().unwrap_or(name_field),
+                typeflag,
+                mode,
+                link: pending_link.take().unwrap_or(link_field),
+                body,
+            });
         }
         entries
     }
@@ -339,7 +417,7 @@ mod tests {
         make_rootfs(&rootfs);
         let mut out = Vec::new();
         write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
-        let names: Vec<String> = read_tar(&out).into_iter().map(|(n, _, _)| n).collect();
+        let names: Vec<String> = read_tar(&out).into_iter().map(|e| e.name).collect();
         assert!(names.iter().any(|n| n == "manifest.json"), "no manifest.json: {names:?}");
         assert!(names.iter().any(|n| n == "config.json"), "no config.json");
         assert!(names.iter().any(|n| n == "repositories"), "no repositories");
@@ -357,8 +435,8 @@ mod tests {
         let mut out = Vec::new();
         write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
         let entries = read_tar(&out);
-        let layer = &entries.iter().find(|(n, _, _)| n.ends_with("/layer.tar")).unwrap().2;
-        let config = &entries.iter().find(|(n, _, _)| n == "config.json").unwrap().2;
+        let layer = &entries.iter().find(|e| e.name.ends_with("/layer.tar")).unwrap().body;
+        let config = &entries.iter().find(|e| e.name == "config.json").unwrap().body;
         let want = format!("sha256:{}", crate::sha256::to_base16(&sha256_bytes(layer)));
         let config_str = String::from_utf8(config.clone()).unwrap();
         assert!(
@@ -367,7 +445,7 @@ mod tests {
         );
         // The layer.tar must itself be a well-formed tar (re-read it).
         let inner = read_tar(layer);
-        assert!(inner.iter().any(|(n, _, _)| n == "gnu/store/pkg/bin/hello"));
+        assert!(inner.iter().any(|e| e.name == "gnu/store/pkg/bin/hello"));
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -402,9 +480,92 @@ mod tests {
         write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
         // The layer.tar inside must carry the full long name (recovered via @LongLink).
         let entries = read_tar(&out);
-        let layer = &entries.iter().find(|(n, _, _)| n.ends_with("/layer.tar")).unwrap().2;
-        let inner: Vec<String> = read_tar(layer).into_iter().map(|(n, _, _)| n).collect();
+        let layer = &entries.iter().find(|e| e.name.ends_with("/layer.tar")).unwrap().body;
+        let inner: Vec<String> = read_tar(layer).into_iter().map(|e| e.name).collect();
         assert!(inner.iter().any(|n| n == &long), "long name not recovered: {inner:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    // ---- coverage for the review fixes -----------------------------------------
+
+    #[test]
+    fn numeric_field_octal_and_base256() {
+        // Small values: classic octal, NUL-terminated.
+        let mut f = [0u8; 12];
+        numeric_field(&mut f, 1);
+        assert_eq!(&f[..12], b"00000000001\0");
+        numeric_field(&mut f, 0o777);
+        assert_eq!(&f[..12], b"00000000777\0");
+        // >= 8 GiB overflows 11 octal digits → GNU base-256 (high bit of byte 0 set),
+        // big-endian value. The earlier octal-only code silently truncated this.
+        let big: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+        numeric_field(&mut f, big);
+        assert_eq!(f[0] & 0x80, 0x80, "base-256 marker not set for {big}");
+        let mut v: u128 = (f[0] & 0x7f) as u128;
+        for &b in &f[1..] {
+            v = (v << 8) | b as u128;
+        }
+        assert_eq!(v as u64, big, "base-256 round-trip wrong");
+    }
+
+    #[test]
+    fn long_symlink_target_roundtrips_via_k() {
+        let d = tmpdir("longtarget");
+        let rootfs = d.join("rootfs");
+        fs::create_dir_all(rootfs.join("bin")).unwrap();
+        // An absolute store-path target >100 bytes — without the 'K' longlink this is
+        // silently truncated to a wrong path.
+        let target = format!("/gnu/store/{}-pkg-1.0/bin/the-real-binary", "b".repeat(70));
+        assert!(target.len() > 100);
+        symlink(&target, rootfs.join("bin/x")).unwrap();
+        let mut out = Vec::new();
+        write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
+        let entries = read_tar(&out);
+        let layer = &entries.iter().find(|e| e.name.ends_with("/layer.tar")).unwrap().body;
+        let inner = read_tar(layer);
+        let link = inner.iter().find(|e| e.name == "bin/x").expect("symlink missing");
+        assert_eq!(link.typeflag, b'2', "not a symlink entry");
+        assert_eq!(link.link, target, "long symlink target was truncated");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn config_uses_pascalcase_keys() {
+        let d = tmpdir("pascal");
+        let rootfs = d.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+        make_rootfs(&rootfs);
+        let mut out = Vec::new();
+        write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
+        let entries = read_tar(&out);
+        let config = String::from_utf8(
+            entries.iter().find(|e| e.name == "config.json").unwrap().body.clone(),
+        )
+        .unwrap();
+        // OCI/docker image-config spec: Env/Entrypoint (PascalCase), not env/entrypoint.
+        assert!(config.contains("\"Env\":"), "config not PascalCase: {config}");
+        assert!(config.contains("\"Entrypoint\":"), "config not PascalCase: {config}");
+        assert!(!config.contains("\"env\":"), "config has lowercase env: {config}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn setuid_bit_preserved() {
+        let d = tmpdir("suid");
+        let rootfs = d.join("rootfs");
+        fs::create_dir_all(rootfs.join("bin")).unwrap();
+        let bin = rootfs.join("bin/su");
+        fs::write(&bin, b"x").unwrap();
+        let mut p = fs::metadata(&bin).unwrap().permissions();
+        p.set_mode(0o4755); // setuid + rwxr-xr-x
+        fs::set_permissions(&bin, p).unwrap();
+        let mut out = Vec::new();
+        write_docker_archive(&mut out, &rootfs, &sample_cfg()).unwrap();
+        let entries = read_tar(&out);
+        let layer = &entries.iter().find(|e| e.name.ends_with("/layer.tar")).unwrap().body;
+        let inner = read_tar(layer);
+        let su = inner.iter().find(|e| e.name == "bin/su").expect("bin/su missing");
+        assert_eq!(su.mode & 0o4000, 0o4000, "setuid bit dropped (mode {:o})", su.mode);
         fs::remove_dir_all(&d).unwrap();
     }
 }

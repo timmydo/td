@@ -1896,8 +1896,8 @@ fn main() -> ExitCode {
         }
         // oci-image: pack a PREPARED rootfs directory into a deterministic, uncompressed
         // docker-archive (OCI image) — td-native, no guix/Guile (system-image-native brick
-        // 1). CONFIG-JSON is {"repoTag","env":[],"entrypoint":[],"cmd":[]} (all optional but
-        // repoTag). Usage: oci-image ROOTFS-DIR CONFIG-JSON OUT.tar
+        // 1). CONFIG-JSON is {"repoTag","env":[],"entrypoint":[],"cmd":[]} (all optional;
+        // repoTag defaults to td:latest). Usage: oci-image ROOTFS-DIR CONFIG-JSON OUT.tar
         Some("oci-image") if args.len() == 5 => {
             let (rootfs, config_file, out_file) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
