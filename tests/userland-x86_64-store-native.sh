@@ -257,10 +257,11 @@ cp -L "$XGLIBC/lib/ld-linux-x86-64.so.2" "$ustore/ld" || fail "could not place t
 
 # --- RUN busybox sh + make from /td/store in the store-ns own-root ---------------------------
 cat > "$ustore/probe.sh" <<PROBE
+export PATH=/td/store/$rel/bin    # the busybox applet symlinks (sh/sed/head/…) live here
 [ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
-/td/store/$rel/bin/busybox echo BUSYBOX-RAN
-/td/store/$rel/bin/busybox sed --version 2>/dev/null | head -1
-/td/store/$rel/bin/make --version | head -1 && echo MAKE-RAN
+busybox echo BUSYBOX-RAN
+sed --version 2>/dev/null | head -1
+make --version | head -1 && echo MAKE-RAN
 PROBE
 out2=`"$TB" store-ns "$ustore" -- "/td/store/$rel/bin/busybox" sh /td/store/probe.sh 2>&1` \
   || { printf '%s\n' "$out2" | sed 's/^/     /' >&2; fail "store-ns userland run exited nonzero"; }
