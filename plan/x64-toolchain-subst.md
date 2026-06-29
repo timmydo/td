@@ -38,16 +38,15 @@ NOT an earlier gcc-4.x split.
   (#219's lock) and RUNS a dynamic x86_64 binary whose interp IS that path → 42, /gnu/store absent.
 - **PR2 (DONE upstream by #213)** — publisher wired into `ci/daily-full-suite.sh` + persistent
   `~/.td/subst` store + gate 412 substitute export (i686).
-- **PR3 (THIS PR — human picked the FULL fetch short-circuit).** Gate 414 builds `td-subst` from
-  source, PUBLISHES the real x86_64 glibc at its lock-keyed path as a SIGNED substitute, then a
-  consumer FETCHES it through `tools/resolve-toolchain.sh` (ed25519 sig + StorePath == the lock
-  path + NarHash verified) and RUNS the fetched-not-rebuilt bytes in the own-root → 42, with
-  cold-store / wrong-key / wrong-StorePath self-discrimination (`tests/x86_64-subst-lib.sh`). This
-  proves the per-PR loop can OBTAIN the real x86_64 toolchain by fetching, not only by building
-  (the consumer capability on real bytes) — a DELIBERATE directive-1 relaxation, human-approved.
-  KEY FINDING: fetch-instead-of-build was wired for NO arch (gate 359 = fixture mechanism proof
-  only; gates 412/414 always built from seed). **#223 was INSUFFICIENT** (human 2026-06-28): it
-  fetches IN ADDITION to building — proves the capability but does NOT skip the ~98-min build.
+- **PR3 (THIS PR, #223) — the per-PR build-SKIP.** Reworked from #223's earlier "fetch-in-addition"
+  (which proved the consumer capability but still always built — INSUFFICIENT per the human
+  2026-06-28). Now gate 414 RESOLVES the 3-component closure FIRST; on HIT it places them at
+  /td/store and SKIPS the ~98-min from-seed build; on MISS it builds from seed, interns +
+  subst-exports the closure (the daily signs + publishes). A unified `x86_64_verify_closure`
+  compiles+runs an x86_64 program with the closure (built OR fetched) → 42, /gnu/store absent.
+  td-subst is host-provisioned (the daily stashes it). DELIBERATE directive-1 relaxation,
+  human-approved. KEY FINDING: fetch-instead-of-build was wired for NO arch before this. Full design
+  in "The REAL skip" below; folds in the old "PR3b".
 
 ## The REAL skip — locked design (human 2026-06-28, the 5 points)
 
@@ -77,11 +76,9 @@ Increment order: (A) gate: intern all 3 + resolve-first SKIP branch using env td
 either; (B) check.sh host-prep warm-subst.sh (EXCLUSIVE); (C) daily publisher closure+stash. Skip is
 testable only against a populated store (manual: build once → publish → re-run → HIT). Multi-hour,
 multiple ~98-min validations.
-- **PR3b (FOLLOW-UP) — the per-PR full-build SKIP.** Actually skip the ~98-min build on a HIT.
-  Needs the whole-toolchain CLOSURE fetch: the cross gcc is an i686 binary that needs the i686
-  glibc runtime to compile the verify program, so skipping the build means fetching gcc + binutils
-  + the i686 runtime closure, not just the glibc runtime. Plus `ci/daily-full-suite.sh` publishing
-  the x86_64 export + `check.sh` host-prep exposing the persistent `~/.td/subst` to the per-PR loop.
+- **PR3b — FOLDED INTO PR3 (done).** The per-PR full-build SKIP is implemented above. (The closure
+  turned out to be just the 3 x86_64 components — the cross gcc/binutils are static i686, so NO i686
+  glibc-2.16 runtime is needed in the closure, simpler than first feared.)
 - **PR4 — x86_64 userland + i686 demotion.** Build the corpus userland (hello/sed/…) x86_64;
   stop publishing/consuming the i686 final toolchain — keep it only as the cross intermediate.
 

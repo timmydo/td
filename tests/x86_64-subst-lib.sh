@@ -73,12 +73,13 @@ x86_64_resolve_closure() {
     p=`env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$TD_SUBST_BIN" \
         TD_SUBST_STORE="$TD_SUBST_STORE" TD_SUBST_PUBKEY="${TD_SUBST_PUBKEY:-tests/td-subst.pub}" \
         TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$X86_LOCK" "$nm" "$_dest"` \
-      || return 1
+      || { rm -rf "$_dest"; return 1; }   # MISS on any component → fall back to from-seed
     base=`basename "$p"`
     rm -rf "$_store/$base"; cp -a "$_dest/$base" "$_store/$base"; chmod -R u+w "$_store/$base"
     _x86_point "$nm" "$_store/$base"
     echo "   [closure/fetch] $nm restored at /td/store/$base (ed25519 sig + StorePath==lock-path + NarHash verified)"
   done
+  rm -rf "$_dest"
   export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR
   return 0
 }
@@ -91,6 +92,15 @@ x86_64_resolve_closure() {
 x86_64_verify_closure() {
   _cpath=$1; _store=$2; _db=$3; _bbase=$4
   test -n "$XBU" -a -n "$XGCC2" -a -n "$XGLIBC" || { echo "verify_closure: closure vars unset" >&2; return 1; }
+  # [no-guix] (DURABLE, runs on BOTH paths — the fetch path's static guix-byte-freeness leg, which
+  # verify_x86_64_ownroot only runs on the build path): the closure libc + cross gcc carry no
+  # /gnu/store bytes. Cheap (a grep), so a fetched substitute that smuggled guix bytes would red.
+  _xcc1=`find "$XGCC2" -name cc1 2>/dev/null | head -1`
+  for _b in "$XGLIBC/lib/libc.so.6" "$XGCC2/bin/$XTARGET-gcc" "$_xcc1"; do
+    test -n "$_b" -a -e "$_b" || { echo "verify_closure: closure file missing ($_b)" >&2; return 1; }
+    if grep -q -a '/gnu/store' "$_b"; then echo "verify_closure: [no-guix] $_b contains /gnu/store bytes" >&2; return 1; fi
+  done
+  echo "   [no-guix] the closure libc.so.6 + cross gcc/cc1 carry no /gnu/store bytes"
   glrel=`basename "$XGLIBC"`
   csh=`command -v bash 2>/dev/null || command -v sh`
   w=`mktemp -d`; printf 'int main(){return 42;}\n' > "$w/c.c"

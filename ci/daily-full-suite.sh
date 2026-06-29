@@ -31,7 +31,12 @@ trap 'rm -f "$hlog" "$slog"' EXIT
 
 heavy_rc=0; system_rc=0; system_fail=""
 echo ">> daily backstop: full ./check.sh on origin/main ($main)"
-TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} ./check.sh >"$hlog" 2>&1 || heavy_rc=$?
+# TD_SUBST_FORCE_BUILD=1: the daily is the SOLE from-seed authoritative build + publisher
+# (x64-toolchain-subst). Suppress the fetch short-circuit so gate 414 ALWAYS builds the x86_64
+# toolchain from seed and re-produces the closure export to publish below — otherwise a persistent
+# ~/.td/subst (the very thing the per-PR loop needs) would make the daily FETCH its own prior
+# publish and never rebuild/republish (self-starvation).
+TD_SUBST_FORCE_BUILD=1 TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} ./check.sh >"$hlog" 2>&1 || heavy_rc=$?
 heavy_fail=$(grep -E '^FAIL' "$hlog" | head -5 | tr '\n' ';')
 
 if [ "$run_system" = 1 ]; then
