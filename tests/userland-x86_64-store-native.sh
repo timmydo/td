@@ -199,6 +199,15 @@ tar -xzf "$KH_X86_64_TB" -C "$KHINC" || fail "could not extract the x86_64 kerne
 test -f "$KHINC/linux/limits.h" || fail "x86_64 kernel headers missing linux/limits.h after extract"
 export KHINC
 
+# --- /bin/sh for popen()/system(): busybox's compiled split-include calls
+# popen("find ...") and glibc's popen hardcodes /bin/sh, which the sandbox lacks (the same
+# /bin/sh gap, but from a compiled libc call — no shebang to sed). The dev-shell root is a
+# writable ephemeral tmpfs, so point /bin/sh at the curated shell: namespace-local, vanishes
+# with the sandbox, NEVER touches the host (the host root was pivoted away).
+csh0=`command -v bash 2>/dev/null || command -v sh`
+[ -e /bin/sh ] || { mkdir -p /bin 2>/dev/null && ln -sf "$csh0" /bin/sh; }
+test -e /bin/sh || fail "could not provide /bin/sh for popen() in the sandbox (root not writable?)"
+
 # --- build the C userland (busybox + make) dynamic vs the x86_64 glibc 2.41 -----------------
 build_make_x86_64    "$cpath" "$XGCC2" "$XGLIBC" "$XLIBGCCDIR" "$XBU" "$MKX" || fail "the cross gcc did not build GNU make 4.4.1"
 build_busybox_x86_64 "$cpath" "$XGCC2" "$XGLIBC" "$XLIBGCCDIR" "$XBU" "$BBX" || fail "the cross gcc did not build busybox 1.37.0"
