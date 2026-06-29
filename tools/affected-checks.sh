@@ -221,6 +221,13 @@ map_path() {
       add_target ts-eval
       add_target ts-diff ;;
 
+    recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock)
+      # The td-recipe crate (the package surface declared in Rust) is consumed
+      # ONLY by the recipe-rs gate today — boa stays the corpus oracle until the
+      # A3 consumer cutover (plan/rust-migration.md), at which point this mapping
+      # must expand to the corpus build gates.
+      add_target recipe-rs ;;
+
     fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock)
       add_target rust-fetch ;;
 
@@ -910,6 +917,10 @@ map_path() {
       add_preflight shell-syntax
       add_target ts-eval ;;
 
+    tests/recipe-rs.sh)
+      add_preflight shell-syntax
+      add_target recipe-rs ;;
+
     system/td-builder.scm)
       add_target td-builder
       add_target rust-build ;;
@@ -957,7 +968,7 @@ map_path() {
     DIGESTS.md)
       require_full "$p is exclusive landing spine; coordinate the landing and run the full local loop." ;;
 
-    *.md|plan/*|HISTORY.md|DESIGN.md|CLAUDE.md|DIGESTS.md)
+    *.md|plan/*|HISTORY.md|DESIGN.md|CLAUDE.md|DIGESTS.md|.gitignore)
       : ;;
 
     channels.scm)
@@ -1118,6 +1129,12 @@ run_self_test() {
   assert_target tests/ts/recipe-perturbed.ts drv-emit
   assert_target tests/guix-surface.sh guix-surface
   assert_target tests/guix-surface.expected guix-surface
+  # The Rust package surface (td-recipe crate) maps to the recipe-rs gate and
+  # waives the full loop (boa stays the corpus oracle until the A3 cutover).
+  assert_target recipes/src/catalog.rs recipe-rs
+  assert_target recipes/Cargo.toml recipe-rs
+  assert_target tests/recipe-rs.sh recipe-rs
+  assert_branch_policy recipes/src/catalog.rs "full ./check.sh would be waived"
   # The td-builder build engine validates on the check-engine SMOKE tier (Option B,
   # DESIGN §7.2): the full heavy+system corpus is the DAILY backstop, not a per-PR gate.
   assert_target builder/src/sandbox.rs check-engine
