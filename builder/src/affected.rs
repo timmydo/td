@@ -743,6 +743,15 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    if pattern_matches(
+        "tests/userland-x86_64-store-native.sh|seed/sources/busybox-*.lock|seed/sources/make-4.4*.lock|mk/gates/420-userland-x86_64-store-native.mk",
+        p,
+    ) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("userland-x86_64-store-native");
+        return;
+    }
+
     // --- the i686 mesboot→store-native chain: each rung + everything downstream ---
     if pattern_matches("tests/bootstrap-patch.sh|seed/sources/patch-*.lock", p) {
         sel.add_preflight("shell-syntax");
@@ -1353,6 +1362,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!(
         "mk/gates/418-toolchain-x86_64-input-addressed.mk",
         "toolchain-x86_64-input-addressed"
+    );
+    assert_target!(
+        "tests/userland-x86_64-store-native.sh",
+        "userland-x86_64-store-native"
+    );
+    assert_target!("seed/sources/busybox-1.37.0.lock", "userland-x86_64-store-native");
+    assert_target!("seed/sources/make-4.4.1.lock", "userland-x86_64-store-native");
+    assert_target!(
+        "mk/gates/420-userland-x86_64-store-native.mk",
+        "userland-x86_64-store-native"
     );
     assert_target!("tests/td-cmake-demo.lock", "cmake");
     assert_target!("tests/uutils-coreutils.lock", "rust-coreutils");
