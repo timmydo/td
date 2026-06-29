@@ -16,9 +16,10 @@
 //! IN ORDER (first match wins); the renderer reproduces the shell stdout
 //! byte-for-byte so the differential holds.
 //!
-//! Unlike the shell (`cd "$(dirname "$0")/.."`), this subcommand operates relative
-//! to CWD = the repo root; the library functions take an explicit `root` so tests
-//! are CWD-independent. The eventual thin-shim cutover will `cd` then exec.
+//! The shell roots itself with `cd "$(dirname "$0")/.."`; the subcommand resolves
+//! the repo root via `git rev-parse --show-toplevel` (falling back to CWD outside a
+//! git repo), so it is CWD-robust like the oracle. The library functions take an
+//! explicit `root` so tests are CWD-independent.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -1426,6 +1427,21 @@ fn git_ok(root: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// The repo root, the way the shell roots itself (`cd "$(dirname "$0")/.."`):
+/// `git rev-parse --show-toplevel` when git is present, else CWD. Keeps the
+/// subcommand CWD-robust like the oracle; outside a git repo it falls back to CWD.
+fn resolve_root() -> PathBuf {
+    if let Ok(o) = Command::new("git").args(["rev-parse", "--show-toplevel"]).output() {
+        if o.status.success() {
+            let top = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !top.is_empty() {
+                return PathBuf::from(top);
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 fn sort_unique(mut v: Vec<String>) -> Vec<String> {
     v.retain(|s| !s.is_empty());
     v.sort();
@@ -1470,7 +1486,7 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
 }
 
 pub fn main(args: &[String]) -> ExitCode {
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = resolve_root();
 
     let mut base = "origin/main".to_string();
     let mut run = false;
@@ -1540,8 +1556,26 @@ pub fn main(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
-        let mb = git_lines(&root, &["merge-base", &base, "HEAD"]);
-        merge_base = mb.first().cloned().unwrap_or_default();
+        // The shell's `merge_base=$(git merge-base …)` runs under `set -e`, so a
+        // merge-base failure (no common ancestor / shallow clone) aborts non-zero;
+        // mirror that rather than continue with an empty merge-base + bogus header.
+        match Command::new("git")
+            .args(["merge-base", &base, "HEAD"])
+            .current_dir(&root)
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                merge_base = String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string();
+            }
+            Ok(o) => {
+                eprint!("{}", String::from_utf8_lossy(&o.stderr));
+                return ExitCode::from(o.status.code().unwrap_or(1) as u8);
+            }
+            Err(e) => {
+                eprintln!("affected-checks: git merge-base failed: {e}");
+                return ExitCode::from(1);
+            }
+        }
         let mut all = git_lines(&root, &["diff", "--name-only", &merge_base, "HEAD"]);
         if !committed_only {
             all.extend(git_lines(&root, &["diff", "--name-only"]));
@@ -1574,7 +1608,9 @@ pub fn main(args: &[String]) -> ExitCode {
 
     if !sel.full_required.is_empty() {
         if explicit {
-            eprintln!("\naffected-checks: --path is inspection only; run full ./check.sh for these paths in branch mode");
+            // Shell: `echo` (blank line to STDOUT) then the message `>&2`.
+            println!();
+            eprintln!("affected-checks: --path is inspection only; run full ./check.sh for these paths in branch mode");
             return ExitCode::from(20);
         }
 
