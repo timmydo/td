@@ -59,4 +59,12 @@ is fine. Everything normalized (mtime, uid/gid, sorted entries) for reproducibil
 
 ## Status / evidence
 
-(brick 1 in progress)
+- **Brick 1 — DONE (PR #233).** `builder/src/oci.rs` + `td-builder oci-image`. Verified:
+  4 unit tests (members, `diff_id==sha256(layer.tar)`, byte-determinism, `@LongLink`
+  roundtrip), full engine suite 93/0, and END-TO-END skopeo `copy docker-archive:` +
+  `inspect` loads a td-built image (foreign OCI impl accepts td's zero-guix bytes).
+  `td-builder affected-checks --committed-only --run` → exit 0, full `./check.sh` waived
+  (builder/src/* → check-engine smoke). NOTE: this is the primitive; it does not yet
+  replace a guix call in a gate (brick 3 does).
+- Mid-track env change: `tools/affected-checks.sh` was replaced on main by the Rust
+  `td-builder affected-checks` subcommand — validation uses that now.
