@@ -57,8 +57,11 @@ echo "   [supply-chain] busybox + make-4.4.1 match their lock sha256 — upstrea
 # system dirs so glibc's own headers win and the kernel ones only fill in linux/*, asm/*.
 emit_cc() {
   csh=`command -v bash 2>/dev/null || command -v sh`
-  printf '#!%s\nexec "%s/bin/%s-gcc" -isystem "%s/include" -idirafter "%s" -B"%s/lib" -L"%s/lib" -L"%s" -Wl,--dynamic-linker -Wl,"%s/lib/ld-linux-x86-64.so.2" -Wl,-rpath -Wl,'\''$ORIGIN/../lib'\'' "$@"\n' \
-    "$csh" "$2" "$XTARGET" "$3" "$KHINC" "$3" "$3" "$4" "$3" > "$1"
+  # interp + rpath = the ABSOLUTE build-dir glibc/libgcc, so the test/built binaries RUN at build
+  # time with NO LD_LIBRARY_PATH (which would poison the host build-driver gawk → SIGFPE). The
+  # assemble step relinks interp → /td/store/ld and rpath → $ORIGIN/../lib for the shipped layout.
+  printf '#!%s\nexec "%s/bin/%s-gcc" -isystem "%s/include" -idirafter "%s" -B"%s/lib" -L"%s/lib" -L"%s" -Wl,--dynamic-linker -Wl,"%s/lib/ld-linux-x86-64.so.2" -Wl,-rpath -Wl,"%s/lib:%s" "$@"\n' \
+    "$csh" "$2" "$XTARGET" "$3" "$KHINC" "$3" "$3" "$4" "$3" "$3" "$4" > "$1"
   chmod 0555 "$1"
 }
 
@@ -74,7 +77,7 @@ build_make_x86_64() {
   # would otherwise fail "No such file or directory"), and rewrite any #!/bin/sh helper shebangs.
   find "$src" -type f -exec sed -i "1s|^#! */bin/sh\b|#!$csh|" {} + 2>/dev/null || true
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
-  ( cd "$src"; bp="$xb/bin:$XBIN:$mc"; export LD_LIBRARY_PATH="$xgl/lib:$xlg"   # build-time: test/host binaries find the build-dir glibc (RUNPATH is $ORIGIN/../lib); $XBIN = the cross-fns _xbin scaffolding (awk/m4/bison/flex/cmp/... — build-drivers, no output bytes)
+  ( cd "$src"; bp="$xb/bin:$XBIN:$mc"   # $XBIN = the cross-fns _xbin scaffolding (awk/m4/bison/flex/cmp/...); target binaries find glibc via the absolute build-dir rpath the cc wrapper bakes (NO LD_LIBRARY_PATH — it would poison the host gawk)
     env PATH="$bp" CC="$wb/cc" CPP="$wb/cc -E" CONFIG_SHELL="$csh" SHELL="$csh" "$csh" ./configure --build="$XTARGET" --host="$XTARGET" --disable-dependency-tracking >cfg.log 2>&1 \
       || { echo "make configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_makex-cfg.log" 2>/dev/null||true; cp config.log "$ROOT/.td-build-cache/_makex-config.log" 2>/dev/null||true; echo "--- config.log CPP/conftest tail ---" >&2; grep -iE 'cpp|conftest|preprocess|cc1|No such|error|cannot' config.log 2>/dev/null | tail -30 >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= make SHELL="$csh" CONFIG_SHELL="$csh" >build.log 2>&1 \
@@ -98,7 +101,7 @@ build_busybox_x86_64() {
   # shebangs to the curated shell and pass SHELL/CONFIG_SHELL to every make so recipes use it too.
   find "$src" -type f -exec sed -i "1s|^#! */bin/sh\b|#!$csh|" {} + 2>/dev/null || true
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
-  ( cd "$src"; bp="$xb/bin:$XBIN:$mc"; export LD_LIBRARY_PATH="$xgl/lib:$xlg"   # build-time: test/host binaries find the build-dir glibc (RUNPATH is $ORIGIN/../lib); $XBIN = the cross-fns _xbin scaffolding (awk/m4/bison/flex/cmp/... — build-drivers, no output bytes)
+  ( cd "$src"; bp="$xb/bin:$XBIN:$mc"   # $XBIN = the cross-fns _xbin scaffolding (awk/m4/bison/flex/cmp/...); target binaries find glibc via the absolute build-dir rpath the cc wrapper bakes (NO LD_LIBRARY_PATH — it would poison the host gawk)
     env PATH="$bp" make CC="$wb/cc" HOSTCC="$wb/cc" SHELL="$csh" CONFIG_SHELL="$csh" defconfig >cfg.log 2>&1 \
       || { echo "busybox defconfig failed" >&2; tail -20 cfg.log >&2; return 1; }
     # dynamic (not CONFIG_STATIC), non-PIE, point the linker at the build-dir glibc archives.
@@ -204,6 +207,8 @@ chmod -R u+w "$tree"
 for b in busybox make; do
   "$TB" elf-set-interp "$tree/bin/$b" /td/store/ld || fail "elf-set-interp $b"
   case `"$TB" elf-interp "$tree/bin/$b"` in /td/store/*) ;; *) fail "interp of $b not relinked to /td/store" ;; esac
+  # rebase the absolute build-dir rpath onto the shipped layout (glibc co-located in ../lib)
+  "$TB" elf-set-rpath "$tree/bin/$b" '$ORIGIN/../lib' || fail "elf-set-rpath $b"
 done
 # busybox applet symlinks (sh, sed, grep, …) so the userland is callable by name
 ( cd "$tree/bin"; for a in sh sed grep awk find tar gzip ls cat cp mkdir rm env printf xargs sort head tail wc tr cut; do ln -sf busybox "$a"; done )
