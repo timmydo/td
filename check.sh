@@ -226,35 +226,63 @@ guix_env=$(dirname "${toolchain%%:*}")
 # fetcher (td-fetch) here on the HOST (network), exactly where the daemon also fetches
 # fixed-output seeds — the in-sandbox loop never egresses. Idempotent + near-instant once
 # the store path is warm; only a cold machine pays the one-time fetch (+ td-fetch build).
-sh tools/warm-tsgo.sh || { echo "check.sh: FATAL: could not warm the tsgo tarball (tools/warm-tsgo.sh)." >&2; exit 1; }
+#
+# --- Warm-prelude robustness + parallelism (loop-latency L3) -------------------
+# Two problems with the host warm: (1) NO per-step timeout, so one slow/hung
+# mirror can stall the prelude — including the fast tier's warm-tsgo — past the
+# CI timeout (the in-file hang-risk note above); (2) the ~10 cargo-proxy warms
+# ran SERIALLY though each is fully INDEPENDENT (its own OS-picked loopback port
+# + work dir — "concurrent agents/worktrees never collide"). Fix: bound every
+# warm with `timeout`, and fan the cargo-proxy warms out in batches of
+# TD_WARM_JOBS. Tunables: TD_WARM_TIMEOUT (per-step seconds, default 600),
+# TD_WARM_JOBS (parallel cargo-proxy warms, default 4 — lower it on a loaded host).
+warm_timeout=${TD_WARM_TIMEOUT:-600}
+warm_jobs=${TD_WARM_JOBS:-4}
+if command -v timeout >/dev/null 2>&1; then
+  warm() { timeout "$warm_timeout" "$@"; }
+else
+  warm() { "$@"; }   # no coreutils timeout: run unbounded (best-effort)
+fi
+warm sh tools/warm-tsgo.sh || { echo "check.sh: FATAL: could not warm the tsgo tarball (tools/warm-tsgo.sh) within ${warm_timeout}s." >&2; exit 1; }
 # --- Bootstrap-source warm: td OWNS fetching the source-bootstrap tarballs (GNU Mes, later -----
 # tinycc/gcc/glibc) the same way — td-fetch on the HOST, sha256-pinned per seed/sources/*.lock,
 # into .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates. BEST-EFFORT (those
 # gates are not in the fast tier): a runner that cannot warm them is fine, the gate enforces.
 if [ "$heavy_warm" = 1 ]; then
-  sh tools/warm-bootstrap-sources.sh || true
-  # --- Crate-guix-free warm: td OWNS fetching td-fetch's crate closure (no guix daemon FOD) -----
-  # td-fetch each `.crate` from static.crates.io, pinned by fetch/Cargo.lock (upstream hash), into
-  # .td-build-cache/crate-vendor/ for the offline `rust-fetch` gate (which interns it as
-  # a vendor tree + builds td-fetch guix-free). BEST-EFFORT (heavy gate, not the fast tier).
-  sh tools/warm-td-fetch-crates.sh || true
-  # --- Corpus crate-guix-free warm: cargo resolves+fetches a rust package's WHOLE crate closure
-  # THROUGH td's OWN cargo-proxy (td-feed cargo-proxy), the proxy verifying each .crate sha256 ==
-  # the crates.io index cksum (upstream pin). Leaves source + vendor tree in .td-build-cache/
-  # crate-vendor/<name>/ for the offline `rust-<name>-crate-free` gates (intern + build via
-  # TD_VENDOR_DIR, guix-free). BEST-EFFORT (heavy gates, not the fast tier).
-  sh tools/warm-cargo-proxy.sh ripgrep 14.1.1 || true
-  sh tools/warm-cargo-proxy.sh sd 1.0.0 || true
-  sh tools/warm-cargo-proxy.sh fd-find 10.2.0 fd || true
-  sh tools/warm-cargo-proxy.sh procs 0.14.10 || true
-  sh tools/warm-cargo-proxy.sh eza 0.21.6 || true
-  sh tools/warm-cargo-proxy.sh bat 0.25.0 || true
-  sh tools/warm-cargo-proxy.sh coreutils 0.9.0 uutils || true
-  sh tools/warm-cargo-proxy.sh youki 0.6.0 || true
-  sh tools/warm-cargo-proxy.sh uu_cat 0.9.0 cat || true
+  # The two SHARED-feed warms stay serial-first: they fetch through the one shared
+  # td-feed daemon (tools/feed-ensure.sh, flock-serialized) into the shared store,
+  # so parallelizing them buys little and risks store contention.
+  #   warm-bootstrap-sources: the pinned source-bootstrap tarballs (GNU Mes, tinycc/
+  #   gcc/glibc) -> .td-build-cache/sources/ for the heavy `bootstrap-*` gates.
+  #   warm-td-fetch-crates : td-fetch's own crate closure -> .td-build-cache/
+  #   crate-vendor/ for the `rust-fetch` gate. Both BEST-EFFORT (not the fast tier).
+  warm sh tools/warm-bootstrap-sources.sh || true
+  warm sh tools/warm-td-fetch-crates.sh || true
+  # --- Corpus crate-guix-free warm: cargo resolves+fetches each rust package's WHOLE crate
+  # closure THROUGH td's OWN cargo-proxy (td-feed cargo-proxy), the proxy verifying each .crate
+  # sha256 == the crates.io index cksum (upstream pin) -> .td-build-cache/crate-vendor/<name>/ for
+  # the offline `rust-<name>-crate-free` gates. Each warm is INDEPENDENT (its own loopback port +
+  # work dir), so they FAN OUT in batches of $warm_jobs instead of running serially. BEST-EFFORT.
+  cp_warm() { warm "$@" || echo "check.sh: cargo-proxy warm (best-effort) failed/timed out: $*" >&2; }
+  _wc=0
+  for _spec in \
+    "ripgrep 14.1.1" \
+    "sd 1.0.0" \
+    "fd-find 10.2.0 fd" \
+    "procs 0.14.10" \
+    "eza 0.21.6" \
+    "bat 0.25.0" \
+    "coreutils 0.9.0 uutils" \
+    "youki 0.6.0" \
+    "uu_cat 0.9.0 cat"; do
+    # shellcheck disable=SC2086 -- $_spec is split into the script's positional args on purpose
+    cp_warm sh tools/warm-cargo-proxy.sh $_spec &
+    _wc=$((_wc + 1)); [ "$((_wc % warm_jobs))" -eq 0 ] && wait
+  done
   # Local-source variant: the russh demo's source is the in-tree tests/russh-demo (NOT a
   # crates.io crate), so only its 188-crate DEP closure is cargo-fetched through the proxy.
-  sh tools/warm-cargo-proxy-local.sh tests/russh-demo russh || true
+  cp_warm sh tools/warm-cargo-proxy-local.sh tests/russh-demo russh &
+  wait   # drain the final batch + the local warm
 fi
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only
