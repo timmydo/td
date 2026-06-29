@@ -66,9 +66,12 @@ build_make_x86_64() {
   csh=`command -v bash 2>/dev/null || command -v sh`
   src=`mktemp -d`/make; mkdir -p "$src"
   tar -xzf "$MK_TB" -C "$src" --strip-components=1 || { echo "make unpack failed" >&2; return 1; }
+  # The sandbox has NO /bin/sh: run configure THROUGH the curated shell (its #!/bin/sh shebang
+  # would otherwise fail "No such file or directory"), and rewrite any #!/bin/sh helper shebangs.
+  find "$src" -type f -exec sed -i "1s|^#! */bin/sh\b|#!$csh|" {} + 2>/dev/null || true
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
   ( cd "$src"; bp="$xb/bin:$mc"
-    env PATH="$bp" CC="$wb/cc" ./configure --build="$XTARGET" --host="$XTARGET" --disable-dependency-tracking >cfg.log 2>&1 \
+    env PATH="$bp" CC="$wb/cc" CONFIG_SHELL="$csh" SHELL="$csh" "$csh" ./configure --build="$XTARGET" --host="$XTARGET" --disable-dependency-tracking >cfg.log 2>&1 \
       || { echo "make configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_makex-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= make SHELL="$csh" CONFIG_SHELL="$csh" >build.log 2>&1 \
       || { echo "make build failed" >&2; cp build.log "$ROOT/.td-build-cache/_makex-build.log" 2>/dev/null||true; tail -25 build.log >&2; return 1; }
@@ -87,16 +90,19 @@ build_busybox_x86_64() {
   test -n "$bz" || { echo "no bzip2 to unpack busybox" >&2; return 1; }
   src=`mktemp -d`/bb; mkdir -p "$src"
   "$bz" -dc "$BB_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "busybox unpack failed" >&2; return 1; }
+  # The sandbox has NO /bin/sh: busybox's Kbuild + gen scripts (#!/bin/sh) would fail. Rewrite the
+  # shebangs to the curated shell and pass SHELL/CONFIG_SHELL to every make so recipes use it too.
+  find "$src" -type f -exec sed -i "1s|^#! */bin/sh\b|#!$csh|" {} + 2>/dev/null || true
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
   ( cd "$src"; bp="$xb/bin:$mc"
-    env PATH="$bp" make CC="$wb/cc" HOSTCC="$wb/cc" defconfig >cfg.log 2>&1 \
+    env PATH="$bp" make CC="$wb/cc" HOSTCC="$wb/cc" SHELL="$csh" CONFIG_SHELL="$csh" defconfig >cfg.log 2>&1 \
       || { echo "busybox defconfig failed" >&2; tail -20 cfg.log >&2; return 1; }
     # dynamic (not CONFIG_STATIC), non-PIE, point the linker at the build-dir glibc archives.
     sed -i -E '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d' .config
     { echo '# CONFIG_STATIC is not set'; echo '# CONFIG_PIE is not set'; echo "CONFIG_EXTRA_LDFLAGS=\"-L$xgl/lib -L$xlg\""; } >> .config
-    yes "" | env PATH="$bp" make CC="$wb/cc" HOSTCC="$wb/cc" oldconfig >/dev/null 2>&1
+    yes "" | env PATH="$bp" make CC="$wb/cc" HOSTCC="$wb/cc" SHELL="$csh" CONFIG_SHELL="$csh" oldconfig >/dev/null 2>&1
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= \
-      make CC="$wb/cc" HOSTCC="$wb/cc" SKIP_STRIP=y SHELL="$csh" -j"$(nproc)" >build.log 2>&1 \
+      make CC="$wb/cc" HOSTCC="$wb/cc" SKIP_STRIP=y SHELL="$csh" CONFIG_SHELL="$csh" -j"$(nproc)" >build.log 2>&1 \
       || { echo "busybox build failed" >&2; cp build.log "$ROOT/.td-build-cache/_bbx-build.log" 2>/dev/null||true; tail -25 build.log >&2; return 1; }
     cp -a busybox "$out/busybox" ) || return 1
   test -x "$out/busybox" || { echo "no x86_64 busybox produced" >&2; return 1; }
