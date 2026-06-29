@@ -50,11 +50,15 @@ echo "   [supply-chain] busybox + make-4.4.1 match their lock sha256 — upstrea
 # An x86_64 cc wrapper that builds RUNNABLE binaries (interp = the build-dir glibc loader, so
 # configure tests + build-time tools run now) + RUNPATH $ORIGIN/../lib (so the shipped tree
 # finds its libs). The final binary's interp is relinked to /td/store/ld afterward.
-#   $1=outfile $2=XGCC2 $3=XGLIBC $4=XLIBGCCDIR
+#   $1=outfile $2=XGCC2 $3=XGLIBC $4=XLIBGCCDIR ; reads $KHINC (Linux UAPI headers root)
+# -idirafter "$KHINC": the glibc component ships glibc's own headers but NOT the Linux UAPI
+# headers (linux/*, asm/* — they live in the build sysroot, not the glibc install), yet glibc's
+# bits/local_lim.h #includes <linux/limits.h>. Add the warmed x86_64 kernel headers AFTER the
+# system dirs so glibc's own headers win and the kernel ones only fill in linux/*, asm/*.
 emit_cc() {
   csh=`command -v bash 2>/dev/null || command -v sh`
-  printf '#!%s\nexec "%s/bin/%s-gcc" -isystem "%s/include" -B"%s/lib" -L"%s/lib" -L"%s" -Wl,--dynamic-linker -Wl,"%s/lib/ld-linux-x86-64.so.2" -Wl,-rpath -Wl,'\''$ORIGIN/../lib'\'' "$@"\n' \
-    "$csh" "$2" "$XTARGET" "$3" "$3" "$3" "$4" "$3" > "$1"
+  printf '#!%s\nexec "%s/bin/%s-gcc" -isystem "%s/include" -idirafter "%s" -B"%s/lib" -L"%s/lib" -L"%s" -Wl,--dynamic-linker -Wl,"%s/lib/ld-linux-x86-64.so.2" -Wl,-rpath -Wl,'\''$ORIGIN/../lib'\'' "$@"\n' \
+    "$csh" "$2" "$XTARGET" "$3" "$KHINC" "$3" "$3" "$4" "$3" > "$1"
   chmod 0555 "$1"
 }
 
@@ -72,7 +76,7 @@ build_make_x86_64() {
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
   ( cd "$src"; bp="$xb/bin:$mc"; export LD_LIBRARY_PATH="$xgl/lib:$xlg"   # build-time: test/host binaries find the build-dir glibc (RUNPATH is $ORIGIN/../lib, set for the shipped layout)
     env PATH="$bp" CC="$wb/cc" CPP="$wb/cc -E" CONFIG_SHELL="$csh" SHELL="$csh" "$csh" ./configure --build="$XTARGET" --host="$XTARGET" --disable-dependency-tracking >cfg.log 2>&1 \
-      || { echo "make configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_makex-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
+      || { echo "make configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_makex-cfg.log" 2>/dev/null||true; cp config.log "$ROOT/.td-build-cache/_makex-config.log" 2>/dev/null||true; echo "--- config.log CPP/conftest tail ---" >&2; grep -iE 'cpp|conftest|preprocess|cc1|No such|error|cannot' config.log 2>/dev/null | tail -30 >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= make SHELL="$csh" CONFIG_SHELL="$csh" >build.log 2>&1 \
       || { echo "make build failed" >&2; cp build.log "$ROOT/.td-build-cache/_makex-build.log" 2>/dev/null||true; tail -25 build.log >&2; return 1; }
     cp -a make "$out/make" ) || return 1
@@ -166,6 +170,13 @@ else
 fi
 x86_64_verify_closure "$cpath" "$cstore" "$cdb" "$bbase" || fail "the x86_64 closure toolchain did not compile+run an x86_64 program → 42"
 echo "   x86_64 toolchain ready (XGCC2=$XGCC2)"
+
+# --- the x86_64 Linux UAPI headers (warm, pinned) for the cc wrapper's -idirafter (glibc's
+# headers #include <linux/*>; the glibc component doesn't carry them) ------------------------
+KHINC="$snwork/kh"; mkdir -p "$KHINC"
+tar -xzf "$KH_X86_64_TB" -C "$KHINC" || fail "could not extract the x86_64 kernel headers ($KH_X86_64_TB)"
+test -f "$KHINC/linux/limits.h" || fail "x86_64 kernel headers missing linux/limits.h after extract"
+export KHINC
 
 # --- build the C userland (busybox + make) dynamic vs the x86_64 glibc 2.41 -----------------
 build_make_x86_64    "$cpath" "$XGCC2" "$XGLIBC" "$XLIBGCCDIR" "$XBU" "$MKX" || fail "the cross gcc did not build GNU make 4.4.1"
