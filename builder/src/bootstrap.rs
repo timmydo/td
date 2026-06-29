@@ -106,13 +106,14 @@ pub struct Recipe {
 pub fn lookup(name: &str) -> Option<Recipe> {
     match name {
         "seed" => Some(seed_recipe()),
+        "mes" => Some(mes_recipe()),
         _ => None,
     }
 }
 
 /// Every migrated rung, in brick order.
 pub fn all_names() -> &'static [&'static str] {
-    &["seed"]
+    &["seed", "mes"]
 }
 
 // --- the shared leg runner -------------------------------------------------------
@@ -210,15 +211,13 @@ fn verify_pin(cx: &Ctx, pin: &Pin) -> Result<String, String> {
             Ok(format!("vendored {path} matches pin sha256 ({sha256}) — auditable, NOT guix-built, no /gnu/store bytes"))
         }
         Pin::Source { lock } => {
-            let lock_path = cx.repo_root.join("seed/sources").join(lock);
-            let text = fs::read_to_string(&lock_path)
-                .map_err(|e| format!("read lock {}: {e}", lock_path.display()))?;
-            let pin = parse_source_lock(&text, lock)?;
+            let pin = source_pin(cx, lock)?;
             let tarball = cx.sources_dir.join(&pin.file);
             if !tarball.exists() {
                 return Err(format!(
-                    "the pinned tarball is not warm ({}) — run 'sh tools/warm-bootstrap-sources.sh' (needs network + td-fetch); check.sh's prelude does this",
-                    tarball.display()
+                    "the pinned tarball is not warm ({}) — run 'sh tools/warm-bootstrap-sources.sh' to td-fetch {} (needs network); check.sh's prelude does this",
+                    tarball.display(),
+                    pin.url
                 ));
             }
             let got = sha256_file(&tarball).map_err(|e| format!("read {}: {e}", tarball.display()))?;
@@ -234,6 +233,14 @@ fn verify_pin(cx: &Ctx, pin: &Pin) -> Result<String, String> {
             ))
         }
     }
+}
+
+/// Read + parse `seed/sources/<lock>`.
+fn source_pin(cx: &Ctx, lock: &str) -> Result<SourcePin, String> {
+    let lock_path = cx.repo_root.join("seed/sources").join(lock);
+    let text = fs::read_to_string(&lock_path)
+        .map_err(|e| format!("read lock {}: {e}", lock_path.display()))?;
+    parse_source_lock(&text, lock)
 }
 
 /// A parsed `seed/sources/*.lock` (the `url`/`sha256`/`file` key/value format).
@@ -302,10 +309,11 @@ fn seed_recipe() -> Recipe {
     }
 }
 
-/// Brick 0 build: copy the vendored seed tree, run the kaem seed build env-cleared,
-/// producing `AMD64/artifact/{hex0,kaem-0}`. (Mirrors `run_seed_build` in
-/// tests/bootstrap-seed.sh.)
-fn build_seed(cx: &Ctx) -> Result<Built, String> {
+/// Copy the vendored seed tree to a fresh scratch dir, chmod the two seeds, and run
+/// the FIRST kaem step (seed → `AMD64/artifact/{hex0,kaem-0}`) env-cleared. Returns
+/// the scratch dir. Shared by brick 0 (`build_seed`) and brick 2's toolchain
+/// (`mes_toolchain`, which drives a second kaem step on top).
+fn seed_stage0_tree(cx: &Ctx) -> Result<PathBuf, String> {
     let seed = cx.repo_root.join("seed/stage0");
     let out = scratch_dir("td-bootstrap-seed").map_err(io_err("scratch dir"))?;
     copy_tree(&seed, &out).map_err(io_err("copy seed tree"))?;
@@ -314,6 +322,7 @@ fn build_seed(cx: &Ctx) -> Result<Built, String> {
     make_executable(&out.join(format!("{amd}/kaem-optional-seed")))
         .map_err(io_err("chmod kaem-optional-seed"))?;
     fs::create_dir_all(out.join("AMD64/artifact")).map_err(io_err("mkdir artifact"))?;
+    fs::create_dir_all(out.join("AMD64/bin")).map_err(io_err("mkdir bin"))?;
 
     let kaem = out.join(format!("{amd}/kaem-optional-seed"));
     let status = scrubbed(&kaem)
@@ -326,7 +335,15 @@ fn build_seed(cx: &Ctx) -> Result<Built, String> {
     if !status.success() {
         return Err(format!("the seed kaem build failed in {}", out.display()));
     }
-    Ok(Built { dir: out })
+    Ok(out)
+}
+
+/// Brick 0 build: the seed stage0 tree, producing `AMD64/artifact/{hex0,kaem-0}`.
+/// (Mirrors `run_seed_build` in tests/bootstrap-seed.sh.)
+fn build_seed(cx: &Ctx) -> Result<Built, String> {
+    Ok(Built {
+        dir: seed_stage0_tree(cx)?,
+    })
 }
 
 fn seed_self_reproduction(_cx: &Ctx, b: &Built) -> Result<(), String> {
@@ -362,6 +379,215 @@ fn seed_behavioral(_cx: &Ctx, b: &Built) -> Result<(), String> {
     let got = sha256_file(&out).map_err(io_err("sha kaem-0b"))?;
     if got != KAEM_PIN {
         return Err(format!("the seed-built hex0 assembled a wrong kaem-0 ({got})"));
+    }
+    Ok(())
+}
+
+// --- the mes recipe (brick 2) ----------------------------------------------------
+
+fn mes_recipe() -> Recipe {
+    Recipe {
+        name: "mes",
+        brick: 2,
+        pins: vec![Pin::Source {
+            lock: "mes-0.27.1.lock",
+        }],
+        build: build_mes,
+        artifacts: vec!["bin/mes-m2"],
+        checks: vec![Check {
+            desc: "[behavioral] the seed-built mes-m2 evaluates Scheme from the Mes module tree: (display 'Hello,M2-mes!)→Hello,M2-mes! and (+ 1 2 3 4)→10 — a working interpreter, not just a linked ELF",
+            run: mes_behavioral,
+        }],
+        summary: "from the seed, td drives M2-Planet + mescc-tools over the td-fetched (pinned, not vendored) GNU Mes 0.27.1 source to a working Scheme interpreter (mes-m2); it evaluates Scheme, carries no /gnu/store bytes, and is reproducible",
+    }
+}
+
+/// Brick 2 toolchain: the seed stage0 tree + a SECOND kaem step
+/// (`mescc-tools-mini-kaem.kaem`, driven by the seed-built kaem-0) → M2-Planet +
+/// mescc-tools (`AMD64/artifact/{M2,blood-elf-0}`, `AMD64/bin/{M1,hex2}`).
+/// (Mirrors `build_toolchain` in tests/bootstrap-mes.sh.)
+fn mes_toolchain(cx: &Ctx) -> Result<PathBuf, String> {
+    let tc = seed_stage0_tree(cx)?;
+    let kaem0 = tc.join("AMD64/artifact/kaem-0");
+    make_executable(&kaem0).map_err(io_err("chmod kaem-0"))?;
+    let status = scrubbed(&kaem0)
+        .arg("./AMD64/mescc-tools-mini-kaem.kaem")
+        .current_dir(&tc)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(io_err("exec mescc-tools-mini-kaem"))?;
+    if !status.success() {
+        return Err(format!("the seed toolchain (M2-Planet + mescc-tools) build failed in {}", tc.display()));
+    }
+    Ok(tc)
+}
+
+/// Extract the M2-Planet input units from the tarball's own `kaem.run` — the port of
+/// the bootstrap-mes.sh `sed` pipeline: take the block from the `^M2-Planet` line to
+/// the `-o m2/mes.M1` line, pull each `-f ${srcdest}<path>` token (the LAST on a
+/// line, like the greedy `.*`), and substitute `${mes_cpu}` → `x86_64`. The build
+/// recipe is upstream's, not ours; only `include/mes/config.h` + `include/arch/` are
+/// generated (as `configure.sh` does for the non-system-libc path).
+fn parse_m2planet_units(kaem_run: &str) -> Vec<String> {
+    const MARK: &str = "-f ${srcdest}";
+    let mut out = Vec::new();
+    let mut in_range = false;
+    for line in kaem_run.lines() {
+        if !in_range {
+            if line.starts_with("M2-Planet") {
+                in_range = true;
+            } else {
+                continue;
+            }
+        }
+        if let Some(idx) = line.rfind(MARK) {
+            let rest = &line[idx + MARK.len()..];
+            let tok: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+            if !tok.is_empty() {
+                out.push(tok.replace("${mes_cpu}", "x86_64"));
+            }
+        }
+        if line.contains("-o m2/mes.M1") {
+            break;
+        }
+    }
+    out
+}
+
+/// Brick 2 build: build the seed toolchain, unpack the pinned Mes tarball, generate
+/// the non-system-libc `config.h` + arch headers, and drive M2-Planet → blood-elf →
+/// M1 → hex2 over the tarball's own input list to produce `bin/mes-m2`. Returns the
+/// mes scratch dir (also its `MES_PREFIX`). (Mirrors `build_mes` in
+/// tests/bootstrap-mes.sh.)
+fn build_mes(cx: &Ctx) -> Result<Built, String> {
+    let tc = mes_toolchain(cx)?;
+    let _tc_guard = Cleanup(tc.clone());
+    let m2p = tc.join("AMD64/artifact/M2");
+    let be = tc.join("AMD64/artifact/blood-elf-0");
+    let m1 = tc.join("AMD64/bin/M1");
+    let hex2 = tc.join("AMD64/bin/hex2");
+    for t in [&m2p, &be, &m1, &hex2] {
+        make_executable(t).map_err(io_err("chmod toolchain tool"))?;
+    }
+
+    // Unpack the warmed, pin-verified tarball into a fresh scratch dir.
+    let pin = source_pin(cx, "mes-0.27.1.lock")?;
+    let tarball = cx.sources_dir.join(&pin.file);
+    let work = scratch_dir("td-bootstrap-mes").map_err(io_err("scratch dir"))?;
+    extract_tar_gz(&tarball, &work)?;
+    let m = single_subdir(&work)?;
+    if !m.join("kaem.run").is_file() || !m.join("src/mes.c").is_file() {
+        return Err(format!("unpacked Mes tree missing kaem.run/src ({})", m.display()));
+    }
+
+    // Generated, exactly as configure.sh does for the non-system-libc path.
+    let ver = read_make_var(&m.join("configure.sh"), "VERSION")?;
+    for d in ["include/mes", "include/arch", "m2", "bin"] {
+        fs::create_dir_all(m.join(d)).map_err(io_err("mkdir mes subdir"))?;
+    }
+    fs::write(
+        m.join("include/mes/config.h"),
+        format!("#undef SYSTEM_LIBC\n#define MES_VERSION \"{ver}\"\n"),
+    )
+    .map_err(io_err("write config.h"))?;
+    for h in ["kernel-stat.h", "signal.h", "syscall.h"] {
+        fs::copy(
+            m.join(format!("include/linux/x86_64/{h}")),
+            m.join(format!("include/arch/{h}")),
+        )
+        .map_err(io_err("cp arch header"))?;
+    }
+
+    // M2-Planet: the tarball's own input list (config.h is generated above).
+    let kaem_run = fs::read_to_string(m.join("kaem.run")).map_err(io_err("read kaem.run"))?;
+    let units = parse_m2planet_units(&kaem_run);
+    if units.is_empty() {
+        return Err("kaem.run yielded no M2-Planet input units (format drift?)".into());
+    }
+    let mut m2_args: Vec<String> = vec![
+        "--debug".into(),
+        "--architecture".into(),
+        "amd64".into(),
+        "-D".into(),
+        "__x86_64__=1".into(),
+        "-D".into(),
+        "__linux__=1".into(),
+    ];
+    for u in &units {
+        m2_args.push("-f".into());
+        m2_args.push(u.clone());
+    }
+    m2_args.push("-o".into());
+    m2_args.push("m2/mes.M1".into());
+    run_step(&m2p, &str_args(&m2_args), &m, "M2-Planet mes.M1")?;
+
+    run_step(
+        &be,
+        &["--64", "--little-endian", "-f", "m2/mes.M1", "-o", "m2/mes.blood-elf-M1"],
+        &m,
+        "blood-elf",
+    )?;
+    run_step(
+        &m1,
+        &[
+            "--architecture", "amd64", "--little-endian",
+            "-f", "lib/m2/x86_64/x86_64_defs.M1",
+            "-f", "lib/x86_64-mes/x86_64.M1",
+            "-f", "lib/linux/x86_64-mes-m2/crt1.M1",
+            "-f", "m2/mes.M1",
+            "-f", "m2/mes.blood-elf-M1",
+            "-o", "m2/mes.hex2",
+        ],
+        &m,
+        "M1 assemble",
+    )?;
+    run_step(
+        &hex2,
+        &[
+            "--architecture", "amd64", "--little-endian", "--base-address", "0x1000000",
+            "-f", "lib/m2/x86_64/ELF-x86_64.hex2",
+            "-f", "m2/mes.hex2",
+            "-o", "bin/mes-m2",
+        ],
+        &m,
+        "hex2 link",
+    )?;
+    make_executable(&m.join("bin/mes-m2")).map_err(io_err("chmod mes-m2"))?;
+    Ok(Built { dir: m })
+}
+
+fn mes_behavioral(_cx: &Ctx, b: &Built) -> Result<(), String> {
+    // mes-m2 finds its boot via MES_PREFIX + resolves modules via GUILE_LOAD_PATH;
+    // both absolute since we run it from outside the mes scratch. (env -i + these two.)
+    let prefix = b.dir.as_os_str();
+    let load_path = format!(
+        "{}:{}",
+        b.dir.join("mes/module").display(),
+        b.dir.join("module").display()
+    );
+    let mes = b.dir.join("bin/mes-m2");
+    let eval = |code: &str| -> Result<String, String> {
+        let out = scrubbed(&mes)
+            .env("MES_PREFIX", prefix)
+            .env("GUILE_LOAD_PATH", &load_path)
+            .arg("-c")
+            .arg(code)
+            .output()
+            .map_err(io_err("exec mes-m2"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("mes-m2 failed to evaluate `{code}`: {}", err.trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let hello = eval("(display 'Hello,M2-mes!) (newline)")?;
+    if hello != "Hello,M2-mes!" {
+        return Err(format!("mes-m2 display gave [{hello}], want [Hello,M2-mes!]"));
+    }
+    let arith = eval("(display (+ 1 2 3 4)) (newline)")?;
+    if arith != "10" {
+        return Err(format!("mes-m2 arithmetic gave [{arith}], want [10]"));
     }
     Ok(())
 }
@@ -453,6 +679,69 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// `&[String]` → `&[&str]` for `Command::args`.
+fn str_args(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+/// Run a scrubbed-env build step with cwd `dir`; on failure include the stderr tail.
+fn run_step(prog: &Path, args: &[&str], dir: &Path, what: &str) -> Result<(), String> {
+    let out = scrubbed(prog)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("exec {what}: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(8).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        return Err(format!("{what} failed:\n{}", tail.join("\n")));
+    }
+    Ok(())
+}
+
+/// Extract a `.tar.gz` into `dest` via the harness `tar` (offline; the build TOOLS
+/// run scrubbed, but unpacking the source is harness work — as the shell does).
+fn extract_tar_gz(tarball: &Path, dest: &Path) -> Result<(), String> {
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(tarball)
+        .arg("-C")
+        .arg(dest)
+        .status()
+        .map_err(|e| format!("exec tar: {e}"))?;
+    if !status.success() {
+        return Err(format!("could not unpack {}", tarball.display()));
+    }
+    Ok(())
+}
+
+/// The single top-level subdirectory of a freshly-unpacked tarball dir.
+fn single_subdir(dir: &Path) -> Result<PathBuf, String> {
+    let mut subdirs: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|e| format!("read {}: {e}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    match subdirs.len() {
+        1 => Ok(subdirs.pop().unwrap()),
+        n => Err(format!("expected one top-level dir under {}, found {n}", dir.display())),
+    }
+}
+
+/// Read a `KEY=value` make/shell variable (first `^KEY=` line) from a file.
+fn read_make_var(file: &Path, key: &str) -> Result<String, String> {
+    let text = fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    let prefix = format!("{key}=");
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix(&prefix) {
+            return Ok(v.trim().to_string());
+        }
+    }
+    Err(format!("{} has no {key}= line", file.display()))
+}
+
 fn make_executable(p: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perm = fs::metadata(p)?.permissions();
@@ -490,11 +779,16 @@ fn scratch_dir(prefix: &str) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Best-effort scratch-dir cleanup on scope exit (the runner builds twice).
+/// Best-effort scratch-dir cleanup on scope exit (the runner builds twice). Set
+/// `TD_BOOTSTRAP_KEEP=1` to keep the scratch dirs for debugging a rung's output.
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if std::env::var_os("TD_BOOTSTRAP_KEEP").is_none() {
+            let _ = fs::remove_dir_all(&self.0);
+        } else {
+            eprintln!("td-bootstrap: kept scratch {}", self.0.display());
+        }
     }
 }
 
@@ -526,6 +820,31 @@ mod tests {
     fn source_lock_missing_field_errors() {
         let e = parse_source_lock("url x\nfile y\n", "broken.lock").unwrap_err();
         assert!(e.contains("missing `sha256`"), "got: {e}");
+    }
+
+    #[test]
+    fn m2planet_units_extracted_in_order_with_cpu_subst() {
+        // The block runs from the `M2-Planet` line to `-o m2/mes.M1`; only
+        // `-f ${srcdest}<path>` lines yield units, `${mes_cpu}` → x86_64.
+        let kaem = "\
+some preamble line\n\
+M2-Planet \\\n\
+    --debug \\\n\
+    -f ${srcdest}include/mes/config.h \\\n\
+    -f ${srcdest}lib/linux/${mes_cpu}-mes-m2/crt1.c \\\n\
+                \\\n\
+    -f ${srcdest}src/mes.c \\\n\
+    -o m2/mes.M1\n\
+    -f ${srcdest}should/not/appear.c\n";
+        let units = parse_m2planet_units(kaem);
+        assert_eq!(
+            units,
+            vec![
+                "include/mes/config.h",
+                "lib/linux/x86_64-mes-m2/crt1.c",
+                "src/mes.c",
+            ]
+        );
     }
 
     #[test]

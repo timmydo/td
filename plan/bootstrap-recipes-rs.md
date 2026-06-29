@@ -73,3 +73,11 @@ bootstrap`, 9 tests green):
 
 Sub-task 1 (framework + seed) done: green via `cargo test` and via the stage0
 binary (`td-builder bootstrap-recipe seed` → all legs + PASS).
+
+Sub-task 2 (mes) done: `td-builder bootstrap-recipe mes` (TD_SOURCES_DIR → the warm
+cache) → all legs + PASS. Reproducible (two builds same sha). **Own-then-diverge:
+the Rust-built mes-m2 is BYTE-IDENTICAL to the shell oracle's** —
+`203e5516bbde550e40602ca43435502760bad5f35929eef6596cd225ed0c1c27` from both
+`bootstrap-recipe mes` and an instrumented `tests/bootstrap-mes.sh` run — so the
+kaem.run input-list port + the M2P/BE/M1/HEX2 chain are faithful. `cargo test
+m2planet_units_extracted_in_order_with_cpu_subst` covers the extraction.
