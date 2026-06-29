@@ -89,6 +89,32 @@ does not, so a bare `check-rung` harness can't run brick8 (these are NOT gate bu
    requirement as the hello-corpus gate. The authoritative run is `./check.sh build-recipes
    bootstrap-sed-corpus-store-native` (or build-recipes once, then the gate).
 
+## From-seed root cause + fix (2026-06-29) — a real pre-existing bug, also hits hello-corpus
+
+The from-seed `./check.sh` run failed for a long time with `configure: error: C compiler cannot
+create executables` in build-recipe, while the cached-toolchain harness always passed. Ruled out
+contention (failed on a quiet box), PATH, MAKEFLAGS (all rungs clear it), TMPDIR-location, and
+`/td/store` pollution. A faithful link diagnostic (reproduce the assembled-toolchain link in a
+store-ns own-root with `-v`) pinned it: **the make-built `ld` kept a build-dir PT_INTERP**
+(`/tmp/tmp.XXX/glibcsharedbuild/out/lib/ld-linux.so.2`) instead of `/td/store/…-glibc-2.41/…`.
+
+Cause: brick8's `elf-set-interp` rewrites PT_INTERP **in place, shrink-or-equal** (td's `elf.rs`
+has no patchelf-style grow). The toolchain binaries' build-time interp lives under `$TMPDIR`. Under
+**check.sh's default `TMPDIR=/tmp`** the build interp is 58 chars — **shorter** than the `/td/store`
+target (71) — so the in-place rewrite silently no-ops (`|| true`) and `ld`/`as` keep a dead
+build-dir interp that doesn't exist in build-recipe's `/td/store`-only pivot sandbox → ld can't
+start → link fails. **check-rung used a long worktree `TMPDIR`**, so its build interp was long
+enough — which is exactly why it always worked there and the bug hid. This hits the landed
+`bootstrap-hello-corpus-store-native` gate **identically** (same chain + check.sh); it just hasn't
+been run from-seed via check.sh yet (it landed dev-green; the daily suite hasn't run).
+
+Fix (in `tests/bootstrap-chain.sh`): `bootstrap_modern_toolchain` pins a deliberately-long `TMPDIR`
+under `.td-build-cache` + a hard length assertion (≥75) so the in-place rewrite always fits and can
+never silently regress. **Validated from seed** via `./check.sh bootstrap-sed-corpus-store-native`:
+build-recipe builds sed 4.9, interp=`/td/store/…-glibc-2.41/ld-linux.so.2`, no guix gcc-toolchain
+ref, sed runs `foo→bar`, /gnu/store ABSENT — PASS. Proper long-term fix: grow support in `elf.rs`
+(PT_INTERP grow), which would remove the TMPDIR-length dependency entirely (follow-up).
+
 ## Notes / gotchas
 
 - i686 (the /td/store toolchain is i686; the x86_64 lift is a separate track). Corpus C tools are
