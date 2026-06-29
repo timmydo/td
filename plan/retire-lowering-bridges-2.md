@@ -70,4 +70,37 @@ td-drv-build-drv.scm + td-builder-s4-drv.scm (path-info queries).
 
 ## Status / evidence
 
-(filled in as gates go green)
+- Byte-identity pre-verified on the host for every value (table above), then CONFIRMED
+  in-sandbox: the landing run printed `registry 3vx3…`, `place 6xkxrh…/1np6wk…`,
+  `generation-image 1k71wcrq…/112m8a9b…` — identical to the deleted bridges.
+- `tools/affected-checks.sh --committed-only --run`: **exit 0**, full `./check.sh`
+  WAIVED. Selected + green: `rollback registry verify-place place drv-emit td-drv-add
+  check-system` (the whole system bundle, incl. the rollback + td-native disk-boot VM
+  tests, oci-load, reset). Preflights green: plan-index, shell-syntax, affected-self-test.
+- Independent code review (Workflow step 6) run before PR. Findings + resolutions:
+  - **[HIGH] `ci/lower-check-drvs.sh` references the deleted bridges.** NOT fixed here,
+    deliberately. That script (the full `td-ci` image enumerator) is ALREADY stale on
+    main: its glob guard rejects 6 drv files from other tracks (build-hermetic, daemon,
+    drv-emit, td-drv-add, td-drv-assemble, td-drv-build) that were never added to
+    `LOWERING_SCRIPTS`, so it exits at line ~71 BEFORE reaching the registry/place/rollback
+    refs — it fails at the same point before and after this PR. It is invoked ONLY by the
+    full image build (`ci-image.yml` / `ci/build-ci-image.sh` full tier); the per-PR loop
+    uses the FAST image (`ci/lower-fast-drvs.sh`, clean) and the daily backstop
+    (`ci/daily-full-suite.sh`) runs `./check.sh` directly — NEITHER uses this enumerator.
+    Touching `ci/lower-*.sh` also force-escalates affected-checks to a full `./check.sh`
+    (multi-hour from-source toolchain rebuild) — disproportionate for a byte-identical
+    refactor, and §7.2 deliberately keeps the full suite off the per-PR path. A holistic
+    repair (this PR's 3 + the other tracks' 6, re-enumerated via `tools/guix-lower.sh`,
+    or retiring the legacy enumerator) belongs in a dedicated CI-image PR under that
+    escalation. A worked patch is staged in this track's notes if wanted.
+  - **[LOW] place IMG via `--out` eager-builds + `2>/dev/null`.** The original computed
+    IMG paths via `derivation->output-path` (no build); `--out` realizes the image. Net
+    pass/fail unchanged (single-output drv → identical path; the images are inputs of the
+    placed tree, built either way). Diagnostics-only; left as-is.
+  - **[INFO] dead `affected-checks.sh` cases (369/373)** for the deleted drv-emit/
+    td-drv-add bridges: KEPT on purpose — they route THIS PR's file-deletion diff to the
+    drv-emit/td-drv-add targets (without them the deletion hits the catch-all →
+    require_full, losing the waiver).
+- Resolution-equivalent (same .drv, same output, DIGESTS.md untouched): the green run is
+  the test; no new assertion ⇒ no verified-red beyond green (same posture as
+  retire-lowering-bridges).
