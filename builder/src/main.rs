@@ -16,6 +16,7 @@
 //!   • S4 — the daemon-vs-td-builder store differential, as a check.sh rung.
 
 mod affected;
+mod bootstrap;
 mod build;
 mod build_daemon;
 mod daemon;
@@ -1862,6 +1863,9 @@ fn main() -> ExitCode {
         // map the branch diff to a right-sized check set + the waive/escalate
         // decision. Run from the repo root. See builder/src/affected.rs.
         Some("affected-checks") => affected::main(&args[2..]),
+        // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
+        // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
+        Some("bootstrap-recipe") => bootstrap::cli(&args),
         Some("nar-hash") if args.len() == 3 => match nar_hash(&args[2]) {
             Ok(h) => {
                 println!("{h}");

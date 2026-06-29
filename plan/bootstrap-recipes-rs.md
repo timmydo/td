@@ -62,4 +62,14 @@ cutover (shell driver → thin shim exec'ing `td-builder bootstrap-recipe`).
 
 ## Verified-red log
 
-(to fill as legs are exercised)
+Each shared leg has a native red test in `builder/src/bootstrap.rs` (`cargo test
+bootstrap`, 9 tests green):
+- `seed_recipe_builds_and_passes_all_legs` — the real seed rung is GREEN end-to-end.
+- `wrong_vendored_pin_reds_pinned_input` — a wrong pin reds `[pinned-input]`.
+- `gnu_store_in_artifact_reds_no_guix` — a `/gnu/store` byte reds `[no-guix]`.
+- `nondeterministic_build_reds_repro` — a non-deterministic build reds `[repro]`.
+- `failing_check_reds_run` — a failing behavioral check reds the run.
+- `green_synthetic_passes` — the synthetic control is green (legs not vacuous).
+
+Sub-task 1 (framework + seed) done: green via `cargo test` and via the stage0
+binary (`td-builder bootstrap-recipe seed` → all legs + PASS).
