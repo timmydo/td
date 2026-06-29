@@ -216,7 +216,7 @@ pub fn build_layer_tar_from_store_paths(
     let store_rel = store_dir
         .to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 store dir"))?
-        .trim_start_matches('/');
+        .trim_matches('/'); // tolerate a trailing slash (no doubled separators)
     let mut out = Vec::new();
     // Emit each parent component (gnu/, gnu/store/) once, before the closure entries.
     let mut acc = String::new();
@@ -401,7 +401,7 @@ mod tests {
             pos += BLOCK;
             let body = archive[pos..pos + size].to_vec();
             pos += size.div_ceil(BLOCK) * BLOCK;
-            let mut detok = |b: Vec<u8>| {
+            let detok = |b: Vec<u8>| {
                 let mut s = String::from_utf8(b).unwrap();
                 if s.ends_with('\0') {
                     s.pop();

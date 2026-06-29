@@ -29,6 +29,7 @@ oci-native:
 	skopeo=`$(GUIX) build skopeo`/bin/skopeo; \
 	crun=`$(GUIX) build crun`/bin/crun; \
 	scratch="$(CURDIR)/.oci-native-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
+	trap 'chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"' EXIT; \
 	printf '{"repoTag":"td-hello:latest","env":["PATH=/bin"],"entrypoint":["%s/bin/hello"]}' "$$hello" > "$$scratch/config.json"; \
 	echo ">> td-builder oci-image-closure (td reads /var/guix/db, packs hello's closure — no guix system image)"; \
 	"$$tb" oci-image-closure /var/guix/db/db.sqlite /gnu/store "$$scratch/config.json" "$$scratch/img1.tar" "$$hello" \
