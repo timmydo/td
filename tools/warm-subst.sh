@@ -24,6 +24,7 @@ pub="$root/tests/td-subst.pub"
 ls "$store"/*.narinfo >/dev/null 2>&1 || exit 0
 [ -s "$pub" ] || exit 0
 
-printf 'export TD_SUBST_BIN=%s\n' "$bin"
-printf 'export TD_SUBST_STORE=%s\n' "$store"
-printf 'export TD_SUBST_PUBKEY=%s\n' "$pub"
+# Single-quote the values so check.sh's `eval` is safe even if $HOME contains spaces.
+printf "export TD_SUBST_BIN='%s'\n" "$bin"
+printf "export TD_SUBST_STORE='%s'\n" "$store"
+printf "export TD_SUBST_PUBKEY='%s'\n" "$pub"
