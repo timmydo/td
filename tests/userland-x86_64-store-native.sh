@@ -183,6 +183,12 @@ echo "   x86_64 toolchain ready (XGCC2=$XGCC2)"
 # unsorted pick grabbed a gawk that SIGFPEs in the sandbox). Build-drivers; no output bytes.
 XBIN="$snwork/xbin"; _xbin "$XBIN"; export XBIN
 test -x "$XBIN/awk" || fail "_xbin produced no awk for the build scaffolding"
+# busybox's Kbuild scripts (e.g. scripts/basic/split-include) call find/xargs, which _xbin
+# doesn't carry — add them (build-drivers, no output bytes; _store_tool is sorted/deterministic).
+for t in find:findutils xargs:findutils; do
+  b=`_store_tool "${t%%:*}" "${t##*:}"`; test -n "$b" && ln -sf "$b" "$XBIN/${t%%:*}" || true
+done
+test -x "$XBIN/find" || fail "no find for the busybox Kbuild scaffolding"
 
 # --- the x86_64 Linux UAPI headers (warm, pinned) for the cc wrapper's -idirafter (glibc's
 # headers #include <linux/*>; the glibc component doesn't carry them) ------------------------
