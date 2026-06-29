@@ -121,9 +121,8 @@ acceptance test. An agent does far better climbing a ladder of green bars than h
 a monolith in context. (Parallel side-tracks alongside the mainline are governed by
 §7.)
 
-The live ladder — mainline M10.3 → M11 → M12 plus the side-tracks — is §7.1, with
-per-track detail under `plan/`. Climbed rungs (v0/M1 through M10.2) are recorded in
-`HISTORY.md`.
+The live ladder — mainline M10.3 → M11 → M12 plus the side-tracks — is §7.1.
+Climbed rungs (v0/M1 through M10.2) are recorded in `HISTORY.md`.
 
 ### 2.5 Replacement order and the oracle for each swap
 

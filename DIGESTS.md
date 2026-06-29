@@ -2,7 +2,7 @@
 
 The shipped artifacts' deterministic outputs (the digest convention from DESIGN §2.7).
 This file changes ONLY on an oracle re-baseline, which is an **exclusive landing**
-(DESIGN §7.3): land it as a small standalone commit, announced in your track file,
+(DESIGN §7.3): land it as a small standalone commit, announced in the PR,
 and expect every other agent to rebase.
 
 **Re-baseline procedure addendum (check-memo constraint 4):** any change to this file MUST be validated with the

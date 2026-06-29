@@ -1,6 +1,6 @@
 ;; system/td-build.scm — construct a derivation built by td's OWN Rust builder
-;; instead of gnu-build-system (DESIGN §7.1 corpus-independence; plan/
-;; corpus-independence.md "own Rust builder").
+;; instead of gnu-build-system (DESIGN §7.1 corpus-independence; td's "own
+;; Rust builder").
 ;;
 ;; Where system/td-recipe.scm lowers a TS-authored recipe through
 ;; `gnu-build-system` (Guile build-system + a Guile builder), this lowers the SAME

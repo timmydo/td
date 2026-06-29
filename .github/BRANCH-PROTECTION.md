@@ -148,8 +148,10 @@ base**, not the latest tip.
    `td-builder affected-checks --committed-only --run` (waives or escalates to the
    full loop per the diff). CI verifies your run; it does not replace it.
 2. Push the branch, open the PR (`gh pr create`), wait for `lint` + `check-fast`.
-3. Human review + approval, then squash- or rebase-merge (merge commits
-   disabled — linear history). **Do not rebase-onto-tip + re-run just because
+3. Human review + approval, then squash-merge (the only merge mode enabled —
+   merge and rebase merges are off, linear history; the squash commit body is
+   the branch's commit messages, not the PR description). **Do not rebase-onto-tip
+   + re-run just because
    main moved** — that toil is what non-strict drops. Rebase only on a real git
    conflict, or to sequence an exclusive landing. A broken combination is healed
    by the next agent as a duty (above): before you start or land, if main's
