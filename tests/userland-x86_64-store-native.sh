@@ -114,35 +114,58 @@ build_busybox_x86_64() {
 # ============================================================================================
 cpath=`make_curated_path`
 for bad in gcc g++ cc guile guix; do test ! -e "$cpath/$bad" || fail "curated PATH still exposes '$bad'"; done
-tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
-mesp=`build_mes_prefix "$tc" "$cpath"` || fail "Mes (MesCC self-host) did not build/install"
-TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$cpath" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
-MK=`mktemp -d`/makebuild; build_make "$tc" "$cpath" "$mesp" "$TCCD" "$MK" || fail "tcc did not build GNU Make 3.80"
-PD=`mktemp -d`/patchbuild; build_patch "$cpath" "$mesp" "$TCCD" "$MK" "$PD" || fail "the tcc-built make did not build patch"
-BD=`mktemp -d`/binutilsbuild; build_binutils "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" || fail "the tcc-built make did not build binutils-mesboot0"
-GD=`mktemp -d`/gccbuild; build_gcc "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" "$GD" || fail "the toolchain did not build gcc 2.95.3"
-HD=`mktemp -d`/headers; build_headers "$mesp" "$HD" || fail "could not install the kernel headers"
-GLD=`mktemp -d`/glibcbuild; build_glibc "$cpath" "$GD" "$BD" "$TCCD" "$MK" "$PD" "$HD" "$GLD" || fail "the seed toolchain did not build glibc 2.2.5"
-G2=`mktemp -d`/gcc2build; build_gcc_mesboot0 "$cpath" "$GD" "$BD" "$GLD" "$HD" "$MK" "$PD" "$G2" || fail "the toolchain did not rebuild gcc 2.95.3 against glibc"
-B2=`mktemp -d`/binutils1build; build_binutils_mesboot1 "$cpath" "$G2" "$BD" "$GLD" "$MK" "$PD" "$B2" || fail "gcc-mesboot0 did not rebuild binutils against glibc"
-MM=`mktemp -d`/makemesbootbuild; build_make_mesboot "$cpath" "$G2" "$BD" "$GLD" "$MK" "$MM" || fail "gcc-mesboot0 did not rebuild GNU Make against glibc"
-GM1=`mktemp -d`/gccmesboot1build; build_gcc_mesboot1 "$cpath" "$G2" "$B2" "$MM" "$GLD" "$PD" "$GM1" || fail "the toolchain did not build GCC 4.6.4 (c,c++)"
-BMB=`mktemp -d`/binutilsmesbootbuild; build_binutils_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$PD" "$BMB" || fail "gcc-mesboot1 did not rebuild binutils"
-GAWKMB=`mktemp -d`/gawkmesbootbuild; build_gawk_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$GAWKMB" || fail "gcc-mesboot1 did not build GNU awk"
-GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GOUT" || fail "the toolchain did not build glibc 2.16.0"
-GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$cpath" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
-GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
-GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
-BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
-MKX=`mktemp -d`/makex; BBX=`mktemp -d`/bbx
-trap 'rm -rf "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$MKX"`" "`dirname "$BBX"`" "`dirname "$cpath"`" "${snwork:-}" "${tree:-}"' EXIT INT TERM
-
-GCC14="$GCC14B/stage/td/store/gcc-14.3.0"; GST="$GOUT/out"
-echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils 2.44"
+. tests/cache-lib.sh
 . tests/x86_64-cross-fns.sh
-run_x86_64_cross "$cpath" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
-# exports: XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU X86_WORK
-echo "   crossed up: x86_64 glibc 2.41 ($XGLIBC) + libgcc_s ($XLIBGCCDIR)"
+. tests/x86_64-subst-lib.sh
+export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
+load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
+export TD_STORE_DIR=/td/store
+snwork=`mktemp -d`
+MKX="$snwork/makex"; BBX="$snwork/bbx"
+trap 'rm -rf "$snwork"' EXIT INT TERM    # the build branch re-traps to also clean its chain temps
+cstore="$snwork/closure-store"; cdb="$snwork/closure.db"; mkdir -p "$cstore"
+bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
+bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash from hello's closure for the own-root shell"
+bbase=`basename "$bs"`; cp -a "$bs" "$cstore/$bbase"; chmod -R u+w "$cstore"
+
+# --- Get the x86_64 toolchain: FETCH the lock-keyed closure (x64-toolchain-subst, #223) if a
+# substitute store is exposed, else BUILD it from the 229-byte seed (directive 1) and export the
+# closure for the daily to publish. Either path sets XBU/XGCC2/XGLIBC/XLIBGCCDIR (via _x86_point
+# or run_x86_64_cross). The substitute is an optimization, NEVER a correctness dependency.
+if x86_64_resolve_closure "$cstore" "$cdb"; then
+  echo ">> [subst/SKIP] fetched the x86_64 toolchain closure {binutils,gcc,glibc} — SKIPPED the ~98-min from-seed build"
+else
+  echo ">> [subst/MISS] no exposed substitute store — building the x86_64 toolchain from the 229-byte seed (directive 1)"
+  tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
+  mesp=`build_mes_prefix "$tc" "$cpath"` || fail "Mes (MesCC self-host) did not build/install"
+  TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$cpath" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
+  MK=`mktemp -d`/makebuild; build_make "$tc" "$cpath" "$mesp" "$TCCD" "$MK" || fail "tcc did not build GNU Make 3.80"
+  PD=`mktemp -d`/patchbuild; build_patch "$cpath" "$mesp" "$TCCD" "$MK" "$PD" || fail "the tcc-built make did not build patch"
+  BD=`mktemp -d`/binutilsbuild; build_binutils "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" || fail "the tcc-built make did not build binutils-mesboot0"
+  GD=`mktemp -d`/gccbuild; build_gcc "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" "$GD" || fail "the toolchain did not build gcc 2.95.3"
+  HD=`mktemp -d`/headers; build_headers "$mesp" "$HD" || fail "could not install the kernel headers"
+  GLD=`mktemp -d`/glibcbuild; build_glibc "$cpath" "$GD" "$BD" "$TCCD" "$MK" "$PD" "$HD" "$GLD" || fail "the seed toolchain did not build glibc 2.2.5"
+  G2=`mktemp -d`/gcc2build; build_gcc_mesboot0 "$cpath" "$GD" "$BD" "$GLD" "$HD" "$MK" "$PD" "$G2" || fail "the toolchain did not rebuild gcc 2.95.3 against glibc"
+  B2=`mktemp -d`/binutils1build; build_binutils_mesboot1 "$cpath" "$G2" "$BD" "$GLD" "$MK" "$PD" "$B2" || fail "gcc-mesboot0 did not rebuild binutils against glibc"
+  MM=`mktemp -d`/makemesbootbuild; build_make_mesboot "$cpath" "$G2" "$BD" "$GLD" "$MK" "$MM" || fail "gcc-mesboot0 did not rebuild GNU Make against glibc"
+  GM1=`mktemp -d`/gccmesboot1build; build_gcc_mesboot1 "$cpath" "$G2" "$B2" "$MM" "$GLD" "$PD" "$GM1" || fail "the toolchain did not build GCC 4.6.4 (c,c++)"
+  BMB=`mktemp -d`/binutilsmesbootbuild; build_binutils_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$PD" "$BMB" || fail "gcc-mesboot1 did not rebuild binutils"
+  GAWKMB=`mktemp -d`/gawkmesbootbuild; build_gawk_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$GAWKMB" || fail "gcc-mesboot1 did not build GNU awk"
+  GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GOUT" || fail "the toolchain did not build glibc 2.16.0"
+  GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$cpath" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
+  GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
+  GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
+  BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
+  trap 'rm -rf "$snwork" "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$cpath"`"' EXIT INT TERM
+  GCC14="$GCC14B/stage/td/store/gcc-14.3.0"; GST="$GOUT/out"
+  echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils 2.44"
+  run_x86_64_cross "$cpath" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
+  verify_x86_64_ownroot "$cpath" "$snwork" || fail "the x86_64 own-root verify failed"
+  x86_64_build_closure "`pwd`/.td-build-cache/x86_64-closure-export" "$cstore" "$cdb" || fail "could not intern + subst-export the x86_64 toolchain closure"
+fi
+x86_64_verify_closure "$cpath" "$cstore" "$cdb" "$bbase" || fail "the x86_64 closure toolchain did not compile+run an x86_64 program → 42"
+echo "   x86_64 toolchain ready (XGCC2=$XGCC2)"
 
 # --- build the C userland (busybox + make) dynamic vs the x86_64 glibc 2.41 -----------------
 build_make_x86_64    "$cpath" "$XGCC2" "$XGLIBC" "$XLIBGCCDIR" "$XBU" "$MKX" || fail "the cross gcc did not build GNU make 4.4.1"
@@ -153,11 +176,7 @@ done
 echo "   [provenance] built busybox + make carry zero /gnu/store bytes"
 
 # --- assemble the self-contained tree (bins + glibc/libgcc closure in lib/) -----------------
-. tests/cache-lib.sh
-export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
-load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-export TD_STORE_DIR=/td/store
-tree=`mktemp -d`/tree; mkdir -p "$tree/bin" "$tree/lib"
+tree="$snwork/tree"; mkdir -p "$tree/bin" "$tree/lib"
 cp "$BBX/busybox" "$tree/bin/busybox"; cp "$MKX/make" "$tree/bin/make"
 for soname in libc.so.6 libdl.so.2 librt.so.1 libpthread.so.0 libm.so.6 libresolv.so.2; do
   s=`ls "$XGLIBC/lib/$soname" 2>/dev/null | head -1`; test -n "$s" -a -e "$s" && cp -L "$s" "$tree/lib/$soname" || true
@@ -173,27 +192,27 @@ done
 ( cd "$tree/bin"; for a in sh sed grep awk find tar gzip ls cat cp mkdir rm env printf xargs sort head tail wc tr cut; do ln -sf busybox "$a"; done )
 echo "   [structural] busybox + make interp relinked to /td/store/ld; applet symlinks placed"
 
-# --- intern the tree at /td/store + place the loader -----------------------------------------
-snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
-out=`"$TB" store-add-recursive userland-x86_64-store-native "$tree" "$store" "$sndb"` || fail "store-add-recursive"
+# --- intern the tree at /td/store + place the loader (a SEPARATE userland store under snwork) -
+ustore="$snwork/userland-store"; udb="$snwork/userland.db"; mkdir -p "$ustore"
+out=`"$TB" store-add-recursive userland-x86_64-store-native "$tree" "$ustore" "$udb"` || fail "store-add-recursive"
 case "$out" in /td/store/*-userland-x86_64-store-native) ;; *) fail "interned path not content-addressed under /td/store (got: $out)" ;; esac
-phys="$store/`basename "$out"`"; rel=${out#/td/store/}
+phys="$ustore/`basename "$out"`"; rel=${out#/td/store/}
 test -x "$phys/bin/busybox" -a -x "$phys/bin/make" || fail "interned tree missing busybox/make"
 if grep -r -a -q '/gnu/store' "$phys" 2>/dev/null; then fail "interned set contains /gnu/store: `grep -r -a -l '/gnu/store' "$phys" 2>/dev/null | head -1`"; fi
 echo "   [no-guix] interned $out — zero /gnu/store (busybox/make + td-built glibc/libgcc)"
 for need in libc.so.6 libm.so.6 libgcc_s.so.1; do ls "$phys"/lib/*"$need"* >/dev/null 2>&1 || fail "interned lib/ missing $need"; done
 echo "   [structural] the interned lib/ holds the userland runtime closure"
-cp -L "$XGLIBC/lib/ld-linux-x86-64.so.2" "$store/ld" || fail "could not place the x86_64 loader at /td/store/ld"
-! grep -q -a '/gnu/store' "$store/ld" || fail "the /td/store/ld loader contains /gnu/store bytes"
+cp -L "$XGLIBC/lib/ld-linux-x86-64.so.2" "$ustore/ld" || fail "could not place the x86_64 loader at /td/store/ld"
+! grep -q -a '/gnu/store' "$ustore/ld" || fail "the /td/store/ld loader contains /gnu/store bytes"
 
 # --- RUN busybox sh + make from /td/store in the store-ns own-root ---------------------------
-cat > "$store/probe.sh" <<PROBE
+cat > "$ustore/probe.sh" <<PROBE
 [ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 /td/store/$rel/bin/busybox echo BUSYBOX-RAN
 /td/store/$rel/bin/busybox sed --version 2>/dev/null | head -1
 /td/store/$rel/bin/make --version | head -1 && echo MAKE-RAN
 PROBE
-out2=`"$TB" store-ns "$store" -- "/td/store/$rel/bin/busybox" sh /td/store/probe.sh 2>&1` \
+out2=`"$TB" store-ns "$ustore" -- "/td/store/$rel/bin/busybox" sh /td/store/probe.sh 2>&1` \
   || { printf '%s\n' "$out2" | sed 's/^/     /' >&2; fail "store-ns userland run exited nonzero"; }
 printf '%s\n' "$out2" | sed 's/^/     /'
 printf '%s\n' "$out2" | grep -q '^BUSYBOX-RAN$' || fail "busybox did not run from /td/store"
