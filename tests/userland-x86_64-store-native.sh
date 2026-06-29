@@ -186,11 +186,12 @@ test -x "$XBIN/awk" || fail "_xbin produced no awk for the build scaffolding"
 # busybox's Kbuild (scripts/gen_build_files.sh) calls find/xargs, which _xbin doesn't carry.
 # Use an EXPLICIT, bound /gnu/store findutils (sorted/deterministic) — _store_tool's `command -v`
 # is unreliable here and yielded a broken `find` symlink. Build-drivers; no output bytes.
-for t in find xargs; do
-  b=`ls /gnu/store/*-findutils-*/bin/"$t" 2>/dev/null | sort | head -1`
-  test -n "$b" -a -x "$b" && ln -sf "$b" "$XBIN/$t" || true
+for t in find:findutils xargs:findutils bzip2:bzip2; do
+  n=${t%%:*}; pk=${t##*:}
+  b=`ls /gnu/store/*-"$pk"-*/bin/"$n" 2>/dev/null | sort | head -1`
+  test -n "$b" -a -x "$b" && ln -sf "$b" "$XBIN/$n" || true
 done
-test -x "$XBIN/find" || fail "no find for the busybox Kbuild scaffolding"
+test -x "$XBIN/find" -a -x "$XBIN/bzip2" || fail "missing find/bzip2 for the busybox Kbuild scaffolding"
 
 # --- the x86_64 Linux UAPI headers (warm, pinned) for the cc wrapper's -idirafter (glibc's
 # headers #include <linux/*>; the glibc component doesn't carry them) ------------------------
