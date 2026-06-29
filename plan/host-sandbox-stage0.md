@@ -269,3 +269,31 @@ it owns gate 414 / x86_64-cross-fns.sh / bootstrap-x86_64-toolchain-store-native
 - It builds the toolchain from seed for now; once #223 + PR3b land the closure-fetch, retarget
   the userland gate's toolchain provisioning to resolve-toolchain.sh (fetch, fall back to seed)
   — a small change then, not the producer build-out planned above.
+
+### GREEN — gate 420 userland-x86_64-store-native (2026-06-28, after #223 merged)
+
+The userland captured set is DONE. After #223 merged, the gate FETCHES the x86_64 toolchain
+closure {binutils-2.44, gcc-14.3.0, glibc-2.41} via `x86_64_resolve_closure` (#223's subst
+machinery, signed + lock-keyed) and falls back to a from-seed build + `x86_64_build_closure`
+(directive 1). On the fetch path each iteration is ~15 min, not ~90 — that unlocked debugging
+the busybox/make build inside the loop sandbox. busybox 1.37.0 + GNU make 4.4.1 build from
+upstream source (td-fetch, sha-pinned) with that toolchain, DYNAMIC vs /td/store glibc 2.41,
+intern at /td/store, and RUN in the store-ns own-root → GNU Make 4.4.1, /gnu/store ABSENT, zero
+guix bytes. Verified-red: interp → bogus /td/store path ⇒ behavioral leg reds ("store-ns:
+spawning busybox: No such file or directory") — the interp relink is load-bearing.
+
+Sandbox-build lessons (busybox surfaces these as loud failures — the point of choosing it):
+- no /bin/sh: configure/Kbuild #!/bin/sh shebangs sed'd to the curated shell; AND glibc's
+  popen()/system() hardcode /bin/sh (busybox split-include) — a COMPILED libc call, no shebang
+  to sed → symlink /bin/sh in the dev-shell's writable ephemeral tmpfs root (namespace-local).
+- build-vs-run interp/rpath: bake the ABSOLUTE build-dir glibc rpath so test binaries run at
+  build with NO LD_LIBRARY_PATH (a global LD_LIBRARY_PATH=<x86_64 glibc> poisons the host gawk →
+  SIGFPE), then relink interp→/td/store/ld AND rpath→$ORIGIN/../lib at assemble (elf-set-rpath).
+- glibc component lacks the Linux UAPI headers (they live in the build sysroot) → -idirafter the
+  warm KH_X86_64_TB so glibc's bits/local_lim.h finds <linux/limits.h>.
+- scaffolding (no output bytes): awk/m4/bison/... via cross-fns _xbin (sorted/deterministic —
+  an ad-hoc gawk pick SIGFPE'd); find/xargs/bzip2 + plain-name binutils (ar/nm/...) for Kbuild;
+  CPP=<cross gcc -E> (no /lib/cpp); pin make's autotools mtimes (no automake re-run).
+
+NEXT (inc2c): wire gate 420 into a guix-free check tier + daily-full-suite; the toolchain
+fetch already works headless on a populated ~/.td/subst (the daily publishes it).
