@@ -66,5 +66,19 @@ is fine. Everything normalized (mtime, uid/gid, sorted entries) for reproducibil
   `td-builder affected-checks --committed-only --run` → exit 0, full `./check.sh` waived
   (builder/src/* → check-engine smoke). NOTE: this is the primitive; it does not yet
   replace a guix call in a gate (brick 3 does).
+- **Brick 2 — DONE.** `build_layer_tar_from_store_paths` + `td-builder oci-image-closure`
+  pack a real store CLOSURE (`Db::closure`, no guix process) into the image. +1 unit
+  test; END-TO-END on real /var/guix/db data (skopeo loaded a 22-path hello closure).
+- **Brick 3 — DONE (the "simple example").** `mk/gates/118-oci-native.mk` +
+  `tests/oci-native-check.sh`: td builds a docker-archive from hello's closure (no guix
+  system image), and DURABLE assertions prove it works — skopeo `copy docker-archive:`
+  loads it, **crun runs hello → "Hello, world!"**, INTRINSIC byte-reproducibility (same
+  closure packs to the same sha256, no guix oracle), self-discriminating negative exec.
+  `./check.sh oci-native` GREEN. (Gotcha: the sandbox has no diffutils → compare with
+  `sha256sum`, not `cmp`.) The package/toolchain bytes stay guix (retired last).
+- NEXT (separate, large PR): RIP OUT the guix-system-image gates/tests/system files
+  (oci/oci-diff/oci-load/generation-*/manifest-*/registry/verify-place/place/rollback/
+  container/run/rootless/boot/reset + their tests/*.scm + system/td*.scm image lowering)
+  — destructive + spine-touching (check.sh/Makefile/DIGESTS/CI), surfaced for sign-off.
 - Mid-track env change: `tools/affected-checks.sh` was replaced on main by the Rust
   `td-builder affected-checks` subcommand — validation uses that now.
