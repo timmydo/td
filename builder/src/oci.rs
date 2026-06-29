@@ -145,21 +145,20 @@ fn tar_entry(out: &mut Vec<u8>, name: &str, typeflag: u8, mode: u32, body: &[u8]
     }
 }
 
-/// Serialize the rootfs at ROOT as a deterministic tar (no trailing zero blocks —
-/// `build_layer_tar` adds the EOF marker). Entry names are relative to ROOT, sorted,
-/// directories carry a trailing "/" (tar convention), with normalized metadata.
-fn append_tree(out: &mut Vec<u8>, root: &Path) -> io::Result<()> {
-    fn walk(out: &mut Vec<u8>, base: &Path, rel: &str) -> io::Result<()> {
-        let path = if rel.is_empty() { base.to_path_buf() } else { base.join(rel) };
-        let meta = fs::symlink_metadata(&path)?;
+/// Append SRC's tree to OUT as deterministic tar entries, each named PREFIX joined with
+/// the path relative to SRC. PREFIX="" packs SRC's CONTENTS at the tar root; a non-empty
+/// PREFIX places SRC's tree under that tar path (e.g. "gnu/store/<base>"). Sorted names,
+/// directories carry a trailing "/", metadata normalized (mode preserves suid/sgid/
+/// sticky); a non-UTF8 name/target errors. No trailing EOF blocks.
+fn append_subtree(out: &mut Vec<u8>, src: &Path, prefix: &str) -> io::Result<()> {
+    fn walk(out: &mut Vec<u8>, abspath: &Path, tarname: &str) -> io::Result<()> {
+        let meta = fs::symlink_metadata(abspath)?;
         let ft = meta.file_type();
         if ft.is_dir() {
-            if !rel.is_empty() {
-                tar_entry(out, &format!("{rel}/"), b'5', 0o755, &[], "");
+            if !tarname.is_empty() {
+                tar_entry(out, &format!("{tarname}/"), b'5', 0o755, &[], "");
             }
-            // Sort on the raw filename and ERROR on non-UTF8 (a lossy conversion would
-            // silently archive a mangled name): a store rootfs is UTF-8 by construction.
-            let mut names: Vec<String> = fs::read_dir(&path)?
+            let mut names: Vec<String> = fs::read_dir(abspath)?
                 .map(|e| {
                     e?.file_name().into_string().map_err(|n| {
                         io::Error::new(
@@ -171,38 +170,69 @@ fn append_tree(out: &mut Vec<u8>, root: &Path) -> io::Result<()> {
                 .collect::<io::Result<_>>()?;
             names.sort();
             for n in names {
-                let child = if rel.is_empty() { n } else { format!("{rel}/{n}") };
-                walk(out, base, &child)?;
+                let child = if tarname.is_empty() { n.clone() } else { format!("{tarname}/{n}") };
+                walk(out, &abspath.join(&n), &child)?;
             }
         } else if ft.is_symlink() {
-            let target = fs::read_link(&path)?;
+            let target = fs::read_link(abspath)?;
             let target = target.to_str().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 symlink target in layer")
             })?;
-            tar_entry(out, rel, b'2', 0o777, &[], target);
+            tar_entry(out, tarname, b'2', 0o777, &[], target);
         } else if ft.is_file() {
-            let body = fs::read(&path)?;
-            // Normalize mode but PRESERVE setuid/setgid/sticky (0o7000) and base exec on
-            // any exec bit — a collapse to 0o755/0o644 alone would drop a suid binary's
-            // bit.
+            let body = fs::read(abspath)?;
+            // Normalize mode but PRESERVE setuid/setgid/sticky (0o7000); base 0644/0755
+            // by any exec bit — a flat collapse would drop a suid binary's bit.
             let m = meta.permissions().mode();
             let mode = (m & 0o7000) | if m & 0o111 != 0 { 0o755 } else { 0o644 };
-            tar_entry(out, rel, b'0', mode, &body, "");
+            tar_entry(out, tarname, b'0', mode, &body, "");
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{}: unsupported file type for an OCI layer", path.display()),
+                format!("{}: unsupported file type for an OCI layer", abspath.display()),
             ));
         }
         Ok(())
     }
-    walk(out, root, "")
+    walk(out, src, prefix)
 }
 
 /// The rootfs at ROOT serialized as a complete layer tar (with the two-zero-block EOF).
 pub fn build_layer_tar(root: &Path) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
-    append_tree(&mut out, root)?;
+    append_subtree(&mut out, root, "")?;
+    out.resize(out.len() + BLOCK * 2, 0);
+    Ok(out)
+}
+
+/// A layer tar laying each store PATH's tree at its location under STORE_DIR (so
+/// `/gnu/store/<base>` -> tar `gnu/store/<base>/…`), preceded by the parent dir entries
+/// (`gnu/`, `gnu/store/`). PATHS is a store closure (sorted + deduped here). This is how
+/// td packs a real package/system closure into an image — no guix process, no temp copy.
+pub fn build_layer_tar_from_store_paths(
+    store_dir: &Path,
+    paths: &[String],
+) -> io::Result<Vec<u8>> {
+    let store_rel = store_dir
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 store dir"))?
+        .trim_start_matches('/');
+    let mut out = Vec::new();
+    // Emit each parent component (gnu/, gnu/store/) once, before the closure entries.
+    let mut acc = String::new();
+    for comp in store_rel.split('/').filter(|c| !c.is_empty()) {
+        acc = if acc.is_empty() { comp.to_string() } else { format!("{acc}/{comp}") };
+        tar_entry(&mut out, &format!("{acc}/"), b'5', 0o755, &[], "");
+    }
+    let mut sorted: Vec<&String> = paths.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    for p in sorted {
+        let base = Path::new(p).file_name().and_then(|b| b.to_str()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("bad store path: {p}"))
+        })?;
+        append_subtree(&mut out, Path::new(p), &format!("{store_rel}/{base}"))?;
+    }
     out.resize(out.len() + BLOCK * 2, 0);
     Ok(out)
 }
@@ -262,15 +292,10 @@ fn split_repo_tag(repo_tag: &str) -> (&str, &str) {
     }
 }
 
-/// Write a complete uncompressed docker-archive of the rootfs at LAYER_ROOT, with the
-/// given image CONFIG, to OUT. No guix/Guile; deterministic.
-pub fn write_docker_archive(
-    out: &mut impl Write,
-    layer_root: &Path,
-    cfg: &ImageConfig,
-) -> io::Result<()> {
-    let layer = build_layer_tar(layer_root)?;
-    let diff_hex = crate::sha256::to_base16(&sha256_bytes(&layer));
+/// Wrap a finished LAYER tar into the docker-archive (manifest/config/<id>/… +
+/// repositories) and write it to OUT. Shared by the rootfs-dir and store-closure paths.
+fn assemble_archive(out: &mut impl Write, layer: &[u8], cfg: &ImageConfig) -> io::Result<()> {
+    let diff_hex = crate::sha256::to_base16(&sha256_bytes(layer));
     // A deterministic v1 layer-dir id. skopeo recomputes digests from the bytes, so
     // any stable unique label works; derive it from the layer hash (distinct from it).
     let id = crate::sha256::to_base16(&sha256_bytes(format!("td-layer:{diff_hex}").as_bytes()));
@@ -289,12 +314,35 @@ pub fn write_docker_archive(
     tar_entry(&mut buf, &format!("{id}/"), b'5', 0o755, &[], "");
     tar_entry(&mut buf, &format!("{id}/VERSION"), b'0', 0o644, b"1.0", "");
     tar_entry(&mut buf, &format!("{id}/json"), b'0', 0o644, layer_json.as_bytes(), "");
-    tar_entry(&mut buf, &format!("{id}/layer.tar"), b'0', 0o644, &layer, "");
+    tar_entry(&mut buf, &format!("{id}/layer.tar"), b'0', 0o644, layer, "");
     tar_entry(&mut buf, "config.json", b'0', 0o644, config_json.as_bytes(), "");
     tar_entry(&mut buf, "manifest.json", b'0', 0o644, manifest_json.as_bytes(), "");
     tar_entry(&mut buf, "repositories", b'0', 0o644, repositories.as_bytes(), "");
     buf.resize(buf.len() + BLOCK * 2, 0);
     out.write_all(&buf)
+}
+
+/// Write a complete uncompressed docker-archive of the rootfs at LAYER_ROOT, with the
+/// given image CONFIG, to OUT. No guix/Guile; deterministic.
+pub fn write_docker_archive(
+    out: &mut impl Write,
+    layer_root: &Path,
+    cfg: &ImageConfig,
+) -> io::Result<()> {
+    assemble_archive(out, &build_layer_tar(layer_root)?, cfg)
+}
+
+/// Write a docker-archive whose single layer is the store CLOSURE PATHS laid out under
+/// STORE_DIR (`build_layer_tar_from_store_paths`). This is the td-native replacement for
+/// `guix system image -t docker`: the caller computes the closure (e.g. `Db::closure`,
+/// no guix process) and td packs it. Deterministic; no guix/Guile.
+pub fn write_docker_archive_from_store_paths(
+    out: &mut impl Write,
+    store_dir: &Path,
+    paths: &[String],
+    cfg: &ImageConfig,
+) -> io::Result<()> {
+    assemble_archive(out, &build_layer_tar_from_store_paths(store_dir, paths)?, cfg)
 }
 
 #[cfg(test)]
@@ -546,6 +594,32 @@ mod tests {
         assert!(config.contains("\"Env\":"), "config not PascalCase: {config}");
         assert!(config.contains("\"Entrypoint\":"), "config not PascalCase: {config}");
         assert!(!config.contains("\"env\":"), "config has lowercase env: {config}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn closure_layer_lays_store_paths_at_their_location() {
+        let d = tmpdir("closure");
+        // A fake store with two "packages"; build_layer_tar_from_store_paths must place
+        // each under <store-rel>/<base>/… and emit the parent dir entries.
+        let store = d.join("gnu/store");
+        fs::create_dir_all(store.join("aaa-pkg-a/bin")).unwrap();
+        fs::write(store.join("aaa-pkg-a/bin/a"), b"A").unwrap();
+        fs::create_dir_all(store.join("bbb-pkg-b")).unwrap();
+        fs::write(store.join("bbb-pkg-b/readme"), b"B").unwrap();
+        let paths = vec![
+            store.join("bbb-pkg-b").to_string_lossy().into_owned(),
+            store.join("aaa-pkg-a").to_string_lossy().into_owned(), // unsorted on purpose
+        ];
+        let layer = build_layer_tar_from_store_paths(&store, &paths).unwrap();
+        let names: Vec<String> = read_tar(&layer).into_iter().map(|e| e.name).collect();
+        let rel = store.to_string_lossy().trim_start_matches('/').to_string();
+        assert!(names.iter().any(|n| n == &format!("{rel}/")), "no store dir entry: {names:?}");
+        assert!(names.iter().any(|n| n == &format!("{rel}/aaa-pkg-a/bin/a")), "pkg-a file missing");
+        assert!(names.iter().any(|n| n == &format!("{rel}/bbb-pkg-b/readme")), "pkg-b file missing");
+        // Deterministic + sorted regardless of input order.
+        let layer2 = build_layer_tar_from_store_paths(&store, &[paths[1].clone(), paths[0].clone()]).unwrap();
+        assert_eq!(layer, layer2, "closure layer must be order-independent + deterministic");
         fs::remove_dir_all(&d).unwrap();
     }
 
