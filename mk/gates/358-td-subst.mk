@@ -18,7 +18,7 @@
 #     to a tree BYTE-IDENTICAL to the original — a path obtained WITHOUT building it. A tampered
 #     narinfo reds the fetch (the consumer falls back to building).
 #   [DURABLE structural] the .drv builder is the td-bootstrapped stage0 (not the guix-built
-#     td-builder); ts-emit ran under td's OWN td-ts-eval.
+#     td-builder); ts-emit ran under td's OWN td-recipe-eval.
 #   [DURABLE repro] td-builder check double-build agrees the td-subst build is reproducible.
 #   [DURABLE behavioral] LOCK-KEYED substitute (tasks 2b/2c — [[toolchain-input-addressed]]): a
 #     real artifact is interned at the INPUT-ADDRESSED path `toolchain-path tests/td-toolchain.lock
@@ -32,18 +32,15 @@
 #     input-addressed runs in the DAILY heavy suite (a ~90-min from-seed build), not per-PR.
 HEAVY_GATES += td-subst
 # A BUILD_GATE (like td-feed): ordered AFTER the parallel build-recipes phase so its cargo
-# build doesn't oversubscribe cores, and it depends on the td-ts-eval that build-recipes'
+# build doesn't oversubscribe cores, and it depends on the td-recipe-eval that build-recipes'
 # prelude builds. Not in BUILD_SPECS — the source is interned at gate time.
 BUILD_GATES += td-subst
 td-subst:
 	@echo ">> td-subst: td builds td-subst (its own substitute server) from source via build-recipe (offline, guix/Guile off PATH); it selftests the signed serve/fetch over loopback, proves fetch-don't-build end-to-end byte-identical, proves the build-recipe CONSUMER HOOK substitutes (CACHE=subst) instead of rebuilding, and is reproducible"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo (the TS front-end compiler)" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; tb="$$TB"; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
-	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
-	echo "  [DURABLE structural] ts-emit evaluates with td's OWN td-ts-eval ($$TD_TS_EVAL)"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; tb="$$TB"; \
+	case "$$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($$TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
+	echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($$TD_RECIPE_EVAL)"; \
 	lock0="$(CURDIR)/tests/td-subst.lock"; \
 	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
@@ -57,7 +54,7 @@ td-subst:
 	eval "$$srcinfo"; \
 	test -n "$$src" -a -d "$$srcstore/`basename "$$src"`" || { echo "ERROR: td interned no subst source tree" >&2; exit 1; }; \
 	lock="$$scratch/td-subst.lock"; { cat "$$lock0"; echo "td-subst-source $$src"; } > "$$lock"; \
-	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-subst.ts" > "$$scratch/subst.json"; \
+	sh tests/recipe-emit.sh td-subst > "$$scratch/subst.json"; \
 	test -s "$$scratch/subst.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
 	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/subst.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe td-subst build:" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \

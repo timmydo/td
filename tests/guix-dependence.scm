@@ -42,51 +42,41 @@
              (gnu system)                   ;operating-system-derivation
              (system td)                    ;td-system (the shipped declaration)
              (srfi srfi-1)
-             (ice-9 ftw)                    ;scandir
+             (json)                         ;json-string->scm (read recipes-meta.json)
              (ice-9 regex)
              (ice-9 format)
              (ice-9 textual-ports))
 
-(define recipe-dir "tests/ts")
 (define expected-file "tests/guix-dependence.expected")
 (define channels-file "channels.scm")
+(define meta-file "tests/recipes-meta.json")
 
-;; --- owned set: non-perturbed recipe-<spec>.ts files ------------------------
-(define (recipe-file->spec name)
-  ;; "recipe-pkg-config.ts" -> "pkg-config"
-  (substring name (string-length "recipe-")
-             (- (string-length name) (string-length ".ts"))))
+;; --- owned set: non-perturbed gnu recipes, from td's RUST catalog ------------
+;; The recipe surface is declared in Rust now (recipes/); the census reads the
+;; committed manifest (`td-recipe-eval meta`, kept in sync by the recipe-rs gate)
+;; instead of scanning tests/ts/recipe-*.ts — so this gate stays cheap and
+;; rust-free. ONLY `"gnu"` recipes (gnu-build-system reconstructions with a
+;; specification->package oracle) are owned; `"rust"`/`"cmake"` self-host tools
+;; are excluded by construction (own-builder proof is their own gate); perturbed
+;; twins are dropped — no enrollment, no drift.
+(define recipe-meta
+  ;; vector of alists: (("stem" . s) ("buildSystem" . bs) ("inputs" . #(...)) ("perturbed" . bool))
+  (json-string->scm (call-with-input-file meta-file get-string-all)))
+
+(define (meta-stem e) (assoc-ref e "stem"))
 
 ;; Authored but NOT yet built by td's own builder (not in corpus-no-guix) — excluded
 ;; from the td-reproducible census so it does not overstate independence.
 (define not-yet-td-built '("pkg-config"))
 
-;; SELF-HOSTED, auto-classified by `buildSystem`. A `"rust"` or `"cmake"` recipe is a
-;; td-built-from-source tool (the cargo/cmake path), NOT a guix-corpus reconstruction:
-;; it has no `specification->package` oracle by design (the channel has no per-crate
-;; packages), so it does not belong in this corpus-closure census — its own-builder
-;; proof is its own `rust-*` / `cmake` gate (it builds + is reproducible there), not a
-;; corpus differential. ONLY `"gnu"` recipes (gnu-build-system reconstructions) are
-;; owned-specs. Classifying by buildSystem instead of a hand-maintained name list means
-;; every future from-source tool is excluded automatically — no enrollment, no drift.
-(define (recipe-build-system spec)
-  (let* ((file (string-append recipe-dir "/recipe-" spec ".ts"))
-         (text (if (file-exists? file)
-                   (call-with-input-file file get-string-all) ""))
-         (m (string-match "buildSystem:[ \t]*\"([a-z]+)\"" text)))
-    (if m (match:substring m 1) "gnu")))
-
 (define owned-specs
   (sort
-   (filter (lambda (s) (and (not (member s not-yet-td-built))
-                            (string=? (recipe-build-system s) "gnu")))
-           (map recipe-file->spec
-                (or (scandir recipe-dir
-                             (lambda (n)
-                               (and (string-prefix? "recipe-" n)
-                                    (string-suffix? ".ts" n)
-                                    (not (string-contains n "perturbed")))))
-                    '())))
+   (filter (lambda (s) (not (member s not-yet-td-built)))
+           (map meta-stem
+                (filter (lambda (e)
+                          (and (string=? (assoc-ref e "buildSystem") "gnu")
+                               (not (assoc-ref e "perturbed"))))
+                        (vector->list recipe-meta))))
    string<?))
 
 ;; --- edge ownership (proposal point 1) --------------------------------------
@@ -101,17 +91,9 @@
 ;; recipe's edges are credited automatically as the owned set grows. Build-tool /
 ;; non-owned inputs are the agreed external seed (exempt).
 (define (recipe-declared-inputs spec)
-  (let* ((file (string-append recipe-dir "/recipe-" spec ".ts"))
-         (text (if (file-exists? file)
-                   (call-with-input-file file get-string-all) ""))
-         (m (string-match "inputs:[ \t]*\\[([^]]*)\\]" text)))
-    (if (not m) '()
-        (filter (lambda (s) (> (string-length s) 0))
-                (map (lambda (s)
-                       (string-trim-both
-                        s (lambda (c) (or (char=? c #\space) (char=? c #\")
-                                          (char=? c #\tab)))))
-                     (string-split (match:substring m 1) #\,))))))
+  (let ((e (find (lambda (e) (string=? (meta-stem e) spec))
+                 (vector->list recipe-meta))))
+    (if e (vector->list (assoc-ref e "inputs")) '())))
 
 ;; A recipe's declared inputs that are themselves owned recipes — the edges the
 ;; build-plan gate chains to td outputs. (Non-owned inputs are the external seed.)
@@ -134,8 +116,8 @@
 
   (when (null? owned-specs)
     (format (current-error-port)
-            "guix-dependence: no owned recipes found under ~a — refusing to record a vacuous census~%"
-            recipe-dir)
+            "guix-dependence: no owned recipes found in ~a — refusing to record a vacuous census~%"
+            meta-file)
     (exit 2))
 
   ;; spec -> the .drv td reconstructs (assert each is a real corpus package).

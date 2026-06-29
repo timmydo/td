@@ -37,12 +37,10 @@ BUILD_GATES += cmake
 cmake:
 	@echo ">> cmake: td builds td-cmake-demo (a cmake C project) via build-recipe (buildSystem cmake) — .drv assembled + realized by td, guix/Guile off PATH; it runs, is reproducible, distinct from guix's cmake-build-system"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
-	ev=`$(GUIX) build $(LOAD) -e '(@ (system td-ts) td-ts-eval)'`/bin/td-ts-eval; \
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
 	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
-	test -x "$$ev" -a -x "$$tb" -a -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo / ts-eval / td-builder" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TS_EVAL="$$ev" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	TD_RECIPE_EVAL=`TD_GUIX="$(GUIX)" sh tests/recipe-eval-tool.sh "$(CURDIR)/.td-build-cache/recipe-eval"`; export TD_RECIPE_EVAL; \
+	test -x "$$tb" -a -x "$$TD_RECIPE_EVAL" || { echo "ERROR: could not resolve td-builder / td-recipe-eval" >&2; exit 1; }; \
 	lock0="$(CURDIR)/tests/td-cmake-demo.lock"; \
 	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
@@ -55,7 +53,7 @@ cmake:
 	test -n "$$src" -a -d "$$srcstore/`basename "$$src"`" || { echo "ERROR: td interned no cmake-demo source tree (store-add-recursive)" >&2; exit 1; }; \
 	echo ">> td interned the CURRENT cmake-demo tree (recursive addToStore, no guix repl / no daemon): $$src"; \
 	lock="$$scratch/td-cmake-demo.lock"; { cat "$$lock0"; echo "td-cmake-demo-source $$src"; } > "$$lock"; \
-	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-cmake-demo.ts" > "$$scratch/td-cmake-demo.json"; \
+	sh tests/recipe-emit.sh td-cmake-demo > "$$scratch/td-cmake-demo.json"; \
 	test -s "$$scratch/td-cmake-demo.json" || { echo "ERROR: ts-emit produced no JSON for td-cmake-demo" >&2; exit 1; }; \
 	grep -q '"buildSystem":"cmake"' "$$scratch/td-cmake-demo.json" || { echo "FAIL: recipe JSON is not buildSystem cmake" >&2; cat "$$scratch/td-cmake-demo.json" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \

@@ -1,0 +1,23 @@
+[package]
+name = "td-recipe"
+version = "0.1.0"
+edition = "2021"
+description = "td's package-recipe surface declared in Rust (replaces the boa/TypeScript surface; §5 move-off-Guile, rust-recipe-surface track)"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "td_recipe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "td-recipe-eval"
+path = "src/bin/td-recipe-eval.rs"
+
+# DEPENDENCY-FREE on purpose (the builder/ discipline): the crate compiles OFFLINE
+# in the check.sh sandbox with nothing fetched. The JSON value/parser/canonical
+# writer is hand-rolled (src/json.rs) rather than pulling serde, so no vendored
+# crate closure is needed — this is the whole point of moving the recipe surface
+# off boa (a JS engine + its crate tree leaves the loop).
+
+[profile.release]
+# Explicit + minimal so a future reproducibility oracle has a stable target.

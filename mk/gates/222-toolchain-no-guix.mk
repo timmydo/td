@@ -24,15 +24,12 @@ BUILD_GATES     += toolchain-no-guix
 toolchain-no-guix:
 	@echo ">> toolchain-no-guix: td builds make + sed + grep + xz + diffutils + patch + file + coreutils + gawk + tar + findutils + bash via build-recipe (no guix/Guile in the build path); each runs, reproducible, distinct from guix; gcc/glibc/binutils seed stays external (§5)"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/make-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
-	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
-	echo "  [DURABLE structural] recipes evaluate with td's OWN td-ts-eval ($$TD_TS_EVAL) — not the guix-built one (brick 4b)"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; CU="$$cu"; CACHE="$(CURDIR)/.td-build-cache/pkg"; mkdir -p "$$CACHE"; \
+	case "$$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($$TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
+	echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($$TD_RECIPE_EVAL) — not the guix-built one (brick 4b)"; \
 	for spec in $(toolchain_SPECS); do \
 	  echo "================ $$spec ================"; \
 	  lock="$(CURDIR)/tests/$$spec-no-guix.lock"; \

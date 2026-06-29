@@ -36,13 +36,11 @@ BUILD_GATES += rust-build
 rust-build:
 	@echo ">> rust-build: td self-hosts td-builder via build-recipe (buildSystem rust) — .drv assembled + realized by td, guix/Guile off PATH; it runs, is reproducible, distinct from guix's build"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; \
 	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
-	test -x "$$tb" -a -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo / td-builder oracle" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
-	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
-	echo "  [DURABLE structural] ts-emit evaluates with td's OWN td-ts-eval ($$TD_TS_EVAL) — not the guix-built one (brick 4c)"; \
+	test -x "$$tb" || { echo "ERROR: could not resolve td-builder oracle" >&2; exit 1; }; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
+	case "$$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($$TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
+	echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($$TD_RECIPE_EVAL) — not the guix-built one (brick 4c)"; \
 	lock0="$(CURDIR)/tests/td-builder-rust.lock"; \
 	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
@@ -55,7 +53,7 @@ rust-build:
 	test -n "$$src" -a -d "$$srcstore/`basename "$$src"`" || { echo "ERROR: td interned no source tree (store-add-recursive)" >&2; exit 1; }; \
 	echo ">> td interned the CURRENT builder tree (recursive addToStore, no guix repl / no daemon): $$src"; \
 	lock="$$scratch/td-builder-rust.lock"; { cat "$$lock0"; echo "td-builder-source $$src"; } > "$$lock"; \
-	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-builder.ts" > "$$scratch/td-builder.json"; \
+	sh tests/recipe-emit.sh td-builder > "$$scratch/td-builder.json"; \
 	test -s "$$scratch/td-builder.json" || { echo "ERROR: ts-emit produced no JSON for td-builder" >&2; exit 1; }; \
 	grep -q '"buildSystem":"rust"' "$$scratch/td-builder.json" || { echo "FAIL: recipe JSON is not buildSystem rust" >&2; cat "$$scratch/td-builder.json" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \

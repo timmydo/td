@@ -13,7 +13,7 @@
 # (guix-built today, the frozen seed tarball next — step 2).
 #
 # Tools (all td-built / guix-free): stage0 td-builder (cache-lib load_stage0), the
-# TS front-end td-tsgo (tests/tsgo.sh) + td-ts-eval (load_ts_eval, from the
+# TS front-end td-tsgo (tests/tsgo.sh) + td-recipe-eval (load_recipe_eval, from the
 # build-recipes prelude). Realizing hello's pinned SEED closure up front is bare
 # `guix build` of the lock's store paths (test setup, not a packager form, not in
 # td shell's path) — the same warming every build gate does.
@@ -33,11 +33,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 . tests/cache-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-load_ts_eval || fail "no td-built td-ts-eval (the build-recipes prelude must run first)"
-TD_TSGO=`sh tests/tsgo.sh` || fail "could not resolve td-tsgo"
-TD_TSDIR=tests/ts
-test -x "$TD_TSGO/lib/tsc" -a -x "$TD_TS_EVAL" || fail "td TS front-end not executable"
-echo ">> td tools (guix-free): stage0=$TB  ts-eval=$TD_TS_EVAL  tsgo=$TD_TSGO"
+load_recipe_eval || fail "no td-built td-recipe-eval (the build-recipes prelude must run first)"
+test -x "$TD_RECIPE_EVAL" || fail "td recipe evaluator not executable"
+echo ">> td tools (guix-free): stage0=$TB  recipe-eval=$TD_RECIPE_EVAL"
 
 # A scrubbed PATH for the td shell process: coreutils + bash from hello's pinned
 # seed, NO guix/Guile — so a green run PROVES td shell uses no guix process.
@@ -58,7 +56,7 @@ cache="`pwd`/.td-build-cache/td-shell-pkgs"; rm -rf "$cache"; mkdir -p "$cache/t
 tdshell() {
   env -i HOME="$cache" TMPDIR="$cache/tmp" PATH="$SCRUB" \
     TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-    TD_TSGO="$TD_TSGO" TD_TS_EVAL="$TD_TS_EVAL" TD_TSDIR="$TD_TSDIR" \
+    TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
     TD_SHELL_RECIPES=tests/ts TD_SHELL_LOCKS=tests TD_SHELL_STORE_DB=/var/guix/db/db.sqlite \
     TD_SHELL_CACHE="$cache" \
     "$TB" shell "$@"

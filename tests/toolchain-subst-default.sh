@@ -30,12 +30,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-tsgo=$(sh tests/tsgo.sh)
-test -n "$tsgo" -a -x "$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }
 . tests/cache-lib.sh
 export TD_STAGE0_BASE="$(pwd)/.td-build-cache/stage0"
-load_stage0; load_ts_eval; tb="$TB"
-export TD_TSGO="$tsgo" TD_TSDIR="$(pwd)/tests/ts"
+load_stage0; load_recipe_eval; tb="$TB"
+export 
 
 # --- build td-subst from source (its own cache dir; CACHE=hit on reruns) ---
 guix=${GUIX:-guix}                              # standalone script: host guix is on PATH (not the make $(GUIX))
@@ -51,7 +49,7 @@ srcinfo=$(sh tests/intern-src.sh "$tb" td-subst-src "$(pwd)/subst" "$scratch" ta
   || { echo "ERROR: could not intern the subst crate tree" >&2; exit 1; }
 eval "$srcinfo"
 lock="$scratch/td-subst.lock"; { cat "$lock0"; echo "td-subst-source $src"; } > "$lock"
-sh tests/ts-emit.sh "$(pwd)/tests/ts/recipe-td-subst.ts" > "$scratch/subst.json"
+sh tests/recipe-emit.sh td-subst > "$scratch/subst.json"
 test -s "$scratch/subst.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }
 sd="$scratch/b"
 env -i HOME="$scratch" TMPDIR="$scratch/tmp" PATH="$cu/bin" \

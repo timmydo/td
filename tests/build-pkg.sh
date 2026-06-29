@@ -10,7 +10,7 @@
 # + migration-oracle assertions.
 #
 # Env in (exported ONCE by the build-recipes target so each package reuses them):
-#   TB (td-builder), CACHE (.td-build-cache/pkg), TD_TSGO/TD_TS_EVAL/TD_TSDIR
+#   TB (td-builder), CACHE (.td-build-cache/pkg), TD_TSGO/TD_RECIPE_EVAL/TD_TSDIR
 #   (ts-emit — native tsc, no node). The seed store paths are realized up front by
 #   build-recipes, so this
 #   script does not touch guix. Arg 1: the spec (lock at tests/<spec>-no-guix.lock).

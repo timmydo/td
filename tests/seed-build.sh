@@ -23,11 +23,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 . tests/cache-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-load_ts_eval || fail "no td-built td-ts-eval (the build-recipes prelude must run first)"
-TD_TSGO=`sh tests/tsgo.sh` || fail "could not resolve td-tsgo"
+load_recipe_eval || fail "no td-built td-recipe-eval (the build-recipes prelude must run first)"
 TD_TSDIR=tests/ts
-export TD_TSGO TD_TSDIR
-echo ">> td tools (guix-free): stage0=$TB  ts-eval=$TD_TS_EVAL"
+echo ">> td tools (guix-free): stage0=$TB  ts-eval=$TD_RECIPE_EVAL"
 
 work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
@@ -63,7 +61,7 @@ test "$seedhash" = "$pin" || fail "seed manifest hash $seedhash != pinned $pin (
 echo "   [DURABLE repro] seed manifest hash matches the pin (reproducible, channel-anchored)"
 
 # --- Leg A: DURABLE behavioral — build hello from the warmed seed ONLY ---------
-sh tests/ts-emit.sh tests/ts/recipe-hello.ts > "$work/hello.json" || fail "ts-emit hello"
+sh tests/recipe-emit.sh hello > "$work/hello.json" || fail "ts-emit hello"
 mkdir -p "$work/b"
 env -i HOME="$work" TMPDIR="$work" PATH="$cu/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \

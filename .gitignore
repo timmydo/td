@@ -21,6 +21,9 @@
 .build-daemon-scratch/
 # cargo-test: scratch CARGO_HOME + CARGO_TARGET_DIR (clean compile each run).
 .cargo-test-scratch/
+# recipe-rs: scratch CARGO_HOME + CARGO_TARGET_DIR + a local `cargo build` target.
+.recipe-rs-scratch/
+recipes/target/
 
 # check-memo verdicts (plan/check-memo.md constraint 2): host-local state,
 # NEVER committed — a verdict greens only the environment that recorded it.

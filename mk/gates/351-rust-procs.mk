@@ -14,10 +14,9 @@ BUILD_GATES += rust-procs
 rust-procs:
 	@echo ">> rust-procs: td builds 'procs' (0.14.10, 297 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); procs reads /proc; reproducible; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
-	nsout=`sh tests/crate-free-build.sh procs procs-0.14.10 tests/procs.lock procs-source tests/ts/recipe-procs.ts` || exit 1; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
+	export GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
+	nsout=`sh tests/crate-free-build.sh procs procs-0.14.10 tests/procs.lock procs-source procs` || exit 1; \
 	eval "$$nsout"; ns="$$NS"; \
 	test -x "$$ns/bin/procs" || { echo "FAIL: no procs binary at $$ns/bin/procs" >&2; exit 1; }; \
 	"$$ns/bin/procs" --version >/dev/null 2>&1 || { echo "FAIL: td-built procs --version failed — the binary does not run" >&2; exit 1; }; \

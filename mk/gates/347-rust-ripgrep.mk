@@ -17,10 +17,9 @@ BUILD_GATES += rust-ripgrep
 rust-ripgrep:
 	@echo ">> rust-ripgrep: td builds 'ripgrep' (rg 14.1.1, 57 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); rg greps a needle; reproducible; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
-	nsout=`sh tests/crate-free-build.sh ripgrep ripgrep-14.1.1 tests/ripgrep.lock ripgrep-source tests/ts/recipe-ripgrep.ts` || exit 1; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
+	export GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
+	nsout=`sh tests/crate-free-build.sh ripgrep ripgrep-14.1.1 tests/ripgrep.lock ripgrep-source ripgrep` || exit 1; \
 	eval "$$nsout"; ns="$$NS"; \
 	test -x "$$ns/bin/rg" || { echo "FAIL: no rg binary at $$ns/bin/rg" >&2; exit 1; }; \
 	tree="$(CURDIR)/.td-build-cache/ripgrep-crate-free/tree"; rm -rf "$$tree"; mkdir -p "$$tree/sub"; printf 'alpha line\nthe needle is here\nbeta line\n' > "$$tree/sub/hay.txt"; printf 'nothing to see\n' > "$$tree/other.txt"; \

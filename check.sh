@@ -243,7 +243,6 @@ if command -v timeout >/dev/null 2>&1; then
 else
   warm() { "$@"; }   # no coreutils timeout: run unbounded (best-effort)
 fi
-warm sh tools/warm-tsgo.sh || { echo "check.sh: FATAL: could not warm the tsgo tarball (tools/warm-tsgo.sh) within ${warm_timeout}s." >&2; exit 1; }
 # --- Substitute store warm (x64-toolchain-subst): if a prior DAILY populated a persistent signed
 # substitute store (~/.td/subst: a stashed td-subst + the published lock-keyed closure), EXPOSE it by
 # exporting TD_SUBST_* — host-sandbox binds ~/.td/subst ro + preserves TD_SUBST_* (builder/src/main.rs),

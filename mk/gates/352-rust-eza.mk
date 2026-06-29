@@ -15,10 +15,9 @@ BUILD_GATES += rust-eza
 rust-eza:
 	@echo ">> rust-eza: td builds 'eza' (0.21.6, 233 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); eza lists a dir; reproducible; no guix build / no /gnu/store crate / no oracle"
 	@set -euo pipefail; \
-	tsgo=`sh tests/tsgo.sh`; test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts" GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
-	nsout=`sh tests/crate-free-build.sh eza eza-0.21.6 tests/eza.lock eza-source tests/ts/recipe-eza.ts` || exit 1; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
+	export GUIX="$(GUIX)" ROOT="$(CURDIR)"; \
+	nsout=`sh tests/crate-free-build.sh eza eza-0.21.6 tests/eza.lock eza-source eza` || exit 1; \
 	eval "$$nsout"; ns="$$NS"; \
 	test -x "$$ns/bin/eza" || { echo "FAIL: no eza binary at $$ns/bin/eza" >&2; exit 1; }; \
 	tree="$(CURDIR)/.td-build-cache/eza-crate-free/tree"; rm -rf "$$tree"; mkdir -p "$$tree"; : > "$$tree/alpha.txt"; : > "$$tree/beta.log"; \

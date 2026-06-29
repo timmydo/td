@@ -24,10 +24,7 @@ rust-fetch:
 	miss=0; for c in "$$vendor"/*.crate; do sha=`sha256sum "$$c" | cut -d' ' -f1`; grep -qF "$$sha" "$(CURDIR)/fetch/Cargo.lock" || { echo "FAIL: crate `basename $$c` sha $$sha is NOT pinned in fetch/Cargo.lock" >&2; miss=$$((miss + 1)); }; done; \
 	test "$$miss" -eq 0 || { echo "FAIL: $$miss vendored crate(s) not pinned by fetch/Cargo.lock" >&2; exit 1; }; \
 	echo "  [DURABLE supply-chain] all $$ncrate vendored crates' sha256 are checksums pinned in fetch/Cargo.lock (upstream crates.io hash — the guix-free oracle)"; \
-	tsgo=`sh tests/tsgo.sh`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: no tsgo" >&2; exit 1; }; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; tb="$$TB"; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; tb="$$TB"; \
 	lock0="$(CURDIR)/tests/td-fetch.lock"; \
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock" >&2; exit 1; }; \
@@ -43,7 +40,7 @@ rust-fetch:
 	test -n "$$vsrc" -a -n "$$vstore" -a -n "$$vdb" || { echo "ERROR: vendor intern produced no path" >&2; exit 1; }; \
 	echo "  [DURABLE structural] td interned the crate set as one content-addressed vendor tree (store-add-recursive, no daemon): $$vsrc"; \
 	seedlock="$$scratch/seed.lock"; { grep -v '\.crate ' "$$lock0"; echo "td-fetch-source $$src"; } > "$$seedlock"; \
-	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-fetch.ts" > "$$scratch/fetch.json"; \
+	sh tests/recipe-emit.sh td-fetch > "$$scratch/fetch.json"; \
 	test -s "$$scratch/fetch.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/sd"; \
 	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/fetch.json" "$$seedlock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" "$$vsrc" "$$vstore" "$$vdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe (guix-free crates):" >&2; tail -40 "$$scratch/err" >&2; exit 1; }; \

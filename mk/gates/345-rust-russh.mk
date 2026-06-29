@@ -37,12 +37,9 @@ rust-russh:
 	miss=0; for c in "$$vendor"/*.crate; do sha=`sha256sum "$$c" | cut -d' ' -f1`; grep -qF "$$sha" "$$clock" || { echo "FAIL: crate `basename $$c` sha $$sha is NOT pinned in tests/russh-demo/Cargo.lock" >&2; miss=$$((miss + 1)); }; done; \
 	test "$$miss" -eq 0 || { echo "FAIL: $$miss vendored crate(s) not pinned by tests/russh-demo/Cargo.lock" >&2; exit 1; }; \
 	echo "  [DURABLE supply-chain] all $$ncrate vendored crates' sha256 are checksums pinned in tests/russh-demo/Cargo.lock (upstream crates.io hash — the guix-free oracle)"; \
-	tsgo=`sh tests/tsgo.sh`; \
-	test -n "$$tsgo" -a -x "$$tsgo/lib/tsc" || { echo "ERROR: could not resolve td-tsgo" >&2; exit 1; }; \
-	export TD_TSGO="$$tsgo" TD_TSDIR="$(CURDIR)/tests/ts"; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_ts_eval; tb="$$TB"; \
-	case "$$TD_TS_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_TS_EVAL is not td's own build ($$TD_TS_EVAL)" >&2; exit 1 ;; esac; \
-	echo "  [DURABLE structural] ts-emit evaluates with td's OWN td-ts-eval ($$TD_TS_EVAL) — not the guix-built one (brick 4c)"; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; tb="$$TB"; \
+	case "$$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($$TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
+	echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($$TD_RECIPE_EVAL) — not the guix-built one (brick 4c)"; \
 	lock0="$(CURDIR)/tests/td-russh-demo.lock"; \
 	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
 	cu=`grep -- '-coreutils-' "$$lock0" | sed 's/^[^ ]* //' | head -1`; \
@@ -60,7 +57,7 @@ rust-russh:
 	test -n "$$vsrc" -a -n "$$vstore" -a -n "$$vdb" || { echo "ERROR: vendor intern produced no path" >&2; exit 1; }; \
 	echo "  [DURABLE structural] td interned the russh-demo source + the $$ncrate-crate set as content-addressed trees (store-add-recursive, no daemon): vendor $$vsrc"; \
 	lock="$$scratch/seed.lock"; { grep -v '\.crate ' "$$lock0" | grep ' /gnu/store/'; echo "td-russh-demo-source $$src"; } > "$$lock"; \
-	sh tests/ts-emit.sh "$(CURDIR)/tests/ts/recipe-td-russh-demo.ts" > "$$scratch/russh.json"; \
+	sh tests/recipe-emit.sh td-russh-demo > "$$scratch/russh.json"; \
 	test -s "$$scratch/russh.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/sd"; \
 	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/russh.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" "$$vsrc" "$$vstore" "$$vdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe russh build (guix-free crates):" >&2; tail -40 "$$scratch/err" >&2; exit 1; }; \
