@@ -10,6 +10,14 @@
 # corpus still builds from boa JSON — cutover is a tracked follow-up,
 # plan/rust-migration.md).
 #
+# guix-surface NOTE (directive 3): the oracle leg resolves boa via
+# `guix build -e '(@ (system td-ts) td-ts-eval)'`, so this file is a guix-as-packager
+# site in tests/guix-surface.expected (count 12 -> 13). It does NOT introduce a new
+# seed — td-ts-eval is an existing baseline packager seed (7 other sites use it the
+# same way, to evaluate .ts) — and it is REMOVABLE migration-oracle scaffolding:
+# step A4 of plan/rust-migration.md (delete boa) deletes this leg and this site,
+# shrinking the ratchet back. Surfaced in the PR for sign-off.
+#
 # Offline by construction (the cargo-test pattern): `guix shell --no-substitutes
 # --no-offload` resolves rust+cargo+gcc-toolchain from the WARM store, and the
 # crate has NO [dependencies] so `--frozen` touches no network. Scratch
