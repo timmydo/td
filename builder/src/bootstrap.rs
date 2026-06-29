@@ -341,7 +341,7 @@ fn seed_stage0_tree(cx: &Ctx) -> Result<PathBuf, String> {
 }
 
 /// Brick 0 build: the seed stage0 tree, producing `AMD64/artifact/{hex0,kaem-0}`.
-/// (Mirrors `run_seed_build` in tests/bootstrap-seed.sh.)
+/// (Ported from `run_seed_build` in the former tests/bootstrap-seed.sh.)
 fn build_seed(cx: &Ctx) -> Result<Built, String> {
     Ok(Built {
         dir: seed_stage0_tree(cx)?,
@@ -405,7 +405,7 @@ fn mes_recipe() -> Recipe {
 /// Brick 2 toolchain: the seed stage0 tree + a SECOND kaem step
 /// (`mescc-tools-mini-kaem.kaem`, driven by the seed-built kaem-0) → M2-Planet +
 /// mescc-tools (`AMD64/artifact/{M2,blood-elf-0}`, `AMD64/bin/{M1,hex2}`).
-/// (Mirrors `build_toolchain` in tests/bootstrap-mes.sh.)
+/// (Ported from `build_toolchain` in the former tests/bootstrap-mes.sh.)
 fn mes_toolchain(cx: &Ctx) -> Result<PathBuf, String> {
     let tc = seed_stage0_tree(cx)?;
     let kaem0 = tc.join("AMD64/artifact/kaem-0");
@@ -461,7 +461,7 @@ fn parse_m2planet_units(kaem_run: &str) -> Vec<String> {
 /// Brick 2 build: build the seed toolchain, unpack the pinned Mes tarball, generate
 /// the non-system-libc `config.h` + arch headers, and drive M2-Planet → blood-elf →
 /// M1 → hex2 over the tarball's own input list to produce `bin/mes-m2`. Returns the
-/// mes scratch dir (also its `MES_PREFIX`). (Mirrors `build_mes` in
+/// mes scratch dir (also its `MES_PREFIX`). (Ported from `build_mes` in the former
 /// tests/bootstrap-mes.sh.)
 fn build_mes(cx: &Ctx) -> Result<Built, String> {
     let tc = mes_toolchain(cx)?;
@@ -818,8 +818,8 @@ mod tests {
     /// (check-engine compiles td-builder as a reproducible package and runs its unit
     /// tests there), only the `builder/` crate is staged — the repo tree is absent.
     /// Those tests skip there; they run for real in the repo-rooted cargo-test job on
-    /// every PR (affected-checks) and via the bootstrap-seed-rs / bootstrap-mes-rs
-    /// gates in the loop sandbox. Pure-logic tests below have no such dependency.
+    /// every PR (affected-checks) and via the bootstrap-seed / bootstrap-mes gates in
+    /// the loop sandbox. Pure-logic tests below have no such dependency.
     fn require_repo_tree() -> Option<PathBuf> {
         let root = repo_root();
         if root.join("seed/stage0").is_dir() {
