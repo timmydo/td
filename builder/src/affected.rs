@@ -1661,6 +1661,16 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
     }
 
+    /// The repo fixtures these tests read (mk/gates + the shell oracle) are present
+    /// only when cargo runs from the full checkout — the `cargo-test` GATE and the
+    /// required CI `cargo-test` job, both on every PR. The `td-builder` GUIX package
+    /// build runs `cargo test` too, but its source is `local-file "../builder"` —
+    /// ONLY the crate, no `mk/gates`/`tools/` — so these tests skip there (not a
+    /// weakening: the gate + CI still run them fully every PR).
+    fn repo_tree_present(root: &Path) -> bool {
+        root.join("mk/gates").is_dir() && root.join("tools/affected-checks.sh").is_file()
+    }
+
     #[test]
     fn glob_basics() {
         assert!(glob_match("builder/src/*", "builder/src/a/b.rs")); // '*' spans '/'
@@ -1688,7 +1698,12 @@ mod tests {
     // no Guix — it still holds with no oracle in the room.
     #[test]
     fn self_test_passes_against_repo() {
-        let failures = run_self_test(&repo_root());
+        let root = repo_root();
+        if !repo_tree_present(&root) {
+            eprintln!("SKIP self-test: repo tree absent at {} (builder-only sandbox)", root.display());
+            return;
+        }
+        let failures = run_self_test(&root);
         assert!(failures.is_empty(), "self-test failures: {failures:#?}");
     }
 
@@ -1702,8 +1717,8 @@ mod tests {
     fn matches_shell_oracle_byte_for_byte() {
         let root = repo_root();
         let script = root.join("tools/affected-checks.sh");
-        if !script.is_file() {
-            eprintln!("SKIP oracle differential: tools/affected-checks.sh absent");
+        if !repo_tree_present(&root) {
+            eprintln!("SKIP oracle differential: repo tree absent at {} (builder-only sandbox)", root.display());
             return;
         }
         // Probe: can we run the shell oracle here at all?
