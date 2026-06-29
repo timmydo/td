@@ -1,19 +1,23 @@
 //! td-recipe-eval — emit / list / verify recipes from the Rust catalog.
 //!
-//! Subcommands:
+//! Subcommands (recipes):
 //!   list                  print every recipe's `.ts` file stem, one per line
-//!   emit STEM             print STEM's recipe as canonical JSON (the Guile
-//!                         lowering bridge's wire format)
+//!   emit STEM             print STEM's recipe as canonical JSON (the wire format
+//!                         the build path consumes)
 //!   verify STEM BOA.json  parse the boa-evaluated JSON for the same recipe and
 //!                         assert it canon-equals the Rust recipe (the removable
 //!                         migration oracle); exits non-zero on mismatch
+//! Subcommands (system specs):
+//!   list-specs            print every system spec's `.ts` file stem
+//!   emit-spec STEM        print STEM's system spec as canonical JSON
+//!   verify-spec STEM BOA.json   canon-equal check against boa, like `verify`
 //!
-//! This is the loop test tool the `recipe-rs` gate drives. `emit` is also the
-//! future corpus consumer entry (replacing `ts-emit` on the boa path).
+//! This is the loop tool the `recipe-rs` gate drives AND the corpus/spec consumer
+//! entry (replacing `ts-emit` on the boa path).
 
 use std::process::exit;
 
-use td_recipe::{catalog, json};
+use td_recipe::{catalog, json, specs};
 
 fn die(msg: &str) -> ! {
     eprintln!("td-recipe-eval: {msg}");
@@ -24,6 +28,30 @@ fn lookup_or_die(stem: &str) -> td_recipe::types::Recipe {
     match catalog::lookup(stem) {
         Some(r) => r,
         None => die(&format!("unknown recipe stem '{stem}' (try `list`)")),
+    }
+}
+
+fn lookup_spec_or_die(stem: &str) -> td_recipe::types::SystemSpec {
+    match specs::lookup(stem) {
+        Some(s) => s,
+        None => die(&format!("unknown spec stem '{stem}' (try `list-specs`)")),
+    }
+}
+
+// Canon-equal check against a boa-emitted JSON file (the removable oracle).
+fn verify_against_boa(kind: &str, stem: &str, rust_canon: &str, path: &str) {
+    let boa_text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("cannot read {path}: {e}")));
+    let boa = json::parse(boa_text.trim())
+        .unwrap_or_else(|e| die(&format!("{path}: invalid JSON: {e}")));
+    let boa_canon = boa.to_canonical();
+    if rust_canon == boa_canon {
+        eprintln!("ok: {stem} — Rust {kind} canon-equals boa");
+    } else {
+        eprintln!("MISMATCH {stem}:");
+        eprintln!("  rust: {rust_canon}");
+        eprintln!("  boa : {boa_canon}");
+        exit(1);
     }
 }
 
@@ -43,20 +71,23 @@ fn main() {
             let stem = args.get(2).unwrap_or_else(|| die("usage: verify STEM BOA.json"));
             let path = args.get(3).unwrap_or_else(|| die("usage: verify STEM BOA.json"));
             let rust_canon = lookup_or_die(stem).to_json().to_canonical();
-            let boa_text = std::fs::read_to_string(path)
-                .unwrap_or_else(|e| die(&format!("cannot read {path}: {e}")));
-            let boa = json::parse(boa_text.trim())
-                .unwrap_or_else(|e| die(&format!("{path}: invalid JSON: {e}")));
-            let boa_canon = boa.to_canonical();
-            if rust_canon == boa_canon {
-                eprintln!("ok: {stem} — Rust recipe canon-equals boa");
-            } else {
-                eprintln!("MISMATCH {stem}:");
-                eprintln!("  rust: {rust_canon}");
-                eprintln!("  boa : {boa_canon}");
-                exit(1);
+            verify_against_boa("recipe", stem, &rust_canon, path);
+        }
+        Some("list-specs") => {
+            for (stem, _) in specs::all() {
+                println!("{stem}");
             }
         }
-        _ => die("usage: td-recipe-eval list | emit STEM | verify STEM BOA.json"),
+        Some("emit-spec") => {
+            let stem = args.get(2).unwrap_or_else(|| die("usage: emit-spec STEM"));
+            println!("{}", lookup_spec_or_die(stem).to_json().to_canonical());
+        }
+        Some("verify-spec") => {
+            let stem = args.get(2).unwrap_or_else(|| die("usage: verify-spec STEM BOA.json"));
+            let path = args.get(3).unwrap_or_else(|| die("usage: verify-spec STEM BOA.json"));
+            let rust_canon = lookup_spec_or_die(stem).to_json().to_canonical();
+            verify_against_boa("spec", stem, &rust_canon, path);
+        }
+        _ => die("usage: td-recipe-eval list|emit|verify | list-specs|emit-spec|verify-spec STEM [BOA.json]"),
     }
 }

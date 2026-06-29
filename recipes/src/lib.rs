@@ -10,4 +10,5 @@
 
 pub mod catalog;
 pub mod json;
+pub mod specs;
 pub mod types;
