@@ -23,9 +23,8 @@ drv-emit:
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
 	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
-	vars=`$(GUIX) repl $(LOAD) tests/drv-emit-drv.scm 2>/dev/null`; \
-	drv=`printf '%s\n' "$$vars" | sed -n 's/^DRV=//p'`; \
-	drv_pert=`printf '%s\n' "$$vars" | sed -n 's/^DRV_PERT=//p'`; \
+	drv=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh '((@ (system td-build) td-rust-build-derivation) s (quote (("name" . "hello") ("version" . "2.12.2") ("source" . (("uri" . "mirror://gnu/hello/hello-2.12.2.tar.gz") ("sha256" . "1aqq1379syjckf0wdn9vs6wfbapnj9zfikhiykf29k4jq9nrk6js"))) ("buildSystem" . "gnu"))))' 2>/dev/null`; \
+	drv_pert=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh '((@ (system td-build) td-rust-build-derivation) s (quote (("name" . "hello") ("version" . "2.12.2") ("source" . (("uri" . "mirror://gnu/hello/hello-2.12.2.tar.gz") ("sha256" . "1bqq1379syjckf0wdn9vs6wfbapnj9zfikhiykf29k4jq9nrk6js"))) ("buildSystem" . "gnu"))))' 2>/dev/null`; \
 	test -n "$$drv" -a -n "$$drv_pert" || { echo "ERROR: could not lower the td-build derivations" >&2; exit 1; }; \
 	echo ">> oracle .drv (guix-constructed): $$drv"; \
 	echo ">> td-builder re-constructs it (output paths + .drv path + ATerm) and verifies byte-identity:"; \

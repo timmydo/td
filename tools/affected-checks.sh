@@ -936,6 +936,16 @@ map_path() {
       require_full "$p affects CI or runner gating; affected-checks cannot waive the full local loop."
       add_note "$p affects CI or branch protection; inspect the workflow result after push." ;;
 
+    tools/guix-lower.sh)
+      # The td-native `.drv` lowering helper (replaces the tests/*-drv.scm Guile
+      # bridges). Load-bearing for every gate that lowers a td object through it, so a
+      # change re-runs them: registry/verify-place/rollback/place (check-system bundle)
+      # + the heavy td-build gates drv-emit + td-drv-add.
+      add_preflight shell-syntax
+      add_target check-system
+      add_target drv-emit
+      add_target td-drv-add ;;
+
     ci/*.sh|tools/*.sh)
       add_preflight shell-syntax ;;
 
@@ -1095,6 +1105,9 @@ run_self_test() {
   assert_target tests/cat-uutils.lock rust-uutils
   assert_target tests/youki.lock rust-youki
   assert_target tests/cmake-demo/CMakeLists.txt cmake
+  assert_target tools/guix-lower.sh check-system
+  assert_target tools/guix-lower.sh drv-emit
+  assert_target tools/guix-lower.sh td-drv-add
   assert_target tests/guix-surface.sh guix-surface
   assert_target tests/guix-surface.expected guix-surface
   # The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a

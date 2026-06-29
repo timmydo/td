@@ -28,13 +28,12 @@ SYSTEM_GATES += place
 place:
 	@echo ">> place: guix-free placer extracts /boot + writes a per-generation GRUB menu, prunes old generations (M10.2)"
 	@set -euo pipefail; \
-	drvs=`$(GUIX) repl $(LOAD) tests/place-drv.scm 2>/dev/null`; \
-	place_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_PLACE=//p'`; \
-	prune_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_PRUNE=//p'`; \
-	img1=`printf '%s\n' "$$drvs" | sed -n 's/^IMG_1=//p'`; \
-	img2=`printf '%s\n' "$$drvs" | sed -n 's/^IMG_2=//p'`; \
-	img3=`printf '%s\n' "$$drvs" | sed -n 's/^IMG_3=//p'`; \
+	place_drv=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh '((@@ (guix store) run-with-store) s ((@ (system td-place) td-placed-tree) #:gens (quote (1 2)) #:keep 10))' 2>/dev/null`; \
+	prune_drv=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh '((@@ (guix store) run-with-store) s ((@ (system td-place) td-placed-tree) #:gens (quote (1 2 3)) #:keep 2))' 2>/dev/null`; \
 	test -n "$$place_drv" -a -n "$$prune_drv" || { echo "ERROR: could not lower the placer tree derivations" >&2; exit 1; }; \
+	img1=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh --out '((@@ (guix store) run-with-store) s ((@ (system td-generation) td-generation-image) ((@ (system td-typed) td-config) #:generation 1)))' 2>/dev/null`; \
+	img2=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh --out '((@@ (guix store) run-with-store) s ((@ (system td-generation) td-generation-image) ((@ (system td-typed) td-config) #:generation 2)))' 2>/dev/null`; \
+	img3=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh --out '((@@ (guix store) run-with-store) s ((@ (system td-generation) td-generation-image) ((@ (system td-typed) td-config) #:generation 3)))' 2>/dev/null`; \
 	test -n "$$img1" -a -n "$$img2" -a -n "$$img3" || { echo "ERROR: could not lower the generation image artifact paths" >&2; exit 1; }; \
 	echo ">> place  tree derivation (gens 1,2 keep 10): $$place_drv"; \
 	echo ">> prune  tree derivation (gens 1,2,3 keep 2): $$prune_drv"; \

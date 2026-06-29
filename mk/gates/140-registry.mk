@@ -19,7 +19,7 @@ SYSTEM_GATES += registry
 registry:
 	@echo ">> registry: signed static OCI-layout distribution — push, verify statements/signatures/pull-by-digest (M12 S3)"
 	@set -euo pipefail; \
-	drv=`$(GUIX) repl $(LOAD) tests/registry-drv.scm 2>/dev/null | sed -n 's/^DRV_REGISTRY=//p'`; \
+	drv=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh '((@@ (guix store) run-with-store) s ((@ (system td-registry) td-registry) #:gens (quote (1 2))))' 2>/dev/null`; \
 	test -n "$$drv" || { echo "ERROR: could not lower the registry derivation" >&2; exit 1; }; \
 	echo ">> registry derivation: $$drv"; \
 	reg=`$(GUIX) build "$$drv"`; \

@@ -20,9 +20,8 @@ SYSTEM_GATES += rollback
 rollback:
 	@echo ">> rollback: boot gen 2, roll back to gen 1 via the GRUB menu, assert identity + persistence (M10.3)"
 	@set -euo pipefail; \
-	drvs=`$(GUIX) repl $(LOAD) tests/rollback-drv.scm 2>/dev/null`; \
-	tree_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_TREE=//p'`; \
-	disk_drv=`printf '%s\n' "$$drvs" | sed -n 's/^DRV_DISK=//p'`; \
+	tree_drv=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh '((@@ (guix store) run-with-store) s ((@ (tests rollback) td-rollback-tree)))' 2>/dev/null`; \
+	disk_drv=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh '((@@ (guix store) run-with-store) s ((@ (tests rollback) td-rollback-disk-value)))' 2>/dev/null`; \
 	test -n "$$tree_drv" -a -n "$$disk_drv" || { echo "ERROR: could not lower the rollback derivations" >&2; exit 1; }; \
 	echo ">> placed tree (mkfs) derivation: $$tree_drv"; \
 	echo ">> rollback disk derivation:      $$disk_drv"; \

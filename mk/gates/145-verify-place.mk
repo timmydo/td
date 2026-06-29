@@ -20,7 +20,7 @@ SYSTEM_GATES += verify-place
 verify-place:
 	@echo ">> verify-place: placer verifies signature+digest before placing; rejects unsigned/tampered (M12 S4)"
 	@set -euo pipefail; \
-	reg_drv=`$(GUIX) repl $(LOAD) tests/registry-drv.scm 2>/dev/null | sed -n 's/^DRV_REGISTRY=//p'`; \
+	reg_drv=`TD_GUIX="$(GUIX)" sh tools/guix-lower.sh '((@@ (guix store) run-with-store) s ((@ (system td-registry) td-registry) #:gens (quote (1 2))))' 2>/dev/null`; \
 	test -n "$$reg_drv" || { echo "ERROR: could not lower the registry derivation" >&2; exit 1; }; \
 	reg=`$(GUIX) build "$$reg_drv"`; \
 	skopeo=`$(GUIX) build skopeo`/bin/skopeo; \
