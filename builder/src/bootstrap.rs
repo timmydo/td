@@ -804,6 +804,23 @@ mod tests {
             .to_path_buf()
     }
 
+    /// The repo-tree integration tests need the vendored `seed/stage0`. When
+    /// `cargo test` runs INSIDE the hermetic td-builder derivation build
+    /// (check-engine compiles td-builder as a reproducible package and runs its unit
+    /// tests there), only the `builder/` crate is staged — the repo tree is absent.
+    /// Those tests skip there; they run for real in the repo-rooted cargo-test job on
+    /// every PR (affected-checks) and via the bootstrap-seed-rs / bootstrap-mes-rs
+    /// gates in the loop sandbox. Pure-logic tests below have no such dependency.
+    fn require_repo_tree() -> Option<PathBuf> {
+        let root = repo_root();
+        if root.join("seed/stage0").is_dir() {
+            Some(root)
+        } else {
+            eprintln!("skip: seed/stage0 absent (hermetic crate build) — runs in the repo-rooted cargo-test job + the -rs gates");
+            None
+        }
+    }
+
     #[test]
     fn source_lock_parses_url_sha_file() {
         let pin = parse_source_lock(
@@ -858,7 +875,8 @@ M2-Planet \\\n\
     // check-engine. Verified-red by perturbing each pin/leg (see plan notes).
     #[test]
     fn seed_recipe_builds_and_passes_all_legs() {
-        let cx = Ctx::rooted(repo_root());
+        let Some(root) = require_repo_tree() else { return };
+        let cx = Ctx::rooted(root);
         let recipe = seed_recipe();
         let report = run(&cx, &recipe).expect("seed recipe should pass all legs");
         assert!(report.contains("[pinned-input]"), "report:\n{report}");
@@ -872,7 +890,8 @@ M2-Planet \\\n\
     // Verified-red harness as a test: a wrong pin must red the pinned-input leg.
     #[test]
     fn wrong_vendored_pin_reds_pinned_input() {
-        let cx = Ctx::rooted(repo_root());
+        let Some(root) = require_repo_tree() else { return };
+        let cx = Ctx::rooted(root);
         let recipe = Recipe {
             pins: vec![Pin::Vendored {
                 path: "seed/stage0/bootstrap-seeds/POSIX/AMD64/hex0-seed",
