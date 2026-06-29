@@ -12,7 +12,7 @@
 # stage0 td-builder build) — NOT a BUILD_GATE.
 HEAVY_GATES += bootstrap-seed-rs
 bootstrap-seed-rs:
-	@echo ">> bootstrap-seed-rs: the structured Rust `seed` recipe builds brick 0 via the stage0 td-builder — self-reproducing, working, reproducible, guix-free (source-bootstrap brick 0, the recipe-as-data port of gate 360)"
+	@echo ">> bootstrap-seed-rs: the structured Rust seed recipe builds brick 0 via the stage0 td-builder — self-reproducing, working, reproducible, guix-free (source-bootstrap brick 0, the recipe-as-data port of gate 360)"
 	@set -euo pipefail; \
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
 	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \

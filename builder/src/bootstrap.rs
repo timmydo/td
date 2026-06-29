@@ -35,6 +35,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // stage0-posix x86 3b9c2bb seed pins (mirror tests/bootstrap-seed.sh).
 const HEX0_PIN: &str = "66c95985e668f20f2465c2b876f83fef066fd7c8c2dd3adb51a969f2d7120c8b";
 const KAEM_PIN: &str = "153b8915b73bd07132b59538d10fe53d26578eb160a67db72af07aaa61c51b3b";
+// The pinned GNU Mes source lock (one place — the pin check and the build read it).
+const MES_LOCK: &str = "mes-0.27.1.lock";
 
 /// Where a recipe finds its inputs: the repo root (vendored seed, lock files) and
 /// the warmed-source cache (`.td-build-cache/sources/`, populated by
@@ -389,9 +391,7 @@ fn mes_recipe() -> Recipe {
     Recipe {
         name: "mes",
         brick: 2,
-        pins: vec![Pin::Source {
-            lock: "mes-0.27.1.lock",
-        }],
+        pins: vec![Pin::Source { lock: MES_LOCK }],
         build: build_mes,
         artifacts: vec!["bin/mes-m2"],
         checks: vec![Check {
@@ -434,12 +434,15 @@ fn parse_m2planet_units(kaem_run: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_range = false;
     for line in kaem_run.lines() {
+        // sed `/^M2-Planet/,/-o m2\/mes\.M1/`: the range opens on the start line and
+        // the end marker is only checked on SUBSEQUENT lines (so it never closes on
+        // the line that opened it).
+        let just_started = !in_range && line.starts_with("M2-Planet");
+        if just_started {
+            in_range = true;
+        }
         if !in_range {
-            if line.starts_with("M2-Planet") {
-                in_range = true;
-            } else {
-                continue;
-            }
+            continue;
         }
         if let Some(idx) = line.rfind(MARK) {
             let rest = &line[idx + MARK.len()..];
@@ -448,7 +451,7 @@ fn parse_m2planet_units(kaem_run: &str) -> Vec<String> {
                 out.push(tok.replace("${mes_cpu}", "x86_64"));
             }
         }
-        if line.contains("-o m2/mes.M1") {
+        if !just_started && line.contains("-o m2/mes.M1") {
             break;
         }
     }
@@ -472,7 +475,7 @@ fn build_mes(cx: &Ctx) -> Result<Built, String> {
     }
 
     // Unpack the warmed, pin-verified tarball into a fresh scratch dir.
-    let pin = source_pin(cx, "mes-0.27.1.lock")?;
+    let pin = source_pin(cx, MES_LOCK)?;
     let tarball = cx.sources_dir.join(&pin.file);
     let work = scratch_dir("td-bootstrap-mes").map_err(io_err("scratch dir"))?;
     extract_tar_gz(&tarball, &work)?;
@@ -774,7 +777,13 @@ fn scratch_dir(prefix: &str) -> io::Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{n}", std::process::id()));
+    let mut dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{n}", std::process::id()));
+    // Keep it ABSOLUTE: build steps use `current_dir(&scratch)` + an absolute program
+    // path; a relative scratch (a relative TMPDIR) would make those programs resolve
+    // against the parent cwd, not the scratch (the relative-program/current_dir gotcha).
+    if dir.is_relative() {
+        dir = std::env::current_dir()?.join(dir);
+    }
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }

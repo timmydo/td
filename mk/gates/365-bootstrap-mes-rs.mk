@@ -14,7 +14,7 @@
 # oracle (no cutover this PR). Standalone (~minutes) — NOT a BUILD_GATE.
 HEAVY_GATES += bootstrap-mes-rs
 bootstrap-mes-rs:
-	@echo ">> bootstrap-mes-rs: the structured Rust `mes` recipe builds brick 2 via the stage0 td-builder — mes-m2 evaluates Scheme, guix-free + reproducible (the recipe-as-data port of gate 364)"
+	@echo ">> bootstrap-mes-rs: the structured Rust mes recipe builds brick 2 via the stage0 td-builder — mes-m2 evaluates Scheme, guix-free + reproducible (the recipe-as-data port of gate 364)"
 	@set -euo pipefail; \
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
 	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \

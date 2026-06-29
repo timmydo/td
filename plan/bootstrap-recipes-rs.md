@@ -38,9 +38,13 @@ rung is a `Recipe { name, brick, pins, build, artifacts, checks }` value.
 The seed gate is **all-durable** (no guix oracle — the seed IS the irreducible
 bottom), so the Rust runner asserts the SAME durable legs. Proof tiers:
 
-- **Durable, fast** (`cargo test`, runs every PR via `check-engine`/cargo-test):
-  a native `#[test]` builds the **seed** rung end-to-end (source-free, vendored
-  bytes) and asserts its 4 legs. Verified-red by perturbing each pin/leg.
+- **Durable, fast** (`cargo test`): pure-logic `#[test]`s (lock parse, kaem.run
+  extraction, the per-leg red paths) run everywhere. The repo-tree integration
+  tests (the **seed** rung built end-to-end + the wrong-pin red) run in the
+  repo-rooted cargo-test job (affected-checks step + CI) where `seed/stage0` is
+  present; they SKIP inside the hermetic `check-engine` crate build (only `builder/`
+  is staged there), keeping that smoke "compile + unit tests, no source build".
+  Verified-red by perturbing each pin/leg.
 - **Durable, heavy** (new `mk/gates/*-rs.mk`): the Rust runner builds seed + mes
   in the loop sandbox.
 - **Removable oracle**: the shell `tests/bootstrap-{seed,mes}.sh` + gates 360/364
