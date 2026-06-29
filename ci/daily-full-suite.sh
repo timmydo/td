@@ -31,7 +31,12 @@ trap 'rm -f "$hlog" "$slog"' EXIT
 
 heavy_rc=0; system_rc=0; system_fail=""
 echo ">> daily backstop: full ./check.sh on origin/main ($main)"
-TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} ./check.sh >"$hlog" 2>&1 || heavy_rc=$?
+# TD_SUBST_FORCE_BUILD=1: the daily is the SOLE from-seed authoritative build + publisher
+# (x64-toolchain-subst). Suppress the fetch short-circuit so gate 414 ALWAYS builds the x86_64
+# toolchain from seed and re-produces the closure export to publish below — otherwise a persistent
+# ~/.td/subst (the very thing the per-PR loop needs) would make the daily FETCH its own prior
+# publish and never rebuild/republish (self-starvation).
+TD_SUBST_FORCE_BUILD=1 TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} ./check.sh >"$hlog" 2>&1 || heavy_rc=$?
 heavy_fail=$(grep -E '^FAIL' "$hlog" | head -5 | tr '\n' ';')
 
 if [ "$run_system" = 1 ]; then
@@ -76,6 +81,22 @@ if [ $rc -eq 0 ]; then
     echo ">> publish-toolchain-subst: signed + published the lock-keyed toolchain to $_store (the loop resolver fetches it; trust = tests/td-subst.pub)"
   else
     echo ">> publish-toolchain-subst: WARN — td-subst sign failed; not published"
+  fi
+  # x64-toolchain-subst: also sign + publish the x86_64 toolchain CLOSURE that gate 414 subst-exported
+  # this run (binutils-2.44 + gcc-14.3.0 + glibc-2.41-x86_64), and STASH the td-subst binary into the
+  # store so check.sh host-prep (tools/warm-subst.sh) can expose it — the per-PR loop FETCHES the
+  # closure + SKIPS the ~98-min from-seed cross build (fallback to from-seed on miss).
+  _xexp=.td-build-cache/x86_64-closure-export
+  if ! ls "$_xexp"/*.narinfo >/dev/null 2>&1; then
+    echo ">> publish-x86_64-closure: SKIP — no export at $_xexp (gate 414 built none this run)"
+  elif [ -z "${TD_SUBST_PRIVKEY:-}" ] || [ -z "$_sb" ] || [ ! -x "$_sb" ]; then
+    echo ">> publish-x86_64-closure: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set"
+  elif "$_sb" sign "$_xexp" "$TD_SUBST_PRIVKEY" >/dev/null 2>&1; then
+    mkdir -p "$_store"; cp -a "$_xexp"/. "$_store"/
+    cp -a "$_sb" "$_store/td-subst"   # stash the consumer's td-subst (warm-subst.sh exposes it)
+    echo ">> publish-x86_64-closure: signed + published the x86_64 toolchain closure to $_store + stashed td-subst (the per-PR loop FETCHES the closure, SKIPS the ~98-min build)"
+  else
+    echo ">> publish-x86_64-closure: WARN — td-subst sign failed; not published"
   fi
 else
   echo ">> daily backstop: RED (heavy_rc=$heavy_rc system_rc=$system_rc) — agent: triage \`git log <last-green>..$main\`, reproduce the failing gate, open a FIX-OR-REVERT PR (no auto-merge). Suspect-revert helper: ci/revert-suspect.sh --ref <sha> --open-pr"

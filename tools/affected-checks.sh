@@ -708,7 +708,7 @@ map_path() {
       add_preflight shell-syntax
       add_target bootstrap-hello-corpus-store-native ;;
 
-    tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tools/warm-kernel-headers-x86_64.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk)
+    tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|tools/warm-kernel-headers-x86_64.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk)
       add_preflight shell-syntax
       add_target bootstrap-x86_64-toolchain-store-native ;;
 
@@ -1104,6 +1104,7 @@ run_self_test() {
   assert_target tests/td-toolchain.lock toolchain-x86_64-input-addressed
   assert_target tests/td-toolchain-x86_64.lock toolchain-x86_64-input-addressed
   assert_target tests/td-toolchain-x86_64.lock bootstrap-x86_64-toolchain-store-native
+  assert_target tests/x86_64-subst-lib.sh bootstrap-x86_64-toolchain-store-native
   assert_target tests/toolchain-x86_64-input-addressed.sh toolchain-x86_64-input-addressed
   assert_target mk/gates/418-toolchain-x86_64-input-addressed.mk toolchain-x86_64-input-addressed
   assert_target tests/ts/recipe-td-cmake-demo.ts cmake

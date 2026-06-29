@@ -375,4 +375,5 @@ verify_x86_64_ownroot() {
     || { printf '%s\n' "$snoia" | sed 's/^/     /' >&2; echo "store-ns input-addressed x86_64 probe exited nonzero" >&2; return 1; }
   echo "$snoia" | grep -q '^IARC=42$' || { printf '%s\n' "$snoia" | sed 's/^/     /' >&2; echo "x86_64 program vs the input-addressed glibc did not return 42 in the own-root" >&2; return 1; }
   echo "   [behavioral/input-addressed] a DYNAMIC x86_64 program whose interp IS the lock-keyed /td/store glibc runs in the own-root → 42 — real x86_64 bytes at a predictable, fetchable path"
+
 }

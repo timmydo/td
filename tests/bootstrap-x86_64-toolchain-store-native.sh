@@ -979,6 +979,38 @@ echo "   [pinned-input] + the x86_64 Linux UAPI headers (derived from the pinned
 # ============================================================================================
 cpath=`make_curated_path`
 for bad in gcc g++ cc guile guix; do test ! -e "$cpath/$bad" || fail "curated PATH still exposes '$bad'"; done
+
+# --- load stage0 + the /td/store own-root store + a static bash for the store-ns shell. BOTH the
+# FETCH-skip and the from-seed BUILD paths need these. ---
+. tests/cache-lib.sh
+. tests/x86_64-cross-fns.sh
+. tests/x86_64-subst-lib.sh
+export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
+load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
+export TD_STORE_DIR=/td/store
+snwork=`mktemp -d`
+trap 'rm -rf "$snwork"' EXIT INT TERM   # both paths (the build branch re-traps, incl. $snwork below)
+# The CLOSURE store: a FRESH /td/store own-root holding the 3 lock-keyed components + a static bash
+# for the store-ns shell. Used by BOTH paths (fetched-into OR built-and-interned-into); kept separate
+# from verify_x86_64_ownroot's own $snwork/td-store so the from-seed path's glibc copy can't collide.
+cstore="$snwork/closure-store"; cdb="$snwork/closure.db"; mkdir -p "$cstore"
+bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
+bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash from hello's closure for the own-root shell"
+bbase=`basename "$bs"`; cp -a "$bs" "$cstore/$bbase"; chmod -R u+w "$cstore"
+
+# --- FETCH SHORT-CIRCUIT (x64-toolchain-subst, human 2026-06-28): if check.sh host-prep exposed a
+# persistent signed substitute store (TD_SUBST_BIN/STORE/PUBKEY), FETCH the lock-keyed x86_64
+# toolchain CLOSURE {binutils-2.44, gcc-14.3.0, glibc-2.41} and SKIP the ~98-min from-seed build.
+# ANY miss → build from seed (the substitute is an optimization, NEVER a correctness dependency).
+# DELIBERATE directive-1 relaxation, human-approved: the daily full suite stays the sole from-seed
+# authoritative build AND the publisher of the signed closure.
+if x86_64_resolve_closure "$cstore" "$cdb"; then
+  echo ">> [subst/SKIP] fetched the x86_64 toolchain closure {binutils,gcc,glibc} — SKIPPED the ~98-min from-seed build"
+  built=0
+else
+  built=1
+  echo ">> [subst/MISS] no exposed substitute store — building the x86_64 toolchain from the 229-byte seed (directive 1)"
 tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
 mesp=`build_mes_prefix "$tc" "$cpath"` || fail "Mes (MesCC self-host) did not build/install"
 TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$cpath" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
@@ -999,27 +1031,34 @@ GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$cpath" "$GM1" "$BMB" "$GOUT
 GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
 GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
 BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
-trap 'rm -rf "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$cpath"`"' EXIT INT TERM
+trap 'rm -rf "$snwork" "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$cpath"`"' EXIT INT TERM
 
 GCC14="$GCC14B/stage/td/store/gcc-14.3.0"; GST="$GOUT/out"
 echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils 2.44"
 
-# ---- CROSS UP to x86_64 (the new rungs) ----
-. tests/x86_64-cross-fns.sh
-run_x86_64_cross "$cpath" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
-# run_x86_64_cross exports: XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU X86_WORK
+  # ---- CROSS UP to x86_64 (the new rungs) ----
+  run_x86_64_cross "$cpath" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
+  # run_x86_64_cross exports: XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU X86_WORK
+  # DURABLE own-root verify on the freshly-built toolchain (#201/#215 legs: [no-guix] no /gnu/store
+  # in the x86_64 libc/gcc, content-addr, the input-addressed glibc at its lock path, distinct-arch),
+  # then intern the FULL closure {binutils,gcc,glibc} into the closure store + subst-export it.
+  verify_x86_64_ownroot "$cpath" "$snwork" || fail "the x86_64 own-root verify failed"
+  x86_64_build_closure "`pwd`/.td-build-cache/x86_64-closure-export" "$cstore" "$cdb" || fail "could not intern + subst-export the x86_64 toolchain closure"
+fi
 
-# --- DURABLE own-root verify (shared verify_x86_64_ownroot): [no-guix] no /gnu/store in the x86_64
-# glibc/gcc; intern the x86_64 glibc 2.41 at /td/store; build x86_64 C/C++ programs vs it (interp =
-# /td/store x86_64 ld-linux-x86-64.so.2) and RUN them in the store-ns own-root → 42, /gnu/store ABSENT.
-. tests/cache-lib.sh
-export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
-load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-export TD_STORE_DIR=/td/store
-snwork=`mktemp -d`
-verify_x86_64_ownroot "$cpath" "$snwork" || fail "the x86_64 own-root verify failed"
+# --- UNIFIED DURABLE verify (the assertion a build-SKIP rests on): the closure — BUILT+interned OR
+# FETCHED, at its lock-keyed /td/store paths — IS a working toolchain: its cross gcc compiles a
+# DYNAMIC x86_64 program (interp = the glibc lock path) that RUNS in the store-ns own-root → 42,
+# /gnu/store ABSENT.
+x86_64_verify_closure "$cpath" "$cstore" "$cdb" "$bbase" || fail "the x86_64 closure toolchain did not compile+run an x86_64 program → 42"
 
-echo "PASS: x86_64-toolchain — from the 229-byte seed, td built the i686 chain → gcc 14.3.0, then CROSSED UP to"
-echo "      an x86_64 toolchain (cross binutils 2.44 + cross gcc 14.3.0 + MODERN x86_64 glibc 2.41 with"
-echo "      libgcc_s.so.1). The cross gcc links a DYNAMIC x86_64 C AND C++ program against the /td/store x86_64"
-echo "      glibc 2.41 (interp = ld-linux-x86-64.so.2) that runs in the own-root → 42, /gnu/store ABSENT."
+if [ "$built" = 1 ]; then
+  echo "PASS: x86_64-toolchain — BUILT from the 229-byte seed (i686 chain → gcc 14.3.0 → CROSS UP), interned the"
+  echo "      closure {cross binutils 2.44 + cross gcc 14.3.0 + x86_64 glibc 2.41} at its lock-keyed /td/store paths;"
+  echo "      the closure compiles + runs a DYNAMIC x86_64 program in the own-root → 42, /gnu/store ABSENT."
+  echo "      (With a publisher key set, the closure was signed + published for the per-PR loop to FETCH next time.)"
+else
+  echo "PASS: x86_64-toolchain — FETCHED the lock-keyed toolchain closure from the substitute store and SKIPPED the"
+  echo "      ~98-min from-seed build; the fetched closure compiles + runs a DYNAMIC x86_64 program in the own-root →"
+  echo "      42, /gnu/store ABSENT (the build-SKIP — directive-1 relaxation; the daily is the sole from-seed builder)."
+fi
