@@ -376,10 +376,7 @@ verify_x86_64_ownroot() {
   echo "$snoia" | grep -q '^IARC=42$' || { printf '%s\n' "$snoia" | sed 's/^/     /' >&2; echo "x86_64 program vs the input-addressed glibc did not return 42 in the own-root" >&2; return 1; }
   echo "   [behavioral/input-addressed] a DYNAMIC x86_64 program whose interp IS the lock-keyed /td/store glibc runs in the own-root → 42 — real x86_64 bytes at a predictable, fetchable path"
 
-  # Export the artifacts the FETCH round-trip (tests/x86_64-subst-lib.sh, x64-toolchain-subst PR2)
-  # needs: the interned lock-keyed glibc path, the program whose interp IS that path, and the static
-  # bash for the store-ns shell — so the caller can publish this REAL component as a signed substitute
-  # and prove a consumer FETCHES + runs it instead of rebuilding.
-  X86_IAGL="$IAGL"; X86_PROGIA_REL="$wpiarel/bin/c"; X86_BASH_BASE="$bbase"; X86_OWNROOT_STORE="$store"; X86_OWNROOT_DB="$sndb"
-  export X86_IAGL X86_PROGIA_REL X86_BASH_BASE X86_OWNROOT_STORE X86_OWNROOT_DB
+  # Export the interned lock-keyed glibc path so x86_64_intern_closure (tests/x86_64-subst-lib.sh)
+  # reuses it (glibc is already interned here — no double-intern) when completing the closure.
+  X86_IAGL="$IAGL"; export X86_IAGL
 }

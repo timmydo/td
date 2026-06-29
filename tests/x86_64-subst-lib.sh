@@ -1,124 +1,117 @@
-# tests/x86_64-subst-lib.sh — helpers for the x86_64 toolchain's FETCH short-circuit
-# (x64-toolchain-subst, human 2026-06-28: "the per-PR loop fetches the x86_64 toolchain instead
-# of building it from seed"). Sourced by tests/bootstrap-x86_64-toolchain-store-native.sh.
+# tests/x86_64-subst-lib.sh — the x86_64 toolchain FETCH SHORT-CIRCUIT (x64-toolchain-subst,
+# human 2026-06-28: "the per-PR loop FETCHES the toolchain instead of building it from seed").
 #
-# Two helpers:
-#   build_td_subst_for_x86_64 <scratch>  -> echoes a td-BUILT (move-off-Guile §5) td-subst binary
-#     path; builds it from source exactly like gate 359 (tests/toolchain-subst-default.sh), reusing
-#     tests/td-subst.lock + tests/ts/recipe-td-subst.ts. Requires: $TB + the load_stage0 env
-#     (TD_BUILDER_PATH/STORE/DB) + TD_TSGO/TD_TSDIR already set by the caller, host guix on PATH.
-#   x86_64_subst_roundtrip <subst> <lock> <name> <iapath> <store> <sndb> <progrel> <bashbase>
-#     publishes the REAL interned x86_64 component at its lock-keyed path as a SIGNED substitute
-#     (ephemeral key — CI has no production secret), FETCHES it back through tools/resolve-toolchain.sh
-#     into a CLEAN store, and RUNS the pre-built x86_64 program (interp = the lock-keyed path) from
-#     the FETCHED-not-built bytes in a store-ns own-root -> 42. Plus the self-discrimination legs
-#     (cold store -> MISS/fall back; wrong pinned key -> reject; wrong StorePath -> reject). This is
-#     the consumer capability proven on the REAL cross-built x86_64 toolchain, not a fixture.
+# The per-PR loop SKIPS the ~98-min from-seed cross build by FETCHING the toolchain CLOSURE — the 3
+# `tests/td-toolchain-x86_64.lock` components {binutils-2.44-x86_64, gcc-14.3.0-x86_64,
+# glibc-2.41-x86_64} — from a persistent signed substitute store (`~/.td/subst`, exposed by
+# check.sh host-prep as TD_SUBST_BIN/TD_SUBST_STORE/TD_SUBST_PUBKEY), and falls back to from-seed on
+# ANY miss (the substitute is an optimization, never a correctness dependency — directive 1 / the
+# human-approved relaxation: the DAILY full suite stays the sole from-seed authoritative build +
+# publisher). The cross gcc/binutils are built `-static` (static i686 binaries), so the closure does
+# NOT need the i686 glibc-2.16 runtime — it is exactly these 3 x86_64 components.
+#
+# td-subst is NOT built here: gate 414 is not a BUILD_GATE, so it has no ts-eval sentinel (`ts-emit`
+# would fail) and making it one drags in the whole corpus. Instead the DAILY (which has td-subst via
+# build-recipes) stashes the td-subst binary into ~/.td/subst alongside the published closure, and
+# check.sh host-prep exposes it. This lib only CONSUMES TD_SUBST_BIN.
+#
+# Toolchain-var convention: XBU/XGCC2/XGLIBC point at the PHYSICAL bytes ($store/<base>) for the
+# host-side compile; the baked interp/RUNPATH use the LOGICAL /td/store/<base> (the store-ns binds
+# $store at /td/store at run time). Identical whether the closure was BUILT+interned or FETCHED.
 
-# build_td_subst_for_x86_64 <scratch>  (echoes the td-subst binary path; nonzero on failure)
-build_td_subst_for_x86_64() {
-  _scratch=$1
-  _guix=${GUIX:-guix}
-  _lock0="$(pwd)/tests/td-subst.lock"
-  test -s "$_lock0" || { echo "build_td_subst: no $_lock0" >&2; return 1; }
-  _cu=$(grep -- '-coreutils-' "$_lock0" | sed 's/^[^ ]* //' | head -1)
-  test -n "$_cu" || { echo "build_td_subst: no coreutils in the lock" >&2; return 1; }
-  mkdir -p "$_scratch/tmp" "$_scratch/b"; rm -f "$_scratch/b/"*.drv
-  grep ' /gnu/store/' "$_lock0" | sed 's/^[^ ]* //' | xargs "$_guix" build >/dev/null \
-    || { echo "build_td_subst: could not realize the seed + vendored .crate deps" >&2; return 1; }
-  _srcinfo=$(sh tests/intern-src.sh "$TB" td-subst-src "$(pwd)/subst" "$_scratch" target vendor .cargo) \
-    || { echo "build_td_subst: could not intern the subst crate tree" >&2; return 1; }
-  eval "$_srcinfo"
-  _lock="$_scratch/td-subst.lock"; { cat "$_lock0"; echo "td-subst-source $src"; } > "$_lock"
-  sh tests/ts-emit.sh "$(pwd)/tests/ts/recipe-td-subst.ts" > "$_scratch/subst.json"
-  test -s "$_scratch/subst.json" || { echo "build_td_subst: ts-emit produced no JSON" >&2; return 1; }
-  env -i HOME="$_scratch" TMPDIR="$_scratch/tmp" PATH="$_cu/bin" \
-    TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-    "$TB" build-recipe "$_scratch/subst.json" "$_lock" "$_scratch/b" /var/guix/db/db.sqlite "$srcstore" "$srcdb" \
-    > "$_scratch/bout" 2>"$_scratch/err" || { echo "build_td_subst: build-recipe failed:" >&2; tail -20 "$_scratch/err" >&2; return 1; }
-  _out=$(sed -n 's/^OUT=out //p' "$_scratch/bout")
-  _ts="$_scratch/b/newstore/$(basename "$_out")/bin/td-subst"
-  test -x "$_ts" || { echo "build_td_subst: no td-subst binary at $_ts" >&2; return 1; }
-  echo "$_ts"
+X86_CLOSURE_NAMES="binutils-2.44-x86_64 gcc-14.3.0-x86_64 glibc-2.41-x86_64"
+X86_LOCK=tests/td-toolchain-x86_64.lock
+
+# _x86_point NAME PHYS — repoint the toolchain vars at a placed closure component (physical path).
+_x86_point() {
+  case "$1" in
+    binutils-*) XBU="$2" ;;
+    gcc-*) XGCC2="$2"
+      XLIBGCCDIR=`find "$2" -name 'libgcc_s.so.1' 2>/dev/null | head -1 | xargs -r dirname`
+      XSTDCXXDIR=`find "$2" -name 'libstdc++.so.6' 2>/dev/null | head -1 | xargs -r dirname` ;;
+    glibc-*) XGLIBC="$2" ;;
+  esac
 }
 
-# x86_64_subst_roundtrip <subst> <lock> <name> <iapath> <store> <sndb> <progrel> <bashbase>
-#   subst    a td-subst binary (build_td_subst_for_x86_64)
-#   lock     tests/td-toolchain-x86_64.lock
-#   name     the component (glibc-2.41-x86_64)
-#   iapath   the interned lock-keyed /td/store path of that component (already in <store>)
-#   store    the physical store dir holding the interned bytes + the program
-#   sndb     the store db recording StorePaths
-#   progrel  the /td/store-relative path of a pre-built x86_64 program whose interp IS <iapath>'s ld
-#   bashbase the basename of a static bash already copied into <store> (for the store-ns shell)
-x86_64_subst_roundtrip() {
-  _ts=$1; _lock=$2; _name=$3; _iap=$4; _store=$5; _sndb=$6; _progrel=$7; _bbase=$8
-  _shdir=$(dirname "$(command -v sh)")
-  # resolve-toolchain.sh / publish-toolchain-subst.sh need coreutils + sed/grep; give them an
-  # explicit coreutils dir (like gate 359) rather than relying on $_shdir carrying them.
-  _cu=$(grep -- '-coreutils-' tests/td-subst.lock | sed 's/^[^ ]* //' | head -1)
-  test -n "$_cu" || { echo "roundtrip: no coreutils in tests/td-subst.lock" >&2; return 1; }
-  _base=$(basename "$_iap")
-  _W=$(mktemp -d); mkdir -p "$_W/out" "$_W/dest"
-  "$_ts" keygen "$_W/priv" "$_W/pub" >/dev/null 2>&1 || { echo "roundtrip: td-subst keygen failed" >&2; return 1; }
-
-  # --- PRODUCER: export + sign the REAL interned x86_64 component into a persistent store ---
-  env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$_ts" TD_SUBST_PRIVKEY="$_W/priv" TD_STORE_DIR=/td/store \
-    sh tools/publish-toolchain-subst.sh "$_lock" "$_name" "$_sndb" "$_store" "$_W/out" >/dev/null \
-    || { echo "roundtrip: publish-toolchain-subst.sh failed" >&2; return 1; }
-  test -f "$_W/out/$_base.narinfo" || { echo "roundtrip: publisher wrote no narinfo for $_base" >&2; return 1; }
-  grep -q '^Sig: ' "$_W/out/$_base.narinfo" || { echo "roundtrip: narinfo not signed" >&2; return 1; }
-  echo "   [subst/publish] exported + signed the REAL x86_64 $_name at its lock-keyed path into the substitute store"
-
-  # --- CONSUMER: the resolver computes the lock path, fetches (sig + StorePath + NarHash verified),
-  #     restores into a CLEAN store at the lock-keyed path ---
-  _fresh="$_W/fresh"; mkdir -p "$_fresh"
-  _got=$(env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$_ts" TD_SUBST_STORE="$_W/out" \
-         TD_SUBST_PUBKEY="$_W/pub" TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$_lock" "$_name" "$_W/dest") \
-    || { echo "roundtrip: resolver MISSED on a populated store (should HIT)" >&2; return 1; }
-  test "x$_got" = "x$_W/dest/$_base" || { echo "roundtrip: resolver printed '$_got' != $_W/dest/$_base" >&2; return 1; }
-  test -e "$_got/lib/ld-linux-x86-64.so.2" || { echo "roundtrip: fetched tree is not the x86_64 glibc (no ld-linux-x86-64.so.2)" >&2; return 1; }
-  echo "   [subst/fetch] resolve-toolchain.sh computed the lock path, fetched the signed substitute (sig+StorePath+NarHash verified) and restored it — no build"
-
-  # --- DURABLE behavioral: RUN the pre-built x86_64 program from the FETCHED-not-built bytes.
-  #     Place the fetched component at its lock path in a fresh store + the program + a static bash,
-  #     bind that as /td/store and run -> 42. The program's interp is the lock path the fetch filled. ---
-  cp -a "$_got" "$_fresh/$_base"
-  mkdir -p "$_fresh/$(dirname "$_progrel")"; cp -a "$_store/$_progrel" "$_fresh/$_progrel"
-  cp -a "$_store/$_bbase" "$_fresh/$_bbase"; chmod -R u+w "$_fresh"
-  _sn='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
-/td/store/'"$_progrel"'; echo "FRC=$?"'
-  _out2=$(env -i "$TB" store-ns "$_fresh" -- "/td/store/$_bbase/bin/bash" -c "$_sn" 2>&1) \
-    || { printf '%s\n' "$_out2" | sed 's/^/     /' >&2; echo "roundtrip: store-ns run from FETCHED bytes exited nonzero" >&2; return 1; }
-  echo "$_out2" | grep -q '^FRC=42$' || { printf '%s\n' "$_out2" | sed 's/^/     /' >&2; echo "roundtrip: program from FETCHED x86_64 glibc did not return 42" >&2; return 1; }
-  echo "$_out2" | grep -q '^GNU-ABSENT$' || { echo "roundtrip: /gnu/store present in the fetched-bytes own-root" >&2; return 1; }
-  echo "   [subst/run-from-fetched DURABLE] a DYNAMIC x86_64 program runs from the FETCHED (not rebuilt) lock-keyed glibc in the own-root → 42, /gnu/store absent"
-
-  # --- SELF-DISCRIMINATION: a cold store -> MISS (exit 1) so the caller falls back to from-seed ---
-  mkdir -p "$_W/cold"
-  if env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$_ts" TD_SUBST_STORE="$_W/cold" \
-     TD_SUBST_PUBKEY="$_W/pub" TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$_lock" "$_name" "$_W/d2" >/dev/null 2>&1; then
-    echo "roundtrip: resolver returned 0 on a COLD store (should MISS -> fall back)" >&2; return 1
-  fi
-  echo "   [subst/fallback DURABLE] a cold store → the resolver MISSES (exit 1) so the gate builds from seed — the substitute is an optimization, never a correctness dependency"
-
-  # --- SELF-DISCRIMINATION: a WRONG pinned key -> rejected -> MISS (signature load-bearing) ---
-  "$_ts" keygen "$_W/wrong.priv" "$_W/wrong.pub" >/dev/null 2>&1 || { echo "roundtrip: wrong-key keygen failed" >&2; return 1; }
-  if env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$_ts" TD_SUBST_STORE="$_W/out" \
-     TD_SUBST_PUBKEY="$_W/wrong.pub" TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$_lock" "$_name" "$_W/d3" >/dev/null 2>&1; then
-    echo "roundtrip: resolver ACCEPTED a substitute under a WRONG pinned key (signature not load-bearing)" >&2; return 1
-  fi
-  echo "   [subst/self-discrimination] a wrong pinned key → fetch rejected → MISS (ed25519 signature load-bearing)"
-
-  # --- SELF-DISCRIMINATION: a validly-signed narinfo for a DIFFERENT StorePath -> rejected ---
-  cp -r "$_W/out" "$_W/out2"
-  sed -i 's#^StorePath: .*#StorePath: /td/store/00000000000000000000000000000000-'"$_name"'#' "$_W/out2/$_base.narinfo"
-  grep -q '^StorePath: /td/store/00000000000000000000000000000000-' "$_W/out2/$_base.narinfo" || { echo "roundtrip: could not tamper StorePath" >&2; return 1; }
-  "$_ts" sign "$_W/out2" "$_W/priv" >/dev/null 2>&1 || { echo "roundtrip: re-sign of tampered narinfo failed" >&2; return 1; }
-  if env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$_ts" TD_SUBST_STORE="$_W/out2" \
-     TD_SUBST_PUBKEY="$_W/pub" TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$_lock" "$_name" "$_W/d4" >/dev/null 2>&1; then
-    echo "roundtrip: resolver ACCEPTED a validly-signed substitute whose StorePath != the lock path" >&2; return 1
-  fi
-  echo "   [subst/self-discrimination] a validly-signed narinfo for a DIFFERENT StorePath → MISS (the input-addressed name is load-bearing alongside the signature)"
-  rm -rf "$_W"
+# x86_64_build_closure OUT STORE DB — for the from-seed BUILD path: intern the 3 BUILT closure trees
+# (XBU/XGCC2/XGLIBC) at their lock-keyed input-addressed paths in a FRESH closure STORE, and
+# subst-EXPORT each (NAR + td-native narinfo, td-builder only — no td-subst/key) to OUT for the daily
+# to sign+publish. INTERLEAVED on purpose: `store-add-input-addressed` REWRITES DB to the single path
+# it just added, so each component must be exported WHILE it is the DB root (before the next intern).
+# A FRESH store also avoids a "File exists" double-intern with verify_x86_64_ownroot's own glibc copy.
+# Repoints XBU/XGCC2/XGLIBC at the interned PHYSICAL paths for x86_64_verify_closure.
+x86_64_build_closure() {
+  _out=$1; _store=$2; _db=$3
+  _k=`"$TB" toolchain-key "$X86_LOCK"` || { echo "build_closure: toolchain-key failed" >&2; return 1; }
+  mkdir -p "$_out"
+  for nm in $X86_CLOSURE_NAMES; do
+    case "$nm" in binutils-*) src="$XBU" ;; gcc-*) src="$XGCC2" ;; glibc-*) src="$XGLIBC" ;; esac
+    test -n "$src" -a -d "$src" || { echo "build_closure: no built tree for $nm ($src)" >&2; return 1; }
+    p=`"$TB" store-add-input-addressed "$nm" "$_k" "$src" "$_store" "$_db"` \
+      || { echo "build_closure: store-add-input-addressed $nm failed" >&2; return 1; }
+    want=`"$TB" toolchain-path "$X86_LOCK" "$nm"`
+    test "$p" = "$want" || { echo "build_closure: $nm path $p != lock-computed $want" >&2; return 1; }
+    "$TB" subst-export "$_db" "$_store" "$_out" "$p" >/dev/null \
+      || { echo "build_closure: subst-export $nm ($p) failed" >&2; return 1; }
+    test -f "$_out/`basename "$p"`.narinfo" || { echo "build_closure: no narinfo for $nm" >&2; return 1; }
+    _x86_point "$nm" "$_store/`basename "$p"`"
+    echo "   [closure] $nm interned at lock-keyed $p + subst-exported (the daily signs + publishes it)"
+  done
+  export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR
 }
+
+# x86_64_resolve_closure STORE DB — if a subst store is exposed (TD_SUBST_BIN+TD_SUBST_STORE),
+# resolve ALL 3 closure components, restore them into STORE at their lock paths, and repoint
+# XBU/XGCC2/XGLIBC. Return 0 only if ALL 3 HIT; any MISS / no subst configured -> 1 (build from seed).
+x86_64_resolve_closure() {
+  _store=$1; _db=$2
+  [ -n "${TD_SUBST_BIN:-}" ] && [ -n "${TD_SUBST_STORE:-}" ] || return 1
+  _shdir=`dirname "$(command -v sh)"`
+  _cu=`grep -- '-coreutils-' tests/td-subst.lock | sed 's/^[^ ]* //' | head -1`
+  _dest=`mktemp -d`
+  for nm in $X86_CLOSURE_NAMES; do
+    p=`env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$TD_SUBST_BIN" \
+        TD_SUBST_STORE="$TD_SUBST_STORE" TD_SUBST_PUBKEY="${TD_SUBST_PUBKEY:-tests/td-subst.pub}" \
+        TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$X86_LOCK" "$nm" "$_dest"` \
+      || return 1
+    base=`basename "$p"`
+    rm -rf "$_store/$base"; cp -a "$_dest/$base" "$_store/$base"; chmod -R u+w "$_store/$base"
+    _x86_point "$nm" "$_store/$base"
+    echo "   [closure/fetch] $nm restored at /td/store/$base (ed25519 sig + StorePath==lock-path + NarHash verified)"
+  done
+  export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR
+  return 0
+}
+
+# x86_64_verify_closure CPATH STORE DB BASHBASE — compile a DYNAMIC x86_64 C program with the
+# closure's cross gcc (XGCC2/XBU) against its glibc (XGLIBC), bake interp/RUNPATH = the glibc lock
+# path, intern the program, and RUN it in the store-ns own-root (STORE bound at /td/store) -> 42,
+# /gnu/store ABSENT. The DURABLE proof that the closure (built+interned OR fetched) is a working
+# toolchain — the prerequisite a skip relies on.
+x86_64_verify_closure() {
+  _cpath=$1; _store=$2; _db=$3; _bbase=$4
+  test -n "$XBU" -a -n "$XGCC2" -a -n "$XGLIBC" || { echo "verify_closure: closure vars unset" >&2; return 1; }
+  glrel=`basename "$XGLIBC"`
+  csh=`command -v bash 2>/dev/null || command -v sh`
+  w=`mktemp -d`; printf 'int main(){return 42;}\n' > "$w/c.c"
+  bw=`mktemp -d`
+  printf '#!%s\nexec "%s/bin/%s-gcc" -isystem "%s/include" -B"%s/lib" -L"%s/lib" -static-libgcc -Wl,--dynamic-linker -Wl,/td/store/%s/lib/ld-linux-x86-64.so.2 -Wl,--enable-new-dtags -Wl,-rpath -Wl,/td/store/%s/lib "$@"\n' \
+    "$csh" "$XGCC2" "$XTARGET" "$XGLIBC" "$XGLIBC" "$XGLIBC" "$glrel" "$glrel" > "$bw/gcc"
+  chmod 0555 "$bw/gcc"
+  ( cd "$w" && env PATH="$XBU/bin:$_cpath" "$bw/gcc" -o c.out c.c ) \
+    || { echo "verify_closure: closure cross gcc could not compile an x86_64 C program" >&2; return 1; }
+  cls=`"$XBU/bin/$XTARGET-readelf" -h "$w/c.out" 2>/dev/null | grep -i 'class:' | grep -o 'ELF64'`
+  test "$cls" = ELF64 || { echo "verify_closure: program not ELF64 (got '$cls')" >&2; return 1; }
+  ci=`"$XBU/bin/$XTARGET-readelf" -l "$w/c.out" 2>/dev/null | grep -o "/td/store/$glrel/lib/ld-linux-x86-64.so.2" | head -1`
+  test -n "$ci" || { echo "verify_closure: program interp not the lock-keyed /td/store x86_64 ld" >&2; return 1; }
+  mkdir -p "$_store/cprog/bin"; cp "$w/c.out" "$_store/cprog/bin/c"; chmod -R u+w "$_store"
+  wp=`"$TB" store-add-recursive cprog "$_store/cprog" "$_store" "$_db"` || { echo "verify_closure: store-add cprog failed" >&2; return 1; }
+  wprel=${wp#/td/store/}
+  sn='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
+/td/store/'"$wprel"'/bin/c; echo "CRC=$?"'
+  out=`"$TB" store-ns "$_store" -- "/td/store/$_bbase/bin/bash" -c "$sn" 2>&1` \
+    || { printf '%s\n' "$out" | sed 's/^/     /' >&2; echo "verify_closure: store-ns run exited nonzero" >&2; return 1; }
+  echo "$out" | grep -q '^CRC=42$' || { printf '%s\n' "$out" | sed 's/^/     /' >&2; echo "verify_closure: x86_64 program did not return 42 from the closure toolchain" >&2; return 1; }
+  echo "$out" | grep -q '^GNU-ABSENT$' || { echo "verify_closure: /gnu/store present in the own-root" >&2; return 1; }
+}
+
