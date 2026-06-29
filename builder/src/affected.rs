@@ -1,25 +1,28 @@
 //! affected-checks — `td-builder affected-checks` (rust-migration C1).
 //!
-//! A faithful port of `tools/affected-checks.sh` (the biggest single shell file):
-//! map a branch's changed paths to a right-sized check set and decide whether the
-//! full `./check.sh` is waived or required. This is the local PR-readiness gate
-//! (CLAUDE.md §"Diff-sized local check and waiver").
+//! Maps a branch's changed paths to a right-sized check set and decides whether the
+//! full `./check.sh` is waived or required — the local PR-readiness gate (CLAUDE.md
+//! §"Diff-sized local check and waiver"). This is the cutover of
+//! `tools/affected-checks.sh`: the 1284-line shell dispatcher is DELETED and callers
+//! invoke this subcommand directly.
 //!
-//! The shell script is the ORACLE: the `run_self_test` here is ported to native
-//! Rust `#[test]`s (the durable guard, runs on every PR via the required
-//! `cargo-test` job / `check-engine` smoke), and a differential `#[test]` diffs
-//! this port's `--path` output byte-for-byte against the live shell script
-//! (the removable "own, then diverge" migration oracle — directive 4).
+//! Proven equivalent before the shell was removed (directive 4 — own, then diverge):
+//! the development PR diffed this port's `--path` output byte-for-byte against the
+//! live shell over 180+ paths. With the shell retired, the durable guards that
+//! remain are `run_self_test` ported to native Rust `#[test]`s (the dynamic mapping,
+//! over the real `mk/gates`/`tests` tree) + `renders_exact_output_for_static_paths`
+//! (frozen full-render byte-equality) — both run every PR via the required
+//! `cargo-test` job / `check-engine` smoke.
 //!
 //! Surfaces preserved exactly: `--run`, `--committed-only`, `--base REF`,
 //! `--path FILE`, `--self-test`, `--help`. The mapping `case` arms are mirrored
 //! IN ORDER (first match wins); the renderer reproduces the shell stdout
-//! byte-for-byte so the differential holds.
+//! byte-for-byte.
 //!
-//! The shell roots itself with `cd "$(dirname "$0")/.."`; the subcommand resolves
+//! The shell rooted itself with `cd "$(dirname "$0")/.."`; the subcommand resolves
 //! the repo root via `git rev-parse --show-toplevel` (falling back to CWD outside a
-//! git repo), so it is CWD-robust like the oracle. The library functions take an
-//! explicit `root` so tests are CWD-independent.
+//! git repo), so it is CWD-robust. The library functions take an explicit `root` so
+//! tests are CWD-independent.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -318,7 +321,7 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
         _ => {
             sel.add_target("check-fast");
             sel.require_full(&format!(
-                "No recipe-specific mapping for '{spec}'; update affected-checks.sh or run full ./check.sh."
+                "No recipe-specific mapping for '{spec}'; update builder/src/affected.rs or run full ./check.sh."
             ));
         }
     }
@@ -362,14 +365,6 @@ const CHAIN: [&str; 29] = [
 fn add_chain(sel: &mut Selection, start: usize, end: usize) {
     for t in &CHAIN[start..end] {
         sel.add_target(t);
-    }
-}
-
-/// Strip everything through the last `/recipe-` (shell `${p##*/recipe-}`).
-fn after_last_recipe(p: &str) -> &str {
-    match p.rfind("/recipe-") {
-        Some(i) => &p[i + "/recipe-".len()..],
-        None => p,
     }
 }
 
@@ -428,9 +423,20 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("ts-eval/*|ts-eval/src/*|ts-eval/Cargo.toml|ts-eval/Cargo.lock", p) {
-        sel.add_target("ts-eval");
-        sel.add_target("ts-diff");
+    if pattern_matches(
+        "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipes-meta.json|tests/recipe-emit.sh|tests/recipe-eval-tool.sh",
+        p,
+    ) {
+        // The td-recipe crate IS the package + system-spec surface (boa/TS retired).
+        // It feeds the corpus build path (cache-lib emits via td-recipe-eval), the spec
+        // differential, and the guix-dependence census manifest — so a catalog change
+        // can affect ANY built package. Run recipe-rs (self-consistency + manifest
+        // sync), spec-diff, the census, and the package build gates.
+        sel.add_preflight("shell-syntax");
+        sel.add_target("recipe-rs");
+        sel.add_target("spec-diff");
+        sel.add_target("guix-dependence");
+        add_build_gate_targets(root, sel);
         return;
     }
 
@@ -446,13 +452,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if pattern_matches("subst/*|subst/src/*|subst/Cargo.toml|subst/Cargo.lock", p) {
         sel.add_target("td-subst");
-        return;
-    }
-
-    if pattern_matches("tests/td-tsgo.lock|tests/tsgo.sh|tools/warm-tsgo.sh", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("tsgo-pin");
-        sel.add_target("ts");
         return;
     }
 
@@ -495,25 +494,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if glob_match("tests/ts/recipe-*-perturbed.ts", p) {
-        let spec = after_last_recipe(p);
-        let spec = spec.strip_suffix("-perturbed.ts").unwrap_or(spec);
-        map_recipe_spec(root, spec, sel);
-        return;
-    }
-
-    if glob_match("tests/ts/recipe-*.ts", p) {
-        let spec = after_last_recipe(p);
-        let spec = spec.strip_suffix(".ts").unwrap_or(spec);
-        map_recipe_spec(root, spec, sel);
-        return;
-    }
-
-    if pattern_matches("tests/ts/spec-*.ts|tests/ts/td-spec.d.ts|tests/ts/spec-v0.expected.js", p) {
-        sel.add_target("ts");
-        sel.add_target("ts-diff");
-        return;
-    }
 
     if glob_match("tests/*-no-guix.lock", p) {
         let spec = p.strip_prefix("tests/").unwrap_or(p);
@@ -893,6 +873,15 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         add_chain(sel, 27, 28);
         return;
     }
+    // bootstrap-chain.sh is the SHARED from-seed toolchain chain; the sed corpus gate is its
+    // only consumer today (other store-native gates can migrate to it later, each adding
+    // itself here). A change to either re-runs the from-seed sed corpus build. (ported from
+    // PR #203's affected-checks.sh arm during the cutover rebase.)
+    if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh|tests/bootstrap-chain.sh", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("bootstrap-sed-corpus-store-native");
+        return;
+    }
     if pattern_matches(
         "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|tools/warm-kernel-headers-x86_64.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk",
         p,
@@ -985,27 +974,19 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("tests/ts-emit.sh|tests/ts-check.sh", p) {
+    if p == "tests/recipe-rs.sh" {
         sel.add_preflight("shell-syntax");
-        sel.add_target("ts");
-        sel.add_target("ts-diff");
+        sel.add_target("recipe-rs");
         return;
     }
-    if p == "tests/ts-eval-check.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("ts-eval");
+    if p == "tests/spec-diff.scm" {
+        sel.add_target("spec-diff");
         return;
     }
 
     if p == "system/td-builder.scm" {
         sel.add_target("td-builder");
         sel.add_target("rust-build");
-        return;
-    }
-    if p == "system/td-ts.scm" {
-        sel.add_target("ts");
-        sel.add_target("ts-eval");
-        sel.add_target("ts-diff");
         return;
     }
     if p == "system/td.scm" {
@@ -1028,12 +1009,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if pattern_matches("PLAN.md|plan/tracks/*|tools/plan-index.sh", p) {
         sel.add_preflight("plan-index");
-        return;
-    }
-
-    if p == "tools/affected-checks.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_preflight("affected-self-test");
         return;
     }
 
@@ -1078,7 +1053,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("*.md|plan/*|HISTORY.md|DESIGN.md|CLAUDE.md|DIGESTS.md", p) {
+    if pattern_matches("*.md|plan/*|HISTORY.md|DESIGN.md|CLAUDE.md|DIGESTS.md|.gitignore", p) {
         return; // docs — no checks
     }
 
@@ -1094,7 +1069,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // Catch-all.
     sel.add_target("check-fast");
     sel.require_full(&format!(
-        "No mapping for {p}; update affected-checks.sh or run full ./check.sh."
+        "No mapping for {p}; update builder/src/affected.rs or run full ./check.sh."
     ));
 }
 
@@ -1109,7 +1084,7 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
         }
         "cargo-test" => Some("  cargo test --manifest-path builder/Cargo.toml"),
         "plan-index" => Some("  tools/plan-index.sh --check"),
-        "affected-self-test" => Some("  tools/affected-checks.sh --self-test"),
+        "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
     }
 }
@@ -1329,10 +1304,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
             _ => continue,
         };
         for spec in specs_in_file(&f) {
-            let recipe = format!("tests/ts/recipe-{spec}.ts");
-            if root.join(&recipe).is_file() {
-                assert_target!(&recipe, &gate);
-            }
             let lock = format!("tests/{spec}-no-guix.lock");
             if root.join(&lock).is_file() {
                 assert_target!(&lock, &gate);
@@ -1340,16 +1311,25 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         }
     }
 
-    // Explicit spot-checks (verbatim from the shell self-test).
-    assert_contains!("tools/affected-checks.sh", "tools/affected-checks.sh --self-test");
-    assert_branch_policy!("tools/affected-checks.sh", "full ./check.sh would be waived");
+    // A gate-file change still selects the dispatcher's own self-test preflight
+    // (now the in-process `td-builder affected-checks --self-test`) and is waived.
+    assert_contains!("mk/gates/325-cargo-test.mk", "td-builder affected-checks --self-test");
+    assert_branch_policy!("mk/gates/325-cargo-test.mk", "full ./check.sh would be waived");
     assert_target!("tests/repro-lib.sh", "bootstrap-binutils-244-store-native");
     assert_branch_policy!("tests/repro-lib.sh", "full ./check.sh would be waived");
-    assert_target!("tests/ts/recipe-td-russh-demo.ts", "rust-russh");
+    // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
+    // catalog edit runs recipe-rs, spec-diff, the census, and the package build gates.
+    assert_target!("recipes/src/catalog.rs", "recipe-rs");
+    assert_target!("recipes/src/catalog.rs", "spec-diff");
+    assert_target!("recipes/src/catalog.rs", "guix-dependence");
+    assert_target!("recipes/src/catalog.rs", "corpus-no-guix");
+    assert_target!("recipes/Cargo.toml", "recipe-rs");
+    assert_target!("tests/recipe-rs.sh", "recipe-rs");
+    assert_target!("tests/recipes-meta.json", "recipe-rs");
+    assert_target!("tests/spec-diff.scm", "spec-diff");
     assert_target!("tests/td-russh-demo.lock", "rust-russh");
     assert_target!("tests/russh-demo/Cargo.lock", "rust-russh");
     assert_target!("tools/warm-cargo-proxy-local.sh", "rust-russh");
-    assert_target!("tests/ts/recipe-td-feed.ts", "td-feed");
     assert_target!("tests/td-feed.lock", "td-feed");
     assert_target!("tests/td-feed.index", "td-feed");
     assert_target!("tools/feed-ensure.sh", "feed-shared");
@@ -1357,7 +1337,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tools/warm-td-fetch-crates.sh", "td-feed");
     assert_target!("tools/warm-cargo-proxy.sh", "rust-ripgrep");
     assert_target!("feed/src/main.rs", "td-feed");
-    assert_target!("tests/ts/recipe-td-subst.ts", "td-subst");
     assert_target!("tests/td-subst.lock", "td-subst");
     assert_target!("subst/src/main.rs", "td-subst");
     assert_target!("tests/toolchain-subst-default.sh", "toolchain-subst-default");
@@ -1375,15 +1354,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "mk/gates/418-toolchain-x86_64-input-addressed.mk",
         "toolchain-x86_64-input-addressed"
     );
-    assert_target!("tests/ts/recipe-td-cmake-demo.ts", "cmake");
     assert_target!("tests/td-cmake-demo.lock", "cmake");
-    assert_target!("tests/ts/recipe-uutils.ts", "rust-coreutils");
     assert_target!("tests/uutils-coreutils.lock", "rust-coreutils");
     assert_target!("tests/cat-uutils.lock", "rust-uutils");
-    assert_target!("tests/ts/recipe-youki.ts", "rust-youki");
     assert_target!("tests/youki.lock", "rust-youki");
     assert_target!("tests/cmake-demo/CMakeLists.txt", "cmake");
-    assert_target!("tests/ts/recipe-perturbed.ts", "drv-emit");
     assert_target!("tests/guix-surface.sh", "guix-surface");
     assert_target!("tests/guix-surface.expected", "guix-surface");
     // The td-builder build engine validates on the check-engine SMOKE tier.
@@ -1478,8 +1453,20 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
         ),
         "cargo-test" => run_shell(root, "cargo test --manifest-path builder/Cargo.toml"),
         "plan-index" => run_command(root, "tools/plan-index.sh", &["--check".to_string()]),
+        // The dispatcher's own self-test — run IN-PROCESS (the shell oracle is gone,
+        // and this binary IS the dispatcher), so no `td-builder` re-resolution.
         "affected-self-test" => {
-            run_command(root, "tools/affected-checks.sh", &["--self-test".to_string()])
+            let failures = run_self_test(root);
+            for f in &failures {
+                eprintln!("FAIL: {f}");
+            }
+            if failures.is_empty() {
+                println!("PASS: affected-checks self-test");
+                0
+            } else {
+                eprintln!("affected-checks self-test: {} failure(s)", failures.len());
+                1
+            }
         }
         _ => 0,
     }
@@ -1661,14 +1648,14 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
     }
 
-    /// The repo fixtures these tests read (mk/gates + the shell oracle) are present
-    /// only when cargo runs from the full checkout — the `cargo-test` GATE and the
-    /// required CI `cargo-test` job, both on every PR. The `td-builder` GUIX package
-    /// build runs `cargo test` too, but its source is `local-file "../builder"` —
-    /// ONLY the crate, no `mk/gates`/`tools/` — so these tests skip there (not a
-    /// weakening: the gate + CI still run them fully every PR).
+    /// The repo fixtures the self-test reads (`mk/gates` + `tests/`) are present only
+    /// when cargo runs from the full checkout — the `cargo-test` GATE and the required
+    /// CI `cargo-test` job, both on every PR. The `td-builder` GUIX package build runs
+    /// `cargo test` too, but its source is `local-file "../builder"` — ONLY the crate,
+    /// no `mk/gates`/`tests/` — so the self-test skips there (not a weakening: the gate
+    /// + CI still run it fully every PR). Markers must be repo files OUTSIDE `builder/`.
     fn repo_tree_present(root: &Path) -> bool {
-        root.join("mk/gates").is_dir() && root.join("tools/affected-checks.sh").is_file()
+        root.join("mk/gates").is_dir() && root.join("check.sh").is_file()
     }
 
     #[test]
@@ -1684,13 +1671,10 @@ mod tests {
 
     #[test]
     fn spec_extraction_matches_shell_word_ops() {
-        assert_eq!(after_last_recipe("tests/ts/recipe-td-russh-demo.ts"), "td-russh-demo.ts");
-        assert_eq!(
-            "tests/ts/recipe-foo-perturbed.ts"
-                .rsplit_once("/recipe-")
-                .map(|(_, s)| s.strip_suffix("-perturbed.ts").unwrap()),
-            Some("foo")
-        );
+        // tests/<spec>-no-guix.lock → <spec> (shell `${p##tests/}` then `${p%-no-guix.lock}`).
+        let p = "tests/td-russh-demo-no-guix.lock";
+        let spec = p.strip_prefix("tests/").unwrap().strip_suffix("-no-guix.lock").unwrap();
+        assert_eq!(spec, "td-russh-demo");
     }
 
     // DURABLE: the dispatcher's own policy, exercised over the real mk/gates +
@@ -1707,128 +1691,101 @@ mod tests {
         assert!(failures.is_empty(), "self-test failures: {failures:#?}");
     }
 
-    // REMOVABLE MIGRATION ORACLE (directive 4 — own, then diverge): the Rust
-    // `--path` render is byte-for-byte identical to the live shell oracle for a
-    // broad path corpus. Guarded to skip where bash / the script is unavailable
-    // (e.g. the loop sandbox's minimal `guix shell` PATH); it DOES run in the
-    // required CI `cargo-test` job (plain ubuntu) on every PR. Deletable the day
-    // `tools/affected-checks.sh` is retired.
+    // DURABLE renderer guard (replaces the now-deleted shell differential — the
+    // shell oracle was the removable migration leg, retired with the cutover,
+    // directive 4). Asserts the FULL `--path` render byte-for-byte for paths whose
+    // mapping is INDEPENDENT of repo files, so it is fully deterministic and runs
+    // EVERYWHERE — including the builder-only package sandbox (no repo tree needed).
+    // The dynamic mappings stay covered by `self_test_passes_against_repo`.
     #[test]
-    fn matches_shell_oracle_byte_for_byte() {
+    fn renders_exact_output_for_static_paths() {
         let root = repo_root();
-        let script = root.join("tools/affected-checks.sh");
-        if !repo_tree_present(&root) {
-            eprintln!("SKIP oracle differential: repo tree absent at {} (builder-only sandbox)", root.display());
-            return;
-        }
-        // Probe: can we run the shell oracle here at all?
-        let probe = Command::new("bash")
-            .arg(&script)
-            .args(["--path", "DESIGN.md"])
-            .current_dir(&root)
-            .output();
-        let probe = match probe {
-            Ok(o) if o.status.success() => o,
-            _ => {
-                eprintln!("SKIP oracle differential: cannot run bash/the shell oracle in this env");
-                return;
-            }
+        let expect = |lines: &[&str]| -> String {
+            let mut s = lines.join("\n");
+            s.push('\n');
+            s
         };
-        // Sanity: the shell really produced the dispatcher output.
-        assert!(String::from_utf8_lossy(&probe.stdout).contains("affected-checks: explicit path mode"));
 
-        // Corpus: every gate file, every recipe spec, + a hand-picked path per arm.
-        let mut corpus: Vec<String> = Vec::new();
-        for f in gate_files(&root) {
-            corpus.push(format!("mk/gates/{}", f.file_name().unwrap().to_string_lossy()));
-        }
-        if let Ok(rd) = std::fs::read_dir(root.join("tests/ts")) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with("recipe-") && n.ends_with(".ts") {
-                    corpus.push(format!("tests/ts/{n}"));
-                }
-            }
-        }
-        corpus.extend(
-            [
-                "Makefile",
-                "check.sh",
-                "channels.scm",
-                "system/td.scm",
-                "system/td-builder.scm",
-                "system/td-ts.scm",
-                "system/foo.scm",
-                "builder/src/main.rs",
-                "builder/Cargo.toml",
-                "DIGESTS.md",
-                "DESIGN.md",
-                "README.md",
-                "plan/tracks/x.md",
-                "plan/notes.md",
-                "PLAN.md",
-                "tools/affected-checks.sh",
-                "tools/plan-index.sh",
-                "tools/warm-cargo-proxy.sh",
-                "tools/warm-cargo-proxy-local.sh",
-                "tools/warm-td-fetch-crates.sh",
-                "tools/feed-ensure.sh",
-                "ci/build-ci-image.sh",
-                "ci/import-store.sh",
-                "ci/other.sh",
-                ".github/workflows/ci.yml",
-                "tests/build-pkg.sh",
-                "tests/cache-lib.sh",
-                "tests/repro-lib.sh",
-                "tests/heal-revert.sh",
-                "tests/td-russh-demo.lock",
-                "tests/cat-uutils.lock",
-                "tests/foo-no-guix.lock",
-                "tests/td-toolchain.lock",
-                "tests/td-toolchain-x86_64.lock",
-                "tests/guix-surface.sh",
-                "tests/guix-dependence.scm",
-                "tests/boot.scm",
-                "tests/store-ns.sh",
-                "tests/bootstrap-patch.sh",
-                "tests/bootstrap-toolchain-store-native.sh",
-                "tests/bootstrap-binutils-244-store-native.sh",
-                "tests/bootstrap-gcc-14-store-native.sh",
-                "tests/rust-store-native.sh",
-                "seed/sources/make-4.4.lock",
-                "seed/sources/mes-0.27.lock",
-                "seed/stage0/hex0",
-                "subst/src/main.rs",
-                "feed/src/main.rs",
-                "fetch/src/main.rs",
-                ".claude/whatever",
-                "totally/unmapped/path.xyz",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
+        // builder/src/* → check-engine smoke + the engine note (waived).
+        assert_eq!(
+            path_output(&root, "builder/src/main.rs"),
+            expect(&[
+                "affected-checks: explicit path mode",
+                "",
+                "Changed paths:",
+                "  builder/src/main.rs",
+                "",
+                "Selected checks:",
+                "  cargo test --manifest-path builder/Cargo.toml",
+                "  ./check.sh check-engine",
+                "",
+                "Waiver: inspection only (--path does not prove the branch diff)",
+                "Branch-mode policy for these paths: full ./check.sh would be waived",
+                "",
+                "Notes:",
+                "  - builder/src/main.rs is the td-builder build engine: validated by the ~2-min check-engine smoke (compile + unit tests); the from-source build coverage is the DAILY backstop (DESIGN §7.2), not a per-PR gate.",
+                "",
+                "Dry run only. Re-run with --run to execute.",
+            ])
         );
 
-        let mut diverged: Vec<String> = Vec::new();
-        for p in &corpus {
-            let shell = Command::new("bash")
-                .arg(&script)
-                .args(["--path", p])
-                .current_dir(&root)
-                .output()
-                .expect("run shell oracle");
-            let shell_out = String::from_utf8_lossy(&shell.stdout).to_string();
-            let rust_out = path_output(&root, p);
-            if shell_out != rust_out {
-                diverged.push(format!(
-                    "--- {p} ---\nSHELL:\n{shell_out}\nRUST:\n{rust_out}\n"
-                ));
-            }
-        }
-        assert!(
-            diverged.is_empty(),
-            "rust port diverged from the shell oracle on {} path(s):\n{}",
-            diverged.len(),
-            diverged.join("\n")
+        // Loop spine → full loop required.
+        assert_eq!(
+            path_output(&root, "check.sh"),
+            expect(&[
+                "affected-checks: explicit path mode",
+                "",
+                "Changed paths:",
+                "  check.sh",
+                "",
+                "Selected checks:",
+                "  bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
+                "  ./check.sh check-fast cargo-test",
+                "",
+                "Waiver: inspection only (--path does not prove the branch diff)",
+                "Branch-mode policy for these paths: full ./check.sh would be required",
+                "  - check.sh touches the loop spine; affected-checks cannot waive the full loop.",
+                "",
+                "Dry run only. Re-run with --run to execute.",
+            ])
+        );
+
+        // Docs → no checks (waived).
+        assert_eq!(
+            path_output(&root, "README.md"),
+            expect(&[
+                "affected-checks: explicit path mode",
+                "",
+                "Changed paths:",
+                "  README.md",
+                "",
+                "Selected checks: none (docs-only or ignored local metadata)",
+                "",
+                "Waiver: inspection only (--path does not prove the branch diff)",
+                "Branch-mode policy for these paths: full ./check.sh would be waived",
+                "",
+                "Dry run only. Re-run with --run to execute.",
+            ])
+        );
+
+        // Catch-all → check-fast + require_full (now points at the moved file).
+        assert_eq!(
+            path_output(&root, "totally/unmapped/path.xyz"),
+            expect(&[
+                "affected-checks: explicit path mode",
+                "",
+                "Changed paths:",
+                "  totally/unmapped/path.xyz",
+                "",
+                "Selected checks:",
+                "  ./check.sh check-fast",
+                "",
+                "Waiver: inspection only (--path does not prove the branch diff)",
+                "Branch-mode policy for these paths: full ./check.sh would be required",
+                "  - No mapping for totally/unmapped/path.xyz; update builder/src/affected.rs or run full ./check.sh.",
+                "",
+                "Dry run only. Re-run with --run to execute.",
+            ])
         );
     }
 }

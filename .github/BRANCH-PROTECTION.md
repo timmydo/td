@@ -145,7 +145,7 @@ Optimistic merge (non-strict since 2026-06-19): validate against your **own
 base**, not the latest tip.
 
 1. Run the loop green locally — `./check.sh`, or
-   `tools/affected-checks.sh --committed-only --run` (waives or escalates to the
+   `td-builder affected-checks --committed-only --run` (waives or escalates to the
    full loop per the diff). CI verifies your run; it does not replace it.
 2. Push the branch, open the PR (`gh pr create`), wait for `lint` + `check-fast`.
 3. Human review + approval, then squash- or rebase-merge (merge commits

@@ -827,7 +827,7 @@ human approval (`.github/BRANCH-PROTECTION.md` is the setup/operations note).
 To land (**optimistic merge** — main is non-strict since 2026-06-19):
 
 1. validate against your **own base**: run the loop green — `./check.sh`, or
-   `tools/affected-checks.sh --committed-only --run` (which waives the full loop
+   `td-builder affected-checks --committed-only --run` (which waives the full loop
    or escalates to it per the diff);
 2. push the branch and mark its PR ready; CI runs `lint` + `check-fast` (the
    fast tier `./check.sh check-fast` on a hosted runner via the small

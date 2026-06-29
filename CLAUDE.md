@@ -123,11 +123,15 @@ Do not proceed to the next sub-task until the current one is green.
 ### Diff-sized local check and waiver
 
 Use the affected-check dispatcher for the fast inner loop and for local PR
-readiness when a full run would stall progress:
+readiness when a full run would stall progress. It is the `affected-checks`
+subcommand of the Rust engine — `td-builder affected-checks` (run from the repo
+root). Resolve `td-builder` to a prebuilt binary if you have one
+(`$TD_BUILDER`, `builder/target/release/td-builder`, or a `td-builder` on PATH),
+else build it once: `cargo build --release --manifest-path builder/Cargo.toml`.
 
 ```
-tools/affected-checks.sh        # show changed paths and selected checks
-tools/affected-checks.sh --run  # run the selected preflights and ./check.sh targets
+td-builder affected-checks        # show changed paths and selected checks
+td-builder affected-checks --run  # run the selected preflights and ./check.sh targets
 ```
 
 It compares the branch to `origin/main` (falling back to `main`) and includes dirty,
@@ -138,7 +142,7 @@ for a specific file.
 After rebasing for PR readiness, run:
 
 ```
-tools/affected-checks.sh --committed-only --run
+td-builder affected-checks --committed-only --run
 ```
 
 If it prints `Waiver: full ./check.sh waived by affected-checks for this diff`,
@@ -231,7 +235,7 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
 - **Land (optimistic merge on green, via PR):** main is **non-strict** (DESIGN
   §7.2, human 2026-06-19) — a PR merges on **its own** green checks; main moving
   under you no longer forces a rebase-onto-tip + re-run. So: (1) validate against
-  your own base — run `tools/affected-checks.sh --committed-only --run`; if it
+  your own base — run `td-builder affected-checks --committed-only --run`; if it
   waives the full loop, record the waiver in the PR body; if it escalates, it
   runs the FULL `./check.sh` before returning success, so record the escalation
   and full result instead; (2) spawn an independent code-review subagent over the
@@ -337,12 +341,12 @@ it.
   markers; the `plan-index` gate enforces sync). `plan/tracks/<track>.md` — one track's
   status record (the claim source of truth). `plan/<track>.md` — per-track working
   notes, single writer. `M10-design.md` — the M10 design note.
-- `tools/affected-checks.sh` — diff-to-check dispatcher for local iteration and PR
-  readiness. Run it first to see the selected checks, then
-  `tools/affected-checks.sh --run` to execute them. Its waiver line decides whether
-  the local full `./check.sh` run is waived or still required; `--run` enforces
-  escalation by running the full loop when required. Its own mapping guard is
-  `tools/affected-checks.sh --self-test`.
+- `td-builder affected-checks` (`builder/src/affected.rs`) — diff-to-check
+  dispatcher for local iteration and PR readiness. Run it first to see the selected
+  checks, then `td-builder affected-checks --run` to execute them. Its waiver line
+  decides whether the local full `./check.sh` run is waived or still required;
+  `--run` enforces escalation by running the full loop when required. Its own mapping
+  guard is `td-builder affected-checks --self-test` (also a `cargo-test` `#[test]`).
 - `HISTORY.md` — completed-milestone record. `DIGESTS.md` — reproducibility record
   (changes only on oracle re-baseline; exclusive landing).
 

@@ -65,15 +65,31 @@ differential, which RAN — not skipped). Binary smoke vs the shell oracle:
 `--self-test` PASS; `--path`, bare branch dry-run, and `--committed-only` all
 byte-IDENTICAL; error/`--help` exit codes (2/2/2/0) match.
 
-## Scope / cutover
+## Cutover — DELETE the shell, in this PR (human, 2026-06-28)
 
-This PR lands the proven Rust port + tests ONLY — `builder/src/*` (+ this track's
-plan files). It does NOT touch `tools/affected-checks.sh`: the shell stays the live
-tool AND the differential oracle. The cutover (replace the script body with a thin
-shim that execs `td-builder affected-checks`) is a deliberate follow-up — it makes
-the dispatcher depend on a built `td-builder` binary (today it needs only
-bash+git+sed), an ergonomic spine decision worth its own small PR.
+The human chose to **delete `tools/affected-checks.sh` entirely** in this PR
+(not a thin shim) and rewire callers/docs to invoke `td-builder affected-checks`
+directly; `td-builder` is resolved **prebuilt → cargo build** ($TD_BUILDER →
+`builder/target/{release,debug}` → PATH → `cargo build`), keeping the dispatcher
+guix-free (North-Star aligned).
 
-affected-checks classifies this diff: `builder/src/*` → `check-engine` smoke,
-full loop WAIVED (DESIGN §7.2). Landing check: `tools/affected-checks.sh
---committed-only --run`.
+Consequences handled:
+- The 1284-line shell file is removed (`git rm`).
+- The only programmatic caller — the `affected-self-test` preflight — now runs the
+  self-test **in-process** (this binary IS the dispatcher; no re-resolution). Its
+  rendered command string becomes `td-builder affected-checks --self-test`.
+- Docs rewired: `CLAUDE.md` (§"Diff-sized local check and waiver" + the conventions
+  entry + the landing step), `DESIGN.md`, `.github/BRANCH-PROTECTION.md`. Historical
+  `plan/*.md` notes are left as-is (they record past work).
+- The removable shell **differential** test is deleted with its oracle (directive 4
+  — the byte-identity leg is the migration oracle, retired with the cutover). It is
+  replaced by `renders_exact_output_for_static_paths` — a frozen full-render
+  byte-equality `#[test]` over paths whose mapping is repo-file-INDEPENDENT (so it is
+  deterministic and runs even in the builder-only package sandbox). The dynamic
+  mapping stays guarded by `self_test_passes_against_repo`.
+- `repo_tree_present` markers changed to `mk/gates` + `check.sh` (the deleted script
+  can no longer be the presence marker, else the self-test would skip vacuously).
+
+affected-checks classifies this diff (the deletion + engine + docs): `builder/src/*`
+→ `check-engine` smoke, full loop WAIVED (DESIGN §7.2). Landing check:
+`td-builder affected-checks --committed-only --run`.
