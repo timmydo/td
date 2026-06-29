@@ -45,24 +45,28 @@ bottom), so the Rust runner asserts the SAME durable legs. Proof tiers:
   present; they SKIP inside the hermetic `check-engine` crate build (only `builder/`
   is staged there), keeping that smoke "compile + unit tests, no source build".
   Verified-red by perturbing each pin/leg.
-- **Durable, heavy** (new `mk/gates/*-rs.mk`): the Rust runner builds seed + mes
-  in the loop sandbox.
-- **Removable oracle**: the shell `tests/bootstrap-{seed,mes}.sh` + gates 360/364
-  stay UNCHANGED as the live driver and the differential oracle. During dev the
-  Rust-built artifact is confirmed byte-identical to the shell-built one (both are
-  reproducible + build from the same pin). No cutover this PR (same scoping as
-  #226 — cutover would make the gate depend on a built td-builder).
+- **Durable, heavy**: gates `bootstrap-seed` (360) + `bootstrap-mes` (364) now RUN
+  the Rust recipe (`td-builder bootstrap-recipe {seed,mes}`) in the loop sandbox.
+- **CUTOVER (directive 3 — called out in the PR):** the shell
+  `tests/bootstrap-{seed,mes}.sh` are DELETED and gates 360/364 repointed to the
+  Rust recipe. No shell oracle is kept — these gates are all-durable (no guix
+  oracle; the shell was the prior *implementation*, not a guix differential). The
+  Rust recipe asserts a SUPERSET of the shell's legs; own-then-diverge was done
+  before deletion (mes-m2 proven byte-identical, sha 203e5516…; seed asserts the
+  same pins). The duplicate `*-rs` gates were removed.
 
-## Sub-tasks (smallest-correct first)
+## Sub-tasks
 
-1. [ ] framework + `seed` recipe; subcommand; cargo `#[test]`; gate `361-…-rs.mk`.
-       Verify green + verified-red (cargo test, `bootstrap-recipe seed`).
-2. [ ] `mes` recipe (Pin::Source, kaem.run input-list port, M2P/BE/M1/HEX2 chain);
-       gate `365-…-rs.mk`. Verify against the warm mes-0.27.1 tarball.
-3. [ ] code-review subagent over the branch; address; PR ready; land.
+1. [x] framework + `seed` recipe; subcommand; cargo `#[test]`; verified-red.
+2. [x] `mes` recipe (Pin::Source, kaem.run input-list port, M2P/BE/M1/HEX2 chain);
+       byte-identical to the shell oracle.
+3. [x] CUTOVER: delete the shell drivers, repoint gates 360/364 to the Rust recipe,
+       update the affected.rs routing (seed tree + mes lock → gates; bootstrap.rs →
+       check-engine).
+4. [x] code review over the branch; address; PR ready; land.
 
-Follow-ups (own PRs/tracks): mescc, tcc, gcc-mesboot*, glibc-mesboot, …; then the
-cutover (shell driver → thin shim exec'ing `td-builder bootstrap-recipe`).
+Follow-ups (own PRs): mescc, tcc, gcc-mesboot*, glibc-mesboot, … — each ports its
+shell driver to a `Recipe`, deletes the shell, and repoints its gate.
 
 ## Verified-red log
 

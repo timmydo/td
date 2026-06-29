@@ -687,19 +687,16 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "tests/bootstrap-seed.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("bootstrap-seed");
-        return;
-    }
+    // bootstrap-seed / bootstrap-mes have NO shell driver — they are STRUCTURED Rust
+    // recipes (`td-builder bootstrap-recipe {seed,mes}`, builder/src/bootstrap.rs,
+    // rust-migration C2; the old tests/bootstrap-{seed,mes}.sh were deleted). A
+    // recipe-code change routes via the builder/src/* arm above (check-engine smoke +
+    // the cargo-test preflight, which builds brick 0 end-to-end on every PR); the seed
+    // tree (seed/stage0/*) and the mes lock (seed/sources/mes-*.lock) route to these
+    // gates via the chain arms below.
     if p == "tests/bootstrap-cc.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-cc");
-        return;
-    }
-    if p == "tests/bootstrap-mes.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("bootstrap-mes");
         return;
     }
     if p == "tests/bootstrap-mescc.sh" {
@@ -1361,6 +1358,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/cmake-demo/CMakeLists.txt", "cmake");
     assert_target!("tests/guix-surface.sh", "guix-surface");
     assert_target!("tests/guix-surface.expected", "guix-surface");
+    // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
+    // the seed tree + the mes lock route to the gates via the chain; the recipe code
+    // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
+    assert_target!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
+    assert_target!("seed/sources/mes-0.27.1.lock", "bootstrap-mes");
+    assert_target!("builder/src/bootstrap.rs", "check-engine");
+    assert_branch_policy!("builder/src/bootstrap.rs", "full ./check.sh would be waived");
     // The td-builder build engine validates on the check-engine SMOKE tier.
     assert_target!("builder/src/sandbox.rs", "check-engine");
     assert_branch_policy!("builder/src/main.rs", "full ./check.sh would be waived");
