@@ -18,18 +18,23 @@ to exactly what `td-config->operating-system` emits for a `#f` config — delete
 differentials still converge, now at guix-free digests, and the differential itself
 enforces the marker on the oracle.
 
-- system drv (oracle): `9yiz1dq6jss2pcdhvny4lkb4b5xblx4c-system.drv`; perturbed
-  (ssh-port 2222): `7z0igfjgga6x6h26ycq69bbgg35pc66z`.
-  (rust-userland re-baseline, 2026-06-17 — was `rxbyhfc70s7…` / `pb06pj1rvc…`
-  before procs/fd/ripgrep/sd/eza/bat joined the injected base set; oracle and
-  typed still converge on this drv, verified `diff`/`manifest-diff`.)
+- system drv (oracle): `iy338wd0mqkbc8qfw4lc9jm9nf2sk6k3-system.drv`; perturbed
+  (ssh-port 2222): `lpx6qlp5g838v5vllidwm5wy6m70jsan`.
+  (rust-userland REMOVAL re-baseline, 2026-06-30 — was
+  `9yiz1dq6jss2pcdhvny4lkb4b5xblx4c` / `7z0igfjgga6x6h26ycq69bbgg35pc66z` while
+  procs/fd/ripgrep/sd/eza/bat were in the injected base set. The Rust userland now
+  ships as td's OWN bytes via td-native OCI images (rust-userland-image / #242), so
+  the guix Rust apps leave the shipped system. Oracle and typed still converge on
+  this drv — verified here, both `(system td)` td-system and `(td-config)` lower to
+  `iy338wd0…-system.drv` — and `diff`/`manifest-diff` enforce it live.)
 - default OCI image drv (oracle): `d4fn2m2vf6rhhgvj4cish3023a7kvpp4-docker-image.tar.gz.drv`;
   perturbed: `z9f9kjb0rp7y3r7adlr265qiizd5ppd4`.
   (NB: these OCI/qcow2 drv+output digests below ALSO shifted with the
-  rust-userland closure change — left at their pre-change values here, like the
-  drift already flagged at the foot of this file; the next build-level
-  re-baseline owner refreshes them. No gate asserts them; convergence and
-  reproducibility are enforced live by the differential + `--check` rungs.)
+  rust-userland closure change — both when it was added and now on its 2026-06-30
+  REMOVAL — left at their pre-change values here, like the drift already flagged at
+  the foot of this file; the next build-level re-baseline owner refreshes them. No
+  gate asserts them; convergence and reproducibility are enforced live by the
+  differential + `--check` rungs.)
 - default qcow2 output: `rgp5cdjpmjcg5jdzqp85gfc5byv8rhi6-image.qcow2`.
 - default docker output: `n3ds4yhw5v49yi53426pc0sbmibc3dl7-docker-image.tar.gz`.
 - swapped (+hello) / no-guix hardened drv: `vkm5wlx6fl5ly3c11qplvall1ryhxd17-…` → output
