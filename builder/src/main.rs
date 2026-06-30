@@ -1472,62 +1472,31 @@ fn build_plan_auto(
     build_plan(&plan_path.to_string_lossy(), guix_db, scratch)
 }
 
-/// Emit a recipe's JSON from its `.ts` with td's OWN TS front-end — `tsgo` (the
-/// native TypeScript compiler, NO node) transpiles TS→JS, `td-ts-eval` (the boa
-/// evaluator) evaluates it to the recipe JSON. No guix, no Guile — the same two
-/// steps as `tests/ts-emit.sh`. Tools come from the env (td-built, placed by the
-/// caller): TD_TSGO (dir holding `lib/tsc`), TD_TS_EVAL (the binary), TD_TSDIR (the
-/// dialect dir holding `td-spec.d.ts`).
-fn emit_recipe_json(recipe_ts: &str) -> Result<String, String> {
-    let tsgo = std::env::var("TD_TSGO")
-        .map_err(|_| "TD_TSGO must point at td's tsgo dir (with lib/tsc) to emit a recipe".to_string())?;
-    let ts_eval = std::env::var("TD_TS_EVAL")
-        .map_err(|_| "TD_TS_EVAL must point at td's td-ts-eval binary".to_string())?;
-    let tsdir = std::env::var("TD_TSDIR").unwrap_or_else(|_| "tests/ts".to_string());
-    let work = std::env::temp_dir().join(format!("td-shell-emit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
-    // tsgo transpile — same pinned flags as tests/ts-emit.sh, so the JS is the golden emit.
-    let tsc = format!("{tsgo}/lib/tsc");
-    let ok = Command::new(&tsc)
-        .args(["--strict", "--target", "es2020", "--lib", "es2020", "--newLine", "lf", "--removeComments", "--outDir"])
-        .arg(&work)
-        .arg(format!("{tsdir}/td-spec.d.ts"))
-        .arg(recipe_ts)
-        .status()
-        .map_err(|e| format!("spawn {tsc}: {e}"))?
-        .success();
-    if !ok {
-        return Err(format!("tsgo tsc failed transpiling {recipe_ts}"));
-    }
-    let stem = Path::new(recipe_ts)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("bad recipe path {recipe_ts}"))?;
-    let js = work.join(format!("{stem}.js"));
-    let js_bytes = std::fs::read(&js).map_err(|e| format!("tsc produced no JS ({}): {e}", js.display()))?;
-    // td-ts-eval: evaluate the JS to the recipe JSON on stdout.
-    let mut child = Command::new(&ts_eval)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn td-ts-eval ({ts_eval}): {e}"))?;
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .ok_or("td-ts-eval stdin")?
-        .write_all(&js_bytes)
-        .map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_dir_all(&work);
+/// Emit PKG's recipe JSON from td's Rust catalog via `td-recipe-eval emit` — the
+/// dependency-free evaluator (recipes/), set in TD_RECIPE_EVAL by the caller (placed,
+/// td-built). This REPLACES the old `tsgo`+`td-ts-eval` `.ts` emit (the TypeScript
+/// recipe surface was deleted in rust-recipe-surface, #224); `tests/recipe-emit.sh`
+/// is the shell sibling of this call. td-recipe-eval `die`s with a non-zero exit on an
+/// unknown stem, which we surface as the loud "no td recipe for PKG" error — td shell
+/// resolves PKG to a td recipe or fails; it never falls back to guix.
+fn emit_recipe_json(pkg: &str) -> Result<String, String> {
+    let eval = std::env::var("TD_RECIPE_EVAL").map_err(|_| {
+        "TD_RECIPE_EVAL must point at td's td-recipe-eval binary (the Rust recipe catalog evaluator)"
+            .to_string()
+    })?;
+    let out = Command::new(&eval)
+        .args(["emit", pkg])
+        .output()
+        .map_err(|e| format!("spawn td-recipe-eval ({eval}): {e}"))?;
     if !out.status.success() {
+        // Unknown stem (or any emit failure) ⇒ loud error, NOT a guix fallback. Keep the
+        // "no td recipe for" phrasing the td-shell gate's load-bearing leg asserts on.
         return Err(format!(
-            "td-ts-eval failed on {recipe_ts}: {}",
+            "no td recipe for `{pkg}' — td shell builds td packages (the recipes/ catalog via td-recipe-eval), it does not fall back to guix: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    String::from_utf8(out.stdout).map_err(|e| format!("td-ts-eval output not UTF-8: {e}"))
+    String::from_utf8(out.stdout).map_err(|e| format!("td-recipe-eval output not UTF-8: {e}"))
 }
 
 /// td-builder shell — run a command with td-BUILT packages on PATH. td's own
@@ -1541,12 +1510,12 @@ fn emit_recipe_json(recipe_ts: &str) -> Result<String, String> {
 /// links the pinned toolchain SEED from the lock — guix-built today, the frozen seed
 /// tarball next, CLAUDE.md "North star" step 2 — but no guix runs here.)
 ///
-/// Config (env): TD_SHELL_RECIPES (dir of `recipe-<pkg>.ts`, default `tests/ts`),
-/// TD_SHELL_LOCKS (dir of `<pkg>-no-guix.lock`, default `tests`), TD_TSGO/TD_TS_EVAL/
-/// TD_TSDIR (td's TS front-end, to emit the recipe), TD_SHELL_STORE_DB (store DB for
-/// closure staging, default `/var/guix/db/db.sqlite`), TD_SHELL_CACHE (build cache
-/// root, default `$HOME/.cache/td-shell`), TD_BUILDER_PATH/STORE/DB (optional stage0
-/// builder override, so the build's builder is td-placed too).
+/// Config (env): TD_RECIPE_EVAL (td's Rust recipe-catalog evaluator, to emit the
+/// recipe), TD_SHELL_LOCKS (dir of `<pkg>-no-guix.lock`, default `tests`),
+/// TD_SHELL_STORE_DB (store DB for closure staging, default `/var/guix/db/db.sqlite`),
+/// TD_SHELL_CACHE (build cache root, default `$HOME/.cache/td-shell`),
+/// TD_BUILDER_PATH/STORE/DB (optional stage0 builder override, so the build's builder
+/// is td-placed too).
 ///
 /// Usage: shell PKG... [-- CMD ARGS...]
 ///   PKG...      td package names (a recipe must exist; no guix fallback)
@@ -1560,7 +1529,6 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
     };
 
     let env_or = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-    let recipe_dir = env_or("TD_SHELL_RECIPES", "tests/ts");
     let lock_dir = env_or("TD_SHELL_LOCKS", "tests");
     let store_db = env_or("TD_SHELL_STORE_DB", "/var/guix/db/db.sqlite");
     let cache = match std::env::var("TD_SHELL_CACHE") {
@@ -1579,20 +1547,18 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
     // td store output's bin/sbin dirs to put on PATH.
     let mut prefix_dirs: Vec<String> = Vec::new();
     for pkg in pkgs {
-        // Resolve PKG to a td recipe. No recipe ⇒ loud error, NOT a guix fallback.
-        let recipe_ts = format!("{recipe_dir}/recipe-{pkg}.ts");
-        if !Path::new(&recipe_ts).is_file() {
-            return Err(format!(
-                "no td recipe for `{pkg}' ({recipe_ts} not found) — td shell builds td packages, it does not fall back to guix"
-            ));
-        }
+        // Resolve PKG to a td recipe via the Rust catalog (td-recipe-eval) and emit its
+        // JSON FIRST — an unknown PKG ⇒ loud "no td recipe" error, NOT a guix fallback.
+        // (Resolve before the lock check so an unknown package reports "no td recipe", the
+        // load-bearing leg the td-shell gate asserts; a known pkg then needs its lock.)
+        let recipe_json = emit_recipe_json(pkg)?;
+        // PKG needs a lock (its pinned toolchain seed). No lock ⇒ loud error.
         let lock = format!("{lock_dir}/{pkg}-no-guix.lock");
         if !Path::new(&lock).is_file() {
             return Err(format!("no lock for `{pkg}' ({lock} not found)"));
         }
-        // Emit the recipe JSON (td's tsgo + td-ts-eval — no guix), stage it in the
-        // per-package cache dir that build-recipe also keys its build cache on.
-        let recipe_json = emit_recipe_json(&recipe_ts)?;
+        // Stage the recipe JSON in the per-package cache dir that build-recipe also keys
+        // its build cache on.
         let sd = format!("{cache}/{pkg}");
         std::fs::create_dir_all(&sd).map_err(|e| e.to_string())?;
         let json_file = format!("{sd}/recipe.json");

@@ -25,8 +25,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 load_recipe_eval || fail "no td-built td-recipe-eval (the build-recipes prelude must run first)"
-TD_TSDIR=tests/ts
-echo ">> td tools (guix-free): stage0=$TB  ts-eval=$TD_RECIPE_EVAL"
+echo ">> td tools (guix-free): stage0=$TB  recipe-eval=$TD_RECIPE_EVAL"
 
 work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
@@ -52,7 +51,7 @@ tdshell() {
   env -i HOME="$work" TMPDIR="$work/tmp" PATH="$cu/bin:$sh_/bin" \
     TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
     TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
-    TD_SHELL_RECIPES=tests/ts TD_SHELL_LOCKS=tests TD_SHELL_CACHE="$work/pkgs" \
+    TD_SHELL_LOCKS=tests TD_SHELL_CACHE="$work/pkgs" \
     TD_SEED_STORE="$SEED_STORE" TD_SEED_DB="$SEED_DB" \
     "$TB" shell "$@"
 }
@@ -80,7 +79,7 @@ echo "   [DURABLE structural] PATH hello = $hb (td's build); every input staged 
 gxout=`env -i HOME="$work" TMPDIR="$work/tmp" PATH="$cu/bin:$sh_/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
   TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
-  TD_SHELL_RECIPES=tests/ts TD_SHELL_LOCKS=tests TD_SHELL_CACHE="$work/pkgs-guix" TD_SHELL_STORE_DB=/var/guix/db/db.sqlite \
+  TD_SHELL_LOCKS=tests TD_SHELL_CACHE="$work/pkgs-guix" TD_SHELL_STORE_DB=/var/guix/db/db.sqlite \
   "$TB" shell hello -- bash -c 'command -v hello'` || fail "td shell hello via /var/guix (oracle) failed"
 gxbase=`basename "$(dirname "$(dirname "$gxout")")"`
 test "$outbase" = "$gxbase" || fail "seed-built hello ($outbase) != /var/guix-built td shell ($gxbase)"
