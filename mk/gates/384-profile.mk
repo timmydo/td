@@ -2,9 +2,9 @@
 # unions the bin/sbin of installed package outputs into a symlink-tree profile (like a guix
 # profile / nix env): the step that turns the seed/`td shell` build engine into a durable,
 # inspectable install (build into a persistent store, link profile/bin/xyz -> store, put it on
-# PATH / link ~/bin/xyz). tests/profile.sh: td BUILDS hello + which (build-recipe, no guix
+# PATH / link ~/bin/xyz). tests/profile.sh: td BUILDS hello + sed (build-recipe, no guix
 # process, stage0 builder), PLACES each into a persistent store ($store/<hash>-<name>), builds
-# a profile unioning them, and runs profile/bin/{hello,which} + a ~/bin symlink into it. Asserts
+# a profile unioning them, and runs profile/bin/{hello,sed} + a ~/bin symlink into it. Asserts
 # behavioral (the binaries run through the profile + ~/bin chain), structural (profile entries
 # are symlinks INTO the store — the union), and a detected name COLLISION. Heavy (stage0 + two
 # source builds) → BUILD_GATES + HEAVY_GATES.

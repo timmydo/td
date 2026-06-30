@@ -2,7 +2,7 @@
 # GENERATED from the recipe GRAPH (no manifest). For every owned recipe that has an
 # owned input edge (a declared input that is itself a td recipe), `td-builder build-plan
 # --auto` topo-sorts the owned-input closure, marks each edge `td-recipe-output`, and
-# builds the DAG — bash<-readline<-ncurses, nano<-gettext-minimal+ncurses, etc., each
+# builds the DAG — bash<-readline<-ncurses, grep<-pcre2, etc., each
 # dep built once (shared scratch). Subjects are DERIVED here from the recipe inputs, so
 # a new recipe's edges chain automatically — the same graph the guix-dependence census
 # reads to credit edge-owned. Per subject: DURABLE structural (the subject's .drv
@@ -57,9 +57,7 @@ build-plan:
 	  echo "  [$$S DURABLE structural] --auto chained$$(for d in $$edges; do printf ' %s' "$$d"; done); .drv references td's edges and NOT guix's"; \
 	  case "$$S" in \
 	    grep) printf 'foobar\nbaz\n' | LD_LIBRARY_PATH="$$ld" "$$out/bin/grep" -P 'o{2}' | grep -qx foobar || { echo "FAIL: $$S -P match" >&2; exit 1; }; bh="grep -P matches via td's pcre2" ;; \
-	    nano) LD_LIBRARY_PATH="$$ld" "$$out/bin/nano" --version | grep -q 'version 8.7.1' || { echo "FAIL: nano --version" >&2; exit 1; }; bh="nano --version 8.7.1 loads td's ncurses" ;; \
 	    bash) LD_LIBRARY_PATH="$$ld" "$$out/bin/bash" -c 'echo $$BASH_VERSION' | grep -q '^5' || { echo "FAIL: bash run" >&2; exit 1; }; bh="bash runs loading td's readline + ncurses" ;; \
-	    gettext-minimal) LD_LIBRARY_PATH="$$ld" "$$out/bin/msgfmt" --version | grep -qi 'gettext' || { echo "FAIL: msgfmt --version" >&2; exit 1; }; bh="msgfmt runs (libtextstyle loads td's shared ncurses)" ;; \
 	    readline) ls "$$out"/lib/libreadline.so* >/dev/null 2>&1 || { echo "FAIL: libreadline.so missing" >&2; exit 1; }; bh="libreadline.so present (library subject)" ;; \
 	    less) LD_LIBRARY_PATH="$$ld" "$$out/bin/less" --version | grep -q 'less 608' || { echo "FAIL: less --version" >&2; exit 1; }; bh="less --version 608 loads td's ncurses" ;; \
 	    *) echo "FAIL: no behavioral check defined for subject $$S — add one" >&2; exit 1 ;; \

@@ -2,7 +2,7 @@
 # tests/corpus-seed.sh — North-Star: ONE warmed seed builds MULTIPLE corpus packages with
 # no guix install. seed-build proved hello builds from the seed; this generalizes it — a
 # single warmed seed (the union of two packages' build closures) builds two DIFFERENT
-# corpus tools (hello + which) from source, each passing the seed DB as its ONLY store DB,
+# corpus tools (hello + sed) from source, each passing the seed DB as its ONLY store DB,
 # so /var/guix + the live /gnu/store are out of every build. Proves the seed mechanism
 # scales to the corpus (one seed, many builds — the shape of "the whole loop builds with no
 # guix install"); chained corpus packages (build-plan seed support) are the next step.
@@ -27,7 +27,7 @@ mkdir -p "$work/tmp"
 cu=`grep -- '-coreutils-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`
 sh_=`grep -- '-bash-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`
 
-SPECS="hello which"
+SPECS="hello sed"
 
 # ONE shared seed = the union of every spec's lock inputs + the stage0 builder's runtime.
 : > "$work/roots"
@@ -65,12 +65,12 @@ hd=`build_from_seed hello`
 test "`"$hd/bin/hello"`" = "Hello, world!" || fail "seed-built hello did not greet"
 echo "   [DURABLE] hello built from the shared seed (no guix) and greeted"
 
-# --- which from the SAME shared seed (a different corpus tool) ---
-wd=`build_from_seed which`
-"$wd/bin/which" --version 2>&1 | grep -qi 'GNU which' || fail "seed-built which --version is not GNU which"
-echo "   [DURABLE] which built from the SAME shared seed (no guix) and runs: `"$wd/bin/which" --version 2>&1 | head -1`"
+# --- sed from the SAME shared seed (a different corpus tool) ---
+sedd=`build_from_seed sed`
+"$sedd/bin/sed" --version 2>&1 | grep -qi 'GNU sed' || fail "seed-built sed --version is not GNU sed"
+echo "   [DURABLE] sed built from the SAME shared seed (no guix) and runs: `"$sedd/bin/sed" --version 2>&1 | head -1`"
 
-echo "PASS: ONE warmed seed built TWO different corpus packages (hello + which) from source —"
+echo "PASS: ONE warmed seed built TWO different corpus packages (hello + sed) from source —"
 echo "      each with the seed as its only store DB (/var/guix + the live /gnu/store out of"
 echo "      the build), every input staged from the seed. The seed scales to the corpus: one"
 echo "      seed, many builds, no guix install (leaf recipes; chained is build-plan-seed next)."

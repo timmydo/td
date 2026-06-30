@@ -5,9 +5,9 @@
 # store, put it on PATH / link ~/bin/xyz). This turns the seed/`td shell` build engine into
 # an inspectable, durable install: not an ephemeral PATH, a real profile that runs.
 #
-# This gate: td BUILDS hello + which (td-builder build-recipe — no guix process, stage0
+# This gate: td BUILDS hello + sed (td-builder build-recipe — no guix process, stage0
 # builder), PLACES each into a persistent store (`$store/<hash>-<name>`), builds a profile
-# unioning them, and runs `$profile/bin/{hello,which}` + a `~/bin`-style symlink into it.
+# unioning them, and runs `$profile/bin/{hello,sed}` + a `~/bin`-style symlink into it.
 # guix/Guile are scrubbed from the build PATH; td-builder is the guix-free stage0.
 #
 # Legs:
@@ -48,27 +48,27 @@ build_pkg() {
 # A PERSISTENT store (the ~/.td/store of a user PM): place each td build at $store/<base>.
 store="$work/td-store"; mkdir -p "$store"
 hout=`build_pkg hello`; hbase=`basename "$hout"`; cp -a "$hout" "$store/$hbase"
-wout=`build_pkg which`; wbase=`basename "$wout"`; cp -a "$wout" "$store/$wbase"
-echo "   td built hello + which into the persistent store: $store"
+sout=`build_pkg sed`; sbase=`basename "$sout"`; cp -a "$sout" "$store/$sbase"
+echo "   td built hello + sed into the persistent store: $store"
 
 # Build the PROFILE — union their bin/ into a symlink tree.
 prof="$work/profile"
-"$TB" profile "$prof" "$store/$hbase" "$store/$wbase" >/dev/null || fail "td-builder profile failed"
+"$TB" profile "$prof" "$store/$hbase" "$store/$sbase" >/dev/null || fail "td-builder profile failed"
 
 # --- Leg A: DURABLE behavioral — run THROUGH the profile -----------------------
 test "`"$prof/bin/hello"`" = "Hello, world!" || fail "$prof/bin/hello did not greet"
-"$prof/bin/which" --version 2>&1 | grep -qi 'GNU which' || fail "$prof/bin/which is not GNU which"
-echo "   [DURABLE behavioral] hello + which run through the profile ($prof/bin/*)"
+"$prof/bin/sed" --version 2>&1 | grep -qi 'GNU sed' || fail "$prof/bin/sed is not GNU sed"
+echo "   [DURABLE behavioral] hello + sed run through the profile ($prof/bin/*)"
 # the ~/bin/xyz -> profile -> store chain a user PM exposes
 mkdir -p "$work/bin"; ln -s "$prof/bin/hello" "$work/bin/hello"
 test "`"$work/bin/hello"`" = "Hello, world!" || fail "~/bin/hello -> profile chain did not run"
 echo "   [DURABLE behavioral] ~/bin/hello -> profile -> store runs (the user-PM symlink chain)"
 
 # --- Leg B: DURABLE structural — symlinks INTO the persistent store, union -----
-test -L "$prof/bin/hello" -a -L "$prof/bin/which" || fail "profile entries are not symlinks"
+test -L "$prof/bin/hello" -a -L "$prof/bin/sed" || fail "profile entries are not symlinks"
 test "`readlink "$prof/bin/hello"`" = "$store/$hbase/bin/hello" || fail "hello symlink does not point into the store"
-test "`readlink "$prof/bin/which"`" = "$store/$wbase/bin/which" || fail "which symlink does not point into the store"
-echo "   [DURABLE structural] profile/bin/{hello,which} are symlinks into the persistent store (the union of both packages)"
+test "`readlink "$prof/bin/sed"`" = "$store/$sbase/bin/sed" || fail "sed symlink does not point into the store"
+echo "   [DURABLE structural] profile/bin/{hello,sed} are symlinks into the persistent store (the union of both packages)"
 
 # --- Leg C: DURABLE discriminate — a name from two packages is a collision -----
 mkdir -p "$store/dup-hello/bin"; cp "$store/$hbase/bin/hello" "$store/dup-hello/bin/hello"
@@ -78,6 +78,6 @@ fi
 grep -q "collision" "$work/cerr" || { cat "$work/cerr" >&2; fail "collision not reported as a collision"; }
 echo "   [DURABLE discriminate] a name provided by two packages is rejected as a collision"
 
-echo "PASS: td built hello + which into a persistent store and td-builder profile unioned them"
+echo "PASS: td built hello + sed into a persistent store and td-builder profile unioned them"
 echo "      into a symlink-tree profile — the binaries run through profile/bin and a ~/bin"
 echo "      symlink into it; collisions are rejected. The user-package-manager profile layer."

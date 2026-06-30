@@ -1,17 +1,17 @@
 //! The package catalog — every td recipe, declared in Rust.
 //!
-//! One entry per `tests/ts/recipe-<stem>.ts`, keyed by the FILE STEM (not the
-//! recipe name): the `-perturbed` self-discrimination twins deliberately share a
-//! recipe `name` with their base (e.g. `perturbed` is name `hello`), so the stem
-//! is the stable key. `recipe-rs` proves each entry equals its boa-evaluated
-//! `.ts` twin (the removable migration oracle).
+//! Keyed by a stable STEM (not the recipe name): the `-perturbed`
+//! self-discrimination twins deliberately share a recipe `name` with their base
+//! (e.g. `hello-perturbed` is name `hello`), so the stem is the stable key. The
+//! `recipe-rs` gate proves the surface is self-consistent and keeps the
+//! `tests/recipes-meta.json` census manifest in sync.
 //!
 //! NOTE (follow-up): a `build.rs` glob over
 //! `src/recipes/*.rs` would let each recipe live in its own self-registering file
 //! (the mk/gates "one file, no shared line" property). PR1 keeps a single central
 //! table for reviewability; splitting it is mechanical and changes no behavior.
 
-use crate::types::{Clause, FileArg, Phase, RefPart, Recipe, Replacement, Source, Stmt, Substitution};
+use crate::types::{Recipe, Source};
 
 /// Look up a recipe by `.ts` file stem (e.g. "hello", "gzip-perturbed").
 pub fn lookup(stem: &str) -> Option<Recipe> {
@@ -31,30 +31,18 @@ pub fn all() -> Vec<(&'static str, Recipe)> {
         ("file", file()),
         ("findutils", findutils()),
         ("gawk", gawk()),
-        ("gettext-minimal", gettext_minimal(GETTEXT_SHA)),
-        ("gettext-minimal-perturbed", gettext_minimal(GETTEXT_SHA_PERTURBED)),
-        ("gperf", gperf()),
-        ("gperf-perturbed", gperf_perturbed()),
         ("grep", grep()),
-        ("gzip", gzip(GZIP_SHA)),
-        ("gzip-perturbed", gzip(GZIP_SHA_PERTURBED)),
         ("hello", hello(HELLO_SHA)),
+        ("hello-perturbed", hello_perturbed()),
         ("less", less()),
-        ("libatomic-ops", libatomic_ops(LIBATOMIC_SHA)),
-        ("libatomic-ops-perturbed", libatomic_ops(LIBATOMIC_SHA_PERTURBED)),
         ("libsigsegv", libsigsegv()),
         ("libunistring", libunistring()),
         ("make", make()),
-        ("nano", nano(NANO_SHA)),
-        ("nano-perturbed", nano(NANO_SHA_PERTURBED)),
         ("ncurses", ncurses()),
         ("patch", patch()),
         ("pcre2", pcre2()),
-        ("perturbed", hello(HELLO_SHA_PERTURBED)),
         ("pkg-config", pkg_config()),
         ("pkg-config-perturbed", pkg_config_perturbed()),
-        ("popt", popt(POPT_SHA)),
-        ("popt-perturbed", popt(POPT_SHA_PERTURBED)),
         ("procs", procs()),
         ("readline", readline()),
         ("ripgrep", ripgrep()),
@@ -70,8 +58,6 @@ pub fn all() -> Vec<(&'static str, Recipe)> {
         ("td-ts-eval", td_ts_eval()),
         ("td-vendor-demo", td_vendor_demo()),
         ("uutils", uutils()),
-        ("which", which()),
-        ("which-perturbed", which_perturbed()),
         ("xz", xz()),
         ("youki", youki()),
     ]
@@ -148,17 +134,6 @@ fn gawk() -> Recipe {
         .configure_flags(&["CFLAGS=-O2 -g -Wno-incompatible-pointer-types"])
 }
 
-fn gperf() -> Recipe {
-    Recipe::gnu("gperf", "3.3").source(Source::one(
-        "mirror://gnu/gperf/gperf-3.3.tar.gz",
-        "1n2ac3cxinbfbq41jdpb7mlz58q3vga6rzbshdaf0fp4lymy11zx",
-    ))
-}
-
-fn gperf_perturbed() -> Recipe {
-    gperf().configure_flags(&["--disable-dependency-tracking"])
-}
-
 fn grep() -> Recipe {
     Recipe::gnu("grep", "3.11")
         .source(Source::one(
@@ -169,13 +144,20 @@ fn grep() -> Recipe {
 }
 
 const HELLO_SHA: &str = "1aqq1379syjckf0wdn9vs6wfbapnj9zfikhiykf29k4jq9nrk6js";
-const HELLO_SHA_PERTURBED: &str = "1bqq1379syjckf0wdn9vs6wfbapnj9zfikhiykf29k4jq9nrk6js";
 
 fn hello(sha: &str) -> Recipe {
     Recipe::gnu("hello", "2.12.2").source(Source::one(
         "mirror://gnu/hello/hello-2.12.2.tar.gz",
         sha,
     ))
+}
+
+// The self-discrimination twin for the corpus-no-guix gate: a LOAD-BEARING recipe
+// field (configureFlags) differs from base `hello`, so it assembles a DISTINCT .drv
+// even though the source is resolved from the lock (a source-hash perturbation would
+// be vacuous in the build-recipe path — see mk/gates/220-corpus-no-guix.mk).
+fn hello_perturbed() -> Recipe {
+    hello(HELLO_SHA).configure_flags(&["--disable-nls"])
 }
 
 fn less() -> Recipe {
@@ -186,18 +168,6 @@ fn less() -> Recipe {
         ))
         .inputs(&["ncurses"])
         .configure_flags(&["CFLAGS=-O2 -std=gnu17"])
-}
-
-const LIBATOMIC_SHA: &str = "0lcv86ib2ryqh18gsgarpkyf6k5l2bd1kh5lbkxv7wh7w9zj01fk";
-const LIBATOMIC_SHA_PERTURBED: &str = "0mcv86ib2ryqh18gsgarpkyf6k5l2bd1kh5lbkxv7wh7w9zj01fk";
-
-fn libatomic_ops(sha: &str) -> Recipe {
-    Recipe::gnu("libatomic-ops", "7.8.2")
-        .source(Source::one(
-            "https://github.com/bdwgc/libatomic_ops/releases/download/v7.8.2/libatomic_ops-7.8.2.tar.gz",
-            sha,
-        ))
-        .outputs(&["out", "debug"])
 }
 
 fn libsigsegv() -> Recipe {
@@ -219,15 +189,6 @@ fn make() -> Recipe {
         "mirror://gnu/make/make-4.4.1.tar.gz",
         "1cwgcmwdn7gqn5da2ia91gkyiqs9birr10sy5ykpkaxzcwfzn5nx",
     ))
-}
-
-const NANO_SHA: &str = "1pyy3hnjr9g0831wcdrs18v0lh7v63yj1kaf3ljz3qpj92rdrw3n";
-const NANO_SHA_PERTURBED: &str = "1qyy3hnjr9g0831wcdrs18v0lh7v63yj1kaf3ljz3qpj92rdrw3n";
-
-fn nano(sha: &str) -> Recipe {
-    Recipe::gnu("nano", "8.7.1")
-        .source(Source::one("mirror://gnu/nano/nano-8.7.1.tar.xz", sha))
-        .inputs(&["gettext-minimal", "ncurses"])
 }
 
 fn ncurses() -> Recipe {
@@ -342,17 +303,6 @@ fn uutils() -> Recipe {
     Recipe::rust("uutils", "0.9.0").bins(&["coreutils"])
 }
 
-fn which() -> Recipe {
-    Recipe::gnu("which", "2.21").source(Source::one(
-        "mirror://gnu/which/which-2.21.tar.gz",
-        "1bgafvy3ypbhhfznwjv1lxmd6mci3x1byilnnkc7gcr486wlb8pl",
-    ))
-}
-
-fn which_perturbed() -> Recipe {
-    which().configure_flags(&["--disable-iberty"])
-}
-
 fn xz() -> Recipe {
     Recipe::gnu("xz", "5.4.5").source(Source::one(
         "http://tukaani.org/xz/xz-5.4.5.tar.gz",
@@ -362,144 +312,6 @@ fn xz() -> Recipe {
 
 fn youki() -> Recipe {
     Recipe::rust("youki", "0.6.0").bins(&["youki"])
-}
-
-// --- phase-bearing recipes ----------------------------------------------------
-
-const GZIP_SHA: &str = "1ihaii7d3vznvj9vk1fkmpvd7pqbz0c8fyzr2pvgs2r2pn0vi9q1";
-const GZIP_SHA_PERTURBED: &str = "1jhaii7d3vznvj9vk1fkmpvd7pqbz0c8fyzr2pvgs2r2pn0vi9q1";
-
-fn gzip(sha: &str) -> Recipe {
-    Recipe::gnu("gzip", "1.14")
-        .source(Source::one("mirror://gnu/gzip/gzip-1.14.tar.xz", sha))
-        .tests(false)
-        .configure_flags(&["ac_cv_prog_LESS=\"less\""])
-        .phases(vec![Phase::new("after", "unpack", "use-absolute-name-of-gzip")
-            .lambda_args(&["outputs"])
-            .substitutions(vec![Substitution::new(
-                "gunzip.in",
-                "exec 'gzip'",
-                Replacement::StringAppend(vec![
-                    RefPart::Lit("exec ".into()),
-                    RefPart::Output("out".into()),
-                    RefPart::Lit("/bin/gzip".into()),
-                ]),
-            )])])
-}
-
-const POPT_SHA: &str = "1lf5zlj5rbg6s4bww7hbhpca97prgprnarx978vcwa0bl81vqnai";
-const POPT_SHA_PERTURBED: &str = "1mf5zlj5rbg6s4bww7hbhpca97prgprnarx978vcwa0bl81vqnai";
-
-fn popt(sha: &str) -> Recipe {
-    Recipe::gnu("popt", "1.18")
-        .source(Source::one(
-            "http://ftp.rpm.org/popt/releases/popt-1.x/popt-1.18.tar.gz",
-            sha,
-        ))
-        .phases(vec![Phase::new("before", "configure", "patch-test")
-            .substitutions(vec![
-                Substitution::new(
-                    "tests/test-poptrc.in",
-                    "/bin/echo",
-                    Replacement::Which("echo".into()),
-                ),
-                Substitution::new("tests/testit.sh", "lt-test1", Replacement::Lit("test1".into())),
-            ])
-            .return_true()])
-}
-
-const GETTEXT_SHA: &str = "0j8fijicvg8jkrisgsqbpnbmfb2mz3gx2p6pcwip82731yb7i9aj";
-const GETTEXT_SHA_PERTURBED: &str = "0k8fijicvg8jkrisgsqbpnbmfb2mz3gx2p6pcwip82731yb7i9aj";
-
-fn gettext_minimal(sha: &str) -> Recipe {
-    Recipe::gnu("gettext-minimal", "0.23.1")
-        .source(Source::one("mirror://gnu/gettext/gettext-0.23.1.tar.gz", sha))
-        .outputs(&["out", "doc"])
-        .inputs(&["libunistring", "libxml2", "ncurses"])
-        .configure_flags(&["--with-included-libunistring=no", "--with-included-libxml=no"])
-        .make_flags(&["VERBOSE=yes"])
-        .phases(vec![
-            Phase::new("before", "patch-source-shebangs", "patch-fixed-paths").body(vec![
-                Stmt::Substitute {
-                    file: FileArg::List(
-                        ["gettext-tools/config.h.in",
-                         "gettext-tools/gnulib-tests/init.sh",
-                         "gettext-tools/tests/init.sh",
-                         "gettext-tools/system-tests/run-test"]
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    ),
-                    clauses: vec![Clause::new("/bin/sh", Replacement::Lit("sh".into()))],
-                },
-                Stmt::Substitute {
-                    file: FileArg::List(
-                        ["gettext-tools/src/project-id",
-                         "gettext-tools/projects/KDE/trigger",
-                         "gettext-tools/projects/GNOME/trigger"]
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    ),
-                    clauses: vec![Clause::new("/bin/pwd", Replacement::Lit("pwd".into()))],
-                },
-            ]),
-            Phase::new("before", "check", "patch-tests")
-                .lambda_args(&["inputs"])
-                .body(vec![
-                    Stmt::Substitute {
-                        file: FileArg::Lit("gettext-tools/gnulib-tests/test-execute.sh".into()),
-                        clauses: vec![Clause::new(
-                            "^#!.*",
-                            Replacement::StringAppend(vec![
-                                RefPart::Var("all".into()),
-                                RefPart::Lit("exit 77;\n".into()),
-                            ]),
-                        )
-                        .matching(&["all"])],
-                    },
-                    Stmt::LetWhich {
-                        binds: vec![("bash".to_string(), "sh".to_string())],
-                        body: vec![Stmt::WithDefaultPortEncodingFalse {
-                            body: vec![
-                                Stmt::Substitute {
-                                    file: FileArg::FindFiles(
-                                        "gettext-tools/tests".into(),
-                                        "^(lang-sh|msg(exec|filter)-[0-9])".into(),
-                                    ),
-                                    clauses: vec![Clause::new(
-                                        "#![[:blank:]]/bin/sh",
-                                        Replacement::Format(
-                                            "#!~a".into(),
-                                            vec![RefPart::Var("bash".into())],
-                                        ),
-                                    )],
-                                },
-                                Stmt::Substitute {
-                                    file: FileArg::Cons(
-                                        Box::new(FileArg::Lit("gettext-tools/src/msginit.c".into())),
-                                        Box::new(FileArg::FindFiles(
-                                            "gettext-tools/gnulib-tests".into(),
-                                            "posix_spawn".into(),
-                                        )),
-                                    ),
-                                    clauses: vec![Clause::new(
-                                        "/bin/sh",
-                                        Replacement::Var("bash".into()),
-                                    )],
-                                },
-                                Stmt::Substitute {
-                                    file: FileArg::Lit("gettext-tools/src/project-id".into()),
-                                    clauses: vec![Clause::new(
-                                        "/bin/pwd",
-                                        Replacement::Lit("pwd".into()),
-                                    )],
-                                },
-                            ],
-                        }],
-                    },
-                ]),
-        ])
 }
 
 #[cfg(test)]
@@ -524,14 +336,7 @@ mod tests {
         // The self-discrimination property the corpus gates rely on: a perturbed
         // twin must NOT serialise identically to its base.
         let pairs = [
-            ("hello", "perturbed"),
-            ("gzip", "gzip-perturbed"),
-            ("gettext-minimal", "gettext-minimal-perturbed"),
-            ("popt", "popt-perturbed"),
-            ("nano", "nano-perturbed"),
-            ("libatomic-ops", "libatomic-ops-perturbed"),
-            ("which", "which-perturbed"),
-            ("gperf", "gperf-perturbed"),
+            ("hello", "hello-perturbed"),
             ("pkg-config", "pkg-config-perturbed"),
         ];
         for (base, pert) in pairs {
