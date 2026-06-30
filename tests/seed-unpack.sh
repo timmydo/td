@@ -58,6 +58,20 @@ regn=`grep -c . "$work/reg"`
 test "$regn" -eq "$n" || fail "DEST-DB closure of $root is $regn, manifest is $n — incomplete registration"
 echo "   [DURABLE structural] td's reader reads the COMPLETE closure from the unpacked DB ($regn == $n)"
 
+# [DURABLE] td re-derives the DB's reachability by CONTENT-SCANNING the unpacked bytes
+# (store-closure-scan = the daemon's scanForReferences/scan.rs, bounded to the seed
+# store) — and it must equal td's own store-db walk over the manifest-built DB. So the
+# seed DB's references faithfully reflect the BYTES, not merely the refs the manifest
+# recorded at capture time. No store DB in the scan, no guix.
+seedstore="$work/store/gnu/store"
+scan_cl=`"$TB" store-closure-scan "$seedstore" "$seedstore/$(basename "$root")" | sed 's#.*/##' | sort -u` \
+  || fail "store-closure-scan failed"
+db_cl=`sed 's#.*/##' "$work/reg" | sort -u`
+test -n "$scan_cl" || fail "store-closure-scan produced an empty closure"
+test "$scan_cl" = "$db_cl" \
+  || { printf '%s\n' "$scan_cl" | sed 's/^/  scan: /' >&2; printf '%s\n' "$db_cl" | sed 's/^/  db:   /' >&2; fail "content-scan closure != the unpacked DB walk — the DB's refs don't reflect the bytes"; }
+echo "   [DURABLE] td content-scanned the seed closure (`printf '%s\n' "$scan_cl" | grep -c .` paths) from the BYTES == the unpacked DB walk — the DB's refs reflect the bytes, not just the manifest (no store DB, no guix)"
+
 # [REMOVABLE oracle] the unpacked closure == guix's gc -R.
 guix gc -R "$root" | sort -u > "$work/oracle"
 extra=`cat "$work/reg" "$work/oracle" | sort | uniq -u | head -3`
