@@ -45,3 +45,6 @@ recipes/target/
 # the latest machine-readable verdict. Local to the runner host, not versioned.
 .td-last-green
 .td-daily-verdict
+
+# Claude Code session runtime state — session-specific, never versioned.
+.claude/scheduled_tasks.lock
