@@ -7,7 +7,7 @@
 # guix at the source rather than relabeling it (NOT the demoted store-relocate of a guix
 # binary). The sha256 content-address IS the oracle (no guix origin / no differential).
 #
-# Warmed guix-free by tools/warm-bootstrap-sources.sh (HOST prep, td-fetch + the shared
+# Warmed guix-free by td-feed warm sources (HOST prep, td-fetch + the shared
 # td-feed) into .td-build-cache/sources/<file>; the gate reads it offline and re-verifies the
 # sha256 itself. Dropping this lock needs NO check.sh edit (the warm is manifest-driven).
 # Bump url + sha256 + file together; sha256 is the value published at <url>.sha256.

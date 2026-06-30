@@ -389,7 +389,7 @@ fn serve_index(store: &Path, idxpath: &str) -> Result<Vec<u8>, String> {
 /// index cksum — the td-owned, verifying egress. The cache is NOT trusted blindly: a cache
 /// hit is re-verified against the index cksum on every serve, and a corrupted/stale entry
 /// is discarded and refetched. So the sha256==index-cksum guarantee holds for cached hits,
-/// not just fresh downloads (the integrity tools/warm-cargo-proxy.sh relies on).
+/// not just fresh downloads (the integrity the `warm crate`/`warm crate-local` path relies on).
 fn serve_crate(store: &Path, cr: &str, ver: &str) -> Result<Vec<u8>, String> {
     let cache = store_path(&store.join("crates"), &format!("{cr}-{ver}.crate"))
         .ok_or("unsafe crate name")?;
