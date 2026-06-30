@@ -79,6 +79,21 @@ retired last. DESIGN §5 carries the detail.
    (`td-builder`/`td-ts-eval`/`td-typescript`) are the snapshotted baseline, retired by
    their own tracks; this just stops NEW ones (author in TS, build/place with td).
 
+8. **No PR adds a guix dependency — the guix surface only shrinks (human, 2026-06-30).**
+   This generalizes directive 7 beyond the packager axis to *every* form of guix
+   reliance — a `guix` process invocation (`guix build`/`gc`/`repl`/`system`/`shell`), a
+   read of guix's private state (e.g. `/var/guix/db/db.sqlite`), or a guix-built byte in
+   a td artifact. A new PR MUST NOT introduce one; the existing baselines
+   (`tests/guix-surface.expected`, `tests/guix-dependence.expected`, and the `guix gc`/
+   `guix repl` census the `guix-surface` gate prints) are one-way ratchets that may only
+   shrink. The ONE sanctioned guix use is the **removable migration oracle** (directive
+   4): a guix leg that builds the same thing the old way so td's own result can be diffed
+   against it — it must be LABELED removable and must never be the load-bearing path (the
+   td-native path is). Adding any other guix dependency is a regression: it needs the
+   relevant `.expected`/baseline edit, called out in the PR for explicit sign-off
+   (directive 3). When in doubt, the test is "does the td-native path still work with guix
+   deleted from this step?" — if no, it's load-bearing and not allowed.
+
 ## The loop
 
 Your inner loop for every change:
