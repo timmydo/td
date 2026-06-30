@@ -12,9 +12,10 @@
 # guix-free; the build still links the pinned toolchain SEED from the lock
 # (guix-built today, the frozen seed tarball next — step 2).
 #
-# Tools (all td-built / guix-free): stage0 td-builder (cache-lib load_stage0), the
-# TS front-end td-tsgo (tests/tsgo.sh) + td-recipe-eval (load_recipe_eval, from the
-# build-recipes prelude). Realizing hello's pinned SEED closure up front is bare
+# Tools (all td-built / guix-free): stage0 td-builder (cache-lib load_stage0) +
+# td-recipe-eval (the Rust recipe catalog evaluator, load_recipe_eval, from the
+# build-recipes prelude — `td shell` resolves PKG through it, NOT the deleted .ts
+# surface). Realizing hello's pinned SEED closure up front is bare
 # `guix build` of the lock's store paths (test setup, not a packager form, not in
 # td shell's path) — the same warming every build gate does.
 #
@@ -57,7 +58,7 @@ tdshell() {
   env -i HOME="$cache" TMPDIR="$cache/tmp" PATH="$SCRUB" \
     TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
     TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
-    TD_SHELL_RECIPES=tests/ts TD_SHELL_LOCKS=tests TD_SHELL_STORE_DB=/var/guix/db/db.sqlite \
+    TD_SHELL_LOCKS=tests TD_SHELL_STORE_DB=/var/guix/db/db.sqlite \
     TD_SHELL_CACHE="$cache" \
     "$TB" shell "$@"
 }
