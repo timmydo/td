@@ -26,7 +26,7 @@ chain (stage0-posix `hex0` → `mes` → `mescc-tools` → `tinycc` → `gcc` �
 binutils/coreutils/bash/make/…), every stage `--prefix=/td/store`. No `/gnu/store`, no
 guix process, no guix bytes. This is a *port* of an existing reproducible bootstrap
 (guix's own Full-Source Bootstrap, live-bootstrap), built **first**, as the foundation
-the corpus/user-PM rests on. Track: `plan/tracks/source-bootstrap.md`.
+the corpus/user-PM rests on.
 
 The build engine it targets already exists: `td-builder build` stages inputs and sets
 `NIX_STORE` at the active `store::store_dir()`, so a `TD_STORE_DIR=/td/store` build is
@@ -36,7 +36,7 @@ diff — directive 4), never as a build input. Priority order: (1) no `guix` pro
 user-facing command/build path (`td shell` resolves td-built packages, never `guix
 build`) — DONE for the shell; (2) the `/td/store` source bootstrap replaces the guix
 toolchain seed; (3) the loop's oracle/lowering (`guix build --check`, `guix repl`/`system`)
-retired last. PLAN tracks this; DESIGN §5 carries the detail.
+retired last. DESIGN §5 carries the detail.
 
 ## Prime directives (never violate)
 
@@ -58,9 +58,9 @@ retired last. PLAN tracks this; DESIGN §5 carries the detail.
 5. **PR is the proposal.** One-maintainer project: build the smallest correct
    increment on a branch and open a PR — the human's PR approval is the sign-off
    (DESIGN §4.3). No roadmap entry, written proposal, or pre-approval is needed to
-   start work; build it, then PR it. Keep plan/design notes terse, and surface any
-   weakened gate in the PR (directive 3). `PLAN.md`/§7.1 are a descriptive status
-   index, not a gate.
+   start work; build it, then PR it. Keep design notes terse, and surface any
+   weakened gate in the PR (directive 3). The roadmap (DESIGN §7.1) is a descriptive
+   status index, not a gate.
 6. **Respect the state boundary.** The VM is ephemeral per test (fresh state, wiped on
    reset) — that is *test isolation*, not a ban on persistence *within* a test:
    a guest that reboots mid-test and keeps its placed generations (M10) is legitimate
@@ -167,9 +167,9 @@ blocked per-PR — the accepted velocity trade.
 
 A green behavioral gate is only meaningful once you have SEEN it red. For every new
 assertion, deliberately break the thing it checks and watch the test fail before
-trusting the pass; record the verified-red evidence in your track file. (This
-discipline caught a three-defect false-green that survived M1–M3 — full story in
-`HISTORY.md`.)
+trusting the pass; record the verified-red evidence in your commit message (and the
+PR body). (This discipline caught a three-defect false-green that survived M1–M3 —
+full story in `HISTORY.md`.)
 
 ## Differential + durable discipline
 
@@ -209,29 +209,24 @@ A task is done only when ALL hold:
 
 If any are missing, the task is not done.
 
-## Parallel work (tracks, worktrees, merge on green)
+## Parallel work (worktrees, merge on green)
 
-Multiple agents work this repo concurrently. The unit of work is a **track**
-(DESIGN §7.1 lists them; `PLAN.md` is the status index).
+Multiple agents work this repo concurrently. The unit of work is a **branch + draft
+PR**. There is no claim file and no generated status index — *the open-PR list is the
+record of who is working on what*, and all working notes live in the git log + PR
+body. DESIGN §7.1's roadmap stays as a descriptive list of workstreams, not a claim
+ledger.
 
-- **Claim** exactly one track: add (or edit) its record `plan/tracks/<track>.md` with
-  `status: claimed` + your handle + date, run `tools/plan-index.sh` to regenerate
-  PLAN.md's table, and commit BOTH as the FIRST commit on your track branch, then open
-  a **draft PR** (main is branch-protected; nothing lands directly). The record is your
-  OWN file, so concurrent claims never collide on a shared PLAN.md line (the gates-split
-  win, applied to PLAN.md); the `plan-index` gate fails the loop if PLAN.md ever drifts
-  from the records, so flip `status:` to `done`/`closed` (and re-run the renderer) when
-  you land — a merged track can't keep reading "claimed". Handles must be
-  **session-unique** — a model name alone collides when two instances run. Generate
-  one at session start and reuse it for all claims and notes:
-  `echo "claude-fable-$(od -An -N3 -tx1 /dev/urandom | tr -d ' ')"` (e.g.
-  `claude-fable-9af31c`). One agent per track; if a record is claimed and fresh, pick
-  another track. Release the claim when you land or stop (close the PR if
-  abandoning). Claim status = the records on main (PLAN.md is generated from them) plus
-  the open PRs' claim edits.
-- **Work in your own git worktree/branch** (`git worktree add ../td-<track>`), never
-  on a shared checkout of main. Keep running notes, sub-task ladder, and verified-red
-  evidence in `plan/<track>.md` — never edit another track's file.
+- **Claim by opening a draft PR.** Before starting, scan the open PRs
+  (`gh pr list`) so two agents don't pick the same work; if one is already open for it,
+  pick something else. Open your **draft PR** early (main is branch-protected; nothing
+  lands directly) — that draft, with a title naming the workstream, IS your claim.
+  Release it by closing the PR if you abandon the work.
+- **Work in your own git worktree/branch** (`git worktree add ../td-<name>`), never on
+  a shared checkout of main. Your running notes, sub-task ladder, and verified-red
+  evidence go in your **commit messages and the PR body** — never in a tracked file. Do
+  not create files to track or claim work; tracking and claiming are the open PRs, full
+  stop.
 - **Land (optimistic merge on green, via PR):** main is **non-strict** (DESIGN
   §7.2, human 2026-06-19) — a PR merges on **its own** green checks; main moving
   under you no longer forces a rebase-onto-tip + re-run. So: (1) validate against
@@ -245,14 +240,15 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
   the required hosted gate and a human review approves (main is branch-protected:
   required checks + mandatory review, no direct pushes —
   `.github/BRANCH-PROTECTION.md`); (3) merge once green and approved — default to
-  arming auto-merge (`gh pr merge --auto --squash`, or `--rebase`) so the human's
+  arming auto-merge (`gh pr merge --auto --squash`; squash is the only merge mode
+  enabled) so the human's
   approval is the last manual step; merge manually instead when the landing must
   be sequenced (e.g. exclusive landings stacked behind another PR).
   **Do NOT rebase-onto-tip + re-run just because main moved** — that is the toil
   we deliberately dropped. Rebase only when GitHub reports a real git conflict
   (or for an exclusive-landing sequence). The rare broken combination
   (green(A)+green(B) ≠ green(A∪B)) is healed by an agent, not a bot:
-  **whenever you fetch main — to start a track or to land — check its latest
+  **whenever you fetch main — to start work or to land — check its latest
   `check-fast`; if it is red, run `ci/revert-suspect.sh --open-pr` to open a
   revert PR for the suspect squash commit (main's HEAD) before continuing.**
   Squash makes the suspect atomic; the script's loop guard refuses to revert a
@@ -268,7 +264,7 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
   full `./check.sh` stays the dev-machine gate (step 1).
 - **Exclusive landings:** changes to the shared spine — `system/td.scm` (frozen
   oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
-  everyone. Announce in your track file, land as small standalone PRs, expect
+  everyone. Announce in the PR description, land as small standalone PRs, expect
   others to rebase. Oracle re-baselines and channel bumps are the canonical cases.
   Note: **adding a gate is no longer an exclusive landing** — it's a new
   `mk/gates/<NNN>-<name>.mk` file, not a `Makefile` edit, so concurrent gate PRs
@@ -279,8 +275,8 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
 
 ## Workflow
 
-1. Claim a track (its `plan/tracks/<track>.md` record + `tools/plan-index.sh`); read
-   its `plan/<track>.md` notes and its DESIGN §7.1 acceptance test.
+1. Claim your work by opening a draft PR (after scanning open PRs to avoid a
+   collision); read the relevant DESIGN §7.1 acceptance test.
 2. Before writing implementation, state the sub-task and write (or name) the test that
    will verify it.
 3. Make the smallest change that turns that test green; verify red first.
@@ -296,9 +292,7 @@ Multiple agents work this repo concurrently. The unit of work is a **track**
    conventions respected — and address its findings BEFORE opening the PR or marking
    it ready. This single PR-level review is the one required agent review; it
    PRECEDES, never replaces, the human's PR review (DESIGN §4.3).
-7. Land per the protocol when the track's acceptance test is green. Flip your
-   `plan/tracks/<track>.md` record to `status: done` and re-run
-   `tools/plan-index.sh` as part of landing (the `plan-index` gate enforces it).
+7. Land per the protocol when the acceptance test is green.
 
 Prefer many small green commits over one large change. If a change spans layers, split
 it.
@@ -336,11 +330,10 @@ it.
   deliberately (exclusive landing), never silently.
 - `DESIGN.md` — the settled contract: loop, target, invariants, roadmap (§7.1),
   parallel-work rules (§7.2–7.4).
-- `PLAN.md` — track status index (one line per track), GENERATED from the
-  `plan/tracks/<track>.md` records by `tools/plan-index.sh` (don't hand-edit between its
-  markers; the `plan-index` gate enforces sync). `plan/tracks/<track>.md` — one track's
-  status record (the claim source of truth). `plan/<track>.md` — per-track working
-  notes, single writer. `M10-design.md` — the M10 design note.
+- Work tracking: there is **no `PLAN.md` and no per-PR tracking/claim files** — claims
+  are the open draft PRs (`gh pr list`), and work notes + verified-red evidence live in
+  commit messages + the PR body (the squash merge preserves the commit messages in
+  `git log`). `M10-design.md` — the M10 design note.
 - `td-builder affected-checks` (`builder/src/affected.rs`) — diff-to-check
   dispatcher for local iteration and PR readiness. Run it first to see the selected
   checks, then `td-builder affected-checks --run` to execute them. Its waiver line
@@ -379,4 +372,11 @@ it.
   large change. The full branch is reviewed once by an independent code-review
   subagent before the PR goes up — not per commit (Workflow step 6). Land on
   main only via the §7.2 protocol (rebase → affected-checks waiver or full escalation
-  → PR → CI green + human approval → rebase/squash-merge).
+  → PR → CI green + human approval → squash-merge).
+- **Commit messages ARE the durable record.** main takes only squash merges (merge and
+  rebase merges are disabled), and the repo composes the squash commit's body from your
+  branch's commit messages, not the PR description (`squash_merge_commit_message =
+  COMMIT_MESSAGES`). So put the rationale, the design decisions, and the verified-red
+  evidence in your commit messages — that is what lands in `git log` on main. The PR
+  body is review context for the human and does NOT persist into git; don't rely on it
+  to record anything you want to keep.

@@ -6,7 +6,7 @@
 # (system/td.scm) — rust-store-native track. Durable legs: supply-chain (sha==pin),
 # provenance (zero /gnu/store), structural (interp -> /td/store, interned content-addressed).
 # The /td/store-RUNTIME leg is PENDING the gcc lane's glibc-final (rust needs GLIBC_2.17; the
-# /td/store glibc is 2.16.0). See plan/rust-store-native.md.
+# /td/store glibc is 2.16.0).
 HEAVY_GATES += rust-store-native
 rust-store-native:
 	@echo ">> rust-store-native: relink the upstream Rust 1.96.0 toolchain to /td/store (td's own ELF rewriter, no patchelf), intern guix-free; interp -> /td/store, zero /gnu/store; runtime leg pending glibc-final"

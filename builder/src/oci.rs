@@ -1,6 +1,6 @@
 //! oci.rs — td-native, zero-dep, DETERMINISTIC docker-archive (OCI image) writer.
 //!
-//! This is brick 1 of the system-image-native track (plan/system-image-native.md):
+//! This is brick 1 of the system-image-native track:
 //! begin retiring the LAST Guile build lowering, `guix system image -t docker` /
 //! `(gnu system image)`. The package build path is already Guile-free (the
 //! build-recipe rail); this module is the foundation for constructing the OCI/disk

@@ -15,7 +15,7 @@
 # authoritative build AND the publisher of the signed substitute. Trust = the ed25519
 # signature (pinned key) + the input-addressed NAME (the lock-computed StorePath); the
 # toolchain is not byte-reproducible, so repro-equality is NOT the trust basis here
-# (that is task 3). See plan/toolchain-subst-default.md.
+# (that is task 3).
 #
 # Usage:   tools/resolve-toolchain.sh LOCK NAME DEST
 #   LOCK   the toolchain's pinned input set (tests/td-toolchain.lock) — derives the key

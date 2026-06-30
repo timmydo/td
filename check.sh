@@ -13,7 +13,7 @@
 #   ./check.sh            # full loop: eval -> build(--check) -> boot test
 #   ./check.sh eval       # a single Makefile target inside the same sandbox
 #   TD_CHECK_FULL=1 ./check.sh   # force-full: bypass all memoized --check
-#                                # verdicts (plan/check-memo.md constraint 4 —
+#                                # verdicts (check-memo constraint 4 —
 #                                # REQUIRED for oracle re-baselines and any
 #                                # suspected nondeterminism)
 #
@@ -84,7 +84,7 @@ if [ "$hostcommit" != "$pinned" ]; then
   exit 1
 fi
 
-# --- check-memo: environment identity + force-full knob (plan/check-memo.md) --
+# --- check-memo: environment identity + force-full knob --
 # The --check verdict-memoization helper (tests/check-memo.sh) may green a
 # reproducibility leg only on a verdict recorded in the SAME environment
 # (constraint 2). That identity is computed HERE, on the host — the -C
@@ -205,7 +205,7 @@ done
 # rung runs here, including `rootless` (its nested unprivileged userns builder now
 # nests cleanly thanks to the PID-ns parity) and the loop self-tests. `guix shell`
 # (no -C) still PROVISIONS the toolchain profile — td replaces the CONTAINER, not
-# guix's profile machinery. See plan/loop-sandbox.md.
+# guix's profile machinery.
 tb=$(guix build -L . -e '(@ (system td-builder) td-builder)')/bin/td-builder
 [ -x "$tb" ] || { echo "check.sh: FATAL: could not build td-builder for the loop sandbox." >&2; exit 1; }
 # The packages guix shell -C would put on PATH, provisioned as a profile (no

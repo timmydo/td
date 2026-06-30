@@ -9,7 +9,7 @@
 # the toolchain's non-byte-reproducible rebuilds (cc1 stamp, ar/install mtimes), where
 # `store-add-recursive`'s content-addressed path VARIES build-to-build. That stable key is
 # the prereq for td-subst chain-caching: a consumer computes the path from this lock and
-# fetches it instead of the ~90-min rebuild. See plan/toolchain-input-addressed.md.
+# fetches it instead of the ~90-min rebuild.
 #
 # The `input`/`patch` pins MIRROR seed/sources/*.lock + seed/patches/*; the
 # toolchain-input-addressed gate asserts they stay in SYNC (a wrong pin is caught). Bump

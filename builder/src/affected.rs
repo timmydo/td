@@ -1013,11 +1013,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("PLAN.md|plan/tracks/*|tools/plan-index.sh", p) {
-        sel.add_preflight("plan-index");
-        return;
-    }
-
     if p == "tests/heal-revert.sh" {
         // CI-lint-only test of the heal primitive — git is absent from the loop
         // sandbox, so it is not a ./check.sh gate; shell-syntax suffices locally.
@@ -1059,7 +1054,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("*.md|plan/*|HISTORY.md|DESIGN.md|CLAUDE.md|DIGESTS.md|.gitignore", p) {
+    if pattern_matches("*.md|HISTORY.md|DESIGN.md|CLAUDE.md|DIGESTS.md|.gitignore", p) {
         return; // docs — no checks
     }
 
@@ -1089,7 +1084,6 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
             Some("  bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh")
         }
         "cargo-test" => Some("  cargo test --manifest-path builder/Cargo.toml"),
-        "plan-index" => Some("  tools/plan-index.sh --check"),
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
     }
@@ -1475,7 +1469,6 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             "bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
         ),
         "cargo-test" => run_shell(root, "cargo test --manifest-path builder/Cargo.toml"),
-        "plan-index" => run_command(root, "tools/plan-index.sh", &["--check".to_string()]),
         // The dispatcher's own self-test — run IN-PROCESS (the shell oracle is gone,
         // and this binary IS the dispatcher), so no `td-builder` re-resolution.
         "affected-self-test" => {

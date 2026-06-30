@@ -100,8 +100,7 @@ cannot be sealed, so tmpfs-root and verity are one move, not two.
 
 ## Still open — answer each when its rung needs it, with a test
 - Unprivileged build (user-namespace guix-daemon vs. building inside the container
-  we already use): deferred to the `rootless-builder` side-track —
-  `plan/rootless-builder.md` owns the question now.
+  we already use): deferred to the `rootless-builder` side-track.
 
 ## Milestone ladder (all landed — records in `HISTORY.md`)
 - [x] **M10.1** — build a reproducible bootc-style td image (the generation bundle), AND

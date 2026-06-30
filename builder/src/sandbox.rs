@@ -1,6 +1,6 @@
 //! The S3 build sandbox: execute a parsed `.drv` in a fresh user namespace,
 //! replicating the pinned daemon's guest-visible contract (read off
-//! nix/libstore/build.cc and recorded in plan/td-builder.md Q4):
+//! nix/libstore/build.cc):
 //!   - namespaces: NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS. NEWNET makes the
 //!     build offline by construction; NEWPID (in the same unshare as NEWUSER, so
 //!     the PID ns is owned by the new user ns) forks the builder to PID 1 of its

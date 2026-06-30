@@ -11,8 +11,7 @@
 # <component>` → /td/store/<key-digest>-<component>), STABLE across the toolchain's
 # non-byte-reproducible rebuilds (where store-add-recursive's content-addressed path varies) —
 # the prereq for td-subst chain-caching so a consumer (rust compile/userland rungs 3/4) FETCHES
-# the x86_64 toolchain instead of the ~90-min from-seed rebuild. See plan/toolchain-input-addressed.md
-# (the i686 parallel, #204) and plan/td-subst.md (#207).
+# the x86_64 toolchain instead of the ~90-min from-seed rebuild.
 #
 # The `input`/`patch` pins MIRROR seed/sources/*.lock + seed/patches/* (identical to the i686
 # lock — same sources); the toolchain-x86_64-input-addressed gate asserts they stay in SYNC and

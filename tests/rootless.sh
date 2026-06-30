@@ -8,7 +8,7 @@
 # so it is race-free even against a second concurrent check (DESIGN §7.3). The
 # two daemon-coordinated fixes are blocked for a non-root client (big-lock is
 # 0600 root; a live `.backup` cannot write the root-owned WAL -shm, R8); building
-# from the closure sidesteps both (plan/rootless-snapshot-race.md). Then re-enters
+# from the closure sidesteps both. Then re-enters
 # itself under `unshare -m -U -r` for the inner phase.
 #
 # Inner phase (--inner): builds a writable view of the store at the SAME path
@@ -58,7 +58,7 @@ if [ "${1-}" != "--inner" ]; then
   # So instead `td-builder store-register` SCANS each closure path (real NAR hash
   # + refs, in pure Rust) and writes ValidPaths/Refs/DerivationOutputs from the
   # fixed path list + path CONTENTS — it never reads the live DB, so a concurrent
-  # bulk-writer has nothing to tear (plan/rootless-snapshot-race.md). img_out is
+  # bulk-writer has nothing to tear. img_out is
   # the artifact (deriver img_drv), so the validity guard + the `--check` oracle
   # (td's NAR hash == the daemon's recorded hash, proven by the store-register
   # gate) hold; img_drv is a closure member, registered once (the deriver-in-

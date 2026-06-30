@@ -7,7 +7,7 @@
 # reader — no guix process), the same cheap static runner store-ns.sh uses; it gives a real
 # multi-entry package (bash + sh). This gate proves the ASSEMBLY + own-root execution; the
 # guix-FREE /td/store-NATIVE userland the toolchain builds (bootstrap-hello-userland #192 /
-# gcc-14 #197) joins this SAME mechanism — see plan/store-native-userspace.md. The
+# gcc-14 #197) joins this SAME mechanism. The
 # profile --store-native logical-vs-physical link behaviour is unit-tested in builder/src.
 #
 # Legs:

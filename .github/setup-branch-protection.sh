@@ -23,7 +23,7 @@
 #     moving no longer re-arms a rebase + full re-run. The rare broken
 #     combination (green(A)+green(B) ≠ green(A∪B)) is caught after the fact and
 #     reverted by the next agent as a duty (DESIGN §7.2; ci/revert-suspect.sh);
-#   - linear history (rebase/squash merges only — matches the repo's
+#   - linear history (squash merges only — matches the repo's
 #     fast-forward convention; squash is also what makes the heal's revert a
 #     single unambiguous commit);
 #   - no force pushes, no branch deletion.
@@ -40,17 +40,23 @@ set -eu
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 checks='{"context": "lint"}, {"context": "check-fast"}'
 
-# Prefer rebase/squash merges; merge commits would break the linear-history
-# rule below. allow_auto_merge is required by the default landing flow
-# (`gh pr merge --auto --squash`, including an agent's revert PR) — codify it
-# here rather than relying on a manual UI toggle.
+# Squash is the ONLY merge mode; merge and rebase merges would break linear
+# history (and rebase merges drop the per-commit messages that are now the
+# durable record — CLAUDE.md "Commits"). The squash commit's body is composed
+# from the branch's commit messages, not the PR description
+# (squash_merge_commit_message=COMMIT_MESSAGES); its title is the lone commit's
+# subject or the PR title (COMMIT_OR_PR_TITLE). allow_auto_merge is required by
+# the default landing flow (`gh pr merge --auto --squash`, including an agent's
+# revert PR) — codify it here rather than relying on a manual UI toggle.
 gh api -X PATCH "repos/$repo" \
   -F allow_merge_commit=false \
-  -F allow_rebase_merge=true \
+  -F allow_rebase_merge=false \
   -F allow_squash_merge=true \
+  -F squash_merge_commit_title=COMMIT_OR_PR_TITLE \
+  -F squash_merge_commit_message=COMMIT_MESSAGES \
   -F allow_auto_merge=true \
   -F delete_branch_on_merge=true >/dev/null
-echo "repo merge settings: rebase/squash only, auto-merge on, auto-delete merged branches"
+echo "repo merge settings: squash only (commit body = branch commit messages), auto-merge on, auto-delete merged branches"
 
 # Replace any previous version of the ruleset (idempotent re-runs).
 existing=$(gh api "repos/$repo/rulesets" -q '.[] | select(.name == "protect-main") | .id' | head -n1 || true)
@@ -81,7 +87,7 @@ gh api -X "$method" "$path" --input - <<EOF >/dev/null
         "require_code_owner_review": false,
         "require_last_push_approval": false,
         "required_review_thread_resolution": false,
-        "allowed_merge_methods": ["rebase", "squash"]
+        "allowed_merge_methods": ["squash"]
       }
     },
     {

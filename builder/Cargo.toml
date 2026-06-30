@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 # S1 is the toolchain probe: no dependencies, so the crate compiles OFFLINE in
 # the check.sh sandbox with nothing fetched. Dependencies arrive later (S2+) and
-# must be free crates vendored through the pinned channel (FSDG — plan/td-builder.md).
+# must be free crates vendored through the pinned channel (FSDG).
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

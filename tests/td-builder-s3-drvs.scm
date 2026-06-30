@@ -1,5 +1,5 @@
 ;; tests/td-builder-s3-drvs.scm — S3 drvs + oracle facts for the td-builder
-;; rung's build differential (plan/td-builder.md S3). Emits, for the Makefile
+;; rung's build differential (S3). Emits, for the Makefile
 ;; recipe to parse:
 ;;
 ;;   DIFF_DRV=...      the differential drv file (deterministic output)

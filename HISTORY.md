@@ -1,8 +1,8 @@
 # HISTORY.md — completed-milestone record
 
-The permanent record of finished milestones, moved out of `PLAN.md` (2026-06-10) so
+The permanent record of finished milestones, moved out of the roadmap (2026-06-10) so
 the working files stay small. Nothing here is open work: scope is governed by the
-roadmap (`DESIGN.md` §7.1), status by `PLAN.md`. Recorded digests live in
+roadmap (`DESIGN.md` §7.1), status by the open PRs. Recorded digests live in
 `DIGESTS.md`.
 
 All milestones below are GREEN with a verified-red differential on record (we've seen
@@ -219,7 +219,6 @@ round on 2026-06-10.
     root.img/recorded state), S4 variant A (rollback act skipped → boot 2 is gen-2
     again: all three gen-1 identity asserts + both persistence asserts FAIL) and
     variant B (gen-2's menuentry vandalized in-guest → "menu still lists BOTH" FAILs).
-    Full evidence in `plan/m10.md`.
 
 - [x] **M11 — verified generations** (`rollback` rung grown to 36 asserts across
   THREE boots; landed 2026-06-11). The DESIGN §7.1 acceptance: a generation's root
@@ -274,7 +273,7 @@ round on 2026-06-10.
     roothashes → exactly the two cmdline asserts), menu tampers V1–V3, the
     unsealed variant H (exactly the 12 sealing asserts across both boots),
     generation-diff (d) read-only-drop, variant I (corruption neutralized →
-    exactly the fail-closed assert). Full evidence in `plan/m11.md`.
+    exactly the fail-closed assert).
 
 ## Key lessons (full narrative — condensed normative versions live in CLAUDE.md)
 

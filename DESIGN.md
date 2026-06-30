@@ -8,13 +8,13 @@ This document is the settled contract the agents work against. It pins the three
 things an agent can't decide for itself — **the loop it runs to check its work**,
 **the target it's aiming at**, and **the scope it may work without sign-off** (the
 §7.1 roadmap). Everything else the agents may propose and iterate on. Section numbers
-are stable anchors; `CLAUDE.md` and `PLAN.md` reference them, so keep them.
+are stable anchors; `CLAUDE.md` references them, so keep them.
 
 It states the north star and the standing decisions — **not the history**: how we got
 here lives in `HISTORY.md` and git, and milestone narration does not belong in this
 file. To stay DRY, each volatile fact lives in exactly one place and everything else
-points at it: the gate list in the `mk/gates/*.mk` fragments, claim status in
-`PLAN.md`, completed milestones in `HISTORY.md`. `CLAUDE.md` mirrors only the stable
+points at it: the gate list in the `mk/gates/*.mk` fragments, claim status in the open
+draft PRs, completed milestones in `HISTORY.md`. `CLAUDE.md` mirrors only the stable
 contract (§1, §3, §7.2–7.3). If two statements disagree anyway, **the later-dated
 decision governs**; reconcile the older text on sight.
 
@@ -84,7 +84,7 @@ nested unprivileged builder nests cleanly given td's PID-namespace parity).
 The harness is **fully ephemeral per test**: boot from a fresh image, wipe all
 writable state on reset. That is test isolation, not a ban on persistence *within* a
 test (§2.6, §3). The CoW reset (QEMU `qcow2` overlay) is in place and asserted by
-the `reset` rung (landed 2026-06-10; measurements in `plan/loop-latency.md`).
+the `reset` rung (landed 2026-06-10).
 
 ---
 
@@ -121,9 +121,8 @@ acceptance test. An agent does far better climbing a ladder of green bars than h
 a monolith in context. (Parallel side-tracks alongside the mainline are governed by
 §7.)
 
-The live ladder — mainline M10.3 → M11 → M12 plus the side-tracks — is §7.1, with
-per-track detail under `plan/`. Climbed rungs (v0/M1 through M10.2) are recorded in
-`HISTORY.md`.
+The live ladder — mainline M10.3 → M11 → M12 plus the side-tracks — is §7.1.
+Climbed rungs (v0/M1 through M10.2) are recorded in `HISTORY.md`.
 
 ### 2.5 Replacement order and the oracle for each swap
 
@@ -247,7 +246,7 @@ lesson is that vehicle choice can sink a milestone):
   next podman. A plain detached ed25519 signature (signify/minisign-style, or
   guile-gcrypt's ed25519 — already a build dependency of
   `system/td-generation.scm`) over the manifest digest fits the offline loop.
-  The track file states the probe criterion up front, M8-style — offline-
+  The PR states the probe criterion up front, M8-style — offline-
   buildable from the pinned channel, sane derivation count — before any
   vehicle is adopted.
 - **Registry: a static layout, not a product.** The OCI distribution API is
@@ -261,9 +260,9 @@ lesson is that vehicle choice can sink a milestone):
   validly signed* generation is re-placeable by design — manual rollback is
   the model (M10), so freshness/epoch enforcement is explicitly not a goal.
   Written down so it isn't invented ad hoc mid-track.
-- **Named open question for the track file:** key distribution — how the
+- **Named open question (carry it in the PR):** key distribution — how the
   target gets the verifying public key (placer flag, well-known path on
-  `td-state`, baked into the placer build). Decide in `plan/m12.md` when the
+  `td-state`, baked into the placer build). Decide when the
   track starts; it does not block the convention above.
 
 ---
@@ -342,7 +341,7 @@ Standing posture decisions; naming them prevents surprises.
   (pure-Rust, in-process inside td-builder's sandbox), ambient I/O removed and
   clock/randomness neutered, with lowering builtins (corpus lookup, store-path
   dependency capture) as Rust native functions. Evaluator rationale (boa vs
-  javy) and the hermetic-eval design: `plan/ts-frontend.md`.
+  javy) and the hermetic-eval design.
 - **Rust toolchain** *(decided 2026-06-11; seed tarball 2026-06-20)*. Rust is the
   approved vehicle for td-builder (§7.1). Building the rustc/gcc toolchain *from
   source* is not required — but it is part of the **seed** that the North Star
@@ -377,7 +376,7 @@ Standing posture decisions; naming them prevents surprises.
     guix bytes — in strings or in provenance. This is the FOUNDATION, built **first**,
     before the user-PM/corpus layering rests on it. It is a *port* of an existing,
     reproducible bootstrap (guix's own Full-Source Bootstrap, live-bootstrap), not
-    research. Track: `plan/tracks/source-bootstrap.md` (the staged brick ladder).
+    research.
     The build engine it targets — `td-builder build` staging inputs + `NIX_STORE` at
     the active `store::store_dir()` (`/td/store`), so a `/td/store` build is *native*,
     re-hashed and rewrite-free — already exists (user-pm Phase 1/3, `TD_STORE_DIR`).
@@ -389,8 +388,7 @@ Standing posture decisions; naming them prevents surprises.
     operational (`grep /gnu/store`) vs provenance tests, and the per-artifact
     status of the daily-suite captured set (busybox/make guix-byte-free via
     td-fetch + the `/td/store` toolchain, dynamic vs the shared `/td/store` glibc;
-    td-builder on upstream rust) — is written up in
-    [`plan/provenance.md`](plan/provenance.md).
+    td-builder on upstream rust) — is detailed in §5.1 below.
 
   Phase 1 (`ts-frontend`, §7.1) replaces the spec *language* and keeps reading
   the pinned corpus underneath; corpus replacement is Phase 2, separately gated
@@ -418,6 +416,98 @@ Standing posture decisions; naming them prevents surprises.
   motivating case). Inside the loop, substitutes stay disabled and builds stay
   offline — that rung is untouched. Revisit trust-agnostic substitution
   (decentralized build attestation) much later.
+
+### 5.1 Provenance model — what "off guix" means for td artifacts
+
+The North Star ("remove guix entirely — no guix *process* AND no guix *bytes*")
+is two separate claims, and the distinction is subtle and was repeatedly
+re-derived; this subsection is the reference.
+
+**Two independent properties.** An artifact can satisfy one without the other:
+
+1. **No guix process** — nothing on the running/target machine invokes `guix` (no
+   `guix build`, no `guix-daemon`, no guix on `PATH`). About the *machine*, not the
+   bytes.
+2. **No guix bytes** — no byte in the artifact originated from guix: not guix-built
+   machine code, not a `/gnu/store` string, not a guix-compiled library statically
+   linked in. About *provenance*, traced through the build.
+
+The daily-suite-on-a-guix-less-VM goal needs **(1) on the VM** unconditionally.
+**(2)** is the stronger, "retire guix last" goal, pursued per-artifact where feasible.
+
+**What contributes bytes to an artifact (and what does not).** When you build a
+binary, only some inputs leave bytes in the result:
+
+- **Source code** → compiled in. Provenance = where the source came from.
+- **The compiler** (`gcc`/`rustc`) → its code generation *is* the binary's machine
+  code; its bundled runtime (`libgcc`, rust `std`) is linked in.
+- **The C library** → for a *static* link, `libc.a`/`libm.a` bytes are copied in; for
+  a dynamic link, only an interpreter path + `NEEDED` names (the `/gnu/store` strings
+  that betray guix provenance).
+- **Build-driver tools** (`make`, `sed`, `coreutils`, `bash` running
+  `configure`/recipes) → **leave no bytes in the output.** They orchestrate the build;
+  their own provenance is irrelevant to the artifact's. You can drive a guix-byte-free
+  build with guix's own `make`/`sed` and the *output* is still guix-byte-free.
+
+The practical consequence: to make an artifact guix-byte-free you control its
+**source, compiler, and libc** — not the tools that drive the build.
+
+**Two tests.**
+
+- **Operational (cheap, necessary):** `grep -c /gnu/store <artifact>` is `0`. Catches
+  the obvious leak (dynamic interpreters, baked store paths). A guix-built static
+  `bash` fails this — it embeds 11 `/gnu/store` strings (measured).
+- **Provenance (strong, sufficient):** every byte traces to {upstream source} ∪ {td's
+  own from-source toolchain}. Established by *how it was built*, not by grepping: built
+  from a td-fetch-pinned source with the `/td/store` toolchain ⇒ guix-byte-free by
+  construction.
+
+**The `/td/store` toolchain is what makes C artifacts guix-byte-free.** td's
+from-source bootstrap (hex0 → mes → tcc → gcc-mesboot → gcc 14.3.0 → glibc 2.41,
+binutils 2.44; x86_64 cross) produces a C toolchain at `/td/store` whose own
+provenance is a tiny auditable seed — no guix bytes. Compiling C with `/td/store` gcc
++ linking `/td/store` glibc is therefore guix-byte-free at the source. (The
+`bootstrap-*-store-native` recipes build it; there is no persistent `/td/store`
+artifact today — it is rebuilt from the seed, which is why a guix-byte-free capture
+must stand one up.)
+
+**Provenance of the captured set (daily-suite harness).** The harness binds three
+binaries — dynamically linked against the shared `/td/store` glibc 2.41 (interp +
+RUNPATH → `/td/store`, no `/gnu/store`) — into a sandbox that mounts `/td/store`
+(`host-sandbox --store-from /td/store --no-daemon`), `/gnu/store` absent. Same model
+as the `rust-store-native` gate, which already runs `rustc` dynamically from
+`/td/store`.
+
+| binary | language | source | compiler | libc (dynamic, from `/td/store`) | guix bytes? |
+|--------|----------|--------|----------|------|-------------|
+| busybox | C | upstream (td-fetch, sha-pinned) | `/td/store` gcc | `/td/store` glibc 2.41 (shared) | **none** |
+| make | C | upstream (td-fetch, sha-pinned) | `/td/store` gcc | `/td/store` glibc 2.41 (shared) | **none** |
+| td-builder | Rust | in-tree `builder/` | upstream rustc relinked to `/td/store` (`elf.rs`) | `/td/store` glibc 2.41 (shared) | none of guix; rust = upstream |
+
+- **busybox / make** reach full provenance-purity: upstream source + td's own
+  toolchain.
+- **td-builder** is Rust. The rust toolchain is **upstream** (the released rust
+  binaries — *not* guix-compiled rust; any `rustup` toolchain builds it). The
+  `rust-store-native` track td-fetches the upstream tarball (sha-pinned, no guix) and
+  relinks it to `/td/store` with td's own ELF interp rewriter (`builder/src/elf.rs`,
+  no patchelf), then runs `rustc`/`cargo` from `/td/store` in an own-root with
+  `/gnu/store` absent. Caveats: (a) `tests/td-builder-rust.lock` still points
+  td-builder's *build* at the guix-placed rust — switching it to the `/td/store`
+  relinked rust is `rust-store-native` rung 3 (*compiling* with it; *running* it is
+  already proven); (b) the rust bytes are an upstream *binary*, not from-source —
+  from-source rust provenance is out of scope for now, but it is upstream, not guix.
+- The **build-driver** tools that run the `configure` + recipes may be guix's (they
+  leave no bytes in the output).
+
+**Why guix appears in the capture today (and the retarget).** The current
+`tools/build-static-*.sh` use guix on the *capture host* for convenience (`guix build
+-S <pkg>` for sources, the guix `gcc-toolchain` + `glibc:static` to compile) — so the
+*output* carries guix glibc bytes — fine for "no guix process on the VM", **not** "no
+guix bytes". The retarget removes guix from the capture: **sources** → `td-fetch`
+upstream tarballs pinned in `seed/sources/*.lock`; **compiler + libc** → the
+`/td/store` gcc + the shared `/td/store` glibc 2.41 (dynamic link). guix then touches
+the capture only if you *choose* it as a build-driver; nothing it provides ends up in
+the shipped binaries.
 
 ---
 
@@ -447,7 +537,7 @@ annotated.
 - **Decoupling image from slot** (§2.7): one image placeable in any slot, root chosen
   at place time; not needed by M12.
 - **M12 key distribution** (§2.7): how the target gets the verifying public key —
-  decide in `plan/m12.md` when the track starts.
+  decide when the track starts.
 - **Build admission scheduler — "kubernetes-lite"** *(wanted next; human 2026-06-28)*.
   The per-build resource cap landed (`build-resource-caps`: opt-in `TD_BUILD_MEM_MAX`
   → a `setrlimit(RLIMIT_DATA)` backstop + a delegated-cgroup `memory.max` RSS cap on
@@ -471,8 +561,8 @@ validate their own work, with the human's gate being the per-PR review (§4.3).
 
 A running list of in-flight and planned work, kept for coordination — **not** a
 prerequisite. You may build something that isn't listed here; the PR review is the
-approval (§4.3). Status lives in `PLAN.md`; per-track working state in
-`plan/<track>.md`. Add or refine entries freely as work evolves.
+approval (§4.3). The live status of in-flight work is the open draft PRs
+(`gh pr list`). Add or refine entries freely as work evolves.
 
 **Mainline** (serial — each builds on the last; one agent drives it at a time):
 
@@ -482,8 +572,7 @@ approval (§4.3). Status lives in `PLAN.md`; per-track working state in
   asserts the older identity. Persistence is asserted per the §2.6 state model, in
   both directions: a declared `td-state` allowlist path written under generation N
   persists into the N−1 boot; an undeclared write does not follow the swap. (§2.6,
-  settled 2026-06-10, governs over older "placed state persists" wording.) Detail:
-  `plan/m10.md`.
+  settled 2026-06-10, governs over older "placed state persists" wording.)
 - **M11 — verified generations.** A generation's root carries build-time integrity
   metadata; booting an intact generation succeeds while a corrupted root fails closed
   (verified-red by corrupting bytes). Mechanism *(settled 2026-06-10)*: **dm-verity
@@ -513,7 +602,7 @@ run concurrently):
 
 - **rootless-builder** — build the target with a rootless user-namespace builder and
   prove daemon-vs-rootless store-path equality (the prime-directive-4 differential;
-  the daemon is the oracle). Deferred from M10.1. `plan/rootless-builder.md`.
+  the daemon is the oracle). Deferred from M10.1.
 - **offline-isolation** — CLOSED 2026-06-11, half delivered / half rescoped (human
   sign-off per §4.3). Delivered: a deliberate undeclared fetch (non-fixed-output
   network access) demonstrably fails, asserted every loop (the `offline` rung,
@@ -521,17 +610,15 @@ run concurrently):
   its substitute set is deferred to the era when td runs its OWN builder daemon
   (rootless-builder and successors) — the shared host daemon is the owner's machine
   state, needed for the host's own (nonguix) maintenance, and is not td's to
-  isolate. The ready-to-resume assertions, evidence, and netns design are archived
-  in `plan/offline-isolation.md`. Standing follow-up from M6.
+  isolate. The ready-to-resume assertions, evidence, and netns design are archived. Standing follow-up from M6.
 - **oci-load** — verify the generation image loads in a foreign OCI runtime without
   breaking the offline loop (podman already rejected at M8; probe cheap vehicles or
-  prove spec conformance structurally). Deferred from M10.1. `plan/oci-load.md`.
+  prove spec conformance structurally). Deferred from M10.1.
 - **loop-latency** — qcow2 overlay / CoW VM reset (§1.5) and other cycle-time wins;
   measured improvement with the loop green and per-test ephemerality intact.
-  `plan/loop-latency.md`.
 - **fhs-app-images** — FHS-style root layout for *app* images (the base stays
   minimal per M9); an FHS app image builds reproducibly and runs on the base host
-  rung. `plan/fhs-app-images.md`.
+  rung.
 - **td-builder** *(approved 2026-06-11 — the first Guix-component replacement,
   under the §2.5 discipline)* — td's own builder: a Rust binary that executes a
   `.drv` in a user-namespace sandbox and registers the output. Acceptance: the
@@ -543,7 +630,7 @@ run concurrently):
   rootless-builder harness (DB snapshot, staged store, validity guards,
   isolation probe) is the rung's skeleton. Vehicle and toolchain posture: §5.
   Follow-on swaps (td-check, evaluator-as-library, loop convergence) are parked
-  in §6 until they earn their own entries. `plan/td-builder.md`.
+  in §6 until they earn their own entries.
 - **ci-gate** *(approved 2026-06-11; re-decided to PR form later that day)* — a
   GitHub Actions runner (hosted, fed by the CI store image —
   `ci/build-ci-image.sh` snapshots the warm build closure, the job imports it)
@@ -556,7 +643,7 @@ run concurrently):
   branch protection blocks its merge. CI only: distribution/CD automation
   waits for M12 and a future entry. The hosted-runner design sidesteps the
   runner-host question (t5700g stays untouched — standing immutable-infra
-  rule); image mechanics and constraints: `plan/ci-gate.md`.
+  rule).
 - **check-memo** *(approved 2026-06-12 — this entry is the §4.3 gate-2
   sign-off: it loosens when an existing assertion runs)* — verdict
   memoization for the `guix build --check` reproducibility legs: skip the
@@ -571,8 +658,7 @@ run concurrently):
   keying, host-local uncommitted verdicts (CI reuse re-opens gate 2),
   bounded TTL, force-full on oracle re-baselines — and the accepted
   detection trade (environment-dependent outputs on unchanged drvs, e.g.
-  the 2026-06-12 hosted-runner readdir-order case) are pinned in
-  `plan/check-memo.md`; changing any of them re-opens gate 2.
+  the 2026-06-12 hosted-runner readdir-order case) are settled; changing any of them re-opens gate 2.
 
 - **ci-image-pipeline** *(approved 2026-06-12)* — a GitHub workflow builds AND
   pushes the CI store image; no human-run commands. Bootstrap a hosted runner
@@ -584,8 +670,7 @@ run concurrently):
   `./check.sh` against it, and only on green retags to `:<pin>`.
   Acceptance: a channel-bump (or rung-addition) PR plus one workflow run
   yields a published `:<pin>` image that a green `check` run consumed, with
-  no command run on a user machine. Design notes: `plan/ci-gate.md`
-  ("pipeline-built CI store image").
+  no command run on a user machine.
   **Policy (human, 2026-06-12), binding repo-wide:** ALL generated artifacts
   are produced on pipelines, never on a user's machine; any exception must be
   documented with explicit human sign-off. (Documented exception under this
@@ -609,7 +694,7 @@ run concurrently):
   randomness) is rejected by the hermetic evaluator (verified-red by a probe
   spec that must fail). Scope is the spec *language* only — corpus replacement
   is Phase 2 (§6), and this track keeps reading the pinned corpus underneath.
-  The curated-global design and the swc/`tsc` build steps: `plan/ts-frontend.md`.
+  The curated-global design and the swc/`tsc` build steps.
 - **corpus-independence** *(approved 2026-06-13 — §4.3 gate-1 roadmap addition,
   graduated from §6; Phase 2 of the §5 move-off-Guile goal, follow-on to
   `ts-frontend`)* — replace the pinned Guix corpus with td's OWN recipes for the
@@ -646,7 +731,7 @@ run concurrently):
   `guile`) + reproducibly (`--check`). Remaining follow-ons: broadening the recipe
   set toward the full target closure (more build systems, packages with inputs), and
   de-Guiling the `.drv` construction itself (the §6 "evaluator as a library", a
-  separate charter). Working state + verified-red log: `plan/corpus-independence.md`.
+  separate charter).
 - **evaluator-as-library** *(approved 2026-06-13 — §4.3 gate-1 roadmap addition,
   graduated from §6; the §5 move-off-Guile goal, follow-on to corpus-independence's
   own-builder increment)* — remove Guile from the `.drv` CONSTRUCTION itself. Today
@@ -667,8 +752,7 @@ run concurrently):
   remain §6 gate-2 items. **DONE 2026-06-13:** the `drv-emit` rung — td-builder
   re-constructs the `td-build` hello `.drv` byte-identical (store path + content) to
   guix's, validated over hundreds of real store drvs; a perturbed recipe is a distinct
-  drv it also matches; verified-red ×2. Working state + verified-red log:
-  `plan/evaluator-as-library.md`.
+  drv it also matches; verified-red ×2.
 - **td-drv-build** *(approved 2026-06-13 — §4.3 gate-1 roadmap addition; the capstone
   of the §5 move-off-Guile arc, follow-on to evaluator-as-library + the own Rust
   builder + td-builder)* — the end-to-end td-driven build: for the `td-build` hello
@@ -685,8 +769,7 @@ run concurrently):
   honestly: input RESOLUTION (which toolchain/source paths are inputs) and the input
   CLOSURE computation stay Guix's, and the daemon still BUILDS the inputs — only the
   TOP derivation (hello) is td-constructed + td-executed; the toolchain is retired
-  last (§5). Reuses the td-builder S3/S4 harness. Working state + verified-red log:
-  `plan/td-drv-build.md`.
+  last (§5). Reuses the td-builder S3/S4 harness.
 - **td-drv-add** *(approved 2026-06-13 — §4.3 gate-1; the §5 move-off-Guile arc,
   follow-on to evaluator-as-library + td-drv-build)* — wire td's constructed `.drv`
   INTO the loop: td-builder constructs the `.drv` (#22) and REGISTERS it in the store
@@ -703,7 +786,6 @@ run concurrently):
   to a working hello (NAR-equality follows from the shared content-addressed path);
   verified-red. Scope: input RESOLUTION (the skeleton) stays Guix's; the daemon is the
   backend.
-  Working state + verified-red log: `plan/td-drv-add.md`.
 - **td-drv-assemble** *(approved 2026-06-13 — §4.3 gate-1; the §5 move-off-Guile arc,
   follow-on to td-drv-add)* — remove the LAST guile `(derivation …)` from the build
   path. Guile RESOLVES the inputs (toolchain + source → store paths — input resolution,
@@ -716,8 +798,7 @@ run concurrently):
   `.drv` is byte-identical to the same recipe lowered through guix's `(derivation …)`
   (the oracle, equal store path ⇒ equal bytes) and `guix build` builds it to a working
   hello; verified-red. So nothing guile CONSTRUCTS the build derivation anymore — only
-  input resolution stays Guix's. Working state + verified-red log:
-  `plan/td-drv-assemble.md`.
+  input resolution stays Guix's.
 - **td-check** *(approved 2026-06-13 — §4.3 **gate-2**, human go-ahead "then the gate-2
   items (td-check oracle, loop sandbox)"; graduated from the backlog stub above)* — td
   OWNS the reproducibility oracle. `td-builder check DRV CLOSURE SCRATCH` executes the
@@ -731,7 +812,6 @@ run concurrently):
   differential a later replacement needs). Scope: input resolution + the closure
   (`guix gc -R`) + the daemon building the INPUTS stay Guix's; only the TOP derivation's
   reproducibility is td's double-build (toolchain retired last, §5).
-  Working state + verified-red log: `plan/td-check.md`.
 - **loop-sandbox** *(approved 2026-06-13 — §4.3 **gate-2**, human go-ahead "then the
   gate-2 items (td-check oracle, loop sandbox)"; graduated from the backlog stub above)*
   — td's OWN sandbox is the **SOLE** loop container: `check.sh` runs the whole loop
@@ -753,7 +833,7 @@ run concurrently):
   oracle). CI runs the unmodified td-sandbox `./check.sh` (the §7.1 ci-gate "fix the
   host, never adapt the loop" policy). Done: #30 (exposure + isolation), #31 (net
   parity), #32/#33 (the swap), then the PID-namespace keystone + carve-out/toggle removal
-  (td is the sole sandbox). Working state + verified-red log: `plan/loop-sandbox.md`.
+  (td is the sole sandbox).
 - **td-store-db** *(approved 2026-06-14 — "what's next" → "Replace the guix-daemon")* —
   begin replacing the **guix-daemon**, the last big reused Guix component on the build
   side (§2.2/§2.5). td-builder already constructs (#22) / executes (#25) / registers via
@@ -823,12 +903,11 @@ run concurrently):
   the DB, add (flat/recursive/referenced), GC (mark + sweep), verify, and back a build output
   end to end — daemon as oracle throughout, never the authority. Next (held by the human until
   the store stack is reconciled): diverge the on-disk format — the differential becomes a
-  correctness check on td's chosen format, not a guix-compat constraint. Working state +
-  verified-red log: `plan/td-store-db.md`.
+  correctness check on td's chosen format, not a guix-compat constraint.
 
 ### 7.2 Landing protocol — merge on green, via PR *(PR gate added 2026-06-11)*
 
-Each agent works one claimed track in its **own git worktree/branch** — never
+Each agent works in its **own git worktree/branch** — never
 directly on a shared checkout of main. Main is branch-protected: no direct
 pushes; every landing is a pull request gated on required CI checks and one
 human approval (`.github/BRANCH-PROTECTION.md` is the setup/operations note).
@@ -842,8 +921,11 @@ To land (**optimistic merge** — main is non-strict since 2026-06-19):
    `td-ci-fast` store image — since #26 CI runs the fast tier ONLY; the full
    loop stays the dev-machine gate in step 1 plus the ci-image pipeline's
    `validate` job);
-3. on green CI and one human approval, squash- or rebase-merge (merge commits
-   disabled — history stays linear).
+3. on green CI and one human approval, **squash-merge** (the only merge mode
+   enabled — merge and rebase merges are off, history stays linear). The squash
+   commit's body is composed from the branch's commit messages, not the PR
+   description (`squash_merge_commit_message = COMMIT_MESSAGES`), so the durable
+   `git log` record is your commit messages — the PR body is review context only.
 
 Main is **non-strict** (`strict_required_status_checks_policy: false`): a PR
 merges on its **own** green checks; **main moving under you no longer forces a
@@ -894,20 +976,17 @@ before landing (§7.3); only the frequent engine case is decoupled here.
 The human approval (here since 2026-06-11) replaced the original "no human merge
 step; review-after on main".
 
-Claims: one agent per track, recorded in the track's own record
-`plan/tracks/<track>.md` (`status: claimed` + handle + date) with PLAN.md's table
-regenerated by `tools/plan-index.sh`, committed as the first commit of the track
-branch and published by opening the PR as a draft — claim status is the records on
-main (PLAN.md is generated from them, enforced by the `plan-index` gate) plus the
-open PRs' claim edits. Per-track records are separate files, so concurrent claims
-never collide on a shared PLAN.md line; generation mechanics live in `CLAUDE.md`
+Claims: open a **draft PR** early — that draft, titled for the workstream, IS the
+claim, and the open-PR list (`gh pr list`) is the record of who is working on what.
+There is no separate claim file and no generated status index; scan the open PRs
+before starting so two agents don't pick the same work. Mechanics live in `CLAUDE.md`
 "Parallel work".
 
 ### 7.3 Exclusive landings
 
 Changes touching the shared spine — `system/td.scm` (the frozen oracle), `check.sh`,
 `Makefile`, `channels.scm`, `DIGESTS.md` — collide with every other agent. Land them
-as small standalone PRs, announced in your track file; everyone else rebases.
+as small standalone PRs, announced in the PR description; everyone else rebases.
 Oracle re-baselines (which rewrite `DIGESTS.md`) and channel-pin bumps are the
 canonical cases. These are coordination rules, not sign-off gates — but remember
 §4.3(2): *weakening* anything in the spine still needs the human.
@@ -919,10 +998,8 @@ don't add a third check or raise `-j`. Stagger landings if loaded.
 
 ### 7.4 Files
 
-`PLAN.md` — status index only, one line per track; GENERATED from the
-`plan/tracks/<track>.md` records by `tools/plan-index.sh` (don't hand-edit between its
-markers — the `plan-index` gate enforces sync, so a merged track cannot keep reading
-"claimed"). `plan/tracks/<track>.md` — one track's status record (the claim source of
-truth; separate files so claims don't collide). `plan/<track>.md` — per-track working
-state, single writer (the claiming agent). `HISTORY.md` — completed-milestone record.
-`DIGESTS.md` — reproducibility record (changes only on re-baseline, exclusive landing).
+Work tracking has no dedicated files: claims are the open draft PRs, and work notes +
+verified-red evidence live in commit messages + the PR body (the squash merge preserves
+the commit messages in `git log`; there is no status-index or claim file). `HISTORY.md`
+— completed-milestone record. `DIGESTS.md` — reproducibility record (changes only on
+re-baseline, exclusive landing).

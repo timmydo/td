@@ -16,7 +16,7 @@
 ;;     DAEMON'S OWN netns — the same netns `guix substitute` queries from. So
 ;;     "only loopback here" asserts the daemon itself is network-isolated and a
 ;;     cold path cannot even query. RED until the host wraps guix-daemon in its
-;;     own netns (plan/offline-isolation.md S3) — and that red is the
+;;     own netns (S3) — and that red is the
 ;;     verified-red for the shared probe body: identical assertions, network
 ;;     present, builder fails.
 ;;

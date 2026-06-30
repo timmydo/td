@@ -1,5 +1,5 @@
 ;; tests/check-memo-drvs.scm — fixture derivations for the `memo` rung
-;; (plan/check-memo.md). Lowers (never builds) three TINY derivations and
+;; Lowers (never builds) three TINY derivations and
 ;; prints their file names:
 ;;
 ;;   DRV_DET=...     deterministic fixture A — the memoization subject

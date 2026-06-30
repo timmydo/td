@@ -1,5 +1,5 @@
-# td-builder S1 toolchain probe + S2 NAR differential (DESIGN §7.1 side-track;
-# plan/td-builder.md). The growing gate of the first Guix-component replacement
+# td-builder S1 toolchain probe + S2 NAR differential (DESIGN §7.1 side-track).
+# The growing gate of the first Guix-component replacement
 # (§2.5 discipline) — each sub-task adds a leg, none is ever removed:
 #   • S1: lower the td-builder package to a drv (`guix build -d -e '(@ (system
 #     td-builder) td-builder)'`), build it offline, `guix build --check` it
@@ -18,11 +18,10 @@
 #     td-builder's own output. This is open question 2 settled by test: the
 #     serialization the eventual builder registers outputs with is bit-for-bit
 #     the daemon's. Verified-red (driven before this leg may land):
-#     ordering/padding defects in nar.rs each red it — evidence in
-#     plan/td-builder.md.
+#     ordering/padding defects in nar.rs each red it.
 #   • S3: BUILD DIFFERENTIAL — td-builder parses the ATerm drv, executes its
 #     builder in a fresh user namespace (uid 30001, staged store rbind, the
-#     daemon's env contract — plan/td-builder.md Q4) and registers the output
+#     daemon's env contract) and registers the output
 #     (v1 record — Q3). Asserted against the daemon, which builds the SAME
 #     deterministic drv (tests/td-builder-s3-drvs.scm): same store path,
 #     NAR hash equal to the daemon's RECORDED hash, NAR size, references set

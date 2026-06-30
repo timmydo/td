@@ -1,6 +1,6 @@
 //! NAR (Nix ARchive) serialization, bit-for-bit compatible with the pinned
 //! daemon / (guix serialization) write-file — the S2 oracle semantics, read
-//! off the pin and recorded in plan/td-builder.md:
+//! off the pin:
 //!   - tokens and contents are framed as u64 little-endian length + bytes,
 //!     zero-padded to the next 8-byte boundary;
 //!   - directory entries are sorted in codepoint order ("." and ".." never

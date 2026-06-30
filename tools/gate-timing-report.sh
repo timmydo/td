@@ -3,7 +3,7 @@
 # events (logged by tools/gate-time.sh) into a per-gate wall-clock table,
 # longest first. Makes latency regressions visible and lets the heavy-gate LPT
 # order (mk/gates/<NNN> filename prefixes) be re-sorted from DATA rather than the
-# hand-run numbers in plan/loop-latency.md (task L1).
+# hand-run numbers (task L1).
 #
 # Pure POSIX sh + coreutils (sort/ls/date): NO bash, NO awk — it leans on nothing
 # beyond what the gate recipes already need. Timestamps are integer nanoseconds

@@ -5,8 +5,7 @@
 //! plain Rust data (`catalog`), and JSON I/O is a tiny hand-rolled module (`json`)
 //! so the crate builds OFFLINE with no external dependencies. The emitted JSON is
 //! the same shape the Guile lowering bridge already consumes from boa, so no bridge
-//! change is needed (the consumer cutover is a tracked follow-up — see
-//! plan/rust-migration.md). See plan/rust-recipe-surface.md.
+//! change is needed (the consumer cutover is a follow-up).
 
 pub mod catalog;
 pub mod json;

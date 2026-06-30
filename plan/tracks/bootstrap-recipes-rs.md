@@ -1,7 +1,0 @@
-section: side
-status: done
-handle: claude-opus-046b70
-date: 2026-06-28
-title: bootstrap-recipes-rs
-notes: plan/bootstrap-recipes-rs.md
-summary: rust-migration C2 (plan/rust-migration.md "C. Scripts -> Rust") — port the tests/bootstrap-*.sh source-bootstrap drivers to STRUCTURED recipes in Rust, in the td-builder engine (builder/src/bootstrap.rs), the way C1 (affected-checks-rs #226) ported tools/affected-checks.sh. Every bootstrap-*.sh has the same leg skeleton (pinned-input -> build -> no-guix -> behavioral -> repro); only build + behavioral are rung-specific. The framework makes the shared legs ONE typed Rust implementation and each rung declares its source pins + build steps + behavioral asserts as a `Recipe` value run by `td-builder bootstrap-recipe <name>`. First slice: the foundational `seed` (brick 0, vendored-byte pins, self-reproducing) and `mes` (brick 2, td-fetched pinned-tarball, build-from-source) rungs — covering both pin kinds and both build shapes. Durable proof: the Rust runner builds the rung + asserts the same all-durable legs as the shell gate (no guix oracle — the seed chain IS the bottom), run as new mk/gates/*-rs.mk gates + a native cargo `#[test]` for the source-free seed. The shell scripts/gates stay the live driver + removable oracle this PR (no cutover — same scoping as #226). Follow-ups: mescc/tcc and the gcc/glibc rungs (each a small Recipe + gate, validated in its heavy gate).

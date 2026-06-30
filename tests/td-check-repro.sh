@@ -22,7 +22,7 @@
 # Exits non-zero (printing the td-builder check output) if td's two builds disagree
 # or the build errors — so a non-reproducible recipe reds the gate, on td's terms.
 #
-# VERDICT MEMOIZATION (plan/fast-check.md; mirrors tests/check-memo.sh, which
+# VERDICT MEMOIZATION (mirrors tests/check-memo.sh, which
 # memoizes `guix build --check`). The td-builder double-build recompiles the recipe
 # from source TWICE every run — the single biggest avoidable cost in the warm inner
 # loop. So: if a FRESH verdict recorded in THIS environment shows this exact DRV
@@ -62,7 +62,7 @@ case "$ttl" in
 esac
 if [ "$ttl" -lt 1 ] || [ "$ttl" -gt 14 ]; then
   echo "td-check-repro: FATAL: TTL ${ttl}d is outside 1..14 — loosening the verdict" >&2
-  echo "  TTL beyond 14 days re-opens gate 2 (plan/check-memo.md constraint 3)." >&2
+  echo "  TTL beyond 14 days re-opens gate 2 (constraint 3)." >&2
   exit 1
 fi
 vdir=${TD_TDCHECK_VERDICTS:-.td-check-verdicts}

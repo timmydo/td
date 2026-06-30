@@ -11,7 +11,7 @@
 #   boot 3, overlay B : the reset under test — fresh overlay, same backing image,
 #                       state MUST be pristine (dirt gone).
 # Dirt lives on the persistent root fs, so the overlay swap is what makes it
-# vanish. All legs DURABLE (no Guix oracle). Verified-red: see plan/ts-frontend.md.
+# vanish. All legs DURABLE (no Guix oracle).
 set -eu
 
 IMAGE="${1:?usage: reset-native.sh NONVOLATILE-QCOW2}"

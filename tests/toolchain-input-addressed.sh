@@ -7,7 +7,7 @@
 # toolchain-key tests/td-toolchain.lock` (a hash of the toolchain's DECLARED inputs), so
 # the path is a pure function of the inputs — identical across non-reproducible rebuilds
 # and computable from the lock BEFORE fetching. That stable key is the prereq for td-subst
-# chain-caching (2b/2c). See plan/toolchain-input-addressed.md.
+# chain-caching (2b/2c).
 #
 # Legs (ALL DURABLE — no guix oracle in any; this is td-native addressing end to end):
 #   [pinned-sync]   td-toolchain.lock's input/patch pins match seed/sources + seed/patches

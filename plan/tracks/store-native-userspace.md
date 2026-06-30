@@ -1,7 +1,0 @@
-section: side
-status: claimed
-handle: claude-opus-5cd532
-date: 2026-06-27
-title: store-native-userspace
-notes: plan/store-native-userspace.md
-summary: The .scm-free USERSPACE ASSEMBLY layer (human-directed 2026-06-27, the "until glibc-final" lane). Build a usable userspace WITHOUT the guix operating-system (system/td.scm): `td-builder profile` unions /td/store-native tools into a symlink-tree profile, run in a `store-ns` own-root with /gnu/store ABSENT — the td-native replacement the rust userland (and any /td/store userland) slots into. Unblocked by glibc-final: it uses the /td/store-NATIVE C userland the gcc agent's GCC 14.3.0 already produces (C binaries run on the existing /td/store glibc 2.16.0), so it advances the off-.scm goal NOW while the rust runtime waits ([[td-rust-store-native-track]] rung 4 is this, with rust tools added once glibc-final lands). Non-colliding: consumes the gcc lane's toolchain output, new gate + a `td-builder profile --store-native` mode, no edit to system/td.scm / check.sh / Makefile / the gcc lane's scripts. Inc 1 (DONE): `profile --store-native` makes the symlink TARGETS logical /td/store paths (read physical, link logical) so the profile resolves in the own-root — unit-tested, + fixed a latent collision-check bug (exists() followed dangling logical links). Next: the heavy gate — the /td/store toolchain compiles ≥2 small programs, `profile --store-native` unions them, store-ns runs the profile/bin tools together → /gnu/store absent. Ladder in plan/store-native-userspace.md.

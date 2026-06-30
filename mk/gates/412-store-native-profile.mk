@@ -2,7 +2,7 @@
 # LOGICAL /td/store symlinks that RESOLVE + RUN inside a store-ns own-root with /gnu/store
 # ABSENT: the .scm-free userspace ASSEMBLY mechanism (no guix operating-system). The tool is
 # bash-static (the cheap store-ns runner pattern); the guix-FREE /td/store-native userland the
-# toolchain builds (#192/#197) joins this same mechanism. See plan/store-native-userspace.md.
+# toolchain builds (#192/#197) joins this same mechanism.
 # Heavy: builds the guix-free stage0 td-builder + runs a rootless userns (like store-ns 386).
 HEAVY_GATES += store-native-profile
 store-native-profile:
