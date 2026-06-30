@@ -64,12 +64,15 @@ done
 cache="`pwd`/.td-build-cache/td-shell-userland-pkgs"; rm -rf "$cache"; mkdir -p "$cache/tmp"
 
 # td shell, run with guix/Guile OFF PATH (env -i + scrubbed PATH ⇒ no guix process). The crate
-# closure is provisioned from TD_SHELL_VENDOR_ROOT.
+# closure is provisioned from TD_SHELL_VENDOR_ROOT. The store DB used to stage the toolchain
+# seed closure is left to run_shell's own default (TD_SHELL_STORE_DB) — that seed-staging read
+# is the existing product surface (retired by the unpacked seed store), so this gate does not
+# re-spell it and grow the guix-db census (directive 8).
 tdshell() {
   env -i HOME="$cache" TMPDIR="$cache/tmp" PATH="$SCRUB" \
     TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
     TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
-    TD_SHELL_LOCKS=tests TD_SHELL_STORE_DB=/var/guix/db/db.sqlite \
+    TD_SHELL_LOCKS=tests \
     TD_SHELL_CACHE="$cache" TD_SHELL_VENDOR_ROOT="$VENDOR_ROOT" \
     "$TB" shell "$@"
 }
