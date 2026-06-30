@@ -79,8 +79,8 @@ build_binutils_x86_64() {
   rm -rf "$out"; mkdir -p "$out"
   xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
   csh=`command -v bash 2>/dev/null || command -v sh`
-  wb=`mktemp -d`/wb; mkdir -p "$wb"; _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc"
-  tb=`mktemp -d`/tb; _xbin "$tb"
+  wb=/tmp/td-x86_64-wrapper; rm -rf "$wb"; mkdir -p "$wb"; _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc"
+  tb=/tmp/td-x86_64-tools; rm -rf "$tb"; _xbin "$tb"   # FIXED path (gcc14-repro): $tb leaks into fixincl's baked SED path (.rodata) — a per-build mktemp made fixincl differ build-to-build
   src=`mktemp -d`/binutils; mkdir -p "$src"
   "$xzb" -dc "$BU244_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "binutils-2.44 unpack failed" >&2; return 1; }
   ( cd "$src"; bp="$bu_i686/bin:$tb:$cpath"
@@ -107,7 +107,10 @@ build_gcc_x86_64_stage1() {
   rm -rf "$out"; mkdir -p "$out"
   xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
   csh=`command -v bash 2>/dev/null || command -v sh`
-  wb=`mktemp -d`/wb; mkdir -p "$wb"
+  # FIXED path (gcc14-repro): the host-wrapper dir $wb is $(LINKER) in gcc's `checksum-options`, which
+  # genchecksum hashes into the cc1/cc1plus executable_checksum (.rodata) — a per-build mktemp made that
+  # 16-byte MD5 differ build-to-build (the residual non-determinism strip can't scrub). Fixed /tmp path.
+  wb=/tmp/td-x86_64-wrapper; rm -rf "$wb"; mkdir -p "$wb"
   # REPRODUCIBILITY (gcc14-repro): a deterministic -frandom-seed for the HOST compiler building cc1/
   # cc1plus/fixincl. gcc's get_file_function_name (tree.cc) names file-scope static initializers
   # `<src>_<crc32>_<random_seed>`; with -frandom-seed UNSET gcc reads /dev/urandom (toplev.cc) → those
@@ -116,7 +119,7 @@ build_gcc_x86_64_stage1() {
   # value: the per-TU `<src>` prefix keeps the symbols unique across TUs (no ODR clash); LTO is off.
   # Also pins local_tick -> -1 (deterministic DWARF timestamps). Bonus: stage1 reproducible too.
   _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc" -frandom-seed=tdgcc14repro; _mk_static_wrapper "$gcc14" "$gst" g++ "$wb/cxx" -frandom-seed=tdgcc14repro
-  tb=`mktemp -d`/tb; _xbin "$tb"
+  tb=/tmp/td-x86_64-tools; rm -rf "$tb"; _xbin "$tb"   # FIXED path (gcc14-repro): $tb leaks into fixincl's baked SED path (.rodata) — a per-build mktemp made fixincl differ build-to-build
   # REPRODUCIBILITY (gcc14-repro): a FIXED source/build dir, NOT a per-build mktemp, so the absolute
   # build path baked into cc1/cc1plus/fixincl (.symtab STT_FILE + __FILE__ in .rodata — NOT DWARF, so
   # `strip --strip-debug` does NOT scrub it) is deterministic build-to-build. A FIXED ABSOLUTE /tmp path
@@ -164,8 +167,8 @@ build_glibc_x86_64() {
   rm -rf "$out"; mkdir -p "$out"
   xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
   csh=`command -v bash 2>/dev/null || command -v sh`
-  bwb=`mktemp -d`/bwb; mkdir -p "$bwb"; _mk_static_wrapper "$gcc14" "$gst" gcc "$bwb/cc"   # i686 BUILD_CC
-  tb=`mktemp -d`/tb; _xbin "$tb"
+  bwb=/tmp/td-x86_64-bwrapper; rm -rf "$bwb"; mkdir -p "$bwb"; _mk_static_wrapper "$gcc14" "$gst" gcc "$bwb/cc"   # i686 BUILD_CC (FIXED path, gcc14-repro)
+  tb=/tmp/td-x86_64-tools; rm -rf "$tb"; _xbin "$tb"   # FIXED path (gcc14-repro): $tb leaks into fixincl's baked SED path (.rodata) — a per-build mktemp made fixincl differ build-to-build
   xgccbin="$xgcc1/stage/td/store/gcc-14.3.0-x86_64/bin"
   src=`mktemp -d`/glibc; mkdir -p "$src"
   "$xzb" -dc "$GLIBC241_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "glibc-2.41 unpack failed" >&2; return 1; }
@@ -213,7 +216,10 @@ build_gcc_x86_64_stage2() {
   rm -rf "$out"; mkdir -p "$out"
   xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
   csh=`command -v bash 2>/dev/null || command -v sh`
-  wb=`mktemp -d`/wb; mkdir -p "$wb"
+  # FIXED path (gcc14-repro): the host-wrapper dir $wb is $(LINKER) in gcc's `checksum-options`, which
+  # genchecksum hashes into the cc1/cc1plus executable_checksum (.rodata) — a per-build mktemp made that
+  # 16-byte MD5 differ build-to-build (the residual non-determinism strip can't scrub). Fixed /tmp path.
+  wb=/tmp/td-x86_64-wrapper; rm -rf "$wb"; mkdir -p "$wb"
   # REPRODUCIBILITY (gcc14-repro): a deterministic -frandom-seed for the HOST compiler building cc1/
   # cc1plus/fixincl. gcc's get_file_function_name (tree.cc) names file-scope static initializers
   # `<src>_<crc32>_<random_seed>`; with -frandom-seed UNSET gcc reads /dev/urandom (toplev.cc) → those
@@ -222,7 +228,7 @@ build_gcc_x86_64_stage2() {
   # value: the per-TU `<src>` prefix keeps the symbols unique across TUs (no ODR clash); LTO is off.
   # Also pins local_tick -> -1 (deterministic DWARF timestamps). Bonus: stage1 reproducible too.
   _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc" -frandom-seed=tdgcc14repro; _mk_static_wrapper "$gcc14" "$gst" g++ "$wb/cxx" -frandom-seed=tdgcc14repro
-  tb=`mktemp -d`/tb; _xbin "$tb"
+  tb=/tmp/td-x86_64-tools; rm -rf "$tb"; _xbin "$tb"   # FIXED path (gcc14-repro): $tb leaks into fixincl's baked SED path (.rodata) — a per-build mktemp made fixincl differ build-to-build
   # REPRODUCIBILITY (gcc14-repro): a FIXED source/build dir, NOT a per-build mktemp, so the absolute
   # build path baked into cc1/cc1plus/fixincl (.symtab STT_FILE + __FILE__ in .rodata — NOT DWARF, so
   # `strip --strip-debug` does NOT scrub it) is deterministic build-to-build. A FIXED ABSOLUTE /tmp path
