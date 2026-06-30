@@ -43,9 +43,31 @@ _xbin() {
 # reaches it → `fatal error: stdlib.h`. -idirafter appends after ALL standard dirs, so #include_next
 # resolves. (build_gcc_14 sidestepped this with --with-build-sysroot; a self-contained wrapper can't.)
 _mk_static_wrapper() {
-  g14=$1; gst=$2; which=$3; dst=$4; csh=`command -v bash 2>/dev/null || command -v sh`
-  printf '#!%s\nexec "%s/bin/%s" -static -idirafter %s/include -B%s/lib "$@"\n' "$csh" "$g14" "$which" "$gst" "$gst" > "$dst"
+  g14=$1; gst=$2; which=$3; dst=$4; extra=${5:-}; csh=`command -v bash 2>/dev/null || command -v sh`
+  printf '#!%s\nexec "%s/bin/%s" -static -idirafter %s/include -B%s/lib %s "$@"\n' "$csh" "$g14" "$which" "$gst" "$gst" "$extra" > "$dst"
   chmod 0555 "$dst"
+}
+
+# _x86_stable_tooldir <xbu> — REPRODUCIBILITY (gcc14-repro / [[toolchain-repro]]). Stage the cross
+# binutils' x86_64 as/ld at a FIXED, deterministic path so the cross gcc bakes a STABLE
+# DEFAULT_ASSEMBLER/DEFAULT_LINKER. `--with-as`/`--with-ld` are AC_DEFINE'd into gcc/gcc.cc and live
+# in the gcc DRIVER binary's `.rodata` (find_a_program: `access(DEFAULT_ASSEMBLER, X_OK)==0`), NOT in
+# DWARF — so repro_normalize_tree's `--strip-debug` can NOT scrub them. Pointing them at the per-build
+# mktemp $xbu (the old code) made the driver differ byte-for-byte every build. The baked path is DEAD
+# at runtime (the access() guard + #225's tooldir bundle resolve as/ld relative to argv[0]); it only
+# has to (1) satisfy access(X_OK) at BUILD time and (2) be the SAME string build-to-build. A fixed-name
+# dir of symlinks to the live $xbu as/ld does both. The dir is a FIXED ABSOLUTE /tmp path (NOT
+# $ROOT-relative), so the baked DEFAULT_ASSEMBLER string is identical for EVERY builder regardless of
+# where the worktree is checked out — checkout-independent, like guix's /tmp/guix-build-* dirs. The
+# loop's host-sandbox gives each run a private tmpfs /tmp (builder/src/sandbox.rs), so the fixed name is
+# isolated per run and vanishes on teardown. Echoes the stable dir.
+_x86_stable_tooldir() {
+  _xbu=$1
+  _d="/tmp/td-x86_64-with-as"
+  mkdir -p "$_d"
+  ln -sf "$_xbu/bin/$XTARGET-as" "$_d/$XTARGET-as"
+  ln -sf "$_xbu/bin/$XTARGET-ld" "$_d/$XTARGET-ld"
+  echo "$_d"
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -86,21 +108,37 @@ build_gcc_x86_64_stage1() {
   xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
   csh=`command -v bash 2>/dev/null || command -v sh`
   wb=`mktemp -d`/wb; mkdir -p "$wb"
-  _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc"; _mk_static_wrapper "$gcc14" "$gst" g++ "$wb/cxx"
+  # REPRODUCIBILITY (gcc14-repro): a deterministic -frandom-seed for the HOST compiler building cc1/
+  # cc1plus/fixincl. gcc's get_file_function_name (tree.cc) names file-scope static initializers
+  # `<src>_<crc32>_<random_seed>`; with -frandom-seed UNSET gcc reads /dev/urandom (toplev.cc) → those
+  # symbols (kept in .symtab past `strip --strip-debug`) differ build-to-build. gcc's own bootstrap
+  # passes -frandom-seed=$@; --disable-bootstrap skips that, so we pin it here. SAFE as a single fixed
+  # value: the per-TU `<src>` prefix keeps the symbols unique across TUs (no ODR clash); LTO is off.
+  # Also pins local_tick -> -1 (deterministic DWARF timestamps). Bonus: stage1 reproducible too.
+  _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc" -frandom-seed=tdgcc14repro; _mk_static_wrapper "$gcc14" "$gst" g++ "$wb/cxx" -frandom-seed=tdgcc14repro
   tb=`mktemp -d`/tb; _xbin "$tb"
-  src=`mktemp -d`/gcc; mkdir -p "$src"
+  # REPRODUCIBILITY (gcc14-repro): a FIXED source/build dir, NOT a per-build mktemp, so the absolute
+  # build path baked into cc1/cc1plus/fixincl (.symtab STT_FILE + __FILE__ in .rodata — NOT DWARF, so
+  # `strip --strip-debug` does NOT scrub it) is deterministic build-to-build. A FIXED ABSOLUTE /tmp path
+  # (NOT $ROOT-relative) so the baked build path is identical for EVERY builder regardless of checkout
+  # location — checkout-independent, like guix's /tmp/guix-build-* dir. The host-sandbox gives each run a
+  # private tmpfs /tmp, so the fixed name is isolated per run and vanishes on teardown (no worktree-disk
+  # leak). Two independent cross-gcc builds (the repro leg) then differ only in DWARF (stripped) + archive
+  # mtimes (-D) → byte-identical after normalization. rm'd fresh each call; sequential rungs never overlap.
+  src="/tmp/td-x86_64-gcc14-src"; rm -rf "$src"; mkdir -p "$src"
   "$xzb" -dc "$GCC14_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "gcc-14.3.0 unpack failed" >&2; return 1; }
   "$xzb" -dc "$GMP63_TB" | tar -xf - -C "$src" || { echo "gmp unpack failed" >&2; return 1; }
   "$xzb" -dc "$MPFR421_TB" | tar -xf - -C "$src" || { echo "mpfr unpack failed" >&2; return 1; }
   tar -xzf "$MPC131_TB" -C "$src" || { echo "mpc unpack failed" >&2; return 1; }
   ( cd "$src" && ln -sf gmp-6.3.0 gmp && ln -sf mpfr-4.2.1 mpfr && ln -sf mpc-1.3.1 mpc ) || return 1
+  wadir=`_x86_stable_tooldir "$xbu"`   # deterministic --with-as/--with-ld (gcc14-repro)
   ( cd "$src"; bp="$xbu/bin:$bu_i686/bin:$tb:$cpath"
     for f in `grep -rl '^#! */bin/sh' . 2>/dev/null`; do sed -i "1s,^#! *[^ ]*/bin/sh,#!$csh," "$f" 2>/dev/null || true; done
     rm -rf bld; mkdir bld; cd bld
     env PATH="$bp" CONFIG_SHELL="$csh" CC="$wb/cc" CXX="$wb/cxx" CPP="$wb/cc -E" CC_FOR_BUILD="$wb/cc" CXX_FOR_BUILD="$wb/cxx" \
         "$csh" ../configure --build=i686-pc-linux-gnu --host=i686-pc-linux-gnu --target=$XTARGET \
         --prefix=/td/store/gcc-14.3.0-x86_64 --with-sysroot="$sysroot" \
-        --with-as="$xbu/bin/$XTARGET-as" --with-ld="$xbu/bin/$XTARGET-ld" \
+        --with-as="$wadir/$XTARGET-as" --with-ld="$wadir/$XTARGET-ld" \
         --enable-languages=c --without-headers --with-newlib --with-glibc-version=2.41 \
         --disable-bootstrap --disable-multilib --disable-shared --disable-threads \
         --disable-libssp --disable-libgomp --disable-libquadmath --disable-libatomic \
@@ -176,21 +214,37 @@ build_gcc_x86_64_stage2() {
   xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
   csh=`command -v bash 2>/dev/null || command -v sh`
   wb=`mktemp -d`/wb; mkdir -p "$wb"
-  _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc"; _mk_static_wrapper "$gcc14" "$gst" g++ "$wb/cxx"
+  # REPRODUCIBILITY (gcc14-repro): a deterministic -frandom-seed for the HOST compiler building cc1/
+  # cc1plus/fixincl. gcc's get_file_function_name (tree.cc) names file-scope static initializers
+  # `<src>_<crc32>_<random_seed>`; with -frandom-seed UNSET gcc reads /dev/urandom (toplev.cc) → those
+  # symbols (kept in .symtab past `strip --strip-debug`) differ build-to-build. gcc's own bootstrap
+  # passes -frandom-seed=$@; --disable-bootstrap skips that, so we pin it here. SAFE as a single fixed
+  # value: the per-TU `<src>` prefix keeps the symbols unique across TUs (no ODR clash); LTO is off.
+  # Also pins local_tick -> -1 (deterministic DWARF timestamps). Bonus: stage1 reproducible too.
+  _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc" -frandom-seed=tdgcc14repro; _mk_static_wrapper "$gcc14" "$gst" g++ "$wb/cxx" -frandom-seed=tdgcc14repro
   tb=`mktemp -d`/tb; _xbin "$tb"
-  src=`mktemp -d`/gcc; mkdir -p "$src"
+  # REPRODUCIBILITY (gcc14-repro): a FIXED source/build dir, NOT a per-build mktemp, so the absolute
+  # build path baked into cc1/cc1plus/fixincl (.symtab STT_FILE + __FILE__ in .rodata — NOT DWARF, so
+  # `strip --strip-debug` does NOT scrub it) is deterministic build-to-build. A FIXED ABSOLUTE /tmp path
+  # (NOT $ROOT-relative) so the baked build path is identical for EVERY builder regardless of checkout
+  # location — checkout-independent, like guix's /tmp/guix-build-* dir. The host-sandbox gives each run a
+  # private tmpfs /tmp, so the fixed name is isolated per run and vanishes on teardown (no worktree-disk
+  # leak). Two independent cross-gcc builds (the repro leg) then differ only in DWARF (stripped) + archive
+  # mtimes (-D) → byte-identical after normalization. rm'd fresh each call; sequential rungs never overlap.
+  src="/tmp/td-x86_64-gcc14-src"; rm -rf "$src"; mkdir -p "$src"
   "$xzb" -dc "$GCC14_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "gcc-14.3.0 unpack failed" >&2; return 1; }
   "$xzb" -dc "$GMP63_TB" | tar -xf - -C "$src" || { echo "gmp unpack failed" >&2; return 1; }
   "$xzb" -dc "$MPFR421_TB" | tar -xf - -C "$src" || { echo "mpfr unpack failed" >&2; return 1; }
   tar -xzf "$MPC131_TB" -C "$src" || { echo "mpc unpack failed" >&2; return 1; }
   ( cd "$src" && ln -sf gmp-6.3.0 gmp && ln -sf mpfr-4.2.1 mpfr && ln -sf mpc-1.3.1 mpc ) || return 1
+  wadir=`_x86_stable_tooldir "$xbu"`   # deterministic --with-as/--with-ld (gcc14-repro)
   ( cd "$src"; bp="$xbu/bin:$bu_i686/bin:$tb:$cpath"
     for f in `grep -rl '^#! */bin/sh' . 2>/dev/null`; do sed -i "1s,^#! *[^ ]*/bin/sh,#!$csh," "$f" 2>/dev/null || true; done
     rm -rf bld; mkdir bld; cd bld
     env PATH="$bp" CONFIG_SHELL="$csh" CC="$wb/cc" CXX="$wb/cxx" CPP="$wb/cc -E" CC_FOR_BUILD="$wb/cc" CXX_FOR_BUILD="$wb/cxx" \
         "$csh" ../configure --build=i686-pc-linux-gnu --host=i686-pc-linux-gnu --target=$XTARGET \
         --prefix=/td/store/gcc-14.3.0-x86_64 --with-sysroot="$sysroot" \
-        --with-as="$xbu/bin/$XTARGET-as" --with-ld="$xbu/bin/$XTARGET-ld" \
+        --with-as="$wadir/$XTARGET-as" --with-ld="$wadir/$XTARGET-ld" \
         --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-c99 --with-glibc-version=2.41 \
         --disable-bootstrap --disable-multilib --disable-libssp --disable-libgomp \
         --disable-libquadmath --disable-libvtv --disable-libitm --disable-libcc1 \
@@ -220,7 +274,13 @@ run_x86_64_cross() {
   # across runs, with a STABLE sysroot, so glibc/stage2 iterations skip ~20 min. The from-seed GATE
   # leaves it UNSET → every rung builds fresh in $work (directive 1).
   rc="${X86_RUNG_CACHE:-}"
-  if [ -n "$rc" ]; then sysroot="$rc/x-sysroot"; else sysroot="$work/sysroot"; fi
+  # REPRODUCIBILITY (gcc14-repro): a FIXED sysroot path even off the dev cache, so the cross gcc bakes
+  # a STABLE --with-sysroot (TARGET_SYSTEM_ROOT in the driver .rodata) + a stable include-fixed (gcc
+  # copies fixed system headers referencing the sysroot path) — a per-build mktemp $work/sysroot made
+  # the cross gcc differ build-to-build in bytes strip can't scrub. The gate path is a FIXED ABSOLUTE
+  # /tmp dir (NOT $ROOT-relative) so the baked sysroot string is checkout-independent (private tmpfs /tmp
+  # per sandbox-run; vanishes on teardown). rm'd fresh below each run.
+  if [ -n "$rc" ]; then sysroot="$rc/x-sysroot"; else sysroot="/tmp/td-x86_64-sysroot"; fi
   rm -rf "$sysroot"; mkdir -p "$sysroot/usr/include"
   tar -xzf "$kh" -C "$sysroot/usr/include" || { echo "x86_64 kernel headers unpack failed" >&2; return 1; }
 
@@ -282,7 +342,7 @@ run_x86_64_cross() {
   test "$cpprc" = 42 || { echo "x86_64 C++ program returned $cpprc (want 42)" >&2; return 1; }
   echo "PASS-HARNESS-CROSS: x86_64 C ($crc) + C++ ($cpprc) built by the cross gcc 14.3.0, ELF64, interp=$ci, run via the /td/store x86_64 glibc 2.41 loader"
   # leave $work in place for the caller to inspect / intern
-  X86_WORK="$work"; export X86_WORK XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU
+  X86_WORK="$work"; X86_SYSROOT="$sysroot"; export X86_WORK X86_SYSROOT XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -376,4 +436,93 @@ verify_x86_64_ownroot() {
   echo "$snoia" | grep -q '^IARC=42$' || { printf '%s\n' "$snoia" | sed 's/^/     /' >&2; echo "x86_64 program vs the input-addressed glibc did not return 42 in the own-root" >&2; return 1; }
   echo "   [behavioral/input-addressed] a DYNAMIC x86_64 program whose interp IS the lock-keyed /td/store glibc runs in the own-root → 42 — real x86_64 bytes at a predictable, fetchable path"
 
+}
+
+# ---------------------------------------------------------------------------------------------------
+# x86_64_gcc_repro_leg <cpath> <gcc14> <gst> <bu_i686> <xbu> <sysroot> <treeA>
+#   DURABLE intrinsic double-build reproducibility (gcc14-repro / [[toolchain-repro]]) for the cross
+#   gcc 14.3.0 — the assertion that retires nothing when guix leaves (no guix oracle in the room).
+#   <treeA> is the freshly-built cross gcc stage2 tree (already `x86_64_bundle_tooldir`'d), NOT yet
+#   normalized. This:
+#     1. records treeA's RAW nar-hash, then NORMALIZES treeA in place (repro_normalize_tree: strip the
+#        build-path-bearing DWARF + deterministic archives + drop *.la) so the caller interns the
+#        REPRODUCIBLE bytes;
+#     2. builds a SECOND, independent stage2 (fresh build dir; same fixed `--with-as`/`--with-ld`/
+#        `--with-sysroot` STRINGS, but an INDEPENDENT binutils PATH — see below), bundles its tooldir,
+#        records its RAW hash, normalizes it;
+#     3. LOGS RAW(A) vs RAW(B) (observed self-discrimination, NOT a hard assert): the gcc build dir
+#        leaks into DWARF so the raw builds normally differ, which shows the normalization below is
+#        load-bearing — but a raw-identical build is a happy surprise, not a failure, so it is not asserted;
+#     4. asserts NORM(A) == NORM(B) — the cross gcc is BYTE-REPRODUCIBLE: a stable, fetchable artifact.
+#   strip = the cross binutils `$XTARGET-strip` (static i686; its x86-family BFD strips BOTH the i686
+#   host driver/cc1 ELFs AND the x86_64 target libgcc archives), run natively (no loader wrapper).
+#   Build B is configured against an INDEPENDENT binutils PATH (a cheap `cp` of $xbu to a fresh dir,
+#   identical bytes) so that `--with-as`/`--with-ld` WOULD differ between A and B without the fixed
+#   _x86_stable_tooldir path — i.e. reverting the fix REDS this leg (verified-red), and a green here is
+#   a real cross-run reproducibility result, not a vacuous same-inputs rebuild. (--with-sysroot is
+#   pinned upstream in run_x86_64_cross to a fixed path; both builds use the same $sysroot string.)
+x86_64_gcc_repro_leg() {
+  _cpath=$1; _gcc14=$2; _gst=$3; _bu=$4; _xbu=$5; _sysroot=$6; _treeA=$7
+  _out2=""; _xbu2=""
+  # Clean up build B's scratch on EVERY exit path (its gcc tree + binutils copy can be GBs, and /tmp is
+  # a RAM-backed tmpfs), and re-point the shared tooldir symlinks at the live build-A binutils so build
+  # B's (now-deleted) $_xbu2 leaves no dangling links behind.
+  _repro_cleanup() {
+    [ -n "$_out2" ] && rm -rf "${_out2%/*}" 2>/dev/null
+    [ -n "$_xbu2" ] && rm -rf "${_xbu2%/*}" 2>/dev/null
+    _x86_stable_tooldir "$_xbu" >/dev/null 2>&1 || true
+    return 0
+  }
+  _strip="$_xbu/bin/$XTARGET-strip"
+  test -x "$_strip" || { echo "repro: no cross strip ($_strip)" >&2; return 1; }
+  _rawA=`"$TB" nar-hash "$_treeA"` || { echo "repro: nar-hash (raw) of build A failed" >&2; return 1; }
+  repro_normalize_tree "$_treeA" "$_strip" || { echo "repro: normalization of build A failed" >&2; return 1; }
+  _normA=`"$TB" nar-hash "$_treeA"` || { echo "repro: nar-hash (normalized) of build A failed" >&2; return 1; }
+  echo "   [repro] cross gcc 14.3.0 build A: raw nar-hash $_rawA → normalized $_normA"
+  # An INDEPENDENT binutils path for build B (identical bytes, different absolute path): without the
+  # deterministic --with-as fix this alone makes the two gcc drivers diverge.
+  _xbu2=`mktemp -d`/xbinutils2
+  cp -a "$_xbu" "$_xbu2" || { echo "repro: could not stage an independent binutils path for build B" >&2; _repro_cleanup; return 1; }
+  _out2=`mktemp -d`/gcc2-repro
+  echo ">> [repro] second, independent cross gcc 14.3.0 stage2 build (fresh build dir + INDEPENDENT binutils path)"
+  build_gcc_x86_64_stage2 "$_cpath" "$_gcc14" "$_gst" "$_bu" "$_xbu2" "$_sysroot" "$_out2" \
+    || { echo "repro: the second cross gcc stage2 build did not run" >&2; _repro_cleanup; return 1; }
+  _treeB="$_out2/stage/td/store/gcc-14.3.0-x86_64"
+  x86_64_bundle_tooldir "$_treeB" || { echo "repro: bundle_tooldir on build B failed" >&2; _repro_cleanup; return 1; }
+  _rawB=`"$TB" nar-hash "$_treeB"` || { echo "repro: nar-hash (raw) of build B failed" >&2; _repro_cleanup; return 1; }
+  repro_normalize_tree "$_treeB" "$_strip" || { echo "repro: normalization of build B failed" >&2; _repro_cleanup; return 1; }
+  _normB=`"$TB" nar-hash "$_treeB"` || { echo "repro: nar-hash (normalized) of build B failed" >&2; _repro_cleanup; return 1; }
+  # Observed self-discrimination (logged, not asserted — a raw-reproducible build would be a happy
+  # surprise, not a failure): the RAW builds differ because the gcc build dir leaks into DWARF, so the
+  # normalization below is load-bearing. NORM(A)==NORM(B) is NOT vacuous: if strip were a no-op AND the
+  # raw builds differ, the normalized hashes would still differ → the assertion would red.
+  if [ "$_rawA" != "$_rawB" ]; then
+    echo "   [repro/self-discrimination] the RAW double-build DIFFERS ($_rawA != $_rawB) — the build dir leaks into DWARF, so normalization is load-bearing"
+  else
+    echo "   [repro] note: the RAW double-build was already byte-identical ($_rawA) — the build is reproducible even pre-normalization"
+  fi
+  if [ "$_normA" != "$_normB" ]; then
+    echo "repro: cross gcc 14.3.0 is NOT byte-reproducible — normalized buildA=$_normA buildB=$_normB" >&2
+    # Diagnostic (only on failure): which files still differ after normalization? (no diffutils in the
+    # sandbox → compare per-file sha256 via sort|uniq -u). The differing relative paths point at the
+    # residual non-determinism to fix (e.g. an install-tools config / include-fixed text leak).
+    ( cd "$_treeA" && find . -type f -exec sha256sum {} + 2>/dev/null | sort ) > "$ROOT/.td-build-cache/_gcc14repro-A.list" 2>/dev/null || true
+    ( cd "$_treeB" && find . -type f -exec sha256sum {} + 2>/dev/null | sort ) > "$ROOT/.td-build-cache/_gcc14repro-B.list" 2>/dev/null || true
+    echo "repro: files differing after normalization (sha256 + path, each appears once per build):" >&2
+    sort "$ROOT/.td-build-cache/_gcc14repro-A.list" "$ROOT/.td-build-cache/_gcc14repro-B.list" | uniq -u | sed 's/^/     /' >&2 || true
+    # Preserve the differing binaries from BOTH builds so the residual non-determinism can be diffed
+    # (readelf/cmp) AFTER the run, instead of a blind re-build.
+    _dd="$ROOT/.td-build-cache/_gcc14repro-diff"; rm -rf "$_dd"; mkdir -p "$_dd/A" "$_dd/B"
+    # NOTE: the sandbox has NO awk — extract the path field with sed (sha256sum = "<hash>  <path>").
+    sort "$ROOT/.td-build-cache/_gcc14repro-A.list" "$ROOT/.td-build-cache/_gcc14repro-B.list" | uniq -u | sed 's/^[^ ]*  *//' | sort -u | while read -r _rel; do
+      mkdir -p "$_dd/A/`dirname "$_rel"`" "$_dd/B/`dirname "$_rel"`" 2>/dev/null || true
+      cp -a "$_treeA/$_rel" "$_dd/A/$_rel" 2>/dev/null || true
+      cp -a "$_treeB/$_rel" "$_dd/B/$_rel" 2>/dev/null || true
+    done
+    echo "repro: preserved the differing binaries under $_dd/{A,B} for post-run inspection" >&2
+    _repro_cleanup
+    return 1
+  fi
+  _repro_cleanup
+  echo "   [repro] two independent from-source builds of the cross gcc 14.3.0, normalized, are byte-identical (nar-hash $_normA) — a STABLE input-addressed /td/store artifact (durable: intrinsic double-build reproducibility, no guix oracle)"
 }
