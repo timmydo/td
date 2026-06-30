@@ -1,7 +1,8 @@
 # rust-userland-image (system-image-native + rust-userland). SHIP td's OWN build of the
-# Rust userland (procs/fd/ripgrep/sd/eza/bat) through td's OWN image builder. Today
-# system/td.scm carries the guix `(gnu packages rust-apps)` objects for these — guix-built
-# bytes; this gate proves td can instead ship its OWN build of each tool in a td-NATIVE
+# Rust userland (procs/fd/ripgrep/sd/eza/bat) through td's OWN image builder. The shipped
+# system no longer carries the guix `(gnu packages rust-apps)` objects for these (removed
+# from system/td.scm + system/td-typed.scm, guarded by the no-guix-rust gate); this gate
+# proves td ships its OWN build of each tool in a td-NATIVE
 # OCI image (`td-builder oci-image`, NO `guix system image`, NO guix profile). For each
 # tool td: builds it guix-free (tests/crate-free-build.sh — the same path the rust-<tool>
 # gates assert), computes its runtime closure TD-NATIVELY (td-builder elf-interp/elf-rpath
