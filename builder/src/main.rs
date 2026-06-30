@@ -2578,6 +2578,83 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: compute the GC-reachable CLOSURE of ROOT(s) by CONTENT-SCANNING a
+        // td-owned store — the daemon's scanForReferences (scan.rs) recursed to fixpoint —
+        // with NO store DB and NO guix process. STORE-DIR is a self-contained td-owned store
+        // (e.g. an unpacked seed); its entries are the candidate set (BOUNDED — so a scan
+        // can't pick up store-path strings to unrelated packages the way scanning the whole
+        // live /gnu/store would), and each ROOT's NAR (read from STORE-DIR) is scanned for
+        // the candidates it references, transitively. Output paths are STORE-DIR/<basename>.
+        // This re-derives a closure from the BYTES — the same set `store-closure` walks from
+        // the store DB, computed without any DB. Usage:
+        //   store-closure-scan STORE-DIR ROOT [ROOT...]
+        // Prints the reachable store paths (under STORE-DIR), sorted (ROOTs included).
+        Some("store-closure-scan") if args.len() >= 4 => {
+            let store_dir = &args[2];
+            let roots: Vec<String> = args[3..].to_vec();
+            let run = || -> Result<Vec<String>, String> {
+                // Candidates = the store-path entries under STORE-DIR, keyed by 32-char hash
+                // part. Skip the daemon's `<canonical>.lock` aux files (they share a real
+                // path's hash); dedup by hash keeping the SHORTEST basename (the canonical,
+                // not a `.chroot`/`.check` sibling). A self-contained td store has no live
+                // /gnu/store and no daemon behind it.
+                let mut by_hash: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for entry in std::fs::read_dir(store_dir).map_err(|e| format!("{store_dir}: {e}"))? {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.ends_with(".lock") {
+                        continue;
+                    }
+                    let pre = match name.split('-').next() {
+                        Some(p) if p.len() == 32 => p.to_string(),
+                        _ => continue,
+                    };
+                    match by_hash.get(&pre) {
+                        Some(cur) if cur.len() <= name.len() => {}
+                        _ => {
+                            by_hash.insert(pre, name);
+                        }
+                    }
+                }
+                let candidates: Vec<String> = by_hash
+                    .into_values()
+                    .map(|name| format!("{store_dir}/{name}"))
+                    .collect();
+                // BFS over CONTENT-scanned references to fixpoint: each path's refs found by
+                // NAR-scanning it (scan::Scanner) against the STORE-DIR candidate set. The
+                // scanner matches by 32-char hash, so a canonical /gnu/store reference in the
+                // bytes resolves to the corresponding STORE-DIR/<basename> entry. No store DB.
+                let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                let mut stack = roots;
+                while let Some(p) = stack.pop() {
+                    if !seen.insert(p.clone()) {
+                        continue;
+                    }
+                    let mut s = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+                    nar::write_nar(&mut s, Path::new(&p)).map_err(|e| format!("nar {p}: {e}"))?;
+                    let (_h, _sz, refs) = s.finish();
+                    for r in refs {
+                        if !seen.contains(&r) {
+                            stack.push(r);
+                        }
+                    }
+                }
+                Ok(seen.into_iter().collect())
+            };
+            match run() {
+                Ok(paths) => {
+                    for p in &paths {
+                        println!("{p}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-closure-scan {store_dir}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-store-db: compute the GC-reachable CLOSURE of a path from td's OWN store
         // DB — the daemon's GC "mark" set (`guix gc -R ROOT`), in pure Rust. Reads the
         // DB with td's own reader (`store_db_read`) and walks the Refs graph from ROOT;
@@ -4475,6 +4552,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
             eprintln!("       td-builder store-query DB info|references");
             eprintln!("       td-builder store-closure DB ROOT");
+            eprintln!("       td-builder store-closure-scan STORE-DIR ROOT...");
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-referenced NAME CONTENT-FILE REFS-FILE STORE-DIR OUT-DB");
