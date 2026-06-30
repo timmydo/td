@@ -998,7 +998,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("guix-dependence");
         return;
     }
-    if glob_match("tests/guix-surface.*", p) {
+    // guix-surface.sh + its TWO baselines (guix-surface.expected packager set,
+    // guix-surface-shrink.expected directive-8 set) all route to the gate.
+    if glob_match("tests/guix-surface*", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("guix-surface");
         return;
@@ -1398,6 +1400,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/cmake-demo/CMakeLists.txt", "cmake");
     assert_target!("tests/guix-surface.sh", "guix-surface");
     assert_target!("tests/guix-surface.expected", "guix-surface");
+    assert_target!("tests/guix-surface-shrink.expected", "guix-surface");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
     // the seed tree + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.

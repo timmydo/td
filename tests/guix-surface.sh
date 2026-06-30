@@ -11,7 +11,7 @@
 # this gate forbids from GROWING, so the §5 metric is enforced, not aspirational.
 #
 # It STATICALLY scans the loop's orchestration sources — Makefile, mk/gates/*.mk,
-# tests/*.sh (minus itself) — for that invocation form, classifies the resolved
+# tests/*.sh, ci/*.sh (minus itself) — for that invocation form, classifies the resolved
 # `(@ (system M) NAME)` by reading system/M.scm (a `(package ...)` define =
 # PACKAGER; an `(origin ...)`/fetch define = an allowed FETCHER seed), and records
 # the sorted set of PACKAGER sites in tests/guix-surface.expected. A one-way
@@ -39,9 +39,11 @@ TAB=$(printf '\t')
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM
 
-# in-scope orchestration files (the scanner excludes itself)
+# in-scope orchestration files (the scanner excludes itself). ci/*.sh — the CI
+# store-image host-prep scripts — are in scope too, so directive 8's "the guix
+# surface only shrinks" covers the CI staging path, not just the in-sandbox loop.
 : > "$work/scope"
-for f in Makefile mk/gates/*.mk tests/*.sh; do
+for f in Makefile mk/gates/*.mk tests/*.sh ci/*.sh; do
   [ -f "$f" ] || continue
   [ "$f" = "$self" ] && continue
   printf '%s\n' "$f" >> "$work/scope"

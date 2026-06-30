@@ -6,8 +6,8 @@
 # fixed-output FETCH the loop realises + td PLACES (store-add-recursive), NEVER a
 # guix (build-system ...) package td asks the daemon to build by resolving
 # (@ (system M) PKG). tests/guix-surface.sh statically scans the loop's
-# orchestration sources (Makefile, mk/gates/*.mk, tests/*.sh) for that resolve
-# form, classifies each (@ (system M) NAME) by reading system/M.scm (a package
+# orchestration sources (Makefile, mk/gates/*.mk, tests/*.sh, ci/*.sh) for that
+# resolve form, classifies each (@ (system M) NAME) by reading system/M.scm (a package
 # define => PACKAGER; an origin/fetch define => an allowed FETCHER), and snapshots
 # the sorted PACKAGER sites in tests/guix-surface.expected.
 #
