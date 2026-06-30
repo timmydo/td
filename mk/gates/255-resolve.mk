@@ -6,8 +6,8 @@
 # `td-builder resolve` looks up the SAME inputs from a PINNED lock
 # (tests/td-build-inputs.lock) with NO Guile, and the gate proves td's lock
 # resolution is store-path-EQUAL to Guile's LIVE resolution (the oracle,
-# tests/resolve-lock.scm) for the nano recipe's declared inputs (ncurses +
-# gettext-minimal). What moves to Rust is the lock CONSUMPTION; the RESOLVER that
+# tests/resolve-lock.scm) for the readline recipe's declared input (ncurses).
+# What moves to Rust is the lock CONSUMPTION; the RESOLVER that
 # computes the lock stays Guile, retired package-by-package later (§5). Heavy only
 # for the warm td-builder compile (no VM); a perturbed lock diverges (verified-red).
 HEAVY_GATES += resolve
@@ -17,8 +17,8 @@ resolve:
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
 	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
-	names="ncurses gettext-minimal"; \
-	echo ">> the nano recipe's declared inputs: $$names"; \
+	names="ncurses"; \
+	echo ">> the readline recipe's declared input: $$names"; \
 	echo ">> ORACLE: Guile's live resolution (specification->package -> #:graft? #f out path)"; \
 	oracle=`$(GUIX) repl $(LOAD) tests/resolve-lock.scm $$names 2>/dev/null | grep ' /gnu/store/'`; \
 	test -n "$$oracle" || { echo "ERROR: oracle resolution produced nothing" >&2; exit 1; }; \
@@ -33,4 +33,4 @@ resolve:
 	  test "$$td_path" = "$$oracle_path" \
 	    || { echo "FAIL: td-builder resolved '$$n' to $$td_path but Guile's live resolution is $$oracle_path — the pinned lock is stale or wrong (regenerate on a channel bump: guix repl -L . tests/resolve-lock.scm $$names)." >&2; exit 1; }; \
 	done; \
-	echo "PASS: td-builder resolved the nano recipe's declared inputs (ncurses + gettext-minimal) from the pinned lock — store-path-equal to Guile's live specification->package resolution, with NO Guile in td's resolution path (additive: the build is unchanged; the resolver is retired last, §5)."
+	echo "PASS: td-builder resolved the readline recipe's declared input (ncurses) from the pinned lock — store-path-equal to Guile's live specification->package resolution, with NO Guile in td's resolution path (additive: the build is unchanged; the resolver is retired last, §5)."

@@ -52,12 +52,12 @@ fi
 echo "   ok: the census manifest matches the Rust catalog"
 
 echo ">> (C) discrimination: verify rejects a mismatched recipe (negative control)"
-test -s "$work/gzip.json" -a -s "$work/hello.json" \
+test -s "$work/sed.json" -a -s "$work/hello.json" \
   || { echo "FAIL: missing emit fixtures for the negative control" >&2; exit 1; }
-if "$TD_RECIPE_EVAL" verify hello "$work/gzip.json" >/dev/null 2>&1; then
-  echo "FAIL: verify accepted hello against gzip's JSON — discrimination is vacuous." >&2
+if "$TD_RECIPE_EVAL" verify hello "$work/sed.json" >/dev/null 2>&1; then
+  echo "FAIL: verify accepted hello against sed's JSON — discrimination is vacuous." >&2
   exit 1
 fi
-echo "   ok: verify hello <gzip.json> correctly FAILS"
+echo "   ok: verify hello <sed.json> correctly FAILS"
 
 echo "PASS: recipe-rs — the Rust package + spec surface emits valid self-consistent JSON, the guix-dependence manifest is in sync, and verify discriminates mismatches. Correctness vs upstream is proven by the corpus differential (corpus-no-guix), not boa (retired)."
