@@ -912,12 +912,25 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("bootstrap-sed-corpus-store-native");
         return;
     }
+    // The rung-X2 native gcc gate's OWN files: a native x86_64 gcc/binutils built on top of the cross
+    // toolchain. Maps only to gate 422 (the native build is downstream of the cross rungs).
+    if pattern_matches(
+        "tests/bootstrap-x86_64-native-gcc-store-native.sh|mk/gates/422-bootstrap-x86_64-native-gcc-store-native.mk",
+        p,
+    ) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("bootstrap-x86_64-native-gcc-store-native");
+        return;
+    }
     if pattern_matches(
         "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk",
         p,
     ) {
         sel.add_preflight("shell-syntax");
         add_chain(sel, 28, 29);
+        // x86_64-cross-fns.sh also defines the rung-X2 native rungs (build_*_x86_64_native), so a change
+        // to it must re-run the native gcc gate too, not only the cross toolchain gate.
+        sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         return;
     }
 
@@ -1376,6 +1389,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/td-toolchain-x86_64.lock", "toolchain-x86_64-input-addressed");
     assert_target!("tests/td-toolchain-x86_64.lock", "bootstrap-x86_64-toolchain-store-native");
     assert_target!("tests/x86_64-subst-lib.sh", "bootstrap-x86_64-toolchain-store-native");
+    assert_target!(
+        "tests/bootstrap-x86_64-native-gcc-store-native.sh",
+        "bootstrap-x86_64-native-gcc-store-native"
+    );
+    assert_target!(
+        "mk/gates/422-bootstrap-x86_64-native-gcc-store-native.mk",
+        "bootstrap-x86_64-native-gcc-store-native"
+    );
+    assert_target!("tests/x86_64-cross-fns.sh", "bootstrap-x86_64-native-gcc-store-native");
     assert_target!("tests/toolchain-x86_64-input-addressed.sh", "toolchain-x86_64-input-addressed");
     assert_target!(
         "mk/gates/418-toolchain-x86_64-input-addressed.mk",
