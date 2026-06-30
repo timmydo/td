@@ -673,13 +673,10 @@ build_gcc_x86_64_native() {
   mch=`"$xnbu/bin/readelf" -h "$g/bin/gcc" 2>/dev/null | grep -i 'machine:' | grep -io 'x86-64'`
   test "$cls" = ELF64 -a -n "$mch" || { echo "native gcc is not ELF64 x86_64 (class='$cls' machine='$mch')" >&2; return 1; }
   test -n "$cc1" || { echo "native gcc produced no cc1" >&2; return 1; }
-  # bundle plain as/ld into the native gcc's OWN tooldir so it resolves them relative to argv[0] in the
-  # own-root (RELATIVE symlinks to the sibling native-binutils install path — the same self-contained
-  # trick x86_64_bundle_tooldir uses for the cross gcc). MUST be set before the tree is interned.
-  nbubase=`basename "$xnbu"`; mkdir -p "$g/$XTARGET/bin"
-  for t in as ld ar nm ranlib strip objcopy objdump; do
-    test -e "$xnbu/bin/$t" && ln -sf "../../../$nbubase/bin/$t" "$g/$XTARGET/bin/$t" || true
-  done
+  # NB: as/ld are NOT bundled into the gcc tooldir. The native gcc + native binutils both live at /td/store
+  # and the gcc finds as/ld via PATH (how every real toolchain works) — the own-root probe sets PATH to the
+  # two /td/store dirs and NOTHING else, so the native binutils is load-bearing. (A self-contained
+  # argv[0]-relative tooldir, like the cross gcc's, is a publish-as-substitute concern for a later rung.)
 }
 
 # verify_x86_64_native_ownroot <cpath> <scratch> — the DURABLE own-root verify for rung X2. Interns the
@@ -687,7 +684,7 @@ build_gcc_x86_64_native() {
 # gcc IN the store-ns own-root: it COMPILES a C and a C++ program from source and the results run → 42,
 # /gnu/store ABSENT. The compiler doing the work is itself an ELF 64-bit x86_64 binary in /td/store.
 # Requires the run_x86_64_cross / closure exports XGLIBC, plus $XNGCC (native gcc tree) and $XNBU
-# (native binutils tree) from the caller. Legs: [no-guix] [native-arch] [content-addr] [behavioral]
+# (native binutils tree) from the caller. Legs: [native-arch] [no-guix] [content-addr] [closure-complete]
 # [self-host-compile] [structural].
 verify_x86_64_native_ownroot() {
   cpath=$1; snwork=$2; store="$snwork/td-store-native"; sndb="$snwork/store-native.db"; mkdir -p "$store"
@@ -704,37 +701,25 @@ verify_x86_64_native_ownroot() {
     if grep -q -a '/gnu/store' "$b"; then echo "$b contains /gnu/store bytes" >&2; return 1; fi
   done
   echo "   [no-guix] the native gcc/cc1 + native as/ld + the x86_64 libc.so.6 carry no /gnu/store bytes"
-  # intern the closure: native binutils, native gcc (tooldir as/ld symlink to the native binutils base),
-  # and the x86_64 glibc 2.41 — all as siblings so the relative tooldir symlinks resolve under /td/store.
-  # Intern the native binutils FIRST to learn its content-addressed basename, then re-point the native
-  # gcc's tooldir as/ld symlinks at THAT basename BEFORE interning the gcc (so the interned, content-
-  # addressed gcc tree is internally consistent — not patched after the fact).
+  # intern the native toolchain closure as siblings under /td/store: native binutils, native gcc, and the
+  # x86_64 glibc 2.41. The own-root probe finds as/ld via PATH (both bins are at /td/store), so no tooldir
+  # symlink wiring is needed; [closure-complete] (below) asserts the binutils as/ld are present.
   NBP=`"$TB" store-add-recursive "\`basename "$XNBU"\`" "$XNBU" "$store" "$sndb"` || { echo "store-add native binutils failed" >&2; return 1; }
   nbrel=`basename "$NBP"`
-  # Re-point the native gcc's tooldir as/ld/... at the INTERNED native-binutils basename ($nbrel) before
-  # interning the gcc. Key on the SOURCE ($XNBU/bin/$t), NOT the dest: the build-time symlinks point at the
-  # mktemp basename and are DANGLING here, so `test -e <dest>` (which FOLLOWS the link) would be false and
-  # skip every tool — leaving the interned tooldir pointing at a non-existent /td/store/native-binutils.
-  mkdir -p "$XNGCC/$XTARGET/bin"
-  for t in as ld ar nm ranlib strip objcopy objdump; do
-    test -e "$XNBU/bin/$t" && ln -sf "../../../$nbrel/bin/$t" "$XNGCC/$XTARGET/bin/$t" || true
-  done
   NGP=`"$TB" store-add-recursive "\`basename "$XNGCC"\`" "$XNGCC" "$store" "$sndb"` || { echo "store-add native gcc failed" >&2; return 1; }
   GLP=`"$TB" store-add-recursive glibc-2.41-x86_64 "$XGLIBC" "$store" "$sndb"` || { echo "store-add x86_64 glibc failed" >&2; return 1; }
   case "$NGP" in /td/store/*-gcc-14.3.0-x86_64-native) ;; *) echo "native gcc not content-addressed: $NGP" >&2; return 1 ;; esac
   echo "   [content-addr] interned the native gcc ($NGP), native binutils, and the x86_64 glibc in /td/store"
   ngrel=`basename "$NGP"`; glrel=`basename "$GLP"`
   chmod -R u+w "$store"
-  # [self-contained] DURABLE (no guix oracle): the interned native gcc carries as/ld in its OWN tooldir
-  # ($XTARGET/bin) resolving (as a SIBLING /td/store path) to the interned native binutils — so the native
-  # gcc finds its assembler/linker relative to argv[0], not only via PATH. A regression that drops/breaks
-  # the re-point above reds HERE (the symlink would be dangling), instead of being masked by the probe's
-  # PATH fallback. Mirrors the cross gcc's [self-contained] leg (x86_64_bundle_tooldir).
+  # [closure-complete] DURABLE (no guix oracle): the native toolchain's assembler + linker are interned at
+  # /td/store alongside the gcc — so the own-root has a COMPLETE native toolchain (gcc + binutils), found via
+  # PATH (how a real toolchain works). The behavioral probe below sets PATH to ONLY these two /td/store dirs,
+  # so the interned native binutils is load-bearing: drop it and the native gcc cannot assemble/link → reds.
   for t in as ld; do
-    test -e "$store/$ngrel/$XTARGET/bin/$t" || { echo "native gcc tooldir '$t' is dangling (not the interned /td/store/$nbrel) — not self-contained" >&2; return 1; }
-    case `readlink "$store/$ngrel/$XTARGET/bin/$t"` in */"$nbrel"/bin/"$t") ;; *) echo "native gcc tooldir '$t' does not point at the interned native binutils $nbrel" >&2; return 1 ;; esac
+    test -x "$store/$nbrel/bin/$t" || { echo "interned native binutils missing an executable '$t' ($store/$nbrel/bin/$t) — incomplete toolchain closure" >&2; return 1; }
   done
-  echo "   [self-contained] the interned native gcc bundles as/ld in its own tooldir ($XTARGET/bin) → the interned /td/store native binutils, resolved relative to argv[0]"
+  echo "   [closure-complete] the native binutils as/ld are interned at /td/store/$nbrel beside the native gcc — a complete native toolchain in td's own store"
   bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
   bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
   bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
