@@ -60,6 +60,21 @@ pin=`cat tests/td-seed.lock`
 test "$seedhash" = "$pin" || fail "seed manifest hash $seedhash != pinned $pin (toolchain seed drifted; re-pin with TD_SEED_WRITE=1 on a deliberate channel bump)"
 echo "   [DURABLE repro] seed manifest hash matches the pin (reproducible, channel-anchored)"
 
+# --- Leg 0: DURABLE — td re-derives the seed closure by CONTENT-SCANNING the bytes ---
+# `store-closure-scan` walks coreutils' closure by NAR-scanning the unpacked seed bytes
+# (scan.rs = the daemon's scanForReferences, bounded to the seed store) — no store DB and
+# no guix — and it must equal td's own store-db walk (`store-closure`) over the SAME seed
+# DB. So td computes a closure two independent ways (from the bytes and from its DB) and
+# they agree, with guix nowhere in either path. A wrong/empty scan would diverge (red).
+scanbase=`basename "$cu"`
+scan_cl=`"$TB" store-closure-scan "$SEED_STORE" "$SEED_STORE/$scanbase" | sed 's#.*/##' | sort -u` \
+  || fail "store-closure-scan failed"
+db_cl=`"$TB" store-closure "$SEED_DB" "$cu" | sed 's#.*/##' | sort -u`
+test -n "$scan_cl" || fail "store-closure-scan produced an empty closure"
+test "$scan_cl" = "$db_cl" \
+  || { printf '%s\n' "$scan_cl" | sed 's/^/  scan: /' >&2; printf '%s\n' "$db_cl" | sed 's/^/  db:   /' >&2; fail "content-scan closure of $scanbase != the seed db walk"; }
+echo "   [DURABLE] td content-scanned $scanbase's `printf '%s\n' "$scan_cl" | grep -c .`-path closure from the seed BYTES (scan.rs) == its store-db walk — no store DB, no guix"
+
 # --- Leg A: DURABLE behavioral — build hello from the warmed seed ONLY ---------
 sh tests/recipe-emit.sh hello > "$work/hello.json" || fail "ts-emit hello"
 mkdir -p "$work/b"
