@@ -1006,7 +1006,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches(
-        "system/*|tests/boot*|tests/reset*|tests/vm-lib.sh|tests/container.scm|tests/run-image.sh|tests/rollback*|tests/place*|tests/verify-place*|tests/registry*|tests/manifest*|tests/generation*|tests/oci*",
+        "system/*|tests/place*|tests/verify-place*|tests/registry*|tests/manifest*|tests/generation*|tests/oci*",
         p,
     ) {
         sel.add_preflight("shell-syntax");

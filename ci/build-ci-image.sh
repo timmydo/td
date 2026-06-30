@@ -99,15 +99,11 @@ test -n "$channel_out" || { echo "FATAL: no channel instance output" >&2; exit 1
 # (ext4's htree order varies with the per-mkfs hash seed, so two runners
 # diverge; btrfs dev box vs ext4 runner likewise), an UPSTREAM defect td
 # cannot patch without forking the builder (future work; human-signed
-# accommodation 2026-06-12). This covers BOTH `guix pack
-# -f docker` shapes: the system `docker-image.tar.gz` AND the `td-app-*`
-# OCI app images (tests/container.scm — same builder, same defect; surfaced
-# 2026-06-13 only once the pipeline's cross-RUNNER --check replaced the
-# dev-box-warm path). Everything embedding such a tarball is excluded too:
-# generation images (repack it), the registry (embeds gen-image layouts),
-# placed trees + rollback disk (extract gen images). NOT the app BUNDLES:
-# they extract the tarball into a tree, which guix re-serializes NAR-sorted,
-# so they are order-independent and stay exported.
+# accommodation 2026-06-12). This covers the `guix pack -f docker` system
+# `docker-image.tar.gz` (same builder defect surfaced 2026-06-13 once the
+# pipeline's cross-RUNNER --check replaced the dev-box-warm path). Everything
+# embedding such a tarball is excluded too: generation images (repack it), the
+# registry (embeds gen-image layouts), placed trees (extract gen images).
 #
 # ALSO exclude the rootless isolation probe (td-rootless-isolation-probe) — a
 # DIFFERENT reason: the `rootless` rung REQUIRES its output INVALID in the host
@@ -123,10 +119,10 @@ test -n "$channel_out" || { echo "FATAL: no channel instance output" >&2; exit 1
 # so the daemon must FRESHLY build them (build-derivations) to record it. The
 # rungs' lowering already builds them expecting that; shipping the outputs
 # short-circuits it. Dropping them makes the daemon build them fresh (the
-# build/boot-disk/rootless rungs rebuild image.qcow2 anyway). NAR hash/size,
+# build/rootless rungs rebuild image.qcow2 anyway). NAR hash/size,
 # the other imported facts, ARE intrinsic and survive import — only deriver
 # needs the fresh build.
-grep -Ev -- '-(docker-image\.tar\.gz|td-app-[a-z]+\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rollback-disk|td-rootless-isolation-probe|td-s3-diff|image\.qcow2)$' \
+grep -Ev -- '-(docker-image\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rootless-isolation-probe|td-s3-diff|image\.qcow2)$' \
   "$work/outputs.txt" > "$work/outputs-kept.txt"
 echo "   excluded $(($(wc -l < "$work/outputs.txt") - $(wc -l < "$work/outputs-kept.txt"))) outputs the runner rebuilds itself (fs-order docker-pack families + the rootless isolation probe)"
 sort -u "$work/check-drvs.txt" "$work/outputs-kept.txt" > "$work/roots.txt"

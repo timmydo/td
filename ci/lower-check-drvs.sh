@@ -49,7 +49,7 @@ lower() {
 # the enumeration loop below (imperative-surface.scm is loop-covered too but
 # named outside the glob).
 LOWERING_SCRIPTS="tests/manifest-image-drv.scm tests/generation-image-drv.scm \
-tests/place-drv.scm tests/rollback-drv.scm tests/imperative-surface.scm \
+tests/place-drv.scm tests/imperative-surface.scm \
 tests/rootless-drvs.scm tests/td-builder-s3-drvs.scm \
 tests/td-builder-s4-drv.scm tests/registry-drv.scm tests/verify-place-drv.scm \
 tests/offline-drv.scm tests/check-memo-drvs.scm \
@@ -160,7 +160,3 @@ for np in $NEGATIVE_PREFIXES; do
        exit 1;;
   esac
 done
-
-# --- Marionette system tests (same two-step lowering as the Makefile recipes).
-lower $GUIX repl -L . ci/system-test-drvs.scm
-grep '^/gnu/store/.*\.drv$' "$tmp"
