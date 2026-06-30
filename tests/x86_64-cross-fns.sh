@@ -532,3 +532,231 @@ x86_64_gcc_repro_leg() {
   _repro_cleanup
   echo "   [repro] two independent from-source builds of the cross gcc 14.3.0, normalized, are byte-identical (nar-hash $_normA) — a STABLE input-addressed /td/store artifact (durable: intrinsic double-build reproducibility, no guix oracle)"
 }
+
+# ===================================================================================================
+# RUNG X2 — a NATIVE x86_64 toolchain at /td/store (x86_64-toolchain track, after the #201 cross rungs).
+# X1 produced a CROSS gcc: an i686 (ELF 32-bit) binary that EMITS x86_64. X2 turns that into a NATIVE
+# x86_64 gcc — gcc/cc1/g++ that are themselves ELF 64-bit x86_64, run natively on x86_64, and compile
+# x86_64 (host == target). Built BY the cross toolchain (XGCC2/XBU) vs the /td/store x86_64 glibc 2.41,
+# STATIC (like the i686 build_gcc_14 / build_binutils_244 rungs) so the binaries run in the store-ns
+# own-root with no interp dependency. The same `int main(){return 42;}` proof, but the COMPILER that
+# builds + runs it is itself an x86_64 binary living in /td/store — the architectural self-hosting rung
+# (a from-source gcc-rebuilds-gcc bootstrap is a separate, much heavier milestone, not claimed here).
+# ---------------------------------------------------------------------------------------------------
+
+# _mk_native_static_wrapper <cross-cc-or-c++> <glibc> <dst> [hdrdir] — a single-token CC wrapper for the
+# native x86_64 builds: the cross gcc/g++, supplying the x86_64 glibc crt/libs (-B), that adds -static
+# for EXECUTABLES + conftests (so they run with no interp in the own-root) but DROPS -static when the
+# link is `-shared` (libtool building a shared module, e.g. binutils' ld libdep.la). On x86_64 a -static
+# non-PIC crt in a shared object is an R_X86_64_32 error; the cross binutils' i686-host builds never hit
+# this (R_386 allows non-PIC text relocs), so this guard is x86_64-specific. The wrapper, not make-level
+# LDFLAGS, is the reliable lever (binutils' recursive program links don't honor a make LDFLAGS override).
+# Optional [hdrdir] is added with -idirafter (NOT -isystem / C_INCLUDE_PATH): the headers must come AFTER
+# gcc's own C++ dirs so libstdc++'s <cstdlib> `#include_next <stdlib.h>` resolves (same reason as
+# _mk_static_wrapper) — a host C++ compile (cc1plus/libcody) else dies on `fatal error: stdlib.h`.
+_mk_native_static_wrapper() {
+  cc=$1; gl=$2; dst=$3; hdr=${4:-}; bsh=`command -v bash 2>/dev/null || command -v sh`
+  ida=; [ -n "$hdr" ] && ida=" -idirafter $hdr"
+  { printf '#!%s\n' "$bsh"
+    printf 'for a in "$@"; do case "$a" in -shared) exec "%s"%s -B%s/lib "$@";; esac; done\n' "$cc" "$ida" "$gl"
+    printf 'exec "%s" -static%s -B%s/lib "$@"\n' "$cc" "$ida" "$gl"
+  } > "$dst"
+  chmod 0555 "$dst"
+}
+
+# build_binutils_x86_64_native <cpath> <xgcc2> <xglibc> <xbu> <kh> <out>
+#   NATIVE GNU Binutils 2.44 (--build=--host=--target=x86_64-pc-linux-gnu), built STATIC by the cross
+#   gcc 14.3.0 ($xgcc2, an i686 binary emitting x86_64) vs the /td/store x86_64 glibc 2.41 static
+#   archives. autoconf's --host=x86_64-pc-linux-gnu tool detection prefixes with $XTARGET-, so the
+#   cross binutils ($xbu) on PATH satisfy AR/RANLIB/AS/LD for the build; CC = the cross gcc. The x86_64
+#   glibc 2.41 headers #include <linux/…>, so the x86_64 kernel UAPI headers ($kh tarball) MUST be on the
+#   include path beside them. Output: ELF 64-bit x86_64 plain-named as/ld/ar/... that run natively on x86_64.
+build_binutils_x86_64_native() {
+  cpath=$1; xgcc2=$2; xglibc=$3; xbu=$4; kh=$5; out=$6
+  rm -rf "$out"; mkdir -p "$out"
+  xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
+  csh=`command -v bash 2>/dev/null || command -v sh`
+  khd=`mktemp -d`/kh; mkdir -p "$khd"; tar -xzf "$kh" -C "$khd" || { echo "x86_64 kernel headers unpack failed" >&2; return 1; }
+  CIP="$xglibc/include:$khd"
+  wb=`mktemp -d`/wb; mkdir -p "$wb"   # -shared-aware static wrapper (handles binutils' ld libdep.la shared module)
+  _mk_native_static_wrapper "$xgcc2/bin/$XTARGET-gcc" "$xglibc" "$wb/cc"
+  tb=`mktemp -d`/tb; _xbin "$tb"
+  src=`mktemp -d`/binutils; mkdir -p "$src"
+  "$xzb" -dc "$BU244_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "binutils-2.44 unpack failed" >&2; return 1; }
+  ( cd "$src"; bp="$xbu/bin:$tb:$cpath"
+    env PATH="$bp" CONFIG_SHELL="$csh" SHELL="$csh" CC="$wb/cc" CC_FOR_BUILD="$wb/cc" \
+        C_INCLUDE_PATH="$CIP" \
+        "$csh" ./configure --build=$XTARGET --host=$XTARGET --target=$XTARGET \
+        --prefix=/td/store/binutils-2.44-x86_64-native \
+        --disable-nls --disable-gold --disable-werror --enable-deterministic-archives \
+        --disable-plugins --disable-gprofng --disable-multilib >cfg.log 2>&1 \
+      || { echo "native x86_64 binutils configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xnbu-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" \
+        C_INCLUDE_PATH="$CIP" make $X86_MAKE_J MAKEINFO=true >build.log 2>&1 \
+      || { echo "native x86_64 binutils make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xnbu-build.log" 2>/dev/null||true; tail -30 build.log >&2; return 1; }
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" \
+        make MAKEINFO=true install prefix="$out" >inst.log 2>&1 \
+      || { echo "native x86_64 binutils install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
+  test -x "$out/bin/as" -a -x "$out/bin/ld" -a -x "$out/bin/readelf" || { echo "no native as/ld/readelf produced" >&2; return 1; }
+  cls=`"$out/bin/readelf" -h "$out/bin/as" 2>/dev/null | grep -i 'class:' | grep -o 'ELF64'`
+  test "$cls" = ELF64 || { echo "native binutils 'as' is not ELF64 x86_64 (got '$cls')" >&2; return 1; }
+}
+
+# build_gcc_x86_64_native <cpath> <xgcc2> <xglibc> <xbu> <xnbu> <kh_x86_64_tb> <out>
+#   NATIVE GCC 14.3.0 (c,c++; --build=--host=--target=x86_64-pc-linux-gnu), built STATIC by the cross
+#   gcc 14.3.0 ($xgcc2) vs the /td/store x86_64 glibc 2.41, with gmp-6.3.0/mpfr-4.2.1/mpc-1.3.1
+#   in-tree. as/ld are the NATIVE x86_64 binutils ($xnbu) via --with-as/--with-ld. A combined build
+#   sysroot ($out/sysroot/include = x86_64 glibc headers + x86_64 kernel UAPI) supplies the target
+#   headers. CC is a single-token -static wrapper SCRIPT (gcc derives CC_FOR_BUILD from CC on a native
+#   build and strips trailing flags from a plain CC_FOR_BUILD — a script survives the munging; same
+#   reason as build_gcc_14). The produced gcc/cc1/g++ are ELF 64-bit x86_64 — a native compiler.
+build_gcc_x86_64_native() {
+  cpath=$1; xgcc2=$2; xglibc=$3; xbu=$4; xnbu=$5; kh=$6; out=$7
+  rm -rf "$out"; mkdir -p "$out"
+  xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
+  csh=`command -v bash 2>/dev/null || command -v sh`
+  "$xzb" -dc "$GCC14_TB" | tar -xf - -C "$out" --strip-components=1 || { echo "gcc-14.3.0 unpack failed" >&2; return 1; }
+  "$xzb" -dc "$GMP63_TB" | tar -xf - -C "$out" || { echo "gmp unpack failed" >&2; return 1; }
+  "$xzb" -dc "$MPFR421_TB" | tar -xf - -C "$out" || { echo "mpfr unpack failed" >&2; return 1; }
+  tar -xzf "$MPC131_TB" -C "$out" || { echo "mpc unpack failed" >&2; return 1; }
+  ( cd "$out" && ln -sf gmp-6.3.0 gmp && ln -sf mpfr-4.2.1 mpfr && ln -sf mpc-1.3.1 mpc ) || { echo "gmp/mpfr/mpc symlink failed" >&2; return 1; }
+  # combined build sysroot: include/ = x86_64 glibc headers + x86_64 kernel UAPI (glibc headers #include
+  # <linux/…>); lib/ = the x86_64 glibc 2.41 libs + crt, so the freshly-built target xgcc can LINK its
+  # libgcc/libstdc++ conftests (--with-build-sysroot points the TARGET compiler here, not the wrapper).
+  sysroot="$out/sysroot"; mkdir -p "$sysroot/include" "$sysroot/lib"
+  cp -a "$xglibc/include/." "$sysroot/include/" || { echo "could not stage glibc headers into the sysroot" >&2; return 1; }
+  tar -xzf "$kh" -C "$sysroot/include" || { echo "x86_64 kernel headers unpack failed" >&2; return 1; }
+  cp -a "$xglibc/lib/." "$sysroot/lib/" || { echo "could not stage glibc libs into the sysroot" >&2; return 1; }
+  # Relocate glibc's GNU ld scripts (libc.so, libm.so AND libm.a — the cross build only relocated *.so)
+  # to BARE names: a fully-static host link pulls libm.a, whose GROUP script else points at the absolute
+  # configure prefix /td/store/glibc-2.41-x86_64/lib (where the glibc is NOT) → "cannot find libm-2.41.a".
+  for so in "$sysroot/lib/"*.so "$sysroot/lib/"*.a; do
+    if head -c 80 "$so" 2>/dev/null | grep -qa 'GNU ld script'; then
+      sed -i "s,/td/store/glibc-2.41-x86_64/lib/,,g" "$so" 2>/dev/null || true
+    fi
+  done
+  wb="$out/wb"; mkdir -p "$wb"   # -shared-aware static wrappers; -B at the RELOCATED sysroot/lib; headers via -idirafter
+  _mk_native_static_wrapper "$xgcc2/bin/$XTARGET-gcc" "$sysroot" "$wb/gcc" "$sysroot/include"
+  _mk_native_static_wrapper "$xgcc2/bin/$XTARGET-g++" "$sysroot" "$wb/g++" "$sysroot/include"
+  tb=`mktemp -d`/tb; _xbin "$tb"
+  # the glibc + kernel headers come via the wrapper's -idirafter (NOT C_INCLUDE_PATH — that breaks the
+  # libstdc++ <cstdlib> #include_next); CIP carries only the in-tree mpfr header dir for the host build.
+  CIP="$out/mpfr/src"; LP="$sysroot/lib"
+  ( cd "$out"
+    for f in `grep -rl '^#! */bin/sh' . 2>/dev/null`; do sed -i "1s,^#! *[^ ]*/bin/sh,#!$csh," "$f" 2>/dev/null || true; done
+    rm -rf bld; mkdir bld; cd bld
+    env PATH="$xnbu/bin:$xbu/bin:$tb:$cpath" CONFIG_SHELL="$csh" \
+        CC="$wb/gcc" CXX="$wb/g++" CPP="$wb/gcc -E" CC_FOR_BUILD="$wb/gcc" CXX_FOR_BUILD="$wb/g++" \
+        C_INCLUDE_PATH="$CIP" CPLUS_INCLUDE_PATH="$CIP" LIBRARY_PATH="$LP" LDFLAGS="-static" \
+        "$csh" ../configure --prefix=/td/store/gcc-14.3.0-x86_64-native \
+        --build=$XTARGET --host=$XTARGET --target=$XTARGET \
+        --with-as="$xnbu/bin/as" --with-ld="$xnbu/bin/ld" \
+        --with-build-sysroot="$sysroot" --with-native-system-header-dir=/include \
+        --disable-bootstrap --disable-multilib --disable-shared --enable-static \
+        --enable-languages=c,c++ --enable-threads=single --disable-libstdcxx-pch \
+        --disable-libatomic --disable-libgomp --disable-libitm --disable-libsanitizer \
+        --disable-libssp --disable-libvtv --disable-libquadmath --disable-lto --disable-plugin \
+        --disable-libcc1 --disable-decimal-float --disable-werror >cfg.log 2>&1 \
+      || { echo "native x86_64 gcc-14.3.0 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xngcc-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
+    env PATH="$xnbu/bin:$xbu/bin:$tb:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
+        C_INCLUDE_PATH="$CIP" CPLUS_INCLUDE_PATH="$CIP" LIBRARY_PATH="$LP" \
+        make $X86_MAKE_J SHELL="$csh" CONFIG_SHELL="$csh" MAKEINFO=true "LDFLAGS=-static" "LDFLAGS_FOR_TARGET=-static" >build.log 2>&1 \
+      || { echo "native x86_64 gcc-14.3.0 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xngcc-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
+    env PATH="$xnbu/bin:$xbu/bin:$tb:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
+        C_INCLUDE_PATH="$CIP" CPLUS_INCLUDE_PATH="$CIP" LIBRARY_PATH="$LP" \
+        make SHELL="$csh" MAKEINFO=true install DESTDIR="$out/stage" >install.log 2>&1 \
+      || { echo "native x86_64 gcc-14.3.0 install failed" >&2; tail -20 install.log >&2; return 1; } ) || return 1
+  g="$out/stage/td/store/gcc-14.3.0-x86_64-native"
+  test -x "$g/bin/gcc" -a -x "$g/bin/g++" || { echo "no native gcc/g++ produced" >&2; return 1; }
+  cc1=`find "$g" -name cc1 | head -1`
+  cls=`"$xnbu/bin/readelf" -h "$g/bin/gcc" 2>/dev/null | grep -i 'class:' | grep -o 'ELF64'`
+  mch=`"$xnbu/bin/readelf" -h "$g/bin/gcc" 2>/dev/null | grep -i 'machine:' | grep -io 'x86-64'`
+  test "$cls" = ELF64 -a -n "$mch" || { echo "native gcc is not ELF64 x86_64 (class='$cls' machine='$mch')" >&2; return 1; }
+  test -n "$cc1" || { echo "native gcc produced no cc1" >&2; return 1; }
+  # NB: as/ld are NOT bundled into the gcc tooldir. The native gcc + native binutils both live at /td/store
+  # and the gcc finds as/ld via PATH (how every real toolchain works) — the own-root probe sets PATH to the
+  # two /td/store dirs and NOTHING else, so the native binutils is load-bearing. (A self-contained
+  # argv[0]-relative tooldir, like the cross gcc's, is a publish-as-substitute concern for a later rung.)
+}
+
+# verify_x86_64_native_ownroot <cpath> <scratch> — the DURABLE own-root verify for rung X2. Interns the
+# NATIVE x86_64 gcc + NATIVE x86_64 binutils + the x86_64 glibc 2.41 at /td/store, then RUNS the native
+# gcc IN the store-ns own-root: it COMPILES a C and a C++ program from source and the results run → 42,
+# /gnu/store ABSENT. The compiler doing the work is itself an ELF 64-bit x86_64 binary in /td/store.
+# Requires the run_x86_64_cross / closure exports XGLIBC, plus $XNGCC (native gcc tree) and $XNBU
+# (native binutils tree) from the caller. Legs: [native-arch] [no-guix] [content-addr] [closure-complete]
+# [self-host-compile] [structural].
+verify_x86_64_native_ownroot() {
+  cpath=$1; snwork=$2; store="$snwork/td-store-native"; sndb="$snwork/store-native.db"; mkdir -p "$store"
+  test -n "${XNGCC:-}" -a -d "${XNGCC:-/nonexistent}" || { echo "native gcc tree (XNGCC) unset" >&2; return 1; }
+  test -n "${XNBU:-}" -a -d "${XNBU:-/nonexistent}" || { echo "native binutils tree (XNBU) unset" >&2; return 1; }
+  test -n "${XGLIBC:-}" -a -d "${XGLIBC:-/nonexistent}" || { echo "x86_64 glibc tree (XGLIBC) unset" >&2; return 1; }
+  ngcc=`"$XNBU/bin/readelf" -h "$XNGCC/bin/gcc" 2>/dev/null`
+  echo "$ngcc" | grep -i 'class:' | grep -q 'ELF64' || { echo "native gcc not ELF64" >&2; return 1; }
+  echo "$ngcc" | grep -i 'machine:' | grep -qi 'x86-64' || { echo "native gcc machine is not x86-64" >&2; return 1; }
+  echo "   [native-arch] the native gcc/binutils ARE ELF 64-bit x86_64 binaries (not the i686 cross gcc)"
+  ncc1=`find "$XNGCC" -name cc1 | head -1`
+  for b in "$XNGCC/bin/gcc" "$ncc1" "$XNBU/bin/as" "$XNBU/bin/ld" "$XGLIBC/lib/libc.so.6"; do
+    test -n "$b" -a -e "$b" || { echo "native output missing ($b)" >&2; return 1; }
+    if grep -q -a '/gnu/store' "$b"; then echo "$b contains /gnu/store bytes" >&2; return 1; fi
+  done
+  echo "   [no-guix] the native gcc/cc1 + native as/ld + the x86_64 libc.so.6 carry no /gnu/store bytes"
+  # intern the native toolchain closure as siblings under /td/store: native binutils, native gcc, and the
+  # x86_64 glibc 2.41. The own-root probe finds as/ld via PATH (both bins are at /td/store), so no tooldir
+  # symlink wiring is needed; [closure-complete] (below) asserts the binutils as/ld are present.
+  NBP=`"$TB" store-add-recursive "\`basename "$XNBU"\`" "$XNBU" "$store" "$sndb"` || { echo "store-add native binutils failed" >&2; return 1; }
+  nbrel=`basename "$NBP"`
+  NGP=`"$TB" store-add-recursive "\`basename "$XNGCC"\`" "$XNGCC" "$store" "$sndb"` || { echo "store-add native gcc failed" >&2; return 1; }
+  GLP=`"$TB" store-add-recursive glibc-2.41-x86_64 "$XGLIBC" "$store" "$sndb"` || { echo "store-add x86_64 glibc failed" >&2; return 1; }
+  case "$NGP" in /td/store/*-gcc-14.3.0-x86_64-native) ;; *) echo "native gcc not content-addressed: $NGP" >&2; return 1 ;; esac
+  echo "   [content-addr] interned the native gcc ($NGP), native binutils, and the x86_64 glibc in /td/store"
+  ngrel=`basename "$NGP"`; glrel=`basename "$GLP"`
+  chmod -R u+w "$store"
+  # [closure-complete] DURABLE (no guix oracle): the native toolchain's assembler + linker are interned at
+  # /td/store alongside the gcc — so the own-root has a COMPLETE native toolchain (gcc + binutils), found via
+  # PATH (how a real toolchain works). The behavioral probe below sets PATH to ONLY these two /td/store dirs,
+  # so the interned native binutils is load-bearing: drop it and the native gcc cannot assemble/link → reds.
+  for t in as ld; do
+    test -x "$store/$nbrel/bin/$t" || { echo "interned native binutils missing an executable '$t' ($store/$nbrel/bin/$t) — incomplete toolchain closure" >&2; return 1; }
+  done
+  echo "   [closure-complete] the native binutils as/ld are interned at /td/store/$nbrel beside the native gcc — a complete native toolchain in td's own store"
+  bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
+  bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+  bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
+  # the probe is a FILE in the (ro) store; it compiles into the writable tmpfs /tmp inside the own-root.
+  # the probe runs the NATIVE gcc IN the own-root. It uses ONLY bash builtins (cd/printf/case/[) + the
+  # store's own binaries (gcc/g++/readelf) — the own-root has NO coreutils (no mkdir/grep/sed). glibc
+  # headers come via -idirafter (NOT C_INCLUDE_PATH — the libstdc++ <cstdlib> #include_next), and
+  # -B + -rpath/interp point at the interned /td/store glibc so the produced binaries are DYNAMIC
+  # (libc.so.6, interp = the /td/store ld) and run via the bound glibc. /tmp is store-ns's writable tmpfs.
+  cat > "$store/nativeprobe.sh" <<PROBE
+export PATH=/td/store/$ngrel/bin:/td/store/$nbrel/bin
+H="-idirafter /td/store/$glrel/include"
+B="-B/td/store/$glrel/lib"
+LD="-Wl,--dynamic-linker,/td/store/$glrel/lib/ld-linux-x86-64.so.2,-rpath,/td/store/$glrel/lib"
+cd /tmp || exit 1
+printf 'int main(){return 42;}\n' > c.c
+printf '#include <vector>\n#include <cstdlib>\nint main(){std::vector<int> v; for(int i=0;i<43;i++) v.push_back(i); return v[42];}\n' > cpp.cc
+gcc \$B \$LD -o c c.c || { echo "NATIVE-CC-FAIL"; exit 1; }
+g++ -O2 \$H -static-libgcc -static-libstdc++ \$B \$LD -o cpp cpp.cc || { echo "NATIVE-CXX-FAIL"; exit 1; }
+hdr=\$(/td/store/$nbrel/bin/readelf -h c)
+case "\$hdr" in *ELF64*) echo CCLASS=ELF64 ;; esac
+case "\$hdr" in *X86-64*|*x86-64*) echo CMACH=x86-64 ;; esac
+itp=\$(/td/store/$nbrel/bin/readelf -l c)
+case "\$itp" in *"/td/store/$glrel/lib/ld-linux-x86-64.so.2"*) echo CINTERP=OK ;; esac
+./c; echo "CRC=\$?"
+./cpp; echo "CPPRC=\$?"
+[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
+PROBE
+  out=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" /td/store/nativeprobe.sh 2>&1` \
+    || { printf '%s\n' "$out" | sed 's/^/     /' >&2; echo "store-ns native-gcc probe exited nonzero" >&2; return 1; }
+  printf '%s\n' "$out" | sed 's/^/     /' >&2
+  echo "$out" | grep -q '^CCLASS=ELF64$' || { echo "the native gcc did not emit an ELF64 program in the own-root" >&2; return 1; }
+  echo "$out" | grep -q '^CMACH=x86-64$' || { echo "the native-gcc-compiled program is not x86-64" >&2; return 1; }
+  echo "$out" | grep -q '^CINTERP=OK$' || { echo "the native-gcc-compiled program's interp is not the /td/store x86_64 ld" >&2; return 1; }
+  echo "$out" | grep -q '^CRC=42$'   || { echo "the native-gcc-compiled C program did not return 42 in the own-root" >&2; return 1; }
+  echo "$out" | grep -q '^CPPRC=42$' || { echo "the native-gcc-compiled C++ program did not return 42 in the own-root" >&2; return 1; }
+  echo "   [self-host-compile] the NATIVE x86_64 gcc RAN in the own-root and compiled a DYNAMIC ELF64 x86-64 C AND C++ program (interp = the /td/store x86_64 ld) from source → both run → 42"
+  echo "$out" | grep -q '^GNU-ABSENT$' || { echo "/gnu/store is PRESENT in the own-root" >&2; return 1; }
+  echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT"
+}
