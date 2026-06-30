@@ -1,7 +1,7 @@
 # seed/sources/make-3.80.lock — GNU Make 3.80, the source-bootstrap brick 5 (gcc-toolchain) first
 # rung: the seed-built TinyCC (brick 4) compiles GNU Make — its first substantial real-program
 # build, and the make the gcc/binutils stages need. Exactly guix's make-mesboot0 (built CC=tcc).
-# td-fetched, not vendored (tools/warm-bootstrap-sources.sh, check.sh prelude).
+# td-fetched, not vendored (td-feed warm sources, check.sh prelude).
 url https://ftp.gnu.org/gnu/make/make-3.80.tar.gz
 sha256 64b30b41fde2ebf669e6af489883fb1df6a06ac30555a96cfa3c39ecce7267dd
 file make-3.80.tar.gz

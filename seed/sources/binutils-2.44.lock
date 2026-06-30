@@ -5,7 +5,7 @@
 # commencement) binutils-boot0)'). guix's stored source is the BOOTSTRAP-REPACKED origin (via
 # `bootstrap-origin`, sha256 3ab695eb…) — NOT pristine; pin the PRISTINE upstream .tar.xz from ftp.gnu.org
 # instead (sha256 below). The sandbox has no zstd/no xz on PATH, so xz is globbed from /gnu/store like the
-# bzip2 trick. td-fetched (tools/warm-bootstrap-sources.sh).
+# bzip2 trick. td-fetched (td-feed warm sources).
 url https://ftp.gnu.org/gnu/binutils/binutils-2.44.tar.xz
 sha256 ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237
 file binutils-2.44.tar.xz

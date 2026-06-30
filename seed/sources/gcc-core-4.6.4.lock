@@ -2,7 +2,7 @@
 # (gcc-toolchain) rung AFTER make-mesboot: the first MODERN, modular gcc — guix's gcc-core-mesboot1.
 # Built by gcc-mesboot0 + binutils-mesboot1 + make-mesboot against glibc-mesboot0, with gmp/mpfr/mpc
 # unpacked into the tree. The capable gcc the gcc-mesboot (4.7.4) / final-toolchain arc builds on.
-# td-fetched (tools/warm-bootstrap-sources.sh). nix-base32 cross-checks guix's pin
+# td-fetched (td-feed warm sources). nix-base32 cross-checks guix's pin
 # 173kdb188qg79pcz073cj9967rs2vzanyjdjyxy9v0xb0p5sad75.
 url https://ftp.gnu.org/gnu/gcc/gcc-4.6.4/gcc-core-4.6.4.tar.gz
 sha256 e534a5cb05ab839d7cf7b2496fd5df42e76352926c1cf0d94de76184c26a739c

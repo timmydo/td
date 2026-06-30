@@ -1,7 +1,7 @@
 # rust-uutils — td builds a REAL coreutils tool from source: the uutils `cat` (crate uu_cat
 # 0.9.0, whose [[bin]] is named `cat`) with its WHOLE crate closure (source + 139 deps)
 # provisioned GUIX-FREE through td's OWN cargo-proxy: cargo resolved + fetched it through
-# `td-feed cargo-proxy` (tools/warm-cargo-proxy.sh uu_cat 0.9.0 cat, host PREP), the proxy
+# `td-feed cargo-proxy` (td-feed warm crate uu_cat 0.9.0 cat, host PREP), the proxy
 # verifying each `.crate` sha256 == the crates.io index cksum; source + deps interned by
 # store-add-recursive, vendored via TD_VENDOR_DIR. No guix oracle: content-address
 # (Cargo.lock pin == index cksum) is the oracle. Shared build+assert in tests/crate-free-

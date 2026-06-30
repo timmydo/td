@@ -6,7 +6,7 @@
 # gcc, against the /td/store x86_64 glibc, and co-locates the resulting libz.so.1 in the
 # relinked rustc tree. Built from source (not a guix package, not a binary) → no guix bytes.
 #
-# Warmed guix-free by tools/warm-bootstrap-sources.sh (HOST prep, td-fetch + the shared
+# Warmed guix-free by td-feed warm sources (HOST prep, td-fetch + the shared
 # td-feed) into .td-build-cache/sources/<file>; the gate reads it offline and re-verifies
 # the sha256 itself. The sha256 content-address IS the oracle. Bump url + sha256 + file
 # together (sha256 is the value madler publishes for the release tarball).

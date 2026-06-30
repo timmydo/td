@@ -1,7 +1,7 @@
 # seed/sources/gcc-g++-4.6.4.lock — GCC 4.6.4 C++ front-end, the source-bootstrap brick 5
 # (gcc-toolchain) rung AFTER gcc-core-mesboot1: overlaid onto the gcc-core-4.6.4 tree to build GCC 4.6.4
 # with C AND C++ (guix's gcc-mesboot1) — cc1plus + a static libstdc++. The c++ compiler the next gcc
-# (gcc-mesboot 4.7.4, itself C++) needs. td-fetched (tools/warm-bootstrap-sources.sh). nix-base32
+# (gcc-mesboot 4.7.4, itself C++) needs. td-fetched (td-feed warm sources). nix-base32
 # cross-checks guix's pin 1fqqk5zkmdg4vmqzdmip9i42q6b82i3f6yc0n86n9021cr7ms2k9.
 url https://ftp.gnu.org/gnu/gcc/gcc-4.6.4/gcc-g++-4.6.4.tar.gz
 sha256 690a5d4f664180640db28079e3461468192c484c37d6f671dde4b53a7f9918bb

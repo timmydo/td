@@ -446,7 +446,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches("feed/*|feed/src/*|feed/Cargo.toml|feed/Cargo.lock", p) {
+        // td-feed builds the mirror + runs its selftests (incl. the offline `warm-selftest`
+        // for the consolidated `td-feed warm <action>` orchestration). main.rs ALSO holds the
+        // host-PREP warm that feeds the corpus + bootstrap gates (the former warm-*.sh), so
+        // smoke a representative consumer of each warm family: rust-ripgrep (`warm crate`) and
+        // bootstrap-glibc (`warm sources` + `warm kernel-headers`).
         sel.add_target("td-feed");
+        sel.add_target("rust-ripgrep");
+        sel.add_target("bootstrap-glibc");
         return;
     }
 
@@ -591,7 +598,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("tools/warm-cargo-proxy.sh|tests/crate-free-build.sh", p) {
+    if p == "tests/crate-free-build.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("rust-ripgrep");
         sel.add_target("rust-sd");
@@ -602,12 +609,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("rust-coreutils");
         sel.add_target("rust-uutils");
         sel.add_target("rust-youki");
-        return;
-    }
-
-    if p == "tools/warm-cargo-proxy-local.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("rust-russh");
         return;
     }
 
@@ -772,7 +773,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
     if pattern_matches(
-        "tests/bootstrap-glibc.sh|seed/sources/glibc-2.2.5.lock|seed/sources/linux-*.lock|seed/patches/glibc-boot-2.2.5.patch|seed/patches/glibc-bootstrap-system-2.2.5.patch|tools/warm-kernel-headers.sh",
+        "tests/bootstrap-glibc.sh|seed/sources/glibc-2.2.5.lock|seed/sources/linux-*.lock|seed/patches/glibc-boot-2.2.5.patch|seed/patches/glibc-bootstrap-system-2.2.5.patch",
         p,
     ) {
         sel.add_preflight("shell-syntax");
@@ -889,7 +890,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
     if pattern_matches(
-        "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|tools/warm-kernel-headers-x86_64.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk",
+        "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk",
         p,
     ) {
         sel.add_preflight("shell-syntax");
@@ -912,7 +913,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         add_chain(sel, 3, 29);
         return;
     }
-    if pattern_matches("seed/sources/mes-*.lock|tools/warm-bootstrap-sources.sh", p) {
+    if pattern_matches("seed/sources/mes-*.lock", p) {
         sel.add_preflight("shell-syntax");
         add_chain(sel, 2, 29);
         return;
@@ -1329,13 +1330,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/spec-diff.scm", "spec-diff");
     assert_target!("tests/td-russh-demo.lock", "rust-russh");
     assert_target!("tests/russh-demo/Cargo.lock", "rust-russh");
-    assert_target!("tools/warm-cargo-proxy-local.sh", "rust-russh");
     assert_target!("tests/td-feed.lock", "td-feed");
     assert_target!("tests/td-feed.index", "td-feed");
     assert_target!("tools/feed-ensure.sh", "feed-shared");
     assert_target!("tools/warm-td-fetch-crates.sh", "rust-fetch");
     assert_target!("tools/warm-td-fetch-crates.sh", "td-feed");
-    assert_target!("tools/warm-cargo-proxy.sh", "rust-ripgrep");
+    // The consolidated warm orchestration lives in feed/src/main.rs (the former warm-*.sh):
+    // a feed change smokes td-feed (build + warm-selftest) + a representative consumer of
+    // each warm family.
+    assert_target!("feed/src/main.rs", "rust-ripgrep");
+    assert_target!("feed/src/main.rs", "bootstrap-glibc");
     assert_target!("feed/src/main.rs", "td-feed");
     assert_target!("tests/td-subst.lock", "td-subst");
     assert_target!("subst/src/main.rs", "td-subst");

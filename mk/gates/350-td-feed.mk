@@ -21,6 +21,11 @@
 #   [SELF-DISCRIMINATION] that same selftest reds if a wrong index hash is accepted on warm
 #     or a corrupted store byte is served (verify-on-serve) — the content hash is
 #     load-bearing on BOTH the warm and the serve side.
+#   [DURABLE behavioral] the td-built td-feed `warm-selftest` exercises the consolidated
+#     `td-feed warm <action>` host-PREP orchestration (the former warm-*.sh): lock parse,
+#     linux/version.h codegen, cargo-config, and an IN-PROCESS cargo-proxy source-crate GET
+#     round-trip — all offline (std::net). A malformed lock + a crate whose bytes mismatch
+#     its index cksum red it [SELF-DISCRIMINATION] (the parse + verifying egress load-bearing).
 #   [DURABLE structural] tests/td-feed.index is self-consistent: every line is
 #     <path> <url> <sha256>, each sha256 is 64-hex, and no path repeats.
 #   [DURABLE structural] the index is TRUTHFUL against the vendored closure: for every crate
@@ -84,6 +89,10 @@ td-feed:
 	echo "$$cps" | grep -q '^td-feed: cargo-proxy selftest OK' || { echo "FAIL: cargo-proxy selftest did not report OK (got: $$cps)" >&2; cat "$$scratch/cps.err" >&2; exit 1; }; \
 	echo "  [DURABLE behavioral] the td-built td-feed cargo-proxy fetched + verified a crate THROUGH the proxy over loopback (cargo's sparse protocol): '$$cps'"; \
 	echo "  [SELF-DISCRIMINATION] the cargo-proxy refuses a crate whose bytes mismatch its index cksum — the verifying egress is load-bearing"; \
+	ws=`"$$ns/bin/td-feed" warm-selftest 2>"$$scratch/ws.err"` || { echo "FAIL: the td-built td-feed warm-selftest failed:" >&2; tail -8 "$$scratch/ws.err" >&2; exit 1; }; \
+	echo "$$ws" | grep -q '^td-feed: warm selftest OK' || { echo "FAIL: warm-selftest did not report OK (got: $$ws)" >&2; cat "$$scratch/ws.err" >&2; exit 1; }; \
+	echo "  [DURABLE behavioral] the td-built td-feed warm-selftest exercised the consolidated 'td-feed warm <action>' orchestration's pure + IN-PROCESS legs (lock parse, linux/version.h codegen, cargo-config, an in-process cargo-proxy source-crate round-trip) over loopback: '$$ws'"; \
+	echo "  [SELF-DISCRIMINATION] warm-selftest reds a malformed lock and a crate whose bytes mismatch its index cksum — the parse + verifying egress are load-bearing"; \
 	idx="$(CURDIR)/tests/td-feed.index"; \
 	test -s "$$idx" || { echo "ERROR: no index $$idx" >&2; exit 1; }; \
 	bad3=`grep -v '^#' "$$idx" | grep -vcE '^[^ ]+ [^ ]+ [^ ]+$$' || true`; \
@@ -109,5 +118,5 @@ td-feed:
 	grep -qE "^CHECK out $$out sha256:[0-9a-f]+ reproducible$$" "$$scratch/checkout.txt" \
 	  || { echo "FAIL: td-builder check did not confirm $$out reproducible:" >&2; cat "$$scratch/checkout.txt" >&2; exit 1; }; \
 	echo "  [DURABLE repro] td-builder check double-build agrees the guix-free-crate td-feed build is reproducible"; \
-	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err" "$$scratch/run.err" "$$scratch/cps.err"; \
+	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err" "$$scratch/run.err" "$$scratch/cps.err" "$$scratch/ws.err"; \
 	echo "PASS: td built td-feed (its own local HTTP mirror) from source via td-builder build-recipe with its 73-crate closure provisioned GUIX-FREE (td-fetched from static.crates.io, Cargo.lock-pinned, no guix build / no /gnu/store FOD), interned as a content-addressed vendor tree by store-add-recursive, vendored via TD_VENDOR_DIR, with its BUILDER the td-bootstrapped stage0 and guix/Guile SCRUBBED FROM PATH; the td-built td-feed warms+serves+fetches a blob over loopback and reds on a wrong/corrupted hash on BOTH the warm and serve side (durable behavioral + self-discrimination, offline); tests/td-feed.index is self-consistent and truthful against the vendored closure (durable structural); and the build is reproducible by td's own double-build (durable). td now OWNS the mirror of its seeds AND its crate path is guix-free with NO oracle (content-address = the upstream Cargo.lock pin). Toolchain seed retired last."

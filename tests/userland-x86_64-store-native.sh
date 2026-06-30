@@ -39,12 +39,12 @@ unset TD_X86_64_LIB
 BB_LOCK=`ls seed/sources/busybox-*.lock 2>/dev/null | head -1`
 test -n "$BB_LOCK" || fail "no seed/sources/busybox-*.lock pin"
 BB_TB=".td-build-cache/sources/`lf "$BB_LOCK" file`"
-test -f "$BB_TB" || fail "warmed $BB_TB absent — run tools/warm-bootstrap-sources.sh (host PREP)"
+test -f "$BB_TB" || fail "warmed $BB_TB absent — run 'td-feed warm sources' (host PREP)"
 test "`sha "$BB_TB"`" = "`lf "$BB_LOCK" sha256`" || fail "warmed $BB_TB sha256 != lock pin"
 MK_LOCK=`ls seed/sources/make-4.4*.lock 2>/dev/null | head -1`
 test -n "$MK_LOCK" || fail "no seed/sources/make-4.4*.lock pin"
 MK_TB=".td-build-cache/sources/`lf "$MK_LOCK" file`"
-test -f "$MK_TB" || fail "warmed $MK_TB absent — run tools/warm-bootstrap-sources.sh (host PREP)"
+test -f "$MK_TB" || fail "warmed $MK_TB absent — run 'td-feed warm sources' (host PREP)"
 test "`sha "$MK_TB"`" = "`lf "$MK_LOCK" sha256`" || fail "warmed $MK_TB sha256 != lock pin"
 echo "   [supply-chain] busybox + make-4.4.1 match their lock sha256 — upstream bytes, not guix"
 

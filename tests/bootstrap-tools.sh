@@ -30,7 +30,7 @@ MES_TB=`tb "$MES_LK"`; NY_TB=`tb "$NY_LK"`; TCC_TB=`tb "$TCC_LK"`; GZ_TB=`tb "$G
 for pair in "$MES_TB:`lf "$MES_LK" sha256`" "$NY_TB:`lf "$NY_LK" sha256`" "$TCC_TB:`lf "$TCC_LK" sha256`" \
             "$GZ_TB:`lf "$GZ_LK" sha256`" "$T927_TB:`lf "$T927_LK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 echo "   [pinned-input] the five td-fetched tarballs (mes/nyacc/tcc/gzip/tcc-0.9.27) match their lock sha256"

@@ -252,45 +252,63 @@ fi
 # ci/daily for its AUTHORITATIVE run) suppresses the exposure so the daily always builds from seed +
 # republishes — otherwise a persistent store would starve the daily of its own from-seed build.
 [ "${TD_SUBST_FORCE_BUILD:-0}" = 1 ] || eval "$(sh tools/warm-subst.sh)"
-# --- Bootstrap-source warm: td OWNS fetching the source-bootstrap tarballs (GNU Mes, later -----
-# tinycc/gcc/glibc) the same way — td-fetch on the HOST, sha256-pinned per seed/sources/*.lock,
-# into .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates. BEST-EFFORT (those
-# gates are not in the fast tier): a runner that cannot warm them is fine, the gate enforces.
+# --- Bootstrap-source + corpus-crate warm: td OWNS fetching the source-bootstrap tarballs ------
+# AND the rust crate closures, sha256-pinned, into .td-build-cache/ for the offline heavy
+# `bootstrap-*`/`rust-*` gates. The host-PREP warm ORCHESTRATION now lives in ONE structured
+# `td-feed warm <action>` subcommand (feed/src/main.rs) — the former
+# tools/warm-{cargo-proxy,cargo-proxy-local,bootstrap-sources,kernel-headers{,-x86_64}}.sh
+# shell scripts, now typed + in-process. BEST-EFFORT (these gates are not in the fast tier):
+# a runner that cannot warm them is fine, the gate enforces presence.
 if [ "$heavy_warm" = 1 ]; then
-  # The two SHARED-feed warms stay serial-first: they fetch through the one shared
-  # td-feed daemon (tools/feed-ensure.sh, flock-serialized) into the shared store,
-  # so parallelizing them buys little and risks store contention.
-  #   warm-bootstrap-sources: the pinned source-bootstrap tarballs (GNU Mes, tinycc/
-  #   gcc/glibc) -> .td-build-cache/sources/ for the heavy `bootstrap-*` gates.
-  #   warm-td-fetch-crates : td-fetch's own crate closure -> .td-build-cache/
-  #   crate-vendor/ for the `rust-fetch` gate. Both BEST-EFFORT (not the fast tier).
-  warm sh tools/warm-bootstrap-sources.sh || true
+  # td-fetch's own crate closure -> .td-build-cache/crate-vendor/td-fetch for `rust-fetch`
+  # (a td-fetch GET, its own warm — not the cargo-proxy). BEST-EFFORT.
   warm sh tools/warm-td-fetch-crates.sh || true
-  # --- Corpus crate-guix-free warm: cargo resolves+fetches each rust package's WHOLE crate
-  # closure THROUGH td's OWN cargo-proxy (td-feed cargo-proxy), the proxy verifying each .crate
-  # sha256 == the crates.io index cksum (upstream pin) -> .td-build-cache/crate-vendor/<name>/ for
-  # the offline `rust-<name>-crate-free` gates. Each warm is INDEPENDENT (its own loopback port +
-  # work dir), so they FAN OUT in batches of $warm_jobs instead of running serially. BEST-EFFORT.
-  cp_warm() { warm "$@" || echo "check.sh: cargo-proxy warm (best-effort) failed/timed out: $*" >&2; }
-  _wc=0
-  for _spec in \
-    "ripgrep 14.1.1" \
-    "sd 1.0.0" \
-    "fd-find 10.2.0 fd" \
-    "procs 0.14.10" \
-    "eza 0.21.6" \
-    "bat 0.25.0" \
-    "coreutils 0.9.0 uutils" \
-    "youki 0.6.0" \
-    "uu_cat 0.9.0 cat"; do
-    # shellcheck disable=SC2086 -- $_spec is split into the script's positional args on purpose
-    cp_warm sh tools/warm-cargo-proxy.sh $_spec &
-    _wc=$((_wc + 1)); [ "$((_wc % warm_jobs))" -eq 0 ] && wait
-  done
-  # Local-source variant: the russh demo's source is the in-tree tests/russh-demo (NOT a
-  # crates.io crate), so only its 188-crate DEP closure is cargo-fetched through the proxy.
-  cp_warm sh tools/warm-cargo-proxy-local.sh tests/russh-demo russh &
-  wait   # drain the final batch + the local warm
+  # Resolve ONE host td-feed binary (the consolidated warm runner): the gate's td-built one,
+  # else a host cargo build of feed/ — done ONCE here, not raced across the parallel warms.
+  tdfeed=$(ls "$PWD"/.td-build-cache/td-feed/sd/newstore/*/bin/td-feed 2>/dev/null | head -1 || true)
+  if { [ -z "$tdfeed" ] || [ ! -x "$tdfeed" ]; } && command -v cargo >/dev/null 2>&1; then
+    ( cd feed && cargo build --release --quiet ) && tdfeed="$PWD/feed/target/release/td-feed" || tdfeed=""
+  fi
+  if [ -z "$tdfeed" ] || [ ! -x "$tdfeed" ]; then
+    echo "check.sh: no td-feed binary for the heavy warm (build feed/ with cargo) — skipping (best-effort; the heavy gates enforce presence)" >&2
+  else
+    # `td-feed warm sources` (serial-first): fetch the pinned seed/sources/*.lock bootstrap
+    # tarballs + produce the i386 + x86_64 kernel UAPI headers. Daemon lifecycle stays in
+    # shell — feed-ensure.sh runs the ONE shared td-feed serve daemon and we route the source
+    # fetches through it (TD_FEED_BASE, egress once across worktrees), with a direct-fetch
+    # fallback on a cold-feed miss.
+    sources_env="TD_ROOT=$PWD"
+    faddr=$(TD_FEED_BIN="$tdfeed" sh tools/feed-ensure.sh 2>/dev/null || true)
+    [ -n "$faddr" ] && sources_env="$sources_env TD_FEED_BASE=http://$faddr"
+    # shellcheck disable=SC2086 -- $sources_env is split into env KEY=VAL assignments on purpose
+    warm env $sources_env "$tdfeed" warm sources || true
+    # --- Corpus crate-guix-free warm: `td-feed warm crate` — cargo resolves+fetches each rust
+    # package's WHOLE crate closure THROUGH td's OWN cargo-proxy (now bound IN-PROCESS, so no
+    # background process + log scrape), the proxy verifying each .crate sha256 == the crates.io
+    # index cksum (upstream pin) -> .td-build-cache/crate-vendor/<name>/ for the offline
+    # `rust-<name>-crate-free` gates. Each warm is INDEPENDENT (its own loopback port + work
+    # dir), so they FAN OUT in batches of $warm_jobs instead of running serially. BEST-EFFORT.
+    cp_warm() { warm "$@" || echo "check.sh: cargo-proxy warm (best-effort) failed/timed out: $*" >&2; }
+    _wc=0
+    for _spec in \
+      "ripgrep 14.1.1" \
+      "sd 1.0.0" \
+      "fd-find 10.2.0 fd" \
+      "procs 0.14.10" \
+      "eza 0.21.6" \
+      "bat 0.25.0" \
+      "coreutils 0.9.0 uutils" \
+      "youki 0.6.0" \
+      "uu_cat 0.9.0 cat"; do
+      # shellcheck disable=SC2086 -- $_spec is split into the subcommand's positional args on purpose
+      cp_warm env TD_ROOT="$PWD" "$tdfeed" warm crate $_spec &
+      _wc=$((_wc + 1)); [ "$((_wc % warm_jobs))" -eq 0 ] && wait
+    done
+    # Local-source variant: the russh demo's source is the in-tree tests/russh-demo (NOT a
+    # crates.io crate), so only its 188-crate DEP closure is cargo-fetched through the proxy.
+    cp_warm env TD_ROOT="$PWD" "$tdfeed" warm crate-local tests/russh-demo russh &
+    wait   # drain the final batch + the local warm
+  fi
 fi
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only

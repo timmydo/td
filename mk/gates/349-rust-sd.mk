@@ -1,6 +1,6 @@
 # rust-sd — td builds `sd` (the find-and-replace tool, 1.0.0) with its WHOLE crate closure
 # (source + 111 deps) provisioned GUIX-FREE through td's OWN cargo-proxy: cargo resolved +
-# fetched it through `td-feed cargo-proxy` (tools/warm-cargo-proxy.sh, host PREP), the proxy
+# fetched it through `td-feed cargo-proxy` (td-feed warm crate, host PREP), the proxy
 # verifying each `.crate` sha256 == the crates.io index cksum (UPSTREAM pin, NOT a guix
 # artifact); source + deps interned by store-add-recursive, vendored via TD_VENDOR_DIR.
 # No guix oracle: the content-address (Cargo.lock pin == index cksum) is the oracle. Shared

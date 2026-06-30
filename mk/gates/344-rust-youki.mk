@@ -1,6 +1,6 @@
 # rust-youki — td builds `youki` (the Rust OCI container runtime, 0.6.0) with its WHOLE crate
 # closure (source + 663 deps) provisioned GUIX-FREE through td's OWN cargo-proxy: cargo
-# resolved + fetched it through `td-feed cargo-proxy` (tools/warm-cargo-proxy.sh youki 0.6.0,
+# resolved + fetched it through `td-feed cargo-proxy` (td-feed warm crate youki 0.6.0,
 # host PREP), the proxy verifying each `.crate` sha256 == the crates.io index cksum; source +
 # deps interned by store-add-recursive, vendored via TD_VENDOR_DIR. No guix oracle:
 # content-address (Cargo.lock pin == index cksum) is the oracle. Shared build+assert in

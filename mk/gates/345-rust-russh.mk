@@ -5,7 +5,7 @@
 # key, exec's a command, and reads the reply: a real SSH handshake (curve25519 kex + the aws-lc
 # crypto backend), no external sshd. Its 188-crate closure is fetched GUIX-FREE through td's OWN
 # cargo-proxy from the IN-TREE source's Cargo.lock — the SOURCE is the in-repo tests/russh-demo/
-# tree (NOT a crates.io crate), so tools/warm-cargo-proxy-local.sh (host PREP) cargo-fetches only
+# tree (NOT a crates.io crate), so td-feed warm crate-local (host PREP) cargo-fetches only
 # the deps through the proxy (each `.crate` sha256 == the crates.io index cksum). Source + the
 # vendor tree are interned by td's OWN store-add-recursive and vendored via TD_VENDOR_DIR. No guix
 # oracle: content-address (the in-tree Cargo.lock pin == index cksum) is the oracle. The crypto
@@ -31,7 +31,7 @@ rust-russh:
 	@set -euo pipefail; \
 	vendor="$(CURDIR)/.td-build-cache/crate-vendor/russh"; \
 	ncrate=`ls "$$vendor"/*.crate 2>/dev/null | wc -l`; \
-	test "$$ncrate" -ge 150 || { echo "ERROR: vendor dir $$vendor has <150 crates ($$ncrate) — the HOST PREP tools/warm-cargo-proxy-local.sh tests/russh-demo russh (check.sh prelude) must cargo-fetch them through the proxy first (offline gate cannot egress)" >&2; exit 1; }; \
+	test "$$ncrate" -ge 150 || { echo "ERROR: vendor dir $$vendor has <150 crates ($$ncrate) — the HOST PREP td-feed warm crate-local tests/russh-demo russh (check.sh prelude) must cargo-fetch them through the proxy first (offline gate cannot egress)" >&2; exit 1; }; \
 	clock="$(CURDIR)/tests/russh-demo/Cargo.lock"; \
 	test -f "$$clock" || { echo "ERROR: no in-tree Cargo.lock at $$clock" >&2; exit 1; }; \
 	miss=0; for c in "$$vendor"/*.crate; do sha=`sha256sum "$$c" | cut -d' ' -f1`; grep -qF "$$sha" "$$clock" || { echo "FAIL: crate `basename $$c` sha $$sha is NOT pinned in tests/russh-demo/Cargo.lock" >&2; miss=$$((miss + 1)); }; done; \

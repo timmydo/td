@@ -31,7 +31,7 @@ MES_TB=".td-build-cache/sources/`lf "$MES_LOCK" file`"; NYACC_TB=".td-build-cach
 TCC_TB=".td-build-cache/sources/`lf "$TCC_LOCK" file`"; MAKE_TB=".td-build-cache/sources/`lf "$MAKE_LOCK" file`"
 for pair in "$MES_TB:`lf "$MES_LOCK" sha256`" "$NYACC_TB:`lf "$NYACC_LOCK" sha256`" "$TCC_TB:`lf "$TCC_LOCK" sha256`" "$MAKE_TB:`lf "$MAKE_LOCK" sha256`"; do
   f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'sh tools/warm-bootstrap-sources.sh'"
+  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 echo "   [pinned-input] td-fetched mes + nyacc + tcc + make tarballs match their lock sha256"

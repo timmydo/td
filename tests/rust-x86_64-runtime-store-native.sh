@@ -49,12 +49,12 @@ unset TD_X86_64_LIB
 RUST_LOCK=`ls seed/sources/rust-*.lock 2>/dev/null | head -1`
 test -n "$RUST_LOCK" || fail "no seed/sources/rust-*.lock pin"
 RUST_FILE=`lf "$RUST_LOCK" file`; RUST_TB=".td-build-cache/sources/$RUST_FILE"
-test -f "$RUST_TB" || fail "warmed $RUST_TB absent — run tools/warm-bootstrap-sources.sh (host PREP)"
+test -f "$RUST_TB" || fail "warmed $RUST_TB absent — run td-feed warm sources (host PREP)"
 test "`sha "$RUST_TB"`" = "`lf "$RUST_LOCK" sha256`" || fail "warmed $RUST_TB sha256 != lock pin"
 ZLIB_LOCK=`ls seed/sources/zlib-*.lock 2>/dev/null | head -1`
 test -n "$ZLIB_LOCK" || fail "no seed/sources/zlib-*.lock pin"
 ZLIB_TB=".td-build-cache/sources/`lf "$ZLIB_LOCK" file`"
-test -f "$ZLIB_TB" || fail "warmed $ZLIB_TB absent — run tools/warm-bootstrap-sources.sh (host PREP)"
+test -f "$ZLIB_TB" || fail "warmed $ZLIB_TB absent — run td-feed warm sources (host PREP)"
 test "`sha "$ZLIB_TB"`" = "`lf "$ZLIB_LOCK" sha256`" || fail "warmed $ZLIB_TB sha256 != lock pin"
 echo "   [supply-chain] rust ($RUST_FILE) + zlib match their lock sha256 — upstream bytes, not guix"
 

@@ -1,6 +1,6 @@
 # rust-fd — td builds `fd` (the fast find, fd-find 10.2.0) with its WHOLE crate closure
 # (source + 113 deps) provisioned GUIX-FREE through td's OWN cargo-proxy: cargo resolved +
-# fetched it through `td-feed cargo-proxy` (tools/warm-cargo-proxy.sh fd-find 10.2.0 fd, host
+# fetched it through `td-feed cargo-proxy` (td-feed warm crate fd-find 10.2.0 fd, host
 # PREP — the crates.io name `fd-find` differs from the recipe name `fd`), the proxy verifying
 # each `.crate` sha256 == the crates.io index cksum (UPSTREAM pin, NOT a guix artifact);
 # source + deps interned by store-add-recursive, vendored via TD_VENDOR_DIR. No guix

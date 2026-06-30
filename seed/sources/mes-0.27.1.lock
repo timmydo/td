@@ -1,6 +1,6 @@
 # seed/sources/mes-0.27.1.lock — GNU Mes 0.27.1 release tarball, the source-bootstrap brick 2
 # input. NOT vendored in-repo and NOT guix-fetched: td's OWN fetcher (td-fetch) warms it from
-# the pinned url + sha256 into .td-build-cache/sources/ (tools/warm-bootstrap-sources.sh, run in
+# the pinned url + sha256 into .td-build-cache/sources/ (td-feed warm sources, run in
 # check.sh's HOST prelude — the offline loop has no egress). The bootstrap-mes gate reads the
 # warmed tarball, re-checks this sha256, and builds mes-m2 from it. Version 0.27.1 is the release
 # version-matched to stage0-posix 3b9c2bb (its lib/m2/x86_64/x86_64_defs.M1 carries the

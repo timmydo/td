@@ -40,7 +40,7 @@ const MES_LOCK: &str = "mes-0.27.1.lock";
 
 /// Where a recipe finds its inputs: the repo root (vendored seed, lock files) and
 /// the warmed-source cache (`.td-build-cache/sources/`, populated by
-/// `tools/warm-bootstrap-sources.sh` in check.sh's HOST prelude — the offline loop
+/// `td-feed warm sources` in check.sh's HOST prelude — the offline loop
 /// never egresses).
 pub struct Ctx {
     pub repo_root: PathBuf,
@@ -217,7 +217,7 @@ fn verify_pin(cx: &Ctx, pin: &Pin) -> Result<String, String> {
             let tarball = cx.sources_dir.join(&pin.file);
             if !tarball.exists() {
                 return Err(format!(
-                    "the pinned tarball is not warm ({}) — run 'sh tools/warm-bootstrap-sources.sh' to td-fetch {} (needs network); check.sh's prelude does this",
+                    "the pinned tarball is not warm ({}) — run 'td-feed warm sources' to td-fetch {} (needs network); check.sh's prelude does this",
                     tarball.display(),
                     pin.url
                 ));
