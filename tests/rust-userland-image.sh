@@ -65,8 +65,14 @@ store_paths() { grep -rhoE '/gnu/store/[0-9a-z]{32}-[a-zA-Z0-9._+-]+' "$@" 2>/de
   "$TB" elf-interp "$NS/bin/$BIN" 2>/dev/null || true
   "$TB" elf-rpath  "$NS/bin/$BIN" 2>/dev/null | tr ':' '\n' || true
   store_paths "$NS/bin/$BIN"
-} | grep -oE '/gnu/store/[0-9a-z]{32}-[a-zA-Z0-9._+-]+' | sort -u > "$work/direct.txt"
-test -s "$work/direct.txt" || { echo "FAIL: no /gnu/store refs found in $NS/bin/$BIN (a static-store binary?)" >&2; exit 1; }
+} | grep -oE '/gnu/store/[0-9a-z]{32}-[a-zA-Z0-9._+-]+' | sort -u > "$work/refs.txt"
+# The binary's OWN OUT path is content-addressed at /gnu/store but registered in TD's db,
+# NOT /var/guix/db; it is laid into the rootfs directly (step 3 below). Drop it before the
+# guix-db closure lookup so that lookup sees only guix toolchain paths (the PT_INTERP +
+# DT_RUNPATH libs), which ARE in /var/guix/db. Any OTHER td-interned ref would make
+# store-closure fail LOUD ("root not in store DB") — never ship a silently-incomplete image.
+grep -vxF "$OUT" "$work/refs.txt" > "$work/direct.txt" || true
+test -s "$work/direct.txt" || { echo "FAIL: no guix /gnu/store runtime refs in $NS/bin/$BIN (only its own OUT? a static-store binary?)" >&2; exit 1; }
 echo "  [structural] $BIN has $(wc -l < "$work/direct.txt") direct /gnu/store runtime ref(s) (PT_INTERP + DT_RUNPATH + embedded)" >&2
 
 # --- (2) closure: expand each direct ref to its full closure via td's OWN reader of
