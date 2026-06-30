@@ -912,12 +912,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("bootstrap-sed-corpus-store-native");
         return;
     }
-    // The rung-X2 native gcc gate's OWN files: a native x86_64 gcc/binutils built on top of the cross
-    // toolchain. Maps only to gate 422 (the native build is downstream of the cross rungs).
-    if pattern_matches(
-        "tests/bootstrap-x86_64-native-gcc-store-native.sh|mk/gates/422-bootstrap-x86_64-native-gcc-store-native.mk",
-        p,
-    ) {
+    // The rung-X2 native gcc gate's consumer test: a native x86_64 gcc/binutils built on top of the
+    // cross toolchain. Maps only to gate 422 (the native build is downstream of the cross rungs). The
+    // gate's mk/gates/422-*.mk file is already handled by the generic `mk/gates/*.mk` arm above.
+    if pattern_matches("tests/bootstrap-x86_64-native-gcc-store-native.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         return;

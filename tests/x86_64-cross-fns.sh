@@ -711,8 +711,13 @@ verify_x86_64_native_ownroot() {
   # addressed gcc tree is internally consistent — not patched after the fact).
   NBP=`"$TB" store-add-recursive "\`basename "$XNBU"\`" "$XNBU" "$store" "$sndb"` || { echo "store-add native binutils failed" >&2; return 1; }
   nbrel=`basename "$NBP"`
+  # Re-point the native gcc's tooldir as/ld/... at the INTERNED native-binutils basename ($nbrel) before
+  # interning the gcc. Key on the SOURCE ($XNBU/bin/$t), NOT the dest: the build-time symlinks point at the
+  # mktemp basename and are DANGLING here, so `test -e <dest>` (which FOLLOWS the link) would be false and
+  # skip every tool — leaving the interned tooldir pointing at a non-existent /td/store/native-binutils.
+  mkdir -p "$XNGCC/$XTARGET/bin"
   for t in as ld ar nm ranlib strip objcopy objdump; do
-    test -e "$XNGCC/$XTARGET/bin/$t" && ln -sf "../../../$nbrel/bin/$t" "$XNGCC/$XTARGET/bin/$t" || true
+    test -e "$XNBU/bin/$t" && ln -sf "../../../$nbrel/bin/$t" "$XNGCC/$XTARGET/bin/$t" || true
   done
   NGP=`"$TB" store-add-recursive "\`basename "$XNGCC"\`" "$XNGCC" "$store" "$sndb"` || { echo "store-add native gcc failed" >&2; return 1; }
   GLP=`"$TB" store-add-recursive glibc-2.41-x86_64 "$XGLIBC" "$store" "$sndb"` || { echo "store-add x86_64 glibc failed" >&2; return 1; }
@@ -720,6 +725,16 @@ verify_x86_64_native_ownroot() {
   echo "   [content-addr] interned the native gcc ($NGP), native binutils, and the x86_64 glibc in /td/store"
   ngrel=`basename "$NGP"`; glrel=`basename "$GLP"`
   chmod -R u+w "$store"
+  # [self-contained] DURABLE (no guix oracle): the interned native gcc carries as/ld in its OWN tooldir
+  # ($XTARGET/bin) resolving (as a SIBLING /td/store path) to the interned native binutils — so the native
+  # gcc finds its assembler/linker relative to argv[0], not only via PATH. A regression that drops/breaks
+  # the re-point above reds HERE (the symlink would be dangling), instead of being masked by the probe's
+  # PATH fallback. Mirrors the cross gcc's [self-contained] leg (x86_64_bundle_tooldir).
+  for t in as ld; do
+    test -e "$store/$ngrel/$XTARGET/bin/$t" || { echo "native gcc tooldir '$t' is dangling (not the interned /td/store/$nbrel) — not self-contained" >&2; return 1; }
+    case `readlink "$store/$ngrel/$XTARGET/bin/$t"` in */"$nbrel"/bin/"$t") ;; *) echo "native gcc tooldir '$t' does not point at the interned native binutils $nbrel" >&2; return 1 ;; esac
+  done
+  echo "   [self-contained] the interned native gcc bundles as/ld in its own tooldir ($XTARGET/bin) → the interned /td/store native binutils, resolved relative to argv[0]"
   bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
   bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
   bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
