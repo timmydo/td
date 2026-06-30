@@ -1,16 +1,6 @@
 td test keys — TEST FIXTURES ONLY. Committed fixtures so builds stay
 reproducible (a key generated at build time would not be). Do not reuse
-either keypair for anything.
-
-td_test_ed25519{,.pub} is a throwaway ed25519 keypair used solely by
-tests/boot.scm to prove that key-based SSH login to the td guest works and
-that a remote command's output is captured.
-
-It is NOT provisioned into the shipped system: the test authorizes it only on
-a test-only operating-system overlay (see tests/boot.scm). The frozen
-`td-system` (and its qcow2/OCI images, the M4/M5 differential oracle) does not
-contain this account or key. The private key grants no access to anything but
-an ephemeral test VM that is wiped on reset.
+the keypair for anything.
 
 td_m12_signify{.sec,.pub} is a throwaway signify (ed25519) keypair used solely
 by the M12 signed-distribution rungs (system/td-registry.scm and the placer's

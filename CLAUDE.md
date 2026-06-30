@@ -87,9 +87,13 @@ Your inner loop for every change:
 write/change declaration
   -> evaluate config            (fails fast, sub-second)
   -> guix build --check TARGET  (reproducibility oracle)
-  -> boot marionette system test (boot + behavioral assertion)
-  -> reset VM state
+  -> package-manager behavioral test (built tool runs / round-trip)
 ```
+
+(The marionette VM-boot/behavioral gates — boot-disk-native, reset-native,
+rollback, container, run — were removed 2026-06-29, human-directed; td no longer
+boots the image under test. Behavioral coverage is now the package-manager loop:
+built tools run, link tests, the per-package guix differential.)
 
 Run all of it with the single pass/fail command:
 
@@ -112,7 +116,7 @@ target expands. That directory is the **authoritative gate list**, the one place
 written down — add a gate by dropping a new `mk/gates/<NNN>-<name>.mk` file, never by
 editing a shared list line (so concurrent gate PRs don't collide). Broad shape:
 config eval →
-differentials → `guix build --check` → behavioral/marionette tests.
+differentials → `guix build --check` → package-manager behavioral tests.
 
 Every build/test runs inside that fresh td sandbox so your own environment cannot
 contaminate results; `./check.sh <target>` runs a single Makefile target in the same
@@ -324,8 +328,9 @@ it.
   prefix sets order (cheap serial-first, heavy LPT for `-j2`); `make list-gates` prints
   the assembled pools.
 - `system/` — Guile system declarations. The frozen oracle lives at `system/td.scm`.
-- `tests/` — marionette system tests in the `(gnu tests)` style, plus the
-  differential/coverage gates.
+- `tests/` — the package-manager/differential/coverage gate scripts and the
+  `guix system image` / OCI / placement gates. (The marionette `(gnu tests)`
+  VM-boot tests were removed 2026-06-29, human-directed.)
 - `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
   deliberately (exclusive landing), never silently.
 - `DESIGN.md` — the settled contract: loop, target, invariants, roadmap (§7.1),
@@ -345,7 +350,7 @@ it.
 
 **Naming & formatting**
 
-- Scheme files: lowercase kebab-case (`td.scm`, `boot.scm`). Modules carry a `td`
+- Scheme files: lowercase kebab-case (`td.scm`, `eval.scm`). Modules carry a `td`
   prefix.
 - Hand-formatted 2-space indentation, no tabs. Do NOT run `guix style` — it was tried
   in M2 and mangled the layout; the hand-formatted style is the convention.

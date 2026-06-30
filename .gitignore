@@ -46,5 +46,9 @@ recipes/target/
 .td-last-green
 .td-daily-verdict
 
+# Ad-hoc captured ./check.sh run logs (e.g. a backgrounded full-loop run). Transient
+# host-local output, never versioned.
+.check-*.log
+
 # Claude Code session runtime state — session-specific, never versioned.
 .claude/scheduled_tasks.lock

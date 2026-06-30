@@ -41,31 +41,6 @@ TD_GATE_TIMING_DIR := $(CURDIR)/.td-build-cache/gate-timing
 TD_GATE_RUN := $(shell date +%s%N)
 export TD_GATE_TIMING_LOG := $(TD_GATE_TIMING_DIR)/run-$(TD_GATE_RUN).log
 
-# Canned lower-then-realise for marionette system tests (the `test`,
-# `boot-disk` and `reset` gates; `container` lowers multiple artifacts and
-# keeps its own block). Two steps on purpose: `guix repl` reading a script
-# from STDIN always exits 0 (it swallows the script's exit code), so building
-# the test there would make a FAILED test look green. Instead: (1) lower the
-# monadic test value to a derivation file name via repl, then (2) realise it
-# with `guix build`, whose exit status is honest and which streams the
-# marionette log so failures are visible.
-#   $(1) = test module, e.g. (tests boot)
-#   $(2) = system-test variable, e.g. %test-td-boot
-#   $(3) = label for messages, e.g. boot
-define realise-system-test
-	@drv=`printf '%s\n' \
-	    '(use-modules (guix) (gnu tests) $(1))' \
-	    '(with-store store' \
-	    '  (set-build-options store #:use-substitutes? #f #:offload? #f)' \
-	    '  (format #t "DRV=~a~%"' \
-	    '          (derivation-file-name' \
-	    '           (run-with-store store (system-test-value $(2))))))' \
-	  | $(GUIX) repl $(LOAD) 2>/dev/null | sed -n 's/^DRV=//p'`; \
-	test -n "$$drv" || { echo "ERROR: could not lower the $(3) test derivation" >&2; exit 1; }; \
-	echo ">> realise $(3) test derivation: $$drv"; \
-	$(GUIX) build "$$drv"
-endef
-
 # Bare `make` runs the in-sandbox loop, never the sandbox wrapper — guards
 # against `container-check` (which calls ./check.sh) being the default goal and
 # recursing into nested containers.

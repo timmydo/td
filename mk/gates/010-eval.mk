@@ -5,5 +5,5 @@
 #    FILE` honors the exit code, so a load error reddens this gate honestly.
 CHEAP_GATES += eval
 eval:
-	@echo ">> eval: load (system td), (system td-typed), (tests boot) and (tests container)"
+	@echo ">> eval: load (system td), (system td-typed) and the system declaration modules"
 	$(GUIX) repl $(LOAD) tests/eval.scm

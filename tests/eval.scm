@@ -13,11 +13,7 @@
              (system td-hardening)
              (system td-generation)
              (system td-place)
-             (system td-disk)
              (system td-builder)
-             (system td-build)
-             (tests boot)
-             (tests container)
-             (tests rollback))
+             (system td-build))
 
 (display "eval ok\n")

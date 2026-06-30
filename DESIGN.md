@@ -47,21 +47,26 @@ ladder, short-circuiting on the first failure; **the drop-in fragments under
 instead of restating it, and a new gate is a new fragment file, not an edit to a shared
 list. Broad shape: config eval → differentials → `guix build --check` →
 package-manager behavioral/oracle tests (built tools run, link tests, the
-per-package guix differential). The whole-OS boot tier — marionette `(gnu tests)`
-system tests and `guix system image` builds — is **parked out of the default
-`check` into the on-demand `check-system`** while td's focus is the user-space
-package manager (a human-directed scope call: Makefile `check-system`, DESIGN §4.3);
-`check-fast` is the cheap + typed-front-end subset CI runs. Plain `make check` is
-only correct when you're already inside that sandbox.
+per-package guix differential). The whole-OS image tier — `guix system image`
+builds + the OCI/placement/manifest gates — sits in the on-demand `check-system`
+while td's focus is the user-space package manager (a human-directed scope call:
+Makefile `check-system`, DESIGN §4.3). The marionette `(gnu tests)` VM-boot
+behavioral gates that used to live there (boot-disk-native, reset-native, rollback,
+container, run) were **removed** (human-directed 2026-06-29); `check-fast` is the
+cheap + typed-front-end subset CI runs. Plain `make check` is only correct when
+you're already inside that sandbox.
 
 ### 1.2 Rung classes
 
 - Hermetic build/dev env: td's own `td-builder host-sandbox` (no host leakage; §7.1).
 - Reproducibility oracle: `guix build --check` (and `--rounds=2` where cheap). A
   non-reproducible output is a failing test.
-- Boot + behavioral: marionette `(gnu tests)` system tests that boot the image and
-  drive the guest from Guile — run in the on-demand `check-system` tier, parked out
-  of the default `check` (§1.1).
+- Whole-OS image: `guix system image` builds + the OCI/placement/manifest gates,
+  in the on-demand `check-system` tier (§1.1). The marionette `(gnu tests)` VM-boot
+  behavioral gates (boot-disk-native, reset-native, rollback, container, run) that
+  drove a booted guest from Guile were removed 2026-06-29 (human-directed); td has
+  no VM-boot behavioral gate now — the package-manager loop keeps its own behavioral
+  coverage (built tools run, link tests, the per-package differential).
 
 Fuzzing/adversarial and real-hardware rungs are deferred (off-roadmap).
 
@@ -92,10 +97,12 @@ the `reset` rung (landed 2026-06-10).
 
 ### 2.1 Base acceptance test
 
-The base of the ladder, still a live rung: `system/td.scm` builds reproducibly
-(`guix build --check` passes) into a bootable image; `tests/boot.scm` boots it and
-asserts that `uname -r` in the guest equals the kernel version pinned by the
-declaration; then the harness resets the ephemeral VM.
+The base of the ladder: `system/td.scm` builds reproducibly (`guix build --check`
+passes) into a bootable image (the `build` and OCI gates lower and
+reproducibility-check it). The marionette boot assertion — `tests/boot.scm` booting
+the image, checking `uname -r` against the declaration's pinned kernel, then
+resetting the ephemeral VM — was removed 2026-06-29 (human-directed); td no longer
+boots the image under test.
 
 ### 2.2 Reused vs. built
 
@@ -186,7 +193,8 @@ git) + restored `td-state/state` (and `home`). Nothing outside `td-state` is wor
 backing up, by construction.
 
 **Enforcement is staged.** M10.3: convention — the allowlist mounts exist, and the
-rollback test asserts both directions (a declared path written under generation N
+rollback test (the marionette gate, removed 2026-06-29; the model below stands as
+design) asserted both directions (a declared path written under generation N
 persists into the N−1 boot; an undeclared write does not follow the swap — it
 merely lingers inside that generation's root until pruned). M11: kernel-enforced —
 sealed read-only image + tmpfs root make an undeclared write fail closed (EROFS).
@@ -566,11 +574,13 @@ approval (§4.3). The live status of in-flight work is the open draft PRs
 
 **Mainline** (serial — each builds on the last; one agent drives it at a time):
 
-- **M10.3 — manual rollback + declared persistence.** From a disk carrying two
-  placed generations, the marionette test boots generation N, asserts its identity
-  (root label / system), reboots selecting generation N−1 from the GRUB menu, and
-  asserts the older identity. Persistence is asserted per the §2.6 state model, in
-  both directions: a declared `td-state` allowlist path written under generation N
+- **M10.3 — manual rollback + declared persistence.** (The marionette rollback
+  gate was removed 2026-06-29, human-directed; the model below stands as design,
+  no longer asserted by a booting test.) From a disk carrying two placed
+  generations, the test booted generation N, asserted its identity (root label /
+  system), rebooted selecting generation N−1 from the GRUB menu, and asserted the
+  older identity. Persistence was asserted per the §2.6 state model, in both
+  directions: a declared `td-state` allowlist path written under generation N
   persists into the N−1 boot; an undeclared write does not follow the swap. (§2.6,
   settled 2026-06-10, governs over older "placed state persists" wording.)
 - **M11 — verified generations.** A generation's root carries build-time integrity
@@ -946,8 +956,8 @@ Squash makes the suspect a single, atomically-revertable commit (the
 merge-strategy reason to keep squash); the script's loop guard refuses to revert
 a revert. An agent opens the revert PR with its own bot credentials, so it
 triggers the required checks and needs no machine PAT or ruleset bypass. The net
-is **the fast tier only** — a heavy-only break (boot/VM/marionette/
-reproducibility, invisible to `check-fast`) is not caught; it surfaces on the
+is **the fast tier only** — a heavy-only break (system-image/reproducibility,
+invisible to `check-fast`) is not caught; it surfaces on the
 next manual full `./check.sh` and is fixed forward. Closing that gap by re-running the full loop in CI per-merge is not
 feasible (cold hosted runners can't rebuild td's closure; the ci-image is keyed
 by channel pin, not main commit), so a **dev-box DAILY full-loop heal is that
