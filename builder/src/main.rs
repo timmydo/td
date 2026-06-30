@@ -25,6 +25,7 @@ mod elf;
 mod json;
 mod lock;
 mod nar;
+mod oci;
 mod sandbox;
 mod scan;
 mod sha256;
@@ -1846,6 +1847,23 @@ fn nice_self_for_builds() {
     let _ = sys::set_self_priority(parse_build_nice(std::env::var("TD_BUILD_NICE").ok()));
 }
 
+/// Parse an `oci-image`/`oci-image-closure` CONFIG-JSON ({"repoTag","env","entrypoint",
+/// "cmd"}, all optional; repoTag defaults to td:latest) into an `oci::ImageConfig`.
+fn image_config_from_json(cj: &json::Json) -> oci::ImageConfig {
+    let strs = |key: &str| -> Vec<String> {
+        cj.get(key)
+            .and_then(json::Json::as_arr)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+    oci::ImageConfig {
+        repo_tag: cj.get("repoTag").and_then(json::Json::as_str).unwrap_or("td:latest").to_string(),
+        env: strs("env"),
+        entrypoint: strs("entrypoint"),
+        cmd: strs("cmd"),
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     // Builds run nicer than the loop's other work so a shared desktop stays smooth.
@@ -1893,6 +1911,79 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: nar-restore {narfile} {dest}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // oci-image: pack a PREPARED rootfs directory into a deterministic, uncompressed
+        // docker-archive (OCI image) — td-native, no guix/Guile (system-image-native brick
+        // 1). CONFIG-JSON is {"repoTag","env":[],"entrypoint":[],"cmd":[]} (all optional;
+        // repoTag defaults to td:latest). Usage: oci-image ROOTFS-DIR CONFIG-JSON OUT.tar
+        Some("oci-image") if args.len() == 5 => {
+            let (rootfs, config_file, out_file) = (&args[2], &args[3], &args[4]);
+            let run = || -> Result<(), String> {
+                let cfg_text = std::fs::read_to_string(config_file)
+                    .map_err(|e| format!("read {config_file}: {e}"))?;
+                let cj = json::parse(&cfg_text).map_err(|e| format!("config JSON: {e}"))?;
+                let cfg = image_config_from_json(&cj);
+                let mut w =
+                    std::fs::File::create(out_file).map_err(|e| format!("create {out_file}: {e}"))?;
+                oci::write_docker_archive(&mut w, Path::new(rootfs), &cfg)
+                    .map_err(|e| format!("write docker-archive: {e}"))?;
+                Ok(())
+            };
+            match run() {
+                Ok(()) => {
+                    println!("{out_file}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: oci-image: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // oci-image-closure: the td-native replacement for `guix system image -t docker`.
+        // Compute the store CLOSURE of ROOT… from DB (no guix process — store_db_read),
+        // lay each member at its STORE-DIR location into a single layer, and pack the
+        // docker-archive. Usage: oci-image-closure DB STORE-DIR CONFIG-JSON OUT.tar ROOT...
+        Some("oci-image-closure") if args.len() >= 7 => {
+            let (db_path, store_dir, config_file, out_file) =
+                (&args[2], &args[3], &args[4], &args[5]);
+            let roots = &args[6..];
+            let run = || -> Result<usize, String> {
+                let data = std::fs::read(db_path).map_err(|e| format!("read db {db_path}: {e}"))?;
+                let db = store_db_read::Db::open(data)?;
+                let mut closure: Vec<String> = Vec::new();
+                for r in roots {
+                    closure.extend(db.closure(r)?);
+                }
+                closure.sort();
+                closure.dedup();
+                let n = closure.len();
+                let cfg_text = std::fs::read_to_string(config_file)
+                    .map_err(|e| format!("read {config_file}: {e}"))?;
+                let cj = json::parse(&cfg_text).map_err(|e| format!("config JSON: {e}"))?;
+                let cfg = image_config_from_json(&cj);
+                let mut w =
+                    std::fs::File::create(out_file).map_err(|e| format!("create {out_file}: {e}"))?;
+                oci::write_docker_archive_from_store_paths(
+                    &mut w,
+                    Path::new(store_dir),
+                    &closure,
+                    &cfg,
+                )
+                .map_err(|e| format!("write docker-archive: {e}"))?;
+                Ok(n)
+            };
+            match run() {
+                Ok(n) => {
+                    eprintln!("td-builder: oci-image-closure: packed {n} store paths");
+                    println!("{out_file}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: oci-image-closure: {e}");
                     ExitCode::FAILURE
                 }
             }
