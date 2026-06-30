@@ -609,6 +609,13 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("rust-coreutils");
         sel.add_target("rust-uutils");
         sel.add_target("rust-youki");
+        sel.add_target("rust-userland-image");
+        return;
+    }
+
+    if p == "tests/rust-userland-image.sh" {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("rust-userland-image");
         return;
     }
 
