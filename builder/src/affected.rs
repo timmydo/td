@@ -683,6 +683,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    if p == "tests/td-shell-userland.sh" {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("td-shell-userland");
+        return;
+    }
+
     if p == "tests/td-shell-seed.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("td-shell-seed");
