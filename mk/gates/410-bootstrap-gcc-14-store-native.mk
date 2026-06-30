@@ -8,6 +8,7 @@
 # own-then-diverges (it already has glibc 2.16.0) and builds a usable gcc 14.3.0 directly in one rung. Built
 # STATIC (so gcc 14's xgcc runs in the sandbox); the wrapper links DYNAMIC vs the shared glibc 2.16.0.
 # DURABLE: pinned-input, no-guix (no /gnu/store in gcc 14's gcc/g++/cpp/cc1 NOR libc.so.6), content-addr,
+# repro (a normalized double-build is nar-identical — intrinsic byte-reproducibility, no guix oracle),
 # behavioral (plain wrapped gcc/g++ → dynamic C/C++ /td/store → 42), structural (/td/store the store, /gnu/store
 # ABSENT). A current gcc at /td/store — the toolchain that unblocks retiring the guix seed. NOT a BUILD_GATE.
 HEAVY_GATES += bootstrap-gcc-14-store-native
