@@ -17,6 +17,9 @@
 #   [pinned-input] chain tarballs + boot patches + gcc-4.9.4 + gcc-14.3.0 + gmp/mpfr/mpc match sha256.
 #   [no-guix]      built with gcc/g++/cc/guile/guix DENIED; no /gnu/store in gcc 14's gcc/g++/cpp/cc1 NOR libc.so.6.
 #   [content-addr] the interned paths are /td/store/<nar-hash>-<name>.
+#   [repro]        gcc 14.3.0 is BYTE-REPRODUCIBLE: two independent from-source builds, normalized
+#                  (strip --strip-debug + deterministic archives via the freshly-built binutils 2.44 -D,
+#                  drop *.la — tests/repro-lib.sh), are byte-identical (durable intrinsic double-build).
 #   [behavioral]   the /td/store gcc-14.3.0 wrapper, called PLAINLY, compiles a DYNAMIC C AND C++ (libstdc++)
 #                  program (interp = /td/store ld-linux.so.2); both RUN in the own-root → 42 — a MODERN gcc.
 #   [structural]   inside the own-root /td/store IS the store AND /gnu/store is ABSENT.
@@ -823,6 +826,12 @@ for pair in "$GCC14_TB:`lf "$GCC14_LOCK" sha256`" "$GMP63_TB:`lf "$GMP63_LOCK" s
   test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
 done
 echo "   [pinned-input] + gcc-14.3.0/gmp-6.3.0/mpfr-4.2.1/mpc-1.3.1 (the modern gcc prereqs) match their pins"
+# binutils 2.44 — built only to supply a strip >= 2.24 with -D / --enable-deterministic-archives for the
+# [repro] leg (the chain's binutils-mesboot 2.20.1a strip has no -D, so it cannot canonicalize archives).
+BU244_LOCK=`ls seed/sources/binutils-2.44.lock`; BU244_TB=".td-build-cache/sources/`lf "$BU244_LOCK" file`"
+test -f "$BU244_TB" || fail "pinned tarball not warm ($BU244_TB) — run 'td-feed warm sources'"
+test "`sha "$BU244_TB"`" = "`lf "$BU244_LOCK" sha256`" || fail "warmed $BU244_TB sha256 != lock pin"
+echo "   [pinned-input] + binutils-2.44 (the modern strip for the repro leg) matches its pin"
 
 # build_gcc_14 — MODERN GCC 14.3.0 (guix's gcc-boot0/gcc-final version) built by gcc-mesboot 4.9.4 against
 # the static glibc 2.16.0, with gmp-6.3.0/mpfr-4.2.1/mpc-1.3.1 (gcc 14's contrib/download_prerequisites
@@ -833,39 +842,82 @@ echo "   [pinned-input] + gcc-14.3.0/gmp-6.3.0/mpfr-4.2.1/mpc-1.3.1 (the modern 
 # --with-native-system-header-dir=/include (gcc 14 CONCATENATES the two; both absolute → a doubled header
 # path that breaks fixincludes). MAKEINFO=true. Installs via DESTDIR (prefix is the unwritable /td/store).
 build_gcc_14() {
-  cpath=$1; gccm=$2; glibc=$3; bmb=$4; out=$5
-  rm -rf "$out"; mkdir -p "$out/bin"
+  cpath=$1; gccm=$2; glibc=$3; bmb=$4; bmb244=$5; out=$6
+  rm -rf "$out"; mkdir -p "$out"
   gcc="$gccm/bin/gcc"; gpp="$gccm/bin/g++"; g494inc="$gccm/lib/gcc/i686-unknown-linux-gnu/4.9.4/include"
   xzb=`command -v xz 2>/dev/null || ls /gnu/store/*'xz-'*/bin/xz 2>/dev/null | sort | head -1`
   test -n "$xzb" || { echo "no xz to unpack gcc-14.3.0" >&2; return 1; }
-  "$xzb" -dc "$GCC14_TB" | tar -xf - -C "$out" --strip-components=1 || { echo "gcc-14.3.0 unpack failed" >&2; return 1; }
-  "$xzb" -dc "$GMP63_TB" | tar -xf - -C "$out" || { echo "gmp unpack failed" >&2; return 1; }
-  "$xzb" -dc "$MPFR421_TB" | tar -xf - -C "$out" || { echo "mpfr unpack failed" >&2; return 1; }
-  tar -xzf "$MPC131_TB" -C "$out" || { echo "mpc unpack failed" >&2; return 1; }
-  ( cd "$out" && ln -sf gmp-6.3.0 gmp && ln -sf mpfr-4.2.1 mpfr && ln -sf mpc-1.3.1 mpc ) || { echo "gmp/mpfr/mpc symlink failed" >&2; return 1; }
-  kh="$out/kh"; mkdir -p "$kh"; tar -xzf "$KH_TB" -C "$kh" || { echo "kernel headers unpack failed" >&2; return 1; }
-  ln -sf "$gccm"/bin/cpp "$out/bin/cpp"
-  for t in "$bmb"/bin/*; do ln -sf "$t" "$out/bin/`basename "$t"`"; done
+  # REPRODUCIBILITY (gcc14-repro / [[toolchain-repro]]): FIXED ABSOLUTE /tmp paths — NOT per-build mktemps —
+  # for the dirs whose absolute path gcc 14 bakes into bytes `strip --strip-debug` can NOT scrub, so two
+  # independent from-source builds are byte-identical after normalization (the [repro] leg below):
+  #   - $gsrc  the gcc source + build dir → leaks into cc1/cc1plus/fixincl as .symtab STT_FILE + __FILE__ in
+  #            .rodata (NOT DWARF, so --strip-debug keeps it).
+  #   - $wb    the host-wrapper dir → it is $(LINKER) in gcc's `checksum-options`, which genchecksum hashes
+  #            into the cc1/cc1plus executable_checksum (16-byte MD5 in .rodata).
+  #   - $tb    the build-tool dir → fixincl bakes the absolute path of the `sed` it found into its script (.rodata).
+  #   - $gsys  --with-build-sysroot → fixincludes copies the sysroot headers into include-fixed/* whose text
+  #            records the sysroot path (a per-build mktemp made each from-seed build differ run-to-run).
+  # FIXED ABSOLUTE /tmp (NOT $ROOT-relative) so the baked strings are checkout-independent for every builder;
+  # the loop's host-sandbox gives each run a private tmpfs /tmp, so the fixed names are isolated per run and
+  # vanish on teardown. rm'd fresh each call; the sequential repro double-build never overlaps. The OUTPUT
+  # staging $out stays a per-build mktemp (DESTDIR is not baked into the binaries).
+  gsrc=/tmp/td-i686-gcc14-src; rm -rf "$gsrc"; mkdir -p "$gsrc"
+  wb=/tmp/td-i686-gcc14-wrapper; rm -rf "$wb"; mkdir -p "$wb"
+  tb=/tmp/td-i686-gcc14-tools; rm -rf "$tb"; mkdir -p "$tb"
+  gsys=/tmp/td-i686-gcc14-sysroot; rm -rf "$gsys"; ln -s "$glibc" "$gsys"
+  "$xzb" -dc "$GCC14_TB" | tar -xf - -C "$gsrc" --strip-components=1 || { echo "gcc-14.3.0 unpack failed" >&2; return 1; }
+  "$xzb" -dc "$GMP63_TB" | tar -xf - -C "$gsrc" || { echo "gmp unpack failed" >&2; return 1; }
+  "$xzb" -dc "$MPFR421_TB" | tar -xf - -C "$gsrc" || { echo "mpfr unpack failed" >&2; return 1; }
+  tar -xzf "$MPC131_TB" -C "$gsrc" || { echo "mpc unpack failed" >&2; return 1; }
+  ( cd "$gsrc" && ln -sf gmp-6.3.0 gmp && ln -sf mpfr-4.2.1 mpfr && ln -sf mpc-1.3.1 mpc ) || { echo "gmp/mpfr/mpc symlink failed" >&2; return 1; }
+  kh="$gsrc/kh"; mkdir -p "$kh"; tar -xzf "$KH_TB" -C "$kh" || { echo "kernel headers unpack failed" >&2; return 1; }
+  ln -sf "$gccm"/bin/cpp "$tb/cpp"
+  for t in "$bmb"/bin/*; do ln -sf "$t" "$tb/`basename "$t"`"; done
+  # REPRODUCIBILITY (gcc14-repro): use binutils 2.44's DETERMINISTIC ar + ranlib (built with
+  # --enable-deterministic-archives → zeroed member mtime/uid/gid by default) for the build-time static
+  # archives. cc1's executable_checksum (.rodata, NOT stripped) is genchecksum's whole-file MD5 over the cc1
+  # link inputs, which include the BACKEND archives (libbackend.a/libcommon.a/libcommon-target.a — gcc builds
+  # them `$(AR) rc` + `$(RANLIB)`, NO `D`). The mesboot 2.20.1a ar/ranlib stamp per-build member mtimes → the
+  # archive bytes (hence executable_checksum) vary build-to-build, while the LINKED cc1 carries no archive
+  # headers (so only the 16-byte checksum differs — the leak -g0 alone can't fix). Override AFTER the mesboot
+  # tool loop so the deterministic ar/ranlib win on PATH; keep mesboot as/ld (they emit no archives).
+  ln -sf "$bmb244/bin/ar" "$tb/ar"; ln -sf "$bmb244/bin/ranlib" "$tb/ranlib"
   for tool in awk:gawk flex:flex bison:bison cmp:diffutils diff:diffutils sed:sed grep:grep m4:m4 make:make; do
     n=${tool%%:*}; pk=${tool##*:}; b=`command -v "$n" 2>/dev/null || ls /gnu/store/*$pk*/bin/$n 2>/dev/null | sort | head -1`
-    test -n "$b" && ln -sf "$b" "$out/bin/$n" || true
+    test -n "$b" && ln -sf "$b" "$tb/$n" || true
   done
-  ln -sf "$out/bin/flex" "$out/bin/lex" 2>/dev/null||true; ln -sf "$out/bin/bison" "$out/bin/yacc" 2>/dev/null||true
-  csh=`PATH="$out/bin:$cpath" command -v sh`
-  mkdir -p "$out/wb"
-  printf '#!%s\nexec "%s" -static -B%s/lib "$@"\n' "$csh" "$gcc" "$glibc" > "$out/wb/gcc"
-  printf '#!%s\nexec "%s" -static -B%s/lib "$@"\n' "$csh" "$gpp" "$glibc" > "$out/wb/g++"
-  chmod 0555 "$out/wb/gcc" "$out/wb/g++"
-  CIP="$g494inc:$kh:$glibc/include:$out/mpfr/src"; LP="$glibc/lib:$gccm/lib"; ldf="-static -B$glibc/lib"
-  ( cd "$out"; bp="$gccm/bin:$out/bin:$cpath"
+  ln -sf "$tb/flex" "$tb/lex" 2>/dev/null||true; ln -sf "$tb/bison" "$tb/yacc" 2>/dev/null||true
+  csh=`PATH="$tb:$cpath" command -v sh`
+  # REPRODUCIBILITY (gcc14-repro) — two flags on the HOST compiler ($gccm = gcc-mesboot 4.9.4) building
+  # cc1/cc1plus, BOTH placed AFTER "$@" so they win over the gcc Makefile's default `-g -O2`:
+  #   -frandom-seed=<fixed>  gcc's get_file_function_name names file-scope statics `<src>_<crc32>_<seed>`;
+  #     with it UNSET gcc reads /dev/urandom (toplev.cc) → those symbols (kept in .symtab past
+  #     `strip --strip-debug`) differ build-to-build. gcc's bootstrap passes -frandom-seed=$@; we
+  #     --disable-bootstrap, so pin it. SAFE as one fixed value (the per-TU <src> prefix keeps symbols
+  #     unique; LTO is off).
+  #   -g0  build the HOST objects WITHOUT DWARF. cc1's executable_checksum (PCH/consistency MD5, in .rodata,
+  #     NOT stripped) is `genchecksum`'s whole-file MD5 over the cc1 link inputs (the .o files AND the BACKEND
+  #     static archives) + checksum-options. With $wb/$tb/$gsrc/$gsys/LDFLAGS all fixed, checksum-options is
+  #     identical A-vs-B; the residual leaks are (a) per-build bytes in the .o/.a-member DWARF — gcc 4.9.4
+  #     (unlike the gcc 14 that hosts the x86_64 cross build, gate 414) emits a per-build element there that
+  #     -frandom-seed does not pin — and (b) the archive member mtimes (handled by the deterministic ar/ranlib
+  #     above). -g0 removes the DWARF so the hashed member CONTENTS are deterministic. No loss:
+  #     repro_normalize_tree strips debug from the final binaries before interning anyway. (Verified-red: the
+  #     leg reds with ONLY cc1/cc1plus differing, in exactly the 16-byte executable_checksum object — fixed by
+  #     -g0 + deterministic ar together.)
+  printf '#!%s\nexec "%s" -static -B%s/lib "$@" -frandom-seed=tdgcc14repro -g0\n' "$csh" "$gcc" "$glibc" > "$wb/gcc"
+  printf '#!%s\nexec "%s" -static -B%s/lib "$@" -frandom-seed=tdgcc14repro -g0\n' "$csh" "$gpp" "$glibc" > "$wb/g++"
+  chmod 0555 "$wb/gcc" "$wb/g++"
+  CIP="$g494inc:$kh:$glibc/include:$gsrc/mpfr/src"; LP="$glibc/lib:$gccm/lib"; ldf="-static -B$glibc/lib"
+  ( cd "$gsrc"; bp="$gccm/bin:$tb:$cpath"
     for f in `grep -rl '^#! */bin/sh' . 2>/dev/null`; do sed -i "1s,^#! *[^ ]*/bin/sh,#!$csh," "$f" 2>/dev/null || true; done
     rm -rf bld; mkdir bld; cd bld
-    env PATH="$bp" CONFIG_SHELL="$csh" CC="$out/wb/gcc" CXX="$out/wb/g++" CPP="$out/wb/gcc -E" \
-        CC_FOR_BUILD="$out/wb/gcc" CXX_FOR_BUILD="$out/wb/g++" \
+    env PATH="$bp" CONFIG_SHELL="$csh" CC="$wb/gcc" CXX="$wb/g++" CPP="$wb/gcc -E" \
+        CC_FOR_BUILD="$wb/gcc" CXX_FOR_BUILD="$wb/g++" \
         C_INCLUDE_PATH="$CIP" CPLUS_INCLUDE_PATH="$CIP" LIBRARY_PATH="$LP" LDFLAGS="$ldf" \
         "$csh" ../configure --prefix=/td/store/gcc-14.3.0 \
         --build=i686-unknown-linux-gnu --host=i686-unknown-linux-gnu \
-        --with-native-system-header-dir=/include --with-build-sysroot="$glibc" \
+        --with-native-system-header-dir=/include --with-build-sysroot="$gsys" \
         --disable-bootstrap --disable-multilib --disable-shared --enable-static \
         --enable-languages=c,c++ --enable-threads=single --disable-libstdcxx-pch \
         --disable-libatomic --disable-libgomp --disable-libitm --disable-libsanitizer \
@@ -881,6 +933,40 @@ build_gcc_14() {
         make SHELL="$csh" MAKEINFO=true install DESTDIR="$out/stage" >install.log 2>&1 \
       || { echo "gcc-14.3.0 install failed" >&2; tail -20 install.log >&2; return 1; } ) || return 1
   test -x "$out/stage/td/store/gcc-14.3.0/bin/gcc" -a -x "$out/stage/td/store/gcc-14.3.0/bin/g++" || { echo "no gcc/g++ 14.3.0 produced" >&2; return 1; }
+}
+# build_binutils_244 — MODERN GNU Binutils 2.44 built SANDBOX-RUNNABLE (build-dir glibc 2.16.0 interp, so its
+# as/ld/strip run during the sandbox build) by gcc-mesboot1 (4.6.4). Built here ONLY to supply a strip >= 2.24
+# with -D / --enable-deterministic-archives for the [repro] leg (the chain's binutils-mesboot 2.20.1a strip
+# has no -D). Same build as the binutils-244 gate but CC bakes the LIVE build-dir interp, not /td/store.
+# -std=gnu99 (binutils 2.44 is C99+; gcc 4.6.4 default gnu89), cross-style, --disable-gold, MAKEINFO=true.
+build_binutils_244() {
+  cpath=$1; gm1=$2; gls=$3; bmb=$4; out=$5
+  rm -rf "$out"; mkdir -p "$out"
+  gm1dir="$gm1/lib/gcc/i686-unknown-linux-gnu/4.6.4"
+  xzb=`command -v xz 2>/dev/null || ls /gnu/store/*'xz-'*/bin/xz 2>/dev/null | sort | head -1`
+  test -n "$xzb" || { echo "no xz" >&2; return 1; }
+  sh=`command -v bash 2>/dev/null || command -v sh`
+  tb=`mktemp -d`/tb; mkdir -p "$tb"
+  for tool in awk:gawk flex:flex bison:bison cmp:diffutils diff:diffutils; do
+    n=${tool%%:*}; pk=${tool##*:}; b=`command -v "$n" 2>/dev/null || ls /gnu/store/*$pk*/bin/$n 2>/dev/null | sort | head -1`
+    test -n "$b" && ln -sf "$b" "$tb/$n" || true; done
+  ln -sf "$tb/flex" "$tb/lex" 2>/dev/null||true; ln -sf "$tb/bison" "$tb/yacc" 2>/dev/null||true
+  wb=`mktemp -d`/wb; mkdir -p "$wb"
+  printf '#!%s\nexec "%s/bin/gcc" -std=gnu99 -isystem "%s/include" -B"%s/lib" -L"%s/lib" -L"%s" -Wl,--dynamic-linker -Wl,%s/lib/ld-linux.so.2 -Wl,-rpath -Wl,%s/lib "$@"\n' \
+    "$sh" "$gm1" "$gls" "$gls" "$gls" "$gm1dir" "$gls" "$gls" > "$wb/gcc"
+  chmod 0555 "$wb/gcc"
+  src=`mktemp -d`/binutils; mkdir -p "$src"
+  "$xzb" -dc "$BU244_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "binutils-2.44 unpack failed" >&2; return 1; }
+  ( cd "$src"; bp="$bmb/bin:$tb:$cpath"
+    env PATH="$bp" CONFIG_SHELL="$sh" SHELL="$sh" CC="$wb/gcc" CC_FOR_BUILD="$wb/gcc" AR="$bmb/bin/ar" RANLIB="$bmb/bin/ranlib" \
+      "$sh" ./configure --build=i686-pc-linux-gnu --host=i686-unknown-linux-gnu --prefix=/td/store/binutils-2.44 \
+      --disable-nls --disable-gold --disable-werror --enable-deterministic-archives --disable-plugins --disable-gprofng >cfg.log 2>&1 \
+      || { echo "binutils-2.44 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_bu244sb-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$sh" SHELL="$sh" make -j"$BJOBS" MAKEINFO=true >build.log 2>&1 \
+      || { echo "binutils-2.44 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_bu244sb-build.log" 2>/dev/null||true; tail -30 build.log >&2; return 1; }
+    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$sh" SHELL="$sh" make MAKEINFO=true install prefix="$out" >inst.log 2>&1 \
+      || { echo "binutils-2.44 install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
+  test -x "$out/bin/as" -a -x "$out/bin/ld" -a -x "$out/bin/strip" || { echo "no as/ld/strip produced" >&2; return 1; }
 }
 
 cpath=`make_curated_path`
@@ -903,8 +989,9 @@ GAWKMB=`mktemp -d`/gawkmesbootbuild; build_gawk_mesboot "$cpath" "$GM1" "$B2" "$
 GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GOUT" || fail "the toolchain did not build glibc 2.16.0"
 GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$cpath" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
 GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
-GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
-trap 'rm -rf "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$cpath"`"' EXIT INT TERM
+BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44 (the repro-leg strip >= 2.24 -D)"
+GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$BMB244SB" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
+trap 'rm -rf "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$BMB244SB"`" "`dirname "$GCC14B"`" "`dirname "$cpath"`"' EXIT INT TERM
 
 GCC14="$GCC14B/stage/td/store/gcc-14.3.0"
 CC1=`ls "$GCC14"/libexec/gcc/i686-unknown-linux-gnu/14.3.0/cc1 2>/dev/null || true`
@@ -926,10 +1013,61 @@ for so in "$GLS/lib/"*.so; do
 done
 
 . tests/cache-lib.sh
+. tests/repro-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 export TD_STORE_DIR=/td/store
+
+# --- [repro] gcc 14.3.0 is BYTE-REPRODUCIBLE (durable intrinsic double-build reproducibility — no guix
+# oracle). Normalize $GCC14 IN PLACE FIRST (strip the build-path-bearing DWARF + deterministic archives +
+# drop libtool .la — tests/repro-lib.sh), so store-add-recursive below interns the REPRODUCIBLE bytes
+# (a stable content-addressed /td/store path), then prove a second independent build normalizes to the
+# same nar-hash. strip is the freshly-built binutils 2.44 (>= 2.24 → -D; the chain's binutils-mesboot
+# 2.20.1a strip has no -D). The fixed $wb/$tb/$gsrc/$gsys paths in build_gcc_14 are what make this hold;
+# reverting any of them to a per-build mktemp REDS this leg (verified-red).
+test -x "$BMB244SB/bin/strip" || fail "no binutils 2.44 strip for the [repro] leg"
+rawA=`"$TB" nar-hash "$GCC14"` || fail "nar-hash (raw) of gcc-14 build A failed"
+repro_normalize_tree "$GCC14" "$BMB244SB/bin/strip" || fail "gcc-14.3.0 normalization (build A) failed"
+normA=`"$TB" nar-hash "$GCC14"` || fail "nar-hash (normalized) of gcc-14 build A failed"
+echo "   [repro] gcc 14.3.0 build A: raw nar-hash $rawA → normalized $normA"
+echo ">> [repro] second, independent gcc 14.3.0 build (fresh output dir; same FIXED /tmp wrapper/tool/src/sysroot paths)"
+GCC14B2=`mktemp -d`/gcc14build2
+build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$BMB244SB" "$GCC14B2" || { rm -rf "`dirname "$GCC14B2"`"; fail "the second (repro) gcc-14.3.0 build did not run"; }
+GCC14_2="$GCC14B2/stage/td/store/gcc-14.3.0"
+rawB=`"$TB" nar-hash "$GCC14_2"` || { rm -rf "`dirname "$GCC14B2"`"; fail "nar-hash (raw) of gcc-14 build B failed"; }
+repro_normalize_tree "$GCC14_2" "$BMB244SB/bin/strip" || { rm -rf "`dirname "$GCC14B2"`"; fail "second gcc-14.3.0 normalization failed"; }
+normB=`"$TB" nar-hash "$GCC14_2"` || { rm -rf "`dirname "$GCC14B2"`"; fail "nar-hash (normalized) of gcc-14 build B failed"; }
+# Observed self-discrimination (logged, not asserted — a raw-reproducible build is a happy surprise): the
+# RAW builds differ in archive member mtimes (the build-time mesboot `ar` is not deterministic), so the
+# -D normalization is load-bearing; NORM(A)==NORM(B) is then a real result, not a vacuous same-bytes rebuild.
+if [ "$rawA" != "$rawB" ]; then
+  echo "   [repro/self-discrimination] the RAW double-build DIFFERS ($rawA != $rawB) — archive member mtimes, so the deterministic-archive normalization is load-bearing"
+else
+  echo "   [repro] note: the RAW double-build was already byte-identical ($rawA) — reproducible even pre-normalization"
+fi
+if [ "$normA" != "$normB" ]; then
+  # Diagnostic (only on failure): which files still differ after normalization, and PRESERVE both copies, so
+  # the residual non-determinism can be MAPPED (readelf -S/-s + cmp -l offset → ELF section/symbol) WITHOUT a
+  # blind re-build. (No diffutils/awk in the sandbox → per-file sha via sort|uniq -u; path field via sed.)
+  ( cd "$GCC14" && find . -type f -exec sha256sum {} + 2>/dev/null | sort ) > "$ROOT/.td-build-cache/_gcc14repro-A.list" 2>/dev/null || true
+  ( cd "$GCC14_2" && find . -type f -exec sha256sum {} + 2>/dev/null | sort ) > "$ROOT/.td-build-cache/_gcc14repro-B.list" 2>/dev/null || true
+  echo "repro: gcc 14.3.0 is NOT byte-reproducible — normalized buildA=$normA buildB=$normB" >&2
+  echo "repro: files differing after normalization (sha256 + path, each appears once per build):" >&2
+  sort "$ROOT/.td-build-cache/_gcc14repro-A.list" "$ROOT/.td-build-cache/_gcc14repro-B.list" | uniq -u | sed 's/^/     /' >&2 || true
+  _dd="$ROOT/.td-build-cache/_gcc14repro-diff"; rm -rf "$_dd"; mkdir -p "$_dd/A" "$_dd/B"
+  sort "$ROOT/.td-build-cache/_gcc14repro-A.list" "$ROOT/.td-build-cache/_gcc14repro-B.list" | uniq -u | sed 's/^[^ ]*  *//' | sort -u | while read -r _rel; do
+    mkdir -p "$_dd/A/`dirname "$_rel"`" "$_dd/B/`dirname "$_rel"`" 2>/dev/null || true
+    cp -a "$GCC14/$_rel" "$_dd/A/$_rel" 2>/dev/null || true
+    cp -a "$GCC14_2/$_rel" "$_dd/B/$_rel" 2>/dev/null || true
+  done
+  echo "repro: preserved the differing binaries under $_dd/{A,B} for post-run inspection (readelf/cmp)" >&2
+  rm -rf "`dirname "$GCC14B2"`"
+  fail "gcc 14.3.0 is not byte-reproducible"
+fi
+rm -rf "`dirname "$GCC14B2"`"
+echo "   [repro] two independent from-source builds of gcc 14.3.0, normalized, are byte-identical (nar-hash $normA) — a STABLE input-addressed /td/store artifact (durable: intrinsic double-build reproducibility, no guix oracle)"
+
 GLP=`"$TB" store-add-recursive glibc-shared "$GLS" "$store" "$sndb"` || fail "store-add glibc-shared failed"
 GCP=`"$TB" store-add-recursive gcc-14.3.0 "$GCC14" "$store" "$sndb"` || fail "store-add gcc-14.3.0 failed"
 BUP=`"$TB" store-add-recursive binutils-mesboot "$BMB/out" "$store" "$sndb"` || fail "store-add binutils-mesboot failed"
@@ -992,5 +1130,6 @@ echo "PASS: source-bootstrap brick 6/7 (final toolchain, rung B — MODERN gcc) 
 echo "      built the chain → gcc-mesboot1 + binutils-mesboot + glibc 2.16.0 (static AND shared) → GCC 4.9.4,"
 echo "      and with 4.9.4 built MODERN GCC 14.3.0 (c,c++) against glibc 2.16.0. 14.3.0 + the shared glibc are"
 echo "      interned at /td/store, and a gcc/g++ WRAPPER there compiles PLAINLY a DYNAMIC C AND C++ (libstdc++)"
-echo "      program that runs in the own-root → 42, /gnu/store ABSENT. A current gcc at /td/store — guix's"
-echo "      gcc-boot0/gcc-final, td-native (own-then-diverge: built vs glibc 2.16.0, not guix's 3-stage dance)."
+echo "      program that runs in the own-root → 42, /gnu/store ABSENT. gcc 14.3.0 is BYTE-REPRODUCIBLE (a"
+echo "      normalized double-build is nar-identical). A current gcc at /td/store — guix's gcc-boot0/gcc-final,"
+echo "      td-native (own-then-diverge: built vs glibc 2.16.0, not guix's 3-stage dance)."
