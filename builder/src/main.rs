@@ -1864,6 +1864,73 @@ fn image_config_from_json(cj: &json::Json) -> oci::ImageConfig {
     }
 }
 
+/// Parsed `host-sandbox` invocation (the loop container). Pure data so the flag
+/// grammar is unit-testable without touching namespaces.
+#[derive(Debug)]
+struct HostSandboxArgs {
+    expose_cwd: bool,
+    /// `--store-from DIR`: bind DIR (an unpacked store, e.g. a captured seed or the
+    /// `/td/store` harness) instead of the host `/gnu/store`.
+    store_from: Option<String>,
+    /// `--store-at DEST`: the in-sandbox mount point for `--store-from`. Defaults to
+    /// `/gnu/store` (a guix-captured seed's binaries hardcode that interpreter path);
+    /// pass `/td/store` for td's own store-native harness (interp relinked to
+    /// `/td/store/ld`). Only meaningful with `--store-from`; when DEST != `/gnu/store`
+    /// the host `/gnu/store` is NOT bound at all — the guix-byte-free VM substrate.
+    store_at: Option<String>,
+    /// `--no-daemon`: do not bind `/var/guix` (no guix-daemon socket / GC roots).
+    no_daemon: bool,
+    cmd: String,
+    cmd_args: Vec<String>,
+}
+
+/// Parse the full `td-builder host-sandbox …` argv (args[0]=prog, args[1]=subcommand,
+/// flags…, `--`, CMD, CMD-ARGS…). Returns the parsed form or a user-facing message.
+fn parse_host_sandbox_args(args: &[String]) -> Result<HostSandboxArgs, String> {
+    let mut i = 2usize;
+    let mut expose_cwd = false;
+    let mut store_from: Option<String> = None;
+    let mut store_at: Option<String> = None;
+    let mut no_daemon = false;
+    while i < args.len() && args[i] != "--" {
+        match args[i].as_str() {
+            "--expose-cwd" => expose_cwd = true,
+            "--no-daemon" => no_daemon = true,
+            "--store-from" => {
+                i += 1;
+                if i >= args.len() || args[i] == "--" {
+                    return Err("--store-from needs a DIR".to_string());
+                }
+                store_from = Some(args[i].clone());
+            }
+            "--store-at" => {
+                i += 1;
+                if i >= args.len() || args[i] == "--" {
+                    return Err("--store-at needs a DIR".to_string());
+                }
+                store_at = Some(args[i].clone());
+            }
+            other => return Err(format!("unknown flag `{other}'")),
+        }
+        i += 1;
+    }
+    if store_at.is_some() && store_from.is_none() {
+        return Err("--store-at requires --store-from".to_string());
+    }
+    // args[i] is now "--" (or we ran off the end); the command follows it.
+    if i >= args.len() || i + 1 >= args.len() {
+        return Err("usage: td-builder host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--no-daemon] -- CMD ARGS...".to_string());
+    }
+    Ok(HostSandboxArgs {
+        expose_cwd,
+        store_from,
+        store_at,
+        no_daemon,
+        cmd: args[i + 1].clone(),
+        cmd_args: args[i + 2..].to_vec(),
+    })
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     // Builds run nicer than the loop's other work so a shared desktop stays smooth.
@@ -4122,39 +4189,24 @@ fn main() -> ExitCode {
         //                      roots). The build path uses td-builder's own build
         //                      jail (its own newstore), not the daemon, so the
         //                      shell needs no /var/guix.
+        //   --store-at DEST  : where --store-from is mounted INSIDE (default
+        //                      /gnu/store). Pass /td/store for td's own store-native
+        //                      harness (busybox/make/td-builder relinked to
+        //                      /td/store/ld); then the host /gnu/store is NOT bound at
+        //                      all — the guix-byte-free loop substrate.
         // Without these flags the binds are byte-identical to before.
         // Usage:
-        //   host-sandbox [--expose-cwd] [--store-from DIR] [--no-daemon] -- CMD ARGS...
+        //   host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--no-daemon] -- CMD ARGS...
         Some("host-sandbox") if args.len() >= 4 => {
-            let mut i = 2usize;
-            let mut expose_cwd = false;
-            let mut store_from: Option<String> = None;
-            let mut no_daemon = false;
-            while i < args.len() && args[i] != "--" {
-                match args[i].as_str() {
-                    "--expose-cwd" => expose_cwd = true,
-                    "--no-daemon" => no_daemon = true,
-                    "--store-from" => {
-                        i += 1;
-                        if i >= args.len() || args[i] == "--" {
-                            eprintln!("td-builder: host-sandbox: --store-from needs a DIR");
-                            return ExitCode::from(2);
-                        }
-                        store_from = Some(args[i].clone());
-                    }
-                    other => {
-                        eprintln!("td-builder: host-sandbox: unknown flag `{other}'");
-                        return ExitCode::from(2);
-                    }
+            let parsed = match parse_host_sandbox_args(&args) {
+                Ok(p) => p,
+                Err(msg) => {
+                    eprintln!("td-builder: host-sandbox: {msg}");
+                    return ExitCode::from(2);
                 }
-                i += 1;
-            }
-            if i >= args.len() || i + 1 >= args.len() {
-                eprintln!("usage: td-builder host-sandbox [--expose-cwd] [--store-from DIR] [--no-daemon] -- CMD ARGS...");
-                return ExitCode::from(2);
-            }
-            let cmd = args[i + 1].clone();
-            let cmd_args: Vec<String> = args[i + 2..].to_vec();
+            };
+            let HostSandboxArgs { expose_cwd, store_from, store_at, no_daemon, cmd, cmd_args } =
+                parsed;
             let run = || -> Result<std::process::ExitStatus, String> {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/home/td".to_string());
                 // The base exposure set: the whole store (ro) and the daemon
@@ -4167,15 +4219,16 @@ fn main() -> ExitCode {
                 // containers see a private /proc.
                 //
                 // The store bind: by default the host /gnu/store; with
-                // --store-from DIR the UNPACKED SEED store DIR, mounted AT
-                // /gnu/store so seed binaries' hardcoded interpreters resolve
-                // (the host store is then absent — the guix-less VM substrate).
-                // --no-daemon drops the /var/guix bind entirely.
+                // --store-from DIR the UNPACKED store DIR, mounted at DEST
+                // (--store-at, default /gnu/store) so its binaries' hardcoded
+                // interpreters resolve. With --store-at /td/store (td's own
+                // store-native harness) the host /gnu/store is then absent — the
+                // guix-byte-free loop substrate. --no-daemon drops /var/guix.
                 let mut binds = Vec::new();
                 match store_from.as_deref() {
                     Some(dir) => binds.push(sandbox::Bind {
                         src: dir.to_string(),
-                        dest: Some("/gnu/store".to_string()),
+                        dest: Some(store_at.clone().unwrap_or_else(|| "/gnu/store".to_string())),
                         readonly: true,
                         ro_optional: false,
                     }),
@@ -4456,6 +4509,62 @@ mod tests {
         assert_eq!(parse_build_nice(Some("0".into())), 0, "0 is honored (opt out)");
         assert_eq!(parse_build_nice(Some("99".into())), 19, "clamp above max");
         assert_eq!(parse_build_nice(Some("-99".into())), -20, "clamp below min");
+    }
+
+    // host-sandbox flag grammar (the loop container). The `--store-at` flag (inc2c)
+    // lets the harness be bound at /td/store instead of the hardcoded /gnu/store.
+    fn hs(argv: &[&str]) -> Result<HostSandboxArgs, String> {
+        let v: Vec<String> = std::iter::once("td-builder".to_string())
+            .chain(std::iter::once("host-sandbox".to_string()))
+            .chain(argv.iter().map(|s| s.to_string()))
+            .collect();
+        parse_host_sandbox_args(&v)
+    }
+
+    #[test]
+    fn host_sandbox_store_at_for_td_store_harness() {
+        // The inc2c path: bind td's own harness at /td/store.
+        let p = hs(&["--store-from", "/h/store", "--store-at", "/td/store", "--no-daemon",
+                     "--", "/td/store/bin/busybox", "sh", "-c", "true"])
+            .expect("valid");
+        assert_eq!(p.store_from.as_deref(), Some("/h/store"));
+        assert_eq!(p.store_at.as_deref(), Some("/td/store"));
+        assert!(p.no_daemon, "--no-daemon parsed");
+        assert!(!p.expose_cwd);
+        assert_eq!(p.cmd, "/td/store/bin/busybox");
+        assert_eq!(p.cmd_args, vec!["sh", "-c", "true"]);
+    }
+
+    #[test]
+    fn host_sandbox_back_compat_no_store_at() {
+        // inc2a back-compat: --store-from alone still means "mount at /gnu/store"
+        // (store_at None — the handler defaults the dest), and the daemon/cwd flags
+        // parse as before. Asserting store_at==None keeps the default wired here.
+        let p = hs(&["--expose-cwd", "--store-from", "/seed", "--", "make", "check"])
+            .expect("valid");
+        assert_eq!(p.store_from.as_deref(), Some("/seed"));
+        assert_eq!(p.store_at, None, "no --store-at -> handler binds at /gnu/store");
+        assert!(p.expose_cwd);
+        assert!(!p.no_daemon);
+        assert_eq!(p.cmd, "make");
+        assert_eq!(p.cmd_args, vec!["check"]);
+    }
+
+    #[test]
+    fn host_sandbox_store_at_requires_store_from() {
+        // --store-at is meaningless without something to mount: reject it loudly
+        // rather than silently bind the host /gnu/store at the wrong place.
+        let e = hs(&["--store-at", "/td/store", "--", "true"]).unwrap_err();
+        assert!(e.contains("--store-at requires --store-from"), "got: {e}");
+    }
+
+    #[test]
+    fn host_sandbox_flag_errors() {
+        assert!(hs(&["--store-from", "--", "true"]).unwrap_err().contains("--store-from needs a DIR"));
+        assert!(hs(&["--store-at", "--", "true"]).unwrap_err().contains("--store-at needs a DIR"));
+        assert!(hs(&["--bogus", "--", "true"]).unwrap_err().contains("unknown flag"));
+        // a `--` with no command after it is a usage error (no vacuous empty cmd).
+        assert!(hs(&["--expose-cwd", "--"]).unwrap_err().contains("usage:"));
     }
 
     // build_profile --store-native: enumerate the PHYSICAL package dir but point the

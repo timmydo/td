@@ -65,6 +65,40 @@ set -eu
 
 cd "$(dirname "$0")"
 
+# --- Guix-free harness tier (host-sandbox-stage0 inc2c) -----------------------
+# `./check.sh check-harness` runs a loop tier on td's OWN /td/store harness — the
+# busybox + GNU make userland built guix-byte-free (gate 420) and persisted to
+# .td-build-cache/harness/ — with NO guix: the guix-free stage0 td-builder enters
+# host-sandbox binding the harness at /td/store (--store-at), /gnu/store + /var/guix
+# ABSENT, guix off PATH, and runs the guix-free inner loop (mk/harness.mk) there.
+# This is the substrate ci/daily-full-suite.sh uses on a VM with no guix installed.
+#
+# Provisioning the harness needs a guix CAPTURE host (gate 420 builds + persists it,
+# shipped to the VM); the CONSUME half here touches no guix. It is handled BEFORE the
+# guix integrity guard / toolchain prelude below so the harness tier never invokes
+# guix. (stage0 td-builder runs HOST-side as the sandbox provider — its own /td/store
+# relink, so it runs INSIDE the harness on a guix-less VM, is rust-store-native rung 3.)
+if [ "${1-}" = check-harness ]; then
+  hdir="$PWD/.td-build-cache/harness"
+  if [ ! -d "$hdir/store" ] || [ ! -s "$hdir/rel" ]; then
+    echo "check.sh: FATAL: no provisioned /td/store harness at $hdir." >&2
+    echo "  Provision it on a guix capture host first:  ./check.sh userland-x86_64-store-native" >&2
+    echo "  (builds busybox+make at /td/store + persists them here); ship $hdir to a guix-less VM." >&2
+    exit 1
+  fi
+  hrel=$(cat "$hdir/rel")
+  hbin="/td/store/$hrel/bin"
+  . tests/cache-lib.sh
+  export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"
+  load_stage0 || { echo "check.sh: FATAL: could not build the guix-free stage0 td-builder." >&2; exit 1; }
+  echo ">> check-harness: entering td's /td/store harness via the guix-free stage0 td-builder ($TB)"
+  echo "   harness: $hdir/store  set: $hrel  (guix + /gnu/store ABSENT inside)"
+  # $TB runs host-side (keeps host PATH for its own setup); the inner make is named by
+  # absolute path and mk/harness.mk pins the recipe PATH to the harness bin (HBIN).
+  exec "$TB" host-sandbox --expose-cwd --store-from "$hdir/store" --store-at /td/store --no-daemon -- \
+    "$hbin/make" -f mk/harness.mk HBIN="$hbin" SHELL="$hbin/sh" check-harness-inner
+fi
+
 # --- Integrity guard: host guix must equal the pinned channel commit ----------
 # The offline/no-download property holds ONLY because the host system guix is
 # the exact commit channels.scm pins: time-machine to a *different* commit would

@@ -277,6 +277,22 @@ echo "   [behavioral] busybox + make RAN from /td/store in the store-ns own-root
 printf '%s\n' "$out2" | grep -q '^GNU-ABSENT$'   || fail "/gnu/store is PRESENT in the own-root"
 echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT"
 
+# --- inc2c: PERSIST the validated /td/store harness for the guix-free check tier --------------
+# Copy the harness (busybox+make + glibc/libgcc closure + the /td/store/ld loader) OUT of the
+# ephemeral $snwork into a stable cache the loop consumes via `./check.sh check-harness`
+# (host-sandbox --store-from <here> --store-at /td/store --no-daemon, guix ABSENT). The
+# guix-less daily VM SHIPS this dir; the capture half (this gate) needs a guix host, the consume
+# half touches no guix. Atomic-ish: assemble beside, then swap into place.
+hdir="$ROOT/.td-build-cache/harness"; htmp="$hdir.tmp.$$"
+rm -rf "$htmp" "$hdir.old"; mkdir -p "$htmp/store"
+cp -a "$ustore/." "$htmp/store/" || fail "could not copy the harness store to the cache"
+printf '%s\n' "$rel" > "$htmp/rel"
+[ -d "$hdir" ] && mv "$hdir" "$hdir.old"
+mv "$htmp" "$hdir"; rm -rf "$hdir.old"
+test -x "$hdir/store/$rel/bin/busybox" -a -x "$hdir/store/$rel/bin/make" -a -e "$hdir/store/ld" \
+  || fail "persisted harness at $hdir is incomplete"
+echo "   [inc2c] persisted the /td/store harness to .td-build-cache/harness (consumed by ./check.sh check-harness)"
+
 echo "PASS: userland-x86_64-store-native — from the 229-byte seed, td built the i686 chain → gcc 14.3.0,"
 echo "  crossed up to x86_64, and built busybox 1.37.0 + GNU make 4.4.1 from upstream source, DYNAMIC vs the"
 echo "  /td/store glibc 2.41, interned at /td/store, and RAN them in the store-ns own-root → /gnu/store ABSENT,"

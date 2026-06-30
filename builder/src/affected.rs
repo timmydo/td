@@ -747,6 +747,22 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     ) {
         sel.add_preflight("shell-syntax");
         sel.add_target("userland-x86_64-store-native");
+        // Gate 420 also PERSISTS the /td/store harness the guix-free tier consumes
+        // (host-sandbox-stage0 inc2c). `check-harness` is a check.sh-intercepted tier
+        // (its own container), not a make gate, so it cannot join the other ./check.sh
+        // targets — run it as its own invocation after provisioning.
+        sel.add_note("run `./check.sh check-harness` separately to validate the guix-free /td/store harness tier (host-sandbox-stage0 inc2c) — it consumes the harness gate 420 persisted.");
+        return;
+    }
+
+    // The guix-free harness loop (host-sandbox-stage0 inc2c): mk/harness.mk + the inner
+    // loop body run by `./check.sh check-harness`. The tier consumes the harness gate 420
+    // persists, so provision it via gate 420; `check-harness` is a check.sh tier (its own
+    // container, not a joinable make gate) and is run as a separate invocation.
+    if pattern_matches("tests/harness-loop.sh|mk/harness.mk", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("userland-x86_64-store-native");
+        sel.add_note("run `./check.sh check-harness` separately to validate the guix-free /td/store harness tier (host-sandbox-stage0 inc2c).");
         return;
     }
 
