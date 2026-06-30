@@ -1046,6 +1046,13 @@ echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils
   # Make the cross gcc self-contained BEFORE interning: bundle plain as/ld into its tooldir so the
   # PUBLISHED nar carries them (a fetched gcc's build-time --with-as scratch path is gone). x64-toolchain-subst.
   x86_64_bundle_tooldir "$XGCC2" || fail "could not bundle as/ld into the cross gcc tooldir"
+  # REPRODUCIBILITY (gcc14-repro / [[toolchain-repro]]): double-build the cross gcc 14.3.0, normalize
+  # both, assert byte-identical (mirrors binutils-2.44 #210 / glibc-2.41 #216). This NORMALIZES $XGCC2
+  # IN PLACE first, so x86_64_build_closure interns + subst-exports the REPRODUCIBLE bytes — a stable
+  # input-addressed artifact, not a per-build throwaway. DURABLE (intrinsic double-build, no guix oracle).
+  . tests/repro-lib.sh
+  x86_64_gcc_repro_leg "$cpath" "$GCC14" "$GST" "$BMB244SB" "$XBU" "$X86_SYSROOT" "$XGCC2" \
+    || fail "the cross gcc 14.3.0 is not byte-reproducible"
   x86_64_build_closure "`pwd`/.td-build-cache/x86_64-closure-export" "$cstore" "$cdb" || fail "could not intern + subst-export the x86_64 toolchain closure"
 fi
 
