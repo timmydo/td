@@ -10,7 +10,9 @@
 #
 # Usage:
 #   ci/daily-full-suite.sh [--no-system] [--verdict FILE]
-# Exit: 0 all green; 1 heavy red; 2 system red; 3 both red; >=4 setup error.
+# Exit: a bitfield over the suites — 1 heavy red, 2 system red, 4 harness red
+#   (guix-free /td/store tier); 0 = all green, up to 7. Setup errors exit 8/9
+#   (before any suite runs), kept out of the bitfield range.
 set -uo pipefail
 
 verdict=".td-daily-verdict"
@@ -19,17 +21,17 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --no-system) run_system=0; shift ;;
     --verdict) verdict=$2; shift 2 ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
-    *) echo "unknown arg: $1" >&2; exit 4 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 8 ;;
   esac
 done
 
-git fetch origin main -q || { echo "daily-full-suite: fetch failed" >&2; exit 5; }
+git fetch origin main -q || { echo "daily-full-suite: fetch failed" >&2; exit 9; }
 main=$(git rev-parse --short origin/main)
-hlog=$(mktemp); slog=$(mktemp)
-trap 'rm -f "$hlog" "$slog"' EXIT
+hlog=$(mktemp); slog=$(mktemp); xlog=$(mktemp)
+trap 'rm -f "$hlog" "$slog" "$xlog"' EXIT
 
-heavy_rc=0; system_rc=0; system_fail=""
+heavy_rc=0; system_rc=0; system_fail=""; harness_rc=0; harness_fail=""
 echo ">> daily backstop: full ./check.sh on origin/main ($main)"
 # TD_SUBST_FORCE_BUILD=1: the daily is the SOLE from-seed authoritative build + publisher
 # (x64-toolchain-subst). Suppress the fetch short-circuit so gate 414 ALWAYS builds the x86_64
@@ -45,6 +47,20 @@ if [ "$run_system" = 1 ]; then
   system_fail=$(grep -E '^FAIL' "$slog" | head -5 | tr '\n' ';')
 fi
 
+# host-sandbox-stage0 inc2c: the GUIX-FREE harness tier — the loop on td's OWN /td/store
+# harness (busybox+make, NO guix). The heavy ./check.sh above ran gate 420, which persists
+# .td-build-cache/harness; consume it here. This is the loop the guix-less VM runs. Only
+# attempt it when the harness was persisted (heavy green enough to reach gate 420); a missing
+# harness is a heavy-suite problem already reported, not a separate harness failure.
+if [ -d .td-build-cache/harness/store ] && [ -s .td-build-cache/harness/rel ]; then
+  echo ">> daily backstop: ./check.sh check-harness on origin/main ($main) — guix-free /td/store loop"
+  ./check.sh check-harness >"$xlog" 2>&1 || harness_rc=$?
+  harness_fail=$(grep -E '^FAIL|^check.sh: FATAL' "$xlog" | head -5 | tr '\n' ';')
+else
+  harness_rc=4; harness_fail="no .td-build-cache/harness persisted (gate 420 did not complete)"
+  echo ">> daily backstop: check-harness SKIPPED — $harness_fail"
+fi
+
 {
   echo "commit=$main"
   echo "date=$(date -Is)"
@@ -54,11 +70,15 @@ fi
   echo "system=$([ "$run_system" = 1 ] && { [ $system_rc -eq 0 ] && echo green || echo red; } || echo skipped)"
   echo "system_rc=$system_rc"
   echo "system_fail=$system_fail"
+  echo "harness=$([ $harness_rc -eq 0 ] && echo green || echo red)"
+  echo "harness_rc=$harness_rc"
+  echo "harness_fail=$harness_fail"
 } > "$verdict"
 
 rc=0
 [ $heavy_rc -ne 0 ] && rc=$((rc+1))
 [ "$run_system" = 1 ] && [ $system_rc -ne 0 ] && rc=$((rc+2))
+[ $harness_rc -ne 0 ] && rc=$((rc+4))
 if [ $rc -eq 0 ]; then
   echo "$main" > .td-last-green   # seed of the future `stable` marker
   echo ">> daily backstop: ALL GREEN at $main (recorded .td-last-green)"
@@ -99,7 +119,7 @@ if [ $rc -eq 0 ]; then
     echo ">> publish-x86_64-closure: WARN — td-subst sign failed; not published"
   fi
 else
-  echo ">> daily backstop: RED (heavy_rc=$heavy_rc system_rc=$system_rc) — agent: triage \`git log <last-green>..$main\`, reproduce the failing gate, open a FIX-OR-REVERT PR (no auto-merge). Suspect-revert helper: ci/revert-suspect.sh --ref <sha> --open-pr"
+  echo ">> daily backstop: RED (heavy_rc=$heavy_rc system_rc=$system_rc harness_rc=$harness_rc) — agent: triage \`git log <last-green>..$main\`, reproduce the failing gate, open a FIX-OR-REVERT PR (no auto-merge). Suspect-revert helper: ci/revert-suspect.sh --ref <sha> --open-pr"
 fi
 cat "$verdict"
 exit $rc
