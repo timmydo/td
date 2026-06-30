@@ -18,7 +18,6 @@
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
   #:use-module (gnu packages containers) ;crun — the container runtime td ships
-  #:use-module (gnu packages rust-apps)  ;procs/fd/ripgrep/sd/eza/bat — Rust userland
   ;; guix-free-marker (embedded build gate) + cgroup2-file-system (container host)
   #:use-module (system td-hardening)
   #:export (td-system
@@ -77,16 +76,17 @@
     ;; It joins %base-packages in the system profile (so the booted base has crun
     ;; on PATH), and the guix-free-marker scans this same set (crun pulls in no
     ;; guix, so the marker still passes). The typed compiler ships crun identically.
-    ;; rust-userland (human-directed 2026-06-17): ALONGSIDE crun, ship the
-    ;; Rust-native userland the pinned channel carries — procs (ps/top), fd
-    ;; (find), ripgrep (grep), sd (sed), eza (ls), bat (cat). ADDITIVE: this does
-    ;; not remove the GNU tools (a Guix-built closure bakes coreutils/bash into
-    ;; activation/shepherd), it ships the Rust tools on PATH beside them. They are
-    ;; injected base userland (not swappable manifest content), so the typed
-    ;; compiler prepends the IDENTICAL list to %base-packages, in the same order —
-    ;; keeping the M4/M5/M6 differentials byte-converged on this oracle. The
-    ;; guix-free-marker scans this same set (the Rust apps pull in no guix).
-    (packages (let ((pkgs (cons* crun procs fd ripgrep sd eza bat %base-packages)))
+    ;; Rust userland (2026-06-30): the Rust-native userland — procs (ps/top), fd
+    ;; (find), ripgrep (grep), sd (sed), eza (ls), bat (cat) — is NO LONGER carried
+    ;; here as guix-built objects. td ships its OWN build of those six (guix-free,
+    ;; crate-free-build) through td-NATIVE OCI images (`td-builder oci-image`, gate
+    ;; rust-userland-image / #242) — removing the guix userland bytes from the
+    ;; shipped system. The guix `operating-system` keeps only crun (plus the base
+    ;; and the toolchain libs, retired last). The static `no-guix-rust` gate asserts
+    ;; neither this file nor system/td-typed.scm re-imports the guix Rust-apps
+    ;; module; the typed compiler drops the IDENTICAL six from %base-capabilities so
+    ;; the M4/M5/M6 differentials stay byte-converged on this oracle.
+    (packages (let ((pkgs (cons* crun %base-packages)))
                 (cons (guix-free-marker pkgs) pkgs)))
 
     ;; sshd requires 'networking; %base-services provides only 'loopback. dhcpcd

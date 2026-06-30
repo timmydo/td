@@ -23,7 +23,6 @@
   #:use-module (gnu services ssh)
   #:use-module (gnu system file-systems)
   #:use-module (gnu packages containers) ;crun — shipped in the base (M9)
-  #:use-module (gnu packages rust-apps)  ;procs/fd/ripgrep/sd/eza/bat — Rust userland
   #:use-module (gnu packages ssh)        ;openssh — host-key generation (§2.6)
   #:use-module (guix gexp)
   #:use-module (guix packages)
@@ -210,22 +209,24 @@
        (manifest-profile-packages manifest)))
 
 ;; The fixed BASE CAPABILITIES the compiler injects into EVERY image regardless
-;; of the manifest (M9: crun, the container host; rust-userland 2026-06-17: the
-;; Rust-native base userland — procs, fd, ripgrep, sd, eza, bat). These are a
-;; mandatory platform invariant — part of "effective = base + payload + markers"
-;; — NOT swappable manifest content. The compiler's `packages` field PREPENDS
-;; this list (single source of truth) to the payload. That prepend is the
-;; by-construction guarantee for the REMOVE half of the contract: every entry is
-;; present in every image for ANY manifest, so the manifest cannot REMOVE a base
-;; capability. The ADD half is a name-based hygiene PRE-FILTER (the constructor
-;; rejects a manifest that names a base capability, directly or via propagation —
-;; see below); it is NOT a closure-complete gate, and (unlike guix) needs none.
+;; of the manifest (M9: crun, the container host). These are a mandatory platform
+;; invariant — part of "effective = base + payload + markers" — NOT swappable
+;; manifest content. The compiler's `packages` field PREPENDS this list (single
+;; source of truth) to the payload. That prepend is the by-construction guarantee
+;; for the REMOVE half of the contract: every entry is present in every image for
+;; ANY manifest, so the manifest cannot REMOVE a base capability. The ADD half is a
+;; name-based hygiene PRE-FILTER (the constructor rejects a manifest that names a
+;; base capability, directly or via propagation — see below); it is NOT a
+;; closure-complete gate, and (unlike guix) needs none.
+;; Rust userland (2026-06-30): the six Rust-native tools (procs/fd/ripgrep/sd/eza/
+;; bat) are NO LONGER injected here as guix-built objects — td ships its OWN build
+;; of them through td-native OCI images (gate rust-userland-image / #242), so the
+;; guix userland bytes leave the shipped system. The frozen oracle (system td)
+;; drops the IDENTICAL six, so the M4/M5/M6 differentials stay byte-converged.
 ;; tests/manifest-diff.scm (d) asserts the injection invariant on lowered systems
 ;; (it checks crun specifically — the canonical capability); tests/typed-coverage.scm
 ;; asserts the pre-filter rejection (direct + propagated) and the narrowed contract.
-;; The frozen oracle (system td) prepends the IDENTICAL list in the same order, so
-;; the M4/M5/M6 differentials stay byte-converged.
-(define %base-capabilities (list crun procs fd ripgrep sd eza bat))
+(define %base-capabilities (list crun))
 
 ;; The base capability a manifest redundantly names, or #f — a hygiene PRE-FILTER,
 ;; not the guarantee. Matched by NAME over the manifest's PROFILE packages (direct
