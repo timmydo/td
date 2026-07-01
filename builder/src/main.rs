@@ -4567,9 +4567,33 @@ fn main() -> ExitCode {
             let keymap: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             let handle = move |req: &str| -> Result<String, String> {
-                let (sub, drv) = match req.strip_prefix("CHECK ") {
-                    Some(d) => ("daemon-check", d),
-                    None => ("daemon-build", req),
+                // Request grammar: "<drv> [BP BS BD]" (build) or "CHECK <drv> [BP BS BD]"
+                // (reproducibility). The optional trailing BP/BS/BD is the td-owned builder
+                // override (TD_BUILDER_PATH/STORE/DB) — carried PER REQUEST because ONE shared
+                // daemon serves many worktrees whose stage0 builder lives at different on-disk
+                // paths (bound at identical absolute paths in every sandbox, so the daemon on
+                // the host opens exactly what the submitter names). Absent → the child inherits
+                // the daemon's own env (gates 358/359, which set TD_BUILDER_* on the daemon).
+                let mut toks = req.split_whitespace();
+                let first = toks.next().ok_or_else(|| "empty request".to_string())?;
+                let (sub, drv) = if first == "CHECK" {
+                    ("daemon-check", toks.next().ok_or_else(|| "CHECK: missing drv".to_string())?)
+                } else {
+                    ("daemon-build", first)
+                };
+                let rest: Vec<&str> = toks.collect();
+                let override_env: Vec<(&str, &str)> = match rest.as_slice() {
+                    [bp, bs, bd] => vec![
+                        ("TD_BUILDER_PATH", *bp),
+                        ("TD_BUILDER_STORE", *bs),
+                        ("TD_BUILDER_DB", *bd),
+                    ],
+                    [] => Vec::new(),
+                    _ => {
+                        return Err(format!(
+                            "malformed request (expected DRV [BUILDER_PATH BUILDER_STORE BUILDER_DB]): {req}"
+                        ))
+                    }
                 };
                 let key = drv_scratch_key(drv)?;
                 let keylock = {
@@ -4581,15 +4605,19 @@ fn main() -> ExitCode {
                 let _kg = keylock.lock().unwrap();
                 // Each build runs in its OWN child td-builder process (Command = the safe
                 // fork+exec): an in-process fork on a daemon thread is unsound (sandbox::build
-                // mutates the process CWD + forks with heavy pre-exec work). The child inherits
-                // TD_BUILDER_*; its stderr is inherited so the daemon log keeps the CACHE
-                // HIT/MISS lines (gate daemon-recipe greps them).
-                let out = Command::new(&exe)
-                    .arg(sub)
+                // mutates the process CWD + forks with heavy pre-exec work). The child's stderr
+                // is inherited so the daemon log keeps the CACHE HIT/MISS lines (gate
+                // daemon-recipe greps them).
+                let mut cmd = Command::new(&exe);
+                cmd.arg(sub)
                     .arg(drv)
                     .arg(&store_db)
                     .arg(&scratch)
-                    .stderr(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+                for (k, v) in &override_env {
+                    cmd.env(k, v);
+                }
+                let out = cmd
                     .output()
                     .map_err(|e| format!("spawn {sub} for {drv}: {e}"))?;
                 if !out.status.success() {
@@ -5142,13 +5170,28 @@ fn main() -> ExitCode {
                     if Path::new(&subst).is_dir() {
                         binds.push(sandbox::Bind { src: subst, dest: None, readonly: true, ro_optional: false });
                     }
+                    // The ONE shared build daemon's socket + output store (~/.td/build-daemon,
+                    // started on the host by tools/build-daemon-ensure.sh). The corpus build
+                    // (inside this sandbox) SUBMITS drvs to it over the socket and reads its
+                    // output back, so it must be visible at the SAME absolute path in every
+                    // check sandbox — RW (connect to the socket; read the store). Bound only
+                    // when present; a cold machine without a running daemon simply lacks it.
+                    let bdd = format!("{home}/.td/build-daemon");
+                    if Path::new(&bdd).is_dir() {
+                        binds.push(sandbox::Bind { src: bdd, dest: None, readonly: false, ro_optional: false });
+                    }
                     path_env = std::env::var("PATH").unwrap_or_default();
                     workdir = cwd;
                     for (k, v) in std::env::vars() {
                         // TD_CHECK_* = the check-memo identity; TD_SUBST_* = the host-provisioned
                         // substitute resolver knobs (TD_SUBST_BIN/STORE/PUBKEY) the toolchain gates
-                        // read to FETCH the lock-keyed closure instead of building from seed.
-                        if k.starts_with("TD_CHECK_") || k.starts_with("TD_SUBST_") {
+                        // read to FETCH the lock-keyed closure instead of building from seed;
+                        // TD_DAEMON_* = the shared build daemon's socket (TD_DAEMON_SOCKET) the
+                        // corpus build submits to.
+                        if k.starts_with("TD_CHECK_")
+                            || k.starts_with("TD_SUBST_")
+                            || k.starts_with("TD_DAEMON_")
+                        {
                             extra_env.push((k, v));
                         }
                     }
