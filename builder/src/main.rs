@@ -2615,6 +2615,57 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // oci-image-paths: pack a PRE-RESOLVED store closure into a docker-archive — like
+        // oci-image-closure, but the closure is read from a PATHS FILE (one store path per
+        // line) instead of walking /var/guix/db. Lets a caller keep closure RESOLUTION
+        // wherever it already is (e.g. a guix-resolved input-resolution step, retired last)
+        // while the image CONSTRUCTION is td-native, and td reads no guix private state.
+        // Usage: oci-image-paths PATHS-FILE STORE-DIR CONFIG-JSON OUT.tar
+        Some("oci-image-paths") if args.len() == 6 => {
+            let (paths_file, store_dir, config_file, out_file) =
+                (&args[2], &args[3], &args[4], &args[5]);
+            let run = || -> Result<usize, String> {
+                let text = std::fs::read_to_string(paths_file)
+                    .map_err(|e| format!("read paths {paths_file}: {e}"))?;
+                let mut closure: Vec<String> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect();
+                closure.sort();
+                closure.dedup();
+                if closure.is_empty() {
+                    return Err(format!("no store paths in {paths_file}"));
+                }
+                let n = closure.len();
+                let cfg_text = std::fs::read_to_string(config_file)
+                    .map_err(|e| format!("read {config_file}: {e}"))?;
+                let cj = json::parse(&cfg_text).map_err(|e| format!("config JSON: {e}"))?;
+                let cfg = image_config_from_json(&cj);
+                let mut w =
+                    std::fs::File::create(out_file).map_err(|e| format!("create {out_file}: {e}"))?;
+                oci::write_docker_archive_from_store_paths(
+                    &mut w,
+                    Path::new(store_dir),
+                    &closure,
+                    &cfg,
+                )
+                .map_err(|e| format!("write docker-archive: {e}"))?;
+                Ok(n)
+            };
+            match run() {
+                Ok(n) => {
+                    eprintln!("td-builder: oci-image-paths: packed {n} store paths");
+                    println!("{out_file}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: oci-image-paths: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // subst-export: write a serve-able substitute directory for the closure of ROOT…
         // over DB's Refs graph — a `<basename>.narinfo` + `nar/<narhash>.nar` per member —
         // the store-coupled, dependency-free half of the substitute server. STORE-DIR is the

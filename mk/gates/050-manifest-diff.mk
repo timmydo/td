@@ -1,5 +1,5 @@
 # M6 manifest-swap differential (DESIGN §6: manifest-driven, image-swap-only).
-# Cheap, derivation-level, self-discriminating like `oci-diff`, but the lever is
+# Cheap, derivation-level, self-discriminating like `typed-diff`, but the lever is
 # the typed config's `manifest` field: (a) the default manifest converges to the
 # frozen OCI oracle; (b) a manifest that adds one package (hello) lowers to a
 # DIFFERENT OCI image — a wholesale image swap; (c) the added package is in the

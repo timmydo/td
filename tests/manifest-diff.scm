@@ -30,7 +30,7 @@
 ;; `crun` is a mandatory platform invariant the compiler injects regardless of
 ;; (and absent from) the manifest.
 ;;
-;; Same self-discriminating shape as tests/oci-diff.scm (the M3 false-green
+;; Same self-discriminating shape as tests/typed-diff.scm (the M3 false-green
 ;; lesson, kept as a permanent guardrail). It asserts THREE things, each able to
 ;; go red:
 ;;
@@ -99,7 +99,7 @@
   (set-build-options store #:use-substitutes? #f #:offload? #f)
 
   ;; Lower an operating-system to the derivation of its Docker/OCI image and
-  ;; return the .drv store path — identical to tests/oci-diff.scm. No image is
+  ;; return the .drv store path — the docker image-type's constructor. No image is
   ;; built here; this is a pure structural fingerprint of the OCI artifact.
   (define (oci-drv os)
     (derivation-file-name

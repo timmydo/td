@@ -15,15 +15,22 @@
 # The td image is an UNCOMPRESSED docker-archive (td-builder is zero-dep), so `tar xf`
 # (auto-detect) unpacks both it and guix's gzipped archives.
 #
-# Usage: oci-native-check.sh IMAGE.tar ENTRYPOINT-ABS-PATH EXPECTED-SUBSTRING
+# Usage: oci-native-check.sh IMAGE.tar ENTRYPOINT-ABS-PATH EXPECTED-SUBSTRING [ARG...]
 #   env: SKOPEO=<skopeo bin> CRUN=<crun bin>
+#   ARGs (optional) are appended to the entrypoint (e.g. `… crun 'crun version' --version`).
 set -eu
 
-IMG=${1:?usage: oci-native-check.sh IMAGE ENTRYPOINT EXPECTED}
+IMG=${1:?usage: oci-native-check.sh IMAGE ENTRYPOINT EXPECTED [ARG...]}
 ENTRY=${2:?missing in-image entrypoint path}
 EXPECT=${3:?missing expected output substring}
 SKOPEO=${SKOPEO:?set SKOPEO to the skopeo binary}
 CRUN=${CRUN:?set CRUN to the crun binary}
+# Any args after EXPECTED are passed to the entrypoint (e.g. `crun --version`),
+# so a self-contained binary that needs a flag to emit output still runs cleanly.
+shift 3
+args_json="[ \"$ENTRY\""
+for a in "$@"; do args_json="$args_json, \"$a\""; done
+args_json="$args_json ]"
 
 WORK=$(mktemp -d)
 cleanup() { chmod -R u+w "$WORK" 2>/dev/null || true; rm -rf "$WORK"; }
@@ -83,8 +90,8 @@ EOF
 run_ctr() { "$CRUN" --cgroup-manager=disabled --root="$WORK/state" run "$1"; }
 
 # --- (2) POSITIVE: the entrypoint runs and emits EXPECTED.
-echo ">> crun run: $ENTRY"
-gen_config "[ \"$ENTRY\" ]"
+echo ">> crun run: $ENTRY $*"
+gen_config "$args_json"
 if ! out=$(run_ctr td-oci-native-pos); then
   echo "FAIL: the td-native OCI image did not run (crun exited non-zero)" >&2
   printf '%s\n' "$out" >&2
