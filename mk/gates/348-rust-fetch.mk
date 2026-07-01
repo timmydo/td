@@ -43,7 +43,7 @@ rust-fetch:
 	sh tests/recipe-emit.sh td-fetch > "$$scratch/fetch.json"; \
 	test -s "$$scratch/fetch.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/fetch.json" "$$seedlock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" "$$vsrc" "$$vstore" "$$vdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe (guix-free crates):" >&2; tail -40 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/fetch.json" "$$seedlock" "$$sd" /gnu/store "$$srcstore" "$$srcdb" "$$vsrc" "$$vstore" "$$vdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe (guix-free crates):" >&2; tail -40 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	ns="$$sd/newstore/`basename "$$out"`"; \

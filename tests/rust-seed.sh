@@ -136,7 +136,7 @@ echo "   [DURABLE repro] td-builder check double-build agrees the seed-built td-
 mkdir -p "$scratch/g"
 env -i HOME="$scratch" TMPDIR="$scratch/tmp" PATH="$cu/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-  "$TB" build-recipe "$scratch/td-builder.json" "$lock" "$scratch/g" /var/guix/db/db.sqlite "$srcstore" "$srcdb" \
+  "$TB" build-recipe "$scratch/td-builder.json" "$lock" "$scratch/g" /gnu/store "$srcstore" "$srcdb" \
   > "$scratch/gout" 2>"$scratch/gerr" || { tail -10 "$scratch/gerr" >&2; fail "guix-seed build (oracle) failed"; }
 gout=`sed -n 's/^OUT=out //p' "$scratch/gout"`
 test "$out" = "$gout" || fail "seed-built td-builder ($out) != guix-seed build ($gout) — provenance changed the output"

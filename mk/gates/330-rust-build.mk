@@ -57,7 +57,7 @@ rust-build:
 	test -s "$$scratch/td-builder.json" || { echo "ERROR: ts-emit produced no JSON for td-builder" >&2; exit 1; }; \
 	grep -q '"buildSystem":"rust"' "$$scratch/td-builder.json" || { echo "FAIL: recipe JSON is not buildSystem rust" >&2; cat "$$scratch/td-builder.json" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$TB" build-recipe "$$scratch/td-builder.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe self-host (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$TB" build-recipe "$$scratch/td-builder.json" "$$lock" "$$sd" /gnu/store "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe self-host (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; grep -q 'no guix (derivation), no Guile' "$$scratch/err" || { echo "FAIL: build-recipe did not assemble the .drv itself" >&2; cat "$$scratch/err" >&2; exit 1; }; fi; \

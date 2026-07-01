@@ -67,7 +67,7 @@ bootstrap-build:
 	test -s "$$scratch/recipe.json" || { echo "ERROR: recipe-emit produced no JSON" >&2; exit 1; }; \
 	if env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" \
 	     TD_BUILDER_PATH="$$Cb" TD_BUILDER_STORE="$$tdstore" TD_BUILDER_DB="$$bdb" \
-	     "$$tb" build-recipe "$$scratch/recipe.json" "$$lock" "$$b" /var/guix/db/db.sqlite > "$$scratch/bout" 2>"$$scratch/err"; then :; \
+	     "$$tb" build-recipe "$$scratch/recipe.json" "$$lock" "$$b" /gnu/store > "$$scratch/bout" 2>"$$scratch/err"; then :; \
 	else echo "FAIL: build-recipe hello with stage0 (guix/Guile off PATH):" >&2; tail -20 "$$scratch/err" >&2; exit 1; fi; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
