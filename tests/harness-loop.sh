@@ -5,12 +5,10 @@
 # real build with NO guix and NO /gnu/store. This is the container ci/daily-full-suite.sh uses
 # on a VM with no guix installed.
 #
-# This script may use ONLY the harness userland (the busybox applets + make on the /td/store
-# PATH). No guix, no /gnu/store, no host tools — that is the whole point. (td-builder, the
-# engine, joins the IN-harness pillars via rust-store-native rung 3 — today it runs host-side
-# as the sandbox provider. A COMPILER is not in the harness yet either: expanding the /td/store
-# userland to the loop toolchain — gcc, so the guix-free loop can build software, not just text
-# — is the next increment; this loop drives the richest build the busybox+make set can today.)
+# This script may use ONLY the harness userland (the busybox applets + make + the staged C
+# toolchain on the /td/store PATH). No guix, no /gnu/store, no host tools — that is the whole
+# point. (td-builder, the engine, joins the IN-harness pillars via rust-store-native rung 3 —
+# today it runs host-side as the sandbox provider.)
 #
 # Legs (DURABLE — no guix oracle in the room):
 #   [structural]  inside, /gnu/store + /var/guix are ABSENT and guix is unresolvable.
@@ -19,6 +17,9 @@
 #                 busybox userland: prerequisites, pattern rules, a deterministic artifact,
 #                 and a correct INCREMENTAL rebuild (a no-op second run; a changed input
 #                 rebuilds only its path). This is the loop's core operation, guix-free.
+#   [behavioral]  the staged /td/store gcc COMPILES + RUNS real software (Increment 3): it
+#                 builds a C program that returns 42 and runs it in the own-root, guix-free —
+#                 the guix-free loop builds programs, not just text.
 set -eu
 fail() { echo "FAIL: $*" >&2; exit 1; }
 echo "HARNESS-LOOP-START"
@@ -91,5 +92,33 @@ want=`printf 'DELTA\nBETA\nGAMMA\n'`
 # line lists build/b.up build/c.up as prerequisites but that is not a rebuild of b/c.
 grep -q 'src/b.txt\|src/c.txt' "$work/log3" && fail "harness make: rebuilt an UNCHANGED chapter (b/c) — incremental tracking is wrong: `cat "$work/log3"`"
 echo "  MAKE-INCREMENTAL-REBUILD-OK (changed a.txt → report=DELTA/BETA/GAMMA; b,c not rebuilt)"
+
+# [behavioral] the harness COMPILES + RUNS real SOFTWARE with the staged /td/store gcc
+# (Increment 3) — the guix-free loop builds programs, not just text. Reads the toolchain
+# manifest gate 420 (userland-x86_64-store-native) persisted alongside the harness.
+mf=.td-build-cache/harness/toolchain
+[ -f "$mf" ] || fail "no harness toolchain manifest ($mf) — rebuild via ./check.sh userland-x86_64-store-native"
+HT_TARGET=; HT_GCC=; HT_GLIBC=; HT_BU=
+. "$mf"
+{ [ -n "$HT_TARGET" ] && [ -n "$HT_GCC" ] && [ -n "$HT_GLIBC" ] && [ -n "$HT_BU" ]; } \
+  || fail "harness toolchain manifest incomplete ($mf)"
+gcc=/td/store/$HT_GCC/bin/$HT_TARGET-gcc
+glib=/td/store/$HT_GLIBC
+[ -x "$gcc" ] || fail "staged harness gcc not present ($gcc)"
+printf 'int main(void){return 42;}\n' > "$work/hello.c"
+# Mirror the proven guix-free own-root compile (x86_64_verify_closure): glibc headers/crt/libs
+# via -isystem/-B/-L, the dynamic linker + rpath baked to the /td/store x86_64 ld; binutils
+# (as/ld) on PATH (the cross gcc also bundles them in its own tooldir).
+PATH="/td/store/$HT_BU/bin:$PATH" "$gcc" \
+  -isystem "$glib/include" -B"$glib/lib" -L"$glib/lib" -static-libgcc \
+  -Wl,--dynamic-linker -Wl,"$glib/lib/ld-linux-x86-64.so.2" \
+  -Wl,--enable-new-dtags -Wl,-rpath -Wl,"$glib/lib" \
+  -o "$work/hello" "$work/hello.c" 2>"$work/cc.log" \
+  || { cat "$work/cc.log" >&2; fail "harness /td/store gcc could not compile hello.c"; }
+# set -e safe: the program EXITS 42 by design, so capture it in a `||` list (a bare
+# `"$work/hello"; hrc=$?` would abort the script on the expected non-zero exit).
+hrc=0; "$work/hello" || hrc=$?
+[ "$hrc" = 42 ] || fail "harness-compiled program returned $hrc, want 42"
+echo "  COMPILE-RUN-OK (harness /td/store $HT_TARGET-gcc compiled hello.c → ran → 42, no guix, no /gnu/store)"
 
 echo "HARNESS-LOOP-OK"

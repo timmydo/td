@@ -277,23 +277,52 @@ echo "   [behavioral] busybox + make RAN from /td/store in the store-ns own-root
 printf '%s\n' "$out2" | grep -q '^GNU-ABSENT$'   || fail "/gnu/store is PRESENT in the own-root"
 echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT"
 
+# --- Increment 3: stage the C TOOLCHAIN into the harness so the guix-free loop can BUILD
+# software, not just text. The closure {binutils, gcc, glibc} is at its lock-keyed /td/store
+# paths in $cstore (fetched or built above; x86_64_verify_closure already proved it compiles a
+# program → 42 in an own-root). Copy the three components alongside the userland set so the
+# harness store carries a WORKING compiler, and record a manifest the check-harness compile leg
+# reads. guix-byte-free (verified above); a paranoia grep guards a smuggled /gnu/store byte.
+gccb=`basename "$XGCC2"`; glibcb=`basename "$XGLIBC"`; bub=`basename "$XBU"`
+for comp in "$XBU" "$XGCC2" "$XGLIBC"; do
+  cb=`basename "$comp"`
+  [ -e "$ustore/$cb" ] || cp -a "$comp" "$ustore/$cb" || fail "could not stage toolchain component $cb into the harness store"
+done
+chmod -R u+w "$ustore"
+# guix-byte-free check on the COMPILE-PATH binaries (as x86_64_verify_closure does), NOT a
+# recursive grep — the latter reds on seed utility SCRIPTS (gcc install-tools, glibc mtrace
+# shebangs) that are scaffolding, not the deliverable ([[td-x86-64-fetch-path-gotchas]]).
+_xcc1=`find "$ustore/$gccb" -name cc1 2>/dev/null | head -1`
+for _b in "$ustore/$glibcb/lib/libc.so.6" "$ustore/$gccb/bin/$XTARGET-gcc" "$_xcc1"; do
+  { [ -n "$_b" ] && [ -e "$_b" ]; } || fail "staged toolchain missing a compile-path binary ($_b)"
+  ! grep -q -a '/gnu/store' "$_b" || fail "staged harness toolchain binary $_b contains /gnu/store bytes"
+done
+test -x "$ustore/$gccb/bin/$XTARGET-gcc" || fail "staged toolchain missing $XTARGET-gcc"
+echo "   [inc3] staged the C toolchain {binutils,gcc,glibc} into the harness — the guix-free loop can now COMPILE (not just drive text)"
+
 # --- inc2c: PERSIST the validated /td/store harness for the guix-free check tier --------------
-# Copy the harness (busybox+make + glibc/libgcc closure + the /td/store/ld loader) OUT of the
-# ephemeral $snwork into a stable cache the loop consumes via `./check.sh check-harness`
-# (host-sandbox --store-from <here> --store-at /td/store --no-daemon, guix ABSENT). The
-# guix-less daily VM SHIPS this dir; the capture half (this gate) needs a guix host, the consume
-# half touches no guix. Atomic-ish: assemble beside, then swap into place.
+# Copy the harness (busybox+make + the staged C toolchain + glibc/libgcc closure + the
+# /td/store/ld loader) OUT of the ephemeral $snwork into a stable cache the loop consumes via
+# `./check.sh check-harness` (host-sandbox --store-from <here> --store-at /td/store --no-daemon,
+# guix ABSENT). The guix-less daily VM SHIPS this dir; the capture half (this gate) needs a guix
+# host, the consume half touches no guix. Atomic-ish: assemble beside, then swap into place.
 hdir="$ROOT/.td-build-cache/harness"; htmp="$hdir.tmp.$$"
 rm -rf "$htmp" "$hdir.old"; mkdir -p "$htmp/store"
 cp -a "$ustore/." "$htmp/store/" || fail "could not copy the harness store to the cache"
 printf '%s\n' "$rel" > "$htmp/rel"
+# The compile leg (tests/harness-loop.sh) reads this manifest for the staged toolchain paths.
+{ printf 'HT_TARGET=%s\n' "$XTARGET"; printf 'HT_GCC=%s\n' "$gccb"; \
+  printf 'HT_GLIBC=%s\n' "$glibcb"; printf 'HT_BU=%s\n' "$bub"; } > "$htmp/toolchain"
 [ -d "$hdir" ] && mv "$hdir" "$hdir.old"
 mv "$htmp" "$hdir"; rm -rf "$hdir.old"
 test -x "$hdir/store/$rel/bin/busybox" -a -x "$hdir/store/$rel/bin/make" -a -e "$hdir/store/ld" \
   || fail "persisted harness at $hdir is incomplete"
-echo "   [inc2c] persisted the /td/store harness to .td-build-cache/harness (consumed by ./check.sh check-harness)"
+test -x "$hdir/store/$gccb/bin/$XTARGET-gcc" -a -s "$hdir/toolchain" \
+  || fail "persisted harness is missing the staged C toolchain / manifest"
+echo "   [inc2c] persisted the /td/store harness + C toolchain to .td-build-cache/harness (consumed by ./check.sh check-harness)"
 
 echo "PASS: userland-x86_64-store-native — from the 229-byte seed, td built the i686 chain → gcc 14.3.0,"
 echo "  crossed up to x86_64, and built busybox 1.37.0 + GNU make 4.4.1 from upstream source, DYNAMIC vs the"
 echo "  /td/store glibc 2.41, interned at /td/store, and RAN them in the store-ns own-root → /gnu/store ABSENT,"
-echo "  zero guix bytes. The C userland of the guix-less daily-suite captured set."
+echo "  zero guix bytes. The C userland of the guix-less daily-suite captured set — plus the staged C toolchain"
+echo "  {binutils,gcc,glibc} (Increment 3) so the guix-free check-harness loop COMPILES + runs real software."
