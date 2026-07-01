@@ -6445,6 +6445,54 @@ memchr-2.7.crate /gnu/store/ddd-memchr.crate
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // #258 ripgrep cutover: the native /td/store gcc is a PLAIN gcc (no ld-wrapper), so run_rust must
+    // bake the interp/RUNPATH/-B explicitly — but the build sandbox CLEARS the env, so those must ride
+    // in the drv's `env` lines. assemble_recipe_drv forwards the caller's TD_RUST_STORE_* into a rust
+    // drv (and ONLY a rust drv; only when set), so run_rust receives them. Exercise the real engine
+    // path and assert the drv env carries them, and that the default (unset) emits none.
+    #[test]
+    fn assemble_recipe_drv_forwards_td_rust_store_env() {
+        let dir = std::env::temp_dir().join(format!("td-ruststore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("ripgrep.lock");
+        std::fs::write(
+            &lock,
+            "ripgrep-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-14.1.1.tar.gz source\n\
+             /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-14.3.0-x86_64-native /td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-14.3.0-x86_64-native\n\
+             /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native /td/store/cccccccccccccccccccccccccccccccc-rust-1.96.0-x86_64-store-native\n",
+        )
+        .unwrap();
+        let recipe = r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"]}"#;
+        let lockp = lock.to_str().unwrap();
+        let builder = "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-td-builder-0.1.0";
+        let env_of = |drv: &drv::Derivation, k: &str| {
+            drv.env.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
+        };
+        let interp = "/td/store/cccccccccccccccccccccccccccccccc-glibc-2.41-x86_64/lib/ld-linux-x86-64.so.2";
+        let rpath = "/td/store/cccccccccccccccccccccccccccccccc-glibc-2.41-x86_64/lib";
+        let bdir = rpath;
+
+        // WITH the vars set: the rust drv carries them so run_rust can bake interp/RUNPATH/-B.
+        std::env::set_var("TD_RUST_STORE_INTERP", interp);
+        std::env::set_var("TD_RUST_STORE_RPATH", rpath);
+        std::env::set_var("TD_RUST_STORE_BDIR", bdir);
+        let (_p, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, builder, None).unwrap();
+        std::env::remove_var("TD_RUST_STORE_INTERP");
+        std::env::remove_var("TD_RUST_STORE_RPATH");
+        std::env::remove_var("TD_RUST_STORE_BDIR");
+        assert_eq!(env_of(&drv, "TD_RUST_STORE_INTERP").as_deref(), Some(interp), "interp forwarded to the drv env");
+        assert_eq!(env_of(&drv, "TD_RUST_STORE_RPATH").as_deref(), Some(rpath), "rpath forwarded");
+        assert_eq!(env_of(&drv, "TD_RUST_STORE_BDIR").as_deref(), Some(bdir), "bdir forwarded");
+
+        // WITHOUT the vars (default): none emitted ⇒ the guix ld-wrapper path, unchanged.
+        let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, builder, None).unwrap();
+        assert!(env_of(&drv0, "TD_RUST_STORE_INTERP").is_none(), "no interp in the drv env by default");
+        assert!(env_of(&drv0, "TD_RUST_STORE_RPATH").is_none(), "no rpath by default");
+        assert!(env_of(&drv0, "TD_RUST_STORE_BDIR").is_none(), "no bdir by default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- content-scan closure (retire /var/guix/db): scan_candidate_index + scan_closure_hybrid ----
     // The daemon-DB-free input-closure computation realize_drv now uses. A store DIR is
     // content-scanned for the seed roots (candidate index keyed by CANONICAL path, bytes
