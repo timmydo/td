@@ -118,6 +118,21 @@ if [ $rc -eq 0 ]; then
   else
     echo ">> publish-x86_64-closure: WARN — td-subst sign failed; not published"
   fi
+  # x86_64 NATIVE toolchain (#258 prereq): sign + publish the native binutils-2.44 + gcc-14.3.0 closure
+  # that gate 422 subst-exported this run (tests/td-toolchain-x86_64-native.lock), so the per-PR loop
+  # FETCHES the native toolchain + SKIPS the ~45-min native build (fallback to from-cross build on miss).
+  # Same signing key + trust anchor (tests/td-subst.pub) as the cross closure.
+  _nxexp=.td-build-cache/x86_64-native-closure-export
+  if ! ls "$_nxexp"/*.narinfo >/dev/null 2>&1; then
+    echo ">> publish-x86_64-native-closure: SKIP — no export at $_nxexp (gate 422 built none this run)"
+  elif [ -z "${TD_SUBST_PRIVKEY:-}" ] || [ -z "$_sb" ] || [ ! -x "$_sb" ]; then
+    echo ">> publish-x86_64-native-closure: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set"
+  elif "$_sb" sign "$_nxexp" "$TD_SUBST_PRIVKEY" >/dev/null 2>&1; then
+    mkdir -p "$_store"; cp -a "$_nxexp"/. "$_store"/
+    echo ">> publish-x86_64-native-closure: signed + published the native x86_64 toolchain closure to $_store (the per-PR loop FETCHES the native toolchain, SKIPS the ~45-min native build)"
+  else
+    echo ">> publish-x86_64-native-closure: WARN — td-subst sign failed; not published"
+  fi
 else
   echo ">> daily backstop: RED (heavy_rc=$heavy_rc system_rc=$system_rc harness_rc=$harness_rc) — agent: triage \`git log <last-green>..$main\`, reproduce the failing gate, open a FIX-OR-REVERT PR (no auto-merge). Suspect-revert helper: ci/revert-suspect.sh --ref <sha> --open-pr"
 fi
