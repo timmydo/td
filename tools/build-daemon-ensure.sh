@@ -11,7 +11,7 @@
 # listening socket, bound into every check sandbox by host-sandbox), store/ (the shared
 # CONTENT-ADDRESSED output store, read back by the submitter), daemon.pid, daemon.log,
 # daemon.lock. STORE-DB (the seed reference graph for input-closure staging) is
-# /var/guix/db/db.sqlite (TD_DAEMON_STORE_DB to override).
+# /gnu/store (TD_DAEMON_SEED_DIR to override).
 #
 # Env: TD_DAEMON_DIR (shared dir), TD_DAEMON_BUILDER (a specific td-builder binary; else a
 # td-bootstrapped stage0 placement, else a host `cargo build` of builder/), TD_BUILD_JOBS
@@ -23,7 +23,10 @@ set -eu
 daemon_dir=${TD_DAEMON_DIR:-$HOME/.td/build-daemon}
 store="$daemon_dir/store"
 lock_f="$daemon_dir/daemon.lock"
-store_db=${TD_DAEMON_STORE_DB:-/var/guix/db/db.sqlite}
+# The daemon's start-time SEED STORE DIR (content-scanned for the input closure — #267
+# retired the /var/guix/db read). Only used for bare-drv requests (gates 358/359); the corpus
+# path passes it per-request. A store DIR, not a db file.
+seed_dir=${TD_DAEMON_SEED_DIR:-/gnu/store}
 mkdir -p "$store"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -73,7 +76,7 @@ rm -f "$sock"
 nice_wrap="nice -n ${TD_NICE:-10}"
 command -v ionice >/dev/null 2>&1 && nice_wrap="$nice_wrap ionice -c2 -n7"
 nohup $nice_wrap env ${TD_BUILD_JOBS:+TD_BUILD_JOBS="$TD_BUILD_JOBS"} \
-  "$tb" daemon "$sock" "$store_db" "$store" >"$log_f" 2>&1 9>&- &
+  "$tb" daemon "$sock" "$seed_dir" "$store" >"$log_f" 2>&1 9>&- &
 pid=$!
 echo "$pid" > "$pid_f"
 

@@ -4,8 +4,11 @@
 # probe discipline — 0 drvs to build on the warm store vs umoci 113 and podman
 # 1238 + 290 cold fetches (rejected at M8); resolved via `$(GUIX) build` so
 # check.sh's package list is untouched. For BOTH the plain td image and the
-# gen-1 bootc generation image (drvs shared with `oci`/`generation-image`, so
-# the marginal cost is the skopeo pass, not a rebuild):
+# gen-1 bootc generation image, the marginal cost is the skopeo pass, not a
+# rebuild. The plain image is now the td-NATIVE system image (`td-builder
+# oci-image-closure` over the td system closure — shared with the `oci` gate, no
+# `guix system image`, the OCI slice of workstream C); gen-1 stays on the guix
+# `generation-image` lowering (its own later slice):
 #   • `skopeo copy docker-archive:… oci:…` — the foreign stack parses the
 #     archive and verifies every blob digest while writing the CANONICAL OCI
 #     LAYOUT, the §2.7 identity carrier;
@@ -26,12 +29,23 @@ SYSTEM_GATES += oci-load
 oci-load:
 	@echo ">> oci-load: foreign OCI implementation (skopeo) loads the shipped images"
 	@set -euo pipefail; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
+	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	skopeo=`$(GUIX) build skopeo`/bin/skopeo; \
-	plain_img=`$(GUIX) system image $(LOAD) -t docker $(SYSTEM)`; \
+	crun=`$(GUIX) build crun`; \
+	work="$(CURDIR)/.oci-load-scratch"; rm -rf "$$work"; mkdir -p "$$work"; \
+	echo ">> plain image: td-builder packs the td SYSTEM closure (td-native, no guix system image — shared with the oci gate)"; \
+	$(GUIX) repl $(LOAD) tests/oci-system-closure.scm > "$$work/plain-closure.txt" 2>/dev/null \
+	  || { echo "ERROR: could not resolve the td system closure" >&2; exit 1; }; \
+	test -s "$$work/plain-closure.txt" || { echo "ERROR: empty td system closure" >&2; exit 1; }; \
+	printf '{"repoTag":"td-system:latest","env":["PATH=/bin"],"entrypoint":["%s/bin/crun"]}' "$$crun" > "$$work/plain-config.json"; \
+	"$$tb" oci-image-paths "$$work/plain-closure.txt" /gnu/store "$$work/plain-config.json" "$$work/plain.tar" \
+	  || { echo "FAIL: td-builder oci-image-paths failed on the td system closure" >&2; exit 1; }; \
+	plain_img="$$work/plain.tar"; \
 	gen1=`$(GUIX) repl $(LOAD) tests/generation-image-drv.scm 2>/dev/null | sed -n 's/^DRV_GEN1=//p'`; \
 	test -n "$$gen1" || { echo "ERROR: could not lower the gen-1 bootc image derivation" >&2; exit 1; }; \
 	gen1_img=`$(GUIX) build "$$gen1"`; \
-	work="$(CURDIR)/.oci-load-scratch"; rm -rf "$$work"; mkdir -p "$$work"; \
 	for leg in plain:$$plain_img gen1:$$gen1_img; do \
 	  name=$${leg%%:*}; img=$${leg#*:}; \
 	  echo ">> skopeo copy docker-archive -> oci layout ($$name): $$img"; \

@@ -137,7 +137,7 @@ MKX="$snwork/makex"; BBX="$snwork/bbx"
 trap 'rm -rf "$snwork"; [ -n "${binsh_made:-}" ] && rm -f /bin/sh' EXIT INT TERM    # the build branch re-traps to also clean its chain temps
 cstore="$snwork/closure-store"; cdb="$snwork/closure.db"; mkdir -p "$cstore"
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash from hello's closure for the own-root shell"
 bbase=`basename "$bs"`; cp -a "$bs" "$cstore/$bbase"; chmod -R u+w "$cstore"
 

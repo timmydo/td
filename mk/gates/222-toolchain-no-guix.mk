@@ -13,8 +13,11 @@
 # The irreducible compiler seed (gcc-toolchain/glibc/binutils) stays external
 # (§5, retired last). Per tool: STRUCTURAL (built with guix/Guile off PATH),
 # DURABLE behavioral (the tool runs --version), DURABLE reproducibility (td-builder
-# check double-build), MIGRATION ORACLE (distinct store path from guix's build —
-# own, then diverge). Locks are the guix-built seed.
+# check double-build). The removable guix-comparison oracle (distinct store path from
+# guix's build — "own, then diverge") is DROPPED: the leaf tools stand on their own
+# here (td-assembled .drv + td-double-build repro), so per AGENTS.md ("the
+# byte-hash-vs-Guix leg is the removable oracle") the guix leg is retired. Locks are
+# the guix-built seed.
 HEAVY_GATES += toolchain-no-guix
 # Built up front by the parallel `build-recipes` phase (into the shared cache); this
 # gate then cache-hits + memo-skips and only asserts behavior/oracle.
@@ -22,7 +25,7 @@ toolchain_SPECS := make sed grep xz diffutils patch file coreutils gawk tar find
 BUILD_SPECS     += $(toolchain_SPECS)
 BUILD_GATES     += toolchain-no-guix
 toolchain-no-guix:
-	@echo ">> toolchain-no-guix: td builds make + sed + grep + xz + diffutils + patch + file + coreutils + gawk + tar + findutils + bash via build-recipe (no guix/Guile in the build path); each runs, reproducible, distinct from guix; gcc/glibc/binutils seed stays external (§5)"
+	@echo ">> toolchain-no-guix: td builds make + sed + grep + xz + diffutils + patch + file + coreutils + gawk + tar + findutils + bash via build-recipe (no guix/Guile in the build path); each runs, reproducible; gcc/glibc/binutils seed stays external (§5)"
 	@set -euo pipefail; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/make-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
@@ -56,9 +59,6 @@ toolchain-no-guix:
 	  LD_LIBRARY_PATH="$$L" "$$ns/bin/$$bin" --version | grep -q "$$nver" || { echo "FAIL: $$spec ($$bin --version lacks '$$nver')" >&2; exit 1; }; \
 	  echo "  [DURABLE behavioral] $$spec: $$bin runs --version ($$nver) from td's own store output"; \
 	  cached_check "$$spec" || exit 1; \
-	  g=`$(GUIX) build "$$spec" 2>/dev/null | grep -v -- '-debug' | head -1 || true`; \
-	  if [ -n "$$g" ] && [ "$$out" = "$$g" ]; then echo "FAIL: td's $$spec path equals guix's — expected a distinct own-builder path" >&2; exit 1; fi; \
-	  echo "  [MIGRATION ORACLE] distinct from guix's $$spec"; \
 	  cached_clean; \
 	done; \
-	echo "PASS: td built its toolchain leaf tools — make (guile-free), sed, grep, xz, diffutils, patch, file, coreutils, gawk, tar, findutils, bash — via td-builder build-recipe, every input resolved from a pinned lock (no specification->package), the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; each runs --version (durable), is reproducible by td's own double-build (durable), and lands at a distinct store path from guix's build (own, then diverge). The compiler seed (gcc-toolchain/glibc/binutils) stays external (§5, retired last)."
+	echo "PASS: td built its toolchain leaf tools — make (guile-free), sed, grep, xz, diffutils, patch, file, coreutils, gawk, tar, findutils, bash — via td-builder build-recipe, every input resolved from a pinned lock (no specification->package), the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; each runs --version (durable) and is reproducible by td's own double-build (durable). The removable guix-comparison oracle was dropped — the leaf tools stand on their own. The compiler seed (gcc-toolchain/glibc/binutils) stays external (§5, retired last)."

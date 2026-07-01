@@ -118,7 +118,7 @@ echo "   [load-bearing] recipe-rev bump moves the key; flipping one input pin mo
 # real runnable FIXTURE — placed at the x86_64-keyed input-addressed path, run in the store-ns own-root.
 bashpkg=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
 test -n "$bashpkg" || fail "no bash in hello's lock"
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashpkg" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashpkg" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in the closure of $bashpkg"
 store="$work/store"; mkdir -p "$store"
 RUNP=`"$TB" store-add-input-addressed bash-static-x86_64 "$KX" "$bs" "$store" "$work/store.db"` || fail "store-add-input-addressed bash-static-x86_64"

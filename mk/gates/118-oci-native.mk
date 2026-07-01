@@ -31,11 +31,11 @@ oci-native:
 	scratch="$(CURDIR)/.oci-native-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	trap 'chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"' EXIT; \
 	printf '{"repoTag":"td-hello:latest","env":["PATH=/bin"],"entrypoint":["%s/bin/hello"]}' "$$hello" > "$$scratch/config.json"; \
-	echo ">> td-builder oci-image-closure (td reads /var/guix/db, packs hello's closure — no guix system image)"; \
-	"$$tb" oci-image-closure /var/guix/db/db.sqlite /gnu/store "$$scratch/config.json" "$$scratch/img1.tar" "$$hello" \
+	echo ">> td-builder oci-image-closure (td CONTENT-SCANS /gnu/store, packs hello's closure — no /var/guix/db, no guix system image)"; \
+	"$$tb" oci-image-closure /gnu/store "$$scratch/config.json" "$$scratch/img1.tar" "$$hello" \
 	  || { echo "FAIL: td-builder oci-image-closure failed" >&2; exit 1; }; \
 	echo ">> INTRINSIC reproducibility: pack the same closure again, assert byte-identical"; \
-	"$$tb" oci-image-closure /var/guix/db/db.sqlite /gnu/store "$$scratch/config.json" "$$scratch/img2.tar" "$$hello" \
+	"$$tb" oci-image-closure /gnu/store "$$scratch/config.json" "$$scratch/img2.tar" "$$hello" \
 	  || { echo "FAIL: second oci-image-closure failed" >&2; exit 1; }; \
 	h1=`sha256sum < "$$scratch/img1.tar" | cut -d" " -f1`; \
 	h2=`sha256sum < "$$scratch/img2.tar" | cut -d" " -f1`; \

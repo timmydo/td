@@ -22,7 +22,7 @@ td-offline:
 	$(GUIX) build "$$sdrv" >/dev/null 2>&1 || { echo "ERROR: could not realize the probe's inputs" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.td-offline-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	echo ">> [DURABLE: td isolation] td-builder realize runs the probe in its userns+NEWNET sandbox (only lo + egress must fail, else the build reds)"; \
-	"$$tb" realize "$$sdrv" /var/guix/db/db.sqlite "$$scratch/b" > "$$scratch/log.txt" 2>&1 || { echo "FAIL: td realize of the network probe failed — td's builder did not isolate the build (or the probe saw the network):" >&2; cat "$$scratch/log.txt" >&2; exit 1; }; \
+	"$$tb" realize "$$sdrv" /gnu/store "$$scratch/b" > "$$scratch/log.txt" 2>&1 || { echo "FAIL: td realize of the network probe failed — td's builder did not isolate the build (or the probe saw the network):" >&2; cat "$$scratch/log.txt" >&2; exit 1; }; \
 	grep -q 'netns interfaces: ("lo")' "$$scratch/log.txt" || { echo "FAIL: the probe under td's builder did not report a loopback-only netns" >&2; cat "$$scratch/log.txt" >&2; exit 1; }; \
 	grep -q 'egress attempt failed as required' "$$scratch/log.txt" || { echo "FAIL: the probe under td's builder did not confirm egress failed" >&2; cat "$$scratch/log.txt" >&2; exit 1; }; \
 	echo "   td's builder gave the build a loopback-only netns and egress failed"; \

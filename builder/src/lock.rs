@@ -18,6 +18,8 @@
 //! guix's. To `build-recipe` a `td-recipe-output` is just another build input
 //! (an input-src) — only its PATH (oracle vs td) changes.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 /// How a lock entry is consumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {

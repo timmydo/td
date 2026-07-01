@@ -24,6 +24,8 @@
 //! git repo), so it is CWD-robust. The library functions take an explicit `root` so
 //! tests are CWD-independent.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -1321,8 +1323,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     if default_check_covers_target(root, "check-system") {
         fail("default coverage: check-system is not covered by plain ./check.sh".into());
     }
-    if default_check_covers_target(root, "oci-diff") {
-        fail("default coverage: system gate oci-diff is not covered by plain ./check.sh".into());
+    if default_check_covers_target(root, "oci-load") {
+        fail("default coverage: system gate oci-load is not covered by plain ./check.sh".into());
     }
 
     // Every gate file maps (via the mk/gates/*.mk arm) to its own gate target.

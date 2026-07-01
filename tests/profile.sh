@@ -38,7 +38,7 @@ build_pkg() {
   env -i HOME="$work" TMPDIR="$work/tmp" PATH="$cu/bin" \
     TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
     TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
-    "$TB" build-recipe "$work/$_s.json" "tests/$_s-no-guix.lock" "$work/$_s-b" /var/guix/db/db.sqlite \
+    "$TB" build-recipe "$work/$_s.json" "tests/$_s-no-guix.lock" "$work/$_s-b" /gnu/store \
     > "$work/$_s.out" 2>"$work/$_s.err" || { tail -15 "$work/$_s.err" >&2; fail "build $_s"; }
   _o=`sed -n 's/^OUT=out //p' "$work/$_s.out"`
   test -n "$_o" || fail "$_s produced no output"

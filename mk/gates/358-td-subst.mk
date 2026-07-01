@@ -57,7 +57,7 @@ td-subst:
 	sh tests/recipe-emit.sh td-subst > "$$scratch/subst.json"; \
 	test -s "$$scratch/subst.json" || { echo "ERROR: ts-emit produced no JSON" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/subst.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe td-subst build:" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/subst.json" "$$lock" "$$sd" /gnu/store "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe td-subst build:" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; fi; \
@@ -105,7 +105,7 @@ td-subst:
 	trap 'kill $$cspid 2>/dev/null || true' EXIT; \
 	cport=""; for i in `seq 1 100`; do cport=`sed -n 's#.*http://127.0.0.1:\([0-9]*\)/.*#\1#p' "$$scratch/csrv.log" 2>/dev/null`; [ -n "$$cport" ] && break; sleep 0.1; done; \
 	test -n "$$cport" || { echo "FAIL: consumer-leg serve never bound a port" >&2; cat "$$scratch/csrv.log" >&2; exit 1; }; \
-	env -i HOME="$$csd" TMPDIR="$$csd/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" TD_SUBST_URL="http://127.0.0.1:$$cport" TD_SUBST_PUBKEY="$$e2e/pub" TD_SUBST_BIN="$$ts" "$$tb" build-recipe "$$scratch/subst.json" "$$lock" "$$csd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$csd/bout" 2>"$$csd/cerr" || { echo "FAIL: build-recipe with TD_SUBST_URL (consumer hook):" >&2; tail -20 "$$csd/cerr" >&2; exit 1; }; \
+	env -i HOME="$$csd" TMPDIR="$$csd/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" TD_SUBST_URL="http://127.0.0.1:$$cport" TD_SUBST_PUBKEY="$$e2e/pub" TD_SUBST_BIN="$$ts" "$$tb" build-recipe "$$scratch/subst.json" "$$lock" "$$csd" /gnu/store "$$srcstore" "$$srcdb" > "$$csd/bout" 2>"$$csd/cerr" || { echo "FAIL: build-recipe with TD_SUBST_URL (consumer hook):" >&2; tail -20 "$$csd/cerr" >&2; exit 1; }; \
 	grep -qx 'CACHE=subst' "$$csd/bout" || { echo "FAIL: build-recipe did NOT substitute (no CACHE=subst) though a valid signed substitute was served" >&2; cat "$$csd/bout" >&2; tail -5 "$$csd/cerr" >&2; exit 1; }; \
 	cout=`sed -n 's/^OUT=out //p' "$$csd/bout"`; \
 	test "x$$cout" = "x$$out" || { echo "FAIL: substituted output path ($$cout) != the built output ($$out)" >&2; exit 1; }; \
@@ -123,7 +123,7 @@ td-subst:
 	ttl="$(CURDIR)/tests/td-toolchain.lock"; test -s "$$ttl" || { echo "FAIL: no td-toolchain.lock" >&2; exit 1; }; \
 	iakey=`env -i PATH="$$cu/bin" "$$tb" toolchain-key "$$ttl"`; test -n "$$iakey" || { echo "FAIL: toolchain-key produced nothing" >&2; exit 1; }; \
 	bashpkg=`grep -- '-bash-' "$(CURDIR)/tests/hello-no-guix.lock" | grep -v static | sed 's/^[^ ]* //' | head -1`; \
-	iabs=`env -i PATH="$$cu/bin" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" store-closure /var/guix/db/db.sqlite "$$bashpkg" | grep -- '-bash-static-' | head -1`; \
+	iabs=`env -i PATH="$$cu/bin" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" store-closure-scan /gnu/store "$$bashpkg" | grep -- '-bash-static-' | head -1`; \
 	test -n "$$iabs" -a -x "$$iabs/bin/bash" || { echo "FAIL: no static bash fixture in hello's closure" >&2; exit 1; }; \
 	iad="$$scratch/ia"; rm -rf "$$iad"; mkdir -p "$$iad/store" "$$iad/served" "$$iad/fetch" "$$iad/restored"; \
 	iap=`env -i PATH="$$cu/bin" TD_STORE_DIR=/td/store "$$tb" store-add-input-addressed glibc-2.41 "$$iakey" "$$iabs" "$$iad/store" "$$iad/td.db"`; \

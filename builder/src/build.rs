@@ -29,6 +29,8 @@
 //!                      real source-patch phases (e.g. gettext-minimal) with NO
 //!                      Guile/gnu-build-system in the build.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use crate::json::Json;
 use std::env;
 use std::fs;

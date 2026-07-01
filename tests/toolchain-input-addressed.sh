@@ -112,7 +112,7 @@ echo "   [load-bearing] flipping one declared input pin moves glibc-2.41's path 
 # a real runnable FIXTURE — placed input-addressed, then executed in the store-ns own-root.
 bashpkg=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
 test -n "$bashpkg" || fail "no bash in hello's lock"
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashpkg" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashpkg" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in the closure of $bashpkg"
 store="$work/store"; mkdir -p "$store"
 RUNP=`"$TB" store-add-input-addressed bash-static "$K1" "$bs" "$store" "$work/store.db"` || fail "store-add-input-addressed bash-static"

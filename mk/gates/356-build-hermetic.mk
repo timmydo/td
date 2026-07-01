@@ -25,7 +25,7 @@ build-hermetic:
 	out=`sed -n 's/^PROBE_OUT=//p' "$$scratch/facts.txt"`; \
 	test -n "$$drv" -a -n "$$out" || { echo "FAIL: missing probe facts" >&2; cat "$$scratch/facts.txt" >&2; exit 1; }; \
 	"$$tb" drv-emit-to "$$drv" "$$scratch/emitted.drv" >/dev/null || { echo "FAIL: drv-emit-to" >&2; exit 1; }; \
-	if "$$tb" realize "$$scratch/emitted.drv" /var/guix/db/db.sqlite "$$scratch/b" > "$$scratch/out.txt" 2> "$$scratch/realize.err"; then :; \
+	if "$$tb" realize "$$scratch/emitted.drv" /gnu/store "$$scratch/b" > "$$scratch/out.txt" 2> "$$scratch/realize.err"; then :; \
 	else echo "FAIL: realize errored — the probe builder saw /var/guix OR the launching td-builder in /proc (build-sandbox isolation regression: sandbox::build did not pivot the host fs away, or did not unshare NEWPID + mount a fresh /proc)" >&2; tail -8 "$$scratch/realize.err" >&2; exit 1; fi; \
 	grep -qx "path $$out" "$$scratch/b/registration" || { echo "FAIL: probe output $$out not registered" >&2; cat "$$scratch/b/registration" >&2; exit 1; }; \
 	echo ">> [DURABLE: behavioral] td realized the probe with NO /var/guix reachable AND the loop's process tree invisible in the build sandbox (no guix oracle — the assertions are that the daemon state and the launching td-builder are absent from the build)"; \

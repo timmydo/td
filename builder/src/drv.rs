@@ -14,6 +14,8 @@
 //! names in sets (dedup, last-wins); we keep file order with duplicates —
 //! identical for real drvs, which are emitted from those sorted structures.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 /// One (name,path,hashAlgo,hash) output entry, in file order.
 #[derive(Debug)]
 pub struct Output {

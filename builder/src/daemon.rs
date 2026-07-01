@@ -9,6 +9,8 @@
 //! The daemon (C++) stays the store/build backend; what this removes from the
 //! `.drv` path is the GUILE client, not the daemon.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 

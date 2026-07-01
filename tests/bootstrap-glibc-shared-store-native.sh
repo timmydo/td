@@ -715,7 +715,7 @@ case "$GLP" in /td/store/*-glibc-shared) ;; *) fail "glibc-shared not content-ad
 echo "   [content-addr] interned $GLP"; echo "                  + gcc-mesboot1 + binutils-mesboot, content-addressed in /td/store"
 
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in hello's closure"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 mkdir -p "$store/work"; printf '#include <stdio.h>\nint main(){printf("dyn-td-store\\n");return 42;}\n' > "$store/work/hello.c"

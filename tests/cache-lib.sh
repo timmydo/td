@@ -81,10 +81,11 @@ cached_build() {
   test -n "$TD_BUILDER_PATH" || { echo "FAIL: TD_BUILDER_PATH unset — load_stage0 did not place a stage0 builder" >&2; return 1; }
   grep -qF "$TD_BUILDER_PATH/bin/td-builder" "$_drvf" \
     || { echo "FAIL: $_spec .drv builder is not the stage0 $TD_BUILDER_PATH — built by the wrong td-builder?" >&2; return 1; }
-  # (2) SUBMIT to the shared daemon, carrying the seed store-db (the guix-built seed's
-  # reference graph, §5 retired-last) + the per-request builder override (BP BS BD) so the
-  # daemon stages THIS worktree's inputs + stage0 builder. Reply: OK <canon> <host> <hit|built>.
-  _resp=`"$TB" daemon-request "$TD_DAEMON_SOCKET" "$_drvf /var/guix/db/db.sqlite $TD_BUILDER_PATH $TD_BUILDER_STORE $TD_BUILDER_DB"` \
+  # (2) SUBMIT to the shared daemon, carrying the SEED STORE DIR (content-scanned for the
+  # input closure — #267 retired the /var/guix/db read) + the per-request builder override
+  # (BP BS BD) so the daemon stages THIS worktree's inputs + stage0 builder. Reply:
+  # OK <canon> <host> <hit|built>.
+  _resp=`"$TB" daemon-request "$TD_DAEMON_SOCKET" "$_drvf /gnu/store $TD_BUILDER_PATH $TD_BUILDER_STORE $TD_BUILDER_DB"` \
     || { echo "FAIL: $_spec daemon build failed ($_resp) — see the daemon log" >&2; return 1; }
   case "$_resp" in "OK "*) : ;; *) echo "FAIL: $_spec daemon build not OK: $_resp" >&2; return 1 ;; esac
   # shellcheck disable=SC2086 -- split the OK <canon> <host> <hit|built> reply into fields
@@ -110,7 +111,7 @@ cached_check() {
   fi
   _drvf=`ls "$sd/b/"*.drv 2>/dev/null | head -1`
   test -n "$_drvf" || { echo "FAIL: no assembled .drv for $_spec" >&2; return 1; }
-  _resp=`"$TB" daemon-request "$TD_DAEMON_SOCKET" "CHECK $_drvf /var/guix/db/db.sqlite $TD_BUILDER_PATH $TD_BUILDER_STORE $TD_BUILDER_DB"` \
+  _resp=`"$TB" daemon-request "$TD_DAEMON_SOCKET" "CHECK $_drvf /gnu/store $TD_BUILDER_PATH $TD_BUILDER_STORE $TD_BUILDER_DB"` \
     || { echo "FAIL: $_spec NOT reproducible (daemon CHECK: $_resp) — see the daemon log" >&2; return 1; }
   case "$_resp" in "OK "*) : ;; *) echo "FAIL: $_spec NOT reproducible: $_resp" >&2; return 1 ;; esac
   printf '%s\n' "${out:-verified}" > "$sd/b/verified-reproducible"

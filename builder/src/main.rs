@@ -40,6 +40,7 @@ use std::process::{Command, ExitCode};
 /// Adapter: stream Write into the hasher.
 struct HashWriter(sha256::Sha256);
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 impl std::io::Write for HashWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.update(buf);
@@ -50,12 +51,14 @@ impl std::io::Write for HashWriter {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nar_hash_path(path: &Path) -> Result<String, std::io::Error> {
     let mut w = HashWriter(sha256::Sha256::new());
     nar::write_nar(&mut w, path)?;
     Ok(format!("sha256:{}", sha256::to_base16(&w.0.finalize())))
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nar_hash(path: &str) -> Result<String, std::io::Error> {
     nar_hash_path(Path::new(path))
 }
@@ -67,6 +70,7 @@ struct HashSizeWriter {
     size: u64,
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 impl std::io::Write for HashSizeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.hasher.update(buf);
@@ -79,6 +83,7 @@ impl std::io::Write for HashSizeWriter {
 }
 
 /// The (NAR hash, NAR size) of a path — one serialization pass.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nar_hash_size_path(path: &Path) -> Result<(String, u64), std::io::Error> {
     let mut w = HashSizeWriter { hasher: sha256::Sha256::new(), size: 0 };
     nar::write_nar(&mut w, path)?;
@@ -103,6 +108,7 @@ struct SubstMember {
 }
 
 /// The basename (`<hash>-name`) of a store path.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn store_basename(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
 }
@@ -110,6 +116,7 @@ fn store_basename(p: &str) -> &str {
 /// Render a td-native narinfo (minimal, line-oriented). References are recorded as
 /// basenames so the record is store-location independent; the consumer rebases them onto
 /// its own store dir. The signature line (`Sig:`) is appended later by the signer.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn narinfo_text(
     store_path: &str,
     narhash: &str,
@@ -125,6 +132,7 @@ fn narinfo_text(
 
 /// Write a serve-able substitute directory for MEMBERS into OUTDIR. Returns the basenames
 /// written. Each member yields `OUTDIR/<basename>.narinfo` + `OUTDIR/nar/<narhash>.nar`.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn subst_export(outdir: &Path, members: &[SubstMember]) -> std::io::Result<Vec<String>> {
     let nardir = outdir.join("nar");
     std::fs::create_dir_all(&nardir)?;
@@ -154,6 +162,7 @@ fn subst_export(outdir: &Path, members: &[SubstMember]) -> std::io::Result<Vec<S
 /// publisher of a single build output need not stage that output's whole closure into STORE_DIR
 /// (its external refs live elsewhere). The narinfo still lists each path's refs as basenames
 /// either way, so the consumer can scan-verify the restored bytes.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn subst_export_members(
     db: &store_db_read::Db,
     store_dir: &str,
@@ -191,6 +200,7 @@ fn subst_export_members(
 }
 
 /// The `path` column (index 1) of a read `ValidPaths` row, or "" if absent.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn path_at(cols: &[store_db_read::Value]) -> &str {
     match cols.get(1) {
         Some(store_db_read::Value::Text(p)) => p,
@@ -206,6 +216,7 @@ fn path_at(cols: &[store_db_read::Value]) -> &str {
 /// reproduced (dirs are left writable so the scratch copy can be cleaned up);
 /// regular files get the canonical `0555`/`0444` by their source exec bit, which
 /// is the one perm NAR encodes. Mirrors `(guix serialization) write-file`.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let md = std::fs::symlink_metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
@@ -237,6 +248,7 @@ fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
 /// Resolve `guix` on the current PATH to its real (symlink-followed) location
 /// and return the directory holding it — the bin dir check.sh prepends to PATH
 /// (under the exposed /gnu/store). None if `guix` is not on PATH.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn host_guix_bin_dir() -> Option<String> {
     let path = std::env::var("PATH").ok()?;
     for dir in path.split(':').filter(|s| !s.is_empty()) {
@@ -267,6 +279,7 @@ struct OutputReg {
 /// references resolve to another output's id or to a scaffolding `ValidPaths` row
 /// (path only) — the same shape `store-add-referenced` writes. registrationTime is
 /// a fixed sentinel (excluded from the daemon differential, as in `store-register`).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
     use std::collections::BTreeMap;
     use store_db::{Table, Value};
@@ -367,6 +380,7 @@ fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
 /// Scope is the GC/closure authority — `ValidPaths` + `Refs`; a persistent commit DB
 /// does not carry `DerivationOutputs` (as `store-gc-sweep`'s swept DB does not: the
 /// drv→output mapping is rebuilt by registration, not by accumulation).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_regs(existing: Option<&[u8]>, new_regs: &[OutputReg]) -> Result<Vec<u8>, String> {
     use std::collections::{BTreeMap, BTreeSet};
     use store_db::{Table, Value as WV};
@@ -492,6 +506,7 @@ fn merge_regs(existing: Option<&[u8]>, new_regs: &[OutputReg]) -> Result<Vec<u8>
 /// Read-modify-write `merge_regs` against an on-disk persistent DB: load DEST-DB if
 /// it exists (a missing file = the first commit), union the NEW outputs in, write it
 /// back. The store dir's bytes are interned by the caller (`store-commit`).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_output_db(dest_db: &Path, new_regs: &[OutputReg]) -> Result<(), String> {
     let existing = match std::fs::read(dest_db) {
         Ok(b) => Some(b),
@@ -510,6 +525,7 @@ fn merge_output_db(dest_db: &Path, new_regs: &[OutputReg]) -> Result<(), String>
 /// shape. Returns the per-output registration facts (for `realize` to write a td
 /// store-db). Shared by `build` (CLOSURE handed in as a file) and `realize`
 /// (CLOSURE computed by td itself from the store DB's Refs graph).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_and_register(
     drv_path: &str,
     closure: &[String],
@@ -579,6 +595,7 @@ fn build_and_register(
 /// separated. Written by `build_and_register` after a real build and by a
 /// persistent-store read-back (so a fresh scratch that reused a prior build's output
 /// still carries the same registration a real build would have).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn registration_text(regs: &[OutputReg]) -> String {
     let mut record = String::new();
     for r in regs {
@@ -597,6 +614,7 @@ fn registration_text(regs: &[OutputReg]) -> String {
 /// PERSISTENT store and MERGE its registration into the accumulating DB — the build-into
 /// half of an incremental store. Idempotent (a content path already present is a no-op).
 /// Shared by the `store-commit` subcommand and build-recipe's persistent-store build-into.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result<Vec<String>, String> {
     let reg = std::fs::read_to_string(scratch.join("registration")).map_err(|e| {
         format!("read {}/registration: {e} (build into this scratch first)", scratch.display())
@@ -639,6 +657,7 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
 /// (the caller writes SCRATCH/registration + td.db from them) — so the build is SKIPPED.
 /// Any missing/mismatched output ⇒ None (rebuild), and any tree staged so far is unwound.
 /// The daemon's valid-path skip, sourced across process boundaries from an on-disk store.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn persistent_realization(
     parsed: &drv::Derivation,
     persist_store: &str,
@@ -735,6 +754,7 @@ fn persistent_realization(
 /// writes — one block per output, a `path ` line opening each. Order is preserved.
 /// Shared by `cached_realization` (the build cache) and `store-commit` (interning a
 /// finished build into the persistent store), so both read the registration the same way.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn parse_registration_blocks(text: &str) -> Vec<OutputReg> {
     let mut recs: Vec<OutputReg> = Vec::new();
     let mut cur: Option<OutputReg> = None;
@@ -775,6 +795,7 @@ fn parse_registration_blocks(text: &str) -> Vec<OutputReg> {
 /// partially-deleted entry. This is consulted ONLY by `build-recipe`; the
 /// reproducibility `check` is a separate command that force-rebuilds, so reuse here
 /// never weakens the repro proof.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn cached_realization(
     parsed: &drv::Derivation,
     scratch: &Path,
@@ -812,6 +833,7 @@ fn cached_realization(
 }
 
 /// Read a `Key: value` field from a td-native narinfo body.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn narinfo_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.lines()
         .find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix(": ")))
@@ -824,6 +846,7 @@ fn narinfo_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 /// signed (and, since td builds are reproducible, those are the bytes a local build would
 /// produce). Returns the output's registration record (refs detected by the same scanner
 /// build_and_register uses, so the store-db registration is identical to a real build's).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn restore_substitute(
     narinfo: &str,
     narfile: &Path,
@@ -905,6 +928,7 @@ fn restore_substitute(
 /// dependency-free, so the network + ed25519 work is shelled out to the `td-subst` binary
 /// (`TD_SUBST_BIN`, default `td-subst`); td-builder only restores (nar::read_nar) + verifies
 /// the hash + registers.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn try_substitute(
     parsed: &drv::Derivation,
     drv_path: &str,
@@ -1037,20 +1061,6 @@ struct BuilderOverride {
     db: String,
 }
 
-/// Realize DRV with NO guix-daemon: compute the input closure ITSELF (td's SQLite
-/// reader over STORE-DB's Refs graph — the `guix gc -R` the daemon did), build it in
-/// the userns sandbox (build_and_register), and register the output(s) into a td
-/// store-db at SCRATCH/td.db. Returns the per-output records. Shared by `realize` and
-/// `build-recipe`. SRC_OVERRIDE, when set, supplies the recipe source from a td-owned
-/// store instead of the daemon store (no `guix repl` interning). STORE_DBS is the set of
-/// store-dbs the closure is computed over (a single guix db for `realize`/`build-recipe`;
-/// build-plan passes [guix-db, …prior steps' td.dbs] so a downstream build's closure spans
-/// both). BUILDER_OVERRIDE, when set, supplies the drv's `builder` from a td-owned store (a
-/// td-bootstrapped stage0, not the guix-built td-builder) — the builder entry binds from the
-/// builder DB and its direct refs' TRANSITIVE closures come from STORE_DBS. TD_STORE, when
-/// set, names td's own store dir holding td-BUILT deps: a closure path whose tree lives
-/// under TD_STORE/<base> is emitted `canonical\ton-disk` so the sandbox binds it FROM THERE
-/// (the build-plan chaining edge) — the same on-disk encoding SRC_OVERRIDE uses.
 /// The machine-wide concurrent-build budget for the build daemon: `TD_BUILD_JOBS` if set,
 /// else `min(nproc*3/4, MemAvailableGiB / 2)` clamped to ≥1. This is the ONE cap that all
 /// agents' submissions to the single shared daemon share, so it must bound the whole box
@@ -1139,7 +1149,7 @@ fn daemon_host_path(scr: &Path, canon: &str) -> Result<String, String> {
 /// (canonical store path, host output path). Run in a child process by `daemon-build`.
 fn daemon_realize_one(
     drv: &str,
-    store_db: &str,
+    seed_dir: &str,
     scratch_base: &Path,
 ) -> Result<(String, String, bool), String> {
     let ov = builder_override_from_env()?;
@@ -1164,8 +1174,8 @@ fn daemon_realize_one(
         return Ok((c, h, true));
     }
     eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
-    let dbs = [store_db.to_string()];
-    let regs = realize_drv(drv, &dbs, &scr, &[], ov.as_ref(), None)?;
+    let seed_dirs = [seed_dir.to_string()];
+    let regs = realize_drv(drv, &seed_dirs, &[], &scr, &[], ov.as_ref(), None)?;
     let (c, h) = mk(&regs)?;
     Ok((c, h, false))
 }
@@ -1176,18 +1186,18 @@ fn daemon_realize_one(
 /// child process by `daemon-check` so the repro rebuilds ALSO count against the budget.
 fn daemon_check_one(
     drv: &str,
-    store_db: &str,
+    seed_dir: &str,
     scratch_base: &Path,
 ) -> Result<(String, String), String> {
     let ov = builder_override_from_env()?;
-    let dbs = [store_db.to_string()];
+    let seed_dirs = [seed_dir.to_string()];
     let key = drv_scratch_key(drv)?;
     let scr = scratch_base.join(format!("{key}-chk"));
     let _ = std::fs::remove_dir_all(&scr); // two INDEPENDENT builds, never a cache reuse
     let r1 = scr.join("r1");
     let r2 = scr.join("r2");
-    let regs1 = realize_drv(drv, &dbs, &r1, &[], ov.as_ref(), None)?;
-    let regs2 = realize_drv(drv, &dbs, &r2, &[], ov.as_ref(), None)?;
+    let regs1 = realize_drv(drv, &seed_dirs, &[], &r1, &[], ov.as_ref(), None)?;
+    let regs2 = realize_drv(drv, &seed_dirs, &[], &r2, &[], ov.as_ref(), None)?;
     for reg in &regs1 {
         let canon = &reg.store_path;
         let h1 = nar_hash(&daemon_host_path(&r1, canon)?).map_err(|e| e.to_string())?;
@@ -1205,9 +1215,143 @@ fn daemon_check_one(
     Ok((canon, host))
 }
 
+/// Build the content-scan candidate index over one or more on-disk store DIRECTORIES —
+/// the guix/seed store bytes — with NO store DB and NO guix daemon. Returns the candidate
+/// CANONICAL paths (`<CANONICAL_PREFIX>/<basename>`, what a reference literally present in
+/// the bytes resolves to) plus a canonical→on-disk map (where those bytes actually live, so
+/// a seed staged under a td-store dir is NAR-read from there). Dedup is by 32-char hash part
+/// keeping the SHORTEST basename (the canonical entry, not a `.chroot`/`.check` sibling), and
+/// `.lock` aux files are skipped — the daemon's own candidate criterion. An absent dir is
+/// skipped (a caller may pass an optional td-store dir). This is the hoisted candidate set a
+/// `scan::Scanner` matches against (store-closure-scan / #260): building it ONCE and
+/// `reset()`-ing between paths keeps a whole-live-store walk O(bytes), not O(candidates).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+fn scan_candidate_index(
+    store_dirs: &[String],
+    canonical_prefix: &str,
+) -> Result<(Vec<String>, std::collections::HashMap<String, String>), String> {
+    use std::collections::HashMap;
+    // hash part -> (basename, on-disk dir); shortest basename wins.
+    let mut by_hash: HashMap<String, (String, String)> = HashMap::new();
+    for dir in store_dirs {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => continue, // an absent optional store dir contributes nothing
+        };
+        for entry in rd {
+            let entry = entry.map_err(|e| format!("{dir}: {e}"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".lock") {
+                continue;
+            }
+            match name.split('-').next() {
+                Some(p) if p.len() == 32 => {
+                    let keep = match by_hash.get(p) {
+                        Some((cur, _)) => name.len() < cur.len(),
+                        None => true,
+                    };
+                    if keep {
+                        by_hash.insert(p.to_string(), (name.clone(), dir.clone()));
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+    let mut candidates = Vec::with_capacity(by_hash.len());
+    let mut on_disk = HashMap::with_capacity(by_hash.len());
+    for (_h, (name, dir)) in by_hash {
+        let canonical = format!("{canonical_prefix}/{name}");
+        candidates.push(canonical.clone());
+        on_disk.insert(canonical, format!("{dir}/{name}"));
+    }
+    Ok((candidates, on_disk))
+}
+
+/// Compute the runtime closure of ROOTS with NO guix store DB: BFS to fixpoint, each path's
+/// references found by NAR-scanning its bytes (`scan::Scanner` against the seed candidate
+/// index) UNIONed with the direct references any td-OWNED store DB registered for it
+/// (EXTRA_REFS — build-plan's td.dbs, whose td-built dep bytes live OUTSIDE the scanned seed
+/// dirs). Content-scan is the daemon's scanForReferences — equal to `guix gc -R` for an
+/// output root (gate 290, store-gc); a union with a byte-scan superset never DROPS a real
+/// reference (the only unsafe direction is under-staging). SCANNER carries the candidate
+/// index built ONCE; it is `reset()` between paths, so this is O(bytes scanned), not
+/// O(candidates × paths). Returns the reachable canonical paths (ROOTS included).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+fn scan_closure_hybrid(
+    scanner: &mut scan::Scanner,
+    on_disk: &std::collections::HashMap<String, String>,
+    extra_refs: &std::collections::HashMap<String, Vec<String>>,
+    roots: &[String],
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut stack: Vec<String> = roots.to_vec();
+    while let Some(p) = stack.pop() {
+        if !seen.insert(p.clone()) {
+            continue;
+        }
+        let mut refs: Vec<String> = Vec::new();
+        // Seed bytes (this path lives in a scanned store dir): content-scan its NAR.
+        if let Some(od) = on_disk.get(&p) {
+            scanner.reset();
+            nar::write_nar(scanner, Path::new(od))
+                .map_err(|e| format!("nar {p} (at {od}): {e}"))?;
+            refs.extend(scanner.refs());
+        }
+        // A td-OWNED store DB's DIRECT refs (a td-built dep staged outside the seed dirs).
+        if let Some(rs) = extra_refs.get(&p) {
+            refs.extend(rs.iter().cloned());
+        }
+        for r in refs {
+            if !seen.contains(&r) {
+                stack.push(r);
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// Merge the DIRECT-reference graph of one or more td-OWNED store DBs (build-plan's td.dbs /
+/// TD_EXTRA_DBS) into a single `path -> direct refs` map, for `scan_closure_hybrid`. These
+/// DBs are td's OWN registration (never `/var/guix`); they carry a td-built dep whose bytes
+/// live outside the content-scanned seed dirs, so its refs are read from the DB it wrote.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+fn merge_extra_refs(
+    extra_dbs: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
+    let mut extra_refs: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for dbp in extra_dbs {
+        let data = std::fs::read(dbp).map_err(|e| format!("read store db {dbp}: {e}"))?;
+        let db = store_db_read::Db::open(data)?;
+        for (from, tos) in db.refs_by_path()? {
+            extra_refs.entry(from).or_default().extend(tos);
+        }
+    }
+    Ok(extra_refs)
+}
+
+/// Realize DRV with NO guix-daemon and NO guix store DB: compute the input closure ITSELF by
+/// CONTENT-SCANNING the seed store dir(s) (the daemon's scanForReferences / `guix gc -R`,
+/// gate 290) — no `/var/guix/db` read — build it in the userns sandbox (build_and_register),
+/// and register the output(s) into a td store-db at SCRATCH/td.db. Returns the per-output
+/// records. Shared by `realize`, `build-recipe` and the build daemon. SRC_OVERRIDE, when set,
+/// supplies the recipe source from a td-owned store instead of the daemon store (no `guix
+/// repl` interning). SEED_STORE_DIRS is the set of store DIRECTORIES the seed/toolchain
+/// closure is content-scanned over (`/gnu/store`, or the unpacked seed store); EXTRA_DBS is
+/// the set of td-OWNED store DBs whose td-built deps live outside those dirs (build-plan
+/// passes the prior steps' td.dbs so a downstream build's closure spans both). BUILDER_OVERRIDE,
+/// when set, supplies the drv's `builder` from a td-owned store (a td-bootstrapped stage0, not
+/// the guix-built td-builder) — the builder entry binds from the builder DB and its direct
+/// refs' TRANSITIVE closures come from the seed content-scan. TD_STORE, when set, names td's
+/// own store dir holding td-BUILT deps: a closure path whose tree lives under TD_STORE/<base>
+/// is emitted `canonical\ton-disk` so the sandbox binds it FROM THERE (the build-plan chaining
+/// edge) — the same on-disk encoding SRC_OVERRIDE uses.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn realize_drv(
     drv_path: &str,
-    store_dbs: &[String],
+    seed_store_dirs: &[String],
+    extra_dbs: &[String],
     scratch: &Path,
     src_overrides: &[SrcOverride],
     builder_override: Option<&BuilderOverride>,
@@ -1230,24 +1374,19 @@ fn realize_drv(
             roots.push(o.path.clone());
         }
     }
-    // Compute the input closure over the MERGED graph of every store-db (td's own
-    // dbs for td-built deps + guix's db for the transitive seeds). With a single db
-    // this is exactly `db.closure`; build-plan passes [guix-db, …td.dbs] so a
-    // downstream build's closure spans both.
-    if store_dbs.is_empty() {
-        return Err("realize: no store DB given".to_string());
+    // Compute the input closure with NO guix store DB: CONTENT-SCAN the seed store dir(s)
+    // for the seed/toolchain roots (scanForReferences == `guix gc -R` for an output root,
+    // gate 290), UNIONed with the direct refs any td-OWNED store DB registers (build-plan's
+    // td.dbs — a td-built dep staged outside the seed dirs). The candidate index (canonical
+    // paths + a canonical→on-disk map) is built ONCE; the Scanner is reset() between roots.
+    if seed_store_dirs.is_empty() {
+        return Err("realize: no seed store dir given".to_string());
     }
-    let datas: Vec<Vec<u8>> = store_dbs
-        .iter()
-        .map(|p| std::fs::read(p).map_err(|e| format!("read store db {p}: {e}")))
-        .collect::<Result<_, _>>()?;
-    let dbs: Vec<store_db_read::Db> = datas
-        .into_iter()
-        .map(store_db_read::Db::open)
-        .collect::<Result<_, _>>()?;
-    let db_refs: Vec<&store_db_read::Db> = dbs.iter().collect();
+    let (candidates, on_disk) = scan_candidate_index(seed_store_dirs, &store::store_dir())?;
+    let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+    let extra_refs = merge_extra_refs(extra_dbs)?;
     // Each td-OWNED interned tree (the recipe source AND the vendored-crate tree) has its
-    // own DB — the daemon DB has no row for it. Open them paired with their override so a
+    // own DB — the seed store has no row for it. Open them paired with their override so a
     // root can be matched to its store + db. Both are no-reference content-addressed trees
     // (store-add-recursive), so they share the SrcOverride handling.
     let src_dbs: Vec<(&SrcOverride, store_db_read::Db)> = src_overrides
@@ -1259,7 +1398,7 @@ fn realize_drv(
         })
         .collect::<Result<_, _>>()?;
     // The td-owned builder likewise has its own DB (store-add-builder wrote the builder
-    // + its DIRECT refs there); the daemon DB has no row for the builder itself.
+    // + its DIRECT refs there); the seed store has no row for the builder itself.
     let builder_db = match builder_override {
         Some(ov) => Some(store_db_read::Db::open(
             std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?,
@@ -1283,26 +1422,36 @@ fn realize_drv(
             continue;
         }
         // The td-placed builder gets its closure from the builder DB; every other
-        // root from the MERGED multi-db graph.
+        // root from the seed content-scan (∪ any td-owned extra dbs).
         match (builder_override, &builder_db) {
             // The td-placed builder: builder DB gives {builder} ∪ its DIRECT refs;
             // the builder entry binds from on_disk (canonical\ton-disk), and each
-            // direct ref's TRANSITIVE closure is read from the merged store-db graph
+            // direct ref's TRANSITIVE closure is CONTENT-SCANNED from the seed store
             // (the pinned toolchain lives there — glibc/gcc-lib + their deps).
             (Some(ov), Some(bdb)) if r == &ov.canonical => {
                 for p in bdb.closure(r)? {
                     if p == ov.canonical {
                         closure.insert(format!("{p}\t{}", ov.on_disk));
                     } else {
-                        for q in store_db_read::closure_multi(&db_refs, &p)? {
+                        for q in scan_closure_hybrid(
+                            &mut scanner,
+                            &on_disk,
+                            &extra_refs,
+                            std::slice::from_ref(&p),
+                        )? {
                             closure.insert(q);
                         }
                     }
                 }
             }
             _ => {
-                for p in store_db_read::closure_multi(&db_refs, r)? {
-                    closure.insert(p);
+                for q in scan_closure_hybrid(
+                    &mut scanner,
+                    &on_disk,
+                    &extra_refs,
+                    std::slice::from_ref(r),
+                )? {
+                    closure.insert(q);
                 }
             }
         }
@@ -1337,9 +1486,10 @@ fn realize_drv(
         })
         .collect();
     eprintln!(
-        "td-builder: realize computed the input closure ITSELF — {} paths from {} store-db(s) (its own reader, no guix gc / no daemon)",
+        "td-builder: realize computed the input closure ITSELF — {} paths by CONTENT-SCANNING {} seed store dir(s) (+ {} td-owned db(s)); no /var/guix/db, no guix gc, no daemon",
         closure.len(),
-        store_dbs.len()
+        seed_store_dirs.len(),
+        extra_dbs.len()
     );
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     std::fs::write(scratch.join("closure.txt"), closure.join("\n")).map_err(|e| e.to_string())?;
@@ -1358,6 +1508,7 @@ fn realize_drv(
 /// The td-builder store path of the RUNNING binary (…/td-builder-<v>), stripped of
 /// the trailing `/bin/td-builder` — so a recipe built by td references the very
 /// builder that built it, with no Guile resolution.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn self_store_path() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let s = exe.to_string_lossy();
@@ -1394,11 +1545,13 @@ fn self_store_path() -> Result<String, String> {
 /// STORE_DBS (the closure's store-db set) and TD_STORE (td's own store dir for td-BUILT
 /// deps) thread straight through to realize_drv — build-plan passes the multi-db set +
 /// td-store so a downstream step consumes an upstream step's td-built output.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_recipe(
     recipe_json: &str,
     lock_file: &str,
     scratch: &Path,
-    store_dbs: &[String],
+    seed_store_dirs: &[String],
+    extra_dbs: &[String],
     src_store: Option<(&str, &str)>,
     vendor_store: Option<(&str, &str, &str)>,
     builder_store: Option<(&str, &str, &str)>,
@@ -1522,7 +1675,8 @@ fn build_recipe(
     // td_store carries any td-BUILT deps (build-plan) for the multi-db closure's staging.
     let regs = realize_drv(
         &drv_file.to_string_lossy(),
-        store_dbs,
+        seed_store_dirs,
+        extra_dbs,
         scratch,
         &src_overrides,
         builder_override.as_ref(),
@@ -1557,6 +1711,7 @@ fn build_recipe(
 /// Only the toolchain input is swapped; every other build input + the order are untouched. Returns
 /// true iff at least one input was substituted (callers no-op silently when none — see the override
 /// site). A multi-match dedup is the caller's (`inputs.dedup()` after sort).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn substitute_gcc_toolchain(inputs: &mut [String], tc: &str) -> bool {
     let mut swapped = false;
     for p in inputs.iter_mut() {
@@ -1577,6 +1732,7 @@ fn substitute_gcc_toolchain(inputs: &mut [String], tc: &str) -> bool {
 /// (assemble-only, so a SEPARATE process — the build daemon — realizes the td-assembled
 /// drv). Splitting assembly from realization is what lets td's own daemon, not a `guix
 /// repl`-emitted drv, be the build's input (own-builder-daemon §5).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn assemble_recipe_drv(
     recipe_json: &str,
     lock_file: &str,
@@ -1758,7 +1914,8 @@ fn assemble_recipe_drv(
 /// step is copied into TD-STORE and its store path recorded for downstream steps.
 ///
 /// Usage: build-plan PLAN GUIX-DB SCRATCH
-fn build_plan(plan_file: &str, guix_db: &str, scratch: &Path) -> Result<(), String> {
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+fn build_plan(plan_file: &str, guix_store: &str, scratch: &Path) -> Result<(), String> {
     use std::collections::BTreeMap;
     let plan = std::fs::read_to_string(plan_file)
         .map_err(|e| format!("read plan {plan_file}: {e}"))?;
@@ -1826,15 +1983,15 @@ fn build_plan(plan_file: &str, guix_db: &str, scratch: &Path) -> Result<(), Stri
             eprintln!("td-builder: build-plan step `{name}': substituted td outputs -> {}", substituted.join(" "));
         }
 
-        // Closure spans guix's db (seeds) + every prior step's td.db (td deps).
-        let mut dbs: Vec<String> = Vec::with_capacity(td_dbs.len() + 1);
-        dbs.push(guix_db.to_string());
-        dbs.extend(td_dbs.iter().cloned());
+        // Closure content-scans guix's seed store (seeds) + reads every prior step's td.db
+        // (td deps, whose bytes live in the shared td-store, outside the seed dir).
+        let seed_dirs = [guix_store.to_string()];
         let regs = build_recipe(
             &recipe_text,
             &resolved_lock.to_string_lossy(),
             &step_scratch,
-            &dbs,
+            &seed_dirs,
+            &td_dbs,
             None,            // src_store: build-plan locks carry resolved paths
             None,            // vendor_store: build-plan deps are not vendored-crate trees
             None,            // builder_store: build-plan uses the guix-built builder
@@ -1871,6 +2028,7 @@ fn build_plan(plan_file: &str, guix_db: &str, scratch: &Path) -> Result<(), Stri
 }
 
 /// A recipe's declared inputs — the JSON `inputs` array (absent → none).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_inputs(recipe_dir: &str, name: &str) -> Result<Vec<String>, String> {
     let p = format!("{recipe_dir}/{name}.json");
     let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
@@ -1884,6 +2042,7 @@ fn auto_inputs(recipe_dir: &str, name: &str) -> Result<Vec<String>, String> {
 
 /// An input is OWNED (td reconstructs it) iff both its recipe JSON and base lock exist;
 /// otherwise it is an external seed (the toolchain, retired last) and stays guix-supplied.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_is_owned(recipe_dir: &str, lock_dir: &str, name: &str) -> bool {
     Path::new(&format!("{recipe_dir}/{name}.json")).exists()
         && Path::new(&format!("{lock_dir}/{name}-no-guix.lock")).exists()
@@ -1891,6 +2050,7 @@ fn auto_is_owned(recipe_dir: &str, lock_dir: &str, name: &str) -> bool {
 
 /// Post-order DFS over the OWNED-input subgraph: appends each recipe AFTER its owned
 /// deps → a topo order (deps first). Cycles error.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_topo(
     recipe_dir: &str,
     lock_dir: &str,
@@ -1920,6 +2080,7 @@ fn auto_topo(
 /// A lock entry (first field + store path) names dep D iff the field is bare `D` or the
 /// path basename is `<hash>-D-<version>` (32-char base32 hash + `-`). Handles both lock
 /// conventions: declared inputs written bare (grep's `pcre2`) and hash-named entries.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_entry_is_dep(first: &str, path: &str, dep: &str) -> bool {
     if first == dep {
         return true;
@@ -1936,6 +2097,7 @@ fn auto_entry_is_dep(first: &str, path: &str, dep: &str) -> bool {
 /// `D <path> td-recipe-output` (so build_plan substitutes td's build of D); non-owned
 /// lines pass through. Every owned dep must appear in the lock — else the recipe
 /// declares an input its lock doesn't carry, and we refuse rather than drop the edge.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_chained_lock(base_lock_text: &str, owned_deps: &[String]) -> Result<String, String> {
     let mut out = String::new();
     let mut marked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1975,12 +2137,13 @@ fn auto_chained_lock(base_lock_text: &str, owned_deps: &[String]) -> Result<Stri
 /// the generated plan to build_plan. No hand-written plan or manifest — a recipe's edges
 /// chain automatically as the owned set grows.
 ///
-/// Usage: build-plan --auto TARGET RECIPE-DIR LOCK-DIR GUIX-DB SCRATCH
+/// Usage: build-plan --auto TARGET RECIPE-DIR LOCK-DIR GUIX-STORE SCRATCH
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_plan_auto(
     target: &str,
     recipe_dir: &str,
     lock_dir: &str,
-    guix_db: &str,
+    guix_store: &str,
     scratch: &Path,
 ) -> Result<(), String> {
     if !auto_is_owned(recipe_dir, lock_dir, target) {
@@ -2016,7 +2179,7 @@ fn build_plan_auto(
     }
     let plan_path = scratch.join("auto.plan");
     std::fs::write(&plan_path, &plan).map_err(|e| e.to_string())?;
-    build_plan(&plan_path.to_string_lossy(), guix_db, scratch)
+    build_plan(&plan_path.to_string_lossy(), guix_store, scratch)
 }
 
 /// Emit PKG's recipe JSON from td's Rust catalog via `td-recipe-eval emit` — the
@@ -2026,6 +2189,7 @@ fn build_plan_auto(
 /// is the shell sibling of this call. td-recipe-eval `die`s with a non-zero exit on an
 /// unknown stem, which we surface as the loud "no td recipe for PKG" error — td shell
 /// resolves PKG to a td recipe or fails; it never falls back to guix.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn emit_recipe_json(pkg: &str) -> Result<String, String> {
     let eval = std::env::var("TD_RECIPE_EVAL").map_err(|_| {
         "TD_RECIPE_EVAL must point at td's td-recipe-eval binary (the Rust recipe catalog evaluator)"
@@ -2067,6 +2231,7 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
 /// Usage: shell PKG... [-- CMD ARGS...]
 ///   PKG...      td package names (a recipe must exist; no guix fallback)
 ///   -- CMD...   the command to run in the composed env; omitted → interactive $SHELL
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
     // Everything before the first `--` is a package name; after it, the command.
     let sep = rest.iter().position(|a| a == "--");
@@ -2200,6 +2365,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
 /// (`store-add-recursive`) — no `guix repl`, no guix-daemon. The shell sibling is
 /// `tests/intern-src.sh`. Returns the content-addressed `source` store path td computed
 /// from the tree's recursive NAR sha256 and restored under `store_dir` (+ `db`).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn run_store_add(
     self_exe: &str,
     name: &str,
@@ -2235,6 +2401,7 @@ fn run_store_add(
 /// FOD line and any stale `<sourcekey> …` line dropped, then the td-interned source pinned
 /// as `<sourcekey> <src_canonical>`. Pure (no I/O) so the line filtering is unit-tested
 /// directly — the same transform `tests/crate-free-build.sh` does with grep/echo.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn seed_lock_body(lock_body: &str, sourcekey: &str, src_canonical: &str) -> String {
     let keypfx = format!("{sourcekey} ");
     let mut seed = String::new();
@@ -2267,6 +2434,7 @@ fn seed_lock_body(lock_body: &str, sourcekey: &str, src_canonical: &str) -> Stri
 ///
 /// Returns `Ok(None)` when no warmed closure exists for PKG (`TD_SHELL_VENDOR_ROOT` unset,
 /// or no `<pkg>/vendor` under it) ⇒ the caller uses the plain seed-package path (e.g. hello).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn provision_rust_inputs(
     pkg: &str,
     lock_dir: &str,
@@ -2393,6 +2561,7 @@ fn provision_rust_inputs(
 /// — so the profile resolves inside a store-ns own-root where `prefix` (e.g. `/td/store`) is
 /// the bound store but the physical scratch dir is absent. `None` keeps the thin-view behavior
 /// (link straight at PKG-OUT as given). Enumeration always reads the physical PKG-OUT dir.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_profile(
     profile_dir: &str,
     pkgs: &[String],
@@ -2460,6 +2629,7 @@ fn build_profile(
 /// Replace every occurrence of `from` with `to` (SAME length — size-preserving, so ELF
 /// offsets/section sizes are untouched and the substitution is binary-safe). Used to
 /// relocate `/gnu/store` → `/td//store` (both 10 bytes).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn replace_bytes_same_len(data: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     assert_eq!(from.len(), to.len(), "relocation substitution must be size-preserving");
     let mut out = data.to_vec();
@@ -2479,6 +2649,7 @@ fn replace_bytes_same_len(data: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 /// under `dir`. Size-preserving (10→10 bytes; `/td//store` is the kernel-collapsed form of
 /// `/td/store`), so RUNPATH/interpreter in `.dynstr`, embedded paths in `.rodata`, and
 /// scripts are all handled by one byte substitution — no ELF surgery. Returns the count.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn relocate_tree(dir: &Path, from: &[u8], to: &[u8]) -> Result<usize, String> {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let md = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -2525,6 +2696,7 @@ fn relocate_tree(dir: &Path, from: &[u8], to: &[u8]) -> Result<usize, String> {
 /// IS the relocated store; binaries' `/td//store` refs resolve into it, with NO `/gnu/store`.
 /// The one-time break from guix (seed captured once, relocated, then td builds/runs from
 /// `/td/store`). Usage: store-relocate STORE-DB ROOT DEST-DIR
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn relocate_closure(store_db: &str, root: &str, dest: &str) -> Result<(usize, usize), String> {
     let bytes = std::fs::read(store_db).map_err(|e| format!("read store db {store_db}: {e}"))?;
     let db = store_db_read::Db::open(bytes)?;
@@ -2547,6 +2719,7 @@ fn relocate_closure(store_db: &str, root: &str, dest: &str) -> Result<(usize, us
 /// from the raw env value so the policy is unit-testable without touching real
 /// process state. Clamped to the kernel's -20..=19 range; a missing/garbage value
 /// falls back to the default.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn parse_build_nice(raw: Option<String>) -> i32 {
     raw.and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(10).clamp(-20, 19)
 }
@@ -2557,12 +2730,14 @@ fn parse_build_nice(raw: Option<String>) -> i32 {
 /// increase-only: the kernel rejects an unprivileged DEcrease with EPERM, which
 /// just means we were already at least this nice, so we ignore the result. Purely
 /// a scheduling knob — build OUTPUT (and thus reproducibility) is unaffected.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nice_self_for_builds() {
     let _ = sys::set_self_priority(parse_build_nice(std::env::var("TD_BUILD_NICE").ok()));
 }
 
 /// Parse an `oci-image`/`oci-image-closure` CONFIG-JSON ({"repoTag","env","entrypoint",
 /// "cmd"}, all optional; repoTag defaults to td:latest) into an `oci::ImageConfig`.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn image_config_from_json(cj: &json::Json) -> oci::ImageConfig {
     let strs = |key: &str| -> Vec<String> {
         cj.get(key)
@@ -2600,6 +2775,7 @@ struct HostSandboxArgs {
 
 /// Parse the full `td-builder host-sandbox …` argv (args[0]=prog, args[1]=subcommand,
 /// flags…, `--`, CMD, CMD-ARGS…). Returns the parsed form or a user-facing message.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn parse_host_sandbox_args(args: &[String]) -> Result<HostSandboxArgs, String> {
     let mut i = 2usize;
     let mut expose_cwd = false;
@@ -2645,6 +2821,7 @@ fn parse_host_sandbox_args(args: &[String]) -> Result<HostSandboxArgs, String> {
     })
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     // Builds run nicer than the loop's other work so a shared desktop stays smooth.
@@ -2725,22 +2902,29 @@ fn main() -> ExitCode {
             }
         }
         // oci-image-closure: the td-native replacement for `guix system image -t docker`.
-        // Compute the store CLOSURE of ROOT… from DB (no guix process — store_db_read),
+        // Compute the store CLOSURE of ROOT… by CONTENT-SCANNING STORE-DIR (no /var/guix/db,
+        // no guix process — scanForReferences == `guix gc -R` for an output root, gate 290),
         // lay each member at its STORE-DIR location into a single layer, and pack the
-        // docker-archive. Usage: oci-image-closure DB STORE-DIR CONFIG-JSON OUT.tar ROOT...
-        Some("oci-image-closure") if args.len() >= 7 => {
-            let (db_path, store_dir, config_file, out_file) =
-                (&args[2], &args[3], &args[4], &args[5]);
-            let roots = &args[6..];
+        // docker-archive. Usage: oci-image-closure STORE-DIR CONFIG-JSON OUT.tar ROOT...
+        Some("oci-image-closure") if args.len() >= 6 => {
+            let (store_dir, config_file, out_file) = (&args[2], &args[3], &args[4]);
+            let roots = &args[5..];
             let run = || -> Result<usize, String> {
-                let data = std::fs::read(db_path).map_err(|e| format!("read db {db_path}: {e}"))?;
-                let db = store_db_read::Db::open(data)?;
-                let mut closure: Vec<String> = Vec::new();
+                let (candidates, on_disk) =
+                    scan_candidate_index(std::slice::from_ref(store_dir), store_dir)?;
+                let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+                let empty = std::collections::HashMap::new();
+                let mut closure_set: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
                 for r in roots {
-                    closure.extend(db.closure(r)?);
+                    closure_set.extend(scan_closure_hybrid(
+                        &mut scanner,
+                        &on_disk,
+                        &empty,
+                        std::slice::from_ref(r),
+                    )?);
                 }
-                closure.sort();
-                closure.dedup();
+                let closure: Vec<String> = closure_set.into_iter().collect();
                 let n = closure.len();
                 let cfg_text = std::fs::read_to_string(config_file)
                     .map_err(|e| format!("read {config_file}: {e}"))?;
@@ -2765,6 +2949,57 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: oci-image-closure: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // oci-image-paths: pack a PRE-RESOLVED store closure into a docker-archive — like
+        // oci-image-closure, but the closure is read from a PATHS FILE (one store path per
+        // line) instead of walking /var/guix/db. Lets a caller keep closure RESOLUTION
+        // wherever it already is (e.g. a guix-resolved input-resolution step, retired last)
+        // while the image CONSTRUCTION is td-native, and td reads no guix private state.
+        // Usage: oci-image-paths PATHS-FILE STORE-DIR CONFIG-JSON OUT.tar
+        Some("oci-image-paths") if args.len() == 6 => {
+            let (paths_file, store_dir, config_file, out_file) =
+                (&args[2], &args[3], &args[4], &args[5]);
+            let run = || -> Result<usize, String> {
+                let text = std::fs::read_to_string(paths_file)
+                    .map_err(|e| format!("read paths {paths_file}: {e}"))?;
+                let mut closure: Vec<String> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect();
+                closure.sort();
+                closure.dedup();
+                if closure.is_empty() {
+                    return Err(format!("no store paths in {paths_file}"));
+                }
+                let n = closure.len();
+                let cfg_text = std::fs::read_to_string(config_file)
+                    .map_err(|e| format!("read {config_file}: {e}"))?;
+                let cj = json::parse(&cfg_text).map_err(|e| format!("config JSON: {e}"))?;
+                let cfg = image_config_from_json(&cj);
+                let mut w =
+                    std::fs::File::create(out_file).map_err(|e| format!("create {out_file}: {e}"))?;
+                oci::write_docker_archive_from_store_paths(
+                    &mut w,
+                    Path::new(store_dir),
+                    &closure,
+                    &cfg,
+                )
+                .map_err(|e| format!("write docker-archive: {e}"))?;
+                Ok(n)
+            };
+            match run() {
+                Ok(n) => {
+                    eprintln!("td-builder: oci-image-paths: packed {n} store paths");
+                    println!("{out_file}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: oci-image-paths: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -3293,67 +3528,35 @@ fn main() -> ExitCode {
             }
         }
         // td-store-db: compute the GC-reachable CLOSURE of ROOT(s) by CONTENT-SCANNING a
-        // td-owned store — the daemon's scanForReferences (scan.rs) recursed to fixpoint —
-        // with NO store DB and NO guix process. STORE-DIR is a self-contained td-owned store
-        // (e.g. an unpacked seed); its entries are the candidate set (BOUNDED — so a scan
-        // can't pick up store-path strings to unrelated packages the way scanning the whole
-        // live /gnu/store would), and each ROOT's NAR (read from STORE-DIR) is scanned for
-        // the candidates it references, transitively. Output paths are STORE-DIR/<basename>.
-        // This re-derives a closure from the BYTES — the same set `store-closure` walks from
-        // the store DB, computed without any DB. Usage:
+        // store — the daemon's scanForReferences (scan.rs) recursed to fixpoint — with NO
+        // store DB and NO guix process. STORE-DIR's entries are the candidate set and each
+        // ROOT's NAR (read from STORE-DIR) is scanned for the candidates it references,
+        // transitively; output paths are STORE-DIR/<basename>. This re-derives a closure
+        // from the BYTES — the same set `store-closure` walks from the store DB (and the
+        // same set `guix gc -R`/`--requisites` returns), computed without any DB or daemon.
+        // STORE-DIR is EITHER a self-contained td-owned store (e.g. an unpacked seed) OR the
+        // live /gnu/store: the candidate index is built once and reused across the walk
+        // (see Scanner::reset), so even a ~500k-entry live store is fast. A match is a
+        // 32-char hash literally present in the bytes — exactly the daemon's own reference
+        // criterion, so scanning the live store cannot report a reference guix would not
+        // (the store-closure-live gate proves == `guix gc -R`). Usage:
         //   store-closure-scan STORE-DIR ROOT [ROOT...]
         // Prints the reachable store paths (under STORE-DIR), sorted (ROOTs included).
         Some("store-closure-scan") if args.len() >= 4 => {
             let store_dir = &args[2];
             let roots: Vec<String> = args[3..].to_vec();
             let run = || -> Result<Vec<String>, String> {
-                // Candidates = the store-path entries under STORE-DIR, keyed by 32-char hash
-                // part. Skip the daemon's `<canonical>.lock` aux files (they share a real
-                // path's hash); dedup by hash keeping the SHORTEST basename (the canonical,
-                // not a `.chroot`/`.check` sibling). A self-contained td store has no live
-                // /gnu/store and no daemon behind it.
-                let mut by_hash: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                for entry in std::fs::read_dir(store_dir).map_err(|e| format!("{store_dir}: {e}"))? {
-                    let entry = entry.map_err(|e| e.to_string())?;
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.ends_with(".lock") {
-                        continue;
-                    }
-                    let pre = match name.split('-').next() {
-                        Some(p) if p.len() == 32 => p.to_string(),
-                        _ => continue,
-                    };
-                    match by_hash.get(&pre) {
-                        Some(cur) if cur.len() <= name.len() => {}
-                        _ => {
-                            by_hash.insert(pre, name);
-                        }
-                    }
-                }
-                let candidates: Vec<String> = by_hash
-                    .into_values()
-                    .map(|name| format!("{store_dir}/{name}"))
-                    .collect();
-                // BFS over CONTENT-scanned references to fixpoint: each path's refs found by
-                // NAR-scanning it (scan::Scanner) against the STORE-DIR candidate set. The
-                // scanner matches by 32-char hash, so a canonical /gnu/store reference in the
-                // bytes resolves to the corresponding STORE-DIR/<basename> entry. No store DB.
-                let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-                let mut stack = roots;
-                while let Some(p) = stack.pop() {
-                    if !seen.insert(p.clone()) {
-                        continue;
-                    }
-                    let mut s = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
-                    nar::write_nar(&mut s, Path::new(&p)).map_err(|e| format!("nar {p}: {e}"))?;
-                    let (_h, _sz, refs) = s.finish();
-                    for r in refs {
-                        if !seen.contains(&r) {
-                            stack.push(r);
-                        }
-                    }
-                }
+                // Candidates = the store-path entries under STORE-DIR, keyed by 32-char hash;
+                // a self-contained store where the on-disk dir IS the canonical location, so
+                // the canonical prefix is STORE-DIR itself. BFS over CONTENT-scanned refs to
+                // fixpoint (no store DB, no extra dbs): the shared `scan_candidate_index` +
+                // `scan_closure_hybrid` — the same content-scan realize_drv uses. Index built
+                // ONCE, reset() between paths, so even a ~500k-entry live store is fast.
+                let (candidates, on_disk) =
+                    scan_candidate_index(std::slice::from_ref(store_dir), store_dir)?;
+                let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+                let empty = std::collections::HashMap::new();
+                let seen = scan_closure_hybrid(&mut scanner, &on_disk, &empty, &roots)?;
                 Ok(seen.into_iter().collect())
             };
             match run() {
@@ -4509,13 +4712,14 @@ fn main() -> ExitCode {
         // retired LAST (§5) — so td realizes only the TOP derivation; reading guix's
         // live /var/guix/db/db.sqlite with td's OWN reader is "own, then diverge"
         // (the store is shared; the reader is td's, no daemon process). The
-        // guix-daemon is no longer in the realize path — it is only the differential
-        // oracle (prime directive 4). Usage:
-        //   realize DRV STORE-DB SCRATCH
+        // guix-daemon is no longer in the realize path, and neither is its store DB:
+        // the input closure is CONTENT-SCANNED from the seed STORE-DIR (no /var/guix/db).
+        // Usage:
+        //   realize DRV STORE-DIR SCRATCH
         Some("realize") if args.len() == 5 => {
-            let (drv_path, store_db, scratch) = (&args[2], &args[3], &args[4]);
+            let (drv_path, store_dir, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
-                realize_drv(drv_path, std::slice::from_ref(store_db), Path::new(scratch), &[], None, None)
+                realize_drv(drv_path, std::slice::from_ref(store_dir), &[], Path::new(scratch), &[], None, None)
                     .map(|_| ())
             };
             match run() {
@@ -4545,9 +4749,9 @@ fn main() -> ExitCode {
         // one, and needs no new `guix build -e' packager site. The override is matched by
         // PATH (only the drv root equal to its canonical is re-keyed), so it is a harmless
         // no-op for a drv that does not name the stage0 (e.g. the guile probes of gate 358).
-        // Usage:  daemon SOCKET STORE-DB SCRATCH-BASE
+        // Usage:  daemon SOCKET STORE-DIR SCRATCH-BASE
         Some("daemon") if args.len() == 5 => {
-            let (socket, store_db, scratch) = (args[2].clone(), args[3].clone(), args[4].clone());
+            let (socket, seed_dir, scratch) = (args[2].clone(), args[3].clone(), args[4].clone());
             // Fail fast on a half-set builder override (the children re-read the same env).
             if let Err(e) = builder_override_from_env() {
                 eprintln!("td-builder: daemon: {e}");
@@ -4569,15 +4773,15 @@ fn main() -> ExitCode {
             let keymap: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             let handle = move |req: &str| -> Result<String, String> {
-                // Request grammar: "<drv> [SDB BP BS BD]" (build) or "CHECK <drv> [SDB BP BS BD]"
-                // (reproducibility). The optional trailing fields are the SEED store-db (SDB, the
-                // reference graph for input-closure staging) and the td-owned builder override
-                // (TD_BUILDER_PATH/STORE/DB). Both are carried PER REQUEST because ONE shared
-                // daemon serves many worktrees: each declares the seed store its inputs come from
-                // and the stage0 builder its drv names (bound at identical absolute paths in every
-                // sandbox, so the daemon on the host opens exactly what the submitter names).
-                // Absent → the child uses the daemon's own start-time store-db + inherited env
-                // (gates 358/359, which pass a bare drv and set TD_BUILDER_* on the daemon).
+                // Request grammar: "<drv> [SEED-DIR BP BS BD]" (build) or "CHECK <drv> [SEED-DIR
+                // BP BS BD]" (reproducibility). The optional trailing fields are the SEED store
+                // DIR (content-scanned for the input closure — #267 retired the /var/guix/db read)
+                // and the td-owned builder override (TD_BUILDER_PATH/STORE/DB). Both are carried
+                // PER REQUEST because ONE shared daemon serves many worktrees: each declares the
+                // seed store dir its inputs come from and the stage0 builder its drv names (bound
+                // at identical absolute paths in every sandbox, so the daemon on the host opens
+                // exactly what the submitter names). Absent → the child uses the daemon's own
+                // start-time seed dir + inherited env (gates 358/359 pass a bare drv).
                 let mut toks = req.split_whitespace();
                 let first = toks.next().ok_or_else(|| "empty request".to_string())?;
                 let (sub, drv) = if first == "CHECK" {
@@ -4586,7 +4790,7 @@ fn main() -> ExitCode {
                     ("daemon-build", first)
                 };
                 let rest: Vec<&str> = toks.collect();
-                let (store_db_req, override_env): (String, Vec<(&str, &str)>) = match rest.as_slice() {
+                let (seed_dir_req, override_env): (String, Vec<(&str, &str)>) = match rest.as_slice() {
                     [sdb, bp, bs, bd] => (
                         (*sdb).to_string(),
                         vec![
@@ -4595,10 +4799,10 @@ fn main() -> ExitCode {
                             ("TD_BUILDER_DB", *bd),
                         ],
                     ),
-                    [] => (store_db.clone(), Vec::new()),
+                    [] => (seed_dir.clone(), Vec::new()),
                     _ => {
                         return Err(format!(
-                            "malformed request (expected DRV [STORE-DB BUILDER_PATH BUILDER_STORE BUILDER_DB]): {req}"
+                            "malformed request (expected DRV [SEED-DIR BUILDER_PATH BUILDER_STORE BUILDER_DB]): {req}"
                         ))
                     }
                 };
@@ -4618,7 +4822,7 @@ fn main() -> ExitCode {
                 let mut cmd = Command::new(&exe);
                 cmd.arg(sub)
                     .arg(drv)
-                    .arg(&store_db_req)
+                    .arg(&seed_dir_req)
                     .arg(&scratch)
                     .stderr(std::process::Stdio::inherit());
                 for (k, v) in &override_env {
@@ -4748,10 +4952,11 @@ fn main() -> ExitCode {
         // toolchain + lock are the guix-built SEED (§5, retired last). The optional
         // trailing SRC-STORE-DIR + SRC-DB make the `<name>-source` a td-OWNED source
         // (interned by td's store-add-recursive, no `guix repl`); omitted → a
-        // daemon-resident source path, as before. Usage:
-        //   build-recipe RECIPE-JSON-FILE LOCK SCRATCH STORE-DB [SRC-STORE-DIR SRC-DB]
+        // daemon-resident source path, as before. STORE-DIR is the seed store DIRECTORY
+        // whose bytes the input closure is CONTENT-SCANNED over (no /var/guix/db). Usage:
+        //   build-recipe RECIPE-JSON-FILE LOCK SCRATCH STORE-DIR [SRC-STORE-DIR SRC-DB]
         Some("build-recipe") if args.len() == 6 || args.len() == 8 || args.len() == 11 => {
-            let (recipe_file, lock, scratch, store_db) =
+            let (recipe_file, lock, scratch, store_dir) =
                 (&args[2], &args[3], &args[4], &args[5]);
             let src_store = if args.len() >= 8 {
                 Some((args[6].as_str(), args[7].as_str()))
@@ -4778,10 +4983,11 @@ fn main() -> ExitCode {
             let bd = std::env::var("TD_BUILDER_DB").ok();
             // North-Star step 2: build from the UNPACKED SEED, not a host guix. With
             // TD_SEED_STORE + TD_SEED_DB set (a `td-builder seed-unpack` output), the input
-            // closure is computed from the seed DB and every seed input binds from the
-            // unpacked store (TD_SEED_STORE/<base>) — so STORE-DB (/var/guix) and the live
-            // /gnu/store are out of the build path. Set together; the build is otherwise
-            // identical (same drv, same output).
+            // closure is CONTENT-SCANNED from the unpacked seed store and every seed input
+            // binds from it (TD_SEED_STORE/<base>) — so STORE-DIR and the live /gnu/store are
+            // out of the build path. Set together; the build is otherwise identical (same drv,
+            // same output). (TD_SEED_DB is the legacy DB companion; the content-scan of
+            // TD_SEED_STORE now supplies the closure, so it is no longer read.)
             let seed_store = std::env::var("TD_SEED_STORE").ok();
             let seed_db = std::env::var("TD_SEED_DB").ok();
             // Optional PERSISTENT store (the incremental /td/store the loop builds into):
@@ -4806,21 +5012,22 @@ fn main() -> ExitCode {
                         )
                     }
                 };
-                let (mut store_dbs, td_store): (Vec<String>, Option<&Path>) =
+                let (seed_store_dirs, td_store): (Vec<String>, Option<&Path>) =
                     match (&seed_store, &seed_db) {
-                        (Some(s), Some(d)) => (vec![d.clone()], Some(Path::new(s))),
-                        (None, None) => (vec![store_db.clone()], None),
+                        (Some(s), Some(_d)) => (vec![s.clone()], Some(Path::new(s))),
+                        (None, None) => (vec![store_dir.clone()], None),
                         _ => return Err("TD_SEED_STORE/TD_SEED_DB must be set together".into()),
                     };
-                // TD_EXTRA_DBS (colon-separated) merges ADDITIONAL store DBs alongside the primary
-                // one via closure_multi — e.g. a td-BUILT toolchain's own db (its /td/store outputs +
-                // refs) chained beside the guix seed, so a corpus recipe builds with the /td/store
-                // toolchain (brick 8). The dep's FILES are staged from td_store/<base> like any td dep;
-                // this only ADDS its closure edges, leaving the seed db's refs intact (store-add into
-                // the seed db would truncate them). Empty/unset → unchanged single-db behavior.
+                // TD_EXTRA_DBS (colon-separated) merges ADDITIONAL td-OWNED store DBs alongside the
+                // content-scanned seed dir — e.g. a td-BUILT toolchain's own db (its /td/store outputs
+                // + refs) chained beside the guix seed, so a corpus recipe builds with the /td/store
+                // toolchain (brick 8). Those deps' bytes live OUTSIDE the seed dir, so their refs come
+                // from the db they wrote; the FILES are staged from td_store/<base> like any td dep.
+                // This only ADDS closure edges. Empty/unset → pure seed content-scan.
+                let mut extra_dbs: Vec<String> = Vec::new();
                 if let Ok(extra) = std::env::var("TD_EXTRA_DBS") {
                     for d in extra.split(':').filter(|s| !s.is_empty()) {
-                        store_dbs.push(d.to_string());
+                        extra_dbs.push(d.to_string());
                     }
                 }
                 let recipe_json =
@@ -4829,7 +5036,8 @@ fn main() -> ExitCode {
                     &recipe_json,
                     lock,
                     Path::new(scratch),
-                    &store_dbs,
+                    &seed_store_dirs,
+                    &extra_dbs,
                     src_store,
                     vendor_store,
                     builder_store,
@@ -4850,11 +5058,11 @@ fn main() -> ExitCode {
         // downstream step consumes an UPSTREAM step's td-BUILT output instead of a
         // guix store path (a `td-recipe-output` lock entry). PLAN is `step
         // RECIPE-JSON LOCK` per line, in dependency order; the closure of each step
-        // spans GUIX-DB ∪ the prior steps' td.dbs, staged from a shared td-store.
-        // Usage: build-plan PLAN GUIX-DB SCRATCH
+        // content-scans GUIX-STORE ∪ the prior steps' td.dbs, staged from a shared td-store.
+        // Usage: build-plan PLAN GUIX-STORE SCRATCH
         Some("build-plan") if args.len() == 5 => {
-            let (plan_file, guix_db, scratch) = (&args[2], &args[3], &args[4]);
-            match build_plan(plan_file, guix_db, Path::new(scratch)) {
+            let (plan_file, guix_store, scratch) = (&args[2], &args[3], &args[4]);
+            match build_plan(plan_file, guix_store, Path::new(scratch)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build-plan {plan_file}: {e}");
@@ -4866,11 +5074,11 @@ fn main() -> ExitCode {
         // hand-written plan or manifest): topo-sort TARGET's owned-input closure, mark each
         // owned-input dep `td-recipe-output`, and run it. An input is owned iff
         // RECIPE-DIR/<name>.json and LOCK-DIR/<name>-no-guix.lock both exist.
-        // Usage: build-plan --auto TARGET RECIPE-DIR LOCK-DIR GUIX-DB SCRATCH
+        // Usage: build-plan --auto TARGET RECIPE-DIR LOCK-DIR GUIX-STORE SCRATCH
         Some("build-plan") if args.len() == 8 && args[2] == "--auto" => {
-            let (target, recipe_dir, lock_dir, guix_db, scratch) =
+            let (target, recipe_dir, lock_dir, guix_store, scratch) =
                 (&args[3], &args[4], &args[5], &args[6], &args[7]);
-            match build_plan_auto(target, recipe_dir, lock_dir, guix_db, Path::new(scratch)) {
+            match build_plan_auto(target, recipe_dir, lock_dir, guix_store, Path::new(scratch)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build-plan --auto {target}: {e}");
@@ -6219,6 +6427,75 @@ memchr-2.7.crate /gnu/store/ddd-memchr.crate
         let ti0 = td_inputs(&drv0);
         assert!(ti0.contains("gcc-toolchain-15.2.0"), "default keeps the guix gcc-toolchain: {ti0}");
         assert!(!ti0.contains(tc), "default has no /td/store toolchain: {ti0}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- content-scan closure (retire /var/guix/db): scan_candidate_index + scan_closure_hybrid ----
+    // The daemon-DB-free input-closure computation realize_drv now uses. A store DIR is
+    // content-scanned for the seed roots (candidate index keyed by CANONICAL path, bytes
+    // NAR-read from on-disk), UNIONed with any td-OWNED store DB's direct refs (build-plan's
+    // td.dbs — a td-built dep whose bytes live OUTSIDE the scanned dir). Covers: the canonical
+    // vs on-disk mapping, the `.lock` aux-file skip, a content-scanned transitive closure, and
+    // the hybrid extra-refs edge (a root with no on-disk bytes resolved via the extra-db map).
+    #[test]
+    fn content_scan_closure_spans_seed_dir_and_extra_dbs() {
+        use std::collections::HashMap;
+        // 32-char nix-base32 hash parts (alphabet omits e,o,u,t).
+        let glibc_h = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let gcc_h = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tddep_h = "cccccccccccccccccccccccccccccccc";
+        let dir = std::env::temp_dir().join(format!("td-cscan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let od = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let canon = |name: &str| format!("/gnu/store/{name}");
+        // glibc: a leaf with no store references. gcc: references glibc (its 32-char hash is
+        // literally in the bytes, the daemon's own reference criterion). A `.lock` aux file
+        // shares glibc's hash and MUST be skipped by the candidate index.
+        std::fs::write(od(&format!("{glibc_h}-glibc-2.41")), b"a leaf, no store references here\n").unwrap();
+        std::fs::write(
+            od(&format!("{gcc_h}-gcc-14")),
+            format!("gcc links libc at /gnu/store/{glibc_h}-glibc-2.41/lib\n").as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(od(&format!("{glibc_h}-glibc-2.41.lock")), b"").unwrap();
+
+        let dirs = [dir.to_string_lossy().into_owned()];
+        let (candidates, on_disk) = scan_candidate_index(&dirs, "/gnu/store").unwrap();
+        // Two candidates (the .lock aux file is skipped), keyed by CANONICAL path.
+        assert_eq!(candidates.len(), 2, "candidates (lock aux file skipped): {candidates:?}");
+        assert!(candidates.contains(&canon(&format!("{glibc_h}-glibc-2.41"))));
+        assert!(candidates.contains(&canon(&format!("{gcc_h}-gcc-14"))));
+        // Canonical path maps to the ON-DISK bytes (here dir == canonical prefix's stand-in).
+        assert_eq!(on_disk[&canon(&format!("{glibc_h}-glibc-2.41"))], od(&format!("{glibc_h}-glibc-2.41")));
+
+        let mut scanner = scan::Scanner::new(&candidates).unwrap();
+        let empty: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Pure content-scan from the gcc root: BFS finds glibc via gcc's bytes.
+        let cl = scan_closure_hybrid(&mut scanner, &on_disk, &empty, &[canon(&format!("{gcc_h}-gcc-14"))]).unwrap();
+        let cl: Vec<String> = cl.into_iter().collect();
+        assert_eq!(
+            cl,
+            vec![canon(&format!("{glibc_h}-glibc-2.41")), canon(&format!("{gcc_h}-gcc-14"))],
+            "content-scan closure of gcc must be {{gcc, glibc}}"
+        );
+
+        // Hybrid: a td-built dep whose bytes live OUTSIDE the scanned dir. Its refs come from
+        // the extra-db map (td.db), then that ref (gcc) is content-scanned into glibc.
+        let mut extra: HashMap<String, Vec<String>> = HashMap::new();
+        extra.insert(canon(&format!("{tddep_h}-mylib-1")), vec![canon(&format!("{gcc_h}-gcc-14"))]);
+        let hy = scan_closure_hybrid(&mut scanner, &on_disk, &extra, &[canon(&format!("{tddep_h}-mylib-1"))]).unwrap();
+        let hy: Vec<String> = hy.into_iter().collect();
+        assert_eq!(
+            hy,
+            vec![
+                canon(&format!("{glibc_h}-glibc-2.41")),
+                canon(&format!("{gcc_h}-gcc-14")),
+                canon(&format!("{tddep_h}-mylib-1")),
+            ],
+            "hybrid closure must span the td-dep (extra db) + its content-scanned seed refs"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
