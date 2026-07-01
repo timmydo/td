@@ -1872,6 +1872,21 @@ fn assemble_recipe_drv(
             if let Some(vd) = vendor_dir {
                 spec.push_str(&format!("env TD_VENDOR_DIR={vd}\n"));
             }
+            // Native /td/store toolchain link mode (#258): the sandbox clears the env, so run_rust
+            // only sees the drv's `env` lines — forward the caller's TD_RUST_STORE_* into the drv
+            // (mirroring the TD_GCC_TOOLCHAIN input override above). When TD_RUST_STORE_INTERP is set
+            // the ripgrep cutover is linking against the native /td/store gcc (a PLAIN gcc, no
+            // ld-wrapper): run_rust bakes the interp/RUNPATH/-B explicitly so the built `rg` resolves
+            // its libc/libgcc_s from /td/store at run time. The values are the /td/store glibc paths,
+            // fixed for the run, so the drv (and its double-build `check`) stay deterministic. Unset
+            // ⇒ no env lines emitted ⇒ the guix ld-wrapper path, unchanged.
+            for k in ["TD_RUST_STORE_INTERP", "TD_RUST_STORE_RPATH", "TD_RUST_STORE_BDIR"] {
+                if let Ok(v) = std::env::var(k) {
+                    if !v.is_empty() {
+                        spec.push_str(&format!("env {k}={v}\n"));
+                    }
+                }
+            }
             // Optional cargo feature selection (both default-absent ⇒ a plain
             // `cargo build` with the crate's defaults, unchanged). `noDefaultFeatures`
             // drops the crate's default features — e.g. fd's `use-jemalloc`, whose
