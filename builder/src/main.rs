@@ -1061,6 +1061,160 @@ struct BuilderOverride {
     db: String,
 }
 
+/// The machine-wide concurrent-build budget for the build daemon: `TD_BUILD_JOBS` if set,
+/// else `min(nproc*3/4, MemAvailableGiB / 2)` clamped to ≥1. This is the ONE cap that all
+/// agents' submissions to the single shared daemon share, so it must bound the whole box
+/// (leaving ~1/4 of cores + memory headroom for interactive work and the not-yet-daemon-
+/// managed heavy gates) — never a per-check slice, which N agents would multiply.
+fn daemon_budget() -> usize {
+    if let Ok(v) = std::env::var("TD_BUILD_JOBS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n >= 1 {
+                return n;
+            }
+        }
+    }
+    let nproc = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let cpu_cap = (nproc * 3 / 4).max(1);
+    match mem_available_gib() {
+        Some(g) => cpu_cap.min(((g / 2.0) as usize).max(1)),
+        None => cpu_cap,
+    }
+}
+
+/// MemAvailable from /proc/meminfo, in GiB (None if unreadable).
+fn mem_available_gib() -> Option<f64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: f64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb / 1024.0 / 1024.0);
+        }
+    }
+    None
+}
+
+/// The optional td-owned builder override from TD_BUILDER_PATH/STORE/DB (all three set
+/// together, or none) — the stage0 td-builder that a corpus drv names as its builder.
+/// Shared by the daemon and its spawned per-build children (which re-read the same env).
+fn builder_override_from_env() -> Result<Option<BuilderOverride>, String> {
+    let bp = std::env::var("TD_BUILDER_PATH").ok();
+    let bs = std::env::var("TD_BUILDER_STORE").ok();
+    let bd = std::env::var("TD_BUILDER_DB").ok();
+    match (&bp, &bs, &bd) {
+        (Some(canonical), Some(store_dir), Some(db)) => {
+            let base = canonical.rsplit('/').next().unwrap_or(canonical);
+            Ok(Some(BuilderOverride {
+                canonical: canonical.clone(),
+                on_disk: format!("{store_dir}/{base}"),
+                db: db.clone(),
+            }))
+        }
+        (None, None, None) => Ok(None),
+        _ => {
+            Err("TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together".to_string())
+        }
+    }
+}
+
+/// The content-addressed first-output basename of `drv` — the STABLE per-drv scratch/dedup
+/// key (the same drv always keys the same dir, so a valid prior realization is a cache hit).
+fn drv_scratch_key(drv: &str) -> Result<String, String> {
+    let content = std::fs::read(drv).map_err(|e| format!("read {drv}: {e}"))?;
+    let parsed = drv::parse(&content).map_err(|e| format!("parse drv {drv}: {e}"))?;
+    let first = parsed
+        .outputs
+        .first()
+        .ok_or_else(|| format!("{drv}: derivation has no outputs"))?;
+    first
+        .path
+        .rsplit('/')
+        .next()
+        .map(str::to_string)
+        .ok_or_else(|| format!("{}: not a store path", first.path))
+}
+
+/// Host path of `canon`'s output tree under a keyed scratch dir (`<scr>/newstore/<base>`).
+fn daemon_host_path(scr: &Path, canon: &str) -> Result<String, String> {
+    let base = canon
+        .strip_prefix("/gnu/store/")
+        .ok_or_else(|| format!("{canon}: not a store path"))?;
+    Ok(scr.join("newstore").join(base).to_string_lossy().into_owned())
+}
+
+/// Realize ONE drv into a content-addressed keyed scratch under `scratch_base`, with
+/// guix-daemon-parity cache reuse (a valid prior output is not rebuilt). Returns
+/// (canonical store path, host output path). Run in a child process by `daemon-build`.
+fn daemon_realize_one(
+    drv: &str,
+    seed_dir: &str,
+    scratch_base: &Path,
+) -> Result<(String, String, bool), String> {
+    let ov = builder_override_from_env()?;
+    let content = std::fs::read(drv).map_err(|e| format!("read {drv}: {e}"))?;
+    let parsed = drv::parse(&content).map_err(|e| format!("parse drv {drv}: {e}"))?;
+    let key = drv_scratch_key(drv)?;
+    let scr = scratch_base.join(&key);
+    let mk = |regs: &[OutputReg]| -> Result<(String, String), String> {
+        let first = regs
+            .first()
+            .ok_or_else(|| "realize produced no outputs".to_string())?;
+        let canon = first.store_path.clone();
+        let host = daemon_host_path(&scr, &canon)?;
+        Ok((canon, host))
+    };
+    if let Some(regs) = cached_realization(&parsed, &scr)? {
+        eprintln!(
+            "td-builder: daemon CACHE HIT for {drv} — output already valid under {}, not rebuilding",
+            scr.display()
+        );
+        let (c, h) = mk(&regs)?;
+        return Ok((c, h, true));
+    }
+    eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
+    let seed_dirs = [seed_dir.to_string()];
+    let regs = realize_drv(drv, &seed_dirs, &[], &scr, &[], ov.as_ref(), None)?;
+    let (c, h) = mk(&regs)?;
+    Ok((c, h, false))
+}
+
+/// Reproducibility double-build of ONE drv (the daemon's `CHECK` verb): realize it twice
+/// into distinct fresh scratch and compare each output's NAR hash. Returns the first
+/// output's (canonical, host) on success, an Err naming the divergence otherwise. Run in a
+/// child process by `daemon-check` so the repro rebuilds ALSO count against the budget.
+fn daemon_check_one(
+    drv: &str,
+    seed_dir: &str,
+    scratch_base: &Path,
+) -> Result<(String, String), String> {
+    let ov = builder_override_from_env()?;
+    let seed_dirs = [seed_dir.to_string()];
+    let key = drv_scratch_key(drv)?;
+    let scr = scratch_base.join(format!("{key}-chk"));
+    let _ = std::fs::remove_dir_all(&scr); // two INDEPENDENT builds, never a cache reuse
+    let r1 = scr.join("r1");
+    let r2 = scr.join("r2");
+    let regs1 = realize_drv(drv, &seed_dirs, &[], &r1, &[], ov.as_ref(), None)?;
+    let regs2 = realize_drv(drv, &seed_dirs, &[], &r2, &[], ov.as_ref(), None)?;
+    for reg in &regs1 {
+        let canon = &reg.store_path;
+        let h1 = nar_hash(&daemon_host_path(&r1, canon)?).map_err(|e| e.to_string())?;
+        let h2 = nar_hash(&daemon_host_path(&r2, canon)?).map_err(|e| e.to_string())?;
+        if h1 != h2 {
+            return Err(format!("NON-REPRODUCIBLE {canon}: {h1} != {h2}"));
+        }
+    }
+    let _ = &regs2; // both builds succeeded and every output matched
+    let first = regs1
+        .first()
+        .ok_or_else(|| "realize produced no outputs".to_string())?;
+    let canon = first.store_path.clone();
+    let host = daemon_host_path(&r1, &canon)?;
+    Ok((canon, host))
+}
+
 /// Build the content-scan candidate index over one or more on-disk store DIRECTORIES —
 /// the guix/seed store bytes — with NO store DB and NO guix daemon. Returns the candidate
 /// CANONICAL paths (`<CANONICAL_PREFIX>/<basename>`, what a reference literally present in
@@ -4597,74 +4751,104 @@ fn main() -> ExitCode {
         // no-op for a drv that does not name the stage0 (e.g. the guile probes of gate 358).
         // Usage:  daemon SOCKET STORE-DIR SCRATCH-BASE
         Some("daemon") if args.len() == 5 => {
-            let (socket, seed_dir, scratch) = (&args[2], &args[3], &args[4]);
-            let bp = std::env::var("TD_BUILDER_PATH").ok();
-            let bs = std::env::var("TD_BUILDER_STORE").ok();
-            let bd = std::env::var("TD_BUILDER_DB").ok();
-            let builder_override = match (&bp, &bs, &bd) {
-                (Some(canonical), Some(store_dir), Some(db)) => {
-                    let base = canonical.rsplit('/').next().unwrap_or(canonical);
-                    Some(BuilderOverride {
-                        canonical: canonical.clone(),
-                        on_disk: format!("{store_dir}/{base}"),
-                        db: db.clone(),
-                    })
-                }
-                (None, None, None) => None,
-                _ => {
-                    eprintln!(
-                        "td-builder: daemon: TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together"
-                    );
+            let (socket, seed_dir, scratch) = (args[2].clone(), args[3].clone(), args[4].clone());
+            // Fail fast on a half-set builder override (the children re-read the same env).
+            if let Err(e) = builder_override_from_env() {
+                eprintln!("td-builder: daemon: {e}");
+                return ExitCode::FAILURE;
+            }
+            let _ = std::fs::create_dir_all(&scratch);
+            let budget = daemon_budget();
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("td-builder: daemon: current_exe: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            let realize = |drv: &str, scr_base: &Path| -> Result<(String, String), String> {
-                // Parse the drv so its (content-addressed) first-output basename can
-                // key a STABLE per-drv scratch — the same drv always lands in the same
-                // dir, so a prior valid realization there is a cache HIT.
-                let content = std::fs::read(drv).map_err(|e| format!("read {drv}: {e}"))?;
-                let parsed =
-                    drv::parse(&content).map_err(|e| format!("parse drv {drv}: {e}"))?;
-                let first_out = parsed
-                    .outputs
-                    .first()
-                    .ok_or_else(|| format!("{drv}: derivation has no outputs"))?;
-                let key = first_out
-                    .path
-                    .rsplit('/')
-                    .next()
-                    .ok_or_else(|| format!("{}: not a store path", first_out.path))?;
-                let scr = scr_base.join(key);
-                let mk = |regs: &[OutputReg]| -> Result<(String, String), String> {
-                    let first =
-                        regs.first().ok_or_else(|| "realize produced no outputs".to_string())?;
-                    let canon = first.store_path.clone();
-                    let base = canon
-                        .strip_prefix("/gnu/store/")
-                        .ok_or_else(|| format!("{canon}: not a store path"))?;
-                    let host = scr.join("newstore").join(base);
-                    Ok((canon, host.to_string_lossy().into_owned()))
+            // Per-key dedup: concurrent requests for the SAME output serialize on one lock,
+            // so the drv builds once (the 2nd cache-hits) and two builds never race the same
+            // content-addressed scratch — the guix-daemon "a valid path is built once"
+            // property, preserved across concurrency and across agents (one shared daemon).
+            let keymap: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let handle = move |req: &str| -> Result<String, String> {
+                // Request grammar: "<drv> [SEED-DIR BP BS BD]" (build) or "CHECK <drv> [SEED-DIR
+                // BP BS BD]" (reproducibility). The optional trailing fields are the SEED store
+                // DIR (content-scanned for the input closure — #267 retired the /var/guix/db read)
+                // and the td-owned builder override (TD_BUILDER_PATH/STORE/DB). Both are carried
+                // PER REQUEST because ONE shared daemon serves many worktrees: each declares the
+                // seed store dir its inputs come from and the stage0 builder its drv names (bound
+                // at identical absolute paths in every sandbox, so the daemon on the host opens
+                // exactly what the submitter names). Absent → the child uses the daemon's own
+                // start-time seed dir + inherited env (gates 358/359 pass a bare drv).
+                let mut toks = req.split_whitespace();
+                let first = toks.next().ok_or_else(|| "empty request".to_string())?;
+                let (sub, drv) = if first == "CHECK" {
+                    ("daemon-check", toks.next().ok_or_else(|| "CHECK: missing drv".to_string())?)
+                } else {
+                    ("daemon-build", first)
                 };
-                // guix-daemon parity: don't rebuild a valid output. If this exact drv
-                // was already realized here AND its output is still present + NAR-verifies,
-                // serve it from cache.
-                if let Some(regs) = cached_realization(&parsed, &scr)? {
-                    eprintln!("td-builder: daemon CACHE HIT for {drv} — output already valid under {}, not rebuilding", scr.display());
-                    return mk(&regs);
+                let rest: Vec<&str> = toks.collect();
+                let (seed_dir_req, override_env): (String, Vec<(&str, &str)>) = match rest.as_slice() {
+                    [sdb, bp, bs, bd] => (
+                        (*sdb).to_string(),
+                        vec![
+                            ("TD_BUILDER_PATH", *bp),
+                            ("TD_BUILDER_STORE", *bs),
+                            ("TD_BUILDER_DB", *bd),
+                        ],
+                    ),
+                    [] => (seed_dir.clone(), Vec::new()),
+                    _ => {
+                        return Err(format!(
+                            "malformed request (expected DRV [SEED-DIR BUILDER_PATH BUILDER_STORE BUILDER_DB]): {req}"
+                        ))
+                    }
+                };
+                let key = drv_scratch_key(drv)?;
+                let keylock = {
+                    let mut m = keymap.lock().unwrap();
+                    m.entry(key)
+                        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+                        .clone()
+                };
+                let _kg = keylock.lock().unwrap();
+                // Each build runs in its OWN child td-builder process (Command = the safe
+                // fork+exec): an in-process fork on a daemon thread is unsound (sandbox::build
+                // mutates the process CWD + forks with heavy pre-exec work). The child's stderr
+                // is inherited so the daemon log keeps the CACHE HIT/MISS lines (gate
+                // daemon-recipe greps them).
+                let mut cmd = Command::new(&exe);
+                cmd.arg(sub)
+                    .arg(drv)
+                    .arg(&seed_dir_req)
+                    .arg(&scratch)
+                    .stderr(std::process::Stdio::inherit());
+                for (k, v) in &override_env {
+                    cmd.env(k, v);
                 }
-                eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
-                let regs = realize_drv(
-                    drv,
-                    std::slice::from_ref(seed_dir),
-                    &[],
-                    &scr,
-                    &[],
-                    builder_override.as_ref(),
-                    None,
-                )?;
-                mk(&regs)
+                let out = cmd
+                    .output()
+                    .map_err(|e| format!("spawn {sub} for {drv}: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("{sub} failed for {drv} (see daemon log)"));
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                stdout
+                    .lines()
+                    .find_map(|l| l.strip_prefix("OK "))
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{sub}: no OK line for {drv}"))
             };
-            match build_daemon::serve(socket, realize, Path::new(scratch)) {
+            // Reserve free memory before admitting a build — the global OOM guard on this
+            // swapless host, shared by every daemon via /proc/meminfo (bounds machine-wide
+            // memory even when per-binary daemons fragment the concurrency budget).
+            let min_free_gib = std::env::var("TD_MIN_FREE_GIB")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(4.0);
+            match build_daemon::serve(&socket, budget, min_free_gib, handle) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: daemon: {e}");
@@ -4672,10 +4856,41 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-builder daemon-build / daemon-check — the per-build CHILD processes the daemon
+        // spawns (one build per process = safe fork + full isolation). daemon-build realizes
+        // one drv into a content-addressed keyed scratch (guix-daemon-parity cache reuse) and
+        // prints `OK <canonical> <host>`; daemon-check reproducibility-double-builds it and
+        // prints `OK repro <canonical> <host>`. Both read the td-owned builder from
+        // TD_BUILDER_* (inherited from the daemon). Usage: daemon-build|daemon-check DRV STORE-DB SCRATCH-BASE
+        Some("daemon-build") if args.len() == 5 => {
+            match daemon_realize_one(&args[2], &args[3], Path::new(&args[4])) {
+                Ok((canon, host, hit)) => {
+                    println!("OK {canon} {host} {}", if hit { "hit" } else { "built" });
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: daemon-build {}: {e}", args[2]);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("daemon-check") if args.len() == 5 => {
+            match daemon_check_one(&args[2], &args[3], Path::new(&args[4])) {
+                Ok((canon, host)) => {
+                    println!("OK repro {canon} {host}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: daemon-check {}: {e}", args[2]);
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-builder daemon-request — the in-process client for `daemon` (so a
-        // caller needs no nc/socat): connect to SOCKET, send DRV, print the daemon's
-        // single-line response and exit 0 only on "OK …". Usage:
-        //   daemon-request SOCKET DRV
+        // caller needs no nc/socat): connect to SOCKET, send REQUEST, print the daemon's
+        // single-line response and exit 0 only on "OK …". REQUEST is a drv path (build),
+        // "CHECK <drv>" (reproducibility double-build), or "SHUTDOWN". Usage:
+        //   daemon-request SOCKET REQUEST
         Some("daemon-request") if args.len() == 4 => {
             let (socket, drv) = (&args[2], &args[3]);
             match build_daemon::request(socket, drv) {
@@ -5177,13 +5392,28 @@ fn main() -> ExitCode {
                     if Path::new(&subst).is_dir() {
                         binds.push(sandbox::Bind { src: subst, dest: None, readonly: true, ro_optional: false });
                     }
+                    // The ONE shared build daemon's socket + output store (~/.td/build-daemon,
+                    // started on the host by tools/build-daemon-ensure.sh). The corpus build
+                    // (inside this sandbox) SUBMITS drvs to it over the socket and reads its
+                    // output back, so it must be visible at the SAME absolute path in every
+                    // check sandbox — RW (connect to the socket; read the store). Bound only
+                    // when present; a cold machine without a running daemon simply lacks it.
+                    let bdd = format!("{home}/.td/build-daemon");
+                    if Path::new(&bdd).is_dir() {
+                        binds.push(sandbox::Bind { src: bdd, dest: None, readonly: false, ro_optional: false });
+                    }
                     path_env = std::env::var("PATH").unwrap_or_default();
                     workdir = cwd;
                     for (k, v) in std::env::vars() {
                         // TD_CHECK_* = the check-memo identity; TD_SUBST_* = the host-provisioned
                         // substitute resolver knobs (TD_SUBST_BIN/STORE/PUBKEY) the toolchain gates
-                        // read to FETCH the lock-keyed closure instead of building from seed.
-                        if k.starts_with("TD_CHECK_") || k.starts_with("TD_SUBST_") {
+                        // read to FETCH the lock-keyed closure instead of building from seed;
+                        // TD_DAEMON_* = the shared build daemon's socket (TD_DAEMON_SOCKET) the
+                        // corpus build submits to.
+                        if k.starts_with("TD_CHECK_")
+                            || k.starts_with("TD_SUBST_")
+                            || k.starts_with("TD_DAEMON_")
+                        {
                             extra_env.push((k, v));
                         }
                     }

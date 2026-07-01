@@ -95,22 +95,22 @@ container-check:
 check: $(CHEAP_GATES) build-recipes $(HEAVY_GATES)
 	@TD_HEAVY_GATES='$(HEAVY_GATES)' sh tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt" || true
 
-# build-recipes — the PARALLEL build phase (DESIGN §7.1 move-off-Guile §5). Separates
-# "build everything" from "the checks": realize + reproducibility-check EVERY package
-# recipe ($(BUILD_SPECS) — the corpus, toolchain leaves and library deps) up front,
-# fanned out across cores, into the shared content-addressed cache (.td-build-cache/pkg).
-# The package build gates then cache-HIT the build and memo-skip the repro double-build,
-# so they only run their durable behavioral + migration-oracle assertions. Each build is
-# single-threaded (the builder runs make serially, NIX_BUILD_CORES=1), so the fan-out is
-# ~nproc wide with no internal oversubscription — overridable with TD_BUILD_JOBS. This is
-# the heavy lifting that USED to run serial-within-gate under -j2; the cache makes the
-# gates' re-build a no-op, so NOTHING is weakened — the same .drv is assembled, realized
-# and double-built, just once and in parallel. Listed first among `check`'s heavy
-# prerequisites (after the cheap serial chain) so make starts it right after the
+# build-recipes — the build phase (DESIGN §7.1 move-off-Guile §5). Separates "build
+# everything" from "the checks": td-ASSEMBLE + SUBMIT every package recipe ($(BUILD_SPECS) —
+# the corpus, toolchain leaves and library deps) up front to the ONE shared build daemon,
+# which realizes + reproducibility-checks them into the shared content-addressed store, then
+# the package build gates cache-HIT + memo-skip the double-build and only assert behavior +
+# migration-oracle. The daemon (tools/build-daemon-ensure.sh, started by check.sh's host
+# prelude) is the SINGLE machine-wide build limiter: it caps concurrent builds at ONE global
+# budget shared by ALL agents/worktrees, so N concurrent checks can no longer oversubscribe
+# the box or OOM it. The `-P` below is now only SUBMIT parallelism (submits block on the
+# daemon's budget) — it no longer sets build concurrency; the daemon does (TD_BUILD_JOBS).
+# Listed first among `check`'s heavy prerequisites so make starts it right after the
 # fail-fast structural gates; the build gates wait on it via the order-only dep below.
 build-recipes:
-	@echo ">> build-recipes: realize + reproducibility-check $(words $(BUILD_SPECS)) recipes in parallel into .td-build-cache/pkg ($(BUILD_SPECS))"
+	@echo ">> build-recipes: assemble + submit $(words $(BUILD_SPECS)) recipes to the shared build daemon (global budget), then reproducibility-check ($(BUILD_SPECS))"
 	@set -euo pipefail; \
+	: "$${TD_DAEMON_SOCKET:?the shared build daemon is not running — check.sh starts it in its host prelude (tools/build-daemon-ensure.sh)}"; \
 	for s in $(BUILD_SPECS); do grep ' /gnu/store/' "tests/$$s-no-guix.lock"; done \
 	  | sed 's/^[^ ]* //' | sort -u | xargs $(GUIX) build >/dev/null \
 	  || { echo "ERROR: could not realize the build seed (regenerate locks on a channel bump)" >&2; exit 1; }; \
@@ -123,10 +123,9 @@ build-recipes:
 	  || { echo "ERROR: could not build td's Rust recipe evaluator (recipes/ crate)" >&2; exit 1; }; \
 	load_recipe_eval; \
 	echo ">> recipes EVALUATE with td's OWN Rust td-recipe-eval ($$TD_RECIPE_EVAL) — boa retired (rust-recipe-surface)"; \
-	jobs=$${TD_BUILD_JOBS:-$$(nproc)}; \
-	echo ">> building $(words $(BUILD_SPECS)) recipes across $$jobs cores (single-threaded each) ..."; \
-	printf '%s\n' $(BUILD_SPECS) | xargs -P "$$jobs" -n1 sh tests/build-pkg.sh; \
-	echo "PASS: build-recipes — all $(words $(BUILD_SPECS)) package recipes realized + reproducible in the shared cache (.td-build-cache/pkg); the build gates now cache-hit + memo-skip the double-build and only assert behavior/oracle."
+	echo ">> submitting $(words $(BUILD_SPECS)) recipes to the shared build daemon ($$TD_DAEMON_SOCKET); the daemon's global budget caps concurrency ..."; \
+	printf '%s\n' $(BUILD_SPECS) | xargs -P "$(words $(BUILD_SPECS))" -n1 sh tests/build-pkg.sh; \
+	echo "PASS: build-recipes — all $(words $(BUILD_SPECS)) package recipes realized + reproducible via the shared build daemon into .td-build-cache/pkg; the build gates now cache-hit + memo-skip the double-build and only assert behavior/oracle."
 
 # The fast tier — the gates that test td's OWN surface (typed/TS front-end + the
 # Rust builder/evaluator) and need only the toolchain: no `guix system image`,
