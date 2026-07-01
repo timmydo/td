@@ -9,7 +9,7 @@
 surface-sites: 108
 ci/build-ci-image.sh	guix-db-read
 ci/build-ci-image.sh	lowering
-ci/import-store.sh	gc
+ci/import-store.sh	guix-db-read
 ci/verify-import-local.sh	guix-db-read
 ci/verify-import-local.sh	shell
 mk/gates/010-eval.mk	lowering
