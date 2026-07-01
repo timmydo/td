@@ -20,11 +20,17 @@
 # interactive work; the budget bounds HOW MANY run, nice bounds their priority).
 set -eu
 
+# PROTO — the daemon request-protocol version. It is part of the socket/pid/log names, so
+# bumping it (whenever the request grammar or daemon behavior changes) makes a new check
+# start a FRESH daemon on a new socket instead of reusing a stale daemon from an older
+# td-builder (which would reject the new grammar). Old-proto daemons idle out on their old
+# socket; the current one is always version-matched.
+proto=2
 daemon_dir=${TD_DAEMON_DIR:-$HOME/.td/build-daemon}
 store="$daemon_dir/store"
-sock="$daemon_dir/socket"
-pid_f="$daemon_dir/daemon.pid"
-log_f="$daemon_dir/daemon.log"
+sock="$daemon_dir/socket.v$proto"
+pid_f="$daemon_dir/daemon.v$proto.pid"
+log_f="$daemon_dir/daemon.v$proto.log"
 lock_f="$daemon_dir/daemon.lock"
 store_db=${TD_DAEMON_STORE_DB:-/var/guix/db/db.sqlite}
 mkdir -p "$store"

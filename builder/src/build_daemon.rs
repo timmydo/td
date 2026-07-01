@@ -82,7 +82,11 @@ pub fn serve(
     // PEAK never exceeds the budget (the cap actually holds) and does reach it (it is not
     // secretly serial).
     let active = Arc::new(AtomicUsize::new(0));
-    let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
+    // Accepted-but-not-finished requests. Workers are DETACHED (no JoinHandle kept) — the
+    // daemon is persistent and effectively never shuts down, so a per-request Vec of handles
+    // would grow without bound and leave zombie threads. SHUTDOWN instead drains via this
+    // counter so no in-flight build is abandoned.
+    let inflight = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let conn = conn.map_err(|e| format!("accept: {e}"))?;
         // Read the request line; scope the reader's borrow before moving `conn`.
@@ -94,13 +98,19 @@ pub fn serve(
             line.trim().to_string()
         };
         if req.is_empty() || req == "SHUTDOWN" {
+            // Drain in-flight builds before exiting so none is killed mid-realize.
+            while inflight.load(Ordering::SeqCst) > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             let _ = (&conn).write_all(b"OK shutdown\n");
             break;
         }
+        inflight.fetch_add(1, Ordering::SeqCst);
         let sem = sem.clone();
         let handle = handle.clone();
         let active = active.clone();
-        workers.push(thread::spawn(move || {
+        let inflight = inflight.clone();
+        thread::spawn(move || {
             let _permit = sem.acquire(); // blocks here when the budget is full (the queue)
             let n = active.fetch_add(1, Ordering::SeqCst) + 1;
             eprintln!("td-builder: daemon build START ({n}/{budget} active): {req}");
@@ -120,10 +130,8 @@ pub fn serve(
             active.fetch_sub(1, Ordering::SeqCst);
             eprintln!("td-builder: daemon build DONE: {req}");
             let _ = (&conn).write_all(resp.as_bytes());
-        }));
-    }
-    for w in workers {
-        let _ = w.join();
+            inflight.fetch_sub(1, Ordering::SeqCst);
+        });
     }
     Ok(())
 }
