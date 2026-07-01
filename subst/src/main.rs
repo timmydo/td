@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md). This single-file network tool is not in the offline rust-clippy gate; the [lints] table still guards new unsafe (forbid) and enforces under a local `cargo clippy`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md). This single-file network tool is not linted in the loop (the cargo-test gate's clippy leg covers only the dependency-free engine crates); the [lints] table still guards new unsafe (forbid) and enforces under a local `cargo clippy`.
 
 // td-subst — the network + crypto half of td's OWN substitute (binary-cache) server. A
 // sibling of feed/ (td-feed) and fetch/ (td-fetch) reusing the same pure-Rust HTTP(S)
