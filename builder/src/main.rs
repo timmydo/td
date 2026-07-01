@@ -34,7 +34,7 @@ mod store_db;
 mod store_db_read;
 mod sys;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// Adapter: stream Write into the hasher.
@@ -1552,23 +1552,43 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         // (Resolve before the lock check so an unknown package reports "no td recipe", the
         // load-bearing leg the td-shell gate asserts; a known pkg then needs its lock.)
         let recipe_json = emit_recipe_json(pkg)?;
-        // PKG needs a lock (its pinned toolchain seed). No lock ⇒ loud error.
-        let lock = format!("{lock_dir}/{pkg}-no-guix.lock");
-        if !Path::new(&lock).is_file() {
-            return Err(format!("no lock for `{pkg}' ({lock} not found)"));
-        }
         // Stage the recipe JSON in the per-package cache dir that build-recipe also keys
         // its build cache on.
         let sd = format!("{cache}/{pkg}");
         std::fs::create_dir_all(&sd).map_err(|e| e.to_string())?;
         let json_file = format!("{sd}/recipe.json");
         std::fs::write(&json_file, &recipe_json).map_err(|e| e.to_string())?;
+        // Assemble the build-recipe argv. A rust userland recipe (ripgrep/fd/…) needs its
+        // whole crate closure provisioned GUIX-FREE: td interns the warmed source + crate
+        // set and feeds build-recipe's 11-arg form (TD_VENDOR_DIR), exactly as the
+        // crate-free corpus gates do — but here from the real `td shell` product command,
+        // not a bespoke harness. A seed package (hello) has no warmed closure ⇒ the plain
+        // 4-arg path on its `<pkg>-no-guix.lock`.
+        let mut bargs: Vec<String> = vec!["build-recipe".into(), json_file.clone()];
+        match provision_rust_inputs(pkg, &lock_dir, &sd, &self_exe)? {
+            Some((seedlock, extra)) => {
+                bargs.push(seedlock);
+                bargs.push(sd.clone());
+                bargs.push(store_db.clone());
+                bargs.extend(extra);
+            }
+            None => {
+                // PKG needs a lock (its pinned toolchain seed). No lock ⇒ loud error.
+                let lock = format!("{lock_dir}/{pkg}-no-guix.lock");
+                if !Path::new(&lock).is_file() {
+                    return Err(format!("no lock for `{pkg}' ({lock} not found)"));
+                }
+                bargs.push(lock);
+                bargs.push(sd.clone());
+                bargs.push(store_db.clone());
+            }
+        }
         // BUILD it via the build-recipe subcommand (its content-addressed cache makes
         // an unchanged recipe a HIT — build-on-demand + cached). A subprocess keeps the
         // build's chatter off the command's stdout, and rides the inherited
         // TD_BUILDER_* override so the builder is the td-placed stage0 too.
         let out = Command::new(&self_exe)
-            .args(["build-recipe", &json_file, &lock, &sd, &store_db])
+            .args(&bargs)
             .output()
             .map_err(|e| format!("build `{pkg}': spawn td-builder build-recipe: {e}"))?;
         if !out.status.success() {
@@ -1627,6 +1647,187 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         .env("PATH", &path)
         .status()
         .map_err(|e| format!("run `{prog}': {e}"))
+}
+
+/// Intern a source TREE into a td-OWNED store with td's OWN recursive add-to-store
+/// (`store-add-recursive`) — no `guix repl`, no guix-daemon. The shell sibling is
+/// `tests/intern-src.sh`. Returns the content-addressed `source` store path td computed
+/// from the tree's recursive NAR sha256 and restored under `store_dir` (+ `db`).
+fn run_store_add(
+    self_exe: &str,
+    name: &str,
+    tree: &Path,
+    store_dir: &Path,
+    db: &Path,
+) -> Result<String, String> {
+    std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+    let out = Command::new(self_exe)
+        .args([
+            "store-add-recursive",
+            name,
+            &tree.to_string_lossy(),
+            &store_dir.to_string_lossy(),
+            &db.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|e| format!("spawn store-add-recursive {name}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "store-add-recursive {name} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err(format!("store-add-recursive {name} produced no path"));
+    }
+    Ok(path)
+}
+
+/// Build the seed-lock body for a vendored rust build: the package lock with any `.crate`
+/// FOD line and any stale `<sourcekey> …` line dropped, then the td-interned source pinned
+/// as `<sourcekey> <src_canonical>`. Pure (no I/O) so the line filtering is unit-tested
+/// directly — the same transform `tests/crate-free-build.sh` does with grep/echo.
+fn seed_lock_body(lock_body: &str, sourcekey: &str, src_canonical: &str) -> String {
+    let keypfx = format!("{sourcekey} ");
+    let mut seed = String::new();
+    for line in lock_body.lines() {
+        if line.contains(".crate ") || line.starts_with(&keypfx) {
+            continue;
+        }
+        seed.push_str(line);
+        seed.push('\n');
+    }
+    seed.push_str(&format!("{sourcekey} {src_canonical}\n"));
+    seed
+}
+
+/// Provision a rust recipe's crate closure for `td shell`, GUIX-FREE — the product-command
+/// counterpart of the `tests/crate-free-build.sh` corpus harness, so `td shell ripgrep -- rg
+/// …` builds the REAL shipped userland the way a user types it (not a bespoke gate script).
+///
+/// Source of the crates: a warmed tree at `$TD_SHELL_VENDOR_ROOT/<pkg>/{src/<one>,vendor}`
+/// (host PREP via `td-feed warm crate`, the cargo-proxy having verified each `.crate`
+/// sha256 == the crates.io sparse-index cksum — the upstream pin, NOT a guix artifact).
+/// This:
+///   - clean-copies the source tree (dropping `target`/`vendor`/`.cargo` so a stray local
+///     build cannot perturb the source hash) and interns it with `store-add-recursive`,
+///   - interns the crate SET the same way (a no-ref content-addressed tree),
+///   - writes a seed lock = the package's `<pkg>.lock` minus any `.crate`/source-key line,
+///     plus `<pkg>-source <interned-src>`,
+/// and returns `(seed-lock-path, [src-store, src-db, vendor-canonical, vendor-store,
+/// vendor-db])` — the extra positional args build-recipe's 11-arg form takes.
+///
+/// Returns `Ok(None)` when no warmed closure exists for PKG (`TD_SHELL_VENDOR_ROOT` unset,
+/// or no `<pkg>/vendor` under it) ⇒ the caller uses the plain seed-package path (e.g. hello).
+fn provision_rust_inputs(
+    pkg: &str,
+    lock_dir: &str,
+    sd: &str,
+    self_exe: &str,
+) -> Result<Option<(String, [String; 5])>, String> {
+    let vendor_root = match std::env::var("TD_SHELL_VENDOR_ROOT") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(None),
+    };
+    let pkg_root = Path::new(&vendor_root).join(pkg);
+    let vendor = pkg_root.join("vendor");
+    let src_parent = pkg_root.join("src");
+    // No warmed crate closure for this package here ⇒ not a vendored rust build.
+    if !vendor.is_dir() || !src_parent.is_dir() {
+        return Ok(None);
+    }
+
+    // The single extracted source tree under src/ (e.g. ripgrep-14.1.1, fd-find-10.2.0):
+    // glob it so td shell needs no per-package crate-name table.
+    let mut subdirs: Vec<PathBuf> = std::fs::read_dir(&src_parent)
+        .map_err(|e| format!("read {}: {e}", src_parent.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    subdirs.sort();
+    let srctree = match subdirs.as_slice() {
+        [one] => one.clone(),
+        [] => {
+            return Err(format!(
+                "warmed crate closure for `{pkg}' has no source tree under {} — re-run `td-feed warm crate'",
+                src_parent.display()
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "warmed crate closure for `{pkg}' has multiple source trees under {} (expected exactly one)",
+                src_parent.display()
+            ))
+        }
+    };
+    if !srctree.join("Cargo.toml").is_file() {
+        return Err(format!(
+            "source tree {} ships no Cargo.toml — re-run `td-feed warm crate'",
+            srctree.display()
+        ));
+    }
+    let ncrate = std::fs::read_dir(&vendor)
+        .map_err(|e| format!("read {}: {e}", vendor.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "crate"))
+        .count();
+    if ncrate == 0 {
+        return Err(format!(
+            "no `.crate' files under {} — re-run `td-feed warm crate'",
+            vendor.display()
+        ));
+    }
+
+    let work = Path::new(sd);
+    // --- intern the source tree (clean-copy dropping the build dirs) ---
+    let clean = work.join("srcclean");
+    let _ = std::fs::remove_dir_all(&clean);
+    std::fs::create_dir_all(&clean).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(&srctree).map_err(|e| format!("read {}: {e}", srctree.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let n = name.to_string_lossy();
+        if n == "target" || n == "vendor" || n == ".cargo" {
+            continue;
+        }
+        copy_canonical(&entry.path(), &clean.join(&name))?;
+    }
+    let src_store = work.join("srcstore");
+    let src_db = work.join("src.db");
+    let _ = std::fs::remove_dir_all(&src_store);
+    let _ = std::fs::remove_file(&src_db);
+    let src_canonical = run_store_add(self_exe, &format!("{pkg}-src"), &clean, &src_store, &src_db)?;
+
+    // --- intern the crate set ---
+    let vendor_store = work.join("vendorstore");
+    let vendor_db = work.join("vendor.db");
+    let _ = std::fs::remove_dir_all(&vendor_store);
+    let _ = std::fs::remove_file(&vendor_db);
+    let vendor_canonical =
+        run_store_add(self_exe, &format!("{pkg}-vendor"), &vendor, &vendor_store, &vendor_db)?;
+
+    // --- seed lock: the package lock minus crate/source-key lines, + the interned source ---
+    let lock = format!("{lock_dir}/{pkg}.lock");
+    if !Path::new(&lock).is_file() {
+        return Err(format!("no lock for `{pkg}' ({lock} not found)"));
+    }
+    let body = std::fs::read_to_string(&lock).map_err(|e| format!("read {lock}: {e}"))?;
+    let sourcekey = format!("{pkg}-source");
+    let seed = seed_lock_body(&body, &sourcekey, &src_canonical);
+    let seedlock = work.join("seed.lock");
+    std::fs::write(&seedlock, &seed).map_err(|e| format!("write {}: {e}", seedlock.display()))?;
+
+    Ok(Some((
+        seedlock.to_string_lossy().into_owned(),
+        [
+            src_store.to_string_lossy().into_owned(),
+            src_db.to_string_lossy().into_owned(),
+            vendor_canonical,
+            vendor_store.to_string_lossy().into_owned(),
+            vendor_db.to_string_lossy().into_owned(),
+        ],
+    )))
 }
 
 /// td-builder profile — build a PROFILE: a symlink tree unioning the `bin`/`sbin` of a
@@ -4541,6 +4742,40 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // `td shell` rust crate provisioning: the seed lock = the package lock with the crate
+    // FODs and any stale source-key line dropped, then the td-interned source pinned. This
+    // is the transform that lets `td shell ripgrep -- rg …` build the real userland from
+    // its guix-free crate closure (build-recipe's TD_VENDOR_DIR form).
+    #[test]
+    fn seed_lock_body_drops_crates_and_pins_interned_source() {
+        let lock = "\
+# a comment line, kept verbatim
+rust /gnu/store/aaa-rust-1.0
+coreutils /gnu/store/bbb-coreutils-9.1
+ripgrep-source /gnu/store/old-stale-source
+serde-1.0.crate /gnu/store/ccc-serde-1.0.crate
+memchr-2.7.crate /gnu/store/ddd-memchr.crate
+";
+        let seed = seed_lock_body(lock, "ripgrep-source", "/gnu/store/zzz-ripgrep-src");
+        // The crate FOD lines are gone (no daemon FOD, the guix-free crate path).
+        assert!(!seed.contains(".crate "), "crate FOD lines must be dropped:\n{seed}");
+        // The stale source-key line is replaced, not duplicated.
+        assert_eq!(
+            seed.matches("ripgrep-source ").count(),
+            1,
+            "exactly one source-key line:\n{seed}"
+        );
+        assert!(!seed.contains("old-stale-source"), "stale source pin removed:\n{seed}");
+        assert!(
+            seed.contains("ripgrep-source /gnu/store/zzz-ripgrep-src\n"),
+            "interned source pinned:\n{seed}"
+        );
+        // The toolchain seed lines (and comments) survive untouched.
+        assert!(seed.contains("# a comment line, kept verbatim\n"), "comment kept:\n{seed}");
+        assert!(seed.contains("rust /gnu/store/aaa-rust-1.0\n"), "rust seed kept:\n{seed}");
+        assert!(seed.contains("coreutils /gnu/store/bbb-coreutils-9.1\n"), "coreutils kept:\n{seed}");
+    }
 
     // TD_BUILD_NICE policy: default 10 when unset/garbage, honor a valid value,
     // clamp to the kernel's -20..=19 nice range. Pure parse, no process state.
