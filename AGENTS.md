@@ -325,11 +325,13 @@ on what*, and all working notes live in the git log + PR body.
 td's Rust is defensive and minimal-surface. These rules bind **new code**;
 existing code that pre-dates them is grandfathered (a per-file `#![allow(...)]`
 header in module files, or per-item `#[allow(...)]` on a crate root's own
-fns/impls) — when you next work a grandfathered file/item substantially, drop its
-`allow` and fix it. The mechanically-checkable rules are declared as a `[lints]`
-table in every crate's `Cargo.toml` at `deny` and enforced by the **`rust-clippy`**
-gate (`./check.sh rust-clippy`, part of the `check-engine` smoke tier), which runs
-`cargo clippy` offline over the dependency-free engine crates.
+fns/impls — a crate-root inner `#![allow]` would be crate-GLOBAL and silently
+exempt everything) — when you next work a grandfathered file/item substantially,
+drop its `allow` and fix it. The mechanically-checkable rules are declared as a
+`[lints]` table in every crate's `Cargo.toml` at `deny` and enforced by the
+**`cargo-test`** gate (`./check.sh cargo-test`, part of the `check-engine` smoke
+tier), which runs `cargo clippy` (then `cargo test`) offline over the
+dependency-free engine crates — a denied lint reds only on new code.
 
 - **No panics on the happy or error path.** No `unwrap()`, `expect()`, `panic!`,
   `unreachable!`, `todo!`, or `unimplemented!`. Return `Result`/`Option` and
