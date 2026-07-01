@@ -60,6 +60,46 @@ impl Drop for Permit {
     }
 }
 
+/// MemAvailable from /proc/meminfo, in GiB (None if unreadable).
+fn mem_available_gib() -> Option<f64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: f64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb / 1024.0 / 1024.0);
+        }
+    }
+    None
+}
+
+/// Global memory admission: atomically claim a build slot (incrementing `active`), blocking
+/// while free memory is below `min_free_gib`. Returns the new `active` count (for the START
+/// log). /proc/meminfo is the shared signal EVERY daemon reads, so this bounds machine-wide
+/// memory even when per-binary daemons fragment the per-daemon concurrency budget — the guard
+/// against OOM on a swapless host. Always admits when none is running (`active == 0`): only a
+/// running build frees memory, so blocking the last one would deadlock. The claim is a CAS so
+/// concurrent workers can't all pass the idle check at once. `min_free_gib <= 0` disables the
+/// memory check (admit immediately). The caller must `active.fetch_sub(1)` when the build ends.
+fn admit(active: &AtomicUsize, min_free_gib: f64) -> usize {
+    loop {
+        let cur = active.load(Ordering::SeqCst);
+        let ok = cur == 0
+            || min_free_gib <= 0.0
+            || mem_available_gib().map(|g| g >= min_free_gib).unwrap_or(true);
+        if !ok {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+        if active
+            .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return cur + 1;
+        }
+        // Lost the race to another worker; re-evaluate against the new count.
+    }
+}
+
 /// Accept-loop over a Unix socket at `socket`. Reads one request line per connection
 /// (cheaply, in the accept loop) and dispatches the build to a worker thread that runs
 /// `handle` only while holding one of `budget` permits — so at most `budget` builds run
@@ -69,13 +109,18 @@ impl Drop for Permit {
 pub fn serve(
     socket: &str,
     budget: usize,
+    min_free_gib: f64,
     handle: impl Fn(&str) -> Result<String, String> + Send + Sync + 'static,
 ) -> Result<(), String> {
     // A stale socket from a prior run would make bind fail with EADDRINUSE.
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket).map_err(|e| format!("bind {socket}: {e}"))?;
     let budget = budget.max(1);
-    eprintln!("td-builder: build daemon listening on {socket} (budget {budget} concurrent builds)");
+    // `min_free_gib` reserves free memory before admitting a build (global OOM guard; see
+    // mem_admission_wait). The daemon arm derives it from TD_MIN_FREE_GIB.
+    eprintln!(
+        "td-builder: build daemon listening on {socket} (budget {budget} concurrent builds, reserve {min_free_gib:.0} GiB free)"
+    );
     let sem = Semaphore::new(budget);
     let handle = Arc::new(handle);
     // Live concurrent-build count, logged on each START so a gate can assert the observed
@@ -112,7 +157,8 @@ pub fn serve(
         let inflight = inflight.clone();
         thread::spawn(move || {
             let _permit = sem.acquire(); // blocks here when the budget is full (the queue)
-            let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+            // Atomically claim a slot, blocking while free memory is below the reserve.
+            let n = admit(&active, min_free_gib);
             eprintln!("td-builder: daemon build START ({n}/{budget} active): {req}");
             // Test-only slot-occupancy hold (never set in production): lets the daemon-budget
             // gate force overlap and measure the concurrency ceiling deterministically without
@@ -177,7 +223,8 @@ mod tests {
             Ok("done".to_string())
         };
         let sock_for_serve = socket_s.clone();
-        let server = thread::spawn(move || serve(&sock_for_serve, budget, handle).unwrap());
+        // min_free_gib = 0.0 → memory guard disabled; this test isolates the budget cap.
+        let server = thread::spawn(move || serve(&sock_for_serve, budget, 0.0, handle).unwrap());
 
         for _ in 0..200 {
             if socket.exists() {
@@ -203,6 +250,61 @@ mod tests {
             peak.load(Ordering::SeqCst),
             budget,
             "peak concurrency must reach exactly the budget — not exceed it, not stay serial"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The memory admission guard, hermetically: with an impossibly-high free-memory reserve,
+    /// the daemon admits only ONE build at a time (the active==0 progress guarantee) even
+    /// though the budget is high — so machine-wide memory is bounded regardless of the budget
+    /// or how many daemons run. Verified-red: drop mem_admission_wait → peak reaches the
+    /// budget (4), not 1. This is the OOM guard on a swapless host.
+    #[test]
+    fn memory_guard_serializes_when_free_memory_is_below_the_reserve() {
+        let dir = std::env::temp_dir().join(format!("td-daemon-mem-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket = dir.join("sock");
+        let socket_s = socket.to_string_lossy().into_owned();
+        let budget = 4usize; // high budget — the memory guard, not the budget, must cap here
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (a, p) = (active.clone(), peak.clone());
+        let handle = move |_req: &str| -> Result<String, String> {
+            let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(120));
+            a.fetch_sub(1, Ordering::SeqCst);
+            Ok("done".to_string())
+        };
+        let sock_for_serve = socket_s.clone();
+        // An impossible reserve (1e9 GiB) → free memory is always "below" it → the guard
+        // admits a second build only when none is running.
+        let server = thread::spawn(move || serve(&sock_for_serve, budget, 1e9, handle).unwrap());
+
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut clients = Vec::new();
+        for _ in 0..4 {
+            let s = socket_s.clone();
+            clients.push(thread::spawn(move || {
+                let _ = request(&s, "/fake.drv");
+            }));
+        }
+        for c in clients {
+            c.join().unwrap();
+        }
+        let _ = request(&socket_s, "SHUTDOWN");
+        server.join().unwrap();
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "the memory guard must admit only one build at a time when free memory is below the reserve"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

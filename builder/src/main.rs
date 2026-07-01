@@ -4637,7 +4637,14 @@ fn main() -> ExitCode {
                     .map(str::to_string)
                     .ok_or_else(|| format!("{sub}: no OK line for {drv}"))
             };
-            match build_daemon::serve(&socket, budget, handle) {
+            // Reserve free memory before admitting a build — the global OOM guard on this
+            // swapless host, shared by every daemon via /proc/meminfo (bounds machine-wide
+            // memory even when per-binary daemons fragment the concurrency budget).
+            let min_free_gib = std::env::var("TD_MIN_FREE_GIB")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(4.0);
+            match build_daemon::serve(&socket, budget, min_free_gib, handle) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: daemon: {e}");
