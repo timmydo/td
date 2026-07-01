@@ -2864,18 +2864,20 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // td-store-db: compute the GC-reachable CLOSURE of a path from td's OWN store
-        // DB — the daemon's GC "mark" set (`guix gc -R ROOT`), in pure Rust. Reads the
-        // DB with td's own reader (`store_db_read`) and walks the Refs graph from ROOT;
-        // no daemon. Usage:
-        //   store-closure DB ROOT
-        // Prints the reachable store paths, sorted (ROOT included).
-        Some("store-closure") if args.len() == 4 => {
-            let (db_path, root) = (&args[2], &args[3]);
+        // td-store-db: compute the GC-reachable CLOSURE of one or more paths from td's
+        // OWN store DB — the daemon's GC "mark" set (`guix gc -R ROOT` / the union
+        // `guix gc --requisites ROOT…`), in pure Rust. Reads the DB with td's own
+        // reader (`store_db_read`) and walks the Refs graph from each ROOT; no daemon.
+        // Multiple ROOTs parse the DB once and union their closures. Usage:
+        //   store-closure DB ROOT [ROOT...]
+        // Prints the reachable store paths, sorted and deduped (every ROOT included).
+        Some("store-closure") if args.len() >= 4 => {
+            let db_path = &args[2];
+            let roots: Vec<String> = args[3..].to_vec();
             let run = || -> Result<Vec<String>, String> {
                 let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
                 let db = store_db_read::Db::open(bytes)?;
-                db.closure(root)
+                db.closure_roots(&roots)
             };
             match run() {
                 Ok(paths) => {
@@ -2885,7 +2887,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("td-builder: store-closure {db_path} {root}: {e}");
+                    eprintln!("td-builder: store-closure {db_path}: {e}");
                     ExitCode::FAILURE
                 }
             }

@@ -75,6 +75,17 @@ impl Db {
     /// `root` included. Errors if `root` is not a `ValidPaths` entry. Resolves
     /// `Refs(referrer, reference)` ids to paths via the `ValidPaths` rowid.
     pub fn closure(&self, root: &str) -> Result<Vec<String>, String> {
+        self.closure_roots(std::slice::from_ref(&root.to_string()))
+    }
+
+    /// The UNION of the GC-reachable closures of every path in `roots` (each root
+    /// included), sorted and deduped — the daemon's `guix gc --requisites root…`
+    /// over the same `Refs` graph. Errors if ANY root is not a `ValidPaths` entry
+    /// (symmetric with single-root `closure`). The `ValidPaths`/`Refs` tables are
+    /// parsed ONCE and the BFS seeds from every root, so a many-root query over a
+    /// full `/var/guix/db` costs one DB parse, not one per root. An empty `roots`
+    /// yields an empty closure.
+    pub fn closure_roots(&self, roots: &[String]) -> Result<Vec<String>, String> {
         let mut path_of: HashMap<i64, String> = HashMap::new();
         let mut id_of: HashMap<String, i64> = HashMap::new();
         for (rowid, cols) in self.table("ValidPaths")? {
@@ -89,13 +100,19 @@ impl Db {
                 edges.entry(*a).or_default().push(*b);
             }
         }
-        let start = *id_of
-            .get(root)
-            .ok_or_else(|| format!("root `{root}' is not in the store DB"))?;
+        // Seed the DFS from every root (each resolved before any walking, so a
+        // missing root fails loudly — like `guix gc --requisites` on an invalid
+        // path — rather than after a partial closure).
+        let mut stack: Vec<i64> = Vec::with_capacity(roots.len());
+        for root in roots {
+            let start = *id_of
+                .get(root)
+                .ok_or_else(|| format!("root `{root}' is not in the store DB"))?;
+            stack.push(start);
+        }
         // Iterative DFS over the reference graph; the rowid set dedups (handles
-        // self-references and cycles).
+        // self-references, cycles, and overlapping roots).
         let mut seen: HashSet<i64> = HashSet::new();
-        let mut stack = vec![start];
         while let Some(n) = stack.pop() {
             if !seen.insert(n) {
                 continue;
@@ -513,6 +530,54 @@ mod tests {
         assert_eq!(db.closure("/a").unwrap(), vec!["/a", "/b", "/c"]);
         assert_eq!(db.closure("/d").unwrap(), vec!["/d"]); // no out-edges
         assert!(db.closure("/missing").is_err());
+    }
+
+    #[test]
+    fn closure_roots_unions_and_dedups() {
+        // /a -> /b -> /c ; /d -> /b ; /e isolated. /a and /d overlap on /b,/c.
+        let vp = |rid: i64, p: &str| {
+            (rid, vec![
+                store_db::Value::Null,
+                store_db::Value::Text(p.to_string()),
+                store_db::Value::Text("sha256:00".to_string()),
+                store_db::Value::Int(1),
+                store_db::Value::Null,
+                store_db::Value::Int(1),
+            ])
+        };
+        let valid = Table {
+            name: "ValidPaths",
+            sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+            rows: vec![vp(1, "/a"), vp(2, "/b"), vp(3, "/c"), vp(4, "/d"), vp(5, "/e")],
+        };
+        let edge = |rid: i64, a: i64, b: i64| {
+            (rid, vec![store_db::Value::Int(a), store_db::Value::Int(b)])
+        };
+        let refs = Table {
+            name: "Refs",
+            sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+            rows: vec![edge(1, 1, 2), edge(2, 2, 3), edge(3, 4, 2)],
+        };
+        let db = Db::open(store_db::write_db(&[valid, refs])).unwrap();
+        // Union of two roots whose closures overlap on /b,/c — deduped, sorted
+        // (== guix gc --requisites /a /d).
+        assert_eq!(
+            db.closure_roots(&["/a".to_string(), "/d".to_string()]).unwrap(),
+            vec!["/a", "/b", "/c", "/d"]
+        );
+        // Single root in a slice matches closure() exactly.
+        assert_eq!(db.closure_roots(&["/a".to_string()]).unwrap(), db.closure("/a").unwrap());
+        // Overlapping/duplicate roots fold into one closure.
+        assert_eq!(
+            db.closure_roots(&["/b".to_string(), "/b".to_string(), "/c".to_string()]).unwrap(),
+            vec!["/b", "/c"]
+        );
+        // An isolated root contributes only itself.
+        assert_eq!(db.closure_roots(&["/e".to_string()]).unwrap(), vec!["/e"]);
+        // No roots => empty closure.
+        assert_eq!(db.closure_roots(&[]).unwrap(), Vec::<String>::new());
+        // A missing root among valid ones fails loudly (no partial closure).
+        assert!(db.closure_roots(&["/a".to_string(), "/missing".to_string()]).is_err());
     }
 
     #[test]
