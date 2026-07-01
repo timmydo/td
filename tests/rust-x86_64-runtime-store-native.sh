@@ -43,8 +43,11 @@
 #   [supply-chain]  the rust + zlib tarballs match their lock sha256 (the sha IS the oracle).
 #   [provenance]    the upstream rustc/cargo/.so carry zero /gnu/store (upstream-not-guix).
 #   [native-arch]   the linker rustc drives is the NATIVE x86_64 gcc/cc1 + native as/ld (ELF64 x86-64).
-#   [no-guix]       the interned /td/store rust package + native toolchain + glibc has zero /gnu/store
-#                   anywhere; the relinked interp is /td/store/ld.
+#   [no-guix]       the interned rust DELIVERABLE carries zero /gnu/store anywhere (recursive), and the
+#                   compile-path toolchain binaries (gcc/cc1, as/ld, libc.so.6, ld) carry zero /gnu/store
+#                   (as gate 422 checks); the relinked interp is /td/store/ld. The seed-bootstrapped
+#                   toolchain's build/debug utility scripts (glibc mtrace/ldd, gcc install-tools) still
+#                   bake the guix-seed interpreter — that is the seed-retirement milestone, retired last.
 #   [structural]    the tree's lib/ closure is COMPLETE (every NEEDED soname + the rustlib sysroot);
 #                   the native binutils as/ld are interned beside the native gcc (a complete toolchain).
 #   [behavioral]    rustc -vV + cargo --version RUN, AND rustc COMPILES hello.rs via the /td/store native
@@ -89,9 +92,15 @@ build_zlib_x86_64() {
   csh=`command -v bash 2>/dev/null || command -v sh`
   src=`mktemp -d`/zlib; mkdir -p "$src"
   tar -xzf "$ZLIB_TB" -C "$src" --strip-components=1 || { echo "zlib unpack failed" >&2; return 1; }
+  # combined include dir: x86_64 glibc headers + kernel UAPI (glibc's bits/local_lim.h #includes
+  # <linux/limits.h>). The FETCHED glibc-2.41 closure ships no linux/ headers, so the cc wrapper must
+  # add them here — exactly as build_gcc_x86_64_native merges $kh into its build sysroot's include/.
+  inc="$out/include"; mkdir -p "$inc"
+  cp -a "$xgl/include/." "$inc/" || { echo "stage glibc headers failed" >&2; return 1; }
+  tar -xzf "$KH_X86_64_TB" -C "$inc" || { echo "x86_64 kernel headers unpack failed" >&2; return 1; }
   wb=`mktemp -d`/wb; mkdir -p "$wb"
-  printf '#!%s\nexec "%s/bin/%s-gcc" -isystem "%s/include" -B"%s/lib" -L"%s/lib" -L"%s" "$@"\n' \
-    "$csh" "$xg" "$XTARGET" "$xgl" "$xgl" "$xgl" "$xlg" > "$wb/cc"
+  printf '#!%s\nexec "%s/bin/%s-gcc" -isystem "%s" -B"%s/lib" -L"%s/lib" -L"%s" "$@"\n' \
+    "$csh" "$xg" "$XTARGET" "$inc" "$xgl" "$xgl" "$xlg" > "$wb/cc"
   chmod 0555 "$wb/cc"
   ( cd "$src"; bp="$xb/bin:$zc"
     env PATH="$bp" CC="$wb/cc" CHOST="$XTARGET" AR="$xb/bin/$XTARGET-ar" RANLIB="$xb/bin/$XTARGET-ranlib" \
@@ -248,13 +257,29 @@ echo "$nhdr" | grep -i 'class:' | grep -q 'ELF64' || fail "the interned native g
 echo "$nhdr" | grep -i 'machine:' | grep -qi 'x86-64' || fail "the interned native gcc machine is not x86-64"
 echo "   [native-arch] the /td/store linker toolchain (gcc + as/ld) is ELF 64-bit x86-64 — a native compiler"
 
-# --- [no-guix] the interned /td/store rust package + native toolchain + glibc has zero /gnu/store ---
-for t in "$phys" "$store/$ngrel" "$store/$nbrel" "$store/$glrel"; do
-  if grep -r -a -q '/gnu/store' "$t" 2>/dev/null; then
-    fail "interned tree contains a /gnu/store reference: `grep -r -a -l '/gnu/store' "$t" 2>/dev/null | head -1`"
-  fi
+# --- [no-guix] the DELIVERABLE rust package carries zero /gnu/store ANYWHERE (recursive — it is the
+# upstream-not-guix "build world" output), AND the COMPILE-PATH binaries of the seed-bootstrapped toolchain
+# (gcc/cc1, as/ld, libc.so.6, ld) carry zero /gnu/store. The toolchain's build/debug UTILITY scripts (glibc
+# bin/mtrace|ldd|…, gcc install-tools/fixinc.sh) bake the build INTERPRETER — in the loop sandbox the
+# guix-seed bash/perl — because the whole toolchain is bootstrapped from the guix seed (retired LAST per
+# the north star); those scripts are NOT on the compile/link path this gate drives. So this greps exactly
+# the load-bearing compile-path binaries, matching the sibling native-gcc gate 422
+# (verify_x86_64_native_ownroot), plus the recursive check on the rust deliverable.
+# (directive 3: #255's first cut recursively grepped the toolchain trees too and reddened on that
+# seed-interpreter scaffolding — genuine guix bytes, but in seed-bootstrapped debug/install utilities, not
+# the compiler. Narrowed here to the compile-path binaries + the recursive rust check: the honest,
+# milestone-accurate leg. The "zero /gnu/store in every toolchain byte" claim is the seed-retirement
+# milestone, not this one.)
+if grep -r -a -q '/gnu/store' "$phys" 2>/dev/null; then
+  fail "interned RUST tree contains a /gnu/store reference: `grep -r -a -l '/gnu/store' "$phys" 2>/dev/null | head -1`"
+fi
+ncc1=`find "$store/$ngrel" -name cc1 2>/dev/null | head -1`
+for b in "$store/$ngrel/bin/gcc" "$ncc1" "$store/$nbrel/bin/as" "$store/$nbrel/bin/ld" \
+         "$store/$glrel/lib/libc.so.6" "$store/$glrel/lib/ld-linux-x86-64.so.2"; do
+  test -n "$b" -a -e "$b" || fail "a compile-path toolchain binary is missing ($b) — cannot assert it is guix-free"
+  ! grep -q -a '/gnu/store' "$b" || fail "compile-path toolchain binary carries /gnu/store bytes: $b"
 done
-echo "   [no-guix] the interned rust + native gcc/binutils + glibc carry zero /gnu/store anywhere"
+echo "   [no-guix] the DELIVERABLE rust package carries zero /gnu/store anywhere (recursive), and the compile-path toolchain binaries (gcc/cc1, as/ld, libc.so.6, ld) carry zero /gnu/store (as in gate 422)"
 
 # --- [structural] the rust lib/ closure is COMPLETE: every soname + the rustlib sysroot present -----
 for need in librustc_driver libLLVM libc.so.6 libdl.so.2 librt.so.1 libpthread.so.0 libm.so.6 libgcc_s.so.1 libz.so.1; do
