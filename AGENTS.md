@@ -3,7 +3,8 @@
 You are one of possibly several agents building a functional Linux
 distribution.  You grow the OS *inside* a verification loop: you do
 not get credit for just code, only for a passing, reproducible test. Read
-`DESIGN.md` for the target, the roadmap, and the parallel-work rules.
+`DESIGN.md` for the north star, the loop, and the provenance chain; the
+parallel-work rules are in this file.
 
 This file is your contract. The rules below are absolute and override any local
 convenience.
@@ -61,11 +62,10 @@ bootstrap replaces the guix toolchain seed.
 4. **PR is the proposal.** One-maintainer project: build the smallest *complete*
    increment — a real working capability with its migration cut over in the one PR
    (directive 9), never a partial mechanism — on a branch and open a PR; the human's
-   PR approval is the sign-off
-   (DESIGN §4.3). No roadmap entry, written proposal, or pre-approval is needed to
+   PR approval is the sign-off. No written proposal or pre-approval is needed to
    start work; build it, then PR it. Keep design notes terse, and surface any
-   weakened gate in the PR (directive 3). The roadmap (DESIGN §7.1) is a descriptive
-   status index, not a gate.
+   weakened gate in the PR (directive 3). There is no roadmap to enroll in — the
+   open-PR list is the record of what work is in flight, not a gate.
 
 5. **Respect the state boundary.** The VM is ephemeral per test (fresh state, wiped on
    reset) — that is *test isolation*, not a ban on persistence *within* a test.
@@ -166,7 +166,7 @@ source) and `affected-checks` waives the full loop for them. The full
 heavy+system suite is no longer a per-PR gate; it runs **once daily**
 on fresh main via `ci/daily-full-suite.sh`, driven by a scheduled
 agent that opens a **fix-or-revert PR (no auto-merge)** on any
-regression (DESIGN §7.2). A corpus/system regression the smoke misses
+regression. A corpus/system regression the smoke misses
 is healed within a day, not blocked per-PR — the accepted velocity
 trade.
 
@@ -207,11 +207,9 @@ If any are missing, the task is not done.
 ## Parallel work (worktrees, merge on green)
 
 Multiple agents work this repo concurrently. The unit of work is a
-**branch + draft PR**. There is no claim file and no generated status
-index — *the open-PR list is the record of who is working on what*,
-and all working notes live in the git log + PR body. DESIGN §7.1's
-roadmap stays as a descriptive list of workstreams, not a claim
-ledger.
+**branch + draft PR**. There is no claim file, no roadmap ledger, and no
+generated status index — *the open-PR list is the record of who is working
+on what*, and all working notes live in the git log + PR body.
 
 - **Claim by opening a draft PR.** Before starting, scan the open PRs
   (`gh pr list`) so two agents don't pick the same work; if one is already open for it,
@@ -294,8 +292,8 @@ ledger.
   VM-boot tests were removed 2026-06-29, human-directed.)
 - `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
   deliberately (exclusive landing), never silently.
-- `DESIGN.md` — the settled contract: loop, target, invariants, roadmap (§7.1),
-  parallel-work rules (§7.2–7.4).
+- `DESIGN.md` — the settled north star: scope (§0), the loop (§1), and the
+  provenance chain. The parallel-work rules live here in AGENTS.md, not DESIGN.md.
 - Work tracking: there is **no `PLAN.md` and no per-PR tracking/claim files** — claims
   are the open draft PRs (`gh pr list`), and work notes + verified-red evidence live in
   commit messages + the PR body (the squash merge preserves the commit messages in
