@@ -4569,13 +4569,15 @@ fn main() -> ExitCode {
             let keymap: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             let handle = move |req: &str| -> Result<String, String> {
-                // Request grammar: "<drv> [BP BS BD]" (build) or "CHECK <drv> [BP BS BD]"
-                // (reproducibility). The optional trailing BP/BS/BD is the td-owned builder
-                // override (TD_BUILDER_PATH/STORE/DB) — carried PER REQUEST because ONE shared
-                // daemon serves many worktrees whose stage0 builder lives at different on-disk
-                // paths (bound at identical absolute paths in every sandbox, so the daemon on
-                // the host opens exactly what the submitter names). Absent → the child inherits
-                // the daemon's own env (gates 358/359, which set TD_BUILDER_* on the daemon).
+                // Request grammar: "<drv> [SDB BP BS BD]" (build) or "CHECK <drv> [SDB BP BS BD]"
+                // (reproducibility). The optional trailing fields are the SEED store-db (SDB, the
+                // reference graph for input-closure staging) and the td-owned builder override
+                // (TD_BUILDER_PATH/STORE/DB). Both are carried PER REQUEST because ONE shared
+                // daemon serves many worktrees: each declares the seed store its inputs come from
+                // and the stage0 builder its drv names (bound at identical absolute paths in every
+                // sandbox, so the daemon on the host opens exactly what the submitter names).
+                // Absent → the child uses the daemon's own start-time store-db + inherited env
+                // (gates 358/359, which pass a bare drv and set TD_BUILDER_* on the daemon).
                 let mut toks = req.split_whitespace();
                 let first = toks.next().ok_or_else(|| "empty request".to_string())?;
                 let (sub, drv) = if first == "CHECK" {
@@ -4584,16 +4586,19 @@ fn main() -> ExitCode {
                     ("daemon-build", first)
                 };
                 let rest: Vec<&str> = toks.collect();
-                let override_env: Vec<(&str, &str)> = match rest.as_slice() {
-                    [bp, bs, bd] => vec![
-                        ("TD_BUILDER_PATH", *bp),
-                        ("TD_BUILDER_STORE", *bs),
-                        ("TD_BUILDER_DB", *bd),
-                    ],
-                    [] => Vec::new(),
+                let (store_db_req, override_env): (String, Vec<(&str, &str)>) = match rest.as_slice() {
+                    [sdb, bp, bs, bd] => (
+                        (*sdb).to_string(),
+                        vec![
+                            ("TD_BUILDER_PATH", *bp),
+                            ("TD_BUILDER_STORE", *bs),
+                            ("TD_BUILDER_DB", *bd),
+                        ],
+                    ),
+                    [] => (store_db.clone(), Vec::new()),
                     _ => {
                         return Err(format!(
-                            "malformed request (expected DRV [BUILDER_PATH BUILDER_STORE BUILDER_DB]): {req}"
+                            "malformed request (expected DRV [STORE-DB BUILDER_PATH BUILDER_STORE BUILDER_DB]): {req}"
                         ))
                     }
                 };
@@ -4613,7 +4618,7 @@ fn main() -> ExitCode {
                 let mut cmd = Command::new(&exe);
                 cmd.arg(sub)
                     .arg(drv)
-                    .arg(&store_db)
+                    .arg(&store_db_req)
                     .arg(&scratch)
                     .stderr(std::process::Stdio::inherit());
                 for (k, v) in &override_env {

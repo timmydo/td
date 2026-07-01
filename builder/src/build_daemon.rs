@@ -104,6 +104,14 @@ pub fn serve(
             let _permit = sem.acquire(); // blocks here when the budget is full (the queue)
             let n = active.fetch_add(1, Ordering::SeqCst) + 1;
             eprintln!("td-builder: daemon build START ({n}/{budget} active): {req}");
+            // Test-only slot-occupancy hold (never set in production): lets the daemon-budget
+            // gate force overlap and measure the concurrency ceiling deterministically without
+            // slow real builds. Held under the permit, so it counts against the budget.
+            if let Ok(ms) = std::env::var("TD_DAEMON_TEST_SLEEP_MS") {
+                if let Ok(ms) = ms.parse::<u64>() {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
             let resp = match handle(&req) {
                 Ok(payload) => format!("OK {payload}\n"),
                 // Keep the response a single line — a build error can be multi-line.
