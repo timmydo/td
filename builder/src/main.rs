@@ -1045,6 +1045,30 @@ fn build_recipe(
 /// SCRATCH/<name>-<version>.drv — WITHOUT building it. Returns (canonical drv store path,
 /// the written `.drv` file, the parsed derivation, the `<name>-source` path).
 ///
+/// Substitute the /td/store gcc-toolchain `tc` for the lock's guix gcc-toolchain input(s) in
+/// `inputs` (corpus-toolchain-default). A gcc-toolchain input is identified by its store-path
+/// PACKAGE NAME (the part after the `<hash>-` store prefix) being `gcc-toolchain-…` — so
+/// `<hash>-gcc-toolchain-15.2.0` matches but a bare `<hash>-gcc-14.3.0`, or an unrelated package
+/// that merely embeds the segment interior (e.g. `<hash>-libfoo-gcc-toolchain-helper`), does NOT.
+/// Only the toolchain input is swapped; every other build input + the order are untouched. Returns
+/// true iff at least one input was substituted (callers no-op silently when none — see the override
+/// site). A multi-match dedup is the caller's (`inputs.dedup()` after sort).
+fn substitute_gcc_toolchain(inputs: &mut [String], tc: &str) -> bool {
+    let mut swapped = false;
+    for p in inputs.iter_mut() {
+        let base = p.rsplit('/').next().unwrap_or(p);
+        // store basename = `<nix-base32 hash>-<package name>`; match the gcc-toolchain PACKAGE,
+        // anchored at the name (split at the first `-`), not an interior substring.
+        let is_toolchain =
+            base.split_once('-').is_some_and(|(_hash, name)| name.starts_with("gcc-toolchain-"));
+        if is_toolchain {
+            *p = tc.to_string();
+            swapped = true;
+        }
+    }
+    swapped
+}
+
 /// Shared by `build-recipe` (which then realizes it daemon-free) and `assemble-recipe`
 /// (assemble-only, so a SEPARATE process — the build daemon — realizes the td-assembled
 /// drv). Splitting assembly from realization is what lets td's own daemon, not a `guix
@@ -1112,7 +1136,25 @@ fn assemble_recipe_drv(
     if source.is_empty() {
         return Err(format!("lock has no `{src_key}' entry (the recipe source)"));
     }
+    // Default corpus toolchain (corpus-toolchain-default): when TD_GCC_TOOLCHAIN names a /td/store
+    // gcc-toolchain-shaped tree, SUBSTITUTE it for the lock's guix `gcc-toolchain-15.2.0` input — so the
+    // corpus package is compiled by td's OWN /td/store toolchain (no guix gcc-toolchain bytes) instead of
+    // guix's. The override path is staged as an input-src + reaches TD_INPUTS like any other input below;
+    // its closure must be in the caller's store-dbs (the corpus gate interns the toolchain + threads its
+    // db, exactly as the inline lock-rewrite did). Equivalent to rewriting the lock's gcc-toolchain line,
+    // but done in the engine so it can be the DEFAULT for the corpus build path, not per-gate shell.
+    // A no-swap (a lock with no gcc-toolchain — e.g. a pure-source package) is a SILENT no-op, NOT an
+    // error: TD_GCC_TOOLCHAIN must be safe to set corpus-wide as the default. A package that wrongly
+    // still pulls guix's toolchain is caught downstream by the gate's [no-guix-toolchain] assertion.
+    if let Ok(tc) = std::env::var("TD_GCC_TOOLCHAIN") {
+        if !tc.is_empty() {
+            substitute_gcc_toolchain(&mut inputs, &tc);
+        }
+    }
     inputs.sort();
+    // Dedup: the override collapses any (today single, but defensively >1) gcc-toolchain inputs to the
+    // same path; the input-src loop + TD_INPUTS below must not carry it twice.
+    inputs.dedup();
     vendor.sort();
     let builder = format!("{builder_path}/bin/td-builder");
     // Assemble the .drv spec: inputs as input-SOURCES (already-realized seed paths,
@@ -5249,5 +5291,98 @@ memchr-2.7.crate /gnu/store/ddd-memchr.crate
         // The symlink is recreated as a symlink, not followed.
         assert!(std::fs::symlink_metadata(dst.join("link")).unwrap().file_type().is_symlink());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gcc_toolchain_substitution_swaps_only_the_toolchain_input() {
+        // corpus-toolchain-default: TD_GCC_TOOLCHAIN swaps the guix gcc-toolchain input for a
+        // /td/store toolchain, leaving every other build input (glibc, make, coreutils, the source)
+        // untouched, order-preserved.
+        let tc = "/td/store/abc123-gcc-toolchain-tdstore";
+        let mut inputs = vec![
+            "/gnu/store/aaa-glibc-2.41".to_string(),
+            "/gnu/store/bbb-gcc-toolchain-15.2.0".to_string(),
+            "/gnu/store/ccc-make-4.4.1".to_string(),
+        ];
+        assert!(super::substitute_gcc_toolchain(&mut inputs, tc), "should report a swap");
+        assert_eq!(
+            inputs,
+            vec![
+                "/gnu/store/aaa-glibc-2.41".to_string(),
+                tc.to_string(),
+                "/gnu/store/ccc-make-4.4.1".to_string(),
+            ],
+            "only the gcc-toolchain input is swapped; others + order preserved"
+        );
+        // Near-miss basenames must NOT be swapped: a bare gcc (the package name is `gcc-…`, not
+        // `gcc-toolchain-…`), and an unrelated package that merely embeds `-gcc-toolchain-` INTERIOR
+        // (the name is `libfoo-…`, so the anchored match at the package name excludes it).
+        let mut other = vec![
+            "/gnu/store/ddd-gcc-14.3.0".to_string(),
+            "/gnu/store/eee-libfoo-gcc-toolchain-helper".to_string(),
+        ];
+        assert!(
+            !super::substitute_gcc_toolchain(&mut other, tc),
+            "bare gcc + interior-substring packages are not toolchain inputs"
+        );
+        assert_eq!(
+            other,
+            vec![
+                "/gnu/store/ddd-gcc-14.3.0".to_string(),
+                "/gnu/store/eee-libfoo-gcc-toolchain-helper".to_string(),
+            ],
+            "unchanged on no-op"
+        );
+    }
+
+    // Exercise the override through the REAL engine path: assemble_recipe_drv reads TD_GCC_TOOLCHAIN and
+    // substitutes it for the lock's guix gcc-toolchain when it assembles the .drv — the code the corpus
+    // build path runs (not just the helper). Asserts the produced drv's TD_INPUTS + input-srcs reflect the
+    // swap, and that the default (env unset) is unchanged. This is the reusable-mechanism analog of the
+    // per-gate lock-rewrite: a build-recipe with TD_GCC_TOOLCHAIN set compiles with td's /td/store toolchain.
+    #[test]
+    fn assemble_recipe_drv_honors_td_gcc_toolchain() {
+        let dir = std::env::temp_dir().join(format!("td-gcctc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("hello.lock");
+        // A minimal recipe lock: source + guix gcc-toolchain + glibc + make (2-field seed inputs).
+        std::fs::write(
+            &lock,
+            "hello-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2.tar.gz source\n\
+             /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-toolchain-15.2.0 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-toolchain-15.2.0\n\
+             /gnu/store/cccccccccccccccccccccccccccccccc-glibc-2.41 /gnu/store/cccccccccccccccccccccccccccccccc-glibc-2.41\n\
+             /gnu/store/dddddddddddddddddddddddddddddddd-make-4.4.1 /gnu/store/dddddddddddddddddddddddddddddddd-make-4.4.1\n",
+        )
+        .unwrap();
+        let recipe = r#"{"name":"hello","version":"2.12.2","buildSystem":"gnu"}"#;
+        let lockp = lock.to_str().unwrap();
+        let builder = "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-td-builder-0.1.0";
+        let tc = "/td/store/ffffffffffffffffffffffffffffffff-gcc-toolchain-tdstore";
+        let td_inputs = |drv: &drv::Derivation| {
+            drv.env.iter().find(|(k, _)| k == "TD_INPUTS").map(|(_, v)| v.clone()).unwrap()
+        };
+
+        // WITH the override: the guix gcc-toolchain is swapped for the /td/store toolchain.
+        std::env::set_var("TD_GCC_TOOLCHAIN", tc);
+        let (_p, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, builder, None).unwrap();
+        std::env::remove_var("TD_GCC_TOOLCHAIN");
+        let ti = td_inputs(&drv);
+        assert!(ti.contains(tc), "TD_INPUTS carries the /td/store toolchain: {ti}");
+        assert!(!ti.contains("gcc-toolchain-15.2.0"), "guix gcc-toolchain swapped OUT of TD_INPUTS: {ti}");
+        assert!(ti.contains("-glibc-2.41") && ti.contains("-make-4.4.1"), "other inputs untouched: {ti}");
+        // The swapped path is an input-src too (staged into the build), not just an env value.
+        assert!(drv.input_srcs.iter().any(|s| s == tc), "override is an input-src");
+        assert!(
+            !drv.input_srcs.iter().any(|s| s.contains("gcc-toolchain-15.2.0")),
+            "guix gcc-toolchain is not an input-src (dropped from the drv closure)"
+        );
+
+        // WITHOUT the override (default): unchanged — the guix gcc-toolchain stays.
+        let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, builder, None).unwrap();
+        let ti0 = td_inputs(&drv0);
+        assert!(ti0.contains("gcc-toolchain-15.2.0"), "default keeps the guix gcc-toolchain: {ti0}");
+        assert!(!ti0.contains(tc), "default has no /td/store toolchain: {ti0}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
