@@ -55,8 +55,10 @@ retired last. DESIGN §5 carries the detail.
    (`guix-daemon`, store, config language, etc.) without first proving behavioral
    equivalence to the original — build the same thing both ways and diff the store
    paths. The existing component is the oracle.
-5. **PR is the proposal.** One-maintainer project: build the smallest correct
-   increment on a branch and open a PR — the human's PR approval is the sign-off
+5. **PR is the proposal.** One-maintainer project: build the smallest *complete*
+   increment — a real working capability with its migration cut over in the one PR
+   (directive 9), never a partial mechanism — on a branch and open a PR; the human's
+   PR approval is the sign-off
    (DESIGN §4.3). No roadmap entry, written proposal, or pre-approval is needed to
    start work; build it, then PR it. Keep design notes terse, and surface any
    weakened gate in the PR (directive 3). The roadmap (DESIGN §7.1) is a descriptive
@@ -93,6 +95,27 @@ retired last. DESIGN §5 carries the detail.
    relevant `.expected`/baseline edit, called out in the PR for explicit sign-off
    (directive 3). When in doubt, the test is "does the td-native path still work with guix
    deleted from this step?" — if no, it's load-bearing and not allowed.
+
+9. **Every PR is a complete, atomic increment — migrations cut over in one PR (human,
+   2026-06-30).** A PR delivers a real, working capability, never a partial mechanism
+   left for a follow-up. When you replace a path, the SAME PR (a) adds the new path,
+   (b) switches every caller onto it, and (c) deletes the old path. "Land the engine
+   mechanism now, adopt it and remove the old path later" is exactly the split this
+   forbids: shipping a new path while the old one stays load-bearing — or shipping an
+   unused mechanism, a dead-code path, or a TODO to finish the migration — is not done.
+   Directive 4 still holds (build both ways and diff, keeping the byte-differential as a
+   labeled removable oracle), but the cutover itself is not deferrable. No minimal PRs:
+   split a big change into small COMMITS within the one PR, never across PRs. This is
+   absolute — there is no "too big to cut over in one PR" exception; if a swap feels too
+   big for one PR, its scope is wrong (narrow the capability so the whole add+cutover+
+   delete fits), not its atomicity. A migration landed half-done is a failing task.
+   **Scope:** this fires when a PR *replaces* an existing path for its *existing
+   consumers* — that add + switch-all-callers + delete-old-path is one PR. Building a
+   genuinely new capability that nothing consumes yet (a fresh bootstrap-ladder rung on
+   the way to retiring guix *last*) is additive, not a half-done migration — but it still
+   ships as a *complete, behaviorally-tested* capability (see "Test the feature, not the
+   possibility"), never an orphan mechanism parked for a later adopter. The #250 tell:
+   the PR's own consumers should have moved onto the new path in that PR and didn't.
 
 ## The loop
 
@@ -213,16 +236,36 @@ have to be rewritten, not deleted, when the oracle goes. So:
 - A gate that is *purely* a Guix differential is a smell to fix, not a finished gate.
 
 This is the test-design corollary of "own, then diverge": once td owns a capability,
-the differential guards it; the durable assertions are what we actually keep.
+the differential guards it; the durable assertions are what we actually keep — and when
+that capability is a user-facing feature, the durable assertion that counts is the
+feature actually running (next section).
+
+## Test the feature, not the possibility
+
+A new test must exercise an **actual feature through its real entry point** and assert
+what that feature *does* — not merely prove an artifact can be produced. Building an app
+(or interning a store path) and asserting its **hash, existence, or shape** shows
+something is *possible*; that is not a feature test and does not, on its own, earn a
+gate. Drive the real path and assert real behavior: for a shipped app, run it the way a
+user does — `td shell <app> -- <app> --do-some-real-thing` — and check the output; for a
+mechanism, invoke it as its real caller would and assert the observable effect.
+Build-and-hash, "it interned", "it round-tripped", "the closure is complete" are the
+*structural self-consistency* legs above — legitimate only as SUPPORTING evidence behind
+a behavioral assertion (and the byte-hash-vs-Guix leg is the removable oracle), never as
+the point of the gate. If the only thing a new test proves is "this can be built", it is
+not covering a feature: find the feature and test that.
 
 ## Definition of done (every task)
 
 A task is done only when ALL hold:
 
-- a test asserts the new behavior and passes,
+- a test exercises the actual feature through its real entry point and asserts what it
+  does — not just that an artifact can be built (see "Test the feature, not the
+  possibility") — and passes,
 - you have seen that assertion fail (verified-red) before trusting the pass,
 - the build is reproducible (`guix build --check` passes),
-- the change is the smallest increment that turns one test green,
+- the change is a complete, atomic increment — a real capability with any replaced path
+  removed in the same PR (directive 9), not a partial mechanism,
 - it is committed with a message stating what test now passes,
 - it is landed on main via the landing protocol below.
 
@@ -307,14 +350,17 @@ ledger.
    `/code-review`) — an independent context, NOT the implementing agent reviewing
    its own diff; that independence is the point and is why this is one review of the
    branch, not per-commit self-review. Review the whole branch against this
-   contract — correctness bugs AND no weakened gates/assertions, smallest increment,
-   conventions respected — and address its findings BEFORE opening the PR or marking
+   contract — correctness bugs AND no weakened gates/assertions, a complete atomic
+   increment (no orphan mechanism; any migration cut over — directive 9), tests that
+   exercise real features not possibility, conventions respected — and address its
+   findings BEFORE opening the PR or marking
    it ready. This single PR-level review is the one required agent review; it
    PRECEDES, never replaces, the human's PR review (DESIGN §4.3).
 7. Land per the protocol when the acceptance test is green.
 
-Prefer many small green commits over one large change. If a change spans layers, split
-it.
+Prefer many small green commits over one large change, but keep the PR itself a complete
+atomic increment (directive 9): when a change spans layers, split it into COMMITS within
+the one PR — never across PRs, and never leave the migration half-done for a follow-up.
 
 ## When stuck or blocked
 
@@ -389,7 +435,8 @@ it.
 
 - Small green increments. Each commit message states which test now passes (e.g.
   "boot test asserts expected kernel via uname -r"). Prefer many small commits over one
-  large change. The full branch is reviewed once by an independent code-review
+  large change — small COMMITS within one complete, atomic PR (directive 9), not a
+  migration sliced across PRs. The full branch is reviewed once by an independent code-review
   subagent before the PR goes up — not per commit (Workflow step 6). Land on
   main only via the §7.2 protocol (rebase → affected-checks waiver or full escalation
   → PR → CI green + human approval → squash-merge).

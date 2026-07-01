@@ -287,8 +287,10 @@ lesson is that vehicle choice can sink a milestone):
   default-deny and declared: only allowlisted paths on `td-state` survive a
   generation swap (the §2.6 state model). Never stash mutable state outside the
   declared boundary to make something work.
-- **Definition of done.** A passing test, reproducible, committed as a small
-  increment. If "done" is undefined, the agent declares victory early.
+- **Definition of done.** A passing test that exercises the real feature (not just that
+  an artifact builds), reproducible, delivered as one complete atomic increment — a
+  migration cuts over (new path added, callers switched, old path removed) in the same
+  PR. If "done" is undefined, the agent declares victory early.
 
 Mirrored in `CLAUDE.md`.
 
@@ -317,7 +319,9 @@ through a branch-protected PR with a mandatory review of the *diff* (§7.2), and
 single review approves everything — new work, scope, `channels.scm` bumps, oracle
 re-baselines, and changes that loosen or restructure an existing rung. You do **not**
 need a written proposal, a roadmap entry, or any pre-approval before building: build
-the smallest correct increment on a branch and open the PR.
+the smallest *complete* increment — a real working capability with its migration cut
+over in the one PR (CLAUDE.md directive 9), not a partial mechanism — on a branch and
+open the PR.
 
 The one thing never to do *silently*: remove, loosen, skip, or restructure away an
 existing rung or assertion (in `check.sh`, the `Makefile`, or `tests/`) and slip it
@@ -537,8 +541,8 @@ annotated.
 - **Loop tooling convergence / loop-sandbox** — GRADUATED to §7.1 (approved
   2026-06-13, §4.3 gate-2); see the active entry below. td-builder's sandbox
   replaces `guix shell -C` in `check.sh` — the north star's "one sandbox stack
-  spanning build and run" made literal. Additive equivalence first; the wholesale
-  `check.sh` swap is a later increment.
+  spanning build and run" made literal. Done: `check.sh` now runs the td-builder
+  host-sandbox as the sole loop container (no `guix shell -C` fallback).
 - **composefs** (re-parked from M11): reconsider if/when cross-generation dedup earns
   its place — it would replace, not extend, the per-generation-image design, and is
   not in the pinned Guix.
@@ -719,7 +723,7 @@ run concurrently):
   sanctioned lowering target, retired LAST), with the toolchain + build-system also
   Guix's (retired last). What changes is provenance: the recipe is reconstructed
   from upstream coordinates (source URL + hash + build system), NOT looked up in
-  `(gnu packages …)`. Acceptance (the POC increment): a recipe for one leaf package
+  `(gnu packages …)`. Acceptance: a recipe for one leaf package
   (GNU `hello`) authored in TypeScript (`tests/ts/recipe-hello.ts`) — transpiled by
   tsc, evaluated by the boa evaluator (which gains `recipe`/`fetchSource` capture
   globals), and lowered by a GENERIC Guile recipe bridge (`system/td-recipe.scm`,
