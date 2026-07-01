@@ -1,7 +1,7 @@
 # Design document — td
 
-A functional Linux distribution, built and maintained by an AI coding
-agents. It aims to be bootstrapped from a the rust toolchain, written
+A functional Linux distribution, built and maintained by AI coding
+agents. It aims to be bootstrapped from the rust toolchain, written
 in a simple zero-dependency manner, focusing on a rust-based userspace
 and using containers for everything else.
 
@@ -35,7 +35,7 @@ per-package guix differential).
 
 The AI agent runs **outside** the container. Every build/test command it
 issues enters a **fresh** container — td's own `td-builder host-sandbox` (the SOLE loop
-container; §7.1) — so the agent's own environment can't contaminate results and the
+container) — so the agent's own environment can't contaminate results and the
 reproducibility rung stays honest. Every rung runs there, including `rootless` (its
 nested unprivileged builder nests cleanly given td's PID-namespace parity).
 
