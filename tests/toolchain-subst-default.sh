@@ -54,7 +54,7 @@ test -s "$scratch/subst.json" || { echo "ERROR: ts-emit produced no JSON" >&2; e
 sd="$scratch/b"
 env -i HOME="$scratch" TMPDIR="$scratch/tmp" PATH="$cu/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-  "$tb" build-recipe "$scratch/subst.json" "$lock" "$sd" /var/guix/db/db.sqlite "$srcstore" "$srcdb" \
+  "$tb" build-recipe "$scratch/subst.json" "$lock" "$sd" /gnu/store "$srcstore" "$srcdb" \
   > "$scratch/bout" 2>"$scratch/err" || { echo "FAIL: build-recipe td-subst:" >&2; tail -20 "$scratch/err" >&2; exit 1; }
 out=$(sed -n 's/^OUT=out //p' "$scratch/bout")
 ts="$sd/newstore/$(basename "$out")/bin/td-subst"

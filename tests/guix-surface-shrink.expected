@@ -6,7 +6,7 @@
 # may only SHRINK); growth needs a deliberate edit here, called out in the PR for
 # sign-off (directive 8). Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB><category>
-surface-sites: 91
+surface-sites: 72
 ci/build-ci-image.sh	guix-db-read
 ci/build-ci-image.sh	lowering
 ci/import-store.sh	guix-db-read
@@ -20,7 +20,6 @@ mk/gates/070-guix-dependence.mk	lowering
 mk/gates/105-generation-image.mk	lowering
 mk/gates/110-no-guix.mk	lowering
 mk/gates/115-manifest-check.mk	lowering
-mk/gates/118-oci-native.mk	guix-db-read
 mk/gates/120-oci.mk	lowering
 mk/gates/130-rootless.mk	gc
 mk/gates/130-rootless.mk	guix-db-read
@@ -36,7 +35,6 @@ mk/gates/185-offline.mk	lowering
 mk/gates/190-memo.mk	lowering
 mk/gates/205-spec-diff.mk	lowering
 mk/gates/207-recipe-rs.mk	shell
-mk/gates/220-corpus-no-guix.mk	guix-db-read
 mk/gates/230-drv-emit.mk	lowering
 mk/gates/235-td-drv-build.mk	gc
 mk/gates/235-td-drv-build.mk	lowering
@@ -57,34 +55,18 @@ mk/gates/305-store-add-referenced.mk	gc
 mk/gates/310-store-backend.mk	gc
 mk/gates/310-store-backend.mk	guix-db-read
 mk/gates/325-cargo-test.mk	shell
-mk/gates/330-rust-build.mk	guix-db-read
-mk/gates/335-rust-vendor.mk	guix-db-read
-mk/gates/345-rust-russh.mk	guix-db-read
-mk/gates/348-rust-fetch.mk	guix-db-read
-mk/gates/350-td-feed.mk	guix-db-read
-mk/gates/352-cmake.mk	guix-db-read
 mk/gates/352-cmake.mk	lowering
-mk/gates/355-td-realize.mk	guix-db-read
 mk/gates/355-td-realize.mk	lowering
-mk/gates/356-build-hermetic.mk	guix-db-read
 mk/gates/356-build-hermetic.mk	lowering
-mk/gates/358-build-daemon.mk	guix-db-read
 mk/gates/358-build-daemon.mk	lowering
-mk/gates/358-td-subst.mk	guix-db-read
-mk/gates/359-daemon-recipe.mk	guix-db-read
-mk/gates/360-td-offline.mk	guix-db-read
 mk/gates/360-td-offline.mk	lowering
 mk/gates/365-bootstrap-build.mk	guix-db-read
-mk/gates/365-build-plan.mk	guix-db-read
 tests/bootstrap-hello-corpus-store-native.sh	gc
 tests/bootstrap-hello-corpus-store-native.sh	guix-db-read
 tests/bootstrap-sed-corpus-store-native.sh	gc
 tests/bootstrap-sed-corpus-store-native.sh	guix-db-read
-tests/cache-lib.sh	guix-db-read
 tests/corpus-seed.sh	guix-db-read
-tests/crate-free-build.sh	guix-db-read
 tests/harness-seed.sh	guix-db-read
-tests/profile.sh	guix-db-read
 tests/rootless.sh	gc
 tests/rootless.sh	guix-db-read
 tests/rust-seed.sh	guix-db-read
@@ -97,4 +79,3 @@ tests/stage0-builder.sh	guix-db-read
 tests/store-relocate.sh	guix-db-read
 tests/td-shell-seed.sh	guix-db-read
 tests/td-shell.sh	guix-db-read
-tests/toolchain-subst-default.sh	guix-db-read

@@ -22,7 +22,7 @@ build-daemon:
 	"$$tb" drv-emit-to "$$da" "$$scratch/a.drv" >/dev/null || { echo "FAIL: drv-emit-to A" >&2; exit 1; }; \
 	"$$tb" drv-emit-to "$$db_" "$$scratch/b.drv" >/dev/null || { echo "FAIL: drv-emit-to B" >&2; exit 1; }; \
 	sock="$$scratch/sock"; \
-	"$$tb" daemon "$$sock" /var/guix/db/db.sqlite "$$scratch/d" > "$$scratch/daemon.log" 2>&1 & dpid=$$!; \
+	"$$tb" daemon "$$sock" /gnu/store "$$scratch/d" > "$$scratch/daemon.log" 2>&1 & dpid=$$!; \
 	trap 'kill $$dpid 2>/dev/null || true' EXIT; \
 	tries=0; while [ ! -S "$$sock" ] && [ $$tries -lt 50 ]; do sleep 0.2; tries=$$((tries+1)); done; \
 	[ -S "$$sock" ] || { echo "FAIL: daemon socket never appeared" >&2; cat "$$scratch/daemon.log" >&2; exit 1; }; \

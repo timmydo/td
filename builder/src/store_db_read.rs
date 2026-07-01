@@ -249,49 +249,6 @@ impl Db {
     }
 }
 
-/// The GC-reachable closure of `root` over the MERGED Refs graphs of `dbs` (path
-/// keyed; `root` included). A node's references are the UNION of its edges across
-/// every db that lists it — so a td.db's extra edges (a td-built dep → its direct
-/// refs) ADD to guix's db (those refs → their transitive seeds) rather than
-/// shadow it, regardless of db order. `root` must be a node in at least one db; a
-/// REACHED path that no db knows is an incomplete store set (error, symmetric with
-/// single-db `closure`). This is what lets a downstream build stage a closure that
-/// spans td's own output (only in td.db) and guix's seeds (only in guix's db).
-pub fn closure_multi(dbs: &[&Db], root: &str) -> Result<Vec<String>, String> {
-    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
-    for db in dbs {
-        for (p, refs) in db.refs_by_path()? {
-            let e = graph.entry(p).or_default();
-            for r in refs {
-                if !e.contains(&r) {
-                    e.push(r);
-                }
-            }
-        }
-    }
-    if !graph.contains_key(root) {
-        return Err(format!("root `{root}' is not in any store DB"));
-    }
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut stack = vec![root.to_string()];
-    while let Some(n) = stack.pop() {
-        if !seen.insert(n.clone()) {
-            continue;
-        }
-        let neighbors = graph.get(&n).ok_or_else(|| {
-            format!("reachable path `{n}' is not in any store DB (incomplete closure)")
-        })?;
-        for m in neighbors {
-            if !seen.contains(m) {
-                stack.push(m.clone());
-            }
-        }
-    }
-    let mut out: Vec<String> = seen.into_iter().collect();
-    out.sort();
-    Ok(out)
-}
-
 /// Read a SQLite varint at `off`; return `(value, bytes_consumed)`. The first 8
 /// bytes contribute 7 bits each (high bit = continue); a 9th byte contributes a
 /// full 8 bits. Inverse of `store_db::put_varint`. Returns `Err` on a varint that
@@ -578,44 +535,6 @@ mod tests {
         assert_eq!(db.closure_roots(&[]).unwrap(), Vec::<String>::new());
         // A missing root among valid ones fails loudly (no partial closure).
         assert!(db.closure_roots(&["/a".to_string(), "/missing".to_string()]).is_err());
-    }
-
-    #[test]
-    fn closure_multi_spans_two_dbs() {
-        const VP_SQL: &str = "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)";
-        const REFS_SQL: &str = "CREATE TABLE Refs (referrer integer, reference integer)";
-        use store_db::Value::{Int, Null, Text};
-        let vp = |rid: i64, p: &str| {
-            (rid, vec![Null, Text(p.to_string()), Text("sha256:00".to_string()), Int(1), Null, Int(1)])
-        };
-        let edge = |rid: i64, a: i64, b: i64| (rid, vec![Int(a), Int(b)]);
-        let mk = |vp_rows: Vec<_>, ref_rows: Vec<_>| {
-            Db::open(store_db::write_db(&[
-                Table { name: "ValidPaths", sql: VP_SQL, rows: vp_rows },
-                Table { name: "Refs", sql: REFS_SQL, rows: ref_rows },
-            ]))
-            .unwrap()
-        };
-        // guix-like db: /glibc -> /headers (the transitive seed only guix knows).
-        let guix = mk(vec![vp(1, "/glibc"), vp(2, "/headers")], vec![edge(1, 1, 2)]);
-        // td-like db: /pcre2 -> /glibc, with /glibc a scaffolding node (path only,
-        // no out-edges) — exactly write_output_db's shape for a td-built dep.
-        let td = mk(vec![vp(1, "/pcre2"), vp(2, "/glibc")], vec![edge(1, 1, 2)]);
-
-        // td.db ALONE stops at the scaffolding /glibc — it misses /headers.
-        assert_eq!(closure_multi(&[&td], "/pcre2").unwrap(), vec!["/glibc", "/pcre2"]);
-        // Merged with guix's db, /glibc's transitive dep /headers is pulled in.
-        assert_eq!(
-            closure_multi(&[&guix, &td], "/pcre2").unwrap(),
-            vec!["/glibc", "/headers", "/pcre2"]
-        );
-        // Order-independent (union, not override).
-        assert_eq!(
-            closure_multi(&[&td, &guix], "/pcre2").unwrap(),
-            vec!["/glibc", "/headers", "/pcre2"]
-        );
-        // A root no db knows is an error.
-        assert!(closure_multi(&[&guix, &td], "/nope").is_err());
     }
 
     #[test]

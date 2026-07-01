@@ -67,7 +67,7 @@ cached_build() {
   if env -i HOME="$sd" TMPDIR="$sd/tmp" PATH="$CU/bin" \
        TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
        "$TB" build-recipe \
-       "$sd/recipe.json" "$_lock" "$sd/b" /var/guix/db/db.sqlite > "$sd/bout" 2>"$sd/err"; then :; \
+       "$sd/recipe.json" "$_lock" "$sd/b" /gnu/store > "$sd/bout" 2>"$sd/err"; then :; \
   else echo "FAIL: build-recipe $_spec (guix/Guile off PATH):" >&2; tail -20 "$sd/err" >&2; return 1; fi
   out=`sed -n 's/^OUT=out //p' "$sd/bout"`
   test -n "$out" || { echo "FAIL: build-recipe produced no output for $_spec" >&2; cat "$sd/err" >&2; return 1; }

@@ -39,7 +39,7 @@ build-plan:
 	for S in $$subjects; do \
 	  edges=`grep -oE '"inputs":\[[^]]*\]' "$$jd/$$S.json" | sed 's/^"inputs"://' | grep -oE '"[^"]*"' | tr -d '"' | while read i; do echo " $$owned " | grep -q " $$i " && echo "$$i"; done`; \
 	  { grep ' /gnu/store/' "$(CURDIR)/tests/$$S-no-guix.lock" | grep -v 'td-recipe-output'; for d in $$edges; do grep ' /gnu/store/' "$(CURDIR)/tests/$$d-no-guix.lock" 2>/dev/null; done; } | sed 's/^[^ ]* //' | sort -u | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize guix seeds for $$S" >&2; exit 1; }; \
-	  env -i HOME="$$root" TMPDIR="$$root/tmp" PATH="$$cu/bin" "$$tb" build-plan --auto "$$S" "$$jd" "$(CURDIR)/tests" /var/guix/db/db.sqlite "$$root" > "$$root/out-$$S" 2>"$$root/err-$$S" || { echo "FAIL: build-plan --auto $$S (guix/Guile off PATH):" >&2; tail -30 "$$root/err-$$S" >&2; exit 1; }; \
+	  env -i HOME="$$root" TMPDIR="$$root/tmp" PATH="$$cu/bin" "$$tb" build-plan --auto "$$S" "$$jd" "$(CURDIR)/tests" /gnu/store "$$root" > "$$root/out-$$S" 2>"$$root/err-$$S" || { echo "FAIL: build-plan --auto $$S (guix/Guile off PATH):" >&2; tail -30 "$$root/err-$$S" >&2; exit 1; }; \
 	  td_S=`sed -n "s/^STEP $$S //p" "$$root/out-$$S"`; \
 	  test -n "$$td_S" || { echo "FAIL: --auto did not report the $$S step" >&2; cat "$$root/out-$$S" >&2; exit 1; }; \
 	  sdrv=`ls "$$root/$$S"/*.drv 2>/dev/null | head -1`; \

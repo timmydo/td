@@ -57,7 +57,7 @@ cmake:
 	test -s "$$scratch/td-cmake-demo.json" || { echo "ERROR: ts-emit produced no JSON for td-cmake-demo" >&2; exit 1; }; \
 	grep -q '"buildSystem":"cmake"' "$$scratch/td-cmake-demo.json" || { echo "FAIL: recipe JSON is not buildSystem cmake" >&2; cat "$$scratch/td-cmake-demo.json" >&2; exit 1; }; \
 	sd="$$scratch/b"; mkdir -p "$$sd"; \
-	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/td-cmake-demo.json" "$$lock" "$$sd" /var/guix/db/db.sqlite "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe cmake build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
+	env -i HOME="$$scratch" TMPDIR="$$scratch/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-recipe "$$scratch/td-cmake-demo.json" "$$lock" "$$sd" /gnu/store "$$srcstore" "$$srcdb" > "$$scratch/bout" 2>"$$scratch/err" || { echo "FAIL: build-recipe cmake build (guix/Guile off PATH):" >&2; tail -30 "$$scratch/err" >&2; exit 1; }; \
 	out=`sed -n 's/^OUT=out //p' "$$scratch/bout"`; \
 	test -n "$$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$$scratch/err" >&2; exit 1; }; \
 	if grep -qx 'CACHE=hit' "$$scratch/bout"; then hit=1; else hit=; grep -q 'no guix (derivation), no Guile' "$$scratch/err" || { echo "FAIL: build-recipe did not assemble the .drv itself" >&2; cat "$$scratch/err" >&2; exit 1; }; fi; \

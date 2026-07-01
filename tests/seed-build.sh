@@ -104,7 +104,7 @@ echo "   [DURABLE structural] every input staged from the unpacked seed store (n
 mkdir -p "$work/g"
 env -i HOME="$work" TMPDIR="$work" PATH="$cu/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-  "$TB" build-recipe "$work/hello.json" tests/hello-no-guix.lock "$work/g" /var/guix/db/db.sqlite \
+  "$TB" build-recipe "$work/hello.json" tests/hello-no-guix.lock "$work/g" /gnu/store \
   > "$work/gout" 2>"$work/gerr" || { tail -10 "$work/gerr" >&2; fail "guix-seed build (oracle) failed"; }
 gout=`sed -n 's/^OUT=out //p' "$work/gout"`
 test "$out" = "$gout" || fail "seed-built hello ($out) != guix-seed build ($gout) — provenance changed the output"

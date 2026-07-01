@@ -62,7 +62,7 @@ corpus-no-guix:
 	    : "$${TB:?}"; \
 	    env -i HOME="$$pdir" TMPDIR="$$pdir/tmp" PATH="$$CU/bin" \
 	      TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" \
-	      "$$TB" build-recipe "$$pdir/recipe.json" "$$lock" "$$pdir/b" /var/guix/db/db.sqlite > "$$pdir/out" 2>&1 || true; \
+	      "$$TB" build-recipe "$$pdir/recipe.json" "$$lock" "$$pdir/b" /gnu/store > "$$pdir/out" 2>&1 || true; \
 	    pdrv=`grep -hoE '/gnu/store/[a-z0-9]+-'"$$spec"'-[^ ]+\.drv' "$$pdir/out" 2>/dev/null | head -1`; \
 	    test -n "$$pdrv" || { echo "FAIL: perturbed $$spec recipe did not assemble a .drv (self-discrimination leg)" >&2; tail -5 "$$pdir/out" >&2; exit 1; }; \
 	    test "$$pdrv" != "$$rdrv" || { echo "FAIL: perturbed $$spec recipe assembled the SAME .drv ($$rdrv) — the recipe's content is not load-bearing in the build (self-discrimination vacuous)" >&2; exit 1; }; \
