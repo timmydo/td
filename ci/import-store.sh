@@ -6,7 +6,11 @@
 #   ci/import-store.sh OCI_DIR
 #
 # Requires: a running guix-daemon, `jq`, and sudo rights (one call, to
-# authorize the image's signing key in /etc/guix/acl). Prints the pinned
+# authorize the image's signing key in /etc/guix/acl). The post-import
+# closure-validity check uses td's own store reader, so it also needs a
+# prebuilt td-builder ($TD_BUILDER / builder/target/release / a PATH
+# td-builder) or a Rust toolchain to build the dependency-free builder crate
+# offline (`cargo --frozen`) — never a `guix gc` process. Prints the pinned
 # guix profile path (meta/CHANNEL_OUT) on the LAST line of stdout; put
 # "<that>/bin" first on PATH before running ./check.sh, exactly as a dev
 # box keeps the pinned system guix first.
@@ -53,7 +57,30 @@ tail -n +2 "$tmp/layers" | while read -r blob; do
   gzip -dc "$oci/blobs/sha256/$blob" | tar -xOf - --wildcards 'chunk-*'
 done | guix archive --import >&2
 
-echo ">> verify: the pinned guix profile closure is valid" >&2
-guix gc --requisites "$channel_out" > /dev/null
+echo ">> verify: the pinned guix profile closure is valid (td-builder store-closure over /var/guix/db — td's OWN Refs-graph reader, NO guix gc process)" >&2
+# Validate the just-imported closure with td's OWN store-DB reader instead of a
+# `guix gc` process (CLAUDE.md directive 8 — the guix surface only shrinks; this
+# retires the LAST `guix gc` site in the CI provisioning path, the one #249
+# deferred). #249 left it a guix call because "no td-builder is available" on the
+# fresh runner — but the builder crate is dependency-free (builder/Cargo.toml has
+# no [dependencies]), so the runner's pre-installed Rust builds it OFFLINE in
+# seconds (the same `cargo --frozen` the ci.yml `cargo-test` job relies on).
+# Resolve a prebuilt td-builder if one exists ($TD_BUILDER / release binary /
+# PATH), else build it once.
+repo=$(cd "$(dirname "$0")/.." && pwd)
+if [ -n "${TD_BUILDER:-}" ]; then tb=$TD_BUILDER
+elif [ -x "$repo/builder/target/release/td-builder" ]; then tb=$repo/builder/target/release/td-builder
+elif command -v td-builder >/dev/null 2>&1; then tb=td-builder
+else
+  echo ">> building td-builder (cargo build --frozen --release; dependency-free, offline)" >&2
+  cargo build --frozen --release --manifest-path "$repo/builder/Cargo.toml" >&2
+  tb=$repo/builder/target/release/td-builder
+fi
+# store-closure walks /var/guix/db's Refs graph from $channel_out (the daemon
+# populated the DB during the `guix archive --import` above) and fails loudly if
+# the root or any requisite is missing — the validity guarantee
+# `guix gc --requisites "$channel_out"` gave. The gate `store-gc` (mk/gates/290)
+# proves store-closure == `guix gc -R` exactly.
+"$tb" store-closure /var/guix/db/db.sqlite "$channel_out" > /dev/null
 echo ">> import complete" >&2
 echo "$channel_out"
