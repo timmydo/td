@@ -79,14 +79,29 @@ else
 fi
 test -n "${XGCC2:-}" -a -n "${XGLIBC:-}" -a -n "${XBU:-}" || fail "cross toolchain vars unset after fetch/build"
 
-# --- RUNG X2: build the NATIVE x86_64 toolchain on top of the cross toolchain ---
-echo ">> [N1] NATIVE x86_64 binutils 2.44 (ELF 64-bit as/ld)"
-XNBU=`mktemp -d`/native-binutils
-build_binutils_x86_64_native "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$KH_X86_64_TB" "$XNBU" || fail "could not build the NATIVE x86_64 binutils"
-echo ">> [N2] NATIVE x86_64 gcc 14.3.0 (ELF 64-bit gcc/cc1/g++)"
-XNGCCB=`mktemp -d`/native-gcc
-build_gcc_x86_64_native "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$XNBU" "$KH_X86_64_TB" "$XNGCCB" || fail "could not build the NATIVE x86_64 gcc"
-XNGCC="$XNGCCB/stage/td/store/gcc-14.3.0-x86_64-native"
+# --- RUNG X2: FETCH the NATIVE x86_64 toolchain from the subst store, else BUILD it from the cross
+# toolchain. The native binutils-2.44 + gcc-14.3.0 are input-addressed (tests/td-toolchain-x86_64-native
+# .lock, gate 419 / #264); a HIT skips the ~45-min native build. On MISS td builds them from the cross
+# toolchain and interns them at their lock-keyed paths + subst-exports them for the daily to sign+publish
+# (from-BUILD fallback — directive 1; the daily is the sole authoritative from-cross builder+publisher).
+ncstore="$snwork/native-closure-store"; ncdb="$snwork/native-closure.db"; mkdir -p "$ncstore"
+if x86_64_resolve_closure_native "$ncstore" "$ncdb"; then
+  echo ">> [subst/SKIP native] fetched the NATIVE x86_64 toolchain {binutils,gcc} at their lock paths — SKIPPED the ~45-min native build"
+else
+  echo ">> [subst/MISS native] no exposed native substitute — building the NATIVE x86_64 toolchain from the cross toolchain (directive 1)"
+  echo ">> [N1] NATIVE x86_64 binutils 2.44 (ELF 64-bit as/ld)"
+  XNBU=`mktemp -d`/native-binutils
+  build_binutils_x86_64_native "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$KH_X86_64_TB" "$XNBU" || fail "could not build the NATIVE x86_64 binutils"
+  echo ">> [N2] NATIVE x86_64 gcc 14.3.0 (ELF 64-bit gcc/cc1/g++)"
+  XNGCCB=`mktemp -d`/native-gcc
+  build_gcc_x86_64_native "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$XNBU" "$KH_X86_64_TB" "$XNGCCB" || fail "could not build the NATIVE x86_64 gcc"
+  XNGCC="$XNGCCB/stage/td/store/gcc-14.3.0-x86_64-native"
+  echo ">> [export] intern the built native binutils + gcc at their lock-keyed paths + subst-export"
+  x86_64_build_closure_native "`pwd`/.td-build-cache/x86_64-native-closure-export" "$ncstore" "$ncdb" \
+    || fail "could not intern + subst-export the native x86_64 toolchain closure"
+fi
+test -n "${XNBU:-}" -a -d "${XNBU:-/nonexistent}" -a -n "${XNGCC:-}" -a -d "${XNGCC:-/nonexistent}" \
+  || fail "native toolchain vars unset after fetch/build"
 
 echo ">> [N3] DURABLE own-root verify: the native gcc compiles + runs C/C++ from /td/store → 42"
 export XNBU XNGCC XGLIBC

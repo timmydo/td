@@ -84,6 +84,74 @@ x86_64_resolve_closure() {
   return 0
 }
 
+# ============================================================================================
+# NATIVE layer (rung X2): the same input-addressed FETCH short-circuit for the NATIVE x86_64
+# toolchain {native binutils-2.44, native gcc-14.3.0} — the ELF64 --host=x86_64 linker a /td/store
+# rust toolchain drives (#240). Keyed by tests/td-toolchain-x86_64-native.lock (gate 419 / #264),
+# DISTINCT from the cross closure above. Lets a consumer (gate 422 native-gcc, gate 416 rust) FETCH
+# the native toolchain instead of the ~45-min from-cross rebuild, with from-BUILD fallback (directive 1;
+# the daily is the sole from-cross authoritative builder + publisher). Var convention: XNBU/XNGCC point
+# at the PHYSICAL bytes ($store/<base>); baked interp/RUNPATH use the LOGICAL /td/store/<base>.
+X86_NATIVE_CLOSURE_NAMES="binutils-2.44-x86_64-native gcc-14.3.0-x86_64-native"
+X86_NATIVE_LOCK=tests/td-toolchain-x86_64-native.lock
+
+# _x86_point_native NAME PHYS — repoint the native toolchain vars at a placed component (physical path).
+_x86_point_native() {
+  case "$1" in
+    binutils-*) XNBU="$2" ;;
+    gcc-*) XNGCC="$2" ;;
+  esac
+}
+
+# x86_64_build_closure_native OUT STORE DB — for the from-BUILD path: intern the 2 BUILT native trees
+# (XNBU/XNGCC) at their lock-keyed input-addressed paths in a FRESH closure STORE, and subst-EXPORT each
+# (NAR + td-native narinfo, td-builder only — no td-subst/key) to OUT for the daily to sign+publish.
+# INTERLEAVED like the cross build_closure (store-add-input-addressed REWRITES DB to the path it added).
+# Repoints XNBU/XNGCC at the interned PHYSICAL paths for verify_x86_64_native_ownroot.
+x86_64_build_closure_native() {
+  _out=$1; _store=$2; _db=$3
+  _k=`"$TB" toolchain-key "$X86_NATIVE_LOCK"` || { echo "build_closure_native: toolchain-key failed" >&2; return 1; }
+  mkdir -p "$_out"
+  for nm in $X86_NATIVE_CLOSURE_NAMES; do
+    case "$nm" in binutils-*) src="$XNBU" ;; gcc-*) src="$XNGCC" ;; esac
+    test -n "$src" -a -d "$src" || { echo "build_closure_native: no built tree for $nm ($src)" >&2; return 1; }
+    p=`"$TB" store-add-input-addressed "$nm" "$_k" "$src" "$_store" "$_db"` \
+      || { echo "build_closure_native: store-add-input-addressed $nm failed" >&2; return 1; }
+    want=`"$TB" toolchain-path "$X86_NATIVE_LOCK" "$nm"`
+    test "$p" = "$want" || { echo "build_closure_native: $nm path $p != lock-computed $want" >&2; return 1; }
+    "$TB" subst-export "$_db" "$_store" "$_out" "$p" >/dev/null \
+      || { echo "build_closure_native: subst-export $nm ($p) failed" >&2; return 1; }
+    test -f "$_out/`basename "$p"`.narinfo" || { echo "build_closure_native: no narinfo for $nm" >&2; return 1; }
+    _x86_point_native "$nm" "$_store/`basename "$p"`"
+    echo "   [closure-native] $nm interned at lock-keyed $p + subst-exported (the daily signs + publishes it)"
+  done
+  export XNBU XNGCC
+}
+
+# x86_64_resolve_closure_native STORE DB — if a subst store is exposed (TD_SUBST_BIN+TD_SUBST_STORE),
+# resolve BOTH native components, restore them into STORE at their lock paths, and repoint XNBU/XNGCC.
+# Return 0 only if BOTH HIT; any MISS / no subst configured -> 1 (build from the cross toolchain).
+x86_64_resolve_closure_native() {
+  _store=$1; _db=$2
+  [ -n "${TD_SUBST_BIN:-}" ] && [ -n "${TD_SUBST_STORE:-}" ] || return 1
+  _shdir=`dirname "$(command -v sh)"`
+  _cu=`grep -- '-coreutils-' tests/td-subst.lock | sed 's/^[^ ]* //' | head -1`
+  _dest=`mktemp -d`
+  for nm in $X86_NATIVE_CLOSURE_NAMES; do
+    p=`env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$TD_SUBST_BIN" \
+        TD_SUBST_STORE="$TD_SUBST_STORE" TD_SUBST_PUBKEY="${TD_SUBST_PUBKEY:-tests/td-subst.pub}" \
+        TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$X86_NATIVE_LOCK" "$nm" "$_dest"` \
+      || { rm -rf "$_dest"; return 1; }   # MISS on either component → fall back to from-cross build
+    base=`basename "$p"`
+    rm -rf "$_store/$base"; cp -a "$_dest/$base" "$_store/$base"; chmod -R u+w "$_store/$base"
+    _x86_point_native "$nm" "$_store/$base"
+    echo "   [closure-native/fetch] $nm restored at /td/store/$base (ed25519 sig + StorePath==lock-path + NarHash verified)"
+  done
+  rm -rf "$_dest"
+  export XNBU XNGCC
+  return 0
+}
+
 # x86_64_bundle_tooldir GCCTREE — make the cross gcc SELF-CONTAINED for the FETCH path. The cross gcc is
 # configured --with-as/--with-ld at the build-time binutils SCRATCH dir (a mktemp path); after a cold
 # fetch that path is gone, and the closure binutils ships only the target-PREFIXED x86_64-pc-linux-gnu-
