@@ -50,55 +50,67 @@ load_recipe_eval() {
   test -x "$TD_RECIPE_EVAL" || { echo "FAIL: td-recipe-eval not executable at $TD_RECIPE_EVAL" >&2; return 1; }
 }
 
-# cached_build SPEC LOCK  — emit the recipe, build via build-recipe with caching.
+# cached_build SPEC LOCK  — emit the recipe, td-ASSEMBLE its .drv, and SUBMIT it to the ONE
+# shared build daemon (the machine-wide budget limiter — tools/build-daemon-ensure.sh; the
+# daemon caps concurrent builds across ALL agents, so N checks never oversubscribe/OOM).
 # Sets sd, out, ns, hit. Returns non-zero (with a FAIL message) on a real failure.
 cached_build() {
   _spec="$1"; _lock="$2"
   sd="$CACHE/$_spec"; mkdir -p "$sd/b" "$sd/tmp"
   : "${TD_RECIPE_EVAL:?load_recipe_eval must run before cached_build (TD_RECIPE_EVAL unset)}"
+  : "${TD_DAEMON_SOCKET:?the shared build daemon must be running (TD_DAEMON_SOCKET unset) — check.sh starts it in its host prelude}"
   "$TD_RECIPE_EVAL" emit "$_spec" > "$sd/recipe.json" \
     || { echo "FAIL: td-recipe-eval emit $_spec" >&2; return 1; }
   test -s "$sd/recipe.json" || { echo "ERROR: td-recipe-eval produced no JSON for $_spec" >&2; return 1; }
-  rm -f "$sd/b/"*.drv                       # drop any stale drv; build-recipe rewrites the current one
-  # Build with the STAGE0 builder override (brick 3): TD_BUILDER_* (set by load_stage0)
-  # ride through `env -i` so the assembled drv's builder is the td-bootstrapped stage0,
-  # not the guix-built td-builder. `: "${TB:?...}"` fails loudly if load_stage0 was skipped.
+  rm -f "$sd/b/"*.drv                       # drop any stale drv; assemble-recipe rewrites the current one
   : "${TB:?load_stage0 must run before cached_build (TB unset)}"
+  # (1) td ASSEMBLES the .drv itself (no guix (derivation …), no Guile) with the STAGE0
+  # builder override (brick 3): TD_BUILDER_* ride through `env -i` so the drv's builder is
+  # the td-bootstrapped stage0, not the guix-built td-builder (asserted below). No realize
+  # here — the daemon does that. The canonical /gnu/store .drv path lands on stderr ($sd/err),
+  # which the corpus gate's self-discrimination leg greps.
   if env -i HOME="$sd" TMPDIR="$sd/tmp" PATH="$CU/bin" \
        TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-       "$TB" build-recipe \
-       "$sd/recipe.json" "$_lock" "$sd/b" /var/guix/db/db.sqlite > "$sd/bout" 2>"$sd/err"; then :; \
-  else echo "FAIL: build-recipe $_spec (guix/Guile off PATH):" >&2; tail -20 "$sd/err" >&2; return 1; fi
-  out=`sed -n 's/^OUT=out //p' "$sd/bout"`
-  test -n "$out" || { echo "FAIL: build-recipe produced no output for $_spec" >&2; cat "$sd/err" >&2; return 1; }
-  ns="$sd/b/newstore/`basename "$out"`"
-  if grep -qx 'CACHE=hit' "$sd/bout"; then hit=1; else hit=; fi
-  # [DURABLE structural, brick 3] the assembled drv's builder is the td-bootstrapped
-  # stage0, NOT the guix-built td-builder — proves cache-lib built with stage0. Holds on
-  # a cache hit too (the drv hash covers the builder, so a hit IS a stage0-keyed drv).
-  _drvf=`ls "$sd/b/"*.drv 2>/dev/null | head -1`
-  test -n "$_drvf" || { echo "FAIL: no assembled .drv for $_spec" >&2; return 1; }
-  # Non-vacuous: TD_BUILDER_PATH must be the stage0 placement load_stage0 set (a bare
-  # grep for an empty value would match any td-builder path).
-  test -n "$TD_BUILDER_PATH" || { echo "FAIL: TD_BUILDER_PATH unset — load_stage0 did not place a stage0 builder (build used the default builder)" >&2; return 1; }
+       "$TB" assemble-recipe \
+       "$sd/recipe.json" "$_lock" "$sd/b" > "$sd/bout" 2>"$sd/err"; then :; \
+  else echo "FAIL: assemble-recipe $_spec (guix/Guile off PATH):" >&2; tail -20 "$sd/err" >&2; return 1; fi
+  _drvf=`sed -n 's/^DRV=//p' "$sd/bout"`
+  test -n "$_drvf" && [ -f "$_drvf" ] || { echo "FAIL: assemble-recipe produced no .drv for $_spec" >&2; cat "$sd/bout" "$sd/err" >&2; return 1; }
+  # [DURABLE structural, brick 3] the assembled drv's builder is the td-bootstrapped stage0,
+  # NOT the guix-built td-builder. Non-vacuous: TD_BUILDER_PATH must be the stage0 placement.
+  test -n "$TD_BUILDER_PATH" || { echo "FAIL: TD_BUILDER_PATH unset — load_stage0 did not place a stage0 builder" >&2; return 1; }
   grep -qF "$TD_BUILDER_PATH/bin/td-builder" "$_drvf" \
     || { echo "FAIL: $_spec .drv builder is not the stage0 $TD_BUILDER_PATH — built by the wrong td-builder?" >&2; return 1; }
+  # (2) SUBMIT to the shared daemon, carrying the per-request builder override (BP BS BD) so
+  # the daemon stages THIS worktree's stage0 as the drv's builder. Reply: OK <canon> <host> <hit|built>.
+  _resp=`"$TB" daemon-request "$TD_DAEMON_SOCKET" "$_drvf $TD_BUILDER_PATH $TD_BUILDER_STORE $TD_BUILDER_DB"` \
+    || { echo "FAIL: $_spec daemon build failed ($_resp) — see the daemon log" >&2; return 1; }
+  case "$_resp" in "OK "*) : ;; *) echo "FAIL: $_spec daemon build not OK: $_resp" >&2; return 1 ;; esac
+  # shellcheck disable=SC2086 -- split the OK <canon> <host> <hit|built> reply into fields
+  set -- $_resp
+  out="$2"; ns="$3"
+  test -n "$out" && [ -n "$ns" ] || { echo "FAIL: $_spec daemon reply malformed: $_resp" >&2; return 1; }
+  if [ "${4:-}" = hit ]; then hit=1; else hit=; fi
 }
 
-# cached_check SPEC — prove reproducibility, memoized: skip the td-builder check
-# double-build when the build was a cache HIT and a prior check already verified this
-# (unchanged) drv. Otherwise run the real double-build and record the verdict.
+# cached_check SPEC — prove reproducibility, memoized: skip the daemon double-build when the
+# build was a cache HIT and a prior check already verified this (unchanged) drv. Otherwise
+# submit a CHECK to the SAME shared daemon (so the repro rebuilds ALSO count against the
+# machine-wide budget instead of re-oversubscribing) and record the verdict.
 cached_check() {
   _spec="$1"
+  : "${TD_DAEMON_SOCKET:?the shared build daemon must be running (TD_DAEMON_SOCKET unset)}"
   if [ -n "$hit" ] && [ -f "$sd/b/verified-reproducible" ]; then
-    echo "  [DURABLE repro] CACHED: $_spec drv unchanged + previously verified reproducible — td-builder check skipped (verdict memoized)"
+    echo "  [DURABLE repro] CACHED: $_spec drv unchanged + previously verified reproducible — daemon double-build skipped (verdict memoized)"
     return 0
   fi
-  rm -rf "$sd/chk"
-  "$TB" check "$sd/b/"*.drv "$sd/b/closure.txt" "$sd/chk" >/dev/null 2>"$sd/chkerr" \
-    || { echo "FAIL: $_spec NOT reproducible (td-builder check):" >&2; tail -6 "$sd/chkerr" >&2; return 1; }
+  _drvf=`ls "$sd/b/"*.drv 2>/dev/null | head -1`
+  test -n "$_drvf" || { echo "FAIL: no assembled .drv for $_spec" >&2; return 1; }
+  _resp=`"$TB" daemon-request "$TD_DAEMON_SOCKET" "CHECK $_drvf $TD_BUILDER_PATH $TD_BUILDER_STORE $TD_BUILDER_DB"` \
+    || { echo "FAIL: $_spec NOT reproducible (daemon CHECK: $_resp) — see the daemon log" >&2; return 1; }
+  case "$_resp" in "OK "*) : ;; *) echo "FAIL: $_spec NOT reproducible: $_resp" >&2; return 1 ;; esac
   : > "$sd/b/verified-reproducible"
-  echo "  [DURABLE repro] td-builder check double-build agrees $_spec is reproducible"
+  echo "  [DURABLE repro] the td build daemon's double-build agrees $_spec is reproducible"
 }
 
 # cached_clean — drop this spec's transient files, KEEP $sd/b (the cache).

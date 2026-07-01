@@ -1141,7 +1141,7 @@ fn daemon_realize_one(
     drv: &str,
     store_db: &str,
     scratch_base: &Path,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, bool), String> {
     let ov = builder_override_from_env()?;
     let content = std::fs::read(drv).map_err(|e| format!("read {drv}: {e}"))?;
     let parsed = drv::parse(&content).map_err(|e| format!("parse drv {drv}: {e}"))?;
@@ -1160,12 +1160,14 @@ fn daemon_realize_one(
             "td-builder: daemon CACHE HIT for {drv} — output already valid under {}, not rebuilding",
             scr.display()
         );
-        return mk(&regs);
+        let (c, h) = mk(&regs)?;
+        return Ok((c, h, true));
     }
     eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
     let dbs = [store_db.to_string()];
     let regs = realize_drv(drv, &dbs, &scr, &[], ov.as_ref(), None)?;
-    mk(&regs)
+    let (c, h) = mk(&regs)?;
+    Ok((c, h, false))
 }
 
 /// Reproducibility double-build of ONE drv (the daemon's `CHECK` verb): realize it twice
@@ -4646,8 +4648,8 @@ fn main() -> ExitCode {
         // TD_BUILDER_* (inherited from the daemon). Usage: daemon-build|daemon-check DRV STORE-DB SCRATCH-BASE
         Some("daemon-build") if args.len() == 5 => {
             match daemon_realize_one(&args[2], &args[3], Path::new(&args[4])) {
-                Ok((canon, host)) => {
-                    println!("OK {canon} {host}");
+                Ok((canon, host, hit)) => {
+                    println!("OK {canon} {host} {}", if hit { "hit" } else { "built" });
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

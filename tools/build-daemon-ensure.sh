@@ -15,7 +15,9 @@
 #
 # Env: TD_DAEMON_DIR (shared dir), TD_DAEMON_BUILDER (a specific td-builder binary; else a
 # td-bootstrapped stage0 placement, else a host `cargo build` of builder/), TD_BUILD_JOBS
-# (the global concurrent-build budget; the daemon defaults it from cores + RAM).
+# (the global concurrent-build budget; the daemon defaults it from cores + RAM), TD_NICE
+# (nice level for the daemon + its build children, default 10 — so builds yield to
+# interactive work; the budget bounds HOW MANY run, nice bounds their priority).
 set -eu
 
 daemon_dir=${TD_DAEMON_DIR:-$HOME/.td/build-daemon}
@@ -55,7 +57,11 @@ fi
 # child so a later ensure does not block forever on the inherited flock.
 : > "$log_f"
 rm -f "$sock"
-nohup env ${TD_BUILD_JOBS:+TD_BUILD_JOBS="$TD_BUILD_JOBS"} \
+# nice/ionice the daemon so its build children (the corpus builds — the real CPU/IO) yield
+# to interactive work; the global budget bounds how MANY run at once.
+nice_wrap="nice -n ${TD_NICE:-10}"
+command -v ionice >/dev/null 2>&1 && nice_wrap="$nice_wrap ionice -c2 -n7"
+nohup $nice_wrap env ${TD_BUILD_JOBS:+TD_BUILD_JOBS="$TD_BUILD_JOBS"} \
   "$tb" daemon "$sock" "$store_db" "$store" >"$log_f" 2>&1 9>&- &
 pid=$!
 echo "$pid" > "$pid_f"

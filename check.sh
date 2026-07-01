@@ -344,6 +344,22 @@ if [ "$heavy_warm" = 1 ]; then
     wait   # drain the final batch + the local warm
   fi
 fi
+# --- Shared build daemon: the loop's SINGLE machine-wide build limiter --------------------
+# Start (or reuse) ONE shared, persistent td build daemon on the HOST before entering the
+# sandbox — it must outlive this check and be shared across every worktree/agent, so it
+# cannot live inside the ephemeral per-check sandbox (its PID namespace dies with the check).
+# The corpus build (build-recipes / cache-lib) SUBMITS drvs to it; the daemon caps concurrent
+# builds at ONE global budget (TD_BUILD_JOBS, default from cores + RAM), so N concurrent
+# checks can no longer oversubscribe the box or OOM it. host-sandbox binds its socket + store
+# into the sandbox and preserves TD_DAEMON_SOCKET. Only the heavy tier builds the corpus.
+if [ "$heavy_warm" = 1 ]; then
+  TD_DAEMON_SOCKET=$(warm sh tools/build-daemon-ensure.sh 2>/dev/null || true)
+  if [ -n "$TD_DAEMON_SOCKET" ]; then
+    export TD_DAEMON_SOCKET
+  else
+    echo "check.sh: WARNING: could not start the shared build daemon (build-daemon-ensure.sh); corpus gates will fail loudly" >&2
+  fi
+fi
 # make -j: the heavy/VM tiers (`check`, `check-system`) are capped at 2 — the DESIGN §7.3
 # two-concurrent-VMs/builds ceiling. The `check-engine` SMOKE tier runs NO VM and only
 # single-threaded builds (NIX_BUILD_CORES=1), so -j2 idles most of the box; run it HOT at
@@ -355,7 +371,14 @@ case " $* " in
   *" check-engine "*) jobs=${TD_CHECK_JOBS:-$(nproc)} ;;
   *) jobs=${TD_CHECK_JOBS:-2} ;;
 esac
-exec env \
+# nice/ionice the whole loop so it YIELDS to interactive work even at high load — the
+# durable half of "don't bring down my machine": the daemon's global budget bounds how many
+# builds run at once, and nice/ionice keeps whatever does run from starving the shell/editor
+# (and covers the toolchain/rust gates that don't route through the daemon yet). TD_NICE
+# tunes it (default 10); belt-and-suspenders with the budget, not a substitute for it.
+nice_wrap="nice -n ${TD_NICE:-10}"
+command -v ionice >/dev/null 2>&1 && nice_wrap="$nice_wrap ionice -c2 -n7"
+exec $nice_wrap env \
   PATH="$hostguix_dir:$toolchain" \
   GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
   GUIX_ENVIRONMENT="$guix_env" \
