@@ -995,6 +995,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("seed-build");
         return;
     }
+    if p == "tests/store-persist.sh" {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("store-persist");
+        return;
+    }
     if p == "tests/corpus-seed.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("corpus-seed");
