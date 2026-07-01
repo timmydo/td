@@ -1084,18 +1084,28 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // The td-builder SEED build's Rust-toolchain resolver (provision-rust) and the seed
-    // build driver feed the `bootstrap` gate (stage0 compile) and are covered behaviorally
-    // by the `provision-rust` gate (provided/rustup resolution + a provided-toolchain build).
-    if pattern_matches("tools/provision-rust.sh|tools/bootstrap-td-builder.sh", p) {
+    // The td-builder SEED build's toolchain resolvers (provision-rust = rustc/cargo,
+    // provision-cc = the C linker) and the seed build driver feed the `bootstrap` gate
+    // (stage0 compile) and are covered behaviorally by the provision-rust/provision-cc gates
+    // (provided/rustup|system resolution + a provided-toolchain build).
+    if pattern_matches(
+        "tools/provision-rust.sh|tools/provision-cc.sh|tools/bootstrap-td-builder.sh",
+        p,
+    ) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap");
         sel.add_target("provision-rust");
+        sel.add_target("provision-cc");
         return;
     }
     if p == "tests/provision-rust.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("provision-rust");
+        return;
+    }
+    if p == "tests/provision-cc.sh" {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("provision-cc");
         return;
     }
 
