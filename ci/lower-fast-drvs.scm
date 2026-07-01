@@ -13,7 +13,6 @@
 ;;   tests/typed-coverage.scm    every VALID field perturbation (the invalid
 ;;                               ones raise at construction — no derivation)
 ;;   tests/generation-diff.scm   generations 1 and 2 (sealed/verity shape)
-;;   tests/oci-diff.scm          OCI of default + ssh-port 2222
 ;;   tests/manifest-diff.scm     OCI of default, swapped (+hello), empty manifest
 ;;
 ;; DRIFT: if a rung gains a VALID perturbation that pulls NEW closure (a new
@@ -62,7 +61,8 @@
 ;; So they pull NO build closure and are deliberately absent here.
 
 ;; The operating-systems the cheap rungs lower to an OCI-IMAGE derivation.
-;; Mirrors oci-diff / manifest-diff.
+;; Mirrors manifest-diff (the OCI slice of workstream C retired the oci-diff
+;; differential; the plain OCI image is now td-native — mk/gates/120-oci.mk).
 (define %oci-systems
   (list
    td-system
