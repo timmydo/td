@@ -11,6 +11,8 @@
 //! (the mk/gates "one file, no shared line" property). PR1 keeps a single central
 //! table for reviewability; splitting it is mechanical and changes no behavior.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use crate::types::{Recipe, Source};
 
 /// Look up a recipe by `.ts` file stem (e.g. "hello", "gzip-perturbed").

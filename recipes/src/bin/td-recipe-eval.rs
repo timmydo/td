@@ -19,11 +19,13 @@ use std::process::exit;
 
 use td_recipe::{catalog, json, specs};
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn die(msg: &str) -> ! {
     eprintln!("td-recipe-eval: {msg}");
     exit(2);
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn lookup_or_die(stem: &str) -> td_recipe::types::Recipe {
     match catalog::lookup(stem) {
         Some(r) => r,
@@ -31,6 +33,7 @@ fn lookup_or_die(stem: &str) -> td_recipe::types::Recipe {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn lookup_spec_or_die(stem: &str) -> td_recipe::types::SystemSpec {
     match specs::lookup(stem) {
         Some(s) => s,
@@ -39,6 +42,7 @@ fn lookup_spec_or_die(stem: &str) -> td_recipe::types::SystemSpec {
 }
 
 // Canon-equal check against a boa-emitted JSON file (the removable oracle).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn verify_against_boa(kind: &str, stem: &str, rust_canon: &str, path: &str) {
     let boa_text =
         std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("cannot read {path}: {e}")));
@@ -55,6 +59,7 @@ fn verify_against_boa(kind: &str, stem: &str, rust_canon: &str, path: &str) {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md). This single-file network tool is not linted in the loop (the cargo-test gate's clippy leg covers only the dependency-free engine crates); the [lints] table still guards new unsafe (forbid) and enforces under a local `cargo clippy`.
+
 // td-feed — td's OWN local HTTP mirror of the artifacts this repo downloads over the
 // network. A sibling of fetch/ (td-fetch) reusing the same pure-Rust HTTP(S)+sha256 stack
 // (ureq + rustls/ring + sha2); the mirror server uses only std::net (no extra crate).

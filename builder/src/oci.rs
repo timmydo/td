@@ -31,6 +31,8 @@
 //! Scope (brick 1): pack a PREPARED rootfs directory into the archive. Laying a store
 //! CLOSURE into the rootfs (brick 2) and the load/run/oracle gate (brick 3) come next.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use crate::sha256::Sha256;
 use std::fs;
 use std::io::{self, Write};

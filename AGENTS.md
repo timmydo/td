@@ -320,6 +320,41 @@ on what*, and all working notes live in the git log + PR body.
   it — that pulls substitutes (offline/hermeticity violation).
 
 
+**Rust code** (`builder/`, `recipes/`, `fetch/`, `feed/`, `subst/`)
+
+td's Rust is defensive and minimal-surface. These rules bind **new code**;
+existing code that pre-dates them is grandfathered (a per-file `#![allow(...)]`
+header in module files, or per-item `#[allow(...)]` on a crate root's own
+fns/impls — a crate-root inner `#![allow]` would be crate-GLOBAL and silently
+exempt everything) — when you next work a grandfathered file/item substantially,
+drop its `allow` and fix it. The mechanically-checkable rules are declared as a
+`[lints]` table in every crate's `Cargo.toml` at `deny` and enforced by the
+**`cargo-test`** gate (`./check.sh cargo-test`, part of the `check-engine` smoke
+tier), which runs `cargo clippy` (then `cargo test`) offline over the
+dependency-free engine crates — a denied lint reds only on new code.
+
+- **No panics on the happy or error path.** No `unwrap()`, `expect()`, `panic!`,
+  `unreachable!`, `todo!`, or `unimplemented!`. Return `Result`/`Option` and
+  propagate with `?`. (Inline `#[cfg(test)]` code may `unwrap` — clippy does not
+  lint it.)
+- **`.get(i)` over `xs[i]`.** No indexing/slicing that can panic (`clippy::indexing_slicing`).
+- **`unsafe` is confined.** The only `unsafe` is the raw-syscall layer
+  (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`), which carry
+  `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other crate
+  `forbid`s `unsafe_code`. Do not add `unsafe` anywhere else.
+- **The engine is dependency-free.** `builder` and `recipes` carry **zero crates**
+  (pure `std`) and must stay that way — the gate fails if either `Cargo.lock` grows
+  past its one self-entry. The network tools (`fetch`/`feed`/`subst`) are the *only*
+  crates allowed dependencies, and only the vendored-through-the-cargo-proxy FSDG
+  set they already have (`ureq`/`rustls`/`sha2`/`ring`); a *new* dependency anywhere
+  is a reviewed decision (directive 6 territory), never casual.
+- **`std`, not `no_std`.** These are OS-driving userspace programs
+  (`std::fs`/`std::process`/namespace syscalls); `no_std` is out of scope.
+- **Prefer allocating off the hot path** — set buffers/collections up once rather
+  than per-iteration in a build's inner loop. This is a code-review guideline, not
+  a lint (there is no clippy check for it); don't contort code to satisfy it.
+
+
 **Commits**
   
 - **Commit messages ARE the durable record.** main takes only squash merges (merge and

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md). This single-file network tool is not linted in the loop (the cargo-test gate's clippy leg covers only the dependency-free engine crates); the [lints] table still guards new unsafe (forbid) and enforces under a local `cargo clippy`.
+
 // td-fetch — td's OWN seed fetcher (move-off-Guile §5). Two modes:
 //
 //   td-fetch fetch URL SHA256-HEX OUT   GET a pinned blob (http/https), verify its

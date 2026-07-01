@@ -4,6 +4,9 @@
 //! hand-rolled SHA-256; the rung's differential proves behavior, and the drv
 //! platform field is checked to be x86_64-linux before any of this runs).
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(unsafe_code)] // confined raw-syscall / low-level layer (AGENTS.md)
+
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-builder's sandbox is x86_64-linux only (the pinned platform)");
 

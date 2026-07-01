@@ -10,6 +10,8 @@
 //! loudly on malformed input — a mis-parsed phase must not silently build something
 //! else.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]

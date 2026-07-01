@@ -17,6 +17,8 @@
 //! Scope: 32- and 64-bit little-endian ELF (i686 + x86-64) — the bootstrap toolchain is
 //! i686, the rust/userland path is x86-64. Any other class/endianness is rejected.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use std::path::Path;
 
 // ELF identification (class-independent).
