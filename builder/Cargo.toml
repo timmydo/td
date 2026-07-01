@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 # Rust coding rules (AGENTS.md → "Rust code"): deny the panic/indexing/unsafe
 # surface for NEW code. Existing files carry a per-file `#![allow(...)]`
-# grandfather header (remove it when the file is cleaned). The rust-clippy gate
+# grandfather header (remove it when the file is cleaned). The cargo-test gate's clippy leg
 # runs `cargo clippy` over this crate offline; a denied lint reds the gate.
 [lints.rust]
 # unsafe is confined to the raw-syscall layer (src/sys.rs) and its two callers

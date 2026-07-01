@@ -16,7 +16,7 @@ ring = "0.17"
 # tier allowed dependencies (the vendored-through-the-cargo-proxy FSDG set above);
 # adding a NEW dep is a reviewed decision. The panic/indexing rules still apply;
 # existing files carry a per-file `#![allow(...)]` grandfather header. (The
-# rust-clippy loop gate lints only the dependency-free engine crates offline;
+# cargo-test gate's clippy leg lints only the dependency-free engine crates offline;
 # these fire under a local `cargo clippy`.)
 [lints.rust]
 unsafe_code = "forbid"     # no unsafe in the network tools
