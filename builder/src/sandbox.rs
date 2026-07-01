@@ -26,6 +26,9 @@
 //!     env, then NIX_BUILD_TOP/TMPDIR/TEMPDIR/TMP/TEMP/PWD — build.cc's
 //!     exact set and override order (the TMPDIR group wins over drv env).
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(unsafe_code)] // confined raw-syscall / low-level layer (AGENTS.md)
+
 use std::ffi::CString;
 use std::fs;
 use std::io;

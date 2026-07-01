@@ -16,6 +16,8 @@
 //! match on one would surface as a references mismatch in the differential,
 //! red and diagnosable, never silently dropped.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 

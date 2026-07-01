@@ -11,5 +11,23 @@ path = "src/main.rs"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 sha2 = "0.10"
 
+# Rust coding rules (AGENTS.md → "Rust code"). This is a NETWORK tool — the only
+# tier allowed dependencies (the vendored-through-the-cargo-proxy FSDG set above);
+# adding a NEW dep is a reviewed decision. The panic/indexing rules still apply;
+# existing files carry a per-file `#![allow(...)]` grandfather header. (The
+# rust-clippy loop gate lints only the dependency-free engine crates offline;
+# these fire under a local `cargo clippy`.)
+[lints.rust]
+unsafe_code = "forbid"     # no unsafe in the network tools
+
+[lints.clippy]
+unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?
+expect_used = "deny"       # no panicking .expect()
+panic = "deny"             # no panic! on the happy/error path
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
+
 [profile.release]
 strip = true

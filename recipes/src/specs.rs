@@ -6,6 +6,8 @@
 //! such variant), so rustc rejects it at compile time, subsuming the boa/tsc
 //! negative control.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use crate::types::{PersistenceTier, PersistentPath, RootFsType, SystemSpec};
 
 /// Look up a system spec by `.ts` file stem (e.g. "v0", "perturbed", "gen1").

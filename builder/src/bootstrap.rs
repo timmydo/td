@@ -24,6 +24,8 @@
 //! asserts. The shell `tests/bootstrap-*.sh` stay the live driver + removable
 //! differential oracle (no cutover — same scoping as C1 #226).
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use crate::sha256::{to_base16, Sha256};
 use std::fs::{self, File};
 use std::io::{self, Read};

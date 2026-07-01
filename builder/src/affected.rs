@@ -24,6 +24,8 @@
 //! git repo), so it is CWD-robust. The library functions take an explicit `root` so
 //! tests are CWD-independent.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 

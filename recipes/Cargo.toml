@@ -19,5 +19,23 @@ path = "src/bin/td-recipe-eval.rs"
 # crate closure is needed — this is the whole point of moving the recipe surface
 # off boa (a JS engine + its crate tree leaves the loop).
 
+# Rust coding rules (AGENTS.md → "Rust code"): deny the panic/indexing/unsafe
+# surface for NEW code. Existing files carry a per-file `#![allow(...)]`
+# grandfather header (remove it when the file is cleaned). The rust-clippy gate
+# runs `cargo clippy` over this crate offline; a denied lint reds the gate.
+[lints.rust]
+# This crate has no unsafe and must stay that way — forbid (cannot be re-enabled
+# by an inner #![allow]).
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?
+expect_used = "deny"       # no panicking .expect()
+panic = "deny"             # no panic! on the happy/error path
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
+
 [profile.release]
 # Explicit + minimal so a future reproducibility oracle has a stable target.
