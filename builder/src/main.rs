@@ -346,6 +346,162 @@ fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// MERGE built outputs into a PERSISTENT store DB — the accumulating dual of
+/// `write_output_db`'s clobber. Given the EXISTING db bytes (None for the first
+/// commit) and the NEW outputs, union their `ValidPaths` + `Refs` into one db and
+/// return the serialized bytes. This is what makes a td store *persistent*: a build
+/// adds its result to a store that already holds prior builds' results, instead of
+/// every build writing a fresh single-output db. The daemon's accumulating
+/// `ValidPaths`/`Refs` authority across SEPARATE builds, in pure Rust.
+///
+/// The store PATH is the identity:
+///   - re-committing the same output is IDEMPOTENT (one row; the bytes are
+///     byte-deterministic, so a re-merge of the same set reproduces them exactly);
+///   - a path first seen only as another output's *reference* is a SCAFFOLD row
+///     (path, no hash) and is UPGRADED in place to a full row when a later commit
+///     registers it for real;
+///   - rowids are assigned in sorted-path order, so the db is deterministic
+///     regardless of commit order.
+/// Mirrors `store-gc-sweep`'s renumber-and-remap-Refs rewrite (its additive dual):
+/// reads with the td reader, writes with the td writer, no daemon, no sqlite engine.
+/// Scope is the GC/closure authority — `ValidPaths` + `Refs`; a persistent commit DB
+/// does not carry `DerivationOutputs` (as `store-gc-sweep`'s swept DB does not: the
+/// drv→output mapping is rebuilt by registration, not by accumulation).
+fn merge_regs(existing: Option<&[u8]>, new_regs: &[OutputReg]) -> Result<Vec<u8>, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use store_db::{Table, Value as WV};
+    use store_db_read::{Db, Value as RV};
+    // One accumulated record per path: full fields when known, else scaffold (None).
+    struct Rec {
+        hash: Option<String>,
+        deriver: Option<String>,
+        size: Option<u64>,
+        refs: BTreeSet<String>,
+    }
+    let mut recs: BTreeMap<String, Rec> = BTreeMap::new();
+    fn ensure<'a>(recs: &'a mut BTreeMap<String, Rec>, p: &str) -> &'a mut Rec {
+        recs.entry(p.to_string()).or_insert_with(|| Rec {
+            hash: None,
+            deriver: None,
+            size: None,
+            refs: BTreeSet::new(),
+        })
+    }
+    // 1) Fold in the existing db (if this is not the first commit).
+    if let Some(bytes) = existing {
+        let db = Db::open(bytes.to_vec())?;
+        let mut path_of: BTreeMap<i64, String> = BTreeMap::new();
+        for (rowid, cols) in db.table("ValidPaths")? {
+            let path = match cols.get(1) {
+                Some(RV::Text(p)) => p.clone(),
+                _ => continue,
+            };
+            path_of.insert(rowid, path.clone());
+            let r = ensure(&mut recs, &path);
+            if let Some(RV::Text(h)) = cols.get(2) {
+                if !h.is_empty() {
+                    r.hash = Some(h.clone());
+                }
+            }
+            if let Some(RV::Text(d)) = cols.get(4) {
+                if !d.is_empty() {
+                    r.deriver = Some(d.clone());
+                }
+            }
+            if let Some(RV::Int(s)) = cols.get(5) {
+                r.size = Some(*s as u64);
+            }
+        }
+        for (_rid, cols) in db.table("Refs")? {
+            if let (Some(RV::Int(a)), Some(RV::Int(b))) = (cols.first(), cols.get(1)) {
+                if let (Some(ap), Some(bp)) = (path_of.get(a), path_of.get(b)) {
+                    let (ap, bp) = (ap.clone(), bp.clone());
+                    ensure(&mut recs, &bp); // a referenced path is at least a scaffold
+                    ensure(&mut recs, &ap).refs.insert(bp);
+                }
+            }
+        }
+    }
+    // 2) Union the new outputs — each a full row; its refs are at least scaffolds.
+    for reg in new_regs {
+        {
+            let r = ensure(&mut recs, &reg.store_path);
+            r.hash = Some(reg.nar_hash.clone());
+            r.deriver = Some(reg.deriver.clone());
+            r.size = Some(reg.nar_size);
+        }
+        for rf in &reg.refs {
+            ensure(&mut recs, rf);
+            ensure(&mut recs, &reg.store_path).refs.insert(rf.clone());
+        }
+    }
+    // 3) Assign rowids in sorted-path order (BTreeMap iterates sorted → deterministic).
+    // `id_of` resolves a reference's TARGET path to its rowid; a row's OWN id is just
+    // its (sorted) position, so the loop uses the enumerate index for that directly.
+    let id_of: BTreeMap<&str, i64> = recs
+        .keys()
+        .enumerate()
+        .map(|(i, p)| (p.as_str(), i as i64 + 1))
+        .collect();
+    let mut valid: Vec<(i64, Vec<WV>)> = Vec::with_capacity(recs.len());
+    let mut ref_rows: Vec<(i64, Vec<WV>)> = Vec::new();
+    let mut rid = 1i64;
+    for (i, (p, r)) in recs.iter().enumerate() {
+        let myid = i as i64 + 1;
+        // registrationTime is the same fixed sentinel write_output_db uses (excluded
+        // from the daemon differential); a scaffold (no hash) keeps it NULL too.
+        let (regtime, deriver, size) = match &r.hash {
+            Some(_) => (
+                WV::Int(1),
+                r.deriver.clone().map(WV::Text).unwrap_or(WV::Null),
+                r.size.map(|s| WV::Int(s as i64)).unwrap_or(WV::Null),
+            ),
+            None => (WV::Null, WV::Null, WV::Null),
+        };
+        valid.push((
+            myid,
+            vec![
+                WV::Null, // id (integer primary key) — rowid is the id
+                WV::Text(p.clone()),
+                r.hash.clone().map(WV::Text).unwrap_or(WV::Null),
+                regtime,
+                deriver,
+                size,
+            ],
+        ));
+        for rf in &r.refs {
+            ref_rows.push((rid, vec![WV::Int(myid), WV::Int(id_of[rf.as_str()])]));
+            rid += 1;
+        }
+    }
+    let tables = [
+        Table {
+            name: "ValidPaths",
+            sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+            rows: valid,
+        },
+        Table {
+            name: "Refs",
+            sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+            rows: ref_rows,
+        },
+    ];
+    Ok(store_db::write_db(&tables))
+}
+
+/// Read-modify-write `merge_regs` against an on-disk persistent DB: load DEST-DB if
+/// it exists (a missing file = the first commit), union the NEW outputs in, write it
+/// back. The store dir's bytes are interned by the caller (`store-commit`).
+fn merge_output_db(dest_db: &Path, new_regs: &[OutputReg]) -> Result<(), String> {
+    let existing = match std::fs::read(dest_db) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("read {}: {e}", dest_db.display())),
+    };
+    let bytes = merge_regs(existing.as_deref(), new_regs)?;
+    std::fs::write(dest_db, bytes).map_err(|e| format!("write {}: {e}", dest_db.display()))
+}
+
 /// Execute DRV in a userns sandbox against CLOSURE (the staged input store paths,
 /// one per line) and write a registration record — `path` / `nar-hash` /
 /// `nar-size` / `reference`* / `deriver` per output — to SCRATCH/registration,
@@ -392,7 +548,6 @@ fn build_and_register(
         .map(|e| sandbox::split_closure_entry(e).0.to_string())
         .collect();
     candidates.extend(parsed.outputs.iter().map(|o| o.path.clone()));
-    let mut record = String::new();
     let mut regs: Vec<OutputReg> = Vec::new();
     for (name, host) in &outputs {
         let store_path = &parsed
@@ -404,13 +559,6 @@ fn build_and_register(
         let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
         nar::write_nar(&mut scanner, host).map_err(|e| e.to_string())?;
         let (hash, size, refs) = scanner.finish();
-        record.push_str(&format!("path {store_path}\n"));
-        record.push_str(&format!("nar-hash {hash}\n"));
-        record.push_str(&format!("nar-size {size}\n"));
-        for r in &refs {
-            record.push_str(&format!("reference {r}\n"));
-        }
-        record.push_str(&format!("deriver {deriver}\n\n"));
         println!("OUT={name} {store_path}");
         regs.push(OutputReg {
             store_path: store_path.clone(),
@@ -420,8 +568,202 @@ fn build_and_register(
             deriver: deriver.clone(),
         });
     }
-    std::fs::write(scratch.join("registration"), record).map_err(|e| e.to_string())?;
+    std::fs::write(scratch.join("registration"), registration_text(&regs))
+        .map_err(|e| e.to_string())?;
     Ok(regs)
+}
+
+/// Serialize per-output registration records into a SCRATCH/registration blob — the
+/// inverse of `parse_registration_blocks` (`parse(registration_text(regs)) == regs`).
+/// One `path`/`nar-hash`/`nar-size`/`reference`*/`deriver` block per output, blank-line
+/// separated. Written by `build_and_register` after a real build and by a
+/// persistent-store read-back (so a fresh scratch that reused a prior build's output
+/// still carries the same registration a real build would have).
+fn registration_text(regs: &[OutputReg]) -> String {
+    let mut record = String::new();
+    for r in regs {
+        record.push_str(&format!("path {}\n", r.store_path));
+        record.push_str(&format!("nar-hash {}\n", r.nar_hash));
+        record.push_str(&format!("nar-size {}\n", r.nar_size));
+        for rf in &r.refs {
+            record.push_str(&format!("reference {rf}\n"));
+        }
+        record.push_str(&format!("deriver {}\n\n", r.deriver));
+    }
+    record
+}
+
+/// Intern a finished build SCRATCH (its `registration` + `newstore/<base>` trees) into a
+/// PERSISTENT store and MERGE its registration into the accumulating DB — the build-into
+/// half of an incremental store. Idempotent (a content path already present is a no-op).
+/// Shared by the `store-commit` subcommand and build-recipe's persistent-store build-into.
+fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result<Vec<String>, String> {
+    let reg = std::fs::read_to_string(scratch.join("registration")).map_err(|e| {
+        format!("read {}/registration: {e} (build into this scratch first)", scratch.display())
+    })?;
+    let regs = parse_registration_blocks(&reg);
+    if regs.is_empty() {
+        return Err("no outputs in the registration to commit".to_string());
+    }
+    std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+    let newstore = scratch.join("newstore");
+    let mut committed = Vec::with_capacity(regs.len());
+    for r in &regs {
+        let base = r
+            .store_path
+            .rsplit('/')
+            .next()
+            .filter(|_| store::name_from_store_path(&r.store_path).is_some())
+            .ok_or_else(|| format!("output {} is not a store path", r.store_path))?;
+        let src = newstore.join(base);
+        if !src.exists() {
+            return Err(format!("output tree missing under {}", src.display()));
+        }
+        let dest = Path::new(store_dir).join(base);
+        // The store path is content-addressed, so an entry already present is the same
+        // bytes — committing is idempotent (skip the copy).
+        if !dest.exists() {
+            copy_canonical(&src, &dest)?;
+        }
+        committed.push(r.store_path.clone());
+    }
+    merge_output_db(db, &regs)?;
+    Ok(committed)
+}
+
+/// Persistent-store build cache — like `cached_realization`, but keyed on a PERSISTENT
+/// store (dir + accumulating DB) that survives ACROSS invocations (the incremental
+/// /td/store). If EVERY output of PARSED is a full valid path in PERSIST_DB whose tree
+/// under PERSIST_STORE re-serializes to the recorded NAR hash, a PRIOR invocation already
+/// built it: stage each output tree into SCRATCH/newstore, and return the read-back regs
+/// (the caller writes SCRATCH/registration + td.db from them) — so the build is SKIPPED.
+/// Any missing/mismatched output ⇒ None (rebuild), and any tree staged so far is unwound.
+/// The daemon's valid-path skip, sourced across process boundaries from an on-disk store.
+fn persistent_realization(
+    parsed: &drv::Derivation,
+    persist_store: &str,
+    persist_db: &Path,
+    scratch: &Path,
+) -> Result<Option<Vec<OutputReg>>, String> {
+    use store_db_read::{Db, Value as RV};
+    let bytes = match std::fs::read(persist_db) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {e}", persist_db.display())),
+    };
+    let db = Db::open(bytes)?;
+    // Fully-registered paths (hash present) → (hash, narSize, deriver).
+    let mut full: std::collections::HashMap<String, (String, u64, String)> =
+        std::collections::HashMap::new();
+    for (_rid, cols) in db.table("ValidPaths")? {
+        if let (Some(RV::Text(p)), Some(RV::Text(h))) = (cols.get(1), cols.get(2)) {
+            if h.is_empty() {
+                continue;
+            }
+            let size = match cols.get(5) {
+                Some(RV::Int(s)) => *s as u64,
+                _ => 0,
+            };
+            let deriver = match cols.get(4) {
+                Some(RV::Text(d)) => d.clone(),
+                _ => String::new(),
+            };
+            full.insert(p.clone(), (h.clone(), size, deriver));
+        }
+    }
+    let refs_map = db.refs_by_path()?;
+    let newstore = scratch.join("newstore");
+    std::fs::create_dir_all(&newstore).map_err(|e| e.to_string())?;
+    let mut out: Vec<OutputReg> = Vec::with_capacity(parsed.outputs.len());
+    let mut staged: Vec<std::path::PathBuf> = Vec::new();
+    // A partial hit (some outputs found, then a miss) must not leave half the outputs
+    // staged in newstore (the rebuild would build ON them) — unwind before returning None.
+    fn unwind(staged: &[std::path::PathBuf]) {
+        for d in staged {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+    for o in &parsed.outputs {
+        let (hash, size, deriver) = match full.get(&o.path) {
+            Some(x) => x.clone(),
+            None => {
+                unwind(&staged);
+                return Ok(None);
+            }
+        };
+        let base = match o.path.rsplit('/').next() {
+            Some(b) => b,
+            None => {
+                unwind(&staged);
+                return Ok(None);
+            }
+        };
+        let src = Path::new(persist_store).join(base);
+        if !src.exists() {
+            unwind(&staged);
+            return Ok(None);
+        }
+        let refs: Vec<String> = refs_map.get(&o.path).cloned().unwrap_or_default();
+        // Integrity: the persistent tree must re-serialize to the recorded hash — a
+        // corrupt/partial persistent entry is a MISS (rebuild), never trusted.
+        let mut scanner = scan::Scanner::new(&refs).map_err(|e| e.to_string())?;
+        nar::write_nar(&mut scanner, &src).map_err(|e| e.to_string())?;
+        let (got, _, _) = scanner.finish();
+        if got != hash {
+            unwind(&staged);
+            return Ok(None);
+        }
+        let dest = newstore.join(base);
+        if dest.exists() {
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+        copy_canonical(&src, &dest)?;
+        staged.push(dest);
+        out.push(OutputReg {
+            store_path: o.path.clone(),
+            nar_hash: hash,
+            nar_size: size,
+            refs,
+            deriver,
+        });
+    }
+    Ok(Some(out))
+}
+
+/// Parse a SCRATCH/registration blob into per-output records. The blob is the
+/// `path`/`nar-hash`/`nar-size`/`reference`*/`deriver` blocks `build_and_register`
+/// writes — one block per output, a `path ` line opening each. Order is preserved.
+/// Shared by `cached_realization` (the build cache) and `store-commit` (interning a
+/// finished build into the persistent store), so both read the registration the same way.
+fn parse_registration_blocks(text: &str) -> Vec<OutputReg> {
+    let mut recs: Vec<OutputReg> = Vec::new();
+    let mut cur: Option<OutputReg> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("path ") {
+            if let Some(r) = cur.take() {
+                recs.push(r);
+            }
+            cur = Some(OutputReg {
+                store_path: p.to_string(),
+                nar_hash: String::new(),
+                nar_size: 0,
+                refs: Vec::new(),
+                deriver: String::new(),
+            });
+        } else if let (Some(r), Some(h)) = (cur.as_mut(), line.strip_prefix("nar-hash ")) {
+            r.nar_hash = h.to_string();
+        } else if let (Some(r), Some(s)) = (cur.as_mut(), line.strip_prefix("nar-size ")) {
+            r.nar_size = s.parse().unwrap_or(0);
+        } else if let (Some(r), Some(rf)) = (cur.as_mut(), line.strip_prefix("reference ")) {
+            r.refs.push(rf.to_string());
+        } else if let (Some(r), Some(d)) = (cur.as_mut(), line.strip_prefix("deriver ")) {
+            r.deriver = d.to_string();
+        }
+    }
+    if let Some(r) = cur {
+        recs.push(r);
+    }
+    recs
 }
 
 /// Content-addressed build cache. The assembled `.drv` path is DETERMINISTIC (its
@@ -441,36 +783,10 @@ fn cached_realization(
         Ok(s) => s,
         Err(_) => return Ok(None), // never built here
     };
-    // Parse the registration blocks (`path`/`nar-hash`/`nar-size`/`reference`*/`deriver`).
-    let mut recs: std::collections::HashMap<String, OutputReg> = std::collections::HashMap::new();
-    let mut cur: Option<OutputReg> = None;
-    let commit = |cur: &mut Option<OutputReg>,
-                  recs: &mut std::collections::HashMap<String, OutputReg>| {
-        if let Some(r) = cur.take() {
-            recs.insert(r.store_path.clone(), r);
-        }
-    };
-    for line in reg.lines() {
-        if let Some(p) = line.strip_prefix("path ") {
-            commit(&mut cur, &mut recs);
-            cur = Some(OutputReg {
-                store_path: p.to_string(),
-                nar_hash: String::new(),
-                nar_size: 0,
-                refs: Vec::new(),
-                deriver: String::new(),
-            });
-        } else if let (Some(r), Some(h)) = (cur.as_mut(), line.strip_prefix("nar-hash ")) {
-            r.nar_hash = h.to_string();
-        } else if let (Some(r), Some(s)) = (cur.as_mut(), line.strip_prefix("nar-size ")) {
-            r.nar_size = s.parse().unwrap_or(0);
-        } else if let (Some(r), Some(rf)) = (cur.as_mut(), line.strip_prefix("reference ")) {
-            r.refs.push(rf.to_string());
-        } else if let (Some(r), Some(d)) = (cur.as_mut(), line.strip_prefix("deriver ")) {
-            r.deriver = d.to_string();
-        }
-    }
-    commit(&mut cur, &mut recs);
+    let recs: std::collections::HashMap<String, OutputReg> = parse_registration_blocks(&reg)
+        .into_iter()
+        .map(|r| (r.store_path.clone(), r))
+        .collect();
 
     let newstore = scratch.join("newstore");
     let mut out: Vec<OutputReg> = Vec::with_capacity(parsed.outputs.len());
@@ -933,6 +1249,7 @@ fn build_recipe(
     vendor_store: Option<(&str, &str, &str)>,
     builder_store: Option<(&str, &str, &str)>,
     td_store: Option<&Path>,
+    persist: Option<(&str, &str)>,
 ) -> Result<Vec<OutputReg>, String> {
     // A td-OWNED builder (optional, bootstrap brick 2): the drv's `builder` is a stage0
     // td-builder td placed at `canonical` (store-add-builder), restored under store_dir,
@@ -1009,6 +1326,29 @@ fn build_recipe(
         println!("CACHE=hit");
         return Ok(regs);
     }
+    // PERSISTENT-STORE skip (opt-in, TD_PERSIST_STORE/TD_PERSIST_DB): an incremental
+    // store that survives ACROSS invocations (the /td/store the loop builds into). If
+    // this exact (deterministic) drv's output is already a valid path there — a PRIOR
+    // invocation built it — and its tree re-verifies, read it back instead of rebuilding.
+    // The daemon's valid-path skip, backed by an on-disk store across process boundaries.
+    if let Some((ps, pd)) = persist {
+        if let Some(regs) = persistent_realization(&parsed, ps, Path::new(pd), scratch)? {
+            eprintln!(
+                "td-builder: build-recipe PERSISTENT-STORE HIT for {drv_path} — {} output(s) already valid under {ps}; skipping the build",
+                regs.len()
+            );
+            for (o, r) in parsed.outputs.iter().zip(&regs) {
+                println!("OUT={} {}", o.name, r.store_path);
+            }
+            // A fresh scratch reusing a prior build's output still needs the registration
+            // + td.db a real build writes (downstream staging / a later store-commit).
+            std::fs::write(scratch.join("registration"), registration_text(&regs))
+                .map_err(|e| e.to_string())?;
+            write_output_db(&regs, &scratch.join("td.db"))?;
+            println!("CACHE=persist");
+            return Ok(regs);
+        }
+    }
     // SUBSTITUTE-OR-BUILD (opt-in, TD_SUBST_URL): fetch the outputs from a substitute
     // server instead of building. OFF for the verification loop — it never sets the env,
     // so this is a no-op there (directive 1: the loop always builds from source + --check).
@@ -1034,6 +1374,16 @@ fn build_recipe(
         builder_override.as_ref(),
         td_store,
     )?;
+    // PERSISTENT-STORE build-into: commit the freshly-built output(s) into the
+    // incremental store so a LATER invocation reads them back (the skip above) —
+    // build-into / read-back across builds, no daemon.
+    if let Some((ps, pd)) = persist {
+        commit_scratch_to_store(scratch, ps, Path::new(pd))?;
+        eprintln!(
+            "td-builder: build-recipe committed {} output(s) into the persistent store {ps}",
+            regs.len()
+        );
+    }
     println!("CACHE=miss");
     Ok(regs)
 }
@@ -1335,6 +1685,7 @@ fn build_plan(plan_file: &str, guix_db: &str, scratch: &Path) -> Result<(), Stri
             None,            // vendor_store: build-plan deps are not vendored-crate trees
             None,            // builder_store: build-plan uses the guix-built builder
             Some(&tdstore),  // td_store: stage td-built deps from the shared td-store
+            None,            // persist: build-plan owns its own in-run td-store
         )?;
         // Single-output recipes (the gnu corpus): the dep is regs[0].
         let out = regs
@@ -3667,6 +4018,34 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-store-db: COMMIT a finished build into a PERSISTENT td store — the
+        // build-into half of an accumulating store+DB that survives across separate
+        // `td-builder` invocations (vs the per-build scratch a one-shot build leaves).
+        // Given a build SCRATCH (its `registration` + `newstore/<base>` trees, as
+        // `build-recipe`/`realize` write), INTERN each output tree into STORE-DIR at
+        // its basename (idempotent — a content path already present is a no-op) and
+        // MERGE its registration into DB (the accumulating `ValidPaths`/`Refs`, via
+        // `merge_output_db`) instead of clobbering. A later, SEPARATE invocation then
+        // reads those outputs back out of STORE-DIR + DB (store-query/store-verify/
+        // store-closure) — build-into / read-back across builds, no daemon. Usage:
+        //   store-commit STORE-DIR DB SCRATCH
+        Some("store-commit") if args.len() == 5 => {
+            let (store_dir, db_path, scratch) = (&args[2], &args[3], &args[4]);
+            let run =
+                || commit_scratch_to_store(Path::new(scratch), store_dir, Path::new(db_path));
+            match run() {
+                Ok(paths) => {
+                    for p in paths {
+                        println!("{p}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-commit: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // toolchain stable key: print the INPUT key of a td-toolchain.lock — sha256 over
         // its declared inputs (sources + patches + name + recipe-rev), order-independent.
         // The input-addressed toolchain path (toolchain-path) is named by this key, so it
@@ -4189,7 +4568,18 @@ fn main() -> ExitCode {
             // identical (same drv, same output).
             let seed_store = std::env::var("TD_SEED_STORE").ok();
             let seed_db = std::env::var("TD_SEED_DB").ok();
+            // Optional PERSISTENT store (the incremental /td/store the loop builds into):
+            // set TD_PERSIST_STORE + TD_PERSIST_DB together and the build reads an
+            // already-built output back from there (skip) or, on a miss, commits its fresh
+            // output into it (build-into) — build-into / read-back across invocations.
+            let persist_store = std::env::var("TD_PERSIST_STORE").ok().filter(|s| !s.is_empty());
+            let persist_db = std::env::var("TD_PERSIST_DB").ok().filter(|s| !s.is_empty());
             let run = || -> Result<(), String> {
+                let persist = match (&persist_store, &persist_db) {
+                    (Some(s), Some(d)) => Some((s.as_str(), d.as_str())),
+                    (None, None) => None,
+                    _ => return Err("TD_PERSIST_STORE/TD_PERSIST_DB must be set together".into()),
+                };
                 let builder_store = match (&bp, &bs, &bd) {
                     (Some(p), Some(s), Some(d)) => Some((p.as_str(), s.as_str(), d.as_str())),
                     (None, None, None) => None,
@@ -4228,6 +4618,7 @@ fn main() -> ExitCode {
                     vendor_store,
                     builder_store,
                     td_store,
+                    persist,
                 )
                 .map(|_| ())
             };
@@ -4819,6 +5210,218 @@ memchr-2.7.crate /gnu/store/ddd-memchr.crate
         assert!(seed.contains("# a comment line, kept verbatim\n"), "comment kept:\n{seed}");
         assert!(seed.contains("rust /gnu/store/aaa-rust-1.0\n"), "rust seed kept:\n{seed}");
         assert!(seed.contains("coreutils /gnu/store/bbb-coreutils-9.1\n"), "coreutils kept:\n{seed}");
+    }
+
+    // ---- persistent accumulating store DB (merge_regs) ----------------------
+    // These are the durable, daemon-free proof that a td store ACCUMULATES across
+    // builds: merge_regs takes the existing db bytes + new outputs and returns a db
+    // that holds BOTH, by store path. (The heavy `store-persist` gate exercises the
+    // same path end-to-end with a real build across separate invocations.)
+
+    fn reg(path: &str, hash: &str, refs: &[&str]) -> OutputReg {
+        OutputReg {
+            store_path: path.to_string(),
+            nar_hash: hash.to_string(),
+            nar_size: 42,
+            refs: refs.iter().map(|s| s.to_string()).collect(),
+            deriver: format!("{path}.drv"),
+        }
+    }
+    // A path's full ValidPaths row (rowid + hash) or None if it is only a scaffold.
+    fn full_row(db: &store_db_read::Db, path: &str) -> Option<(i64, String)> {
+        for (rowid, cols) in db.table("ValidPaths").unwrap() {
+            if let (Some(store_db_read::Value::Text(p)), Some(store_db_read::Value::Text(h))) =
+                (cols.get(1), cols.get(2))
+            {
+                if p == path && !h.is_empty() {
+                    return Some((rowid, h.clone()));
+                }
+            }
+        }
+        None
+    }
+    fn sorted_closure(db: &store_db_read::Db, root: &str) -> Vec<String> {
+        let mut c = db.closure(root).unwrap();
+        c.sort();
+        c
+    }
+
+    const A: &str = "/gnu/store/00000000000000000000000000000000-a";
+    const B: &str = "/gnu/store/11111111111111111111111111111111-b";
+    const X: &str = "/gnu/store/22222222222222222222222222222222-x";
+
+    #[test]
+    fn merge_into_empty_registers_output_and_scaffold_ref() {
+        // First commit (no existing db): A (full) referencing X (scaffold).
+        let bytes = merge_regs(None, &[reg(A, "hashA", &[X])]).unwrap();
+        let db = store_db_read::Db::open(bytes).unwrap();
+        assert_eq!(full_row(&db, A).map(|r| r.1), Some("hashA".to_string()));
+        assert!(full_row(&db, X).is_none(), "a bare reference is a scaffold (no hash)");
+        assert_eq!(sorted_closure(&db, A), vec![A.to_string(), X.to_string()]);
+    }
+
+    #[test]
+    fn merge_accumulates_across_commits_without_clobbering() {
+        // Commit A, then commit B (referencing A) into the SAME db: BOTH survive.
+        // This is the accumulation property a fresh-write (clobber) lacks — the
+        // verified-red is exactly "make merge ignore `existing` → A vanishes here".
+        let db1 = merge_regs(None, &[reg(A, "hashA", &[])]).unwrap();
+        let db2 = merge_regs(Some(&db1), &[reg(B, "hashB", &[A])]).unwrap();
+        let db = store_db_read::Db::open(db2).unwrap();
+        assert_eq!(full_row(&db, A).map(|r| r.1), Some("hashA".to_string()), "A NOT clobbered by B's commit");
+        assert_eq!(full_row(&db, B).map(|r| r.1), Some("hashB".to_string()));
+        // B's closure spans the earlier-committed A (read-back across commits).
+        assert_eq!(sorted_closure(&db, B), vec![A.to_string(), B.to_string()]);
+    }
+
+    #[test]
+    fn merge_is_idempotent_and_byte_deterministic() {
+        // Re-committing the same set reproduces the bytes exactly (sorted rowids),
+        // so a redundant commit is a safe no-op on the db.
+        let once = merge_regs(None, &[reg(A, "hashA", &[X]), reg(B, "hashB", &[A])]).unwrap();
+        let twice = merge_regs(Some(&once), &[reg(A, "hashA", &[X]), reg(B, "hashB", &[A])]).unwrap();
+        assert_eq!(once, twice, "re-merging the same outputs must be byte-identical");
+        // Commit ORDER must not matter either (rowids assigned by sorted path).
+        let other = merge_regs(None, &[reg(B, "hashB", &[A]), reg(A, "hashA", &[X])]).unwrap();
+        assert_eq!(once, other, "merge result is independent of commit order");
+    }
+
+    #[test]
+    fn merge_upgrades_scaffold_to_full_row() {
+        // A appears first only as B's reference (scaffold), then is committed for
+        // real: its row gains the hash in place (no duplicate path row).
+        let db1 = merge_regs(None, &[reg(B, "hashB", &[A])]).unwrap();
+        assert!(full_row(&store_db_read::Db::open(db1.clone()).unwrap(), A).is_none());
+        let db2 = merge_regs(Some(&db1), &[reg(A, "hashA", &[])]).unwrap();
+        let db = store_db_read::Db::open(db2).unwrap();
+        assert_eq!(full_row(&db, A).map(|r| r.1), Some("hashA".to_string()), "scaffold A upgraded to full");
+        let a_rows = db
+            .table("ValidPaths")
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| matches!(c.get(1), Some(store_db_read::Value::Text(p)) if p == A))
+            .count();
+        assert_eq!(a_rows, 1, "A is a single row, not duplicated");
+        // B's edge to A is preserved through the upgrade.
+        assert_eq!(sorted_closure(&db, B), vec![A.to_string(), B.to_string()]);
+    }
+
+    #[test]
+    fn registration_text_round_trips_through_parse() {
+        // registration_text is the inverse of parse_registration_blocks — a
+        // persistent-store read-back writes it so a fresh scratch carries the same
+        // registration a real build would (incl. an empty deriver, e.g. a source).
+        let regs = vec![
+            reg(A, "sha256:aa", &[X]),
+            OutputReg {
+                store_path: B.to_string(),
+                nar_hash: "sha256:bb".to_string(),
+                nar_size: 7,
+                refs: vec![],
+                deriver: String::new(),
+            },
+        ];
+        let parsed = parse_registration_blocks(&registration_text(&regs));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].store_path, A);
+        assert_eq!(parsed[0].nar_hash, "sha256:aa");
+        assert_eq!(parsed[0].nar_size, 42);
+        assert_eq!(parsed[0].refs, vec![X.to_string()]);
+        assert_eq!(parsed[0].deriver, format!("{A}.drv"));
+        assert_eq!(parsed[1].store_path, B);
+        assert_eq!(parsed[1].deriver, "", "an empty deriver round-trips");
+    }
+
+    fn one_output_drv(out_path: &str) -> drv::Derivation {
+        drv::Derivation {
+            outputs: vec![drv::Output {
+                name: "out".to_string(),
+                path: out_path.to_string(),
+                hash_algo: String::new(),
+                hash: String::new(),
+            }],
+            input_drvs: vec![],
+            input_srcs: vec![],
+            platform: String::new(),
+            builder: String::new(),
+            args: vec![],
+            env: vec![],
+        }
+    }
+
+    #[test]
+    fn persistent_realization_hits_stages_and_rejects_miss_or_corrupt() {
+        // The cross-invocation SKIP: an output already valid in a persistent store (DB +
+        // a tree that re-verifies) is read back (staged into scratch/newstore); an unknown
+        // output or a tampered tree is a MISS (rebuild), and a corrupt miss stages nothing.
+        let tmp = std::env::temp_dir().join(format!("td-persist-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let base = "00000000000000000000000000000abc-persist-demo-1";
+        let path = format!("/td/store/{base}");
+        let tree = store.join(base);
+        std::fs::create_dir_all(tree.join("bin")).unwrap();
+        std::fs::write(tree.join("bin/run"), b"#!/bin/sh\necho hi\n").unwrap();
+        // Register with the hash the checker computes (Scanner over the tree, no refs).
+        let mut sc = scan::Scanner::new(&[]).unwrap();
+        nar::write_nar(&mut sc, &tree).unwrap();
+        let (hash, size, _) = sc.finish();
+        let reg = OutputReg {
+            store_path: path.clone(),
+            nar_hash: hash,
+            nar_size: size,
+            refs: vec![],
+            deriver: format!("{path}.drv"),
+        };
+        let db = tmp.join("db");
+        std::fs::write(&db, merge_regs(None, &[reg]).unwrap()).unwrap();
+        let sd = store.to_str().unwrap();
+
+        // HIT: staged into scratch/newstore + the reg returned.
+        let s1 = tmp.join("s-hit");
+        std::fs::create_dir_all(&s1).unwrap();
+        let regs = persistent_realization(&one_output_drv(&path), sd, &db, &s1)
+            .unwrap()
+            .expect("expected a persistent-store HIT");
+        assert_eq!(regs[0].store_path, path);
+        assert!(s1.join("newstore").join(base).join("bin/run").exists(), "output tree staged into newstore");
+
+        // MISS: an output path not registered in the persistent DB.
+        let s2 = tmp.join("s-miss");
+        std::fs::create_dir_all(&s2).unwrap();
+        let miss = persistent_realization(
+            &one_output_drv("/td/store/11111111111111111111111111111111-other-1"),
+            sd,
+            &db,
+            &s2,
+        )
+        .unwrap();
+        assert!(miss.is_none(), "an unregistered output must be a MISS");
+
+        // CORRUPT: the tree no longer matches the registered hash → MISS, nothing staged.
+        std::fs::write(tree.join("bin/run"), b"tampered\n").unwrap();
+        let s3 = tmp.join("s-corrupt");
+        std::fs::create_dir_all(&s3).unwrap();
+        let corrupt = persistent_realization(&one_output_drv(&path), sd, &db, &s3).unwrap();
+        assert!(corrupt.is_none(), "a tree that no longer matches its hash must be a MISS");
+        assert!(!s3.join("newstore").join(base).exists(), "a corrupt miss must not leave a staged tree");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_registration_blocks_reads_multi_output() {
+        let blob = "path /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-o\n\
+                    nar-hash sha256:deadbeef\nnar-size 7\n\
+                    reference /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep\n\
+                    deriver /gnu/store/cccccccccccccccccccccccccccccccc-o.drv\n";
+        let regs = parse_registration_blocks(blob);
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs[0].store_path, "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-o");
+        assert_eq!(regs[0].nar_hash, "sha256:deadbeef");
+        assert_eq!(regs[0].nar_size, 7);
+        assert_eq!(regs[0].refs, vec!["/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep".to_string()]);
+        assert_eq!(regs[0].deriver, "/gnu/store/cccccccccccccccccccccccccccccccc-o.drv");
     }
 
     // TD_BUILD_NICE policy: default 10 when unset/garbage, honor a valid value,
