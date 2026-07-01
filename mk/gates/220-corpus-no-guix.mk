@@ -13,9 +13,11 @@
 # DURABLE behavioral (the artifact runs / ships its lib+header); DURABLE reproducibility
 # (`td-builder check` double-builds the .drv, no guix --check); DURABLE self-discrimination
 # (a perturbed <spec>-perturbed twin — a load-bearing field change — assembles a DISTINCT
-# .drv, so the build is recipe-driven, not vacuous); MIGRATION ORACLE (distinct store path
-# from guix's build — own, then diverge; the removable Guix leg). The toolchain + locks are
-# the guix-built SEED (§5, retired last).
+# .drv, so the build is recipe-driven, not vacuous). The removable guix-comparison oracle
+# (distinct store path from guix's build — "own, then diverge") is DROPPED: hello now
+# stands on its own here (td-assembled .drv + td-double-build repro), so per AGENTS.md
+# ("the byte-hash-vs-Guix leg is the removable oracle") the guix leg is retired. The
+# toolchain + locks are the guix-built SEED (§5, retired last).
 HEAVY_GATES += corpus-no-guix
 # Built up front by the parallel `build-recipes` phase (into the shared cache); this
 # gate then cache-hits + memo-skips and only asserts behavior/oracle.
@@ -30,7 +32,7 @@ corpus_SELFDISC_SPECS := hello
 BUILD_SPECS  += $(corpus_SPECS)
 BUILD_GATES  += corpus-no-guix
 corpus-no-guix:
-	@echo ">> corpus-no-guix: hello builds via td-builder build-recipe (no guix/Guile in the path), runs, reproducible (td-builder check), distinct from guix; self-discriminated by hello-perturbed"
+	@echo ">> corpus-no-guix: hello builds via td-builder build-recipe (no guix/Guile in the path), runs, reproducible (td-builder check); self-discriminated by hello-perturbed"
 	@set -euo pipefail; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/hello-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
@@ -67,9 +69,6 @@ corpus-no-guix:
 	    echo "  [DURABLE self-discrimination] perturbed $$spec recipe -> distinct .drv (real $$rdrv vs perturbed $$pdrv); the recipe's content is load-bearing"; \
 	    rm -rf "$$pdir"; \
 	  fi; \
-	  g=`$(GUIX) build "$$spec" 2>/dev/null | grep -v -- '-debug' | head -1 || true`; \
-	  if [ -n "$$g" ] && [ "$$out" = "$$g" ]; then echo "FAIL: td's $$spec path equals guix's — expected a distinct own-builder path" >&2; exit 1; fi; \
-	  echo "  [MIGRATION ORACLE] distinct from guix's $$spec"; \
 	  cached_clean; \
 	done; \
-	echo "PASS: the reconstructed corpus (hello) builds via td-builder build-recipe — every input resolved from a pinned lock (no specification->package), the .drv assembled by td (no guix (derivation …)) and realized (no guix-daemon), with guix/Guile SCRUBBED FROM PATH; the artifact runs (durable), is reproducible by td's own double-build (durable), is self-discriminated by hello-perturbed's load-bearing configureFlags (durable), and is at a distinct store path from guix's build (own, then diverge). The toolchain + locks are the guix-built seed (§5, retired last)."
+	echo "PASS: the reconstructed corpus (hello) builds via td-builder build-recipe — every input resolved from a pinned lock (no specification->package), the .drv assembled by td (no guix (derivation …)) and realized (no guix-daemon), with guix/Guile SCRUBBED FROM PATH; the artifact runs (durable), is reproducible by td's own double-build (durable), and is self-discriminated by hello-perturbed's load-bearing configureFlags (durable). The removable guix-comparison oracle was dropped — hello stands on its own. The toolchain + locks are the guix-built seed (§5, retired last)."

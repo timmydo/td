@@ -10,10 +10,12 @@
 # STRUCTURAL (built with guix/Guile off PATH), DURABLE behavioral (a tiny C program
 # LINKS against td's installed header+lib with -Wl,--no-as-needed and RUNS, exit 0,
 # so the loader must load td's shared lib — pcre2 also runs pcre2test --version),
-# DURABLE reproducibility (td-builder check double-build), MIGRATION ORACLE
-# (distinct store path from guix's build — own, then diverge). The link-test gcc is
-# guix's gcc-toolchain (the compiler seed, retired last §5). gmp deferred (its
-# configure rejects the seed compiler at its long-long run-test).
+# DURABLE reproducibility (td-builder check double-build). The removable guix-comparison
+# oracle (distinct store path from guix's build — "own, then diverge") is DROPPED: the
+# deps stand on their own here (td-assembled .drv + td-double-build repro), so per
+# AGENTS.md ("the byte-hash-vs-Guix leg is the removable oracle") the guix leg is
+# retired. The link-test gcc is guix's gcc-toolchain (the compiler seed, retired last
+# §5). gmp deferred (its configure rejects the seed compiler at its long-long run-test).
 #
 # CONTENT-ADDRESSED CACHE: build-recipe's .drv path is deterministic, so a persistent
 # cache (.td-build-cache/, gitignored) lets td SKIP the build when an unchanged recipe
@@ -29,7 +31,7 @@ deps_SPECS  := libsigsegv libunistring pcre2 ncurses readline
 BUILD_SPECS += $(deps_SPECS)
 BUILD_GATES += corpus-deps-no-guix
 corpus-deps-no-guix:
-	@echo ">> corpus-deps-no-guix: td builds libsigsegv + libunistring + pcre2 + ncurses + readline via build-recipe (no guix/Guile in the build path); each links+runs from td's own output, reproducible, distinct from guix"
+	@echo ">> corpus-deps-no-guix: td builds libsigsegv + libunistring + pcre2 + ncurses + readline via build-recipe (no guix/Guile in the build path); each links+runs from td's own output, reproducible"
 	@set -euo pipefail; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/pcre2-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
@@ -68,9 +70,6 @@ corpus-deps-no-guix:
 	    echo "  [DURABLE behavioral] pcre2test --version reports 10.42"; \
 	  fi; \
 	  cached_check "$$spec" || exit 1; \
-	  g=`$(GUIX) build "$$spec" 2>/dev/null | grep -v -- '-debug\|-doc\|-static' | head -1 || true`; \
-	  if [ -n "$$g" ] && [ "$$out" = "$$g" ]; then echo "FAIL: td's $$spec path equals guix's — expected a distinct own-builder path" >&2; exit 1; fi; \
-	  echo "  [MIGRATION ORACLE] distinct from guix's $$spec"; \
 	  cached_clean; \
 	done; \
-	echo "PASS: td built corpus/toolchain library deps — libsigsegv, libunistring, pcre2, ncurses, readline — via td-builder build-recipe, every input resolved from a pinned lock (no specification->package), the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; each links+runs from td's own output (durable), is reproducible by td's own double-build (durable), and lands at a distinct store path from guix's build (own, then diverge). The compiler seed (gcc-toolchain) stays external (§5, retired last)."
+	echo "PASS: td built corpus/toolchain library deps — libsigsegv, libunistring, pcre2, ncurses, readline — via td-builder build-recipe, every input resolved from a pinned lock (no specification->package), the .drv assembled + realized by td (no guix (derivation …) / no guix-daemon), with guix/Guile SCRUBBED FROM PATH; each links+runs from td's own output (durable) and is reproducible by td's own double-build (durable). The removable guix-comparison oracle was dropped — the deps stand on their own. The compiler seed (gcc-toolchain) stays external (§5, retired last)."
