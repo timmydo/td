@@ -3190,14 +3190,18 @@ fn main() -> ExitCode {
             }
         }
         // td-store-db: compute the GC-reachable CLOSURE of ROOT(s) by CONTENT-SCANNING a
-        // td-owned store — the daemon's scanForReferences (scan.rs) recursed to fixpoint —
-        // with NO store DB and NO guix process. STORE-DIR is a self-contained td-owned store
-        // (e.g. an unpacked seed); its entries are the candidate set (BOUNDED — so a scan
-        // can't pick up store-path strings to unrelated packages the way scanning the whole
-        // live /gnu/store would), and each ROOT's NAR (read from STORE-DIR) is scanned for
-        // the candidates it references, transitively. Output paths are STORE-DIR/<basename>.
-        // This re-derives a closure from the BYTES — the same set `store-closure` walks from
-        // the store DB, computed without any DB. Usage:
+        // store — the daemon's scanForReferences (scan.rs) recursed to fixpoint — with NO
+        // store DB and NO guix process. STORE-DIR's entries are the candidate set and each
+        // ROOT's NAR (read from STORE-DIR) is scanned for the candidates it references,
+        // transitively; output paths are STORE-DIR/<basename>. This re-derives a closure
+        // from the BYTES — the same set `store-closure` walks from the store DB (and the
+        // same set `guix gc -R`/`--requisites` returns), computed without any DB or daemon.
+        // STORE-DIR is EITHER a self-contained td-owned store (e.g. an unpacked seed) OR the
+        // live /gnu/store: the candidate index is built once and reused across the walk
+        // (see Scanner::reset), so even a ~500k-entry live store is fast. A match is a
+        // 32-char hash literally present in the bytes — exactly the daemon's own reference
+        // criterion, so scanning the live store cannot report a reference guix would not
+        // (the store-closure-live gate proves == `guix gc -R`). Usage:
         //   store-closure-scan STORE-DIR ROOT [ROOT...]
         // Prints the reachable store paths (under STORE-DIR), sorted (ROOTs included).
         Some("store-closure-scan") if args.len() >= 4 => {
@@ -3236,16 +3240,19 @@ fn main() -> ExitCode {
                 // NAR-scanning it (scan::Scanner) against the STORE-DIR candidate set. The
                 // scanner matches by 32-char hash, so a canonical /gnu/store reference in the
                 // bytes resolves to the corresponding STORE-DIR/<basename> entry. No store DB.
+                // Build the candidate index ONCE and `reset()` between paths: with STORE-DIR
+                // = the live /gnu/store the candidate set is hundreds of thousands of paths,
+                // so rebuilding the map per path would be quadratic and unusable.
+                let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
                 let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
                 let mut stack = roots;
                 while let Some(p) = stack.pop() {
                     if !seen.insert(p.clone()) {
                         continue;
                     }
-                    let mut s = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
-                    nar::write_nar(&mut s, Path::new(&p)).map_err(|e| format!("nar {p}: {e}"))?;
-                    let (_h, _sz, refs) = s.finish();
-                    for r in refs {
+                    scanner.reset();
+                    nar::write_nar(&mut scanner, Path::new(&p)).map_err(|e| format!("nar {p}: {e}"))?;
+                    for r in scanner.refs() {
                         if !seen.contains(&r) {
                             stack.push(r);
                         }

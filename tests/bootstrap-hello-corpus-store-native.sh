@@ -1040,7 +1040,7 @@ echo "   built C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
 mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
 WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || fail "store-add prog failed"; wprel=${WP#/td/store/}
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 /td/store/'"$wprel"'/bin/c; echo "CRC=$?"
@@ -1136,7 +1136,7 @@ echo "   [brick8 no-guix-toolchain] build-recipe built hello 2.12.2 with the /td
 # (c) [DURABLE behavioral] hello runs in an own-root holding the /td/store glibc 2.41 + a static bash.
 vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`; hb2=`basename "$o"`
 cp -a "$bstore/$glb" "$vs/$glb"; cp -a "$hdir" "$vs/$hb2"
-bs8=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs8=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 bb8=`basename "$bs8"`; cp -a "$bs8" "$vs/$bb8"; chmod -R u+w "$vs"
 g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "/td/store/$hb2/bin/hello" 2>&1` || { echo "$g8" | sed 's/^/     /' >&2; fail "brick8: store-ns hello run rc"; }
 case "$g8" in *"Hello, world!"*) ;; *) fail "brick8: hello did not greet: $g8" ;; esac

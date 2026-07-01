@@ -758,7 +758,7 @@ echo "   [content-addr] interned $GCCP"; echo "                  + binutils-mesb
 # bash-static — the own-root orchestration shell (cp'd; static guix binary, only the runner — the
 # TOOLCHAIN above is the content-addressed deliverable, matching tests/store-ns.sh).
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in hello's closure"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 mkdir -p "$store/work"; printf '#include <stdio.h>\nint main(){printf("td-store-gcc\\n");return 42;}\n' > "$store/work/hello.c"

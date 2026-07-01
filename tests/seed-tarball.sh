@@ -44,7 +44,7 @@ n=`grep -c . "$work/cap/seed.manifest"`
 echo "   captured $n seed paths from `basename "$root"` -> seed.tar (`du -h "$work/cap/seed.tar" | cut -f1`)"
 
 # --- [DURABLE structural] the manifest is the COMPLETE closure -----------------
-exp=`"$TB" store-closure /var/guix/db/db.sqlite "$root" | sort -u | grep -c .`
+exp=`"$TB" store-closure-scan /gnu/store "$root" | sort -u | grep -c .`
 test "$n" -eq "$exp" || fail "manifest has $n paths but the closure is $exp — incomplete capture"
 echo "   [DURABLE structural] manifest covers the complete closure ($n == $exp paths)"
 
@@ -65,7 +65,7 @@ echo "   [DURABLE round-trip] all $checked captured paths are NAR-identical afte
 
 # --- [REMOVABLE oracle] td's closure == guix's `gc -R` -------------------------
 guix gc -R "$root" | sort -u > "$work/oracle"
-"$TB" store-closure /var/guix/db/db.sqlite "$root" | sort -u > "$work/tdclosure"
+"$TB" store-closure-scan /gnu/store "$root" | sort -u > "$work/tdclosure"
 extra=`cat "$work/tdclosure" "$work/oracle" | sort | uniq -u | head -3`
 test -z "$extra" || fail "td's captured closure differs from guix gc -R: $extra"
 echo "   [REMOVABLE oracle] td's captured closure == guix gc -R $(basename "$root")"

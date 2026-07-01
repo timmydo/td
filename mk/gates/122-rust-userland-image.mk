@@ -6,7 +6,7 @@
 # OCI image (`td-builder oci-image`, NO `guix system image`, NO guix profile). For each
 # tool td: builds it guix-free (tests/crate-free-build.sh — the same path the rust-<tool>
 # gates assert), computes its runtime closure TD-NATIVELY (td-builder elf-interp/elf-rpath
-# + store-closure over /var/guix/db — no guix process), lays the td binary + its guix
+# + store-closure-scan over /gnu/store — no guix process), lays the td binary + its guix
 # toolchain closure into a rootfs, packs it, and crun-RUNS it from the image (no host store
 # bound) — td's OWN bytes execute. The toolchain LIBS (glibc/libgcc_s) stay guix (retired
 # last by the /td/store source-bootstrap); only the userland TOOLS are td's bytes here.

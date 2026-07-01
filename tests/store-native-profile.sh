@@ -28,7 +28,7 @@ trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 # A static package from hello's PINNED closure (td's own store-closure reader, no guix process).
 bash=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
 test -n "$bash" || fail "no bash in hello's lock"
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bash" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bash" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in the closure of $bash"
 
 # Intern it at the LOGICAL /td/store (TD_STORE_DIR); bytes land physically under $store.

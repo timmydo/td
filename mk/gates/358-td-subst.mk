@@ -123,7 +123,7 @@ td-subst:
 	ttl="$(CURDIR)/tests/td-toolchain.lock"; test -s "$$ttl" || { echo "FAIL: no td-toolchain.lock" >&2; exit 1; }; \
 	iakey=`env -i PATH="$$cu/bin" "$$tb" toolchain-key "$$ttl"`; test -n "$$iakey" || { echo "FAIL: toolchain-key produced nothing" >&2; exit 1; }; \
 	bashpkg=`grep -- '-bash-' "$(CURDIR)/tests/hello-no-guix.lock" | grep -v static | sed 's/^[^ ]* //' | head -1`; \
-	iabs=`env -i PATH="$$cu/bin" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" store-closure /var/guix/db/db.sqlite "$$bashpkg" | grep -- '-bash-static-' | head -1`; \
+	iabs=`env -i PATH="$$cu/bin" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" store-closure-scan /gnu/store "$$bashpkg" | grep -- '-bash-static-' | head -1`; \
 	test -n "$$iabs" -a -x "$$iabs/bin/bash" || { echo "FAIL: no static bash fixture in hello's closure" >&2; exit 1; }; \
 	iad="$$scratch/ia"; rm -rf "$$iad"; mkdir -p "$$iad/store" "$$iad/served" "$$iad/fetch" "$$iad/restored"; \
 	iap=`env -i PATH="$$cu/bin" TD_STORE_DIR=/td/store "$$tb" store-add-input-addressed glibc-2.41 "$$iakey" "$$iabs" "$$iad/store" "$$iad/td.db"`; \

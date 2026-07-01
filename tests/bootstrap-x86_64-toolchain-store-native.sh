@@ -995,7 +995,7 @@ trap 'rm -rf "$snwork"' EXIT INT TERM   # both paths (the build branch re-traps,
 # from verify_x86_64_ownroot's own $snwork/td-store so the from-seed path's glibc copy can't collide.
 cstore="$snwork/closure-store"; cdb="$snwork/closure.db"; mkdir -p "$cstore"
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash from hello's closure for the own-root shell"
 bbase=`basename "$bs"`; cp -a "$bs" "$cstore/$bbase"; chmod -R u+w "$cstore"
 

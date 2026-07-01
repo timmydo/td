@@ -27,11 +27,11 @@ work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 
 # A static binary to run from /td/store: bash-static, from hello's seed closure (td's own
-# store-closure reader over the store db — no guix process). Static ⇒ no RUNPATH, so it runs
+# content-scan of the live /gnu/store (store-closure-scan) — no store DB, no guix process). Static ⇒ no RUNPATH, so it runs
 # from /td/store before the dynamic toolchain is relocated there (Phase 2).
 bash=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
 test -n "$bash" || fail "no bash in hello's lock"
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bash" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bash" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in the closure of $bash"
 # (That it runs in the own-root with /gnu/store absent IS the proof it is self-sufficient —
 # a dynamic binary would fail to find its libs, so no separate `file`/`ldd' check needed.)
