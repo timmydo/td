@@ -229,10 +229,12 @@ on what*, and all working notes live in the git log + PR body.
   your own base — run `td-builder affected-checks --committed-only --run`; if it
   waives the full loop, record the waiver in the PR body; if it escalates, it
   runs the FULL `./check.sh` before returning success, so record the escalation
-  and full result instead; (2) spawn an independent code-review subagent over the
-  full branch diff (`/code-review`) and address its findings (Workflow step 6 —
-  MANDATORY for AI agents), then push the branch and mark the PR
-  ready — CI runs
+  and full result instead; (2) **every PR gets a subagent code review — no exceptions:** spawn an
+  independent code-review subagent over the full branch diff (`/code-review`) and
+  **post the subagent's review results as a comment on the PR**; address its
+  findings, posting each resulting fix as a **reply to that review comment and
+  resolving the comment once the fix is done** (Workflow step 6 — MANDATORY for AI
+  agents), then push the branch and mark the PR ready — CI runs
   the required hosted gate and a human review approves (main is branch-protected:
   required checks + mandatory review, no direct pushes —
   `.github/BRANCH-PROTECTION.md`); (3) merge once green and approved — default to
