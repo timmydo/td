@@ -6,7 +6,7 @@
 # may only SHRINK); growth needs a deliberate edit here, called out in the PR for
 # sign-off (directive 8). Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB><category>
-surface-sites: 108
+surface-sites: 91
 ci/build-ci-image.sh	guix-db-read
 ci/build-ci-image.sh	lowering
 ci/import-store.sh	guix-db-read
@@ -76,19 +76,10 @@ mk/gates/360-td-offline.mk	guix-db-read
 mk/gates/360-td-offline.mk	lowering
 mk/gates/365-bootstrap-build.mk	guix-db-read
 mk/gates/365-build-plan.mk	guix-db-read
-tests/bootstrap-binutils-244-store-native.sh	guix-db-read
-tests/bootstrap-gcc-14-store-native.sh	guix-db-read
-tests/bootstrap-gcc-mesboot-494-store-native.sh	guix-db-read
-tests/bootstrap-gcc-mesboot-wrapper.sh	guix-db-read
-tests/bootstrap-glibc-241-store-native.sh	guix-db-read
-tests/bootstrap-glibc-shared-store-native.sh	guix-db-read
 tests/bootstrap-hello-corpus-store-native.sh	gc
 tests/bootstrap-hello-corpus-store-native.sh	guix-db-read
-tests/bootstrap-hello-userland.sh	guix-db-read
 tests/bootstrap-sed-corpus-store-native.sh	gc
 tests/bootstrap-sed-corpus-store-native.sh	guix-db-read
-tests/bootstrap-toolchain-store-native.sh	guix-db-read
-tests/bootstrap-x86_64-toolchain-store-native.sh	guix-db-read
 tests/cache-lib.sh	guix-db-read
 tests/corpus-seed.sh	guix-db-read
 tests/crate-free-build.sh	guix-db-read
@@ -97,21 +88,13 @@ tests/profile.sh	guix-db-read
 tests/rootless.sh	gc
 tests/rootless.sh	guix-db-read
 tests/rust-seed.sh	guix-db-read
-tests/rust-userland-image.sh	guix-db-read
-tests/rust-x86_64-runtime-store-native.sh	guix-db-read
 tests/seed-build.sh	guix-db-read
 tests/seed-tarball.sh	gc
 tests/seed-tarball.sh	guix-db-read
 tests/seed-unpack.sh	gc
 tests/seed-unpack.sh	guix-db-read
 tests/stage0-builder.sh	guix-db-read
-tests/store-native-profile.sh	guix-db-read
-tests/store-ns.sh	guix-db-read
 tests/store-relocate.sh	guix-db-read
 tests/td-shell-seed.sh	guix-db-read
 tests/td-shell.sh	guix-db-read
-tests/toolchain-input-addressed.sh	guix-db-read
 tests/toolchain-subst-default.sh	guix-db-read
-tests/toolchain-x86_64-input-addressed.sh	guix-db-read
-tests/userland-x86_64-store-native.sh	guix-db-read
-tests/x86_64-cross-fns.sh	guix-db-read

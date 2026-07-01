@@ -808,7 +808,7 @@ echo "   [content-addr] interned $BUP244, content-addressed in /td/store"
 # presence; then the MODERN /td/store as+ld actually run AND link — gcc-mesboot1 driven with -B at the new
 # binutils assembles+links a C program → a dynamic /td/store binary that returns 42.
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash to drive the own-root probe"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 mkdir -p "$store/work"; printf 'int main(){return 42;}\n' > "$store/work/t.c"

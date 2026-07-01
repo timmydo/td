@@ -14,7 +14,7 @@
 #   1. the realized binary tree is scanned for /gnu/store references (the ELF
 #      PT_INTERP + DT_RUNPATH via `td-builder elf-interp`/`elf-rpath`, plus any
 #      embedded store path), giving the binary's DIRECT runtime deps;
-#   2. `td-builder store-closure /var/guix/db` expands each to its full closure;
+#   2. `td-builder store-closure-scan /gnu/store` expands each to its full closure;
 #   3. those guix toolchain trees + the td-built binary tree are laid at their
 #      /gnu/store locations into a rootfs and packed with `td-builder oci-image`.
 #
@@ -76,16 +76,17 @@ grep -vxF "$OUT" "$work/refs.txt" > "$work/direct.txt" || true
 test -s "$work/direct.txt" || { echo "FAIL: no guix /gnu/store runtime refs in $NS/bin/$BIN (only its own OUT? a static-store binary?)" >&2; exit 1; }
 echo "  [structural] $BIN has $(wc -l < "$work/direct.txt") direct /gnu/store runtime ref(s) (PT_INTERP + DT_RUNPATH + embedded)" >&2
 
-# --- (2) closure: expand each direct ref to its full closure via td's OWN reader of
-# /var/guix/db (no guix process). The toolchain seed must be realized first (caller does).
+# --- (2) closure: expand each direct ref to its full closure by CONTENT-SCANNING the live
+# /gnu/store (td-builder store-closure-scan — no store DB, no /var/guix read, no guix
+# process). The toolchain seed must be realized first (caller does).
 : > "$work/closure.txt"
 while read -r p; do
-  "$TB" store-closure /var/guix/db/db.sqlite "$p" >> "$work/closure.txt" \
+  "$TB" store-closure-scan /gnu/store "$p" >> "$work/closure.txt" \
     || { echo "FAIL: store-closure of $p failed (toolchain seed not realized?)" >&2; exit 1; }
 done < "$work/direct.txt"
 sort -u "$work/closure.txt" -o "$work/closure.txt"
 nclo=$(wc -l < "$work/closure.txt")
-echo "  [structural] td-native closure (td-builder store-closure /var/guix/db): $nclo guix toolchain path(s)" >&2
+echo "  [structural] td-native closure (td-builder store-closure-scan /gnu/store): $nclo guix toolchain path(s)" >&2
 
 # --- (3) rootfs: lay each closure member at its /gnu/store location, then the td-built
 # binary tree at ITS canonical path. -a preserves the exec bits + symlinks.
@@ -188,4 +189,4 @@ if run_ctr "td-$BIN-neg" >/dev/null 2>&1; then
 fi
 echo "  [self-discrim] a bogus exec in the same image failed (the green discriminates)" >&2
 
-echo "PASS: rust-userland-image — a td-NATIVE OCI image (td-builder oci-image, NO guix system image) ships the td-BUILT '$BIN' (guix-free crates) + its toolchain closure, laid out td-natively (td-builder store-closure /var/guix/db); skopeo loads it; crun runs '$BIN' from the image's OWN bytes (no host store bound) doing its job; byte-reproducible; self-discriminating."
+echo "PASS: rust-userland-image — a td-NATIVE OCI image (td-builder oci-image, NO guix system image) ships the td-BUILT '$BIN' (guix-free crates) + its toolchain closure, laid out td-natively (td-builder store-closure-scan /gnu/store); skopeo loads it; crun runs '$BIN' from the image's OWN bytes (no host store bound) doing its job; byte-reproducible; self-discriminating."

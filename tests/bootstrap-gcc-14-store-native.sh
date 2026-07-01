@@ -1077,7 +1077,7 @@ echo "   [content-addr] interned $GCP + glibc-shared + binutils-mesboot, content
 
 # static bash for the own-root probe (build scaffolding from the corpus closure).
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash to drive the own-root probe"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 mkdir -p "$store/work"

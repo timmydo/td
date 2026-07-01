@@ -66,7 +66,7 @@ echo "   built C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
 mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
 WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || fail "store-add prog failed"; wprel=${WP#/td/store/}
 bashlock=`grep -- '-bash-' tests/sed-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 /td/store/'"$wprel"'/bin/c; echo "CRC=$?"
@@ -167,7 +167,7 @@ echo "   [brick8 no-guix-toolchain] build-recipe built sed 4.9 with the /td/stor
 # performs a real text substitution: s/foo/bar/ on "foo\nbaz" must yield "bar\nbaz" (a transform, not a print).
 vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`; sb2=`basename "$o"`
 cp -a "$bstore/$glb" "$vs/$glb"; cp -a "$sdir" "$vs/$sb2"
-bs8=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs8=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 bb8=`basename "$bs8"`; cp -a "$bs8" "$vs/$bb8"; chmod -R u+w "$vs"
 sedrun='printf "foo\nbaz\n" | /td/store/'"$sb2"'/bin/sed "s/foo/bar/"'
 g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "$sedrun" 2>&1` || { echo "$g8" | sed 's/^/     /' >&2; fail "brick8: store-ns sed run rc"; }

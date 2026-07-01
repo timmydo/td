@@ -294,7 +294,7 @@ cp -L "$XGLIBC/lib/ld-linux-x86-64.so.2" "$store/ld" || fail "could not place th
 
 # --- a static bash (td's own store-closure reader, no guix process) for the own-root shell ---------
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in hello's closure"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 

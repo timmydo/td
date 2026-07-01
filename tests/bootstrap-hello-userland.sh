@@ -755,7 +755,7 @@ echo "   [content-addr] interned $HLP, content-addressed in /td/store"
 # own-root probe: a static bash (from hello's guix closure, build scaffolding only) reports whether
 # /gnu/store is present, then EXECS the from-source hello — one store-ns invocation gives both legs.
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure /var/guix/db/db.sqlite "$bashlock" | grep -- '-bash-static-' | head -1`
+bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash to drive the own-root probe"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 snscript='

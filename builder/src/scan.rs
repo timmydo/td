@@ -16,7 +16,7 @@
 //! match on one would surface as a references mismatch in the differential,
 //! red and diagnosable, never silently dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
 use crate::sha256::Sha256;
@@ -46,11 +46,20 @@ fn hash_part(path: &str) -> io::Result<[u8; REF_LEN]> {
 }
 
 /// Streaming Write sink: NAR bytes in; hash, size and seen references out.
+///
+/// The candidate INDEX (hash part -> store path) is immutable once built; the
+/// per-scan state (which candidates were `seen`, plus the running hash/size and
+/// seam tail) is separate and `reset()`-able. So a closure walk over many roots
+/// pays the candidate-map build ONCE and resets between paths in O(refs seen),
+/// not O(candidates) — the difference between a fast and an unusable scan when
+/// the candidate set is the whole live store (hundreds of thousands of paths).
 pub struct Scanner {
     sha: Sha256,
     size: u64,
-    /// hash part -> (full store path, seen yet?)
-    candidates: HashMap<[u8; REF_LEN], (String, bool)>,
+    /// hash part -> full store path (the immutable candidate index)
+    candidates: HashMap<[u8; REF_LEN], String>,
+    /// hash parts matched in the bytes scanned since `new`/`reset`
+    seen: HashSet<[u8; REF_LEN]>,
     tail: Vec<u8>,
 }
 
@@ -60,9 +69,25 @@ impl Scanner {
         for p in candidate_paths {
             // Duplicate hash parts cannot happen for distinct store items;
             // last-in wins harmlessly for duplicate path entries.
-            candidates.insert(hash_part(p)?, (p.clone(), false));
+            candidates.insert(hash_part(p)?, p.clone());
         }
-        Ok(Scanner { sha: Sha256::new(), size: 0, candidates, tail: Vec::new() })
+        Ok(Scanner {
+            sha: Sha256::new(),
+            size: 0,
+            candidates,
+            seen: HashSet::new(),
+            tail: Vec::new(),
+        })
+    }
+
+    /// Clear the per-scan state (seen refs, hash, size, seam tail) while KEEPING
+    /// the built candidate index, so the next `write_nar` scans a fresh path
+    /// against the same candidates without rebuilding the map.
+    pub fn reset(&mut self) {
+        self.seen.clear();
+        self.sha = Sha256::new();
+        self.size = 0;
+        self.tail.clear();
     }
 
     /// The daemon's `search`: backwards base32 check with skip-ahead.
@@ -81,25 +106,32 @@ impl Scanner {
                 continue;
             }
             let window: &[u8; REF_LEN] = s[i..i + REF_LEN].try_into().unwrap();
-            if let Some((_, seen)) = self.candidates.get_mut(window) {
-                *seen = true;
+            if self.candidates.contains_key(window) {
+                self.seen.insert(*window);
             }
             i += 1;
         }
     }
 
-    /// (nar sha256, nar size, sorted seen reference paths)
-    pub fn finish(self) -> (String, u64, Vec<String>) {
+    /// Sorted store paths whose hash part was matched since the last
+    /// `new`/`reset` (does not consume the scanner, so the index is reusable).
+    pub fn refs(&self) -> Vec<String> {
         let mut refs: Vec<String> = self
-            .candidates
-            .into_values()
-            .filter(|(_, seen)| *seen)
-            .map(|(path, _)| path)
+            .seen
+            .iter()
+            .filter_map(|h| self.candidates.get(h).cloned())
             .collect();
         refs.sort();
+        refs
+    }
+
+    /// (nar sha256, nar size, sorted seen reference paths)
+    pub fn finish(self) -> (String, u64, Vec<String>) {
+        let refs = self.refs();
+        let size = self.size;
         (
             format!("sha256:{}", crate::sha256::to_base16(&self.sha.finalize())),
-            self.size,
+            size,
             refs,
         )
     }
@@ -155,6 +187,26 @@ mod tests {
         let cand = vec![path(HASH_A, "dep"), path(HASH_B, "other")];
         let data = format!("prefix {} suffix", path(HASH_A, "dep"));
         assert_eq!(scan_chunks(&cand, &[data.as_bytes()]), vec![path(HASH_A, "dep")]);
+    }
+
+    #[test]
+    fn reset_reuses_the_index_with_no_bleed_through() {
+        // The invariant store-closure-scan relies on: build the candidate index
+        // ONCE, then reset() between roots — each scan sees only its OWN path's
+        // refs (no bleed-through from a prior root) and matches a fresh scanner.
+        let cand = vec![path(HASH_A, "dep"), path(HASH_B, "other")];
+        let d1 = format!("uses {}", path(HASH_A, "dep"));
+        let d2 = format!("uses {}", path(HASH_B, "other"));
+
+        let mut reused = Scanner::new(&cand).unwrap();
+        reused.write_all(d1.as_bytes()).unwrap();
+        assert_eq!(reused.refs(), vec![path(HASH_A, "dep")]);
+        // Reset, then a DIFFERENT path — the first path's ref must NOT persist.
+        reused.reset();
+        reused.write_all(d2.as_bytes()).unwrap();
+        assert_eq!(reused.refs(), vec![path(HASH_B, "other")]);
+        // The reset scanner's finish() tuple equals a fresh scanner's for d2.
+        assert_eq!(reused.finish().2, scan_chunks(&cand, &[d2.as_bytes()]));
     }
 
     #[test]

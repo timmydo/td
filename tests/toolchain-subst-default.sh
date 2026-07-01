@@ -69,7 +69,7 @@ test -n "$key" || { echo "FAIL: toolchain-key produced nothing" >&2; exit 1; }
 # a real static bash from hello's pinned closure (runs directly, no interp) as the fixture
 bashpkg=$(grep -- '-bash-' "$(pwd)/tests/hello-no-guix.lock" | grep -v static | sed 's/^[^ ]* //' | head -1)
 fixt=$(env -i PATH="$cu/bin" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-       "$tb" store-closure /var/guix/db/db.sqlite "$bashpkg" | grep -- '-bash-static-' | head -1)
+       "$tb" store-closure-scan /gnu/store "$bashpkg" | grep -- '-bash-static-' | head -1)
 test -n "$fixt" -a -x "$fixt/bin/bash" || { echo "FAIL: no static bash fixture in hello's closure" >&2; exit 1; }
 W="$scratch/ia"; rm -rf "$W"; mkdir -p "$W/phys" "$W/store" "$W/dest"
 path=$(env -i PATH="$cu/bin" TD_STORE_DIR=/td/store "$tb" store-add-input-addressed glibc-2.41 "$key" "$fixt" "$W/phys" "$W/td.db")
