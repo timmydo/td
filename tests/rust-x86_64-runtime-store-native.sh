@@ -170,60 +170,13 @@ x86_64_build_native_recipe "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$nrout" || fail "
 test -x "$XNGCC/bin/gcc" -a -x "$XNBU/bin/as" -a -x "$XNBU/bin/ld" || fail "the native x86_64 toolchain is missing gcc/as/ld"
 echo "   native x86_64 toolchain ready: gcc ($XNGCC) + as/ld ($XNBU)"
 
-# ---- x86_64 zlib (libLLVM needs libz; the toolchain doesn't provide it) ----
-ZLIBX=`mktemp -d`/zlibx
-build_zlib_x86_64 "$cpath" "$XGCC2" "$XGLIBC" "$XLIBGCCDIR" "$XBU" "$ZLIBX" || fail "the cross gcc did not build x86_64 zlib"
-XLIBZ="$ZLIBX/libz.so.1.3.1"
-if grep -q -a '/gnu/store' "$XLIBZ"; then fail "the built x86_64 libz contains /gnu/store bytes"; fi
-echo "   built x86_64 libz.so.1 from zlib 1.3.1 source (cross gcc 14.3.0, no /gnu/store)"
-
 # ============================================================================================
-# Assemble the /td/store rust tree: rustc + cargo + the rustlib SYSROOT (so rustc has a target to
-# link against), the interp relinked to the /td/store glibc's hashed loader path (grown), the full
-# runtime closure co-located in lib/.
-# ============================================================================================
-rtree=`mktemp -d`/r; mkdir -p "$rtree/x"
-top="${RUST_FILE%.tar.gz}"
-# rustc (full, incl its rustlib) + cargo are required; the standalone rust-std component (the libstd/
-# libcore rlibs) is merged in if the combined tarball ships it as a separate top-level dir.
-tar -xzf "$RUST_TB" -C "$rtree/x" "$top/rustc" "$top/cargo/bin/cargo" || fail "rust tarball extract (rustc+cargo) failed"
-tar -xzf "$RUST_TB" -C "$rtree/x" "$top/rust-std-x86_64-unknown-linux-gnu/lib/rustlib" 2>/dev/null || true
-rx="$rtree/x/$top"
-tree="$rtree/tree"; mkdir -p "$tree/bin" "$tree/lib"
-cp -a "$rx/rustc/bin/rustc" "$tree/bin/rustc"
-cp -a "$rx/cargo/bin/cargo" "$tree/bin/cargo"
-cp -a "$rx/rustc/lib/." "$tree/lib/"   # librustc_driver, libLLVM, libstd*.so, AND rustc's own rustlib/
-if [ -d "$rx/rust-std-x86_64-unknown-linux-gnu/lib/rustlib" ]; then
-  cp -a "$rx/rust-std-x86_64-unknown-linux-gnu/lib/rustlib/." "$tree/lib/rustlib/"
-fi
-chmod -R u+w "$tree"
-# the sysroot MUST hold the libstd rlib rustc links a program against — else there is nothing to compile to.
-ls "$tree"/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib >/dev/null 2>&1 \
-  || fail "assembled rust sysroot has no libstd rlib (rustlib missing) — rustc could not link a program"
-echo "   assembled the /td/store rust tree with the rustlib sysroot (libstd rlib present)"
-
-# --- [provenance] the upstream binaries + .so carry NO /gnu/store ----------------------------------
-for b in "$tree/bin/rustc" "$tree/bin/cargo" "$tree"/lib/librustc_driver-*.so; do
-  test -e "$b" || continue
-  ! grep -q -a '/gnu/store' "$b" || fail "$b contains /gnu/store bytes — not guix-free upstream"
-done
-echo "   [provenance] upstream rustc + cargo + librustc_driver carry zero /gnu/store bytes"
-
-# --- co-locate the FULL external runtime closure in the tree's lib/ (found via RUNPATH $ORIGIN/../lib):
-# glibc 2.41 x86_64 sonames + libgcc_s (with the .so link so the rust link's `-lgcc_s` resolves) + libz.
-for soname in libc.so.6 libdl.so.2 librt.so.1 libpthread.so.0 libm.so.6; do
-  src=`ls "$XGLIBC/lib/$soname" 2>/dev/null | head -1`
-  test -n "$src" -a -e "$src" || fail "x86_64 glibc 2.41 is missing $soname"
-  cp -L "$src" "$tree/lib/$soname"
-done
-cp -L "$XLIBGCCDIR/libgcc_s.so.1" "$tree/lib/libgcc_s.so.1" || fail "no libgcc_s.so.1 in $XLIBGCCDIR"
-ln -sf libgcc_s.so.1 "$tree/lib/libgcc_s.so"
-cp -L "$XLIBZ" "$tree/lib/libz.so.1"
-chmod -R u+w "$tree"
-
-# ============================================================================================
-# Intern the native gcc + native binutils + x86_64 glibc at /td/store, THEN relink rustc/cargo to
-# the interned glibc's FULL hashed loader path, then intern the rust tree beside them.
+# Stage the toolchain into the own-root store + obtain the RELINKED rust tree. glibc is interned at
+# its cross-lock INPUT-ADDRESSED path (the relinked rust tree's interp points there — a STABLE,
+# subst-fetchable loader path); the native gcc/binutils stay content-addressed (the own-root probe
+# finds them via PATH). The rust tree is FETCHED at its td-toolchain-rust-x86_64.lock path if a
+# substitute is exposed, else ASSEMBLED+RELINKED by the `toolchain-recipe rust-x86_64` recipe and
+# interned at that lock path + subst-exported (from-BUILD fallback — directive 1; the daily publishes).
 # ============================================================================================
 store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 NBP=`"$TB" store-add-recursive "\`basename "$XNBU"\`" "$XNBU" "$store" "$sndb"` || fail "store-add native binutils failed"
@@ -231,30 +184,42 @@ nbrel=`basename "$NBP"`
 NGP=`"$TB" store-add-recursive "\`basename "$XNGCC"\`" "$XNGCC" "$store" "$sndb"` || fail "store-add native gcc failed"
 case "$NGP" in /td/store/*-gcc-14.3.0-x86_64-native) ;; *) fail "native gcc not content-addressed under /td/store (got: $NGP)" ;; esac
 ngrel=`basename "$NGP"`
-GLP=`"$TB" store-add-recursive glibc-2.41-x86_64 "$XGLIBC" "$store" "$sndb"` || fail "store-add x86_64 glibc failed"
+# glibc at its cross-lock INPUT-ADDRESSED path (so the rust interp target is stable + fetchable).
+GLK=`"$TB" toolchain-key tests/td-toolchain-x86_64.lock` || fail "toolchain-key (cross) failed"
+GLP=`"$TB" store-add-input-addressed glibc-2.41-x86_64 "$GLK" "$XGLIBC" "$store" "$sndb"` || fail "store-add-input-addressed x86_64 glibc failed"
 glrel=`basename "$GLP"`
+GLWANT=`"$TB" toolchain-path tests/td-toolchain-x86_64.lock glibc-2.41-x86_64`
+test "$GLP" = "$GLWANT" || fail "interned glibc path $GLP != lock-computed $GLWANT"
+GLIBC_INTERP="$GLP/lib/ld-linux-x86-64.so.2"
 
-# --- RELINK: td's OWN elf-set-interp retargets the interpreter (no patchelf) to the interned
-# glibc's FULL hashed loader path ($GLP/lib/ld-linux-x86-64.so.2). That path is LONGER than the
-# original /lib64/ld-linux-x86-64.so.2 slot, so elf-set-interp GROWS it (PT_NOTE→PT_LOAD; see
-# builder/src/elf.rs). A NORMAL hashed store path — unlike the previous bare /td/store/ld — is
-# what build-recipe's sandbox stages, so the relinked rustc/cargo can exec inside a build
-# (#258's ripgrep cutover); it also makes the interned rust tree carry a REAL store reference
-# to its glibc (store-add-recursive records it), so the closure follows the loader.
-for b in rustc cargo; do
-  "$TB" elf-set-interp "$tree/bin/$b" "$GLP/lib/ld-linux-x86-64.so.2" || fail "elf-set-interp $b"
-  i=`"$TB" elf-interp "$tree/bin/$b"`
-  case "$i" in /td/store/*/lib/ld-linux-x86-64.so.2) ;; *) fail "interp of $b not relinked to the /td/store glibc loader (got: $i)" ;; esac
-done
-echo "   [structural] rustc + cargo interp relinked (grown) to $GLP/lib/ld-linux-x86-64.so.2 (was /lib64/ld-linux-x86-64.so.2)"
-
-out=`"$TB" store-add-recursive rust-1.96.0-x86_64-store-native "$tree" "$store" "$sndb"` || fail "store-add rust tree failed"
-case "$out" in /td/store/*-rust-1.96.0-x86_64-store-native) ;; *) fail "interned path not content-addressed under /td/store (got: $out)" ;; esac
-phys="$store/`basename "$out"`"; rustrel=${out#/td/store/}
+if x86_64_resolve_closure_rust "$store" "$sndb"; then
+  echo ">> [subst/SKIP rust] fetched the RELINKED rust tree at its lock path — SKIPPED the assemble+relink"
+else
+  echo ">> [subst/MISS rust] no exposed rust substitute — assembling + relinking from the cross toolchain (directive 1)"
+  # x86_64 zlib (libLLVM NEEDs libz; the toolchain provides none) — only needed to ASSEMBLE the tree.
+  ZLIBX=`mktemp -d`/zlibx
+  build_zlib_x86_64 "$cpath" "$XGCC2" "$XGLIBC" "$XLIBGCCDIR" "$XBU" "$ZLIBX" || fail "the cross gcc did not build x86_64 zlib"
+  XLIBZ="$ZLIBX/libz.so.1.3.1"
+  if grep -q -a '/gnu/store' "$XLIBZ"; then fail "the built x86_64 libz contains /gnu/store bytes"; fi
+  echo "   built x86_64 libz.so.1 from zlib 1.3.1 source (cross gcc 14.3.0, no /gnu/store)"
+  # assemble + relink via the structured recipe (relink target = the LOCK-KEYED glibc loader).
+  top="${RUST_FILE%.tar.gz}"
+  rrout=`mktemp -d`/rust-out; mkdir -p "$rrout"   # the recipe stdout is captured to $rrout/recipe.out
+  env TDRX_RUST_TAR="$RUST_TB" TDRX_RUST_TOP="$top" TDRX_XGLIBC="$XGLIBC" \
+      TDRX_XLIBGCCDIR="$XLIBGCCDIR" TDRX_XLIBZ="$XLIBZ" TDRX_GLIBC_INTERP="$GLIBC_INTERP" \
+      TDRX_OUT="$rrout" "$TB" toolchain-recipe rust-x86_64 > "$rrout/recipe.out" 2>&1 \
+    || { sed 's/^/   /' "$rrout/recipe.out" >&2; fail "toolchain-recipe rust-x86_64 failed"; }
+  sed 's/^/   /' "$rrout/recipe.out"
+  RUST_TREE=`sed -n 's/^RUST_TREE=//p' "$rrout/recipe.out"`
+  test -n "$RUST_TREE" -a -d "$RUST_TREE" || fail "the rust recipe produced no tree"
+  x86_64_build_closure_rust "`pwd`/.td-build-cache/x86_64-rust-closure-export" "$store" "$sndb" "$RUST_TREE" \
+    || fail "could not intern + subst-export the relinked rust tree"
+fi
+rustrel="$RUSTREL"; phys="$store/$rustrel"; out="/td/store/$rustrel"
 chmod -R u+w "$store"
-test -x "$phys/bin/rustc" -a -x "$phys/bin/cargo" || fail "interned tree missing rustc/cargo at $phys"
+test -x "$phys/bin/rustc" -a -x "$phys/bin/cargo" || fail "rust tree missing rustc/cargo at $phys"
 test -x "$store/$ngrel/bin/gcc" -a -x "$store/$nbrel/bin/as" -a -x "$store/$nbrel/bin/ld" || fail "interned native toolchain missing gcc/as/ld"
-echo "   [content-addr] interned rust ($out), native gcc ($NGP), native binutils, and the x86_64 glibc"
+echo "   [input-addressed] rust ($out) at its lock-keyed path; native gcc ($NGP) + binutils content-addressed; x86_64 glibc at its lock path ($GLP)"
 
 # --- [native-arch] the linker rustc will drive is the NATIVE x86_64 gcc/cc1 + native as/ld (ELF64) --
 nhdr=`"$store/$nbrel/bin/readelf" -h "$store/$ngrel/bin/gcc" 2>/dev/null`
