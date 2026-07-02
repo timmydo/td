@@ -1,14 +1,18 @@
 # td-builder S1 toolchain probe + S2 NAR differential (DESIGN §7.1 side-track).
-# The growing gate of the first Guix-component replacement
-# (§2.5 discipline) — each sub-task adds a leg, none is ever removed:
-#   • S1: lower the td-builder package to a drv (`guix build -d -e '(@ (system
-#     td-builder) td-builder)'`), build it offline, `guix build --check` it
-#     bit-for-bit (prime directive 1;
-#     --check re-runs the compile, so a toolchain regression reds the loop),
-#     RUN the binary and assert its sentinel (the toolchain produced a WORKING
-#     executable — stronger than "cargo build exited 0"), and record closure
-#     size + compile wall-clock (§1.3). The crate's unit tests (FIPS SHA-256
-#     vectors, NAR framing/sort) also run inside the build (#:tests? #t).
+# The growing gate of the first Guix-component replacement (§2.5 discipline) — each
+# sub-task adds a leg. R2 (#275) RESTRUCTURED S1: the subject td-builder is now built by
+# the cargo-bootstrapped stage0 (NOT `guix build -e '(@ (system td-builder) td-builder)'`),
+# and its `guix build --check` repro leg became a stage0 DOUBLE-bootstrap — the last
+# guix-as-packager site is gone (guix-surface packager ratchet → 0). S2/S3/S4 are
+# unchanged; their `guix repl`/`guix system`/`guix gc` ORACLE legs are R4 lowering scope,
+# not the packager surface. The legs:
+#   • S1: build the td-builder SUBJECT from source with the cargo-bootstrapped stage0
+#     (tools/bootstrap-td-builder.sh — guix/Guile off PATH), RUN the binary and assert
+#     its sentinel (the toolchain produced a WORKING executable — stronger than "cargo
+#     build exited 0"), and prove reproducibility by a stage0 DOUBLE-bootstrap: two
+#     independent builds are bit-identical (td's own oracle, prime directive 1 — the
+#     same repro guarantee guix build --check gave, without guix). S2/S3/S4 exercise
+#     this SAME stage0-built subject against the daemon oracle.
 #   • S2: NAR DIFFERENTIAL — td-builder's own NAR serializer + SHA-256
 #     (`nar-hash`) must agree with the hash the DAEMON recorded in its DB
 #     (query-path-info via tests/td-builder-nar.scm, printing NAR=<path> <hash>
@@ -39,24 +43,29 @@
 #     builder is a real multi-process Guile build (mke2fs/genimage tree) that
 #     honestly reds on any missing piece of the daemon's chroot contract.
 # OFFLINE PRECONDITION (DESIGN §5): the pinned Rust closure must be warm in the
-# host store — the loop fetches nothing. Two-step lower-then-realise (repl ->
-# guix build) for an honest exit status, as in the other gates.
+# host store — the loop fetches nothing. S1 realises the stage0 toolchain seed
+# (tests/td-builder-rust.lock) up front; the S2/S3/S4 oracle legs lower with
+# `guix repl`/`guix system` and realise with `guix build` for an honest exit status.
 HEAVY_GATES += td-builder
 td-builder:
 	@echo ">> td-builder: reproducible offline build (S1) + NAR differential (S2) + build differential (S3) + system-image differential (S4)"
 	@set -euo pipefail; \
-	drv=`$(GUIX) build -d $(LOAD) -e '(@ (system td-builder) td-builder)'`; \
-	test -n "$$drv" || { echo "ERROR: could not lower the td-builder derivation" >&2; exit 1; }; \
-	echo ">> td-builder derivation: $$drv"; \
-	start=`date +%s`; \
-	out=`$(GUIX) build "$$drv"`; \
-	elapsed=$$(( `date +%s` - start )); \
-	test -n "$$out" || { echo "ERROR: the td-builder build produced no output path" >&2; exit 1; }; \
-	echo ">> check: reproducibility of the td-builder binary (verdict-memoized)"; \
-	TD_GUIX="$(GUIX)" sh tests/check-memo.sh "$$drv"; \
+	scratch0="$(CURDIR)/.td-build-cache/td-builder-stage0"; rm -rf "$$scratch0"; mkdir -p "$$scratch0"; \
+	lock0="$(CURDIR)/tests/td-builder-rust.lock"; \
+	test -s "$$lock0" || { echo "ERROR: no lock $$lock0" >&2; exit 1; }; \
+	grep ' /gnu/store/' "$$lock0" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }; \
+	echo ">> S1: build the td-builder SUBJECT from source with the cargo-bootstrapped stage0 (guix/Guile off PATH — the guix-as-packager build retired in R2, #275)"; \
+	s0=`TD_LOCK="$$lock0" sh tools/bootstrap-td-builder.sh "$$scratch0/a"`; \
+	test -x "$$s0" || { echo "FAIL: bootstrap produced no stage0 td-builder" >&2; exit 1; }; \
+	out=$${s0%/bin/td-builder}; \
 	echo ">> run: the compiled binary must print its sentinel"; \
 	"$$out/bin/td-builder" | grep -Eq '^td-builder [0-9.]+ ok$$' \
 	  || { echo "FAIL: the compiled td-builder did not print its sentinel (or exited nonzero) — the toolchain did not produce a working binary." >&2; exit 1; }; \
+	echo ">> check: reproducibility of the td-builder binary (stage0 double-bootstrap — td's own oracle, not guix build --check)"; \
+	s0b=`TD_LOCK="$$lock0" sh tools/bootstrap-td-builder.sh "$$scratch0/b"`; \
+	ha=`sha256sum "$$s0" | cut -d' ' -f1`; hb=`sha256sum "$$s0b" | cut -d' ' -f1`; \
+	test "$$ha" = "$$hb" || { echo "FAIL: the two stage0 builds differ ($$ha != $$hb) — the td-builder build is NOT reproducible" >&2; exit 1; }; \
+	echo "   reproducible: two independent bootstraps are bit-identical (sha256 $$ha)"; \
 	echo ">> S2: NAR differential — td-builder nar-hash vs the daemon's recorded hash"; \
 	pairs=`$(GUIX) repl $(LOAD) tests/td-builder-nar.scm 2>/dev/null | sed -n 's/^NAR=//p'`; \
 	test -n "$$pairs" || { echo "ERROR: could not compute the oracle NAR pairs (tests/td-builder-nar.scm)" >&2; exit 1; }; \
@@ -176,7 +185,5 @@ td-builder:
 	test "$$img_rehash" = "sha256:$$img_hash" \
 	  || { echo "FAIL: independent re-hash of the on-disk image rebuild gives $$img_rehash, the daemon recorded sha256:$$img_hash" >&2; exit 1; }; \
 	echo "   image rebuild equal: store path, NAR hash (registered + re-hashed), size, references, deriver"; \
-	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; \
-	echo ">> closure size:"; $(GUIX) size "$$out" | tail -n1; \
-	echo "   compile wall-clock: $${elapsed}s (first run; warm store thereafter)"; \
+	chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch" "$$scratch0"; \
 	echo "PASS: reproducible offline build (S1); NAR serialization bit-for-bit equal to the daemon's recorded hashes across $$n items (S2); the userns sandbox rebuild registers the daemon's exact facts at the same store path and builds in a fresh user namespace (S3); td-builder rebuilds the SYSTEM IMAGE drv itself, daemon-equal on every recorded field (S4)."

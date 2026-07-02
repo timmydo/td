@@ -9,14 +9,19 @@
 # references td's dep outputs AND NOT guix's), behavioral (runs from td's output loading
 # td's deps; a library subject's .so is present), repro (td-builder check double-build),
 # MIGRATION ORACLE (distinct path). guix/Guile SCRUBBED FROM PATH; toolchain + locks are
-# the guix-built seed (§5, retired last).
+# the guix-built seed (§5, retired last). The build-plan DRIVER is the cargo-bootstrapped
+# stage0 td-builder (load_stage0) — no guix-built td-builder (R2, #275: the guix-as-packager
+# surface is 0). The per-subject `guix build <S>` remains a removable differential oracle
+# (grows per package, retires wholesale with guix — NOT the ratcheted packager surface).
 HEAVY_GATES += build-plan
 build-plan:
 	@echo ">> build-plan: --auto chains td-built deps into downstream builds (subjects DERIVED from the recipe graph, no manifest) — each subject's .drv references td's deps (NOT guix's), runs, reproducibly, at distinct paths"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
 	TD_RECIPE_EVAL=`TD_GUIX="$(GUIX)" sh tests/recipe-eval-tool.sh "$(CURDIR)/.td-build-cache/recipe-eval"`; export TD_RECIPE_EVAL; \
-	test -x "$$tb" -a -x "$$TD_RECIPE_EVAL" || { echo "ERROR: could not resolve td-builder / td-recipe-eval" >&2; exit 1; }; \
+	test -x "$$TD_RECIPE_EVAL" || { echo "ERROR: could not resolve td-recipe-eval" >&2; exit 1; }; \
+	grep ' /gnu/store/' "$(CURDIR)/tests/td-builder-rust.lock" | sed 's/^[^ ]* //' | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/build-plan/stage0"; load_stage0; \
+	tb="$$TB"; \
 	cu=`grep -- '-coreutils-' "$(CURDIR)/tests/grep-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
 	test -n "$$cu" || { echo "ERROR: no coreutils for the scrubbed PATH" >&2; exit 1; }; \
 	if ls "$$cu/bin" | grep -qE '^(guix|guile)$$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
@@ -39,7 +44,7 @@ build-plan:
 	for S in $$subjects; do \
 	  edges=`grep -oE '"inputs":\[[^]]*\]' "$$jd/$$S.json" | sed 's/^"inputs"://' | grep -oE '"[^"]*"' | tr -d '"' | while read i; do echo " $$owned " | grep -q " $$i " && echo "$$i"; done`; \
 	  { grep ' /gnu/store/' "$(CURDIR)/tests/$$S-no-guix.lock" | grep -v 'td-recipe-output'; for d in $$edges; do grep ' /gnu/store/' "$(CURDIR)/tests/$$d-no-guix.lock" 2>/dev/null; done; } | sed 's/^[^ ]* //' | sort -u | xargs $(GUIX) build >/dev/null || { echo "ERROR: could not realize guix seeds for $$S" >&2; exit 1; }; \
-	  env -i HOME="$$root" TMPDIR="$$root/tmp" PATH="$$cu/bin" "$$tb" build-plan --auto "$$S" "$$jd" "$(CURDIR)/tests" /gnu/store "$$root" > "$$root/out-$$S" 2>"$$root/err-$$S" || { echo "FAIL: build-plan --auto $$S (guix/Guile off PATH):" >&2; tail -30 "$$root/err-$$S" >&2; exit 1; }; \
+	  env -i HOME="$$root" TMPDIR="$$root/tmp" PATH="$$cu/bin" TD_BUILDER_PATH="$$TD_BUILDER_PATH" TD_BUILDER_STORE="$$TD_BUILDER_STORE" TD_BUILDER_DB="$$TD_BUILDER_DB" "$$tb" build-plan --auto "$$S" "$$jd" "$(CURDIR)/tests" /gnu/store "$$root" > "$$root/out-$$S" 2>"$$root/err-$$S" || { echo "FAIL: build-plan --auto $$S (guix/Guile off PATH):" >&2; tail -30 "$$root/err-$$S" >&2; exit 1; }; \
 	  td_S=`sed -n "s/^STEP $$S //p" "$$root/out-$$S"`; \
 	  test -n "$$td_S" || { echo "FAIL: --auto did not report the $$S step" >&2; cat "$$root/out-$$S" >&2; exit 1; }; \
 	  sdrv=`ls "$$root/$$S"/*.drv 2>/dev/null | head -1`; \

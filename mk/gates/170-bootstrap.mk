@@ -37,10 +37,10 @@
 #     BIT-IDENTICAL stage0 (td's own double-build — no guix --check).
 #   [DURABLE self-discrimination] stage0's nar-hash is load-bearing: a perturbed input
 #     gives a different hash.
-#   [MIGRATION ORACLE, removable] stage0 is behaviorally EQUIVALENT to the guix-built
-#     td-builder (identical nar-hash on the same input) while being a DISTINCT binary
-#     (plain cargo vs cargo-build-system) — own, then diverge. Delete this leg when guix
-#     retires; the durable legs above still stand.
+#   (The guix-vs-stage0 differential oracle leg — stage0 behaviorally equal to yet a
+#    distinct binary from the guix-built td-builder — was RETIRED in R2 (#275,
+#    guix-as-packager surface → 0). The durable legs above ARE the feature; the last
+#    `guix build -e '(@ (system td-builder) td-builder)'` packager site is gone.)
 #
 # This is brick 1 of the bootstrap arc: it proves td-builder needs no guix to be
 # CREATED. Making the loop's builds USE stage0 as the in-store builder-of-record is the
@@ -82,13 +82,5 @@ bootstrap:
 	ha=`sha256sum "$$s0" | cut -d' ' -f1`; hb=`sha256sum "$$s0b" | cut -d' ' -f1`; \
 	test "$$ha" = "$$hb" || { echo "FAIL: the two stage0 builds differ ($$ha != $$hb) — the bootstrap is NOT reproducible" >&2; exit 1; }; \
 	echo "  [DURABLE intrinsic-reproducibility] two independent bootstraps are bit-identical (sha256 $$ha)"; \
-	echo ">> migration oracle: compare to the guix-built td-builder (removable when guix retires)"; \
-	gtb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
-	test -x "$$gtb" || { echo "ERROR: could not resolve the guix-built td-builder oracle" >&2; exit 1; }; \
-	hg=`"$$gtb" nar-hash "$$scratch/probe"`; \
-	test "$$h0" = "$$hg" || { echo "FAIL: stage0 and the guix-built td-builder DISAGREE on nar-hash ($$h0 != $$hg) — stage0 is not a faithful build" >&2; exit 1; }; \
-	echo "  [MIGRATION ORACLE] stage0 behaviorally equals the guix-built td-builder (same nar-hash $$hg)"; \
-	hgb=`sha256sum "$$gtb" | cut -d' ' -f1`; \
-	if [ "$$ha" = "$$hgb" ]; then echo "NOTE: stage0 is byte-identical to guix's build"; else echo "  [own, then diverge] stage0 ($$ha) is a DISTINCT binary from guix's cargo-build-system build ($$hgb) — expected, different build wrapper"; fi; \
 	rm -rf "$$scratch"; \
-	echo "PASS: td compiled its OWN stage0 td-builder from source with the pinned toolchain and NO guix / NO Guile / NO guix-daemon (offline, inside td's loop sandbox: only /gnu/store + worktree exposed, loopback-only netns); it runs its sentinel and nar-hashes (durable behavioral), links ONLY into the pinned store closure — no host libc/lib leak (durable hygiene), its hash is load-bearing (durable self-discrimination), two independent bootstraps are bit-identical (durable intrinsic reproducibility), and it is behaviorally equivalent to — yet a distinct binary from — the guix-built td-builder (migration oracle, own-then-diverge). The first td-builder no longer needs guix to be created; the toolchain seed is retired last (§5)."
+	echo "PASS: td compiled its OWN stage0 td-builder from source with the pinned toolchain and NO guix / NO Guile / NO guix-daemon (offline, inside td's loop sandbox: only /gnu/store + worktree exposed, loopback-only netns); it runs its sentinel and nar-hashes (durable behavioral), links ONLY into the pinned store closure — no host libc/lib leak (durable hygiene), its hash is load-bearing (durable self-discrimination), and two independent bootstraps are bit-identical (durable intrinsic reproducibility). The first td-builder no longer needs guix to be created (the guix-vs-stage0 differential oracle leg was retired in R2 — #275, guix-as-packager surface → 0); the toolchain seed is retired last (§5)."

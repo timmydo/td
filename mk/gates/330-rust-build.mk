@@ -20,12 +20,13 @@
 # store dir + db so it stages the source from there + reads its closure from the td db.
 # Per the differential+durable discipline:
 #   [STRUCTURAL] the build runs with guix/Guile off PATH and produces td-builder.
-#   [DURABLE behavioral] the td-built td-builder RUNS (nar-hash) and agrees with the
-#     guix-built one (behavioral equivalence — the migration-oracle leg).
+#   [DURABLE behavioral] the td-built td-builder RUNS (nar-hash) — a functioning builder,
+#     not just a compile that exits 0.
 #   [DURABLE repro] td-builder check's double-build agrees the output is
 #     reproducible (td's own oracle, not guix build --check).
-#   [MIGRATION ORACLE, removable] the td-built path differs from guix's
-#     cargo-build-system td-builder (own, then diverge).
+#   (The guix-vs-td differential oracle legs — behavioral equivalence to, and a distinct
+#    store path from, guix's cargo-build-system td-builder — were RETIRED in R2 (#275,
+#    guix-as-packager surface → 0). The durable legs above ARE the feature.)
 # Heavy (a bootstrap td-builder compile + a cargo self-host build + a double-build
 # check), so it slots in the heavy pool with the other td gates.
 HEAVY_GATES += rust-build
@@ -34,10 +35,8 @@ HEAVY_GATES += rust-build
 # — its lock is extended with the freshly-interned source, so it stays self-contained.
 BUILD_GATES += rust-build
 rust-build:
-	@echo ">> rust-build: td self-hosts td-builder via build-recipe (buildSystem rust) — .drv assembled + realized by td, guix/Guile off PATH; it runs, is reproducible, distinct from guix's build"
+	@echo ">> rust-build: td self-hosts td-builder via build-recipe (buildSystem rust) — .drv assembled + realized by td, guix/Guile off PATH; it runs and is reproducible"
 	@set -euo pipefail; \
-	tb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`/bin/td-builder; \
-	test -x "$$tb" || { echo "ERROR: could not resolve td-builder oracle" >&2; exit 1; }; \
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
 	case "$$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($$TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
 	echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($$TD_RECIPE_EVAL) — not the guix-built one (brick 4c)"; \
@@ -69,11 +68,8 @@ rust-build:
 	if [ -n "$$hit" ]; then echo "  [STRUCTURAL] CACHE HIT — builder source unchanged, reused td's prior self-host build (no rebuild): $$out"; else echo "  [STRUCTURAL] td assembled + realized the .drv with guix/Guile off PATH: $$out"; fi; \
 	printf 'td rust-build behavioral probe\n' > "$$scratch/probe"; \
 	h_td=`"$$ns/bin/td-builder" nar-hash "$$scratch/probe"`; \
-	h_gx=`"$$tb" nar-hash "$$scratch/probe"`; \
 	test -n "$$h_td" || { echo "FAIL: the td-built td-builder did not run / produced no nar-hash" >&2; exit 1; }; \
 	echo "  [DURABLE behavioral] the td-built td-builder RUNS: nar-hash = $$h_td"; \
-	test "$$h_td" = "$$h_gx" || { echo "FAIL: td-built and guix-built td-builder disagree ($$h_td != $$h_gx)" >&2; exit 1; }; \
-	echo "  [DURABLE behavioral / migration oracle] it agrees with the guix-built td-builder (behavioral equivalence)"; \
 	if [ -n "$$hit" ] && [ -f "$$sd/verified-reproducible" ]; then \
 	  echo "  [DURABLE repro] CACHED: builder source unchanged + previously verified reproducible — td-builder check skipped (verdict memoized)"; \
 	else \
@@ -84,8 +80,5 @@ rust-build:
 	  : > "$$sd/verified-reproducible"; \
 	  echo "  [DURABLE repro] td-builder check double-build agrees the rust-build output is reproducible"; \
 	fi; \
-	gtb=`$(GUIX) build $(LOAD) -e '(@ (system td-builder) td-builder)'`; \
-	if [ "$$out" = "$$gtb" ]; then echo "FAIL: td's rust-build path equals guix's cargo-build-system path — expected a distinct own-builder path" >&2; exit 1; fi; \
-	echo "  [MIGRATION ORACLE, removable] distinct from guix's cargo-build-system td-builder ($$gtb)"; \
 	rm -rf "$$scratch/chk" "$$scratch/tmp" "$$scratch/bout" "$$scratch/err" "$$scratch/checkout.txt" "$$scratch/chk.err"; mkdir -p "$$scratch/tmp"; \
-	echo "PASS: td self-hosted td-builder via build-recipe (buildSystem rust) — every input resolved from a pinned lock (no specification->package), the .drv assembled by td (no guix (derivation …)) and realized daemon-free (no guix-daemon), with guix/Guile SCRUBBED FROM PATH; the output RUNS and agrees with the guix-built builder (durable behavioral), is reproducible by td's own double-build (durable), and lands at a distinct store path from guix's cargo-build-system build (own, then diverge). The rustc/cargo/gcc seed stays external (§5, retired last)."
+	echo "PASS: td self-hosted td-builder via build-recipe (buildSystem rust) — every input resolved from a pinned lock (no specification->package), the .drv assembled by td (no guix (derivation …)) and realized daemon-free (no guix-daemon), with guix/Guile SCRUBBED FROM PATH; the output RUNS (durable behavioral) and is reproducible by td's own double-build (durable). The guix-vs-td differential oracle legs were retired in R2 (#275, guix-as-packager surface → 0). The rustc/cargo/gcc seed stays external (§5, retired last)."

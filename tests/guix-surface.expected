@@ -5,9 +5,4 @@
 # growing it needs a deliberate edit here, called out in the PR (directive 3).
 # Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB>(system <mod>) <name>
-packager-sites: 5
-mk/gates/170-bootstrap.mk	(system td-builder) td-builder
-mk/gates/175-td-builder.mk	(system td-builder) td-builder
-mk/gates/330-rust-build.mk	(system td-builder) td-builder
-mk/gates/365-bootstrap-build.mk	(system td-builder) td-builder
-mk/gates/365-build-plan.mk	(system td-builder) td-builder
+packager-sites: 0
