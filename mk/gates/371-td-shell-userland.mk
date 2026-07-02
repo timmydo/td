@@ -1,21 +1,23 @@
-# td-shell-userland — the REAL `td shell` product command over the REAL shipped Rust
-# userland, end-to-end and GUIX-FREE. `td shell ripgrep -- rg PATTERN tree` (and a multi-tool
-# `td shell ripgrep fd -- …`) resolves each PKG to a td RECIPE, provisions its crate closure
-# GUIX-FREE (intern the warmed source + crate set → build-recipe's TD_VENDOR_DIR form, the
-# crate-closure path that until now lived only in the bespoke `crate-free-build.sh` harness),
-# builds it with td-builder itself, composes the command's PATH from the td store OUTPUT, and
-# execs — with guix/Guile SCRUBBED from PATH, so a green run proves no `guix` process is in the
-# resolve/build/exec path. This is the use-case complement to the per-tool `rust-<x>` gates:
-# those assert each tool builds == its pin in isolation; THIS asserts a person can actually USE
-# the shipped userland through the product command. All legs are DURABLE behavioral (NO guix
-# oracle): rg greps a needle (and not the unrelated file); the rg/fd on PATH are td's OWN builds
-# at td store paths; fd+rg cooperate in one shell on a real task; an unknown package errors with
-# no guix fallback. The rust/gcc toolchain SEED stays guix-built (retired last by the source
-# bootstrap). tests/td-shell-userland.sh carries the legs; the ripgrep+fd crate closures are
-# warmed by the check.sh prelude (`td-feed warm crate`, sha256 == the crates.io index cksum).
-# Build gate (stage0 + td-recipe-eval via the build-recipes prelude) → BUILD_GATES + HEAVY_GATES.
+# td-shell-userland — the end-to-end gate for the shipped Rust userland, driven through the REAL
+# `td shell <tool> -- <tool> <real-task>` PRODUCT command over td's OWN /td/store toolchain,
+# GUIX-FREE (no guix rust, no guix gcc-toolchain in the build path — the #258 "347/371 cutover").
+# A person types `td shell ripgrep -- rg PATTERN tree`; the shipped tool builds on demand with td's
+# native x86_64 gcc 14.3.0 + binutils 2.44 + glibc 2.41 (assembled by gate 416/424's library,
+# fetched from the signed subst store or built from seed), links the /td/store glibc (ELF interp =
+# /td/store/ld), and RUNS in a store-ns own-root with /gnu/store ABSENT. run_shell learned the
+# native path (builder/src/main.rs run_shell_native): it stages the built tool into the native
+# store and execs it in the own-root binding /td/store + the cwd — so `td shell` is the guix-free
+# product command, not a bespoke harness. Per tool: [behavioral] the tool does its real job in the
+# own-root; [no-guix] the built tool references no guix rust/gcc-toolchain, interp = /td/store/ld;
+# [native-arch] the linker was the native x86_64 gcc (ELF64); [td-built] the bin is td's own build
+# staged in the /td/store store; [supply-chain] every vendored crate's sha256 ∈ the shipped
+# Cargo.lock; [repro] the double-build is reproducible (prime directive 1). The structural legs are
+# SUPPORTING evidence behind the behavioral run, never the point (AGENTS.md). Crate closures are
+# warmed by the check.sh prelude (`td-feed warm crate`); the rust tarball + coreutils/bash/tar/gzip
+# build seed are the retired-last seed. The shipped userland set (TD_USERLAND_TOOLS) grows tool by
+# tool as each is verified through the product command; ripgrep is the template. HEAVY (assembles
+# the native toolchain + warms td-recipe-eval itself), so NOT a BUILD_GATE — like gate 424.
 HEAVY_GATES += td-shell-userland
-BUILD_GATES += td-shell-userland
 td-shell-userland:
-	@echo ">> td-shell-userland: td shell builds + runs the real Rust userland (ripgrep, fd) GUIX-FREE and execs a real task (durable behavioral; no guix process, no oracle)"
-	sh tests/td-shell-userland.sh
+	@echo ">> td-shell-userland: td shell builds + runs the shipped Rust userland over td's OWN /td/store toolchain (native gcc/binutils/glibc; guix rust + gcc-toolchain removed), guix-free own-root run"
+	@GUIX="$(GUIX)" ROOT="$(CURDIR)" sh tests/td-shell-userland.sh

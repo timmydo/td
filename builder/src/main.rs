@@ -2296,7 +2296,16 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
 
     // Build each named package with td-builder itself — no guix — and collect the
     // td store output's bin/sbin dirs to put on PATH.
+    // NATIVE MODE (TD_SHELL_NATIVE_STORE): the rust tools are linked by td's OWN /td/store
+    // toolchain (ELF interp = /td/store/ld), so they cannot exec on the host (which has no
+    // /td/store). They are staged into the native store and run in a store-ns own-root that
+    // binds it at /td/store (see run_shell_native). The build itself is env-driven — the caller
+    // sets TD_SEED_STORE / TD_EXTRA_DBS / TD_RUST_STORE_{INTERP,RPATH,BDIR} and points
+    // TD_SHELL_STORE_DB + TD_SHELL_LOCKS at the native store + rewritten locks — so the build
+    // loop needs no native-specific branch, only the exec + PATH do.
+    let native_store = std::env::var("TD_SHELL_NATIVE_STORE").ok().filter(|s| !s.is_empty());
     let mut prefix_dirs: Vec<String> = Vec::new();
+    let mut built: Vec<(String, String)> = Vec::new(); // (output basename, host outdir tree)
     for pkg in pkgs {
         // Resolve PKG to a td recipe via the Rust catalog (td-recipe-eval) and emit its
         // JSON FIRST — an unknown PKG ⇒ loud "no td recipe" error, NOT a guix fallback.
@@ -2362,13 +2371,34 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         for sub in ["bin", "sbin"] {
             let dir = format!("{outdir}/{sub}");
             if Path::new(&dir).is_dir() {
-                prefix_dirs.push(dir);
+                // On the host PATH points at the scratch newstore tree; in native mode it
+                // points INSIDE the own-root, where the tool is staged at /td/store/<base>.
+                prefix_dirs.push(match &native_store {
+                    Some(_) => format!("/td/store/{base}/{sub}"),
+                    None => dir.clone(),
+                });
                 any = true;
             }
         }
         if !any {
             return Err(format!("build `{pkg}': td output {outdir} has no bin/sbin"));
         }
+        built.push((base.to_string(), outdir));
+    }
+
+    // Explicit `-- CMD…`, else drop into an interactive $SHELL (fallback /bin/sh).
+    let shell;
+    let (prog, prog_args): (&str, &[String]) = if let Some((first, args)) = cmd.split_first() {
+        (first.as_str(), args)
+    } else {
+        shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        (shell.as_str(), &[])
+    };
+
+    // Native /td/store toolchain: run in a store-ns own-root (no host exec — the tools' interp
+    // is /td/store/ld). Otherwise exec on the host PATH (the tools link the guix seed).
+    if let Some(store) = native_store {
+        return run_shell_native(&store, &built, &prefix_dirs, prog, prog_args);
     }
 
     // Compose the child PATH ourselves: the td package bins FIRST (so the
@@ -2384,20 +2414,88 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         path.push_str(&inherited);
     }
 
-    // Explicit `-- CMD…`, else drop into an interactive $SHELL (fallback /bin/sh).
-    let shell;
-    let (prog, prog_args): (&str, &[String]) = if let Some((first, args)) = cmd.split_first() {
-        (first.as_str(), args)
-    } else {
-        shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        (shell.as_str(), &[])
-    };
-
     Command::new(prog)
         .args(prog_args)
         .env("PATH", &path)
         .status()
         .map_err(|e| format!("run `{prog}': {e}"))
+}
+
+/// Native `/td/store` exec for `td shell`: the built rust tools were linked by td's OWN
+/// `/td/store` toolchain (ELF interp = the `/td/store` x86_64 ld), so they cannot run on the
+/// host (there is no `/td/store` there). Stage each built tool into the NATIVE STORE by basename
+/// and run CMD in a store-ns own-root that binds the native store at `/td/store` (its toolchain
+/// + the staged tools) and the current working directory (so relative file args resolve) — with
+/// `/gnu/store` ABSENT and PATH = the tools' `/td/store` bins. This is the product command over
+/// td's OWN guix-free toolchain (the #258 "347/371 cutover").
+fn run_shell_native(
+    native_store: &str,
+    built: &[(String, String)],
+    prefix_dirs: &[String],
+    prog: &str,
+    prog_args: &[String],
+) -> Result<std::process::ExitStatus, String> {
+    // Stage each built tool tree into the native store at /td/store/<base> (host-side write,
+    // before the read-only bind below); the toolchain the caller assembled is already there.
+    for (base, outdir) in built {
+        let dest = format!("{native_store}/{base}");
+        if !Path::new(&dest).exists() {
+            copy_canonical(Path::new(outdir), Path::new(&dest))?;
+        }
+    }
+    // Resolve a bare program name to its /td/store bin (host_shell execs CMD directly). A
+    // sub-spawn (`fd -x rg`) still resolves via the child PATH we set below.
+    let mut prog_run = prog.to_string();
+    if !prog.contains('/') {
+        for d in prefix_dirs {
+            if let Some(rest) = d.strip_prefix("/td/store/") {
+                if Path::new(&format!("{native_store}/{rest}/{prog}")).is_file() {
+                    prog_run = format!("{d}/{prog}");
+                    break;
+                }
+            }
+        }
+    }
+    let path = prefix_dirs.join(":");
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("cwd: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    let binds = vec![
+        sandbox::Bind {
+            src: native_store.to_string(),
+            dest: Some("/td/store".to_string()),
+            readonly: true,
+            ro_optional: false,
+        },
+        sandbox::Bind {
+            src: cwd.clone(),
+            dest: Some(cwd.clone()),
+            readonly: false,
+            ro_optional: false,
+        },
+    ];
+    let scratch = std::env::temp_dir().join(format!(
+        "td-shell-ns-{}-{}",
+        sys::getuid(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+    let result = sandbox::host_shell(
+        &prog_run,
+        prog_args,
+        &binds,
+        &["/tmp".to_string()],
+        &path,
+        "/tmp",
+        &cwd,
+        &[],
+        &scratch,
+    )
+    .map_err(|e| format!("run `{prog}' in the /td/store own-root: {e}"));
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
 }
 
 /// Intern a source TREE into a td-OWNED store with td's OWN recursive add-to-store
