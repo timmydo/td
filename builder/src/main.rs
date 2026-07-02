@@ -4806,7 +4806,14 @@ fn main() -> ExitCode {
         Some("realize") if args.len() == 5 => {
             let (drv_path, store_dir, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
-                realize_drv(drv_path, std::slice::from_ref(store_dir), &[], Path::new(scratch), &[], None, None)
+                // Honor the optional td-OWNED stage0 builder override (TD_BUILDER_PATH/STORE/DB)
+                // exactly as the daemon's realize path does — a td-ASSEMBLED drv (e.g. corpus
+                // hello) names the stage0 td-builder as its builder, which is NOT in /gnu/store,
+                // so without the override the content-scanned closure can't stage it. Unset env
+                // ⇒ None ⇒ identical to the prior behavior. The override rides into closure.txt,
+                // so a later `td-builder build`/`check` of this drv stages the builder too.
+                let ov = builder_override_from_env()?;
+                realize_drv(drv_path, std::slice::from_ref(store_dir), &[], Path::new(scratch), &[], ov.as_ref(), None)
                     .map(|_| ())
             };
             match run() {
