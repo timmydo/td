@@ -885,6 +885,12 @@ fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
         }
         let _ = fs::set_permissions(to, md.permissions());
     } else if ft.is_file() {
+        // cp -f semantics: an existing dest may be read-only (rust ships 0444 files, and the
+        // rust-std rustlib merge overlays rustc's rustlib), and fs::copy would then fail with
+        // EACCES opening it for write — remove it first so the overlay always lands.
+        if fs::symlink_metadata(to).is_ok() {
+            let _ = fs::remove_file(to);
+        }
         fs::copy(from, to)?;
     }
     Ok(())
@@ -1103,6 +1109,23 @@ mod tests {
         fs::write(d.join("dirty"), b"\x7fELF refers to /gnu/store/abc-foo/lib").unwrap();
         assert!(!contains_gnu_store(&d.join("clean")).unwrap());
         assert!(contains_gnu_store(&d.join("dirty")).unwrap());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copy_tree_overlays_a_read_only_dest() {
+        // the rustlib merge overlays rust-std over rustc's rustlib; rust ships 0444 files, so
+        // the overlay must succeed over a read-only destination (cp -f), not fail with EACCES.
+        let d = tmp("td-xn-test-overlay");
+        let src = d.join("src");
+        let dst = d.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("f"), b"OLD").unwrap();
+        set_mode(&dst.join("f"), 0o444).unwrap(); // read-only existing dest
+        fs::write(src.join("f"), b"NEW").unwrap();
+        copy_tree_contents(&src, &dst).expect("overlay over a read-only dest must succeed");
+        assert_eq!(fs::read(dst.join("f")).unwrap(), b"NEW");
         let _ = fs::remove_dir_all(&d);
     }
 
