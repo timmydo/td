@@ -11,8 +11,15 @@
 # Usage:
 #   ci/daily-full-suite.sh [--no-system] [--verdict FILE]
 # Exit: a bitfield over the suites — 1 heavy red, 2 system red, 4 harness red
-#   (guix-free /td/store tier); 0 = all green, up to 7. Setup errors exit 8/9
-#   (before any suite runs), kept out of the bitfield range.
+#   (guix-free /td/store tier); 0 = all green, up to 7. Setup errors exit 8/9/10
+#   (before any suite runs, or before any GATE inside a suite runs), kept out of
+#   the bitfield range:
+#     8  - unknown CLI argument
+#     9  - git fetch of origin/main failed
+#     10 - runner host not provisioned: check.sh's own integrity guard refused
+#          to start (e.g. host guix missing/mismatched vs channels.scm — see
+#          issue #268). This is a RUNNER problem, not a code regression: no
+#          gate ran, so there is nothing to triage/revert on the td side.
 set -uo pipefail
 
 verdict=".td-daily-verdict"
@@ -21,7 +28,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --no-system) run_system=0; shift ;;
     --verdict) verdict=$2; shift 2 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 8 ;;
   esac
 done
@@ -32,6 +39,7 @@ hlog=$(mktemp); slog=$(mktemp); xlog=$(mktemp)
 trap 'rm -f "$hlog" "$slog" "$xlog"' EXIT
 
 heavy_rc=0; system_rc=0; system_fail=""; harness_rc=0; harness_fail=""
+env_error=0; env_error_msg=""
 echo ">> daily backstop: full ./check.sh on origin/main ($main)"
 # TD_SUBST_FORCE_BUILD=1: the daily is the SOLE from-seed authoritative build + publisher
 # (x64-toolchain-subst). Suppress the fetch short-circuit so gate 414 ALWAYS builds the x86_64
@@ -41,10 +49,27 @@ echo ">> daily backstop: full ./check.sh on origin/main ($main)"
 TD_SUBST_FORCE_BUILD=1 TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} ./check.sh >"$hlog" 2>&1 || heavy_rc=$?
 heavy_fail=$(grep -E '^FAIL' "$hlog" | head -5 | tr '\n' ';')
 
-if [ "$run_system" = 1 ]; then
+# check.sh's own integrity guard (host guix == pinned channels.scm commit) aborts
+# BEFORE any gate runs when the runner host isn't provisioned with guix at all, or
+# with a mismatched channel. That is a runner-provisioning problem, not a gate
+# regression (issue #268) — a bare heavy=red/system=red with no *_fail is
+# indistinguishable from a real break, so detect it here and report it distinctly
+# instead of sending an agent hunting for a code regression that doesn't exist.
+if [ $heavy_rc -ne 0 ] && grep -q '^check\.sh: FATAL: host guix' "$hlog"; then
+  env_error=1
+  env_error_msg="runner host not provisioned: host guix missing/mismatched vs channels.scm (see issue #268) — no gate ran, not a code regression"
+  heavy_fail="$env_error_msg"
+  echo ">> daily backstop: $env_error_msg"
+fi
+
+if [ "$run_system" = 1 ] && [ $env_error -eq 0 ]; then
   echo ">> daily backstop: ./check.sh check-system on origin/main ($main)"
   TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} ./check.sh check-system >"$slog" 2>&1 || system_rc=$?
   system_fail=$(grep -E '^FAIL' "$slog" | head -5 | tr '\n' ';')
+elif [ "$run_system" = 1 ]; then
+  system_rc=1
+  system_fail="SKIPPED — $env_error_msg"
+  echo ">> daily backstop: check-system SKIPPED — $env_error_msg"
 fi
 
 # host-sandbox-stage0 inc2c: the GUIX-FREE harness tier — the loop on td's OWN /td/store
@@ -52,7 +77,10 @@ fi
 # .td-build-cache/harness; consume it here. This is the loop the guix-less VM runs. Only
 # attempt it when the harness was persisted (heavy green enough to reach gate 420); a missing
 # harness is a heavy-suite problem already reported, not a separate harness failure.
-if [ -d .td-build-cache/harness/store ] && [ -s .td-build-cache/harness/rel ]; then
+if [ $env_error -eq 1 ]; then
+  harness_rc=4; harness_fail="SKIPPED — $env_error_msg"
+  echo ">> daily backstop: check-harness SKIPPED — $env_error_msg"
+elif [ -d .td-build-cache/harness/store ] && [ -s .td-build-cache/harness/rel ]; then
   echo ">> daily backstop: ./check.sh check-harness on origin/main ($main) — guix-free /td/store loop"
   ./check.sh check-harness >"$xlog" 2>&1 || harness_rc=$?
   harness_fail=$(grep -E '^FAIL|^check.sh: FATAL' "$xlog" | head -5 | tr '\n' ';')
@@ -64,6 +92,8 @@ fi
 {
   echo "commit=$main"
   echo "date=$(date -Is)"
+  echo "env_error=$env_error"
+  echo "env_error_msg=$env_error_msg"
   echo "heavy=$([ $heavy_rc -eq 0 ] && echo green || echo red)"
   echo "heavy_rc=$heavy_rc"
   echo "heavy_fail=$heavy_fail"
@@ -74,6 +104,13 @@ fi
   echo "harness_rc=$harness_rc"
   echo "harness_fail=$harness_fail"
 } > "$verdict"
+
+if [ $env_error -eq 1 ]; then
+  echo ">> daily backstop: RUNNER NOT PROVISIONED at $main — $env_error_msg"
+  echo ">> daily backstop: this is a HOST setup gap, not a code regression — no fix-or-revert PR is warranted from this alone. Provision the runner with guix pulled to the channels.scm-pinned commit, then re-run."
+  cat "$verdict"
+  exit 10
+fi
 
 rc=0
 [ $heavy_rc -ne 0 ] && rc=$((rc+1))
