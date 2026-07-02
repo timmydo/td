@@ -2249,6 +2249,68 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|e| format!("td-recipe-eval output not UTF-8: {e}"))
 }
 
+/// The pre-provisioned NATIVE `/td/store` toolchain `td shell` builds the Rust userland with,
+/// handed in via the `TD_SHELL_NATIVE_*` environment (gate `td-shell-userland` / host-prep
+/// stages it: fetch-or-build the native x86_64 gcc/binutils/glibc + relinked rust, stage a
+/// combined seed+native store, and expose it). When present, a vendored rust build (ripgrep,
+/// fd, …) links this toolchain — never the guix rust/gcc-toolchain: the seed lock is retargeted
+/// (`native_seed_lock_body`), the combined store is the build's STORE-DIR + `TD_SEED_STORE`, the
+/// native store's db rides `TD_EXTRA_DBS`, and `TD_RUST_STORE_{INTERP,RPATH,BDIR}` put run_rust
+/// in native link mode. Absence is fine for a plain seed package (hello); a *vendored rust* build
+/// with no native toolchain provisioned is a hard error (no guix-rust fallback — the cutover).
+struct NativeToolchain {
+    /// The combined seed+native store dir (guix build seed + the `/td/store` toolchain trees):
+    /// the build's STORE-DIR and `TD_SEED_STORE`.
+    store: String,
+    /// A placeholder `TD_SEED_DB` companion (the engine content-scans `store`; this is the legacy
+    /// set-together companion, never `/var/guix/db`).
+    seed_db: String,
+    /// The native toolchain's own td store db (its `/td/store` outputs + refs) → `TD_EXTRA_DBS`.
+    extra_dbs: String,
+    /// Native link mode: the `/td/store` glibc loader, RUNPATH, and `-B` dir baked by run_rust.
+    interp: String,
+    rpath: String,
+    bdir: String,
+    /// The native toolchain lock lines (`…-x86_64-store-native /td/store/<rel> seed`, one per
+    /// line) appended to the retargeted seed lock.
+    lock_lines: String,
+}
+
+impl NativeToolchain {
+    /// Read the `TD_SHELL_NATIVE_*` env. `Ok(None)` when unset (no native toolchain provisioned);
+    /// `Err` when partially set (a provisioning bug we surface loudly rather than silently
+    /// falling back to guix). `TD_SHELL_NATIVE_LOCK` names a file with the native lock lines.
+    fn from_env() -> Result<Option<NativeToolchain>, String> {
+        let store = match std::env::var("TD_SHELL_NATIVE_STORE") {
+            Ok(s) if !s.is_empty() => s,
+            _ => return Ok(None),
+        };
+        let get = |k: &str| -> Result<String, String> {
+            std::env::var(k)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("TD_SHELL_NATIVE_STORE is set but {k} is not (native-toolchain provisioning is incomplete)"))
+        };
+        let seed_db = get("TD_SHELL_NATIVE_DB")?;
+        let extra_dbs = get("TD_SHELL_NATIVE_EXTRA_DBS")?;
+        let interp = get("TD_SHELL_NATIVE_INTERP")?;
+        let rpath = get("TD_SHELL_NATIVE_RPATH")?;
+        let bdir = get("TD_SHELL_NATIVE_BDIR")?;
+        let lock_file = get("TD_SHELL_NATIVE_LOCK")?;
+        let lock_lines = std::fs::read_to_string(&lock_file)
+            .map_err(|e| format!("read TD_SHELL_NATIVE_LOCK {lock_file}: {e}"))?;
+        Ok(Some(NativeToolchain {
+            store,
+            seed_db,
+            extra_dbs,
+            interp,
+            rpath,
+            bdir,
+            lock_lines,
+        }))
+    }
+}
+
 /// td-builder shell — run a command with td-BUILT packages on PATH. td's own
 /// `guix shell`, but with NO guix anywhere: each PKG is resolved to a td RECIPE and
 /// BUILT by td-builder itself (the recipe → `td-builder build-recipe`, whose
@@ -2256,14 +2318,16 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
 /// the command's PATH from the td store OUTPUT and execs. There is no `guix`
 /// process in the resolve/build/exec path; an unknown package errors ("no td recipe
 /// for PKG"), it does NOT fall back to guix. The package that lands on PATH is td's
-/// own build at td's own store path. (Boundary, North Star step 1: the build still
-/// links the pinned toolchain SEED from the lock — guix-built today, the frozen seed
-/// tarball next, CLAUDE.md "North star" step 2 — but no guix runs here.)
+/// own build at td's own store path. A vendored rust build (ripgrep, fd, …) links the
+/// NATIVE `/td/store` toolchain provisioned via `TD_SHELL_NATIVE_*` (see `NativeToolchain`),
+/// never the guix rust/gcc-toolchain — that path is retired for `td shell`; a plain seed
+/// package (hello) still links the pinned build seed from its `<pkg>-no-guix.lock`.
 ///
 /// Config (env): TD_RECIPE_EVAL (td's Rust recipe-catalog evaluator, to emit the
-/// recipe), TD_SHELL_LOCKS (dir of `<pkg>-no-guix.lock`, default `tests`),
-/// TD_SHELL_STORE_DB (store DB for closure staging, default `/var/guix/db/db.sqlite`),
-/// TD_SHELL_CACHE (build cache root, default `$HOME/.cache/td-shell`),
+/// recipe), TD_SHELL_LOCKS (dir of `<pkg>.lock` / `<pkg>-no-guix.lock`, default `tests`),
+/// TD_SHELL_STORE_DB (store DB for the plain seed-package path, default `/var/guix/db/db.sqlite`),
+/// TD_SHELL_NATIVE_* (the pre-provisioned native `/td/store` toolchain for vendored rust builds —
+/// `NativeToolchain::from_env`), TD_SHELL_CACHE (build cache root, default `$HOME/.cache/td-shell`),
 /// TD_BUILDER_PATH/STORE/DB (optional stage0 builder override, so the build's builder
 /// is td-placed too).
 ///
@@ -2293,6 +2357,9 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         .map_err(|e| format!("locate td-builder: {e}"))?
         .to_string_lossy()
         .into_owned();
+    // The pre-provisioned NATIVE /td/store toolchain (TD_SHELL_NATIVE_*), if any. When present, a
+    // vendored rust build links it instead of the guix rust/gcc-toolchain (the `td shell` cutover).
+    let native = NativeToolchain::from_env()?;
 
     // Build each named package with td-builder itself — no guix — and collect the
     // td store output's bin/sbin dirs to put on PATH.
@@ -2316,11 +2383,40 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         // not a bespoke harness. A seed package (hello) has no warmed closure ⇒ the plain
         // 4-arg path on its `<pkg>-no-guix.lock`.
         let mut bargs: Vec<String> = vec!["build-recipe".into(), json_file.clone()];
+        // A vendored rust build links the native /td/store toolchain when it is provisioned; a
+        // plain seed package (hello) never does. Track it so the build-recipe subprocess gets the
+        // native env (TD_SEED_STORE/TD_EXTRA_DBS/TD_RUST_STORE_*) only for the vendored-rust case.
+        let mut used_native = false;
         match provision_rust_inputs(pkg, &lock_dir, &sd, &self_exe)? {
             Some((seedlock, extra)) => {
-                bargs.push(seedlock);
-                bargs.push(sd.clone());
-                bargs.push(store_db.clone());
+                match &native {
+                    // CUTOVER: retarget the seed lock onto the native /td/store toolchain (drop the
+                    // guix rust/gcc-toolchain lines) and build against the combined seed+native
+                    // store — never the guix rust/gcc-toolchain. This is the `td shell` product
+                    // command building the Rust userland with td's OWN toolchain.
+                    Some(nt) => {
+                        let body = std::fs::read_to_string(&seedlock)
+                            .map_err(|e| format!("read seed lock {seedlock}: {e}"))?;
+                        let retargeted = native_seed_lock_body(&body, &nt.lock_lines);
+                        std::fs::write(&seedlock, &retargeted)
+                            .map_err(|e| format!("write seed lock {seedlock}: {e}"))?;
+                        bargs.push(seedlock);
+                        bargs.push(sd.clone());
+                        bargs.push(nt.store.clone());
+                        used_native = true;
+                    }
+                    // No native toolchain provisioned ⇒ this vendored rust build has no toolchain.
+                    // The guix rust/gcc-toolchain path is RETIRED for `td shell` (the cutover): fail
+                    // loudly rather than silently fall back to guix.
+                    None => {
+                        return Err(format!(
+                            "build `{pkg}': a vendored rust build needs the native /td/store toolchain, \
+                             but TD_SHELL_NATIVE_STORE is not set. Provision it (gate `td-shell-userland' \
+                             or host-prep stages the native gcc/binutils/glibc + relinked rust). \
+                             The guix rust/gcc-toolchain path is retired for `td shell'."
+                        ));
+                    }
+                }
                 bargs.extend(extra);
             }
             None => {
@@ -2338,8 +2434,23 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         // an unchanged recipe a HIT — build-on-demand + cached). A subprocess keeps the
         // build's chatter off the command's stdout, and rides the inherited
         // TD_BUILDER_* override so the builder is the td-placed stage0 too.
-        let out = Command::new(&self_exe)
-            .args(&bargs)
+        let mut build = Command::new(&self_exe);
+        build.args(&bargs);
+        if used_native {
+            // Native link mode, exactly as `tests/rust-x86_64-userland-store-native.sh` sets it:
+            // the combined store is content-scanned for the closure, the native toolchain's own db
+            // adds its /td/store refs, and run_rust bakes the /td/store interp/RUNPATH/-B.
+            if let Some(nt) = &native {
+                build
+                    .env("TD_SEED_STORE", &nt.store)
+                    .env("TD_SEED_DB", &nt.seed_db)
+                    .env("TD_EXTRA_DBS", &nt.extra_dbs)
+                    .env("TD_RUST_STORE_INTERP", &nt.interp)
+                    .env("TD_RUST_STORE_RPATH", &nt.rpath)
+                    .env("TD_RUST_STORE_BDIR", &nt.bdir);
+            }
+        }
+        let out = build
             .output()
             .map_err(|e| format!("build `{pkg}': spawn td-builder build-recipe: {e}"))?;
         if !out.status.success() {
@@ -2453,6 +2564,35 @@ fn seed_lock_body(lock_body: &str, sourcekey: &str, src_canonical: &str) -> Stri
     }
     seed.push_str(&format!("{sourcekey} {src_canonical}\n"));
     seed
+}
+
+/// Retarget a rust seed lock onto the NATIVE `/td/store` toolchain: drop every guix rust /
+/// gcc-toolchain seed line (a `/gnu/store/…-rust-…` or `…-gcc-toolchain-…` entry), keep the
+/// retired-last build seed (coreutils/bash/tar/gzip) and the interned-source line, then append
+/// `native_lines` (the `/td/store` gcc/binutils/glibc + relinked-rust lock lines the gate
+/// pre-provisioned). Pure (no I/O) so it is unit-tested directly — the same transform
+/// `tests/rust-x86_64-userland-store-native.sh` does with `grep -vE -- '-rust-|-gcc-toolchain-'`.
+/// This is the `td shell` cutover: the product command builds the Rust userland with td's OWN
+/// toolchain, never the guix rust/gcc-toolchain.
+fn native_seed_lock_body(seed_body: &str, native_lines: &str) -> String {
+    let mut out = String::new();
+    for line in seed_body.lines() {
+        // Only a `/gnu/store/` toolchain line is dropped; the native `/td/store` lines and the
+        // non-toolchain seed (coreutils/bash/tar/gzip, no `-rust-`/`-gcc-toolchain-`) survive.
+        let is_guix_toolchain = line.contains("/gnu/store/")
+            && (line.contains("-rust-") || line.contains("-gcc-toolchain-"));
+        if is_guix_toolchain {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let native = native_lines.trim_end_matches('\n');
+    if !native.is_empty() {
+        out.push_str(native);
+        out.push('\n');
+    }
+    out
 }
 
 /// Provision a rust recipe's crate closure for `td shell`, GUIX-FREE — the product-command
@@ -5762,6 +5902,79 @@ memchr-2.7.crate /gnu/store/ddd-memchr.crate
         assert!(seed.contains("# a comment line, kept verbatim\n"), "comment kept:\n{seed}");
         assert!(seed.contains("rust /gnu/store/aaa-rust-1.0\n"), "rust seed kept:\n{seed}");
         assert!(seed.contains("coreutils /gnu/store/bbb-coreutils-9.1\n"), "coreutils kept:\n{seed}");
+    }
+
+    // native_seed_lock_body is the `td shell` cutover transform: retarget a seed lock onto the
+    // native /td/store toolchain — drop the guix rust/gcc-toolchain lines, keep the retired-last
+    // build seed + the source pin, append the native toolchain lines. It mirrors what
+    // `tests/rust-x86_64-userland-store-native.sh` does with `grep -vE -- '-rust-|-gcc-toolchain-'`.
+    #[test]
+    fn native_seed_lock_body_retargets_onto_the_td_store_toolchain() {
+        // A realistic post-provision seed lock: guix rust + cargo + gcc-toolchain, the retired-last
+        // build seed (coreutils/bash/tar/gzip), and the interned source.
+        let seed = "\
+xxx-rust-1.93.0 /gnu/store/xxx-rust-1.93.0
+yyy-rust-1.93.0-cargo /gnu/store/yyy-rust-1.93.0-cargo
+zzz-gcc-toolchain-15.2.0 /gnu/store/zzz-gcc-toolchain-15.2.0
+bbb-coreutils-9.1 /gnu/store/bbb-coreutils-9.1
+ppp-bash-5.2.37 /gnu/store/ppp-bash-5.2.37
+vvv-tar-1.35 /gnu/store/vvv-tar-1.35
+ccc-gzip-1.14 /gnu/store/ccc-gzip-1.14
+ripgrep-source /gnu/store/interned-ripgrep-src
+";
+        let native = "\
+rust-1.96.0-x86_64-store-native /td/store/qnkl-rust-1.96.0-x86_64-store-native seed
+gcc-14.3.0-x86_64-native /td/store/ng-gcc-14.3.0-x86_64-native seed
+binutils-2.44-x86_64-native /td/store/nb-binutils-2.44-x86_64-native seed
+glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
+";
+        let out = native_seed_lock_body(seed, native);
+
+        // The guix rust / cargo / gcc-toolchain lines are GONE — the cutover, checked at the lock.
+        assert!(
+            !out.lines().any(|l| l.contains("/gnu/store/") && (l.contains("-rust-") || l.contains("-gcc-toolchain-"))),
+            "no guix rust/gcc-toolchain line may survive:\n{out}"
+        );
+        // The retired-last build seed and the source pin are KEPT verbatim.
+        for keep in [
+            "bbb-coreutils-9.1 /gnu/store/bbb-coreutils-9.1",
+            "ppp-bash-5.2.37 /gnu/store/ppp-bash-5.2.37",
+            "vvv-tar-1.35 /gnu/store/vvv-tar-1.35",
+            "ccc-gzip-1.14 /gnu/store/ccc-gzip-1.14",
+            "ripgrep-source /gnu/store/interned-ripgrep-src",
+        ] {
+            assert!(out.contains(&format!("{keep}\n")), "must keep `{keep}':\n{out}");
+        }
+        // The native /td/store toolchain lines are appended, each exactly once.
+        for nl in native.lines() {
+            assert_eq!(out.matches(nl).count(), 1, "native line `{nl}' appended once:\n{out}");
+        }
+        // No trailing blank line / double newline surprises: the body ends with a single newline.
+        assert!(out.ends_with("glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed\n"), "ends clean:\n{out}");
+    }
+
+    // A native line containing the substring `-rust-`/`-gcc-toolchain-` (e.g. a hypothetical
+    // `…-rust-…` native component) must NOT be dropped: the drop only fires on `/gnu/store/`
+    // lines, so appended `/td/store` native lines always survive.
+    #[test]
+    fn native_seed_lock_body_keeps_td_store_lines_even_if_named_rust() {
+        let seed = "aaa-rust-1.93.0 /gnu/store/aaa-rust-1.93.0\nbbb-coreutils-9.1 /gnu/store/bbb-coreutils-9.1\n";
+        let native = "some-rust-thing /td/store/hh-some-rust-thing seed\n";
+        let out = native_seed_lock_body(seed, native);
+        assert!(!out.contains("/gnu/store/aaa-rust-1.93.0"), "guix rust dropped:\n{out}");
+        assert!(out.contains("some-rust-thing /td/store/hh-some-rust-thing seed\n"), "td-store native rust line kept:\n{out}");
+        assert!(out.contains("bbb-coreutils-9.1 /gnu/store/bbb-coreutils-9.1\n"), "coreutils kept:\n{out}");
+    }
+
+    // Empty native lines (defensive): the transform still drops guix toolchain lines and does not
+    // append a stray blank line.
+    #[test]
+    fn native_seed_lock_body_tolerates_empty_native_lines() {
+        let seed = "aaa-rust-1.0 /gnu/store/aaa-rust-1.0\nbbb-coreutils-9.1 /gnu/store/bbb-coreutils-9.1\n";
+        let out = native_seed_lock_body(seed, "");
+        assert!(!out.contains("-rust-"), "guix rust dropped:\n{out}");
+        assert!(out.contains("bbb-coreutils-9.1 /gnu/store/bbb-coreutils-9.1\n"), "coreutils kept:\n{out}");
+        assert!(!out.contains("\n\n"), "no stray blank line:\n{out}");
     }
 
     // ---- persistent accumulating store DB (merge_regs) ----------------------
