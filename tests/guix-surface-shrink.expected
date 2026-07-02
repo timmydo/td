@@ -6,7 +6,7 @@
 # may only SHRINK); growth needs a deliberate edit here, called out in the PR for
 # sign-off (directive 8). Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB><category>
-surface-sites: 59
+surface-sites: 55
 ci/build-ci-image.sh	guix-db-read
 ci/build-ci-image.sh	lowering
 ci/import-store.sh	guix-db-read
@@ -35,10 +35,6 @@ mk/gates/185-offline.mk	lowering
 mk/gates/190-memo.mk	lowering
 mk/gates/205-spec-diff.mk	lowering
 mk/gates/230-drv-emit.mk	lowering
-mk/gates/235-td-drv-build.mk	gc
-mk/gates/235-td-drv-build.mk	lowering
-mk/gates/240-td-drv-add.mk	lowering
-mk/gates/245-td-drv-assemble.mk	lowering
 mk/gates/255-resolve.mk	lowering
 mk/gates/270-loop-rung.mk	lowering
 mk/gates/285-store-add-tree.mk	lowering
