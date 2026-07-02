@@ -121,7 +121,7 @@ load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builde
 export TD_STORE_DIR=/td/store
 
 snwork=`mktemp -d`
-trap 'rm -rf "$snwork" "${rtree:-}" "${ZLIBX:-}" "${XNBU:-}" "${XNGCCB:-}" "${cpathdir:-}"' EXIT INT TERM
+trap 'rm -rf "$snwork" "${rtree:-}" "${ZLIBX:-}" "${nrout:-}" "${cpathdir:-}"' EXIT INT TERM
 cpathdir=`dirname "$cpath"`
 
 # ============================================================================================

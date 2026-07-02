@@ -541,14 +541,21 @@ fn rewrite_binsh_shebangs(root: &Path, shell: &str) -> Result<(), String> {
                     continue;
                 }
                 let line = String::from_utf8_lossy(first);
-                let trimmed = line.trim_start_matches("#!").trim_start();
-                // matches `^#! */bin/sh` — the interpreter path ends in /bin/sh.
-                let interp = trimmed.split_whitespace().next().unwrap_or("");
+                // after "#!", skip leading spaces, then the interpreter token (up to the
+                // next whitespace); it must end in /bin/sh (matches `^#! */bin/sh`).
+                let after_bang = line.get(2..).unwrap_or("");
+                let ws_len = after_bang.len() - after_bang.trim_start().len();
+                let interp = after_bang.trim_start().split(char::is_whitespace).next().unwrap_or("");
                 if !interp.ends_with("/bin/sh") {
                     continue;
                 }
+                // PRESERVE the tail after the interpreter (args like " -e"), exactly as the
+                // shell `1s,^#! *[^ ]*/bin/sh,#!$csh,` keeps everything past /bin/sh — dropping
+                // it would silently change a `#!/bin/sh -e` script's error behavior.
+                let interp_end = 2 + ws_len + interp.len();
+                let tail = line.get(interp_end..).unwrap_or("");
                 let rest = bytes.get(first_end..).unwrap_or(&[]);
-                let mut new = format!("#!{shell}").into_bytes();
+                let mut new = format!("#!{shell}{tail}").into_bytes();
                 new.extend_from_slice(rest);
                 let _ = fs::write(&p, new);
             }
@@ -599,13 +606,13 @@ fn untar(xz: &Path, tarball: &Path, dest: &Path, strip: u32, comp: TarComp) -> R
         }
         TarComp::Xz => {
             // xz -dc TARBALL | tar -xf - -C dest [--strip-components=N]
-            let dec = Command::new(xz)
+            let mut dec = Command::new(xz)
                 .arg("-dc")
                 .arg(tarball)
                 .stdout(Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("{what}: spawn xz: {e}"))?;
-            let stdout = dec.stdout.ok_or_else(|| format!("{what}: xz produced no stdout"))?;
+            let stdout = dec.stdout.take().ok_or_else(|| format!("{what}: xz produced no stdout"))?;
             let mut tar = Command::new("tar");
             tar.arg("-xf").arg("-").arg("-C").arg(dest);
             if strip > 0 {
@@ -615,8 +622,14 @@ fn untar(xz: &Path, tarball: &Path, dest: &Path, strip: u32, comp: TarComp) -> R
                 .stdin(Stdio::from(stdout))
                 .status()
                 .map_err(|e| format!("{what}: spawn tar: {e}"))?;
+            // Reap the xz child + surface its exit: a corrupt/truncated .tar.xz makes xz
+            // fail while tar can still exit 0 on the partial stream, so check BOTH.
+            let dec_status = dec.wait().map_err(|e| format!("{what}: wait xz: {e}"))?;
             if !status.success() {
                 return Err(format!("{what}: tar failed"));
+            }
+            if !dec_status.success() {
+                return Err(format!("{what}: xz decompression failed"));
             }
             Ok(())
         }
@@ -858,12 +871,9 @@ mod tests {
         fs::write(d.join("d.txt"), "not a script /bin/sh inside\n").unwrap();
         rewrite_binsh_shebangs(&d, "/curated/bash").expect("rewrite");
         assert_eq!(fs::read_to_string(d.join("a.sh")).unwrap(), "#!/curated/bash\necho hi\n");
-        // preserves the rest of the shebang line's tail? The shell sed only replaces the
-        // interpreter path token; our port replaces the whole first line up to \n. Both keep
-        // the body. Assert the body survived and the interpreter changed.
-        let b = fs::read_to_string(d.join("sub/b.sh")).unwrap();
-        assert!(b.starts_with("#!/curated/bash"), "b: {b}");
-        assert!(b.contains("echo ho"), "b body lost: {b}");
+        // the shebang TAIL (args like ` -e`) is preserved, exactly as the shell sed keeps
+        // everything past /bin/sh — dropping it would change the script's error behavior.
+        assert_eq!(fs::read_to_string(d.join("sub/b.sh")).unwrap(), "#!/curated/bash -e\necho ho\n");
         // non-/bin/sh interpreter untouched.
         assert_eq!(fs::read_to_string(d.join("c.pl")).unwrap(), "#!/usr/bin/perl\nprint 1;\n");
         // non-shebang file untouched.
