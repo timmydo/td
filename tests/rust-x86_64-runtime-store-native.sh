@@ -21,12 +21,13 @@
 #     (rung X2 of #240 — ELF 64-bit as/ld/gcc/cc1, STATIC vs the /td/store x86_64 glibc 2.41), plus an
 #     x86_64 libz.so.1 from zlib 1.3.1 source (upstream libLLVM dynamically NEEDs libz).
 #   - the upstream Rust 1.96.0 release tarball (static.rust-lang.org, sha256-pinned, GUIX-FREE) is
-#     RELINKED to /td/store by td's OWN ELF rewriter (elf-set-interp → /td/store/ld, no patchelf), with
+#     RELINKED to /td/store by td's OWN ELF rewriter (elf-set-interp → the interned glibc's FULL hashed
+#     loader path, GROWN via PT_NOTE→PT_LOAD — a normal staged store path, no patchelf), with
 #     its full runtime closure co-located in the tree's lib/ (via the UNCHANGED RUNPATH $ORIGIN/../lib):
 #     librustc_driver + libLLVM, the /td/store x86_64 glibc 2.41 libs, libgcc_s.so.1, the built
 #     libz.so.1, AND the rustlib SYSROOT (libstd/libcore rlibs) so rustc has a target to link against.
 #   - the rust tree AND the native gcc + native binutils + x86_64 glibc are interned content-addressed
-#     as siblings at /td/store, and inside the store-ns own-root (interp = /td/store/ld) rustc:
+#     as siblings at /td/store, and inside the store-ns own-root (interp = the /td/store glibc loader) rustc:
 #       (a) RUNS: rustc -vV / cargo --version → "rustc 1.96.0" / "cargo 1.96.0";
 #       (b) COMPILES a real program: `rustc hello.rs -o hello -C linker=<the /td/store native gcc>` (with
 #           link-args baking interp/RUNPATH = the /td/store glibc) → a DYNAMIC ELF64 x86-64 binary whose
@@ -45,7 +46,7 @@
 #   [native-arch]   the linker rustc drives is the NATIVE x86_64 gcc/cc1 + native as/ld (ELF64 x86-64).
 #   [no-guix]       the interned rust DELIVERABLE carries zero /gnu/store anywhere (recursive), and the
 #                   compile-path toolchain binaries (gcc/cc1, as/ld, libc.so.6, ld) carry zero /gnu/store
-#                   (as gate 422 checks); the relinked interp is /td/store/ld. The seed-bootstrapped
+#                   (as gate 422 checks); the relinked interp is the /td/store glibc loader. The seed-bootstrapped
 #                   toolchain's build/debug utility scripts (glibc mtrace/ldd, gcc install-tools) still
 #                   bake the guix-seed interpreter — that is the seed-retirement milestone, retired last.
 #   [structural]    the tree's lib/ closure is COMPLETE (every NEEDED soname + the rustlib sysroot);
@@ -182,7 +183,8 @@ echo "   built x86_64 libz.so.1 from zlib 1.3.1 source (cross gcc 14.3.0, no /gn
 
 # ============================================================================================
 # Assemble the /td/store rust tree: rustc + cargo + the rustlib SYSROOT (so rustc has a target to
-# link against), the interp relinked to /td/store/ld, the full runtime closure co-located in lib/.
+# link against), the interp relinked to the /td/store glibc's hashed loader path (grown), the full
+# runtime closure co-located in lib/.
 # ============================================================================================
 rtree=`mktemp -d`/r; mkdir -p "$rtree/x"
 top="${RUST_FILE%.tar.gz}"
@@ -223,17 +225,9 @@ ln -sf libgcc_s.so.1 "$tree/lib/libgcc_s.so"
 cp -L "$XLIBZ" "$tree/lib/libz.so.1"
 chmod -R u+w "$tree"
 
-# --- RELINK: td's OWN elf-set-interp retargets the interpreter to /td/store/ld (no patchelf) -------
-# /td/store/ld is short → fits the original /lib64/ld-linux-x86-64.so.2 slot in-place (no growing).
-for b in rustc cargo; do
-  "$TB" elf-set-interp "$tree/bin/$b" /td/store/ld || fail "elf-set-interp $b"
-  i=`"$TB" elf-interp "$tree/bin/$b"`
-  case "$i" in /td/store/*) ;; *) fail "interp of $b not relinked to /td/store (got: $i)" ;; esac
-done
-echo "   [structural] rustc + cargo interp relinked to /td/store/ld (was /lib64/ld-linux-x86-64.so.2)"
-
 # ============================================================================================
-# Intern the rust tree AND the native gcc + native binutils + x86_64 glibc as siblings at /td/store.
+# Intern the native gcc + native binutils + x86_64 glibc at /td/store, THEN relink rustc/cargo to
+# the interned glibc's FULL hashed loader path, then intern the rust tree beside them.
 # ============================================================================================
 store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 NBP=`"$TB" store-add-recursive "\`basename "$XNBU"\`" "$XNBU" "$store" "$sndb"` || fail "store-add native binutils failed"
@@ -243,6 +237,21 @@ case "$NGP" in /td/store/*-gcc-14.3.0-x86_64-native) ;; *) fail "native gcc not 
 ngrel=`basename "$NGP"`
 GLP=`"$TB" store-add-recursive glibc-2.41-x86_64 "$XGLIBC" "$store" "$sndb"` || fail "store-add x86_64 glibc failed"
 glrel=`basename "$GLP"`
+
+# --- RELINK: td's OWN elf-set-interp retargets the interpreter (no patchelf) to the interned
+# glibc's FULL hashed loader path ($GLP/lib/ld-linux-x86-64.so.2). That path is LONGER than the
+# original /lib64/ld-linux-x86-64.so.2 slot, so elf-set-interp GROWS it (PT_NOTE→PT_LOAD; see
+# builder/src/elf.rs). A NORMAL hashed store path — unlike the previous bare /td/store/ld — is
+# what build-recipe's sandbox stages, so the relinked rustc/cargo can exec inside a build
+# (#258's ripgrep cutover); it also makes the interned rust tree carry a REAL store reference
+# to its glibc (store-add-recursive records it), so the closure follows the loader.
+for b in rustc cargo; do
+  "$TB" elf-set-interp "$tree/bin/$b" "$GLP/lib/ld-linux-x86-64.so.2" || fail "elf-set-interp $b"
+  i=`"$TB" elf-interp "$tree/bin/$b"`
+  case "$i" in /td/store/*/lib/ld-linux-x86-64.so.2) ;; *) fail "interp of $b not relinked to the /td/store glibc loader (got: $i)" ;; esac
+done
+echo "   [structural] rustc + cargo interp relinked (grown) to $GLP/lib/ld-linux-x86-64.so.2 (was /lib64/ld-linux-x86-64.so.2)"
+
 out=`"$TB" store-add-recursive rust-1.96.0-x86_64-store-native "$tree" "$store" "$sndb"` || fail "store-add rust tree failed"
 case "$out" in /td/store/*-rust-1.96.0-x86_64-store-native) ;; *) fail "interned path not content-addressed under /td/store (got: $out)" ;; esac
 phys="$store/`basename "$out"`"; rustrel=${out#/td/store/}
@@ -288,10 +297,6 @@ done
 ls "$phys"/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib >/dev/null 2>&1 || fail "the interned sysroot lost its libstd rlib"
 echo "   [structural] the interned lib/ holds the complete rustc/cargo runtime closure + rustlib sysroot"
 
-# --- provide /td/store/ld (the x86_64 glibc 2.41 loader) at the store root for the own-root --------
-cp -L "$XGLIBC/lib/ld-linux-x86-64.so.2" "$store/ld" || fail "could not place the x86_64 loader at /td/store/ld"
-! grep -q -a '/gnu/store' "$store/ld" || fail "the /td/store/ld loader contains /gnu/store bytes"
-
 # --- a static bash (td's own store-closure reader, no guix process) for the own-root shell ---------
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
 bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
@@ -302,7 +307,8 @@ bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 # When this script is SOURCED with TD_RUST_STORE_NATIVE_ASSEMBLE_ONLY=1 (by
 # tests/rust-x86_64-userland-store-native.sh), the caller only needs the fully-assembled /td/store —
 # the native x86_64 gcc + binutils, the relinked upstream rust (rustc/cargo + rustlib sysroot), the
-# x86_64 glibc 2.41, /td/store/ld, and a static bash — interned in $store with its db $sndb. Export
+# x86_64 glibc 2.41 (whose hashed loader path IS the relinked interp), and a static bash — interned
+# in $store with its db $sndb. Export
 # the handles and RETURN here, BEFORE the hello.rs probe (which is THIS gate's own behavioral leg).
 # The from-scratch assembly above is byte-for-byte the same code gate 416 runs; a normal gate run
 # leaves the guard unset and falls through to the probe unchanged (directive 3: the guard is inert
@@ -316,7 +322,7 @@ if [ "${TD_RUST_STORE_NATIVE_ASSEMBLE_ONLY:-}" = 1 ]; then
 fi
 
 # ============================================================================================
-# In the store-ns own-root (interp = /td/store/ld): rustc RUNS, then rustc COMPILES a real program
+# In the store-ns own-root (interp = the /td/store glibc loader): rustc RUNS, then rustc COMPILES a real program
 # using the /td/store NATIVE gcc as the linker, and the produced DYNAMIC ELF64 binary RUNS → 42.
 # The probe is a FILE (no nested quoting) and uses ONLY bash builtins + the store's own binaries
 # (the own-root has no coreutils). PATH = the native gcc + native binutils only (both load-bearing:

@@ -90,18 +90,37 @@ test -n "$vsrc" -a -n "$vstore" -a -n "$vdb" || fail "vendor intern produced no 
 echo "   [structural] interned the source ($src) + the $ncrate-crate set ($vsrc) content-addressed (store-add-recursive, no daemon)"
 
 # ============================================================================================
-# 3. Provision the guix build SEED (coreutils/tar/gzip — cp/chmod/tar for run_rust; retired LAST) into a
-#    warm-seed store, and copy the native /td/store toolchain trees in beside it so ALL build inputs
-#    stage from ONE store (the brick-8 combined-store form). The native toolchain refs come from $SNDB
-#    (TD_EXTRA_DBS); the guix seed refs from the warmed seed db.
+# 3. Provision the guix build SEED (coreutils/bash/tar/gzip — cp/chmod/tar for run_rust; retired
+#    LAST) into a staging store built with td's OWN store-closure-scan (content-scan closure — NO
+#    /var/guix/db read, unlike the brick-8 warm-seed path), and copy the native /td/store toolchain
+#    trees in beside it so ALL build inputs stage from ONE store (the brick-8 combined-store form).
+#    The native toolchain refs come from $SNDB (TD_EXTRA_DBS); the guix seed refs from the
+#    content-scan of the staging store itself. The stage0 BUILDER's direct refs (its guix glibc/
+#    gcc-lib — read from td's OWN builder db, store-query) must be in the staging store too, else
+#    the drv's builder cannot exec in the sandbox.
 # ============================================================================================
 seedroots=`grep ' /gnu/store/' "$LOCK" | grep -vE -- '-rust-|-gcc-toolchain-' | sed 's/^[^ ]* //'`
 test -n "$seedroots" || fail "no guix build seed (coreutils/tar/gzip) in $LOCK"
-# realize the seed closure (retired-last guix bytes; the DELIVERABLE `rg` carries none — asserted below)
+# realize the seed roots (retired-last guix bytes; the DELIVERABLE `rg` carries none — asserted below)
 echo "$seedroots" | xargs "$GUIX" build >/dev/null 2>&1 || fail "could not realize the guix build seed"
-seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-userland" $seedroots` \
-  || fail "warm-seed of the build seed failed"
-WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
+{ echo "$seedroots"
+  "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' || true
+} | sort -u > "$scratch/seed-roots"
+WSTORE="$scratch/seed-store"; mkdir -p "$WSTORE"
+: > "$scratch/seed-closure"
+while read -r r; do
+  test -n "$r" || continue
+  "$TB" store-closure-scan /gnu/store "$r" >> "$scratch/seed-closure" || fail "store-closure-scan $r failed"
+done < "$scratch/seed-roots"
+sort -u "$scratch/seed-closure" -o "$scratch/seed-closure"
+while read -r p; do
+  test -n "$p" || continue
+  b=`basename "$p"`
+  test -e "$WSTORE/$b" || cp -a "$p" "$WSTORE/$b" || fail "staging $p into the seed store failed"
+done < "$scratch/seed-closure"
+# TD_SEED_DB is the legacy set-together companion; the engine content-scans TD_SEED_STORE and no
+# longer reads it (builder/src/main.rs build-recipe) — pass a placeholder path, never /var/guix/db.
+WDB="$WSTORE/.unused-legacy-db"; : > "$WDB"
 for rel in "$NGREL" "$NBREL" "$GLREL" "$RUSTREL"; do
   test -d "$WSTORE/$rel" || cp -a "$STORE/$rel" "$WSTORE/$rel"
 done
@@ -124,12 +143,13 @@ newlock="$scratch/$PKG.lock"
 if grep -qE -- '/gnu/store/[a-z0-9]+-(rust-|gcc-toolchain-)' "$newlock"; then fail "rewritten lock still names a guix rust/gcc-toolchain"; fi
 echo "   [cutover] lock retargeted onto the /td/store native toolchain (guix rust + gcc-toolchain removed)"
 
-# link-mode env: run_rust bakes the native gcc's interp/RUNPATH/-B (native gcc is a PLAIN gcc). libgcc_s
-# lives in the native gcc tree; the produced `rg` resolves libc + libgcc_s from /td/store at run time.
-lgrel=`cd "$STORE/$NGREL" && find . -name libgcc_s.so.1 2>/dev/null | head -1 | sed 's|^\./||'`
-test -n "$lgrel" || fail "no libgcc_s.so.1 in the native gcc tree"
+# link-mode env: run_rust bakes the native gcc's interp/RUNPATH/-B (the native gcc is a PLAIN gcc, no
+# ld-wrapper). libgcc_s.so.1 (+ the .so link the `-lgcc_s` link resolves) lives in the RUST tree's lib/
+# (the #255 assembly co-located it there; the native gcc tree is static and may ship none), so the
+# produced `rg` resolves libc from the /td/store glibc and libgcc_s from the rust tree at run time.
+test -e "$STORE/$RUSTREL/lib/libgcc_s.so.1" || fail "no libgcc_s.so.1 in the rust tree lib/"
 interp="/td/store/$GLREL/lib/ld-linux-x86-64.so.2"
-rpath="/td/store/$GLREL/lib:/td/store/$NGREL/`dirname "$lgrel"`"
+rpath="/td/store/$GLREL/lib:/td/store/$RUSTREL/lib"
 bdir="/td/store/$GLREL/lib"
 
 # emit the ripgrep recipe (guix-free evaluator) + build it through run_rust with the /td/store toolchain.
