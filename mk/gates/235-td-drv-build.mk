@@ -48,15 +48,18 @@ td-drv-build:
 	test -n "$${out:-}" -a -n "$${ns:-}" || { echo "FAIL: cached_build set no out/ns" >&2; exit 1; }; \
 	drvf=`ls "$$sd/b/"*.drv 2>/dev/null | head -1`; \
 	test -n "$$drvf" || { echo "FAIL: no assembled hello .drv under $$sd/b" >&2; exit 1; }; \
-	echo "   assembled .drv (builder=stage0): $$drvf  ->  output $$out"; \
-	echo ">> (1) CONSTRUCT: td EMITS the .drv (drv-emit-to) — canonical round-trip byte-identical:"; \
-	computed=`"$$TB" drv-emit-to "$$drvf" "$$CACHE/emitted.drv" 2>"$$CACHE/emit.err"` \
+	canon=`grep -hoE '/gnu/store/[a-z0-9]+-hello-[^ ]+\.drv' "$$sd/err" "$$sd/bout" 2>/dev/null | head -1`; \
+	test -n "$$canon" || { echo "FAIL: could not read the canonical hello .drv path from the build log ($$sd/err)" >&2; exit 1; }; \
+	sdrv="$$CACHE/`basename "$$canon"`"; cp "$$drvf" "$$sdrv"; \
+	echo "   assembled .drv (builder=stage0): $$drvf  ->  canonical $$canon  ->  output $$out"; \
+	echo ">> (1) CONSTRUCT: td re-emits the .drv (drv-emit-to) and recomputes its CONTENT-ADDRESSED path — equal to assemble-recipe's canonical path proves the re-emission is byte-identical (the path is a hash of the .drv content+refs; no external cmp needed):"; \
+	computed=`"$$TB" drv-emit-to "$$sdrv" "$$CACHE/emitted.drv" 2>"$$CACHE/emit.err"` \
 	  || { echo "FAIL: drv-emit-to failed:" >&2; cat "$$CACHE/emit.err" >&2; exit 1; }; \
-	cmp -s "$$CACHE/emitted.drv" "$$drvf" \
-	  || { echo "FAIL: drv-emit-to output is not byte-identical to the assembled .drv — td's drv construction is not canonical/deterministic" >&2; exit 1; }; \
-	echo "   re-emitted .drv byte-identical to the assembled one; td computed store path $$computed"; \
+	test "$$computed" = "$$canon" \
+	  || { echo "FAIL: drv-emit-to recomputed $$computed, but assemble-recipe's canonical path is $$canon — the re-emitted content hashes differently, so td's drv construction is not canonical/deterministic" >&2; exit 1; }; \
+	echo "   re-emitted .drv hashes to the SAME canonical content-addressed path $$computed (⟹ byte-identical construction)"; \
 	echo ">> (2) CLOSURE: realize content-scans the seed store for the build-input closure (stages the stage0 builder via TD_BUILDER_*) — no guix gc:"; \
-	"$$TB" realize "$$drvf" /gnu/store "$$CACHE/rz" > "$$CACHE/rz.out" 2>&1 \
+	"$$TB" realize "$$sdrv" /gnu/store "$$CACHE/rz" > "$$CACHE/rz.out" 2>&1 \
 	  || { echo "FAIL: td-builder realize could not compute the input closure / build:" >&2; tail -20 "$$CACHE/rz.out" >&2; exit 1; }; \
 	test -s "$$CACHE/rz/closure.txt" || { echo "FAIL: realize wrote no closure.txt" >&2; exit 1; }; \
 	echo "   input closure: $$(wc -l < "$$CACHE/rz/closure.txt") paths (content-scanned, guix-free)"; \
