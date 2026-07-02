@@ -1,18 +1,24 @@
 //! Minimal, dependency-free ELF reader/writer — td's OWN replacement for the two
 //! `patchelf` features the store-native relink/cleanup needs, so the build path adds NO
 //! guix tool (patchelf would come from the host guix). This is deliberately NOT a full
-//! patchelf: it only reads and rewrites two strings IN PLACE —
+//! patchelf: it reads and rewrites two strings —
 //!   - the program interpreter (`PT_INTERP`), which the upstream-Rust relink retargets to
-//!     `/td/store/ld` (12 bytes, SHORTER than `/lib64/ld-linux-x86-64.so.2`, 27 bytes), so
-//!     it fits the existing `p_filesz` slot (NUL-padded). No segment growing.
+//!     the `/td/store` loader. A SHORTER path (e.g. `/td/store/ld`, 12 bytes vs
+//!     `/lib64/ld-linux-x86-64.so.2`, 27 bytes) is written IN PLACE (NUL-padded); a LONGER
+//!     path — the case that lets rustc/cargo point at the full hashed
+//!     `/td/store/<hash>-glibc.../ld-linux-x86-64.so.2`, a NORMAL staged store path the
+//!     build sandbox already mounts — is handled by GROWING: the new path is appended to the
+//!     end of the file and `PT_INTERP`'s `p_offset`/`p_filesz` are repointed at it. This is
+//!     sound because the kernel reads the interpreter path from the FILE at `p_offset` (it
+//!     need NOT lie in a PT_LOAD segment), so no new LOAD segment / `.dynstr` surgery is
+//!     needed — the interp is the one field that grows cheaply.
 //!   - the run-path (`DT_RUNPATH` / legacy `DT_RPATH`), which makes a toolchain binary
 //!     self-sufficient — e.g. retargeting an `ar`/`ranlib` build-dir search path to
 //!     `/td/store/...lib` so it finds its shared libc without an `LD_LIBRARY_PATH` wrapper.
-//! Both rewrites are in-place only: the new string (plus its NUL) must fit the existing
-//! slot. Growing a string (or ADDING a run-path where none exists) would need the full
-//! add-a-LOAD-segment / grow-.dynstr dance; if that is ever required, the setter errors
-//! loudly rather than corrupting the file — a deliberate, visible boundary, not a silent
-//! truncation.
+//!     This one is still IN-PLACE ONLY: a run-path string IS consumed by the dynamic loader
+//!     from a mapped `.dynstr`, so growing it WOULD need the add-a-LOAD-segment / grow-.dynstr
+//!     dance; a too-long run-path (or adding one where none exists) errors loudly rather than
+//!     corrupting the file — a deliberate, visible boundary, not a silent truncation.
 //!
 //! Scope: 32- and 64-bit little-endian ELF (i686 + x86-64) — the bootstrap toolchain is
 //! i686, the rust/userland path is x86-64. Any other class/endianness is rejected.
@@ -30,6 +36,8 @@ const EI_DATA: usize = 5; // 1 = ELFDATA2LSB
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
+const PT_NOTE: u32 = 4;
+const PF_R: u32 = 4; // segment readable
 const DT_NULL: u64 = 0; // end of the dynamic array
 const DT_STRTAB: u64 = 5; // vaddr of the .dynstr string table
 const DT_RPATH: u64 = 15; // legacy run-path (string offset into .dynstr)
@@ -49,6 +57,64 @@ fn u64le(b: &[u8], off: usize) -> Result<u64, String> {
     b.get(off..off + 8)
         .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
         .ok_or_else(|| format!("ELF truncated at u64 offset {off}"))
+}
+
+/// Write a class-width word (u64 on ELF64, low u32 on ELF32) at `off`, little-endian.
+fn put_word(b: &mut [u8], off: usize, v: u64, is64: bool) -> Result<(), String> {
+    if is64 {
+        b.get_mut(off..off + 8)
+            .ok_or_else(|| format!("ELF truncated writing u64 at {off}"))?
+            .copy_from_slice(&v.to_le_bytes());
+    } else {
+        b.get_mut(off..off + 4)
+            .ok_or_else(|| format!("ELF truncated writing u32 at {off}"))?
+            .copy_from_slice(&(v as u32).to_le_bytes());
+    }
+    Ok(())
+}
+
+/// The mutable program-header fields, as a class-dependent byte offset within a ph entry.
+/// (ELF64: p_offset@8 p_vaddr@16 p_paddr@24 p_filesz@32 p_memsz@40 p_align@48; ELF32:
+/// p_offset@4 p_vaddr@8 p_paddr@12 p_filesz@16 p_memsz@20 p_align@28.)
+enum PField {
+    Type,
+    Flags,
+    Offset,
+    Vaddr,
+    Paddr,
+    Filesz,
+    Memsz,
+    Align,
+}
+fn ph_field(f: &PField, is64: bool) -> usize {
+    match (f, is64) {
+        (PField::Type, _) => 0x00,
+        (PField::Flags, true) => 0x04,
+        (PField::Flags, false) => 0x18,
+        (PField::Offset, true) => 0x08,
+        (PField::Vaddr, true) => 0x10,
+        (PField::Paddr, true) => 0x18,
+        (PField::Filesz, true) => 0x20,
+        (PField::Memsz, true) => 0x28,
+        (PField::Align, true) => 0x30,
+        (PField::Offset, false) => 0x04,
+        (PField::Vaddr, false) => 0x08,
+        (PField::Paddr, false) => 0x0C,
+        (PField::Filesz, false) => 0x10,
+        (PField::Memsz, false) => 0x14,
+        (PField::Align, false) => 0x1C,
+    }
+}
+fn set_ph_word(b: &mut [u8], ph: usize, is64: bool, f: PField, v: u64) -> Result<(), String> {
+    put_word(b, ph + ph_field(&f, is64), v, is64)
+}
+/// Write a 4-byte program-header field (`p_type`/`p_flags`, which are u32 in BOTH classes).
+fn set_ph_u32(b: &mut [u8], ph: usize, is64: bool, f: PField, v: u32) -> Result<(), String> {
+    let off = ph + ph_field(&f, is64);
+    b.get_mut(off..off + 4)
+        .ok_or_else(|| format!("ELF truncated writing ph u32 at {off}"))?
+        .copy_from_slice(&v.to_le_bytes());
+    Ok(())
 }
 
 /// A validated little-endian ELF buffer carrying its class. The header + program-header +
@@ -157,6 +223,28 @@ fn interp_slot(b: &[u8]) -> Result<Option<(usize, usize)>, String> {
     Elf::parse(b)?.segment_slot(PT_INTERP, "PT_INTERP string")
 }
 
+/// Locate the PT_INTERP program-header ENTRY and return `(ph_entry_offset, string_off,
+/// string_filesz, is64)`, or `None` if the ELF has no interpreter. Unlike `interp_slot`
+/// this yields the ph ENTRY offset so the setter can grow the string (repoint p_offset/
+/// p_filesz), not just overwrite it in place.
+fn interp_ph_entry(b: &[u8]) -> Result<Option<(usize, usize, usize, bool)>, String> {
+    let elf = Elf::parse(b)?;
+    let (phoff, phentsize, phnum) = elf.phdr_table()?;
+    let (p_off, _pv, p_filesz) = elf.ph_fields();
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        if u32le(b, ph)? == PT_INTERP {
+            let off = elf.word(ph + p_off)? as usize;
+            let sz = elf.word(ph + p_filesz)? as usize;
+            if off + sz > b.len() {
+                return Err("PT_INTERP string runs past end of file".into());
+            }
+            return Ok(Some((ph, off, sz, elf.is64)));
+        }
+    }
+    Ok(None)
+}
+
 /// The .dynstr file offset plus the `(tag, string-offset)` of every DT_RPATH/DT_RUNPATH
 /// entry, or `None` if the ELF has no PT_DYNAMIC or no run-path entry at all.
 struct RpathSlots {
@@ -209,29 +297,87 @@ pub fn read_interp(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// Rewrite the program interpreter (`PT_INTERP`) string in place. The new path (plus its
-/// NUL terminator) must fit in the existing slot; any remaining bytes are NUL-padded.
-/// Errors (without modifying the file) if there is no interpreter, or if the new path is
-/// too long for the slot — the case that would need real segment growing.
+/// Rewrite the program interpreter (`PT_INTERP`) string. A path that fits the existing slot
+/// (plus its NUL) is written IN PLACE (remaining bytes NUL-padded). A LONGER path is handled
+/// by GROWING: the new path (NUL-terminated) is appended to the end of the file and
+/// `PT_INTERP`'s `p_offset`/`p_filesz`/`p_memsz` are repointed at it. This is sound because
+/// the kernel reads the interpreter path from the FILE at `p_offset` during `execve` — it
+/// need not lie in a PT_LOAD segment — so no new LOAD segment / `.dynstr` growth is required.
+/// Errors (without modifying the file) only if the ELF has no interpreter at all. Lets the
+/// upstream-Rust relink point rustc/cargo at the full hashed `/td/store/<hash>-glibc.../ld…`
+/// loader (a normal staged store path), not just the short `/td/store/ld`.
 pub fn set_interp(path: &Path, new_interp: &str) -> Result<(), String> {
     let mut b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let (off, sz) = interp_slot(&b)?
+    let (ph, off, sz, is64) = interp_ph_entry(&b)?
         .ok_or_else(|| format!("{}: no PT_INTERP (not an interpreted executable)", path.display()))?;
     let nb = new_interp.as_bytes();
     if nb.contains(&0) {
         return Err("new interpreter contains a NUL byte".into());
     }
-    if nb.len() + 1 > sz {
-        return Err(format!(
-            "new interpreter {:?} ({} bytes + NUL) does not fit the {}-byte PT_INTERP slot \
-             — would need segment growing (out of scope for this minimal rewriter)",
-            new_interp,
-            nb.len(),
-            sz
-        ));
-    }
-    for (i, slot) in b[off..off + sz].iter_mut().enumerate() {
-        *slot = if i < nb.len() { nb[i] } else { 0 };
+    if nb.len() + 1 <= sz {
+        // fits — overwrite in place, NUL-padding the tail of the old slot.
+        for (i, slot) in b[off..off + sz].iter_mut().enumerate() {
+            *slot = if i < nb.len() { nb[i] } else { 0 };
+        }
+    } else {
+        // Too long for the slot — GROW. Appending the string and repointing PT_INTERP's file
+        // offset is NOT enough: the glibc dynamic linker re-reads the interpreter NAME from
+        // MEMORY at `(load_bias + p_vaddr)` when it walks the main program's headers, so the
+        // string must live in a MAPPED (PT_LOAD) region. We append the string at EOF and
+        // repurpose the non-essential PT_NOTE segment into a PT_LOAD covering it (the standard
+        // ELF-patch trick — cheaper than relocating the whole program-header table, and the
+        // build-id note it displaces is cosmetic). PT_INTERP then points at the mapped vaddr.
+        let (note_ph, load_end) = {
+            let elf = Elf::parse(&b)?;
+            let (phoff, phentsize, phnum) = elf.phdr_table()?;
+            let (p_off, p_vaddr, p_filesz) = elf.ph_fields();
+            let p_memsz = if is64 { 0x28 } else { 0x14 };
+            let mut note: Option<usize> = None;
+            let mut end: u64 = 0;
+            for i in 0..phnum {
+                let e = phoff + i * phentsize;
+                match u32le(&b, e)? {
+                    PT_NOTE if note.is_none() => note = Some(e),
+                    PT_LOAD => {
+                        let va = elf.word(e + p_vaddr)?;
+                        let msz = elf.word(e + p_memsz)?;
+                        end = end.max(va + msz);
+                    }
+                    _ => {}
+                }
+                let _ = p_off;
+                let _ = p_filesz;
+            }
+            (
+                note.ok_or("cannot grow PT_INTERP: no PT_NOTE segment to repurpose into a PT_LOAD")?,
+                end,
+            )
+        };
+        const PAGE: u64 = 0x1000;
+        let new_off = b.len() as u64;
+        let new_sz = (nb.len() + 1) as u64;
+        b.extend_from_slice(nb);
+        b.push(0);
+        // A fresh mapped vaddr beyond every existing segment, congruent to the file offset mod
+        // page (mmap requires p_vaddr ≡ p_offset (mod p_align)).
+        let base = (load_end / PAGE + 2) * PAGE;
+        let new_vaddr = base + (new_off % PAGE);
+        // Repurpose the PT_NOTE entry as the covering PT_LOAD (read-only).
+        set_ph_u32(&mut b, note_ph, is64, PField::Type, PT_LOAD)?;
+        set_ph_u32(&mut b, note_ph, is64, PField::Flags, PF_R)?;
+        set_ph_word(&mut b, note_ph, is64, PField::Offset, new_off)?;
+        set_ph_word(&mut b, note_ph, is64, PField::Vaddr, new_vaddr)?;
+        set_ph_word(&mut b, note_ph, is64, PField::Paddr, new_vaddr)?;
+        set_ph_word(&mut b, note_ph, is64, PField::Filesz, new_sz)?;
+        set_ph_word(&mut b, note_ph, is64, PField::Memsz, new_sz)?;
+        set_ph_word(&mut b, note_ph, is64, PField::Align, PAGE)?;
+        // Point PT_INTERP at the string's file offset AND its mapped vaddr.
+        set_ph_word(&mut b, ph, is64, PField::Offset, new_off)?;
+        set_ph_word(&mut b, ph, is64, PField::Vaddr, new_vaddr)?;
+        set_ph_word(&mut b, ph, is64, PField::Paddr, new_vaddr)?;
+        set_ph_word(&mut b, ph, is64, PField::Filesz, new_sz)?;
+        set_ph_word(&mut b, ph, is64, PField::Memsz, new_sz)?;
+        set_ph_word(&mut b, ph, is64, PField::Align, 1)?;
     }
     std::fs::write(path, &b).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(())
@@ -324,18 +470,27 @@ mod tests {
     // for the reader/writer; not a runnable binary (no sections), which is all this needs.
     fn synth_interp_elf(interp: &str, is64: bool) -> Vec<u8> {
         let (ehdr, phentsize) = if is64 { (64usize, 56usize) } else { (52usize, 32usize) };
-        let interp_off = ehdr + phentsize; // string right after the single phdr
+        // Two program headers: PT_INTERP + a spare PT_NOTE (which the grow path repurposes into
+        // a covering PT_LOAD). The interp string follows both phdr entries.
+        let phnum = 2usize;
+        let interp_off = ehdr + phnum * phentsize;
         let slot = interp.len() + 1; // include the NUL terminator
         let mut b = vec![0u8; interp_off + slot];
         b[0..4].copy_from_slice(EI_MAG);
         b[EI_CLASS] = if is64 { 2 } else { 1 };
         b[EI_DATA] = 1; // little-endian
-        put_phdr_header(&mut b, ehdr, phentsize, 1, is64);
+        put_phdr_header(&mut b, ehdr, phentsize, phnum, is64);
         let (p_off, _p_vaddr, p_filesz) = ph_field_offsets(is64);
-        // the single program header: PT_INTERP, p_offset, p_filesz
+        // PHDR 0: PT_INTERP → the interp string.
         b[ehdr..ehdr + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
         put_word(&mut b, ehdr + p_off, interp_off as u64, is64);
         put_word(&mut b, ehdr + p_filesz, slot as u64, is64);
+        // PHDR 1: a spare PT_NOTE (small, points at the interp region — its fields are
+        // overwritten if the grow path repurposes it).
+        let n = ehdr + phentsize;
+        b[n..n + 4].copy_from_slice(&PT_NOTE.to_le_bytes());
+        put_word(&mut b, n + p_off, interp_off as u64, is64);
+        put_word(&mut b, n + p_filesz, 1, is64);
         b[interp_off..interp_off + interp.len()].copy_from_slice(interp.as_bytes());
         b
     }
@@ -438,16 +593,40 @@ mod tests {
     }
 
     #[test]
-    fn refuses_too_long_interp() {
+    fn grows_interp_that_does_not_fit() {
+        // A path LONGER than the original slot is no longer refused: it is appended to the end
+        // of the file and PT_INTERP is repointed at it (the interp is read from the file at
+        // p_offset by the kernel, so no LOAD segment is needed). This is what lets rustc/cargo
+        // point at the full hashed /td/store/<hash>-glibc.../ld-linux-x86-64.so.2 loader.
         let dir = std::env::temp_dir().join(format!("elf-test-l-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(&f, synth_elf("/lib64/ld.so")).unwrap();
-        // a longer path than the original slot must be refused, not silently truncated
-        let err = set_interp(&f, "/td/store/aaaaaaaaaaaaaaaaaaaa/ld").unwrap_err();
-        assert!(err.contains("does not fit"), "unexpected error: {err}");
-        // and the file is unchanged
-        assert_eq!(read_interp(&f).unwrap().as_deref(), Some("/lib64/ld.so"));
+        let before = std::fs::metadata(&f).unwrap().len();
+        let long = "/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.41-x86_64/lib/ld-linux-x86-64.so.2";
+        assert!(long.len() + 1 > "/lib64/ld.so".len() + 1, "the test path must exceed the slot");
+        set_interp(&f, long).unwrap();
+        // reads back the full long path, and the file GREW (the string was appended)
+        assert_eq!(read_interp(&f).unwrap().as_deref(), Some(long));
+        let after = std::fs::metadata(&f).unwrap().len();
+        assert!(after > before, "file should grow ({before} -> {after})");
+        assert_eq!(after as usize, before as usize + long.len() + 1, "grew by exactly the path + NUL");
+        // a subsequent SHORTER set still works (fits the now-large slot, in place)
+        set_interp(&f, "/td/store/ld").unwrap();
+        assert_eq!(read_interp(&f).unwrap().as_deref(), Some("/td/store/ld"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grows_interp_elf32() {
+        // the i686 class grows the same way (the bootstrap toolchain is i686).
+        let dir = std::env::temp_dir().join(format!("elf-test-l32-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a");
+        std::fs::write(&f, synth_interp_elf("/lib/ld.so", false)).unwrap();
+        let long = "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.41/lib/ld-linux.so.2";
+        set_interp(&f, long).unwrap();
+        assert_eq!(read_interp(&f).unwrap().as_deref(), Some(long));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -5245,9 +5245,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        // elf-set-interp FILE NEW — rewrite FILE's PT_INTERP to NEW in place (must fit the
-        // existing slot). The one patchelf feature the rust-store-native relink needs,
-        // owned by td in Rust so the build path adds NO guix tool.
+        // elf-set-interp FILE NEW — rewrite FILE's PT_INTERP to NEW: in place when it fits
+        // the existing slot, else GROWN (string appended at EOF, mapped by repurposing the
+        // PT_NOTE segment into a covering PT_LOAD — see elf::set_interp), so a full hashed
+        // /td/store/<hash>-glibc.../ld loader path fits. The one patchelf feature the
+        // rust-store-native relink needs, owned by td in Rust so the build path adds NO guix tool.
         Some("elf-set-interp") if args.len() == 4 => {
             match elf::set_interp(Path::new(&args[2]), &args[3]) {
                 Ok(()) => {
