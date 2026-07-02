@@ -33,6 +33,7 @@ mod store;
 mod store_db;
 mod store_db_read;
 mod sys;
+mod toolchain_x86_64;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -2857,6 +2858,9 @@ fn main() -> ExitCode {
         // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
         // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
         Some("bootstrap-recipe") => bootstrap::cli(&args),
+        // toolchain-recipe <name> — build a /td/store toolchain rung as a structured Rust
+        // recipe (the tests/x86_64-cross-fns.sh drivers as typed Rust; see toolchain_x86_64.rs).
+        Some("toolchain-recipe") => toolchain_x86_64::cli(&args),
         Some("nar-hash") if args.len() == 3 => match nar_hash(&args[2]) {
             Ok(h) => {
                 println!("{h}");
