@@ -101,8 +101,12 @@ echo "   [structural] interned the source ($src) + the $ncrate-crate set ($vsrc)
 # ============================================================================================
 seedroots=`grep ' /gnu/store/' "$LOCK" | grep -vE -- '-rust-|-gcc-toolchain-' | sed 's/^[^ ]* //'`
 test -n "$seedroots" || fail "no guix build seed (coreutils/tar/gzip) in $LOCK"
-# realize the seed roots (retired-last guix bytes; the DELIVERABLE `rg` carries none — asserted below)
-echo "$seedroots" | xargs "$GUIX" build >/dev/null 2>&1 || fail "could not realize the guix build seed"
+# realize the seed roots (retired-last guix bytes; the DELIVERABLE `rg` carries none — asserted below).
+# $GUIX is multi-word (`guix time-machine -C channels.scm --`) — expand UNQUOTED, as
+# crate-free-build.sh does.
+mkdir -p "$scratch"
+echo "$seedroots" | xargs $GUIX build >/dev/null 2>"$scratch/guix-build.err" \
+  || { tail -5 "$scratch/guix-build.err" >&2; fail "could not realize the guix build seed"; }
 { echo "$seedroots"
   "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' || true
 } | sort -u > "$scratch/seed-roots"
