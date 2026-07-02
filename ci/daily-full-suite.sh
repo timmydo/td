@@ -14,7 +14,7 @@
 #   (guix-free /td/store tier); 0 = all green, up to 7. Setup errors exit 8/9/10
 #   (before any suite runs, or before any GATE inside a suite runs), kept out of
 #   the bitfield range:
-#     8  - reserved
+#     8  - unknown CLI argument
 #     9  - git fetch of origin/main failed
 #     10 - runner host not provisioned: check.sh's own integrity guard refused
 #          to start (e.g. host guix missing/mismatched vs channels.scm — see
@@ -28,7 +28,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --no-system) run_system=0; shift ;;
     --verdict) verdict=$2; shift 2 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 8 ;;
   esac
 done
