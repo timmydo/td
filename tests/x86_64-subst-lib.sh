@@ -220,3 +220,53 @@ x86_64_verify_closure() {
   echo "$out" | grep -q '^GNU-ABSENT$' || { echo "verify_closure: /gnu/store present in the own-root" >&2; return 1; }
 }
 
+# ============================================================================================
+# RUST layer: the same input-addressed FETCH short-circuit for the RELINKED upstream Rust
+# toolchain (rust-1.96.0-x86_64-store-native — the rust-x86_64 toolchain-recipe's deliverable).
+# Keyed by tests/td-toolchain-rust-x86_64.lock (the rust tarball + zlib + the native-toolchain
+# source set). Lets a consumer (gate 416/424, `td shell ripgrep`) FETCH the relinked rustc/cargo
+# tree instead of the ~45-min from-cross rebuild+relink, with from-BUILD fallback (directive 1;
+# the daily is the sole authoritative builder+publisher). Var: RUSTREL is the tree's store-
+# relative basename in STORE (the caller composes /td/store/$RUSTREL/bin/{rustc,cargo}).
+X86_RUST_CLOSURE_NAME=rust-1.96.0-x86_64-store-native
+X86_RUST_LOCK=tests/td-toolchain-rust-x86_64.lock
+
+# x86_64_build_closure_rust OUT STORE DB TREE — intern the assembled+relinked rust TREE at its
+# lock-keyed input-addressed path in STORE, and subst-EXPORT it (NAR + td-native narinfo) to OUT
+# for the daily to sign+publish. Sets RUSTREL. Mirrors x86_64_build_closure_native.
+x86_64_build_closure_rust() {
+  _out=$1; _store=$2; _db=$3; _tree=$4
+  test -n "$_tree" -a -d "$_tree" || { echo "build_closure_rust: no assembled rust tree ($_tree)" >&2; return 1; }
+  _k=`"$TB" toolchain-key "$X86_RUST_LOCK"` || { echo "build_closure_rust: toolchain-key failed" >&2; return 1; }
+  mkdir -p "$_out"
+  p=`"$TB" store-add-input-addressed "$X86_RUST_CLOSURE_NAME" "$_k" "$_tree" "$_store" "$_db"` \
+    || { echo "build_closure_rust: store-add-input-addressed failed" >&2; return 1; }
+  want=`"$TB" toolchain-path "$X86_RUST_LOCK" "$X86_RUST_CLOSURE_NAME"`
+  test "$p" = "$want" || { echo "build_closure_rust: rust path $p != lock-computed $want" >&2; return 1; }
+  "$TB" subst-export "$_db" "$_store" "$_out" "$p" >/dev/null \
+    || { echo "build_closure_rust: subst-export ($p) failed" >&2; return 1; }
+  test -f "$_out/`basename "$p"`.narinfo" || { echo "build_closure_rust: no narinfo" >&2; return 1; }
+  RUSTREL=`basename "$p"`; export RUSTREL
+  echo "   [closure-rust] $X86_RUST_CLOSURE_NAME interned at lock-keyed $p + subst-exported (the daily signs + publishes it)"
+}
+
+# x86_64_resolve_closure_rust STORE DB — if a subst store is exposed, resolve the relinked rust
+# tree, restore it into STORE at its lock path, and set RUSTREL. Return 0 on HIT; MISS/none -> 1
+# (build+relink from the cross toolchain). Mirrors x86_64_resolve_closure_native.
+x86_64_resolve_closure_rust() {
+  _store=$1; _db=$2
+  [ -n "${TD_SUBST_BIN:-}" ] && [ -n "${TD_SUBST_STORE:-}" ] || return 1
+  _shdir=`dirname "$(command -v sh)"`
+  _cu=`grep -- '-coreutils-' tests/td-subst.lock | sed 's/^[^ ]* //' | head -1`
+  _dest=`mktemp -d`
+  p=`env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$TD_SUBST_BIN" \
+      TD_SUBST_STORE="$TD_SUBST_STORE" TD_SUBST_PUBKEY="${TD_SUBST_PUBKEY:-tests/td-subst.pub}" \
+      TD_STORE_DIR=/td/store sh tools/resolve-toolchain.sh "$X86_RUST_LOCK" "$X86_RUST_CLOSURE_NAME" "$_dest"` \
+    || { rm -rf "$_dest"; return 1; }
+  base=`basename "$p"`
+  rm -rf "$_store/$base"; cp -a "$_dest/$base" "$_store/$base"; chmod -R u+w "$_store/$base"
+  rm -rf "$_dest"
+  RUSTREL="$base"; export RUSTREL
+  echo "   [closure-rust/fetch] $X86_RUST_CLOSURE_NAME restored at /td/store/$base (ed25519 sig + StorePath==lock-path + NarHash verified)"
+  return 0
+}
