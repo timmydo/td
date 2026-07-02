@@ -95,7 +95,7 @@ build_zlib_x86_64() {
   tar -xzf "$ZLIB_TB" -C "$src" --strip-components=1 || { echo "zlib unpack failed" >&2; return 1; }
   # combined include dir: x86_64 glibc headers + kernel UAPI (glibc's bits/local_lim.h #includes
   # <linux/limits.h>). The FETCHED glibc-2.41 closure ships no linux/ headers, so the cc wrapper must
-  # add them here — exactly as build_gcc_x86_64_native merges $kh into its build sysroot's include/.
+  # add them here — exactly as the toolchain-recipe x86_64-native merges $kh into its build sysroot's include/.
   inc="$out/include"; mkdir -p "$inc"
   cp -a "$xgl/include/." "$inc/" || { echo "stage glibc headers failed" >&2; return 1; }
   tar -xzf "$KH_X86_64_TB" -C "$inc" || { echo "x86_64 kernel headers unpack failed" >&2; return 1; }
@@ -121,7 +121,7 @@ load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builde
 export TD_STORE_DIR=/td/store
 
 snwork=`mktemp -d`
-trap 'rm -rf "$snwork" "${rtree:-}" "${ZLIBX:-}" "${XNBU:-}" "${XNGCCB:-}" "${cpathdir:-}"' EXIT INT TERM
+trap 'rm -rf "$snwork" "${rtree:-}" "${ZLIBX:-}" "${nrout:-}" "${cpathdir:-}"' EXIT INT TERM
 cpathdir=`dirname "$cpath"`
 
 # ============================================================================================
@@ -164,13 +164,9 @@ echo "   cross toolchain ready: x86_64 glibc 2.41 ($XGLIBC) + libgcc_s ($XLIBGCC
 # ============================================================================================
 # RUNG X2: the NATIVE x86_64 toolchain (rung X2 of #240) — the LINKER rustc will drive in the own-root.
 # ============================================================================================
-echo ">> [N1] NATIVE x86_64 binutils 2.44 (ELF 64-bit as/ld)"
-XNBU=`mktemp -d`/native-binutils
-build_binutils_x86_64_native "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$KH_X86_64_TB" "$XNBU" || fail "could not build the NATIVE x86_64 binutils"
-echo ">> [N2] NATIVE x86_64 gcc 14.3.0 (ELF 64-bit gcc/cc1)"
-XNGCCB=`mktemp -d`/native-gcc
-build_gcc_x86_64_native "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$XNBU" "$KH_X86_64_TB" "$XNGCCB" || fail "could not build the NATIVE x86_64 gcc"
-XNGCC="$XNGCCB/stage/td/store/gcc-14.3.0-x86_64-native"
+echo ">> [N1+N2] NATIVE x86_64 binutils 2.44 + gcc 14.3.0 via the Rust toolchain-recipe (structured port)"
+nrout=`mktemp -d`/native-out
+x86_64_build_native_recipe "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$nrout" || fail "could not build the NATIVE x86_64 toolchain (recipe)"
 test -x "$XNGCC/bin/gcc" -a -x "$XNBU/bin/as" -a -x "$XNBU/bin/ld" || fail "the native x86_64 toolchain is missing gcc/as/ld"
 echo "   native x86_64 toolchain ready: gcc ($XNGCC) + as/ld ($XNBU)"
 

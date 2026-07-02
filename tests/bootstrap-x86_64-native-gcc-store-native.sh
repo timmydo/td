@@ -41,7 +41,7 @@ export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 export TD_STORE_DIR=/td/store
 snwork=`mktemp -d`
-trap 'rm -rf "$snwork"' EXIT INT TERM
+trap 'rm -rf "$snwork" "${nrout:-}"' EXIT INT TERM
 
 # the closure store: a FRESH /td/store own-root that holds the fetched/built cross closure components
 # (as siblings, so the cross gcc tooldir's relative as/ld symlinks resolve).
@@ -89,13 +89,9 @@ if x86_64_resolve_closure_native "$ncstore" "$ncdb"; then
   echo ">> [subst/SKIP native] fetched the NATIVE x86_64 toolchain {binutils,gcc} at their lock paths — SKIPPED the ~45-min native build"
 else
   echo ">> [subst/MISS native] no exposed native substitute — building the NATIVE x86_64 toolchain from the cross toolchain (directive 1)"
-  echo ">> [N1] NATIVE x86_64 binutils 2.44 (ELF 64-bit as/ld)"
-  XNBU=`mktemp -d`/native-binutils
-  build_binutils_x86_64_native "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$KH_X86_64_TB" "$XNBU" || fail "could not build the NATIVE x86_64 binutils"
-  echo ">> [N2] NATIVE x86_64 gcc 14.3.0 (ELF 64-bit gcc/cc1/g++)"
-  XNGCCB=`mktemp -d`/native-gcc
-  build_gcc_x86_64_native "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$XNBU" "$KH_X86_64_TB" "$XNGCCB" || fail "could not build the NATIVE x86_64 gcc"
-  XNGCC="$XNGCCB/stage/td/store/gcc-14.3.0-x86_64-native"
+  echo ">> [N1+N2] NATIVE x86_64 binutils 2.44 + gcc 14.3.0 via the Rust toolchain-recipe (structured port)"
+  nrout=`mktemp -d`/native-out
+  x86_64_build_native_recipe "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$nrout" || fail "could not build the NATIVE x86_64 toolchain (recipe)"
   echo ">> [export] intern the built native binutils + gcc at their lock-keyed paths + subst-export"
   x86_64_build_closure_native "`pwd`/.td-build-cache/x86_64-native-closure-export" "$ncstore" "$ncdb" \
     || fail "could not intern + subst-export the native x86_64 toolchain closure"

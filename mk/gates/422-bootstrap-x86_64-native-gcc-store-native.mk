@@ -12,7 +12,9 @@
 # (the native gcc RUNS and compiles+links a C AND C++ program -> 42), structural (own-root /td/store, no
 # /gnu/store). The NATIVE gcc is ALWAYS BUILT (never fetched); only its cross-toolchain prerequisite may
 # be fetched. HEAVY (the native gcc build is ~45 min; from-seed adds the ~98-min cross build). NOT a
-# BUILD_GATE. The cross + native rungs live in tests/x86_64-cross-fns.sh.
+# BUILD_GATE. The cross rungs + own-root verify live in tests/x86_64-cross-fns.sh; the native
+# binutils/gcc BUILD is the structured Rust recipe `td-builder toolchain-recipe x86_64-native`
+# (builder/src/toolchain_x86_64.rs) — the former build_{binutils,gcc}_x86_64_native shell drivers.
 HEAVY_GATES += bootstrap-x86_64-native-gcc-store-native
 bootstrap-x86_64-native-gcc-store-native:
 	@echo ">> bootstrap-x86_64-native-gcc-store-native: build a NATIVE x86_64 gcc 14.3.0 + binutils 2.44 (ELF 64-bit) with the cross toolchain, intern the native gcc at /td/store, and RUN it in the store-ns own-root where it compiles a C AND C++ program from source -> both 42, /gnu/store ABSENT (x86_64-toolchain rung X2 — the native, self-hosting-arch compiler)"
