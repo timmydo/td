@@ -1930,7 +1930,29 @@ fn assemble_recipe_drv(
 ///
 /// Usage: build-plan PLAN GUIX-DB SCRATCH
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn build_plan(plan_file: &str, guix_store: &str, scratch: &Path) -> Result<(), String> {
+/// The optional td-OWNED stage0 builder override from TD_BUILDER_PATH/STORE/DB — all
+/// three set together (a `store-add-builder` placement) → the drv's builder is that
+/// td-placed stage0, staged from its own store + db; none set → the running binary
+/// (self_store_path). Any partial set is a loud error. Returns owned strings; borrow
+/// them into the `(&str, &str, &str)` build_recipe/build_plan expects at the call site.
+fn builder_store_env() -> Result<Option<(String, String, String)>, String> {
+    match (
+        std::env::var("TD_BUILDER_PATH").ok(),
+        std::env::var("TD_BUILDER_STORE").ok(),
+        std::env::var("TD_BUILDER_DB").ok(),
+    ) {
+        (Some(p), Some(s), Some(d)) => Ok(Some((p, s, d))),
+        (None, None, None) => Ok(None),
+        _ => Err("TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together".into()),
+    }
+}
+
+fn build_plan(
+    plan_file: &str,
+    guix_store: &str,
+    scratch: &Path,
+    builder_store: Option<(&str, &str, &str)>,
+) -> Result<(), String> {
     use std::collections::BTreeMap;
     let plan = std::fs::read_to_string(plan_file)
         .map_err(|e| format!("read plan {plan_file}: {e}"))?;
@@ -2009,7 +2031,7 @@ fn build_plan(plan_file: &str, guix_store: &str, scratch: &Path) -> Result<(), S
             &td_dbs,
             None,            // src_store: build-plan locks carry resolved paths
             None,            // vendor_store: build-plan deps are not vendored-crate trees
-            None,            // builder_store: build-plan uses the guix-built builder
+            builder_store,   // builder_store: the td-placed stage0 (TD_BUILDER_*), or None → self
             Some(&tdstore),  // td_store: stage td-built deps from the shared td-store
             None,            // persist: build-plan owns its own in-run td-store
         )?;
@@ -2160,6 +2182,7 @@ fn build_plan_auto(
     lock_dir: &str,
     guix_store: &str,
     scratch: &Path,
+    builder_store: Option<(&str, &str, &str)>,
 ) -> Result<(), String> {
     if !auto_is_owned(recipe_dir, lock_dir, target) {
         return Err(format!(
@@ -2194,7 +2217,7 @@ fn build_plan_auto(
     }
     let plan_path = scratch.join("auto.plan");
     std::fs::write(&plan_path, &plan).map_err(|e| e.to_string())?;
-    build_plan(&plan_path.to_string_lossy(), guix_store, scratch)
+    build_plan(&plan_path.to_string_lossy(), guix_store, scratch, builder_store)
 }
 
 /// Emit PKG's recipe JSON from td's Rust catalog via `td-recipe-eval emit` — the
@@ -5077,7 +5100,15 @@ fn main() -> ExitCode {
         // Usage: build-plan PLAN GUIX-STORE SCRATCH
         Some("build-plan") if args.len() == 5 => {
             let (plan_file, guix_store, scratch) = (&args[2], &args[3], &args[4]);
-            match build_plan(plan_file, guix_store, Path::new(scratch)) {
+            let bov = match builder_store_env() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("td-builder: build-plan {plan_file}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let builder_store = bov.as_ref().map(|(p, s, d)| (p.as_str(), s.as_str(), d.as_str()));
+            match build_plan(plan_file, guix_store, Path::new(scratch), builder_store) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build-plan {plan_file}: {e}");
@@ -5093,7 +5124,15 @@ fn main() -> ExitCode {
         Some("build-plan") if args.len() == 8 && args[2] == "--auto" => {
             let (target, recipe_dir, lock_dir, guix_store, scratch) =
                 (&args[3], &args[4], &args[5], &args[6], &args[7]);
-            match build_plan_auto(target, recipe_dir, lock_dir, guix_store, Path::new(scratch)) {
+            let bov = match builder_store_env() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("td-builder: build-plan --auto {target}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let builder_store = bov.as_ref().map(|(p, s, d)| (p.as_str(), s.as_str(), d.as_str()));
+            match build_plan_auto(target, recipe_dir, lock_dir, guix_store, Path::new(scratch), builder_store) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build-plan --auto {target}: {e}");
