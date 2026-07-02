@@ -94,23 +94,32 @@ pub fn cli(args: &[String]) -> ExitCode {
     match args.get(2).map(String::as_str) {
         Some("x86_64-native") => {
             let result = NativeInputs::from_env().and_then(|inp| run_native(&inp));
-            match result {
-                Ok(report) => {
-                    print!("{report}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("FAIL: toolchain-recipe x86_64-native: {e}");
-                    ExitCode::FAILURE
-                }
-            }
+            finish("x86_64-native", result)
+        }
+        Some("rust-x86_64") => {
+            let result = RustInputs::from_env().and_then(|inp| run_rust(&inp));
+            finish("rust-x86_64", result)
         }
         Some("--list") | Some("list") => {
             println!("x86_64-native");
+            println!("rust-x86_64");
             ExitCode::SUCCESS
         }
         _ => {
             eprintln!("{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn finish(name: &str, result: Result<String, String>) -> ExitCode {
+    match result {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("FAIL: toolchain-recipe {name}: {e}");
             ExitCode::FAILURE
         }
     }
@@ -136,6 +145,144 @@ pub fn run_native(inp: &NativeInputs) -> Result<String, String> {
     report.push_str(&format!("NATIVE_BINUTILS={}\n", nbu.display()));
     report.push_str(&format!("NATIVE_GCC={}\n", ngcc.display()));
     Ok(report)
+}
+
+// --- rust-x86_64: relink the upstream Rust toolchain to /td/store --------------------
+//
+// Port of the "assemble the /td/store rust tree" driver
+// (tests/rust-x86_64-runtime-store-native.sh lines ~185-249): extract rustc/cargo + the
+// rust-std rustlib from the upstream tarball, co-locate the runtime closure (glibc
+// sonames + libgcc_s + libz) in the tree's lib/ (found via the UNCHANGED RUNPATH
+// $ORIGIN/../lib), and RELINK rustc/cargo's ELF interpreter — td's own rewriter
+// (`crate::elf::set_interp`, GROWS the slot per #258), NOT patchelf — to the LOCK-KEYED
+// /td/store x86_64 glibc loader (so the published tree's interp is stable/predictable,
+// the prerequisite for subst-fetching it). The gate interns the returned tree at the
+// td-toolchain-rust-x86_64.lock path + subst-exports it (generic td-builder subcommands).
+
+/// Inputs for the rust relink recipe (from `TDRX_*` env, how the gate passes them).
+pub struct RustInputs {
+    /// The upstream rust release tarball (`rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz`).
+    pub rust_tar: PathBuf,
+    /// Its top-level dir name (the tarball file minus `.tar.gz`).
+    pub rust_top: String,
+    /// The x86_64 glibc 2.41 tree (physical) — the co-located sonames come from its lib/.
+    pub glibc: PathBuf,
+    /// The dir holding `libgcc_s.so.1` (the cross/native gcc's target libgcc).
+    pub libgcc_dir: PathBuf,
+    /// The built x86_64 `libz.so.1.3.1`.
+    pub libz: PathBuf,
+    /// The LOCK-KEYED /td/store glibc loader path to relink rustc/cargo's interp to
+    /// (e.g. `/td/store/<key>-glibc-2.41-x86_64/lib/ld-linux-x86-64.so.2`) — computed by
+    /// the gate via `toolchain-path tests/td-toolchain-x86_64.lock glibc-2.41-x86_64`.
+    pub glibc_interp: String,
+    /// Scratch to assemble under; the tree lands at `<out>/tree`.
+    pub out: PathBuf,
+}
+
+impl RustInputs {
+    fn from_env() -> Result<RustInputs, String> {
+        let g = |k: &str| -> Result<String, String> {
+            std::env::var(k).map_err(|_| format!("env {k} unset"))
+        };
+        Ok(RustInputs {
+            rust_tar: PathBuf::from(g("TDRX_RUST_TAR")?),
+            rust_top: g("TDRX_RUST_TOP")?,
+            glibc: PathBuf::from(g("TDRX_XGLIBC")?),
+            libgcc_dir: PathBuf::from(g("TDRX_XLIBGCCDIR")?),
+            libz: PathBuf::from(g("TDRX_XLIBZ")?),
+            glibc_interp: g("TDRX_GLIBC_INTERP")?,
+            out: PathBuf::from(g("TDRX_OUT")?),
+        })
+    }
+}
+
+/// Assemble + relink the /td/store rust tree; print `RUST_TREE=<path>` for the gate.
+pub fn run_rust(inp: &RustInputs) -> Result<String, String> {
+    let mut report = String::new();
+    let tree = assemble_rust_tree(inp)?;
+    relink_rust_interp(&tree, &inp.glibc_interp, &mut report)?;
+    report.push_str(&format!("RUST_TREE={}\n", tree.display()));
+    Ok(report)
+}
+
+/// Extract rustc/cargo + rustlib, merge, provenance-check, co-locate the closure.
+/// Returns the assembled tree dir (`<out>/tree`).
+fn assemble_rust_tree(inp: &RustInputs) -> Result<PathBuf, String> {
+    let xtract = inp.out.join("x");
+    reset_dir(&xtract)?;
+    let top = &inp.rust_top;
+    // rustc (incl. its rustlib) + cargo are required; rust-std (libstd/libcore rlibs) merged if present.
+    selective_untar_gz(&inp.rust_tar, &xtract, &[&format!("{top}/rustc"), &format!("{top}/cargo/bin/cargo")])?;
+    // best-effort: the standalone rust-std component dir (ignore failure if the combined tarball lacks it).
+    let _ = selective_untar_gz(
+        &inp.rust_tar,
+        &xtract,
+        &[&format!("{top}/rust-std-x86_64-unknown-linux-gnu/lib/rustlib")],
+    );
+
+    let rx = xtract.join(top);
+    let tree = inp.out.join("tree");
+    reset_dir(&tree.join("bin"))?;
+    fs::create_dir_all(tree.join("lib")).map_err(ioerr("mkdir tree/lib"))?;
+    fs::copy(rx.join("rustc/bin/rustc"), tree.join("bin/rustc")).map_err(ioerr("cp rustc"))?;
+    fs::copy(rx.join("cargo/bin/cargo"), tree.join("bin/cargo")).map_err(ioerr("cp cargo"))?;
+    // librustc_driver, libLLVM, libstd*.so, AND rustc's own rustlib/.
+    copy_tree_contents(&rx.join("rustc/lib"), &tree.join("lib")).map_err(ioerr("cp rustc/lib"))?;
+    let std_rustlib = rx.join("rust-std-x86_64-unknown-linux-gnu/lib/rustlib");
+    if std_rustlib.is_dir() {
+        copy_tree_contents(&std_rustlib, &tree.join("lib/rustlib")).map_err(ioerr("merge rustlib"))?;
+    }
+    make_writable(&tree).map_err(ioerr("chmod tree"))?;
+
+    // the sysroot MUST hold a libstd rlib — else rustc has nothing to link a program to.
+    let rlib_dir = tree.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
+    if !glob_exists(&rlib_dir, "libstd-", ".rlib") {
+        return Err("assembled rust sysroot has no libstd rlib (rustlib missing) — rustc could not link a program".into());
+    }
+
+    // [provenance] the upstream binaries + librustc_driver carry NO /gnu/store bytes.
+    let mut provenance = vec![tree.join("bin/rustc"), tree.join("bin/cargo")];
+    if let Some(drv) = glob_first_in(&tree.join("lib"), "librustc_driver-", ".so") {
+        provenance.push(drv);
+    }
+    for b in &provenance {
+        if contains_gnu_store(b)? {
+            return Err(format!("{} contains /gnu/store bytes — not guix-free upstream", b.display()));
+        }
+    }
+
+    // co-locate the full external runtime closure in lib/ (found via RUNPATH $ORIGIN/../lib):
+    // glibc sonames + libgcc_s (+ the bare .so link the rust link's -lgcc_s resolves) + libz.
+    for soname in ["libc.so.6", "libdl.so.2", "librt.so.1", "libpthread.so.0", "libm.so.6"] {
+        let src = inp.glibc.join("lib").join(soname);
+        if !src.exists() {
+            return Err(format!("x86_64 glibc 2.41 is missing {soname}"));
+        }
+        copy_deref(&src, &tree.join("lib").join(soname))?;
+    }
+    copy_deref(&inp.libgcc_dir.join("libgcc_s.so.1"), &tree.join("lib/libgcc_s.so.1"))?;
+    symlink_force("libgcc_s.so.1", &tree.join("lib/libgcc_s.so"))?;
+    copy_deref(&inp.libz, &tree.join("lib/libz.so.1"))?;
+    make_writable(&tree).map_err(ioerr("chmod tree"))?;
+    Ok(tree)
+}
+
+/// Relink rustc + cargo's ELF interpreter to `glibc_interp` (td's own rewriter; GROWS
+/// the slot when the new path is longer, #258), asserting each landed under /td/store.
+fn relink_rust_interp(tree: &Path, glibc_interp: &str, report: &mut String) -> Result<(), String> {
+    for b in ["rustc", "cargo"] {
+        let bin = tree.join("bin").join(b);
+        crate::elf::set_interp(&bin, glibc_interp)?;
+        let got = crate::elf::read_interp(&bin)?.unwrap_or_default();
+        let ok = got.starts_with("/td/store/") && got.ends_with("/lib/ld-linux-x86-64.so.2");
+        if !ok {
+            return Err(format!("interp of {b} not relinked to the /td/store glibc loader (got: {got})"));
+        }
+    }
+    report.push_str(&format!(
+        "   [structural] rustc + cargo interp relinked (grown) to {glibc_interp} (was /lib64/ld-linux-x86-64.so.2)\n"
+    ));
+    Ok(())
 }
 
 // --- native binutils 2.44 --------------------------------------------------------
@@ -738,6 +885,12 @@ fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
         }
         let _ = fs::set_permissions(to, md.permissions());
     } else if ft.is_file() {
+        // cp -f semantics: an existing dest may be read-only (rust ships 0444 files, and the
+        // rust-std rustlib merge overlays rustc's rustlib), and fs::copy would then fail with
+        // EACCES opening it for write — remove it first so the overlay always lands.
+        if fs::symlink_metadata(to).is_ok() {
+            let _ = fs::remove_file(to);
+        }
         fs::copy(from, to)?;
     }
     Ok(())
@@ -762,6 +915,53 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// `tar -xzf TARBALL -C dest MEMBER...` — extract only the named members.
+fn selective_untar_gz(tarball: &Path, dest: &Path, members: &[&str]) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(ioerr("mkdir untar dest"))?;
+    let mut c = Command::new("tar");
+    c.arg("-xzf").arg(tarball).arg("-C").arg(dest);
+    for m in members {
+        c.arg(m);
+    }
+    run(c, "selective rust tarball extract")
+}
+
+/// `cp -L SRC DST` — copy following a symlink (fs::copy reads through the symlink),
+/// making the destination writable (the source .so may be 0444).
+fn copy_deref(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::copy(src, dst).map_err(|e| format!("cp {} -> {}: {e}", src.display(), dst.display()))?;
+    let mut perm = fs::metadata(dst).map_err(ioerr("stat copy"))?.permissions();
+    perm.set_mode(perm.mode() | 0o644);
+    fs::set_permissions(dst, perm).map_err(ioerr("chmod copy"))
+}
+
+/// True iff any file in `dir` is named `<prefix>…<suffix>`.
+fn glob_exists(dir: &Path, prefix: &str, suffix: &str) -> bool {
+    glob_first_in(dir, prefix, suffix).is_some()
+}
+
+/// The first (name-sorted) file in `dir` named `<prefix>…<suffix>`.
+fn glob_first_in(dir: &Path, prefix: &str, suffix: &str) -> Option<PathBuf> {
+    let mut hits: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            s.starts_with(prefix) && s.ends_with(suffix)
+        })
+        .map(|e| e.path())
+        .collect();
+    hits.sort();
+    hits.into_iter().next()
+}
+
+/// True iff the file contains the literal `/gnu/store` byte sequence.
+fn contains_gnu_store(p: &Path) -> Result<bool, String> {
+    let bytes = fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+    Ok(contains_sub(&bytes, b"/gnu/store"))
 }
 
 fn readelf_header(readelf: &Path, bin: &Path) -> Result<String, String> {
@@ -886,5 +1086,64 @@ mod tests {
         assert!(contains_sub(b"aa GNU ld script bb", b"GNU ld script"));
         assert!(!contains_sub(b"nope", b"GNU ld script"));
         assert!(!contains_sub(b"anything", b""));
+    }
+
+    #[test]
+    fn glob_first_in_matches_prefix_and_suffix() {
+        let d = tmp("td-xn-test-glob");
+        fs::write(d.join("libstd-abc123.rlib"), b"x").unwrap();
+        fs::write(d.join("libstd-abc123.so"), b"x").unwrap();
+        fs::write(d.join("libcore-xyz.rlib"), b"x").unwrap();
+        assert!(glob_exists(&d, "libstd-", ".rlib"));
+        assert!(!glob_exists(&d, "libstd-", ".dylib"));
+        // name-sorted first match.
+        let hit = glob_first_in(&d, "lib", ".rlib").unwrap();
+        assert!(hit.file_name().unwrap().to_string_lossy().starts_with("libcore-"), "got {hit:?}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn contains_gnu_store_detects_bytes() {
+        let d = tmp("td-xn-test-gnu");
+        fs::write(d.join("clean"), b"\x7fELF ordinary binary").unwrap();
+        fs::write(d.join("dirty"), b"\x7fELF refers to /gnu/store/abc-foo/lib").unwrap();
+        assert!(!contains_gnu_store(&d.join("clean")).unwrap());
+        assert!(contains_gnu_store(&d.join("dirty")).unwrap());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copy_tree_overlays_a_read_only_dest() {
+        // the rustlib merge overlays rust-std over rustc's rustlib; rust ships 0444 files, so
+        // the overlay must succeed over a read-only destination (cp -f), not fail with EACCES.
+        let d = tmp("td-xn-test-overlay");
+        let src = d.join("src");
+        let dst = d.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("f"), b"OLD").unwrap();
+        set_mode(&dst.join("f"), 0o444).unwrap(); // read-only existing dest
+        fs::write(src.join("f"), b"NEW").unwrap();
+        copy_tree_contents(&src, &dst).expect("overlay over a read-only dest must succeed");
+        assert_eq!(fs::read(dst.join("f")).unwrap(), b"NEW");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copy_deref_follows_symlink_and_makes_writable() {
+        let d = tmp("td-xn-test-deref");
+        let real = d.join("libc-real.so");
+        fs::write(&real, b"REALBYTES").unwrap();
+        set_mode(&real, 0o444).unwrap();
+        let link = d.join("libc.so.6");
+        std::os::unix::fs::symlink("libc-real.so", &link).unwrap();
+        let dst = d.join("out/libc.so.6");
+        fs::create_dir_all(d.join("out")).unwrap();
+        // copy through the symlink → the destination holds the TARGET's bytes and is writable.
+        copy_deref(&link, &dst).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"REALBYTES");
+        assert!(!fs::symlink_metadata(&dst).unwrap().file_type().is_symlink(), "dst should be a real file, not a symlink");
+        assert!(fs::metadata(&dst).unwrap().permissions().mode() & 0o200 != 0, "dst should be writable");
+        let _ = fs::remove_dir_all(&d);
     }
 }

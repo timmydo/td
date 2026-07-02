@@ -477,6 +477,16 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    if p == "tests/td-toolchain-rust-x86_64.lock" {
+        sel.add_preflight("shell-syntax");
+        // the RELINKED rust tree's input-addressed lock: its consumers are the rust runtime
+        // gate (which assembles+relinks+publishes it) and the rust userland gate (which sources
+        // the runtime gate's assembly). A pin/recipe-rev change re-keys + re-publishes the tree.
+        sel.add_target("rust-x86_64-runtime-store-native");
+        sel.add_target("rust-userland-x86_64-store-native");
+        return;
+    }
+
     if pattern_matches(
         "tests/toolchain-x86_64-input-addressed.sh|mk/gates/418-toolchain-x86_64-input-addressed.mk",
         p,
