@@ -17,7 +17,10 @@
 #     replaces "byte-identical to guix's `.drv`".
 #   • CLOSURE: `td-builder realize` computes the build-input closure by CONTENT-SCANNING the
 #     seed store (no `guix gc`) and writes closure.txt, staging the stage0 builder via the
-#     TD_BUILDER_* override (the realize engine change this slice adds).
+#     TD_BUILDER_* override (the realize engine change this slice adds). (realize also builds +
+#     registers the assembled drv as a side effect; the EXECUTE step below independently runs
+#     the EMITTED file through the raw `build` executor — a deliberate, distinct assertion, so
+#     the gate builds hello twice.)
 #   • EXECUTE: `td-builder build` runs the EMITTED `.drv` in its own userns sandbox to the
 #     canonical output path (OUT=out $out) with a registration — the S3/S4 executor, no daemon.
 #   • BEHAVIORAL: the built hello RUNS and prints "Hello, world!".
