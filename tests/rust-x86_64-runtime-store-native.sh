@@ -204,7 +204,7 @@ else
   echo "   built x86_64 libz.so.1 from zlib 1.3.1 source (cross gcc 14.3.0, no /gnu/store)"
   # assemble + relink via the structured recipe (relink target = the LOCK-KEYED glibc loader).
   top="${RUST_FILE%.tar.gz}"
-  rrout=`mktemp -d`/rust-out
+  rrout=`mktemp -d`/rust-out; mkdir -p "$rrout"   # the recipe stdout is captured to $rrout/recipe.out
   env TDRX_RUST_TAR="$RUST_TB" TDRX_RUST_TOP="$top" TDRX_XGLIBC="$XGLIBC" \
       TDRX_XLIBGCCDIR="$XLIBGCCDIR" TDRX_XLIBZ="$XLIBZ" TDRX_GLIBC_INTERP="$GLIBC_INTERP" \
       TDRX_OUT="$rrout" "$TB" toolchain-recipe rust-x86_64 > "$rrout/recipe.out" 2>&1 \
