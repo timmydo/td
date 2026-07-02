@@ -298,6 +298,23 @@ bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | 
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in hello's closure"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 
+# --- assemble-only library mode (#258 rust userland cutover) -----------------------------------------
+# When this script is SOURCED with TD_RUST_STORE_NATIVE_ASSEMBLE_ONLY=1 (by
+# tests/rust-x86_64-userland-store-native.sh), the caller only needs the fully-assembled /td/store —
+# the native x86_64 gcc + binutils, the relinked upstream rust (rustc/cargo + rustlib sysroot), the
+# x86_64 glibc 2.41, /td/store/ld, and a static bash — interned in $store with its db $sndb. Export
+# the handles and RETURN here, BEFORE the hello.rs probe (which is THIS gate's own behavioral leg).
+# The from-scratch assembly above is byte-for-byte the same code gate 416 runs; a normal gate run
+# leaves the guard unset and falls through to the probe unchanged (directive 3: the guard is inert
+# when unset — no existing gate behavior is altered).
+if [ "${TD_RUST_STORE_NATIVE_ASSEMBLE_ONLY:-}" = 1 ]; then
+  export TDSN_STORE="$store" TDSN_DB="$sndb" TDSN_NGREL="$ngrel" TDSN_NBREL="$nbrel" \
+         TDSN_GLREL="$glrel" TDSN_RUSTREL="$rustrel" TDSN_BBASE="$bbase" TDSN_CPATH="$cpath" \
+         TDSN_SNWORK="$snwork" TDSN_XGLIBC="$XGLIBC" TDSN_XNGCC="$XNGCC" TDSN_XNBU="$XNBU"
+  echo "   [assemble-only] /td/store assembled: native gcc=$ngrel binutils=$nbrel glibc=$glrel rust=$rustrel — returning to the userland caller"
+  return 0
+fi
+
 # ============================================================================================
 # In the store-ns own-root (interp = /td/store/ld): rustc RUNS, then rustc COMPILES a real program
 # using the /td/store NATIVE gcc as the linker, and the produced DYNAMIC ELF64 binary RUNS → 42.
