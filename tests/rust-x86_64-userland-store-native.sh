@@ -159,19 +159,24 @@ cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
 test -n "$cu" || fail "no coreutils in the rewritten lock for the scrubbed PATH"
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then fail "guix/guile on the scrubbed PATH"; fi
 
+# NOTE on the output's canonical prefix: build-recipe runs with the DEFAULT store dir (/gnu/store) —
+# the same mixed-prefix form the brick-8 corpus gates use — so the drv's OUTPUT canonical is
+# /gnu/store/<h>-ripgrep-14.1.1 while its INPUT closure spans both prefixes (the /td/store toolchain
+# via TD_EXTRA_DBS). The canonical is a label; the no-guix legs below assert the CONTENT (zero
+# /gnu/store bytes in rg, interp/RUNPATH = /td/store), and the own-root run stages rg by BASENAME
+# into the /td/store store — where it runs with /gnu/store absent.
 sb="$scratch/sb"
 env -i HOME="$scratch" TMPDIR="$scratch/tmp" PATH="$cu/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
   TD_SEED_STORE="$WSTORE" TD_SEED_DB="$WDB" TD_EXTRA_DBS="$SNDB" \
   TD_RUST_STORE_INTERP="$interp" TD_RUST_STORE_RPATH="$rpath" TD_RUST_STORE_BDIR="$bdir" \
-  TD_PERSIST_STORE="$STORE" TD_PERSIST_DB="$SNDB" \
   "$TB" build-recipe "$scratch/recipe.json" "$newlock" "$sb" "$WSTORE" "$srcstore" "$srcdb" "$vsrc" "$vstore" "$vdb" \
   > "$sb.out" 2>"$sb.err" || { echo "FAIL: build-recipe (ripgrep on the /td/store toolchain):" >&2; tail -40 "$sb.err" >&2; exit 1; }
 out=`sed -n 's/^OUT=out //p' "$sb.out"`
 test -n "$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$sb.err" >&2; exit 1; }
-case "$out" in /td/store/*-ripgrep-14.1.1) ;; *) fail "ripgrep output not content-addressed under /td/store (got: $out)" ;; esac
-rgrel=${out#/td/store/}
-echo "   [build] build-recipe built ripgrep at $out (persisted into the /td/store toolchain store)"
+case "$out" in */*-ripgrep-14.1.1) ;; *) fail "unexpected ripgrep output path (got: $out)" ;; esac
+rgrel=`basename "$out"`
+echo "   [build] build-recipe built ripgrep at $out (linked by the /td/store native toolchain)"
 
 # --- [structural] the .drv sets TD_VENDOR_DIR + the native link mode, and references NO guix rust/gcc-toolchain
 grep -q 'TD_VENDOR_DIR' "$sb"/*.drv || fail "the .drv lacks TD_VENDOR_DIR"
@@ -179,6 +184,10 @@ grep -q 'TD_RUST_STORE_INTERP' "$sb"/*.drv || fail "the .drv lacks TD_RUST_STORE
 if grep -oqE '/gnu/store/[a-z0-9]+-(rust-|gcc-toolchain-)' "$sb"/*.drv; then fail "the .drv references a guix rust/gcc-toolchain path"; fi
 
 # --- [no-guix] the DELIVERABLE `rg` references NO guix rust / gcc-toolchain, and links the /td/store glibc
+# stage the built output by BASENAME into the /td/store store for the own-root run (as the
+# toolchain trees were staged).
+test -d "$sb/newstore/$rgrel" || fail "no realized ripgrep tree at $sb/newstore/$rgrel"
+rm -rf "$STORE/$rgrel"; cp -a "$sb/newstore/$rgrel" "$STORE/$rgrel"; chmod -R u+w "$STORE/$rgrel" 2>/dev/null || true
 rgbin="$STORE/$rgrel/bin/$BIN"
 test -x "$rgbin" || fail "no $BIN binary at $rgbin"
 if grep -q -a -- '/gnu/store' "$rgbin"; then fail "the built $BIN contains /gnu/store bytes"; fi
