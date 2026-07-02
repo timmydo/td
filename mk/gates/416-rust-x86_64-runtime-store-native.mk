@@ -13,8 +13,9 @@
 # DURABLE: supply-chain (sha==pin), provenance (no /gnu/store upstream), native-arch (the linker is the
 # ELF64 native gcc/as/ld), no-guix (interned rust+native-gcc+glibc /gnu/store-free), structural (interp ∈
 # /td/store; complete lib closure + rustlib sysroot), behavioral (rustc RUNS, COMPILES, output RUNS).
-# HEAVY (native gcc build ~45 min; from-seed adds the ~98-min cross build). NOT a BUILD_GATE. The cross +
-# native rungs live in tests/x86_64-cross-fns.sh; the fetch short-circuit in tests/x86_64-subst-lib.sh.
+# HEAVY (native gcc build ~45 min; from-seed adds the ~98-min cross build). NOT a BUILD_GATE. The cross
+# rungs live in tests/x86_64-cross-fns.sh; the native binutils/gcc BUILD is the Rust recipe `td-builder
+# toolchain-recipe x86_64-native` (builder/src/toolchain_x86_64.rs); the fetch short-circuit in tests/x86_64-subst-lib.sh.
 HEAVY_GATES += rust-x86_64-runtime-store-native
 rust-x86_64-runtime-store-native:
 	@echo ">> rust-x86_64-runtime-store-native: build the NATIVE x86_64 gcc/binutils (rung X2), relink the upstream x86_64 Rust 1.96.0 toolchain to /td/store WITH its rustlib sysroot, and in the store-ns own-root RUN rustc/cargo AND COMPILE hello.rs via the /td/store native gcc into a DYNAMIC ELF64 binary that RUNS → 42, /gnu/store ABSENT (the rust-store-native runtime+COMPILE leg — the DESIGN 'retarget rust to /td/store' arrow)"

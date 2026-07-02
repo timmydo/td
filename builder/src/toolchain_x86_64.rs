@@ -60,7 +60,7 @@ impl NativeInputs {
     /// Read the inputs from `TDXN_*` env vars (how the gate passes them).
     fn from_env() -> Result<NativeInputs, String> {
         let g = |k: &str| -> Result<String, String> {
-            std::env::var(k).map_err(|_| format!("toolchain-recipe x86_64-native: env {k} unset"))
+            std::env::var(k).map_err(|_| format!("env {k} unset"))
         };
         Ok(NativeInputs {
             cpath: std::env::var("TDXN_CPATH").unwrap_or_default(),
