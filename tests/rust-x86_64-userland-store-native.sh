@@ -79,7 +79,11 @@ done
 test "$miss" -eq 0 || fail "$miss vendored crate(s) not pinned by $PKG's Cargo.lock"
 echo "   [supply-chain] all $ncrate vendored crates' sha256 are pinned in $PKG's Cargo.lock (== the crates.io cksum the cargo-proxy verified)"
 
-scratch="$ROOT/.td-build-cache/$PKG-userland-store-native"; rm -rf "$scratch"; mkdir -p "$scratch/tmp" "$scratch/sb"
+scratch="$ROOT/.td-build-cache/$PKG-userland-store-native"
+# A prior in-place run leaves read-only guix trees under $scratch/seed-store (cp -a preserves the
+# store's 0555 dirs), which plain `rm -rf` cannot unlink; make it writable first. (A CI fresh
+# checkout has no leftover, so this is a dev-rerun robustness fix, not a gate behavior change.)
+chmod -R u+w "$scratch" 2>/dev/null || true; rm -rf "$scratch"; mkdir -p "$scratch/tmp" "$scratch/sb"
 srcinfo=`sh tests/intern-src.sh "$TB" "$PKG-src" "$srctree" "$scratch/src" target vendor .cargo` || fail "intern source failed"
 eval "$srcinfo"   # -> src, srcstore, srcdb
 vinfo=`sh tests/intern-src.sh "$TB" "$PKG-vendor" "$vendor" "$scratch/vendor"` || fail "intern vendor tree failed"
