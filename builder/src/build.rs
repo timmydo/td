@@ -660,9 +660,26 @@ pub fn run_rust() -> Result<(), String> {
     // Reproducibility: remap the (varying) build dir + CARGO_HOME so file!()/debug
     // paths don't leak into the binary; link via gcc (ld-wrapper) so the output
     // gets a RUNPATH to the toolchain libs.
-    let rustflags = format!(
+    let mut rustflags = format!(
         "--remap-path-prefix={build_abs}=/td-build --remap-path-prefix={cargo_home}=/td-cargo -Clinker={gcc}"
     );
+    // Native /td/store toolchain (#258): the native gcc is a PLAIN gcc, NOT guix's ld-wrapper, so it
+    // injects no interp/RUNPATH. When TD_RUST_STORE_INTERP is set the caller is linking against the
+    // native /td/store toolchain — bake them explicitly (the #255 rustc-compile recipe): the dynamic
+    // linker = the /td/store ld, a RUNPATH per TD_RUST_STORE_RPATH dir so the produced binary resolves
+    // its libs (glibc, libgcc_s, libz) from /td/store at run time, and -B per TD_RUST_STORE_BDIR so the
+    // native gcc finds the glibc crt/lib at link time. Unset ⇒ the guix ld-wrapper path, unchanged.
+    if let Ok(interp) = env::var("TD_RUST_STORE_INTERP") {
+        if !interp.is_empty() {
+            rustflags.push_str(&format!(" -Clink-arg=-Wl,--dynamic-linker,{interp}"));
+            for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
+                rustflags.push_str(&format!(" -Clink-arg=-Wl,-rpath,{rp}"));
+            }
+            for b in env::var("TD_RUST_STORE_BDIR").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
+                rustflags.push_str(&format!(" -Clink-arg=-B{b}"));
+            }
+        }
+    }
     let mut envs: Vec<(String, String)> = vec![
         ("out".into(), out.clone()),
         ("PATH".into(), path.clone()),

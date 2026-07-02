@@ -753,6 +753,19 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     ) {
         sel.add_preflight("shell-syntax");
         sel.add_target("rust-x86_64-runtime-store-native");
+        // gate 424 (#258 rust userland) sources this script ASSEMBLE-ONLY for its /td/store
+        // toolchain assembly, so a change here must re-validate that consumer too.
+        sel.add_target("rust-userland-x86_64-store-native");
+        return;
+    }
+
+    // #258 rust userland: ripgrep built by the native x86_64 /td/store toolchain (gate 424).
+    if pattern_matches(
+        "tests/rust-x86_64-userland-store-native.sh|mk/gates/424-rust-userland-x86_64-store-native.mk",
+        p,
+    ) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("rust-userland-x86_64-store-native");
         return;
     }
 
@@ -1440,6 +1453,18 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!(
         "mk/gates/418-toolchain-x86_64-input-addressed.mk",
         "toolchain-x86_64-input-addressed"
+    );
+    assert_target!(
+        "tests/rust-x86_64-userland-store-native.sh",
+        "rust-userland-x86_64-store-native"
+    );
+    assert_target!(
+        "mk/gates/424-rust-userland-x86_64-store-native.mk",
+        "rust-userland-x86_64-store-native"
+    );
+    assert_target!(
+        "tests/rust-x86_64-runtime-store-native.sh",
+        "rust-userland-x86_64-store-native"
     );
     assert_target!(
         "tests/userland-x86_64-store-native.sh",
