@@ -8,10 +8,11 @@
 //!     path — the case that lets rustc/cargo point at the full hashed
 //!     `/td/store/<hash>-glibc.../ld-linux-x86-64.so.2`, a NORMAL staged store path the
 //!     build sandbox already mounts — is handled by GROWING: the new path is appended to the
-//!     end of the file and `PT_INTERP`'s `p_offset`/`p_filesz` are repointed at it. This is
-//!     sound because the kernel reads the interpreter path from the FILE at `p_offset` (it
-//!     need NOT lie in a PT_LOAD segment), so no new LOAD segment / `.dynstr` surgery is
-//!     needed — the interp is the one field that grows cheaply.
+//!     end of the file, the non-essential `PT_NOTE` program header is repurposed into a
+//!     read-only `PT_LOAD` mapping it (the string must be MAPPED — the glibc dynamic linker
+//!     re-reads the interp name from memory at `load_bias + p_vaddr`; verified-red: without
+//!     the covering LOAD the relinked binary segfaults), and `PT_INTERP` is repointed at it.
+//!     The standard patchelf-style trick, with no program-header-table relocation.
 //!   - the run-path (`DT_RUNPATH` / legacy `DT_RPATH`), which makes a toolchain binary
 //!     self-sufficient — e.g. retargeting an `ar`/`ranlib` build-dir search path to
 //!     `/td/store/...lib` so it finds its shared libc without an `LD_LIBRARY_PATH` wrapper.
@@ -299,13 +300,15 @@ pub fn read_interp(path: &Path) -> Result<Option<String>, String> {
 
 /// Rewrite the program interpreter (`PT_INTERP`) string. A path that fits the existing slot
 /// (plus its NUL) is written IN PLACE (remaining bytes NUL-padded). A LONGER path is handled
-/// by GROWING: the new path (NUL-terminated) is appended to the end of the file and
-/// `PT_INTERP`'s `p_offset`/`p_filesz`/`p_memsz` are repointed at it. This is sound because
-/// the kernel reads the interpreter path from the FILE at `p_offset` during `execve` — it
-/// need not lie in a PT_LOAD segment — so no new LOAD segment / `.dynstr` growth is required.
-/// Errors (without modifying the file) only if the ELF has no interpreter at all. Lets the
-/// upstream-Rust relink point rustc/cargo at the full hashed `/td/store/<hash>-glibc.../ld…`
-/// loader (a normal staged store path), not just the short `/td/store/ld`.
+/// by GROWING: the new path (NUL-terminated) is appended to the end of the file, the
+/// non-essential `PT_NOTE` program header is repurposed into a read-only `PT_LOAD` mapping
+/// it, and `PT_INTERP` is repointed at the new offset/vaddr. The covering LOAD is required —
+/// the glibc dynamic linker re-reads the interp name from MEMORY at `load_bias + p_vaddr`
+/// (verified-red: append + repoint alone segfaults at run time). Errors (without modifying
+/// the file) if the ELF has no interpreter, or no `PT_NOTE` to repurpose when growth is
+/// needed. Lets the upstream-Rust relink point rustc/cargo at the full hashed
+/// `/td/store/<hash>-glibc.../ld…` loader (a normal staged store path), not just the short
+/// `/td/store/ld`.
 pub fn set_interp(path: &Path, new_interp: &str) -> Result<(), String> {
     let mut b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let (ph, off, sz, is64) = interp_ph_entry(&b)?
@@ -330,8 +333,8 @@ pub fn set_interp(path: &Path, new_interp: &str) -> Result<(), String> {
         let (note_ph, load_end) = {
             let elf = Elf::parse(&b)?;
             let (phoff, phentsize, phnum) = elf.phdr_table()?;
-            let (p_off, p_vaddr, p_filesz) = elf.ph_fields();
-            let p_memsz = if is64 { 0x28 } else { 0x14 };
+            let pv = ph_field(&PField::Vaddr, is64);
+            let pm = ph_field(&PField::Memsz, is64);
             let mut note: Option<usize> = None;
             let mut end: u64 = 0;
             for i in 0..phnum {
@@ -339,14 +342,12 @@ pub fn set_interp(path: &Path, new_interp: &str) -> Result<(), String> {
                 match u32le(&b, e)? {
                     PT_NOTE if note.is_none() => note = Some(e),
                     PT_LOAD => {
-                        let va = elf.word(e + p_vaddr)?;
-                        let msz = elf.word(e + p_memsz)?;
+                        let va = elf.word(e + pv)?;
+                        let msz = elf.word(e + pm)?;
                         end = end.max(va + msz);
                     }
                     _ => {}
                 }
-                let _ = p_off;
-                let _ = p_filesz;
             }
             (
                 note.ok_or("cannot grow PT_INTERP: no PT_NOTE segment to repurpose into a PT_LOAD")?,
