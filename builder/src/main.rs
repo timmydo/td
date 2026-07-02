@@ -3152,6 +3152,35 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // drv-refs: print a `.drv`'s DIRECT references — the store paths folded into its own
+        // content-addressed path (inputDrvs ∪ inputSrcs), the exact set `drv-path`/the daemon's
+        // makeTextPath uses. Parsed from the `.drv` bytes (drv::parse), so it is guix-free and
+        // needs no store DB / no `guix gc --references`. One path per line, sorted+deduped —
+        // the reference list `store-add-referenced` folds back in. Usage: drv-refs FILE
+        Some("drv-refs") if args.len() == 3 => {
+            let file = &args[2];
+            let run = || -> Result<Vec<String>, String> {
+                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
+                let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
+                refs.extend(d.input_srcs.iter().cloned());
+                refs.sort();
+                refs.dedup();
+                Ok(refs)
+            };
+            match run() {
+                Ok(refs) => {
+                    for r in &refs {
+                        println!("{r}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: drv-refs {file}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // evaluator-as-library (sub-task 4): compute output `out`'s store path via
         // the recursive hashDerivationModulo. Prints the computed path; the rung
         // compares it to the real one. Proves the modulo recursion matches guix.
@@ -3581,21 +3610,37 @@ fn main() -> ExitCode {
         // (see Scanner::reset), so even a ~500k-entry live store is fast. A match is a
         // 32-char hash literally present in the bytes — exactly the daemon's own reference
         // criterion, so scanning the live store cannot report a reference guix would not
-        // (the store-closure-live gate proves == `guix gc -R`). Usage:
-        //   store-closure-scan STORE-DIR ROOT [ROOT...]
-        // Prints the reachable store paths (under STORE-DIR), sorted (ROOTs included).
+        // (the store-closure-live gate proves == `guix gc -R`). STORE-DIR may be a
+        // COMMA-SEPARATED list DIR1,DIR2,…: the candidate index then spans every listed
+        // dir (a path's bytes are read from whichever dir holds them — matching is by 32-char
+        // hash, not by prefix, so a member found under a non-canonical dir still resolves),
+        // while the FIRST dir is the canonical prefix the ROOT paths use. This closes a
+        // subject whose output tree lives in one store (e.g. a build scratch's `newstore`)
+        // and whose deps live in another (the seed /gnu/store) in a SINGLE scan. Usage:
+        //   store-closure-scan STORE-DIR[,EXTRA-DIR...] ROOT [ROOT...]
+        // Prints the reachable store paths (canonical under the first dir), sorted (ROOTs incl).
         Some("store-closure-scan") if args.len() >= 4 => {
-            let store_dir = &args[2];
+            let store_dirs: Vec<String> = args[2]
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            // The first (canonical) dir names the ROOT/candidate prefix; the rest are extra
+            // byte sources merged into the index. A degenerate all-separator arg (e.g. ",")
+            // yields no dirs → an empty prefix and an empty candidate set (the scan then just
+            // echoes the roots) rather than a panic — callers pass real dirs.
+            let canonical_prefix = store_dirs.first().cloned().unwrap_or_default();
             let roots: Vec<String> = args[3..].to_vec();
             let run = || -> Result<Vec<String>, String> {
-                // Candidates = the store-path entries under STORE-DIR, keyed by 32-char hash;
-                // a self-contained store where the on-disk dir IS the canonical location, so
-                // the canonical prefix is STORE-DIR itself. BFS over CONTENT-scanned refs to
-                // fixpoint (no store DB, no extra dbs): the shared `scan_candidate_index` +
-                // `scan_closure_hybrid` — the same content-scan realize_drv uses. Index built
-                // ONCE, reset() between paths, so even a ~500k-entry live store is fast.
+                // Candidates = the store-path entries under every listed dir, keyed by 32-char
+                // hash; the canonical prefix is the FIRST dir (a single-dir list keeps the
+                // original "the dir IS the canonical location" behavior). BFS over CONTENT-
+                // scanned refs to fixpoint (no store DB, no extra dbs): the shared
+                // `scan_candidate_index` + `scan_closure_hybrid` — the same content-scan
+                // realize_drv uses. Index built ONCE, reset() between paths, so even a
+                // ~500k-entry live store is fast.
                 let (candidates, on_disk) =
-                    scan_candidate_index(std::slice::from_ref(store_dir), store_dir)?;
+                    scan_candidate_index(&store_dirs, &canonical_prefix)?;
                 let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
                 let empty = std::collections::HashMap::new();
                 let seen = scan_closure_hybrid(&mut scanner, &on_disk, &empty, &roots)?;
@@ -3609,7 +3654,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("td-builder: store-closure-scan {store_dir}: {e}");
+                    eprintln!("td-builder: store-closure-scan {}: {e}", args[2]);
                     ExitCode::FAILURE
                 }
             }
@@ -5648,12 +5693,13 @@ fn main() -> ExitCode {
             eprintln!("       td-builder nar-restore NARFILE DEST");
             eprintln!("       td-builder subst-export DB STORE-DIR OUTDIR ROOT...");
             eprintln!("       td-builder drv-parse FILE.drv");
+            eprintln!("       td-builder drv-refs FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
             eprintln!("       td-builder store-query DB info|references");
             eprintln!("       td-builder store-closure DB ROOT");
-            eprintln!("       td-builder store-closure-scan STORE-DIR ROOT...");
+            eprintln!("       td-builder store-closure-scan STORE-DIR[,EXTRA-DIR...] ROOT...");
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-referenced NAME CONTENT-FILE REFS-FILE STORE-DIR OUT-DB");
@@ -6605,5 +6651,55 @@ memchr-2.7.crate /gnu/store/ddd-memchr.crate
             "hybrid closure must span the td-dep (extra db) + its content-scanned seed refs"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- multi-store store-closure-scan: candidate index spans several dirs -------------
+    // The store-closure-scan primitive R3 uses to close a td-built subject whose OUTPUT tree
+    // lives in a build scratch's `newstore` while its deps live in the seed store: the
+    // candidate index spans BOTH dirs, the FIRST dir is the canonical prefix the roots use,
+    // and — because matching is by 32-char HASH, not by prefix — a member whose bytes sit
+    // under the non-canonical dir still resolves. This mirrors scan_candidate_index(&[seed,
+    // newstore], seed) exactly as the `store-closure-scan seed,newstore ROOT` arm calls it.
+    #[test]
+    fn multi_store_scan_spans_seed_and_newstore() {
+        use std::collections::HashMap;
+        let glibc_h = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hello_h = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let base = std::env::temp_dir().join(format!("td-multiscan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed"); // the canonical /gnu/store stand-in (deps live here)
+        let newstore = base.join("newstore"); // a build scratch's newstore (the output only)
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::create_dir_all(&newstore).unwrap();
+        // glibc is a leaf in the seed; hello is the SUBJECT output, present ONLY in newstore,
+        // and its bytes reference glibc by hash (the daemon's own reference criterion).
+        std::fs::write(seed.join(format!("{glibc_h}-glibc-2.41")), b"a libc leaf\n").unwrap();
+        std::fs::write(
+            newstore.join(format!("{hello_h}-hello-2.12.2")),
+            format!("hello links /gnu/store/{glibc_h}-glibc-2.41/lib/libc.so\n").as_bytes(),
+        )
+        .unwrap();
+
+        let seed_s = seed.to_string_lossy().into_owned();
+        let newstore_s = newstore.to_string_lossy().into_owned();
+        let canon = |name: &str| format!("/gnu/store/{name}");
+        // The FIRST dir is the canonical prefix; both dirs are byte sources.
+        let (candidates, on_disk) =
+            scan_candidate_index(&[seed_s.clone(), newstore_s.clone()], "/gnu/store").unwrap();
+        // hello's canonical path uses the /gnu/store prefix, but its BYTES come from newstore.
+        let hello_c = canon(&format!("{hello_h}-hello-2.12.2"));
+        let glibc_c = canon(&format!("{glibc_h}-glibc-2.41"));
+        assert!(candidates.contains(&hello_c) && candidates.contains(&glibc_c));
+        assert_eq!(on_disk[&hello_c], newstore.join(format!("{hello_h}-hello-2.12.2")).to_string_lossy());
+        assert_eq!(on_disk[&glibc_c], seed.join(format!("{glibc_h}-glibc-2.41")).to_string_lossy());
+
+        let mut scanner = scan::Scanner::new(&candidates).unwrap();
+        let empty: HashMap<String, Vec<String>> = HashMap::new();
+        // Closing from the subject root pulls glibc out of the OTHER store dir, by hash.
+        let mut cl: Vec<String> =
+            scan_closure_hybrid(&mut scanner, &on_disk, &empty, &[hello_c.clone()]).unwrap().into_iter().collect();
+        cl.sort();
+        assert_eq!(cl, vec![glibc_c, hello_c], "multi-store closure must span both stores");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -3,41 +3,41 @@
 # (#39), in pure Rust, no daemon. `td-builder store-gc-sweep STORE-DIR DB ROOT` computes
 # the live set (closure of ROOT over the Refs), DELETES every registered content path NOT
 # reachable from ROOT from the td-owned STORE-DIR, and rewrites the DB to the live set
-# (ValidPaths + Refs renumbered). The differential (daemon = oracle, prime directive 4):
-# a td-owned store is built by copying hello's full closure (cp -a) and registering it
-# (`store-register`); after sweeping with ROOT=glibc (whose closure is a PROPER subset),
-# the surviving store entries AND the rewritten DB hold EXACTLY `guix gc -R glibc` — the
-# daemon's own reachable set — and the dead paths' files are gone. Boundary: the sweep
-# deletes ONLY from the td-owned scratch STORE-DIR (a cp -a copy, chmod'd writable so it
-# is deletable) and rewrites only the scratch DB — the host /gnu/store is NEVER touched.
-# Needs td-builder built, so it slots in the heavy pool.
+# (ValidPaths + Refs renumbered).
+# R3 (guix-retirement ladder → #261): the SUBJECT is now td-BUILT (tests/store-subject.sh —
+# hello via build-recipe, cache-hit) staged into a td-OWNED store and its closure
+# CONTENT-SCANNED, so this gate runs with guix OFF PATH — no `guix build`, no `guix gc`. The
+# removable guix-comparison oracle (survivors == `guix gc -R glibc`) is DROPPED per CLAUDE.md
+# directive 3 (called out in the PR): the expected live set is td's OWN mark phase
+# (`store-closure DB glibc` — the reachable set the sweep must keep), so the gate asserts the
+# sweep KEEPS exactly what td's own liveness walk marks and DELETES the rest. Sweeping with
+# ROOT=glibc (a PROPER subset of hello's closure), the surviving store entries AND the
+# rewritten DB hold EXACTLY that reachable set and the dead paths' files are gone. Boundary:
+# the sweep deletes ONLY from the td-owned staged STORE-DIR and rewrites only its DB — the
+# host /gnu/store is NEVER touched. Needs td-builder + the corpus build → heavy pool + the
+# build-recipes prelude.
 HEAVY_GATES += store-gc-sweep
+BUILD_GATES += store-gc-sweep
 store-gc-sweep:
-	@echo ">> store-gc-sweep: td DELETES the GC-dead paths from its OWN store + rewrites the DB to the live set (destructive GC sweep, pure Rust, no daemon) == guix gc -R"
+	@echo ">> store-gc-sweep: td DELETES the GC-dead paths from its OWN store + rewrites the DB to the live set (destructive GC sweep of a TD-BUILT closure, pure Rust, no daemon; guix off PATH) == td's own mark phase"
 	@set -euo pipefail; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
-	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
-	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
-	out=`guix build hello`; drv=`guix build -d hello`; \
-	test -n "$$out" -a -n "$$drv" || { echo "ERROR: could not realise hello" >&2; exit 1; }; \
-	scratch="$(CURDIR)/.store-gc-sweep-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch/store"; \
-	guix gc -R "$$out" | sort -u > "$$scratch/closure.txt"; \
-	n=`wc -l < "$$scratch/closure.txt"`; \
-	while read p; do cp -a "$$p" "$$scratch/store/"; done < "$$scratch/closure.txt"; \
-	chmod -R u+w "$$scratch/store"; \
-	"$$tb" store-register "$$out" "$$drv" "$$scratch/closure.txt" "$$scratch/td.db" >/dev/null; \
-	root=`grep -- '-glibc-' "$$scratch/closure.txt" | head -1`; \
+	. tests/store-subject.sh; \
+	scratch="$(CURDIR)/.store-gc-sweep-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
+	td_store_subject "$$scratch" || exit 1; \
+	n="$$SUBJ_N"; \
+	"$$TB" store-register "$$SUBJ_ROOT" "$$SUBJ_DRV" "$$SUBJ_CLOSURE" "$$scratch/td.db" >/dev/null; \
+	root=`grep -- '-glibc-' "$$SUBJ_CLOSURE" | head -1`; \
 	test -n "$$root" || { echo "FAIL: no glibc in hello's closure to use as a non-trivial GC root" >&2; exit 1; }; \
-	live=`guix gc -R "$$root" | sed 's#.*/##' | sort`; \
+	live=`"$$TB" store-closure "$$scratch/td.db" "$$root" | sed 's#.*/##' | sort`; \
 	nlive=`echo "$$live" | wc -l`; \
 	test "$$nlive" -lt "$$n" || { echo "FAIL: glibc's closure is not a PROPER subset of hello's ($$nlive vs $$n) — nothing would be swept" >&2; exit 1; }; \
-	echo ">> td store holds hello's $$n-path closure; GC root glibc keeps $$nlive live, $$(($$n-$$nlive)) dead"; \
-	"$$tb" store-gc-sweep "$$scratch/store" "$$scratch/td.db" "$$root"; \
-	survivors=`ls "$$scratch/store" | sort`; \
-	test "$$survivors" = "$$live" || { echo "FAIL: surviving store entries != guix gc -R glibc" >&2; echo "$$survivors" | sed 's/^/  surv: /' >&2; echo "$$live" | sed 's/^/  live: /' >&2; exit 1; }; \
-	echo "   td DELETED the $$(($$n-$$nlive)) dead paths; the store now holds EXACTLY guix gc -R glibc's $$nlive live paths"; \
-	db_paths=`"$$tb" store-query "$$scratch/td.db" info | sed 's#|.*##;s#.*/##' | sort`; \
+	echo ">> td store holds hello's $$n-path closure; GC root glibc marks $$nlive live (td's own store-closure), $$(($$n-$$nlive)) dead"; \
+	"$$TB" store-gc-sweep "$$SUBJ_STORE" "$$scratch/td.db" "$$root"; \
+	survivors=`ls "$$SUBJ_STORE" | sort`; \
+	test "$$survivors" = "$$live" || { echo "FAIL: surviving store entries != td's marked live set" >&2; echo "$$survivors" | sed 's/^/  surv: /' >&2; echo "$$live" | sed 's/^/  live: /' >&2; exit 1; }; \
+	echo "   td DELETED the $$(($$n-$$nlive)) dead paths; the store now holds EXACTLY the $$nlive marked-live paths"; \
+	db_paths=`"$$TB" store-query "$$scratch/td.db" info | sed 's#|.*##;s#.*/##' | sort`; \
 	test "$$db_paths" = "$$live" || { echo "FAIL: the swept DB's ValidPaths != the live set" >&2; echo "$$db_paths" | sed 's/^/  db:   /' >&2; echo "$$live" | sed 's/^/  live: /' >&2; exit 1; }; \
 	echo "   the rewritten DB records EXACTLY the live set (dead ValidPaths rows removed)"; \
 	rm -rf "$$scratch"; \
-	echo "PASS: td performed the DESTRUCTIVE GC SWEEP on its OWN store, in pure Rust with NO daemon — after copying hello's $$n-path closure into a td-owned store and registering it, td swept with GC root glibc: it DELETED the dead paths' files and rewrote the DB so BOTH the surviving store entries AND the ValidPaths records hold EXACTLY guix gc -R glibc's $$nlive-path reachable set (the daemon's own GC decision, the oracle). The host /gnu/store is never touched (the sweep operates only on the td-owned cp -a copy). td now owns BOTH halves of GC — mark (#39) and sweep. A td store backend is a later increment."
+	echo "PASS: td performed the DESTRUCTIVE GC SWEEP on its OWN store, in pure Rust with NO daemon — over a TD-BUILT hello's $$n-path closure staged into a td-owned store (guix off PATH; no guix build, no guix gc). After registering it and marking the live set with td's own store-closure (GC root glibc), td swept: it DELETED the dead paths' files and rewrote the DB so BOTH the surviving store entries AND the ValidPaths records hold EXACTLY the $$nlive-path marked-live set. The removable == guix gc -R glibc oracle was replaced by td's own mark phase (directive 3). The host /gnu/store is never touched (the sweep operates only on the td-owned staged store). td now owns BOTH halves of GC — mark (#39) and sweep."

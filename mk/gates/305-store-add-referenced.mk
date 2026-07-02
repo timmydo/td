@@ -5,40 +5,45 @@
 # with the references FOLDED INTO THE TYPE (`make_text_path`: `text:<sorted refs>` — the
 # daemon's makeTextPath/makeType), WRITES the content into a td-owned store (canonical 0444
 # file), and REGISTERS the path with its `Refs` to the referenced paths. The canonical
-# referenced content-addressed item is a `.drv` (referenced by its input drvs/srcs). The
-# differential (daemon = oracle, prime directive 4): for hello's `.drv` and its references
-# (`guix gc --references`), td computes the IDENTICAL store path (proving the references are
-# folded into the path correctly — drop one and the path diverges), writes a `.drv`
-# byte-identical (by NAR hash) to the daemon's own, and registers EXACTLY the daemon's
-# recorded references (read back by td's own `store-query references`). Boundary: td writes
-# only its OWN scratch store/DB and READS the daemon's `.drv`; the host store is untouched.
-# Needs td-builder built, so it slots in the heavy pool.
+# referenced content-addressed item is a `.drv` (referenced by its input drvs/srcs).
+# R3 (guix-retirement ladder → #261): the subject `.drv` is now the one td ASSEMBLED
+# (tests/store-subject.sh — assemble-recipe, guix/Guile off PATH), NOT `guix build -d`, and
+# its references are read with `td-builder drv-refs` (parse inputDrvs ∪ inputSrcs), NOT `guix
+# gc --references`. So this gate runs with guix OFF PATH. The removable guix oracle (the
+# stored `.drv` byte-identical to the DAEMON's own + references == `guix gc --references`) is
+# DROPPED per CLAUDE.md directive 3 (called out in the PR); in its place a genuine ROUND-TRIP:
+# the references RECOVERED from the `.drv` bytes by `drv-refs` (parse — a DIFFERENT provenance
+# from the recipe inputs the ASSEMBLER folded in at build time) fold — through the shared
+# make_text_path — back to the SAME store path the assembler produced (drop a ref and the path
+# diverges, so this proves drv-refs recovers the exact folded set). Plus: the stored `.drv` is NAR-identical
+# to the source, and td registers EXACTLY the parsed references (read back by td's own
+# `store-query references`). Boundary: td writes only its OWN scratch store/DB. Needs
+# td-builder + the corpus build → heavy pool + the build-recipes prelude.
 HEAVY_GATES += store-add-referenced
+BUILD_GATES += store-add-referenced
 store-add-referenced:
-	@echo ">> store-add-referenced: td ADDS a path WITH references (hello's .drv) to its OWN store + registers the references (pure Rust, no daemon) — differential vs the daemon"
+	@echo ">> store-add-referenced: td ADDS a td-ASSEMBLED hello .drv WITH references to its OWN store + registers the references (pure Rust, no daemon; guix off PATH) — a round-trip of the folded references"
 	@set -euo pipefail; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
-	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
-	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
-	drv=`guix build -d hello`; \
-	test -n "$$drv" -a -f "$$drv" || { echo "ERROR: could not realise hello's .drv" >&2; exit 1; }; \
-	name=`basename "$$drv"`; name=$${name:33}; \
+	. tests/store-subject.sh; \
 	scratch="$(CURDIR)/.store-add-referenced-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch/store"; \
-	guix gc --references "$$drv" | sort > "$$scratch/refs.txt"; \
+	td_store_subject "$$scratch" || exit 1; \
+	drv="$$SUBJ_LOCALDRV"; tddrv="$$SUBJ_DRV"; \
+	name=`basename "$$tddrv"`; name=$${name:33}; \
+	"$$TB" drv-refs "$$drv" | sort > "$$scratch/refs.txt"; \
 	nref=`wc -l < "$$scratch/refs.txt"`; \
-	test "$$nref" -gt 0 || { echo "FAIL: the .drv has no references (the differential would be vacuous)" >&2; exit 1; }; \
-	echo ">> hello's .drv ($$name) has $$nref references (its input drvs/srcs) — the daemon's record"; \
-	td_path=`"$$tb" store-add-referenced "$$name" "$$drv" "$$scratch/refs.txt" "$$scratch/store" "$$scratch/td.db"`; \
-	test "$$td_path" = "$$drv" || { echo "FAIL: td computed $$td_path != the daemon's $$drv (references not folded into the path correctly)" >&2; exit 1; }; \
-	echo "   td computed the IDENTICAL content-addressed path WITH the $$nref references folded into the type"; \
+	test "$$nref" -gt 0 || { echo "FAIL: the .drv has no references (the round-trip would be vacuous)" >&2; exit 1; }; \
+	echo ">> hello's td-assembled .drv ($$name) has $$nref references (its input drvs/srcs, parsed by td-builder drv-refs)"; \
+	td_path=`"$$TB" store-add-referenced "$$name" "$$drv" "$$scratch/refs.txt" "$$scratch/store" "$$scratch/td.db"`; \
+	test "$$td_path" = "$$tddrv" || { echo "FAIL: td computed $$td_path != the ASSEMBLER's $$tddrv (references not folded into the path correctly)" >&2; exit 1; }; \
+	echo "   the $$nref references PARSED from the .drv fold back to the SAME path the assembler computed from the recipe inputs (round-trip)"; \
 	base=`basename "$$td_path"`; \
 	test -f "$$scratch/store/$$base" || { echo "FAIL: td did not write the .drv into its store" >&2; exit 1; }; \
-	td_nar=`"$$tb" nar-hash "$$scratch/store/$$base"`; oracle_nar=`"$$tb" nar-hash "$$drv"`; \
-	test "$$td_nar" = "$$oracle_nar" || { echo "FAIL: td's stored .drv NAR $$td_nar != the daemon's $$oracle_nar" >&2; exit 1; }; \
-	echo "   td's stored .drv is byte-identical (NAR) to the daemon's own: $$oracle_nar"; \
-	td_refs=`"$$tb" store-query "$$scratch/td.db" references | sed 's#^[^|]*|##' | sort`; \
-	oracle_refs=`cat "$$scratch/refs.txt"`; \
-	test "$$td_refs" = "$$oracle_refs" || { echo "FAIL: td's registered references (read by td's own reader) != the daemon's guix gc --references" >&2; echo "$$td_refs" | sed 's/^/  td:     /' >&2; echo "$$oracle_refs" | sed 's/^/  daemon: /' >&2; exit 1; }; \
-	echo "   td REGISTERED all $$nref references (read back by TD'S OWN reader) == guix gc --references (the daemon's record)"; \
+	td_nar=`"$$TB" nar-hash "$$scratch/store/$$base"`; src_nar=`"$$TB" nar-hash "$$drv"`; \
+	test "$$td_nar" = "$$src_nar" || { echo "FAIL: td's stored .drv NAR $$td_nar != the source .drv $$src_nar" >&2; exit 1; }; \
+	echo "   td's stored .drv is byte-identical (NAR) to the source: $$src_nar"; \
+	td_refs=`"$$TB" store-query "$$scratch/td.db" references | sed 's#^[^|]*|##' | sort`; \
+	parsed_refs=`cat "$$scratch/refs.txt"`; \
+	test "$$td_refs" = "$$parsed_refs" || { echo "FAIL: td's registered references (read by td's own reader) != the parsed references" >&2; echo "$$td_refs" | sed 's/^/  registered: /' >&2; echo "$$parsed_refs" | sed 's/^/  parsed:     /' >&2; exit 1; }; \
+	echo "   td REGISTERED all $$nref references (read back by TD'S OWN reader) == td-builder drv-refs (the parsed set)"; \
 	rm -rf "$$scratch"; \
-	echo "PASS: td ADDED a path WITH references to its OWN store, in pure Rust with NO daemon — for hello's .drv and its $$nref references, td computed the IDENTICAL content-addressed path (the references folded into the type, makeTextPath — drop one and it diverges), WROTE a .drv byte-identical (by NAR hash) to the daemon's own, and REGISTERED exactly the daemon's recorded references (read back by td's own store-query). The daemon is only the oracle. td now owns addToStore for flat (#38), recursive (#41), AND referenced paths. A td store backend is a later increment."
+	echo "PASS: td ADDED a path WITH references to its OWN store, in pure Rust with NO daemon — for hello's TD-ASSEMBLED .drv and its $$nref references (guix off PATH; no guix build -d, no guix gc --references). td computed the content-addressed path with the references folded into the type (makeTextPath), and the references RECOVERED from the .drv bytes by drv-refs (parse) fold back through the shared make_text_path to the SAME path the ASSEMBLER produced from the recipe inputs — a round-trip that proves drv-refs recovers the exact folded set (drop one ref and it diverges). The stored .drv is NAR-identical to the source, and td registered exactly the parsed references (read back by td's own store-query). The removable guix oracle (== the daemon's .drv + == guix gc --references) was dropped (directive 3). td now owns addToStore for flat (#38), recursive (#41), AND referenced paths."

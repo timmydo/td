@@ -627,6 +627,24 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // The store-backend gate cluster's shared subject-swap helper (R3): it builds the
+    // td subject + closure for exactly these six store-DB gates, so a change to it routes
+    // to them (not every build gate).
+    if p == "tests/store-subject.sh" {
+        sel.add_preflight("shell-syntax");
+        for g in [
+            "store-register",
+            "store-gc",
+            "store-verify",
+            "store-gc-sweep",
+            "store-add-referenced",
+            "store-backend",
+        ] {
+            sel.add_target(g);
+        }
+        return;
+    }
+
     if glob_match("tests/check-memo*", p) {
         sel.add_target("memo");
         return;
