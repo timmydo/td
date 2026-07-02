@@ -7,7 +7,7 @@
 # recipes/src/specs.rs), so the loop evaluates recipes/specs with `td-recipe-eval`
 # instead of transpiling+evaluating `.ts` through tsgo+boa. Built ONCE by the
 # build-recipes prelude into BASEDIR (content cached via CARGO_TARGET_DIR), then
-# read by cache-lib's `load_recipe_eval` and by every build gate via ts-emit.sh.
+# read by cache-lib's `load_recipe_eval` and by every build gate via recipe-emit.sh.
 #
 # Offline + toolchain-only (the cargo-test pattern): `guix shell --no-substitutes
 # --no-offload rust rust:cargo gcc-toolchain` resolves the warm rust toolchain;

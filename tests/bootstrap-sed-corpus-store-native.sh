@@ -146,9 +146,11 @@ seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$ROO
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
 for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done
 chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
-# emit the sed recipe (td-ts-eval is provided by the build-recipes prelude), then build it.
-TD_TSGO=`sh tests/tsgo.sh`; export TD_TSGO TD_TSDIR="$ROOT/tests/ts"; load_ts_eval || fail "brick8: no td-ts-eval"
-sh tests/ts-emit.sh tests/ts/recipe-sed.ts > "$b8/sed.json" || fail "brick8: ts-emit sed"
+# emit the sed recipe: load td's OWN Rust recipe evaluator (td-recipe-eval, built by the build-recipes
+# prelude — the same dependency-free evaluator the build path and `td shell` use since the TypeScript
+# surface was deleted in #224), then emit + build the recipe from the Rust catalog.
+load_recipe_eval || fail "brick8: no td-recipe-eval (the build-recipes prelude must run first)"
+sh tests/recipe-emit.sh sed > "$b8/sed.json" || fail "brick8: recipe-emit sed"
 mkdir -p "$b8/sb" "$b8/tmp"; cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
 env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
