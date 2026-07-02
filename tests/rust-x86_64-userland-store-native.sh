@@ -235,8 +235,12 @@ echo "   [behavioral] the /td/store-linked $BIN RAN in the own-root (/gnu/store 
 # 6. [repro] td-builder check double-builds the ripgrep drv → bit-for-bit reproducible.
 # ============================================================================================
 rm -rf "$scratch/chk"
-"$TB" check "$sb"/*.drv "$sb/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
-  || { echo "FAIL: NOT reproducible (td-builder check):" >&2; tail -8 "$scratch/checkout.txt" "$scratch/chk.err" >&2; exit 1; }
+# env -u TD_STORE_DIR: the sourced 416 assembly exports TD_STORE_DIR=/td/store, but this drv's
+# output canonical is /gnu/store (the mixed-prefix note above) — with the var set, check's
+# store-path validation rejects it ("not a store path") before building. Run5 verified-red
+# exactly that; env -u restores the default and the double-build runs.
+env -u TD_STORE_DIR "$TB" check "$sb"/*.drv "$sb/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
+  || { echo "FAIL: NOT reproducible (td-builder check):" >&2; tail -n 8 "$scratch/checkout.txt" >&2; tail -n 8 "$scratch/chk.err" >&2; exit 1; }
 grep -qE "^CHECK out $out sha256:[0-9a-f]+ reproducible$" "$scratch/checkout.txt" \
   || { echo "FAIL: td-builder check did not confirm $out reproducible:" >&2; cat "$scratch/checkout.txt" >&2; exit 1; }
 echo "   [repro] td-builder check double-build agrees the /td/store-toolchain $PKG build is reproducible"
