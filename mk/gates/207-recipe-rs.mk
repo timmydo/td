@@ -8,21 +8,25 @@
 # upstream is the corpus differential's job (corpus-no-guix builds each recipe NAR-equal
 # to guix), not a boa oracle.
 #
-# Offline by construction (the cargo-test pattern): `guix shell --no-substitutes
-# --no-offload rust rust:cargo gcc-toolchain` resolves the warm rust toolchain; the crate
-# has NO [dependencies] so `--frozen` touches no network. No guix package is built via
-# `guix build -e (system M) PKG` — so NOTHING is added to the guix-surface ratchet.
+# Offline by construction (the cargo-test pattern): the guix-free tools/provision-rust.sh +
+# tools/provision-cc.sh resolve the warm rust + cc toolchain onto PATH — NOT a `guix shell`
+# process (R1, github issue #274) — so this file drops OUT of the guix-surface `shell` shrink
+# ratchet (a PURE shrink); the crate has NO [dependencies] so `--frozen` touches no network.
+# No guix package is built via `guix build -e (system M) PKG` either — NOTHING is added to
+# the guix-surface ratchet.
 HEAVY_GATES += recipe-rs
 # Not FAST_GATES: needs the rust toolchain (absent from the small td-ci-fast image), same
 # rationale as cargo-test.
 recipe-rs:
 	@echo ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent + the census manifest is in sync (rust-recipe-surface)"
 	@set -euo pipefail; \
+	rustpath=`sh tools/provision-rust.sh`; \
+	ccpath=`sh tools/provision-cc.sh`; \
 	scratch="$(CURDIR)/.recipe-rs-scratch"; \
 	rm -rf "$$scratch"; mkdir -p "$$scratch/home" "$$scratch/target"; \
-	echo ">> build + unit-test the dependency-free td-recipe crate (offline, toolchain-only)"; \
+	echo ">> build + unit-test the dependency-free td-recipe crate (offline, guix-free toolchain via tools/provision-{rust,cc}.sh)"; \
+	PATH="$$rustpath:$$ccpath:$$PATH" \
 	CARGO_HOME="$$scratch/home" CARGO_TARGET_DIR="$$scratch/target" \
-	  $(GUIX) shell --no-substitutes --no-offload rust "rust:cargo" gcc-toolchain -- \
 	  sh -c 'cargo test --frozen --manifest-path recipes/Cargo.toml \
 	     && cargo build --release --frozen --manifest-path recipes/Cargo.toml' 2>&1 | tail -20; \
 	bin="$$scratch/target/release/td-recipe-eval"; \
