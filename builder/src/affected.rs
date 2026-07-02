@@ -676,14 +676,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("td-drv-build");
         return;
     }
-    if p == "tests/td-drv-add-drv.scm" {
-        sel.add_target("td-drv-add");
-        return;
-    }
-    if p == "tests/td-drv-assemble-drv.scm" {
-        sel.add_target("td-drv-assemble");
-        return;
-    }
     if p == "tests/resolve-lock.scm" {
         sel.add_target("resolve");
         return;
