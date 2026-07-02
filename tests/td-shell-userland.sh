@@ -66,7 +66,10 @@ work="$ROOT/.td-build-cache/td-shell-userland-native"
 chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"; mkdir -p "$work/tmp"
 seedroots=`grep ' /gnu/store/' tests/ripgrep.lock | grep -vE -- '-rust-|-gcc-toolchain-' | sed 's/^[^ ]* //'`
 test -n "$seedroots" || fail "no guix build seed (coreutils/tar/gzip) in tests/ripgrep.lock"
-echo "$seedroots" | xargs guix build >/dev/null 2>"$work/guix-build.err" \
+# Realize via the PINNED guix ($GUIX = `guix time-machine -C channels.scm --`, set by the gate),
+# not a bare/ambient `guix`, to match the oracle every other gate uses. Expanded UNQUOTED (it is
+# multi-word), as the reference gate does.
+echo "$seedroots" | xargs ${GUIX:-guix} build >/dev/null 2>"$work/guix-build.err" \
   || { tail -5 "$work/guix-build.err" >&2; fail "could not realize the guix build seed"; }
 { echo "$seedroots"
   "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' || true
@@ -177,7 +180,7 @@ fold_legs() {
     TD_RUST_STORE_INTERP="$interp" TD_RUST_STORE_RPATH="$rpath" TD_RUST_STORE_BDIR="$bdir" \
     "$TB" check "$drv" "$sd/closure.txt" "$sd/chk" > "$sd/checkout.txt" 2>"$sd/chk.err" \
     || { tail -6 "$sd/checkout.txt" "$sd/chk.err" >&2; fail "$pkg: NOT reproducible"; }
-  grep -qE "^CHECK out .* reproducible$" "$sd/checkout.txt" || { cat "$sd/checkout.txt" >&2; fail "$pkg: check did not confirm reproducible"; }
+  grep -qE "^CHECK out .* sha256:[0-9a-f]+ reproducible$" "$sd/checkout.txt" || { cat "$sd/checkout.txt" >&2; fail "$pkg: check did not confirm reproducible (with a real double-build hash)"; }
   echo "   [repro] td-builder check double-build agrees $pkg is reproducible"
 }
 
@@ -185,9 +188,7 @@ fold_legs() {
 for pkg in $TOOLS; do
   wdir="$cache/$pkg-run"; rm -rf "$wdir"; mkdir -p "$wdir/tree/sub"
   printf 'alpha line\nthe needle is here\nbeta line\n' > "$wdir/tree/sub/hay.txt"
-  : > "$wdir/tree/sub/needle.txt"
   printf 'nothing to see\n' > "$wdir/tree/other.log"
-  printf 'roses are red\nviolets are blue\n' > "$wdir/doc.txt"
   echo ">> [$pkg] td shell $pkg -- $pkg <real task> over td's /td/store toolchain (guix OFF PATH, own-root run)"
   case "$pkg" in
     ripgrep)
@@ -197,19 +198,7 @@ for pkg in $TOOLS; do
       echo "$out" | grep -q 'other.log' && fail "rg matched the unrelated file (over-match)"
       echo "   [behavioral] rg (td-built, native /td/store toolchain) found the needle in the own-root"
       bin=rg ;;
-    fd)
-      out=`cd "$wdir" && tdshell fd -- fd needle tree 2>"$cache/$pkg.err"` \
-        || { tail -40 "$cache/$pkg.err" >&2; fail "td shell fd -- fd exited nonzero"; }
-      echo "$out" | grep -q 'needle.txt' || fail "fd did not find sub/needle.txt (got: $out)"
-      echo "   [behavioral] fd (td-built, native) found sub/needle.txt by name in the own-root"
-      bin=fd ;;
-    sd)
-      got=`cd "$wdir" && printf 'hello world\n' | tdshell sd -- sd world there 2>"$cache/$pkg.err"` \
-        || { tail -40 "$cache/$pkg.err" >&2; fail "td shell sd -- sd exited nonzero"; }
-      test "$got" = "hello there" || fail "sd did not replace world->there (got: '$got')"
-      echo "   [behavioral] sd (td-built, native) replaced world->there in the own-root"
-      bin=sd ;;
-    *) fail "no behavioral task defined for tool '$pkg'" ;;
+    *) fail "no behavioral task for '$pkg' — the native product-command path is verified for ripgrep (the template); add a verified per-tool branch to grow the shipped set (fast-follow)" ;;
   esac
   fold_legs "$pkg" "$bin"
 done

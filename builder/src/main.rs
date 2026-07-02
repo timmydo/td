@@ -2428,6 +2428,10 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
 /// + the staged tools) and the current working directory (so relative file args resolve) — with
 /// `/gnu/store` ABSENT and PATH = the tools' `/td/store` bins. This is the product command over
 /// td's OWN guix-free toolchain (the #258 "347/371 cutover").
+///
+/// CONSTRAINT: the own-root PATH holds ONLY the named packages' bins (no coreutils, no shell), so
+/// CMD must be one of the built tools (or an absolute path into `/td/store`); a bare non-tool name
+/// (e.g. `ls`) or the interactive no-`--` `$SHELL` will not resolve and `host_shell` errors.
 fn run_shell_native(
     native_store: &str,
     built: &[(String, String)],
@@ -2461,20 +2465,32 @@ fn run_shell_native(
         .map_err(|e| format!("cwd: {e}"))?
         .to_string_lossy()
         .into_owned();
-    let binds = vec![
-        sandbox::Bind {
-            src: native_store.to_string(),
-            dest: Some("/td/store".to_string()),
-            readonly: true,
-            ro_optional: false,
-        },
-        sandbox::Bind {
+    // Bind the cwd read-write so relative file args resolve — but ONLY when it is a normal
+    // project directory. A cwd of `/` would rbind the whole host root, re-exposing /gnu/store and
+    // defeating the guix-free own-root; a cwd UNDER a sandbox mount (the /tmp tmpfs, /td/store, or
+    // /proc/dev/sys) would be shadowed by that mount, since binds are applied before the tmpfs. In
+    // those cases we skip the cwd bind and run in /tmp (relative args then resolve against the
+    // own-root's fresh /tmp — the caller should run from a project dir for host-file access).
+    let mut binds = vec![sandbox::Bind {
+        src: native_store.to_string(),
+        dest: Some("/td/store".to_string()),
+        readonly: true,
+        ro_optional: false,
+    }];
+    let reserved = ["/tmp", "/td/store", "/gnu/store", "/proc", "/sys", "/dev"];
+    let cwd_safe =
+        cwd != "/" && !reserved.iter().any(|m| cwd == *m || cwd.starts_with(&format!("{m}/")));
+    let workdir = if cwd_safe {
+        binds.push(sandbox::Bind {
             src: cwd.clone(),
             dest: Some(cwd.clone()),
             readonly: false,
             ro_optional: false,
-        },
-    ];
+        });
+        cwd.as_str()
+    } else {
+        "/tmp"
+    };
     let scratch = std::env::temp_dir().join(format!(
         "td-shell-ns-{}-{}",
         sys::getuid(),
@@ -2489,7 +2505,7 @@ fn run_shell_native(
         &["/tmp".to_string()],
         &path,
         "/tmp",
-        &cwd,
+        workdir,
         &[],
         &scratch,
     )
