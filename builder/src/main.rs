@@ -1270,14 +1270,6 @@ fn scan_candidate_index(
     Ok((candidates, on_disk))
 }
 
-/// The 32-char nix-base32 hash part of a store path (`<dir>/<hash>-<name>`), or None
-/// for a non-store-shaped path. The store-hash uniqueness the whole index relies on.
-fn store_hash_part(path: &str) -> Option<&str> {
-    let base = path.rsplit('/').next()?;
-    let h = base.split('-').next()?;
-    (h.len() == 32).then_some(h)
-}
-
 /// Re-key candidate-index entries onto their TRUE canonical store paths (#292). A seed
 /// staging dir mixes entries whose canonical homes DIFFER — guix-captured bytes live at
 /// `/gnu/store`, td-built copies (a chained /td/store toolchain) at `/td/store` — but
@@ -1287,13 +1279,21 @@ fn store_hash_part(path: &str) -> Option<&str> {
 /// a root whose prefix differs from the stamped one misses the on-disk map, is never
 /// content-scanned, and silently drops its whole transitive runtime closure (gate 377:
 /// coreutils' gmp vanished and `expr` died on libgmp.so.10).
+///
+/// PRECONDITION: an entry whose true canonical differs from the stamped seed prefix must
+/// be visible as a drv root or via a TD_EXTRA_DBS registration, or it keeps the stamp.
+/// Callers satisfy this by construction — every td-built tree is created WITH its OUT-DB
+/// (store-add-recursive/store-add-builder/write_output_db), and the paths that stage one
+/// into a seed dir (gate 377's toolchain pair, the td-shell native store) pass that DB in
+/// TD_EXTRA_DBS and/or name the tree as a lock root. Don't stage an unregistered td-built
+/// tree into a seed dir.
 fn recanonicalize_candidates(
     candidates: &mut [String],
     on_disk: &mut std::collections::HashMap<String, String>,
     overrides: &std::collections::HashMap<String, String>,
 ) {
     for c in candidates.iter_mut() {
-        let Some(h) = store_hash_part(c) else { continue };
+        let Some(h) = store::hash_from_store_path(c) else { continue };
         let Some(true_canonical) = overrides.get(h) else { continue };
         if true_canonical == c {
             continue;
@@ -1432,12 +1432,12 @@ fn realize_drv(
     let mut canonical_overrides: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for p in extra_refs.keys() {
-        if let Some(h) = store_hash_part(p) {
+        if let Some(h) = store::hash_from_store_path(p) {
             canonical_overrides.insert(h.to_string(), p.clone());
         }
     }
     for r in &roots {
-        if let Some(h) = store_hash_part(r) {
+        if let Some(h) = store::hash_from_store_path(r) {
             canonical_overrides.insert(h.to_string(), r.clone());
         }
     }
@@ -7095,7 +7095,7 @@ glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
         let mut overrides: HashMap<String, String> = HashMap::new();
         overrides.insert(gl_h.to_string(), gl_c.clone()); // TD_EXTRA_DBS registration
         for r in &roots {
-            overrides.insert(store_hash_part(r).unwrap().to_string(), r.clone());
+            overrides.insert(store::hash_from_store_path(r).unwrap().to_string(), r.clone());
         }
         let (mut candidates, mut on_disk) = scan_candidate_index(&dirs, "/gnu/store").unwrap();
         recanonicalize_candidates(&mut candidates, &mut on_disk, &overrides);
