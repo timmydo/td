@@ -11,14 +11,14 @@
 #
 # Bounded to one real seed root (hello's pinned bash, closure incl. glibc) so the gate
 # is fast; the tool captures the whole toolchain the same way. The td-builder is the
-# guix-free stage0. guix is only the SOURCE the seed is captured FROM (its store DB) +
-# the removable closure oracle (`guix gc -R`) — no `guix build -e (system M)` packager.
+# guix-free stage0. guix is only the SOURCE the seed is captured FROM (its store DB) —
+# the removable `guix gc -R` closure oracle was DROPPED (CLAUDE.md directive 3; see the
+# log) — no `guix build -e (system M)` packager either.
 #
-# Legs:
+# Legs (all DURABLE — no guix oracle in any):
 #   [DURABLE structural]  the manifest covers the COMPLETE closure (count == store-closure)
 #   [DURABLE round-trip]  every captured path is NAR-identical after tar -> extract
 #                         (the seed survives the tarball, byte-faithful)
-#   [REMOVABLE oracle]    td's captured closure == `guix gc -R ROOT` (matches guix)
 set -eu
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -62,13 +62,6 @@ while read -r p h _size _refs; do
 done < "$work/cap/seed.manifest"
 test "$checked" -eq "$n" || fail "round-trip checked $checked of $n paths"
 echo "   [DURABLE round-trip] all $checked captured paths are NAR-identical after tar -> extract (seed survives the tarball)"
-
-# --- [REMOVABLE oracle] td's closure == guix's `gc -R` -------------------------
-guix gc -R "$root" | sort -u > "$work/oracle"
-"$TB" store-closure-scan /gnu/store "$root" | sort -u > "$work/tdclosure"
-extra=`cat "$work/tdclosure" "$work/oracle" | sort | uniq -u | head -3`
-test -z "$extra" || fail "td's captured closure differs from guix gc -R: $extra"
-echo "   [REMOVABLE oracle] td's captured closure == guix gc -R $(basename "$root")"
 
 echo "PASS: td captured a toolchain seed closure into a frozen tarball + manifest (its own"
 echo "      store-closure + NAR serializer) and the seed is NAR-identical after a tar round-trip"
