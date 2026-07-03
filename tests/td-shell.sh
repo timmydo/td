@@ -54,11 +54,16 @@ grep ' /gnu/store/' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | sort -u | xar
 cache="`pwd`/.td-build-cache/td-shell-pkgs"; rm -rf "$cache"; mkdir -p "$cache/tmp"
 
 # td shell, run with guix/Guile OFF PATH (env -i + scrubbed PATH ⇒ no guix process).
+# TD_SHELL_STORE_DB is the SEED STORE DIR the seed-package build CONTENT-SCANS for hello's
+# input closure (== guix gc -R; gate 290) — the live /gnu/store (the guix-BUILT toolchain
+# seed, retired last by step 2, gate td-shell-seed), NOT guix's private /var/guix/db. No
+# guix store DB is read. (A DB *file* here is a no-op: the scan needs the store DIR so the
+# transitive closure — e.g. bash's libreadline — is staged, not just the lock's direct roots.)
 tdshell() {
   env -i HOME="$cache" TMPDIR="$cache/tmp" PATH="$SCRUB" \
     TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
     TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
-    TD_SHELL_LOCKS=tests TD_SHELL_STORE_DB=/var/guix/db/db.sqlite \
+    TD_SHELL_LOCKS=tests TD_SHELL_STORE_DB=/gnu/store \
     TD_SHELL_CACHE="$cache" \
     "$TB" shell "$@"
 }

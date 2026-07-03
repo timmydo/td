@@ -3828,16 +3828,63 @@ fn main() -> ExitCode {
             }
         }
         // seed-manifest: emit the MANIFEST for a seed closure — the capture half of the
-        // frozen seed tarball (North-Star step 2). For the GC closure of ROOT… over DB's
-        // Refs graph, print one line per member: `<path> <nar-hash> <nar-size> <ref,ref,…>`
-        // (direct refs sorted; `-` if none), all from td's OWN reader + NAR serializer (no
-        // daemon). The capture tool tars the same closure; `seed-unpack` restores + registers
-        // from this manifest. Usage: seed-manifest DB ROOT...
+        // frozen seed tarball (North-Star step 2). For the GC closure of ROOT…, print one
+        // line per member: `<path> <nar-hash> <nar-size> <ref,ref,…>` (direct refs sorted;
+        // `-` if none), all from td's OWN reader + NAR serializer (no daemon). The capture
+        // tool tars the same closure; `seed-unpack` restores + registers from this manifest.
+        //
+        // SOURCE (arg 1) is EITHER a store DB FILE — closure + direct refs read from its Refs
+        // graph (td's `store_db_read`) — OR a store DIRECTORY, in which case the closure and
+        // every member's direct refs are computed by CONTENT-SCANNING the store bytes
+        // (`scan_candidate_index` + `scan_closure_hybrid`, the same content-scan realize_drv
+        // uses, == `guix gc -R`; gate 290) with NO store DB read at all. The dir form lets a
+        // seed be captured with ZERO reads of guix's PRIVATE /var/guix/db (directive 8) — the
+        // caller points it at the store dir the bytes live in (e.g. /gnu/store). Auto-detected
+        // by whether SOURCE is a directory (a DB is always a file). Usage:
+        //   seed-manifest DB-FILE-OR-STORE-DIR ROOT...
         Some("seed-manifest") if args.len() >= 4 => {
-            let db_path = &args[2];
+            let src = &args[2];
             let roots = &args[3..];
+            // A closure member's `<path> <nar-hash> <nar-size> <refs>` line — refs sorted +
+            // deduped, `-` when none (both branches emit the identical format).
+            let manifest_line = |p: &str, hash: &str, size: u64, refs: &[String]| -> String {
+                let mut rs: Vec<String> = refs.to_vec();
+                rs.sort();
+                rs.dedup();
+                let refstr = if rs.is_empty() { "-".to_string() } else { rs.join(",") };
+                format!("{p} {hash} {size} {refstr}")
+            };
             let run = || -> Result<Vec<String>, String> {
-                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+                // STORE-DIR form: compute the closure + each member's direct refs by
+                // content-scanning the store bytes — no store DB, no /var/guix/db, no daemon.
+                if Path::new(src).is_dir() {
+                    let store_dirs = std::slice::from_ref(src);
+                    let (candidates, on_disk) = scan_candidate_index(store_dirs, src)?;
+                    let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+                    let empty = std::collections::HashMap::new();
+                    // BFS the runtime closure over content-scanned refs (== guix gc -R).
+                    let closure_set =
+                        scan_closure_hybrid(&mut scanner, &on_disk, &empty, roots)?;
+                    // Refs restricted to the (ref-closed) closure — a member's real direct
+                    // refs are all closure members, so scanning against the closure set finds
+                    // exactly them and drops nothing (superset-safe; matches the DB form).
+                    let closure: Vec<String> = closure_set.iter().cloned().collect();
+                    let mut lines = Vec::with_capacity(closure.len());
+                    for p in &closure {
+                        let od = on_disk.get(p).map(String::as_str).unwrap_or(p.as_str());
+                        let mut s =
+                            scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
+                        nar::write_nar(&mut s, Path::new(od))
+                            .map_err(|e| format!("nar of {p} (at {od}): {e}"))?;
+                        // finish() gives (nar-hash, nar-size, sorted refs) in the ONE pass —
+                        // same "sha256:<base16>" hash + narSize the DB form's nar_hash_size_path emits.
+                        let (hash, size, refs) = s.finish();
+                        lines.push(manifest_line(p, &hash, size, &refs));
+                    }
+                    return Ok(lines);
+                }
+                // STORE-DB form: closure + direct refs from the DB's Refs graph.
+                let bytes = std::fs::read(src).map_err(|e| e.to_string())?;
                 let db = store_db_read::Db::open(bytes)?;
                 let mut closure = std::collections::BTreeSet::new();
                 for r in roots {
@@ -3850,11 +3897,8 @@ fn main() -> ExitCode {
                 for p in &closure {
                     let (hash, size) =
                         nar_hash_size_path(Path::new(p)).map_err(|e| format!("nar of {p}: {e}"))?;
-                    let mut rs: Vec<String> = refs.get(p).cloned().unwrap_or_default();
-                    rs.sort();
-                    rs.dedup();
-                    let refstr = if rs.is_empty() { "-".to_string() } else { rs.join(",") };
-                    lines.push(format!("{p} {hash} {size} {refstr}"));
+                    let rs: Vec<String> = refs.get(p).cloned().unwrap_or_default();
+                    lines.push(manifest_line(p, &hash, size, &rs));
                 }
                 Ok(lines)
             };

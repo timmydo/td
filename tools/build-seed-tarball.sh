@@ -13,7 +13,9 @@
 # the loop builds from the tarball with no guix install.
 #
 # Env: TB (td-builder binary; default: the stage0 from .td-build-cache/td-shell, or PATH),
-# TD_SEED_DB (store DB; default /var/guix/db/db.sqlite).
+# TD_SEED_DB (the seed SOURCE passed to seed-manifest: a store DB FILE, or a store
+# DIRECTORY to content-scan — the dir form reads NO /var/guix/db; default
+# /var/guix/db/db.sqlite).
 set -eu
 
 out="${1:?usage: build-seed-tarball.sh OUTDIR ROOT...}"; shift
