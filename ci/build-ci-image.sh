@@ -86,10 +86,11 @@ echo "   $(wc -l < "$work/check-drvs.txt") top-level derivations"
 # ROOT and abort on its usage error anyway — say why here.
 test -s "$work/check-drvs.txt" || { echo "FATAL: $enum enumerated no derivations" >&2; exit 1; }
 
-# td-builder: td's OWN store-DB reader, so the build closure is staged with NO
-# `guix gc` process (move-off-Guile / CLAUDE.md directive 8 — the guix surface only
-# shrinks). A dev box that just ran a green check has the release binary; fall back
-# to $TD_BUILDER, a PATH td-builder, or a one-off cargo build.
+# td-builder: td's OWN store CONTENT-SCANNER, so the build closure is staged with NO
+# `guix gc` process AND no read of guix's private /var/guix/db (move-off-Guile /
+# CLAUDE.md directive 8 — the guix surface only shrinks). A dev box that just ran a
+# green check has the release binary; fall back to $TD_BUILDER, a PATH td-builder,
+# or a one-off cargo build.
 if [ -n "${TD_BUILDER:-}" ]; then tb=$TD_BUILDER
 elif [ -x builder/target/release/td-builder ]; then tb=builder/target/release/td-builder
 elif command -v td-builder >/dev/null 2>&1; then tb=td-builder
@@ -99,18 +100,21 @@ else
   tb=builder/target/release/td-builder
 fi
 
-echo ">> closure: drv graph + valid outputs (td-builder store-closure over /var/guix/db — td's OWN Refs-graph reader, NO guix gc process)"
-# store-closure DB ROOT… walks the daemon's recorded Refs graph with td's own
-# SQLite reader, unioning each root's GC-reachable set — the daemon's
-# `guix gc --requisites ROOT…` (`-R` is its short alias). The store-gc gate proves
-# store-closure == `guix gc -R` for a registered root (over an output root); the
-# walk is root-type-agnostic, so a .drv root yields its derivation-input graph
-# (cross-checked live: identical .drv set to `guix gc --requisites` for a .drv).
+echo ">> closure: drv graph + valid outputs (td-builder store-closure-scan over /gnu/store — td's OWN content-scanner, NO guix gc process, NO /var/guix/db read)"
+# store-closure-scan STORE-DIR ROOT… CONTENT-SCANS the live /gnu/store (the daemon's
+# scanForReferences — a 32-char store-hash literally present in a path's NAR bytes is
+# a reference) to fixpoint, with NO store DB and NO guix process. The store-gc gate
+# (mk/gates/290) proves store-closure-scan == `guix gc -R` for a registered root; the
+# scan is root-type-agnostic, so a .drv root yields its derivation-input graph exactly
+# as the old /var/guix/db Refs walk did — a .drv's ATerm names its input .drvs + input
+# sources by full path, the same set `guix gc --requisites` returns for a .drv. We keep
+# only the `.drv` lines below, so any extra runtime-closure paths a built output pulls
+# into the scan are discarded by the grep.
 # No pipeline: a pipe to sort would swallow xargs's exit status (no pipefail in
 # POSIX sh) and stage a silently-incomplete closure on a missing root. xargs may
 # split a very long root list across invocations; the per-batch unions concatenate
 # and `sort -u` re-folds them into one closure.
-xargs -a "$work/check-drvs.txt" "$tb" store-closure /var/guix/db/db.sqlite \
+xargs -a "$work/check-drvs.txt" "$tb" store-closure-scan /gnu/store \
   > "$work/drv-closure.raw"
 sort -u "$work/drv-closure.raw" > "$work/drv-closure.txt"
 grep '\.drv$' "$work/drv-closure.txt" > "$work/all-drvs.txt"

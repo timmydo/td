@@ -6,12 +6,8 @@
 # may only SHRINK); growth needs a deliberate edit here, called out in the PR for
 # sign-off (directive 8). Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB><category>
-surface-sites: 28
-ci/build-ci-image.sh	guix-db-read
+surface-sites: 24
 ci/build-ci-image.sh	lowering
-ci/import-store.sh	guix-db-read
-ci/verify-import-local.sh	guix-db-read
-ci/verify-import-local.sh	shell
 mk/gates/010-eval.mk	lowering
 mk/gates/070-guix-dependence.mk	lowering
 mk/gates/255-resolve.mk	lowering

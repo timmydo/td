@@ -18,29 +18,29 @@
 #   3. meta/CHANNEL_OUT names a runnable guix whose `guix describe` reports
 #      the channels.scm pin.
 #
-# What it deliberately does NOT prove: placement into a truly EMPTY store.
-# On the dev box every image path already exists in /gnu/store (the image
-# was exported from here), and inside a user namespace those host-root-owned
-# trees cannot be deleted for rewrite, so the throwaway daemon's database is
-# SEEDED with a copy of the host's: the daemon still verifies every
-# signature and restores every nar, then skips final placement of
-# already-valid paths. The genuinely pristine-placement case is exactly what
-# the CI runner exercises on every run (empty /gnu/store by construction —
-# see .github/workflows/ci.yml).
+# The throwaway daemon starts with a FRESH EMPTY database (NO read of guix's
+# private /var/guix/db — CLAUDE.md directive 8, the guix surface only shrinks):
+# it verifies every signature, restores every nar, and PLACES each path into the
+# overlay upper (a lower-only host path is superseded by a whiteout + the restored
+# tree in the writable upper). This exercises real placement — no seeded DB skips
+# it — but over an OVERLAY (host store as lower), not a truly empty store; the
+# truly-pristine empty-/gnu/store case remains the CI runner's on every run (empty
+# by construction — see .github/workflows/ci.yml, and the closing PASS line). The
+# overlay is what keeps the host guix/daemon binaries reachable here.
 #
 # How: a user namespace (fake root) where
 #   - /gnu/store is an OVERLAY (lower = host store read-only, upper =
 #     scratch) so the host guix/daemon binaries stay runnable while the
-#     import's temporary writes land in the scratch upper layer;
-#   - /var/guix is a bind holding the seeded database copy; /etc/guix is an
-#     EMPTY bind: no key is authorized until ci/import-store.sh authorizes
-#     the image's own.
+#     import's writes land in the scratch upper layer;
+#   - /var/guix is a bind holding a FRESH empty database dir (the daemon
+#     initialises the schema on first start); /etc/guix is an EMPTY bind:
+#     no key is authorized until ci/import-store.sh authorizes the image's own.
 # A throwaway guix-daemon (--disable-chroot; no builds happen, only imports)
 # serves the import.
 set -eu
 
 command -v jq >/dev/null 2>&1 \
-  || { echo "jq is required (e.g. run via: guix shell jq -- sh $0 OCI_DIR)" >&2; exit 1; }
+  || { echo "jq is required on PATH (this dev-box preflight parses the OCI index/manifest JSON with it)" >&2; exit 1; }
 
 oci=${1:?usage: ci/verify-import-local.sh OCI_DIR}
 oci=$(cd "$oci" && pwd)
@@ -54,10 +54,10 @@ work=$(mktemp -d "$HOME/.cache/td-verify-XXXXXX")
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/upper" "$work/ovl-work" "$work/var/db" "$work/etc" "$work/home"
 
-# Seed the throwaway daemon's database from the host's (see header). Copied,
-# never shared: the host database is opened read-only here and only the copy
-# is ever written.
-cp /var/guix/db/db.sqlite "$work/var/db/db.sqlite"
+# The throwaway daemon's database dir ($work/var/db) is left EMPTY: guix-daemon
+# initialises a fresh store schema on first start, so every path is INVALID until
+# the import registers it (genuine placement — see header). No read of the host's
+# private /var/guix/db (CLAUDE.md directive 8 — the guix surface only shrinks).
 
 hostguix_dir=$(dirname "$(readlink -f "$(command -v guix)")")
 
