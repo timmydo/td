@@ -6,8 +6,9 @@ not get credit for just code, only for a passing, reproducible test. Read
 `DESIGN.md` for the north star, the loop, and the provenance chain; the
 parallel-work rules are in this file.
 
-This file is your contract. The rules below are absolute and override any local
-convenience.
+This file is your contract. The **Prime Directives** below are absolute and
+override any local convenience; the process conventions that follow are strong
+defaults — deviate only with a clear reason, stated in the PR.
 
 ## North star: full guix independence (human, 2026-06-20; sharpened 2026-06-21)
 
@@ -88,11 +89,14 @@ bootstrap replaces the guix toolchain seed.
    and remove the old path later" is exactly the split this forbids:
    shipping a new path while the old one stays load-bearing — or
    shipping an unused mechanism, a dead-code path, or a TODO to finish
-   the migration — is not done.  This is absolute — there is no "too
-   big to cut over in one PR" exception; if a swap feels too big for
-   one PR, its scope is wrong (narrow the capability so the whole
-   add+cutover+ delete fits), not its atomicity. A migration landed
-   half-done is a failing task.  **Scope:** this fires when a PR
+   the migration — is not done.  The default is strong: narrow the
+   capability so the whole add+cutover+delete fits one reviewable PR,
+   and treat a migration landed half-done as a failing task. If a
+   migration *genuinely* cannot fit one PR — too many consumers to
+   switch atomically, or a cutover that needs coordinated sequencing —
+   raise the scope with the human *before* splitting it, not as
+   license to ship the new path while the old one stays load-bearing.
+   **Scope:** this fires when a PR
    *replaces* an existing path for its *existing consumers* — that add
    + switch-all-callers + delete-old-path is one PR. Building a
    genuinely new capability that nothing consumes yet (a fresh
@@ -229,7 +233,7 @@ on what*, and all working notes live in the git log + PR body.
   your own base — run `td-builder affected-checks --committed-only --run`; if it
   waives the full loop, record the waiver in the PR body; if it escalates, it
   runs the FULL `./check.sh` before returning success, so record the escalation
-  and full result instead; (2) **every PR gets a subagent code review — no exceptions:** spawn an
+  and full result instead; (2) **every PR gets a subagent code review — waivable only for a trivial docs- or comment-only diff, and only if you say so in the PR:** spawn an
   independent code-review subagent over the full branch diff (`/code-review`) and
   **post the subagent's review results as a comment on the PR**; address its
   findings, posting each resulting fix as a **reply to that review comment and
