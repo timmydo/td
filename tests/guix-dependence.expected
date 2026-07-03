@@ -13,6 +13,5 @@
 pin: 520785e315eddbe47199ac557e88e60eca3ae97c
 owned-recipes (19): bash coreutils diffutils file findutils gawk grep hello less libsigsegv libunistring make ncurses patch pcre2 readline sed tar xz
 corpus-union: td-reproducible 19 / 316 (6.01%) [bash coreutils diffutils file findutils gawk grep hello less libsigsegv libunistring make ncurses patch pcre2 readline sed tar xz]
-shipped-system: td-reproducible 17 / 1405 (1.21%) [bash coreutils diffutils file findutils gawk grep less libsigsegv libunistring ncurses patch pcre2 readline sed tar xz]
 edge-owned (every owned-input edge built from a td output, proven by mk/gates/365 build-plan): 19 / 19
 chained (recipes with owned input edges): bash grep less readline

@@ -10,11 +10,11 @@
 # FULL ladder). It emits, reusing the rungs' own lowering entry points:
 #   - the pinned channel instance (every rung's time-machine target)
 #   - the check.sh sandbox toolchain (so the offline `guix shell -C` has it)
-#   - the pinned tsgo tarball FOD (the `ts` rung's native compiler seed = the
-#     tests/td-tsgo.lock pin path; node + td-typescript retired in #111)
-#   - the SYSTEM and OCI-image derivations the cheap rungs lower
-#     (ci/lower-fast-drvs.scm — mirrors typed-diff/typed-coverage/oci-diff/
-#     manifest-diff/generation-diff)
+# (The guix-system museum tier and its cheap differential rungs were retired,
+# so no SYSTEM/OCI-image lowering remains in the
+# fast tier: the surviving cheap rungs are eval (module load), guix-dependence
+# (pure lowering off the pinned channel, no extra closure) and the static
+# census scripts.)
 #
 # Usage: ci/lower-fast-drvs.sh   (run from the repo root; host guix must be the
 # pinned channel commit — callers guard this, as check.sh and build-ci-image.sh
@@ -46,8 +46,5 @@ lower $GUIX repl -L . ci/channel-instance-drv.scm
 sed -n 's/^CHANNEL_DRV=//p' "$tmp"
 
 # (The `ts`/tsgo seed is gone: the TypeScript surface was retired — recipes/specs
-# are declared in Rust now (rust-recipe-surface), so check-fast carries no tsgo.)
-
-# --- The SYSTEM and OCI-image derivations the cheap rungs lower.
-lower $GUIX repl -L . ci/lower-fast-drvs.scm
-grep '^/gnu/store/.*\.drv$' "$tmp"
+# are declared in Rust now (rust-recipe-surface), so check-fast carries no tsgo.
+# The SYSTEM/OCI-image lowerings are gone with the museum tier, 2026-07-02.)

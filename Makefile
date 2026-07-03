@@ -25,8 +25,6 @@ SHELL   := bash
 
 GUIX    := guix time-machine -C channels.scm --
 LOAD    := -L .
-SYSTEM  := system/td.scm
-IMGTYPE := qcow2
 
 # --- Per-gate wall-clock instrumentation (task L1) -------
 # Every TIMED gate (see the .SHELLFLAGS block after the gate pools) runs its
@@ -75,6 +73,10 @@ HEAVY_GATES :=
 FAST_GATES  :=
 SYSTEM_GATES :=
 ENGINE_GATES :=
+# PARKED_GATES — gates a human has UNHOOKED from every check tier pending a tracked
+# fix (the gate file documents the issue + how to re-enable). No tier consumes this
+# pool; members stay runnable on demand (`./check.sh <gate>`).
+PARKED_GATES :=
 # BUILD_SPECS — every package recipe the parallel `build-recipes` phase realizes +
 # reproducibility-checks up front (the corpus, toolchain leaves and library deps). Each
 # package-build gate fragment appends its OWN spec list (so the list lives next to the
@@ -136,15 +138,14 @@ build-recipes:
 # remains the gate; nothing here removes, loosens, reorders, or skips a gate.
 check-fast: $(CHEAP_GATES) $(FAST_GATES)
 
-# The `guix system` / whole-OS tier — gates that boot a VM (QEMU/marionette/
-# SSH-harness), build/realize a full system or OCI *image*, or diff the system
-# image / generation roots. DELIBERATELY PARKED out of the default `check` while
-# td's focus is the user-space PACKAGE MANAGER (build/realize/store/recipes) — not
-# `guix system`. This is a human-directed scope decision (DESIGN §4.3 / directive
-# 3): the gates are NOT deleted or weakened, only moved to an on-demand tier; the
-# package-manager loop (`check`) keeps its OWN behavioral coverage (built tools
-# run, link-tests, the guix per-PACKAGE differential). Re-fold these back into
-# `check` when the OS becomes the focus. Run them on demand: `./check.sh check-system`.
+# The IMAGE tier — the gates that ship + run td-native OCI images (oci-native,
+# rust-userland-image). The old guix-system museum that filled this pool (guix
+# qcow2/docker images, generations, signed registry, placement, rootless-daemon
+# differentials) was RETIRED wholesale (human direction, directive 3:
+# "I never wanted the guix museum" — the guix operating-system was scaffolding,
+# not the product; td ships td-native images of td-built packages, and the
+# retained gates test exactly that). Run on demand: `./check.sh check-system`;
+# the daily backstop runs it too.
 check-system: $(CHEAP_GATES) $(SYSTEM_GATES)
 	@TD_HEAVY_GATES='$(SYSTEM_GATES)' sh tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt" || true
 
@@ -167,6 +168,7 @@ list-gates:
 	@echo "fast   ($(words $(FAST_GATES))): $(FAST_GATES)"
 	@echo "system ($(words $(SYSTEM_GATES))): $(SYSTEM_GATES)"
 	@echo "engine ($(words $(ENGINE_GATES))): $(ENGINE_GATES)"
+	@echo "parked ($(words $(PARKED_GATES))): $(PARKED_GATES)"
 
 # Generated ordering graph (do not hand-edit): chain each cheap gate order-only
 # on its predecessor, and gate every heavy gate on the last cheap gate.
@@ -211,16 +213,3 @@ endif
 gate-timing-report:
 	@TD_HEAVY_GATES='$(HEAVY_GATES)' sh tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt"
 
-# `rootless` needs NO special scheduling — it runs as an ordinary heavy gate
-# under -j2 (its only prereq is the generic last-cheap-gate one above). It USED to
-# be serialized alone at the tail because it SNAPSHOTTED the live store DB by
-# copying /var/guix/db: a concurrently-building gate's active WAL could tear the
-# non-root copy. Since the rootless-snapshot-race fix (PR #53) the gate instead
-# CONSTRUCTS its snapshot DB from the static closure (`td-builder store-register`
-# — mk/gates/130-rootless.mk / tests/rootless.sh, sealed against any live-DB
-# read), so the cross-check race is eliminated BY CONSTRUCTION, not mitigated by
-# ordering. Dropping the old `rootless: | $(filter-out rootless,$(HEAVY_GATES))`
-# constraint removes dead-weight tail latency (rootless is the single longest
-# heavy gate, so running it alone last was doubly wasteful) and weakens no gate:
-# rootless's validity guard, the daemon-oracle differential, and the live-DB-read
-# seal all still run and must pass.

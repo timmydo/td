@@ -7,17 +7,14 @@
 //!   verify STEM BOA.json  parse the boa-evaluated JSON for the same recipe and
 //!                         assert it canon-equals the Rust recipe (the removable
 //!                         migration oracle); exits non-zero on mismatch
-//! Subcommands (system specs):
-//!   list-specs            print every system spec's `.ts` file stem
-//!   emit-spec STEM        print STEM's system spec as canonical JSON
-//!   verify-spec STEM BOA.json   canon-equal check against boa, like `verify`
-//!
-//! This is the loop tool the `recipe-rs` gate drives AND the corpus/spec consumer
-//! entry (replacing `ts-emit` on the boa path).
+//! This is the loop tool the `recipe-rs` gate drives AND the corpus consumer
+//! entry (replacing `ts-emit` on the boa path). (The system-spec subcommands —
+//! list-specs/emit-spec/verify-spec — were retired with the guix-system museum
+//! tier: their only real consumer was the deleted spec-diff differential.)
 
 use std::process::exit;
 
-use td_recipe::{catalog, json, specs};
+use td_recipe::{catalog, json};
 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn die(msg: &str) -> ! {
@@ -30,14 +27,6 @@ fn lookup_or_die(stem: &str) -> td_recipe::types::Recipe {
     match catalog::lookup(stem) {
         Some(r) => r,
         None => die(&format!("unknown recipe stem '{stem}' (try `list`)")),
-    }
-}
-
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn lookup_spec_or_die(stem: &str) -> td_recipe::types::SystemSpec {
-    match specs::lookup(stem) {
-        Some(s) => s,
-        None => die(&format!("unknown spec stem '{stem}' (try `list-specs`)")),
     }
 }
 
@@ -103,21 +92,6 @@ fn main() {
             let rust_canon = lookup_or_die(stem).to_json().to_canonical();
             verify_against_boa("recipe", stem, &rust_canon, path);
         }
-        Some("list-specs") => {
-            for (stem, _) in specs::all() {
-                println!("{stem}");
-            }
-        }
-        Some("emit-spec") => {
-            let stem = args.get(2).unwrap_or_else(|| die("usage: emit-spec STEM"));
-            println!("{}", lookup_spec_or_die(stem).to_json().to_canonical());
-        }
-        Some("verify-spec") => {
-            let stem = args.get(2).unwrap_or_else(|| die("usage: verify-spec STEM BOA.json"));
-            let path = args.get(3).unwrap_or_else(|| die("usage: verify-spec STEM BOA.json"));
-            let rust_canon = lookup_spec_or_die(stem).to_json().to_canonical();
-            verify_against_boa("spec", stem, &rust_canon, path);
-        }
-        _ => die("usage: td-recipe-eval list|emit|verify | list-specs|emit-spec|verify-spec STEM [BOA.json]"),
+        _ => die("usage: td-recipe-eval list|meta|emit|verify STEM [BOA.json]"),
     }
 }

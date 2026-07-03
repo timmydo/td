@@ -119,40 +119,18 @@ DRVLIST="$work/all-drvs.txt" guix repl ci/drv-outputs.scm \
 channel_out=$(guix repl -L . ci/channel-instance-drv.scm 2>/dev/null \
   | sed -n 's/^CHANNEL_OUT=//p')
 test -n "$channel_out" || { echo "FATAL: no channel instance output" >&2; exit 1; }
-# EXCLUDE the docker-image artifact family's OUTPUTS from the export (their
-# drvs and input closures stay, so the runner builds them itself and the
-# --check rungs compare runner-vs-runner). Why: the pinned guix's docker
-# builder packs tars in READDIR ORDER (guix/docker.scm never passes #:tar to
-# tar-base-options, so --sort=name is dropped) — filesystem-dependent bytes
-# (ext4's htree order varies with the per-mkfs hash seed, so two runners
-# diverge; btrfs dev box vs ext4 runner likewise), an UPSTREAM defect td
-# cannot patch without forking the builder (future work; human-signed
-# accommodation 2026-06-12). This covers the `guix pack -f docker` system
-# `docker-image.tar.gz` (same builder defect surfaced 2026-06-13 once the
-# pipeline's cross-RUNNER --check replaced the dev-box-warm path). Everything
-# embedding such a tarball is excluded too: generation images (repack it), the
-# registry (embeds gen-image layouts), placed trees (extract gen images).
-#
-# ALSO exclude the rootless isolation probe (td-rootless-isolation-probe) — a
-# DIFFERENT reason: the `rootless` rung REQUIRES its output INVALID in the host
-# store so the unprivileged userns builder is what produces it (the isolation
-# assertion reads /proc/self/uid_map from THAT build — tests/rootless.sh). A
-# dev box never root-builds it (only the userns does), but the pipeline's
-# warming pass does, so drop it from the export; the runner builds it fresh.
-#
-# AND exclude the td-builder differential oracles: td-s3-diff (S3) and the
-# qcow2 system image.qcow2 (S4). A THIRD reason: those rungs assert that the
-# DAEMON's recorded deriver equals the rebuild's, and `guix archive --import`
-# does NOT restore the deriver field — an imported output reports deriver=#f,
-# so the daemon must FRESHLY build them (build-derivations) to record it. The
-# rungs' lowering already builds them expecting that; shipping the outputs
-# short-circuits it. Dropping them makes the daemon build them fresh (the
-# build/rootless rungs rebuild image.qcow2 anyway). NAR hash/size,
-# the other imported facts, ARE intrinsic and survive import — only deriver
-# needs the fresh build.
-grep -Ev -- '-(docker-image\.tar\.gz|td-generation-image-gen-[0-9]+|td-registry|td-placed-tree(-mkfs)?|td-rootless-isolation-probe|td-s3-diff|image\.qcow2)$' \
+# EXCLUDE the `guix pack -f docker` docker-image OUTPUTS from the export (their
+# drvs and input closures stay, so the runner builds them itself). Why: the
+# pinned guix's docker builder packs tars in READDIR ORDER (guix/docker.scm
+# never passes #:tar to tar-base-options, so --sort=name is dropped) —
+# filesystem-dependent bytes an UPSTREAM defect td cannot patch without forking
+# the builder (human-signed accommodation 2026-06-12). The rest of the old
+# exclusion family (generation images, registry, placed trees, the rootless
+# isolation probe, the S3/S4 differential oracles) died with the guix-system
+# museum tier — their patterns are gone with their rungs.
+grep -Ev -- '-(docker-image\.tar\.gz)$' \
   "$work/outputs.txt" > "$work/outputs-kept.txt"
-echo "   excluded $(($(wc -l < "$work/outputs.txt") - $(wc -l < "$work/outputs-kept.txt"))) outputs the runner rebuilds itself (fs-order docker-pack families + the rootless isolation probe)"
+echo "   excluded $(($(wc -l < "$work/outputs.txt") - $(wc -l < "$work/outputs-kept.txt"))) outputs the runner rebuilds itself (fs-order docker-pack family)"
 sort -u "$work/check-drvs.txt" "$work/outputs-kept.txt" > "$work/roots.txt"
 printf '%s\n' "$channel_out" >> "$work/roots.txt"
 echo "   $(wc -l < "$work/roots.txt") export roots (channel profile: $channel_out)"

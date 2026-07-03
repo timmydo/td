@@ -6,35 +6,14 @@
 # may only SHRINK); growth needs a deliberate edit here, called out in the PR for
 # sign-off (directive 8). Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB><category>
-surface-sites: 51
+surface-sites: 28
 ci/build-ci-image.sh	guix-db-read
 ci/build-ci-image.sh	lowering
 ci/import-store.sh	guix-db-read
 ci/verify-import-local.sh	guix-db-read
 ci/verify-import-local.sh	shell
 mk/gates/010-eval.mk	lowering
-mk/gates/030-typed-coverage.mk	lowering
-mk/gates/050-manifest-diff.mk	lowering
-mk/gates/060-generation-diff.mk	lowering
 mk/gates/070-guix-dependence.mk	lowering
-mk/gates/105-generation-image.mk	lowering
-mk/gates/110-no-guix.mk	lowering
-mk/gates/115-manifest-check.mk	lowering
-mk/gates/120-oci.mk	lowering
-mk/gates/130-rootless.mk	gc
-mk/gates/130-rootless.mk	guix-db-read
-mk/gates/130-rootless.mk	lowering
-mk/gates/135-oci-load.mk	lowering
-mk/gates/140-registry.mk	lowering
-mk/gates/145-verify-place.mk	lowering
-mk/gates/160-place.mk	lowering
-mk/gates/165-build.mk	lowering
-mk/gates/175-td-builder.mk	gc
-mk/gates/175-td-builder.mk	lowering
-mk/gates/185-offline.mk	lowering
-mk/gates/190-memo.mk	lowering
-mk/gates/205-spec-diff.mk	lowering
-mk/gates/230-drv-emit.mk	lowering
 mk/gates/255-resolve.mk	lowering
 mk/gates/270-loop-rung.mk	lowering
 mk/gates/285-store-add-tree.mk	lowering
@@ -50,8 +29,6 @@ tests/bootstrap-sed-corpus-store-native.sh	gc
 tests/bootstrap-sed-corpus-store-native.sh	guix-db-read
 tests/corpus-seed.sh	guix-db-read
 tests/harness-seed.sh	guix-db-read
-tests/rootless.sh	gc
-tests/rootless.sh	guix-db-read
 tests/rust-seed.sh	guix-db-read
 tests/seed-build.sh	guix-db-read
 tests/seed-tarball.sh	guix-db-read

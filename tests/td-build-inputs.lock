@@ -7,8 +7,8 @@
 # WITHOUT Guile; the `resolve` rung proves it equals Guile's LIVE resolution (the
 # oracle) and a perturbed lock diverges.
 #
-# PINNED ARTIFACT — regenerate on a channel bump (an exclusive landing, like
-# DIGESTS.md):  guix repl -L . tests/resolve-lock.scm ncurses
+# PINNED ARTIFACT — regenerate on a channel bump (an exclusive landing):
+#   guix repl -L . tests/resolve-lock.scm ncurses
 # The RESOLVER (this generation) stays Guile, retired last (§5); the increment
 # moves the lock CONSUMPTION to Rust.
 ncurses /gnu/store/rcpg5kn07hflcv2lvz0k8gd76lr5ihdc-ncurses-6.2.20210619

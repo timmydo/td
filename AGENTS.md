@@ -193,6 +193,19 @@ legitimate only as SUPPORTING evidence behind a behavioral assertion
 point of the gate. If the only thing a new test proves is "this can be
 built", it is not covering a feature: find the feature and test that.
 
+**What counts as a feature.** The gates exist to test
+td end to end: td builds package recipes, `td shell` runs those builds, the
+/td/store bootstrap chain produces the toolchain, td-native images run under
+crun. Guix differentials, guix-implemented capabilities, and artifact-shape
+checks are NOT features — the guix-system "museum" tier (the guix
+operating-system, its typed front-end, generations/registry/placement as
+guix derivations, the qcow2, the guix-daemon rootless/netns experiments) was
+retired wholesale on this direction: "I never wanted the guix museum ... I
+want our tests to be testing actual end to end features like having td
+build package recipes and td shell testing those builds." Do not rebuild
+museum-style gates; the generations/signed-distribution/placement CONCEPTS
+are deliberately uncovered until the human asks for td-native versions.
+
 ## Definition of done (every task)
 
 A task is done only when ALL hold:
@@ -265,10 +278,11 @@ on what*, and all working notes live in the git log + PR body.
   run, it does not replace it. `lint` + `check-fast` are the required checks; the
   full `./check.sh` stays the dev-machine gate (step 1).
   
-- **Exclusive landings:** changes to the shared spine — `system/td.scm` (frozen
-  oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
-  everyone. Announce in the PR description, land as small standalone PRs, expect
-  others to rebase. Oracle re-baselines and channel bumps are the canonical cases.
+- **Exclusive landings:** changes to the shared spine — `check.sh`, `Makefile`,
+  `channels.scm` — collide with everyone. Announce in the PR description, land as
+  small standalone PRs, expect others to rebase. Channel bumps are the canonical
+  case. (The frozen-oracle `system/td.scm` + `DIGESTS.md` spine entries were
+  retired with the guix-system gate tier.)
   Note: **adding a gate is no longer an exclusive landing** — it's a new
   `mk/gates/<NNN>-<name>.mk` file, not a `Makefile` edit, so concurrent gate PRs
   don't collide (the core `Makefile` itself stays exclusive).
@@ -292,14 +306,25 @@ on what*, and all working notes live in the git log + PR body.
   gate PRs touch different files and don't collide on a shared list line. The `<NNN>`
   prefix sets order (cheap serial-first, heavy LPT for `-j2`); `make list-gates` prints
   the assembled pools.
-- `system/` — Guile system declarations. The frozen oracle lives at `system/td.scm`.
-- `tests/` — the package-manager/differential/coverage gate scripts and the
-  `guix system image` / OCI / placement gates. (The marionette `(gnu tests)`
-  VM-boot tests were removed 2026-06-29, human-directed.)
+- `system/` — the two load-bearing Guile modules: `td-builder.scm` (check.sh's
+  outer-sandbox prelude realizes it) and `td-build.scm` (the drv fixtures for the
+  realize/hermetic/daemon gates lower through it; retired with those fixtures).
+  (The guix operating-system declarations — the frozen oracle `td.scm` and the
+  typed/generation/place/registry/verity modules — were retired with the
+  guix-system gate tier; the marionette `(gnu tests)` VM-boot tests went
+  earlier.)
+- `tests/` — the gate scripts: package-manager behavioral tests, locks, and the
+  drv fixtures for td's build-engine gates.
 - `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
   deliberately (exclusive landing), never silently.
 - `DESIGN.md` — the settled north star: scope (§0), the loop (§1), and the
   provenance chain. The parallel-work rules live here in AGENTS.md, not DESIGN.md.
+- Clarifications persist HERE: when the human gives a
+  direction, a scope decision, or a lasting clarification, fold it into
+  AGENTS.md (or the governing file's own comments) in the same PR — do NOT
+  squirrel it away in agent-private memory/notes where other agents and the
+  human cannot see or review it. This file is the shared contract; private
+  memory is not.
 - Work tracking: there is **no `PLAN.md` and no per-PR tracking/claim files** — claims
   are the open draft PRs (`gh pr list`), and work notes + verified-red evidence live in
   commit messages + the PR body (the squash merge preserves the commit messages in
@@ -310,8 +335,6 @@ on what*, and all working notes live in the git log + PR body.
   decides whether the local full `./check.sh` run is waived or still required;
   `--run` enforces escalation by running the full loop when required. Its own mapping
   guard is `td-builder affected-checks --self-test` (also a `cargo-test` `#[test]`).
-- `HISTORY.md` — completed-milestone record. `DIGESTS.md` — reproducibility record
-  (changes only on oracle re-baseline; exclusive landing).
 
 **Naming & formatting**
 

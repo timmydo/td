@@ -150,38 +150,19 @@ jobs:
             sudo "$(cat /tmp/channel-out)/bin/guix" archive --generate-key
           fi
       - name: realize the rung-ladder closure
-        # The generator exports POSITIVE outputs, so they must be valid here
-        # first; the must-fail negatives contribute only their input closures
-        # (see below). Image prep may fetch (substitutes stay on for this
-        # daemon) — the LOOP's offline discipline applies to ./check.sh, not
-        # to warming.
+        # Image prep may fetch (substitutes stay on for this daemon) — the
+        # LOOP's offline discipline applies to ./check.sh, not to warming.
+        # (The must-fail NEGATIVE drvs and their keep-going/positive-split
+        # handling died with the guix-system museum tier: every enumerated drv
+        # is a positive now and must build.)
         run: |
           set -eu
           export PATH="$(cat /tmp/host-guix)/bin:$PATH"
           guix describe
-          # Enumerate the closure; tap the must-FAIL-to-build negatives into a
-          # side list (no-guix marker + system gate, offline daemon probe).
-          # Their rungs assert `! guix build`, and the failing builder can sit
-          # DEEP in a negative's input closure (the adversarial's guix-free
-          # marker is embedded in its system), so they cannot just be skipped —
-          # only NOT REQUIRED to build to completion.
-          TD_NEGATIVE_DRVS_OUT=/tmp/neg-drvs.raw \
-            sh ci/lower-check-drvs.sh > /tmp/check-drvs.raw
+          sh ci/lower-check-drvs.sh > /tmp/check-drvs.raw
           sort -u /tmp/check-drvs.raw > /tmp/check-drvs.txt
-          sort -u /tmp/neg-drvs.raw  > /tmp/neg-drvs.txt
-          comm -23 /tmp/check-drvs.txt /tmp/neg-drvs.txt > /tmp/pos-drvs.txt
-          wc -l /tmp/check-drvs.txt /tmp/neg-drvs.txt /tmp/pos-drvs.txt
-          # Pass 1 — realize EVERYTHING buildable. --keep-going builds each
-          # negative's closure UP TO its asserted failing builder, exactly as
-          # ./check.sh's no-guix/offline rungs do on a dev box, leaving the warm
-          # pre-failure closure the generator exports. The expected non-zero is
-          # tolerated here and pinned down by pass 2.
-          xargs -r -a /tmp/check-drvs.txt guix build --keep-going --max-jobs=4 || true
-          # Pass 2 (backstop) — every POSITIVE must now be valid: a no-op if
-          # pass 1 built it, a hard RED if any positive genuinely failed (so the
-          # `|| true` above can only ever mask the expected negative builder
-          # failures, never a real one).
-          xargs -r -a /tmp/pos-drvs.txt guix build --max-jobs=4
+          wc -l /tmp/check-drvs.txt
+          xargs -r -a /tmp/check-drvs.txt guix build --max-jobs=4
       - name: build the image (in-repo generator)
         run: |
           set -eu

@@ -1,46 +1,32 @@
-;; tests/offline-drv.scm — offline-isolation: print the two network-namespace
-;; probe derivations, so the Makefile's `offline` rung can realise them and
-;; `guix build --check` them (forcing the probe assertions to RE-EXECUTE every
-;; loop — a probe that ran green once is not a standing guarantee).
+;; tests/offline-drv.scm — offline-isolation probe for td's OWN builder: print
+;; the DRV_SANDBOX network-namespace probe derivation the `td-offline` gate
+;; (mk/gates/360) realizes with `td-builder realize`. The probe is a regular
+;; (non-fixed-output) derivation whose builder asserts, from INSIDE the build:
+;; /proc/net/dev lists ONLY `lo`, and an actual TCP egress attempt raises — so
+;; a realize that SUCCEEDS proves td's userns+NEWNET sandbox isolated the build.
 ;;
-;; One probe body, two derivations; the ONLY difference is fixed-output-ness,
-;; which is exactly the daemon's network-isolation lever:
+;; (The old guix-daemon twin — DRV_DAEMON, the fixed-output variant probing the
+;; DAEMON's netns — was retired with the `offline` gate 185 and the guix-system
+;; museum tier: guix-daemon's sandbox is not td's
+;; subject; 360-td-offline covers td's builder, which is.)
 ;;
-;;   • DRV_SANDBOX — a regular (non-fixed-output) derivation. guix-daemon gives
-;;     it a private netns, so this is the "deliberate undeclared fetch" of the
-;;     track's acceptance: a builder that was NOT declared fixed-output tries to
-;;     reach the network and must fail. Green on any correctly sandboxed daemon.
+;; The probe asserts the netns two ways: interface visibility (precisely what
+;; CLONE_NEWNET scopes) and a real TCP egress attempt to TEST-NET-1 (192.0.2.1,
+;; a documentation address no real host answers), which must raise immediately
+;; in a loopback-only netns. The interface check runs first, so a
+;; network-visible red fails fast instead of hanging in connect.
 ;;
-;;   • DRV_DAEMON — the same body as a fixed-output derivation. FO builders are
-;;     the one path the daemon does NOT unshare a netns for: they run in the
-;;     DAEMON'S OWN netns — the same netns `guix substitute` queries from. So
-;;     "only loopback here" asserts the daemon itself is network-isolated and a
-;;     cold path cannot even query. RED until the host wraps guix-daemon in its
-;;     own netns (S3) — and that red is the
-;;     verified-red for the shared probe body: identical assertions, network
-;;     present, builder fails.
-;;
-;; The probe asserts the netns two ways: /proc/net/dev must list ONLY `lo`
-;; (interface visibility is precisely what CLONE_NEWNET scopes — check.sh's
-;; host-side control proves this mechanism reports non-lo interfaces where
-;; network IS present), and an actual TCP egress attempt must raise (the
-;; interface check runs first, so a network-visible red fails fast instead of
-;; hanging in connect). Output is a fixed one-line file, so both probes are
-;; trivially reproducible and `--check` doubles as the per-loop re-run.
-;;
-;; Emits `DRV_SANDBOX=` / `DRV_DAEMON=` lines (the Makefile greps them out),
-;; mirroring the two-step lower-then-realise pattern: lowering only prints drv
-;; names; the build — and the rung's honest pass/fail — happens in `guix build`.
+;; Run as a repl SCRIPT (`guix repl FILE`), never piped via STDIN: guix repl
+;; reading from STDIN always exits 0 (it swallows the script's status), while
+;; script mode propagates a load error as a non-zero exit.
 (use-modules (guix store)
              (guix derivations)
              (guix gexp)
              (guix monads)
-             (guix base32)
              (ice-9 format))
 
 (define (netns-probe-gexp context)
-  ;; CONTEXT is only a label baked into the messages (and it usefully makes the
-  ;; two probes distinct derivations).
+  ;; CONTEXT is only a label baked into the messages.
   #~(begin
       (use-modules (ice-9 rdelim))
       ;; Every interface in THIS process's netns, parsed from /proc/net/dev
@@ -89,15 +75,5 @@ egress is possible.~%"
 
   (let ((sandbox (run-with-store store
                    (gexp->derivation "td-offline-sandbox-probe"
-                                     (netns-probe-gexp "sandbox"))))
-        ;; sha256 of the literal "isolated\n" the probe writes — what makes
-        ;; this one fixed-output, i.e. run in the daemon's own netns.
-        (daemon (run-with-store store
-                  (gexp->derivation "td-offline-daemon-probe"
-                                    (netns-probe-gexp "daemon")
-                                    #:hash-algo 'sha256
-                                    #:hash (nix-base32-string->bytevector
-                                            "0rnc30gw1l688ijhhfjka569ia9c8flsvh8cg538fikfkfa7g3cv")
-                                    #:recursive? #f))))
-    (format #t "DRV_SANDBOX=~a~%" (derivation-file-name sandbox))
-    (format #t "DRV_DAEMON=~a~%" (derivation-file-name daemon))))
+                                     (netns-probe-gexp "sandbox")))))
+    (format #t "DRV_SANDBOX=~a~%" (derivation-file-name sandbox))))
