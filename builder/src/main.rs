@@ -1176,7 +1176,8 @@ fn daemon_realize_one(
     }
     eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
     let seed_dirs = [seed_dir.to_string()];
-    let regs = realize_drv(drv, &seed_dirs, &[], &scr, &[], ov.as_ref(), None)?;
+    // The daemon scans the live store dir: entries are canonical where they sit.
+    let regs = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &scr, &[], ov.as_ref(), None)?;
     let (c, h) = mk(&regs)?;
     Ok((c, h, false))
 }
@@ -1197,8 +1198,8 @@ fn daemon_check_one(
     let _ = std::fs::remove_dir_all(&scr); // two INDEPENDENT builds, never a cache reuse
     let r1 = scr.join("r1");
     let r2 = scr.join("r2");
-    let regs1 = realize_drv(drv, &seed_dirs, &[], &r1, &[], ov.as_ref(), None)?;
-    let regs2 = realize_drv(drv, &seed_dirs, &[], &r2, &[], ov.as_ref(), None)?;
+    let regs1 = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &r1, &[], ov.as_ref(), None)?;
+    let regs2 = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &r2, &[], ov.as_ref(), None)?;
     for reg in &regs1 {
         let canon = &reg.store_path;
         let h1 = nar_hash(&daemon_host_path(&r1, canon)?).map_err(|e| e.to_string())?;
@@ -1267,6 +1268,41 @@ fn scan_candidate_index(
         on_disk.insert(canonical, format!("{dir}/{name}"));
     }
     Ok((candidates, on_disk))
+}
+
+/// Re-key candidate-index entries onto their TRUE canonical store paths (#292). A seed
+/// staging dir mixes entries whose canonical homes DIFFER — guix-captured bytes live at
+/// `/gnu/store`, td-built copies (a chained /td/store toolchain) at `/td/store` — but
+/// `scan_candidate_index` can only stamp ONE prefix on all of them. OVERRIDES carries the
+/// hash-keyed truth the caller does know: the drv's own roots (the lock is authoritative
+/// for its entries' canonicals) and every td-OWNED store DB registration. Without this,
+/// a root whose prefix differs from the stamped one misses the on-disk map, is never
+/// content-scanned, and silently drops its whole transitive runtime closure (gate 377:
+/// coreutils' gmp vanished and `expr` died on libgmp.so.10).
+///
+/// PRECONDITION: an entry whose true canonical differs from the stamped seed prefix must
+/// be visible as a drv root or via a TD_EXTRA_DBS registration, or it keeps the stamp.
+/// Callers satisfy this by construction — every td-built tree is created WITH its OUT-DB
+/// (store-add-recursive/store-add-builder/write_output_db), and the paths that stage one
+/// into a seed dir (gate 377's toolchain pair, the td-shell native store) pass that DB in
+/// TD_EXTRA_DBS and/or name the tree as a lock root. Don't stage an unregistered td-built
+/// tree into a seed dir.
+fn recanonicalize_candidates(
+    candidates: &mut [String],
+    on_disk: &mut std::collections::HashMap<String, String>,
+    overrides: &std::collections::HashMap<String, String>,
+) {
+    for c in candidates.iter_mut() {
+        let Some(h) = store::hash_from_store_path(c) else { continue };
+        let Some(true_canonical) = overrides.get(h) else { continue };
+        if true_canonical == c {
+            continue;
+        }
+        if let Some(od) = on_disk.remove(c) {
+            on_disk.insert(true_canonical.clone(), od);
+        }
+        *c = true_canonical.clone();
+    }
 }
 
 /// Compute the runtime closure of ROOTS with NO guix store DB: BFS to fixpoint, each path's
@@ -1347,11 +1383,16 @@ fn merge_extra_refs(
 /// refs' TRANSITIVE closures come from the seed content-scan. TD_STORE, when set, names td's
 /// own store dir holding td-BUILT deps: a closure path whose tree lives under TD_STORE/<base>
 /// is emitted `canonical\ton-disk` so the sandbox binds it FROM THERE (the build-plan chaining
-/// edge) — the same on-disk encoding SRC_OVERRIDE uses.
+/// edge) — the same on-disk encoding SRC_OVERRIDE uses. SEED_CANONICAL_PREFIX is the canonical
+/// home of the seed dirs' entries — `/gnu/store` for a guix-captured seed/warm-seed staging
+/// dir, the live `store::store_dir()` when scanning the active store itself; per-entry truth
+/// (a td-built copy inside a guix seed dir, or vice versa) is restored from the drv roots +
+/// td-owned DBs by `recanonicalize_candidates` (#292).
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn realize_drv(
     drv_path: &str,
     seed_store_dirs: &[String],
+    seed_canonical_prefix: &str,
     extra_dbs: &[String],
     scratch: &Path,
     src_overrides: &[SrcOverride],
@@ -1383,9 +1424,27 @@ fn realize_drv(
     if seed_store_dirs.is_empty() {
         return Err("realize: no seed store dir given".to_string());
     }
-    let (candidates, on_disk) = scan_candidate_index(seed_store_dirs, &store::store_dir())?;
-    let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
     let extra_refs = merge_extra_refs(extra_dbs)?;
+    // TRUE-canonical overrides for the index, keyed by store hash (#292): td-owned DB
+    // registrations first, then the drv's own roots (the drv/lock is the stronger
+    // authority where both name the same hash). Every other seed entry keeps
+    // SEED_CANONICAL_PREFIX.
+    let mut canonical_overrides: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for p in extra_refs.keys() {
+        if let Some(h) = store::hash_from_store_path(p) {
+            canonical_overrides.insert(h.to_string(), p.clone());
+        }
+    }
+    for r in &roots {
+        if let Some(h) = store::hash_from_store_path(r) {
+            canonical_overrides.insert(h.to_string(), r.clone());
+        }
+    }
+    let (mut candidates, mut on_disk) =
+        scan_candidate_index(seed_store_dirs, seed_canonical_prefix)?;
+    recanonicalize_candidates(&mut candidates, &mut on_disk, &canonical_overrides);
+    let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
     // Each td-OWNED interned tree (the recipe source AND the vendored-crate tree) has its
     // own DB — the seed store has no row for it. Open them paired with their override so a
     // root can be matched to its store + db. Both are no-reference content-addressed trees
@@ -1552,6 +1611,7 @@ fn build_recipe(
     lock_file: &str,
     scratch: &Path,
     seed_store_dirs: &[String],
+    seed_canonical_prefix: &str,
     extra_dbs: &[String],
     src_store: Option<(&str, &str)>,
     vendor_store: Option<(&str, &str, &str)>,
@@ -1677,6 +1737,7 @@ fn build_recipe(
     let regs = realize_drv(
         &drv_file.to_string_lossy(),
         seed_store_dirs,
+        seed_canonical_prefix,
         extra_dbs,
         scratch,
         &src_overrides,
@@ -2029,6 +2090,7 @@ fn build_plan(
             &resolved_lock.to_string_lossy(),
             &step_scratch,
             &seed_dirs,
+            store::STORE_DIR, // the guix seed store's canonical home
             &td_dbs,
             None,            // src_store: build-plan locks carry resolved paths
             None,            // vendor_store: build-plan deps are not vendored-crate trees
@@ -5018,7 +5080,7 @@ fn main() -> ExitCode {
                 // ⇒ None ⇒ identical to the prior behavior. The override rides into closure.txt,
                 // so a later `td-builder build`/`check` of this drv stages the builder too.
                 let ov = builder_override_from_env()?;
-                realize_drv(drv_path, std::slice::from_ref(store_dir), &[], Path::new(scratch), &[], ov.as_ref(), None)
+                realize_drv(drv_path, std::slice::from_ref(store_dir), &store::store_dir(), &[], Path::new(scratch), &[], ov.as_ref(), None)
                     .map(|_| ())
             };
             match run() {
@@ -5311,10 +5373,15 @@ fn main() -> ExitCode {
                         )
                     }
                 };
-                let (seed_store_dirs, td_store): (Vec<String>, Option<&Path>) =
+                // The seed staging dir's entries are guix-captured bytes whose canonical
+                // home is /gnu/store even when the BUILD targets TD_STORE_DIR=/td/store
+                // (#292 — gate 377's collapse); td-built copies inside it are restored to
+                // their /td/store canonicals from the roots + TD_EXTRA_DBS. Without a seed,
+                // the scanned dir IS the live store, canonical where it sits.
+                let (seed_store_dirs, seed_prefix, td_store): (Vec<String>, &str, Option<&Path>) =
                     match (&seed_store, &seed_db) {
-                        (Some(s), Some(_d)) => (vec![s.clone()], Some(Path::new(s))),
-                        (None, None) => (vec![store_dir.clone()], None),
+                        (Some(s), Some(_d)) => (vec![s.clone()], store::STORE_DIR, Some(Path::new(s))),
+                        (None, None) => (vec![store_dir.clone()], store_dir.as_str(), None),
                         _ => return Err("TD_SEED_STORE/TD_SEED_DB must be set together".into()),
                     };
                 // TD_EXTRA_DBS (colon-separated) merges ADDITIONAL td-OWNED store DBs alongside the
@@ -5336,6 +5403,7 @@ fn main() -> ExitCode {
                     lock,
                     Path::new(scratch),
                     &seed_store_dirs,
+                    seed_prefix,
                     &extra_dbs,
                     src_store,
                     vendor_store,
@@ -6986,5 +7054,69 @@ glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
         cl.sort();
         assert_eq!(cl, vec![glibc_c, hello_c], "multi-store closure must span both stores");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- #292: roots whose canonical prefix differs from the candidate index's ----------
+    // Gate 377 (store-persist) builds at TD_STORE_DIR=/td/store from a lock whose seed roots
+    // are /gnu/store paths. The walk only content-scans a path whose CANONICAL form is an
+    // index key — so a /gnu/store root against a single-prefix-canonicalized index collapsed
+    // to "roots only" and dropped every transitive runtime dep (coreutils → gmp: expr died
+    // on libgmp.so.10). VERIFIED-RED: composed the pre-fix way (prefix = the active
+    // /td/store, no overrides), the gmp assertion below fails with closure == roots. This
+    // composes index + overrides + walk exactly as realize_drv now does: /gnu/store as the
+    // seed dirs' canonical home, per-hash TRUE canonicals restored from the drv roots and
+    // the td-owned extra DBs (recanonicalize_candidates).
+    #[test]
+    fn cross_prefix_roots_keep_transitive_deps() {
+        use std::collections::HashMap;
+        let cu_h = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // coreutils (a /gnu/store lock root)
+        let gmp_h = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // gmp (transitive: only in coreutils' bytes)
+        let tc_h = "cccccccccccccccccccccccccccccccc"; // td-built toolchain (a /td/store root)
+        let gl_h = "dddddddddddddddddddddddddddddddd"; // td-built glibc (a /td/store root, td-db-registered)
+        let dir = std::env::temp_dir().join(format!("td-xprefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wr = |name: &str, bytes: String| std::fs::write(dir.join(name), bytes).unwrap();
+        // The warm-seed staging dir mixes guix-captured entries and copied-in td-built ones.
+        wr(&format!("{cu_h}-coreutils-9.1"), format!("expr RPATHs /gnu/store/{gmp_h}-gmp-6.3.0/lib\n"));
+        wr(&format!("{gmp_h}-gmp-6.3.0"), "a guix-built leaf\n".to_string());
+        wr(&format!("{tc_h}-gcc-toolchain-tdstore"), format!("wrapper: -Wl,--dynamic-linker /td/store/{gl_h}-glibc-2.41/lib/ld-linux.so.2\n"));
+        wr(&format!("{gl_h}-glibc-2.41"), "a td-built leaf\n".to_string());
+        let dirs = [dir.to_string_lossy().into_owned()];
+        // The gate's roots: guix seed entries at /gnu/store + the td-built toolchain pair
+        // at /td/store (the substituted lock lines).
+        let cu_c = format!("/gnu/store/{cu_h}-coreutils-9.1");
+        let tc_c = format!("/td/store/{tc_h}-gcc-toolchain-tdstore");
+        let gl_c = format!("/td/store/{gl_h}-glibc-2.41");
+        let roots = [cu_c.clone(), tc_c.clone(), gl_c.clone()];
+        // realize_drv's composition: /gnu/store is the seed dirs' canonical home; the
+        // roots + the td-owned DB registrations (glibc rides bgdb in the gate) override
+        // per hash; everything else keeps the seed prefix.
+        let mut overrides: HashMap<String, String> = HashMap::new();
+        overrides.insert(gl_h.to_string(), gl_c.clone()); // TD_EXTRA_DBS registration
+        for r in &roots {
+            overrides.insert(store::hash_from_store_path(r).unwrap().to_string(), r.clone());
+        }
+        let (mut candidates, mut on_disk) = scan_candidate_index(&dirs, "/gnu/store").unwrap();
+        recanonicalize_candidates(&mut candidates, &mut on_disk, &overrides);
+        let mut scanner = scan::Scanner::new(&candidates).unwrap();
+        let empty: HashMap<String, Vec<String>> = HashMap::new();
+        let cl = scan_closure_hybrid(&mut scanner, &on_disk, &empty, &roots).unwrap();
+        let gmp_c = format!("/gnu/store/{gmp_h}-gmp-6.3.0");
+        assert!(
+            cl.contains(&gmp_c),
+            "transitive runtime dep gmp dropped from the closure (#292): {cl:?}"
+        );
+        // The toolchain's byte-scanned glibc ref must resolve to the td-built glibc at its
+        // TRUE /td/store canonical — a phantom /gnu/store twin would poison the output
+        // reference scan's candidate set (duplicate hash, last-in wins).
+        assert!(cl.contains(&gl_c), "td-built glibc missing: {cl:?}");
+        assert!(
+            !cl.contains(&format!("/gnu/store/{gl_h}-glibc-2.41")),
+            "td-built glibc duplicated under /gnu/store: {cl:?}"
+        );
+        // All four members, each at exactly its true canonical.
+        assert_eq!(cl.len(), 4, "closure must be exactly the 4 true-canonical members: {cl:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

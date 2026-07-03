@@ -12,17 +12,12 @@
 # (§5, retired last); the build reads the td-owned seed DB, not /var/guix (guix-surface flat).
 # Heavy (the /td/store toolchain from the seed); the build-recipes prelude runs → BUILD_GATES.
 #
-# PARKED — NOT registered in any pool (human direction, PR #291): deterministically RED
-# from clean state because build-recipe's staged closure for this gate's invocation
-# collapses to the lock's direct entries (no transitive runtime deps — coreutils' gmp is
-# dropped, `expr` dies on libgmp.so.10, and sed's configure spins). Full evidence + repro
-# in issue #292; the machinery (warm-seed / build-recipe staging) is shared with the
-# #287/#288 workstreams. Run it on demand with `./check.sh store-persist`. RE-ENABLE by
-# replacing the PARKED_GATES line below with the original registrations when #292 is
-# fixed:
-#   HEAVY_GATES += store-persist
-#   BUILD_GATES += store-persist
-PARKED_GATES += store-persist
+# (Was PARKED between PR #291 and the #292 fix: realize_drv canonicalized every seed-store
+# candidate under the ACTIVE store dir, so this gate's /gnu/store lock roots missed the
+# index and the staged closure collapsed to the lock entries — coreutils' gmp dropped,
+# `expr` died on libgmp.so.10. Fixed by seed-canonical-prefix + recanonicalize_candidates.)
+HEAVY_GATES += store-persist
+BUILD_GATES += store-persist
 store-persist:
 	@echo ">> store-persist: the loop builds a corpus package at /td/store into a persistent store + DB (build-into), and a SEPARATE invocation SKIPS the rebuild reading it back (CACHE=persist), running it own-root /gnu/store-absent — incremental /td/store, wired into the build path"
 	sh tests/store-persist.sh

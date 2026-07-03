@@ -433,3 +433,11 @@ dependency-free engine crates — a denied lint reds only on new code.
   evidence in your commit messages — that is what lands in `git log` on main. The PR
   body is review context for the human and does NOT persist into git; don't rely on it
   to record anything you want to keep.
+
+- **Closing keywords in commit messages fire on main.** Because the squash body is
+  composed from branch commit messages, a `fixes #N` / `closes #N` / `resolves #N`
+  ANYWHERE in any branch commit auto-closes that issue the moment the squash lands —
+  GitHub offers no setting to disable this, and it has mis-closed a live issue before
+  (#292, closed by the unrelated #291 squash whose body said "for whoever fixes #292").
+  Write `re #N` / `see #N` / `until #N is fixed` when referring to an issue you are NOT
+  resolving; reserve the closing keywords for the issue your PR actually closes.

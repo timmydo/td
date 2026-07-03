@@ -108,6 +108,17 @@ pub fn name_from_store_path(path: &str) -> Option<String> {
     }
 }
 
+/// The 32-char digest part of a store path (`<dir>/<digest>-<name>`), or None for a
+/// non-store-shaped path — `name_from_store_path`'s sibling. Length-32 is the whole
+/// criterion, matching the pinned daemon parse (`scan::hash_part`); the digest encodes
+/// the store dir (see `make_store_path_in`'s fingerprint), so one digest names exactly
+/// one canonical path.
+pub fn hash_from_store_path(path: &str) -> Option<&str> {
+    let base = path.rsplit('/').next()?;
+    let h = base.split('-').next()?;
+    (h.len() == 32).then_some(h)
+}
+
 /// The store path a `.drv` with `content` and `refs` (its inputDrvs ∪ inputSrcs)
 /// would be written to.
 pub fn drv_store_path(name: &str, content: &[u8], refs: &[String]) -> String {
