@@ -31,8 +31,10 @@ export GUIX="$TD_GUIX" ROOT="$PWD"; \
 nsout=`sh tests/crate-free-build.sh youki youki-0.6.0 tests/youki.lock youki-source youki` || exit 1; \
 eval "$nsout"; ns="$NS"; \
 test -x "$ns/bin/youki" || { echo "FAIL: no youki binary at $ns/bin/youki" >&2; exit 1; }; \
-"$ns/bin/youki" --version 2>&1 | grep -qi 'youki' || { echo "FAIL: youki --version did not report youki" >&2; "$ns/bin/youki" --version >&2 || true; exit 1; }; \
-"$ns/bin/youki" --help 2>&1 | grep -qiE '\bcreate\b' || { echo "FAIL: youki --help did not list the OCI 'create' subcommand" >&2; "$ns/bin/youki" --help >&2 || true; exit 1; }; \
+vout=$("$ns/bin/youki" --version 2>&1) || { echo "FAIL: youki --version exited nonzero" >&2; printf '%s\n' "$vout" >&2; exit 1; }; \
+printf '%s\n' "$vout" | grep -qi 'youki' || { echo "FAIL: youki --version did not report youki" >&2; printf '%s\n' "$vout" >&2; exit 1; }; \
+hout=$("$ns/bin/youki" --help 2>&1) || { echo "FAIL: youki --help exited nonzero" >&2; exit 1; }; \
+printf '%s\n' "$hout" | grep -qiE '\bcreate\b' || { echo "FAIL: youki --help did not list the OCI 'create' subcommand" >&2; printf '%s\n' "$hout" >&2; exit 1; }; \
 echo "  [DURABLE behavioral] the td-built youki (guix-free crates) runs — --version reports youki + --help lists the OCI lifecycle subcommands (a real OCI runtime CLI)"; \
 echo "PASS: rust-youki — youki (0.6.0) built with its 663-crate closure provisioned GUIX-FREE via td's cargo-proxy (Cargo.lock-pinned, sha == crates.io cksum, no guix build / no /gnu/store FOD), source+vendor interned by store-add-recursive, built via TD_VENDOR_DIR with guix off PATH; youki runs as an OCI runtime CLI; reproducible. The crates.io corpus rust packages now build guix-free. NO oracle (content-address = the upstream pin). Toolchain seed retired last."
 "##,
