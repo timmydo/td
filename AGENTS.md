@@ -66,7 +66,8 @@ bootstrap replaces the guix toolchain seed.
    PR approval is the sign-off. No written proposal or pre-approval is needed to
    start work; build it, then PR it. Keep design notes terse, and surface any
    weakened gate in the PR (directive 3). There is no roadmap to enroll in — the
-   open-PR list is the record of what work is in flight, not a gate.
+   issue backlog is where work is enumerated and the open-PR list is what's in
+   flight (see "Parallel work"); neither is an approval gate.
 
 5. **Respect the state boundary.** The VM is ephemeral per test (fresh state, wiped on
    reset) — that is *test isolation*, not a ban on persistence *within* a test.
@@ -224,22 +225,47 @@ If any are missing, the task is not done.
 ## Parallel work (worktrees, merge on green)
 
 Multiple agents work this repo concurrently. The unit of work is a
-**branch + draft PR**. There is no claim file, no roadmap ledger, and no
-generated status index — *the open-PR list is the record of who is working
-on what*, and all working notes live in the git log + PR body.
+**branch + draft PR**, and the backlog is **GitHub issues**: issues say what
+needs doing, open PRs say who is doing it. There is no claim file, no roadmap
+ledger, and no generated status index — the two `gh` lists are the whole
+tracking system, and all working notes live in the git log + PR body.
 
-- **Claim by opening a draft PR.** Before starting, scan the open PRs
-  (`gh pr list`) so two agents don't pick the same work; if one is already open for it,
-  pick something else. Open your **draft PR** early (main is branch-protected; nothing
-  lands directly) — that draft, with a title naming the workstream, IS your claim.
-  Release it by closing the PR if you abandon the work.
+- **Take work from the issue backlog.** `gh issue list` is the menu. An issue
+  is claimable when ALL hold: (a) it is open and **no open PR references it** —
+  scan `gh pr list` (the open PRs are authoritative; `gh issue list --search
+  'is:open -linked:pr'` is a convenience pre-filter, but a stale link from a
+  closed PR can lie either way); (b) everything in its "Blocked by" line is
+  closed; (c) its **Collisions** section is disjoint from the territory of
+  every open PR (and from the exclusive-landing spine below, unless you
+  sequence behind it). Issues follow the work-item shape
+  (`.github/ISSUE_TEMPLATE/work-item.md`): What / Entry points / Done /
+  Collisions / Blocked by, with Done stated behaviorally ("Test the feature,
+  not the possibility"). If an issue you want is missing its Done or
+  Collisions, fix the issue body first — an issue that can't be claimed safely
+  as written is a bug in the issue.
+
+- **Claim by opening a draft PR that links the issue.** Open your **draft PR**
+  early (main is branch-protected; nothing lands directly) with `Closes #NNN`
+  in the body — that link IS your claim, and GitHub closes the issue on the
+  squash merge. Release the claim by closing the PR (and comment on the issue
+  with what you learned) if you abandon the work. Self-directed work not on
+  the backlog claims the same way — a draft PR with a title naming the
+  workstream; file the issue first when the work spans more than one PR, so
+  its territory is visible to other agents.
+
+- **File issues for follow-up work you find but don't do.** Work discovered
+  mid-task that doesn't fit the current PR becomes an issue in the work-item
+  shape — never a code TODO, never a parked half-mechanism (directive 8), and
+  never a note in agent-private memory. Declare its Collisions honestly and
+  name its blockers; a well-formed issue is the only sanctioned way to defer
+  work.
 
 - **Work in your own git worktree/branch** (`git worktree add
   ../td-<name>`), never on a shared checkout of main. Your running
   notes, sub-task ladder, and verified-red evidence go in your
   **commit messages and the PR body** — never in a tracked file. Do
-  not create files to track or claim work; tracking and claiming are
-  the open PRs, full stop.
+  not create files to track or claim work; tracking is the issue list
+  and claiming is the open PRs, full stop.
 
 - **Land (optimistic merge on green, via PR):** main is **non-strict** — a PR merges on **its own** green checks; main moving
   under you no longer forces a rebase-onto-tip + re-run. So: (1) validate against
@@ -325,10 +351,11 @@ on what*, and all working notes live in the git log + PR body.
   squirrel it away in agent-private memory/notes where other agents and the
   human cannot see or review it. This file is the shared contract; private
   memory is not.
-- Work tracking: there is **no `PLAN.md` and no per-PR tracking/claim files** — claims
-  are the open draft PRs (`gh pr list`), and work notes + verified-red evidence live in
-  commit messages + the PR body (the squash merge preserves the commit messages in
-  `git log`).
+- Work tracking: there is **no `PLAN.md` and no per-PR tracking/claim files** — the
+  backlog is GitHub issues in the work-item shape (`.github/ISSUE_TEMPLATE/work-item.md`),
+  claims are the open draft PRs linking them (`Closes #NNN`), and work notes +
+  verified-red evidence live in commit messages + the PR body (the squash merge
+  preserves the commit messages in `git log`).
 - `td-builder affected-checks` (`builder/src/affected.rs`) — diff-to-check
   dispatcher for local iteration and PR readiness. Run it first to see the selected
   checks, then `td-builder affected-checks --run` to execute them. Its waiver line
