@@ -277,6 +277,13 @@ tracking system, and all working notes live in the git log + PR body.
   Collisions, fix the issue body first — an issue that can't be claimed safely
   as written is a bug in the issue.
 
+- **Draft means "not yet reviewable" — nothing else.** A draft PR is a CLAIM;
+  the moment its validation + review protocol is complete, the SAME agent marks
+  it ready — never ask the human to look at a PR still labeled draft, and never
+  leave a finished PR in draft (the human reads draft as "don't review yet").
+  If the human asks about a draft PR, treat it as the signal your readiness
+  state drifted: reconcile immediately (mark ready or say what's missing).
+
 - **Claim by opening a draft PR that links the issue.** Open your **draft PR**
   early (main is branch-protected; nothing lands directly) with `Closes #NNN`
   in the body — that link IS your claim, and GitHub closes the issue on the
