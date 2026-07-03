@@ -86,6 +86,16 @@ fn guard_pinned_guix(root: &Path) -> Result<(), String> {
         .lines()
         .find_map(|l| l.strip_prefix("commit:").map(|v| v.trim().to_string()))
         .unwrap_or_default();
+    if host.is_empty() {
+        // Distinguish "guix missing/broken" from a genuine pin mismatch — an
+        // empty commit in the mismatch message sent operators to re-pin
+        // channels.scm when the real problem was `guix describe` itself.
+        return Err(fatal(
+            "could not read the host guix commit (`guix describe` failed — is guix \
+             installed and on PATH?). The loop needs the pinned host guix; a guix-less \
+             host runs only `./check.sh check-harness`.",
+        ));
+    }
     if host != pinned {
         return Err(fatal(&format!(
             "host guix ({host}) != pinned channel ({pinned}).\n  The offline loop assumes \
@@ -422,7 +432,33 @@ fn run(args: &[String]) -> Result<i32, String> {
         return Err(fatal("run from the repo root (tests/ + channels.scm not found)"));
     }
 
-    let mut goals: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
+    // Parse args LOUDLY: `-j N`/`-jN` overrides the local worker width; any other
+    // flag is a hard error (the old shell prelude forwarded "$@" to make, so
+    // silently dropping a flag here would turn e.g. a throttle request into a
+    // full-width run — the opposite of the user's intent).
+    let mut goals: Vec<String> = Vec::new();
+    let mut jobs_flag: Option<usize> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let jv = if a == "-j" || a == "--jobs" {
+            Some(it.next().cloned().unwrap_or_default())
+        } else {
+            a.strip_prefix("-j").map(str::to_string)
+        };
+        if a == "-j" || a == "--jobs" || (a.starts_with("-j") && a.len() > 2) {
+            match jv.as_deref().unwrap_or("").trim().parse::<usize>() {
+                Ok(n) if n >= 1 => jobs_flag = Some(n),
+                _ => return Err(fatal(&format!("bad {a} value — -j needs a positive integer"))),
+            }
+        } else if a.starts_with('-') {
+            return Err(fatal(&format!(
+                "unknown flag `{a}` — td-builder check takes goals (tiers/gate names) \
+                 and -j N; there is no make behind this anymore"
+            )));
+        } else {
+            goals.push(a.clone());
+        }
+    }
     if goals.is_empty() {
         goals.push("check".to_string());
     }
@@ -454,6 +490,14 @@ fn run(args: &[String]) -> Result<i32, String> {
         (s("PATH"), format!("{}:{toolchain}", hostguix_dir.display())),
         (s("GUIX_BUILD_OPTIONS"), s("--no-substitutes --no-offload")),
     ];
+    // The runner's knobs must cross the sandbox boundary (host-sandbox
+    // preserves the TD_CHECK_ prefix): without this, TD_CHECK_SLOTS=… ./check.sh
+    // would be silently dead and gate-run would always default to nproc.
+    for k in ["TD_CHECK_SLOTS", "TD_CHECK_SLOTS_DIR", "TD_CHECK_JOBS"] {
+        if let Ok(v) = std::env::var(k) {
+            child_envs.push((k.to_string(), v));
+        }
+    }
     child_envs.extend(subst_env(&root));
 
     if heavy_warm {
@@ -478,11 +522,13 @@ fn run(args: &[String]) -> Result<i32, String> {
         let _ = std::fs::create_dir_all(Path::new(&home).join(".td/build-daemon/slots"));
     }
 
-    let jobs = std::env::var("TD_CHECK_JOBS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    let jobs = jobs_flag.unwrap_or_else(|| {
+        std::env::var("TD_CHECK_JOBS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or_else(crate::gates::nproc)
+    });
 
     // nice/ionice the whole loop so it yields to interactive work; the slot pool
     // and daemon budget bound how MUCH runs, nice bounds its priority.

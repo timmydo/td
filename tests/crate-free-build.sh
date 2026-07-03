@@ -74,7 +74,7 @@ grep -q 'TD_VENDOR_DIR' "$sd"/*.drv || { echo "FAIL: the .drv lacks TD_VENDOR_DI
 if grep -oqE '/gnu/store/[a-z0-9]+-[^ /]+\.crate' "$sd"/*.drv; then echo "FAIL: the .drv references a /gnu/store crate path (not guix-free)" >&2; exit 1; fi
 echo "  [DURABLE structural] the .drv sets TD_VENDOR_DIR and references NO /gnu/store crate path — crates are guix-free: $out" >&2
 
-rm -rf "$scratch/chk"; "$TB" check "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
+rm -rf "$scratch/chk"; "$TB" check-drv "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
   || { echo "FAIL: NOT reproducible (td-builder check):" >&2; tail -6 "$scratch/checkout.txt" "$scratch/chk.err" >&2; exit 1; }
 grep -qE "^CHECK out $out sha256:[0-9a-f]+ reproducible$" "$scratch/checkout.txt" \
   || { echo "FAIL: td-builder check did not confirm $out reproducible:" >&2; cat "$scratch/checkout.txt" >&2; exit 1; }

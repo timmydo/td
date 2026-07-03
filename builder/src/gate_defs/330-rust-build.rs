@@ -81,7 +81,7 @@ echo "  [DURABLE behavioral] the td-built td-builder RUNS: nar-hash = $h_td"; \
 if [ -n "$hit" ] && [ -f "$sd/verified-reproducible" ]; then \
   echo "  [DURABLE repro] CACHED: builder source unchanged + previously verified reproducible — td-builder check skipped (verdict memoized)"; \
 else \
-  rm -rf "$scratch/chk"; "$TB" check "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
+  rm -rf "$scratch/chk"; "$TB" check-drv "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
     || { echo "FAIL: rust-build NOT reproducible (td-builder check):" >&2; cat "$scratch/checkout.txt" "$scratch/chk.err" >&2; exit 1; }; \
   grep -qE "^CHECK out $out sha256:[0-9a-f]+ reproducible$" "$scratch/checkout.txt" \
     || { echo "FAIL: td-builder check did not confirm $out reproducible:" >&2; cat "$scratch/checkout.txt" >&2; exit 1; }; \

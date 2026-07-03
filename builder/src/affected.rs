@@ -247,6 +247,11 @@ fn default_check_covers_target(_root: &Path, target: &str) -> bool {
 
 fn add_gate_file_targets(sel: &mut Selection, gate: &str) {
     sel.add_target(gate);
+    // Gate defs are compiled Rust in the engine crate now: the AGENTS.md deny
+    // lints are enforced by cargo clippy/test, so a gate-file edit runs the
+    // engine smoke too — the old .mk fragments carried no Rust and needed none.
+    sel.add_preflight("cargo-test");
+    sel.add_target("check-engine");
 }
 
 fn add_build_gate_targets(root: &Path, sel: &mut Selection) {

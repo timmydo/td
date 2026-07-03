@@ -164,7 +164,7 @@ rm -rf "$csrv" "$csd" "$scratch/wrong.priv" "$scratch/wrong.pub" "$scratch/wrong
 if [ -n "$hit" ] && [ -f "$sd/verified-reproducible" ]; then \
   echo "  [DURABLE repro] CACHED: recipe unchanged + previously verified reproducible — td-builder check skipped"; \
 else \
-  rm -rf "$scratch/chk"; "$tb" check "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
+  rm -rf "$scratch/chk"; "$tb" check-drv "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
     || { echo "FAIL: td-subst NOT reproducible (td-builder check):" >&2; tail -6 "$scratch/checkout.txt" "$scratch/chk.err" >&2; exit 1; }; \
   grep -qE "^CHECK out $out sha256:[0-9a-f]+ reproducible$" "$scratch/checkout.txt" \
     || { echo "FAIL: td-builder check did not confirm $out reproducible:" >&2; cat "$scratch/checkout.txt" >&2; exit 1; }; \

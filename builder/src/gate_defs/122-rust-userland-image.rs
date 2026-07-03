@@ -24,7 +24,13 @@ pub fn gate() -> GateDef {
         name: "rust-userland-image",
         pools: &[Pool::System],
         needs: &[],
-        build_gate: false,
+        // The script sources cache-lib and calls load_recipe_eval, so it NEEDS the
+        // build-recipes prelude. The retired mk fragment never declared this edge
+        // and only passed on worktrees whose cache held a stale recipe-eval
+        // sentinel from an earlier full check — the runner's longest-first start
+        // order exposed the gap deterministically on a cold worktree (verified
+        // red: "no td-recipe-eval sentinel" before this flag; green after).
+        build_gate: true,
         specs: &[],
         script: r##"
 echo ">> rust-userland-image: ship td-BUILT procs/fd/ripgrep/sd/eza/bat in td-NATIVE OCI images (td-builder oci-image, no guix system image); crun runs each from its image; reproducible"

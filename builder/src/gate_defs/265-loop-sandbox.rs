@@ -6,7 +6,7 @@
 //! It spawns a fresh `td-builder host-sandbox` and asserts:
 //! (1) STORE + DAEMON SOCKET + GUIX exposed — `guix build -d hello` lowers to a valid
 //! hello .drv inside it (a real daemon round-trip; drop the socket bind and this
-//! errors → red). (2) ISOLATION — the host worktree ($(CURDIR)/Makefile) is INVISIBLE
+//! errors → red). (2) ISOLATION — the host worktree ($PWD/check.sh) is INVISIBLE
 //! while /gnu/store + the socket remain exposed (a real container, not a bare userns).
 //! (3) PID NAMESPACE + PRIVATE /proc — the command runs as PID 1 (not the host's
 //! root-owned shepherd) and /proc shows only the sandbox's own PIDs. (4) NET
@@ -38,7 +38,7 @@ tdout=`"$tb" host-sandbox -- guix build -d hello`; \
 echo "   td host-sandbox: $tdout"; \
 case "$tdout" in /gnu/store/*-hello-*.drv) : ;; *) echo "FAIL: td's sandbox did not lower hello to a .drv ('$tdout') — store/socket/guix exposure is broken" >&2; exit 1;; esac; \
 echo ">> isolation: the host worktree is invisible inside td's sandbox, while the store + socket stay exposed"; \
-if "$tb" host-sandbox -- "$realbash" -c "test -e '$PWD/Makefile'"; then \
+if "$tb" host-sandbox -- "$realbash" -c "test -e '$PWD/check.sh'"; then \
   echo "FAIL: the host worktree ($PWD) leaked into td's sandbox — not isolated" >&2; exit 1; fi; \
 "$tb" host-sandbox -- "$realbash" -c "test -d /gnu/store && test -S /var/guix/daemon-socket/socket" \
   || { echo "FAIL: td's sandbox did not expose /gnu/store + the daemon socket" >&2; exit 1; }; \

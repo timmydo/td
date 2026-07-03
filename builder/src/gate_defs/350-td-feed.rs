@@ -121,7 +121,7 @@ for c in "$vendor"/*.crate; do \
   checked=$((checked+1)); \
 done; \
 echo "  [DURABLE structural] index is TRUTHFUL: all $checked vendored crates' recorded sha256 == their td-fetched .crate content (the mirror serves the same content-addressed bytes td built against)"; \
-rm -rf "$scratch/chk"; "$tb" check "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
+rm -rf "$scratch/chk"; "$tb" check-drv "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
   || { echo "FAIL: td-feed NOT reproducible (td-builder check):" >&2; tail -6 "$scratch/checkout.txt" "$scratch/chk.err" >&2; exit 1; }; \
 grep -qE "^CHECK out $out sha256:[0-9a-f]+ reproducible$" "$scratch/checkout.txt" \
   || { echo "FAIL: td-builder check did not confirm $out reproducible:" >&2; cat "$scratch/checkout.txt" >&2; exit 1; }; \

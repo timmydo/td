@@ -81,7 +81,7 @@ echo "  [DURABLE structural] the .drv sets TD_VENDOR_DIR + NO /gnu/store crate p
 got=`"$ns/bin/td-russh-demo" 2>"$scratch/run.err"` || { echo "FAIL: the td-built russh binary failed to run the SSH round-trip:" >&2; tail -5 "$scratch/run.err" >&2; exit 1; }; \
 echo "$got" | grep -q '^td-russh-ok: ping$' || { echo "FAIL: russh round-trip did not return the expected reply (got: $got)" >&2; cat "$scratch/run.err" >&2; exit 1; }; \
 echo "  [DURABLE behavioral] the td-built russh binary (guix-free crates) ran a full SSH round-trip (handshake + publickey auth + exec) over loopback: '$got'"; \
-rm -rf "$scratch/chk"; "$tb" check "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
+rm -rf "$scratch/chk"; "$tb" check-drv "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
   || { echo "FAIL: rust-russh NOT reproducible (td-builder check):" >&2; tail -6 "$scratch/checkout.txt" "$scratch/chk.err" >&2; exit 1; }; \
 grep -qE "^CHECK out $out sha256:[0-9a-f]+ reproducible$" "$scratch/checkout.txt" \
   || { echo "FAIL: td-builder check did not confirm $out reproducible:" >&2; cat "$scratch/checkout.txt" >&2; exit 1; }; \

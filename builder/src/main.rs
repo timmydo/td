@@ -3093,12 +3093,9 @@ fn main() -> ExitCode {
         // check [GOAL...] — the loop's HOST PRELUDE (the old shell check.sh,
         // ported): guards, stage0 + toolchain provisioning, warms, the shared
         // daemon, then the sandboxed gate-run. check.sh is now a guix-free cargo
-        // bootstrap shim that execs this. Guarded on "no .drv argument" so the
-        // drv reproducibility double-build (`check FILE.drv CLOSURE SCRATCH`,
-        // dispatched below) keeps its invocation — goals never end in .drv.
-        Some("check") if !args.get(2).is_some_and(|a| a.ends_with(".drv")) => {
-            check_loop::cli(args.get(2..).unwrap_or(&[]))
-        }
+        // bootstrap shim that execs this. (The drv reproducibility double-build
+        // that used to share this verb is `check-drv` now — no argument sniffing.)
+        Some("check") => check_loop::cli(args.get(2..).unwrap_or(&[])),
         // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
         // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
         Some("bootstrap-recipe") => bootstrap::cli(&args),
@@ -5495,9 +5492,11 @@ fn main() -> ExitCode {
         // line); the two builds land under SCRATCH/r1 and SCRATCH/r2. Exits 0 if
         // every output is bit-for-bit identical across the two builds, 3 if any
         // output diverges (NON-REPRODUCIBLE — a FAILING test per prime directive 1).
-        // The drv reproducibility double-build; the LOOP `check [GOAL...]` entry
-        // above takes every invocation without a .drv argument.
-        Some("check") if args.len() == 5 => {
+        // The drv reproducibility double-build. RENAMED from `check` when the
+        // loop entry (`td-builder check [GOAL...]`) took that verb — every
+        // caller (tests/*.sh + the gate bodies) was switched in the same change,
+        // so there is no argument-shape sniffing between the two features.
+        Some("check-drv") if args.len() == 5 => {
             let (drv_path, closure_file, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<bool, String> {
                 let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
@@ -5816,7 +5815,10 @@ fn main() -> ExitCode {
                         // read to FETCH the lock-keyed closure instead of building from seed;
                         // TD_DAEMON_* = the shared build daemon's socket (TD_DAEMON_SOCKET) the
                         // corpus build submits to.
-                        if k.starts_with("TD_SUBST_") || k.starts_with("TD_DAEMON_") {
+                        if k.starts_with("TD_CHECK_")
+                            || k.starts_with("TD_SUBST_")
+                            || k.starts_with("TD_DAEMON_")
+                        {
                             extra_env.push((k, v));
                         }
                     }
@@ -5995,7 +5997,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder drv-refs FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
-            eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
+            eprintln!("       td-builder check-drv FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
             eprintln!("       td-builder store-query DB info|references");
             eprintln!("       td-builder store-closure DB ROOT");

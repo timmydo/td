@@ -126,7 +126,7 @@ echo "   [DURABLE behavioral] it agrees with the stage0 td-builder (behavioral e
 
 # --- Leg C: DURABLE repro — td-builder check double-build ------------------------------
 rm -rf "$scratch/chk"
-"$TB" check "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
+"$TB" check-drv "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
   || { cat "$scratch/checkout.txt" "$scratch/chk.err" >&2; fail "rust-seed NOT reproducible (td-builder check)"; }
 grep -qE "^CHECK out $out sha256:[0-9a-f]+ reproducible$" "$scratch/checkout.txt" \
   || { cat "$scratch/checkout.txt" >&2; fail "td-builder check did not confirm $out reproducible"; }

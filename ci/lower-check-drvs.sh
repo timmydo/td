@@ -56,7 +56,7 @@ done
 # `td-builder check` provisions the loop toolchain profile from, so it cannot
 # drift. skopeo is realized by the oci-native/rust-userland-image rungs.
 tools=$(cat tools/loop-toolchain.txt)
-test -n "$tools" || { echo "ERROR: could not parse toolchain from check.sh" >&2; exit 1; }
+test -n "$tools" || { echo "ERROR: empty toolchain list — tools/loop-toolchain.txt missing or empty" >&2; exit 1; }
 # shellcheck disable=SC2086
 $GUIX build -d $tools skopeo
 

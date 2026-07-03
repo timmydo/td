@@ -61,7 +61,7 @@ if grep -oqE '/gnu/store/[a-z0-9]+-[^ /]+\.crate' "$sd"/*.drv; then echo "FAIL: 
 echo "  [DURABLE structural] the .drv sets TD_VENDOR_DIR and references NO /gnu/store crate path — crates are guix-free: $out"; \
 rc=0; "$ns/bin/td-fetch" >/dev/null 2>&1 || rc=$?; test "$rc" = 2 || { echo "FAIL: the td-built td-fetch usage exit != 2 (got $rc)" >&2; exit 1; }; \
 echo "  [DURABLE behavioral] the td-built td-fetch (guix-free crates) runs (usage exit 2)"; \
-rm -rf "$scratch/chk"; "$tb" check "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
+rm -rf "$scratch/chk"; "$tb" check-drv "$sd"/*.drv "$sd/closure.txt" "$scratch/chk" > "$scratch/checkout.txt" 2>"$scratch/chk.err" \
   || { echo "FAIL: NOT reproducible (td-builder check):" >&2; tail -6 "$scratch/checkout.txt" "$scratch/chk.err" >&2; exit 1; }; \
 grep -qE "^CHECK out $out sha256:[0-9a-f]+ reproducible$" "$scratch/checkout.txt" \
   || { echo "FAIL: td-builder check did not confirm $out reproducible:" >&2; cat "$scratch/checkout.txt" >&2; exit 1; }; \

@@ -96,10 +96,13 @@ struct Gate {
     deps: Vec<String>,
     /// Extra env for the body (the synthetic build-recipes node uses this).
     extra_env: Vec<(String, String)>,
+    /// The def's own spec list, exported to the body as TD_GATE_SPECS — the
+    /// single source both the build phase and the gate's assertion loop read.
+    specs: Vec<String>,
 }
 
 struct GateSet {
-    /// Registration order = sorted gates/*.gate filename order (the <NNN> prefix).
+    /// Registration order = sorted src/gate_defs/*.rs stem order (the <NNN> prefix).
     gates: Vec<Gate>,
     index: HashMap<String, usize>,
     build_specs: Vec<String>,
@@ -184,6 +187,7 @@ fn load() -> Result<GateSet, String> {
             body: def.script.to_string(),
             deps: def.needs.iter().map(|d| d.to_string()).collect(),
             extra_env: Vec::new(),
+            specs: def.specs.iter().map(|s| s.to_string()).collect(),
         });
     }
 
@@ -227,6 +231,7 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
         body: "bash tests/build-recipes.sh".to_string(),
         deps: last_cheap.iter().cloned().collect(),
         extra_env: vec![("TD_BUILD_SPECS".to_string(), set.build_specs.join(" "))],
+        specs: Vec::new(),
     };
     set.index.insert(BUILD_RECIPES.to_string(), set.gates.len());
     set.gates.push(br);
@@ -333,13 +338,12 @@ fn duration_table(root: &Path) -> HashMap<String, f64> {
     };
     for line in text.lines() {
         let mut it = line.split_whitespace();
-        let (Some(name), Some(kind), Some(secs)) = (it.next(), it.next(), it.next()) else {
+        let (Some(name), Some(_kind), Some(secs)) = (it.next(), it.next(), it.next()) else {
             continue;
         };
         if name.starts_with('#') || name == "GATE" {
             continue;
         }
-        let _ = kind;
         if let Ok(v) = secs.parse::<f64>() {
             out.insert(name.to_string(), v);
         }
@@ -371,19 +375,34 @@ enum Grant {
 impl SlotPool {
     fn acquire(&self, aborted: &dyn Fn() -> bool) -> Grant {
         let Some(dir) = &self.dir else { return Grant::NoPool };
+        // Loop-invariant: compute the slot paths once, not per 200ms poll.
+        let paths: Vec<PathBuf> = (0..self.n).map(|i| dir.join(format!("slot-{i}"))).collect();
         loop {
-            for i in 0..self.n {
-                let p = dir.join(format!("slot-{i}"));
-                let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&p)
+            let mut opened_any = false;
+            for p in &paths {
+                let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(p)
                 else {
                     continue;
                 };
+                opened_any = true;
                 {
                     use std::os::fd::AsRawFd;
                     if let Ok(true) = crate::sys::flock_try_exclusive(f.as_raw_fd()) {
                         return Grant::Held(f);
                     }
                 }
+            }
+            if !opened_any {
+                // Every slot file is unopenable (permissions, ENOSPC, read-only
+                // mount): spinning forever would hang the whole check silently.
+                // Degrade to unpooled — same posture as slot_pool_from_env's
+                // cannot-create fallback — and say so.
+                eprintln!(
+                    "gate-run: cannot open any slot file under {} — running WITHOUT the \
+                     machine-wide slot pool (local -j is the only cap)",
+                    dir.display()
+                );
+                return Grant::NoPool;
             }
             if aborted() {
                 return Grant::Aborted;
@@ -393,7 +412,7 @@ impl SlotPool {
     }
 }
 
-fn nproc() -> usize {
+pub(crate) fn nproc() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
@@ -479,6 +498,9 @@ fn run_gate(g: &Gate, root: &Path, log_path: &Path, timing: Option<&Path>) -> bo
             .env("TD_GUIX", GUIX_CMD)
             .stdout(std::process::Stdio::from(out))
             .stderr(std::process::Stdio::from(err));
+        if !g.specs.is_empty() {
+            cmd.env("TD_GATE_SPECS", g.specs.join(" "));
+        }
         for (k, v) in &g.extra_env {
             cmd.env(k, v);
         }
@@ -504,12 +526,14 @@ fn run_gate(g: &Gate, root: &Path, log_path: &Path, timing: Option<&Path>) -> bo
 }
 
 /// Dump one finished gate's buffered output atomically (--output-sync=target
-/// parity), with a one-line PASS/FAIL trailer.
+/// parity), with a one-line PASS/FAIL trailer. Raw bytes, not String: build
+/// logs routinely carry non-UTF-8 (compiler/tar output), and read_to_string
+/// would silently drop the WHOLE log — the one thing a red gate must not lose.
 fn print_gate_output(name: &str, log_path: &Path, ok: bool, secs: f64) {
-    let body = std::fs::read_to_string(log_path).unwrap_or_default();
+    let body = std::fs::read(log_path).unwrap_or_default();
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let _ = lock.write_all(body.as_bytes());
+    let _ = lock.write_all(&body);
     let verdict = if ok { "PASS" } else { "FAIL" };
     let _ = writeln!(lock, "[gate-run] {name}: {verdict} ({secs:.1}s)");
     let _ = lock.flush();
@@ -540,11 +564,14 @@ struct RunCfg {
 }
 
 /// True when a node contends on the machine-wide pool: everything except the
-/// sub-5s serial cheap gates and build-recipes (whose real concurrency is the
-/// build daemon's own global budget — holding a slot while blocked on the daemon
-/// would double-count the box).
+/// sub-5s serial cheap gates, build-recipes, and the BUILD_GATES behind it —
+/// those two classes submit to the shared build daemon, whose own global budget
+/// (TD_BUILD_JOBS) is their real limiter; holding a box-wide slot while blocked
+/// on the daemon would double-count the box and starve the CPU-heavy gates.
 fn takes_slot(g: &Gate) -> bool {
-    g.name != BUILD_RECIPES && !g.pools.contains(&Pool::Cheap)
+    g.name != BUILD_RECIPES
+        && !g.pools.contains(&Pool::Cheap)
+        && !g.deps.iter().any(|d| d == BUILD_RECIPES)
 }
 
 fn lock_sched<'a>(m: &'a Mutex<Sched>) -> std::sync::MutexGuard<'a, Sched> {
@@ -851,14 +878,22 @@ mod tests {
         // The pools the Makefile assembled on the day of the cutover (the counts
         // only grow as gates are added; membership spot-checks are structural).
         let cheap = set.names(Pool::Cheap);
-        assert_eq!(cheap, vec!["eval", "guix-dependence", "guix-surface"]);
+        // Membership + relative order, NOT exact vectors: adding a gate must
+        // never require touching this file (the one-file-per-gate property).
+        let pos = |n: &str| cheap.iter().position(|x| x == n);
+        let (e, gd, gs) = (pos("eval"), pos("guix-dependence"), pos("guix-surface"));
+        assert!(e.is_some() && gd.is_some() && gs.is_some(), "cheap chain lost a member");
+        assert!(e < gd && gd < gs, "cheap chain order changed");
         let heavy = set.names(Pool::Heavy);
         assert!(heavy.len() >= 99, "heavy pool shrank: {}", heavy.len());
         for g in ["bootstrap", "td-subst", "cargo-test", "rust-userland-x86_64-store-native"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
-        assert_eq!(set.names(Pool::Engine), vec!["cargo-test"]);
-        assert_eq!(set.names(Pool::System), vec!["oci-native", "rust-userland-image"]);
+        assert!(set.names(Pool::Engine).iter().any(|n| n == "cargo-test"));
+        let system = set.names(Pool::System);
+        for g in ["oci-native", "rust-userland-image"] {
+            assert!(system.iter().any(|n| n == g), "missing system gate {g}");
+        }
         // Fragment-declared specs feed the synthetic build-recipes node.
         for s in ["hello", "bash", "pcre2"] {
             assert!(set.build_specs.iter().any(|x| x == s), "missing build spec {s}");
@@ -896,6 +931,7 @@ mod tests {
                 body: cmd.replace("{D}", &dir.display().to_string()),
                 deps: deps.iter().map(|d| d.to_string()).collect(),
                 extra_env: Vec::new(),
+                specs: Vec::new(),
             });
         }
         GateSet { gates, index, build_specs: Vec::new() }
@@ -986,6 +1022,7 @@ mod tests {
             body: format!("sleep 0.1 && touch {}/br.ran", d.display()),
             deps: Vec::new(),
             extra_env: Vec::new(),
+            specs: Vec::new(),
         });
         set.index.insert(BUILD_RECIPES.to_string(), idx);
         let sel = expand_goals(&set, &["consumer".to_string()]).unwrap();

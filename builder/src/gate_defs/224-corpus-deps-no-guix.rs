@@ -51,7 +51,7 @@ test -n "$ncs" || { echo "ERROR: could not resolve ncurses for readline's termca
 . tests/cache-lib.sh; export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; load_stage0; load_recipe_eval; CU="$cu"; CACHE="$PWD/.td-build-cache/pkg"; mkdir -p "$CACHE"; \
 case "$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \
 echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($TD_RECIPE_EVAL) — not the guix-built one (brick 4b)"; \
-for spec in libsigsegv libunistring pcre2 ncurses readline; do \
+for spec in $TD_GATE_SPECS; do \
   echo "================ $spec ================"; \
   lock="$PWD/tests/$spec-no-guix.lock"; \
   test -s "$lock" || { echo "ERROR: no lock $lock" >&2; exit 1; }; \
