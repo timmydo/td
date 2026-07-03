@@ -155,7 +155,11 @@ TD_CHECK_MEM_PSI, default 10) or MemAvailable is under TD_MIN_FREE_GIB
 (default 4, the daemon's knob); every gate body additionally runs
 under a per-process RLIMIT_DATA cap (TD_CHECK_GATE_MEM_MIB, default
 8192) and an AGGREGATE process-tree budget
-(TD_CHECK_GATE_TREE_MEM_MIB, default 16384, watchdog-enforced) — so do
+(TD_CHECK_GATE_TREE_MEM_MIB, default 16384 — kernel-enforced via a
+per-gate cgroup when the host delegates a writable cgroup-v2 subtree
+(TD_CGROUP_ROOT / /sys/fs/cgroup/td / systemd user delegation; see
+issue #328 for the one-time root-side setup), else enforced by the
+sampling watchdog) — so do
 NOT stagger checks, tune `-j`, or otherwise hand-schedule; run the
 full check whenever you need
 it and let the pool arbitrate.

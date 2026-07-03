@@ -636,6 +636,32 @@ fn pgroup_rss_bytes(pgid: u32) -> u64 {
     total
 }
 
+/// Create the gate's child cgroup with the tree budget; returns its dir.
+fn cgroup_enter(run_dir: &Path, gate: &str, budget_mib: u64) -> Option<PathBuf> {
+    let cg = run_dir.join(gate);
+    std::fs::create_dir(&cg).ok()?;
+    let bytes = budget_mib.saturating_mul(1024 * 1024);
+    if std::fs::write(cg.join("memory.max"), bytes.to_string()).is_err() {
+        let _ = std::fs::remove_dir(&cg);
+        return None;
+    }
+    // Throttle-before-kill: reclaim pressure starts at 90% of the cap.
+    let _ = std::fs::write(cg.join("memory.high"), (bytes / 10 * 9).to_string());
+    Some(cg)
+}
+
+/// oom_kill count from the cgroup's memory.events (0 when unreadable).
+fn cgroup_oom_kills(cg: &Path) -> u64 {
+    std::fs::read_to_string(cg.join("memory.events"))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("oom_kill "))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn run_gate(
     g: &Gate,
     root: &Path,
@@ -644,6 +670,7 @@ fn run_gate(
     chain_cache: Option<&str>,
     mem_mib: u64,
     tree_mem_mib: u64,
+    cgroup_dir: Option<&Path>,
 ) -> bool {
     let mut logf = match std::fs::File::create(log_path) {
         Ok(f) => f,
@@ -653,6 +680,21 @@ fn run_gate(
         }
     };
     timing_event(timing, &g.name, "START");
+    // Cgroup mode (primary when delegated): the BODY self-moves into the gate's
+    // cgroup before anything else runs — written by the child itself, so there
+    // is no parent-side move race with early forks.
+    let gate_cg = match (cgroup_dir, tree_mem_mib) {
+        (Some(run_dir), b) if b > 0 => cgroup_enter(run_dir, &g.name, b),
+        _ => None,
+    };
+    let body = match &gate_cg {
+        Some(cg) => format!(
+            "echo $$ > '{}' || {{ echo 'gate-run: cannot enter the gate cgroup' >&2; exit 97; }}\n{}",
+            cg.join("cgroup.procs").display(),
+            g.body
+        ),
+        None => g.body.clone(),
+    };
     let ok = (|| {
         let (out, err) = match (logf.try_clone(), logf.try_clone()) {
             (Ok(o), Ok(e)) => (o, e),
@@ -667,7 +709,7 @@ fn run_gate(
             std::process::Command::new("bash")
         };
         cmd.arg("-c")
-            .arg(&g.body)
+            .arg(&body)
             .current_dir(root)
             .env("TD_GUIX", GUIX_CMD)
             .stdout(std::process::Stdio::from(out))
@@ -712,7 +754,7 @@ fn run_gate(
         let stop = std::sync::atomic::AtomicBool::new(false);
         let breached = std::sync::atomic::AtomicBool::new(false);
         let status = std::thread::scope(|ws| {
-            if tree_mem_mib > 0 {
+            if tree_mem_mib > 0 && gate_cg.is_none() {
                 ws.spawn(|| {
                     let budget = tree_mem_mib.saturating_mul(1024 * 1024);
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -729,7 +771,26 @@ fn run_gate(
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             st
         });
-        if breached.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(cg) = &gate_cg {
+            if cgroup_oom_kills(cg) > 0 {
+                breached.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = writeln!(
+                    logf,
+                    "gate-run: FAIL: gate {} — the kernel OOM-killed inside its cgroup \
+                     ({tree_mem_mib} MiB memory.max, TD_CHECK_GATE_TREE_MEM_MIB)",
+                    g.name
+                );
+            }
+            // The group is dead or done; empty cgroups rmdir immediately, a
+            // straggler zombie can delay it a moment.
+            for _ in 0..10 {
+                if std::fs::remove_dir(cg).is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        if breached.load(std::sync::atomic::Ordering::Relaxed) && gate_cg.is_none() {
             let _ = writeln!(
                 logf,
                 "gate-run: FAIL: gate {} — process-tree RSS exceeded the {tree_mem_mib} MiB \
@@ -825,6 +886,12 @@ struct RunCfg {
     /// --resume: skip gates journaled green for THIS tree key (issue #320).
     /// Opt-in, interactive iteration only — CI and the daily never pass it.
     resume: bool,
+    /// The delegated per-run cgroup dir (TD_CHECK_CGROUP, issue #328). When
+    /// present, each gate runs in its own child cgroup with memory.max set to
+    /// the tree budget (kernel-enforced, escape-proof — a setsid() child stays
+    /// in its cgroup) and the sampling watchdog below is NOT used. None =
+    /// undelegated host = watchdog fallback.
+    cgroup_dir: Option<PathBuf>,
     /// AGGREGATE tree budget per gate, in MiB (0 = off): a watchdog samples the
     /// gate's process group's summed RSS and SIGKILLs the whole group on breach
     /// — the layer the per-process rlimit below cannot provide (N children each
@@ -999,6 +1066,7 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     cfg.chain_cache.as_deref(),
                     cfg.gate_mem_mib,
                     cfg.gate_tree_mem_mib,
+                    cfg.cgroup_dir.as_deref(),
                 );
                 print_gate_output(&g.name, &log_path, ok, started.elapsed().as_secs_f64());
                 if ok {
@@ -1197,6 +1265,11 @@ pub fn cli(args: &[String]) -> ExitCode {
         gate_mem_mib,
         gate_tree_mem_mib,
         chain_cache,
+        cgroup_dir: std::env::var("TD_CHECK_CGROUP")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir()),
     };
     match run_selected(&set, &selected, &cfg) {
         Ok(true) => {
@@ -1308,6 +1381,7 @@ mod tests {
             gate_mem_mib: 0,
             gate_tree_mem_mib: 0,
             chain_cache: None,
+            cgroup_dir: None,
         }
     }
 
@@ -1423,6 +1497,47 @@ mod tests {
         // Green half: watchdog off, the same tree passes.
         let c = cfg(&d, 2, None);
         assert!(run_selected(&set, &sel, &c).unwrap(), "unbudgeted tree must pass");
+    }
+
+    #[test]
+    fn cgroup_mode_enforces_the_tree_budget_when_delegated() {
+        // Runs ONLY where a writable delegated cgroup subtree exists (systemd
+        // user session, or the documented root-side /sys/fs/cgroup/td setup);
+        // everywhere else the watchdog fallback tests carry the budget
+        // property. The check_loop probe is replicated inline.
+        let probe = |c: &Path| -> bool {
+            let p = c.join(format!("td-probe-{}", std::process::id()));
+            std::fs::create_dir(&p).map(|_| { let _ = std::fs::remove_dir(&p); true }).unwrap_or(false)
+        };
+        let root = [PathBuf::from("/sys/fs/cgroup/td")]
+            .into_iter()
+            .chain(
+                std::fs::read_to_string("/proc/self/cgroup")
+                    .ok()
+                    .and_then(|t| t.lines().find_map(|l| l.strip_prefix("0::").map(|p| PathBuf::from(format!("/sys/fs/cgroup{}", p.trim()))))),
+            )
+            .find(|c| probe(c));
+        let Some(root) = root else { return };
+        let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory");
+        let run = root.join(format!("td-test-{}", std::process::id()));
+        std::fs::create_dir(&run).unwrap();
+        if std::fs::write(run.join("cgroup.subtree_control"), "+memory").is_err() {
+            let _ = std::fs::remove_dir(&run);
+            return; // memory controller not delegatable here
+        }
+        let d = tmpdir("cg");
+        let hog = r#"x=$(head -c 134217728 /dev/zero | tr '\0' a); sleep 1; echo ${#x}"#;
+        let set = synth(&d, &[("cghog", Pool::Heavy, hog, &[])]);
+        let sel = expand_goals(&set, &["cghog".to_string()]).unwrap();
+        let mut c = cfg(&d, 2, None);
+        c.cgroup_dir = Some(run.clone());
+        c.gate_tree_mem_mib = 32; // 128 MiB allocation vs a 32 MiB cgroup cap
+        assert!(!run_selected(&set, &sel, &c).unwrap(), "cgroup memory.max must red the hog");
+        let mut c2 = cfg(&d, 2, None);
+        c2.cgroup_dir = Some(run.clone());
+        c2.gate_tree_mem_mib = 1024;
+        assert!(run_selected(&set, &sel, &c2).unwrap(), "roomy cgroup cap must pass");
+        let _ = std::fs::remove_dir(&run);
     }
 
     #[test]

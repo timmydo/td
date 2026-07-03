@@ -233,6 +233,53 @@ fn s(v: &str) -> String {
     v.to_string()
 }
 
+/// A writable cgroup-v2 subtree delegated to this uid, or None (issue #328).
+/// Probe order: TD_CGROUP_ROOT (explicit) → /sys/fs/cgroup/td (the documented
+/// Guix System/Shepherd delegation: one root-side
+///   mkdir /sys/fs/cgroup/td
+///   echo +memory > /sys/fs/cgroup/cgroup.subtree_control
+///   chown -R <loop-user> /sys/fs/cgroup/td
+/// ) → the process's OWN cgroup dir (systemd hosts: user@.service subtrees are
+/// Delegate=yes, so /proc/self/cgroup names a dir we own). Writability is
+/// proven by actually creating a child (the only test that matters).
+fn cgroup_delegated_root() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(v) = std::env::var("TD_CGROUP_ROOT") {
+        if !v.is_empty() {
+            candidates.push(PathBuf::from(v));
+        }
+    }
+    candidates.push(PathBuf::from("/sys/fs/cgroup/td"));
+    if let Ok(selfcg) = std::fs::read_to_string("/proc/self/cgroup") {
+        if let Some(path) = selfcg.lines().find_map(|l| l.strip_prefix("0::")) {
+            candidates.push(PathBuf::from(format!("/sys/fs/cgroup{}", path.trim())));
+        }
+    }
+    for c in candidates {
+        let probe = c.join(format!("td-probe-{}", std::process::id()));
+        if std::fs::create_dir(&probe).is_ok() {
+            let _ = std::fs::remove_dir(&probe);
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Prepare the per-run cgroup parent under the delegated root: enable the
+/// memory controller for its children and return the run dir. Best-effort —
+/// any failure means "no cgroup mode this run" (the watchdog fallback holds).
+fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
+    // +memory must be enabled at EVERY level above the gate leaves.
+    let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory");
+    let run = root.join(format!("run-{}", std::process::id()));
+    std::fs::create_dir(&run).ok()?;
+    if std::fs::write(run.join("cgroup.subtree_control"), "+memory").is_err() {
+        let _ = std::fs::remove_dir(&run);
+        return None;
+    }
+    Some(run)
+}
+
 /// The working-tree content key for the verdict journal (issue #320): sha256
 /// over git HEAD + the full dirty diff + every untracked file's bytes — ANY
 /// tree change yields a new key, so a --resume skip can never survive an edit
@@ -536,6 +583,22 @@ fn run(args: &[String]) -> Result<i32, String> {
             child_envs.push((k.to_string(), v));
         }
     }
+    // Per-gate cgroup memory limits (issue #328): when the host delegates a
+    // writable cgroup-v2 subtree, gate-run gives every gate a child cgroup
+    // with memory.max/high — the escape-proof successor to the RSS watchdog
+    // (which stays the fallback everywhere else). The run dir is created HOST-
+    // side (the sandbox binds it RW; see host-sandbox) and removed after.
+    let cgroup_run = cgroup_delegated_root().and_then(|r| cgroup_run_dir(&r));
+    match &cgroup_run {
+        Some(dir) => {
+            child_envs.push((s("TD_CHECK_CGROUP"), dir.display().to_string()));
+        }
+        None => eprintln!(
+            "td-builder check: no delegated cgroup subtree — per-gate tree memory \
+             budgets fall back to the sampling watchdog (delegation setup: issue #328)"
+        ),
+    }
+
     // The verdict-journal tree key (issue #320): computed on the HOST (git is
     // not in the sandbox toolchain) and forwarded so gate-run journals every
     // PASS; --resume additionally skips journaled-green gates for this exact
@@ -616,6 +679,18 @@ fn run(args: &[String]) -> Result<i32, String> {
     let st = cmd
         .status()
         .map_err(|e| fatal(&format!("could not start the loop sandbox: {e}")))?;
+    // Best-effort cgroup cleanup: gate leaves are removed by gate-run; the
+    // per-run parent goes here (empty by now; a leftover only wastes a dir).
+    if let Some(dir) = &cgroup_run {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                if e.path().is_dir() {
+                    let _ = std::fs::remove_dir(e.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
     let _ = std::io::stdout().flush();
     Ok(st.code().unwrap_or(1))
 }
