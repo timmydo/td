@@ -9,9 +9,11 @@
 //! Each recipe lives in its own self-registering file `src/recipes/<stem>.rs`
 //! (github issue #295): the file name IS the stem, `pub fn recipe() -> Recipe`
 //! is the registration, and `build.rs` generates the stem-sorted registry
-//! (module declarations + the `all()` table) included below — so adding a
-//! recipe touches only its new file, and parallel recipe PRs never collide on
-//! a shared table (the mk/gates/ one-file-per-entry property).
+//! (module declarations + the `all()` table) included below. Adding a recipe
+//! touches only its new file plus the shared regenerate-on-rebase census files
+//! (`tests/recipes-meta.json`, the guix-dependence baseline — issue #296): no
+//! Rust source line is shared, so parallel recipe PRs don't collide on a
+//! central table (the mk/gates/ one-file-per-entry property).
 
 use crate::types::Recipe;
 
