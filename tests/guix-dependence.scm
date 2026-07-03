@@ -22,11 +22,13 @@
 ;;
 ;; For each TARGET we take the full BUILD CLOSURE — the derivation prerequisite
 ;; graph (`derivation-prerequisites`; lowering only, NO building) — and classify
-;; every derivation td-reproducible vs guix-supplied. Two targets:
+;; every derivation td-reproducible vs guix-supplied. One target:
 ;;   corpus-union   — union build closure of all owned recipes (the number that
 ;;                    MOVES as input-recipes lands more recipes / the toolchain).
-;;   shipped-system — (operating-system-derivation td-system) from system/td.scm,
-;;                    i.e. the product td actually ships.
+;; (The old `shipped-system` target — (operating-system-derivation td-system) —
+;; retired with the guix-system gate tier, human direction 2026-07-02: the guix
+;; operating-system is not the product; td ships td-native images of td-built
+;; packages, and this census measures exactly that ownership.)
 ;;
 ;; The emitted report is DETERMINISTIC given the pinned channel. The gate
 ;; (mk/gates/070) compares it verbatim to tests/guix-dependence.expected; drift
@@ -39,8 +41,6 @@
              (guix packages)
              (guix monads)
              (gnu packages)                 ;specification->package (the oracle)
-             (gnu system)                   ;operating-system-derivation
-             (system td)                    ;td-system (the shipped declaration)
              (srfi srfi-1)
              (json)                         ;json-string->scm (read recipes-meta.json)
              (ice-9 regex)
@@ -157,8 +157,6 @@
                                        store (specification->package spec)
                                        #:graft? #f))))
           '() owned-specs))
-  (define system-closure
-    (closure-drvs (run-with-store store (operating-system-derivation td-system))))
 
   (define (target-line label u)
     (call-with-values (lambda () (classify u))
@@ -194,7 +192,6 @@
      (format #f "owned-recipes (~a): ~a~%"
              (length owned-specs) (string-join owned-specs " "))
      (target-line "corpus-union" corpus-union)
-     (target-line "shipped-system" system-closure)
      edge-report))
 
   (cond

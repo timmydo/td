@@ -279,11 +279,6 @@ fn default_check_covers_target(root: &Path, target: &str) -> bool {
 
 fn add_gate_file_targets(sel: &mut Selection, gate: &str) {
     sel.add_target(gate);
-    if gate == "offline" {
-        // The old Guix oracle and td's own offline builder enforce the same durable
-        // isolation property; edits to either side need both.
-        sel.add_target("td-offline");
-    }
 }
 
 fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
@@ -315,7 +310,10 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
         "td-fetch" => sel.add_target("rust-fetch"),
         "td-feed" => sel.add_target("td-feed"),
         "td-subst" => sel.add_target("td-subst"),
-        "perturbed" => sel.add_target("drv-emit"),
+        // The `-perturbed` self-discrimination twins are exercised by the corpus
+        // build gates (drv-emit, their old guix-differential consumer, was retired
+        // with the museum tier 2026-07-02).
+        "perturbed" => add_build_gate_targets(root, sel),
         "pkg-config" => {
             sel.add_target("guix-dependence");
             sel.add_note("pkg-config is authored but excluded from td-built census until it has an own-builder gate.");
@@ -430,13 +428,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         // The td-recipe crate IS the package + system-spec surface (boa/TS retired).
-        // It feeds the corpus build path (cache-lib emits via td-recipe-eval), the spec
-        // differential, and the guix-dependence census manifest — so a catalog change
-        // can affect ANY built package. Run recipe-rs (self-consistency + manifest
-        // sync), spec-diff, the census, and the package build gates.
+        // It feeds the corpus build path (cache-lib emits via td-recipe-eval) and the
+        // guix-dependence census manifest — so a catalog change can affect ANY built
+        // package. Run recipe-rs (self-consistency + manifest sync), the census, and
+        // the package build gates. (spec-diff retired with the museum tier.)
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-rs");
-        sel.add_target("spec-diff");
         sel.add_target("guix-dependence");
         add_build_gate_targets(root, sel);
         return;
@@ -655,23 +652,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if glob_match("tests/check-memo*", p) {
-        sel.add_target("memo");
-        return;
-    }
-
-    if pattern_matches(
-        "tests/td-builder-nar.scm|tests/td-builder-s3-drvs.scm|tests/td-builder-s4-drv.scm",
-        p,
-    ) {
-        sel.add_target("td-builder");
-        return;
-    }
-
-    if p == "tests/drv-emit-drv.scm" {
-        sel.add_target("drv-emit");
-        return;
-    }
     if p == "tests/td-drv-build-drv.scm" {
         sel.add_target("td-drv-build");
         return;
@@ -681,14 +661,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if glob_match("tests/rootless*", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("rootless");
-        return;
-    }
 
     if p == "tests/offline-drv.scm" {
-        sel.add_target("offline");
         sel.add_target("td-offline");
         return;
     }
@@ -1068,29 +1042,15 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("recipe-rs");
         return;
     }
-    if p == "tests/spec-diff.scm" {
-        sel.add_target("spec-diff");
-        return;
-    }
-
     if p == "system/td-builder.scm" {
         sel.add_target("td-builder");
         sel.add_target("rust-build");
         return;
     }
-    if p == "system/td.scm" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("check-system");
-        sel.require_full(&format!(
-            "{p} is exclusive landing spine; coordinate the landing and run the full local loop."
-        ));
-        return;
-    }
-
-    if pattern_matches(
-        "system/*|tests/place*|tests/verify-place*|tests/registry*|tests/manifest*|tests/generation*|tests/oci*",
-        p,
-    ) {
+    // The remaining system/ modules (td-build.scm — td-builder.scm has its own arm
+    // above) and the OCI check harness (tests/oci-native-check.sh) feed the image
+    // tier (oci-native + rust-userland-image) and the drv-fixture gates.
+    if pattern_matches("system/*|tests/oci*", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("check-system");
         return;
@@ -1155,14 +1115,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "DIGESTS.md" {
-        sel.require_full(&format!(
-            "{p} is exclusive landing spine; coordinate the landing and run the full local loop."
-        ));
-        return;
-    }
-
-    if pattern_matches("*.md|HISTORY.md|DESIGN.md|CLAUDE.md|DIGESTS.md|.gitignore", p) {
+    if pattern_matches("*.md|DESIGN.md|CLAUDE.md|.gitignore", p) {
         return; // docs — no checks
     }
 
@@ -1394,10 +1347,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         }
     }
 
-    if root.join("mk/gates/185-offline.mk").is_file() {
-        assert_target!("mk/gates/185-offline.mk", "offline");
-        assert_target!("mk/gates/185-offline.mk", "td-offline");
-    }
 
     // Every BUILD_GATE is selected by the build-pkg/cache-lib arm.
     for bg in build_gates(root) {
@@ -1426,15 +1375,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/repro-lib.sh", "bootstrap-binutils-244-store-native");
     assert_branch_policy!("tests/repro-lib.sh", "full ./check.sh would be waived");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
-    // catalog edit runs recipe-rs, spec-diff, the census, and the package build gates.
+    // catalog edit runs recipe-rs, the census, and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
-    assert_target!("recipes/src/catalog.rs", "spec-diff");
     assert_target!("recipes/src/catalog.rs", "guix-dependence");
     assert_target!("recipes/src/catalog.rs", "corpus-no-guix");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("tests/recipe-rs.sh", "recipe-rs");
     assert_target!("tests/recipes-meta.json", "recipe-rs");
-    assert_target!("tests/spec-diff.scm", "spec-diff");
     assert_target!("tests/td-russh-demo.lock", "rust-russh");
     assert_target!("tests/russh-demo/Cargo.lock", "rust-russh");
     assert_target!("tests/td-feed.lock", "td-feed");
@@ -1516,11 +1463,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_branch_policy!("builder/src/main.rs", "full ./check.sh would be waived");
     assert_branch_policy!("builder/src/sandbox.rs", "full ./check.sh would be waived");
     assert_branch_policy!("builder/Cargo.toml", "full ./check.sh would be waived");
-    assert_target!("system/td.scm", "check-system");
+    assert_target!("system/td-build.scm", "check-system");
     assert_branch_policy!("check.sh", "full ./check.sh would be required");
     assert_branch_policy!("channels.scm", "full ./check.sh would be required");
-    assert_branch_policy!("system/td.scm", "full ./check.sh would be required");
-    assert_branch_policy!("DIGESTS.md", "full ./check.sh would be required");
     assert_branch_policy!("new/unmapped.file", "full ./check.sh would be required");
 
     failures

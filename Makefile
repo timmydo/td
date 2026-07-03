@@ -25,8 +25,6 @@ SHELL   := bash
 
 GUIX    := guix time-machine -C channels.scm --
 LOAD    := -L .
-SYSTEM  := system/td.scm
-IMGTYPE := qcow2
 
 # --- Per-gate wall-clock instrumentation (task L1) -------
 # Every TIMED gate (see the .SHELLFLAGS block after the gate pools) runs its
@@ -136,15 +134,14 @@ build-recipes:
 # remains the gate; nothing here removes, loosens, reorders, or skips a gate.
 check-fast: $(CHEAP_GATES) $(FAST_GATES)
 
-# The `guix system` / whole-OS tier — gates that boot a VM (QEMU/marionette/
-# SSH-harness), build/realize a full system or OCI *image*, or diff the system
-# image / generation roots. DELIBERATELY PARKED out of the default `check` while
-# td's focus is the user-space PACKAGE MANAGER (build/realize/store/recipes) — not
-# `guix system`. This is a human-directed scope decision (DESIGN §4.3 / directive
-# 3): the gates are NOT deleted or weakened, only moved to an on-demand tier; the
-# package-manager loop (`check`) keeps its OWN behavioral coverage (built tools
-# run, link-tests, the guix per-PACKAGE differential). Re-fold these back into
-# `check` when the OS becomes the focus. Run them on demand: `./check.sh check-system`.
+# The IMAGE tier — the gates that ship + run td-native OCI images (oci-native,
+# rust-userland-image). The old guix-system museum that filled this pool (guix
+# qcow2/docker images, generations, signed registry, placement, rootless-daemon
+# differentials) was RETIRED wholesale 2026-07-02 (human direction, directive 3:
+# "I never wanted the guix museum" — the guix operating-system was scaffolding,
+# not the product; td ships td-native images of td-built packages, and the
+# retained gates test exactly that). Run on demand: `./check.sh check-system`;
+# the daily backstop runs it too.
 check-system: $(CHEAP_GATES) $(SYSTEM_GATES)
 	@TD_HEAVY_GATES='$(SYSTEM_GATES)' sh tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt" || true
 
@@ -211,16 +208,3 @@ endif
 gate-timing-report:
 	@TD_HEAVY_GATES='$(HEAVY_GATES)' sh tools/gate-timing-report.sh "$(TD_GATE_TIMING_DIR)" "$(TD_GATE_TIMING_DIR)/latest.txt"
 
-# `rootless` needs NO special scheduling — it runs as an ordinary heavy gate
-# under -j2 (its only prereq is the generic last-cheap-gate one above). It USED to
-# be serialized alone at the tail because it SNAPSHOTTED the live store DB by
-# copying /var/guix/db: a concurrently-building gate's active WAL could tear the
-# non-root copy. Since the rootless-snapshot-race fix (PR #53) the gate instead
-# CONSTRUCTS its snapshot DB from the static closure (`td-builder store-register`
-# — mk/gates/130-rootless.mk / tests/rootless.sh, sealed against any live-DB
-# read), so the cross-check race is eliminated BY CONSTRUCTION, not mitigated by
-# ordering. Dropping the old `rootless: | $(filter-out rootless,$(HEAVY_GATES))`
-# constraint removes dead-weight tail latency (rootless is the single longest
-# heavy gate, so running it alone last was doubly wasteful) and weakens no gate:
-# rootless's validity guard, the daemon-oracle differential, and the live-DB-read
-# seal all still run and must pass.

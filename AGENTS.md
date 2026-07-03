@@ -265,10 +265,11 @@ on what*, and all working notes live in the git log + PR body.
   run, it does not replace it. `lint` + `check-fast` are the required checks; the
   full `./check.sh` stays the dev-machine gate (step 1).
   
-- **Exclusive landings:** changes to the shared spine — `system/td.scm` (frozen
-  oracle), `check.sh`, `Makefile`, `channels.scm`, `DIGESTS.md` — collide with
-  everyone. Announce in the PR description, land as small standalone PRs, expect
-  others to rebase. Oracle re-baselines and channel bumps are the canonical cases.
+- **Exclusive landings:** changes to the shared spine — `check.sh`, `Makefile`,
+  `channels.scm` — collide with everyone. Announce in the PR description, land as
+  small standalone PRs, expect others to rebase. Channel bumps are the canonical
+  case. (The frozen-oracle `system/td.scm` + `DIGESTS.md` spine entries were
+  retired with the guix-system gate tier, human direction 2026-07-02.)
   Note: **adding a gate is no longer an exclusive landing** — it's a new
   `mk/gates/<NNN>-<name>.mk` file, not a `Makefile` edit, so concurrent gate PRs
   don't collide (the core `Makefile` itself stays exclusive).
@@ -292,10 +293,15 @@ on what*, and all working notes live in the git log + PR body.
   gate PRs touch different files and don't collide on a shared list line. The `<NNN>`
   prefix sets order (cheap serial-first, heavy LPT for `-j2`); `make list-gates` prints
   the assembled pools.
-- `system/` — Guile system declarations. The frozen oracle lives at `system/td.scm`.
-- `tests/` — the package-manager/differential/coverage gate scripts and the
-  `guix system image` / OCI / placement gates. (The marionette `(gnu tests)`
-  VM-boot tests were removed 2026-06-29, human-directed.)
+- `system/` — the two load-bearing Guile modules: `td-builder.scm` (check.sh's
+  outer-sandbox prelude realizes it) and `td-build.scm` (the drv fixtures for the
+  realize/hermetic/daemon gates lower through it; retired with those fixtures).
+  (The guix operating-system declarations — the frozen oracle `td.scm` and the
+  typed/generation/place/registry/verity modules — were retired with the
+  guix-system gate tier, 2026-07-02, human-directed; the marionette `(gnu tests)`
+  VM-boot tests went earlier, 2026-06-29.)
+- `tests/` — the gate scripts: package-manager behavioral tests, locks, and the
+  drv fixtures for td's build-engine gates.
 - `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
   deliberately (exclusive landing), never silently.
 - `DESIGN.md` — the settled north star: scope (§0), the loop (§1), and the
@@ -310,8 +316,6 @@ on what*, and all working notes live in the git log + PR body.
   decides whether the local full `./check.sh` run is waived or still required;
   `--run` enforces escalation by running the full loop when required. Its own mapping
   guard is `td-builder affected-checks --self-test` (also a `cargo-test` `#[test]`).
-- `HISTORY.md` — completed-milestone record. `DIGESTS.md` — reproducibility record
-  (changes only on oracle re-baseline; exclusive landing).
 
 **Naming & formatting**
 

@@ -4,7 +4,7 @@
 # guix-free by tests/crate-free-build.sh. This SHIPS the td-built binary through
 # td's OWN image builder (`td-builder oci-image`, system-image-native) instead of
 # the guix `(gnu packages rust-apps)` object the shipped system used to carry (now
-# removed from system/td.scm + system/td-typed.scm) — so the shipped tool is td's
+# removed from the retired guix operating-system declarations) — so the shipped tool is td's
 # OWN bytes, not guix-built ones. The rust/gcc toolchain
 # LIBS the binary links (glibc, libgcc_s) stay guix for now (retired last by the
 # /td/store source-bootstrap); they are laid into the image at their /gnu/store
