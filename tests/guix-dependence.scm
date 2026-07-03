@@ -39,7 +39,6 @@
 (use-modules (guix store)
              (guix derivations)
              (guix packages)
-             (guix monads)
              (gnu packages)                 ;specification->package (the oracle)
              (srfi srfi-1)
              (json)                         ;json-string->scm (read recipes-meta.json)

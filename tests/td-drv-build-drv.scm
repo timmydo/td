@@ -3,7 +3,7 @@
 ;; derivation (corpus-independence's own-Rust-builder drv): td emits its `.drv`
 ;; (#22) and td-builder EXECUTES it in its own userns sandbox, daemon-equal.
 ;; The daemon builds it HERE so query-path-info returns the oracle's recorded
-;; facts; mirrors tests/td-builder-s3-drvs.scm / -s4-drv.scm.
+;; facts.
 ;;
 ;; Emits: HELLO_DRV, HELLO_OUT, HELLO_HASH (recorded NAR sha256, base16),
 ;; HELLO_NARSIZE, HELLO_DERIVER, HELLO_INPUT (each direct input's output path).

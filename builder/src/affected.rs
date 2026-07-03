@@ -310,10 +310,6 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
         "td-fetch" => sel.add_target("rust-fetch"),
         "td-feed" => sel.add_target("td-feed"),
         "td-subst" => sel.add_target("td-subst"),
-        // The `-perturbed` self-discrimination twins are exercised by the corpus
-        // build gates (drv-emit, their old guix-differential consumer, was retired
-        // with the museum tier 2026-07-02).
-        "perturbed" => add_build_gate_targets(root, sel),
         "pkg-config" => {
             sel.add_target("guix-dependence");
             sel.add_note("pkg-config is authored but excluded from td-built census until it has an own-builder gate.");
@@ -1334,7 +1330,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     if default_check_covers_target(root, "check-system") {
         fail("default coverage: check-system is not covered by plain ./check.sh".into());
     }
-    if default_check_covers_target(root, "oci-load") {
+    if default_check_covers_target(root, "oci-native") {
         fail("default coverage: system gate oci-load is not covered by plain ./check.sh".into());
     }
 

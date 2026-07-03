@@ -1,10 +1,6 @@
 # guix-dependence — measure td's BUILD-TIME independence from guix
-# (independence-metric track). The loop has many DIFFERENTIAL gates that test
-# td's own code against guix as the oracle (td-build*, drv-*, store-*), and the
-# `no-guix` gate (110) proves the shipped IMAGE carries no guix binary (RUNTIME
-# independence). What was missing is a NUMBER for the other axis — BUILD-TIME
-# independence: of everything needed to BUILD a target, how much does td build
-# itself vs pull from guix? This gate records that ratio.
+# (independence-metric track): of everything needed to BUILD the corpus, how
+# much does td build itself vs pull from guix? This gate records that NUMBER.
 #
 # A derivation is "td-reproducible" iff a non-perturbed tests/ts/recipe-<spec>.ts
 # exists AND td BUILDS it with its own Rust builder (proven by a td-build-* gate in
@@ -12,9 +8,10 @@
 # gates that used to ground this were retired with system/td-recipe.scm; pkg-config
 # is authored but not yet td-built (no own-builder gate) and is excluded.
 # tests/guix-dependence.scm walks the full build closure (derivation prerequisite
-# graph — lowering only, NO building) of two targets — the owned-recipe union and
-# the shipped system/td.scm — and emits a DETERMINISTIC census, compared verbatim
-# to tests/guix-dependence.expected.
+# graph — lowering only, NO building) of the owned-recipe union and emits a
+# DETERMINISTIC census, compared verbatim to tests/guix-dependence.expected. (The
+# old shipped-system target died with the guix-system museum tier — the guix
+# operating-system is not the product.)
 #
 # Snapshot, not threshold (the DIGESTS pattern): the number can only change by a
 # deliberate re-baseline, so landing a recipe RAISES it and the PR shows the
