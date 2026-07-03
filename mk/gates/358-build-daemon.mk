@@ -7,6 +7,10 @@
 # realize itself daemon-free. DURABLE/behavioral — no guix oracle leg.
 # Verified-red: make build_daemon::serve exit after one request → the 2nd request
 # reds (connection refused / no response).
+# Reply format: `OK <canon> <host> <hit|built>` — the hit|built suffix landed with
+# the machine-wide limiter (fe58ab5) and the old last-token parse here read "built"
+# as the output path (a latent red hidden while the daily runner was down, #268);
+# the recipe takes token 3 (the host-side output) like tests/cache-lib.sh does.
 HEAVY_GATES += build-daemon
 build-daemon:
 	@echo ">> build-daemon: one long-running td-builder serves multiple realize requests over a Unix socket (the loop's builder, not guix-daemon)"
@@ -30,7 +34,7 @@ build-daemon:
 	rb=`"$$tb" daemon-request "$$sock" "$$scratch/b.drv"` || { echo "FAIL: request B (PERSISTENCE — 2nd request to the SAME daemon) errored: $$rb" >&2; cat "$$scratch/daemon.log" >&2; exit 1; }; \
 	case "$$ra" in "OK "*) : ;; *) echo "FAIL: A response not OK: $$ra" >&2; exit 1 ;; esac; \
 	case "$$rb" in "OK "*) : ;; *) echo "FAIL: B response not OK: $$rb" >&2; exit 1 ;; esac; \
-	ha="$${ra##* }"; hb="$${rb##* }"; \
+	set -- $$ra; ha="$$3"; set -- $$rb; hb="$$3"; \
 	case "$$ha" in "$$scratch"/*) : ;; *) echo "FAIL: A output not under td's scratch store (not a td-owned build): $$ha" >&2; exit 1 ;; esac; \
 	grep -q "td-daemon-built:a" "$$ha/marker" || { echo "FAIL: A marker missing/wrong at $$ha/marker" >&2; exit 1; }; \
 	grep -q "td-daemon-built:b" "$$hb/marker" || { echo "FAIL: B marker missing/wrong at $$hb/marker" >&2; exit 1; }; \
