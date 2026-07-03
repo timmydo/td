@@ -306,9 +306,11 @@ on what*, and all working notes live in the git log + PR body.
   gate PRs touch different files and don't collide on a shared list line. The `<NNN>`
   prefix sets order (cheap serial-first, heavy LPT for `-j2`); `make list-gates` prints
   the assembled pools.
-- `system/` — the two load-bearing Guile modules: `td-builder.scm` (check.sh's
-  outer-sandbox prelude realizes it) and `td-build.scm` (the drv fixtures for the
-  realize/hermetic/daemon gates lower through it; retired with those fixtures).
+- `system/` — the two load-bearing Guile modules: `td-builder.scm` (the guix
+  td-builder package — `td-build.scm`'s fixtures use it as their builder/oracle;
+  check.sh's loop container is provisioned by the guix-free stage0 instead) and
+  `td-build.scm` (the drv fixtures for the realize/hermetic/daemon gates lower
+  through it; both modules retire with those fixtures).
   (The guix operating-system declarations — the frozen oracle `td.scm` and the
   typed/generation/place/registry/verity modules — were retired with the
   guix-system gate tier; the marionette `(gnu tests)` VM-boot tests went

@@ -1,10 +1,11 @@
 # tools/bootstrap-td-builder.sh — produce a STAGE0 td-builder from the checked-in
 # builder/ source using ONLY a Rust toolchain — NO guix, NO Guile, NO guix-daemon. This
-# breaks the bootstrap circularity at the heart of move-off-Guile §5: today the FIRST
-# td-builder comes from `guix build -e '(@ (system td-builder) td-builder)'` (guix's
-# cargo-build-system evaluating a Guile package), and rust-build only "self-hosts" because
-# that guix-built binary already exists to run build-recipe. Here cargo compiles td-builder
-# directly. td-builder has ZERO external crate deps (std-only — builder/Cargo.lock is one
+# breaks the bootstrap circularity at the heart of move-off-Guile §5: the FIRST
+# td-builder used to come from `guix build -e '(@ (system td-builder) td-builder)'` (guix's
+# cargo-build-system evaluating a Guile package), and rust-build only "self-hosted" because
+# that guix-built binary already existed to run build-recipe. Here cargo compiles td-builder
+# directly; since workstream E (#294) THIS is how every td-builder in the loop —
+# including check.sh's own container provider — comes to be. td-builder has ZERO external crate deps (std-only — builder/Cargo.lock is one
 # package), so the OFFLINE build needs only rustc/cargo + a gcc linker.
 #
 # The toolchain is provisioned guix-free (DESIGN.md §Provenance line 45: the whole userland

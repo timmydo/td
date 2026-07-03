@@ -18,7 +18,7 @@
 #   e.g.  sh tools/check-rung.sh .td-build-cache/sbdev1/gccmboot-harness.sh
 #
 # The sandbox + toolchain provisioning below is kept deliberately in sync with check.sh's (same
-# `td-builder host-sandbox --expose-cwd` container, same `guix shell` toolchain list — notably
+# stage0 td-builder container provider, same `guix shell` toolchain list — notably
 # WITHOUT bzip2, so the sandbox matches the gate's exactly and a missing-bzip2 bug still reproduces).
 set -eu
 
@@ -27,18 +27,23 @@ test -f "$harness" || { echo "check-rung: no such harness: $harness" >&2; exit 1
 shift
 root=$(cd "$(dirname "$0")/.." && pwd); cd "$root"
 
-tb=$(guix build -L . -e '(@ (system td-builder) td-builder)')/bin/td-builder
-[ -x "$tb" ] || { echo "check-rung: FATAL: could not build td-builder for the sandbox." >&2; exit 1; }
+# The container provider is the guix-free stage0 td-builder, exactly as in check.sh
+# (workstream E, #294): realize the pinned stage0 toolchain seed (warm-store no-op),
+# then place/reuse the stage0 under .td-build-cache/stage0.
+grep ' /gnu/store/' tests/td-builder-rust.lock | sed 's/^[^ ]* //' | xargs guix build >/dev/null \
+  || { echo "check-rung: FATAL: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }
+. tests/cache-lib.sh
+export TD_STAGE0_BASE="$root/.td-build-cache/stage0"
+load_stage0 || { echo "check-rung: FATAL: could not build the guix-free stage0 td-builder for the sandbox." >&2; exit 1; }
+tb="$TB"
 # Exactly check.sh's loop toolchain (no bzip2 — the sandbox must match the gate's).
 toolchain=$(guix shell --no-substitutes --no-offload \
     make bash coreutils sed grep findutils tar gzip crun util-linux sqlite \
     --search-paths | sed -n 's/^export PATH="\([^$]*\).*/\1/p' | head -n1)
 [ -n "$toolchain" ] || { echo "check-rung: FATAL: could not provision the loop toolchain PATH." >&2; exit 1; }
-guix_env=$(dirname "${toolchain%%:*}")
 
 echo ">> check-rung: $harness inside td-builder host-sandbox (cached chain reused; sandbox env matches the gate)" >&2
 exec env \
   PATH="$toolchain" \
   GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
-  GUIX_ENVIRONMENT="$guix_env" \
   "$tb" host-sandbox --expose-cwd -- sh "$harness" "$@"
