@@ -17,7 +17,7 @@
 //! well-formed). A BUILD_GATE like td-subst: builds td-subst from source, ordered after the
 //! build-recipes phase.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,6 +26,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> toolchain-subst-default: the loop FETCHES the lock-keyed /td/store toolchain by DEFAULT (resolve-toolchain.sh) — sig+StorePath+NarHash verified, runs the fetched-not-built artifact, FALLS BACK to from-seed on a cold store / wrong key (deliberate directive-1 relaxation: the daily suite is the sole from-seed authoritative build + publisher)"
 sh tests/toolchain-subst-default.sh

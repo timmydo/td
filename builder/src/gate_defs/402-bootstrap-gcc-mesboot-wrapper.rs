@@ -9,7 +9,7 @@
 //! (no /gnu/store in libc.so.6), content-addr, behavioral (plain wrapped gcc → dynamic /td/store → 42),
 //! structural (/td/store is the store, /gnu/store ABSENT). NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-gcc-mesboot-wrapper: a gcc-mesboot-wrapper at /td/store — a PLAIN gcc invocation produces a DYNAMIC /td/store binary that runs → 42, /gnu/store ABSENT (the unmodified-build-system primitive; source-bootstrap brick 6 rung 2)"
 sh tests/bootstrap-gcc-mesboot-wrapper.sh

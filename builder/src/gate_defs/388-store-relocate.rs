@@ -9,7 +9,7 @@
 //! guix's hello (removable oracle). guix is only the one-time relocation SOURCE; td-builder is
 //! the guix-free stage0. Heavy (stage0 + relocate a closure + a userns) → HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-relocate: relocate a dynamic package /gnu/store -> /td/store and run it with /gnu/store ABSENT (the break from guix for dynamic binaries; user-pm Phase 2)"
 sh tests/store-relocate.sh

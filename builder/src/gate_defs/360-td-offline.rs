@@ -11,7 +11,7 @@
 //! DOES see it) proves the probe is load-bearing, not vacuous. All-durable; no guix
 //! differential leg.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): offline probe — warm state would mask a network reach
         script: r##"
 echo ">> td-offline: td's OWN builder network-isolates a non-fixed-output build (realize the DRV_SANDBOX probe: only lo + egress fails); the dummy-interface control proves the check is load-bearing"
 set -euo pipefail; \

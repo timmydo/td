@@ -528,7 +528,10 @@ fn run(args: &[String]) -> Result<i32, String> {
     // The runner's knobs must cross the sandbox boundary (host-sandbox
     // preserves the TD_CHECK_ prefix): without this, TD_CHECK_SLOTS=… ./check.sh
     // would be silently dead and gate-run would always default to nproc.
-    for k in ["TD_CHECK_SLOTS", "TD_CHECK_SLOTS_DIR", "TD_CHECK_JOBS"] {
+    // TD_CHAIN_CACHE rides along for the same reason: `TD_CHAIN_CACHE= ./check.sh`
+    // (set-and-empty) is the operator's force-cold switch for the #317 warm
+    // chain-brick default — the daily backstop uses it to stay authoritative.
+    for k in ["TD_CHECK_SLOTS", "TD_CHECK_SLOTS_DIR", "TD_CHECK_JOBS", "TD_CHAIN_CACHE"] {
         if let Ok(v) = std::env::var(k) {
             child_envs.push((k.to_string(), v));
         }
@@ -569,9 +572,12 @@ fn run(args: &[String]) -> Result<i32, String> {
 
     // The machine-wide slot dir must exist HOST-SIDE so host-sandbox binds
     // ~/.td/build-daemon (same absolute path inside) — that bind is what makes
-    // the gate runner's slot pool machine-wide.
+    // the gate runner's slot pool machine-wide. The chain-brick cache (#317's
+    // flipped shared-state default) lives under the same bind for the same
+    // reason: every check sandbox sees it at the same absolute path, RW.
     if let Ok(home) = std::env::var("HOME") {
         let _ = std::fs::create_dir_all(Path::new(&home).join(".td/build-daemon/slots"));
+        let _ = std::fs::create_dir_all(Path::new(&home).join(".td/build-daemon/chain"));
     }
 
     let jobs = jobs_flag.unwrap_or_else(|| {

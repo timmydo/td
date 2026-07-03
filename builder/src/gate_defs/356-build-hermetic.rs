@@ -12,7 +12,7 @@
 //! drop the pivot_root → realize fails (build sees /var/guix); drop NEWPID → realize
 //! fails (build sees the launching td-builder in /proc).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): hermeticity probe — warm state would mask an undeclared input
         script: r##"
 echo ">> build-hermetic: a td-realized build cannot see /var/guix or the loop's process tree — sandbox::build pivot_roots into a minimal root AND unshares NEWPID"
 set -euo pipefail; \

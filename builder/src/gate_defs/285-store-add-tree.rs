@@ -15,7 +15,7 @@
 //! is already in the store (no fresh add, no WAL). Needs td-builder built, so it slots in
 //! the heavy pool.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -24,6 +24,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-add-tree: td CANONICALLY restores a directory tree into its OWN store + registers it (recursive addToStore, pure Rust, no daemon) — differential vs the daemon's interned source tree"
 set -euo pipefail; \

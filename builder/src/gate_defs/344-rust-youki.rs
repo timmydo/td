@@ -14,7 +14,7 @@
 //! OCI `create` subcommand (a real OCI runtime CLI).
 //! [DURABLE repro] td-builder check double-build agrees the 663-crate build is reproducible.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-youki: td builds 'youki' (0.6.0, 663 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); youki runs as an OCI runtime CLI; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

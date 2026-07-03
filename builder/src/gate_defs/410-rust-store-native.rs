@@ -8,7 +8,7 @@
 //! The /td/store-RUNTIME leg is PENDING the gcc lane's glibc-final (rust needs GLIBC_2.17; the
 //! /td/store glibc is 2.16.0).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-store-native: relink the upstream Rust 1.96.0 toolchain to /td/store (td's own ELF rewriter, no patchelf), intern guix-free; interp -> /td/store, zero /gnu/store; runtime leg pending glibc-final"
 sh tests/rust-store-native.sh

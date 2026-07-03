@@ -10,7 +10,7 @@
 //! only the one-time capture SOURCE (run on a guix host, like rust-seed/warm-seed). HEAVY +
 //! BUILD_GATE so it slots after the build-recipes fan-out (it reuses the warm stage0).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): the loop container stands up from a SEED alone
         script: r##"
 echo ">> harness-seed: td's loop container stands up from a SEED alone — host /gnu/store + the guix daemon absent, guix off PATH — and the loop toolchain runs inside it (the guix-less VM substrate)"
 sh tests/harness-seed.sh

@@ -13,7 +13,7 @@
 //! pinned-input, no-guix (no /gnu/store in libc.so.6 NOR gcc/cc1), content-addr, repro (intrinsic double-build,
 //! no guix oracle), behavioral (C + C++ vs glibc 2.41 → 42 from /td/store), structural. NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-glibc-241-store-native: a MODERN glibc 2.41 at /td/store — built from the seed by gcc 14.3.0 + binutils 2.44; gcc 14.3.0 links a DYNAMIC C AND C++ program against it that runs → 42, /gnu/store ABSENT (source-bootstrap brick 6/7, final-toolchain rung C — the full modern toolchain)"
 sh tests/bootstrap-glibc-241-store-native.sh

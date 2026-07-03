@@ -17,7 +17,7 @@
 //! host /gnu/store is NEVER touched. Needs td-builder + the corpus build → heavy pool + the
 //! build-recipes prelude.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,6 +26,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): GC-sweep semantics assert exact contents of a fresh fixture store
         script: r##"
 echo ">> store-gc-sweep: td DELETES the GC-dead paths from its OWN store + rewrites the DB to the live set (destructive GC sweep of a TD-BUILT closure, pure Rust, no daemon; guix off PATH) == td's own mark phase"
 set -euo pipefail; \

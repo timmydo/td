@@ -21,7 +21,7 @@
 //! Built up front by the parallel `build-recipes` phase (into the shared cache); this
 //! gate then cache-hits + memo-skips and only asserts behavior/oracle.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -30,6 +30,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &["make", "sed", "grep", "xz", "diffutils", "patch", "file", "coreutils", "gawk", "tar", "findutils", "bash"],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> toolchain-no-guix: td builds make + sed + grep + xz + diffutils + patch + file + coreutils + gawk + tar + findutils + bash via build-recipe (no guix/Guile in the build path); each runs, reproducible; gcc/glibc/binutils seed stays external (§5)"
 set -euo pipefail; \

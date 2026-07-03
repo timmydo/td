@@ -10,7 +10,7 @@
 //! guix at all — no process, no install. Heavy (stage0 + warmed seed + a hello build) →
 //! BUILD_GATES + HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): guix-free td shell standup from the frozen seed alone
         script: r##"
 echo ">> td-shell-seed: td shell builds + runs td's hello entirely from the frozen seed — no guix process AND no /var/guix (the user-facing command is fully guix-free)"
 sh tests/td-shell-seed.sh

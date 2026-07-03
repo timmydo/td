@@ -8,7 +8,7 @@
 //! gcc/guile/guix; no /gnu/store in patch), behavioral (make builds patch; patch runs + applies a
 //! diff), repro (byte-identical). NOT a BUILD_GATE. binutils-mesboot0 (patch-applied + make) is next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-patch: the tcc-built GNU Make compiles GNU patch 2.5.9 in the sandbox (SHELL override clears the no-/bin/sh segfault) — guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-patch.sh

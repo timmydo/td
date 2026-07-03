@@ -17,7 +17,7 @@
 //! guix (retired last — the /td/store source-bootstrap); `hello` is realized as the seed
 //! (the same way the corpus gates realize theirs), and its run-time closure is what td packs.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,6 +26,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> oci-native: td-builder builds a working OCI image from a store closure (no guix system image); skopeo loads it, crun runs it, reproducible"
 set -euo pipefail; \

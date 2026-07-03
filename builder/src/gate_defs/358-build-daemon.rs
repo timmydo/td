@@ -12,7 +12,7 @@
 //! as the output path (a latent red hidden while the daily runner was down, #268);
 //! the recipe takes token 3 (the host-side output) like tests/cache-lib.sh does.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> build-daemon: one long-running td-builder serves multiple realize requests over a Unix socket (the loop's builder, not guix-daemon)"
 set -euo pipefail; \

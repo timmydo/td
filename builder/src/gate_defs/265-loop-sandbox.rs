@@ -16,7 +16,7 @@
 //! including rootless and this one — run nested in td's sandbox. Heavy (a td-builder
 //! compile + a few nested-sandbox guix/bash probes), in the heavy pool.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -25,6 +25,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> loop-sandbox: td's OWN sandbox provides the hermetic loop surface (store ro + daemon socket + guix, host isolation, own PID + net namespaces) — intrinsic, no guix shell -C oracle"
 set -euo pipefail; \

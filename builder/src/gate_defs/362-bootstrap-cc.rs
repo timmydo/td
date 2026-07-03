@@ -10,7 +10,7 @@
 //! Standalone (a few hundred-KB assemblers/compilers, ~seconds) — NOT a BUILD_GATE, never pulls
 //! build-recipes. Brick 2 drives these tools over mes → tinycc; bricks 4-5 reach gcc/glibc at /td/store.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-cc: from the seed, td builds M2-Planet (a minimal C compiler) + mescc-tools; it compiles+links+RUNS a C program, guix-free + reproducible (source-bootstrap brick 1)"
 sh tests/bootstrap-cc.sh

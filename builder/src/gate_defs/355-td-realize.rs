@@ -11,7 +11,7 @@
 //! (removable when guix retires) — the output (path/NAR/size/deriver) is byte-identical to
 //! the daemon's build of the same drv.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> td-realize: td realizes the hello drv with no guix-daemon and no /var/guix/db — computes the input closure itself by CONTENT-SCANNING /gnu/store, builds in its userns sandbox, registers; output matches the daemon (oracle)"
 set -euo pipefail; \

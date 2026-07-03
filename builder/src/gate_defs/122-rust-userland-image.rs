@@ -17,7 +17,7 @@
 //! --version (the binary loads + runs self-contained — their function is the rust-<tool>
 //! gates' job).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -32,6 +32,7 @@ pub fn gate() -> GateDef {
         // red: "no td-recipe-eval sentinel" before this flag; green after).
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-userland-image: ship td-BUILT procs/fd/ripgrep/sd/eza/bat in td-NATIVE OCI images (td-builder oci-image, no guix system image); crun runs each from its image; reproducible"
 set -euo pipefail; \

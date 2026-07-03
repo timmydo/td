@@ -18,7 +18,7 @@
 //! runtime closure (`.drv`-free); the destructive SWEEP is store-gc-sweep, not here. Needs
 //! td-builder + the corpus build, so it slots in the heavy pool and the build-recipes prelude.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): GC semantics assert exact contents of a fresh fixture store
         script: r##"
 echo ">> store-gc: td computes the GC-reachable closure of a TD-BUILT hello from its OWN store DB (pure Rust, no daemon) == td's own content scan (guix off PATH; no guix gc)"
 set -euo pipefail; \

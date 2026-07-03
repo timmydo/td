@@ -7,7 +7,7 @@
 //! runs C → 42), repro (byte-identical gcc+cc1). NOT a BUILD_GATE. binutils-mesboot1 + make-mesboot 3.82
 //! then gcc-mesboot1 (4.6.4, needs gmp/mpfr/mpc) are next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -16,6 +16,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-gcc-mesboot0: the first gcc rebuilds GCC 2.95.3 against glibc — a gcc self-hosted on the real C library, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-gcc-mesboot0.sh

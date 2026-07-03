@@ -5814,10 +5814,13 @@ fn main() -> ExitCode {
                         // substitute resolver knobs (TD_SUBST_BIN/STORE/PUBKEY) the toolchain gates
                         // read to FETCH the lock-keyed closure instead of building from seed;
                         // TD_DAEMON_* = the shared build daemon's socket (TD_DAEMON_SOCKET) the
-                        // corpus build submits to.
+                        // corpus build submits to. TD_CHAIN_CACHE = the #317 warm chain-brick
+                        // knob — must survive into the sandbox so `TD_CHAIN_CACHE= ./check.sh`
+                        // (set-and-empty, the force-cold switch) reaches gate-run.
                         if k.starts_with("TD_CHECK_")
                             || k.starts_with("TD_SUBST_")
                             || k.starts_with("TD_DAEMON_")
+                            || k == "TD_CHAIN_CACHE"
                         {
                             extra_env.push((k, v));
                         }

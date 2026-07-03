@@ -33,7 +33,7 @@
 //! cores against build-recipes' fan-out). Not in BUILD_SPECS — the source is interned at
 //! gate time by td's OWN recursive addToStore (no `guix repl`), so it is self-contained.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -42,6 +42,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> cmake: td builds td-cmake-demo (a cmake C project) via build-recipe (buildSystem cmake) — .drv assembled + realized by td, guix/Guile off PATH; it runs, is reproducible, distinct from guix's cmake-build-system"
 set -euo pipefail; \

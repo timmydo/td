@@ -8,7 +8,7 @@
 //! gcc/cc1), behavioral (the modern gcc compiles+links+runs C → 42), repro (byte-identical gcc+cc1). NOT
 //! a BUILD_GATE. gcc-mesboot1 (+c++) then gcc-mesboot (4.7.4) are next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-gcc-core-mesboot1: the toolchain builds GCC 4.6.4 (C) with in-tree gmp/mpfr/mpc — a modern gcc from the seed, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-gcc-core-mesboot1.sh

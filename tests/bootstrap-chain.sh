@@ -868,14 +868,33 @@ build_glibc_241() {
 # bootstrap_modern_toolchain — verify the pinned inputs, then build the full chain from the seed and
 # finalize the modern toolchain (no /gnu/store, relocated glibc ld-scripts, kernel headers in glibc).
 bootstrap_modern_toolchain() {
+# #317 — the FLIPPED gate-state default: chain bricks persist MACHINE-WIDE, content-keyed and
+# NAR-verified, under TD_CHAIN_CACHE (the gate runner wires it per gate: Shared gates get
+# ~/.td/build-daemon/chain — bound RW into every check sandbox at the same absolute path —
+# and Private gates get "" = cold). Warm mode builds every brick under the KEYED cache dir
+# (TMPDIR moves there), so brick paths are stable and bricks are reused IN PLACE — later
+# bricks bake these paths (interp, symlinks), so a cached brick must never move — and the
+# EXIT cleanup trap is skipped (persistence is the point; the shared dir is the state).
+# Cold mode (TD_CHAIN_CACHE explicitly empty, or no flock/$TB) is the pre-#317 from-scratch
+# behavior, unchanged. The key covers this file + every seed lock/patch + the seed tree:
+# any recipe or pin change re-keys the chain, so sharing can never serve a stale brick.
+. tests/chain-cache-lib.sh
+TD_CHAIN_CACHE="${TD_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
+chain_cache_init chain tests/bootstrap-chain.sh seed/sources/*.lock seed/patches/* `find seed/stage0 -type f | sort`
 # brick8's elf-set-interp rewrites PT_INTERP IN PLACE (shrink-or-equal; td's elf.rs has no patchelf-style
 # grow). The toolchain binaries' build-time interp lives under TMPDIR (…/glibcsharedbuild/out/lib/ld-linux.so.2)
 # and MUST be >= the /td/store target interp (/td/store/<32-char-hash>-glibc-2.41/lib/ld-linux.so.2, 71 chars),
 # or the rewrite silently no-ops (|| true) and ld/as keep a build-dir interp that does NOT exist in
 # build-recipe's /td/store-only pivot sandbox → "C compiler cannot create executables". check.sh's default
-# TMPDIR=/tmp is too short (build interp ~58 < 71); pin a deliberately-long TMPDIR under the worktree's
-# .td-build-cache and HARD-ASSERT it stays long enough (so this can never silently regress).
-TMPDIR="$ROOT/.td-build-cache/chain-build-tmp-keep-interp-paths-long-for-elf-set-interp"; mkdir -p "$TMPDIR"; export TMPDIR
+# TMPDIR=/tmp is too short (build interp ~58 < 71); pin a deliberately-long TMPDIR (warm: under the keyed
+# machine-wide cache dir; cold: under the worktree's .td-build-cache) and HARD-ASSERT it stays long
+# enough (so this can never silently regress).
+if [ "$CHAIN_WARM" = 1 ]; then
+  TMPDIR="$CHAIN_DIR/tmp-keep-interp-paths-long-for-elf-set-interp"
+else
+  TMPDIR="$ROOT/.td-build-cache/chain-build-tmp-keep-interp-paths-long-for-elf-set-interp"
+fi
+mkdir -p "$TMPDIR"; export TMPDIR
 _ip="$TMPDIR/tmp.XXXXXXXX/glibcsharedbuild/out/lib/ld-linux.so.2"
 test ${#_ip} -ge 75 || fail "TMPDIR too short ($TMPDIR): build-dir interp ${#_ip}<75 chars would break elf-set-interp's in-place PT_INTERP rewrite to the /td/store glibc (71 chars)"
 # --- [pinned-input] all source tarballs + the vendored boot patch match their pins ----------------
@@ -961,50 +980,115 @@ echo "   [pinned-input] + binutils-2.44/glibc-2.41 (the modern toolchain final p
 # single-token wrapper survives the munging). The sysroot is passed as --with-build-sysroot=<glibc> +
 # --with-native-system-header-dir=/include (gcc 14 CONCATENATES the two; both absolute → a doubled header
 # path that breaks fixincludes). MAKEINFO=true. Installs via DESTDIR (prefix is the unwritable /td/store).
+# --- the brick ladder — warm: chain_hit reuses a NAR-verified brick at its recorded stable
+# path, else build + chain_save (recording ONLY the products later consumers read — some
+# whole trees are deliberately not recorded because a later brick ADDS files to them, e.g.
+# build_binutils/build_gcc copy crt into $TCCD/out/lib). Cold: every branch misses and this
+# is exactly the old straight-line ladder. cpath (the curated host-PATH symlink farm) is
+# rebuilt per run in both modes — it mirrors the CURRENT host PATH and costs nothing.
 cpath=`make_curated_path`
 for bad in gcc g++ cc guile guix; do test ! -e "$cpath/$bad" || fail "curated PATH still exposes '$bad'"; done
-tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
-mesp=`build_mes_prefix "$tc" "$cpath"` || fail "Mes (MesCC self-host) did not build/install"
-TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$cpath" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
-MK=`mktemp -d`/makebuild; build_make "$tc" "$cpath" "$mesp" "$TCCD" "$MK" || fail "tcc did not build GNU Make 3.80"
-PD=`mktemp -d`/patchbuild; build_patch "$cpath" "$mesp" "$TCCD" "$MK" "$PD" || fail "the tcc-built make did not build patch"
-BD=`mktemp -d`/binutilsbuild; build_binutils "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" || fail "the tcc-built make did not build binutils-mesboot0"
-GD=`mktemp -d`/gccbuild; build_gcc "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" "$GD" || fail "the toolchain did not build gcc 2.95.3"
-HD=`mktemp -d`/headers; build_headers "$mesp" "$HD" || fail "could not install the kernel headers"
-GLD=`mktemp -d`/glibcbuild; build_glibc "$cpath" "$GD" "$BD" "$TCCD" "$MK" "$PD" "$HD" "$GLD" || fail "the seed toolchain did not build glibc 2.2.5"
-G2=`mktemp -d`/gcc2build; build_gcc_mesboot0 "$cpath" "$GD" "$BD" "$GLD" "$HD" "$MK" "$PD" "$G2" || fail "the toolchain did not rebuild gcc 2.95.3 against glibc"
-B2=`mktemp -d`/binutils1build; build_binutils_mesboot1 "$cpath" "$G2" "$BD" "$GLD" "$MK" "$PD" "$B2" || fail "gcc-mesboot0 did not rebuild binutils against glibc"
-MM=`mktemp -d`/makemesbootbuild; build_make_mesboot "$cpath" "$G2" "$BD" "$GLD" "$MK" "$MM" || fail "gcc-mesboot0 did not rebuild GNU Make against glibc"
-GM1=`mktemp -d`/gccmesboot1build; build_gcc_mesboot1 "$cpath" "$G2" "$B2" "$MM" "$GLD" "$PD" "$GM1" || fail "the toolchain did not build GCC 4.6.4 (c,c++)"
-BMB=`mktemp -d`/binutilsmesbootbuild; build_binutils_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$PD" "$BMB" || fail "gcc-mesboot1 did not rebuild binutils"
-GAWKMB=`mktemp -d`/gawkmesbootbuild; build_gawk_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$GAWKMB" || fail "gcc-mesboot1 did not build GNU awk"
-GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GOUT" || fail "the toolchain did not build glibc 2.16.0"
-GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$cpath" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
-GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
-GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
-BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
-GLIBC241B=`mktemp -d`/glibc241build; build_glibc_241 "$cpath" "$GCC14B/stage/td/store/gcc-14.3.0" "$GSH/out" "$BMB244SB" "$GLIBC241B" || fail "the toolchain did not build the modern glibc 2.41"
-trap 'rm -rf "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$GLIBC241B"`" "`dirname "$cpath"`"' EXIT INT TERM
+if chain_hit tc; then tc=$CHAIN_PATH; else
+  tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
+  chain_save tc "$tc" "$tc/$A/bin" "$tc/$A/artifact"; fi
+if chain_hit mes; then mesp=$CHAIN_PATH; else
+  mesp=`build_mes_prefix "$tc" "$cpath"` || fail "Mes (MesCC self-host) did not build/install"
+  chain_save mes "$mesp" "$mesp"; fi
+if chain_hit tcc; then TCCD=$CHAIN_PATH; else
+  TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$cpath" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
+  chain_save tcc "$TCCD" "$TCCD/tcc" "$TCCD/libc.a" "$TCCD/libtcc1.a" "$TCCD/crt1.o" "$TCCD/crti.o" "$TCCD/crtn.o"; fi
+if chain_hit make; then MK=$CHAIN_PATH; else
+  MK=`mktemp -d`/makebuild; build_make "$tc" "$cpath" "$mesp" "$TCCD" "$MK" || fail "tcc did not build GNU Make 3.80"
+  chain_save make "$MK" "$MK/make"; fi
+if chain_hit patch; then PD=$CHAIN_PATH; else
+  PD=`mktemp -d`/patchbuild; build_patch "$cpath" "$mesp" "$TCCD" "$MK" "$PD" || fail "the tcc-built make did not build patch"
+  chain_save patch "$PD" "$PD/patch"; fi
+if chain_hit binutils-mesboot0; then BD=$CHAIN_PATH; else
+  BD=`mktemp -d`/binutilsbuild; build_binutils "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" || fail "the tcc-built make did not build binutils-mesboot0"
+  chain_save binutils-mesboot0 "$BD" "$BD/out"; fi
+if chain_hit gcc-core-mesboot0; then GD=$CHAIN_PATH; else
+  GD=`mktemp -d`/gccbuild; build_gcc "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" "$GD" || fail "the toolchain did not build gcc 2.95.3"
+  chain_save gcc-core-mesboot0 "$GD" "$GD/out"; fi
+if chain_hit headers; then HD=$CHAIN_PATH; else
+  HD=`mktemp -d`/headers; build_headers "$mesp" "$HD" || fail "could not install the kernel headers"
+  chain_save headers "$HD" "$HD/include"; fi
+if chain_hit glibc-mesboot0; then GLD=$CHAIN_PATH; else
+  GLD=`mktemp -d`/glibcbuild; build_glibc "$cpath" "$GD" "$BD" "$TCCD" "$MK" "$PD" "$HD" "$GLD" || fail "the seed toolchain did not build glibc 2.2.5"
+  chain_save glibc-mesboot0 "$GLD" "$GLD/out"; fi
+if chain_hit gcc-mesboot0; then G2=$CHAIN_PATH; else
+  G2=`mktemp -d`/gcc2build; build_gcc_mesboot0 "$cpath" "$GD" "$BD" "$GLD" "$HD" "$MK" "$PD" "$G2" || fail "the toolchain did not rebuild gcc 2.95.3 against glibc"
+  chain_save gcc-mesboot0 "$G2" "$G2/out"; fi
+if chain_hit binutils-mesboot1; then B2=$CHAIN_PATH; else
+  B2=`mktemp -d`/binutils1build; build_binutils_mesboot1 "$cpath" "$G2" "$BD" "$GLD" "$MK" "$PD" "$B2" || fail "gcc-mesboot0 did not rebuild binutils against glibc"
+  chain_save binutils-mesboot1 "$B2" "$B2/out"; fi
+if chain_hit make-mesboot; then MM=$CHAIN_PATH; else
+  MM=`mktemp -d`/makemesbootbuild; build_make_mesboot "$cpath" "$G2" "$BD" "$GLD" "$MK" "$MM" || fail "gcc-mesboot0 did not rebuild GNU Make against glibc"
+  chain_save make-mesboot "$MM" "$MM/make"; fi
+if chain_hit gcc-mesboot1; then GM1=$CHAIN_PATH; else
+  GM1=`mktemp -d`/gccmesboot1build; build_gcc_mesboot1 "$cpath" "$G2" "$B2" "$MM" "$GLD" "$PD" "$GM1" || fail "the toolchain did not build GCC 4.6.4 (c,c++)"
+  chain_save gcc-mesboot1 "$GM1" "$GM1/out"; fi
+if chain_hit binutils-mesboot; then BMB=$CHAIN_PATH; else
+  BMB=`mktemp -d`/binutilsmesbootbuild; build_binutils_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$PD" "$BMB" || fail "gcc-mesboot1 did not rebuild binutils"
+  chain_save binutils-mesboot "$BMB" "$BMB/out"; fi
+if chain_hit gawk-mesboot; then GAWKMB=$CHAIN_PATH; else
+  GAWKMB=`mktemp -d`/gawkmesbootbuild; build_gawk_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$GAWKMB" || fail "gcc-mesboot1 did not build GNU awk"
+  chain_save gawk-mesboot "$GAWKMB" "$GAWKMB/out"; fi
+if chain_hit glibc-mesboot; then GOUT=$CHAIN_PATH; else
+  GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GOUT" || fail "the toolchain did not build glibc 2.16.0"
+  chain_save glibc-mesboot "$GOUT" "$GOUT/out"; fi
+if chain_hit gcc-mesboot; then GMB=$CHAIN_PATH; else
+  GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$cpath" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
+  chain_save gcc-mesboot "$GMB" "$GMB/out"; fi
+if chain_hit glibc-mesboot-shared; then GSH=$CHAIN_PATH; else
+  GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
+  chain_save glibc-mesboot-shared "$GSH" "$GSH/out"; fi
+if chain_hit gcc-14; then GCC14B=$CHAIN_PATH; else
+  GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
+  chain_save gcc-14 "$GCC14B" "$GCC14B/stage/td/store/gcc-14.3.0"; fi
+if chain_hit binutils-244; then BMB244SB=$CHAIN_PATH; else
+  BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
+  chain_save binutils-244 "$BMB244SB" "$BMB244SB"; fi
+if chain_hit glibc-241; then GLIBC241B=$CHAIN_PATH; GLIBC241="$GLIBC241B/stage/td/store/glibc-2.41"; else
+  GLIBC241B=`mktemp -d`/glibc241build; build_glibc_241 "$cpath" "$GCC14B/stage/td/store/gcc-14.3.0" "$GSH/out" "$BMB244SB" "$GLIBC241B" || fail "the toolchain did not build the modern glibc 2.41"
+  GLIBC241="$GLIBC241B/stage/td/store/glibc-2.41"
+  # finalize BEFORE recording, so a reused brick is already relocated+header-complete:
+  # relocate glibc 2.41's ld scripts: strip the configure PREFIX path to bare names (ld finds them via -L).
+  for so in "$GLIBC241/lib/"*.so; do
+    if head -c20 "$so" 2>/dev/null | grep -q 'GNU ld script' 2>/dev/null; then sed -i "s,/td/store/glibc-2.41/lib/,,g; s,$GLIBC241/lib/,,g" "$so"; fi
+  done
+  # BRICK 8: glibc's headers `#include <linux/*>`/`<asm/*>` (kernel UAPI) — add the SAME pure kernel headers the
+  # glibc build used into glibc 2.41's include dir so a --sysroot corpus build finds them (else bits/local_lim.h
+  # → "linux/limits.h: No such file"). Harmless for the C/C++ verify below (it includes no kernel headers).
+  khb8=`mktemp -d`; tar -xzf "$KH_TB" -C "$khb8" || fail "brick8: kernel headers unpack failed"
+  for kd in linux asm asm-generic mtd rdma scsi sound video xen drm misc; do test -d "$khb8/$kd" && cp -rn "$khb8/$kd" "$GLIBC241/include/" 2>/dev/null || true; done
+  chain_save glibc-241 "$GLIBC241B" "$GLIBC241"; fi
+# the bricks are recorded — concurrent agents blocked on the key lock can now cache-hit.
+chain_done
+# Warm mode: point TMPDIR back at the WORKTREE-local dir for the caller's own scratch
+# (consumer gates mktemp multi-GB assembly dirs and do not always clean them — that litter
+# belongs to the worktree, not the machine-wide cache). Brick-internal references to the
+# cache TMPDIR (a cached script's shebang into a prior run's curated-path dir) stay valid
+# because warm mode never deletes ANYTHING under $CHAIN_DIR — evict whole keys only, never
+# prune inside one.
+if [ "$CHAIN_WARM" = 1 ]; then
+  TMPDIR="$ROOT/.td-build-cache/chain-build-tmp-keep-interp-paths-long-for-elf-set-interp"; mkdir -p "$TMPDIR"; export TMPDIR
+fi
+# COLD only: the from-scratch ladder cleans up after itself exactly as before. Warm bricks
+# PERSIST (that is the point) — they live under the machine-wide keyed cache dir, not the
+# worktree.
+test "$CHAIN_WARM" = 1 || trap 'rm -rf "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$GLIBC241B"`" "`dirname "$cpath"`"' EXIT INT TERM
 
 GCC14="$GCC14B/stage/td/store/gcc-14.3.0"
 GLIBC241="$GLIBC241B/stage/td/store/glibc-2.41"
 CC1=`ls "$GCC14"/libexec/gcc/i686-unknown-linux-gnu/14.3.0/cc1 2>/dev/null || true`
 
-# --- [no-guix] the modern glibc 2.41 + gcc 14 carry no guix bytes -----------------------------------
+# --- [no-guix] the modern glibc 2.41 + gcc 14 carry no guix bytes — RE-ASSERTED on every
+# run, warm or cold (reuse skips redundant rebuilds, never the gate's assertions) ---------
 test -e "$GLIBC241/lib/libc.so.6" -a -e "$GLIBC241/lib/ld-linux.so.2" || fail "glibc 2.41 missing libc.so.6/ld-linux.so.2"
 for b in "$GLIBC241/lib/libc.so.6" "$GCC14/bin/gcc" "$CC1"; do
   test -n "$b" -a -e "$b" || fail "output missing ($b)"
   if grep -q -a '/gnu/store' "$b"; then fail "$b contains /gnu/store bytes"; fi
 done
 echo "   [no-guix] seed → … → gcc 14.3.0 + binutils 2.44 → MODERN glibc 2.41; no /gnu/store in libc.so.6 / gcc / cc1"
-# relocate glibc 2.41's ld scripts: strip the configure PREFIX path to bare names (ld finds them via -L).
-for so in "$GLIBC241/lib/"*.so; do
-  if head -c20 "$so" 2>/dev/null | grep -q 'GNU ld script' 2>/dev/null; then sed -i "s,/td/store/glibc-2.41/lib/,,g; s,$GLIBC241/lib/,,g" "$so"; fi
-done
-# BRICK 8: glibc's headers `#include <linux/*>`/`<asm/*>` (kernel UAPI) — add the SAME pure kernel headers the
-# glibc build used into glibc 2.41's include dir so a --sysroot corpus build finds them (else bits/local_lim.h
-# → "linux/limits.h: No such file"). Harmless for the C/C++ verify above (it includes no kernel headers).
-khb8=`mktemp -d`; tar -xzf "$KH_TB" -C "$khb8" || fail "brick8: kernel headers unpack failed"
-for kd in linux asm asm-generic mtd rdma scsi sound video xen drm misc; do test -d "$khb8/$kd" && cp -rn "$khb8/$kd" "$GLIBC241/include/" 2>/dev/null || true; done
-test -e "$GLIBC241/include/linux/limits.h" || fail "brick8: kernel headers not added to glibc include"
+test -e "$GLIBC241/include/linux/limits.h" || fail "brick8: kernel headers not present in glibc include"
 }

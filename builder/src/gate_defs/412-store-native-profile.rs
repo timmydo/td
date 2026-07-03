@@ -5,7 +5,7 @@
 //! toolchain builds (#192/#197) joins this same mechanism.
 //! Heavy: builds the guix-free stage0 td-builder + runs a rootless userns (like store-ns 386).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -14,6 +14,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-native-profile: td-builder profile --store-native builds a profile of logical /td/store links that resolve + run in the store-ns own-root, /gnu/store ABSENT (the .scm-free userspace assembly mechanism)"
 sh tests/store-native-profile.sh

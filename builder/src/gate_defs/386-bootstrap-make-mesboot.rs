@@ -8,7 +8,7 @@
 //! runs a recipe → BUILT), repro (byte-identical make). NOT a BUILD_GATE. gcc-mesboot1 (4.6.4, needs
 //! gmp/mpfr/mpc) is next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-make-mesboot: gcc-mesboot0 rebuilds GNU Make 3.82 against glibc — a glibc-linked make that does its job, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-make-mesboot.sh

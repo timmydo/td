@@ -33,7 +33,7 @@
 //! all cores concurrently with build-recipes' fan-out). td-builder is NOT in BUILD_SPECS
 //! — its lock is extended with the freshly-interned source, so it stays self-contained.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -42,6 +42,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-build: td self-hosts td-builder via build-recipe (buildSystem rust) — .drv assembled + realized by td, guix/Guile off PATH; it runs and is reproducible"
 set -euo pipefail; \

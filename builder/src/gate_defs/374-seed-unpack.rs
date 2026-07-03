@@ -9,7 +9,7 @@
 //! from with no guix install (PR3: build hello from it). td-builder is the guix-free stage0;
 //! guix is only the capture source + the removable oracle. Heavy (stage0 + a real tar).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): restores a frozen seed into a FRESH store and asserts registration
         script: r##"
 echo ">> seed-unpack: td-builder restores a frozen seed tarball into a td store + registers it (NAR-verified, no daemon); td's reader reads the complete closure back out (North-Star step 2 PR2)"
 sh tests/seed-unpack.sh

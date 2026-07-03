@@ -14,7 +14,7 @@
 //! [DURABLE behavioral] td BUILDS td-fetch from the interned vendor tree and it runs.
 //! [DURABLE repro] td-builder check double-build agrees the build is reproducible.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-fetch: td builds td-fetch with crates provisioned GUIX-FREE (td-fetched + interned vendor tree, TD_VENDOR_DIR), no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

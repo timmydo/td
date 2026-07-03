@@ -37,7 +37,7 @@
 //! builder unreachable — `closure item … (on disk …): No such file`, the build fails —
 //! proving stage0 is genuinely fed into the build FROM td's own store, not /gnu/store.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -46,6 +46,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-build: td places its stage0 builder into its OWN store and the loop BUILDS hello with it (the builder-of-record is a binary guix never produced) — runs, reproducible, distinct from guix"
 set -euo pipefail; \

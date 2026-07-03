@@ -14,7 +14,7 @@
 //! libc.so.6 NOR ld), content-addr, repro (intrinsic double-build, no guix oracle), behavioral (modern as/ld
 //! 2.44 run+link → 42 from /td/store), structural (/td/store is the store, /gnu/store ABSENT). NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-binutils-244-store-native: the /td/store toolchain builds MODERN binutils 2.44 from source; as/ld run from /td/store, report 2.44, and link a program → 42, /gnu/store ABSENT (source-bootstrap brick 6/7, final-toolchain rung A)"
 sh tests/bootstrap-binutils-244-store-native.sh

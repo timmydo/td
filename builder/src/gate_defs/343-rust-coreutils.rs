@@ -12,7 +12,7 @@
 //! [DURABLE behavioral] the ONE multicall `coreutils` binary dispatches mkdir/cp/cat/ls/mv/rm.
 //! [DURABLE repro] td-builder check double-build agrees the 507-crate build is reproducible.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-coreutils: td builds uutils-coreutils (coreutils 0.9.0, 507 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); the multicall binary dispatches util subcommands; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

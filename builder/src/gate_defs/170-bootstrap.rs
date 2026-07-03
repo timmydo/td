@@ -47,7 +47,7 @@
 //! next brick (build-recipe references the builder by store path, so it needs daemon-free
 //! placement of the builder).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -56,6 +56,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap: td compiles its OWN stage0 td-builder from source with the pinned toolchain — no guix, no Guile — and it runs, is bit-reproducible, and behaviorally equals the guix-built builder"
 set -euo pipefail; \

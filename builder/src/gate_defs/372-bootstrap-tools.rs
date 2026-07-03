@@ -7,7 +7,7 @@
 //! 1.2.4 runs; tcc-0.9.27 compiles+runs C → 33), repro (each byte-identical). NOT a BUILD_GATE.
 //! patch + binutils (make-driven) build on these next; then gcc-2.95 → gcc-4.7 → glibc.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -16,6 +16,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-tools: from the seed, the tcc from brick 4 compiles mesboot tools toward binutils — gzip 1.2.4 + the fuller pristine tcc 0.9.27, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-tools.sh

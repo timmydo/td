@@ -34,7 +34,7 @@
 //! build doesn't oversubscribe cores, and it depends on the td-recipe-eval that build-recipes'
 //! prelude builds. Not in BUILD_SPECS — the source is interned at gate time.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -43,6 +43,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> td-subst: td builds td-subst (its own substitute server) from source via build-recipe (offline, guix/Guile off PATH); it selftests the signed serve/fetch over loopback, proves fetch-don't-build end-to-end byte-identical, proves the build-recipe CONSUMER HOOK substitutes (CACHE=subst) instead of rebuilding, and is reproducible"
 set -euo pipefail; \

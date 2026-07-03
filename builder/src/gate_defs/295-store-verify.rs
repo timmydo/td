@@ -17,7 +17,7 @@
 //! Boundary: td READS + writes only its OWN scratch store/DB/probe — host infra stays
 //! immutable. Needs td-builder + the corpus build → heavy pool + the build-recipes prelude.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,6 +26,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-verify: td VERIFIES store integrity of a TD-BUILT closure (re-hash vs the recorded registration) + DETECTS a one-byte corruption — the daemon's guix gc --verify --check-contents, pure Rust, no daemon (guix off PATH)"
 set -euo pipefail; \

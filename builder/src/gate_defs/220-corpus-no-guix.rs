@@ -28,7 +28,7 @@
 //! (recipes/src/recipes/hello-perturbed.rs), so it assembles a DISTINCT .drv —
 //! load-bearing here.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -37,6 +37,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &["hello"],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> corpus-no-guix: hello builds via td-builder build-recipe (no guix/Guile in the path), runs, reproducible (td-builder check); self-discriminated by hello-perturbed"
 set -euo pipefail; \

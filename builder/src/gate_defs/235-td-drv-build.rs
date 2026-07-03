@@ -34,7 +34,7 @@
 //! prelude warms hello + td-recipe-eval. Per-gate scratch (.td-drv-build-scratch), removed on
 //! green, kept on red for triage.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -43,6 +43,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> td-drv-build: td-builder EMITS a canonical hello .drv (round-trip byte-identical) AND EXECUTES the emitted .drv in its own userns sandbox (td-builder build) → the canonical output; guix off PATH, no guile"
 set -euo pipefail; \

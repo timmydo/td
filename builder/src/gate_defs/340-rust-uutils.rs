@@ -12,7 +12,7 @@
 //! [DURABLE behavioral] the built `cat` round-trips a file AND a stdin pipe — it works as cat.
 //! [DURABLE repro] td-builder check double-build agrees the 139-crate build is reproducible.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-uutils: td builds the uutils 'cat' (uu_cat 0.9.0, 139 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); it works as cat (file + stdin); reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

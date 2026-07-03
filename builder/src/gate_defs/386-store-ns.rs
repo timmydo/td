@@ -9,7 +9,7 @@
 //! /td/store in Phase 2 (static sidesteps relocation here). td-builder is the guix-free stage0.
 //! Heavy (stage0 + a nested userns) → HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-ns: td owns its own root with its store at /td/store — a binary runs from /td/store, /gnu/store ABSENT (rootless, unmixed from guix; user-pm Phase 0)"
 sh tests/store-ns.sh

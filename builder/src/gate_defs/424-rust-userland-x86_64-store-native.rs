@@ -15,7 +15,7 @@
 //! NOTE (#258 dev gate): this is the mechanism gate; the atomic cutover folds it into the rust-ripgrep
 //! gate (347) and deletes the guix rust/gcc-toolchain from tests/ripgrep.lock.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -24,6 +24,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-userland-x86_64-store-native: build ripgrep (rg 14.1.1) with the NATIVE x86_64 /td/store toolchain (guix rust + gcc-toolchain removed), run rg in a /gnu/store-absent own-root, grep a needle, reproducible"
 GUIX="$TD_GUIX" ROOT="$PWD" sh tests/rust-x86_64-userland-store-native.sh

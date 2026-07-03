@@ -19,7 +19,7 @@
 //! undocumented growth. Static, offline, no guix invoked => cheap pool, fails fast.
 //! Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface  (commit the .expected).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -28,6 +28,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> guix-surface: ratchet td's guix-as-packager seed surface (move-off-Guile §5) — new seeds are td-placed fixed-output fetches, not guix-built packages; the snapshot may only shrink"
 sh tests/guix-surface.sh

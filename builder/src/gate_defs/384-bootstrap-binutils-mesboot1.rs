@@ -7,7 +7,7 @@
 //! no /gnu/store in as/ld/ar), behavioral (the new as+ld assemble+link+run C → 42), repro (byte-identical
 //! as+ld). NOT a BUILD_GATE. make-mesboot 3.82 then gcc-mesboot1 (4.6.4, needs gmp/mpfr/mpc) are next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -16,6 +16,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-binutils-mesboot1: gcc-mesboot0 rebuilds GNU Binutils 2.20.1a against glibc — a gcc-built, glibc-linked as+ld, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-binutils-mesboot1.sh

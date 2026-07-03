@@ -17,7 +17,7 @@
 //! rungs live in tests/x86_64-cross-fns.sh; the native binutils/gcc BUILD is the Rust recipe `td-builder
 //! toolchain-recipe x86_64-native` (builder/src/toolchain_x86_64.rs); the fetch short-circuit in tests/x86_64-subst-lib.sh.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,6 +26,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-x86_64-runtime-store-native: build the NATIVE x86_64 gcc/binutils (rung X2), relink the upstream x86_64 Rust 1.96.0 toolchain to /td/store WITH its rustlib sysroot, and in the store-ns own-root RUN rustc/cargo AND COMPILE hello.rs via the /td/store native gcc into a DYNAMIC ELF64 binary that RUNS → 42, /gnu/store ABSENT (the rust-store-native runtime+COMPILE leg — the DESIGN 'retarget rust to /td/store' arrow)"
 sh tests/rust-x86_64-runtime-store-native.sh

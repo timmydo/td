@@ -13,7 +13,7 @@
 //! differential (distinct store path, same greeting). Build gate (stage0 + td-recipe-eval
 //! via the build-recipes prelude) → BUILD_GATES + HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> td-shell: td-builder shell builds a td package (no guix) and runs a command with it on PATH (North-Star step 1; durable behavioral + td-built + load-bearing, removable guix differential)"
 sh tests/td-shell.sh

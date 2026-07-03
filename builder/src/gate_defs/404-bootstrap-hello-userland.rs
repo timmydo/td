@@ -9,7 +9,7 @@
 //! libc.so.6 NOR in the built hello), content-addr, behavioral (hello built from source runs → "Hello,
 //! world!"), structural (/td/store is the store, /gnu/store ABSENT). NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-hello-userland: the /td/store toolchain compiles GNU hello 2.10 from source (configure+make); the dynamic binary runs from /td/store → \"Hello, world!\", /gnu/store ABSENT (source-bootstrap brick 6 rung 3)"
 sh tests/bootstrap-hello-userland.sh

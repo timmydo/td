@@ -8,7 +8,7 @@
 //! → 42), repro (byte-identical as+ld+gawk). NOT a BUILD_GATE. glibc-mesboot (2.16.0) then gcc-mesboot
 //! (GCC 4.9, the final mesboot gcc) are next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-binutils-gawk-mesboot: the gcc-mesboot1 toolchain rebuilds GNU Binutils 2.20.1a + builds GNU awk 3.1.8 — guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-binutils-gawk-mesboot.sh

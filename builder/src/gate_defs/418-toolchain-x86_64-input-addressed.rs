@@ -15,7 +15,7 @@
 //! Heavy: builds the guix-free stage0 td-builder + runs a rootless userns (like #204) — NOT a
 //! ~90-min toolchain build, NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -24,6 +24,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> toolchain-x86_64-input-addressed: the x86_64 /td/store toolchain gets a STABLE input-addressed key (td-toolchain-x86_64.lock + toolchain-key/path) — sharing i686's source set with ARCH as the sole discriminator, predictable from the lock across non-reproducible rebuilds; a real binary placed there runs, /gnu/store absent (the x86_64 parallel of #204 — the x86_64 td-subst chain-caching prereq)"
 sh tests/toolchain-x86_64-input-addressed.sh

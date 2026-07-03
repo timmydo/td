@@ -17,7 +17,7 @@
 //! index and the staged closure collapsed to the lock entries — coreutils' gmp dropped,
 //! `expr` died on libgmp.so.10. Fixed by seed-canonical-prefix + recanonicalize_candidates.)
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,6 +26,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-persist: the loop builds a corpus package at /td/store into a persistent store + DB (build-into), and a SEPARATE invocation SKIPS the rebuild reading it back (CACHE=persist), running it own-root /gnu/store-absent — incremental /td/store, wired into the build path"
 sh tests/store-persist.sh

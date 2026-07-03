@@ -52,7 +52,7 @@
 //! full td-ci validate job — both carry rust. Promote to FAST later by adding the
 //! rust+builder closure to ci/lower-fast-drvs.sh (grows the fast image).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -61,6 +61,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> cargo-test: engine crates lint clean (cargo clippy: no panic surface, .get over indexing, unsafe confined) + td-builder unit tests (cargo test) — offline, guix-free toolchain (tools/provision-{rust,cc}.sh)"
 set -euo pipefail; \

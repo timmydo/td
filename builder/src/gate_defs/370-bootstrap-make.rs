@@ -7,7 +7,7 @@
 //! reports GNU Make 3.80), repro (byte-identical make). Standalone (~minutes of the brick 0-4 chain +
 //! make) — NOT a BUILD_GATE. Brick 5 next rungs: binutils, then gcc-2.95 with tcc + make + binutils.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -16,6 +16,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-make: from the seed, the tcc from brick 4 compiles GNU Make 3.80 — its first real-program build, guix-free + reproducible (source-bootstrap brick 5, first rung)"
 sh tests/bootstrap-make.sh

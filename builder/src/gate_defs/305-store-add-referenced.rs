@@ -20,7 +20,7 @@
 //! `store-query references`). Boundary: td writes only its OWN scratch store/DB. Needs
 //! td-builder + the corpus build → heavy pool + the build-recipes prelude.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -29,6 +29,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-add-referenced: td ADDS a td-ASSEMBLED hello .drv WITH references to its OWN store + registers the references (pure Rust, no daemon; guix off PATH) — a round-trip of the folded references"
 set -euo pipefail; \
