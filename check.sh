@@ -212,14 +212,11 @@ done
 # toolchain, guix/Guile off the build PATH, self-placed via its own
 # store-add-builder), now the DEFAULT loop substrate (workstream E, #294):
 # `guix build -e '(@ (system td-builder) td-builder)'` no longer provisions the
-# loop container anywhere. Realize the pinned stage0 toolchain seed first so a
-# cold machine can compile stage0 (warm-store no-op; same idiom as gate 175).
-grep ' /gnu/store/' tests/td-builder-rust.lock | sed 's/^[^ ]* //' | xargs guix build >/dev/null \
-  || { echo "check.sh: FATAL: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }
+# loop container anywhere. provision_stage0 (tests/cache-lib.sh) realizes the
+# pinned seed only when a path is missing (host-side warming — the cold-machine
+# case; the warm path spawns no guix) and loads the placed stage0 as $TB.
 . tests/cache-lib.sh
-export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"
-load_stage0 || { echo "check.sh: FATAL: could not build the guix-free stage0 td-builder for the loop sandbox." >&2; exit 1; }
-tb="$TB"
+provision_stage0 || { echo "check.sh: FATAL: could not provision the guix-free stage0 td-builder for the loop sandbox." >&2; exit 1; }
 # The packages guix shell -C would put on PATH, provisioned as a profile (no
 # container); --search-paths prints the `export PATH="…"` line we splice in. The
 # leading non-`$` run is the profile bin:sbin; the trailing `${PATH:+:}$PATH` (a
@@ -352,4 +349,4 @@ command -v ionice >/dev/null 2>&1 && nice_wrap="$nice_wrap ionice -c2 -n7"
 exec $nice_wrap env \
   PATH="$hostguix_dir:$toolchain" \
   GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
-  "$tb" host-sandbox --expose-cwd -- make -j"$jobs" --output-sync=target "$@"
+  "$TB" host-sandbox --expose-cwd -- make -j"$jobs" --output-sync=target "$@"

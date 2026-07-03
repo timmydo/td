@@ -87,9 +87,12 @@ jobs:
   check-fast:
     # Fast feedback gate: import the SMALL td-ci-fast store image and run the
     # UNMODIFIED offline ./check.sh check-fast (Makefile FAST_GATES = the cheap
-    # derivation-level gates + ts). Same mechanism as the (now local-only) full
-    # check, but a ~4G image (fast-tier closure: no qemu/marionette, no rust/boa,
-    # no qcow2) and no KVM — imports in minutes and runs the real hermetic loop.
+    # derivation-level gates). Same mechanism as the (now local-only) full
+    # check, but a small image (fast-tier closure: no qemu/marionette, no qcow2;
+    # it DOES carry the pinned stage0 rust seed — tests/td-builder-rust.lock —
+    # since check.sh's loop container is provisioned by the cargo-compiled
+    # stage0 td-builder on every tier, workstream E #294) and no KVM — imports
+    # in minutes and runs the real hermetic loop.
     #
     # Image: ghcr.io/<owner>/td-ci-fast:<pin>, with the bot-namespace image as
     # the current source (built on a dev box with ci/build-ci-image.sh
@@ -193,8 +196,10 @@ jobs:
     # framing, the SQLite store-db reader, ref-scan, and the userns sandbox helpers
     # (builder/src/*.rs #[test]s). This is the heart of td (the thing replacing guix),
     # yet it was in NO required CI check: `check-fast` runs the small td-ci-fast store
-    # image, which carries NO rust toolchain (no rust/boa), so it cannot `cargo test`.
-    # This job closes that gap WITHOUT growing the image: the builder crate is
+    # image, which historically carried no rust toolchain (it now ships the pinned
+    # stage0 seed for check.sh's loop-container compile, #294 — but importing it just
+    # to `cargo test` would still be minutes of image import for a seconds-long job).
+    # This job closes that gap WITHOUT the image: the builder crate is
     # dependency-free (builder/Cargo.toml has no [dependencies]), so the runner's
     # pre-installed Rust runs `cargo test --frozen` (= --locked --offline) with no
     # network, no guix, no store image — the same unit tests the dev-machine
