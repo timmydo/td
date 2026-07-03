@@ -134,17 +134,55 @@ pub fn serve(
     // would grow without bound and leave zombie threads. SHUTDOWN instead drains via this
     // counter so no in-flight build is abandoned.
     let inflight = Arc::new(AtomicUsize::new(0));
+    // The request read below runs ON the accept thread (cheap by design), so a client
+    // that connects and never delivers a full line would otherwise wedge the WHOLE
+    // machine-wide daemon (head-of-line): observed live when a gate's kill-cascade test
+    // (sandbox-hardening) SIGKILLs process trees while build-recipes' submitters are
+    // connecting — a dying client can leave a byte-less connection open via an inherited
+    // fd. Bound the read; a connection that times out, errors, or EOFs is DROPPED (with
+    // a log line) and the daemon serves the next one. Only an explicit "SHUTDOWN" line
+    // stops the daemon — an empty read is a dead client, never a shutdown request.
+    let read_timeout = std::env::var("TD_DAEMON_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30_000);
     for conn in listener.incoming() {
-        let conn = conn.map_err(|e| format!("accept: {e}"))?;
+        let conn = match conn {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("td-builder: daemon: accept error (serving on): {e}");
+                continue;
+            }
+        };
+        let _ = conn.set_read_timeout(Some(std::time::Duration::from_millis(read_timeout)));
         // Read the request line; scope the reader's borrow before moving `conn`.
         let req = {
             let mut line = String::new();
-            BufReader::new(&conn)
-                .read_line(&mut line)
-                .map_err(|e| e.to_string())?;
-            line.trim().to_string()
+            match BufReader::new(&conn).read_line(&mut line) {
+                Ok(0) => {
+                    eprintln!(
+                        "td-builder: daemon: dropped an empty connection (client gone before sending a request)"
+                    );
+                    continue;
+                }
+                Ok(_) => line.trim().to_string(),
+                Err(e) => {
+                    eprintln!(
+                        "td-builder: daemon: dropped a connection without a readable request within {read_timeout}ms: {e}"
+                    );
+                    continue;
+                }
+            }
         };
-        if req.is_empty() || req == "SHUTDOWN" {
+        // The reply is written by the worker thread when the build ends — that can be
+        // minutes/hours later, long past any read deadline; the timeout was only for
+        // the request read.
+        let _ = conn.set_read_timeout(None);
+        if req.is_empty() {
+            eprintln!("td-builder: daemon: dropped a blank request line");
+            continue;
+        }
+        if req == "SHUTDOWN" {
             // Drain in-flight builds before exiting so none is killed mid-realize.
             while inflight.load(Ordering::SeqCst) > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -253,6 +291,58 @@ mod tests {
             budget,
             "peak concurrency must reach exactly the budget — not exceed it, not stay serial"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dead and silent connections must not stop or wedge the daemon (the machine-wide
+    /// serializer): (a) a client that connects and dies without sending a request (EOF)
+    /// used to be treated as SHUTDOWN — the daemon exited; (b) a client that connects and
+    /// stays SILENT used to wedge the accept thread forever (blocking read, no timeout —
+    /// observed live when sandbox-hardening's kill-cascade test SIGKILLed process trees
+    /// while build-recipes' submitters were connecting). With the fix, both connections
+    /// are dropped and a real request still succeeds. Verified-red: revert the accept-loop
+    /// fix — (a) makes the post-EOF request fail (daemon gone), (b) hangs this test.
+    #[test]
+    fn daemon_survives_dead_and_silent_connections() {
+        std::env::set_var("TD_DAEMON_READ_TIMEOUT_MS", "100");
+        let dir = std::env::temp_dir().join(format!("td-daemon-hol-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket = dir.join("sock");
+        let socket_s = socket.to_string_lossy().into_owned();
+
+        let handle = move |_req: &str| -> Result<String, String> { Ok("done".to_string()) };
+        let sock_for_serve = socket_s.clone();
+        let server = thread::spawn(move || serve(&sock_for_serve, 2, 0.0, handle).unwrap());
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // (a) connect-and-die: EOF must drop the CONNECTION, not the daemon.
+        drop(std::os::unix::net::UnixStream::connect(&socket).unwrap());
+        // (b) connect-and-stall: held open with no bytes; must not wedge the accept loop.
+        let _silent = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+
+        // A real request must still succeed (bounded wait so a regression fails loudly
+        // instead of hanging the test runner).
+        let s = socket_s.clone();
+        let real = thread::spawn(move || request(&s, "/fake.drv").unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !real.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon wedged: a dead/silent connection blocked a real request (head-of-line)"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let r = real.join().unwrap();
+        assert!(r.starts_with("OK "), "unexpected response: {r}");
+
+        let _ = request(&socket_s, "SHUTDOWN");
+        server.join().unwrap();
+        std::env::remove_var("TD_DAEMON_READ_TIMEOUT_MS");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
