@@ -23,7 +23,17 @@ td_system_closure() {
   _tsc_tb="$1"; _tsc_out="$2"
   _tsc_lock="tests/td-system.lock"
   _tsc_regen="regenerate the lock HOST-SIDE: sh tools/td-system-lock-regen.sh (channel bump / td-system re-baseline; an exclusive landing)"
-  for _tsc_f in channels.scm system/td.scm system/td-hardening.scm; do
+  # The input list comes from the LOCK's own input-sha256-* keys (one source of
+  # truth — the capture tool's lowering-inputs list), so an input pinned by a
+  # future capture can never be silently unchecked here. Two anchors that can
+  # never legitimately disappear are required, so a truncated lock reds too.
+  _tsc_inputs=`sed -n 's/^input-sha256-\([^ ]*\) .*/\1/p' "$_tsc_lock"` \
+    || { echo "FAIL: cannot read $_tsc_lock — $_tsc_regen" >&2; return 1; }
+  for _tsc_anchor in channels.scm system/td.scm; do
+    printf '%s\n' "$_tsc_inputs" | grep -qxF "$_tsc_anchor" \
+      || { echo "FAIL: $_tsc_lock has no input-sha256-$_tsc_anchor pin — the lock is truncated or pre-dates input anchoring; $_tsc_regen" >&2; return 1; }
+  done
+  for _tsc_f in $_tsc_inputs; do
     _tsc_want=`"$_tsc_tb" resolve "$_tsc_lock" "input-sha256-$_tsc_f"` \
       || { echo "FAIL: $_tsc_lock has no input-sha256-$_tsc_f entry — $_tsc_regen" >&2; return 1; }
     _tsc_got=`sha256sum "$_tsc_f" | cut -d' ' -f1`

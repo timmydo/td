@@ -12,7 +12,7 @@
 #      the lock header + the pinned root/deriver + the input-sha256-* pins.
 #   2. CLOSURE PIN (td): `td-builder store-closure-scan` computes the runtime
 #      closure from the pinned root — the SAME scan the consuming gates run
-#      (td_system_closure, tests/cache-lib.sh) — and its count + sha256 are
+#      (td_system_closure, tests/td-system-lib.sh) — and its count + sha256 are
 #      appended, so a gate-time scan that diverges (cold store, grown candidate
 #      set) reds against this pin instead of packing different bytes per host.
 set -eu
@@ -44,6 +44,7 @@ n=$(grep -c . "$cls")
 h=$(sha256sum < "$cls" | cut -d' ' -f1)
 printf 'closure-count %s\nclosure-sha256 %s\n' "$n" "$h" >> "$tmp"
 
+chmod 644 "$tmp"   # mktemp creates 0600; the lock is a world-readable tracked file
 mv "$tmp" "$lock"
 trap - EXIT INT TERM
 rm -f "$cls"
