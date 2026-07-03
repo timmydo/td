@@ -137,7 +137,7 @@ check-fast: $(CHEAP_GATES) $(FAST_GATES)
 # The IMAGE tier — the gates that ship + run td-native OCI images (oci-native,
 # rust-userland-image). The old guix-system museum that filled this pool (guix
 # qcow2/docker images, generations, signed registry, placement, rootless-daemon
-# differentials) was RETIRED wholesale 2026-07-02 (human direction, directive 3:
+# differentials) was RETIRED wholesale (human direction, directive 3:
 # "I never wanted the guix museum" — the guix operating-system was scaffolding,
 # not the product; td ships td-native images of td-built packages, and the
 # retained gates test exactly that). Run on demand: `./check.sh check-system`;

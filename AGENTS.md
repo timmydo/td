@@ -193,7 +193,7 @@ legitimate only as SUPPORTING evidence behind a behavioral assertion
 point of the gate. If the only thing a new test proves is "this can be
 built", it is not covering a feature: find the feature and test that.
 
-**What counts as a feature (human, 2026-07-02).** The gates exist to test
+**What counts as a feature.** The gates exist to test
 td end to end: td builds package recipes, `td shell` runs those builds, the
 /td/store bootstrap chain produces the toolchain, td-native images run under
 crun. Guix differentials, guix-implemented capabilities, and artifact-shape
@@ -282,7 +282,7 @@ on what*, and all working notes live in the git log + PR body.
   `channels.scm` — collide with everyone. Announce in the PR description, land as
   small standalone PRs, expect others to rebase. Channel bumps are the canonical
   case. (The frozen-oracle `system/td.scm` + `DIGESTS.md` spine entries were
-  retired with the guix-system gate tier, human direction 2026-07-02.)
+  retired with the guix-system gate tier.)
   Note: **adding a gate is no longer an exclusive landing** — it's a new
   `mk/gates/<NNN>-<name>.mk` file, not a `Makefile` edit, so concurrent gate PRs
   don't collide (the core `Makefile` itself stays exclusive).
@@ -311,15 +311,15 @@ on what*, and all working notes live in the git log + PR body.
   realize/hermetic/daemon gates lower through it; retired with those fixtures).
   (The guix operating-system declarations — the frozen oracle `td.scm` and the
   typed/generation/place/registry/verity modules — were retired with the
-  guix-system gate tier, 2026-07-02, human-directed; the marionette `(gnu tests)`
-  VM-boot tests went earlier, 2026-06-29.)
+  guix-system gate tier; the marionette `(gnu tests)` VM-boot tests went
+  earlier.)
 - `tests/` — the gate scripts: package-manager behavioral tests, locks, and the
   drv fixtures for td's build-engine gates.
 - `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
   deliberately (exclusive landing), never silently.
 - `DESIGN.md` — the settled north star: scope (§0), the loop (§1), and the
   provenance chain. The parallel-work rules live here in AGENTS.md, not DESIGN.md.
-- Clarifications persist HERE (human, 2026-07-02): when the human gives a
+- Clarifications persist HERE: when the human gives a
   direction, a scope decision, or a lasting clarification, fold it into
   AGENTS.md (or the governing file's own comments) in the same PR — do NOT
   squirrel it away in agent-private memory/notes where other agents and the

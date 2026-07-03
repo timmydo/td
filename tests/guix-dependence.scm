@@ -26,7 +26,7 @@
 ;;   corpus-union   — union build closure of all owned recipes (the number that
 ;;                    MOVES as input-recipes lands more recipes / the toolchain).
 ;; (The old `shipped-system` target — (operating-system-derivation td-system) —
-;; retired with the guix-system gate tier, human direction 2026-07-02: the guix
+;; retired with the guix-system gate tier: the guix
 ;; operating-system is not the product; td ships td-native images of td-built
 ;; packages, and this census measures exactly that ownership.)
 ;;

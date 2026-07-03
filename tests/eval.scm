@@ -10,8 +10,8 @@
 ;; intentional `(error …)` and observing exit 0. Run as a FILE, the identical
 ;; error exits 1.
 ;;
-;; Only two system modules remain since the guix-system museum tier was retired
-;; (human direction 2026-07-02): td-builder (check.sh's outer-sandbox prelude
+;; Only two system modules remain since the guix-system museum tier was
+;; retired: td-builder (check.sh's outer-sandbox prelude
 ;; still realizes it) and td-build (the drv fixtures for the realize/hermetic/
 ;; daemon gates still lower through it, retired with the remaining fixtures).
 (use-modules (system td-builder)

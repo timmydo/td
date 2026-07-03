@@ -7,7 +7,7 @@
 ;;
 ;; (The old guix-daemon twin — DRV_DAEMON, the fixed-output variant probing the
 ;; DAEMON's netns — was retired with the `offline` gate 185 and the guix-system
-;; museum tier, human direction 2026-07-02: guix-daemon's sandbox is not td's
+;; museum tier: guix-daemon's sandbox is not td's
 ;; subject; 360-td-offline covers td's builder, which is.)
 ;;
 ;; The probe asserts the netns two ways: interface visibility (precisely what

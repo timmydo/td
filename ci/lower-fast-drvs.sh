@@ -10,8 +10,8 @@
 # FULL ladder). It emits, reusing the rungs' own lowering entry points:
 #   - the pinned channel instance (every rung's time-machine target)
 #   - the check.sh sandbox toolchain (so the offline `guix shell -C` has it)
-# (The guix-system museum tier and its cheap differential rungs were retired
-# 2026-07-02, human direction, so no SYSTEM/OCI-image lowering remains in the
+# (The guix-system museum tier and its cheap differential rungs were retired,
+# so no SYSTEM/OCI-image lowering remains in the
 # fast tier: the surviving cheap rungs are eval (module load), guix-dependence
 # (pure lowering off the pinned channel, no extra closure) and the static
 # census scripts.)

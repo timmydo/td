@@ -5,7 +5,7 @@
 #
 # The old S2/S3/S4 legs (NAR differential vs the daemon's recorded hashes, userns build
 # differential vs the daemon, and the qcow2 SYSTEM-IMAGE differential) were RETIRED with
-# the guix-system museum tier (human direction 2026-07-02, directive 3): their distinct
+# the guix-system museum tier (human direction, directive 3): their distinct
 # purpose was the guix/daemon byte-identity comparison, and the td-side capabilities
 # they exercised are covered by the live td-native gates — NAR hashing backs every
 # store registration/verify (store-add/register/verify/backend, 275–310), the userns

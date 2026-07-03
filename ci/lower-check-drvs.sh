@@ -12,7 +12,7 @@
 #
 # The guix-system museum tier (system images, generations, registry, place,
 # rootless, no-guix, memo, offline-probe — and their negative must-fail drvs)
-# was retired 2026-07-02 (human direction), so this enumeration is now just:
+# was retired (human direction), so this enumeration is now just:
 # the sandbox toolchain, the pinned channel instance, and the drv fixtures of
 # the surviving td build-engine gates.
 #
