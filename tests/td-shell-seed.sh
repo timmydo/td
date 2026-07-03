@@ -7,9 +7,10 @@
 # which inherits TD_SEED_* and uses the seed-store override (#133). So the user-facing
 # command builds td's own package with NO guix at all — no process, no install.
 #
-# The seed is the warmed, content-addressed cache (tools/warm-seed.sh); guix/Guile are
-# SCRUBBED FROM PATH (proving no guix process); the only guix is the one-time capture
-# source + the removable equivalence oracle.
+# The seed is the warmed, content-addressed cache (tools/warm-seed.sh) — captured by
+# CONTENT-SCANNING the store bytes (seed-manifest over the store dir; no /var/guix/db read);
+# guix/Guile are SCRUBBED FROM PATH (proving no guix process); the only guix left is the
+# guix-BUILT seed bytes (the toolchain seed, retired last) + the removable equivalence oracle.
 #
 # Legs:
 #   [DURABLE behavioral] `td shell hello -- hello` builds + runs from the seed (guix off
@@ -40,7 +41,11 @@ grep ' /gnu/store/' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | sort -u > "$w
 sort -u "$work/roots" -o "$work/roots"
 grep ' /gnu/store/' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | sort -u | xargs guix build >/dev/null \
   || fail "could not realize hello's seed closure"
-seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$(pwd)/.td-build-cache/seed" $(cat "$work/roots")` \
+# Capture the seed by CONTENT-SCANNING the store dir (TD_SEED_DB=/gnu/store) — seed-manifest
+# computes the closure + every member's refs from the store bytes (== guix gc -R; gate 290),
+# with NO read of guix's private /var/guix/db. The captured seed is byte-identical to a
+# DB-read capture (same closure, NAR hashes, refs), so the seed-built hello is unchanged.
+seedline=`TB="$TB" TD_SEED_DB=/gnu/store sh tools/warm-seed.sh "$(pwd)/.td-build-cache/seed" $(cat "$work/roots")` \
   || fail "warm-seed failed"
 SEED_STORE=`echo "$seedline" | cut -d' ' -f1`; SEED_DB=`echo "$seedline" | cut -d' ' -f2`
 test -d "$SEED_STORE" -a -s "$SEED_DB" || fail "warm-seed produced no usable seed"
@@ -73,17 +78,19 @@ bare=`grep -v '	' "$work/pkgs/hello/closure.txt" | grep '^/gnu/store/' | grep -v
 test -z "$bare" || fail "an input staged from the live /gnu/store, not the seed: $bare"
 echo "   [DURABLE structural] PATH hello = $hb (td's build); every input staged FROM the seed store"
 
-# --- Leg C: REMOVABLE oracle — same td path whether built from the seed or /var/guix
-# (provenance-only change; td's own build path is distinct from guix's daemon hello —
-# own, then diverge — so the oracle is the /var/guix-built TD shell, not `guix build`).
+# --- Leg C: REMOVABLE oracle — same td path whether hello is built from the frozen SEED or
+# CONTENT-SCANNED from the LIVE /gnu/store (provenance-only change; td's own build path is
+# distinct from guix's daemon hello — own, then diverge — so the oracle is td's own live-store
+# build, NOT `guix build`). TD_SHELL_STORE_DB is the live store dir the build scans for hello's
+# closure (== guix gc -R) — no /var/guix read.
 gxout=`env -i HOME="$work" TMPDIR="$work/tmp" PATH="$cu/bin:$sh_/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
   TD_RECIPE_EVAL="$TD_RECIPE_EVAL" \
-  TD_SHELL_LOCKS=tests TD_SHELL_CACHE="$work/pkgs-guix" TD_SHELL_STORE_DB=/var/guix/db/db.sqlite \
-  "$TB" shell hello -- bash -c 'command -v hello'` || fail "td shell hello via /var/guix (oracle) failed"
+  TD_SHELL_LOCKS=tests TD_SHELL_CACHE="$work/pkgs-guix" TD_SHELL_STORE_DB=/gnu/store \
+  "$TB" shell hello -- bash -c 'command -v hello'` || fail "td shell hello via the live store (oracle) failed"
 gxbase=`basename "$(dirname "$(dirname "$gxout")")"`
-test "$outbase" = "$gxbase" || fail "seed-built hello ($outbase) != /var/guix-built td shell ($gxbase)"
-echo "   [REMOVABLE oracle] seed-built hello == /var/guix-built td shell ($gxbase) — provenance-only change"
+test "$outbase" = "$gxbase" || fail "seed-built hello ($outbase) != live-store-built td shell ($gxbase)"
+echo "   [REMOVABLE oracle] seed-built hello == live-store-built td shell ($gxbase) — provenance-only change"
 
 echo "PASS: td shell builds + runs td's OWN hello entirely from the frozen seed — guix/Guile"
 echo "      off PATH (no process) AND the seed as the only store DB (no /var/guix). The"

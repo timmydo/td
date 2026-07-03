@@ -6,7 +6,7 @@
 # may only SHRINK); growth needs a deliberate edit here, called out in the PR for
 # sign-off (directive 8). Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB><category>
-surface-sites: 53
+surface-sites: 51
 ci/build-ci-image.sh	guix-db-read
 ci/build-ci-image.sh	lowering
 ci/import-store.sh	guix-db-read
@@ -58,5 +58,3 @@ tests/seed-tarball.sh	guix-db-read
 tests/seed-unpack.sh	guix-db-read
 tests/stage0-builder.sh	guix-db-read
 tests/store-relocate.sh	guix-db-read
-tests/td-shell-seed.sh	guix-db-read
-tests/td-shell.sh	guix-db-read

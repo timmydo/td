@@ -10,8 +10,9 @@
 # `td-builder seed-unpack`s once, then drops the big tar (keeps the unpacked store + DB +
 # manifest). Prints: `<TD_SEED_STORE> <TD_SEED_DB> <MANIFEST>` for a build to consume.
 #
-# Env: TB (td-builder; default `td-builder`), TD_SEED_DB (capture store DB; default
-# /var/guix/db/db.sqlite — the one-time capture SOURCE).
+# Env: TB (td-builder; default `td-builder`), TD_SEED_DB (the one-time capture SOURCE,
+# passed to seed-manifest: a store DB FILE, or a store DIRECTORY to content-scan — the
+# latter captures the seed with NO /var/guix/db read; default /var/guix/db/db.sqlite).
 set -eu
 
 base="${1:?usage: warm-seed.sh OUT-BASE ROOT...}"; shift
