@@ -7,8 +7,8 @@
 # or the hosted runner's offline `./check.sh` reds on a missing input. To stay
 # honest it reuses the rungs' OWN lowering entry points (the tests/*-drv.scm
 # scripts) — there is no second hand-maintained list of what the check builds.
-# The toolchain is parsed straight off check.sh's `guix shell` line for the
-# same reason.
+# The toolchain list is read from tools/loop-toolchain.txt (td-builder check's
+# one source) for the same reason.
 #
 # The guix-system museum tier (system images, generations, registry, place,
 # rootless, no-guix, memo, offline-probe — and their negative must-fail drvs)
@@ -52,11 +52,11 @@ for s in tests/*-drv.scm tests/*-drvs.scm; do
   esac
 done
 
-# --- Sandbox toolchain: parse the package list off check.sh's `guix shell
-# --search-paths` line that provisions the loop toolchain profile, so it cannot
+# --- Sandbox toolchain: tools/loop-toolchain.txt is the ONE package-list source
+# `td-builder check` provisions the loop toolchain profile from, so it cannot
 # drift. skopeo is realized by the oci-native/rust-userland-image rungs.
-tools=$(sed -n 's/^    \(make bash [a-z0-9 .+-]*\) \\$/\1/p' check.sh)
-test -n "$tools" || { echo "ERROR: could not parse toolchain from check.sh" >&2; exit 1; }
+tools=$(cat tools/loop-toolchain.txt)
+test -n "$tools" || { echo "ERROR: empty toolchain list — tools/loop-toolchain.txt missing or empty" >&2; exit 1; }
 # shellcheck disable=SC2086
 $GUIX build -d $tools skopeo
 

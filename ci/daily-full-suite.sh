@@ -55,7 +55,7 @@ heavy_fail=$(grep -E '^FAIL' "$hlog" | head -5 | tr '\n' ';')
 # regression (issue #268) — a bare heavy=red/system=red with no *_fail is
 # indistinguishable from a real break, so detect it here and report it distinctly
 # instead of sending an agent hunting for a code regression that doesn't exist.
-if [ $heavy_rc -ne 0 ] && grep -q '^check\.sh: FATAL: host guix' "$hlog"; then
+if [ $heavy_rc -ne 0 ] && grep -q '^(check\.sh|td-builder check): FATAL: host guix' "$hlog"; then
   env_error=1
   env_error_msg="runner host not provisioned: host guix missing/mismatched vs channels.scm (see issue #268) — no gate ran, not a code regression"
   heavy_fail="$env_error_msg"
@@ -83,7 +83,7 @@ if [ $env_error -eq 1 ]; then
 elif [ -d .td-build-cache/harness/store ] && [ -s .td-build-cache/harness/rel ]; then
   echo ">> daily backstop: ./check.sh check-harness on origin/main ($main) — guix-free /td/store loop"
   ./check.sh check-harness >"$xlog" 2>&1 || harness_rc=$?
-  harness_fail=$(grep -E '^FAIL|^check.sh: FATAL' "$xlog" | head -5 | tr '\n' ';')
+  harness_fail=$(grep -E '^FAIL|^(check\.sh|td-builder check): FATAL' "$xlog" | head -5 | tr '\n' ';')
 else
   harness_rc=4; harness_fail="no .td-build-cache/harness persisted (gate 420 did not complete)"
   echo ">> daily backstop: check-harness SKIPPED — $harness_fail"

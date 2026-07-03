@@ -19,9 +19,11 @@ mod affected;
 mod bootstrap;
 mod build;
 mod build_daemon;
+mod check_loop;
 mod daemon;
 mod drv;
 mod elf;
+mod gates;
 mod json;
 mod lock;
 mod nar;
@@ -3080,6 +3082,20 @@ fn main() -> ExitCode {
         // map the branch diff to a right-sized check set + the waive/escalate
         // decision. Run from the repo root. See builder/src/affected.rs.
         Some("affected-checks") => affected::main(&args[2..]),
+        // gate-run — td's OWN gate runner: the loop scheduler that replaced `make`
+        // on the spine. The gates are compiled in (src/gate_defs/*.rs registry);
+        // runs the requested tier/gates with cheap-serial + heavy-parallel
+        // ordering, a MACHINE-WIDE flock slot pool (TD_CHECK_SLOTS, shared across
+        // every concurrent check on the box), and data-driven longest-first heavy
+        // order. Run from the repo root, inside the loop sandbox (`td-builder
+        // check` execs it there). See builder/src/gates.rs.
+        Some("gate-run") => gates::cli(args.get(2..).unwrap_or(&[])),
+        // check [GOAL...] — the loop's HOST PRELUDE (the old shell check.sh,
+        // ported): guards, stage0 + toolchain provisioning, warms, the shared
+        // daemon, then the sandboxed gate-run. check.sh is now a guix-free cargo
+        // bootstrap shim that execs this. (The drv reproducibility double-build
+        // that used to share this verb is `check-drv` now — no argument sniffing.)
+        Some("check") => check_loop::cli(args.get(2..).unwrap_or(&[])),
         // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
         // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
         Some("bootstrap-recipe") => bootstrap::cli(&args),
@@ -5476,7 +5492,11 @@ fn main() -> ExitCode {
         // line); the two builds land under SCRATCH/r1 and SCRATCH/r2. Exits 0 if
         // every output is bit-for-bit identical across the two builds, 3 if any
         // output diverges (NON-REPRODUCIBLE — a FAILING test per prime directive 1).
-        Some("check") if args.len() == 5 => {
+        // The drv reproducibility double-build. RENAMED from `check` when the
+        // loop entry (`td-builder check [GOAL...]`) took that verb — every
+        // caller (tests/*.sh + the gate bodies) was switched in the same change,
+        // so there is no argument-shape sniffing between the two features.
+        Some("check-drv") if args.len() == 5 => {
             let (drv_path, closure_file, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<bool, String> {
                 let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
@@ -5795,7 +5815,10 @@ fn main() -> ExitCode {
                         // read to FETCH the lock-keyed closure instead of building from seed;
                         // TD_DAEMON_* = the shared build daemon's socket (TD_DAEMON_SOCKET) the
                         // corpus build submits to.
-                        if k.starts_with("TD_SUBST_") || k.starts_with("TD_DAEMON_") {
+                        if k.starts_with("TD_CHECK_")
+                            || k.starts_with("TD_SUBST_")
+                            || k.starts_with("TD_DAEMON_")
+                        {
                             extra_env.push((k, v));
                         }
                     }
@@ -5966,13 +5989,15 @@ fn main() -> ExitCode {
         },
         _ => {
             eprintln!("usage: td-builder            # print the S1 sentinel");
+            eprintln!("       td-builder check [GOAL...]             # the loop: host prelude + sandboxed gate ladder");
+            eprintln!("       td-builder gate-run [-j N] [GOAL...]   # the in-sandbox gate scheduler (src/gate_defs/)");
             eprintln!("       td-builder nar-hash PATH");
             eprintln!("       td-builder nar-restore NARFILE DEST");
             eprintln!("       td-builder subst-export DB STORE-DIR OUTDIR ROOT...");
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder drv-refs FILE.drv");
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
-            eprintln!("       td-builder check FILE.drv CLOSURE-FILE SCRATCH-DIR");
+            eprintln!("       td-builder check-drv FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
             eprintln!("       td-builder store-query DB info|references");
             eprintln!("       td-builder store-closure DB ROOT");

@@ -32,9 +32,10 @@ root=$(cd "$(dirname "$0")/.." && pwd); cd "$root"
 # realize the pinned seed only if missing, then place/reuse the stage0.
 . tests/cache-lib.sh
 provision_stage0 || { echo "check-rung: FATAL: could not provision the guix-free stage0 td-builder for the sandbox." >&2; exit 1; }
-# Exactly check.sh's loop toolchain (no bzip2 — the sandbox must match the gate's).
+# Exactly the loop toolchain (tools/loop-toolchain.txt — the ONE source td-builder
+# check provisions from; no bzip2 — the sandbox must match the gate's).
 toolchain=$(guix shell --no-substitutes --no-offload \
-    make bash coreutils sed grep findutils tar gzip crun util-linux sqlite \
+    $(cat tools/loop-toolchain.txt) \
     --search-paths | sed -n 's/^export PATH="\([^$]*\).*/\1/p' | head -n1)
 [ -n "$toolchain" ] || { echo "check-rung: FATAL: could not provision the loop toolchain PATH." >&2; exit 1; }
 

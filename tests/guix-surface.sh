@@ -10,8 +10,10 @@
 # `guix build -e '(@ (system M) PKG)'`. That "guix-as-packager" surface is what
 # this gate forbids from GROWING, so the §5 metric is enforced, not aspirational.
 #
-# It STATICALLY scans the loop's orchestration sources — Makefile, mk/gates/*.mk,
-# tests/*.sh, ci/*.sh (minus itself) — for that invocation form, classifies the resolved
+# It STATICALLY scans the loop's orchestration sources — the compiled gate
+# bodies (builder/src/gate_defs/*.rs — their bash scripts invoke guix via the
+# $TD_GUIX time-machine prefix the runner exports), tests/*.sh, ci/*.sh (minus
+# itself) — for that invocation form, classifies the resolved
 # `(@ (system M) NAME)` by reading system/M.scm (a `(package ...)` define =
 # PACKAGER; an `(origin ...)`/fetch define = an allowed FETCHER seed), and records
 # the sorted set of PACKAGER sites in tests/guix-surface.expected. A one-way
@@ -43,7 +45,10 @@ trap 'rm -rf "$work"' EXIT INT TERM
 # store-image host-prep scripts — are in scope too, so directive 8's "the guix
 # surface only shrinks" covers the CI staging path, not just the in-sandbox loop.
 : > "$work/scope"
-for f in Makefile mk/gates/*.mk tests/*.sh ci/*.sh; do
+# (the Makefile + mk/gates/*.mk entries became builder/src/gate_defs/*.rs when the
+# gate runner replaced make; check_loop.rs — the ported check.sh host prelude — stays
+# out of scope exactly as the shell check.sh always was)
+for f in builder/src/gate_defs/*.rs tests/*.sh ci/*.sh; do
   [ -f "$f" ] || continue
   [ "$f" = "$self" ] && continue
   printf '%s\n' "$f" >> "$work/scope"
@@ -82,8 +87,8 @@ classify() {
 # --- gather active (non-comment) `guix build -e '(@ (system M) X)'` hits -------
 : > "$work/hits"
 while IFS= read -r f; do
-  grep -nE "(guix|GUIX\)) build.*-e.*\(@ \(system " "$f" 2>/dev/null \
-    | grep -vE "^[0-9]+:[[:space:]]*#" \
+  grep -nE "(guix|GUIX\)|TD_GUIX) build.*-e.*\(@ \(system " "$f" 2>/dev/null \
+    | grep -vE "^[0-9]+:[[:space:]]*(#|//)" \
     | sed "s|^|$f:|" >> "$work/hits" || true
 done < "$work/scope"
 
@@ -136,10 +141,10 @@ while IFS= read -r f; do
   [ -f "$f" ] || continue
   # real command lines only: drop comments and leading-echo/printf narration
   # (|| true: a file with no surviving lines must not trip `set -e`)
-  body=$(grep -vE "^[[:space:]]*#" "$f" | grep -vE "^[[:space:]]*(@?echo|printf)([[:space:]]|\")" || true)
-  printf '%s\n' "$body" | grep -qE "(guix|GUIX\)) (repl|system)" && printf '%s\t%s\n' "$f" "lowering" >> "$work/shrink.cur"
-  printf '%s\n' "$body" | grep -qE "(guix|GUIX\)) shell"          && printf '%s\t%s\n' "$f" "shell"    >> "$work/shrink.cur"
-  printf '%s\n' "$body" | grep -qE "(guix|GUIX\)) gc"             && printf '%s\t%s\n' "$f" "gc"       >> "$work/shrink.cur"
+  body=$(grep -vE "^[[:space:]]*(#|//)" "$f" | grep -vE "^[[:space:]]*(@?echo|printf)([[:space:]]|\")" || true)
+  printf '%s\n' "$body" | grep -qE "(guix|GUIX\)|TD_GUIX) (repl|system)" && printf '%s\t%s\n' "$f" "lowering" >> "$work/shrink.cur"
+  printf '%s\n' "$body" | grep -qE "(guix|GUIX\)|TD_GUIX) shell"          && printf '%s\t%s\n' "$f" "shell"    >> "$work/shrink.cur"
+  printf '%s\n' "$body" | grep -qE "(guix|GUIX\)|TD_GUIX) gc"             && printf '%s\t%s\n' "$f" "gc"       >> "$work/shrink.cur"
   printf '%s\n' "$body" | grep -qE "/var/guix/db"                 && printf '%s\t%s\n' "$f" "guix-db-read" >> "$work/shrink.cur"
 done < "$work/scope"
 sort -u "$work/shrink.cur" -o "$work/shrink.cur"
@@ -148,15 +153,15 @@ shrink_n=$(grep -c . "$work/shrink.cur" || true)
 # --- compact informational census (trend; NOT ratcheted) ----------------------
 : > "$work/code"
 while IFS= read -r f; do
-  grep -vE "^[[:space:]]*#" "$f" >> "$work/code" || true
+  grep -vE "^[[:space:]]*(#|//)" "$f" >> "$work/code" || true
 done < "$work/scope"
 occ() { grep -oE "$1" "$work/code" 2>/dev/null | grep -c . || true; }
 census() {
   echo ">> guix-surface census (informational; only the packager set is ratcheted):"
   echo "   packager  guix build -e (system M) <package> : $cur_n   <-- RATCHETED (move-off-Guile §5)"
-  echo "   oracle    guix build --check                 : $(occ '(guix|GUIX\)) build --check')   (kept: the repro oracle, retired with guix)"
-  echo "   lowerer   guix repl / guix system            : $(occ '(guix|GUIX\)) (repl|system)')   (Guile config/lowering, retired last)"
-  echo "   gc        guix gc                            : $(occ '(guix|GUIX\)) gc')"
+  echo "   oracle    guix build --check                 : $(occ '(guix|GUIX\)|TD_GUIX) build --check')   (kept: the repro oracle, retired with guix)"
+  echo "   lowerer   guix repl / guix system            : $(occ '(guix|GUIX\)|TD_GUIX) (repl|system)')   (Guile config/lowering, retired last)"
+  echo "   gc        guix gc                            : $(occ '(guix|GUIX\)|TD_GUIX) gc')"
 }
 
 # --- WRITE / COMPARE ----------------------------------------------------------

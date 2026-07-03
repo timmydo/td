@@ -24,7 +24,7 @@ meta="$base/.stage0-meta"
 test -s "$lock" || { echo "stage0-builder: no toolchain lock $lock" >&2; exit 1; }
 
 # Fingerprint the builder source the stage0 is compiled from — reuse only if unchanged.
-fp=`find builder/src builder/Cargo.toml builder/Cargo.lock -type f -exec sha256sum {} + \
+fp=`find builder/src builder/build.rs builder/Cargo.toml builder/Cargo.lock -type f -exec sha256sum {} + \
      | sort | sha256sum | cut -d' ' -f1`
 # A valid memo: the fingerprint matches AND the placement + db are present. Sets $cb.
 memo_hit() {
