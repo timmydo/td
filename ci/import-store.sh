@@ -57,8 +57,8 @@ tail -n +2 "$tmp/layers" | while read -r blob; do
   gzip -dc "$oci/blobs/sha256/$blob" | tar -xOf - --wildcards 'chunk-*'
 done | guix archive --import >&2
 
-echo ">> verify: the pinned guix profile closure is valid (td-builder store-closure over /var/guix/db — td's OWN Refs-graph reader, NO guix gc process)" >&2
-# Validate the just-imported closure with td's OWN store-DB reader instead of a
+echo ">> verify: the pinned guix profile closure is valid (td-builder store-closure-scan over /gnu/store — td's OWN content-scanner, NO guix gc process, NO /var/guix/db read)" >&2
+# Validate the just-imported closure with td's OWN content-scanner instead of a
 # `guix gc` process (CLAUDE.md directive 8 — the guix surface only shrinks; this
 # retires the LAST `guix gc` site in the CI provisioning path, the one #249
 # deferred). #249 left it a guix call because "no td-builder is available" on the
@@ -76,11 +76,16 @@ else
   cargo build --frozen --release --manifest-path "$repo/builder/Cargo.toml" >&2
   tb=$repo/builder/target/release/td-builder
 fi
-# store-closure walks /var/guix/db's Refs graph from $channel_out (the daemon
-# populated the DB during the `guix archive --import` above) and fails loudly if
-# the root or any requisite is missing — the validity guarantee
-# `guix gc --requisites "$channel_out"` gave. The gate `store-gc` (mk/gates/290)
-# proves store-closure == `guix gc -R` exactly.
-"$tb" store-closure /var/guix/db/db.sqlite "$channel_out" > /dev/null
+# store-closure-scan CONTENT-SCANS the live /gnu/store from $channel_out (the daemon
+# placed it during the `guix archive --import` above) — the daemon's scanForReferences,
+# proven == `guix gc -R` by the `store-gc` gate (mk/gates/290) — with NO read of guix's
+# private /var/guix/db. `guix archive --import` already registers in topological order
+# and fails on any unsatisfied reference, so the closure is complete by here; this is
+# the independent td-native re-walk. Guard the root explicitly (a MISSING root is the
+# one incompleteness a content-scan cannot otherwise see — it would echo the root and
+# exit 0); store-closure-scan then fails loudly if any reachable path's bytes are
+# unreadable.
+test -e "$channel_out" || { echo "FATAL: imported profile $channel_out is missing" >&2; exit 1; }
+"$tb" store-closure-scan /gnu/store "$channel_out" > /dev/null
 echo ">> import complete" >&2
 echo "$channel_out"
