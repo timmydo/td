@@ -3,8 +3,8 @@
 # (the dependency-free `td-recipe` crate, recipes/) and print the binary path.
 #
 # This REPLACES the boa td-recipe-eval (tests/ts-eval-tool.sh) on the build path: the
-# package surface is declared in Rust now (recipes/src/catalog.rs +
-# recipes/src/specs.rs), so the loop evaluates recipes/specs with `td-recipe-eval`
+# package surface is declared in Rust now (recipes/src/recipes/<stem>.rs, one
+# self-registering file per recipe), so the loop evaluates recipes with `td-recipe-eval`
 # instead of transpiling+evaluating `.ts` through tsgo+boa. Built ONCE by the
 # build-recipes prelude into BASEDIR (content cached via CARGO_TARGET_DIR), then
 # read by cache-lib's `load_recipe_eval` and by every build gate via recipe-emit.sh.
