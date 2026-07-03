@@ -1,10 +1,16 @@
 # tests/td-system.lock — PINNED lowering of the FROZEN td system (system/td.scm
 # td-system) at the pinned channel (channels.scm): the store path the system
-# lowers to and the derivation that produces it. Consumed by the loop with NO
-# guix process: `td-builder resolve` reads it and `td-builder store-closure-scan`
-# computes the runtime closure from the pinned root by content-scan (gates
-# 120-oci / 135-oci-load). PINNED ARTIFACT — regenerate on a channel bump
-# (an exclusive landing, like DIGESTS.md):
-#   guix time-machine -C channels.scm -- repl -L . tests/td-system-lock.scm > tests/td-system.lock
+# lowers to, the derivation that produces it, the sha256 of each lowering INPUT,
+# and the count/sha256 of the scanned runtime closure (see
+# tests/td-system-lock.scm, the capture tool, which documents each entry).
+# Consumed by the loop with NO guix process (td_system_closure in
+# tests/td-system-lib.sh; gates 120-oci / 135-oci-load). PINNED ARTIFACT —
+# regenerate on a channel bump or td-system re-baseline (atomic driver):
+#   sh tools/td-system-lock-regen.sh
 td-system /gnu/store/r3cajym1fjw463vys32ld2r9ilhbg2z8-system
 td-system-drv /gnu/store/iy338wd0mqkbc8qfw4lc9jm9nf2sk6k3-system.drv
+input-sha256-channels.scm 1b230c265245e7eef18554d548d3b3b9d3f3a6430e3209031aa98453a9701d5d
+input-sha256-system/td.scm 60acfa6b1c8e93a963398f2ebed780b7a36348738ca2fffbbbd36846d46d7363
+input-sha256-system/td-hardening.scm b029e58bc1b123fbfb9b0ce8d187ae62766fcbbd2e4be16b0c2ee71620c7f031
+closure-count 330
+closure-sha256 b4ee540c947bda83160781737f54178858d1c36347431eff41241acf9ce39476

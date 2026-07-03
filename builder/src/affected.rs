@@ -1073,10 +1073,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // The pinned td-system lowering lock + its channel-bump capture tool feed the two
-    // gates that consume the pinned system root (oci resolves + content-scans it;
-    // oci-load's plain-image leg shares the seam).
-    if pattern_matches("tests/td-system.lock|tests/td-system-lock.scm", p) {
+    // The pinned td-system lowering lock, its channel-bump capture tool + regen
+    // driver, and the shared resolution seam (td_system_closure) feed the two gates
+    // that consume the pinned system root (oci resolves + content-scans it;
+    // oci-load's plain-image leg shares the seam). tests/oci-system-closure.scm is
+    // the RETIRED predecessor (the per-gate `guix repl` lowering these replaced):
+    // mapped here so its deletion routes to its two consumer gates instead of
+    // falling through to the broad `tests/oci*` -> check-system glob.
+    if pattern_matches(
+        "tests/td-system.lock|tests/td-system-lock.scm|tests/td-system-lib.sh|tools/td-system-lock-regen.sh|tests/oci-system-closure.scm",
+        p,
+    ) {
+        sel.add_preflight("shell-syntax");
         sel.add_target("oci");
         sel.add_target("oci-load");
         return;
@@ -1178,6 +1186,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if p == "channels.scm" {
         sel.add_target("check-fast");
         sel.add_target("guix-dependence");
+        // The pinned system lock (tests/td-system.lock) is input-anchored on
+        // channels.scm: a bump PRs must regenerate it (tools/td-system-lock-regen.sh)
+        // or these gates red deterministically at the input-sha256 pin — select them
+        // so the red surfaces in the bump PR, not a day later in the daily backstop.
+        sel.add_target("oci");
+        sel.add_target("oci-load");
         sel.require_full(&format!(
             "{p} changed; the dependency pin affects the whole loop."
         ));
@@ -1516,6 +1530,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/td-system.lock", "oci");
     assert_target!("tests/td-system.lock", "oci-load");
     assert_target!("tests/td-system-lock.scm", "oci");
+    assert_target!("tests/td-system-lock.scm", "oci-load");
+    assert_target!("tests/td-system-lib.sh", "oci");
+    assert_target!("tools/td-system-lock-regen.sh", "oci-load");
+    assert_target!("tests/oci-system-closure.scm", "oci");
+    assert_target!("channels.scm", "oci");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
     // the seed tree + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.

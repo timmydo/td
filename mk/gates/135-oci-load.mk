@@ -32,20 +32,16 @@ SYSTEM_GATES += oci-load
 oci-load:
 	@echo ">> oci-load: foreign OCI implementation (skopeo) loads the shipped images"
 	@set -euo pipefail; \
-	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	. tests/cache-lib.sh; . tests/td-system-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
 	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
 	skopeo=`$(GUIX) build skopeo`/bin/skopeo; \
 	crun=`$(GUIX) build crun`; \
 	work="$(CURDIR)/.oci-load-scratch"; rm -rf "$$work"; mkdir -p "$$work"; \
-	echo ">> plain image: td-builder resolves + packs the td SYSTEM closure (td-native: pinned tests/td-system.lock + store-closure-scan, no guix repl, no guix system image — shared with the oci gate)"; \
-	sysout=`"$$tb" resolve tests/td-system.lock td-system` \
-	  || { echo "ERROR: could not resolve td-system from tests/td-system.lock" >&2; exit 1; }; \
-	test -d "$$sysout" \
-	  || { echo "ERROR: the pinned td system root $$sysout is not in the store — the lock is stale or the store is cold; regenerate on a channel bump: guix time-machine -C channels.scm -- repl -L . tests/td-system-lock.scm > tests/td-system.lock" >&2; exit 1; }; \
-	"$$tb" store-closure-scan /gnu/store "$$sysout" > "$$work/plain-closure.txt" \
-	  || { echo "ERROR: td-builder store-closure-scan failed on the td system root" >&2; exit 1; }; \
-	test -s "$$work/plain-closure.txt" || { echo "ERROR: empty td system closure" >&2; exit 1; }; \
+	echo ">> plain image: td-builder resolves + packs the td SYSTEM closure (td-native: the shared td_system_closure seam — pinned tests/td-system.lock, input+closure pins checked, no guix repl, no guix system image)"; \
+	td_system_closure "$$tb" "$$work/plain-closure.txt"; \
+	grep -qxF "$$crun" "$$work/plain-closure.txt" \
+	  || { echo "FAIL: crun ($$crun, the image entrypoint) is not in td's scanned system closure — the packed image would carry a dangling entrypoint" >&2; exit 1; }; \
 	printf '{"repoTag":"td-system:latest","env":["PATH=/bin"],"entrypoint":["%s/bin/crun"]}' "$$crun" > "$$work/plain-config.json"; \
 	"$$tb" oci-image-paths "$$work/plain-closure.txt" /gnu/store "$$work/plain-config.json" "$$work/plain.tar" \
 	  || { echo "FAIL: td-builder oci-image-paths failed on the td system closure" >&2; exit 1; }; \
