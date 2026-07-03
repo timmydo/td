@@ -55,8 +55,9 @@ bootstrap replaces the guix toolchain seed.
    loosen, or `xfail` a test just to turn a task green. It is ok to
    remove tests when migrating to another system (which has its own
    tests). Removing, loosening, or restructuring any existing gate or
-   assertion in `check.sh`, the `Makefile`, or `tests/` must be called
-   out plainly in the PR so the human approves it knowingly — never
+   assertion in `check.sh`, the gate runner or gate definitions
+   (`builder/src/gates.rs`, `builder/src/gate_defs/`), or `tests/` must be
+   called out plainly in the PR so the human approves it knowingly — never
    slip it past review. Adding or strengthening tests is always
    free. If a test cannot pass honestly, STOP and report.
    
@@ -115,15 +116,28 @@ Run all the tests with the single pass/fail command:
 ./check.sh
 ```
 
-`./check.sh` is the canonical hermetic entry point: it sets up the
-fresh sandbox — **td's OWN `td-builder host-sandbox --expose-cwd`, the
-sole loop container** it runs the gate ladder (structural gates
-serial-first, heavy gates two at a time), short-circuiting on the
-first failure, and exits non-zero on any failure.
+`./check.sh` is a GUIX-FREE cargo bootstrap shim (the host Rust
+toolchain is the one thing the user brings — the initial seed): it
+builds the dependency-free builder crate and execs **`td-builder
+check`** (builder/src/check_loop.rs), td's own compiled host prelude —
+the pinned-guix integrity guard, the loop toolchain provisioning, the
+warm prelude, the shared build daemon — which then enters the fresh
+sandbox (**td's OWN `td-builder host-sandbox --expose-cwd`, the sole
+loop container**) and runs the gate ladder with **td's OWN gate
+runner** (`td-builder gate-run`, builder/src/gates.rs; make and the
+Makefile are retired), short-circuiting on the first failure and
+exiting non-zero on any failure. Scheduling is the runner's job, not
+yours: cheap structural gates run serial-first, heavy gates run in
+parallel bounded by a machine-wide slot pool shared by every
+concurrent check on the box (flock'd slot files under
+`~/.td/build-daemon/slots`; TD_CHECK_SLOTS sizes it, default nproc) —
+so do NOT stagger checks, tune `-j`, or otherwise hand-schedule; run
+`./check.sh` whenever you need it and let the pool arbitrate.
 
 Every build/test runs inside that fresh td sandbox so your own
 environment cannot contaminate results; `./check.sh <target>` runs a
-single Makefile target in the same sandbox.
+single gate or tier in the same sandbox (`td-builder gate-run
+list-gates` prints the assembled pools).
 
 Do not proceed to the next sub-task until the current one is green.
 
@@ -319,18 +333,22 @@ tracking system, and all working notes live in the git log + PR body.
   run, it does not replace it. `lint` + `check-fast` are the required checks; the
   full `./check.sh` stays the dev-machine gate (step 1).
   
-- **Exclusive landings:** changes to the shared spine — `check.sh`, `Makefile`,
-  `channels.scm` — collide with everyone. Announce in the PR description, land as
-  small standalone PRs, expect others to rebase. Channel bumps are the canonical
-  case. (The frozen-oracle `system/td.scm` + `DIGESTS.md` spine entries were
-  retired with the guix-system gate tier.)
-  Note: **adding a gate is no longer an exclusive landing** — it's a new
-  `mk/gates/<NNN>-<name>.mk` file, not a `Makefile` edit, so concurrent gate PRs
-  don't collide (the core `Makefile` itself stays exclusive).
-  
-- **Resources:** each full check already runs its heavy gates two at a time (`-j2`),
-  so two concurrent checks mean up to four VMs/builds — the observed ceiling. Don't
-  add a third check or raise `-j`; stagger if the host is loaded.
+- **Exclusive landings:** changes to the shared spine — `check.sh`,
+  `channels.scm`, the gate runner (`builder/src/gates.rs`) — collide with everyone.
+  Announce in the PR description, land as small standalone PRs, expect others to
+  rebase. Channel bumps are the canonical case. (The frozen-oracle `system/td.scm`
+  + `DIGESTS.md` spine entries were retired with the guix-system gate tier; the
+  `Makefile` was retired when the gate runner replaced make as the loop scheduler.)
+  Note: **adding a gate is not an exclusive landing** — it's a new
+  `builder/src/gate_defs/<NNN>-<gate>.rs` file; the build.rs registry assembles
+  the pools, so concurrent gate PRs touch different files and never collide.
+
+- **Resources:** scheduling is the gate runner's job, not yours. Every check's
+  heavy gates draw from ONE machine-wide slot pool shared across all concurrent
+  checks and agents (default nproc slots; a crashed gate's slot is released by the
+  kernel), and builds are additionally bounded by the shared build daemon's global
+  budget — so run checks whenever you need them; do not stagger, throttle, or
+  hand-tune `-j`.
 
 ## Repo conventions
 
@@ -338,15 +356,23 @@ tracking system, and all working notes live in the git log + PR body.
 
 - `check.sh` — the canonical hermetic, offline pass/fail command (`./check.sh`). The
   only command you need to determine green/red.
-- `Makefile` — the `make check` target it runs inside that sandbox; it assembles the
-  `CHEAP_GATES`/`HEAVY_GATES` pools from the `mk/gates/*.mk` drop-in fragments and
-  derives `.PHONY`, the `check` targets, and the ordering graph from them.
-- `mk/gates/` — one drop-in fragment per gate (`<NNN>-<name>.mk`: a `CHEAP_GATES`/
-  `HEAVY_GATES +=` self-registration line, the recipe, and its doc comment). This
-  directory IS the authoritative gate list — adding a gate adds a file, so concurrent
-  gate PRs touch different files and don't collide on a shared list line. The `<NNN>`
-  prefix sets order (cheap serial-first, heavy LPT for `-j2`); `make list-gates` prints
-  the assembled pools.
+- `builder/src/gates.rs` + `builder/src/check_loop.rs` — td's OWN gate runner
+  (`td-builder gate-run`, the in-sandbox scheduler) and the loop host prelude
+  (`td-builder check`); together they replaced the `Makefile` + `make` and the
+  shell check.sh logic. The runner derives the ordering graph from the compiled
+  gate registry (cheap serial-first, heavy after the last cheap gate, build
+  gates after `build-recipes`), runs heavy gates longest-first from the measured
+  timing table, and bounds the whole box with the machine-wide slot pool.
+- `builder/src/gate_defs/` — one compiled Rust file per gate
+  (`<NNN>-<gate>.rs`: `pub fn gate() -> GateDef` — pools, deps, specs, and the
+  plain-bash `script` body as a raw string, plus the gate's doc comments;
+  `builder/build.rs` generates the registry, same pattern as `recipes/`). This
+  directory IS the authoritative gate list — adding a gate adds a file, so
+  concurrent gate PRs touch different files and never collide on a shared list
+  line; a malformed gate is a compile error, not a runtime surprise. The `<NNN>`
+  prefix sets the registration/serial order (heavy start order is data-driven
+  from `.td-build-cache/gate-timing/latest.txt`, falling back to `<NNN>`);
+  `td-builder gate-run list-gates` prints the assembled pools.
 - `system/` — the two load-bearing Guile modules: `td-builder.scm` (the guix
   td-builder package — `td-build.scm`'s fixtures use it as their builder/oracle;
   check.sh's loop container is provisioned by the guix-free stage0 instead) and

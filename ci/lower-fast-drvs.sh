@@ -36,7 +36,7 @@ lower() {
 # --search-paths` line that provisions the loop toolchain profile, so it cannot
 # drift (same source ci/lower-check-drvs.sh parses). The fast tier needs no
 # skopeo/signify (those are heavy-rung tools).
-tools=$(sed -n 's/^    \(make bash [a-z0-9 .+-]*\) \\$/\1/p' check.sh)
+tools=$(cat tools/loop-toolchain.txt)
 test -n "$tools" || { echo "ERROR: could not parse toolchain from check.sh" >&2; exit 1; }
 # shellcheck disable=SC2086
 $GUIX build -d $tools

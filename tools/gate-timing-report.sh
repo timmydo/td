@@ -1,9 +1,9 @@
 #!/bin/sh
-# gate-timing-report.sh — reduce one `make check` run's per-recipe START/END
-# events (logged by tools/gate-time.sh) into a per-gate wall-clock table,
-# longest first. Makes latency regressions visible and lets the heavy-gate LPT
-# order (mk/gates/<NNN> filename prefixes) be re-sorted from DATA rather than the
-# hand-run numbers (task L1).
+# gate-timing-report.sh — reduce one check run's per-gate START/END events
+# (logged natively by the gate runner, `td-builder gate-run`) into a per-gate
+# wall-clock table, longest first. Makes latency regressions visible; the runner
+# reads the reduced table back (latest.txt) to start heavy gates longest-first,
+# so the LPT order is data-driven rather than hand-renumbered (task L1).
 #
 # Pure POSIX sh + coreutils (sort/ls/date): NO bash, NO awk — it leans on nothing
 # beyond what the gate recipes already need. Timestamps are integer nanoseconds
@@ -68,7 +68,7 @@ fmt() { ns=$1; printf '%d.%03d' "$(( ns / 1000000000 ))" "$(( (ns % 1000000000) 
 
 report=$(
   echo "# td gate wall-clock — $(date -u '+%Y-%m-%dT%H:%M:%SZ') — $(basename "$log")"
-  echo "# per-gate wall span (gates run in parallel under make -j; the sum is NOT the wall time)."
+  echo "# per-gate wall span (gates run in parallel; the sum is NOT the wall time)."
   echo "# heavy rows drive the mk/gates/<NNN> LPT order — renumber longest-first when this drifts."
   printf '%-34s %-6s %10s\n' GATE KIND SECONDS
   printf '%s\n' "$rows" | sort -rn | while IFS="$TAB" read -r dur kind gate; do

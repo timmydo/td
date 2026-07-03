@@ -10,7 +10,7 @@
 //! the development PR diffed this port's `--path` output byte-for-byte against the
 //! live shell over 180+ paths. With the shell retired, the durable guards that
 //! remain are `run_self_test` ported to native Rust `#[test]`s (the dynamic mapping,
-//! over the real `mk/gates`/`tests` tree) + `renders_exact_output_for_static_paths`
+//! over the real `gate_defs`/`tests` tree) + `renders_exact_output_for_static_paths`
 //! (frozen full-render byte-equality) — both run every PR via the required
 //! `cargo-test` job / `check-engine` smoke.
 //!
@@ -159,123 +159,86 @@ impl Selection {
 }
 
 // ---------------------------------------------------------------------------
-// mk/gates/*.mk parsing (the shell `sed` extractors).
+// Gate registry access. The gates are compiled Rust (src/gate_defs/*.rs, the
+// build.rs registry) — the old mk/gates sed extractors became direct registry
+// reads: this binary IS the runner, so the diff mapping and the scheduler read
+// the SAME table by construction.
 // ---------------------------------------------------------------------------
 
-/// Sorted absolute paths of `mk/gates/*.mk` (shell glob order = byte sort).
+/// Sorted absolute paths of `builder/src/gate_defs/*.rs` (one file per gate —
+/// the paths the diff mapping routes on).
 fn gate_files(root: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(root.join("mk/gates"))
+    let mut v: Vec<PathBuf> = std::fs::read_dir(root.join("builder/src/gate_defs"))
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "mk").unwrap_or(false))
+        .filter(|p| p.extension().map(|e| e == "rs").unwrap_or(false))
         .collect();
     v.sort();
     v
 }
 
-/// `^(NAME)[[:space:]]*+=[[:space:]]*REST` → REST, or None. NAME must be a whole
-/// token (so `CHEAP_GATESX` does not match `CHEAP_GATES`).
-fn parse_assign<'a>(line: &'a str, name: &str, op: &str) -> Option<&'a str> {
-    let rest = line.strip_prefix(name)?;
-    let rest = rest.trim_start_matches([' ', '\t']);
-    let rest = rest.strip_prefix(op)?;
-    Some(rest.trim_start_matches([' ', '\t']))
+/// The registry def whose file stem (`<NNN>-<gate>`) matches.
+fn def_for_stem(stem: &str) -> Option<crate::gates::GateDef> {
+    crate::gates::defs().into_iter().find(|(s, _)| *s == stem).map(|(_, d)| d)
 }
 
-const GATE_POOLS: [&str; 5] =
-    ["CHEAP_GATES", "HEAVY_GATES", "FAST_GATES", "SYSTEM_GATES", "PARKED_GATES"];
+fn stem_of(file: &Path) -> Option<String> {
+    file.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+}
 
-/// First `CHEAP/HEAVY/FAST/SYSTEM/PARKED_GATES += <target>` line's target (shell
-/// `target_from_gate_file`; note ENGINE/BUILD are intentionally NOT in the set).
-/// PARKED_GATES is the documented parking pool for a gate a human has unhooked
-/// pending a tracked fix (e.g. #292): the Makefile defines the pool but no check
-/// tier consumes it, so the gate stays an on-demand `./check.sh <gate>` target and
-/// its file edits still map here.
+/// The gate target a def file maps to. Engine-only gates return None (the
+/// check-engine smoke covers them — parity with the old extractor, which
+/// scanned CHEAP/HEAVY/FAST/SYSTEM/PARKED and intentionally not ENGINE).
+/// PARKED gates stay mapped: a parked gate (a human unhooked it pending a
+/// tracked fix) remains an on-demand `./check.sh <gate>` target.
 fn target_from_gate_file(file: &Path) -> Option<String> {
-    let body = std::fs::read_to_string(file).ok()?;
-    for line in body.lines() {
-        for name in GATE_POOLS {
-            if let Some(rest) = parse_assign(line, name, "+=") {
-                return Some(rest.to_string());
-            }
-        }
+    let stem = stem_of(file)?;
+    let def = def_for_stem(&stem)?;
+    let mapped = def.pools.iter().any(|p| !matches!(p, crate::gates::Pool::Engine));
+    if mapped {
+        Some(def.name.to_string())
+    } else {
+        None
     }
-    None
 }
 
-/// Every `<X>_SPECS := ...` token in a single gate file.
+/// The def file's spec list (the former `*_SPECS :=` extraction).
 fn specs_in_file(file: &Path) -> Vec<String> {
-    let body = match std::fs::read_to_string(file) {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    for line in body.lines() {
-        // `^[A-Za-z0-9_-]*_SPECS[[:space:]]*:=[[:space:]]*REST`
-        if let Some((lhs, rhs)) = line.split_once(":=") {
-            if lhs.starts_with(|c: char| c.is_whitespace()) {
-                continue;
-            }
-            let lhs = lhs.trim_end_matches([' ', '\t']);
-            if lhs.ends_with("_SPECS")
-                && lhs
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            {
-                out.extend(rhs.split_whitespace().map(str::to_string));
-            }
-        }
-    }
-    out
+    stem_of(file)
+        .and_then(|s| def_for_stem(&s))
+        .map(|d| d.specs.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default()
 }
 
-/// Every `NAME += <token>` value across all gate files (NAME in `names`).
-fn collect_registrations(root: &Path, names: &[&str]) -> Vec<String> {
-    let mut out = Vec::new();
-    for f in gate_files(root) {
-        let body = match std::fs::read_to_string(&f) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        for line in body.lines() {
-            for name in names {
-                if let Some(rest) = parse_assign(line, name, "+=") {
-                    out.push(rest.to_string());
-                }
-            }
-        }
-    }
-    out
+fn build_gates(_root: &Path) -> Vec<String> {
+    crate::gates::defs()
+        .into_iter()
+        .filter(|(_, d)| d.build_gate)
+        .map(|(_, d)| d.name.to_string())
+        .collect()
 }
 
-fn build_gates(root: &Path) -> Vec<String> {
-    collect_registrations(root, &["BUILD_GATES"])
-}
-
-/// First gate file whose `*_SPECS` contains `spec` → its registered target.
-fn target_for_build_spec(root: &Path, spec: &str) -> Option<String> {
-    for f in gate_files(root) {
-        let target = match target_from_gate_file(&f) {
-            Some(t) => t,
-            None => continue,
-        };
-        if specs_in_file(&f).iter().any(|s| s == spec) {
-            return Some(target);
-        }
-    }
-    None
+/// First gate whose `specs` contains `spec` → its target.
+fn target_for_build_spec(_root: &Path, spec: &str) -> Option<String> {
+    crate::gates::defs()
+        .into_iter()
+        .find(|(_, d)| d.specs.iter().any(|s| *s == spec))
+        .map(|(_, d)| d.name.to_string())
 }
 
 /// Would a plain `./check.sh` (cheap+heavy gates + build-recipes) cover `target`?
-fn default_check_covers_target(root: &Path, target: &str) -> bool {
+fn default_check_covers_target(_root: &Path, target: &str) -> bool {
     if target == "check-fast" || target == "build-recipes" {
         return true;
     }
-    collect_registrations(root, &["CHEAP_GATES", "HEAVY_GATES"])
-        .iter()
-        .any(|g| g == target)
+    crate::gates::defs().into_iter().any(|(_, d)| {
+        d.name == target
+            && d.pools
+                .iter()
+                .any(|p| matches!(p, crate::gates::Pool::Cheap | crate::gates::Pool::Heavy))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +342,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("Makefile|check.sh", p) {
+    if pattern_matches("check.sh|builder/build.rs|builder/src/gates.rs|builder/src/check_loop.rs", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("check-fast");
         sel.add_target("cargo-test");
@@ -389,7 +352,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if glob_match("mk/gates/*.mk", p) {
+    if glob_match("builder/src/gate_defs/*.rs", p) {
         sel.add_preflight("shell-syntax");
         sel.add_preflight("affected-self-test");
         let abs = root.join(p);
@@ -486,7 +449,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches(
-        "tests/toolchain-x86_64-input-addressed.sh|mk/gates/418-toolchain-x86_64-input-addressed.mk",
+        "tests/toolchain-x86_64-input-addressed.sh|builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         p,
     ) {
         sel.add_preflight("shell-syntax");
@@ -629,7 +592,13 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh", p) {
+    // tests/build-recipes.sh IS the build phase (the former Makefile build-recipes
+    // recipe, run by the gate runner) — a change to it affects every build gate,
+    // exactly like the build-phase helpers below.
+    if pattern_matches(
+        "tests/build-recipes.sh|tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh",
+        p,
+    ) {
         sel.add_preflight("shell-syntax");
         add_build_gate_targets(root, sel);
         return;
@@ -743,7 +712,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches(
-        "tests/rust-x86_64-runtime-store-native.sh|seed/sources/zlib-*.lock|mk/gates/416-rust-x86_64-runtime-store-native.mk",
+        "tests/rust-x86_64-runtime-store-native.sh|seed/sources/zlib-*.lock|builder/src/gate_defs/416-rust-x86_64-runtime-store-native.rs",
         p,
     ) {
         sel.add_preflight("shell-syntax");
@@ -756,7 +725,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // #258 rust userland: ripgrep built by the native x86_64 /td/store toolchain (gate 424).
     if pattern_matches(
-        "tests/rust-x86_64-userland-store-native.sh|mk/gates/424-rust-userland-x86_64-store-native.mk",
+        "tests/rust-x86_64-userland-store-native.sh|builder/src/gate_defs/424-rust-userland-x86_64-store-native.rs",
         p,
     ) {
         sel.add_preflight("shell-syntax");
@@ -765,7 +734,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches(
-        "tests/userland-x86_64-store-native.sh|seed/sources/busybox-*.lock|seed/sources/make-4.4*.lock|mk/gates/420-userland-x86_64-store-native.mk",
+        "tests/userland-x86_64-store-native.sh|seed/sources/busybox-*.lock|seed/sources/make-4.4*.lock|builder/src/gate_defs/420-userland-x86_64-store-native.rs",
         p,
     ) {
         sel.add_preflight("shell-syntax");
@@ -930,14 +899,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
     // The rung-X2 native gcc gate's consumer test: a native x86_64 gcc/binutils built on top of the
     // cross toolchain. Maps only to gate 422 (the native build is downstream of the cross rungs). The
-    // gate's mk/gates/422-*.mk file is already handled by the generic `mk/gates/*.mk` arm above.
+    // gate's gate_defs/422-*.rs file is already handled by the generic gate_defs arm above.
     if pattern_matches("tests/bootstrap-x86_64-native-gcc-store-native.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         return;
     }
     if pattern_matches(
-        "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|mk/gates/414-bootstrap-x86_64-toolchain-store-native.mk",
+        "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|builder/src/gate_defs/414-bootstrap-x86_64-toolchain-store-native.rs",
         p,
     ) {
         sel.add_preflight("shell-syntax");
@@ -1339,9 +1308,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         fail("default coverage: system gate oci-load is not covered by plain ./check.sh".into());
     }
 
-    // Every gate file maps (via the mk/gates/*.mk arm) to its own gate target.
+    // Every gate file maps (via the builder/src/gate_defs/*.rs arm) to its own gate target.
     for f in gate_files(root) {
-        let rel = format!("mk/gates/{}", f.file_name().unwrap().to_string_lossy());
+        let rel = format!("builder/src/gate_defs/{}", f.file_name().unwrap().to_string_lossy());
         match target_from_gate_file(&f) {
             Some(gate) if !gate.is_empty() => assert_target!(&rel, &gate),
             _ => fail(format!("{rel}: no gate registration found")),
@@ -1349,8 +1318,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     }
 
 
-    // Every BUILD_GATE is selected by the build-pkg/cache-lib arm.
+    // Every BUILD_GATE is selected by the build-phase arm (build-recipes is the
+    // phase itself; build-pkg/cache-lib are its helpers).
     for bg in build_gates(root) {
+        assert_target!("tests/build-recipes.sh", &bg);
         assert_target!("tests/build-pkg.sh", &bg);
         assert_target!("tests/cache-lib.sh", &bg);
     }
@@ -1371,8 +1342,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
 
     // A gate-file change still selects the dispatcher's own self-test preflight
     // (now the in-process `td-builder affected-checks --self-test`) and is waived.
-    assert_contains!("mk/gates/325-cargo-test.mk", "td-builder affected-checks --self-test");
-    assert_branch_policy!("mk/gates/325-cargo-test.mk", "full ./check.sh would be waived");
+    assert_contains!("builder/src/gate_defs/325-cargo-test.rs", "td-builder affected-checks --self-test");
+    assert_branch_policy!("builder/src/gate_defs/325-cargo-test.rs", "full ./check.sh would be waived");
     assert_target!("tests/repro-lib.sh", "bootstrap-binutils-244-store-native");
     assert_branch_policy!("tests/repro-lib.sh", "full ./check.sh would be waived");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
@@ -1419,13 +1390,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "bootstrap-x86_64-native-gcc-store-native"
     );
     assert_target!(
-        "mk/gates/422-bootstrap-x86_64-native-gcc-store-native.mk",
+        "builder/src/gate_defs/422-bootstrap-x86_64-native-gcc-store-native.rs",
         "bootstrap-x86_64-native-gcc-store-native"
     );
     assert_target!("tests/x86_64-cross-fns.sh", "bootstrap-x86_64-native-gcc-store-native");
     assert_target!("tests/toolchain-x86_64-input-addressed.sh", "toolchain-x86_64-input-addressed");
     assert_target!(
-        "mk/gates/418-toolchain-x86_64-input-addressed.mk",
+        "builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         "toolchain-x86_64-input-addressed"
     );
     assert_target!(
@@ -1433,7 +1404,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "rust-userland-x86_64-store-native"
     );
     assert_target!(
-        "mk/gates/424-rust-userland-x86_64-store-native.mk",
+        "builder/src/gate_defs/424-rust-userland-x86_64-store-native.rs",
         "rust-userland-x86_64-store-native"
     );
     assert_target!(
@@ -1447,7 +1418,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("seed/sources/busybox-1.37.0.lock", "userland-x86_64-store-native");
     assert_target!("seed/sources/make-4.4.1.lock", "userland-x86_64-store-native");
     assert_target!(
-        "mk/gates/420-userland-x86_64-store-native.mk",
+        "builder/src/gate_defs/420-userland-x86_64-store-native.rs",
         "userland-x86_64-store-native"
     );
     assert_target!("tests/td-cmake-demo.lock", "cmake");
@@ -1749,14 +1720,14 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
     }
 
-    /// The repo fixtures the self-test reads (`mk/gates` + `tests/`) are present only
+    /// The repo fixtures the self-test reads (`tests/` + the gate-def files) are present only
     /// when cargo runs from the full checkout — the `cargo-test` GATE and the required
     /// CI `cargo-test` job, both on every PR. The `td-builder` GUIX package build runs
     /// `cargo test` too, but its source is `local-file "../builder"` — ONLY the crate,
-    /// no `mk/gates`/`tests/` — so the self-test skips there (not a weakening: the gate
+    /// no `tests/` or check.sh — so the self-test skips there (not a weakening: the gate
     /// + CI still run it fully every PR). Markers must be repo files OUTSIDE `builder/`.
     fn repo_tree_present(root: &Path) -> bool {
-        root.join("mk/gates").is_dir() && root.join("check.sh").is_file()
+        root.join("builder/src/gate_defs").is_dir() && root.join("check.sh").is_file()
     }
 
     #[test]
@@ -1766,8 +1737,8 @@ mod tests {
         assert!(glob_match("seed/sources/make-*.lock", "seed/sources/make-4.4.lock"));
         assert!(!glob_match("seed/sources/make-*.lock", "seed/sources/make-4.4.lockX"));
         assert!(!glob_match("CHEAP_GATES", "CHEAP_GATESX"));
-        assert!(pattern_matches("Makefile|check.sh", "check.sh"));
-        assert!(!pattern_matches("Makefile|check.sh", "Makefile2"));
+        assert!(pattern_matches("check.sh|builder/src/gates.rs", "check.sh"));
+        assert!(!pattern_matches("check.sh|builder/src/gates.rs", "check.sh2"));
     }
 
     #[test]
@@ -1778,7 +1749,7 @@ mod tests {
         assert_eq!(spec, "td-russh-demo");
     }
 
-    // DURABLE: the dispatcher's own policy, exercised over the real mk/gates +
+    // DURABLE: the dispatcher's own policy, exercised over the real gate_defs +
     // tests tree. Runs on every PR via the required `cargo-test` job. No shell,
     // no Guix — it still holds with no oracle in the room.
     #[test]

@@ -243,6 +243,29 @@ pub fn getgid() -> u32 {
     unsafe { syscall5(SYS_GETGID, 0, 0, 0, 0, 0) as u32 }
 }
 
+/// flock(2) LOCK_EX|LOCK_NB — the gate runner's machine-wide slot pool (gates.rs).
+/// A slot is an exclusively-flocked file; the kernel releases the lock when the
+/// holding process exits (even on SIGKILL), so a crashed gate can never leak a slot
+/// — the property that makes the cross-agent pool safe without a reaper.
+const SYS_FLOCK: usize = 73;
+const LOCK_EX: usize = 2;
+const LOCK_NB: usize = 4;
+const EWOULDBLOCK: i32 = 11;
+
+/// Try to take an exclusive, non-blocking flock on FD. `Ok(true)` = acquired (held
+/// until the fd closes); `Ok(false)` = another process holds it; `Err` = real failure.
+pub fn flock_try_exclusive(fd: i32) -> io::Result<bool> {
+    let ret = unsafe { syscall5(SYS_FLOCK, fd as usize, LOCK_EX | LOCK_NB, 0, 0, 0) };
+    if ret == 0 {
+        return Ok(true);
+    }
+    let errno = -ret as i32;
+    if errno == EWOULDBLOCK {
+        return Ok(false);
+    }
+    Err(io::Error::from_raw_os_error(errno))
+}
+
 /// fork(2): returns the child PID in the parent and 0 in the child. The
 /// host-sandbox forks AFTER unshare(CLONE_NEWUSER|CLONE_NEWPID) so the child is
 /// PID 1 of the fresh PID namespace (the namespace's first process), which then
