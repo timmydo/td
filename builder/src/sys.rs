@@ -252,6 +252,16 @@ const LOCK_EX: usize = 2;
 const LOCK_NB: usize = 4;
 const EWOULDBLOCK: i32 = 11;
 
+/// kill(2) to a whole PROCESS GROUP (negative pid) — the gate-tree memory
+/// watchdog's enforcement (gates.rs): SIGKILL the gate's process group when its
+/// aggregate RSS crosses the tree budget.
+const SYS_KILL: usize = 62;
+
+pub fn kill_process_group(pgid: u32, sig: usize) -> io::Result<()> {
+    let neg = -(i64::from(pgid));
+    check(unsafe { syscall5(SYS_KILL, neg as usize, sig, 0, 0, 0) })
+}
+
 /// Try to take an exclusive, non-blocking flock on FD. `Ok(true)` = acquired (held
 /// until the fd closes); `Ok(false)` = another process holds it; `Err` = real failure.
 pub fn flock_try_exclusive(fd: i32) -> io::Result<bool> {

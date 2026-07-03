@@ -14,7 +14,7 @@
 //!     path host-sandbox already binds into every check sandbox). flock dies with
 //!     the holder, so a SIGKILLed gate can never leak a slot. Every run can
 //!     therefore use `-j$(nproc)` without N runs multiplying to N×nproc: the pool
-//!     (TD_CHECK_SLOTS, default 2×nproc — over-provisioned; memory admission +
+//!     (TD_CHECK_SLOTS, default 8×nproc — a runaway BRAKE, not a schedule; memory admission +
 //!     the per-gate rlimit backstop are the safety limits, #319) caps the box, `-j` only the local
 //!     width. This replaces the retired AGENTS.md "two checks, -j2, stagger by
 //!     hand" guidance — scheduling is the runner's job now, not the agents'.
@@ -368,6 +368,26 @@ struct SlotPool {
     /// pressure isn't ours and blocking the whole loop forever is worse; the
     /// per-gate rlimit backstop contains the runaway). `<= 0` disables.
     min_free_gib: f64,
+    /// Memory-PRESSURE admission ceiling (PSI `some avg10`, %): unlike
+    /// MemAvailable — which LAGS allocation — pressure leads OOM and catches
+    /// reclaim-thrash, so it is the primary "go up until a memory limit"
+    /// signal (human direction re #319). `<= 0` disables.
+    psi_limit: f64,
+    /// Grant pacing (ms): at most one slot grant per interval box-wide, so a
+    /// herd of ready gates cannot all pass the memory checks in the window
+    /// BEFORE any of them has allocated (the lag the pace exists to damp).
+    pace_ms: u64,
+}
+
+/// PSI memory `some avg10` from /proc/pressure/memory (None: no PSI).
+fn mem_psi_some_avg10() -> Option<f64> {
+    parse_psi_some_avg10(&std::fs::read_to_string("/proc/pressure/memory").ok()?)
+}
+
+fn parse_psi_some_avg10(text: &str) -> Option<f64> {
+    let line = text.lines().find(|l| l.starts_with("some "))?;
+    let field = line.split_whitespace().find_map(|w| w.strip_prefix("avg10="))?;
+    field.parse().ok()
 }
 
 enum Grant {
@@ -380,6 +400,34 @@ enum Grant {
 }
 
 impl SlotPool {
+    /// The pace gate: one grant per pace_ms box-wide. Serialized by a flock'd
+    /// pace file whose contents are the last grant's ns timestamp; a busy lock
+    /// means another runner is granting RIGHT NOW — defer (that IS the pace).
+    fn pace_grant(&self, dir: &Path) -> bool {
+        if self.pace_ms == 0 {
+            return true;
+        }
+        let p = dir.join("grant.pace");
+        let Ok(f) = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&p)
+        else {
+            return true; // pacing is damping, never a correctness gate
+        };
+        use std::os::fd::AsRawFd;
+        if !matches!(crate::sys::flock_try_exclusive(f.as_raw_fd()), Ok(true)) {
+            return false;
+        }
+        let last: u128 = std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0);
+        let now = now_ns();
+        if now.saturating_sub(last) < u128::from(self.pace_ms) * 1_000_000 {
+            return false;
+        }
+        let _ = std::fs::write(&p, now.to_string());
+        true
+    }
+
     fn acquire(&self, aborted: &dyn Fn() -> bool) -> Grant {
         let Some(dir) = &self.dir else { return Grant::NoPool };
         // Loop-invariant: compute the slot paths once, not per 200ms poll.
@@ -423,15 +471,16 @@ impl SlotPool {
                 // is the binding safety limit. Defer the grant while
                 // MemAvailable is below the reserve, unless nothing else holds a
                 // slot (the daemon admit()'s no-deadlock rule).
-                let mem_ok = held == 0
-                    || self.min_free_gib <= 0.0
+                let mem_ok = self.min_free_gib <= 0.0
                     || crate::build_daemon::mem_available_gib()
                         .map(|g| g >= self.min_free_gib)
                         .unwrap_or(true);
-                if mem_ok {
+                let psi_ok = self.psi_limit <= 0.0
+                    || mem_psi_some_avg10().map(|p| p < self.psi_limit).unwrap_or(true);
+                if held == 0 || (mem_ok && psi_ok && self.pace_grant(dir)) {
                     return Grant::Held(f);
                 }
-                drop(f); // give the slot back while memory is tight
+                drop(f); // give the slot back while memory is tight or the pace gate defers
             }
             if aborted() {
                 return Grant::Aborted;
@@ -465,15 +514,23 @@ pub(crate) fn nproc() -> usize {
 /// memory-admission reserve.
 fn slot_pool_from_env() -> SlotPool {
     let n = match std::env::var("TD_CHECK_SLOTS") {
-        Ok(v) => v.trim().parse::<usize>().unwrap_or_else(|_| 2 * nproc()),
-        Err(_) => 2 * nproc(),
+        Ok(v) => v.trim().parse::<usize>().unwrap_or_else(|_| 8 * nproc()),
+        Err(_) => 8 * nproc(),
     };
     let min_free_gib = std::env::var("TD_MIN_FREE_GIB")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(4.0);
+    let psi_limit = std::env::var("TD_CHECK_MEM_PSI")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(10.0);
+    let pace_ms = std::env::var("TD_CHECK_GRANT_PACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(250);
     if n == 0 {
-        return SlotPool { dir: None, n: 0, min_free_gib };
+        return SlotPool { dir: None, n: 0, min_free_gib, psi_limit, pace_ms };
     }
     let dir = match std::env::var("TD_CHECK_SLOTS_DIR") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
@@ -484,7 +541,7 @@ fn slot_pool_from_env() -> SlotPool {
                     "gate-run: no HOME and no TD_CHECK_SLOTS_DIR — running WITHOUT the \
                      machine-wide slot pool (local -j is the only cap)"
                 );
-                return SlotPool { dir: None, n: 0, min_free_gib };
+                return SlotPool { dir: None, n: 0, min_free_gib, psi_limit, pace_ms };
             }
         },
     };
@@ -494,9 +551,9 @@ fn slot_pool_from_env() -> SlotPool {
              slot pool (local -j is the only cap)",
             dir.display()
         );
-        return SlotPool { dir: None, n: 0, min_free_gib };
+        return SlotPool { dir: None, n: 0, min_free_gib, psi_limit, pace_ms };
     }
-    SlotPool { dir: Some(dir), n, min_free_gib }
+    SlotPool { dir: Some(dir), n, min_free_gib, psi_limit, pace_ms }
 }
 
 // ---------------------------------------------------------------------------
@@ -525,7 +582,45 @@ fn timing_event(log: Option<&Path>, gate: &str, kind: &str) {
 /// Run one gate's body under `bash -c` (through `prlimit --data` when a
 /// per-process memory cap is configured), stdout+stderr appended in order to
 /// LOG_PATH (the per-gate output buffer). Returns success.
-fn run_gate(g: &Gate, root: &Path, log_path: &Path, timing: Option<&Path>, mem_mib: u64) -> bool {
+/// Sum the resident bytes of every process in PGID's process group
+/// (/proc/*/stat field 5 == pgid; RSS from /proc/*/statm resident pages).
+fn pgroup_rss_bytes(pgid: u32) -> u64 {
+    const PAGE: u64 = 4096; // platform pinned x86_64-linux
+    let Ok(entries) = std::fs::read_dir("/proc") else { return 0 };
+    let mut total = 0u64;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit())) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        // pgrp is field 5, but comm (field 2) may contain spaces — parse after
+        // the closing paren.
+        let Some(after) = stat.rsplit_once(')').map(|(_, a)| a) else { continue };
+        let mut it = after.split_whitespace();
+        let _state = it.next();
+        let _ppid = it.next();
+        let Some(grp) = it.next() else { continue };
+        if grp != pgid.to_string() {
+            continue;
+        }
+        let Ok(statm) = std::fs::read_to_string(format!("/proc/{pid}/statm")) else { continue };
+        if let Some(resident) = statm.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+        {
+            total = total.saturating_add(resident.saturating_mul(PAGE));
+        }
+    }
+    total
+}
+
+fn run_gate(
+    g: &Gate,
+    root: &Path,
+    log_path: &Path,
+    timing: Option<&Path>,
+    mem_mib: u64,
+    tree_mem_mib: u64,
+) -> bool {
     let mut logf = match std::fs::File::create(log_path) {
         Ok(f) => f,
         Err(e) => {
@@ -559,19 +654,64 @@ fn run_gate(g: &Gate, root: &Path, log_path: &Path, timing: Option<&Path>, mem_m
         for (k, v) in &g.extra_env {
             cmd.env(k, v);
         }
-        match cmd.status() {
-            Ok(st) if st.success() => true,
+        // Own process group: the tree watchdog kills by pgid, and a gate's
+        // children must never share the runner's group.
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = writeln!(logf, "gate-run: FAIL: gate {}: cannot spawn bash: {e}", g.name);
+                timing_event(timing, &g.name, "END");
+                return false;
+            }
+        };
+        let pgid = child.id();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let breached = std::sync::atomic::AtomicBool::new(false);
+        let status = std::thread::scope(|ws| {
+            if tree_mem_mib > 0 {
+                ws.spawn(|| {
+                    let budget = tree_mem_mib.saturating_mul(1024 * 1024);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if pgroup_rss_bytes(pgid) > budget {
+                            breached.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                });
+            }
+            let st = child.wait();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            st
+        });
+        if breached.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = writeln!(
+                logf,
+                "gate-run: FAIL: gate {} — process-tree RSS exceeded the {tree_mem_mib} MiB \
+                 budget (TD_CHECK_GATE_TREE_MEM_MIB); the whole process group was killed",
+                g.name
+            );
+        }
+        match status {
+            Ok(st) if st.success() && !breached.load(std::sync::atomic::Ordering::Relaxed) => true,
             Ok(st) => {
-                let _ = writeln!(
-                    logf,
-                    "gate-run: FAIL: gate {} — body exited {}",
-                    g.name,
-                    st.code().unwrap_or(-1)
-                );
+                if !breached.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = writeln!(
+                        logf,
+                        "gate-run: FAIL: gate {} — body exited {}",
+                        g.name,
+                        st.code().unwrap_or(-1)
+                    );
+                }
                 false
             }
             Err(e) => {
-                let _ = writeln!(logf, "gate-run: FAIL: gate {}: cannot spawn bash: {e}", g.name);
+                let _ = writeln!(logf, "gate-run: FAIL: gate {}: wait failed: {e}", g.name);
                 false
             }
         }
@@ -645,6 +785,14 @@ struct RunCfg {
     /// --resume: skip gates journaled green for THIS tree key (issue #320).
     /// Opt-in, interactive iteration only — CI and the daily never pass it.
     resume: bool,
+    /// AGGREGATE tree budget per gate, in MiB (0 = off): a watchdog samples the
+    /// gate's process group's summed RSS and SIGKILLs the whole group on breach
+    /// — the layer the per-process rlimit below cannot provide (N children each
+    /// under the per-process cap can collectively exceed the box; human review
+    /// re #319). KNOWN GAP: a setsid() escapee leaves the process group and the
+    /// sampler's sight — the cgroup v2 layer is the escape-proof successor once
+    /// the host delegates a subtree.
+    gate_tree_mem_mib: u64,
     /// Per-PROCESS RLIMIT_DATA cap for gate bodies, in MiB (0 = off). Applied
     /// via util-linux `prlimit` from the provisioned toolchain: with the pool
     /// over-provisioned past nproc (#319), one runaway allocator must die by
@@ -799,7 +947,14 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 let log_path = cfg.log_dir.join(format!("{}.log", g.name));
                 let started = std::time::Instant::now();
                 let ok =
-                    run_gate(g, &cfg.root, &log_path, cfg.timing_log.as_deref(), cfg.gate_mem_mib);
+                    run_gate(
+                    g,
+                    &cfg.root,
+                    &log_path,
+                    cfg.timing_log.as_deref(),
+                    cfg.gate_mem_mib,
+                    cfg.gate_tree_mem_mib,
+                );
                 print_gate_output(&g.name, &log_path, ok, started.elapsed().as_secs_f64());
                 if ok {
                     if let Some(key) = &cfg.tree_key {
@@ -972,6 +1127,13 @@ pub fn cli(args: &[String]) -> ExitCode {
         );
         resume = false;
     }
+    // TD_CHECK_GATE_TREE_MEM_MIB: aggregate per-gate process-tree budget
+    // (default 16 GiB; 0 off). Enforced by the runner itself via /proc — no
+    // prlimit, no cgroups needed.
+    let gate_tree_mem_mib: u64 = std::env::var("TD_CHECK_GATE_TREE_MEM_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(16384);
     let cfg = RunCfg {
         root: root.clone(),
         jobs,
@@ -981,6 +1143,7 @@ pub fn cli(args: &[String]) -> ExitCode {
         tree_key,
         resume,
         gate_mem_mib,
+        gate_tree_mem_mib,
     };
     match run_selected(&set, &selected, &cfg) {
         Ok(true) => {
@@ -1083,12 +1246,13 @@ mod tests {
         RunCfg {
             root: dir.to_path_buf(),
             jobs,
-            pool: SlotPool { dir: sdir, n, min_free_gib: 0.0 },
+            pool: SlotPool { dir: sdir, n, min_free_gib: 0.0, psi_limit: 0.0, pace_ms: 0 },
             timing_log: None,
             log_dir: dir.join("logs"),
             tree_key: None,
             resume: false,
             gate_mem_mib: 0,
+            gate_tree_mem_mib: 0,
         }
     }
 
@@ -1144,13 +1308,25 @@ mod tests {
         assert!(crate::sys::flock_try_exclusive(holder.as_raw_fd()).unwrap());
         // An impossibly-high reserve: with a held slot present, the free slot
         // must NOT be granted (deferred), so the aborted() escape is taken.
-        let pool = SlotPool { dir: Some(slots.clone()), n: 2, min_free_gib: 1e9 };
+        let pool = SlotPool { dir: Some(slots.clone()), n: 2, min_free_gib: 1e9, psi_limit: 0.0, pace_ms: 0 };
         assert!(matches!(pool.acquire(&|| true), Grant::Aborted));
         // Same reserve, but nothing else held: the no-deadlock rule admits.
+        // Poll briefly: another test thread's Command::spawn may have forked
+        // while `holder` was open — the child inherits the flock'd fd until
+        // its exec's CLOEXEC closes it, keeping the lock alive a few ms past
+        // drop(). Production tolerates the same window as one poll cycle.
         drop(holder);
-        assert!(matches!(pool.acquire(&|| true), Grant::Held(_)));
+        let mut admitted = false;
+        for _ in 0..40 {
+            if matches!(pool.acquire(&|| true), Grant::Held(_)) {
+                admitted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(admitted, "no-deadlock rule must admit once the inherited fd clears");
         // Reserve disabled: always admits.
-        let pool = SlotPool { dir: Some(slots), n: 2, min_free_gib: 0.0 };
+        let pool = SlotPool { dir: Some(slots), n: 2, min_free_gib: 0.0, psi_limit: 0.0, pace_ms: 0 };
         assert!(matches!(pool.acquire(&|| true), Grant::Held(_)));
     }
 
@@ -1172,6 +1348,44 @@ mod tests {
         // Green half: with the cap off the same body passes.
         let c = cfg(&d, 2, None);
         assert!(run_selected(&set, &sel, &c).unwrap(), "uncapped hog must pass");
+    }
+
+    #[test]
+    fn tree_watchdog_kills_a_collectively_oversized_process_group() {
+        let d = tmpdir("tree");
+        // Four children, ~32 MiB each — every one modest, ~128 MiB together.
+        // NOTE the echo after sleep: bash EXECS a trailing command over itself,
+        // which would free the 32 MiB string before the sampler's first tick —
+        // the trailing echo keeps each subshell (and its allocation) resident.
+        let hog = r#"for i in 1 2 3 4; do ( x=$(head -c 33554432 /dev/zero | tr '\0' a); sleep 3; echo ${#x} ) & done; wait; echo tree-done"#;
+        let set = synth(&d, &[("tree", Pool::Heavy, hog, &[])]);
+        let sel = expand_goals(&set, &["tree".to_string()]).unwrap();
+        // VERIFIED-RED half: a 64 MiB TREE budget kills the group (each child is
+        // far under any per-process cap — only the aggregate trips).
+        let mut c = cfg(&d, 2, None);
+        c.gate_tree_mem_mib = 64;
+        assert!(!run_selected(&set, &sel, &c).unwrap(), "64MiB tree budget must red the group");
+        // Green half: watchdog off, the same tree passes.
+        let c = cfg(&d, 2, None);
+        assert!(run_selected(&set, &sel, &c).unwrap(), "unbudgeted tree must pass");
+    }
+
+    #[test]
+    fn psi_parser_reads_some_avg10() {
+        let sample = "some avg10=3.25 avg60=1.00 avg300=0.10 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!(parse_psi_some_avg10(sample), Some(3.25));
+        assert_eq!(parse_psi_some_avg10("garbage"), None);
+    }
+
+    #[test]
+    fn pace_gate_defers_within_the_interval_and_admits_after() {
+        let d = tmpdir("pace");
+        let pool =
+            SlotPool { dir: Some(d.clone()), n: 1, min_free_gib: 0.0, psi_limit: 0.0, pace_ms: 200 };
+        assert!(pool.pace_grant(&d), "first grant is free");
+        assert!(!pool.pace_grant(&d), "second grant inside the interval defers");
+        std::thread::sleep(Duration::from_millis(220));
+        assert!(pool.pace_grant(&d), "grant admits after the interval");
     }
 
     #[test]
