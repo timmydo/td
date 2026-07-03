@@ -24,10 +24,14 @@ labels: []
 ## Collisions
 
 <!-- The files/gates/areas this work touches. Name any exclusive-landing files
-     (check.sh, Makefile, channels.scm) and any regenerate-on-rebase baselines.
-     Claimable only while disjoint from every open PR's territory. -->
+     (check.sh, Makefile, channels.scm) and any shared regenerated baselines
+     (e.g. tests/guix-surface-shrink.expected, tests/guix-dependence.expected —
+     regenerate on rebase, never hand-merge). Claimable only while disjoint
+     from every open PR's territory. -->
 
 ## Blocked by
 
-<!-- Issue/PR numbers that must close first, or "none". A blocker is cleared
-     when the referenced number is closed — there is no label to maintain. -->
+<!-- Issue/PR numbers that must clear first, or "none". A blocker is cleared
+     when the referenced issue closes as completed or the referenced PR merges
+     (a not-planned or unmerged close doesn't clear it) — there is no label to
+     maintain. -->

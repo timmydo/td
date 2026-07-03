@@ -62,7 +62,7 @@ bootstrap replaces the guix toolchain seed.
    
 4. **PR is the proposal.** One-maintainer project: build the smallest *complete*
    increment — a real working capability with its migration cut over in the one PR
-   (directive 9), never a partial mechanism — on a branch and open a PR; the human's
+   (directive 8), never a partial mechanism — on a branch and open a PR; the human's
    PR approval is the sign-off. No written proposal or pre-approval is needed to
    start work; build it, then PR it. Keep design notes terse, and surface any
    weakened gate in the PR (directive 3). There is no roadmap to enroll in — the
@@ -216,7 +216,7 @@ A task is done only when ALL hold:
   possibility") — and passes,
 - you have seen that assertion fail (verified-red) before trusting the pass,
 - the change is a complete, atomic increment — a real capability with any replaced path
-  removed in the same PR (directive 9), not a partial mechanism,
+  removed in the same PR (directive 8), not a partial mechanism,
 - it is committed with a message stating what test now passes,
 - it is landed on main via the landing protocol below.
 
@@ -233,9 +233,13 @@ tracking system, and all working notes live in the git log + PR body.
 - **Take work from the issue backlog.** `gh issue list` is the menu. An issue
   is claimable when ALL hold: (a) it is open and **no open PR references it** —
   scan `gh pr list` (the open PRs are authoritative; `gh issue list --search
-  'is:open -linked:pr'` is a convenience pre-filter, but a stale link from a
-  closed PR can lie either way); (b) everything in its "Blocked by" line is
-  closed; (c) its **Collisions** section is disjoint from the territory of
+  'is:open -linked:pr'` is a convenience pre-filter, but it lies both ways —
+  a closed PR's leftover closing link hides a claimable issue, and an open PR
+  that mentions an issue without a closing keyword leaves it looking free);
+  (b) every blocker in its "Blocked by" line is cleared — the referenced
+  issue closed as completed / the referenced PR merged (a not-planned or
+  unmerged close doesn't clear it: reassess, don't proceed);
+  (c) its **Collisions** section is disjoint from the territory of
   every open PR (and from the exclusive-landing spine below, unless you
   sequence behind it). Issues follow the work-item shape
   (`.github/ISSUE_TEMPLATE/work-item.md`): What / Entry points / Done /
@@ -248,17 +252,21 @@ tracking system, and all working notes live in the git log + PR body.
   early (main is branch-protected; nothing lands directly) with `Closes #NNN`
   in the body — that link IS your claim, and GitHub closes the issue on the
   squash merge. Release the claim by closing the PR (and comment on the issue
-  with what you learned) if you abandon the work. Self-directed work not on
-  the backlog claims the same way — a draft PR with a title naming the
-  workstream; file the issue first when the work spans more than one PR, so
-  its territory is visible to other agents.
+  with what you learned) if you abandon the work. Racing claims: if two open
+  PRs claim the same issue, the lower PR number wins and the other closes with
+  a comment. Dead claims: a draft PR with no pushes for 48 hours is abandoned —
+  any agent may close it (with a comment) to release the issue. Self-directed
+  work not on the backlog is still claimed by a draft PR — the title names the
+  workstream in place of a `Closes` link; file the issue first when the work
+  spans more than one PR, so its territory is visible to other agents.
 
 - **File issues for follow-up work you find but don't do.** Work discovered
   mid-task that doesn't fit the current PR becomes an issue in the work-item
   shape — never a code TODO, never a parked half-mechanism (directive 8), and
   never a note in agent-private memory. Declare its Collisions honestly and
   name its blockers; a well-formed issue is the only sanctioned way to defer
-  work.
+  work. (Filing an issue records a deferral — it does not license splitting a
+  migration; directive 8 still requires raising that with the human first.)
 
 - **Work in your own git worktree/branch** (`git worktree add
   ../td-<name>`), never on a shared checkout of main. Your running
