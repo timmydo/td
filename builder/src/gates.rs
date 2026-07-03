@@ -1529,14 +1529,31 @@ mod tests {
         let hog = r#"x=$(head -c 134217728 /dev/zero | tr '\0' a); sleep 1; echo ${#x}"#;
         let set = synth(&d, &[("cghog", Pool::Heavy, hog, &[])]);
         let sel = expand_goals(&set, &["cghog".to_string()]).unwrap();
+        // FIRST HOP: self-move into a host leaf so the gate bodies' own moves
+        // are within-delegation (mirrors cgroup_run_dir; without it the enter
+        // write is EPERM and the red half would be red for the WRONG reason —
+        // which is exactly how the first live run of this test caught the
+        // common-ancestor rule).
+        let host = run.join("host");
+        std::fs::create_dir(&host).unwrap();
+        if std::fs::write(host.join("cgroup.procs"), std::process::id().to_string()).is_err() {
+            let _ = std::fs::remove_dir(&host);
+            let _ = std::fs::remove_dir(&run);
+            return; // delegation without the first-hop grant — see check_loop
+        }
         let mut c = cfg(&d, 2, None);
         c.cgroup_dir = Some(run.clone());
         c.gate_tree_mem_mib = 32; // 128 MiB allocation vs a 32 MiB cgroup cap
         assert!(!run_selected(&set, &sel, &c).unwrap(), "cgroup memory.max must red the hog");
+        // The RIGHT red: the kernel OOM inside the cgroup, named in the log —
+        // never the enter-failure exit 97 (that once masked an EPERM as red).
+        let log = std::fs::read_to_string(d.join("logs/cghog.log")).unwrap_or_default();
+        assert!(log.contains("OOM-killed inside its cgroup"), "red must be the cgroup OOM, got: {log}");
         let mut c2 = cfg(&d, 2, None);
         c2.cgroup_dir = Some(run.clone());
         c2.gate_tree_mem_mib = 1024;
         assert!(run_selected(&set, &sel, &c2).unwrap(), "roomy cgroup cap must pass");
+        let _ = std::fs::remove_dir(&host);
         let _ = std::fs::remove_dir(&run);
     }
 

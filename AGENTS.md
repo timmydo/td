@@ -308,6 +308,11 @@ tracking system, and all working notes live in the git log + PR body.
   leave a finished PR in draft (the human reads draft as "don't review yet").
   If the human asks about a draft PR, treat it as the signal your readiness
   state drifted: reconcile immediately (mark ready or say what's missing).
+  **Marking ready REQUIRES the subagent code review to already be POSTED on the
+  PR with its findings addressed** (landing step 2 — waivable only for a
+  trivial docs/comment-only diff, and only by saying so in the PR). A PR that
+  is non-draft with no review comment on it is a protocol violation the human
+  should not have to catch (they did once — this sentence is that lesson).
 
 - **Claim by opening a draft PR that links the issue.** Open your **draft PR**
   early (main is branch-protected; nothing lands directly) with `Closes #NNN`

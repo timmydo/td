@@ -245,6 +245,13 @@ fn s(v: &str) -> String {
 fn cgroup_delegated_root() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(v) = std::env::var("TD_CGROUP_ROOT") {
+        // `off` forces the NON-cgroup path on a delegated machine — keeps the
+        // watchdog fallback testable where cgroup mode would otherwise win
+        // (human direction 2026-07-03).
+        if matches!(v.as_str(), "off" | "none" | "0") {
+            eprintln!("td-builder check: cgroup mode disabled (TD_CGROUP_ROOT={v}) — using the watchdog fallback");
+            return None;
+        }
         if !v.is_empty() {
             candidates.push(PathBuf::from(v));
         }
@@ -271,10 +278,61 @@ fn cgroup_delegated_root() -> Option<PathBuf> {
 fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
     // +memory must be enabled at EVERY level above the gate leaves.
     let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory");
+    // Sweep DEAD runs' leftovers: a run dir can't remove itself (the check
+    // process sits in its own host leaf until exit), so each run reaps its
+    // predecessors — empty leaves + parents whose pid is gone rmdir cleanly;
+    // a LIVE concurrent run's dirs are populated and refuse, which is the
+    // correct discrimination.
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = e.file_name();
+            let is_run = name.to_str().map(|n| n.starts_with("run-") || n.starts_with("td-test-")).unwrap_or(false);
+            if !is_run || !p.is_dir() {
+                continue;
+            }
+            if let Ok(children) = std::fs::read_dir(&p) {
+                for c in children.flatten() {
+                    if c.path().is_dir() {
+                        let _ = std::fs::remove_dir(c.path());
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&p);
+        }
+    }
     let run = root.join(format!("run-{}", std::process::id()));
     std::fs::create_dir(&run).ok()?;
+    // Enable child controllers BEFORE any process joins (no-internal-process
+    // rule: a cgroup can't gain controllers while populated).
     if std::fs::write(run.join("cgroup.subtree_control"), "+memory").is_err() {
         let _ = std::fs::remove_dir(&run);
+        return None;
+    }
+    // THE FIRST HOP: migrating a process needs write access to the COMMON
+    // ANCESTOR's cgroup.procs, and this process starts OUTSIDE the delegated
+    // subtree — so self-move ONCE here (into a host leaf; the run dir itself
+    // must stay process-free, it has child controllers). Every descendant
+    // (sandbox → gate-run → gates) then inherits, and the gates' own moves
+    // (host leaf → gate leaf) share the user-owned run dir as ancestor —
+    // always permitted. If THIS write is EPERM, the delegation lacks the
+    // first-hop grant — group-writable root cgroup.procs (chgrp+g+w for the
+    // loop user's group), or a PAM session hook placing sessions inside the
+    // subtree as systemd's PID1 does — fall back loudly.
+    let host_leaf = run.join("host");
+    if std::fs::create_dir(&host_leaf).is_err()
+        || std::fs::write(host_leaf.join("cgroup.procs"), std::process::id().to_string())
+            .is_err()
+    {
+        let _ = std::fs::remove_dir(&host_leaf);
+        let _ = std::fs::remove_dir(&run);
+        eprintln!(
+            "td-builder check: delegated cgroup subtree found but the FIRST HOP into it \
+             is denied (common-ancestor cgroup.procs) — grant it once, e.g.  \
+             sudo sh -c 'chgrp <loop-group> /sys/fs/cgroup/cgroup.procs && chmod g+w \
+             /sys/fs/cgroup/cgroup.procs'  (cgroupfs perms reset at boot: persist it \
+             in the system config; issue #328)"
+        );
         return None;
     }
     Some(run)
@@ -593,10 +651,18 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some(dir) => {
             child_envs.push((s("TD_CHECK_CGROUP"), dir.display().to_string()));
         }
-        None => eprintln!(
-            "td-builder check: no delegated cgroup subtree — per-gate tree memory \
-             budgets fall back to the sampling watchdog (delegation setup: issue #328)"
-        ),
+        // (The off-knob and first-hop branches already said their piece.)
+        None if !matches!(
+            std::env::var("TD_CGROUP_ROOT").ok().as_deref(),
+            Some("off") | Some("none") | Some("0")
+        ) =>
+        {
+            eprintln!(
+                "td-builder check: no delegated cgroup subtree — per-gate tree memory \
+                 budgets fall back to the sampling watchdog (delegation setup: issue #328)"
+            )
+        }
+        None => {}
     }
 
     // The verdict-journal tree key (issue #320): computed on the HOST (git is
@@ -682,6 +748,9 @@ fn run(args: &[String]) -> Result<i32, String> {
     // Best-effort cgroup cleanup: gate leaves are removed by gate-run; the
     // per-run parent goes here (empty by now; a leftover only wastes a dir).
     if let Some(dir) = &cgroup_run {
+        // NOTE: this process still SITS in dir/host, so that rmdir fails and
+        // the run dir lingers until the process exits — harmless (empty dirs),
+        // and the next run uses a fresh pid-keyed dir. Gate leaves go now.
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 if e.path().is_dir() {
