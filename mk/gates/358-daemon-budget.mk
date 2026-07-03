@@ -18,6 +18,11 @@
 # lexicographic-first picked a STALE binary predating the `daemon` subcommand, so the socket
 # never appeared (a latent red hidden while the daily runner was down, #293/#268; fresh
 # checkouts have one placement and never saw it).
+# TD_MIN_FREE_GIB=0 on the daemon spawn disables its memory-reserve admission (a separate
+# mechanism with its own build_daemon.rs unit test, which also passes 0.0): below the default
+# 4 GiB reserve admit() serializes slot claims, so a memory-pressured runner would read peak 1
+# and falsely red the peak==budget assertion. The gate tests the BUDGET cap; pinning the
+# reserve off keeps the ceiling deterministic, per the gate's own charter above.
 HEAVY_GATES += daemon-budget
 daemon-budget:
 	@echo ">> daemon-budget: the shared build daemon caps concurrent builds at its global budget across independent submitters (the machine-wide limiter)"
@@ -27,7 +32,7 @@ daemon-budget:
 	test -x "$$tb" || { echo "FAIL: no td-builder binary for the gate" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.daemon-budget-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch/d"; \
 	sock="$$scratch/sock"; budget=2; \
-	TD_BUILD_JOBS=$$budget TD_DAEMON_TEST_SLEEP_MS=400 "$$tb" daemon "$$sock" "$$scratch/unused-store-db" "$$scratch/d" > "$$scratch/daemon.log" 2>&1 & dpid=$$!; \
+	TD_BUILD_JOBS=$$budget TD_DAEMON_TEST_SLEEP_MS=400 TD_MIN_FREE_GIB=0 "$$tb" daemon "$$sock" "$$scratch/unused-store-db" "$$scratch/d" > "$$scratch/daemon.log" 2>&1 & dpid=$$!; \
 	trap 'kill $$dpid 2>/dev/null || true; rm -rf "$$scratch"' EXIT; \
 	t=0; while [ ! -S "$$sock" ] && [ $$t -lt 50 ]; do sleep 0.2; t=$$((t+1)); done; \
 	[ -S "$$sock" ] || { echo "FAIL: daemon socket never appeared" >&2; cat "$$scratch/daemon.log" >&2; exit 1; }; \
