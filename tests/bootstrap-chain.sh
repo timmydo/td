@@ -27,8 +27,8 @@ GLIBC_P2="$ROOT/seed/patches/glibc-bootstrap-system-2.2.5.patch"
 GLIBC_P2_SHA=a8a214f78c96723fee3d9d26b59249029e617bc720880ca2789a66ed73e2c7d0
 lf() { sed -n "s/^$2 //p" "$1" | head -1; }
 
-make_curated_path() {
-  cdir=`mktemp -d`/bin; mkdir -p "$cdir"; oldifs=$IFS; IFS=:
+make_curated_path() { # $1 (optional): a stable parent dir — warm mode reuses ONE farm per key
+  cdir=${1:-`mktemp -d`}/bin; mkdir -p "$cdir"; oldifs=$IFS; IFS=:
   for d in $PATH; do [ -d "$d" ] || continue; for f in "$d"/*; do b=`basename "$f"`
     case "$b" in gcc|g++|cc|c++|cpp|gcc-*|g++-*|clang|clang*|tcc|guile|guild|guile-*|guix|guix-*) continue ;; esac
     [ -e "$cdir/$b" ] || ln -s "$f" "$cdir/$b" 2>/dev/null || true; done; done
@@ -869,18 +869,22 @@ build_glibc_241() {
 # finalize the modern toolchain (no /gnu/store, relocated glibc ld-scripts, kernel headers in glibc).
 bootstrap_modern_toolchain() {
 # #317 — the FLIPPED gate-state default: chain bricks persist MACHINE-WIDE, content-keyed and
-# NAR-verified, under TD_CHAIN_CACHE (the gate runner wires it per gate: Shared gates get
-# ~/.td/build-daemon/chain — bound RW into every check sandbox at the same absolute path —
+# NAR-verified, under TD_CHECK_CHAIN_CACHE (the gate runner wires it per gate: Shared gates
+# get ~/.td/build-daemon/chain — bound RW into every check sandbox at the same absolute path —
 # and Private gates get "" = cold). Warm mode builds every brick under the KEYED cache dir
 # (TMPDIR moves there), so brick paths are stable and bricks are reused IN PLACE — later
 # bricks bake these paths (interp, symlinks), so a cached brick must never move — and the
 # EXIT cleanup trap is skipped (persistence is the point; the shared dir is the state).
-# Cold mode (TD_CHAIN_CACHE explicitly empty, or no flock/$TB) is the pre-#317 from-scratch
-# behavior, unchanged. The key covers this file + every seed lock/patch + the seed tree:
-# any recipe or pin change re-keys the chain, so sharing can never serve a stale brick.
+# Cold mode (TD_CHECK_CHAIN_CACHE explicitly empty) is the pre-#317 from-scratch behavior,
+# unchanged; a REQUESTED warm cache that cannot be used safely fails closed (see the lib).
+# The key covers this file + every seed lock/patch + the seed tree + channels.scm (the
+# pinned host toolchain the curated PATH exposes — awk/flex/bison/… come from it): any
+# recipe, pin, or host-toolchain change re-keys the chain, so sharing can never serve a
+# stale brick.
 . tests/chain-cache-lib.sh
-TD_CHAIN_CACHE="${TD_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
-chain_cache_init chain tests/bootstrap-chain.sh seed/sources/*.lock seed/patches/* `find seed/stage0 -type f | sort`
+TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
+chain_cache_init chain tests/bootstrap-chain.sh channels.scm seed/sources/*.lock seed/patches/* `find seed/stage0 -type f | sort` \
+  || fail "chain-cache: the requested warm brick cache is unusable (see message above)"
 # brick8's elf-set-interp rewrites PT_INTERP IN PLACE (shrink-or-equal; td's elf.rs has no patchelf-style
 # grow). The toolchain binaries' build-time interp lives under TMPDIR (…/glibcsharedbuild/out/lib/ld-linux.so.2)
 # and MUST be >= the /td/store target interp (/td/store/<32-char-hash>-glibc-2.41/lib/ld-linux.so.2, 71 chars),
@@ -982,11 +986,15 @@ echo "   [pinned-input] + binutils-2.44/glibc-2.41 (the modern toolchain final p
 # path that breaks fixincludes). MAKEINFO=true. Installs via DESTDIR (prefix is the unwritable /td/store).
 # --- the brick ladder — warm: chain_hit reuses a NAR-verified brick at its recorded stable
 # path, else build + chain_save (recording ONLY the products later consumers read — some
-# whole trees are deliberately not recorded because a later brick ADDS files to them, e.g.
-# build_binutils/build_gcc copy crt into $TCCD/out/lib). Cold: every branch misses and this
-# is exactly the old straight-line ladder. cpath (the curated host-PATH symlink farm) is
-# rebuilt per run in both modes — it mirrors the CURRENT host PATH and costs nothing.
-cpath=`make_curated_path`
+# whole trees are deliberately not recorded because a later brick ADDS files to them; the
+# crt set build_binutils/build_gcc re-copy into $TCCD/out/lib is staged and RECORDED by the
+# tcc brick itself, so the re-copies are identical bytes and NAR-invisible). Cold: every
+# branch misses and this is exactly the old straight-line ladder.
+# cpath (the curated host-PATH symlink farm): ONE farm per key in warm mode, created under
+# the key lock and reused forever (cached brick scripts bake shebangs into it, and same key
+# ⇒ same pinned host toolchain, channels.scm being a key input; make_curated_path only adds
+# missing links, so re-runs are idempotent). Cold mode keeps the per-run mktemp dir.
+if [ "$CHAIN_WARM" = 1 ]; then cpath=`make_curated_path "$CHAIN_DIR/cpath"`; else cpath=`make_curated_path`; fi
 for bad in gcc g++ cc guile guix; do test ! -e "$cpath/$bad" || fail "curated PATH still exposes '$bad'"; done
 if chain_hit tc; then tc=$CHAIN_PATH; else
   tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
@@ -996,7 +1004,11 @@ if chain_hit mes; then mesp=$CHAIN_PATH; else
   chain_save mes "$mesp" "$mesp"; fi
 if chain_hit tcc; then TCCD=$CHAIN_PATH; else
   TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$cpath" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
-  chain_save tcc "$TCCD" "$TCCD/tcc" "$TCCD/libc.a" "$TCCD/libtcc1.a" "$TCCD/crt1.o" "$TCCD/crti.o" "$TCCD/crtn.o"; fi
+  # stage tcc's crt search dir (its baked crtprefix) HERE so it is part of the recorded,
+  # NAR-verified brick — build_binutils/build_gcc re-copy the same bytes (NAR-invisible),
+  # and a mixed hit/miss run can never link against an unverified out/lib.
+  mkdir -p "$TCCD/out/lib"; cp "$TCCD"/crt1.o "$TCCD"/crti.o "$TCCD"/crtn.o "$TCCD"/libc.a "$TCCD/out/lib/" || fail "tcc crt staging failed"
+  chain_save tcc "$TCCD" "$TCCD/tcc" "$TCCD/libc.a" "$TCCD/libtcc1.a" "$TCCD/crt1.o" "$TCCD/crti.o" "$TCCD/crtn.o" "$TCCD/out/lib"; fi
 if chain_hit make; then MK=$CHAIN_PATH; else
   MK=`mktemp -d`/makebuild; build_make "$tc" "$cpath" "$mesp" "$TCCD" "$MK" || fail "tcc did not build GNU Make 3.80"
   chain_save make "$MK" "$MK/make"; fi
@@ -1048,7 +1060,7 @@ if chain_hit gcc-14; then GCC14B=$CHAIN_PATH; else
 if chain_hit binutils-244; then BMB244SB=$CHAIN_PATH; else
   BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
   chain_save binutils-244 "$BMB244SB" "$BMB244SB"; fi
-if chain_hit glibc-241; then GLIBC241B=$CHAIN_PATH; GLIBC241="$GLIBC241B/stage/td/store/glibc-2.41"; else
+if chain_hit glibc-241; then GLIBC241B=$CHAIN_PATH; else
   GLIBC241B=`mktemp -d`/glibc241build; build_glibc_241 "$cpath" "$GCC14B/stage/td/store/gcc-14.3.0" "$GSH/out" "$BMB244SB" "$GLIBC241B" || fail "the toolchain did not build the modern glibc 2.41"
   GLIBC241="$GLIBC241B/stage/td/store/glibc-2.41"
   # finalize BEFORE recording, so a reused brick is already relocated+header-complete:
@@ -1061,6 +1073,7 @@ if chain_hit glibc-241; then GLIBC241B=$CHAIN_PATH; GLIBC241="$GLIBC241B/stage/t
   # → "linux/limits.h: No such file"). Harmless for the C/C++ verify below (it includes no kernel headers).
   khb8=`mktemp -d`; tar -xzf "$KH_TB" -C "$khb8" || fail "brick8: kernel headers unpack failed"
   for kd in linux asm asm-generic mtd rdma scsi sound video xen drm misc; do test -d "$khb8/$kd" && cp -rn "$khb8/$kd" "$GLIBC241/include/" 2>/dev/null || true; done
+  rm -rf "$khb8"   # scratch only — everything needed was copied into the glibc include dir
   chain_save glibc-241 "$GLIBC241B" "$GLIBC241"; fi
 # the bricks are recorded — concurrent agents blocked on the key lock can now cache-hit.
 chain_done

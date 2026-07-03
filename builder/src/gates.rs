@@ -70,13 +70,13 @@ pub enum Pool {
 pub enum StoreMode {
     /// The default: the gate may read/populate the machine-wide content-keyed
     /// caches (the shared daemon store, the chain-brick cache). The runner
-    /// exports TD_CHAIN_CACHE (default `~/.td/build-daemon/chain`, a path
+    /// exports TD_CHECK_CHAIN_CACHE (default `~/.td/build-daemon/chain`, a path
     /// host-sandbox binds into every check sandbox) unless the caller already
-    /// set it — an explicitly EMPTY ambient TD_CHAIN_CACHE forces a cold run.
+    /// set it — an explicitly EMPTY ambient TD_CHECK_CHAIN_CACHE forces a cold run.
     Shared,
     /// The explicit opt-out for gates whose assertions require a cold store
     /// (hermeticity/offline/sandbox probes, GC semantics, seed-alone standup):
-    /// the runner force-clears TD_CHAIN_CACHE so no warm state can leak in.
+    /// the runner force-clears TD_CHECK_CHAIN_CACHE so no warm state can leak in.
     Private,
 }
 
@@ -673,20 +673,19 @@ fn run_gate(
             .stdout(std::process::Stdio::from(out))
             .stderr(std::process::Stdio::from(err));
         // The #317 gate-state wiring: Shared (the default) gets the machine-wide
-        // chain-brick cache exported; Private gets TD_CHAIN_CACHE FORCE-CLEARED —
+        // chain-brick cache exported; Private gets TD_CHECK_CHAIN_CACHE FORCE-CLEARED —
         // set-and-empty, NOT unset: the consuming libs default an UNSET var to the
         // warm home, so only an explicit "" keeps warm state out of a gate whose
-        // feature is clean-slate behavior.
+        // feature is clean-slate behavior. (This one env var IS the whole per-gate
+        // store-mode contract — deliberately no second signal to keep in sync.)
         match g.store {
             StoreMode::Shared => {
-                cmd.env("TD_GATE_STORE", "shared");
                 if let Some(cc) = chain_cache {
-                    cmd.env("TD_CHAIN_CACHE", cc);
+                    cmd.env("TD_CHECK_CHAIN_CACHE", cc);
                 }
             }
             StoreMode::Private => {
-                cmd.env("TD_GATE_STORE", "private");
-                cmd.env("TD_CHAIN_CACHE", "");
+                cmd.env("TD_CHECK_CHAIN_CACHE", "");
             }
         }
         if !g.specs.is_empty() {
@@ -841,9 +840,9 @@ struct RunCfg {
     /// OOM-killer. Per-process, so a make -jN tree of modest compilers passes.
     gate_mem_mib: u64,
     /// The warm chain-brick cache exported to Shared gates (#317): the ambient
-    /// TD_CHAIN_CACHE if the caller set one (empty = the operator's force-cold
+    /// TD_CHECK_CHAIN_CACHE if the caller set one (empty = the operator's force-cold
     /// switch), else `~/.td/build-daemon/chain`. None (no HOME) leaves the gate
-    /// env untouched. Private gates ALWAYS get TD_CHAIN_CACHE force-cleared.
+    /// env untouched. Private gates ALWAYS get TD_CHECK_CHAIN_CACHE force-cleared.
     chain_cache: Option<String>,
 }
 
@@ -1180,10 +1179,10 @@ pub fn cli(args: &[String]) -> ExitCode {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(16384);
-    // The warm-cache home for Shared gates (#317): ambient TD_CHAIN_CACHE wins
+    // The warm-cache home for Shared gates (#317): ambient TD_CHECK_CHAIN_CACHE wins
     // (set-but-empty = the operator's force-cold switch), else the machine-wide
     // default under ~/.td/build-daemon (bound into every check sandbox).
-    let chain_cache = match std::env::var("TD_CHAIN_CACHE") {
+    let chain_cache = match std::env::var("TD_CHECK_CHAIN_CACHE") {
         Ok(v) => Some(v),
         Err(_) => std::env::var("HOME").ok().map(|h| format!("{h}/.td/build-daemon/chain")),
     };
@@ -1573,7 +1572,7 @@ mod tests {
     /// Through the REAL scheduler + bash execution — the #317 poison differential:
     /// with a warm cache configured and a poison marker seeded in it, the Shared gate
     /// sees exactly that cache (and can read the marker), while the Private gate gets
-    /// TD_CHAIN_CACHE force-cleared to SET-AND-EMPTY (not unset — the consuming libs
+    /// TD_CHECK_CHAIN_CACHE force-cleared to SET-AND-EMPTY (not unset — the consuming libs
     /// default an unset var to the warm home, so only an explicit "" is cold).
     #[test]
     fn store_mode_wires_the_chain_cache_env() {
@@ -1587,13 +1586,13 @@ mod tests {
                 (
                     "wshared",
                     Pool::Heavy,
-                    r#"test "$TD_GATE_STORE" = shared && test "${TD_CHAIN_CACHE:-}" = "{D}/cache" && test -f "$TD_CHAIN_CACHE/poison" && touch {D}/shared.ok"#,
+                    r#"test "${TD_CHECK_CHAIN_CACHE:-}" = "{D}/cache" && test -f "$TD_CHECK_CHAIN_CACHE/poison" && touch {D}/shared.ok"#,
                     &[],
                 ),
                 (
                     "wprivate",
                     Pool::Heavy,
-                    r#"test "$TD_GATE_STORE" = private && test "${TD_CHAIN_CACHE+set}" = set && test -z "$TD_CHAIN_CACHE" && touch {D}/private.ok"#,
+                    r#"test "${TD_CHECK_CHAIN_CACHE+set}" = set && test -z "$TD_CHECK_CHAIN_CACHE" && touch {D}/private.ok"#,
                     &[],
                 ),
             ],
@@ -1610,7 +1609,7 @@ mod tests {
         assert!(d.join("shared.ok").exists(), "shared gate did not see the configured warm cache");
         assert!(
             d.join("private.ok").exists(),
-            "private gate's TD_CHAIN_CACHE was not force-cleared to set-and-empty"
+            "private gate's TD_CHECK_CHAIN_CACHE was not force-cleared to set-and-empty"
         );
     }
 }

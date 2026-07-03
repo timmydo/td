@@ -82,7 +82,7 @@ bootstrap replaces the guix toolchain seed.
    `store_modes_are_audited` cargo test, so widening or shrinking it is a reviewed
    act. Sharing skips redundant REBUILDS, never assertions: behavioral and
    reproducibility legs run every time, a cache entry is re-verified (NAR) on every
-   reuse, and the daily backstop runs force-cold (`TD_CHAIN_CACHE=` — set-and-empty)
+   reuse, and the daily backstop runs force-cold (`TD_CHECK_CHAIN_CACHE=` — set-and-empty)
    as the authoritative from-seed proof that the whole chain still builds.
   
 6. **No PR adds a guix dependency** — the guix surface only shrinks

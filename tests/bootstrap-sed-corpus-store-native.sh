@@ -31,12 +31,14 @@ ROOT=$(pwd)
 # The ~850-line seed→…→gcc-14.3.0+binutils-2.44+glibc-2.41 chain lives in the shared library
 # tests/bootstrap-chain.sh (extracted; all bootstrap-*-store-native gates can source it). This gate
 # adds ONLY the corpus step: build GNU sed 4.9 with that toolchain via td-builder build-recipe.
-. tests/bootstrap-chain.sh
-bootstrap_modern_toolchain   # from the seed: builds + verifies the toolchain; sets GCC14/GLIBC241/BMB244SB/CC1/cpath/KH_TB
-
+# stage0 FIRST: chain_cache_init (inside bootstrap_modern_toolchain) needs $TB for the warm
+# brick cache's NAR verification (#317) — a chain run without TB would fail closed.
 . tests/cache-lib.sh
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
+
+. tests/bootstrap-chain.sh
+bootstrap_modern_toolchain   # from the seed: builds + verifies the toolchain; sets GCC14/GLIBC241/BMB244SB/CC1/cpath/KH_TB
 snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 export TD_STORE_DIR=/td/store
 GLP=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$store" "$sndb"` || fail "store-add glibc-2.41 failed"
