@@ -233,6 +233,38 @@ fn s(v: &str) -> String {
     v.to_string()
 }
 
+/// The working-tree content key for the verdict journal (issue #320): sha256
+/// over git HEAD + the full dirty diff + every untracked file's bytes — ANY
+/// tree change yields a new key, so a --resume skip can never survive an edit
+/// (whole-tree invalidation, deliberately no per-gate cleverness). None when
+/// git is unavailable (resume then refuses to run).
+fn tree_key(root: &Path) -> Option<String> {
+    let git = |args: &[&str]| -> Option<Vec<u8>> {
+        let out = Command::new("git").args(args).current_dir(root).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(out.stdout)
+    };
+    let mut h = crate::sha256::Sha256::new();
+    h.update(&git(&["rev-parse", "HEAD"])?);
+    h.update(&git(&["diff", "HEAD"])?);
+    let status = git(&["status", "--porcelain=v1", "-uall", "-z"])?;
+    h.update(&status);
+    // Untracked file CONTENTS too — `git diff` cannot see them, and an edited
+    // untracked input changing a gate's behavior must invalidate the journal.
+    for entry in status.split(|b| *b == 0) {
+        let line = String::from_utf8_lossy(entry);
+        if let Some(path) = line.strip_prefix("?? ") {
+            if let Ok(bytes) = std::fs::read(root.join(path)) {
+                h.update(path.as_bytes());
+                h.update(&bytes);
+            }
+        }
+    }
+    Some(crate::sha256::to_base16(&h.finalize()))
+}
+
 /// The substitute-store exposure (x64-toolchain-subst): tools/warm-subst.sh
 /// echoes `export TD_SUBST_*='…'` lines when a prior daily populated ~/.td/subst;
 /// parse them into child env (host-sandbox preserves TD_SUBST_*). No-op on a
@@ -438,6 +470,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     // full-width run — the opposite of the user's intent).
     let mut goals: Vec<String> = Vec::new();
     let mut jobs_flag: Option<usize> = None;
+    let mut resume = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let jv = if a == "-j" || a == "--jobs" {
@@ -450,10 +483,12 @@ fn run(args: &[String]) -> Result<i32, String> {
                 Ok(n) if n >= 1 => jobs_flag = Some(n),
                 _ => return Err(fatal(&format!("bad {a} value — -j needs a positive integer"))),
             }
+        } else if a == "--resume" {
+            resume = true;
         } else if a.starts_with('-') {
             return Err(fatal(&format!(
-                "unknown flag `{a}` — td-builder check takes goals (tiers/gate names) \
-                 and -j N; there is no make behind this anymore"
+                "unknown flag `{a}` — td-builder check takes goals (tiers/gate names), \
+                 -j N, and --resume; there is no make behind this anymore"
             )));
         } else {
             goals.push(a.clone());
@@ -497,6 +532,23 @@ fn run(args: &[String]) -> Result<i32, String> {
         if let Ok(v) = std::env::var(k) {
             child_envs.push((k.to_string(), v));
         }
+    }
+    // The verdict-journal tree key (issue #320): computed on the HOST (git is
+    // not in the sandbox toolchain) and forwarded so gate-run journals every
+    // PASS; --resume additionally skips journaled-green gates for this exact
+    // key. TD_CHECK_FULL forces everything, resume included.
+    if std::env::var("TD_CHECK_FULL").is_ok() && resume {
+        eprintln!("td-builder check: TD_CHECK_FULL is set — ignoring --resume");
+        resume = false;
+    }
+    match tree_key(&root) {
+        Some(key) => child_envs.push((s("TD_CHECK_TREE"), key)),
+        None if resume => {
+            return Err(fatal(
+                "--resume needs a git working tree to key the verdict journal, and                  `git` failed here — cannot prove the tree is unchanged, refusing to skip",
+            ))
+        }
+        None => {}
     }
     child_envs.extend(subst_env(&root));
 
@@ -542,6 +594,9 @@ fn run(args: &[String]) -> Result<i32, String> {
     }
     argv.extend([tb.clone(), s("host-sandbox"), s("--expose-cwd"), s("--"), tb, s("gate-run")]);
     argv.extend([s("-j"), jobs.to_string()]);
+    if resume {
+        argv.push(s("--resume"));
+    }
     argv.extend(goals);
 
     let (head, rest) = argv

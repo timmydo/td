@@ -142,7 +142,10 @@ it and let the pool arbitrate.
 Every build/test runs inside that fresh td sandbox so your own
 environment cannot contaminate results; `./check.sh <target>` runs a
 single gate or tier in the same sandbox (`td-builder gate-run
-list-gates` prints the assembled pools).
+list-gates` prints the assembled pools). `./check.sh --resume` skips
+gates already journaled green for the IDENTICAL working tree (any edit
+invalidates every skip; skipped gates print loudly) — an interactive
+iteration aid only: CI and the daily backstop never pass it.
 
 Do not proceed to the next sub-task until the current one is green.
 
