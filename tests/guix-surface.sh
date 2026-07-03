@@ -118,6 +118,18 @@ cur_n=$(grep -c . "$work/cur" || true)
 # count; only real command lines. A NEW site fails (directive 8); the set may shrink
 # freely (re-baseline to lock the win). This is what would have caught the load-bearing
 # `guix repl` + /var/guix/db read an earlier store-of-record gate tried to add.
+#
+# KNOWN COARSENESS (each site is a per-file boolean, greps are substring regexes):
+#  - the `gc` regex matches INSIDE `guix gcc-toolchain`, so a real code line merely
+#    mentioning the guix gcc-toolchain (e.g. a fail-message string) records a PHANTOM
+#    `gc` site — confirm a `gc` site with a real `guix gc` command line before
+#    treating it as one. Phantom sites still only-shrink honestly, so the ratchet
+#    stays sound; the census counts just read high.
+#  - CONCURRENT SHRINK PRs: two branches removing DIFFERENT sites 3-way-merge
+#    textually clean but leave a STALE `surface-sites:` header count. Never
+#    hand-merge the .expected files — after rebasing, REGENERATE both
+#    (TD_SURFACE_WRITE=1 sh tests/guix-surface.sh) and re-verify with a no-write run
+#    (the compare greps the header out, but the count should be right for humans).
 shrink_expected="tests/guix-surface-shrink.expected"
 : > "$work/shrink.cur"
 while IFS= read -r f; do
