@@ -3428,7 +3428,14 @@ fn main() -> ExitCode {
                 let (computed, content) = store::construct_drv(&d, drv_name, &read)?;
                 let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
                 refs.extend(d.input_srcs.iter().cloned());
-                let socket = std::env::var("TD_DAEMON_SOCKET")
+                // The GUIX daemon's worker-protocol socket — deliberately NOT
+                // TD_DAEMON_SOCKET: that env var names td's OWN build daemon (a line
+                // protocol) since the machine-wide limiter landed, and check.sh exports
+                // it loop-wide, so reading it here dialed the wrong daemon and spoke
+                // binary worker-protocol at a line reader — the newline never came and
+                // the td daemon's accept thread blocked forever (the machine-wide wedge
+                // the daemon's read-timeout now bounds; this is the caller-side fix).
+                let socket = std::env::var("TD_GUIX_DAEMON_SOCKET")
                     .unwrap_or_else(|_| daemon::DEFAULT_SOCKET.to_string());
                 let mut dm = daemon::Daemon::connect(&socket)
                     .map_err(|e| format!("connect {socket}: {e}"))?;
@@ -3461,7 +3468,14 @@ fn main() -> ExitCode {
             let (name, file) = (&args[2], &args[3]);
             let run = || -> Result<String, String> {
                 let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
-                let socket = std::env::var("TD_DAEMON_SOCKET")
+                // The GUIX daemon's worker-protocol socket — deliberately NOT
+                // TD_DAEMON_SOCKET: that env var names td's OWN build daemon (a line
+                // protocol) since the machine-wide limiter landed, and check.sh exports
+                // it loop-wide, so reading it here dialed the wrong daemon and spoke
+                // binary worker-protocol at a line reader — the newline never came and
+                // the td daemon's accept thread blocked forever (the machine-wide wedge
+                // the daemon's read-timeout now bounds; this is the caller-side fix).
+                let socket = std::env::var("TD_GUIX_DAEMON_SOCKET")
                     .unwrap_or_else(|_| daemon::DEFAULT_SOCKET.to_string());
                 let mut dm = daemon::Daemon::connect(&socket)
                     .map_err(|e| format!("connect {socket}: {e}"))?;
@@ -4924,7 +4938,14 @@ fn main() -> ExitCode {
                     .ok_or_else(|| format!("computed path {computed} is malformed"))?;
                 let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
                 refs.extend(d.input_srcs.iter().cloned());
-                let socket = std::env::var("TD_DAEMON_SOCKET")
+                // The GUIX daemon's worker-protocol socket — deliberately NOT
+                // TD_DAEMON_SOCKET: that env var names td's OWN build daemon (a line
+                // protocol) since the machine-wide limiter landed, and check.sh exports
+                // it loop-wide, so reading it here dialed the wrong daemon and spoke
+                // binary worker-protocol at a line reader — the newline never came and
+                // the td daemon's accept thread blocked forever (the machine-wide wedge
+                // the daemon's read-timeout now bounds; this is the caller-side fix).
+                let socket = std::env::var("TD_GUIX_DAEMON_SOCKET")
                     .unwrap_or_else(|_| daemon::DEFAULT_SOCKET.to_string());
                 let mut dm = daemon::Daemon::connect(&socket)
                     .map_err(|e| format!("connect {socket}: {e}"))?;
