@@ -90,7 +90,7 @@ greet=`LD_LIBRARY_PATH="$ns/lib" "$ns/bin/hello"`; \
 test "$greet" = "Hello, world!" || { echo "FAIL: stage0-built hello did not greet ('$greet')" >&2; exit 1; }; \
 echo "  [DURABLE behavioral] the loop ran hello from td's own store output ($ns/bin/hello) → '$greet'"; \
 rm -rf "$scratch/chk"; \
-"$s0" check "$drv" "$b/closure.txt" "$scratch/chk" >/dev/null 2>"$scratch/chkerr" || { echo "FAIL: stage0-built hello NOT reproducible (td-builder check):" >&2; tail -6 "$scratch/chkerr" >&2; exit 1; }; \
+"$s0" check-drv "$drv" "$b/closure.txt" "$scratch/chk" >/dev/null 2>"$scratch/chkerr" || { echo "FAIL: stage0-built hello NOT reproducible (td-builder check):" >&2; tail -6 "$scratch/chkerr" >&2; exit 1; }; \
 echo "  [DURABLE intrinsic-reproducibility] td-builder check double-build agrees the stage0-built hello is reproducible (builder staged from td's own store both runs)"; \
 g=`$TD_GUIX build hello 2>/dev/null | grep -v -- '-debug' | head -1 || true`; \
 test -n "$g" || { echo "ERROR: could not resolve the guix hello oracle" >&2; exit 1; }; \

@@ -79,7 +79,7 @@ for S in $subjects; do \
   echo "  [$S DURABLE behavioral] $bh"; \
   if [ -f "$root/$S/repro-ok" ] && [ "$root/$S/repro-ok" -nt "$sdrv" ]; then echo "  [$S DURABLE repro] CACHED"; else \
     rm -rf "$root/$S/chk"; \
-    env -i HOME="$root" TMPDIR="$root/tmp" PATH="$cu/bin" "$tb" check "$sdrv" "$root/$S/closure.txt" "$root/$S/chk" >/dev/null 2>"$root/chkerr-$S" || { echo "FAIL: chained $S NOT reproducible:" >&2; tail -6 "$root/chkerr-$S" >&2; exit 1; }; \
+    env -i HOME="$root" TMPDIR="$root/tmp" PATH="$cu/bin" "$tb" check-drv "$sdrv" "$root/$S/closure.txt" "$root/$S/chk" >/dev/null 2>"$root/chkerr-$S" || { echo "FAIL: chained $S NOT reproducible:" >&2; tail -6 "$root/chkerr-$S" >&2; exit 1; }; \
     touch "$root/$S/repro-ok"; echo "  [$S DURABLE repro] td-builder check double-build agrees $S is reproducible"; fi; \
   gs=`$TD_GUIX build "$S" 2>/dev/null | grep -v -- '-debug\|-doc\|-static\|-lib$' | head -1 || true`; \
   if [ -n "$gs" ] && [ "$td_S" = "$gs" ]; then echo "FAIL: td's $S path equals guix's" >&2; exit 1; fi; \
