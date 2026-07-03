@@ -14,7 +14,7 @@
 //!     path host-sandbox already binds into every check sandbox). flock dies with
 //!     the holder, so a SIGKILLed gate can never leak a slot. Every run can
 //!     therefore use `-j$(nproc)` without N runs multiplying to N×nproc: the pool
-//!     (TD_CHECK_SLOTS, default 2×nproc — over-provisioned; memory admission +
+//!     (TD_CHECK_SLOTS, default 8×nproc — a runaway BRAKE, not a schedule; memory admission +
 //!     the per-gate rlimit backstop are the safety limits, #319) caps the box, `-j` only the local
 //!     width. This replaces the retired AGENTS.md "two checks, -j2, stagger by
 //!     hand" guidance — scheduling is the runner's job now, not the agents'.
@@ -368,6 +368,26 @@ struct SlotPool {
     /// pressure isn't ours and blocking the whole loop forever is worse; the
     /// per-gate rlimit backstop contains the runaway). `<= 0` disables.
     min_free_gib: f64,
+    /// Memory-PRESSURE admission ceiling (PSI `some avg10`, %): unlike
+    /// MemAvailable — which LAGS allocation — pressure leads OOM and catches
+    /// reclaim-thrash, so it is the primary "go up until a memory limit"
+    /// signal (human direction re #319). `<= 0` disables.
+    psi_limit: f64,
+    /// Grant pacing (ms): at most one slot grant per interval box-wide, so a
+    /// herd of ready gates cannot all pass the memory checks in the window
+    /// BEFORE any of them has allocated (the lag the pace exists to damp).
+    pace_ms: u64,
+}
+
+/// PSI memory `some avg10` from /proc/pressure/memory (None: no PSI).
+fn mem_psi_some_avg10() -> Option<f64> {
+    parse_psi_some_avg10(&std::fs::read_to_string("/proc/pressure/memory").ok()?)
+}
+
+fn parse_psi_some_avg10(text: &str) -> Option<f64> {
+    let line = text.lines().find(|l| l.starts_with("some "))?;
+    let field = line.split_whitespace().find_map(|w| w.strip_prefix("avg10="))?;
+    field.parse().ok()
 }
 
 enum Grant {
@@ -380,6 +400,34 @@ enum Grant {
 }
 
 impl SlotPool {
+    /// The pace gate: one grant per pace_ms box-wide. Serialized by a flock'd
+    /// pace file whose contents are the last grant's ns timestamp; a busy lock
+    /// means another runner is granting RIGHT NOW — defer (that IS the pace).
+    fn pace_grant(&self, dir: &Path) -> bool {
+        if self.pace_ms == 0 {
+            return true;
+        }
+        let p = dir.join("grant.pace");
+        let Ok(f) = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&p)
+        else {
+            return true; // pacing is damping, never a correctness gate
+        };
+        use std::os::fd::AsRawFd;
+        if !matches!(crate::sys::flock_try_exclusive(f.as_raw_fd()), Ok(true)) {
+            return false;
+        }
+        let last: u128 = std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0);
+        let now = now_ns();
+        if now.saturating_sub(last) < u128::from(self.pace_ms) * 1_000_000 {
+            return false;
+        }
+        let _ = std::fs::write(&p, now.to_string());
+        true
+    }
+
     fn acquire(&self, aborted: &dyn Fn() -> bool) -> Grant {
         let Some(dir) = &self.dir else { return Grant::NoPool };
         // Loop-invariant: compute the slot paths once, not per 200ms poll.
@@ -423,15 +471,16 @@ impl SlotPool {
                 // is the binding safety limit. Defer the grant while
                 // MemAvailable is below the reserve, unless nothing else holds a
                 // slot (the daemon admit()'s no-deadlock rule).
-                let mem_ok = held == 0
-                    || self.min_free_gib <= 0.0
+                let mem_ok = self.min_free_gib <= 0.0
                     || crate::build_daemon::mem_available_gib()
                         .map(|g| g >= self.min_free_gib)
                         .unwrap_or(true);
-                if mem_ok {
+                let psi_ok = self.psi_limit <= 0.0
+                    || mem_psi_some_avg10().map(|p| p < self.psi_limit).unwrap_or(true);
+                if held == 0 || (mem_ok && psi_ok && self.pace_grant(dir)) {
                     return Grant::Held(f);
                 }
-                drop(f); // give the slot back while memory is tight
+                drop(f); // give the slot back while memory is tight or the pace gate defers
             }
             if aborted() {
                 return Grant::Aborted;
@@ -465,15 +514,23 @@ pub(crate) fn nproc() -> usize {
 /// memory-admission reserve.
 fn slot_pool_from_env() -> SlotPool {
     let n = match std::env::var("TD_CHECK_SLOTS") {
-        Ok(v) => v.trim().parse::<usize>().unwrap_or_else(|_| 2 * nproc()),
-        Err(_) => 2 * nproc(),
+        Ok(v) => v.trim().parse::<usize>().unwrap_or_else(|_| 8 * nproc()),
+        Err(_) => 8 * nproc(),
     };
     let min_free_gib = std::env::var("TD_MIN_FREE_GIB")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(4.0);
+    let psi_limit = std::env::var("TD_CHECK_MEM_PSI")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(10.0);
+    let pace_ms = std::env::var("TD_CHECK_GRANT_PACE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(250);
     if n == 0 {
-        return SlotPool { dir: None, n: 0, min_free_gib };
+        return SlotPool { dir: None, n: 0, min_free_gib, psi_limit, pace_ms };
     }
     let dir = match std::env::var("TD_CHECK_SLOTS_DIR") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
@@ -484,7 +541,7 @@ fn slot_pool_from_env() -> SlotPool {
                     "gate-run: no HOME and no TD_CHECK_SLOTS_DIR — running WITHOUT the \
                      machine-wide slot pool (local -j is the only cap)"
                 );
-                return SlotPool { dir: None, n: 0, min_free_gib };
+                return SlotPool { dir: None, n: 0, min_free_gib, psi_limit, pace_ms };
             }
         },
     };
@@ -494,9 +551,9 @@ fn slot_pool_from_env() -> SlotPool {
              slot pool (local -j is the only cap)",
             dir.display()
         );
-        return SlotPool { dir: None, n: 0, min_free_gib };
+        return SlotPool { dir: None, n: 0, min_free_gib, psi_limit, pace_ms };
     }
-    SlotPool { dir: Some(dir), n, min_free_gib }
+    SlotPool { dir: Some(dir), n, min_free_gib, psi_limit, pace_ms }
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,7 +1140,7 @@ mod tests {
         RunCfg {
             root: dir.to_path_buf(),
             jobs,
-            pool: SlotPool { dir: sdir, n, min_free_gib: 0.0 },
+            pool: SlotPool { dir: sdir, n, min_free_gib: 0.0, psi_limit: 0.0, pace_ms: 0 },
             timing_log: None,
             log_dir: dir.join("logs"),
             tree_key: None,
@@ -1144,13 +1201,25 @@ mod tests {
         assert!(crate::sys::flock_try_exclusive(holder.as_raw_fd()).unwrap());
         // An impossibly-high reserve: with a held slot present, the free slot
         // must NOT be granted (deferred), so the aborted() escape is taken.
-        let pool = SlotPool { dir: Some(slots.clone()), n: 2, min_free_gib: 1e9 };
+        let pool = SlotPool { dir: Some(slots.clone()), n: 2, min_free_gib: 1e9, psi_limit: 0.0, pace_ms: 0 };
         assert!(matches!(pool.acquire(&|| true), Grant::Aborted));
         // Same reserve, but nothing else held: the no-deadlock rule admits.
+        // Poll briefly: another test thread's Command::spawn may have forked
+        // while `holder` was open — the child inherits the flock'd fd until
+        // its exec's CLOEXEC closes it, keeping the lock alive a few ms past
+        // drop(). Production tolerates the same window as one poll cycle.
         drop(holder);
-        assert!(matches!(pool.acquire(&|| true), Grant::Held(_)));
+        let mut admitted = false;
+        for _ in 0..40 {
+            if matches!(pool.acquire(&|| true), Grant::Held(_)) {
+                admitted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(admitted, "no-deadlock rule must admit once the inherited fd clears");
         // Reserve disabled: always admits.
-        let pool = SlotPool { dir: Some(slots), n: 2, min_free_gib: 0.0 };
+        let pool = SlotPool { dir: Some(slots), n: 2, min_free_gib: 0.0, psi_limit: 0.0, pace_ms: 0 };
         assert!(matches!(pool.acquire(&|| true), Grant::Held(_)));
     }
 
@@ -1172,6 +1241,24 @@ mod tests {
         // Green half: with the cap off the same body passes.
         let c = cfg(&d, 2, None);
         assert!(run_selected(&set, &sel, &c).unwrap(), "uncapped hog must pass");
+    }
+
+    #[test]
+    fn psi_parser_reads_some_avg10() {
+        let sample = "some avg10=3.25 avg60=1.00 avg300=0.10 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!(parse_psi_some_avg10(sample), Some(3.25));
+        assert_eq!(parse_psi_some_avg10("garbage"), None);
+    }
+
+    #[test]
+    fn pace_gate_defers_within_the_interval_and_admits_after() {
+        let d = tmpdir("pace");
+        let pool =
+            SlotPool { dir: Some(d.clone()), n: 1, min_free_gib: 0.0, psi_limit: 0.0, pace_ms: 200 };
+        assert!(pool.pace_grant(&d), "first grant is free");
+        assert!(!pool.pace_grant(&d), "second grant inside the interval defers");
+        std::thread::sleep(Duration::from_millis(220));
+        assert!(pool.pace_grant(&d), "grant admits after the interval");
     }
 
     #[test]
