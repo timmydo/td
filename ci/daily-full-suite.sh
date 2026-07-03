@@ -40,13 +40,22 @@ trap 'rm -f "$hlog" "$slog" "$xlog"' EXIT
 
 heavy_rc=0; system_rc=0; system_fail=""; harness_rc=0; harness_fail=""
 env_error=0; env_error_msg=""
-echo ">> daily backstop: full ./check.sh on origin/main ($main)"
+# The loop entry (check.sh retired, #318): host cargo builds td-builder, else the
+# pre-placed guix-free stage0 (the harness VM ships one).
+if command -v cargo >/dev/null 2>&1; then
+  cargo build --release --quiet --manifest-path builder/Cargo.toml
+  TDB=builder/target/release/td-builder
+else
+  TDB=$(ls .td-build-cache/stage0/store/*/bin/td-builder 2>/dev/null | head -1)
+fi
+[ -n "$TDB" ] && [ -x "$TDB" ] || { echo "daily: FATAL: no td-builder (need host cargo or a pre-placed stage0)" >&2; exit 1; }
+echo ">> daily backstop: full td-builder check on origin/main ($main)"
 # TD_SUBST_FORCE_BUILD=1: the daily is the SOLE from-seed authoritative build + publisher
 # (x64-toolchain-subst). Suppress the fetch short-circuit so gate 414 ALWAYS builds the x86_64
 # toolchain from seed and re-produces the closure export to publish below — otherwise a persistent
 # ~/.td/subst (the very thing the per-PR loop needs) would make the daily FETCH its own prior
 # publish and never rebuild/republish (self-starvation).
-TD_SUBST_FORCE_BUILD=1 TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} ./check.sh >"$hlog" 2>&1 || heavy_rc=$?
+TD_SUBST_FORCE_BUILD=1 TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} "$TDB" check >"$hlog" 2>&1 || heavy_rc=$?
 heavy_fail=$(grep -E '^FAIL' "$hlog" | head -5 | tr '\n' ';')
 
 # check.sh's own integrity guard (host guix == pinned channels.scm commit) aborts
@@ -63,8 +72,8 @@ if [ $heavy_rc -ne 0 ] && grep -q '^(check\.sh|td-builder check): FATAL: host gu
 fi
 
 if [ "$run_system" = 1 ] && [ $env_error -eq 0 ]; then
-  echo ">> daily backstop: ./check.sh check-system on origin/main ($main)"
-  TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} ./check.sh check-system >"$slog" 2>&1 || system_rc=$?
+  echo ">> daily backstop: td-builder check check-system on origin/main ($main)"
+  TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} "$TDB" check check-system >"$slog" 2>&1 || system_rc=$?
   system_fail=$(grep -E '^FAIL' "$slog" | head -5 | tr '\n' ';')
 elif [ "$run_system" = 1 ]; then
   system_rc=1
@@ -81,8 +90,8 @@ if [ $env_error -eq 1 ]; then
   harness_rc=4; harness_fail="SKIPPED — $env_error_msg"
   echo ">> daily backstop: check-harness SKIPPED — $env_error_msg"
 elif [ -d .td-build-cache/harness/store ] && [ -s .td-build-cache/harness/rel ]; then
-  echo ">> daily backstop: ./check.sh check-harness on origin/main ($main) — guix-free /td/store loop"
-  ./check.sh check-harness >"$xlog" 2>&1 || harness_rc=$?
+  echo ">> daily backstop: td-builder check check-harness on origin/main ($main) — guix-free /td/store loop"
+  "$TDB" check check-harness >"$xlog" 2>&1 || harness_rc=$?
   harness_fail=$(grep -E '^FAIL|^(check\.sh|td-builder check): FATAL' "$xlog" | head -5 | tr '\n' ';')
 else
   harness_rc=4; harness_fail="no .td-build-cache/harness persisted (gate 420 did not complete)"
