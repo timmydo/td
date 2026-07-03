@@ -1380,10 +1380,24 @@ fn realize_drv(
     // gate 290), UNIONed with the direct refs any td-OWNED store DB registers (build-plan's
     // td.dbs — a td-built dep staged outside the seed dirs). The candidate index (canonical
     // paths + a canonical→on-disk map) is built ONCE; the Scanner is reset() between roots.
+    //
+    // The candidate canonical prefix is ALWAYS the fixed guix-seed namespace
+    // (`store::STORE_DIR`, "/gnu/store") — NEVER `store::store_dir()` (the ACTIVE
+    // TD_STORE_DIR, which names where THIS recipe's own NEW output lands, e.g. /td/store
+    // for the store-persist / north-star builds). The seed bytes are guix-built and their
+    // embedded reference strings are canonically /gnu/store regardless of where the
+    // current build's output is placed; using the active store dir here silently
+    // mismatched every seed root/reference once TD_STORE_DIR diverged from /gnu/store —
+    // scan_candidate_index built candidates as `<TD_STORE_DIR>/<basename>` while the
+    // roots parsed from the drv/lock (and every literal store-path string embedded in the
+    // seed's own ELF/script bytes) stayed `/gnu/store/<basename>`, so NOTHING matched and
+    // the BFS silently collapsed to "roots only, zero transitive refs" (gate 377,
+    // store-persist: coreutils' bin/expr RPATHs to a /gnu/store gmp that was physically
+    // present in TD_SEED_STORE but never recognized as a candidate — issue #292).
     if seed_store_dirs.is_empty() {
         return Err("realize: no seed store dir given".to_string());
     }
-    let (candidates, on_disk) = scan_candidate_index(seed_store_dirs, &store::store_dir())?;
+    let (candidates, on_disk) = scan_candidate_index(seed_store_dirs, store::STORE_DIR)?;
     let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
     let extra_refs = merge_extra_refs(extra_dbs)?;
     // Each td-OWNED interned tree (the recipe source AND the vendored-crate tree) has its
