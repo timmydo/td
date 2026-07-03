@@ -63,7 +63,7 @@ impl Drop for Permit {
 }
 
 /// MemAvailable from /proc/meminfo, in GiB (None if unreadable).
-fn mem_available_gib() -> Option<f64> {
+pub(crate) fn mem_available_gib() -> Option<f64> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {

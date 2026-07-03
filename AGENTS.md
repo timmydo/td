@@ -130,9 +130,14 @@ exiting non-zero on any failure. Scheduling is the runner's job, not
 yours: cheap structural gates run serial-first, heavy gates run in
 parallel bounded by a machine-wide slot pool shared by every
 concurrent check on the box (flock'd slot files under
-`~/.td/build-daemon/slots`; TD_CHECK_SLOTS sizes it, default nproc) —
-so do NOT stagger checks, tune `-j`, or otherwise hand-schedule; run
-`./check.sh` whenever you need it and let the pool arbitrate.
+`~/.td/build-daemon/slots`; TD_CHECK_SLOTS sizes it, default 2×nproc —
+deliberately over-provisioned since most gates are single-threaded or
+IO/daemon-blocked; memory is the real safety limit: slot grants defer
+while MemAvailable is under TD_MIN_FREE_GIB (default 4, the daemon's
+knob) and every gate body runs under a per-process RLIMIT_DATA cap,
+TD_CHECK_GATE_MEM_MIB, default 8192) — so do NOT stagger checks, tune
+`-j`, or otherwise hand-schedule; run `./check.sh` whenever you need
+it and let the pool arbitrate.
 
 Every build/test runs inside that fresh td sandbox so your own
 environment cannot contaminate results; `./check.sh <target>` runs a
@@ -345,10 +350,13 @@ tracking system, and all working notes live in the git log + PR body.
 
 - **Resources:** scheduling is the gate runner's job, not yours. Every check's
   heavy gates draw from ONE machine-wide slot pool shared across all concurrent
-  checks and agents (default nproc slots; a crashed gate's slot is released by the
-  kernel), and builds are additionally bounded by the shared build daemon's global
-  budget — so run checks whenever you need them; do not stagger, throttle, or
-  hand-tune `-j`.
+  checks and agents (default 2×nproc slots — over-provisioned; a crashed gate's
+  slot is released by the kernel), guarded by memory rather than slot count:
+  grants defer while MemAvailable < TD_MIN_FREE_GIB, and each gate body runs
+  under a per-process TD_CHECK_GATE_MEM_MIB rlimit so a runaway reds cleanly
+  instead of OOMing the box. Builds are additionally bounded by the shared
+  build daemon's global budget — run checks whenever you need them; do not
+  stagger, throttle, or hand-tune `-j`.
 
 ## Repo conventions
 

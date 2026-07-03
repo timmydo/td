@@ -14,7 +14,8 @@
 //!     path host-sandbox already binds into every check sandbox). flock dies with
 //!     the holder, so a SIGKILLed gate can never leak a slot. Every run can
 //!     therefore use `-j$(nproc)` without N runs multiplying to N×nproc: the pool
-//!     (TD_CHECK_SLOTS, default nproc) is the box-wide cap, `-j` only the local
+//!     (TD_CHECK_SLOTS, default 2×nproc — over-provisioned; memory admission +
+//!     the per-gate rlimit backstop are the safety limits, #319) caps the box, `-j` only the local
 //!     width. This replaces the retired AGENTS.md "two checks, -j2, stagger by
 //!     hand" guidance — scheduling is the runner's job now, not the agents'.
 //!   • DATA-DRIVEN order: ready heavy gates start longest-first from the previous
@@ -361,6 +362,12 @@ fn duration_table(root: &Path) -> HashMap<String, f64> {
 struct SlotPool {
     dir: Option<PathBuf>,
     n: usize,
+    /// Memory-admission reserve (GiB): a free slot is only taken while
+    /// MemAvailable stays above this, EXCEPT when no other slot is held (the
+    /// daemon's `admit` no-deadlock rule, mirrored — if nothing else runs, the
+    /// pressure isn't ours and blocking the whole loop forever is worse; the
+    /// per-gate rlimit backstop contains the runaway). `<= 0` disables.
+    min_free_gib: f64,
 }
 
 enum Grant {
@@ -378,18 +385,24 @@ impl SlotPool {
         // Loop-invariant: compute the slot paths once, not per 200ms poll.
         let paths: Vec<PathBuf> = (0..self.n).map(|i| dir.join(format!("slot-{i}"))).collect();
         loop {
+            // One sweep: take the first free slot, and COUNT the held ones —
+            // the memory admission below needs to know whether anything else
+            // is running box-wide.
             let mut opened_any = false;
+            let mut held = 0usize;
+            let mut got: Option<std::fs::File> = None;
             for p in &paths {
                 let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(p)
                 else {
                     continue;
                 };
                 opened_any = true;
-                {
-                    use std::os::fd::AsRawFd;
-                    if let Ok(true) = crate::sys::flock_try_exclusive(f.as_raw_fd()) {
-                        return Grant::Held(f);
-                    }
+                use std::os::fd::AsRawFd;
+                match crate::sys::flock_try_exclusive(f.as_raw_fd()) {
+                    Ok(true) if got.is_none() => got = Some(f),
+                    Ok(true) => {} // free; dropping f releases the probe flock
+                    Ok(false) => held += 1,
+                    Err(_) => {}
                 }
             }
             if !opened_any {
@@ -404,6 +417,22 @@ impl SlotPool {
                 );
                 return Grant::NoPool;
             }
+            if let Some(f) = got {
+                // Memory admission (the over-provisioned pool's OOM guard, issue
+                // #319): with CPU slots > cores, free memory — not slot count —
+                // is the binding safety limit. Defer the grant while
+                // MemAvailable is below the reserve, unless nothing else holds a
+                // slot (the daemon admit()'s no-deadlock rule).
+                let mem_ok = held == 0
+                    || self.min_free_gib <= 0.0
+                    || crate::build_daemon::mem_available_gib()
+                        .map(|g| g >= self.min_free_gib)
+                        .unwrap_or(true);
+                if mem_ok {
+                    return Grant::Held(f);
+                }
+                drop(f); // give the slot back while memory is tight
+            }
             if aborted() {
                 return Grant::Aborted;
             }
@@ -412,21 +441,39 @@ impl SlotPool {
     }
 }
 
+/// Is util-linux `prlimit` resolvable on PATH? (The loop toolchain provisions
+/// util-linux, so inside the sandbox this is normally true.)
+fn prlimit_available() -> bool {
+    let Ok(path) = std::env::var("PATH") else { return false };
+    path.split(':')
+        .filter(|d| !d.is_empty())
+        .any(|d| Path::new(d).join("prlimit").is_file())
+}
+
 pub(crate) fn nproc() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// Build the slot pool from the environment. TD_CHECK_SLOTS sizes it (default
-/// nproc; 0 disables). TD_CHECK_SLOTS_DIR overrides the shared directory
-/// (default ~/.td/build-daemon/slots — bound into every check sandbox at the
-/// same absolute path, so concurrent sandboxed checks really do contend).
+/// 2×nproc — deliberately OVER-PROVISIONED, issue #319: most heavy gates are
+/// single-threaded or daemon/IO-blocked for long stretches, so slot=gate at
+/// nproc left cores idle; memory admission + the per-gate rlimit backstop are
+/// the safety limits instead. 0 disables). TD_CHECK_SLOTS_DIR overrides the
+/// shared directory (default ~/.td/build-daemon/slots — bound into every check
+/// sandbox at the same absolute path, so concurrent sandboxed checks really do
+/// contend). TD_MIN_FREE_GIB (default 4, the build daemon's knob) sets the
+/// memory-admission reserve.
 fn slot_pool_from_env() -> SlotPool {
     let n = match std::env::var("TD_CHECK_SLOTS") {
-        Ok(v) => v.trim().parse::<usize>().unwrap_or_else(|_| nproc()),
-        Err(_) => nproc(),
+        Ok(v) => v.trim().parse::<usize>().unwrap_or_else(|_| 2 * nproc()),
+        Err(_) => 2 * nproc(),
     };
+    let min_free_gib = std::env::var("TD_MIN_FREE_GIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(4.0);
     if n == 0 {
-        return SlotPool { dir: None, n: 0 };
+        return SlotPool { dir: None, n: 0, min_free_gib };
     }
     let dir = match std::env::var("TD_CHECK_SLOTS_DIR") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
@@ -437,7 +484,7 @@ fn slot_pool_from_env() -> SlotPool {
                     "gate-run: no HOME and no TD_CHECK_SLOTS_DIR — running WITHOUT the \
                      machine-wide slot pool (local -j is the only cap)"
                 );
-                return SlotPool { dir: None, n: 0 };
+                return SlotPool { dir: None, n: 0, min_free_gib };
             }
         },
     };
@@ -447,9 +494,9 @@ fn slot_pool_from_env() -> SlotPool {
              slot pool (local -j is the only cap)",
             dir.display()
         );
-        return SlotPool { dir: None, n: 0 };
+        return SlotPool { dir: None, n: 0, min_free_gib };
     }
-    SlotPool { dir: Some(dir), n }
+    SlotPool { dir: Some(dir), n, min_free_gib }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,9 +522,10 @@ fn timing_event(log: Option<&Path>, gate: &str, kind: &str) {
     }
 }
 
-/// Run one gate's body under `bash -c`, stdout+stderr appended in order to
+/// Run one gate's body under `bash -c` (through `prlimit --data` when a
+/// per-process memory cap is configured), stdout+stderr appended in order to
 /// LOG_PATH (the per-gate output buffer). Returns success.
-fn run_gate(g: &Gate, root: &Path, log_path: &Path, timing: Option<&Path>) -> bool {
+fn run_gate(g: &Gate, root: &Path, log_path: &Path, timing: Option<&Path>, mem_mib: u64) -> bool {
     let mut logf = match std::fs::File::create(log_path) {
         Ok(f) => f,
         Err(e) => {
@@ -491,7 +539,14 @@ fn run_gate(g: &Gate, root: &Path, log_path: &Path, timing: Option<&Path>) -> bo
             (Ok(o), Ok(e)) => (o, e),
             _ => return false,
         };
-        let mut cmd = std::process::Command::new("bash");
+        let mut cmd = if mem_mib > 0 {
+            let mut c = std::process::Command::new("prlimit");
+            c.arg(format!("--data={}", mem_mib.saturating_mul(1024 * 1024)))
+                .arg("bash");
+            c
+        } else {
+            std::process::Command::new("bash")
+        };
         cmd.arg("-c")
             .arg(&g.body)
             .current_dir(root)
@@ -561,6 +616,12 @@ struct RunCfg {
     timing_log: Option<PathBuf>,
     /// Where per-gate output buffers live.
     log_dir: PathBuf,
+    /// Per-PROCESS RLIMIT_DATA cap for gate bodies, in MiB (0 = off). Applied
+    /// via util-linux `prlimit` from the provisioned toolchain: with the pool
+    /// over-provisioned past nproc (#319), one runaway allocator must die by
+    /// its own limit — a clean red gate — instead of triggering the box
+    /// OOM-killer. Per-process, so a make -jN tree of modest compilers passes.
+    gate_mem_mib: u64,
 }
 
 /// True when a node contends on the machine-wide pool: everything except the
@@ -690,7 +751,8 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 }
                 let log_path = cfg.log_dir.join(format!("{}.log", g.name));
                 let started = std::time::Instant::now();
-                let ok = run_gate(g, &cfg.root, &log_path, cfg.timing_log.as_deref());
+                let ok =
+                    run_gate(g, &cfg.root, &log_path, cfg.timing_log.as_deref(), cfg.gate_mem_mib);
                 print_gate_output(&g.name, &log_path, ok, started.elapsed().as_secs_f64());
                 let mut s = lock_sched(&sched);
                 s.st.insert(gi, if ok { St::Done } else { St::Failed });
@@ -837,12 +899,24 @@ pub fn cli(args: &[String]) -> ExitCode {
     } else {
         Some(root.join(format!(".td-build-cache/gate-timing/run-{}.log", now_ns())))
     };
+    // TD_CHECK_GATE_MEM_MIB: per-process gate memory cap (default 8192; 0 off).
+    let mut gate_mem_mib: u64 = std::env::var("TD_CHECK_GATE_MEM_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(8192);
+    if gate_mem_mib > 0 && !prlimit_available() {
+        eprintln!(
+            "gate-run: no `prlimit` on PATH — running WITHOUT the per-gate memory              backstop (TD_CHECK_GATE_MEM_MIB={gate_mem_mib} requested)"
+        );
+        gate_mem_mib = 0;
+    }
     let cfg = RunCfg {
         root: root.clone(),
         jobs,
         pool: slot_pool_from_env(),
         timing_log,
         log_dir: std::env::temp_dir().join(format!("td-gate-run-{}", std::process::id())),
+        gate_mem_mib,
     };
     match run_selected(&set, &selected, &cfg) {
         Ok(true) => {
@@ -945,9 +1019,10 @@ mod tests {
         RunCfg {
             root: dir.to_path_buf(),
             jobs,
-            pool: SlotPool { dir: sdir, n },
+            pool: SlotPool { dir: sdir, n, min_free_gib: 0.0 },
             timing_log: None,
             log_dir: dir.join("logs"),
+            gate_mem_mib: 0,
         }
     }
 
@@ -986,6 +1061,51 @@ mod tests {
         let sel = expand_goals(&set, &["check".to_string()]).unwrap();
         assert!(!run_selected(&set, &sel, &cfg(&d, 4, None)).unwrap());
         assert!(!d.join("late.ran").exists(), "gate behind a red gate must not start");
+    }
+
+    #[test]
+    fn memory_admission_defers_while_another_slot_is_held() {
+        use std::os::fd::AsRawFd;
+        let d = tmpdir("mem");
+        let slots = d.join("slots");
+        std::fs::create_dir_all(&slots).unwrap();
+        // Simulate "someone else is running": hold slot-0 ourselves.
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(slots.join("slot-0"))
+            .unwrap();
+        assert!(crate::sys::flock_try_exclusive(holder.as_raw_fd()).unwrap());
+        // An impossibly-high reserve: with a held slot present, the free slot
+        // must NOT be granted (deferred), so the aborted() escape is taken.
+        let pool = SlotPool { dir: Some(slots.clone()), n: 2, min_free_gib: 1e9 };
+        assert!(matches!(pool.acquire(&|| true), Grant::Aborted));
+        // Same reserve, but nothing else held: the no-deadlock rule admits.
+        drop(holder);
+        assert!(matches!(pool.acquire(&|| true), Grant::Held(_)));
+        // Reserve disabled: always admits.
+        let pool = SlotPool { dir: Some(slots), n: 2, min_free_gib: 0.0 };
+        assert!(matches!(pool.acquire(&|| true), Grant::Held(_)));
+    }
+
+    #[test]
+    fn gate_mem_backstop_contains_a_runaway_allocator() {
+        if !prlimit_available() {
+            return; // dev host without util-linux prlimit; the sandbox has it
+        }
+        let d = tmpdir("rlimit");
+        // ~64 MiB heap allocation in bash (command substitution buffers it).
+        let hog = r#"x=$(head -c 67108864 /dev/zero | tr '\0' a); echo grew ${#x}"#;
+        let set = synth(&d, &[("hog", Pool::Heavy, hog, &[])]);
+        let sel = expand_goals(&set, &["hog".to_string()]).unwrap();
+        // VERIFIED-RED half: capped at 16 MiB per process, the allocator dies
+        // and the gate reds cleanly (no box OOM).
+        let mut c = cfg(&d, 2, None);
+        c.gate_mem_mib = 16;
+        assert!(!run_selected(&set, &sel, &c).unwrap(), "16MiB cap must red the hog");
+        // Green half: with the cap off the same body passes.
+        let c = cfg(&d, 2, None);
+        assert!(run_selected(&set, &sel, &c).unwrap(), "uncapped hog must pass");
     }
 
     #[test]
