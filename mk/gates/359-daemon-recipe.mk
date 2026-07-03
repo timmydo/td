@@ -27,6 +27,10 @@
 # Verified-red: (a) skip the daemon (start nothing) → daemon-request reds (connection
 # refused); (b) revert the daemon's cached_realization check → the 2nd request rebuilds
 # (CACHE MISS) and the HIT assertion reds.
+# Reply format: `OK <canon> <host> <hit|built>` — the hit|built suffix landed with the
+# machine-wide limiter (fe58ab5); the old last-token parse here read the status word as
+# the output path (latent red hidden while the daily runner was down, #268). The recipe
+# takes token 3 (the host-side output), like tests/cache-lib.sh and gate 358.
 HEAVY_GATES += daemon-recipe
 daemon-recipe:
 	@echo ">> daemon-recipe: td's persistent build daemon realizes a TD-ASSEMBLED real recipe (hello) into td's OWN store over a Unix socket (no guix-daemon, no guix repl/Guile emitting the drv); the artifact runs; a repeat request is a cache HIT"
@@ -59,7 +63,7 @@ daemon-recipe:
 	[ -S "$$sock" ] || { echo "FAIL: daemon socket never appeared" >&2; cat "$$scratch/daemon.log" >&2; exit 1; }; \
 	r1=`"$$tb" daemon-request "$$sock" "$$drv"` || { echo "FAIL: request 1 errored: $$r1" >&2; cat "$$scratch/daemon.log" >&2; exit 1; }; \
 	case "$$r1" in "OK "*) : ;; *) echo "FAIL: request 1 not OK: $$r1" >&2; cat "$$scratch/daemon.log" >&2; exit 1 ;; esac; \
-	host="$${r1##* }"; \
+	set -- $$r1; host="$$3"; \
 	case "$$host" in "$$scratch/d"/*) : ;; *) echo "FAIL: daemon output not under td's scratch store (not a td-owned build): $$host" >&2; exit 1 ;; esac; \
 	case "$$host" in /gnu/store/*) echo "FAIL: daemon output is under /gnu/store — not td's own store" >&2; exit 1 ;; esac; \
 	echo "  [DURABLE structural] the daemon built into td's OWN scratch store ($$host) — NOT /gnu/store, NOT guix-daemon"; \
