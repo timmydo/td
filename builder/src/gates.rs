@@ -647,6 +647,16 @@ fn cgroup_enter(run_dir: &Path, gate: &str, budget_mib: u64) -> Option<PathBuf> 
     }
     // Throttle-before-kill: reclaim pressure starts at 90% of the cap.
     let _ = std::fs::write(cg.join("memory.high"), (bytes / 10 * 9).to_string());
+    // Swap must be bounded too: memory.swap.max defaults to `max`, so on a
+    // swap-enabled host the kernel would page the gate out instead of
+    // OOM-killing — the budget silently unenforced and the host thrashed
+    // (review finding). Absent file = kernel without swap accounting: swap
+    // can't be charged there either way.
+    let swap = cg.join("memory.swap.max");
+    if swap.is_file() && std::fs::write(&swap, "0").is_err() {
+        let _ = std::fs::remove_dir(&cg);
+        return None;
+    }
     Some(cg)
 }
 
@@ -687,10 +697,12 @@ fn run_gate(
         (Some(run_dir), b) if b > 0 => cgroup_enter(run_dir, &g.name, b),
         _ => None,
     };
+    // The enter path travels via env, NEVER interpolated into the bash text:
+    // an env-derived run dir containing a quote would otherwise escape the
+    // quoting and execute as code (review finding).
     let body = match &gate_cg {
-        Some(cg) => format!(
-            "echo $$ > '{}' || {{ echo 'gate-run: cannot enter the gate cgroup' >&2; exit 97; }}\n{}",
-            cg.join("cgroup.procs").display(),
+        Some(_) => format!(
+            "echo $$ > \"$TD_GATE_CG\" || {{ echo 'gate-run: cannot enter the gate cgroup' >&2; exit 97; }}\n{}",
             g.body
         ),
         None => g.body.clone(),
@@ -729,6 +741,9 @@ fn run_gate(
             StoreMode::Private => {
                 cmd.env("TD_CHECK_CHAIN_CACHE", "");
             }
+        }
+        if let Some(cg) = &gate_cg {
+            cmd.env("TD_GATE_CG", cg.join("cgroup.procs"));
         }
         if !g.specs.is_empty() {
             cmd.env("TD_GATE_SPECS", g.specs.join(" "));

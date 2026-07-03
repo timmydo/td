@@ -263,6 +263,13 @@ fn cgroup_delegated_root() -> Option<PathBuf> {
         }
     }
     for c in candidates {
+        // Must be cgroup2fs, not merely a writable directory: on a plain dir
+        // every 'cgroup file' write would create ordinary files and appear to
+        // succeed — cgroup mode would engage with ZERO kernel enforcement
+        // while also disabling the watchdog (review finding).
+        if !c.join("cgroup.controllers").is_file() {
+            continue;
+        }
         let probe = c.join(format!("td-probe-{}", std::process::id()));
         if std::fs::create_dir(&probe).is_ok() {
             let _ = std::fs::remove_dir(&probe);
@@ -276,8 +283,6 @@ fn cgroup_delegated_root() -> Option<PathBuf> {
 /// memory controller for its children and return the run dir. Best-effort —
 /// any failure means "no cgroup mode this run" (the watchdog fallback holds).
 fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
-    // +memory must be enabled at EVERY level above the gate leaves.
-    let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory");
     // Sweep DEAD runs' leftovers: a run dir can't remove itself (the check
     // process sits in its own host leaf until exit), so each run reaps its
     // predecessors — empty leaves + parents whose pid is gone rmdir cleanly;
@@ -287,8 +292,20 @@ fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
         for e in entries.flatten() {
             let p = e.path();
             let name = e.file_name();
-            let is_run = name.to_str().map(|n| n.starts_with("run-") || n.starts_with("td-test-")).unwrap_or(false);
-            if !is_run || !p.is_dir() {
+            let Some(n) = name.to_str() else { continue };
+            if !(n.starts_with("run-") || n.starts_with("td-test-")) || !p.is_dir() {
+                continue;
+            }
+            // LIVENESS, not emptiness: a live concurrent run's just-created
+            // leaf is momentarily empty (between cgroup_enter and the body's
+            // self-move) and rmdir would spuriously red its gate with exit 97
+            // (review finding). Only dirs whose owning pid is GONE are reaped.
+            let alive = n
+                .rsplit_once('-')
+                .and_then(|(_, pid)| pid.parse::<u32>().ok())
+                .map(|pid| Path::new(&format!("/proc/{pid}")).exists())
+                .unwrap_or(true);
+            if alive {
                 continue;
             }
             if let Ok(children) = std::fs::read_dir(&p) {
@@ -303,12 +320,6 @@ fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
     }
     let run = root.join(format!("run-{}", std::process::id()));
     std::fs::create_dir(&run).ok()?;
-    // Enable child controllers BEFORE any process joins (no-internal-process
-    // rule: a cgroup can't gain controllers while populated).
-    if std::fs::write(run.join("cgroup.subtree_control"), "+memory").is_err() {
-        let _ = std::fs::remove_dir(&run);
-        return None;
-    }
     // THE FIRST HOP: migrating a process needs write access to the COMMON
     // ANCESTOR's cgroup.procs, and this process starts OUTSIDE the delegated
     // subtree — so self-move ONCE here (into a host leaf; the run dir itself
@@ -319,6 +330,10 @@ fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
     // first-hop grant — group-writable root cgroup.procs (chgrp+g+w for the
     // loop user's group), or a PAM session hook placing sessions inside the
     // subtree as systemd's PID1 does — fall back loudly.
+    // ORDER MATTERS (review finding): the self-move must precede enabling
+    // controllers — the no-internal-process rule EBUSYes a subtree_control
+    // write while the cgroup has member processes, so the own-cgroup
+    // (systemd scope) candidate only works if we vacate it FIRST.
     let host_leaf = run.join("host");
     if std::fs::create_dir(&host_leaf).is_err()
         || std::fs::write(host_leaf.join("cgroup.procs"), std::process::id().to_string())
@@ -332,6 +347,18 @@ fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
              sudo sh -c 'chgrp <loop-group> /sys/fs/cgroup/cgroup.procs && chmod g+w \
              /sys/fs/cgroup/cgroup.procs'  (cgroupfs perms reset at boot: persist it \
              in the system config; issue #328)"
+        );
+        return None;
+    }
+    // Controllers, after vacating: root (may only now be empty in the scope
+    // case), then the run dir (its processes live in leaves, never in itself).
+    let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory");
+    if std::fs::write(run.join("cgroup.subtree_control"), "+memory").is_err() {
+        // Leave the dirs for the next run's sweep — this process now SITS in
+        // run/host and cannot rmdir it.
+        eprintln!(
+            "td-builder check: delegated cgroup subtree found but the memory controller \
+             could not be enabled for it — falling back to the watchdog"
         );
         return None;
     }
@@ -641,30 +668,6 @@ fn run(args: &[String]) -> Result<i32, String> {
             child_envs.push((k.to_string(), v));
         }
     }
-    // Per-gate cgroup memory limits (issue #328): when the host delegates a
-    // writable cgroup-v2 subtree, gate-run gives every gate a child cgroup
-    // with memory.max/high — the escape-proof successor to the RSS watchdog
-    // (which stays the fallback everywhere else). The run dir is created HOST-
-    // side (the sandbox binds it RW; see host-sandbox) and removed after.
-    let cgroup_run = cgroup_delegated_root().and_then(|r| cgroup_run_dir(&r));
-    match &cgroup_run {
-        Some(dir) => {
-            child_envs.push((s("TD_CHECK_CGROUP"), dir.display().to_string()));
-        }
-        // (The off-knob and first-hop branches already said their piece.)
-        None if !matches!(
-            std::env::var("TD_CGROUP_ROOT").ok().as_deref(),
-            Some("off") | Some("none") | Some("0")
-        ) =>
-        {
-            eprintln!(
-                "td-builder check: no delegated cgroup subtree — per-gate tree memory \
-                 budgets fall back to the sampling watchdog (delegation setup: issue #328)"
-            )
-        }
-        None => {}
-    }
-
     // The verdict-journal tree key (issue #320): computed on the HOST (git is
     // not in the sandbox toolchain) and forwarded so gate-run journals every
     // PASS; --resume additionally skips journaled-green gates for this exact
@@ -697,6 +700,33 @@ fn run(args: &[String]) -> Result<i32, String> {
         } else {
             child_envs.push((s("TD_DAEMON_SOCKET"), sock));
         }
+    }
+
+    // Per-gate cgroup memory limits (issue #328): when the host delegates a
+    // writable cgroup-v2 subtree, gate-run gives every gate a child cgroup
+    // with memory.max/high — the escape-proof successor to the RSS watchdog
+    // (which stays the fallback everywhere else). Deliberately AFTER the
+    // daemon warm: the self-move happens here, so the nohup'd persistent
+    // build daemon (started above, outliving this check) is NOT captured in
+    // this run's host leaf (review finding — it would pin the run dir forever
+    // and a recycled pid would then silently lose cgroup mode on EEXIST).
+    let cgroup_run = cgroup_delegated_root().and_then(|r| cgroup_run_dir(&r));
+    match &cgroup_run {
+        Some(dir) => {
+            child_envs.push((s("TD_CHECK_CGROUP"), dir.display().to_string()));
+        }
+        // (The off-knob and first-hop branches already said their piece.)
+        None if !matches!(
+            std::env::var("TD_CGROUP_ROOT").ok().as_deref(),
+            Some("off") | Some("none") | Some("0")
+        ) =>
+        {
+            eprintln!(
+                "td-builder check: no delegated cgroup subtree — per-gate tree memory \
+                 budgets fall back to the sampling watchdog (delegation setup: issue #328)"
+            )
+        }
+        None => {}
     }
 
     // The machine-wide slot dir must exist HOST-SIDE so host-sandbox binds
