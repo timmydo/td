@@ -582,7 +582,45 @@ fn timing_event(log: Option<&Path>, gate: &str, kind: &str) {
 /// Run one gate's body under `bash -c` (through `prlimit --data` when a
 /// per-process memory cap is configured), stdout+stderr appended in order to
 /// LOG_PATH (the per-gate output buffer). Returns success.
-fn run_gate(g: &Gate, root: &Path, log_path: &Path, timing: Option<&Path>, mem_mib: u64) -> bool {
+/// Sum the resident bytes of every process in PGID's process group
+/// (/proc/*/stat field 5 == pgid; RSS from /proc/*/statm resident pages).
+fn pgroup_rss_bytes(pgid: u32) -> u64 {
+    const PAGE: u64 = 4096; // platform pinned x86_64-linux
+    let Ok(entries) = std::fs::read_dir("/proc") else { return 0 };
+    let mut total = 0u64;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().filter(|n| n.bytes().all(|b| b.is_ascii_digit())) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        // pgrp is field 5, but comm (field 2) may contain spaces — parse after
+        // the closing paren.
+        let Some(after) = stat.rsplit_once(')').map(|(_, a)| a) else { continue };
+        let mut it = after.split_whitespace();
+        let _state = it.next();
+        let _ppid = it.next();
+        let Some(grp) = it.next() else { continue };
+        if grp != pgid.to_string() {
+            continue;
+        }
+        let Ok(statm) = std::fs::read_to_string(format!("/proc/{pid}/statm")) else { continue };
+        if let Some(resident) = statm.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+        {
+            total = total.saturating_add(resident.saturating_mul(PAGE));
+        }
+    }
+    total
+}
+
+fn run_gate(
+    g: &Gate,
+    root: &Path,
+    log_path: &Path,
+    timing: Option<&Path>,
+    mem_mib: u64,
+    tree_mem_mib: u64,
+) -> bool {
     let mut logf = match std::fs::File::create(log_path) {
         Ok(f) => f,
         Err(e) => {
@@ -616,19 +654,64 @@ fn run_gate(g: &Gate, root: &Path, log_path: &Path, timing: Option<&Path>, mem_m
         for (k, v) in &g.extra_env {
             cmd.env(k, v);
         }
-        match cmd.status() {
-            Ok(st) if st.success() => true,
+        // Own process group: the tree watchdog kills by pgid, and a gate's
+        // children must never share the runner's group.
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = writeln!(logf, "gate-run: FAIL: gate {}: cannot spawn bash: {e}", g.name);
+                timing_event(timing, &g.name, "END");
+                return false;
+            }
+        };
+        let pgid = child.id();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let breached = std::sync::atomic::AtomicBool::new(false);
+        let status = std::thread::scope(|ws| {
+            if tree_mem_mib > 0 {
+                ws.spawn(|| {
+                    let budget = tree_mem_mib.saturating_mul(1024 * 1024);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if pgroup_rss_bytes(pgid) > budget {
+                            breached.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                });
+            }
+            let st = child.wait();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            st
+        });
+        if breached.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = writeln!(
+                logf,
+                "gate-run: FAIL: gate {} — process-tree RSS exceeded the {tree_mem_mib} MiB \
+                 budget (TD_CHECK_GATE_TREE_MEM_MIB); the whole process group was killed",
+                g.name
+            );
+        }
+        match status {
+            Ok(st) if st.success() && !breached.load(std::sync::atomic::Ordering::Relaxed) => true,
             Ok(st) => {
-                let _ = writeln!(
-                    logf,
-                    "gate-run: FAIL: gate {} — body exited {}",
-                    g.name,
-                    st.code().unwrap_or(-1)
-                );
+                if !breached.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = writeln!(
+                        logf,
+                        "gate-run: FAIL: gate {} — body exited {}",
+                        g.name,
+                        st.code().unwrap_or(-1)
+                    );
+                }
                 false
             }
             Err(e) => {
-                let _ = writeln!(logf, "gate-run: FAIL: gate {}: cannot spawn bash: {e}", g.name);
+                let _ = writeln!(logf, "gate-run: FAIL: gate {}: wait failed: {e}", g.name);
                 false
             }
         }
@@ -702,6 +785,14 @@ struct RunCfg {
     /// --resume: skip gates journaled green for THIS tree key (issue #320).
     /// Opt-in, interactive iteration only — CI and the daily never pass it.
     resume: bool,
+    /// AGGREGATE tree budget per gate, in MiB (0 = off): a watchdog samples the
+    /// gate's process group's summed RSS and SIGKILLs the whole group on breach
+    /// — the layer the per-process rlimit below cannot provide (N children each
+    /// under the per-process cap can collectively exceed the box; human review
+    /// re #319). KNOWN GAP: a setsid() escapee leaves the process group and the
+    /// sampler's sight — the cgroup v2 layer is the escape-proof successor once
+    /// the host delegates a subtree.
+    gate_tree_mem_mib: u64,
     /// Per-PROCESS RLIMIT_DATA cap for gate bodies, in MiB (0 = off). Applied
     /// via util-linux `prlimit` from the provisioned toolchain: with the pool
     /// over-provisioned past nproc (#319), one runaway allocator must die by
@@ -856,7 +947,14 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 let log_path = cfg.log_dir.join(format!("{}.log", g.name));
                 let started = std::time::Instant::now();
                 let ok =
-                    run_gate(g, &cfg.root, &log_path, cfg.timing_log.as_deref(), cfg.gate_mem_mib);
+                    run_gate(
+                    g,
+                    &cfg.root,
+                    &log_path,
+                    cfg.timing_log.as_deref(),
+                    cfg.gate_mem_mib,
+                    cfg.gate_tree_mem_mib,
+                );
                 print_gate_output(&g.name, &log_path, ok, started.elapsed().as_secs_f64());
                 if ok {
                     if let Some(key) = &cfg.tree_key {
@@ -1029,6 +1127,13 @@ pub fn cli(args: &[String]) -> ExitCode {
         );
         resume = false;
     }
+    // TD_CHECK_GATE_TREE_MEM_MIB: aggregate per-gate process-tree budget
+    // (default 16 GiB; 0 off). Enforced by the runner itself via /proc — no
+    // prlimit, no cgroups needed.
+    let gate_tree_mem_mib: u64 = std::env::var("TD_CHECK_GATE_TREE_MEM_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(16384);
     let cfg = RunCfg {
         root: root.clone(),
         jobs,
@@ -1038,6 +1143,7 @@ pub fn cli(args: &[String]) -> ExitCode {
         tree_key,
         resume,
         gate_mem_mib,
+        gate_tree_mem_mib,
     };
     match run_selected(&set, &selected, &cfg) {
         Ok(true) => {
@@ -1146,6 +1252,7 @@ mod tests {
             tree_key: None,
             resume: false,
             gate_mem_mib: 0,
+            gate_tree_mem_mib: 0,
         }
     }
 
@@ -1241,6 +1348,26 @@ mod tests {
         // Green half: with the cap off the same body passes.
         let c = cfg(&d, 2, None);
         assert!(run_selected(&set, &sel, &c).unwrap(), "uncapped hog must pass");
+    }
+
+    #[test]
+    fn tree_watchdog_kills_a_collectively_oversized_process_group() {
+        let d = tmpdir("tree");
+        // Four children, ~32 MiB each — every one modest, ~128 MiB together.
+        // NOTE the echo after sleep: bash EXECS a trailing command over itself,
+        // which would free the 32 MiB string before the sampler's first tick —
+        // the trailing echo keeps each subshell (and its allocation) resident.
+        let hog = r#"for i in 1 2 3 4; do ( x=$(head -c 33554432 /dev/zero | tr '\0' a); sleep 3; echo ${#x} ) & done; wait; echo tree-done"#;
+        let set = synth(&d, &[("tree", Pool::Heavy, hog, &[])]);
+        let sel = expand_goals(&set, &["tree".to_string()]).unwrap();
+        // VERIFIED-RED half: a 64 MiB TREE budget kills the group (each child is
+        // far under any per-process cap — only the aggregate trips).
+        let mut c = cfg(&d, 2, None);
+        c.gate_tree_mem_mib = 64;
+        assert!(!run_selected(&set, &sel, &c).unwrap(), "64MiB tree budget must red the group");
+        // Green half: watchdog off, the same tree passes.
+        let c = cfg(&d, 2, None);
+        assert!(run_selected(&set, &sel, &c).unwrap(), "unbudgeted tree must pass");
     }
 
     #[test]
