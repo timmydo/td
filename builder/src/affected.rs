@@ -184,10 +184,15 @@ fn parse_assign<'a>(line: &'a str, name: &str, op: &str) -> Option<&'a str> {
     Some(rest.trim_start_matches([' ', '\t']))
 }
 
-const GATE_POOLS: [&str; 4] = ["CHEAP_GATES", "HEAVY_GATES", "FAST_GATES", "SYSTEM_GATES"];
+const GATE_POOLS: [&str; 5] =
+    ["CHEAP_GATES", "HEAVY_GATES", "FAST_GATES", "SYSTEM_GATES", "PARKED_GATES"];
 
-/// First `CHEAP/HEAVY/FAST/SYSTEM_GATES += <target>` line's target (shell
+/// First `CHEAP/HEAVY/FAST/SYSTEM/PARKED_GATES += <target>` line's target (shell
 /// `target_from_gate_file`; note ENGINE/BUILD are intentionally NOT in the set).
+/// PARKED_GATES is the documented parking pool for a gate a human has unhooked
+/// pending a tracked fix (e.g. #292): the Makefile defines the pool but no check
+/// tier consumes it, so the gate stays an on-demand `./check.sh <gate>` target and
+/// its file edits still map here.
 fn target_from_gate_file(file: &Path) -> Option<String> {
     let body = std::fs::read_to_string(file).ok()?;
     for line in body.lines() {

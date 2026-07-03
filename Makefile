@@ -73,6 +73,10 @@ HEAVY_GATES :=
 FAST_GATES  :=
 SYSTEM_GATES :=
 ENGINE_GATES :=
+# PARKED_GATES — gates a human has UNHOOKED from every check tier pending a tracked
+# fix (the gate file documents the issue + how to re-enable). No tier consumes this
+# pool; members stay runnable on demand (`./check.sh <gate>`).
+PARKED_GATES :=
 # BUILD_SPECS — every package recipe the parallel `build-recipes` phase realizes +
 # reproducibility-checks up front (the corpus, toolchain leaves and library deps). Each
 # package-build gate fragment appends its OWN spec list (so the list lives next to the
@@ -164,6 +168,7 @@ list-gates:
 	@echo "fast   ($(words $(FAST_GATES))): $(FAST_GATES)"
 	@echo "system ($(words $(SYSTEM_GATES))): $(SYSTEM_GATES)"
 	@echo "engine ($(words $(ENGINE_GATES))): $(ENGINE_GATES)"
+	@echo "parked ($(words $(PARKED_GATES))): $(PARKED_GATES)"
 
 # Generated ordering graph (do not hand-edit): chain each cheap gate order-only
 # on its predecessor, and gate every heavy gate on the last cheap gate.
