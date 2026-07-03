@@ -594,6 +594,28 @@ fn print_gate_output(name: &str, log_path: &Path, ok: bool, secs: f64) {
     let _ = lock.flush();
 }
 
+/// The verdict journal for one tree key: a line per gate that passed.
+fn journal_path(root: &Path, key: &str) -> PathBuf {
+    root.join(".td-build-cache/gate-verdicts").join(key)
+}
+
+fn journal_read(root: &Path, key: &str) -> HashSet<String> {
+    std::fs::read_to_string(journal_path(root, key))
+        .map(|t| t.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Append one PASS (best-effort — journaling must never affect a verdict).
+fn journal_pass(root: &Path, key: &str, gate: &str) {
+    let p = journal_path(root, key);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = writeln!(f, "{gate}");
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum St {
     Pending,
@@ -616,6 +638,13 @@ struct RunCfg {
     timing_log: Option<PathBuf>,
     /// Where per-gate output buffers live.
     log_dir: PathBuf,
+    /// The working-tree content key (TD_CHECK_TREE, computed host-side by
+    /// `td-builder check` from git HEAD + dirty diff + untracked contents).
+    /// When present, every PASS is journaled under it; None disables journaling.
+    tree_key: Option<String>,
+    /// --resume: skip gates journaled green for THIS tree key (issue #320).
+    /// Opt-in, interactive iteration only — CI and the daily never pass it.
+    resume: bool,
     /// Per-PROCESS RLIMIT_DATA cap for gate bodies, in MiB (0 = off). Applied
     /// via util-linux `prlimit` from the provisioned toolchain: with the pool
     /// over-provisioned past nproc (#319), one runaway allocator must die by
@@ -668,11 +697,29 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
         .map(|g| g.deps.iter().filter_map(|d| set.index.get(d).copied()).collect())
         .collect();
 
-    let sched = Mutex::new(Sched {
-        st: selected.iter().map(|i| (*i, St::Pending)).collect(),
-        fail: false,
-        running: 0,
-    });
+    // --resume: gates journaled green for THIS tree key start as Done — loudly,
+    // so a green-with-skips run is visually distinct from a full green run.
+    let mut initial: HashMap<usize, St> = selected.iter().map(|i| (*i, St::Pending)).collect();
+    if cfg.resume {
+        if let Some(key) = &cfg.tree_key {
+            let green = journal_read(&cfg.root, key);
+            let mut skipped = 0usize;
+            for (&i, st) in initial.iter_mut() {
+                let Some(g) = set.gates.get(i) else { continue };
+                if green.contains(&g.name) {
+                    *st = St::Done;
+                    println!("[gate-run] {}: SKIPPED(resume — green for this exact tree)", g.name);
+                    skipped += 1;
+                }
+            }
+            if skipped > 0 {
+                println!(
+                    "[gate-run] resume: {skipped} gate(s) skipped from the verdict journal                      (key {key}); any tree change invalidates the whole journal"
+                );
+            }
+        }
+    }
+    let sched = Mutex::new(Sched { st: initial, fail: false, running: 0 });
     let cv = Condvar::new();
 
     let pick_ready = |s: &Sched| -> Option<usize> {
@@ -754,6 +801,11 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 let ok =
                     run_gate(g, &cfg.root, &log_path, cfg.timing_log.as_deref(), cfg.gate_mem_mib);
                 print_gate_output(&g.name, &log_path, ok, started.elapsed().as_secs_f64());
+                if ok {
+                    if let Some(key) = &cfg.tree_key {
+                        journal_pass(&cfg.root, key, &g.name);
+                    }
+                }
                 let mut s = lock_sched(&sched);
                 s.st.insert(gi, if ok { St::Done } else { St::Failed });
                 s.running -= 1;
@@ -820,6 +872,7 @@ pub fn cli(args: &[String]) -> ExitCode {
         Err(_) => nproc(),
     };
     let mut goals: Vec<String> = Vec::new();
+    let mut resume = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "-j" || a == "--jobs" {
@@ -842,6 +895,8 @@ pub fn cli(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+        } else if a == "--resume" {
+            resume = true;
         } else if a == "--list" {
             goals.push("list-gates".to_string());
         } else {
@@ -910,12 +965,21 @@ pub fn cli(args: &[String]) -> ExitCode {
         );
         gate_mem_mib = 0;
     }
+    let tree_key = std::env::var("TD_CHECK_TREE").ok().filter(|k| !k.is_empty());
+    if resume && tree_key.is_none() {
+        eprintln!(
+            "gate-run: --resume needs the TD_CHECK_TREE key (td-builder check computes it              from git); refusing to guess — running everything"
+        );
+        resume = false;
+    }
     let cfg = RunCfg {
         root: root.clone(),
         jobs,
         pool: slot_pool_from_env(),
         timing_log,
         log_dir: std::env::temp_dir().join(format!("td-gate-run-{}", std::process::id())),
+        tree_key,
+        resume,
         gate_mem_mib,
     };
     match run_selected(&set, &selected, &cfg) {
@@ -1022,6 +1086,8 @@ mod tests {
             pool: SlotPool { dir: sdir, n, min_free_gib: 0.0 },
             timing_log: None,
             log_dir: dir.join("logs"),
+            tree_key: None,
+            resume: false,
             gate_mem_mib: 0,
         }
     }
@@ -1148,6 +1214,44 @@ mod tests {
         let sel = expand_goals(&set, &["consumer".to_string()]).unwrap();
         assert!(run_selected(&set, &sel, &cfg(&d, 4, None)).unwrap());
         assert!(d.join("ok").exists());
+    }
+
+    #[test]
+    fn resume_skips_journaled_greens_only_for_the_identical_tree_key() {
+        let d = tmpdir("resume");
+        let runs = |f: &str| -> usize {
+            std::fs::read_to_string(d.join(f)).map(|t| t.lines().count()).unwrap_or(0)
+        };
+        // `a` passes and is journaled; `b` reds every time (so each run's
+        // journal state is observable through a's re-execution count).
+        let set = synth(
+            &d,
+            &[
+                ("a", Pool::Heavy, "echo run >> {D}/a.runs", &[]),
+                ("b", Pool::Heavy, "echo run >> {D}/b.runs; exit 1", &["a"]),
+            ],
+        );
+        let sel = expand_goals(&set, &["check".to_string()]).unwrap();
+        let with = |key: Option<&str>, resume: bool| {
+            let mut c = cfg(&d, 2, None);
+            c.root = d.clone();
+            c.tree_key = key.map(str::to_string);
+            c.resume = resume;
+            c
+        };
+        // Red run journals a's PASS under key k1.
+        assert!(!run_selected(&set, &sel, &with(Some("k1"), false)).unwrap());
+        assert_eq!((runs("a.runs"), runs("b.runs")), (1, 1));
+        // Resume, same key: a SKIPPED (not re-run), b re-runs.
+        assert!(!run_selected(&set, &sel, &with(Some("k1"), true)).unwrap());
+        assert_eq!((runs("a.runs"), runs("b.runs")), (1, 2), "a must be skipped on resume");
+        // VERIFIED-RED half: a DIFFERENT key (any tree change) invalidates the
+        // whole journal — a re-runs.
+        assert!(!run_selected(&set, &sel, &with(Some("k2"), true)).unwrap());
+        assert_eq!(runs("a.runs"), 2, "a key change must invalidate every skip");
+        // A plain (non-resume) run ignores the journal entirely.
+        assert!(!run_selected(&set, &sel, &with(Some("k1"), false)).unwrap());
+        assert_eq!(runs("a.runs"), 3, "non-resume runs must ignore the journal");
     }
 
     #[test]
