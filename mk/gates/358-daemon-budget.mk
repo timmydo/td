@@ -13,12 +13,17 @@
 # so the peak grep yields 6 != 2 and the gate reds; force it serial → peak 1 != 2. (The cap
 # logic is also covered hermetically + deterministically by the build_daemon budget unit
 # test, run in the check-engine cargo-test tier.)
+# tb resolution: load_stage0 (the lock-keyed CURRENT stage0), like build-daemon/daemon-recipe —
+# NOT `ls stage0/store/*/bin/td-builder | head -1`: a warm runner accumulates placements and
+# lexicographic-first picked a STALE binary predating the `daemon` subcommand, so the socket
+# never appeared (a latent red hidden while the daily runner was down, #293/#268; fresh
+# checkouts have one placement and never saw it).
 HEAVY_GATES += daemon-budget
 daemon-budget:
 	@echo ">> daemon-budget: the shared build daemon caps concurrent builds at its global budget across independent submitters (the machine-wide limiter)"
 	@set -euo pipefail; \
-	tb=`ls "$(CURDIR)"/.td-build-cache/stage0/store/*/bin/td-builder 2>/dev/null | head -1 || true`; \
-	if [ -z "$$tb" ] || [ ! -x "$$tb" ]; then ( cd builder && cargo build --release --quiet ) && tb="$(CURDIR)/builder/target/release/td-builder"; fi; \
+	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
+	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
 	test -x "$$tb" || { echo "FAIL: no td-builder binary for the gate" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.daemon-budget-scratch"; rm -rf "$$scratch"; mkdir -p "$$scratch/d"; \
 	sock="$$scratch/sock"; budget=2; \
