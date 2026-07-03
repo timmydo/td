@@ -45,6 +45,21 @@ $GUIX build -d $tools
 lower $GUIX repl -L . ci/channel-instance-drv.scm
 sed -n 's/^CHANNEL_DRV=//p' "$tmp"
 
+# --- Stage0 toolchain seed (workstream E, #294): check.sh's loop container is
+# provisioned by the guix-free stage0 td-builder on EVERY tier — cargo-compiled
+# with the pinned lock toolchain (tests/td-builder-rust.lock) — so the fast
+# image must carry the seed's runtime closure or the hosted runner cannot stand
+# the loop container up. These are OUTPUT paths, not .drv paths: build-ci-image's
+# closure walker (td-builder store-closure) and `guix archive --export -r` are
+# both root-type-agnostic, so output roots export their runtime closure. Fail
+# loudly if a seed path is not live on this build host (stale lock / cold store)
+# rather than shipping an image the runner cannot compile stage0 from. (No
+# while-in-pipeline: its subshell would swallow the exit under POSIX sh.)
+for p in $(sed -n 's/^[^ ]* \(\/gnu\/store\/[^ ]*\)$/\1/p' tests/td-builder-rust.lock); do
+  test -e "$p" || { echo "ERROR: stage0 seed path not in this host's store: $p (realize tests/td-builder-rust.lock first)" >&2; exit 1; }
+  printf '%s\n' "$p"
+done
+
 # (The `ts`/tsgo seed is gone: the TypeScript surface was retired — recipes/specs
 # are declared in Rust now (rust-recipe-surface), so check-fast carries no tsgo.
 # The SYSTEM/OCI-image lowerings are gone with the museum tier, 2026-07-02.)

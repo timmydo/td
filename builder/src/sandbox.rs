@@ -499,7 +499,7 @@ pub struct Bind {
 /// `guix shell -C` — NOT the host device tree); the host filesystem is otherwise
 /// gone. `path_env` is the full PATH (empty → a default); `home` is HOME;
 /// `workdir` is the cwd to enter after pivot (empty → `/`); `extra_env` is
-/// caller-preserved env (e.g. the check-memo `TD_CHECK_*`). Runs `cmd args` and
+/// caller-preserved env (e.g. the `TD_SUBST_*`/`TD_DAEMON_*` knobs). Runs `cmd args` and
 /// returns its exit status. Unshares
 /// NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS and runs the command as PID 1 of the
 /// new PID namespace with a private /proc mounted by that PID-1 process — full
@@ -627,7 +627,7 @@ pub fn host_shell(
     command.env("PATH", path_env);
     command.env("HOME", home);
     command.env("TMPDIR", "/tmp");
-    // Caller-preserved env (e.g. the check-memo TD_CHECK_* identity).
+    // Caller-preserved env (e.g. the TD_SUBST_*/TD_DAEMON_* knobs).
     for (k, v) in extra_env {
         command.env(k, v);
     }
@@ -643,7 +643,6 @@ pub fn host_shell(
         "USER",
         "LOGNAME",
         "GUIX_BUILD_OPTIONS",
-        "GUIX_ENVIRONMENT",
     ] {
         if let Ok(v) = std::env::var(k) {
             command.env(k, v);

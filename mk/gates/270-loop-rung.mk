@@ -1,8 +1,8 @@
 # loop-rung (DESIGN §7.1; gate-2 "Loop tooling convergence"). Where loop-sandbox checks
 # the BASE sandbox surface, this checks the FULL loop env that `td-builder host-sandbox
 # --expose-cwd` provides — the worktree/cwd bound (rw), the cgroup hierarchy + the guix
-# cache, the caller's PATH (the toolchain, all /gnu/store), TD_CHECK_*/USER preserved,
-# chdir into the cwd. INTRINSIC self-test (no guix shell -C oracle — the human's
+# cache, the caller's PATH (the toolchain, all /gnu/store), TD_SUBST_*/TD_DAEMON_*/USER
+# preserved, chdir into the cwd. INTRINSIC self-test (no guix shell -C oracle — the human's
 # direction 2026-06-14): the `eval` gate's exact command (`$(GUIX) repl $(LOAD)
 # tests/eval.scm` — loads every system/test module + prints "eval ok") RUNS and prints
 # "eval ok" inside td's --expose-cwd sandbox. That a real module-loading gate succeeds

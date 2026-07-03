@@ -11,9 +11,10 @@
 ;; error exits 1.
 ;;
 ;; Only two system modules remain since the guix-system museum tier was
-;; retired: td-builder (check.sh's outer-sandbox prelude
-;; still realizes it) and td-build (the drv fixtures for the realize/hermetic/
-;; daemon gates still lower through it, retired with the remaining fixtures).
+;; retired: td-builder (the guix td-builder package — td-build's fixtures use
+;; it as their builder/oracle; check.sh's loop container is provisioned by the
+;; guix-free stage0 instead) and td-build (the drv fixtures for the realize/
+;; hermetic/daemon gates still lower through it; both retire with those fixtures).
 (use-modules (system td-builder)
              (system td-build))
 

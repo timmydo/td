@@ -10,26 +10,30 @@
 # baking it here makes "the single command" real instead of tribal knowledge.
 #
 # Usage:
-#   ./check.sh            # full loop: eval -> build(--check) -> boot test
-#   ./check.sh eval       # a single Makefile target inside the same sandbox
-#   TD_CHECK_FULL=1 ./check.sh   # force-full: bypass all memoized --check
-#                                # verdicts (check-memo constraint 4 —
-#                                # REQUIRED for oracle re-baselines and any
-#                                # suspected nondeterminism)
+#   ./check.sh                # full loop: cheap structural gates -> build-recipes -> heavy gates
+#   ./check.sh eval           # a single Makefile target inside the same sandbox
+#   ./check.sh check-harness  # the guix-free /td/store harness tier (see below)
 #
-# Why each piece (learned in M2, see HISTORY.md):
-#   --expose=/gnu/store        : -C otherwise hides the host guix binary closure.
-#   --share=$HOME/.cache/guix  : pinned channel checkout — avoids a re-fetch.
-#   --share=/var/guix          : daemon socket + writable profiles/GC roots.
+# Why each piece (host-sandbox --expose-cwd binds these itself, builder/src/main.rs;
+# rationale learned in M2, see HISTORY.md):
+#   /gnu/store (ro)            : the host store — the warm closures the loop's
+#                                REMAINING guix surface resolves against (the
+#                                census gates' `guix repl` lowering + the pinned
+#                                seed-lock realizations; a shrink-only ratchet,
+#                                tests/guix-surface-shrink.expected). This bind —
+#                                and the guix pieces below — go away when that
+#                                in-sandbox surface reaches zero, not before.
+#   ~/.cache/guix (rw)         : pinned channel checkout — avoids a re-fetch.
+#   /var/guix (rw)             : daemon socket + writable profiles/GC roots.
 #   host guix first on PATH     : the host *system* guix already IS the pinned
 #                                 commit, so the Makefile's `time-machine` is a
 #                                 no-op that hits the warm store (no re-fetch).
-#   NO --network               : on purpose. Network => substitutes => unpinned bits.
+#   NO network                 : on purpose. Network => substitutes => unpinned bits.
 #   guix shell --no-substitutes --no-offload : the daemon we share
-#                                 (--share=/var/guix) runs on the HOST and HAS
+#                                 (/var/guix) runs on the HOST and HAS
 #                                 network — container isolation does not isolate
 #                                 it, and it is configured with
-#                                 substitute servers. So dropping --network
+#                                 substitute servers. So a no-network container
 #                                 is NOT enough: a not-yet-warm path would still
 #                                 make the daemon query/fetch substitutes or
 #                                 offload to a remote builder, violating the
@@ -42,9 +46,9 @@
 #                                 profile. Passing them to `guix shell` forbids
 #                                 substitution/offload for the environment build
 #                                 too.
-#   GUIX_BUILD_OPTIONS=...      : belt-and-suspenders for the guix build/system
-#                                 calls the Makefile makes INSIDE the shell (the
-#                                 repl-based diff rungs set the same via
+#   GUIX_BUILD_OPTIONS=...      : belt-and-suspenders for the guix build/repl
+#                                 calls the gates make INSIDE the sandbox (the
+#                                 repl-based drv fixtures set the same via
 #                                 `set-build-options #:use-substitutes? #f
 #                                 #:offload? #f`, since `guix repl` does not read
 #                                 this variable).
@@ -53,7 +57,7 @@
 # construction is: NO binary substitutes and NO remote build offloading — every
 # realisation is a LOCAL build, and nothing is pulled from a substitute server,
 # cold or warm. It does NOT guarantee a fully network-free run:
-# the daemon we share (--share=/var/guix) runs on the HOST and keeps its network,
+# the daemon we share (/var/guix) runs on the HOST and keeps its network,
 # and `--no-substitutes` does not stop a *fixed-output* derivation (a `git`/`url`
 # source fetch) from reaching out on a cold path. That residual is permitted by
 # the hermeticity clause (CLAUDE.md prime directive 2: "offline except declared
@@ -118,37 +122,6 @@ if [ "$hostcommit" != "$pinned" ]; then
   exit 1
 fi
 
-# --- check-memo: environment identity + force-full knob --
-# The --check verdict-memoization helper (tests/check-memo.sh) may green a
-# reproducibility leg only on a verdict recorded in the SAME environment
-# (constraint 2). That identity is computed HERE, on the host — the -C
-# container cannot see /etc/machine-id — and carried in via --preserve below:
-#   machine-id : this host (a verdict never travels between machines)
-#   store fs type : the filesystem under /gnu/store (the 2026-06-12
-#     readdir-order divergence was btrfs-vs-ext4 — environment-dependence the
-#     same-environment keying must preserve detection of)
-#   pinned commit : the channel pin (a bump re-keys every verdict)
-# FAIL CLOSED: if any component is unknown the identity stays EMPTY and the
-# helper never hits and never records — every leg runs the full --check.
-# CI GATE (constraint 2: CI verdict reuse is OFF until gate 2 re-opens): under
-# CI the identity is FORCED empty, so a persistent runner workspace can never
-# accumulate verdicts that would loosen a required check.
-# FORCE-FULL (constraint 4): TD_CHECK_FULL=1 ./check.sh bypasses all verdicts;
-# oracle re-baselines (any DIGESTS.md change) and suspected nondeterminism
-# MUST use it.
-if [ -n "${CI-}" ] || [ -n "${GITHUB_ACTIONS-}" ]; then
-  TD_CHECK_ENV=""
-else
-  machineid=$(cat /etc/machine-id 2>/dev/null || true)
-  storefs=$(stat -f -c %T /gnu/store 2>/dev/null || true)
-  if [ -n "$machineid" ] && [ -n "$storefs" ]; then
-    TD_CHECK_ENV="$machineid:$storefs:$pinned"
-  else
-    TD_CHECK_ENV=""
-  fi
-fi
-export TD_CHECK_ENV
-
 # --- Offline-isolation control: the netns probe mechanism must discriminate ---
 # The `offline` rung's probes assert "only `lo` in /proc/net/dev" inside
 # builders (tests/offline-drv.scm). That assertion only has teeth if the same
@@ -176,13 +149,12 @@ if [ "$#" -eq 0 ]; then
 fi
 
 # Heavy-gate source/crate warm prelude: ON by default, OFF for the LIGHT tiers.
-# `check-fast` (cheap gates + ts) and `check-engine` (engine smoke) run NONE of the
-# heavy/bootstrap/rust gates, so they must not warm — or HANG warming — those gates'
+# `check-fast` (the cheap structural gates) and `check-engine` (engine smoke) run NONE of
+# the heavy/bootstrap/rust gates, so they must not warm — or HANG warming — those gates'
 # inputs: the source-bootstrap tarballs (now 17, incl. the ~100MB linux + gcc seeds) and
 # the rust corpus crate closures (~2200 crates across 8 cargo-proxy warms). That host-side
 # warm has no per-fetch timeout, so a single slow/unresponsive mirror could block the fast
-# tier past the CI timeout (it tipped over when #178 added the gcc-mesboot1 seeds). Only
-# warm-tsgo stays unconditional below — the fast tier's `ts`/`tsgo-pin` gates need it.
+# tier past the CI timeout (it tipped over when #178 added the gcc-mesboot1 seeds).
 heavy_warm=0
 for _goal in "$@"; do
   case "$_goal" in
@@ -202,30 +174,24 @@ done
 #                                grouping
 #                                keeps failures readable. All rungs still must pass;
 #                                a red stops new rungs from spawning.
-#   util-linux + sqlite        : the `rootless` rung needs unshare/mount (the
-#                                nested userns + staged-store binds) and
-#                                sqlite3 (a CONSISTENT snapshot of the host
-#                                store DB via sqlite's backup API — a plain cp
-#                                races against the live daemon's writes). Both
-#                                resolve from the warm store (sqlite is in
-#                                guix's own closure), so the offline contract
-#                                is unchanged.
-#   --expose=/sys/fs/cgroup    : the M8 `run` rung runs the shipped OCI image as a
-#                                rootless crun container. crun probes the host
-#                                cgroup hierarchy at startup; inside `-C` the
-#                                container's /sys/fs/cgroup is plain sysfs, not
-#                                cgroup2, so crun aborts ("invalid file system type
-#                                on /sys/fs/cgroup"). Exposing the host's real
-#                                cgroup2 mount satisfies the probe. It is a
-#                                read-only host-resource exposure (like
-#                                --share=/var/guix), NOT a network/substitute path,
-#                                so it does not weaken the offline contract; crun is
+#   util-linux + sqlite        : gate consumers, both resolved from the warm store
+#                                (sqlite is in guix's own closure), so the offline
+#                                contract is unchanged: unshare/flock for the
+#                                offline/hermetic rungs' netns probes and
+#                                stage0-builder's placement lock; sqlite3 as the
+#                                store-register/store-backend gates' parser oracle
+#                                (td writes the store DB itself; sqlite3 only
+#                                verifies the bytes).
+#   /sys/fs/cgroup (ro)        : the OCI gates (oci-native, rust-userland-image)
+#                                run td-native images as rootless crun containers.
+#                                crun probes the host cgroup hierarchy at startup;
+#                                without the host's real cgroup2 mount it aborts
+#                                ("invalid file system type on /sys/fs/cgroup").
+#                                A read-only host-resource exposure (like
+#                                /var/guix), NOT a network/substitute path, so it
+#                                does not weaken the offline contract; crun is
 #                                additionally run with --cgroup-manager=disabled so
 #                                it never writes the hierarchy.
-#   --preserve='^TD_CHECK_'    : the check-memo identity/knobs computed above
-#                                (TD_CHECK_ENV, TD_CHECK_FULL, ...) — --pure
-#                                would otherwise strip them; the `memo` rung
-#                                asserts TD_CHECK_ENV arrives.
 # --- The hermetic container ---------------------------------------------------
 # td's OWN sandbox (`td-builder host-sandbox --expose-cwd`) is THE loop container —
 # the north star's one Rust sandbox stack spanning build AND run, made literal.
@@ -236,34 +202,36 @@ done
 # the worktree + the guix cache, host guix + the toolchain on PATH, running as
 # PID 1 of its own PID namespace in its own loopback-only network namespace (full
 # guix-shell-C parity, asserted by the loop-sandbox/loop-rung self-tests). EVERY
-# rung runs here, including `rootless` (its nested unprivileged userns builder now
-# nests cleanly thanks to the PID-ns parity) and the loop self-tests. `guix shell`
-# (no -C) still PROVISIONS the toolchain profile — td replaces the CONTAINER, not
-# guix's profile machinery.
-tb=$(guix build -L . -e '(@ (system td-builder) td-builder)')/bin/td-builder
-[ -x "$tb" ] || { echo "check.sh: FATAL: could not build td-builder for the loop sandbox." >&2; exit 1; }
+# rung runs here, including the loop self-tests. `guix shell` (no -C) still
+# PROVISIONS the toolchain profile — td replaces the CONTAINER, not guix's
+# profile machinery.
+#
+# The container PROVIDER is td's own bootstrapped stage0 td-builder — the same
+# guix-free provider the `check-harness` tier and every package-build gate already
+# use (tests/stage0-builder.sh: cargo-compiled from builder/ with the pinned lock
+# toolchain, guix/Guile off the build PATH, self-placed via its own
+# store-add-builder), now the DEFAULT loop substrate (workstream E, #294):
+# `guix build -e '(@ (system td-builder) td-builder)'` no longer provisions the
+# loop container anywhere. provision_stage0 (tests/cache-lib.sh) realizes the
+# pinned seed only when a path is missing (host-side warming — the cold-machine
+# case; the warm path spawns no guix) and loads the placed stage0 as $TB.
+. tests/cache-lib.sh
+provision_stage0 || { echo "check.sh: FATAL: could not provision the guix-free stage0 td-builder for the loop sandbox." >&2; exit 1; }
 # The packages guix shell -C would put on PATH, provisioned as a profile (no
 # container); --search-paths prints the `export PATH="…"` line we splice in. The
 # leading non-`$` run is the profile bin:sbin; the trailing `${PATH:+:}$PATH` (a
-# shell-eval append) is dropped — we set PATH ourselves.
+# shell-eval append) is dropped — we set PATH ourselves. This `guix shell` is the
+# loop substrate's last guix-provisioned piece (bash is the Makefile's recipe
+# shell; see the util-linux/sqlite note above); it retires when td's own /td/store
+# userland can supply these tools — today the harness carries only busybox + make
+# + the C toolchain (gate 420).
 toolchain=$(guix shell --no-substitutes --no-offload \
     make bash coreutils sed grep findutils tar gzip crun util-linux sqlite \
     --search-paths | sed -n 's/^export PATH="\([^$]*\).*/\1/p' | head -n1)
 [ -n "$toolchain" ] || { echo "check.sh: FATAL: could not provision the loop toolchain PATH." >&2; exit 1; }
-# GUIX_ENVIRONMENT is the profile root (what `guix shell -C` used to export) — the
-# `rootless` rung binds it into its staged store. The first PATH entry is the
-# profile's bin; its parent is the profile root.
-guix_env=$(dirname "${toolchain%%:*}")
-# --- Seed warm: td OWNS fetching the tsgo tarball (move-off-Guile §5) -----------
-# The offline loop's gates read the pinned tsgo tarball (tests/td-tsgo.lock) instead of
-# `guix build -e '(@ (system td-ts) td-tsgo-tarball)'`. The blob is fetched by td's OWN
-# fetcher (td-fetch) here on the HOST (network), exactly where the daemon also fetches
-# fixed-output seeds — the in-sandbox loop never egresses. Idempotent + near-instant once
-# the store path is warm; only a cold machine pays the one-time fetch (+ td-fetch build).
-#
 # --- Warm-prelude robustness + parallelism (loop-latency L3) -------------------
 # Two problems with the host warm: (1) NO per-step timeout, so one slow/hung
-# mirror can stall the prelude — including the fast tier's warm-tsgo — past the
+# mirror can stall the prelude past the
 # CI timeout (the in-file hang-risk note above); (2) the ~10 cargo-proxy warms
 # ran SERIALLY though each is fully INDEPENDENT (its own OS-picked loopback port
 # + work dir — "concurrent agents/worktrees never collide"). Fix: bound every
@@ -381,5 +349,4 @@ command -v ionice >/dev/null 2>&1 && nice_wrap="$nice_wrap ionice -c2 -n7"
 exec $nice_wrap env \
   PATH="$hostguix_dir:$toolchain" \
   GUIX_BUILD_OPTIONS="--no-substitutes --no-offload" \
-  GUIX_ENVIRONMENT="$guix_env" \
-  "$tb" host-sandbox --expose-cwd -- make -j"$jobs" --output-sync=target "$@"
+  "$TB" host-sandbox --expose-cwd -- make -j"$jobs" --output-sync=target "$@"

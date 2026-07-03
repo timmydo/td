@@ -5664,8 +5664,8 @@ fn main() -> ExitCode {
         // the daemon socket /var/guix, /proc, /dev; host-guix on PATH; its own
         // loopback-only netns), toward replacing `guix shell -C`. With
         // `--expose-cwd` it adds the FULL loop env (worktree + cgroups + guix
-        // cache, caller PATH + TD_CHECK_* preserved, chdir into the cwd) so a real
-        // rung runs as under `guix shell -C`.
+        // cache, caller PATH + TD_SUBST_*/TD_DAEMON_* preserved, chdir into the
+        // cwd) so a real rung runs as under `guix shell -C`.
         //
         // GUIX-LESS provisioning (host-sandbox-stage0 inc2 — the daily-suite VM):
         //   --store-from DIR : bind DIR (an UNPACKED SEED store, e.g.
@@ -5790,15 +5790,12 @@ fn main() -> ExitCode {
                     path_env = std::env::var("PATH").unwrap_or_default();
                     workdir = cwd;
                     for (k, v) in std::env::vars() {
-                        // TD_CHECK_* = the check-memo identity; TD_SUBST_* = the host-provisioned
+                        // TD_SUBST_* = the host-provisioned
                         // substitute resolver knobs (TD_SUBST_BIN/STORE/PUBKEY) the toolchain gates
                         // read to FETCH the lock-keyed closure instead of building from seed;
                         // TD_DAEMON_* = the shared build daemon's socket (TD_DAEMON_SOCKET) the
                         // corpus build submits to.
-                        if k.starts_with("TD_CHECK_")
-                            || k.starts_with("TD_SUBST_")
-                            || k.starts_with("TD_DAEMON_")
-                        {
+                        if k.starts_with("TD_SUBST_") || k.starts_with("TD_DAEMON_") {
                             extra_env.push((k, v));
                         }
                     }
