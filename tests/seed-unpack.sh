@@ -9,13 +9,13 @@
 # stage from with no guix install (PR3 — build hello from it).
 #
 # Bounded to one real seed root (hello's pinned bash, closure incl. glibc). td-builder is
-# the guix-free stage0; guix is only the capture SOURCE + the removable closure oracle.
+# the guix-free stage0; guix is only the capture SOURCE (its store DB) — the removable
+# `guix gc -R` closure oracle was DROPPED (CLAUDE.md directive 3; see the log).
 #
-# Legs:
+# Legs (all DURABLE — no guix oracle in any):
 #   [DURABLE round-trip]  seed-unpack restores + NAR-verifies the whole closure (no daemon)
 #   [DURABLE structural]  every restored path is present + NAR-identical in the td store
 #   [DURABLE structural]  td's reader sees the COMPLETE closure in the unpacked DEST-DB
-#   [REMOVABLE oracle]    the unpacked closure == `guix gc -R ROOT`
 set -eu
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -71,12 +71,6 @@ test -n "$scan_cl" || fail "store-closure-scan produced an empty closure"
 test "$scan_cl" = "$db_cl" \
   || { printf '%s\n' "$scan_cl" | sed 's/^/  scan: /' >&2; printf '%s\n' "$db_cl" | sed 's/^/  db:   /' >&2; fail "content-scan closure != the unpacked DB walk — the DB's refs don't reflect the bytes"; }
 echo "   [DURABLE] td content-scanned the seed closure (`printf '%s\n' "$scan_cl" | grep -c .` paths) from the BYTES == the unpacked DB walk — the DB's refs reflect the bytes, not just the manifest (no store DB, no guix)"
-
-# [REMOVABLE oracle] the unpacked closure == guix's gc -R.
-guix gc -R "$root" | sort -u > "$work/oracle"
-extra=`cat "$work/reg" "$work/oracle" | sort | uniq -u | head -3`
-test -z "$extra" || fail "unpacked closure differs from guix gc -R: $extra"
-echo "   [REMOVABLE oracle] the unpacked DB closure == guix gc -R `basename "$root"`"
 
 echo "PASS: td-builder seed-unpack restored a frozen seed tarball into a td-owned store +"
 echo "      registered it (NAR-verified, no daemon, no /gnu/store write); td's own reader"
