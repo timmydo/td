@@ -1380,6 +1380,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
     assert_target!("recipes/src/catalog.rs", "guix-dependence");
     assert_target!("recipes/src/catalog.rs", "corpus-no-guix");
+    // Recipes are one self-registering file each under src/recipes/ (issue #295);
+    // the nested path must select the same gates (glob `*` crosses `/`).
+    assert_target!("recipes/src/recipes/hello.rs", "recipe-rs");
+    assert_target!("recipes/src/recipes/hello.rs", "guix-dependence");
+    assert_target!("recipes/src/recipes/hello.rs", "corpus-no-guix");
+    assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("tests/recipe-rs.sh", "recipe-rs");
     assert_target!("tests/recipes-meta.json", "recipe-rs");

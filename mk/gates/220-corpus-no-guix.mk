@@ -27,7 +27,8 @@ corpus_SPECS := hello
 # RECIPE FIELD (e.g. configureFlags) belong here: in the build-recipe path the SOURCE
 # is resolved from the pinned lock, not the recipe, so a twin that only flips a
 # SOURCE-HASH byte would be vacuous HERE. `hello-perturbed` perturbs configureFlags
-# (recipes/src/catalog.rs), so it assembles a DISTINCT .drv — load-bearing here.
+# (recipes/src/recipes/hello-perturbed.rs), so it assembles a DISTINCT .drv —
+# load-bearing here.
 corpus_SELFDISC_SPECS := hello
 BUILD_SPECS  += $(corpus_SPECS)
 BUILD_GATES  += corpus-no-guix

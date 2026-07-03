@@ -1,6 +1,7 @@
 # recipe-rs — td's package + system-spec surface declared in RUST (rust-recipe-surface
 # track; the §5 move-off-Guile goal). boa/TypeScript/tsgo are RETIRED: recipes live in
-# recipes/src/catalog.rs and specs in recipes/src/specs.rs, evaluated by td-recipe-eval.
+# recipes/src/recipes/<stem>.rs (one self-registering file per recipe; build.rs
+# assembles the registry — issue #295), evaluated by td-recipe-eval.
 # This gate compiles the dependency-free `td-recipe` crate OFFLINE, runs its unit tests,
 # then asserts (tests/recipe-rs.sh) the surface is self-consistent — every recipe + spec
 # emits valid round-tripping JSON, the guix-dependence manifest (tests/recipes-meta.json)
