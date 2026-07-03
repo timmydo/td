@@ -8,7 +8,7 @@
 #
 #   check-fast — GitHub-hosted. Imports the SMALL td-ci-fast store image (~4G:
 #                the fast-tier closure only) and runs the UNMODIFIED offline
-#                ./check.sh check-fast — the cheap derivation-level gates + the
+#                cargo run --release --quiet --manifest-path builder/Cargo.toml -- check check-fast — the cheap derivation-level gates + the
 #                tsc type-check (Makefile FAST_GATES). The real hermetic loop,
 #                fast because the store is warm: import + lower + tsc in minutes,
 #                no KVM, no 41G.
@@ -46,10 +46,9 @@ jobs:
     steps:
       # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: shell syntax (check.sh, tests/*.sh, ci/*.sh, .github/*.sh)
+      - name: shell syntax (tests/*.sh, ci/*.sh, .github/*.sh)
         run: |
           set -eu
-          bash -n check.sh
           for d in tests ci .github; do
             for f in "$d"/*.sh; do [ -e "$f" ] || continue; bash -n "$f"; done
           done
@@ -184,12 +183,12 @@ jobs:
           test -x "$host_guix/bin/guix" && test -x "$host_guix/bin/guix-daemon" \
             || { echo "host-guix shim came out malformed: '$host_guix'" >&2; exit 1; }
           echo "$host_guix" > /tmp/host-guix
-      - name: run the fast tier (./check.sh check-fast, offline)
+      - name: run the fast tier (td-builder check check-fast, offline)
         run: |
           set -euo pipefail
           export PATH="$(cat /tmp/host-guix)/bin:$PATH"
           guix describe
-          ./check.sh check-fast
+          cargo run --release --quiet --manifest-path builder/Cargo.toml -- check check-fast
 
   cargo-test:
     # The td-native build ENGINE gate — drv parse/emit, store-path hashing, NAR

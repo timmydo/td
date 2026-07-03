@@ -290,7 +290,7 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
         _ => {
             sel.add_target("check-fast");
             sel.require_full(&format!(
-                "No recipe-specific mapping for '{spec}'; update builder/src/affected.rs or run full ./check.sh."
+                "No recipe-specific mapping for '{spec}'; update builder/src/affected.rs or run the full check."
             ));
         }
     }
@@ -367,7 +367,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
                 _ => {
                     sel.add_target("check-fast");
                     sel.require_full(&format!(
-                        "{p} does not register a gate target; update the gate or run full ./check.sh."
+                        "{p} does not register a gate target; update the gate or run the full check."
                     ));
                 }
             }
@@ -748,7 +748,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // (host-sandbox-stage0 inc2c). `check-harness` is a check.sh-intercepted tier
         // (its own container), not a make gate, so it cannot join the other ./check.sh
         // targets — run it as its own invocation after provisioning.
-        sel.add_note("run `./check.sh check-harness` separately to validate the guix-free /td/store harness tier (host-sandbox-stage0 inc2c) — it consumes the harness gate 420 persisted.");
+        sel.add_note("run `td-builder check check-harness` separately to validate the guix-free /td/store harness tier (host-sandbox-stage0 inc2c) — it consumes the harness gate 420 persisted.");
         return;
     }
 
@@ -759,7 +759,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if pattern_matches("tests/harness-loop.sh|mk/harness.mk", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("userland-x86_64-store-native");
-        sel.add_note("run `./check.sh check-harness` separately to validate the guix-free /td/store harness tier (host-sandbox-stage0 inc2c).");
+        sel.add_note("run `td-builder check check-harness` separately to validate the guix-free /td/store harness tier (host-sandbox-stage0 inc2c).");
         return;
     }
 
@@ -1106,7 +1106,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // Catch-all.
     sel.add_target("check-fast");
     sel.require_full(&format!(
-        "No mapping for {p}; update builder/src/affected.rs or run full ./check.sh."
+        "No mapping for {p}; update builder/src/affected.rs or run the full check."
     ));
 }
 
@@ -1161,7 +1161,7 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
             }
         }
         if !sel.targets.is_empty() {
-            o.push_str(&format!("  ./check.sh {}\n", sel.targets.join(" ")));
+            o.push_str(&format!("  td-builder check {}\n", sel.targets.join(" ")));
         }
     }
 
@@ -1169,17 +1169,17 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     if header.explicit {
         o.push_str("Waiver: inspection only (--path does not prove the branch diff)\n");
         if sel.full_required.is_empty() {
-            o.push_str("Branch-mode policy for these paths: full ./check.sh would be waived\n");
+            o.push_str("Branch-mode policy for these paths: the full check would be waived\n");
         } else {
-            o.push_str("Branch-mode policy for these paths: full ./check.sh would be required\n");
+            o.push_str("Branch-mode policy for these paths: the full check would be required\n");
             for n in &sel.full_required {
                 o.push_str(&format!("  - {n}\n"));
             }
         }
     } else if sel.full_required.is_empty() {
-        o.push_str("Waiver: full ./check.sh waived by affected-checks for this diff\n");
+        o.push_str("Waiver: the full check waived by affected-checks for this diff\n");
     } else {
-        o.push_str("Waiver: full ./check.sh required before marking ready\n");
+        o.push_str("Waiver: the full check required before marking ready\n");
         for n in &sel.full_required {
             o.push_str(&format!("  - {n}\n"));
         }
@@ -1225,7 +1225,7 @@ Select a right-sized check set from the diff against main.
   td-builder affected-checks --self-test  # verify the mapping table
 
 This is the local PR-readiness gate for diffs it can classify. It maps changed
-paths to focused Make targets and prints whether the full ./check.sh is waived
+paths to focused Make targets and prints whether the the full check is waived
 or still required.
 ";
 
@@ -1244,7 +1244,7 @@ fn path_output(root: &Path, path: &str) -> String {
 fn last_check_targets(output: &str) -> Vec<String> {
     let mut line: Option<&str> = None;
     for l in output.lines() {
-        if let Some(rest) = l.strip_prefix("  ./check.sh ") {
+        if let Some(rest) = l.strip_prefix("  td-builder check ") {
             line = Some(rest);
         }
     }
@@ -1348,9 +1348,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // A gate-file change still selects the dispatcher's own self-test preflight
     // (now the in-process `td-builder affected-checks --self-test`) and is waived.
     assert_contains!("builder/src/gate_defs/325-cargo-test.rs", "td-builder affected-checks --self-test");
-    assert_branch_policy!("builder/src/gate_defs/325-cargo-test.rs", "full ./check.sh would be waived");
+    assert_branch_policy!("builder/src/gate_defs/325-cargo-test.rs", "the full check would be waived");
     assert_target!("tests/repro-lib.sh", "bootstrap-binutils-244-store-native");
-    assert_branch_policy!("tests/repro-lib.sh", "full ./check.sh would be waived");
+    assert_branch_policy!("tests/repro-lib.sh", "the full check would be waived");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
     // catalog edit runs recipe-rs, the census, and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
@@ -1440,16 +1440,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
     assert_target!("seed/sources/mes-0.27.1.lock", "bootstrap-mes");
     assert_target!("builder/src/bootstrap.rs", "check-engine");
-    assert_branch_policy!("builder/src/bootstrap.rs", "full ./check.sh would be waived");
+    assert_branch_policy!("builder/src/bootstrap.rs", "the full check would be waived");
     // The td-builder build engine validates on the check-engine SMOKE tier.
     assert_target!("builder/src/sandbox.rs", "check-engine");
-    assert_branch_policy!("builder/src/main.rs", "full ./check.sh would be waived");
-    assert_branch_policy!("builder/src/sandbox.rs", "full ./check.sh would be waived");
-    assert_branch_policy!("builder/Cargo.toml", "full ./check.sh would be waived");
+    assert_branch_policy!("builder/src/main.rs", "the full check would be waived");
+    assert_branch_policy!("builder/src/sandbox.rs", "the full check would be waived");
+    assert_branch_policy!("builder/Cargo.toml", "the full check would be waived");
     assert_target!("system/td-build.scm", "check-system");
-    assert_branch_policy!("check.sh", "full ./check.sh would be required");
-    assert_branch_policy!("channels.scm", "full ./check.sh would be required");
-    assert_branch_policy!("new/unmapped.file", "full ./check.sh would be required");
+    assert_branch_policy!("check.sh", "the full check would be required");
+    assert_branch_policy!("channels.scm", "the full check would be required");
+    assert_branch_policy!("new/unmapped.file", "the full check would be required");
 
     failures
 }
@@ -1502,6 +1502,15 @@ fn sort_unique(mut v: Vec<String>) -> Vec<String> {
     v
 }
 
+/// Run the loop entry — THIS binary's `check` subcommand (check.sh is retired;
+/// the td programs are called directly, #318).
+fn run_self_check(root: &Path, targets: &[String]) -> i32 {
+    let Ok(me) = std::env::current_exe() else { return 1 };
+    let mut args: Vec<String> = vec!["check".to_string()];
+    args.extend(targets.iter().cloned());
+    run_command(root, &me.display().to_string(), &args)
+}
+
 fn run_command(root: &Path, program: &str, args: &[String]) -> i32 {
     Command::new(program)
         .args(args)
@@ -1527,7 +1536,7 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
     match name {
         "shell-syntax" => run_shell(
             root,
-            "bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
+            "bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
         ),
         "cargo-test" => run_shell(root, "cargo test --manifest-path builder/Cargo.toml"),
         // The dispatcher's own self-test — run IN-PROCESS (the shell oracle is gone,
@@ -1674,7 +1683,7 @@ pub fn main(args: &[String]) -> ExitCode {
         if explicit {
             // Shell: `echo` (blank line to STDOUT) then the message `>&2`.
             println!();
-            eprintln!("affected-checks: --path is inspection only; run full ./check.sh for these paths in branch mode");
+            eprintln!("affected-checks: --path is inspection only; run the full check for these paths in branch mode");
             return ExitCode::from(20);
         }
 
@@ -1689,23 +1698,23 @@ pub fn main(args: &[String]) -> ExitCode {
         }
 
         if !uncovered.is_empty() {
-            let code = run_command(&root, "./check.sh", &uncovered);
+            let code = run_self_check(&root, &uncovered);
             if code != 0 {
                 return ExitCode::from(code as u8);
             }
         }
         if !skipped.is_empty() {
             println!(
-                "\naffected-checks: escalation active; full ./check.sh covers skipped target(s): {}",
+                "\naffected-checks: escalation active; the full check covers skipped target(s): {}",
                 skipped.join(" ")
             );
         }
 
-        println!("\naffected-checks: escalation active; running full ./check.sh");
-        let code = run_command(&root, "./check.sh", &[]);
+        println!("\naffected-checks: escalation active; running the full check");
+        let code = run_self_check(&root, &[]);
         return ExitCode::from(code as u8);
     } else if !sel.targets.is_empty() {
-        let code = run_command(&root, "./check.sh", &sel.targets);
+        let code = run_self_check(&root, &sel.targets);
         return ExitCode::from(code as u8);
     }
 
@@ -1794,10 +1803,10 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  cargo test --manifest-path builder/Cargo.toml",
-                "  ./check.sh check-engine",
+                "  td-builder check check-engine",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
-                "Branch-mode policy for these paths: full ./check.sh would be waived",
+                "Branch-mode policy for these paths: the full check would be waived",
                 "",
                 "Notes:",
                 "  - builder/src/main.rs is the td-builder build engine: validated by the ~2-min check-engine smoke (compile + unit tests); the from-source build coverage is the DAILY backstop (DESIGN §7.2), not a per-PR gate.",
@@ -1817,10 +1826,10 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
-                "  ./check.sh check-fast cargo-test",
+                "  td-builder check check-fast cargo-test",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
-                "Branch-mode policy for these paths: full ./check.sh would be required",
+                "Branch-mode policy for these paths: the full check would be required",
                 "  - check.sh touches the loop spine; affected-checks cannot waive the full loop.",
                 "",
                 "Dry run only. Re-run with --run to execute.",
@@ -1839,7 +1848,7 @@ mod tests {
                 "Selected checks: none (docs-only or ignored local metadata)",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
-                "Branch-mode policy for these paths: full ./check.sh would be waived",
+                "Branch-mode policy for these paths: the full check would be waived",
                 "",
                 "Dry run only. Re-run with --run to execute.",
             ])
@@ -1855,11 +1864,11 @@ mod tests {
                 "  totally/unmapped/path.xyz",
                 "",
                 "Selected checks:",
-                "  ./check.sh check-fast",
+                "  td-builder check check-fast",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
-                "Branch-mode policy for these paths: full ./check.sh would be required",
-                "  - No mapping for totally/unmapped/path.xyz; update builder/src/affected.rs or run full ./check.sh.",
+                "Branch-mode policy for these paths: the full check would be required",
+                "  - No mapping for totally/unmapped/path.xyz; update builder/src/affected.rs or run the full check.",
                 "",
                 "Dry run only. Re-run with --run to execute.",
             ])

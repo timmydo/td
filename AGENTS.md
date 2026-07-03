@@ -55,7 +55,7 @@ bootstrap replaces the guix toolchain seed.
    loosen, or `xfail` a test just to turn a task green. It is ok to
    remove tests when migrating to another system (which has its own
    tests). Removing, loosening, or restructuring any existing gate or
-   assertion in `check.sh`, the gate runner or gate definitions
+   assertion in the gate runner or gate definitions
    (`builder/src/gates.rs`, `builder/src/gate_defs/`), or `tests/` must be
    called out plainly in the PR so the human approves it knowingly — never
    slip it past review. Adding or strengthening tests is always
@@ -110,16 +110,21 @@ bootstrap replaces the guix toolchain seed.
 
 ## The loop
 
-Run all the tests with the single pass/fail command:
+Run all the tests with the single pass/fail command (check.sh is
+retired — the td programs are called directly, #318; the host Rust
+toolchain is the one thing the user brings, the initial seed):
 
 ```
-./check.sh
+cargo run --release --manifest-path builder/Cargo.toml -- check
 ```
 
-`./check.sh` is a GUIX-FREE cargo bootstrap shim (the host Rust
-toolchain is the one thing the user brings — the initial seed): it
-builds the dependency-free builder crate and execs **`td-builder
-check`** (builder/src/check_loop.rs), td's own compiled host prelude —
+(After the first build, `builder/target/release/td-builder check` is
+the same thing without cargo's freshness probe. A cargo-less host —
+the guix-free harness VM — invokes its pre-placed stage0 binary:
+`.td-build-cache/stage0/store/*/bin/td-builder check check-harness`.)
+
+**`td-builder check`** (builder/src/check_loop.rs) is td's own compiled
+host prelude —
 the pinned-guix integrity guard, the loop toolchain provisioning, the
 warm prelude, the shared build daemon — which then enters the fresh
 sandbox (**td's OWN `td-builder host-sandbox --expose-cwd`, the sole
@@ -136,13 +141,13 @@ IO/daemon-blocked; memory is the real safety limit: slot grants defer
 while MemAvailable is under TD_MIN_FREE_GIB (default 4, the daemon's
 knob) and every gate body runs under a per-process RLIMIT_DATA cap,
 TD_CHECK_GATE_MEM_MIB, default 8192) — so do NOT stagger checks, tune
-`-j`, or otherwise hand-schedule; run `./check.sh` whenever you need
+`-j`, or otherwise hand-schedule; run the full check whenever you need
 it and let the pool arbitrate.
 
 Every build/test runs inside that fresh td sandbox so your own
-environment cannot contaminate results; `./check.sh <target>` runs a
+environment cannot contaminate results; `td-builder check <target>` runs a
 single gate or tier in the same sandbox (`td-builder gate-run
-list-gates` prints the assembled pools). `./check.sh --resume` skips
+list-gates` prints the assembled pools). `td-builder check --resume` skips
 gates already journaled green for the IDENTICAL working tree (any edit
 invalidates every skip; skipped gates print loudly) — an interactive
 iteration aid only: CI and the daily backstop never pass it.
@@ -162,7 +167,7 @@ builder/Cargo.toml`.
 
 ```
 td-builder affected-checks        # show changed paths and selected checks
-td-builder affected-checks --run  # run the selected preflights and ./check.sh targets
+td-builder affected-checks --run  # run the selected preflights and check targets
 ```
 
 It compares the branch to `origin/main` (falling back to `main`) and
@@ -177,16 +182,16 @@ After rebasing for PR readiness, run:
 td-builder affected-checks --committed-only --run
 ```
 
-If it prints `Waiver: full ./check.sh waived by affected-checks for
+If it prints `Waiver: the full check waived by affected-checks for
 this diff`, that is the local waiver for the full loop; record the
 selected checks and waiver line in the PR body. If it prints `Waiver:
-full ./check.sh required before marking ready`, `--run` executes the
-selected checks and then the full `./check.sh` before it can exit
+the full check required before marking ready`, `--run` executes the
+selected checks and then the full check before it can exit
 successfully.
 
 **Build-engine changes (`builder/src/*`) are the exception** they no
 longer escalate to the full loop — they validate on the
-**`check-engine` smoke tier** (`./check.sh check-engine`: a TRUE
+**`check-engine` smoke tier** (`td-builder check check-engine`: a TRUE
 ~2-min smoke — cheap structural gates + `cargo-test` (compile the
 engine + its unit tests), and NOTHING that builds a package from
 source) and `affected-checks` waives the full loop for them. The full
@@ -308,7 +313,7 @@ tracking system, and all working notes live in the git log + PR body.
   under you no longer forces a rebase-onto-tip + re-run. So: (1) validate against
   your own base — run `td-builder affected-checks --committed-only --run`; if it
   waives the full loop, record the waiver in the PR body; if it escalates, it
-  runs the FULL `./check.sh` before returning success, so record the escalation
+  runs the FULL the full check before returning success, so record the escalation
   and full result instead; (2) **every PR gets a subagent code review — waivable only for a trivial docs- or comment-only diff, and only if you say so in the PR:** spawn an
   independent code-review subagent over the full branch diff (`/code-review`) and
   **post the subagent's review results as a comment on the PR**; address its
@@ -334,15 +339,16 @@ tracking system, and all working notes live in the git log + PR body.
   (check with `gh run list --branch main --workflow ci.yml -L1` or
   `gh api repos/<owner>/td/commits/main/check-runs`). A heavy-only break
   (boot/VM/repro, not seen by the fast tier) is NOT caught by check-fast either —
-  it surfaces on the next manual full `./check.sh`; this is an accepted gap of
+  it surfaces on the next manual full check; this is an accepted gap of
   the velocity trade. Marking a PR ready
   with a locally-red or un-run affected-checks gate, or without the full run when
   affected-checks escalates, is still a contract violation — CI verifies your
   run, it does not replace it. `lint` + `check-fast` are the required checks; the
-  full `./check.sh` stays the dev-machine gate (step 1).
+  full check stays the dev-machine gate (step 1).
   
-- **Exclusive landings:** changes to the shared spine — `check.sh`,
-  `channels.scm`, the gate runner (`builder/src/gates.rs`) — collide with everyone.
+- **Exclusive landings:** changes to the shared spine — `channels.scm`, the loop
+  entry + gate runner (`builder/src/check_loop.rs`, `builder/src/gates.rs`) —
+  collide with everyone.
   Announce in the PR description, land as small standalone PRs, expect others to
   rebase. Channel bumps are the canonical case. (The frozen-oracle `system/td.scm`
   + `DIGESTS.md` spine entries were retired with the guix-system gate tier; the
@@ -365,8 +371,9 @@ tracking system, and all working notes live in the git log + PR body.
 
 **Directory layout**
 
-- `check.sh` — the canonical hermetic, offline pass/fail command (`./check.sh`). The
-  only command you need to determine green/red.
+- `td-builder check` — the canonical hermetic, offline pass/fail command (built by
+  the host cargo; check.sh is retired). The only command you need to determine
+  green/red.
 - `builder/src/gates.rs` + `builder/src/check_loop.rs` — td's OWN gate runner
   (`td-builder gate-run`, the in-sandbox scheduler) and the loop host prelude
   (`td-builder check`); together they replaced the `Makefile` + `make` and the
@@ -413,7 +420,7 @@ tracking system, and all working notes live in the git log + PR body.
 - `td-builder affected-checks` (`builder/src/affected.rs`) — diff-to-check
   dispatcher for local iteration and PR readiness. Run it first to see the selected
   checks, then `td-builder affected-checks --run` to execute them. Its waiver line
-  decides whether the local full `./check.sh` run is waived or still required;
+  decides whether the local full check run is waived or still required;
   `--run` enforces escalation by running the full loop when required. Its own mapping
   guard is `td-builder affected-checks --self-test` (also a `cargo-test` `#[test]`).
 
@@ -423,7 +430,7 @@ tracking system, and all working notes live in the git log + PR body.
   prefix.
 - Hand-formatted 2-space indentation, no tabs. Do NOT run `guix style` — it was tried
   in M2 and mangled the layout; the hand-formatted style is the convention.
-- Run every build/test via `./check.sh` (or `./check.sh <target>`), which enters td's
+- Run every build/test via the full check (or `td-builder check <target>`), which enters td's
   own `td-builder host-sandbox` for you (see "The loop"). Don't add `--network` to
   it — that pulls substitutes (offline/hermeticity violation).
 
@@ -437,7 +444,7 @@ fns/impls — a crate-root inner `#![allow]` would be crate-GLOBAL and silently
 exempt everything) — when you next work a grandfathered file/item substantially,
 drop its `allow` and fix it. The mechanically-checkable rules are declared as a
 `[lints]` table in every crate's `Cargo.toml` at `deny` and enforced by the
-**`cargo-test`** gate (`./check.sh cargo-test`, part of the `check-engine` smoke
+**`cargo-test`** gate (`td-builder check cargo-test`, part of the `check-engine` smoke
 tier), which runs `cargo clippy` (then `cargo test`) offline over the
 dependency-free engine crates — a denied lint reds only on new code.
 

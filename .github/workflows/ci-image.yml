@@ -247,12 +247,12 @@ jobs:
           test -x "$host_guix/bin/guix" && test -x "$host_guix/bin/guix-daemon" \
             || { echo "host-guix shim malformed: '$host_guix'" >&2; exit 1; }
           echo "$host_guix" > /tmp/host-guix
-      - name: run the full check (./check.sh) against the candidate
+      - name: run the full check (td-builder check) against the candidate
         run: |
           set -eu
           export PATH="$(cat /tmp/host-guix)/bin:$PATH"
           guix describe
-          ./check.sh
+          cargo run --release --quiet --manifest-path builder/Cargo.toml -- check
 
   promote:
     # Registry-side retag — the candidate VERBATIM becomes :<pin> (and
