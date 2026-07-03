@@ -1073,6 +1073,15 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // The pinned td-system lowering lock + its channel-bump capture tool feed the two
+    // gates that consume the pinned system root (oci resolves + content-scans it;
+    // oci-load's plain-image leg shares the seam).
+    if pattern_matches("tests/td-system.lock|tests/td-system-lock.scm", p) {
+        sel.add_target("oci");
+        sel.add_target("oci-load");
+        return;
+    }
+
     if p == "system/td-builder.scm" {
         sel.add_target("td-builder");
         sel.add_target("rust-build");
@@ -1504,6 +1513,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/guix-surface.sh", "guix-surface");
     assert_target!("tests/guix-surface.expected", "guix-surface");
     assert_target!("tests/guix-surface-shrink.expected", "guix-surface");
+    assert_target!("tests/td-system.lock", "oci");
+    assert_target!("tests/td-system.lock", "oci-load");
+    assert_target!("tests/td-system-lock.scm", "oci");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
     // the seed tree + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.

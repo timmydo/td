@@ -1,0 +1,10 @@
+# tests/td-system.lock — PINNED lowering of the FROZEN td system (system/td.scm
+# td-system) at the pinned channel (channels.scm): the store path the system
+# lowers to and the derivation that produces it. Consumed by the loop with NO
+# guix process: `td-builder resolve` reads it and `td-builder store-closure-scan`
+# computes the runtime closure from the pinned root by content-scan (gates
+# 120-oci / 135-oci-load). PINNED ARTIFACT — regenerate on a channel bump
+# (an exclusive landing, like DIGESTS.md):
+#   guix time-machine -C channels.scm -- repl -L . tests/td-system-lock.scm > tests/td-system.lock
+td-system /gnu/store/r3cajym1fjw463vys32ld2r9ilhbg2z8-system
+td-system-drv /gnu/store/iy338wd0mqkbc8qfw4lc9jm9nf2sk6k3-system.drv

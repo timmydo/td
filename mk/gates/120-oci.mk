@@ -3,11 +3,20 @@
 # lowering the system to a Docker image through guix's `(gnu system image)` Guile
 # (`guix system image -t docker`, the M5 packing), `td-builder oci-image-paths` packs
 # the td SYSTEM's runtime closure into a deterministic docker-archive itself
-# (builder/src/oci.rs). The IMAGE CONSTRUCTION moves off Guile here; only INPUT
-# RESOLUTION — realizing the td system + listing its closure store paths — stays Guix's
-# (tests/oci-system-closure.scm, a `guix repl` that calls NO image lowering and reads NO
-# guix private state; the retired-last half, §5). So the guix surface SHRINKS: this
-# retires the guix-image reproducibility check AND the M5 OCI differential
+# (builder/src/oci.rs) — and INPUT RESOLUTION is td's too: the frozen oracle's lowered
+# system root is PINNED in tests/td-system.lock (regenerated on a channel bump by
+# tests/td-system-lock.scm — the Guile lowering demoted from a per-gate loop step to a
+# capture tool), and the gate computes "which store paths make up the system" with
+# `td-builder resolve` + `td-builder store-closure-scan` (td's OWN content-scan closure
+# — NO `guix repl`, NO /var/guix/db read; the lock pattern of tests/td-build-inputs.lock
+# / gate 255). A stale lock cannot pass silently: the pinned root must exist on disk and
+# crun — the entrypoint, resolved from the LIVE pinned channel — must be IN td's scanned
+# closure, so a channel bump that moves the system reddens here until the lock is
+# regenerated. (Grounded 2026-07-02: td's scan == `guix repl` requisites ∪ closure(man-db)
+# — the one extra edge is a REAL byte-reference, manual-database/share/man/index.db →
+# man-db, that guix's own DB records as zero references; td ships the man index's
+# runtime deps instead of dangling them.) So the guix surface SHRINKS: this earlier
+# retired the guix-image reproducibility check AND the M5 OCI differential
 # (tests/oci-diff.scm, gate oci-diff) with no new guix-db-read/gc reliance (directive 6;
 # see the PR's directive-3 callout for the removed gates). Proven with DURABLE
 # assertions (no guix byte-identity oracle):
@@ -21,7 +30,7 @@
 #   • self-discrimination: a bogus exec in the same image fails (oci-native-check.sh).
 SYSTEM_GATES += oci
 oci:
-	@echo ">> oci: td-builder packs the td SYSTEM closure into a working OCI image (no guix system image); reproducible, skopeo loads it, crun runs the shipped runtime"
+	@echo ">> oci: td-builder resolves the td SYSTEM closure from the pinned lock (no guix repl) and packs it into a working OCI image (no guix system image); reproducible, skopeo loads it, crun runs the shipped runtime"
 	@set -euo pipefail; \
 	. tests/cache-lib.sh; export TD_STAGE0_BASE="$(CURDIR)/.td-build-cache/stage0"; load_stage0; tb="$$TB"; \
 	case "$$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($$tb)" >&2; exit 1 ;; esac; \
@@ -31,12 +40,16 @@ oci:
 	test -x "$$crun/bin/crun" -a -x "$$skopeo" || { echo "ERROR: could not resolve crun/skopeo" >&2; exit 1; }; \
 	scratch="$(CURDIR)/.oci-scratch"; chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"; mkdir -p "$$scratch"; \
 	trap 'chmod -R u+w "$$scratch" 2>/dev/null || true; rm -rf "$$scratch"' EXIT; \
-	echo ">> resolve the td system runtime closure (input resolution — guix repl, retired last)"; \
-	$(GUIX) repl $(LOAD) tests/oci-system-closure.scm > "$$scratch/closure.txt" 2>/dev/null \
-	  || { echo "FAIL: could not resolve the td system closure" >&2; exit 1; }; \
+	echo ">> resolve the td system runtime closure (td-NATIVE: pinned tests/td-system.lock + content-scan — no guix repl, no /var/guix/db)"; \
+	sysout=`"$$tb" resolve tests/td-system.lock td-system` \
+	  || { echo "FAIL: could not resolve td-system from tests/td-system.lock" >&2; exit 1; }; \
+	test -d "$$sysout" \
+	  || { echo "FAIL: the pinned td system root $$sysout is not in the store — the lock is stale or the store is cold; regenerate on a channel bump: guix time-machine -C channels.scm -- repl -L . tests/td-system-lock.scm > tests/td-system.lock" >&2; exit 1; }; \
+	"$$tb" store-closure-scan /gnu/store "$$sysout" > "$$scratch/closure.txt" \
+	  || { echo "FAIL: td-builder store-closure-scan failed on the td system root" >&2; exit 1; }; \
 	test -s "$$scratch/closure.txt" || { echo "FAIL: empty td system closure" >&2; exit 1; }; \
 	grep -qx "$$crun" "$$scratch/closure.txt" \
-	  || { echo "FAIL: crun ($$crun) is not in the td system closure — wrong entrypoint" >&2; exit 1; }; \
+	  || { echo "FAIL: crun ($$crun, resolved from the live pinned channel) is not in td's scanned system closure — wrong entrypoint, or tests/td-system.lock is STALE (regenerate on a channel bump: guix time-machine -C channels.scm -- repl -L . tests/td-system-lock.scm > tests/td-system.lock)" >&2; exit 1; }; \
 	echo "   resolved `wc -l < "$$scratch/closure.txt"` store paths (the td system closure)"; \
 	printf '{"repoTag":"td-system:latest","env":["PATH=/bin"],"entrypoint":["%s/bin/crun"]}' "$$crun" > "$$scratch/config.json"; \
 	echo ">> td-builder oci-image-paths (td-native image construction — no guix system image, no /var/guix/db)"; \

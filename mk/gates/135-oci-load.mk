@@ -5,10 +5,13 @@
 # 1238 + 290 cold fetches (rejected at M8); resolved via `$(GUIX) build` so
 # check.sh's package list is untouched. For BOTH the plain td image and the
 # gen-1 bootc generation image, the marginal cost is the skopeo pass, not a
-# rebuild. The plain image is now the td-NATIVE system image (`td-builder
-# oci-image-closure` over the td system closure — shared with the `oci` gate, no
-# `guix system image`, the OCI slice of workstream C); gen-1 stays on the guix
-# `generation-image` lowering (its own later slice):
+# rebuild. The plain image is the td-NATIVE system image, resolved AND packed by
+# td alone (shared with the `oci` gate): the system root pinned in
+# tests/td-system.lock, `td-builder store-closure-scan` for the closure, and
+# `td-builder oci-image-paths` for the packing — no `guix repl`, no `guix system
+# image` (the OCI slice of workstream C); gen-1 stays on the guix
+# `generation-image` lowering (its own later slice — this file's remaining
+# `lowering` census entry):
 #   • `skopeo copy docker-archive:… oci:…` — the foreign stack parses the
 #     archive and verifies every blob digest while writing the CANONICAL OCI
 #     LAYOUT, the §2.7 identity carrier;
@@ -35,9 +38,13 @@ oci-load:
 	skopeo=`$(GUIX) build skopeo`/bin/skopeo; \
 	crun=`$(GUIX) build crun`; \
 	work="$(CURDIR)/.oci-load-scratch"; rm -rf "$$work"; mkdir -p "$$work"; \
-	echo ">> plain image: td-builder packs the td SYSTEM closure (td-native, no guix system image — shared with the oci gate)"; \
-	$(GUIX) repl $(LOAD) tests/oci-system-closure.scm > "$$work/plain-closure.txt" 2>/dev/null \
-	  || { echo "ERROR: could not resolve the td system closure" >&2; exit 1; }; \
+	echo ">> plain image: td-builder resolves + packs the td SYSTEM closure (td-native: pinned tests/td-system.lock + store-closure-scan, no guix repl, no guix system image — shared with the oci gate)"; \
+	sysout=`"$$tb" resolve tests/td-system.lock td-system` \
+	  || { echo "ERROR: could not resolve td-system from tests/td-system.lock" >&2; exit 1; }; \
+	test -d "$$sysout" \
+	  || { echo "ERROR: the pinned td system root $$sysout is not in the store — the lock is stale or the store is cold; regenerate on a channel bump: guix time-machine -C channels.scm -- repl -L . tests/td-system-lock.scm > tests/td-system.lock" >&2; exit 1; }; \
+	"$$tb" store-closure-scan /gnu/store "$$sysout" > "$$work/plain-closure.txt" \
+	  || { echo "ERROR: td-builder store-closure-scan failed on the td system root" >&2; exit 1; }; \
 	test -s "$$work/plain-closure.txt" || { echo "ERROR: empty td system closure" >&2; exit 1; }; \
 	printf '{"repoTag":"td-system:latest","env":["PATH=/bin"],"entrypoint":["%s/bin/crun"]}' "$$crun" > "$$work/plain-config.json"; \
 	"$$tb" oci-image-paths "$$work/plain-closure.txt" /gnu/store "$$work/plain-config.json" "$$work/plain.tar" \
