@@ -7,9 +7,14 @@
 # that guix-process dependency: a missing seed root is FETCHED from td's own signed
 # substitute store (td-subst — the same ~/.td/subst mechanism the toolchain gates use,
 # published by ci/daily-full-suite.sh via tools/publish-seed-subst.sh) and restored by
-# td's own nar-restore, CLOSURE AND ALL (each fetched narinfo's References basenames are
-# walked breadth-first, so a cold host gets the full runtime closure — exactly what
-# `guix build` used to realize). Trust = the ed25519 signature (pinned key) + the
+# td's own nar-restore, walking each fetched narinfo's References breadth-first so the
+# fetched set is ref-closed. A tree already PRESENT under the seed root is trusted as
+# complete and not descended into — the same trust the retired presence check placed in
+# present roots. Every fetched tree is restored to a pid-scoped temp next to its final
+# name and PLACED only after the whole walk, members before lock roots — so an
+# interrupted resolve never leaves a root present with its closure incomplete (a dead
+# resolver can leave stale `.resolve-seed.<pid>.*` temps under the root; they are inert
+# and re-resolving ignores them). Trust = the ed25519 signature (pinned key) + the
 # expected NAME (every fetched narinfo's StorePath must be the /gnu/store path asked
 # for). Seed BYTES stay the guix-built pin (retired last, per the north star); only the
 # guix PROCESS is gone.
@@ -17,7 +22,10 @@
 # FAIL-CLOSED: if a seed path is missing and the substitute store cannot supply it (no
 # store, no entry, bad signature, wrong StorePath, restore failure), exit non-zero with
 # a clear message. There is NO guix fallback — warm the host store out-of-band or
-# publish the seed substitutes (the daily does).
+# publish the seed substitutes (the daily does). Deliberately NOT gated on
+# TD_SUBST_FORCE_BUILD (the daily's "always build from seed" knob): the guix-built seed
+# has no from-source alternative for the daily to protect, so fetching it never
+# undermines the daily's from-seed authority over the toolchain.
 #
 # Usage: resolve-seed.sh LOCK
 #   LOCK lines: `NAME /gnu/store/<base>` (the pinned seed roots; other lines ignored)
@@ -79,7 +87,7 @@ mkdir -p "$root" 2>/dev/null || true
 
 work=`mktemp -d`
 spid=
-trap 'kill "$spid" 2>/dev/null || true; rm -rf "$work"' EXIT
+trap 'kill "$spid" 2>/dev/null || true; rm -rf "$work" "$root"/.resolve-seed.$$.* 2>/dev/null || true' EXIT
 
 # One loopback server for the whole walk; td-subst fetch verifies sig + NarHash per item.
 "$TD_SUBST_BIN" serve "$TD_SUBST_STORE" 127.0.0.1:0 >"$work/serve.log" 2>&1 &
@@ -87,18 +95,25 @@ spid=$!
 port=
 i=0
 while [ "$i" -lt 100 ]; do
-  port=`sed -n 's#.*http://127.0.0.1:\([0-9]*\)/.*#\1#p' "$work/serve.log" 2>/dev/null`
+  port=`sed -n 's#.*http://127.0.0.1:\([0-9]*\)/.*#\1#p' "$work/serve.log" 2>/dev/null || true`
   [ -n "$port" ] && break
   i=$((i + 1)); sleep 0.1
 done
 [ -n "$port" ] || fail "td-subst serve never bound a loopback port"
 
-# BFS over basenames: the missing roots, then each fetched narinfo's References — so the
-# restored set is ref-closed (what `guix build` used to guarantee).
+rootbases=" "
+for p in $roots; do rootbases="$rootbases${p##*/} "; done
+
+# Walk over basenames: the missing roots, then each fetched narinfo's References. Every
+# fetched tree is verified and restored to `.resolve-seed.<pid>.<base>` next to its
+# final name (same filesystem, so placement below is an atomic rename); each nar is
+# dropped right after its restore, bounding transient disk to one nar at a time.
 queue=""
 for p in $missing; do queue="$queue ${p##*/}"; done
 seen=" "
-restored=0
+members=""
+rootlist=""
+fetched=0
 while :; do
   queue="${queue# }"
   [ -n "$queue" ] || break
@@ -108,7 +123,7 @@ while :; do
   [ -e "$root/$base" ] && continue
   [ -f "$TD_SUBST_STORE/$base.narinfo" ] \
     || fail "no substitute entry for $base in $TD_SUBST_STORE (the seed closure is not published — run the daily's tools/publish-seed-subst.sh, or warm this host out-of-band)"
-  fd="$work/f$restored"
+  fd="$work/f$fetched"
   "$TD_SUBST_BIN" fetch "http://127.0.0.1:$port" "$base" "$fd" "$pub" >/dev/null 2>"$work/fetch.err" \
     || fail "fetch/verify of $base failed (bad signature vs $pub, or corrupt nar): $(tail -1 "$work/fetch.err" 2>/dev/null)"
   # The NAME is load-bearing alongside the signature: a validly-signed substitute for a
@@ -117,24 +132,32 @@ while :; do
   [ "x$fsp" = "x/gnu/store/$base" ] || fail "fetched StorePath ($fsp) != the expected /gnu/store/$base"
   narfile=`grep '^NarFile: ' "$fd/$base.narinfo" | cut -d' ' -f2`
   [ -n "$narfile" ] && [ -f "$fd/$narfile" ] || fail "fetched narinfo for $base names no nar file"
-  # Restore next to the final name, then rename into place — atomic on one filesystem,
-  # and a concurrent resolver winning the race is a skip, not an error.
   tmp="$root/.resolve-seed.$$.$base"
   rm -rf "$tmp"
   "$tb" nar-restore "$fd/$narfile" "$tmp" >/dev/null 2>"$work/restore.err" \
     || { rm -rf "$tmp"; fail "nar-restore of $base failed: $(tail -1 "$work/restore.err" 2>/dev/null)"; }
-  if [ -e "$root/$base" ]; then
-    rm -rf "$tmp"
-  else
-    mv "$tmp" "$root/$base" 2>/dev/null \
-      || { rm -rf "$tmp"; [ -e "$root/$base" ] || fail "could not place $base under $root"; }
-  fi
-  restored=$((restored + 1))
+  rm -f "$fd/$narfile"
   refs=`sed -n 's/^References: //p' "$fd/$base.narinfo"`
   [ -n "$refs" ] && queue="$queue $refs"
+  case "$rootbases" in
+    *" $base "*) rootlist="$rootlist $base" ;;
+    *) members="$members $base" ;;
+  esac
+  fetched=$((fetched + 1))
 done
+
+# Place members first, lock roots LAST, so a root only ever appears with its whole
+# fetched closure already in place. `mv -T` FAILS rather than nesting the temp into a
+# concurrently-placed tree — losing that race is a skip, not an error.
+place() {
+  _t="$root/.resolve-seed.$$.$1"
+  if [ -e "$root/$1" ]; then rm -rf "$_t"; return 0; fi
+  mv -T "$_t" "$root/$1" 2>/dev/null \
+    || { rm -rf "$_t"; [ -e "$root/$1" ] || fail "could not place $1 under $root"; }
+}
+for b in $members $rootlist; do place "$b"; done
 
 for p in $roots; do
   [ -e "$root/${p##*/}" ] || fail "seed root $p still missing after substitute resolution"
 done
-echo "resolve-seed: fetched + restored $restored path(s) into $root (ed25519 sig + StorePath + NarHash verified; no guix process)" >&2
+echo "resolve-seed: fetched + restored $fetched path(s) into $root (ed25519 sig + StorePath + NarHash verified; no guix process)" >&2

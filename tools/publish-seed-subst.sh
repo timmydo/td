@@ -36,11 +36,30 @@ warmbase=${TD_SEED_WARM:-.td-build-cache/seed-subst-warm}
 roots=`sed -n 's/^[^ ]* \(\/gnu\/store\/[^ ]*\)$/\1/p' "$lock" 2>/dev/null` || roots=""
 [ -n "$roots" ] || { echo "publish-seed-subst: no /gnu/store seed paths in $lock" >&2; exit 1; }
 
-# Idempotence: every root already published -> nothing to do.
-need=0
-for p in $roots; do [ -f "$out/${p##*/}.narinfo" ] || { need=1; break; }; done
-if [ "$need" = 0 ]; then
-  echo "publish-seed-subst: every root of $lock already published in $out — nothing to do"
+# Idempotence: the whole published CLOSURE must be complete — every root narinfo, every
+# References member's narinfo (walked from the local files), and every named nar. A
+# publish interrupted mid-copy, or a store that lost members, re-triggers the export
+# instead of wedging at "nothing to do" while cold hosts fail on a missing member.
+published_complete() {
+  _q=""
+  for _p in $roots; do _q="$_q ${_p##*/}"; done
+  _s=" "
+  while :; do
+    _q="${_q# }"
+    [ -n "$_q" ] || return 0
+    case "$_q" in *" "*) _b="${_q%% *}"; _q="${_q#* }" ;; *) _b="$_q"; _q="" ;; esac
+    case "$_s" in *" $_b "*) continue ;; esac
+    _s="$_s$_b "
+    _ni="$out/$_b.narinfo"
+    [ -f "$_ni" ] || return 1
+    _nf=`sed -n 's/^NarFile: //p' "$_ni"`
+    { [ -n "$_nf" ] && [ -f "$out/$_nf" ]; } || return 1
+    _r=`sed -n 's/^References: //p' "$_ni"`
+    [ -n "$_r" ] && _q="$_q $_r"
+  done
+}
+if published_complete; then
+  echo "publish-seed-subst: the full closure of $lock is already published in $out — nothing to do"
   exit 0
 fi
 
@@ -70,7 +89,10 @@ for p in $roots; do
   grep -q '^Sig: ' "$exp/${p##*/}.narinfo" \
     || { echo "publish-seed-subst: ${p##*/}.narinfo not signed" >&2; exit 1; }
 done
-mkdir -p "$out"
-cp -a "$exp"/. "$out"/
+# nars BEFORE narinfos: a narinfo must never be visible without its nar, so an
+# interrupted copy is re-triggered by the completeness walk above, never half-served.
+mkdir -p "$out/nar"
+cp -a "$exp"/nar/. "$out"/nar/
+cp -a "$exp"/*.narinfo "$out"/
 n=`ls "$exp"/*.narinfo | grep -c . || true`
 echo "publish-seed-subst: published $n narinfo(s) — the signed $lock seed closure -> $out"

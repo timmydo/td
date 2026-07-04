@@ -42,8 +42,11 @@ load_stage0; tb="$TB"
 ts=`ls "$PWD"/.td-build-cache/td-subst/b/newstore/*/bin/td-subst 2>/dev/null | head -1 || true`
 test -n "$ts" -a -x "$ts" || { echo "ERROR: no td-built td-subst binary (the td-subst gate must build it first)" >&2; exit 1; }
 
+# $W/warm (the publisher's content-addressed capture cache) survives runs; everything
+# else is scratch, wiped by the ONE list-free pattern used here and at the end.
 W="$PWD/.td-build-cache/seed-subst"
-rm -rf "$W/store" "$W/store2" "$W/root" "$W/root2" "$W/root3" "$W/root4" "$W/nohome" "$W/poison"
+mkdir -p "$W"
+find "$W" -mindepth 1 -maxdepth 1 ! -name warm -exec rm -rf {} +
 mkdir -p "$W/poison" "$W/nohome"
 
 # The poison shim: any `guix` invocation on the seed-resolve path reds loudly.
@@ -87,11 +90,14 @@ ran=`"$W/root/$bashbase/bin/bash" -c 'echo RAN-FETCHED'`
 test "x$ran" = "xRAN-FETCHED" || { echo "FAIL: the fetched (not guix-built) seed bash did not run (got '$ran')" >&2; exit 1; }
 nres=`ls "$W/root" | grep -c .`
 test "$nres" -ge 2 || { echo "FAIL: the seed's closure members were not restored (only $nres tree(s) — References walk broken?)" >&2; exit 1; }
+# Each restored tree must NAR-match its PUBLISHED narinfo (what the publisher captured
+# from the origin) — one hash pass per tree, no re-hash of the live origin.
 for b in `ls "$W/root"`; do
-  oh=`"$tb" nar-hash "/gnu/store/$b"`; rh=`"$tb" nar-hash "$W/root/$b"`
-  test -n "$oh" -a "x$oh" = "x$rh" || { echo "FAIL: restored $b differs from the origin (NAR $rh != $oh)" >&2; exit 1; }
+  want=`sed -n 's/^NarHash: //p' "$W/store/$b.narinfo"`
+  rh=`"$tb" nar-hash "$W/root/$b"`
+  test -n "$want" -a "x$want" = "x$rh" || { echo "FAIL: restored $b differs from the published seed (NAR $rh != $want)" >&2; exit 1; }
 done
-echo "  [DURABLE behavioral] PRELUDE FETCH: provision_stage0 fetched the missing seed REF-CLOSED ($nres trees, each byte-identical to the origin), the restored bash RAN, stage0 provisioned — guix poisoned on PATH the whole way"
+echo "  [DURABLE behavioral] PRELUDE FETCH: provision_stage0 fetched the missing seed REF-CLOSED ($nres trees, each NAR-identical to the published capture), the restored bash RAN, stage0 provisioned — guix poisoned on PATH the whole way"
 
 # --- [DURABLE structural] WARM PATH: presence short-circuits, no store needed ---------
 mkdir -p "$W/empty"
@@ -129,16 +135,25 @@ fi
 echo "  [SELF-DISCRIMINATION] a wrong pinned key reds the resolve — the ed25519 signature is load-bearing"
 
 # --- [SELF-DISCRIMINATION] validly-signed narinfo for a DIFFERENT StorePath -> red ----
+# Strip the stale Sig BEFORE re-signing: `td-subst sign` skips already-signed narinfos,
+# so without the strip the doctored narinfo reds on SIGNATURE and the name check is
+# never exercised. td-subst fetch does NOT compare StorePath to the requested name —
+# resolve-seed's own check is the only guard, so the red must name the StorePath.
 cp -a "$W/store" "$W/store2"
-sed -i "s#^StorePath: .*#StorePath: /gnu/store/00000000000000000000000000000000-not-the-seed#" "$W/store2/$bashbase.narinfo"
+sed -i -e '/^Sig: /d' \
+       -e "s#^StorePath: .*#StorePath: /gnu/store/00000000000000000000000000000000-not-the-seed#" \
+  "$W/store2/$bashbase.narinfo"
 "$ts" sign "$W/store2" "$W/priv" >/dev/null
+grep -q '^Sig: ' "$W/store2/$bashbase.narinfo" || { echo "ERROR: doctored narinfo did not get re-signed" >&2; exit 1; }
 mkdir -p "$W/root4"
 if env TD_SEED_ROOT="$W/root4" TD_BUILDER="$tb" TD_SUBST_BIN="$ts" \
        TD_SUBST_STORE="$W/store2" TD_SUBST_PUBKEY="$W/pub" PATH="$W/poison:$PATH" \
-     sh tools/resolve-seed.sh "$W/seed.lock" >/dev/null 2>&1; then
+     sh tools/resolve-seed.sh "$W/seed.lock" >/dev/null 2>"$W/sp.err"; then
   echo "FAIL: resolve-seed ACCEPTED a validly-signed substitute whose StorePath != the expected seed path" >&2; exit 1
 fi
-echo "  [SELF-DISCRIMINATION] a validly-signed narinfo for a DIFFERENT StorePath reds the resolve — the expected NAME is load-bearing alongside the signature"
+grep -q 'StorePath' "$W/sp.err" \
+  || { echo "FAIL: the wrong-StorePath red did not come from the name check:" >&2; cat "$W/sp.err" >&2; exit 1; }
+echo "  [SELF-DISCRIMINATION] a VALIDLY-SIGNED narinfo for a DIFFERENT StorePath reds the resolve on the name check itself — the expected NAME is load-bearing alongside the signature"
 
 # --- [SELF-DISCRIMINATION] an empty lock -> red (the provenance-switch guard) ---------
 printf '# no seed lines\n' > "$W/empty.lock"
@@ -155,6 +170,5 @@ if grep -vE '^[[:space:]]*#' tests/cache-lib.sh | grep -qE "(guix|GUIX)[\"')}]*[
 fi
 echo "  [DURABLE structural] tests/cache-lib.sh carries no guix-build invocation — the seed-realize site is retired, not bypassed"
 
-rm -rf "$W/store" "$W/store2" "$W/root" "$W/root2" "$W/root3" "$W/root4" "$W/nohome" "$W/empty" \
-       "$W"/p*.out "$W"/p*.err "$W/el.err" "$W/pub.out" "$W/pub.err" "$W/pub2.out"
+find "$W" -mindepth 1 -maxdepth 1 ! -name warm -exec rm -rf {} +
 echo "PASS: seed realizations go through td's OWN signed substitute store, not a guix process (#311) — the producer (publish-seed-subst.sh) captures the pinned seed closure content-scanned (no guix db), exports + signs it (idempotent re-run); the loop's REAL host prelude (provision_stage0 -> resolve-seed.sh) fetches a missing seed ref-closed (ed25519 sig vs the pinned key + StorePath == expected path + NarHash verified, restored byte-identical, the fetched bash RUNS, stage0 provisioned) with guix POISONED on PATH; the all-present warm path needs no store; a missing seed with no store FAILS CLOSED with a clear message and no guix fallback; a wrong key / wrong-StorePath substitute / empty lock red the resolve; and the shared prelude carries no guix-build invocation anymore."

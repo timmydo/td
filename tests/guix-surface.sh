@@ -159,10 +159,11 @@ occ() { grep -oE "$1" "$work/code" 2>/dev/null | grep -c . || true; }
 census() {
   # realize: plain `guix build <paths>` lines (seed realizes + build oracles) — the set
   # #311 retires site-by-site via td-subst (tools/resolve-seed.sh). Counted per LINE,
-  # minus the --check oracle and the packager `-e (@ (system …))` form counted above.
-  # Coarse like the rest of the census (a fail-message quoting `guix build` counts);
-  # informational only, so the trend is what matters.
-  sr_n=$(grep -E "(guix|GUIX)[\"')}]* build" "$work/code" 2>/dev/null \
+  # minus echo/printf narration (like the shrink scan), the --check oracle, and the
+  # packager `-e (@ (system …))` form counted above. Still coarse (a non-echo line
+  # quoting `guix build` counts); informational only, so the trend is what matters.
+  sr_n=$(grep -vE "^[[:space:]]*(@?echo|printf)([[:space:]]|\")" "$work/code" 2>/dev/null \
+         | grep -E "(guix|GUIX)[\"')}]* build" \
          | grep -v -- '--check' | grep -v '(@ (system' | grep -c . || true)
   echo ">> guix-surface census (informational; only the packager set is ratcheted):"
   echo "   packager  guix build -e (system M) <package> : $cur_n   <-- RATCHETED (move-off-Guile §5)"
