@@ -9,8 +9,8 @@
 # build daemon, which realizes + reproducibility-checks them into the shared
 # content-addressed store; the package build gates then cache-HIT + memo-skip the
 # double-build and only assert behavior + migration-oracle. The daemon
-# (tools/build-daemon-ensure.sh, started by check.sh's host prelude) is the SINGLE
-# machine-wide build limiter (TD_BUILD_JOBS). The xargs -P below is only SUBMIT
+# (started by the `td-builder check` host prelude) is the SINGLE machine-wide
+# build limiter (TD_BUILD_JOBS). The xargs -P below is only SUBMIT
 # parallelism — submits block on the daemon's budget.
 #
 # Called by the runner with cwd = repo root and:
@@ -24,7 +24,7 @@ nspecs=$(set -- $TD_BUILD_SPECS; echo $#)
 [ "$nspecs" -gt 0 ] || { echo "ERROR: empty TD_BUILD_SPECS — no package recipes registered" >&2; exit 1; }
 
 echo ">> build-recipes: assemble + submit $nspecs recipes to the shared build daemon (global budget), then reproducibility-check ($TD_BUILD_SPECS)"
-: "${TD_DAEMON_SOCKET:?the shared build daemon is not running — check.sh starts it in its host prelude (tools/build-daemon-ensure.sh)}"
+: "${TD_DAEMON_SOCKET:?the shared build daemon is not running — the \`td-builder check\` host prelude starts it (ensure_build_daemon)}"
 for s in $TD_BUILD_SPECS; do grep ' /gnu/store/' "tests/$s-no-guix.lock"; done \
   | sed 's/^[^ ]* //' | sort -u | xargs $TD_GUIX build >/dev/null \
   || { echo "ERROR: could not realize the build seed (regenerate locks on a channel bump)" >&2; exit 1; }

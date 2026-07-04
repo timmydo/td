@@ -36,7 +36,7 @@ load_stage0() {
 }
 
 # provision_stage0 — the HOST prelude for the loop-container provider (td-builder
-# check + tools/check-rung.sh; workstream E #294): ensure the pinned stage0
+# check + check-rung; workstream E #294): ensure the pinned stage0
 # toolchain seed (tests/td-builder-rust.lock) is PRESENT — resolving a missing
 # path through td's OWN signed substitute store (tools/resolve-seed.sh; #311 — no
 # guix process, FAIL-CLOSED with no guix fallback; the common all-present path
@@ -69,14 +69,15 @@ load_recipe_eval() {
 }
 
 # cached_build SPEC LOCK  — emit the recipe, td-ASSEMBLE its .drv, and SUBMIT it to the ONE
-# shared build daemon (the machine-wide budget limiter — tools/build-daemon-ensure.sh; the
-# daemon caps concurrent builds across ALL agents, so N checks never oversubscribe/OOM).
+# shared build daemon (the machine-wide budget limiter, started by the `td-builder check`
+# prelude; the daemon caps concurrent builds across ALL agents, so N checks never
+# oversubscribe/OOM).
 # Sets sd, out, ns, hit. Returns non-zero (with a FAIL message) on a real failure.
 cached_build() {
   _spec="$1"; _lock="$2"
   sd="$CACHE/$_spec"; mkdir -p "$sd/b" "$sd/tmp"
   : "${TD_RECIPE_EVAL:?load_recipe_eval must run before cached_build (TD_RECIPE_EVAL unset)}"
-  : "${TD_DAEMON_SOCKET:?the shared build daemon must be running (TD_DAEMON_SOCKET unset) — check.sh starts it in its host prelude}"
+  : "${TD_DAEMON_SOCKET:?the shared build daemon must be running (TD_DAEMON_SOCKET unset) — the \`td-builder check\` host prelude starts it}"
   "$TD_RECIPE_EVAL" emit "$_spec" > "$sd/recipe.json" \
     || { echo "FAIL: td-recipe-eval emit $_spec" >&2; return 1; }
   test -s "$sd/recipe.json" || { echo "ERROR: td-recipe-eval produced no JSON for $_spec" >&2; return 1; }

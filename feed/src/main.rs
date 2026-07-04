@@ -4,7 +4,7 @@
 // network. A sibling of fetch/ (td-fetch) reusing the same pure-Rust HTTP(S)+sha256 stack
 // (ureq + rustls/ring + sha2); the mirror server uses only std::net (no extra crate).
 //
-// It is run as a SHARED, persistent host daemon (tools/feed-ensure.sh) serving a shared
+// It is run as a SHARED, persistent host daemon (`td-feed ensure-serve`) serving a shared
 // store across worktrees, so a td-native download happens ONCE. Two verification layers:
 //
 //   - warm = the SUPPLY-CHAIN gate. `td-feed warm INDEX STORE` (host PREP, egress) GETs
@@ -888,8 +888,8 @@ fn strip_scheme(url: &str) -> String {
         .to_string()
 }
 
-/// The shared feed `(addr, store)` if TD_FEED_BASE is set (the bootstrap-sources shim runs
-/// feed-ensure.sh — daemon lifecycle stays in shell — and exports it). Else None (direct).
+/// The shared feed `(addr, store)` if TD_FEED_BASE is set (the loop prelude runs
+/// `td-feed ensure-serve` for the daemon lifecycle and exports it). Else None (direct).
 fn shared_feed() -> Option<(String, PathBuf)> {
     let base = std::env::var("TD_FEED_BASE").ok().filter(|s| !s.is_empty())?;
     let addr = strip_scheme(&base);
@@ -1232,6 +1232,135 @@ fn warm_usage() -> ! {
     std::process::exit(2);
 }
 
+/// Extract `HOST:PORT` from a `serve` announcement line (`… on http://HOST:PORT/ …`).
+/// The one line-format coupling between `serve` (the daemon) and `ensure-serve`
+/// (its launcher); unit-tested so a wording drift on one side is caught.
+fn parse_serve_addr(line: &str) -> Option<String> {
+    let after = line.split("on http://").nth(1)?;
+    let addr = after.split('/').next()?;
+    // A bound loopback address is `host:port`, both non-empty.
+    let (host, port) = addr.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(addr.to_string())
+}
+
+/// Is `pid` a live process? (`/proc/<pid>` exists — the shell's `kill -0`.)
+fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// `td-feed ensure-serve` — ensure ONE shared, persistent td-feed `serve` daemon
+/// is running for this host, and print its loopback address (HOST:PORT) on
+/// stdout (native since #318 axis 2 — was tools/feed-ensure.sh). Idempotent +
+/// concurrency-safe (an exclusive lock on feed.lock): the FIRST caller starts
+/// the daemon; every later caller (any worktree, any agent) reuses it. This is
+/// how a bunch of agents on different worktrees SHARE one feed + its store.
+///
+/// The shared state lives under TD_FEED_DIR (default ~/.td/feed): store/ (the
+/// artifacts + .sha256 sidecars), feed.addr, feed.pid, feed.log, feed.lock. The
+/// daemon is index-free (serve verifies each file against its sidecar), so it
+/// serves whatever any worktree has `td-feed warm`ed into the shared store — no
+/// restart when the warmed set grows.
+///
+/// The daemon binary is TD_FEED_BIN if set, else THIS executable (the natural
+/// port: ensure-serve IS a td-feed subcommand, so it launches its own `serve`).
+fn ensure_serve() -> ! {
+    let feed_dir = match std::env::var("TD_FEED_DIR") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".td/feed")
+        }
+    };
+    let store = feed_dir.join("store");
+    let addr_f = feed_dir.join("feed.addr");
+    let pid_f = feed_dir.join("feed.pid");
+    let log_f = feed_dir.join("feed.log");
+    let lock_f = feed_dir.join("feed.lock");
+    if let Err(e) = std::fs::create_dir_all(&store) {
+        die(format!("ensure-serve: mkdir {}: {e}", store.display()));
+    }
+    let bin = match std::env::var("TD_FEED_BIN") {
+        Ok(v) if !v.trim().is_empty() && Path::new(&v).is_file() => PathBuf::from(v),
+        _ => std::env::current_exe()
+            .unwrap_or_else(|e| die(format!("ensure-serve: cannot resolve current_exe: {e}"))),
+    };
+
+    // Serialize concurrent ensures so two agents never both start a daemon. The
+    // lock file is O_CLOEXEC (std default), so the detached daemon does not
+    // inherit-and-hold it; it releases when this process exits.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // a lock handle only; its content is never written
+        .open(&lock_f)
+        .unwrap_or_else(|e| die(format!("ensure-serve: open {}: {e}", lock_f.display())));
+    if let Err(e) = lock.lock() {
+        die(format!("ensure-serve: lock {}: {e}", lock_f.display()));
+    }
+
+    // Reuse a live daemon.
+    let live_pid = std::fs::read_to_string(&pid_f)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        .filter(|p| pid_alive(*p));
+    if live_pid.is_some() {
+        if let Ok(addr) = std::fs::read_to_string(&addr_f) {
+            let addr = addr.trim();
+            if !addr.is_empty() {
+                println!("{addr}");
+                std::process::exit(0);
+            }
+        }
+    }
+
+    // Start a fresh daemon on an ephemeral loopback port, detached in its own
+    // process group so it outlives this launcher and survives ^C/hangup (the
+    // shell's `nohup` role). stdout+stderr → the log; we scrape the bound
+    // address from serve's announcement line.
+    let log = std::fs::File::create(&log_f)
+        .unwrap_or_else(|e| die(format!("ensure-serve: create {}: {e}", log_f.display())));
+    let log2 = log
+        .try_clone()
+        .unwrap_or_else(|e| die(format!("ensure-serve: clone log fd: {e}")));
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve")
+        .arg(&store)
+        .arg("127.0.0.1:0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log2));
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| die(format!("ensure-serve: spawn {} serve: {e}", bin.display())));
+    let pid = child.id();
+    let _ = std::fs::write(&pid_f, format!("{pid}\n"));
+
+    // Wait for it to announce its bound address in the log.
+    for _ in 0..100 {
+        if let Ok(logtext) = std::fs::read_to_string(&log_f) {
+            if let Some(addr) = logtext.lines().find_map(parse_serve_addr) {
+                let _ = std::fs::write(&addr_f, format!("{addr}\n"));
+                println!("{addr}");
+                std::process::exit(0);
+            }
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
+            die(format!("ensure-serve: daemon exited before binding:\n{tail}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
+    die(format!("ensure-serve: daemon did not report an address:\n{tail}"));
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a.get(1).map(String::as_str) {
@@ -1291,6 +1420,7 @@ fn main() {
             let _ = io::stdout().flush();
             cargo_proxy_loop(listener, Arc::new(store), bound.to_string());
         }
+        Some("ensure-serve") if a.len() == 2 => ensure_serve(),
         Some("selftest") if a.len() == 2 => selftest(),
         Some("cargo-proxy-selftest") if a.len() == 2 => cargo_proxy_selftest(),
         _ => {
@@ -1298,10 +1428,33 @@ fn main() {
                 "usage:\n  td-feed warm INDEX STORE   (low-level; also: warm index INDEX STORE)\n  \
                  td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
                  td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  td-feed serve STORE ADDR\n  \
-                 td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  td-feed cargo-proxy-selftest\n  \
-                 td-feed warm-selftest"
+                 td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
+                 td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
             );
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_serve_addr;
+
+    #[test]
+    fn parses_the_serve_announcement_line() {
+        // The exact line `serve` prints (the format ensure-serve scrapes).
+        let line = "td-feed: serving /home/x/.td/feed/store on http://127.0.0.1:54321/";
+        assert_eq!(parse_serve_addr(line), Some("127.0.0.1:54321".to_string()));
+    }
+
+    #[test]
+    fn rejects_non_announcement_lines() {
+        // A daemon-startup error, a blank line, and a malformed URL must NOT be
+        // mistaken for an address (ensure-serve would otherwise print garbage).
+        assert_eq!(parse_serve_addr("bind 127.0.0.1:0: Address already in use"), None);
+        assert_eq!(parse_serve_addr(""), None);
+        assert_eq!(parse_serve_addr("on http://127.0.0.1/"), None); // no port
+        assert_eq!(parse_serve_addr("on http://:8080/"), None); // no host
+        assert_eq!(parse_serve_addr("on http://host:port/"), None); // non-numeric port
     }
 }

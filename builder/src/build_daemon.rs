@@ -6,7 +6,7 @@
 //! The daemon is the loop's SINGLE machine-wide build limiter: it realizes drvs
 //! CONCURRENTLY but only up to a global `budget` of simultaneous builds (a counting
 //! semaphore), queueing the rest. Because ONE shared daemon serves every worktree
-//! /agent (tools/build-daemon-ensure.sh starts one per host), N agents submitting at
+//! /agent (the `td-builder check` prelude starts one per host), N agents submitting at
 //! once can never exceed the budget — bounding CPU and (budget × per-build RSS) memory
 //! no matter how many checks run. Each build runs in a SEPARATE child `td-builder`
 //! process (Command::spawn — the safe fork+exec), never an in-process fork on a daemon

@@ -3102,6 +3102,9 @@ fn main() -> ExitCode {
         // bootstrap shim that execs this. (The drv reproducibility double-build
         // that used to share this verb is `check-drv` now — no argument sniffing.)
         Some("check") => check_loop::cli(args.get(2..).unwrap_or(&[])),
+        // check-rung HARNESS [ARGS...] — dev-iteration helper: run a cached-chain
+        // bootstrap harness inside the loop sandbox (was tools/check-rung.sh).
+        Some("check-rung") => check_loop::check_rung_cli(args.get(2..).unwrap_or(&[])),
         // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
         // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
         Some("bootstrap-recipe") => bootstrap::cli(&args),
@@ -5828,7 +5831,7 @@ fn main() -> ExitCode {
                         binds.push(sandbox::Bind { src: subst, dest: None, readonly: true, ro_optional: false });
                     }
                     // The ONE shared build daemon's socket + output store (~/.td/build-daemon,
-                    // started on the host by tools/build-daemon-ensure.sh). The corpus build
+                    // started on the host by the `td-builder check` prelude). The corpus build
                     // (inside this sandbox) SUBMITS drvs to it over the socket and reads its
                     // output back, so it must be visible at the SAME absolute path in every
                     // check sandbox — RW (connect to the socket; read the store). Bound only
@@ -6041,6 +6044,7 @@ fn main() -> ExitCode {
             eprintln!("usage: td-builder            # print the S1 sentinel");
             eprintln!("       td-builder check [GOAL...]             # the loop: host prelude + sandboxed gate ladder");
             eprintln!("       td-builder gate-run [-j N] [GOAL...]   # the in-sandbox gate scheduler (src/gate_defs/)");
+            eprintln!("       td-builder check-rung HARNESS [ARG...] # dev: run a harness inside the loop sandbox");
             eprintln!("       td-builder nar-hash PATH");
             eprintln!("       td-builder nar-restore NARFILE DEST");
             eprintln!("       td-builder subst-export DB STORE-DIR OUTDIR ROOT...");
