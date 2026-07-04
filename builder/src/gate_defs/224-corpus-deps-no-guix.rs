@@ -32,7 +32,7 @@ use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 pub fn gate() -> GateDef {
     GateDef {
         name: "corpus-deps-no-guix",
-        pools: &[Pool::Heavy],
+        pools: &[Pool::Daily],
         needs: &[],
         build_gate: true,
         specs: &["libsigsegv", "libunistring", "pcre2", "ncurses", "readline"],

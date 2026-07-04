@@ -182,6 +182,23 @@ gates already journaled green for the IDENTICAL working tree (any edit
 invalidates every skip; skipped gates print loudly) — an interactive
 iteration aid only: CI and the daily backstop never pass it.
 
+**The per-PR budget (human 2026-07-04): PR checks are ~10 minutes, not
+hours.** The gate registry splits the former heavy pool in two:
+`heavy` (PR-sized behavioral gates) and `daily` (the deep from-seed
+bootstrap rungs, the from-source package corpus, the seed-capture
+family — everything measured in tens of minutes). **`td-builder check
+check-pr`** is the bounded per-PR tier (cheap + heavy + a
+build-recipes phase scoped to the selected gates' specs); the plain
+**`td-builder check` is unchanged** — the full authoritative loop
+(cheap + heavy + daily), run nightly by the daily backstop and on
+demand. A single daily gate still runs by name (`td-builder check
+bootstrap-glibc`). When a diff touches daily-tier territory,
+`affected-checks` names those gates on a "Deferred to the daily
+backstop" line instead of running them — a daily-tier regression is
+healed within a day by the backstop's fix-or-revert PR, not blocked
+per-PR (the accepted velocity trade, now applied beyond the build
+engine).
+
 Do not proceed to the next sub-task until the current one is green.
 
 ### Diff-sized local check and waiver
@@ -214,23 +231,28 @@ td-builder affected-checks --committed-only --run
 
 If it prints `Waiver: the full check waived by affected-checks for
 this diff`, that is the local waiver for the full loop; record the
-selected checks and waiver line in the PR body. If it prints `Waiver:
-the full check required before marking ready`, `--run` executes the
+selected checks and waiver line in the PR body (include the
+"Deferred to the daily backstop" line when one prints — that is the
+record of what the daily covers for this diff). If it prints `Waiver:
+the full check required before marking ready` (only a `channels.scm`
+pin bump does, an exclusive landing anyway), `--run` executes the
 selected checks and then the full check before it can exit
 successfully.
 
-**Build-engine changes (`builder/src/*`) are the exception** they no
-longer escalate to the full loop — they validate on the
+**Every selection is bounded (the ~10-min per-PR budget, human
+2026-07-04).** Build-engine changes (`builder/src/*`) validate on the
 **`check-engine` smoke tier** (`td-builder check check-engine`: a TRUE
 ~2-min smoke — cheap structural gates + `cargo-test` (compile the
 engine + its unit tests), and NOTHING that builds a package from
-source) and `affected-checks` waives the full loop for them. The full
-heavy+system suite is no longer a per-PR gate; it runs **once daily**
+source). The loop spine (`builder/src/gates.rs`,
+`builder/src/check_loop.rs`, `builder/build.rs`) and unmapped paths
+validate on the bounded **`check-pr` tier** — no longer the full loop.
+Daily/system-tier gates a diff affects are NAMED but deferred: the
+full heavy+system suite is not a per-PR gate; it runs **once daily**
 on fresh main via `ci/daily-full-suite.sh`, driven by a scheduled
 agent that opens a **fix-or-revert PR (no auto-merge)** on any
-regression. A corpus/system regression the smoke misses
-is healed within a day, not blocked per-PR — the accepted velocity
-trade.
+regression. A daily-tier regression the per-PR tiers miss is healed
+within a day, not blocked per-PR — the accepted velocity trade.
 
 
 ## Test the feature, not the possibility
@@ -363,8 +385,9 @@ tracking system, and all working notes live in the git log + PR body.
 - **Land (optimistic merge on green, via PR):** main is **non-strict** — a PR merges on **its own** green checks; main moving
   under you no longer forces a rebase-onto-tip + re-run. So: (1) validate against
   your own base — run `td-builder affected-checks --committed-only --run`; if it
-  waives the full loop, record the waiver in the PR body; if it escalates, it
-  runs the FULL the full check before returning success, so record the escalation
+  waives the full loop, record the waiver (and any "Deferred to the daily
+  backstop" line) in the PR body; if it escalates (only a `channels.scm` bump),
+  it runs the full check before returning success, so record the escalation
   and full result instead; (2) **every PR gets a subagent code review — waivable only for a trivial docs- or comment-only diff, and only if you say so in the PR:** spawn an
   independent code-review subagent over the full branch diff (`/code-review`) and
   **post the subagent's review results as a comment on the PR**; address its
@@ -390,12 +413,13 @@ tracking system, and all working notes live in the git log + PR body.
   (check with `gh run list --branch main --workflow ci.yml -L1` or
   `gh api repos/<owner>/td/commits/main/check-runs`). A heavy-only break
   (boot/VM/repro, not seen by the fast tier) is NOT caught by check-fast either —
-  it surfaces on the next manual full check; this is an accepted gap of
+  it surfaces on the daily backstop; this is an accepted gap of
   the velocity trade. Marking a PR ready
   with a locally-red or un-run affected-checks gate, or without the full run when
   affected-checks escalates, is still a contract violation — CI verifies your
   run, it does not replace it. `lint` + `check-fast` are the required checks; the
-  full check stays the dev-machine gate (step 1).
+  bounded affected-checks run is the dev-machine gate (step 1) and the full
+  check is the daily backstop's.
   
 - **Exclusive landings:** changes to the shared spine — `channels.scm`, the loop
   entry + gate runner (`builder/src/check_loop.rs`, `builder/src/gates.rs`) —
