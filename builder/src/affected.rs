@@ -220,12 +220,16 @@ fn build_gates(_root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// First gate whose `specs` contains `spec` → its target.
-fn target_for_build_spec(_root: &Path, spec: &str) -> Option<String> {
+/// EVERY gate whose `specs` contains `spec` → its targets. A spec can feed more
+/// than one gate (hello: corpus-no-guix builds/asserts it, oci-native packs it),
+/// and a lock/recipe change must re-prove every consumer — first-match-only
+/// silently dropped corpus-no-guix when gate 118 (a lower stem) declared hello.
+fn targets_for_build_spec(_root: &Path, spec: &str) -> Vec<String> {
     crate::gates::defs()
         .into_iter()
-        .find(|(_, d)| d.specs.iter().any(|s| *s == spec))
+        .filter(|(_, d)| d.specs.iter().any(|s| *s == spec))
         .map(|(_, d)| d.name.to_string())
+        .collect()
 }
 
 /// Would a plain `./check.sh` (cheap+heavy gates + build-recipes) cover `target`?
@@ -262,8 +266,11 @@ fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
 }
 
 fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
-    if let Some(t) = target_for_build_spec(root, spec) {
-        sel.add_target(&t);
+    let gate_targets = targets_for_build_spec(root, spec);
+    if !gate_targets.is_empty() {
+        for t in &gate_targets {
+            sel.add_target(t);
+        }
         return;
     }
     match spec {

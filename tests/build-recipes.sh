@@ -20,6 +20,10 @@ set -euo pipefail
 
 : "${TD_BUILD_SPECS:?the gate runner passes TD_BUILD_SPECS (the BUILD_SPECS pool)}"
 : "${TD_GUIX:?the gate runner passes TD_GUIX (the pinned time-machine prefix)}"
+# Two gates may declare the same spec (corpus-no-guix and oci-native both consume
+# hello); build each recipe ONCE — a duplicate here would run two concurrent
+# build-pkg.sh on the same $CACHE/<spec> dir (their b/*.drv resets race).
+TD_BUILD_SPECS=$(printf '%s\n' $TD_BUILD_SPECS | sort -u | tr '\n' ' ')
 nspecs=$(set -- $TD_BUILD_SPECS; echo $#)
 [ "$nspecs" -gt 0 ] || { echo "ERROR: empty TD_BUILD_SPECS — no package recipes registered" >&2; exit 1; }
 
