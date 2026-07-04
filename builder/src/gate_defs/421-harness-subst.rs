@@ -19,7 +19,7 @@
 //! and self-discrimination (wrong pinned key / wrong StorePath -> MISS). A BUILD_GATE like td-subst:
 //! builds td-subst from source, ordered after the build-recipes phase.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -28,7 +28,22 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): same pair as sibling gate 359 —
+        // resolved by the runner, no lock-grepping in the body.
+        inputs: &[
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
+            },
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/hello-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

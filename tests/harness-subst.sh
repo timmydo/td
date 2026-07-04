@@ -45,8 +45,10 @@ export
 guix=${GUIX:-guix}
 lock0="$(pwd)/tests/td-subst.lock"
 test -s "$lock0" || { echo "ERROR: no $lock0" >&2; exit 1; }
-cu=$(grep -- '-coreutils-' "$lock0" | sed 's/^[^ ]* //' | head -1)
-test -n "$cu" || { echo "ERROR: no coreutils in the lock" >&2; exit 1; }
+# coreutils is a DECLARED gate input (#353): the runner resolved it from
+# tests/td-subst.lock and exported it — no lock-grepping here.
+cu=${TD_GATE_INPUT_COREUTILS:-}
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
 shdir=$(dirname "$(command -v sh)")   # the helper scripts are shell scripts: coreutils $cu has no `sh`
 scratch="$(pwd)/.td-build-cache/harness-subst"; mkdir -p "$scratch/tmp" "$scratch/b"; rm -f "$scratch/b/"*.drv
 grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs "$guix" build >/dev/null \
@@ -78,10 +80,11 @@ glibcb="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-glibc-2.41-x86_64"
 bub="wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww-binutils-2.44-x86_64"
 target=x86_64-pc-linux-gnu
 mkdir -p "$H/store/$rel/bin" "$H/store/$gccb/bin"
-bashpkg=$(grep -- '-bash-' "$(pwd)/tests/hello-no-guix.lock" | grep -v static | sed 's/^[^ ]* //' | head -1)
-fixt=$(env -i PATH="$cu/bin" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-       "$tb" store-closure-scan /gnu/store "$bashpkg" | grep -- '-bash-static-' | head -1)
-test -n "$fixt" -a -x "$fixt/bin/bash" || { echo "FAIL: no static bash fixture in hello's closure" >&2; exit 1; }
+# the static-bash fixture is a DECLARED gate input (#353): the runner
+# content-scanned hello's bash closure and exported the unique bash-static member.
+fixt=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$fixt" || { echo "ERROR: TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
+test -x "$fixt/bin/bash" || { echo "FAIL: no static bash fixture at $fixt" >&2; exit 1; }
 cp "$fixt/bin/bash" "$H/store/$rel/bin/busybox"; chmod 0755 "$H/store/$rel/bin/busybox"
 printf '\177ELF-loader-stub\n' > "$H/store/ld"                       # loose store-root member
 printf '#!/bin/sh\necho stub-gcc\n' > "$H/store/$gccb/bin/$target-gcc"; chmod 0755 "$H/store/$gccb/bin/$target-gcc"

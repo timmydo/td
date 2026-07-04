@@ -116,10 +116,11 @@ echo "   [load-bearing] recipe-rev bump moves the key; flipping one input pin mo
 # --- [behavioral]+[structural] a real binary at the x86_64-keyed path RUNS in the own-root -----
 # A static bash from hello's PINNED closure (td's own store-closure reader, no guix process) is a
 # real runnable FIXTURE — placed at the x86_64-keyed input-addressed path, run in the store-ns own-root.
-bashpkg=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-test -n "$bashpkg" || fail "no bash in hello's lock"
-bs=`"$TB" store-closure-scan /gnu/store "$bashpkg" | grep -- '-bash-static-' | head -1`
-test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in the closure of $bashpkg"
+# the static-bash fixture is a DECLARED gate input (#353): the runner
+# content-scanned hello's bash closure and exported the unique bash-static member.
+bs=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 store="$work/store"; mkdir -p "$store"
 RUNP=`"$TB" store-add-input-addressed bash-static-x86_64 "$KX" "$bs" "$store" "$work/store.db"` || fail "store-add-input-addressed bash-static-x86_64"
 case "$RUNP" in /td/store/*-bash-static-x86_64) ;; *) fail "fixture not input-addressed at /td/store: $RUNP" ;; esac

@@ -110,10 +110,11 @@ echo "   [load-bearing] flipping one declared input pin moves glibc-2.41's path 
 # --- [behavioral]+[structural] a real binary at an input-addressed path RUNS in the own-root --
 # A static bash from hello's PINNED closure (td's own store-closure reader, no guix process) is
 # a real runnable FIXTURE — placed input-addressed, then executed in the store-ns own-root.
-bashpkg=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-test -n "$bashpkg" || fail "no bash in hello's lock"
-bs=`"$TB" store-closure-scan /gnu/store "$bashpkg" | grep -- '-bash-static-' | head -1`
-test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in the closure of $bashpkg"
+# the static-bash fixture is a DECLARED gate input (#353): the runner
+# content-scanned hello's bash closure and exported the unique bash-static member.
+bs=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 store="$work/store"; mkdir -p "$store"
 RUNP=`"$TB" store-add-input-addressed bash-static "$K1" "$bs" "$store" "$work/store.db"` || fail "store-add-input-addressed bash-static"
 case "$RUNP" in /td/store/*-bash-static) ;; *) fail "bash-static not input-addressed at /td/store: $RUNP" ;; esac
