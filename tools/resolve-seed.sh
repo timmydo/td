@@ -60,7 +60,7 @@ done
 # The substitute-store exposure: explicit env wins; otherwise derive it the same way the
 # check prelude does (tools/warm-subst.sh echoes the exports iff ~/.td/subst is usable).
 if [ -z "${TD_SUBST_BIN:-}" ]; then
-  _exp=`sh "$(dirname "$0")/warm-subst.sh" 2>/dev/null || true`
+  _exp=$(sh "$(dirname "$0")/warm-subst.sh" 2>/dev/null || true)
   [ -n "$_exp" ] && eval "$_exp"
 fi
 { [ -n "${TD_SUBST_BIN:-}" ] && [ -x "${TD_SUBST_BIN:-}" ] \

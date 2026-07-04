@@ -29,17 +29,17 @@ lock=${1:?usage: publish-seed-subst.sh LOCK OUT_STORE}
 out=${2:?usage: publish-seed-subst.sh LOCK OUT_STORE}
 : "${TD_BUILDER:?TD_BUILDER unset}"
 : "${TD_SUBST_BIN:?TD_SUBST_BIN unset}"
-: "${TD_SUBST_PRIVKEY:?TD_SUBST_PRIVKEY unset (the runner's private key is a host secret)}"
+: "${TD_SUBST_PRIVKEY:?TD_SUBST_PRIVKEY unset (the runner private key is a host secret)}"
 src=${TD_SEED_SRC:-/gnu/store}
 warmbase=${TD_SEED_WARM:-.td-build-cache/seed-subst-warm}
 
-roots=`sed -n 's/^[^ ]* \(\/gnu\/store\/[^ ]*\)$/\1/p' "$lock" 2>/dev/null` || roots=""
+roots=$(sed -n 's/^[^ ]* \(\/gnu\/store\/[^ ]*\)$/\1/p' "$lock" 2>/dev/null) || roots=""
 [ -n "$roots" ] || { echo "publish-seed-subst: no /gnu/store seed paths in $lock" >&2; exit 1; }
 
-# Idempotence: the whole published CLOSURE must be complete — every root narinfo, every
-# References member's narinfo (walked from the local files), and every named nar. A
-# publish interrupted mid-copy, or a store that lost members, re-triggers the export
-# instead of wedging at "nothing to do" while cold hosts fail on a missing member.
+# Idempotence: the whole published CLOSURE must be complete -- every root narinfo, every
+# member narinfo named in the References (walked from the local files), and every named
+# nar. A publish interrupted mid-copy, or a store that lost members, re-triggers the
+# export instead of wedging at nothing-to-do while cold hosts fail on a missing member.
 published_complete() {
   _q=""
   for _p in $roots; do _q="$_q ${_p##*/}"; done
@@ -52,9 +52,9 @@ published_complete() {
     _s="$_s$_b "
     _ni="$out/$_b.narinfo"
     [ -f "$_ni" ] || return 1
-    _nf=`sed -n 's/^NarFile: //p' "$_ni"`
+    _nf=$(sed -n 's/^NarFile: //p' "$_ni")
     { [ -n "$_nf" ] && [ -f "$out/$_nf" ]; } || return 1
-    _r=`sed -n 's/^References: //p' "$_ni"`
+    _r=$(sed -n 's/^References: //p' "$_ni")
     [ -n "$_r" ] && _q="$_q $_r"
   done
 }
@@ -71,9 +71,9 @@ done
 # Content-scanned, NAR-verified closure copy (store + refs db) — warm-seed caches it by
 # root set, so a re-publish after a partial store wipe reuses the capture.
 # shellcheck disable=SC2086 -- $roots is a whitespace-separated store-path list on purpose
-wm=`TB="$TD_BUILDER" TD_SEED_DB="$src" sh "$(dirname "$0")/warm-seed.sh" "$warmbase" $roots` \
+wm=$(TB="$TD_BUILDER" TD_SEED_DB="$src" sh "$(dirname "$0")/warm-seed.sh" "$warmbase" $roots) \
   || { echo "publish-seed-subst: seed capture (warm-seed) failed" >&2; exit 1; }
-# shellcheck disable=SC2086 -- warm-seed prints `<store> <db> <manifest>`
+# shellcheck disable=SC2086 -- warm-seed prints the triple: store db manifest
 set -- $wm
 seedstore=$1; seeddb=$2
 
@@ -94,5 +94,5 @@ done
 mkdir -p "$out/nar"
 cp -a "$exp"/nar/. "$out"/nar/
 cp -a "$exp"/*.narinfo "$out"/
-n=`ls "$exp"/*.narinfo | grep -c . || true`
+n=$(ls "$exp"/*.narinfo | grep -c . || true)
 echo "publish-seed-subst: published $n narinfo(s) — the signed $lock seed closure -> $out"
