@@ -15,8 +15,10 @@
 //! tools (tar, gcc, make, …) are the Guix toolchain — retired LAST (§5); what is
 //! removed is the build-system Guile, not the toolchain.
 //!
-//! Every phase command runs under a fail-fast watchdog (#308) — see `Watch`: a
-//! broken staged closure must red in minutes with a named tool, never spin.
+//! Every phase command run through `run_cmd` sits under a fail-fast watchdog
+//! (#308) — see `Watch`: a broken staged closure must red in minutes with a
+//! named tool, never spin. (`find_files`' short bash probe is the one
+//! subprocess outside it.)
 //!
 //! Inputs (env, set by system td-build):
 //!   out                output prefix (the daemon sets this)
@@ -31,8 +33,6 @@
 //!                      is what lets the OWN-builder path build a package with
 //!                      real source-patch phases (e.g. gettext-minimal) with NO
 //!                      Guile/gnu-build-system in the build.
-
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use crate::json::Json;
 use std::env;
@@ -96,12 +96,12 @@ fn patch_one_shebang(path: &Path, bash: &str) -> Result<(), String> {
     }
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     let nl = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
-    let line = match std::str::from_utf8(&bytes[..nl]) {
+    let line = match std::str::from_utf8(bytes.get(..nl).unwrap_or_default()) {
         Ok(s) => s,
         Err(_) => return Ok(()), // binary first line — skip
     };
     // "#!  /bin/sh -e"  ->  interp="/bin/sh", trailing=" -e"
-    let after = line[2..].trim_start();
+    let after = line.get(2..).unwrap_or_default().trim_start();
     let mut it = after.splitn(2, char::is_whitespace);
     let interp = it.next().unwrap_or("");
     let trailing = it.next().map(|s| format!(" {s}")).unwrap_or_default();
@@ -134,7 +134,7 @@ fn patch_one_shebang(path: &Path, bash: &str) -> Result<(), String> {
     }
     // File::create truncates but keeps the existing mode (exec bit survives).
     let mut out = format!("#!{bash}{trailing}").into_bytes();
-    out.extend_from_slice(&bytes[nl..]);
+    out.extend_from_slice(bytes.get(nl..).unwrap_or_default());
     fs::write(path, &out).map_err(|e| format!("patch-shebang {}: {e}", path.display()))?;
     if let Some(meta) = meta.as_ref() {
         if let (Ok(accessed), Ok(modified)) = (meta.accessed(), meta.modified()) {
@@ -174,36 +174,79 @@ fn single_subdir(dir: &str) -> Result<String, String> {
 /// `ac_count` increment in configure's "checking for grep that handles long
 /// lines" loop never happened), configure retries at 100% CPU for 30+ minutes,
 /// turning a clean, diagnosable red into an apparent hang that ties up a
-/// heavy-gate slot. `run_cmd` supervises every phase command with two
-/// independent bounds; zero disables a bound:
+/// heavy-gate slot. `run_cmd` supervises every phase command it runs; zero
+/// disables a bound:
 ///
-///   * `stderr_repeat_limit` — the SAME stderr line this many times in a row is
-///     a persistently-failing tool in a retry loop. Trips in seconds on the
-///     #292 shape, and the repeated line itself names the failing tool.
-///   * `silence` — no output on either stream for this long is a wedged phase:
-///     the backstop for a spin whose tool stderr configure redirects away
-///     (conftest stderr usually goes to /dev/null or config.log).
+///   * `repeat_limit` — while the command still RUNS, the SAME line this many
+///     times in a row on one stream is a persistently-failing tool in a retry
+///     loop; the group is killed and the phase reds, the repeated line naming
+///     the failing tool. Only ever kills a running command: a command that
+///     terminates on its own is judged by its exit status, so a self-limiting
+///     spammer is never falsely killed. Set ONLY for configure — healthy
+///     non-configure tools can repeat a line per work item (`tar xf` prints the
+///     identical "Ignoring unknown extended header keyword" warning per pax
+///     member), while a healthy configure never emits hundreds of identical
+///     consecutive lines. KNOWN RESIDUAL (#339): a #292-shape spin nested
+///     INSIDE a `make` phase (a bundled sub-`./configure` the Makefile re-runs)
+///     is not repeat-bounded and, if it spins chattily, resets the silence
+///     clock — the silence bound only catches a SILENT wedge there. The
+///     top-level configure the issue targets is fully covered.
+///   * `silence` — no output on either stream for this long, while the command
+///     still runs, is a wedged phase: the backstop for a spin whose tool
+///     stderr configure redirects away (conftest stderr usually goes to
+///     /dev/null or config.log), and the sole bound for the WATCH_PHASE
+///     residual above.
+///   * `drain_grace` — once the command has EXITED, how long a leftover
+///     background process may keep the output pipes open before the phase's
+///     process group is killed (and, `DRAIN_EXTRA` later, the drain abandoned
+///     so a group-escaped holder cannot wedge the build). Wall-clock from the
+///     exit, deliberately NOT activity-based: a chatty straggler must not
+///     extend it. Always active (unlike silence/repeat_limit, a zero here does
+///     NOT disable it — an unbounded drain is the hang we are removing). The
+///     command's own exit status decides pass/fail — a green exit stays green.
 ///
 /// The bounds are compiled in per phase, not env knobs: the sandbox clears the
 /// builder's env, and a drv-env knob would vary the drv hash with a tuning
 /// value. Tests pass their own tiny bounds.
 struct Watch {
     silence: Duration,
-    stderr_repeat_limit: u32,
+    repeat_limit: u32,
+    drain_grace: Duration,
 }
 
 /// Default phase bound: make can legitimately be silent for minutes while one
 /// big translation unit compiles; 30 minutes is comfortably past the corpus'
-/// (and the bootstrap chain's) worst single-file case, while still bounding a
-/// truly-wedged phase.
-const WATCH_PHASE: Watch =
-    Watch { silence: Duration::from_secs(1800), stderr_repeat_limit: 200 };
+/// worst single-file case (the /td/store bootstrap chain does NOT run through
+/// run_cmd — bootstrap.rs/toolchain_x86_64.rs have their own runners), while
+/// still bounding a truly-wedged phase. No repeat bound (see `Watch`).
+const WATCH_PHASE: Watch = Watch {
+    silence: Duration::from_secs(1800),
+    repeat_limit: 0,
+    drain_grace: Duration::from_secs(15),
+};
 
 /// configure bound: each configure check compiles+links a conftest in seconds,
 /// so ten silent minutes means wedged — this is what turns the #292 class of
 /// hang into a red "within minutes" even when the loop is silent.
-const WATCH_CONFIGURE: Watch =
-    Watch { silence: Duration::from_secs(600), stderr_repeat_limit: 200 };
+const WATCH_CONFIGURE: Watch = Watch {
+    silence: Duration::from_secs(600),
+    repeat_limit: 200,
+    drain_grace: Duration::from_secs(15),
+};
+
+/// After a drain-phase group kill, how long before the drain is abandoned
+/// (a holder that survived the SIGKILL left the process group or is stuck in
+/// the kernel; the abandoned reader threads exit with the builder process).
+const DRAIN_EXTRA: Duration = Duration::from_secs(5);
+
+/// `1500` → `1500ms`, `1000` → `1s` (sub-second test bounds must not print 0s).
+fn fmt_ms(ms: u64) -> String {
+    if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{ms}ms")
+    }
+}
 
 /// Clip one raw output line to a printable diagnostic fragment.
 fn clip_line(line: &[u8]) -> String {
@@ -213,70 +256,81 @@ fn clip_line(line: &[u8]) -> String {
     format!("{}{ell}", String::from_utf8_lossy(head))
 }
 
-/// The trip channel shared by the supervisor threads: the first cause wins,
-/// and a trip SIGKILLs the phase's whole process group — configure's children
-/// included, not just the shell.
-struct TripCtl<'a> {
-    why: &'a Mutex<Option<String>>,
-    tripped: &'a AtomicBool,
-    pgid: u32,
+/// One stream's line accountant: repeat counting + the diagnostic tail.
+struct StreamWatch {
+    last_line: Vec<u8>,
+    repeats: u32,
+    /// Last few DISTINCT lines, clipped, for the kill diagnostic (a repeat is
+    /// already quoted by the trip reason; duplicating it 5x buries context).
+    tail: std::collections::VecDeque<String>,
 }
 
-impl TripCtl<'_> {
-    fn trip(&self, why: String) {
-        if let Ok(mut t) = self.why.lock() {
-            if t.is_none() {
-                *t = Some(why);
-                self.tripped.store(true, Ordering::Relaxed);
-                let _ = crate::sys::kill_process_group(self.pgid, crate::sys::SIGKILL);
+impl StreamWatch {
+    fn new() -> Self {
+        StreamWatch { last_line: Vec::new(), repeats: 0, tail: std::collections::VecDeque::new() }
+    }
+}
+
+/// State shared between the two reader threads and run_cmd's poll loop.
+struct Supervise {
+    start: Instant,
+    /// ms since `start` of the last read from EITHER stream (silence clock).
+    last_activity_ms: AtomicU64,
+    /// The first trip reason wins; the poll loop kills and reds on it.
+    why: Mutex<Option<String>>,
+    out_done: AtomicBool,
+    err_done: AtomicBool,
+    out_watch: Mutex<StreamWatch>,
+    err_watch: Mutex<StreamWatch>,
+}
+
+/// Account one complete line: repeat counting + the distinct-line tail. At
+/// `limit` consecutive identical lines the trip reason is recorded (once);
+/// the poll loop does the killing, so kill and reap stay ordered in one
+/// thread and a stale pgid is never signalled.
+fn account_line(
+    st: &mut StreamWatch,
+    line: &[u8],
+    limit: u32,
+    stream: &str,
+    why: &Mutex<Option<String>>,
+) {
+    if line == st.last_line.as_slice() {
+        st.repeats = st.repeats.saturating_add(1);
+    } else {
+        st.last_line.clear();
+        st.last_line.extend_from_slice(line);
+        st.repeats = 1;
+        if st.tail.len() >= 5 {
+            st.tail.pop_front();
+        }
+        st.tail.push_back(clip_line(line));
+    }
+    if limit > 0 && st.repeats >= limit {
+        if let Ok(mut w) = why.lock() {
+            if w.is_none() {
+                *w = Some(format!(
+                    "the same {stream} line repeated {}x (a persistently-failing tool in a retry loop): {}",
+                    st.repeats,
+                    clip_line(line)
+                ));
             }
         }
     }
 }
 
-/// The stderr accountant's state.
-struct StderrWatch {
-    last_line: Vec<u8>,
-    repeats: u32,
-    /// Last few stderr lines, clipped, for the kill diagnostic.
-    tail: std::collections::VecDeque<String>,
-}
-
-/// Account one complete stderr line: repeat counting + the diagnostic tail.
-/// Trips (and kills the group) when the SAME line repeats `limit` times in a
-/// row — decided here at line granularity, so a command that emits fewer
-/// repeats and exits green can never race a sampling thread into a false kill.
-fn account_stderr_line(st: &mut StderrWatch, line: &[u8], limit: u32, ctl: &TripCtl) {
-    if line == st.last_line.as_slice() {
-        st.repeats = st.repeats.saturating_add(1);
-    } else {
-        st.last_line = line.to_vec();
-        st.repeats = 1;
-    }
-    if st.tail.len() >= 5 {
-        st.tail.pop_front();
-    }
-    st.tail.push_back(clip_line(line));
-    if limit > 0 && st.repeats >= limit && !ctl.tripped.load(Ordering::Relaxed) {
-        ctl.trip(format!(
-            "the same stderr line repeated {}x (a persistently-failing tool in a retry loop): {}",
-            st.repeats,
-            clip_line(line)
-        ));
-    }
-}
-
-/// Tee one child stream to `sink`, updating the shared activity clock; for
-/// stderr (`watch_lines` set) also split into lines for the repeat accountant.
-/// Chunk-based (not read_until): a `\r`-progress stream with no newline still
-/// counts as activity, and an unterminated line cannot grow unboundedly.
+/// Tee one child stream to `sink`, updating the shared activity clock; when
+/// `watch` is set, also split into lines for the repeat accountant (stderr
+/// always — its tail feeds the silence-kill diagnostic — and stdout too when a
+/// repeat bound is set, so a retry spin printing to stdout cannot escape the
+/// watchdog by resetting the silence clock). Chunk-based (not read_until): a
+/// `\r`-progress stream with no newline still counts as activity, and an
+/// unterminated line cannot grow unboundedly.
 fn tee_stream(
     mut src: impl std::io::Read,
     mut sink: impl std::io::Write,
-    start: Instant,
-    last_activity_ms: &AtomicU64,
-    watch_lines: Option<(&Mutex<StderrWatch>, u32)>,
-    ctl: &TripCtl,
+    sup: &Supervise,
+    watch: Option<(&Mutex<StreamWatch>, u32, &str)>,
 ) {
     let mut buf = [0u8; 8192];
     let mut pending: Vec<u8> = Vec::new();
@@ -284,29 +338,40 @@ fn tee_stream(
         let n = match src.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
+        // Activity FIRST: the read itself proves the child is alive. The sink
+        // write below can block (a stalled log consumer) and must not freeze
+        // the silence clock while output is in fact arriving.
+        let elapsed = u64::try_from(sup.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        sup.last_activity_ms.store(elapsed, Ordering::Relaxed);
         let chunk = buf.get(..n).unwrap_or(&buf);
         let _ = sink.write_all(chunk);
         let _ = sink.flush();
-        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        last_activity_ms.store(elapsed, Ordering::Relaxed);
-        if let Some((watch, limit)) = watch_lines {
-            pending.extend_from_slice(chunk);
-            while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
-                let mut line: Vec<u8> = pending.drain(..=nl).collect();
-                line.pop(); // the \n
-                if let Ok(mut st) = watch.lock() {
-                    account_stderr_line(&mut st, &line, limit, ctl);
+        if let Some((watch, limit, stream)) = watch {
+            if let Ok(mut st) = watch.lock() {
+                // Linear scan of the chunk; only a trailing partial line is
+                // carried over (no per-line allocation, no re-scan).
+                let mut rest = chunk;
+                while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
+                    let line = rest.get(..nl).unwrap_or_default();
+                    if pending.is_empty() {
+                        account_line(&mut st, line, limit, stream, &sup.why);
+                    } else {
+                        pending.extend_from_slice(line);
+                        account_line(&mut st, &pending, limit, stream, &sup.why);
+                        pending.clear();
+                    }
+                    rest = rest.get(nl.saturating_add(1)..).unwrap_or_default();
                 }
-            }
-            // A pathological unterminated "line": account it in slices so the
-            // buffer stays bounded (repeat detection needs whole lines anyway).
-            if pending.len() > 65536 {
-                if let Ok(mut st) = watch.lock() {
-                    account_stderr_line(&mut st, &pending, limit, ctl);
+                pending.extend_from_slice(rest);
+                // A pathological unterminated "line" counts as activity only:
+                // identical 64 KiB slices of a newline-free progress stream
+                // must not masquerade as a retry loop.
+                if pending.len() > 65536 {
+                    pending.clear();
                 }
-                pending.clear();
             }
         }
     }
@@ -315,9 +380,19 @@ fn tee_stream(
 /// Run a command with a CLEAN environment (`envs` only), in `cwd`, echoing it to
 /// the build log. Fail-closed: a non-zero exit aborts the build. Supervised by
 /// `watch` (#308): the child runs in its OWN process group with stdout/stderr
-/// teed to the build log, and a tripped bound SIGKILLs the whole group and reds
-/// the phase with the last stderr lines — a broken tool loop in configure
-/// becomes a diagnosable red in minutes, not a 30-minute spin.
+/// teed to the build log; a tripped bound SIGKILLs the whole group and reds the
+/// phase with the last stderr lines — a broken tool loop in configure becomes a
+/// diagnosable red in minutes, not a 30-minute spin. The supervision loop runs
+/// on the calling thread with detached readers, so run_cmd's return is bounded
+/// in EVERY case (trip, wedge, straggler, group-escaped pipe holder); only the
+/// child's recorded exit status decides pass/fail once it has exited.
+///
+/// Process-group note: the new group makes the trip kill atomic (configure's
+/// transient children included) and is invisible to the post-#328 cgroup
+/// memory enforcement (descendants inherit the gate cgroup regardless of
+/// pgroup). The gate runner's FALLBACK pgroup-RSS sampler, used only where no
+/// delegated cgroup exists, does lose sight of phase children for a build run
+/// in-gate — the per-process RLIMIT_DATA cap still binds each of them.
 fn run_cmd(
     prog: &str,
     args: &[&str],
@@ -343,72 +418,161 @@ fn run_cmd(
     let child_out = child.stdout.take().ok_or_else(|| format!("{prog}: no stdout pipe"))?;
     let child_err = child.stderr.take().ok_or_else(|| format!("{prog}: no stderr pipe"))?;
 
-    let start = Instant::now();
-    let last_activity_ms = AtomicU64::new(0);
-    let why: Mutex<Option<String>> = Mutex::new(None);
-    let tripped = AtomicBool::new(false);
-    let stop = AtomicBool::new(false);
-    let ctl = TripCtl { why: &why, tripped: &tripped, pgid };
-    let stderr_watch = Mutex::new(StderrWatch {
-        last_line: Vec::new(),
-        repeats: 0,
-        tail: std::collections::VecDeque::new(),
+    let sup = std::sync::Arc::new(Supervise {
+        start: Instant::now(),
+        last_activity_ms: AtomicU64::new(0),
+        why: Mutex::new(None),
+        out_done: AtomicBool::new(false),
+        err_done: AtomicBool::new(false),
+        out_watch: Mutex::new(StreamWatch::new()),
+        err_watch: Mutex::new(StreamWatch::new()),
     });
+    let limit = watch.repeat_limit;
+    let out_reader = {
+        let sup = std::sync::Arc::clone(&sup);
+        std::thread::spawn(move || {
+            // stdout is line-watched only under a repeat bound (configure).
+            let w = if limit > 0 { Some((&sup.out_watch, limit, "stdout")) } else { None };
+            tee_stream(child_out, std::io::stdout(), &sup, w);
+            sup.out_done.store(true, Ordering::Relaxed);
+        })
+    };
+    let err_reader = {
+        let sup = std::sync::Arc::clone(&sup);
+        std::thread::spawn(move || {
+            // stderr is always line-watched: its tail feeds every diagnostic.
+            tee_stream(child_err, std::io::stderr(), &sup, Some((&sup.err_watch, limit, "stderr")));
+            sup.err_done.store(true, Ordering::Relaxed);
+        })
+    };
 
+    // The supervision loop, on this thread. It kills ONLY a command that is
+    // still RUNNING: a bound trips → SIGKILL the group → red. A command that
+    // TERMINATES on its own is judged by its exit status alone — the repeat/
+    // silence reasons a reader may have recorded while draining its buffered
+    // output are ignored (so a self-terminating spammer, or a straggler noisy
+    // during the drain, never overrides a real exit). Kill ordering vs reap:
+    // the pre-exit kill fires while the un-reaped leader pins the pgid, so it
+    // cannot hit a recycled group; the one post-reap kill (drain phase, below)
+    // fires only while a pipe holder is still alive and carries the same
+    // low-probability recycled-pgid caveat the gate runner's kill already does.
     let silence_ms = u64::try_from(watch.silence.as_millis()).unwrap_or(u64::MAX);
-    let status = std::thread::scope(|s| {
-        let out_reader = s.spawn(|| {
-            tee_stream(child_out, std::io::stdout(), start, &last_activity_ms, None, &ctl);
-        });
-        let err_reader = s.spawn(|| {
-            tee_stream(
-                child_err,
-                std::io::stderr(),
-                start,
-                &last_activity_ms,
-                Some((&stderr_watch, watch.stderr_repeat_limit)),
-                &ctl,
-            );
-        });
-        // Silence watchdog: runs until the readers have drained (NOT merely
-        // until the child exits) — so a build that leaves a background child
-        // holding the pipes open is also bounded, instead of hanging the join.
-        s.spawn(|| {
-            while !stop.load(Ordering::Relaxed) && !tripped.load(Ordering::Relaxed) {
+    let tick = Duration::from_millis(25);
+    let mut exit: Option<std::process::ExitStatus> = None;
+    let mut exited_at = sup.start;
+    let mut killed = false;
+    let mut killed_at = sup.start;
+    let mut drain_killed = false;
+    let mut abandoned = false;
+    loop {
+        if exit.is_none() {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    exit = Some(st);
+                    exited_at = Instant::now();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                    let _ = child.wait();
+                    return Err(format!("wait {prog}: {e}"));
+                }
+            }
+        }
+        let drained =
+            sup.out_done.load(Ordering::Relaxed) && sup.err_done.load(Ordering::Relaxed);
+        match exit {
+            Some(_) if drained => break,
+            Some(_) => {
+                // Drain phase: the command has exited but something still
+                // holds its output pipes (a leftover background process).
+                let dt = exited_at.elapsed();
+                if !drain_killed && dt > watch.drain_grace {
+                    eprintln!(
+                        "td-build watchdog: `{prog}` exited but a leftover background process \
+                         still holds its output pipes after {}s — killing the phase's process group",
+                        watch.drain_grace.as_secs()
+                    );
+                    let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                    drain_killed = true;
+                } else if drain_killed && dt > watch.drain_grace.saturating_add(DRAIN_EXTRA) {
+                    eprintln!(
+                        "td-build watchdog: abandoning the output drain of `{prog}` \
+                         (a pipe holder survived the group kill)"
+                    );
+                    abandoned = true;
+                    break;
+                }
+            }
+            None if killed => {
+                // A kill was issued but the child has not reaped yet. Bound
+                // this too: a child wedged in uninterruptible (D-state) sleep
+                // would otherwise never reap and spin the loop forever — the
+                // pre-exit analog of the drain-abandon path. The un-reaped
+                // leader still pins the pgid, so nothing recycled was signalled.
+                if killed_at.elapsed() > DRAIN_EXTRA {
+                    abandoned = true;
+                    break;
+                }
+            }
+            None => {
                 if silence_ms > 0 {
-                    let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    if elapsed.saturating_sub(last_activity_ms.load(Ordering::Relaxed)) > silence_ms {
-                        ctl.trip(format!("no output for {}s (a wedged phase)", silence_ms / 1000));
-                        return;
+                    let elapsed =
+                        u64::try_from(sup.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let last = sup.last_activity_ms.load(Ordering::Relaxed);
+                    if elapsed.saturating_sub(last) > silence_ms {
+                        if let Ok(mut w) = sup.why.lock() {
+                            if w.is_none() {
+                                *w = Some(format!(
+                                    "no output for {} (a wedged phase)",
+                                    fmt_ms(silence_ms)
+                                ));
+                            }
+                        }
                     }
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                if sup.why.lock().map(|w| w.is_some()).unwrap_or(false) {
+                    let _ = crate::sys::kill_process_group(pgid, crate::sys::SIGKILL);
+                    killed = true;
+                    killed_at = Instant::now();
+                }
             }
-        });
-        let st = child.wait();
+        }
+        std::thread::sleep(tick);
+    }
+    if !abandoned {
         let _ = out_reader.join();
         let _ = err_reader.join();
-        stop.store(true, Ordering::Relaxed);
-        st
-    });
+    }
 
-    let why = why.lock().ok().and_then(|mut t| t.take());
-    if let Some(why) = why {
-        let tail = stderr_watch
+    // A watchdog error is reported ONLY when the loop actually killed a running
+    // command. `why` recorded without a kill (buffered spam from a command that
+    // then exited on its own, or a straggler noisy during the drain) is dropped
+    // — the command's own exit status decides.
+    if killed {
+        let why = sup
+            .why
+            .lock()
+            .ok()
+            .and_then(|mut w| w.take())
+            .unwrap_or_else(|| "killed by the phase watchdog".to_string());
+        let tail = sup
+            .err_watch
             .lock()
             .map(|st| st.tail.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n"))
             .unwrap_or_default();
-        let tail = if tail.is_empty() { String::new() } else { format!("; last stderr lines:\n{tail}") };
+        let tail =
+            if tail.is_empty() { String::new() } else { format!("; last stderr lines:\n{tail}") };
         return Err(format!(
             "td-build watchdog KILLED `{prog} {}` after {}s — {why}{tail}",
             args.join(" "),
-            start.elapsed().as_secs(),
+            sup.start.elapsed().as_secs(),
         ));
     }
-    match status {
-        Ok(st) if st.success() => Ok(()),
-        Ok(st) => Err(format!("{prog} {} failed: {st}", args.join(" "))),
-        Err(e) => Err(format!("wait {prog}: {e}")),
+    match exit {
+        Some(st) if st.success() => Ok(()),
+        Some(st) => Err(format!("{prog} {} failed: {st}", args.join(" "))),
+        None => Err(format!("{prog}: exit status lost (supervision bug)")),
     }
 }
 
@@ -481,13 +645,13 @@ fn resolve_to(to: &Json, bindings: &BTreeMap<String, String>, search_path: &str)
         // (format #f FMT ARG…): substitute each `~a` in FMT with the next ARG.
         let fmt = fmtargs.first().and_then(Json::as_str).ok_or("format: missing format string")?;
         let mut o = String::new();
-        let mut args = fmtargs[1..].iter();
+        let mut args = fmtargs.get(1..).unwrap_or_default().iter();
         let mut rest = fmt;
         while let Some(pos) = rest.find("~a") {
-            o.push_str(&escape_sed_repl(&rest[..pos]));
+            o.push_str(&escape_sed_repl(rest.get(..pos).unwrap_or_default()));
             let a = args.next().ok_or("format: too few arguments for ~a")?;
             o.push_str(&resolve_part(a, bindings, search_path)?);
-            rest = &rest[pos + 2..];
+            rest = rest.get(pos + 2..).unwrap_or_default();
         }
         o.push_str(&escape_sed_repl(rest));
         return Ok(o);
@@ -1140,6 +1304,15 @@ mod tests {
         (bash, vec![("PATH".to_string(), path)])
     }
 
+    /// A test-sized Watch. `silence`/`limit` 0 = off; drain grace 1s.
+    fn w(silence_secs: u64, limit: u32) -> Watch {
+        Watch {
+            silence: Duration::from_secs(silence_secs),
+            repeat_limit: limit,
+            drain_grace: Duration::from_secs(1),
+        }
+    }
+
     #[test]
     fn watchdog_reds_a_configure_stuck_in_a_failing_tool_loop() {
         // The #292 shape (issue #308): a staged closure missing libgmp makes
@@ -1153,14 +1326,8 @@ mod tests {
         let loop_forever = "while :; do echo 'expr: error while loading shared libraries: \
                             libgmp.so.10: cannot open shared object file' >&2; done";
         let t0 = Instant::now();
-        let err = run_cmd(
-            &bash,
-            &["-c", loop_forever],
-            ".",
-            &envs,
-            &Watch { silence: Duration::ZERO, stderr_repeat_limit: 25 },
-        )
-        .expect_err("a persistently-failing tool loop must red");
+        let err = run_cmd(&bash, &["-c", loop_forever], ".", &envs, &w(0, 25))
+            .expect_err("a persistently-failing tool loop must red");
         assert!(t0.elapsed() < Duration::from_secs(30), "must red promptly, not spin: {err}");
         assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
         assert!(err.contains("repeated 25x"), "names the repeat bound: {err}");
@@ -1168,7 +1335,25 @@ mod tests {
             err.contains("expr: error while loading shared libraries"),
             "quotes the failing tool's stderr: {err}"
         );
-        assert!(err.contains("last stderr lines:"), "carries the stderr tail: {err}");
+    }
+
+    #[test]
+    fn watchdog_reds_a_stdout_spinning_loop_too() {
+        // A retry spin that prints to STDOUT would reset the silence clock on
+        // every line and escape a stderr-only repeat bound — under a repeat
+        // bound both streams are line-watched, so it reds all the same.
+        let (bash, envs) = bash_and_env();
+        let t0 = Instant::now();
+        let err = run_cmd(
+            &bash,
+            &["-c", "while :; do echo 'configure: retrying tool probe'; done"],
+            ".",
+            &envs,
+            &w(0, 25),
+        )
+        .expect_err("a stdout-spinning loop must red");
+        assert!(t0.elapsed() < Duration::from_secs(30), "must red promptly: {err}");
+        assert!(err.contains("stdout line repeated 25x"), "names the stream: {err}");
     }
 
     #[test]
@@ -1179,16 +1364,54 @@ mod tests {
         // sleep included), so the test returns instead of waiting 300s.
         let (bash, envs) = bash_and_env();
         let t0 = Instant::now();
-        let err = run_cmd(
-            &bash,
-            &["-c", "exec sleep 300"],
-            ".",
-            &envs,
-            &Watch { silence: Duration::from_secs(1), stderr_repeat_limit: 0 },
-        )
-        .expect_err("a silent wedged phase must red");
+        let err = run_cmd(&bash, &["-c", "exec sleep 300"], ".", &envs, &w(1, 0))
+            .expect_err("a silent wedged phase must red");
         assert!(t0.elapsed() < Duration::from_secs(30), "must red at the bound: {err}");
         assert!(err.contains("no output for 1s"), "names the silence bound: {err}");
+        assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
+    }
+
+    #[test]
+    fn watchdog_keeps_a_green_exit_despite_a_repeating_straggler_during_drain() {
+        // A command exits 0 but leaves a background straggler that SPAMS the
+        // same stderr line while holding the pipes open. The repeat accountant
+        // sees the spam and records a trip reason — but the main command
+        // already exited, so the loop is in the drain phase and never enters
+        // the kill path: `killed` stays false, the recorded reason is dropped,
+        // and the exit status (0) decides. The drain grace kills the straggler
+        // group so run_cmd still returns promptly. This is the guarantee that a
+        // repeat reason recorded WITHOUT a kill never overrides a real exit.
+        let (bash, envs) = bash_and_env();
+        let t0 = Instant::now();
+        run_cmd(
+            &bash,
+            &["-c", "while :; do echo 'expr: died again' >&2; done & exit 0"],
+            ".",
+            &envs,
+            &w(600, 25),
+        )
+        .expect("a green exit must win over a straggler's repeat spam during drain");
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the drain grace must bound the repeating straggler"
+        );
+    }
+
+    #[test]
+    fn watchdog_drain_bounds_a_pipe_holding_straggler_and_keeps_the_green_exit() {
+        // A phase that exits 0 but leaves a background child holding the
+        // output pipes must NOT hang run_cmd (the old .status() semantics
+        // returned at exit; the readers must not wait 30s for the sleep) and
+        // must NOT red: the drain grace kills the straggler group, and the
+        // command's own exit status decides.
+        let (bash, envs) = bash_and_env();
+        let t0 = Instant::now();
+        run_cmd(&bash, &["-c", "sleep 30 & exit 0"], ".", &envs, &w(600, 0))
+            .expect("a green exit with a straggler must stay green");
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the drain grace must bound the straggler well before its natural 30s exit"
+        );
     }
 
     #[test]
@@ -1199,24 +1422,12 @@ mod tests {
         // the counter, so far more total lines than the limit stay green.
         let (bash, envs) = bash_and_env();
         let noisy = "for i in $(seq 24); do echo 'same warning' >&2; done; echo done-ok";
-        run_cmd(
-            &bash,
-            &["-c", noisy],
-            ".",
-            &envs,
-            &Watch { silence: Duration::from_secs(600), stderr_repeat_limit: 25 },
-        )
-        .expect("sub-limit repeats must stay green");
+        run_cmd(&bash, &["-c", noisy], ".", &envs, &w(600, 25))
+            .expect("sub-limit repeats must stay green");
         let alternating =
             "for i in $(seq 40); do echo \"warn $((i % 2))\" >&2; done; echo done-ok";
-        run_cmd(
-            &bash,
-            &["-c", alternating],
-            ".",
-            &envs,
-            &Watch { silence: Duration::from_secs(600), stderr_repeat_limit: 25 },
-        )
-        .expect("alternating stderr lines must reset the repeat counter");
+        run_cmd(&bash, &["-c", alternating], ".", &envs, &w(600, 25))
+            .expect("alternating stderr lines must reset the repeat counter");
     }
 
     #[test]
@@ -1225,14 +1436,8 @@ mod tests {
         // the supervisor changes HOW output is carried, not the pass/fail
         // contract.
         let (bash, envs) = bash_and_env();
-        let err = run_cmd(
-            &bash,
-            &["-c", "echo out; echo err >&2; exit 3"],
-            ".",
-            &envs,
-            &WATCH_PHASE,
-        )
-        .expect_err("exit 3 must red");
+        let err = run_cmd(&bash, &["-c", "echo out; echo err >&2; exit 3"], ".", &envs, &WATCH_PHASE)
+            .expect_err("exit 3 must red");
         assert!(err.contains("failed"), "plain failure message kept: {err}");
         run_cmd(&bash, &["-c", "true"], ".", &envs, &WATCH_PHASE).expect("true is green");
     }
