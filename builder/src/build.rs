@@ -1568,6 +1568,44 @@ mod tests {
     }
 
     #[test]
+    fn stage0_output_seal_reds_a_gnu_store_byte_and_passes_a_clean_tree() {
+        // The stage0 SEAL's output half (#378): any /gnu/store byte in the seed
+        // rung's output must red the BUILD in the engine. Verified-red by
+        // construction: the poisoned tree errors, the clean twin passes.
+        let d = std::env::temp_dir().join(format!("td-stage0-seal-{}", std::process::id()));
+        let sub = d.join("AMD64/bin");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("M1"), b"clean bytes").unwrap();
+        assert!(require_no_gnu_store(&d).is_ok(), "a clean tree must pass");
+        fs::write(sub.join("kaem"), b"oops /gnu/store/abc-glibc leak").unwrap();
+        let err = require_no_gnu_store(&d).expect_err("a /gnu/store byte must red");
+        assert!(err.contains("/gnu/store"), "diagnostic names the leak: {err}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn stage0_copy_tree_writable_preserves_exec_and_adds_write() {
+        // run_stage0's working copy: store trees are read-only (0444/0555) and the
+        // kaem build must write into its tree; exec bits must survive the copy.
+        let d = std::env::temp_dir().join(format!("td-stage0-copy-{}", std::process::id()));
+        let src = d.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("tool"), b"#!x").unwrap();
+        fs::set_permissions(&src.join("tool"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::write(src.join("data"), b"d").unwrap();
+        fs::set_permissions(&src.join("data"), fs::Permissions::from_mode(0o444)).unwrap();
+        let dst = d.join("dst");
+        copy_tree_writable(&src, &dst).unwrap();
+        let tool = fs::metadata(dst.join("tool")).unwrap().permissions().mode();
+        let data = fs::metadata(dst.join("data")).unwrap().permissions().mode();
+        assert_eq!(tool & 0o111, 0o111, "exec bit preserved: {tool:o}");
+        assert_eq!(tool & 0o200, 0o200, "owner write added: {tool:o}");
+        assert_eq!(data & 0o111, 0, "plain file stays non-exec: {data:o}");
+        assert_eq!(data & 0o200, 0o200, "owner write added: {data:o}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn watchdog_reds_a_configure_stuck_in_a_failing_tool_loop() {
         // The #292 shape (issue #308): a staged closure missing libgmp makes
         // every `expr` die with the SAME loader error, and configure's
