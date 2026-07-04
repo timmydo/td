@@ -69,7 +69,9 @@ toolchain, and rust rides on it. Work item: #380.
    (`builder/src/gates.rs`, `builder/src/gate_defs/`), or `tests/` must be
    called out plainly in the PR so the human approves it knowingly — never
    slip it past review. Adding or strengthening tests is always
-   free. If a test cannot pass honestly, STOP and report.
+   free — free meaning no approval is needed, not that every PR should
+   add one (see "Test the feature, not the possibility"). If a test
+   cannot pass honestly, STOP and report.
    
 4. **PR is the proposal.** One-maintainer project: build the smallest *complete*
    increment — a real working capability with its migration cut over in the one PR
@@ -272,6 +274,10 @@ legitimate only as SUPPORTING evidence behind a behavioral assertion
 (and the byte-hash-vs-Guix leg is the removable oracle), never as the
 point of the gate. If the only thing a new test proves is "this can be
 built", it is not covering a feature: find the feature and test that.
+New tests accompany new or changed behavior; a behavior-preserving
+refactor is validated by the existing tests covering that path staying
+green, and a test added just to have one — re-asserting covered
+behavior or pinning implementation details — is noise, not coverage.
 
 **What counts as a feature.** The gates exist to test
 td end to end: td builds package recipes, `td shell` runs those builds, the
@@ -292,8 +298,11 @@ A task is done only when ALL hold:
 
 - a test exercises the actual feature through its real entry point and asserts what it
   does — not just that an artifact can be built (see "Test the feature, not the
-  possibility") — and passes,
-- you have seen that assertion fail (verified-red) before trusting the pass,
+  possibility") — and passes; for a behavior-preserving refactor this is the existing
+  coverage of the refactored path staying green, not a minted new test,
+- you have seen that assertion fail (verified-red) before trusting the pass (applies to
+  tests you add or change; a refactor leaning on existing coverage has nothing new to
+  red),
 - the change is a complete, atomic increment — a real capability with any replaced path
   removed in the same PR (directive 8), not a partial mechanism,
 - it is committed with a message stating what test now passes,
