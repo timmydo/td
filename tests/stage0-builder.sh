@@ -68,4 +68,33 @@ case "$cb" in
 esac
 test -x "$store/`basename "$cb"`/bin/td-builder" || { echo "stage0-builder: stage0 not restored under $store" >&2; exit 1; }
 printf '%s\n%s\n' "$fp" "$cb" > "$meta"
+
+# 3. GC stale placements (#309). This slow path just placed the CURRENT stage0 ($cb)
+#    and store-add-builder rewrote builder.db to reference ONLY it, so every OTHER
+#    *-td-builder-* directory under $store is a placement from an earlier builder/
+#    fingerprint (a new fingerprint ⇒ new content-addressed $cb ⇒ a fresh dir, and the
+#    old one was never removed). Left alone they accumulate one-per-change on a
+#    long-lived warm runner (unbounded disk) and are a latent hazard for any glob-style
+#    resolver (the #293 daemon-budget red). Sweep them.
+#
+#    Concurrency-safe: we still hold the .stage0.lock (fd 9, open until this script
+#    exits), so no other stage0-builder.sh can be placing here, and load_stage0 only
+#    ever resolves the CURRENT $cb (from .stage0-meta / the memo) — which we KEEP —
+#    within the same per-BASEDIR store; a fast-path resolver returns $cb only when its
+#    fingerprint matches the meta, i.e. the very dir we preserve. Only the slow path
+#    (which holds the lock) ever creates or removes placements.
+cur=`basename "$cb"`
+swept=0
+for d in "$store"/*-td-builder-*; do
+  [ -e "$d" ] || continue          # no glob match ⇒ the literal pattern; skip
+  [ -d "$d" ] || continue
+  b=`basename "$d"`
+  if [ "$b" = "$cur" ]; then continue; fi   # keep the current placement
+  rm -rf "$d"
+  swept=`expr $swept + 1`
+done
+if [ "$swept" -gt 0 ]; then
+  echo "stage0-builder: swept $swept stale placement(s) from $store (kept $cur)" >&2
+fi
+
 echo "$cb"
