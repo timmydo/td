@@ -26,6 +26,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -234,18 +235,13 @@ fn target_for_build_spec(_root: &Path, spec: &str) -> Option<String> {
 
 /// Would a plain `td-builder check` (cheap+heavy+daily gates + build-recipes)
 /// cover `target`? (`check-pr` is a subset of the plain check by construction.)
+/// The pool question is gates.rs's (`pool_in_full_check`), not a local list.
 fn default_check_covers_target(_root: &Path, target: &str) -> bool {
     if target == "check-fast" || target == "check-pr" || target == "build-recipes" {
         return true;
     }
     crate::gates::defs().into_iter().any(|(_, d)| {
-        d.name == target
-            && d.pools.iter().any(|p| {
-                matches!(
-                    p,
-                    crate::gates::Pool::Cheap | crate::gates::Pool::Heavy | crate::gates::Pool::Daily
-                )
-            })
+        d.name == target && d.pools.iter().any(|p| crate::gates::pool_in_full_check(*p))
     })
 }
 
@@ -365,8 +361,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // 2026-07-04).
         sel.add_preflight("shell-syntax");
         sel.add_preflight("cargo-test");
+        // check-pr already contains the cargo-test GATE (Pool::Heavy) — no
+        // explicit target, or spine diffs would run the engine suite twice.
         sel.add_target("check-pr");
-        sel.add_target("cargo-test");
         sel.add_note(&format!(
             "{p} touches the loop spine: validated by the bounded check-pr tier (the runner \
              runs itself over the whole PR pool); the daily backstop covers the daily tier."
@@ -1302,23 +1299,20 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     o
 }
 
-/// Is `target` a gate that runs ONLY in the daily/system tiers? (Pool::Daily or
-/// Pool::System membership with no cheap/heavy/fast/engine membership, or the
-/// `check-system` tier itself.) Such targets are honest members of the affected
-/// set but are NOT run per-PR — the daily backstop covers them.
-fn daily_tier_only(target: &str) -> bool {
-    if target == "check-system" {
-        return true;
-    }
+/// The gate names that run ONLY in the daily/system tiers (no membership in
+/// any per-PR pool — gates.rs's `pool_runs_per_pr` is the single source of
+/// that taxonomy). Such targets are honest members of the affected set but are
+/// NOT run per-PR — the daily backstop covers them. Built once per selection.
+fn daily_tier_only_names() -> HashSet<String> {
     use crate::gates::Pool;
-    crate::gates::defs().into_iter().any(|(_, d)| {
-        d.name == target
-            && d.pools.iter().any(|p| matches!(p, Pool::Daily | Pool::System))
-            && !d
-                .pools
-                .iter()
-                .any(|p| matches!(p, Pool::Cheap | Pool::Heavy | Pool::Fast | Pool::Engine))
-    })
+    crate::gates::defs()
+        .into_iter()
+        .filter(|(_, d)| {
+            !d.pools.iter().any(|p| crate::gates::pool_runs_per_pr(*p))
+                && d.pools.iter().any(|p| matches!(p, Pool::Daily | Pool::System))
+        })
+        .map(|(_, d)| d.name.to_string())
+        .collect()
 }
 
 fn compute_selection(root: &Path, changed: &[String]) -> Selection {
@@ -1328,15 +1322,18 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
             map_path(root, p, &mut sel);
         }
     }
-    // The per-PR budget partition: daily/system-tier gates leave the run list
-    // and are reported as deferred — the mapping arms stay honest about what a
-    // diff AFFECTS, the partition decides what runs per-PR.
-    let (run, defer): (Vec<String>, Vec<String>) =
-        sel.targets.drain(..).partition(|t| !daily_tier_only(t));
+    // The per-PR budget partition: daily/system-tier gates (and the
+    // check-system tier itself) leave the run list and are reported as
+    // deferred — the mapping arms stay honest about what a diff AFFECTS, the
+    // partition decides what runs per-PR. targets is already deduped, so the
+    // partition halves are too.
+    let daily = daily_tier_only_names();
+    let (run, defer): (Vec<String>, Vec<String>) = sel
+        .targets
+        .drain(..)
+        .partition(|t| t != "check-system" && !daily.contains(t));
     sel.targets = run;
-    for t in defer {
-        push_unique(&mut sel.deferred, &t);
-    }
+    sel.deferred = defer;
     sel
 }
 
@@ -2055,7 +2052,7 @@ mod tests {
                 "Selected checks:",
                 "  bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
                 "  cargo test --manifest-path builder/Cargo.toml",
-                "  td-builder check check-pr cargo-test",
+                "  td-builder check check-pr",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",

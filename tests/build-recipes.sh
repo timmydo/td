@@ -30,11 +30,7 @@ nspecs=$(set -- $TD_BUILD_SPECS; echo $#)
 
 echo ">> build-recipes: assemble + submit $nspecs recipes to the shared build daemon (global budget), then reproducibility-check ($TD_BUILD_SPECS)"
 : "${TD_DAEMON_SOCKET:?the shared build daemon is not running — the \`td-builder check\` host prelude starts it (ensure_build_daemon)}"
-if [ "$nspecs" -gt 0 ]; then
-  for s in $TD_BUILD_SPECS; do grep ' /gnu/store/' "tests/$s-no-guix.lock"; done \
-    | sed 's/^[^ ]* //' | sort -u | xargs $TD_GUIX build >/dev/null \
-    || { echo "ERROR: could not realize the build seed (regenerate locks on a channel bump)" >&2; exit 1; }
-fi
+# The PRELUDE — always runs, spec-independent: build gates fail-fast without it.
 grep ' /gnu/store/' tests/td-builder-rust.lock | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null \
   || { echo "ERROR: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }
 export CACHE="$PWD/.td-build-cache/pkg" TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; mkdir -p "$CACHE"
@@ -44,7 +40,11 @@ TD_GUIX="$TD_GUIX" sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eva
   || { echo "ERROR: could not build td's Rust recipe evaluator (recipes/ crate)" >&2; exit 1; }
 load_recipe_eval
 echo ">> recipes EVALUATE with td's OWN Rust td-recipe-eval ($TD_RECIPE_EVAL) — boa retired (rust-recipe-surface)"
+# The spec-dependent tail — ONE guard so prelude-only mode can't half-run it.
 if [ "$nspecs" -gt 0 ]; then
+  for s in $TD_BUILD_SPECS; do grep ' /gnu/store/' "tests/$s-no-guix.lock"; done \
+    | sed 's/^[^ ]* //' | sort -u | xargs $TD_GUIX build >/dev/null \
+    || { echo "ERROR: could not realize the build seed (regenerate locks on a channel bump)" >&2; exit 1; }
   echo ">> submitting $nspecs recipes to the shared build daemon ($TD_DAEMON_SOCKET); the daemon's global budget caps concurrency ..."
   printf '%s\n' $TD_BUILD_SPECS | xargs -P "$nspecs" -n1 sh tests/build-pkg.sh
   echo "PASS: build-recipes — all $nspecs package recipes realized + reproducible via the shared build daemon into .td-build-cache/pkg; the build gates now cache-hit + memo-skip the double-build and only assert behavior/oracle."

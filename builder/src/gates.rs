@@ -70,6 +70,20 @@ pub enum Pool {
     Parked,
 }
 
+/// Does this pool run somewhere in the per-PR tiers (check-pr / check-fast /
+/// check-engine)? THE single source the affected-checks partition derives
+/// "deferred to the daily backstop" from — extend HERE when adding a pool,
+/// never in a per-site match list (a missed site silently mis-partitions).
+pub(crate) fn pool_runs_per_pr(p: Pool) -> bool {
+    matches!(p, Pool::Cheap | Pool::Heavy | Pool::Fast | Pool::Engine)
+}
+
+/// Does this pool run in the plain full `check`? (The coverage question
+/// affected-checks' default_check_covers_target asks.)
+pub(crate) fn pool_in_full_check(p: Pool) -> bool {
+    matches!(p, Pool::Cheap | Pool::Heavy | Pool::Daily)
+}
+
 /// The gate-state default, FLIPPED per the human direction of 2026-07-03 (#317):
 /// gates share warm, machine-wide builder state by default; a gate declares a
 /// private (cold) store only when clean-slate behavior IS the feature under test.
@@ -400,24 +414,20 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
     let add_pool = |sel: &mut HashSet<usize>, p: Pool| sel.extend(set.members(p));
     for goal in goals {
         match goal.as_str() {
-            "check" => {
-                add_pool(&mut sel, Pool::Cheap);
-                if let Some(i) = set.index.get(BUILD_RECIPES) {
-                    sel.insert(*i);
-                }
-                add_pool(&mut sel, Pool::Heavy);
-                add_pool(&mut sel, Pool::Daily);
-            }
-            // The bounded per-PR tier (~10 min, human 2026-07-04): everything in
-            // the full check EXCEPT the daily-only pool. The daily backstop
+            // check-pr is the bounded per-PR tier (~10 min, human 2026-07-04):
+            // the full check MINUS the daily-only pool — one arm so the subset
+            // relation holds by construction. The daily backstop
             // (ci/daily-full-suite.sh) runs the full `check`, so the daily pool
             // keeps its coverage nightly.
-            "check-pr" => {
+            "check" | "check-pr" => {
                 add_pool(&mut sel, Pool::Cheap);
                 if let Some(i) = set.index.get(BUILD_RECIPES) {
                     sel.insert(*i);
                 }
                 add_pool(&mut sel, Pool::Heavy);
+                if goal == "check" {
+                    add_pool(&mut sel, Pool::Daily);
+                }
             }
             "check-fast" => {
                 add_pool(&mut sel, Pool::Cheap);
@@ -466,13 +476,15 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
 }
 
 /// Scope the synthetic build-recipes node's TD_BUILD_SPECS to the specs the
-/// SELECTED gates declare (registration order, deduped — so selecting every
-/// spec-carrying gate reproduces the static all-specs list exactly). The full
-/// `check` goal and an explicit `build-recipes` goal keep the whole pool. The
-/// body always runs even with ZERO scoped specs: build-recipes is also the
-/// build-gate PRELUDE (the stage0-seed realize + the td-recipe-eval build that
-/// `load_recipe_eval` fails-fast without) — only the per-spec pre-build loop
-/// scopes down (tests/build-recipes.sh tolerates an empty list).
+/// SELECTED gates declare, by FILTERING the static `build_specs` accumulation —
+/// order, duplicates, everything about the surviving entries is identical to
+/// the full list by construction (selecting every spec-carrying gate
+/// reproduces it exactly). The full `check` goal and an explicit
+/// `build-recipes` goal keep the whole pool. The body always runs even with
+/// ZERO scoped specs: build-recipes is also the build-gate PRELUDE (the
+/// stage0-seed realize + the td-recipe-eval build that `load_recipe_eval`
+/// fails-fast without) — only the per-spec pre-build scopes down
+/// (tests/build-recipes.sh tolerates an empty list).
 fn scope_build_recipes(set: &mut GateSet, selected: &HashSet<usize>, goals: &[String]) {
     if goals.iter().any(|g| g == "check" || g == BUILD_RECIPES) {
         return;
@@ -481,20 +493,25 @@ fn scope_build_recipes(set: &mut GateSet, selected: &HashSet<usize>, goals: &[St
     if !selected.contains(&bi) {
         return;
     }
-    let mut specs: Vec<String> = Vec::new();
-    for (i, g) in set.gates.iter().enumerate() {
-        if selected.contains(&i) {
-            for s in &g.specs {
-                if !specs.contains(s) {
-                    specs.push(s.clone());
-                }
+    let specs: String = {
+        let mut wanted: HashSet<&str> = HashSet::new();
+        for (i, g) in set.gates.iter().enumerate() {
+            if selected.contains(&i) {
+                wanted.extend(g.specs.iter().map(String::as_str));
             }
         }
-    }
+        let kept: Vec<&str> = set
+            .build_specs
+            .iter()
+            .map(String::as_str)
+            .filter(|s| wanted.contains(s))
+            .collect();
+        kept.join(" ")
+    };
     let Some(br) = set.gates.get_mut(bi) else { return };
     for (k, v) in br.extra_env.iter_mut() {
         if k == "TD_BUILD_SPECS" {
-            *v = specs.join(" ");
+            *v = specs.clone();
         }
     }
 }
@@ -1478,6 +1495,14 @@ fn run_timing_report(root: &Path, heavy_gates: &[String]) {
     crate::gate_timing::report(root, heavy_gates);
 }
 
+/// The long-running gates the timing table classifies as heavy (heavy + daily)
+/// — ONE list so the report goal and the green-run epilogue cannot drift.
+fn long_gate_names(set: &GateSet) -> Vec<String> {
+    let mut v = set.names(Pool::Heavy);
+    v.extend(set.names(Pool::Daily));
+    v
+}
+
 pub fn cli(args: &[String]) -> ExitCode {
     let mut jobs: usize = match std::env::var("TD_CHECK_JOBS") {
         Ok(v) => v.trim().parse().unwrap_or_else(|_| nproc()),
@@ -1549,9 +1574,7 @@ pub fn cli(args: &[String]) -> ExitCode {
             eprintln!("gate-run: gate-timing-report does not combine with other goals");
             return ExitCode::from(2);
         }
-        let mut long = set.names(Pool::Heavy);
-        long.extend(set.names(Pool::Daily));
-        run_timing_report(&root, &long);
+        run_timing_report(&root, &long_gate_names(&set));
         return ExitCode::SUCCESS;
     }
 
@@ -1660,9 +1683,7 @@ pub fn cli(args: &[String]) -> ExitCode {
             // Parity with the old check/check-system targets: print the per-gate
             // timing table on a green full run (best-effort).
             if goals.iter().any(|g| g == "check") {
-                let mut long = set.names(Pool::Heavy);
-                long.extend(set.names(Pool::Daily));
-                run_timing_report(&root, &long);
+                run_timing_report(&root, &long_gate_names(&set));
             } else if goals.iter().any(|g| g == "check-pr") {
                 run_timing_report(&root, &set.names(Pool::Heavy));
             } else if goals.iter().any(|g| g == "check-system") {
