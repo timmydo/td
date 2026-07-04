@@ -51,9 +51,17 @@ guix's gcc-toolchain. The reference gates are
 `bootstrap-sed-corpus-store-native`: source the shared chain
 (`bootstrap_modern_toolchain`), substitute the toolchain into the
 recipe's `<stem>-no-guix.lock`, then `build-recipe` — the engine wires
-the declared `(inputs …)`. (Building the toolchain/harness ITSELF is a
-different job — the seed-bootstrap ladder — and is necessarily shell;
-that is not a package build.)
+the declared `(inputs …)`. This holds for the *whole* graph: even the
+seed→toolchain ladder (`mes` → `tcc` → `gcc` → `glibc` → `binutils`) is
+a recipe graph in principle — each rung built from the prior as its
+builder, à la guix's `commencement.scm` — with only the ~229-byte
+`hex0`/`kaem` seed `exec` as the irreducibly imperative floor. td's
+per-rung bootstrap shell (`bootstrap-chain.sh`'s `build_*` fns, the
+`bootstrap-x86_64-*` gates) is expedient port debt to migrate onto
+recipes (it needs staged builders — each rung declaring the prior as
+its `native-inputs`, an extension of `build-plan --auto`'s existing
+td-built-dep chaining) — #353 axis 2. Do not treat the current
+bootstrap shell as the pattern to copy.
 
 ## Prime directives (never violate)
 
