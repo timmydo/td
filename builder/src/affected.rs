@@ -380,6 +380,31 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // Tombstones for the shell the native store bodies replaced (#318 axis 3):
+    // the DELETING diff still routes to the gates that absorbed the logic
+    // (a deleted path has no file to introspect, so map it explicitly).
+    if p == "tests/store-subject.sh" {
+        for g in [
+            "store-register",
+            "store-gc",
+            "store-verify",
+            "store-gc-sweep",
+            "store-add-referenced",
+            "store-backend",
+        ] {
+            sel.add_target(g);
+        }
+        return;
+    }
+    if p == "tests/store-ns.sh" {
+        sel.add_target("store-ns");
+        return;
+    }
+    if p == "tests/store-relocate.sh" {
+        sel.add_target("store-relocate");
+        return;
+    }
+
     // Native (typed-Rust) gate BODIES (#318 axis 3): a body change must run the
     // native gates it implements (the former tests/store-*.sh / gate script
     // mapping), plus the engine smoke for the shared helpers.
