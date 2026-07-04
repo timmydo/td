@@ -157,11 +157,19 @@ while IFS= read -r f; do
 done < "$work/scope"
 occ() { grep -oE "$1" "$work/code" 2>/dev/null | grep -c . || true; }
 census() {
+  # realize: plain `guix build <paths>` lines (seed realizes + build oracles) — the set
+  # #311 retires site-by-site via td-subst (tools/resolve-seed.sh). Counted per LINE,
+  # minus the --check oracle and the packager `-e (@ (system …))` form counted above.
+  # Coarse like the rest of the census (a fail-message quoting `guix build` counts);
+  # informational only, so the trend is what matters.
+  sr_n=$(grep -E "(guix|GUIX)[\"')}]* build" "$work/code" 2>/dev/null \
+         | grep -v -- '--check' | grep -v '(@ (system' | grep -c . || true)
   echo ">> guix-surface census (informational; only the packager set is ratcheted):"
   echo "   packager  guix build -e (system M) <package> : $cur_n   <-- RATCHETED (move-off-Guile §5)"
   echo "   oracle    guix build --check                 : $(occ '(guix|GUIX\)|TD_GUIX) build --check')   (kept: the repro oracle, retired with guix)"
   echo "   lowerer   guix repl / guix system            : $(occ '(guix|GUIX\)|TD_GUIX) (repl|system)')   (Guile config/lowering, retired last)"
   echo "   gc        guix gc                            : $(occ '(guix|GUIX\)|TD_GUIX) gc')"
+  echo "   realize   guix build <pinned store paths>    : $sr_n   (seed realizes, retiring via td-subst — re #311)"
 }
 
 # --- WRITE / COMPARE ----------------------------------------------------------

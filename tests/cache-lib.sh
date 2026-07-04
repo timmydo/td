@@ -35,30 +35,21 @@ load_stage0() {
   test -x "$TB" || { echo "FAIL: stage0 td-builder not executable at $TB" >&2; return 1; }
 }
 
-# provision_stage0 — the GUIX-HAVING host prelude for the loop-container provider
-# (check.sh + tools/check-rung.sh; workstream E #294): ensure the pinned stage0
-# toolchain seed (tests/td-builder-rust.lock) is PRESENT — realizing it with the
-# host guix ONLY when a path is missing (host-side warming, like every other host
-# warm; the common all-present path never spawns a guix process) — then place/load
-# the stage0 via load_stage0. Guix-free consumers (the check-harness tier, the
-# in-sandbox gates) call load_stage0 directly: seed realization is the guix-having
-# caller's half (see the stage0-builder.sh header). Fails closed on a lock that
-# yields no seed paths — otherwise provision-rust.sh would silently fall through
-# to its rustup/system-cc path on a guix host (a provenance switch, not a warm).
+# provision_stage0 — the HOST prelude for the loop-container provider (td-builder
+# check + tools/check-rung.sh; workstream E #294): ensure the pinned stage0
+# toolchain seed (tests/td-builder-rust.lock) is PRESENT — resolving a missing
+# path through td's OWN signed substitute store (tools/resolve-seed.sh; #311 — no
+# guix process, FAIL-CLOSED with no guix fallback; the common all-present path
+# fetches nothing) — then place/load the stage0 via load_stage0. Guix-free
+# consumers (the check-harness tier, the in-sandbox gates) call load_stage0
+# directly: seed realization is the host caller's half (see the stage0-builder.sh
+# header). resolve-seed fails closed on a lock that yields no seed paths —
+# otherwise provision-rust.sh would silently fall through to its rustup/system-cc
+# path on a warm host (a provenance switch, not a warm).
 provision_stage0() {
   _s0lock="${TD_LOCK:-tests/td-builder-rust.lock}"
-  _s0paths=`sed -n 's/^[^ ]* \(\/gnu\/store\/[^ ]*\)$/\1/p' "$_s0lock" 2>/dev/null` || _s0paths=""
-  if [ -z "$_s0paths" ]; then
-    echo "FAIL: no /gnu/store seed paths in $_s0lock (missing/malformed lock — regenerate it on a channel bump)" >&2
-    return 1
-  fi
-  _s0need=0
-  for _p in $_s0paths; do [ -e "$_p" ] || { _s0need=1; break; }; done
-  if [ "$_s0need" = 1 ]; then
-    # shellcheck disable=SC2086 -- $_s0paths is a whitespace-separated store-path list on purpose
-    ${TD_GUIX:-guix} build $_s0paths >/dev/null \
-      || { echo "FAIL: could not realize the stage0 toolchain seed from $_s0lock (warm this host's store, or regenerate the lock on a channel bump)" >&2; return 1; }
-  fi
+  sh tools/resolve-seed.sh "$_s0lock" \
+    || { echo "FAIL: could not resolve the stage0 toolchain seed from $_s0lock (tools/resolve-seed.sh — warm this host's store out-of-band or publish the seed substitutes; the loop's guix-build seed realize is retired, #311)" >&2; return 1; }
   load_stage0
 }
 

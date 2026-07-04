@@ -182,6 +182,20 @@ if [ $rc -eq 0 ]; then
   else
     echo ">> publish-x86_64-native-closure: WARN — td-subst sign failed; not published"
   fi
+  # seed substitutes (#311): publish the pinned stage0 SEED closure (tests/
+  # td-builder-rust.lock) so the loop's seed resolver (tools/resolve-seed.sh, called by
+  # the provision_stage0 prelude) can realize a MISSING seed with NO guix process —
+  # fail-closed, no guix fallback. publish-seed-subst.sh captures the closure by
+  # content-scanning the live store bytes (zero guix-db reads) and is idempotent: it
+  # re-exports only when a lock root is unpublished (i.e. after a channel bump).
+  if [ -z "${TD_SUBST_PRIVKEY:-}" ] || [ -z "$_sb" ] || [ ! -x "$_sb" ]; then
+    echo ">> publish-seed-subst: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set"
+  elif TD_BUILDER="$TDB" TD_SUBST_BIN="$_sb" TD_SUBST_PRIVKEY="$TD_SUBST_PRIVKEY" \
+       sh tools/publish-seed-subst.sh tests/td-builder-rust.lock "$_store"; then
+    :
+  else
+    echo ">> publish-seed-subst: WARN — seed publish failed; not published"
+  fi
 else
   echo ">> daily backstop: RED (heavy_rc=$heavy_rc system_rc=$system_rc harness_rc=$harness_rc) — agent: triage \`git log <last-green>..$main\`, reproduce the failing gate, open a FIX-OR-REVERT PR (no auto-merge). Suspect-revert helper: ci/revert-suspect.sh --ref <sha> --open-pr"
 fi
