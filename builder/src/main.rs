@@ -4425,9 +4425,22 @@ fn main() -> ExitCode {
                 copy_canonical(Path::new(tree), &disk)?;
                 // Scan the restored tree for references AGAINST the seed store DIRECTORY's
                 // entries (the pinned toolchain store) — the builder's actual store deps,
-                // with NO read of guix's private db (#313: a guix-less host cold-starts;
-                // scan_candidate_index skips an absent dir, leaving no candidates). The
-                // path itself is a candidate so a self-reference is detected. Extra
+                // with NO read of guix's private db (#313: a guix-less host cold-starts).
+                // An ABSENT seed dir is legitimate (a guix-less host has no /gnu/store, so
+                // the stage0 embeds no store refs and the placement records an empty ref
+                // set). But a PRESENT-but-unreadable seed dir (a typo'd path, a regular
+                // file, an EACCES mount) must FAIL LOUDLY, not be silently treated as
+                // empty — a refless placement would poison the builder's closure and
+                // surface only as an opaque exec/link failure at build time. So
+                // distinguish NotFound (benign, no candidates) from any other read_dir
+                // error here, restoring the loud failure the old sqlite seed read gave;
+                // scan_candidate_index itself swallows both as "contributes nothing".
+                match std::fs::read_dir(seed_store) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("seed store {seed_store}: {e}")),
+                }
+                // The path itself is a candidate so a self-reference is detected. Extra
                 // never-matching candidates cannot add references (scan.rs candidate note).
                 let (mut candidates, _on_disk) =
                     scan_candidate_index(std::slice::from_ref(seed_store), seed_store)?;
