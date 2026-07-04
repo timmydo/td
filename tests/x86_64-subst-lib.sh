@@ -67,7 +67,11 @@ x86_64_resolve_closure() {
   _store=$1; _db=$2
   [ -n "${TD_SUBST_BIN:-}" ] && [ -n "${TD_SUBST_STORE:-}" ] || return 1
   _shdir=`dirname "$(command -v sh)"`
-  _cu=`grep -- '-coreutils-' tests/td-subst.lock | sed 's/^[^ ]* //' | head -1`
+  # coreutils is a DECLARED gate input (#353): every gate calling this fn declares it.
+  _cu=${TD_GATE_INPUT_COREUTILS:-}
+  # exit, not return: a return-1 here would read as a substitute MISS and silently
+  # take the ~90-min from-seed path — a forgotten declaration must red the gate.
+  test -n "$_cu" || { echo "TD_GATE_INPUT_COREUTILS unset — the calling gate must declare the coreutils input (#353)" >&2; exit 1; }
   _dest=`mktemp -d`
   for nm in $X86_CLOSURE_NAMES; do
     p=`env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$TD_SUBST_BIN" \
@@ -135,7 +139,11 @@ x86_64_resolve_closure_native() {
   _store=$1; _db=$2
   [ -n "${TD_SUBST_BIN:-}" ] && [ -n "${TD_SUBST_STORE:-}" ] || return 1
   _shdir=`dirname "$(command -v sh)"`
-  _cu=`grep -- '-coreutils-' tests/td-subst.lock | sed 's/^[^ ]* //' | head -1`
+  # coreutils is a DECLARED gate input (#353): every gate calling this fn declares it.
+  _cu=${TD_GATE_INPUT_COREUTILS:-}
+  # exit, not return: a return-1 here would read as a substitute MISS and silently
+  # take the ~90-min from-seed path — a forgotten declaration must red the gate.
+  test -n "$_cu" || { echo "TD_GATE_INPUT_COREUTILS unset — the calling gate must declare the coreutils input (#353)" >&2; exit 1; }
   _dest=`mktemp -d`
   for nm in $X86_NATIVE_CLOSURE_NAMES; do
     p=`env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$TD_SUBST_BIN" \
@@ -257,7 +265,11 @@ x86_64_resolve_closure_rust() {
   _store=$1; _db=$2
   [ -n "${TD_SUBST_BIN:-}" ] && [ -n "${TD_SUBST_STORE:-}" ] || return 1
   _shdir=`dirname "$(command -v sh)"`
-  _cu=`grep -- '-coreutils-' tests/td-subst.lock | sed 's/^[^ ]* //' | head -1`
+  # coreutils is a DECLARED gate input (#353): every gate calling this fn declares it.
+  _cu=${TD_GATE_INPUT_COREUTILS:-}
+  # exit, not return: a return-1 here would read as a substitute MISS and silently
+  # take the ~90-min from-seed path — a forgotten declaration must red the gate.
+  test -n "$_cu" || { echo "TD_GATE_INPUT_COREUTILS unset — the calling gate must declare the coreutils input (#353)" >&2; exit 1; }
   _dest=`mktemp -d`
   p=`env -i PATH="$_cu/bin:$_shdir" TD_BUILDER="$TB" TD_SUBST_BIN="$TD_SUBST_BIN" \
       TD_SUBST_STORE="$TD_SUBST_STORE" TD_SUBST_PUBKEY="${TD_SUBST_PUBKEY:-tests/td-subst.pub}" \

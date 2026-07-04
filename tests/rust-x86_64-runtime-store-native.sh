@@ -259,9 +259,10 @@ ls "$phys"/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib >/dev/null 2>&
 echo "   [structural] the interned lib/ holds the complete rustc/cargo runtime closure + rustlib sysroot"
 
 # --- a static bash (td's own store-closure reader, no guix process) for the own-root shell ---------
-bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
-test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in hello's closure"
+# the static-bash fixture is a DECLARED gate input (#353): the runner resolved it.
+bs=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 
 # --- assemble-only library mode (#258 rust userland cutover) -----------------------------------------

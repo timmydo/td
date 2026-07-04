@@ -16,7 +16,7 @@
 //! binutils/gcc BUILD is the structured Rust recipe `td-builder toolchain-recipe x86_64-native`
 //! (builder/src/toolchain_x86_64.rs) — the former build_{binutils,gcc}_x86_64_native shell drivers.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -25,7 +25,25 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): resolved by the runner — the shared
+        // x86_64 resolve/verify fns consume TD_GATE_INPUT_{COREUTILS,BASH_STATIC}.
+        inputs: &[
+            // coreutils: the x86_64_obtain_* wrappers call the subst-lib
+            // resolve fns, which consume TD_GATE_INPUT_COREUTILS (#353 review
+            // find — the wrapper call path was missed in the first cut).
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
+            },
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/hello-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
