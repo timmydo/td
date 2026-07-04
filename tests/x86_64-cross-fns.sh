@@ -571,15 +571,20 @@ x86_64_build_native_recipe() {
   export XNBU XNGCC
 }
 
-# verify_x86_64_native_ownroot <cpath> <scratch> — the DURABLE own-root verify for rung X2. Interns the
-# NATIVE x86_64 gcc + NATIVE x86_64 binutils + the x86_64 glibc 2.41 at /td/store, then RUNS the native
-# gcc IN the store-ns own-root: it COMPILES a C and a C++ program from source and the results run → 42,
-# /gnu/store ABSENT. The compiler doing the work is itself an ELF 64-bit x86_64 binary in /td/store.
-# Requires the run_x86_64_cross / closure exports XGLIBC, plus $XNGCC (native gcc tree) and $XNBU
-# (native binutils tree) from the caller. Legs: [native-arch] [no-guix] [content-addr] [closure-complete]
-# [self-host-compile] [structural].
+# verify_x86_64_native_ownroot <cpath> <scratch> [expected-gcc-name] — the DURABLE own-root verify for
+# rungs X2 AND X3. Interns the NATIVE x86_64 gcc + NATIVE x86_64 binutils + the x86_64 glibc 2.41 at
+# /td/store, then RUNS the native gcc IN the store-ns own-root: it COMPILES a C and a C++ program from
+# source and the results run → 42, /gnu/store ABSENT. The compiler doing the work is itself an ELF
+# 64-bit x86_64 binary in /td/store. Requires the run_x86_64_cross / closure exports XGLIBC, plus
+# $XNGCC (gcc tree) and $XNBU (binutils tree) from the caller. The X3 gate reuses this verify by
+# pointing XNGCC/XNBU at the SELF-rebuilt trees and passing gcc-14.3.0-x86_64-self as $3 — the
+# [content-addr] leg asserts the interned name matches, so the two rungs' artifacts can't be confused.
+# ($3 is a POSITIONAL arg, not an env knob: an ambient variable must not be able to repoint a gate's
+# name assert.) Legs: [native-arch] [no-guix] [content-addr] [closure-complete] [self-host-compile]
+# [structural].
 verify_x86_64_native_ownroot() {
-  cpath=$1; snwork=$2; store="$snwork/td-store-native"; sndb="$snwork/store-native.db"; mkdir -p "$store"
+  cpath=$1; snwork=$2; _xvname="${3:-gcc-14.3.0-x86_64-native}"
+  store="$snwork/td-store-native"; sndb="$snwork/store-native.db"; mkdir -p "$store"
   test -n "${XNGCC:-}" -a -d "${XNGCC:-/nonexistent}" || { echo "native gcc tree (XNGCC) unset" >&2; return 1; }
   test -n "${XNBU:-}" -a -d "${XNBU:-/nonexistent}" || { echo "native binutils tree (XNBU) unset" >&2; return 1; }
   test -n "${XGLIBC:-}" -a -d "${XGLIBC:-/nonexistent}" || { echo "x86_64 glibc tree (XGLIBC) unset" >&2; return 1; }
@@ -600,7 +605,7 @@ verify_x86_64_native_ownroot() {
   nbrel=`basename "$NBP"`
   NGP=`"$TB" store-add-recursive "\`basename "$XNGCC"\`" "$XNGCC" "$store" "$sndb"` || { echo "store-add native gcc failed" >&2; return 1; }
   GLP=`"$TB" store-add-recursive glibc-2.41-x86_64 "$XGLIBC" "$store" "$sndb"` || { echo "store-add x86_64 glibc failed" >&2; return 1; }
-  case "$NGP" in /td/store/*-gcc-14.3.0-x86_64-native) ;; *) echo "native gcc not content-addressed: $NGP" >&2; return 1 ;; esac
+  case "$NGP" in /td/store/*-"$_xvname") ;; *) echo "gcc not content-addressed as $_xvname: $NGP" >&2; return 1 ;; esac
   echo "   [content-addr] interned the native gcc ($NGP), native binutils, and the x86_64 glibc in /td/store"
   ngrel=`basename "$NGP"`; glrel=`basename "$GLP"`
   chmod -R u+w "$store"
@@ -651,4 +656,152 @@ PROBE
   echo "   [self-host-compile] the NATIVE x86_64 gcc RAN in the own-root and compiled a DYNAMIC ELF64 x86-64 C AND C++ program (interp = the /td/store x86_64 ld) from source → both run → 42"
   echo "$out" | grep -q '^GNU-ABSENT$' || { echo "/gnu/store is PRESENT in the own-root" >&2; return 1; }
   echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT"
+}
+
+# ===================================================================================================
+# SHARED PREREQUISITE OBTAINERS — the fetch-or-build ladder gates 422 (native) and 426 (self) both
+# need, extracted from gate 422's driver so the X3 gate does not duplicate it. Behavior-preserving:
+# the bodies are gate 422's former inline blocks, verbatim.
+# ---------------------------------------------------------------------------------------------------
+
+# x86_64_obtain_cross_toolchain <cpath> <store> <db> — obtain the CROSS toolchain {XBU, XGCC2,
+# XGLIBC}: FETCH the lock-keyed signed closure if check host-prep exposed a substitute store, else
+# BUILD it from the 229-byte seed (directive 1; the daily full suite is the sole from-seed
+# authoritative builder). Exports XBU/XGCC2/XGLIBC (+ XLIBGCCDIR/XSTDCXXDIR, and X86_WORK on the
+# build path). Requires the 414 driver lib sourced (the chain build_* fns + the pinned tarball
+# globals + fail()).
+x86_64_obtain_cross_toolchain() {
+  _occp=$1; _occstore=$2; _occdb=$3
+  if x86_64_resolve_closure "$_occstore" "$_occdb"; then
+    echo ">> [subst/SKIP] fetched the x86_64 cross toolchain closure {binutils,gcc,glibc} — SKIPPED the ~98-min from-seed build"
+  else
+    echo ">> [subst/MISS] no exposed substitute store — building the cross toolchain from the 229-byte seed (directive 1)"
+    tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
+    mesp=`build_mes_prefix "$tc" "$_occp"` || fail "Mes (MesCC self-host) did not build/install"
+    TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$_occp" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
+    MK=`mktemp -d`/makebuild; build_make "$tc" "$_occp" "$mesp" "$TCCD" "$MK" || fail "tcc did not build GNU Make 3.80"
+    PD=`mktemp -d`/patchbuild; build_patch "$_occp" "$mesp" "$TCCD" "$MK" "$PD" || fail "the tcc-built make did not build patch"
+    BD=`mktemp -d`/binutilsbuild; build_binutils "$_occp" "$mesp" "$TCCD" "$MK" "$PD" "$BD" || fail "the tcc-built make did not build binutils-mesboot0"
+    GD=`mktemp -d`/gccbuild; build_gcc "$_occp" "$mesp" "$TCCD" "$MK" "$PD" "$BD" "$GD" || fail "the toolchain did not build gcc 2.95.3"
+    HD=`mktemp -d`/headers; build_headers "$mesp" "$HD" || fail "could not install the kernel headers"
+    GLD=`mktemp -d`/glibcbuild; build_glibc "$_occp" "$GD" "$BD" "$TCCD" "$MK" "$PD" "$HD" "$GLD" || fail "the seed toolchain did not build glibc 2.2.5"
+    G2=`mktemp -d`/gcc2build; build_gcc_mesboot0 "$_occp" "$GD" "$BD" "$GLD" "$HD" "$MK" "$PD" "$G2" || fail "the toolchain did not rebuild gcc 2.95.3 against glibc"
+    B2=`mktemp -d`/binutils1build; build_binutils_mesboot1 "$_occp" "$G2" "$BD" "$GLD" "$MK" "$PD" "$B2" || fail "gcc-mesboot0 did not rebuild binutils against glibc"
+    MM=`mktemp -d`/makemesbootbuild; build_make_mesboot "$_occp" "$G2" "$BD" "$GLD" "$MK" "$MM" || fail "gcc-mesboot0 did not rebuild GNU Make against glibc"
+    GM1=`mktemp -d`/gccmesboot1build; build_gcc_mesboot1 "$_occp" "$G2" "$B2" "$MM" "$GLD" "$PD" "$GM1" || fail "the toolchain did not build GCC 4.6.4 (c,c++)"
+    BMB=`mktemp -d`/binutilsmesbootbuild; build_binutils_mesboot "$_occp" "$GM1" "$B2" "$GLD" "$MM" "$PD" "$BMB" || fail "gcc-mesboot1 did not rebuild binutils"
+    GAWKMB=`mktemp -d`/gawkmesbootbuild; build_gawk_mesboot "$_occp" "$GM1" "$B2" "$GLD" "$MM" "$GAWKMB" || fail "gcc-mesboot1 did not build GNU awk"
+    GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$_occp" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GOUT" || fail "the toolchain did not build glibc 2.16.0"
+    GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$_occp" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
+    GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$_occp" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
+    GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$_occp" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
+    BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$_occp" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
+    GCC14="$GCC14B/stage/td/store/gcc-14.3.0"; GST="$GOUT/out"
+    echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils 2.44"
+    run_x86_64_cross "$_occp" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
+    # run_x86_64_cross exports XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU X86_WORK (physical trees)
+  fi
+  test -n "${XGCC2:-}" -a -n "${XGLIBC:-}" -a -n "${XBU:-}" || fail "cross toolchain vars unset after fetch/build"
+}
+
+# x86_64_obtain_native_toolchain <cpath> <store> <db> <export-dir> — obtain the NATIVE x86_64
+# toolchain {XNBU, XNGCC} (rung X2's artifact): FETCH it at its lock-keyed paths
+# (tests/td-toolchain-x86_64-native.lock), else BUILD it from the cross toolchain (XGCC2/XGLIBC/XBU
+# — call x86_64_obtain_cross_toolchain first) via the x86_64-native toolchain-recipe, intern it at
+# the lock paths and subst-export it to <export-dir> for the daily to sign+publish (from-BUILD
+# fallback — directive 1; the daily is the sole authoritative from-cross builder+publisher). Sets
+# the GLOBAL nrout (build scratch) so the caller's trap can clean it. Exports XNBU/XNGCC.
+x86_64_obtain_native_toolchain() {
+  _onp=$1; _onstore=$2; _ondb=$3; _onexp=$4
+  if x86_64_resolve_closure_native "$_onstore" "$_ondb"; then
+    echo ">> [subst/SKIP native] fetched the NATIVE x86_64 toolchain {binutils,gcc} at their lock paths — SKIPPED the ~45-min native build"
+  else
+    echo ">> [subst/MISS native] no exposed native substitute — building the NATIVE x86_64 toolchain from the cross toolchain (directive 1)"
+    echo ">> [N1+N2] NATIVE x86_64 binutils 2.44 + gcc 14.3.0 via the Rust toolchain-recipe (structured port)"
+    nrout=`mktemp -d`/native-out
+    x86_64_build_native_recipe "$_onp" "$XGCC2" "$XGLIBC" "$XBU" "$nrout" || fail "could not build the NATIVE x86_64 toolchain (recipe)"
+    echo ">> [export] intern the built native binutils + gcc at their lock-keyed paths + subst-export"
+    x86_64_build_closure_native "$_onexp" "$_onstore" "$_ondb" \
+      || fail "could not intern + subst-export the native x86_64 toolchain closure"
+  fi
+  test -n "${XNBU:-}" -a -d "${XNBU:-/nonexistent}" -a -n "${XNGCC:-}" -a -d "${XNGCC:-/nonexistent}" \
+    || fail "native toolchain vars unset after fetch/build"
+}
+
+# ===================================================================================================
+# RUNG X3 — SELF-HOSTING (gcc rebuilds gcc). X2 produced a NATIVE x86_64 toolchain, but its BUILDER
+# was the i686 CROSS gcc — the bootstrap step that produced the native compiler was not itself
+# native. X3 closes the loop: the NATIVE /td/store toolchain (XNGCC/XNBU) rebuilds binutils 2.44 +
+# GCC 14.3.0 — the compiler that compiles the compiler is itself an x86_64 binary living in td's own
+# store, the from-source gcc-rebuilds-gcc milestone rung X2 explicitly did not claim. Same version,
+# same configure flags as X2 (one Rust code path builds both flavors), which is what makes the
+# [codegen] agreement leg meaningful. STATIC vs the /td/store x86_64 glibc 2.41, like X2.
+# ---------------------------------------------------------------------------------------------------
+
+# x86_64_build_self_recipe <cpath> <xngcc> <xnbu> <xglibc> <out> — build the SELF-HOSTED x86_64
+# binutils 2.44 + gcc 14.3.0 via the structured Rust recipe `td-builder toolchain-recipe x86_64-self`
+# (builder/src/toolchain_x86_64.rs). The recipe's own [builder-arch] leg asserts the DRIVING gcc is
+# an ELF64 x86_64 binary — handing it the i686 cross gcc reds (verified-red lever). Sets + exports
+# XSBU (self binutils tree) and XSGCC (self gcc staged prefix).
+x86_64_build_self_recipe() {
+  _sp=$1; _sxngcc=$2; _sxnbu=$3; _sxglibc=$4; _sout=$5
+  rm -rf "$_sout"; mkdir -p "$_sout"
+  env TDXS_CPATH="$_sp" TDXS_BUILDER_GCC="$_sxngcc" TDXS_BUILDER_BINUTILS="$_sxnbu" TDXS_GLIBC="$_sxglibc" \
+      TDXS_BINUTILS_TAR="$BU244_TB" TDXS_GCC_TAR="$GCC14_TB" TDXS_GMP_TAR="$GMP63_TB" \
+      TDXS_MPFR_TAR="$MPFR421_TB" TDXS_MPC_TAR="$MPC131_TB" TDXS_KERNEL_HEADERS_TAR="$KH_X86_64_TB" \
+      TDXS_OUT="$_sout" X86_MAKE_J="${X86_MAKE_J:--j4}" \
+      "$TB" toolchain-recipe x86_64-self > "$_sout/recipe.out" 2>&1 \
+    || { echo "x86_64_build_self_recipe: toolchain-recipe x86_64-self failed" >&2; tail -40 "$_sout/recipe.out" >&2; return 1; }
+  sed 's/^/   /' "$_sout/recipe.out"
+  XSBU=`sed -n 's/^SELF_BINUTILS=//p' "$_sout/recipe.out"`
+  XSGCC=`sed -n 's/^SELF_GCC=//p' "$_sout/recipe.out"`
+  test -n "$XSBU" -a -d "$XSBU" || { echo "x86_64_build_self_recipe: recipe returned no self binutils tree" >&2; return 1; }
+  test -n "$XSGCC" -a -d "$XSGCC" || { echo "x86_64_build_self_recipe: recipe returned no self gcc tree" >&2; return 1; }
+  export XSBU XSGCC
+}
+
+# x86_64_self_codegen_agreement <xngcc> <xsgcc> — [codegen] the stage2-vs-stage3 agreement at the
+# assembly level: the INPUT native gcc (built by the cross gcc) and the SELF-rebuilt gcc (built by
+# the native gcc) compile the same fixed C and C++ TU at -O2 -S to BYTE-IDENTICAL assembly. Same
+# gcc version + same configure flags (one Rust code path builds both flavors) → the self-hosted
+# compiler must generate exactly the code its builder does; GCC's own `make bootstrap` asserts the
+# same fixpoint on stage2/stage3 objects. The TUs are include-less ON PURPOSE: -S needs no headers,
+# no as/ld, no libc — the leg isolates CODE GENERATION from environment. Both sides get the SAME
+# pinned -frandom-seed (belt to the TUs' no-file-scope-statics braces: with the seed unset gcc
+# draws /dev/urandom into generated symbol names, and a pinned seed shuts that whole class off
+# structurally instead of relying on the TU text staying nondeterminism-free — same move as the
+# gcc14-repro wrappers above). Compared by sha256 via the chain lib's sha() (diffutils is not
+# guaranteed in the sandbox).
+x86_64_self_codegen_agreement() {
+  _cgn=$1; _cgs=$2
+  _cgw=`mktemp -d`
+  cat > "$_cgw/cg.c" <<'EOF'
+unsigned fib(unsigned n) { unsigned a = 0, b = 1; while (n--) { unsigned t = a + b; a = b; b = t; } return a; }
+int classify(int x) { switch (x & 3) { case 0: return x / 3; case 1: return x * 5; case 2: return x - 7; default: return -x; } }
+int main(void) { return (fib(12) == 144 && classify(9) == 45) ? 42 : 1; }
+EOF
+  cat > "$_cgw/cg.cc" <<'EOF'
+template <typename T> struct Acc { T v; explicit Acc(T s) : v(s) {} Acc &add(T x) { v += x; return *this; } };
+template <typename T> T sq(T x) { return x * x; }
+int main() { Acc<int> a(2); a.add(sq(3)).add(sq(5)); return a.v == 36 ? 42 : 1; }
+EOF
+  for _cgcc in "$_cgn" "$_cgs"; do
+    test -x "$_cgcc/bin/gcc" -a -x "$_cgcc/bin/g++" || { echo "codegen: no gcc/g++ under $_cgcc" >&2; rm -rf "$_cgw"; return 1; }
+  done
+  _cgseed=-frandom-seed=tdselfcodegen
+  ( cd "$_cgw" \
+      && "$_cgn/bin/gcc" -O2 -S $_cgseed -o n-c.s cg.c && "$_cgs/bin/gcc" -O2 -S $_cgseed -o s-c.s cg.c \
+      && "$_cgn/bin/g++" -O2 -S $_cgseed -o n-cpp.s cg.cc && "$_cgs/bin/g++" -O2 -S $_cgseed -o s-cpp.s cg.cc ) \
+    || { echo "codegen: -O2 -S compile failed" >&2; rm -rf "$_cgw"; return 1; }
+  for _cgl in c cpp; do
+    _cghn=`sha "$_cgw/n-$_cgl.s"`
+    _cghs=`sha "$_cgw/s-$_cgl.s"`
+    if [ "$_cghn" != "$_cghs" ]; then
+      echo "codegen: $_cgl assembly DIFFERS between the native gcc ($_cghn) and the self-rebuilt gcc ($_cghs)" >&2
+      cmp "$_cgw/n-$_cgl.s" "$_cgw/s-$_cgl.s" >&2 2>/dev/null || true
+      rm -rf "$_cgw"; return 1
+    fi
+    echo "   [codegen] $_cgl: the native gcc and the SELF-rebuilt gcc emit byte-identical -O2 -S assembly (sha256 $_cghn)"
+  done
+  rm -rf "$_cgw"
 }

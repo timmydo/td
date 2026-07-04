@@ -47,57 +47,18 @@ trap 'rm -rf "$snwork" "${nrout:-}"' EXIT INT TERM
 # (as siblings, so the cross gcc tooldir's relative as/ld symlinks resolve).
 cstore="$snwork/closure-store"; cdb="$snwork/closure.db"; mkdir -p "$cstore"
 
-# --- obtain the CROSS toolchain {XBU, XGCC2, XGLIBC}: FETCH the lock-keyed closure, else build from seed
-if x86_64_resolve_closure "$cstore" "$cdb"; then
-  echo ">> [subst/SKIP] fetched the x86_64 cross toolchain closure {binutils,gcc,glibc} — SKIPPED the ~98-min from-seed build"
-else
-  echo ">> [subst/MISS] no exposed substitute store — building the cross toolchain from the 229-byte seed (directive 1)"
-  tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
-  mesp=`build_mes_prefix "$tc" "$cpath"` || fail "Mes (MesCC self-host) did not build/install"
-  TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$cpath" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
-  MK=`mktemp -d`/makebuild; build_make "$tc" "$cpath" "$mesp" "$TCCD" "$MK" || fail "tcc did not build GNU Make 3.80"
-  PD=`mktemp -d`/patchbuild; build_patch "$cpath" "$mesp" "$TCCD" "$MK" "$PD" || fail "the tcc-built make did not build patch"
-  BD=`mktemp -d`/binutilsbuild; build_binutils "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" || fail "the tcc-built make did not build binutils-mesboot0"
-  GD=`mktemp -d`/gccbuild; build_gcc "$cpath" "$mesp" "$TCCD" "$MK" "$PD" "$BD" "$GD" || fail "the toolchain did not build gcc 2.95.3"
-  HD=`mktemp -d`/headers; build_headers "$mesp" "$HD" || fail "could not install the kernel headers"
-  GLD=`mktemp -d`/glibcbuild; build_glibc "$cpath" "$GD" "$BD" "$TCCD" "$MK" "$PD" "$HD" "$GLD" || fail "the seed toolchain did not build glibc 2.2.5"
-  G2=`mktemp -d`/gcc2build; build_gcc_mesboot0 "$cpath" "$GD" "$BD" "$GLD" "$HD" "$MK" "$PD" "$G2" || fail "the toolchain did not rebuild gcc 2.95.3 against glibc"
-  B2=`mktemp -d`/binutils1build; build_binutils_mesboot1 "$cpath" "$G2" "$BD" "$GLD" "$MK" "$PD" "$B2" || fail "gcc-mesboot0 did not rebuild binutils against glibc"
-  MM=`mktemp -d`/makemesbootbuild; build_make_mesboot "$cpath" "$G2" "$BD" "$GLD" "$MK" "$MM" || fail "gcc-mesboot0 did not rebuild GNU Make against glibc"
-  GM1=`mktemp -d`/gccmesboot1build; build_gcc_mesboot1 "$cpath" "$G2" "$B2" "$MM" "$GLD" "$PD" "$GM1" || fail "the toolchain did not build GCC 4.6.4 (c,c++)"
-  BMB=`mktemp -d`/binutilsmesbootbuild; build_binutils_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$PD" "$BMB" || fail "gcc-mesboot1 did not rebuild binutils"
-  GAWKMB=`mktemp -d`/gawkmesbootbuild; build_gawk_mesboot "$cpath" "$GM1" "$B2" "$GLD" "$MM" "$GAWKMB" || fail "gcc-mesboot1 did not build GNU awk"
-  GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GOUT" || fail "the toolchain did not build glibc 2.16.0"
-  GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$cpath" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
-  GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$cpath" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
-  GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$cpath" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
-  BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$cpath" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
-  GCC14="$GCC14B/stage/td/store/gcc-14.3.0"; GST="$GOUT/out"
-  echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils 2.44"
-  run_x86_64_cross "$cpath" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
-  # run_x86_64_cross exports XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU X86_WORK (physical trees)
-fi
-test -n "${XGCC2:-}" -a -n "${XGLIBC:-}" -a -n "${XBU:-}" || fail "cross toolchain vars unset after fetch/build"
+# --- obtain the CROSS toolchain {XBU, XGCC2, XGLIBC}: FETCH the lock-keyed closure, else build from
+# seed (x86_64_obtain_cross_toolchain — the former inline block, now shared with the X3 gate).
+x86_64_obtain_cross_toolchain "$cpath" "$cstore" "$cdb"
 
 # --- RUNG X2: FETCH the NATIVE x86_64 toolchain from the subst store, else BUILD it from the cross
 # toolchain. The native binutils-2.44 + gcc-14.3.0 are input-addressed (tests/td-toolchain-x86_64-native
 # .lock, gate 419 / #264); a HIT skips the ~45-min native build. On MISS td builds them from the cross
 # toolchain and interns them at their lock-keyed paths + subst-exports them for the daily to sign+publish
 # (from-BUILD fallback — directive 1; the daily is the sole authoritative from-cross builder+publisher).
+# (x86_64_obtain_native_toolchain — the former inline block, now shared with the X3 gate.)
 ncstore="$snwork/native-closure-store"; ncdb="$snwork/native-closure.db"; mkdir -p "$ncstore"
-if x86_64_resolve_closure_native "$ncstore" "$ncdb"; then
-  echo ">> [subst/SKIP native] fetched the NATIVE x86_64 toolchain {binutils,gcc} at their lock paths — SKIPPED the ~45-min native build"
-else
-  echo ">> [subst/MISS native] no exposed native substitute — building the NATIVE x86_64 toolchain from the cross toolchain (directive 1)"
-  echo ">> [N1+N2] NATIVE x86_64 binutils 2.44 + gcc 14.3.0 via the Rust toolchain-recipe (structured port)"
-  nrout=`mktemp -d`/native-out
-  x86_64_build_native_recipe "$cpath" "$XGCC2" "$XGLIBC" "$XBU" "$nrout" || fail "could not build the NATIVE x86_64 toolchain (recipe)"
-  echo ">> [export] intern the built native binutils + gcc at their lock-keyed paths + subst-export"
-  x86_64_build_closure_native "`pwd`/.td-build-cache/x86_64-native-closure-export" "$ncstore" "$ncdb" \
-    || fail "could not intern + subst-export the native x86_64 toolchain closure"
-fi
-test -n "${XNBU:-}" -a -d "${XNBU:-/nonexistent}" -a -n "${XNGCC:-}" -a -d "${XNGCC:-/nonexistent}" \
-  || fail "native toolchain vars unset after fetch/build"
+x86_64_obtain_native_toolchain "$cpath" "$ncstore" "$ncdb" "`pwd`/.td-build-cache/x86_64-native-closure-export"
 
 echo ">> [N3] DURABLE own-root verify: the native gcc compiles + runs C/C++ from /td/store → 42"
 export XNBU XNGCC XGLIBC
