@@ -3245,13 +3245,23 @@ fn main() -> ExitCode {
         // Compute the store CLOSURE of ROOT… by CONTENT-SCANNING STORE-DIR (no /var/guix/db,
         // no guix process — scanForReferences == `guix gc -R` for an output root, gate 290),
         // lay each member at its STORE-DIR location into a single layer, and pack the
-        // docker-archive. Usage: oci-image-closure STORE-DIR CONFIG-JSON OUT.tar ROOT...
+        // docker-archive. TD_STORE (env; the same td-owned-store concept realize_drv threads
+        // as its `td_store` PARAMETER — build-plan passes it programmatically; this subcommand
+        // is the only env reader of the name), when set,
+        // names td's OWN store dir holding td-BUILT trees (the shared daemon cache): its
+        // entries join the candidate index CANONICALIZED at STORE-DIR, are content-scanned
+        // where their bytes lie, and are packed at their canonical names — so a td-built
+        // root packs next to the guix-seed deps physically in STORE-DIR.
+        // Usage: oci-image-closure STORE-DIR CONFIG-JSON OUT.tar ROOT...
         Some("oci-image-closure") if args.len() >= 6 => {
             let (store_dir, config_file, out_file) = (&args[2], &args[3], &args[4]);
             let roots = &args[5..];
             let run = || -> Result<usize, String> {
-                let (candidates, on_disk) =
-                    scan_candidate_index(std::slice::from_ref(store_dir), store_dir)?;
+                let mut store_dirs = vec![store_dir.clone()];
+                if let Some(ts) = std::env::var("TD_STORE").ok().filter(|s| !s.is_empty()) {
+                    store_dirs.push(ts);
+                }
+                let (candidates, mut on_disk) = scan_candidate_index(&store_dirs, store_dir)?;
                 let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
                 let empty = std::collections::HashMap::new();
                 let mut closure_set: std::collections::BTreeSet<String> =
@@ -3264,18 +3274,30 @@ fn main() -> ExitCode {
                         std::slice::from_ref(r),
                     )?);
                 }
-                let closure: Vec<String> = closure_set.into_iter().collect();
-                let n = closure.len();
+                // Pack each canonical member from where its bytes really live. A member in
+                // NO scanned dir is a hole in the image — fail loud, never ship a
+                // silently-incomplete closure.
+                let mut members: Vec<(String, String)> = Vec::with_capacity(closure_set.len());
+                for c in closure_set {
+                    let od = on_disk.remove(&c).ok_or_else(|| {
+                        format!(
+                            "closure member {c} is on disk in none of the scanned store dir(s) {}",
+                            store_dirs.join(", ")
+                        )
+                    })?;
+                    members.push((c, od));
+                }
+                let n = members.len();
                 let cfg_text = std::fs::read_to_string(config_file)
                     .map_err(|e| format!("read {config_file}: {e}"))?;
                 let cj = json::parse(&cfg_text).map_err(|e| format!("config JSON: {e}"))?;
                 let cfg = image_config_from_json(&cj);
                 let mut w =
                     std::fs::File::create(out_file).map_err(|e| format!("create {out_file}: {e}"))?;
-                oci::write_docker_archive_from_store_paths(
+                oci::write_docker_archive_from_closure(
                     &mut w,
                     Path::new(store_dir),
-                    &closure,
+                    &members,
                     &cfg,
                 )
                 .map_err(|e| format!("write docker-archive: {e}"))?;

@@ -207,13 +207,18 @@ pub fn build_layer_tar(root: &Path) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// A layer tar laying each store PATH's tree at its location under STORE_DIR (so
-/// `/gnu/store/<base>` -> tar `gnu/store/<base>/…`), preceded by the parent dir entries
-/// (`gnu/`, `gnu/store/`). PATHS is a store closure (sorted + deduped here). This is how
-/// td packs a real package/system closure into an image — no guix process, no temp copy.
-pub fn build_layer_tar_from_store_paths(
+/// A layer tar laying each closure MEMBER — a `(canonical, on_disk)` pair — at its
+/// CANONICAL location under STORE_DIR (so `/gnu/store/<base>` -> tar `gnu/store/<base>/…`)
+/// while reading its BYTES from `on_disk`, preceded by the parent dir entries (`gnu/`,
+/// `gnu/store/`). The split lets td pack a td-BUILT tree whose bytes live in a td-owned
+/// store (the shared daemon cache) at its canonical /gnu/store name next to the guix-seed
+/// deps that really live there — no temp copy, no guix process. MEMBERS is a store
+/// closure (sorted + deduped by canonical here; the SAME canonical with two DIFFERENT
+/// on-disk sources is a caller bug and fails loud — silently packing either copy, or
+/// both at one tar path, would corrupt the layer).
+pub fn build_layer_tar_from_closure(
     store_dir: &Path,
-    paths: &[String],
+    members: &[(String, String)],
 ) -> io::Result<Vec<u8>> {
     let store_rel = store_dir
         .to_str()
@@ -226,17 +231,39 @@ pub fn build_layer_tar_from_store_paths(
         acc = if acc.is_empty() { comp.to_string() } else { format!("{acc}/{comp}") };
         tar_entry(&mut out, &format!("{acc}/"), b'5', 0o755, &[], "");
     }
-    let mut sorted: Vec<&String> = paths.iter().collect();
+    let mut sorted: Vec<&(String, String)> = members.iter().collect();
     sorted.sort();
     sorted.dedup();
-    for p in sorted {
-        let base = Path::new(p).file_name().and_then(|b| b.to_str()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("bad store path: {p}"))
-        })?;
-        append_subtree(&mut out, Path::new(p), &format!("{store_rel}/{base}"))?;
+    for w in sorted.windows(2) {
+        if let [(c1, d1), (c2, d2)] = w {
+            if c1 == c2 && d1 != d2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("closure member {c1} has two on-disk sources: {d1} vs {d2}"),
+                ));
+            }
+        }
+    }
+    for (canonical, on_disk) in sorted {
+        let base =
+            Path::new(canonical).file_name().and_then(|b| b.to_str()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("bad store path: {canonical}"))
+            })?;
+        append_subtree(&mut out, Path::new(on_disk), &format!("{store_rel}/{base}"))?;
     }
     out.resize(out.len() + BLOCK * 2, 0);
     Ok(out)
+}
+
+/// A layer tar laying each store PATH's tree at its location under STORE_DIR — the
+/// bytes are read from the path itself (canonical == on-disk; a live store).
+pub fn build_layer_tar_from_store_paths(
+    store_dir: &Path,
+    paths: &[String],
+) -> io::Result<Vec<u8>> {
+    let members: Vec<(String, String)> =
+        paths.iter().map(|p| (p.clone(), p.clone())).collect();
+    build_layer_tar_from_closure(store_dir, &members)
 }
 
 // ---- JSON (hand-rolled, deterministic key order) --------------------------------
@@ -345,6 +372,20 @@ pub fn write_docker_archive_from_store_paths(
     cfg: &ImageConfig,
 ) -> io::Result<()> {
     assemble_archive(out, &build_layer_tar_from_store_paths(store_dir, paths)?, cfg)
+}
+
+/// Write a docker-archive whose single layer is the closure MEMBERS — `(canonical,
+/// on_disk)` pairs — each laid at its CANONICAL location under STORE_DIR with bytes read
+/// from `on_disk` (`build_layer_tar_from_closure`). This packs a td-BUILT tree living in
+/// a td-owned store (the shared daemon cache) at its canonical /gnu/store name alongside
+/// the guix-seed deps physically there. Deterministic; no guix/Guile.
+pub fn write_docker_archive_from_closure(
+    out: &mut impl Write,
+    store_dir: &Path,
+    members: &[(String, String)],
+    cfg: &ImageConfig,
+) -> io::Result<()> {
+    assemble_archive(out, &build_layer_tar_from_closure(store_dir, members)?, cfg)
 }
 
 #[cfg(test)]
@@ -622,6 +663,66 @@ mod tests {
         // Deterministic + sorted regardless of input order.
         let layer2 = build_layer_tar_from_store_paths(&store, &[paths[1].clone(), paths[0].clone()]).unwrap();
         assert_eq!(layer, layer2, "closure layer must be order-independent + deterministic");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn closure_layer_reads_bytes_from_on_disk_at_canonical_name() {
+        let d = tmpdir("closure-split");
+        // The canonical store holds the seed dep; the td-built tree's bytes live in a
+        // SEPARATE td-owned store dir (the daemon cache). The layer must place BOTH at
+        // their canonical names under the store dir, reading the td tree from on_disk.
+        let store = d.join("gnu/store");
+        fs::create_dir_all(store.join("ccc-dep/lib")).unwrap();
+        fs::write(store.join("ccc-dep/lib/libd.so"), b"D").unwrap();
+        let tdstore = d.join("daemon-store");
+        fs::create_dir_all(tdstore.join("ddd-td-built/bin")).unwrap();
+        fs::write(tdstore.join("ddd-td-built/bin/hello"), b"H").unwrap();
+        let dep = store.join("ccc-dep").to_string_lossy().into_owned();
+        let members = vec![
+            (
+                store.join("ddd-td-built").to_string_lossy().into_owned(),
+                tdstore.join("ddd-td-built").to_string_lossy().into_owned(),
+            ),
+            (dep.clone(), dep),
+        ];
+        let layer = build_layer_tar_from_closure(&store, &members).unwrap();
+        let names: Vec<String> = read_tar(&layer).into_iter().map(|e| e.name).collect();
+        let rel = store.to_string_lossy().trim_start_matches('/').to_string();
+        assert!(
+            names.iter().any(|n| n == &format!("{rel}/ddd-td-built/bin/hello")),
+            "td-built tree not at its canonical store name: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == &format!("{rel}/ccc-dep/lib/libd.so")),
+            "seed dep missing: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("daemon-store")),
+            "on-disk (daemon cache) path leaked into the layer: {names:?}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn closure_layer_rejects_conflicting_on_disk_sources() {
+        let d = tmpdir("closure-conflict");
+        let store = d.join("gnu/store");
+        fs::create_dir_all(store.join("eee-pkg")).unwrap();
+        fs::write(store.join("eee-pkg/f"), b"a").unwrap();
+        let alt = d.join("other-store");
+        fs::create_dir_all(alt.join("eee-pkg")).unwrap();
+        fs::write(alt.join("eee-pkg/f"), b"b").unwrap();
+        let canonical = store.join("eee-pkg").to_string_lossy().into_owned();
+        let members = vec![
+            (canonical.clone(), canonical.clone()),
+            (canonical, alt.join("eee-pkg").to_string_lossy().into_owned()),
+        ];
+        let err = build_layer_tar_from_closure(&store, &members).unwrap_err();
+        assert!(
+            err.to_string().contains("two on-disk sources"),
+            "expected the conflicting-sources error, got: {err}"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
