@@ -2,8 +2,9 @@
 # td-reproducible = td BUILDS the derivation with its OWN Rust builder (a
 # non-perturbed tests/ts/recipe-<spec>.ts; proven by the corpus-no-guix /
 # toolchain-no-guix gates). The
-# byte-identity corpus-* gates were retired with system/td-recipe.scm. pkg-config
-# is authored but not yet td-built (not in corpus-no-guix) and is excluded.
+# byte-identity corpus-* gates were retired with system/td-recipe.scm. The
+# not-yet-td-built exclusion is empty (pkg-config, the last holdout, is now
+# built by the pkg-config-no-guix gate — issue #297).
 # Build closure = the derivation prerequisite graph (lowering only, no build).
 # edge-owned = td builds the recipe AND every declared input edge that is itself an
 # owned recipe is built FROM a td output. `td-builder build-plan --auto` wires those
@@ -11,7 +12,7 @@
 # Build-tool / non-owned inputs are the external seed (exempt).
 # Deterministic given the pinned channel; a pin bump re-baselines this snapshot.
 pin: 520785e315eddbe47199ac557e88e60eca3ae97c
-owned-recipes (19): bash coreutils diffutils file findutils gawk grep hello less libsigsegv libunistring make ncurses patch pcre2 readline sed tar xz
-corpus-union: td-reproducible 19 / 316 (6.01%) [bash coreutils diffutils file findutils gawk grep hello less libsigsegv libunistring make ncurses patch pcre2 readline sed tar xz]
-edge-owned (every owned-input edge built from a td output, proven by mk/gates/365 build-plan): 19 / 19
+owned-recipes (20): bash coreutils diffutils file findutils gawk grep hello less libsigsegv libunistring make ncurses patch pcre2 pkg-config readline sed tar xz
+corpus-union: td-reproducible 20 / 316 (6.33%) [bash coreutils diffutils file findutils gawk grep hello less libsigsegv libunistring make ncurses patch pcre2 pkg-config readline sed tar xz]
+edge-owned (every owned-input edge built from a td output, proven by mk/gates/365 build-plan): 20 / 20
 chained (recipes with owned input edges): bash grep less readline

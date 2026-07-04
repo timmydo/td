@@ -15,10 +15,10 @@
 ;; asserts each resolves to a real corpus package; it does NOT re-lower the TS recipes
 ;; here — that proof is the build-recipe gates' job.)
 ;;
-;; EXCLUDED: pkg-config has an authored recipe but no own-builder build yet — its
-;; bundled glib hits a C-standard wall under td's build env — so it is NOT counted
-;; as td-reproducible (it would overstate independence). Drop the exclusion once
-;; corpus-no-guix covers pkg-config.
+;; not-yet-td-built is now EMPTY. pkg-config was the last excluded holdout — its
+;; bundled glib hit GCC 14's default -std=gnu23 C-standard wall — until issue #297
+;; pinned CFLAGS=-std=gnu17 in the recipe and gave it the pkg-config-no-guix
+;; own-builder gate (builds it + resolves a .pc file). It is now a counted owned recipe.
 ;;
 ;; For each TARGET we take the full BUILD CLOSURE — the derivation prerequisite
 ;; graph (`derivation-prerequisites`; lowering only, NO building) — and classify
@@ -64,9 +64,12 @@
 
 (define (meta-stem e) (assoc-ref e "stem"))
 
-;; Authored but NOT yet built by td's own builder (not in corpus-no-guix) — excluded
-;; from the td-reproducible census so it does not overstate independence.
-(define not-yet-td-built '("pkg-config"))
+;; Authored but NOT yet built by td's own builder — excluded from the td-reproducible
+;; census so it does not overstate independence. Now empty: pkg-config was the last
+;; holdout (its bundled glib failed GCC 14's default -std=gnu23); CFLAGS=-std=gnu17 in
+;; the recipe cleared that wall and pkg-config-no-guix now builds it + resolves a .pc
+;; file, so it is a genuine owned recipe (issue #297).
+(define not-yet-td-built '())
 
 (define owned-specs
   (sort
@@ -179,8 +182,9 @@
      "# td-reproducible = td BUILDS the derivation with its OWN Rust builder (a\n"
      "# non-perturbed tests/ts/recipe-<spec>.ts; proven by the corpus-no-guix /\n"
      "# toolchain-no-guix gates). The\n"
-     "# byte-identity corpus-* gates were retired with system/td-recipe.scm. pkg-config\n"
-     "# is authored but not yet td-built (not in corpus-no-guix) and is excluded.\n"
+     "# byte-identity corpus-* gates were retired with system/td-recipe.scm. The\n"
+     "# not-yet-td-built exclusion is empty (pkg-config, the last holdout, is now\n"
+     "# built by the pkg-config-no-guix gate — issue #297).\n"
      "# Build closure = the derivation prerequisite graph (lowering only, no build).\n"
      "# edge-owned = td builds the recipe AND every declared input edge that is itself an\n"
      "# owned recipe is built FROM a td output. `td-builder build-plan --auto` wires those\n"

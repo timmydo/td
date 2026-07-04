@@ -5,8 +5,9 @@
 //! A derivation is "td-reproducible" iff a non-perturbed tests/ts/recipe-<spec>.ts
 //! exists AND td BUILDS it with its own Rust builder (proven by a td-build-* gate in
 //! THIS ladder, so a green loop means recipe ⇒ proof). The byte-identity corpus-*
-//! gates that used to ground this were retired with system/td-recipe.scm; pkg-config
-//! is authored but not yet td-built (no own-builder gate) and is excluded.
+//! gates that used to ground this were retired with system/td-recipe.scm. (pkg-config
+//! was the last authored-but-unproven holdout; issue #297 gave it an own-builder gate
+//! — pkg-config-no-guix — so the not-yet-td-built exclusion is now empty.)
 //! tests/guix-dependence.scm walks the full build closure (derivation prerequisite
 //! graph — lowering only, NO building) of the owned-recipe union and emits a
 //! DETERMINISTIC census, compared verbatim to tests/guix-dependence.expected. (The

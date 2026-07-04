@@ -283,10 +283,8 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
         "td-fetch" => sel.add_target("rust-fetch"),
         "td-feed" => sel.add_target("td-feed"),
         "td-subst" => sel.add_target("td-subst"),
-        "pkg-config" => {
-            sel.add_target("guix-dependence");
-            sel.add_note("pkg-config is authored but excluded from td-built census until it has an own-builder gate.");
-        }
+        // pkg-config is now a build spec of pkg-config-no-guix (issue #297), so
+        // target_for_build_spec above resolves it before this match — no special arm.
         _ => {
             sel.add_target("check-fast");
             sel.require_full(&format!(
@@ -663,6 +661,13 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if p == "tests/rust-userland-image.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("rust-userland-image");
+        return;
+    }
+
+    // The pkg-config .pc-resolution behavioral helper feeds only its own gate (#297).
+    if p == "tests/pkg-config-check.sh" {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("pkg-config-no-guix");
         return;
     }
 
@@ -1406,6 +1411,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/chain-cache.sh", "chain-cache");
     assert_target!("tests/bootstrap-chain.sh", "store-persist");
     assert_target!("tests/bootstrap-chain.sh", "chain-cache");
+<<<<<<< HEAD
     // #327: the hello corpus gate now SOURCES the shared chain (inline copy deleted), so a
     // chain change must re-prove it too (its own-file arm still selects just itself).
     assert_target!("tests/bootstrap-chain.sh", "bootstrap-hello-corpus-store-native");
@@ -1413,6 +1419,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "tests/bootstrap-hello-corpus-store-native.sh",
         "bootstrap-hello-corpus-store-native"
     );
+=======
+    // The pkg-config .pc behavioral helper routes to its own gate (#297), not the
+    // full-check fallback — its mapping arm keeps the diff tractable.
+    assert_target!("tests/pkg-config-check.sh", "pkg-config-no-guix");
+>>>>>>> 9f33677 (pkg-config: td-built via pkg-config-no-guix; census 19→20 (closes #297))
 
     // Spec→gate routing: a recipe/lock for a gate's SPEC selects that gate.
     for f in gate_files(root) {
