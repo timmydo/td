@@ -4,7 +4,7 @@
 # with /gnu/store ABSENT — the .scm-free userspace ASSEMBLY mechanism (no guix operating-system).
 #
 # The tool here is bash-static (from hello's PINNED closure, read by td's own store-closure
-# reader — no guix process), the same cheap static runner store-ns.sh uses; it gives a real
+# reader — no guix process), the same cheap static runner the store-ns gate uses; it gives a real
 # multi-entry package (bash + sh). This gate proves the ASSEMBLY + own-root execution; the
 # guix-FREE /td/store-NATIVE userland the toolchain builds (bootstrap-hello-userland #192 /
 # gcc-14 #197) joins this SAME mechanism. The
