@@ -40,8 +40,10 @@ echo ">> td tools (guix-free): stage0=$TB  recipe-eval=$TD_RECIPE_EVAL"
 
 # A scrubbed PATH for the td shell process: coreutils + bash from hello's pinned
 # seed, NO guix/Guile — so a green run PROVES td shell uses no guix process.
-cu=`grep -- '-coreutils-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`
-sh_=`grep -- '-bash-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`
+# coreutils + bash are DECLARED gate inputs (#353): resolved by the runner.
+cu=${TD_GATE_INPUT_COREUTILS:-}
+sh_=${TD_GATE_INPUT_BASH:-}
+test -n "$cu" -a -n "$sh_" || { echo "ERROR: TD_GATE_INPUT_{COREUTILS,BASH} unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
 test -n "$cu" -a -n "$sh_" || fail "no coreutils/bash in tests/hello-no-guix.lock"
 if ls "$cu/bin" "$sh_/bin" | grep -qE '^(guix|guile)$'; then fail "guix/guile on the scrubbed PATH"; fi
 SCRUB="$cu/bin:$sh_/bin"

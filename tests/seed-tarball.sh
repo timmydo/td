@@ -32,7 +32,9 @@ work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 
 # One real seed root: hello's pinned bash (a toolchain seed; closure pulls in glibc).
-root=`grep -- '-bash-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`
+# bash is a DECLARED gate input (#353): resolved by the runner.
+root=${TD_GATE_INPUT_BASH:-}
+test -n "$root" || { echo "ERROR: TD_GATE_INPUT_BASH unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
 test -n "$root" || fail "no bash seed in tests/hello-no-guix.lock"
 guix build "$root" >/dev/null 2>&1 || fail "seed root $root is not realized (warm it first)"
 

@@ -80,8 +80,10 @@ LOCK=tests/ripgrep.lock   # ripgrep.lock == fd.lock for the seed; used for the g
 # A scrubbed PATH for the td shell process: coreutils + bash from the pinned seed, NO guix/Guile
 # — so a green run PROVES td shell used no guix process. (These retired-last seed bytes are the
 # shell the user's command runs IN; the deliverable tools carry no guix — asserted in legs B/D.)
-cu=`grep -- '-coreutils-' "$LOCK" | sed 's/^[^ ]* //' | head -1`
-sh_=`grep -- '-bash-' "$LOCK" | sed 's/^[^ ]* //' | head -1`
+# coreutils + bash are DECLARED gate inputs (#353): resolved by the runner.
+cu=${TD_GATE_INPUT_COREUTILS:-}
+sh_=${TD_GATE_INPUT_BASH:-}
+test -n "$cu" -a -n "$sh_" || { echo "ERROR: TD_GATE_INPUT_{COREUTILS,BASH} unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
 test -n "$cu" -a -n "$sh_" || fail "no coreutils/bash in $LOCK"
 if ls "$cu/bin" "$sh_/bin" | grep -qE '^(guix|guile)$'; then fail "guix/guile on the scrubbed PATH"; fi
 SCRUB="$cu/bin:$sh_/bin"

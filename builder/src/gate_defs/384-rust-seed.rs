@@ -14,7 +14,7 @@
 //! BUILD_GATE so it slots after the parallel build-recipes fan-out (its cargo build would
 //! otherwise contend for cores).
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,7 +23,14 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): resolved by the runner —
+        // the body consumes TD_GATE_INPUT_*.
+        inputs: &[
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/td-builder-rust.lock", stem: "coreutils" },
+            },
+        ],
         store: StoreMode::Private, // cold by design (#317 audit): the Rust engine builds from the frozen rust seed alone
         non_blocking: true,
         script: r##"

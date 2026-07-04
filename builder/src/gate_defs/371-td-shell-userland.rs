@@ -20,7 +20,7 @@
 //! gcc build); the ripgrep+fd crate closures are warmed by the check.sh prelude (`td-feed warm
 //! crate`, sha256 == the crates.io index cksum). Build gate → BUILD_GATES + HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -29,7 +29,18 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): resolved by the runner —
+        // the body consumes TD_GATE_INPUT_*.
+        inputs: &[
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/ripgrep.lock", stem: "coreutils" },
+            },
+            ArtifactInput {
+                name: "bash",
+                kind: InputKind::LockEntry { lock: "tests/ripgrep.lock", stem: "bash" },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

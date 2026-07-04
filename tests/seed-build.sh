@@ -29,7 +29,9 @@ echo ">> td tools (guix-free): stage0=$TB  ts-eval=$TD_RECIPE_EVAL"
 
 work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
-cu=`grep -- '-coreutils-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`
+# coreutils is a DECLARED gate input (#353): resolved by the runner.
+cu=${TD_GATE_INPUT_COREUTILS:-}
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
 test -n "$cu" || fail "no coreutils in hello lock"
 
 # Capture roots: hello's lock inputs (toolchain + source) + the stage0 builder's runtime
