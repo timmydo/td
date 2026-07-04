@@ -291,6 +291,10 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
             sel.add_target("guix-dependence");
             sel.add_note("pkg-config is authored but excluded from td-built census until it has an own-builder gate.");
         }
+        // sqlite builds in-gate with the substituted /td/store toolchain (#312), not via a
+        // build-gate spec, so route its recipe/lock to that gate (census-excluded until a
+        // corpus gate builds it from its pinned lock).
+        "sqlite" => sel.add_target("bootstrap-sqlite-corpus-store-native"),
         _ => {
             sel.add_target("check-pr");
             sel.add_note(&format!(
@@ -974,10 +978,16 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // re-proves the chain-cache gate (hit/poison/cold semantics). (hello-corpus's OWN-file arm
     // is above; here it is a chain CONSUMER, re-proved when the shared chain changes. chain arm
     // ported from PR #203's affected-checks.sh.)
+    if pattern_matches("tests/bootstrap-sqlite-corpus-store-native.sh", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("bootstrap-sqlite-corpus-store-native");
+        return;
+    }
     if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh|tests/bootstrap-chain.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-sed-corpus-store-native");
         sel.add_target("bootstrap-hello-corpus-store-native");
+        sel.add_target("bootstrap-sqlite-corpus-store-native");
         sel.add_target("store-persist");
         sel.add_target("chain-cache");
         return;
@@ -1518,6 +1528,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "tests/bootstrap-hello-corpus-store-native.sh",
         "bootstrap-hello-corpus-store-native"
     );
+    // #312: the sqlite corpus gate sources the shared chain too; its recipe/lock route to it.
+    assert_target!("tests/bootstrap-chain.sh", "bootstrap-sqlite-corpus-store-native");
+    assert_target!(
+        "tests/bootstrap-sqlite-corpus-store-native.sh",
+        "bootstrap-sqlite-corpus-store-native"
+    );
+    assert_target!("tests/sqlite-no-guix.lock", "bootstrap-sqlite-corpus-store-native");
 
     // Spec→gate routing: a recipe/lock for a gate's SPEC selects that gate.
     for f in gate_files(root) {

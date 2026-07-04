@@ -19,6 +19,11 @@
 ;; bundled glib hits a C-standard wall under td's build env — so it is NOT counted
 ;; as td-reproducible (it would overstate independence). Drop the exclusion once
 ;; corpus-no-guix covers pkg-config.
+;; EXCLUDED: sqlite is built by td's own builder ONLY store-native (the
+;; bootstrap-sqlite-corpus-store-native gate substitutes the /td/store toolchain —
+;; #312); no gate builds it from its pinned lock, and this census's denominators
+;; are the pinned-channel closures, so counting it would claim a proof no gate
+;; carries. Drop the exclusion when a corpus gate builds sqlite from its lock.
 ;;
 ;; For each TARGET we take the full BUILD CLOSURE — the derivation prerequisite
 ;; graph (`derivation-prerequisites`; lowering only, NO building) — and classify
@@ -64,9 +69,10 @@
 
 (define (meta-stem e) (assoc-ref e "stem"))
 
-;; Authored but NOT yet built by td's own builder (not in corpus-no-guix) — excluded
-;; from the td-reproducible census so it does not overstate independence.
-(define not-yet-td-built '("pkg-config"))
+;; Authored but NOT yet built by td's own builder from its pinned lock (not in
+;; corpus-no-guix) — excluded from the td-reproducible census so it does not
+;; overstate independence. (sqlite: store-native-only, see the EXCLUDED note above.)
+(define not-yet-td-built '("pkg-config" "sqlite"))
 
 (define owned-specs
   (sort
