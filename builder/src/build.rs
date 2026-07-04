@@ -15,6 +15,9 @@
 //! tools (tar, gcc, make, …) are the Guix toolchain — retired LAST (§5); what is
 //! removed is the build-system Guile, not the toolchain.
 //!
+//! Every phase command runs under a fail-fast watchdog (#308) — see `Watch`: a
+//! broken staged closure must red in minutes with a named tool, never spin.
+//!
 //! Inputs (env, set by system td-build):
 //!   out                output prefix (the daemon sets this)
 //!   TD_SRC             the source tarball (a fixed-output url-fetch)
@@ -35,7 +38,10 @@ use crate::json::Json;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Find an executable `name` in a ':'-joined search path; return its abs path.
 fn find_in_path(path: &str, name: &str) -> Option<String> {
@@ -162,21 +168,247 @@ fn single_subdir(dir: &str) -> Result<String, String> {
     }
 }
 
+/// Phase-command watchdog bounds (#308). A broken staged closure can make a GNU
+/// configure spin FOREVER instead of failing: with a helper tool persistently
+/// dying (issue #292 — every `expr` aborted on a missing libgmp.so.10, so the
+/// `ac_count` increment in configure's "checking for grep that handles long
+/// lines" loop never happened), configure retries at 100% CPU for 30+ minutes,
+/// turning a clean, diagnosable red into an apparent hang that ties up a
+/// heavy-gate slot. `run_cmd` supervises every phase command with two
+/// independent bounds; zero disables a bound:
+///
+///   * `stderr_repeat_limit` — the SAME stderr line this many times in a row is
+///     a persistently-failing tool in a retry loop. Trips in seconds on the
+///     #292 shape, and the repeated line itself names the failing tool.
+///   * `silence` — no output on either stream for this long is a wedged phase:
+///     the backstop for a spin whose tool stderr configure redirects away
+///     (conftest stderr usually goes to /dev/null or config.log).
+///
+/// The bounds are compiled in per phase, not env knobs: the sandbox clears the
+/// builder's env, and a drv-env knob would vary the drv hash with a tuning
+/// value. Tests pass their own tiny bounds.
+struct Watch {
+    silence: Duration,
+    stderr_repeat_limit: u32,
+}
+
+/// Default phase bound: make can legitimately be silent for minutes while one
+/// big translation unit compiles; 30 minutes is comfortably past the corpus'
+/// (and the bootstrap chain's) worst single-file case, while still bounding a
+/// truly-wedged phase.
+const WATCH_PHASE: Watch =
+    Watch { silence: Duration::from_secs(1800), stderr_repeat_limit: 200 };
+
+/// configure bound: each configure check compiles+links a conftest in seconds,
+/// so ten silent minutes means wedged — this is what turns the #292 class of
+/// hang into a red "within minutes" even when the loop is silent.
+const WATCH_CONFIGURE: Watch =
+    Watch { silence: Duration::from_secs(600), stderr_repeat_limit: 200 };
+
+/// Clip one raw output line to a printable diagnostic fragment.
+fn clip_line(line: &[u8]) -> String {
+    const MAX: usize = 400;
+    let head = line.get(..MAX.min(line.len())).unwrap_or(line);
+    let ell = if line.len() > MAX { "…" } else { "" };
+    format!("{}{ell}", String::from_utf8_lossy(head))
+}
+
+/// The trip channel shared by the supervisor threads: the first cause wins,
+/// and a trip SIGKILLs the phase's whole process group — configure's children
+/// included, not just the shell.
+struct TripCtl<'a> {
+    why: &'a Mutex<Option<String>>,
+    tripped: &'a AtomicBool,
+    pgid: u32,
+}
+
+impl TripCtl<'_> {
+    fn trip(&self, why: String) {
+        if let Ok(mut t) = self.why.lock() {
+            if t.is_none() {
+                *t = Some(why);
+                self.tripped.store(true, Ordering::Relaxed);
+                let _ = crate::sys::kill_process_group(self.pgid, crate::sys::SIGKILL);
+            }
+        }
+    }
+}
+
+/// The stderr accountant's state.
+struct StderrWatch {
+    last_line: Vec<u8>,
+    repeats: u32,
+    /// Last few stderr lines, clipped, for the kill diagnostic.
+    tail: std::collections::VecDeque<String>,
+}
+
+/// Account one complete stderr line: repeat counting + the diagnostic tail.
+/// Trips (and kills the group) when the SAME line repeats `limit` times in a
+/// row — decided here at line granularity, so a command that emits fewer
+/// repeats and exits green can never race a sampling thread into a false kill.
+fn account_stderr_line(st: &mut StderrWatch, line: &[u8], limit: u32, ctl: &TripCtl) {
+    if line == st.last_line.as_slice() {
+        st.repeats = st.repeats.saturating_add(1);
+    } else {
+        st.last_line = line.to_vec();
+        st.repeats = 1;
+    }
+    if st.tail.len() >= 5 {
+        st.tail.pop_front();
+    }
+    st.tail.push_back(clip_line(line));
+    if limit > 0 && st.repeats >= limit && !ctl.tripped.load(Ordering::Relaxed) {
+        ctl.trip(format!(
+            "the same stderr line repeated {}x (a persistently-failing tool in a retry loop): {}",
+            st.repeats,
+            clip_line(line)
+        ));
+    }
+}
+
+/// Tee one child stream to `sink`, updating the shared activity clock; for
+/// stderr (`watch_lines` set) also split into lines for the repeat accountant.
+/// Chunk-based (not read_until): a `\r`-progress stream with no newline still
+/// counts as activity, and an unterminated line cannot grow unboundedly.
+fn tee_stream(
+    mut src: impl std::io::Read,
+    mut sink: impl std::io::Write,
+    start: Instant,
+    last_activity_ms: &AtomicU64,
+    watch_lines: Option<(&Mutex<StderrWatch>, u32)>,
+    ctl: &TripCtl,
+) {
+    let mut buf = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        let n = match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let chunk = buf.get(..n).unwrap_or(&buf);
+        let _ = sink.write_all(chunk);
+        let _ = sink.flush();
+        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        last_activity_ms.store(elapsed, Ordering::Relaxed);
+        if let Some((watch, limit)) = watch_lines {
+            pending.extend_from_slice(chunk);
+            while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = pending.drain(..=nl).collect();
+                line.pop(); // the \n
+                if let Ok(mut st) = watch.lock() {
+                    account_stderr_line(&mut st, &line, limit, ctl);
+                }
+            }
+            // A pathological unterminated "line": account it in slices so the
+            // buffer stays bounded (repeat detection needs whole lines anyway).
+            if pending.len() > 65536 {
+                if let Ok(mut st) = watch.lock() {
+                    account_stderr_line(&mut st, &pending, limit, ctl);
+                }
+                pending.clear();
+            }
+        }
+    }
+}
+
 /// Run a command with a CLEAN environment (`envs` only), in `cwd`, echoing it to
-/// the build log. Fail-closed: a non-zero exit aborts the build.
-fn run_cmd(prog: &str, args: &[&str], cwd: &str, envs: &[(String, String)]) -> Result<(), String> {
+/// the build log. Fail-closed: a non-zero exit aborts the build. Supervised by
+/// `watch` (#308): the child runs in its OWN process group with stdout/stderr
+/// teed to the build log, and a tripped bound SIGKILLs the whole group and reds
+/// the phase with the last stderr lines — a broken tool loop in configure
+/// becomes a diagnosable red in minutes, not a 30-minute spin.
+fn run_cmd(
+    prog: &str,
+    args: &[&str],
+    cwd: &str,
+    envs: &[(String, String)],
+    watch: &Watch,
+) -> Result<(), String> {
     println!(">> td-build: (cd {cwd} && {prog} {})", args.join(" "));
-    let status = Command::new(prog)
-        .args(args)
+    let mut cmd = Command::new(prog);
+    cmd.args(args)
         .current_dir(cwd)
         .env_clear()
         .envs(envs.iter().map(|(k, v)| (k.clone(), v.clone())))
-        .status()
-        .map_err(|e| format!("spawn {prog}: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{prog} {} failed: {status}", args.join(" ")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn {prog}: {e}"))?;
+    let pgid = child.id();
+    let child_out = child.stdout.take().ok_or_else(|| format!("{prog}: no stdout pipe"))?;
+    let child_err = child.stderr.take().ok_or_else(|| format!("{prog}: no stderr pipe"))?;
+
+    let start = Instant::now();
+    let last_activity_ms = AtomicU64::new(0);
+    let why: Mutex<Option<String>> = Mutex::new(None);
+    let tripped = AtomicBool::new(false);
+    let stop = AtomicBool::new(false);
+    let ctl = TripCtl { why: &why, tripped: &tripped, pgid };
+    let stderr_watch = Mutex::new(StderrWatch {
+        last_line: Vec::new(),
+        repeats: 0,
+        tail: std::collections::VecDeque::new(),
+    });
+
+    let silence_ms = u64::try_from(watch.silence.as_millis()).unwrap_or(u64::MAX);
+    let status = std::thread::scope(|s| {
+        let out_reader = s.spawn(|| {
+            tee_stream(child_out, std::io::stdout(), start, &last_activity_ms, None, &ctl);
+        });
+        let err_reader = s.spawn(|| {
+            tee_stream(
+                child_err,
+                std::io::stderr(),
+                start,
+                &last_activity_ms,
+                Some((&stderr_watch, watch.stderr_repeat_limit)),
+                &ctl,
+            );
+        });
+        // Silence watchdog: runs until the readers have drained (NOT merely
+        // until the child exits) — so a build that leaves a background child
+        // holding the pipes open is also bounded, instead of hanging the join.
+        s.spawn(|| {
+            while !stop.load(Ordering::Relaxed) && !tripped.load(Ordering::Relaxed) {
+                if silence_ms > 0 {
+                    let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    if elapsed.saturating_sub(last_activity_ms.load(Ordering::Relaxed)) > silence_ms {
+                        ctl.trip(format!("no output for {}s (a wedged phase)", silence_ms / 1000));
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let st = child.wait();
+        let _ = out_reader.join();
+        let _ = err_reader.join();
+        stop.store(true, Ordering::Relaxed);
+        st
+    });
+
+    let why = why.lock().ok().and_then(|mut t| t.take());
+    if let Some(why) = why {
+        let tail = stderr_watch
+            .lock()
+            .map(|st| st.tail.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        let tail = if tail.is_empty() { String::new() } else { format!("; last stderr lines:\n{tail}") };
+        return Err(format!(
+            "td-build watchdog KILLED `{prog} {}` after {}s — {why}{tail}",
+            args.join(" "),
+            start.elapsed().as_secs(),
+        ));
+    }
+    match status {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => Err(format!("{prog} {} failed: {st}", args.join(" "))),
+        Err(e) => Err(format!("wait {prog}: {e}")),
     }
 }
 
@@ -358,7 +590,7 @@ fn apply_substitute(
         // Run from the build root: resolve_files / find_files yield paths already
         // joined to `srcdir` (which is relative to the build root, e.g.
         // `./gzip-1.14/gunzip.in`), so the cwd must be `.`, not `srcdir`.
-        run_cmd(sed, &argrefs, ".", envs)?;
+        run_cmd(sed, &argrefs, ".", envs, &WATCH_PHASE)?;
     }
     Ok(())
 }
@@ -496,7 +728,7 @@ pub fn run() -> Result<(), String> {
     ];
 
     // unpack -> the single source tree.
-    run_cmd(&tar, &["xf", &src], ".", &envs)?;
+    run_cmd(&tar, &["xf", &src], ".", &envs, &WATCH_PHASE)?;
     let srcdir = single_subdir(".")?;
 
     // patch-source-shebangs — rewrite `#!/bin/sh` build scripts to the seed bash
@@ -512,15 +744,15 @@ pub fn run() -> Result<(), String> {
     let prefix = format!("--prefix={out}");
     let mut conf: Vec<&str> = vec!["./configure", &prefix];
     conf.extend(configure_flags.iter().map(String::as_str));
-    run_cmd(&bash, &conf, &srcdir, &envs)?;
+    run_cmd(&bash, &conf, &srcdir, &envs, &WATCH_CONFIGURE)?;
 
     // build + install. Pass SHELL=<bash> as a make OVERRIDE (not just env): make
     // launches recipe shells via the SHELL make-variable, defaulting to /bin/sh,
     // which does not exist in the sandbox (the `po/` install rules hit this). A
     // command-line assignment overrides the Makefile AND propagates to sub-makes.
     let shell = format!("SHELL={bash}");
-    run_cmd(&make, &[&shell], &srcdir, &envs)?;
-    run_cmd(&make, &[&shell, "install"], &srcdir, &envs)?;
+    run_cmd(&make, &[&shell], &srcdir, &envs, &WATCH_PHASE)?;
+    run_cmd(&make, &[&shell, "install"], &srcdir, &envs, &WATCH_PHASE)?;
     Ok(())
 }
 
@@ -642,15 +874,15 @@ pub fn run_rust() -> Result<(), String> {
     let path_env = vec![("PATH".to_string(), path.clone())];
     let build_dir = "td-rust-build";
     if Path::new(&src).is_dir() {
-        run_cmd(&cp, &["-aT", &src, build_dir], ".", &path_env)?;
+        run_cmd(&cp, &["-aT", &src, build_dir], ".", &path_env, &WATCH_PHASE)?;
     } else {
         let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS")?;
-        run_cmd(&tar, &["xf", &src], ".", &path_env)?;
+        run_cmd(&tar, &["xf", &src], ".", &path_env, &WATCH_PHASE)?;
         let sub = single_subdir(".")?;
-        run_cmd(&cp, &["-aT", &sub, build_dir], ".", &path_env)?;
+        run_cmd(&cp, &["-aT", &sub, build_dir], ".", &path_env, &WATCH_PHASE)?;
     }
     // store copies are read-only; make the tree writable for cargo's target/.
-    run_cmd(&chmod, &["-R", "u+w", build_dir], ".", &path_env)?;
+    run_cmd(&chmod, &["-R", "u+w", build_dir], ".", &path_env, &WATCH_PHASE)?;
 
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
     let build_abs = cwd.join(build_dir);
@@ -714,7 +946,7 @@ pub fn run_rust() -> Result<(), String> {
         let vendor_abs = vendor_dir.to_str().ok_or("non-utf8 vendor path")?.to_string();
         for (c, nv) in &crate_files {
             // a cargo `.crate` tarball unpacks to exactly the single `<name>-<version>/` dir.
-            run_cmd(&tar, &["xf", c.as_str(), "-C", &vendor_abs], ".", &path_env)?;
+            run_cmd(&tar, &["xf", c.as_str(), "-C", &vendor_abs], ".", &path_env, &WATCH_PHASE)?;
             let cdir = vendor_dir.join(nv);
             if !cdir.is_dir() {
                 return Err(format!("crate {c} did not unpack to {}/", cdir.display()));
@@ -752,7 +984,7 @@ pub fn run_rust() -> Result<(), String> {
         }
     }
     let cargo_argv: Vec<&str> = cargo_args.iter().map(String::as_str).collect();
-    run_cmd(&cargo, &cargo_argv, build_dir, &envs)?;
+    run_cmd(&cargo, &cargo_argv, build_dir, &envs, &WATCH_PHASE)?;
 
     // install the named binaries to $out/bin.
     let bindir = format!("{out}/bin");
@@ -762,7 +994,7 @@ pub fn run_rust() -> Result<(), String> {
         if !Path::new(&from).is_file() {
             return Err(format!("cargo did not produce expected binary `{b}' at {from}"));
         }
-        run_cmd(&cp, &["-p", &from, &format!("{bindir}/{b}")], ".", &path_env)?;
+        run_cmd(&cp, &["-p", &from, &format!("{bindir}/{b}")], ".", &path_env, &WATCH_PHASE)?;
     }
     Ok(())
 }
@@ -863,7 +1095,7 @@ pub fn run_cmake() -> Result<(), String> {
         src.clone()
     } else {
         let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS")?;
-        run_cmd(&tar, &["xf", &src], ".", &envs)?;
+        run_cmd(&tar, &["xf", &src], ".", &envs, &WATCH_PHASE)?;
         let rel = single_subdir(".")?;
         // make it absolute so the cmake invocation (run from the build dir) resolves it.
         let cwd = env::current_dir().map_err(|e| e.to_string())?;
@@ -885,14 +1117,14 @@ pub fn run_cmake() -> Result<(), String> {
     let prefix = format!("-DCMAKE_INSTALL_PREFIX={out}");
     let mut conf: Vec<&str> = vec![&srcdir, &prefix, "-DCMAKE_BUILD_TYPE=Release"];
     conf.extend(configure_flags.iter().map(String::as_str));
-    run_cmd(&cmake, &conf, build_dir, &envs)?;
+    run_cmd(&cmake, &conf, build_dir, &envs, &WATCH_CONFIGURE)?;
 
     // build + install. Pass SHELL=<bash> as a make OVERRIDE (not just env), as `run`
     // does: make launches recipe shells via the SHELL make-variable, defaulting to
     // /bin/sh, which does not exist in the sandbox.
     let shell = format!("SHELL={bash}");
-    run_cmd(&make, &[&shell], build_dir, &envs)?;
-    run_cmd(&make, &[&shell, "install"], build_dir, &envs)?;
+    run_cmd(&make, &[&shell], build_dir, &envs, &WATCH_PHASE)?;
+    run_cmd(&make, &[&shell, "install"], build_dir, &envs, &WATCH_PHASE)?;
     Ok(())
 }
 
@@ -900,6 +1132,110 @@ pub fn run_cmake() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The test-process bash + a PATH env for the child (scripts use sleep etc.).
+    fn bash_and_env() -> (String, Vec<(String, String)>) {
+        let path = env::var("PATH").unwrap();
+        let bash = find_in_path(&path, "bash").expect("bash on PATH");
+        (bash, vec![("PATH".to_string(), path)])
+    }
+
+    #[test]
+    fn watchdog_reds_a_configure_stuck_in_a_failing_tool_loop() {
+        // The #292 shape (issue #308): a staged closure missing libgmp makes
+        // every `expr` die with the SAME loader error, and configure's
+        // "checking for grep that handles long lines" counter loop retries
+        // forever at 100% CPU. Without the guard this run_cmd call never
+        // returns (verified-red: with the trip neutered, this test hangs past
+        // any bound); with it, the phase reds in seconds and the diagnostic
+        // quotes the failing tool's stderr line.
+        let (bash, envs) = bash_and_env();
+        let loop_forever = "while :; do echo 'expr: error while loading shared libraries: \
+                            libgmp.so.10: cannot open shared object file' >&2; done";
+        let t0 = Instant::now();
+        let err = run_cmd(
+            &bash,
+            &["-c", loop_forever],
+            ".",
+            &envs,
+            &Watch { silence: Duration::ZERO, stderr_repeat_limit: 25 },
+        )
+        .expect_err("a persistently-failing tool loop must red");
+        assert!(t0.elapsed() < Duration::from_secs(30), "must red promptly, not spin: {err}");
+        assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
+        assert!(err.contains("repeated 25x"), "names the repeat bound: {err}");
+        assert!(
+            err.contains("expr: error while loading shared libraries"),
+            "quotes the failing tool's stderr: {err}"
+        );
+        assert!(err.contains("last stderr lines:"), "carries the stderr tail: {err}");
+    }
+
+    #[test]
+    fn watchdog_reds_a_silently_wedged_phase() {
+        // The silent variant: configure often sends a helper's stderr to
+        // /dev/null or config.log, so the spin produces NO output. The silence
+        // bound is the backstop; the whole process group dies (the exec'd
+        // sleep included), so the test returns instead of waiting 300s.
+        let (bash, envs) = bash_and_env();
+        let t0 = Instant::now();
+        let err = run_cmd(
+            &bash,
+            &["-c", "exec sleep 300"],
+            ".",
+            &envs,
+            &Watch { silence: Duration::from_secs(1), stderr_repeat_limit: 0 },
+        )
+        .expect_err("a silent wedged phase must red");
+        assert!(t0.elapsed() < Duration::from_secs(30), "must red at the bound: {err}");
+        assert!(err.contains("no output for 1s"), "names the silence bound: {err}");
+    }
+
+    #[test]
+    fn watchdog_passes_a_healthy_command_and_sub_limit_repeats() {
+        // Green control: repeats BELOW the bound (24 identical stderr lines,
+        // limit 25) exit green — the guard trips on the pathological loop, not
+        // on a noisy-but-terminating tool. And a changing stderr stream resets
+        // the counter, so far more total lines than the limit stay green.
+        let (bash, envs) = bash_and_env();
+        let noisy = "for i in $(seq 24); do echo 'same warning' >&2; done; echo done-ok";
+        run_cmd(
+            &bash,
+            &["-c", noisy],
+            ".",
+            &envs,
+            &Watch { silence: Duration::from_secs(600), stderr_repeat_limit: 25 },
+        )
+        .expect("sub-limit repeats must stay green");
+        let alternating =
+            "for i in $(seq 40); do echo \"warn $((i % 2))\" >&2; done; echo done-ok";
+        run_cmd(
+            &bash,
+            &["-c", alternating],
+            ".",
+            &envs,
+            &Watch { silence: Duration::from_secs(600), stderr_repeat_limit: 25 },
+        )
+        .expect("alternating stderr lines must reset the repeat counter");
+    }
+
+    #[test]
+    fn watchdog_keeps_the_plain_failure_contract() {
+        // A normal non-zero exit still reds with the pre-#308 message shape —
+        // the supervisor changes HOW output is carried, not the pass/fail
+        // contract.
+        let (bash, envs) = bash_and_env();
+        let err = run_cmd(
+            &bash,
+            &["-c", "echo out; echo err >&2; exit 3"],
+            ".",
+            &envs,
+            &WATCH_PHASE,
+        )
+        .expect_err("exit 3 must red");
+        assert!(err.contains("failed"), "plain failure message kept: {err}");
+        run_cmd(&bash, &["-c", "true"], ".", &envs, &WATCH_PHASE).expect("true is green");
+    }
 
     #[test]
     fn vendor_dir_collects_crates_by_filename_guix_free() {
