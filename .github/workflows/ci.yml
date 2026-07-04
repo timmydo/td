@@ -183,6 +183,21 @@ jobs:
           test -x "$host_guix/bin/guix" && test -x "$host_guix/bin/guix-daemon" \
             || { echo "host-guix shim came out malformed: '$host_guix'" >&2; exit 1; }
           echo "$host_guix" > /tmp/host-guix
+      - name: warm the pinned stage0 seed into the store (host-prep; the loop is guix-free, #311)
+        # The loop's container-provider prelude (tests/cache-lib.sh provision_stage0)
+        # no longer realizes the stage0 toolchain seed with `guix build` (#311 — it
+        # resolves it from a td-subst store or FAILS CLOSED, no guix fallback). This
+        # guix-HAVING CI runner has no td-subst store, so it warms the seed OUT-OF-BAND
+        # here (tools/warm-stage0-seed.sh) — exactly the escape resolve-seed.sh's
+        # fail-closed message names — keeping the LOOP guix-free while the seed (the
+        # guix-built pin, retired last per the north star) is present when
+        # provision_stage0 runs. The image carries the seed COMPONENTS; gcc-toolchain is
+        # a cheap union guix realizes offline (the one path the image doesn't
+        # pre-materialize).
+        run: |
+          set -euo pipefail
+          export PATH="$(cat /tmp/host-guix)/bin:$PATH"
+          sh tools/warm-stage0-seed.sh
       - name: run the fast tier (td-builder check check-fast, offline)
         run: |
           set -euo pipefail
