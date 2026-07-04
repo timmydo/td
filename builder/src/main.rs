@@ -28,6 +28,7 @@ mod elf;
 // to the release binary or the clippy pass.
 #[cfg(test)]
 mod gate_lint;
+mod gate_timing;
 mod gates;
 mod json;
 mod lock;
