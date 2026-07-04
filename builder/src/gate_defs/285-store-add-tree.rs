@@ -15,17 +15,21 @@
 //! a pure function of the content). [ROUND-TRIP] the restored tree is NAR-byte-identical
 //! to the source (exec bits + symlinks + nesting survive copy_canonical), cross-checked
 //! by concrete restored-tree probes. [REGISTRATION] td's OWN reader reads back the path
-//! + the tree's NAR hash. [DISCRIMINATION, load-bearing] a one-byte content change AND an
-//! exec-bit flip each MOVE the content-addressed path — the addressing is a real function
-//! of the bytes, not a constant. Needs td-builder built, so it slots in the heavy pool.
+//! + the tree's NAR hash. [DISCRIMINATION, load-bearing] a single-byte append AND an
+//! exec-bit flip each MOVE the content-addressed path (and the append moves the registered
+//! NAR hash) — the addressing is a real function of the bytes, not a constant. Needs
+//! td-builder built, so it slots in the heavy pool.
 //!
 //! History: the guix-daemon differential this gate began as — interning the daemon's own
 //! `%builder-source` tree (lowered with `guix repl … lower-object`) and asserting td's
 //! path/NAR equals the daemon's — was the `lowering` guix-surface site retired here
 //! (#310 / directive 6). The daemon-equality ORACLE is dropped; the DETERMINISM +
 //! ROUND-TRIP + DISCRIMINATION assertions below cover the same property (a stable
-//! content address that faithfully captures the tree) td-native, and are strictly
-//! stronger — called out in the PR per directive 3.
+//! content address that faithfully captures the tree) td-native — trading a REMOVABLE
+//! guix-canonical cross-check (the byte-hash-vs-Guix oracle, removable per directive 4)
+//! for a DURABLE discrimination the old gate never proved (it only matched the daemon for
+//! one tree, never showed the address changes when the tree does). Called out in the PR
+//! per directive 3.
 
 use crate::gates::{GateDef, Pool, StoreMode};
 
@@ -71,16 +75,17 @@ reg=`"$tb" store-query "$scratch/td.db" info`; \
 test "`echo "$reg" | cut -d'|' -f1`" = "$p1" || { echo "FAIL: registered path != $p1 ($reg)" >&2; exit 1; }; \
 test "`echo "$reg" | cut -d'|' -f2`" = "$srcnar" || { echo "FAIL: registered NAR hash != $srcnar ($reg)" >&2; exit 1; }; \
 echo "   [REGISTRATION] td's own reader reads back the interned path + the tree's NAR hash"; \
-cp -a "$fx" "$scratch/tree_c"; printf 'CHANGED\n' > "$scratch/tree_c/file.txt"; \
+cp -a "$fx" "$scratch/tree_c"; printf 'x' >> "$scratch/tree_c/file.txt"; \
 pc=`"$tb" store-add-recursive "$name" "$scratch/tree_c" "$scratch/store_c" "$scratch/td_c.db"`; \
-test "$pc" != "$p1" || { echo "FAIL: a one-byte content change did NOT move the path — the store path is not a function of the content" >&2; exit 1; }; \
-test "`"$tb" store-query "$scratch/td_c.db" info | cut -d'|' -f2`" != "$srcnar" || { echo "FAIL: a content change did not change the registered NAR hash" >&2; exit 1; }; \
+test "$pc" != "$p1" || { echo "FAIL: appending a single byte did NOT move the path — the store path is not a function of the content" >&2; exit 1; }; \
+cnar=`"$tb" store-query "$scratch/td_c.db" info | cut -d'|' -f2`; \
+test -n "$cnar" -a "$cnar" != "$srcnar" || { echo "FAIL: the single-byte edit did not change the registered NAR hash (got '$cnar')" >&2; exit 1; }; \
 cp -a "$fx" "$scratch/tree_x"; chmod -x "$scratch/tree_x/run.sh"; \
 px=`"$tb" store-add-recursive "$name" "$scratch/tree_x" "$scratch/store_x" "$scratch/td_x.db"`; \
 test "$px" != "$p1" || { echo "FAIL: flipping the executable bit did NOT move the path — the exec bit is not captured in the content address" >&2; exit 1; }; \
-echo "   [DISCRIMINATION] a one-byte edit and an exec-bit flip each move the content-addressed path (contents + exec bits are load-bearing)"; \
+echo "   [DISCRIMINATION] a single-byte append and an exec-bit flip each move the content-addressed path + registered NAR hash (contents + exec bits are load-bearing)"; \
 rm -rf "$scratch"; \
-echo "PASS: td CANONICALLY RESTORED a directory tree into its OWN store and REGISTERED it ITSELF, in pure Rust with NO daemon and NO guix — the content-addressed source path is a deterministic function of the tree's recursive NAR sha256 (re-interning is identical), the restored tree is NAR-byte-identical to the source (structure + contents + exec bits + symlinks), td's own reader reads back the path + hash, and a one-byte content change or an exec-bit flip each move the path (the addressing is load-bearing). td owns the recursive addToStore write side for no-reference sources; referenced sources, the destructive GC sweep, and a td store backend are later increments."
+echo "PASS: td CANONICALLY RESTORED a directory tree into its OWN store and REGISTERED it ITSELF, in pure Rust with NO daemon and NO guix — the content-addressed source path is a deterministic function of the tree's recursive NAR sha256 (re-interning is identical), the restored tree is NAR-byte-identical to the source (structure + contents + exec bits + symlinks), td's own reader reads back the path + hash, and a single-byte append or an exec-bit flip each move the path (the addressing is load-bearing). td owns the recursive addToStore write side for no-reference sources; referenced sources, the destructive GC sweep, and a td store backend are later increments."
 "##,
     }
 }
