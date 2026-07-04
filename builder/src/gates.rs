@@ -259,8 +259,22 @@ fn load() -> Result<GateSet, String> {
         if def.pools.is_empty() {
             return Err(format!("gate-run: gate `{}` is in no pool", def.name));
         }
-        if def.script.trim().is_empty() {
-            return Err(format!("gate-run: gate `{}` has an empty script", def.name));
+        // Empty script ⟺ native (typed-Rust) gate (#318 axis 3): a native gate
+        // carries no bash and is run via `td-builder gate-body <name>`; a bash
+        // gate must carry a script. Mismatch either way is a load-time error, so
+        // a typo (empty script with no registered body, or a body-registered
+        // gate that still ships bash) can never silently no-op.
+        let native = crate::gate_bodies::is_native(def.name);
+        if def.script.trim().is_empty() != native {
+            return Err(if native {
+                format!(
+                    "gate-run: native gate `{}` must have an empty script (its body is \
+                     gate_bodies.rs)",
+                    def.name
+                )
+            } else {
+                format!("gate-run: gate `{}` has an empty script", def.name)
+            });
         }
         for w in def.needs.iter().chain(def.specs) {
             if !valid_word(w) {
@@ -876,32 +890,56 @@ fn run_gate(
         (Some(run_dir), b) if b > 0 => cgroup_enter(run_dir, &g.name, b),
         _ => None,
     };
+    // A native (typed-Rust) gate carries an empty body: run it as `<current_exe>
+    // gate-body <name>` instead of `bash -c <script>` (#318 axis 3). Same
+    // wrapper (prlimit/cgroup/pgroup/env); the native body self-moves into the
+    // gate cgroup itself (gate_bodies::cli), so the bash cgroup prelude — which
+    // is bash-only — is skipped for it.
+    let native = g.body.trim().is_empty();
     // The enter path travels via env, NEVER interpolated into the bash text:
     // an env-derived run dir containing a quote would otherwise escape the
     // quoting and execute as code (review finding).
     let body = match &gate_cg {
-        Some(_) => format!(
+        Some(_) if !native => format!(
             "echo $$ > \"$TD_GATE_CG\" || {{ echo 'gate-run: cannot enter the gate cgroup' >&2; exit 97; }}\n{}",
             g.body
         ),
-        None => g.body.clone(),
+        _ => g.body.clone(),
+    };
+    let self_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = writeln!(logf, "gate-run: FAIL: gate {}: cannot resolve current_exe: {e}", g.name);
+            timing_event(timing, &g.name, "END");
+            return false;
+        }
     };
     let ok = (|| {
         let (out, err) = match (logf.try_clone(), logf.try_clone()) {
             (Ok(o), Ok(e)) => (o, e),
             _ => return false,
         };
+        // The inner program is `bash -c <body>` (bash gate) or `<self> gate-body
+        // <name>` (native gate); prlimit --data wraps either when mem_mib > 0.
         let mut cmd = if mem_mib > 0 {
             let mut c = std::process::Command::new("prlimit");
-            c.arg(format!("--data={}", mem_mib.saturating_mul(1024 * 1024)))
-                .arg("bash");
+            c.arg(format!("--data={}", mem_mib.saturating_mul(1024 * 1024)));
+            if native {
+                c.arg(&self_exe).arg("gate-body").arg(&g.name);
+            } else {
+                c.arg("bash").arg("-c").arg(&body);
+            }
+            c
+        } else if native {
+            let mut c = std::process::Command::new(&self_exe);
+            c.arg("gate-body").arg(&g.name);
             c
         } else {
-            std::process::Command::new("bash")
+            let mut c = std::process::Command::new("bash");
+            c.arg("-c").arg(&body);
+            c
         };
-        cmd.arg("-c")
-            .arg(&body)
-            .current_dir(root)
+        cmd.current_dir(root)
             .env("TD_GUIX", GUIX_CMD)
             .stdout(std::process::Stdio::from(out))
             .stderr(std::process::Stdio::from(err));
@@ -1622,8 +1660,16 @@ mod tests {
         assert!(ts.deps.iter().any(|d| d == "guix-surface"));
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(br.extra_env.iter().any(|(k, _)| k == "TD_BUILD_SPECS"));
-        // Every body is non-empty plain bash (no make-isms survived conversion).
+        // Every bash body is non-empty plain bash (no make-isms survived
+        // conversion). A NATIVE (typed-Rust) gate (#318 axis 3) legitimately has
+        // an empty body — it runs via `td-builder gate-body <name>` — so it is
+        // asserted empty-and-registered instead (the empty ⟺ is_native pairing
+        // that `load` enforces).
         for g in &set.gates {
+            if crate::gate_bodies::is_native(&g.name) {
+                assert!(g.body.trim().is_empty(), "{} is native but carries bash", g.name);
+                continue;
+            }
             assert!(!g.body.trim().is_empty(), "{} has an empty body", g.name);
             assert!(!g.body.contains("$(CURDIR)"), "{} kept a make var", g.name);
             assert!(!g.body.contains("$$"), "{} kept make $$ escaping", g.name);

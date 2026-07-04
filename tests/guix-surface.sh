@@ -47,8 +47,11 @@ trap 'rm -rf "$work"' EXIT INT TERM
 : > "$work/scope"
 # (the Makefile + mk/gates/*.mk entries became builder/src/gate_defs/*.rs when the
 # gate runner replaced make; check_loop.rs — the ported check.sh host prelude — stays
-# out of scope exactly as the shell check.sh always was)
-for f in builder/src/gate_defs/*.rs tests/*.sh ci/*.sh; do
+# out of scope exactly as the shell check.sh always was. builder/src/gate_bodies.rs —
+# native typed gate BODIES, #318 axis 3 — is IN scope: gate bodies were always
+# censused wherever they live, so porting a body out of bash must not move its
+# surface out of the ratchet's sight)
+for f in builder/src/gate_defs/*.rs builder/src/gate_bodies.rs tests/*.sh ci/*.sh; do
   [ -f "$f" ] || continue
   [ "$f" = "$self" ] && continue
   printf '%s\n' "$f" >> "$work/scope"
