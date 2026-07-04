@@ -44,6 +44,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> td-drv-build: td-builder EMITS a canonical hello .drv (round-trip byte-identical) AND EXECUTES the emitted .drv in its own userns sandbox (td-builder build) → the canonical output; guix off PATH, no guile"
 set -euo pipefail; \

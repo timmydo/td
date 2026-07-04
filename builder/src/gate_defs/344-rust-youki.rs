@@ -24,6 +24,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-youki: td builds 'youki' (0.6.0, 663 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); youki runs as an OCI runtime CLI; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

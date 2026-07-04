@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-x86_64-self-gcc-store-native: the NATIVE /td/store toolchain rebuilds binutils 2.44 + GCC 14.3.0 (gcc-rebuilds-gcc, rung X3) — builder is ELF64 x86_64 by assertion, the rebuilt gcc emits byte-identical -O2 -S assembly to its builder, is interned at /td/store as gcc-14.3.0-x86_64-self, and compiles+runs C/C++ in the own-root -> 42, /gnu/store ABSENT"
 sh tests/bootstrap-x86_64-self-gcc-store-native.sh

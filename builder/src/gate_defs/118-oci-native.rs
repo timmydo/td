@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> oci-native: td-builder builds a working OCI image from a store closure (no guix system image); skopeo loads it, crun runs it, reproducible"
 set -euo pipefail; \

@@ -24,6 +24,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-fetch: td builds td-fetch with crates provisioned GUIX-FREE (td-fetched + interned vendor tree, TD_VENDOR_DIR), no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-patch: the tcc-built GNU Make compiles GNU patch 2.5.9 in the sandbox (SHELL override clears the no-/bin/sh segfault) — guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-patch.sh

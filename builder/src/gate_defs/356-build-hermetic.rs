@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): hermeticity probe — warm state would mask an undeclared input
+        non_blocking: true,
         script: r##"
 echo ">> build-hermetic: a td-realized build cannot see /var/guix or the loop's process tree — sandbox::build pivot_roots into a minimal root AND unshares NEWPID"
 set -euo pipefail; \

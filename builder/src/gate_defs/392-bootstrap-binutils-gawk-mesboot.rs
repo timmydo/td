@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-binutils-gawk-mesboot: the gcc-mesboot1 toolchain rebuilds GNU Binutils 2.20.1a + builds GNU awk 3.1.8 — guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-binutils-gawk-mesboot.sh

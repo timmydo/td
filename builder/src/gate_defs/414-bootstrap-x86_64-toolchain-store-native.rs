@@ -35,6 +35,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-x86_64-toolchain-store-native: cross the i686 bootstrap up to a native x86_64 toolchain at /td/store — cross binutils 2.44 + cross gcc 14.3.0 + MODERN x86_64 glibc 2.41 (libgcc_s.so.1); a DYNAMIC x86_64 C AND C++ program runs in the own-root → 42, /gnu/store ABSENT (unblocks the x86_64 Rust runtime leg)"
 sh tests/bootstrap-x86_64-toolchain-store-native.sh

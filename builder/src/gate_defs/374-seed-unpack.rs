@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): restores a frozen seed into a FRESH store and asserts registration
+        non_blocking: true,
         script: r##"
 echo ">> seed-unpack: td-builder restores a frozen seed tarball into a td store + registers it (NAR-verified, no daemon); td's reader reads the complete closure back out (North-Star step 2 PR2)"
 sh tests/seed-unpack.sh

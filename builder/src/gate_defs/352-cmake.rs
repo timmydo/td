@@ -43,6 +43,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> cmake: td builds td-cmake-demo (a cmake C project) via build-recipe (buildSystem cmake) — .drv assembled + realized by td, guix/Guile off PATH; it runs, is reproducible, distinct from guix's cmake-build-system"
 set -euo pipefail; \

@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): the sandbox isolation probe must not see warm state
+        non_blocking: true,
         script: r##"
 echo ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak) and reaps its inner tree when killed"
 set -euo pipefail; \

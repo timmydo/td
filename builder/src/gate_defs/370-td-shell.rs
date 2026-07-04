@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> td-shell: td-builder shell builds a td package (no guix) and runs a command with it on PATH (North-Star step 1; durable behavioral + td-built + load-bearing, removable guix differential)"
 sh tests/td-shell.sh

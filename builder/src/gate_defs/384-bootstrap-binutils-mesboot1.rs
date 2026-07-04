@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-binutils-mesboot1: gcc-mesboot0 rebuilds GNU Binutils 2.20.1a against glibc — a gcc-built, glibc-linked as+ld, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-binutils-mesboot1.sh

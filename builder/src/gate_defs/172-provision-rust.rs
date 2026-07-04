@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> provision-rust: the td-builder seed Rust toolchain is provided-or-rustup (guix-free), resolved in order and used to build a working td-builder; the pinned guix lock is the fallback (dev loop unchanged)"
 set -eu; \

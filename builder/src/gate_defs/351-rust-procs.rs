@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-procs: td builds 'procs' (0.14.10, 297 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); procs reads /proc; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

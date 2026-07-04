@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> toolchain-subst-default: the loop FETCHES the lock-keyed /td/store toolchain by DEFAULT (resolve-toolchain.sh) — sig+StorePath+NarHash verified, runs the fetched-not-built artifact, FALLS BACK to from-seed on a cold store / wrong key (deliberate directive-1 relaxation: the daily suite is the sole from-seed authoritative build + publisher)"
 sh tests/toolchain-subst-default.sh

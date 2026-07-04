@@ -37,6 +37,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &["libsigsegv", "libunistring", "pcre2", "ncurses", "readline"],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> corpus-deps-no-guix: td builds libsigsegv + libunistring + pcre2 + ncurses + readline via build-recipe (no guix/Guile in the build path); each links+runs from td's own output, reproducible"
 set -euo pipefail; \

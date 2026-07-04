@@ -26,6 +26,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-x86_64-native-gcc-store-native: build a NATIVE x86_64 gcc 14.3.0 + binutils 2.44 (ELF 64-bit) with the cross toolchain, intern the native gcc at /td/store, and RUN it in the store-ns own-root where it compiles a C AND C++ program from source -> both 42, /gnu/store ABSENT (x86_64-toolchain rung X2 — the native, self-hosting-arch compiler)"
 sh tests/bootstrap-x86_64-native-gcc-store-native.sh

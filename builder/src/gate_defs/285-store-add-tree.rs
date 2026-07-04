@@ -41,6 +41,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> store-add-tree: td CANONICALLY restores a directory tree into its OWN store + registers it (recursive addToStore, pure Rust, no daemon, no guix) — content-addressed round-trip + a perturbation control proving the addressing is load-bearing"
 set -euo pipefail; \

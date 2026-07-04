@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> userland-x86_64-store-native: busybox + GNU make built from upstream source by the /td/store toolchain, dynamic vs /td/store glibc, run in the store-ns own-root — NO /gnu/store, no guix bytes"
 sh tests/userland-x86_64-store-native.sh

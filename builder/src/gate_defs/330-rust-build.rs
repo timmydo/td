@@ -43,6 +43,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-build: td self-hosts td-builder via build-recipe (buildSystem rust) — .drv assembled + realized by td, guix/Guile off PATH; it runs and is reproducible"
 set -euo pipefail; \

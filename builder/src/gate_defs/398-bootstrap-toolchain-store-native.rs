@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-toolchain-store-native: the seed-built static mesboot toolchain is interned at /td/store and compiles+runs a C program → 42 from td's own store, /gnu/store ABSENT (first /td/store-native step)"
 sh tests/bootstrap-toolchain-store-native.sh

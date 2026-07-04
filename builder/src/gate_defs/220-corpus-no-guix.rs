@@ -38,6 +38,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &["hello"],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> corpus-no-guix: hello builds via td-builder build-recipe (no guix/Guile in the path), runs, reproducible (td-builder check); self-discriminated by hello-perturbed"
 set -euo pipefail; \

@@ -24,6 +24,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): the Rust engine builds from the frozen rust seed alone
+        non_blocking: true,
         script: r##"
 echo ">> rust-seed: td builds td-builder (its Rust engine) from a FROZEN seed that carries the rust toolchain — /var/guix + live /gnu/store toolchain out of the build path; it runs, agrees with guix's, is reproducible (RUST IN THE SEED, North-Star)"
 sh tests/rust-seed.sh

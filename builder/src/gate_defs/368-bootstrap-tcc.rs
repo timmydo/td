@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-tcc: from the seed, MesCC builds TinyCC (tcc) — the first real C compiler; it compiles+runs a C program returning 42, guix-free + reproducible (source-bootstrap brick 4)"
 sh tests/bootstrap-tcc.sh

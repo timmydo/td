@@ -97,6 +97,13 @@ pub struct GateDef {
     pub specs: &'static [&'static str],
     /// Shared (warm, the default) vs Private (cold) builder state — see StoreMode.
     pub store: StoreMode,
+    /// Non-blocking (allow-failure) tag: when a tagged gate FAILS the runner
+    /// TOLERATES it — no fail-fast, and the run is not reded by it (it is reported
+    /// as a non-blocking failure). A tagged gate that PASSES is unaffected (still
+    /// full coverage). Used for the gates that fail when the host guix != the
+    /// channels.scm pin, so a pin-drifted host is not blocked by them while a
+    /// correctly-pinned host still runs and covers them normally.
+    pub non_blocking: bool,
     /// The gate body: plain bash, run as one `bash -c` from the repo root.
     pub script: &'static str,
 }
@@ -121,6 +128,9 @@ struct Gate {
     specs: Vec<String>,
     /// Shared/Private builder state (the #317 flip) — wired into the body's env.
     store: StoreMode,
+    /// Allow-failure tag (see GateDef::non_blocking): a failure is tolerated
+    /// (no fail-fast, does not red the run).
+    non_blocking: bool,
 }
 
 struct GateSet {
@@ -211,6 +221,7 @@ fn load() -> Result<GateSet, String> {
             extra_env: Vec::new(),
             specs: def.specs.iter().map(|s| s.to_string()).collect(),
             store: def.store,
+            non_blocking: def.non_blocking,
         });
     }
 
@@ -256,6 +267,10 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
         extra_env: vec![("TD_BUILD_SPECS".to_string(), set.build_specs.join(" "))],
         specs: Vec::new(),
         store: StoreMode::Shared,
+        // build-recipes builds the corpus via the guix-seeded daemon — it fails
+        // when host guix != pin, so it is non-blocking too (its SoftFailed still
+        // satisfies its BUILD_GATE dependents' readiness).
+        non_blocking: true,
     };
     set.index.insert(BUILD_RECIPES.to_string(), set.gates.len());
     set.gates.push(br);
@@ -918,12 +933,18 @@ fn run_gate(
 /// parity), with a one-line PASS/FAIL trailer. Raw bytes, not String: build
 /// logs routinely carry non-UTF-8 (compiler/tar output), and read_to_string
 /// would silently drop the WHOLE log — the one thing a red gate must not lose.
-fn print_gate_output(name: &str, log_path: &Path, ok: bool, secs: f64) {
+fn print_gate_output(name: &str, log_path: &Path, ok: bool, non_blocking: bool, secs: f64) {
     let body = std::fs::read(log_path).unwrap_or_default();
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let _ = lock.write_all(&body);
-    let verdict = if ok { "PASS" } else { "FAIL" };
+    let verdict = if ok {
+        "PASS"
+    } else if non_blocking {
+        "FAIL (non-blocking — tolerated)"
+    } else {
+        "FAIL"
+    };
     let _ = writeln!(lock, "[gate-run] {name}: {verdict} ({secs:.1}s)");
     let _ = lock.flush();
 }
@@ -956,6 +977,9 @@ enum St {
     Running,
     Done,
     Failed,
+    /// A non-blocking gate that FAILED: tolerated — it satisfies dependents (like
+    /// Done for readiness) and does not red the run, but is reported distinctly.
+    SoftFailed,
 }
 
 struct Sched {
@@ -1082,9 +1106,12 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 continue;
             }
             let deps = dep_idx.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            let ready = deps
-                .iter()
-                .all(|d| !s.st.contains_key(d) || s.st.get(d) == Some(&St::Done));
+            // A dep is satisfied when it is Done OR SoftFailed (a tolerated
+            // non-blocking failure must not wedge its dependents as Pending).
+            let ready = deps.iter().all(|d| {
+                !s.st.contains_key(d)
+                    || matches!(s.st.get(d), Some(St::Done) | Some(St::SoftFailed))
+            });
             if !ready {
                 continue;
             }
@@ -1161,16 +1188,32 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     cfg.gate_tree_mem_mib,
                     cfg.cgroup_dir.as_deref(),
                 );
-                print_gate_output(&g.name, &log_path, ok, started.elapsed().as_secs_f64());
+                print_gate_output(
+                    &g.name,
+                    &log_path,
+                    ok,
+                    g.non_blocking,
+                    started.elapsed().as_secs_f64(),
+                );
                 if ok {
                     if let Some(key) = &cfg.tree_key {
                         journal_pass(&cfg.root, key, &g.name);
                     }
                 }
                 let mut s = lock_sched(&sched);
-                s.st.insert(gi, if ok { St::Done } else { St::Failed });
+                // A non-blocking gate that fails SoftFails: it satisfies dependents
+                // and does not red the run, and — crucially — does not set `fail`,
+                // so it never triggers the fail-fast that would stop other gates.
+                let new_st = if ok {
+                    St::Done
+                } else if g.non_blocking {
+                    St::SoftFailed
+                } else {
+                    St::Failed
+                };
+                s.st.insert(gi, new_st);
                 s.running -= 1;
-                if !ok {
+                if new_st == St::Failed {
                     s.fail = true;
                 }
                 cv.notify_all();
@@ -1179,14 +1222,27 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
     });
 
     let s = lock_sched(&sched);
-    let all_done = s.st.values().all(|st| *st == St::Done);
-    if !all_done {
-        let failed: Vec<&str> = s
-            .st
+    let names = |want: St| -> Vec<&str> {
+        s.st
             .iter()
-            .filter(|(_, st)| **st == St::Failed)
+            .filter(|(_, st)| **st == want)
             .filter_map(|(i, _)| set.gates.get(*i).map(|g| g.name.as_str()))
-            .collect();
+            .collect()
+    };
+    // Non-blocking failures are tolerated: reported, but they do NOT red the run.
+    let soft: Vec<&str> = names(St::SoftFailed);
+    if !soft.is_empty() {
+        eprintln!(
+            "gate-run: {} non-blocking gate(s) FAILED but tolerated (not blocking): {}",
+            soft.len(),
+            soft.join(" ")
+        );
+    }
+    // Green iff every gate ended Done or SoftFailed (no hard Failed, none left
+    // Pending/Running by fail-fast).
+    let green = s.st.values().all(|st| matches!(st, St::Done | St::SoftFailed));
+    if !green {
+        let failed = names(St::Failed);
         let skipped = s.st.values().filter(|st| **st == St::Pending).count();
         eprintln!(
             "gate-run: RED — failed: {}{}",
@@ -1194,7 +1250,7 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
             if skipped > 0 { format!(" ({skipped} gates not started)") } else { String::new() }
         );
     }
-    Ok(all_done)
+    Ok(green)
 }
 
 // ---------------------------------------------------------------------------
@@ -1475,6 +1531,7 @@ mod tests {
                 extra_env: Vec::new(),
                 specs: Vec::new(),
                 store: StoreMode::Shared,
+                non_blocking: false,
             });
         }
         GateSet { gates, index, build_specs: Vec::new() }
@@ -1535,6 +1592,55 @@ mod tests {
         let sel = expand_goals(&set, &["check".to_string()]).unwrap();
         assert!(!run_selected(&set, &sel, &cfg(&d, 4, None)).unwrap());
         assert!(!d.join("late.ran").exists(), "gate behind a red gate must not start");
+    }
+
+    #[test]
+    fn non_blocking_gate_failure_is_tolerated_and_does_not_fail_fast() {
+        // A `non_blocking` gate that FAILS must not red the run and must not stop
+        // other gates (the guix-pin gates, on a drifted host).
+        let d = tmpdir("nonblock");
+        let mut set = synth(
+            &d,
+            &[
+                ("softfail", Pool::Cheap, "exit 7", &[]), // fails
+                ("after", Pool::Cheap, "touch {D}/after.ran", &["softfail"]), // depends on it
+                ("indep", Pool::Cheap, "touch {D}/indep.ran", &[]), // independent
+            ],
+        );
+        // tag `softfail` non-blocking (as the guix-pin gate_defs are).
+        let si = *set.index.get("softfail").unwrap();
+        set.gates.get_mut(si).unwrap().non_blocking = true;
+
+        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        // GREEN despite softfail failing — the failure is tolerated.
+        assert!(
+            run_selected(&set, &sel, &cfg(&d, 4, None)).unwrap(),
+            "a non-blocking gate's failure must not red the run"
+        );
+        // No fail-fast: the dependent (its SoftFailed dep is satisfied) AND the
+        // independent gate both ran.
+        assert!(
+            d.join("after.ran").exists(),
+            "a dependent of a soft-failed non-blocking gate must still run"
+        );
+        assert!(d.join("indep.ran").exists(), "an independent gate must still run");
+
+        // Contrast: WITHOUT the tag the same failure reds the run + fail-fasts the
+        // dependent (this is the existing blocking behavior).
+        let d2 = tmpdir("nonblock-blocking");
+        let set2 = synth(
+            &d2,
+            &[
+                ("softfail", Pool::Cheap, "exit 7", &[]),
+                ("after", Pool::Heavy, "touch {D}/after.ran", &["softfail"]),
+            ],
+        );
+        let sel2 = expand_goals(&set2, &["check".to_string()]).unwrap();
+        assert!(
+            !run_selected(&set2, &sel2, &cfg(&d2, 4, None)).unwrap(),
+            "an untagged (blocking) failure must still red the run"
+        );
+        assert!(!d2.join("after.ran").exists(), "blocking failure must fail-fast the dependent");
     }
 
     #[test]
@@ -1777,6 +1883,7 @@ mod tests {
             extra_env: Vec::new(),
             specs: Vec::new(),
             store: StoreMode::Shared,
+            non_blocking: false,
         });
         set.index.insert(BUILD_RECIPES.to_string(), idx);
         let sel = expand_goals(&set, &["consumer".to_string()]).unwrap();

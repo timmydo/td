@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-hello-userland: the /td/store toolchain compiles GNU hello 2.10 from source (configure+make); the dynamic binary runs from /td/store → \"Hello, world!\", /gnu/store ABSENT (source-bootstrap brick 6 rung 3)"
 sh tests/bootstrap-hello-userland.sh

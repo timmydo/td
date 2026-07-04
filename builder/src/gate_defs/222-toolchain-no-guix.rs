@@ -31,6 +31,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &["make", "sed", "grep", "xz", "diffutils", "patch", "file", "coreutils", "gawk", "tar", "findutils", "bash"],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> toolchain-no-guix: td builds make + sed + grep + xz + diffutils + patch + file + coreutils + gawk + tar + findutils + bash via build-recipe (no guix/Guile in the build path); each runs, reproducible; gcc/glibc/binutils seed stays external (§5)"
 set -euo pipefail; \

@@ -24,6 +24,7 @@ pub fn gate() -> GateDef {
         // Private: the gate must exercise its OWN throwaway cache, never the machine-wide
         // one (it poisons entries on purpose).
         store: StoreMode::Private,
+        non_blocking: false,
         script: r##"
 echo ">> chain-cache: warm bricks build once + NAR-verified reuse; poisoned entries rejected; Private/cold runs never touch the cache (#317); whole-key GC sweeps stale keys, spares live + flock-held (#326)"
 sh tests/chain-cache.sh

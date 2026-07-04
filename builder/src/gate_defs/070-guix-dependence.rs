@@ -37,6 +37,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> guix-dependence: td's build-time independence from guix (snapshot census of td-reproducible vs guix-supplied derivations across the owned-corpus union + shipped system)"
 $TD_GUIX repl -L . tests/guix-dependence.scm

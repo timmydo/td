@@ -29,6 +29,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> guix-surface: ratchet td's guix-as-packager seed surface (move-off-Guile §5) — new seeds are td-placed fixed-output fetches, not guix-built packages; the snapshot may only shrink"
 sh tests/guix-surface.sh

@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): the loop container stands up from a SEED alone
+        non_blocking: true,
         script: r##"
 echo ">> harness-seed: td's loop container stands up from a SEED alone — host /gnu/store + the guix daemon absent, guix off PATH — and the loop toolchain runs inside it (the guix-less VM substrate)"
 sh tests/harness-seed.sh

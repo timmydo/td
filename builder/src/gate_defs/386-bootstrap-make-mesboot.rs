@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-make-mesboot: gcc-mesboot0 rebuilds GNU Make 3.82 against glibc — a glibc-linked make that does its job, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-make-mesboot.sh

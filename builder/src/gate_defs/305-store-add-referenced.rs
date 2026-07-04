@@ -30,6 +30,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> store-add-referenced: td ADDS a td-ASSEMBLED hello .drv WITH references to its OWN store + registers the references (pure Rust, no daemon; guix off PATH) — a round-trip of the folded references"
 set -euo pipefail; \

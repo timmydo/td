@@ -28,6 +28,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): GC semantics assert exact contents of a fresh fixture store
+        non_blocking: true,
         script: r##"
 echo ">> store-gc: td computes the GC-reachable closure of a TD-BUILT hello from its OWN store DB (pure Rust, no daemon) == td's own content scan (guix off PATH; no guix gc)"
 set -euo pipefail; \

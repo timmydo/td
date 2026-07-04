@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): guix-free td shell standup from the frozen seed alone
+        non_blocking: true,
         script: r##"
 echo ">> td-shell-seed: td shell builds + runs td's hello entirely from the frozen seed — no guix process AND no /var/guix (the user-facing command is fully guix-free)"
 sh tests/td-shell-seed.sh

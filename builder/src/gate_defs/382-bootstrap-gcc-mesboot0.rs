@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-gcc-mesboot0: the first gcc rebuilds GCC 2.95.3 against glibc — a gcc self-hosted on the real C library, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-gcc-mesboot0.sh

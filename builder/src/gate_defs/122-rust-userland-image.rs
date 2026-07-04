@@ -33,6 +33,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-userland-image: ship td-BUILT procs/fd/ripgrep/sd/eza/bat in td-NATIVE OCI images (td-builder oci-image, no guix system image); crun runs each from its image; reproducible"
 set -euo pipefail; \

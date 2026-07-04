@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> store-add: td PLACES a text path into its OWN store + registers it (pure Rust, no daemon in the write path) — differential vs the daemon's addToStore"
 set -euo pipefail; \

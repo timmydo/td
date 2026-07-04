@@ -41,6 +41,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> td-check: td computes the reproducibility verdict ITSELF — its build daemon builds the TD-BUILT hello .drv in two independent userns sandboxes (the realized build + one fresh rebuild), NAR-equal; guix off PATH, no guix build --check"
 set -euo pipefail; \

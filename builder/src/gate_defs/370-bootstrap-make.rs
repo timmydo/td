@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-make: from the seed, the tcc from brick 4 compiles GNU Make 3.80 — its first real-program build, guix-free + reproducible (source-bootstrap brick 5, first rung)"
 sh tests/bootstrap-make.sh

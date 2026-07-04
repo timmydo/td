@@ -42,6 +42,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> daemon-recipe: td's persistent build daemon realizes a TD-ASSEMBLED real recipe (hello) into td's OWN store over a Unix socket (no guix-daemon, no guix repl/Guile emitting the drv); the artifact runs; a repeat request is a cache HIT"
 set -euo pipefail; \
