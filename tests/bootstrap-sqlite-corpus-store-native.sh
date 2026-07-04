@@ -46,8 +46,8 @@ export TD_STORE_DIR=/td/store
 
 echo "   --- build-recipe builds sqlite 3.51.0 with the /td/store toolchain ---"
 b8=`mktemp -d`; bstore="$b8/seed-store"; bgdb="$b8/glibc.db"; btdb="$b8/toolchain.db"; mkdir -p "$bstore"
+trap 'rm -rf "$b8"' EXIT INT TERM
 BMB="$BMB244SB"
-csh=`command -v bash 2>/dev/null || command -v sh`
 BUILDBASH=`grep -- '-bash-5.2.37 ' tests/sqlite-no-guix.lock | grep -v -e static -e minimal | sed 's/^[^ ]* //' | head -1`/bin/bash
 case "$BUILDBASH" in /gnu/store/*-bash-*/bin/bash) ;; *) fail "could not resolve the lock's bash" ;; esac
 GLP8=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$bstore" "$bgdb"` || fail "store-add glibc-2.41 failed"
@@ -100,18 +100,28 @@ oldtc=${TD_GATE_INPUT_GCC_TOOLCHAIN:-}
 test -n "$oldtc" || fail "TD_GATE_INPUT_GCC_TOOLCHAIN unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 newlock="$b8/sqlite.lock"
 sed "s|^[^ ]*-gcc-toolchain-[^ ]* .*|gcc-toolchain $TCP seed\nglibc-2.41 $GLP8 seed|" tests/sqlite-no-guix.lock > "$newlock"
-# Seed provisioning WITHOUT a guix process (#311): present roots are trusted, missing ones come
-# from td's own signed substitute store, else this fails closed (the non_blocking trade until
-# #350 re-verifies the family blocking).
-sh tools/resolve-seed.sh tests/sqlite-no-guix.lock || fail "resolve-seed could not supply the pinned lock closure (warm the host store or publish the seed substitutes)"
 grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
 "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
 sort -u "$b8/roots" -o "$b8/roots"
+# Seed provisioning WITHOUT a guix process (#311): resolve exactly what the build STAGES —
+# $newlock's remaining /gnu/store roots (the substituted-out seed gcc-toolchain is NOT here;
+# only its path string is used, by the no-ref grep below) plus the stage0 builder's own refs
+# (warm-seed content-scans them too). Present roots are trusted, missing ones come from td's
+# own signed substitute store, else this fails closed (the non_blocking trade until #350
+# re-verifies the family blocking).
+sed 's|^|seed |' "$b8/roots" > "$b8/roots.lock"
+sh tools/resolve-seed.sh "$b8/roots.lock" || fail "resolve-seed could not supply the build's pinned closure (warm the host store or publish the seed substitutes)"
 # Warm seed capture by CONTENT-SCAN: TD_SEED_DB is a store DIRECTORY, so the capture walks the
 # closure from the roots by scanning bytes — no packager-private DB in the path (#311).
 seedline=`TB="$TB" TD_SEED_DB=/gnu/store sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-b8-sqlite" $(cat "$b8/roots")` || fail "warm-seed failed"
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
-for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done
+# skip-if-present: the basenames are content-addressed, and a bare cp -a onto an existing
+# dir would NEST the copy inside it — a retry after a mid-gate failure (the cache is only
+# removed on success) must not corrupt the warm seed store.
+for p in "$TCP" "$GLP8"; do
+  b=`basename "$p"`
+  [ -e "$WSTORE/$b" ] || cp -a "$bstore/$b" "$WSTORE/$b"
+done
 chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
 # emit the sqlite recipe via td's OWN Rust recipe evaluator (build it ourselves when the
 # build-recipes prelude hasn't run — standalone `check` runs carry no prelude).
@@ -121,7 +131,7 @@ load_recipe_eval 2>/dev/null || {
 }
 sh tests/recipe-emit.sh sqlite > "$b8/sqlite.json" || fail "recipe-emit sqlite"
 mkdir -p "$b8/sb" "$b8/tmp"; cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
-env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
+env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
   TD_SEED_STORE="$WSTORE" TD_SEED_DB="$WDB" TD_EXTRA_DBS="$bgdb:$btdb" \
   "$TB" build-recipe "$b8/sqlite.json" "$newlock" "$b8/sb" "$WDB" >"$b8/sb.out" 2>"$b8/sb.err" \
@@ -131,8 +141,10 @@ sdir="$b8/sb/newstore/`basename "$o"`"; sqb="$sdir/bin/sqlite3"; test -x "$sqb" 
 # (a) the /td/store toolchain linked it: interp is the /td/store glibc 2.41.
 si=`"$BMB/bin/readelf" -l "$sqb" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
 test -n "$si" || fail "sqlite3 not linked vs the /td/store glibc 2.41"
-# (b) [no-guix-toolchain] NO reference to the seed gcc-toolchain (the substituted-OUT compiler).
-if grep -q -a -- "$oldtc" "$sqb"; then fail "sqlite3 references the substituted-out gcc-toolchain $oldtc"; fi
+# (b) [no-guix-toolchain] NO reference to the seed gcc-toolchain (the substituted-OUT compiler)
+# anywhere in the installed tree — the behavioral leg loads lib/libsqlite3.so too, so the
+# library half must be as clean as the CLI binary.
+if grep -q -a -r -- "$oldtc" "$sdir"; then fail "the sqlite output tree references the substituted-out gcc-toolchain $oldtc"; fi
 echo "   [no-guix-toolchain] build-recipe built sqlite 3.51.0 with the /td/store toolchain; interp=$si; no seed gcc-toolchain ref"
 # (c) [DURABLE behavioral] sqlite3 runs in an own-root holding the /td/store glibc 2.41 + a
 # static bash, driven as the LADDER drives it (store-register's parser-oracle role):
@@ -155,16 +167,17 @@ snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 sq=/td/store/'"$sq2"'/bin/sqlite3
 export LD_LIBRARY_PATH=/td/store/'"$sq2"'/lib
 ic=`"$sq" /td/store/td-store.db "PRAGMA integrity_check"`; echo "IC=$ic"
-"$sq" /td/store/td-store.db "SELECT path FROM ValidPaths ORDER BY path"
+"$sq" /td/store/td-store.db "SELECT path FROM ValidPaths ORDER BY path" | while read -r p; do echo "VP=$p"; done
 sum=`"$sq" /tmp/t.db "CREATE TABLE t(v INTEGER); INSERT INTO t VALUES(41),(1); SELECT SUM(v) FROM t"`; echo "SUM=$sum"
 "$sq" /td/store/td-bad.db "PRAGMA integrity_check" >/dev/null 2>&1 && echo "BAD=accepted" || echo "BAD=rejected"'
 snout=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | sed 's/^/     /' >&2; fail "store-ns sqlite3 probe exited nonzero"; }
 printf '%s\n' "$snout" | sed 's/^/     /' >&2
 echo "$snout" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root — mixed with the seed store"
 echo "$snout" | grep -q '^IC=ok$' || fail "sqlite3 integrity_check over td's store DB did not return ok"
-# the interned glibc path can appear in snout ONLY via the ValidPaths SELECT (nothing else
-# prints it), and it embeds the content hash — a self-discriminating read-back.
-echo "$snout" | grep -q -- "^$GLP8\$" || fail "sqlite3 did not read the interned glibc path back from td's ValidPaths"
+# the VP= prefix is emitted only by the ValidPaths SELECT loop (stderr noise can't carry
+# it), the match is a fixed-string whole line (-xF, no BRE dots), and the path embeds the
+# content hash — a self-discriminating read-back.
+echo "$snout" | grep -qxF -- "VP=$GLP8" || fail "sqlite3 did not read the interned glibc path back from td's ValidPaths"
 echo "$snout" | grep -q '^SUM=42$' || fail "sqlite3 SQL write/read round-trip did not return 42"
 echo "$snout" | grep -q '^BAD=rejected$' || fail "sqlite3 accepted a garbage non-DB (the parser oracle is vacuous)"
 echo "   [DURABLE behavioral] sqlite3 runs from /td/store: integrity_check=ok on td-written DB bytes, ValidPaths reads back $GLP8, SQL round-trip → 42, garbage rejected"

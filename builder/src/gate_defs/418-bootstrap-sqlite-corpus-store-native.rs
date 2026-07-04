@@ -10,7 +10,10 @@
 //! self-discriminating), a real SQL write/read round-trip → 42 on the ns tmpfs, and a garbage
 //! non-DB is rejected (the oracle is not vacuous) — /gnu/store ABSENT. Seed provisioning is
 //! guix-PROCESS-free, unlike the grandfathered hello/sed siblings: resolve-seed (td-subst, #311)
-//! supplies the pinned lock closure and the warm seed capture content-scans the store directory.
+//! supplies the roots the build actually STAGES (the substituted-out seed gcc-toolchain is not
+//! demanded) and the warm seed capture content-scans the store directory. Like every #353 gate,
+//! the typed inputs below resolve from the on-disk lock closure BEFORE the body runs — a fully
+//! cold /gnu/store reds at input resolution, the same family property as the siblings.
 //! `non_blocking` matches the corpus siblings until the seed-provisioning dependence retires
 //! (#311/#350): on a host without the warm chain bricks or the pinned seed closure this red is
 //! environmental, not a regression. Warm via the shared chain cache (#317). `Pool::Daily` like
