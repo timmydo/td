@@ -16,9 +16,10 @@
 //! removed is the build-system Guile, not the toolchain.
 //!
 //! Every phase command run through `run_cmd` sits under a fail-fast watchdog
-//! (#308) — see `Watch`: a broken staged closure must red in minutes with a
-//! named tool, never spin. (`find_files`' short bash probe is the one
-//! subprocess outside it.)
+//! (#308, #339) — see `Watch`: a broken staged closure must red in minutes with
+//! a named tool, never spin — whether the spin is the top-level configure or a
+//! chatty sub-`./configure` nested inside a `make` phase. (`find_files`' short
+//! bash probe is the one subprocess outside it.)
 //!
 //! Inputs (env, set by system td-build):
 //!   out                output prefix (the daemon sets this)
@@ -177,25 +178,33 @@ fn single_subdir(dir: &str) -> Result<String, String> {
 /// heavy-gate slot. `run_cmd` supervises every phase command it runs; zero
 /// disables a bound:
 ///
-///   * `repeat_limit` — while the command still RUNS, the SAME line this many
-///     times in a row on one stream is a persistently-failing tool in a retry
-///     loop; the group is killed and the phase reds, the repeated line naming
-///     the failing tool. Only ever kills a running command: a command that
-///     terminates on its own is judged by its exit status, so a self-limiting
-///     spammer is never falsely killed. Set ONLY for configure — healthy
-///     non-configure tools can repeat a line per work item (`tar xf` prints the
-///     identical "Ignoring unknown extended header keyword" warning per pax
-///     member), while a healthy configure never emits hundreds of identical
-///     consecutive lines. KNOWN RESIDUAL (#339): a #292-shape spin nested
-///     INSIDE a `make` phase (a bundled sub-`./configure` the Makefile re-runs)
-///     is not repeat-bounded and, if it spins chattily, resets the silence
-///     clock — the silence bound only catches a SILENT wedge there. The
-///     top-level configure the issue targets is fully covered.
+///   * `repeat_limit` — a COUNT bound: while the command still RUNS, the SAME
+///     line this many times in a row on one stream is a persistently-failing
+///     tool in a retry loop; the group is killed and the phase reds, the
+///     repeated line naming the failing tool. Only ever kills a running command:
+///     a command that terminates on its own is judged by its exit status, so a
+///     self-limiting spammer is never falsely killed. Set ONLY for configure —
+///     healthy non-configure tools can repeat a line per work item (`tar xf`
+///     prints the identical "Ignoring unknown extended header keyword" warning
+///     per pax member), while a healthy configure never emits hundreds of
+///     identical consecutive lines.
+///   * `repeat_secs` — a DURATION bound for the same-line spin, robust to the
+///     high-volume output that rules `repeat_limit` out of the `make` phase.
+///     It trips only when the identical line is STILL ARRIVING after this much
+///     wall-clock (the run of consecutive identical lines has lasted the window),
+///     which distinguishes a chatty spin from legit high-volume output: a healthy
+///     phase PROGRESSES (different lines reset the run) or COMPLETES (the burst
+///     ends) long before the window — `tar xf` finishes, a verbose `make` prints
+///     varied lines — whereas a broken tool keeps emitting the one line forever.
+///     This closes the #339 residual: a #292-shape spin nested INSIDE a `make`
+///     phase (a bundled sub-`./configure` the Makefile re-runs) that spins
+///     CHATTILY resets the silence clock on every line, so only this bound — not
+///     the count bound (off for `make`) nor the silence bound — catches it.
 ///   * `silence` — no output on either stream for this long, while the command
 ///     still runs, is a wedged phase: the backstop for a spin whose tool
 ///     stderr configure redirects away (conftest stderr usually goes to
-///     /dev/null or config.log), and the sole bound for the WATCH_PHASE
-///     residual above.
+///     /dev/null or config.log), and the bound for a SILENT `make`-phase wedge
+///     (the chatty one is `repeat_secs`'s job).
 ///   * `drain_grace` — once the command has EXITED, how long a leftover
 ///     background process may keep the output pipes open before the phase's
 ///     process group is killed (and, `DRAIN_EXTRA` later, the drain abandoned
@@ -211,6 +220,7 @@ fn single_subdir(dir: &str) -> Result<String, String> {
 struct Watch {
     silence: Duration,
     repeat_limit: u32,
+    repeat_secs: Duration,
     drain_grace: Duration,
 }
 
@@ -218,19 +228,28 @@ struct Watch {
 /// big translation unit compiles; 30 minutes is comfortably past the corpus'
 /// worst single-file case (the /td/store bootstrap chain does NOT run through
 /// run_cmd — bootstrap.rs/toolchain_x86_64.rs have their own runners), while
-/// still bounding a truly-wedged phase. No repeat bound (see `Watch`).
+/// still bounding a truly-wedged phase. No COUNT repeat bound (`tar xf` repeats
+/// a warning per member); the `repeat_secs` DURATION bound (5 min of the same
+/// line still arriving) is the #339 make-nested chatty-spin catch — comfortably
+/// above any real burst (a tar of a huge tarball finishes in a minute or two,
+/// its warning does not keep arriving for five straight minutes) yet well under
+/// the 30-min silence backstop, so a broken sub-configure reds in minutes.
 const WATCH_PHASE: Watch = Watch {
     silence: Duration::from_secs(1800),
     repeat_limit: 0,
+    repeat_secs: Duration::from_secs(300),
     drain_grace: Duration::from_secs(15),
 };
 
 /// configure bound: each configure check compiles+links a conftest in seconds,
 /// so ten silent minutes means wedged — this is what turns the #292 class of
-/// hang into a red "within minutes" even when the loop is silent.
+/// hang into a red "within minutes" even when the loop is silent. The fast COUNT
+/// bound catches the chatty top-level configure spin; a healthy configure never
+/// emits 200 identical lines in a row, so no duration bound is needed here.
 const WATCH_CONFIGURE: Watch = Watch {
     silence: Duration::from_secs(600),
     repeat_limit: 200,
+    repeat_secs: Duration::from_secs(0),
     drain_grace: Duration::from_secs(15),
 };
 
@@ -260,6 +279,11 @@ fn clip_line(line: &[u8]) -> String {
 struct StreamWatch {
     last_line: Vec<u8>,
     repeats: u32,
+    /// ms (relative to the supervise `start`) when the CURRENT run of consecutive
+    /// identical lines began — reset whenever the line changes. Feeds the
+    /// `repeat_secs` duration bound: `now - run_start_ms` is how long the same
+    /// line has been arriving without interruption.
+    run_start_ms: u64,
     /// Last few DISTINCT lines, clipped, for the kill diagnostic (a repeat is
     /// already quoted by the trip reason; duplicating it 5x buries context).
     tail: std::collections::VecDeque<String>,
@@ -267,7 +291,12 @@ struct StreamWatch {
 
 impl StreamWatch {
     fn new() -> Self {
-        StreamWatch { last_line: Vec::new(), repeats: 0, tail: std::collections::VecDeque::new() }
+        StreamWatch {
+            last_line: Vec::new(),
+            repeats: 0,
+            run_start_ms: 0,
+            tail: std::collections::VecDeque::new(),
+        }
     }
 }
 
@@ -284,53 +313,95 @@ struct Supervise {
     err_watch: Mutex<StreamWatch>,
 }
 
-/// Account one complete line: repeat counting + the distinct-line tail. At
-/// `limit` consecutive identical lines the trip reason is recorded (once);
-/// the poll loop does the killing, so kill and reap stay ordered in one
-/// thread and a stale pgid is never signalled.
+/// Record the first trip reason; later reasons lose (the poll loop kills on it).
+fn record_why(why: &Mutex<Option<String>>, reason: impl FnOnce() -> String) {
+    if let Ok(mut w) = why.lock() {
+        if w.is_none() {
+            *w = Some(reason());
+        }
+    }
+}
+
+/// Account one complete line: repeat counting + the distinct-line tail, then the
+/// two same-line spin bounds. `now_ms` is ms since the supervise `start` (the
+/// time this line arrived). A trip reason is recorded (once); the poll loop does
+/// the killing, so kill and reap stay ordered in one thread and a stale pgid is
+/// never signalled.
+///
+///   * COUNT bound (`count_limit`, configure): `count_limit` identical lines in
+///     a row. Fast — a healthy configure never emits that many.
+///   * DURATION bound (`repeat_ms`, `make` phase): the identical line is STILL
+///     arriving `repeat_ms` after the run began. Robust to legit high-volume
+///     output (`tar xf`'s per-member warning) because that COMPLETES — the line
+///     stops arriving — long before the window; only a real spin keeps the one
+///     line coming for the whole duration. `repeats >= 2` gates out a lone line
+///     (a single line that then goes silent is the silence bound's job).
+///
+/// `keep_tail` records the distinct-line diagnostic tail; only the stderr
+/// watcher's tail is ever read (it feeds the kill diagnostic), so stdout passes
+/// `false` to skip the per-line `clip_line` allocation on a verbose build.
 fn account_line(
     st: &mut StreamWatch,
     line: &[u8],
-    limit: u32,
+    count_limit: u32,
+    repeat_ms: u64,
+    now_ms: u64,
+    keep_tail: bool,
     stream: &str,
     why: &Mutex<Option<String>>,
 ) {
-    if line == st.last_line.as_slice() {
+    // `repeats == 0` is the initial state (no line accounted yet); force the
+    // first line down the run-start path so its `run_start_ms` is seeded — an
+    // empty first line must not be mistaken for a repeat of the empty sentinel.
+    if st.repeats > 0 && line == st.last_line.as_slice() {
         st.repeats = st.repeats.saturating_add(1);
     } else {
         st.last_line.clear();
         st.last_line.extend_from_slice(line);
         st.repeats = 1;
-        if st.tail.len() >= 5 {
-            st.tail.pop_front();
-        }
-        st.tail.push_back(clip_line(line));
-    }
-    if limit > 0 && st.repeats >= limit {
-        if let Ok(mut w) = why.lock() {
-            if w.is_none() {
-                *w = Some(format!(
-                    "the same {stream} line repeated {}x (a persistently-failing tool in a retry loop): {}",
-                    st.repeats,
-                    clip_line(line)
-                ));
+        st.run_start_ms = now_ms;
+        if keep_tail {
+            if st.tail.len() >= 5 {
+                st.tail.pop_front();
             }
+            st.tail.push_back(clip_line(line));
         }
+    }
+    if count_limit > 0 && st.repeats >= count_limit {
+        let repeats = st.repeats;
+        record_why(why, || {
+            format!(
+                "the same {stream} line repeated {repeats}x (a persistently-failing tool in a retry loop): {}",
+                clip_line(line)
+            )
+        });
+        return;
+    }
+    if repeat_ms > 0 && st.repeats >= 2 && now_ms.saturating_sub(st.run_start_ms) >= repeat_ms {
+        let repeats = st.repeats;
+        record_why(why, || {
+            format!(
+                "the same {stream} line kept arriving for {} ({repeats}x — a chatty spin, likely a persistently-failing tool in a make-nested retry loop): {}",
+                fmt_ms(repeat_ms),
+                clip_line(line)
+            )
+        });
     }
 }
 
 /// Tee one child stream to `sink`, updating the shared activity clock; when
 /// `watch` is set, also split into lines for the repeat accountant (stderr
-/// always — its tail feeds the silence-kill diagnostic — and stdout too when a
-/// repeat bound is set, so a retry spin printing to stdout cannot escape the
-/// watchdog by resetting the silence clock). Chunk-based (not read_until): a
+/// always — its tail feeds the silence-kill diagnostic — and stdout too when
+/// either repeat bound is set, so a retry spin printing to stdout cannot escape
+/// the watchdog by resetting the silence clock). `watch` carries `(state,
+/// count_limit, repeat_ms, keep_tail, stream)`. Chunk-based (not read_until): a
 /// `\r`-progress stream with no newline still counts as activity, and an
 /// unterminated line cannot grow unboundedly.
 fn tee_stream(
     mut src: impl std::io::Read,
     mut sink: impl std::io::Write,
     sup: &Supervise,
-    watch: Option<(&Mutex<StreamWatch>, u32, &str)>,
+    watch: Option<(&Mutex<StreamWatch>, u32, u64, bool, &str)>,
 ) {
     let mut buf = [0u8; 8192];
     let mut pending: Vec<u8> = Vec::new();
@@ -349,18 +420,19 @@ fn tee_stream(
         let chunk = buf.get(..n).unwrap_or(&buf);
         let _ = sink.write_all(chunk);
         let _ = sink.flush();
-        if let Some((watch, limit, stream)) = watch {
+        if let Some((watch, count_limit, repeat_ms, keep_tail, stream)) = watch {
             if let Ok(mut st) = watch.lock() {
                 // Linear scan of the chunk; only a trailing partial line is
-                // carried over (no per-line allocation, no re-scan).
+                // carried over (no per-line allocation, no re-scan). `elapsed`
+                // (the chunk's read time) is the arrival clock for the run.
                 let mut rest = chunk;
                 while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
                     let line = rest.get(..nl).unwrap_or_default();
                     if pending.is_empty() {
-                        account_line(&mut st, line, limit, stream, &sup.why);
+                        account_line(&mut st, line, count_limit, repeat_ms, elapsed, keep_tail, stream, &sup.why);
                     } else {
                         pending.extend_from_slice(line);
-                        account_line(&mut st, &pending, limit, stream, &sup.why);
+                        account_line(&mut st, &pending, count_limit, repeat_ms, elapsed, keep_tail, stream, &sup.why);
                         pending.clear();
                     }
                     rest = rest.get(nl.saturating_add(1)..).unwrap_or_default();
@@ -427,12 +499,20 @@ fn run_cmd(
         out_watch: Mutex::new(StreamWatch::new()),
         err_watch: Mutex::new(StreamWatch::new()),
     });
-    let limit = watch.repeat_limit;
+    let count_limit = watch.repeat_limit;
+    let repeat_ms = u64::try_from(watch.repeat_secs.as_millis()).unwrap_or(u64::MAX);
     let out_reader = {
         let sup = std::sync::Arc::clone(&sup);
         std::thread::spawn(move || {
-            // stdout is line-watched only under a repeat bound (configure).
-            let w = if limit > 0 { Some((&sup.out_watch, limit, "stdout")) } else { None };
+            // stdout is line-watched under EITHER repeat bound (the count bound
+            // for configure, the duration bound for the make phase) — a chatty
+            // spin printing to stdout must not escape by resetting the silence
+            // clock. No tail kept: only err_watch.tail feeds the diagnostic.
+            let w = if count_limit > 0 || repeat_ms > 0 {
+                Some((&sup.out_watch, count_limit, repeat_ms, false, "stdout"))
+            } else {
+                None
+            };
             tee_stream(child_out, std::io::stdout(), &sup, w);
             sup.out_done.store(true, Ordering::Relaxed);
         })
@@ -441,7 +521,12 @@ fn run_cmd(
         let sup = std::sync::Arc::clone(&sup);
         std::thread::spawn(move || {
             // stderr is always line-watched: its tail feeds every diagnostic.
-            tee_stream(child_err, std::io::stderr(), &sup, Some((&sup.err_watch, limit, "stderr")));
+            tee_stream(
+                child_err,
+                std::io::stderr(),
+                &sup,
+                Some((&sup.err_watch, count_limit, repeat_ms, true, "stderr")),
+            );
             sup.err_done.store(true, Ordering::Relaxed);
         })
     };
@@ -1304,11 +1389,14 @@ mod tests {
         (bash, vec![("PATH".to_string(), path)])
     }
 
-    /// A test-sized Watch. `silence`/`limit` 0 = off; drain grace 1s.
-    fn w(silence_secs: u64, limit: u32) -> Watch {
+    /// A test-sized Watch. `silence`/`limit`/`repeat_ms` 0 = off; drain grace 1s.
+    /// `repeat_ms` is the sustained-duration bound in ms (a `Duration` field, so
+    /// tests can use a sub-second window and stay fast).
+    fn w(silence_secs: u64, limit: u32, repeat_ms: u64) -> Watch {
         Watch {
             silence: Duration::from_secs(silence_secs),
             repeat_limit: limit,
+            repeat_secs: Duration::from_millis(repeat_ms),
             drain_grace: Duration::from_secs(1),
         }
     }
@@ -1326,7 +1414,7 @@ mod tests {
         let loop_forever = "while :; do echo 'expr: error while loading shared libraries: \
                             libgmp.so.10: cannot open shared object file' >&2; done";
         let t0 = Instant::now();
-        let err = run_cmd(&bash, &["-c", loop_forever], ".", &envs, &w(0, 25))
+        let err = run_cmd(&bash, &["-c", loop_forever], ".", &envs, &w(0, 25, 0))
             .expect_err("a persistently-failing tool loop must red");
         assert!(t0.elapsed() < Duration::from_secs(30), "must red promptly, not spin: {err}");
         assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
@@ -1349,7 +1437,7 @@ mod tests {
             &["-c", "while :; do echo 'configure: retrying tool probe'; done"],
             ".",
             &envs,
-            &w(0, 25),
+            &w(0, 25, 0),
         )
         .expect_err("a stdout-spinning loop must red");
         assert!(t0.elapsed() < Duration::from_secs(30), "must red promptly: {err}");
@@ -1364,11 +1452,102 @@ mod tests {
         // sleep included), so the test returns instead of waiting 300s.
         let (bash, envs) = bash_and_env();
         let t0 = Instant::now();
-        let err = run_cmd(&bash, &["-c", "exec sleep 300"], ".", &envs, &w(1, 0))
+        let err = run_cmd(&bash, &["-c", "exec sleep 300"], ".", &envs, &w(1, 0, 0))
             .expect_err("a silent wedged phase must red");
         assert!(t0.elapsed() < Duration::from_secs(30), "must red at the bound: {err}");
         assert!(err.contains("no output for 1s"), "names the silence bound: {err}");
         assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
+    }
+
+    #[test]
+    fn watchdog_reds_a_make_nested_chatty_sub_configure_spin() {
+        // #339: a #292-shape broken-tool loop nested INSIDE a `make` phase — a
+        // bundled sub-`./configure` the Makefile re-runs — that spins CHATTILY
+        // (constant identical output at 100% CPU) resets the silence clock on
+        // every line, so the silence bound never trips; and WATCH_PHASE carries
+        // NO count bound (`tar xf` repeats a warning per member). Only the
+        // sustained-DURATION bound catches it. Modeled with a phase-shaped Watch
+        // — silence OFF, count OFF, a tiny repeat window — so the duration bound
+        // is the sole thing that can red it, and the spin prints to STDOUT to
+        // prove stdout is line-watched under the phase's duration bound. Verified
+        // red: with the duration bound neutered this run_cmd never returns
+        // (silence + count both off), the test hangs past any bound.
+        let (bash, envs) = bash_and_env();
+        let make_nested_spin = "echo 'make: Entering directory subdir'; \
+            while :; do echo 'configure: error: cannot run C compiled programs'; done";
+        let t0 = Instant::now();
+        let err = run_cmd(&bash, &["-c", make_nested_spin], ".", &envs, &w(0, 0, 500))
+            .expect_err("a chatty make-nested spin must red on the duration bound");
+        assert!(t0.elapsed() < Duration::from_secs(30), "must red at the window, not spin: {err}");
+        assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
+        assert!(err.contains("kept arriving for 500ms"), "names the duration bound: {err}");
+        assert!(err.contains("stdout"), "names the spinning stream: {err}");
+        assert!(
+            err.contains("configure: error: cannot run C compiled programs"),
+            "quotes the spinning sub-configure line: {err}"
+        );
+    }
+
+    #[test]
+    fn watchdog_spares_a_healthy_high_volume_repeating_phase() {
+        // The false-kill guard (#339): a healthy phase may print the SAME line at
+        // high volume — `tar xf` of a many-member pax tarball emits an identical
+        // "Ignoring unknown extended header keyword" warning per member — but it
+        // COMPLETES; the line stops arriving long before the window. Under a
+        // phase-shaped Watch (count OFF, a repeat window far above the burst's
+        // runtime) the duration bound must NOT trip: 50k identical lines — vastly
+        // more than any count bound would tolerate — exit 0 and stay GREEN,
+        // because it is the DURATION (not the count) the phase bound keys on.
+        // Verified red: dropping the `now - run_start >= repeat_ms` gate (trip on
+        // volume alone) reds this while the spin test above still passes.
+        let (bash, envs) = bash_and_env();
+        let tar_like =
+            "yes 'tar: Ignoring unknown extended header keyword' | head -n 50000; echo done-ok";
+        let t0 = Instant::now();
+        run_cmd(&bash, &["-c", tar_like], ".", &envs, &w(0, 0, 5000))
+            .expect("a healthy high-volume identical burst that COMPLETES must stay green");
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "the burst must finish well within the window, not wedge"
+        );
+    }
+
+    #[test]
+    fn account_line_seeds_run_start_on_first_line_and_honors_keep_tail() {
+        // Two #339-review invariants, tested at the accountant directly.
+        //
+        // (1) run_start_ms is seeded on the FIRST accounted line even when it
+        //     equals the empty-sentinel last_line — otherwise the duration
+        //     window would measure from process start (t=0), and an empty
+        //     first line could false-trip. Verified red: without the
+        //     `repeats > 0` guard the empty first line is counted as a repeat
+        //     of the sentinel with run_start_ms stuck at 0, so the second empty
+        //     line at t=1100 (1100 - 0 >= 300) trips.
+        let why = Mutex::new(None);
+        let mut st = StreamWatch::new();
+        account_line(&mut st, b"", 0, 300, 1000, true, "stderr", &why);
+        assert_eq!(
+            (st.repeats, st.run_start_ms),
+            (1, 1000),
+            "empty first line starts a run seeded at its arrival, not t=0"
+        );
+        account_line(&mut st, b"", 0, 300, 1100, true, "stderr", &why);
+        assert_eq!(st.repeats, 2);
+        assert!(why.lock().unwrap().is_none(), "100ms < 300ms window must not trip");
+
+        // (2) keep_tail gates the distinct-line tail: the stdout watcher passes
+        //     false, so a verbose build allocates no clip_line String per line;
+        //     the stderr watcher passes true (its tail feeds the diagnostic).
+        //     Verified red: without the gate stdout would keep a 2-entry tail.
+        let why2 = Mutex::new(None);
+        let mut sout = StreamWatch::new();
+        account_line(&mut sout, b"line-a", 0, 300, 0, false, "stdout", &why2);
+        account_line(&mut sout, b"line-b", 0, 300, 0, false, "stdout", &why2);
+        assert!(sout.tail.is_empty(), "keep_tail=false keeps no diagnostic tail");
+        let mut serr = StreamWatch::new();
+        account_line(&mut serr, b"e-a", 0, 300, 0, true, "stderr", &why2);
+        account_line(&mut serr, b"e-b", 0, 300, 0, true, "stderr", &why2);
+        assert_eq!(serr.tail.len(), 2, "keep_tail=true records the distinct-line tail");
     }
 
     #[test]
@@ -1388,7 +1567,7 @@ mod tests {
             &["-c", "while :; do echo 'expr: died again' >&2; done & exit 0"],
             ".",
             &envs,
-            &w(600, 25),
+            &w(600, 25, 0),
         )
         .expect("a green exit must win over a straggler's repeat spam during drain");
         assert!(
@@ -1406,7 +1585,7 @@ mod tests {
         // command's own exit status decides.
         let (bash, envs) = bash_and_env();
         let t0 = Instant::now();
-        run_cmd(&bash, &["-c", "sleep 30 & exit 0"], ".", &envs, &w(600, 0))
+        run_cmd(&bash, &["-c", "sleep 30 & exit 0"], ".", &envs, &w(600, 0, 0))
             .expect("a green exit with a straggler must stay green");
         assert!(
             t0.elapsed() < Duration::from_secs(10),
@@ -1422,11 +1601,11 @@ mod tests {
         // the counter, so far more total lines than the limit stay green.
         let (bash, envs) = bash_and_env();
         let noisy = "for i in $(seq 24); do echo 'same warning' >&2; done; echo done-ok";
-        run_cmd(&bash, &["-c", noisy], ".", &envs, &w(600, 25))
+        run_cmd(&bash, &["-c", noisy], ".", &envs, &w(600, 25, 0))
             .expect("sub-limit repeats must stay green");
         let alternating =
             "for i in $(seq 40); do echo \"warn $((i % 2))\" >&2; done; echo done-ok";
-        run_cmd(&bash, &["-c", alternating], ".", &envs, &w(600, 25))
+        run_cmd(&bash, &["-c", alternating], ".", &envs, &w(600, 25, 0))
             .expect("alternating stderr lines must reset the repeat counter");
     }
 
