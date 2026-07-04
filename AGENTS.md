@@ -286,14 +286,29 @@ build package recipes and td shell testing those builds." Do not rebuild
 museum-style gates; the generations/signed-distribution/placement CONCEPTS
 are deliberately uncovered until the human asks for td-native versions.
 
+**Refactors don't mint tests (human, 2026-07-04).** A
+behavior-preserving change — a refactor, a cleanup, a mechanical
+migration with no observable behavior change — is validated by the
+EXISTING tests covering that path staying green, not by a new test.
+Do not add a gate or test that merely re-asserts already-covered
+behavior or pins implementation details just to satisfy the
+Definition of done. Directive 3's "adding tests is always free" means
+no approval is needed — not that every PR should add one; a new test
+still has to clear the feature bar above. New tests accompany new or
+changed behavior, or a real coverage gap the change exposes.
+
 ## Definition of done (every task)
 
 A task is done only when ALL hold:
 
 - a test exercises the actual feature through its real entry point and asserts what it
   does — not just that an artifact can be built (see "Test the feature, not the
-  possibility") — and passes,
-- you have seen that assertion fail (verified-red) before trusting the pass,
+  possibility") — and passes; for a behavior-preserving refactor this is the EXISTING
+  coverage of the refactored path staying green — do not mint a meaningless new test
+  ("Refactors don't mint tests", human 2026-07-04),
+- you have seen that assertion fail (verified-red) before trusting the pass (applies to
+  tests you add or change; a refactor leaning on existing coverage has nothing new to
+  red),
 - the change is a complete, atomic increment — a real capability with any replaced path
   removed in the same PR (directive 8), not a partial mechanism,
 - it is committed with a message stating what test now passes,
