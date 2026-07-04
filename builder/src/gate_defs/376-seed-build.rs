@@ -10,7 +10,7 @@
 //! guix/Guile scrubbed from PATH; guix is only the one-time capture source + the oracle. Heavy
 //! (stage0 + ~660M seed tar + a real hello build) → BUILD_GATES + HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,7 +19,14 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): resolved by the runner —
+        // the body consumes TD_GATE_INPUT_*.
+        inputs: &[
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "coreutils" },
+            },
+        ],
         store: StoreMode::Private, // cold by design (#317 audit): builds hello from the unpacked seed alone (no warm store)
         non_blocking: true,
         script: r##"

@@ -10,7 +10,7 @@
 //! guix at all — no process, no install. Heavy (stage0 + warmed seed + a hello build) →
 //! BUILD_GATES + HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,7 +19,18 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): resolved by the runner —
+        // the body consumes TD_GATE_INPUT_*.
+        inputs: &[
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "coreutils" },
+            },
+            ArtifactInput {
+                name: "bash",
+                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "bash" },
+            },
+        ],
         store: StoreMode::Private, // cold by design (#317 audit): guix-free td shell standup from the frozen seed alone
         non_blocking: true,
         script: r##"

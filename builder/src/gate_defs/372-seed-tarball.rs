@@ -9,7 +9,7 @@
 //! td-builder is the guix-free stage0; guix is only the capture SOURCE + the removable
 //! closure oracle (no `guix build -e (system M)` packager). Heavy (stage0 + a real tar).
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,7 +18,14 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): resolved by the runner —
+        // the body consumes TD_GATE_INPUT_*.
+        inputs: &[
+            ArtifactInput {
+                name: "bash",
+                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "bash" },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

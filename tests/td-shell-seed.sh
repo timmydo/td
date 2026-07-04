@@ -30,9 +30,10 @@ echo ">> td tools (guix-free): stage0=$TB  recipe-eval=$TD_RECIPE_EVAL"
 
 work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
-cu=`grep -- '-coreutils-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`
-sh_=`grep -- '-bash-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`
-test -n "$cu" -a -n "$sh_" || fail "no coreutils/bash in hello lock"
+# coreutils + bash are DECLARED gate inputs (#353): resolved by the runner.
+cu=${TD_GATE_INPUT_COREUTILS:-}
+sh_=${TD_GATE_INPUT_BASH:-}
+test -n "$cu" -a -n "$sh_" || { echo "ERROR: TD_GATE_INPUT_{COREUTILS,BASH} unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
 if ls "$cu/bin" "$sh_/bin" | grep -qE '^(guix|guile)$'; then fail "guix/guile on the scrubbed PATH"; fi
 
 # WARM hello's seed (same roots the seed-build gate uses): lock inputs + stage0 runtime.
