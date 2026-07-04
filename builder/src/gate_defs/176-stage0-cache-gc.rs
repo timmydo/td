@@ -30,7 +30,11 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Shared,
+        // Realizes the guix-built rust seed ($TD_GUIX build) — fails on a pin-drifted
+        // host, so tagged non-blocking like its seed-realizing siblings (220/222/359).
+        non_blocking: true,
         script: r##"
 echo ">> stage0-cache-gc: stage0-builder.sh sweeps stale placements on a fresh placement (under .stage0.lock); load_stage0 resolves the survivor and it runs (#309)"
 set -euo pipefail; \
@@ -47,21 +51,26 @@ echo ">> simulate a warm cache that accumulated stale placements from prior buil
 for h in 0000000000000000000000000000000a 0000000000000000000000000000000b; do \
   mkdir -p "$B/store/$h-td-builder-0.1.0/bin"; \
   printf '#!/bin/sh\nexit 0\n' > "$B/store/$h-td-builder-0.1.0/bin/td-builder"; \
-  chmod +x "$B/store/$h-td-builder-0.1.0/bin/td-builder"; \
+  chmod 555 "$B/store/$h-td-builder-0.1.0/bin/td-builder"; \
 done; \
 rm -rf "$B/store/$cur"; \
-before=`ls "$B/store" | wc -l`; \
+before=`ls -d "$B/store/"*-td-builder-* 2>/dev/null | wc -l`; \
 test "$before" -gt 1 || { echo "FAIL: setup did not produce N>1 placements (got $before)" >&2; exit 1; }; \
 echo "   cache now holds $before placements (N>1); the current one is removed so the next resolve takes the slow (placement) path"; \
 echo ">> load_stage0 again -> slow path re-places the current stage0 AND sweeps the stale ones (holding .stage0.lock)"; \
 load_stage0; \
-after=`ls "$B/store" | wc -l`; \
-test "$after" -eq 1 || { echo "FAIL: sweep left $after placement(s), expected exactly 1 (the current) — stale placements were NOT swept" >&2; ls "$B/store" >&2; exit 1; }; \
-test -d "$B/store/$cur" || { echo "FAIL: the sweep removed the CURRENT placement ($cur)" >&2; exit 1; }; \
-echo "   ok: exactly 1 placement remains ($cur) — the stale ones were swept"; \
+for h in 0000000000000000000000000000000a 0000000000000000000000000000000b; do \
+  test ! -d "$B/store/$h-td-builder-0.1.0" || { echo "FAIL: stale placement $h-td-builder-0.1.0 survived the sweep" >&2; exit 1; }; \
+done; \
+after=`ls -d "$B/store/"*-td-builder-* 2>/dev/null | wc -l`; \
+test "$after" -eq 1 || { echo "FAIL: sweep left $after placement(s), expected exactly 1 (the current)" >&2; ls "$B/store" >&2; exit 1; }; \
+survivor=`ls -d "$B/store/"*-td-builder-*`; survivor=`basename "$survivor"`; \
+test "$survivor" = "$cur" || echo "   note: the re-place landed at a different hash than the first ($survivor vs $cur) — a stage0 build-reproducibility drift, NOT a sweep fault (the sweep behaved: stales gone, exactly one placement)"; \
+echo "   ok: both injected stale placements are gone; exactly 1 placement remains ($survivor)"; \
 echo ">> consumer check: load_stage0 resolves the survivor and it RUNS a real subcommand"; \
-test "`basename "$TD_BUILDER_PATH"`" = "$cur" || { echo "FAIL: load_stage0 resolved a different placement ($TD_BUILDER_PATH) than the survivor after the sweep" >&2; exit 1; }; \
+test "`basename "$TD_BUILDER_PATH"`" = "$survivor" || { echo "FAIL: load_stage0 resolved a different placement ($TD_BUILDER_PATH) than the survivor after the sweep" >&2; exit 1; }; \
 interp=`"$TB" elf-interp "$TB"` || { echo "FAIL: the surviving stage0 td-builder does not run (elf-interp on itself errored)" >&2; exit 1; }; \
+test -n "$interp" || { echo "FAIL: surviving stage0 has no PT_INTERP (elf-interp returned empty)" >&2; exit 1; }; \
 case "$interp" in /gnu/store/*ld-linux*) : ;; *) echo "FAIL: surviving stage0 elf-interp returned an unexpected loader ($interp)" >&2; exit 1 ;; esac; \
 echo "PASS: stage0-cache-gc — stage0-builder.sh sweeps stale placements on a fresh placement (under .stage0.lock); after a slow-path re-place exactly the current placement survives, load_stage0 resolves it, and it runs a real td-builder subcommand (#309)."
 "##,

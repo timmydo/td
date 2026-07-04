@@ -674,6 +674,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
+        // stage0-builder.sh also hosts the stale-placement sweep (#309), asserted by
+        // the NON-build gate stage0-cache-gc — build gates all memo-hit the warm shared
+        // base and never exercise the slow-path sweep, so route it explicitly.
+        if p == "tests/stage0-builder.sh" {
+            sel.add_target("stage0-cache-gc");
+        }
         add_build_gate_targets(root, sel);
         // provision_stage0 lives in cache-lib: its seed fetch / fail-closed paths are
         // exercised only by the seed-subst gate (the build gates all run on a warm
@@ -1399,6 +1405,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         assert_target!("tests/build-pkg.sh", &bg);
         assert_target!("tests/cache-lib.sh", &bg);
     }
+
+    // The stale-placement sweep lives in stage0-builder.sh; only the NON-build
+    // stage0-cache-gc gate exercises its slow path (#309), so the mapping must
+    // select it alongside the build gates.
+    assert_target!("tests/stage0-builder.sh", "stage0-cache-gc");
 
     // The warm chain-brick cache (#317): the lib and its gate map to chain-cache, and
     // the shared chain re-proves BOTH consumers + the cache gate.

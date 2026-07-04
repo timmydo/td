@@ -90,8 +90,10 @@ for d in "$store"/*-td-builder-*; do
   [ -d "$d" ] || continue
   b=`basename "$d"`
   if [ "$b" = "$cur" ]; then continue; fi   # keep the current placement
-  rm -rf "$d"
-  swept=`expr $swept + 1`
+  # Best-effort: a failed rm (transient EBUSY, perms) must never fail the PLACEMENT —
+  # the current stage0 is already placed and the memo written; the next slow path retries.
+  rm -rf "$d" 2>/dev/null || continue
+  swept=$((swept + 1))
 done
 if [ "$swept" -gt 0 ]; then
   echo "stage0-builder: swept $swept stale placement(s) from $store (kept $cur)" >&2
