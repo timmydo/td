@@ -17,7 +17,7 @@
 //! a MISS adds the ~45-min native build, from-seed adds the ~98-min cross build). NOT a BUILD_GATE.
 //! The shared fetch-or-build ladder + the X3 fns live in tests/x86_64-cross-fns.sh.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,7 +26,16 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): resolved by the runner — the shared
+        // x86_64 verify fns consume TD_GATE_INPUT_BASH_STATIC.
+        inputs: &[ArtifactInput {
+            name: "bash-static",
+            kind: InputKind::ClosureMember {
+                lock: "tests/hello-no-guix.lock",
+                root_stem: "bash",
+                member_stem: "bash-static",
+            },
+        }],
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"

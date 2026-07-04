@@ -391,8 +391,10 @@ verify_x86_64_ownroot() {
   echo "   built x86_64 (ELF 64-bit) C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
   mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
   WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || { echo "store-add prog failed" >&2; return 1; }; wprel=${WP#/td/store/}
-  bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-  bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
+  # the static-bash fixture is a DECLARED gate input (#353): every gate calling
+  # this fn declares bash-static; the runner content-scanned hello's bash closure.
+  bs=${TD_GATE_INPUT_BASH_STATIC:-}
+  test -n "$bs" || { echo "TD_GATE_INPUT_BASH_STATIC unset — the calling gate must declare the bash-static input (#353)" >&2; return 1; }
   bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
   snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 /td/store/'"$wprel"'/bin/c; echo "CRC=$?"
@@ -617,8 +619,10 @@ verify_x86_64_native_ownroot() {
     test -x "$store/$nbrel/bin/$t" || { echo "interned native binutils missing an executable '$t' ($store/$nbrel/bin/$t) — incomplete toolchain closure" >&2; return 1; }
   done
   echo "   [closure-complete] the native binutils as/ld are interned at /td/store/$nbrel beside the native gcc — a complete native toolchain in td's own store"
-  bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-  bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
+  # the static-bash fixture is a DECLARED gate input (#353): every gate calling
+  # this fn declares bash-static; the runner content-scanned hello's bash closure.
+  bs=${TD_GATE_INPUT_BASH_STATIC:-}
+  test -n "$bs" || { echo "TD_GATE_INPUT_BASH_STATIC unset — the calling gate must declare the bash-static input (#353)" >&2; return 1; }
   bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
   # the probe is a FILE in the (ro) store; it compiles into the writable tmpfs /tmp inside the own-root.
   # the probe runs the NATIVE gcc IN the own-root. It uses ONLY bash builtins (cd/printf/case/[) + the

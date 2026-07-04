@@ -25,7 +25,7 @@
 //! needs the whole-toolchain closure fetch + a populated persistent store and is the PR3b follow-up. The subst round-trip lives in tests/x86_64-subst-lib.sh. NOT a BUILD_GATE. The
 //! cross rungs live in tests/x86_64-cross-fns.sh.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -34,7 +34,22 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): resolved by the runner — the shared
+        // x86_64 libs consume TD_GATE_INPUT_{COREUTILS,BASH_STATIC}.
+        inputs: &[
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
+            },
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/hello-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
