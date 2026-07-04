@@ -418,10 +418,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // for the consolidated `td-feed warm <action>` orchestration). main.rs ALSO holds the
         // host-PREP warm that feeds the corpus + bootstrap gates (the former warm-*.sh), so
         // smoke a representative consumer of each warm family: rust-ripgrep (`warm crate`) and
-        // bootstrap-glibc (`warm sources` + `warm kernel-headers`).
+        // bootstrap-glibc (`warm sources` + `warm kernel-headers`). feed-shared drives the
+        // shared-daemon lifecycle (`td-feed ensure-serve`, the former tools/feed-ensure.sh).
         sel.add_target("td-feed");
         sel.add_target("rust-ripgrep");
         sel.add_target("bootstrap-glibc");
+        sel.add_target("feed-shared");
         return;
     }
 
@@ -574,11 +576,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if p == "tools/gen-feed-index.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("td-feed");
-        return;
-    }
-    if p == "tools/feed-ensure.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("feed-shared");
         return;
     }
     if p == "tools/warm-td-fetch-crates.sh" {
@@ -1423,12 +1420,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/russh-demo/Cargo.lock", "rust-russh");
     assert_target!("tests/td-feed.lock", "td-feed");
     assert_target!("tests/td-feed.index", "td-feed");
-    assert_target!("tools/feed-ensure.sh", "feed-shared");
     assert_target!("tools/warm-td-fetch-crates.sh", "rust-fetch");
     assert_target!("tools/warm-td-fetch-crates.sh", "td-feed");
-    // The consolidated warm orchestration lives in feed/src/main.rs (the former warm-*.sh):
-    // a feed change smokes td-feed (build + warm-selftest) + a representative consumer of
-    // each warm family.
+    // The consolidated warm orchestration + the shared-daemon lifecycle
+    // (`td-feed ensure-serve`, former tools/feed-ensure.sh) live in feed/src/main.rs:
+    // a feed change smokes td-feed (build + warm-selftest), a representative consumer of
+    // each warm family, and feed-shared (the ensure-serve lifecycle).
+    assert_target!("feed/src/main.rs", "feed-shared");
     assert_target!("feed/src/main.rs", "rust-ripgrep");
     assert_target!("feed/src/main.rs", "bootstrap-glibc");
     assert_target!("feed/src/main.rs", "td-feed");

@@ -397,27 +397,57 @@ fn tree_key(root: &Path) -> Option<String> {
     Some(crate::sha256::to_base16(&h.finalize()))
 }
 
-/// The substitute-store exposure (x64-toolchain-subst): tools/warm-subst.sh
-/// echoes `export TD_SUBST_*='…'` lines when a prior daily populated ~/.td/subst;
-/// parse them into child env (host-sandbox preserves TD_SUBST_*). No-op on a
-/// cold machine. TD_SUBST_FORCE_BUILD=1 (the daily's authoritative run)
-/// suppresses the exposure so the daily always builds from seed.
+/// The substitute-store exposure (x64-toolchain-subst, human 2026-06-28;
+/// native since #318 axis 2 — was tools/warm-subst.sh): if a prior DAILY run
+/// populated a persistent signed substitute store (~/.td/subst: a stashed
+/// td-subst binary + the published closure narinfos), expose TD_SUBST_* to
+/// the loop sandbox (host-sandbox binds ~/.td/subst ro + preserves
+/// TD_SUBST_*). The toolchain gates then FETCH the lock-keyed closure instead
+/// of rebuilding ~98 min from seed, FALLING BACK to from-seed on ANY miss.
+/// This NEVER fetches or builds td-subst — the DAILY is the sole producer; a
+/// COLD machine (no prior daily) exposes nothing and the gate builds from
+/// seed (the substitute is an optimization, never a correctness dependency).
+/// TD_SUBST_FORCE_BUILD=1 (the daily's authoritative run) suppresses the
+/// exposure so the daily always builds from seed.
 fn subst_env(root: &Path) -> Vec<(String, String)> {
     if std::env::var("TD_SUBST_FORCE_BUILD").ok().as_deref() == Some("1") {
         return Vec::new();
     }
-    let out = warm_capture(&[s("sh"), s("tools/warm-subst.sh")], root, &[]);
-    let mut envs = Vec::new();
-    for line in out.lines() {
-        let Some(rest) = line.strip_prefix("export ") else { continue };
-        let Some((k, v)) = rest.split_once('=') else { continue };
-        if !k.starts_with("TD_SUBST_") {
-            continue;
-        }
-        let v = v.trim().trim_matches('\'');
-        envs.push((k.to_string(), v.to_string()));
+    let store = match std::env::var("TD_SUBST_STORE") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => match std::env::var("HOME") {
+            Ok(h) => Path::new(&h).join(".td/subst"),
+            Err(_) => return Vec::new(),
+        },
+    };
+    subst_env_at(&store, &root.join("tests/td-subst.pub"))
+}
+
+/// A USABLE store = the daily's stashed td-subst binary + at least one signed
+/// narinfo + the pinned trust anchor. Any missing piece => expose nothing.
+fn subst_env_at(store: &Path, pubkey: &Path) -> Vec<(String, String)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = store.join("td-subst");
+    let executable = std::fs::metadata(&bin)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
+    if !executable {
+        return Vec::new();
     }
-    envs
+    let has_narinfo = std::fs::read_dir(store)
+        .map(|rd| rd.flatten().any(|e| e.path().extension().is_some_and(|x| x == "narinfo")))
+        .unwrap_or(false);
+    if !has_narinfo {
+        return Vec::new();
+    }
+    if !std::fs::metadata(pubkey).map(|m| m.is_file() && m.len() > 0).unwrap_or(false) {
+        return Vec::new();
+    }
+    vec![
+        (s("TD_SUBST_BIN"), bin.display().to_string()),
+        (s("TD_SUBST_STORE"), store.display().to_string()),
+        (s("TD_SUBST_PUBKEY"), pubkey.display().to_string()),
+    ]
 }
 
 /// The heavy-tier warm prelude: source-bootstrap tarballs + rust crate closures
@@ -461,13 +491,10 @@ fn heavy_warms(root: &Path) {
     }
 
     // `td-feed warm sources` (serial-first), routed through the ONE shared
-    // td-feed serve daemon when feed-ensure can start/reuse it.
+    // td-feed serve daemon when `td-feed ensure-serve` can start/reuse it
+    // (native since #318 axis 2 — was tools/feed-ensure.sh).
     let mut src_envs = vec![(s("TD_ROOT"), root.display().to_string())];
-    let faddr = warm_capture(
-        &[s("sh"), s("tools/feed-ensure.sh")],
-        root,
-        &[(s("TD_FEED_BIN"), tdfeed.clone())],
-    );
+    let faddr = warm_capture(&[tdfeed.clone(), s("ensure-serve")], root, &[]);
     if !faddr.is_empty() {
         src_envs.push((s("TD_FEED_BASE"), format!("http://{faddr}")));
     }
@@ -522,6 +549,137 @@ fn heavy_warms(root: &Path) {
         }
     }
     drain(&mut running);
+}
+
+/// Ensure ONE shared, persistent td build daemon is running for this host and
+/// return its Unix-socket PATH (native since #318 axis 2 — was
+/// tools/build-daemon-ensure.sh). Idempotent + concurrency-safe (an exclusive
+/// file lock serializes ensures): the FIRST caller starts the daemon; every
+/// later caller (any worktree, any agent) reuses it. This is how N agents on N
+/// worktrees SHARE one builder with ONE global budget — the machine-wide build
+/// limiter. The daemon realizes drvs submitted over the socket (`td-builder
+/// daemon`), bounded to TD_BUILD_JOBS concurrent builds; the per-drv builder
+/// override travels with each request, so one shared daemon serves every
+/// worktree.
+///
+/// The daemon BINARY is the provisioned stage0 `tb` (TD_DAEMON_BUILDER
+/// overrides) — the same deterministic current-tree build the loop's client
+/// (cache-lib) resolves, so the client and the serving daemon always speak the
+/// same request grammar. The socket/pid/log are keyed by the binary's CONTENT
+/// hash: a daemon started by a different (e.g. older-grammar) td-builder lives
+/// on a different socket, so an ensure never reuses a stale-grammar daemon;
+/// old-binary daemons idle out on their own sockets.
+///
+/// Env: TD_DAEMON_DIR (shared dir, default ~/.td/build-daemon),
+/// TD_DAEMON_BUILDER (daemon binary override), TD_DAEMON_SEED_DIR (the
+/// start-time seed store DIR, default /gnu/store — content-scanned for the
+/// input closure, #267; only bare-drv requests use it), TD_BUILD_JOBS (the
+/// global budget — inherited by the spawned daemon), TD_NICE (nice level for
+/// the daemon + its build children, default 10).
+fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
+    let daemon_dir = match std::env::var("TD_DAEMON_DIR") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var("HOME").map_err(|_| s("no HOME for TD_DAEMON_DIR"))?;
+            Path::new(&home).join(".td/build-daemon")
+        }
+    };
+    let store = daemon_dir.join("store");
+    std::fs::create_dir_all(&store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
+    let seed_dir = std::env::var("TD_DAEMON_SEED_DIR").unwrap_or_else(|_| s("/gnu/store"));
+    let daemon_tb = match std::env::var("TD_DAEMON_BUILDER") {
+        Ok(v) if !v.trim().is_empty() && Path::new(&v).is_file() => v,
+        _ => tb.to_string(),
+    };
+
+    // Key the socket/pid/log by the daemon binary's CONTENT hash (grammar skew
+    // guard — see the doc comment).
+    let bytes = std::fs::read(&daemon_tb).map_err(|e| format!("read {daemon_tb}: {e}"))?;
+    let mut h = crate::sha256::Sha256::new();
+    h.update(&bytes);
+    let full = crate::sha256::to_base16(&h.finalize());
+    let key: String = full.chars().take(16).collect();
+    let sock = daemon_dir.join(format!("socket.{key}"));
+    let pid_f = daemon_dir.join(format!("daemon.{key}.pid"));
+    let log_f = daemon_dir.join(format!("daemon.{key}.log"));
+
+    // Serialize concurrent ensures so two agents never both start a daemon.
+    // The lock file is O_CLOEXEC (std default), so the spawned daemon does not
+    // inherit-and-hold it; it releases when this fn returns.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // a lock handle only; its content is never written
+        .open(daemon_dir.join("daemon.lock"))
+        .map_err(|e| format!("open daemon.lock: {e}"))?;
+    lock.lock().map_err(|e| format!("lock daemon.lock: {e}"))?;
+
+    // Reuse a live daemon.
+    let pid_alive = |pf: &Path| -> bool {
+        std::fs::read_to_string(pf)
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+    };
+    let is_socket = |p: &Path| -> bool {
+        use std::os::unix::fs::FileTypeExt as _;
+        std::fs::symlink_metadata(p).map(|m| m.file_type().is_socket()).unwrap_or(false)
+    };
+    if pid_alive(&pid_f) && is_socket(&sock) {
+        return Ok(sock.display().to_string());
+    }
+
+    // Start a fresh daemon, detached in its OWN process group so it outlives
+    // this check AND survives the terminal's ^C/hangup signals (the machine-
+    // wide limiter must persist across checks — the shell's `nohup` role).
+    // nice/ionice it so its build children (the corpus builds — the real
+    // CPU/IO) yield to interactive work; the global budget bounds how MANY run
+    // at once. TD_BUILD_JOBS reaches the daemon by plain env inheritance.
+    let log = std::fs::File::create(&log_f).map_err(|e| format!("create {}: {e}", log_f.display()))?;
+    let log2 = log.try_clone().map_err(|e| format!("clone log fd: {e}"))?;
+    let _ = std::fs::remove_file(&sock);
+    let tdnice = std::env::var("TD_NICE").unwrap_or_else(|_| s("10"));
+    let mut argv: Vec<String> = Vec::new();
+    if find_in_path("nice").is_some() {
+        argv.extend([s("nice"), s("-n"), tdnice]);
+        if find_in_path("ionice").is_some() {
+            argv.extend([s("ionice"), s("-c2"), s("-n7")]);
+        }
+    }
+    argv.extend([
+        daemon_tb,
+        s("daemon"),
+        sock.display().to_string(),
+        seed_dir,
+        store.display().to_string(),
+    ]);
+    let (head, rest) = argv.split_first().ok_or_else(|| s("internal: empty daemon argv"))?;
+    let mut cmd = Command::new(head);
+    cmd.args(rest)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log2));
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn the build daemon: {e}"))?;
+    let _ = std::fs::write(&pid_f, format!("{}\n", child.id()));
+
+    // Wait for it to bind the socket.
+    for _ in 0..100 {
+        if is_socket(&sock) {
+            return Ok(sock.display().to_string());
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
+            return Err(format!("the daemon exited before binding:\n{tail}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
+    Err(format!("the daemon did not bind {}:\n{tail}", sock.display()))
 }
 
 /// The guix-free `check-harness` tier: enter td's OWN /td/store harness via the
@@ -691,14 +849,12 @@ fn run(args: &[String]) -> Result<i32, String> {
         heavy_warms(&root);
         // The shared build daemon: the loop's single machine-wide BUILD limiter
         // (host-side; it must outlive this check). Only the heavy tier needs it.
-        let sock = warm_capture(&[s("sh"), s("tools/build-daemon-ensure.sh")], &root, &[]);
-        if sock.is_empty() {
-            eprintln!(
+        match ensure_build_daemon(&root, &tb) {
+            Ok(sock) => child_envs.push((s("TD_DAEMON_SOCKET"), sock)),
+            Err(e) => eprintln!(
                 "td-builder check: WARNING: could not start the shared build daemon \
-                 (build-daemon-ensure.sh); corpus gates will fail loudly"
-            );
-        } else {
-            child_envs.push((s("TD_DAEMON_SOCKET"), sock));
+                 ({e}); corpus gates will fail loudly"
+            ),
         }
     }
 
@@ -706,7 +862,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     // writable cgroup-v2 subtree, gate-run gives every gate a child cgroup
     // with memory.max/high — the escape-proof successor to the RSS watchdog
     // (which stays the fallback everywhere else). Deliberately AFTER the
-    // daemon warm: the self-move happens here, so the nohup'd persistent
+    // daemon warm: the self-move happens here, so the detached persistent
     // build daemon (started above, outliving this check) is NOT captured in
     // this run's host leaf (review finding — it would pin the run dir forever
     // and a recycled pid would then silently lose cgroup mode on EEXIST).
@@ -792,4 +948,127 @@ fn run(args: &[String]) -> Result<i32, String> {
     }
     let _ = std::io::stdout().flush();
     Ok(st.code().unwrap_or(1))
+}
+
+/// `td-builder check-rung HARNESS [ARGS...]` — DEV ITERATION helper (NOT a
+/// gate, NOT part of the loop; native since #318 axis 2 — was
+/// tools/check-rung.sh). Run a cached-chain bootstrap dev harness INSIDE td's
+/// loop sandbox, so sandbox-only failures (no `bzip2`/no `/bin/sh` on PATH,
+/// env_clear + C locale, the read-only /gnu/store) surface in MINUTES against
+/// the already-built chain in .td-build-cache/ — instead of a ~40-min
+/// from-the-seed gate round-trip just to discover a one-line unpack/shebang
+/// bug. The dev harnesses otherwise run on the HOST (which has bzip2, /bin/sh,
+/// a full locale), so they cannot catch the class of bug that only bites in
+/// the sandbox.
+///
+/// Purely an inner-loop accelerator: the AUTHORITATIVE gate still builds the
+/// whole chain from the seed with substitutes off (prime directive 1). Once a
+/// harness is green here, run the real `td-builder check bootstrap-<rung>`.
+///
+/// The sandbox + toolchain provisioning is EXACTLY the loop prelude's (same
+/// stage0 container provider, same loop-toolchain list — notably WITHOUT
+/// bzip2, so a missing-bzip2 bug still reproduces).
+pub fn check_rung_cli(args: &[String]) -> ExitCode {
+    match check_rung(args) {
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn check_rung(args: &[String]) -> Result<i32, String> {
+    let Some((harness, rest)) = args.split_first() else {
+        return Err(s("usage: td-builder check-rung HARNESS [ARGS...]"));
+    };
+    if !Path::new(harness).is_file() {
+        return Err(format!("check-rung: no such harness: {harness}"));
+    }
+    let root = std::env::current_dir().map_err(|e| fatal(&format!("cannot resolve cwd: {e}")))?;
+    if !root.join("tests").is_dir() || !root.join("channels.scm").is_file() {
+        return Err(fatal("run from the repo root (tests/ + channels.scm not found)"));
+    }
+    let tb = provision_stage0(&root).map_err(|e| {
+        format!("check-rung: FATAL: could not provision the guix-free stage0 td-builder for the sandbox ({e})")
+    })?;
+    let toolchain = provision_toolchain(&root)?;
+    eprintln!(
+        ">> check-rung: {harness} inside td-builder host-sandbox (cached chain reused; \
+         sandbox env matches the gate)"
+    );
+    let mut cmd = Command::new(&tb);
+    cmd.args(["host-sandbox", "--expose-cwd", "--", "sh"])
+        .arg(harness)
+        .args(rest)
+        .env("PATH", toolchain)
+        .env("GUIX_BUILD_OPTIONS", "--no-substitutes --no-offload")
+        .current_dir(&root);
+    // Replace this process, exactly as the shell helper's `exec` did.
+    use std::os::unix::process::CommandExt as _;
+    let e = cmd.exec();
+    Err(fatal(&format!("check-rung: could not exec the sandbox: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("td-subst-env-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A usable store: executable td-subst + a narinfo + a non-empty pubkey.
+    fn populate(store: &Path, pubkey: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(store.join("td-subst"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(store.join("td-subst"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(store.join("x.narinfo"), b"StorePath: /x\n").unwrap();
+        std::fs::write(pubkey, b"pinned-trust-anchor\n").unwrap();
+    }
+
+    #[test]
+    fn subst_env_exposes_a_usable_store() {
+        let d = scratch("usable");
+        let (store, pubkey) = (d.join("subst"), d.join("td-subst.pub"));
+        std::fs::create_dir_all(&store).unwrap();
+        populate(&store, &pubkey);
+        let envs = subst_env_at(&store, &pubkey);
+        let keys: Vec<&str> = envs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["TD_SUBST_BIN", "TD_SUBST_STORE", "TD_SUBST_PUBKEY"]);
+        assert!(envs.iter().any(|(k, v)| k == "TD_SUBST_BIN" && v.ends_with("/td-subst")));
+    }
+
+    #[test]
+    fn subst_env_is_empty_when_any_piece_is_missing() {
+        // Each missing piece independently means "expose nothing" — the gate
+        // then builds from seed (the substitute is never a correctness dep).
+        for missing in ["bin", "exec-bit", "narinfo", "pubkey"] {
+            let d = scratch(missing);
+            let (store, pubkey) = (d.join("subst"), d.join("td-subst.pub"));
+            std::fs::create_dir_all(&store).unwrap();
+            populate(&store, &pubkey);
+            match missing {
+                "bin" => std::fs::remove_file(store.join("td-subst")).unwrap(),
+                "exec-bit" => {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(
+                        store.join("td-subst"),
+                        std::fs::Permissions::from_mode(0o644),
+                    )
+                    .unwrap();
+                }
+                "narinfo" => std::fs::remove_file(store.join("x.narinfo")).unwrap(),
+                _ => std::fs::write(&pubkey, b"").unwrap(),
+            }
+            assert!(
+                subst_env_at(&store, &pubkey).is_empty(),
+                "missing {missing} must expose nothing"
+            );
+        }
+    }
 }

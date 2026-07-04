@@ -161,8 +161,8 @@ if [ $rc -eq 0 ]; then
   fi
   # x64-toolchain-subst: also sign + publish the x86_64 toolchain CLOSURE that gate 414 subst-exported
   # this run (binutils-2.44 + gcc-14.3.0 + glibc-2.41-x86_64), and STASH the td-subst binary into the
-  # store so check.sh host-prep (tools/warm-subst.sh) can expose it — the per-PR loop FETCHES the
-  # closure + SKIPS the ~98-min from-seed cross build (fallback to from-seed on miss).
+  # store so the `td-builder check` host prelude (subst_env) can expose it — the per-PR loop
+  # FETCHES the closure + SKIPS the ~98-min from-seed cross build (fallback to from-seed on miss).
   _xexp=.td-build-cache/x86_64-closure-export
   if ! ls "$_xexp"/*.narinfo >/dev/null 2>&1; then
     echo ">> publish-x86_64-closure: SKIP — no export at $_xexp (gate 414 built none this run)"
@@ -170,7 +170,7 @@ if [ $rc -eq 0 ]; then
     echo ">> publish-x86_64-closure: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set"
   elif "$_sb" sign "$_xexp" "$TD_SUBST_PRIVKEY" >/dev/null 2>&1; then
     mkdir -p "$_store"; cp -a "$_xexp"/. "$_store"/
-    cp -a "$_sb" "$_store/td-subst"   # stash the consumer's td-subst (warm-subst.sh exposes it)
+    cp -a "$_sb" "$_store/td-subst"   # stash the consumer's td-subst (subst_env exposes it)
     echo ">> publish-x86_64-closure: signed + published the x86_64 toolchain closure to $_store + stashed td-subst (the per-PR loop FETCHES the closure, SKIPS the ~98-min build)"
   else
     echo ">> publish-x86_64-closure: WARN — td-subst sign failed; not published"

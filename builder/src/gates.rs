@@ -37,8 +37,8 @@
 //! `guix time-machine -C channels.scm --` prefix the remaining guix-surface
 //! invocations go through). Output is buffered per gate (`--output-sync=target`
 //! parity), first red stops new gates while running ones drain, and timing
-//! events keep the exact per-gate START/END line format
-//! tools/gate-timing-report.sh reads.
+//! events keep the exact per-gate START/END line format the native report
+//! reducer (gate_timing.rs) reads.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -355,11 +355,18 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
 /// Per-gate wall-clock history (seconds) from the last timing report — the
 /// data-driven LPT order. Missing/unparseable => empty (fallback: <NNN> order).
 fn duration_table(root: &Path) -> HashMap<String, f64> {
-    let mut out = HashMap::new();
     let path = root.join(".td-build-cache/gate-timing/latest.txt");
     let Ok(text) = std::fs::read_to_string(path) else {
-        return out;
+        return HashMap::new();
     };
+    parse_duration_table(&text)
+}
+
+/// Parse the timing report's `name kind seconds` rows (the table
+/// gate_timing::report writes back; split out so the write→read round trip
+/// is unit-tested in gate_timing.rs).
+pub(crate) fn parse_duration_table(text: &str) -> HashMap<String, f64> {
+    let mut out = HashMap::new();
     for line in text.lines() {
         let mut it = line.split_whitespace();
         let (Some(name), Some(_kind), Some(secs)) = (it.next(), it.next(), it.next()) else {
@@ -590,7 +597,7 @@ fn now_ns() -> u128 {
 }
 
 /// Append one timing event (`<gate>\tSTART|END\t<ns>` — the format
-/// tools/gate-timing-report.sh reduces); best-effort (a logging hiccup must
+/// gate_timing.rs reduces); best-effort (a logging hiccup must
 /// never change a gate's outcome).
 fn timing_event(log: Option<&Path>, gate: &str, kind: &str) {
     let Some(log) = log else { return };
@@ -1136,17 +1143,9 @@ fn print_pools(set: &GateSet) {
 }
 
 /// Re-print the newest run's per-gate table (the former Makefile
-/// gate-timing-report target). Best-effort, like the old `|| true` recipe.
-fn run_timing_report(root: &Path, heavy_gates: &str) {
-    let dir = root.join(".td-build-cache/gate-timing");
-    let latest = dir.join("latest.txt");
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("tools/gate-timing-report.sh")
-        .arg(&dir)
-        .arg(&latest)
-        .env("TD_HEAVY_GATES", heavy_gates)
-        .current_dir(root);
-    let _ = cmd.status();
+/// gate-timing-report target, native since #318 axis 2). Best-effort.
+fn run_timing_report(root: &Path, heavy_gates: &[String]) {
+    crate::gate_timing::report(root, heavy_gates);
 }
 
 pub fn cli(args: &[String]) -> ExitCode {
@@ -1220,7 +1219,7 @@ pub fn cli(args: &[String]) -> ExitCode {
             eprintln!("gate-run: gate-timing-report does not combine with other goals");
             return ExitCode::from(2);
         }
-        run_timing_report(&root, &set.names(Pool::Heavy).join(" "));
+        run_timing_report(&root, &set.names(Pool::Heavy));
         return ExitCode::SUCCESS;
     }
 
@@ -1291,9 +1290,9 @@ pub fn cli(args: &[String]) -> ExitCode {
             // Parity with the old check/check-system targets: print the per-gate
             // timing table on a green full run (best-effort).
             if goals.iter().any(|g| g == "check") {
-                run_timing_report(&root, &set.names(Pool::Heavy).join(" "));
+                run_timing_report(&root, &set.names(Pool::Heavy));
             } else if goals.iter().any(|g| g == "check-system") {
-                run_timing_report(&root, &set.names(Pool::System).join(" "));
+                run_timing_report(&root, &set.names(Pool::System));
             }
             ExitCode::SUCCESS
         }
