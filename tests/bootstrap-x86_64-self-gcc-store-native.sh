@@ -65,10 +65,10 @@ echo ">> [codegen] fixpoint: the input native gcc and the SELF-rebuilt gcc emit 
 x86_64_self_codegen_agreement "$XNGCC" "$XSGCC" || fail "codegen agreement between the native gcc and the self-rebuilt gcc failed"
 
 echo ">> [verify] DURABLE own-root verify: the SELF-rebuilt gcc compiles + runs C/C++ from /td/store → 42"
-# point the shared verify at the SELF trees; the name assert pins the -self artifact name.
-XNGCC="$XSGCC"; XNBU="$XSBU"; X86_VERIFY_GCC_NAME=gcc-14.3.0-x86_64-self
-export XNBU XNGCC XGLIBC X86_VERIFY_GCC_NAME
-verify_x86_64_native_ownroot "$cpath" "$snwork" || fail "the self-rebuilt x86_64 gcc own-root verify failed"
+# point the shared verify at the SELF trees; the positional name arg pins the -self artifact name.
+XNGCC="$XSGCC"; XNBU="$XSBU"
+export XNBU XNGCC XGLIBC
+verify_x86_64_native_ownroot "$cpath" "$snwork" gcc-14.3.0-x86_64-self || fail "the self-rebuilt x86_64 gcc own-root verify failed"
 
 echo "PASS: x86_64-self-gcc (rung X3) — with the NATIVE /td/store toolchain (fetched or from-cross/seed)"
 echo "      as the BUILDER, td rebuilt x86_64 binutils 2.44 + GCC 14.3.0: gcc-rebuilds-gcc. The rebuilt"

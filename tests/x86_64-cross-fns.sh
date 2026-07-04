@@ -571,17 +571,20 @@ x86_64_build_native_recipe() {
   export XNBU XNGCC
 }
 
-# verify_x86_64_native_ownroot <cpath> <scratch> — the DURABLE own-root verify for rungs X2 AND X3.
-# Interns the NATIVE x86_64 gcc + NATIVE x86_64 binutils + the x86_64 glibc 2.41 at /td/store, then
-# RUNS the native gcc IN the store-ns own-root: it COMPILES a C and a C++ program from source and the
-# results run → 42, /gnu/store ABSENT. The compiler doing the work is itself an ELF 64-bit x86_64
-# binary in /td/store. Requires the run_x86_64_cross / closure exports XGLIBC, plus $XNGCC (gcc tree)
-# and $XNBU (binutils tree) from the caller. The X3 gate reuses this verify by pointing XNGCC/XNBU at
-# the SELF-rebuilt trees and setting X86_VERIFY_GCC_NAME=gcc-14.3.0-x86_64-self — the [content-addr]
-# leg asserts the interned name matches, so the two rungs' artifacts can't be confused. Legs:
-# [native-arch] [no-guix] [content-addr] [closure-complete] [self-host-compile] [structural].
+# verify_x86_64_native_ownroot <cpath> <scratch> [expected-gcc-name] — the DURABLE own-root verify for
+# rungs X2 AND X3. Interns the NATIVE x86_64 gcc + NATIVE x86_64 binutils + the x86_64 glibc 2.41 at
+# /td/store, then RUNS the native gcc IN the store-ns own-root: it COMPILES a C and a C++ program from
+# source and the results run → 42, /gnu/store ABSENT. The compiler doing the work is itself an ELF
+# 64-bit x86_64 binary in /td/store. Requires the run_x86_64_cross / closure exports XGLIBC, plus
+# $XNGCC (gcc tree) and $XNBU (binutils tree) from the caller. The X3 gate reuses this verify by
+# pointing XNGCC/XNBU at the SELF-rebuilt trees and passing gcc-14.3.0-x86_64-self as $3 — the
+# [content-addr] leg asserts the interned name matches, so the two rungs' artifacts can't be confused.
+# ($3 is a POSITIONAL arg, not an env knob: an ambient variable must not be able to repoint a gate's
+# name assert.) Legs: [native-arch] [no-guix] [content-addr] [closure-complete] [self-host-compile]
+# [structural].
 verify_x86_64_native_ownroot() {
-  cpath=$1; snwork=$2; store="$snwork/td-store-native"; sndb="$snwork/store-native.db"; mkdir -p "$store"
+  cpath=$1; snwork=$2; _xvname="${3:-gcc-14.3.0-x86_64-native}"
+  store="$snwork/td-store-native"; sndb="$snwork/store-native.db"; mkdir -p "$store"
   test -n "${XNGCC:-}" -a -d "${XNGCC:-/nonexistent}" || { echo "native gcc tree (XNGCC) unset" >&2; return 1; }
   test -n "${XNBU:-}" -a -d "${XNBU:-/nonexistent}" || { echo "native binutils tree (XNBU) unset" >&2; return 1; }
   test -n "${XGLIBC:-}" -a -d "${XGLIBC:-/nonexistent}" || { echo "x86_64 glibc tree (XGLIBC) unset" >&2; return 1; }
@@ -602,7 +605,6 @@ verify_x86_64_native_ownroot() {
   nbrel=`basename "$NBP"`
   NGP=`"$TB" store-add-recursive "\`basename "$XNGCC"\`" "$XNGCC" "$store" "$sndb"` || { echo "store-add native gcc failed" >&2; return 1; }
   GLP=`"$TB" store-add-recursive glibc-2.41-x86_64 "$XGLIBC" "$store" "$sndb"` || { echo "store-add x86_64 glibc failed" >&2; return 1; }
-  _xvname="${X86_VERIFY_GCC_NAME:-gcc-14.3.0-x86_64-native}"
   case "$NGP" in /td/store/*-"$_xvname") ;; *) echo "gcc not content-addressed as $_xvname: $NGP" >&2; return 1 ;; esac
   echo "   [content-addr] interned the native gcc ($NGP), native binutils, and the x86_64 glibc in /td/store"
   ngrel=`basename "$NGP"`; glrel=`basename "$GLP"`
@@ -764,9 +766,12 @@ x86_64_build_self_recipe() {
 # gcc version + same configure flags (one Rust code path builds both flavors) → the self-hosted
 # compiler must generate exactly the code its builder does; GCC's own `make bootstrap` asserts the
 # same fixpoint on stage2/stage3 objects. The TUs are include-less ON PURPOSE: -S needs no headers,
-# no as/ld, no libc — the leg isolates CODE GENERATION from environment (and gcc only draws
-# /dev/urandom into symbol names for file-scope statics, which the TUs avoid, so the output is
-# deterministic). Compared by sha256 (diffutils is not guaranteed in the sandbox).
+# no as/ld, no libc — the leg isolates CODE GENERATION from environment. Both sides get the SAME
+# pinned -frandom-seed (belt to the TUs' no-file-scope-statics braces: with the seed unset gcc
+# draws /dev/urandom into generated symbol names, and a pinned seed shuts that whole class off
+# structurally instead of relying on the TU text staying nondeterminism-free — same move as the
+# gcc14-repro wrappers above). Compared by sha256 via the chain lib's sha() (diffutils is not
+# guaranteed in the sandbox).
 x86_64_self_codegen_agreement() {
   _cgn=$1; _cgs=$2
   _cgw=`mktemp -d`
@@ -783,13 +788,14 @@ EOF
   for _cgcc in "$_cgn" "$_cgs"; do
     test -x "$_cgcc/bin/gcc" -a -x "$_cgcc/bin/g++" || { echo "codegen: no gcc/g++ under $_cgcc" >&2; rm -rf "$_cgw"; return 1; }
   done
+  _cgseed=-frandom-seed=tdselfcodegen
   ( cd "$_cgw" \
-      && "$_cgn/bin/gcc" -O2 -S -o n-c.s cg.c && "$_cgs/bin/gcc" -O2 -S -o s-c.s cg.c \
-      && "$_cgn/bin/g++" -O2 -S -o n-cpp.s cg.cc && "$_cgs/bin/g++" -O2 -S -o s-cpp.s cg.cc ) \
+      && "$_cgn/bin/gcc" -O2 -S $_cgseed -o n-c.s cg.c && "$_cgs/bin/gcc" -O2 -S $_cgseed -o s-c.s cg.c \
+      && "$_cgn/bin/g++" -O2 -S $_cgseed -o n-cpp.s cg.cc && "$_cgs/bin/g++" -O2 -S $_cgseed -o s-cpp.s cg.cc ) \
     || { echo "codegen: -O2 -S compile failed" >&2; rm -rf "$_cgw"; return 1; }
   for _cgl in c cpp; do
-    _cghn=`sha256sum "$_cgw/n-$_cgl.s" | cut -d' ' -f1`
-    _cghs=`sha256sum "$_cgw/s-$_cgl.s" | cut -d' ' -f1`
+    _cghn=`sha "$_cgw/n-$_cgl.s"`
+    _cghs=`sha "$_cgw/s-$_cgl.s"`
     if [ "$_cghn" != "$_cghs" ]; then
       echo "codegen: $_cgl assembly DIFFERS between the native gcc ($_cghn) and the self-rebuilt gcc ($_cghs)" >&2
       cmp "$_cgw/n-$_cgl.s" "$_cgw/s-$_cgl.s" >&2 2>/dev/null || true

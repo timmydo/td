@@ -216,7 +216,14 @@ pub fn run_native(inp: &BuildInputs) -> Result<String, String> {
 pub fn run_self(inp: &BuildInputs) -> Result<String, String> {
     let mut report = String::new();
     let readelf = inp.builder_tools.join("readelf");
-    if !readelf_is_elf64(&readelf, &inp.builder_cc)? || !readelf_is_x86_64(&readelf, &inp.builder_cc)? {
+    if !is_exec(&readelf) {
+        return Err(format!(
+            "[builder-arch] no readelf at {} — the builder binutils tree must ship plain-named tools",
+            readelf.display()
+        ));
+    }
+    let hdr = readelf_header(&readelf, &inp.builder_cc)?;
+    if !header_is_elf64(&hdr) || !header_is_x86_64(&hdr) {
         return Err(format!(
             "[builder-arch] the builder gcc ({}) is NOT an ELF64 x86_64 binary — rung X3 \
              requires the NATIVE /td/store gcc as the builder (an i686 cross gcc is rung \
@@ -1067,20 +1074,26 @@ fn readelf_header(readelf: &Path, bin: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn readelf_is_elf64(readelf: &Path, bin: &Path) -> Result<bool, String> {
-    let h = readelf_header(readelf, bin)?;
-    Ok(h.lines().any(|l| {
+fn header_is_elf64(h: &str) -> bool {
+    h.lines().any(|l| {
         let ll = l.to_ascii_lowercase();
         ll.contains("class:") && ll.contains("elf64")
-    }))
+    })
+}
+
+fn header_is_x86_64(h: &str) -> bool {
+    h.lines().any(|l| {
+        let ll = l.to_ascii_lowercase();
+        ll.contains("machine:") && ll.contains("x86-64")
+    })
+}
+
+fn readelf_is_elf64(readelf: &Path, bin: &Path) -> Result<bool, String> {
+    Ok(header_is_elf64(&readelf_header(readelf, bin)?))
 }
 
 fn readelf_is_x86_64(readelf: &Path, bin: &Path) -> Result<bool, String> {
-    let h = readelf_header(readelf, bin)?;
-    Ok(h.lines().any(|l| {
-        let ll = l.to_ascii_lowercase();
-        ll.contains("machine:") && ll.contains("x86-64")
-    }))
+    Ok(header_is_x86_64(&readelf_header(readelf, bin)?))
 }
 
 fn contains_sub(hay: &[u8], needle: &[u8]) -> bool {
