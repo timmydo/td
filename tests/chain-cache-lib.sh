@@ -101,14 +101,16 @@ chain_cache_init() {
 
 # chain_gc NAMESPACE — whole-key eviction. A key is stale when its `last-used` stamp is
 # older than TD_CHECK_CHAIN_GC_DAYS (default 14; non-numeric ⇒ GC off), or absent (a
-# partial/legacy key). Each stale candidate is removed ONLY while its own exclusive .lock
-# is takeable non-blocking — a key another agent is mid-build/mid-reuse on holds that lock
-# (flock treats each open-file-description independently, so this is faithful even in-proc),
-# so it is skipped, never swept. The rm -rf is CONFINED: only dirs directly under
-# $TD_CHECK_CHAIN_CACHE whose basename matches "$NS-*" are eligible, and the current key
-# ($CHAIN_DIR, just stamped + locked) is never a candidate. Best-effort: a broken threshold
-# or a delete race skips quietly rather than reclaiming wrongly (a missed sweep just retries
-# next init; a bad sweep would be data loss).
+# partial/legacy key). `find -mtime +N` buckets age into whole 24h periods, so the
+# effective cutoff is the first N-day-plus boundary (a hair conservative — keeps a key
+# up to a day longer, never sweeps too soon). Each stale candidate is removed ONLY while
+# its own exclusive .lock is takeable non-blocking — a key another agent is mid-build or
+# mid-reuse on holds that lock (flock treats each open-file-description independently, so
+# this is faithful even in-proc), so it is skipped, never swept. The rm -rf is CONFINED:
+# only dirs directly under $TD_CHECK_CHAIN_CACHE whose basename matches "$NS-*" are
+# eligible, and the current key ($CHAIN_DIR, just stamped + locked) is never a candidate.
+# Best-effort: a broken threshold or a delete race skips quietly rather than reclaiming
+# wrongly (a missed sweep just retries next init; a bad sweep would be data loss).
 chain_gc() {
   _gcns="$1"
   _gcdays="${TD_CHECK_CHAIN_GC_DAYS:-14}"
