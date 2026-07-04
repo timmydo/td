@@ -675,7 +675,10 @@ fn sha256_file(p: &Path) -> io::Result<String> {
     Ok(to_base16(&h.finalize()))
 }
 
-fn contains_gnu_store(p: &Path) -> io::Result<bool> {
+// pub(crate): also the per-file half of build::require_no_gnu_store, the stage0
+// seed rung's output seal (#378) — ONE predicate for the north-star "no guix
+// bytes" invariant, not a copy per module.
+pub(crate) fn contains_gnu_store(p: &Path) -> io::Result<bool> {
     let bytes = fs::read(p)?;
     Ok(find_sub(&bytes, b"/gnu/store"))
 }
@@ -747,7 +750,8 @@ fn read_make_var(file: &Path, key: &str) -> Result<String, String> {
     Err(format!("{} has no {key}= line", file.display()))
 }
 
-fn make_executable(p: &Path) -> io::Result<()> {
+// pub(crate): also chmods the two binary seeds in build::run_stage0 (#378).
+pub(crate) fn make_executable(p: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perm = fs::metadata(p)?.permissions();
     perm.set_mode(perm.mode() | 0o755);

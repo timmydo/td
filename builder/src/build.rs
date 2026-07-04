@@ -38,6 +38,7 @@
 use crate::json::Json;
 use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1382,7 +1383,6 @@ pub fn run_cmake() -> Result<(), String> {
 /// exec bits are preserved; symlinks are recreated. Pure `std` — the stage0 rung
 /// has NO build inputs, so there is no coreutils `cp` in its sandbox to shell to.
 fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
@@ -1404,7 +1404,8 @@ fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
         } else {
             fs::copy(&from, &to)
                 .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
-            let mode = fs::metadata(&from)
+            let mode = entry
+                .metadata()
                 .map_err(|e| format!("stat {}: {e}", from.display()))?
                 .permissions()
                 .mode();
@@ -1415,21 +1416,12 @@ fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Mark a file executable (u+rwx, go+rx) — the two binary seeds are checked into
-/// git as plain files, and the interned source tree preserves that.
-fn make_executable(p: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(p)
-        .map_err(|e| format!("stat {}: {e}", p.display()))?
-        .permissions()
-        .mode();
-    fs::set_permissions(p, fs::Permissions::from_mode((mode & 0o777) | 0o755))
-        .map_err(|e| format!("chmod +x {}: {e}", p.display()))
-}
-
-/// Scan a tree for the literal `/gnu/store` in any regular file; the first hit is
-/// an error. The stage0 SEAL's output half: a guix byte in the seed rung's output
-/// reds the BUILD, in the engine, not just a downstream gate.
+/// Scan a tree for `/gnu/store` in any regular file's CONTENTS or any symlink's
+/// TARGET; the first hit is an error. The stage0 SEAL's output half: a guix byte
+/// in the seed rung's output reds the BUILD, in the engine, not just a downstream
+/// gate. (Symlink targets are scanned explicitly — a `grep -r` style content walk
+/// misses a dangling symlink into /gnu/store; the per-file predicate is
+/// bootstrap::contains_gnu_store, the crate's one copy.)
 fn require_no_gnu_store(dir: &Path) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
     for entry in entries {
@@ -1438,16 +1430,24 @@ fn require_no_gnu_store(dir: &Path) -> Result<(), String> {
             .file_type()
             .map_err(|e| format!("file type {}: {e}", entry.path().display()))?;
         let p = entry.path();
-        if ft.is_dir() {
+        let leak = if ft.is_dir() {
             require_no_gnu_store(&p)?;
+            false
+        } else if ft.is_symlink() {
+            let target =
+                fs::read_link(&p).map_err(|e| format!("readlink {}: {e}", p.display()))?;
+            target.to_string_lossy().contains("/gnu/store")
         } else if ft.is_file() {
-            let bytes = fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-            if bytes.windows(b"/gnu/store".len()).any(|w| w == b"/gnu/store") {
-                return Err(format!(
-                    "stage0 output {} contains /gnu/store bytes — the seed rung is sealed (north star: no guix bytes)",
-                    p.display()
-                ));
-            }
+            crate::bootstrap::contains_gnu_store(&p)
+                .map_err(|e| format!("read {}: {e}", p.display()))?
+        } else {
+            false
+        };
+        if leak {
+            return Err(format!(
+                "stage0 output {} contains /gnu/store bytes — the seed rung is sealed (north star: no guix bytes)",
+                p.display()
+            ));
         }
     }
     Ok(())
@@ -1492,7 +1492,9 @@ pub fn run_stage0() -> Result<(), String> {
         "bootstrap-seeds/POSIX/AMD64/hex0-seed",
         "bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
     ] {
-        make_executable(&tree.join(seed))?;
+        let p = tree.join(seed);
+        crate::bootstrap::make_executable(&p)
+            .map_err(|e| format!("chmod +x {}: {e}", p.display()))?;
     }
     for d in ["AMD64/artifact", "AMD64/bin"] {
         fs::create_dir_all(tree.join(d)).map_err(|e| format!("mkdir {d}: {e}"))?;
@@ -1500,20 +1502,19 @@ pub fn run_stage0() -> Result<(), String> {
 
     // The two kaem steps, env EMPTY (env -i): the scripts drive everything through
     // relative paths inside the tree; nothing outside it is reachable.
-    let envs: Vec<(String, String)> = Vec::new();
     let cwd = tree.to_string_lossy();
     run_cmd(
         "./bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
         &["./AMD64/mescc-tools-seed-kaem.kaem"],
         &cwd,
-        &envs,
+        &[],
         &WATCH_PHASE,
     )?;
     run_cmd(
         "./AMD64/artifact/kaem-0",
         &["./AMD64/mescc-tools-mini-kaem.kaem"],
         &cwd,
-        &envs,
+        &[],
         &WATCH_PHASE,
     )?;
 
@@ -1532,11 +1533,12 @@ pub fn run_stage0() -> Result<(), String> {
         "AMD64/artifact/kaem-0",
     ] {
         let p = Path::new(&out).join(b);
-        use std::os::unix::fs::PermissionsExt;
         let meta = fs::metadata(&p)
             .map_err(|_| format!("seed build did not produce {b} (expected under $out)"))?;
-        if meta.permissions().mode() & 0o111 == 0 {
-            return Err(format!("seed build product {b} is not executable"));
+        // A regular file with an exec bit — a directory also has 0o111, so the
+        // mode alone would pass a misplaced tree here.
+        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+            return Err(format!("seed build product {b} is not an executable file"));
         }
     }
     // The output half of the seal: no /gnu/store byte leaves this build.
@@ -1576,10 +1578,19 @@ mod tests {
         let sub = d.join("AMD64/bin");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("M1"), b"clean bytes").unwrap();
+        std::os::unix::fs::symlink("../artifact/M2", sub.join("clean-link")).unwrap();
         assert!(require_no_gnu_store(&d).is_ok(), "a clean tree must pass");
+        // Red 1: a /gnu/store byte in file CONTENTS.
         fs::write(sub.join("kaem"), b"oops /gnu/store/abc-glibc leak").unwrap();
         let err = require_no_gnu_store(&d).expect_err("a /gnu/store byte must red");
         assert!(err.contains("/gnu/store"), "diagnostic names the leak: {err}");
+        fs::remove_file(sub.join("kaem")).unwrap();
+        // Red 2: a symlink whose TARGET points into /gnu/store — invisible to a
+        // grep -r content walk, so the engine scan must catch it itself.
+        std::os::unix::fs::symlink("/gnu/store/abc-glibc/lib/ld.so", sub.join("leak-link"))
+            .unwrap();
+        let err = require_no_gnu_store(&d).expect_err("a /gnu/store symlink target must red");
+        assert!(err.contains("leak-link"), "diagnostic names the symlink: {err}");
         fs::remove_dir_all(&d).unwrap();
     }
 

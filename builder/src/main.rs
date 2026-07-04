@@ -1993,15 +1993,27 @@ fn assemble_recipe_drv(
             spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
         }
         // stage0: the SEED rung is sealed — source + builder are its WHOLE closure.
-        // A build input here would smuggle a toolchain dep into the seed build (and,
-        // on a guix host, /gnu/store bytes into its sandbox), so it is a hard error,
-        // not a silently-ignored field. No extra env: run_stage0 reads only TD_SRC/out.
+        // ANY other build material is a hard error, never a silently-ignored field:
+        // a seed/td-recipe-output input OR a crate-class entry/vendored tree would
+        // smuggle a store path into the seed sandbox, and configureFlags/phases have
+        // no runner here (run_stage0 reads only TD_SRC/out) so accepting them would
+        // silently drop declared behavior.
         "stage0" => {
             if !inputs.is_empty() {
                 return Err(format!(
                     "recipe: buildSystem \"stage0\" takes no build inputs (the seed needs nothing), but the lock carries {}",
                     inputs.join(" ")
                 ));
+            }
+            if !vendor.is_empty() || vendor_dir.is_some() {
+                return Err(
+                    "recipe: buildSystem \"stage0\" takes no vendored crates — a crate-class lock entry or vendor tree would stage a store path into the sealed seed sandbox".into(),
+                );
+            }
+            if alist.get("configureFlags").is_some() || alist.get("phases").is_some() {
+                return Err(
+                    "recipe: buildSystem \"stage0\" supports no configureFlags/phases — the seed runner would silently ignore them, so declaring them is an error".into(),
+                );
             }
         }
         // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS) and,
