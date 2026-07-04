@@ -150,8 +150,13 @@ for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "
 chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
 # emit the sed recipe: load td's OWN Rust recipe evaluator (td-recipe-eval, built by the build-recipes
 # prelude — the same dependency-free evaluator the build path and `td shell` use since the TypeScript
-# surface was deleted in #224), then emit + build the recipe from the Rust catalog.
-load_recipe_eval || fail "brick8: no td-recipe-eval (the build-recipes prelude must run first)"
+# surface was deleted in #224), then emit + build the recipe from the Rust catalog. When the prelude
+# hasn't run (standalone `check` of this gate; a cold full run outracing build-recipes), build the
+# evaluator ourselves via the same tool — it writes the same sentinel.
+load_recipe_eval 2>/dev/null || {
+  sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval" >/dev/null || fail "brick8: could not build td-recipe-eval (recipe-eval-tool)"
+  load_recipe_eval || fail "brick8: no td-recipe-eval after recipe-eval-tool"
+}
 sh tests/recipe-emit.sh sed > "$b8/sed.json" || fail "brick8: recipe-emit sed"
 mkdir -p "$b8/sb" "$b8/tmp"; cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
 env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \

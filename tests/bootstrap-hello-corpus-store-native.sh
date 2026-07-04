@@ -155,7 +155,14 @@ seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$ROO
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
 for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done
 chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
-# emit the hello recipe (td-recipe-eval is provided by the build-recipes prelude), then build it.
+# emit the hello recipe (td-recipe-eval: the build-recipes prelude's sentinel when it ran
+# first — a full check — else build it ourselves via the same tool: standalone `check
+# bootstrap-hello-corpus-store-native` runs carry no prelude, and NOT being a BUILD_GATE
+# means a cold full run can reach this line before build-recipes finishes), then build it.
+load_recipe_eval 2>/dev/null || {
+  sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval" >/dev/null || fail "brick8: could not build td-recipe-eval (recipe-eval-tool)"
+  load_recipe_eval || fail "brick8: no td-recipe-eval after recipe-eval-tool"
+}
 sh tests/recipe-emit.sh hello > "$b8/hello.json" || fail "brick8: ts-emit hello"
 mkdir -p "$b8/hb" "$b8/tmp"; cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
 env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
