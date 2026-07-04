@@ -113,18 +113,20 @@ cached_build() {
   if [ "${4:-}" = hit ]; then hit=1; else hit=; fi
 }
 
-# cached_check SPEC — prove reproducibility, memoized: skip the daemon double-build only when
+# cached_check SPEC — prove reproducibility, memoized: skip the daemon repro rebuild only when
 # a prior check verified THIS EXACT output (the sentinel records the verified output path, so
 # a cross-worktree daemon-store HIT for a different drv cannot reuse a stale verdict — the
 # shared store made a bare present/absent sentinel unsafe). Otherwise submit a CHECK to the
-# SAME shared daemon (so the repro rebuilds ALSO count against the machine-wide budget instead
-# of re-oversubscribing) and record the verified output. `out` is set by the preceding
-# cached_build in the same shell.
+# SAME shared daemon (so the repro rebuild ALSO counts against the machine-wide budget instead
+# of re-oversubscribing) and record the verified output. The CHECK verb reuses the build the
+# daemon already realized as the first of the two independent builds and rebuilds only once
+# more, so a check costs ONE build, not two. `out` is set by the preceding cached_build in the
+# same shell.
 cached_check() {
   _spec="$1"
   : "${TD_DAEMON_SOCKET:?the shared build daemon must be running (TD_DAEMON_SOCKET unset)}"
   if [ -n "$hit" ] && [ -n "${out:-}" ] && [ "`cat "$sd/b/verified-reproducible" 2>/dev/null`" = "$out" ]; then
-    echo "  [DURABLE repro] CACHED: $_spec output $out previously verified reproducible — daemon double-build skipped (verdict memoized)"
+    echo "  [DURABLE repro] CACHED: $_spec output $out previously verified reproducible — daemon repro rebuild skipped (verdict memoized)"
     return 0
   fi
   _drvf=`ls "$sd/b/"*.drv 2>/dev/null | head -1`
@@ -133,7 +135,7 @@ cached_check() {
     || { echo "FAIL: $_spec NOT reproducible (daemon CHECK: $_resp) — see the daemon log" >&2; return 1; }
   case "$_resp" in "OK "*) : ;; *) echo "FAIL: $_spec NOT reproducible: $_resp" >&2; return 1 ;; esac
   printf '%s\n' "${out:-verified}" > "$sd/b/verified-reproducible"
-  echo "  [DURABLE repro] the td build daemon's double-build agrees $_spec is reproducible"
+  echo "  [DURABLE repro] the td build daemon agrees $_spec is reproducible (a fresh rebuild is NAR-equal to the build it already realized)"
 }
 
 # cached_clean — drop this spec's transient files, KEEP $sd/b (the cache).

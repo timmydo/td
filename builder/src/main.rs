@@ -1152,6 +1152,20 @@ fn daemon_host_path(scr: &Path, canon: &str) -> Result<String, String> {
     Ok(scr.join("newstore").join(base).to_string_lossy().into_owned())
 }
 
+/// Is every one of `canons`' output trees present under `dir` (a keyed build scratch)?
+/// The daemon's CHECK verb uses this to decide whether it can reuse a prior build as one
+/// of the two independent reproducibility builds (all present ⇒ reuse, one rebuild) or
+/// must do a second fresh build (any missing ⇒ the bare-CHECK fallback). Empty ⇒ false, so
+/// a drv with no outputs never spuriously "reuses" a vacuous baseline.
+fn output_trees_present(dir: &Path, canons: &[String]) -> bool {
+    !canons.is_empty()
+        && canons.iter().all(|canon| {
+            daemon_host_path(dir, canon)
+                .map(|p| Path::new(&p).exists())
+                .unwrap_or(false)
+        })
+}
+
 /// Realize ONE drv into a content-addressed keyed scratch under `scratch_base`, with
 /// guix-daemon-parity cache reuse (a valid prior output is not rebuilt). Returns
 /// (canonical store path, host output path). Run in a child process by `daemon-build`.
@@ -1189,10 +1203,20 @@ fn daemon_realize_one(
     Ok((c, h, false))
 }
 
-/// Reproducibility double-build of ONE drv (the daemon's `CHECK` verb): realize it twice
-/// into distinct fresh scratch and compare each output's NAR hash. Returns the first
-/// output's (canonical, host) on success, an Err naming the divergence otherwise. Run in a
-/// child process by `daemon-check` so the repro rebuilds ALSO count against the budget.
+/// Reproducibility check of ONE drv (the daemon's `CHECK` verb): compare two INDEPENDENT
+/// realizations of the drv by per-output NAR hash. Returns the first output's (canonical,
+/// host) on success, an Err naming the divergence otherwise. Run in a child process by
+/// `daemon-check` so the repro rebuild ALSO counts against the budget.
+///
+/// The proof needs two independent builds; it does NOT need two *fresh* ones. The `daemon-build`
+/// verb already realized this drv into `scratch_base/<key>` — the artifact the client consumes —
+/// so this reuses THAT as the first build and rebuilds only ONCE here: two genuine builds total,
+/// not three (this verb used to discard the built artifact and realize twice more, tripling the
+/// single-threaded build cost that dominates `build-recipes`). In the loop substitutes are off,
+/// so the build verb's output is a real local build; comparing a fresh rebuild against it is a
+/// full two-independent-build reproducibility test (and additionally catches cross-run drift).
+/// When no prior build output is present (a bare `CHECK` issued with no preceding build), it
+/// falls back to a second fresh build, so the verb stays correct on its own.
 fn daemon_check_one(
     drv: &str,
     seed_dir: &str,
@@ -1202,20 +1226,29 @@ fn daemon_check_one(
     let seed_dirs = [seed_dir.to_string()];
     let key = drv_scratch_key(drv)?;
     let scr = scratch_base.join(format!("{key}-chk"));
-    let _ = std::fs::remove_dir_all(&scr); // two INDEPENDENT builds, never a cache reuse
+    let _ = std::fs::remove_dir_all(&scr); // the rebuild here must be fresh, never a cache reuse
     let r1 = scr.join("r1");
-    let r2 = scr.join("r2");
     let regs1 = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &r1, &[], ov.as_ref(), None)?;
-    let regs2 = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &r2, &[], ov.as_ref(), None)?;
+    // Baseline for the comparison: the build verb's already-realized output at
+    // scratch_base/<key> when every output tree is present there (the loop's normal path,
+    // ⇒ 2 builds total), else a SECOND fresh build (bare-CHECK fallback ⇒ the original 3).
+    let built = scratch_base.join(&key);
+    let canons: Vec<String> = regs1.iter().map(|r| r.store_path.clone()).collect();
+    let base_dir = if output_trees_present(&built, &canons) {
+        built
+    } else {
+        let r2 = scr.join("r2");
+        let _ = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &r2, &[], ov.as_ref(), None)?;
+        r2
+    };
     for reg in &regs1 {
         let canon = &reg.store_path;
         let h1 = nar_hash(&daemon_host_path(&r1, canon)?).map_err(|e| e.to_string())?;
-        let h2 = nar_hash(&daemon_host_path(&r2, canon)?).map_err(|e| e.to_string())?;
+        let h2 = nar_hash(&daemon_host_path(&base_dir, canon)?).map_err(|e| e.to_string())?;
         if h1 != h2 {
             return Err(format!("NON-REPRODUCIBLE {canon}: {h1} != {h2}"));
         }
     }
-    let _ = &regs2; // both builds succeeded and every output matched
     let first = regs1
         .first()
         .ok_or_else(|| "realize produced no outputs".to_string())?;
@@ -6073,6 +6106,36 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The daemon CHECK verb reuses the build already realized as ONE of the two
+    /// independent reproducibility builds — but ONLY when every output tree is actually
+    /// present under the build scratch; a missing output must force the fresh-rebuild
+    /// fallback (never a comparison against an absent baseline). This pins that decision.
+    #[test]
+    fn output_trees_present_gates_the_repro_build_reuse() {
+        let dir = std::env::temp_dir().join(format!("td-repro-baseline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = "/gnu/store/aaaaaaaaaaaaaaaa-hello-2.12".to_string();
+        let b = "/gnu/store/bbbbbbbbbbbbbbbb-hello-2.12-lib".to_string();
+        let touch = |canon: &str| {
+            let p = daemon_host_path(&dir, canon).unwrap();
+            let p = std::path::Path::new(&p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"out").unwrap();
+        };
+        // Empty ⇒ false: a drv with no outputs must never reuse a vacuous baseline.
+        assert!(!output_trees_present(&dir, &[]), "empty canon set must not reuse");
+        // Missing ⇒ false (the fallback trigger — VERIFIED-RED for the reuse guard).
+        assert!(!output_trees_present(&dir, &[a.clone()]), "absent output must force a rebuild");
+        // Present ⇒ true (the loop's normal 2-build path).
+        touch(&a);
+        assert!(output_trees_present(&dir, &[a.clone()]), "present output must be reusable");
+        // Multi-output: reuse only when EVERY output is present.
+        assert!(!output_trees_present(&dir, &[a.clone(), b.clone()]), "one missing output must force a rebuild");
+        touch(&b);
+        assert!(output_trees_present(&dir, &[a, b]), "all outputs present must be reusable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // `td shell` rust crate provisioning: the seed lock = the package lock with the crate
     // FODs and any stale source-key line dropped, then the td-interned source pinned. This
