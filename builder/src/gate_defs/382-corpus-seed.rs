@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): corpus builds from the warmed seed ALONE prove seed sufficiency
         non_blocking: true,
         script: r##"

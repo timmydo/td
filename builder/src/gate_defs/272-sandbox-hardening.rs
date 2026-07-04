@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): the sandbox isolation probe must not see warm state
         non_blocking: true,
         script: r##"

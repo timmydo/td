@@ -29,6 +29,7 @@ mod elf;
 #[cfg(test)]
 mod gate_lint;
 mod gate_bodies;
+mod gate_inputs;
 mod gate_timing;
 mod gates;
 mod json;

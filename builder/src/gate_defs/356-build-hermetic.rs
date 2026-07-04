@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): hermeticity probe — warm state would mask an undeclared input
         non_blocking: true,
         script: r##"

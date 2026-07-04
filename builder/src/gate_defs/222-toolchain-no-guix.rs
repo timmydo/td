@@ -30,6 +30,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &["make", "sed", "grep", "xz", "diffutils", "patch", "file", "coreutils", "gawk", "tar", "findutils", "bash"],
+        inputs: &[],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

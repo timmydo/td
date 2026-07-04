@@ -29,6 +29,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): brick 0 builds from the 229-byte seed alone
         non_blocking: true,
         script: r##"

@@ -39,8 +39,10 @@ export
 guix=${GUIX:-guix}                              # standalone script: host guix is on PATH (not the make $(GUIX))
 lock0="$(pwd)/tests/td-subst.lock"
 test -s "$lock0" || { echo "ERROR: no $lock0" >&2; exit 1; }
-cu=$(grep -- '-coreutils-' "$lock0" | sed 's/^[^ ]* //' | head -1)
-test -n "$cu" || { echo "ERROR: no coreutils in the lock" >&2; exit 1; }
+# coreutils is a DECLARED gate input (#353): the runner resolved it from
+# tests/td-subst.lock and exported it — no lock-grepping here.
+cu=${TD_GATE_INPUT_COREUTILS:-}
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
 shdir=$(dirname "$(command -v sh)")   # the helper scripts are shell scripts: coreutils $cu has no `sh`
 scratch="$(pwd)/.td-build-cache/toolchain-subst-default"; mkdir -p "$scratch/tmp" "$scratch/b"; rm -f "$scratch/b/"*.drv
 grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs "$guix" build >/dev/null \
@@ -66,11 +68,12 @@ echo "  [DURABLE structural] td-built td-subst from source (move-off-Guile §5):
 ttl="$(pwd)/tests/td-toolchain.lock"; test -s "$ttl" || { echo "FAIL: no td-toolchain.lock" >&2; exit 1; }
 key=$(env -i PATH="$cu/bin" "$tb" toolchain-key "$ttl")
 test -n "$key" || { echo "FAIL: toolchain-key produced nothing" >&2; exit 1; }
-# a real static bash from hello's pinned closure (runs directly, no interp) as the fixture
-bashpkg=$(grep -- '-bash-' "$(pwd)/tests/hello-no-guix.lock" | grep -v static | sed 's/^[^ ]* //' | head -1)
-fixt=$(env -i PATH="$cu/bin" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-       "$tb" store-closure-scan /gnu/store "$bashpkg" | grep -- '-bash-static-' | head -1)
-test -n "$fixt" -a -x "$fixt/bin/bash" || { echo "FAIL: no static bash fixture in hello's closure" >&2; exit 1; }
+# a real static bash from hello's pinned closure (runs directly, no interp) as the
+# fixture — a DECLARED gate input (#353): the runner content-scanned hello's bash
+# closure and exported the unique bash-static member.
+fixt=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$fixt" || { echo "ERROR: TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
+test -x "$fixt/bin/bash" || { echo "FAIL: no static bash fixture at $fixt" >&2; exit 1; }
 W="$scratch/ia"; rm -rf "$W"; mkdir -p "$W/phys" "$W/store" "$W/dest"
 path=$(env -i PATH="$cu/bin" TD_STORE_DIR=/td/store "$tb" store-add-input-addressed glibc-2.41 "$key" "$fixt" "$W/phys" "$W/td.db")
 base=$(basename "$path")

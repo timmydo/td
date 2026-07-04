@@ -29,6 +29,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Shared,
         non_blocking: true,
         script: "",

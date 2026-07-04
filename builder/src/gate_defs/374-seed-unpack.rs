@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): restores a frozen seed into a FRESH store and asserts registration
         non_blocking: true,
         script: r##"
