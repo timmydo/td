@@ -16,7 +16,7 @@
 ;; here — that proof is the build-recipe gates' job.)
 ;;
 ;; not-yet-td-built is now EMPTY. pkg-config was the last excluded holdout — its
-;; bundled glib hit GCC 14's default -std=gnu23 C-standard wall — until issue #297
+;; bundled glib hit GCC 15's default -std=gnu23 C-standard wall — until issue #297
 ;; pinned CFLAGS=-std=gnu17 in the recipe and gave it the pkg-config-no-guix
 ;; own-builder gate (builds it + resolves a .pc file). It is now a counted owned recipe.
 ;;
@@ -66,7 +66,7 @@
 
 ;; Authored but NOT yet built by td's own builder — excluded from the td-reproducible
 ;; census so it does not overstate independence. Now empty: pkg-config was the last
-;; holdout (its bundled glib failed GCC 14's default -std=gnu23); CFLAGS=-std=gnu17 in
+;; holdout (its bundled glib failed GCC 15's default -std=gnu23); CFLAGS=-std=gnu17 in
 ;; the recipe cleared that wall and pkg-config-no-guix now builds it + resolves a .pc
 ;; file, so it is a genuine owned recipe (issue #297).
 (define not-yet-td-built '())

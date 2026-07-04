@@ -1,7 +1,7 @@
 //! pkg-config-no-guix — td builds pkg-config with its OWN builder, guix/Guile off
 //! PATH, and the tool RESOLVES a .pc file (issue #297). pkg-config had an authored
 //! recipe but was the ONE authored-but-unproven package: its bundled glib 2.x fails
-//! GCC 14's default -std=gnu23 (goption.c uses `bool`/`true`/`false` as identifiers,
+//! GCC 15's default -std=gnu23 (goption.c uses `bool`/`true`/`false` as identifiers,
 //! now C23 keywords). Pinning CFLAGS=-std=gnu17 in the recipe (the same lever
 //! bash/less use) clears the wall, so pkg-config now builds td-natively and this gate
 //! proves the FEATURE — not "it built": it resolves a .pc file (--modversion / --cflags
@@ -33,11 +33,16 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &["pkg-config"],
+        inputs: &[],
         store: StoreMode::Shared,
+        // Realizes the guix-built seed ($TD_GUIX build) — fails on a pin-drifted host,
+        // so tagged non-blocking like its seed-realizing siblings (220/222/359).
+        non_blocking: true,
         script: r##"
 echo ">> pkg-config-no-guix: pkg-config builds via td-builder build-recipe (no guix/Guile in the path), RESOLVES a .pc file, reproducible; self-discriminated by pkg-config-perturbed"
 set -euo pipefail; \
-spec=pkg-config; \
+spec="${TD_GATE_SPECS:?the runner exports this gate's declared specs}"; \
+case "$spec" in *' '*) echo "FAIL: this gate's script handles exactly ONE spec, got '$spec' — extend the script before extending specs" >&2; exit 1 ;; esac; \
 lock="$PWD/tests/$spec-no-guix.lock"; \
 test -s "$lock" || { echo "ERROR: no lock $lock" >&2; exit 1; }; \
 cu=`grep -- '-coreutils-' "$lock" | sed 's/^[^ ]* //' | head -1`; \

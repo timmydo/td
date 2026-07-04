@@ -1411,7 +1411,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/chain-cache.sh", "chain-cache");
     assert_target!("tests/bootstrap-chain.sh", "store-persist");
     assert_target!("tests/bootstrap-chain.sh", "chain-cache");
-<<<<<<< HEAD
     // #327: the hello corpus gate now SOURCES the shared chain (inline copy deleted), so a
     // chain change must re-prove it too (its own-file arm still selects just itself).
     assert_target!("tests/bootstrap-chain.sh", "bootstrap-hello-corpus-store-native");
@@ -1419,11 +1418,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "tests/bootstrap-hello-corpus-store-native.sh",
         "bootstrap-hello-corpus-store-native"
     );
-=======
     // The pkg-config .pc behavioral helper routes to its own gate (#297), not the
     // full-check fallback — its mapping arm keeps the diff tractable.
     assert_target!("tests/pkg-config-check.sh", "pkg-config-no-guix");
->>>>>>> 9f33677 (pkg-config: td-built via pkg-config-no-guix; census 19→20 (closes #297))
 
     // Spec→gate routing: a recipe/lock for a gate's SPEC selects that gate.
     for f in gate_files(root) {
