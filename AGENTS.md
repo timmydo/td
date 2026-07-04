@@ -341,6 +341,15 @@ tracking system, and all working notes live in the git log + PR body.
   not create files to track or claim work; tracking is the issue list
   and claiming is the open PRs, full stop.
 
+- **Never `git stash` in this repo.** The stash stack (`refs/stash`)
+  is repo-*global* — shared by every worktree — so with agents working
+  concurrently a `stash pop` can pop *another* agent's WIP into your
+  worktree and drop their entry (it has already dumped one worktree's
+  changes into an unrelated one and forced hand-reconstruction). For a
+  temporary revert (verified-red runs, A/B tests) use `git checkout
+  <commit> -- <paths>` against your branch's own commits, or a
+  throwaway scratch commit on your branch — both worktree-local.
+
 - **Land (optimistic merge on green, via PR):** main is **non-strict** — a PR merges on **its own** green checks; main moving
   under you no longer forces a rebase-onto-tip + re-run. So: (1) validate against
   your own base — run `td-builder affected-checks --committed-only --run`; if it
