@@ -5783,6 +5783,21 @@ fn main() -> ExitCode {
                             readonly: true,
                             ro_optional: true,
                         });
+                        // The delegated per-run cgroup dir (issue #328): bound
+                        // RW OVER the ro hierarchy so gate-run (inside) can
+                        // create per-gate child cgroups + set memory.max. Only
+                        // when `td-builder check` probed a delegation; the rest
+                        // of the hierarchy stays ro (the crun-probe posture).
+                        if let Ok(cg) = std::env::var("TD_CHECK_CGROUP") {
+                            if !cg.is_empty() && Path::new(&cg).is_dir() {
+                                binds.push(sandbox::Bind {
+                                    src: cg,
+                                    dest: None,
+                                    readonly: false,
+                                    ro_optional: false,
+                                });
+                            }
+                        }
                     }
                     let cache = format!("{home}/.cache/guix");
                     if Path::new(&cache).is_dir() {
