@@ -140,10 +140,13 @@ done
 TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$btdb"` || fail "brick8: store-add gcc-toolchain failed"
 echo "   [brick8] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
 # Substitute the gcc-toolchain entry in hello's lock; glibc 2.41 stays in the closure via the toolchain's ref.
-oldtc=`awk '/-gcc-toolchain-/{print $2}' tests/hello-no-guix.lock | head -1`
+# (sed/cut, not awk: gawk is not in tools/loop-toolchain.txt, so bare `awk` dies on the loop PATH.)
+oldtc=`grep -- '-gcc-toolchain-' tests/hello-no-guix.lock | head -1 | cut -d' ' -f2`
 test -n "$oldtc" || fail "brick8: no gcc-toolchain in hello-no-guix.lock"
 newlock="$b8/hello.lock"
-awk -v tc="$TCP" -v gl="$GLP8" '/-gcc-toolchain-/ { print "gcc-toolchain " tc " seed"; print "glibc-2.41 " gl " seed"; next } { print }' tests/hello-no-guix.lock > "$newlock"
+sed "/-gcc-toolchain-/c\\
+gcc-toolchain $TCP seed\\
+glibc-2.41 $GLP8 seed" tests/hello-no-guix.lock > "$newlock"
 grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
 "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
 sort -u "$b8/roots" -o "$b8/roots"
@@ -152,7 +155,14 @@ seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$ROO
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
 for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done
 chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
-# emit the hello recipe (td-recipe-eval is provided by the build-recipes prelude), then build it.
+# emit the hello recipe (td-recipe-eval: the build-recipes prelude's sentinel when it ran
+# first — a full check — else build it ourselves via the same tool: standalone `check
+# bootstrap-hello-corpus-store-native` runs carry no prelude, and NOT being a BUILD_GATE
+# means a cold full run can reach this line before build-recipes finishes), then build it.
+load_recipe_eval 2>/dev/null || {
+  sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval" >/dev/null || fail "brick8: could not build td-recipe-eval (recipe-eval-tool)"
+  load_recipe_eval || fail "brick8: no td-recipe-eval after recipe-eval-tool"
+}
 sh tests/recipe-emit.sh hello > "$b8/hello.json" || fail "brick8: ts-emit hello"
 mkdir -p "$b8/hb" "$b8/tmp"; cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
 env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
