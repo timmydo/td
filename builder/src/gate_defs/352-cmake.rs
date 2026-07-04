@@ -33,7 +33,7 @@
 //! cores against build-recipes' fan-out). Not in BUILD_SPECS — the source is interned at
 //! gate time by td's OWN recursive addToStore (no `guix repl`), so it is self-contained.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -42,7 +42,13 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils — resolved by
+        // the runner from this gate's lock; the body's inline lock-grep is
+        // deleted (no shell comment in the body: its lines are `; \`-continued).
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/td-cmake-demo.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
@@ -54,8 +60,8 @@ TD_RECIPE_EVAL=`TD_GUIX="$TD_GUIX" sh tests/recipe-eval-tool.sh "$PWD/.td-build-
 test -x "$tb" -a -x "$TD_RECIPE_EVAL" || { echo "ERROR: could not resolve td-builder / td-recipe-eval" >&2; exit 1; }; \
 lock0="$PWD/tests/td-cmake-demo.lock"; \
 test -s "$lock0" || { echo "ERROR: no lock $lock0" >&2; exit 1; }; \
-cu=`grep -- '-coreutils-' "$lock0" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
+cu=${TD_GATE_INPUT_COREUTILS:-}; \
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 scratch="$PWD/.td-build-cache/cmake"; mkdir -p "$scratch/tmp" "$scratch/b"; rm -f "$scratch/b/"*.drv; \
 grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null || { echo "ERROR: could not realize the cmake seed (regenerate the lock on a channel bump)" >&2; exit 1; }; \
