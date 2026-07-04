@@ -655,13 +655,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("td-feed");
         return;
     }
-    if p == "tools/warm-td-fetch-crates.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("rust-fetch");
-        sel.add_target("td-feed");
-        return;
-    }
-
     if p == "tests/crate-free-build.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("rust-ripgrep");
@@ -1563,8 +1556,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/russh-demo/Cargo.lock", "rust-russh");
     assert_target!("tests/td-feed.lock", "td-feed");
     assert_target!("tests/td-feed.index", "td-feed");
-    assert_target!("tools/warm-td-fetch-crates.sh", "rust-fetch");
-    assert_target!("tools/warm-td-fetch-crates.sh", "td-feed");
+    // td-fetch's own crate-closure warm is native in check_loop.rs (the former
+    // tools/warm-td-fetch-crates.sh): a warm-code change rides the loop-spine arm
+    // (full-check escalation), and the lock it parses maps to the gate that
+    // consumes the warmed vendor dir.
+    assert_target!("fetch/Cargo.lock", "rust-fetch");
     // The consolidated warm orchestration + the shared-daemon lifecycle
     // (`td-feed ensure-serve`, former tools/feed-ensure.sh) live in feed/src/main.rs:
     // a feed change smokes td-feed (build + warm-selftest), a representative consumer of

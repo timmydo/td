@@ -4,7 +4,7 @@
 #
 # Phase 2b: the 73-crate closure is NO LONGER pinned here as /gnu/store FODs. The rust-fetch
 # gate provisions it GUIX-FREE — td-fetch's OWN fetcher gets each crate file from static.crates.io
-# (tools/warm-td-fetch-crates.sh, Cargo.lock-pinned, sha256 == the fetch/Cargo.lock checksum),
+# (the td-builder check prelude's native warm, Cargo.lock-pinned, sha256 == the fetch/Cargo.lock checksum),
 # interned as a content-addressed vendor tree (TD_VENDOR_DIR). The source is the local fetch/
 # tree. No guix build, no /gnu/store crate FOD, no oracle.
 kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0 /gnu/store/kalrvf4si2s65g1ps7cw4gkz0q7lwryn-rust-1.93.0

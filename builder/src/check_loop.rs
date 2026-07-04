@@ -454,45 +454,198 @@ fn subst_env_at(store: &Path, pubkey: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// A gate's cached td-built binary out of its newstore dir: the first
+/// `<newstore>/*/bin/<bin>` in sorted order — the deterministic pick the
+/// shell's `ls | head -1` made. None when the cache is cold.
+fn newstore_bin(root: &Path, newstore_rel: &str, bin: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root.join(newstore_rel)).ok()?;
+    let mut candidates: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path().join("bin").join(bin))
+        .filter(|p| p.is_file())
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// Host-cargo fallback for a warm-prelude tool: `cargo build --release` in
+/// `<dir>/` and return `target/release/<bin>`. None when cargo is absent or
+/// the build fails (every warm is best-effort; the gates enforce presence).
+fn host_cargo_bin(root: &Path, dir: &str, bin: &str) -> Option<PathBuf> {
+    find_in_path("cargo")?;
+    let built = Command::new("cargo")
+        .args(["build", "--release", "--quiet"])
+        .current_dir(root.join(dir))
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false);
+    if !built {
+        return None;
+    }
+    let p = root.join(dir).join("target/release").join(bin);
+    p.is_file().then_some(p)
+}
+
+/// One `[[package]]` entry of a Cargo.lock that carries a checksum — `(name,
+/// version, sha256)`. The checksummed entries are the vendored crates-io deps;
+/// the root (path) crate has no checksum and is excluded, exactly the
+/// reduction the retired shell awk did.
+fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
+    fn field(line: &str, key: &str) -> Option<String> {
+        let rest = line.strip_prefix(key)?.strip_prefix(" = \"")?;
+        rest.split('"').next().map(str::to_string)
+    }
+    let mut out = Vec::new();
+    let (mut name, mut ver) = (String::new(), String::new());
+    for line in lock.lines() {
+        if line.starts_with("[[package]]") {
+            name.clear();
+            ver.clear();
+        } else if let Some(v) = field(line, "name") {
+            name = v;
+        } else if let Some(v) = field(line, "version") {
+            ver = v;
+        } else if let Some(sum) = field(line, "checksum") {
+            if !name.is_empty() && !ver.is_empty() && !sum.is_empty() {
+                out.push((name.clone(), ver.clone(), sum));
+            }
+        }
+    }
+    out
+}
+
+/// sha256 (lowercase hex) of a file's bytes; None when unreadable.
+fn sha256_hex(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = crate::sha256::Sha256::new();
+    h.update(&bytes);
+    Some(crate::sha256::to_base16(&h.finalize()))
+}
+
+/// td-fetch's OWN crate closure (native since this port — was
+/// tools/warm-td-fetch-crates.sh, the prelude's last `sh tools/…` spawn;
+/// #318 axis 2): host-side NETWORK PREP that GETs each `.crate` of
+/// fetch/Cargo.lock GUIX-FREE with td's OWN fetcher (td-fetch), pinned by the
+/// UPSTREAM lock checksum (NOT a guix artifact), into the flat vendor dir the
+/// rust-fetch gate interns and builds td-fetch from (TD_VENDOR_DIR). td-fetch
+/// does every GET — td dogfoods its own fetcher, and td-fetch honors
+/// TD_FEED_BASE so the reads route through the shared feed when it is up.
+/// Best-effort like every warm (no td-fetch binary / no network → warn and
+/// return; the gate reports if it actually runs cold), and the whole warm
+/// shares ONE TD_WARM_TIMEOUT budget (numeric seconds, default 600; 0
+/// disables) exactly as the shell's single `timeout` over the script did —
+/// one hung mirror must not stall the prelude.
+fn warm_td_fetch_crates(root: &Path) {
+    use std::time::{Duration, Instant};
+    let lock_path = root.join("fetch/Cargo.lock");
+    let Ok(lock) = std::fs::read_to_string(&lock_path) else {
+        eprintln!("td-builder check: warm td-fetch crates: no {} — skipping", lock_path.display());
+        return;
+    };
+    let dest = root.join(".td-build-cache/crate-vendor/td-fetch");
+    if std::fs::create_dir_all(&dest).is_err() {
+        eprintln!("td-builder check: warm td-fetch crates: cannot create {} — skipping", dest.display());
+        return;
+    }
+    // Locate or build td-fetch (the fetcher), reused across crates.
+    let Some(tdf) = newstore_bin(root, ".td-build-cache/rust-fetch/b/newstore", "td-fetch")
+        .or_else(|| host_cargo_bin(root, "fetch", "td-fetch"))
+    else {
+        eprintln!(
+            "td-builder check: warm td-fetch crates: no td-fetch binary — skipping (PREP best-effort)"
+        );
+        return;
+    };
+    let deadline = std::env::var("TD_WARM_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .or(Some(600))
+        .filter(|n| *n > 0)
+        .map(|n| Instant::now() + Duration::from_secs(n));
+    for (name, ver, sum) in parse_lock_checksums(&lock) {
+        let nv = format!("{name}-{ver}");
+        let out = dest.join(format!("{nv}.crate"));
+        if sha256_hex(&out).as_deref() == Some(sum.as_str()) {
+            continue; // already warm + verified
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            eprintln!("td-builder check: warm td-fetch crates: TD_WARM_TIMEOUT budget exhausted — stopping");
+            break;
+        }
+        let url = format!("https://static.crates.io/crates/{name}/{nv}.crate");
+        let tmp = dest.join(format!("{nv}.crate.tmp"));
+        // td-fetch verifies the pin itself; its one success line goes to our
+        // stderr (the shell's `>&2`), and a fetch outliving the budget is
+        // killed rather than left to stall the prelude.
+        let mut cmd = Command::new(&tdf);
+        cmd.args(["fetch", &url, &sum])
+            .arg(&tmp)
+            .current_dir(root)
+            .stdout(Stdio::piped());
+        let fetched = match cmd.spawn() {
+            Ok(mut child) => {
+                let ok = loop {
+                    match child.try_wait() {
+                        Ok(Some(st)) => break st.success(),
+                        Ok(None) if deadline.is_some_and(|d| Instant::now() >= d) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break false;
+                        }
+                        Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                        Err(_) => break false,
+                    }
+                };
+                if let Some(mut so) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let mut line = String::new();
+                    if so.read_to_string(&mut line).is_ok() && !line.trim().is_empty() {
+                        eprint!("{line}");
+                    }
+                }
+                ok
+            }
+            Err(_) => false,
+        };
+        if fetched && sha256_hex(&tmp).as_deref() == Some(sum.as_str()) {
+            let _ = std::fs::rename(&tmp, &out);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!("td-builder check: warm td-fetch crates: could not td-fetch/verify {nv}");
+        }
+    }
+    let n = std::fs::read_dir(&dest)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "crate"))
+                .count()
+        })
+        .unwrap_or(0);
+    eprintln!(
+        "td-builder check: warm td-fetch crates: {n} crates in {} (td-fetched, Cargo.lock-pinned, guix-free)",
+        dest.display()
+    );
+}
+
 /// The heavy-tier warm prelude: source-bootstrap tarballs + rust crate closures
 /// (td-feed), all BEST-EFFORT (the gates enforce presence), fanned out in
 /// batches of TD_WARM_JOBS exactly as the shell prelude did.
 fn heavy_warms(root: &Path) {
     // td-fetch's own crate closure (its own warm — not the cargo-proxy).
-    let _ = warm_status(&[s("sh"), s("tools/warm-td-fetch-crates.sh")], root, &[]);
+    warm_td_fetch_crates(root);
 
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
     // cargo build of feed/.
-    let mut tdfeed = String::new();
-    if let Ok(entries) = std::fs::read_dir(root.join(".td-build-cache/td-feed/sd/newstore")) {
-        let mut candidates: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path().join("bin/td-feed"))
-            .filter(|p| p.is_file())
-            .collect();
-        candidates.sort();
-        if let Some(p) = candidates.first() {
-            tdfeed = p.display().to_string();
-        }
-    }
-    if tdfeed.is_empty() && find_in_path("cargo").is_some() {
-        let built = Command::new("cargo")
-            .args(["build", "--release", "--quiet"])
-            .current_dir(root.join("feed"))
-            .status()
-            .map(|st| st.success())
-            .unwrap_or(false);
-        if built {
-            tdfeed = root.join("feed/target/release/td-feed").display().to_string();
-        }
-    }
-    if tdfeed.is_empty() || !Path::new(&tdfeed).is_file() {
+    let Some(tdfeed) = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed")
+        .or_else(|| host_cargo_bin(root, "feed", "td-feed"))
+    else {
         eprintln!(
             "td-builder check: no td-feed binary for the heavy warm (build feed/ with cargo) — \
              skipping (best-effort; the heavy gates enforce presence)"
         );
         return;
-    }
+    };
+    let tdfeed = tdfeed.display().to_string();
 
     // `td-feed warm sources` (serial-first), routed through the ONE shared
     // td-feed serve daemon when `td-feed ensure-serve` can start/reuse it
@@ -1150,5 +1303,68 @@ mod tests {
                 "missing {missing} must expose nothing"
             );
         }
+    }
+
+    #[test]
+    fn parse_lock_checksums_takes_only_checksummed_packages() {
+        // The root (path) crate carries no checksum and must be excluded; the
+        // vendored crates-io deps carry one each.
+        let lock = "\
+# This file is automatically @generated by Cargo.\n\
+version = 3\n\
+\n\
+[[package]]\n\
+name = \"adler2\"\n\
+version = \"2.0.0\"\n\
+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+checksum = \"512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627\"\n\
+\n\
+[[package]]\n\
+name = \"td-fetch\"\n\
+version = \"0.1.0\"\n\
+dependencies = [\n\
+ \"ureq\",\n\
+]\n\
+\n\
+[[package]]\n\
+name = \"ureq\"\n\
+version = \"2.10.1\"\n\
+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\n";
+        let got = parse_lock_checksums(lock);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "adler2".to_string(),
+                    "2.0.0".to_string(),
+                    "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627".to_string()
+                ),
+                (
+                    "ureq".to_string(),
+                    "2.10.1".to_string(),
+                    "b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_lock_checksums_covers_the_real_td_fetch_lock() {
+        // The rust-fetch gate asserts ≥70 vendored crates in the warmed dir;
+        // the parser must see at least that many in the real fetch/Cargo.lock
+        // (drift guard: a lockfile-format change that blinds the parser reds
+        // here, not as a silently-cold warm).
+        let lock = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fetch/Cargo.lock"
+        ))
+        .unwrap();
+        let got = parse_lock_checksums(&lock);
+        assert!(got.len() >= 70, "only {} checksummed packages parsed", got.len());
+        assert!(
+            got.iter().all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
+            "malformed triplet parsed from the real lock"
+        );
     }
 }

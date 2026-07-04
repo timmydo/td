@@ -5,7 +5,7 @@
 # Phase 2b: the 73-crate closure is NO LONGER pinned here as /gnu/store FODs. td-feed shares
 # td-fetch's closure EXACTLY (ureq + rustls/ring + sha2 — only the bin name differs), so the
 # td-feed gate reuses td-fetch's GUIX-FREE vendor tree (.td-build-cache/crate-vendor/td-fetch,
-# td-fetched from static.crates.io by tools/warm-td-fetch-crates.sh, sha256 == the upstream
+# td-fetched from static.crates.io by the td-builder check prelude's native warm, sha256 == the upstream
 # feed/Cargo.lock checksum) and interns it + the feed/ source at gate time (no guix build, no
 # /gnu/store crate FOD, no oracle — content-address is the upstream pin). The feed/ SOURCE
 # tree is interned by td's OWN recursive addToStore (tests/intern-src.sh), keyed td-feed-source.
