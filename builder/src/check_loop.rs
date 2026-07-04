@@ -682,17 +682,93 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     Err(format!("the daemon did not bind {}:\n{tail}", sock.display()))
 }
 
+/// Resolve the guix-free stage0 td-builder (the loop-container provider). Both a harness FETCH
+/// (nar-restore) and entering the harness sandbox need it, and it never invokes guix (the stage0
+/// warm path spawns none once placed).
+fn load_stage0_tb(root: &Path) -> Result<String, String> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(". tests/cache-lib.sh && load_stage0 1>&2 && printf '%s' \"$TB\"")
+        .env("TD_STAGE0_BASE", root.join(".td-build-cache/stage0"))
+        .current_dir(root);
+    let out = run_capture(&mut cmd)
+        .map_err(|_| fatal("could not build the guix-free stage0 td-builder."))?;
+    Ok(out.trim().to_string())
+}
+
+/// A guix-less runner may have an EMPTY .td-build-cache/harness (no local heavy build, and no
+/// guix to run one). If a signed substitute store carries the harness (the daily published it,
+/// #314), FETCH + verify + restore it here rather than FATALing — tools/resolve-harness.sh checks
+/// the ed25519 signature against the pinned tests/td-subst.pub. Best-effort: any MISS (no store,
+/// no entry, bad sig, wrong path) leaves the harness absent so the caller fails CLOSED. There is
+/// no from-source fallback on a guix-less runner — the fetch IS the provisioning path.
+fn try_fetch_harness(root: &Path, hdir: &Path, tb: &str) {
+    // Resolve the substitute store exactly as tools/warm-subst.sh does for the toolchain: the
+    // daily stashes its td-subst binary + the signed narinfos under ~/.td/subst.
+    let store = std::env::var("TD_SUBST_STORE").unwrap_or_else(|_| {
+        std::env::var("HOME")
+            .map(|h| format!("{h}/.td/subst"))
+            .unwrap_or_default()
+    });
+    if store.is_empty() {
+        return;
+    }
+    let bin = std::env::var("TD_SUBST_BIN").unwrap_or_else(|_| format!("{store}/td-subst"));
+    let pub_key = std::env::var("TD_SUBST_PUBKEY")
+        .unwrap_or_else(|_| root.join("tests/td-subst.pub").to_string_lossy().into_owned());
+    // Cheap negatives — a usable store carries the signed harness narinfo + a td-subst binary +
+    // the pinned anchor. Any missing piece → no fetch (the caller then fails closed).
+    if !Path::new(&store).join("td-harness.narinfo").is_file()
+        || !Path::new(&bin).is_file()
+        || !Path::new(&pub_key).is_file()
+    {
+        return;
+    }
+    println!(
+        ">> check-harness: no local harness — FETCHING the signed /td/store harness from {store} (verified vs {pub_key})"
+    );
+    let st = Command::new("sh")
+        .arg("tools/resolve-harness.sh")
+        .arg(hdir)
+        .env("TD_SUBST_STORE", &store)
+        .env("TD_SUBST_BIN", &bin)
+        .env("TD_SUBST_PUBKEY", &pub_key)
+        .env("TD_BUILDER", tb)
+        .current_dir(root)
+        .status();
+    match st {
+        Ok(s) if s.success() => println!(
+            "   check-harness: fetched + restored the /td/store harness to {}",
+            hdir.display()
+        ),
+        _ => eprintln!(
+            "   check-harness: no verified harness substitute available at {store} — failing closed"
+        ),
+    }
+}
+
 /// The guix-free `check-harness` tier: enter td's OWN /td/store harness via the
 /// stage0 td-builder — handled BEFORE the guix guard/toolchain so this tier
 /// never invokes guix (the stage0 warm path spawns none once placed).
 fn run_check_harness(root: &Path) -> Result<i32, String> {
     let hdir = root.join(".td-build-cache/harness");
     let rel_f = hdir.join("rel");
+
+    // The guix-free stage0 td-builder: nar-restore tool for a FETCH AND the sandbox provider.
+    let tb = load_stage0_tb(root)?;
+
+    // Absent locally? A guix-less runner FETCHES the signed harness from a substitute store (#314)
+    // rather than FATALing. Any miss leaves it absent -> the fail-closed message below.
+    if !hdir.join("store").is_dir() || !rel_f.is_file() {
+        try_fetch_harness(root, &hdir, &tb);
+    }
     if !hdir.join("store").is_dir() || !rel_f.is_file() {
         return Err(fatal(&format!(
-            "no provisioned /td/store harness at {}.\n  Provision it on a guix capture host \
-             first:  ./check.sh userland-x86_64-store-native\n  (builds busybox+make at \
-             /td/store + persists them here); ship the dir to a guix-less VM.",
+            "no provisioned /td/store harness at {} (and none fetchable from a substitute store).\n  \
+             Provision it on a guix capture host:  td-builder check userland-x86_64-store-native\n  \
+             (builds busybox+make + the C toolchain at /td/store, persists them here), then ship the \
+             dir to a guix-less VM — or expose the signed substitute store the daily published the \
+             harness to (TD_SUBST_STORE + tests/td-subst.pub) so this host FETCHES it.",
             hdir.display()
         )));
     }
@@ -703,16 +779,6 @@ fn run_check_harness(root: &Path) -> Result<i32, String> {
         return Err(fatal("empty harness rel"));
     }
     let hbin = format!("/td/store/{hrel}/bin");
-    let tb = {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(". tests/cache-lib.sh && load_stage0 1>&2 && printf '%s' \"$TB\"")
-            .env("TD_STAGE0_BASE", root.join(".td-build-cache/stage0"))
-            .current_dir(root);
-        let out = run_capture(&mut cmd)
-            .map_err(|_| fatal("could not build the guix-free stage0 td-builder."))?;
-        out.trim().to_string()
-    };
     println!(">> check-harness: entering td's /td/store harness via the guix-free stage0 td-builder ({tb})");
     println!("   harness: {}/store  set: {hrel}  (guix + /gnu/store ABSENT inside)", hdir.display());
     let st = Command::new(&tb)
