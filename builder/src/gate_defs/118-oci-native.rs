@@ -36,10 +36,16 @@ pub fn gate() -> GateDef {
         name: "oci-native",
         pools: &[Pool::System],
         needs: &[],
-        // cached_build needs the build-recipes prelude: the stage0 placement, the
-        // td-recipe-eval sentinel, and the warm daemon-cache hello it cache-hits.
+        // build_gate (waits for the build-recipes prelude) so the stage0 placement +
+        // td-recipe-eval sentinel exist before load_stage0/load_recipe_eval — the same
+        // reason rust-userland-image is a build_gate with no specs. This gate does NOT
+        // declare `hello` as a build spec: it builds hello ITSELF via cached_build into
+        // its own cache root (below), and the daemon dedupes against corpus-no-guix's
+        // hello build. Declaring the spec here would duplicate `hello` in TD_BUILD_SPECS
+        // (corpus-no-guix already owns it) and needlessly widen affected-checks to the
+        // whole build-gate pool.
         build_gate: true,
-        specs: &["hello"],
+        specs: &[],
         inputs: &[],
         store: StoreMode::Shared,
         non_blocking: true,
