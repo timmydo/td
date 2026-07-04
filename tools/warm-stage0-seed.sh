@@ -29,9 +29,20 @@ paths=$(sed -n 's/^[^ ]* \(\/gnu\/store\/[^ ]*\)$/\1/p' "$lock" 2>/dev/null) || 
 command -v guix >/dev/null 2>&1 \
   || { echo "warm-stage0-seed: no guix on PATH — a guix-less runner uses the td-subst seed path (resolve-seed.sh), not this host warm" >&2; exit 0; }
 
-# --no-substitutes: offline; realize gcc-toolchain's union (and validate the rest) from
-# the components already in the store, never the network.
+# Realize the seed exactly as the retired in-loop provision_stage0 did — plain
+# `guix build <output paths>`, substitutes ENABLED. gcc-toolchain-15.2.0 is a union
+# whose .drv a store image does not carry, so it is materialized from the substitute
+# the image imported (the daemon prefers the local narinfo); `--no-substitutes` would
+# leave nothing to realize it from. This runs on the runner/host (not the offline loop
+# sandbox), so a substitute fetch here is host-prep, never a loop network dependency.
 # shellcheck disable=SC2086 -- $paths is a whitespace-separated store-path list on purpose
-guix build --no-substitutes $paths >/dev/null \
+guix build $paths >/dev/null \
   || { echo "warm-stage0-seed: could not realize the stage0 seed from $lock (warm this host's /gnu/store, or check the pinned guix daemon)" >&2; exit 1; }
+# Post-condition: EVERY seed path must now exist under /gnu/store — guix build can exit 0
+# for a substitutable output it did not actually materialize, and provision_stage0 then
+# fails closed downstream. Fail loudly HERE instead, naming the still-missing path.
+missing=""
+for p in $paths; do [ -e "$p" ] || missing="$missing $p"; done
+[ -z "$missing" ] \
+  || { echo "warm-stage0-seed: guix build exited 0 but these seed paths are still absent under /gnu/store:$missing" >&2; exit 1; }
 echo "warm-stage0-seed: realized the stage0 toolchain seed from $lock into /gnu/store (host-prep; the loop stays guix-free)" >&2
