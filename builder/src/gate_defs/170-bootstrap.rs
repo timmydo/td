@@ -47,7 +47,7 @@
 //! next brick (build-recipe references the builder by store path, so it needs daemon-free
 //! placement of the builder).
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -56,7 +56,13 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the pinned gcc-toolchain (readelf for the
+        // ELF-hygiene legs) — resolved by the runner from the stage0 toolchain
+        // lock; the body's lock-grepping is deleted.
+        inputs: &[ArtifactInput {
+            name: "gcc-toolchain",
+            kind: InputKind::LockEntry { lock: "tests/td-builder-rust.lock", stem: "gcc-toolchain" },
+        }],
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
@@ -77,7 +83,9 @@ printf 'bootstrap probe\n' > "$scratch/probe"; \
 h0=`"$s0" nar-hash "$scratch/probe"`; \
 test -n "$h0" || { echo "FAIL: stage0 nar-hash produced nothing" >&2; exit 1; }; \
 echo "  [DURABLE behavioral] stage0 runs its sentinel + nar-hashes a probe ($h0)"; \
-gcc=`grep -- '-gcc-toolchain-' "$lock" | sed 's/^[^ ]* //' | head -1`; rd="$gcc/bin/readelf"; \
+gcc=${TD_GATE_INPUT_GCC_TOOLCHAIN:-}; \
+test -n "$gcc" || { echo "ERROR: TD_GATE_INPUT_GCC_TOOLCHAIN unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
+rd="$gcc/bin/readelf"; \
 test -x "$rd" || { echo "ERROR: no readelf in the pinned gcc-toolchain ($gcc)" >&2; exit 1; }; \
 interp=`"$rd" -l "$s0" 2>/dev/null | sed -n 's/.*program interpreter: \(.*\)\]/\1/p'`; \
 case "$interp" in /gnu/store/*) : ;; *) echo "FAIL: stage0's ELF interpreter is NOT in the store — host-libc leak: '$interp'" >&2; exit 1 ;; esac; \
