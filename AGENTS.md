@@ -41,6 +41,16 @@ process in any user-facing command/build path (`td shell` resolves
 td-built packages, never `guix build`); the `/td/store` source
 bootstrap replaces the guix toolchain seed.
 
+**Rust toolchain scope (human, 2026-07-04):** the rust toolchain td
+uses to build rust packages is NOT part of the full-source-bootstrap
+requirement. It enters as a **pinned upstream rust release** (a
+declared fixed-output fetch) transformed by a td **recipe** that
+rewrites the ELF binaries (PT_INTERP/RUNPATH via
+`builder/src/elf.rs::set_interp`) onto td's own `/td/store` glibc.
+"Zero guix bytes, no guix process" still holds — upstream-release
+bytes are not guix bytes; the full-source ladder covers the C
+toolchain, and rust rides on it. Work item: #380.
+
 ## Prime directives (never violate)
 
 1. **Reproducibility is a test.** A non-reproducible build is a
