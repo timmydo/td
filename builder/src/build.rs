@@ -336,26 +336,36 @@ fn record_why(why: &Mutex<Option<String>>, reason: impl FnOnce() -> String) {
 ///     stops arriving — long before the window; only a real spin keeps the one
 ///     line coming for the whole duration. `repeats >= 2` gates out a lone line
 ///     (a single line that then goes silent is the silence bound's job).
+///
+/// `keep_tail` records the distinct-line diagnostic tail; only the stderr
+/// watcher's tail is ever read (it feeds the kill diagnostic), so stdout passes
+/// `false` to skip the per-line `clip_line` allocation on a verbose build.
 fn account_line(
     st: &mut StreamWatch,
     line: &[u8],
     count_limit: u32,
     repeat_ms: u64,
     now_ms: u64,
+    keep_tail: bool,
     stream: &str,
     why: &Mutex<Option<String>>,
 ) {
-    if line == st.last_line.as_slice() {
+    // `repeats == 0` is the initial state (no line accounted yet); force the
+    // first line down the run-start path so its `run_start_ms` is seeded — an
+    // empty first line must not be mistaken for a repeat of the empty sentinel.
+    if st.repeats > 0 && line == st.last_line.as_slice() {
         st.repeats = st.repeats.saturating_add(1);
     } else {
         st.last_line.clear();
         st.last_line.extend_from_slice(line);
         st.repeats = 1;
         st.run_start_ms = now_ms;
-        if st.tail.len() >= 5 {
-            st.tail.pop_front();
+        if keep_tail {
+            if st.tail.len() >= 5 {
+                st.tail.pop_front();
+            }
+            st.tail.push_back(clip_line(line));
         }
-        st.tail.push_back(clip_line(line));
     }
     if count_limit > 0 && st.repeats >= count_limit {
         let repeats = st.repeats;
@@ -384,14 +394,14 @@ fn account_line(
 /// always — its tail feeds the silence-kill diagnostic — and stdout too when
 /// either repeat bound is set, so a retry spin printing to stdout cannot escape
 /// the watchdog by resetting the silence clock). `watch` carries `(state,
-/// count_limit, repeat_ms, stream)`. Chunk-based (not read_until): a
+/// count_limit, repeat_ms, keep_tail, stream)`. Chunk-based (not read_until): a
 /// `\r`-progress stream with no newline still counts as activity, and an
 /// unterminated line cannot grow unboundedly.
 fn tee_stream(
     mut src: impl std::io::Read,
     mut sink: impl std::io::Write,
     sup: &Supervise,
-    watch: Option<(&Mutex<StreamWatch>, u32, u64, &str)>,
+    watch: Option<(&Mutex<StreamWatch>, u32, u64, bool, &str)>,
 ) {
     let mut buf = [0u8; 8192];
     let mut pending: Vec<u8> = Vec::new();
@@ -410,7 +420,7 @@ fn tee_stream(
         let chunk = buf.get(..n).unwrap_or(&buf);
         let _ = sink.write_all(chunk);
         let _ = sink.flush();
-        if let Some((watch, count_limit, repeat_ms, stream)) = watch {
+        if let Some((watch, count_limit, repeat_ms, keep_tail, stream)) = watch {
             if let Ok(mut st) = watch.lock() {
                 // Linear scan of the chunk; only a trailing partial line is
                 // carried over (no per-line allocation, no re-scan). `elapsed`
@@ -419,10 +429,10 @@ fn tee_stream(
                 while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
                     let line = rest.get(..nl).unwrap_or_default();
                     if pending.is_empty() {
-                        account_line(&mut st, line, count_limit, repeat_ms, elapsed, stream, &sup.why);
+                        account_line(&mut st, line, count_limit, repeat_ms, elapsed, keep_tail, stream, &sup.why);
                     } else {
                         pending.extend_from_slice(line);
-                        account_line(&mut st, &pending, count_limit, repeat_ms, elapsed, stream, &sup.why);
+                        account_line(&mut st, &pending, count_limit, repeat_ms, elapsed, keep_tail, stream, &sup.why);
                         pending.clear();
                     }
                     rest = rest.get(nl.saturating_add(1)..).unwrap_or_default();
@@ -497,9 +507,9 @@ fn run_cmd(
             // stdout is line-watched under EITHER repeat bound (the count bound
             // for configure, the duration bound for the make phase) — a chatty
             // spin printing to stdout must not escape by resetting the silence
-            // clock.
+            // clock. No tail kept: only err_watch.tail feeds the diagnostic.
             let w = if count_limit > 0 || repeat_ms > 0 {
-                Some((&sup.out_watch, count_limit, repeat_ms, "stdout"))
+                Some((&sup.out_watch, count_limit, repeat_ms, false, "stdout"))
             } else {
                 None
             };
@@ -515,7 +525,7 @@ fn run_cmd(
                 child_err,
                 std::io::stderr(),
                 &sup,
-                Some((&sup.err_watch, count_limit, repeat_ms, "stderr")),
+                Some((&sup.err_watch, count_limit, repeat_ms, true, "stderr")),
             );
             sup.err_done.store(true, Ordering::Relaxed);
         })
@@ -1500,6 +1510,44 @@ mod tests {
             t0.elapsed() < Duration::from_secs(30),
             "the burst must finish well within the window, not wedge"
         );
+    }
+
+    #[test]
+    fn account_line_seeds_run_start_on_first_line_and_honors_keep_tail() {
+        // Two #339-review invariants, tested at the accountant directly.
+        //
+        // (1) run_start_ms is seeded on the FIRST accounted line even when it
+        //     equals the empty-sentinel last_line — otherwise the duration
+        //     window would measure from process start (t=0), and an empty
+        //     first line could false-trip. Verified red: without the
+        //     `repeats > 0` guard the empty first line is counted as a repeat
+        //     of the sentinel with run_start_ms stuck at 0, so the second empty
+        //     line at t=1100 (1100 - 0 >= 300) trips.
+        let why = Mutex::new(None);
+        let mut st = StreamWatch::new();
+        account_line(&mut st, b"", 0, 300, 1000, true, "stderr", &why);
+        assert_eq!(
+            (st.repeats, st.run_start_ms),
+            (1, 1000),
+            "empty first line starts a run seeded at its arrival, not t=0"
+        );
+        account_line(&mut st, b"", 0, 300, 1100, true, "stderr", &why);
+        assert_eq!(st.repeats, 2);
+        assert!(why.lock().unwrap().is_none(), "100ms < 300ms window must not trip");
+
+        // (2) keep_tail gates the distinct-line tail: the stdout watcher passes
+        //     false, so a verbose build allocates no clip_line String per line;
+        //     the stderr watcher passes true (its tail feeds the diagnostic).
+        //     Verified red: without the gate stdout would keep a 2-entry tail.
+        let why2 = Mutex::new(None);
+        let mut sout = StreamWatch::new();
+        account_line(&mut sout, b"line-a", 0, 300, 0, false, "stdout", &why2);
+        account_line(&mut sout, b"line-b", 0, 300, 0, false, "stdout", &why2);
+        assert!(sout.tail.is_empty(), "keep_tail=false keeps no diagnostic tail");
+        let mut serr = StreamWatch::new();
+        account_line(&mut serr, b"e-a", 0, 300, 0, true, "stderr", &why2);
+        account_line(&mut serr, b"e-b", 0, 300, 0, true, "stderr", &why2);
+        assert_eq!(serr.tail.len(), 2, "keep_tail=true records the distinct-line tail");
     }
 
     #[test]
