@@ -31,7 +31,7 @@
 //! BUILD_GATE so the build-recipes prelude warms hello + td-recipe-eval (daemon cache-hit).
 //! Per-gate scratch (.td-check-scratch), removed on green, kept on red for triage.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -40,7 +40,12 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils — resolved by
+        // the runner from this gate's lock; the body's lock-grepping is deleted.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
@@ -48,8 +53,8 @@ echo ">> td-check: td computes the reproducibility verdict ITSELF — its build 
 set -euo pipefail; \
 . tests/cache-lib.sh; \
 export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; load_stage0; load_recipe_eval; \
-CU=`grep -- '-coreutils-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`; export CU; \
-test -n "$CU" || { echo "ERROR: no coreutils in tests/hello-no-guix.lock" >&2; exit 1; }; \
+CU=${TD_GATE_INPUT_COREUTILS:-}; export CU; \
+test -n "$CU" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 export CACHE="$PWD/.td-check-scratch"; chmod -R u+w "$CACHE" 2>/dev/null || true; rm -rf "$CACHE"; mkdir -p "$CACHE"; \
 echo ">> td BUILDS the subject hello (assemble-recipe + the shared td daemon; guix off PATH, input closure content-scanned)"; \
 cached_build hello tests/hello-no-guix.lock || exit 1; \

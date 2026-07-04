@@ -32,7 +32,7 @@
 //! the output path (latent red hidden while the daily runner was down, #268). The recipe
 //! takes token 3 (the host-side output), like tests/cache-lib.sh and gate 358.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -41,7 +41,12 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils — resolved by
+        // the runner from this gate's lock; the body's lock-grepping is deleted.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
@@ -49,8 +54,8 @@ echo ">> daemon-recipe: td's persistent build daemon realizes a TD-ASSEMBLED rea
 set -euo pipefail; \
 lock="$PWD/tests/hello-no-guix.lock"; \
 test -s "$lock" || { echo "ERROR: no lock $lock" >&2; exit 1; }; \
-cu=`grep -- '-coreutils-' "$lock" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
+cu=${TD_GATE_INPUT_COREUTILS:-}; \
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 . tests/cache-lib.sh; export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; load_stage0; tb="$TB"; \
 case "$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($tb)" >&2; exit 1 ;; esac; \

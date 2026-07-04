@@ -23,7 +23,7 @@
 //! is interned at gate time by td's OWN recursive addToStore (tests/intern-src.sh →
 //! store-add-recursive, no `guix repl`; move-off-Guile §5), so the gate is self-contained.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -32,7 +32,12 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils — resolved by
+        // the runner from this gate's lock; the body's lock-grepping is deleted.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/td-vendor-demo.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
@@ -43,8 +48,8 @@ case "$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL
 echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($TD_RECIPE_EVAL) — not the guix-built one (brick 4c)"; \
 lock0="$PWD/tests/td-vendor-demo.lock"; \
 test -s "$lock0" || { echo "ERROR: no lock $lock0" >&2; exit 1; }; \
-cu=`grep -- '-coreutils-' "$lock0" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
+cu=${TD_GATE_INPUT_COREUTILS:-}; \
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 ncrate=`grep -cE '\.crate /gnu/store/' "$lock0"`; \
 test "$ncrate" -ge 2 || { echo "ERROR: lock has <2 vendored .crate deps ($ncrate)" >&2; exit 1; }; \

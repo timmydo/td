@@ -38,7 +38,7 @@
 //! builder unreachable — `closure item … (on disk …): No such file`, the build fails —
 //! proving stage0 is genuinely fed into the build FROM td's own store, not /gnu/store.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -47,7 +47,12 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils — resolved by
+        // the runner from this gate's lock; the body's lock-grepping is deleted.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
@@ -59,8 +64,8 @@ test -x "$TD_RECIPE_EVAL" || { echo "ERROR: could not resolve td-recipe-eval" >&
 lock="$PWD/tests/hello-no-guix.lock"; \
 test -s "$lock" || { echo "ERROR: no lock $lock" >&2; exit 1; }; \
 grep ' /gnu/store/' "$lock" | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null || { echo "ERROR: could not realize hello's seed (regenerate locks on a channel bump)" >&2; exit 1; }; \
-cu=`grep -- '-coreutils-' "$lock" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
+cu=${TD_GATE_INPUT_COREUTILS:-}; \
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 tblock="$PWD/tests/td-builder-rust.lock"; \
 test -s "$tblock" || { echo "ERROR: no td-builder toolchain lock $tblock" >&2; exit 1; }; \

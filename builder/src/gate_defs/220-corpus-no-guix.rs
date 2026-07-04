@@ -28,7 +28,7 @@
 //! (recipes/src/recipes/hello-perturbed.rs), so it assembles a DISTINCT .drv —
 //! load-bearing here.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -37,14 +37,19 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &["hello"],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils — resolved by
+        // the runner from this gate's lock; the body's lock-grepping is deleted.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
 echo ">> corpus-no-guix: hello builds via td-builder build-recipe (no guix/Guile in the path), runs, reproducible (td-builder check); self-discriminated by hello-perturbed"
 set -euo pipefail; \
-cu=`grep -- '-coreutils-' "$PWD/tests/hello-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
+cu=${TD_GATE_INPUT_COREUTILS:-}; \
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 . tests/cache-lib.sh; export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; load_stage0; load_recipe_eval; CU="$cu"; CACHE="$PWD/.td-build-cache/pkg"; mkdir -p "$CACHE"; \
 case "$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($TD_RECIPE_EVAL)" >&2; exit 1 ;; esac; \

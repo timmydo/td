@@ -53,7 +53,9 @@ csh=`command -v bash 2>/dev/null || command -v sh`
 b8=`mktemp -d`; bstore="$b8/seed-store"; bgdb="$b8/glibc.db"; btdb="$b8/toolchain.db"; mkdir -p "$bstore"
 export TD_STORE_DIR=/td/store
 BMB="$BMB244SB"
-BUILDBASH=`grep -- '-bash-5.2.37 ' tests/sed-no-guix.lock | grep -v -e static -e minimal | sed 's/^[^ ]* //' | head -1`/bin/bash
+# the build bash is a DECLARED gate input (#353): the runner resolved it.
+test -n "${TD_GATE_INPUT_BASH:-}" || fail "TD_GATE_INPUT_BASH unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+BUILDBASH="$TD_GATE_INPUT_BASH/bin/bash"
 case "$BUILDBASH" in /gnu/store/*-bash-*/bin/bash) ;; *) fail "could not resolve the lock's bash" ;; esac
 GLP8=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$bstore" "$bgdb"` || fail "store-add glibc-2.41 failed"
 tc="$b8/gcc-toolchain"; mkdir -p "$tc/bin" "$tc/gcc"
@@ -93,8 +95,9 @@ TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$btdb"` ||
 echo "   [toolchain] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
 
 # --- Substitute the /td/store toolchain into sed's lock + warm the seed inputs (as 416) -------
-oldtc=`grep -- '-gcc-toolchain-' tests/sed-no-guix.lock | head -1 | sed 's/^[^ ]* //'`
-test -n "$oldtc" || fail "no gcc-toolchain in sed-no-guix.lock"
+# the gcc-toolchain entry is a DECLARED gate input (#353): the runner resolved it.
+oldtc=${TD_GATE_INPUT_GCC_TOOLCHAIN:-}
+test -n "$oldtc" || fail "TD_GATE_INPUT_GCC_TOOLCHAIN unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 newlock="$b8/sed.lock"
 sed "s|^[^ ]*-gcc-toolchain-[^ ]* .*|gcc-toolchain $TCP seed\nglibc-2.41 $GLP8 seed|" tests/sed-no-guix.lock > "$newlock"
 grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
@@ -143,11 +146,12 @@ if grep -q -a -- "$oldtc" "$P/store/$sbase/bin/sed"; then fail "the persisted se
 vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`
 cp -a "$bstore/$glb" "$vs/$glb"
 cp -a "$P/store/$sbase" "$vs/$sbase"        # <-- from the PERSISTENT store P, not the build scratch
-# Resolve the own-root runner (a static bash) from the WARM-SEED db, not /var/guix — so
-# no guix private-state read appears here (the seed capture, inside warm-seed, is the only
-# guix source; directive 8: the should-shrink guix surface stays flat).
-bashlock=`grep -- '-bash-' tests/sed-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs8=`"$TB" store-closure "$WDB" "$bashlock" | grep -- '-bash-static-' | head -1`
+# The own-root runner (a static bash) is a DECLARED gate input (#353): the runner
+# resolved it from sed's pinned closure by content-scan — still no /var/guix read
+# (the seed capture, inside warm-seed, is the only guix source; the guix surface
+# stays flat).
+bs8=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs8" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 bb8=`basename "$bs8"`; cp -a "$bs8" "$vs/$bb8"; chmod -R u+w "$vs"
 sedrun='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 printf "foo\nbaz\n" | /td/store/'"$sbase"'/bin/sed "s/foo/bar/"'
