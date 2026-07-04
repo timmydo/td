@@ -3,7 +3,8 @@
 //! Brick 1 (gate 170) proved td-builder needs no guix to be CREATED. This gate proves the
 //! loop can USE that stage0 to build: td places the cargo-built stage0 into its OWN
 //! content-addressed store (store-add-builder — restore the tree, scan its toolchain refs
-//! against the daemon db's ValidPaths, register path+refs), then `build-recipe` assembles
+//! against the seed store dir's entries (a readdir, no guix db read — #313), register
+//! path+refs), then `build-recipe` assembles
 //! hello's .drv with the stage0 path as `builder` and realizes it daemon-free, the
 //! builder STAGED from td's own store (canonical\ton-disk) and its closure self-contained
 //! by spanning the td builder db (the builder + its direct refs) ∪ the daemon seed db
@@ -67,9 +68,9 @@ s0dir="$scratch/stage0"; \
 s0=`TD_LOCK="$tblock" sh tools/bootstrap-td-builder.sh "$s0dir"`; \
 test -x "$s0" || { echo "FAIL: bootstrap produced no stage0 td-builder" >&2; exit 1; }; \
 test "`"$s0"`" = "td-builder 0.1.0 ok" || { echo "FAIL: stage0 sentinel" >&2; exit 1; }; \
-echo ">> place stage0 into td's OWN content-addressed store (store-add-builder; refs scanned vs the daemon db)"; \
+echo ">> place stage0 into td's OWN content-addressed store (store-add-builder; refs scanned vs the seed store dir — no guix db read)"; \
 tdstore="$scratch/tdstore"; bdb="$scratch/builder.db"; \
-Cb=`"$s0" store-add-builder td-builder-0.1.0 "$s0dir" "$tdstore" "$bdb" /var/guix/db/db.sqlite`; \
+Cb=`"$s0" store-add-builder td-builder-0.1.0 "$s0dir" "$tdstore" "$bdb" /gnu/store`; \
 case "$Cb" in /gnu/store/*-td-builder-0.1.0) : ;; *) echo "FAIL: store-add-builder gave a malformed path '$Cb'" >&2; exit 1 ;; esac; \
 test -x "$tdstore/`basename "$Cb"`/bin/td-builder" || { echo "FAIL: stage0 not restored under the td store dir" >&2; exit 1; }; \
 echo "  td placed stage0 at $Cb"; \
@@ -100,7 +101,7 @@ gg=`LD_LIBRARY_PATH="$g/lib" "$g/bin/hello"`; \
 test "$gg" = "$greet" || { echo "FAIL: guix's hello greeting ('$gg') differs from td's ('$greet')" >&2; exit 1; }; \
 echo "  [MIGRATION ORACLE] stage0-built hello is behaviorally == guix's hello (same greeting) at a DISTINCT path ($out vs $g)"; \
 rm -rf "$scratch"; \
-echo "PASS: td placed its cargo-bootstrapped stage0 td-builder into its OWN content-addressed store (store-add-builder: tree restored, toolchain refs scanned against the daemon db, path+refs registered) and the loop BUILT hello with that stage0 as the drv's builder-of-record — assembled by td (no guix (derivation …)), realized daemon-free with the closure spanning td's builder db ∪ the seed db, guix/Guile SCRUBBED FROM PATH. The artifact greets (durable behavioral), is reproducible by td's own double-build (durable), and sits at a distinct store path from guix's hello while greeting identically (migration oracle, own-then-diverge). So the loop builds with a binary guix NEVER produced; the toolchain seed is the guix-built pin (§5, retired last)."
+echo "PASS: td placed its cargo-bootstrapped stage0 td-builder into its OWN content-addressed store (store-add-builder: tree restored, toolchain refs scanned against the seed store dir's entries — no guix db read, path+refs registered) and the loop BUILT hello with that stage0 as the drv's builder-of-record — assembled by td (no guix (derivation …)), realized daemon-free with the closure spanning td's builder db ∪ the seed db, guix/Guile SCRUBBED FROM PATH. The artifact greets (durable behavioral), is reproducible by td's own double-build (durable), and sits at a distinct store path from guix's hello while greeting identically (migration oracle, own-then-diverge). So the loop builds with a binary guix NEVER produced; the toolchain seed is the guix-built pin (§5, retired last)."
 "##,
     }
 }

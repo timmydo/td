@@ -4390,16 +4390,19 @@ fn main() -> ExitCode {
         // content-addressed — the builder analog of store-add-recursive (which REFUSES a
         // referenced tree). td restores the tree into STORE-DIR, computes its
         // content-addressed `source` path from the recursive NAR, SCANS its references
-        // against the SEED db's ValidPaths (the pinned toolchain — the glibc/gcc-lib the
-        // stage0 builder links), and registers the path + those refs in OUT-DB (each ref a
-        // scaffolding ValidPaths row so the Refs join resolves — store-add-referenced's
-        // external-ref shape). This lets the loop use a td-BOOTSTRAPPED builder (stage0,
+        // against the SEED STORE DIRECTORY's entries (readdir via scan_candidate_index —
+        // the pinned toolchain store holding the glibc/gcc-lib the stage0 builder links;
+        // NO guix db read, #313), and registers the path + those refs in OUT-DB (each ref
+        // a scaffolding ValidPaths row so the Refs join resolves — store-add-referenced's
+        // external-ref shape). An ABSENT seed dir contributes no candidates: a guix-less
+        // host's rustup/system-cc stage0 embeds no store paths, so the cold start records
+        // an empty reference set. This lets the loop use a td-BOOTSTRAPPED builder (stage0,
         // NEVER produced by guix) as a recipe's builder-of-record: build-recipe reads its
-        // closure as OUT-DB.closure(path) (the builder + its DIRECT refs) ∪ the seed db
-        // (those refs' transitive closures). No daemon, no guix. Usage:
-        //   store-add-builder NAME TREE STORE-DIR OUT-DB SEED-DB    (prints the store path)
+        // closure as OUT-DB.closure(path) (the builder + its DIRECT refs) ∪ the seed
+        // content-scan (those refs' transitive closures). No daemon, no guix. Usage:
+        //   store-add-builder NAME TREE STORE-DIR OUT-DB SEED-STORE-DIR  (prints the store path)
         Some("store-add-builder") if args.len() == 7 => {
-            let (name, tree, store_dir, out_db, seed_db) =
+            let (name, tree, store_dir, out_db, seed_store) =
                 (&args[2], &args[3], &args[4], &args[5], &args[6]);
             let run = || -> Result<String, String> {
                 use store_db::{Table, Value};
@@ -4420,21 +4423,14 @@ fn main() -> ExitCode {
                 std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
                 let disk = Path::new(store_dir).join(&base);
                 copy_canonical(Path::new(tree), &disk)?;
-                // Scan the restored tree for references AGAINST the seed db's valid paths
-                // (the pinned toolchain closure) — the builder's actual store deps. The
+                // Scan the restored tree for references AGAINST the seed store DIRECTORY's
+                // entries (the pinned toolchain store) — the builder's actual store deps,
+                // with NO read of guix's private db (#313: a guix-less host cold-starts;
+                // scan_candidate_index skips an absent dir, leaving no candidates). The
                 // path itself is a candidate so a self-reference is detected. Extra
                 // never-matching candidates cannot add references (scan.rs candidate note).
-                let seed = store_db_read::Db::open(
-                    std::fs::read(seed_db).map_err(|e| format!("read seed db {seed_db}: {e}"))?,
-                )?;
-                let mut candidates: Vec<String> = seed
-                    .table("ValidPaths")?
-                    .into_iter()
-                    .filter_map(|(_, cols)| match cols.get(1) {
-                        Some(store_db_read::Value::Text(p)) => Some(p.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                let (mut candidates, _on_disk) =
+                    scan_candidate_index(std::slice::from_ref(seed_store), seed_store)?;
                 candidates.push(path.clone());
                 let mut s = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
                 nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
@@ -4444,7 +4440,7 @@ fn main() -> ExitCode {
                 // Register: id 1 = the builder (full record), each external reference a
                 // scaffolding ValidPaths row (path only) so the Refs ids resolve. So
                 // OUT-DB.closure(path) returns the builder + its DIRECT refs; realize then
-                // spans those refs' transitive closures from the seed db.
+                // spans those refs' transitive closures from the seed content-scan.
                 let mut valid: Vec<(i64, Vec<Value>)> = vec![(
                     1,
                     vec![

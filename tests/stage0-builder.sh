@@ -56,9 +56,12 @@ trap 'rm -rf "$work"' EXIT INT TERM
 s0=`TD_LOCK="$lock" sh tools/bootstrap-td-builder.sh "$work/s0"`
 test -x "$s0" || { echo "stage0-builder: bootstrap produced no stage0 td-builder" >&2; exit 1; }
 # 2. stage0 places ITSELF into the td store (its OWN store-add-builder; refs scanned vs
-#    the daemon db). No guix-built td-builder anywhere in the loop.
+#    the seed store dir's entries — a readdir, NO /var/guix/db read (#313), so a guix-less
+#    host cold-starts: /gnu/store absent → no candidates → no refs, exactly right for a
+#    rustup/system-cc stage0 that embeds no store paths). No guix-built td-builder
+#    anywhere in the loop.
 mkdir -p "$store"
-cb=`"$s0" store-add-builder td-builder-0.1.0 "$work/s0" "$store" "$db" /var/guix/db/db.sqlite`
+cb=`"$s0" store-add-builder td-builder-0.1.0 "$work/s0" "$store" "$db" /gnu/store`
 case "$cb" in
   /gnu/store/*-td-builder-0.1.0) : ;;
   *) echo "stage0-builder: store-add-builder gave a malformed path '$cb'" >&2; exit 1 ;;
