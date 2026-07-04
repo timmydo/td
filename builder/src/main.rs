@@ -28,6 +28,7 @@ mod elf;
 // to the release binary or the clippy pass.
 #[cfg(test)]
 mod gate_lint;
+mod gate_bodies;
 mod gate_timing;
 mod gates;
 mod json;
@@ -3161,6 +3162,10 @@ fn main() -> ExitCode {
         // order. Run from the repo root, inside the loop sandbox (`td-builder
         // check` execs it there). See builder/src/gates.rs.
         Some("gate-run") => gates::cli(args.get(2..).unwrap_or(&[])),
+        // gate-body <name> — run one NATIVE (typed-Rust) gate body (#318 axis 3).
+        // The runner execs this in place of `bash -c <script>` for a gate whose
+        // GateDef.script is empty; see builder/src/gate_bodies.rs.
+        Some("gate-body") if args.len() == 3 => gate_bodies::cli(&args[2]),
         // check [GOAL...] — the loop's HOST PRELUDE (the old shell check.sh,
         // ported): guards, stage0 + toolchain provisioning, warms, the shared
         // daemon, then the sandboxed gate-run. check.sh is now a guix-free cargo
