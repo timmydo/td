@@ -16,7 +16,10 @@
 //! live in the spawned child; the daemon adds persistence, the socket front end, and the
 //! budget. Line protocol (one request per connection):
 //!   request  = "<drv-path>\n"          build (realize) the drv
-//!            | "CHECK <drv-path>\n"     reproducibility double-build + compare
+//!            | "CHECK <drv-path>\n"     reproducibility check: rebuild once + compare
+//!                                       against the build already realized (two
+//!                                       independent builds; falls back to two fresh
+//!                                       builds if none was realized yet)
 //!            | "SHUTDOWN\n"             clean stop
 //!   response = "OK <payload>\n" | "ERR <msg>\n"
 
