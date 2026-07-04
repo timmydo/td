@@ -479,6 +479,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // The seed-substitute pair (#311): the resolver the provision_stage0 prelude calls
+    // and the daily's seed publisher. The seed-subst gate drives both end-to-end (the
+    // prelude's warm path additionally runs before every selected check anyway).
+    if pattern_matches(
+        "tests/seed-subst.sh|tools/resolve-seed.sh|tools/publish-seed-subst.sh",
+        p,
+    ) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("seed-subst");
+        return;
+    }
+
 
     if glob_match("tests/*-no-guix.lock", p) {
         let spec = p.strip_prefix("tests/").unwrap_or(p);
@@ -606,6 +618,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     ) {
         sel.add_preflight("shell-syntax");
         add_build_gate_targets(root, sel);
+        // provision_stage0 lives in cache-lib: its seed fetch / fail-closed paths are
+        // exercised only by the seed-subst gate (the build gates all run on a warm
+        // host where the prelude fetches nothing).
+        if p == "tests/cache-lib.sh" {
+            sel.add_target("seed-subst");
+        }
         return;
     }
 
@@ -1419,6 +1437,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/toolchain-subst-default.sh", "toolchain-subst-default");
     assert_target!("tools/resolve-toolchain.sh", "toolchain-subst-default");
     assert_target!("tools/publish-toolchain-subst.sh", "toolchain-subst-default");
+    assert_target!("tests/seed-subst.sh", "seed-subst");
+    assert_target!("tools/resolve-seed.sh", "seed-subst");
+    assert_target!("tools/publish-seed-subst.sh", "seed-subst");
+    assert_target!("tests/cache-lib.sh", "seed-subst");
     assert_target!("tests/td-subst.pub", "toolchain-subst-default");
     assert_target!("tests/td-toolchain.lock", "toolchain-subst-default");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");

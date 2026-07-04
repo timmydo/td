@@ -50,6 +50,14 @@ else
 fi
 [ -n "$TDB" ] && [ -x "$TDB" ] || { echo "daily: FATAL: no td-builder (need host cargo or a pre-placed stage0)" >&2; exit 1; }
 echo ">> daily backstop: full td-builder check on origin/main ($main)"
+# Host-prep: warm the stage0 toolchain seed into /gnu/store (#311 — the loop's
+# provision_stage0 no longer realizes it with `guix build`; it resolves from a td-subst
+# store or fails closed). The daily runner is guix-having, so it warms the guix-built pin
+# out-of-band here (gcc-toolchain is a cheap union guix realizes offline) so the loop
+# finds the seed present — and so the daily can bootstrap the seed publication below even
+# after a channel bump. Best-effort: a failure here surfaces as the loop's own clear
+# fail-closed message.
+sh tools/warm-stage0-seed.sh || echo ">> daily backstop: WARN — could not warm the stage0 seed out-of-band (provision_stage0 will fail closed if it is absent)" >&2
 # TD_SUBST_FORCE_BUILD=1: the daily is the SOLE from-seed authoritative build + publisher
 # (x64-toolchain-subst). Suppress the fetch short-circuit so gate 414 ALWAYS builds the x86_64
 # toolchain from seed and re-produces the closure export to publish below — otherwise a persistent
@@ -181,6 +189,20 @@ if [ $rc -eq 0 ]; then
     echo ">> publish-x86_64-native-closure: signed + published the native x86_64 toolchain closure to $_store (the per-PR loop FETCHES the native toolchain, SKIPS the ~45-min native build)"
   else
     echo ">> publish-x86_64-native-closure: WARN — td-subst sign failed; not published"
+  fi
+  # seed substitutes (#311): publish the pinned stage0 SEED closure (tests/
+  # td-builder-rust.lock) so the loop's seed resolver (tools/resolve-seed.sh, called by
+  # the provision_stage0 prelude) can realize a MISSING seed with NO guix process —
+  # fail-closed, no guix fallback. publish-seed-subst.sh captures the closure by
+  # content-scanning the live store bytes (zero guix-db reads) and is idempotent: it
+  # re-exports only when a lock root is unpublished (i.e. after a channel bump).
+  if [ -z "${TD_SUBST_PRIVKEY:-}" ] || [ -z "$_sb" ] || [ ! -x "$_sb" ]; then
+    echo ">> publish-seed-subst: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set"
+  elif TD_BUILDER="$TDB" TD_SUBST_BIN="$_sb" TD_SUBST_PRIVKEY="$TD_SUBST_PRIVKEY" \
+       sh tools/publish-seed-subst.sh tests/td-builder-rust.lock "$_store"; then
+    :
+  else
+    echo ">> publish-seed-subst: WARN — seed publish failed; not published"
   fi
 else
   echo ">> daily backstop: RED (heavy_rc=$heavy_rc system_rc=$system_rc harness_rc=$harness_rc) — agent: triage \`git log <last-green>..$main\`, reproduce the failing gate, open a FIX-OR-REVERT PR (no auto-merge). Suspect-revert helper: ci/revert-suspect.sh --ref <sha> --open-pr"

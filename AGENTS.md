@@ -445,7 +445,11 @@ tracking system, and all working notes live in the git log + PR body.
 - `tests/` — the gate scripts: package-manager behavioral tests, locks, and the
   drv fixtures for td's build-engine gates.
 - `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
-  deliberately (exclusive landing), never silently.
+  deliberately (exclusive landing), never silently. A bump that regenerates a seed lock
+  must also publish the new seed substitutes (tools/publish-seed-subst.sh into
+  ~/.td/subst) or warm the runner hosts out-of-band: the loop's preludes no longer
+  realize a missing seed with `guix build` — they fetch from the substitute store and
+  otherwise FAIL CLOSED (#311).
 - `DESIGN.md` — the settled north star: scope (§0), the loop (§1), and the
   provenance chain. The parallel-work rules live here in AGENTS.md, not DESIGN.md.
 - Clarifications persist HERE: when the human gives a
