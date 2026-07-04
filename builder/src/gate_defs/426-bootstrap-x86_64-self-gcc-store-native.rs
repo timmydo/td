@@ -26,8 +26,8 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        // Typed artifact input (#353): resolved by the runner — the shared
-        // x86_64 verify fns consume TD_GATE_INPUT_BASH_STATIC.
+        // Typed artifact inputs (#353): resolved by the runner — the shared
+        // x86_64 resolve/verify fns consume TD_GATE_INPUT_{COREUTILS,BASH_STATIC}.
         inputs: &[
             // coreutils: the x86_64_obtain_* wrappers call the subst-lib
             // resolve fns, which consume TD_GATE_INPUT_COREUTILS (#353 review
