@@ -994,9 +994,10 @@ trap 'rm -rf "$snwork"' EXIT INT TERM   # both paths (the build branch re-traps,
 # for the store-ns shell. Used by BOTH paths (fetched-into OR built-and-interned-into); kept separate
 # from verify_x86_64_ownroot's own $snwork/td-store so the from-seed path's glibc copy can't collide.
 cstore="$snwork/closure-store"; cdb="$snwork/closure.db"; mkdir -p "$cstore"
-bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
-test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash from hello's closure for the own-root shell"
+# the static-bash fixture is a DECLARED gate input (#353): the runner resolved it.
+bs=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 bbase=`basename "$bs"`; cp -a "$bs" "$cstore/$bbase"; chmod -R u+w "$cstore"
 
 # --- FETCH SHORT-CIRCUIT (x64-toolchain-subst, human 2026-06-28): if check.sh host-prep exposed a

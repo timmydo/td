@@ -27,14 +27,23 @@ pub fn gate() -> GateDef {
         specs: &[],
         // Typed artifact input (#353): resolved by the runner — the shared
         // x86_64 verify fns consume TD_GATE_INPUT_BASH_STATIC.
-        inputs: &[ArtifactInput {
-            name: "bash-static",
-            kind: InputKind::ClosureMember {
-                lock: "tests/hello-no-guix.lock",
-                root_stem: "bash",
-                member_stem: "bash-static",
+        inputs: &[
+            // coreutils: the x86_64_obtain_* wrappers call the subst-lib
+            // resolve fns, which consume TD_GATE_INPUT_COREUTILS (#353 review
+            // find — the wrapper call path was missed in the first cut).
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
             },
-        }],
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/hello-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
