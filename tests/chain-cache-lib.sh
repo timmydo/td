@@ -40,15 +40,25 @@
 #     holder (flock semantics), so a SIGKILLed gate never wedges the cache. (Pure hits
 #     re-verify under the same exclusive lock — seconds against the ~90-min build they
 #     replace; a shared-lock fast path is not worth the upgrade races.)
+#   * WHOLE-KEY GC (#326): each key dir carries a `last-used` stamp, re-touched on every
+#     chain_cache_init. A key not used for TD_CHECK_CHAIN_GC_DAYS (default 14) is a
+#     multi-GB orphan from a superseded (recipe, pin, channels.scm) tuple — nothing ever
+#     prunes INSIDE a key (brick paths are baked into later bricks), so reclamation must be
+#     whole-key. chain_cache_init sweeps stale keys AFTER taking its own lock+stamp; each
+#     candidate is removed ONLY while its own exclusive .lock can be taken non-blocking, so
+#     a key mid-build/mid-reuse (its holder still owns the flock) is NEVER swept. Confined:
+#     only dirs directly under $TD_CHECK_CHAIN_CACHE matching "<namespace>-*" are eligible.
 #
 # API:
 #   chain_cache_init NAME FILE...  — compute the key from FILEs, set CHAIN_WARM/CHAIN_DIR,
-#                                    take the lock. NAME namespaces the lock+dir (the
-#                                    modern chain uses "chain"). Nonzero = requested warm
-#                                    cache unusable (fail closed).
+#                                    take the lock, stamp last-used, GC stale keys. NAME
+#                                    namespaces the lock+dir+sweep (the modern chain uses
+#                                    "chain"). Nonzero = requested warm cache unusable
+#                                    (fail closed).
 #   chain_hit NAME                 — 0 on verified reuse; sets CHAIN_PATH to the brick dir.
 #   chain_path NAME                — echo the recorded brick dir.
 #   chain_save NAME DIR PRODUCT... — record the sentinel after a successful build.
+#   chain_gc NAMESPACE             — whole-key eviction of stale keys (called by init).
 #   chain_done                     — release the lock (also released on process exit).
 
 # chain_cache_init NAMESPACE FILE... — CHAIN_WARM=1 + the key lock on success; CHAIN_WARM=0
@@ -84,6 +94,49 @@ chain_cache_init() {
     flock 9 || { echo "chain-cache: FAIL-CLOSED: flock failed on $CHAIN_DIR/.lock" >&2; exec 9>&-; return 1; }
   fi
   CHAIN_WARM=1
+  # Mark this key live (the GC freshness signal), then reclaim stale sibling keys.
+  touch "$CHAIN_DIR/last-used" 2>/dev/null || true
+  chain_gc "$CHAIN_NS"
+}
+
+# chain_gc NAMESPACE — whole-key eviction. A key is stale when its `last-used` stamp is
+# older than TD_CHECK_CHAIN_GC_DAYS (default 14; non-numeric ⇒ GC off), or absent (a
+# partial/legacy key). Each stale candidate is removed ONLY while its own exclusive .lock
+# is takeable non-blocking — a key another agent is mid-build/mid-reuse on holds that lock
+# (flock treats each open-file-description independently, so this is faithful even in-proc),
+# so it is skipped, never swept. The rm -rf is CONFINED: only dirs directly under
+# $TD_CHECK_CHAIN_CACHE whose basename matches "$NS-*" are eligible, and the current key
+# ($CHAIN_DIR, just stamped + locked) is never a candidate. Best-effort: a broken threshold
+# or a delete race skips quietly rather than reclaiming wrongly (a missed sweep just retries
+# next init; a bad sweep would be data loss).
+chain_gc() {
+  _gcns="$1"
+  _gcdays="${TD_CHECK_CHAIN_GC_DAYS:-14}"
+  case "$_gcdays" in ''|*[!0-9]*) return 0 ;; esac   # non-numeric/empty ⇒ GC disabled
+  test -n "${TD_CHECK_CHAIN_CACHE:-}" || return 0
+  for _gcd in "$TD_CHECK_CHAIN_CACHE/$_gcns"-*; do
+    [ -d "$_gcd" ] || continue                        # no glob match ⇒ literal pattern; skip
+    [ "$_gcd" = "$CHAIN_DIR" ] && continue             # never sweep the key we just took
+    # Keep a key whose stamp EXISTS and is fresh; everything else is a candidate.
+    if [ -f "$_gcd/last-used" ] && \
+       [ -z "`find "$_gcd/last-used" -mtime +"$_gcdays" -print 2>/dev/null`" ]; then
+      continue
+    fi
+    # Confinement: only ever a dir the glob produced under the cache root (defensive —
+    # $_gcd already comes from the "$NS-*" glob, never an untrusted sentinel).
+    case "$_gcd" in "$TD_CHECK_CHAIN_CACHE/$_gcns"-*) : ;; *) continue ;; esac
+    # Take the candidate's own exclusive lock and HOLD it across the delete (flock's
+    # command form: it opens+locks $_gcd/.lock, runs rm while holding it, then unlocks).
+    # A key another agent is mid-build/mid-reuse on holds that lock, so `flock -n` can't
+    # take it ⇒ the key is skipped, never swept. rm unlinks the dir (incl .lock) while
+    # flock still owns the now-unlinked inode; flock returns rm's status, so 0 ⇒ swept.
+    # (`2>/dev/null` is scoped to THIS command — a lock-busy diagnostic is expected noise,
+    # not an error — and never leaks to the shell's stderr the way `exec N>f 2>/dev/null`
+    # would.)
+    if flock -n "$_gcd/.lock" rm -rf "$_gcd" 2>/dev/null; then
+      echo "   [chain-cache] GC swept stale key $_gcd (unused > ${_gcdays}d)" >&2
+    fi
+  done
 }
 
 # chain_path NAME — the recorded brick dir (empty when absent).
