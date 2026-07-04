@@ -17,7 +17,7 @@
 //! --version (the binary loads + runs self-contained — their function is the rust-<tool>
 //! gates' job).
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -32,7 +32,16 @@ pub fn gate() -> GateDef {
         // red: "no td-recipe-eval sentinel" before this flag; green after).
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils the shared
+        // crate-free-build.sh harness consumes — resolved by the runner from
+        // this gate's lock.
+        // (This gate ships several tools, each via its own lock; every one of
+        // those locks pins the IDENTICAL coreutils entry, so one declaration
+        // covers all the harness invocations byte-identically.)
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/fd.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
