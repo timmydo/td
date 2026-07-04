@@ -56,6 +56,8 @@ export GUIX="$TD_GUIX" ROOT="$PWD"; \
 ship() { \
   name=$1; cratedir=$2; lock=$3; skey=$4; recipe=$5; bin=$6; expect=$7; shift 7; \
   echo ">> [$bin] build guix-free (crate-free-build) + ship via td-native OCI image"; \
+  lc=`grep -- '-coreutils-' "$lock" | sed 's/^[^ ]* //' | head -1`; \
+  test "x$lc" = "x$TD_GATE_INPUT_COREUTILS" || { echo "FAIL: $lock coreutils ($lc) diverged from the declared input ($TD_GATE_INPUT_COREUTILS) — the per-lock-identical premise of this gate's single declaration broke; update the inputs" >&2; return 1; }; \
   nsout=`sh tests/crate-free-build.sh "$name" "$cratedir" "$lock" "$skey" "$recipe"` || return 1; \
   eval "$nsout"; \
   test -x "$NS/bin/$bin" || { echo "FAIL: no td-built $bin at $NS/bin/$bin" >&2; return 1; }; \
