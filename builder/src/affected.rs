@@ -380,6 +380,54 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // Tombstones for the shell the native store bodies replaced (#318 axis 3):
+    // the DELETING diff still routes to the gates that absorbed the logic
+    // (a deleted path has no file to introspect, so map it explicitly).
+    if p == "tests/store-subject.sh" {
+        for g in [
+            "store-register",
+            "store-gc",
+            "store-verify",
+            "store-gc-sweep",
+            "store-add-referenced",
+            "store-backend",
+        ] {
+            sel.add_target(g);
+        }
+        return;
+    }
+    if p == "tests/store-ns.sh" {
+        sel.add_target("store-ns");
+        return;
+    }
+    if p == "tests/store-relocate.sh" {
+        sel.add_target("store-relocate");
+        return;
+    }
+
+    // Native (typed-Rust) gate BODIES (#318 axis 3): a body change must run the
+    // native gates it implements (the former tests/store-*.sh / gate script
+    // mapping), plus the engine smoke for the shared helpers.
+    if p == "builder/src/gate_bodies.rs" {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check-engine");
+        for g in [
+            "store-add",
+            "store-add-tree",
+            "store-register",
+            "store-gc",
+            "store-gc-sweep",
+            "store-add-referenced",
+            "store-verify",
+            "store-backend",
+            "store-ns",
+            "store-relocate",
+        ] {
+            sel.add_target(g);
+        }
+        return;
+    }
+
     if pattern_matches("builder/Cargo.toml|builder/Cargo.lock|builder/src/*", p) {
         // The td-builder build engine validates on the ~2-min check-engine SMOKE tier
         // (DESIGN §7.2): cargo-test (compile + unit tests), NOT the from-source corpus
@@ -632,24 +680,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // host where the prelude fetches nothing).
         if p == "tests/cache-lib.sh" {
             sel.add_target("seed-subst");
-        }
-        return;
-    }
-
-    // The store-backend gate cluster's shared subject-swap helper (R3): it builds the
-    // td subject + closure for exactly these six store-DB gates, so a change to it routes
-    // to them (not every build gate).
-    if p == "tests/store-subject.sh" {
-        sel.add_preflight("shell-syntax");
-        for g in [
-            "store-register",
-            "store-gc",
-            "store-verify",
-            "store-gc-sweep",
-            "store-add-referenced",
-            "store-backend",
-        ] {
-            sel.add_target(g);
         }
         return;
     }
@@ -997,16 +1027,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "tests/store-ns.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("store-ns");
-        return;
-    }
-    if p == "tests/store-relocate.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("store-relocate");
-        return;
-    }
     if p == "tests/store-native-profile.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("store-native-profile");
@@ -1414,6 +1434,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_branch_policy!("builder/src/gate_defs/325-cargo-test.rs", "the full check would be waived");
     assert_target!("tests/repro-lib.sh", "bootstrap-binutils-244-store-native");
     assert_branch_policy!("tests/repro-lib.sh", "the full check would be waived");
+    // Native (typed-Rust) gate bodies (#318 axis 3): a body change runs its gates
+    // (the former tests/store-*.sh / gate-script mapping) + the engine smoke.
+    assert_target!("builder/src/gate_bodies.rs", "store-register");
+    assert_target!("builder/src/gate_bodies.rs", "store-ns");
+    assert_target!("builder/src/gate_bodies.rs", "store-relocate");
+    assert_target!("builder/src/gate_bodies.rs", "check-engine");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
     // catalog edit runs recipe-rs, the census, and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");

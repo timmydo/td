@@ -2,7 +2,7 @@
 //! from guix (human 2026-06-21). `td-builder store-ns STORE-DIR -- CMD` enters a user namespace
 //! pivoted into a minimal td-owned root that binds STORE-DIR at /td/store and binds NOTHING from
 //! /gnu/store or /var/guix — so inside, /td/store IS the store and the host /gnu/store + guix
-//! install are ABSENT. Rootless (no daemon, no root). tests/store-ns.sh places a static binary
+//! install are ABSENT. Rootless (no daemon, no root). gate_bodies::store_ns places a static binary
 //! (bash-static, from hello's seed closure) into a td-owned store and runs it inside the store-ns,
 //! asserting it runs from /td/store with /gnu/store absent (unmixed from the local guix). The
 //! unmixed base the /td/store package manager runs in; the dynamic toolchain is relocated to
@@ -11,6 +11,9 @@
 
 use crate::gates::{GateDef, Pool, StoreMode};
 
+// Native (typed-Rust) gate body (#318 axis 3): the bash was ported verbatim into
+// `gate_bodies::store_ns`; `script: ""` marks it native, so the runner execs
+// `td-builder gate-body store-ns` (as the stage0) under the same memory wrapper.
 pub fn gate() -> GateDef {
     GateDef {
         name: "store-ns",
@@ -21,9 +24,6 @@ pub fn gate() -> GateDef {
         inputs: &[],
         store: StoreMode::Shared,
         non_blocking: false,
-        script: r##"
-echo ">> store-ns: td owns its own root with its store at /td/store — a binary runs from /td/store, /gnu/store ABSENT (rootless, unmixed from guix; user-pm Phase 0)"
-sh tests/store-ns.sh
-"##,
+        script: "",
     }
 }

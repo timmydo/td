@@ -107,10 +107,14 @@ test "x$got" = "x$D" || { echo "FAIL: resolver did not print the restored harnes
 # a binary FROM THE FETCHED store runs
 ran=$(env -i "$D/store/$rel/bin/busybox" -c 'echo RAN-FETCHED-HARNESS')
 test "x$ran" = "xRAN-FETCHED-HARNESS" || { echo "FAIL: the fetched (not built) harness binary did not run (got '$ran')" >&2; exit 1; }
-# the loose /td/store/ld loader shipped (the tree-set member no per-path export can express)
-cmp -s "$H/store/ld" "$D/store/ld" || { echo "FAIL: the loose /td/store/ld loader did not round-trip byte-identically" >&2; exit 1; }
+# the loose /td/store/ld loader shipped (the tree-set member no per-path export can express).
+# Byte-identity via sha256sum: cmp is diffutils, which the loop toolchain
+# (tools/loop-toolchain.txt) does not carry — the gate red with `cmp: command
+# not found` in the sandbox; coreutils sha256sum asserts the same byte equality.
+same_bytes() { test "x$(sha256sum < "$1")" = "x$(sha256sum < "$2")"; }
+same_bytes "$H/store/ld" "$D/store/ld" || { echo "FAIL: the loose /td/store/ld loader did not round-trip byte-identically" >&2; exit 1; }
 # the runnable member is byte-identical to what was published
-cmp -s "$H/store/$rel/bin/busybox" "$D/store/$rel/bin/busybox" || { echo "FAIL: the fetched harness binary is not byte-identical to the published one" >&2; exit 1; }
+same_bytes "$H/store/$rel/bin/busybox" "$D/store/$rel/bin/busybox" || { echo "FAIL: the fetched harness binary is not byte-identical to the published one" >&2; exit 1; }
 # the rel + toolchain metadata the check-harness loop reads survived intact
 test "x$(cat "$D/rel")" = "x$rel" || { echo "FAIL: fetched rel != published rel" >&2; exit 1; }
 HT_TARGET=; HT_GCC=; HT_GLIBC=; HT_BU=; . "$D/toolchain"
