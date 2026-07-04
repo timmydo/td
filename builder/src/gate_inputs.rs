@@ -16,7 +16,9 @@
 //! silent first-wins.
 
 use crate::gates::{ArtifactInput, InputKind};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 /// The env var carrying a resolved input: `TD_GATE_INPUT_<NAME>` with the
 /// declared name upper-cased and `-` mapped to `_` (names are validated as
@@ -32,14 +34,15 @@ pub(crate) fn env_var(name: &str) -> String {
     format!("TD_GATE_INPUT_{mapped}")
 }
 
-/// Does a store path name package `stem`? The basename after the 32-char hash
-/// prefix must BE the stem or be `<stem>-<version…>` with the version starting
-/// in a digit — so `bash` matches `bash-5.2.37`, not `bash-static-5.2.37`.
+/// Does a store path name package `stem`? The basename after the 32-char
+/// digest (the shape rule lives in `store::name_from_store_path` — one source,
+/// not a fourth copy) must BE the stem or be `<stem>-<version…>` with the
+/// version starting in a digit — so `bash` matches `bash-5.2.37`, not
+/// `bash-static-5.2.37`. A non-store-shaped basename is matched as-is.
 fn path_names_stem(path: &str, stem: &str) -> bool {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    let name_ver = match base.split_once('-') {
-        Some((h, rest)) if h.len() == 32 => rest,
-        _ => base,
+    let name_ver = match crate::store::name_from_store_path(path) {
+        Some(n) => n,
+        None => path.rsplit('/').next().unwrap_or(path).to_string(),
     };
     if name_ver == stem {
         return true;
@@ -84,35 +87,77 @@ fn resolve_lock_entry(root: &Path, lock: &str, stem: &str) -> Result<String, Str
     unique_match(entries.iter().map(|e| e.path.as_str()), stem, lock)
 }
 
+/// Per-process memo for ClosureMember resolutions. Many gates declare the
+/// IDENTICAL triple (9 gates share hello's bash → bash-static today) and every
+/// resolution pays a full store-dir index + a byte-scan of the root's whole
+/// runtime closure, so one gate-run process resolves each distinct triple ONCE.
+/// Keyed by the ABSOLUTE lock path (unit tests run many roots in one process).
+/// Only Ok is memoized: a failure may be transient ordering (the subject gets
+/// realized by build-recipes after an early non-build gate asked), and caching
+/// it would poison every later gate in the run. Computed under the lock on
+/// purpose — single-flight, so concurrent workers asking for the same triple
+/// wait for the one scan instead of racing their own.
+type ClosureKey = (String, String, String);
+fn closure_memo() -> &'static Mutex<HashMap<ClosureKey, String>> {
+    static MEMO: OnceLock<Mutex<HashMap<ClosureKey, String>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The uncached ClosureMember walk: content-scan the runtime closure of the
+/// lock entry naming `root_stem` and pick the unique member naming
+/// `member_stem`. NOTE this runs in the RUNNER process, outside the per-gate
+/// prlimit/cgroup budgets that bound gate bodies — the memo above keeps it to
+/// one scan per triple per run, which is the same order of work the old
+/// per-gate `store-closure-scan` subprocess did once.
+fn resolve_closure_member(
+    root: &Path,
+    lock: &str,
+    root_stem: &str,
+    member_stem: &str,
+) -> Result<String, String> {
+    let root_path = resolve_lock_entry(root, lock, root_stem)?;
+    // The scanned store dir is the root entry's OWN prefix dir — no
+    // hardcoded /gnu/store, so a /td/store lock resolves the same way.
+    let store_dir = match root_path.rsplit_once('/') {
+        Some((dir, _)) if !dir.is_empty() => dir.to_string(),
+        _ => return Err(format!("lock entry `{root_stem}` ({root_path}) is not a store path")),
+    };
+    let dirs = vec![store_dir.clone()];
+    let (candidates, on_disk) = crate::scan_candidate_index(&dirs, &store_dir)?;
+    let mut scanner = crate::scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+    let empty = std::collections::HashMap::new();
+    let closure = crate::scan_closure_hybrid(
+        &mut scanner,
+        &on_disk,
+        &empty,
+        std::slice::from_ref(&root_path),
+    )?;
+    unique_match(
+        closure.iter().map(String::as_str),
+        member_stem,
+        &format!("the content-scanned closure of {root_path}"),
+    )
+}
+
 /// Resolve one declared input to a store path. `root` is the repo root (lock
 /// paths are repo-relative, as everywhere else in the gate ladder).
 pub(crate) fn resolve(root: &Path, input: &ArtifactInput) -> Result<String, String> {
     match &input.kind {
         InputKind::LockEntry { lock, stem } => resolve_lock_entry(root, lock, stem),
         InputKind::ClosureMember { lock, root_stem, member_stem } => {
-            let root_path = resolve_lock_entry(root, lock, root_stem)?;
-            // The scanned store dir is the root entry's OWN prefix dir — no
-            // hardcoded /gnu/store, so a /td/store lock resolves the same way.
-            let store_dir = match root_path.rsplit_once('/') {
-                Some((dir, _)) if !dir.is_empty() => dir.to_string(),
-                _ => return Err(format!("lock entry `{root_stem}` ({root_path}) is not a store path")),
-            };
-            let dirs = vec![store_dir.clone()];
-            let (candidates, on_disk) = crate::scan_candidate_index(&dirs, &store_dir)?;
-            let mut scanner =
-                crate::scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
-            let empty = std::collections::HashMap::new();
-            let closure = crate::scan_closure_hybrid(
-                &mut scanner,
-                &on_disk,
-                &empty,
-                std::slice::from_ref(&root_path),
-            )?;
-            unique_match(
-                closure.iter().map(String::as_str),
-                member_stem,
-                &format!("the content-scanned closure of {root_path}"),
-            )
+            let key = (
+                root.join(lock).display().to_string(),
+                (*root_stem).to_string(),
+                (*member_stem).to_string(),
+            );
+            let mut memo =
+                closure_memo().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(hit) = memo.get(&key) {
+                return Ok(hit.clone());
+            }
+            let resolved = resolve_closure_member(root, lock, root_stem, member_stem)?;
+            memo.insert(key, resolved.clone());
+            Ok(resolved)
         }
     }
 }
@@ -252,6 +297,36 @@ mod tests {
             },
         };
         assert!(resolve(&d, &noise).is_err());
+    }
+
+    #[test]
+    fn closure_member_memoizes_ok_but_never_errors() {
+        let d = tmpdir("memo");
+        let store = d.join("store");
+        let app = format!("{H1}-app-1.0");
+        let dep = format!("{H2}-dep-static-2.0");
+        std::fs::create_dir_all(store.join(&app)).unwrap();
+        std::fs::create_dir_all(store.join(&dep)).unwrap();
+        std::fs::write(store.join(&app).join("bin"), format!("run {H2} now")).unwrap();
+        let input = ArtifactInput {
+            name: "dep-static",
+            kind: InputKind::ClosureMember {
+                lock: "m.lock",
+                root_stem: "app",
+                member_stem: "dep-static",
+            },
+        };
+        // An error (missing lock) is NOT memoized: fixing the cause fixes the
+        // next resolution in the same process — a transient pre-build-recipes
+        // failure must never poison a later gate's resolution.
+        assert!(resolve(&d, &input).is_err());
+        std::fs::write(d.join("m.lock"), format!("{app} {}/{app}\n", store.display())).unwrap();
+        let got = resolve(&d, &input).unwrap();
+        assert_eq!(got, format!("{}/{dep}", store.display()));
+        // Ok IS memoized: delete the store; the same triple still resolves —
+        // the second lookup answered from the memo, not a rescan.
+        std::fs::remove_dir_all(&store).unwrap();
+        assert_eq!(resolve(&d, &input).unwrap(), got);
     }
 
     #[test]
