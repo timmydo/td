@@ -213,7 +213,9 @@ pub fn build_layer_tar(root: &Path) -> io::Result<Vec<u8>> {
 /// `gnu/store/`). The split lets td pack a td-BUILT tree whose bytes live in a td-owned
 /// store (the shared daemon cache) at its canonical /gnu/store name next to the guix-seed
 /// deps that really live there — no temp copy, no guix process. MEMBERS is a store
-/// closure (sorted + deduped by canonical here).
+/// closure (sorted + deduped by canonical here; the SAME canonical with two DIFFERENT
+/// on-disk sources is a caller bug and fails loud — silently packing either copy, or
+/// both at one tar path, would corrupt the layer).
 pub fn build_layer_tar_from_closure(
     store_dir: &Path,
     members: &[(String, String)],
@@ -232,6 +234,16 @@ pub fn build_layer_tar_from_closure(
     let mut sorted: Vec<&(String, String)> = members.iter().collect();
     sorted.sort();
     sorted.dedup();
+    for w in sorted.windows(2) {
+        if let [(c1, d1), (c2, d2)] = w {
+            if c1 == c2 && d1 != d2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("closure member {c1} has two on-disk sources: {d1} vs {d2}"),
+                ));
+            }
+        }
+    }
     for (canonical, on_disk) in sorted {
         let base =
             Path::new(canonical).file_name().and_then(|b| b.to_str()).ok_or_else(|| {
@@ -688,6 +700,28 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.contains("daemon-store")),
             "on-disk (daemon cache) path leaked into the layer: {names:?}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn closure_layer_rejects_conflicting_on_disk_sources() {
+        let d = tmpdir("closure-conflict");
+        let store = d.join("gnu/store");
+        fs::create_dir_all(store.join("eee-pkg")).unwrap();
+        fs::write(store.join("eee-pkg/f"), b"a").unwrap();
+        let alt = d.join("other-store");
+        fs::create_dir_all(alt.join("eee-pkg")).unwrap();
+        fs::write(alt.join("eee-pkg/f"), b"b").unwrap();
+        let canonical = store.join("eee-pkg").to_string_lossy().into_owned();
+        let members = vec![
+            (canonical.clone(), canonical.clone()),
+            (canonical, alt.join("eee-pkg").to_string_lossy().into_owned()),
+        ];
+        let err = build_layer_tar_from_closure(&store, &members).unwrap_err();
+        assert!(
+            err.to_string().contains("two on-disk sources"),
+            "expected the conflicting-sources error, got: {err}"
         );
         fs::remove_dir_all(&d).unwrap();
     }

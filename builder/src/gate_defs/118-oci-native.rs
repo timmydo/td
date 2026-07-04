@@ -52,12 +52,12 @@ pub fn gate() -> GateDef {
         script: r##"
 echo ">> oci-native: td-builder builds a working OCI image from the TD-BUILT hello closure (no guix system image, no guix build hello); skopeo loads it, crun runs it, reproducible"
 set -euo pipefail; \
-cu=`grep -- '-coreutils-' "$PWD/tests/hello-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
+CU=`grep -- '-coreutils-' "$PWD/tests/hello-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
+test -n "$CU" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
 . tests/cache-lib.sh; export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; load_stage0; load_recipe_eval; tb="$TB"; \
 case "$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($tb)" >&2; exit 1 ;; esac; \
 test -x "$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
-CU="$cu"; CACHE="$PWD/.td-build-cache/oci-native"; mkdir -p "$CACHE"; \
+CACHE="$PWD/.td-build-cache/oci-native"; mkdir -p "$CACHE"; \
 lock="$PWD/tests/hello-no-guix.lock"; \
 grep ' /gnu/store/' "$lock" | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null \
   || { echo "ERROR: could not realize the toolchain seed for hello (regenerate locks on a channel bump)" >&2; exit 1; }; \

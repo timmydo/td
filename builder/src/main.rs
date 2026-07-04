@@ -3245,7 +3245,9 @@ fn main() -> ExitCode {
         // Compute the store CLOSURE of ROOT… by CONTENT-SCANNING STORE-DIR (no /var/guix/db,
         // no guix process — scanForReferences == `guix gc -R` for an output root, gate 290),
         // lay each member at its STORE-DIR location into a single layer, and pack the
-        // docker-archive. TD_STORE (env; the same name + semantics as `realize`), when set,
+        // docker-archive. TD_STORE (env; the same td-owned-store concept realize_drv threads
+        // as its `td_store` PARAMETER — build-plan passes it programmatically; this subcommand
+        // is the only env reader of the name), when set,
         // names td's OWN store dir holding td-BUILT trees (the shared daemon cache): its
         // entries join the candidate index CANONICALIZED at STORE-DIR, are content-scanned
         // where their bytes lie, and are packed at their canonical names — so a td-built
@@ -3256,11 +3258,10 @@ fn main() -> ExitCode {
             let roots = &args[5..];
             let run = || -> Result<usize, String> {
                 let mut store_dirs = vec![store_dir.clone()];
-                match std::env::var("TD_STORE") {
-                    Ok(ts) if !ts.is_empty() => store_dirs.push(ts),
-                    _ => {}
+                if let Some(ts) = std::env::var("TD_STORE").ok().filter(|s| !s.is_empty()) {
+                    store_dirs.push(ts);
                 }
-                let (candidates, on_disk) = scan_candidate_index(&store_dirs, store_dir)?;
+                let (candidates, mut on_disk) = scan_candidate_index(&store_dirs, store_dir)?;
                 let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
                 let empty = std::collections::HashMap::new();
                 let mut closure_set: std::collections::BTreeSet<String> =
@@ -3278,7 +3279,7 @@ fn main() -> ExitCode {
                 // silently-incomplete closure.
                 let mut members: Vec<(String, String)> = Vec::with_capacity(closure_set.len());
                 for c in closure_set {
-                    let od = on_disk.get(&c).cloned().ok_or_else(|| {
+                    let od = on_disk.remove(&c).ok_or_else(|| {
                         format!(
                             "closure member {c} is on disk in none of the scanned store dir(s) {}",
                             store_dirs.join(", ")
