@@ -9,7 +9,7 @@
 //! libc.so.6 NOR in the built hello), content-addr, behavioral (hello built from source runs → "Hello,
 //! world!"), structural (/td/store is the store, /gnu/store ABSENT). NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,7 +18,17 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the runnable static-bash fixture from the
+        // pinned closure — resolved by the runner; the body's grep +
+        // store-closure-scan hand-wiring is deleted.
+        inputs: &[ArtifactInput {
+            name: "bash-static",
+            kind: InputKind::ClosureMember {
+                lock: "tests/hello-no-guix.lock",
+                root_stem: "bash",
+                member_stem: "bash-static",
+            },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

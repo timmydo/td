@@ -1083,8 +1083,10 @@ if grep -q -a '/gnu/store' "$snwork/w/c.out"; then fail "the C program contains 
 echo "   built C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
 mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
 WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || fail "store-add prog failed"; wprel=${WP#/td/store/}
-bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
+# the static-bash fixture is a DECLARED gate input (#353): the runner resolved it.
+bs=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 /td/store/'"$wprel"'/bin/c; echo "CRC=$?"

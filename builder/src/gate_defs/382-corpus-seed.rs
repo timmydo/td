@@ -8,7 +8,7 @@
 //! scrubbed from the build PATH. Heavy (stage0 + a shared seed + two source builds) →
 //! BUILD_GATES + HEAVY_GATES. Chained corpus (build-plan seed support) is the next step.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,7 +17,18 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): the seed userland pieces from hello's
+        // lock — resolved by the runner; the body's lock-grepping is deleted.
+        inputs: &[
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "coreutils" },
+            },
+            ArtifactInput {
+                name: "bash",
+                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "bash" },
+            },
+        ],
         store: StoreMode::Private, // cold by design (#317 audit): corpus builds from the warmed seed ALONE prove seed sufficiency
         non_blocking: true,
         script: r##"

@@ -9,7 +9,7 @@
 //! are symlinks INTO the store — the union), and a detected name COLLISION. Heavy (stage0 + two
 //! source builds) → BUILD_GATES + HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,7 +18,12 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the hermetic-PATH coreutils from hello's
+        // lock — resolved by the runner; the body's lock-grepping is deleted.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

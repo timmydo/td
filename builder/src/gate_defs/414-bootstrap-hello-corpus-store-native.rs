@@ -13,7 +13,7 @@
 //! (StoreMode::Shared) it reuses the machine-wide, content-keyed, NAR-verified chain bricks instead of rebuilding
 //! from the seed every run (~90min cold → minutes warm), while every corpus assertion still runs. NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -22,7 +22,24 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): the static-bash fixture from hello's pinned
+        // closure + the lock's gcc-toolchain entry (brick8's lock-rewrite base) —
+        // resolved by the runner; the body's grep + store-closure-scan wiring is
+        // deleted.
+        inputs: &[
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/hello-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
+            ArtifactInput {
+                name: "gcc-toolchain",
+                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "gcc-toolchain" },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

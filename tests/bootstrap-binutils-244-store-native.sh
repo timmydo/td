@@ -807,9 +807,10 @@ echo "   [content-addr] interned $BUP244, content-addressed in /td/store"
 # own-root probe: a static bash (from the corpus guix closure, build scaffolding only) reports /gnu/store
 # presence; then the MODERN /td/store as+ld actually run AND link — gcc-mesboot1 driven with -B at the new
 # binutils assembles+links a C program → a dynamic /td/store binary that returns 42.
-bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
-test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash to drive the own-root probe"
+# the static-bash fixture is a DECLARED gate input (#353): the runner resolved it.
+bs=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 mkdir -p "$store/work"; printf 'int main(){return 42;}\n' > "$store/work/t.c"
 snscript='

@@ -28,7 +28,9 @@ echo ">> td-builder under test (stage0, guix-free): $TB"
 work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 mkdir -p "$work/tmp"
-cu=`grep -- '-coreutils-' tests/hello-no-guix.lock | sed 's/^[^ ]* //' | head -1`
+# coreutils is a DECLARED gate input (#353): the runner resolved it.
+cu=${TD_GATE_INPUT_COREUTILS:-}
+test -n "$cu" || fail "TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 
 # Build a leaf recipe with td-builder (no guix process); print its td store output dir.
 build_pkg() {
