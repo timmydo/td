@@ -921,15 +921,23 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         return;
     }
+    // The rung-X3 self-hosting gate's own driver (gcc-rebuilds-gcc, #298): maps only to gate 426.
+    if pattern_matches("tests/bootstrap-x86_64-self-gcc-store-native.sh", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("bootstrap-x86_64-self-gcc-store-native");
+        return;
+    }
     if pattern_matches(
         "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|builder/src/gate_defs/414-bootstrap-x86_64-toolchain-store-native.rs",
         p,
     ) {
         sel.add_preflight("shell-syntax");
         add_chain(sel, 28, 29);
-        // x86_64-cross-fns.sh also defines the rung-X2 native rungs (build_*_x86_64_native), so a change
-        // to it must re-run the native gcc gate too, not only the cross toolchain gate.
+        // x86_64-cross-fns.sh also defines the rung-X2 native rungs (build_*_x86_64_native), the shared
+        // fetch-or-build obtainers, and the rung-X3 self-host fns — so a change to it must re-run the
+        // native gcc gate AND the self-host gate, not only the cross toolchain gate.
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
+        sel.add_target("bootstrap-x86_64-self-gcc-store-native");
         return;
     }
 
@@ -1411,6 +1419,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!(
         "tests/bootstrap-x86_64-native-gcc-store-native.sh",
         "bootstrap-x86_64-native-gcc-store-native"
+    );
+    assert_target!(
+        "tests/bootstrap-x86_64-self-gcc-store-native.sh",
+        "bootstrap-x86_64-self-gcc-store-native"
+    );
+    assert_target!("tests/x86_64-cross-fns.sh", "bootstrap-x86_64-self-gcc-store-native");
+    assert_target!(
+        "builder/src/gate_defs/426-bootstrap-x86_64-self-gcc-store-native.rs",
+        "bootstrap-x86_64-self-gcc-store-native"
     );
     assert_target!(
         "builder/src/gate_defs/422-bootstrap-x86_64-native-gcc-store-native.rs",

@@ -1,24 +1,31 @@
-//! Structured Rust port of the NATIVE x86_64 toolchain build (rung X2) — the
-//! `build_binutils_x86_64_native` + `build_gcc_x86_64_native` drivers that until now
+//! Structured Rust port of the x86_64 toolchain builds — the drivers that until now
 //! lived as imperative shell in `tests/x86_64-cross-fns.sh`. This kills that ad-hoc
 //! build logic: `td-builder toolchain-recipe x86_64-native` builds the NATIVE (ELF
-//! 64-bit, `--host=x86_64`) binutils 2.44 + gcc 14.3.0 from the CROSS toolchain, so
-//! the build is one typed unit the loop (and, later, the substitute publisher) drives
-//! uniformly — the same "port the shell driver → structured recipe" move #229 made for
-//! the seed/mes rungs, extended to the x86_64 track named by this workstream.
+//! 64-bit, `--host=x86_64`) binutils 2.44 + gcc 14.3.0 from the CROSS toolchain (rung
+//! X2), and `td-builder toolchain-recipe x86_64-self` rebuilds the SAME binutils + gcc
+//! with the NATIVE toolchain as the builder (rung X3 — self-hosting, gcc-rebuilds-gcc:
+//! the compiler that compiles the compiler is itself a td-built ELF64 x86_64 binary;
+//! its `[builder-arch]` leg REJECTS an i686 builder, so rung X2's cross gcc cannot
+//! silently stand in). Both are one typed unit the loop (and, later, the substitute
+//! publisher) drives uniformly — the same "port the shell driver → structured recipe"
+//! move #229 made for the seed/mes rungs, extended to the x86_64 track.
 //!
-//! The NATIVE build is NOT byte-reproducible (trust = the input-addressed lock name +
+//! Neither flavor is byte-reproducible (trust = the input-addressed lock name +
 //! the ed25519 substitute signature, see `tests/td-toolchain-x86_64-native.lock`), so
 //! this is deliberately NOT a `bootstrap::Recipe` (whose leg skeleton double-builds and
 //! asserts byte-identity). It is the build half only; the gate keeps interning the
-//! outputs at their lock-keyed paths (`store-add-input-addressed`), running the own-root
+//! outputs (content-addressed, or at their lock-keyed paths), running the own-root
 //! behavioral verify, and `subst-export`ing them — those are generic `td-builder`
-//! subcommands, not ad-hoc build logic.
+//! subcommands, not ad-hoc build logic. (The X3 gate adds a `[codegen]` agreement leg
+//! in shell: the input native gcc and the self-rebuilt gcc must emit byte-identical
+//! `-O2 -S` assembly — the same-flags premise holds because both flavors run THIS
+//! module's one configure line, differing only in the `--prefix` suffix and the
+//! `--with-as`/`--with-ld` paths, which live in the driver, not in cc1's code gen.)
 //!
-//! Inputs (the cross toolchain + pinned sources) are passed by the caller — the gate has
-//! them as shell vars (fetched from the substitute closure or built from seed). The port
-//! mirrors the shell's every configure flag, env var and wrapper; the divergences that
-//! are load-bearing carry the shell's own comments.
+//! Inputs (the builder toolchain + pinned sources) are passed by the caller — the gate
+//! has them as shell vars (fetched from the substitute closure or built from seed). The
+//! port mirrors the shell's every configure flag, env var and wrapper; the divergences
+//! that are load-bearing carry the shell's own comments.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -29,15 +36,46 @@ use std::process::{Command, ExitCode, Stdio};
 
 const XTARGET: &str = "x86_64-pc-linux-gnu";
 
-/// Everything a native rung needs. The gate populates it (from the fetched-or-built
-/// cross closure + the warmed pinned sources) via the CLI spec.
-pub struct NativeInputs {
+/// Which toolchain drives the build, and how the outputs are named:
+/// `Native` (rung X2) is built BY the i686 cross gcc into `…-x86_64-native`;
+/// `SelfHost` (rung X3) is built BY the native gcc itself into `…-x86_64-self`.
+#[derive(Clone, Copy)]
+enum Flavor {
+    Native,
+    SelfHost,
+}
+
+impl Flavor {
+    /// The /td/store name suffix (`binutils-2.44-x86_64-<sfx>`, `gcc-14.3.0-x86_64-<sfx>`).
+    fn suffix(self) -> &'static str {
+        match self {
+            Flavor::Native => "native",
+            Flavor::SelfHost => "self",
+        }
+    }
+    /// The env-var prefix the gate passes inputs under.
+    fn env_prefix(self) -> &'static str {
+        match self {
+            Flavor::Native => "TDXN",
+            Flavor::SelfHost => "TDXS",
+        }
+    }
+}
+
+/// Everything a native/self rung needs. The gate populates it (from the fetched-or-built
+/// builder closure + the warmed pinned sources) via `TDXN_*`/`TDXS_*` env vars.
+pub struct BuildInputs {
     /// Scaffolding PATH tail (coreutils/bash/… — the exposed /gnu/store build tools).
     pub cpath: String,
-    /// The CROSS gcc 14.3.0 stage2 tree (`XGCC2`; an i686 binary emitting x86_64).
-    pub cross_gcc: PathBuf,
-    /// The CROSS binutils 2.44 tree (`XBU`; i686 host `x86_64-pc-linux-gnu-*`).
-    pub cross_binutils: PathBuf,
+    /// The DRIVING C compiler, full path: the cross `x86_64-pc-linux-gnu-gcc` (Native;
+    /// an i686 binary emitting x86_64) or the native plain `gcc` (SelfHost; ELF64).
+    pub builder_cc: PathBuf,
+    /// The driving C++ compiler (`…-g++` / `g++`), same tree as `builder_cc`.
+    pub builder_cxx: PathBuf,
+    /// The driving toolchain's binutils `bin/` dir, prepended to the build PATH — the
+    /// cross target-prefixed `x86_64-pc-linux-gnu-{as,ld}` (Native) or the native
+    /// plain `as`/`ld` (+ `readelf`, which the SelfHost `[builder-arch]` leg uses).
+    pub builder_tools: PathBuf,
     /// The x86_64 glibc 2.41 tree (`XGLIBC`; `libc.so.6` + `ld-linux-x86-64.so.2`).
     pub glibc: PathBuf,
     /// binutils-2.44.tar.xz.
@@ -54,47 +92,68 @@ pub struct NativeInputs {
     pub kernel_headers_tar: PathBuf,
     /// Where to build (the caller's scratch). Outputs land under here.
     pub out: PathBuf,
+    flavor: Flavor,
 }
 
-impl NativeInputs {
-    /// Read the inputs from `TDXN_*` env vars (how the gate passes them).
-    fn from_env() -> Result<NativeInputs, String> {
-        let g = |k: &str| -> Result<String, String> {
-            std::env::var(k).map_err(|_| format!("env {k} unset"))
+impl BuildInputs {
+    /// Read the inputs from the flavor's env vars (how the gate passes them). The
+    /// builder-toolchain keys differ per flavor: `TDXN_CROSS_GCC`/`TDXN_CROSS_BINUTILS`
+    /// name the CROSS trees (target-prefixed drivers); `TDXS_BUILDER_GCC`/
+    /// `TDXS_BUILDER_BINUTILS` name the NATIVE trees (plain-named drivers).
+    fn from_env(flavor: Flavor) -> Result<BuildInputs, String> {
+        let p = flavor.env_prefix();
+        let g = |k: String| -> Result<String, String> {
+            std::env::var(&k).map_err(|_| format!("env {k} unset"))
         };
-        Ok(NativeInputs {
-            cpath: std::env::var("TDXN_CPATH").unwrap_or_default(),
-            cross_gcc: PathBuf::from(g("TDXN_CROSS_GCC")?),
-            cross_binutils: PathBuf::from(g("TDXN_CROSS_BINUTILS")?),
-            glibc: PathBuf::from(g("TDXN_GLIBC")?),
-            binutils_tar: PathBuf::from(g("TDXN_BINUTILS_TAR")?),
-            gcc_tar: PathBuf::from(g("TDXN_GCC_TAR")?),
-            gmp_tar: PathBuf::from(g("TDXN_GMP_TAR")?),
-            mpfr_tar: PathBuf::from(g("TDXN_MPFR_TAR")?),
-            mpc_tar: PathBuf::from(g("TDXN_MPC_TAR")?),
-            kernel_headers_tar: PathBuf::from(g("TDXN_KERNEL_HEADERS_TAR")?),
-            out: PathBuf::from(g("TDXN_OUT")?),
+        let (builder_cc, builder_cxx, builder_tools) = match flavor {
+            Flavor::Native => {
+                let gcc = PathBuf::from(g(format!("{p}_CROSS_GCC"))?);
+                let bu = PathBuf::from(g(format!("{p}_CROSS_BINUTILS"))?);
+                (
+                    gcc.join("bin").join(format!("{XTARGET}-gcc")),
+                    gcc.join("bin").join(format!("{XTARGET}-g++")),
+                    bu.join("bin"),
+                )
+            }
+            Flavor::SelfHost => {
+                let gcc = PathBuf::from(g(format!("{p}_BUILDER_GCC"))?);
+                let bu = PathBuf::from(g(format!("{p}_BUILDER_BINUTILS"))?);
+                (gcc.join("bin/gcc"), gcc.join("bin/g++"), bu.join("bin"))
+            }
+        };
+        Ok(BuildInputs {
+            cpath: std::env::var(format!("{p}_CPATH")).unwrap_or_default(),
+            builder_cc,
+            builder_cxx,
+            builder_tools,
+            glibc: PathBuf::from(g(format!("{p}_GLIBC"))?),
+            binutils_tar: PathBuf::from(g(format!("{p}_BINUTILS_TAR"))?),
+            gcc_tar: PathBuf::from(g(format!("{p}_GCC_TAR"))?),
+            gmp_tar: PathBuf::from(g(format!("{p}_GMP_TAR"))?),
+            mpfr_tar: PathBuf::from(g(format!("{p}_MPFR_TAR"))?),
+            mpc_tar: PathBuf::from(g(format!("{p}_MPC_TAR"))?),
+            kernel_headers_tar: PathBuf::from(g(format!("{p}_KERNEL_HEADERS_TAR"))?),
+            out: PathBuf::from(g(format!("{p}_OUT"))?),
+            flavor,
         })
-    }
-
-    fn xgcc_gcc(&self) -> PathBuf {
-        self.cross_gcc.join("bin").join(format!("{XTARGET}-gcc"))
-    }
-    fn xgcc_gpp(&self) -> PathBuf {
-        self.cross_gcc.join("bin").join(format!("{XTARGET}-g++"))
     }
 }
 
 // --- CLI -------------------------------------------------------------------------
 
-const USAGE: &str = "usage: td-builder toolchain-recipe x86_64-native  (inputs via TDXN_* env)";
+const USAGE: &str =
+    "usage: td-builder toolchain-recipe {x86_64-native|x86_64-self|rust-x86_64}  (inputs via TDXN_*/TDXS_*/TDRX_* env)";
 
 /// `td-builder toolchain-recipe <name>`.
 pub fn cli(args: &[String]) -> ExitCode {
     match args.get(2).map(String::as_str) {
         Some("x86_64-native") => {
-            let result = NativeInputs::from_env().and_then(|inp| run_native(&inp));
+            let result = BuildInputs::from_env(Flavor::Native).and_then(|inp| run_native(&inp));
             finish("x86_64-native", result)
+        }
+        Some("x86_64-self") => {
+            let result = BuildInputs::from_env(Flavor::SelfHost).and_then(|inp| run_self(&inp));
+            finish("x86_64-self", result)
         }
         Some("rust-x86_64") => {
             let result = RustInputs::from_env().and_then(|inp| run_rust(&inp));
@@ -102,6 +161,7 @@ pub fn cli(args: &[String]) -> ExitCode {
         }
         Some("--list") | Some("list") => {
             println!("x86_64-native");
+            println!("x86_64-self");
             println!("rust-x86_64");
             ExitCode::SUCCESS
         }
@@ -129,14 +189,14 @@ fn finish(name: &str, result: Result<String, String>) -> ExitCode {
 /// two output trees are `<out>/binutils/stage-prefix` and `<out>/gcc/stage-prefix`;
 /// their staged store-prefix subdirs are printed as `NATIVE_BINUTILS=`/`NATIVE_GCC=`
 /// lines the gate reads (like `build-recipe`'s `OUT=` line).
-pub fn run_native(inp: &NativeInputs) -> Result<String, String> {
+pub fn run_native(inp: &BuildInputs) -> Result<String, String> {
     let mut report = String::new();
-    let nbu = build_binutils_native(inp)?;
+    let nbu = build_binutils_x86_64(inp)?;
     report.push_str(&format!(
         "   [build] native x86_64 binutils 2.44 built (ELF64) at {}\n",
         nbu.display()
     ));
-    let ngcc = build_gcc_native(inp, &nbu)?;
+    let ngcc = build_gcc_x86_64(inp, &nbu)?;
     report.push_str(&format!(
         "   [build] native x86_64 gcc 14.3.0 (c,c++) built (ELF64 x86-64) at {}\n",
         ngcc.display()
@@ -144,6 +204,42 @@ pub fn run_native(inp: &NativeInputs) -> Result<String, String> {
     // Machine-readable lines for the gate.
     report.push_str(&format!("NATIVE_BINUTILS={}\n", nbu.display()));
     report.push_str(&format!("NATIVE_GCC={}\n", ngcc.display()));
+    Ok(report)
+}
+
+/// Rung X3 (self-hosting, gcc-rebuilds-gcc): the NATIVE /td/store toolchain rebuilds
+/// binutils 2.44 + gcc 14.3.0. Identical build to `run_native` except the DRIVER: the
+/// `[builder-arch]` leg first asserts the gcc doing the building is ITSELF an ELF64
+/// x86_64 binary — the discriminator vs rung X2, whose builder (the cross gcc) is an
+/// i686 ELF32 binary. Pointing the builder at the cross gcc reds here (verified-red).
+/// Prints `SELF_BINUTILS=`/`SELF_GCC=` lines the gate reads.
+pub fn run_self(inp: &BuildInputs) -> Result<String, String> {
+    let mut report = String::new();
+    let readelf = inp.builder_tools.join("readelf");
+    if !readelf_is_elf64(&readelf, &inp.builder_cc)? || !readelf_is_x86_64(&readelf, &inp.builder_cc)? {
+        return Err(format!(
+            "[builder-arch] the builder gcc ({}) is NOT an ELF64 x86_64 binary — rung X3 \
+             requires the NATIVE /td/store gcc as the builder (an i686 cross gcc is rung \
+             X2's builder, not self-hosting)",
+            inp.builder_cc.display()
+        ));
+    }
+    report.push_str(
+        "   [builder-arch] the builder gcc IS an ELF64 x86_64 binary — the compiler compiling the compiler is td's own native /td/store gcc\n",
+    );
+    let sbu = build_binutils_x86_64(inp)?;
+    report.push_str(&format!(
+        "   [build] SELF-HOSTED x86_64 binutils 2.44 built by the native toolchain (ELF64) at {}\n",
+        sbu.display()
+    ));
+    let sgcc = build_gcc_x86_64(inp, &sbu)?;
+    report.push_str(&format!(
+        "   [build] SELF-HOSTED x86_64 gcc 14.3.0 (c,c++) built by the native gcc (ELF64 x86-64) at {}\n",
+        sgcc.display()
+    ));
+    // Machine-readable lines for the gate.
+    report.push_str(&format!("SELF_BINUTILS={}\n", sbu.display()));
+    report.push_str(&format!("SELF_GCC={}\n", sgcc.display()));
     Ok(report)
 }
 
@@ -285,13 +381,14 @@ fn relink_rust_interp(tree: &Path, glibc_interp: &str, report: &mut String) -> R
     Ok(())
 }
 
-// --- native binutils 2.44 --------------------------------------------------------
+// --- x86_64 binutils 2.44 (native + self flavors) ----------------------------------
 
-/// Port of `build_binutils_x86_64_native`. NATIVE GNU Binutils 2.44
-/// (`--build=--host=--target=x86_64-pc-linux-gnu`), built STATIC by the cross gcc
-/// 14.3.0 vs the /td/store x86_64 glibc 2.41 static archives. Returns the install
-/// prefix (`<out>/binutils`) — plain-named ELF64 `as`/`ld`/`ar`/…
-fn build_binutils_native(inp: &NativeInputs) -> Result<PathBuf, String> {
+/// Port of `build_binutils_x86_64_native`. GNU Binutils 2.44
+/// (`--build=--host=--target=x86_64-pc-linux-gnu`), built STATIC by the flavor's
+/// builder gcc (Native: the cross gcc; SelfHost: the native gcc) vs the /td/store
+/// x86_64 glibc 2.41 static archives. Returns the install prefix (`<out>/binutils`)
+/// — plain-named ELF64 `as`/`ld`/`ar`/…
+fn build_binutils_x86_64(inp: &BuildInputs) -> Result<PathBuf, String> {
     let out = inp.out.join("binutils");
     reset_dir(&out)?;
     let xz = store_tool("xz", "xz-").ok_or("no xz")?;
@@ -305,7 +402,7 @@ fn build_binutils_native(inp: &NativeInputs) -> Result<PathBuf, String> {
     // -shared-aware static wrapper (handles binutils' ld libdep.la shared module).
     let wb = mktemp_dir("td-xn-wb")?;
     let cc = wb.join("cc");
-    mk_native_static_wrapper(&inp.xgcc_gcc(), &inp.glibc, &cc, None)?;
+    mk_native_static_wrapper(&inp.builder_cc, &inp.glibc, &cc, None)?;
 
     let tb = mktemp_dir("td-xn-tb")?;
     xbin(&tb)?;
@@ -313,12 +410,7 @@ fn build_binutils_native(inp: &NativeInputs) -> Result<PathBuf, String> {
     let src = mktemp_dir("td-xn-binutils")?;
     untar(&xz, &inp.binutils_tar, &src, 1, TarComp::Xz)?;
 
-    let bp = format!(
-        "{}:{}:{}",
-        inp.cross_binutils.join("bin").display(),
-        tb.display(),
-        inp.cpath
-    );
+    let bp = format!("{}:{}:{}", inp.builder_tools.display(), tb.display(), inp.cpath);
 
     // configure
     let mut cfg = Command::new(&csh);
@@ -326,7 +418,7 @@ fn build_binutils_native(inp: &NativeInputs) -> Result<PathBuf, String> {
         .arg("--build=x86_64-pc-linux-gnu")
         .arg("--host=x86_64-pc-linux-gnu")
         .arg("--target=x86_64-pc-linux-gnu")
-        .arg("--prefix=/td/store/binutils-2.44-x86_64-native")
+        .arg(format!("--prefix=/td/store/binutils-2.44-x86_64-{}", inp.flavor.suffix()))
         .arg("--disable-nls")
         .arg("--disable-gold")
         .arg("--disable-werror")
@@ -379,13 +471,15 @@ fn build_binutils_native(inp: &NativeInputs) -> Result<PathBuf, String> {
     Ok(out)
 }
 
-// --- native gcc 14.3.0 -----------------------------------------------------------
+// --- x86_64 gcc 14.3.0 (native + self flavors) --------------------------------------
 
-/// Port of `build_gcc_x86_64_native`. NATIVE GCC 14.3.0 (c,c++;
-/// `--build=--host=--target=x86_64-pc-linux-gnu`), built STATIC by the cross gcc
-/// 14.3.0 vs the /td/store x86_64 glibc 2.41, gmp/mpfr/mpc in-tree, as/ld = the native
-/// binutils. Returns the staged prefix `<out>/gcc/stage/td/store/gcc-14.3.0-x86_64-native`.
-fn build_gcc_native(inp: &NativeInputs, native_binutils: &Path) -> Result<PathBuf, String> {
+/// Port of `build_gcc_x86_64_native`. GCC 14.3.0 (c,c++;
+/// `--build=--host=--target=x86_64-pc-linux-gnu`), built STATIC by the flavor's builder
+/// gcc (Native: the cross gcc; SelfHost: the native gcc — the gcc-rebuilds-gcc step) vs
+/// the /td/store x86_64 glibc 2.41, gmp/mpfr/mpc in-tree, as/ld = the freshly built
+/// sibling binutils. Returns the staged prefix
+/// `<out>/gcc/stage/td/store/gcc-14.3.0-x86_64-<flavor-suffix>`.
+fn build_gcc_x86_64(inp: &BuildInputs, fresh_binutils: &Path) -> Result<PathBuf, String> {
     let out = inp.out.join("gcc");
     reset_dir(&out)?;
     let xz = store_tool("xz", "xz-").ok_or("no xz")?;
@@ -418,8 +512,8 @@ fn build_gcc_native(inp: &NativeInputs, native_binutils: &Path) -> Result<PathBu
     let wb = out.join("wb");
     fs::create_dir_all(&wb).map_err(ioerr("mkdir wb"))?;
     let inc = sysroot.join("include");
-    mk_native_static_wrapper(&inp.xgcc_gcc(), &sysroot, &wb.join("gcc"), Some(&inc))?;
-    mk_native_static_wrapper(&inp.xgcc_gpp(), &sysroot, &wb.join("g++"), Some(&inc))?;
+    mk_native_static_wrapper(&inp.builder_cc, &sysroot, &wb.join("gcc"), Some(&inc))?;
+    mk_native_static_wrapper(&inp.builder_cxx, &sysroot, &wb.join("g++"), Some(&inc))?;
 
     let tb = mktemp_dir("td-xn-tb")?;
     xbin(&tb)?;
@@ -437,8 +531,8 @@ fn build_gcc_native(inp: &NativeInputs, native_binutils: &Path) -> Result<PathBu
 
     let bp = format!(
         "{}:{}:{}:{}",
-        native_binutils.join("bin").display(),
-        inp.cross_binutils.join("bin").display(),
+        fresh_binutils.join("bin").display(),
+        inp.builder_tools.display(),
         tb.display(),
         inp.cpath
     );
@@ -449,12 +543,12 @@ fn build_gcc_native(inp: &NativeInputs, native_binutils: &Path) -> Result<PathBu
     // configure
     let mut cfg = Command::new(&csh);
     cfg.arg("../configure")
-        .arg("--prefix=/td/store/gcc-14.3.0-x86_64-native")
+        .arg(format!("--prefix=/td/store/gcc-14.3.0-x86_64-{}", inp.flavor.suffix()))
         .arg("--build=x86_64-pc-linux-gnu")
         .arg("--host=x86_64-pc-linux-gnu")
         .arg("--target=x86_64-pc-linux-gnu")
-        .arg(format!("--with-as={}", native_binutils.join("bin/as").display()))
-        .arg(format!("--with-ld={}", native_binutils.join("bin/ld").display()))
+        .arg(format!("--with-as={}", fresh_binutils.join("bin/as").display()))
+        .arg(format!("--with-ld={}", fresh_binutils.join("bin/ld").display()))
         .arg(format!("--with-build-sysroot={}", sysroot.display()))
         .arg("--with-native-system-header-dir=/include")
         .arg("--disable-bootstrap")
@@ -522,14 +616,14 @@ fn build_gcc_native(inp: &NativeInputs, native_binutils: &Path) -> Result<PathBu
     clear_makeflags(&mut inst);
     run(inst, "native x86_64 gcc-14.3.0 install")?;
 
-    let g = out.join("stage/td/store/gcc-14.3.0-x86_64-native");
+    let g = out.join(format!("stage/td/store/gcc-14.3.0-x86_64-{}", inp.flavor.suffix()));
     if !is_exec(&g.join("bin/gcc")) || !is_exec(&g.join("bin/g++")) {
         return Err("no native gcc/g++ produced".into());
     }
     if find_file(&g, "cc1").is_none() {
         return Err("native gcc produced no cc1".into());
     }
-    let readelf = native_binutils.join("bin/readelf");
+    let readelf = fresh_binutils.join("bin/readelf");
     if !readelf_is_elf64(&readelf, &g.join("bin/gcc"))?
         || !readelf_is_x86_64(&readelf, &g.join("bin/gcc"))?
     {
@@ -1079,6 +1173,15 @@ mod tests {
         // non-shebang file untouched.
         assert_eq!(fs::read_to_string(d.join("d.txt")).unwrap(), "not a script /bin/sh inside\n");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn flavor_naming_is_distinct() {
+        // the two flavors must never collide on /td/store names or env namespaces —
+        // a published x86_64-self artifact must not be confusable with the native one.
+        assert_eq!(Flavor::Native.suffix(), "native");
+        assert_eq!(Flavor::SelfHost.suffix(), "self");
+        assert_ne!(Flavor::Native.env_prefix(), Flavor::SelfHost.env_prefix());
     }
 
     #[test]
