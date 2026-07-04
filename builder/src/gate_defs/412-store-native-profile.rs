@@ -10,7 +10,7 @@ use crate::gates::{GateDef, Pool, StoreMode};
 pub fn gate() -> GateDef {
     GateDef {
         name: "store-native-profile",
-        pools: &[Pool::Heavy],
+        pools: &[Pool::Daily],
         needs: &[],
         build_gate: false,
         specs: &[],

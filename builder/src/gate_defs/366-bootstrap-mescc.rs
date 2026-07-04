@@ -12,7 +12,7 @@ use crate::gates::{GateDef, Pool, StoreMode};
 pub fn gate() -> GateDef {
     GateDef {
         name: "bootstrap-mescc",
-        pools: &[Pool::Heavy],
+        pools: &[Pool::Daily],
         needs: &[],
         build_gate: false,
         specs: &[],

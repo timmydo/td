@@ -13,7 +13,7 @@ use crate::gates::{GateDef, Pool, StoreMode};
 pub fn gate() -> GateDef {
     GateDef {
         name: "rust-store-native",
-        pools: &[Pool::Heavy],
+        pools: &[Pool::Daily],
         needs: &[],
         build_gate: false,
         specs: &[],

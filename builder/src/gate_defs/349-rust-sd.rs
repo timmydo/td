@@ -18,7 +18,7 @@ use crate::gates::{GateDef, Pool, StoreMode};
 pub fn gate() -> GateDef {
     GateDef {
         name: "rust-sd",
-        pools: &[Pool::Heavy],
+        pools: &[Pool::Daily],
         needs: &[],
         build_gate: true,
         specs: &[],
