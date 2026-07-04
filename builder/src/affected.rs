@@ -893,13 +893,24 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         add_chain(sel, 27, 28);
         return;
     }
-    // bootstrap-chain.sh is the SHARED from-seed toolchain chain; the sed corpus gate is its
-    // only consumer today (other store-native gates can migrate to it later, each adding
-    // itself here). A change to either re-runs the from-seed sed corpus build. (ported from
-    // PR #203's affected-checks.sh arm during the cutover rebase.)
+    // bootstrap-chain.sh is the SHARED from-seed toolchain chain; its consumers are the sed
+    // corpus gate and store-persist (other store-native gates can migrate to it later, each
+    // adding itself here). Since #317 the chain's bricks persist through the warm chain-brick
+    // cache (tests/chain-cache-lib.sh), so a chain/lib change also re-proves the chain-cache
+    // gate (hit/poison/cold semantics). (chain arm ported from PR #203's affected-checks.sh.)
     if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh|tests/bootstrap-chain.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-sed-corpus-store-native");
+        sel.add_target("store-persist");
+        sel.add_target("chain-cache");
+        return;
+    }
+    // The warm chain-brick cache itself (#317): the chain-cache gate drives the real lib's
+    // hit/build/save/poison/cold paths; the chain consumers exercise the reuse path in anger.
+    if pattern_matches("tests/chain-cache.sh|tests/chain-cache-lib.sh", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("chain-cache");
+        sel.add_target("store-persist");
         return;
     }
     // The rung-X2 native gcc gate's consumer test: a native x86_64 gcc/binutils built on top of the
@@ -1330,6 +1341,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         assert_target!("tests/build-pkg.sh", &bg);
         assert_target!("tests/cache-lib.sh", &bg);
     }
+
+    // The warm chain-brick cache (#317): the lib and its gate map to chain-cache, and
+    // the shared chain re-proves BOTH consumers + the cache gate.
+    assert_target!("tests/chain-cache-lib.sh", "chain-cache");
+    assert_target!("tests/chain-cache.sh", "chain-cache");
+    assert_target!("tests/bootstrap-chain.sh", "store-persist");
+    assert_target!("tests/bootstrap-chain.sh", "chain-cache");
 
     // Spec→gate routing: a recipe/lock for a gate's SPEC selects that gate.
     for f in gate_files(root) {

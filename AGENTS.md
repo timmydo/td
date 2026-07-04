@@ -72,6 +72,18 @@ bootstrap replaces the guix toolchain seed.
 
 5. **Respect the state boundary.** The VM is ephemeral per test (fresh state, wiped on
    reset) — that is *test isolation*, not a ban on persistence *within* a test.
+   **Gate state is SHARED by default (human, 2026-07-03; #317).** Gates read and
+   populate warm, machine-wide, content-keyed builder state (the shared build-daemon
+   store; the chain-brick cache at `~/.td/build-daemon/chain`, NAR-verified on every
+   reuse) across runs, worktrees, and agents. A gate runs cold ONLY by declaring
+   `store: StoreMode::Private` in its `gate_defs` file — reserved for gates whose
+   FEATURE is clean-slate behavior (hermeticity/offline/sandbox probes, GC semantics,
+   seed-alone standup); the audited Private list is pinned by the
+   `store_modes_are_audited` cargo test, so widening or shrinking it is a reviewed
+   act. Sharing skips redundant REBUILDS, never assertions: behavioral and
+   reproducibility legs run every time, a cache entry is re-verified (NAR) on every
+   reuse, and the daily backstop runs force-cold (`TD_CHECK_CHAIN_CACHE=` — set-and-empty)
+   as the authoritative from-seed proof that the whole chain still builds.
   
 6. **No PR adds a guix dependency** — the guix surface only shrinks
    This generalizes beyond the packager axis to *every* form of guix

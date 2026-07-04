@@ -7,7 +7,7 @@
 //! (mes-mescc evaluates Scheme + libc+tcc.a is a real ar archive), repro (byte-identical mes-mescc).
 //! Standalone (~minutes of MesCC) — NOT a BUILD_GATE. Brick 4 links libc+tcc.a to build TinyCC.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -16,6 +16,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-mescc: from the seed, Mes's own MesCC compiler self-hosts mes (mes-mescc) + emits libc+tcc.a, guix-free + reproducible (source-bootstrap brick 3)"
 sh tests/bootstrap-mescc.sh

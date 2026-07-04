@@ -9,7 +9,7 @@
 //! (nptl) program link statically + run → 42), repro (crt byte-identical + the libc's linked output
 //! byte-identical). NOT a BUILD_GATE. gcc-mesboot (GCC 4.9, the final mesboot gcc) is next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-glibc-mesboot: the gcc-mesboot1 toolchain builds GNU libc 2.16.0 with nptl — a modern, threaded C library from the seed, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-glibc-mesboot.sh

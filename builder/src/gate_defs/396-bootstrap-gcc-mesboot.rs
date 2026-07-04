@@ -10,7 +10,7 @@
 //! C++ (libstdc++) program compile+link statically + run → 42), repro (gcc/cpp drivers byte-identical +
 //! `gcc -S` output deterministic). NOT a BUILD_GATE. The Mes full-source bootstrap now reaches a modern GCC.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-gcc-mesboot: the gcc-mesboot1 toolchain builds GCC 4.9.4 against glibc 2.16.0 — the final mesboot gcc, a modern C/C++ compiler from the seed, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-gcc-mesboot.sh

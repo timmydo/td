@@ -18,7 +18,7 @@
 //! Standalone (static seed tools + ~minutes of M2-Planet/M1/hex2) — NOT a BUILD_GATE. Brick 3
 //! bootstraps tinycc from mes; bricks 4-5 reach gcc/glibc at /td/store.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-mes: the structured Rust mes recipe builds GNU Mes (mes-m2) and proves it evaluates Scheme, guix-free + reproducible (source-bootstrap brick 2)"
 set -euo pipefail; \

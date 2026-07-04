@@ -17,7 +17,7 @@
 //! (as the existing store-add/drv-add gates do) purely as the oracle — host infra stays
 //! immutable. Needs td-builder built, so it slots in the heavy pool.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,6 +26,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-add: td PLACES a text path into its OWN store + registers it (pure Rust, no daemon in the write path) — differential vs the daemon's addToStore"
 set -euo pipefail; \

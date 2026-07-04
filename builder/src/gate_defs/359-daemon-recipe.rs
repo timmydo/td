@@ -32,7 +32,7 @@
 //! the output path (latent red hidden while the daily runner was down, #268). The recipe
 //! takes token 3 (the host-side output), like tests/cache-lib.sh and gate 358.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -41,6 +41,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> daemon-recipe: td's persistent build daemon realizes a TD-ASSEMBLED real recipe (hello) into td's OWN store over a Unix socket (no guix-daemon, no guix repl/Guile emitting the drv); the artifact runs; a repeat request is a cache HIT"
 set -euo pipefail; \

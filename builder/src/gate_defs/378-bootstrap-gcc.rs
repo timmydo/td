@@ -8,7 +8,7 @@
 //! 2.95.3 + compiles+links+runs a C program → 42), repro (byte-identical gcc+cc1). NOT a BUILD_GATE.
 //! gcc-mesboot1 (4.6.4) → gcc-mesboot (4.7.4) → glibc build on this.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-gcc: from the seed, the tcc-built make + binutils build GCC 2.95.3 — a real C compiler that compiles+links+runs C, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-gcc.sh

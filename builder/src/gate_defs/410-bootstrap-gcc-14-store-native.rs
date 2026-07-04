@@ -12,7 +12,7 @@
 //! behavioral (plain wrapped gcc/g++ → dynamic C/C++ /td/store → 42), structural (/td/store the store, /gnu/store
 //! ABSENT). A current gcc at /td/store — the toolchain that unblocks retiring the guix seed. NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-gcc-14-store-native: a MODERN GCC 14.3.0 (c,c++) at /td/store — built from the seed via gcc-mesboot 4.9.4; a PLAIN wrapped gcc/g++ builds a DYNAMIC C AND C++ program that runs → 42, /gnu/store ABSENT (source-bootstrap brick 6/7, final-toolchain rung B)"
 sh tests/bootstrap-gcc-14-store-native.sh

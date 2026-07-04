@@ -10,7 +10,7 @@
 //! reds (descendants survive the kill).
 //! Heavy (a td-builder compile + nested-sandbox probes), in the heavy pool.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): the sandbox isolation probe must not see warm state
         script: r##"
 echo ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak) and reaps its inner tree when killed"
 set -euo pipefail; \

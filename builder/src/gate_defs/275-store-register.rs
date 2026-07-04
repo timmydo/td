@@ -22,7 +22,7 @@
 //! store/DB; the host store is untouched. Needs td-builder + the corpus build → heavy pool +
 //! the build-recipes prelude.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -31,6 +31,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-register: td WRITES the store SQLite DB for a TD-BUILT hello's FULL CLOSURE (pure-Rust file format) and READS it back byte-identically to sqlite3 (guix off PATH; no guix build, no guix gc, no /var/guix read)"
 set -euo pipefail; \

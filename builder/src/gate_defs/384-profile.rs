@@ -9,7 +9,7 @@
 //! are symlinks INTO the store — the union), and a detected name COLLISION. Heavy (stage0 + two
 //! source builds) → BUILD_GATES + HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> profile: td-builder profile unions installed packages into a symlink-tree profile; the binaries run through profile/bin (+ a ~/bin symlink) — the user-package-manager profile layer"
 sh tests/profile.sh

@@ -14,7 +14,7 @@
 //! warmed + verified.
 //! Needs the td-built td-feed binary (the td-feed gate builds + caches it from source).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         needs: &["td-feed"],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> feed-shared: a persistent SHARED td-feed daemon serves a warmed artifact to consumers on different worktrees, offline over loopback; reused not restarted; reds on corruption/cold"
 set -euo pipefail; \

@@ -8,7 +8,7 @@
 //! repro (byte-identical tcc). Standalone (~minutes of Mes self-host + tcc) — NOT a BUILD_GATE.
 //! Brick 5 builds gcc with tcc.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-tcc: from the seed, MesCC builds TinyCC (tcc) — the first real C compiler; it compiles+runs a C program returning 42, guix-free + reproducible (source-bootstrap brick 4)"
 sh tests/bootstrap-tcc.sh

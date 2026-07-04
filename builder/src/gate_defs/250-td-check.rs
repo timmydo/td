@@ -30,7 +30,7 @@
 //! BUILD_GATE so the build-recipes prelude warms hello + td-recipe-eval (daemon cache-hit).
 //! Per-gate scratch (.td-check-scratch), removed on green, kept on red for triage.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -39,6 +39,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> td-check: td computes the reproducibility verdict ITSELF — its build daemon realizes the TD-BUILT hello .drv TWICE (independent userns sandboxes), NAR-equal; guix off PATH, no guix build --check"
 set -euo pipefail; \

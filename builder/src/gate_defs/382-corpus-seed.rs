@@ -8,7 +8,7 @@
 //! scrubbed from the build PATH. Heavy (stage0 + a shared seed + two source builds) →
 //! BUILD_GATES + HEAVY_GATES. Chained corpus (build-plan seed support) is the next step.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): corpus builds from the warmed seed ALONE prove seed sufficiency
         script: r##"
 echo ">> corpus-seed: one warmed seed builds two different corpus packages (hello + sed) from source, no guix install (the seed scales to the corpus)"
 sh tests/corpus-seed.sh

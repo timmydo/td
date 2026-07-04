@@ -9,7 +9,7 @@
 //! td-builder is the guix-free stage0; guix is only the capture SOURCE + the removable
 //! closure oracle (no `guix build -e (system M)` packager). Heavy (stage0 + a real tar).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> seed-tarball: capture a toolchain seed closure into a frozen tarball + manifest; the seed is NAR-identical after a tar round-trip (North-Star step 2 PR1)"
 sh tests/seed-tarball.sh

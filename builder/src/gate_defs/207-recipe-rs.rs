@@ -18,7 +18,7 @@
 //! Not FAST_GATES: needs the rust toolchain (absent from the small td-ci-fast image), same
 //! rationale as cargo-test.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent + the census manifest is in sync (rust-recipe-surface)"
 set -euo pipefail; \

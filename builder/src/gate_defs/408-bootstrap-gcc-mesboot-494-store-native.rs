@@ -10,7 +10,7 @@
 //! NOR libc.so.6), content-addr, behavioral (plain wrapped gcc/g++ → dynamic C/C++ /td/store → 42), structural
 //! (/td/store is the store, /gnu/store ABSENT). NOT a BUILD_GATE. (4.9.4's repro is guarded by #185.)
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-gcc-mesboot-494-store-native: GCC 4.9.4 + a C++-capable gcc/g++ wrapper at /td/store — a PLAIN invocation builds a DYNAMIC C AND C++ program that runs → 42, /gnu/store ABSENT (source-bootstrap brick 6/7, final-toolchain rung B0 / the bridge)"
 sh tests/bootstrap-gcc-mesboot-494-store-native.sh

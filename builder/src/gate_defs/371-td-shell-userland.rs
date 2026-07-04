@@ -20,7 +20,7 @@
 //! gcc build); the ripgrep+fd crate closures are warmed by the check.sh prelude (`td-feed warm
 //! crate`, sha256 == the crates.io index cksum). Build gate → BUILD_GATES + HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -29,6 +29,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> td-shell-userland: td shell builds + runs the real Rust userland (ripgrep, fd) with td's OWN NATIVE /td/store toolchain (guix rust/gcc-toolchain retired for td shell), execs a real task (durable behavioral; no guix process, no oracle)"
 sh tests/td-shell-userland.sh

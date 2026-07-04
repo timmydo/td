@@ -10,7 +10,7 @@
 //! and the modules vanish → the eval fails → red (self-discriminating). Heavy (a
 //! td-builder compile + a guix repl eval), in the heavy pool.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> loop-rung: a REAL gate (eval) runs + prints 'eval ok' inside td's full-env sandbox (--expose-cwd) — intrinsic, no guix shell -C oracle"
 set -euo pipefail; \

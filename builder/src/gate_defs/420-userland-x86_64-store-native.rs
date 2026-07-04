@@ -12,7 +12,7 @@
 //! (td-builder, the engine, joins the set via rust-store-native rung 3; this proves the
 //! busybox+make + staged-compiler half.)
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> userland-x86_64-store-native: busybox + GNU make built from upstream source by the /td/store toolchain, dynamic vs /td/store glibc, run in the store-ns own-root — NO /gnu/store, no guix bytes"
 sh tests/userland-x86_64-store-native.sh

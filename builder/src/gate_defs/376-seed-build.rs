@@ -10,7 +10,7 @@
 //! guix/Guile scrubbed from PATH; guix is only the one-time capture source + the oracle. Heavy
 //! (stage0 + ~660M seed tar + a real hello build) → BUILD_GATES + HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): builds hello from the unpacked seed alone (no warm store)
         script: r##"
 echo ">> seed-build: build hello from the unpacked seed tarball (its only store DB) — /var/guix out of the path; td builds with NO guix install (North-Star step 2 PR3)"
 sh tests/seed-build.sh

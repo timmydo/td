@@ -21,7 +21,7 @@
 //! store — S1 realises the stage0 toolchain seed (tests/td-builder-rust.lock) up front
 //! (seed realize, retired last).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -30,6 +30,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> td-builder: reproducible offline self-build (S1 — stage0 double-bootstrap, guix/Guile off PATH)"
 set -euo pipefail; \

@@ -9,7 +9,7 @@
 //! libc.so.6), content-addr (/td/store/<hash>-name), behavioral (dynamic program interp=/td/store, runs → 42),
 //! structural (/td/store is the store, /gnu/store ABSENT). NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-glibc-shared-store-native: the seed toolchain builds a SHARED glibc 2.16.0 and runs a DYNAMIC program from /td/store (interp+RUNPATH = /td/store) → 42, /gnu/store ABSENT — the first dynamic /td/store toolchain (source-bootstrap brick 6)"
 sh tests/bootstrap-glibc-shared-store-native.sh

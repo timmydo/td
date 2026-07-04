@@ -8,7 +8,7 @@
 //! linked against the new glibc runs → 42), repro (byte-identical libc.a). NOT a BUILD_GATE.
 //! gcc-mesboot1 (4.6.4) links against this glibc and is next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-glibc: the seed gcc + binutils build glibc 2.2.5 (guix's glibc-mesboot0) — a real C library a program links against + runs, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-glibc.sh

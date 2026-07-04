@@ -8,7 +8,7 @@
 //! gcc/guile/guix; no /gnu/store in as/ld), behavioral (as/ld report 2.20.1 + assemble+link a running
 //! i386 program → 42), repro (byte-identical). NOT a BUILD_GATE. gcc-core-mesboot0 (2.95.3) is next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-binutils: the tcc-built GNU Make builds GNU Binutils 2.20.1a (as + ld) from the seed — patch-applied, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-binutils.sh

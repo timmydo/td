@@ -55,7 +55,10 @@ echo ">> daily backstop: full td-builder check on origin/main ($main)"
 # toolchain from seed and re-produces the closure export to publish below — otherwise a persistent
 # ~/.td/subst (the very thing the per-PR loop needs) would make the daily FETCH its own prior
 # publish and never rebuild/republish (self-starvation).
-TD_SUBST_FORCE_BUILD=1 TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} "$TDB" check >"$hlog" 2>&1 || heavy_rc=$?
+# TD_CHECK_CHAIN_CACHE= (set-and-empty = force-cold, #317): the per-PR loop reuses the machine-wide
+# warm chain bricks by default; the daily stays the authoritative from-seed proof that the
+# whole bootstrap chain still BUILDS, so it must never consume a warm brick.
+TD_CHECK_CHAIN_CACHE= TD_SUBST_FORCE_BUILD=1 TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} "$TDB" check >"$hlog" 2>&1 || heavy_rc=$?
 heavy_fail=$(grep -E '^FAIL' "$hlog" | head -5 | tr '\n' ';')
 
 # check.sh's own integrity guard (host guix == pinned channels.scm commit) aborts

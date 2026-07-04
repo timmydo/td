@@ -14,7 +14,7 @@
 //! BUILD_GATE so it slots after the parallel build-recipes fan-out (its cargo build would
 //! otherwise contend for cores).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Private, // cold by design (#317 audit): the Rust engine builds from the frozen rust seed alone
         script: r##"
 echo ">> rust-seed: td builds td-builder (its Rust engine) from a FROZEN seed that carries the rust toolchain — /var/guix + live /gnu/store toolchain out of the build path; it runs, agrees with guix's, is reproducible (RUST IN THE SEED, North-Star)"
 sh tests/rust-seed.sh

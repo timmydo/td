@@ -20,7 +20,7 @@
 //! Boundary: td writes only its OWN scratch store/DB; the host store is untouched. Needs
 //! td-builder + the corpus build → heavy pool + the build-recipes prelude.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -29,6 +29,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> store-backend: a td store backend HOLDS + SERVES a TD-BUILT hello output (place + register + query + verify, pure Rust, no daemon; guix off PATH)"
 set -euo pipefail; \

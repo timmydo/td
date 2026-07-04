@@ -23,7 +23,7 @@
 //! is interned at gate time by td's OWN recursive addToStore (tests/intern-src.sh →
 //! store-add-recursive, no `guix repl`; move-off-Guile §5), so the gate is self-contained.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -32,6 +32,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-vendor: td builds td-vendor-demo (depends on itoa + ryu) via build-recipe with VENDORED deps (offline, guix/Guile off PATH); it runs + is reproducible"
 set -euo pipefail; \

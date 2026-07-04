@@ -11,7 +11,7 @@
 //! [DURABLE behavioral] the td-built `eza` lists a directory's entries (and not a missing one).
 //! [DURABLE repro] td-builder check double-build agrees the 233-crate build is reproducible.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-eza: td builds 'eza' (0.21.6, 233 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); eza lists a dir; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

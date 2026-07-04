@@ -25,7 +25,7 @@
 //! needs the whole-toolchain closure fetch + a populated persistent store and is the PR3b follow-up. The subst round-trip lives in tests/x86_64-subst-lib.sh. NOT a BUILD_GATE. The
 //! cross rungs live in tests/x86_64-cross-fns.sh.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -34,6 +34,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-x86_64-toolchain-store-native: cross the i686 bootstrap up to a native x86_64 toolchain at /td/store — cross binutils 2.44 + cross gcc 14.3.0 + MODERN x86_64 glibc 2.41 (libgcc_s.so.1); a DYNAMIC x86_64 C AND C++ program runs in the own-root → 42, /gnu/store ABSENT (unblocks the x86_64 Rust runtime leg)"
 sh tests/bootstrap-x86_64-toolchain-store-native.sh

@@ -11,7 +11,7 @@
 //! computes the lock stays Guile, retired package-by-package later (§5). Heavy only
 //! for the warm td-builder compile (no VM); a perturbed lock diverges (verified-red).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> resolve: td-builder resolves recipe inputs from a pinned lock, store-path-equal to Guile's live specification->package resolution (input-resolution; additive, build unchanged)"
 set -euo pipefail; \

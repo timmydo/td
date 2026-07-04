@@ -12,7 +12,7 @@
 //! [DURABLE behavioral] the td-built `bat` prints a file's contents (plain style).
 //! [DURABLE repro] td-builder check double-build agrees the 207-crate build is reproducible.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-bat: td builds 'bat' (0.25.0, 207 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); bat prints a file; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

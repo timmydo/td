@@ -11,7 +11,7 @@
 //! `guix build <store-path>` (as gate 170 does — realizing a pinned path, NOT a
 //! `-e '(@ (system M) PKG)'` packager site, so the guix-surface ratchet is unaffected).
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> provision-rust: the td-builder seed Rust toolchain is provided-or-rustup (guix-free), resolved in order and used to build a working td-builder; the pinned guix lock is the fallback (dev loop unchanged)"
 set -eu; \

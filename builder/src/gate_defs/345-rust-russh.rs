@@ -25,7 +25,7 @@
 //! crypto, would otherwise oversubscribe cores against build-recipes' fan-out). Not in BUILD_SPECS —
 //! the source is interned at gate time.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -34,6 +34,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> rust-russh: td builds a russh client<->server SSH round-trip (188 deps incl. aws-lc crypto) from source via build-recipe with crates provisioned GUIX-FREE (cargo-proxy from the in-tree Cargo.lock, interned vendor tree, TD_VENDOR_DIR); the SSH session works + is reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

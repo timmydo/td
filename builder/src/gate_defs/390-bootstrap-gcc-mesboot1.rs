@@ -8,7 +8,7 @@
 //! (gcc+g++ drivers byte-identical + both emit identical assembly). NOT a BUILD_GATE. gcc-mesboot (4.7.4)
 //! then the final toolchain are next.
 
-use crate::gates::{GateDef, Pool};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        store: StoreMode::Shared,
         script: r##"
 echo ">> bootstrap-gcc-mesboot1: the toolchain builds GCC 4.6.4 with C AND C++ (cc1plus + static libstdc++) — a modern gcc+g++ from the seed, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-gcc-mesboot1.sh
