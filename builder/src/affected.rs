@@ -493,6 +493,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // The guix-less-runner harness shipping mechanism (#314): the consumer resolver, the daily's
+    // producer, and the gate that drives them. run_check_harness (check_loop.rs, the spine) also
+    // calls resolve-harness.sh, but a spine touch already escalates to the full check.
+    if pattern_matches(
+        "tests/harness-subst.sh|tools/resolve-harness.sh|tools/publish-harness-subst.sh",
+        p,
+    ) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("harness-subst");
+        return;
+    }
+
 
     if glob_match("tests/*-no-guix.lock", p) {
         let spec = p.strip_prefix("tests/").unwrap_or(p);

@@ -204,6 +204,24 @@ if [ $rc -eq 0 ]; then
   else
     echo ">> publish-seed-subst: WARN — seed publish failed; not published"
   fi
+  # harness-subst (#314): the heavy suite ran gate 420, which persisted .td-build-cache/harness
+  # (the from-source, guix-byte-free /td/store busybox+make + staged C toolchain + the rel/toolchain
+  # metadata). Sign + publish it as ONE whole-tree substitute (fixed name `td-harness`) so a
+  # GUIX-LESS runner with an empty .td-build-cache/harness FETCHES it (tools/resolve-harness.sh, from
+  # run_check_harness) instead of needing a local guix-hosted heavy build to have produced it — the
+  # circularity that kept the cloud daily runner guix-dependent (#294). Same signing key + trust
+  # anchor (tests/td-subst.pub) as the toolchain closures. This runner consumes its harness LOCALLY
+  # (gate 420 built it); the fetch path is for the separate guix-less runner.
+  if [ ! -d .td-build-cache/harness/store ] || [ ! -s .td-build-cache/harness/rel ]; then
+    echo ">> publish-harness-subst: SKIP — no persisted .td-build-cache/harness (gate 420 did not complete this run)"
+  elif [ -z "${TD_SUBST_PRIVKEY:-}" ] || [ -z "$_sb" ] || [ ! -x "$_sb" ]; then
+    echo ">> publish-harness-subst: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set"
+  elif TD_BUILDER="$TDB" TD_SUBST_BIN="$_sb" TD_SUBST_PRIVKEY="$TD_SUBST_PRIVKEY" \
+       sh tools/publish-harness-subst.sh .td-build-cache/harness "$_store" >/dev/null 2>&1; then
+    echo ">> publish-harness-subst: signed + published the /td/store harness to $_store (a guix-less runner FETCHES it for check-harness — no local guix build needed)"
+  else
+    echo ">> publish-harness-subst: WARN — harness publish failed; not published"
+  fi
 else
   echo ">> daily backstop: RED (heavy_rc=$heavy_rc system_rc=$system_rc harness_rc=$harness_rc) — agent: triage \`git log <last-green>..$main\`, reproduce the failing gate, open a FIX-OR-REVERT PR (no auto-merge). Suspect-revert helper: ci/revert-suspect.sh --ref <sha> --open-pr"
 fi

@@ -208,6 +208,38 @@ fn subst_export_members(
         .collect())
 }
 
+/// The fixed logical store path under which the guix-less-runner harness ships as a single
+/// whole-tree substitute (issue #314). Unlike the lock-keyed toolchain CLOSURES (whose name a
+/// consumer recomputes from the lock), the /td/store harness — the busybox+make set, the staged
+/// C toolchain, the /td/store/ld loader, and the `rel`/`toolchain` metadata — is a
+/// content-addressed BUILD OUTPUT with no derivable lock name, so it ships as ONE nar of the
+/// whole `.td-build-cache/harness` tree under this fixed name. Integrity is the signed NarHash;
+/// trust is the pinned ed25519 key (tests/td-subst.pub). A forger without the private key cannot
+/// mint a valid `td-harness.narinfo`, so the worst a store-writer can do is a signed DOWNGRADE
+/// to an older td-published harness — acceptable for an optimization the consumer fails CLOSED on.
+const HARNESS_SUBST_STORE_PATH: &str = "/td/store/td-harness";
+
+/// Export the harness tree at `harness_dir` (the `.td-build-cache/harness` layout: `store/` +
+/// `rel` + `toolchain`) as a single substitute: one nar of the WHOLE tree + a `td-harness.narinfo`
+/// (StorePath == `HARNESS_SUBST_STORE_PATH`, no References), written under `outdir`. No store DB is
+/// needed — the harness is content-addressed by its NarHash, not by a lock. The daily signs the
+/// narinfo (tools/publish-harness-subst.sh) and the guix-less runner fetches+verifies+restores it
+/// (tools/resolve-harness.sh). Returns the written basenames (exactly one: `td-harness`).
+fn harness_subst_export(outdir: &Path, harness_dir: &Path) -> Result<Vec<String>, String> {
+    if !harness_dir.join("store").is_dir() || !harness_dir.join("rel").is_file() {
+        return Err(format!(
+            "{} is not a harness tree (expected store/ + rel)",
+            harness_dir.display()
+        ));
+    }
+    let member = SubstMember {
+        store_path: HARNESS_SUBST_STORE_PATH.to_string(),
+        physical: harness_dir.to_path_buf(),
+        refs: Vec::new(),
+    };
+    subst_export(outdir, std::slice::from_ref(&member)).map_err(|e| e.to_string())
+}
+
 /// The `path` column (index 1) of a read `ValidPaths` row, or "" if absent.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn path_at(cols: &[store_db_read::Value]) -> &str {
@@ -3340,6 +3372,27 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: subst-export: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // harness-subst-export OUTDIR HARNESS-DIR — ship the whole /td/store harness tree
+        // (.td-build-cache/harness: store/ + rel + toolchain) to a guix-less runner as ONE nar +
+        // a fixed-name `td-harness.narinfo` (issue #314). The daily signs it
+        // (tools/publish-harness-subst.sh); a runner with an empty `.td-build-cache/harness`
+        // fetches+verifies+restores it (tools/resolve-harness.sh) and runs check-harness.
+        Some("harness-subst-export") if args.len() == 4 => {
+            let (outdir, harness_dir) = (&args[2], &args[3]);
+            match harness_subst_export(Path::new(outdir), Path::new(harness_dir)) {
+                Ok(written) => {
+                    println!(
+                        "td-builder: harness-subst-export wrote {} narinfo(s) + nar -> {outdir}",
+                        written.len()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: harness-subst-export: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -6700,6 +6753,61 @@ glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
         let mut r = std::io::BufReader::new(std::fs::File::open(outdir.join(narfile)).unwrap());
         nar::read_nar(&mut r, &restored).unwrap();
         assert_eq!(std::fs::read(restored.join("run")).unwrap(), b"app\n");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    // harness_subst_export (#314): the WHOLE harness tree — a store/ with multiple entries
+    // AND loose files (the /td/store/ld loader), plus the rel + toolchain metadata — ships as
+    // ONE fixed-name nar and restores byte-for-byte. This is the tree-set variant the toolchain
+    // per-path export can't express (ld is not a `<hash>-name` store path).
+    #[test]
+    fn harness_subst_export_ships_the_whole_tree_under_a_fixed_name() {
+        let base = std::env::temp_dir().join(format!("td-harness-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let hdir = base.join("harness");
+        // A harness-shaped fixture: store/<rel>/bin/busybox (exec), a loose store/ld loader,
+        // plus the rel + toolchain manifest the check-harness loop reads.
+        let rel = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-userland-x86_64-store-native";
+        let bind = hdir.join("store").join(rel).join("bin");
+        std::fs::create_dir_all(&bind).unwrap();
+        std::fs::write(bind.join("busybox"), b"#!/bin/sh\necho hi\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bind.join("busybox"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::write(hdir.join("store").join("ld"), b"loader bytes\n").unwrap();
+        std::fs::write(hdir.join("rel"), format!("{rel}\n")).unwrap();
+        std::fs::write(hdir.join("toolchain"), b"HT_TARGET=x86_64-pc-linux-gnu\nHT_GCC=g\n").unwrap();
+
+        let outdir = base.join("out");
+        let written = harness_subst_export(&outdir, &hdir).unwrap();
+        assert_eq!(written, vec!["td-harness".to_string()]);
+        let ni = std::fs::read_to_string(outdir.join("td-harness.narinfo")).unwrap();
+        assert!(ni.contains("StorePath: /td/store/td-harness\n"), "narinfo: {ni}");
+        assert!(ni.contains("References: \n"), "harness has no refs: {ni}");
+        let narfile = ni.lines().find_map(|l| l.strip_prefix("NarFile: ")).unwrap();
+
+        // The served nar RESTORES the WHOLE tree — the store subdir (its entry + the loose ld)
+        // and both metadata files — byte-for-byte, exec bit preserved on the binary.
+        let restored = base.join("restored");
+        let mut r = std::io::BufReader::new(std::fs::File::open(outdir.join(narfile)).unwrap());
+        nar::read_nar(&mut r, &restored).unwrap();
+        assert_eq!(std::fs::read(restored.join("store").join(rel).join("bin/busybox")).unwrap(),
+                   b"#!/bin/sh\necho hi\n");
+        assert_eq!(std::fs::read(restored.join("store").join("ld")).unwrap(), b"loader bytes\n");
+        assert_eq!(std::fs::read_to_string(restored.join("rel")).unwrap(), format!("{rel}\n"));
+        assert!(std::fs::read_to_string(restored.join("toolchain")).unwrap().contains("HT_GCC=g"));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(restored.join("store").join(rel).join("bin/busybox"))
+                .unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "exec bit not preserved through the harness nar");
+        }
+
+        // A non-harness dir (no store/ or rel) is rejected — the producer never ships junk.
+        assert!(harness_subst_export(&outdir, &base).is_err());
 
         std::fs::remove_dir_all(&base).unwrap();
     }
