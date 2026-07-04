@@ -22,7 +22,7 @@ use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 pub fn gate() -> GateDef {
     GateDef {
         name: "bootstrap-x86_64-self-gcc-store-native",
-        pools: &[Pool::Heavy],
+        pools: &[Pool::Daily],
         needs: &[],
         build_gate: false,
         specs: &[],

@@ -16,7 +16,7 @@ use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 pub fn gate() -> GateDef {
     GateDef {
         name: "rust-eza",
-        pools: &[Pool::Heavy],
+        pools: &[Pool::Daily],
         needs: &[],
         build_gate: true,
         specs: &[],

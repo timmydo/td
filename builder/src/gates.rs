@@ -56,11 +56,32 @@ const BUILD_RECIPES: &str = "build-recipes";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pool {
     Cheap,
+    /// PR-sized behavioral gates: part of the full `check` AND of the bounded
+    /// `check-pr` tier (the ~10-minute per-PR budget, human 2026-07-04).
     Heavy,
+    /// Daily-only gates (the deep from-seed bootstrap rungs, the from-source
+    /// package corpus, the seed-capture family): part of the full `check` the
+    /// daily backstop runs (ci/daily-full-suite.sh, fix-or-revert healing),
+    /// NOT of `check-pr`. Still runnable by name (`td-builder check <gate>`).
+    Daily,
     Fast,
     System,
     Engine,
     Parked,
+}
+
+/// Does this pool run somewhere in the per-PR tiers (check-pr / check-fast /
+/// check-engine)? THE single source the affected-checks partition derives
+/// "deferred to the daily backstop" from — extend HERE when adding a pool,
+/// never in a per-site match list (a missed site silently mis-partitions).
+pub(crate) fn pool_runs_per_pr(p: Pool) -> bool {
+    matches!(p, Pool::Cheap | Pool::Heavy | Pool::Fast | Pool::Engine)
+}
+
+/// Does this pool run in the plain full `check`? (The coverage question
+/// affected-checks' default_check_covers_target asks.)
+pub(crate) fn pool_in_full_check(p: Pool) -> bool {
+    matches!(p, Pool::Cheap | Pool::Heavy | Pool::Daily)
 }
 
 /// The gate-state default, FLIPPED per the human direction of 2026-07-03 (#317):
@@ -355,7 +376,7 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
     set.gates.push(br);
 
     if let Some(lc) = &last_cheap {
-        for p in [Pool::Heavy, Pool::System, Pool::Engine] {
+        for p in [Pool::Heavy, Pool::Daily, Pool::System, Pool::Engine] {
             for gi in set.members(p) {
                 if let Some(g) = set.gates.get_mut(gi) {
                     if g.name != *lc && !g.deps.contains(lc) {
@@ -393,12 +414,20 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
     let add_pool = |sel: &mut HashSet<usize>, p: Pool| sel.extend(set.members(p));
     for goal in goals {
         match goal.as_str() {
-            "check" => {
+            // check-pr is the bounded per-PR tier (~10 min, human 2026-07-04):
+            // the full check MINUS the daily-only pool — one arm so the subset
+            // relation holds by construction. The daily backstop
+            // (ci/daily-full-suite.sh) runs the full `check`, so the daily pool
+            // keeps its coverage nightly.
+            "check" | "check-pr" => {
                 add_pool(&mut sel, Pool::Cheap);
                 if let Some(i) = set.index.get(BUILD_RECIPES) {
                     sel.insert(*i);
                 }
                 add_pool(&mut sel, Pool::Heavy);
+                if goal == "check" {
+                    add_pool(&mut sel, Pool::Daily);
+                }
             }
             "check-fast" => {
                 add_pool(&mut sel, Pool::Cheap);
@@ -419,7 +448,7 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
                 None => {
                     return Err(format!(
                         "gate-run: unknown goal `{name}` — a tier \
-                         (check/check-fast/check-system/check-engine), a gate name \
+                         (check/check-pr/check-fast/check-system/check-engine), a gate name \
                          (`td-builder gate-run list-gates`), or build-recipes"
                     ))
                 }
@@ -442,6 +471,47 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
         }
         if !grew {
             return Ok(sel);
+        }
+    }
+}
+
+/// Scope the synthetic build-recipes node's TD_BUILD_SPECS to the specs the
+/// SELECTED gates declare, by FILTERING the static `build_specs` accumulation —
+/// order, duplicates, everything about the surviving entries is identical to
+/// the full list by construction (selecting every spec-carrying gate
+/// reproduces it exactly). The full `check` goal and an explicit
+/// `build-recipes` goal keep the whole pool. The body always runs even with
+/// ZERO scoped specs: build-recipes is also the build-gate PRELUDE (the
+/// stage0-seed realize + the td-recipe-eval build that `load_recipe_eval`
+/// fails-fast without) — only the per-spec pre-build scopes down
+/// (tests/build-recipes.sh tolerates an empty list).
+fn scope_build_recipes(set: &mut GateSet, selected: &HashSet<usize>, goals: &[String]) {
+    if goals.iter().any(|g| g == "check" || g == BUILD_RECIPES) {
+        return;
+    }
+    let Some(bi) = set.index.get(BUILD_RECIPES).copied() else { return };
+    if !selected.contains(&bi) {
+        return;
+    }
+    let specs: String = {
+        let mut wanted: HashSet<&str> = HashSet::new();
+        for (i, g) in set.gates.iter().enumerate() {
+            if selected.contains(&i) {
+                wanted.extend(g.specs.iter().map(String::as_str));
+            }
+        }
+        let kept: Vec<&str> = set
+            .build_specs
+            .iter()
+            .map(String::as_str)
+            .filter(|s| wanted.contains(s))
+            .collect();
+        kept.join(" ")
+    };
+    let Some(br) = set.gates.get_mut(bi) else { return };
+    for (k, v) in br.extra_env.iter_mut() {
+        if k == "TD_BUILD_SPECS" {
+            *v = specs.clone();
         }
     }
 }
@@ -481,6 +551,7 @@ fn parse_pool(name: &str) -> Option<Pool> {
     match name {
         "cheap" => Some(Pool::Cheap),
         "heavy" => Some(Pool::Heavy),
+        "daily" => Some(Pool::Daily),
         "fast" => Some(Pool::Fast),
         "system" => Some(Pool::System),
         "engine" => Some(Pool::Engine),
@@ -1390,6 +1461,7 @@ fn print_pools(set: &GateSet) {
     };
     line("cheap ", Pool::Cheap);
     line("heavy ", Pool::Heavy);
+    line("daily ", Pool::Daily);
     line("fast  ", Pool::Fast);
     line("system", Pool::System);
     line("engine", Pool::Engine);
@@ -1421,6 +1493,14 @@ fn print_pools(set: &GateSet) {
 /// gate-timing-report target, native since #318 axis 2). Best-effort.
 fn run_timing_report(root: &Path, heavy_gates: &[String]) {
     crate::gate_timing::report(root, heavy_gates);
+}
+
+/// The long-running gates the timing table classifies as heavy (heavy + daily)
+/// — ONE list so the report goal and the green-run epilogue cannot drift.
+fn long_gate_names(set: &GateSet) -> Vec<String> {
+    let mut v = set.names(Pool::Heavy);
+    v.extend(set.names(Pool::Daily));
+    v
 }
 
 pub fn cli(args: &[String]) -> ExitCode {
@@ -1471,7 +1551,7 @@ pub fn cli(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let set = match load() {
+    let mut set = match load() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
@@ -1494,7 +1574,7 @@ pub fn cli(args: &[String]) -> ExitCode {
             eprintln!("gate-run: gate-timing-report does not combine with other goals");
             return ExitCode::from(2);
         }
-        run_timing_report(&root, &set.names(Pool::Heavy));
+        run_timing_report(&root, &long_gate_names(&set));
         return ExitCode::SUCCESS;
     }
 
@@ -1507,8 +1587,8 @@ pub fn cli(args: &[String]) -> ExitCode {
     };
 
     // A way to disable gates WITHOUT editing gate definitions: TD_CHECK_DISABLE
-    // lists what to skip — bare gate NAMES and/or `pool:<cheap|heavy|fast|system|
-    // engine|parked>` tokens (comma/space separated). gate-run drops the named
+    // lists what to skip — bare gate NAMES and/or `pool:<cheap|heavy|daily|fast|
+    // system|engine|parked>` tokens (comma/space separated). gate-run drops the named
     // gates AND anything that transitively depends on them (dep-closure prune), so
     // the scheduler never blocks on a prerequisite that won't run. Unknown tokens
     // are reported, not silently ignored. (Used e.g. to turn off the guix-dependent
@@ -1535,6 +1615,14 @@ pub fn cli(args: &[String]) -> ExitCode {
         }
         _ => selected,
     };
+
+    // Scope the synthetic build-recipes phase to the SELECTED gates' specs (the
+    // per-PR budget, human 2026-07-04): pre-building the whole 18-package corpus
+    // to run one gate was the old behavior; the phase now builds exactly the
+    // specs the selected gates declare. The full `check` (and an explicit
+    // `build-recipes` goal) keeps the whole pool — the daily backstop is
+    // byte-identical to before.
+    scope_build_recipes(&mut set, &selected, &goals);
 
     let timing_log = if std::env::var("TD_GATE_TIMING").ok().as_deref() == Some("0") {
         None
@@ -1595,6 +1683,8 @@ pub fn cli(args: &[String]) -> ExitCode {
             // Parity with the old check/check-system targets: print the per-gate
             // timing table on a green full run (best-effort).
             if goals.iter().any(|g| g == "check") {
+                run_timing_report(&root, &long_gate_names(&set));
+            } else if goals.iter().any(|g| g == "check-pr") {
                 run_timing_report(&root, &set.names(Pool::Heavy));
             } else if goals.iter().any(|g| g == "check-system") {
                 run_timing_report(&root, &set.names(Pool::System));
@@ -1630,10 +1720,20 @@ mod tests {
         let (e, gd, gs) = (pos("eval"), pos("guix-dependence"), pos("guix-surface"));
         assert!(e.is_some() && gd.is_some() && gs.is_some(), "cheap chain lost a member");
         assert!(e < gd && gd < gs, "cheap chain order changed");
+        // The heavy/daily split (the ~10-min per-PR budget, human 2026-07-04):
+        // heavy = PR-sized behavioral gates, daily = the slow from-seed rungs +
+        // from-source corpus the daily backstop covers. Together they are the
+        // full check — the split may move members but never lose one.
         let heavy = set.names(Pool::Heavy);
-        assert!(heavy.len() >= 99, "heavy pool shrank: {}", heavy.len());
-        for g in ["bootstrap", "td-subst", "cargo-test", "rust-userland-x86_64-store-native"] {
+        let daily = set.names(Pool::Daily);
+        assert!(heavy.len() >= 45, "heavy (PR) pool shrank: {}", heavy.len());
+        assert!(daily.len() >= 50, "daily pool shrank: {}", daily.len());
+        assert!(heavy.len() + daily.len() >= 105, "the full check lost gates");
+        for g in ["bootstrap", "td-subst", "cargo-test", "corpus-no-guix", "td-shell"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
+        }
+        for g in ["bootstrap-gcc-mesboot", "rust-ripgrep", "rust-userland-x86_64-store-native"] {
+            assert!(daily.iter().any(|n| n == g), "missing daily gate {g}");
         }
         assert!(set.names(Pool::Engine).iter().any(|n| n == "cargo-test"));
         let system = set.names(Pool::System);
@@ -1674,6 +1774,59 @@ mod tests {
             assert!(!g.body.contains("$(CURDIR)"), "{} kept a make var", g.name);
             assert!(!g.body.contains("$$"), "{} kept make $$ escaping", g.name);
         }
+    }
+
+    #[test]
+    fn check_pr_is_the_full_check_minus_the_daily_pool() {
+        let set = load().unwrap();
+        let pr = expand_goals(&set, &["check-pr".to_string()]).unwrap();
+        let full = expand_goals(&set, &["check".to_string()]).unwrap();
+        assert!(pr.is_subset(&full), "check-pr selected a gate the full check does not");
+        for i in set.members(Pool::Daily) {
+            assert!(!pr.contains(&i), "a daily-only gate leaked into check-pr");
+            assert!(full.contains(&i), "the full check lost a daily gate");
+        }
+        for i in set.members(Pool::Cheap).into_iter().chain(set.members(Pool::Heavy)) {
+            assert!(pr.contains(&i), "check-pr lost a cheap/heavy gate");
+        }
+        let bi = *set.index.get(BUILD_RECIPES).unwrap();
+        assert!(pr.contains(&bi) && full.contains(&bi), "build-recipes left a tier");
+    }
+
+    #[test]
+    fn build_recipes_specs_scope_to_the_selection() {
+        let br_specs = |set: &GateSet| {
+            set.gates
+                .iter()
+                .find(|g| g.name == BUILD_RECIPES)
+                .and_then(|g| g.extra_env.iter().find(|(k, _)| k == "TD_BUILD_SPECS"))
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        // A single spec-carrying gate scopes the phase to its own spec.
+        let mut set = load().unwrap();
+        let goals = vec!["corpus-no-guix".to_string()];
+        let sel = expand_goals(&set, &goals).unwrap();
+        scope_build_recipes(&mut set, &sel, &goals);
+        assert_eq!(br_specs(&set), "hello");
+        // The full check keeps the whole pool, byte-identical to the static env.
+        let mut set = load().unwrap();
+        let all = set.build_specs.join(" ");
+        let goals = vec!["check".to_string()];
+        let sel = expand_goals(&set, &goals).unwrap();
+        scope_build_recipes(&mut set, &sel, &goals);
+        assert_eq!(br_specs(&set), all);
+        // A spec-less selection (a store-DB gate builds its subject in-gate)
+        // scopes the pre-build to nothing, but the BODY still runs — it is the
+        // build-gate prelude (stage0 seed + td-recipe-eval; load_recipe_eval
+        // fails-fast without its sentinel), so it must never be no-op'd.
+        let mut set = load().unwrap();
+        let goals = vec!["store-verify".to_string()];
+        let sel = expand_goals(&set, &goals).unwrap();
+        scope_build_recipes(&mut set, &sel, &goals);
+        assert_eq!(br_specs(&set), "");
+        let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
+        assert!(br.body.contains("build-recipes.sh"), "the prelude body must survive scoping");
     }
 
     /// A tiny synthetic gate set exercising the REAL scheduler + bash execution

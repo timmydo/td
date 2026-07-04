@@ -18,7 +18,7 @@ use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 pub fn gate() -> GateDef {
     GateDef {
         name: "bootstrap-hello-corpus-store-native",
-        pools: &[Pool::Heavy],
+        pools: &[Pool::Daily],
         needs: &[],
         build_gate: false,
         specs: &[],

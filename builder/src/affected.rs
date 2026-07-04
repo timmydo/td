@@ -26,6 +26,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -135,6 +136,10 @@ struct Selection {
     targets: Vec<String>,
     notes: Vec<String>,
     full_required: Vec<String>,
+    /// Affected gates that are DAILY/SYSTEM-tier: named for the record but not
+    /// run per-PR — ci/daily-full-suite.sh covers them nightly with
+    /// fix-or-revert healing (the ~10-min per-PR budget, human 2026-07-04).
+    deferred: Vec<String>,
 }
 
 fn push_unique(v: &mut Vec<String>, x: &str) {
@@ -228,16 +233,15 @@ fn target_for_build_spec(_root: &Path, spec: &str) -> Option<String> {
         .map(|(_, d)| d.name.to_string())
 }
 
-/// Would a plain `./check.sh` (cheap+heavy gates + build-recipes) cover `target`?
+/// Would a plain `td-builder check` (cheap+heavy+daily gates + build-recipes)
+/// cover `target`? (`check-pr` is a subset of the plain check by construction.)
+/// The pool question is gates.rs's (`pool_in_full_check`), not a local list.
 fn default_check_covers_target(_root: &Path, target: &str) -> bool {
-    if target == "check-fast" || target == "build-recipes" {
+    if target == "check-fast" || target == "check-pr" || target == "build-recipes" {
         return true;
     }
     crate::gates::defs().into_iter().any(|(_, d)| {
-        d.name == target
-            && d.pools
-                .iter()
-                .any(|p| matches!(p, crate::gates::Pool::Cheap | crate::gates::Pool::Heavy))
+        d.name == target && d.pools.iter().any(|p| crate::gates::pool_in_full_check(*p))
     })
 }
 
@@ -288,9 +292,11 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
             sel.add_note("pkg-config is authored but excluded from td-built census until it has an own-builder gate.");
         }
         _ => {
-            sel.add_target("check-fast");
-            sel.require_full(&format!(
-                "No recipe-specific mapping for '{spec}'; update builder/src/affected.rs or run the full check."
+            sel.add_target("check-pr");
+            sel.add_note(&format!(
+                "No recipe-specific mapping for '{spec}' — running the bounded check-pr tier; \
+                 the daily backstop covers the daily-tier gates. Update builder/src/affected.rs \
+                 with a mapping for it."
             ));
         }
     }
@@ -348,11 +354,19 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches("check.sh|builder/build.rs|builder/src/gates.rs|builder/src/check_loop.rs", p) {
+        // The loop spine used to escalate to the FULL loop; it now validates on
+        // the bounded check-pr tier (which exercises the runner/prelude end to
+        // end over the whole PR pool) + the engine unit tests — the daily-tier
+        // gates are the daily backstop's job (the ~10-min per-PR budget, human
+        // 2026-07-04).
         sel.add_preflight("shell-syntax");
-        sel.add_target("check-fast");
-        sel.add_target("cargo-test");
-        sel.require_full(&format!(
-            "{p} touches the loop spine; affected-checks cannot waive the full loop."
+        sel.add_preflight("cargo-test");
+        // check-pr already contains the cargo-test GATE (Pool::Heavy) — no
+        // explicit target, or spine diffs would run the engine suite twice.
+        sel.add_target("check-pr");
+        sel.add_note(&format!(
+            "{p} touches the loop spine: validated by the bounded check-pr tier (the runner \
+             runs itself over the whole PR pool); the daily backstop covers the daily tier."
         ));
         return;
     }
@@ -365,16 +379,19 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
             match target_from_gate_file(&abs) {
                 Some(gate) if !gate.is_empty() => add_gate_file_targets(sel, &gate),
                 _ => {
-                    sel.add_target("check-fast");
-                    sel.require_full(&format!(
-                        "{p} does not register a gate target; update the gate or run the full check."
+                    sel.add_target("check-pr");
+                    sel.add_note(&format!(
+                        "{p} does not register a gate target — running the bounded check-pr \
+                         tier; the daily backstop covers the daily-tier gates."
                     ));
                 }
             }
         } else {
-            sel.add_target("check-fast");
-            sel.require_full(&format!(
-                "{p} was deleted or is unavailable; affected-checks cannot infer the removed gate target."
+            sel.add_target("check-pr");
+            sel.add_note(&format!(
+                "{p} was deleted; affected-checks cannot infer the removed gate target — \
+                 running the bounded check-pr tier (a stale reference to the gate reds there \
+                 or in the daily backstop)."
             ));
         }
         return;
@@ -1093,9 +1110,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
     // The remaining system/ modules (td-build.scm — td-builder.scm has its own arm
     // above) and the OCI check harness (tests/oci-native-check.sh) feed the image
-    // tier (oci-native + rust-userland-image) and the drv-fixture gates.
+    // tier (oci-native + rust-userland-image, deferred to the daily backstop) and
+    // the drv-fixture gates (PR-sized — run them per-PR).
     if pattern_matches("system/*|tests/oci*", p) {
         sel.add_preflight("shell-syntax");
+        sel.add_target("td-drv-build");
+        sel.add_target("td-realize");
         sel.add_target("check-system");
         return;
     }
@@ -1111,10 +1131,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         "ci/build-ci-image.sh|ci/import-store.sh|ci/lower-*.sh|.github/setup-branch-protection.sh|.github/workflows/*",
         p,
     ) {
+        // CI/runner-gating files used to escalate to the full local loop; the
+        // local loop never exercises hosted CI, so the honest local check is the
+        // syntax preflight — the workflow run after push is the real test.
         sel.add_preflight("shell-syntax");
-        sel.require_full(&format!(
-            "{p} affects CI or runner gating; affected-checks cannot waive the full local loop."
-        ));
         sel.add_note(&format!(
             "{p} affects CI or branch protection; inspect the workflow result after push."
         ));
@@ -1172,10 +1192,13 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // Catch-all.
-    sel.add_target("check-fast");
-    sel.require_full(&format!(
-        "No mapping for {p}; update builder/src/affected.rs or run the full check."
+    // Catch-all: an unmapped path used to require the FULL loop; it now runs
+    // the bounded check-pr tier (the ~10-min per-PR budget) and leans on the
+    // daily backstop for the daily-tier gates.
+    sel.add_target("check-pr");
+    sel.add_note(&format!(
+        "No mapping for {p} — running the bounded check-pr tier; the daily backstop covers \
+         the daily-tier gates. Update builder/src/affected.rs with a mapping for it."
     ));
 }
 
@@ -1219,7 +1242,7 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     }
     o.push('\n');
 
-    if sel.preflights.is_empty() && sel.targets.is_empty() {
+    if sel.preflights.is_empty() && sel.targets.is_empty() && sel.deferred.is_empty() {
         o.push_str("Selected checks: none (docs-only or ignored local metadata)\n");
     } else {
         o.push_str("Selected checks:\n");
@@ -1231,6 +1254,13 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
         }
         if !sel.targets.is_empty() {
             o.push_str(&format!("  td-builder check {}\n", sel.targets.join(" ")));
+        }
+        if !sel.deferred.is_empty() {
+            o.push_str(&format!(
+                "Deferred to the daily backstop (daily/system tier — not run per-PR; \
+                 ci/daily-full-suite.sh heals regressions by fix-or-revert PR):\n  {}\n",
+                sel.deferred.join(" ")
+            ));
         }
     }
 
@@ -1269,6 +1299,22 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     o
 }
 
+/// The gate names that run ONLY in the daily/system tiers (no membership in
+/// any per-PR pool — gates.rs's `pool_runs_per_pr` is the single source of
+/// that taxonomy). Such targets are honest members of the affected set but are
+/// NOT run per-PR — the daily backstop covers them. Built once per selection.
+fn daily_tier_only_names() -> HashSet<String> {
+    use crate::gates::Pool;
+    crate::gates::defs()
+        .into_iter()
+        .filter(|(_, d)| {
+            !d.pools.iter().any(|p| crate::gates::pool_runs_per_pr(*p))
+                && d.pools.iter().any(|p| matches!(p, Pool::Daily | Pool::System))
+        })
+        .map(|(_, d)| d.name.to_string())
+        .collect()
+}
+
 fn compute_selection(root: &Path, changed: &[String]) -> Selection {
     let mut sel = Selection::default();
     for p in changed {
@@ -1276,6 +1322,18 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
             map_path(root, p, &mut sel);
         }
     }
+    // The per-PR budget partition: daily/system-tier gates (and the
+    // check-system tier itself) leave the run list and are reported as
+    // deferred — the mapping arms stay honest about what a diff AFFECTS, the
+    // partition decides what runs per-PR. targets is already deduped, so the
+    // partition halves are too.
+    let daily = daily_tier_only_names();
+    let (run, defer): (Vec<String>, Vec<String>) = sel
+        .targets
+        .drain(..)
+        .partition(|t| t != "check-system" && !daily.contains(t));
+    sel.targets = run;
+    sel.deferred = defer;
     sel
 }
 
@@ -1294,8 +1352,9 @@ Select a right-sized check set from the diff against main.
   td-builder affected-checks --self-test  # verify the mapping table
 
 This is the local PR-readiness gate for diffs it can classify. It maps changed
-paths to focused Make targets and prints whether the the full check is waived
-or still required.
+paths to focused gate targets (daily/system-tier gates are named but deferred
+to the daily backstop — the ~10-min per-PR budget) and prints whether the full
+check is waived or still required.
 ";
 
 /// The dry-run render for `--path PATH` (explicit mode, run=0) — the exact text
@@ -1321,17 +1380,57 @@ fn last_check_targets(output: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The targets on the "Deferred to the daily backstop" line (the indented line
+/// right after the header).
+fn deferred_targets(output: &str) -> Vec<String> {
+    let mut lines = output.lines();
+    while let Some(l) = lines.next() {
+        if l.starts_with("Deferred to the daily backstop") {
+            return lines
+                .next()
+                .map(|l| l.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_default();
+        }
+    }
+    Vec::new()
+}
+
 pub fn run_self_test(root: &Path) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     let mut fail = |m: String| failures.push(m);
 
+    // A mapping "selects" a target when it either RUNS it per-PR or names it on
+    // the deferred-to-daily line — both prove the diff→gate table is right; the
+    // run/defer split is the tier partition's job, asserted separately below.
     let has_target = |path: &str, target: &str| -> bool {
+        let out = path_output(root, path);
+        last_check_targets(&out).iter().any(|t| t == target)
+            || deferred_targets(&out).iter().any(|t| t == target)
+    };
+    let runs_target = |path: &str, target: &str| -> bool {
         last_check_targets(&path_output(root, path)).iter().any(|t| t == target)
+    };
+    let defers_target = |path: &str, target: &str| -> bool {
+        deferred_targets(&path_output(root, path)).iter().any(|t| t == target)
     };
     macro_rules! assert_target {
         ($path:expr, $target:expr) => {
             if !has_target($path, $target) {
                 fail(format!("{}: expected ./check.sh target '{}'", $path, $target));
+            }
+        };
+    }
+    macro_rules! assert_runs {
+        ($path:expr, $target:expr) => {
+            if !runs_target($path, $target) {
+                fail(format!("{}: expected PER-PR (run) target '{}'", $path, $target));
+            }
+        };
+    }
+    macro_rules! assert_deferred {
+        ($path:expr, $target:expr) => {
+            if !defers_target($path, $target) {
+                fail(format!("{}: expected DEFERRED-to-daily target '{}'", $path, $target));
             }
         };
     }
@@ -1380,6 +1479,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     }
     if default_check_covers_target(root, "oci-native") {
         fail("default coverage: system gate oci-load is not covered by plain ./check.sh".into());
+    }
+    if !default_check_covers_target(root, "check-pr") {
+        fail("default coverage: missing check-pr (a subset of the plain check)".into());
+    }
+    if !default_check_covers_target(root, "bootstrap-gcc-mesboot") {
+        fail("default coverage: daily gates are covered by the plain check".into());
     }
 
     // Every gate file maps (via the builder/src/gate_defs/*.rs arm) to its own gate target.
@@ -1550,9 +1655,25 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_branch_policy!("builder/src/sandbox.rs", "the full check would be waived");
     assert_branch_policy!("builder/Cargo.toml", "the full check would be waived");
     assert_target!("system/td-build.scm", "check-system");
-    assert_branch_policy!("check.sh", "the full check would be required");
+    // The per-PR budget (human 2026-07-04): only channels.scm still escalates to
+    // the FULL loop. The loop spine and unmapped paths validate on the bounded
+    // check-pr tier; daily/system-tier gates are named but deferred.
     assert_branch_policy!("channels.scm", "the full check would be required");
-    assert_branch_policy!("new/unmapped.file", "the full check would be required");
+    assert_runs!("builder/src/gates.rs", "check-pr");
+    assert_branch_policy!("builder/src/gates.rs", "the full check would be waived");
+    assert_runs!("new/unmapped.file", "check-pr");
+    assert_branch_policy!("new/unmapped.file", "the full check would be waived");
+    // The run/defer partition: a chain diff RUNS its PR-sized rungs and DEFERS
+    // the deep ones; the corpus arms defer the from-source package gates; the
+    // system tier defers wholesale.
+    assert_runs!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
+    assert_deferred!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-gcc-mesboot");
+    assert_deferred!("tests/crate-free-build.sh", "rust-ripgrep");
+    assert_deferred!("tests/crate-free-build.sh", "rust-userland-image");
+    assert_runs!("recipes/src/catalog.rs", "corpus-no-guix");
+    assert_deferred!("recipes/src/catalog.rs", "rust-ripgrep");
+    assert_deferred!("system/td-build.scm", "check-system");
+    assert_runs!("system/td-build.scm", "td-realize");
 
     failures
 }
@@ -1918,7 +2039,8 @@ mod tests {
             ])
         );
 
-        // Loop spine → full loop required.
+        // Loop spine → the bounded check-pr tier + engine tests (waived; the
+        // daily backstop covers the daily tier — the per-PR budget, 2026-07-04).
         assert_eq!(
             path_output(&root, "check.sh"),
             expect(&[
@@ -1929,11 +2051,14 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
-                "  td-builder check check-fast cargo-test",
+                "  cargo test --manifest-path builder/Cargo.toml",
+                "  td-builder check check-pr",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
-                "Branch-mode policy for these paths: the full check would be required",
-                "  - check.sh touches the loop spine; affected-checks cannot waive the full loop.",
+                "Branch-mode policy for these paths: the full check would be waived",
+                "",
+                "Notes:",
+                "  - check.sh touches the loop spine: validated by the bounded check-pr tier (the runner runs itself over the whole PR pool); the daily backstop covers the daily tier.",
                 "",
                 "Dry run only. Re-run with --run to execute.",
             ])
@@ -1957,7 +2082,8 @@ mod tests {
             ])
         );
 
-        // Catch-all → check-fast + require_full (now points at the moved file).
+        // Catch-all → the bounded check-pr tier (waived; the daily backstop
+        // covers the daily-tier gates — the per-PR budget, 2026-07-04).
         assert_eq!(
             path_output(&root, "totally/unmapped/path.xyz"),
             expect(&[
@@ -1967,11 +2093,13 @@ mod tests {
                 "  totally/unmapped/path.xyz",
                 "",
                 "Selected checks:",
-                "  td-builder check check-fast",
+                "  td-builder check check-pr",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
-                "Branch-mode policy for these paths: the full check would be required",
-                "  - No mapping for totally/unmapped/path.xyz; update builder/src/affected.rs or run the full check.",
+                "Branch-mode policy for these paths: the full check would be waived",
+                "",
+                "Notes:",
+                "  - No mapping for totally/unmapped/path.xyz — running the bounded check-pr tier; the daily backstop covers the daily-tier gates. Update builder/src/affected.rs with a mapping for it.",
                 "",
                 "Dry run only. Re-run with --run to execute.",
             ])

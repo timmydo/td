@@ -1,9 +1,12 @@
 # Daily full-suite backstop — operations
 
-The full `./check.sh` (heavy + system) is **no longer a per-PR blocking gate** (DESIGN §7.2,
-human 2026-06-21). Engine PRs validate on the `check-engine` smoke tier; the whole suite runs
-**once daily** on fresh main, and a scheduled agent heals any regression by opening a
-**fix-or-revert PR (no auto-merge — a human merges)**. This note is how that agent is run.
+The full `td-builder check` (heavy + daily + system) is **no longer a per-PR blocking gate**
+(DESIGN §7.2, human 2026-06-21; per-PR budget sharpened to ~10 min, human 2026-07-04). Engine
+PRs validate on the `check-engine` smoke tier and everything else on the bounded `check-pr`
+tier; the `daily` gate pool (the deep bootstrap rungs + the from-source package corpus) runs
+ONLY here. The whole suite runs **once daily** on fresh main, and a scheduled agent heals any
+regression by opening a **fix-or-revert PR (no auto-merge — a human merges)**. This note is
+how that agent is run.
 
 ## The two halves
 
