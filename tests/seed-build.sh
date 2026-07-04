@@ -32,7 +32,6 @@ trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 # coreutils is a DECLARED gate input (#353): resolved by the runner.
 cu=${TD_GATE_INPUT_COREUTILS:-}
 test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
-test -n "$cu" || fail "no coreutils in hello lock"
 
 # Capture roots: hello's lock inputs (toolchain + source) + the stage0 builder's runtime
 # refs (so the seed covers the builder too) — their union closure is hello's full seed.

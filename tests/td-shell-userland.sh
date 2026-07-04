@@ -84,7 +84,6 @@ LOCK=tests/ripgrep.lock   # ripgrep.lock == fd.lock for the seed; used for the g
 cu=${TD_GATE_INPUT_COREUTILS:-}
 sh_=${TD_GATE_INPUT_BASH:-}
 test -n "$cu" -a -n "$sh_" || { echo "ERROR: TD_GATE_INPUT_{COREUTILS,BASH} unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
-test -n "$cu" -a -n "$sh_" || fail "no coreutils/bash in $LOCK"
 if ls "$cu/bin" "$sh_/bin" | grep -qE '^(guix|guile)$'; then fail "guix/guile on the scrubbed PATH"; fi
 SCRUB="$cu/bin:$sh_/bin"
 

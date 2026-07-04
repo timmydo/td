@@ -34,7 +34,6 @@ trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 cu=${TD_GATE_INPUT_COREUTILS:-}
 sh_=${TD_GATE_INPUT_BASH:-}
 test -n "$cu" -a -n "$sh_" || { echo "ERROR: TD_GATE_INPUT_{COREUTILS,BASH} unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
-test -n "$cu" -a -n "$sh_" || fail "no coreutils/bash in hello lock"
 if ls "$cu/bin" "$sh_/bin" | grep -qE '^(guix|guile)$'; then fail "guix/guile on the scrubbed PATH"; fi
 
 # WARM hello's seed (same roots the seed-build gate uses): lock inputs + stage0 runtime.

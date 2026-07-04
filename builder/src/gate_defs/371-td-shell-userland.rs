@@ -40,6 +40,17 @@ pub fn gate() -> GateDef {
                 name: "bash",
                 kind: InputKind::LockEntry { lock: "tests/ripgrep.lock", stem: "bash" },
             },
+            // the rust-substitute-MISS path sources tests/rust-x86_64-runtime-
+            // store-native.sh (assemble-only), which consumes the bash-static
+            // fixture — declare it so that path resolves (#353 review find).
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/hello-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
         ],
         store: StoreMode::Shared,
         non_blocking: true,

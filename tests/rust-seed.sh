@@ -50,7 +50,6 @@ test -s "$lock0" || fail "no rust lock $lock0"
 # coreutils is a DECLARED gate input (#353): resolved by the runner.
 cu=${TD_GATE_INPUT_COREUTILS:-}
 test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
-test -n "$cu" || fail "no coreutils in the rust lock for the scrubbed PATH"
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then fail "guix/guile on the scrubbed PATH"; fi
 
 scratch="$root/.td-build-cache/rust-seed"; rm -rf "$scratch"; mkdir -p "$scratch/tmp" "$scratch/b"
