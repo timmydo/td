@@ -8,7 +8,10 @@
 //! "Hello, world!", /gnu/store ABSENT. DURABLE: pinned-input, no-guix-toolchain (no guix gcc-toolchain ref in the
 //! binary), behavioral (the corpus package actually runs from /td/store), structural (own-root /td/store, no
 //! /gnu/store). This is the first corpus package built by td's OWN toolchain — the substitution that retires the
-//! guix toolchain seed. Builds the full toolchain from the seed (heavy, ~90min). NOT a BUILD_GATE (no corpus prep).
+//! guix toolchain seed. The ~850-line seed→gcc-14.3.0+binutils-2.44+glibc-2.41 chain lives in the SHARED library
+//! tests/bootstrap-chain.sh (bootstrap_modern_toolchain), sourced here (#327 — the inline copy is deleted): warm
+//! (StoreMode::Shared) it reuses the machine-wide, content-keyed, NAR-verified chain bricks instead of rebuilding
+//! from the seed every run (~90min cold → minutes warm), while every corpus assertion still runs. NOT a BUILD_GATE.
 
 use crate::gates::{GateDef, Pool, StoreMode};
 

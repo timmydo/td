@@ -894,13 +894,16 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
     // bootstrap-chain.sh is the SHARED from-seed toolchain chain; its consumers are the sed
-    // corpus gate and store-persist (other store-native gates can migrate to it later, each
-    // adding itself here). Since #317 the chain's bricks persist through the warm chain-brick
-    // cache (tests/chain-cache-lib.sh), so a chain/lib change also re-proves the chain-cache
-    // gate (hit/poison/cold semantics). (chain arm ported from PR #203's affected-checks.sh.)
+    // corpus gate, the hello corpus gate (#327), and store-persist (other store-native gates
+    // can migrate to it later, each adding itself here). Since #317 the chain's bricks persist
+    // through the warm chain-brick cache (tests/chain-cache-lib.sh), so a chain/lib change also
+    // re-proves the chain-cache gate (hit/poison/cold semantics). (hello-corpus's OWN-file arm
+    // is above; here it is a chain CONSUMER, re-proved when the shared chain changes. chain arm
+    // ported from PR #203's affected-checks.sh.)
     if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh|tests/bootstrap-chain.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-sed-corpus-store-native");
+        sel.add_target("bootstrap-hello-corpus-store-native");
         sel.add_target("store-persist");
         sel.add_target("chain-cache");
         return;
@@ -1356,6 +1359,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/chain-cache.sh", "chain-cache");
     assert_target!("tests/bootstrap-chain.sh", "store-persist");
     assert_target!("tests/bootstrap-chain.sh", "chain-cache");
+    // #327: the hello corpus gate now SOURCES the shared chain (inline copy deleted), so a
+    // chain change must re-prove it too (its own-file arm still selects just itself).
+    assert_target!("tests/bootstrap-chain.sh", "bootstrap-hello-corpus-store-native");
+    assert_target!(
+        "tests/bootstrap-hello-corpus-store-native.sh",
+        "bootstrap-hello-corpus-store-native"
+    );
 
     // Spec→gate routing: a recipe/lock for a gate's SPEC selects that gate.
     for f in gate_files(root) {
