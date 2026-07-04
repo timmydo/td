@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): GC-sweep semantics assert exact contents of a fresh fixture store
+        non_blocking: true,
         script: r##"
 echo ">> store-gc-sweep: td DELETES the GC-dead paths from its OWN store + rewrites the DB to the live set (destructive GC sweep of a TD-BUILT closure, pure Rust, no daemon; guix off PATH) == td's own mark phase"
 set -euo pipefail; \

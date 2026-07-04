@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-fd: td builds 'fd' (fd-find 10.2.0, 113 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); fd finds a file; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

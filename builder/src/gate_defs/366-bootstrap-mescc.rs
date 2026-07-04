@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-mescc: from the seed, Mes's own MesCC compiler self-hosts mes (mes-mescc) + emits libc+tcc.a, guix-free + reproducible (source-bootstrap brick 3)"
 sh tests/bootstrap-mescc.sh

@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> toolchain-input-addressed: the /td/store modern toolchain gets a STABLE input-addressed key (td-toolchain.lock + toolchain-key/path) — identical across non-reproducible rebuilds, predictable from the lock; a real binary placed there runs, /gnu/store absent (task 2a — td-subst chain-caching prereq)"
 sh tests/toolchain-input-addressed.sh

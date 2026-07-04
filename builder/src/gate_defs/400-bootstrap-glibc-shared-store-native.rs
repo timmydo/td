@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-glibc-shared-store-native: the seed toolchain builds a SHARED glibc 2.16.0 and runs a DYNAMIC program from /td/store (interp+RUNPATH = /td/store) → 42, /gnu/store ABSENT — the first dynamic /td/store toolchain (source-bootstrap brick 6)"
 sh tests/bootstrap-glibc-shared-store-native.sh

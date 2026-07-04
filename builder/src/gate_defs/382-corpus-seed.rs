@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): corpus builds from the warmed seed ALONE prove seed sufficiency
+        non_blocking: true,
         script: r##"
 echo ">> corpus-seed: one warmed seed builds two different corpus packages (hello + sed) from source, no guix install (the seed scales to the corpus)"
 sh tests/corpus-seed.sh

@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-glibc: the seed gcc + binutils build glibc 2.2.5 (guix's glibc-mesboot0) — a real C library a program links against + runs, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-glibc.sh

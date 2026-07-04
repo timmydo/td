@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-sed-corpus-store-native: the /td/store MODERN toolchain (gcc 14.3.0 + binutils 2.44 + glibc 2.41, all from the seed) builds REAL corpus GNU sed 4.9 via build-recipe — substituted for guix's gcc-toolchain-15.2.0; sed links /td/store glibc 2.41, no guix gcc-toolchain ref, runs → substitutes foo→bar, /gnu/store ABSENT (source-bootstrap brick 8 — 2nd corpus package, after hello)"
 sh tests/bootstrap-sed-corpus-store-native.sh

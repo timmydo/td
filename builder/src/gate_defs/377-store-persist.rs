@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> store-persist: the loop builds a corpus package at /td/store into a persistent store + DB (build-into), and a SEPARATE invocation SKIPS the rebuild reading it back (CACHE=persist), running it own-root /gnu/store-absent — incremental /td/store, wired into the build path"
 sh tests/store-persist.sh

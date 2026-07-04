@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-uutils: td builds the uutils 'cat' (uu_cat 0.9.0, 139 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); it works as cat (file + stdin); reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

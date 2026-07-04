@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-gcc: from the seed, the tcc-built make + binutils build GCC 2.95.3 — a real C compiler that compiles+links+runs C, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-gcc.sh

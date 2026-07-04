@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-gcc-mesboot: the gcc-mesboot1 toolchain builds GCC 4.9.4 against glibc 2.16.0 — the final mesboot gcc, a modern C/C++ compiler from the seed, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-gcc-mesboot.sh

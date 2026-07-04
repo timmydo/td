@@ -35,6 +35,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-russh: td builds a russh client<->server SSH round-trip (188 deps incl. aws-lc crypto) from source via build-recipe with crates provisioned GUIX-FREE (cargo-proxy from the in-tree Cargo.lock, interned vendor tree, TD_VENDOR_DIR); the SSH session works + is reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

@@ -31,6 +31,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> td-builder: reproducible offline self-build (S1 — stage0 double-bootstrap, guix/Guile off PATH)"
 set -euo pipefail; \

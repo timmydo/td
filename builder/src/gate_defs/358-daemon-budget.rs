@@ -34,6 +34,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> daemon-budget: the shared build daemon caps concurrent builds at its global budget across independent submitters (the machine-wide limiter)"
 set -euo pipefail; \

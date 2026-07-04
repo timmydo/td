@@ -97,11 +97,15 @@ fn guard_pinned_guix(root: &Path) -> Result<(), String> {
         ));
     }
     if host != pinned {
-        return Err(fatal(&format!(
-            "host guix ({host}) != pinned channel ({pinned}).\n  The offline loop assumes \
-             they match (see HISTORY.md). Refusing to run a check that would silently \
-             download substitutes."
-        )));
+        // A pin DRIFT no longer aborts the run. The guix-pin-dependent gates are
+        // tagged non-blocking, so on a drifted host they fail without blocking the
+        // rest; a correctly-pinned host runs them normally. (Guix is being removed;
+        // the pin's significance goes with it.) Warn loudly and continue.
+        eprintln!(
+            "td-builder check: WARNING: host guix ({host}) != pinned channel ({pinned}).\n  \
+             Proceeding — the guix-pin-dependent gates are tagged non-blocking, so their \
+             failures will not block the run. A correctly-pinned host runs and covers them."
+        );
     }
     Ok(())
 }

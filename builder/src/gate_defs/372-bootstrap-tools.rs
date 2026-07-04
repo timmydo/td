@@ -17,6 +17,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-tools: from the seed, the tcc from brick 4 compiles mesboot tools toward binutils — gzip 1.2.4 + the fuller pristine tcc 0.9.27, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-tools.sh

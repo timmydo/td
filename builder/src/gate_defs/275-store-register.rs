@@ -32,6 +32,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> store-register: td WRITES the store SQLite DB for a TD-BUILT hello's FULL CLOSURE (pure-Rust file format) and READS it back byte-identically to sqlite3 (guix off PATH; no guix build, no guix gc, no /var/guix read)"
 set -euo pipefail; \

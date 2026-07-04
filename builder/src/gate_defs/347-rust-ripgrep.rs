@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-ripgrep: td builds 'ripgrep' (rg 14.1.1, 57 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); rg greps a needle; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

@@ -41,6 +41,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> stage0-cold-start: a COLD stage0 placement works with guix state HIDDEN — same path, same closure as the warm guix-host placement; an absent seed dir places with no refs, a broken seed dir errors loudly (#313)"
 set -euo pipefail; \

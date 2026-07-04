@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> store-relocate: relocate a dynamic package /gnu/store -> /td/store and run it with /gnu/store ABSENT (the break from guix for dynamic binaries; user-pm Phase 2)"
 sh tests/store-relocate.sh

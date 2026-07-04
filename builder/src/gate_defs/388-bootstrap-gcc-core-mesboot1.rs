@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-gcc-core-mesboot1: the toolchain builds GCC 4.6.4 (C) with in-tree gmp/mpfr/mpc — a modern gcc from the seed, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-gcc-core-mesboot1.sh

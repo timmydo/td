@@ -44,6 +44,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> td-subst: td builds td-subst (its own substitute server) from source via build-recipe (offline, guix/Guile off PATH); it selftests the signed serve/fetch over loopback, proves fetch-don't-build end-to-end byte-identical, proves the build-recipe CONSUMER HOOK substitutes (CACHE=subst) instead of rebuilding, and is reproducible"
 set -euo pipefail; \

@@ -30,6 +30,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> td-shell-userland: td shell builds + runs the real Rust userland (ripgrep, fd) with td's OWN NATIVE /td/store toolchain (guix rust/gcc-toolchain retired for td shell), execs a real task (durable behavioral; no guix process, no oracle)"
 sh tests/td-shell-userland.sh

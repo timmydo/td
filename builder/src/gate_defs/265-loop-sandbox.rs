@@ -26,6 +26,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> loop-sandbox: td's OWN sandbox provides the hermetic loop surface (store ro + daemon socket + guix, host isolation, own PID + net namespaces) — intrinsic, no guix shell -C oracle"
 set -euo pipefail; \

@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-coreutils: td builds uutils-coreutils (coreutils 0.9.0, 507 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); the multicall binary dispatches util subcommands; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

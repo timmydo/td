@@ -15,6 +15,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> store-native-profile: td-builder profile --store-native builds a profile of logical /td/store links that resolve + run in the store-ns own-root, /gnu/store ABSENT (the .scm-free userspace assembly mechanism)"
 sh tests/store-native-profile.sh

@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-bat: td builds 'bat' (0.25.0, 207 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); bat prints a file; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

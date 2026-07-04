@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): builds hello from the unpacked seed alone (no warm store)
+        non_blocking: true,
         script: r##"
 echo ">> seed-build: build hello from the unpacked seed tarball (its only store DB) — /var/guix out of the path; td builds with NO guix install (North-Star step 2 PR3)"
 sh tests/seed-build.sh

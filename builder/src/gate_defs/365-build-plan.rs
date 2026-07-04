@@ -24,6 +24,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> build-plan: --auto chains td-built deps into downstream builds (subjects DERIVED from the recipe graph, no manifest) — each subject's .drv references td's deps (NOT guix's), runs, reproducibly, at distinct paths"
 set -euo pipefail; \

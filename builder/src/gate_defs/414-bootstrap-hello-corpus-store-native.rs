@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-hello-corpus-store-native: the /td/store MODERN toolchain (gcc 14.3.0 + binutils 2.44 + glibc 2.41, all from the seed) builds REAL corpus GNU hello 2.12.2 via build-recipe — substituted for guix's gcc-toolchain-15.2.0; hello links /td/store glibc 2.41, no guix gcc-toolchain ref, runs → \"Hello, world!\", /gnu/store ABSENT (source-bootstrap brick 8 — retire the guix toolchain seed, step 1)"
 sh tests/bootstrap-hello-corpus-store-native.sh

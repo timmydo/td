@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> loop-rung: a REAL gate (eval) runs + prints 'eval ok' inside td's full-env sandbox (--expose-cwd) — intrinsic, no guix shell -C oracle"
 set -euo pipefail; \

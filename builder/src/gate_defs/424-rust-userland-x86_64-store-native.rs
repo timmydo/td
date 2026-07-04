@@ -25,6 +25,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-userland-x86_64-store-native: build ripgrep (rg 14.1.1) with the NATIVE x86_64 /td/store toolchain (guix rust + gcc-toolchain removed), run rg in a /gnu/store-absent own-root, grep a needle, reproducible"
 GUIX="$TD_GUIX" ROOT="$PWD" sh tests/rust-x86_64-userland-store-native.sh

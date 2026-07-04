@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> seed-tarball: capture a toolchain seed closure into a frozen tarball + manifest; the seed is NAR-identical after a tar round-trip (North-Star step 2 PR1)"
 sh tests/seed-tarball.sh

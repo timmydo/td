@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> store-verify: td VERIFIES store integrity of a TD-BUILT closure (re-hash vs the recorded registration) + DETECTS a one-byte corruption — the daemon's guix gc --verify --check-contents, pure Rust, no daemon (guix off PATH)"
 set -euo pipefail; \

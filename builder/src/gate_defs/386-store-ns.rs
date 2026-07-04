@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> store-ns: td owns its own root with its store at /td/store — a binary runs from /td/store, /gnu/store ABSENT (rootless, unmixed from guix; user-pm Phase 0)"
 sh tests/store-ns.sh

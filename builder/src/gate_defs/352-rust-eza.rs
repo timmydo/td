@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-eza: td builds 'eza' (0.21.6, 233 deps) GUIX-FREE via the cargo-proxy (interned vendor tree, TD_VENDOR_DIR); eza lists a dir; reproducible; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

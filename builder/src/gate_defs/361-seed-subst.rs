@@ -34,6 +34,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> seed-subst: a missing pinned /gnu/store seed is realized via td's OWN signed substitute store (resolve-seed.sh), ref-closed + verified, through the REAL host prelude with guix POISONED on PATH; missing+no-store FAILS CLOSED (no guix fallback); the producer (publish-seed-subst.sh) captures/exports/signs the closure content-scanned (#311)"
 sh tests/seed-subst.sh

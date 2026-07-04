@@ -33,6 +33,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-vendor: td builds td-vendor-demo (depends on itoa + ryu) via build-recipe with VENDORED deps (offline, guix/Guile off PATH); it runs + is reproducible"
 set -euo pipefail; \

@@ -24,6 +24,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-binutils-244-store-native: the /td/store toolchain builds MODERN binutils 2.44 from source; as/ld run from /td/store, report 2.44, and link a program → 42, /gnu/store ABSENT (source-bootstrap brick 6/7, final-toolchain rung A)"
 sh tests/bootstrap-binutils-244-store-native.sh

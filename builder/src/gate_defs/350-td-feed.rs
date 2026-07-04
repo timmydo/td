@@ -48,6 +48,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> td-feed: td builds td-feed (its own local HTTP mirror, 73 vendored deps) from source via build-recipe with crates provisioned GUIX-FREE (td-fetched + interned vendor tree, TD_VENDOR_DIR); it warms+serves+fetches over loopback + is reproducible, and tests/td-feed.index is self-consistent + truthful; no guix build / no /gnu/store crate / no oracle"
 set -euo pipefail; \

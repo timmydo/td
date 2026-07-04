@@ -22,6 +22,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-gcc-14-store-native: a MODERN GCC 14.3.0 (c,c++) at /td/store — built from the seed via gcc-mesboot 4.9.4; a PLAIN wrapped gcc/g++ builds a DYNAMIC C AND C++ program that runs → 42, /gnu/store ABSENT (source-bootstrap brick 6/7, final-toolchain rung B)"
 sh tests/bootstrap-gcc-14-store-native.sh

@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-binutils: the tcc-built GNU Make builds GNU Binutils 2.20.1a (as + ld) from the seed — patch-applied, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-binutils.sh

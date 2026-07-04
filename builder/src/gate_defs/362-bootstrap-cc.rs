@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-cc: from the seed, td builds M2-Planet (a minimal C compiler) + mescc-tools; it compiles+links+RUNS a C program, guix-free + reproducible (source-bootstrap brick 1)"
 sh tests/bootstrap-cc.sh

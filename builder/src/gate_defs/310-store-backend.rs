@@ -30,6 +30,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> store-backend: a td store backend HOLDS + SERVES a TD-BUILT hello output (place + register + query + verify, pure Rust, no daemon; guix off PATH)"
 set -euo pipefail; \

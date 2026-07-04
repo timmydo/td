@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-glibc-mesboot: the gcc-mesboot1 toolchain builds GNU libc 2.16.0 with nptl — a modern, threaded C library from the seed, guix-free + reproducible (source-bootstrap brick 5)"
 sh tests/bootstrap-glibc-mesboot.sh

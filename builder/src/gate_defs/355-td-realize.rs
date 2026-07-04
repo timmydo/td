@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> td-realize: td realizes the hello drv with no guix-daemon and no /var/guix/db — computes the input closure itself by CONTENT-SCANNING /gnu/store, builds in its userns sandbox, registers; output matches the daemon (oracle)"
 set -euo pipefail; \

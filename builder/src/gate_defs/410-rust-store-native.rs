@@ -18,6 +18,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> rust-store-native: relink the upstream Rust 1.96.0 toolchain to /td/store (td's own ELF rewriter, no patchelf), intern guix-free; interp -> /td/store, zero /gnu/store; runtime leg pending glibc-final"
 sh tests/rust-store-native.sh

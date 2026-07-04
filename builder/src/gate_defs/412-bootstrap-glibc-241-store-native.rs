@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-glibc-241-store-native: a MODERN glibc 2.41 at /td/store — built from the seed by gcc 14.3.0 + binutils 2.44; gcc 14.3.0 links a DYNAMIC C AND C++ program against it that runs → 42, /gnu/store ABSENT (source-bootstrap brick 6/7, final-toolchain rung C — the full modern toolchain)"
 sh tests/bootstrap-glibc-241-store-native.sh

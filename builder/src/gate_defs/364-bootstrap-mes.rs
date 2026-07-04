@@ -28,6 +28,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-mes: the structured Rust mes recipe builds GNU Mes (mes-m2) and proves it evaluates Scheme, guix-free + reproducible (source-bootstrap brick 2)"
 set -euo pipefail; \

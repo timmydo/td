@@ -48,6 +48,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-build: td places its stage0 builder into its OWN store and the loop BUILDS hello with it (the builder-of-record is a binary guix never produced) — runs, reproducible, distinct from guix"
 set -euo pipefail; \

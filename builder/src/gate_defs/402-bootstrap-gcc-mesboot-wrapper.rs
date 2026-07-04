@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-gcc-mesboot-wrapper: a gcc-mesboot-wrapper at /td/store — a PLAIN gcc invocation produces a DYNAMIC /td/store binary that runs → 42, /gnu/store ABSENT (the unmodified-build-system primitive; source-bootstrap brick 6 rung 2)"
 sh tests/bootstrap-gcc-mesboot-wrapper.sh

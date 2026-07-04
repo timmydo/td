@@ -57,6 +57,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap: td compiles its OWN stage0 td-builder from source with the pinned toolchain — no guix, no Guile — and it runs, is bit-reproducible, and behaviorally equals the guix-built builder"
 set -euo pipefail; \

@@ -28,6 +28,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
+        non_blocking: false,
         script: r##"
 echo ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent + the census manifest is in sync (rust-recipe-surface)"
 set -euo pipefail; \

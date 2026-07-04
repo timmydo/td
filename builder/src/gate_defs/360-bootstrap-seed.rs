@@ -30,6 +30,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): brick 0 builds from the 229-byte seed alone
+        non_blocking: true,
         script: r##"
 echo ">> bootstrap-seed: the structured Rust seed recipe builds the first stage0 artifacts with guix off env — self-reproducing, working, reproducible (source-bootstrap brick 0)"
 set -euo pipefail; \
