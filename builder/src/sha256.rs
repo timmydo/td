@@ -134,6 +134,24 @@ pub fn to_base16(digest: &[u8; 32]) -> String {
     s
 }
 
+/// sha256 (lowercase hex) of a file's bytes, streamed in 64 KiB chunks —
+/// bootstrap artifacts and warmed crates run multi-MB, so no whole-file
+/// buffer. The one shared file-hash helper (bootstrap.rs + check_loop.rs).
+pub fn sha256_file(p: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(p)?;
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(buf.get(..n).unwrap_or(&[]));
+    }
+    Ok(to_base16(&h.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
