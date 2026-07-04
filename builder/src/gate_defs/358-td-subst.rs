@@ -34,7 +34,7 @@
 //! build doesn't oversubscribe cores, and it depends on the td-recipe-eval that build-recipes'
 //! prelude builds. Not in BUILD_SPECS — the source is interned at gate time.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -43,7 +43,24 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): the scrubbed-PATH coreutils from td-subst's
+        // lock + the runnable static-bash fixture from hello's pinned closure (the
+        // input-addressed producer leg) — resolved by the runner; the body's
+        // lock-grepping + store-closure-scan wiring is deleted.
+        inputs: &[
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
+            },
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/hello-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
@@ -54,8 +71,8 @@ case "$TD_RECIPE_EVAL" in *.td-build-cache/*) : ;; *) echo "FAIL: TD_RECIPE_EVAL
 echo "  [DURABLE structural] recipes evaluate with td's OWN td-recipe-eval ($TD_RECIPE_EVAL)"; \
 lock0="$PWD/tests/td-subst.lock"; \
 test -s "$lock0" || { echo "ERROR: no lock $lock0" >&2; exit 1; }; \
-cu=`grep -- '-coreutils-' "$lock0" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
+cu=${TD_GATE_INPUT_COREUTILS:-}; \
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 ncrate=`grep -cE '\.crate /gnu/store/' "$lock0"`; \
 test "$ncrate" -ge 70 || { echo "ERROR: lock has <70 vendored .crate deps ($ncrate)" >&2; exit 1; }; \
@@ -133,9 +150,9 @@ kill $cspid 2>/dev/null || true; trap - EXIT; \
 echo "  --- lock-keyed input-addressed substitute (tasks 2b/2c): a consumer fetches a /td/store path it computes FROM td-toolchain.lock ---"; \
 ttl="$PWD/tests/td-toolchain.lock"; test -s "$ttl" || { echo "FAIL: no td-toolchain.lock" >&2; exit 1; }; \
 iakey=`env -i PATH="$cu/bin" "$tb" toolchain-key "$ttl"`; test -n "$iakey" || { echo "FAIL: toolchain-key produced nothing" >&2; exit 1; }; \
-bashpkg=`grep -- '-bash-' "$PWD/tests/hello-no-guix.lock" | grep -v static | sed 's/^[^ ]* //' | head -1`; \
-iabs=`env -i PATH="$cu/bin" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" "$tb" store-closure-scan /gnu/store "$bashpkg" | grep -- '-bash-static-' | head -1`; \
-test -n "$iabs" -a -x "$iabs/bin/bash" || { echo "FAIL: no static bash fixture in hello's closure" >&2; exit 1; }; \
+iabs=${TD_GATE_INPUT_BASH_STATIC:-}; \
+test -n "$iabs" || { echo "ERROR: TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
+test -x "$iabs/bin/bash" || { echo "FAIL: no static bash fixture at $iabs" >&2; exit 1; }; \
 iad="$scratch/ia"; rm -rf "$iad"; mkdir -p "$iad/store" "$iad/served" "$iad/fetch" "$iad/restored"; \
 iap=`env -i PATH="$cu/bin" TD_STORE_DIR=/td/store "$tb" store-add-input-addressed glibc-2.41 "$iakey" "$iabs" "$iad/store" "$iad/td.db"`; \
 case "$iap" in /td/store/*-glibc-2.41) : ;; *) echo "FAIL: producer path not input-addressed at /td/store: $iap" >&2; exit 1 ;; esac; \

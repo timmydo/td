@@ -14,7 +14,7 @@
 //! surface is 0). The per-subject `guix build <S>` remains a removable differential oracle
 //! (grows per package, retires wholesale with guix — NOT the ratcheted packager surface).
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,7 +23,12 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils — resolved by
+        // the runner from this gate's lock; the body's lock-grepping is deleted.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/grep-no-guix.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
@@ -34,8 +39,8 @@ test -x "$TD_RECIPE_EVAL" || { echo "ERROR: could not resolve td-recipe-eval" >&
 grep ' /gnu/store/' "$PWD/tests/td-builder-rust.lock" | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null || { echo "ERROR: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a channel bump)" >&2; exit 1; }; \
 . tests/cache-lib.sh; export TD_STAGE0_BASE="$PWD/.td-build-cache/build-plan/stage0"; load_stage0; \
 tb="$TB"; \
-cu=`grep -- '-coreutils-' "$PWD/tests/grep-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils for the scrubbed PATH" >&2; exit 1; }; \
+cu=${TD_GATE_INPUT_COREUTILS:-}; \
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 root="$PWD/.td-build-cache/build-plan"; jd="$root/json"; mkdir -p "$jd" "$root/tmp"; \
 owned=""; \

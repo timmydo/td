@@ -27,7 +27,7 @@
 //! Built up front by the parallel `build-recipes` phase (into the shared cache); this
 //! gate then cache-hits + memo-skips and only asserts behavior/oracle.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -36,14 +36,19 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &["libsigsegv", "libunistring", "pcre2", "ncurses", "readline"],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils — resolved by
+        // the runner from this gate's lock; the body's lock-grepping is deleted.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/pcre2-no-guix.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
 echo ">> corpus-deps-no-guix: td builds libsigsegv + libunistring + pcre2 + ncurses + readline via build-recipe (no guix/Guile in the build path); each links+runs from td's own output, reproducible"
 set -euo pipefail; \
-cu=`grep -- '-coreutils-' "$PWD/tests/pcre2-no-guix.lock" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils in the lock for the scrubbed PATH" >&2; exit 1; }; \
+cu=${TD_GATE_INPUT_COREUTILS:-}; \
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 gtbin=`for p in $($TD_GUIX build gcc-toolchain 2>/dev/null); do [ -x "$p/bin/gcc" ] && echo "$p/bin" && break; done`; \
 test -n "$gtbin" || { echo "ERROR: could not resolve gcc-toolchain for the link-test" >&2; exit 1; }; \

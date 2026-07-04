@@ -17,7 +17,7 @@
 //! index and the staged closure collapsed to the lock entries — coreutils' gmp dropped,
 //! `expr` died on libgmp.so.10. Fixed by seed-canonical-prefix + recanonicalize_candidates.)
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,7 +26,29 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): the sed-lock pieces the script consumed by
+        // hand — the build bash (the generated builders' shebang), brick8's
+        // gcc-toolchain lock-rewrite base, and the static-bash own-root runner from
+        // the pinned closure — resolved by the runner. (The $newlock coreutils read
+        // stays: that lock is gate-GENERATED, not a pinned input.)
+        inputs: &[
+            ArtifactInput {
+                name: "bash",
+                kind: InputKind::LockEntry { lock: "tests/sed-no-guix.lock", stem: "bash" },
+            },
+            ArtifactInput {
+                name: "gcc-toolchain",
+                kind: InputKind::LockEntry { lock: "tests/sed-no-guix.lock", stem: "gcc-toolchain" },
+            },
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/sed-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
