@@ -1377,6 +1377,172 @@ pub fn run_cmake() -> Result<(), String> {
     Ok(())
 }
 
+/// Recursively copy a store tree to `dst`, making the copy user-writable (store
+/// trees are read-only; the kaem build writes its artifacts INTO its tree). File
+/// exec bits are preserved; symlinks are recreated. Pure `std` — the stage0 rung
+/// has NO build inputs, so there is no coreutils `cp` in its sandbox to shell to.
+fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
+    let entries = fs::read_dir(src).map_err(|e| format!("read dir {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read dir {}: {e}", src.display()))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("file type {}: {e}", entry.path().display()))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_tree_writable(&from, &to)?;
+        } else if ft.is_symlink() {
+            let target = fs::read_link(&from)
+                .map_err(|e| format!("readlink {}: {e}", from.display()))?;
+            std::os::unix::fs::symlink(&target, &to)
+                .map_err(|e| format!("symlink {}: {e}", to.display()))?;
+        } else {
+            fs::copy(&from, &to)
+                .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
+            let mode = fs::metadata(&from)
+                .map_err(|e| format!("stat {}: {e}", from.display()))?
+                .permissions()
+                .mode();
+            fs::set_permissions(&to, fs::Permissions::from_mode((mode & 0o777) | 0o200))
+                .map_err(|e| format!("chmod {}: {e}", to.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Mark a file executable (u+rwx, go+rx) — the two binary seeds are checked into
+/// git as plain files, and the interned source tree preserves that.
+fn make_executable(p: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(p)
+        .map_err(|e| format!("stat {}: {e}", p.display()))?
+        .permissions()
+        .mode();
+    fs::set_permissions(p, fs::Permissions::from_mode((mode & 0o777) | 0o755))
+        .map_err(|e| format!("chmod +x {}: {e}", p.display()))
+}
+
+/// Scan a tree for the literal `/gnu/store` in any regular file; the first hit is
+/// an error. The stage0 SEAL's output half: a guix byte in the seed rung's output
+/// reds the BUILD, in the engine, not just a downstream gate.
+fn require_no_gnu_store(dir: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("file type {}: {e}", entry.path().display()))?;
+        let p = entry.path();
+        if ft.is_dir() {
+            require_no_gnu_store(&p)?;
+        } else if ft.is_file() {
+            let bytes = fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+            if bytes.windows(b"/gnu/store".len()).any(|w| w == b"/gnu/store") {
+                return Err(format!(
+                    "stage0 output {} contains /gnu/store bytes — the seed rung is sealed (north star: no guix bytes)",
+                    p.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// stage0-build — td's stage0-posix SEED build "system" (sibling of `run`, the
+/// autotools runner; #378 slice 1). The seed rung of the /td/store toolchain as a
+/// recipe: TD_SRC is the interned seed/stage0 tree (stage0-posix-x86, pinned —
+/// seed/stage0/README.md); this runner places a writable copy, marks the two
+/// binary seeds executable, and execs the kaem interpreter over the two vendored
+/// build scripts:
+///
+///   kaem-optional-seed AMD64/mescc-tools-seed-kaem.kaem  (hex0 → … → M2, blood-elf-0, kaem-0)
+///   kaem-0             AMD64/mescc-tools-mini-kaem.kaem  (M2 → M1, hex2, kaem)
+///
+/// then installs the built tool dirs (AMD64/bin + AMD64/artifact) into $out. This
+/// is the ONLY place a raw binary seed is exec'd — an engine BuildSystem, so the
+/// toolchain recipe graph is total (no imperative shell outside the engine).
+///
+/// The SEAL (no /gnu/store leaks into the seed build): the recipe has NO build
+/// inputs (assemble_recipe_drv enforces it — the 229-byte hex0-seed + 618-byte
+/// kaem-optional-seed need nothing), so the copy/install run natively in Rust
+/// (there is no coreutils in this sandbox); the kaem steps run with an EMPTY
+/// environment (the chain's `env -i`, now engine policy — no PATH, no store path
+/// reaches the seed processes) and reference only paths inside their own tree;
+/// and the installed output is scanned — any `/gnu/store` byte REDS the build
+/// here in the engine. What still enters the sandbox mount-wise is td-builder's
+/// OWN runtime closure (this binary's libc — the host-seed exception, gone when
+/// td-builder self-hosts on the recipe-built toolchain); the empty env keeps it
+/// unreachable by the build.
+pub fn run_stage0() -> Result<(), String> {
+    let out = env::var("out").map_err(|_| "out not set".to_string())?;
+    let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
+    if !Path::new(&src).is_dir() {
+        return Err(format!("TD_SRC {src} is not a directory (want the interned seed/stage0 tree)"));
+    }
+
+    // Writable working copy — the kaem build writes artifacts INTO its tree.
+    let tree = Path::new("stage0-tree");
+    copy_tree_writable(Path::new(&src), tree)?;
+    for seed in [
+        "bootstrap-seeds/POSIX/AMD64/hex0-seed",
+        "bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
+    ] {
+        make_executable(&tree.join(seed))?;
+    }
+    for d in ["AMD64/artifact", "AMD64/bin"] {
+        fs::create_dir_all(tree.join(d)).map_err(|e| format!("mkdir {d}: {e}"))?;
+    }
+
+    // The two kaem steps, env EMPTY (env -i): the scripts drive everything through
+    // relative paths inside the tree; nothing outside it is reachable.
+    let envs: Vec<(String, String)> = Vec::new();
+    let cwd = tree.to_string_lossy();
+    run_cmd(
+        "./bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
+        &["./AMD64/mescc-tools-seed-kaem.kaem"],
+        &cwd,
+        &envs,
+        &WATCH_PHASE,
+    )?;
+    run_cmd(
+        "./AMD64/artifact/kaem-0",
+        &["./AMD64/mescc-tools-mini-kaem.kaem"],
+        &cwd,
+        &envs,
+        &WATCH_PHASE,
+    )?;
+
+    // Install the built tool dirs — the exact paths the chain's downstream rungs
+    // read ($tc/AMD64/bin/{M1,hex2,kaem}, $tc/AMD64/artifact/{M2,blood-elf-0,…}).
+    for d in ["AMD64/bin", "AMD64/artifact"] {
+        copy_tree_writable(&tree.join(d), &Path::new(&out).join(d))?;
+    }
+    // Fail HERE (a named tool), not as an opaque exec failure three rungs later.
+    for b in [
+        "AMD64/bin/M1",
+        "AMD64/bin/hex2",
+        "AMD64/bin/kaem",
+        "AMD64/artifact/M2",
+        "AMD64/artifact/blood-elf-0",
+        "AMD64/artifact/kaem-0",
+    ] {
+        let p = Path::new(&out).join(b);
+        use std::os::unix::fs::PermissionsExt;
+        let meta = fs::metadata(&p)
+            .map_err(|_| format!("seed build did not produce {b} (expected under $out)"))?;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(format!("seed build product {b} is not executable"));
+        }
+    }
+    // The output half of the seal: no /gnu/store byte leaves this build.
+    require_no_gnu_store(Path::new(&out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

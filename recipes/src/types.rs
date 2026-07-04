@@ -22,11 +22,18 @@ fn arr(xs: &[String]) -> Json {
 }
 
 /// Build systems td knows how to lower (mirrors `BuildSystem` in td-spec.d.ts).
+/// `Stage0` is the SEED build system (#378): the engine places the pinned
+/// stage0-posix tree (the recipe's lock-supplied source) in the build sandbox and
+/// execs its kaem interpreter — the only place a raw binary seed is exec'd, an
+/// engine primitive so the toolchain recipe graph is total (no imperative shell).
+/// (Named `stage0`, not `seed`: the `seed` word is taken by the lock input class
+/// and the guix seed store.)
 #[derive(Clone)]
 pub enum BuildSystem {
     Gnu,
     Rust,
     Cmake,
+    Stage0,
 }
 
 impl BuildSystem {
@@ -35,6 +42,7 @@ impl BuildSystem {
             BuildSystem::Gnu => "gnu",
             BuildSystem::Rust => "rust",
             BuildSystem::Cmake => "cmake",
+            BuildSystem::Stage0 => "stage0",
         }
     }
 }
@@ -390,6 +398,12 @@ impl Recipe {
     pub fn cmake(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Cmake)
     }
+    /// The stage0 SEED build system (#378): no upstream `Source` — the pinned
+    /// seed tree is vendored in-repo (seed/stage0) and rides in through the
+    /// lock's `<name>-source` entry, interned by the caller.
+    pub fn stage0(name: &str, version: &str) -> Recipe {
+        Recipe::base(name, version, BuildSystem::Stage0)
+    }
 
     pub fn source(mut self, src: Source) -> Recipe {
         self.source = Some(src);
@@ -432,7 +446,7 @@ impl Recipe {
         self
     }
 
-    /// The build system as its JSON/lowering token ("gnu"/"rust"/"cmake").
+    /// The build system as its JSON/lowering token ("gnu"/"rust"/"cmake"/"stage0").
     pub fn build_system_name(&self) -> &'static str {
         self.build_system.as_str()
     }
