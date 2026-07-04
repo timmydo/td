@@ -41,7 +41,7 @@ pub fn gate() -> GateDef {
         script: r##"
 echo ">> pkg-config-no-guix: pkg-config builds via td-builder build-recipe (no guix/Guile in the path), RESOLVES a .pc file, reproducible; self-discriminated by pkg-config-perturbed"
 set -euo pipefail; \
-spec="${TD_GATE_SPECS:?the runner exports this gate's declared specs}"; \
+spec="${TD_GATE_SPECS:?the runner exports the declared specs}"; \
 case "$spec" in *' '*) echo "FAIL: this gate's script handles exactly ONE spec, got '$spec' — extend the script before extending specs" >&2; exit 1 ;; esac; \
 lock="$PWD/tests/$spec-no-guix.lock"; \
 test -s "$lock" || { echo "ERROR: no lock $lock" >&2; exit 1; }; \
