@@ -14,7 +14,7 @@
 //! [DURABLE behavioral] td BUILDS td-fetch from the interned vendor tree and it runs.
 //! [DURABLE repro] td-builder check double-build agrees the build is reproducible.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,7 +23,13 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils — resolved by
+        // the runner from this gate's lock; the body's inline lock-grep is
+        // deleted (no shell comment in the body: its lines are `; \`-continued).
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/td-fetch.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
@@ -37,8 +43,8 @@ test "$miss" -eq 0 || { echo "FAIL: $miss vendored crate(s) not pinned by fetch/
 echo "  [DURABLE supply-chain] all $ncrate vendored crates' sha256 are checksums pinned in fetch/Cargo.lock (upstream crates.io hash — the guix-free oracle)"; \
 . tests/cache-lib.sh; export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; load_stage0; load_recipe_eval; tb="$TB"; \
 lock0="$PWD/tests/td-fetch.lock"; \
-cu=`grep -- '-coreutils-' "$lock0" | sed 's/^[^ ]* //' | head -1`; \
-test -n "$cu" || { echo "ERROR: no coreutils in the lock" >&2; exit 1; }; \
+cu=${TD_GATE_INPUT_COREUTILS:-}; \
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }; \
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi; \
 scratch="$PWD/.td-build-cache/rust-fetch"; rm -rf "$scratch"; mkdir -p "$scratch/tmp" "$scratch/sd"; \
 grep -v '\.crate ' "$lock0" | grep ' /gnu/store/' | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null || { echo "ERROR: could not realize the toolchain seed" >&2; exit 1; }; \
