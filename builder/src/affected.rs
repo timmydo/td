@@ -809,6 +809,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // The /td/store harness bash (re #312): GNU bash 5.2.37 built by the /td/store x86_64 toolchain,
+    // run in the own-root under `bash -c` as the gate runner runs every gate body.
+    if pattern_matches(
+        "tests/bash-x86_64-store-native.sh|seed/sources/bash-5.2.37.lock|builder/src/gate_defs/423-bash-x86_64-store-native.rs",
+        p,
+    ) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("bash-x86_64-store-native");
+        return;
+    }
+
     // The guix-free harness loop (host-sandbox-stage0 inc2c): mk/harness.mk + the inner
     // loop body run by `./check.sh check-harness`. The tier consumes the harness gate 420
     // persists, so provision it via gate 420; `check-harness` is a check.sh tier (its own
@@ -1528,6 +1539,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!(
         "builder/src/gate_defs/420-userland-x86_64-store-native.rs",
         "userland-x86_64-store-native"
+    );
+    assert_target!("tests/bash-x86_64-store-native.sh", "bash-x86_64-store-native");
+    assert_target!("seed/sources/bash-5.2.37.lock", "bash-x86_64-store-native");
+    assert_target!(
+        "builder/src/gate_defs/423-bash-x86_64-store-native.rs",
+        "bash-x86_64-store-native"
     );
     assert_target!("tests/td-cmake-demo.lock", "cmake");
     assert_target!("tests/uutils-coreutils.lock", "rust-coreutils");
