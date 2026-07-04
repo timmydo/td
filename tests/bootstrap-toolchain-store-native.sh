@@ -756,7 +756,7 @@ case "$GLP" in /td/store/*-glibc-mesboot) ;; *) fail "glibc-mesboot not content-
 echo "   [content-addr] interned $GCCP"; echo "                  + binutils-mesboot + glibc-mesboot, content-addressed in /td/store"
 
 # bash-static — the own-root orchestration shell (cp'd; static guix binary, only the runner — the
-# TOOLCHAIN above is the content-addressed deliverable, matching tests/store-ns.sh).
+# TOOLCHAIN above is the content-addressed deliverable, matching the store-ns gate).
 bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
 bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in hello's closure"
