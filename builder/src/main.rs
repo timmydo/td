@@ -23,6 +23,11 @@ mod check_loop;
 mod daemon;
 mod drv;
 mod elf;
+// The comment-splice static guard (#300) is exercised only by its own `#[test]`
+// (the cargo-test tier) — gate it to test builds so it adds no dead-code surface
+// to the release binary or the clippy pass.
+#[cfg(test)]
+mod gate_lint;
 mod gates;
 mod json;
 mod lock;
