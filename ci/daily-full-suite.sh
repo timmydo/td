@@ -69,13 +69,23 @@ sh tools/warm-stage0-seed.sh || echo ">> daily backstop: WARN — could not warm
 TD_CHECK_CHAIN_CACHE= TD_SUBST_FORCE_BUILD=1 TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} "$TDB" check >"$hlog" 2>&1 || heavy_rc=$?
 heavy_fail=$(grep -E '^FAIL' "$hlog" | head -5 | tr '\n' ';')
 
-# check.sh's own integrity guard (host guix == pinned channels.scm commit) aborts
-# BEFORE any gate runs when the runner host isn't provisioned with guix at all, or
-# with a mismatched channel. That is a runner-provisioning problem, not a gate
-# regression (issue #268) — a bare heavy=red/system=red with no *_fail is
-# indistinguishable from a real break, so detect it here and report it distinctly
-# instead of sending an agent hunting for a code regression that doesn't exist.
-if [ $heavy_rc -ne 0 ] && grep -q '^(check\.sh|td-builder check): FATAL: host guix' "$hlog"; then
+# td-builder check's own integrity guard (guard_pinned_guix, builder/src/check_loop.rs)
+# aborts BEFORE any gate runs when the runner host isn't provisioned with guix at all.
+# That is a runner-provisioning problem, not a gate regression (issue #268) — a bare
+# heavy=red/system=red with no *_fail is indistinguishable from a real break, so detect
+# it here and report it distinctly instead of sending an agent hunting for a code
+# regression that doesn't exist.
+#
+# The matched text must track guard_pinned_guix's actual FATAL wording (check_loop.rs):
+# #316 (2026-07-03) ported check.sh's "check.sh: FATAL: host guix (...) != pinned..."
+# message to td-builder's "td-builder check: FATAL: could not read the host guix commit
+# (...)" without updating this grep, so every guix-less run since silently fell through
+# to the heavy=red/system=red path this guard exists to avoid (reproduced on a guix-less
+# runner: heavy_rc=1/system_rc=1 with empty heavy_fail/system_fail, exit 7 instead of the
+# distinct exit 10). Match on the stable "FATAL: could not read the host guix commit"
+# substring rather than the whole sentence so an unrelated wording tweak doesn't silently
+# reopen this gap again.
+if [ $heavy_rc -ne 0 ] && grep -q '^td-builder check: FATAL: could not read the host guix commit' "$hlog"; then
   env_error=1
   env_error_msg="runner host not provisioned: host guix missing/mismatched vs channels.scm (see issue #268) — no gate ran, not a code regression"
   heavy_fail="$env_error_msg"
