@@ -889,7 +889,15 @@ fn run(args: &[String]) -> Result<i32, String> {
     // TD_CHECK_CHAIN_CACHE rides along for the same reason: `TD_CHECK_CHAIN_CACHE= ./check.sh`
     // (set-and-empty) is the operator's force-cold switch for the #317 warm
     // chain-brick default — the daily backstop uses it to stay authoritative.
-    for k in ["TD_CHECK_SLOTS", "TD_CHECK_SLOTS_DIR", "TD_CHECK_JOBS", "TD_CHECK_CHAIN_CACHE"] {
+    // TD_CHECK_DISABLE forwards the gate-disable list (gate names / `pool:<name>`
+    // tokens) so `TD_CHECK_DISABLE=… td-builder check` reaches the in-sandbox runner.
+    for k in [
+        "TD_CHECK_SLOTS",
+        "TD_CHECK_SLOTS_DIR",
+        "TD_CHECK_JOBS",
+        "TD_CHECK_CHAIN_CACHE",
+        "TD_CHECK_DISABLE",
+    ] {
         if let Ok(v) = std::env::var(k) {
             child_envs.push((k.to_string(), v));
         }
