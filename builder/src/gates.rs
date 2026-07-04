@@ -352,6 +352,77 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
     }
 }
 
+/// Gate-disable support (TD_CHECK_DISABLE): from `selected`, drop every index in
+/// `disabled` AND every gate that transitively depends on a dropped one — a gate
+/// cannot run without its prerequisite. The result stays dep-closed over what
+/// remains, so the scheduler never blocks waiting on a prerequisite that will
+/// never run.
+fn drop_disabled(
+    set: &GateSet,
+    selected: &HashSet<usize>,
+    disabled: &HashSet<usize>,
+) -> HashSet<usize> {
+    let mut kept: HashSet<usize> = selected.difference(disabled).copied().collect();
+    loop {
+        let mut shrank = false;
+        for i in kept.iter().copied().collect::<Vec<usize>>() {
+            let Some(g) = set.gates.get(i) else { continue };
+            let has_dropped_dep = g.deps.iter().any(|d| match set.index.get(d) {
+                Some(di) => !kept.contains(di),
+                None => false,
+            });
+            if has_dropped_dep {
+                kept.remove(&i);
+                shrank = true;
+            }
+        }
+        if !shrank {
+            return kept;
+        }
+    }
+}
+
+/// Parse a `pool:<name>` token used by TD_CHECK_DISABLE (case-sensitive lower).
+fn parse_pool(name: &str) -> Option<Pool> {
+    match name {
+        "cheap" => Some(Pool::Cheap),
+        "heavy" => Some(Pool::Heavy),
+        "fast" => Some(Pool::Fast),
+        "system" => Some(Pool::System),
+        "engine" => Some(Pool::Engine),
+        "parked" => Some(Pool::Parked),
+        _ => None,
+    }
+}
+
+/// Apply a TD_CHECK_DISABLE `spec` to `selected`: parse comma/space-separated
+/// gate NAMES and `pool:<name>` tokens into the disabled index set, then drop
+/// those gates and their dependents (`drop_disabled`). Returns the kept set and
+/// the list of tokens that matched no gate or pool (surfaced, not silently
+/// dropped). This is the whole gate-disable mechanism — a way to turn gates off
+/// without editing the gate definitions.
+fn filter_disabled(
+    set: &GateSet,
+    selected: &HashSet<usize>,
+    spec: &str,
+) -> (HashSet<usize>, Vec<String>) {
+    let mut disabled: HashSet<usize> = HashSet::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for tok in spec.split([',', ' ', '\t', '\n']).filter(|t| !t.is_empty()) {
+        if let Some(pname) = tok.strip_prefix("pool:") {
+            match parse_pool(pname) {
+                Some(p) => disabled.extend(set.members(p)),
+                None => unknown.push(tok.to_string()),
+            }
+        } else if let Some(i) = set.index.get(tok) {
+            disabled.insert(*i);
+        } else {
+            unknown.push(tok.to_string());
+        }
+    }
+    (drop_disabled(set, selected, &disabled), unknown)
+}
+
 /// Per-gate wall-clock history (seconds) from the last timing report — the
 /// data-driven LPT order. Missing/unparseable => empty (fallback: <NNN> order).
 fn duration_table(root: &Path) -> HashMap<String, f64> {
@@ -1231,6 +1302,36 @@ pub fn cli(args: &[String]) -> ExitCode {
         }
     };
 
+    // A way to disable gates WITHOUT editing gate definitions: TD_CHECK_DISABLE
+    // lists what to skip — bare gate NAMES and/or `pool:<cheap|heavy|fast|system|
+    // engine|parked>` tokens (comma/space separated). gate-run drops the named
+    // gates AND anything that transitively depends on them (dep-closure prune), so
+    // the scheduler never blocks on a prerequisite that won't run. Unknown tokens
+    // are reported, not silently ignored. (Used e.g. to turn off the guix-dependent
+    // gates on a host where guix can't satisfy them — `pool:heavy pool:system` —
+    // without touching every gate def; re #350.)
+    let selected = match std::env::var("TD_CHECK_DISABLE") {
+        Ok(v) if !v.trim().is_empty() => {
+            let (kept, unknown) = filter_disabled(&set, &selected, &v);
+            if !unknown.is_empty() {
+                eprintln!(
+                    "gate-run: TD_CHECK_DISABLE: unknown gate/pool token(s) ignored: {}",
+                    unknown.join(", ")
+                );
+            }
+            let dropped = selected.len() - kept.len();
+            if dropped > 0 {
+                eprintln!(
+                    "gate-run: TD_CHECK_DISABLE — skipping {dropped} disabled gate(s) [and any \
+                     dependents]; running {} gate(s).",
+                    kept.len()
+                );
+            }
+            kept
+        }
+        _ => selected,
+    };
+
     let timing_log = if std::env::var("TD_GATE_TIMING").ok().as_deref() == Some("0") {
         None
     } else {
@@ -1434,6 +1535,57 @@ mod tests {
         let sel = expand_goals(&set, &["check".to_string()]).unwrap();
         assert!(!run_selected(&set, &sel, &cfg(&d, 4, None)).unwrap());
         assert!(!d.join("late.ran").exists(), "gate behind a red gate must not start");
+    }
+
+    #[test]
+    fn td_check_disable_skips_named_and_pooled_gates_and_prunes_dependents() {
+        // TD_CHECK_DISABLE mechanism: a spec of gate NAMES + `pool:<name>` tokens
+        // drops those gates and anything depending on them; unknown tokens are
+        // surfaced, not silently ignored.
+        let d = tmpdir("disable");
+        let set = synth(
+            &d,
+            &[
+                ("cheapgate", Pool::Cheap, "true", &[]),
+                ("enginegate", Pool::Engine, "true", &[]),
+                ("heavy_a", Pool::Heavy, "true", &[]),
+                ("heavy_b", Pool::Heavy, "true", &[]),
+                ("sysgate", Pool::System, "true", &[]),
+                // in a KEPT pool, but transitively needs a dropped heavy gate:
+                ("needs_heavy", Pool::Cheap, "true", &["heavy_a"]),
+            ],
+        );
+        // selected = the whole set (as if expand_goals closed over it).
+        let selected: HashSet<usize> = (0..set.gates.len()).collect();
+
+        // Drive the real entry point: a spec mixing a pool token, a bare name, and
+        // a bogus token — commas AND spaces as separators.
+        let (kept, unknown) =
+            filter_disabled(&set, &selected, "pool:heavy, sysgate  bogus-name");
+        let names: HashSet<&str> = kept
+            .iter()
+            .filter_map(|i| set.gates.get(*i).map(|g| g.name.as_str()))
+            .collect();
+
+        // `pool:heavy` drops both heavy gates; `sysgate` drops the named system gate.
+        assert!(!names.contains("heavy_a"));
+        assert!(!names.contains("heavy_b"));
+        assert!(!names.contains("sysgate"));
+        // gates with no disabled dependency survive.
+        assert!(names.contains("cheapgate"));
+        assert!(names.contains("enginegate"));
+        // a gate depending on a dropped gate is pruned too — else the scheduler
+        // would block forever on a prerequisite that never runs.
+        assert!(
+            !names.contains("needs_heavy"),
+            "a gate depending on a dropped gate must be pruned"
+        );
+        assert_eq!(names.len(), 2, "only the two independent kept gates remain");
+        // the bogus token is reported, not silently dropped.
+        assert_eq!(unknown, vec!["bogus-name".to_string()]);
+        // and a bare `pool:bogus` is unknown too, while known pools/names parse.
+        let (_, unk2) = filter_disabled(&set, &selected, "pool:bogus cheapgate");
+        assert_eq!(unk2, vec!["pool:bogus".to_string()]);
     }
 
     #[test]
