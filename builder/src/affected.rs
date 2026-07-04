@@ -1535,6 +1535,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "bootstrap-sqlite-corpus-store-native"
     );
     assert_target!("tests/sqlite-no-guix.lock", "bootstrap-sqlite-corpus-store-native");
+    // #374 policy: the sqlite corpus gate is Pool::Daily, so a per-PR selection DEFERS it
+    // to the daily backstop rather than running it.
+    assert_deferred!("tests/sqlite-no-guix.lock", "bootstrap-sqlite-corpus-store-native");
 
     // Spec→gate routing: a recipe/lock for a gate's SPEC selects that gate.
     for f in gate_files(root) {

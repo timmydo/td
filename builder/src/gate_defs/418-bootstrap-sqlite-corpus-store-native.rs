@@ -13,16 +13,18 @@
 //! supplies the pinned lock closure and the warm seed capture content-scans the store directory.
 //! `non_blocking` matches the corpus siblings until the seed-provisioning dependence retires
 //! (#311/#350): on a host without the warm chain bricks or the pinned seed closure this red is
-//! environmental, not a regression. Warm via the shared chain cache (#317); heavy. NOT a
-//! BUILD_GATE (it builds its subject in-gate with the substituted toolchain, so it declares no
-//! spec — the build-recipes prelude's pinned-toolchain pre-build would be a different artifact).
+//! environmental, not a regression. Warm via the shared chain cache (#317). `Pool::Daily` like
+//! its hello/sed siblings (the #374 heavy/daily split): it runs in the plain full check and the
+//! daily backstop, and per-PR selections defer it to the daily line. NOT a BUILD_GATE (it builds
+//! its subject in-gate with the substituted toolchain, so it declares no spec — the
+//! build-recipes prelude's pinned-toolchain pre-build would be a different artifact).
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
         name: "bootstrap-sqlite-corpus-store-native",
-        pools: &[Pool::Heavy],
+        pools: &[Pool::Daily],
         needs: &[],
         build_gate: false,
         specs: &[],
