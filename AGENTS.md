@@ -41,22 +41,19 @@ process in any user-facing command/build path (`td shell` resolves
 td-built packages, never `guix build`); the `/td/store` source
 bootstrap replaces the guix toolchain seed.
 
-**Build `/td/store` packages via the recipe primitive, not per-package
-shell.** A package or userland tool is added as a *recipe*
-(`recipes/src/`) and built by the engine — `td-builder build-recipe`
-(leaf) or `td-builder build-plan --auto` (a recipe with owned-input
-edges: it builds the dependency subchain store-native too) — with the
-`/td/store` toolchain substituted for guix's gcc-toolchain. The
-`bootstrap-hello-corpus-store-native` / `bootstrap-sed-corpus-store-native`
-gates are the reference: source the shared chain
+**Build `/td/store` packages via the recipe primitive.** A package or
+userland tool is a *recipe* (`recipes/src/`) built by the engine —
+`td-builder build-recipe` (leaf) or `td-builder build-plan --auto` (a
+recipe with owned-input edges builds its dependency subchain
+store-native too) — with the `/td/store` toolchain substituted for
+guix's gcc-toolchain. The reference gates are
+`bootstrap-hello-corpus-store-native` /
+`bootstrap-sed-corpus-store-native`: source the shared chain
 (`bootstrap_modern_toolchain`), substitute the toolchain into the
-recipe's `<stem>-no-guix.lock`, then `build-recipe`. The engine wires
-the declared `(inputs …)`; do NOT hand-roll the toolchain obtain +
-`configure`/`make` in per-package shell. The `bootstrap-x86_64-*` and
-`userland-x86_64-store-native` gates hand-roll a *cross toolchain*
-because their job is building the toolchain itself — a different
-problem — and are NOT the template for adding a package/tool (this
-mistake was made once, a hand-rolled bash gate, and reverted; re #312).
+recipe's `<stem>-no-guix.lock`, then `build-recipe` — the engine wires
+the declared `(inputs …)`. (Building the toolchain/harness ITSELF is a
+different job — the seed-bootstrap ladder — and is necessarily shell;
+that is not a package build.)
 
 ## Prime directives (never violate)
 
