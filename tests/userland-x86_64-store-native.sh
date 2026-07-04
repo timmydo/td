@@ -139,7 +139,7 @@ cstore="$snwork/closure-store"; cdb="$snwork/closure.db"; mkdir -p "$cstore"
 # the static-bash fixture is a DECLARED gate input (#353): the runner resolved it.
 bs=${TD_GATE_INPUT_BASH_STATIC:-}
 test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
-test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash from hello's closure for the own-root shell"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 bbase=`basename "$bs"`; cp -a "$bs" "$cstore/$bbase"; chmod -R u+w "$cstore"
 
 # --- Get the x86_64 toolchain: FETCH the lock-keyed closure (x64-toolchain-subst, #223) if a

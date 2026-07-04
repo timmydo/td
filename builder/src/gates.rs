@@ -196,6 +196,29 @@ impl GateSet {
     }
 }
 
+/// Input declarations: each name must be a valid env handle, and no two may
+/// collide on the MAPPED env var — env_var folds case and maps `-`/`.`/`+`
+/// all to `_`, so comparing raw names would let `bash-static` and
+/// `bash.static` both export TD_GATE_INPUT_BASH_STATIC, silently shadowing
+/// each other (exactly what this check exists to prevent).
+fn validate_input_decls(gate: &str, inputs: &[ArtifactInput]) -> Result<(), String> {
+    for (i, inp) in inputs.iter().enumerate() {
+        if !valid_word(inp.name) {
+            return Err(format!("gate-run: gate `{gate}`: invalid input name `{}`", inp.name));
+        }
+        let var = crate::gate_inputs::env_var(inp.name);
+        if let Some(o) =
+            inputs.iter().take(i).find(|o| crate::gate_inputs::env_var(o.name) == var)
+        {
+            return Err(format!(
+                "gate-run: gate `{gate}`: inputs `{}` and `{}` collide on the same {var} env var",
+                o.name, inp.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A word that may name a gate or build spec.
 fn valid_word(w: &str) -> bool {
     !w.is_empty()
@@ -244,23 +267,7 @@ fn load() -> Result<GateSet, String> {
                 return Err(format!("gate-run: gate `{}`: invalid word `{w}`", def.name));
             }
         }
-        // Input declarations: the name must be a valid env handle and unique
-        // within the gate (two inputs mapping to one TD_GATE_INPUT_* var would
-        // silently shadow each other).
-        for (i, inp) in def.inputs.iter().enumerate() {
-            if !valid_word(inp.name) {
-                return Err(format!(
-                    "gate-run: gate `{}`: invalid input name `{}`",
-                    def.name, inp.name
-                ));
-            }
-            if def.inputs.iter().take(i).any(|o| o.name == inp.name) {
-                return Err(format!(
-                    "gate-run: gate `{}`: duplicate input name `{}`",
-                    def.name, inp.name
-                ));
-            }
-        }
+        validate_input_decls(def.name, def.inputs)?;
         if index.contains_key(def.name) {
             return Err(format!("gate-run: duplicate gate `{}`", def.name));
         }
@@ -1751,6 +1758,22 @@ mod tests {
             "an untagged (blocking) failure must still red the run"
         );
         assert!(!d2.join("after.ran").exists(), "blocking failure must fail-fast the dependent");
+    }
+
+    #[test]
+    fn input_names_colliding_on_the_mapped_env_var_are_rejected() {
+        // env_var folds case and maps -/./+ to _, so the dedup must compare the
+        // MAPPED names — raw-name comparison would let these shadow each other.
+        const K: InputKind = InputKind::LockEntry { lock: "x.lock", stem: "bash" };
+        let a = ArtifactInput { name: "bash-static", kind: K };
+        let b = ArtifactInput { name: "bash.static", kind: K };
+        let err = validate_input_decls("g", &[a, b]).unwrap_err();
+        assert!(err.contains("collide on the same TD_GATE_INPUT_BASH_STATIC"), "got: {err}");
+        // distinct mapped names pass; an invalid name is rejected.
+        let c = ArtifactInput { name: "coreutils", kind: K };
+        assert!(validate_input_decls("g", &[a, c]).is_ok());
+        let bad = ArtifactInput { name: "no/slash", kind: K };
+        assert!(validate_input_decls("g", &[bad]).is_err());
     }
 
     #[test]
