@@ -22,17 +22,24 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        // Typed artifact input (#353): the runnable static-bash fixture from the
-        // pinned closure — resolved by the runner; the body's grep +
-        // store-closure-scan hand-wiring is deleted.
-        inputs: &[ArtifactInput {
-            name: "bash-static",
-            kind: InputKind::ClosureMember {
-                lock: "tests/hello-no-guix.lock",
-                root_stem: "bash",
-                member_stem: "bash-static",
+        // Typed artifact inputs (#353): the static-bash fixture from hello's pinned
+        // closure + the lock's gcc-toolchain entry (brick8's lock-rewrite base) —
+        // resolved by the runner; the body's grep + store-closure-scan wiring is
+        // deleted.
+        inputs: &[
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/hello-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
             },
-        }],
+            ArtifactInput {
+                name: "gcc-toolchain",
+                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "gcc-toolchain" },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

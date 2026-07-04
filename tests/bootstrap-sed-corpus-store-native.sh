@@ -179,7 +179,8 @@ echo "   [brick8 no-guix-toolchain] build-recipe built sed 4.9 with the /td/stor
 # performs a real text substitution: s/foo/bar/ on "foo\nbaz" must yield "bar\nbaz" (a transform, not a print).
 vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`; sb2=`basename "$o"`
 cp -a "$bstore/$glb" "$vs/$glb"; cp -a "$sdir" "$vs/$sb2"
-bs8=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
+# the static-bash fixture is the DECLARED gate input resolved above (#353).
+bs8="$bs"
 bb8=`basename "$bs8"`; cp -a "$bs8" "$vs/$bb8"; chmod -R u+w "$vs"
 sedrun='printf "foo\nbaz\n" | /td/store/'"$sb2"'/bin/sed "s/foo/bar/"'
 g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "$sedrun" 2>&1` || { echo "$g8" | sed 's/^/     /' >&2; fail "brick8: store-ns sed run rc"; }

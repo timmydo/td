@@ -143,8 +143,9 @@ TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$btdb"` ||
 echo "   [brick8] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
 # Substitute the gcc-toolchain entry in hello's lock; glibc 2.41 stays in the closure via the toolchain's ref.
 # (sed/cut, not awk: gawk is not in tools/loop-toolchain.txt, so bare `awk` dies on the loop PATH.)
-oldtc=`grep -- '-gcc-toolchain-' tests/hello-no-guix.lock | head -1 | cut -d' ' -f2`
-test -n "$oldtc" || fail "brick8: no gcc-toolchain in hello-no-guix.lock"
+# the gcc-toolchain entry is a DECLARED gate input (#353): the runner resolved it.
+oldtc=${TD_GATE_INPUT_GCC_TOOLCHAIN:-}
+test -n "$oldtc" || fail "TD_GATE_INPUT_GCC_TOOLCHAIN unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 newlock="$b8/hello.lock"
 sed "/-gcc-toolchain-/c\\
 gcc-toolchain $TCP seed\\
@@ -183,7 +184,8 @@ echo "   [brick8 no-guix-toolchain] build-recipe built hello 2.12.2 with the /td
 # (c) [DURABLE behavioral] hello runs in an own-root holding the /td/store glibc 2.41 + a static bash.
 vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`; hb2=`basename "$o"`
 cp -a "$bstore/$glb" "$vs/$glb"; cp -a "$hdir" "$vs/$hb2"
-bs8=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
+# the static-bash fixture is the DECLARED gate input resolved above (#353).
+bs8="$bs"
 bb8=`basename "$bs8"`; cp -a "$bs8" "$vs/$bb8"; chmod -R u+w "$vs"
 g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "/td/store/$hb2/bin/hello" 2>&1` || { echo "$g8" | sed 's/^/     /' >&2; fail "brick8: store-ns hello run rc"; }
 case "$g8" in *"Hello, world!"*) ;; *) fail "brick8: hello did not greet: $g8" ;; esac
