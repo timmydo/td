@@ -11,7 +11,7 @@
 //! gcc-toolchain ref in the binary), behavioral (a text processor actually transforms text from /td/store),
 //! structural (own-root /td/store, no /gnu/store). Builds the full toolchain from the seed (heavy, ~90min). NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -20,7 +20,24 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact inputs (#353): the static-bash fixture from sed's pinned
+        // closure + the lock's gcc-toolchain entry (brick8's lock-rewrite base) —
+        // resolved by the runner; the body's grep + store-closure-scan wiring is
+        // deleted.
+        inputs: &[
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/sed-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
+            ArtifactInput {
+                name: "gcc-toolchain",
+                kind: InputKind::LockEntry { lock: "tests/sed-no-guix.lock", stem: "gcc-toolchain" },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

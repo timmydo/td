@@ -757,9 +757,10 @@ echo "   [content-addr] interned $GCCP"; echo "                  + binutils-mesb
 
 # bash-static — the own-root orchestration shell (cp'd; static guix binary, only the runner — the
 # TOOLCHAIN above is the content-addressed deliverable, matching the store-ns gate).
-bashlock=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
-test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in hello's closure"
+# the static-bash fixture is a DECLARED gate input (#353): the runner resolved it.
+bs=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 mkdir -p "$store/work"; printf '#include <stdio.h>\nint main(){printf("td-store-gcc\\n");return 42;}\n' > "$store/work/hello.c"
 

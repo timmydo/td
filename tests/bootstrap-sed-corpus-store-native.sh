@@ -67,8 +67,10 @@ if grep -q -a '/gnu/store' "$snwork/w/c.out"; then fail "the C program contains 
 echo "   built C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
 mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
 WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || fail "store-add prog failed"; wprel=${WP#/td/store/}
-bashlock=`grep -- '-bash-' tests/sed-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
-bs=`"$TB" store-closure-scan /gnu/store "$bashlock" | grep -- '-bash-static-' | head -1`
+# the static-bash fixture is a DECLARED gate input (#353): the runner resolved it.
+bs=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
 snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 /td/store/'"$wprel"'/bin/c; echo "CRC=$?"
@@ -135,8 +137,9 @@ echo "   [brick8] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
 # Substitute the gcc-toolchain entry in sed's lock; glibc 2.41 stays in the closure via the toolchain's ref.
 # Use grep/sed (both in the declared loop toolchain) rather than awk — awk/gawk is NOT in the loop profile
 # (it is only on PATH via the host guix dir, an undeclared dependency), so grep/sed keeps this hermetic.
-oldtc=`grep -- '-gcc-toolchain-' tests/sed-no-guix.lock | head -1 | sed 's/^[^ ]* //'`
-test -n "$oldtc" || fail "brick8: no gcc-toolchain in sed-no-guix.lock"
+# the gcc-toolchain entry is a DECLARED gate input (#353): the runner resolved it.
+oldtc=${TD_GATE_INPUT_GCC_TOOLCHAIN:-}
+test -n "$oldtc" || fail "TD_GATE_INPUT_GCC_TOOLCHAIN unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 newlock="$b8/sed.lock"
 # rewrite the lone gcc-toolchain line into the /td/store toolchain ref + glibc 2.41 (paths are /td/store/<base32>-…, no sed-special chars; | delimiter avoids the path slashes).
 sed "s|^[^ ]*-gcc-toolchain-[^ ]* .*|gcc-toolchain $TCP seed\nglibc-2.41 $GLP8 seed|" tests/sed-no-guix.lock > "$newlock"
