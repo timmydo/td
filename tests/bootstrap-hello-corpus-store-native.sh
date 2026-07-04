@@ -140,10 +140,13 @@ done
 TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$btdb"` || fail "brick8: store-add gcc-toolchain failed"
 echo "   [brick8] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
 # Substitute the gcc-toolchain entry in hello's lock; glibc 2.41 stays in the closure via the toolchain's ref.
-oldtc=`awk '/-gcc-toolchain-/{print $2}' tests/hello-no-guix.lock | head -1`
+# (sed/cut, not awk: gawk is not in tools/loop-toolchain.txt, so bare `awk` dies on the loop PATH.)
+oldtc=`grep -- '-gcc-toolchain-' tests/hello-no-guix.lock | head -1 | cut -d' ' -f2`
 test -n "$oldtc" || fail "brick8: no gcc-toolchain in hello-no-guix.lock"
 newlock="$b8/hello.lock"
-awk -v tc="$TCP" -v gl="$GLP8" '/-gcc-toolchain-/ { print "gcc-toolchain " tc " seed"; print "glibc-2.41 " gl " seed"; next } { print }' tests/hello-no-guix.lock > "$newlock"
+sed "/-gcc-toolchain-/c\\
+gcc-toolchain $TCP seed\\
+glibc-2.41 $GLP8 seed" tests/hello-no-guix.lock > "$newlock"
 grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
 "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
 sort -u "$b8/roots" -o "$b8/roots"
