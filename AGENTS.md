@@ -60,8 +60,10 @@ per-rung bootstrap shell (`bootstrap-chain.sh`'s `build_*` fns, the
 `bootstrap-x86_64-*` gates) is expedient port debt to migrate onto
 recipes (it needs staged builders — each rung declaring the prior as
 its `native-inputs`, an extension of `build-plan --auto`'s existing
-td-built-dep chaining) — #353 axis 2. Do not treat the current
-bootstrap shell as the pattern to copy.
+td-built-dep chaining) — and even the seed becomes a recipe via an
+engine `BuildSystem` that places+`exec`s the pinned blob, so the graph
+is *total* with no imperative-shell floor (#378; re #353 axis 2). Do
+not treat the current bootstrap shell as the pattern to copy.
 
 ## Prime directives (never violate)
 
