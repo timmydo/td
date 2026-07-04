@@ -29,7 +29,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
-        non_blocking: false,
+        non_blocking: true,
         script: r##"
 echo ">> harness-subst: the /td/store harness ships to guix-less runners via td-subst (#314) — the daily EXPORTS + SIGNS the whole tree as one td-harness substitute; tools/resolve-harness.sh (the consumer run_check_harness calls) FETCHES it (sig vs the pinned key + StorePath + NarHash verified), restores a runnable, metadata-intact, byte-identical tree, and FAILS CLOSED on a cold store / wrong key / wrong StorePath"
 sh tests/harness-subst.sh

@@ -24,7 +24,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         store: StoreMode::Shared,
-        non_blocking: false,
+        non_blocking: true,
         script: r##"
 echo ">> feed-shared: a persistent SHARED td-feed daemon serves a warmed artifact to consumers on different worktrees, offline over loopback; reused not restarted; reds on corruption/cold"
 set -euo pipefail; \

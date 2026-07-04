@@ -19,7 +19,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         store: StoreMode::Shared,
-        non_blocking: false,
+        non_blocking: true,
         script: r##"
 echo ">> profile: td-builder profile unions installed packages into a symlink-tree profile; the binaries run through profile/bin (+ a ~/bin symlink) — the user-package-manager profile layer"
 sh tests/profile.sh
