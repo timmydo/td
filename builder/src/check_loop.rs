@@ -716,11 +716,13 @@ fn try_fetch_harness(root: &Path, hdir: &Path, tb: &str) {
     let bin = std::env::var("TD_SUBST_BIN").unwrap_or_else(|_| format!("{store}/td-subst"));
     let pub_key = std::env::var("TD_SUBST_PUBKEY")
         .unwrap_or_else(|_| root.join("tests/td-subst.pub").to_string_lossy().into_owned());
-    // Cheap negatives — a usable store carries the signed harness narinfo + a td-subst binary +
-    // the pinned anchor. Any missing piece → no fetch (the caller then fails closed).
+    // Cheap negatives — a usable store carries the signed harness narinfo + the pinned anchor.
+    // Any missing piece → no fetch (the caller then fails closed). The td-subst bin is NOT
+    // file-checked when it is a bare PATH name (resolve-harness just execs $TD_SUBST_BIN, exactly
+    // like resolve-toolchain); only a path-shaped bin that is absent is a cheap skip.
     if !Path::new(&store).join("td-harness.narinfo").is_file()
-        || !Path::new(&bin).is_file()
         || !Path::new(&pub_key).is_file()
+        || (bin.contains('/') && !Path::new(&bin).is_file())
     {
         return;
     }
