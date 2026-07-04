@@ -17,7 +17,7 @@
 //! --version (the binary loads + runs self-contained — their function is the rust-<tool>
 //! gates' job).
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -32,7 +32,16 @@ pub fn gate() -> GateDef {
         // red: "no td-recipe-eval sentinel" before this flag; green after).
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils the shared
+        // crate-free-build.sh harness consumes — resolved by the runner from
+        // this gate's lock.
+        // (This gate ships several tools, each via its own lock; every one of
+        // those locks pins the IDENTICAL coreutils entry, so one declaration
+        // covers all the harness invocations byte-identically.)
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/fd.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
@@ -47,6 +56,8 @@ export GUIX="$TD_GUIX" ROOT="$PWD"; \
 ship() { \
   name=$1; cratedir=$2; lock=$3; skey=$4; recipe=$5; bin=$6; expect=$7; shift 7; \
   echo ">> [$bin] build guix-free (crate-free-build) + ship via td-native OCI image"; \
+  lc=`grep -- '-coreutils-' "$lock" | sed 's/^[^ ]* //' | head -1`; \
+  test "x$lc" = "x$TD_GATE_INPUT_COREUTILS" || { echo "FAIL: $lock coreutils ($lc) diverged from the declared input ($TD_GATE_INPUT_COREUTILS) — the per-lock-identical premise of this gate's single declaration broke; update the inputs" >&2; return 1; }; \
   nsout=`sh tests/crate-free-build.sh "$name" "$cratedir" "$lock" "$skey" "$recipe"` || return 1; \
   eval "$nsout"; \
   test -x "$NS/bin/$bin" || { echo "FAIL: no td-built $bin at $NS/bin/$bin" >&2; return 1; }; \

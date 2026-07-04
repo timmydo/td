@@ -12,7 +12,7 @@
 //! [DURABLE behavioral] the ONE multicall `coreutils` binary dispatches mkdir/cp/cat/ls/mv/rm.
 //! [DURABLE repro] td-builder check double-build agrees the 507-crate build is reproducible.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,7 +21,13 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils the shared
+        // crate-free-build.sh harness consumes — resolved by the runner from
+        // this gate's lock.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/uutils-coreutils.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

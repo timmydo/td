@@ -14,7 +14,7 @@
 //! OCI `create` subcommand (a real OCI runtime CLI).
 //! [DURABLE repro] td-builder check double-build agrees the 663-crate build is reproducible.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,7 +23,13 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the scrubbed-PATH coreutils the shared
+        // crate-free-build.sh harness consumes — resolved by the runner from
+        // this gate's lock.
+        inputs: &[ArtifactInput {
+            name: "coreutils",
+            kind: InputKind::LockEntry { lock: "tests/youki.lock", stem: "coreutils" },
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

@@ -45,8 +45,11 @@ done
 test "$miss" -eq 0 || { echo "FAIL: $miss vendored crate(s) not pinned by $name's Cargo.lock" >&2; exit 1; }
 echo "  [DURABLE supply-chain] all $ncrate vendored crates' sha256 are checksums pinned in $name's shipped Cargo.lock (== the upstream crates.io cksum the cargo-proxy verified — the guix-free oracle)" >&2
 
-cu=$(grep -- '-coreutils-' "$lock" | sed 's/^[^ ]* //' | head -1)
-test -n "$cu" || { echo "ERROR: no coreutils in $lock for the scrubbed PATH" >&2; exit 1; }
+# coreutils is a DECLARED gate input (#353): every consuming gate declares it
+# from its own lock (all corpus locks pin the identical coreutils entry) and
+# the runner resolved it — no lock-grepping here.
+cu=${TD_GATE_INPUT_COREUTILS:-}
+test -n "$cu" || { echo "ERROR: TD_GATE_INPUT_COREUTILS unset — run via td-builder gate-run, which resolves the gate's declared inputs" >&2; exit 1; }
 if ls "$cu/bin" | grep -qE '^(guix|guile)$'; then echo "FAIL: guix/guile on the scrubbed PATH" >&2; exit 1; fi
 
 scratch="$root/.td-build-cache/$name-crate-free"; rm -rf "$scratch"; mkdir -p "$scratch/tmp" "$scratch/sd"
