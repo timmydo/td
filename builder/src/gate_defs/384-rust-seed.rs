@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): the Rust engine builds from the frozen rust seed alone
         non_blocking: true,
         script: r##"

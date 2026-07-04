@@ -32,6 +32,7 @@ pub fn gate() -> GateDef {
         // red: "no td-recipe-eval sentinel" before this flag; green after).
         build_gate: true,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

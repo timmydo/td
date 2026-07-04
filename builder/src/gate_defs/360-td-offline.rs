@@ -20,6 +20,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): offline probe — warm state would mask a network reach
         non_blocking: true,
         script: r##"

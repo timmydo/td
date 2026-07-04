@@ -17,7 +17,7 @@
 //! well-formed). A BUILD_GATE like td-subst: builds td-subst from source, ordered after the
 //! build-recipes phase.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,6 +26,28 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        // Typed artifact inputs (#353, first cutover): the runner resolves these
+        // and exports TD_GATE_INPUT_{COREUTILS,BASH_STATIC}; the body's own
+        // `grep LOCK | head -1` / `store-closure-scan | grep` wiring is deleted.
+        inputs: &[
+            // the hermetic PATH for the env -i legs (was: grep -- '-coreutils-'
+            // tests/td-subst.lock | head -1)
+            ArtifactInput {
+                name: "coreutils",
+                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
+            },
+            // the runnable no-interp fixture interned at the lock-keyed path
+            // (was: grep -- '-bash-' | grep -v static on hello-no-guix.lock →
+            // store-closure-scan → grep -- '-bash-static-' | head -1)
+            ArtifactInput {
+                name: "bash-static",
+                kind: InputKind::ClosureMember {
+                    lock: "tests/hello-no-guix.lock",
+                    root_stem: "bash",
+                    member_stem: "bash-static",
+                },
+            },
+        ],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

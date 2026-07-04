@@ -80,6 +80,40 @@ pub enum StoreMode {
     Private,
 }
 
+/// A TYPED artifact input (#353): a store-path artifact the gate's body
+/// consumes, declared on the GateDef instead of derived by shell inside it.
+/// The runner resolves each declaration (gate_inputs.rs) BEFORE the script
+/// body runs and exports the path as `TD_GATE_INPUT_<NAME>` (upper-cased,
+/// `-`→`_`); an unresolvable input (missing lock, no match, ambiguous match)
+/// REDS the gate without running its body. This replaces the per-gate
+/// `grep -- '-<stem>-' LOCK | head -1` / `store-closure-scan | grep | head -1`
+/// wiring and makes the gate's artifact dependencies inspectable
+/// (`gate-run list-gates` prints them).
+#[derive(Clone, Copy, Debug)]
+pub struct ArtifactInput {
+    /// The env handle: the body reads `TD_GATE_INPUT_<name upper-snake>`.
+    pub name: &'static str,
+    pub kind: InputKind,
+}
+
+/// How an ArtifactInput is resolved (gate_inputs::resolve).
+#[derive(Clone, Copy, Debug)]
+pub enum InputKind {
+    /// The UNIQUE entry of a td lock whose PATH names package `stem` —
+    /// exact-package matching on the basename after the 32-char hash
+    /// (`bash` matches `…-bash-5.2.37`, never `…-bash-static-5.2.37`), and
+    /// two matches are an error, never a silent first-wins.
+    LockEntry { lock: &'static str, stem: &'static str },
+    /// The UNIQUE member naming `member_stem` in the CONTENT-SCANNED runtime
+    /// closure of the lock entry naming `root_stem` (the daemon's
+    /// scanForReferences walk, scanned in the root's own store dir).
+    ClosureMember {
+        lock: &'static str,
+        root_stem: &'static str,
+        member_stem: &'static str,
+    },
+}
+
 /// One gate, declared as compiled Rust data in `src/gate_defs/<NNN>-<name>.rs`.
 /// The registry (`build.rs`) collects every file's `gate()` into `all()`.
 pub struct GateDef {
@@ -95,6 +129,9 @@ pub struct GateDef {
     /// Package recipes this gate asserts on — contributed to the build phase
     /// (the former BUILD_SPECS pool).
     pub specs: &'static [&'static str],
+    /// Typed artifact inputs (#353): resolved by the runner before the body
+    /// runs, exported as `TD_GATE_INPUT_<NAME>` — see ArtifactInput.
+    pub inputs: &'static [ArtifactInput],
     /// Shared (warm, the default) vs Private (cold) builder state — see StoreMode.
     pub store: StoreMode,
     /// Non-blocking (allow-failure) tag: when a tagged gate FAILS the runner
@@ -126,6 +163,8 @@ struct Gate {
     /// The def's own spec list, exported to the body as TD_GATE_SPECS — the
     /// single source both the build phase and the gate's assertion loop read.
     specs: Vec<String>,
+    /// Typed artifact inputs (#353), resolved per run — see ArtifactInput.
+    inputs: Vec<ArtifactInput>,
     /// Shared/Private builder state (the #317 flip) — wired into the body's env.
     store: StoreMode,
     /// Allow-failure tag (see GateDef::non_blocking): a failure is tolerated
@@ -205,6 +244,23 @@ fn load() -> Result<GateSet, String> {
                 return Err(format!("gate-run: gate `{}`: invalid word `{w}`", def.name));
             }
         }
+        // Input declarations: the name must be a valid env handle and unique
+        // within the gate (two inputs mapping to one TD_GATE_INPUT_* var would
+        // silently shadow each other).
+        for (i, inp) in def.inputs.iter().enumerate() {
+            if !valid_word(inp.name) {
+                return Err(format!(
+                    "gate-run: gate `{}`: invalid input name `{}`",
+                    def.name, inp.name
+                ));
+            }
+            if def.inputs.iter().take(i).any(|o| o.name == inp.name) {
+                return Err(format!(
+                    "gate-run: gate `{}`: duplicate input name `{}`",
+                    def.name, inp.name
+                ));
+            }
+        }
         if index.contains_key(def.name) {
             return Err(format!("gate-run: duplicate gate `{}`", def.name));
         }
@@ -220,6 +276,7 @@ fn load() -> Result<GateSet, String> {
             deps: def.needs.iter().map(|d| d.to_string()).collect(),
             extra_env: Vec::new(),
             specs: def.specs.iter().map(|s| s.to_string()).collect(),
+            inputs: def.inputs.to_vec(),
             store: def.store,
             non_blocking: def.non_blocking,
         });
@@ -266,6 +323,7 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
         deps: last_cheap.iter().cloned().collect(),
         extra_env: vec![("TD_BUILD_SPECS".to_string(), set.build_specs.join(" "))],
         specs: Vec::new(),
+        inputs: Vec::new(),
         store: StoreMode::Shared,
         // build-recipes builds the corpus via the guix-seeded daemon — it fails
         // when host guix != pin, so it is non-blocking too (its SoftFailed still
@@ -783,6 +841,27 @@ fn run_gate(
         }
     };
     timing_event(timing, &g.name, "START");
+    // Typed artifact inputs (#353): resolve every declaration BEFORE the body
+    // runs. A failure reds the gate with the reason in its log — the body
+    // never starts on a missing/misdeclared input.
+    let mut input_env: Vec<(String, String)> = Vec::new();
+    for inp in &g.inputs {
+        match crate::gate_inputs::resolve(root, inp) {
+            Ok(p) => {
+                let _ = writeln!(logf, "[gate-run] {}: input {} = {p}", g.name, inp.name);
+                input_env.push((crate::gate_inputs::env_var(inp.name), p));
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    logf,
+                    "gate-run: FAIL: gate {}: cannot resolve declared input `{}`: {e}",
+                    g.name, inp.name
+                );
+                timing_event(timing, &g.name, "END");
+                return false;
+            }
+        }
+    }
     // Cgroup mode (primary when delegated): the BODY self-moves into the gate's
     // cgroup before anything else runs — written by the child itself, so there
     // is no parent-side move race with early forks.
@@ -840,6 +919,9 @@ fn run_gate(
         }
         if !g.specs.is_empty() {
             cmd.env("TD_GATE_SPECS", g.specs.join(" "));
+        }
+        for (k, v) in &input_env {
+            cmd.env(k, v);
         }
         for (k, v) in &g.extra_env {
             cmd.env(k, v);
@@ -1267,6 +1349,27 @@ fn print_pools(set: &GateSet) {
     line("system", Pool::System);
     line("engine", Pool::Engine);
     line("parked", Pool::Parked);
+    // Declared artifact inputs (#353): the inspectable per-gate dependency
+    // graph the shell wiring used to bury (one line per gate that declares any).
+    for g in &set.gates {
+        if g.inputs.is_empty() {
+            continue;
+        }
+        let decls: Vec<String> = g
+            .inputs
+            .iter()
+            .map(|i| {
+                let d = match &i.kind {
+                    InputKind::LockEntry { lock, stem } => format!("lock-entry({lock}#{stem})"),
+                    InputKind::ClosureMember { lock, root_stem, member_stem } => {
+                        format!("closure-member({lock}#{root_stem} -> {member_stem})")
+                    }
+                };
+                format!("{}={d}", crate::gate_inputs::env_var(i.name))
+            })
+            .collect();
+        println!("inputs {}: {}", g.name, decls.join(" "));
+    }
 }
 
 /// Re-print the newest run's per-gate table (the former Makefile
@@ -1496,6 +1599,12 @@ mod tests {
         for s in ["hello", "bash", "pcre2"] {
             assert!(set.build_specs.iter().any(|x| x == s), "missing build spec {s}");
         }
+        // Typed artifact inputs (#353): the first cut-over gate declares its
+        // inputs instead of grepping locks in shell.
+        let tsd = set.gates.iter().find(|g| g.name == "toolchain-subst-default").unwrap();
+        assert_eq!(tsd.inputs.len(), 2, "toolchain-subst-default lost its declared inputs");
+        assert!(tsd.inputs.iter().any(|i| i.name == "coreutils"));
+        assert!(tsd.inputs.iter().any(|i| i.name == "bash-static"));
         // The explicit fragment dep survived; the derived graph holds.
         let fs = set.gates.iter().find(|g| g.name == "feed-shared").unwrap();
         assert!(fs.deps.iter().any(|d| d == "td-feed"));
@@ -1530,6 +1639,7 @@ mod tests {
                 deps: deps.iter().map(|d| d.to_string()).collect(),
                 extra_env: Vec::new(),
                 specs: Vec::new(),
+                inputs: Vec::new(),
                 store: StoreMode::Shared,
                 non_blocking: false,
             });
@@ -1641,6 +1751,55 @@ mod tests {
             "an untagged (blocking) failure must still red the run"
         );
         assert!(!d2.join("after.ran").exists(), "blocking failure must fail-fast the dependent");
+    }
+
+    #[test]
+    fn a_declared_input_is_resolved_and_exported_to_the_body() {
+        // Drive the REAL runner path: the gate's body sees the resolved path in
+        // TD_GATE_INPUT_<NAME> and asserts it equals the lock's entry.
+        let d = tmpdir("inputs-env");
+        const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /gnu/store/{H}-make-4.4.1\n"))
+            .unwrap();
+        let mut set = synth(
+            &d,
+            &[(
+                "uses-input",
+                Pool::Cheap,
+                "test \"$TD_GATE_INPUT_MAKE\" = \"/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-make-4.4.1\" && touch {D}/env.ok",
+                &[],
+            )],
+        );
+        let gi = *set.index.get("uses-input").unwrap();
+        set.gates.get_mut(gi).unwrap().inputs = vec![ArtifactInput {
+            name: "make",
+            kind: InputKind::LockEntry { lock: "t.lock", stem: "make" },
+        }];
+        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        assert!(run_selected(&set, &sel, &cfg(&d, 2, None)).unwrap());
+        assert!(d.join("env.ok").exists(), "the body did not see the resolved input");
+    }
+
+    #[test]
+    fn an_unresolvable_input_reds_the_gate_without_running_its_body() {
+        // The verified-red half of #353: a misdeclared input (a stem the lock
+        // does not carry) fails the gate BEFORE the body starts.
+        let d = tmpdir("inputs-red");
+        const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /gnu/store/{H}-make-4.4.1\n"))
+            .unwrap();
+        let mut set = synth(&d, &[("bad-input", Pool::Cheap, "touch {D}/ran", &[])]);
+        let gi = *set.index.get("bad-input").unwrap();
+        set.gates.get_mut(gi).unwrap().inputs = vec![ArtifactInput {
+            name: "gawk",
+            kind: InputKind::LockEntry { lock: "t.lock", stem: "gawk" },
+        }];
+        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        assert!(!run_selected(&set, &sel, &cfg(&d, 2, None)).unwrap());
+        assert!(!d.join("ran").exists(), "the body must not run on an unresolvable input");
+        // The reason lands in the gate's log, not just a generic exit.
+        let log = std::fs::read_to_string(d.join("logs/bad-input.log")).unwrap();
+        assert!(log.contains("cannot resolve declared input `gawk`"), "log: {log}");
     }
 
     #[test]
@@ -1882,6 +2041,7 @@ mod tests {
             deps: Vec::new(),
             extra_env: Vec::new(),
             specs: Vec::new(),
+            inputs: Vec::new(),
             store: StoreMode::Shared,
             non_blocking: false,
         });

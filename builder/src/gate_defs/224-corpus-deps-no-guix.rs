@@ -36,6 +36,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &["libsigsegv", "libunistring", "pcre2", "ncurses", "readline"],
+        inputs: &[],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

@@ -21,6 +21,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
+        inputs: &[],
         // Private: the gate must exercise its OWN throwaway cache, never the machine-wide
         // one (it poisons entries on purpose).
         store: StoreMode::Private,

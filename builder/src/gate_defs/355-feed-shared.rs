@@ -23,6 +23,7 @@ pub fn gate() -> GateDef {
         needs: &["td-feed"],
         build_gate: false,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"

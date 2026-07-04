@@ -19,6 +19,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): the loop container stands up from a SEED alone
         non_blocking: true,
         script: r##"

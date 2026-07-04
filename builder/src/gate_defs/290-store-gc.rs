@@ -27,6 +27,7 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
+        inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): GC semantics assert exact contents of a fresh fixture store
         non_blocking: true,
         script: r##"
