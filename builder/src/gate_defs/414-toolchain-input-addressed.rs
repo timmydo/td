@@ -12,7 +12,7 @@
 //! store-ns own-root, /gnu/store absent). Heavy: builds the guix-free stage0 td-builder +
 //! runs a rootless userns (like store-native-profile). NOT a BUILD_GATE.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,7 +21,17 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // Typed artifact input (#353): the runnable static-bash fixture from
+        // hello's pinned closure — resolved by the runner, no lock-grepping or
+        // store-closure-scan in the body.
+        inputs: &[ArtifactInput {
+            name: "bash-static",
+            kind: InputKind::ClosureMember {
+                lock: "tests/hello-no-guix.lock",
+                root_stem: "bash",
+                member_stem: "bash-static",
+            },
+        }],
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
