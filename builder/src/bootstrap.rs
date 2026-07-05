@@ -675,9 +675,8 @@ fn sha256_file(p: &Path) -> io::Result<String> {
     Ok(to_base16(&h.finalize()))
 }
 
-// pub(crate): also the per-file half of build::require_no_gnu_store, the stage0
-// seed rung's output seal (#378) — ONE predicate for the north-star "no guix
-// bytes" invariant, not a copy per module.
+// pub(crate): also the per-file half of build::require_no_gnu_store (#378) —
+// ONE copy of the north-star "no guix bytes" predicate.
 pub(crate) fn contains_gnu_store(p: &Path) -> io::Result<bool> {
     let bytes = fs::read(p)?;
     Ok(find_sub(&bytes, b"/gnu/store"))

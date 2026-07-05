@@ -22,12 +22,9 @@ fn arr(xs: &[String]) -> Json {
 }
 
 /// Build systems td knows how to lower (mirrors `BuildSystem` in td-spec.d.ts).
-/// `Stage0` is the SEED build system (#378): the engine places the pinned
-/// stage0-posix tree (the recipe's lock-supplied source) in the build sandbox and
-/// execs its kaem interpreter — the only place a raw binary seed is exec'd, an
-/// engine primitive so the toolchain recipe graph is total (no imperative shell).
-/// (Named `stage0`, not `seed`: the `seed` word is taken by the lock input class
-/// and the guix seed store.)
+/// `Stage0` is the SEED executor (#378) — see the engine's build::run_stage0.
+/// (Named `stage0`, not `seed`: `seed` is taken by the lock input class and the
+/// guix seed store.)
 #[derive(Clone)]
 pub enum BuildSystem {
     Gnu,

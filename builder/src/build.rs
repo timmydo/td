@@ -1417,11 +1417,8 @@ fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// Scan a tree for `/gnu/store` in any regular file's CONTENTS or any symlink's
-/// TARGET; the first hit is an error. The stage0 SEAL's output half: a guix byte
-/// in the seed rung's output reds the BUILD, in the engine, not just a downstream
-/// gate. (Symlink targets are scanned explicitly — a `grep -r` style content walk
-/// misses a dangling symlink into /gnu/store; the per-file predicate is
-/// bootstrap::contains_gnu_store, the crate's one copy.)
+/// TARGET (a grep-style content walk misses a dangling guix symlink); first hit
+/// errors. The stage0 seal's output half, enforced in the ENGINE per build.
 fn require_no_gnu_store(dir: &Path) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
     for entry in entries {
@@ -1453,31 +1450,19 @@ fn require_no_gnu_store(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// stage0-build — td's stage0-posix SEED build "system" (sibling of `run`, the
-/// autotools runner; #378 slice 1). The seed rung of the /td/store toolchain as a
-/// recipe: TD_SRC is the interned seed/stage0 tree (stage0-posix-x86, pinned —
-/// seed/stage0/README.md); this runner places a writable copy, marks the two
-/// binary seeds executable, and execs the kaem interpreter over the two vendored
-/// build scripts:
+/// stage0-build — td's stage0-posix SEED build "system" (#378 slice 1; sibling of
+/// `run`/`run_rust`/`run_cmake`). TD_SRC is the interned seed/stage0 tree: place a
+/// writable copy, mark the two binary seeds executable, exec the kaem interpreter
+/// over the two vendored scripts (hex0-seed → … → M2, blood-elf-0, kaem-0 → M1,
+/// hex2, kaem), install AMD64/{bin,artifact} into $out. The ONLY place a raw
+/// binary seed is exec'd — an engine BuildSystem, so the recipe graph is total.
 ///
-///   kaem-optional-seed AMD64/mescc-tools-seed-kaem.kaem  (hex0 → … → M2, blood-elf-0, kaem-0)
-///   kaem-0             AMD64/mescc-tools-mini-kaem.kaem  (M2 → M1, hex2, kaem)
-///
-/// then installs the built tool dirs (AMD64/bin + AMD64/artifact) into $out. This
-/// is the ONLY place a raw binary seed is exec'd — an engine BuildSystem, so the
-/// toolchain recipe graph is total (no imperative shell outside the engine).
-///
-/// The SEAL (no /gnu/store leaks into the seed build): the recipe has NO build
-/// inputs (assemble_recipe_drv enforces it — the 229-byte hex0-seed + 618-byte
-/// kaem-optional-seed need nothing), so the copy/install run natively in Rust
-/// (there is no coreutils in this sandbox); the kaem steps run with an EMPTY
-/// environment (the chain's `env -i`, now engine policy — no PATH, no store path
-/// reaches the seed processes) and reference only paths inside their own tree;
-/// and the installed output is scanned — any `/gnu/store` byte REDS the build
-/// here in the engine. What still enters the sandbox mount-wise is td-builder's
-/// OWN runtime closure (this binary's libc — the host-seed exception, gone when
-/// td-builder self-hosts on the recipe-built toolchain); the empty env keeps it
-/// unreachable by the build.
+/// The SEAL: no build inputs (assemble_recipe_drv hard-errors on any), so the
+/// copy/install are native Rust (no coreutils in this sandbox); the kaem steps
+/// run with an EMPTY env (`env -i` as engine policy); and any /gnu/store byte or
+/// symlink target in the output REDS the build HERE. The one /gnu/store still
+/// staged is td-builder's own runtime libc (the host seed) — unreachable by the
+/// env-cleared build; retires when td-builder self-hosts on the recipe toolchain.
 pub fn run_stage0() -> Result<(), String> {
     let out = env::var("out").map_err(|_| "out not set".to_string())?;
     let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;

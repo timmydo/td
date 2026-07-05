@@ -1992,12 +1992,9 @@ fn assemble_recipe_drv(
         "cmake" => {
             spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
         }
-        // stage0: the SEED rung is sealed — source + builder are its WHOLE closure.
-        // ANY other build material is a hard error, never a silently-ignored field:
-        // a seed/td-recipe-output input OR a crate-class entry/vendored tree would
-        // smuggle a store path into the seed sandbox, and configureFlags/phases have
-        // no runner here (run_stage0 reads only TD_SRC/out) so accepting them would
-        // silently drop declared behavior.
+        // stage0: sealed — source + builder are the WHOLE closure. Any other build
+        // material (inputs, crates/vendor tree) or unrunnable field (configureFlags/
+        // phases — run_stage0 reads only TD_SRC/out) is a hard error, never ignored.
         "stage0" => {
             if !inputs.is_empty() {
                 return Err(format!(
@@ -6159,10 +6156,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        // td's stage0-posix SEED build system (#378): places a writable copy of the
-        // TD_SRC seed tree and execs its kaem interpreter over the vendored build
-        // scripts, installing the built mescc-tools into $out. Sibling of
-        // autotools-build/rust-build/cmake-build; same env-driven contract.
+        // td's stage0-posix SEED build system (#378): see build::run_stage0.
+        // Sibling of autotools-build/rust-build/cmake-build; same env contract.
         Some("stage0-build") if args.len() == 2 => match build::run_stage0() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

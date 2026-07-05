@@ -2,8 +2,7 @@
 # tests/bootstrap-chain.sh — the SHARED from-seed modern-toolchain chain, sourced by the
 # bootstrap-*-store-native gates (extracted verbatim from the per-gate inline chain so the ~850-line
 # seed→…→gcc-14.3.0+binutils-2.44+glibc-2.41 build lives in ONE place). The caller sets `set -eu` +
-# ROOT=$(pwd), runs load_stage0 (tests/cache-lib.sh — the chain needs $TB + TD_BUILDER_* for warm
-# brick NAR-verification, #317, AND for the stage0 recipe rung, #378),
+# ROOT=$(pwd), runs load_stage0 ($TB + TD_BUILDER_* — #317 warm verify + the #378 recipe rung),
 # sources this, then calls `bootstrap_modern_toolchain`, which builds the whole chain
 # from the 229-byte seed, verifies it carries no /gnu/store, and leaves these GLOBALS set for the gate:
 #   GCC14        = the gcc 14.3.0 prefix (…/stage/td/store/gcc-14.3.0)
@@ -11,8 +10,7 @@
 #   BMB244SB     = the sandbox-runnable binutils 2.44 build dir (…/out/bin has as/ld/readelf)
 #   CC1, cpath, KH_TB + the intermediate build dirs (the EXIT trap cleans them).
 # Originally a pure code-move of the per-gate inline chain. The SEED rung (brick 0+1) is now a
-# RECIPE built by the engine (`build_stage0_recipe`, #378 slice 1) — byte-identical tools, no
-# build_* shell for that rung; the later rungs migrate to recipes slice by slice (#378).
+# RECIPE built by the engine (#378 slice 1); the later rungs migrate to recipes slice by slice.
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 # Parallelism for the MODERN rungs (gcc 14 / glibc 2.41 / binutils 2.44 — robust guix make with MAKEFLAGS
@@ -39,16 +37,11 @@ make_curated_path() { # $1 (optional): a stable parent dir — warm mode reuses 
   IFS=$oldifs; echo "$cdir"
 }
 # --- brick 0+1: the stage0/mescc-tools SEED RUNG is a RECIPE (#378 slice 1) -----------------------
-# `td-builder build-recipe` builds the `stage0` catalog recipe (recipes/src/recipes/stage0.rs)
-# with the engine's `stage0` BuildSystem — the seed executor and its SEAL live in the engine, see
-# build::run_stage0's doc (builder/src/build.rs) for the canonical telling; the old
-# `build_toolchain` shell fn is DELETED. Output = $out/AMD64/{bin,artifact}, the exact layout the
-# downstream rungs read; at migration the recipe-built tools were proven BYTE-IDENTICAL to the
-# shell fn's (see the PR). Asserted per cold build below: double-build NAR-identical (directive 1),
-# zero /gnu/store bytes in the .drv, and exactly the 2 /td/store closure roots (source + builder —
-# the engine rejects any other build material). Sets the globals `tc` (the output tree) + `TC_W`
-# (the recipe work dir, for the cold-mode EXIT trap) — called PLAINLY, not via command
-# substitution, so they persist. Requires load_stage0 first ($TB + TD_BUILDER_*).
+# `td-builder build-recipe` over the `stage0` catalog recipe; executor + SEAL live in the engine
+# (build::run_stage0 — the canonical doc). Replaces the deleted `build_toolchain` shell fn with
+# BYTE-IDENTICAL tools (proven at migration, PR #383). Cold-build asserts: double-build
+# NAR-identical (directive 1); drv guix-free; exactly the 2 /td/store closure roots (source +
+# builder). Sets globals `tc` + `TC_W` (called PLAINLY — not via command substitution).
 build_stage0_recipe() {
   test -n "${TB:-}" -a -n "${TD_BUILDER_PATH:-}" -a -n "${TD_BUILDER_STORE:-}" \
     || { echo "build_stage0_recipe: run load_stage0 (tests/cache-lib.sh) first — the seed rung needs \$TB + TD_BUILDER_*" >&2; return 1; }
@@ -76,10 +69,8 @@ build_stage0_recipe() {
   _h1=`"$TB" nar-hash "$TC_W/r1/newstore/$_b"` || { echo "nar-hash r1 failed" >&2; return 1; }
   _h2=`"$TB" nar-hash "$TC_W/r2/newstore/$_b"` || { echo "nar-hash r2 failed" >&2; return 1; }
   test "$_h1" = "$_h2" || { echo "stage0 recipe NOT reproducible ($_h1 != $_h2)" >&2; return 1; }
-  # [sealed] zero /gnu/store bytes in the assembled drv; the /td/store closure roots are exactly
-  # the interned source + the builder-of-record (the engine already rejects any build input).
-  # `set --` pins the drv file FIRST: an unmatched glob would make the grep exit 2 (open error)
-  # and the `if` silently pass — the seal must fail closed, not vacuously green.
+  # [sealed] drv guix-free + exactly the 2 /td/store closure roots. `set --` pins the drv file
+  # FIRST — on an unmatched glob grep exits 2 and an `if grep` would pass vacuously.
   set -- "$TC_W/r1"/*.drv
   test -f "$1" || { echo "no assembled .drv in the r1 scratch ($TC_W/r1)" >&2; return 1; }
   if grep -q '/gnu/store' "$1"; then echo "stage0 drv carries /gnu/store bytes" >&2; return 1; fi
@@ -928,11 +919,8 @@ bootstrap_modern_toolchain() {
 # stale brick.
 . tests/chain-cache-lib.sh
 TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
-# (The seed rung is a RECIPE now — #378 slice 1 — so the RECIPE SURFACE that determines its
-# emitted JSON re-keys the chain: recipes/src/recipes/stage0.rs AND recipes/src/types.rs (the
-# lowering — a to_json change alters the drv just as surely as the recipe file). A change to the
-# ENGINE's run_stage0 itself does NOT re-key — like every engine change it is healed by the daily
-# force-cold backstop, #317.)
+# (The recipe SURFACE re-keys the chain — stage0.rs + types.rs determine the seed rung's emitted
+# JSON/drv; ENGINE changes (run_stage0) do not re-key and are healed by the daily force-cold, #317.)
 chain_cache_init chain tests/bootstrap-chain.sh channels.scm recipes/src/recipes/stage0.rs recipes/src/types.rs seed/sources/*.lock seed/patches/* `find seed/stage0 -type f | sort` \
   || fail "chain-cache: the requested warm brick cache is unusable (see message above)"
 # brick8's elf-set-interp rewrites PT_INTERP IN PLACE (shrink-or-equal; td's elf.rs has no patchelf-style
@@ -1047,9 +1035,7 @@ echo "   [pinned-input] + binutils-2.44/glibc-2.41 (the modern toolchain final p
 if [ "$CHAIN_WARM" = 1 ]; then cpath=`make_curated_path "$CHAIN_DIR/cpath"`; else cpath=`make_curated_path`; fi
 for bad in gcc g++ cc guile guix; do test ! -e "$cpath/$bad" || fail "curated PATH still exposes '$bad'"; done
 if chain_hit tc; then tc=$CHAIN_PATH; else
-  # cold only: the recipe JSON is emitted from the Rust catalog (td-recipe-eval — the
-  # build-recipes prelude's sentinel in a full check; built on demand for a standalone gate,
-  # the same fallback the hello gate's brick 8 uses).
+  # cold only: emit the recipe from the Rust catalog (the brick-8 fallback pattern).
   command -v load_recipe_eval >/dev/null 2>&1 || . tests/cache-lib.sh
   load_recipe_eval 2>/dev/null || {
     sh tests/recipe-eval-tool.sh "$ROOT/.td-build-cache/recipe-eval" >/dev/null || fail "could not build td-recipe-eval (tests/recipe-eval-tool.sh)"
@@ -1057,15 +1043,12 @@ if chain_hit tc; then tc=$CHAIN_PATH; else
   }
   build_stage0_recipe || fail "the seed rung (stage0 recipe, brick 0+1) did not build"
   chain_save tc "$tc" "$tc/$A/bin" "$tc/$A/artifact"; fi
-# The recipe rung is AMD64-only by upstream layout (run_stage0 hardcodes it); tie it to the
-# chain's $A knob so an arch flip fails HERE, not as an opaque mes failure three rungs later.
+# The recipe rung is AMD64-only (run_stage0); tie it to the chain's $A knob so an arch flip
+# fails HERE, not as an opaque mes failure three rungs later. The output no-guix seal is the
+# ENGINE's, enforced per build (require_no_gnu_store, contents + symlink targets, unit-tested);
+# warm reuse is NAR-verified against that sealed build (gate-level duplicate greps dropped at
+# the maintainer's direction, PR #383).
 test -d "$tc/$A/bin" -a -d "$tc/$A/artifact" || fail "stage0 recipe output lacks $A/{bin,artifact} (run_stage0 builds AMD64 only)"
-# [no-guix] the seed rung's output — re-asserted on EVERY run, warm or cold (#317: reuse skips
-# redundant rebuilds, never assertions). Both halves: file CONTENTS (grep -r) and symlink
-# TARGETS (find/readlink — grep -r reads contents only, so a dangling guix symlink would slip
-# past it; the engine's run_stage0 scan covers both at build time, this is the per-run gate half).
-if grep -r -q -a '/gnu/store' "$tc" 2>/dev/null; then fail "stage0 output carries /gnu/store bytes"; fi
-if find "$tc" -type l -exec readlink {} \; 2>/dev/null | grep -q '/gnu/store'; then fail "stage0 output symlinks into /gnu/store"; fi
 if chain_hit mes; then mesp=$CHAIN_PATH; else
   mesp=`build_mes_prefix "$tc" "$cpath"` || fail "Mes (MesCC self-host) did not build/install"
   chain_save mes "$mesp" "$mesp"; fi
