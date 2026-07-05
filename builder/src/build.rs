@@ -1829,6 +1829,47 @@ mod tests {
     }
 
     #[test]
+    fn mesboot_template_expands_tokens_and_passes_foreign_braces_verbatim() {
+        // The rung seds carry brace text (`${vdso_symver//./_}`) that must NOT
+        // expand; recognised tokens must; an unknown {in:X} is a hard error.
+        let ctx = StepCtx {
+            root: "/r".into(),
+            src: "/r/src".into(),
+            out: "/o".into(),
+            tools: "/r/tools".into(),
+            jobs: "4".into(),
+            inputs: vec![("mes".into(), "/td/store/abc-mes".into())],
+        };
+        assert_eq!(
+            ctx.expand("{in:mes}/bin -j{jobs} {src}").unwrap(),
+            "/td/store/abc-mes/bin -j4 /r/src"
+        );
+        assert_eq!(
+            ctx.expand("s,${vdso_symver//./_},x,").unwrap(),
+            "s,${vdso_symver//./_},x,"
+        );
+        let err = ctx.expand("{in:nope}/bin").expect_err("unknown input reds");
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn mesboot_glob_one_star_matches_sorted_and_rejects_bad_patterns() {
+        let d = std::env::temp_dir().join(format!("td-glob-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        for f in ["b.o", "a.o", "c.txt"] {
+            fs::write(d.join(f), b"x").unwrap();
+        }
+        let pat = format!("{}/*.o", d.display());
+        let mut hits = glob_one_star(&pat).unwrap();
+        hits.sort();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits[0].ends_with("/a.o") && hits[1].ends_with("/b.o"), "{hits:?}");
+        assert!(glob_one_star("no-star-here").is_err());
+        assert!(glob_one_star("two/*st*ars").is_err());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn stage0_output_seal_reds_a_gnu_store_byte_and_passes_a_clean_tree() {
         // The stage0 SEAL's output half (#378): any /gnu/store byte in the seed
         // rung's output must red the BUILD in the engine. Verified-red by
