@@ -24,13 +24,16 @@ fn arr(xs: &[String]) -> Json {
 /// Build systems td knows how to lower (mirrors `BuildSystem` in td-spec.d.ts).
 /// `Stage0` is the SEED executor (#378) — see the engine's build::run_stage0.
 /// (Named `stage0`, not `seed`: `seed` is taken by the lock input class and the
-/// guix seed store.)
+/// guix seed store.) `Mesboot` is the bootstrap-RUNG executor (#378 slices 2+3):
+/// the recipe carries typed `steps` (below) and the engine's build::run_mesboot
+/// executes them — the toolchain ladder rungs (mes → tcc → … → glibc-2.41).
 #[derive(Clone)]
 pub enum BuildSystem {
     Gnu,
     Rust,
     Cmake,
     Stage0,
+    Mesboot,
 }
 
 impl BuildSystem {
@@ -40,6 +43,136 @@ impl BuildSystem {
             BuildSystem::Rust => "rust",
             BuildSystem::Cmake => "cmake",
             BuildSystem::Stage0 => "stage0",
+            BuildSystem::Mesboot => "mesboot",
+        }
+    }
+}
+
+/// A bootstrap-rung build STEP (the `mesboot` build system, #378 slices 2+3).
+/// Steps are DATA — the engine (build::run_mesboot) executes them in order; the
+/// only processes spawned are `Run` steps' argv (td interprets NO shell — a
+/// configure script runs because its argv names the declared bash input).
+/// Every string is a TEMPLATE: `{root}` (the build root), `{src}` ({root}/src,
+/// where the primary source is unpacked), `{out}`, `{tools}` (the ToolFarm bin
+/// dir, {root}/tools), and `{in:NAME}` (the store path of lock input NAME).
+/// An unknown token is a hard error at execution.
+#[derive(Clone)]
+pub enum Step {
+    /// Spawn argv[0] with argv[1..]; env EXACTLY as given (cleared otherwise —
+    /// the chain's `env -i` + MAKEFLAGS= scrubbing, as engine policy); cwd=dir.
+    Run {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        dir: String,
+    },
+    /// Symlink name → target under {tools} (the rung's PATH farm; replaces the
+    /// ladder's per-rung `bin/` symlink dirs + `ls /gnu/store/*pkg*` scavenging).
+    ToolFarm { links: Vec<(String, String)> },
+    /// Write a file (wrapper scripts, config.cache, stub makefiles).
+    WriteFile {
+        path: String,
+        content: String,
+        exec: bool,
+    },
+    /// Copy files (flat) into dest, made user-writable (build trees are written into).
+    CopyFiles { files: Vec<String>, dest: String },
+    /// Recursive tree copy (kernel-header overlays, module trees).
+    CopyTree { from: String, dest: String },
+    Symlink { target: String, link: String },
+    MkDir { path: String },
+    /// Rewrite `#!/bin/sh`-style shebangs under dir to the given shell (the
+    /// engine's own patch_shebangs — the sandbox has no /bin/sh).
+    PatchShebangs { dir: String, shell: String },
+    /// Assert products exist (and are executable files if exec) — fail HERE with
+    /// a named path, not three rungs later.
+    Require { paths: Vec<String>, exec: bool },
+}
+
+impl Step {
+    /// `Run` with an empty env; chain `.env()` for each variable.
+    pub fn run(dir: &str, argv: &[&str]) -> Step {
+        Step::Run {
+            argv: vs(argv),
+            env: Vec::new(),
+            dir: dir.into(),
+        }
+    }
+    /// Add one env var to a `Run` (no-op on other variants).
+    pub fn env(self, k: &str, v: &str) -> Step {
+        match self {
+            Step::Run { argv, mut env, dir } => {
+                env.push((k.into(), v.into()));
+                Step::Run { argv, env, dir }
+            }
+            other => other,
+        }
+    }
+    fn to_json(&self) -> Json {
+        let pair_arr = |xs: &[(String, String)]| {
+            Json::Arr(
+                xs.iter()
+                    .map(|(a, b)| Json::Arr(vec![Json::Str(a.clone()), Json::Str(b.clone())]))
+                    .collect(),
+            )
+        };
+        match self {
+            Step::Run { argv, env, dir } => Json::Obj(vec![(
+                "run".into(),
+                Json::Obj(vec![
+                    ("argv".into(), arr(argv)),
+                    ("env".into(), pair_arr(env)),
+                    ("dir".into(), Json::Str(dir.clone())),
+                ]),
+            )]),
+            Step::ToolFarm { links } => {
+                Json::Obj(vec![("toolFarm".into(), pair_arr(links))])
+            }
+            Step::WriteFile { path, content, exec } => Json::Obj(vec![(
+                "writeFile".into(),
+                Json::Obj(vec![
+                    ("path".into(), Json::Str(path.clone())),
+                    ("content".into(), Json::Str(content.clone())),
+                    ("exec".into(), Json::Bool(*exec)),
+                ]),
+            )]),
+            Step::CopyFiles { files, dest } => Json::Obj(vec![(
+                "copyFiles".into(),
+                Json::Obj(vec![
+                    ("files".into(), arr(files)),
+                    ("dest".into(), Json::Str(dest.clone())),
+                ]),
+            )]),
+            Step::CopyTree { from, dest } => Json::Obj(vec![(
+                "copyTree".into(),
+                Json::Obj(vec![
+                    ("from".into(), Json::Str(from.clone())),
+                    ("dest".into(), Json::Str(dest.clone())),
+                ]),
+            )]),
+            Step::Symlink { target, link } => Json::Obj(vec![(
+                "symlink".into(),
+                Json::Obj(vec![
+                    ("target".into(), Json::Str(target.clone())),
+                    ("link".into(), Json::Str(link.clone())),
+                ]),
+            )]),
+            Step::MkDir { path } => {
+                Json::Obj(vec![("mkDir".into(), Json::Str(path.clone()))])
+            }
+            Step::PatchShebangs { dir, shell } => Json::Obj(vec![(
+                "patchShebangs".into(),
+                Json::Obj(vec![
+                    ("dir".into(), Json::Str(dir.clone())),
+                    ("shell".into(), Json::Str(shell.clone())),
+                ]),
+            )]),
+            Step::Require { paths, exec } => Json::Obj(vec![(
+                "require".into(),
+                Json::Obj(vec![
+                    ("paths".into(), arr(paths)),
+                    ("exec".into(), Json::Bool(*exec)),
+                ]),
+            )]),
         }
     }
 }
@@ -358,6 +491,12 @@ pub struct Recipe {
     pub source: Option<Source>,
     pub build_system: BuildSystem,
     pub inputs: Option<Vec<String>>,
+    /// Staged builders (#378): inputs that are themselves td recipes and act as
+    /// this rung's COMPILER/tools — the prior rung's output used to build this
+    /// one (guix's native-inputs). `build-plan --auto` chains them like inputs.
+    pub native_inputs: Option<Vec<String>>,
+    /// The `mesboot` build system's typed step list (#378 slices 2+3).
+    pub steps: Option<Vec<Step>>,
     pub configure_flags: Option<Vec<String>>,
     pub make_flags: Option<Vec<String>>,
     pub outputs: Option<Vec<String>>,
@@ -376,6 +515,8 @@ impl Recipe {
             source: None,
             build_system: bs,
             inputs: None,
+            native_inputs: None,
+            steps: None,
             configure_flags: None,
             make_flags: None,
             outputs: None,
@@ -400,6 +541,20 @@ impl Recipe {
     /// lock's `<name>-source` entry, interned by the caller.
     pub fn stage0(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Stage0)
+    }
+    /// A bootstrap-ladder rung (#378 slices 2+3): typed `steps` executed by the
+    /// engine's build::run_mesboot; `native_inputs` name the prior rungs.
+    pub fn mesboot(name: &str, version: &str) -> Recipe {
+        Recipe::base(name, version, BuildSystem::Mesboot)
+    }
+
+    pub fn native_inputs(mut self, xs: &[&str]) -> Recipe {
+        self.native_inputs = Some(vs(xs));
+        self
+    }
+    pub fn steps(mut self, xs: Vec<Step>) -> Recipe {
+        self.steps = Some(xs);
+        self
     }
 
     pub fn source(mut self, src: Source) -> Recipe {
@@ -462,6 +617,15 @@ impl Recipe {
         ));
         if let Some(x) = &self.inputs {
             o.push(("inputs".into(), arr(x)));
+        }
+        if let Some(x) = &self.native_inputs {
+            o.push(("nativeInputs".into(), arr(x)));
+        }
+        if let Some(x) = &self.steps {
+            o.push((
+                "steps".into(),
+                Json::Arr(x.iter().map(|s| s.to_json()).collect()),
+            ));
         }
         if let Some(x) = &self.configure_flags {
             o.push(("configureFlags".into(), arr(x)));
