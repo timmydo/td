@@ -407,52 +407,69 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
     Ok(())
 }
 
+/// A goal string that selects a whole TIER (a pool or combination of pools)
+/// rather than naming one gate — the single source of truth `expand_goals`
+/// and `explicit_goal_indices` both dispatch on, so the two can't drift apart
+/// (issue #377 review).
+fn is_tier_keyword(goal: &str) -> bool {
+    matches!(goal, "check" | "check-pr" | "check-fast" | "check-system" | "check-engine")
+}
+
 /// Expand the requested goals into the set of node indices to run (make
 /// semantics kept: prerequisites always run, so take the transitive dep closure).
 fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, String> {
     let mut sel: HashSet<usize> = HashSet::new();
     let add_pool = |sel: &mut HashSet<usize>, p: Pool| sel.extend(set.members(p));
     for goal in goals {
-        match goal.as_str() {
-            // check-pr is the bounded per-PR tier (~10 min, human 2026-07-04):
-            // the full check MINUS the daily-only pool — one arm so the subset
-            // relation holds by construction. The daily backstop
-            // (ci/daily-full-suite.sh) runs the full `check`, so the daily pool
-            // keeps its coverage nightly.
-            "check" | "check-pr" => {
-                add_pool(&mut sel, Pool::Cheap);
-                if let Some(i) = set.index.get(BUILD_RECIPES) {
-                    sel.insert(*i);
+        if is_tier_keyword(goal) {
+            match goal.as_str() {
+                // check-pr is the bounded per-PR tier (~10 min, human
+                // 2026-07-04): the full check MINUS the daily-only pool — one
+                // arm so the subset relation holds by construction. The daily
+                // backstop (ci/daily-full-suite.sh) runs the full `check`, so
+                // the daily pool keeps its coverage nightly.
+                "check" | "check-pr" => {
+                    add_pool(&mut sel, Pool::Cheap);
+                    if let Some(i) = set.index.get(BUILD_RECIPES) {
+                        sel.insert(*i);
+                    }
+                    add_pool(&mut sel, Pool::Heavy);
+                    if goal == "check" {
+                        add_pool(&mut sel, Pool::Daily);
+                    }
                 }
-                add_pool(&mut sel, Pool::Heavy);
-                if goal == "check" {
-                    add_pool(&mut sel, Pool::Daily);
+                "check-fast" => {
+                    add_pool(&mut sel, Pool::Cheap);
+                    add_pool(&mut sel, Pool::Fast);
                 }
-            }
-            "check-fast" => {
-                add_pool(&mut sel, Pool::Cheap);
-                add_pool(&mut sel, Pool::Fast);
-            }
-            "check-system" => {
-                add_pool(&mut sel, Pool::Cheap);
-                add_pool(&mut sel, Pool::System);
-            }
-            "check-engine" => {
-                add_pool(&mut sel, Pool::Cheap);
-                add_pool(&mut sel, Pool::Engine);
-            }
-            name => match set.index.get(name) {
-                Some(i) => {
-                    sel.insert(*i);
+                "check-system" => {
+                    add_pool(&mut sel, Pool::Cheap);
+                    add_pool(&mut sel, Pool::System);
                 }
-                None => {
+                "check-engine" => {
+                    add_pool(&mut sel, Pool::Cheap);
+                    add_pool(&mut sel, Pool::Engine);
+                }
+                _ => {
                     return Err(format!(
-                        "gate-run: unknown goal `{name}` — a tier \
-                         (check/check-pr/check-fast/check-system/check-engine), a gate name \
-                         (`td-builder gate-run list-gates`), or build-recipes"
+                        "gate-run: internal error: `{goal}` is a tier keyword with no \
+                         dispatch arm (is_tier_keyword/expand_goals out of sync)"
                     ))
                 }
-            },
+            }
+            continue;
+        }
+        match set.index.get(goal.as_str()) {
+            Some(i) => {
+                sel.insert(*i);
+            }
+            None => {
+                return Err(format!(
+                    "gate-run: unknown goal `{goal}` — a tier \
+                     (check/check-pr/check-fast/check-system/check-engine), a gate name \
+                     (`td-builder gate-run list-gates`), or build-recipes"
+                ))
+            }
         }
     }
     // Transitive closure over deps.
@@ -482,10 +499,7 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
 fn explicit_goal_indices(set: &GateSet, goals: &[String]) -> HashSet<usize> {
     let mut out = HashSet::new();
     for goal in goals {
-        if matches!(
-            goal.as_str(),
-            "check" | "check-pr" | "check-fast" | "check-system" | "check-engine"
-        ) {
+        if is_tier_keyword(goal) {
             continue;
         }
         if let Some(i) = set.index.get(goal.as_str()) {
@@ -1454,8 +1468,23 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
             .filter_map(|(i, _)| set.gates.get(*i).map(|g| g.name.as_str()))
             .collect()
     };
-    // Non-blocking failures are tolerated: reported, but they do NOT red the run.
-    let soft: Vec<&str> = names(St::SoftFailed);
+    // Non-blocking failures are tolerated: reported, but they do NOT red the run
+    // — EXCEPT a SoftFailed gate that is itself the explicit goal (issue #377):
+    // that one is about to red the run below, so it's excluded here rather than
+    // reported as "tolerated" right before a contradictory RED line.
+    let mut soft: Vec<&str> = Vec::new();
+    let mut explicit_soft: Vec<&str> = Vec::new();
+    for (i, st) in s.st.iter() {
+        if *st != St::SoftFailed {
+            continue;
+        }
+        let Some(name) = set.gates.get(*i).map(|g| g.name.as_str()) else { continue };
+        if cfg.explicit_goals.contains(i) {
+            explicit_soft.push(name);
+        } else {
+            soft.push(name);
+        }
+    }
     if !soft.is_empty() {
         eprintln!(
             "gate-run: {} non-blocking gate(s) FAILED but tolerated (not blocking): {}",
@@ -1474,12 +1503,6 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
     });
     if !green {
         let failed = names(St::Failed);
-        let explicit_soft: Vec<&str> = s
-            .st
-            .iter()
-            .filter(|(i, st)| **st == St::SoftFailed && cfg.explicit_goals.contains(*i))
-            .filter_map(|(i, _)| set.gates.get(*i).map(|g| g.name.as_str()))
-            .collect();
         let skipped = s.st.values().filter(|st| **st == St::Pending).count();
         eprintln!(
             "gate-run: RED — failed: {}{}{}",
