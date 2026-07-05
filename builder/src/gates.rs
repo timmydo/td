@@ -475,6 +475,26 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
     }
 }
 
+/// The subset of `goals` naming a gate DIRECTLY (not a tier keyword) — see
+/// `RunCfg::explicit_goals` (issue #377). Deliberately does NOT take the
+/// transitive-dep closure `expand_goals` does: a dependency pulled in to
+/// satisfy an explicit goal is still only along for the ride.
+fn explicit_goal_indices(set: &GateSet, goals: &[String]) -> HashSet<usize> {
+    let mut out = HashSet::new();
+    for goal in goals {
+        if matches!(
+            goal.as_str(),
+            "check" | "check-pr" | "check-fast" | "check-system" | "check-engine"
+        ) {
+            continue;
+        }
+        if let Some(i) = set.index.get(goal.as_str()) {
+            out.insert(*i);
+        }
+    }
+    out
+}
+
 /// Scope the synthetic build-recipes node's TD_BUILD_SPECS to the specs the
 /// SELECTED gates declare, by FILTERING the static `build_specs` accumulation —
 /// order, duplicates, everything about the surviving entries is identical to
@@ -1226,6 +1246,13 @@ struct RunCfg {
     /// switch), else `~/.td/build-daemon/chain`. None (no HOME) leaves the gate
     /// env untouched. Private gates ALWAYS get TD_CHECK_CHAIN_CACHE force-cleared.
     chain_cache: Option<String>,
+    /// Gate indices named DIRECTLY in the invocation's goals (issue #377) —
+    /// e.g. `store-verify` in `td-builder check store-verify` — as opposed to
+    /// pulled in only via a tier keyword or as another goal's dependency. A
+    /// `non_blocking` gate's failure is tolerated (SoftFailed) when it is
+    /// merely along for the ride, but NOT when it IS the goal: asking "is
+    /// this one gate green?" must not silently report green for a red gate.
+    explicit_goals: HashSet<usize>,
 }
 
 /// True when a node contends on the machine-wide pool: everything except the
@@ -1436,15 +1463,39 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
             soft.join(" ")
         );
     }
-    // Green iff every gate ended Done or SoftFailed (no hard Failed, none left
-    // Pending/Running by fail-fast).
-    let green = s.st.values().all(|st| matches!(st, St::Done | St::SoftFailed));
+    // Green iff every gate ended Done, or SoftFailed AND not the explicit goal
+    // (issue #377 — a SoftFailed gate that IS the goal must red the run; one
+    // that's merely along for the ride stays tolerated) — no hard Failed,
+    // none left Pending/Running by fail-fast.
+    let green = s.st.iter().all(|(i, st)| match st {
+        St::Done => true,
+        St::SoftFailed => !cfg.explicit_goals.contains(i),
+        St::Failed | St::Pending | St::Running => false,
+    });
     if !green {
         let failed = names(St::Failed);
+        let explicit_soft: Vec<&str> = s
+            .st
+            .iter()
+            .filter(|(i, st)| **st == St::SoftFailed && cfg.explicit_goals.contains(*i))
+            .filter_map(|(i, _)| set.gates.get(*i).map(|g| g.name.as_str()))
+            .collect();
         let skipped = s.st.values().filter(|st| **st == St::Pending).count();
         eprintln!(
-            "gate-run: RED — failed: {}{}",
-            if failed.is_empty() { "(none — internal error)".to_string() } else { failed.join(" ") },
+            "gate-run: RED — failed: {}{}{}",
+            if failed.is_empty() && explicit_soft.is_empty() {
+                "(none — internal error)".to_string()
+            } else {
+                failed.join(" ")
+            },
+            if !explicit_soft.is_empty() {
+                format!(
+                    " (non-blocking but explicitly requested, so not tolerated: {})",
+                    explicit_soft.join(" ")
+                )
+            } else {
+                String::new()
+            },
             if skipped > 0 { format!(" ({skipped} gates not started)") } else { String::new() }
         );
     }
@@ -1672,6 +1723,7 @@ pub fn cli(args: &[String]) -> ExitCode {
         gate_mem_mib,
         gate_tree_mem_mib,
         chain_cache,
+        explicit_goals: explicit_goal_indices(&set, &goals),
         cgroup_dir: std::env::var("TD_CHECK_CGROUP")
             .ok()
             .filter(|v| !v.is_empty())
@@ -1869,6 +1921,7 @@ mod tests {
             gate_mem_mib: 0,
             gate_tree_mem_mib: 0,
             chain_cache: None,
+            explicit_goals: HashSet::new(),
             cgroup_dir: None,
         }
     }
@@ -1957,6 +2010,35 @@ mod tests {
             "an untagged (blocking) failure must still red the run"
         );
         assert!(!d2.join("after.ran").exists(), "blocking failure must fail-fast the dependent");
+    }
+
+    #[test]
+    fn non_blocking_gate_named_as_the_explicit_goal_reds_the_run() {
+        // Issue #377: `td-builder check store-verify` on a red-but-non_blocking
+        // store-verify must NOT exit 0 — the non_blocking tolerance is for gates
+        // pulled in as a tier member or a dependency, not for the gate the caller
+        // is directly asking about.
+        let d = tmpdir("nonblock-explicit");
+        let mut set = synth(&d, &[("softfail", Pool::Cheap, "exit 7", &[])]);
+        let si = *set.index.get("softfail").unwrap();
+        set.gates.get_mut(si).unwrap().non_blocking = true;
+
+        let sel = expand_goals(&set, &["softfail".to_string()]).unwrap();
+        let mut c = cfg(&d, 4, None);
+        c.explicit_goals = explicit_goal_indices(&set, &["softfail".to_string()]);
+        assert!(
+            !run_selected(&set, &sel, &c).unwrap(),
+            "a non_blocking gate named directly as the goal must red, not silently pass"
+        );
+
+        // Contrast: the SAME gate, selected only via its tier, stays tolerated —
+        // unaffected by this fix (matches the existing test above).
+        let sel_tier = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        let c_tier = cfg(&d, 4, None); // explicit_goals empty: not named directly
+        assert!(
+            run_selected(&set, &sel_tier, &c_tier).unwrap(),
+            "the same gate reached only via a tier must still be tolerated"
+        );
     }
 
     #[test]
