@@ -24,6 +24,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 fn fatal(msg: &str) -> String {
     format!("td-builder check: FATAL: {msg}")
@@ -187,16 +188,77 @@ fn provision_toolchain(root: &Path) -> Result<String, String> {
     Err(fatal("could not provision the loop toolchain PATH (no PATH line)"))
 }
 
-/// Wrap a warm step with `timeout` (TD_WARM_TIMEOUT, default 600s) when
-/// coreutils timeout exists — one hung mirror must not stall the prelude.
+/// A timeout(1)-style duration: bare integer seconds or an integer with an
+/// s/m/h/d suffix. None on anything else (fractions are out of scope).
+fn parse_timeout_secs(v: &str) -> Option<u64> {
+    let (num, mult) = match v.chars().last() {
+        Some('s') => (v.get(..v.len() - 1)?, 1),
+        Some('m') => (v.get(..v.len() - 1)?, 60),
+        Some('h') => (v.get(..v.len() - 1)?, 3600),
+        Some('d') => (v.get(..v.len() - 1)?, 86400),
+        _ => (v, 1),
+    };
+    num.parse::<u64>().ok().and_then(|n| n.checked_mul(mult))
+}
+
+/// The ONE interpretation of TD_WARM_TIMEOUT, shared by every warm step —
+/// the `timeout`-wrapped children (warm_argv) and the native crate warm — so
+/// the knob means one thing across the prelude: seconds (timeout(1) suffixes
+/// s/m/h/d accepted), default 600, `0` disables (None), an unparseable value
+/// warns loudly and takes the default rather than silently diverging.
+fn warm_timeout_secs() -> Option<u64> {
+    let raw = match std::env::var("TD_WARM_TIMEOUT") {
+        Ok(v) => v.trim().to_string(),
+        Err(_) => return Some(600),
+    };
+    match parse_timeout_secs(&raw) {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => {
+            eprintln!(
+                "td-builder check: TD_WARM_TIMEOUT `{raw}` is not seconds (integer, \
+                 s/m/h/d suffix ok) — using the 600s default"
+            );
+            Some(600)
+        }
+    }
+}
+
+/// Wrap a warm step with `timeout` (warm_timeout_secs) when coreutils timeout
+/// exists — one hung mirror must not stall the prelude.
 fn warm_argv(base: &[String]) -> Vec<String> {
-    let secs = std::env::var("TD_WARM_TIMEOUT").unwrap_or_else(|_| "600".to_string());
-    if find_in_path("timeout").is_some() {
-        let mut v = vec!["timeout".to_string(), secs];
-        v.extend(base.iter().cloned());
-        v
-    } else {
-        base.to_vec()
+    match warm_timeout_secs() {
+        Some(secs) if find_in_path("timeout").is_some() => {
+            let mut v = vec!["timeout".to_string(), secs.to_string()];
+            v.extend(base.iter().cloned());
+            v
+        }
+        _ => base.to_vec(),
+    }
+}
+
+/// Wait for a warm child under an optional deadline: block when there is
+/// none; past it (or on a wait error), kill the child and report failure —
+/// a killed child is a failed warm step, never a failed check.
+fn wait_with_deadline(child: &mut std::process::Child, deadline: Option<Instant>) -> bool {
+    let Some(d) = deadline else {
+        return child.wait().map(|st| st.success()).unwrap_or(false);
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) if Instant::now() >= d => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
     }
 }
 
@@ -454,45 +516,183 @@ fn subst_env_at(store: &Path, pubkey: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// A gate's cached td-built binary out of its newstore dir: the
+/// lexicographically-first EXECUTABLE `<newstore>/*/bin/<bin>` — the
+/// deterministic pick the shell's `ls | head -1` made, with the shell's `-x`
+/// requirement kept so a permission-mangled cache entry falls through to the
+/// cargo fallback instead of failing every spawn. None when the cache is cold.
+fn newstore_bin(root: &Path, newstore_rel: &str, bin: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::read_dir(root.join(newstore_rel))
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join("bin").join(bin))
+        .filter(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+        .min()
+}
+
+/// Host-cargo fallback for a warm-prelude tool: `cargo build --release` in
+/// `<dir>/` and return `target/release/<bin>`. None when cargo is absent, the
+/// build fails, or it outlives the warm deadline (a hung cargo — e.g. a stale
+/// target-dir lock — must not stall the prelude; every warm is best-effort,
+/// the gates enforce presence).
+fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) -> Option<PathBuf> {
+    find_in_path("cargo")?;
+    let mut child = Command::new("cargo")
+        .args(["build", "--release", "--quiet"])
+        .current_dir(root.join(dir))
+        .spawn()
+        .ok()?;
+    if !wait_with_deadline(&mut child, deadline) {
+        return None;
+    }
+    let p = root.join(dir).join("target/release").join(bin);
+    p.is_file().then_some(p)
+}
+
+/// One `[[package]]` entry of a Cargo.lock that carries a checksum — `(name,
+/// version, sha256)`. The checksummed entries are the vendored crates-io deps;
+/// the root (path) crate has no checksum and is excluded, exactly the
+/// reduction the retired shell awk did.
+fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
+    fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.strip_prefix(key)?
+            .strip_prefix(" = \"")?
+            .split('"')
+            .next()
+            .filter(|v| !v.is_empty())
+    }
+    let mut out = Vec::new();
+    let (mut name, mut ver): (Option<&str>, Option<&str>) = (None, None);
+    for line in lock.lines() {
+        if line.starts_with("[[package]]") {
+            (name, ver) = (None, None);
+        } else if let Some(v) = field(line, "name") {
+            name = Some(v);
+        } else if let Some(v) = field(line, "version") {
+            ver = Some(v);
+        } else if let Some(sum) = field(line, "checksum") {
+            if let (Some(n), Some(v)) = (name, ver) {
+                out.push((n.to_string(), v.to_string(), sum.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// td-fetch's OWN crate closure (native since this port — was
+/// tools/warm-td-fetch-crates.sh, the prelude's last `sh tools/…` spawn;
+/// #318 axis 2): host-side NETWORK PREP that GETs each `.crate` of
+/// fetch/Cargo.lock GUIX-FREE with td's OWN fetcher (td-fetch), pinned by the
+/// UPSTREAM lock checksum (NOT a guix artifact), into the flat vendor dir the
+/// rust-fetch gate interns and builds td-fetch from (TD_VENDOR_DIR). td-fetch
+/// does every GET — td dogfoods its own fetcher, and td-fetch honors
+/// TD_FEED_BASE so the reads route through the shared feed when it is up.
+/// Best-effort like every warm (no td-fetch binary / no network → warn and
+/// return; the gate reports if it actually runs cold), and the whole warm —
+/// cargo fallback included — shares ONE warm_timeout_secs budget exactly as
+/// the shell's single `timeout` over the script did: one hung mirror must
+/// not stall the prelude.
+fn warm_td_fetch_crates(root: &Path) {
+    let lock_path = root.join("fetch/Cargo.lock");
+    let Ok(lock) = std::fs::read_to_string(&lock_path) else {
+        eprintln!("td-builder check: warm td-fetch crates: no {} — skipping", lock_path.display());
+        return;
+    };
+    let dest = root.join(".td-build-cache/crate-vendor/td-fetch");
+    if std::fs::create_dir_all(&dest).is_err() {
+        eprintln!("td-builder check: warm td-fetch crates: cannot create {} — skipping", dest.display());
+        return;
+    }
+    // The deadline covers the WHOLE warm including a cargo build of the
+    // fetcher, exactly as the shell's one `timeout` over the script did.
+    let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
+    // Locate or build td-fetch (the fetcher), reused across crates.
+    let Some(tdf) = newstore_bin(root, ".td-build-cache/rust-fetch/b/newstore", "td-fetch")
+        .or_else(|| host_cargo_bin(root, "fetch", "td-fetch", deadline))
+    else {
+        eprintln!(
+            "td-builder check: warm td-fetch crates: no td-fetch binary — skipping (PREP best-effort)"
+        );
+        return;
+    };
+    let mut complete = true;
+    for (name, ver, sum) in parse_lock_checksums(&lock) {
+        let nv = format!("{name}-{ver}");
+        let out = dest.join(format!("{nv}.crate"));
+        if crate::sha256::sha256_file(&out).ok().as_deref() == Some(sum.as_str()) {
+            continue; // already warm + verified
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            eprintln!("td-builder check: warm td-fetch crates: TD_WARM_TIMEOUT budget exhausted — stopping");
+            complete = false;
+            break;
+        }
+        let url = format!("https://static.crates.io/crates/{name}/{nv}.crate");
+        // Pid-suffixed tmp: concurrent preludes (normal on this box) each
+        // write their own, so one warm's rename never publishes bytes another
+        // warm is still writing.
+        let tmp = dest.join(format!("{nv}.crate.{}.tmp", std::process::id()));
+        // td-fetch verifies the pin itself; its one success line STREAMS to
+        // our stderr (the shell's `>&2` — a dup'd fd, never a pipe, so a
+        // chatty child cannot deadlock the warm), and a fetch outliving the
+        // budget is killed rather than left to stall the prelude.
+        let mut cmd = Command::new(&tdf);
+        cmd.args(["fetch", &url, &sum]).arg(&tmp).current_dir(root);
+        {
+            use std::os::fd::AsFd as _;
+            if let Ok(err_fd) = std::io::stderr().as_fd().try_clone_to_owned() {
+                cmd.stdout(Stdio::from(err_fd));
+            }
+        }
+        let fetched = match cmd.spawn() {
+            Ok(mut child) => wait_with_deadline(&mut child, deadline),
+            Err(_) => false,
+        };
+        if fetched && crate::sha256::sha256_file(&tmp).ok().as_deref() == Some(sum.as_str()) {
+            let _ = std::fs::rename(&tmp, &out);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!("td-builder check: warm td-fetch crates: could not td-fetch/verify {nv}");
+        }
+    }
+    let n = std::fs::read_dir(&dest)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "crate"))
+                .count()
+        })
+        .unwrap_or(0);
+    eprintln!(
+        "td-builder check: warm td-fetch crates: {n} crates in {} (td-fetched, Cargo.lock-pinned, guix-free){}",
+        dest.display(),
+        if complete { "" } else { " — INCOMPLETE (TD_WARM_TIMEOUT exhausted)" }
+    );
+}
+
 /// The heavy-tier warm prelude: source-bootstrap tarballs + rust crate closures
 /// (td-feed), all BEST-EFFORT (the gates enforce presence), fanned out in
 /// batches of TD_WARM_JOBS exactly as the shell prelude did.
 fn heavy_warms(root: &Path) {
     // td-fetch's own crate closure (its own warm — not the cargo-proxy).
-    let _ = warm_status(&[s("sh"), s("tools/warm-td-fetch-crates.sh")], root, &[]);
+    warm_td_fetch_crates(root);
 
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
     // cargo build of feed/.
-    let mut tdfeed = String::new();
-    if let Ok(entries) = std::fs::read_dir(root.join(".td-build-cache/td-feed/sd/newstore")) {
-        let mut candidates: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path().join("bin/td-feed"))
-            .filter(|p| p.is_file())
-            .collect();
-        candidates.sort();
-        if let Some(p) = candidates.first() {
-            tdfeed = p.display().to_string();
-        }
-    }
-    if tdfeed.is_empty() && find_in_path("cargo").is_some() {
-        let built = Command::new("cargo")
-            .args(["build", "--release", "--quiet"])
-            .current_dir(root.join("feed"))
-            .status()
-            .map(|st| st.success())
-            .unwrap_or(false);
-        if built {
-            tdfeed = root.join("feed/target/release/td-feed").display().to_string();
-        }
-    }
-    if tdfeed.is_empty() || !Path::new(&tdfeed).is_file() {
+    let Some(tdfeed) = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed")
+        .or_else(|| host_cargo_bin(root, "feed", "td-feed", None))
+    else {
         eprintln!(
             "td-builder check: no td-feed binary for the heavy warm (build feed/ with cargo) — \
              skipping (best-effort; the heavy gates enforce presence)"
         );
         return;
-    }
+    };
+    let tdfeed = tdfeed.display().to_string();
 
     // `td-feed warm sources` (serial-first), routed through the ONE shared
     // td-feed serve daemon when `td-feed ensure-serve` can start/reuse it
@@ -1150,5 +1350,87 @@ mod tests {
                 "missing {missing} must expose nothing"
             );
         }
+    }
+
+    #[test]
+    fn parse_timeout_secs_accepts_timeout1_durations() {
+        // Bare seconds and the timeout(1) integer suffixes — the ONE
+        // TD_WARM_TIMEOUT grammar every warm step shares.
+        assert_eq!(parse_timeout_secs("600"), Some(600));
+        assert_eq!(parse_timeout_secs("0"), Some(0));
+        assert_eq!(parse_timeout_secs("90s"), Some(90));
+        assert_eq!(parse_timeout_secs("30m"), Some(1800));
+        assert_eq!(parse_timeout_secs("2h"), Some(7200));
+        assert_eq!(parse_timeout_secs("1d"), Some(86400));
+    }
+
+    #[test]
+    fn parse_timeout_secs_rejects_garbage() {
+        for bad in ["", "s", "m", "-5", "1.5", "5x", "m30", "30 m"] {
+            assert_eq!(parse_timeout_secs(bad), None, "`{bad}` must not parse");
+        }
+    }
+
+    #[test]
+    fn parse_lock_checksums_takes_only_checksummed_packages() {
+        // The root (path) crate carries no checksum and must be excluded; the
+        // vendored crates-io deps carry one each.
+        let lock = "\
+# This file is automatically @generated by Cargo.\n\
+version = 3\n\
+\n\
+[[package]]\n\
+name = \"adler2\"\n\
+version = \"2.0.0\"\n\
+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+checksum = \"512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627\"\n\
+\n\
+[[package]]\n\
+name = \"td-fetch\"\n\
+version = \"0.1.0\"\n\
+dependencies = [\n\
+ \"ureq\",\n\
+]\n\
+\n\
+[[package]]\n\
+name = \"ureq\"\n\
+version = \"2.10.1\"\n\
+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\n";
+        let got = parse_lock_checksums(lock);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "adler2".to_string(),
+                    "2.0.0".to_string(),
+                    "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627".to_string()
+                ),
+                (
+                    "ureq".to_string(),
+                    "2.10.1".to_string(),
+                    "b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_lock_checksums_covers_the_real_td_fetch_lock() {
+        // The rust-fetch gate asserts ≥70 vendored crates in the warmed dir;
+        // the parser must see at least that many in the real fetch/Cargo.lock
+        // (drift guard: a lockfile-format change that blinds the parser reds
+        // here, not as a silently-cold warm).
+        let lock = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fetch/Cargo.lock"
+        ))
+        .unwrap();
+        let got = parse_lock_checksums(&lock);
+        assert!(got.len() >= 70, "only {} checksummed packages parsed", got.len());
+        assert!(
+            got.iter().all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
+            "malformed triplet parsed from the real lock"
+        );
     }
 }

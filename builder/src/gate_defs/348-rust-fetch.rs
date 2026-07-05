@@ -1,6 +1,6 @@
 //! rust-fetch — td builds td-fetch with its crate closure provisioned GUIX-FREE:
 //! the 73 `.crate` deps are td-fetched from static.crates.io (Cargo.lock-pinned, NO guix
-//! build, NO /gnu/store FOD; tools/warm-td-fetch-crates.sh, host PREP), interned as ONE
+//! build, NO /gnu/store FOD; the `td-builder check` prelude's native warm, host PREP), interned as ONE
 //! content-addressed vendor TREE by td's OWN store-add-recursive, and build-recipe vendors
 //! from it (TD_VENDOR_DIR) — so NOTHING in the crate path is guix. Per the human (2026-06-23,
 //! "no new guix dependencies, even an oracle"): crates are content-addressed, so the
@@ -37,7 +37,7 @@ echo ">> rust-fetch: td builds td-fetch with crates provisioned GUIX-FREE (td-fe
 set -euo pipefail; \
 vendor="$PWD/.td-build-cache/crate-vendor/td-fetch"; \
 ncrate=`ls "$vendor"/*.crate 2>/dev/null | wc -l`; \
-test "$ncrate" -ge 70 || { echo "ERROR: vendor dir $vendor has <70 crates ($ncrate) — the HOST PREP tools/warm-td-fetch-crates.sh (check.sh prelude) must td-fetch them first (offline gate cannot egress)" >&2; exit 1; }; \
+test "$ncrate" -ge 70 || { echo "ERROR: vendor dir $vendor has <70 crates ($ncrate) — the HOST PREP warm in the td-builder check prelude must td-fetch them first (offline gate cannot egress)" >&2; exit 1; }; \
 miss=0; for c in "$vendor"/*.crate; do sha=`sha256sum "$c" | cut -d' ' -f1`; grep -qF "$sha" "$PWD/fetch/Cargo.lock" || { echo "FAIL: crate `basename $c` sha $sha is NOT pinned in fetch/Cargo.lock" >&2; miss=$((miss + 1)); }; done; \
 test "$miss" -eq 0 || { echo "FAIL: $miss vendored crate(s) not pinned by fetch/Cargo.lock" >&2; exit 1; }; \
 echo "  [DURABLE supply-chain] all $ncrate vendored crates' sha256 are checksums pinned in fetch/Cargo.lock (upstream crates.io hash — the guix-free oracle)"; \

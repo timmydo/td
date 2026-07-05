@@ -26,9 +26,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
-use crate::sha256::{to_base16, Sha256};
-use std::fs::{self, File};
-use std::io::{self, Read};
+use crate::sha256::sha256_file;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -659,20 +659,6 @@ fn scrubbed(prog: &Path) -> Command {
 
 fn io_err(ctx: &'static str) -> impl Fn(io::Error) -> String {
     move |e| format!("{ctx}: {e}")
-}
-
-fn sha256_file(p: &Path) -> io::Result<String> {
-    let mut f = File::open(p)?;
-    let mut h = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(to_base16(&h.finalize()))
 }
 
 // pub(crate): also the per-file half of build::require_no_gnu_store (#378) —

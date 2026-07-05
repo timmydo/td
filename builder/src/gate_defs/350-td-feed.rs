@@ -4,7 +4,7 @@
 //! its crate closure provisioned GUIX-FREE. td-feed shares td-fetch's vendored closure
 //! exactly (ureq + rustls/ring + sha2, 73 crates — only the bin name differs), so it reuses
 //! td-fetch's td-fetched vendor tree (.td-build-cache/crate-vendor/td-fetch, warmed GUIX-FREE
-//! by tools/warm-td-fetch-crates.sh in the check.sh prelude — NO guix build, NO /gnu/store
+//! by the `td-builder check` prelude's native warm — NO guix build, NO /gnu/store
 //! crate FOD), interned by td's OWN store-add-recursive and vendored via TD_VENDOR_DIR. The
 //! crate correctness oracle is the UPSTREAM feed/Cargo.lock checksum, NOT a guix differential
 //! (human 2026-06-23, "no new guix dependencies, even an oracle"). The .drv is assembled by td
@@ -60,7 +60,7 @@ echo ">> td-feed: td builds td-feed (its own local HTTP mirror, 73 vendored deps
 set -euo pipefail; \
 vendor="$PWD/.td-build-cache/crate-vendor/td-fetch"; \
 ncrate=`ls "$vendor"/*.crate 2>/dev/null | wc -l`; \
-test "$ncrate" -ge 70 || { echo "ERROR: vendor dir $vendor has <70 crates ($ncrate) — the HOST PREP tools/warm-td-fetch-crates.sh (check.sh prelude) must td-fetch them first (offline gate cannot egress); td-feed shares td-fetch's closure" >&2; exit 1; }; \
+test "$ncrate" -ge 70 || { echo "ERROR: vendor dir $vendor has <70 crates ($ncrate) — the HOST PREP warm in the td-builder check prelude must td-fetch them first (offline gate cannot egress); td-feed shares td-fetch's closure" >&2; exit 1; }; \
 miss=0; for c in "$vendor"/*.crate; do sha=`sha256sum "$c" | cut -d' ' -f1`; grep -qF "$sha" "$PWD/feed/Cargo.lock" || { echo "FAIL: crate `basename $c` sha $sha is NOT pinned in feed/Cargo.lock" >&2; miss=$((miss + 1)); }; done; \
 test "$miss" -eq 0 || { echo "FAIL: $miss vendored crate(s) not pinned by feed/Cargo.lock" >&2; exit 1; }; \
 echo "  [DURABLE supply-chain] all $ncrate vendored crates' sha256 are checksums pinned in feed/Cargo.lock (upstream crates.io hash — the guix-free oracle; td-feed shares td-fetch's closure exactly)"; \
