@@ -12,7 +12,7 @@ pub fn recipe() -> Recipe {
     let cip = "{in:mes}/include:{in:mes}/include/x86";
     let lp = "{in:tcc}/lib";
     let gccdir = "{out}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
-    let mut steps = unpack_into("gcc-core-source", "{src}");
+    let mut steps = unpack_into("gcc-core-mesboot0-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-gcc-boot-2.95.3"));
     steps.push(Step::CopyFiles {
         files: vec![

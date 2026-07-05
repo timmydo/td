@@ -1,34 +1,22 @@
-use crate::ladder::{apply_patch, base_path, unpack_into, SH};
+use crate::ladder::{apply_patch, base_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
-// GNU Binutils 2.20.1a — bootstrap rung 6 (#378, guix's binutils-mesboot0):
-// tcc + the tcc-built make/patch build the first as/ld against the mes libc.
-// Faithful port of the deleted build_binutils fn: boot patch via the td-built
-// patch rung, CPPFLAGS' MES_BOOTSTRAP defines, AR="tcc -ar", CXX=false,
-// RANLIB=true, serial make, install prefix={out}. crt resolves via tcc's baked
-// prefix ({in:tcc}/lib — the tcc RECIPE stages crt there at install, retiring
-// the ladder's cross-brick out/lib mutation); libc via LIBRARY_PATH; headers
-// via C_INCLUDE_PATH (guix's tcc-boot0 search-path setup).
+// GNU Binutils 2.20.1a #2 — rung 10 (#378, guix's binutils-mesboot1): rebuilt
+// by gcc-mesboot0 against glibc-mesboot0 + the PURE kernel UAPI headers. Two
+// proven constraints from the deleted fn: NO -B in CC (gcc 2.95's "prefix never
+// used" stderr poisons autoconf's header probes → fibheap loses LONG_MIN), and
+// the PURE headers, never the mes-merged set (its limits.h shadows gcc's).
 pub fn recipe() -> Recipe {
     let path = base_path();
-    let cip = "{in:mes}/include:{in:mes}/include/x86";
-    let lp = "{in:tcc}/lib";
-    let cc = "CC=tcc -static -D __GLIBC_MINOR__=6 -D MES_BOOTSTRAP=1";
-    let mut steps = unpack_into("binutils-mesboot0-source", "{src}");
+    let cip = "{in:glibc-mesboot0}/include:{root}/kh";
+    let lp = "{in:glibc-mesboot0}/lib:{in:gcc-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
+    let cc = "CC={in:gcc-mesboot0}/bin/gcc -static";
+    let mut steps = unpack_into("binutils-mesboot1-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-binutils-boot-2.20.1a"));
-    steps.push(Step::CopyFiles {
-        files: vec![
-            "{in:tcc}/lib/crt1.o".into(),
-            "{in:tcc}/lib/crti.o".into(),
-            "{in:tcc}/lib/crtn.o".into(),
-            "{in:tcc}/lib/libc.a".into(),
-            "{in:tcc}/lib/libtcc1.a".into(),
-        ],
-        dest: "{src}".into(),
-    });
+    steps.extend(unpack_keep_top("linux-headers", "{root}/kh"));
     steps.push(Step::ToolFarm {
         links: vec![
-            ("tcc".into(), "{in:tcc}/bin/tcc".into()),
+            ("cpp".into(), "{in:gcc-mesboot0}/bin/cpp".into()),
             ("make".into(), "{in:make-mesboot0}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
             ("awk".into(), "{in:gawk}/bin/awk".into()),
@@ -40,15 +28,26 @@ pub fn recipe() -> Recipe {
     });
     steps.push(
         Step::run(
+            "{root}",
+            &[
+                "{in:coreutils}/bin/ln",
+                "-sf",
+                "glob:{in:binutils-mesboot0}/bin/*",
+                "{tools}",
+            ],
+        )
+        .env("PATH", &path),
+    );
+    steps.push(
+        Step::run(
             "{src}",
             &[
                 SH,
                 "./configure",
                 cc,
-                "CPPFLAGS=-D __GLIBC_MINOR__=6 -D MES_BOOTSTRAP=1",
-                "AR=tcc -ar",
+                "AR=ar",
+                "RANLIB=ranlib",
                 "CXX=false",
-                "RANLIB=true",
                 "--disable-nls",
                 "--disable-shared",
                 "--disable-werror",
@@ -72,7 +71,7 @@ pub fn recipe() -> Recipe {
             argv.push(t);
             argv.push("prefix={out}");
         } else {
-            argv.extend([cc, "AR=tcc -ar", "CXX=false", "RANLIB=true"]);
+            argv.extend([cc, "AR=ar", "RANLIB=ranlib", "CXX=false"]);
         }
         steps.push(
             Step::run("{src}", &argv)
@@ -85,10 +84,17 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/as".into(), "{out}/bin/ld".into()],
         exec: true,
     });
-    Recipe::mesboot("binutils-mesboot0", "2.20.1a")
-        .native_inputs(&["mes", "tcc", "make-mesboot0", "patch-mesboot"])
+    Recipe::mesboot("binutils-mesboot1", "2.20.1a")
+        .native_inputs(&[
+            "make-mesboot0",
+            "patch-mesboot",
+            "binutils-mesboot0",
+            "gcc-mesboot0",
+            "glibc-mesboot0",
+        ])
         .inputs(&[
             "patch-binutils-boot-2.20.1a",
+            "linux-headers",
             "flex",
             "bison",
             "bash",

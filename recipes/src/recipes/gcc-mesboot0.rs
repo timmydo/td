@@ -11,7 +11,7 @@ pub fn recipe() -> Recipe {
     let cip = format!("{{in:glibc-mesboot0}}/include:{gccdir1}/include:{{in:mesboot-headers}}/include");
     let lp = format!("{{in:glibc-mesboot0}}/lib:{gccdir1}");
     let gccdir2 = "{out}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
-    let mut steps = unpack_into("gcc-core-source", "{src}");
+    let mut steps = unpack_into("gcc-mesboot0-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-gcc-boot-2.95.3"));
     steps.push(Step::ToolFarm {
         links: vec![
