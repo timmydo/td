@@ -155,7 +155,7 @@ grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
 "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
 sort -u "$b8/roots" -o "$b8/roots"
 xargs guix build < "$b8/roots" >/dev/null 2>&1 || fail "brick8: could not realize the guix seed closure"
-seedline=`TB="$TB" TD_SEED_DB=/var/guix/db/db.sqlite sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-b8" $(cat "$b8/roots")` || fail "brick8: warm-seed failed"
+seedline=`TB="$TB" TD_SEED_DB=/gnu/store sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-b8" $(cat "$b8/roots")` || fail "brick8: warm-seed failed"
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
 for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done
 chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
