@@ -1,4 +1,4 @@
-use crate::ladder::{base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{SH, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0 — rung 18 (#378, guix's gcc-boot0/gcc-final version): gcc-mesboot
@@ -47,16 +47,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                "{in:coreutils}/bin/ln",
-                "-sf",
-                "glob:{in:binutils-mesboot}/bin/*",
-                "{tools}",
-            ],
-        )
-        .env("PATH", &base_path()),
+        link_bins("binutils-mesboot"),
     );
     // single-token static wrappers (see header): CC/CXX survive gcc's munging
     for (name, real) in [("gcc", "gcc"), ("g++", "g++")] {
@@ -163,26 +154,6 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("gcc-14", "14.3.0")
         .native_inputs(&["binutils-mesboot", "gcc-mesboot", "glibc-mesboot"])
-        .inputs(&[
-            "gmp63",
-            "mpfr421",
-            "mpc131",
-            "linux-headers",
-            "flex",
-            "bison",
-            "m4",
-            "make",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["gmp63", "mpfr421", "mpc131", "linux-headers", "flex", "bison", "m4", "make"]))
         .steps(steps)
 }

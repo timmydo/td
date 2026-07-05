@@ -1,4 +1,4 @@
-use crate::ladder::{base_path, sed_i, unpack_into, SH};
+use crate::ladder::{SH, base_inputs, base_path, sed_i, unpack_into};
 use crate::types::{Recipe, Step};
 
 // GNU patch 2.5.9 — bootstrap rung 5 (#378): the tcc-built make builds patch
@@ -70,18 +70,6 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("patch-mesboot", "2.5.9")
         .native_inputs(&["mes", "tcc", "make-mesboot0"])
-        .inputs(&[
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&[]))
         .steps(steps)
 }

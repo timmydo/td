@@ -565,6 +565,12 @@ impl Recipe {
         self.inputs = Some(vs(xs));
         self
     }
+    /// Owned-string variant of `inputs`, for `ladder::base_inputs(...)` which
+    /// assembles the extras + BASE_TOOLS list at runtime.
+    pub fn inputs_owned(mut self, xs: Vec<String>) -> Recipe {
+        self.inputs = Some(xs);
+        self
+    }
     pub fn configure_flags(mut self, xs: &[&str]) -> Recipe {
         self.configure_flags = Some(vs(xs));
         self

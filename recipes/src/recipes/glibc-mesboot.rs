@@ -1,4 +1,4 @@
-use crate::ladder::{apply_patch, base_path, sed_i, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, sed_i, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // glibc 2.16.0 STATIC — rung 15 (#378, guix's glibc-headers-mesboot +
@@ -40,16 +40,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                "{in:coreutils}/bin/ln",
-                "-sf",
-                "glob:{in:binutils-mesboot}/bin/*",
-                "{tools}",
-            ],
-        )
-        .env("PATH", &base_path()),
+        link_bins("binutils-mesboot"),
     );
     // the deleted fn's source fixups, verbatim
     steps.push(sed_i(
@@ -175,21 +166,6 @@ pub fn recipe() -> Recipe {
             "glibc-mesboot0",
             "gawk-mesboot",
         ])
-        .inputs(&[
-            "patch-glibc-boot-2.16.0",
-            "patch-glibc-bootstrap-system-2.16.0",
-            "linux-headers",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["patch-glibc-boot-2.16.0", "patch-glibc-bootstrap-system-2.16.0", "linux-headers"]))
         .steps(steps)
 }

@@ -1,4 +1,4 @@
-use crate::ladder::{apply_patch, base_path, unpack_into, SH};
+use crate::ladder::{SH, apply_patch, base_inputs, base_path, unpack_into};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.20.1a — bootstrap rung 6 (#378, guix's binutils-mesboot0):
@@ -87,21 +87,6 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("binutils-mesboot0", "2.20.1a")
         .native_inputs(&["mes", "tcc", "make-mesboot0", "patch-mesboot"])
-        .inputs(&[
-            "patch-binutils-boot-2.20.1a",
-            "flex",
-            "bison",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["patch-binutils-boot-2.20.1a", "flex", "bison"]))
         .steps(steps)
 }

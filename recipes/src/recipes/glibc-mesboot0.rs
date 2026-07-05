@@ -1,4 +1,4 @@
-use crate::ladder::{apply_patch, base_path, sed_i, unpack_into, SH};
+use crate::ladder::{SH, apply_patch, base_inputs, base_path, sed_i, unpack_into};
 use crate::types::{Recipe, Step};
 
 // glibc 2.2.5 — bootstrap rung 8 (#378, guix's glibc-mesboot0): the first gcc
@@ -111,20 +111,6 @@ pub fn recipe() -> Recipe {
             "gcc-core-mesboot0",
             "mesboot-headers",
         ])
-        .inputs(&[
-            "patch-glibc-boot-2.2.5",
-            "patch-glibc-bootstrap-system-2.2.5",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["patch-glibc-boot-2.2.5", "patch-glibc-bootstrap-system-2.2.5"]))
         .steps(steps)
 }

@@ -36,6 +36,36 @@ pub fn base_path() -> String {
     p
 }
 
+/// A rung's full lock-input list: the rung-specific `extras` FIRST, then the
+/// shared `BASE_TOOLS` — the exact order every recipe declared by hand. Keeping
+/// the base set here (not re-typed per recipe) closes the drift hazard: a rung's
+/// inputs must stay in lockstep with the constant `base_path()` templates
+/// `{in:X}/bin` for, or the missing tool reds only at execution, deep in the
+/// chain. Pair with `Recipe::inputs_owned`.
+pub fn base_inputs(extras: &[&str]) -> Vec<String> {
+    extras
+        .iter()
+        .chain(BASE_TOOLS.iter())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// The tool-farm step that symlinks a prior binutils rung's whole `bin/` into
+/// `{tools}` (as/ld/ar/ranlib/nm/strip/…) with the declared coreutils `ln`, on
+/// `base_path()`. The `glob:` argv element expands sorted in the engine.
+pub fn link_bins(binutils_rung: &str) -> Step {
+    Step::run(
+        "{root}",
+        &[
+            "{in:coreutils}/bin/ln",
+            "-sf",
+            &format!("glob:{{in:{binutils_rung}}}/bin/*"),
+            "{tools}",
+        ],
+    )
+    .env("PATH", &base_path())
+}
+
 /// The declared shell (the sandbox has no /bin/sh).
 pub const SH: &str = "{in:bash}/bin/bash";
 
