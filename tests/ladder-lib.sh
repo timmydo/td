@@ -43,7 +43,8 @@ ladder_setup() {
   # Idempotence: an intern into an existing read-only store path EACCESes, so the
   # whole setup runs ONCE per pin-set — keyed on the source locks + patches + the
   # seed tree; a pin change wipes and re-interns.
-  _pinsum=`{ cat seed/sources/*.lock seed/patches/*.patch; find seed/stage0 -type f | sort | xargs cat; } 2>/dev/null | sha256sum | cut -d' ' -f1`
+  # LADDER_SETUP_V bumps force a re-setup when the tool/source SET grows.
+  _pinsum=`{ echo ladder-setup-v2; cat seed/sources/*.lock seed/patches/*.patch; find seed/stage0 -type f | sort | xargs cat; } 2>/dev/null | sha256sum | cut -d' ' -f1`
   if [ -f "$LW/setup-ok" ] && [ "`cat "$LW/setup-ok"`" = "$_pinsum" ]; then
     ladder_stage_tdstore || return 1
     return 0
@@ -54,7 +55,7 @@ ladder_setup() {
   : > "$LW/tools.map"
   for spec in bash:bash coreutils:ls sed:sed grep:grep gawk:awk tar:tar gzip:gzip \
               bzip2:bzip2 xz:xz findutils:find diffutils:diff flex:flex bison:bison \
-              m4:m4 make:make; do
+              m4:m4 make:make gettext:msgfmt texinfo:makeinfo python:python3; do
     _n=${spec%%:*}; _p=${spec##*:}
     _root=`ladder_tool_root "$_n" "$_p"` || return 1
     printf '%s %s\n' "$_n" "$_root" >> "$LW/tools.map"
