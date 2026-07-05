@@ -1,4 +1,4 @@
-use crate::ladder::{base_path, sed_i, unpack_into, SH};
+use crate::ladder::{SH, base_inputs, base_path, sed_i, unpack_into};
 use crate::types::{Recipe, Step};
 
 // GNU Make 3.80 — bootstrap rung 4 (#378): tcc builds the first make (guix's
@@ -60,18 +60,6 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("make-mesboot0", "3.80")
         .native_inputs(&["mes", "tcc"])
-        .inputs(&[
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&[]))
         .steps(steps)
 }

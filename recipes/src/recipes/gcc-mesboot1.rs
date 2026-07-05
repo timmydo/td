@@ -1,4 +1,4 @@
-use crate::ladder::{apply_patch, base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GCC 4.6.4 (c,c++) — rung 12 (#378, guix's gcc-mesboot1): gcc-mesboot0 builds
@@ -59,16 +59,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                "{in:coreutils}/bin/ln",
-                "-sf",
-                "glob:{in:binutils-mesboot1}/bin/*",
-                "{tools}",
-            ],
-        )
-        .env("PATH", &base_path()),
+        link_bins("binutils-mesboot1"),
     );
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
@@ -164,26 +155,6 @@ pub fn recipe() -> Recipe {
             "glibc-mesboot0",
             "make-mesboot",
         ])
-        .inputs(&[
-            "gcc-464-gpp",
-            "patch-gcc-boot-4.6.4",
-            "gmp",
-            "mpfr",
-            "mpc",
-            "linux-headers",
-            "flex",
-            "bison",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["gcc-464-gpp", "patch-gcc-boot-4.6.4", "gmp", "mpfr", "mpc", "linux-headers", "flex", "bison"]))
         .steps(steps)
 }

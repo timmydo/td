@@ -1,4 +1,4 @@
-use crate::ladder::{base_path, sed_i, unpack_into, SH};
+use crate::ladder::{SH, base_inputs, base_path, sed_i, unpack_into};
 use crate::types::{Recipe, Step};
 
 // TinyCC (mes fork, 0.9.26-1149-g46a75d0c) — bootstrap rung 3 (#378): MesCC
@@ -70,18 +70,6 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("tcc", "0.9.26-1149-g46a75d0c")
         .native_inputs(&["stage0", "mes"])
-        .inputs(&[
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&[]))
         .steps(steps)
 }

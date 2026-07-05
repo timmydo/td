@@ -1,4 +1,4 @@
-use crate::ladder::{base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{SH, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU Make 3.82 — rung 11 (#378, guix's make-mesboot): gcc-mesboot0 rebuilds
@@ -19,16 +19,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                "{in:coreutils}/bin/ln",
-                "-sf",
-                "glob:{in:binutils-mesboot0}/bin/*",
-                "{tools}",
-            ],
-        )
-        .env("PATH", &path),
+        link_bins("binutils-mesboot0"),
     );
     steps.push(
         Step::run(
@@ -81,19 +72,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot0",
             "glibc-mesboot0",
         ])
-        .inputs(&[
-            "linux-headers",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["linux-headers"]))
         .steps(steps)
 }

@@ -1,4 +1,4 @@
-use crate::ladder::unpack_keep_top;
+use crate::ladder::{base_inputs, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // mesboot-headers — bootstrap rung 8 prerequisite (#378, guix's mesboot-headers):
@@ -19,18 +19,6 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("mesboot-headers", "4.14.67")
         .native_inputs(&["mes"])
-        .inputs(&[
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&[]))
         .steps(steps)
 }

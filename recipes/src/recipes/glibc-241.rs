@@ -1,4 +1,4 @@
-use crate::ladder::{base_path, sed_i, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{SH, base_inputs, base_path, link_bins, sed_i, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // glibc 2.41 — rung 20, the top (#378, guix's glibc-final): gcc 14.3.0 +
@@ -26,16 +26,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                "{in:coreutils}/bin/ln",
-                "-sf",
-                "glob:{in:binutils-244}/bin/*",
-                "{tools}",
-            ],
-        )
-        .env("PATH", &base_path()),
+        link_bins("binutils-244"),
     );
     steps.push(Step::WriteFile {
         path: "{root}/wb/gcc".into(),
@@ -147,24 +138,6 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("glibc-241", "2.41")
         .native_inputs(&["gcc-14", "glibc-mesboot-shared", "binutils-244"])
-        .inputs(&[
-            "linux-headers",
-            "flex",
-            "bison",
-            "m4",
-            "make",
-            "python",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["linux-headers", "flex", "bison", "m4", "make", "python"]))
         .steps(steps)
 }

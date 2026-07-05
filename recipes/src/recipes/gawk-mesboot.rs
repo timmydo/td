@@ -1,4 +1,4 @@
-use crate::ladder::{base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{SH, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU awk 3.1.8 — rung 14 (#378, guix's gawk-mesboot): gcc-mesboot1 builds the
@@ -18,16 +18,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                "{in:coreutils}/bin/ln",
-                "-sf",
-                "glob:{in:binutils-mesboot1}/bin/*",
-                "{tools}",
-            ],
-        )
-        .env("PATH", &base_path()),
+        link_bins("binutils-mesboot1"),
     );
     steps.push(
         Step::run(
@@ -86,19 +77,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot1",
             "glibc-mesboot0",
         ])
-        .inputs(&[
-            "linux-headers",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["linux-headers"]))
         .steps(steps)
 }

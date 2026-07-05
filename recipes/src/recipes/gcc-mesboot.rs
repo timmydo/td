@@ -1,4 +1,4 @@
-use crate::ladder::{base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{SH, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GCC 4.9.4 — rung 16 (#378, guix's gcc-mesboot): gcc-mesboot1 (4.6.4 c,c++) +
@@ -45,16 +45,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                "{in:coreutils}/bin/ln",
-                "-sf",
-                "glob:{in:binutils-mesboot}/bin/*",
-                "{tools}",
-            ],
-        )
-        .env("PATH", &base_path()),
+        link_bins("binutils-mesboot"),
     );
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
@@ -156,24 +147,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot1",
             "glibc-mesboot",
         ])
-        .inputs(&[
-            "gmp",
-            "mpfr",
-            "mpc",
-            "linux-headers",
-            "flex",
-            "bison",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["gmp", "mpfr", "mpc", "linux-headers", "flex", "bison"]))
         .steps(steps)
 }

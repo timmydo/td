@@ -1,4 +1,4 @@
-use crate::ladder::{base_path, unpack_into, SH};
+use crate::ladder::{SH, base_inputs, base_path, unpack_into};
 use crate::types::{Recipe, Step};
 
 // GNU Mes 0.27.1 — bootstrap rung 2 (#378): MesCC self-hosts mes on the stage0
@@ -71,19 +71,6 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("mes", "0.27.1")
         .native_inputs(&["stage0"])
-        .inputs(&[
-            "nyacc",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["nyacc"]))
         .steps(steps)
 }

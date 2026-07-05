@@ -1,4 +1,4 @@
-use crate::ladder::{apply_patch, base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.20.1a #2 — rung 10 (#378, guix's binutils-mesboot1): rebuilt
@@ -27,16 +27,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                "{in:coreutils}/bin/ln",
-                "-sf",
-                "glob:{in:binutils-mesboot0}/bin/*",
-                "{tools}",
-            ],
-        )
-        .env("PATH", &path),
+        link_bins("binutils-mesboot0"),
     );
     steps.push(
         Step::run(
@@ -92,22 +83,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot0",
             "glibc-mesboot0",
         ])
-        .inputs(&[
-            "patch-binutils-boot-2.20.1a",
-            "linux-headers",
-            "flex",
-            "bison",
-            "bash",
-            "coreutils",
-            "sed",
-            "grep",
-            "gawk",
-            "tar",
-            "gzip",
-            "bzip2",
-            "xz",
-            "findutils",
-            "diffutils",
-        ])
+        .inputs_owned(base_inputs(&["patch-binutils-boot-2.20.1a", "linux-headers", "flex", "bison"]))
         .steps(steps)
 }
