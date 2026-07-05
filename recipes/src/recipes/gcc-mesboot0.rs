@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, base_inputs, base_path, unpack_into};
+use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, unpack_into};
 use crate::types::{Recipe, Step};
 
 // GCC 2.95.3 #2 — bootstrap rung 9 (#378, guix's gcc-mesboot0): the FIRST gcc
@@ -27,16 +27,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                "{in:coreutils}/bin/ln",
-                "-sf",
-                "glob:{in:binutils-mesboot0}/bin/*",
-                "{tools}",
-            ],
-        )
-        .env("PATH", &path),
+        link_bins("binutils-mesboot0"),
     );
     steps.push(Step::WriteFile {
         path: "{src}/config.cache".into(),
