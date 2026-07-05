@@ -26,7 +26,7 @@ ladder_tool_root() {
     fi
   fi
   if [ -z "$_r" ] || [ ! -x "$_r/bin/$2" ]; then
-    _b=`ls /gnu/store/*-"$1"-[0-9]*/bin/"$2" 2>/dev/null | sort | head -1`
+    _b=`ls /gnu/store/*-"$1"-[0-9]*/bin/"$2" /gnu/store/*-"$1"-minimal-[0-9]*/bin/"$2" 2>/dev/null | sort | head -1`
     test -n "$_b" && _r=${_b%/bin/*}
   fi
   test -n "$_r" -a -x "$_r/bin/$2" \
@@ -40,18 +40,9 @@ ladder_tool_root() {
 ladder_setup() {
   LW=$1
   mkdir -p "$LW/store" "$LW/locks" "$LW/recipes" "$LW/scratch"
-  # Idempotence: an intern into an existing read-only store path EACCESes, so the
-  # whole setup runs ONCE per pin-set — keyed on the source locks + patches + the
-  # seed tree; a pin change wipes and re-interns.
-  # LADDER_SETUP_V bumps force a re-setup when the tool/source SET grows.
-  _pinsum=`{ echo ladder-setup-v2; cat seed/sources/*.lock seed/patches/*.patch; find seed/stage0 -type f | sort | xargs cat; } 2>/dev/null | sha256sum | cut -d' ' -f1`
-  if [ -f "$LW/setup-ok" ] && [ "`cat "$LW/setup-ok"`" = "$_pinsum" ]; then
-    ladder_stage_tdstore || return 1
-    return 0
-  fi
-  rm -rf "$LW/store" "$LW/db" "$LW/srcs.map" "$LW/tools.map" "$LW/setup-ok"
-  mkdir -p "$LW/store"
-  # --- host tool packages (the declared BASE_TOOLS + per-rung extras) ---------------
+  # --- host tool packages: re-resolved EVERY call (a glob-resolved tool is not a GC
+  # root — a path can vanish between runs; a changed root correctly re-keys exactly
+  # the rungs that consume it, since tool paths ride into their locks/drvs) ----------
   : > "$LW/tools.map"
   for spec in bash:bash coreutils:ls sed:sed grep:grep gawk:awk tar:tar gzip:gzip \
               bzip2:bzip2 xz:xz findutils:find diffutils:diff flex:flex bison:bison \
@@ -60,6 +51,17 @@ ladder_setup() {
     _root=`ladder_tool_root "$_n" "$_p"` || return 1
     printf '%s %s\n' "$_n" "$_root" >> "$LW/tools.map"
   done
+  # Idempotence for the INTERNS: an intern into an existing read-only store path
+  # EACCESes, so they run ONCE per pin-set — keyed on the source locks + patches +
+  # the seed tree; a pin change wipes and re-interns.
+  # LADDER_SETUP_V bumps force a re-setup when the source SET grows.
+  _pinsum=`{ echo ladder-setup-v2; cat seed/sources/*.lock seed/patches/*.patch; find seed/stage0 -type f | sort | xargs cat; } 2>/dev/null | sha256sum | cut -d' ' -f1`
+  if [ -f "$LW/setup-ok" ] && [ "`cat "$LW/setup-ok"`" = "$_pinsum" ]; then
+    ladder_stage_tdstore || return 1
+    return 0
+  fi
+  rm -rf "$LW/store" "$LW/db" "$LW/srcs.map" "$LW/setup-ok"
+  mkdir -p "$LW/store"
   # --- intern the pinned sources (seed/sources locks; td-fetched tarballs) ----------
   # map: LOCKSTEM -> intern NAME (the lock entry name rungs reference)
   : > "$LW/srcs.map"
