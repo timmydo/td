@@ -20,8 +20,10 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // A directory path makes cargo rescan the whole tree, so file adds/removes
-    // and edits all retrigger the registry generation.
+    // The directory path retriggers on file ADDS/REMOVES (dir mtime); an EDIT to
+    // an existing file does NOT change the dir mtime, so each recipe file is
+    // also declared below (bit us live in #378: a stale td-recipe-eval emitted a
+    // recipe's OLD nativeInputs after an in-place edit).
     println!("cargo:rerun-if-changed=src/recipes");
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")?;
@@ -52,6 +54,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let Some(stem) = name.strip_suffix(".rs") else {
             continue;
         };
+        // Per-file edit tracking (see the header note — the dir mtime misses edits).
+        println!("cargo:rerun-if-changed=src/recipes/{name}");
         // The stem is the catalog key and doubles as a module name, so keep it
         // to the charset every existing key uses and reject a digit lead.
         let ok = !stem.is_empty()
