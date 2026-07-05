@@ -46,7 +46,7 @@ ladder_setup() {
   : > "$LW/tools.map"
   for spec in bash:bash coreutils:ls sed:sed grep:grep gawk:awk tar:tar gzip:gzip \
               bzip2:bzip2 xz:xz findutils:find diffutils:diff flex:flex bison:bison \
-              m4:m4 make:make gettext:msgfmt texinfo:makeinfo python:python3; do
+              m4:m4 make:make python:python3; do
     _n=${spec%%:*}; _p=${spec##*:}
     _root=`ladder_tool_root "$_n" "$_p"` || return 1
     printf '%s %s\n' "$_n" "$_root" >> "$LW/tools.map"

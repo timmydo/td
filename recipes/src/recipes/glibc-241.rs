@@ -22,8 +22,6 @@ pub fn recipe() -> Recipe {
             ("flex".into(), "{in:flex}/bin/flex".into()),
             ("m4".into(), "{in:m4}/bin/m4".into()),
             ("make".into(), "{in:make}/bin/make".into()),
-            ("msgfmt".into(), "{in:gettext}/bin/msgfmt".into()),
-            ("makeinfo".into(), "{in:texinfo}/bin/makeinfo".into()),
             ("python3".into(), "{in:python}/bin/python3".into()),
         ],
     });
@@ -155,8 +153,6 @@ pub fn recipe() -> Recipe {
             "bison",
             "m4",
             "make",
-            "gettext",
-            "texinfo",
             "python",
             "bash",
             "coreutils",
