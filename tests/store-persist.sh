@@ -46,7 +46,7 @@ load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builde
 
 # The ~850-line seed→…→gcc-14.3.0+binutils-2.44+glibc-2.41 chain (shared library).
 . tests/bootstrap-chain.sh
-bootstrap_modern_toolchain   # from the seed: builds + verifies the toolchain; sets GCC14/GLIBC241/BMB244SB/CC1/cpath/KH_TB
+bootstrap_modern_toolchain   # the 20-rung recipe ladder; sets GCC14/GLIBC241/BMB244SB/CC1 + LADDER_TDSTORE/*_BASE
 csh=`command -v bash 2>/dev/null || command -v sh`
 
 # --- Assemble a guix-gcc-toolchain-shaped /td/store toolchain (as gate 416) ------------------
@@ -104,7 +104,7 @@ grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
 "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
 sort -u "$b8/roots" -o "$b8/roots"
 xargs guix build < "$b8/roots" >/dev/null 2>&1 || fail "could not realize the guix seed closure"
-seedline=`TB="$TB" sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-persist" $(cat "$b8/roots")` || fail "warm-seed failed"
+seedline=`TB="$TB" TD_SEED_DB=/gnu/store sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-persist" $(cat "$b8/roots")` || fail "warm-seed failed"
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
 for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done
 chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
@@ -140,7 +140,7 @@ o2=`sed -n 's/^OUT=out //p' "$b8/sb2.out"`; test "$o" = "$o2" || fail "the skipp
 echo "   [DURABLE skip/read-back] a SEPARATE invocation SKIPPED the build (CACHE=persist) — the build path read sed back from P at the same /td/store path"
 
 # --- [DURABLE behavioral] run the sed READ BACK FROM P in the own-root (/gnu/store ABSENT) ----
-si=`"$BMB/bin/readelf" -l "$P/store/$sbase/bin/sed" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
+si=`"$TB" elf-interp "$P/store/$sbase/bin/sed" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
 test -n "$si" || fail "the persisted sed is not linked vs the /td/store glibc 2.41"
 if grep -q -a -- "$oldtc" "$P/store/$sbase/bin/sed"; then fail "the persisted sed references the substituted-out gcc-toolchain $oldtc"; fi
 vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`

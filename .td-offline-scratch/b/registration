@@ -1,0 +1,5 @@
+path /gnu/store/99mbzp0yk8wvq0q0lqmnnq0ksv90y126-td-offline-sandbox-probe
+nar-hash sha256:d1d732b2c41a5c5dfd624097e71320d79d642c06af0195535f199a7b44a0b1c0
+nar-size 128
+deriver /gnu/store/c30dqdygzafvs9alvzq6nzryvn5d4mzi-td-offline-sandbox-probe.drv
+

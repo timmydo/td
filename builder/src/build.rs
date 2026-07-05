@@ -1397,6 +1397,10 @@ fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
         if ft.is_dir() {
             copy_tree_writable(&from, &to)?;
         } else if ft.is_symlink() {
+            // Overlay semantics: a CopyTree may land onto an already-populated tree (the
+            // kernel-header overlay after `make install`), so remove a colliding dest first —
+            // otherwise symlink() reds EEXIST where the regular-file arm below would overwrite.
+            let _ = fs::remove_file(&to);
             let target = fs::read_link(&from)
                 .map_err(|e| format!("readlink {}: {e}", from.display()))?;
             std::os::unix::fs::symlink(&target, &to)
@@ -1530,6 +1534,285 @@ pub fn run_stage0() -> Result<(), String> {
     require_no_gnu_store(Path::new(&out))
 }
 
+/// The template context for mesboot steps: `{root}` `{src}` `{out}` `{tools}`
+/// `{jobs}` `{in:NAME}`. Any OTHER `{…}` content passes through VERBATIM — the
+/// rungs' sed expressions and configure args legitimately contain shell/brace
+/// text (`${vdso_symver//./_}`), so only exactly-recognised tokens expand.
+struct StepCtx {
+    root: String,
+    src: String,
+    out: String,
+    tools: String,
+    jobs: String,
+    inputs: Vec<(String, String)>,
+}
+
+impl StepCtx {
+    fn expand(&self, s: &str) -> Result<String, String> {
+        let mut r = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find('{') {
+            let (before, after) = rest.split_at(i);
+            r.push_str(before);
+            match after.find('}') {
+                None => {
+                    r.push_str(after);
+                    return Ok(r);
+                }
+                Some(j) => {
+                    let tok = after.get(1..j).unwrap_or("");
+                    let repl = match tok {
+                        "root" => Some(self.root.as_str()),
+                        "src" => Some(self.src.as_str()),
+                        "out" => Some(self.out.as_str()),
+                        "tools" => Some(self.tools.as_str()),
+                        "jobs" => Some(self.jobs.as_str()),
+                        _ => match tok.strip_prefix("in:") {
+                            Some(name) => Some(
+                                self.inputs
+                                    .iter()
+                                    .find(|(n, _)| n == name)
+                                    .map(|(_, p)| p.as_str())
+                                    .ok_or_else(|| {
+                                        format!("mesboot step template: no input `{name}' in TD_INPUT_MAP (token {{{tok}}})")
+                                    })?,
+                            ),
+                            None => None,
+                        },
+                    };
+                    match repl {
+                        Some(v) => {
+                            r.push_str(v);
+                            rest = after.get(j + 1..).unwrap_or("");
+                        }
+                        None => {
+                            // not a recognised token: emit the brace verbatim and continue
+                            r.push('{');
+                            rest = after.get(1..).unwrap_or("");
+                        }
+                    }
+                }
+            }
+        }
+        r.push_str(rest);
+        Ok(r)
+    }
+    fn expand_all(&self, xs: &[String]) -> Result<Vec<String>, String> {
+        xs.iter().map(|x| self.expand(x)).collect()
+    }
+}
+
+/// Minimal glob for mesboot `glob:` argv elements: exactly one `*`, in the LAST
+/// path component (`DIR/PRE*SUF`). Returns full paths of matching entries.
+fn glob_one_star(pat: &str) -> Result<Vec<String>, String> {
+    let (dir, base) = match pat.rfind('/') {
+        Some(i) => (pat.get(..i).unwrap_or("."), pat.get(i + 1..).unwrap_or("")),
+        None => (".", pat),
+    };
+    let (pre, suf) = base
+        .split_once('*')
+        .ok_or_else(|| format!("glob pattern has no `*': {pat}"))?;
+    if suf.contains('*') || dir.contains('*') {
+        return Err(format!("glob supports exactly one `*' in the basename: {pat}"));
+    }
+    let mut hits = Vec::new();
+    let rd = fs::read_dir(dir).map_err(|e| format!("glob {pat}: read {dir}: {e}"))?;
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("glob {pat}: {e}"))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(pre) && name.ends_with(suf) && name.len() >= pre.len() + suf.len() {
+            hits.push(format!("{dir}/{name}"));
+        }
+    }
+    Ok(hits)
+}
+
+/// Copy one file to dest dir (keeping its basename), exec bit preserved, owner-
+/// write added (the rungs copy crt/libs INTO writable build trees).
+fn copy_file_writable(from: &Path, dest_dir: &Path) -> Result<(), String> {
+    let base = from
+        .file_name()
+        .ok_or_else(|| format!("copyFiles: {} has no basename", from.display()))?;
+    fs::create_dir_all(dest_dir).map_err(|e| format!("mkdir {}: {e}", dest_dir.display()))?;
+    let to = dest_dir.join(base);
+    fs::copy(from, &to)
+        .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
+    let mode = fs::metadata(from)
+        .map_err(|e| format!("stat {}: {e}", from.display()))?
+        .permissions()
+        .mode();
+    fs::set_permissions(&to, fs::Permissions::from_mode((mode & 0o777) | 0o200))
+        .map_err(|e| format!("chmod {}: {e}", to.display()))
+}
+
+/// mesboot-build — td's bootstrap-RUNG build "system" (#378 slices 2+3; sibling
+/// of `run`/`run_rust`/`run_cmake`/`run_stage0`). Executes the recipe's typed
+/// steps (TD_STEPS, data — see recipes/src/types.rs `Step`) over the staged
+/// inputs (TD_INPUT_MAP: lock name → store path, `{in:NAME}` templates). The
+/// engine interprets NO shell: a `run` step spawns its argv directly with the
+/// EXACT env given (cleared otherwise — the ladder's `env -i` + `MAKEFLAGS=`
+/// scrubbing as engine policy); configure scripts run because their argv names
+/// the declared bash input. `{jobs}` is the available parallelism (execution-
+/// time, not baked into the drv — the double-build repro oracle guards it).
+pub fn run_mesboot() -> Result<(), String> {
+    let out = env::var("out").map_err(|_| "out not set".to_string())?;
+    let steps_json = env::var("TD_STEPS").map_err(|_| "TD_STEPS not set".to_string())?;
+    let map_json = env::var("TD_INPUT_MAP").map_err(|_| "TD_INPUT_MAP not set".to_string())?;
+    let steps = crate::json::parse(&steps_json).map_err(|e| format!("TD_STEPS JSON: {e}"))?;
+    let steps = steps.as_arr().ok_or("TD_STEPS is not a JSON array")?;
+    let map = crate::json::parse(&map_json).map_err(|e| format!("TD_INPUT_MAP JSON: {e}"))?;
+    let inputs: Vec<(String, String)> = match &map {
+        Json::Obj(kvs) => kvs
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|p| (k.clone(), p.to_string())))
+            .collect(),
+        _ => return Err("TD_INPUT_MAP is not a JSON object".into()),
+    };
+    let root = env::current_dir()
+        .map_err(|e| format!("cwd: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    let ctx = StepCtx {
+        src: format!("{root}/src"),
+        tools: format!("{root}/tools"),
+        jobs: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .to_string(),
+        out: out.clone(),
+        root,
+        inputs,
+    };
+    for d in [&ctx.src, &ctx.tools, &ctx.out] {
+        fs::create_dir_all(d).map_err(|e| format!("mkdir {d}: {e}"))?;
+    }
+
+    let field = |o: &Json, k: &str| -> Result<String, String> {
+        o.get(k)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("mesboot step: missing/non-string `{k}'"))
+    };
+    let pairs = |o: &Json, k: &str| -> Result<Vec<(String, String)>, String> {
+        let a = o.get(k).and_then(Json::as_arr).ok_or_else(|| format!("mesboot step: `{k}' not an array"))?;
+        a.iter()
+            .map(|p| {
+                let pa = p.as_arr().filter(|pa| pa.len() == 2).ok_or("mesboot step: pair is not a 2-array")?;
+                match (pa.first().and_then(Json::as_str), pa.get(1).and_then(Json::as_str)) {
+                    (Some(a), Some(b)) => Ok((a.to_string(), b.to_string())),
+                    _ => Err("mesboot step: non-string pair".to_string()),
+                }
+            })
+            .collect()
+    };
+    let strs = |o: &Json, k: &str| -> Result<Vec<String>, String> {
+        let a = o.get(k).and_then(Json::as_arr).ok_or_else(|| format!("mesboot step: `{k}' not an array"))?;
+        Ok(a.iter().filter_map(Json::as_str).map(str::to_string).collect())
+    };
+
+    for (i, step) in steps.iter().enumerate() {
+        let err = |m: String| format!("mesboot step {}: {m}", i + 1);
+        if let Some(o) = step.get("run") {
+            // `glob:PAT` argv elements expand to the SORTED matches (one `*`,
+            // basename component only) — `ar r out.a tg/*.o`-shaped rung steps
+            // without any shell. Zero matches is a hard error (a silent empty
+            // splice would turn an install step into a no-op).
+            let mut argv: Vec<String> = Vec::new();
+            for a in ctx.expand_all(&strs(o, "argv")?).map_err(err)? {
+                match a.strip_prefix("glob:") {
+                    None => argv.push(a),
+                    Some(pat) => {
+                        let mut hits = glob_one_star(pat).map_err(err)?;
+                        if hits.is_empty() {
+                            return Err(err(format!("glob:{pat} matched nothing")));
+                        }
+                        hits.sort();
+                        argv.extend(hits);
+                    }
+                }
+            }
+            let dir = ctx.expand(&field(o, "dir")?).map_err(err)?;
+            let mut envs: Vec<(String, String)> = Vec::new();
+            for (k, v) in pairs(o, "env")? {
+                envs.push((k, ctx.expand(&v).map_err(err)?));
+            }
+            let (prog, rest) = argv
+                .split_first()
+                .ok_or_else(|| err("run: empty argv".into()))?;
+            let restv: Vec<&str> = rest.iter().map(String::as_str).collect();
+            run_cmd(prog, &restv, &dir, &envs, &WATCH_PHASE)?;
+        } else if let Some(o) = step.get("toolFarm") {
+            let links = o
+                .as_arr()
+                .ok_or_else(|| err("toolFarm: not an array".into()))?;
+            for p in links {
+                let pa = p.as_arr().filter(|pa| pa.len() == 2).ok_or_else(|| err("toolFarm: pair".into()))?;
+                let (name, target) = match (pa.first().and_then(Json::as_str), pa.get(1).and_then(Json::as_str)) {
+                    (Some(a), Some(b)) => (a.to_string(), ctx.expand(b).map_err(err)?),
+                    _ => return Err(err("toolFarm: non-string pair".into())),
+                };
+                let link = Path::new(&ctx.tools).join(&name);
+                let _ = fs::remove_file(&link);
+                std::os::unix::fs::symlink(&target, &link)
+                    .map_err(|e| err(format!("symlink {name} -> {target}: {e}")))?;
+            }
+        } else if let Some(o) = step.get("writeFile") {
+            let path = ctx.expand(&field(o, "path")?).map_err(err)?;
+            let content = ctx.expand(&field(o, "content")?).map_err(err)?;
+            let exec = o.get("exec").is_some_and(Json::is_true);
+            if let Some(parent) = Path::new(&path).parent() {
+                fs::create_dir_all(parent).map_err(|e| err(format!("mkdir {}: {e}", parent.display())))?;
+            }
+            fs::write(&path, content).map_err(|e| err(format!("write {path}: {e}")))?;
+            let mode = if exec { 0o755 } else { 0o644 };
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                .map_err(|e| err(format!("chmod {path}: {e}")))?;
+        } else if let Some(o) = step.get("copyFiles") {
+            let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
+            for f in ctx.expand_all(&strs(o, "files")?).map_err(err)? {
+                copy_file_writable(Path::new(&f), Path::new(&dest)).map_err(err)?;
+            }
+        } else if let Some(o) = step.get("copyTree") {
+            let from = ctx.expand(&field(o, "from")?).map_err(err)?;
+            let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
+            copy_tree_writable(Path::new(&from), Path::new(&dest)).map_err(err)?;
+        } else if let Some(o) = step.get("symlink") {
+            let target = ctx.expand(&field(o, "target")?).map_err(err)?;
+            let link = ctx.expand(&field(o, "link")?).map_err(err)?;
+            // Create the link's parent (every sibling step does), so a symlink into a
+            // not-yet-made dir does not red ENOENT; then replace any existing entry.
+            if let Some(parent) = Path::new(&link).parent() {
+                fs::create_dir_all(parent).map_err(|e| err(format!("mkdir {}: {e}", parent.display())))?;
+            }
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link)
+                .map_err(|e| err(format!("symlink {link} -> {target}: {e}")))?;
+        } else if let Some(p) = step.get("mkDir") {
+            let path = ctx
+                .expand(p.as_str().ok_or_else(|| err("mkDir: not a string".into()))?)
+                .map_err(err)?;
+            fs::create_dir_all(&path).map_err(|e| err(format!("mkdir {path}: {e}")))?;
+        } else if let Some(o) = step.get("patchShebangs") {
+            let dir = ctx.expand(&field(o, "dir")?).map_err(err)?;
+            let shell = ctx.expand(&field(o, "shell")?).map_err(err)?;
+            patch_shebangs(Path::new(&dir), &shell).map_err(err)?;
+        } else if let Some(o) = step.get("require") {
+            let exec = o.get("exec").is_some_and(Json::is_true);
+            for p in ctx.expand_all(&strs(o, "paths")?).map_err(err)? {
+                let meta = fs::metadata(&p)
+                    .map_err(|_| err(format!("required product missing: {p}")))?;
+                if exec && (!meta.is_file() || meta.permissions().mode() & 0o111 == 0) {
+                    return Err(err(format!("required product not an executable file: {p}")));
+                }
+            }
+        } else {
+            return Err(err("unknown step kind".into()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1552,6 +1835,47 @@ mod tests {
             repeat_secs: Duration::from_millis(repeat_ms),
             drain_grace: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn mesboot_template_expands_tokens_and_passes_foreign_braces_verbatim() {
+        // The rung seds carry brace text (`${vdso_symver//./_}`) that must NOT
+        // expand; recognised tokens must; an unknown {in:X} is a hard error.
+        let ctx = StepCtx {
+            root: "/r".into(),
+            src: "/r/src".into(),
+            out: "/o".into(),
+            tools: "/r/tools".into(),
+            jobs: "4".into(),
+            inputs: vec![("mes".into(), "/td/store/abc-mes".into())],
+        };
+        assert_eq!(
+            ctx.expand("{in:mes}/bin -j{jobs} {src}").unwrap(),
+            "/td/store/abc-mes/bin -j4 /r/src"
+        );
+        assert_eq!(
+            ctx.expand("s,${vdso_symver//./_},x,").unwrap(),
+            "s,${vdso_symver//./_},x,"
+        );
+        let err = ctx.expand("{in:nope}/bin").expect_err("unknown input reds");
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn mesboot_glob_one_star_matches_sorted_and_rejects_bad_patterns() {
+        let d = std::env::temp_dir().join(format!("td-glob-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        for f in ["b.o", "a.o", "c.txt"] {
+            fs::write(d.join(f), b"x").unwrap();
+        }
+        let pat = format!("{}/*.o", d.display());
+        let mut hits = glob_one_star(&pat).unwrap();
+        hits.sort();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits[0].ends_with("/a.o") && hits[1].ends_with("/b.o"), "{hits:?}");
+        assert!(glob_one_star("no-star-here").is_err());
+        assert!(glob_one_star("two/*st*ars").is_err());
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

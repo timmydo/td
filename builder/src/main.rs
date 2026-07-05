@@ -1894,7 +1894,10 @@ fn assemble_recipe_drv(
         // stage0: the seed executor (build::run_stage0, #378) — place the pinned
         // stage0-posix tree writable and exec its kaem interpreter; no build inputs.
         "stage0" => "stage0-build",
-        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0)")),
+        // mesboot: the bootstrap-RUNG executor (build::run_mesboot, #378 slices
+        // 2+3) — the recipe's typed steps run in the sandbox over staged inputs.
+        "mesboot" => "mesboot-build",
+        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot)")),
     };
     // configure flags + phases (both optional) -> JSON array string. A configure
     // flag may itself contain whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`), so the
@@ -2012,6 +2015,28 @@ fn assemble_recipe_drv(
                     "recipe: buildSystem \"stage0\" supports no configureFlags/phases — the seed runner would silently ignore them, so declaring them is an error".into(),
                 );
             }
+        }
+        // mesboot: the bootstrap-rung step executor (#378 slices 2+3). The typed
+        // steps ride as JSON; {in:NAME} templates resolve through TD_INPUT_MAP
+        // (lock entry name -> canonical store path, source entry included).
+        // configureFlags/phases have no runner here — hard error, never ignored.
+        "mesboot" => {
+            let steps = alist
+                .get("steps")
+                .ok_or("recipe: buildSystem \"mesboot\" requires `steps'")?;
+            if alist.get("configureFlags").is_some() || alist.get("phases").is_some() {
+                return Err(
+                    "recipe: buildSystem \"mesboot\" supports no configureFlags/phases — rungs declare typed `steps'".into(),
+                );
+            }
+            spec.push_str(&format!("env TD_STEPS={}\n", steps.to_json_string()));
+            let map = json::Json::Obj(
+                entries
+                    .iter()
+                    .map(|e| (e.name.clone(), json::Json::Str(e.path.clone())))
+                    .collect(),
+            );
+            spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
         }
         // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS) and,
         // if any vendored deps were locked, resolves them offline (TD_VENDOR_CRATES).
@@ -2226,17 +2251,21 @@ fn build_plan(
     Ok(())
 }
 
-/// A recipe's declared inputs — the JSON `inputs` array (absent → none).
+/// A recipe's declared inputs — the JSON `inputs` array UNION `nativeInputs`
+/// (#378 staged builders: a rung's compiler is a prior rung's output; --auto
+/// chains both edge kinds identically).
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_inputs(recipe_dir: &str, name: &str) -> Result<Vec<String>, String> {
     let p = format!("{recipe_dir}/{name}.json");
     let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
     let alist = json::parse(&text).map_err(|e| format!("recipe JSON {p}: {e}"))?;
-    Ok(alist
-        .get("inputs")
-        .and_then(json::Json::as_arr)
-        .map(|a| a.iter().filter_map(json::Json::as_str).map(str::to_string).collect())
-        .unwrap_or_default())
+    let mut xs: Vec<String> = Vec::new();
+    for key in ["inputs", "nativeInputs"] {
+        if let Some(a) = alist.get(key).and_then(json::Json::as_arr) {
+            xs.extend(a.iter().filter_map(json::Json::as_str).map(str::to_string));
+        }
+    }
+    Ok(xs)
 }
 
 /// An input is OWNED (td reconstructs it) iff both its recipe JSON and base lock exist;
@@ -6184,6 +6213,15 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("td-builder: stage0-build: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        // td's bootstrap-RUNG step executor (#378 slices 2+3): see
+        // build::run_mesboot. Same env-driven derivation-builder contract.
+        Some("mesboot-build") if args.len() == 2 => match build::run_mesboot() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: mesboot-build: {e}");
                 ExitCode::FAILURE
             }
         },
