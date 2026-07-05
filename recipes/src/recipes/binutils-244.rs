@@ -2,12 +2,13 @@ use crate::ladder::{base_path, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.44 — rung 19 (#378): the modern binutils glibc 2.41 needs
-// (2.20.1a is too old), built by gcc-mesboot1 (4.6.4) DYNAMIC against the
-// shared glibc 2.16.0 — its as/ld run inside the glibc-2.41 rung's sandbox
-// where the shared glibc input resolves at its canonical path (this retires
-// the deleted ladder's build-dir-interp/TMPDIR-length dance: store paths are
-// stable). -std=gnu99 (2.44 is C99+; 4.6.4 defaults gnu89); deterministic
-// archives; install prefix={out}.
+// (2.20.1a is too old), built by gcc-mesboot1 (4.6.4) STATIC against the
+// static glibc 2.16.0 — like every other mesboot binutils. The deleted ladder
+// built it DYNAMIC with a build-dir interp only to make it sandbox-runnable
+// (the TMPDIR-length dance); as recipes, static as/ld run ANYWHERE — later
+// rung sandboxes, store-ns own-roots — with no interp/RUNPATH story at all.
+// -std=gnu99 (2.44 is C99+; 4.6.4 defaults gnu89); deterministic archives;
+// install prefix={out}.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:binutils-mesboot}}/bin:{}", base_path());
     let mut steps = unpack_into("binutils-244-source", "{src}");
@@ -21,13 +22,12 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make}/bin/make".into()),
         ],
     });
-    // the wrapper CC: gcc 4.6.4 vs the SHARED glibc 2.16.0, interp + rpath at
-    // the input's canonical lib (resolves wherever this rung's output is used
-    // inside a sandbox — the glibc-2.41 rung).
+    // single-token static wrapper (the gcc-14 rung's proven shape): gcc 4.6.4
+    // vs the STATIC glibc 2.16.0.
     steps.push(Step::WriteFile {
         path: "{root}/wb/gcc".into(),
         content: format!(
-            "#!{SH}\nexec \"{{in:gcc-mesboot1}}/bin/gcc\" -std=gnu99 -isystem \"{{in:glibc-mesboot-shared}}/include\" -B\"{{in:glibc-mesboot-shared}}/lib\" -L\"{{in:glibc-mesboot-shared}}/lib\" -L\"{{in:gcc-mesboot1}}/lib/gcc/i686-unknown-linux-gnu/4.6.4\" -Wl,--dynamic-linker -Wl,{{in:glibc-mesboot-shared}}/lib/ld-linux.so.2 -Wl,-rpath -Wl,{{in:glibc-mesboot-shared}}/lib \"$@\"\n"
+            "#!{SH}\nexec \"{{in:gcc-mesboot1}}/bin/gcc\" -std=gnu99 -static -isystem \"{{in:glibc-mesboot}}/include\" -B\"{{in:glibc-mesboot}}/lib\" -L\"{{in:glibc-mesboot}}/lib\" -L\"{{in:gcc-mesboot1}}/lib/gcc/i686-unknown-linux-gnu/4.6.4\" \"$@\"\n"
         ),
         exec: true,
     });
@@ -91,7 +91,7 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     Recipe::mesboot("binutils-244", "2.44")
-        .native_inputs(&["gcc-mesboot1", "glibc-mesboot-shared", "binutils-mesboot"])
+        .native_inputs(&["gcc-mesboot1", "glibc-mesboot", "binutils-mesboot"])
         .inputs(&[
             "flex",
             "bison",

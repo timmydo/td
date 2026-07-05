@@ -121,7 +121,7 @@ ladder_lock glibc-mesboot glibc-216-source rung:make-mesboot rung:patch-mesboot 
 ladder_lock gcc-mesboot gcc-494-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot src:gmp src:mpfr src:mpc src:linux-headers tool:flex tool:bison $BT || fail "lock gcc-mesboot"
 ladder_lock glibc-mesboot-shared glibc-216-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot0 rung:gawk-mesboot src:patch-glibc-boot-2.16.0 src:patch-glibc-bootstrap-system-2.16.0 src:linux-headers $BT || fail "lock glibc-mesboot-shared"
 ladder_lock gcc-14 gcc-14-source rung:binutils-mesboot rung:gcc-mesboot rung:glibc-mesboot src:gmp63 src:mpfr421 src:mpc131 src:linux-headers tool:flex tool:bison tool:m4 tool:make $BT || fail "lock gcc-14"
-ladder_lock binutils-244 binutils-244-source rung:gcc-mesboot1 rung:glibc-mesboot-shared rung:binutils-mesboot tool:flex tool:bison tool:make $BT || fail "lock binutils-244"
+ladder_lock binutils-244 binutils-244-source rung:gcc-mesboot1 rung:glibc-mesboot rung:binutils-mesboot tool:flex tool:bison tool:make $BT || fail "lock binutils-244"
 ladder_lock glibc-241 glibc-241-source rung:gcc-14 rung:glibc-mesboot-shared rung:binutils-244 src:linux-headers tool:flex tool:bison tool:m4 tool:make tool:python $BT || fail "lock glibc-241"
 echo "   [ladder] build-plan --auto glibc-241: the 20-rung recipe graph, from the 229-byte seed"
 ladder_build glibc-241 >/dev/null || fail "the recipe ladder did not build (see $LWDIR/build-glibc-241.err)"
