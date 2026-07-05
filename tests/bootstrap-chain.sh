@@ -91,11 +91,20 @@ TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chai
 if [ -n "$TD_CHECK_CHAIN_CACHE" ]; then
   LWDIR="$HOME/.td/build-daemon/ladder"
 else
-  LWDIR="$ROOT/.td-build-cache/ladder-cold"; rm -rf "$LWDIR"
+  LWDIR="$ROOT/.td-build-cache/ladder-cold"
 fi
+# The lock lives OUTSIDE LWDIR (a STABLE sibling) and is taken BEFORE the cold-mode wipe: a
+# lock file inside LWDIR would be unlinked by a peer's `rm -rf "$LWDIR"`, so its flock would
+# guard nothing and two force-cold gates (both Shared/Daily, run in parallel on the daily
+# backstop) would build into the same dir and corrupt each other's from-seed run. Held for
+# the WHOLE body (not released after ladder_build): the tail's `_lout` reads build-*.out,
+# which a peer's ladder_build truncates — so a peer must not run until this gate's tail is
+# done reading. The kernel drops the fd on process exit; concurrent gates serialize and the
+# waiter then cache-hits the warm ladder (or, cold, rebuilds from seed after the winner).
+mkdir -p "`dirname "$LWDIR"`"
+exec 9>"$LWDIR.lock"; flock 9 || fail "ladder: flock failed"
+test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$LWDIR"   # cold: from-scratch, now serialized under the lock
 mkdir -p "$LWDIR"
-# One builder at a time on the shared dir; the flock loser then cache-hits through.
-exec 9>"$LWDIR/.lock"; flock 9 || fail "ladder: flock failed"
 ladder_setup "$LWDIR" || fail "ladder_setup (intern/tools) failed"
 ladder_emit stage0 mes tcc make-mesboot0 patch-mesboot binutils-mesboot0 gcc-core-mesboot0 \
   mesboot-headers glibc-mesboot0 gcc-mesboot0 binutils-mesboot1 make-mesboot gcc-mesboot1 \
@@ -137,9 +146,20 @@ BMB244SB="$LADDER_TDSTORE/$BU244_BASE"
 CC1=`ls "$GCC14"/libexec/gcc/i686-unknown-linux-gnu/14.3.0/cc1 2>/dev/null || true`
 test -e "$GLIBC241/lib/libc.so.6" -a -e "$GLIBC241/lib/ld-linux.so.2" || fail "glibc 2.41 missing libc.so.6/ld-linux.so.2"
 test -e "$GLIBC241/include/linux/limits.h" || fail "kernel headers not present in glibc 2.41 include"
-for b in "$GLIBC241/lib/libc.so.6" "$GCC14/bin/gcc" "$CC1"; do
-  test -n "$b" -a -e "$b" || fail "toolchain output missing ($b)"
+# Scan the toolchain's LINK INPUTS — the objects/libs a compiled program actually pulls in
+# (glibc crt + gcc-internal libgcc/crtbegin/crtend + static libstdc++), not just the driver.
+# A /gnu/store byte in ANY of these injects guix into every program td's toolchain builds; the
+# old leg checked only libc.so.6/gcc/cc1 and missed the crt/libgcc surface. (This is the
+# toolchain-provenance seal; a corpus binary may still carry harmless NON-load-bearing residue
+# from the guix-seed BUILD TOOLS — make/bash/coreutils, retired last in #312 — so the assertion
+# is on what td PRODUCES, not on the whole compiled artifact.)
+GCCLIBEXEC="$GCC14/lib/gcc/i686-unknown-linux-gnu/14.3.0"
+for b in "$GLIBC241/lib/libc.so.6" "$GCC14/bin/gcc" "$CC1" \
+         "$GLIBC241/lib/crt1.o" "$GLIBC241/lib/crti.o" "$GLIBC241/lib/crtn.o" \
+         "$GCCLIBEXEC/libgcc.a" "$GCCLIBEXEC/crtbegin.o" "$GCCLIBEXEC/crtend.o" \
+         "$GCC14/lib/libstdc++.a"; do
+  test -n "$b" -a -e "$b" || fail "toolchain link input missing ($b)"
   if grep -q -a '/gnu/store' "$b"; then fail "$b contains /gnu/store bytes"; fi
 done
-echo "   [no-guix] recipe ladder: seed → … → gcc 14.3.0 + binutils 2.44 → glibc 2.41; no /gnu/store in libc.so.6 / gcc / cc1"
+echo "   [no-guix] recipe ladder: seed → … → gcc 14.3.0 + binutils 2.44 → glibc 2.41; no /gnu/store in libc.so.6 / gcc / cc1 / crt / libgcc / libstdc++"
 }

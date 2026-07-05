@@ -46,7 +46,7 @@ load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builde
 
 # The ~850-line seed→…→gcc-14.3.0+binutils-2.44+glibc-2.41 chain (shared library).
 . tests/bootstrap-chain.sh
-bootstrap_modern_toolchain   # from the seed: builds + verifies the toolchain; sets GCC14/GLIBC241/BMB244SB/CC1/cpath/KH_TB
+bootstrap_modern_toolchain   # the 20-rung recipe ladder; sets GCC14/GLIBC241/BMB244SB/CC1 + LADDER_TDSTORE/*_BASE
 csh=`command -v bash 2>/dev/null || command -v sh`
 
 # --- Assemble a guix-gcc-toolchain-shaped /td/store toolchain (as gate 416) ------------------

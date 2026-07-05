@@ -38,7 +38,7 @@ export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 
 . tests/bootstrap-chain.sh
-bootstrap_modern_toolchain   # from the seed: builds + verifies the toolchain; sets GCC14/GLIBC241/BMB244SB/CC1/cpath/KH_TB
+bootstrap_modern_toolchain   # the 20-rung recipe ladder; sets GCC14/GLIBC241/BMB244SB/CC1 + LADDER_TDSTORE/*_BASE
 snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 export TD_STORE_DIR=/td/store
 GLP=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$store" "$sndb"` || fail "store-add glibc-2.41 failed"

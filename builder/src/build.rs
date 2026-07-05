@@ -1397,6 +1397,10 @@ fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
         if ft.is_dir() {
             copy_tree_writable(&from, &to)?;
         } else if ft.is_symlink() {
+            // Overlay semantics: a CopyTree may land onto an already-populated tree (the
+            // kernel-header overlay after `make install`), so remove a colliding dest first —
+            // otherwise symlink() reds EEXIST where the regular-file arm below would overwrite.
+            let _ = fs::remove_file(&to);
             let target = fs::read_link(&from)
                 .map_err(|e| format!("readlink {}: {e}", from.display()))?;
             std::os::unix::fs::symlink(&target, &to)
@@ -1776,6 +1780,11 @@ pub fn run_mesboot() -> Result<(), String> {
         } else if let Some(o) = step.get("symlink") {
             let target = ctx.expand(&field(o, "target")?).map_err(err)?;
             let link = ctx.expand(&field(o, "link")?).map_err(err)?;
+            // Create the link's parent (every sibling step does), so a symlink into a
+            // not-yet-made dir does not red ENOENT; then replace any existing entry.
+            if let Some(parent) = Path::new(&link).parent() {
+                fs::create_dir_all(parent).map_err(|e| err(format!("mkdir {}: {e}", parent.display())))?;
+            }
             let _ = fs::remove_file(&link);
             std::os::unix::fs::symlink(&target, &link)
                 .map_err(|e| err(format!("symlink {link} -> {target}: {e}")))?;
