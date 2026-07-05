@@ -407,52 +407,69 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
     Ok(())
 }
 
+/// A goal string that selects a whole TIER (a pool or combination of pools)
+/// rather than naming one gate — the single source of truth `expand_goals`
+/// and `explicit_goal_indices` both dispatch on, so the two can't drift apart
+/// (issue #377 review).
+fn is_tier_keyword(goal: &str) -> bool {
+    matches!(goal, "check" | "check-pr" | "check-fast" | "check-system" | "check-engine")
+}
+
 /// Expand the requested goals into the set of node indices to run (make
 /// semantics kept: prerequisites always run, so take the transitive dep closure).
 fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, String> {
     let mut sel: HashSet<usize> = HashSet::new();
     let add_pool = |sel: &mut HashSet<usize>, p: Pool| sel.extend(set.members(p));
     for goal in goals {
-        match goal.as_str() {
-            // check-pr is the bounded per-PR tier (~10 min, human 2026-07-04):
-            // the full check MINUS the daily-only pool — one arm so the subset
-            // relation holds by construction. The daily backstop
-            // (ci/daily-full-suite.sh) runs the full `check`, so the daily pool
-            // keeps its coverage nightly.
-            "check" | "check-pr" => {
-                add_pool(&mut sel, Pool::Cheap);
-                if let Some(i) = set.index.get(BUILD_RECIPES) {
-                    sel.insert(*i);
+        if is_tier_keyword(goal) {
+            match goal.as_str() {
+                // check-pr is the bounded per-PR tier (~10 min, human
+                // 2026-07-04): the full check MINUS the daily-only pool — one
+                // arm so the subset relation holds by construction. The daily
+                // backstop (ci/daily-full-suite.sh) runs the full `check`, so
+                // the daily pool keeps its coverage nightly.
+                "check" | "check-pr" => {
+                    add_pool(&mut sel, Pool::Cheap);
+                    if let Some(i) = set.index.get(BUILD_RECIPES) {
+                        sel.insert(*i);
+                    }
+                    add_pool(&mut sel, Pool::Heavy);
+                    if goal == "check" {
+                        add_pool(&mut sel, Pool::Daily);
+                    }
                 }
-                add_pool(&mut sel, Pool::Heavy);
-                if goal == "check" {
-                    add_pool(&mut sel, Pool::Daily);
+                "check-fast" => {
+                    add_pool(&mut sel, Pool::Cheap);
+                    add_pool(&mut sel, Pool::Fast);
                 }
-            }
-            "check-fast" => {
-                add_pool(&mut sel, Pool::Cheap);
-                add_pool(&mut sel, Pool::Fast);
-            }
-            "check-system" => {
-                add_pool(&mut sel, Pool::Cheap);
-                add_pool(&mut sel, Pool::System);
-            }
-            "check-engine" => {
-                add_pool(&mut sel, Pool::Cheap);
-                add_pool(&mut sel, Pool::Engine);
-            }
-            name => match set.index.get(name) {
-                Some(i) => {
-                    sel.insert(*i);
+                "check-system" => {
+                    add_pool(&mut sel, Pool::Cheap);
+                    add_pool(&mut sel, Pool::System);
                 }
-                None => {
+                "check-engine" => {
+                    add_pool(&mut sel, Pool::Cheap);
+                    add_pool(&mut sel, Pool::Engine);
+                }
+                _ => {
                     return Err(format!(
-                        "gate-run: unknown goal `{name}` — a tier \
-                         (check/check-pr/check-fast/check-system/check-engine), a gate name \
-                         (`td-builder gate-run list-gates`), or build-recipes"
+                        "gate-run: internal error: `{goal}` is a tier keyword with no \
+                         dispatch arm (is_tier_keyword/expand_goals out of sync)"
                     ))
                 }
-            },
+            }
+            continue;
+        }
+        match set.index.get(goal.as_str()) {
+            Some(i) => {
+                sel.insert(*i);
+            }
+            None => {
+                return Err(format!(
+                    "gate-run: unknown goal `{goal}` — a tier \
+                     (check/check-pr/check-fast/check-system/check-engine), a gate name \
+                     (`td-builder gate-run list-gates`), or build-recipes"
+                ))
+            }
         }
     }
     // Transitive closure over deps.
@@ -473,6 +490,23 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
             return Ok(sel);
         }
     }
+}
+
+/// The subset of `goals` naming a gate DIRECTLY (not a tier keyword) — see
+/// `RunCfg::explicit_goals` (issue #377). Deliberately does NOT take the
+/// transitive-dep closure `expand_goals` does: a dependency pulled in to
+/// satisfy an explicit goal is still only along for the ride.
+fn explicit_goal_indices(set: &GateSet, goals: &[String]) -> HashSet<usize> {
+    let mut out = HashSet::new();
+    for goal in goals {
+        if is_tier_keyword(goal) {
+            continue;
+        }
+        if let Some(i) = set.index.get(goal.as_str()) {
+            out.insert(*i);
+        }
+    }
+    out
 }
 
 /// Scope the synthetic build-recipes node's TD_BUILD_SPECS to the specs the
@@ -1226,6 +1260,13 @@ struct RunCfg {
     /// switch), else `~/.td/build-daemon/chain`. None (no HOME) leaves the gate
     /// env untouched. Private gates ALWAYS get TD_CHECK_CHAIN_CACHE force-cleared.
     chain_cache: Option<String>,
+    /// Gate indices named DIRECTLY in the invocation's goals (issue #377) —
+    /// e.g. `store-verify` in `td-builder check store-verify` — as opposed to
+    /// pulled in only via a tier keyword or as another goal's dependency. A
+    /// `non_blocking` gate's failure is tolerated (SoftFailed) when it is
+    /// merely along for the ride, but NOT when it IS the goal: asking "is
+    /// this one gate green?" must not silently report green for a red gate.
+    explicit_goals: HashSet<usize>,
 }
 
 /// True when a node contends on the machine-wide pool: everything except the
@@ -1427,8 +1468,23 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
             .filter_map(|(i, _)| set.gates.get(*i).map(|g| g.name.as_str()))
             .collect()
     };
-    // Non-blocking failures are tolerated: reported, but they do NOT red the run.
-    let soft: Vec<&str> = names(St::SoftFailed);
+    // Non-blocking failures are tolerated: reported, but they do NOT red the run
+    // — EXCEPT a SoftFailed gate that is itself the explicit goal (issue #377):
+    // that one is about to red the run below, so it's excluded here rather than
+    // reported as "tolerated" right before a contradictory RED line.
+    let mut soft: Vec<&str> = Vec::new();
+    let mut explicit_soft: Vec<&str> = Vec::new();
+    for (i, st) in s.st.iter() {
+        if *st != St::SoftFailed {
+            continue;
+        }
+        let Some(name) = set.gates.get(*i).map(|g| g.name.as_str()) else { continue };
+        if cfg.explicit_goals.contains(i) {
+            explicit_soft.push(name);
+        } else {
+            soft.push(name);
+        }
+    }
     if !soft.is_empty() {
         eprintln!(
             "gate-run: {} non-blocking gate(s) FAILED but tolerated (not blocking): {}",
@@ -1436,15 +1492,33 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
             soft.join(" ")
         );
     }
-    // Green iff every gate ended Done or SoftFailed (no hard Failed, none left
-    // Pending/Running by fail-fast).
-    let green = s.st.values().all(|st| matches!(st, St::Done | St::SoftFailed));
+    // Green iff every gate ended Done, or SoftFailed AND not the explicit goal
+    // (issue #377 — a SoftFailed gate that IS the goal must red the run; one
+    // that's merely along for the ride stays tolerated) — no hard Failed,
+    // none left Pending/Running by fail-fast.
+    let green = s.st.iter().all(|(i, st)| match st {
+        St::Done => true,
+        St::SoftFailed => !cfg.explicit_goals.contains(i),
+        St::Failed | St::Pending | St::Running => false,
+    });
     if !green {
         let failed = names(St::Failed);
         let skipped = s.st.values().filter(|st| **st == St::Pending).count();
         eprintln!(
-            "gate-run: RED — failed: {}{}",
-            if failed.is_empty() { "(none — internal error)".to_string() } else { failed.join(" ") },
+            "gate-run: RED — failed: {}{}{}",
+            if failed.is_empty() && explicit_soft.is_empty() {
+                "(none — internal error)".to_string()
+            } else {
+                failed.join(" ")
+            },
+            if !explicit_soft.is_empty() {
+                format!(
+                    " (non-blocking but explicitly requested, so not tolerated: {})",
+                    explicit_soft.join(" ")
+                )
+            } else {
+                String::new()
+            },
             if skipped > 0 { format!(" ({skipped} gates not started)") } else { String::new() }
         );
     }
@@ -1672,6 +1746,7 @@ pub fn cli(args: &[String]) -> ExitCode {
         gate_mem_mib,
         gate_tree_mem_mib,
         chain_cache,
+        explicit_goals: explicit_goal_indices(&set, &goals),
         cgroup_dir: std::env::var("TD_CHECK_CGROUP")
             .ok()
             .filter(|v| !v.is_empty())
@@ -1869,6 +1944,7 @@ mod tests {
             gate_mem_mib: 0,
             gate_tree_mem_mib: 0,
             chain_cache: None,
+            explicit_goals: HashSet::new(),
             cgroup_dir: None,
         }
     }
@@ -1957,6 +2033,35 @@ mod tests {
             "an untagged (blocking) failure must still red the run"
         );
         assert!(!d2.join("after.ran").exists(), "blocking failure must fail-fast the dependent");
+    }
+
+    #[test]
+    fn non_blocking_gate_named_as_the_explicit_goal_reds_the_run() {
+        // Issue #377: `td-builder check store-verify` on a red-but-non_blocking
+        // store-verify must NOT exit 0 — the non_blocking tolerance is for gates
+        // pulled in as a tier member or a dependency, not for the gate the caller
+        // is directly asking about.
+        let d = tmpdir("nonblock-explicit");
+        let mut set = synth(&d, &[("softfail", Pool::Cheap, "exit 7", &[])]);
+        let si = *set.index.get("softfail").unwrap();
+        set.gates.get_mut(si).unwrap().non_blocking = true;
+
+        let sel = expand_goals(&set, &["softfail".to_string()]).unwrap();
+        let mut c = cfg(&d, 4, None);
+        c.explicit_goals = explicit_goal_indices(&set, &["softfail".to_string()]);
+        assert!(
+            !run_selected(&set, &sel, &c).unwrap(),
+            "a non_blocking gate named directly as the goal must red, not silently pass"
+        );
+
+        // Contrast: the SAME gate, selected only via its tier, stays tolerated —
+        // unaffected by this fix (matches the existing test above).
+        let sel_tier = expand_goals(&set, &["check-fast".to_string()]).unwrap();
+        let c_tier = cfg(&d, 4, None); // explicit_goals empty: not named directly
+        assert!(
+            run_selected(&set, &sel_tier, &c_tier).unwrap(),
+            "the same gate reached only via a tier must still be tolerated"
+        );
     }
 
     #[test]
