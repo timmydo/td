@@ -140,7 +140,7 @@ o2=`sed -n 's/^OUT=out //p' "$b8/sb2.out"`; test "$o" = "$o2" || fail "the skipp
 echo "   [DURABLE skip/read-back] a SEPARATE invocation SKIPPED the build (CACHE=persist) — the build path read sed back from P at the same /td/store path"
 
 # --- [DURABLE behavioral] run the sed READ BACK FROM P in the own-root (/gnu/store ABSENT) ----
-si=`"$BMB/bin/readelf" -l "$P/store/$sbase/bin/sed" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
+si=`"$TB" elf-interp "$P/store/$sbase/bin/sed" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
 test -n "$si" || fail "the persisted sed is not linked vs the /td/store glibc 2.41"
 if grep -q -a -- "$oldtc" "$P/store/$sbase/bin/sed"; then fail "the persisted sed references the substituted-out gcc-toolchain $oldtc"; fi
 vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`

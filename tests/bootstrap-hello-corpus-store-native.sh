@@ -45,7 +45,7 @@ export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 
 . tests/bootstrap-chain.sh
-bootstrap_modern_toolchain   # from the seed: builds + verifies the toolchain; sets GCC14/GLIBC241/BMB244SB/CC1/cpath/KH_TB
+bootstrap_modern_toolchain   # the 20-rung recipe ladder; sets GCC14/GLIBC241/BMB244SB/CC1 + LADDER_TDSTORE/*_BASE
 snwork=`mktemp -d`; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
 export TD_STORE_DIR=/td/store
 GLP=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$store" "$sndb"` || fail "store-add glibc-2.41 failed"
@@ -53,40 +53,49 @@ case "$GLP" in /td/store/*-glibc-2.41) ;; *) fail "glibc-2.41 not content-addres
 glrel=${GLP#/td/store/}
 echo "   [content-addr] interned $GLP in /td/store"
 
-# Build the test C/C++ programs IN THE SANDBOX (the userland build-wrapper trick): real -B/-L/-isystem at the
-# live glibc 2.41 build dir, the /td/store glibc 2.41 interp+RUNPATH baked; sandbox binutils 2.44 for as/ld.
-# Then RUN the artifacts standalone in the own-root (no binutils needed there). gcc 14's static libstdc++
-# (built vs glibc 2.16.0) runs on glibc 2.41 (backward-compatible). C++ exercises <vector>.
+# Build the test C/C++ programs INSIDE store-ns (#378: binutils 2.44's as/ld are dynamic vs the
+# shared glibc 2.16 recipe output, so they run where /td/store canonicals resolve — the own-root,
+# not the host). The rung outputs stage in at their CANONICAL names via cp -a from the ladder's
+# td-store (no re-hash — baked references keep resolving); gcc-14's stage tree + the interned
+# glibc 2.41 give the wrapper its -B/-L/-isystem; the built programs then run in the SAME root.
 csh=`command -v bash 2>/dev/null || command -v sh`
-bw=`mktemp -d`/bw; mkdir -p "$bw" "$snwork/w"
-printf 'int main(){return 42;}\n' > "$snwork/w/c.c"
-printf '#include <vector>\nint main(){std::vector<int> v; for(int i=0;i<43;i++) v.push_back(i); return v[42];}\n' > "$snwork/w/cpp.cc"
-for cc in gcc g++; do
-  printf '#!%s\nexec "%s/bin/%s" -isystem "%s/include" -B"%s/lib" -L"%s/lib" -L"%s/lib/gcc/i686-unknown-linux-gnu/14.3.0" -static-libgcc -static-libstdc++ -Wl,--dynamic-linker -Wl,/td/store/%s/lib/ld-linux.so.2 -Wl,--enable-new-dtags -Wl,-rpath -Wl,/td/store/%s/lib "$@"\n' \
-    "$csh" "$GCC14" "$cc" "$GLIBC241" "$GLIBC241" "$GLIBC241" "$GCC14" "$glrel" "$glrel" > "$bw/$cc"
+for b in "$GCC14_BASE" "$BU244_BASE" "$GLSHARED_BASE"; do
+  cp -a "$LADDER_TDSTORE/$b" "$store/$b" || fail "staging $b into the verify store failed"
 done
-chmod 0555 "$bw/gcc" "$bw/g++"
-( cd "$snwork/w" && env PATH="$BMB244SB/bin:$cpath" "$bw/gcc" -o c.out c.c ) || fail "gcc 14.3.0 did not compile a C program vs glibc 2.41"
-( cd "$snwork/w" && env PATH="$BMB244SB/bin:$cpath" "$bw/g++" -O2 -o cpp.out cpp.cc ) || fail "g++ 14.3.0 did not compile a C++ program vs glibc 2.41"
-ci=`"$BMB244SB/bin/readelf" -l "$snwork/w/c.out" 2>/dev/null | grep -o "/td/store/$glrel/lib/ld-linux.so.2" | head -1`
-test -n "$ci" || fail "the C program interp is not the /td/store glibc 2.41 ld-linux"
-if grep -q -a '/gnu/store' "$snwork/w/c.out"; then fail "the C program contains /gnu/store bytes"; fi
-echo "   built C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
-mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
-WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || fail "store-add prog failed"; wprel=${WP#/td/store/}
+chmod -R u+w "$store" 2>/dev/null || true
 # the static-bash fixture is a DECLARED gate input (#353): the runner resolved it.
 bs=${TD_GATE_INPUT_BASH_STATIC:-}
 test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
+mkdir -p "$store/w"
+printf 'int main(){return 42;}\n' > "$store/w/c.c"
+printf '#include <vector>\nint main(){std::vector<int> v; for(int i=0;i<43;i++) v.push_back(i); return v[42];}\n' > "$store/w/cpp.cc"
+gcc14ns="/td/store/$GCC14_BASE/stage/td/store/gcc-14.3.0"
+for cc in gcc g++; do
+  printf '#!/td/store/%s/bin/bash\nexec "%s/bin/%s" -isystem "/td/store/%s/include" -B"/td/store/%s/lib" -L"/td/store/%s/lib" -L"%s/lib/gcc/i686-unknown-linux-gnu/14.3.0" -static-libgcc -static-libstdc++ -Wl,--dynamic-linker -Wl,/td/store/%s/lib/ld-linux.so.2 -Wl,--enable-new-dtags -Wl,-rpath -Wl,/td/store/%s/lib "$@"\n' \
+    "$bbase" "$gcc14ns" "$cc" "$glrel" "$glrel" "$glrel" "$gcc14ns" "$glrel" "$glrel" > "$store/w/$cc"
+done
+chmod 0555 "$store/w/gcc" "$store/w/g++"
 snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
-/td/store/'"$wprel"'/bin/c; echo "CRC=$?"
-/td/store/'"$wprel"'/bin/cpp; echo "CPPRC=$?"'
-snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | sed 's/^/     /' >&2; fail "store-ns glibc-2.41 probe exited nonzero"; }
-printf '%s\n' "$snout" | sed 's/^/     /' >&2
+cd /td/store/w
+PATH=/td/store/'"$BU244_BASE"'/bin
+export PATH
+./gcc -o c.out c.c || echo COMPILE-C-FAILED
+./g++ -O2 -o cpp.out cpp.cc || echo COMPILE-CPP-FAILED
+./c.out; echo "CRC=$?"
+./cpp.out; echo "CPPRC=$?"'
+snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | sed 's/^/     /' >&2; fail "store-ns glibc-2.41 build+run probe exited nonzero"; }
+printf '%s\n' "$snout" | tail -6 | sed 's/^/     /' >&2
+echo "$snout" | grep -q 'COMPILE-C-FAILED'   && fail "gcc 14.3.0 did not compile a C program vs glibc 2.41 in the own-root"
+echo "$snout" | grep -q 'COMPILE-CPP-FAILED' && fail "g++ 14.3.0 did not compile a C++ program vs glibc 2.41 in the own-root"
 echo "$snout" | grep -q '^CRC=42$'   || fail "the C program (vs glibc 2.41) did not return 42 in the own-root"
 echo "$snout" | grep -q '^CPPRC=42$' || fail "the C++ program (vs glibc 2.41) did not return 42 in the own-root"
-echo "   [behavioral] gcc 14.3.0 links a DYNAMIC C AND C++ (libstdc++) program against the MODERN glibc 2.41; both run in the own-root → 42"
+ci=`"$TB" elf-interp "$store/w/c.out" 2>/dev/null | grep -o "/td/store/$glrel/lib/ld-linux.so.2" | head -1`
+test -n "$ci" || fail "the C program interp is not the /td/store glibc 2.41 ld-linux"
+if grep -q -a '/gnu/store' "$store/w/c.out"; then fail "the C program contains /gnu/store bytes"; fi
+echo "   [behavioral] gcc 14.3.0 COMPILED AND LINKED a dynamic C and C++ (libstdc++) program against the"
+echo "   MODERN glibc 2.41 INSIDE td's own root (binutils 2.44 as/ld from /td/store), interp=$ci; both ran → 42"
 echo "$snout" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root — mixed with guix"
 echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT (unmixed from guix)"
 
@@ -176,7 +185,7 @@ env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
 o=`sed -n 's/^OUT=out //p' "$b8/hb.out"`; test -n "$o" || fail "brick8: hello produced no output"
 hdir="$b8/hb/newstore/`basename "$o"`"; hbin="$hdir/bin/hello"; test -x "$hbin" || fail "brick8: no hello binary"
 # (a) the /td/store toolchain linked it: interp is the /td/store glibc 2.41.
-hi=`"$BMB/bin/readelf" -l "$hbin" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
+hi=`"$TB" elf-interp "$hbin" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
 test -n "$hi" || fail "brick8: hello not linked vs the /td/store glibc 2.41"
 # (b) [no-guix-toolchain] NO reference to guix's gcc-toolchain (the substituted-OUT compiler).
 if grep -q -a -- "$oldtc" "$hbin"; then fail "brick8: hello references the guix gcc-toolchain $oldtc"; fi
