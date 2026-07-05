@@ -38,6 +38,7 @@
 use crate::json::Json;
 use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1377,6 +1378,158 @@ pub fn run_cmake() -> Result<(), String> {
     Ok(())
 }
 
+/// Recursively copy a store tree to `dst`, making the copy user-writable (store
+/// trees are read-only; the kaem build writes its artifacts INTO its tree). File
+/// exec bits are preserved; symlinks are recreated. Pure `std` — the stage0 rung
+/// has NO build inputs, so there is no coreutils `cp` in its sandbox to shell to.
+fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
+    let entries = fs::read_dir(src).map_err(|e| format!("read dir {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read dir {}: {e}", src.display()))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("file type {}: {e}", entry.path().display()))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_tree_writable(&from, &to)?;
+        } else if ft.is_symlink() {
+            let target = fs::read_link(&from)
+                .map_err(|e| format!("readlink {}: {e}", from.display()))?;
+            std::os::unix::fs::symlink(&target, &to)
+                .map_err(|e| format!("symlink {}: {e}", to.display()))?;
+        } else {
+            fs::copy(&from, &to)
+                .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
+            let mode = entry
+                .metadata()
+                .map_err(|e| format!("stat {}: {e}", from.display()))?
+                .permissions()
+                .mode();
+            fs::set_permissions(&to, fs::Permissions::from_mode((mode & 0o777) | 0o200))
+                .map_err(|e| format!("chmod {}: {e}", to.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Scan a tree for `/gnu/store` in any regular file's CONTENTS or any symlink's
+/// TARGET (a grep-style content walk misses a dangling guix symlink); first hit
+/// errors. The stage0 seal's output half, enforced in the ENGINE per build.
+fn require_no_gnu_store(dir: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("file type {}: {e}", entry.path().display()))?;
+        let p = entry.path();
+        let leak = if ft.is_dir() {
+            require_no_gnu_store(&p)?;
+            false
+        } else if ft.is_symlink() {
+            let target =
+                fs::read_link(&p).map_err(|e| format!("readlink {}: {e}", p.display()))?;
+            target.to_string_lossy().contains("/gnu/store")
+        } else if ft.is_file() {
+            crate::bootstrap::contains_gnu_store(&p)
+                .map_err(|e| format!("read {}: {e}", p.display()))?
+        } else {
+            false
+        };
+        if leak {
+            return Err(format!(
+                "stage0 output {} contains /gnu/store bytes — the seed rung is sealed (north star: no guix bytes)",
+                p.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// stage0-build — td's stage0-posix SEED build "system" (#378 slice 1; sibling of
+/// `run`/`run_rust`/`run_cmake`). TD_SRC is the interned seed/stage0 tree: place a
+/// writable copy, mark the two binary seeds executable, exec the kaem interpreter
+/// over the two vendored scripts (hex0-seed → … → M2, blood-elf-0, kaem-0 → M1,
+/// hex2, kaem), install AMD64/{bin,artifact} into $out. The ONLY place a raw
+/// binary seed is exec'd — an engine BuildSystem, so the recipe graph is total.
+///
+/// The SEAL: no build inputs (assemble_recipe_drv hard-errors on any), so the
+/// copy/install are native Rust (no coreutils in this sandbox); the kaem steps
+/// run with an EMPTY env (`env -i` as engine policy); and any /gnu/store byte or
+/// symlink target in the output REDS the build HERE. The one /gnu/store still
+/// staged is td-builder's own runtime libc (the host seed) — unreachable by the
+/// env-cleared build; retires when td-builder self-hosts on the recipe toolchain.
+pub fn run_stage0() -> Result<(), String> {
+    let out = env::var("out").map_err(|_| "out not set".to_string())?;
+    let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
+    if !Path::new(&src).is_dir() {
+        return Err(format!("TD_SRC {src} is not a directory (want the interned seed/stage0 tree)"));
+    }
+
+    // Writable working copy — the kaem build writes artifacts INTO its tree.
+    let tree = Path::new("stage0-tree");
+    copy_tree_writable(Path::new(&src), tree)?;
+    for seed in [
+        "bootstrap-seeds/POSIX/AMD64/hex0-seed",
+        "bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
+    ] {
+        let p = tree.join(seed);
+        crate::bootstrap::make_executable(&p)
+            .map_err(|e| format!("chmod +x {}: {e}", p.display()))?;
+    }
+    for d in ["AMD64/artifact", "AMD64/bin"] {
+        fs::create_dir_all(tree.join(d)).map_err(|e| format!("mkdir {d}: {e}"))?;
+    }
+
+    // The two kaem steps, env EMPTY (env -i): the scripts drive everything through
+    // relative paths inside the tree; nothing outside it is reachable.
+    let cwd = tree.to_string_lossy();
+    run_cmd(
+        "./bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
+        &["./AMD64/mescc-tools-seed-kaem.kaem"],
+        &cwd,
+        &[],
+        &WATCH_PHASE,
+    )?;
+    run_cmd(
+        "./AMD64/artifact/kaem-0",
+        &["./AMD64/mescc-tools-mini-kaem.kaem"],
+        &cwd,
+        &[],
+        &WATCH_PHASE,
+    )?;
+
+    // Install the built tool dirs — the exact paths the chain's downstream rungs
+    // read ($tc/AMD64/bin/{M1,hex2,kaem}, $tc/AMD64/artifact/{M2,blood-elf-0,…}).
+    for d in ["AMD64/bin", "AMD64/artifact"] {
+        copy_tree_writable(&tree.join(d), &Path::new(&out).join(d))?;
+    }
+    // Fail HERE (a named tool), not as an opaque exec failure three rungs later.
+    for b in [
+        "AMD64/bin/M1",
+        "AMD64/bin/hex2",
+        "AMD64/bin/kaem",
+        "AMD64/artifact/M2",
+        "AMD64/artifact/blood-elf-0",
+        "AMD64/artifact/kaem-0",
+    ] {
+        let p = Path::new(&out).join(b);
+        let meta = fs::metadata(&p)
+            .map_err(|_| format!("seed build did not produce {b} (expected under $out)"))?;
+        // A regular file with an exec bit — a directory also has 0o111, so the
+        // mode alone would pass a misplaced tree here.
+        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+            return Err(format!("seed build product {b} is not an executable file"));
+        }
+    }
+    // The output half of the seal: no /gnu/store byte leaves this build.
+    require_no_gnu_store(Path::new(&out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1399,6 +1552,53 @@ mod tests {
             repeat_secs: Duration::from_millis(repeat_ms),
             drain_grace: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn stage0_output_seal_reds_a_gnu_store_byte_and_passes_a_clean_tree() {
+        // The stage0 SEAL's output half (#378): any /gnu/store byte in the seed
+        // rung's output must red the BUILD in the engine. Verified-red by
+        // construction: the poisoned tree errors, the clean twin passes.
+        let d = std::env::temp_dir().join(format!("td-stage0-seal-{}", std::process::id()));
+        let sub = d.join("AMD64/bin");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("M1"), b"clean bytes").unwrap();
+        std::os::unix::fs::symlink("../artifact/M2", sub.join("clean-link")).unwrap();
+        assert!(require_no_gnu_store(&d).is_ok(), "a clean tree must pass");
+        // Red 1: a /gnu/store byte in file CONTENTS.
+        fs::write(sub.join("kaem"), b"oops /gnu/store/abc-glibc leak").unwrap();
+        let err = require_no_gnu_store(&d).expect_err("a /gnu/store byte must red");
+        assert!(err.contains("/gnu/store"), "diagnostic names the leak: {err}");
+        fs::remove_file(sub.join("kaem")).unwrap();
+        // Red 2: a symlink whose TARGET points into /gnu/store — invisible to a
+        // grep -r content walk, so the engine scan must catch it itself.
+        std::os::unix::fs::symlink("/gnu/store/abc-glibc/lib/ld.so", sub.join("leak-link"))
+            .unwrap();
+        let err = require_no_gnu_store(&d).expect_err("a /gnu/store symlink target must red");
+        assert!(err.contains("leak-link"), "diagnostic names the symlink: {err}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn stage0_copy_tree_writable_preserves_exec_and_adds_write() {
+        // run_stage0's working copy: store trees are read-only (0444/0555) and the
+        // kaem build must write into its tree; exec bits must survive the copy.
+        let d = std::env::temp_dir().join(format!("td-stage0-copy-{}", std::process::id()));
+        let src = d.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("tool"), b"#!x").unwrap();
+        fs::set_permissions(&src.join("tool"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::write(src.join("data"), b"d").unwrap();
+        fs::set_permissions(&src.join("data"), fs::Permissions::from_mode(0o444)).unwrap();
+        let dst = d.join("dst");
+        copy_tree_writable(&src, &dst).unwrap();
+        let tool = fs::metadata(dst.join("tool")).unwrap().permissions().mode();
+        let data = fs::metadata(dst.join("data")).unwrap().permissions().mode();
+        assert_eq!(tool & 0o111, 0o111, "exec bit preserved: {tool:o}");
+        assert_eq!(tool & 0o200, 0o200, "owner write added: {tool:o}");
+        assert_eq!(data & 0o111, 0, "plain file stays non-exec: {data:o}");
+        assert_eq!(data & 0o200, 0o200, "owner write added: {data:o}");
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

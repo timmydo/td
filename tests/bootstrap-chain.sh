@@ -2,13 +2,15 @@
 # tests/bootstrap-chain.sh — the SHARED from-seed modern-toolchain chain, sourced by the
 # bootstrap-*-store-native gates (extracted verbatim from the per-gate inline chain so the ~850-line
 # seed→…→gcc-14.3.0+binutils-2.44+glibc-2.41 build lives in ONE place). The caller sets `set -eu` +
-# ROOT=$(pwd), sources this, then calls `bootstrap_modern_toolchain`, which builds the whole chain
+# ROOT=$(pwd), runs load_stage0 ($TB + TD_BUILDER_* — #317 warm verify + the #378 recipe rung),
+# sources this, then calls `bootstrap_modern_toolchain`, which builds the whole chain
 # from the 229-byte seed, verifies it carries no /gnu/store, and leaves these GLOBALS set for the gate:
 #   GCC14        = the gcc 14.3.0 prefix (…/stage/td/store/gcc-14.3.0)
 #   GLIBC241     = the modern glibc 2.41 prefix (ld-scripts relocated + kernel headers added)
 #   BMB244SB     = the sandbox-runnable binutils 2.44 build dir (…/out/bin has as/ld/readelf)
 #   CC1, cpath, KH_TB + the intermediate build dirs (the EXIT trap cleans them).
-# This is a pure code-move: the gates that source it build the IDENTICAL toolchain they did inline.
+# Originally a pure code-move of the per-gate inline chain. The SEED rung (brick 0+1) is now a
+# RECIPE built by the engine (#378 slice 1); the later rungs migrate to recipes slice by slice.
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 # Parallelism for the MODERN rungs (gcc 14 / glibc 2.41 / binutils 2.44 — robust guix make with MAKEFLAGS
@@ -34,14 +36,48 @@ make_curated_path() { # $1 (optional): a stable parent dir — warm mode reuses 
     [ -e "$cdir/$b" ] || ln -s "$f" "$cdir/$b" 2>/dev/null || true; done; done
   IFS=$oldifs; echo "$cdir"
 }
-build_toolchain() {
-  tc=`mktemp -d`; cp -a "$STAGE0/." "$tc/"
-  chmod +x "$tc/bootstrap-seeds/POSIX/$A/hex0-seed" "$tc/bootstrap-seeds/POSIX/$A/kaem-optional-seed"
-  mkdir -p "$tc/$A/artifact" "$tc/$A/bin"
-  ( cd "$tc" && env -i ./bootstrap-seeds/POSIX/$A/kaem-optional-seed ./$A/mescc-tools-seed-kaem.kaem \
-      && env -i ./$A/artifact/kaem-0 ./$A/mescc-tools-mini-kaem.kaem ) >/dev/null 2>&1 \
-    || { echo "seed toolchain build failed" >&2; return 1; }
-  echo "$tc"
+# --- brick 0+1: the stage0/mescc-tools SEED RUNG is a RECIPE (#378 slice 1) -----------------------
+# `td-builder build-recipe` over the `stage0` catalog recipe; executor + SEAL live in the engine
+# (build::run_stage0 — the canonical doc). Replaces the deleted `build_toolchain` shell fn with
+# BYTE-IDENTICAL tools (proven at migration, PR #383). Cold-build asserts: double-build
+# NAR-identical (directive 1); drv guix-free; exactly the 2 /td/store closure roots (source +
+# builder). Sets globals `tc` + `TC_W` (called PLAINLY — not via command substitution).
+build_stage0_recipe() {
+  test -n "${TB:-}" -a -n "${TD_BUILDER_PATH:-}" -a -n "${TD_BUILDER_STORE:-}" \
+    || { echo "build_stage0_recipe: run load_stage0 (tests/cache-lib.sh) first — the seed rung needs \$TB + TD_BUILDER_*" >&2; return 1; }
+  TC_W=`mktemp -d`; mkdir -p "$TC_W/store" "$TC_W/r1" "$TC_W/r2"
+  _src=`TD_STORE_DIR=/td/store "$TB" store-add-recursive stage0-source "$ROOT/$STAGE0" "$TC_W/store" "$TC_W/db"` \
+    || { echo "stage0-source intern failed" >&2; return 1; }
+  # Re-place the loaded stage0 builder at its /td/store CANONICAL (same bytes; refs re-scanned
+  # vs the live seed store) so the drv's builder line carries no /gnu/store path.
+  _bt="$TD_BUILDER_STORE/${TD_BUILDER_PATH##*/}"
+  _bp=`TD_STORE_DIR=/td/store "$TB" store-add-builder td-builder-0.1.0 "$_bt" "$TC_W/store" "$TC_W/builder.db" /gnu/store` \
+    || { echo "stage0 builder re-placement failed" >&2; return 1; }
+  sh tests/recipe-emit.sh stage0 > "$TC_W/stage0.json" || { echo "recipe-emit stage0 failed" >&2; return 1; }
+  printf 'stage0-source %s source\n' "$_src" > "$TC_W/stage0.lock"
+  # [repro] td's double-build (directive 1): realize the SAME drv twice, independently.
+  for _sc in r1 r2; do
+    env -i HOME="$TC_W" TMPDIR="$TC_W" TD_STORE_DIR=/td/store \
+      TD_BUILDER_PATH="$_bp" TD_BUILDER_STORE="$TC_W/store" TD_BUILDER_DB="$TC_W/builder.db" \
+      "$TB" build-recipe "$TC_W/stage0.json" "$TC_W/stage0.lock" "$TC_W/$_sc" /gnu/store "$TC_W/store" "$TC_W/db" \
+        >"$TC_W/$_sc.out" 2>"$TC_W/$_sc.err" \
+      || { tail -20 "$TC_W/$_sc.err" >&2; echo "build-recipe stage0 failed ($_sc)" >&2; return 1; }
+  done
+  _o=`sed -n 's/^OUT=out //p' "$TC_W/r1.out" | head -1`
+  test -n "$_o" || { echo "build-recipe stage0 printed no OUT" >&2; return 1; }
+  _b=${_o##*/}
+  _h1=`"$TB" nar-hash "$TC_W/r1/newstore/$_b"` || { echo "nar-hash r1 failed" >&2; return 1; }
+  _h2=`"$TB" nar-hash "$TC_W/r2/newstore/$_b"` || { echo "nar-hash r2 failed" >&2; return 1; }
+  test "$_h1" = "$_h2" || { echo "stage0 recipe NOT reproducible ($_h1 != $_h2)" >&2; return 1; }
+  # [sealed] drv guix-free + exactly the 2 /td/store closure roots. `set --` pins the drv file
+  # FIRST — on an unmatched glob grep exits 2 and an `if grep` would pass vacuously.
+  set -- "$TC_W/r1"/*.drv
+  test -f "$1" || { echo "no assembled .drv in the r1 scratch ($TC_W/r1)" >&2; return 1; }
+  if grep -q '/gnu/store' "$1"; then echo "stage0 drv carries /gnu/store bytes" >&2; return 1; fi
+  test "`grep -c '^/td/store' "$TC_W/r1/closure.txt"`" = 2 \
+    || { echo "stage0 closure has unexpected /td/store roots" >&2; return 1; }
+  tc="$TC_W/r1/newstore/$_b"
+  echo "   [stage0-recipe] brick 0+1 built by build-recipe: $_o (drv guix-free, double-build NAR-identical)"
 }
 seedbin_for() {
   tc=$1; sb=`mktemp -d`/seedbin; mkdir -p "$sb"
@@ -883,7 +919,9 @@ bootstrap_modern_toolchain() {
 # stale brick.
 . tests/chain-cache-lib.sh
 TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
-chain_cache_init chain tests/bootstrap-chain.sh channels.scm seed/sources/*.lock seed/patches/* `find seed/stage0 -type f | sort` \
+# (The recipe SURFACE re-keys the chain — stage0.rs + types.rs determine the seed rung's emitted
+# JSON/drv; ENGINE changes (run_stage0) do not re-key and are healed by the daily force-cold, #317.)
+chain_cache_init chain tests/bootstrap-chain.sh channels.scm recipes/src/recipes/stage0.rs recipes/src/types.rs seed/sources/*.lock seed/patches/* `find seed/stage0 -type f | sort` \
   || fail "chain-cache: the requested warm brick cache is unusable (see message above)"
 # brick8's elf-set-interp rewrites PT_INTERP IN PLACE (shrink-or-equal; td's elf.rs has no patchelf-style
 # grow). The toolchain binaries' build-time interp lives under TMPDIR (…/glibcsharedbuild/out/lib/ld-linux.so.2)
@@ -997,8 +1035,20 @@ echo "   [pinned-input] + binutils-2.44/glibc-2.41 (the modern toolchain final p
 if [ "$CHAIN_WARM" = 1 ]; then cpath=`make_curated_path "$CHAIN_DIR/cpath"`; else cpath=`make_curated_path`; fi
 for bad in gcc g++ cc guile guix; do test ! -e "$cpath/$bad" || fail "curated PATH still exposes '$bad'"; done
 if chain_hit tc; then tc=$CHAIN_PATH; else
-  tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
+  # cold only: emit the recipe from the Rust catalog (the brick-8 fallback pattern).
+  command -v load_recipe_eval >/dev/null 2>&1 || . tests/cache-lib.sh
+  load_recipe_eval 2>/dev/null || {
+    sh tests/recipe-eval-tool.sh "$ROOT/.td-build-cache/recipe-eval" >/dev/null || fail "could not build td-recipe-eval (tests/recipe-eval-tool.sh)"
+    load_recipe_eval || fail "no td-recipe-eval sentinel after recipe-eval-tool"
+  }
+  build_stage0_recipe || fail "the seed rung (stage0 recipe, brick 0+1) did not build"
   chain_save tc "$tc" "$tc/$A/bin" "$tc/$A/artifact"; fi
+# The recipe rung is AMD64-only (run_stage0); tie it to the chain's $A knob so an arch flip
+# fails HERE, not as an opaque mes failure three rungs later. The output no-guix seal is the
+# ENGINE's, enforced per build (require_no_gnu_store, contents + symlink targets, unit-tested);
+# warm reuse is NAR-verified against that sealed build (gate-level duplicate greps dropped at
+# the maintainer's direction, PR #383).
+test -d "$tc/$A/bin" -a -d "$tc/$A/artifact" || fail "stage0 recipe output lacks $A/{bin,artifact} (run_stage0 builds AMD64 only)"
 if chain_hit mes; then mesp=$CHAIN_PATH; else
   mesp=`build_mes_prefix "$tc" "$cpath"` || fail "Mes (MesCC self-host) did not build/install"
   chain_save mes "$mesp" "$mesp"; fi
@@ -1089,7 +1139,7 @@ fi
 # COLD only: the from-scratch ladder cleans up after itself exactly as before. Warm bricks
 # PERSIST (that is the point) — they live under the machine-wide keyed cache dir, not the
 # worktree.
-test "$CHAIN_WARM" = 1 || trap 'rm -rf "$tc" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$GLIBC241B"`" "`dirname "$cpath"`"' EXIT INT TERM
+test "$CHAIN_WARM" = 1 || trap 'rm -rf "$TC_W" "$mesp" "`dirname "$TCCD"`" "`dirname "$MK"`" "`dirname "$PD"`" "`dirname "$BD"`" "`dirname "$GD"`" "`dirname "$HD"`" "`dirname "$GLD"`" "`dirname "$G2"`" "`dirname "$B2"`" "`dirname "$MM"`" "`dirname "$GM1"`" "`dirname "$BMB"`" "`dirname "$GAWKMB"`" "`dirname "$GOUT"`" "`dirname "$GMB"`" "`dirname "$GSH"`" "`dirname "$GCC14B"`" "`dirname "$BMB244SB"`" "`dirname "$GLIBC241B"`" "`dirname "$cpath"`"' EXIT INT TERM
 
 GCC14="$GCC14B/stage/td/store/gcc-14.3.0"
 GLIBC241="$GLIBC241B/stage/td/store/glibc-2.41"

@@ -1891,7 +1891,10 @@ fn assemble_recipe_drv(
         // cmake: td's own cmake phase runner (build::run_cmake), the cmake-build-system
         // replacement — out-of-source cmake configure -> make -> make install in Rust.
         "cmake" => "cmake-build",
-        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake)")),
+        // stage0: the seed executor (build::run_stage0, #378) — place the pinned
+        // stage0-posix tree writable and exec its kaem interpreter; no build inputs.
+        "stage0" => "stage0-build",
+        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0)")),
     };
     // configure flags + phases (both optional) -> JSON array string. A configure
     // flag may itself contain whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`), so the
@@ -1988,6 +1991,27 @@ fn assemble_recipe_drv(
         // the autotools `substitute*` phase interpreter (TD_PHASES) does not apply here.
         "cmake" => {
             spec.push_str(&format!("env TD_CONFIGURE_FLAGS={cflags}\n"));
+        }
+        // stage0: sealed — source + builder are the WHOLE closure. Any other build
+        // material (inputs, crates/vendor tree) or unrunnable field (configureFlags/
+        // phases — run_stage0 reads only TD_SRC/out) is a hard error, never ignored.
+        "stage0" => {
+            if !inputs.is_empty() {
+                return Err(format!(
+                    "recipe: buildSystem \"stage0\" takes no build inputs (the seed needs nothing), but the lock carries {}",
+                    inputs.join(" ")
+                ));
+            }
+            if !vendor.is_empty() || vendor_dir.is_some() {
+                return Err(
+                    "recipe: buildSystem \"stage0\" takes no vendored crates — a crate-class lock entry or vendor tree would stage a store path into the sealed seed sandbox".into(),
+                );
+            }
+            if alist.get("configureFlags").is_some() || alist.get("phases").is_some() {
+                return Err(
+                    "recipe: buildSystem \"stage0\" supports no configureFlags/phases — the seed runner would silently ignore them, so declaring them is an error".into(),
+                );
+            }
         }
         // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS) and,
         // if any vendored deps were locked, resolves them offline (TD_VENDOR_CRATES).
@@ -6151,6 +6175,15 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("td-builder: cmake-build: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        // td's stage0-posix SEED build system (#378): see build::run_stage0.
+        // Sibling of autotools-build/rust-build/cmake-build; same env contract.
+        Some("stage0-build") if args.len() == 2 => match build::run_stage0() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: stage0-build: {e}");
                 ExitCode::FAILURE
             }
         },
