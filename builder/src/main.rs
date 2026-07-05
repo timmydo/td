@@ -2102,7 +2102,7 @@ fn assemble_recipe_drv(
 
 /// build-plan: realize a TOPO-ordered chain of recipes where a downstream step
 /// consumes an UPSTREAM step's td-BUILT output instead of a guix store path. This
-/// is the edge the per-package locks could not express: `corpus-no-guix` builds
+/// is the edge the per-package locks could not express: `recipe-checks` builds
 /// grep's own derivation Guile-free but still links GUIX's pcre2; here grep links
 /// the pcre2 td just built.
 ///

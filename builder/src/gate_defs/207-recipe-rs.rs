@@ -6,8 +6,7 @@
 //! then asserts (tests/recipe-rs.sh) the surface is self-consistent — every recipe + spec
 //! emits valid round-tripping JSON, the guix-dependence manifest (tests/recipes-meta.json)
 //! is in sync, and `verify` discriminates a mismatch (negative control). Correctness vs
-//! upstream is the corpus differential's job (corpus-no-guix builds each recipe NAR-equal
-//! to guix), not a boa oracle.
+//! upstream is recipe-checks' job, not a boa oracle.
 //! 
 //! Offline by construction (the cargo-test pattern): the guix-free tools/provision-rust.sh +
 //! tools/provision-cc.sh resolve the warm rust + cc toolchain onto PATH — NOT a `guix shell`

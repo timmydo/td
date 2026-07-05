@@ -24,7 +24,7 @@
 //! tools, not packed subjects.
 //!
 //! The gate uses its OWN cache root (.td-build-cache/oci-native), not the shared
-//! .td-build-cache/pkg: corpus-no-guix runs concurrently (Heavy vs System pool) and
+//! .td-build-cache/pkg: recipe-checks runs concurrently (Heavy vs System pool) and
 //! cached_build's per-spec dir is not safe for two gates to share at once (the
 //! `rm -f $sd/b/*.drv` reset would yank the other's drv mid-daemon-request). The daemon
 //! itself dedupes the build — the prelude-warmed hello is a HIT either way.
@@ -40,9 +40,9 @@ pub fn gate() -> GateDef {
         // td-recipe-eval sentinel exist before load_stage0/load_recipe_eval — the same
         // reason rust-userland-image is a build_gate with no specs. This gate does NOT
         // declare `hello` as a build spec: it builds hello ITSELF via cached_build into
-        // its own cache root (below), and the daemon dedupes against corpus-no-guix's
+        // its own cache root (below), and the daemon dedupes against recipe-checks'
         // hello build. Declaring the spec here would duplicate `hello` in TD_BUILD_SPECS
-        // (corpus-no-guix already owns it) and needlessly widen affected-checks to the
+        // (recipe-checks already owns it) and needlessly widen affected-checks to the
         // whole build-gate pool.
         build_gate: true,
         specs: &[],

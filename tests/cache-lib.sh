@@ -1,6 +1,6 @@
 # tests/cache-lib.sh — the shared content-addressed build-recipe cache wrapper used
-# by the package-manager build gates (corpus-no-guix, toolchain-no-guix,
-# corpus-deps-no-guix, rust-build). `td-builder build-recipe` assembles a
+# by the package-manager build gates (recipe-checks, rust-build).
+# `td-builder build-recipe` assembles a
 # DETERMINISTIC .drv, so a PERSISTENT cache (.td-build-cache/<gate>/, gitignored)
 # lets td reuse a prior NAR-verified output for an UNCHANGED recipe (build-recipe
 # prints CACHE=hit) and skip the build; on a verified hit the reproducibility

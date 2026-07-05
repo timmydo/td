@@ -12,7 +12,7 @@
 //!
 //! The `td-recipe-output` class is the new edge: it names a dependency td BUILDS
 //! itself (a `build-plan` step) and SUBSTITUTES into this recipe's inputs. When a
-//! lock is consumed standalone (e.g. `corpus-no-guix`) its recorded PATH is the
+//! lock is consumed standalone (e.g. by `recipe-checks`) its recorded PATH is the
 //! guix oracle for that dep; `build-plan` rewrites it to td's own output before
 //! the build, which is how a downstream `.drv` comes to reference td's dep, not
 //! guix's. To `build-recipe` a `td-recipe-output` is just another build input

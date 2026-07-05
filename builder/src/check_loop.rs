@@ -589,8 +589,8 @@ fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
 /// #318 axis 2): host-side NETWORK PREP that GETs each `.crate` of
 /// fetch/Cargo.lock GUIX-FREE with td's OWN fetcher (td-fetch), pinned by the
 /// UPSTREAM lock checksum (NOT a guix artifact), into the flat vendor dir the
-/// rust-fetch gate interns and builds td-fetch from (TD_VENDOR_DIR). td-fetch
-/// does every GET — td dogfoods its own fetcher, and td-fetch honors
+/// td-fetch recipe check interns and builds td-fetch from (TD_VENDOR_DIR).
+/// td-fetch does every GET — td dogfoods its own fetcher, and td-fetch honors
 /// TD_FEED_BASE so the reads route through the shared feed when it is up.
 /// Best-effort like every warm (no td-fetch binary / no network → warn and
 /// return; the gate reports if it actually runs cold), and the whole warm —
@@ -612,7 +612,7 @@ fn warm_td_fetch_crates(root: &Path) {
     // fetcher, exactly as the shell's one `timeout` over the script did.
     let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
     // Locate or build td-fetch (the fetcher), reused across crates.
-    let Some(tdf) = newstore_bin(root, ".td-build-cache/rust-fetch/b/newstore", "td-fetch")
+    let Some(tdf) = newstore_bin(root, ".td-build-cache/td-fetch-recipe-check/sd/newstore", "td-fetch")
         .or_else(|| host_cargo_bin(root, "fetch", "td-fetch", deadline))
     else {
         eprintln!(
@@ -1417,7 +1417,7 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
 
     #[test]
     fn parse_lock_checksums_covers_the_real_td_fetch_lock() {
-        // The rust-fetch gate asserts ≥70 vendored crates in the warmed dir;
+        // The td-fetch recipe check asserts ≥70 vendored crates in the warmed dir;
         // the parser must see at least that many in the real fetch/Cargo.lock
         // (drift guard: a lockfile-format change that blinds the parser reds
         // here, not as a silently-cold warm).

@@ -1,4 +1,4 @@
-use crate::types::{Recipe, Source};
+use crate::types::{Recipe, RecipeCheck, Source};
 
 pub fn recipe() -> Recipe {
     Recipe::gnu("ncurses", "6.2")
@@ -7,4 +7,7 @@ pub fn recipe() -> Recipe {
             "17bcm2z1rdx5gmzj5fb8cp7f28aw5b4g2z4qvvqg3yg0fq66wc1h",
         ))
         .configure_flags(&["--without-cxx-binding", "--enable-overwrite", "--with-shared"])
+        .checks(vec![RecipeCheck::daily(r#"
+recipe_c_link_check ncurses curses.h ncurses
+"#)])
 }

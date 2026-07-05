@@ -1,4 +1,4 @@
-# tests/cmake-demo — a minimal cmake C project, used by the `cmake` gate to prove
+# tests/cmake-demo — a minimal cmake C project, used by the td-cmake-demo recipe check to prove
 # td-builder builds a cmake-based package from source with NO gnu-build-system and
 # NO guix/Guile in the build path (move-off-Guile §5). td's own cmake phase runner
 # (build::run_cmake) configures this out-of-source, builds it, and installs the

@@ -954,6 +954,7 @@ fn run_gate(
     root: &Path,
     log_path: &Path,
     timing: Option<&Path>,
+    goal_words: &str,
     chain_cache: Option<&str>,
     mem_mib: u64,
     tree_mem_mib: u64,
@@ -1046,6 +1047,7 @@ fn run_gate(
         };
         cmd.current_dir(root)
             .env("TD_GUIX", GUIX_CMD)
+            .env("TD_GATE_GOALS", goal_words)
             .stdout(std::process::Stdio::from(out))
             .stderr(std::process::Stdio::from(err));
         // The #317 gate-state wiring: Shared (the default) gets the machine-wide
@@ -1260,6 +1262,9 @@ struct RunCfg {
     /// switch), else `~/.td/build-daemon/chain`. None (no HOME) leaves the gate
     /// env untouched. Private gates ALWAYS get TD_CHECK_CHAIN_CACHE force-cleared.
     chain_cache: Option<String>,
+    /// Original requested goal words, exported to gate bodies that need to
+    /// distinguish a tier run from a direct gate run.
+    goal_words: String,
     /// Gate indices named DIRECTLY in the invocation's goals (issue #377) —
     /// e.g. `store-verify` in `td-builder check store-verify` — as opposed to
     /// pulled in only via a tier keyword or as another goal's dependency. A
@@ -1422,6 +1427,7 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     &cfg.root,
                     &log_path,
                     cfg.timing_log.as_deref(),
+                    &cfg.goal_words,
                     cfg.chain_cache.as_deref(),
                     cfg.gate_mem_mib,
                     cfg.gate_tree_mem_mib,
@@ -1746,6 +1752,7 @@ pub fn cli(args: &[String]) -> ExitCode {
         gate_mem_mib,
         gate_tree_mem_mib,
         chain_cache,
+        goal_words: goals.join(" "),
         explicit_goals: explicit_goal_indices(&set, &goals),
         cgroup_dir: std::env::var("TD_CHECK_CGROUP")
             .ok()
@@ -1802,12 +1809,12 @@ mod tests {
         let heavy = set.names(Pool::Heavy);
         let daily = set.names(Pool::Daily);
         assert!(heavy.len() >= 45, "heavy (PR) pool shrank: {}", heavy.len());
-        assert!(daily.len() >= 50, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 105, "the full check lost gates");
-        for g in ["bootstrap", "td-subst", "cargo-test", "corpus-no-guix", "td-shell"] {
+        assert!(daily.len() >= 40, "daily pool shrank: {}", daily.len());
+        assert!(heavy.len() + daily.len() >= 85, "the full check lost gates");
+        for g in ["bootstrap", "td-subst", "cargo-test", "recipe-checks", "td-shell"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
-        for g in ["bootstrap-gcc-mesboot", "rust-ripgrep", "rust-userland-x86_64-store-native"] {
+        for g in ["bootstrap-gcc-mesboot", "recipe-checks-daily", "rust-userland-x86_64-store-native"] {
             assert!(daily.iter().any(|n| n == g), "missing daily gate {g}");
         }
         assert!(set.names(Pool::Engine).iter().any(|n| n == "cargo-test"));
@@ -1816,7 +1823,7 @@ mod tests {
             assert!(system.iter().any(|n| n == g), "missing system gate {g}");
         }
         // Fragment-declared specs feed the synthetic build-recipes node.
-        for s in ["hello", "bash", "pcre2"] {
+        for s in ["hello"] {
             assert!(set.build_specs.iter().any(|x| x == s), "missing build spec {s}");
         }
         // Typed artifact inputs (#353): the first cut-over gate declares its
@@ -1880,7 +1887,7 @@ mod tests {
         };
         // A single spec-carrying gate scopes the phase to its own spec.
         let mut set = load().unwrap();
-        let goals = vec!["corpus-no-guix".to_string()];
+        let goals = vec!["recipe-checks".to_string()];
         let sel = expand_goals(&set, &goals).unwrap();
         scope_build_recipes(&mut set, &sel, &goals);
         assert_eq!(br_specs(&set), "hello");
@@ -1944,6 +1951,7 @@ mod tests {
             gate_mem_mib: 0,
             gate_tree_mem_mib: 0,
             chain_cache: None,
+            goal_words: String::new(),
             explicit_goals: HashSet::new(),
             cgroup_dir: None,
         }
@@ -2455,7 +2463,7 @@ mod tests {
         );
         // The default is Shared — the #317 flip: warm machine-wide state unless a gate
         // declares that cold IS its feature.
-        for g in ["store-persist", "bootstrap", "corpus-no-guix"] {
+        for g in ["store-persist", "bootstrap", "recipe-checks"] {
             let gate = set.gates.iter().find(|x| x.name == g).unwrap();
             assert_eq!(gate.store, StoreMode::Shared, "{g} must default Shared");
         }

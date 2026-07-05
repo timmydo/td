@@ -34,7 +34,7 @@
 //! [DURABLE structural] the .drv builder is the td-bootstrapped stage0 (not the guix-built
 //! td-builder); ts-emit ran under td's OWN td-recipe-eval.
 //! [DURABLE repro] td-builder check double-build agrees the build is reproducible.
-//! A BUILD_GATE (like rust-fetch): ordered AFTER the parallel build-recipes phase so its
+//! A BUILD_GATE (like recipe-checks): ordered AFTER the parallel build-recipes phase so its
 //! 73-crate cargo build doesn't oversubscribe cores, and it depends on the td-recipe-eval that
 //! build-recipes' prelude builds. Not in BUILD_SPECS — the source is interned at gate time.
 

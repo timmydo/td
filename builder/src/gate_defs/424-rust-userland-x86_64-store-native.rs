@@ -12,8 +12,8 @@
 //! HEAVY (the native gcc build is ~45 min; from-seed adds the ~98-min cross build). It warms td's own
 //! recipe evaluator itself (tests/recipe-eval-tool.sh), so it does NOT drag in the full build-recipes
 //! corpus — it is a HEAVY gate, not a BUILD_GATE. Reuses the crate closure the check.sh prelude warms.
-//! NOTE (#258 dev gate): this is the mechanism gate; the atomic cutover folds it into the rust-ripgrep
-//! gate (347) and deletes the guix rust/gcc-toolchain from tests/ripgrep.lock.
+//! NOTE (#258 dev gate): this is the mechanism gate; the product-command cutover folds it into
+//! `td shell`, while the recipe-owned ripgrep check keeps the crate-free package assertion.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
