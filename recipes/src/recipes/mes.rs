@@ -18,7 +18,6 @@ pub fn recipe() -> Recipe {
             .env("MES_MAX_ARENA", "100000000")
             .env("MES_STACK", "8000000")
             .env("GUILE", "true")
-            .env("CC", "")
             .env("MES_FOR_BUILD", "mes")
     };
     let mut steps = unpack_into("mes-source", "{src}");
@@ -35,10 +34,16 @@ pub fn recipe() -> Recipe {
             ("kaem".into(), "{in:stage0}/AMD64/bin/kaem".into()),
         ],
     });
-    steps.push(common(Step::run(
-        "{src}",
-        &[SH, "configure.sh", "--prefix={out}", "--host=i686-linux-gnu"],
-    )));
+    // CC set-but-EMPTY on configure ONLY (the deleted fn's exact env): configure.sh
+    // falls through to mescc; the generated bootstrap.sh must NOT see an empty CC
+    // (its ${CC-…} default would be overridden by the empty).
+    steps.push(
+        common(Step::run(
+            "{src}",
+            &[SH, "configure.sh", "--prefix={out}", "--host=i686-linux-gnu"],
+        ))
+        .env("CC", ""),
+    );
     for script in ["bootstrap.sh", "install.sh"] {
         steps.push(
             common(Step::run("{src}", &[SH, script]))
