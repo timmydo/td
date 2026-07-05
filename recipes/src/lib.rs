@@ -9,4 +9,5 @@
 
 pub mod catalog;
 pub mod json;
+pub mod ladder;
 pub mod types;
