@@ -41,6 +41,21 @@ process in any user-facing command/build path (`td shell` resolves
 td-built packages, never `guix build`); the `/td/store` source
 bootstrap replaces the guix toolchain seed.
 
+**Path re-aim (human): new packages build on td packages
+from the mes-rooted chain.** The guix-seeded corpus template — a
+pinned `tests/<pkg>-no-guix.lock` staging guix-built build tools, at
+best substituting only the toolchain — proved the engine but retires
+no guix bytes, and is CLOSED to new packages. A new package's lock
+carries zero `/gnu/store` entries: the toolchain AND the build tools
+are chain-built `/td/store` outputs, the source a td-fetched pinned
+fixed-output (the `seed/sources` pattern). A missing build input
+means building that rung first, not staging the guix seed. Existing
+guix-seeded gates/locks are grandfathered, shrink-only (directive 6).
+The front is the chain's build userland (make, shell, core tools),
+enabling the first zero-`/gnu/store` `build-recipe` gate — the
+template that replaces the substitution gates (#388; PR #382 is held
+to redo on it).
+
 **Rust toolchain scope (human, 2026-07-04):** the rust toolchain td
 uses to build rust packages is NOT part of the full-source-bootstrap
 requirement. It enters as a **pinned upstream rust release** (a
