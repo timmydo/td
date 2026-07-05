@@ -46,7 +46,19 @@ if command -v cargo >/dev/null 2>&1; then
   cargo build --release --quiet --manifest-path builder/Cargo.toml
   TDB=builder/target/release/td-builder
 else
-  TDB=$(ls .td-build-cache/stage0/store/*/bin/td-builder 2>/dev/null | head -1)
+  # Prefer the CURRENT placement out of the stage0 memo (.stage0-meta line 2 = Cb):
+  # it is the one placement the #309 stale-sweep always KEEPS, so this pick cannot
+  # vanish mid-run — the raw glob's lexicographic-first choice could name a STALE
+  # placement (the #293 hazard class) that a mid-check slow-path sweep then unlinks
+  # between this suite's three invocations. Glob fallback: a pre-placed harness VM
+  # image may ship a store dir without the memo.
+  cb=$(sed -n 2p .td-build-cache/stage0/.stage0-meta 2>/dev/null || true)
+  TDB=""
+  if [ -n "$cb" ] && [ -x ".td-build-cache/stage0/store/$(basename "$cb")/bin/td-builder" ]; then
+    TDB=".td-build-cache/stage0/store/$(basename "$cb")/bin/td-builder"
+  else
+    TDB=$(ls .td-build-cache/stage0/store/*/bin/td-builder 2>/dev/null | head -1)
+  fi
 fi
 [ -n "$TDB" ] && [ -x "$TDB" ] || { echo "daily: FATAL: no td-builder (need host cargo or a pre-placed stage0)" >&2; exit 1; }
 echo ">> daily backstop: full td-builder check on origin/main ($main)"
