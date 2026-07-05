@@ -1598,6 +1598,32 @@ impl StepCtx {
     }
 }
 
+/// Minimal glob for mesboot `glob:` argv elements: exactly one `*`, in the LAST
+/// path component (`DIR/PRE*SUF`). Returns full paths of matching entries.
+fn glob_one_star(pat: &str) -> Result<Vec<String>, String> {
+    let (dir, base) = match pat.rfind('/') {
+        Some(i) => (pat.get(..i).unwrap_or("."), pat.get(i + 1..).unwrap_or("")),
+        None => (".", pat),
+    };
+    let (pre, suf) = base
+        .split_once('*')
+        .ok_or_else(|| format!("glob pattern has no `*': {pat}"))?;
+    if suf.contains('*') || dir.contains('*') {
+        return Err(format!("glob supports exactly one `*' in the basename: {pat}"));
+    }
+    let mut hits = Vec::new();
+    let rd = fs::read_dir(dir).map_err(|e| format!("glob {pat}: read {dir}: {e}"))?;
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("glob {pat}: {e}"))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(pre) && name.ends_with(suf) && name.len() >= pre.len() + suf.len() {
+            hits.push(format!("{dir}/{name}"));
+        }
+    }
+    Ok(hits)
+}
+
 /// Copy one file to dest dir (keeping its basename), exec bit preserved, owner-
 /// write added (the rungs copy crt/libs INTO writable build trees).
 fn copy_file_writable(from: &Path, dest_dir: &Path) -> Result<(), String> {
@@ -1684,7 +1710,24 @@ pub fn run_mesboot() -> Result<(), String> {
     for (i, step) in steps.iter().enumerate() {
         let err = |m: String| format!("mesboot step {}: {m}", i + 1);
         if let Some(o) = step.get("run") {
-            let argv = ctx.expand_all(&strs(o, "argv")?).map_err(err)?;
+            // `glob:PAT` argv elements expand to the SORTED matches (one `*`,
+            // basename component only) — `ar r out.a tg/*.o`-shaped rung steps
+            // without any shell. Zero matches is a hard error (a silent empty
+            // splice would turn an install step into a no-op).
+            let mut argv: Vec<String> = Vec::new();
+            for a in ctx.expand_all(&strs(o, "argv")?).map_err(err)? {
+                match a.strip_prefix("glob:") {
+                    None => argv.push(a),
+                    Some(pat) => {
+                        let mut hits = glob_one_star(pat).map_err(err)?;
+                        if hits.is_empty() {
+                            return Err(err(format!("glob:{pat} matched nothing")));
+                        }
+                        hits.sort();
+                        argv.extend(hits);
+                    }
+                }
+            }
             let dir = ctx.expand(&field(o, "dir")?).map_err(err)?;
             let mut envs: Vec<(String, String)> = Vec::new();
             for (k, v) in pairs(o, "env")? {
