@@ -15,7 +15,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::ToolFarm {
         links: vec![
             ("cpp".into(), "{in:gcc-mesboot1}/bin/cpp".into()),
-            ("make".into(), "{in:make-mesboot0}/bin/make".into()),
+            ("make".into(), "{in:make-mesboot}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
             ("awk".into(), "{in:gawk}/bin/awk".into()),
             ("flex".into(), "{in:flex}/bin/flex".into()),
@@ -61,7 +61,7 @@ pub fn recipe() -> Recipe {
     );
     for target in [None, Some("install")] {
         let mut argv: Vec<&str> = vec![
-            "{in:make-mesboot0}/bin/make",
+            "{in:make-mesboot}/bin/make",
             "SHELL={in:bash}/bin/bash",
             "CONFIG_SHELL={in:bash}/bin/bash",
         ];
@@ -84,7 +84,7 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("binutils-mesboot", "2.20.1a")
         .native_inputs(&[
-            "make-mesboot0",
+            "make-mesboot",
             "patch-mesboot",
             "binutils-mesboot1",
             "gcc-mesboot1",

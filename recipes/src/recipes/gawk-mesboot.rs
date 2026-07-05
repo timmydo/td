@@ -14,7 +14,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::ToolFarm {
         links: vec![
             ("cpp".into(), "{in:gcc-mesboot1}/bin/cpp".into()),
-            ("make".into(), "{in:make-mesboot0}/bin/make".into()),
+            ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
     steps.push(
@@ -54,7 +54,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make-mesboot0}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "SHELL={in:bash}/bin/bash",
                 "CONFIG_SHELL={in:bash}/bin/bash",
                 cc,
@@ -81,7 +81,7 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("gawk-mesboot", "3.1.8")
         .native_inputs(&[
-            "make-mesboot0",
+            "make-mesboot",
             "binutils-mesboot1",
             "gcc-mesboot1",
             "glibc-mesboot0",

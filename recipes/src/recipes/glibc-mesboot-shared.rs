@@ -20,7 +20,7 @@ pub fn recipe() -> Recipe {
         links: vec![
             ("gcc".into(), "{in:gcc-mesboot1}/bin/gcc".into()),
             ("cpp".into(), "{in:gcc-mesboot1}/bin/cpp".into()),
-            ("make".into(), "{in:make-mesboot0}/bin/make".into()),
+            ("make".into(), "{in:make-mesboot}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
             ("awk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
             ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
@@ -100,7 +100,7 @@ pub fn recipe() -> Recipe {
     ));
     for target in [None, Some("install")] {
         let mut argv: Vec<&str> = vec![
-            "{in:make-mesboot0}/bin/make",
+            "{in:make-mesboot}/bin/make",
             "SHELL={in:bash}/bin/bash",
         ];
         if let Some(t) = target {
@@ -126,7 +126,7 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("glibc-mesboot-shared", "2.16.0")
         .native_inputs(&[
-            "make-mesboot0",
+            "make-mesboot",
             "patch-mesboot",
             "binutils-mesboot",
             "gcc-mesboot1",
