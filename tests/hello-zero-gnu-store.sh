@@ -271,9 +271,12 @@ env -i HOME="$snwork" TMPDIR="$snwork/tmp" PATH="$cpath" \
 o=`sed -n 's/^OUT=out //p' "$snwork/hb.out"`; test -n "$o" || fail "hello produced no output"
 hdir="$snwork/hb/newstore/`basename "$o"`"; hbin="$hdir/bin/hello"; test -x "$hbin" || fail "no hello binary"
 
-# [no-guix-env] the build closure staged NO /gnu/store path.
-if grep -v '	' "$snwork/hb/closure.txt" 2>/dev/null | grep -q '^/gnu/store/'; then
-  fail "[no-guix-env] the build staged a /gnu/store path: `grep -v '	' "$snwork/hb/closure.txt" | grep '^/gnu/store/' | head -1`"
+# [no-guix-env] the build closure staged NO /gnu/store path. Check the CANONICAL (first tab-field) of
+# EVERY line — a re-keyed entry is `canonical<TAB>on-disk` (main.rs), so filtering tab lines out first
+# would skip a /gnu/store canonical; `cut -f1` yields the canonical for tab lines and the whole line
+# otherwise, so no store path escapes the check.
+if cut -f1 "$snwork/hb/closure.txt" 2>/dev/null | grep -q '^/gnu/store/'; then
+  fail "[no-guix-env] the build staged a /gnu/store path: `cut -f1 "$snwork/hb/closure.txt" | grep '^/gnu/store/' | head -1`"
 fi
 echo "   [no-guix-env] the build sandbox staged no /gnu/store path — the userland+toolchain are all /td/store"
 

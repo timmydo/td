@@ -57,13 +57,14 @@ fn find_in_path(path: &str, name: &str) -> Option<String> {
 }
 
 /// The build shell — `bash` preferred, a POSIX `sh` as the fallback. The
-/// autotools `run()` path (CONFIG_SHELL/SHELL/shebang-rewrite) and the
-/// find-files phase helper both need a shell from the inputs; a guix build
-/// userland supplies `bash`, but a td-native busybox-style userland supplies
-/// only `sh` (issue #388: "a POSIX shell — bash or a busybox-style sh"). This is
-/// a STRICT fallback: any lock carrying bash resolves to bash exactly as before,
-/// so every existing build is byte-unchanged; only a bash-less (busybox) userland
-/// takes the `sh` branch, making it a first-class build userland.
+/// autotools `run()` path (CONFIG_SHELL/SHELL/shebang-rewrite) needs a shell from
+/// the inputs; a guix build userland supplies `bash`, but a td-native
+/// busybox-style userland supplies only `sh` (issue #388: "a POSIX shell — bash
+/// or a busybox-style sh"). This is a STRICT fallback: any lock carrying bash
+/// resolves to bash exactly as before, so every existing build is byte-unchanged;
+/// only a bash-less (busybox) userland takes the `sh` branch, making it a
+/// first-class build userland. NOTE: `run()`'s driven commands are POSIX; the
+/// find-files phase helper stays bash-only (its `set -o pipefail` is a bashism).
 fn find_build_shell(path: &str) -> Option<String> {
     find_in_path(path, "bash").or_else(|| find_in_path(path, "sh"))
 }
@@ -790,7 +791,11 @@ fn find_files(srcdir: &str, dir: &str, regex: &str, search_path: &str) -> Result
     if !full.is_dir() {
         return Ok(Vec::new());
     }
-    let bash = find_build_shell(search_path).ok_or("no bash or sh found for find-files")?;
+    // find-files is a recipe-PHASE helper; its script uses `set -o pipefail` (a
+    // bashism dash/older-busybox reject), and phases today are a GNU-userland
+    // feature (bash present). Keep it bash-only — the sh fallback is scoped to
+    // run()'s autotools path, where the script is POSIX (issue #388 review).
+    let bash = find_in_path(search_path, "bash").ok_or("bash not found for find-files")?;
     // List files; keep those whose basename matches the regex. Single-quote the
     // regex (the corpus find-files regexes contain none); PATH carries find/grep.
     // The match test is an `if` (not `grep && printf`): a NON-matching last file
