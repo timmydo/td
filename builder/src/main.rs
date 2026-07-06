@@ -2486,9 +2486,10 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
 }
 
 /// The pre-provisioned NATIVE `/td/store` toolchain `td shell` builds the Rust userland with,
-/// handed in via the `TD_SHELL_NATIVE_*` environment (gate `td-shell-userland` / host-prep
-/// stages it: fetch-or-build the native x86_64 gcc/binutils/glibc + relinked rust, stage a
-/// combined seed+native store, and expose it). When present, a vendored rust build (ripgrep,
+/// handed in via the `TD_SHELL_NATIVE_*` environment (its provisioning gate `td-shell-userland`
+/// was retired with the #410 rust-toolchain recipe-graph cutover — the native-toolchain +
+/// rust-userland coverage is being re-added on the recipe-graph model; until then no gate stages
+/// this env). When present, a vendored rust build (ripgrep,
 /// fd, …) links this toolchain — never the guix rust/gcc-toolchain: the seed lock is retargeted
 /// (`native_seed_lock_body`), the combined store is the build's STORE-DIR + `TD_SEED_STORE`, the
 /// native store's db rides `TD_EXTRA_DBS`, and `TD_RUST_STORE_{INTERP,RPATH,BDIR}` put run_rust
@@ -2647,9 +2648,10 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                     None => {
                         return Err(format!(
                             "build `{pkg}': a vendored rust build needs the native /td/store toolchain, \
-                             but TD_SHELL_NATIVE_STORE is not set. Provision it (gate `td-shell-userland' \
-                             or host-prep stages the native gcc/binutils/glibc + relinked rust). \
-                             The guix rust/gcc-toolchain path is retired for `td shell'."
+                             but TD_SHELL_NATIVE_STORE is not set. Its provisioning gate was retired with \
+                             the #410 rust-toolchain recipe-graph cutover (rust userland re-coverage pending); \
+                             host-prep must stage the native gcc/binutils/glibc + the recipe-graph relinked \
+                             rust. The guix rust/gcc-toolchain path is retired for `td shell'."
                         ));
                     }
                 }
@@ -2673,7 +2675,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         let mut build = Command::new(&self_exe);
         build.args(&bargs);
         if used_native {
-            // Native link mode, exactly as `tests/rust-x86_64-userland-store-native.sh` sets it:
+            // Native link mode, exactly as the retired rust-userland gate (#410 cutover) set it:
             // the combined store is content-scanned for the closure, the native toolchain's own db
             // adds its /td/store refs, and run_rust bakes the /td/store interp/RUNPATH/-B.
             if let Some(nt) = &native {
@@ -2807,7 +2809,7 @@ fn seed_lock_body(lock_body: &str, sourcekey: &str, src_canonical: &str) -> Stri
 /// retired-last build seed (coreutils/bash/tar/gzip) and the interned-source line, then append
 /// `native_lines` (the `/td/store` gcc/binutils/glibc + relinked-rust lock lines the gate
 /// pre-provisioned). Pure (no I/O) so it is unit-tested directly — the same transform
-/// `tests/rust-x86_64-userland-store-native.sh` does with `grep -vE -- '-rust-|-gcc-toolchain-'`.
+/// the retired rust-userland gate (#410) did with `grep -vE -- '-rust-|-gcc-toolchain-'`.
 /// This is the `td shell` cutover: the product command builds the Rust userland with td's OWN
 /// toolchain, never the guix rust/gcc-toolchain.
 fn native_seed_lock_body(seed_body: &str, native_lines: &str) -> String {
@@ -6387,7 +6389,7 @@ memchr-2.7.crate /gnu/store/ddd-memchr.crate
     // native_seed_lock_body is the `td shell` cutover transform: retarget a seed lock onto the
     // native /td/store toolchain — drop the guix rust/gcc-toolchain lines, keep the retired-last
     // build seed + the source pin, append the native toolchain lines. It mirrors what
-    // `tests/rust-x86_64-userland-store-native.sh` does with `grep -vE -- '-rust-|-gcc-toolchain-'`.
+    // the retired rust-userland gate (#410) did with `grep -vE -- '-rust-|-gcc-toolchain-'`.
     #[test]
     fn native_seed_lock_body_retargets_onto_the_td_store_toolchain() {
         // A realistic post-provision seed lock: guix rust + cargo + gcc-toolchain, the retired-last

@@ -29,10 +29,13 @@ use crate::types::{Recipe, RecipeCheck, Source};
 // `td-builder check` double-build oracle proves it); a missing input reds at drv-assembly.
 //
 // Validation is a recipe-owned RecipeCheck::daily (below): `build-plan --auto rust-toolchain`
-// builds the tree, rustc RUNS from /td/store in an own-root (/gnu/store absent), the transform
-// double-builds byte-identically, and a missing declared input reds the recipe. The
-// rustc-COMPILES-a-real-program proof stays on the consumer gate `rust-userland-x86_64-store-native`
-// (it needs the NATIVE x86_64 gcc, a deliberately non-reproducible subcommand, not a recipe).
+// builds the tree, rustc RUNS from /td/store in an own-root (/gnu/store absent), and a missing
+// declared input reds the recipe (byte-for-byte reproducibility is the daily force-cold backstop,
+// per the mesboot-rung precedent — see tests/rust-toolchain-recipe-check.sh). The
+// rustc-COMPILES-a-real-program proof + the `td shell` userland cutover (which need the NATIVE
+// x86_64 gcc, a deliberately non-reproducible subcommand, not a recipe) lived on the
+// rust-userland-x86_64-store-native / td-shell-userland gates; those were DISABLED with this
+// cutover (maintainer-directed) pending re-coverage on the recipe-graph model (follow-up issue).
 pub fn recipe() -> Recipe {
     Recipe::rust_toolchain("rust-toolchain", "1.96.0")
         .source(Source::one(

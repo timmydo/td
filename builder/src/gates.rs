@@ -1814,7 +1814,7 @@ mod tests {
         for g in ["bootstrap", "td-subst", "cargo-test", "recipe-checks", "td-shell"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
-        for g in ["bootstrap-gcc-mesboot", "recipe-checks-daily", "rust-userland-x86_64-store-native"] {
+        for g in ["bootstrap-gcc-mesboot", "recipe-checks-daily"] {
             assert!(daily.iter().any(|n| n == g), "missing daily gate {g}");
         }
         assert!(set.names(Pool::Engine).iter().any(|n| n == "cargo-test"));

@@ -513,16 +513,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "tests/td-toolchain-rust-x86_64.lock" {
-        sel.add_preflight("shell-syntax");
-        // the RELINKED rust tree's input-addressed lock: its consumers are the rust runtime
-        // gate (which assembles+relinks+publishes it) and the rust userland gate (which sources
-        // the runtime gate's assembly). A pin/recipe-rev change re-keys + re-publishes the tree.
-        sel.add_target("rust-x86_64-runtime-store-native");
-        sel.add_target("rust-userland-x86_64-store-native");
-        return;
-    }
-
     if pattern_matches(
         "tests/toolchain-x86_64-input-addressed.sh|builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         p,
@@ -730,12 +720,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "tests/td-shell-userland.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("td-shell-userland");
-        return;
-    }
-
     if p == "tests/td-shell-seed.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("td-shell-seed");
@@ -788,29 +772,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if pattern_matches("tests/rust-store-native.sh|seed/sources/rust-*.lock", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("rust-store-native");
-        sel.add_target("rust-x86_64-runtime-store-native");
+        // #410: seed/sources/rust-*.lock is also the rust-toolchain recipe's pinned source; its
+        // recipe-owned RecipeCheck::daily (tests/rust-toolchain-recipe-check.sh) runs under
+        // recipe-checks-daily.
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
-    if pattern_matches(
-        "tests/rust-x86_64-runtime-store-native.sh|seed/sources/zlib-*.lock|builder/src/gate_defs/416-rust-x86_64-runtime-store-native.rs",
-        p,
-    ) {
+    // #410: seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source, and the rust-toolchain
+    // transform co-locates its libz — both build under the rust-toolchain recipe check.
+    if pattern_matches("seed/sources/zlib-*.lock|tests/rust-toolchain-recipe-check.sh", p) {
         sel.add_preflight("shell-syntax");
-        sel.add_target("rust-x86_64-runtime-store-native");
-        // gate 424 (#258 rust userland) sources this script ASSEMBLE-ONLY for its /td/store
-        // toolchain assembly, so a change here must re-validate that consumer too.
-        sel.add_target("rust-userland-x86_64-store-native");
-        return;
-    }
-
-    // #258 rust userland: ripgrep built by the native x86_64 /td/store toolchain (gate 424).
-    if pattern_matches(
-        "tests/rust-x86_64-userland-store-native.sh|builder/src/gate_defs/424-rust-userland-x86_64-store-native.rs",
-        p,
-    ) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("rust-userland-x86_64-store-native");
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
@@ -1619,18 +1592,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         "toolchain-x86_64-input-addressed"
     );
-    assert_target!(
-        "tests/rust-x86_64-userland-store-native.sh",
-        "rust-userland-x86_64-store-native"
-    );
-    assert_target!(
-        "builder/src/gate_defs/424-rust-userland-x86_64-store-native.rs",
-        "rust-userland-x86_64-store-native"
-    );
-    assert_target!(
-        "tests/rust-x86_64-runtime-store-native.sh",
-        "rust-userland-x86_64-store-native"
-    );
+    // #410: the rust-x86_64 runtime/userland/td-shell-userland gates were retired with the
+    // rust-toolchain recipe-graph cutover; the recipe-owned RecipeCheck::daily + its source locks
+    // route to recipe-checks-daily instead.
+    assert_target!("tests/rust-toolchain-recipe-check.sh", "recipe-checks-daily");
+    assert_target!("seed/sources/zlib-1.3.1.lock", "recipe-checks-daily");
+    assert_target!("seed/sources/rust-1.96.0.lock", "recipe-checks-daily");
     assert_target!(
         "tests/userland-x86_64-store-native.sh",
         "userland-x86_64-store-native"
