@@ -247,44 +247,51 @@ pub fn run_self(inp: &BuildInputs) -> Result<String, String> {
     Ok(report)
 }
 
-// --- rust-toolchain: the pinned-upstream-Rust ELF-retarget transform (#380) -----------
+// --- rust-toolchain: the pinned-upstream-Rust ELF-retarget transform (#380, #410) ------
 //
 // The engine phase runner for buildSystem "rust-toolchain" (recipes/src/recipes/
-// rust-toolchain.rs) — the FIRST-CLASS RECIPE form of what was the `toolchain-recipe
-// rust-x86_64` shell subcommand. It co-locates the /td/store runtime closure (glibc
-// sonames + libgcc_s + libz, found via the UNCHANGED upstream RUNPATH $ORIGIN/../lib —
-// the portable, content-addressed-store-safe choice) and RELINKS rustc/cargo's ELF
-// interpreter — `crate::elf::set_interp`, GROWS the slot per #258, NOT patchelf — onto
-// the /td/store x86_64 glibc loader.
+// rust-toolchain.rs), fully in the recipe-graph model (#410). It UNPACKS the pinned
+// upstream Rust release tarball IN-SANDBOX (the declared tar/gzip inputs, as
+// ladder::unpack_into does — so the recipe's `.source()` is the raw tarball), co-locates
+// the /td/store runtime closure (glibc sonames + libgcc_s + libz, found via the UNCHANGED
+// upstream RUNPATH $ORIGIN/../lib — the portable, content-addressed-store-safe choice) and
+// RELINKS rustc/cargo's ELF interpreter — `crate::elf::set_interp`, GROWS the slot per
+// #258, NOT patchelf — onto the /td/store x86_64 glibc loader.
 //
-// It runs in the HERMETIC drv sandbox as PURE td-builder Rust (fs copies + crate::elf),
-// so it stages NO external tool (tar/patchelf) into the sandbox: the sha-pinned upstream
-// tarball is unpacked by the GATE as source prep (like every recipe's source is a
-// prepared artifact), and TD_SRC is that extracted release tree.
+// It runs in the HERMETIC drv sandbox as td-builder Rust (fs copies + crate::elf) plus the
+// in-sandbox untar via the declared tar/gzip inputs.
 //
-//   TD_SRC        the extracted upstream Rust release tree (root: rustc/ cargo/ rust-std-…/).
-//   TD_INPUT_MAP  lock name -> /td/store path; the transform reads by name:
-//                   rust-native-glibc   the x86_64 glibc 2.41 tree (interp + sonames)
-//                   rust-native-libgcc  a tree holding libgcc_s.so.1
-//                   rust-native-libz    a tree holding libz.so.1.*
+//   TD_SRC        the pinned upstream Rust release TARBALL (rust-toolchain-source, Class::Source).
+//   TD_INPUT_MAP  lock name -> /td/store path; the transform reads its inputs BY RECIPE NAME
+//                 (#410 — no gate-assembled rust-native-* lock):
+//                   glibc-x86-64       the x86_64 glibc 2.41 tree (interp + sonames), at its
+//                                      staged stage/td/store/glibc-2.41-x86_64 prefix
+//                   gcc-x86-64-stage2  the cross gcc final — libgcc_s.so.1 (found recursively)
+//                   zlib-x86-64        the td-built libz.so.1 tree
+//                   tar, gzip          the declared unpackers (base tools)
 //   out           the output tree (rustc/cargo relinked onto /td/store).
 //
-// The interp target is <rust-native-glibc>/lib/ld-linux-x86-64.so.2 — the input's own
-// /td/store path, which IS the lock-keyed loader the gate interns glibc at, so the
-// relinked tree is byte-identical to the retired subcommand's output (the gate interns
-// it at the same td-toolchain-rust-x86_64.lock path + subst-exports it, unchanged). Same
-// pinned source + same inputs => byte-identical tree (the `td-builder check` double-build
-// oracle proves it); a missing input reds at drv-assembly (build-recipe), before a build.
+// The interp target is <glibc-x86-64 staged>/lib/ld-linux-x86-64.so.2 — the input's own
+// /td/store path. Same pinned source + same inputs => byte-identical tree (the `td-builder
+// check` double-build oracle proves it); a missing input reds at drv-assembly
+// (build-recipe), before a build.
+
+/// The staged install-prefix subpaths of the x86_64 toolchain rung outputs (a mesboot rung
+/// installs into <out>/stage/td/store/<prefix>). Kept beside the transform so the resolution
+/// stays in one place if a rung's version bumps.
+const GLIBC_X86_64_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
+const GCC_X86_64_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64";
+const ZLIB_X86_64_LIB: &str = "stage/td/store/zlib-1.3.1/lib";
 
 /// The resolved rust-toolchain transform inputs, read from the drv env.
 struct RustInputs {
-    /// TD_SRC — the extracted upstream Rust release tree (rustc/ cargo/ rust-std-…/).
+    /// The upstream Rust release, UNPACKED in-sandbox from TD_SRC (root: rustc/ cargo/ rust-std-…/).
     src: PathBuf,
-    /// rust-native-glibc — the x86_64 glibc 2.41 tree (interp target + co-located sonames).
+    /// glibc-x86-64 (staged) — the x86_64 glibc 2.41 tree (interp target + co-located sonames).
     glibc: PathBuf,
-    /// rust-native-libgcc — a tree holding `libgcc_s.so.1`.
+    /// The dir under gcc-x86-64-stage2 holding `libgcc_s.so.1` (found recursively).
     libgcc_dir: PathBuf,
-    /// rust-native-libz — a tree holding `libz.so.1.*`.
+    /// zlib-x86-64 (staged lib) — holds `libz.so.1.*`.
     libz_dir: PathBuf,
     /// `<glibc>/lib/ld-linux-x86-64.so.2` — the /td/store loader rustc/cargo relink onto.
     glibc_interp: String,
@@ -305,17 +312,75 @@ impl RustInputs {
                 .map(PathBuf::from)
                 .ok_or_else(|| format!("rust-toolchain: lock is missing the `{name}' input (needed by the transform)"))
         };
-        let glibc = pick("rust-native-glibc")?;
+        // #410: inputs resolved BY RECIPE NAME to their staged install prefixes — the
+        // recipe-graph model (glibc/libgcc/libz are the rungs build-plan --auto chained).
+        let glibc = pick("glibc-x86-64")?.join(GLIBC_X86_64_STAGE);
+        let gcc = pick("gcc-x86-64-stage2")?.join(GCC_X86_64_STAGE);
+        let libgcc = find_file(&gcc, "libgcc_s.so.1").ok_or_else(|| {
+            format!("rust-toolchain: no libgcc_s.so.1 under the gcc-x86-64-stage2 input {}", gcc.display())
+        })?;
+        let libgcc_dir = libgcc
+            .parent()
+            .ok_or("rust-toolchain: libgcc_s.so.1 has no parent dir")?
+            .to_path_buf();
+        let libz_dir = pick("zlib-x86-64")?.join(ZLIB_X86_64_LIB);
         let glibc_interp = format!("{}/lib/ld-linux-x86-64.so.2", glibc.display());
+        // unpack the pinned release tarball IN-SANDBOX (TD_SRC is the raw .tar.gz — the
+        // recipe's .source()) with the declared tar/gzip inputs, as ladder::unpack_into does.
+        let tarball = PathBuf::from(g("TD_SRC")?);
+        let extract = mktemp_dir("td-rust-src")?;
+        unpack_rust_release(&map, &tarball, &extract)?;
         Ok(RustInputs {
-            src: PathBuf::from(g("TD_SRC")?),
+            src: extract,
             glibc,
-            libgcc_dir: pick("rust-native-libgcc")?,
-            libz_dir: pick("rust-native-libz")?,
+            libgcc_dir,
+            libz_dir,
             glibc_interp,
             out: PathBuf::from(g("out")?),
         })
     }
+}
+
+/// Unpack the pinned Rust release `.tar.gz` into `dest` (top-level dir stripped) using the
+/// declared tar/gzip inputs (resolved from TD_INPUT_MAP by name) — no host PATH dependency,
+/// mirroring `untar`'s Xz pipe form: `gzip -dc TARBALL | tar -xf - --strip-components=1`.
+fn unpack_rust_release(map: &crate::json::Json, tarball: &Path, dest: &Path) -> Result<(), String> {
+    let pick_bin = |name: &str, bin: &str| -> Result<PathBuf, String> {
+        map.get(name)
+            .and_then(crate::json::Json::as_str)
+            .map(|p| Path::new(p).join("bin").join(bin))
+            .ok_or_else(|| format!("rust-toolchain: lock is missing the `{name}' input (needed to unpack the release tarball in-sandbox)"))
+    };
+    let tar = pick_bin("tar", "tar")?;
+    let gzip = pick_bin("gzip", "gzip")?;
+    fs::create_dir_all(dest).map_err(ioerr("mkdir rust src dest"))?;
+    let what = format!("unpack {}", tarball.display());
+    let mut dec = Command::new(&gzip)
+        .arg("-dc")
+        .arg(tarball)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{what}: spawn gzip: {e}"))?;
+    let stdout = dec.stdout.take().ok_or_else(|| format!("{what}: gzip produced no stdout"))?;
+    let status = Command::new(&tar)
+        .arg("-xf")
+        .arg("-")
+        .arg("--strip-components=1")
+        .arg("-C")
+        .arg(dest)
+        .stdin(Stdio::from(stdout))
+        .status()
+        .map_err(|e| format!("{what}: spawn tar: {e}"))?;
+    // Reap gzip + surface its exit: a corrupt/truncated .tar.gz makes gzip fail while tar can
+    // still exit 0 on the partial stream, so check BOTH (as untar's Xz path does).
+    let dec_status = dec.wait().map_err(|e| format!("{what}: wait gzip: {e}"))?;
+    if !status.success() {
+        return Err(format!("{what}: tar failed"));
+    }
+    if !dec_status.success() {
+        return Err(format!("{what}: gzip decompression failed"));
+    }
+    Ok(())
 }
 
 /// `rust-toolchain-build` phase runner (#380): assemble + relink the /td/store rust tree
@@ -1143,6 +1208,24 @@ mod tests {
         mk_native_static_wrapper(Path::new("/xg/gcc"), Path::new("/gl"), &dst, None).expect("write");
         let body = fs::read_to_string(&dst).expect("read");
         assert!(!body.contains("-idirafter"), "unexpected -idirafter:\n{body}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_file_returns_deterministic_recursive_match() {
+        let d = tmp("td-xn-test-find");
+        // libgcc_s.so.1 nested under a gcc-style tree; a decoy dir sorts earlier.
+        fs::create_dir_all(d.join("aaa/decoy")).unwrap();
+        fs::create_dir_all(d.join("lib/gcc/x86_64-pc-linux-gnu/14.3.0")).unwrap();
+        fs::write(d.join("lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc_s.so.1"), b"x").unwrap();
+        let hit = find_file(&d, "libgcc_s.so.1").expect("found libgcc");
+        assert!(
+            hit.ends_with("lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc_s.so.1"),
+            "hit: {}",
+            hit.display()
+        );
+        // absent name → None (the transform's "no libgcc_s.so.1 under …" red).
+        assert!(find_file(&d, "libz.so.1.3.1").is_none());
         let _ = fs::remove_dir_all(&d);
     }
 
