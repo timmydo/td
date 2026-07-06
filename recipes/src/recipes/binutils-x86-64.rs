@@ -1,4 +1,4 @@
-use crate::ladder::{base_inputs, base_path, unpack_keep_top, SH};
+use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.44, CROSS to x86_64 (#378 slice 4, guix's cross-binutils):
@@ -13,7 +13,7 @@ use crate::types::{Recipe, Step};
 // libc its host binaries link) + binutils-244 (the i686 host as/ld/ar).
 pub fn recipe() -> Recipe {
     let path = format!("{{in:binutils-244}}/bin:{}", base_path());
-    let mut steps = unpack_keep_top("binutils-x86-64-source", "{src}");
+    let mut steps = unpack_into("binutils-x86-64-source", "{src}");
     // the x86_64 kernel UAPI headers → a sysroot (--with-sysroot); the tarball
     // top level is {linux,asm,…}, landing at usr/include/*.
     steps.extend(unpack_keep_top(
