@@ -10,8 +10,8 @@
 #   (A) coverage         — `list` is non-empty and every recipe emits valid JSON
 #                          that round-trips (parse+re-emit stable).
 #   (B) manifest in sync — `td-recipe-eval meta` byte-equals the committed
-#                          tests/recipes-meta.json (what the rust-free guix-dependence
-#                          census reads); a stale manifest fails here.
+#                          tests/recipes-meta.json (the recipe manifest recipe-rs
+#                          keeps in sync); a stale manifest fails here.
 #   (C) discrimination   — `verify` of a recipe against a DIFFERENT recipe's JSON
 #                          FAILS (the always-on negative control; not vacuous).
 #
@@ -54,4 +54,4 @@ if "$TD_RECIPE_EVAL" verify hello "$work/sed.json" >/dev/null 2>&1; then
 fi
 echo "   ok: verify hello <sed.json> correctly FAILS"
 
-echo "PASS: recipe-rs — the Rust package surface emits valid self-consistent JSON, the guix-dependence manifest is in sync, and verify discriminates mismatches. Correctness vs upstream is proven by recipe-owned package checks, not boa (retired)."
+echo "PASS: recipe-rs — the Rust package surface emits valid self-consistent JSON, the recipe manifest is in sync, and verify discriminates mismatches. Correctness vs upstream is proven by recipe-owned package checks, not boa (retired)."

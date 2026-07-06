@@ -4,16 +4,15 @@
 //! assembles the registry — issue #295), evaluated by td-recipe-eval.
 //! This gate compiles the dependency-free `td-recipe` crate OFFLINE, runs its unit tests,
 //! then asserts (tests/recipe-rs.sh) the surface is self-consistent — every recipe + spec
-//! emits valid round-tripping JSON, the guix-dependence manifest (tests/recipes-meta.json)
+//! emits valid round-tripping JSON, the recipe manifest (tests/recipes-meta.json)
 //! is in sync, and `verify` discriminates a mismatch (negative control). Correctness vs
 //! upstream is recipe-checks' job, not a boa oracle.
-//! 
+//!
 //! Offline by construction (the cargo-test pattern): the guix-free tools/provision-rust.sh +
 //! tools/provision-cc.sh resolve the warm rust + cc toolchain onto PATH — NOT a `guix shell`
-//! process (R1, github issue #274) — so this file drops OUT of the guix-surface `shell` shrink
-//! ratchet (a PURE shrink); the crate has NO [dependencies] so `--frozen` touches no network.
-//! No guix package is built via `guix build -e (system M) PKG` either — NOTHING is added to
-//! the guix-surface ratchet.
+//! process (R1, github issue #274); the crate has NO [dependencies] so `--frozen` touches no
+//! network. No guix package is built via `guix build -e (system M) PKG` either — this gate
+//! adds no new guix packager surface (directive 6).
 //! Not FAST_GATES: needs the rust toolchain (absent from the small td-ci-fast image), same
 //! rationale as cargo-test.
 

@@ -274,15 +274,15 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
         "make" | "sed" | "grep" | "xz" | "diffutils" | "patch" | "file" | "coreutils"
         | "gawk" | "tar" | "findutils" | "bash" | "libsigsegv" | "libunistring"
         | "pcre2" | "ncurses" | "readline" => sel.add_target("recipe-checks-daily"),
-        "td-builder" => sel.add_target("rust-build"),
+        "td-builder" => sel.add_target("check-pr"),
         "td-vendor-demo" | "td-cmake-demo" | "td-fetch" => sel.add_target("recipe-checks"),
         "td-russh-demo" | "cat" | "eza" | "bat" | "sd" | "procs" | "fd" | "ripgrep"
         | "uutils" | "youki" => sel.add_target("recipe-checks-daily"),
-        "td-feed" => sel.add_target("td-feed"),
-        "td-subst" => sel.add_target("td-subst"),
+        "td-feed" => sel.add_target("check-pr"),
+        "td-subst" => sel.add_target("check-pr"),
         "pkg-config" => {
-            sel.add_target("guix-dependence");
-            sel.add_note("pkg-config is authored but excluded from td-built census until it has an own-builder gate.");
+            sel.add_target("check-pr");
+            sel.add_note("pkg-config is authored but not yet built by a td gate; running the bounded check-pr tier.");
         }
         _ => {
             if let Some(t) = target_for_build_spec(root, spec) {
@@ -459,44 +459,30 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         // The td-recipe crate IS the package + system-spec surface (boa/TS retired).
-        // It feeds the corpus build path (cache-lib emits via td-recipe-eval) and the
-        // guix-dependence census manifest — so a catalog change can affect ANY built
-        // package. Run recipe-rs (self-consistency + manifest sync), the census, and
-        // the package build gates. (spec-diff retired with the museum tier.)
+        // It feeds the corpus build path (cache-lib emits via td-recipe-eval) — so a
+        // catalog change can affect ANY built package. Run recipe-rs (self-consistency
+        // + manifest sync) and the package build gates. (spec-diff retired with the
+        // museum tier; the guix-dependence census retired with the guix-oracle gates.)
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-rs");
-        sel.add_target("guix-dependence");
         add_build_gate_targets(root, sel);
         return;
     }
 
     if pattern_matches("fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock", p) {
-        // BOTH consumers of the warmed vendor dir: recipe-checks builds td-fetch
-        // from it, and the td-feed gate shares td-fetch's closure exactly —
-        // it greps every vendored crate's sha against feed/Cargo.lock, so a
-        // fetch/Cargo.lock bump without the matching feed/Cargo.lock bump
-        // must red locally, not on the daily.
+        // recipe-checks builds td-fetch from the warmed vendor dir. (The td-feed
+        // gate, the other consumer, retired with the guix-invoking gates.)
         sel.add_target("recipe-checks");
-        sel.add_target("td-feed");
         return;
     }
 
     if pattern_matches("feed/*|feed/src/*|feed/Cargo.toml|feed/Cargo.lock", p) {
-        // td-feed builds the mirror + runs its selftests (incl. the offline `warm-selftest`
-        // for the consolidated `td-feed warm <action>` orchestration). main.rs ALSO holds the
-        // host-PREP warm that feeds the corpus + bootstrap gates (the former warm-*.sh), so
-        // smoke a representative consumer of each warm family: recipe-checks-daily (`warm crate`) and
-        // bootstrap-glibc (`warm sources` + `warm kernel-headers`). feed-shared drives the
-        // shared-daemon lifecycle (`td-feed ensure-serve`, the former tools/feed-ensure.sh).
-        sel.add_target("td-feed");
+        // main.rs holds the host-PREP warm that feeds the corpus + bootstrap gates,
+        // so smoke a representative consumer of each warm family: recipe-checks-daily
+        // (`warm crate`) and bootstrap-glibc (`warm sources` + `warm kernel-headers`).
+        // (The td-feed / feed-shared gates retired with the guix-invoking gates.)
         sel.add_target("recipe-checks-daily");
         sel.add_target("bootstrap-glibc");
-        sel.add_target("feed-shared");
-        return;
-    }
-
-    if pattern_matches("subst/*|subst/src/*|subst/Cargo.toml|subst/Cargo.lock", p) {
-        sel.add_target("td-subst");
         return;
     }
 
@@ -515,11 +501,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if p == "tests/td-toolchain-rust-x86_64.lock" {
         sel.add_preflight("shell-syntax");
-        // the RELINKED rust tree's input-addressed lock: its consumers are the rust runtime
-        // gate (which assembles+relinks+publishes it) and the rust userland gate (which sources
-        // the runtime gate's assembly). A pin/recipe-rev change re-keys + re-publishes the tree.
+        // the RELINKED rust tree's input-addressed lock: its consumer is the rust runtime
+        // gate (which assembles+relinks+publishes it). A pin/recipe-rev change re-keys +
+        // re-publishes the tree. (The rust-userland-x86_64 gate retired with the guix gates.)
         sel.add_target("rust-x86_64-runtime-store-native");
-        sel.add_target("rust-userland-x86_64-store-native");
         return;
     }
 
@@ -549,18 +534,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // The seed-substitute pair (#311): the resolver the provision_stage0 prelude calls
-    // and the daily's seed publisher. The seed-subst gate drives both end-to-end (the
-    // prelude's warm path additionally runs before every selected check anyway).
-    if pattern_matches(
-        "tests/seed-subst.sh|tools/resolve-seed.sh|tools/publish-seed-subst.sh",
-        p,
-    ) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("seed-subst");
-        return;
-    }
-
     // The guix-less-runner harness shipping mechanism (#314): the consumer resolver, the daily's
     // producer, and the gate that drives them. run_check_harness (check_loop.rs, the spine) also
     // calls resolve-harness.sh, but a spine touch already escalates to the full check.
@@ -578,11 +551,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         let spec = p.strip_prefix("tests/").unwrap_or(p);
         let spec = spec.strip_suffix("-no-guix.lock").unwrap_or(spec);
         map_recipe_spec(root, spec, sel);
-        return;
-    }
-
-    if pattern_matches("tests/td-builder-rust.lock|tests/td-builder-source.scm", p) {
-        sel.add_target("rust-build");
         return;
     }
 
@@ -644,24 +612,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("recipe-checks");
         return;
     }
-    if pattern_matches("tests/td-feed.lock|tests/td-feed.index", p) {
-        sel.add_target("td-feed");
-        return;
-    }
-    if p == "tests/td-subst.lock" {
-        sel.add_target("td-subst");
-        return;
-    }
-
-    if p == "tools/gen-feed-index.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("td-feed");
-        return;
-    }
     if p == "tests/crate-free-build.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-checks-daily");
-        sel.add_target("rust-userland-image");
         return;
     }
 
@@ -679,12 +632,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "tests/rust-userland-image.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("rust-userland-image");
-        return;
-    }
-
     // tests/build-recipes.sh IS the build phase (the former Makefile build-recipes
     // recipe, run by the gate runner) — a change to it affects every build gate,
     // exactly like the build-phase helpers below.
@@ -694,27 +641,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     ) {
         sel.add_preflight("shell-syntax");
         add_build_gate_targets(root, sel);
-        // provision_stage0 lives in cache-lib: its seed fetch / fail-closed paths are
-        // exercised only by the seed-subst gate (the build gates all run on a warm
-        // host where the prelude fetches nothing).
-        if p == "tests/cache-lib.sh" {
-            sel.add_target("seed-subst");
-        }
-        return;
-    }
-
-    if p == "tests/td-drv-build-drv.scm" {
-        sel.add_target("td-drv-build");
-        return;
-    }
-    if p == "tests/resolve-lock.scm" {
-        sel.add_target("resolve");
-        return;
-    }
-
-
-    if p == "tests/offline-drv.scm" {
-        sel.add_target("td-offline");
         return;
     }
 
@@ -798,19 +724,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     ) {
         sel.add_preflight("shell-syntax");
         sel.add_target("rust-x86_64-runtime-store-native");
-        // gate 424 (#258 rust userland) sources this script ASSEMBLE-ONLY for its /td/store
-        // toolchain assembly, so a change here must re-validate that consumer too.
-        sel.add_target("rust-userland-x86_64-store-native");
-        return;
-    }
-
-    // #258 rust userland: ripgrep built by the native x86_64 /td/store toolchain (gate 424).
-    if pattern_matches(
-        "tests/rust-x86_64-userland-store-native.sh|builder/src/gate_defs/424-rust-userland-x86_64-store-native.rs",
-        p,
-    ) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("rust-userland-x86_64-store-native");
         return;
     }
 
@@ -1097,40 +1010,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if glob_match("tests/guix-dependence.*", p) {
-        sel.add_target("guix-dependence");
-        return;
-    }
-    // guix-surface.sh + its TWO baselines (guix-surface.expected packager set,
-    // guix-surface-shrink.expected directive-8 set) all route to the gate.
-    if glob_match("tests/guix-surface*", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("guix-surface");
-        return;
-    }
 
     if p == "tests/recipe-rs.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-rs");
         return;
     }
-    if p == "system/td-builder.scm" {
-        sel.add_target("td-builder");
-        sel.add_target("rust-build");
-        return;
-    }
-    // The remaining system/ modules (td-build.scm — td-builder.scm has its own arm
-    // above) and the OCI check harness (tests/oci-native-check.sh) feed the image
-    // tier (oci-native + rust-userland-image, deferred to the daily backstop) and
-    // the drv-fixture gates (PR-sized — run them per-PR).
-    if pattern_matches("system/*|tests/oci*", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("td-drv-build");
-        sel.add_target("td-realize");
-        sel.add_target("check-system");
-        return;
-    }
-
     if p == "tests/heal-revert.sh" {
         // CI-lint-only test of the heal primitive — git is absent from the loop
         // sandbox, so it is not a ./check.sh gate; shell-syntax suffices locally.
@@ -1152,31 +1037,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // The td-builder SEED build's toolchain resolvers (provision-rust = rustc/cargo,
-    // provision-cc = the C linker) and the seed build driver feed the `bootstrap` gate
-    // (stage0 compile) and are covered behaviorally by the provision-rust/provision-cc gates
-    // (provided/rustup|system resolution + a provided-toolchain build).
-    if pattern_matches(
-        "tools/provision-rust.sh|tools/provision-cc.sh|tools/bootstrap-td-builder.sh",
-        p,
-    ) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("bootstrap");
-        sel.add_target("provision-rust");
-        sel.add_target("provision-cc");
-        return;
-    }
-    if p == "tests/provision-rust.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("provision-rust");
-        return;
-    }
-    if p == "tests/provision-cc.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("provision-cc");
-        return;
-    }
-
+    // (The td-builder SEED-build resolver scripts tools/provision-{rust,cc}.sh +
+    // tools/bootstrap-td-builder.sh and tests/provision-{rust,cc}.sh fall through to
+    // the shell-syntax preflight below — their gates (bootstrap/provision-rust/
+    // provision-cc) retired with the guix-invoking gates.)
     if pattern_matches("ci/*.sh|tools/*.sh", p) {
         sel.add_preflight("shell-syntax");
         return;
@@ -1196,7 +1060,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if p == "channels.scm" {
         sel.add_target("check-fast");
-        sel.add_target("guix-dependence");
         sel.require_full(&format!(
             "{p} changed; the dependency pin affects the whole loop."
         ));
@@ -1488,9 +1351,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     if default_check_covers_target(root, "check-system") {
         fail("default coverage: check-system is not covered by plain ./check.sh".into());
     }
-    if default_check_covers_target(root, "oci-native") {
-        fail("default coverage: system gate oci-load is not covered by plain ./check.sh".into());
-    }
     if !default_check_covers_target(root, "check-pr") {
         fail("default coverage: missing check-pr (a subset of the plain check)".into());
     }
@@ -1557,15 +1417,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("builder/src/gate_bodies.rs", "store-relocate");
     assert_target!("builder/src/gate_bodies.rs", "check-engine");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
-    // catalog edit runs recipe-rs, the census, and the package build gates.
+    // catalog edit runs recipe-rs and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
-    assert_target!("recipes/src/catalog.rs", "guix-dependence");
     assert_target!("recipes/src/catalog.rs", "recipe-checks");
     assert_target!("recipes/src/catalog.rs", "recipe-checks-daily");
     // Recipes are one self-registering file each under src/recipes/ (issue #295);
     // the nested path must select the same gates (glob `*` crosses `/`).
     assert_target!("recipes/src/recipes/hello.rs", "recipe-rs");
-    assert_target!("recipes/src/recipes/hello.rs", "guix-dependence");
     assert_target!("recipes/src/recipes/hello.rs", "recipe-checks");
     assert_target!("recipes/src/recipes/hello.rs", "recipe-checks-daily");
     assert_target!("recipes/build.rs", "recipe-rs");
@@ -1574,31 +1432,18 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/recipes-meta.json", "recipe-rs");
     assert_target!("tests/td-russh-demo.lock", "recipe-checks-daily");
     assert_target!("tests/russh-demo/Cargo.lock", "recipe-checks-daily");
-    assert_target!("tests/td-feed.lock", "td-feed");
-    assert_target!("tests/td-feed.index", "td-feed");
-    // td-fetch's own crate-closure warm is native in check_loop.rs (the former
-    // tools/warm-td-fetch-crates.sh): a warm-code change rides the loop-spine arm
-    // (full-check escalation), and the lock it parses maps to BOTH gates that
-    // consume the warmed vendor dir (td-feed shares td-fetch's closure).
+    // td-fetch's crate-closure warm is native in check_loop.rs: the lock it parses
+    // maps to recipe-checks (which consumes the warmed vendor dir). (The td-feed gate,
+    // the other consumer, retired with the guix-invoking gates.)
     assert_target!("fetch/Cargo.lock", "recipe-checks");
-    assert_target!("fetch/Cargo.lock", "td-feed");
-    // The consolidated warm orchestration + the shared-daemon lifecycle
-    // (`td-feed ensure-serve`, former tools/feed-ensure.sh) live in feed/src/main.rs:
-    // a feed change smokes td-feed (build + warm-selftest), a representative consumer of
-    // each warm family, and feed-shared (the ensure-serve lifecycle).
-    assert_target!("feed/src/main.rs", "feed-shared");
+    // A feed/src change smokes a representative consumer of each warm family:
+    // recipe-checks-daily (`warm crate`) and bootstrap-glibc (`warm sources`).
+    // (td-feed / feed-shared / seed-subst retired with the guix-invoking gates.)
     assert_target!("feed/src/main.rs", "recipe-checks-daily");
     assert_target!("feed/src/main.rs", "bootstrap-glibc");
-    assert_target!("feed/src/main.rs", "td-feed");
-    assert_target!("tests/td-subst.lock", "td-subst");
-    assert_target!("subst/src/main.rs", "td-subst");
     assert_target!("tests/toolchain-subst-default.sh", "toolchain-subst-default");
     assert_target!("tools/resolve-toolchain.sh", "toolchain-subst-default");
     assert_target!("tools/publish-toolchain-subst.sh", "toolchain-subst-default");
-    assert_target!("tests/seed-subst.sh", "seed-subst");
-    assert_target!("tools/resolve-seed.sh", "seed-subst");
-    assert_target!("tools/publish-seed-subst.sh", "seed-subst");
-    assert_target!("tests/cache-lib.sh", "seed-subst");
     assert_target!("tests/td-subst.pub", "toolchain-subst-default");
     assert_target!("tests/td-toolchain.lock", "toolchain-subst-default");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");
@@ -1630,18 +1475,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "toolchain-x86_64-input-addressed"
     );
     assert_target!(
-        "tests/rust-x86_64-userland-store-native.sh",
-        "rust-userland-x86_64-store-native"
-    );
-    assert_target!(
-        "builder/src/gate_defs/424-rust-userland-x86_64-store-native.rs",
-        "rust-userland-x86_64-store-native"
-    );
-    assert_target!(
-        "tests/rust-x86_64-runtime-store-native.sh",
-        "rust-userland-x86_64-store-native"
-    );
-    assert_target!(
         "tests/userland-x86_64-store-native.sh",
         "userland-x86_64-store-native"
     );
@@ -1662,9 +1495,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/recipe-check-lib.sh", "recipe-checks-daily");
     assert_target!("tests/intern-src.sh", "check-pr");
     assert_target!("tests/intern-src.sh", "recipe-checks-daily");
-    assert_target!("tests/guix-surface.sh", "guix-surface");
-    assert_target!("tests/guix-surface.expected", "guix-surface");
-    assert_target!("tests/guix-surface-shrink.expected", "guix-surface");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
     // the seed tree + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
@@ -1677,7 +1507,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_branch_policy!("builder/src/main.rs", "the full check would be waived");
     assert_branch_policy!("builder/src/sandbox.rs", "the full check would be waived");
     assert_branch_policy!("builder/Cargo.toml", "the full check would be waived");
-    assert_target!("system/td-build.scm", "check-system");
     // The per-PR budget (human 2026-07-04): only channels.scm still escalates to
     // the FULL loop. The loop spine and unmapped paths validate on the bounded
     // check-pr tier; daily/system-tier gates are named but deferred.
@@ -1692,11 +1521,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_runs!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
     assert_deferred!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-gcc-mesboot");
     assert_deferred!("tests/crate-free-build.sh", "recipe-checks-daily");
-    assert_deferred!("tests/crate-free-build.sh", "rust-userland-image");
     assert_runs!("recipes/src/catalog.rs", "recipe-checks");
     assert_deferred!("recipes/src/catalog.rs", "recipe-checks-daily");
-    assert_deferred!("system/td-build.scm", "check-system");
-    assert_runs!("system/td-build.scm", "td-realize");
 
     failures
 }

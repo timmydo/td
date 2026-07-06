@@ -9,9 +9,9 @@
 # dev box after a channel bump) has no td-subst seed store, so it warms the seed
 # OUT-OF-BAND here — exactly the escape tools/resolve-seed.sh's fail-closed message names
 # — so provision_stage0 finds the seed present. The LOOP itself stays guix-free; this is
-# host-prep, a sibling of the other tools/warm-*.sh (not a loop step, and — like them —
-# outside the guix-surface scanner's scope, which covers the loop orchestration in
-# tests/ci/gate_defs, not the host warms).
+# host-prep, a sibling of the other tools/warm-*.sh (not a loop step, so it is not part
+# of the loop's guix surface — that covers the loop orchestration in tests/ci/gate_defs,
+# not the host warms).
 #
 # The seed is the guix-built pin (retired last per the north star). Most of it is
 # already materialized wherever a store image was imported or prior work ran;

@@ -27,8 +27,7 @@ ladder, short-circuiting on the first failure; **the drop-in fragments under
 `mk/gates/*.mk` (each self-registering into the `CHEAP_GATES`/`HEAVY_GATES` pools the
 `check:` target expands) are the authoritative gate list** — documents point here
 instead of restating it, and a new gate is a new fragment file, not an edit to a shared
-list. Broad shape: config eval → the guix-surface/dependence censuses → the
-package-manager behavioral tests (td builds every recipe with its own
+list. Broad shape: the package-manager behavioral tests (td builds every recipe with its own
 builder/daemon and the built tools RUN; td shell serves them; td-native
 images run under crun; the /td/store bootstrap chain compiles the toolchain).
 

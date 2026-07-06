@@ -103,10 +103,10 @@ fn main() {
             }
         }
         Some("meta") => {
-            // A canonical JSON manifest of every recipe's census-relevant metadata
-            // (stem, buildSystem, inputs, perturbed). The guix-dependence census
-            // reads the committed tests/recipes-meta.json (rust-free, cheap)
-            // instead of scanning tests/ts/recipe-*.ts; recipe-rs asserts this
+            // A canonical JSON manifest of every recipe's metadata (stem,
+            // buildSystem, inputs, perturbed) — the recipe manifest that recipe-rs
+            // keeps in sync (rust-free, cheap, committed at tests/recipes-meta.json
+            // instead of scanning tests/ts/recipe-*.ts); recipe-rs asserts this
             // command stays in sync with that file.
             use td_recipe::json::Json;
             let mut arr = Vec::new();
