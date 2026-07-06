@@ -505,6 +505,31 @@ pub struct Recipe {
     pub bins: Option<Vec<String>>,
     pub no_default_features: Option<bool>,
     pub features: Option<Vec<String>>,
+    /// Package-owned behavioral/reproducibility checks. The gate runner consumes
+    /// these through `td-recipe-eval check-*`; the build path ignores them.
+    pub checks: Option<Vec<RecipeCheck>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CheckTier {
+    Pr,
+    Daily,
+}
+
+#[derive(Clone)]
+pub struct RecipeCheck {
+    pub tier: CheckTier,
+    pub script: String,
+}
+
+impl RecipeCheck {
+    pub fn pr(script: &str) -> RecipeCheck {
+        RecipeCheck { tier: CheckTier::Pr, script: script.into() }
+    }
+
+    pub fn daily(script: &str) -> RecipeCheck {
+        RecipeCheck { tier: CheckTier::Daily, script: script.into() }
+    }
 }
 
 impl Recipe {
@@ -525,6 +550,7 @@ impl Recipe {
             bins: None,
             no_default_features: None,
             features: None,
+            checks: None,
         }
     }
     pub fn gnu(name: &str, version: &str) -> Recipe {
@@ -601,6 +627,10 @@ impl Recipe {
     }
     pub fn features(mut self, xs: &[&str]) -> Recipe {
         self.features = Some(vs(xs));
+        self
+    }
+    pub fn checks(mut self, xs: Vec<RecipeCheck>) -> Recipe {
+        self.checks = Some(xs);
         self
     }
 
@@ -687,6 +717,15 @@ mod tests {
         assert_eq!(
             r.to_json().to_canonical(),
             r#"{"bins":["cat"],"buildSystem":"rust","name":"cat","version":"0.9.0"}"#
+        );
+    }
+
+    #[test]
+    fn recipe_checks_are_not_build_json() {
+        let r = Recipe::gnu("hello", "2.12.2").checks(vec![RecipeCheck::pr("echo ok")]);
+        assert_eq!(
+            r.to_json().to_canonical(),
+            r#"{"buildSystem":"gnu","name":"hello","version":"2.12.2"}"#
         );
     }
 }

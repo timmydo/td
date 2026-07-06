@@ -1,7 +1,7 @@
 #!/bin/sh
 # intern-src.sh — intern a source TREE into a td-OWNED store with td's OWN recursive
 # addToStore (`td-builder store-add-recursive`), NO `guix repl` / NO guix-daemon. This
-# is the source PREP that the rust-build / rust-vendor / rust-russh gates do; it
+# is the source PREP that the rust-build gate and recipe-owned Rust checks do; it
 # replaces the retired Guile helpers tests/td-builder-source.scm,
 # td-vendor-demo-source.scm and td-russh-demo-source.scm, whose `guix repl …
 # lower-object` made the daemon intern the live tree (move-off-Guile §5). td computes

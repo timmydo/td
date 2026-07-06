@@ -7,7 +7,7 @@
 //! guix (derivation …)), and it is REALIZED daemon-free (realize_drv — no
 //! guix-daemon). The whole BUILD runs with guix/Guile SCRUBBED FROM PATH. So nothing
 //! in td-builder's own build path is guix/Guile — only the rustc/cargo/gcc seed and
-//! the lock stay external (§5, retired LAST), exactly as the toolchain-no-guix gate.
+//! the lock stay external (§5, retired LAST), exactly as the recipe-owned package checks.
 //! This routes the self-host onto the same build-recipe rail the corpus/toolchain
 //! leaves and nano use (own-builder-daemon, #74), replacing the earlier Guile
 //! `(derivation …)` lowering.

@@ -1,4 +1,4 @@
-use crate::types::{Recipe, Source};
+use crate::types::{Recipe, RecipeCheck, Source};
 
 pub fn recipe() -> Recipe {
     Recipe::gnu("bash", "5.2.37")
@@ -8,4 +8,7 @@ pub fn recipe() -> Recipe {
         ))
         .inputs(&["readline", "ncurses"])
         .configure_flags(&["CFLAGS=-O2 -g -std=gnu17"])
+        .checks(vec![RecipeCheck::daily(r#"
+recipe_gnu_version bash bash "GNU bash, version 5.2.37"
+"#)])
 }

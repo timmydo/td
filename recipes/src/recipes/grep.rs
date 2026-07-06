@@ -1,4 +1,4 @@
-use crate::types::{Recipe, Source};
+use crate::types::{Recipe, RecipeCheck, Source};
 
 pub fn recipe() -> Recipe {
     Recipe::gnu("grep", "3.11")
@@ -7,4 +7,7 @@ pub fn recipe() -> Recipe {
             "1avf4x8skxbqrjp5j2qr9sp5vlf8jkw2i5bdn51fl3cxx3fsxchx",
         ))
         .inputs(&["pcre2"])
+        .checks(vec![RecipeCheck::daily(r#"
+recipe_gnu_version grep grep "(GNU grep) 3.11"
+"#)])
 }

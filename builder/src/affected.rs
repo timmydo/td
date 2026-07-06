@@ -266,25 +266,18 @@ fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
 }
 
 fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
-    if let Some(t) = target_for_build_spec(root, spec) {
-        sel.add_target(&t);
-        return;
-    }
     match spec {
+        "hello" => {
+            sel.add_target("recipe-checks");
+            sel.add_target("recipe-checks-daily");
+        }
+        "make" | "sed" | "grep" | "xz" | "diffutils" | "patch" | "file" | "coreutils"
+        | "gawk" | "tar" | "findutils" | "bash" | "libsigsegv" | "libunistring"
+        | "pcre2" | "ncurses" | "readline" => sel.add_target("recipe-checks-daily"),
         "td-builder" => sel.add_target("rust-build"),
-        "td-vendor-demo" => sel.add_target("rust-vendor"),
-        "td-russh-demo" => sel.add_target("rust-russh"),
-        "td-cmake-demo" => sel.add_target("cmake"),
-        "cat" => sel.add_target("rust-uutils"),
-        "eza" => sel.add_target("rust-eza"),
-        "bat" => sel.add_target("rust-bat"),
-        "sd" => sel.add_target("rust-sd"),
-        "procs" => sel.add_target("rust-procs"),
-        "fd" => sel.add_target("rust-fd"),
-        "ripgrep" => sel.add_target("rust-ripgrep"),
-        "uutils" => sel.add_target("rust-coreutils"),
-        "youki" => sel.add_target("rust-youki"),
-        "td-fetch" => sel.add_target("rust-fetch"),
+        "td-vendor-demo" | "td-cmake-demo" | "td-fetch" => sel.add_target("recipe-checks"),
+        "td-russh-demo" | "cat" | "eza" | "bat" | "sd" | "procs" | "fd" | "ripgrep"
+        | "uutils" | "youki" => sel.add_target("recipe-checks-daily"),
         "td-feed" => sel.add_target("td-feed"),
         "td-subst" => sel.add_target("td-subst"),
         "pkg-config" => {
@@ -292,12 +285,16 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
             sel.add_note("pkg-config is authored but excluded from td-built census until it has an own-builder gate.");
         }
         _ => {
-            sel.add_target("check-pr");
-            sel.add_note(&format!(
-                "No recipe-specific mapping for '{spec}' — running the bounded check-pr tier; \
-                 the daily backstop covers the daily-tier gates. Update builder/src/affected.rs \
-                 with a mapping for it."
-            ));
+            if let Some(t) = target_for_build_spec(root, spec) {
+                sel.add_target(&t);
+            } else {
+                sel.add_target("check-pr");
+                sel.add_note(&format!(
+                    "No recipe-specific mapping for '{spec}' — running the bounded check-pr tier; \
+                     the daily backstop covers the daily-tier gates. Update builder/src/affected.rs \
+                     with a mapping for it."
+                ));
+            }
         }
     }
 }
@@ -333,7 +330,7 @@ const CHAIN: [&str; 29] = [
     "bootstrap-gcc-mesboot-494-store-native",
     "bootstrap-gcc-14-store-native",
     "bootstrap-glibc-241-store-native",
-    "bootstrap-hello-corpus-store-native",
+    "recipe-checks-daily",
     "bootstrap-x86_64-toolchain-store-native",
 ];
 
@@ -474,12 +471,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches("fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock", p) {
-        // BOTH consumers of the warmed vendor dir: rust-fetch builds td-fetch
+        // BOTH consumers of the warmed vendor dir: recipe-checks builds td-fetch
         // from it, and the td-feed gate shares td-fetch's closure exactly —
         // it greps every vendored crate's sha against feed/Cargo.lock, so a
         // fetch/Cargo.lock bump without the matching feed/Cargo.lock bump
         // must red locally, not on the daily.
-        sel.add_target("rust-fetch");
+        sel.add_target("recipe-checks");
         sel.add_target("td-feed");
         return;
     }
@@ -488,11 +485,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // td-feed builds the mirror + runs its selftests (incl. the offline `warm-selftest`
         // for the consolidated `td-feed warm <action>` orchestration). main.rs ALSO holds the
         // host-PREP warm that feeds the corpus + bootstrap gates (the former warm-*.sh), so
-        // smoke a representative consumer of each warm family: rust-ripgrep (`warm crate`) and
+        // smoke a representative consumer of each warm family: recipe-checks-daily (`warm crate`) and
         // bootstrap-glibc (`warm sources` + `warm kernel-headers`). feed-shared drives the
         // shared-daemon lifecycle (`td-feed ensure-serve`, the former tools/feed-ensure.sh).
         sel.add_target("td-feed");
-        sel.add_target("rust-ripgrep");
+        sel.add_target("recipe-checks-daily");
         sel.add_target("bootstrap-glibc");
         sel.add_target("feed-shared");
         return;
@@ -593,58 +590,58 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         "tests/td-vendor-demo.lock|tests/td-vendor-demo-source.scm|tests/vendor-demo/*|tests/vendor-demo/src/*",
         p,
     ) {
-        sel.add_target("rust-vendor");
+        sel.add_target("recipe-checks");
         return;
     }
 
     if pattern_matches("tests/td-russh-demo.lock|tests/td-russh-demo-source.scm|tests/russh-demo/*", p) {
-        sel.add_target("rust-russh");
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
     if pattern_matches("tests/td-cmake-demo.lock|tests/cmake-demo/*", p) {
-        sel.add_target("cmake");
+        sel.add_target("recipe-checks");
         return;
     }
 
     if p == "tests/cat-uutils.lock" {
-        sel.add_target("rust-uutils");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/eza.lock" {
-        sel.add_target("rust-eza");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/bat.lock" {
-        sel.add_target("rust-bat");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/sd.lock" {
-        sel.add_target("rust-sd");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/procs.lock" {
-        sel.add_target("rust-procs");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/fd.lock" {
-        sel.add_target("rust-fd");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/ripgrep.lock" {
-        sel.add_target("rust-ripgrep");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/uutils-coreutils.lock" {
-        sel.add_target("rust-coreutils");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/youki.lock" {
-        sel.add_target("rust-youki");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/td-fetch.lock" {
-        sel.add_target("rust-fetch");
+        sel.add_target("recipe-checks");
         return;
     }
     if pattern_matches("tests/td-feed.lock|tests/td-feed.index", p) {
@@ -663,16 +660,22 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
     if p == "tests/crate-free-build.sh" {
         sel.add_preflight("shell-syntax");
-        sel.add_target("rust-ripgrep");
-        sel.add_target("rust-sd");
-        sel.add_target("rust-fd");
-        sel.add_target("rust-procs");
-        sel.add_target("rust-eza");
-        sel.add_target("rust-bat");
-        sel.add_target("rust-coreutils");
-        sel.add_target("rust-uutils");
-        sel.add_target("rust-youki");
+        sel.add_target("recipe-checks-daily");
         sel.add_target("rust-userland-image");
+        return;
+    }
+
+    if pattern_matches("tests/recipe-checks.sh|tests/recipe-check-lib.sh", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("recipe-checks");
+        sel.add_target("recipe-checks-daily");
+        return;
+    }
+
+    if p == "tests/intern-src.sh" {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("check-pr");
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
@@ -963,7 +966,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
     if pattern_matches("tests/bootstrap-hello-corpus-store-native.sh|seed/sources/hello-2.12.2.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 27, 28);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     // bootstrap-chain.sh is the SHARED from-seed toolchain chain; its consumers are the sed
@@ -975,8 +978,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // ported from PR #203's affected-checks.sh.)
     if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh|tests/bootstrap-chain.sh", p) {
         sel.add_preflight("shell-syntax");
-        sel.add_target("bootstrap-sed-corpus-store-native");
-        sel.add_target("bootstrap-hello-corpus-store-native");
+        sel.add_target("recipe-checks-daily");
         sel.add_target("store-persist");
         sel.add_target("chain-cache");
         return;
@@ -1510,12 +1512,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/chain-cache.sh", "chain-cache");
     assert_target!("tests/bootstrap-chain.sh", "store-persist");
     assert_target!("tests/bootstrap-chain.sh", "chain-cache");
-    // #327: the hello corpus gate now SOURCES the shared chain (inline copy deleted), so a
-    // chain change must re-prove it too (its own-file arm still selects just itself).
-    assert_target!("tests/bootstrap-chain.sh", "bootstrap-hello-corpus-store-native");
+    // The store-native corpus recipe checks source the shared chain, so a chain
+    // change must re-prove the daily recipe-check wrapper too.
+    assert_target!("tests/bootstrap-chain.sh", "recipe-checks-daily");
     assert_target!(
         "tests/bootstrap-hello-corpus-store-native.sh",
-        "bootstrap-hello-corpus-store-native"
+        "recipe-checks-daily"
     );
 
     // Spec→gate routing: a recipe/lock for a gate's SPEC selects that gate.
@@ -1548,32 +1550,34 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // catalog edit runs recipe-rs, the census, and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
     assert_target!("recipes/src/catalog.rs", "guix-dependence");
-    assert_target!("recipes/src/catalog.rs", "corpus-no-guix");
+    assert_target!("recipes/src/catalog.rs", "recipe-checks");
+    assert_target!("recipes/src/catalog.rs", "recipe-checks-daily");
     // Recipes are one self-registering file each under src/recipes/ (issue #295);
     // the nested path must select the same gates (glob `*` crosses `/`).
     assert_target!("recipes/src/recipes/hello.rs", "recipe-rs");
     assert_target!("recipes/src/recipes/hello.rs", "guix-dependence");
-    assert_target!("recipes/src/recipes/hello.rs", "corpus-no-guix");
+    assert_target!("recipes/src/recipes/hello.rs", "recipe-checks");
+    assert_target!("recipes/src/recipes/hello.rs", "recipe-checks-daily");
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("tests/recipe-rs.sh", "recipe-rs");
     assert_target!("tests/recipes-meta.json", "recipe-rs");
-    assert_target!("tests/td-russh-demo.lock", "rust-russh");
-    assert_target!("tests/russh-demo/Cargo.lock", "rust-russh");
+    assert_target!("tests/td-russh-demo.lock", "recipe-checks-daily");
+    assert_target!("tests/russh-demo/Cargo.lock", "recipe-checks-daily");
     assert_target!("tests/td-feed.lock", "td-feed");
     assert_target!("tests/td-feed.index", "td-feed");
     // td-fetch's own crate-closure warm is native in check_loop.rs (the former
     // tools/warm-td-fetch-crates.sh): a warm-code change rides the loop-spine arm
     // (full-check escalation), and the lock it parses maps to BOTH gates that
     // consume the warmed vendor dir (td-feed shares td-fetch's closure).
-    assert_target!("fetch/Cargo.lock", "rust-fetch");
+    assert_target!("fetch/Cargo.lock", "recipe-checks");
     assert_target!("fetch/Cargo.lock", "td-feed");
     // The consolidated warm orchestration + the shared-daemon lifecycle
     // (`td-feed ensure-serve`, former tools/feed-ensure.sh) live in feed/src/main.rs:
     // a feed change smokes td-feed (build + warm-selftest), a representative consumer of
     // each warm family, and feed-shared (the ensure-serve lifecycle).
     assert_target!("feed/src/main.rs", "feed-shared");
-    assert_target!("feed/src/main.rs", "rust-ripgrep");
+    assert_target!("feed/src/main.rs", "recipe-checks-daily");
     assert_target!("feed/src/main.rs", "bootstrap-glibc");
     assert_target!("feed/src/main.rs", "td-feed");
     assert_target!("tests/td-subst.lock", "td-subst");
@@ -1637,11 +1641,17 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "builder/src/gate_defs/420-userland-x86_64-store-native.rs",
         "userland-x86_64-store-native"
     );
-    assert_target!("tests/td-cmake-demo.lock", "cmake");
-    assert_target!("tests/uutils-coreutils.lock", "rust-coreutils");
-    assert_target!("tests/cat-uutils.lock", "rust-uutils");
-    assert_target!("tests/youki.lock", "rust-youki");
-    assert_target!("tests/cmake-demo/CMakeLists.txt", "cmake");
+    assert_target!("tests/td-cmake-demo.lock", "recipe-checks");
+    assert_target!("tests/uutils-coreutils.lock", "recipe-checks-daily");
+    assert_target!("tests/cat-uutils.lock", "recipe-checks-daily");
+    assert_target!("tests/youki.lock", "recipe-checks-daily");
+    assert_target!("tests/cmake-demo/CMakeLists.txt", "recipe-checks");
+    assert_target!("tests/recipe-checks.sh", "recipe-checks");
+    assert_target!("tests/recipe-checks.sh", "recipe-checks-daily");
+    assert_target!("tests/recipe-check-lib.sh", "recipe-checks");
+    assert_target!("tests/recipe-check-lib.sh", "recipe-checks-daily");
+    assert_target!("tests/intern-src.sh", "check-pr");
+    assert_target!("tests/intern-src.sh", "recipe-checks-daily");
     assert_target!("tests/guix-surface.sh", "guix-surface");
     assert_target!("tests/guix-surface.expected", "guix-surface");
     assert_target!("tests/guix-surface-shrink.expected", "guix-surface");
@@ -1671,10 +1681,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // system tier defers wholesale.
     assert_runs!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
     assert_deferred!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-gcc-mesboot");
-    assert_deferred!("tests/crate-free-build.sh", "rust-ripgrep");
+    assert_deferred!("tests/crate-free-build.sh", "recipe-checks-daily");
     assert_deferred!("tests/crate-free-build.sh", "rust-userland-image");
-    assert_runs!("recipes/src/catalog.rs", "corpus-no-guix");
-    assert_deferred!("recipes/src/catalog.rs", "rust-ripgrep");
+    assert_runs!("recipes/src/catalog.rs", "recipe-checks");
+    assert_deferred!("recipes/src/catalog.rs", "recipe-checks-daily");
     assert_deferred!("system/td-build.scm", "check-system");
     assert_runs!("system/td-build.scm", "td-realize");
 

@@ -6,25 +6,23 @@
 # may only SHRINK); growth needs a deliberate edit here, called out in the PR for
 # sign-off (directive 8). Re-baseline: TD_SURFACE_WRITE=1 ./check.sh guix-surface
 # Each line: <file><TAB><category>
-surface-sites: 22
+surface-sites: 20
 builder/src/gate_bodies.rs	gc
 builder/src/gate_bodies.rs	guix-db-read
 builder/src/gate_defs/010-eval.rs	lowering
 builder/src/gate_defs/070-guix-dependence.rs	lowering
 builder/src/gate_defs/255-resolve.rs	lowering
 builder/src/gate_defs/270-loop-rung.rs	lowering
-builder/src/gate_defs/352-cmake.rs	lowering
 builder/src/gate_defs/355-td-realize.rs	lowering
 builder/src/gate_defs/356-build-hermetic.rs	lowering
 builder/src/gate_defs/358-build-daemon.rs	lowering
 builder/src/gate_defs/360-td-offline.rs	lowering
 ci/build-ci-image.sh	lowering
 tests/bootstrap-hello-corpus-store-native.sh	gc
-tests/bootstrap-hello-corpus-store-native.sh	guix-db-read
 tests/bootstrap-sed-corpus-store-native.sh	gc
-tests/bootstrap-sed-corpus-store-native.sh	guix-db-read
 tests/corpus-seed.sh	guix-db-read
 tests/harness-seed.sh	guix-db-read
+tests/recipe-check-lib.sh	lowering
 tests/rust-seed.sh	guix-db-read
 tests/seed-build.sh	guix-db-read
 tests/seed-tarball.sh	guix-db-read

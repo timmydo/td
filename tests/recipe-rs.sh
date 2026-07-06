@@ -3,8 +3,8 @@
 #
 # td's package surface is declared in Rust (the td-recipe crate,
 # recipes/). boa/TypeScript are gone, so the differential-vs-boa oracle is gone too;
-# the DURABLE proof that the recipes are CORRECT is the corpus differential
-# (corpus-no-guix builds every recipe and proves NAR-equality to guix). This gate
+# the DURABLE proof that the recipes are CORRECT is the recipe-owned package
+# check coverage (recipe-checks). This gate
 # proves the surface is self-consistent and that the census's manifest is in sync:
 #
 #   (A) coverage         — `list` is non-empty and every recipe emits valid JSON
@@ -54,4 +54,4 @@ if "$TD_RECIPE_EVAL" verify hello "$work/sed.json" >/dev/null 2>&1; then
 fi
 echo "   ok: verify hello <sed.json> correctly FAILS"
 
-echo "PASS: recipe-rs — the Rust package surface emits valid self-consistent JSON, the guix-dependence manifest is in sync, and verify discriminates mismatches. Correctness vs upstream is proven by the corpus differential (corpus-no-guix), not boa (retired)."
+echo "PASS: recipe-rs — the Rust package surface emits valid self-consistent JSON, the guix-dependence manifest is in sync, and verify discriminates mismatches. Correctness vs upstream is proven by recipe-owned package checks, not boa (retired)."

@@ -14,9 +14,9 @@
 # /td/store; run_shell retargets the seed lock onto them — dropping the guix rust/gcc-toolchain
 # — and puts run_rust in native link mode). The guix rust/gcc-toolchain path is RETIRED for the
 # product command: a vendored rust build with no native toolchain provisioned is a hard error,
-# never a guix-rust fallback. The per-tool corpus gates (rust-ripgrep 347, rust-fd 346) and the
-# image gate (122) keep the bespoke `crate-free-build.sh` harness (a separate capability); this
-# gate is the PRODUCT-COMMAND cutover.
+# never a guix-rust fallback. The recipe-owned package checks and the image gate (122) keep
+# the bespoke `crate-free-build.sh` harness (a separate capability); this gate is the
+# PRODUCT-COMMAND cutover.
 #
 # The tools RUN on the host PATH the way a user runs them: their interp/RUNPATH are /td/store, so
 # the gate exposes the physical native store at /td/store (a symlink on the sandbox's writable

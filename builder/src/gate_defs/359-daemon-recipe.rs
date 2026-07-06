@@ -11,8 +11,8 @@
 //! (TD_BUILDER_* override — a binary guix never produced), so NO new `guix build -e'
 //! packager site (move-off-Guile §5). assemble-recipe + the daemon both run with
 //! guix/Guile SCRUBBED FROM PATH — the structural proof the path needs neither. The
-//! recipe JSON is a given input here (the recipe-<n>.ts -> JSON lowering by td's OWN
-//! evaluator is corpus-no-guix's concern); this gate's novelty is the assemble/realize
+//! recipe JSON is a given input here (td's OWN recipe evaluator is
+//! recipe-checks' concern); this gate's novelty is the assemble/realize
 //! SPLIT across the daemon, not recipe authoring.
 //! 
 //! ALL-DURABLE (no guix oracle leg — there is no guix daemon in the realize to diff):
