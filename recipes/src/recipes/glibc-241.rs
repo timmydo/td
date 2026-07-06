@@ -1,4 +1,6 @@
-use crate::ladder::{SH, base_inputs, base_path, link_bins, sed_i, unpack_into, unpack_keep_top};
+use crate::ladder::{
+    SH, base_inputs, base_path, link_bins, relocate_ld_scripts, sed_i, unpack_into, unpack_keep_top,
+};
 use crate::types::{Recipe, Step};
 
 // glibc 2.41 — rung 20, the top (#378, guix's glibc-final): gcc 14.3.0 +
@@ -99,14 +101,10 @@ pub fn recipe() -> Recipe {
         .env("SHELL", SH)
         .env("LD_LIBRARY_PATH", "{in:glibc-mesboot-shared}/lib"),
     );
-    // FINALIZE (was bootstrap_modern_toolchain's brick-8 epilogue): relocate the
-    // GNU ld scripts' absolute member paths to bare names (ld finds them via -L)
-    // — libc.so is the ld-script in 2.41; harmless no-op sed on real ELFs is NOT
-    // run (named files only).
-    steps.push(sed_i(
-        "s,/td/store/glibc-2.41/lib/,,g",
-        &[&format!("{stage}/lib/libc.so"), &format!("{stage}/lib/libm.so")],
-    ));
+    // FINALIZE (was bootstrap_modern_toolchain's brick-8 epilogue): relocate
+    // every GNU ld script under lib/*.so from absolute member paths to bare
+    // names (ld finds them via -L); real ELFs and absent scripts are skipped.
+    steps.push(relocate_ld_scripts(stage, "/td/store/glibc-2.41"));
     // kernel UAPI headers into the staged include dir (a --sysroot corpus build
     // needs <linux/*>); the glibc-installed headers win collisions, so copy the
     // kernel trees only where absent — CopyTree overwrites, hence subdir-wise.

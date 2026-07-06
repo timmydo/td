@@ -37,6 +37,7 @@
 
 use crate::json::Json;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1752,6 +1753,58 @@ fn copy_file_writable(from: &Path, dest_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("chmod {}: {e}", to.display()))
 }
 
+fn bytes_contains(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn bytes_replace_all(hay: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return hay.to_vec();
+    }
+    let mut out = Vec::with_capacity(hay.len());
+    let mut rest = hay;
+    while let Some(pos) = rest.windows(needle.len()).position(|w| w == needle) {
+        let Some(before) = rest.get(..pos) else {
+            break;
+        };
+        out.extend_from_slice(before);
+        out.extend_from_slice(replacement);
+        let next = pos.saturating_add(needle.len());
+        rest = rest.get(next..).unwrap_or(&[]);
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+fn relocate_ld_scripts(dir: &Path, prefix: &str) -> Result<(), String> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("relocate ld scripts: read {}: {e}", dir.display())),
+    };
+    let needle = format!("{prefix}/lib/");
+    for entry in rd {
+        let entry = entry.map_err(|e| format!("relocate ld scripts: read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("so")) {
+            continue;
+        }
+        let bytes = fs::read(&path)
+            .map_err(|e| format!("relocate ld scripts: read {}: {e}", path.display()))?;
+        let head_len = bytes.len().min(80);
+        let head = bytes.get(..head_len).unwrap_or(&[]);
+        if !bytes_contains(head, b"GNU ld script") {
+            continue;
+        }
+        let fixed = bytes_replace_all(&bytes, needle.as_bytes(), b"");
+        if fixed != bytes {
+            fs::write(&path, fixed)
+                .map_err(|e| format!("relocate ld scripts: write {}: {e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// mesboot-build — td's bootstrap-RUNG build "system" (#378 slices 2+3; sibling
 /// of `run`/`run_rust`/`run_cmake`/`run_stage0`). Executes the recipe's typed
 /// steps (TD_STEPS, data — see recipes/src/types.rs `Step`) over the staged
@@ -1903,6 +1956,10 @@ pub fn run_mesboot() -> Result<(), String> {
             let dir = ctx.expand(&field(o, "dir")?).map_err(err)?;
             let shell = ctx.expand(&field(o, "shell")?).map_err(err)?;
             patch_shebangs(Path::new(&dir), &shell).map_err(err)?;
+        } else if let Some(o) = step.get("relocateLdScripts") {
+            let dir = ctx.expand(&field(o, "dir")?).map_err(err)?;
+            let prefix = ctx.expand(&field(o, "prefix")?).map_err(err)?;
+            relocate_ld_scripts(Path::new(&dir), &prefix).map_err(err)?;
         } else if let Some(o) = step.get("require") {
             let exec = o.get("exec").is_some_and(Json::is_true);
             for p in ctx.expand_all(&strs(o, "paths")?).map_err(err)? {
@@ -1981,6 +2038,31 @@ mod tests {
         assert!(hits[0].ends_with("/a.o") && hits[1].ends_with("/b.o"), "{hits:?}");
         assert!(glob_one_star("no-star-here").is_err());
         assert!(glob_one_star("two/*st*ars").is_err());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn mesboot_ld_script_relocation_rewrites_only_marked_so_scripts() {
+        let d = std::env::temp_dir().join(format!("td-ldscripts-{}", std::process::id()));
+        let lib = d.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        let script = "/* GNU ld script */\nGROUP ( /td/store/glibc-test/lib/libc.so.6 /td/store/glibc-test/lib/libc_nonshared.a )\n";
+        fs::write(lib.join("libc.so"), script).unwrap();
+        fs::write(lib.join("libextra.so"), b"not a linker script /td/store/glibc-test/lib/keep").unwrap();
+        fs::write(lib.join("libm.a"), b"/* GNU ld script */ /td/store/glibc-test/lib/keep").unwrap();
+        fs::write(lib.join("libc.so.6"), b"\x7fELF /td/store/glibc-test/lib/keep").unwrap();
+
+        relocate_ld_scripts(&lib, "/td/store/glibc-test").unwrap();
+
+        let got = fs::read_to_string(lib.join("libc.so")).unwrap();
+        assert!(got.contains("GROUP ( libc.so.6 libc_nonshared.a )"), "got: {got}");
+        assert!(!got.contains("/td/store/glibc-test/lib/"), "prefix not stripped: {got}");
+        let unmarked = fs::read(lib.join("libextra.so")).unwrap();
+        assert!(bytes_contains(&unmarked, b"/td/store/glibc-test/lib/keep"));
+        let archive = fs::read(lib.join("libm.a")).unwrap();
+        assert!(bytes_contains(&archive, b"/td/store/glibc-test/lib/keep"));
+        let versioned = fs::read(lib.join("libc.so.6")).unwrap();
+        assert!(bytes_contains(&versioned, b"/td/store/glibc-test/lib/keep"));
         fs::remove_dir_all(&d).unwrap();
     }
 

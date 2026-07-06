@@ -117,3 +117,13 @@ pub fn sed_i(expr: &str, files: &[&str]) -> Step {
     argv.extend_from_slice(files);
     Step::run("{src}", &argv).env("PATH", &base_path())
 }
+
+/// Relocate every staged glibc GNU ld script under `lib/*.so` to bare member
+/// names by stripping the configured store prefix. Real ELF shared objects are
+/// left untouched.
+pub fn relocate_ld_scripts(stage: &str, store_prefix: &str) -> Step {
+    Step::RelocateLdScripts {
+        dir: format!("{stage}/lib"),
+        prefix: store_prefix.into(),
+    }
+}
