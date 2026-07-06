@@ -4,14 +4,14 @@
 #
 #   ./.github/setup-branch-protection.sh
 #
-# Both GitHub-hosted jobs are REQUIRED status checks: `lint` and `check-fast`.
-# The td-ci-fast store image is published to GHCR (ci/build-ci-image.sh) and
-# `check-fast` has been green on recent PRs, so it is now mandatory — a PR is
-# not mergeable until it passes.
-# (Since #26 CI runs the FAST tier only — `./check.sh check-fast`. The full
-# hermetic loop is the dev-machine gate, DESIGN §7.2 step 2, plus the image
-# pipeline's validate job; it is NOT a per-PR status check, so this requires the
-# `check-fast` context — there is no `check` job.)
+# Both GitHub-hosted jobs are REQUIRED status checks: `lint` and `cargo-test`.
+# The guix-built td-ci-fast store image + the `check-fast` sandbox job were
+# retired 2026-07-06 (github issue #415): the fast tier went empty when the guix
+# gates were deleted (#409), so check-fast was a vacuous no-op. cargo-test (the
+# host engine gate — clippy + unit tests) is now the mandatory per-PR check — a
+# PR is not mergeable until lint + cargo-test pass. The full hermetic loop is the
+# dev-machine gate (DESIGN §7.2 step 2, `td-builder check` / affected-checks) plus
+# the nightly ci/daily-full-suite.sh; it is NOT a per-PR status check.
 #
 # What the ruleset enforces on main:
 #   - no direct pushes: changes land only via pull request;
@@ -38,12 +38,13 @@
 set -eu
 
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-# cargo-test (host job, has the rust toolchain) is now the real per-PR engine gate:
-# check-fast's content — the cheap guix gates — retired, so the td-ci-fast sandbox
-# tier is VACUOUS (passes as a no-op) and slated for retirement. Keep check-fast
-# required until that job is removed; make cargo-test required so engine regressions
-# (clippy/unit tests) still block merges. RE-APPLY this script for it to take effect.
-checks='{"context": "lint"}, {"context": "check-fast"}, {"context": "cargo-test"}'
+# cargo-test (host job, has the rust toolchain) is the real per-PR engine gate:
+# the retired check-fast sandbox tier was VACUOUS (its cheap guix gates were
+# deleted in #409), so cargo-test — clippy + the builder unit tests — is what
+# blocks a merge on an engine regression. RE-APPLY this script (repo admin) for
+# the dropped check-fast context to take effect: a PR gated on the OLD list would
+# otherwise wait forever for a check-fast job that no longer runs.
+checks='{"context": "lint"}, {"context": "cargo-test"}'
 
 # Squash is the ONLY merge mode; merge and rebase merges would break linear
 # history (and rebase merges drop the per-commit messages that are now the
@@ -106,5 +107,5 @@ gh api -X "$method" "$path" --input - <<EOF >/dev/null
   "bypass_actors": []
 }
 EOF
-echo "ruleset 'protect-main' applied ($method): PRs only, 1 review (not dismissed on push), required checks: lint + check-fast${existing:+ (replaced previous)}"
+echo "ruleset 'protect-main' applied ($method): PRs only, 1 review (not dismissed on push), required checks: lint + cargo-test${existing:+ (replaced previous)}"
 exit 0

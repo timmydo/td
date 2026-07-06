@@ -135,7 +135,6 @@ struct Selection {
     preflights: Vec<String>,
     targets: Vec<String>,
     notes: Vec<String>,
-    full_required: Vec<String>,
     /// Affected gates that are DAILY/SYSTEM-tier: named for the record but not
     /// run per-PR — ci/daily-full-suite.sh covers them nightly with
     /// fix-or-revert healing (the ~10-min per-PR budget, human 2026-07-04).
@@ -157,9 +156,6 @@ impl Selection {
     }
     fn add_note(&mut self, x: &str) {
         push_unique(&mut self.notes, x);
-    }
-    fn require_full(&mut self, x: &str) {
-        push_unique(&mut self.full_required, x);
     }
 }
 
@@ -266,23 +262,18 @@ fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
 }
 
 fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
+    // Only tests/hello-no-guix.lock and tests/sed-no-guix.lock survive; both are
+    // pinned inputs staged by the store-native gates that consume them. A lock edit
+    // routes to the gate that stages it AND to recipe-checks-daily, which runs the
+    // recipe's store-native /td/store check (recipes/src/recipes/{hello,sed}.rs).
     match spec {
         "hello" => {
-            sel.add_target("recipe-checks");
+            sel.add_target("bootstrap-hello-userland");
             sel.add_target("recipe-checks-daily");
         }
-        "make" | "sed" | "grep" | "xz" | "diffutils" | "patch" | "file" | "coreutils"
-        | "gawk" | "tar" | "findutils" | "bash" | "libsigsegv" | "libunistring"
-        | "pcre2" | "ncurses" | "readline" => sel.add_target("recipe-checks-daily"),
-        "td-builder" => sel.add_target("check-pr"),
-        "td-vendor-demo" | "td-cmake-demo" | "td-fetch" => sel.add_target("recipe-checks"),
-        "td-russh-demo" | "cat" | "eza" | "bat" | "sd" | "procs" | "fd" | "ripgrep"
-        | "uutils" | "youki" => sel.add_target("recipe-checks-daily"),
-        "td-feed" => sel.add_target("check-pr"),
-        "td-subst" => sel.add_target("check-pr"),
-        "pkg-config" => {
-            sel.add_target("check-pr");
-            sel.add_note("pkg-config is authored but not yet built by a td gate; running the bounded check-pr tier.");
+        "sed" => {
+            sel.add_target("store-persist");
+            sel.add_target("recipe-checks-daily");
         }
         _ => {
             if let Some(t) = target_for_build_spec(root, spec) {
@@ -302,7 +293,7 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
 // The i686 mesboot→store-native chain in dependency order. Each "chain" arm adds
 // itself + everything downstream (a contiguous slice); x86_64 hangs off
 // gcc-14/binutils-244/glibc-241, so the pure-i686-userland arms stop before it.
-const CHAIN: [&str; 29] = [
+const CHAIN: [&str; 28] = [
     "bootstrap-seed",
     "bootstrap-cc",
     "bootstrap-mes",
@@ -330,7 +321,6 @@ const CHAIN: [&str; 29] = [
     "bootstrap-gcc-mesboot-494-store-native",
     "bootstrap-gcc-14-store-native",
     "bootstrap-glibc-241-store-native",
-    "recipe-checks-daily",
     "bootstrap-x86_64-toolchain-store-native",
 ];
 
@@ -470,18 +460,16 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches("fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock", p) {
-        // recipe-checks builds td-fetch from the warmed vendor dir. (The td-feed
-        // gate, the other consumer, retired with the guix-invoking gates.)
-        sel.add_target("recipe-checks");
+        // No gate builds the fetch crate from source (the td-fetch corpus recipe is
+        // retired), so a change to it validates on the bounded check-pr tier.
+        sel.add_target("check-pr");
         return;
     }
 
     if pattern_matches("feed/*|feed/src/*|feed/Cargo.toml|feed/Cargo.lock", p) {
-        // main.rs holds the host-PREP warm that feeds the corpus + bootstrap gates,
-        // so smoke a representative consumer of each warm family: recipe-checks-daily
-        // (`warm crate`) and bootstrap-glibc (`warm sources` + `warm kernel-headers`).
-        // (The td-feed / feed-shared gates retired with the guix-invoking gates.)
-        sel.add_target("recipe-checks-daily");
+        // main.rs holds the host-PREP warm that feeds the bootstrap gates, so smoke a
+        // representative consumer of the warm-sources family: bootstrap-glibc (`warm
+        // sources` + `warm kernel-headers`).
         sel.add_target("bootstrap-glibc");
         return;
     }
@@ -501,7 +489,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // #410: the tests/td-toolchain-rust-x86_64.lock mapping was removed with the rust-toolchain
     // recipe-graph cutover — that gate-assembled lock and its consumer gate (416) are retired; the
-    // recipe now carries its source pin (seed/sources/rust-*.lock) routed to recipe-checks-daily.
+    // recipe now carries its source pin (seed/sources/rust-*.lock) routed to recipe-rs / rust-store-native.
     if pattern_matches(
         "tests/toolchain-x86_64-input-addressed.sh|builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         p,
@@ -514,32 +502,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if p == "tests/td-toolchain.lock" {
         sel.add_preflight("shell-syntax");
         sel.add_target("toolchain-input-addressed");
-        sel.add_target("toolchain-subst-default");
         sel.add_target("toolchain-x86_64-input-addressed");
         return;
     }
-
-    if pattern_matches(
-        "tests/toolchain-subst-default.sh|tools/resolve-toolchain.sh|tools/publish-toolchain-subst.sh|tests/td-subst.pub",
-        p,
-    ) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("toolchain-subst-default");
-        return;
-    }
-
-    // The guix-less-runner harness shipping mechanism (#314): the consumer resolver, the daily's
-    // producer, and the gate that drives them. run_check_harness (check_loop.rs, the spine) also
-    // calls resolve-harness.sh, but a spine touch already escalates to the full check.
-    if pattern_matches(
-        "tests/harness-subst.sh|tools/resolve-harness.sh|tools/publish-harness-subst.sh",
-        p,
-    ) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("harness-subst");
-        return;
-    }
-
 
     if glob_match("tests/*-no-guix.lock", p) {
         let spec = p.strip_prefix("tests/").unwrap_or(p);
@@ -548,89 +513,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches(
-        "tests/td-vendor-demo.lock|tests/td-vendor-demo-source.scm|tests/vendor-demo/*|tests/vendor-demo/src/*",
-        p,
-    ) {
-        sel.add_target("recipe-checks");
-        return;
-    }
-
-    if pattern_matches("tests/td-russh-demo.lock|tests/td-russh-demo-source.scm|tests/russh-demo/*", p) {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-
-    if pattern_matches("tests/td-cmake-demo.lock|tests/cmake-demo/*", p) {
-        sel.add_target("recipe-checks");
-        return;
-    }
-
-    if p == "tests/cat-uutils.lock" {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    if p == "tests/eza.lock" {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    if p == "tests/bat.lock" {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    if p == "tests/sd.lock" {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    if p == "tests/procs.lock" {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    if p == "tests/fd.lock" {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    if p == "tests/ripgrep.lock" {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    if p == "tests/uutils-coreutils.lock" {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    if p == "tests/youki.lock" {
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    if p == "tests/td-fetch.lock" {
-        sel.add_target("recipe-checks");
-        return;
-    }
-    if p == "tests/crate-free-build.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-
-    if pattern_matches("tests/recipe-checks.sh|tests/recipe-check-lib.sh", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("recipe-checks");
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-
-    if p == "tests/intern-src.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-
     // tests/build-recipes.sh IS the build phase (the former Makefile build-recipes
     // recipe, run by the gate runner) — a change to it affects every build gate,
     // exactly like the build-phase helpers below.
     if pattern_matches(
-        "tests/build-recipes.sh|tests/build-pkg.sh|tests/cache-lib.sh|tests/stage0-builder.sh",
+        "tests/build-recipes.sh|tests/cache-lib.sh|tests/stage0-builder.sh",
         p,
     ) {
         sel.add_preflight("shell-syntax");
@@ -641,24 +528,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if p == "tests/sandbox-hardening.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("sandbox-hardening");
-        return;
-    }
-
-    if p == "tests/td-shell.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("td-shell");
-        return;
-    }
-
-    if p == "tests/td-shell-seed.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("td-shell-seed");
-        return;
-    }
-
-    if p == "tests/profile.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("profile");
         return;
     }
 
@@ -702,17 +571,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if pattern_matches("tests/rust-store-native.sh|seed/sources/rust-*.lock", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("rust-store-native");
-        // #410: seed/sources/rust-*.lock is also the rust-toolchain recipe's pinned source; its
-        // recipe-owned RecipeCheck::daily (tests/rust-toolchain-recipe-check.sh) runs under
-        // recipe-checks-daily.
+        // seed/sources/rust-*.lock is also the rust-toolchain recipe's pinned source; the
+        // recipe validates on the recipe-engine gate + its store-native check runner.
+        sel.add_target("recipe-rs");
         sel.add_target("recipe-checks-daily");
         return;
     }
 
-    // #410: seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source, and the rust-toolchain
-    // transform co-locates its libz — both build under the rust-toolchain recipe check.
+    // seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source; rust-toolchain-recipe-check.sh
+    // is the rust-toolchain recipe's store-native check BODY, run by recipe-checks-daily.
     if pattern_matches("seed/sources/zlib-*.lock|tests/rust-toolchain-recipe-check.sh", p) {
         sel.add_preflight("shell-syntax");
+        sel.add_target("recipe-rs");
         sel.add_target("recipe-checks-daily");
         return;
     }
@@ -745,7 +615,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // --- the i686 mesboot→store-native chain: each rung + everything downstream ---
     if pattern_matches("tests/bootstrap-patch.sh|seed/sources/patch-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 7, 29);
+        add_chain(sel, 7, 28);
         return;
     }
     if pattern_matches(
@@ -753,7 +623,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 8, 29);
+        add_chain(sel, 8, 28);
         return;
     }
     if pattern_matches(
@@ -761,7 +631,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 9, 29);
+        add_chain(sel, 9, 28);
         return;
     }
     if pattern_matches(
@@ -769,7 +639,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 10, 29);
+        add_chain(sel, 10, 28);
         return;
     }
     if p == "tests/bootstrap-gcc-mesboot0.sh" {
@@ -792,17 +662,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 14, 29);
+        add_chain(sel, 14, 28);
         return;
     }
     if pattern_matches("tests/bootstrap-gcc-mesboot1.sh|seed/sources/gcc-g++-4.6.4.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 15, 29);
+        add_chain(sel, 15, 28);
         return;
     }
     if pattern_matches("tests/bootstrap-binutils-gawk-mesboot.sh|seed/sources/gawk-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 16, 29);
+        add_chain(sel, 16, 28);
         return;
     }
     if pattern_matches(
@@ -810,32 +680,32 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 17, 29);
+        add_chain(sel, 17, 28);
         return;
     }
     if pattern_matches("tests/bootstrap-gcc-mesboot.sh|seed/sources/gcc-4.9.4.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 18, 29);
+        add_chain(sel, 18, 28);
         return;
     }
     if p == "tests/bootstrap-toolchain-store-native.sh" {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 19, 28); // pure i686 userland — stops before x86_64
+        add_chain(sel, 19, 27); // pure i686 userland — stops before x86_64
         return;
     }
     if p == "tests/bootstrap-glibc-shared-store-native.sh" {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 20, 28);
+        add_chain(sel, 20, 27);
         return;
     }
     if p == "tests/bootstrap-gcc-mesboot-wrapper.sh" {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 21, 28);
+        add_chain(sel, 21, 27);
         return;
     }
     if pattern_matches("tests/bootstrap-hello-userland.sh|seed/sources/hello-2.10.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 22, 28);
+        add_chain(sel, 22, 27);
         return;
     }
     if p == "tests/repro-lib.sh" {
@@ -846,12 +716,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
     if pattern_matches("tests/bootstrap-binutils-244-store-native.sh|seed/sources/binutils-2.44.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 23, 29);
+        add_chain(sel, 23, 28);
         return;
     }
     if p == "tests/bootstrap-gcc-mesboot-494-store-native.sh" {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 24, 28);
+        add_chain(sel, 24, 27);
         return;
     }
     if pattern_matches(
@@ -859,29 +729,37 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 25, 29);
+        add_chain(sel, 25, 28);
         return;
     }
     if pattern_matches("tests/bootstrap-glibc-241-store-native.sh|seed/sources/glibc-2.41.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 26, 29);
+        add_chain(sel, 26, 28);
         return;
     }
+    // bootstrap-hello-corpus-store-native.sh is hello's store-native recipe-check BODY (run
+    // by recipe-checks-daily); the hello source lock also feeds the store-native hello build.
     if pattern_matches("tests/bootstrap-hello-corpus-store-native.sh|seed/sources/hello-2.12.2.lock", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-checks-daily");
+        sel.add_target("bootstrap-hello-userland");
         return;
     }
-    // bootstrap-chain.sh is the SHARED from-seed toolchain chain; its consumers are the sed
-    // corpus gate, the hello corpus gate (#327), and store-persist (other store-native gates
-    // can migrate to it later, each adding itself here). Since #317 the chain's bricks persist
-    // through the warm chain-brick cache (tests/chain-cache-lib.sh), so a chain/lib change also
-    // re-proves the chain-cache gate (hit/poison/cold semantics). (hello-corpus's OWN-file arm
-    // is above; here it is a chain CONSUMER, re-proved when the shared chain changes. chain arm
-    // ported from PR #203's affected-checks.sh.)
-    if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh|tests/bootstrap-chain.sh", p) {
+    // bootstrap-sed-corpus-store-native.sh is sed's store-native recipe-check BODY, run by
+    // recipe-checks-daily.
+    if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-checks-daily");
+        return;
+    }
+    // bootstrap-chain.sh is the SHARED from-seed toolchain chain; its consumers are the
+    // store-native hello build (bootstrap-hello-userland), store-persist (which stages the
+    // sed-no-guix.lock entries), and the chain-cache gate. Since #317 the chain's bricks
+    // persist through the warm chain-brick cache (tests/chain-cache-lib.sh), so a chain/lib
+    // change also re-proves the chain-cache gate (hit/poison/cold semantics).
+    if pattern_matches("tests/bootstrap-chain.sh", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("bootstrap-hello-userland");
         sel.add_target("store-persist");
         sel.add_target("chain-cache");
         return;
@@ -923,7 +801,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 28, 29);
+        add_chain(sel, 27, 28);
         // x86_64-cross-fns.sh also defines the rung-X2 native driver (run_x86_64_native), the shared
         // fetch-or-build obtainers, and the rung-X3 self-host fns — so a change to it must re-run the
         // native gcc gate AND the self-host gate, not only the cross toolchain gate.
@@ -934,27 +812,27 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if glob_match("seed/sources/make-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 5, 29);
+        add_chain(sel, 5, 28);
         return;
     }
     if glob_match("seed/sources/tcc-0.9.26*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 4, 29);
+        add_chain(sel, 4, 28);
         return;
     }
     if glob_match("seed/sources/nyacc-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 3, 29);
+        add_chain(sel, 3, 28);
         return;
     }
     if pattern_matches("seed/sources/mes-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 2, 29);
+        add_chain(sel, 2, 28);
         return;
     }
     if glob_match("seed/stage0/*", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 0, 29);
+        add_chain(sel, 0, 28);
         return;
     }
 
@@ -964,42 +842,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("tests/seed-tarball.sh|tools/build-seed-tarball.sh", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("seed-tarball");
-        return;
-    }
-    if p == "tests/seed-unpack.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("seed-unpack");
-        return;
-    }
-    if pattern_matches("tests/seed-build.sh|tools/warm-seed.sh|tests/td-seed.lock", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("seed-build");
-        return;
-    }
     if p == "tests/store-persist.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("store-persist");
         return;
     }
-    if p == "tests/corpus-seed.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("corpus-seed");
-        return;
-    }
-    if p == "tests/rust-seed.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("rust-seed");
-        return;
-    }
-    if p == "tests/harness-seed.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("harness-seed");
-        return;
-    }
-
 
     if p == "tests/recipe-rs.sh" {
         sel.add_preflight("shell-syntax");
@@ -1014,12 +861,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches(
-        "ci/build-ci-image.sh|ci/import-store.sh|ci/lower-*.sh|.github/setup-branch-protection.sh|.github/workflows/*",
+        ".github/setup-branch-protection.sh|.github/workflows/*",
         p,
     ) {
-        // CI/runner-gating files used to escalate to the full local loop; the
-        // local loop never exercises hosted CI, so the honest local check is the
-        // syntax preflight — the workflow run after push is the real test.
+        // CI/runner-gating files: the local loop never exercises hosted CI, so
+        // the honest local check is the syntax preflight — the workflow run after
+        // push is the real test.
         sel.add_preflight("shell-syntax");
         sel.add_note(&format!(
             "{p} affects CI or branch protection; inspect the workflow result after push."
@@ -1046,14 +893,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if pattern_matches("*.md|DESIGN.md|CLAUDE.md|.gitignore", p) {
         return; // docs — no checks
-    }
-
-    if p == "channels.scm" {
-        sel.add_target("check-fast");
-        sel.require_full(&format!(
-            "{p} changed; the dependency pin affects the whole loop."
-        ));
-        return;
     }
 
     // Catch-all: an unmapped path used to require the FULL loop; it now runs
@@ -1131,21 +970,10 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     o.push('\n');
     if header.explicit {
         o.push_str("Waiver: inspection only (--path does not prove the branch diff)\n");
-        if sel.full_required.is_empty() {
-            o.push_str("Branch-mode policy for these paths: the full check would be waived\n");
-        } else {
-            o.push_str("Branch-mode policy for these paths: the full check would be required\n");
-            for n in &sel.full_required {
-                o.push_str(&format!("  - {n}\n"));
-            }
-        }
-    } else if sel.full_required.is_empty() {
-        o.push_str("Waiver: the full check waived by affected-checks for this diff\n");
+        // Nothing escalates to the full loop, so the branch-mode policy is always waived.
+        o.push_str("Branch-mode policy for these paths: the full check would be waived\n");
     } else {
-        o.push_str("Waiver: the full check required before marking ready\n");
-        for n in &sel.full_required {
-            o.push_str(&format!("  - {n}\n"));
-        }
+        o.push_str("Waiver: the full check waived by affected-checks for this diff\n");
     }
 
     if !sel.notes.is_empty() {
@@ -1359,10 +1187,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
 
 
     // Every BUILD_GATE is selected by the build-phase arm (build-recipes is the
-    // phase itself; build-pkg/cache-lib are its helpers).
+    // phase itself; cache-lib is its helper).
     for bg in build_gates(root) {
         assert_target!("tests/build-recipes.sh", &bg);
-        assert_target!("tests/build-pkg.sh", &bg);
         assert_target!("tests/cache-lib.sh", &bg);
     }
 
@@ -1372,12 +1199,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/chain-cache.sh", "chain-cache");
     assert_target!("tests/bootstrap-chain.sh", "store-persist");
     assert_target!("tests/bootstrap-chain.sh", "chain-cache");
-    // The store-native corpus recipe checks source the shared chain, so a chain
-    // change must re-prove the daily recipe-check wrapper too.
-    assert_target!("tests/bootstrap-chain.sh", "recipe-checks-daily");
+    // The store-native hello build sources the shared chain, so a chain change must
+    // re-prove the hello store-native gate too.
+    assert_target!("tests/bootstrap-chain.sh", "bootstrap-hello-userland");
     assert_target!(
         "tests/bootstrap-hello-corpus-store-native.sh",
-        "recipe-checks-daily"
+        "bootstrap-hello-userland"
     );
 
     // Spec→gate routing: a recipe/lock for a gate's SPEC selects that gate.
@@ -1409,33 +1236,22 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
     // catalog edit runs recipe-rs and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
-    assert_target!("recipes/src/catalog.rs", "recipe-checks");
-    assert_target!("recipes/src/catalog.rs", "recipe-checks-daily");
     // Recipes are one self-registering file each under src/recipes/ (issue #295);
-    // the nested path must select the same gates (glob `*` crosses `/`).
+    // the nested path must select the same gate (glob `*` crosses `/`).
     assert_target!("recipes/src/recipes/hello.rs", "recipe-rs");
-    assert_target!("recipes/src/recipes/hello.rs", "recipe-checks");
-    assert_target!("recipes/src/recipes/hello.rs", "recipe-checks-daily");
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("tests/recipe-rs.sh", "recipe-rs");
     assert_target!("tests/recipes-meta.json", "recipe-rs");
-    assert_target!("tests/td-russh-demo.lock", "recipe-checks-daily");
-    assert_target!("tests/russh-demo/Cargo.lock", "recipe-checks-daily");
-    // td-fetch's crate-closure warm is native in check_loop.rs: the lock it parses
-    // maps to recipe-checks (which consumes the warmed vendor dir). (The td-feed gate,
-    // the other consumer, retired with the guix-invoking gates.)
-    assert_target!("fetch/Cargo.lock", "recipe-checks");
-    // A feed/src change smokes a representative consumer of each warm family:
-    // recipe-checks-daily (`warm crate`) and bootstrap-glibc (`warm sources`).
-    // (td-feed / feed-shared / seed-subst retired with the guix-invoking gates.)
-    assert_target!("feed/src/main.rs", "recipe-checks-daily");
+    // The surviving pinned inputs: a lock edit routes to the store-native gate that
+    // stages it (hello → the store-native hello build; sed → store-persist).
+    assert_target!("tests/hello-no-guix.lock", "bootstrap-hello-userland");
+    assert_target!("tests/sed-no-guix.lock", "store-persist");
+    // No gate builds the fetch crate from source (the td-fetch corpus recipe is
+    // retired), so a change to it validates on the bounded check-pr tier.
+    assert_target!("fetch/Cargo.lock", "check-pr");
+    // A feed/src change smokes the warm-sources consumer, bootstrap-glibc.
     assert_target!("feed/src/main.rs", "bootstrap-glibc");
-    assert_target!("tests/toolchain-subst-default.sh", "toolchain-subst-default");
-    assert_target!("tools/resolve-toolchain.sh", "toolchain-subst-default");
-    assert_target!("tools/publish-toolchain-subst.sh", "toolchain-subst-default");
-    assert_target!("tests/td-subst.pub", "toolchain-subst-default");
-    assert_target!("tests/td-toolchain.lock", "toolchain-subst-default");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");
     assert_target!("tests/td-toolchain.lock", "toolchain-x86_64-input-addressed");
     assert_target!("tests/td-toolchain-x86_64.lock", "toolchain-x86_64-input-addressed");
@@ -1465,11 +1281,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "toolchain-x86_64-input-addressed"
     );
     // #410: the rust-x86_64 runtime/userland/td-shell-userland gates were retired with the
-    // rust-toolchain recipe-graph cutover; the recipe-owned RecipeCheck::daily + its source locks
-    // route to recipe-checks-daily instead.
-    assert_target!("tests/rust-toolchain-recipe-check.sh", "recipe-checks-daily");
-    assert_target!("seed/sources/zlib-1.3.1.lock", "recipe-checks-daily");
-    assert_target!("seed/sources/rust-1.96.0.lock", "recipe-checks-daily");
+    // rust-toolchain recipe-graph cutover; the recipe check + its zlib source lock route to
+    // the recipe-engine gate, and the rust source lock also drives the rust-store-native gate.
+    assert_target!("tests/rust-toolchain-recipe-check.sh", "recipe-rs");
+    assert_target!("seed/sources/zlib-1.3.1.lock", "recipe-rs");
+    assert_target!("seed/sources/rust-1.96.0.lock", "rust-store-native");
     assert_target!(
         "tests/userland-x86_64-store-native.sh",
         "userland-x86_64-store-native"
@@ -1480,17 +1296,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "builder/src/gate_defs/420-userland-x86_64-store-native.rs",
         "userland-x86_64-store-native"
     );
-    assert_target!("tests/td-cmake-demo.lock", "recipe-checks");
-    assert_target!("tests/uutils-coreutils.lock", "recipe-checks-daily");
-    assert_target!("tests/cat-uutils.lock", "recipe-checks-daily");
-    assert_target!("tests/youki.lock", "recipe-checks-daily");
-    assert_target!("tests/cmake-demo/CMakeLists.txt", "recipe-checks");
-    assert_target!("tests/recipe-checks.sh", "recipe-checks");
-    assert_target!("tests/recipe-checks.sh", "recipe-checks-daily");
-    assert_target!("tests/recipe-check-lib.sh", "recipe-checks");
-    assert_target!("tests/recipe-check-lib.sh", "recipe-checks-daily");
-    assert_target!("tests/intern-src.sh", "check-pr");
-    assert_target!("tests/intern-src.sh", "recipe-checks-daily");
+    // The store-native recipe checks (hello/sed/rust-toolchain build on the /td/store
+    // mes ladder) run via recipe-checks-daily; a change to a check BODY selects it.
+    assert_target!("tests/bootstrap-hello-corpus-store-native.sh", "recipe-checks-daily");
+    assert_target!("tests/bootstrap-sed-corpus-store-native.sh", "recipe-checks-daily");
+    assert_target!("tests/rust-toolchain-recipe-check.sh", "recipe-checks-daily");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
     // the seed tree + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
@@ -1503,22 +1313,19 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_branch_policy!("builder/src/main.rs", "the full check would be waived");
     assert_branch_policy!("builder/src/sandbox.rs", "the full check would be waived");
     assert_branch_policy!("builder/Cargo.toml", "the full check would be waived");
-    // The per-PR budget (human 2026-07-04): only channels.scm still escalates to
-    // the FULL loop. The loop spine and unmapped paths validate on the bounded
-    // check-pr tier; daily/system-tier gates are named but deferred.
-    assert_branch_policy!("channels.scm", "the full check would be required");
+    // The per-PR budget (human 2026-07-04): NOTHING escalates to the FULL loop.
+    // The loop spine and unmapped paths validate on the bounded check-pr tier;
+    // daily/system-tier gates are named but deferred.
     assert_runs!("builder/src/gates.rs", "check-pr");
     assert_branch_policy!("builder/src/gates.rs", "the full check would be waived");
     assert_runs!("new/unmapped.file", "check-pr");
     assert_branch_policy!("new/unmapped.file", "the full check would be waived");
-    // The run/defer partition: a chain diff RUNS its PR-sized rungs and DEFERS
-    // the deep ones; the corpus arms defer the from-source package gates; the
-    // system tier defers wholesale.
+    // The run/defer partition: a chain diff RUNS its PR-sized rungs (bootstrap-seed,
+    // Heavy) and DEFERS the deep daily rungs (bootstrap-gcc-mesboot); a catalog edit
+    // RUNS the recipe-engine gate per-PR.
     assert_runs!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
     assert_deferred!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-gcc-mesboot");
-    assert_deferred!("tests/crate-free-build.sh", "recipe-checks-daily");
-    assert_runs!("recipes/src/catalog.rs", "recipe-checks");
-    assert_deferred!("recipes/src/catalog.rs", "recipe-checks-daily");
+    assert_runs!("recipes/src/catalog.rs", "recipe-rs");
 
     failures
 }
@@ -1748,41 +1555,9 @@ pub fn main(args: &[String]) -> ExitCode {
         }
     }
 
-    if !sel.full_required.is_empty() {
-        if explicit {
-            // Shell: `echo` (blank line to STDOUT) then the message `>&2`.
-            println!();
-            eprintln!("affected-checks: --path is inspection only; run the full check for these paths in branch mode");
-            return ExitCode::from(20);
-        }
-
-        let mut uncovered: Vec<String> = Vec::new();
-        let mut skipped: Vec<String> = Vec::new();
-        for t in &sel.targets {
-            if default_check_covers_target(&root, t) {
-                skipped.push(t.clone());
-            } else {
-                uncovered.push(t.clone());
-            }
-        }
-
-        if !uncovered.is_empty() {
-            let code = run_self_check(&root, &uncovered);
-            if code != 0 {
-                return ExitCode::from(code as u8);
-            }
-        }
-        if !skipped.is_empty() {
-            println!(
-                "\naffected-checks: escalation active; the full check covers skipped target(s): {}",
-                skipped.join(" ")
-            );
-        }
-
-        println!("\naffected-checks: escalation active; running the full check");
-        let code = run_self_check(&root, &[]);
-        return ExitCode::from(code as u8);
-    } else if !sel.targets.is_empty() {
+    // Nothing escalates to the full loop: every diff runs its bounded selected
+    // targets; daily/system-tier gates it affects are named + deferred above.
+    if !sel.targets.is_empty() {
         let code = run_self_check(&root, &sel.targets);
         return ExitCode::from(code as u8);
     }

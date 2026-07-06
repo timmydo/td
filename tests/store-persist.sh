@@ -103,7 +103,8 @@ sed "s|^[^ ]*-gcc-toolchain-[^ ]* .*|gcc-toolchain $TCP seed\nglibc-2.41 $GLP8 s
 grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
 "$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
 sort -u "$b8/roots" -o "$b8/roots"
-xargs guix build < "$b8/roots" >/dev/null 2>&1 || fail "could not realize the guix seed closure"
+sed 's|^|seed |' "$b8/roots" > "$b8/roots.lock"
+sh tools/resolve-seed.sh "$b8/roots.lock" >/dev/null 2>&1 || fail "could not resolve the seed closure (guix-free resolve-seed — present paths are trusted; else warm ~/.td/subst / run the daily publish-seed-subst.sh)"
 seedline=`TB="$TB" TD_SEED_DB=/gnu/store sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-persist" $(cat "$b8/roots")` || fail "warm-seed failed"
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
 for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "$p"`"; done

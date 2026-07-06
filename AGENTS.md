@@ -251,15 +251,13 @@ After rebasing for PR readiness, run:
 td-builder affected-checks --committed-only --run
 ```
 
-If it prints `Waiver: the full check waived by affected-checks for
-this diff`, that is the local waiver for the full loop; record the
+It prints `Waiver: the full check waived by affected-checks for
+this diff` — the local waiver for the full loop; record the
 selected checks and waiver line in the PR body (include the
 "Deferred to the daily backstop" line when one prints — that is the
-record of what the daily covers for this diff). If it prints `Waiver:
-the full check required before marking ready` (only a `channels.scm`
-pin bump does, an exclusive landing anyway), `--run` executes the
-selected checks and then the full check before it can exit
-successfully.
+record of what the daily covers for this diff). Nothing escalates to
+the full loop; every diff waives to the bounded per-PR tiers + the
+daily backstop.
 
 **Every selection is bounded (the ~10-min per-PR budget, human
 2026-07-04).** Build-engine changes (`builder/src/*`) validate on the
@@ -320,7 +318,7 @@ capability** (a Guile `guix repl` lowering/eval), or an **artifact-shape** check
 worth keeping: **delete it, coverage and all** (human, 2026-07-05: "if the feature
 is testing guix, it's not something we want"). The code stays in git history as
 reference. Only when a genuine **td feature** is under test and guix is merely
-incidental to how it's exercised — seeded `/gnu/store` inputs, a `$TD_GUIX build`,
+incidental to how it's exercised — seeded `/gnu/store` inputs, a `guix build`,
 a removable byte-vs-Guix / sqlite3-vs-own-reader oracle leg — do you KEEP the gate
 and remove the guix touch instead (migrate inputs to `/td/store`, drop the oracle
 leg) rather than lose the td-feature coverage; if the guix-free replacement is a
@@ -433,11 +431,9 @@ tracking system, and all working notes live in the git log + PR body.
 
 - **Land (optimistic merge on green, via PR):** main is **non-strict** — a PR merges on **its own** green checks; main moving
   under you no longer forces a rebase-onto-tip + re-run. So: (1) validate against
-  your own base — run `td-builder affected-checks --committed-only --run`; if it
-  waives the full loop, record the waiver (and any "Deferred to the daily
-  backstop" line) in the PR body; if it escalates (only a `channels.scm` bump),
-  it runs the full check before returning success, so record the escalation
-  and full result instead; (2) **every PR gets a subagent code review — waivable only for a trivial docs- or comment-only diff, and only if you say so in the PR:** spawn an
+  your own base — run `td-builder affected-checks --committed-only --run`; it
+  waives the full loop (nothing escalates), so record the waiver (and any
+  "Deferred to the daily backstop" line) in the PR body; (2) **every PR gets a subagent code review — waivable only for a trivial docs- or comment-only diff, and only if you say so in the PR:** spawn an
   independent code-review subagent over the full branch diff (`/code-review`) and
   **post the subagent's review results as a comment on the PR**; address its
   findings, posting each resulting fix as a **reply to that review comment and
@@ -455,28 +451,28 @@ tracking system, and all working notes live in the git log + PR body.
   (or for an exclusive-landing sequence). The rare broken combination
   (green(A)+green(B) ≠ green(A∪B)) is healed by an agent, not a bot:
   **whenever you fetch main — to start work or to land — check its latest
-  `check-fast`; if it is red, run `ci/revert-suspect.sh --open-pr` to open a
-  revert PR for the suspect squash commit (main's HEAD) before continuing.**
+  required checks (`lint` + `cargo-test`); if red, run `ci/revert-suspect.sh
+  --open-pr` to open a revert PR for the suspect squash commit (main's HEAD)
+  before continuing.**
   Squash makes the suspect atomic; the script's loop guard refuses to revert a
   revert. There is no automated revert workflow — the duty is the next agent's
   (check with `gh run list --branch main --workflow ci.yml -L1` or
   `gh api repos/<owner>/td/commits/main/check-runs`). A heavy-only break
-  (boot/VM/repro, not seen by the fast tier) is NOT caught by check-fast either —
-  it surfaces on the daily backstop; this is an accepted gap of
-  the velocity trade. Marking a PR ready
-  with a locally-red or un-run affected-checks gate, or without the full run when
-  affected-checks escalates, is still a contract violation — CI verifies your
-  run, it does not replace it. `lint` + `check-fast` are the required checks; the
-  bounded affected-checks run is the dev-machine gate (step 1) and the full
-  check is the daily backstop's.
+  (the from-source bootstrap ladder, the corpus, the /td/store harness, repro —
+  not seen by the hosted checks) is NOT caught per-PR — it surfaces on the daily
+  backstop; this is an accepted gap of the velocity trade. Marking a PR ready
+  with a locally-red or un-run affected-checks gate is still a contract
+  violation — CI verifies your run, it does not replace it. `lint` + `cargo-test`
+  are the required checks; the bounded affected-checks run is the dev-machine gate
+  (step 1) and the full check is the daily backstop's.
   
-- **Exclusive landings:** changes to the shared spine — `channels.scm`, the loop
-  entry + gate runner (`builder/src/check_loop.rs`, `builder/src/gates.rs`) —
-  collide with everyone.
+- **Exclusive landings:** changes to the shared spine — the loop entry + gate
+  runner (`builder/src/check_loop.rs`, `builder/src/gates.rs`) — collide with
+  everyone.
   Announce in the PR description, land as small standalone PRs, expect others to
-  rebase. Channel bumps are the canonical case. (The frozen-oracle `system/td.scm`
-  + `DIGESTS.md` spine entries were retired with the guix-system gate tier; the
-  `Makefile` was retired when the gate runner replaced make as the loop scheduler.)
+  rebase. (The frozen-oracle `system/td.scm` + `DIGESTS.md` spine entries were
+  retired with the guix-system gate tier; the `Makefile` was retired when the gate
+  runner replaced make as the loop scheduler.)
   Note: **adding a gate is not an exclusive landing** — it's a new
   `builder/src/gate_defs/<NNN>-<gate>.rs` file; the build.rs registry assembles
   the pools, so concurrent gate PRs touch different files and never collide.
@@ -527,11 +523,13 @@ tracking system, and all working notes live in the git log + PR body.
   earlier.)
 - `tests/` — the gate scripts: package-manager behavioral tests, locks, and the
   drv fixtures for td's build-engine gates.
-- `channels.scm` — pinned Guix channel commit. Reproducibility is anchored here; bump it
-  deliberately (exclusive landing), never silently. A bump that regenerates a seed lock
-  must also publish the new seed substitutes (tools/publish-seed-subst.sh into
-  ~/.td/subst) or warm the runner hosts out-of-band: the loop's preludes no longer
-  realize a missing seed with `guix build` — they fetch from the substitute store and
+- The loop does not pin guix: the deferred corpus/seed gates realize their
+  guix-built seed via plain host `guix build` (the seed BYTES retire last per the
+  north star), and reproducibility for those gates is anchored by the exact
+  `/gnu/store` paths their locks pin. A seed lock regenerated on a host-guix
+  change must publish the new seed substitutes (tools/publish-seed-subst.sh into
+  ~/.td/subst) or warm the runner hosts out-of-band: the loop's preludes never
+  realize a missing seed themselves — they fetch from the substitute store and
   otherwise FAIL CLOSED (#311).
 - `DESIGN.md` — the settled north star: scope (§0), the loop (§1), and the
   provenance chain. The parallel-work rules live here in AGENTS.md, not DESIGN.md.

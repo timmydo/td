@@ -36,20 +36,15 @@ load_stage0() {
 }
 
 # provision_stage0 — the HOST prelude for the loop-container provider (td-builder
-# check + check-rung; workstream E #294): ensure the pinned stage0
-# toolchain seed (tests/td-builder-rust.lock) is PRESENT — resolving a missing
-# path through td's OWN signed substitute store (tools/resolve-seed.sh; #311 — no
-# guix process, FAIL-CLOSED with no guix fallback; the common all-present path
-# fetches nothing) — then place/load the stage0 via load_stage0. Guix-free
-# consumers (the check-harness tier, the in-sandbox gates) call load_stage0
-# directly: seed realization is the host caller's half (see the stage0-builder.sh
-# header). resolve-seed fails closed on a lock that yields no seed paths —
-# otherwise provision-rust.sh would silently fall through to its rustup/system-cc
-# path on a warm host (a provenance switch, not a warm).
+# check + check-rung; workstream E #294). The stage0 td-builder compiles from
+# builder/ source with the ENVIRONMENT's rust + cc (tools/provision-{rust,cc}.sh),
+# so there is no guix-built toolchain seed to realize/fetch here — it is just
+# load_stage0. On a guix host with the pinned lock paths present, provision-rust/cc
+# use them (a guix-free PROCESS); on a guix-less host they use rustup / system cc.
 provision_stage0() {
-  _s0lock="${TD_LOCK:-tests/td-builder-rust.lock}"
-  sh tools/resolve-seed.sh "$_s0lock" \
-    || { echo "FAIL: could not resolve the stage0 toolchain seed from $_s0lock (tools/resolve-seed.sh — warm this host's store out-of-band or publish the seed substitutes; the loop's guix-build seed realize is retired, #311)" >&2; return 1; }
+  # The stage0 td-builder compiles from builder/ source with the ENVIRONMENT's rust +
+  # cc (tools/provision-{rust,cc}.sh — TD_RUST_HOME / rust on PATH / rustup), so there is
+  # no guix-built toolchain seed to realize here. load_stage0 does the whole job.
   load_stage0
 }
 

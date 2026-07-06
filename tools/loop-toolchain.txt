@@ -1,1 +1,12 @@
-make bash coreutils sed grep findutils tar gzip crun util-linux sqlite
+# The loop toolchain: the host-PATH tools the loop sandbox needs to run its gate
+# bodies (make/sh/sed/…). check_loop.rs::provision_toolchain resolves each on the
+# host PATH and canonicalizes it to its real /gnu/store bin dir (the sandbox binds
+# /gnu/store ro, so a profile-symlink dir would not resolve inside). The host
+# brings these, exactly as it brings the rust/cc toolchain the stage0 seed build
+# resolves via tools/provision-{rust,cc}.sh. Was a guix PACKAGE list fed to
+# `guix shell`; it is now a list of representative BINARIES (one per package —
+# resolving `env` gives the whole coreutils bin dir, `unshare` the util-linux
+# dir, etc.). A tool absent from the host PATH warns (a misconfigured runner is
+# visible); the gate that needs it then fails loudly. Core tools (sh/bash/make/
+# env) are fatal-if-missing.
+make bash sh env sed grep find tar gzip crun unshare sqlite3

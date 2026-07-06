@@ -49,21 +49,6 @@ mod tests {
     }
 
     #[test]
-    fn perturbed_twins_diverge_from_their_base() {
-        // The self-discrimination property the corpus gates rely on: a perturbed
-        // twin must NOT serialise identically to its base.
-        let pairs = [
-            ("hello", "hello-perturbed"),
-            ("pkg-config", "pkg-config-perturbed"),
-        ];
-        for (base, pert) in pairs {
-            let b = lookup(base).unwrap().to_json().to_canonical();
-            let p = lookup(pert).unwrap().to_json().to_canonical();
-            assert_ne!(b, p, "{pert} did not diverge from {base}");
-        }
-    }
-
-    #[test]
     fn catalog_is_sorted_and_stems_are_unique() {
         // The generated registry must stay stem-sorted (the stable `list`/`meta`
         // order) with no duplicate stems, whatever read_dir order build.rs saw.

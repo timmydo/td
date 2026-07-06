@@ -9,9 +9,9 @@
 //!   1. the guix-free `check-harness` tier branch (never touches guix),
 //!   2. the netns-probe discrimination check,
 //!   3. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   4. the loop toolchain PATH (guix shell --search-paths — spawned as a child
-//!      process; the package list lives in tools/loop-toolchain.txt so the CI
-//!      image enumerators read the same single source),
+//!   4. the loop toolchain PATH (resolved from the HOST PATH — the tools listed
+//!      in tools/loop-toolchain.txt, canonicalized to their /gnu/store bin dirs;
+//!      the host brings them, like it brings rust/cc — no `guix shell`),
 //!   5. the warm prelude (subst store, source/crate warms, build daemon),
 //!   6. the machine-wide slot dir, and
 //!   7. the sandboxed gate run: TB host-sandbox --expose-cwd -- TB gate-run.
@@ -21,9 +21,11 @@
 //! behavior-preserving for a correctly-pinned host and drops one guix subprocess
 //! per run.)
 //!
-//! The guix invocations here (build/shell) are the loop's EXISTING, ratcheted
-//! surface relocated from shell into typed code — not new surface; they retire
-//! with the /td/store userland, exactly as before (directive 6).
+//! The only remaining guix here is host guix on the sandbox PATH, for the
+//! DEFERRED corpus/seed/bootstrap gates that still call `guix build` for their
+//! guix-built seed (unpinned host guix; the seed BYTES retire last per the north
+//! star / #412). It is EXISTING, ratcheted surface — not new — and shrinks
+//! further with the /td/store userland (directive 6).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -105,36 +107,132 @@ fn provision_stage0(root: &Path) -> Result<String, String> {
     Ok(tb)
 }
 
-/// The loop toolchain PATH: the packages `guix shell -C` used to put on PATH,
-/// provisioned as a profile (no container). The package list is
-/// tools/loop-toolchain.txt — ONE source shared with the CI image enumerators
-/// (ci/lower-*-drvs.sh), which used to sed-scrape the shell prelude for it.
-/// This `guix shell` is the loop substrate's last guix-provisioned piece; it
-/// retires when td's own /td/store userland supplies these tools.
+/// The store prefix the loop sandbox binds over its fresh-tmpfs root: the loop
+/// prelude enters `host-sandbox --expose-cwd` with NO `--store-from`, so main.rs
+/// binds the host `/gnu/store` at `/gnu/store` and NOTHING else of the host FS
+/// (no /usr, /bin, /home). A toolchain bin dir is therefore reachable INSIDE the
+/// sandbox only if it physically lies under this prefix — a `/usr/bin` tool on a
+/// foreign-distro guix host would vanish. Keep this string in sync with the
+/// host-sandbox loop-mode store bind (builder/src/main.rs).
+const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
+
+/// The loop toolchain PATH, resolved from the HOST PATH: the host brings the
+/// userland tools (the "check the right tools are on $PATH" model), exactly as it
+/// already brings the rust/cc toolchain the stage0 seed build resolves via
+/// tools/provision-{rust,cc}.sh — no `guix shell` subprocess. For each expected
+/// tool in tools/loop-toolchain.txt we find it on PATH and CANONICALIZE to its real bin
+/// dir. Canonicalization + the store-prefix check matter — the loop sandbox binds
+/// ONLY `/gnu/store` (SANDBOX_STORE_PREFIX) over a fresh tmpfs, so a
+/// profile-symlink dir (~/.guix-home/profile/bin) OR a distro dir (/usr/bin on a
+/// Debian+guix host) would not resolve inside; only the real
+/// `/gnu/store/<pkg>/bin` target does. The deduped in-store dirs become the
+/// sandbox PATH (host guix's own bin dir is prepended by the caller for the
+/// deferred `guix build` corpus/seed gates).
+///
+/// A tool that is ABSENT from the host PATH, or that resolves OUTSIDE the bound
+/// store (so it would vanish inside the sandbox), is reported in one loud warning
+/// line (a misconfigured runner is visible) but is NOT fatal for a heavy-only
+/// tool: the gate that needs it fails loudly, exactly as the best-effort warms
+/// let their gates enforce presence — a host missing crun/sqlite3 must still run
+/// check-engine/check-pr. Fatal ONLY when a CORE tool (sh/bash/make/env) failed
+/// to resolve to an in-store bin dir — without those no gate body runs at all,
+/// and this fatal's `loop toolchain` prefix is what the daily backstop matches to
+/// classify it as a runner-provisioning gap rather than a code regression
+/// (ci/daily-full-suite.sh).
 fn provision_toolchain(root: &Path) -> Result<String, String> {
-    let pkgs_text = std::fs::read_to_string(root.join("tools/loop-toolchain.txt"))
+    let list = std::fs::read_to_string(root.join("tools/loop-toolchain.txt"))
         .map_err(|e| fatal(&format!("cannot read tools/loop-toolchain.txt: {e}")))?;
-    let pkgs: Vec<&str> = pkgs_text.split_whitespace().collect();
-    if pkgs.is_empty() {
-        return Err(fatal("tools/loop-toolchain.txt is empty"));
+    let tools: Vec<&str> = list
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("")) // strip `# comment` tails
+        .flat_map(str::split_whitespace)
+        .collect();
+    if tools.is_empty() {
+        return Err(fatal("tools/loop-toolchain.txt lists no tools"));
     }
-    let mut cmd = Command::new("guix");
-    cmd.args(["shell", "--no-substitutes", "--no-offload"])
-        .args(&pkgs)
-        .arg("--search-paths")
-        .current_dir(root);
-    let out = run_capture(&mut cmd)
-        .map_err(|e| fatal(&format!("could not provision the loop toolchain PATH ({e})")))?;
-    // `export PATH="<bin:sbin>${PATH:+:}$PATH"` — take the leading non-`$` run.
-    for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("export PATH=\"") {
-            let val: String = rest.chars().take_while(|c| *c != '$' && *c != '"').collect();
-            if !val.is_empty() {
-                return Ok(val);
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut missing: Vec<&str> = Vec::new(); // not on PATH at all
+    let mut off_store: Vec<&str> = Vec::new(); // on PATH but NEVER under the bound store
+    for t in &tools {
+        // Scan EVERY PATH entry for the tool and take the FIRST whose REAL dir is under the
+        // store the sandbox binds — not just the first PATH hit. On a guix-on-foreign-distro
+        // host /usr/bin/env may precede the in-store env; the first hit is off-store but a
+        // usable in-store copy is later on PATH, so stopping at the first match would
+        // false-fatal a loop the sandbox could actually run. A dir the sandbox never exposes
+        // is worse than useless (Ok now, `command not found` for every gate later).
+        let mut found_on_path = false;
+        let mut in_store: Option<String> = None;
+        for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+            let p = Path::new(dir).join(t);
+            if !p.is_file() {
+                continue;
+            }
+            found_on_path = true;
+            if let Some(real) = std::fs::canonicalize(&p)
+                .ok()
+                .and_then(|c| c.parent().map(|d| d.display().to_string()))
+            {
+                if real.starts_with(SANDBOX_STORE_PREFIX) {
+                    in_store = Some(real);
+                    break;
+                }
             }
         }
+        match in_store {
+            Some(dir) => {
+                resolved.insert(t);
+                if !dirs.contains(&dir) {
+                    dirs.push(dir); // dedupe (e.g. sh + bash share one bin dir)
+                }
+            }
+            None if found_on_path => off_store.push(t),
+            None => missing.push(t),
+        }
     }
-    Err(fatal("could not provision the loop toolchain PATH (no PATH line)"))
+    // Core tools every gate body needs — checked against what ACTUALLY resolved to
+    // an in-store dir (mere presence on PATH is not enough: a /usr/bin bash is
+    // invisible inside the sandbox). A host without them cannot run the loop.
+    for core in ["sh", "bash", "make", "env"] {
+        if !resolved.contains(core) {
+            return Err(fatal(&format!(
+                "loop toolchain: core tool `{core}` did not resolve to a path under \
+                 {SANDBOX_STORE_PREFIX} on the host PATH — the loop sandbox exposes only \
+                 that store (not /usr/bin etc.), so the base userland (bash/coreutils/make) \
+                 must be on PATH FROM there, e.g. a guix profile. host-brings-the-tools; \
+                 tools/loop-toolchain.txt"
+            )));
+        }
+    }
+    if !missing.is_empty() || !off_store.is_empty() {
+        let mut why = String::new();
+        if !missing.is_empty() {
+            why.push_str(&format!("not on PATH: {}", missing.join(" ")));
+        }
+        if !off_store.is_empty() {
+            if !why.is_empty() {
+                why.push_str("; ");
+            }
+            why.push_str(&format!(
+                "on PATH but outside {SANDBOX_STORE_PREFIX} (invisible in the sandbox): {}",
+                off_store.join(" ")
+            ));
+        }
+        eprintln!(
+            "td-builder check: loop toolchain: {} heavy-only tool(s) unavailable ({why}); \
+             the gates that need them will fail loudly — expose them under \
+             {SANDBOX_STORE_PREFIX} on the runner PATH (host-brings-the-tools; \
+             tools/loop-toolchain.txt)",
+            missing.len() + off_store.len()
+        );
+    }
+    if dirs.is_empty() {
+        return Err(fatal(
+            "loop toolchain: no expected tool resolved to an in-store bin dir on the host PATH",
+        ));
+    }
+    Ok(dirs.join(":"))
 }
 
 /// A timeout(1)-style duration: bare integer seconds or an integer with an
@@ -971,8 +1069,8 @@ pub fn cli(args: &[String]) -> ExitCode {
 
 fn run(args: &[String]) -> Result<i32, String> {
     let root = std::env::current_dir().map_err(|e| fatal(&format!("cannot resolve cwd: {e}")))?;
-    if !root.join("tests").is_dir() || !root.join("channels.scm").is_file() {
-        return Err(fatal("run from the repo root (tests/ + channels.scm not found)"));
+    if !root.join("tests").is_dir() {
+        return Err(fatal("run from the repo root (tests/ not found)"));
     }
 
     // Parse args LOUDLY: `-j N`/`-jN` overrides the local worker width; any other
@@ -1016,21 +1114,23 @@ fn run(args: &[String]) -> Result<i32, String> {
 
     guard_netns_probe()?;
 
-    // Host guix stays first on PATH inside the sandbox (its dir prepended). This
-    // is the standard tier's last remaining guix dependency (provision_toolchain's
-    // `guix shell`, retiring with the /td/store userland) — so it carries the
-    // "guix-less host → run check-harness" hint the removed pin guard used to
-    // print. The hint points at the guix-FREE path; it does not ask for guix to
-    // be installed (guix is being removed, not required).
+    // Host guix stays first on PATH inside the sandbox (its dir prepended). The
+    // loop TOOLCHAIN comes from the host PATH (provision_toolchain), not guix —
+    // but the DEFERRED corpus/seed/bootstrap gates still realize their guix-built
+    // seed via `guix build` (unpinned host guix; the seed BYTES retire last
+    // per the north star / #412). So guix must still be on PATH for the standard
+    // tier. A guix-less host runs the guix-FREE `check-harness` tier only; the
+    // hint does not ask for guix to be installed (guix is being removed, not
+    // required — the /td/store userland is what retires this last piece).
     let hostguix_dir = find_in_path("guix")
         .and_then(|p| std::fs::canonicalize(p).ok())
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .ok_or_else(|| {
             fatal(
                 "no guix on PATH — a guix-less host runs only `td-builder check \
-                 check-harness`. (The standard tier still provisions its loop \
-                 toolchain via host guix, which is being removed with the /td/store \
-                 userland.)",
+                 check-harness`. (The standard tier's corpus/seed gates still \
+                 realize their guix-built seed via host guix, retiring last with \
+                 the /td/store userland.)",
             )
         })?;
 
@@ -1226,8 +1326,8 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
         return Err(format!("check-rung: no such harness: {harness}"));
     }
     let root = std::env::current_dir().map_err(|e| fatal(&format!("cannot resolve cwd: {e}")))?;
-    if !root.join("tests").is_dir() || !root.join("channels.scm").is_file() {
-        return Err(fatal("run from the repo root (tests/ + channels.scm not found)"));
+    if !root.join("tests").is_dir() {
+        return Err(fatal("run from the repo root (tests/ not found)"));
     }
     let tb = provision_stage0(&root).map_err(|e| {
         format!("check-rung: FATAL: could not provision the guix-free stage0 td-builder for the sandbox ({e})")

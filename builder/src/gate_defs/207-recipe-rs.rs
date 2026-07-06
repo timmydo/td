@@ -13,8 +13,7 @@
 //! process (R1, github issue #274); the crate has NO [dependencies] so `--frozen` touches no
 //! network. No guix package is built via `guix build -e (system M) PKG` either — this gate
 //! adds no new guix packager surface (directive 6).
-//! Not FAST_GATES: needs the rust toolchain (absent from the small td-ci-fast image), same
-//! rationale as cargo-test.
+//! Heavy, not fast: needs the rust toolchain, same rationale as cargo-test.
 
 use crate::gates::{GateDef, Pool, StoreMode};
 
