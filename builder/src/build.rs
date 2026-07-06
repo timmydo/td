@@ -56,6 +56,18 @@ fn find_in_path(path: &str, name: &str) -> Option<String> {
     None
 }
 
+/// The build shell — `bash` preferred, a POSIX `sh` as the fallback. The
+/// autotools `run()` path (CONFIG_SHELL/SHELL/shebang-rewrite) and the
+/// find-files phase helper both need a shell from the inputs; a guix build
+/// userland supplies `bash`, but a td-native busybox-style userland supplies
+/// only `sh` (issue #388: "a POSIX shell — bash or a busybox-style sh"). This is
+/// a STRICT fallback: any lock carrying bash resolves to bash exactly as before,
+/// so every existing build is byte-unchanged; only a bash-less (busybox) userland
+/// takes the `sh` branch, making it a first-class build userland.
+fn find_build_shell(path: &str) -> Option<String> {
+    find_in_path(path, "bash").or_else(|| find_in_path(path, "sh"))
+}
+
 /// patch-source-shebangs (in Rust) — gnu-build-system rewrites `#!/bin/sh` (and
 /// friends) across the unpacked tree to a real interpreter, because the pure
 /// build sandbox has no /bin/sh. td does the same: any file whose shebang names
@@ -778,7 +790,7 @@ fn find_files(srcdir: &str, dir: &str, regex: &str, search_path: &str) -> Result
     if !full.is_dir() {
         return Ok(Vec::new());
     }
-    let bash = find_in_path(search_path, "bash").ok_or("bash not found for find-files")?;
+    let bash = find_build_shell(search_path).ok_or("no bash or sh found for find-files")?;
     // List files; keep those whose basename matches the regex. Single-quote the
     // regex (the corpus find-files regexes contain none); PATH carries find/grep.
     // The match test is an `if` (not `grep && printf`): a NON-matching last file
@@ -959,7 +971,7 @@ pub fn run() -> Result<(), String> {
     }
     let path = path.join(":");
 
-    let bash = find_in_path(&path, "bash").ok_or("bash not found in TD_INPUTS")?;
+    let bash = find_build_shell(&path).ok_or("no bash or sh found in TD_INPUTS")?;
     let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS")?;
     let make = find_in_path(&path, "make").ok_or("make not found in TD_INPUTS")?;
 
@@ -1876,6 +1888,39 @@ mod tests {
         assert!(glob_one_star("no-star-here").is_err());
         assert!(glob_one_star("two/*st*ars").is_err());
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn build_shell_prefers_bash_but_falls_back_to_a_busybox_style_sh() {
+        // Issue #388: a td-native busybox-style userland ships only `sh`, so the
+        // autotools build shell must accept it — while a guix userland (which
+        // ships `bash`) resolves to bash EXACTLY as before (strict fallback, so
+        // every existing build is byte-unchanged).
+        let base = std::env::temp_dir().join(format!("td-shell-{}", std::process::id()));
+        let shdir = base.join("busybox/bin");
+        let bashdir = base.join("guix/bin");
+        fs::create_dir_all(&shdir).unwrap();
+        fs::create_dir_all(&bashdir).unwrap();
+        fs::write(shdir.join("sh"), b"#!x\n").unwrap();
+        fs::write(bashdir.join("sh"), b"#!x\n").unwrap();
+        fs::write(bashdir.join("bash"), b"#!x\n").unwrap();
+
+        // A bash-less (busybox) userland: falls back to its `sh`.
+        let only_sh = shdir.display().to_string();
+        let resolved = find_build_shell(&only_sh).expect("sh is a valid build shell");
+        assert!(resolved.ends_with("/busybox/bin/sh"), "{resolved}");
+
+        // A userland carrying bash: resolves to bash even though `sh` is present
+        // in the same dir — the existing behaviour is preserved.
+        let with_bash = bashdir.display().to_string();
+        let resolved = find_build_shell(&with_bash).expect("bash is a valid build shell");
+        assert!(resolved.ends_with("/guix/bin/bash"), "{resolved}");
+
+        // Neither present: no shell.
+        let empty = base.join("empty").display().to_string();
+        assert!(find_build_shell(&empty).is_none());
+
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
