@@ -4,8 +4,8 @@
 //! --auto` topo-sorts the owned-input closure, marks each edge `td-recipe-output`, and
 //! builds the DAG — bash<-readline<-ncurses, grep<-pcre2, etc., each
 //! dep built once (shared scratch). Subjects are DERIVED here from the recipe inputs, so
-//! a new recipe's edges chain automatically — the same graph the guix-dependence census
-//! reads to credit edge-owned. Per subject: DURABLE structural (the subject's .drv
+//! a new recipe's edges chain automatically — the same dependency graph the recipe
+//! manifest encodes. Per subject: DURABLE structural (the subject's .drv
 //! references td's dep outputs AND NOT guix's), behavioral (runs from td's output loading
 //! td's deps; a library subject's .so is present), repro (td-builder check double-build),
 //! MIGRATION ORACLE (distinct path). guix/Guile SCRUBBED FROM PATH; toolchain + locks are

@@ -26,8 +26,8 @@
 #                         binds on-disk under DEST-STORE, none bare-/gnu/store); the .drv
 #                         builder is the td-bootstrapped stage0.
 #   [DURABLE behavioral]  the seed-built td-builder RUNS (nar-hash) and agrees with the
-#                         stage0 td-builder (both td-built — no guix-built oracle, so the
-#                         guix-surface ratchet does not grow).
+#                         stage0 td-builder (both td-built — no guix-built oracle, so this
+#                         adds no new guix packager surface).
 #   [DURABLE repro]       td-builder check's double-build agrees the output is reproducible.
 #   [REMOVABLE oracle]    the seed-built td-builder == the guix-seed build (same drv —
 #                         own, then diverge: provenance changed, output didn't).
@@ -115,7 +115,7 @@ echo "   [DURABLE structural] every toolchain input staged from the unpacked RUS
 # --- Leg B: DURABLE behavioral — the seed-built td-builder RUNS + matches stage0 -------
 # Compare to the stage0 td-builder (TB), NOT the guix-built one: both are td's own
 # binaries, so this is a guix-free behavioral-equivalence check (no `guix build -e`
-# packager site — the guix-surface ratchet must not grow). Same source + same nar-hash
+# packager site — adds no new guix packager surface). Same source + same nar-hash
 # algorithm ⇒ identical probe hash; a mismatch means the seed-built engine misbehaves.
 printf 'td rust-seed behavioral probe\n' > "$scratch/probe"
 h_td=`"$nsd/bin/td-builder" nar-hash "$scratch/probe"`

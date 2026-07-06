@@ -9,7 +9,7 @@
 //! so the seed build needs ONLY rust + this cc (the removed coreutils/bash were never used).
 //! Together with gate 172 the stage0 td-builder builds with NO guix. Seed store paths are
 //! materialized with `guix build <store-path>` (as gate 170 does — a path realize, NOT a
-//! `-e '(@ (system M) PKG)'` packager site, so the guix-surface ratchet is unaffected).
+//! `-e '(@ (system M) PKG)'` packager site, so it adds no new guix packager surface — directive 6).
 
 use crate::gates::{GateDef, Pool, StoreMode};
 

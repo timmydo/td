@@ -10,11 +10,11 @@
 # FULL ladder). It emits, reusing the rungs' own lowering entry points:
 #   - the pinned channel instance (every rung's time-machine target)
 #   - the check.sh sandbox toolchain (so the offline `guix shell -C` has it)
-# (The guix-system museum tier and its cheap differential rungs were retired,
-# so no SYSTEM/OCI-image lowering remains in the
-# fast tier: the surviving cheap rungs are eval (module load), guix-dependence
-# (pure lowering off the pinned channel, no extra closure) and the static
-# census scripts.)
+# (The guix-system museum tier and the cheap differential rungs — eval, the
+# guix-dependence census, the static guix-surface census — were retired as
+# guix-oracle gates, so the cheap serial-first tier is now empty and no
+# SYSTEM/OCI-image or cheap-rung lowering remains in the fast tier beyond the
+# pinned channel instance + the sandbox toolchain enumerated below.)
 #
 # Usage: ci/lower-fast-drvs.sh   (run from the repo root; host guix must be the
 # pinned channel commit — callers guard this, as check.sh and build-ci-image.sh

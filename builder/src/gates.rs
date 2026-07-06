@@ -34,7 +34,7 @@
 //!
 //! A GateDef's `script` is PLAIN BASH (no make escaping), executed as one
 //! `bash -c` with cwd = repo root and TD_GUIX exported (the pinned
-//! `guix time-machine -C channels.scm --` prefix the remaining guix-surface
+//! `guix time-machine -C channels.scm --` prefix the remaining guix
 //! invocations go through). Output is buffered per gate (`--output-sync=target`
 //! parity), first red stops new gates while running ones drain, and timing
 //! events keep the exact per-gate START/END line format the native report
@@ -1793,15 +1793,12 @@ mod tests {
         // including the guix td-builder package build (unlike the old
         // repo-tree-reading parser tests, which had to skip there).
         let set = load().unwrap();
-        // The pools the Makefile assembled on the day of the cutover (the counts
-        // only grow as gates are added; membership spot-checks are structural).
-        let cheap = set.names(Pool::Cheap);
-        // Membership + relative order, NOT exact vectors: adding a gate must
-        // never require touching this file (the one-file-per-gate property).
-        let pos = |n: &str| cheap.iter().position(|x| x == n);
-        let (e, gd, gs) = (pos("eval"), pos("guix-dependence"), pos("guix-surface"));
-        assert!(e.is_some() && gd.is_some() && gs.is_some(), "cheap chain lost a member");
-        assert!(e < gd && gd < gs, "cheap chain order changed");
+        // The cheap serial-first tier is currently EMPTY: its only members were the
+        // guix-oracle gates (eval/guix-dependence/guix-surface), retired under the
+        // keep/retire rule (AGENTS.md "Test the feature, not the possibility"). The
+        // scheduler handles an empty cheap pool — last_cheap is None, so heavy gates
+        // carry no serial-barrier dep and start subject to the slot pool. A future
+        // cheap gate may be added without touching this file.
         // The heavy/daily split (the ~10-min per-PR budget, human 2026-07-04):
         // heavy = PR-sized behavioral gates, daily = the slow from-seed rungs +
         // from-source corpus the daily backstop covers. Together they are the
@@ -1835,11 +1832,8 @@ mod tests {
         // The explicit fragment dep survived; the derived graph holds.
         let fs = set.gates.iter().find(|g| g.name == "feed-shared").unwrap();
         assert!(fs.deps.iter().any(|d| d == "td-feed"));
-        let gs = set.gates.iter().find(|g| g.name == "guix-surface").unwrap();
-        assert!(gs.deps.iter().any(|d| d == "guix-dependence"));
         let ts = set.gates.iter().find(|g| g.name == "td-subst").unwrap();
         assert!(ts.deps.iter().any(|d| d == BUILD_RECIPES));
-        assert!(ts.deps.iter().any(|d| d == "guix-surface"));
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(br.extra_env.iter().any(|(k, _)| k == "TD_BUILD_SPECS"));
         // Every bash body is non-empty plain bash (no make-isms survived
@@ -2442,7 +2436,7 @@ mod tests {
         private.sort_unstable();
         // The DELIBERATE cold-store audit (#317): exactly the gates whose feature is
         // clean-slate behavior. Tagging a new gate Private means extending this list in
-        // the same PR — a conscious act, like the one-way guix-surface ratchets.
+        // the same PR — a conscious, reviewed act (directive 3).
         assert_eq!(
             private,
             vec![

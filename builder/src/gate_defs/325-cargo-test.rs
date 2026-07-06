@@ -27,9 +27,8 @@
 //! C toolchain is resolved by tools/provision-rust.sh + tools/provision-cc.sh — the SAME
 //! guix-free resolvers the stage0 td-builder SEED build uses (a PROVIDED TD_RUST_HOME/
 //! TD_CC_HOME, or rustup/system cc on a guix-less host, else the pinned lock seed retired
-//! LAST §5) — NOT a `guix shell` process. No guix is invoked here anymore, so this file
-//! drops OUT of the guix-surface `shell` shrink ratchet (tests/guix-surface-shrink.expected;
-//! a PURE shrink — the same clippy/test assertions run, just without the guix daemon).
+//! LAST §5) — NOT a `guix shell` process. No guix is invoked here anymore (this used to
+//! be tracked by the guix-surface census, since retired with the guix-oracle gates).
 //! 
 //! Offline by construction: the provisioned rust bin dir carries rustc + cargo-clippy +
 //! clippy-driver, the cargo bin dir carries cargo, and the cc bin dir (gcc-toolchain, rust's

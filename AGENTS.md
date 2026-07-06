@@ -116,11 +116,16 @@ toolchain, and rust rides on it. Work item: #380.
    This generalizes beyond the packager axis to *every* form of guix
    reliance — a `guix` process invocation (`guix build`/`gc`/`repl`/`system`/`shell`), a
    read of guix's private state (e.g. `/var/guix/db/db.sqlite`), or a guix-built byte in
-   a td artifact. A new PR MUST NOT introduce one; the existing baselines
-   (`tests/guix-surface.expected`, `tests/guix-dependence.expected`, and the `guix gc`/
-   `guix repl` census the `guix-surface` gate prints) are one-way ratchets that may only
-   shrink. When in doubt, the test is "does the td-native path still work with guix
-   deleted from this step?" — if no, it's load-bearing and not allowed.
+   a td artifact. A new PR MUST NOT introduce one; the surface is a one-way
+   ratchet that may only shrink. (The gate-enforced baselines that used to pin
+   this — the `guix-surface`/`guix-dependence` census gates and their
+   `tests/guix-*.expected` snapshots — were themselves retired as guix-oracle
+   gates: they tested *guix*, not a td feature, and a live guix census in the
+   gate list mislead agents into treating the guix surface as something to
+   maintain. The ratchet is now enforced by human review against the keep/retire
+   rule under "Test the feature, not the possibility", not by a gate.) When in
+   doubt, the test is "does the td-native path still work with guix deleted from
+   this step?" — if no, it's load-bearing and not allowed.
 
 8. **Every PR is a complete, atomic increment — migrations cut over in
    one PR** A PR delivers a real, working capability, never a partial
@@ -306,6 +311,23 @@ want our tests to be testing actual end to end features like having td
 build package recipes and td shell testing those builds." Do not rebuild
 museum-style gates; the generations/signed-distribution/placement CONCEPTS
 are deliberately uncovered until the human asks for td-native versions.
+
+**When a gate must be retired (the keep/retire rule).** The inverse of "earn a
+gate": a gate whose ONLY assertion is a guix **differential** (byte-hash-vs-Guix,
+a dependence census), a guix-**implemented capability** (a Guile `guix repl`
+lowering/eval), or an **artifact-shape** check ("it built", "it interned", "the
+closure is complete") does not test a td feature — retire it. The code stays in
+git history as reference. But if a gate tests a *real* feature and merely
+*touches* guix — seeded `/gnu/store` inputs, a byte-vs-Guix or
+sqlite3-vs-own-reader oracle leg, a `$TD_GUIX build` — you KEEP the gate and
+remove the guix touch instead (migrate inputs to `/td/store`, drop the removable
+oracle leg); never delete the feature coverage to shed guix. This rule exists
+because agents read the *gate list*, not just this file, to infer the direction:
+a live guix-oracle gate sitting next to the real feature gates signals that guix
+differentials still matter, and that conflicting signal is what stalls the
+north-star work. The gate set must therefore show only td features. Retiring a
+gate is still a directive-3 act — call it out in the PR so the human approves it
+knowingly.
 
 ## Definition of done (every task)
 

@@ -9,7 +9,7 @@
 //! `mes bootstrap -> gcc toolchain` provenance arrow) is a later increment; here gcc/
 //! coreutils/bash stay the pinned seed. The seed store paths are materialized with
 //! `guix build <store-path>` (as gate 170 does — realizing a pinned path, NOT a
-//! `-e '(@ (system M) PKG)'` packager site, so the guix-surface ratchet is unaffected).
+//! `-e '(@ (system M) PKG)'` packager site, so it adds no new guix packager surface — directive 6).
 
 use crate::gates::{GateDef, Pool, StoreMode};
 

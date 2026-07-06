@@ -281,8 +281,8 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
         "td-feed" => sel.add_target("td-feed"),
         "td-subst" => sel.add_target("td-subst"),
         "pkg-config" => {
-            sel.add_target("guix-dependence");
-            sel.add_note("pkg-config is authored but excluded from td-built census until it has an own-builder gate.");
+            sel.add_target("check-pr");
+            sel.add_note("pkg-config is authored but not yet built by a td gate; running the bounded check-pr tier.");
         }
         _ => {
             if let Some(t) = target_for_build_spec(root, spec) {
@@ -459,13 +459,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         // The td-recipe crate IS the package + system-spec surface (boa/TS retired).
-        // It feeds the corpus build path (cache-lib emits via td-recipe-eval) and the
-        // guix-dependence census manifest — so a catalog change can affect ANY built
-        // package. Run recipe-rs (self-consistency + manifest sync), the census, and
-        // the package build gates. (spec-diff retired with the museum tier.)
+        // It feeds the corpus build path (cache-lib emits via td-recipe-eval) — so a
+        // catalog change can affect ANY built package. Run recipe-rs (self-consistency
+        // + manifest sync) and the package build gates. (spec-diff retired with the
+        // museum tier; the guix-dependence census retired with the guix-oracle gates.)
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-rs");
-        sel.add_target("guix-dependence");
         add_build_gate_targets(root, sel);
         return;
     }
@@ -1087,17 +1086,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if glob_match("tests/guix-dependence.*", p) {
-        sel.add_target("guix-dependence");
-        return;
-    }
-    // guix-surface.sh + its TWO baselines (guix-surface.expected packager set,
-    // guix-surface-shrink.expected directive-8 set) all route to the gate.
-    if glob_match("tests/guix-surface*", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("guix-surface");
-        return;
-    }
 
     if p == "tests/recipe-rs.sh" {
         sel.add_preflight("shell-syntax");
@@ -1186,7 +1174,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if p == "channels.scm" {
         sel.add_target("check-fast");
-        sel.add_target("guix-dependence");
         sel.require_full(&format!(
             "{p} changed; the dependency pin affects the whole loop."
         ));
@@ -1547,15 +1534,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("builder/src/gate_bodies.rs", "store-relocate");
     assert_target!("builder/src/gate_bodies.rs", "check-engine");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
-    // catalog edit runs recipe-rs, the census, and the package build gates.
+    // catalog edit runs recipe-rs and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
-    assert_target!("recipes/src/catalog.rs", "guix-dependence");
     assert_target!("recipes/src/catalog.rs", "recipe-checks");
     assert_target!("recipes/src/catalog.rs", "recipe-checks-daily");
     // Recipes are one self-registering file each under src/recipes/ (issue #295);
     // the nested path must select the same gates (glob `*` crosses `/`).
     assert_target!("recipes/src/recipes/hello.rs", "recipe-rs");
-    assert_target!("recipes/src/recipes/hello.rs", "guix-dependence");
     assert_target!("recipes/src/recipes/hello.rs", "recipe-checks");
     assert_target!("recipes/src/recipes/hello.rs", "recipe-checks-daily");
     assert_target!("recipes/build.rs", "recipe-rs");
@@ -1652,9 +1637,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/recipe-check-lib.sh", "recipe-checks-daily");
     assert_target!("tests/intern-src.sh", "check-pr");
     assert_target!("tests/intern-src.sh", "recipe-checks-daily");
-    assert_target!("tests/guix-surface.sh", "guix-surface");
-    assert_target!("tests/guix-surface.expected", "guix-surface");
-    assert_target!("tests/guix-surface-shrink.expected", "guix-surface");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
     // the seed tree + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
