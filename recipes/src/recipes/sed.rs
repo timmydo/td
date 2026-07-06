@@ -11,7 +11,8 @@ recipe_gnu_version sed sed "(GNU sed) 4.9"
 "#),
         RecipeCheck::daily(r#"
 echo ">> recipe-check sed/store-native: /td/store source-bootstrap toolchain builds GNU sed"
-sh tests/bootstrap-sed-corpus-store-native.sh
+test -n "${TD_GATE_INPUT_SED_GCC_TOOLCHAIN:-}" || { echo "FAIL: TD_GATE_INPUT_SED_GCC_TOOLCHAIN unset" >&2; exit 1; }
+TD_GATE_INPUT_GCC_TOOLCHAIN="$TD_GATE_INPUT_SED_GCC_TOOLCHAIN" sh tests/bootstrap-sed-corpus-store-native.sh
 "#),
     ])
 }

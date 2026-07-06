@@ -516,15 +516,6 @@ pub enum CheckTier {
     Daily,
 }
 
-impl CheckTier {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CheckTier::Pr => "pr",
-            CheckTier::Daily => "daily",
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct RecipeCheck {
     pub tier: CheckTier,

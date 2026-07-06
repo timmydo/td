@@ -8,6 +8,7 @@ pub fn recipe() -> Recipe {
         ))
         .inputs(&["ncurses"])
         .checks(vec![RecipeCheck::daily(r##"
+recipe_link_seed
 recipe_c_link_check readline readline/readline.h readline "#include <stdio.h>" "-L$RECIPE_NCURSES_LIB -lncurses" ":$RECIPE_NCURSES_LIB"
 "##)])
 }

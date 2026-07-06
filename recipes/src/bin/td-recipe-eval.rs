@@ -37,7 +37,6 @@ fn lookup_or_die(stem: &str) -> td_recipe::types::Recipe {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn tier_filter(arg: Option<&String>) -> Option<td_recipe::types::CheckTier> {
     match arg.map(String::as_str).unwrap_or("all") {
         "all" => None,

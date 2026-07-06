@@ -82,7 +82,7 @@ recipe_gnu_version() {
 }
 
 recipe_link_seed() {
-  if [ -n "${RECIPE_GT_BIN:-}" ]; then
+  if [ -n "${RECIPE_GT_BIN:-}" ] && [ -n "${RECIPE_LINUX_HEADERS:-}" ] && [ -n "${RECIPE_NCURSES_LIB:-}" ]; then
     return
   fi
   RECIPE_GT_BIN=`for p in $($TD_GUIX build gcc-toolchain 2>/dev/null); do [ -x "$p/bin/gcc" ] && echo "$p/bin" && break; done`
@@ -151,7 +151,7 @@ recipe_local_crate_lock_build() {
   tb="$TB"
   test -s "$lock0" || { echo "ERROR: no lock $lock0" >&2; exit 1; }
   ncrate=`grep -cE '\.crate /gnu/store/' "$lock0"`
-  test "$ncrate" -ge 1 || { echo "ERROR: lock has no vendored .crate deps" >&2; exit 1; }
+  test "$ncrate" -ge 2 || { echo "ERROR: lock has <2 vendored .crate deps ($ncrate)" >&2; exit 1; }
   scratch="$PWD/.td-build-cache/$name-recipe-check"; mkdir -p "$scratch/tmp" "$scratch/b"; rm -f "$scratch/b/"*.drv
   grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null \
     || { echo "ERROR: could not realize the seed + vendored .crate deps" >&2; exit 1; }
@@ -272,6 +272,13 @@ recipe_cmake_local_build() {
     || { echo "FAIL: build-recipe cmake build (guix/Guile off PATH):" >&2; tail -30 "$scratch/err" >&2; exit 1; }
   out=`sed -n 's/^OUT=out //p' "$scratch/bout"`
   test -n "$out" || { echo "FAIL: build-recipe produced no output" >&2; cat "$scratch/err" >&2; exit 1; }
+  if grep -qx 'CACHE=hit' "$scratch/bout"; then
+    hit=1
+  else
+    hit=
+    grep -q 'no guix (derivation), no Guile' "$scratch/err" \
+      || { echo "FAIL: build-recipe did not assemble the .drv itself" >&2; cat "$scratch/err" >&2; exit 1; }
+  fi
   grep -qE '\["cmake-build"\]' "$sd"/*.drv \
     || { echo "FAIL: the .drv did not select the cmake-build phase runner" >&2; exit 1; }
   grep -qF "$TD_BUILDER_PATH/bin/td-builder" "$sd"/*.drv \

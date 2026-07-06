@@ -22,9 +22,15 @@ echo ">> recipe-checks: running recipe-owned package checks (scope=$scope; goals
 . tests/recipe-check-lib.sh
 recipe_checks_prelude
 
-scratch="$PWD/.td-build-cache/recipe-checks"
-rm -rf "$scratch/scripts"
+scratch="$PWD/.td-build-cache/recipe-checks/$scope-$$"
+rm -rf "$scratch"
 mkdir -p "$scratch/scripts"
+
+if [ "$scope" != pr ]; then
+  # Daily/all includes the seeded C link checks. Resolve that tool seed once in
+  # the parent so each per-body subshell can reuse the exported paths.
+  recipe_link_seed
+fi
 
 checks=`"$TD_RECIPE_EVAL" check-list "$scope"`
 test -n "$checks" || { echo "FAIL: no recipe checks selected for scope=$scope" >&2; exit 1; }
@@ -47,8 +53,6 @@ for spec in $checks; do
     test -s "$script" || { echo "FAIL: empty check script for $label" >&2; exit 1; }
     if (
       set -euo pipefail
-      . tests/recipe-check-lib.sh
-      recipe_checks_prelude >/dev/null
       export TD_RECIPE_CHECK_SPEC="$spec" TD_RECIPE_CHECK_INDEX="$i"
       . "$script"
     ); then

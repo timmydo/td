@@ -29,6 +29,10 @@ pub fn gate() -> GateDef {
                 name: "gcc-toolchain",
                 kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "gcc-toolchain" },
             },
+            ArtifactInput {
+                name: "sed-gcc-toolchain",
+                kind: InputKind::LockEntry { lock: "tests/sed-no-guix.lock", stem: "gcc-toolchain" },
+            },
         ],
         store: StoreMode::Shared,
         non_blocking: true,
