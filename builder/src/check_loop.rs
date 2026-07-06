@@ -1017,17 +1017,20 @@ fn run(args: &[String]) -> Result<i32, String> {
     guard_netns_probe()?;
 
     // Host guix stays first on PATH inside the sandbox (its dir prepended). This
-    // is where the standard tier's hard dependency on the host guix bites, so it
-    // carries the "guix missing/broken → a guix-less host runs only
-    // check-harness" hint the retired pin guard used to print.
+    // is the standard tier's last remaining guix dependency (provision_toolchain's
+    // `guix shell`, retiring with the /td/store userland) — so it carries the
+    // "guix-less host → run check-harness" hint the removed pin guard used to
+    // print. The hint points at the guix-FREE path; it does not ask for guix to
+    // be installed (guix is being removed, not required).
     let hostguix_dir = find_in_path("guix")
         .and_then(|p| std::fs::canonicalize(p).ok())
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .ok_or_else(|| {
             fatal(
-                "no guix on PATH — the standard-tier loop needs the host guix (is it \
-                 installed and on PATH?). A guix-less host runs only `td-builder check \
-                 check-harness`.",
+                "no guix on PATH — a guix-less host runs only `td-builder check \
+                 check-harness`. (The standard tier still provisions its loop \
+                 toolchain via host guix, which is being removed with the /td/store \
+                 userland.)",
             )
         })?;
 
