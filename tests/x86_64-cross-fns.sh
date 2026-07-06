@@ -135,7 +135,8 @@ run_x86_64_rust_toolchain() {
   ladder_intern_extra zlib-x86-64-source zlib-1.3.1 || return 1
   ladder_emit zlib-x86-64 rust-toolchain || return 1
   ladder_lock zlib-x86-64 zlib-x86-64-source rung:gcc-x86-64-stage2 rung:glibc-x86-64 rung:binutils-x86-64 tool:make $_bt || return 1
-  ladder_lock rust-toolchain rust-toolchain-source rung:glibc-x86-64 rung:gcc-x86-64-stage2 rung:zlib-x86-64 tool:tar tool:gzip $_bt || return 1
+  # $_bt already provides tar+gzip (the transform's in-sandbox unpacker) + the rest of the base tools.
+  ladder_lock rust-toolchain rust-toolchain-source rung:glibc-x86-64 rung:gcc-x86-64-stage2 rung:zlib-x86-64 $_bt || return 1
   ladder_build rust-toolchain || { echo "the x86_64 rust-toolchain ladder failed" >&2; return 1; }
   _lt="$_lw/scratch/tdstore"
   _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-rust-toolchain.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
