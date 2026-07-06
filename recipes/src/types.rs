@@ -83,6 +83,10 @@ pub enum Step {
     /// Rewrite `#!/bin/sh`-style shebangs under dir to the given shell (the
     /// engine's own patch_shebangs — the sandbox has no /bin/sh).
     PatchShebangs { dir: String, shell: String },
+    /// Rewrite glibc text linker scripts under `dir/*.so`, stripping
+    /// `<prefix>/lib/` from their member names. Real ELF shared objects are
+    /// skipped by the engine's GNU-ld-script marker check.
+    RelocateLdScripts { dir: String, prefix: String },
     /// Assert products exist (and are executable files if exec) — fail HERE with
     /// a named path, not three rungs later.
     Require { paths: Vec<String>, exec: bool },
@@ -164,6 +168,13 @@ impl Step {
                 Json::Obj(vec![
                     ("dir".into(), Json::Str(dir.clone())),
                     ("shell".into(), Json::Str(shell.clone())),
+                ]),
+            )]),
+            Step::RelocateLdScripts { dir, prefix } => Json::Obj(vec![(
+                "relocateLdScripts".into(),
+                Json::Obj(vec![
+                    ("dir".into(), Json::Str(dir.clone())),
+                    ("prefix".into(), Json::Str(prefix.clone())),
                 ]),
             )]),
             Step::Require { paths, exec } => Json::Obj(vec![(

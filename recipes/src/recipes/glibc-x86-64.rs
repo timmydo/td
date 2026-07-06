@@ -1,4 +1,6 @@
-use crate::ladder::{base_inputs, base_path, sed_i, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{
+    SH, base_inputs, base_path, relocate_ld_scripts, sed_i, unpack_into, unpack_keep_top,
+};
 use crate::types::{Recipe, Step};
 
 // glibc 2.41 for x86_64 (#378 slice 4, guix's cross glibc): the MODERN shared
@@ -99,12 +101,9 @@ pub fn recipe() -> Recipe {
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH),
     );
-    // relocate the GNU ld scripts' absolute member paths to bare names (ld finds
-    // them via -L) — libc.so/libm.so are ld-scripts in 2.41.
-    steps.push(sed_i(
-        "s,/td/store/glibc-2.41-x86_64/lib/,,g",
-        &[&format!("{stage}/lib/libc.so"), &format!("{stage}/lib/libm.so")],
-    ));
+    // Relocate every GNU ld script under lib/*.so from absolute member paths to
+    // bare names (ld finds them via -L); real ELFs and absent scripts are skipped.
+    steps.push(relocate_ld_scripts(stage, "/td/store/glibc-2.41-x86_64"));
     // kernel UAPI headers into the staged include dir (glibc-installed headers
     // win collisions, so copy the kernel trees subdir-wise).
     for kd in [
