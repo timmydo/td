@@ -25,7 +25,7 @@ labels: []
 
 <!-- The files/gates/areas this work touches. Name any exclusive-landing files
      (check.sh, builder/src/gates.rs, channels.scm) and any shared regenerated baselines
-     (e.g. tests/guix-surface-shrink.expected, tests/guix-dependence.expected —
+     (e.g. tests/recipes-meta.json —
      regenerate on rebase, never hand-merge). Claimable only while disjoint
      from every open PR's territory. -->
 

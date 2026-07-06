@@ -312,22 +312,25 @@ build package recipes and td shell testing those builds." Do not rebuild
 museum-style gates; the generations/signed-distribution/placement CONCEPTS
 are deliberately uncovered until the human asks for td-native versions.
 
-**When a gate must be retired (the keep/retire rule).** The inverse of "earn a
-gate": a gate whose ONLY assertion is a guix **differential** (byte-hash-vs-Guix,
-a dependence census), a guix-**implemented capability** (a Guile `guix repl`
-lowering/eval), or an **artifact-shape** check ("it built", "it interned", "the
-closure is complete") does not test a td feature — retire it. The code stays in
-git history as reference. But if a gate tests a *real* feature and merely
-*touches* guix — seeded `/gnu/store` inputs, a byte-vs-Guix or
-sqlite3-vs-own-reader oracle leg, a `$TD_GUIX build` — you KEEP the gate and
-remove the guix touch instead (migrate inputs to `/td/store`, drop the removable
-oracle leg); never delete the feature coverage to shed guix. This rule exists
-because agents read the *gate list*, not just this file, to infer the direction:
-a live guix-oracle gate sitting next to the real feature gates signals that guix
-differentials still matter, and that conflicting signal is what stalls the
-north-star work. The gate set must therefore show only td features. Retiring a
-gate is still a directive-3 act — call it out in the PR so the human approves it
-knowingly.
+**When a gate must be retired (the keep/retire rule).** The deciding question is
+what is UNDER TEST. If the thing under test is a **guix behavior** — a guix
+**differential** (byte-hash-vs-Guix, a dependence census), a guix-**implemented
+capability** (a Guile `guix repl` lowering/eval), or an **artifact-shape** check
+("it built", "it interned", "the closure is complete") — the gate is not coverage
+worth keeping: **delete it, coverage and all** (human, 2026-07-05: "if the feature
+is testing guix, it's not something we want"). The code stays in git history as
+reference. Only when a genuine **td feature** is under test and guix is merely
+incidental to how it's exercised — seeded `/gnu/store` inputs, a `$TD_GUIX build`,
+a removable byte-vs-Guix / sqlite3-vs-own-reader oracle leg — do you KEEP the gate
+and remove the guix touch instead (migrate inputs to `/td/store`, drop the oracle
+leg) rather than lose the td-feature coverage; if the guix-free replacement is a
+separate effort, file a td-native follow-up issue so the feature is not left
+uncovered. This rule exists because agents read the *gate list*, not just this
+file, to infer the direction: a live guix-oracle gate sitting next to the real
+feature gates signals that guix differentials still matter, and that conflicting
+signal is what stalls the north-star work. The gate set must therefore show only
+td features. Retiring a gate is still a directive-3 act — call it out in the PR so
+the human approves it knowingly.
 
 ## Definition of done (every task)
 

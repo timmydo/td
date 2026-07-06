@@ -439,8 +439,19 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
                     }
                 }
                 "check-fast" => {
+                    // Cheap + Fast are both empty since the guix-oracle gates (the
+                    // whole Cheap pool) retired, so check-fast — the REQUIRED CI
+                    // status check (.github/setup-branch-protection.sh) — selects the
+                    // cargo-test smoke (clippy deny + compile + unit tests, offline,
+                    // no package builds): the faithful guix-free replacement for the
+                    // retired cheap structural gates. It must never expand to the
+                    // empty set — an empty required check errors ("nothing selected")
+                    // and blocks every merge; the registry test below guards this.
                     add_pool(&mut sel, Pool::Cheap);
                     add_pool(&mut sel, Pool::Fast);
+                    if let Some(i) = set.index.get("cargo-test") {
+                        sel.insert(*i);
+                    }
                 }
                 "check-system" => {
                     add_pool(&mut sel, Pool::Cheap);
@@ -1867,6 +1878,22 @@ mod tests {
         }
         let bi = *set.index.get(BUILD_RECIPES).unwrap();
         assert!(pr.contains(&bi) && full.contains(&bi), "build-recipes left a tier");
+    }
+
+    #[test]
+    fn every_tier_keyword_selects_a_nonempty_set_against_the_real_registry() {
+        // A tier keyword that expands to {} makes `run_selected` error with
+        // "nothing selected" and exit non-zero. For check-fast that is fatal —
+        // it is the REQUIRED CI status check (.github/setup-branch-protection.sh),
+        // so an empty expansion reds it on every PR and blocks all merges. The
+        // earlier expand_goals tests use synthetic pools (synth(...)); this one
+        // runs the REAL load() registry so emptying a pool (as retiring the whole
+        // Cheap pool did) cannot slip through. Guards the check-fast → Engine fold.
+        let set = load().unwrap();
+        for goal in ["check-fast", "check-engine", "check-system", "check-pr", "check"] {
+            let sel = expand_goals(&set, &[goal.to_string()]).unwrap();
+            assert!(!sel.is_empty(), "tier keyword `{goal}` expanded to the empty set");
+        }
     }
 
     #[test]
