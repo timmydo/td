@@ -3141,12 +3141,7 @@ fn host_sandbox_base_binds(store_from: Option<&str>, store_at: Option<&str>) -> 
             readonly: true,
             ro_optional: false,
         }],
-        None => vec![sandbox::Bind {
-            src: "/gnu/store".to_string(),
-            dest: None,
-            readonly: true,
-            ro_optional: false,
-        }],
+        None => Vec::new(),
     }
 }
 
@@ -5694,7 +5689,7 @@ fn main() -> ExitCode {
         //                      harness (busybox/make/td-builder relinked to
         //                      /td/store/ld); then the host /gnu/store is NOT bound at
         //                      all — the guix-byte-free loop substrate.
-        // Without --store-from the sandbox still binds the host store for the loop toolchain.
+        // Without --store-from the sandbox binds no host store.
         // Usage:
         //   host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--no-daemon] -- CMD ARGS...
         Some("host-sandbox") if args.len() >= 4 => {
@@ -5718,8 +5713,8 @@ fn main() -> ExitCode {
                 // PID namespace, so the host /proc never leaks in and nested
                 // containers see a private /proc.
                 //
-                // The store bind: by default the host /gnu/store; with
-                // --store-from DIR the UNPACKED store DIR, mounted at DEST
+                // The store bind is explicit: with --store-from DIR, bind the
+                // UNPACKED store DIR, mounted at DEST
                 // (--store-at, default /gnu/store) so its binaries' hardcoded
                 // interpreters resolve. With --store-at /td/store (td's own
                 // store-native harness) the host /gnu/store is then absent — the
@@ -6408,8 +6403,7 @@ glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
     #[test]
     fn host_sandbox_base_binds_never_mount_var_guix() {
         let default = host_sandbox_base_binds(None, None);
-        assert_eq!(default.len(), 1);
-        assert_eq!(default[0].src.as_str(), "/gnu/store");
+        assert!(default.is_empty());
         assert!(default.iter().all(|b| b.src != "/var/guix"));
 
         let harness = host_sandbox_base_binds(Some("/h/store"), Some("/td/store"));

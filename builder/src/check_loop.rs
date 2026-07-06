@@ -102,12 +102,10 @@ fn provision_stage0(root: &Path) -> Result<String, String> {
 }
 
 /// The store prefix the loop sandbox binds over its fresh-tmpfs root: the loop
-/// prelude enters `host-sandbox --expose-cwd` with NO `--store-from`, so main.rs
-/// binds the host `/gnu/store` at `/gnu/store` and NOTHING else of the host FS
-/// (no /usr, /bin, /home). A toolchain bin dir is therefore reachable INSIDE the
-/// sandbox only if it physically lies under this prefix — a `/usr/bin` tool on a
-/// foreign-distro guix host would vanish. Keep this string in sync with the
-/// host-sandbox loop-mode store bind (builder/src/main.rs).
+/// prelude passes `--store-from`/`--store-at` explicitly and binds NOTHING else
+/// of the host FS (no /usr, /bin, /home). A toolchain bin dir is therefore
+/// reachable INSIDE the sandbox only if it physically lies under this prefix —
+/// a `/usr/bin` tool on a foreign-distro guix host would vanish.
 const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 
 /// The loop toolchain PATH, resolved from the HOST PATH: the host brings the
@@ -1228,7 +1226,20 @@ fn run(args: &[String]) -> Result<i32, String> {
             argv.extend([s("ionice"), s("-c2"), s("-n7")]);
         }
     }
-    argv.extend([tb.clone(), s("host-sandbox"), s("--expose-cwd"), s("--no-daemon"), s("--"), tb, s("gate-run")]);
+    let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
+    argv.extend([
+        tb.clone(),
+        s("host-sandbox"),
+        s("--expose-cwd"),
+        s("--no-daemon"),
+        s("--store-from"),
+        s(sandbox_store),
+        s("--store-at"),
+        s(sandbox_store),
+        s("--"),
+        tb,
+        s("gate-run"),
+    ]);
     argv.extend([s("-j"), jobs.to_string()]);
     if resume {
         argv.push(s("--resume"));
@@ -1313,7 +1324,18 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
          sandbox env matches the gate)"
     );
     let mut cmd = Command::new(&tb);
-    cmd.args(["host-sandbox", "--expose-cwd", "--no-daemon", "--", "sh"])
+    let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
+    cmd.args([
+        "host-sandbox",
+        "--expose-cwd",
+        "--no-daemon",
+        "--store-from",
+        sandbox_store,
+        "--store-at",
+        sandbox_store,
+        "--",
+        "sh",
+    ])
         .arg(harness)
         .args(rest)
         .env("PATH", toolchain)

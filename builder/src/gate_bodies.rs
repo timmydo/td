@@ -108,9 +108,16 @@ fn tb() -> Result<PathBuf, String> {
 /// Run `tb <args...>`, returning trimmed stdout on success. On a non-zero exit
 /// the error carries `<ctx>` and the child's stderr (the bash `2>&1` tail).
 fn tb_out(tb: &Path, args: &[&str], ctx: &str) -> Result<String, String> {
-    let out = Command::new(tb)
-        .args(args)
-        .stdin(Stdio::null())
+    tb_out_env(tb, args, &[], ctx)
+}
+
+fn tb_out_env(tb: &Path, args: &[&str], envs: &[(&str, &str)], ctx: &str) -> Result<String, String> {
+    let mut cmd = Command::new(tb);
+    cmd.args(args).stdin(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd
         .output()
         .map_err(|e| format!("FAIL: {ctx}: cannot spawn td-builder: {e}"))?;
     if !out.status.success() {
@@ -566,8 +573,8 @@ fn store_subject(s0: &Stage0, root: &Path, scratch: &Path) -> Result<Subject, St
 /// Rust, no daemon in the write path).
 fn store_add(root: &Path) -> Result<(), String> {
     println!(
-        ">> store-add: td PLACES a text path into its OWN store + registers it (pure Rust, no \
-         daemon in the write path)"
+        ">> store-add: td PLACES a /td/store text path into its OWN store + registers it (pure \
+         Rust, no daemon in the write path)"
     );
     let tb = stage0_from_memo(root)?.tb;
 
@@ -585,11 +592,15 @@ fn store_add(root: &Path) -> Result<(), String> {
     let store_s = path_str(&store)?;
     let tddb = scratch.join("td.db");
     let tddb_s = path_str(&tddb)?;
-    let td_path =
-        tb_out(&tb, &["store-add-text", name, &content_s, &store_s, &tddb_s], "td store-add-text")?;
+    let td_path = tb_out_env(
+        &tb,
+        &["store-add-text", name, &content_s, &store_s, &tddb_s],
+        &[("TD_STORE_DIR", "/td/store")],
+        "td store-add-text (/td/store)",
+    )?;
     let content_bytes = std::fs::read(&content)
         .map_err(|e| format!("FAIL: read {}: {e}", content.display()))?;
-    let expected_path = "/gnu/store/7xminwvw4fidpj31znmzg16n6f2fhqns-td-store-add-probe";
+    let expected_path = "/td/store/acs7ncyflz0ms0wfcd0vlvrcirn5fhp1-td-store-add-probe";
     if td_path != expected_path {
         return Err(format!(
             "FAIL: td computed {td_path} != the fixed addTextToStore known vector {expected_path}"
@@ -636,7 +647,7 @@ fn store_add(root: &Path) -> Result<(), String> {
 
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
-        "PASS: td PLACED a path into its OWN store and REGISTERED it ITSELF, in pure Rust with NO \
+        "PASS: td PLACED a /td/store path into its OWN store and REGISTERED it ITSELF, in pure Rust with NO \
          daemon in the write path — td computed the addTextToStore path, wrote the exact content \
          as a canonical 0444 store file, and its registration (read back by TD'S OWN reader) \
          records that path + the NAR hash of what td wrote."
