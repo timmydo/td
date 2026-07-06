@@ -7,19 +7,23 @@
 //! What runs here, in order (the exact sequence the shell prelude ran; the
 //! rationale comments live with each step):
 //!   1. the guix-free `check-harness` tier branch (never touches guix),
-//!   2. the host-guix == pinned-channel integrity guard,
-//!   3. the netns-probe discrimination check,
-//!   4. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   5. the loop toolchain PATH (guix shell --search-paths — spawned as a child
+//!   2. the netns-probe discrimination check,
+//!   3. stage0 provisioning (the guix-free loop-container provider, #294),
+//!   4. the loop toolchain PATH (guix shell --search-paths — spawned as a child
 //!      process; the package list lives in tools/loop-toolchain.txt so the CI
 //!      image enumerators read the same single source),
-//!   6. the warm prelude (subst store, source/crate warms, build daemon),
-//!   7. the machine-wide slot dir, and
-//!   8. the sandboxed gate run: TB host-sandbox --expose-cwd -- TB gate-run.
+//!   5. the warm prelude (subst store, source/crate warms, build daemon),
+//!   6. the machine-wide slot dir, and
+//!   7. the sandboxed gate run: TB host-sandbox --expose-cwd -- TB gate-run.
 //!
-//! The guix invocations here (describe/build/shell) are the loop's EXISTING,
-//! ratcheted surface relocated from shell into typed code — not new surface; they
-//! retire with the /td/store userland, exactly as before (directive 6).
+//! (The host-guix == pinned-channel integrity guard that used to run `guix
+//! describe` was removed in #406 — it only warned on drift, so dropping it is
+//! behavior-preserving for a correctly-pinned host and drops one guix subprocess
+//! per run.)
+//!
+//! The guix invocations here (build/shell) are the loop's EXISTING, ratcheted
+//! surface relocated from shell into typed code — not new surface; they retire
+//! with the /td/store userland, exactly as before (directive 6).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -899,8 +903,8 @@ fn try_fetch_harness(root: &Path, hdir: &Path, tb: &str) {
 }
 
 /// The guix-free `check-harness` tier: enter td's OWN /td/store harness via the
-/// stage0 td-builder — handled BEFORE the guix guard/toolchain so this tier
-/// never invokes guix (the stage0 warm path spawns none once placed).
+/// stage0 td-builder — handled BEFORE the host-guix toolchain provisioning so
+/// this tier never invokes guix (the stage0 warm path spawns none once placed).
 fn run_check_harness(root: &Path) -> Result<i32, String> {
     let hdir = root.join(".td-build-cache/harness");
     let rel_f = hdir.join("rel");
