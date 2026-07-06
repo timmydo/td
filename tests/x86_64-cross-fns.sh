@@ -63,6 +63,28 @@ run_x86_64_cross() {
   mkdir -p "$_lw"
   ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
   _bt="tool:bash tool:coreutils tool:sed tool:grep tool:gawk tool:tar tool:gzip tool:bzip2 tool:xz tool:findutils tool:diffutils"
+  _x86_64_cross_ladder || return 1
+  ladder_build gcc-x86-64-stage2 || { echo "the x86_64 cross toolchain ladder failed" >&2; return 1; }
+  _lt="$_lw/scratch/tdstore"
+  _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-gcc-x86-64-stage2.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
+  # Export ONLY the cross toolchain trees (run_x86_64_cross's contract, consumed by verify/closure/
+  # native): binutils-x86-64, gcc-x86-64-stage2, glibc-x86-64. gcc-14/glibc-mesboot(-shared)/
+  # binutils-244 are in the plan as build DEPS but are NOT exported — they were gate-locals for the
+  # retired shell repro leg, and glibc-mesboot-shared isn't even in stage2's closure.
+  XBU=`_lo binutils-x86-64` || return 1
+  _b=`_lo gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
+  _b=`_lo glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
+  XLIBGCCDIR=`find "$XGCC2" -name 'libgcc_s.so.1' | head -1 | xargs -r dirname`
+  XSTDCXXDIR=`find "$XGCC2" -name 'libstdc++.so.6*' | head -1 | xargs -r dirname`
+  X86_WORK="$_lw"; X86_SYSROOT="$_lw/x-sysroot-unused"
+  export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR X86_WORK X86_SYSROOT
+  echo "   [ladder] x86_64 cross toolchain via build-plan --auto: i686 base (21 rungs) -> cross binutils 2.44 -> gcc stage1 -> glibc 2.41 -> gcc stage2"
+}
+
+# _x86_64_cross_ladder — emit + lock the 25-rung i686-base -> x86_64-cross ladder ($_bt set +
+# ladder_setup already ran). Shared by run_x86_64_cross (target gcc-x86-64-stage2) and
+# run_x86_64_rust_toolchain (which adds the zlib-x86-64 + rust-toolchain rungs on top).
+_x86_64_cross_ladder() {
   ladder_emit stage0 mes tcc make-mesboot0 patch-mesboot binutils-mesboot0 gcc-core-mesboot0 mesboot-headers glibc-mesboot0 gcc-mesboot0 binutils-mesboot1 make-mesboot gcc-mesboot1 binutils-mesboot gawk-mesboot glibc-mesboot gcc-mesboot glibc-mesboot-shared gcc-14 binutils-244 glibc-241 binutils-x86-64 gcc-x86-64-stage1 glibc-x86-64 gcc-x86-64-stage2 || return 1
   ladder_lock stage0 stage0-source || return 1
   ladder_lock mes mes-source rung:stage0 src:nyacc $_bt || return 1
@@ -89,21 +111,43 @@ run_x86_64_cross() {
   ladder_lock gcc-x86-64-stage1 gcc-14-source rung:gcc-14 rung:glibc-mesboot rung:binutils-x86-64 rung:binutils-244 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
   ladder_lock glibc-x86-64 glibc-241-source rung:gcc-x86-64-stage1 rung:gcc-14 rung:glibc-mesboot rung:binutils-x86-64 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make tool:python $_bt || return 1
   ladder_lock gcc-x86-64-stage2 gcc-14-source rung:gcc-14 rung:glibc-mesboot rung:binutils-x86-64 rung:glibc-x86-64 rung:binutils-244 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
-  ladder_build gcc-x86-64-stage2 || { echo "the x86_64 cross toolchain ladder failed" >&2; return 1; }
+}
+
+# run_x86_64_rust_toolchain — build the /td/store rust-toolchain via build-plan --auto (#410):
+# the cross ladder + zlib-x86-64 + rust-toolchain rungs. rust-toolchain's transitive closure IS
+# the cross toolchain, so one `ladder_build rust-toolchain` realizes the whole graph (the warm
+# chain cache-hits the cross rungs). Exports the cross trees (XBU XGCC2 XGLIBC XLIBGCCDIR
+# XSTDCXXDIR) AND the relinked rustc/cargo tree XRUSTTREE. Same preamble as run_x86_64_cross.
+run_x86_64_rust_toolchain() {
+  . tests/ladder-lib.sh
+  TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
+  if [ -n "$TD_CHECK_CHAIN_CACHE" ]; then _lw="$HOME/.td/build-daemon/ladder"; else _lw="$ROOT/.td-build-cache/ladder-cold"; fi
+  mkdir -p "`dirname "$_lw"`"
+  exec 9>"$_lw.lock"; flock 9 || { echo "ladder: flock failed" >&2; return 1; }
+  test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$_lw"
+  mkdir -p "$_lw"
+  ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
+  _bt="tool:bash tool:coreutils tool:sed tool:grep tool:gawk tool:tar tool:gzip tool:bzip2 tool:xz tool:findutils tool:diffutils"
+  _x86_64_cross_ladder || return 1
+  # rust/zlib sources are NOT in the base ladder_setup spec set — intern them now (idempotent),
+  # so the zlib/rust rungs' locks resolve their -source entries.
+  ladder_intern_extra rust-toolchain-source rust-1.96.0 || return 1
+  ladder_intern_extra zlib-x86-64-source zlib-1.3.1 || return 1
+  ladder_emit zlib-x86-64 rust-toolchain || return 1
+  ladder_lock zlib-x86-64 zlib-x86-64-source rung:gcc-x86-64-stage2 rung:glibc-x86-64 rung:binutils-x86-64 tool:make $_bt || return 1
+  ladder_lock rust-toolchain rust-toolchain-source rung:glibc-x86-64 rung:gcc-x86-64-stage2 rung:zlib-x86-64 tool:tar tool:gzip $_bt || return 1
+  ladder_build rust-toolchain || { echo "the x86_64 rust-toolchain ladder failed" >&2; return 1; }
   _lt="$_lw/scratch/tdstore"
-  _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-gcc-x86-64-stage2.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
-  # Export ONLY the cross toolchain trees (run_x86_64_cross's contract, consumed by verify/closure/
-  # native): binutils-x86-64, gcc-x86-64-stage2, glibc-x86-64. gcc-14/glibc-mesboot(-shared)/
-  # binutils-244 are in the plan as build DEPS but are NOT exported — they were gate-locals for the
-  # retired shell repro leg, and glibc-mesboot-shared isn't even in stage2's closure.
+  _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-rust-toolchain.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
   XBU=`_lo binutils-x86-64` || return 1
   _b=`_lo gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
   _b=`_lo glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
   XLIBGCCDIR=`find "$XGCC2" -name 'libgcc_s.so.1' | head -1 | xargs -r dirname`
   XSTDCXXDIR=`find "$XGCC2" -name 'libstdc++.so.6*' | head -1 | xargs -r dirname`
+  XRUSTTREE=`_lo rust-toolchain` || return 1
   X86_WORK="$_lw"; X86_SYSROOT="$_lw/x-sysroot-unused"
-  export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR X86_WORK X86_SYSROOT
-  echo "   [ladder] x86_64 cross toolchain via build-plan --auto: i686 base (21 rungs) -> cross binutils 2.44 -> gcc stage1 -> glibc 2.41 -> gcc stage2"
+  export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR XRUSTTREE X86_WORK X86_SYSROOT
+  echo "   [ladder] x86_64 rust-toolchain via build-plan --auto: cross toolchain -> zlib-x86-64 -> rust-toolchain (relinked rustc/cargo tree $XRUSTTREE)"
 }
 
 # ---------------------------------------------------------------------------------------------------

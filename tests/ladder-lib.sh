@@ -142,6 +142,30 @@ ladder_stage_tdstore() {
   done < "$LW/srcs.map"
 }
 
+# ladder_intern_extra INTERN-NAME LOCK-STEM — intern ONE more pinned source
+# (seed/sources/LOCK-STEM*.lock, td-fetched warm) into the already-set-up ladder store as
+# intern INTERN-NAME, idempotently (skip if already in srcs.map — a re-intern into the
+# read-only content-addressed path would EACCES), and stage it into the shared td-store. For a
+# source a specific rung needs but the base ladder_setup spec set does not carry (the rust/zlib
+# inputs of run_x86_64_rust_toolchain), so the cross ladder_setup stays untouched (no regression
+# to the cross-toolchain gates). Requires ladder_setup already ran ($LW set).
+ladder_intern_extra() {
+  _name=$1; _stem=$2
+  grep -q "^$_name " "$LW/srcs.map" 2>/dev/null && return 0
+  _lock=`ls seed/sources/$_stem*.lock 2>/dev/null | head -1`
+  test -n "$_lock" || { echo "ladder: no seed/sources lock for $_stem" >&2; return 1; }
+  _file=".td-build-cache/sources/`sed -n 's/^file //p' "$_lock" | head -1`"
+  test -f "$_file" || { echo "ladder: pinned tarball not warm ($_file) — run 'td-feed warm sources'" >&2; return 1; }
+  _p=`TD_STORE_DIR=/td/store "$TB" store-add-recursive "$_name" "$_file" "$LW/store" "$LW/db"` \
+    || { echo "ladder: intern $_name failed" >&2; return 1; }
+  printf '%s %s\n' "$_name" "$_p" >> "$LW/srcs.map"
+  _b=${_p##*/}
+  test -e "$LW/scratch/tdstore/$_b" \
+    || cp -al "$LW/store/$_b" "$LW/scratch/tdstore/$_b" 2>/dev/null \
+    || cp -a "$LW/store/$_b" "$LW/scratch/tdstore/$_b" \
+    || { echo "ladder: stage $_b into tdstore failed" >&2; return 1; }
+}
+
 # ladder_map NAME — the interned path (srcs.map) or tool root (tools.map).
 ladder_map() {
   _v=`sed -n "s/^$1 //p" "$LW/srcs.map" "$LW/tools.map" 2>/dev/null | head -1`
