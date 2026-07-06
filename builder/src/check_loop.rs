@@ -7,19 +7,23 @@
 //! What runs here, in order (the exact sequence the shell prelude ran; the
 //! rationale comments live with each step):
 //!   1. the guix-free `check-harness` tier branch (never touches guix),
-//!   2. the host-guix == pinned-channel integrity guard,
-//!   3. the netns-probe discrimination check,
-//!   4. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   5. the loop toolchain PATH (guix shell --search-paths — spawned as a child
+//!   2. the netns-probe discrimination check,
+//!   3. stage0 provisioning (the guix-free loop-container provider, #294),
+//!   4. the loop toolchain PATH (guix shell --search-paths — spawned as a child
 //!      process; the package list lives in tools/loop-toolchain.txt so the CI
 //!      image enumerators read the same single source),
-//!   6. the warm prelude (subst store, source/crate warms, build daemon),
-//!   7. the machine-wide slot dir, and
-//!   8. the sandboxed gate run: TB host-sandbox --expose-cwd -- TB gate-run.
+//!   5. the warm prelude (subst store, source/crate warms, build daemon),
+//!   6. the machine-wide slot dir, and
+//!   7. the sandboxed gate run: TB host-sandbox --expose-cwd -- TB gate-run.
 //!
-//! The guix invocations here (describe/build/shell) are the loop's EXISTING,
-//! ratcheted surface relocated from shell into typed code — not new surface; they
-//! retire with the /td/store userland, exactly as before (directive 6).
+//! (The host-guix == pinned-channel integrity guard that used to run `guix
+//! describe` was removed in #406 — it only warned on drift, so dropping it is
+//! behavior-preserving for a correctly-pinned host and drops one guix subprocess
+//! per run.)
+//!
+//! The guix invocations here (build/shell) are the loop's EXISTING, ratcheted
+//! surface relocated from shell into typed code — not new surface; they retire
+//! with the /td/store userland, exactly as before (directive 6).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -54,61 +58,6 @@ fn run_capture(cmd: &mut Command) -> Result<String, String> {
         return Err(format!("{:?} exited {}", cmd.get_program(), out.status));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// The pinned channel commit out of channels.scm (the shell `sed -n
-/// 's/.*(commit *"..."/p'` — a 40-hex string inside `(commit "…")`).
-fn pinned_commit(root: &Path) -> Result<String, String> {
-    let text = std::fs::read_to_string(root.join("channels.scm"))
-        .map_err(|e| fatal(&format!("cannot read channels.scm: {e}")))?;
-    for (i, _) in text.match_indices("(commit") {
-        let (_, from_match) = text.split_at(i);
-        let after = from_match.trim_start_matches("(commit").trim_start();
-        if let Some(rest) = after.strip_prefix('"') {
-            let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-            if hex.len() == 40 {
-                return Ok(hex);
-            }
-        }
-    }
-    Err(fatal("could not parse pinned commit from channels.scm"))
-}
-
-/// --- Integrity guard: host guix must equal the pinned channel commit ----------
-/// The offline/no-download property holds ONLY because the host system guix is
-/// the exact commit channels.scm pins: time-machine to a *different* commit would
-/// recompute the channel-instance derivation, miss the warm store, and try to
-/// download it. Fail loudly rather than silently going online.
-fn guard_pinned_guix(root: &Path) -> Result<(), String> {
-    let pinned = pinned_commit(root)?;
-    let desc = run_capture(Command::new("guix").args(["describe", "-f", "recutils"]))
-        .unwrap_or_default();
-    let host = desc
-        .lines()
-        .find_map(|l| l.strip_prefix("commit:").map(|v| v.trim().to_string()))
-        .unwrap_or_default();
-    if host.is_empty() {
-        // Distinguish "guix missing/broken" from a genuine pin mismatch — an
-        // empty commit in the mismatch message sent operators to re-pin
-        // channels.scm when the real problem was `guix describe` itself.
-        return Err(fatal(
-            "could not read the host guix commit (`guix describe` failed — is guix \
-             installed and on PATH?). The loop needs the pinned host guix; a guix-less \
-             host runs only `./check.sh check-harness`.",
-        ));
-    }
-    if host != pinned {
-        // A pin DRIFT no longer aborts the run. The guix-pin-dependent gates are
-        // tagged non-blocking, so on a drifted host they fail without blocking the
-        // rest; a correctly-pinned host runs them normally. (Guix is being removed;
-        // the pin's significance goes with it.) Warn loudly and continue.
-        eprintln!(
-            "td-builder check: WARNING: host guix ({host}) != pinned channel ({pinned}).\n  \
-             Proceeding — the guix-pin-dependent gates are tagged non-blocking, so their \
-             failures will not block the run. A correctly-pinned host runs and covers them."
-        );
-    }
-    Ok(())
 }
 
 /// --- Offline-isolation control: the netns probe mechanism must discriminate ---
@@ -954,8 +903,8 @@ fn try_fetch_harness(root: &Path, hdir: &Path, tb: &str) {
 }
 
 /// The guix-free `check-harness` tier: enter td's OWN /td/store harness via the
-/// stage0 td-builder — handled BEFORE the guix guard/toolchain so this tier
-/// never invokes guix (the stage0 warm path spawns none once placed).
+/// stage0 td-builder — handled BEFORE the host-guix toolchain provisioning so
+/// this tier never invokes guix (the stage0 warm path spawns none once placed).
 fn run_check_harness(root: &Path) -> Result<i32, String> {
     let hdir = root.join(".td-build-cache/harness");
     let rel_f = hdir.join("rel");
@@ -1060,19 +1009,30 @@ fn run(args: &[String]) -> Result<i32, String> {
         goals.push("check".to_string());
     }
 
-    // The guix-free harness tier: never reaches the guix guard below.
+    // The guix-free harness tier: never reaches the host-guix requirement below.
     if goals.first().map(String::as_str) == Some("check-harness") {
         return run_check_harness(&root);
     }
 
-    guard_pinned_guix(&root)?;
     guard_netns_probe()?;
 
-    // Host guix stays first on PATH inside the sandbox (its dir prepended).
+    // Host guix stays first on PATH inside the sandbox (its dir prepended). This
+    // is the standard tier's last remaining guix dependency (provision_toolchain's
+    // `guix shell`, retiring with the /td/store userland) — so it carries the
+    // "guix-less host → run check-harness" hint the removed pin guard used to
+    // print. The hint points at the guix-FREE path; it does not ask for guix to
+    // be installed (guix is being removed, not required).
     let hostguix_dir = find_in_path("guix")
         .and_then(|p| std::fs::canonicalize(p).ok())
         .and_then(|p| p.parent().map(Path::to_path_buf))
-        .ok_or_else(|| fatal("no guix on PATH"))?;
+        .ok_or_else(|| {
+            fatal(
+                "no guix on PATH — a guix-less host runs only `td-builder check \
+                 check-harness`. (The standard tier still provisions its loop \
+                 toolchain via host guix, which is being removed with the /td/store \
+                 userland.)",
+            )
+        })?;
 
     // Light tiers own no heavy gate — skip the heavy warms + daemon (exactly the
     // shell prelude's goal scan).
