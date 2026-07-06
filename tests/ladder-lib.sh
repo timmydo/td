@@ -57,6 +57,18 @@ ladder_setup() {
   # LADDER_SETUP_V bumps force a re-setup when the source SET grows.
   _pinsum=`{ echo ladder-setup-v2; cat seed/sources/*.lock seed/patches/*.patch; find seed/stage0 -type f | sort | xargs cat; } 2>/dev/null | sha256sum | cut -d' ' -f1`
   if [ -f "$LW/setup-ok" ] && [ "`cat "$LW/setup-ok"`" = "$_pinsum" ]; then
+    # slice 4: add the x86_64 kernel headers to an already-warm ladder WITHOUT a full
+    # re-setup (idempotent — interns only if absent, a NEW store path so no EACCES). This
+    # is why adding the x86_64 rungs did NOT need a LADDER_SETUP_V bump.
+    if ! grep -q '^linux-headers-x86-64 ' "$LW/srcs.map" 2>/dev/null; then
+      _lkv=`ls seed/sources/linux-*.lock | head -1`
+      _vv=`sed -n 's/^file linux-\(.*\)\.tar\..*$/\1/p' "$_lkv" | head -1`
+      _khx=".td-build-cache/sources/linux-headers-$_vv-x86_64.tar.gz"
+      test -f "$_khx" || { echo "ladder: x86_64 kernel-headers tarball not warm ($_khx)" >&2; return 1; }
+      _p=`TD_STORE_DIR=/td/store "$TB" store-add-recursive linux-headers-x86-64 "$_khx" "$LW/store" "$LW/db"` \
+        || { echo "ladder: intern linux-headers-x86-64 failed" >&2; return 1; }
+      printf 'linux-headers-x86-64 %s\n' "$_p" >> "$LW/srcs.map"
+    fi
     ladder_stage_tdstore || return 1
     return 0
   fi
@@ -93,6 +105,13 @@ ladder_setup() {
   _p=`TD_STORE_DIR=/td/store "$TB" store-add-recursive linux-headers "$_kh" "$LW/store" "$LW/db"` \
     || { echo "ladder: intern linux-headers failed" >&2; return 1; }
   printf 'linux-headers %s\n' "$_p" >> "$LW/srcs.map"
+  # the x86_64 kernel-headers tarball (slice 4 cross rungs; td-feed warm sources produces BOTH
+  # archs, so this is always warm alongside the i386 set). Interned as `linux-headers-x86-64`.
+  _khx=".td-build-cache/sources/linux-headers-$_v-x86_64.tar.gz"
+  test -f "$_khx" || { echo "ladder: x86_64 kernel-headers tarball not warm ($_khx)" >&2; return 1; }
+  _p=`TD_STORE_DIR=/td/store "$TB" store-add-recursive linux-headers-x86-64 "$_khx" "$LW/store" "$LW/db"` \
+    || { echo "ladder: intern linux-headers-x86-64 failed" >&2; return 1; }
+  printf 'linux-headers-x86-64 %s\n' "$_p" >> "$LW/srcs.map"
   # --- intern the vendored boot patches + the stage0 seed tree ----------------------
   for pp in binutils-boot-2.20.1a gcc-boot-2.95.3 glibc-boot-2.2.5 glibc-bootstrap-system-2.2.5 \
             gcc-boot-4.6.4 glibc-boot-2.16.0 glibc-bootstrap-system-2.16.0; do
