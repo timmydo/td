@@ -439,19 +439,17 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
                     }
                 }
                 "check-fast" => {
-                    // Cheap + Fast are both empty since the guix-oracle gates (the
-                    // whole Cheap pool) retired, so check-fast — the REQUIRED CI
-                    // status check (.github/setup-branch-protection.sh) — selects the
-                    // cargo-test smoke (clippy deny + compile + unit tests, offline,
-                    // no package builds): the faithful guix-free replacement for the
-                    // retired cheap structural gates. It must never expand to the
-                    // empty set — an empty required check errors ("nothing selected")
-                    // and blocks every merge; the registry test below guards this.
+                    // Cheap + Fast are both empty since the fast tier's ENTIRE content
+                    // — the cheap guix gates eval/guix-dependence/guix-surface — retired.
+                    // check-fast now expands to {} and PASSES as a no-op (run_selected
+                    // treats an empty selection as a pass). Do NOT fold cargo-test in
+                    // here: check-fast runs inside the td-ci-fast sandbox image, which
+                    // carries no clippy, so `cargo clippy` would red the required check
+                    // (see 325-cargo-test.rs:47). The real per-PR engine check is the
+                    // HOST cargo-test CI job; the td-ci-fast sandbox tier is now obsolete
+                    // and slated for retirement (guix-removal follow-up).
                     add_pool(&mut sel, Pool::Cheap);
                     add_pool(&mut sel, Pool::Fast);
-                    if let Some(i) = set.index.get("cargo-test") {
-                        sel.insert(*i);
-                    }
                 }
                 "check-system" => {
                     add_pool(&mut sel, Pool::Cheap);
@@ -1896,10 +1894,12 @@ mod tests {
         // runs the REAL load() registry so emptying a pool (as retiring the whole
         // Cheap pool did) cannot slip through. Guards the check-fast → Engine fold.
         let set = load().unwrap();
-        // check-system is intentionally omitted: the System pool is empty since the
-        // guix OCI-image gates retired, so it legitimately expands to {} (run_selected
-        // treats that as a pass). The REQUIRED check-fast tier must stay non-empty.
-        for goal in ["check-fast", "check-engine", "check-pr", "check"] {
+        // check-fast and check-system are intentionally omitted: their pools are empty
+        // since the guix gates that populated them (the cheap fast-tier gates; the OCI
+        // image gates) retired, so both legitimately expand to {} and PASS as a no-op
+        // (run_selected treats empty as a pass). check-engine/check-pr/check MUST stay
+        // non-empty — they carry the real per-PR + full coverage.
+        for goal in ["check-engine", "check-pr", "check"] {
             let sel = expand_goals(&set, &[goal.to_string()]).unwrap();
             assert!(!sel.is_empty(), "tier keyword `{goal}` expanded to the empty set");
         }

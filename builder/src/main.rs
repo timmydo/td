@@ -6135,7 +6135,7 @@ fn main() -> ExitCode {
         // corpus-independence: run AS a derivation's builder, executing the
         // autotools phases in Rust (replaces gnu-build-system). Reads the build
         // environment from env vars (out, TD_SRC, TD_INPUTS, TD_CONFIGURE_FLAGS)
-        // that system/td-build.scm sets on the derivation.
+        // that the td-native derivation contract sets on the derivation.
         Some("autotools-build") if args.len() == 2 => match build::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -6146,7 +6146,7 @@ fn main() -> ExitCode {
         // td's OWN Rust/cargo build system (the cargo-build-system replacement):
         // builds the TD_SRC crate with `cargo build --offline` and installs
         // TD_RUST_BINS into $out/bin. Sibling of autotools-build; same
-        // env-driven derivation-builder contract (system/td-build.scm).
+        // env-driven derivation-builder contract.
         Some("rust-build") if args.len() == 2 => match build::run_rust() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -6157,7 +6157,7 @@ fn main() -> ExitCode {
         // td's OWN cmake build system (the cmake-build-system replacement): runs an
         // out-of-source `cmake` configure -> make -> make install over the TD_SRC
         // tree, installing into $out. Sibling of autotools-build/rust-build; same
-        // env-driven derivation-builder contract (system/td-build.scm).
+        // env-driven derivation-builder contract.
         Some("cmake-build") if args.len() == 2 => match build::run_cmake() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

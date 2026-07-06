@@ -38,7 +38,12 @@
 set -eu
 
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-checks='{"context": "lint"}, {"context": "check-fast"}'
+# cargo-test (host job, has the rust toolchain) is now the real per-PR engine gate:
+# check-fast's content — the cheap guix gates — retired, so the td-ci-fast sandbox
+# tier is VACUOUS (passes as a no-op) and slated for retirement. Keep check-fast
+# required until that job is removed; make cargo-test required so engine regressions
+# (clippy/unit tests) still block merges. RE-APPLY this script for it to take effect.
+checks='{"context": "lint"}, {"context": "check-fast"}, {"context": "cargo-test"}'
 
 # Squash is the ONLY merge mode; merge and rebase merges would break linear
 # history (and rebase merges drop the per-commit messages that are now the
