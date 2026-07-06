@@ -26,26 +26,20 @@ set -euo pipefail
 : "${TD_BUILD_SPECS?the gate runner passes TD_BUILD_SPECS (empty = prelude only)}"
 nspecs=$(set -- $TD_BUILD_SPECS; echo $#)
 
-echo ">> build-recipes: assemble + submit $nspecs recipes to the shared build daemon (global budget), then reproducibility-check ($TD_BUILD_SPECS)"
+echo ">> build-recipes: the build_gate PRELUDE — stage0 td-builder (env rust) + td-recipe-eval, GUIX-FREE"
 : "${TD_DAEMON_SOCKET:?the shared build daemon is not running — the \`td-builder check\` host prelude starts it (ensure_build_daemon)}"
-# The PRELUDE — always runs, spec-independent: build gates fail-fast without it.
-grep ' /gnu/store/' tests/td-builder-rust.lock | sed 's/^[^ ]* //' | xargs guix build >/dev/null \
-  || { echo "ERROR: could not realize the stage0 toolchain seed (regenerate tests/td-builder-rust.lock on a host-guix change)" >&2; exit 1; }
+# The guix-seeded corpus (recipe-checks + the *-no-guix.lock packages) retired — every
+# package now builds on td's mes-rooted /td/store toolchain via the store-native gates,
+# not guix's gcc-toolchain. So build-recipes is a corpus-free prelude: it places the stage0
+# td-builder (compiled from builder/ source with the ENVIRONMENT's rust — no guix seed) and
+# builds td-recipe-eval, which the build_gate store primitives reuse. There is no per-spec
+# corpus pre-build (TD_BUILD_SPECS is empty) and no `guix build`.
 export CACHE="$PWD/.td-build-cache/pkg" TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; mkdir -p "$CACHE"
 . tests/cache-lib.sh; load_stage0
-echo ">> builds run on the td-bootstrapped stage0 td-builder ($TD_BUILDER_PATH) — NO guix-built td-builder (move-off-Guile §5 brick 3)"
+echo ">> builds run on the td-bootstrapped stage0 td-builder ($TD_BUILDER_PATH) — compiled from source with the environment's rust, no guix-built td-builder"
 sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval" >/dev/null \
   || { echo "ERROR: could not build td's Rust recipe evaluator (recipes/ crate)" >&2; exit 1; }
 load_recipe_eval
-echo ">> recipes EVALUATE with td's OWN Rust td-recipe-eval ($TD_RECIPE_EVAL) — boa retired (rust-recipe-surface)"
-# The spec-dependent tail — ONE guard so prelude-only mode can't half-run it.
-if [ "$nspecs" -gt 0 ]; then
-  for s in $TD_BUILD_SPECS; do grep ' /gnu/store/' "tests/$s-no-guix.lock"; done \
-    | sed 's/^[^ ]* //' | sort -u | xargs guix build >/dev/null \
-    || { echo "ERROR: could not realize the build seed (regenerate locks on a host-guix change)" >&2; exit 1; }
-  echo ">> submitting $nspecs recipes to the shared build daemon ($TD_DAEMON_SOCKET); the daemon's global budget caps concurrency ..."
-  printf '%s\n' $TD_BUILD_SPECS | xargs -P "$nspecs" -n1 sh tests/build-pkg.sh
-  echo "PASS: build-recipes — all $nspecs package recipes realized + reproducible via the shared build daemon into .td-build-cache/pkg; the build gates now cache-hit + memo-skip the double-build and only assert behavior/oracle."
-else
-  echo "PASS: build-recipes — prelude only (no specs among the selected gates): stage0 seed realized + td-recipe-eval built; nothing pre-built (in-gate builds cover the rest)."
-fi
+echo ">> recipes EVALUATE with td's OWN Rust td-recipe-eval ($TD_RECIPE_EVAL)"
+test "$nspecs" -eq 0 || { echo "ERROR: build-recipes got specs ($TD_BUILD_SPECS) but the guix-seeded corpus retired — no spec-carrying gate should remain" >&2; exit 1; }
+echo "PASS: build-recipes — guix-free prelude: stage0 td-builder placed (env rust) + td-recipe-eval built; the store primitives build their subjects in-gate."

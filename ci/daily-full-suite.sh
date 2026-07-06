@@ -62,14 +62,8 @@ else
 fi
 [ -n "$TDB" ] && [ -x "$TDB" ] || { echo "daily: FATAL: no td-builder (need host cargo or a pre-placed stage0)" >&2; exit 1; }
 echo ">> daily backstop: full td-builder check on origin/main ($main)"
-# Host-prep: warm the stage0 toolchain seed into /gnu/store (#311 — the loop's
-# provision_stage0 no longer realizes it with `guix build`; it resolves from a td-subst
-# store or fails closed). The daily runner is guix-having, so it warms the guix-built pin
-# out-of-band here (gcc-toolchain is a cheap union guix realizes offline) so the loop
-# finds the seed present — and so the daily can bootstrap the seed publication below even
-# after a channel bump. Best-effort: a failure here surfaces as the loop's own clear
-# fail-closed message.
-sh tools/warm-stage0-seed.sh || echo ">> daily backstop: WARN — could not warm the stage0 seed out-of-band (provision_stage0 will fail closed if it is absent)" >&2
+# The stage0 td-builder compiles from source with the ENVIRONMENT's rust (provision-rust/cc),
+# so there is no guix-built toolchain seed to warm here — the runner brings rust + cc.
 # TD_SUBST_FORCE_BUILD=1: the daily is the SOLE from-seed authoritative build + publisher
 # (x64-toolchain-subst). Suppress the fetch short-circuit so gate 414 ALWAYS builds the x86_64
 # toolchain from seed and re-produces the closure export to publish below — otherwise a persistent

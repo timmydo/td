@@ -47,9 +47,9 @@ load_stage0() {
 # otherwise provision-rust.sh would silently fall through to its rustup/system-cc
 # path on a warm host (a provenance switch, not a warm).
 provision_stage0() {
-  _s0lock="${TD_LOCK:-tests/td-builder-rust.lock}"
-  sh tools/resolve-seed.sh "$_s0lock" \
-    || { echo "FAIL: could not resolve the stage0 toolchain seed from $_s0lock (tools/resolve-seed.sh — warm this host's store out-of-band or publish the seed substitutes; the loop's guix-build seed realize is retired, #311)" >&2; return 1; }
+  # The stage0 td-builder compiles from builder/ source with the ENVIRONMENT's rust +
+  # cc (tools/provision-{rust,cc}.sh — TD_RUST_HOME / rust on PATH / rustup), so there is
+  # no guix-built toolchain seed to realize here. load_stage0 does the whole job.
   load_stage0
 }
 

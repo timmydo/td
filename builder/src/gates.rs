@@ -1817,40 +1817,32 @@ mod tests {
         // full check — the split may move members but never lose one.
         let heavy = set.names(Pool::Heavy);
         let daily = set.names(Pool::Daily);
-        // Thresholds ratchet DOWN as guix gates retire (the guix-removal workstream):
-        // the guix-oracle + Guile-lowering gates AND every guix-invoking gate
-        // (bootstrap/provision-*/rust-build/td-feed/td-subst/oci/… + the feed-shared /
-        // seed-subst companions) were deleted, so heavy dropped 45→27 and the System
-        // pool emptied. #410 additionally retired the rust-toolchain recipe-graph
-        // cutover's daily-tier gates (rust-x86_64-runtime-store-native + the
-        // maintainer-disabled rust-userland-x86_64 / td-shell-userland), so daily
-        // dropped 42→40 and the combined floor fell 69→67. These guard against
-        // ACCIDENTAL loss, not deliberate retirement — lower them in the same PR that
-        // removes gates.
-        assert!(heavy.len() >= 27, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
-        assert!(daily.len() >= 40, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 67, "the full check lost gates");
-        for g in ["recipe-checks", "td-shell"] {
+        // Thresholds ratchet DOWN as guix gates retire (the guix-removal workstream).
+        // The guix-SEEDED corpus (recipe-checks/recipe-checks-daily + the 35 corpus
+        // recipes) and the guix seed-capture/td-shell/subst gates were deleted — they
+        // built packages on guix's gcc-toolchain/rust, not td's mes-rooted /td/store
+        // toolchain — leaving only the /td/store store-native ladder, the store
+        // primitives, and the engine. These guard against ACCIDENTAL loss, not
+        // deliberate retirement — lower them in the same PR that removes gates.
+        assert!(heavy.len() >= 20, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
+        assert!(daily.len() >= 32, "daily pool shrank: {}", daily.len());
+        assert!(heavy.len() + daily.len() >= 52, "the full check lost gates");
+        for g in ["cargo-test", "store-verify"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
-        for g in ["bootstrap-gcc-mesboot", "recipe-checks-daily"] {
+        for g in ["bootstrap-gcc-mesboot"] {
             assert!(daily.iter().any(|n| n == g), "missing daily gate {g}");
         }
         assert!(set.names(Pool::Engine).iter().any(|n| n == "cargo-test"));
-        // (The System pool is EMPTY since the guix OCI-image gates — oci-native,
-        // rust-userland-image — retired; a future td-native image gate repopulates it,
-        // so no membership assertion here. check-system legitimately expands to {}.)
-        // Fragment-declared specs feed the synthetic build-recipes node.
-        for s in ["hello"] {
-            assert!(set.build_specs.iter().any(|x| x == s), "missing build spec {s}");
-        }
-        // Typed artifact inputs (#353): the first cut-over gate declares its
-        // inputs instead of grepping locks in shell.
-        let tsd = set.gates.iter().find(|g| g.name == "toolchain-subst-default").unwrap();
-        assert_eq!(tsd.inputs.len(), 2, "toolchain-subst-default lost its declared inputs");
-        assert!(tsd.inputs.iter().any(|i| i.name == "coreutils"));
-        assert!(tsd.inputs.iter().any(|i| i.name == "bash-static"));
-        // The derived graph holds: the synthetic build-recipes node carries the specs.
+        // (The System pool is EMPTY since the guix OCI-image gates retired; check-system
+        // legitimately expands to {}. The build_specs corpus is empty since the
+        // guix-seeded recipe-checks retired — build-recipes is now a corpus-free stage0 +
+        // recipe-eval prelude only.)
+        // Typed artifact inputs (#353): a KEEP store-native gate declares its lock inputs
+        // instead of grepping locks in shell.
+        let sp = set.gates.iter().find(|g| g.name == "store-persist").unwrap();
+        assert!(sp.inputs.iter().any(|i| i.name == "bash-static"), "store-persist lost its declared inputs");
+        // The derived graph holds: the synthetic build-recipes prelude node is present.
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(br.extra_env.iter().any(|(k, _)| k == "TD_BUILD_SPECS"));
         // Every bash body is non-empty plain bash (no make-isms survived
@@ -1917,24 +1909,12 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .unwrap()
         };
-        // A single spec-carrying gate scopes the phase to its own spec.
+        // The guix-seeded corpus (the only spec-carrying gates) retired, so build_specs
+        // is empty and scoping is a no-op — the point now is that the build-recipes
+        // PRELUDE body (stage0 seed + td-recipe-eval; load_recipe_eval fails-fast without
+        // its sentinel) still runs for a build_gate selection, never no-op'd.
         let mut set = load().unwrap();
-        let goals = vec!["recipe-checks".to_string()];
-        let sel = expand_goals(&set, &goals).unwrap();
-        scope_build_recipes(&mut set, &sel, &goals);
-        assert_eq!(br_specs(&set), "hello");
-        // The full check keeps the whole pool, byte-identical to the static env.
-        let mut set = load().unwrap();
-        let all = set.build_specs.join(" ");
-        let goals = vec!["check".to_string()];
-        let sel = expand_goals(&set, &goals).unwrap();
-        scope_build_recipes(&mut set, &sel, &goals);
-        assert_eq!(br_specs(&set), all);
-        // A spec-less selection (a store-DB gate builds its subject in-gate)
-        // scopes the pre-build to nothing, but the BODY still runs — it is the
-        // build-gate prelude (stage0 seed + td-recipe-eval; load_recipe_eval
-        // fails-fast without its sentinel), so it must never be no-op'd.
-        let mut set = load().unwrap();
+        assert!(set.build_specs.is_empty(), "no corpus specs after the guix-corpus retirement");
         let goals = vec!["store-verify".to_string()];
         let sel = expand_goals(&set, &goals).unwrap();
         scope_build_recipes(&mut set, &sel, &goals);
@@ -2481,20 +2461,14 @@ mod tests {
             vec![
                 "bootstrap-seed",
                 "chain-cache",
-                "corpus-seed",
-                "harness-seed",
-                "rust-seed",
                 "sandbox-hardening",
-                "seed-build",
-                "seed-unpack",
                 "store-gc",
                 "store-gc-sweep",
-                "td-shell-seed",
             ]
         );
         // The default is Shared — the #317 flip: warm machine-wide state unless a gate
         // declares that cold IS its feature.
-        for g in ["store-persist", "recipe-checks"] {
+        for g in ["store-persist", "store-verify"] {
             let gate = set.gates.iter().find(|x| x.name == g).unwrap();
             assert_eq!(gate.store, StoreMode::Shared, "{g} must default Shared");
         }
