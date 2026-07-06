@@ -4,9 +4,11 @@
 //! COMPILES. rustc links final binaries through a C toolchain, and the first x86_64 gcc that can RUN in an
 //! x86_64 own-root is the NATIVE gcc of #240 (rung X2; the cross gcc is an i686 binary). So: the x86_64
 //! CROSS toolchain is FETCHED as the lock-keyed signed closure (else built from the 229-byte seed —
-//! directive 1), td builds the NATIVE x86_64 binutils 2.44 + gcc 14.3.0 + an x86_64 libz, RELINKS the
+//! directive 1), td builds the NATIVE x86_64 binutils 2.44 + gcc 14.3.0 + an x86_64 libz, and RELINKS the
 //! upstream Rust 1.96.0 rustc + cargo to /td/store (td's own ELF rewriter, no patchelf) WITH the rustlib
-//! sysroot, interns them beside the native toolchain + x86_64 glibc, and in the store-ns own-root rustc
+//! sysroot via the first-class `rust-toolchain` RECIPE (`td-builder build-recipe`, buildSystem
+//! "rust-toolchain"; #380 — the retired `toolchain-recipe rust-x86_64` subcommand), interns them beside
+//! the native toolchain + x86_64 glibc, and in the store-ns own-root rustc
 //! RUNS, COMPILES hello.rs via the /td/store native gcc into a DYNAMIC ELF64 x86-64 binary (interp = the
 //! /td/store x86_64 ld), and that binary RUNS → "…: 42", /gnu/store ABSENT. An x86_64 Rust toolchain that
 //! COMPILES with no guix process AND no guix bytes in its store.

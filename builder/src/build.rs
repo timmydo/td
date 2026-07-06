@@ -1273,6 +1273,16 @@ pub fn run_rust() -> Result<(), String> {
 ///                      carry internal whitespace, the same drv-safe encoding the
 ///                      autotools path uses.
 ///
+/// rust-toolchain-build — the pinned-upstream-Rust ELF-retarget TRANSFORM (#380).
+/// The declared-input, reproducible recipe form of the retired `toolchain-recipe
+/// rust-x86_64` subcommand: extract-and-relink the upstream Rust release onto the
+/// /td/store x86_64 glibc loader. Reads the drv env (out, TD_SRC, TD_INPUT_MAP);
+/// the transform itself lives beside its ELF helpers in `crate::toolchain_x86_64`.
+/// Sibling of run/run_rust/run_cmake/run_stage0/run_mesboot; same env-driven contract.
+pub fn run_rust_toolchain() -> Result<(), String> {
+    crate::toolchain_x86_64::run_rust_toolchain_build()
+}
+
 /// Determinism: the configure pins CMAKE_BUILD_TYPE=Release and the build dir is a
 /// fixed relative path, and SOURCE_DATE_EPOCH=1 / HOME=/homeless-shelter mirror the
 /// autotools path — so `td-builder check`'s double-build (the durable repro oracle)

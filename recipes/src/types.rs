@@ -34,6 +34,14 @@ pub enum BuildSystem {
     Cmake,
     Stage0,
     Mesboot,
+    /// The rust-toolchain TRANSFORM (#380): NOT a compile — the recipe's source is
+    /// a pinned upstream Rust release tarball and its inputs are the /td/store
+    /// x86_64 glibc/libgcc/libz; the engine's build::run_rust_toolchain extracts
+    /// rustc/cargo + the rustlib sysroot, co-locates the runtime closure, and
+    /// RELINKS the ELF interpreter onto td's own glibc loader (crate::elf, no
+    /// patchelf). A DECLARED-input, reproducible recipe — the first-class form of
+    /// the retired `toolchain-recipe rust-x86_64` shell subcommand.
+    RustToolchain,
 }
 
 impl BuildSystem {
@@ -44,6 +52,7 @@ impl BuildSystem {
             BuildSystem::Cmake => "cmake",
             BuildSystem::Stage0 => "stage0",
             BuildSystem::Mesboot => "mesboot",
+            BuildSystem::RustToolchain => "rust-toolchain",
         }
     }
 }
@@ -572,6 +581,12 @@ impl Recipe {
     /// engine's build::run_mesboot; `native_inputs` name the prior rungs.
     pub fn mesboot(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Mesboot)
+    }
+    /// The rust-toolchain TRANSFORM recipe (#380): `source` is the pinned upstream
+    /// Rust release tarball; `inputs` are the /td/store x86_64 glibc/libgcc/libz the
+    /// engine relinks against. No compile — see BuildSystem::RustToolchain.
+    pub fn rust_toolchain(name: &str, version: &str) -> Recipe {
+        Recipe::base(name, version, BuildSystem::RustToolchain)
     }
 
     pub fn native_inputs(mut self, xs: &[&str]) -> Recipe {
