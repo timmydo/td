@@ -2339,7 +2339,19 @@ fn auto_chained_lock(base_lock_text: &str, owned_deps: &[String]) -> Result<Stri
         let mut toks = trimmed.split_whitespace();
         let first = toks.next().unwrap_or("");
         let path = toks.next().unwrap_or("");
-        match owned_deps.iter().find(|d| auto_entry_is_dep(first, path, d)) {
+        let class = toks.next().unwrap_or("");
+        // A `source`-class line is the recipe's OWN source, NEVER a rung dependency — so it
+        // must pass through unchanged. Without this, a rung that reuses another rung's source
+        // TARBALL (e.g. the x86_64 cross rungs build the i686 gcc-14/binutils-2.44 source and
+        // ALSO depend on those rungs) mis-fires auto_entry_is_dep: the source path basename
+        // `<hash>-binutils-244-source` matches the dep `binutils-244` via its `starts_with`
+        // prefix rule, re-keying the source line away and leaving the recipe with no source.
+        let dep = if class == "source" {
+            None
+        } else {
+            owned_deps.iter().find(|d| auto_entry_is_dep(first, path, d))
+        };
+        match dep {
             Some(d) => {
                 out.push_str(&format!("{d} {path} td-recipe-output\n"));
                 marked.insert(d.clone());
@@ -6764,6 +6776,33 @@ glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
             &format!("/gnu/store/{h}-coreutils-9.1"),
             "ncurses"
         )); // toolchain entry
+    }
+
+    // --auto: a `source`-class line is the recipe's OWN source, never a rung dep, so it must
+    // NOT be re-keyed even when its path basename prefix-matches an owned dep. Regression for
+    // the x86_64 cross rungs: binutils-x86-64 builds the `binutils-244-source` tarball AND
+    // depends on the `binutils-244` rung — the source path `<hash>-binutils-244-source` else
+    // mis-matches `binutils-244` and the recipe loses its source.
+    #[test]
+    fn auto_chained_lock_never_rekeys_the_source_line() {
+        let h = "agdqkcaybihqgjiwq9s9kz5mqsxwdjdv";
+        let base = format!(
+            "binutils-x86-64-source /td/store/{h}-binutils-244-source source\n\
+             binutils-244 /td/store/pending-binutils-244\n"
+        );
+        let out = auto_chained_lock(&base, &["binutils-244".to_string()]).unwrap();
+        // the source line passes through unchanged (still `source`-class), and the rung dep
+        // is the line that gets re-keyed to td-recipe-output.
+        assert!(
+            out.contains(&format!(
+                "binutils-x86-64-source /td/store/{h}-binutils-244-source source"
+            )),
+            "source line was re-keyed: {out}"
+        );
+        assert!(
+            out.contains("binutils-244 /td/store/pending-binutils-244 td-recipe-output"),
+            "rung dep not re-keyed: {out}"
+        );
     }
 
     // --auto: topo-sort follows the recipe JSONs' `inputs`, ordering deps before
