@@ -1823,11 +1823,15 @@ mod tests {
         // the guix-oracle + Guile-lowering gates AND every $TD_GUIX-invoking gate
         // (bootstrap/provision-*/rust-build/td-feed/td-subst/oci/… + the feed-shared /
         // seed-subst companions) were deleted, so heavy dropped 45→27 and the System
-        // pool emptied. These guard against ACCIDENTAL loss, not deliberate retirement —
-        // lower them in the same PR that removes gates.
+        // pool emptied. #410 additionally retired the rust-toolchain recipe-graph
+        // cutover's daily-tier gates (rust-x86_64-runtime-store-native + the
+        // maintainer-disabled rust-userland-x86_64 / td-shell-userland), so daily
+        // dropped 42→40 and the combined floor fell 69→67. These guard against
+        // ACCIDENTAL loss, not deliberate retirement — lower them in the same PR that
+        // removes gates.
         assert!(heavy.len() >= 27, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
         assert!(daily.len() >= 40, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 69, "the full check lost gates");
+        assert!(heavy.len() + daily.len() >= 67, "the full check lost gates");
         for g in ["recipe-checks", "td-shell"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }

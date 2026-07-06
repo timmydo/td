@@ -499,15 +499,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "tests/td-toolchain-rust-x86_64.lock" {
-        sel.add_preflight("shell-syntax");
-        // the RELINKED rust tree's input-addressed lock: its consumer is the rust runtime
-        // gate (which assembles+relinks+publishes it). A pin/recipe-rev change re-keys +
-        // re-publishes the tree. (The rust-userland-x86_64 gate retired with the guix gates.)
-        sel.add_target("rust-x86_64-runtime-store-native");
-        return;
-    }
-
+    // #410: the tests/td-toolchain-rust-x86_64.lock mapping was removed with the rust-toolchain
+    // recipe-graph cutover — that gate-assembled lock and its consumer gate (416) are retired; the
+    // recipe now carries its source pin (seed/sources/rust-*.lock) routed to recipe-checks-daily.
     if pattern_matches(
         "tests/toolchain-x86_64-input-addressed.sh|builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         p,
@@ -656,12 +650,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "tests/td-shell-userland.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("td-shell-userland");
-        return;
-    }
-
     if p == "tests/td-shell-seed.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("td-shell-seed");
@@ -714,16 +702,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if pattern_matches("tests/rust-store-native.sh|seed/sources/rust-*.lock", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("rust-store-native");
-        sel.add_target("rust-x86_64-runtime-store-native");
+        // #410: seed/sources/rust-*.lock is also the rust-toolchain recipe's pinned source; its
+        // recipe-owned RecipeCheck::daily (tests/rust-toolchain-recipe-check.sh) runs under
+        // recipe-checks-daily.
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
-    if pattern_matches(
-        "tests/rust-x86_64-runtime-store-native.sh|seed/sources/zlib-*.lock|builder/src/gate_defs/416-rust-x86_64-runtime-store-native.rs",
-        p,
-    ) {
+    // #410: seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source, and the rust-toolchain
+    // transform co-locates its libz — both build under the rust-toolchain recipe check.
+    if pattern_matches("seed/sources/zlib-*.lock|tests/rust-toolchain-recipe-check.sh", p) {
         sel.add_preflight("shell-syntax");
-        sel.add_target("rust-x86_64-runtime-store-native");
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
@@ -919,13 +909,13 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
     // The NATIVE x86_64 toolchain's input-addressed key file: consumed by the native gcc gate (422,
-    // builds+interns the native toolchain at these lock paths), the self-host gate (426, obtains the
-    // native toolchain as its builder), and the rust runtime gate (416, fetches it as the linker) —
-    // all Daily/system tier, deferred to the daily backstop. (A recipe-rev bump here re-keys the path.)
+    // builds+interns the native toolchain at these lock paths) and the self-host gate (426, obtains the
+    // native toolchain as its builder) — both Daily/system tier, deferred to the daily backstop.
+    // (A recipe-rev bump here re-keys the path.) The rust runtime gate (416) that also fetched this as
+    // the linker was retired with the rust-toolchain recipe-graph cutover (#410).
     if pattern_matches("tests/td-toolchain-x86_64-native.lock", p) {
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         sel.add_target("bootstrap-x86_64-self-gcc-store-native");
-        sel.add_target("rust-x86_64-runtime-store-native");
         return;
     }
     if pattern_matches(
@@ -1474,6 +1464,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         "toolchain-x86_64-input-addressed"
     );
+    // #410: the rust-x86_64 runtime/userland/td-shell-userland gates were retired with the
+    // rust-toolchain recipe-graph cutover; the recipe-owned RecipeCheck::daily + its source locks
+    // route to recipe-checks-daily instead.
+    assert_target!("tests/rust-toolchain-recipe-check.sh", "recipe-checks-daily");
+    assert_target!("seed/sources/zlib-1.3.1.lock", "recipe-checks-daily");
+    assert_target!("seed/sources/rust-1.96.0.lock", "recipe-checks-daily");
     assert_target!(
         "tests/userland-x86_64-store-native.sh",
         "userland-x86_64-store-native"

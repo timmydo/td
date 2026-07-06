@@ -33,6 +33,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::io::BufRead;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -209,44 +210,51 @@ pub fn run_self(inp: &BuildInputs) -> Result<String, String> {
     Ok(report)
 }
 
-// --- rust-toolchain: the pinned-upstream-Rust ELF-retarget transform (#380) -----------
+// --- rust-toolchain: the pinned-upstream-Rust ELF-retarget transform (#380, #410) ------
 //
 // The engine phase runner for buildSystem "rust-toolchain" (recipes/src/recipes/
-// rust-toolchain.rs) — the FIRST-CLASS RECIPE form of what was the `toolchain-recipe
-// rust-x86_64` shell subcommand. It co-locates the /td/store runtime closure (glibc
-// sonames + libgcc_s + libz, found via the UNCHANGED upstream RUNPATH $ORIGIN/../lib —
-// the portable, content-addressed-store-safe choice) and RELINKS rustc/cargo's ELF
-// interpreter — `crate::elf::set_interp`, GROWS the slot per #258, NOT patchelf — onto
-// the /td/store x86_64 glibc loader.
+// rust-toolchain.rs), fully in the recipe-graph model (#410). It UNPACKS the pinned
+// upstream Rust release tarball IN-SANDBOX (the declared tar/gzip inputs, as
+// ladder::unpack_into does — so the recipe's `.source()` is the raw tarball), co-locates
+// the /td/store runtime closure (glibc sonames + libgcc_s + libz, found via the UNCHANGED
+// upstream RUNPATH $ORIGIN/../lib — the portable, content-addressed-store-safe choice) and
+// RELINKS rustc/cargo's ELF interpreter — `crate::elf::set_interp`, GROWS the slot per
+// #258, NOT patchelf — onto the /td/store x86_64 glibc loader.
 //
-// It runs in the HERMETIC drv sandbox as PURE td-builder Rust (fs copies + crate::elf),
-// so it stages NO external tool (tar/patchelf) into the sandbox: the sha-pinned upstream
-// tarball is unpacked by the GATE as source prep (like every recipe's source is a
-// prepared artifact), and TD_SRC is that extracted release tree.
+// It runs in the HERMETIC drv sandbox as td-builder Rust (fs copies + crate::elf) plus the
+// in-sandbox untar via the declared tar/gzip inputs.
 //
-//   TD_SRC        the extracted upstream Rust release tree (root: rustc/ cargo/ rust-std-…/).
-//   TD_INPUT_MAP  lock name -> /td/store path; the transform reads by name:
-//                   rust-native-glibc   the x86_64 glibc 2.41 tree (interp + sonames)
-//                   rust-native-libgcc  a tree holding libgcc_s.so.1
-//                   rust-native-libz    a tree holding libz.so.1.*
+//   TD_SRC        the pinned upstream Rust release TARBALL (rust-toolchain-source, Class::Source).
+//   TD_INPUT_MAP  lock name -> /td/store path; the transform reads its inputs BY RECIPE NAME
+//                 (#410 — no gate-assembled rust-native-* lock):
+//                   glibc-x86-64       the x86_64 glibc 2.41 tree (interp + sonames), at its
+//                                      staged stage/td/store/glibc-2.41-x86_64 prefix
+//                   gcc-x86-64-stage2  the cross gcc final — libgcc_s.so.1 (found recursively)
+//                   zlib-x86-64        the td-built libz.so.1 tree
+//                   tar, gzip          the declared unpackers (base tools)
 //   out           the output tree (rustc/cargo relinked onto /td/store).
 //
-// The interp target is <rust-native-glibc>/lib/ld-linux-x86-64.so.2 — the input's own
-// /td/store path, which IS the lock-keyed loader the gate interns glibc at, so the
-// relinked tree is byte-identical to the retired subcommand's output (the gate interns
-// it at the same td-toolchain-rust-x86_64.lock path + subst-exports it, unchanged). Same
-// pinned source + same inputs => byte-identical tree (the `td-builder check` double-build
-// oracle proves it); a missing input reds at drv-assembly (build-recipe), before a build.
+// The interp target is <glibc-x86-64 staged>/lib/ld-linux-x86-64.so.2 — the input's own
+// /td/store path. Same pinned source + same inputs => byte-identical tree (the `td-builder
+// check` double-build oracle proves it); a missing input reds at drv-assembly
+// (build-recipe), before a build.
+
+/// The staged install-prefix subpaths of the x86_64 toolchain rung outputs (a mesboot rung
+/// installs into <out>/stage/td/store/<prefix>). Kept beside the transform so the resolution
+/// stays in one place if a rung's version bumps.
+const GLIBC_X86_64_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
+const GCC_X86_64_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64";
+const ZLIB_X86_64_LIB: &str = "stage/td/store/zlib-1.3.1/lib";
 
 /// The resolved rust-toolchain transform inputs, read from the drv env.
 struct RustInputs {
-    /// TD_SRC — the extracted upstream Rust release tree (rustc/ cargo/ rust-std-…/).
+    /// The upstream Rust release, UNPACKED in-sandbox from TD_SRC (root: rustc/ cargo/ rust-std-…/).
     src: PathBuf,
-    /// rust-native-glibc — the x86_64 glibc 2.41 tree (interp target + co-located sonames).
+    /// glibc-x86-64 (staged) — the x86_64 glibc 2.41 tree (interp target + co-located sonames).
     glibc: PathBuf,
-    /// rust-native-libgcc — a tree holding `libgcc_s.so.1`.
+    /// The dir under gcc-x86-64-stage2 holding `libgcc_s.so.1` (found recursively).
     libgcc_dir: PathBuf,
-    /// rust-native-libz — a tree holding `libz.so.1.*`.
+    /// zlib-x86-64 (staged lib) — holds `libz.so.1.*`.
     libz_dir: PathBuf,
     /// `<glibc>/lib/ld-linux-x86-64.so.2` — the /td/store loader rustc/cargo relink onto.
     glibc_interp: String,
@@ -267,17 +275,131 @@ impl RustInputs {
                 .map(PathBuf::from)
                 .ok_or_else(|| format!("rust-toolchain: lock is missing the `{name}' input (needed by the transform)"))
         };
-        let glibc = pick("rust-native-glibc")?;
+        // #410: inputs resolved BY RECIPE NAME to their staged install prefixes — the
+        // recipe-graph model (glibc/libgcc/libz are the rungs build-plan --auto chained).
+        let glibc = pick("glibc-x86-64")?.join(GLIBC_X86_64_STAGE);
+        let gcc = pick("gcc-x86-64-stage2")?.join(GCC_X86_64_STAGE);
+        let libgcc = find_file(&gcc, "libgcc_s.so.1").ok_or_else(|| {
+            format!("rust-toolchain: no libgcc_s.so.1 under the gcc-x86-64-stage2 input {}", gcc.display())
+        })?;
+        let libgcc_dir = libgcc
+            .parent()
+            .ok_or("rust-toolchain: libgcc_s.so.1 has no parent dir")?
+            .to_path_buf();
+        let libz_dir = pick("zlib-x86-64")?.join(ZLIB_X86_64_LIB);
         let glibc_interp = format!("{}/lib/ld-linux-x86-64.so.2", glibc.display());
+        // unpack the pinned release tarball IN-SANDBOX (TD_SRC is the raw .tar.gz — the
+        // recipe's .source()) with the declared tar/gzip inputs, as ladder::unpack_into does.
+        let tarball = PathBuf::from(g("TD_SRC")?);
+        let extract = mktemp_dir("td-rust-src")?;
+        unpack_rust_release(&map, &tarball, &extract)?;
         Ok(RustInputs {
-            src: PathBuf::from(g("TD_SRC")?),
+            src: extract,
             glibc,
-            libgcc_dir: pick("rust-native-libgcc")?,
-            libz_dir: pick("rust-native-libz")?,
+            libgcc_dir,
+            libz_dir,
             glibc_interp,
             out: PathBuf::from(g("out")?),
         })
     }
+}
+
+/// Unpack the pinned Rust release `.tar.gz` into `dest` (top-level dir stripped) using the
+/// declared tar/gzip inputs (resolved from TD_INPUT_MAP by name) — no host PATH dependency,
+/// mirroring `untar`'s Xz pipe form: `gzip -dc TARBALL | tar -xf - --strip-components=1`.
+fn unpack_rust_release(map: &crate::json::Json, tarball: &Path, dest: &Path) -> Result<(), String> {
+    let pick_bin = |name: &str, bin: &str| -> Result<PathBuf, String> {
+        map.get(name)
+            .and_then(crate::json::Json::as_str)
+            .map(|p| Path::new(p).join("bin").join(bin))
+            .ok_or_else(|| format!("rust-toolchain: lock is missing the `{name}' input (needed to unpack the release tarball in-sandbox)"))
+    };
+    let tar = pick_bin("tar", "tar")?;
+    let gzip = pick_bin("gzip", "gzip")?;
+    fs::create_dir_all(dest).map_err(ioerr("mkdir rust src dest"))?;
+    let what = format!("unpack {}", tarball.display());
+    // The release is the COMBINED installer tarball (rustc + cargo + rust-std + docs + rustfmt +
+    // clippy + rls + analysis + …); assemble_rust_tree consumes ONLY rustc/, cargo/, and
+    // rust-std-<triple>/. Extract just those top-level dirs (tar extracts a named directory
+    // recursively) to avoid writing ~1 GB of unused components — as the retired shell path's
+    // selective member extraction did. Derive the single top-level dir from the first archive entry.
+    let top = gz_tar_top(&gzip, &tar, tarball)?;
+    let members = [
+        format!("{top}/rustc"),
+        format!("{top}/cargo"),
+        format!("{top}/rust-std-x86_64-unknown-linux-gnu"),
+    ];
+    let mut dec = Command::new(&gzip)
+        .arg("-dc")
+        .arg(tarball)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{what}: spawn gzip: {e}"))?;
+    let stdout = dec.stdout.take().ok_or_else(|| format!("{what}: gzip produced no stdout"))?;
+    let mut tarc = Command::new(&tar);
+    tarc.arg("-xf").arg("-").arg("--strip-components=1").arg("-C").arg(dest);
+    for m in &members {
+        tarc.arg(m);
+    }
+    // GNU tar reads to EOF selecting the named members (no --occurrence), so gzip decompresses
+    // the whole stream and exits 0 on a good archive; a corrupt/truncated .tar.gz makes gzip fail
+    // while tar can still exit 0 on the partial stream, so check BOTH (as untar's Xz path does).
+    let status = tarc
+        .stdin(Stdio::from(stdout))
+        .status()
+        .map_err(|e| format!("{what}: spawn tar: {e}"))?;
+    let dec_status = dec.wait().map_err(|e| format!("{what}: wait gzip: {e}"))?;
+    if !status.success() {
+        return Err(format!("{what}: tar failed"));
+    }
+    if !dec_status.success() {
+        return Err(format!("{what}: gzip decompression failed"));
+    }
+    // Guard the selection: every consumed member must have landed (a layout drift would else
+    // surface three rungs later as a confusing "cp rustc" copy error).
+    for sub in ["rustc/bin/rustc", "cargo/bin/cargo"] {
+        if !dest.join(sub).exists() {
+            return Err(format!("{what}: extracted release is missing {sub} (top dir `{top}'?)"));
+        }
+    }
+    Ok(())
+}
+
+/// The single top-level directory name inside the gz tarball (e.g.
+/// `rust-1.96.0-x86_64-unknown-linux-gnu`), read from its FIRST entry (stop after one line — no
+/// full-archive decompress). Used to name the members `unpack_rust_release` selectively extracts.
+fn gz_tar_top(gzip: &Path, tar: &Path, tarball: &Path) -> Result<String, String> {
+    let mut dec = Command::new(gzip)
+        .arg("-dc")
+        .arg(tarball)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("list {}: spawn gzip: {e}", tarball.display()))?;
+    let gout = dec.stdout.take().ok_or("list: gzip produced no stdout")?;
+    let mut tarc = Command::new(tar)
+        .arg("-tf")
+        .arg("-")
+        .stdin(Stdio::from(gout))
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("list: spawn tar: {e}"))?;
+    let tout = tarc.stdout.take().ok_or("list: tar produced no stdout")?;
+    let mut first = String::new();
+    io::BufReader::new(tout)
+        .read_line(&mut first)
+        .map_err(|e| format!("list: read tar listing: {e}"))?;
+    // Stop early: reap both children (tar/gzip get SIGPIPE once we drop the read side — expected).
+    let _ = tarc.kill();
+    let _ = tarc.wait();
+    let _ = dec.kill();
+    let _ = dec.wait();
+    let top = first
+        .trim_end_matches(['\n', '\r'])
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("list: no top-level dir in {}", tarball.display()))?;
+    Ok(top.to_string())
 }
 
 /// `rust-toolchain-build` phase runner (#380): assemble + relink the /td/store rust tree
@@ -335,7 +457,7 @@ fn assemble_rust_tree(inp: &RustInputs) -> Result<(), String> {
     copy_deref(&inp.libgcc_dir.join("libgcc_s.so.1"), &tree.join("lib/libgcc_s.so.1"))?;
     symlink_force("libgcc_s.so.1", &tree.join("lib/libgcc_s.so"))?;
     let libz = glob_first_in(&inp.libz_dir, "libz.so.1", "").ok_or_else(|| {
-        format!("rust-toolchain: no libz.so.1* under the rust-native-libz input {}", inp.libz_dir.display())
+        format!("rust-toolchain: no libz.so.1* under the zlib-x86-64 input {}", inp.libz_dir.display())
     })?;
     copy_deref(&libz, &tree.join("lib/libz.so.1"))?;
     make_writable(tree).map_err(ioerr("chmod tree"))?;
@@ -967,22 +1089,39 @@ fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Find the first file named `name` anywhere under `root`.
+/// Find the first file named `name` anywhere under `root`, DETERMINISTICALLY: at each
+/// directory level the immediate files are checked in sorted order, then the subdirectories are
+/// recursed in sorted order (a files-first depth-first search). An unreadable subdirectory is
+/// SKIPPED, not fatal — so one bad dir cannot mask a match elsewhere in the tree (a `.ok()?` in
+/// the loop would abort the whole search). Determinism matters: the rust-toolchain transform
+/// co-locates the libgcc_s.so.1 this returns, so a filesystem-order pick would make the relinked
+/// tree non-reproducible when a gcc install ships more than one copy.
 fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let rd = fs::read_dir(&d).ok()?;
-        for e in rd.flatten() {
-            let ft = match e.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let p = e.path();
-            if ft.is_dir() {
-                stack.push(p);
-            } else if ft.is_file() && e.file_name() == OsStr::new(name) {
-                return Some(p);
-            }
+    let rd = fs::read_dir(root).ok()?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for e in rd.flatten() {
+        let ft = match e.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
+            dirs.push(e.path());
+        } else if ft.is_file() {
+            files.push(e.path());
+        }
+    }
+    files.sort();
+    if let Some(hit) = files
+        .into_iter()
+        .find(|p| p.file_name() == Some(OsStr::new(name)))
+    {
+        return Some(hit);
+    }
+    dirs.sort();
+    for d in dirs {
+        if let Some(hit) = find_file(&d, name) {
+            return Some(hit);
         }
     }
     None
@@ -1105,6 +1244,42 @@ mod tests {
         mk_native_static_wrapper(Path::new("/xg/gcc"), Path::new("/gl"), &dst, None).expect("write");
         let body = fs::read_to_string(&dst).expect("read");
         assert!(!body.contains("-idirafter"), "unexpected -idirafter:\n{body}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_file_returns_deterministic_recursive_match() {
+        let d = tmp("td-xn-test-find");
+        // libgcc_s.so.1 nested under a gcc-style tree; a decoy dir sorts earlier.
+        fs::create_dir_all(d.join("aaa/decoy")).unwrap();
+        fs::create_dir_all(d.join("lib/gcc/x86_64-pc-linux-gnu/14.3.0")).unwrap();
+        fs::write(d.join("lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc_s.so.1"), b"x").unwrap();
+        let hit = find_file(&d, "libgcc_s.so.1").expect("found libgcc");
+        assert!(
+            hit.ends_with("lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc_s.so.1"),
+            "hit: {}",
+            hit.display()
+        );
+        // absent name → None (the transform's "no libgcc_s.so.1 under …" red).
+        assert!(find_file(&d, "libz.so.1.3.1").is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_file_picks_sorted_first_on_multiple_matches() {
+        // Two copies (as a multilib gcc install can ship): the files-first sorted DFS must pick
+        // a STABLE one every run, else the co-located libgcc makes the relinked tree non-repro.
+        let d = tmp("td-xn-test-find2");
+        fs::create_dir_all(d.join("zdir")).unwrap();
+        fs::create_dir_all(d.join("adir")).unwrap();
+        fs::write(d.join("zdir/libgcc_s.so.1"), b"x").unwrap();
+        fs::write(d.join("adir/libgcc_s.so.1"), b"x").unwrap();
+        let hit = find_file(&d, "libgcc_s.so.1").expect("found");
+        assert!(
+            hit.ends_with("adir/libgcc_s.so.1"),
+            "expected the sorted-first (adir) match, got {}",
+            hit.display()
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
