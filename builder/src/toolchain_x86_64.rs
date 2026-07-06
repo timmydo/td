@@ -30,6 +30,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::io::BufRead;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -355,6 +356,17 @@ fn unpack_rust_release(map: &crate::json::Json, tarball: &Path, dest: &Path) -> 
     let gzip = pick_bin("gzip", "gzip")?;
     fs::create_dir_all(dest).map_err(ioerr("mkdir rust src dest"))?;
     let what = format!("unpack {}", tarball.display());
+    // The release is the COMBINED installer tarball (rustc + cargo + rust-std + docs + rustfmt +
+    // clippy + rls + analysis + …); assemble_rust_tree consumes ONLY rustc/, cargo/, and
+    // rust-std-<triple>/. Extract just those top-level dirs (tar extracts a named directory
+    // recursively) to avoid writing ~1 GB of unused components — as the retired shell path's
+    // selective member extraction did. Derive the single top-level dir from the first archive entry.
+    let top = gz_tar_top(&gzip, &tar, tarball)?;
+    let members = [
+        format!("{top}/rustc"),
+        format!("{top}/cargo"),
+        format!("{top}/rust-std-x86_64-unknown-linux-gnu"),
+    ];
     let mut dec = Command::new(&gzip)
         .arg("-dc")
         .arg(tarball)
@@ -362,17 +374,18 @@ fn unpack_rust_release(map: &crate::json::Json, tarball: &Path, dest: &Path) -> 
         .spawn()
         .map_err(|e| format!("{what}: spawn gzip: {e}"))?;
     let stdout = dec.stdout.take().ok_or_else(|| format!("{what}: gzip produced no stdout"))?;
-    let status = Command::new(&tar)
-        .arg("-xf")
-        .arg("-")
-        .arg("--strip-components=1")
-        .arg("-C")
-        .arg(dest)
+    let mut tarc = Command::new(&tar);
+    tarc.arg("-xf").arg("-").arg("--strip-components=1").arg("-C").arg(dest);
+    for m in &members {
+        tarc.arg(m);
+    }
+    // GNU tar reads to EOF selecting the named members (no --occurrence), so gzip decompresses
+    // the whole stream and exits 0 on a good archive; a corrupt/truncated .tar.gz makes gzip fail
+    // while tar can still exit 0 on the partial stream, so check BOTH (as untar's Xz path does).
+    let status = tarc
         .stdin(Stdio::from(stdout))
         .status()
         .map_err(|e| format!("{what}: spawn tar: {e}"))?;
-    // Reap gzip + surface its exit: a corrupt/truncated .tar.gz makes gzip fail while tar can
-    // still exit 0 on the partial stream, so check BOTH (as untar's Xz path does).
     let dec_status = dec.wait().map_err(|e| format!("{what}: wait gzip: {e}"))?;
     if !status.success() {
         return Err(format!("{what}: tar failed"));
@@ -380,7 +393,51 @@ fn unpack_rust_release(map: &crate::json::Json, tarball: &Path, dest: &Path) -> 
     if !dec_status.success() {
         return Err(format!("{what}: gzip decompression failed"));
     }
+    // Guard the selection: every consumed member must have landed (a layout drift would else
+    // surface three rungs later as a confusing "cp rustc" copy error).
+    for sub in ["rustc/bin/rustc", "cargo/bin/cargo"] {
+        if !dest.join(sub).exists() {
+            return Err(format!("{what}: extracted release is missing {sub} (top dir `{top}'?)"));
+        }
+    }
     Ok(())
+}
+
+/// The single top-level directory name inside the gz tarball (e.g.
+/// `rust-1.96.0-x86_64-unknown-linux-gnu`), read from its FIRST entry (stop after one line — no
+/// full-archive decompress). Used to name the members `unpack_rust_release` selectively extracts.
+fn gz_tar_top(gzip: &Path, tar: &Path, tarball: &Path) -> Result<String, String> {
+    let mut dec = Command::new(gzip)
+        .arg("-dc")
+        .arg(tarball)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("list {}: spawn gzip: {e}", tarball.display()))?;
+    let gout = dec.stdout.take().ok_or("list: gzip produced no stdout")?;
+    let mut tarc = Command::new(tar)
+        .arg("-tf")
+        .arg("-")
+        .stdin(Stdio::from(gout))
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("list: spawn tar: {e}"))?;
+    let tout = tarc.stdout.take().ok_or("list: tar produced no stdout")?;
+    let mut first = String::new();
+    io::BufReader::new(tout)
+        .read_line(&mut first)
+        .map_err(|e| format!("list: read tar listing: {e}"))?;
+    // Stop early: reap both children (tar/gzip get SIGPIPE once we drop the read side — expected).
+    let _ = tarc.kill();
+    let _ = tarc.wait();
+    let _ = dec.kill();
+    let _ = dec.wait();
+    let top = first
+        .trim_end_matches(['\n', '\r'])
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("list: no top-level dir in {}", tarball.display()))?;
+    Ok(top.to_string())
 }
 
 /// `rust-toolchain-build` phase runner (#380): assemble + relink the /td/store rust tree
@@ -438,7 +495,7 @@ fn assemble_rust_tree(inp: &RustInputs) -> Result<(), String> {
     copy_deref(&inp.libgcc_dir.join("libgcc_s.so.1"), &tree.join("lib/libgcc_s.so.1"))?;
     symlink_force("libgcc_s.so.1", &tree.join("lib/libgcc_s.so"))?;
     let libz = glob_first_in(&inp.libz_dir, "libz.so.1", "").ok_or_else(|| {
-        format!("rust-toolchain: no libz.so.1* under the rust-native-libz input {}", inp.libz_dir.display())
+        format!("rust-toolchain: no libz.so.1* under the zlib-x86-64 input {}", inp.libz_dir.display())
     })?;
     copy_deref(&libz, &tree.join("lib/libz.so.1"))?;
     make_writable(tree).map_err(ioerr("chmod tree"))?;
@@ -1070,22 +1127,39 @@ fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Find the first file named `name` anywhere under `root`.
+/// Find the first file named `name` anywhere under `root`, DETERMINISTICALLY: at each
+/// directory level the immediate files are checked in sorted order, then the subdirectories are
+/// recursed in sorted order (a files-first depth-first search). An unreadable subdirectory is
+/// SKIPPED, not fatal — so one bad dir cannot mask a match elsewhere in the tree (a `.ok()?` in
+/// the loop would abort the whole search). Determinism matters: the rust-toolchain transform
+/// co-locates the libgcc_s.so.1 this returns, so a filesystem-order pick would make the relinked
+/// tree non-reproducible when a gcc install ships more than one copy.
 fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let rd = fs::read_dir(&d).ok()?;
-        for e in rd.flatten() {
-            let ft = match e.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let p = e.path();
-            if ft.is_dir() {
-                stack.push(p);
-            } else if ft.is_file() && e.file_name() == OsStr::new(name) {
-                return Some(p);
-            }
+    let rd = fs::read_dir(root).ok()?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for e in rd.flatten() {
+        let ft = match e.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
+            dirs.push(e.path());
+        } else if ft.is_file() {
+            files.push(e.path());
+        }
+    }
+    files.sort();
+    if let Some(hit) = files
+        .into_iter()
+        .find(|p| p.file_name() == Some(OsStr::new(name)))
+    {
+        return Some(hit);
+    }
+    dirs.sort();
+    for d in dirs {
+        if let Some(hit) = find_file(&d, name) {
+            return Some(hit);
         }
     }
     None
@@ -1226,6 +1300,24 @@ mod tests {
         );
         // absent name → None (the transform's "no libgcc_s.so.1 under …" red).
         assert!(find_file(&d, "libz.so.1.3.1").is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_file_picks_sorted_first_on_multiple_matches() {
+        // Two copies (as a multilib gcc install can ship): the files-first sorted DFS must pick
+        // a STABLE one every run, else the co-located libgcc makes the relinked tree non-repro.
+        let d = tmp("td-xn-test-find2");
+        fs::create_dir_all(d.join("zdir")).unwrap();
+        fs::create_dir_all(d.join("adir")).unwrap();
+        fs::write(d.join("zdir/libgcc_s.so.1"), b"x").unwrap();
+        fs::write(d.join("adir/libgcc_s.so.1"), b"x").unwrap();
+        let hit = find_file(&d, "libgcc_s.so.1").expect("found");
+        assert!(
+            hit.ends_with("adir/libgcc_s.so.1"),
+            "expected the sorted-first (adir) match, got {}",
+            hit.display()
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

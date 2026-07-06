@@ -59,11 +59,15 @@ test -n "${XRUSTTREE:-}" -a -x "$XRUSTTREE/bin/rustc" -a -x "$XRUSTTREE/bin/carg
 case "$XRUSTTREE" in */[a-z0-9]*-rust-toolchain-1.96.0) ;; *) fail "rust-toolchain output is not content-addressed (got $XRUSTTREE)" ;; esac
 echo "   [recipe-graph] build-plan --auto rust-toolchain built the relinked, content-addressed tree at $XRUSTTREE"
 
-# the interned rust deliverable carries NO guix bytes (upstream-release bytes are not guix bytes).
-for b in "$XRUSTTREE/bin/rustc" "$XRUSTTREE/bin/cargo"; do
-  if grep -q -a '/gnu/store' "$b"; then fail "$b contains /gnu/store bytes"; fi
-done
-echo "   [no-guix] the relinked rustc/cargo carry zero /gnu/store bytes"
+# [no-guix] the ENTIRE interned rust deliverable carries zero /gnu/store bytes — a recursive
+# scan of the whole tree (rustc/cargo + libLLVM + librustc_driver + the rustlib sysroot + the
+# co-located libc/libgcc_s/libz), as the retired gate 416 did. This is the north-star "zero guix
+# bytes" leg: the co-located libgcc_s/libz come from the td-built gcc-x86-64-stage2 / zlib-x86-64
+# rungs, and libLLVM/rustlib from the upstream-not-guix release — none may embed a /gnu/store path.
+if grep -r -a -q '/gnu/store' "$XRUSTTREE" 2>/dev/null; then
+  fail "the interned rust tree contains /gnu/store bytes: $(grep -r -a -l '/gnu/store' "$XRUSTTREE" 2>/dev/null | head -1)"
+fi
+echo "   [no-guix] the whole relinked rust deliverable (rustc/cargo/libLLVM/rustlib + co-located libc/libgcc_s/libz) carries zero /gnu/store bytes"
 
 # --- [behavioral] rustc + cargo RUN from /td/store in a store-ns own-root, /gnu/store ABSENT ---
 snwork=$(mktemp -d)
