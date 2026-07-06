@@ -16,8 +16,9 @@
 //! ELF64 native gcc/as/ld), no-guix (interned rust+native-gcc+glibc /gnu/store-free), structural (interp ∈
 //! /td/store; complete lib closure + rustlib sysroot), behavioral (rustc RUNS, COMPILES, output RUNS).
 //! HEAVY (native gcc build ~45 min; from-seed adds the ~98-min cross build). NOT a BUILD_GATE. The cross
-//! rungs live in tests/x86_64-cross-fns.sh; the native binutils/gcc BUILD is the Rust recipe `td-builder
-//! toolchain-recipe x86_64-native` (builder/src/toolchain_x86_64.rs); the fetch short-circuit in tests/x86_64-subst-lib.sh.
+//! rungs live in tests/x86_64-cross-fns.sh; the native binutils/gcc BUILD is the recipe ladder
+//! `binutils-x86-64-native` -> `gcc-x86-64-native` (recipes/src/recipes/, via run_x86_64_native); the
+//! fetch short-circuit in tests/x86_64-subst-lib.sh.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 

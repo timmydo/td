@@ -1005,13 +1005,23 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("bootstrap-x86_64-self-gcc-store-native");
         return;
     }
+    // The NATIVE x86_64 toolchain's input-addressed key file: consumed by the native gcc gate (422,
+    // builds+interns the native toolchain at these lock paths), the self-host gate (426, obtains the
+    // native toolchain as its builder), and the rust runtime gate (416, fetches it as the linker) —
+    // all Daily/system tier, deferred to the daily backstop. (A recipe-rev bump here re-keys the path.)
+    if pattern_matches("tests/td-toolchain-x86_64-native.lock", p) {
+        sel.add_target("bootstrap-x86_64-native-gcc-store-native");
+        sel.add_target("bootstrap-x86_64-self-gcc-store-native");
+        sel.add_target("rust-x86_64-runtime-store-native");
+        return;
+    }
     if pattern_matches(
         "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|builder/src/gate_defs/414-bootstrap-x86_64-toolchain-store-native.rs",
         p,
     ) {
         sel.add_preflight("shell-syntax");
         add_chain(sel, 28, 29);
-        // x86_64-cross-fns.sh also defines the rung-X2 native rungs (build_*_x86_64_native), the shared
+        // x86_64-cross-fns.sh also defines the rung-X2 native driver (run_x86_64_native), the shared
         // fetch-or-build obtainers, and the rung-X3 self-host fns — so a change to it must re-run the
         // native gcc gate AND the self-host gate, not only the cross toolchain gate.
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");

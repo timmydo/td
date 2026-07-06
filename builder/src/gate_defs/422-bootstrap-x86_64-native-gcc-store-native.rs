@@ -13,8 +13,9 @@
 //! /gnu/store). The NATIVE gcc is ALWAYS BUILT (never fetched); only its cross-toolchain prerequisite may
 //! be fetched. HEAVY (the native gcc build is ~45 min; from-seed adds the ~98-min cross build). NOT a
 //! BUILD_GATE. The cross rungs + own-root verify live in tests/x86_64-cross-fns.sh; the native
-//! binutils/gcc BUILD is the structured Rust recipe `td-builder toolchain-recipe x86_64-native`
-//! (builder/src/toolchain_x86_64.rs) — the former build_{binutils,gcc}_x86_64_native shell drivers.
+//! binutils/gcc BUILD is the recipe ladder `binutils-x86-64-native` -> `gcc-x86-64-native`
+//! (recipes/src/recipes/, driven by build-plan --auto via run_x86_64_native) — the retirement of the
+//! former `td-builder toolchain-recipe x86_64-native` imperative Rust path.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
