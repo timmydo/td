@@ -5565,12 +5565,10 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // td-builder shell — td's own `guix shell` (NOT a container; the default,
-        // non-`-C` form): resolve the named packages, compose the command's PATH
-        // from their outputs, run it. Resolution stays on the guix package oracle
-        // for v1; the env composition + exec are td's own (see run_shell). The
-        // durable assertion is behavioral — the command actually runs with the
-        // package on PATH. Usage:
+        // td-builder shell — td's own package shell (NOT a container): resolve
+        // the named recipes, build them with td, compose the command's PATH from
+        // their outputs, and run it. The durable assertion is behavioral — the
+        // command actually runs with the package on PATH. Usage:
         //   shell PKG... [-- CMD ARGS...]
         Some("shell") => match run_shell(&args[2..]) {
             Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),

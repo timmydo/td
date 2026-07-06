@@ -589,13 +589,13 @@ fn store_add(root: &Path) -> Result<(), String> {
         tb_out(&tb, &["store-add-text", name, &content_s, &store_s, &tddb_s], "td store-add-text")?;
     let content_bytes = std::fs::read(&content)
         .map_err(|e| format!("FAIL: read {}: {e}", content.display()))?;
-    let expected_path = crate::store::make_text_path(name, &content_bytes, &[]);
+    let expected_path = "/gnu/store/7xminwvw4fidpj31znmzg16n6f2fhqns-td-store-add-probe";
     if td_path != expected_path {
         return Err(format!(
-            "FAIL: td computed {td_path} != its own make_text_path result {expected_path}"
+            "FAIL: td computed {td_path} != the fixed addTextToStore known vector {expected_path}"
         ));
     }
-    println!("   td computed the expected addTextToStore path itself");
+    println!("   td computed the fixed addTextToStore known-vector path");
 
     let base = base_of(&td_path);
     let td_file = store.join(&base);
