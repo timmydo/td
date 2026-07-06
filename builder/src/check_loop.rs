@@ -1118,7 +1118,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Some(key) => child_envs.push((s("TD_CHECK_TREE"), key)),
         None if resume => {
             return Err(fatal(
-                "--resume needs a git working tree to key the verdict journal, and                  `git` failed here — cannot prove the tree is unchanged, refusing to skip",
+                "--resume needs a git working tree to key the verdict journal, and `git` failed here — cannot prove the tree is unchanged, refusing to skip",
             ))
         }
         None => {}

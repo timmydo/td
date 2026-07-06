@@ -1335,7 +1335,7 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
             }
             if skipped > 0 {
                 println!(
-                    "[gate-run] resume: {skipped} gate(s) skipped from the verdict journal                      (key {key}); any tree change invalidates the whole journal"
+                    "[gate-run] resume: {skipped} gate(s) skipped from the verdict journal (key {key}); any tree change invalidates the whole journal"
                 );
             }
         }
@@ -1716,14 +1716,14 @@ pub fn cli(args: &[String]) -> ExitCode {
         .unwrap_or(8192);
     if gate_mem_mib > 0 && !prlimit_available() {
         eprintln!(
-            "gate-run: no `prlimit` on PATH — running WITHOUT the per-gate memory              backstop (TD_CHECK_GATE_MEM_MIB={gate_mem_mib} requested)"
+            "gate-run: no `prlimit` on PATH — running WITHOUT the per-gate memory backstop (TD_CHECK_GATE_MEM_MIB={gate_mem_mib} requested)"
         );
         gate_mem_mib = 0;
     }
     let tree_key = std::env::var("TD_CHECK_TREE").ok().filter(|k| !k.is_empty());
     if resume && tree_key.is_none() {
         eprintln!(
-            "gate-run: --resume needs the TD_CHECK_TREE key (td-builder check computes it              from git); refusing to guess — running everything"
+            "gate-run: --resume needs the TD_CHECK_TREE key (td-builder check computes it from git); refusing to guess — running everything"
         );
         resume = false;
     }
