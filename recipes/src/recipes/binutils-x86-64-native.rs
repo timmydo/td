@@ -111,6 +111,25 @@ pub fn recipe() -> Recipe {
         ],
         exec: true,
     });
+    // [native-arch] the produced `as` is itself an ELF64 x86_64 binary (a NATIVE
+    // assembler, not the i686 cross), asserted by the freshly built native readelf —
+    // the readelf_is_elf64(as) check the retired build_binutils_x86_64 ran. Catch a
+    // wrong-arch `as` HERE, at the rung that produced it, not indirectly at the
+    // downstream gcc-x86-64-native link. The static native readelf runs on the x86_64
+    // kernel (the same host the native gcc runs on).
+    steps.push(
+        Step::run(
+            "{out}",
+            &[
+                SH,
+                "-c",
+                "h=$('{out}/bin/readelf' -h '{out}/bin/as'); \
+                 printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || { echo 'native binutils as is not ELF64' >&2; exit 1; }; \
+                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'native binutils as is not x86-64' >&2; exit 1; }",
+            ],
+        )
+        .env("PATH", &base_path()),
+    );
     Recipe::mesboot("binutils-x86-64-native", "2.44")
         .native_inputs(&["gcc-x86-64-stage2", "binutils-x86-64", "glibc-x86-64"])
         .inputs_owned(base_inputs(&[

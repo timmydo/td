@@ -17,10 +17,13 @@
 //! outputs (content-addressed, or at their lock-keyed paths), running the own-root
 //! behavioral verify, and `subst-export`ing them — those are generic `td-builder`
 //! subcommands, not ad-hoc build logic. (The X3 gate adds a `[codegen]` agreement leg
-//! in shell: the input native gcc and the self-rebuilt gcc must emit byte-identical
-//! `-O2 -S` assembly — the same-flags premise holds because both flavors run THIS
-//! module's one configure line, differing only in the `--prefix` suffix and the
-//! `--with-as`/`--with-ld` paths, which live in the driver, not in cc1's code gen.)
+//! in shell: the INPUT native gcc — now built by the `gcc-x86-64-native` recipe (rung
+//! X2) — and the self-rebuilt gcc (this module's `build_gcc_x86_64`, rung X3) must emit
+//! byte-identical `-O2 -S` assembly. That fixpoint SILENTLY DEPENDS on the two builds
+//! sharing every code-gen-affecting configure flag: `gcc-x86-64-native.rs`'s configure
+//! line and `build_gcc_x86_64` below must stay in lockstep (they differ only in the
+//! `--prefix` suffix and the `--with-as`/`--with-ld` paths, which don't affect cc1's
+//! code gen). Change one, change the other, or the X3 `[codegen]` leg reds.)
 //!
 //! Inputs (the builder toolchain + pinned sources) are passed by the caller — the gate
 //! has them as shell vars (fetched from the substitute closure or built from seed). The

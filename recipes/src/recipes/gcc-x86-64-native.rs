@@ -1,4 +1,4 @@
-use crate::ladder::{base_inputs, base_path, sed_i, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0, NATIVE x86_64 (x86_64-toolchain rung X2, the port of the shell
@@ -60,15 +60,24 @@ pub fn recipe() -> Recipe {
     // relocate glibc's GNU ld scripts to bare names (ld finds the members via -B):
     // libc.so/libm.so AND libm.a — a fully-static host link pulls libm.a, whose
     // GROUP script else points at the absolute /td/store configure prefix (which
-    // is not the input-addressed store path here). Same move as glibc-x86-64/glibc-241.
-    steps.push(sed_i(
-        "s,/td/store/glibc-2.41-x86_64/lib/,,g",
-        &[
-            "{root}/sysroot/lib/libc.so",
-            "{root}/sysroot/lib/libm.so",
-            "{root}/sysroot/lib/libm.a",
-        ],
-    ));
+    // is not the input-addressed store path here). GUARDED (existence + first-80-bytes
+    // "GNU ld script"), mirroring the ported Rust relocate_ld_scripts, so a pin where a
+    // name is absent or a real binary archive is skipped rather than errored/corrupted
+    // (re #401, the general glob+guard for the glibc-x86-64/glibc-241 recipes too).
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                "for f in libc.so libm.so libm.a; do p={root}/sysroot/lib/$f; \
+                 [ -f \"$p\" ] || continue; \
+                 head -c 80 \"$p\" | grep -q 'GNU ld script' || continue; \
+                 sed -i 's,/td/store/glibc-2.41-x86_64/lib/,,g' \"$p\"; done",
+            ],
+        )
+        .env("PATH", &base_path()),
+    );
     // -shared-aware STATIC wrappers (port of _mk_native_static_wrapper): -static for
     // executables/conftests, DROPPED when the link is -shared; -idirafter (not
     // -isystem) so libstdc++'s <cstdlib> #include_next resolves after gcc's own C++

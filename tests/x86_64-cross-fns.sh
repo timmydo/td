@@ -242,8 +242,9 @@ run_x86_64_native() {
   # absent; ensure it here so build-plan can emit the rung recipes.
   command -v load_recipe_eval >/dev/null 2>&1 || . tests/cache-lib.sh
   load_recipe_eval 2>/dev/null || {
-    sh tests/recipe-eval-tool.sh "$ROOT/.td-build-cache/recipe-eval" >/dev/null || fail "could not build td-recipe-eval (tests/recipe-eval-tool.sh)"
-    load_recipe_eval || fail "no td-recipe-eval sentinel after recipe-eval-tool"
+    sh tests/recipe-eval-tool.sh "$ROOT/.td-build-cache/recipe-eval" >/dev/null \
+      || { echo "run_x86_64_native: could not build td-recipe-eval (tests/recipe-eval-tool.sh)" >&2; return 1; }
+    load_recipe_eval || { echo "run_x86_64_native: no td-recipe-eval sentinel after recipe-eval-tool" >&2; return 1; }
   }
   . tests/ladder-lib.sh
   TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
