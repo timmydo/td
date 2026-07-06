@@ -171,10 +171,11 @@ env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
   TD_SEED_STORE="$WSTORE" TD_SEED_DB="$WDB" TD_EXTRA_DBS="$bgdb:$btdb" \
   "$TB" build-recipe "$b8/sed.json" "$newlock" "$b8/sb" "$WDB" >"$b8/sb.out" 2>"$b8/sb.err" \
-  || { tail -80 "$b8/sb.err" >&2; fail "brick8: build-recipe sed with the /td/store toolchain"; }
-  # ^ 80 (was 25) so the whole config.log tail the engine now appends on a configure
-  #   failure lands in the gate log — #366's socklen_t flake was undiagnosable because
-  #   the conftest cause (a compiler killed under memory pressure) was never captured.
+  || { tail -160 "$b8/sb.err" >&2; fail "brick8: build-recipe sed with the /td/store toolchain"; }
+  # ^ 160 (was 25) so the whole config.log conftest-section tail the engine now appends
+  #   on a configure failure lands in the gate log — #366's socklen_t flake was
+  #   undiagnosable because the conftest cause (a compiler killed under memory pressure)
+  #   was never captured (autoconf logs it to config.log, not the terminal).
 o=`sed -n 's/^OUT=out //p' "$b8/sb.out"`; test -n "$o" || fail "brick8: sed produced no output"
 sdir="$b8/sb/newstore/`basename "$o"`"; sbin="$sdir/bin/sed"; test -x "$sbin" || fail "brick8: no sed binary"
 # (a) the /td/store toolchain linked it: interp is the /td/store glibc 2.41.

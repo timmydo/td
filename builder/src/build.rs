@@ -973,9 +973,19 @@ fn find_config_logs(root: &Path, max: usize) -> Vec<PathBuf> {
 /// `TAIL_LINES` lines each — so a tree of sub-configures cannot flood the log.
 /// Best-effort: an unreadable or absent log is skipped, never an error (this runs
 /// on an already-failing path, so it must not mask the real failure with its own).
+///
+/// Crucially, the tail is taken from the conftest section, NOT the raw file end:
+/// autoconf's EXIT trap appends a large debug dump on ANY exit (the
+/// `## Cache variables ##` / `## Output variables ##` / `## confdefs.h ##`
+/// sections — hundreds of lines of cache assignments and `#define`s; a real
+/// config.log measured 2266 lines with that dump running from line 1937 to EOF).
+/// A blind file tail would show only that `#define` noise. So the window is cut at
+/// the first dump marker: the failing conftest — the actual #366 evidence — is the
+/// last thing before it. A configure KILLED before its trap ran has no marker, so
+/// the whole file is used (the failure is then at its very end).
 fn configure_log_tails(srcdir: &Path) -> String {
     const MAX_LOGS: usize = 4;
-    const TAIL_LINES: usize = 40;
+    const TAIL_LINES: usize = 80;
     let mut out = String::new();
     for log in find_config_logs(srcdir, MAX_LOGS) {
         let body = match fs::read(&log) {
@@ -984,11 +994,18 @@ fn configure_log_tails(srcdir: &Path) -> String {
         };
         let text = String::from_utf8_lossy(&body);
         let lines: Vec<&str> = text.lines().collect();
-        let shown = TAIL_LINES.min(lines.len());
-        let start = lines.len().saturating_sub(TAIL_LINES);
-        let tail = lines.get(start..).unwrap_or(&[]).join("\n");
+        // Cut at the first line of autoconf's trailing debug dump; everything
+        // above it is the useful conftest section. No marker ⇒ use the whole file.
+        let cut = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("## Cache variables"))
+            .unwrap_or(lines.len());
+        let region = lines.get(..cut).unwrap_or(lines.as_slice());
+        let shown = TAIL_LINES.min(region.len());
+        let start = region.len().saturating_sub(TAIL_LINES);
+        let tail = region.get(start..).unwrap_or(&[]).join("\n");
         out.push_str(&format!(
-            "\n--- tail of {} (last {shown} lines — autoconf logs conftest failures here, not on the terminal) ---\n{tail}\n",
+            "\n--- {} — {shown} lines of the conftest section (autoconf's trailing cache/confdefs dump trimmed); the compile failure is logged here, not on the terminal ---\n{tail}\n",
             log.display(),
         ));
     }
@@ -2266,9 +2283,14 @@ mod tests {
         let srcdir = base.join("sed-4.9");
         fs::create_dir_all(srcdir.join("lib")).unwrap();
 
-        // A realistic top-level config.log: an ancient sentinel the tail MUST
-        // drop, a long filler stretch, then the exact conftest failure a
-        // compiler killed under memory pressure produces (the #366 symptom).
+        // A realistic top-level config.log with the SHAPE a real one has: an
+        // ancient sentinel the tail must drop, a long filler stretch, the exact
+        // conftest failure a compiler killed under memory pressure produces (the
+        // #366 symptom), then — critically — autoconf's EXIT-trap debug dump
+        // (`## Cache variables ##` … `## confdefs.h ##` + hundreds of `#define`s).
+        // That dump is what a naive file-tail would surface INSTEAD of the
+        // failure, so the tail must be cut at the dump marker (the fix the code
+        // review caught: a blind `tail 40` shows only the `#define` spam below).
         let mut top = String::from("ANCIENT-PREAMBLE-SENTINEL must be dropped by the tail\n");
         for i in 0..200 {
             top.push_str(&format!("configure:{i}: checking a harmless earlier probe\n"));
@@ -2278,6 +2300,18 @@ mod tests {
         top.push_str("gcc: fatal error: Killed signal terminated program cc1\n");
         top.push_str("configure:4041: $? = 1\n");
         top.push_str("configure: error: Cannot find a type to use in place of socklen_t\n");
+        // autoconf's trailing debug dump — 300 lines of cache/confdefs noise that
+        // must NOT drown the failure above it.
+        top.push_str("## ---------------- ##\n## Cache variables. ##\n## ---------------- ##\n");
+        for i in 0..120 {
+            top.push_str(&format!("ac_cv_probe_{i}=yes\n"));
+        }
+        top.push_str("## ----------------- ##\n## Output variables. ##\n## ----------------- ##\n");
+        top.push_str("## ----------- ##\n## confdefs.h. ##\n## ----------- ##\n");
+        for i in 0..180 {
+            top.push_str(&format!("#define CONFDEFS_DUMP_SPAM_{i} 1\n"));
+        }
+        top.push_str("configure: exit 1\n");
         fs::write(srcdir.join("config.log"), &top).unwrap();
 
         // A sub-configure (AC_CONFIG_SUBDIRS) log, one level deeper, must ALSO be
@@ -2300,6 +2334,18 @@ mod tests {
         assert!(
             !out.contains("ANCIENT-PREAMBLE-SENTINEL"),
             "lines older than the tail window must be dropped (a tail, not a dump): {out}"
+        );
+        // THE FIX (code-review Finding 1): autoconf's trailing cache/confdefs dump
+        // must be trimmed, NOT surfaced — a blind file tail would show only these
+        // 300 lines of `#define` noise and miss the failure above. This is what
+        // reds against the naive tail-the-whole-file implementation.
+        assert!(
+            !out.contains("CONFDEFS_DUMP_SPAM"),
+            "autoconf's trailing confdefs dump must be trimmed, not surfaced: {out}"
+        );
+        assert!(
+            !out.contains("ac_cv_probe_"),
+            "autoconf's trailing cache-variables dump must be trimmed, not surfaced: {out}"
         );
         // Both logs surface, and the top-level leads the deeper sub-configure's.
         let top_at = out.find("sed-4.9/config.log").expect("top-level log named");
