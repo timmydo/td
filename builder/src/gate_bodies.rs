@@ -25,9 +25,10 @@
 //! gate LOGIC (every assertion) is typed Rust.
 //!
 //! guix-surface note: store_relocate's `/var/guix/db` read + `guix build`
-//! relocation source moved here VERBATIM from tests/store-relocate.sh — the
-//! existing ratcheted surface relocated, not new surface (directive 6). This
-//! file is IN tests/guix-surface.sh's scan scope so the census keeps seeing it.
+//! relocation source moved here VERBATIM from tests/store-relocate.sh — existing
+//! guix reliance relocated, not new surface (directive 6). It shrinks with the
+//! store-relocate migration; the guix-surface census that used to track it was
+//! retired with the guix-oracle gates.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -1511,7 +1512,8 @@ fn store_ns(root: &Path) -> Result<(), String> {
 /// /td/store (size-preserving /td//store rewrite) and run it with /gnu/store
 /// ABSENT. Port of tests/store-relocate.sh (gate 388). guix is only the
 /// one-time relocation SOURCE (`guix build hello` + the /var/guix/db closure
-/// read — the ratcheted surface moved verbatim from the retired shell driver).
+/// read — the last guix reliance in this leg, to shrink out as store-relocate
+/// migrates to a td-built dynamic package).
 fn store_relocate(root: &Path) -> Result<(), String> {
     println!(
         ">> store-relocate: relocate a dynamic package /gnu/store -> /td/store and run it with \

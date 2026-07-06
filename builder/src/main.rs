@@ -6166,66 +6166,12 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // input-resolution: RESOLVE recipe input names -> store paths from a PINNED
-        // lock (one `NAME<whitespace>STORE-PATH` per line, `#` comments allowed) —
-        // the lookup system/td-build.scm does via Guile's `specification->package`
-        // -> `package-derivation` -> output path. Additive equivalence FIRST (the
-        // gate pattern of loop-sandbox/td-check): the `resolve` rung proves
-        // td-builder's lock resolution EQUALS Guile's live resolution (the oracle);
-        // the build is unchanged. The lock is a pinned artifact (regenerated on a
-        // channel bump, like DIGESTS.md); the RESOLVER that computes it stays Guile,
-        // retired package-by-package later (§5: toolchain retired last). Usage:
-        //   resolve LOCKFILE NAME...
-        // Prints one resolved store path per NAME, in order; errors if a NAME is
-        // absent (so a recipe input the pinned lock does not cover fails loudly).
-        Some("resolve") if args.len() >= 4 => {
-            let lockfile = &args[2];
-            let names = &args[3..];
-            let run = || -> Result<Vec<String>, String> {
-                let text =
-                    std::fs::read_to_string(lockfile).map_err(|e| format!("{lockfile}: {e}"))?;
-                let mut map = std::collections::HashMap::new();
-                for (i, line) in text.lines().enumerate() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    let mut it = line.splitn(2, char::is_whitespace);
-                    let name = it.next().unwrap_or_default().trim();
-                    let path = it.next().unwrap_or_default().trim();
-                    if name.is_empty() || path.is_empty() {
-                        return Err(format!("{lockfile}:{}: malformed lock line", i + 1));
-                    }
-                    if map.insert(name.to_string(), path.to_string()).is_some() {
-                        return Err(format!("{lockfile}:{}: duplicate name `{name}'", i + 1));
-                    }
-                }
-                names
-                    .iter()
-                    .map(|n| {
-                        map.get(n)
-                            .cloned()
-                            .ok_or_else(|| format!("name `{n}' not in lock {lockfile}"))
-                    })
-                    .collect()
-            };
-            match run() {
-                Ok(paths) => {
-                    for p in paths {
-                        println!("{p}");
-                    }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: resolve: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        // (the `resolve` subcommand — a Guile-oracle lock resolver — retired with
+        // the guix Guile-lowering gates; native input resolution lives in gate_inputs.rs.)
         // corpus-independence: run AS a derivation's builder, executing the
         // autotools phases in Rust (replaces gnu-build-system). Reads the build
         // environment from env vars (out, TD_SRC, TD_INPUTS, TD_CONFIGURE_FLAGS)
-        // that system/td-build.scm sets on the derivation.
+        // that the td-native derivation contract sets on the derivation.
         Some("autotools-build") if args.len() == 2 => match build::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -6236,7 +6182,7 @@ fn main() -> ExitCode {
         // td's OWN Rust/cargo build system (the cargo-build-system replacement):
         // builds the TD_SRC crate with `cargo build --offline` and installs
         // TD_RUST_BINS into $out/bin. Sibling of autotools-build; same
-        // env-driven derivation-builder contract (system/td-build.scm).
+        // env-driven derivation-builder contract.
         Some("rust-build") if args.len() == 2 => match build::run_rust() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -6247,7 +6193,7 @@ fn main() -> ExitCode {
         // td's OWN cmake build system (the cmake-build-system replacement): runs an
         // out-of-source `cmake` configure -> make -> make install over the TD_SRC
         // tree, installing into $out. Sibling of autotools-build/rust-build; same
-        // env-driven derivation-builder contract (system/td-build.scm).
+        // env-driven derivation-builder contract.
         Some("cmake-build") if args.len() == 2 => match build::run_cmake() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

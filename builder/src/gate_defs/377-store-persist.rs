@@ -9,7 +9,7 @@
 //! path finds sed valid in P (persistent_realization) and SKIPS the build; the sed READ BACK
 //! FROM P runs in the own-root, /gnu/store ABSENT, transforming foo->bar. DURABLE (build-into,
 //! skip/read-back, behavioral). guix only = the one-time seed capture + the seed toolchain
-//! (§5, retired last); the build reads the td-owned seed DB, not /var/guix (guix-surface flat).
+//! (§5, retired last); the build reads the td-owned seed DB, not /var/guix (no new guix surface).
 //! Heavy (the /td/store toolchain from the seed); the build-recipes prelude runs → BUILD_GATES.
 //! 
 //! (Was PARKED between PR #291 and the #292 fix: realize_drv canonicalized every seed-store
