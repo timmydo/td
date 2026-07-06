@@ -38,9 +38,10 @@ lower() {
 }
 
 # --- Maintenance guard: every drv-lowering script in tests/ must be run by
-# the enumeration loop below.
-LOWERING_SCRIPTS="tests/build-hermetic-drv.scm tests/daemon-drv.scm \
-tests/td-drv-build-drv.scm tests/offline-drv.scm"
+# the enumeration loop below. Empty since the Guile drv-fixture gates (and their
+# tests/*-drv.scm) retired with the guix Guile-lowering gates; the guard still
+# fires if a new tests/*-drv.scm is added without being enumerated here.
+LOWERING_SCRIPTS=""
 for s in tests/*-drv.scm tests/*-drvs.scm; do
   [ -e "$s" ] || continue
   case " $LOWERING_SCRIPTS " in

@@ -1303,7 +1303,12 @@ fn lock_sched<'a>(m: &'a Mutex<Sched>) -> std::sync::MutexGuard<'a, Sched> {
 /// Run the selected nodes. Returns Ok(true) if everything passed.
 fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Result<bool, String> {
     if selected.is_empty() {
-        return Err("gate-run: nothing selected".to_string());
+        // A tier keyword can legitimately expand to NO gates — e.g. check-system
+        // after the guix OCI-image gates retired left the System pool empty. Nothing
+        // to run is a PASS, not an error; the REQUIRED check-fast tier is held
+        // non-empty by the every_tier_keyword_* registry test, not by this guard.
+        eprintln!("gate-run: no gates selected for the given goals — nothing to run");
+        return Ok(true);
     }
     std::fs::create_dir_all(&cfg.log_dir)
         .map_err(|e| format!("gate-run: cannot create {}: {e}", cfg.log_dir.display()))?;
@@ -1816,20 +1821,25 @@ mod tests {
         // full check — the split may move members but never lose one.
         let heavy = set.names(Pool::Heavy);
         let daily = set.names(Pool::Daily);
-        assert!(heavy.len() >= 45, "heavy (PR) pool shrank: {}", heavy.len());
+        // Thresholds ratchet DOWN as guix gates retire (the guix-removal workstream):
+        // the guix-oracle + Guile-lowering gates AND every $TD_GUIX-invoking gate
+        // (bootstrap/provision-*/rust-build/td-feed/td-subst/oci/… + the feed-shared /
+        // seed-subst companions) were deleted, so heavy dropped 45→27 and the System
+        // pool emptied. These guard against ACCIDENTAL loss, not deliberate retirement —
+        // lower them in the same PR that removes gates.
+        assert!(heavy.len() >= 27, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
         assert!(daily.len() >= 40, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 85, "the full check lost gates");
-        for g in ["bootstrap", "td-subst", "cargo-test", "recipe-checks", "td-shell"] {
+        assert!(heavy.len() + daily.len() >= 69, "the full check lost gates");
+        for g in ["recipe-checks", "td-shell"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
-        for g in ["bootstrap-gcc-mesboot", "recipe-checks-daily", "rust-userland-x86_64-store-native"] {
+        for g in ["bootstrap-gcc-mesboot", "recipe-checks-daily"] {
             assert!(daily.iter().any(|n| n == g), "missing daily gate {g}");
         }
         assert!(set.names(Pool::Engine).iter().any(|n| n == "cargo-test"));
-        let system = set.names(Pool::System);
-        for g in ["oci-native", "rust-userland-image"] {
-            assert!(system.iter().any(|n| n == g), "missing system gate {g}");
-        }
+        // (The System pool is EMPTY since the guix OCI-image gates — oci-native,
+        // rust-userland-image — retired; a future td-native image gate repopulates it,
+        // so no membership assertion here. check-system legitimately expands to {}.)
         // Fragment-declared specs feed the synthetic build-recipes node.
         for s in ["hello"] {
             assert!(set.build_specs.iter().any(|x| x == s), "missing build spec {s}");
@@ -1840,11 +1850,7 @@ mod tests {
         assert_eq!(tsd.inputs.len(), 2, "toolchain-subst-default lost its declared inputs");
         assert!(tsd.inputs.iter().any(|i| i.name == "coreutils"));
         assert!(tsd.inputs.iter().any(|i| i.name == "bash-static"));
-        // The explicit fragment dep survived; the derived graph holds.
-        let fs = set.gates.iter().find(|g| g.name == "feed-shared").unwrap();
-        assert!(fs.deps.iter().any(|d| d == "td-feed"));
-        let ts = set.gates.iter().find(|g| g.name == "td-subst").unwrap();
-        assert!(ts.deps.iter().any(|d| d == BUILD_RECIPES));
+        // The derived graph holds: the synthetic build-recipes node carries the specs.
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(br.extra_env.iter().any(|(k, _)| k == "TD_BUILD_SPECS"));
         // Every bash body is non-empty plain bash (no make-isms survived
@@ -1890,7 +1896,10 @@ mod tests {
         // runs the REAL load() registry so emptying a pool (as retiring the whole
         // Cheap pool did) cannot slip through. Guards the check-fast → Engine fold.
         let set = load().unwrap();
-        for goal in ["check-fast", "check-engine", "check-system", "check-pr", "check"] {
+        // check-system is intentionally omitted: the System pool is empty since the
+        // guix OCI-image gates retired, so it legitimately expands to {} (run_selected
+        // treats that as a pass). The REQUIRED check-fast tier must stay non-empty.
+        for goal in ["check-fast", "check-engine", "check-pr", "check"] {
             let sel = expand_goals(&set, &[goal.to_string()]).unwrap();
             assert!(!sel.is_empty(), "tier keyword `{goal}` expanded to the empty set");
         }
@@ -2468,7 +2477,6 @@ mod tests {
             private,
             vec![
                 "bootstrap-seed",
-                "build-hermetic",
                 "chain-cache",
                 "corpus-seed",
                 "harness-seed",
@@ -2478,13 +2486,12 @@ mod tests {
                 "seed-unpack",
                 "store-gc",
                 "store-gc-sweep",
-                "td-offline",
                 "td-shell-seed",
             ]
         );
         // The default is Shared — the #317 flip: warm machine-wide state unless a gate
         // declares that cold IS its feature.
-        for g in ["store-persist", "bootstrap", "recipe-checks"] {
+        for g in ["store-persist", "recipe-checks"] {
             let gate = set.gates.iter().find(|x| x.name == g).unwrap();
             assert_eq!(gate.store, StoreMode::Shared, "{g} must default Shared");
         }
