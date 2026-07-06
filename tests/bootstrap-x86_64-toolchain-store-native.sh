@@ -119,9 +119,9 @@ test -f "$KH_X86_64_TB" || fail "x86_64 kernel headers not warm ($KH_X86_64_TB) 
 echo "   [pinned-input] + the x86_64 Linux UAPI headers (derived from the pinned linux-$KH_VER source)"
 
 # --- sourced as a FUNCTION LIBRARY (TD_X86_64_LIB=1): the build_* rung functions are now
-# defined and the pinned-input checks (incl. the x86_64 kernel headers) have run, so a consumer
-# (tests/rust-x86_64-runtime-store-native.sh) can drive the rungs itself and add its own legs
-# without copying the ~800-line chain. Return BEFORE the build driver. Behavior-preserving when
+# run, so a consumer (rust-x86_64-runtime/userland) can source this gate for the pinned-input vars +
+# KH_X86_64_TB + the cross-fns library (run_x86_64_cross/verify/native), then drive the rungs and
+# add its own legs. Return BEFORE the build driver. Behavior-preserving when
 # executed normally: TD_X86_64_LIB is unset → the guard is false → the driver below runs as-is.
 [ "${TD_X86_64_LIB:-0}" = 1 ] && return 0
 
@@ -129,14 +129,15 @@ echo "   [pinned-input] + the x86_64 Linux UAPI headers (derived from the pinned
 # Build the i686 base FROM THE SEED (the 21-rung chain → gcc 14.3.0 + glibc 2.16 static/shared +
 # binutils 2.44), then CROSS UP to x86_64. Directive 1: from the 229-byte seed, no cache, offline.
 # ============================================================================================
-cpath=`make_curated_path`
-for bad in gcc g++ cc guile guix; do test ! -e "$cpath/$bad" || fail "curated PATH still exposes '$bad'"; done
-
 # --- load stage0 + the /td/store own-root store + a static bash for the store-ns shell. BOTH the
 # FETCH-skip and the from-seed BUILD paths need these. ---
 . tests/cache-lib.sh
 . tests/x86_64-cross-fns.sh
 . tests/x86_64-subst-lib.sh
+# make_curated_path now lives in x86_64-cross-fns.sh (moved when the inline i686 chain retired), so
+# the curated PATH must be built AFTER that source, not before.
+cpath=`make_curated_path`
+for bad in gcc g++ cc guile guix; do test ! -e "$cpath/$bad" || fail "curated PATH still exposes '$bad'"; done
 export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 export TD_STORE_DIR=/td/store
