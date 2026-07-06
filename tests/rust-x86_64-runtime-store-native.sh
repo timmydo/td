@@ -218,55 +218,72 @@ else
   tar -xzf "$RUST_TB" -C "$xr" "$top/rust-std-x86_64-unknown-linux-gnu/lib/rustlib" 2>/dev/null || true
   RUSTSRC=`"$TB" store-add-recursive rust-toolchain-source "$xr/$top" "$store" "$sndb"` || fail "store-add rust source failed"
 
-  # --- the rust-toolchain recipe JSON + its lock (declared inputs; the recipe-rs gate proves this is
-  #     exactly what `td-recipe-eval emit rust-toolchain` produces — recipes/src/recipes/rust-toolchain.rs) ---
-  printf '%s\n' '{"buildSystem":"rust-toolchain","inputs":["rust-native-glibc","rust-native-libgcc","rust-native-libz"],"name":"rust-toolchain","version":"1.96.0"}' > "$rtwork/rust-toolchain.json"
+  # --- the rust-toolchain recipe JSON, emitted through its REAL entry point (td's own dependency-free
+  #     evaluator over recipes/src/recipes/rust-toolchain.rs — the same `recipe-emit.sh` the corpus gates
+  #     use), + its lock (declared inputs; zero /gnu/store). load_recipe_eval reads the td-recipe-eval the
+  #     build-recipes prelude built (it runs before the heavy gates). ---
+  load_recipe_eval || fail "no td-recipe-eval (the build-recipes prelude must run before this gate)"
+  sh tests/recipe-emit.sh rust-toolchain > "$rtwork/rust-toolchain.json" || fail "recipe-emit rust-toolchain failed"
+  test -s "$rtwork/rust-toolchain.json" || fail "recipe-emit rust-toolchain produced no JSON"
   cat > "$rtwork/rust-toolchain.lock" <<EOF
 rust-toolchain-source $RUSTSRC source
 rust-native-glibc $GLP td-recipe-output
 rust-native-libgcc $LIBGCCP td-recipe-output
 rust-native-libz $LIBZP td-recipe-output
 EOF
-  # --- [verified-red] a lock MISSING the release input reds the recipe at drv-assembly, BEFORE any
-  #     build — the declared-input enforcement #380 requires (a misdeclared/missing release input fails
-  #     fast, not silently). Cheap (fails at assembly, builds nothing); 416's own leg, not the sourcing gates'. ---
+  # --- [verified-red] the recipe ENFORCES its declared inputs (#380), message-checked (not just exit code)
+  #     so neither probe passes vacuously. 416's own leg, not the sourcing gates'. ---
   if [ "${TD_RUST_STORE_NATIVE_ASSEMBLE_ONLY:-}" != 1 ]; then
+    # (a) a lock MISSING the pinned RELEASE source reds at drv-assembly, BEFORE any build.
     grep -v '^rust-toolchain-source ' "$rtwork/rust-toolchain.lock" > "$rtwork/rust-toolchain.nosrc.lock"
-    if env TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-         TD_SEED_STORE="$store" TD_SEED_DB="$sndb" TD_EXTRA_DBS="$sndb" \
-         "$TB" build-recipe "$rtwork/rust-toolchain.json" "$rtwork/rust-toolchain.nosrc.lock" "$rtwork/sb-nosrc" "$store" >/dev/null 2>&1; then
-      fail "the rust-toolchain recipe built with NO release source — the missing-input guard is vacuous"
-    fi
-    echo "   [verified-red] a lock without rust-toolchain-source reds the recipe at drv-assembly (declared-input enforcement, before any build)"
+    env TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
+        TD_SEED_STORE="$store" TD_SEED_DB="$sndb" TD_EXTRA_DBS="$sndb" \
+        "$TB" build-recipe "$rtwork/rust-toolchain.json" "$rtwork/rust-toolchain.nosrc.lock" "$rtwork/sb-nosrc" "$store" \
+        >/dev/null 2>"$rtwork/nosrc.err" && fail "the recipe built with NO pinned release source — the missing-release guard is vacuous"
+    grep -q 'rust-toolchain-source' "$rtwork/nosrc.err" || { cat "$rtwork/nosrc.err" >&2; fail "the missing-release red did not name rust-toolchain-source"; }
+    echo "   [verified-red] a lock without the pinned release source reds at drv-assembly, before any build ($(grep -o 'lock has no.*' "$rtwork/nosrc.err" | head -1))"
+    # (b) the transform ENFORCES its declared /td/store inputs: the phase runner (build::run_rust_toolchain)
+    #     reds NAMING a missing input — the new from_drv_env guard, exercised directly (no build needed).
+    env out="$rtwork/rr-red" TD_SRC="$RUSTSRC" \
+        TD_INPUT_MAP="{\"rust-native-libgcc\":\"$LIBGCCP\",\"rust-native-libz\":\"$LIBZP\"}" \
+        "$TB" rust-toolchain-build 2>"$rtwork/noglibc.err" && fail "the transform ran with NO rust-native-glibc input — the missing-input guard is vacuous"
+    grep -q 'rust-native-glibc' "$rtwork/noglibc.err" || { cat "$rtwork/noglibc.err" >&2; fail "the missing-input red did not name rust-native-glibc"; }
+    echo "   [verified-red] the transform reds naming a missing declared input ($(grep -o 'lock is missing.*' "$rtwork/noglibc.err" | head -1))"
   fi
-  # --- build the recipe: the transform (extract-copy + co-locate + interp relink) runs in the
-  #     HERMETIC drv sandbox as pure td-builder Rust (build::run_rust_toolchain). The /td/store
-  #     toolchain inputs ride via TD_SEED_STORE (content-scanned) + TD_EXTRA_DBS (their refs). ---
+  # --- build the recipe: the transform (extract-copy + co-locate + interp relink) runs in the HERMETIC drv
+  #     sandbox as pure td-builder Rust (build::run_rust_toolchain). The /td/store toolchain inputs ride via
+  #     TD_SEED_STORE (content-scanned) + TD_EXTRA_DBS (their refs). build-recipe materializes the realized
+  #     output tree UNDER THE SCRATCH dir at <scratch>/newstore/<base> (as the userland gate stages it). ---
   rtsb="$rtwork/sb"
   env TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
       TD_SEED_STORE="$store" TD_SEED_DB="$sndb" TD_EXTRA_DBS="$sndb" \
       "$TB" build-recipe "$rtwork/rust-toolchain.json" "$rtwork/rust-toolchain.lock" "$rtsb" "$store" \
       > "$rtwork/br.out" 2>"$rtwork/br.err" || { tail -40 "$rtwork/br.err" >&2; fail "build-recipe rust-toolchain failed"; }
   RUST_OUT=`sed -n 's/^OUT=out //p' "$rtwork/br.out"`
-  RUST_TREE="$store/`basename "$RUST_OUT"`"   # the OUT canonical is a /td/store label; the physical tree is under $store
+  RUST_TREE="$rtsb/newstore/`basename "$RUST_OUT"`"   # build-recipe realizes the output tree under the SCRATCH dir
   test -n "$RUST_OUT" -a -d "$RUST_TREE" || fail "build-recipe produced no rust-toolchain tree (OUT=$RUST_OUT phys=$RUST_TREE)"
+  test -x "$RUST_TREE/bin/rustc" -a -x "$RUST_TREE/bin/cargo" || fail "the recipe output lacks rustc/cargo at $RUST_TREE/bin"
   echo "   [recipe] build-recipe assembled + relinked the /td/store rust toolchain at $RUST_OUT (buildSystem rust-toolchain)"
 
-  # --- [DURABLE repro] the rust-toolchain recipe is byte-reproducible: build it a SECOND time from the
-  #     SAME pinned release source + inputs into a FRESH store + scratch, and assert the content-addressed
-  #     output path (= the NAR hash) is IDENTICAL — same pinned tarball -> byte-identical /td/store rust
-  #     toolchain twice (#380). Skipped in assemble-only mode (the sourcing userland/shell gates do not
-  #     re-prove the toolchain's repro; that is gate 416's own leg). ---
+  # --- [DURABLE repro] the rust-toolchain recipe is byte-reproducible: build it a SECOND time from the SAME
+  #     pinned release source + inputs into a FRESH scratch (which forces a genuine independent realize — the
+  #     per-scratch cache misses and no persistent store is set), and assert the two realized output trees'
+  #     NAR HASHES agree. The OUT= store path is INPUT-addressed (equal by construction), so the NAR hash of
+  #     the physical tree — not the path — is what proves same pinned tarball -> byte-identical toolchain
+  #     twice (#380). Skipped in assemble-only mode (416's own leg). ---
   if [ "${TD_RUST_STORE_NATIVE_ASSEMBLE_ONLY:-}" != 1 ]; then
-    rtstore2="$rtwork/store2"; rtsb2="$rtwork/sb2"; mkdir -p "$rtstore2"
+    rtsb2="$rtwork/sb2"
     env TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
         TD_SEED_STORE="$store" TD_SEED_DB="$sndb" TD_EXTRA_DBS="$sndb" \
-        "$TB" build-recipe "$rtwork/rust-toolchain.json" "$rtwork/rust-toolchain.lock" "$rtsb2" "$rtstore2" \
+        "$TB" build-recipe "$rtwork/rust-toolchain.json" "$rtwork/rust-toolchain.lock" "$rtsb2" "$store" \
         > "$rtwork/br2.out" 2>"$rtwork/br2.err" || { tail -40 "$rtwork/br2.err" >&2; fail "rust-toolchain repro rebuild failed"; }
     RUST_OUT2=`sed -n 's/^OUT=out //p' "$rtwork/br2.out"`
-    test -n "$RUST_OUT2" || fail "rust-toolchain repro rebuild produced no output"
-    test "$RUST_OUT" = "$RUST_OUT2" || fail "the rust-toolchain recipe is NOT byte-reproducible: $RUST_OUT != $RUST_OUT2"
-    echo "   [DURABLE repro] the rust-toolchain recipe is byte-reproducible — the same pinned release + inputs yield $RUST_OUT twice"
+    RUST_TREE2="$rtsb2/newstore/`basename "$RUST_OUT2"`"
+    test -n "$RUST_OUT2" -a -d "$RUST_TREE2" || fail "rust-toolchain repro rebuild produced no tree ($RUST_TREE2)"
+    h1=`"$TB" nar-hash "$RUST_TREE"`  || fail "nar-hash of rust-toolchain build #1 failed"
+    h2=`"$TB" nar-hash "$RUST_TREE2"` || fail "nar-hash of rust-toolchain build #2 failed"
+    test -n "$h1" -a "$h1" = "$h2" || fail "the rust-toolchain recipe is NOT byte-reproducible: nar-hash $h1 != $h2"
+    echo "   [DURABLE repro] the rust-toolchain recipe is byte-reproducible — same pinned release + inputs -> nar-hash $h1 twice"
   fi
 
   # intern the recipe's output tree at the lock-keyed input-addressed path + subst-export (unchanged).
