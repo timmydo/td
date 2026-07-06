@@ -14,18 +14,12 @@
 //!      the host brings them, like it brings rust/cc — no `guix shell`),
 //!   5. the warm prelude (subst store, source/crate warms, build daemon),
 //!   6. the machine-wide slot dir, and
-//!   7. the sandboxed gate run: TB host-sandbox --expose-cwd -- TB gate-run.
+//!   7. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon -- TB gate-run.
 //!
 //! (The host-guix == pinned-channel integrity guard that used to run `guix
 //! describe` was removed in #406 — it only warned on drift, so dropping it is
 //! behavior-preserving for a correctly-pinned host and drops one guix subprocess
 //! per run.)
-//!
-//! The only remaining guix here is host guix on the sandbox PATH, for the
-//! DEFERRED corpus/seed/bootstrap gates that still call `guix build` for their
-//! guix-built seed (unpinned host guix; the seed BYTES retire last per the north
-//! star / #412). It is EXISTING, ratcheted surface — not new — and shrinks
-//! further with the /td/store userland (directive 6).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -126,8 +120,7 @@ const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 /// profile-symlink dir (~/.guix-home/profile/bin) OR a distro dir (/usr/bin on a
 /// Debian+guix host) would not resolve inside; only the real
 /// `/gnu/store/<pkg>/bin` target does. The deduped in-store dirs become the
-/// sandbox PATH (host guix's own bin dir is prepended by the caller for the
-/// deferred `guix build` corpus/seed gates).
+/// sandbox PATH; nothing else is prepended.
 ///
 /// A tool that is ABSENT from the host PATH, or that resolves OUTSIDE the bound
 /// store (so it would vanish inside the sandbox), is reported in one loud warning
@@ -1235,7 +1228,7 @@ fn run(args: &[String]) -> Result<i32, String> {
             argv.extend([s("ionice"), s("-c2"), s("-n7")]);
         }
     }
-    argv.extend([tb.clone(), s("host-sandbox"), s("--expose-cwd"), s("--"), tb, s("gate-run")]);
+    argv.extend([tb.clone(), s("host-sandbox"), s("--expose-cwd"), s("--no-daemon"), s("--"), tb, s("gate-run")]);
     argv.extend([s("-j"), jobs.to_string()]);
     if resume {
         argv.push(s("--resume"));
@@ -1320,7 +1313,7 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
          sandbox env matches the gate)"
     );
     let mut cmd = Command::new(&tb);
-    cmd.args(["host-sandbox", "--expose-cwd", "--", "sh"])
+    cmd.args(["host-sandbox", "--expose-cwd", "--no-daemon", "--", "sh"])
         .arg(harness)
         .args(rest)
         .env("PATH", toolchain)

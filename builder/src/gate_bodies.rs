@@ -138,7 +138,7 @@ fn tb_ok(tb: &Path, args: &[&str]) -> bool {
 }
 
 /// Run an arbitrary tool, returning trimmed stdout on success (the generic
-/// subprocess oracle spawn — sqlite3, guix build, …).
+/// subprocess oracle spawn for sqlite3 and staging helpers).
 fn run_out(program: &str, args: &[&str], ctx: &str) -> Result<String, String> {
     let out = Command::new(program)
         .args(args)
@@ -563,12 +563,11 @@ fn store_subject(s0: &Stage0, root: &Path, scratch: &Path) -> Result<Subject, St
 // --- the gate bodies ---------------------------------------------------------
 
 /// store-add — td PLACES a text path into its OWN store + registers it (pure
-/// Rust, no daemon in the write path), differential vs the daemon's
-/// addTextToStore. Faithful port of gate_defs/280-store-add.rs's bash.
+/// Rust, no daemon in the write path).
 fn store_add(root: &Path) -> Result<(), String> {
     println!(
         ">> store-add: td PLACES a text path into its OWN store + registers it (pure Rust, no \
-         daemon in the write path) — differential vs the daemon's addToStore"
+         daemon in the write path)"
     );
     let tb = stage0_from_memo(root)?.tb;
 
@@ -582,29 +581,21 @@ fn store_add(root: &Path) -> Result<(), String> {
     let name = "td-store-add-probe";
     let content_s = path_str(&content)?;
 
-    // The daemon (oracle) addTextToStore: writes to /gnu/store, returns the path.
-    let daemon_path =
-        tb_out(&tb, &["store-add", name, &content_s], "the daemon (oracle) addTextToStore")?;
-    if daemon_path.is_empty() {
-        return Err("FAIL: the daemon (oracle) returned no path for addTextToStore".into());
-    }
-    if !Path::new(&daemon_path).is_file() {
-        return Err(format!(
-            "FAIL: the daemon did not write its store file {daemon_path} (oracle missing)"
-        ));
-    }
-    println!(">> daemon (oracle) addTextToStore wrote: {daemon_path}");
-
     // td computes + writes + registers the SAME path itself, no daemon.
     let store_s = path_str(&store)?;
     let tddb = scratch.join("td.db");
     let tddb_s = path_str(&tddb)?;
     let td_path =
         tb_out(&tb, &["store-add-text", name, &content_s, &store_s, &tddb_s], "td store-add-text")?;
-    if td_path != daemon_path {
-        return Err(format!("FAIL: td computed {td_path} != the daemon's {daemon_path}"));
+    let content_bytes = std::fs::read(&content)
+        .map_err(|e| format!("FAIL: read {}: {e}", content.display()))?;
+    let expected_path = crate::store::make_text_path(name, &content_bytes, &[]);
+    if td_path != expected_path {
+        return Err(format!(
+            "FAIL: td computed {td_path} != its own make_text_path result {expected_path}"
+        ));
     }
-    println!("   td computed the SAME store path as the daemon (no daemon in td's path computation)");
+    println!("   td computed the expected addTextToStore path itself");
 
     let base = base_of(&td_path);
     let td_file = store.join(&base);
@@ -615,29 +606,28 @@ fn store_add(root: &Path) -> Result<(), String> {
     if mode != 0o444 {
         return Err(format!("FAIL: td's store file mode {mode:o} != 444 (canonical read-only)"));
     }
+    let written = std::fs::read(&td_file)
+        .map_err(|e| format!("FAIL: read td store file {}: {e}", td_file.display()))?;
+    if written != content_bytes {
+        return Err("FAIL: td's store file bytes differ from the input content".into());
+    }
     println!("   td WROTE the store file itself, canonical mode 0444 (no daemon in the write path)");
 
-    // Byte-identity by NAR hash (metadata-independent).
+    // NAR hash is metadata-independent over the canonical store file.
     let td_file_s = path_str(&td_file)?;
-    let oracle_hash = tb_out(&tb, &["nar-hash", &daemon_path], "nar-hash of the daemon's store file")?;
     let td_file_hash = tb_out(&tb, &["nar-hash", &td_file_s], "nar-hash of td's store file")?;
-    if td_file_hash != oracle_hash {
-        return Err(format!(
-            "FAIL: td's store bytes NAR-hash {td_file_hash} != the daemon's store file {oracle_hash}"
-        ));
-    }
-    println!("   td's store file is byte-identical (NAR) to the daemon's own: {oracle_hash}");
+    println!("   td's store file NAR hash is {td_file_hash}");
 
     // td's registration, read back by TD'S OWN reader.
     let td_reg = tb_out(&tb, &["store-query", &tddb_s, "info"], "td store-query (td's own reader)")?;
     let mut fields = td_reg.split('|');
     let reg_path = fields.next().unwrap_or("");
     let reg_hash = fields.next().unwrap_or("");
-    if reg_path != daemon_path {
-        return Err(format!("FAIL: td registered path {reg_path} != {daemon_path}"));
+    if reg_path != td_path {
+        return Err(format!("FAIL: td registered path {reg_path} != {td_path}"));
     }
-    if reg_hash != oracle_hash {
-        return Err(format!("FAIL: td registered hash {reg_hash} != the daemon-equivalent {oracle_hash}"));
+    if reg_hash != td_file_hash {
+        return Err(format!("FAIL: td registered hash {reg_hash} != td's NAR hash {td_file_hash}"));
     }
     println!(
         "   td's registration (read back by TD'S OWN reader) records the path + the NAR hash of \
@@ -647,10 +637,9 @@ fn store_add(root: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
         "PASS: td PLACED a path into its OWN store and REGISTERED it ITSELF, in pure Rust with NO \
-         daemon in the write path — td computed the IDENTICAL store path to the daemon's \
-         addTextToStore, WROTE a store file (canonical mode 0444) BYTE-IDENTICAL (by NAR hash) to \
-         the daemon's own store file, and its registration (read back by TD'S OWN reader) records \
-         that path + the hash of what td wrote. The daemon is only the oracle."
+         daemon in the write path — td computed the addTextToStore path, wrote the exact content \
+         as a canonical 0444 store file, and its registration (read back by TD'S OWN reader) \
+         records that path + the NAR hash of what td wrote."
     );
     Ok(())
 }
