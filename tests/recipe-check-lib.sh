@@ -27,16 +27,15 @@ recipe_checks_prelude() {
   fi
   CACHE="$PWD/.td-build-cache/pkg"
   mkdir -p "$CACHE"
-  export TD_GUIX="${TD_GUIX:-guix}"
-  export CU CACHE GUIX="$TD_GUIX" ROOT="$PWD"
+  export CU CACHE GUIX=guix ROOT="$PWD"
 }
 
 recipe_cached_build() {
   spec=$1
   lock=$2
   test -s "$lock" || { echo "ERROR: no lock $lock" >&2; exit 1; }
-  grep ' /gnu/store/' "$lock" | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null \
-    || { echo "ERROR: could not realize the seed for $spec (regenerate locks on a channel bump)" >&2; exit 1; }
+  grep ' /gnu/store/' "$lock" | sed 's/^[^ ]* //' | xargs guix build >/dev/null \
+    || { echo "ERROR: could not realize the seed for $spec (regenerate locks on a host-guix change)" >&2; exit 1; }
   cached_build "$spec" "$lock" || exit 1
   if [ -n "$hit" ]; then
     echo "  [STRUCTURAL] CACHE HIT — drv unchanged, reused td's prior output (no rebuild): $out"
@@ -85,12 +84,19 @@ recipe_link_seed() {
   if [ -n "${RECIPE_GT_BIN:-}" ] && [ -n "${RECIPE_LINUX_HEADERS:-}" ] && [ -n "${RECIPE_NCURSES_LIB:-}" ]; then
     return
   fi
-  RECIPE_GT_BIN=`for p in $($TD_GUIX build gcc-toolchain 2>/dev/null); do [ -x "$p/bin/gcc" ] && echo "$p/bin" && break; done`
-  test -n "$RECIPE_GT_BIN" || { echo "ERROR: could not resolve gcc-toolchain for the link-test" >&2; exit 1; }
-  RECIPE_LINUX_HEADERS=`for p in $($TD_GUIX build linux-libre-headers 2>/dev/null); do [ -f "$p/include/linux/limits.h" ] && echo "$p/include" && break; done`
-  test -n "$RECIPE_LINUX_HEADERS" || { echo "ERROR: could not resolve linux-libre-headers for the link-test" >&2; exit 1; }
-  RECIPE_NCURSES_LIB=`for p in $($TD_GUIX build ncurses 2>/dev/null); do [ -f "$p/lib/libncurses.so" ] && echo "$p/lib" && break; done`
-  test -n "$RECIPE_NCURSES_LIB" || { echo "ERROR: could not resolve ncurses for readline's termcap link-test" >&2; exit 1; }
+  # The C link toolchain, GUIX-FREE: the host brings the C toolchain via
+  # tools/provision-cc.sh (a PROVIDED TD_CC_HOME, the pinned gcc-toolchain seed, or a
+  # system cc) — the same resolver the seed build uses. gcc-toolchain bundles the kernel
+  # headers (include/linux/*.h), so there is no separate linux-libre-headers. ncurses
+  # (only readline's termcap link needs it) resolves from readline's own pinned lock,
+  # realized by the seed when readline builds — no `guix build` here.
+  RECIPE_GT_BIN=`sh tools/provision-cc.sh` \
+    || { echo "ERROR: could not provision a C toolchain for the link-test (tools/provision-cc.sh)" >&2; exit 1; }
+  test -x "$RECIPE_GT_BIN/gcc" || { echo "ERROR: provisioned C toolchain has no gcc at $RECIPE_GT_BIN" >&2; exit 1; }
+  RECIPE_LINUX_HEADERS="${RECIPE_GT_BIN%/bin}/include"
+  test -f "$RECIPE_LINUX_HEADERS/linux/limits.h" || { echo "ERROR: the C toolchain at $RECIPE_GT_BIN bundles no kernel headers ($RECIPE_LINUX_HEADERS/linux/limits.h)" >&2; exit 1; }
+  RECIPE_NCURSES_LIB=`grep ' /gnu/store/' tests/readline-no-guix.lock | grep -- '-ncurses-' | sed 's/^[^ ]* //' | head -1`/lib
+  test "$RECIPE_NCURSES_LIB" != /lib || { echo "ERROR: no ncurses pinned in tests/readline-no-guix.lock for the termcap link-test" >&2; exit 1; }
   export RECIPE_GT_BIN RECIPE_LINUX_HEADERS RECIPE_NCURSES_LIB
 }
 
@@ -153,7 +159,7 @@ recipe_local_crate_lock_build() {
   ncrate=`grep -cE '\.crate /gnu/store/' "$lock0"`
   test "$ncrate" -ge 2 || { echo "ERROR: lock has <2 vendored .crate deps ($ncrate)" >&2; exit 1; }
   scratch="$PWD/.td-build-cache/$name-recipe-check"; mkdir -p "$scratch/tmp" "$scratch/b"; rm -f "$scratch/b/"*.drv
-  grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null \
+  grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs guix build >/dev/null \
     || { echo "ERROR: could not realize the seed + vendored .crate deps" >&2; exit 1; }
   srcinfo=`sh tests/intern-src.sh "$tb" "$sourcekey-src" "$source_dir" "$scratch" target .cargo` \
     || { echo "ERROR: td could not intern $source_dir (store-add-recursive)" >&2; exit 1; }
@@ -208,7 +214,7 @@ recipe_vendor_tree_rust_build() {
   echo "  [DURABLE supply-chain] all $ncrate vendored crates' sha256 are checksums pinned in $cargo_lock"
 
   scratch="$PWD/.td-build-cache/$name-recipe-check"; rm -rf "$scratch"; mkdir -p "$scratch/tmp" "$scratch/sd"
-  grep -v '\.crate ' "$lock0" | grep ' /gnu/store/' | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null \
+  grep -v '\.crate ' "$lock0" | grep ' /gnu/store/' | sed 's/^[^ ]* //' | xargs guix build >/dev/null \
     || { echo "ERROR: could not realize the toolchain seed" >&2; exit 1; }
   srcinfo=`sh tests/intern-src.sh "$tb" "$sourcekey-src" "$source_dir" "$scratch/src" target vendor .cargo` \
     || { echo "ERROR: intern source failed" >&2; exit 1; }
@@ -254,7 +260,7 @@ recipe_cmake_local_build() {
   case "$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($tb)" >&2; exit 1 ;; esac
   test -s "$lock0" || { echo "ERROR: no lock $lock0" >&2; exit 1; }
   scratch="$PWD/.td-build-cache/$name-recipe-check"; mkdir -p "$scratch/tmp" "$scratch/b"; rm -f "$scratch/b/"*.drv
-  grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs $TD_GUIX build >/dev/null \
+  grep ' /gnu/store/' "$lock0" | sed 's/^[^ ]* //' | xargs guix build >/dev/null \
     || { echo "ERROR: could not realize the cmake seed" >&2; exit 1; }
   srcinfo=`sh tests/intern-src.sh "$tb" "$sourcekey-src" "$source_dir" "$scratch"` \
     || { echo "ERROR: td could not intern $source_dir (store-add-recursive)" >&2; exit 1; }
@@ -289,21 +295,5 @@ recipe_cmake_local_build() {
   test "$got" = "$expected_output" || { echo "FAIL: $expected_bin printed '$got', expected '$expected_output'" >&2; exit 1; }
   echo "  [DURABLE behavioral] the cmake-built binary runs and prints '$got'"
   recipe_check_drv_repro
-
-  oracle="$scratch/oracle.scm"
-  { echo "(use-modules (guix packages) (guix gexp) (guix build-system cmake) ((guix licenses) #:prefix license:))";
-    echo "(package (name \"$name-guix\") (version \"0.1.0\")";
-    echo "  (source (local-file \"$PWD/$source_dir\" \"$sourcekey-src\" #:recursive? #t))";
-    echo "  (build-system cmake-build-system) (arguments (list #:tests? #f))";
-    echo "  (synopsis \"o\") (description \"cmake-build-system oracle.\") (home-page \"https://example.invalid\") (license license:gpl3+))"; } > "$oracle"
-  gdrv=`$TD_GUIX build -d -f "$oracle" 2>/dev/null` \
-    || { echo "ERROR: could not compute the guix cmake-build-system oracle derivation" >&2; exit 1; }
-  gout=`printf '(use-modules (guix derivations))\n(for-each (lambda (o) (display (derivation-output-path (cdr o))) (newline)) (derivation-outputs (read-derivation-from-file "%s")))\n' "$gdrv" | $TD_GUIX repl 2>/dev/null | grep -oE '/gnu/store/[a-z0-9]+-'"$name"'-guix-[^ ]+' | head -1` || true
-  test -n "$gout" || { echo "ERROR: could not read the guix oracle output path from $gdrv" >&2; exit 1; }
-  if [ "$out" = "$gout" ]; then
-    echo "FAIL: td's cmake-build path equals guix's cmake-build-system path" >&2
-    exit 1
-  fi
-  echo "  [MIGRATION ORACLE, removable] distinct from guix's cmake-build-system build ($gout)"
   export tb scratch sd out ns
 }

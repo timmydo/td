@@ -33,9 +33,10 @@
 //! parser used to check — a malformed gate is a build error, never a mis-run.
 //!
 //! A GateDef's `script` is PLAIN BASH (no make escaping), executed as one
-//! `bash -c` with cwd = repo root and TD_GUIX exported (the pinned
-//! `guix time-machine -C channels.scm --` prefix the remaining guix
-//! invocations go through). Output is buffered per gate (`--output-sync=target`
+//! `bash -c` with cwd = repo root. (The remaining deferred corpus/seed gates
+//! realize their guix-built seed by calling host `guix` directly — the seed
+//! bytes retire last per the north star / #412.) Output is buffered per gate
+//! (`--output-sync=target`
 //! parity), first red stops new gates while running ones drain, and timing
 //! events keep the exact per-gate START/END line format the native report
 //! reducer (gate_timing.rs) reads.
@@ -47,9 +48,6 @@ use std::process::ExitCode;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// `$TD_GUIX` — the pinned time-machine prefix every remaining guix invocation in
-/// a gate body goes through (exported to every gate).
-pub const GUIX_CMD: &str = "guix time-machine -C channels.scm --";
 /// The synthetic build-phase node (the former Makefile `build-recipes` target).
 const BUILD_RECIPES: &str = "build-recipes";
 
@@ -158,9 +156,10 @@ pub struct GateDef {
     /// Non-blocking (allow-failure) tag: when a tagged gate FAILS the runner
     /// TOLERATES it — no fail-fast, and the run is not reded by it (it is reported
     /// as a non-blocking failure). A tagged gate that PASSES is unaffected (still
-    /// full coverage). Used for the gates that fail when the host guix != the
-    /// channels.scm pin, so a pin-drifted host is not blocked by them while a
-    /// correctly-pinned host still runs and covers them normally.
+    /// full coverage). Used for the deferred corpus/seed gates that depend on
+    /// host guix realizing their guix-built seed (`guix build`): a host that
+    /// cannot satisfy that is not blocked by them, while a host that can still
+    /// runs and covers them normally.
     pub non_blocking: bool,
     /// The gate body: plain bash, run as one `bash -c` from the repo root.
     pub script: &'static str,
@@ -368,8 +367,9 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
         inputs: Vec::new(),
         store: StoreMode::Shared,
         // build-recipes builds the corpus via the guix-seeded daemon — it fails
-        // when host guix != pin, so it is non-blocking too (its SoftFailed still
-        // satisfies its BUILD_GATE dependents' readiness).
+        // on a host that cannot realize the guix-built seed, so it is non-blocking
+        // too (its SoftFailed still satisfies its BUILD_GATE dependents'
+        // readiness).
         non_blocking: true,
     };
     set.index.insert(BUILD_RECIPES.to_string(), set.gates.len());
@@ -439,15 +439,14 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
                     }
                 }
                 "check-fast" => {
-                    // Cheap + Fast are both empty since the fast tier's ENTIRE content
-                    // — the cheap guix gates eval/guix-dependence/guix-surface — retired.
-                    // check-fast now expands to {} and PASSES as a no-op (run_selected
-                    // treats an empty selection as a pass). Do NOT fold cargo-test in
-                    // here: check-fast runs inside the td-ci-fast sandbox image, which
-                    // carries no clippy, so `cargo clippy` would red the required check
-                    // (see 325-cargo-test.rs:47). The real per-PR engine check is the
-                    // HOST cargo-test CI job; the td-ci-fast sandbox tier is now obsolete
-                    // and slated for retirement (guix-removal follow-up).
+                    // LOCAL-ONLY, VACUOUS: the Cheap + Fast pools are both empty (the
+                    // fast tier's former content — the cheap guix gates
+                    // eval/guix-dependence/guix-surface — is gone, #409), so check-fast
+                    // expands to {} and passes as a no-op (run_selected treats an empty
+                    // selection as a pass). There is no hosted `check-fast` CI job; the
+                    // per-PR engine check is the HOST `cargo-test` job. The keyword is
+                    // kept only so existing tooling/goal-lists don't break; running it
+                    // locally proves nothing.
                     add_pool(&mut sel, Pool::Cheap);
                     add_pool(&mut sel, Pool::Fast);
                 }
@@ -1055,7 +1054,6 @@ fn run_gate(
             c
         };
         cmd.current_dir(root)
-            .env("TD_GUIX", GUIX_CMD)
             .env("TD_GATE_GOALS", goal_words)
             .stdout(std::process::Stdio::from(out))
             .stderr(std::process::Stdio::from(err));
@@ -1820,7 +1818,7 @@ mod tests {
         let heavy = set.names(Pool::Heavy);
         let daily = set.names(Pool::Daily);
         // Thresholds ratchet DOWN as guix gates retire (the guix-removal workstream):
-        // the guix-oracle + Guile-lowering gates AND every $TD_GUIX-invoking gate
+        // the guix-oracle + Guile-lowering gates AND every guix-invoking gate
         // (bootstrap/provision-*/rust-build/td-feed/td-subst/oci/… + the feed-shared /
         // seed-subst companions) were deleted, so heavy dropped 45→27 and the System
         // pool emptied. #410 additionally retired the rust-toolchain recipe-graph
@@ -2031,7 +2029,8 @@ mod tests {
     #[test]
     fn non_blocking_gate_failure_is_tolerated_and_does_not_fail_fast() {
         // A `non_blocking` gate that FAILS must not red the run and must not stop
-        // other gates (the guix-pin gates, on a drifted host).
+        // other gates (the deferred corpus/seed gates, on a host that cannot
+        // realize the guix-built seed).
         let d = tmpdir("nonblock");
         let mut set = synth(
             &d,

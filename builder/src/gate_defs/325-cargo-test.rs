@@ -44,12 +44,11 @@
 //! lint it, and run its unit tests, ~2-4 min, no from-source builds. Anything that
 //! builds a package (bootstrap-build/build-plan/td-check/corpus/…) is NOT smoke; it
 //! stays in the full `check` / daily backstop.
-//! Not FAST_GATES: cargo clippy/test needs the rust toolchain, which the small
-//! td-ci-fast image does NOT carry (ci/lower-fast-drvs.sh ships node+tsc+cheap-rung
-//! closures only), so tagging it FAST would red the required offline `check-fast`. It
-//! runs in the dev-machine full ./check.sh (the §7.2 step-2 landing gate) and the
-//! full td-ci validate job — both carry rust. Promote to FAST later by adding the
-//! rust+builder closure to ci/lower-fast-drvs.sh (grows the fast image).
+//! This gate IS the hosted per-PR engine check: the `cargo-test` GitHub job
+//! (.github/workflows/ci.yml) runs `cargo test --frozen` on the runner's own
+//! rust — no store image, and it is a required check (github issue #415). The
+//! deep from-source gates stay on the dev-machine full `td-builder check` (the
+//! §7.2 step-2 landing gate) + the nightly daily suite.
 
 use crate::gates::{GateDef, Pool, StoreMode};
 

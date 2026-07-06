@@ -16,10 +16,10 @@
 #   the bitfield range:
 #     8  - unknown CLI argument
 #     9  - git fetch of origin/main failed
-#     10 - runner host not provisioned: check.sh's own integrity guard refused
-#          to start (e.g. host guix missing/mismatched vs channels.scm — see
-#          issue #268). This is a RUNNER problem, not a code regression: no
-#          gate ran, so there is nothing to triage/revert on the td side.
+#     10 - runner host not provisioned: the loop prelude refused to start (e.g.
+#          host guix absent so the deferred corpus/seed gates cannot realize their
+#          guix-built seed — see issue #268). This is a RUNNER problem, not a code
+#          regression: no gate ran, so there is nothing to triage/revert on the td side.
 set -uo pipefail
 
 verdict=".td-daily-verdict"
@@ -96,10 +96,15 @@ heavy_fail=$(grep -E '^FAIL' "$hlog" | head -5 | tr '\n' ';')
 # runner: heavy_rc=1/system_rc=1 with empty heavy_fail/system_fail, exit 7 instead of the
 # distinct exit 10). Match on the stable "FATAL: could not read the host guix commit"
 # substring rather than the whole sentence so an unrelated wording tweak doesn't silently
-# reopen this gap again.
-if [ $heavy_rc -ne 0 ] && grep -q '^td-builder check: FATAL: could not read the host guix commit' "$hlog"; then
+# reopen this gap again. TWO runner-provisioning fatals now count: (a) no host guix on PATH
+# (the deferred corpus/seed gates cannot realize their guix-built seed), and (b) a loop
+# TOOLCHAIN fatal — a core tool (bash/make/…) not resolving to an in-store bin dir, i.e. the
+# host did not bring the base userland under /gnu/store on PATH (check_loop.rs
+# provision_toolchain). Both are HOST gaps, not code regressions, and must NOT trigger a
+# fix-or-revert PR against an innocent squash commit.
+if [ $heavy_rc -ne 0 ] && grep -qE '^td-builder check: FATAL: (no guix on PATH|loop toolchain:)' "$hlog"; then
   env_error=1
-  env_error_msg="runner host not provisioned: host guix missing/mismatched vs channels.scm (see issue #268) — no gate ran, not a code regression"
+  env_error_msg="runner host not provisioned: the loop prelude could not resolve host guix and/or the base loop toolchain under /gnu/store on PATH (see issue #268) — no gate ran, not a code regression"
   heavy_fail="$env_error_msg"
   echo ">> daily backstop: $env_error_msg"
 fi
@@ -149,7 +154,7 @@ fi
 
 if [ $env_error -eq 1 ]; then
   echo ">> daily backstop: RUNNER NOT PROVISIONED at $main — $env_error_msg"
-  echo ">> daily backstop: this is a HOST setup gap, not a code regression — no fix-or-revert PR is warranted from this alone. Provision the runner with guix pulled to the channels.scm-pinned commit, then re-run."
+  echo ">> daily backstop: this is a HOST setup gap, not a code regression — no fix-or-revert PR is warranted from this alone. Provision the runner with guix on PATH (the deferred corpus/seed gates realize their guix-built seed through it), then re-run."
   cat "$verdict"
   exit 10
 fi

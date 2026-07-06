@@ -764,8 +764,9 @@ pub fn host_shell(
                             // The only ro_optional bind is /sys/fs/cgroup, needed
                             // solely by the crun gates (run/container) which run
                             // locally where the ro-remount SUCCEEDS; they never run
-                            // where this branch fires (CI runs only check-fast), so
-                            // the leftover empty dir is harmless.
+                            // where this branch fires (the hosted CI checks are
+                            // host-native lint + cargo-test, no sandbox), so the
+                            // leftover empty dir is harmless.
                             sys::warn(b"td-builder host-sandbox: ro-remount not permitted for an ro_optional bind; detached (fail-closed, no host exposure)\n");
                             let _ = sys::umount2(target_c, sys::MNT_DETACH);
                         } else {

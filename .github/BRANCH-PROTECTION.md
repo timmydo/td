@@ -7,29 +7,30 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
 
 ## What enforces what
 
-- `.github/workflows/ci.yml` — three status checks per PR:
-  - `lint` (GitHub-hosted): cheap structural checks only. It has no Guix and
-    cannot run the loop; it never substitutes for `./check.sh`.
-  - `check-fast` (hosted): `./check.sh check-fast` — the FAST tier (cheap +
-    derivation-level gates + the tsc type-check, Makefile `FAST_GATES`), run by
-    importing the small `td-ci-fast` store image. Since #26 the per-PR runner
-    runs the fast tier ONLY; the full hermetic loop is the dev-machine gate
-    (DESIGN §7.2 step 2) plus the ci-image pipeline's `validate` job (full
-    `./check.sh` against the `td-ci` image, `ci-image.yml`) — NOT a per-PR check.
-    So branch protection requires `check-fast`, never a `check` context (there
-    is no such job).
-  - `cargo-test` (GitHub-hosted): the td-native build ENGINE unit tests
-    (`cargo test --frozen`, builder/src/*.rs). The `td-ci-fast` image carries no
-    rust, so `check-fast` cannot run these — yet the engine is the heart of td.
-    The builder crate is dependency-free, so this runs on the runner's stock Rust
-    with no image, no guix, no network. **TODO (admin): add `cargo-test` to the
-    required-checks set** so the engine is gated on every PR (the bot lacks admin;
-    a human runs `.github/setup-branch-protection.sh` with it added, or edits the
-    ruleset in the UI).
+- `.github/workflows/ci.yml` — two required status checks per PR, both
+  GitHub-hosted and **host-native** (no Guix, no store image):
+  - `lint`: cheap structural checks only (shell syntax, the heal-revert
+    primitive, the no-tabs-in-Scheme convention). It cannot run the loop; it
+    never substitutes for `td-builder check`.
+  - `cargo-test`: the td-native build ENGINE gate — `cargo test --frozen`
+    (= --locked --offline) + `cargo clippy` over the dependency-free `builder`
+    crate (drv parse/emit, store-path hashing, NAR framing, the SQLite store-db
+    reader, ref-scan, the userns sandbox helpers). The builder crate carries no
+    dependencies, so this runs on the runner's stock Rust with no image, no guix,
+    no network — the same unit tests the dev-machine `check-engine` gate runs.
+    This is the heart of td, so it is a required check.
+
+  The guix-built `td-ci-fast` store image + the `check-fast` sandbox job were
+  **retired 2026-07-06** (github issue #415): the fast tier went empty when the
+  guix gates were deleted (#409), so `check-fast` was a vacuous no-op importing a
+  ~4G image. `cargo-test` is the real per-PR engine gate now. The deep tiers (the
+  from-source bootstrap ladder, the corpus, the /td/store harness) are NOT per-PR
+  checks — they run on the dev machine via `td-builder check` and nightly via
+  `ci/daily-full-suite.sh`. Cold hosted runners cannot reliably rebuild td's
+  closure, so a from-scratch CI build of the full store is not dependable.
 - `ci/revert-suspect.sh` — the optimistic-merge heal primitive. Healing is an
-  AGENT DUTY (not an automated workflow): when an agent sees `check-fast` red on
-  main, it runs this to open a revert PR for the suspect squash commit. See
-  "Heal net" below.
+  AGENT DUTY (not an automated workflow): when an agent sees `check-fast`… — see
+  "Heal net" below (it now watches `lint` + `cargo-test`).
 - `.github/setup-branch-protection.sh` — applies the `protect-main` ruleset:
   PRs only, 1 approving review, required status checks (**NON-strict** since
   2026-06-19 — a PR merges on its own green checks, NOT forced current with main
@@ -46,60 +47,21 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
    the repo. This is not optional with mandatory reviews: a PR author cannot
    approve their own PR, so if agents push and open PRs as your account,
    every PR deadlocks. Agents authenticate as the machine account (its SSH
-   key for pushes; `gh auth login` as it on the dev box for opening PRs:
-   `guix shell gh -- gh auth login`); your account reviews and approves.
-3. **Apply the gate** (lint + check-fast required) with an admin
-   `gh auth`:
+   key for pushes; `gh auth login` as it on the dev box for opening PRs);
+   your account reviews and approves.
+3. **Apply the gate** (lint + cargo-test required) with an admin `gh auth`:
 
        ./.github/setup-branch-protection.sh
 
    If branch protection was already configured by hand in the UI, this
    codifies it as the `protect-main` ruleset; remove or align the manual rule
    afterwards so there is one source of truth (Settings → Branches /
-   Settings → Rules).
-4. **Push the CI store image** (the real gate's fuel). The ci-image pipeline's
-   `validate` job (and, with the fast subset, the per-PR `check-fast` job) runs
-   on GitHub-HOSTED runners by importing a snapshot of the warm build closure
-   the ladder needs — built on a dev box whose guix matches the pin (this
-   sidesteps self-hosted runners entirely, and with them the t5700g
-   immutable-infra exclusion). On the dev box:
-
-       PUSH=1 ci/build-ci-image.sh /path/with/50G/free
-
-   (needs a gh login holding `write:packages`; pushes
-   `ghcr.io/timmydo-bot/td-ci:<pin>` and `:latest`). After the FIRST push, make
-   the package public once — GHCR UI ("td-ci" package → settings →
-   visibility) — so the workflow pulls it anonymously.
-5. **The runner check is mandatory.** As of 2026-06-18 the `td-ci-fast` image
-   is published and `check-fast` has been green on recent PRs, so
-   `setup-branch-protection.sh` requires it by default (step 3) — there is no
-   longer a separate opt-in flag. Only make `check-fast` required while the
-   image exists and the job is passing: requiring a check that cannot pass
-   blocks every PR. (This requires the `check-fast` context — not `check`,
-   which #26 removed as a per-PR job.)
-
-## CI store image (how the hosted runner runs guix)
-
-`./check.sh` needs a host guix at the pinned commit and a warm /gnu/store —
-a fresh hosted runner has neither, and with substitutes disabled it would
-build the world. The sanctioned move is DESIGN §5's "warm store in, nothing
-fetched inside": `ci/build-ci-image.sh` snapshots the exact build closure of
-every rung (enumerated from the rungs' own lowering scripts —
-`ci/lower-check-drvs.sh`), signs it with the dev box daemon's key, and ships
-it as OCI layers; the workflow imports it (`ci/import-store.sh`) and runs the
-loop unmodified, offline. The loop is never adapted to CI (ci-gate track
-constraint) — the image fixes the HOST.
-
-- **Image tag = channels.scm pin.** The workflow derives the tag from the
-  PR's channels.scm, so a channel-bump PR is red until whoever bumps it runs
-  `PUSH=1 ci/build-ci-image.sh` from the new pin (part of the bump's
-  exclusive-landing duty; the failing pull names the missing tag).
-- **New rungs:** `ci/lower-check-drvs.sh` fails loudly when the Makefile rung
-  pools change, so a rung-adding PR also updates the enumeration and pushes a
-  refreshed image (same tag — push overwrites).
-- **Run budget:** image pull+import ≈ 15–25 min, the ladder ≈ 15–30 min on
-  the 4-vCPU hosted runner (vs ~6 min on the dev box) — well inside the job's
-  240-min timeout.
+   Settings → Rules). **When the required-checks list changes** (as with the
+   2026-07-06 drop of `check-fast`), re-run this script — a PR gated on a check
+   whose job no longer runs waits forever.
+4. **No CI store image to push.** The former guix store-image pipeline
+   (`ci/build-ci-image.sh`, `ci-image.yml`) was retired with `check-fast`
+   (#415); both CI checks are host-native and need no pre-built store.
 
 ## Heal net (optimistic merge — DESIGN §7.2)
 
@@ -110,25 +72,21 @@ rebase-onto-tip + re-run. Healing is an **AGENT DUTY, not an automated workflow*
 provision.
 
 1. **The duty.** Whenever an agent fetches main (to start a track or to land),
-   it checks main's latest `check-fast`:
+   it checks main's latest required checks (`lint` + `cargo-test`):
 
        gh run list --branch main --workflow ci.yml -L 1
        # or: gh api repos/<owner>/td/commits/main/check-runs
 
-   If it is red, the agent runs `ci/revert-suspect.sh --open-pr` to open a revert
-   PR for the suspect squash commit (main's HEAD) before continuing. The agent
-   opens it with its own bot credentials (the same `~/.local/bin/gh` it uses for
-   every PR), so the revert PR triggers the required checks normally and is
-   reviewed/merged like any other PR — no `GITHUB_TOKEN` recursion-guard problem,
-   so no machine PAT is needed. The script's loop guard refuses to revert a
-   revert (no storms).
-2. **Scope.** Only the FAST tier is covered — `check-fast` is what an agent
-   watches. A heavy-only break (boot/VM/marionette/reproducibility, invisible to
-   `check-fast`) is not caught; it surfaces on the next manual full `./check.sh`
-   and is fixed forward. Running the full loop per-merge in CI isn't feasible
-   (cold hosted runners can't rebuild td's closure; the ci-image is keyed by
-   channel pin, not main commit), so a periodic dev-box full-loop heal is the
-   deferred heavy net.
+   If red, the agent runs `ci/revert-suspect.sh --open-pr` to open a revert PR
+   for the suspect squash commit (main's HEAD) before continuing. The agent opens
+   it with its own bot credentials, so the revert PR triggers the required checks
+   normally and is reviewed/merged like any other PR. The script's loop guard
+   refuses to revert a revert (no storms).
+2. **Scope.** Only what the hosted checks see is covered — a lint/engine break.
+   A heavy-only break (the from-source bootstrap ladder, the corpus, the
+   /td/store harness, reproducibility — invisible to `lint`/`cargo-test`) is not
+   caught per-PR; it surfaces on the nightly `ci/daily-full-suite.sh`, which
+   opens a fix-or-revert PR. This is the accepted velocity trade.
 
 ## The review deadlock (why the machine account is mandatory)
 
@@ -146,15 +104,15 @@ base**, not the latest tip.
 
 1. Run the loop green locally —
    `td-builder affected-checks --committed-only --run` (bounded to the ~10-min
-   per-PR tiers; daily-tier gates are deferred to the daily backstop, and only a
-   `channels.scm` bump escalates to the full loop). CI verifies your run; it
-   does not replace it.
-2. Push the branch, open the PR (`gh pr create`), wait for `lint` + `check-fast`.
+   per-PR tiers; daily-tier gates are deferred to the daily backstop). Nothing
+   escalates to the full loop anymore — the channels.scm pin, the sole
+   escalation, was removed 2026-07-06. CI verifies your run; it does not replace
+   it.
+2. Push the branch, open the PR (`gh pr create`), wait for `lint` + `cargo-test`.
 3. Human review + approval, then squash-merge (the only merge mode enabled —
    merge and rebase merges are off, linear history; the squash commit body is
    the branch's commit messages, not the PR description). **Do not rebase-onto-tip
-   + re-run just because
-   main moved** — that toil is what non-strict drops. Rebase only on a real git
-   conflict, or to sequence an exclusive landing. A broken combination is healed
-   by the next agent as a duty (above): before you start or land, if main's
-   `check-fast` is red, open the revert first.
+   + re-run just because main moved** — that toil is what non-strict drops.
+   Rebase only on a real git conflict, or to sequence an exclusive landing. A
+   broken combination is healed by the next agent as a duty (above): before you
+   start or land, if main's required checks are red, open the revert first.

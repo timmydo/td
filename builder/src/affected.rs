@@ -135,7 +135,6 @@ struct Selection {
     preflights: Vec<String>,
     targets: Vec<String>,
     notes: Vec<String>,
-    full_required: Vec<String>,
     /// Affected gates that are DAILY/SYSTEM-tier: named for the record but not
     /// run per-PR — ci/daily-full-suite.sh covers them nightly with
     /// fix-or-revert healing (the ~10-min per-PR budget, human 2026-07-04).
@@ -157,9 +156,6 @@ impl Selection {
     }
     fn add_note(&mut self, x: &str) {
         push_unique(&mut self.notes, x);
-    }
-    fn require_full(&mut self, x: &str) {
-        push_unique(&mut self.full_required, x);
     }
 }
 
@@ -530,7 +526,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // The guix-less-runner harness shipping mechanism (#314): the consumer resolver, the daily's
     // producer, and the gate that drives them. run_check_harness (check_loop.rs, the spine) also
-    // calls resolve-harness.sh, but a spine touch already escalates to the full check.
+    // calls resolve-harness.sh, but a spine touch already validates on the bounded check-pr tier.
     if pattern_matches(
         "tests/harness-subst.sh|tools/resolve-harness.sh|tools/publish-harness-subst.sh",
         p,
@@ -1014,12 +1010,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches(
-        "ci/build-ci-image.sh|ci/import-store.sh|ci/lower-*.sh|.github/setup-branch-protection.sh|.github/workflows/*",
+        ".github/setup-branch-protection.sh|.github/workflows/*",
         p,
     ) {
-        // CI/runner-gating files used to escalate to the full local loop; the
-        // local loop never exercises hosted CI, so the honest local check is the
-        // syntax preflight — the workflow run after push is the real test.
+        // CI/runner-gating files: the local loop never exercises hosted CI, so
+        // the honest local check is the syntax preflight — the workflow run after
+        // push is the real test.
         sel.add_preflight("shell-syntax");
         sel.add_note(&format!(
             "{p} affects CI or branch protection; inspect the workflow result after push."
@@ -1046,14 +1042,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if pattern_matches("*.md|DESIGN.md|CLAUDE.md|.gitignore", p) {
         return; // docs — no checks
-    }
-
-    if p == "channels.scm" {
-        sel.add_target("check-fast");
-        sel.require_full(&format!(
-            "{p} changed; the dependency pin affects the whole loop."
-        ));
-        return;
     }
 
     // Catch-all: an unmapped path used to require the FULL loop; it now runs
@@ -1131,21 +1119,10 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     o.push('\n');
     if header.explicit {
         o.push_str("Waiver: inspection only (--path does not prove the branch diff)\n");
-        if sel.full_required.is_empty() {
-            o.push_str("Branch-mode policy for these paths: the full check would be waived\n");
-        } else {
-            o.push_str("Branch-mode policy for these paths: the full check would be required\n");
-            for n in &sel.full_required {
-                o.push_str(&format!("  - {n}\n"));
-            }
-        }
-    } else if sel.full_required.is_empty() {
-        o.push_str("Waiver: the full check waived by affected-checks for this diff\n");
+        // Nothing escalates to the full loop, so the branch-mode policy is always waived.
+        o.push_str("Branch-mode policy for these paths: the full check would be waived\n");
     } else {
-        o.push_str("Waiver: the full check required before marking ready\n");
-        for n in &sel.full_required {
-            o.push_str(&format!("  - {n}\n"));
-        }
+        o.push_str("Waiver: the full check waived by affected-checks for this diff\n");
     }
 
     if !sel.notes.is_empty() {
@@ -1503,10 +1480,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_branch_policy!("builder/src/main.rs", "the full check would be waived");
     assert_branch_policy!("builder/src/sandbox.rs", "the full check would be waived");
     assert_branch_policy!("builder/Cargo.toml", "the full check would be waived");
-    // The per-PR budget (human 2026-07-04): only channels.scm still escalates to
-    // the FULL loop. The loop spine and unmapped paths validate on the bounded
-    // check-pr tier; daily/system-tier gates are named but deferred.
-    assert_branch_policy!("channels.scm", "the full check would be required");
+    // The per-PR budget (human 2026-07-04): NOTHING escalates to the FULL loop.
+    // The loop spine and unmapped paths validate on the bounded check-pr tier;
+    // daily/system-tier gates are named but deferred.
     assert_runs!("builder/src/gates.rs", "check-pr");
     assert_branch_policy!("builder/src/gates.rs", "the full check would be waived");
     assert_runs!("new/unmapped.file", "check-pr");
@@ -1748,41 +1724,9 @@ pub fn main(args: &[String]) -> ExitCode {
         }
     }
 
-    if !sel.full_required.is_empty() {
-        if explicit {
-            // Shell: `echo` (blank line to STDOUT) then the message `>&2`.
-            println!();
-            eprintln!("affected-checks: --path is inspection only; run the full check for these paths in branch mode");
-            return ExitCode::from(20);
-        }
-
-        let mut uncovered: Vec<String> = Vec::new();
-        let mut skipped: Vec<String> = Vec::new();
-        for t in &sel.targets {
-            if default_check_covers_target(&root, t) {
-                skipped.push(t.clone());
-            } else {
-                uncovered.push(t.clone());
-            }
-        }
-
-        if !uncovered.is_empty() {
-            let code = run_self_check(&root, &uncovered);
-            if code != 0 {
-                return ExitCode::from(code as u8);
-            }
-        }
-        if !skipped.is_empty() {
-            println!(
-                "\naffected-checks: escalation active; the full check covers skipped target(s): {}",
-                skipped.join(" ")
-            );
-        }
-
-        println!("\naffected-checks: escalation active; running the full check");
-        let code = run_self_check(&root, &[]);
-        return ExitCode::from(code as u8);
-    } else if !sel.targets.is_empty() {
+    // Nothing escalates to the full loop: every diff runs its bounded selected
+    // targets; daily/system-tier gates it affects are named + deferred above.
+    if !sel.targets.is_empty() {
         let code = run_self_check(&root, &sel.targets);
         return ExitCode::from(code as u8);
     }
