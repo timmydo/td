@@ -8,8 +8,8 @@ use crate::types::{Recipe, Step};
 // glibc 2.41 (from-source, not a guix package, not a binary → no guix bytes), so
 // `rust-toolchain` can co-locate a td-built libz.so.1 instead of a gate-interned one.
 //
-// This is the recipe port of the retired shell `build_zlib_x86_64`
-// (tests/rust-x86_64-runtime-store-native.sh): CC is a wrapper around the cross gcc
+// This is the recipe port of the shell `build_zlib_x86_64` that lived in the gate-416
+// script (tests/rust-x86_64-runtime-store-native.sh), retired with #410: CC is a wrapper around the cross gcc
 // (`{in:gcc-x86-64-stage2}/…/x86_64-pc-linux-gnu-gcc`) that adds the x86_64 glibc 2.41
 // headers/libs (`-isystem`/`-B`/`-L`); the glibc-x86-64 output's include already carries the
 // kernel UAPI headers glibc's bits/local_lim.h needs, so no separate kernel-header overlay is

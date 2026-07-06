@@ -1,6 +1,6 @@
 # tests/td-toolchain-x86_64-native.lock — the NATIVE x86_64 /td/store toolchain's stable
 # INPUT-ADDRESSED key: the native (ELF 64-bit, --host=x86_64) gcc 14.3.0 + binutils 2.44 (rung
-# X2, tests/x86_64-cross-fns.sh build_{gcc,binutils}_x86_64_native, #240) — the LINKER a
+# X2, the binutils-x86-64-native -> gcc-x86-64-native recipes, #240) — the LINKER a
 # /td/store rust toolchain drives. It is built FROM the cross toolchain
 # (tests/td-toolchain-x86_64.lock: cross binutils/gcc + x86_64 glibc-2.41) over the SAME pinned
 # source set, so the ARCH+HOST is the discriminator: a distinct `name` +
@@ -22,9 +22,11 @@
 # The `input`/`patch` pins MIRROR seed/sources/*.lock + seed/patches/* (IDENTICAL to
 # tests/td-toolchain-x86_64.lock — the native gcc is a BUILD configuration over the same
 # sources). The toolchain-x86_64-native-input-addressed gate asserts they stay in SYNC with the
-# cross lock's source set. Bump `recipe-rev` when the native RECIPE (tests/x86_64-cross-fns.sh
-# build_{gcc,binutils}_x86_64_native) changes without an input pin change, so a recipe change
-# re-keys it.
+# cross lock's source set. Bump `recipe-rev` when the native RECIPE (recipes/src/recipes/
+# binutils-x86-64-native.rs + gcc-x86-64-native.rs) changes what the toolchain IS (version,
+# configure flags, arch) without an input pin change, so the re-key reaches consumers. (The
+# shell->recipe port that introduced these recipes is NOT such a change — same gcc 14.3.0 +
+# binutils 2.44, same config over the same sources — so recipe-rev stayed 1.)
 name td-toolchain-x86_64-native
 recipe-rev 1
 component binutils-2.44-x86_64-native
