@@ -49,8 +49,8 @@ make_curated_path() {
 # one `ladder_build gcc-x86-64-stage2` realizes the whole graph (the warm ladder cache-hits the i686
 # base). The positional args (the old shell driver's cpath/gcc14/gst/…) are IGNORED — every rung
 # input is resolved from its lock — but kept so the gate call sites need no change. Exports the same
-# vars the shell driver did: GCC14 GST GSH BMB244SB (i686 base, for the closure/subst) + XBU XGCC2
-# XGLIBC XLIBGCCDIR XSTDCXXDIR (the cross toolchain, for verify + the native recipe).
+# vars run_x86_64_cross always did: XBU XGCC2
+# XGLIBC XLIBGCCDIR XSTDCXXDIR (the cross toolchain, for verify + closure + the native recipe).
 run_x86_64_cross() {
   . tests/ladder-lib.sh
   TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
@@ -92,17 +92,17 @@ run_x86_64_cross() {
   ladder_build gcc-x86-64-stage2 || { echo "the x86_64 cross toolchain ladder failed" >&2; return 1; }
   _lt="$_lw/scratch/tdstore"
   _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-gcc-x86-64-stage2.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
-  _b=`_lo gcc-14` && GCC14="$_b/stage/td/store/gcc-14.3.0" || return 1
-  GST=`_lo glibc-mesboot` || return 1
-  GSH=`_lo glibc-mesboot-shared` || return 1
-  BMB244SB=`_lo binutils-244` || return 1
+  # Export ONLY the cross toolchain trees (run_x86_64_cross's contract, consumed by verify/closure/
+  # native): binutils-x86-64, gcc-x86-64-stage2, glibc-x86-64. gcc-14/glibc-mesboot(-shared)/
+  # binutils-244 are in the plan as build DEPS but are NOT exported — they were gate-locals for the
+  # retired shell repro leg, and glibc-mesboot-shared isn't even in stage2's closure.
   XBU=`_lo binutils-x86-64` || return 1
   _b=`_lo gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
   _b=`_lo glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
   XLIBGCCDIR=`find "$XGCC2" -name 'libgcc_s.so.1' | head -1 | xargs -r dirname`
   XSTDCXXDIR=`find "$XGCC2" -name 'libstdc++.so.6*' | head -1 | xargs -r dirname`
   X86_WORK="$_lw"; X86_SYSROOT="$_lw/x-sysroot-unused"
-  export GCC14 GST GSH BMB244SB XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR X86_WORK X86_SYSROOT
+  export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR X86_WORK X86_SYSROOT
   echo "   [ladder] x86_64 cross toolchain via build-plan --auto: i686 base (21 rungs) -> cross binutils 2.44 -> gcc stage1 -> glibc 2.41 -> gcc stage2"
 }
 
@@ -346,30 +346,9 @@ x86_64_obtain_cross_toolchain() {
     echo ">> [subst/SKIP] fetched the x86_64 cross toolchain closure {binutils,gcc,glibc} — SKIPPED the ~98-min from-seed build"
   else
     echo ">> [subst/MISS] no exposed substitute store — building the cross toolchain from the 229-byte seed (directive 1)"
-    tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
-    mesp=`build_mes_prefix "$tc" "$_occp"` || fail "Mes (MesCC self-host) did not build/install"
-    TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$_occp" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
-    MK=`mktemp -d`/makebuild; build_make "$tc" "$_occp" "$mesp" "$TCCD" "$MK" || fail "tcc did not build GNU Make 3.80"
-    PD=`mktemp -d`/patchbuild; build_patch "$_occp" "$mesp" "$TCCD" "$MK" "$PD" || fail "the tcc-built make did not build patch"
-    BD=`mktemp -d`/binutilsbuild; build_binutils "$_occp" "$mesp" "$TCCD" "$MK" "$PD" "$BD" || fail "the tcc-built make did not build binutils-mesboot0"
-    GD=`mktemp -d`/gccbuild; build_gcc "$_occp" "$mesp" "$TCCD" "$MK" "$PD" "$BD" "$GD" || fail "the toolchain did not build gcc 2.95.3"
-    HD=`mktemp -d`/headers; build_headers "$mesp" "$HD" || fail "could not install the kernel headers"
-    GLD=`mktemp -d`/glibcbuild; build_glibc "$_occp" "$GD" "$BD" "$TCCD" "$MK" "$PD" "$HD" "$GLD" || fail "the seed toolchain did not build glibc 2.2.5"
-    G2=`mktemp -d`/gcc2build; build_gcc_mesboot0 "$_occp" "$GD" "$BD" "$GLD" "$HD" "$MK" "$PD" "$G2" || fail "the toolchain did not rebuild gcc 2.95.3 against glibc"
-    B2=`mktemp -d`/binutils1build; build_binutils_mesboot1 "$_occp" "$G2" "$BD" "$GLD" "$MK" "$PD" "$B2" || fail "gcc-mesboot0 did not rebuild binutils against glibc"
-    MM=`mktemp -d`/makemesbootbuild; build_make_mesboot "$_occp" "$G2" "$BD" "$GLD" "$MK" "$MM" || fail "gcc-mesboot0 did not rebuild GNU Make against glibc"
-    GM1=`mktemp -d`/gccmesboot1build; build_gcc_mesboot1 "$_occp" "$G2" "$B2" "$MM" "$GLD" "$PD" "$GM1" || fail "the toolchain did not build GCC 4.6.4 (c,c++)"
-    BMB=`mktemp -d`/binutilsmesbootbuild; build_binutils_mesboot "$_occp" "$GM1" "$B2" "$GLD" "$MM" "$PD" "$BMB" || fail "gcc-mesboot1 did not rebuild binutils"
-    GAWKMB=`mktemp -d`/gawkmesbootbuild; build_gawk_mesboot "$_occp" "$GM1" "$B2" "$GLD" "$MM" "$GAWKMB" || fail "gcc-mesboot1 did not build GNU awk"
-    GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$_occp" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GOUT" || fail "the toolchain did not build glibc 2.16.0"
-    GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$_occp" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
-    GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$_occp" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
-    GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$_occp" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
-    BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$_occp" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
-    GCC14="$GCC14B/stage/td/store/gcc-14.3.0"; GST="$GOUT/out"
-    echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils 2.44"
-    run_x86_64_cross "$_occp" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
-    # run_x86_64_cross exports XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU X86_WORK (physical trees)
+    # i686 base (21 rungs) + the 4 cross rungs are recipes (#378 slice 4); run_x86_64_cross drives
+    # the whole graph via build-plan --auto and exports XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR.
+    run_x86_64_cross "$_occp" || fail "the x86_64 cross toolchain (recipe ladder) failed to build from the seed"
   fi
   test -n "${XGCC2:-}" -a -n "${XGLIBC:-}" -a -n "${XBU:-}" || fail "cross toolchain vars unset after fetch/build"
 }
