@@ -49,6 +49,12 @@ done
 echo "   [supply-chain] busybox 1.37.0 + make 4.4.1 + hello 2.12.2 tarballs match their seed/sources pins — upstream bytes, not guix"
 
 # --- x86_64 toolchain + the build-userland builders (gate 420's function libraries) -----------------
+# The x86_64 toolchain gate sources as a FUNCTION LIBRARY under TD_X86_64_LIB=1: it runs the x86_64
+# pinned-input checks and sets KH_X86_64_TB (+ ROOT/fail/sha/lf), returning before its build driver.
+# Then the two low libs give make_curated_path / run_x86_64_cross / x86_64_* / _xbin / XTARGET.
+export TD_X86_64_LIB=1
+. tests/bootstrap-x86_64-toolchain-store-native.sh
+unset TD_X86_64_LIB
 . tests/cache-lib.sh
 . tests/x86_64-cross-fns.sh
 . tests/x86_64-subst-lib.sh
@@ -157,8 +163,12 @@ echo "   [provenance] built busybox + make carry zero /gnu/store bytes"
 # ==========================================================================================================
 # Intern the glibc, assemble+intern the /td/store userland and gcc-toolchain trees, and intern the source —
 # every lock input, in ONE seed store the build-recipe closure spans.
-bstore="$snwork/seed-store"; bdb="$snwork/seed.db"; mkdir -p "$bstore"
-GLP=`"$TB" store-add-recursive glibc-2.41 "$XGLIBC" "$bstore" "$bdb"` || fail "store-add glibc-2.41 failed"
+bstore="$snwork/seed-store"; mkdir -p "$bstore"
+# store-add-recursive REWRITES its db to the single path it adds, so each interned input gets its OWN
+# db; they are merged into the build closure via TD_SEED_DB + TD_EXTRA_DBS (the corpus TD_EXTRA_DBS
+# pattern). The store DIR is shared — content-scanned by build-recipe.
+gldb="$snwork/gl.db"; updb="$snwork/up.db"; tcdb="$snwork/tc.db"; hsdb="$snwork/hs.db"
+GLP=`"$TB" store-add-recursive glibc-2.41 "$XGLIBC" "$bstore" "$gldb"` || fail "store-add glibc-2.41 failed"
 case "$GLP" in /td/store/*-glibc-2.41) ;; *) fail "glibc-2.41 not content-addressed at /td/store: $GLP" ;; esac
 LD="$GLP/lib/ld-linux-x86-64.so.2"
 
@@ -176,7 +186,7 @@ done
     chmod chown touch test true false expr echo printf env pwd dirname basename head tail sort uniq wc tr cut \
     tee find xargs install date sleep id uname od comm cmp diff seq split readlink realpath stat mktemp which; do
     ln -sf busybox "$a"; done )
-UP=`"$TB" store-add-recursive hello-userland "$utree" "$bstore" "$bdb"` || fail "store-add userland failed"
+UP=`"$TB" store-add-recursive hello-userland "$utree" "$bstore" "$updb"` || fail "store-add userland failed"
 case "$UP" in /td/store/*-hello-userland) ;; *) fail "userland not content-addressed at /td/store: $UP" ;; esac
 test -x "$bstore/`basename "$UP"`/bin/sh" -a -x "$bstore/`basename "$UP"`/bin/make" || fail "interned userland missing sh/make"
 UPSH="$UP/bin/sh"
@@ -197,7 +207,7 @@ export PATH="\$d/bin:\$PATH"
 unset C_INCLUDE_PATH CPLUS_INCLUDE_PATH
 case " \$* " in
   *" -E "*|*" -c "*|*" -S "*|*" -M "*|*" -MM "*) set -- --sysroot=$GLP -B$GLP/lib "\$@" ;;
-  *) set -- --sysroot=$GLP -B$GLP/lib -L$GLP/lib -L"$LIBGCC" -Wl,--dynamic-linker -Wl,$LD -Wl,--enable-new-dtags -Wl,-rpath -Wl,$GLP/lib "\$@" ;;
+  *) set -- --sysroot=$GLP -B$GLP/lib -L$GLP/lib -L"$LIBGCC" -static-libgcc -static-libstdc++ -Wl,--dynamic-linker -Wl,$LD -Wl,--enable-new-dtags -Wl,-rpath -Wl,$GLP/lib "\$@" ;;
 esac
 exec "\$d/gcc/bin/$XTARGET-$cc" "\$@"
 WRAP
@@ -215,16 +225,19 @@ AWRAP
     chmod 0555 "$tc/bin/$tool"
   fi
 done
-# Relink every dynamic bin in the toolchain to the interned glibc loader (static bins are a no-op).
+# Relink each x86_64-DYNAMIC bin's interp to the interned glibc loader. Arch-aware ON PURPOSE:
+# static bins have no interp (skipped), and an i686 tool must NOT be repointed at the x86_64 ld
+# (it would stop running) — only a bin already naming an x86-64 loader is retargeted.
 find "$tc" -type f | while read -r t; do
-  if "$TB" elf-interp "$t" >/dev/null 2>&1; then "$TB" elf-set-interp "$t" "$LD" >/dev/null 2>&1 || true; fi
+  cur=`"$TB" elf-interp "$t" 2>/dev/null` || continue
+  case "$cur" in *ld-linux-x86-64*) "$TB" elf-set-interp "$t" "$LD" >/dev/null 2>&1 || true ;; esac
 done
-TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$bdb"` || fail "store-add gcc-toolchain failed"
+TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$tcdb"` || fail "store-add gcc-toolchain failed"
 case "$TCP" in /td/store/*-gcc-toolchain-tdstore) ;; *) fail "gcc-toolchain not content-addressed at /td/store: $TCP" ;; esac
 echo "   [content-addr] assembled /td/store gcc-toolchain: $TCP"
 
 # The source, interned at /td/store (the seed/sources fixed-output pattern) — NOT a /gnu/store path.
-HSRC=`"$TB" store-add-recursive hello-source "$HL_TB" "$bstore" "$bdb"` || fail "store-add hello-source failed"
+HSRC=`"$TB" store-add-recursive hello-source "$HL_TB" "$bstore" "$hsdb"` || fail "store-add hello-source failed"
 case "$HSRC" in /td/store/*-hello-source) ;; *) fail "hello-source not content-addressed at /td/store: $HSRC" ;; esac
 echo "   [content-addr] interned hello source $HSRC"
 
@@ -252,8 +265,8 @@ sh tests/recipe-emit.sh hello > "$snwork/hello.json" || fail "recipe-emit hello"
 mkdir -p "$snwork/hb" "$snwork/tmp"
 env -i HOME="$snwork" TMPDIR="$snwork/tmp" PATH="$cpath" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-  TD_SEED_STORE="$bstore" TD_SEED_DB="$bdb" \
-  "$TB" build-recipe "$snwork/hello.json" "$newlock" "$snwork/hb" "$bdb" >"$snwork/hb.out" 2>"$snwork/hb.err" \
+  TD_SEED_STORE="$bstore" TD_SEED_DB="$gldb" TD_EXTRA_DBS="$updb:$tcdb:$hsdb" \
+  "$TB" build-recipe "$snwork/hello.json" "$newlock" "$snwork/hb" "$gldb" >"$snwork/hb.out" 2>"$snwork/hb.err" \
   || { tail -30 "$snwork/hb.err" >&2; fail "build-recipe hello with the all-/td/store userland+toolchain"; }
 o=`sed -n 's/^OUT=out //p' "$snwork/hb.out"`; test -n "$o" || fail "hello produced no output"
 hdir="$snwork/hb/newstore/`basename "$o"`"; hbin="$hdir/bin/hello"; test -x "$hbin" || fail "no hello binary"
@@ -291,8 +304,8 @@ grep -v -- "$UP" "$newlock" > "$redlock"
 mkdir -p "$snwork/hb-red"
 if env -i HOME="$snwork" TMPDIR="$snwork/tmp" PATH="$cpath" \
      TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-     TD_SEED_STORE="$bstore" TD_SEED_DB="$bdb" \
-     "$TB" build-recipe "$snwork/hello.json" "$redlock" "$snwork/hb-red" "$bdb" >"$snwork/hb-red.out" 2>"$snwork/hb-red.err"; then
+     TD_SEED_STORE="$bstore" TD_SEED_DB="$gldb" TD_EXTRA_DBS="$updb:$tcdb:$hsdb" \
+     "$TB" build-recipe "$snwork/hello.json" "$redlock" "$snwork/hb-red" "$gldb" >"$snwork/hb-red.out" 2>"$snwork/hb-red.err"; then
   fail "[verified-red] build-recipe SUCCEEDED with the /td/store userland removed — the userland is not load-bearing"
 fi
 grep -qE 'no bash or sh|tar not found|make not found' "$snwork/hb-red.err" \
