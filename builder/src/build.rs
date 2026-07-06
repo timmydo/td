@@ -2077,18 +2077,23 @@ mod tests {
     #[test]
     fn watchdog_keeps_a_green_exit_despite_a_repeating_straggler_during_drain() {
         // A command exits 0 but leaves a background straggler that SPAMS the
-        // same stderr line while holding the pipes open. The repeat accountant
-        // sees the spam and records a trip reason — but the main command
-        // already exited, so the loop is in the drain phase and never enters
-        // the kill path: `killed` stays false, the recorded reason is dropped,
+        // same stderr line while holding the pipes open. The straggler waits
+        // until the parent shell PID has disappeared; because a zombie still
+        // answers kill -0, that means run_cmd has reaped the shell and entered
+        // the drain phase. It then emits enough repeated lines to record a trip
+        // reason and sleeps while holding the pipe open, but the kill path is no
+        // longer reachable: `killed` stays false, the recorded reason is dropped,
         // and the exit status (0) decides. The drain grace kills the straggler
-        // group so run_cmd still returns promptly. This is the guarantee that a
-        // repeat reason recorded WITHOUT a kill never overrides a real exit.
+        // group so run_cmd still returns promptly.
         let (bash, envs) = bash_and_env();
         let t0 = Instant::now();
         run_cmd(
             &bash,
-            &["-c", "while :; do echo 'expr: died again' >&2; done & exit 0"],
+            &[
+                "-c",
+                "parent=$$; (while kill -0 \"$parent\" 2>/dev/null; do sleep 0.01; done; \
+                 for ((i = 0; i < 30; i++)); do echo 'expr: died again' >&2; done; sleep 30) & exit 0",
+            ],
             ".",
             &envs,
             &w(600, 25, 0),
