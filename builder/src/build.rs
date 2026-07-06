@@ -914,6 +914,104 @@ fn apply_phases(srcdir: &str, search_path: &str, envs: &[(String, String)]) -> R
     Ok(())
 }
 
+/// Bounded, shallow-first search for `config.log` files under `root` (the
+/// top-level configure's log first, then any AC_CONFIG_SUBDIRS sub-configures).
+/// Returns at most `max` paths and stops walking once `max` are found; depth-
+/// capped so a pathological tree cannot make the failure path walk forever.
+/// Symlinked directories are not descended (a symlink reports `is_dir() == false`
+/// via `file_type`), so a self-referential source tree cannot loop.
+fn find_config_logs(root: &Path, max: usize) -> Vec<PathBuf> {
+    const MAX_DEPTH: usize = 4;
+    let mut found: Vec<PathBuf> = Vec::new();
+    // BFS by (dir, depth): shallow dirs are visited first, so the top-level
+    // config.log — the one a gnulib probe like socklen_t writes — leads.
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0));
+    while let Some((dir, depth)) = queue.pop_front() {
+        if found.len() >= max {
+            break;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if ft.is_dir() {
+                if depth < MAX_DEPTH {
+                    subdirs.push(path);
+                }
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("config.log") {
+                found.push(path);
+                if found.len() >= max {
+                    return found;
+                }
+            }
+        }
+        subdirs.sort();
+        for s in subdirs {
+            queue.push_back((s, depth.saturating_add(1)));
+        }
+    }
+    found
+}
+
+/// autoconf writes every conftest compile/link invocation and its stderr to
+/// `config.log`, NOT to the terminal — configure prints only a summary ("cannot
+/// find a type to use in place of socklen_t"), while the REAL cause (a conftest
+/// the memory watchdog / kernel OOM killer took under load, a header that failed
+/// to stage, a miscompiled probe) sits in config.log. So on a `./configure`
+/// failure, surface the tail of every config.log under the build tree: the failing
+/// probe becomes diagnosable from the gate log alone, turning a bare flaky red into
+/// evidence (issue #366). Bounded — at most `MAX_LOGS` logs, shallowest first,
+/// `TAIL_LINES` lines each — so a tree of sub-configures cannot flood the log.
+/// Best-effort: an unreadable or absent log is skipped, never an error (this runs
+/// on an already-failing path, so it must not mask the real failure with its own).
+///
+/// Crucially, the tail is taken from the conftest section, NOT the raw file end:
+/// autoconf's EXIT trap appends a large debug dump on ANY exit (the
+/// `## Cache variables ##` / `## Output variables ##` / `## confdefs.h ##`
+/// sections — hundreds of lines of cache assignments and `#define`s; a real
+/// config.log measured 2266 lines with that dump running from line 1937 to EOF).
+/// A blind file tail would show only that `#define` noise. So the window is cut at
+/// the first dump marker: the failing conftest — the actual #366 evidence — is the
+/// last thing before it. A configure KILLED before its trap ran has no marker, so
+/// the whole file is used (the failure is then at its very end).
+fn configure_log_tails(srcdir: &Path) -> String {
+    const MAX_LOGS: usize = 4;
+    const TAIL_LINES: usize = 80;
+    let mut out = String::new();
+    for log in find_config_logs(srcdir, MAX_LOGS) {
+        let body = match fs::read(&log) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let text = String::from_utf8_lossy(&body);
+        let lines: Vec<&str> = text.lines().collect();
+        // Cut at the first line of autoconf's trailing debug dump; everything
+        // above it is the useful conftest section. No marker ⇒ use the whole file.
+        let cut = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("## Cache variables"))
+            .unwrap_or(lines.len());
+        let region = lines.get(..cut).unwrap_or(lines.as_slice());
+        let shown = TAIL_LINES.min(region.len());
+        let start = region.len().saturating_sub(TAIL_LINES);
+        let tail = region.get(start..).unwrap_or(&[]).join("\n");
+        out.push_str(&format!(
+            "\n--- {} — {shown} lines of the conftest section (autoconf's trailing cache/confdefs dump trimmed); the compile failure is logged here, not on the terminal ---\n{tail}\n",
+            log.display(),
+        ));
+    }
+    out
+}
+
 pub fn run() -> Result<(), String> {
     let out = env::var("out").map_err(|_| "out not set".to_string())?;
     let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
@@ -994,7 +1092,15 @@ pub fn run() -> Result<(), String> {
     let prefix = format!("--prefix={out}");
     let mut conf: Vec<&str> = vec!["./configure", &prefix];
     conf.extend(configure_flags.iter().map(String::as_str));
-    run_cmd(&bash, &conf, &srcdir, &envs, &WATCH_CONFIGURE)?;
+    // On a configure failure the real cause is in config.log, never on the
+    // terminal (autoconf redirects conftest output there). Append its tail to the
+    // error so the failing probe is diagnosable from the gate log alone — this is
+    // what turns the #366-class flake ("cannot find a type to use in place of
+    // socklen_t", a conftest killed under memory pressure) from a bare red into
+    // evidence. The tail lands at the END of the error, so even a short `tail` of
+    // the build log shows it.
+    run_cmd(&bash, &conf, &srcdir, &envs, &WATCH_CONFIGURE)
+        .map_err(|e| format!("{e}{}", configure_log_tails(Path::new(&srcdir))))?;
 
     // build + install. Pass SHELL=<bash> as a make OVERRIDE (not just env): make
     // launches recipe shells via the SHELL make-variable, defaulting to /bin/sh,
@@ -2087,18 +2193,23 @@ mod tests {
     #[test]
     fn watchdog_keeps_a_green_exit_despite_a_repeating_straggler_during_drain() {
         // A command exits 0 but leaves a background straggler that SPAMS the
-        // same stderr line while holding the pipes open. The repeat accountant
-        // sees the spam and records a trip reason — but the main command
-        // already exited, so the loop is in the drain phase and never enters
-        // the kill path: `killed` stays false, the recorded reason is dropped,
+        // same stderr line while holding the pipes open. The straggler waits
+        // until the parent shell PID has disappeared; because a zombie still
+        // answers kill -0, that means run_cmd has reaped the shell and entered
+        // the drain phase. It then emits enough repeated lines to record a trip
+        // reason and sleeps while holding the pipe open, but the kill path is no
+        // longer reachable: `killed` stays false, the recorded reason is dropped,
         // and the exit status (0) decides. The drain grace kills the straggler
-        // group so run_cmd still returns promptly. This is the guarantee that a
-        // repeat reason recorded WITHOUT a kill never overrides a real exit.
+        // group so run_cmd still returns promptly.
         let (bash, envs) = bash_and_env();
         let t0 = Instant::now();
         run_cmd(
             &bash,
-            &["-c", "while :; do echo 'expr: died again' >&2; done & exit 0"],
+            &[
+                "-c",
+                "parent=$$; (while kill -0 \"$parent\" 2>/dev/null; do sleep 0.01; done; \
+                 for ((i = 0; i < 30; i++)); do echo 'expr: died again' >&2; done; sleep 30) & exit 0",
+            ],
             ".",
             &envs,
             &w(600, 25, 0),
@@ -2173,6 +2284,106 @@ mod tests {
         // neither source set ⇒ empty (the dependency-free self-host path).
         assert!(collect_vendor_crates("", "").unwrap().is_empty());
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn configure_log_tails_surfaces_the_failing_probe_bounded_and_shallow_first() {
+        // #366: on a configure failure the real cause is in config.log, never on
+        // the terminal (autoconf redirects conftest output there). The engine
+        // must surface the TAIL of every config.log under the build tree — the
+        // failing conftest — bounded (a real tail, not a whole-file dump) and
+        // top-level first (a gnulib probe like socklen_t writes the top-level log).
+        let base = std::env::temp_dir().join(format!("td-configlog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let srcdir = base.join("sed-4.9");
+        fs::create_dir_all(srcdir.join("lib")).unwrap();
+
+        // A realistic top-level config.log with the SHAPE a real one has: an
+        // ancient sentinel the tail must drop, a long filler stretch, the exact
+        // conftest failure a compiler killed under memory pressure produces (the
+        // #366 symptom), then — critically — autoconf's EXIT-trap debug dump
+        // (`## Cache variables ##` … `## confdefs.h ##` + hundreds of `#define`s).
+        // That dump is what a naive file-tail would surface INSTEAD of the
+        // failure, so the tail must be cut at the dump marker (the fix the code
+        // review caught: a blind `tail 40` shows only the `#define` spam below).
+        let mut top = String::from("ANCIENT-PREAMBLE-SENTINEL must be dropped by the tail\n");
+        for i in 0..200 {
+            top.push_str(&format!("configure:{i}: checking a harmless earlier probe\n"));
+        }
+        top.push_str("configure:4033: checking for socklen_t\n");
+        top.push_str("configure:4041: gcc -c -O2 conftest.c >&5\n");
+        top.push_str("gcc: fatal error: Killed signal terminated program cc1\n");
+        top.push_str("configure:4041: $? = 1\n");
+        top.push_str("configure: error: Cannot find a type to use in place of socklen_t\n");
+        // autoconf's trailing debug dump — 300 lines of cache/confdefs noise that
+        // must NOT drown the failure above it.
+        top.push_str("## ---------------- ##\n## Cache variables. ##\n## ---------------- ##\n");
+        for i in 0..120 {
+            top.push_str(&format!("ac_cv_probe_{i}=yes\n"));
+        }
+        top.push_str("## ----------------- ##\n## Output variables. ##\n## ----------------- ##\n");
+        top.push_str("## ----------- ##\n## confdefs.h. ##\n## ----------- ##\n");
+        for i in 0..180 {
+            top.push_str(&format!("#define CONFDEFS_DUMP_SPAM_{i} 1\n"));
+        }
+        top.push_str("configure: exit 1\n");
+        fs::write(srcdir.join("config.log"), &top).unwrap();
+
+        // A sub-configure (AC_CONFIG_SUBDIRS) log, one level deeper, must ALSO be
+        // surfaced — the failure may be in a bundled sub-package's configure.
+        fs::write(srcdir.join("lib").join("config.log"), "sub-configure: a different failure\n")
+            .unwrap();
+
+        let out = configure_log_tails(&srcdir);
+
+        // The failing probe AND its real cause (the killed compiler) are surfaced.
+        assert!(
+            out.contains("Cannot find a type to use in place of socklen_t"),
+            "the socklen_t failure line must be surfaced: {out}"
+        );
+        assert!(
+            out.contains("Killed signal terminated program cc1"),
+            "the killed-compiler evidence (the real cause) must be surfaced: {out}"
+        );
+        // It is a TAIL, not a dump: the ancient sentinel (200+ lines back) is gone.
+        assert!(
+            !out.contains("ANCIENT-PREAMBLE-SENTINEL"),
+            "lines older than the tail window must be dropped (a tail, not a dump): {out}"
+        );
+        // THE FIX (code-review Finding 1): autoconf's trailing cache/confdefs dump
+        // must be trimmed, NOT surfaced — a blind file tail would show only these
+        // 300 lines of `#define` noise and miss the failure above. This is what
+        // reds against the naive tail-the-whole-file implementation.
+        assert!(
+            !out.contains("CONFDEFS_DUMP_SPAM"),
+            "autoconf's trailing confdefs dump must be trimmed, not surfaced: {out}"
+        );
+        assert!(
+            !out.contains("ac_cv_probe_"),
+            "autoconf's trailing cache-variables dump must be trimmed, not surfaced: {out}"
+        );
+        // Both logs surface, and the top-level leads the deeper sub-configure's.
+        let top_at = out.find("sed-4.9/config.log").expect("top-level log named");
+        let sub_at = out.find("lib/config.log").expect("sub-configure log named");
+        assert!(top_at < sub_at, "the top-level config.log must lead the sub-configure's: {out}");
+        assert!(out.contains("sub-configure: a different failure"), "sub log surfaced: {out}");
+
+        // No config.log anywhere ⇒ empty addendum (the configure error is left
+        // exactly as it was — the diagnostic only ADDS, never rewrites).
+        let empty = base.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(configure_log_tails(&empty).is_empty(), "no logs ⇒ no addendum");
+
+        // The count bound is load-bearing (a tree of sub-configures cannot flood
+        // the log): five logs, asked for at most two, yields two.
+        for d in ["a", "b", "c", "d", "e"] {
+            let sub = base.join("many").join(d);
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("config.log"), "x\n").unwrap();
+        }
+        assert_eq!(find_config_logs(&base.join("many"), 2).len(), 2, "MAX_LOGS bound holds");
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

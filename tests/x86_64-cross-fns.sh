@@ -19,10 +19,10 @@ XTARGET=x86_64-pc-linux-gnu
 # endorses -j for exactly these (keep the mesboot base serial). Override with X86_MAKE_J= for serial.
 : "${X86_MAKE_J:=-j4}"
 
-# _store_tool <name> <guix-pkg> — a build-time scaffolding tool, from PATH or the exposed /gnu/store
+# _store_tool <name> <guix-pkg> — a build-time scaffolding tool, from PATH or the exposed /gnu/store.
+# _xbin <dir> — a bin/ of the autoconf/recursive-make scaffolding (awk/sed/make/bison/flex/…). Kept
+# for the userland gate (busybox's Kbuild) after the cross build_* rungs became recipes.
 _store_tool() { command -v "$1" 2>/dev/null || ls /gnu/store/*"$2"*/bin/"$1" 2>/dev/null | sort | head -1; }
-
-# _xbin <dir> — a bin/ of the build-time tools the autoconf/recursive-make builds need (build host)
 _xbin() {
   d=$1; mkdir -p "$d"
   for tool in awk:gawk gawk:gawk sed:sed grep:grep make:make m4:m4 bison:bison flex:flex \
@@ -32,323 +32,78 @@ _xbin() {
   ln -sf "$d/flex" "$d/lex" 2>/dev/null || true; ln -sf "$d/bison" "$d/yacc" 2>/dev/null || true
 }
 
-# _mk_static_wrapper <gcc14> <glibc216-static> <gcc|g++> <out> — a single-token, -static i686 gcc-14
-# wrapper SCRIPT for compiling the BUILD/host (i686) parts of the cross builds. build_gcc_14's
-# CC_FOR_BUILD trick: gcc strips trailing flags from a plain CC_FOR_BUILD on a native build, so the
-# build CC must be ONE token (a script survives the munging — and -isystem/-B hide inside it). The
-# glibc 2.16 headers (-idirafter) + libs/crt (-B) are the i686 libc the host conftest/programs need
-# (else `fatal error: stdio.h`); gcc's own headers + libstdc++ come from gcc14 automatically. NOTE
-# -idirafter, NOT -isystem: -isystem places the libc dir BEFORE gcc's built-in C++ header dirs, so
-# libstdc++'s `<cstdlib>` `#include_next <stdlib.h>` (which searches AFTER its own c++ dir) never
-# reaches it → `fatal error: stdlib.h`. -idirafter appends after ALL standard dirs, so #include_next
-# resolves. (build_gcc_14 sidestepped this with --with-build-sysroot; a self-contained wrapper can't.)
-_mk_static_wrapper() {
-  g14=$1; gst=$2; which=$3; dst=$4; extra=${5:-}; csh=`command -v bash 2>/dev/null || command -v sh`
-  printf '#!%s\nexec "%s/bin/%s" -static -idirafter %s/include -B%s/lib %s "$@"\n' "$csh" "$g14" "$which" "$gst" "$gst" "$extra" > "$dst"
-  chmod 0555 "$dst"
+# make_curated_path — a build/verify PATH from /gnu/store EXCLUDING every compiler (gcc/cc/guile/
+# guix): the recipe rungs bring their own toolchain, and the store-ns verifiers must not find a
+# host gcc. Moved here from the toolchain gate when its inline i686 chain was retired (#378 s4).
+make_curated_path() {
+  cdir=`mktemp -d`/bin; mkdir -p "$cdir"; oldifs=$IFS; IFS=:
+  for d in $PATH; do [ -d "$d" ] || continue; for f in "$d"/*; do b=`basename "$f"`
+    case "$b" in gcc|g++|cc|c++|cpp|gcc-*|g++-*|clang|clang*|tcc|guile|guild|guile-*|guix|guix-*) continue ;; esac
+    [ -e "$cdir/$b" ] || ln -s "$f" "$cdir/$b" 2>/dev/null || true; done; done
+  IFS=$oldifs; echo "$cdir"
 }
 
-# _x86_stable_tooldir <xbu> — REPRODUCIBILITY (gcc14-repro / [[toolchain-repro]]). Stage the cross
-# binutils' x86_64 as/ld at a FIXED, deterministic path so the cross gcc bakes a STABLE
-# DEFAULT_ASSEMBLER/DEFAULT_LINKER. `--with-as`/`--with-ld` are AC_DEFINE'd into gcc/gcc.cc and live
-# in the gcc DRIVER binary's `.rodata` (find_a_program: `access(DEFAULT_ASSEMBLER, X_OK)==0`), NOT in
-# DWARF — so repro_normalize_tree's `--strip-debug` can NOT scrub them. Pointing them at the per-build
-# mktemp $xbu (the old code) made the driver differ byte-for-byte every build. The baked path is DEAD
-# at runtime (the access() guard + #225's tooldir bundle resolve as/ld relative to argv[0]); it only
-# has to (1) satisfy access(X_OK) at BUILD time and (2) be the SAME string build-to-build. A fixed-name
-# dir of symlinks to the live $xbu as/ld does both. The dir is a FIXED ABSOLUTE /tmp path (NOT
-# $ROOT-relative), so the baked DEFAULT_ASSEMBLER string is identical for EVERY builder regardless of
-# where the worktree is checked out — checkout-independent, like guix's /tmp/guix-build-* dirs. The
-# loop's host-sandbox gives each run a private tmpfs /tmp (builder/src/sandbox.rs), so the fixed name is
-# isolated per run and vanishes on teardown. Echoes the stable dir.
-_x86_stable_tooldir() {
-  _xbu=$1
-  _d="/tmp/td-x86_64-with-as"
-  mkdir -p "$_d"
-  ln -sf "$_xbu/bin/$XTARGET-as" "$_d/$XTARGET-as"
-  ln -sf "$_xbu/bin/$XTARGET-ld" "$_d/$XTARGET-ld"
-  echo "$_d"
-}
-
-# ---------------------------------------------------------------------------------------------------
-# build_binutils_x86_64 <cpath> <gcc14> <glibc216-static> <binutils244-i686> <sysroot> <out>
-#   Cross GNU Binutils 2.44 (--target=x86_64-pc-linux-gnu), built STATIC by the i686 gcc 14.3.0.
-#   Output: i686 host binaries x86_64-pc-linux-gnu-{as,ld,ar,...} (in $out/bin) that EMIT x86_64.
-build_binutils_x86_64() {
-  cpath=$1; gcc14=$2; gst=$3; bu_i686=$4; sysroot=$5; out=$6
-  rm -rf "$out"; mkdir -p "$out"
-  xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
-  csh=`command -v bash 2>/dev/null || command -v sh`
-  wb=/tmp/td-x86_64-wrapper; rm -rf "$wb"; mkdir -p "$wb"; _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc"
-  tb=/tmp/td-x86_64-tools; rm -rf "$tb"; _xbin "$tb"   # FIXED path (gcc14-repro): $tb leaks into fixincl's baked SED path (.rodata) — a per-build mktemp made fixincl differ build-to-build
-  src=`mktemp -d`/binutils; mkdir -p "$src"
-  "$xzb" -dc "$BU244_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "binutils-2.44 unpack failed" >&2; return 1; }
-  ( cd "$src"; bp="$bu_i686/bin:$tb:$cpath"
-    env PATH="$bp" CONFIG_SHELL="$csh" SHELL="$csh" CC="$wb/cc" CC_FOR_BUILD="$wb/cc" AR="$bu_i686/bin/ar" RANLIB="$bu_i686/bin/ranlib" \
-      "$csh" ./configure --build=i686-pc-linux-gnu --host=i686-pc-linux-gnu --target=$XTARGET \
-      --prefix=/td/store/binutils-2.44-x86_64 --with-sysroot="$sysroot" \
-      --disable-nls --disable-gold --disable-werror --enable-deterministic-archives \
-      --disable-plugins --disable-gprofng --disable-multilib >cfg.log 2>&1 \
-      || { echo "x86_64 binutils configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xbu-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
-    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" make $X86_MAKE_J MAKEINFO=true >build.log 2>&1 \
-      || { echo "x86_64 binutils make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xbu-build.log" 2>/dev/null||true; tail -30 build.log >&2; return 1; }
-    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" make MAKEINFO=true install prefix="$out" >inst.log 2>&1 \
-      || { echo "x86_64 binutils install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
-  test -x "$out/bin/$XTARGET-as" -a -x "$out/bin/$XTARGET-ld" || { echo "no x86_64 as/ld produced" >&2; return 1; }
-}
-
-# ---------------------------------------------------------------------------------------------------
-# build_gcc_x86_64_stage1 <cpath> <gcc14> <glibc216-static> <binutils244-i686> <xbu> <sysroot> <out>
-#   Cross GCC 14.3.0 stage1: C only, --without-headers, --disable-shared. `make all-gcc
-#   all-target-libgcc` only (no libc yet). Built STATIC by the i686 gcc 14. Produces
-#   x86_64-pc-linux-gnu-gcc (i686 binary emitting x86_64) + a minimal libgcc.a — enough to build glibc.
-build_gcc_x86_64_stage1() {
-  cpath=$1; gcc14=$2; gst=$3; bu_i686=$4; xbu=$5; sysroot=$6; out=$7
-  rm -rf "$out"; mkdir -p "$out"
-  xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
-  csh=`command -v bash 2>/dev/null || command -v sh`
-  # FIXED path (gcc14-repro): the host-wrapper dir $wb is $(LINKER) in gcc's `checksum-options`, which
-  # genchecksum hashes into the cc1/cc1plus executable_checksum (.rodata) — a per-build mktemp made that
-  # 16-byte MD5 differ build-to-build (the residual non-determinism strip can't scrub). Fixed /tmp path.
-  wb=/tmp/td-x86_64-wrapper; rm -rf "$wb"; mkdir -p "$wb"
-  # REPRODUCIBILITY (gcc14-repro): a deterministic -frandom-seed for the HOST compiler building cc1/
-  # cc1plus/fixincl. gcc's get_file_function_name (tree.cc) names file-scope static initializers
-  # `<src>_<crc32>_<random_seed>`; with -frandom-seed UNSET gcc reads /dev/urandom (toplev.cc) → those
-  # symbols (kept in .symtab past `strip --strip-debug`) differ build-to-build. gcc's own bootstrap
-  # passes -frandom-seed=$@; --disable-bootstrap skips that, so we pin it here. SAFE as a single fixed
-  # value: the per-TU `<src>` prefix keeps the symbols unique across TUs (no ODR clash); LTO is off.
-  # Also pins local_tick -> -1 (deterministic DWARF timestamps). Bonus: stage1 reproducible too.
-  _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc" -frandom-seed=tdgcc14repro; _mk_static_wrapper "$gcc14" "$gst" g++ "$wb/cxx" -frandom-seed=tdgcc14repro
-  tb=/tmp/td-x86_64-tools; rm -rf "$tb"; _xbin "$tb"   # FIXED path (gcc14-repro): $tb leaks into fixincl's baked SED path (.rodata) — a per-build mktemp made fixincl differ build-to-build
-  # REPRODUCIBILITY (gcc14-repro): a FIXED source/build dir, NOT a per-build mktemp, so the absolute
-  # build path baked into cc1/cc1plus/fixincl (.symtab STT_FILE + __FILE__ in .rodata — NOT DWARF, so
-  # `strip --strip-debug` does NOT scrub it) is deterministic build-to-build. A FIXED ABSOLUTE /tmp path
-  # (NOT $ROOT-relative) so the baked build path is identical for EVERY builder regardless of checkout
-  # location — checkout-independent, like guix's /tmp/guix-build-* dir. The host-sandbox gives each run a
-  # private tmpfs /tmp, so the fixed name is isolated per run and vanishes on teardown (no worktree-disk
-  # leak). Two independent cross-gcc builds (the repro leg) then differ only in DWARF (stripped) + archive
-  # mtimes (-D) → byte-identical after normalization. rm'd fresh each call; sequential rungs never overlap.
-  src="/tmp/td-x86_64-gcc14-src"; rm -rf "$src"; mkdir -p "$src"
-  "$xzb" -dc "$GCC14_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "gcc-14.3.0 unpack failed" >&2; return 1; }
-  "$xzb" -dc "$GMP63_TB" | tar -xf - -C "$src" || { echo "gmp unpack failed" >&2; return 1; }
-  "$xzb" -dc "$MPFR421_TB" | tar -xf - -C "$src" || { echo "mpfr unpack failed" >&2; return 1; }
-  tar -xzf "$MPC131_TB" -C "$src" || { echo "mpc unpack failed" >&2; return 1; }
-  ( cd "$src" && ln -sf gmp-6.3.0 gmp && ln -sf mpfr-4.2.1 mpfr && ln -sf mpc-1.3.1 mpc ) || return 1
-  wadir=`_x86_stable_tooldir "$xbu"`   # deterministic --with-as/--with-ld (gcc14-repro)
-  ( cd "$src"; bp="$xbu/bin:$bu_i686/bin:$tb:$cpath"
-    for f in `grep -rl '^#! */bin/sh' . 2>/dev/null`; do sed -i "1s,^#! *[^ ]*/bin/sh,#!$csh," "$f" 2>/dev/null || true; done
-    rm -rf bld; mkdir bld; cd bld
-    env PATH="$bp" CONFIG_SHELL="$csh" CC="$wb/cc" CXX="$wb/cxx" CPP="$wb/cc -E" CC_FOR_BUILD="$wb/cc" CXX_FOR_BUILD="$wb/cxx" \
-        "$csh" ../configure --build=i686-pc-linux-gnu --host=i686-pc-linux-gnu --target=$XTARGET \
-        --prefix=/td/store/gcc-14.3.0-x86_64 --with-sysroot="$sysroot" \
-        --with-as="$wadir/$XTARGET-as" --with-ld="$wadir/$XTARGET-ld" \
-        --enable-languages=c --without-headers --with-newlib --with-glibc-version=2.41 \
-        --disable-bootstrap --disable-multilib --disable-shared --disable-threads \
-        --disable-libssp --disable-libgomp --disable-libquadmath --disable-libatomic \
-        --disable-libvtv --disable-libitm --disable-libstdcxx --disable-libcc1 \
-        --disable-lto --disable-plugin --disable-decimal-float --disable-werror >cfg.log 2>&1 \
-      || { echo "x86_64 gcc stage1 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xgcc1-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
-    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
-        make $X86_MAKE_J SHELL="$csh" MAKEINFO=true all-gcc all-target-libgcc >build.log 2>&1 \
-      || { echo "x86_64 gcc stage1 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xgcc1-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
-    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
-        make SHELL="$csh" MAKEINFO=true install-gcc install-target-libgcc DESTDIR="$out/stage" >inst.log 2>&1 \
-      || { echo "x86_64 gcc stage1 install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
-  test -x "$out/stage/td/store/gcc-14.3.0-x86_64/bin/$XTARGET-gcc" || { echo "no x86_64 stage1 gcc produced" >&2; return 1; }
-}
-
-# ---------------------------------------------------------------------------------------------------
-# build_glibc_x86_64 <cpath> <gcc14> <glibc216-static> <xbu> <xgcc1> <sysroot> <kh_x86_64_tb> <out>
-#   MODERN glibc 2.41 for x86_64, built by the stage1 cross-gcc. CC=<x86_64-cross-gcc>,
-#   BUILD_CC=<i686 gcc14 wrapper> (cross build: build-time helpers run on i686). Produces a SHARED
-#   x86_64 libc: ld-linux-x86-64.so.2 + libc.so.6. Interned at /td/store/glibc-2.41-x86_64.
-build_glibc_x86_64() {
-  cpath=$1; gcc14=$2; gst=$3; xbu=$4; xgcc1=$5; sysroot=$6; kh=$7; out=$8
-  rm -rf "$out"; mkdir -p "$out"
-  xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
-  csh=`command -v bash 2>/dev/null || command -v sh`
-  bwb=/tmp/td-x86_64-bwrapper; rm -rf "$bwb"; mkdir -p "$bwb"; _mk_static_wrapper "$gcc14" "$gst" gcc "$bwb/cc"   # i686 BUILD_CC (FIXED path, gcc14-repro)
-  tb=/tmp/td-x86_64-tools; rm -rf "$tb"; _xbin "$tb"   # FIXED path (gcc14-repro): $tb leaks into fixincl's baked SED path (.rodata) — a per-build mktemp made fixincl differ build-to-build
-  xgccbin="$xgcc1/stage/td/store/gcc-14.3.0-x86_64/bin"
-  src=`mktemp -d`/glibc; mkdir -p "$src"
-  "$xzb" -dc "$GLIBC241_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "glibc-2.41 unpack failed" >&2; return 1; }
-  ( cd "$src"
-    for f in `grep -rl '^#! */bin/sh' . 2>/dev/null`; do sed -i "1s,^#! *[^ ]*/bin/sh,#!$csh," "$f" 2>/dev/null || true; done
-    sed -i "s,^SHELL := /bin/sh,SHELL := $csh," Makeconfig 2>/dev/null || true
-    rm -rf bld; mkdir bld; cd bld
-    env PATH="$xgccbin:$xbu/bin:$tb:$cpath" CONFIG_SHELL="$csh" SHELL="$csh" \
-        CC="$XTARGET-gcc" BUILD_CC="$bwb/cc" \
-        AR="$XTARGET-ar" RANLIB="$XTARGET-ranlib" \
-        "$csh" ../configure --prefix=/td/store/glibc-2.41-x86_64 \
-        --build=i686-pc-linux-gnu --host=$XTARGET \
-        --with-headers="$sysroot/usr/include" --enable-kernel=3.2.0 --disable-werror --disable-nscd \
-        --with-binutils="$xbu/$XTARGET/bin" libc_cv_slibdir=/td/store/glibc-2.41-x86_64/lib >cfg.log 2>&1 \
-      || { echo "x86_64 glibc configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xglibc-cfg.log" 2>/dev/null||true; cp config.log "$ROOT/.td-build-cache/_xglibc-config.log" 2>/dev/null||true; tail -30 cfg.log >&2; return 1; }
-    env PATH="$xgccbin:$xbu/bin:$tb:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" \
-        make $X86_MAKE_J >build.log 2>&1 \
-      || { echo "x86_64 glibc make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xglibc-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
-    env PATH="$xgccbin:$xbu/bin:$tb:$cpath" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" SHELL="$csh" \
-        make install DESTDIR="$out/stage" >inst.log 2>&1 \
-      || { echo "x86_64 glibc install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
-  gl="$out/stage/td/store/glibc-2.41-x86_64"
-  test -e "$gl/lib/libc.so.6" -a -e "$gl/lib/ld-linux-x86-64.so.2" || { echo "no x86_64 libc.so.6/ld.so produced" >&2; return 1; }
-  # relocate glibc's ld scripts (libc.so/libpthread.so): strip the configure prefix to bare names.
-  for so in "$gl/lib/"*.so; do
-    if head -c20 "$so" 2>/dev/null | grep -q 'GNU ld script' 2>/dev/null; then
-      sed -i "s,/td/store/glibc-2.41-x86_64/lib/,,g" "$so"
-    fi
-  done
-  # populate the sysroot so the stage2 cross-gcc finds the x86_64 glibc at build time. MERGE the glibc
-  # headers INTO the existing kernel headers ($sysroot/usr/include — glibc headers #include <linux/…>,
-  # <asm/…>), and copy the glibc libs + crt + loader. ld scripts already relocated to bare names above.
-  mkdir -p "$sysroot/usr/include" "$sysroot/usr/lib"
-  cp -a "$gl/include/." "$sysroot/usr/include/"
-  cp -a "$gl/lib/." "$sysroot/usr/lib/"
-  rm -f "$sysroot/lib"; ln -sf usr/lib "$sysroot/lib"
-}
-
-# ---------------------------------------------------------------------------------------------------
-# build_gcc_x86_64_stage2 <cpath> <gcc14> <glibc216-static> <binutils244-i686> <xbu> <sysroot> <out>
-#   Cross GCC 14.3.0 stage2 (full): c,c++ --enable-shared against the x86_64 glibc sysroot ->
-#   libgcc_s.so.1 (rustc needs it dynamically) + libstdc++.so.6 + the x86_64 cross-gcc/g++.
-build_gcc_x86_64_stage2() {
-  cpath=$1; gcc14=$2; gst=$3; bu_i686=$4; xbu=$5; sysroot=$6; out=$7
-  rm -rf "$out"; mkdir -p "$out"
-  xzb=`_store_tool xz xz-`; test -n "$xzb" || { echo "no xz" >&2; return 1; }
-  csh=`command -v bash 2>/dev/null || command -v sh`
-  # FIXED path (gcc14-repro): the host-wrapper dir $wb is $(LINKER) in gcc's `checksum-options`, which
-  # genchecksum hashes into the cc1/cc1plus executable_checksum (.rodata) — a per-build mktemp made that
-  # 16-byte MD5 differ build-to-build (the residual non-determinism strip can't scrub). Fixed /tmp path.
-  wb=/tmp/td-x86_64-wrapper; rm -rf "$wb"; mkdir -p "$wb"
-  # REPRODUCIBILITY (gcc14-repro): a deterministic -frandom-seed for the HOST compiler building cc1/
-  # cc1plus/fixincl. gcc's get_file_function_name (tree.cc) names file-scope static initializers
-  # `<src>_<crc32>_<random_seed>`; with -frandom-seed UNSET gcc reads /dev/urandom (toplev.cc) → those
-  # symbols (kept in .symtab past `strip --strip-debug`) differ build-to-build. gcc's own bootstrap
-  # passes -frandom-seed=$@; --disable-bootstrap skips that, so we pin it here. SAFE as a single fixed
-  # value: the per-TU `<src>` prefix keeps the symbols unique across TUs (no ODR clash); LTO is off.
-  # Also pins local_tick -> -1 (deterministic DWARF timestamps). Bonus: stage1 reproducible too.
-  _mk_static_wrapper "$gcc14" "$gst" gcc "$wb/cc" -frandom-seed=tdgcc14repro; _mk_static_wrapper "$gcc14" "$gst" g++ "$wb/cxx" -frandom-seed=tdgcc14repro
-  tb=/tmp/td-x86_64-tools; rm -rf "$tb"; _xbin "$tb"   # FIXED path (gcc14-repro): $tb leaks into fixincl's baked SED path (.rodata) — a per-build mktemp made fixincl differ build-to-build
-  # REPRODUCIBILITY (gcc14-repro): a FIXED source/build dir, NOT a per-build mktemp, so the absolute
-  # build path baked into cc1/cc1plus/fixincl (.symtab STT_FILE + __FILE__ in .rodata — NOT DWARF, so
-  # `strip --strip-debug` does NOT scrub it) is deterministic build-to-build. A FIXED ABSOLUTE /tmp path
-  # (NOT $ROOT-relative) so the baked build path is identical for EVERY builder regardless of checkout
-  # location — checkout-independent, like guix's /tmp/guix-build-* dir. The host-sandbox gives each run a
-  # private tmpfs /tmp, so the fixed name is isolated per run and vanishes on teardown (no worktree-disk
-  # leak). Two independent cross-gcc builds (the repro leg) then differ only in DWARF (stripped) + archive
-  # mtimes (-D) → byte-identical after normalization. rm'd fresh each call; sequential rungs never overlap.
-  src="/tmp/td-x86_64-gcc14-src"; rm -rf "$src"; mkdir -p "$src"
-  "$xzb" -dc "$GCC14_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "gcc-14.3.0 unpack failed" >&2; return 1; }
-  "$xzb" -dc "$GMP63_TB" | tar -xf - -C "$src" || { echo "gmp unpack failed" >&2; return 1; }
-  "$xzb" -dc "$MPFR421_TB" | tar -xf - -C "$src" || { echo "mpfr unpack failed" >&2; return 1; }
-  tar -xzf "$MPC131_TB" -C "$src" || { echo "mpc unpack failed" >&2; return 1; }
-  ( cd "$src" && ln -sf gmp-6.3.0 gmp && ln -sf mpfr-4.2.1 mpfr && ln -sf mpc-1.3.1 mpc ) || return 1
-  wadir=`_x86_stable_tooldir "$xbu"`   # deterministic --with-as/--with-ld (gcc14-repro)
-  ( cd "$src"; bp="$xbu/bin:$bu_i686/bin:$tb:$cpath"
-    for f in `grep -rl '^#! */bin/sh' . 2>/dev/null`; do sed -i "1s,^#! *[^ ]*/bin/sh,#!$csh," "$f" 2>/dev/null || true; done
-    rm -rf bld; mkdir bld; cd bld
-    env PATH="$bp" CONFIG_SHELL="$csh" CC="$wb/cc" CXX="$wb/cxx" CPP="$wb/cc -E" CC_FOR_BUILD="$wb/cc" CXX_FOR_BUILD="$wb/cxx" \
-        "$csh" ../configure --build=i686-pc-linux-gnu --host=i686-pc-linux-gnu --target=$XTARGET \
-        --prefix=/td/store/gcc-14.3.0-x86_64 --with-sysroot="$sysroot" \
-        --with-as="$wadir/$XTARGET-as" --with-ld="$wadir/$XTARGET-ld" \
-        --enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-c99 --with-glibc-version=2.41 \
-        --disable-bootstrap --disable-multilib --disable-libssp --disable-libgomp \
-        --disable-libquadmath --disable-libvtv --disable-libitm --disable-libcc1 \
-        --disable-libsanitizer --disable-lto --disable-plugin --disable-decimal-float \
-        --disable-libstdcxx-pch --disable-werror >cfg.log 2>&1 \
-      || { echo "x86_64 gcc stage2 configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_xgcc2-cfg.log" 2>/dev/null||true; tail -25 cfg.log >&2; return 1; }
-    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
-        make $X86_MAKE_J SHELL="$csh" MAKEINFO=true >build.log 2>&1 \
-      || { echo "x86_64 gcc stage2 make failed" >&2; cp build.log "$ROOT/.td-build-cache/_xgcc2-build.log" 2>/dev/null||true; tail -40 build.log >&2; return 1; }
-    env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= CONFIG_SHELL="$csh" \
-        make SHELL="$csh" MAKEINFO=true install DESTDIR="$out/stage" >inst.log 2>&1 \
-      || { echo "x86_64 gcc stage2 install failed" >&2; tail -20 inst.log >&2; return 1; } ) || return 1
-  g="$out/stage/td/store/gcc-14.3.0-x86_64"
-  test -x "$g/bin/$XTARGET-gcc" -a -x "$g/bin/$XTARGET-g++" || { echo "no x86_64 stage2 gcc/g++ produced" >&2; return 1; }
-  find "$g" -name 'libgcc_s.so.1' | head -1 | grep -q . || { echo "x86_64 stage2 did not produce libgcc_s.so.1" >&2; return 1; }
-}
-
-# ---------------------------------------------------------------------------------------------------
-# run_x86_64_cross <cpath> <gcc14> <glibc216-static> <glibc216-shared> <binutils244-i686> <kh_x86_64_tb>
-#   Build all four cross rungs (into mktemp dirs) + a fast harness verify (run the x86_64 program via
-#   the explicit loader on the x86_64 host). Exports XGLIBC / XGCC2 / XLIBGCC for the caller's own
-#   verify. The gate calls the build_* functions itself and does the store-ns own-root verify.
+# run_x86_64_cross — build the x86_64 CROSS toolchain via the recipe ladder (build-plan --auto), the
+# #378 slice-4 replacement for the deleted shell build_* rungs. The i686 base (21 rungs) AND the 4
+# cross rungs (binutils-x86-64 → gcc-x86-64-stage1 → glibc-x86-64 → gcc-x86-64-stage2) are recipes;
+# one `ladder_build gcc-x86-64-stage2` realizes the whole graph (the warm ladder cache-hits the i686
+# base). The positional args (the old shell driver's cpath/gcc14/gst/…) are IGNORED — every rung
+# input is resolved from its lock — but kept so the gate call sites need no change. Exports the same
+# vars run_x86_64_cross always did: XBU XGCC2
+# XGLIBC XLIBGCCDIR XSTDCXXDIR (the cross toolchain, for verify + closure + the native recipe).
 run_x86_64_cross() {
-  cpath=$1; gcc14=$2; gst=$3; gshared=$4; bu_i686=$5; kh=$6
-  work=`mktemp -d`/x86; mkdir -p "$work"
-  # X86_RUNG_CACHE (dev harness only): reuse the cross binutils + gcc stage1 (the unchanging early rungs)
-  # across runs, with a STABLE sysroot, so glibc/stage2 iterations skip ~20 min. The from-seed GATE
-  # leaves it UNSET → every rung builds fresh in $work (directive 1).
-  rc="${X86_RUNG_CACHE:-}"
-  # REPRODUCIBILITY (gcc14-repro): a FIXED sysroot path even off the dev cache, so the cross gcc bakes
-  # a STABLE --with-sysroot (TARGET_SYSTEM_ROOT in the driver .rodata) + a stable include-fixed (gcc
-  # copies fixed system headers referencing the sysroot path) — a per-build mktemp $work/sysroot made
-  # the cross gcc differ build-to-build in bytes strip can't scrub. The gate path is a FIXED ABSOLUTE
-  # /tmp dir (NOT $ROOT-relative) so the baked sysroot string is checkout-independent (private tmpfs /tmp
-  # per sandbox-run; vanishes on teardown). rm'd fresh below each run.
-  if [ -n "$rc" ]; then sysroot="$rc/x-sysroot"; else sysroot="/tmp/td-x86_64-sysroot"; fi
-  rm -rf "$sysroot"; mkdir -p "$sysroot/usr/include"
-  tar -xzf "$kh" -C "$sysroot/usr/include" || { echo "x86_64 kernel headers unpack failed" >&2; return 1; }
-
-  echo ">> [x1] cross binutils 2.44 (--target=$XTARGET)"
-  if [ -n "$rc" ] && [ -x "$rc/x-binutils/bin/$XTARGET-as" ]; then
-    XBU="$rc/x-binutils"; echo "   (reusing cached cross binutils)"
-  else
-    if [ -n "$rc" ]; then XBU="$rc/x-binutils"; else XBU="$work/binutils"; fi
-    build_binutils_x86_64 "$cpath" "$gcc14" "$gst" "$bu_i686" "$sysroot" "$XBU" || return 1
-  fi
-  echo ">> [x2] cross gcc 14.3.0 stage1 (C, no libc)"
-  if [ -n "$rc" ] && [ -x "$rc/x-gcc1/stage/td/store/gcc-14.3.0-x86_64/bin/$XTARGET-gcc" ]; then
-    XGCC1="$rc/x-gcc1"; echo "   (reusing cached cross gcc stage1)"
-  else
-    if [ -n "$rc" ]; then XGCC1="$rc/x-gcc1"; else XGCC1="$work/gcc1"; fi
-    build_gcc_x86_64_stage1 "$cpath" "$gcc14" "$gst" "$bu_i686" "$XBU" "$sysroot" "$XGCC1" || return 1
-  fi
-  echo ">> [x3] x86_64 glibc 2.41 (built by the stage1 cross-gcc)"
-  if [ -n "$rc" ] && [ -e "$rc/x-glibc/stage/td/store/glibc-2.41-x86_64/lib/libc.so.6" ]; then
-    XGLIBCB="$rc/x-glibc"; echo "   (reusing cached x86_64 glibc)"
-  else
-    if [ -n "$rc" ]; then XGLIBCB="$rc/x-glibc"; else XGLIBCB="$work/glibc"; fi
-    build_glibc_x86_64 "$cpath" "$gcc14" "$gst" "$XBU" "$XGCC1" "$sysroot" "$kh" "$XGLIBCB" || return 1
-  fi
-  echo ">> [x4] cross gcc 14.3.0 stage2 (c,c++ + shared libgcc_s)"
-  if [ -n "$rc" ] && [ -x "$rc/x-gcc2/stage/td/store/gcc-14.3.0-x86_64/bin/$XTARGET-g++" ]; then
-    XGCC2B="$rc/x-gcc2"; echo "   (reusing cached cross gcc stage2)"
-  else
-    if [ -n "$rc" ]; then XGCC2B="$rc/x-gcc2"; else XGCC2B="$work/gcc2"; fi
-    build_gcc_x86_64_stage2 "$cpath" "$gcc14" "$gst" "$bu_i686" "$XBU" "$sysroot" "$XGCC2B" || return 1
-  fi
-
-  XGLIBC="$XGLIBCB/stage/td/store/glibc-2.41-x86_64"
-  XGCC2="$XGCC2B/stage/td/store/gcc-14.3.0-x86_64"
-  XLIBGCC=`find "$XGCC2" -name 'libgcc_s.so.1' | head -1`; XLIBGCCDIR=`dirname "$XLIBGCC"`
-  XSTDCXXDIR=`find "$XGCC2" -name 'libstdc++.so.6' | head -1 | xargs -r dirname`
-
-  echo ">> [verify] compile an x86_64 C + C++ program and run it via the x86_64 loader"
-  w="$work/w"; mkdir -p "$w"
-  printf 'int main(){return 42;}\n' > "$w/c.c"
-  printf '#include <vector>\nint main(){std::vector<int> v; for(int i=0;i<43;i++) v.push_back(i); return v[42];}\n' > "$w/cpp.cc"
-  csh=`command -v bash 2>/dev/null || command -v sh`
-  bw="$work/bw"; mkdir -p "$bw"; rel="glibc-2.41-x86_64"   # logical /td/store name (harness uses the live dir)
-  for cc in gcc g++; do
-    printf '#!%s\nexec "%s/bin/%s-%s" -isystem "%s/include" -B"%s/lib" -L"%s/lib" -L"%s" -L"%s" -Wl,--dynamic-linker -Wl,/td/store/%s/lib/ld-linux-x86-64.so.2 -Wl,-rpath -Wl,/td/store/%s/lib "$@"\n' \
-      "$csh" "$XGCC2" "$XTARGET" "$cc" "$XGLIBC" "$XGLIBC" "$XGLIBC" "$XLIBGCCDIR" "$XSTDCXXDIR" "$rel" "$rel" > "$bw/$cc"
-  done
-  chmod 0555 "$bw/gcc" "$bw/g++"
-  ( cd "$w" && env PATH="$XBU/bin:$cpath" "$bw/gcc" -o c.out c.c ) || { echo "x86_64 C compile failed" >&2; return 1; }
-  ( cd "$w" && env PATH="$XBU/bin:$cpath" "$bw/g++" -O2 -o cpp.out cpp.cc ) || { echo "x86_64 C++ compile failed" >&2; return 1; }
-  cls=`"$XBU/bin/$XTARGET-readelf" -h "$w/c.out" 2>/dev/null | grep -i 'class:' | grep -o 'ELF64'`
-  test "$cls" = ELF64 || { echo "the C program is not ELF64 (x86_64): got '$cls'" >&2; return 1; }
-  ci=`"$XBU/bin/$XTARGET-readelf" -l "$w/c.out" 2>/dev/null | grep -o '/td/store/[^]]*ld-linux-x86-64.so.2' | head -1`
-  test -n "$ci" || { echo "the C program interp is not the /td/store x86_64 ld" >&2; return 1; }
-  # run via the explicit loader on the x86_64 host (the baked /td/store interp doesn't exist here)
-  crc=`"$XGLIBC/lib/ld-linux-x86-64.so.2" --library-path "$XGLIBC/lib:$XLIBGCCDIR:$XSTDCXXDIR" "$w/c.out"; echo $?`
-  cpprc=`"$XGLIBC/lib/ld-linux-x86-64.so.2" --library-path "$XGLIBC/lib:$XLIBGCCDIR:$XSTDCXXDIR" "$w/cpp.out"; echo $?`
-  test "$crc" = 42 || { echo "x86_64 C program returned $crc (want 42)" >&2; return 1; }
-  test "$cpprc" = 42 || { echo "x86_64 C++ program returned $cpprc (want 42)" >&2; return 1; }
-  echo "PASS-HARNESS-CROSS: x86_64 C ($crc) + C++ ($cpprc) built by the cross gcc 14.3.0, ELF64, interp=$ci, run via the /td/store x86_64 glibc 2.41 loader"
-  # leave $work in place for the caller to inspect / intern
-  X86_WORK="$work"; X86_SYSROOT="$sysroot"; export X86_WORK X86_SYSROOT XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU
+  . tests/ladder-lib.sh
+  TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
+  if [ -n "$TD_CHECK_CHAIN_CACHE" ]; then _lw="$HOME/.td/build-daemon/ladder"; else _lw="$ROOT/.td-build-cache/ladder-cold"; fi
+  mkdir -p "`dirname "$_lw"`"
+  # STABLE sibling lock, taken before the cold wipe (the bootstrap-chain.sh #378-s3 fix); held for the
+  # body so a peer can't race the tail's _lo reads of build-*.out.
+  exec 9>"$_lw.lock"; flock 9 || { echo "ladder: flock failed" >&2; return 1; }
+  test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$_lw"
+  mkdir -p "$_lw"
+  ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
+  _bt="tool:bash tool:coreutils tool:sed tool:grep tool:gawk tool:tar tool:gzip tool:bzip2 tool:xz tool:findutils tool:diffutils"
+  ladder_emit stage0 mes tcc make-mesboot0 patch-mesboot binutils-mesboot0 gcc-core-mesboot0 mesboot-headers glibc-mesboot0 gcc-mesboot0 binutils-mesboot1 make-mesboot gcc-mesboot1 binutils-mesboot gawk-mesboot glibc-mesboot gcc-mesboot glibc-mesboot-shared gcc-14 binutils-244 glibc-241 binutils-x86-64 gcc-x86-64-stage1 glibc-x86-64 gcc-x86-64-stage2 || return 1
+  ladder_lock stage0 stage0-source || return 1
+  ladder_lock mes mes-source rung:stage0 src:nyacc $_bt || return 1
+  ladder_lock tcc tcc-source rung:stage0 rung:mes $_bt || return 1
+  ladder_lock make-mesboot0 make-mesboot0-source rung:mes rung:tcc $_bt || return 1
+  ladder_lock patch-mesboot patch-mesboot-source rung:mes rung:tcc rung:make-mesboot0 $_bt || return 1
+  ladder_lock binutils-mesboot0 binutils-mesboot-source rung:mes rung:tcc rung:make-mesboot0 rung:patch-mesboot src:patch-binutils-boot-2.20.1a tool:flex tool:bison $_bt || return 1
+  ladder_lock gcc-core-mesboot0 gcc-core-source rung:mes rung:tcc rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 src:patch-gcc-boot-2.95.3 tool:flex tool:bison $_bt || return 1
+  ladder_lock mesboot-headers linux-headers rung:mes $_bt || return 1
+  ladder_lock glibc-mesboot0 glibc-mesboot0-source rung:mes rung:tcc rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 rung:gcc-core-mesboot0 rung:mesboot-headers src:patch-glibc-boot-2.2.5 src:patch-glibc-bootstrap-system-2.2.5 $_bt || return 1
+  ladder_lock gcc-mesboot0 gcc-core-source rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 rung:gcc-core-mesboot0 rung:glibc-mesboot0 rung:mesboot-headers src:patch-gcc-boot-2.95.3 tool:flex tool:bison $_bt || return 1
+  ladder_lock binutils-mesboot1 binutils-mesboot-source rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 rung:gcc-mesboot0 rung:glibc-mesboot0 src:patch-binutils-boot-2.20.1a src:linux-headers tool:flex tool:bison $_bt || return 1
+  ladder_lock make-mesboot make-mesboot-source rung:make-mesboot0 rung:binutils-mesboot0 rung:gcc-mesboot0 rung:glibc-mesboot0 src:linux-headers $_bt || return 1
+  ladder_lock gcc-mesboot1 gcc-464-core rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot1 rung:gcc-mesboot0 rung:glibc-mesboot0 rung:make-mesboot src:gcc-464-gpp src:patch-gcc-boot-4.6.4 src:gmp src:mpfr src:mpc src:linux-headers tool:flex tool:bison $_bt || return 1
+  ladder_lock binutils-mesboot binutils-mesboot-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot1 rung:gcc-mesboot1 rung:glibc-mesboot0 src:patch-binutils-boot-2.20.1a src:linux-headers tool:flex tool:bison $_bt || return 1
+  ladder_lock gawk-mesboot gawk-mesboot-source rung:make-mesboot rung:binutils-mesboot1 rung:gcc-mesboot1 rung:glibc-mesboot0 src:linux-headers $_bt || return 1
+  ladder_lock glibc-mesboot glibc-216-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot0 rung:gawk-mesboot src:patch-glibc-boot-2.16.0 src:patch-glibc-bootstrap-system-2.16.0 src:linux-headers $_bt || return 1
+  ladder_lock gcc-mesboot gcc-494-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot src:gmp src:mpfr src:mpc src:linux-headers tool:flex tool:bison $_bt || return 1
+  ladder_lock glibc-mesboot-shared glibc-216-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot0 rung:gawk-mesboot src:patch-glibc-boot-2.16.0 src:patch-glibc-bootstrap-system-2.16.0 src:linux-headers $_bt || return 1
+  ladder_lock gcc-14 gcc-14-source rung:binutils-mesboot rung:gcc-mesboot rung:glibc-mesboot src:gmp63 src:mpfr421 src:mpc131 src:linux-headers tool:flex tool:bison tool:m4 tool:make $_bt || return 1
+  ladder_lock binutils-244 binutils-244-source rung:gcc-mesboot1 rung:glibc-mesboot rung:binutils-mesboot tool:flex tool:bison tool:make $_bt || return 1
+  ladder_lock glibc-241 glibc-241-source rung:gcc-14 rung:glibc-mesboot-shared rung:binutils-244 src:linux-headers tool:flex tool:bison tool:m4 tool:make tool:python $_bt || return 1
+  ladder_lock binutils-x86-64 binutils-244-source rung:gcc-14 rung:glibc-mesboot rung:binutils-244 src:linux-headers-x86-64 tool:flex tool:bison tool:make $_bt || return 1
+  ladder_lock gcc-x86-64-stage1 gcc-14-source rung:gcc-14 rung:glibc-mesboot rung:binutils-x86-64 rung:binutils-244 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
+  ladder_lock glibc-x86-64 glibc-241-source rung:gcc-x86-64-stage1 rung:gcc-14 rung:glibc-mesboot rung:binutils-x86-64 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make tool:python $_bt || return 1
+  ladder_lock gcc-x86-64-stage2 gcc-14-source rung:gcc-14 rung:glibc-mesboot rung:binutils-x86-64 rung:glibc-x86-64 rung:binutils-244 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
+  ladder_build gcc-x86-64-stage2 || { echo "the x86_64 cross toolchain ladder failed" >&2; return 1; }
+  _lt="$_lw/scratch/tdstore"
+  _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-gcc-x86-64-stage2.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
+  # Export ONLY the cross toolchain trees (run_x86_64_cross's contract, consumed by verify/closure/
+  # native): binutils-x86-64, gcc-x86-64-stage2, glibc-x86-64. gcc-14/glibc-mesboot(-shared)/
+  # binutils-244 are in the plan as build DEPS but are NOT exported — they were gate-locals for the
+  # retired shell repro leg, and glibc-mesboot-shared isn't even in stage2's closure.
+  XBU=`_lo binutils-x86-64` || return 1
+  _b=`_lo gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
+  _b=`_lo glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
+  XLIBGCCDIR=`find "$XGCC2" -name 'libgcc_s.so.1' | head -1 | xargs -r dirname`
+  XSTDCXXDIR=`find "$XGCC2" -name 'libstdc++.so.6*' | head -1 | xargs -r dirname`
+  X86_WORK="$_lw"; X86_SYSROOT="$_lw/x-sysroot-unused"
+  export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR X86_WORK X86_SYSROOT
+  echo "   [ladder] x86_64 cross toolchain via build-plan --auto: i686 base (21 rungs) -> cross binutils 2.44 -> gcc stage1 -> glibc 2.41 -> gcc stage2"
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -444,95 +199,6 @@ verify_x86_64_ownroot() {
   echo "$snoia" | grep -q '^IARC=42$' || { printf '%s\n' "$snoia" | sed 's/^/     /' >&2; echo "x86_64 program vs the input-addressed glibc did not return 42 in the own-root" >&2; return 1; }
   echo "   [behavioral/input-addressed] a DYNAMIC x86_64 program whose interp IS the lock-keyed /td/store glibc runs in the own-root → 42 — real x86_64 bytes at a predictable, fetchable path"
 
-}
-
-# ---------------------------------------------------------------------------------------------------
-# x86_64_gcc_repro_leg <cpath> <gcc14> <gst> <bu_i686> <xbu> <sysroot> <treeA>
-#   DURABLE intrinsic double-build reproducibility (gcc14-repro / [[toolchain-repro]]) for the cross
-#   gcc 14.3.0 — the assertion that retires nothing when guix leaves (no guix oracle in the room).
-#   <treeA> is the freshly-built cross gcc stage2 tree (already `x86_64_bundle_tooldir`'d), NOT yet
-#   normalized. This:
-#     1. records treeA's RAW nar-hash, then NORMALIZES treeA in place (repro_normalize_tree: strip the
-#        build-path-bearing DWARF + deterministic archives + drop *.la) so the caller interns the
-#        REPRODUCIBLE bytes;
-#     2. builds a SECOND, independent stage2 (fresh build dir; same fixed `--with-as`/`--with-ld`/
-#        `--with-sysroot` STRINGS, but an INDEPENDENT binutils PATH — see below), bundles its tooldir,
-#        records its RAW hash, normalizes it;
-#     3. LOGS RAW(A) vs RAW(B) (observed self-discrimination, NOT a hard assert): the gcc build dir
-#        leaks into DWARF so the raw builds normally differ, which shows the normalization below is
-#        load-bearing — but a raw-identical build is a happy surprise, not a failure, so it is not asserted;
-#     4. asserts NORM(A) == NORM(B) — the cross gcc is BYTE-REPRODUCIBLE: a stable, fetchable artifact.
-#   strip = the cross binutils `$XTARGET-strip` (static i686; its x86-family BFD strips BOTH the i686
-#   host driver/cc1 ELFs AND the x86_64 target libgcc archives), run natively (no loader wrapper).
-#   Build B is configured against an INDEPENDENT binutils PATH (a cheap `cp` of $xbu to a fresh dir,
-#   identical bytes) so that `--with-as`/`--with-ld` WOULD differ between A and B without the fixed
-#   _x86_stable_tooldir path — i.e. reverting the fix REDS this leg (verified-red), and a green here is
-#   a real cross-run reproducibility result, not a vacuous same-inputs rebuild. (--with-sysroot is
-#   pinned upstream in run_x86_64_cross to a fixed path; both builds use the same $sysroot string.)
-x86_64_gcc_repro_leg() {
-  _cpath=$1; _gcc14=$2; _gst=$3; _bu=$4; _xbu=$5; _sysroot=$6; _treeA=$7
-  _out2=""; _xbu2=""
-  # Clean up build B's scratch on EVERY exit path (its gcc tree + binutils copy can be GBs, and /tmp is
-  # a RAM-backed tmpfs), and re-point the shared tooldir symlinks at the live build-A binutils so build
-  # B's (now-deleted) $_xbu2 leaves no dangling links behind.
-  _repro_cleanup() {
-    [ -n "$_out2" ] && rm -rf "${_out2%/*}" 2>/dev/null
-    [ -n "$_xbu2" ] && rm -rf "${_xbu2%/*}" 2>/dev/null
-    _x86_stable_tooldir "$_xbu" >/dev/null 2>&1 || true
-    return 0
-  }
-  _strip="$_xbu/bin/$XTARGET-strip"
-  test -x "$_strip" || { echo "repro: no cross strip ($_strip)" >&2; return 1; }
-  _rawA=`"$TB" nar-hash "$_treeA"` || { echo "repro: nar-hash (raw) of build A failed" >&2; return 1; }
-  repro_normalize_tree "$_treeA" "$_strip" || { echo "repro: normalization of build A failed" >&2; return 1; }
-  _normA=`"$TB" nar-hash "$_treeA"` || { echo "repro: nar-hash (normalized) of build A failed" >&2; return 1; }
-  echo "   [repro] cross gcc 14.3.0 build A: raw nar-hash $_rawA → normalized $_normA"
-  # An INDEPENDENT binutils path for build B (identical bytes, different absolute path): without the
-  # deterministic --with-as fix this alone makes the two gcc drivers diverge.
-  _xbu2=`mktemp -d`/xbinutils2
-  cp -a "$_xbu" "$_xbu2" || { echo "repro: could not stage an independent binutils path for build B" >&2; _repro_cleanup; return 1; }
-  _out2=`mktemp -d`/gcc2-repro
-  echo ">> [repro] second, independent cross gcc 14.3.0 stage2 build (fresh build dir + INDEPENDENT binutils path)"
-  build_gcc_x86_64_stage2 "$_cpath" "$_gcc14" "$_gst" "$_bu" "$_xbu2" "$_sysroot" "$_out2" \
-    || { echo "repro: the second cross gcc stage2 build did not run" >&2; _repro_cleanup; return 1; }
-  _treeB="$_out2/stage/td/store/gcc-14.3.0-x86_64"
-  x86_64_bundle_tooldir "$_treeB" || { echo "repro: bundle_tooldir on build B failed" >&2; _repro_cleanup; return 1; }
-  _rawB=`"$TB" nar-hash "$_treeB"` || { echo "repro: nar-hash (raw) of build B failed" >&2; _repro_cleanup; return 1; }
-  repro_normalize_tree "$_treeB" "$_strip" || { echo "repro: normalization of build B failed" >&2; _repro_cleanup; return 1; }
-  _normB=`"$TB" nar-hash "$_treeB"` || { echo "repro: nar-hash (normalized) of build B failed" >&2; _repro_cleanup; return 1; }
-  # Observed self-discrimination (logged, not asserted — a raw-reproducible build would be a happy
-  # surprise, not a failure): the RAW builds differ because the gcc build dir leaks into DWARF, so the
-  # normalization below is load-bearing. NORM(A)==NORM(B) is NOT vacuous: if strip were a no-op AND the
-  # raw builds differ, the normalized hashes would still differ → the assertion would red.
-  if [ "$_rawA" != "$_rawB" ]; then
-    echo "   [repro/self-discrimination] the RAW double-build DIFFERS ($_rawA != $_rawB) — the build dir leaks into DWARF, so normalization is load-bearing"
-  else
-    echo "   [repro] note: the RAW double-build was already byte-identical ($_rawA) — the build is reproducible even pre-normalization"
-  fi
-  if [ "$_normA" != "$_normB" ]; then
-    echo "repro: cross gcc 14.3.0 is NOT byte-reproducible — normalized buildA=$_normA buildB=$_normB" >&2
-    # Diagnostic (only on failure): which files still differ after normalization? (no diffutils in the
-    # sandbox → compare per-file sha256 via sort|uniq -u). The differing relative paths point at the
-    # residual non-determinism to fix (e.g. an install-tools config / include-fixed text leak).
-    ( cd "$_treeA" && find . -type f -exec sha256sum {} + 2>/dev/null | sort ) > "$ROOT/.td-build-cache/_gcc14repro-A.list" 2>/dev/null || true
-    ( cd "$_treeB" && find . -type f -exec sha256sum {} + 2>/dev/null | sort ) > "$ROOT/.td-build-cache/_gcc14repro-B.list" 2>/dev/null || true
-    echo "repro: files differing after normalization (sha256 + path, each appears once per build):" >&2
-    sort "$ROOT/.td-build-cache/_gcc14repro-A.list" "$ROOT/.td-build-cache/_gcc14repro-B.list" | uniq -u | sed 's/^/     /' >&2 || true
-    # Preserve the differing binaries from BOTH builds so the residual non-determinism can be diffed
-    # (readelf/cmp) AFTER the run, instead of a blind re-build.
-    _dd="$ROOT/.td-build-cache/_gcc14repro-diff"; rm -rf "$_dd"; mkdir -p "$_dd/A" "$_dd/B"
-    # NOTE: the sandbox has NO awk — extract the path field with sed (sha256sum = "<hash>  <path>").
-    sort "$ROOT/.td-build-cache/_gcc14repro-A.list" "$ROOT/.td-build-cache/_gcc14repro-B.list" | uniq -u | sed 's/^[^ ]*  *//' | sort -u | while read -r _rel; do
-      mkdir -p "$_dd/A/`dirname "$_rel"`" "$_dd/B/`dirname "$_rel"`" 2>/dev/null || true
-      cp -a "$_treeA/$_rel" "$_dd/A/$_rel" 2>/dev/null || true
-      cp -a "$_treeB/$_rel" "$_dd/B/$_rel" 2>/dev/null || true
-    done
-    echo "repro: preserved the differing binaries under $_dd/{A,B} for post-run inspection" >&2
-    _repro_cleanup
-    return 1
-  fi
-  _repro_cleanup
-  echo "   [repro] two independent from-source builds of the cross gcc 14.3.0, normalized, are byte-identical (nar-hash $_normA) — a STABLE input-addressed /td/store artifact (durable: intrinsic double-build reproducibility, no guix oracle)"
 }
 
 # ===================================================================================================
@@ -680,30 +346,9 @@ x86_64_obtain_cross_toolchain() {
     echo ">> [subst/SKIP] fetched the x86_64 cross toolchain closure {binutils,gcc,glibc} — SKIPPED the ~98-min from-seed build"
   else
     echo ">> [subst/MISS] no exposed substitute store — building the cross toolchain from the 229-byte seed (directive 1)"
-    tc=`build_toolchain` || fail "the seed toolchain (brick 0+1) did not build"
-    mesp=`build_mes_prefix "$tc" "$_occp"` || fail "Mes (MesCC self-host) did not build/install"
-    TCCD=`mktemp -d`/tcc; build_tcc "$tc" "$_occp" "$mesp" "$TCCD" || fail "MesCC did not build tcc"
-    MK=`mktemp -d`/makebuild; build_make "$tc" "$_occp" "$mesp" "$TCCD" "$MK" || fail "tcc did not build GNU Make 3.80"
-    PD=`mktemp -d`/patchbuild; build_patch "$_occp" "$mesp" "$TCCD" "$MK" "$PD" || fail "the tcc-built make did not build patch"
-    BD=`mktemp -d`/binutilsbuild; build_binutils "$_occp" "$mesp" "$TCCD" "$MK" "$PD" "$BD" || fail "the tcc-built make did not build binutils-mesboot0"
-    GD=`mktemp -d`/gccbuild; build_gcc "$_occp" "$mesp" "$TCCD" "$MK" "$PD" "$BD" "$GD" || fail "the toolchain did not build gcc 2.95.3"
-    HD=`mktemp -d`/headers; build_headers "$mesp" "$HD" || fail "could not install the kernel headers"
-    GLD=`mktemp -d`/glibcbuild; build_glibc "$_occp" "$GD" "$BD" "$TCCD" "$MK" "$PD" "$HD" "$GLD" || fail "the seed toolchain did not build glibc 2.2.5"
-    G2=`mktemp -d`/gcc2build; build_gcc_mesboot0 "$_occp" "$GD" "$BD" "$GLD" "$HD" "$MK" "$PD" "$G2" || fail "the toolchain did not rebuild gcc 2.95.3 against glibc"
-    B2=`mktemp -d`/binutils1build; build_binutils_mesboot1 "$_occp" "$G2" "$BD" "$GLD" "$MK" "$PD" "$B2" || fail "gcc-mesboot0 did not rebuild binutils against glibc"
-    MM=`mktemp -d`/makemesbootbuild; build_make_mesboot "$_occp" "$G2" "$BD" "$GLD" "$MK" "$MM" || fail "gcc-mesboot0 did not rebuild GNU Make against glibc"
-    GM1=`mktemp -d`/gccmesboot1build; build_gcc_mesboot1 "$_occp" "$G2" "$B2" "$MM" "$GLD" "$PD" "$GM1" || fail "the toolchain did not build GCC 4.6.4 (c,c++)"
-    BMB=`mktemp -d`/binutilsmesbootbuild; build_binutils_mesboot "$_occp" "$GM1" "$B2" "$GLD" "$MM" "$PD" "$BMB" || fail "gcc-mesboot1 did not rebuild binutils"
-    GAWKMB=`mktemp -d`/gawkmesbootbuild; build_gawk_mesboot "$_occp" "$GM1" "$B2" "$GLD" "$MM" "$GAWKMB" || fail "gcc-mesboot1 did not build GNU awk"
-    GOUT=`mktemp -d`/glibcmesbootbuild; build_glibc_mesboot "$_occp" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GOUT" || fail "the toolchain did not build glibc 2.16.0"
-    GMB=`mktemp -d`/gccmesbootbuild; build_gcc_mesboot "$_occp" "$GM1" "$BMB" "$GOUT" "$MM" "$PD" "$GMB" || fail "the toolchain did not build gcc-mesboot (GCC 4.9.4)"
-    GSH=`mktemp -d`/glibcsharedbuild; build_glibc_mesboot_shared "$_occp" "$GM1" "$BMB" "$GAWKMB" "$GLD" "$MM" "$PD" "$GSH" || fail "the toolchain did not build the SHARED glibc 2.16.0"
-    GCC14B=`mktemp -d`/gcc14build; build_gcc_14 "$_occp" "$GMB/out" "$GOUT/out" "$BMB/out" "$GCC14B" || fail "the toolchain did not build MODERN GCC 14.3.0"
-    BMB244SB=`mktemp -d`/bu244sbbuild; build_binutils_244 "$_occp" "$GM1/out" "$GSH/out" "$BMB/out" "$BMB244SB" || fail "the toolchain did not build the modern binutils 2.44"
-    GCC14="$GCC14B/stage/td/store/gcc-14.3.0"; GST="$GOUT/out"
-    echo "   built the i686 base: gcc 14.3.0 + glibc 2.16 (static+shared) + binutils 2.44"
-    run_x86_64_cross "$_occp" "$GCC14" "$GST" "$GSH/out" "$BMB244SB" "$KH_X86_64_TB" || fail "the x86_64 cross rungs failed"
-    # run_x86_64_cross exports XGLIBC XGCC2 XLIBGCCDIR XSTDCXXDIR XBU X86_WORK (physical trees)
+    # i686 base (21 rungs) + the 4 cross rungs are recipes (#378 slice 4); run_x86_64_cross drives
+    # the whole graph via build-plan --auto and exports XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR.
+    run_x86_64_cross "$_occp" || fail "the x86_64 cross toolchain (recipe ladder) failed to build from the seed"
   fi
   test -n "${XGCC2:-}" -a -n "${XGLIBC:-}" -a -n "${XBU:-}" || fail "cross toolchain vars unset after fetch/build"
 }

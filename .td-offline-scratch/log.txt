@@ -2,4 +2,4 @@ td-builder: realize computed the input closure ITSELF — 10 paths by CONTENT-SC
 sandbox probe: netns interfaces: ("lo")
 sandbox probe: egress attempt failed as required: Network is unreachable
 OUT=out /gnu/store/99mbzp0yk8wvq0q0lqmnnq0ksv90y126-td-offline-sandbox-probe
-td-builder: realize registered 1 output(s) into td's store-db /home/test/src/td/.claude/worktrees/issue-378-ladder-recipes/.td-offline-scratch/b/td.db
+td-builder: realize registered 1 output(s) into td's store-db /home/test/src/td/.claude/worktrees/issue-378-slice4-x86_64/.td-offline-scratch/b/td.db
