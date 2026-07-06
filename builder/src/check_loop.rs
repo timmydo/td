@@ -150,25 +150,44 @@ fn provision_toolchain(root: &Path) -> Result<String, String> {
     if tools.is_empty() {
         return Err(fatal("tools/loop-toolchain.txt lists no tools"));
     }
+    let path_var = std::env::var("PATH").unwrap_or_default();
     let mut dirs: Vec<String> = Vec::new();
     let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut missing: Vec<&str> = Vec::new(); // not on PATH at all
-    let mut off_store: Vec<&str> = Vec::new(); // on PATH but OUTSIDE the bound store
+    let mut off_store: Vec<&str> = Vec::new(); // on PATH but NEVER under the bound store
     for t in &tools {
-        // Resolve to the tool's REAL bin dir, then keep it only if it lies under
-        // the store the sandbox binds — a dir the sandbox never exposes is worse
-        // than useless (Ok now, `command not found` for every gate later).
-        match find_in_path(t)
-            .and_then(|p| std::fs::canonicalize(p).ok())
-            .and_then(|p| p.parent().map(|d| d.display().to_string()))
-        {
-            Some(dir) if dir.starts_with(SANDBOX_STORE_PREFIX) => {
+        // Scan EVERY PATH entry for the tool and take the FIRST whose REAL dir is under the
+        // store the sandbox binds — not just the first PATH hit. On a guix-on-foreign-distro
+        // host /usr/bin/env may precede the in-store env; the first hit is off-store but a
+        // usable in-store copy is later on PATH, so stopping at the first match would
+        // false-fatal a loop the sandbox could actually run. A dir the sandbox never exposes
+        // is worse than useless (Ok now, `command not found` for every gate later).
+        let mut found_on_path = false;
+        let mut in_store: Option<String> = None;
+        for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+            let p = Path::new(dir).join(t);
+            if !p.is_file() {
+                continue;
+            }
+            found_on_path = true;
+            if let Some(real) = std::fs::canonicalize(&p)
+                .ok()
+                .and_then(|c| c.parent().map(|d| d.display().to_string()))
+            {
+                if real.starts_with(SANDBOX_STORE_PREFIX) {
+                    in_store = Some(real);
+                    break;
+                }
+            }
+        }
+        match in_store {
+            Some(dir) => {
                 resolved.insert(t);
                 if !dirs.contains(&dir) {
                     dirs.push(dir); // dedupe (e.g. sh + bash share one bin dir)
                 }
             }
-            Some(_) => off_store.push(t),
+            None if found_on_path => off_store.push(t),
             None => missing.push(t),
         }
     }

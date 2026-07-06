@@ -264,11 +264,17 @@ fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
 fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
     // Only tests/hello-no-guix.lock and tests/sed-no-guix.lock survive; both are
     // pinned inputs staged by the store-native gates that consume them. A lock edit
-    // routes to the gate that stages it: hello → the store-native hello build,
-    // sed → the store-persist gate that stages its lock entries.
+    // routes to the gate that stages it AND to recipe-checks-daily, which runs the
+    // recipe's store-native /td/store check (recipes/src/recipes/{hello,sed}.rs).
     match spec {
-        "hello" => sel.add_target("bootstrap-hello-userland"),
-        "sed" => sel.add_target("store-persist"),
+        "hello" => {
+            sel.add_target("bootstrap-hello-userland");
+            sel.add_target("recipe-checks-daily");
+        }
+        "sed" => {
+            sel.add_target("store-persist");
+            sel.add_target("recipe-checks-daily");
+        }
         _ => {
             if let Some(t) = target_for_build_spec(root, spec) {
                 sel.add_target(&t);
@@ -507,13 +513,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // fd/ripgrep are surviving recipes; their locks validate on the recipe-engine gate
-    // (their corpus build gate is retired).
-    if pattern_matches("tests/fd.lock|tests/ripgrep.lock", p) {
-        sel.add_target("recipe-rs");
-        return;
-    }
-
     // tests/build-recipes.sh IS the build phase (the former Makefile build-recipes
     // recipe, run by the gate runner) — a change to it affects every build gate,
     // exactly like the build-phase helpers below.
@@ -573,16 +572,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_preflight("shell-syntax");
         sel.add_target("rust-store-native");
         // seed/sources/rust-*.lock is also the rust-toolchain recipe's pinned source; the
-        // recipe validates on the recipe-engine gate.
+        // recipe validates on the recipe-engine gate + its store-native check runner.
         sel.add_target("recipe-rs");
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
-    // seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source, and rust-toolchain-recipe-check.sh
-    // drives the rust-toolchain recipe check — both validate on the recipe-engine gate.
+    // seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source; rust-toolchain-recipe-check.sh
+    // is the rust-toolchain recipe's store-native check BODY, run by recipe-checks-daily.
     if pattern_matches("seed/sources/zlib-*.lock|tests/rust-toolchain-recipe-check.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-rs");
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
@@ -736,18 +737,27 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         add_chain(sel, 26, 28);
         return;
     }
+    // bootstrap-hello-corpus-store-native.sh is hello's store-native recipe-check BODY (run
+    // by recipe-checks-daily); the hello source lock also feeds the store-native hello build.
     if pattern_matches("tests/bootstrap-hello-corpus-store-native.sh|seed/sources/hello-2.12.2.lock", p) {
         sel.add_preflight("shell-syntax");
+        sel.add_target("recipe-checks-daily");
         sel.add_target("bootstrap-hello-userland");
+        return;
+    }
+    // bootstrap-sed-corpus-store-native.sh is sed's store-native recipe-check BODY, run by
+    // recipe-checks-daily.
+    if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     // bootstrap-chain.sh is the SHARED from-seed toolchain chain; its consumers are the
     // store-native hello build (bootstrap-hello-userland), store-persist (which stages the
     // sed-no-guix.lock entries), and the chain-cache gate. Since #317 the chain's bricks
     // persist through the warm chain-brick cache (tests/chain-cache-lib.sh), so a chain/lib
-    // change also re-proves the chain-cache gate (hit/poison/cold semantics). (hello-corpus's
-    // OWN-file arm is above; here it is a chain CONSUMER, re-proved when the shared chain changes.)
-    if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh|tests/bootstrap-chain.sh", p) {
+    // change also re-proves the chain-cache gate (hit/poison/cold semantics).
+    if pattern_matches("tests/bootstrap-chain.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-hello-userland");
         sel.add_target("store-persist");
@@ -1286,9 +1296,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "builder/src/gate_defs/420-userland-x86_64-store-native.rs",
         "userland-x86_64-store-native"
     );
-    // fd/ripgrep are surviving recipes; their locks validate on the recipe-engine gate.
-    assert_target!("tests/fd.lock", "recipe-rs");
-    assert_target!("tests/ripgrep.lock", "recipe-rs");
+    // The store-native recipe checks (hello/sed/rust-toolchain build on the /td/store
+    // mes ladder) run via recipe-checks-daily; a change to a check BODY selects it.
+    assert_target!("tests/bootstrap-hello-corpus-store-native.sh", "recipe-checks-daily");
+    assert_target!("tests/bootstrap-sed-corpus-store-native.sh", "recipe-checks-daily");
+    assert_target!("tests/rust-toolchain-recipe-check.sh", "recipe-checks-daily");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
     // the seed tree + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
