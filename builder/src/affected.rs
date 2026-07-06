@@ -404,10 +404,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("store-ns");
         return;
     }
-    if p == "tests/store-relocate.sh" {
-        sel.add_target("store-relocate");
-        return;
-    }
 
     // Native (typed-Rust) gate BODIES (#318 axis 3): a body change must run the
     // native gates it implements (the former tests/store-*.sh / gate script
@@ -425,7 +421,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
             "store-verify",
             "store-backend",
             "store-ns",
-            "store-relocate",
         ] {
             sel.add_target(g);
         }
@@ -1231,7 +1226,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // (the former tests/store-*.sh / gate-script mapping) + the engine smoke.
     assert_target!("builder/src/gate_bodies.rs", "store-register");
     assert_target!("builder/src/gate_bodies.rs", "store-ns");
-    assert_target!("builder/src/gate_bodies.rs", "store-relocate");
     assert_target!("builder/src/gate_bodies.rs", "check-engine");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
     // catalog edit runs recipe-rs and the package build gates.

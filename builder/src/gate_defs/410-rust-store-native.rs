@@ -1,8 +1,8 @@
 //! rust-store-native — RELINK the upstream Rust toolchain to /td/store with td's OWN ELF
 //! rewriter (builder/src/elf.rs `elf-set-interp`, NO patchelf / no guix tool), then intern it
 //! GUIX-FREE. The bytes are the upstream Rust release tarball (seed/sources/rust-*.lock), not a
-//! guix build, so this eliminates guix at the source (NOT the demoted store-relocate of a guix
-//! binary). Toward a usable Rust userspace assembled WITHOUT the guix operating-system
+//! guix build, so this eliminates guix at the source rather than relabeling guix bytes.
+//! Toward a usable Rust userspace assembled WITHOUT the guix operating-system
 //! (system/td.scm) — rust-store-native track. Durable legs: supply-chain (sha==pin),
 //! provenance (zero /gnu/store), structural (interp -> /td/store, interned content-addressed).
 //! The /td/store-RUNTIME leg is PENDING the gcc lane's glibc-final (rust needs GLIBC_2.17; the

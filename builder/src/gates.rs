@@ -1824,9 +1824,9 @@ mod tests {
         // toolchain — leaving only the /td/store store-native ladder, the store
         // primitives, and the engine. These guard against ACCIDENTAL loss, not
         // deliberate retirement — lower them in the same PR that removes gates.
-        assert!(heavy.len() >= 20, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
+        assert!(heavy.len() >= 19, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
         assert!(daily.len() >= 32, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 52, "the full check lost gates");
+        assert!(heavy.len() + daily.len() >= 51, "the full check lost gates");
         for g in ["cargo-test", "store-verify"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
