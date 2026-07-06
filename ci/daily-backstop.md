@@ -11,19 +11,41 @@ how that agent is run.
 ## The two halves
 
 - **Mechanical runner — `ci/daily-full-suite.sh`** (in repo): fetches fresh main, runs
-  `./check.sh` + `./check.sh check-system`, writes `.td-daily-verdict` (machine-readable) and,
-  on all-green, records `.td-last-green` (the seed of a future "stable" marker). Exit: 0 green,
-  1 heavy red, 2 system red, 3 both.
-- **The agent** — judgment: runs the runner, and on red triages the suspect range and opens a
-  fix-or-revert PR. Run it daily as a fresh headless agent (NOT inside a working session).
+  `td-builder check` (the heavy+daily pool) + `td-builder check check-system`, and ALWAYS
+  also attempts the guix-free `td-builder check check-harness` leg — its own precondition is
+  "harness locally persisted or fetchable from a substitute store", not "did heavy run"
+  (issue #315). Writes `.td-daily-verdict` (machine-readable) and, on all-green, records
+  `.td-last-green` (the seed of a future "stable" marker).
+  - **Exit is a bitfield**: 1 heavy red, 2 system red, 4 harness red — REAL regressions only;
+    a leg the runner isn't provisioned for does not set its bit (see `env_error`/
+    `env_error_msg` and `harness_env_error` in the verdict).
+  - **Exit 10**: the runner is unprovisioned for EVERY leg (no host guix / loop toolchain for
+    heavy/system, and no local/fetchable `/td/store` harness) — nothing ran anywhere, nothing
+    to triage.
+  - **Exit 8/9**: bad CLI arg / `git fetch origin main` failed, before anything ran.
+  - A runner with no host guix/loop-toolchain but a reachable harness substitute does NOT hit exit 10:
+    heavy/system are marked unprovisioned (not counted as regressions) while the harness
+    leg's own green/red still reaches the verdict — printed as `PARTIAL` (harness green,
+    nothing to revert, `.td-last-green` NOT recorded since heavy/system never ran) or as a
+    real `rc` bit (harness red — genuinely actionable even though heavy/system didn't run).
+- **The agent** — judgment: runs the runner, and on a real (non-unprovisioned) red triages
+  the suspect range and opens a fix-or-revert PR. Run it daily as a fresh headless agent
+  (NOT inside a working session).
 
 ## Agent prompt (what the daily agent does)
 
 ```
 You are the td daily full-suite backstop. The repo is at <REPO>. Steps:
 1. cd <REPO>; run: ci/daily-full-suite.sh --verdict .td-daily-verdict
-2. Read .td-daily-verdict. If heavy=green and system in {green,skipped}: report green, stop.
-3. On red: the suspect is in `git log $(cat .td-last-green 2>/dev/null || echo origin/main~10)..origin/main`.
+2. Read .td-daily-verdict.
+   - Exit 10: runner unprovisioned for every leg (no host guix/loop-toolchain, no reachable
+     harness) — a HOST setup gap, not a code regression. Report it and stop; no PR.
+   - `env_error=1` with harness green: heavy/system didn't run (no host guix/loop-toolchain)
+     but nothing that DID run is red — report the PARTIAL state and stop; no PR.
+   - Any leg genuinely red (heavy_rc/system_rc/harness_rc nonzero and NOT explained by
+     env_error / harness_env_error): a real regression — proceed to step 3.
+   - Otherwise (all green): report green, stop.
+3. On a real red: the suspect is in `git log $(cat .td-last-green 2>/dev/null || echo origin/main~10)..origin/main`.
    Reproduce the failing gate (the *_fail field names it) to confirm it is a real regression,
    not host contention (re-run that one gate in isolation). If real, identify the squash commit
    that introduced it and open a FIX-OR-REVERT PR with `ci/revert-suspect.sh --ref <sha> --open-pr`

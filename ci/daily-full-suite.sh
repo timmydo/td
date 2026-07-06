@@ -11,16 +11,33 @@
 # Usage:
 #   ci/daily-full-suite.sh [--no-system] [--verdict FILE]
 # Exit: a bitfield over the suites — 1 heavy red, 2 system red, 4 harness red
-#   (guix-free /td/store tier); 0 = all green, up to 7. Setup errors exit 8/9/10
-#   (before any suite runs, or before any GATE inside a suite runs), kept out of
+#   (guix-free /td/store tier); 0 = all green, up to 7. A leg that could not run
+#   because the RUNNER isn't provisioned for it (no host guix/loop-toolchain for
+#   heavy/system; no local + no fetchable harness for the harness leg) does NOT
+#   set its bit — see env_error/env_error_msg and harness_env_error/harness_fail
+#   in the verdict. Setup errors exit 8/9/10 (before any suite runs, or before any
+#   GATE anywhere ran — heavy/system AND harness all unprovisioned), kept out of
 #   the bitfield range:
 #     8  - unknown CLI argument
 #     9  - git fetch of origin/main failed
-#     10 - runner host not provisioned: the loop prelude refused to start (e.g.
-#          host guix absent so the deferred corpus/seed gates cannot realize their
-#          guix-built seed — see issue #268). This is a RUNNER problem, not a code
-#          regression: no gate ran, so there is nothing to triage/revert on the td side.
+#     10 - runner host not provisioned for EVERY leg: the loop prelude refused to
+#          start (no host guix / loop toolchain on PATH — see issue #268) AND no
+#          local/fetchable /td/store harness (harness — see issue #315). This is
+#          a RUNNER problem, not a code regression: no gate ran anywhere, so there
+#          is nothing to triage/revert on the td side. A runner that can run at
+#          least the harness leg does NOT hit this exit — see below.
 set -uo pipefail
+
+# Classify a td-builder check FATAL as a runner-provisioning condition (not a code
+# regression) vs a genuine failure. One shared matcher for the call sites below (the
+# heavy/system guix-guard and the harness leg's own not-provisioned guard) so the
+# "td-builder check: FATAL: " prefix — the part shared with check_loop.rs's `fatal()`
+# helper — has a single place to update instead of copies that can drift out of sync
+# with each other, which is exactly how this classification silently broke before (#268,
+# then again via e0f8401 — issue #315).
+is_unprovisioned_fatal() {
+  grep -qE "^td-builder check: FATAL: ($2)" "$1"
+}
 
 verdict=".td-daily-verdict"
 run_system=1
@@ -73,30 +90,30 @@ echo ">> daily backstop: full td-builder check on origin/main ($main)"
 # warm chain bricks by default; the daily stays the authoritative from-seed proof that the
 # whole bootstrap chain still BUILDS, so it must never consume a warm brick.
 TD_CHECK_CHAIN_CACHE= TD_SUBST_FORCE_BUILD=1 TD_BUILD_JOBS=${TD_BUILD_JOBS:-4} "$TDB" check >"$hlog" 2>&1 || heavy_rc=$?
-heavy_fail=$(grep -E '^FAIL' "$hlog" | head -5 | tr '\n' ';')
+# Widened to also catch a pre-gate FATAL (e.g. provision_stage0 failing for a real,
+# non-guix reason with env_error staying 0) — matches the harness leg's own FATAL-inclusive
+# grep below, so a heavy-tier FATAL doesn't leave heavy_fail empty in the verdict (#417 review).
+heavy_fail=$(grep -E '^FAIL|^td-builder check: FATAL' "$hlog" | head -5 | tr '\n' ';')
 
-# td-builder check's own integrity guard (guard_pinned_guix, builder/src/check_loop.rs)
-# aborts BEFORE any gate runs when the runner host isn't provisioned with guix at all.
-# That is a runner-provisioning problem, not a gate regression (issue #268) — a bare
-# heavy=red/system=red with no *_fail is indistinguishable from a real break, so detect
-# it here and report it distinctly instead of sending an agent hunting for a code
-# regression that doesn't exist.
+# td-builder check's own fail-closed guards (builder/src/check_loop.rs `run()`) abort BEFORE
+# any gate runs when the runner host isn't provisioned for the standard tier at all. That is
+# a runner-provisioning problem, not a gate regression (issue #268) — a bare
+# heavy=red/system=red with no *_fail is indistinguishable from a real break, so detect it
+# here and report it distinctly instead of sending an agent hunting for a code regression
+# that doesn't exist.
 #
-# The matched text must track guard_pinned_guix's actual FATAL wording (check_loop.rs):
-# #316 (2026-07-03) ported check.sh's "check.sh: FATAL: host guix (...) != pinned..."
-# message to td-builder's "td-builder check: FATAL: could not read the host guix commit
-# (...)" without updating this grep, so every guix-less run since silently fell through
-# to the heavy=red/system=red path this guard exists to avoid (reproduced on a guix-less
-# runner: heavy_rc=1/system_rc=1 with empty heavy_fail/system_fail, exit 7 instead of the
-# distinct exit 10). Match on the stable "FATAL: could not read the host guix commit"
-# substring rather than the whole sentence so an unrelated wording tweak doesn't silently
-# reopen this gap again. TWO runner-provisioning fatals now count: (a) no host guix on PATH
-# (the deferred corpus/seed gates cannot realize their guix-built seed), and (b) a loop
-# TOOLCHAIN fatal — a core tool (bash/make/…) not resolving to an in-store bin dir, i.e. the
-# host did not bring the base userland under /gnu/store on PATH (check_loop.rs
-# provision_toolchain). Both are HOST gaps, not code regressions, and must NOT trigger a
-# fix-or-revert PR against an innocent squash commit.
-if [ $heavy_rc -ne 0 ] && grep -qE '^td-builder check: FATAL: (no guix on PATH|loop toolchain:)' "$hlog"; then
+# The matched substrings must track check_loop.rs's actual FATAL wording. History: #316
+# (2026-07-03) ported check.sh's old guard to td-builder's own "FATAL: could not read the
+# host guix commit (...)" wording; e0f8401 (2026-07-05, #406) then REMOVED that guard
+# entirely in favor of a simpler "no guix on PATH" check, but did not update this grep — so
+# every guix-less daily run since silently fell through to the heavy=red/system=red path
+# this guard exists to avoid (issue #315). #416 (2026-07-06) then dropped the guix pin
+# entirely and added a SECOND runner-provisioning fatal: a "loop toolchain:" fatal when a
+# core tool (bash/make/…) doesn't resolve to an in-store bin dir — i.e. the host didn't
+# bring the base userland under /gnu/store on PATH. Both are HOST gaps, not code
+# regressions. Match on stable substrings rather than whole sentences so an unrelated
+# wording tweak doesn't silently reopen this gap again.
+if [ $heavy_rc -ne 0 ] && is_unprovisioned_fatal "$hlog" 'no guix on PATH|loop toolchain:'; then
   env_error=1
   env_error_msg="runner host not provisioned: the loop prelude could not resolve host guix and/or the base loop toolchain under /gnu/store on PATH (see issue #268) — no gate ran, not a code regression"
   heavy_fail="$env_error_msg"
@@ -114,20 +131,51 @@ elif [ "$run_system" = 1 ]; then
 fi
 
 # host-sandbox-stage0 inc2c: the GUIX-FREE harness tier — the loop on td's OWN /td/store
-# harness (busybox+make, NO guix). The heavy ./check.sh above ran gate 420, which persists
-# .td-build-cache/harness; consume it here. This is the loop the guix-less VM runs. Only
-# attempt it when the harness was persisted (heavy green enough to reach gate 420); a missing
-# harness is a heavy-suite problem already reported, not a separate harness failure.
-if [ $env_error -eq 1 ]; then
-  harness_rc=4; harness_fail="SKIPPED — $env_error_msg"
-  echo ">> daily backstop: check-harness SKIPPED — $env_error_msg"
-elif [ -d .td-build-cache/harness/store ] && [ -s .td-build-cache/harness/rel ]; then
-  echo ">> daily backstop: td-builder check check-harness on origin/main ($main) — guix-free /td/store loop"
-  "$TDB" check check-harness >"$xlog" 2>&1 || harness_rc=$?
-  harness_fail=$(grep -E '^FAIL|^(check\.sh|td-builder check): FATAL' "$xlog" | head -5 | tr '\n' ';')
+# harness (busybox+make, NO guix). This is the loop a guix-less runner can ALWAYS attempt,
+# independent of whether heavy/system ran at all (issue #315): `check-harness` resolves its
+# own precondition — it consumes a locally-persisted .td-build-cache/harness (e.g. this same
+# run's heavy suite reached gate 420), or FETCHES the daily-published signed harness
+# substitute (tools/resolve-harness.sh) when absent locally, and only THEN fails closed. So
+# the harness leg's precondition is "harness provisioned/fetchable", never "did heavy run" —
+# do not gate the attempt on env_error or on a local .td-build-cache/harness check.
+harness_env_error=0
+echo ">> daily backstop: td-builder check check-harness on origin/main ($main) — guix-free /td/store loop"
+"$TDB" check check-harness >"$xlog" 2>&1 || harness_rc=$?
+# `check-harness` can FATAL two ways before its own loop content ever runs: the harness
+# itself unfetchable/unprovisioned, OR its own stage0 td-builder failing to build
+# (load_stage0_tb, check_loop.rs) — both are runner-provisioning gaps, not a harness-loop
+# regression, so classify either as harness_env_error.
+if [ $harness_rc -ne 0 ] && is_unprovisioned_fatal "$xlog" 'no provisioned /td/store harness|could not build the guix-free stage0 td-builder'; then
+  harness_env_error=1
+  harness_fail="runner not provisioned: no local /td/store harness and none fetchable from a substitute store (see issue #315) — not a code regression"
+  echo ">> daily backstop: $harness_fail"
 else
-  harness_rc=4; harness_fail="no .td-build-cache/harness persisted (gate 420 did not complete)"
-  echo ">> daily backstop: check-harness SKIPPED — $harness_fail"
+  harness_fail=$(grep -E '^FAIL|^td-builder check: FATAL' "$xlog" | head -5 | tr '\n' ';')
+fi
+
+# Per-leg verdict state, computed once as plain variables (not inline &&/|| ternaries in the
+# echo below — a nested ternary there previously hid a since-fixed unreachable branch, #417
+# review) so each leg's env-error/skip/genuinely-red states stay easy to audit at a glance.
+heavy_state=green
+[ $heavy_rc -ne 0 ] && heavy_state=red
+[ $env_error -eq 1 ] && heavy_state=unprovisioned
+
+if [ "$run_system" != 1 ]; then
+  system_state=skipped
+elif [ $env_error -eq 1 ]; then
+  system_state=unprovisioned
+elif [ $system_rc -eq 0 ]; then
+  system_state=green
+else
+  system_state=red
+fi
+
+if [ $harness_env_error -eq 1 ]; then
+  harness_state=unprovisioned
+elif [ $harness_rc -eq 0 ]; then
+  harness_state=green
+else
+  harness_state=red
 fi
 
 {
@@ -135,29 +183,47 @@ fi
   echo "date=$(date -Is)"
   echo "env_error=$env_error"
   echo "env_error_msg=$env_error_msg"
-  echo "heavy=$([ $heavy_rc -eq 0 ] && echo green || echo red)"
+  echo "heavy=$heavy_state"
   echo "heavy_rc=$heavy_rc"
   echo "heavy_fail=$heavy_fail"
-  echo "system=$([ "$run_system" = 1 ] && { [ $system_rc -eq 0 ] && echo green || echo red; } || echo skipped)"
+  echo "system=$system_state"
   echo "system_rc=$system_rc"
   echo "system_fail=$system_fail"
-  echo "harness=$([ $harness_rc -eq 0 ] && echo green || echo red)"
+  echo "harness=$harness_state"
   echo "harness_rc=$harness_rc"
+  echo "harness_env_error=$harness_env_error"
   echo "harness_fail=$harness_fail"
 } > "$verdict"
 
-if [ $env_error -eq 1 ]; then
-  echo ">> daily backstop: RUNNER NOT PROVISIONED at $main — $env_error_msg"
-  echo ">> daily backstop: this is a HOST setup gap, not a code regression — no fix-or-revert PR is warranted from this alone. Provision the runner with guix on PATH (the deferred corpus/seed gates realize their guix-built seed through it), then re-run."
+# Exit 10 (full abort, nothing to triage) ONLY when EVERY leg is unprovisioned — heavy/
+# system need host guix/loop-toolchain and the harness leg has neither a local nor a
+# fetchable /td/store harness. A runner that can run at least one leg (issue #315: e.g. a
+# guix-less runner with a fetchable harness substitute) falls through to the normal verdict
+# below instead, so its harness leg's real green/red still reaches the agent rather than
+# being folded away.
+if [ $env_error -eq 1 ] && [ $harness_env_error -eq 1 ]; then
+  echo ">> daily backstop: RUNNER NOT PROVISIONED at $main — no gate could run anywhere (heavy/system: $env_error_msg; harness: $harness_fail)"
+  echo ">> daily backstop: this is a HOST setup gap, not a code regression — no fix-or-revert PR is warranted from this alone. Provision host guix/loop-toolchain (heavy/system) or expose a /td/store harness substitute (harness — issue #315), then re-run."
   cat "$verdict"
   exit 10
 fi
+if [ $env_error -eq 1 ]; then
+  echo ">> daily backstop: heavy/system SKIPPED (runner not provisioned: $env_error_msg) — the harness leg ran independently below"
+fi
 
 rc=0
-[ $heavy_rc -ne 0 ] && rc=$((rc+1))
-[ "$run_system" = 1 ] && [ $system_rc -ne 0 ] && rc=$((rc+2))
-[ $harness_rc -ne 0 ] && rc=$((rc+4))
-if [ $rc -eq 0 ]; then
+[ $env_error -eq 0 ] && [ $heavy_rc -ne 0 ] && rc=$((rc+1))
+[ $env_error -eq 0 ] && [ "$run_system" = 1 ] && [ $system_rc -ne 0 ] && rc=$((rc+2))
+[ $harness_env_error -eq 0 ] && [ $harness_rc -ne 0 ] && rc=$((rc+4))
+if [ $rc -eq 0 ] && [ $env_error -eq 1 ]; then
+  # Reached only when the "both unprovisioned" exit-10 abort above did NOT fire, i.e. the
+  # harness leg (guix-free) DID run — but heavy/system never ran (no host guix), so this is
+  # not a full-suite proof: no .td-last-green, no publish steps (their gate exports don't
+  # exist — heavy didn't reach them). rc==0 here also GUARANTEES harness_rc==0 (a genuinely
+  # red harness with heavy/system unprovisioned instead falls to the `else` RED branch below,
+  # since it sets bit 4) — so this is always the harness-green case, never harness-red.
+  echo ">> daily backstop: PARTIAL at $main — harness leg GREEN; heavy/system unprovisioned this run ($env_error_msg, issue #315) — not a full-suite proof, .td-last-green NOT recorded"
+elif [ $rc -eq 0 ]; then
   echo "$main" > .td-last-green   # seed of the future `stable` marker
   echo ">> daily backstop: ALL GREEN at $main (recorded .td-last-green)"
   # toolchain-subst-default (#209): the heavy suite (incl. gate 412) is green, so the
