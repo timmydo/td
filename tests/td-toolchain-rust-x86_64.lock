@@ -15,10 +15,14 @@
 # The `input`/`patch` pins therefore MIRROR tests/td-toolchain-x86_64-native.lock (the native
 # gcc/binutils/glibc sources) PLUS the two rust-specific inputs (the rust release tarball + the
 # co-located zlib). Kept in sync with the native lock by the toolchain-rust-x86_64-input-addressed
-# gate. Bump `recipe-rev` when the RELINK recipe (builder/src/toolchain_x86_64.rs rust-x86_64)
+# gate. Bump `recipe-rev` when the RELINK recipe (the `rust-toolchain` recipe,
+# recipes/src/recipes/rust-toolchain.rs + builder/src/toolchain_x86_64.rs run_rust_toolchain_build)
 # changes without an input pin change.
+# recipe-rev 2 (#380): the relink is now the first-class `rust-toolchain` recipe built by
+# `td-builder build-recipe` (buildSystem "rust-toolchain") instead of the retired `toolchain-recipe
+# rust-x86_64` subcommand — the transform mechanism changed, so the input-addressed key is re-keyed.
 name td-toolchain-rust-x86_64
-recipe-rev 1
+recipe-rev 2
 component rust-1.96.0-x86_64-store-native
 # --- rust-specific inputs (the upstream rust release tarball + the co-located zlib) ---
 input c1130e4f7976f230766ab062b105b1fb050d6a78177db2246a5878fd6a589680 rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz

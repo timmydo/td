@@ -142,9 +142,11 @@ impl BuildInputs {
 // --- CLI -------------------------------------------------------------------------
 
 const USAGE: &str =
-    "usage: td-builder toolchain-recipe {x86_64-native|x86_64-self|rust-x86_64}  (inputs via TDXN_*/TDXS_*/TDRX_* env)";
+    "usage: td-builder toolchain-recipe {x86_64-native|x86_64-self}  (inputs via TDXN_*/TDXS_* env)";
 
-/// `td-builder toolchain-recipe <name>`.
+/// `td-builder toolchain-recipe <name>`. (The rust-x86_64 relink is retired as a
+/// subcommand — it is now the first-class `rust-toolchain` recipe, buildSystem
+/// "rust-toolchain" / build::run_rust_toolchain; #380.)
 pub fn cli(args: &[String]) -> ExitCode {
     match args.get(2).map(String::as_str) {
         Some("x86_64-native") => {
@@ -155,14 +157,9 @@ pub fn cli(args: &[String]) -> ExitCode {
             let result = BuildInputs::from_env(Flavor::SelfHost).and_then(|inp| run_self(&inp));
             finish("x86_64-self", result)
         }
-        Some("rust-x86_64") => {
-            let result = RustInputs::from_env().and_then(|inp| run_rust(&inp));
-            finish("rust-x86_64", result)
-        }
         Some("--list") | Some("list") => {
             println!("x86_64-native");
             println!("x86_64-self");
-            println!("rust-x86_64");
             ExitCode::SUCCESS
         }
         _ => {
@@ -250,83 +247,93 @@ pub fn run_self(inp: &BuildInputs) -> Result<String, String> {
     Ok(report)
 }
 
-// --- rust-x86_64: relink the upstream Rust toolchain to /td/store --------------------
+// --- rust-toolchain: the pinned-upstream-Rust ELF-retarget transform (#380) -----------
 //
-// Port of the "assemble the /td/store rust tree" driver
-// (tests/rust-x86_64-runtime-store-native.sh lines ~185-249): extract rustc/cargo + the
-// rust-std rustlib from the upstream tarball, co-locate the runtime closure (glibc
-// sonames + libgcc_s + libz) in the tree's lib/ (found via the UNCHANGED RUNPATH
-// $ORIGIN/../lib), and RELINK rustc/cargo's ELF interpreter — td's own rewriter
-// (`crate::elf::set_interp`, GROWS the slot per #258), NOT patchelf — to the LOCK-KEYED
-// /td/store x86_64 glibc loader (so the published tree's interp is stable/predictable,
-// the prerequisite for subst-fetching it). The gate interns the returned tree at the
-// td-toolchain-rust-x86_64.lock path + subst-exports it (generic td-builder subcommands).
+// The engine phase runner for buildSystem "rust-toolchain" (recipes/src/recipes/
+// rust-toolchain.rs) — the FIRST-CLASS RECIPE form of what was the `toolchain-recipe
+// rust-x86_64` shell subcommand. It co-locates the /td/store runtime closure (glibc
+// sonames + libgcc_s + libz, found via the UNCHANGED upstream RUNPATH $ORIGIN/../lib —
+// the portable, content-addressed-store-safe choice) and RELINKS rustc/cargo's ELF
+// interpreter — `crate::elf::set_interp`, GROWS the slot per #258, NOT patchelf — onto
+// the /td/store x86_64 glibc loader.
+//
+// It runs in the HERMETIC drv sandbox as PURE td-builder Rust (fs copies + crate::elf),
+// so it stages NO external tool (tar/patchelf) into the sandbox: the sha-pinned upstream
+// tarball is unpacked by the GATE as source prep (like every recipe's source is a
+// prepared artifact), and TD_SRC is that extracted release tree.
+//
+//   TD_SRC        the extracted upstream Rust release tree (root: rustc/ cargo/ rust-std-…/).
+//   TD_INPUT_MAP  lock name -> /td/store path; the transform reads by name:
+//                   rust-native-glibc   the x86_64 glibc 2.41 tree (interp + sonames)
+//                   rust-native-libgcc  a tree holding libgcc_s.so.1
+//                   rust-native-libz    a tree holding libz.so.1.*
+//   out           the output tree (rustc/cargo relinked onto /td/store).
+//
+// The interp target is <rust-native-glibc>/lib/ld-linux-x86-64.so.2 — the input's own
+// /td/store path, which IS the lock-keyed loader the gate interns glibc at, so the
+// relinked tree is byte-identical to the retired subcommand's output (the gate interns
+// it at the same td-toolchain-rust-x86_64.lock path + subst-exports it, unchanged). Same
+// pinned source + same inputs => byte-identical tree (the `td-builder check` double-build
+// oracle proves it); a missing input reds at drv-assembly (build-recipe), before a build.
 
-/// Inputs for the rust relink recipe (from `TDRX_*` env, how the gate passes them).
-pub struct RustInputs {
-    /// The upstream rust release tarball (`rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz`).
-    pub rust_tar: PathBuf,
-    /// Its top-level dir name (the tarball file minus `.tar.gz`).
-    pub rust_top: String,
-    /// The x86_64 glibc 2.41 tree (physical) — the co-located sonames come from its lib/.
-    pub glibc: PathBuf,
-    /// The dir holding `libgcc_s.so.1` (the cross/native gcc's target libgcc).
-    pub libgcc_dir: PathBuf,
-    /// The built x86_64 `libz.so.1.3.1`.
-    pub libz: PathBuf,
-    /// The LOCK-KEYED /td/store glibc loader path to relink rustc/cargo's interp to
-    /// (e.g. `/td/store/<key>-glibc-2.41-x86_64/lib/ld-linux-x86-64.so.2`) — computed by
-    /// the gate via `toolchain-path tests/td-toolchain-x86_64.lock glibc-2.41-x86_64`.
-    pub glibc_interp: String,
-    /// Scratch to assemble under; the tree lands at `<out>/tree`.
-    pub out: PathBuf,
+/// The resolved rust-toolchain transform inputs, read from the drv env.
+struct RustInputs {
+    /// TD_SRC — the extracted upstream Rust release tree (rustc/ cargo/ rust-std-…/).
+    src: PathBuf,
+    /// rust-native-glibc — the x86_64 glibc 2.41 tree (interp target + co-located sonames).
+    glibc: PathBuf,
+    /// rust-native-libgcc — a tree holding `libgcc_s.so.1`.
+    libgcc_dir: PathBuf,
+    /// rust-native-libz — a tree holding `libz.so.1.*`.
+    libz_dir: PathBuf,
+    /// `<glibc>/lib/ld-linux-x86-64.so.2` — the /td/store loader rustc/cargo relink onto.
+    glibc_interp: String,
+    /// `$out` — the transform's output tree.
+    out: PathBuf,
 }
 
 impl RustInputs {
-    fn from_env() -> Result<RustInputs, String> {
+    fn from_drv_env() -> Result<RustInputs, String> {
         let g = |k: &str| -> Result<String, String> {
             std::env::var(k).map_err(|_| format!("env {k} unset"))
         };
+        let map = crate::json::parse(&g("TD_INPUT_MAP")?)
+            .map_err(|e| format!("TD_INPUT_MAP JSON: {e}"))?;
+        let pick = |name: &str| -> Result<PathBuf, String> {
+            map.get(name)
+                .and_then(crate::json::Json::as_str)
+                .map(PathBuf::from)
+                .ok_or_else(|| format!("rust-toolchain: lock is missing the `{name}' input (needed by the transform)"))
+        };
+        let glibc = pick("rust-native-glibc")?;
+        let glibc_interp = format!("{}/lib/ld-linux-x86-64.so.2", glibc.display());
         Ok(RustInputs {
-            rust_tar: PathBuf::from(g("TDRX_RUST_TAR")?),
-            rust_top: g("TDRX_RUST_TOP")?,
-            glibc: PathBuf::from(g("TDRX_XGLIBC")?),
-            libgcc_dir: PathBuf::from(g("TDRX_XLIBGCCDIR")?),
-            libz: PathBuf::from(g("TDRX_XLIBZ")?),
-            glibc_interp: g("TDRX_GLIBC_INTERP")?,
-            out: PathBuf::from(g("TDRX_OUT")?),
+            src: PathBuf::from(g("TD_SRC")?),
+            glibc,
+            libgcc_dir: pick("rust-native-libgcc")?,
+            libz_dir: pick("rust-native-libz")?,
+            glibc_interp,
+            out: PathBuf::from(g("out")?),
         })
     }
 }
 
-/// Assemble + relink the /td/store rust tree; print `RUST_TREE=<path>` for the gate.
-pub fn run_rust(inp: &RustInputs) -> Result<String, String> {
-    let mut report = String::new();
-    let tree = assemble_rust_tree(inp)?;
-    relink_rust_interp(&tree, &inp.glibc_interp, &mut report)?;
-    report.push_str(&format!("RUST_TREE={}\n", tree.display()));
-    Ok(report)
+/// `rust-toolchain-build` phase runner (#380): assemble + relink the /td/store rust tree
+/// into `$out` from the drv env. No compile; pure td-builder Rust (fs + crate::elf).
+pub fn run_rust_toolchain_build() -> Result<(), String> {
+    let inp = RustInputs::from_drv_env()?;
+    assemble_rust_tree(&inp)?;
+    relink_rust_interp(&inp.out, &inp.glibc_interp)?;
+    Ok(())
 }
 
-/// Extract rustc/cargo + rustlib, merge, provenance-check, co-locate the closure.
-/// Returns the assembled tree dir (`<out>/tree`).
-fn assemble_rust_tree(inp: &RustInputs) -> Result<PathBuf, String> {
-    let xtract = inp.out.join("x");
-    reset_dir(&xtract)?;
-    let top = &inp.rust_top;
-    // rustc (incl. its rustlib) + cargo are required; rust-std (libstd/libcore rlibs) merged if present.
-    selective_untar_gz(&inp.rust_tar, &xtract, &[&format!("{top}/rustc"), &format!("{top}/cargo/bin/cargo")])?;
-    // best-effort: the standalone rust-std component dir (ignore failure if the combined tarball lacks it).
-    let _ = selective_untar_gz(
-        &inp.rust_tar,
-        &xtract,
-        &[&format!("{top}/rust-std-x86_64-unknown-linux-gnu/lib/rustlib")],
-    );
-
-    let rx = xtract.join(top);
-    let tree = inp.out.join("tree");
-    reset_dir(&tree.join("bin"))?;
-    fs::create_dir_all(tree.join("lib")).map_err(ioerr("mkdir tree/lib"))?;
+/// Copy rustc/cargo + rustlib from the extracted release tree (TD_SRC), provenance-check,
+/// and co-locate the /td/store runtime closure into `<out>/lib`.
+fn assemble_rust_tree(inp: &RustInputs) -> Result<(), String> {
+    let rx = &inp.src; // the extracted release tree: rustc/ cargo/ rust-std-…/
+    let tree = &inp.out;
+    fs::create_dir_all(tree.join("bin")).map_err(ioerr("mkdir out/bin"))?;
+    fs::create_dir_all(tree.join("lib")).map_err(ioerr("mkdir out/lib"))?;
     fs::copy(rx.join("rustc/bin/rustc"), tree.join("bin/rustc")).map_err(ioerr("cp rustc"))?;
     fs::copy(rx.join("cargo/bin/cargo"), tree.join("bin/cargo")).map_err(ioerr("cp cargo"))?;
     // librustc_driver, libLLVM, libstd*.so, AND rustc's own rustlib/.
@@ -335,7 +342,7 @@ fn assemble_rust_tree(inp: &RustInputs) -> Result<PathBuf, String> {
     if std_rustlib.is_dir() {
         copy_tree_contents(&std_rustlib, &tree.join("lib/rustlib")).map_err(ioerr("merge rustlib"))?;
     }
-    make_writable(&tree).map_err(ioerr("chmod tree"))?;
+    make_writable(tree).map_err(ioerr("chmod tree"))?;
 
     // the sysroot MUST hold a libstd rlib — else rustc has nothing to link a program to.
     let rlib_dir = tree.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
@@ -365,14 +372,18 @@ fn assemble_rust_tree(inp: &RustInputs) -> Result<PathBuf, String> {
     }
     copy_deref(&inp.libgcc_dir.join("libgcc_s.so.1"), &tree.join("lib/libgcc_s.so.1"))?;
     symlink_force("libgcc_s.so.1", &tree.join("lib/libgcc_s.so"))?;
-    copy_deref(&inp.libz, &tree.join("lib/libz.so.1"))?;
-    make_writable(&tree).map_err(ioerr("chmod tree"))?;
-    Ok(tree)
+    let libz = glob_first_in(&inp.libz_dir, "libz.so.1", "").ok_or_else(|| {
+        format!("rust-toolchain: no libz.so.1* under the rust-native-libz input {}", inp.libz_dir.display())
+    })?;
+    copy_deref(&libz, &tree.join("lib/libz.so.1"))?;
+    make_writable(tree).map_err(ioerr("chmod tree"))?;
+    Ok(())
 }
 
-/// Relink rustc + cargo's ELF interpreter to `glibc_interp` (td's own rewriter; GROWS
-/// the slot when the new path is longer, #258), asserting each landed under /td/store.
-fn relink_rust_interp(tree: &Path, glibc_interp: &str, report: &mut String) -> Result<(), String> {
+/// Relink rustc + cargo's ELF interpreter to `glibc_interp` (crate::elf::set_interp,
+/// GROWS the slot when the new path is longer per #258 — no patchelf), asserting each
+/// landed under /td/store.
+fn relink_rust_interp(tree: &Path, glibc_interp: &str) -> Result<(), String> {
     for b in ["rustc", "cargo"] {
         let bin = tree.join("bin").join(b);
         crate::elf::set_interp(&bin, glibc_interp)?;
@@ -382,9 +393,6 @@ fn relink_rust_interp(tree: &Path, glibc_interp: &str, report: &mut String) -> R
             return Err(format!("interp of {b} not relinked to the /td/store glibc loader (got: {got})"));
         }
     }
-    report.push_str(&format!(
-        "   [structural] rustc + cargo interp relinked (grown) to {glibc_interp} (was /lib64/ld-linux-x86-64.so.2)\n"
-    ));
     Ok(())
 }
 
@@ -1018,16 +1026,6 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// `tar -xzf TARBALL -C dest MEMBER...` — extract only the named members.
-fn selective_untar_gz(tarball: &Path, dest: &Path, members: &[&str]) -> Result<(), String> {
-    fs::create_dir_all(dest).map_err(ioerr("mkdir untar dest"))?;
-    let mut c = Command::new("tar");
-    c.arg("-xzf").arg(tarball).arg("-C").arg(dest);
-    for m in members {
-        c.arg(m);
-    }
-    run(c, "selective rust tarball extract")
-}
 
 /// `cp -L SRC DST` — copy following a symlink (fs::copy reads through the symlink),
 /// making the destination writable (the source .so may be 0444).

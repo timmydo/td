@@ -1897,7 +1897,12 @@ fn assemble_recipe_drv(
         // mesboot: the bootstrap-RUNG executor (build::run_mesboot, #378 slices
         // 2+3) — the recipe's typed steps run in the sandbox over staged inputs.
         "mesboot" => "mesboot-build",
-        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot)")),
+        // rust-toolchain: the pinned-upstream-Rust ELF-retarget TRANSFORM (#380,
+        // build::run_rust_toolchain) — extract rustc/cargo + rustlib from TD_SRC,
+        // co-locate the /td/store glibc/libgcc/libz runtime closure, relink the
+        // interp onto td's own glibc loader. Declared inputs, reproducible output.
+        "rust-toolchain" => "rust-toolchain-build",
+        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot, rust-toolchain)")),
     };
     // configure flags + phases (both optional) -> JSON array string. A configure
     // flag may itself contain whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`), so the
@@ -2030,6 +2035,35 @@ fn assemble_recipe_drv(
                 );
             }
             spec.push_str(&format!("env TD_STEPS={}\n", steps.to_json_string()));
+            let map = json::Json::Obj(
+                entries
+                    .iter()
+                    .map(|e| (e.name.clone(), json::Json::Str(e.path.clone())))
+                    .collect(),
+            );
+            spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
+        }
+        // rust-toolchain: the pinned-upstream-Rust ELF-retarget transform (#380).
+        // TD_SRC is the release tarball (the `rust-toolchain-source' lock entry);
+        // the /td/store glibc/libgcc/libz inputs reach build::run_rust_toolchain by
+        // NAME through TD_INPUT_MAP (lock entry name -> canonical store path), the
+        // same resolution mesboot uses. No compile: configureFlags/phases/bins have
+        // no runner here — declaring them is a hard error, never silently ignored.
+        "rust-toolchain" => {
+            if alist.get("configureFlags").is_some()
+                || alist.get("phases").is_some()
+                || alist.get("bins").is_some()
+                || alist.get("steps").is_some()
+            {
+                return Err(
+                    "recipe: buildSystem \"rust-toolchain\" supports no configureFlags/phases/bins/steps — it declares `inputs' (glibc/libgcc/libz) and transforms the release tarball".into(),
+                );
+            }
+            if !vendor.is_empty() || vendor_dir.is_some() {
+                return Err(
+                    "recipe: buildSystem \"rust-toolchain\" takes no vendored crates — the transform extracts a prebuilt release, it does not compile".into(),
+                );
+            }
             let map = json::Json::Obj(
                 entries
                     .iter()
@@ -6234,6 +6268,16 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("td-builder: mesboot-build: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        // td's rust-toolchain ELF-retarget transform (#380): see
+        // build::run_rust_toolchain. Same env-driven derivation-builder contract —
+        // extract+co-locate+relink the pinned upstream Rust release onto /td/store.
+        Some("rust-toolchain-build") if args.len() == 2 => match build::run_rust_toolchain() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: rust-toolchain-build: {e}");
                 ExitCode::FAILURE
             }
         },
