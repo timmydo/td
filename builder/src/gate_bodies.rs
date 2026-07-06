@@ -21,14 +21,8 @@
 //! content scan, and stages a self-contained td-owned store for the gates'
 //! store ops. External tools spawned by these bodies are ORACLES or artifacts
 //! (`sqlite3` validating td's hand-written DB bytes, `cp -a`/`chmod` staging
-//! trees, `guix build` as store-relocate's one-time relocation source) — the
-//! gate LOGIC (every assertion) is typed Rust.
-//!
-//! guix-surface note: store_relocate's `/var/guix/db` read + `guix build`
-//! relocation source moved here VERBATIM from tests/store-relocate.sh — existing
-//! guix reliance relocated, not new surface (directive 6). It shrinks with the
-//! store-relocate migration; the guix-surface census that used to track it was
-//! retired with the guix-oracle gates.
+//! trees) — the gate LOGIC (every assertion) is typed Rust. No body spawns a
+//! guix process.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -51,7 +45,6 @@ const NATIVE: &[&str] = &[
     "store-verify",
     "store-backend",
     "store-ns",
-    "store-relocate",
 ];
 
 /// `td-builder gate-body <name>` — run one native gate body. Self-moves into
@@ -79,7 +72,6 @@ pub fn cli(name: &str) -> ExitCode {
         "store-verify" => store_verify(&root),
         "store-backend" => store_backend(&root),
         "store-ns" => store_ns(&root),
-        "store-relocate" => store_relocate(&root),
         other => Err(format!("gate-body: unknown native gate `{other}`")),
     };
     match res {
@@ -1504,89 +1496,6 @@ fn store_ns(root: &Path) -> Result<(), String> {
         "PASS: td owns its own root with its own store at /td/store — a static package runs from \
          /td/store in a rootless user namespace with /gnu/store and the guix install ABSENT. The \
          unmixed /td/store base the user package manager runs in (user-pm Phase 0)."
-    );
-    Ok(())
-}
-
-/// store-relocate — relocate a DYNAMIC package's closure /gnu/store →
-/// /td/store (size-preserving /td//store rewrite) and run it with /gnu/store
-/// ABSENT. Port of tests/store-relocate.sh (gate 388). guix is only the
-/// one-time relocation SOURCE (`guix build hello` + the /var/guix/db closure
-/// read — the last guix reliance in this leg, to shrink out as store-relocate
-/// migrates to a td-built dynamic package).
-fn store_relocate(root: &Path) -> Result<(), String> {
-    println!(
-        ">> store-relocate: relocate a dynamic package /gnu/store -> /td/store and run it with \
-         /gnu/store ABSENT (the break from guix for dynamic binaries; user-pm Phase 2)"
-    );
-    let tb = tb()?;
-    println!(">> td-builder under test (stage0, guix-free): {}", tb.display());
-    let work = fresh_scratch(root, ".store-relocate-scratch")?;
-
-    let hello = run_out("guix", &["build", "hello"], "guix build hello (the relocation source)")?
-        .lines()
-        .last()
-        .unwrap_or("")
-        .to_string();
-    if hello.is_empty() {
-        return Err("FAIL: guix build hello (the relocation source)".into());
-    }
-    let hbase = base_of(&hello);
-
-    // RELOCATE hello's closure /gnu/store -> /td/store (td's own store-relocate).
-    let dest = work.join("store");
-    let dest_s = path_str(&dest)?;
-    tb_out(
-        &tb,
-        &["store-relocate", "/var/guix/db/db.sqlite", &hello, &dest_s],
-        "store-relocate",
-    )?;
-    let reloc_bin = dest.join(&hbase).join("bin/hello");
-    if !reloc_bin.is_file() {
-        return Err("FAIL: relocated hello binary missing".into());
-    }
-
-    // Leg A: DURABLE behavioral — run the relocated DYNAMIC binary from /td/store.
-    let out = tb_out(
-        &tb,
-        &["store-ns", &dest_s, "--", &format!("/td/store/{hbase}/bin/hello")],
-        "relocated hello did not run in the store-ns",
-    )?;
-    if out != "Hello, world!" {
-        return Err(format!("FAIL: relocated hello printed '{out}'"));
-    }
-    println!(
-        "   [DURABLE behavioral] the relocated dynamic hello ran from /td/store (no /gnu/store) \
-         and greeted"
-    );
-
-    // Leg B: DURABLE structural — no /gnu/store left; rewritten to /td//store.
-    let bytes = std::fs::read(&reloc_bin).map_err(|e| format!("FAIL: read {}: {e}", reloc_bin.display()))?;
-    let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
-    if contains(b"/gnu/store") {
-        return Err("FAIL: the relocated hello binary STILL has /gnu/store references".into());
-    }
-    if !contains(b"/td//store") {
-        return Err(
-            "FAIL: the relocated hello binary has no /td//store references (was it rewritten?)".into(),
-        );
-    }
-    println!("   [DURABLE structural] the relocated binary has NO /gnu/store refs — all rewritten to /td//store");
-
-    // Leg C: REMOVABLE oracle — same greeting as guix's /gnu/store hello.
-    let oracle = run_out(&format!("{hello}/bin/hello"), &[], "guix's hello (oracle)")?;
-    if out != oracle {
-        return Err("FAIL: relocated hello != guix hello".into());
-    }
-    println!("   [REMOVABLE oracle] the relocated hello greets identically to guix's /gnu/store hello");
-
-    let _ = chmod_r_uw(&work);
-    let _ = std::fs::remove_dir_all(&work);
-    println!(
-        "PASS: td relocated a dynamic package's closure from guix's /gnu/store to /td/store \
-         (size-preserving /gnu/store -> /td//store rewrite, no patchelf) and ran it from \
-         /td/store with /gnu/store ABSENT — the break from guix, made real for dynamic binaries \
-         (user-pm Phase 2)."
     );
     Ok(())
 }

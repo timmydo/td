@@ -3043,95 +3043,6 @@ fn build_profile(
     Ok(linked)
 }
 
-/// Replace every occurrence of `from` with `to` (SAME length — size-preserving, so ELF
-/// offsets/section sizes are untouched and the substitution is binary-safe). Used to
-/// relocate `/gnu/store` → `/td//store` (both 10 bytes).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn replace_bytes_same_len(data: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    assert_eq!(from.len(), to.len(), "relocation substitution must be size-preserving");
-    let mut out = data.to_vec();
-    let mut i = 0;
-    while i + from.len() <= out.len() {
-        if &out[i..i + from.len()] == from {
-            out[i..i + from.len()].copy_from_slice(to);
-            i += from.len();
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-/// Rewrite `/gnu/store` → `/td//store` in every file's CONTENT and every symlink TARGET
-/// under `dir`. Size-preserving (10→10 bytes; `/td//store` is the kernel-collapsed form of
-/// `/td/store`), so RUNPATH/interpreter in `.dynstr`, embedded paths in `.rodata`, and
-/// scripts are all handled by one byte substitution — no ELF surgery. Returns the count.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn relocate_tree(dir: &Path, from: &[u8], to: &[u8]) -> Result<usize, String> {
-    use std::os::unix::fs::{symlink, PermissionsExt};
-    let md = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let ft = md.file_type();
-    let mut n = 0;
-    if ft.is_symlink() {
-        // Store-path symlink targets are ASCII; rewrite the prefix textually.
-        let target = std::fs::read_link(dir).map_err(|e| e.to_string())?;
-        let ts = target.to_string_lossy();
-        let from_s = std::str::from_utf8(from).unwrap();
-        let to_s = std::str::from_utf8(to).unwrap();
-        if ts.contains(from_s) {
-            let new = ts.replace(from_s, to_s);
-            std::fs::remove_file(dir).map_err(|e| e.to_string())?;
-            symlink(&new, dir).map_err(|e| e.to_string())?;
-            n += 1;
-        }
-    } else if ft.is_dir() {
-        for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-            n += relocate_tree(&e.map_err(|e| e.to_string())?.path(), from, to)?;
-        }
-    } else if ft.is_file() {
-        let data = std::fs::read(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        if data.windows(from.len()).any(|w| w == from) {
-            let mode = md.permissions().mode();
-            let mut w = md.permissions();
-            w.set_mode(mode | 0o200); // make writable for the rewrite
-            std::fs::set_permissions(dir, w).ok();
-            std::fs::write(dir, replace_bytes_same_len(&data, from, to))
-                .map_err(|e| format!("{}: {e}", dir.display()))?;
-            let mut back = std::fs::metadata(dir).map_err(|e| e.to_string())?.permissions();
-            back.set_mode(mode); // restore the canonical (read-only) mode
-            std::fs::set_permissions(dir, back).ok();
-            n += 1;
-        }
-    }
-    Ok(n)
-}
-
-/// Relocate ROOT's closure (over STORE-DB) from guix's `/gnu/store` into DEST-DIR as a
-/// td-prefixed store: copy each closure member to `DEST-DIR/<base>` and rewrite every
-/// `/gnu/store` reference to `/td//store` (the length-preserving form of `/td/store`, so
-/// the substitution is binary-safe — no patchelf). DEST-DIR bound at `/td/store` (store-ns)
-/// IS the relocated store; binaries' `/td//store` refs resolve into it, with NO `/gnu/store`.
-/// The one-time break from guix (seed captured once, relocated, then td builds/runs from
-/// `/td/store`). Usage: store-relocate STORE-DB ROOT DEST-DIR
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn relocate_closure(store_db: &str, root: &str, dest: &str) -> Result<(usize, usize), String> {
-    let bytes = std::fs::read(store_db).map_err(|e| format!("read store db {store_db}: {e}"))?;
-    let db = store_db_read::Db::open(bytes)?;
-    let closure = db.closure(root)?;
-    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-    let (from, to): (&[u8], &[u8]) = (b"/gnu/store", b"/td//store");
-    let mut files = 0usize;
-    for p in &closure {
-        let base = p.rsplit('/').next().ok_or_else(|| format!("{p}: not a store path"))?;
-        let dst = Path::new(dest).join(base);
-        if !dst.exists() {
-            copy_canonical(Path::new(p), &dst)?;
-            files += relocate_tree(&dst, from, to)?;
-        }
-    }
-    Ok((closure.len(), files))
-}
-
 /// The nice value build work runs at, from `TD_BUILD_NICE` (default 10). Parsed
 /// from the raw env value so the policy is unit-testable without touching real
 /// process state. Clamped to the kernel's -20..=19 range; a missing/garbage value
@@ -5830,26 +5741,6 @@ fn main() -> ExitCode {
                         eprintln!("td-builder: profile: {e}");
                         ExitCode::FAILURE
                     }
-                }
-            }
-        }
-        // td-builder store-relocate — relocate ROOT's closure from guix's /gnu/store into
-        // DEST-DIR as a td /td/store seed (size-preserving /gnu/store -> /td//store rewrite;
-        // see relocate_closure). user-pm Phase 2: the one-time break from guix. Usage:
-        //   store-relocate STORE-DB ROOT DEST-DIR
-        Some("store-relocate") if args.len() == 5 => {
-            match relocate_closure(&args[2], &args[3], &args[4]) {
-                Ok((paths, files)) => {
-                    eprintln!(
-                        "td-builder: store-relocate — {paths} store path(s) -> {}, rewrote {files} file(s)/symlink(s) /gnu/store -> /td//store",
-                        args[4]
-                    );
-                    println!("{}", args[4]);
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: store-relocate: {e}");
-                    ExitCode::FAILURE
                 }
             }
         }

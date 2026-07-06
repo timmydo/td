@@ -1107,32 +1107,17 @@ fn run(args: &[String]) -> Result<i32, String> {
         goals.push("check".to_string());
     }
 
-    // The guix-free harness tier: never reaches the host-guix requirement below.
+    // The guix-free harness tier still short-circuits here (kept for its
+    // stage0-only provisioning path); the standard tier below is now guix-free too.
     if goals.first().map(String::as_str) == Some("check-harness") {
         return run_check_harness(&root);
     }
 
     guard_netns_probe()?;
 
-    // Host guix stays first on PATH inside the sandbox (its dir prepended). The
-    // loop TOOLCHAIN comes from the host PATH (provision_toolchain), not guix —
-    // but the DEFERRED corpus/seed/bootstrap gates still realize their guix-built
-    // seed via `guix build` (unpinned host guix; the seed BYTES retire last
-    // per the north star / #412). So guix must still be on PATH for the standard
-    // tier. A guix-less host runs the guix-FREE `check-harness` tier only; the
-    // hint does not ask for guix to be installed (guix is being removed, not
-    // required — the /td/store userland is what retires this last piece).
-    let hostguix_dir = find_in_path("guix")
-        .and_then(|p| std::fs::canonicalize(p).ok())
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .ok_or_else(|| {
-            fatal(
-                "no guix on PATH — a guix-less host runs only `td-builder check \
-                 check-harness`. (The standard tier's corpus/seed gates still \
-                 realize their guix-built seed via host guix, retiring last with \
-                 the /td/store userland.)",
-            )
-        })?;
+    // No guix process remains: the loop TOOLCHAIN comes from the host PATH
+    // (provision_toolchain, make/bash/sed/…), and no gate spawns `guix build`.
+    // The sandbox PATH is exactly that toolchain — nothing guix is prepended.
 
     // Light tiers own no heavy gate — skip the heavy warms + daemon (exactly the
     // shell prelude's goal scan).
@@ -1143,10 +1128,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     let tb = provision_stage0(&root)?;
     let toolchain = provision_toolchain(&root)?;
 
-    let mut child_envs: Vec<(String, String)> = vec![
-        (s("PATH"), format!("{}:{toolchain}", hostguix_dir.display())),
-        (s("GUIX_BUILD_OPTIONS"), s("--no-substitutes --no-offload")),
-    ];
+    let mut child_envs: Vec<(String, String)> = vec![(s("PATH"), toolchain)];
     // The runner's knobs must cross the sandbox boundary (host-sandbox
     // preserves the TD_CHECK_ prefix): without this, TD_CHECK_SLOTS=… ./check.sh
     // would be silently dead and gate-run would always default to nproc.
@@ -1342,7 +1324,6 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
         .arg(harness)
         .args(rest)
         .env("PATH", toolchain)
-        .env("GUIX_BUILD_OPTIONS", "--no-substitutes --no-offload")
         .current_dir(&root);
     // Replace this process, exactly as the shell helper's `exec` did.
     use std::os::unix::process::CommandExt as _;

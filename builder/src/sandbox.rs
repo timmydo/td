@@ -631,19 +631,10 @@ pub fn host_shell(
     for (k, v) in extra_env {
         command.env(k, v);
     }
-    // guix reads these: TERM/GUIX_LOCPATH for terminal+locale; USER/LOGNAME so it
-    // finds the per-user profile (/var/guix/profiles/per-user/$USER) — without
-    // them `guix time-machine` falls back to the root-owned default profile and
-    // EPERMs; GUIX_BUILD_OPTIONS carries the loop's --no-substitutes/--no-offload
-    // posture (check.sh sets it for the in-loop `guix build`/`system` calls).
-    // Harmless, and keeps behaviour identical to the outer shell.
-    for k in [
-        "TERM",
-        "GUIX_LOCPATH",
-        "USER",
-        "LOGNAME",
-        "GUIX_BUILD_OPTIONS",
-    ] {
+    // Generic terminal/identity env the gate bodies may read (TERM for terminal
+    // output; USER/LOGNAME for any per-user path). Harmless, and keeps behaviour
+    // identical to the outer shell.
+    for k in ["TERM", "USER", "LOGNAME"] {
         if let Ok(v) = std::env::var(k) {
             command.env(k, v);
         }
