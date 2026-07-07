@@ -56,8 +56,9 @@ export TD_STORE_DIR=/td/store
 # Cheap: `emit` only, no build. Each of the three native rungs appears solely in the recipe's
 # nativeInputs, so a plain grep of the emitted JSON is a faithful assertion — and reds if a future
 # edit drops the native toolchain (the whole point of the rung).
+emitted=$("$TD_RECIPE_EVAL" emit make-x86-64) || fail "could not emit the make-x86-64 recipe"
 for ni in gcc-x86-64-native binutils-x86-64-native glibc-x86-64; do
-  "$TD_RECIPE_EVAL" emit make-x86-64 | grep -q "\"$ni\"" \
+  printf '%s' "$emitted" | grep -q "\"$ni\"" \
     || fail "the make-x86-64 recipe does not declare native input '$ni' — rung 1 must build ON the native /td/store toolchain, not guix build tools (#388)"
 done
 echo "   [recipe-graph-wiring] the make-x86-64 recipe declares the native /td/store toolchain (gcc-x86-64-native + binutils-x86-64-native + glibc-x86-64) as its build compiler"

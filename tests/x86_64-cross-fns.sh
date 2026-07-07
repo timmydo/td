@@ -274,6 +274,17 @@ verify_x86_64_ownroot() {
 # did, so verify_x86_64_native_ownroot / the closure-export consume them unchanged. The native gcc is
 # NOT byte-reproducible (trust = the input-addressed lock name + the substitute signature), so this is
 # a build+behavioral rung, not a bootstrap::Recipe repro rung.
+# _x86_64_emit_lock_native — emit + lock the two NATIVE x86_64 rungs (binutils/gcc-x86-64-native) on the
+# cross toolchain. Shared by run_x86_64_native and run_x86_64_make so the native rungs' declared inputs
+# live in ONE place (mirrors _x86_64_emit_lock_cross for the cross rungs) — a drift-proof single source:
+# a change to a native rung's inputs re-keys BOTH ladder paths identically, keeping the warm chain cache
+# shared. Requires $_bt set (by _x86_64_emit_lock_cross) and ladder_setup already run.
+_x86_64_emit_lock_native() {
+  ladder_emit binutils-x86-64-native gcc-x86-64-native || return 1
+  ladder_lock binutils-x86-64-native binutils-244-source rung:gcc-x86-64-stage2 rung:binutils-x86-64 rung:glibc-x86-64 src:linux-headers-x86-64 tool:flex tool:bison tool:make $_bt || return 1
+  ladder_lock gcc-x86-64-native gcc-14-source rung:gcc-x86-64-stage2 rung:binutils-x86-64-native rung:binutils-x86-64 rung:glibc-x86-64 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
+}
+
 run_x86_64_native() {
   # td-recipe-eval drives ladder_emit — self-load it (the bootstrap-chain.sh pattern). run_x86_64_cross
   # inherits TD_RECIPE_EVAL from the check prelude on its cross-BUILD path, but the native build is
@@ -295,9 +306,7 @@ run_x86_64_native() {
   mkdir -p "$_lw"
   ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
   _x86_64_emit_lock_cross || return 1
-  ladder_emit binutils-x86-64-native gcc-x86-64-native || return 1
-  ladder_lock binutils-x86-64-native binutils-244-source rung:gcc-x86-64-stage2 rung:binutils-x86-64 rung:glibc-x86-64 src:linux-headers-x86-64 tool:flex tool:bison tool:make $_bt || return 1
-  ladder_lock gcc-x86-64-native gcc-14-source rung:gcc-x86-64-stage2 rung:binutils-x86-64-native rung:binutils-x86-64 rung:glibc-x86-64 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
+  _x86_64_emit_lock_native || return 1
   ladder_build gcc-x86-64-native || { echo "the x86_64 native toolchain ladder failed" >&2; return 1; }
   XNBU=`ladder_out binutils-x86-64-native` || return 1
   _b=`ladder_out gcc-x86-64-native` && XNGCC="$_b/stage/td/store/gcc-14.3.0-x86_64-native" || return 1
@@ -330,9 +339,8 @@ run_x86_64_make() {
   mkdir -p "$_lw"
   ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
   _x86_64_emit_lock_cross || return 1
-  ladder_emit binutils-x86-64-native gcc-x86-64-native make-x86-64 || return 1
-  ladder_lock binutils-x86-64-native binutils-244-source rung:gcc-x86-64-stage2 rung:binutils-x86-64 rung:glibc-x86-64 src:linux-headers-x86-64 tool:flex tool:bison tool:make $_bt || return 1
-  ladder_lock gcc-x86-64-native gcc-14-source rung:gcc-x86-64-stage2 rung:binutils-x86-64-native rung:binutils-x86-64 rung:glibc-x86-64 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
+  _x86_64_emit_lock_native || return 1
+  ladder_emit make-x86-64 || return 1
   # make-4.4.1 source is NOT in the base ladder_setup spec set — intern it now (idempotent), so the
   # make-x86-64 rung's lock resolves its -source entry.
   ladder_intern_extra make-x86-64-source make-4.4.1 || return 1
