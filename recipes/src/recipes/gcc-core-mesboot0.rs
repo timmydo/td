@@ -163,6 +163,7 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     Recipe::mesboot("gcc-core-mesboot0", "2.95.3")
+        .source_input("gcc-core-source")
         .native_inputs(&[
             "mes",
             "tcc",

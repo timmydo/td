@@ -116,6 +116,7 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     Recipe::mesboot("glibc-mesboot-shared", "2.16.0")
+        .source_input("glibc-216-source")
         .native_inputs(&[
             "make-mesboot",
             "patch-mesboot",

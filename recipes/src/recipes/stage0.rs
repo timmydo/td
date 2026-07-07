@@ -6,5 +6,5 @@ use crate::types::Recipe;
 // lock's `stage0-source` entry. Executor + seal: the engine's build::run_stage0.
 // The version is the pinned upstream commit.
 pub fn recipe() -> Recipe {
-    Recipe::stage0("stage0", "3b9c2bb")
+    Recipe::stage0("stage0", "3b9c2bb").source_input("stage0-source")
 }

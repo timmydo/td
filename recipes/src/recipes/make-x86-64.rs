@@ -122,9 +122,9 @@ pub fn recipe() -> Recipe {
         .env("PATH", &base_path()),
     );
     Recipe::mesboot("make-x86-64", "4.4.1")
+        .source_input("make-x86-64-source")
         .native_inputs(&["gcc-x86-64-native", "binutils-x86-64-native", "glibc-x86-64"])
         .inputs_owned(base_inputs(&[
-            "make-x86-64-source",
             "linux-headers-x86-64",
             "make",
         ]))

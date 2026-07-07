@@ -70,6 +70,7 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     Recipe::mesboot("mes", "0.27.1")
+        .source_input("mes-source")
         .native_inputs(&["stage0"])
         .inputs_owned(base_inputs(&["nyacc"]))
         .steps(steps)

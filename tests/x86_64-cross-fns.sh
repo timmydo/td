@@ -43,40 +43,16 @@ make_curated_path() {
   IFS=$oldifs; echo "$cdir"
 }
 
-# _x86_64_emit_lock_cross — emit + lock the i686 base (21 rungs) + the 4 cross rungs (binutils-x86-64
-# → gcc-x86-64-stage1 → glibc-x86-64 → gcc-x86-64-stage2) into the already-`ladder_setup`'d $_lw. Sets
-# the global $_bt (the base host-tool lock set). Shared by run_x86_64_cross (which then builds
-# gcc-x86-64-stage2) and run_x86_64_native (which appends the two native rungs). Idempotent — re-emits
-# the same JSON and re-writes the same lock files, so run_x86_64_native can call it after
+# _x86_64_emit_cross — emit the i686 base (21 rungs) + the 4 cross rungs (binutils-x86-64 →
+# gcc-x86-64-stage1 → glibc-x86-64 → gcc-x86-64-stage2) recipe JSONs into the already-
+# `ladder_setup`'d $_lw. Locks are no longer written here (#429): `ladder_build` drives
+# `build-plan --auto`, which SYNTHESIZES each rung's lock straight from its recipe JSON's
+# declared `inputs`/`nativeInputs`/`sourceInput`. Shared by run_x86_64_cross (which then
+# builds gcc-x86-64-stage2) and run_x86_64_native (which appends the two native rungs).
+# Idempotent — re-emits the same JSON, so run_x86_64_native can call it after
 # run_x86_64_cross already did without disturbing the built graph.
-_x86_64_emit_lock_cross() {
-  _bt="tool:bash tool:coreutils tool:sed tool:grep tool:gawk tool:tar tool:gzip tool:bzip2 tool:xz tool:findutils tool:diffutils"
+_x86_64_emit_cross() {
   ladder_emit stage0 mes tcc make-mesboot0 patch-mesboot binutils-mesboot0 gcc-core-mesboot0 mesboot-headers glibc-mesboot0 gcc-mesboot0 binutils-mesboot1 make-mesboot gcc-mesboot1 binutils-mesboot gawk-mesboot glibc-mesboot gcc-mesboot glibc-mesboot-shared gcc-14 binutils-244 glibc-241 binutils-x86-64 gcc-x86-64-stage1 glibc-x86-64 gcc-x86-64-stage2 || return 1
-  ladder_lock stage0 stage0-source || return 1
-  ladder_lock mes mes-source rung:stage0 src:nyacc $_bt || return 1
-  ladder_lock tcc tcc-source rung:stage0 rung:mes $_bt || return 1
-  ladder_lock make-mesboot0 make-mesboot0-source rung:mes rung:tcc $_bt || return 1
-  ladder_lock patch-mesboot patch-mesboot-source rung:mes rung:tcc rung:make-mesboot0 $_bt || return 1
-  ladder_lock binutils-mesboot0 binutils-mesboot-source rung:mes rung:tcc rung:make-mesboot0 rung:patch-mesboot src:patch-binutils-boot-2.20.1a tool:flex tool:bison $_bt || return 1
-  ladder_lock gcc-core-mesboot0 gcc-core-source rung:mes rung:tcc rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 src:patch-gcc-boot-2.95.3 tool:flex tool:bison $_bt || return 1
-  ladder_lock mesboot-headers linux-headers rung:mes $_bt || return 1
-  ladder_lock glibc-mesboot0 glibc-mesboot0-source rung:mes rung:tcc rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 rung:gcc-core-mesboot0 rung:mesboot-headers src:patch-glibc-boot-2.2.5 src:patch-glibc-bootstrap-system-2.2.5 $_bt || return 1
-  ladder_lock gcc-mesboot0 gcc-core-source rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 rung:gcc-core-mesboot0 rung:glibc-mesboot0 rung:mesboot-headers src:patch-gcc-boot-2.95.3 tool:flex tool:bison $_bt || return 1
-  ladder_lock binutils-mesboot1 binutils-mesboot-source rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 rung:gcc-mesboot0 rung:glibc-mesboot0 src:patch-binutils-boot-2.20.1a src:linux-headers tool:flex tool:bison $_bt || return 1
-  ladder_lock make-mesboot make-mesboot-source rung:make-mesboot0 rung:binutils-mesboot0 rung:gcc-mesboot0 rung:glibc-mesboot0 src:linux-headers $_bt || return 1
-  ladder_lock gcc-mesboot1 gcc-464-core rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot1 rung:gcc-mesboot0 rung:glibc-mesboot0 rung:make-mesboot src:gcc-464-gpp src:patch-gcc-boot-4.6.4 src:gmp src:mpfr src:mpc src:linux-headers tool:flex tool:bison $_bt || return 1
-  ladder_lock binutils-mesboot binutils-mesboot-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot1 rung:gcc-mesboot1 rung:glibc-mesboot0 src:patch-binutils-boot-2.20.1a src:linux-headers tool:flex tool:bison $_bt || return 1
-  ladder_lock gawk-mesboot gawk-mesboot-source rung:make-mesboot rung:binutils-mesboot1 rung:gcc-mesboot1 rung:glibc-mesboot0 src:linux-headers $_bt || return 1
-  ladder_lock glibc-mesboot glibc-216-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot0 rung:gawk-mesboot src:patch-glibc-boot-2.16.0 src:patch-glibc-bootstrap-system-2.16.0 src:linux-headers $_bt || return 1
-  ladder_lock gcc-mesboot gcc-494-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot src:gmp src:mpfr src:mpc src:linux-headers tool:flex tool:bison $_bt || return 1
-  ladder_lock glibc-mesboot-shared glibc-216-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot0 rung:gawk-mesboot src:patch-glibc-boot-2.16.0 src:patch-glibc-bootstrap-system-2.16.0 src:linux-headers $_bt || return 1
-  ladder_lock gcc-14 gcc-14-source rung:binutils-mesboot rung:gcc-mesboot rung:glibc-mesboot src:gmp63 src:mpfr421 src:mpc131 src:linux-headers tool:flex tool:bison tool:m4 tool:make $_bt || return 1
-  ladder_lock binutils-244 binutils-244-source rung:gcc-mesboot1 rung:glibc-mesboot rung:binutils-mesboot tool:flex tool:bison tool:make $_bt || return 1
-  ladder_lock glibc-241 glibc-241-source rung:gcc-14 rung:glibc-mesboot-shared rung:binutils-244 src:linux-headers tool:flex tool:bison tool:m4 tool:make tool:python $_bt || return 1
-  ladder_lock binutils-x86-64 binutils-244-source rung:gcc-14 rung:glibc-mesboot rung:binutils-244 src:linux-headers-x86-64 tool:flex tool:bison tool:make $_bt || return 1
-  ladder_lock gcc-x86-64-stage1 gcc-14-source rung:gcc-14 rung:glibc-mesboot rung:binutils-x86-64 rung:binutils-244 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
-  ladder_lock glibc-x86-64 glibc-241-source rung:gcc-x86-64-stage1 rung:gcc-14 rung:glibc-mesboot rung:binutils-x86-64 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make tool:python $_bt || return 1
-  ladder_lock gcc-x86-64-stage2 gcc-14-source rung:gcc-14 rung:glibc-mesboot rung:binutils-x86-64 rung:glibc-x86-64 rung:binutils-244 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
 }
 
 # run_x86_64_cross — build the x86_64 CROSS toolchain via the recipe ladder (build-plan --auto), the
@@ -98,7 +74,7 @@ run_x86_64_cross() {
   test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$_lw"
   mkdir -p "$_lw"
   ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
-  _x86_64_emit_lock_cross || return 1
+  _x86_64_emit_cross || return 1
   ladder_build gcc-x86-64-stage2 || { echo "the x86_64 cross toolchain ladder failed" >&2; return 1; }
   _lt="$_lw/scratch/tdstore"
   _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-gcc-x86-64-stage2.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
@@ -117,7 +93,7 @@ run_x86_64_cross() {
 }
 
 # run_x86_64_rust_toolchain — build the /td/store rust-toolchain via build-plan --auto (#410): the
-# cross ladder (_x86_64_emit_lock_cross) + the zlib-x86-64 + rust-toolchain rungs on top. rust-toolchain's
+# cross ladder (_x86_64_emit_cross) + the zlib-x86-64 + rust-toolchain rungs on top. rust-toolchain's
 # transitive closure IS the cross toolchain, so one `ladder_build rust-toolchain` realizes the whole graph
 # (the warm chain cache-hits the cross rungs). Same preamble as run_x86_64_cross; exports the cross trees
 # (XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR) AND the relinked rustc/cargo tree XRUSTTREE. Called by the
@@ -131,16 +107,12 @@ run_x86_64_rust_toolchain() {
   test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$_lw"
   mkdir -p "$_lw"
   ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
-  _x86_64_emit_lock_cross || return 1
+  _x86_64_emit_cross || return 1
   # rust/zlib sources are NOT in the base ladder_setup spec set — intern them now (idempotent),
-  # so the zlib/rust rungs' locks resolve their -source entries.
+  # so the zlib/rust rungs' synthesized locks resolve their declared sourceInput.
   ladder_intern_extra rust-toolchain-source rust-1.96.0 || return 1
   ladder_intern_extra zlib-x86-64-source zlib-1.3.1 || return 1
   ladder_emit zlib-x86-64 rust-toolchain || return 1
-  ladder_lock zlib-x86-64 zlib-x86-64-source rung:gcc-x86-64-stage2 rung:glibc-x86-64 rung:binutils-x86-64 tool:make $_bt || return 1
-  # $_bt (set by _x86_64_emit_lock_cross) already provides tar+gzip (the transform's in-sandbox
-  # unpacker) + the rest of the base tools, so the rust rung needs no extra tool: entries.
-  ladder_lock rust-toolchain rust-toolchain-source rung:glibc-x86-64 rung:gcc-x86-64-stage2 rung:zlib-x86-64 $_bt || return 1
   ladder_build rust-toolchain || { echo "the x86_64 rust-toolchain ladder failed" >&2; return 1; }
   _lt="$_lw/scratch/tdstore"
   _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-rust-toolchain.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
@@ -294,10 +266,8 @@ run_x86_64_native() {
   # cross toolchain obtain_cross already built into $_lw. ladder_setup is idempotent/self-healing.
   mkdir -p "$_lw"
   ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
-  _x86_64_emit_lock_cross || return 1
+  _x86_64_emit_cross || return 1
   ladder_emit binutils-x86-64-native gcc-x86-64-native || return 1
-  ladder_lock binutils-x86-64-native binutils-244-source rung:gcc-x86-64-stage2 rung:binutils-x86-64 rung:glibc-x86-64 src:linux-headers-x86-64 tool:flex tool:bison tool:make $_bt || return 1
-  ladder_lock gcc-x86-64-native gcc-14-source rung:gcc-x86-64-stage2 rung:binutils-x86-64-native rung:binutils-x86-64 rung:glibc-x86-64 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
   ladder_build gcc-x86-64-native || { echo "the x86_64 native toolchain ladder failed" >&2; return 1; }
   XNBU=`ladder_out binutils-x86-64-native` || return 1
   _b=`ladder_out gcc-x86-64-native` && XNGCC="$_b/stage/td/store/gcc-14.3.0-x86_64-native" || return 1

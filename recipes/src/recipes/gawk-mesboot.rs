@@ -71,6 +71,7 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     Recipe::mesboot("gawk-mesboot", "3.1.8")
+        .source_input("gawk-mesboot-source")
         .native_inputs(&[
             "make-mesboot",
             "binutils-mesboot1",

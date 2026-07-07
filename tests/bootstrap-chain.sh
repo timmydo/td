@@ -8,9 +8,10 @@
 # gcc-14.3.0 + binutils-2.44 + glibc-2.41 — is a RECIPE (recipes/src/recipes/*.rs, typed
 # steps) built by the ENGINE: ONE `td-builder build-plan --auto glibc-241` realizes the
 # whole 20-rung graph, chaining each rung on the prior rungs' outputs (native-inputs /
-# td-recipe-output edges). tests/ladder-lib.sh is the only shell left: interning the
-# pinned sources/patches/seed (content-addressed), resolving the DECLARED host tools,
-# writing locks, and driving the engine — plumbing, not build logic.
+# td-recipe-output edges), with every rung's lock SYNTHESIZED from its recipe JSON (#429 —
+# no hand-written lock). tests/ladder-lib.sh is the only shell left: interning the pinned
+# sources/patches/seed (content-addressed), resolving the DECLARED host tools, and driving
+# the engine — plumbing, not build logic.
 #
 # Warm reuse (#317): the ladder workdir is machine-wide under TD_CHECK_CHAIN_CACHE's
 # regime (Shared gates get a warm dir; Private/empty = cold fresh) — but the CACHE is the
@@ -110,28 +111,8 @@ ladder_emit stage0 mes tcc make-mesboot0 patch-mesboot binutils-mesboot0 gcc-cor
   mesboot-headers glibc-mesboot0 gcc-mesboot0 binutils-mesboot1 make-mesboot gcc-mesboot1 \
   binutils-mesboot gawk-mesboot glibc-mesboot gcc-mesboot glibc-mesboot-shared gcc-14 \
   binutils-244 glibc-241 || fail "ladder recipe emit failed"
-BT="tool:bash tool:coreutils tool:sed tool:grep tool:gawk tool:tar tool:gzip tool:bzip2 tool:xz tool:findutils tool:diffutils"
-ladder_lock stage0 stage0-source || fail "lock stage0"
-ladder_lock mes mes-source rung:stage0 src:nyacc $BT || fail "lock mes"
-ladder_lock tcc tcc-source rung:stage0 rung:mes $BT || fail "lock tcc"
-ladder_lock make-mesboot0 make-mesboot0-source rung:mes rung:tcc $BT || fail "lock make-mesboot0"
-ladder_lock patch-mesboot patch-mesboot-source rung:mes rung:tcc rung:make-mesboot0 $BT || fail "lock patch-mesboot"
-ladder_lock binutils-mesboot0 binutils-mesboot-source rung:mes rung:tcc rung:make-mesboot0 rung:patch-mesboot src:patch-binutils-boot-2.20.1a tool:flex tool:bison $BT || fail "lock binutils-mesboot0"
-ladder_lock gcc-core-mesboot0 gcc-core-source rung:mes rung:tcc rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 src:patch-gcc-boot-2.95.3 tool:flex tool:bison $BT || fail "lock gcc-core-mesboot0"
-ladder_lock mesboot-headers linux-headers rung:mes $BT || fail "lock mesboot-headers"
-ladder_lock glibc-mesboot0 glibc-mesboot0-source rung:mes rung:tcc rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 rung:gcc-core-mesboot0 rung:mesboot-headers src:patch-glibc-boot-2.2.5 src:patch-glibc-bootstrap-system-2.2.5 $BT || fail "lock glibc-mesboot0"
-ladder_lock gcc-mesboot0 gcc-core-source rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 rung:gcc-core-mesboot0 rung:glibc-mesboot0 rung:mesboot-headers src:patch-gcc-boot-2.95.3 tool:flex tool:bison $BT || fail "lock gcc-mesboot0"
-ladder_lock binutils-mesboot1 binutils-mesboot-source rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot0 rung:gcc-mesboot0 rung:glibc-mesboot0 src:patch-binutils-boot-2.20.1a src:linux-headers tool:flex tool:bison $BT || fail "lock binutils-mesboot1"
-ladder_lock make-mesboot make-mesboot-source rung:make-mesboot0 rung:binutils-mesboot0 rung:gcc-mesboot0 rung:glibc-mesboot0 src:linux-headers $BT || fail "lock make-mesboot"
-ladder_lock gcc-mesboot1 gcc-464-core rung:make-mesboot0 rung:patch-mesboot rung:binutils-mesboot1 rung:gcc-mesboot0 rung:glibc-mesboot0 rung:make-mesboot src:gcc-464-gpp src:patch-gcc-boot-4.6.4 src:gmp src:mpfr src:mpc src:linux-headers tool:flex tool:bison $BT || fail "lock gcc-mesboot1"
-ladder_lock binutils-mesboot binutils-mesboot-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot1 rung:gcc-mesboot1 rung:glibc-mesboot0 src:patch-binutils-boot-2.20.1a src:linux-headers tool:flex tool:bison $BT || fail "lock binutils-mesboot"
-ladder_lock gawk-mesboot gawk-mesboot-source rung:make-mesboot rung:binutils-mesboot1 rung:gcc-mesboot1 rung:glibc-mesboot0 src:linux-headers $BT || fail "lock gawk-mesboot"
-ladder_lock glibc-mesboot glibc-216-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot0 rung:gawk-mesboot src:patch-glibc-boot-2.16.0 src:patch-glibc-bootstrap-system-2.16.0 src:linux-headers $BT || fail "lock glibc-mesboot"
-ladder_lock gcc-mesboot gcc-494-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot src:gmp src:mpfr src:mpc src:linux-headers tool:flex tool:bison $BT || fail "lock gcc-mesboot"
-ladder_lock glibc-mesboot-shared glibc-216-source rung:make-mesboot rung:patch-mesboot rung:binutils-mesboot rung:gcc-mesboot1 rung:glibc-mesboot0 rung:gawk-mesboot src:patch-glibc-boot-2.16.0 src:patch-glibc-bootstrap-system-2.16.0 src:linux-headers $BT || fail "lock glibc-mesboot-shared"
-ladder_lock gcc-14 gcc-14-source rung:binutils-mesboot rung:gcc-mesboot rung:glibc-mesboot src:gmp63 src:mpfr421 src:mpc131 src:linux-headers tool:flex tool:bison tool:m4 tool:make $BT || fail "lock gcc-14"
-ladder_lock binutils-244 binutils-244-source rung:gcc-mesboot1 rung:glibc-mesboot rung:binutils-mesboot tool:flex tool:bison tool:make $BT || fail "lock binutils-244"
-ladder_lock glibc-241 glibc-241-source rung:gcc-14 rung:glibc-mesboot-shared rung:binutils-244 src:linux-headers tool:flex tool:bison tool:m4 tool:make tool:python $BT || fail "lock glibc-241"
+# Locks are no longer written here (#429): build-plan --auto SYNTHESIZES each rung's lock
+# straight from its recipe JSON's declared inputs/nativeInputs/sourceInput.
 echo "   [ladder] build-plan --auto glibc-241: the 20-rung recipe graph, from the 229-byte seed"
 ladder_build glibc-241 >/dev/null || fail "the recipe ladder did not build (see $LWDIR/build-glibc-241.err)"
 

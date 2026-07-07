@@ -140,6 +140,7 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     Recipe::mesboot("gcc-mesboot", "4.9.4")
+        .source_input("gcc-494-source")
         .native_inputs(&[
             "make-mesboot",
             "patch-mesboot",

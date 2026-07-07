@@ -104,17 +104,13 @@ load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builde
 load_recipe_eval || fail "no td-recipe-eval"
 export TD_STORE_DIR=/td/store
 # build-plan --auto make-test realizes the whole graph: the native /td/store x86_64 toolchain
-# (run_x86_64_native emits+locks it), make-x86-64, and make-test. make-test's steps RUN make.
+# (run_x86_64_native emits it), make-x86-64, and make-test. Every rung's lock is SYNTHESIZED
+# from its recipe JSON (#429) — make-x86-64's declared sourceInput resolves the pinned make
+# 4.4.1 tarball; make-test declares NO sourceInput (it only RUNS the built make, no source of
+# its own), so the synthesizer emits no source line for it. make-test's steps RUN make.
 run_x86_64_native || fail "the native /td/store x86_64 toolchain failed to build (build-plan --auto)"
 ladder_intern_extra make-x86-64-source make-4.4.1 || fail "intern the pinned make 4.4.1 source"
 ladder_emit make-x86-64 make-test || fail "emit the make-x86-64/make-test recipes"
-ladder_lock make-x86-64 make-x86-64-source rung:gcc-x86-64-native rung:binutils-x86-64-native rung:glibc-x86-64 src:linux-headers-x86-64 tool:make $_bt || fail "compose the make-x86-64 lock"
-# make-test writes its Makefile in-step, so it has no source of its OWN — but the engine's
-# assemble_recipe_drv REQUIRES a `<name>-source` lock entry (TD_SRC) for every non-stage0
-# build system. So alias an already-interned path as make-test-source: reuse the make 4.4.1
-# tarball (make-x86-64-source). make-test never unpacks it (no unpack step), so it's a harmless
-# staged input — the same pattern mesboot-headers uses (its source is linux-headers).
-ladder_lock make-test make-x86-64-source rung:make-x86-64 $_bt || fail "compose the make-test lock"
 ladder_build make-test || fail "build-plan --auto make-test — the built make failed its own build test"
 echo "PASS: make-test — GNU make 4.4.1 built on the native /td/store toolchain drove a real build in the recipe sandbox (a broken make would red this)"
 CHECK
