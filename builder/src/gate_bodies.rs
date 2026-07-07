@@ -19,11 +19,13 @@
 //! build-recipe path (a daemon cache-HIT — the `build-recipes` prelude already
 //! realised it), discovers its runtime closure with a guix-free multi-store
 //! content scan, and stages a self-contained td-owned store for the gates'
-//! store ops. External tools spawned by these bodies are ORACLES or artifacts
-//! (`sqlite3` validating td's hand-written DB bytes, `cp -a`/`chmod` staging
-//! trees) — the gate LOGIC (every assertion) is typed Rust. No body spawns a
-//! guix process.
+//! store ops. External tools spawned by these bodies are staging artifacts only
+//! (`cp -a`/`chmod`) — the gate LOGIC (every assertion) is typed Rust, and the
+//! only reader of td's hand-written SQLite bytes is td's OWN pure-Rust reader
+//! (`store_db_read`, via `store-query`); no external oracle (`sqlite3` or
+//! otherwise) is spawned. No body spawns a guix process.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -147,7 +149,7 @@ fn tb_ok(tb: &Path, args: &[&str]) -> bool {
 }
 
 /// Run an arbitrary tool, returning trimmed stdout on success (the generic
-/// subprocess oracle spawn for sqlite3 and staging helpers).
+/// subprocess spawn for staging helpers and one-off tool invocations).
 fn run_out(program: &str, args: &[&str], ctx: &str) -> Result<String, String> {
     run_out_env(program, args, &[], ctx)
 }
@@ -186,14 +188,6 @@ fn find_in_path_frags(frags: &str, bin: &str) -> Option<PathBuf> {
         let exec = p.is_file() && file_mode(&p).ok().is_some_and(|mode| mode & 0o111 != 0);
         exec.then_some(p)
     })
-}
-
-/// `sqlite3 <db> <sql>` — the PARSER ORACLE for td's hand-written SQLite bytes
-/// (an independent implementation reading the same file, exactly as the bash
-/// gates spawned it; sqlite comes from the loop toolchain).
-fn sqlite3(db: &Path, sql: &str) -> Result<String, String> {
-    let db_s = path_str(db)?;
-    run_out("sqlite3", &[&db_s, sql], "sqlite3 oracle")
 }
 
 /// `cp -a src dst` — faithful tree staging (perms/symlinks/times), the same
@@ -845,13 +839,14 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
 }
 
 /// store-register — td WRITES the store SQLite DB for a td-built hello's FULL
-/// closure (pure-Rust file format) and READS it back byte-identically to
-/// sqlite3 (the parser oracle). Port of 275-store-register.rs.
+/// closure (pure-Rust file format) and READS it back itself (td-builder
+/// store-query — a pure-Rust SQLite reader, no external engine). Port of
+/// 275-store-register.rs.
 fn store_register(root: &Path) -> Result<(), String> {
     println!(
         ">> store-register: td WRITES the store SQLite DB for a TD-BUILT hello's FULL CLOSURE \
-         (pure-Rust file format) and READS it back byte-identically to sqlite3 (guix off PATH; \
-         no guix build, no guix gc, no /var/guix read)"
+         (pure-Rust file format) and READS it back itself (guix off PATH; no guix build, no guix \
+         gc, no /var/guix read; no external SQLite engine anywhere in this gate)"
     );
     let s0 = stage0_from_memo(root)?;
     let tb = s0.tb.clone();
@@ -863,56 +858,35 @@ fn store_register(root: &Path) -> Result<(), String> {
     let tddb_s = path_str(&tddb)?;
     let closure_s = path_str(&subj.closure_file)?;
     println!(
-        ">> td WRITES the store SQLite DB for the {n}-path closure at {} (no sqlite3 engine — td \
-         emits the SQLite bytes)",
+        ">> td WRITES the store SQLite DB for the {n}-path closure at {} (td emits the SQLite \
+         bytes itself, no external engine)",
         tddb.display()
     );
     tb_out(&tb, &["store-register", &subj.root, &subj.drv, &closure_s, &tddb_s], "store-register")?;
     if std::fs::metadata(&tddb).map(|m| m.len()).unwrap_or(0) == 0 {
         return Err("FAIL: td wrote no store DB".into());
     }
-    let integrity = sqlite3(&tddb, "PRAGMA integrity_check")?;
-    println!(">> sqlite3 validates td's hand-written DB: {integrity}");
-    if integrity != "ok" {
-        return Err("FAIL: td's store DB is not a valid SQLite file (integrity_check failed)".into());
-    }
-
-    let rowsql =
-        "SELECT path||'|'||hash||'|'||narSize FROM ValidPaths WHERE hash IS NOT NULL ORDER BY path";
-    let refsql = "SELECT a.path||'|'||b.path FROM Refs r JOIN ValidPaths a ON r.referrer=a.id \
-                  JOIN ValidPaths b ON r.reference=b.id";
-    let td_rows = sqlite3(&tddb, rowsql)?;
-    let nrows = td_rows.lines().count();
-    if nrows != n {
-        return Err(format!("FAIL: td registered {nrows} paths, expected {n}"));
-    }
-    let regpaths = cut_field(&td_rows, 1);
-    if regpaths != subj.closure {
-        return Err("FAIL: the registered path set != the staged closure".into());
-    }
-    println!("   td registered all {n} closure paths (hash + narSize), exactly the staged closure");
 
     println!(
         ">> td READS its own store DB itself (td-builder store-query — a pure-Rust SQLite reader; \
-         NO sqlite3 engine, NO daemon in td's query path):"
+         no external engine, no daemon in td's query path):"
     );
     let td_read_info = tb_out(&tb, &["store-query", &tddb_s, "info"], "store-query info")?;
-    if td_read_info != td_rows {
-        return Err(format!(
-            "FAIL: td's reader disagrees with sqlite3 reading the SAME td.db bytes (info)\n  \
-             td-read:\n{td_read_info}\n  sqlite3:\n{td_rows}"
-        ));
+    let nrows = td_read_info.lines().count();
+    if nrows != n {
+        return Err(format!("FAIL: td registered {nrows} paths, expected {n}"));
     }
-    println!("   info: td's reader == sqlite3 (same bytes) for all {n} paths' path|hash|narSize");
-    let td_refs = sqlite3(&tddb, &format!("{refsql} ORDER BY 1"))?;
+    let regpaths = cut_field(&td_read_info, 1);
+    if regpaths != subj.closure {
+        return Err("FAIL: the registered path set != the staged closure".into());
+    }
+    println!(
+        "   info: td's reader parsed all {n} closure paths' path|hash|narSize, exactly the \
+         staged closure"
+    );
     let td_read_refs = tb_out(&tb, &["store-query", &tddb_s, "references"], "store-query references")?;
-    if td_read_refs != td_refs {
-        return Err(
-            "FAIL: td's reader disagrees with sqlite3 reading the SAME td.db bytes (references)".into(),
-        );
-    }
     let nedges = td_read_refs.lines().count();
-    println!("   references: td's reader == sqlite3 ({nedges} edges of the inter-path Refs relation)");
+    println!("   references: td's reader parsed {nedges} edges of the inter-path Refs relation");
 
     // deriver-in-closure: a deriver that is itself a member registers ONCE.
     println!(
@@ -936,20 +910,24 @@ fn store_register(root: &Path) -> Result<(), String> {
         &["store-register", &subj.root, &fakedrv, &closure_s, &dic_s],
         "store-register (deriver-in-closure)",
     )?;
-    if sqlite3(&dic_db, "PRAGMA integrity_check")? != "ok" {
-        return Err("FAIL: the deriver-in-closure DB is not valid SQLite".into());
-    }
-    let dic_total = sqlite3(&dic_db, "SELECT COUNT(*) FROM ValidPaths")?;
-    let dic_distinct = sqlite3(&dic_db, "SELECT COUNT(DISTINCT path) FROM ValidPaths")?;
-    if dic_total != n.to_string() || dic_distinct != n.to_string() {
-        let dups = sqlite3(
-            &dic_db,
-            "SELECT path,COUNT(*) c FROM ValidPaths GROUP BY path HAVING c>1",
-        )
-        .unwrap_or_default();
+    let dic_info = tb_out(&tb, &["store-query", &dic_s, "info"], "store-query info (deriver-in-closure)")?;
+    let dic_total = dic_info.lines().count();
+    let mut dic_paths = cut_field(&dic_info, 1);
+    dic_paths.sort();
+    let mut dic_distinct_paths = dic_paths.clone();
+    dic_distinct_paths.dedup();
+    let dic_distinct = dic_distinct_paths.len();
+    if dic_total != n || dic_distinct != n {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for p in &dic_paths {
+            *counts.entry(p.clone()).or_insert(0) += 1;
+        }
+        let mut dups: Vec<String> =
+            counts.into_iter().filter(|(_, c)| *c > 1).map(|(p, c)| format!("{p} {c}")).collect();
+        dups.sort();
         return Err(format!(
             "FAIL: deriver-in-closure produced {dic_total} rows ({dic_distinct} distinct), \
-             expected {n} with no duplicate — the closure-member deriver was registered twice\n{dups}"
+             expected {n} with no duplicate — the closure-member deriver was registered twice\n{dups:?}"
         ));
     }
     println!("   the closure-member deriver is registered once ({n} rows, no duplicate)");
@@ -958,10 +936,9 @@ fn store_register(root: &Path) -> Result<(), String> {
     println!(
         "PASS: td WROTE the store SQLite DB for a TD-BUILT hello's full {n}-path closure itself \
          in pure Rust AND READ it back itself (td-builder store-query — a pure-Rust SQLite \
-         reader, no sqlite3 engine and no daemon in td's own store-query path). sqlite3 PRAGMA \
-         integrity_check = ok on td's bytes; every path's hash + narSize and the full inter-path \
-         Refs relation, as answered by TD'S OWN READER, are BYTE-IDENTICAL to sqlite3 reading the \
-         same bytes (the parser oracle); and a closure-member deriver is registered once."
+         reader, no external SQLite engine and no daemon anywhere in this gate): every path's \
+         hash + narSize, the full inter-path Refs relation, and a closure-member deriver \
+         registered exactly once."
     );
     Ok(())
 }
@@ -1409,17 +1386,17 @@ fn store_backend(root: &Path) -> Result<(), String> {
     }
     println!("   (4) td's store VERIFIES (store-verify) the placed output's integrity against its OWN files");
 
-    let doutsql = format!(
-        "SELECT (SELECT deriver FROM ValidPaths WHERE path='{root}')||' :: '||v.path||':'||d.id||':'\
-         ||d.path FROM DerivationOutputs d JOIN ValidPaths v ON d.drv=v.id WHERE d.path='{root}'",
-        root = subj.root
-    );
-    let td_dout = sqlite3(&tddb, &doutsql)?;
-    let expected = format!("{drv} :: {drv}:out:{root}", drv = subj.drv, root = subj.root);
-    if td_dout != expected {
+    let all_outputs = tb_out(&tb, &["store-query", &tddb_s, "outputs"], "store-query outputs")?;
+    let out_prefix = format!("{}|", subj.root);
+    let dout_line = all_outputs
+        .lines()
+        .find(|l| l.starts_with(&out_prefix))
+        .ok_or_else(|| format!("FAIL: no DerivationOutputs row for the built output {}", subj.root))?;
+    let expected = format!("{root}|{drv}|{drv}|out", root = subj.root, drv = subj.drv);
+    if dout_line != expected {
         return Err(format!(
-            "FAIL: td's deriver/drv->output ({td_dout}) != the expected (td-assembled .drv) -> \
-             out -> output"
+            "FAIL: td's deriver/drv->output ({dout_line}) != the expected (td-assembled .drv) -> \
+             out -> output ({expected})"
         ));
     }
     println!(
