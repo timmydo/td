@@ -307,6 +307,43 @@ run_x86_64_native() {
   echo "   [ladder] x86_64 NATIVE toolchain via build-plan --auto: cross graph -> native binutils 2.44 -> native gcc 14.3.0 (ELF64 x86_64)"
 }
 
+# run_x86_64_make — build GNU make 4.4.1 (the FIRST td-native build-userland tool, #388 rung 1) via
+# build-plan --auto on the NATIVE toolchain. The whole graph — i686 base + 4 cross rungs + the two
+# native rungs (binutils/gcc-x86-64-native) + make-x86-64 — is one recipe DAG; one
+# `ladder_build make-x86-64` realizes it (the warm chain cache-hits the toolchain rungs). Same preamble
+# as run_x86_64_native (append-only: NO cold wipe); adds the make-x86-64 source intern + emit + lock on
+# top of the native rungs. Exports XMAKE (the built /td/store make tree, a static ELF64 x86_64 make).
+# Called by the recipe-owned daily check (tests/make-x86-64-recipe-check.sh).
+run_x86_64_make() {
+  command -v load_recipe_eval >/dev/null 2>&1 || . tests/cache-lib.sh
+  load_recipe_eval 2>/dev/null || {
+    sh tests/recipe-eval-tool.sh "$ROOT/.td-build-cache/recipe-eval" >/dev/null \
+      || { echo "run_x86_64_make: could not build td-recipe-eval (tests/recipe-eval-tool.sh)" >&2; return 1; }
+    load_recipe_eval || { echo "run_x86_64_make: no td-recipe-eval sentinel after recipe-eval-tool" >&2; return 1; }
+  }
+  . tests/ladder-lib.sh
+  TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
+  if [ -n "$TD_CHECK_CHAIN_CACHE" ]; then _lw="$HOME/.td/build-daemon/ladder"; else _lw="$ROOT/.td-build-cache/ladder-cold"; fi
+  mkdir -p "`dirname "$_lw"`"
+  exec 9>"$_lw.lock"; flock 9 || { echo "ladder: flock failed" >&2; return 1; }
+  # NO cold wipe (run_x86_64_cross owns it): appending the make rung must not discard the toolchain.
+  mkdir -p "$_lw"
+  ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
+  _x86_64_emit_lock_cross || return 1
+  ladder_emit binutils-x86-64-native gcc-x86-64-native make-x86-64 || return 1
+  ladder_lock binutils-x86-64-native binutils-244-source rung:gcc-x86-64-stage2 rung:binutils-x86-64 rung:glibc-x86-64 src:linux-headers-x86-64 tool:flex tool:bison tool:make $_bt || return 1
+  ladder_lock gcc-x86-64-native gcc-14-source rung:gcc-x86-64-stage2 rung:binutils-x86-64-native rung:binutils-x86-64 rung:glibc-x86-64 src:gmp63 src:mpfr421 src:mpc131 src:linux-headers-x86-64 tool:flex tool:bison tool:m4 tool:make $_bt || return 1
+  # make-4.4.1 source is NOT in the base ladder_setup spec set — intern it now (idempotent), so the
+  # make-x86-64 rung's lock resolves its -source entry.
+  ladder_intern_extra make-x86-64-source make-4.4.1 || return 1
+  ladder_lock make-x86-64 make-x86-64-source rung:gcc-x86-64-native rung:binutils-x86-64-native rung:glibc-x86-64 src:linux-headers-x86-64 tool:make $_bt || return 1
+  ladder_build make-x86-64 || { echo "the x86_64 make-x86-64 ladder failed" >&2; return 1; }
+  XMAKE=`ladder_out make-x86-64` || return 1
+  test -n "$XMAKE" -a -d "$XMAKE" || { echo "run_x86_64_make: no make tree ($XMAKE)" >&2; return 1; }
+  export XMAKE
+  echo "   [ladder] x86_64 make 4.4.1 via build-plan --auto: cross graph -> native binutils/gcc -> make-x86-64 (static ELF64 x86_64 make at $XMAKE)"
+}
+
 # verify_x86_64_native_ownroot <cpath> <scratch> [expected-gcc-name] — the DURABLE own-root verify for
 # rungs X2 AND X3. Interns the NATIVE x86_64 gcc + NATIVE x86_64 binutils + the x86_64 glibc 2.41 at
 # /td/store, then RUNS the native gcc IN the store-ns own-root: it COMPILES a C and a C++ program from

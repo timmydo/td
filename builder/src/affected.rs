@@ -582,12 +582,26 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // make-x86-64-recipe-check.sh is the make-x86-64 recipe's daily check BODY (#388 rung 1: GNU
+    // make 4.4.1 built via build-plan --auto on the native /td/store toolchain), run by
+    // recipe-checks-daily. The recipe itself (recipes/src/recipes/make-x86-64.rs) routes to recipe-rs
+    // via the earlier recipes/* arm; the make-4.4.1 source lock feeds both this check and gate 420.
+    if p == "tests/make-x86-64-recipe-check.sh" {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("recipe-rs");
+        sel.add_target("recipe-checks-daily");
+        return;
+    }
+
     if pattern_matches(
         "tests/userland-x86_64-store-native.sh|seed/sources/busybox-*.lock|seed/sources/make-4.4*.lock|builder/src/gate_defs/420-userland-x86_64-store-native.rs",
         p,
     ) {
         sel.add_preflight("shell-syntax");
         sel.add_target("userland-x86_64-store-native");
+        // seed/sources/make-4.4.1.lock is ALSO the make-x86-64 recipe's pinned source (#388 rung 1),
+        // so a lock edit re-runs its recipe check (recipe-checks-daily) as well as gate 420.
+        sel.add_target("recipe-checks-daily");
         // Gate 420 also PERSISTS the /td/store harness the guix-free tier consumes
         // (host-sandbox-stage0 inc2c). `check-harness` is a check.sh-intercepted tier
         // (its own container), not a make gate, so it cannot join the other ./check.sh
@@ -798,10 +812,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_preflight("shell-syntax");
         add_chain(sel, 27, 28);
         // x86_64-cross-fns.sh also defines the rung-X2 native driver (run_x86_64_native), the shared
-        // fetch-or-build obtainers, and the rung-X3 self-host fns — so a change to it must re-run the
-        // native gcc gate AND the self-host gate, not only the cross toolchain gate.
+        // fetch-or-build obtainers, the rung-X3 self-host fns, AND run_x86_64_make (the #388 rung-1
+        // make driver) — so a change to it must re-run the native gcc gate, the self-host gate, AND
+        // the make-x86-64 recipe check (recipe-checks-daily), not only the cross toolchain gate.
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         sel.add_target("bootstrap-x86_64-self-gcc-store-native");
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
@@ -1295,6 +1311,14 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/bootstrap-hello-corpus-store-native.sh", "recipe-checks-daily");
     assert_target!("tests/bootstrap-sed-corpus-store-native.sh", "recipe-checks-daily");
     assert_target!("tests/rust-toolchain-recipe-check.sh", "recipe-checks-daily");
+    // #388 rung 1: the make-x86-64 recipe check body + its shared driver + its pinned source all
+    // route to recipe-checks-daily (and the check body + shared driver also to recipe-rs/the x86_64
+    // gates); the recipe .rs routes to recipe-rs via the recipes/* arm.
+    assert_target!("tests/make-x86-64-recipe-check.sh", "recipe-checks-daily");
+    assert_target!("tests/make-x86-64-recipe-check.sh", "recipe-rs");
+    assert_target!("tests/x86_64-cross-fns.sh", "recipe-checks-daily");
+    assert_target!("seed/sources/make-4.4.1.lock", "recipe-checks-daily");
+    assert_target!("recipes/src/recipes/make-x86-64.rs", "recipe-rs");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
     // the seed tree + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
