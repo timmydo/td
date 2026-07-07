@@ -65,7 +65,7 @@ impl std::fmt::Display for CheckError {
 }
 
 /// First `name` on PATH (the child-spawn resolver `Command` itself uses).
-fn find_in_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var("PATH").ok()?;
     for dir in path.split(':') {
         if dir.is_empty() {

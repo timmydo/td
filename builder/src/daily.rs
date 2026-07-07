@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::check_loop::EXIT_UNPROVISIONED;
+use crate::check_loop::{find_in_path, EXIT_UNPROVISIONED};
 
 const HELP: &str = "\
 td-builder daily [--no-system] [--verdict FILE]
@@ -99,12 +99,18 @@ struct Verdict {
     all_green: bool,
 }
 
-/// The exact verdict/exit contract ci/daily-full-suite.sh implemented, as a pure
-/// function so the scenario matrix is a unit test (the shell only ever verified it
-/// by stubbing td-builder). heavy/system share the "loop toolchain unprovisioned"
-/// state: system is only attempted when heavy is provisioned.
+/// The verdict/exit contract, as a pure function so the scenario matrix is a unit
+/// test (the shell could only verify it by stubbing td-builder). Every leg is
+/// symmetric: an unprovisioned leg (its `td-builder check` exited
+/// `EXIT_UNPROVISIONED`) never sets a red bit AND never counts toward a full-suite
+/// green — a tier that could not run means this is not a full-suite proof, so the
+/// run is PARTIAL and `.td-last-green` is withheld. (`env_error` = heavy
+/// unprovisioned, which also skips system.)
 fn compute_verdict(inp: &VerdictInput) -> Verdict {
     let env_error = inp.heavy.unprovisioned;
+    // system is only attempted when heavy is provisioned; if it ran and came back
+    // unprovisioned (exit 69), treat it symmetrically — no red bit, PARTIAL.
+    let system_unprov = inp.run_system && !env_error && inp.system.unprovisioned;
     let harness_env_error = inp.harness.unprovisioned;
 
     let heavy_state = if env_error {
@@ -116,7 +122,7 @@ fn compute_verdict(inp: &VerdictInput) -> Verdict {
     };
     let system_state = if !inp.run_system {
         "skipped"
-    } else if env_error {
+    } else if env_error || system_unprov {
         "unprovisioned"
     } else if inp.system.rc == 0 {
         "green"
@@ -131,7 +137,8 @@ fn compute_verdict(inp: &VerdictInput) -> Verdict {
         "red"
     };
 
-    // Every leg unprovisioned → nothing ran; abort 10, no triage.
+    // Every attemptable leg unprovisioned → nothing ran; abort 10, no triage.
+    // (heavy unprovisioned ⇒ system skipped, so it is not "attemptable" here.)
     if env_error && harness_env_error {
         return Verdict {
             heavy_state,
@@ -151,17 +158,19 @@ fn compute_verdict(inp: &VerdictInput) -> Verdict {
     if !env_error && inp.heavy.rc != 0 {
         rc += 1;
     }
-    if !env_error && inp.run_system && inp.system.rc != 0 {
+    if inp.run_system && !env_error && !system_unprov && inp.system.rc != 0 {
         rc += 2;
     }
     if !harness_env_error && inp.harness.rc != 0 {
         rc += 4;
     }
 
-    // rc==0 && env_error: the harness leg (the only one that ran) is green — but
-    // heavy/system never ran, so it is not a full-suite proof.
-    let partial = rc == 0 && env_error;
-    let all_green = rc == 0 && !env_error;
+    // Any leg unprovisioned (heavy/system/harness) means this is not a full-suite
+    // proof: PARTIAL, and `.td-last-green` / publish are withheld. all_green requires
+    // every attempted leg to have actually run green.
+    let any_unprovisioned = env_error || system_unprov || harness_env_error;
+    let partial = rc == 0 && any_unprovisioned;
+    let all_green = rc == 0 && !any_unprovisioned;
 
     Verdict {
         heavy_state,
@@ -258,6 +267,7 @@ fn run(args: &[String]) -> i32 {
     if heavy.unprovisioned {
         println!(">> daily backstop: {ENV_ERROR_MSG}");
     }
+    let _ = std::fs::remove_file(&hlog); // the shell's `trap rm` — don't leak leg logs
 
     // System: only when provisioned (it needs the same loop toolchain as heavy).
     let mut system = LegRc::green();
@@ -274,6 +284,7 @@ fn run(args: &[String]) -> i32 {
         );
         system = LegRc::from_code(code);
         system_fail = grep_fails(&slog);
+        let _ = std::fs::remove_file(&slog);
     }
 
     // Harness: the /td/store harness tier (busybox+make). ALWAYS attempted — its
@@ -292,6 +303,7 @@ fn run(args: &[String]) -> i32 {
     if harness.unprovisioned {
         println!(">> daily backstop: {HARNESS_ENV_MSG}");
     }
+    let _ = std::fs::remove_file(&xlog);
 
     let v = compute_verdict(&VerdictInput {
         run_system,
@@ -337,8 +349,10 @@ fn run(args: &[String]) -> i32 {
 
     if v.partial {
         println!(
-            ">> daily backstop: PARTIAL at {main} — harness leg GREEN; heavy/system unprovisioned \
-             this run — not a full-suite proof, .td-last-green NOT recorded"
+            ">> daily backstop: PARTIAL at {main} — a tier was unprovisioned this run \
+             (heavy={} system={} harness={}); nothing that ran is red, but this is not a \
+             full-suite proof — .td-last-green NOT recorded",
+            v.heavy_state, v.system_state, v.harness_state
         );
     } else if v.all_green {
         let _ = std::fs::write(root.join(".td-last-green"), format!("{main}\n"));
@@ -387,7 +401,7 @@ fn git_capture(root: &Path, args: &[&str]) -> Option<String> {
 /// stage0 (its CURRENT placement out of the #309 memo, which the stale-sweep
 /// always keeps; glob fallback for a shipped store with no memo).
 fn locate_tdb(root: &Path) -> Option<PathBuf> {
-    if which("cargo").is_some() {
+    if find_in_path("cargo").is_some() {
         let built = Command::new("cargo")
             .args([
                 "build",
@@ -528,19 +542,16 @@ fn cat(root: &Path, path: &str) {
     }
 }
 
+/// A regular file with an execute bit — the `[ -x ]` guard the deleted shell put
+/// on `$TDB`. is_file() alone is not enough: a partial cargo output or a placed
+/// store file that lost +x would be picked as the check binary, then every leg's
+/// spawn fails with code 1 and scores as a spurious heavy RED instead of the clean
+/// "no td-builder" setup exit.
 fn is_exec(p: &Path) -> bool {
-    p.is_file()
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var("PATH").ok()?;
-    for dir in path.split(':').filter(|d| !d.is_empty()) {
-        let p = Path::new(dir).join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// On all-green: sign + publish the from-seed exports this run produced so the
@@ -557,7 +568,7 @@ fn publish_substitutes(root: &Path, tdb: &Path) {
     let privkey = std::env::var("TD_SUBST_PRIVKEY").unwrap_or_default();
     let sb = std::env::var("TD_SUBST_BIN")
         .ok()
-        .or_else(|| which("td-subst").map(|p| p.display().to_string()))
+        .or_else(|| find_in_path("td-subst").map(|p| p.display().to_string()))
         .unwrap_or_default();
 
     publish_export(
@@ -813,5 +824,39 @@ mod tests {
         assert_eq!(v.system_state, "skipped");
         assert_eq!(v.exit_code, 0);
         assert!(v.all_green);
+    }
+
+    // Cross-model review (codex P1 / subagent): heavy+system green but the harness
+    // tier unprovisioned must NOT record .td-last-green — the harness is part of the
+    // full-suite proof, so it is PARTIAL, not ALL GREEN.
+    #[test]
+    fn heavy_green_harness_unprovisioned_is_partial_not_all_green() {
+        let v = compute_verdict(&VerdictInput {
+            run_system: true,
+            heavy: LegRc::green(),
+            system: LegRc::green(),
+            harness: unprov(),
+        });
+        assert_eq!(v.exit_code, 0);
+        assert!(v.partial, "an unprovisioned harness tier => PARTIAL");
+        assert!(!v.all_green, "must NOT record .td-last-green / publish");
+        assert_eq!(v.harness_state, "unprovisioned");
+    }
+
+    // Cross-model review (codex P2): a system leg that itself exits 69 while heavy is
+    // provisioned must NOT set the system red bit (contract: unprovisioned legs never
+    // set a bit) — it is unprovisioned, hence PARTIAL.
+    #[test]
+    fn system_unprovisioned_does_not_set_a_red_bit() {
+        let v = compute_verdict(&VerdictInput {
+            run_system: true,
+            heavy: LegRc::green(),
+            system: unprov(),
+            harness: LegRc::green(),
+        });
+        assert_eq!(v.exit_code, 0, "no red bit for an unprovisioned system leg");
+        assert_eq!(v.system_state, "unprovisioned");
+        assert!(v.partial);
+        assert!(!v.all_green);
     }
 }
