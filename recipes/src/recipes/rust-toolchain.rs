@@ -42,6 +42,7 @@ pub fn recipe() -> Recipe {
             "https://static.rust-lang.org/dist/rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz",
             "104nb1mgsy2qd8jb4z8pg1m0s1gvn42v2qmhd9v31wkng57hw4y1",
         ))
+        .source_input("rust-toolchain-source")
         .native_inputs(&["glibc-x86-64", "gcc-x86-64-stage2", "zlib-x86-64"])
         .checks(vec![RecipeCheck::daily(
             r#"

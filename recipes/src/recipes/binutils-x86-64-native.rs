@@ -131,9 +131,9 @@ pub fn recipe() -> Recipe {
         .env("PATH", &base_path()),
     );
     Recipe::mesboot("binutils-x86-64-native", "2.44")
+        .source_input("binutils-244-source")
         .native_inputs(&["gcc-x86-64-stage2", "binutils-x86-64", "glibc-x86-64"])
         .inputs_owned(base_inputs(&[
-            "binutils-x86-64-native-source",
             "linux-headers-x86-64",
             "flex",
             "bison",

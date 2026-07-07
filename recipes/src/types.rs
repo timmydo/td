@@ -509,6 +509,16 @@ pub struct Recipe {
     pub name: String,
     pub version: String,
     pub source: Option<Source>,
+    /// The MAP KEY (in the `build-plan --auto` tool/source map `ladder_setup`
+    /// interns) that resolves to this recipe's OWN `<name>-source` lock entry
+    /// (#429) — distinct from `source` (an actual declared upstream fetch): a
+    /// mesboot rung's source is a seed/sources-pinned tarball ALREADY interned
+    /// under some other name (e.g. gcc-mesboot1 builds from the map key
+    /// `gcc-464-core`, not `gcc-mesboot1-source`), so this just names which
+    /// interned entry to alias in. `None` means the recipe has no source of its
+    /// own (e.g. make-test, which only RUNS a sibling rung's output) — the
+    /// synthesizer then emits no `<name>-source` line at all.
+    pub source_input: Option<String>,
     pub build_system: BuildSystem,
     pub inputs: Option<Vec<String>>,
     /// Staged builders (#378): inputs that are themselves td recipes and act as
@@ -558,6 +568,7 @@ impl Recipe {
             name: name.into(),
             version: version.into(),
             source: None,
+            source_input: None,
             build_system: bs,
             inputs: None,
             native_inputs: None,
@@ -611,6 +622,13 @@ impl Recipe {
 
     pub fn source(mut self, src: Source) -> Recipe {
         self.source = Some(src);
+        self
+    }
+    /// Declare the tool/source MAP KEY this rung's own `<name>-source` lock
+    /// entry resolves from (see `source_input`'s doc comment). A recipe with no
+    /// source of its own (make-test) simply never calls this.
+    pub fn source_input(mut self, key: &str) -> Recipe {
+        self.source_input = Some(key.into());
         self
     }
     pub fn inputs(mut self, xs: &[&str]) -> Recipe {
@@ -672,6 +690,9 @@ impl Recipe {
         ];
         if let Some(src) = &self.source {
             o.push(("source".into(), src.to_json()));
+        }
+        if let Some(k) = &self.source_input {
+            o.push(("sourceInput".into(), Json::Str(k.clone())));
         }
         o.push((
             "buildSystem".into(),

@@ -135,6 +135,7 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     Recipe::mesboot("glibc-241", "2.41")
+        .source_input("glibc-241-source")
         .native_inputs(&["gcc-14", "glibc-mesboot-shared", "binutils-244"])
         .inputs_owned(base_inputs(&["linux-headers", "flex", "bison", "m4", "make", "python"]))
         .steps(steps)

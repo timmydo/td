@@ -18,6 +18,7 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     Recipe::mesboot("mesboot-headers", "4.14.67")
+        .source_input("linux-headers")
         .native_inputs(&["mes"])
         .inputs_owned(base_inputs(&[]))
         .steps(steps)

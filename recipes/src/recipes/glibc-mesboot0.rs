@@ -93,6 +93,7 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     Recipe::mesboot("glibc-mesboot0", "2.2.5")
+        .source_input("glibc-mesboot0-source")
         .native_inputs(&[
             "mes",
             "tcc",

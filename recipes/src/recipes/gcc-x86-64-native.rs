@@ -209,6 +209,7 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     Recipe::mesboot("gcc-x86-64-native", "14.3.0")
+        .source_input("gcc-14-source")
         .native_inputs(&[
             "gcc-x86-64-stage2",
             "binutils-x86-64-native",
@@ -216,7 +217,6 @@ pub fn recipe() -> Recipe {
             "glibc-x86-64",
         ])
         .inputs_owned(base_inputs(&[
-            "gcc-x86-64-native-source",
             "gmp63",
             "mpfr421",
             "mpc131",

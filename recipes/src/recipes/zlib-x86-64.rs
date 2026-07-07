@@ -77,7 +77,8 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     Recipe::mesboot("zlib-x86-64", "1.3.1")
+        .source_input("zlib-x86-64-source")
         .native_inputs(&["gcc-x86-64-stage2", "glibc-x86-64", "binutils-x86-64"])
-        .inputs_owned(base_inputs(&["zlib-x86-64-source", "make"]))
+        .inputs_owned(base_inputs(&["make"]))
         .steps(steps)
 }

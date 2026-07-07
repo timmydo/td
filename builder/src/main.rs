@@ -1925,7 +1925,11 @@ fn assemble_recipe_drv(
             lock::Class::Seed | lock::Class::TdRecipeOutput => inputs.push(e.path.clone()),
         }
     }
-    if source.is_empty() {
+    // Every build system needs its own source EXCEPT mesboot: a rung that only RUNS a
+    // sibling rung's output (make-test, #429) has no source of its own — its recipe
+    // declares no `sourceInput`, so --auto synthesizes no `<name>-source` line, and
+    // requiring one here would force back the removed nominal-source alias hack.
+    if source.is_empty() && build_system != "mesboot" {
         return Err(format!("lock has no `{src_key}' entry (the recipe source)"));
     }
     // Default corpus toolchain (corpus-toolchain-default): when TD_GCC_TOOLCHAIN names a /td/store
@@ -1956,7 +1960,9 @@ fn assemble_recipe_drv(
     spec.push_str("system x86_64-linux\n");
     spec.push_str(&format!("builder {builder}\n"));
     spec.push_str(&format!("arg {phase_runner}\n"));
-    spec.push_str(&format!("input-src {source}\n"));
+    if !source.is_empty() {
+        spec.push_str(&format!("input-src {source}\n"));
+    }
     spec.push_str(&format!("input-src {builder_path}\n"));
     for p in &inputs {
         spec.push_str(&format!("input-src {p}\n"));
@@ -1971,7 +1977,9 @@ fn assemble_recipe_drv(
     if let Some(vd) = vendor_dir {
         spec.push_str(&format!("input-src {vd}\n"));
     }
-    spec.push_str(&format!("env TD_SRC={source}\n"));
+    if !source.is_empty() {
+        spec.push_str(&format!("env TD_SRC={source}\n"));
+    }
     spec.push_str(&format!("env TD_INPUTS={}\n", inputs.join(":")));
     match build_system {
         // gnu: the autotools phase runner reads the configure flags + custom phases.
@@ -2286,12 +2294,12 @@ fn auto_inputs(recipe_dir: &str, name: &str) -> Result<Vec<String>, String> {
     Ok(xs)
 }
 
-/// An input is OWNED (td reconstructs it) iff both its recipe JSON and base lock exist;
-/// otherwise it is an external seed (the toolchain, retired last) and stays guix-supplied.
+/// An input is OWNED (td reconstructs it) iff its recipe JSON exists in RECIPE-DIR;
+/// otherwise it is an external seed/tool (the toolchain, retired last) resolved
+/// through the --auto MAP instead (#429 — no per-rung hand-written base lock).
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn auto_is_owned(recipe_dir: &str, lock_dir: &str, name: &str) -> bool {
+fn auto_is_owned(recipe_dir: &str, name: &str) -> bool {
     Path::new(&format!("{recipe_dir}/{name}.json")).exists()
-        && Path::new(&format!("{lock_dir}/{name}-no-guix.lock")).exists()
 }
 
 /// Post-order DFS over the OWNED-input subgraph: appends each recipe AFTER its owned
@@ -2299,7 +2307,6 @@ fn auto_is_owned(recipe_dir: &str, lock_dir: &str, name: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_topo(
     recipe_dir: &str,
-    lock_dir: &str,
     name: &str,
     order: &mut Vec<String>,
     seen: &mut std::collections::BTreeSet<String>,
@@ -2313,8 +2320,8 @@ fn auto_topo(
     }
     stack.push(name.to_string());
     for inp in auto_inputs(recipe_dir, name)? {
-        if auto_is_owned(recipe_dir, lock_dir, &inp) {
-            auto_topo(recipe_dir, lock_dir, &inp, order, seen, stack)?;
+        if auto_is_owned(recipe_dir, &inp) {
+            auto_topo(recipe_dir, &inp, order, seen, stack)?;
         }
     }
     stack.pop();
@@ -2323,66 +2330,69 @@ fn auto_topo(
     Ok(())
 }
 
-/// A lock entry (first field + store path) names dep D iff the field is bare `D` or the
-/// path basename is `<hash>-D-<version>` (32-char base32 hash + `-`). Handles both lock
-/// conventions: declared inputs written bare (grep's `pcre2`) and hash-named entries.
+/// Parse a --auto MAP file: `NAME PATH` per line (blank/`#`-comment lines skipped) —
+/// the merged host-tool + pinned-source resolution `ladder_setup` interns (its
+/// `srcs.map` then `tools.map`, concatenated by the caller). The FIRST occurrence of
+/// a name wins (mirrors the shell `ladder_map`'s `head -1` over the same two files in
+/// the same order), so a name present in both keeps the source-map's entry.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn auto_entry_is_dep(first: &str, path: &str, dep: &str) -> bool {
-    if first == dep {
-        return true;
-    }
-    let base = path.rsplit('/').next().unwrap_or(path);
-    if base.len() > 33 && base.as_bytes().get(32) == Some(&b'-') {
-        let rest = &base[33..];
-        return rest == dep || rest.starts_with(&format!("{dep}-"));
-    }
-    false
-}
-
-/// Derive a chained lock from BASE_LOCK_TEXT by re-keying each OWNED-input dep to
-/// `D <path> td-recipe-output` (so build_plan substitutes td's build of D); non-owned
-/// lines pass through. Every owned dep must appear in the lock — else the recipe
-/// declares an input its lock doesn't carry, and we refuse rather than drop the edge.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn auto_chained_lock(base_lock_text: &str, owned_deps: &[String]) -> Result<String, String> {
-    let mut out = String::new();
-    let mut marked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for line in base_lock_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            out.push_str(line);
-            out.push('\n');
+fn auto_parse_map(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut m = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut toks = trimmed.split_whitespace();
-        let first = toks.next().unwrap_or("");
-        let path = toks.next().unwrap_or("");
-        let class = toks.next().unwrap_or("");
-        // A `source`-class line is the recipe's OWN source, NEVER a rung dependency — so it
-        // must pass through unchanged. Without this, a rung that reuses another rung's source
-        // TARBALL (e.g. the x86_64 cross rungs build the i686 gcc-14/binutils-2.44 source and
-        // ALSO depend on those rungs) mis-fires auto_entry_is_dep: the source path basename
-        // `<hash>-binutils-244-source` matches the dep `binutils-244` via its `starts_with`
-        // prefix rule, re-keying the source line away and leaving the recipe with no source.
-        let dep = if class == "source" {
-            None
-        } else {
-            owned_deps.iter().find(|d| auto_entry_is_dep(first, path, d))
-        };
-        match dep {
-            Some(d) => {
-                out.push_str(&format!("{d} {path} td-recipe-output\n"));
-                marked.insert(d.clone());
-            }
-            None => {
-                out.push_str(line);
-                out.push('\n');
-            }
+        if let Some((n, p)) = line.split_once(' ') {
+            m.entry(n.trim().to_string()).or_insert_with(|| p.trim().to_string());
         }
     }
-    for d in owned_deps {
-        if !marked.contains(d) {
-            return Err(format!("--auto: owned input `{d}' not found in the lock"));
+    m
+}
+
+/// Resolve NAME to a real store path through the --auto MAP — every declared input
+/// that is NOT itself an owned recipe (a host tool, a pinned seed/source tarball)
+/// must be in MAP or synthesis fails loudly: a recipe declaring an input nothing
+/// interned is a bug to surface, not an edge to silently drop.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+fn auto_map_lookup(map: &std::collections::BTreeMap<String, String>, name: &str) -> Result<String, String> {
+    map.get(name).cloned().ok_or_else(|| {
+        format!("no map entry for `{name}' (not an owned recipe, not interned by ladder_setup)")
+    })
+}
+
+/// Synthesize NAME's whole lock text FROM ITS RECIPE JSON — the #429 replacement for
+/// the hand-written `ladder_lock` shell calls (which re-declared, per rung, exactly
+/// what the recipe's own `inputs`/`nativeInputs`/`sourceInput` already say). Every
+/// declared `inputs`/`nativeInputs` entry that is itself OWNED (has a recipe JSON)
+/// becomes a `td-recipe-output` PENDING placeholder — build_plan substitutes the real
+/// path once that step has run; every other declared input is resolved through MAP
+/// (the tool/source paths `ladder_setup` interned) and written `seed`. The recipe's
+/// own declared `sourceInput` (if any) becomes the required `<name>-source` line,
+/// resolved through MAP the same way; a recipe with no `sourceInput` (e.g. make-test,
+/// which only RUNS a sibling rung's output, not compiles one) gets no source line.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+fn auto_synthesize_lock(
+    recipe_dir: &str,
+    map: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Result<String, String> {
+    let p = format!("{recipe_dir}/{name}.json");
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
+    let alist = json::parse(&text).map_err(|e| format!("recipe JSON {p}: {e}"))?;
+    let mut out = String::new();
+    if let Some(key) = alist.get("sourceInput").and_then(json::Json::as_str) {
+        let path = auto_map_lookup(map, key)
+            .map_err(|e| format!("--auto: recipe `{name}' sourceInput `{key}': {e}"))?;
+        out.push_str(&format!("{name}-source {path} source\n"));
+    }
+    for inp in auto_inputs(recipe_dir, name)? {
+        if auto_is_owned(recipe_dir, &inp) {
+            out.push_str(&format!("{inp} /td/store/pending-{inp} td-recipe-output\n"));
+        } else {
+            let path = auto_map_lookup(map, &inp)
+                .map_err(|e| format!("--auto: recipe `{name}' input `{inp}': {e}"))?;
+            out.push_str(&format!("{inp} {path} seed\n"));
         }
     }
     Ok(out)
@@ -2390,31 +2400,34 @@ fn auto_chained_lock(base_lock_text: &str, owned_deps: &[String]) -> Result<Stri
 
 /// build-plan --auto: GENERATE the plan from the recipe GRAPH, then run it. Given a
 /// TARGET recipe spec, recursively resolve every declared input that is itself an owned
-/// recipe (RECIPE-DIR/<name>.json + LOCK-DIR/<name>-no-guix.lock both exist), topo-sort,
-/// emit a per-recipe chained lock marking those owned deps `td-recipe-output`, and feed
-/// the generated plan to build_plan. No hand-written plan or manifest — a recipe's edges
-/// chain automatically as the owned set grows.
+/// recipe (RECIPE-DIR/<name>.json exists), topo-sort, SYNTHESIZE each owned recipe's
+/// whole lock straight from its declared graph (`auto_synthesize_lock` — owned deps
+/// `td-recipe-output`, everything else resolved through MAP-FILE, the recipe's declared
+/// `sourceInput` if any), and feed the generated plan to build_plan. No hand-written
+/// lock, plan, or manifest (#429) — a recipe's edges chain automatically as the owned
+/// set grows.
 ///
-/// Usage: build-plan --auto TARGET RECIPE-DIR LOCK-DIR GUIX-STORE SCRATCH
+/// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE GUIX-STORE SCRATCH
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_plan_auto(
     target: &str,
     recipe_dir: &str,
-    lock_dir: &str,
+    map_file: &str,
     guix_store: &str,
     scratch: &Path,
     builder_store: Option<(&str, &str, &str)>,
 ) -> Result<(), String> {
-    if !auto_is_owned(recipe_dir, lock_dir, target) {
-        return Err(format!(
-            "--auto target `{target}': need {recipe_dir}/{target}.json and {lock_dir}/{target}-no-guix.lock"
-        ));
+    if !auto_is_owned(recipe_dir, target) {
+        return Err(format!("--auto target `{target}': need {recipe_dir}/{target}.json"));
     }
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+    let map_text =
+        std::fs::read_to_string(map_file).map_err(|e| format!("read --auto map {map_file}: {e}"))?;
+    let map = auto_parse_map(&map_text);
     let mut order: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
-    auto_topo(recipe_dir, lock_dir, target, &mut order, &mut seen, &mut stack)?;
+    auto_topo(recipe_dir, target, &mut order, &mut seen, &mut stack)?;
     eprintln!(
         "td-builder: build-plan --auto {target}: derived a {}-step plan from the recipe graph: {}",
         order.len(),
@@ -2422,15 +2435,9 @@ fn build_plan_auto(
     );
     let mut plan = String::new();
     for name in &order {
-        let owned: Vec<String> = auto_inputs(recipe_dir, name)?
-            .into_iter()
-            .filter(|i| auto_is_owned(recipe_dir, lock_dir, i))
-            .collect();
-        let base = std::fs::read_to_string(format!("{lock_dir}/{name}-no-guix.lock"))
-            .map_err(|e| format!("read lock for {name}: {e}"))?;
-        let chained = auto_chained_lock(&base, &owned)?;
+        let synthesized = auto_synthesize_lock(recipe_dir, &map, name)?;
         let lock_path = scratch.join(format!("{name}-auto.lock"));
-        std::fs::write(&lock_path, &chained).map_err(|e| e.to_string())?;
+        std::fs::write(&lock_path, &synthesized).map_err(|e| e.to_string())?;
         plan.push_str(&format!(
             "step {recipe_dir}/{name}.json {}\n",
             lock_path.to_string_lossy()
@@ -5477,12 +5484,15 @@ fn main() -> ExitCode {
             }
         }
         // td-builder build-plan --auto — GENERATE the plan from the recipe GRAPH (no
-        // hand-written plan or manifest): topo-sort TARGET's owned-input closure, mark each
-        // owned-input dep `td-recipe-output`, and run it. An input is owned iff
-        // RECIPE-DIR/<name>.json and LOCK-DIR/<name>-no-guix.lock both exist.
-        // Usage: build-plan --auto TARGET RECIPE-DIR LOCK-DIR GUIX-STORE SCRATCH
+        // hand-written lock, plan, or manifest, #429): topo-sort TARGET's owned-input
+        // closure, SYNTHESIZE each owned recipe's lock straight from its declared
+        // `inputs`/`nativeInputs`/`sourceInput` (owned deps `td-recipe-output`,
+        // everything else resolved through MAP-FILE), and run it. An input is owned iff
+        // RECIPE-DIR/<name>.json exists. MAP-FILE is `NAME PATH` per line — the host-tool
+        // + pinned seed/source paths `ladder_setup` interned (tools.map + srcs.map).
+        // Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE GUIX-STORE SCRATCH
         Some("build-plan") if args.len() == 8 && args[2] == "--auto" => {
-            let (target, recipe_dir, lock_dir, guix_store, scratch) =
+            let (target, recipe_dir, map_file, guix_store, scratch) =
                 (&args[3], &args[4], &args[5], &args[6], &args[7]);
             let bov = match builder_store_env() {
                 Ok(b) => b,
@@ -5492,7 +5502,7 @@ fn main() -> ExitCode {
                 }
             };
             let builder_store = bov.as_ref().map(|(p, s, d)| (p.as_str(), s.as_str(), d.as_str()));
-            match build_plan_auto(target, recipe_dir, lock_dir, guix_store, Path::new(scratch), builder_store) {
+            match build_plan_auto(target, recipe_dir, map_file, guix_store, Path::new(scratch), builder_store) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build-plan --auto {target}: {e}");
@@ -6482,108 +6492,120 @@ glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --auto: a lock entry names a dep whether it's written bare (declared inputs like
-    // grep's `pcre2`) or hash-named (`<hash>-D-<version>`); a non-matching toolchain
-    // entry and a near-miss (`ncursesw` vs `ncurses`) do NOT match.
-    #[test]
-    fn auto_entry_is_dep_matches_bare_and_hash_forms() {
-        let h = "agdqkcaybihqgjiwq9s9kz5mqsxwdjdv"; // 32-char base32 hash
-        assert!(auto_entry_is_dep("pcre2", "/gnu/store/x-pcre2-10.42", "pcre2")); // bare
-        assert!(auto_entry_is_dep(
-            &format!("{h}-ncurses-6.2"),
-            &format!("/gnu/store/{h}-ncurses-6.2"),
-            "ncurses"
-        )); // hash-named
-        assert!(auto_entry_is_dep(
-            &format!("{h}-gettext-minimal-0.23.1"),
-            &format!("/gnu/store/{h}-gettext-minimal-0.23.1"),
-            "gettext-minimal"
-        )); // dep name contains a dash
-        assert!(!auto_entry_is_dep(
-            &format!("{h}-ncursesw-6.2"),
-            &format!("/gnu/store/{h}-ncursesw-6.2"),
-            "ncurses"
-        )); // near-miss must NOT match
-        assert!(!auto_entry_is_dep(
-            &format!("{h}-coreutils-9.1"),
-            &format!("/gnu/store/{h}-coreutils-9.1"),
-            "ncurses"
-        )); // toolchain entry
-    }
-
-    // --auto: a `source`-class line is the recipe's OWN source, never a rung dep, so it must
-    // NOT be re-keyed even when its path basename prefix-matches an owned dep. Regression for
-    // the x86_64 cross rungs: binutils-x86-64 builds the `binutils-244-source` tarball AND
-    // depends on the `binutils-244` rung — the source path `<hash>-binutils-244-source` else
-    // mis-matches `binutils-244` and the recipe loses its source.
-    #[test]
-    fn auto_chained_lock_never_rekeys_the_source_line() {
-        let h = "agdqkcaybihqgjiwq9s9kz5mqsxwdjdv";
-        let base = format!(
-            "binutils-x86-64-source /td/store/{h}-binutils-244-source source\n\
-             binutils-244 /td/store/pending-binutils-244\n"
-        );
-        let out = auto_chained_lock(&base, &["binutils-244".to_string()]).unwrap();
-        // the source line passes through unchanged (still `source`-class), and the rung dep
-        // is the line that gets re-keyed to td-recipe-output.
-        assert!(
-            out.contains(&format!(
-                "binutils-x86-64-source /td/store/{h}-binutils-244-source source"
-            )),
-            "source line was re-keyed: {out}"
-        );
-        assert!(
-            out.contains("binutils-244 /td/store/pending-binutils-244 td-recipe-output"),
-            "rung dep not re-keyed: {out}"
-        );
-    }
-
     // --auto: topo-sort follows the recipe JSONs' `inputs`, ordering deps before
-    // dependents, recursing only through OWNED inputs (those with a recipe JSON + lock);
-    // a non-owned input (toolchain seed) is not a node.
+    // dependents, recursing only through OWNED inputs (those with a recipe JSON — #429
+    // dropped the base-lock half of ownership); a non-owned input (toolchain seed) is
+    // not a node.
     #[test]
     fn auto_topo_orders_deps_before_dependents() {
         let d = std::env::temp_dir().join(format!("td-auto-topo-{}", std::process::id()));
         let rj = d.join("rj");
-        let ld = d.join("ld");
         std::fs::create_dir_all(&rj).unwrap();
-        std::fs::create_dir_all(&ld).unwrap();
         let put = |name: &str, json: &str| {
             std::fs::write(rj.join(format!("{name}.json")), json).unwrap();
-            std::fs::write(ld.join(format!("{name}-no-guix.lock")), "x\n").unwrap();
         };
         put("bash", r#"{"name":"bash","inputs":["readline","ncurses","gcc-toolchain"]}"#);
         put("readline", r#"{"name":"readline","inputs":["ncurses"]}"#);
         put("ncurses", r#"{"name":"ncurses"}"#);
-        // gcc-toolchain has no recipe JSON / lock → not owned → not a node.
-        let (rjs, lds) = (rj.to_string_lossy().to_string(), ld.to_string_lossy().to_string());
+        // gcc-toolchain has no recipe JSON → not owned → not a node.
+        let rjs = rj.to_string_lossy().to_string();
         let mut order = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         let mut stack = Vec::new();
-        auto_topo(&rjs, &lds, "bash", &mut order, &mut seen, &mut stack).unwrap();
+        auto_topo(&rjs, "bash", &mut order, &mut seen, &mut stack).unwrap();
         assert_eq!(order, vec!["ncurses", "readline", "bash"]);
         std::fs::remove_dir_all(&d).ok();
     }
 
-    // --auto: deriving the chained lock re-keys each owned dep to bare-name +
-    // td-recipe-output (so build_plan substitutes by recipe name), passes every other
-    // line through unchanged, and errors if a declared owned dep isn't in the lock.
+    // --auto MAP file: `NAME PATH` per line, blank/`#`-comment lines skipped, and the
+    // FIRST occurrence of a repeated name wins (mirrors the shell `ladder_map`'s
+    // `head -1` over srcs.map then tools.map, in that order).
     #[test]
-    fn auto_chained_lock_marks_owned_deps_only() {
-        let h = "agdqkcaybihqgjiwq9s9kz5mqsxwdjdv"; // 32-char base32 store hash
-        let base = format!(
-            "{h}-coreutils-9.1 /gnu/store/{h}-coreutils-9.1\n\
-             {h}-ncurses-6.2 /gnu/store/{h}-ncurses-6.2\n\
-             pcre2 /gnu/store/{h}-pcre2-10.42\n\
-             bash-source /gnu/store/{h}-bash-5.2.tar.gz\n"
-        );
-        let got = auto_chained_lock(&base, &["ncurses".into(), "pcre2".into()]).unwrap();
-        assert!(got.contains(&format!("ncurses /gnu/store/{h}-ncurses-6.2 td-recipe-output")));
-        assert!(got.contains(&format!("pcre2 /gnu/store/{h}-pcre2-10.42 td-recipe-output")));
-        assert!(got.contains(&format!("{h}-coreutils-9.1 /gnu/store/{h}-coreutils-9.1\n"))); // seed untouched
-        assert!(got.contains(&format!("bash-source /gnu/store/{h}-bash-5.2.tar.gz\n"))); // source untouched
-        // a declared owned dep absent from the lock is an error (don't drop the edge).
-        assert!(auto_chained_lock(&base, &["readline".into()]).is_err());
+    fn auto_parse_map_skips_blanks_and_comments_first_wins() {
+        let text = "# a comment\n\nbash /gnu/store/aaa-bash\nbash /gnu/store/zzz-bash-dup\nmake /gnu/store/bbb-make\n";
+        let m = auto_parse_map(text);
+        assert_eq!(m.get("bash").map(String::as_str), Some("/gnu/store/aaa-bash"));
+        assert_eq!(m.get("make").map(String::as_str), Some("/gnu/store/bbb-make"));
+        assert_eq!(m.len(), 2);
+    }
+
+    // --auto: synthesize a recipe's WHOLE lock straight from its declared graph — no
+    // hand-written base lock (#429). An owned dep (its own recipe JSON exists) becomes a
+    // `td-recipe-output` pending placeholder; every other declared input resolves through
+    // MAP as `seed`; the declared `sourceInput` becomes the `<name>-source` line.
+    #[test]
+    fn auto_synthesize_lock_marks_owned_deps_and_resolves_the_rest() {
+        let d = std::env::temp_dir().join(format!("td-auto-synth-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("gcc-mesboot0.json"),
+            r#"{"name":"gcc-mesboot0","sourceInput":"gcc-core-source","nativeInputs":["binutils-mesboot0"],"inputs":["flex","bison"]}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("binutils-mesboot0.json"), r#"{"name":"binutils-mesboot0"}"#).unwrap();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("gcc-core-source".to_string(), "/gnu/store/aaa-gcc-core-2.95.3".to_string());
+        map.insert("flex".to_string(), "/gnu/store/bbb-flex-2.6".to_string());
+        map.insert("bison".to_string(), "/gnu/store/ccc-bison-3.8".to_string());
+        let got = auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0").unwrap();
+        assert!(got.contains("gcc-mesboot0-source /gnu/store/aaa-gcc-core-2.95.3 source"));
+        assert!(got.contains("binutils-mesboot0 /td/store/pending-binutils-mesboot0 td-recipe-output"));
+        assert!(got.contains("flex /gnu/store/bbb-flex-2.6 seed"));
+        assert!(got.contains("bison /gnu/store/ccc-bison-3.8 seed"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // --auto: a recipe with no declared `sourceInput` (make-test — it only RUNS a
+    // sibling rung's output) gets NO `<name>-source` line at all — no nominal-source alias.
+    #[test]
+    fn auto_synthesize_lock_omits_the_source_line_when_none_declared() {
+        let d = std::env::temp_dir().join(format!("td-auto-synth-nosrc-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("make-test.json"), r#"{"name":"make-test","nativeInputs":["make-x86-64"]}"#).unwrap();
+        std::fs::write(d.join("make-x86-64.json"), r#"{"name":"make-x86-64"}"#).unwrap();
+        let map = std::collections::BTreeMap::new();
+        let got = auto_synthesize_lock(&d.to_string_lossy(), &map, "make-test").unwrap();
+        assert!(!got.contains("-source"), "unexpected source line: {got}");
+        assert!(got.contains("make-x86-64 /td/store/pending-make-x86-64 td-recipe-output"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // --auto: a declared input that is neither an owned recipe nor in MAP is a loud
+    // error, never a silently dropped edge.
+    #[test]
+    fn auto_synthesize_lock_errors_on_an_unresolvable_input() {
+        let d = std::env::temp_dir().join(format!("td-auto-synth-err-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("tcc.json"), r#"{"name":"tcc","inputs":["mystery-tool"]}"#).unwrap();
+        let map = std::collections::BTreeMap::new();
+        let err = auto_synthesize_lock(&d.to_string_lossy(), &map, "tcc").unwrap_err();
+        assert!(err.contains("mystery-tool"), "unexpected error: {err}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // Verified-red lever (issue #429's Done criterion): perturbing a recipe's declared
+    // inputs changes the synthesized lock (hence the plan build_plan_auto derives from
+    // it) — the synthesis genuinely reads the recipe graph, not a stale hand-written one.
+    #[test]
+    fn auto_synthesize_lock_changes_when_declared_inputs_change() {
+        let d = std::env::temp_dir().join(format!("td-auto-synth-perturb-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("flex".to_string(), "/gnu/store/bbb-flex-2.6".to_string());
+        map.insert("bison".to_string(), "/gnu/store/ccc-bison-3.8".to_string());
+        std::fs::write(d.join("gcc-mesboot0.json"), r#"{"name":"gcc-mesboot0","inputs":["flex"]}"#).unwrap();
+        let before = auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0").unwrap();
+        assert!(before.contains("flex"));
+        assert!(!before.contains("bison"));
+        std::fs::write(
+            d.join("gcc-mesboot0.json"),
+            r#"{"name":"gcc-mesboot0","inputs":["flex","bison"]}"#,
+        )
+        .unwrap();
+        let after = auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0").unwrap();
+        assert!(after.contains("bison /gnu/store/ccc-bison-3.8 seed"));
+        assert_ne!(before, after, "synthesized lock did not change when declared inputs changed");
+        std::fs::remove_dir_all(&d).ok();
     }
 
     // subst-export writes, for each member, a narinfo with the right StorePath/References

@@ -66,6 +66,7 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     Recipe::mesboot("make-mesboot", "3.82")
+        .source_input("make-mesboot-source")
         .native_inputs(&[
             "make-mesboot0",
             "binutils-mesboot0",

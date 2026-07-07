@@ -106,9 +106,9 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     Recipe::mesboot("binutils-x86-64", "2.44")
+        .source_input("binutils-244-source")
         .native_inputs(&["gcc-14", "glibc-mesboot", "binutils-244"])
         .inputs_owned(base_inputs(&[
-            "binutils-x86-64-source",
             "linux-headers-x86-64",
             "flex",
             "bison",

@@ -3,9 +3,10 @@
 # bootstrap-chain.sh (the chain driver) and the dev harness. NO build logic lives here —
 # the rungs are recipes (recipes/src/recipes/*.rs) executed by the engine (mesboot-build);
 # this lib only: interns the pinned sources/patches/seed tree (content-addressed, so the
-# lock paths are deterministic), resolves the declared host TOOL packages from the loop
-# PATH (replacing the deleted ladder's `ls /gnu/store/*pkg*` scavenging), writes the
-# per-rung locks, emits the rung recipes, and drives `td-builder build-plan --auto`.
+# map paths are deterministic), resolves the declared host TOOL packages from the loop
+# PATH (replacing the deleted ladder's `ls /gnu/store/*pkg*` scavenging), emits the rung
+# recipes, and drives `td-builder build-plan --auto` — which SYNTHESIZES every rung's
+# lock itself from the recipe graph (#429; no hand-written `ladder_lock` locks here).
 #
 # Requires (caller): set -eu, ROOT, fail(), $TB + TD_BUILDER_* (load_stage0),
 # TD_RECIPE_EVAL (load_recipe_eval), and the td-fetched tarballs warm under
@@ -39,7 +40,7 @@ ladder_tool_root() {
 # cached_realization is the warm reuse.
 ladder_setup() {
   LW=$1
-  mkdir -p "$LW/store" "$LW/locks" "$LW/recipes" "$LW/scratch"
+  mkdir -p "$LW/store" "$LW/recipes" "$LW/scratch"
   # --- host tool packages: re-resolved EVERY call (a glob-resolved tool is not a GC
   # root — a path can vanish between runs; a changed root correctly re-keys exactly
   # the rungs that consume it, since tool paths ride into their locks/drvs) ----------
@@ -173,25 +174,6 @@ ladder_map() {
   printf '%s\n' "$_v"
 }
 
-# ladder_lock RUNG SOURCE-NAME ENTRY…  — write locks/RUNG-no-guix.lock. Each ENTRY is
-# either `tool:NAME` / `src:NAME` (resolved via the maps) or `rung:NAME` (a prior rung —
-# a placeholder path; --auto re-keys it td-recipe-output and build-plan substitutes the
-# built output).
-ladder_lock() {
-  _rung=$1; _srcname=$2; shift 2
-  _lf="$LW/locks/$_rung-no-guix.lock"; : > "$_lf"
-  _sp=`ladder_map "$_srcname"` || return 1
-  printf '%s-source %s source\n' "$_rung" "$_sp" >> "$_lf"
-  for e in "$@"; do
-    _k=${e%%:*}; _n=${e##*:}
-    case "$_k" in
-      rung) printf '%s /td/store/pending-%s\n' "$_n" "$_n" >> "$_lf" ;;
-      *) _p=`ladder_map "$_n"` || return 1
-         printf '%s %s seed\n' "$_n" "$_p" >> "$_lf" ;;
-    esac
-  done
-}
-
 # ladder_emit RUNG… — emit each rung's recipe JSON into $LW/recipes (the --auto
 # ownership scope: ONLY rung recipes live here, so tool inputs stay seed-resolved).
 ladder_emit() {
@@ -200,11 +182,16 @@ ladder_emit() {
   done
 }
 
-# ladder_build TARGET — drive the engine: build-plan --auto over the rung graph.
+# ladder_build TARGET — drive the engine: build-plan --auto over the rung graph. The
+# engine SYNTHESIZES every rung's lock straight from its recipe JSON's declared
+# `inputs`/`nativeInputs`/`sourceInput` (#429) — no hand-written `ladder_lock` locks —
+# resolving every non-owned declared input through the MAP-FILE (srcs.map then
+# tools.map, concatenated — the same two files + order `ladder_map` reads).
 ladder_build() {
+  cat "$LW/srcs.map" "$LW/tools.map" > "$LW/auto-map"
   env -i HOME="$LW" TMPDIR="$LW" TD_STORE_DIR=/td/store \
     TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-    "$TB" build-plan --auto "$1" "$LW/recipes" "$LW/locks" /gnu/store "$LW/scratch" \
+    "$TB" build-plan --auto "$1" "$LW/recipes" "$LW/auto-map" /gnu/store "$LW/scratch" \
       >"$LW/build-$1.out" 2>"$LW/build-$1.err" \
     || { tail -40 "$LW/build-$1.err" >&2; echo "ladder: build-plan --auto $1 failed" >&2; return 1; }
   cat "$LW/build-$1.out"

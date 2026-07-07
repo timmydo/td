@@ -69,6 +69,7 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     Recipe::mesboot("tcc", "0.9.26-1149-g46a75d0c")
+        .source_input("tcc-source")
         .native_inputs(&["stage0", "mes"])
         .inputs_owned(base_inputs(&[]))
         .steps(steps)

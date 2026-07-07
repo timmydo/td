@@ -759,6 +759,21 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("chain-cache");
         return;
     }
+    // ladder-lib.sh is the SHARED plumbing UNDER both bootstrap-chain.sh (the i686 base) and
+    // x86_64-cross-fns.sh (the x86_64 cross/native tracks) — intern/tool-resolve/emit/drive
+    // build-plan --auto, including the #429 lock synthesis every consumer's `ladder_build`
+    // call goes through. A change here can affect every rung's synthesized lock, so map to
+    // the UNION of both consumers' targets, not either alone.
+    if pattern_matches("tests/ladder-lib.sh", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("bootstrap-hello-userland");
+        sel.add_target("store-persist");
+        sel.add_target("chain-cache");
+        add_chain(sel, 27, 28);
+        sel.add_target("bootstrap-x86_64-native-gcc-store-native");
+        sel.add_target("bootstrap-x86_64-self-gcc-store-native");
+        return;
+    }
     // The warm chain-brick cache itself (#317): the chain-cache gate drives the real lib's
     // hit/build/save/poison/cold paths; the chain consumers exercise the reuse path in anger.
     if pattern_matches("tests/chain-cache.sh|tests/chain-cache-lib.sh", p) {

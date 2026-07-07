@@ -69,6 +69,7 @@ pub fn recipe() -> Recipe {
         exec: true,
     });
     Recipe::mesboot("patch-mesboot", "2.5.9")
+        .source_input("patch-mesboot-source")
         .native_inputs(&["mes", "tcc", "make-mesboot0"])
         .inputs_owned(base_inputs(&[]))
         .steps(steps)

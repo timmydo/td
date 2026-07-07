@@ -133,9 +133,9 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     Recipe::mesboot("glibc-x86-64", "2.41")
+        .source_input("glibc-241-source")
         .native_inputs(&["gcc-x86-64-stage1", "gcc-14", "glibc-mesboot", "binutils-x86-64"])
         .inputs_owned(base_inputs(&[
-            "glibc-x86-64-source",
             "linux-headers-x86-64",
             "flex",
             "bison",
