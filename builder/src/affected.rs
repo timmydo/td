@@ -596,17 +596,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // The first zero-/gnu/store build-recipe (#388): GNU hello built from an all-/td/store
-    // lock (gcc-toolchain + busybox/make userland + source). Only the test SCRIPT maps here:
-    // the gate_def `428-*.rs` is already caught by the earlier `builder/src/*` arm (→ the
-    // check-engine smoke), and the busybox/make/hello source pins it reuses are owned by its
-    // store-native siblings (gate 420, the corpus gate). Deferred to the daily backstop.
-    if p == "tests/hello-zero-gnu-store.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("hello-zero-gnu-store");
-        return;
-    }
-
     // The guix-free harness loop (host-sandbox-stage0 inc2c): mk/harness.mk + the inner
     // loop body run by `./check.sh check-harness`. The tier consumes the harness gate 420
     // persists, so provision it via gate 420; `check-harness` is a check.sh tier (its own
