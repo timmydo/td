@@ -52,7 +52,8 @@ echo ">> warm leg (baseline): realize the pinned seed + place the shared stage0 
 provision_stage0 || { echo "FAIL: warm stage0 provisioning failed" >&2; exit 1; }; \
 cbw="$TD_BUILDER_PATH"; tbw="$TB"; wdb="$TD_BUILDER_DB"; \
 echo ">> cold leg (the feature): fresh cache, /var/guix bind-mounted EMPTY in a private mount ns — the placement must need no guix db"; \
-printf '%s\n' 'mount --bind "$1" /var/guix || exit 9' \
+printf '%s\n' 'mkdir -p /var/guix' \
+              'mount --bind "$1" /var/guix || exit 9' \
               'test -z "$(ls -A /var/guix)" || { echo "cold leg: /var/guix not hidden" >&2; exit 9; }' \
               'exec sh tests/stage0-builder.sh "$2"' > "$scratch/cold.sh"; \
 cbc=`unshare -rm sh "$scratch/cold.sh" "$scratch/empty" "$scratch/cold"` \
