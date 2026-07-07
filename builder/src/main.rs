@@ -1925,11 +1925,17 @@ fn assemble_recipe_drv(
             lock::Class::Seed | lock::Class::TdRecipeOutput => inputs.push(e.path.clone()),
         }
     }
-    // Every build system needs its own source EXCEPT mesboot: a rung that only RUNS a
-    // sibling rung's output (make-test, #429) has no source of its own — its recipe
-    // declares no `sourceInput`, so --auto synthesizes no `<name>-source` line, and
-    // requiring one here would force back the removed nominal-source alias hack.
-    if source.is_empty() && build_system != "mesboot" {
+    // Every build system needs its own source EXCEPT a mesboot recipe that EXPLICITLY
+    // declares it has none (make-test, #429: it only RUNS a sibling rung's output) — its
+    // recipe carries no `sourceInput`, so --auto synthesizes no `<name>-source` line, and
+    // requiring one here would force back the removed nominal-source alias hack. Scoped to
+    // BOTH conditions (build system AND the recipe's own declaration), not build_system
+    // alone: a mesboot rung that DOES declare a `sourceInput` (every rung but make-test)
+    // still hard-errors here if its lock ends up missing the source line — catching that
+    // mistake immediately at drv-assembly time instead of a confusing failure deep in step
+    // execution when a `{in:<name>-source}` template has nothing to resolve.
+    let declares_no_source = build_system == "mesboot" && alist.get("sourceInput").is_none();
+    if source.is_empty() && !declares_no_source {
         return Err(format!("lock has no `{src_key}' entry (the recipe source)"));
     }
     // Default corpus toolchain (corpus-toolchain-default): when TD_GCC_TOOLCHAIN names a /td/store
@@ -2280,18 +2286,22 @@ fn build_plan(
 /// A recipe's declared inputs — the JSON `inputs` array UNION `nativeInputs`
 /// (#378 staged builders: a rung's compiler is a prior rung's output; --auto
 /// chains both edge kinds identically).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn auto_inputs(recipe_dir: &str, name: &str) -> Result<Vec<String>, String> {
-    let p = format!("{recipe_dir}/{name}.json");
-    let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
-    let alist = json::parse(&text).map_err(|e| format!("recipe JSON {p}: {e}"))?;
+fn inputs_from_recipe_json(alist: &json::Json) -> Vec<String> {
     let mut xs: Vec<String> = Vec::new();
     for key in ["inputs", "nativeInputs"] {
         if let Some(a) = alist.get(key).and_then(json::Json::as_arr) {
             xs.extend(a.iter().filter_map(json::Json::as_str).map(str::to_string));
         }
     }
-    Ok(xs)
+    xs
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+fn auto_inputs(recipe_dir: &str, name: &str) -> Result<Vec<String>, String> {
+    let p = format!("{recipe_dir}/{name}.json");
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
+    let alist = json::parse(&text).map_err(|e| format!("recipe JSON {p}: {e}"))?;
+    Ok(inputs_from_recipe_json(&alist))
 }
 
 /// An input is OWNED (td reconstructs it) iff its recipe JSON exists in RECIPE-DIR;
@@ -2335,7 +2345,6 @@ fn auto_topo(
 /// `srcs.map` then `tools.map`, concatenated by the caller). The FIRST occurrence of
 /// a name wins (mirrors the shell `ladder_map`'s `head -1` over the same two files in
 /// the same order), so a name present in both keeps the source-map's entry.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_parse_map(text: &str) -> std::collections::BTreeMap<String, String> {
     let mut m = std::collections::BTreeMap::new();
     for line in text.lines() {
@@ -2354,7 +2363,6 @@ fn auto_parse_map(text: &str) -> std::collections::BTreeMap<String, String> {
 /// that is NOT itself an owned recipe (a host tool, a pinned seed/source tarball)
 /// must be in MAP or synthesis fails loudly: a recipe declaring an input nothing
 /// interned is a bug to surface, not an edge to silently drop.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_map_lookup(map: &std::collections::BTreeMap<String, String>, name: &str) -> Result<String, String> {
     map.get(name).cloned().ok_or_else(|| {
         format!("no map entry for `{name}' (not an owned recipe, not interned by ladder_setup)")
@@ -2371,7 +2379,8 @@ fn auto_map_lookup(map: &std::collections::BTreeMap<String, String>, name: &str)
 /// own declared `sourceInput` (if any) becomes the required `<name>-source` line,
 /// resolved through MAP the same way; a recipe with no `sourceInput` (e.g. make-test,
 /// which only RUNS a sibling rung's output, not compiles one) gets no source line.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+/// Reads + parses NAME's recipe JSON exactly once (shared between the sourceInput
+/// check and the declared-inputs loop below).
 fn auto_synthesize_lock(
     recipe_dir: &str,
     map: &std::collections::BTreeMap<String, String>,
@@ -2386,7 +2395,7 @@ fn auto_synthesize_lock(
             .map_err(|e| format!("--auto: recipe `{name}' sourceInput `{key}': {e}"))?;
         out.push_str(&format!("{name}-source {path} source\n"));
     }
-    for inp in auto_inputs(recipe_dir, name)? {
+    for inp in inputs_from_recipe_json(&alist) {
         if auto_is_owned(recipe_dir, &inp) {
             out.push_str(&format!("{inp} /td/store/pending-{inp} td-recipe-output\n"));
         } else {
@@ -7074,6 +7083,54 @@ glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
         assert!(env_of(&drv0, "TD_RUST_STORE_INTERP").is_none(), "no interp in the drv env by default");
         assert!(env_of(&drv0, "TD_RUST_STORE_RPATH").is_none(), "no rpath by default");
         assert!(env_of(&drv0, "TD_RUST_STORE_BDIR").is_none(), "no bdir by default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #429 code-review fix: a mesboot recipe with NO declared `sourceInput` (make-test —
+    // it only RUNS a sibling rung's output) is the ONLY case a missing `<name>-source`
+    // lock line is tolerated.
+    #[test]
+    fn assemble_recipe_drv_tolerates_no_source_only_when_the_recipe_declares_none() {
+        let dir = std::env::temp_dir().join(format!("td-nosrc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("make-test.lock");
+        // No `make-test-source` line at all.
+        std::fs::write(
+            &lock,
+            "make-x86-64 /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-make-4.4.1-x86_64 td-recipe-output\n",
+        )
+        .unwrap();
+        let recipe = r#"{"name":"make-test","version":"1.0","buildSystem":"mesboot","nativeInputs":["make-x86-64"],"steps":[]}"#;
+        let builder = "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-td-builder-0.1.0";
+        let (_p, _f, _drv, source) =
+            assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, builder, None).unwrap();
+        assert_eq!(source, "", "make-test has no source (none declared)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #429 code-review fix (CONFIRMED finding): a mesboot recipe that DOES declare a
+    // `sourceInput` must still hard-error on a lock missing the `<name>-source` line —
+    // the exemption is scoped to BOTH the build system AND the recipe's own declaration,
+    // not the build system alone, so a real mistake (a rung that needs a source, but
+    // whose lock lost the line) is still caught here instead of failing later, deep in
+    // step execution, when a `{in:<name>-source}` template has nothing to resolve.
+    #[test]
+    fn assemble_recipe_drv_still_requires_source_for_a_mesboot_recipe_that_declares_one() {
+        let dir = std::env::temp_dir().join(format!("td-nosrc-bug-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("gcc-14.lock");
+        // No `gcc-14-source` line — as if --auto's synthesis (or a hand-edit) dropped it.
+        std::fs::write(
+            &lock,
+            "binutils-mesboot /td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-binutils-mesboot td-recipe-output\n",
+        )
+        .unwrap();
+        let recipe = r#"{"name":"gcc-14","version":"14.3.0","buildSystem":"mesboot","sourceInput":"gcc-14-source","nativeInputs":["binutils-mesboot"],"steps":[]}"#;
+        let builder = "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-td-builder-0.1.0";
+        let err = assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, builder, None).unwrap_err();
+        assert!(err.contains("lock has no `gcc-14-source' entry"), "unexpected error: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
