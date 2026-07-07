@@ -9,9 +9,8 @@
 //!   1. the guix-free `check-harness` tier branch (never touches guix),
 //!   2. the netns-probe discrimination check,
 //!   3. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   4. the loop toolchain PATH (resolved from the HOST PATH — the tools listed
-//!      in tools/loop-toolchain.txt, canonicalized to their /gnu/store bin dirs;
-//!      the host brings them, like it brings rust/cc — no `guix shell`),
+//!   4. the loop PATH: core host-provided tools from tools/loop-toolchain.txt
+//!      plus td-declared text tools resolved from tests/hello-no-guix.lock,
 //!   5. the warm prelude (subst store, source/crate warms, build daemon),
 //!   6. the machine-wide slot dir, and
 //!   7. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon -- TB gate-run.
@@ -142,17 +141,17 @@ fn provision_stage0(root: &Path) -> Result<String, String> {
 /// a `/usr/bin` tool on a foreign-distro guix host would vanish.
 const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 
-/// The loop toolchain PATH, resolved from the HOST PATH: the host brings the
-/// userland tools (the "check the right tools are on $PATH" model), exactly as it
-/// already brings the rust/cc toolchain the stage0 seed build resolves via
-/// tools/provision-{rust,cc}.sh — no `guix shell` subprocess. For each expected
-/// tool in tools/loop-toolchain.txt we find it on PATH and CANONICALIZE to its real bin
-/// dir. Canonicalization + the store-prefix check matter — the loop sandbox binds
-/// ONLY `/gnu/store` (SANDBOX_STORE_PREFIX) over a fresh tmpfs, so a
-/// profile-symlink dir (~/.guix-home/profile/bin) OR a distro dir (/usr/bin on a
-/// Debian+guix host) would not resolve inside; only the real
-/// `/gnu/store/<pkg>/bin` target does. The deduped in-store dirs become the
-/// sandbox PATH; nothing else is prepended.
+/// The core loop toolchain PATH, resolved from the HOST PATH: the host brings
+/// only the base process-driving tools (the "check the right tools are on $PATH"
+/// model), exactly as it already brings the rust/cc toolchain the stage0 seed
+/// build resolves via tools/provision-{rust,cc}.sh — no `guix shell` subprocess.
+/// For each expected tool in tools/loop-toolchain.txt we find it on PATH and
+/// CANONICALIZE to its real bin dir. Canonicalization + the store-prefix check
+/// matter — the loop sandbox binds ONLY `/gnu/store` (SANDBOX_STORE_PREFIX) over
+/// a fresh tmpfs, so a profile-symlink dir (~/.guix-home/profile/bin) OR a
+/// distro dir (/usr/bin on a Debian+guix host) would not resolve inside; only
+/// the real `/gnu/store/<pkg>/bin` target does. The deduped in-store dirs become
+/// the sandbox PATH.
 ///
 /// A tool that is ABSENT from the host PATH, or that resolves OUTSIDE the bound
 /// store (so it would vanish inside the sandbox), is reported in one loud warning
@@ -258,6 +257,103 @@ fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
         )));
     }
     Ok(dirs.join(":"))
+}
+
+const DECLARED_LOOP_TOOLS_LOCK: &str = "tests/hello-no-guix.lock";
+const DECLARED_LOOP_TOOLS: &[(&str, &str)] =
+    &[("sed", "sed"), ("grep", "grep"), ("findutils", "find")];
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeclaredLoopToolError {
+    Lock(String),
+    MissingBinary(String),
+}
+
+impl std::fmt::Display for DeclaredLoopToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeclaredLoopToolError::Lock(m) | DeclaredLoopToolError::MissingBinary(m) => {
+                f.write_str(m)
+            }
+        }
+    }
+}
+
+/// Text/tree tools are no longer host-PATH loop tools. They are ordinary,
+/// declared seed artifacts pinned by tests/hello-no-guix.lock, so td resolves
+/// that lock and adds the exact bin dirs to the loop PATH. findutils also
+/// carries xargs, which several historical gate scripts use through the same
+/// package even though xargs was never listed as a representative binary.
+fn declared_loop_tool_dirs_from_lock<F>(
+    lock_text: &str,
+    exists: F,
+) -> Result<String, DeclaredLoopToolError>
+where
+    F: Fn(&Path) -> bool,
+{
+    let entries = crate::lock::parse(lock_text, "").map_err(DeclaredLoopToolError::Lock)?;
+    let mut dirs: Vec<String> = Vec::new();
+    for (stem, bin) in DECLARED_LOOP_TOOLS {
+        let mut hits: Vec<&str> = entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .filter(|p| crate::gate_inputs::path_names_stem(p, stem))
+            .collect();
+        hits.sort_unstable();
+        hits.dedup();
+        let path = match hits.as_slice() {
+            [one] => *one,
+            [] => {
+                return Err(DeclaredLoopToolError::Lock(format!(
+                    "{DECLARED_LOOP_TOOLS_LOCK} has no `{stem}` entry"
+                )))
+            }
+            many => {
+                return Err(DeclaredLoopToolError::Lock(format!(
+                    "{DECLARED_LOOP_TOOLS_LOCK} has ambiguous `{stem}` entries: {}",
+                    many.join(", ")
+                )))
+            }
+        };
+        if !path.starts_with(SANDBOX_STORE_PREFIX) {
+            return Err(DeclaredLoopToolError::Lock(format!(
+                "{DECLARED_LOOP_TOOLS_LOCK} `{stem}` resolved to {path}, outside {SANDBOX_STORE_PREFIX}"
+            )));
+        }
+        let bin_path = Path::new(path).join("bin").join(bin);
+        if !exists(&bin_path) {
+            return Err(DeclaredLoopToolError::MissingBinary(format!(
+                "{DECLARED_LOOP_TOOLS_LOCK} `{stem}` resolved to {path}, but {} is not present",
+                bin_path.display()
+            )));
+        }
+        let dir = Path::new(path).join("bin").display().to_string();
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    Ok(dirs.join(":"))
+}
+
+fn provision_declared_loop_tools(root: &Path) -> Result<String, CheckError> {
+    let lock_path = root.join(DECLARED_LOOP_TOOLS_LOCK);
+    let lock_text = std::fs::read_to_string(&lock_path)
+        .map_err(|e| fatal(&format!("cannot read {}: {e}", lock_path.display())))?;
+    declared_loop_tool_dirs_from_lock(&lock_text, Path::is_file)
+        .map_err(|e| match e {
+            DeclaredLoopToolError::Lock(m) => {
+                CheckError::Fatal(fatal(&format!("declared loop tools: {m}")))
+            }
+            DeclaredLoopToolError::MissingBinary(m) => {
+                CheckError::Unprovisioned(fatal(&format!("declared loop tools: {m}")))
+            }
+        })
+}
+
+fn provision_loop_path(root: &Path) -> Result<String, CheckError> {
+    let declared = provision_declared_loop_tools(root)?;
+    let host = provision_toolchain(root)?;
+    Ok(format!("{declared}:{host}"))
 }
 
 /// A timeout(1)-style duration: bare integer seconds or an integer with an
@@ -1147,9 +1243,9 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 
     guard_netns_probe()?;
 
-    // No guix process remains: the loop TOOLCHAIN comes from the host PATH
-    // (provision_toolchain, make/bash/sed/…), and no gate spawns `guix build`.
-    // The sandbox PATH is exactly that toolchain — nothing guix is prepended.
+    // No guix process remains: the loop PATH is td-resolved declared text tools
+    // plus the host-PATH core toolchain (provision_loop_path, make/bash/…); no
+    // gate spawns `guix build`.
 
     // Light tiers own no heavy gate — skip the heavy warms + daemon (exactly the
     // shell prelude's goal scan).
@@ -1158,7 +1254,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     });
 
     let tb = provision_stage0(&root)?;
-    let toolchain = provision_toolchain(&root)?;
+    let toolchain = provision_loop_path(&root)?;
 
     let mut child_envs: Vec<(String, String)> = vec![(s("PATH"), toolchain)];
     // The runner's knobs must cross the sandbox boundary (host-sandbox
@@ -1362,7 +1458,7 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     })?;
     // check-rung is a dev helper, not the loop: it does not branch on the
     // provisioned/regression distinction, so collapse CheckError back to a string.
-    let toolchain = provision_toolchain(&root).map_err(|e| e.to_string())?;
+    let toolchain = provision_loop_path(&root).map_err(|e| e.to_string())?;
     eprintln!(
         ">> check-rung: {harness} inside td-builder host-sandbox (cached chain reused; \
          sandbox env matches the gate)"
@@ -1532,5 +1628,76 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
             got.iter().all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
             "malformed triplet parsed from the real lock"
         );
+    }
+
+    #[test]
+    fn declared_loop_tools_resolve_from_lock() {
+        let lock = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9 /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
+cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
+";
+        let got = declared_loop_tool_dirs_from_lock(lock, |p| {
+            matches!(
+                p.to_str(),
+                Some("/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9/bin/sed")
+                    | Some("/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11/bin/grep")
+                    | Some("/gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0/bin/find")
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9/bin:/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11/bin:/gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0/bin"
+        );
+    }
+
+    #[test]
+    fn declared_loop_tools_reject_missing_binary() {
+        let lock = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9 /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
+cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
+";
+        let err = declared_loop_tool_dirs_from_lock(lock, |_| false).unwrap_err();
+        assert!(matches!(err, DeclaredLoopToolError::MissingBinary(_)));
+        assert!(err.to_string().contains("sed"), "got: {err}");
+        assert!(err.to_string().contains("not present"), "got: {err}");
+    }
+
+    #[test]
+    fn declared_loop_tools_must_be_under_bound_store() {
+        let lock = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9 /tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
+cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
+";
+        let err = declared_loop_tool_dirs_from_lock(lock, |_| true).unwrap_err();
+        assert!(matches!(err, DeclaredLoopToolError::Lock(_)));
+        assert!(err.to_string().contains("outside /gnu/store/"), "got: {err}");
+    }
+
+    #[test]
+    fn declared_loop_tools_reject_missing_lock_entry() {
+        let lock = "\
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
+cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
+";
+        let err = declared_loop_tool_dirs_from_lock(lock, |_| true).unwrap_err();
+        assert!(matches!(err, DeclaredLoopToolError::Lock(_)));
+        assert!(err.to_string().contains("no `sed` entry"), "got: {err}");
+    }
+
+    #[test]
+    fn declared_loop_tools_reject_ambiguous_lock_entry() {
+        let lock = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9 /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9
+dddddddddddddddddddddddddddddddd-sed-4.8 /gnu/store/dddddddddddddddddddddddddddddddd-sed-4.8
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
+cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
+";
+        let err = declared_loop_tool_dirs_from_lock(lock, |_| true).unwrap_err();
+        assert!(matches!(err, DeclaredLoopToolError::Lock(_)));
+        assert!(err.to_string().contains("ambiguous `sed` entries"), "got: {err}");
     }
 }
