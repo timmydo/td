@@ -2285,6 +2285,14 @@ mod tests {
         // everywhere else the watchdog fallback tests carry the budget
         // property. The check_loop probe is replicated inline.
         let probe = |c: &Path| -> bool {
+            // Must be cgroup2fs, not merely a writable directory (mirrors
+            // check_loop::cgroup_delegated_root's guard): on a hybrid v1/v2
+            // host, /sys/fs/cgroup itself is plain tmpfs, so a directory
+            // create there succeeds with zero kernel enforcement and this
+            // test would go on to assert a memory cap that was never real.
+            if !c.join("cgroup.controllers").is_file() {
+                return false;
+            }
             let p = c.join(format!("td-probe-{}", std::process::id()));
             std::fs::create_dir(&p).map(|_| { let _ = std::fs::remove_dir(&p); true }).unwrap_or(false)
         };
