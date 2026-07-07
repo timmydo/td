@@ -108,27 +108,38 @@ Work in your own git worktree/branch.
 Never `git stash` in this repo. The stash stack (`refs/stash`) is
   repo-*global*.
 
-Every PR gets TWO
-  independent code reviews — the subagent review AND a cross-model review by a
-  different model's CLI — both waivable only for a trivial docs- or comment-only
-  diff, and only if you say so in the PR:** spawn an
-  independent code-review subagent over the full branch diff (`/code-review`),
-  AND run a second review with a *different* model driven from its CLI so a
-  distinct model audits the same diff (catches blind spots one model shares with
-  its own subagent). Run the cross-model reviewer at a strong model + high
-  reasoning effort, and feed it the branch diff on stdin — a bare `git diff`
-  is empty once the branch is committed, so pipe `git diff origin/main...HEAD`
-  so the cross-model reviewer audits the same full branch diff the subagent
-  does. Claude runs Codex (gpt-5.5, xhigh):
-  `git diff origin/main...HEAD | codex exec --model gpt-5.5 -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible."`
-  and Codex runs Claude (Opus 4.8, xhigh):
-  `git diff origin/main...HEAD | claude -p --model opus --effort xhigh "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible."`
-  (`--model`/`--effort` for `claude` — effort levels `low|medium|high|xhigh|max`;
-  `--model` + `-c model_reasoning_effort=…` for `codex`. Use `gpt-5.5`, not
-  `gpt-5.5-codex`, under a ChatGPT-account login; swap in whichever model and
-  effort you want.) `codex` is installed and on `$PATH` — do NOT drop it for a
-  second `claude` CLI run, which varies only the model, not the harness.
-  
+Every PR gets TWO independent code reviews — the subagent review AND a
+cross-model review by a different model's CLI — both waivable only for
+a trivial docs- or comment-only diff, and only if you say so in the
+PR:** spawn an independent code-review subagent over the full branch
+diff (`/code-review`), AND run a second review with a *different*
+model driven from its CLI so a distinct model audits the same diff
+(catches blind spots one model shares with its own subagent). Run the
+cross-model reviewer at a strong model + high reasoning effort, and
+feed it the branch diff on stdin — a bare `git diff` is empty once the
+branch is committed, so pipe `git diff origin/main...HEAD` so the
+cross-model reviewer audits the same full branch diff the subagent
+does. Subagents MUST post their review findings to the PR as a comment
+(unfiltered by the main agent requesting it).
+
+Claude runs Codex (gpt-5.5, xhigh): 
+
+```
+git diff origin/main...HEAD | codex exec --model gpt-5.5 -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible. Post the review as comment on PR #<insert number>"
+```
+
+and Codex runs Claude (Opus 4.8, xhigh): 
+```
+git diff origin/main...HEAD | claude -p --model opus --effort xhigh "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible. Post the review as comment on PR #<insert number>"
+``` 
+
+Use (`--model`/`--effort` for `claude` — effort levels `xhigh`;
+`--model` + `-c model_reasoning_effort=…` for `codex`. Use `gpt-5.5`,
+not `gpt-5.5-codex`, under a ChatGPT-account login) `codex` is
+installed and on `$PATH` — do NOT drop it for a second `claude` CLI
+run, which varies only the model, not the harness.
+
+
 # Rust code
 
 td's Rust is defensive and minimal-surface.
