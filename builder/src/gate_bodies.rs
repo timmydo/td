@@ -146,6 +146,8 @@ fn cmd_ok(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// True if `tb <args...>` exits zero (`cmd_ok` specialized to the td-builder
+/// binary under test).
 fn tb_ok(tb: &Path, args: &[&str]) -> bool {
     cmd_ok(tb, args)
 }
@@ -187,7 +189,8 @@ fn run_out_env(program: &str, args: &[&str], envs: &[(&str, &str)], ctx: &str) -
 fn find_in_path_frags(frags: &str, bin: &str) -> Option<PathBuf> {
     frags.split(':').map(Path::new).find_map(|d| {
         let p = d.join(bin);
-        p.is_file().then_some(p)
+        let exec = p.is_file() && file_mode(&p).ok().is_some_and(|mode| mode & 0o111 != 0);
+        exec.then_some(p)
     })
 }
 
