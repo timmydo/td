@@ -311,10 +311,21 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
 // hello/sed checks (recipes/src/recipes/{hello,sed}.rs) are what now prove the
 // whole ladder works end to end, plus `bootstrap_modern_toolchain()`'s own
 // no-guix/existence assertions at its tail.
+//
+// The x86_64 cross track hangs off the SAME 20-rung graph (`run_x86_64_cross`,
+// tests/x86_64-cross-fns.sh, ladder_emits the identical stage0..glibc-241
+// prefix before appending its own 4 rungs) — every pinned input here also
+// feeds it, so it belongs in the shared target set too, not just the i686
+// gates. (x86_64 itself is untouched by #397 — its gates never carried
+// duplicate `build_*` shell — this is purely restoring the cascade the old
+// `CHAIN`/`add_chain` slicing gave it.)
 fn add_chain_targets(sel: &mut Selection) {
     sel.add_target("store-persist");
     sel.add_target("chain-cache");
     sel.add_target("recipe-checks-daily");
+    sel.add_target("bootstrap-x86_64-toolchain-store-native");
+    sel.add_target("bootstrap-x86_64-native-gcc-store-native");
+    sel.add_target("bootstrap-x86_64-self-gcc-store-native");
 }
 
 // ---------------------------------------------------------------------------
@@ -623,17 +634,13 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // x86_64-cross-fns.sh (the x86_64 cross/native tracks) — intern/tool-resolve/emit/drive
     // build-plan --auto, including the #429 lock synthesis every consumer's `ladder_build`
     // call goes through. A change here can affect every rung's synthesized lock, so map to
-    // the UNION of all consumers' targets, not just one track: the i686 chain's target set
-    // (`add_chain_targets`, which already includes recipe-checks-daily — whose rust-toolchain
-    // (tests/rust-toolchain-recipe-check.sh -> run_x86_64_rust_toolchain) and make-test (its
-    // own inline RecipeCheck body) bodies also source this file) plus the x86_64 cross/native
-    // track's own gates.
+    // the UNION of all consumers' targets, not just one track — `add_chain_targets` already
+    // is that union (both the i686 chain gates and the x86_64 cross/native gates, plus
+    // recipe-checks-daily, whose rust-toolchain (tests/rust-toolchain-recipe-check.sh ->
+    // run_x86_64_rust_toolchain) and make-test bodies also source this file).
     if pattern_matches("tests/ladder-lib.sh", p) {
         sel.add_preflight("shell-syntax");
-        add_chain_targets(sel);
-        sel.add_target("bootstrap-x86_64-toolchain-store-native");
-        sel.add_target("bootstrap-x86_64-native-gcc-store-native");
-        sel.add_target("bootstrap-x86_64-self-gcc-store-native");
+        add_chain_targets(sel); // already covers the i686 + x86_64 targets ladder-lib.sh underlies
         return;
     }
     // The warm chain-brick cache itself (#317): the chain-cache gate drives the real lib's
