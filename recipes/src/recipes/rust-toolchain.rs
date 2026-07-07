@@ -1,3 +1,4 @@
+use crate::ladder::base_inputs;
 use crate::types::{Recipe, RecipeCheck, Source};
 
 // rust-toolchain — the /td/store Rust toolchain, as a first-class RECIPE fully in the
@@ -44,6 +45,12 @@ pub fn recipe() -> Recipe {
         ))
         .source_input("rust-toolchain-source")
         .native_inputs(&["glibc-x86-64", "gcc-x86-64-stage2", "zlib-x86-64"])
+        // #429: the transform unpacks the release tarball in-sandbox with the declared
+        // tar/gzip inputs (unpack_rust_release, builder/src/toolchain_x86_64.rs) — under
+        // the OLD hand-written ladder_lock these rode in unconditionally via `$_bt`; the
+        // synthesized lock now only carries what the recipe itself declares, so they must
+        // be genuine inputs here (matching every other mesboot-family rung's base_inputs()).
+        .inputs_owned(base_inputs(&[]))
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check rust-toolchain: build-plan --auto builds the /td/store rust toolchain (glibc-x86-64 + gcc-x86-64-stage2 + zlib-x86-64); rustc runs from /td/store in an own-root (/gnu/store absent); byte-reproducible; verified-red on a missing declared input"

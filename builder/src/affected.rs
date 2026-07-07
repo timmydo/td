@@ -763,7 +763,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // x86_64-cross-fns.sh (the x86_64 cross/native tracks) — intern/tool-resolve/emit/drive
     // build-plan --auto, including the #429 lock synthesis every consumer's `ladder_build`
     // call goes through. A change here can affect every rung's synthesized lock, so map to
-    // the UNION of both consumers' targets, not either alone.
+    // the UNION of all consumers' targets, not just one track: also recipe-checks-daily,
+    // whose rust-toolchain (tests/rust-toolchain-recipe-check.sh -> run_x86_64_rust_toolchain)
+    // and make-test (its own inline RecipeCheck body) bodies both source this file too.
     if pattern_matches("tests/ladder-lib.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-hello-userland");
@@ -772,6 +774,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         add_chain(sel, 27, 28);
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         sel.add_target("bootstrap-x86_64-self-gcc-store-native");
+        sel.add_target("recipe-checks-daily");
         return;
     }
     // The warm chain-brick cache itself (#317): the chain-cache gate drives the real lib's
@@ -1212,6 +1215,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // The store-native hello build sources the shared chain, so a chain change must
     // re-prove the hello store-native gate too.
     assert_target!("tests/bootstrap-chain.sh", "bootstrap-hello-userland");
+    // ladder-lib.sh (#429) is the shared foundation under BOTH the i686 chain and the
+    // x86_64 cross/native tracks, plus recipe-checks-daily's rust-toolchain/make-test
+    // bodies — a change must re-prove all of them, not just one track.
+    assert_target!("tests/ladder-lib.sh", "bootstrap-hello-userland");
+    assert_target!("tests/ladder-lib.sh", "store-persist");
+    assert_target!("tests/ladder-lib.sh", "chain-cache");
+    assert_target!("tests/ladder-lib.sh", "bootstrap-x86_64-toolchain-store-native");
+    assert_target!("tests/ladder-lib.sh", "bootstrap-x86_64-native-gcc-store-native");
+    assert_target!("tests/ladder-lib.sh", "bootstrap-x86_64-self-gcc-store-native");
+    assert_target!("tests/ladder-lib.sh", "recipe-checks-daily");
     assert_target!(
         "tests/bootstrap-hello-corpus-store-native.sh",
         "bootstrap-hello-userland"
