@@ -3904,7 +3904,9 @@ fn main() -> ExitCode {
                                     let drvpath = path_of.get(&drv_id).cloned().ok_or_else(|| {
                                         format!("DerivationOutputs drv {drv_id} has no ValidPaths row")
                                     })?;
-                                    let deriver = deriver_of.get(&outpath).cloned().unwrap_or_default();
+                                    let deriver = deriver_of.get(&outpath).cloned().ok_or_else(|| {
+                                        format!("DerivationOutputs path {outpath} has no ValidPaths row")
+                                    })?;
                                     lines.push(format!("{outpath}|{deriver}|{drvpath}|{id}"));
                                 }
                                 _ => return Err("DerivationOutputs row has non-int/text columns".to_string()),

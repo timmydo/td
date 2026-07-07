@@ -867,6 +867,38 @@ fn store_register(root: &Path) -> Result<(), String> {
         return Err("FAIL: td wrote no store DB".into());
     }
 
+    // The content-scan oracle: seed-manifest's STORE-DIR form recomputes each
+    // member's hash/narSize/direct-refs straight from the staged bytes (the
+    // scan.rs candidate-index + NAR walk, same as store_subject's OWN closure
+    // discovery) — it never reads td.db, so it's independent of both
+    // store_db.rs (the writer) and store_db_read.rs (the reader) and gives the
+    // gate a real ground truth to check store-query's output against, in place
+    // of the dropped sqlite3 reader-vs-reader cross-check.
+    let store_s = path_str(&subj.store)?;
+    let manifest = tb_out(
+        &tb,
+        &["seed-manifest", &store_s, &subj.root],
+        "seed-manifest (content-scan oracle)",
+    )?;
+    let mut expected_info: Vec<String> = Vec::new();
+    let mut expected_refs: Vec<String> = Vec::new();
+    for line in manifest.lines() {
+        let mut f = line.splitn(4, ' ');
+        let malformed = || format!("FAIL: malformed seed-manifest line: {line}");
+        let p = f.next().ok_or_else(malformed)?;
+        let hash = f.next().ok_or_else(malformed)?;
+        let size = f.next().ok_or_else(malformed)?;
+        let refs = f.next().ok_or_else(malformed)?;
+        expected_info.push(format!("{p}|{hash}|{size}"));
+        if refs != "-" {
+            for r in refs.split(',') {
+                expected_refs.push(format!("{p}|{r}"));
+            }
+        }
+    }
+    expected_info.sort();
+    expected_refs.sort();
+
     println!(
         ">> td READS its own store DB itself (td-builder store-query — a pure-Rust SQLite reader; \
          no external engine, no daemon in td's query path):"
@@ -880,13 +912,32 @@ fn store_register(root: &Path) -> Result<(), String> {
     if regpaths != subj.closure {
         return Err("FAIL: the registered path set != the staged closure".into());
     }
+    let td_info_lines = sorted_lines(&td_read_info);
+    if td_info_lines != expected_info {
+        return Err(format!(
+            "FAIL: td's reader (store-query info) disagrees with the content-scan oracle \
+             (seed-manifest, independent of the SQLite bytes) for the SAME staged store\n  \
+             td-read: {td_info_lines:?}\n  content-scan: {expected_info:?}"
+        ));
+    }
     println!(
-        "   info: td's reader parsed all {n} closure paths' path|hash|narSize, exactly the \
-         staged closure"
+        "   info: td's reader parsed all {n} closure paths' path|hash|narSize, matching an \
+         INDEPENDENT content-scan of the same staged store — exactly the staged closure"
     );
     let td_read_refs = tb_out(&tb, &["store-query", &tddb_s, "references"], "store-query references")?;
-    let nedges = td_read_refs.lines().count();
-    println!("   references: td's reader parsed {nedges} edges of the inter-path Refs relation");
+    let td_refs_lines = sorted_lines(&td_read_refs);
+    if td_refs_lines != expected_refs {
+        return Err(format!(
+            "FAIL: td's reader (store-query references) disagrees with the content-scan oracle \
+             (seed-manifest) for the SAME staged store\n  td-read: {td_refs_lines:?}\n  \
+             content-scan: {expected_refs:?}"
+        ));
+    }
+    let nedges = td_refs_lines.len();
+    println!(
+        "   references: td's reader parsed {nedges} edges of the inter-path Refs relation, \
+         matching an INDEPENDENT content-scan of the same staged store"
+    );
 
     // deriver-in-closure: a deriver that is itself a member registers ONCE.
     println!(
@@ -937,8 +988,10 @@ fn store_register(root: &Path) -> Result<(), String> {
         "PASS: td WROTE the store SQLite DB for a TD-BUILT hello's full {n}-path closure itself \
          in pure Rust AND READ it back itself (td-builder store-query — a pure-Rust SQLite \
          reader, no external SQLite engine and no daemon anywhere in this gate): every path's \
-         hash + narSize, the full inter-path Refs relation, and a closure-member deriver \
-         registered exactly once."
+         hash + narSize and the full inter-path Refs relation, as answered by TD'S OWN READER, \
+         match an INDEPENDENT content-scan oracle (seed-manifest, bypassing the SQLite bytes \
+         entirely) of the same staged store; and a closure-member deriver is registered exactly \
+         once."
     );
     Ok(())
 }
@@ -1388,15 +1441,13 @@ fn store_backend(root: &Path) -> Result<(), String> {
 
     let all_outputs = tb_out(&tb, &["store-query", &tddb_s, "outputs"], "store-query outputs")?;
     let out_prefix = format!("{}|", subj.root);
-    let dout_line = all_outputs
-        .lines()
-        .find(|l| l.starts_with(&out_prefix))
-        .ok_or_else(|| format!("FAIL: no DerivationOutputs row for the built output {}", subj.root))?;
+    let dout_lines: Vec<&str> = all_outputs.lines().filter(|l| l.starts_with(&out_prefix)).collect();
     let expected = format!("{root}|{drv}|{drv}|out", root = subj.root, drv = subj.drv);
-    if dout_line != expected {
+    if dout_lines != [expected.as_str()] {
         return Err(format!(
-            "FAIL: td's deriver/drv->output ({dout_line}) != the expected (td-assembled .drv) -> \
-             out -> output ({expected})"
+            "FAIL: td's deriver/drv->output rows for {} ({dout_lines:?}) != EXACTLY one row \
+             equal to the expected (td-assembled .drv) -> out -> output ({expected})",
+            subj.root
         ));
     }
     println!(
