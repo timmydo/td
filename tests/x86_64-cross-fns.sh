@@ -18,6 +18,9 @@ XTARGET=x86_64-pc-linux-gnu
 # The MODERN cross builds (binutils 2.44 / gcc 14 / glibc 2.41) parallelize safely — PLAN task #1
 # endorses -j for exactly these (keep the mesboot base serial). Override with X86_MAKE_J= for serial.
 : "${X86_MAKE_J:=-j4}"
+x86_lock_fd() {
+  if [ -n "${TD_LOCK_TOOL:-}" ]; then "$TD_LOCK_TOOL" lock-fd "$1"; else flock "$1"; fi
+}
 
 # _store_tool <name> <guix-pkg> — a build-time scaffolding tool, from PATH or the exposed /gnu/store.
 # _xbin <dir> — a bin/ of the autoconf/recursive-make scaffolding (awk/sed/make/bison/flex/…). Kept
@@ -70,7 +73,7 @@ run_x86_64_cross() {
   mkdir -p "`dirname "$_lw"`"
   # STABLE sibling lock, taken before the cold wipe (the bootstrap-chain.sh #378-s3 fix); held for the
   # body so a peer can't race the tail's _lo reads of build-*.out.
-  exec 9>"$_lw.lock"; flock 9 || { echo "ladder: flock failed" >&2; return 1; }
+  exec 9>"$_lw.lock"; x86_lock_fd 9 || { echo "ladder: lock failed" >&2; return 1; }
   test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$_lw"
   mkdir -p "$_lw"
   ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
@@ -103,7 +106,7 @@ run_x86_64_rust_toolchain() {
   TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
   if [ -n "$TD_CHECK_CHAIN_CACHE" ]; then _lw="$HOME/.td/build-daemon/ladder"; else _lw="$ROOT/.td-build-cache/ladder-cold"; fi
   mkdir -p "`dirname "$_lw"`"
-  exec 9>"$_lw.lock"; flock 9 || { echo "ladder: flock failed" >&2; return 1; }
+  exec 9>"$_lw.lock"; x86_lock_fd 9 || { echo "ladder: lock failed" >&2; return 1; }
   test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$_lw"
   mkdir -p "$_lw"
   ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
@@ -261,7 +264,7 @@ run_x86_64_native() {
   TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
   if [ -n "$TD_CHECK_CHAIN_CACHE" ]; then _lw="$HOME/.td/build-daemon/ladder"; else _lw="$ROOT/.td-build-cache/ladder-cold"; fi
   mkdir -p "`dirname "$_lw"`"
-  exec 9>"$_lw.lock"; flock 9 || { echo "ladder: flock failed" >&2; return 1; }
+  exec 9>"$_lw.lock"; x86_lock_fd 9 || { echo "ladder: lock failed" >&2; return 1; }
   # NO cold wipe here (run_x86_64_cross owns it): appending the native rungs must not discard the
   # cross toolchain obtain_cross already built into $_lw. ladder_setup is idempotent/self-healing.
   mkdir -p "$_lw"

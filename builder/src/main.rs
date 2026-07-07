@@ -46,6 +46,7 @@ mod sys;
 mod toolchain_x86_64;
 
 use std::ffi::CString;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -3164,6 +3165,111 @@ fn host_sandbox_base_binds(store_from: Option<&str>, store_at: Option<&str>) -> 
     }
 }
 
+fn parse_lock_fd(fd: &str, subcmd: &str) -> Result<i32, String> {
+    let parsed = fd
+        .parse::<i32>()
+        .map_err(|_| format!("td-builder: {subcmd}: invalid fd `{fd}`"))?;
+    if parsed < 0 {
+        return Err(format!("td-builder: {subcmd}: invalid fd `{fd}`"));
+    }
+    Ok(parsed)
+}
+
+fn lock_fd_cli(args: &[String]) -> ExitCode {
+    let usage = "usage: td-builder lock-fd [-n] FD";
+    let (nonblock, fd_s) = match args {
+        [fd] => (false, fd.as_str()),
+        [flag, fd] if flag == "-n" => (true, fd.as_str()),
+        _ => {
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
+    };
+    let fd = match parse_lock_fd(fd_s, "lock-fd") {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    if nonblock {
+        match sys::flock_try_exclusive(fd) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("td-builder: lock-fd {fd}: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        match sys::flock_exclusive(fd) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: lock-fd {fd}: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn lock_file_cli(args: &[String]) -> ExitCode {
+    let usage = "usage: td-builder lock-file [-n] PATH -- CMD ARGS...";
+    let mut rest = args;
+    let nonblock = if rest.first().map(String::as_str) == Some("-n") {
+        rest = rest.get(1..).unwrap_or(&[]);
+        true
+    } else {
+        false
+    };
+    let Some(path) = rest.first() else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let rest = rest.get(1..).unwrap_or(&[]);
+    if rest.first().map(String::as_str) != Some("--") {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    }
+    let Some(cmd) = rest.get(1) else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let cmd_args = rest.get(2..).unwrap_or(&[]);
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("td-builder: lock-file {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if nonblock {
+        match sys::flock_try_exclusive(file.as_raw_fd()) {
+            Ok(true) => {}
+            Ok(false) => return ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("td-builder: lock-file {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Err(e) = sys::flock_exclusive(file.as_raw_fd()) {
+        eprintln!("td-builder: lock-file {path}: {e}");
+        return ExitCode::FAILURE;
+    }
+    match Command::new(cmd).args(cmd_args).status() {
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(e) => {
+            eprintln!("td-builder: lock-file {path}: exec {cmd}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -3207,6 +3313,10 @@ fn main() -> ExitCode {
         // check-rung HARNESS [ARGS...] — dev-iteration helper: run a cached-chain
         // bootstrap harness inside the loop sandbox (was tools/check-rung.sh).
         Some("check-rung") => check_loop::check_rung_cli(args.get(2..).unwrap_or(&[])),
+        // Native replacement for util-linux flock(1) in the loop scripts. `lock-fd`
+        // locks a shell-opened fd; `lock-file` holds a path lock while running a command.
+        Some("lock-fd") => lock_fd_cli(args.get(2..).unwrap_or(&[])),
+        Some("lock-file") => lock_file_cli(args.get(2..).unwrap_or(&[])),
         // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
         // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
         Some("bootstrap-recipe") => bootstrap::cli(&args),
@@ -5841,6 +5951,7 @@ fn main() -> ExitCode {
                         if k.starts_with("TD_CHECK_")
                             || k.starts_with("TD_SUBST_")
                             || k.starts_with("TD_DAEMON_")
+                            || k == "TD_LOCK_TOOL"
                         {
                             extra_env.push((k, v));
                         }
@@ -5917,23 +6028,47 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // td-builder userns-private -- CMD ARGS... — a private mount+user namespace
-        // over the CURRENT root: no pivot_root, no fresh tmpfs, no bind allowlist.
+        // td-builder userns-private [--bind SRC DEST]... -- CMD ARGS... — a private
+        // mount+user namespace over the CURRENT root: no pivot_root, no fresh tmpfs.
+        // Optional binds are installed natively after the root mount tree is made
+        // private, so callers do not need util-linux's mount(1).
         // The native replacement for the util-linux `unshare -rm` CLI a gate body
         // used to shell out to (gate 171 stage0-cold-start's cold leg: it needs the
         // WHOLE host filesystem visible minus one path hidden by a private bind
         // mount — the opposite shape from host-sandbox/store-ns, which both pivot
         // into a FRESH root with an explicit bind allowlist). Maps to ROOT (uid/gid
-        // 0), matching `-r`/`--map-root-user`: the namespace creator holds full
-        // capabilities inside it regardless of the mapped id, so the raw mount(2)
-        // syscall would succeed either way, but the `mount(8)` CLI itself refuses
-        // ("must be superuser") unless its apparent euid is 0 — verified empirically
-        // (an identity map here made a plain `mount --bind` inside fail with that
-        // message even though the syscall-level capability was present).
-        //   userns-private -- CMD ARGS...
-        Some("userns-private") if args.len() >= 4 && args[2] == "--" => {
-            let cmd = args[3].clone();
-            let cmd_args: Vec<String> = args[4..].to_vec();
+        // 0), matching `-r`/`--map-root-user`.
+        //   userns-private [--bind SRC DEST]... -- CMD ARGS...
+        Some("userns-private") => {
+            let parse_userns_private = || -> Result<(Vec<(String, String)>, String, Vec<String>), String> {
+                let mut rest = args.get(2..).unwrap_or(&[]);
+                let mut binds = Vec::new();
+                while rest.first().map(String::as_str) == Some("--bind") {
+                    let Some(src) = rest.get(1) else {
+                        return Err("usage: userns-private [--bind SRC DEST]... -- CMD ARGS...".to_string());
+                    };
+                    let Some(dest) = rest.get(2) else {
+                        return Err("usage: userns-private [--bind SRC DEST]... -- CMD ARGS...".to_string());
+                    };
+                    binds.push((src.clone(), dest.clone()));
+                    rest = rest.get(3..).unwrap_or(&[]);
+                }
+                if rest.first().map(String::as_str) != Some("--") {
+                    return Err("usage: userns-private [--bind SRC DEST]... -- CMD ARGS...".to_string());
+                }
+                let Some(cmd) = rest.get(1) else {
+                    return Err("usage: userns-private [--bind SRC DEST]... -- CMD ARGS...".to_string());
+                };
+                let cmd_args = rest.get(2..).unwrap_or(&[]).to_vec();
+                Ok((binds, cmd.clone(), cmd_args))
+            };
+            let (binds, cmd, cmd_args) = match parse_userns_private() {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    eprintln!("td-builder: userns-private: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             // Returns Infallible on the Ok side: this only ever ends by exec'ing the
             // command (which replaces the process and never returns here on success)
             // or by producing an error — there is no success value to carry.
@@ -5944,13 +6079,20 @@ fn main() -> ExitCode {
                     .map_err(|e| format!("unshare(NEWUSER|NEWNS): {e}"))?;
                 sandbox::map_userns_id(host_uid, host_gid, 0, 0)
                     .map_err(|e| format!("map_userns_id: {e}"))?;
-                // Make the root mount tree private so a nested mount (e.g. the
-                // caller's `mount --bind ... /var/guix`) never propagates to the
-                // host — `unshare -m`'s actual behavior, not merely a fresh
-                // mount-namespace id.
+                // Make the root mount tree private so caller-requested binds
+                // (e.g. hiding /var/guix) never propagate to the host —
+                // `unshare -m`'s actual behavior, not merely a fresh namespace id.
                 let root_c = CString::new("/").map_err(|e| e.to_string())?;
                 sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)
                     .map_err(|e| format!("mount(/ private): {e}"))?;
+                for (src, dest) in &binds {
+                    let src_c =
+                        CString::new(src.as_str()).map_err(|e| format!("bind source `{src}`: {e}"))?;
+                    let dest_c =
+                        CString::new(dest.as_str()).map_err(|e| format!("bind target `{dest}`: {e}"))?;
+                    sys::mount(Some(&src_c), &dest_c, None, sys::MS_BIND, None)
+                        .map_err(|e| format!("bind-mount `{src}` on `{dest}`: {e}"))?;
+                }
                 let err = Command::new(&cmd).args(&cmd_args).exec();
                 Err(format!("exec {cmd}: {err}"))
             };

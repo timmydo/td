@@ -119,14 +119,17 @@ fn guard_netns_probe() -> Result<(), String> {
 /// Provision the guix-free stage0 td-builder (the loop-container provider,
 /// workstream E #294) via the existing shell machinery and return $TB.
 fn provision_stage0(root: &Path) -> Result<String, String> {
-    let out = run_capture(
-        Command::new("sh")
-            .arg("-c")
-            .arg(". tests/cache-lib.sh && provision_stage0 1>&2 && printf '%s' \"$TB\"")
-            .current_dir(root),
-    )
-    .map_err(|e| {
-        fatal(&format!("could not provision the guix-free stage0 td-builder for the loop sandbox ({e})"))
+    let lock_tool = std::env::current_exe()
+        .map_err(|e| fatal(&format!("cannot resolve current td-builder for TD_LOCK_TOOL: {e}")))?;
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(". tests/cache-lib.sh && provision_stage0 1>&2 && printf '%s' \"$TB\"")
+        .env("TD_LOCK_TOOL", lock_tool)
+        .current_dir(root);
+    let out = run_capture(&mut cmd).map_err(|e| {
+        fatal(&format!(
+            "could not provision the guix-free stage0 td-builder for the loop sandbox ({e})"
+        ))
     })?;
     let tb = out.trim().to_string();
     if tb.is_empty() || !Path::new(&tb).is_file() {
@@ -916,10 +919,10 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     let _ = std::fs::remove_file(&sock);
     let tdnice = std::env::var("TD_NICE").unwrap_or_else(|_| s("10"));
     let mut argv: Vec<String> = Vec::new();
-    if find_in_path("nice").is_some() {
-        argv.extend([s("nice"), s("-n"), tdnice]);
-        if find_in_path("ionice").is_some() {
-            argv.extend([s("ionice"), s("-c2"), s("-n7")]);
+    if let Some(nice) = find_in_path("nice") {
+        argv.extend([nice.display().to_string(), s("-n"), tdnice]);
+        if let Some(ionice) = find_in_path("ionice") {
+            argv.extend([ionice.display().to_string(), s("-c2"), s("-n7")]);
         }
     }
     argv.extend([
@@ -962,10 +965,16 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
 /// (nar-restore) and entering the harness sandbox need it, and it never invokes guix (the stage0
 /// warm path spawns none once placed).
 fn load_stage0_tb(root: &Path) -> Result<String, CheckError> {
+    let lock_tool = std::env::current_exe().map_err(|e| {
+        CheckError::Unprovisioned(fatal(&format!(
+            "cannot resolve current td-builder for TD_LOCK_TOOL: {e}"
+        )))
+    })?;
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(". tests/cache-lib.sh && load_stage0 1>&2 && printf '%s' \"$TB\"")
         .env("TD_STAGE0_BASE", root.join(".td-build-cache/stage0"))
+        .env("TD_LOCK_TOOL", lock_tool)
         .current_dir(root);
     let out = run_capture(&mut cmd)
         .map_err(|_| CheckError::Unprovisioned(fatal("could not build the stage0 td-builder")))?;
@@ -1076,6 +1085,7 @@ fn run_check_harness(root: &Path) -> Result<i32, CheckError> {
             &format!("SHELL={hbin}/sh"),
             "check-harness-inner",
         ])
+        .env("TD_LOCK_TOOL", &tb)
         .current_dir(root)
         .status()
         .map_err(|e| fatal(&format!("could not enter the harness: {e}")))?;
@@ -1160,7 +1170,8 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     let tb = provision_stage0(&root)?;
     let toolchain = provision_toolchain(&root)?;
 
-    let mut child_envs: Vec<(String, String)> = vec![(s("PATH"), toolchain)];
+    let mut child_envs: Vec<(String, String)> =
+        vec![(s("PATH"), toolchain), (s("TD_LOCK_TOOL"), tb.clone())];
     // The runner's knobs must cross the sandbox boundary (host-sandbox
     // preserves the TD_CHECK_ prefix): without this, TD_CHECK_SLOTS=… ./check.sh
     // would be silently dead and gate-run would always default to nproc.
@@ -1259,13 +1270,16 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     });
 
     // nice/ionice the whole loop so it yields to interactive work; the slot pool
-    // and daemon budget bound how MUCH runs, nice bounds its priority.
+    // and daemon budget bound how MUCH runs, nice bounds its priority. Use
+    // absolute host-side wrapper paths: the child environment's PATH is the
+    // sandbox toolchain, and optional scheduling tools must not become implicit
+    // loop-toolchain dependencies.
     let tdnice = std::env::var("TD_NICE").unwrap_or_else(|_| "10".to_string());
     let mut argv: Vec<String> = Vec::new();
-    if find_in_path("nice").is_some() {
-        argv.extend([s("nice"), s("-n"), tdnice]);
-        if find_in_path("ionice").is_some() {
-            argv.extend([s("ionice"), s("-c2"), s("-n7")]);
+    if let Some(nice) = find_in_path("nice") {
+        argv.extend([nice.display().to_string(), s("-n"), tdnice]);
+        if let Some(ionice) = find_in_path("ionice") {
+            argv.extend([ionice.display().to_string(), s("-c2"), s("-n7")]);
         }
     }
     let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
@@ -1383,6 +1397,7 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
         .arg(harness)
         .args(rest)
         .env("PATH", toolchain)
+        .env("TD_LOCK_TOOL", &tb)
         .current_dir(&root);
     // Replace this process, exactly as the shell helper's `exec` did.
     use std::os::unix::process::CommandExt as _;

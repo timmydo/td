@@ -31,7 +31,8 @@ load_stage0() {
   TD_BUILDER_PATH="$_cb"
   TD_BUILDER_STORE="$_s0base/store"
   TD_BUILDER_DB="$_s0base/builder.db"
-  export TB TD_BUILDER_PATH TD_BUILDER_STORE TD_BUILDER_DB
+  TD_LOCK_TOOL="${TD_LOCK_TOOL:-$TB}"
+  export TB TD_BUILDER_PATH TD_BUILDER_STORE TD_BUILDER_DB TD_LOCK_TOOL
   test -x "$TB" || { echo "FAIL: stage0 td-builder not executable at $TB" >&2; return 1; }
 }
 

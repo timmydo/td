@@ -17,7 +17,7 @@
 #   TB                   — the stage0 td-builder (load_stage0): `$TB nar-hash` verifies.
 #
 # FAIL-CLOSED: when a warm cache is requested but cannot be used SAFELY (no $TB, no
-# flock, unreadable key inputs, unwritable cache dir), chain_cache_init returns nonzero —
+# lock helper, unreadable key inputs, unwritable cache dir), chain_cache_init returns nonzero —
 # under the callers' `set -eu` that reds the gate with an actionable message. Silently
 # degrading to cold is how a dead warm path hides (it did, in review); a deliberate cold
 # run is always available by setting the var empty.
@@ -35,9 +35,9 @@
 #     (recorded at build time). chain_hit re-hashes each product on EVERY reuse: a
 #     tampered/poisoned/truncated product mismatches ⇒ the brick is torn down and rebuilt
 #     (NAR-verified reuse, never trust-on-presence).
-#   * ONE exclusive flock per key serializes build-or-reuse across agents: the first
+#   * ONE exclusive lock per key serializes build-or-reuse across agents: the first
 #     check builds, concurrent checks block, then cache-hit. The lock dies with its
-#     holder (flock semantics), so a SIGKILLed gate never wedges the cache. (Pure hits
+#     holder (kernel flock semantics), so a SIGKILLed gate never wedges the cache. (Pure hits
 #     re-verify under the same exclusive lock — seconds against the ~90-min build they
 #     replace; a shared-lock fast path is not worth the upgrade races.)
 #   * WHOLE-KEY GC (#326): each key dir carries a `last-used` stamp, re-touched on every
@@ -46,7 +46,7 @@
 #     prunes INSIDE a key (brick paths are baked into later bricks), so reclamation must be
 #     whole-key. chain_cache_init sweeps stale keys AFTER taking its own lock+stamp; each
 #     candidate is removed ONLY while its own exclusive .lock can be taken non-blocking, so
-#     a key mid-build/mid-reuse (its holder still owns the flock) is NEVER swept. Confined:
+#     a key mid-build/mid-reuse (its holder still owns the lock) is NEVER swept. Confined:
 #     only dirs directly under $TD_CHECK_CHAIN_CACHE matching "<namespace>-*" are eligible.
 #
 # API:
@@ -61,6 +61,19 @@
 #   chain_gc NAMESPACE             — whole-key eviction of stale keys (called by init).
 #   chain_done                     — release the lock (also released on process exit).
 
+chain_lock_fd() {
+  if [ -n "${TD_LOCK_TOOL:-}" ]; then "$TD_LOCK_TOOL" lock-fd "$@"; else flock "$@"; fi
+}
+
+chain_lock_file_cmd() {
+  if [ -n "${TD_LOCK_TOOL:-}" ]; then "$TD_LOCK_TOOL" lock-file "$@"; return $?; fi
+  _clf_nonblock=0
+  if [ "${1:-}" = -n ]; then _clf_nonblock=1; shift; fi
+  _clf_path="${1:?chain_lock_file_cmd: missing lock path}"; shift
+  [ "${1:-}" = "--" ] && shift
+  if [ "$_clf_nonblock" = 1 ]; then flock -n "$_clf_path" "$@"; else flock "$_clf_path" "$@"; fi
+}
+
 # chain_cache_init NAMESPACE FILE... — CHAIN_WARM=1 + the key lock on success; CHAIN_WARM=0
 # when the cache is deliberately off (var empty/unset); nonzero when warm was requested
 # but cannot be established safely.
@@ -72,8 +85,12 @@ chain_cache_init() {
     echo "chain-cache: FAIL-CLOSED: warm cache requested ($TD_CHECK_CHAIN_CACHE) but \$TB is unset — load_stage0 first, or set TD_CHECK_CHAIN_CACHE= for a deliberate cold run" >&2
     return 1
   fi
-  if ! command -v flock >/dev/null 2>&1; then
-    echo "chain-cache: FAIL-CLOSED: warm cache requested but flock (util-linux) is not on PATH — fix the environment, or set TD_CHECK_CHAIN_CACHE= for a deliberate cold run" >&2
+  if [ -n "${TD_LOCK_TOOL:-}" ] && [ ! -x "$TD_LOCK_TOOL" ]; then
+    echo "chain-cache: FAIL-CLOSED: warm cache requested but TD_LOCK_TOOL is not executable ($TD_LOCK_TOOL) — fix the environment, or set TD_CHECK_CHAIN_CACHE= for a deliberate cold run" >&2
+    return 1
+  fi
+  if [ -z "${TD_LOCK_TOOL:-}" ] && ! command -v flock >/dev/null 2>&1; then
+    echo "chain-cache: FAIL-CLOSED: warm cache requested but no TD_LOCK_TOOL is set and fallback flock(1) is not on PATH — fix the environment, or set TD_CHECK_CHAIN_CACHE= for a deliberate cold run" >&2
     return 1
   fi
   # sha256sum -- errors on ANY unreadable/missing input (an unexpanded glob, a bad cwd),
@@ -89,9 +106,9 @@ chain_cache_init() {
   # The per-key exclusive lock (fd 9), held for the whole build-or-reuse section. A
   # concurrent agent building the same key blocks here, then hits the finished bricks.
   exec 9>>"$CHAIN_DIR/.lock" || { echo "chain-cache: FAIL-CLOSED: cannot open $CHAIN_DIR/.lock" >&2; return 1; }
-  if ! flock -n 9; then
+  if ! chain_lock_fd -n 9; then
     echo "chain-cache: waiting for $CHAIN_DIR/.lock (another agent is building this chain key)..." >&2
-    flock 9 || { echo "chain-cache: FAIL-CLOSED: flock failed on $CHAIN_DIR/.lock" >&2; exec 9>&-; return 1; }
+    chain_lock_fd 9 || { echo "chain-cache: FAIL-CLOSED: lock failed on $CHAIN_DIR/.lock" >&2; exec 9>&-; return 1; }
   fi
   CHAIN_WARM=1
   # Mark this key live (the GC freshness signal), then reclaim stale sibling keys.
@@ -105,7 +122,7 @@ chain_cache_init() {
 # effective cutoff is the first N-day-plus boundary (a hair conservative — keeps a key
 # up to a day longer, never sweeps too soon). Each stale candidate is removed ONLY while
 # its own exclusive .lock is takeable non-blocking — a key another agent is mid-build or
-# mid-reuse on holds that lock (flock treats each open-file-description independently, so
+# mid-reuse on holds that lock (kernel flock treats each open-file-description independently, so
 # this is faithful even in-proc), so it is skipped, never swept. The rm -rf is CONFINED:
 # only dirs directly under $TD_CHECK_CHAIN_CACHE whose basename matches "$NS-*" are
 # eligible, and the current key ($CHAIN_DIR, just stamped + locked) is never a candidate.
@@ -127,15 +144,15 @@ chain_gc() {
     # Confinement: only ever a dir the glob produced under the cache root (defensive —
     # $_gcd already comes from the "$NS-*" glob, never an untrusted sentinel).
     case "$_gcd" in "$TD_CHECK_CHAIN_CACHE/$_gcns"-*) : ;; *) continue ;; esac
-    # Take the candidate's own exclusive lock and HOLD it across the delete (flock's
-    # command form: it opens+locks $_gcd/.lock, runs rm while holding it, then unlocks).
-    # A key another agent is mid-build/mid-reuse on holds that lock, so `flock -n` can't
-    # take it ⇒ the key is skipped, never swept. rm unlinks the dir (incl .lock) while
-    # flock still owns the now-unlinked inode; flock returns rm's status, so 0 ⇒ swept.
+    # Take the candidate's own exclusive lock and HOLD it across the delete.
+    # A key another agent is mid-build/mid-reuse on holds that lock, so a nonblocking lock
+    # can't take it ⇒ the key is skipped, never swept. rm unlinks the dir (incl .lock)
+    # while the lock helper still owns the now-unlinked inode; it returns rm's status,
+    # so 0 ⇒ swept.
     # (`2>/dev/null` is scoped to THIS command — a lock-busy diagnostic is expected noise,
     # not an error — and never leaks to the shell's stderr the way `exec N>f 2>/dev/null`
     # would.)
-    if flock -n "$_gcd/.lock" rm -rf "$_gcd" 2>/dev/null; then
+    if chain_lock_file_cmd -n "$_gcd/.lock" -- rm -rf "$_gcd" 2>/dev/null; then
       echo "   [chain-cache] GC swept stale key $_gcd (unused > ${_gcdays}d)" >&2
     fi
   done

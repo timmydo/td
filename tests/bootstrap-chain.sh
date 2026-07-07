@@ -19,7 +19,7 @@
 # rung's drv (recipe JSON + lock + builder-of-record), so a recipe OR ENGINE change
 # re-keys exactly the affected rungs — stronger than the old file-keyed brick cache (and
 # the retired TMPDIR/interp-length hack: store paths are stable inside sandboxes, so no
-# brick ever bakes a movable path). flock serializes concurrent gates on the warm dir;
+# brick ever bakes a movable path). An exclusive lock serializes concurrent gates on the warm dir;
 # the loser cache-hits through.
 #
 # Exports for the gate tails:
@@ -35,6 +35,9 @@
 #                   store basenames (verify-store staging + interp assertions).
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+ladder_lock_fd() {
+  if [ -n "${TD_LOCK_TOOL:-}" ]; then "$TD_LOCK_TOOL" lock-fd "$1"; else flock "$1"; fi
+}
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 lf() { sed -n "s/^$2 //p" "$1" | head -1; }
 
@@ -95,7 +98,7 @@ else
   LWDIR="$ROOT/.td-build-cache/ladder-cold"
 fi
 # The lock lives OUTSIDE LWDIR (a STABLE sibling) and is taken BEFORE the cold-mode wipe: a
-# lock file inside LWDIR would be unlinked by a peer's `rm -rf "$LWDIR"`, so its flock would
+# lock file inside LWDIR would be unlinked by a peer's `rm -rf "$LWDIR"`, so its lock would
 # guard nothing and two force-cold gates (both Shared/Daily, run in parallel on the daily
 # backstop) would build into the same dir and corrupt each other's from-seed run. Held for
 # the WHOLE body (not released after ladder_build): the tail's `_lout` reads build-*.out,
@@ -103,7 +106,7 @@ fi
 # done reading. The kernel drops the fd on process exit; concurrent gates serialize and the
 # waiter then cache-hits the warm ladder (or, cold, rebuilds from seed after the winner).
 mkdir -p "`dirname "$LWDIR"`"
-exec 9>"$LWDIR.lock"; flock 9 || fail "ladder: flock failed"
+exec 9>"$LWDIR.lock"; ladder_lock_fd 9 || fail "ladder: lock failed"
 test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$LWDIR"   # cold: from-scratch, now serialized under the lock
 mkdir -p "$LWDIR"
 ladder_setup "$LWDIR" || fail "ladder_setup (intern/tools) failed"

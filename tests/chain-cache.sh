@@ -5,7 +5,7 @@
 # and a cold run (what the runner wires for a Private gate: TD_CHECK_CHAIN_CACHE="") neither
 # reads nor writes the cache. Plus whole-key GC (#326): chain_cache_init sweeps a stale key
 # (last-used aged past the threshold) while the live key still NAR-verifies + cache-hits,
-# and a key whose exclusive flock is held (a concurrent build) is NEVER swept. Driven
+# and a key whose exclusive lock is held (a concurrent build) is NEVER swept. Driven
 # through the REAL library the bootstrap chain sources (tests/chain-cache-lib.sh) with the
 # REAL verifier (the stage0 td-builder's nar-hash) — the same entry points
 # bootstrap_modern_toolchain uses per brick.
@@ -35,7 +35,7 @@ build_demo() { # $1 = brick dir
 # One warm consumer pass — exactly the per-brick shape bootstrap_modern_toolchain runs.
 pass() {
   chain_cache_init demo tests/chain-cache.sh
-  test "$CHAIN_WARM" = 1 || fail "warm cache expected but the lib went cold (flock/\$TB missing?)"
+  test "$CHAIN_WARM" = 1 || fail "warm cache expected but the lib went cold (lock helper/\$TB missing?)"
   if chain_hit demo; then D=$CHAIN_PATH; else
     D="$CHAIN_DIR/demobuild"; build_demo "$D"
     chain_save demo "$D" "$D/out"
@@ -97,10 +97,10 @@ SK=`gckey stale`; populate "$SK";  STALE_DIR="$POP_DIR"
 HK=`gckey held`;  populate "$HK";  HELD_DIR="$POP_DIR"
 # Age STALE and HELD past the default threshold (14d); LIVE keeps its fresh stamp.
 touch -d '400 days ago' "$STALE_DIR/last-used" "$HELD_DIR/last-used"
-# A concurrent agent building/reusing HELD == its exclusive .lock is held. flock locks each
+# A concurrent agent building/reusing HELD == its exclusive .lock is held. Kernel flock locks each
 # open-file-description independently (even within one process), so holding fd 7 here is a
-# faithful stand-in for another agent's hold: the GC's own `flock -n` on HELD is denied.
-exec 7>>"$HELD_DIR/.lock"; flock -n 7 || fail "gc: could not take the simulated concurrent-build lock on HELD"
+# faithful stand-in for another agent's hold: the GC's own nonblocking lock on HELD is denied.
+exec 7>>"$HELD_DIR/.lock"; chain_lock_fd -n 7 || fail "gc: could not take the simulated concurrent-build lock on HELD"
 
 builds_before=`wc -l < "$counter"`
 # Re-init LIVE: chain_cache_init re-stamps LIVE and runs the sweep.
@@ -112,7 +112,7 @@ exec 7>&-   # release the simulated concurrent-build lock
 
 test "`wc -l < "$counter"`" -eq "$builds_before" || fail "gc: the live key rebuilt instead of cache-hitting after the sweep"
 test ! -d "$STALE_DIR" || fail "gc: the stale key was NOT swept ($STALE_DIR)"
-test -d "$HELD_DIR" || fail "gc: a key holding the flock (concurrent build) was swept ($HELD_DIR)"
+test -d "$HELD_DIR" || fail "gc: a key holding the lock (concurrent build) was swept ($HELD_DIR)"
 test -d "$LIVE_DIR" || fail "gc: the live key was swept ($LIVE_DIR)"
 
-echo "PASS: chain-cache — warm builds once, reuse is NAR-verified, a poisoned entry is rejected+rebuilt, cold never touches the cache, and whole-key GC sweeps a stale key while sparing the live and the flock-held ones"
+echo "PASS: chain-cache — warm builds once, reuse is NAR-verified, a poisoned entry is rejected+rebuilt, cold never touches the cache, and whole-key GC sweeps a stale key while sparing the live and the lock-held ones"

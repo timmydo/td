@@ -5,7 +5,7 @@
 //! (TD_CHECK_CHAIN_CACHE force-cleared) — neither reads nor writes the cache. Plus whole-key
 //! GC (#326): chain_cache_init sweeps a key whose `last-used` stamp has aged past the
 //! threshold, while the LIVE key still NAR-verifies + cache-hits and a key whose exclusive
-//! flock is held (a concurrent build) is NEVER swept — bounding the machine-wide cache
+//! lock is held (a concurrent build) is NEVER swept — bounding the machine-wide cache
 //! against ENOSPC as recipe/pin/channel changes mint fresh multi-GB keys. Drives the REAL
 //! library the bootstrap chain sources (tests/chain-cache-lib.sh) through the same
 //! hit/build/save/init entry points `bootstrap_modern_toolchain` uses per brick, with the
@@ -27,7 +27,7 @@ pub fn gate() -> GateDef {
         store: StoreMode::Private,
         non_blocking: false,
         script: r##"
-echo ">> chain-cache: warm bricks build once + NAR-verified reuse; poisoned entries rejected; Private/cold runs never touch the cache (#317); whole-key GC sweeps stale keys, spares live + flock-held (#326)"
+echo ">> chain-cache: warm bricks build once + NAR-verified reuse; poisoned entries rejected; Private/cold runs never touch the cache (#317); whole-key GC sweeps stale keys, spares live + lock-held (#326)"
 sh tests/chain-cache.sh
 "##,
     }
