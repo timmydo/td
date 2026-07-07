@@ -6,7 +6,7 @@
 # `guix build <lock paths>` when a pinned seed path was missing. This resolver replaces
 # that guix-process dependency: a missing seed root is FETCHED from td's own signed
 # substitute store (td-subst — the same ~/.td/subst mechanism the toolchain gates use,
-# published by ci/daily-full-suite.sh via tools/publish-seed-subst.sh) and restored by
+# published by td-builder daily via tools/publish-seed-subst.sh) and restored by
 # td's own nar-restore, walking each fetched narinfo's References breadth-first so the
 # fetched set is ref-closed. A tree already PRESENT under the seed root is trusted as
 # complete and not descended into — the same trust the retired presence check placed in

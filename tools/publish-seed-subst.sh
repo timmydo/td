@@ -2,7 +2,7 @@
 # tools/publish-seed-subst.sh — the PRODUCER half of #311 (seed realizations via
 # td-subst): export the pinned /gnu/store SEED closure as SIGNED substitutes so the
 # loop's seed resolver (tools/resolve-seed.sh) can realize a missing seed WITHOUT a
-# guix process. Runs in ci/daily-full-suite.sh's all-green publish block, next to
+# guix process. Runs in td-builder daily's all-green publish block, next to
 # publish-toolchain-subst.sh; the gate (tests/seed-subst.sh) drives it against a
 # scratch store with an ephemeral key.
 #

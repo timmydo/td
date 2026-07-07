@@ -269,7 +269,7 @@ source). The loop spine (`builder/src/gates.rs`,
 validate on the bounded **`check-pr` tier** — no longer the full loop.
 Daily/system-tier gates a diff affects are NAMED but deferred: the
 full heavy+system suite is not a per-PR gate; it runs **once daily**
-on fresh main via `ci/daily-full-suite.sh`, driven by a scheduled
+on fresh main via `td-builder daily`, driven by a scheduled
 agent that opens a **fix-or-revert PR (no auto-merge)** on any
 regression. A daily-tier regression the per-PR tiers miss is healed
 within a day, not blocked per-PR — the accepted velocity trade.

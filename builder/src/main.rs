@@ -20,6 +20,7 @@ mod bootstrap;
 mod build;
 mod build_daemon;
 mod check_loop;
+mod daily;
 mod drv;
 mod elf;
 // The comment-splice static guard (#300) is exercised only by its own `#[test]`
@@ -3181,6 +3182,10 @@ fn main() -> ExitCode {
         // bootstrap shim that execs this. (The drv reproducibility double-build
         // that used to share this verb is `check-drv` now — no argument sniffing.)
         Some("check") => check_loop::cli(args.get(2..).unwrap_or(&[])),
+        // daily [--no-system] [--verdict FILE] — the daily-backstop runner: run the
+        // full suite on fresh origin/main + write a machine verdict (was
+        // ci/daily-full-suite.sh). See builder/src/daily.rs.
+        Some("daily") => daily::cli(args.get(2..).unwrap_or(&[])),
         // check-rung HARNESS [ARGS...] — dev-iteration helper: run a cached-chain
         // bootstrap harness inside the loop sandbox (was tools/check-rung.sh).
         Some("check-rung") => check_loop::check_rung_cli(args.get(2..).unwrap_or(&[])),

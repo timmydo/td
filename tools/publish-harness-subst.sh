@@ -4,7 +4,7 @@
 # with an empty .td-build-cache/harness fetches it (tools/resolve-harness.sh) instead of needing a
 # local guix-hosted heavy build to have produced it first.
 #
-# Runs in ci/daily-full-suite.sh AFTER the heavy suite's gate 420 persists .td-build-cache/harness
+# Runs in td-builder daily AFTER the heavy suite's gate 420 persists .td-build-cache/harness
 # (the from-source, guix-byte-free /td/store busybox+make + staged C toolchain). It exports that
 # tree as ONE nar + a fixed-name `td-harness` narinfo (td-builder harness-subst-export) and signs
 # it with the daily-runner's PRIVATE key (whose public half is the pinned tests/td-subst.pub the

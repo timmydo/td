@@ -1103,7 +1103,7 @@ echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store
 # Restore the lock-keyed glibc-2.41 from the subst-export written above (td-builder only — NO subst
 # binary, NO network), prove it round-trips byte-identically AND the prebuilt programs RUN against the
 # FETCHED-not-rebuilt libc in a fresh own-root → 42 — the toolchain artifact obtained by FETCH, not the
-# ~90-min from-seed rebuild. The export is persisted so the daily suite (ci/daily-full-suite.sh) signs +
+# ~90-min from-seed rebuild. The export is persisted so the daily suite (td-builder daily) signs +
 # publishes it with the real key; the loop's resolver (tools/resolve-toolchain.sh, #209) then fetches it.
 # Deliberate directive-1 relaxation: the daily full suite is the sole from-seed authoritative build + publisher.
 rstore="$snwork/rstore"; mkdir -p "$rstore"
