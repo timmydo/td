@@ -1,7 +1,10 @@
 #!/bin/sh
-# tests/bootstrap-chain.sh — the SHARED from-seed modern-toolchain driver, sourced by the
-# bootstrap-*-store-native gates. The caller sets `set -eu` + ROOT=$(pwd), runs load_stage0
-# ($TB + TD_BUILDER_*), sources this, then calls `bootstrap_modern_toolchain`.
+# tests/bootstrap-chain.sh — the SHARED from-seed modern-toolchain driver. #397 retired the
+# last per-rung bootstrap-*.sh consumers (their build_* ladders duplicated this driver); the
+# surviving consumers are tests/store-persist.sh, tests/chain-cache.sh,
+# tests/bootstrap-{hello,sed}-corpus-store-native.sh, and tests/x86_64-cross-fns.sh (via
+# tests/ladder-lib.sh / tests/chain-cache-lib.sh). The caller sets `set -eu` + ROOT=$(pwd),
+# runs load_stage0 ($TB + TD_BUILDER_*), sources this, then calls `bootstrap_modern_toolchain`.
 #
 # #378 slices 2+3: the ~850-line build_* shell LADDER IS DELETED. Every rung — stage0 →
 # mes → tcc → make/patch → binutils/gcc-2.95 → the mesboot ladder → gcc-4.9.4 →
