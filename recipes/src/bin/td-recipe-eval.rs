@@ -157,6 +157,8 @@ mod tests {
     // catalog::tests::every_recipe_emits_canonical_json_and_round_trips covers
     // "every recipe emits valid, round-tripping JSON" — no need to duplicate it
     // here, `cargo test --manifest-path recipes/Cargo.toml` already runs both.
+    // (`verify` itself is gone — it was a boa-migration oracle with no live
+    // caller left once this discrimination check moved off the CLI.)
     //
     // (C) discrimination leg (negative control): two different recipes' canonical
     // JSON must differ — the always-on proof that a JSON comparison actually

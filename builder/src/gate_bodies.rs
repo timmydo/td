@@ -133,10 +133,10 @@ fn tb_out_env(tb: &Path, args: &[&str], envs: &[(&str, &str)], ctx: &str) -> Res
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// True if `<program> <args...>` exits zero (for the discrimination legs that
-/// expect a NON-zero exit — corruption/verify-fail). stdout+stderr discarded.
-fn cmd_ok(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> bool {
-    Command::new(program)
+/// True if `tb <args...>` exits zero (for the discrimination legs that expect
+/// a NON-zero exit — corruption/verify-fail). stdout+stderr discarded.
+fn tb_ok(tb: &Path, args: &[&str]) -> bool {
+    Command::new(tb)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -144,12 +144,6 @@ fn cmd_ok(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-/// True if `tb <args...>` exits zero (`cmd_ok` specialized to the td-builder
-/// binary under test).
-fn tb_ok(tb: &Path, args: &[&str]) -> bool {
-    cmd_ok(tb, args)
 }
 
 /// Run an arbitrary tool, returning trimmed stdout on success (the generic
@@ -1535,16 +1529,19 @@ fn store_ns(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// --- recipe-rs (port of tests/recipe-rs.sh) -----------------------------------
+// --- recipe-rs (formerly tests/recipe-rs.sh) ----------------------------------
 
 /// recipe-rs — the Rust package + spec surface (the `recipes` crate) is
 /// self-consistent (rust-recipe-surface track). Builds + unit-tests the
 /// dependency-free `recipes` crate OFFLINE with a guix-free rust+cc toolchain
 /// (`tools/provision-{rust,cc}.sh` — a host-prep concern, not part of the
-/// rust-recipe-surface itself, so still shelled out to, same as the bash gate
-/// did), then proves `td-recipe-eval`'s catalog is coverage-complete
-/// (every recipe emits valid, round-tripping JSON) and discriminating
-/// (`verify` rejects a mismatched recipe — a negative control, not vacuous).
+/// rust-recipe-surface itself, so still shelled out to). The catalog's
+/// coverage (every recipe emits valid, round-tripping JSON) and
+/// discrimination (a mismatch is not vacuously accepted) legs are `#[test]`s
+/// in the `recipes` crate itself (`catalog::tests`, `td-recipe-eval::tests`)
+/// — `cargo test` below is what runs them; this function only additionally
+/// smokes the RELEASE binary's `list`/`emit` entry points (the CLI surface a
+/// live consumer, `ladder-lib.sh`'s `ladder_emit`, actually spawns).
 fn recipe_rs(root: &Path) -> Result<(), String> {
     println!(
         ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent (rust-recipe-surface)"
@@ -1599,10 +1596,16 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     }
     let eval_s = path_str(&eval)?;
 
-    // CLI smoke: `cargo test` only proves the underlying Rust functions are
-    // correct — it never runs the RELEASE BINARY's argv dispatch. `emit` is
-    // the one subcommand a live consumer (ladder-lib.sh's `ladder_emit`)
-    // actually spawns as a subprocess, so prove that entry point works too.
+    // CLI smoke: `cargo test` proves EVERY recipe's data is correct
+    // (catalog::tests::every_recipe_emits_canonical_json_and_round_trips runs
+    // `to_json().to_canonical()` on all of them) but never runs the RELEASE
+    // BINARY's argv dispatch, which is untested surface of its own (a typo in
+    // `main`'s `Some("emit") => ...` arm wouldn't fail any unit test). That
+    // dispatch doesn't branch per-stem, so one representative stem is enough
+    // to prove it — looping over the whole catalog here would just re-run
+    // `cargo test`'s own per-recipe assertion via a slower subprocess path.
+    // `emit` is also the one subcommand a live consumer (ladder-lib.sh's
+    // `ladder_emit`) actually spawns, so it's the entry point worth smoking.
     println!(">> CLI smoke: the release td-recipe-eval binary's list/emit subcommands work");
     let list_out = run_out(&eval_s, &["list"], "td-recipe-eval list")?;
     let first = list_out
