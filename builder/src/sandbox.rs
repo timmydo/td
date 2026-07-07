@@ -539,6 +539,10 @@ pub fn host_shell(
     // /proc reflects the sandbox's OWN PID namespace, not the host's. The host
     // /proc is no longer bound in (main.rs drops it from the exposure set).
     let proc_c = CString::new("proc").unwrap();
+    let host_proc_c = CString::new("/proc").unwrap();
+    let allow_host_proc_fallback = extra_env
+        .iter()
+        .any(|(k, v)| k == "TD_CHECK_HOST_TOOL_ROOTS" && !v.is_empty());
     let proc_target_dir = newroot.join("proc");
     let proc_target_c = CString::new(proc_target_dir.as_os_str().as_encoded_bytes()).unwrap();
     let oldroot_rel = newroot.join("oldroot");
@@ -792,8 +796,16 @@ pub fn host_shell(
             // and friends against this; the host /proc (root-owned PID 1) refused
             // those writes from the non-root sandbox uid.
             fs::create_dir_all(&proc_target_dir)?;
-            sys::mount(Some(&proc_c), &proc_target_c, Some(&proc_c), 0, None)
-                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED mounting a fresh /proc\n"); e })?;
+            if let Err(e) = sys::mount(Some(&proc_c), &proc_target_c, Some(&proc_c), 0, None) {
+                if allow_host_proc_fallback {
+                    sys::warn(b"td-builder host-sandbox: fresh /proc unavailable; binding host /proc for host-tool fallback\n");
+                    sys::mount(Some(&host_proc_c), &proc_target_c, None, sys::MS_BIND | sys::MS_REC, None)
+                        .map_err(|_| { sys::warn(b"td-builder host-sandbox: FAILED binding fallback /proc\n"); e })?;
+                } else {
+                    sys::warn(b"td-builder host-sandbox: FAILED mounting a fresh /proc\n");
+                    return Err(e);
+                }
+            }
             // Writable scratch tmpfs mounts (/tmp, HOME), owned by the host uid.
             for (target_dir, target_c) in &tmpfs_specs {
                 fs::create_dir_all(target_dir)?;

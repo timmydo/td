@@ -142,6 +142,43 @@ fn provision_stage0(root: &Path) -> Result<String, String> {
 /// a `/usr/bin` tool on a foreign-distro guix host would vanish.
 const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 
+#[derive(Debug, Clone)]
+struct LoopToolchain {
+    path: String,
+    host_roots: Vec<String>,
+}
+
+fn host_tool_root(dir: &str) -> Option<String> {
+    let p = Path::new(dir);
+    for root in ["/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/bin", "/sbin"] {
+        let r = Path::new(root);
+        if p.starts_with(r) && r.exists() {
+            return Some(root.to_string());
+        }
+    }
+    None
+}
+
+fn rustup_toolchain_home() -> Option<String> {
+    if std::env::var("TD_RUST_HOME").ok().filter(|v| !v.is_empty()).is_some() {
+        return None;
+    }
+    let home = std::env::var("HOME").ok()?;
+    let ver = std::env::var("TD_RUST_VERSION").unwrap_or_else(|_| "1.96.0".to_string());
+    let p = Path::new(&home).join(".rustup/toolchains").join(format!("{ver}-x86_64-unknown-linux-gnu"));
+    if !(p.join("bin/rustc").is_file() && p.join("bin/cargo").is_file()) {
+        return None;
+    }
+    if !p.join("bin/cargo-clippy").is_file() && find_in_path("rustup").is_some() {
+        let _ = Command::new("rustup").args(["component", "add", "clippy", "--toolchain", &ver]).status();
+    }
+    if p.join("bin/cargo-clippy").is_file() {
+        Some(p.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
 /// The loop toolchain PATH, resolved from the HOST PATH: the host brings the
 /// userland tools (the "check the right tools are on $PATH" model), exactly as it
 /// already brings the rust/cc toolchain the stage0 seed build resolves via
@@ -164,7 +201,7 @@ const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 /// and that fatal is a `CheckError::Unprovisioned`, so `cli()` exits
 /// `EXIT_UNPROVISIONED`: the machine signal `td-builder daily` reads to classify
 /// this as a runner-provisioning gap rather than a code regression.
-fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
+fn provision_toolchain(root: &Path) -> Result<LoopToolchain, CheckError> {
     let list = std::fs::read_to_string(root.join("tools/loop-toolchain.txt"))
         .map_err(|e| fatal(&format!("cannot read tools/loop-toolchain.txt: {e}")))?;
     let tools: Vec<&str> = list
@@ -177,9 +214,9 @@ fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
     }
     let path_var = std::env::var("PATH").unwrap_or_default();
     let mut dirs: Vec<String> = Vec::new();
+    let mut host_roots: Vec<String> = Vec::new();
     let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut missing: Vec<&str> = Vec::new(); // not on PATH at all
-    let mut off_store: Vec<&str> = Vec::new(); // on PATH but NEVER under the bound store
     for t in &tools {
         // Scan EVERY PATH entry for the tool and take the FIRST whose REAL dir is under the
         // store the sandbox binds — not just the first PATH hit. On a guix-on-foreign-distro
@@ -189,6 +226,7 @@ fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
         // is worse than useless (Ok now, `command not found` for every gate later).
         let mut found_on_path = false;
         let mut in_store: Option<String> = None;
+        let mut first_host: Option<(String, String)> = None;
         for dir in path_var.split(':').filter(|d| !d.is_empty()) {
             let p = Path::new(dir).join(t);
             if !p.is_file() {
@@ -202,17 +240,31 @@ fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
                 if real.starts_with(SANDBOX_STORE_PREFIX) {
                     in_store = Some(real);
                     break;
+                } else if first_host.is_none() {
+                    if let Some(root) = host_tool_root(&real) {
+                        first_host = Some((real, root));
+                    }
                 }
             }
         }
-        match in_store {
-            Some(dir) => {
+        match in_store.map(|d| (d, None)).or_else(|| first_host.map(|(d, r)| (d, Some(r)))) {
+            Some((dir, root)) => {
                 resolved.insert(t);
                 if !dirs.contains(&dir) {
                     dirs.push(dir); // dedupe (e.g. sh + bash share one bin dir)
                 }
+                if let Some(root) = root {
+                    if !host_roots.contains(&root) {
+                        host_roots.push(root);
+                    }
+                    for lib_root in ["/bin", "/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/libexec", "/etc/alternatives"] {
+                        if Path::new(lib_root).exists() && !host_roots.iter().any(|r| r == lib_root) {
+                            host_roots.push(lib_root.to_string());
+                        }
+                    }
+                }
             }
-            None if found_on_path => off_store.push(t),
+            None if found_on_path => missing.push(t),
             None => missing.push(t),
         }
     }
@@ -230,26 +282,19 @@ fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
             ))));
         }
     }
-    if !missing.is_empty() || !off_store.is_empty() {
-        let mut why = String::new();
-        if !missing.is_empty() {
-            why.push_str(&format!("not on PATH: {}", missing.join(" ")));
-        }
-        if !off_store.is_empty() {
-            if !why.is_empty() {
-                why.push_str("; ");
-            }
-            why.push_str(&format!(
-                "on PATH but outside {SANDBOX_STORE_PREFIX} (invisible in the sandbox): {}",
-                off_store.join(" ")
-            ));
-        }
+    if !missing.is_empty() {
         eprintln!(
-            "td-builder check: loop toolchain: {} heavy-only tool(s) unavailable ({why}); \
-             the gates that need them will fail loudly — expose them under \
-             {SANDBOX_STORE_PREFIX} on the runner PATH (host-brings-the-tools; \
+            "td-builder check: loop toolchain: {} heavy-only tool(s) unavailable (not on PATH or not under an exposable host root: {}); \
+             the gates that need them will fail loudly (host-brings-the-tools; \
              tools/loop-toolchain.txt)",
-            missing.len() + off_store.len()
+            missing.len(),
+            missing.join(" ")
+        );
+    }
+    if !host_roots.is_empty() {
+        eprintln!(
+            "td-builder check: loop toolchain: using host PATH fallback outside {SANDBOX_STORE_PREFIX}; exposing read-only host roots: {}",
+            host_roots.join(":")
         );
     }
     if dirs.is_empty() {
@@ -257,7 +302,7 @@ fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
             "loop toolchain: no expected tool resolved to an in-store bin dir on the host PATH",
         )));
     }
-    Ok(dirs.join(":"))
+    Ok(LoopToolchain { path: dirs.join(":"), host_roots })
 }
 
 /// A timeout(1)-style duration: bare integer seconds or an integer with an
@@ -1160,7 +1205,13 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     let tb = provision_stage0(&root)?;
     let toolchain = provision_toolchain(&root)?;
 
-    let mut child_envs: Vec<(String, String)> = vec![(s("PATH"), toolchain)];
+    let mut child_envs: Vec<(String, String)> = vec![(s("PATH"), toolchain.path.clone())];
+    if !toolchain.host_roots.is_empty() {
+        child_envs.push((s("TD_CHECK_HOST_TOOL_ROOTS"), toolchain.host_roots.join(":")));
+        if let Some(rust_home) = rustup_toolchain_home() {
+            child_envs.push((s("TD_RUST_HOME"), rust_home));
+        }
+    }
     // The runner's knobs must cross the sandbox boundary (host-sandbox
     // preserves the TD_CHECK_ prefix): without this, TD_CHECK_SLOTS=… ./check.sh
     // would be silently dead and gate-run would always default to nproc.
@@ -1269,19 +1320,11 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
         }
     }
     let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
-    argv.extend([
-        tb.clone(),
-        s("host-sandbox"),
-        s("--expose-cwd"),
-        s("--no-daemon"),
-        s("--store-from"),
-        s(sandbox_store),
-        s("--store-at"),
-        s(sandbox_store),
-        s("--"),
-        tb,
-        s("gate-run"),
-    ]);
+    argv.extend([tb.clone(), s("host-sandbox"), s("--expose-cwd"), s("--no-daemon")]);
+    if Path::new(sandbox_store).is_dir() {
+        argv.extend([s("--store-from"), s(sandbox_store), s("--store-at"), s(sandbox_store)]);
+    }
+    argv.extend([s("--"), tb, s("gate-run")]);
     argv.extend([s("-j"), jobs.to_string()]);
     if resume {
         argv.push(s("--resume"));
@@ -1369,20 +1412,15 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     );
     let mut cmd = Command::new(&tb);
     let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
-    cmd.args([
-        "host-sandbox",
-        "--expose-cwd",
-        "--no-daemon",
-        "--store-from",
-        sandbox_store,
-        "--store-at",
-        sandbox_store,
-        "--",
-        "sh",
-    ])
+    cmd.args(["host-sandbox", "--expose-cwd", "--no-daemon"]);
+    if Path::new(sandbox_store).is_dir() {
+        cmd.args(["--store-from", sandbox_store, "--store-at", sandbox_store]);
+    }
+    cmd.args(["--", "sh"])
         .arg(harness)
         .args(rest)
-        .env("PATH", toolchain)
+        .env("PATH", toolchain.path)
+        .env("TD_CHECK_HOST_TOOL_ROOTS", toolchain.host_roots.join(":"))
         .current_dir(&root);
     // Replace this process, exactly as the shell helper's `exec` did.
     use std::os::unix::process::CommandExt as _;

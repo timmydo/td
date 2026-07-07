@@ -5787,6 +5787,33 @@ fn main() -> ExitCode {
                             }
                         }
                     }
+                    if let Ok(roots) = std::env::var("TD_CHECK_HOST_TOOL_ROOTS") {
+                        for root in roots.split(':').filter(|r| !r.is_empty()) {
+                            if Path::new(root).is_dir() {
+                                let src = std::fs::canonicalize(root)
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|_| root.to_string());
+                                binds.push(sandbox::Bind {
+                                    src,
+                                    dest: Some(root.to_string()),
+                                    readonly: true,
+                                    ro_optional: false,
+                                });
+                            }
+                        }
+                    }
+                    for tool_home in ["TD_RUST_HOME", "TD_CC_HOME"] {
+                        if let Ok(dir) = std::env::var(tool_home) {
+                            if !dir.is_empty() && Path::new(&dir).is_dir() {
+                                binds.push(sandbox::Bind {
+                                    src: dir.clone(),
+                                    dest: Some(dir),
+                                    readonly: true,
+                                    ro_optional: false,
+                                });
+                            }
+                        }
+                    }
                     // The persistent signed substitute store (~/.td/subst, populated by the daily) —
                     // READ-ONLY: the loop FETCHES the lock-keyed toolchain closure from it
                     // (x64-toolchain-subst) over its own loopback netns instead of rebuilding ~98 min
@@ -5837,6 +5864,8 @@ fn main() -> ExitCode {
                         if k.starts_with("TD_CHECK_")
                             || k.starts_with("TD_SUBST_")
                             || k.starts_with("TD_DAEMON_")
+                            || k == "TD_RUST_HOME"
+                            || k == "TD_CC_HOME"
                         {
                             extra_env.push((k, v));
                         }
