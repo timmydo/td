@@ -3,17 +3,14 @@
 //! Keyed by a stable STEM (not the recipe name): the `-perturbed`
 //! self-discrimination twins deliberately share a recipe `name` with their base
 //! (e.g. `hello-perturbed` is name `hello`), so the stem is the stable key. The
-//! `recipe-rs` gate proves the surface is self-consistent and keeps the
-//! `tests/recipes-meta.json` recipe manifest in sync.
+//! `recipe-rs` gate proves the surface is self-consistent.
 //!
 //! Each recipe lives in its own self-registering file `src/recipes/<stem>.rs`
 //! (github issue #295): the file name IS the stem, `pub fn recipe() -> Recipe`
 //! is the registration, and `build.rs` generates the stem-sorted registry
 //! (module declarations + the `all()` table) included below. Adding a recipe
-//! touches only its new file plus the shared regenerate-on-rebase recipe
-//! manifest (`tests/recipes-meta.json` — issue #296): no
-//! Rust source line is shared, so parallel recipe PRs don't collide on a
-//! central table (the mk/gates/ one-file-per-entry property).
+//! touches only its new file: no Rust source line is shared, so parallel recipe
+//! PRs don't collide on a central table (the mk/gates/ one-file-per-entry property).
 
 use crate::types::Recipe;
 
@@ -50,7 +47,7 @@ mod tests {
 
     #[test]
     fn catalog_is_sorted_and_stems_are_unique() {
-        // The generated registry must stay stem-sorted (the stable `list`/`meta`
+        // The generated registry must stay stem-sorted (the stable `list`
         // order) with no duplicate stems, whatever read_dir order build.rs saw.
         let stems: Vec<&str> = all().into_iter().map(|(s, _)| s).collect();
         let mut sorted = stems.clone();

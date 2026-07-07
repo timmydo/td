@@ -4,11 +4,9 @@
 //! catalog stem, and the file exports `pub fn recipe() -> Recipe`. This script
 //! globs the directory and writes `$OUT_DIR/registry.rs` — the module
 //! declarations plus the stem-sorted `all()` table — which `src/catalog.rs`
-//! includes. Adding a recipe therefore touches only its new file plus the
-//! shared regenerate-on-rebase recipe manifest (`tests/recipes-meta.json` —
-//! issue #296): no Rust source line is shared, the
-//! mk/gates/ "one file per entry" property, so parallel recipe PRs don't
-//! collide on a central table.
+//! includes. Adding a recipe therefore touches only its new file: no Rust
+//! source line is shared, the mk/gates/ "one file per entry" property, so
+//! parallel recipe PRs don't collide on a central table.
 //!
 //! Deterministic by construction: the registry is sorted by stem, never
 //! `read_dir` order. Pure `std` — the crate stays dependency-free.

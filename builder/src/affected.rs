@@ -440,7 +440,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches(
-        "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipes-meta.json|tests/recipe-emit.sh|tests/recipe-eval-tool.sh",
+        "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipe-emit.sh|tests/recipe-eval-tool.sh",
         p,
     ) {
         // The td-recipe crate IS the package + system-spec surface (boa/TS retired).
@@ -1236,7 +1236,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("tests/recipe-rs.sh", "recipe-rs");
-    assert_target!("tests/recipes-meta.json", "recipe-rs");
     // The surviving pinned inputs: a lock edit routes to the store-native gate that
     // stages it (hello → the store-native hello build; sed → store-persist).
     assert_target!("tests/hello-no-guix.lock", "bootstrap-hello-userland");
