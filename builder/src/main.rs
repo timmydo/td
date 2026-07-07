@@ -3892,14 +3892,14 @@ fn main() -> ExitCode {
                         let mut path_of = std::collections::HashMap::new();
                         let mut deriver_of = std::collections::HashMap::new();
                         for (rowid, cols) in db.table("ValidPaths")? {
-                            if let Some(p) = text(&cols[1]) {
-                                deriver_of.insert(p.clone(), text(&cols[4]).unwrap_or_default());
+                            if let Some(p) = cols.get(1).and_then(text) {
+                                deriver_of.insert(p.clone(), cols.get(4).and_then(text).unwrap_or_default());
                                 path_of.insert(rowid, p);
                             }
                         }
                         let mut lines = Vec::new();
                         for (_rowid, cols) in db.table("DerivationOutputs")? {
-                            match (int(&cols[0]), text(&cols[1]), text(&cols[2])) {
+                            match (cols.first().and_then(int), cols.get(1).and_then(text), cols.get(2).and_then(text)) {
                                 (Some(drv_id), Some(id), Some(outpath)) => {
                                     let drvpath = path_of.get(&drv_id).cloned().ok_or_else(|| {
                                         format!("DerivationOutputs drv {drv_id} has no ValidPaths row")
