@@ -5754,17 +5754,19 @@ fn main() -> ExitCode {
                         .to_string_lossy()
                         .into_owned();
                     // Worktree (rw, like guix shell -C's shared cwd) and the host
-                    // cgroup hierarchy (ro, for crun). HOME is a dir on the writable
-                    // root tmpfs (created by these binds), so no HOME tmpfs.
+                    // cgroup hierarchy (ro — gate-run's per-gate memory-limit
+                    // delegation, issue #328, needs to READ the hierarchy structure;
+                    // only its own delegated subtree, bound separately below, is
+                    // writable). HOME is a dir on the writable root tmpfs (created by
+                    // these binds), so no HOME tmpfs.
                     binds.push(sandbox::Bind { src: cwd.clone(), dest: None, readonly: false, ro_optional: false });
                     if Path::new("/sys/fs/cgroup").is_dir() {
-                        // ro is defense-in-depth (crun probes the hierarchy with
-                        // --cgroup-manager=disabled, never writing it). A child
-                        // userns can't remount-ro the host-owned cgroup2 on some
-                        // kernels (EPERM, e.g. the azure CI runner); there the bind
-                        // is DETACHED (fail-closed), never left writable — see
-                        // Bind::ro_optional. The crun gates that need it run only
-                        // locally, where the ro-remount succeeds.
+                        // ro is defense-in-depth (least-privilege default: expose the
+                        // hierarchy read-only unless a specific subtree needs writes).
+                        // A child userns can't remount-ro the host-owned cgroup2 on
+                        // some kernels (EPERM, e.g. the azure CI runner); there the
+                        // bind is DETACHED (fail-closed), never left writable — see
+                        // Bind::ro_optional.
                         binds.push(sandbox::Bind {
                             src: "/sys/fs/cgroup".to_string(),
                             dest: None,
@@ -5775,7 +5777,7 @@ fn main() -> ExitCode {
                         // RW OVER the ro hierarchy so gate-run (inside) can
                         // create per-gate child cgroups + set memory.max. Only
                         // when `td-builder check` probed a delegation; the rest
-                        // of the hierarchy stays ro (the crun-probe posture).
+                        // of the hierarchy stays ro.
                         if let Ok(cg) = std::env::var("TD_CHECK_CGROUP") {
                             if !cg.is_empty() && Path::new(&cg).is_dir() {
                                 binds.push(sandbox::Bind {

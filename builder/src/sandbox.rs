@@ -731,10 +731,9 @@ pub fn host_shell(
                         None,
                     );
                     // A child userns cannot remount-ro a mount owned by the host
-                    // userns (e.g. /sys/fs/cgroup → EPERM on the azure runner).
-                    // For ro_optional binds that ro is defense-in-depth (crun runs
-                    // --cgroup-manager=disabled and never writes cgroup), so keep
-                    // the bind writable rather than fail the whole sandbox. For
+                    // userns (e.g. /sys/fs/cgroup → EPERM on the azure runner). For
+                    // ro_optional binds, that failure is tolerated (fail closed
+                    // instead of failing the whole sandbox) rather than fatal. For
                     // every other ro bind (the store) the read-only is load-bearing
                     // — a failed remount is fatal.
                     if let Err(e) = ro {
@@ -744,12 +743,11 @@ pub fn host_shell(
                             // cgroup2 on the azure runner). Rather than leave the
                             // host subtree WRITABLE inside the "hermetic" sandbox,
                             // DETACH it — fail closed, nothing host-owned exposed.
-                            // The only ro_optional bind is /sys/fs/cgroup, needed
-                            // solely by the crun gates (run/container) which run
-                            // locally where the ro-remount SUCCEEDS; they never run
-                            // where this branch fires (the hosted CI checks are
-                            // host-native lint + cargo-test, no sandbox), so the
-                            // leftover empty dir is harmless.
+                            // The only ro_optional bind is /sys/fs/cgroup (gate-run's
+                            // per-gate memory-limit delegation, issue #328, reads the
+                            // hierarchy structure); where the ro-remount succeeds
+                            // (most local/dev hosts) it stays bound, so the leftover
+                            // empty dir here is harmless.
                             sys::warn(b"td-builder host-sandbox: ro-remount not permitted for an ro_optional bind; detached (fail-closed, no host exposure)\n");
                             let _ = sys::umount2(target_c, sys::MNT_DETACH);
                         } else {
@@ -776,8 +774,8 @@ pub fn host_shell(
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED mounting /dev/shm\n"); e })?;
             // /dev/pts + /dev/ptmx are best-effort: a new devpts instance needs an
             // unprivileged-mountable devpts (most kernels allow it; some restrict).
-            // crun sets up its OWN container pts, so a missing /dev/pts only
-            // affects a direct pty user — none in the loop.
+            // Nothing in the loop needs a real pty, so a missing /dev/pts only
+            // affects a direct interactive user of this sandbox.
             fs::create_dir_all(&dev_pts_dir)?;
             if sys::mount(Some(&devpts_c), &dev_pts_c, Some(&devpts_c), 0, Some(&devpts_data))
                 .is_err()
