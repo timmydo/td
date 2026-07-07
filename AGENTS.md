@@ -452,7 +452,8 @@ tracking system, and all working notes live in the git log + PR body.
   (`--model`/`--effort` for `claude` — effort levels `low|medium|high|xhigh|max`;
   `--model` + `-c model_reasoning_effort=…` for `codex`. Use `gpt-5.5`, not
   `gpt-5.5-codex`, under a ChatGPT-account login; swap in whichever model and
-  effort you want.)
+  effort you want.) `codex` is installed and on `$PATH` — do NOT drop it for a
+  second `claude` CLI run, which varies only the model, not the harness.
   — **post BOTH reviews' results as comments on the PR**; address their
   findings, posting each resulting fix as a **reply to the review comment and
   resolving the comment once the fix is done** (Workflow step 6 — MANDATORY for AI
