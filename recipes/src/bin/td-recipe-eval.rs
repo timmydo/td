@@ -1,12 +1,9 @@
-//! td-recipe-eval — emit / list / verify recipes from the Rust catalog.
+//! td-recipe-eval — emit / list recipes from the Rust catalog.
 //!
 //! Subcommands (recipes):
 //!   list                  print every recipe's `.ts` file stem, one per line
 //!   emit STEM             print STEM's recipe as canonical JSON (the wire format
 //!                         the build path consumes)
-//!   verify STEM BOA.json  parse the boa-evaluated JSON for the same recipe and
-//!                         assert it canon-equals the Rust recipe (the removable
-//!                         migration oracle); exits non-zero on mismatch
 //!   check-list [pr|daily|all]
 //!                         print recipe stems that own checks in the requested tier
 //!   check-count STEM [pr|daily|all]
@@ -21,7 +18,7 @@
 
 use std::process::exit;
 
-use td_recipe::{catalog, json};
+use td_recipe::catalog;
 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn die(msg: &str) -> ! {
@@ -75,24 +72,6 @@ fn check_index(arg: Option<&String>) -> Option<usize> {
     Some(n)
 }
 
-// Canon-equal check against a boa-emitted JSON file (the removable oracle).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn verify_against_boa(kind: &str, stem: &str, rust_canon: &str, path: &str) {
-    let boa_text =
-        std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("cannot read {path}: {e}")));
-    let boa = json::parse(boa_text.trim())
-        .unwrap_or_else(|e| die(&format!("{path}: invalid JSON: {e}")));
-    let boa_canon = boa.to_canonical();
-    if rust_canon == boa_canon {
-        eprintln!("ok: {stem} — Rust {kind} canon-equals boa");
-    } else {
-        eprintln!("MISMATCH {stem}:");
-        eprintln!("  rust: {rust_canon}");
-        eprintln!("  boa : {boa_canon}");
-        exit(1);
-    }
-}
-
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -144,13 +123,7 @@ fn main() {
                 }
             }
         }
-        Some("verify") => {
-            let stem = args.get(2).unwrap_or_else(|| die("usage: verify STEM BOA.json"));
-            let path = args.get(3).unwrap_or_else(|| die("usage: verify STEM BOA.json"));
-            let rust_canon = lookup_or_die(stem).to_json().to_canonical();
-            verify_against_boa("recipe", stem, &rust_canon, path);
-        }
-        _ => die("usage: td-recipe-eval list|emit|verify|check-list|check-count|check-script ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script ..."),
     }
 }
 
