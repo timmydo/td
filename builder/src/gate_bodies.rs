@@ -45,6 +45,7 @@ const NATIVE: &[&str] = &[
     "store-verify",
     "store-backend",
     "store-ns",
+    "recipe-rs",
 ];
 
 /// `td-builder gate-body <name>` — run one native gate body. Self-moves into
@@ -72,6 +73,7 @@ pub fn cli(name: &str) -> ExitCode {
         "store-verify" => store_verify(&root),
         "store-backend" => store_backend(&root),
         "store-ns" => store_ns(&root),
+        "recipe-rs" => recipe_rs(&root),
         other => Err(format!("gate-body: unknown native gate `{other}`")),
     };
     match res {
@@ -131,8 +133,8 @@ fn tb_out_env(tb: &Path, args: &[&str], envs: &[(&str, &str)], ctx: &str) -> Res
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// True if `tb <args...>` exits zero (for the discrimination legs that expect a
-/// NON-zero exit — corruption/verify-fail). stdout+stderr are discarded.
+/// True if `tb <args...>` exits zero (for the discrimination legs that expect
+/// a NON-zero exit — corruption/verify-fail). stdout+stderr discarded.
 fn tb_ok(tb: &Path, args: &[&str]) -> bool {
     Command::new(tb)
         .args(args)
@@ -147,16 +149,43 @@ fn tb_ok(tb: &Path, args: &[&str]) -> bool {
 /// Run an arbitrary tool, returning trimmed stdout on success (the generic
 /// subprocess oracle spawn for sqlite3 and staging helpers).
 fn run_out(program: &str, args: &[&str], ctx: &str) -> Result<String, String> {
-    let out = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
+    run_out_env(program, args, &[], ctx)
+}
+
+/// `run_out`, plus extra env vars set on the child (inheriting the rest of the
+/// current environment — never `env -i`, matching the bash gates' bare
+/// `VAR=val cmd` prefix form).
+fn run_out_env(program: &str, args: &[&str], envs: &[(&str, &str)], ctx: &str) -> Result<String, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdin(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd
         .output()
         .map_err(|e| format!("FAIL: {ctx}: cannot spawn {program}: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("FAIL: {ctx}: {program} {args:?} exited {}\n{err}", out.status));
+        let sout = String::from_utf8_lossy(&out.stdout);
+        return Err(format!(
+            "FAIL: {ctx}: {program} {args:?} exited {}\n{sout}{err}",
+            out.status
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The first `bin`-dir among `frags` (a `:`-joined PATH fragment, as
+/// `tools/provision-{rust,cc}.sh` print) that actually has an executable
+/// named `bin` — resolving the absolute binary path ourselves rather than
+/// leaning on `Command`'s PATH search (which uses the CURRENT process's PATH,
+/// not a child `.env("PATH", ..)` override).
+fn find_in_path_frags(frags: &str, bin: &str) -> Option<PathBuf> {
+    frags.split(':').map(Path::new).find_map(|d| {
+        let p = d.join(bin);
+        let exec = p.is_file() && file_mode(&p).ok().is_some_and(|mode| mode & 0o111 != 0);
+        exec.then_some(p)
+    })
 }
 
 /// `sqlite3 <db> <sql>` — the PARSER ORACLE for td's hand-written SQLite bytes
@@ -1496,6 +1525,105 @@ fn store_ns(root: &Path) -> Result<(), String> {
         "PASS: td owns its own root with its own store at /td/store — a static package runs from \
          /td/store in a rootless user namespace with /gnu/store and the guix install ABSENT. The \
          unmixed /td/store base the user package manager runs in (user-pm Phase 0)."
+    );
+    Ok(())
+}
+
+// --- recipe-rs (formerly tests/recipe-rs.sh) ----------------------------------
+
+/// recipe-rs — the Rust package + spec surface (the `recipes` crate) is
+/// self-consistent (rust-recipe-surface track). Builds + unit-tests the
+/// dependency-free `recipes` crate OFFLINE with a guix-free rust+cc toolchain
+/// (`tools/provision-{rust,cc}.sh` — a host-prep concern, not part of the
+/// rust-recipe-surface itself, so still shelled out to). The catalog's
+/// coverage (every recipe emits valid, round-tripping JSON) and
+/// discrimination (a mismatch is not vacuously accepted) legs are `#[test]`s
+/// in the `recipes` crate itself (`catalog::tests`, `td-recipe-eval::tests`)
+/// — `cargo test` below is what runs them; this function only additionally
+/// smokes the RELEASE binary's `list`/`emit` entry points (the CLI surface a
+/// live consumer, `ladder-lib.sh`'s `ladder_emit`, actually spawns).
+fn recipe_rs(root: &Path) -> Result<(), String> {
+    println!(
+        ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent (rust-recipe-surface)"
+    );
+
+    let rustpath = run_out("sh", &["tools/provision-rust.sh"], "provision-rust")?;
+    let ccpath = run_out("sh", &["tools/provision-cc.sh"], "provision-cc")?;
+    let cargo_bin = find_in_path_frags(&rustpath, "cargo")
+        .ok_or_else(|| format!("FAIL: no cargo in provision-rust output ({rustpath})"))?;
+
+    let scratch = fresh_scratch(root, ".recipe-rs-scratch")?;
+    let cargo_home = scratch.join("home");
+    let cargo_target = scratch.join("target");
+    std::fs::create_dir_all(&cargo_home).map_err(|e| format!("FAIL: mkdir {}: {e}", cargo_home.display()))?;
+    std::fs::create_dir_all(&cargo_target).map_err(|e| format!("FAIL: mkdir {}: {e}", cargo_target.display()))?;
+    let cargo_home_s = path_str(&cargo_home)?;
+    let cargo_target_s = path_str(&cargo_target)?;
+    let cargo_bin_s = path_str(&cargo_bin)?;
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{rustpath}:{ccpath}:{old_path}");
+    let envs: [(&str, &str); 3] = [
+        ("PATH", &new_path),
+        ("CARGO_HOME", &cargo_home_s),
+        ("CARGO_TARGET_DIR", &cargo_target_s),
+    ];
+
+    println!(
+        ">> build + unit-test the dependency-free td-recipe crate (offline, guix-free toolchain via tools/provision-{{rust,cc}}.sh)"
+    );
+    // The coverage (every recipe emits valid, round-tripping JSON) and
+    // discrimination (a mismatch is not vacuously accepted) legs are plain
+    // #[test]s in recipes/src/bin/td-recipe-eval.rs — same crate, same types,
+    // no subprocess/temp-file dance needed to exercise a property of the
+    // crate's own data. `cargo test` here is what actually runs them.
+    run_out_env(
+        &cargo_bin_s,
+        &["test", "--frozen", "--manifest-path", "recipes/Cargo.toml"],
+        &envs,
+        "cargo test recipes",
+    )?;
+    run_out_env(
+        &cargo_bin_s,
+        &["build", "--release", "--frozen", "--manifest-path", "recipes/Cargo.toml"],
+        &envs,
+        "cargo build recipes",
+    )?;
+
+    let eval = cargo_target.join("release/td-recipe-eval");
+    if !eval.is_file() {
+        return Err(format!("FAIL: td-recipe-eval was not built at {}", eval.display()));
+    }
+    let eval_s = path_str(&eval)?;
+
+    // CLI smoke: `cargo test` proves EVERY recipe's data is correct
+    // (catalog::tests::every_recipe_emits_canonical_json_and_round_trips runs
+    // `to_json().to_canonical()` on all of them) but never runs the RELEASE
+    // BINARY's argv dispatch, which is untested surface of its own (a typo in
+    // `main`'s `Some("emit") => ...` arm wouldn't fail any unit test). That
+    // dispatch doesn't branch per-stem, so one representative stem is enough
+    // to prove it — looping over the whole catalog here would just re-run
+    // `cargo test`'s own per-recipe assertion via a slower subprocess path.
+    // `emit` is also the one subcommand a live consumer (ladder-lib.sh's
+    // `ladder_emit`) actually spawns, so it's the entry point worth smoking.
+    println!(">> CLI smoke: the release td-recipe-eval binary's list/emit subcommands work");
+    let list_out = run_out(&eval_s, &["list"], "td-recipe-eval list")?;
+    let first = list_out
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "FAIL: empty recipe catalog (vacuous)".to_string())?;
+    let json = run_out(&eval_s, &["emit", first], &format!("emit {first}"))?;
+    if json.trim().is_empty() {
+        return Err(format!("FAIL: emit {first} produced no JSON"));
+    }
+    println!("   ok: list/emit {first} produced JSON via the release binary");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    println!(
+        "PASS: recipe-rs — the Rust package surface emits valid self-consistent JSON and \
+         discriminates a mismatch (recipes/src/bin/td-recipe-eval.rs unit tests), and the \
+         release binary's CLI entry points work. Correctness vs upstream is proven by \
+         recipe-owned package checks, not boa (retired)."
     );
     Ok(())
 }
