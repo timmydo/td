@@ -109,9 +109,12 @@ run_x86_64_native || fail "the native /td/store x86_64 toolchain failed to build
 ladder_intern_extra make-x86-64-source make-4.4.1 || fail "intern the pinned make 4.4.1 source"
 ladder_emit make-x86-64 make-test || fail "emit the make-x86-64/make-test recipes"
 ladder_lock make-x86-64 make-x86-64-source rung:gcc-x86-64-native rung:binutils-x86-64-native rung:glibc-x86-64 src:linux-headers-x86-64 tool:make $_bt || fail "compose the make-x86-64 lock"
-# make-test has no source (its Makefile is written in-step); its lock is make-x86-64 (rung) +
-# the base tools (ladder_lock always emits a -source line, so compose this one directly).
-{ echo "make-x86-64 /td/store/pending-make-x86-64"; for e in $_bt; do t=${e#tool:}; echo "$t $(ladder_map "$t") seed"; done; } > "$LW/locks/make-test-no-guix.lock" || fail "compose the make-test lock"
+# make-test writes its Makefile in-step, so it has no source of its OWN — but the engine's
+# assemble_recipe_drv REQUIRES a `<name>-source` lock entry (TD_SRC) for every non-stage0
+# build system. So alias an already-interned path as make-test-source: reuse the make 4.4.1
+# tarball (make-x86-64-source). make-test never unpacks it (no unpack step), so it's a harmless
+# staged input — the same pattern mesboot-headers uses (its source is linux-headers).
+ladder_lock make-test make-x86-64-source rung:make-x86-64 $_bt || fail "compose the make-test lock"
 ladder_build make-test || fail "build-plan --auto make-test — the built make failed its own build test"
 echo "PASS: make-test — GNU make 4.4.1 built on the native /td/store toolchain drove a real build in the recipe sandbox (a broken make would red this)"
 CHECK

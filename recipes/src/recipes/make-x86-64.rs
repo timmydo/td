@@ -80,6 +80,8 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
+        .env("CONFIG_SHELL", SH)
+        .env("SHELL", SH)
         .env("C_INCLUDE_PATH", &cip),
     );
     steps.push(
@@ -93,7 +95,9 @@ pub fn recipe() -> Recipe {
                 "prefix={out}",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", &path)
+        .env("CONFIG_SHELL", SH)
+        .env("SHELL", SH),
     );
     steps.push(Step::Require {
         paths: vec!["{out}/bin/make".into()],
