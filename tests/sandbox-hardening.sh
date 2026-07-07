@@ -20,8 +20,29 @@ tb=${1:?usage: sandbox-hardening.sh TD_BUILDER}
 realbash=$(readlink -f "$(command -v bash)")
 realsleep=$(readlink -f "$(command -v sleep)")
 
+store_root_for() {
+  case "$1" in
+    /*/store/*)
+      rest=${1#/}
+      first=${rest%%/*}
+      printf '/%s/store\n' "$first"
+      ;;
+    *)
+      echo "FAIL: $1 is not under a store root" >&2
+      exit 1
+      ;;
+  esac
+}
+
+sroot=$(store_root_for "$realbash")
+sleep_root=$(store_root_for "$realsleep")
+test "$sroot" = "$sleep_root" || {
+  echo "FAIL: bash and sleep resolved under different store roots: $realbash / $realsleep" >&2
+  exit 1
+}
+
 echo ">> (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input absent"
-"$tb" host-sandbox -- "$realbash" -c '
+"$tb" host-sandbox --store-from "$sroot" --store-at "$sroot" -- "$realbash" -c '
   [ -e /dev/null ] && [ -w /dev/null ]    || { echo "  no writable /dev/null";   exit 11; }
   [ -e /dev/zero ] && [ -e /dev/urandom ] || { echo "  missing /dev/zero|urandom"; exit 12; }
   for leak in kmsg kvm mem sda sdb nvme0n1 input/event0; do
@@ -51,7 +72,7 @@ sweep() {                         # SIGKILL any leftover marker-carrying procs
   done
 }
 
-"$tb" host-sandbox -- "$realbash" -c "$realsleep $marker & $realsleep $marker & wait" &
+"$tb" host-sandbox --store-from "$sroot" --store-at "$sroot" -- "$realbash" -c "$realsleep $marker & $realsleep $marker & wait" &
 top=$!
 for _ in $(seq 1 100); do [ "$(scan)" -ge 2 ] && break; sleep 0.1; done
 before=$(scan)
