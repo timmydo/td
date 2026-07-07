@@ -55,6 +55,7 @@ pub fn recipe() -> Recipe {
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
                 "--prefix=/td/store/make-4.4.1-x86_64",
+                "--disable-dependency-tracking",
                 "--disable-nls",
                 // make optionally links Guile for $(guile …); there is no guile input, so
                 // build it out explicitly (deterministic closure = glibc only).
