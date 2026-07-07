@@ -55,7 +55,7 @@ echo ">> cold leg (the feature): fresh cache, /var/guix bind-mounted EMPTY in a 
 printf '%s\n' 'mount --bind "$1" /var/guix || exit 9' \
               'test -z "$(ls -A /var/guix)" || { echo "cold leg: /var/guix not hidden" >&2; exit 9; }' \
               'exec sh tests/stage0-builder.sh "$2"' > "$scratch/cold.sh"; \
-cbc=`unshare -rm sh "$scratch/cold.sh" "$scratch/empty" "$scratch/cold"` \
+cbc=`"$tbw" userns-private -- sh "$scratch/cold.sh" "$scratch/empty" "$scratch/cold"` \
   || { echo "FAIL: cold stage0 placement with /var/guix hidden failed — the guix-less cold start is broken (#313)" >&2; exit 1; }; \
 test "$cbw" = "$cbc" || { echo "FAIL: cold placement $cbc != warm placement $cbw — provenance drift" >&2; exit 1; }; \
 tbc="$scratch/cold/store/`basename "$cbc"`/bin/td-builder"; \
