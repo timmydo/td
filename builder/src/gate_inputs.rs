@@ -39,7 +39,7 @@ pub(crate) fn env_var(name: &str) -> String {
 /// not a fourth copy) must BE the stem or be `<stem>-<version…>` with the
 /// version starting in a digit — so `bash` matches `bash-5.2.37`, not
 /// `bash-static-5.2.37`. A non-store-shaped basename is matched as-is.
-fn path_names_stem(path: &str, stem: &str) -> bool {
+pub(crate) fn path_names_stem(path: &str, stem: &str) -> bool {
     let name_ver = match crate::store::name_from_store_path(path) {
         Some(n) => n,
         None => path.rsplit('/').next().unwrap_or(path).to_string(),
