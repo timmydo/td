@@ -57,6 +57,21 @@ fn err(what: String) -> io::Error {
     io::Error::new(io::ErrorKind::Other, what)
 }
 
+/// Map exactly one uid/gid pair into a user namespace already entered via
+/// `unshare(2)`/`CLONE_NEWUSER` (a separate call — its flags and failure handling differ
+/// per caller, so this covers only the part that's IDENTICAL everywhere: the ordering-
+/// sensitive id-mapping triplet). Order matters: `setgroups` MUST be denied BEFORE the
+/// `gid_map` write — the kernel refuses an unprivileged gid_map write otherwise
+/// (CVE-2014-8989). `host_uid`/`host_gid` are the real ids as seen from OUTSIDE the
+/// namespace (the map's second column); `uid_target`/`gid_target` are what the process
+/// appears as INSIDE it (the map's first column).
+pub fn map_userns_id(host_uid: u32, host_gid: u32, uid_target: u32, gid_target: u32) -> io::Result<()> {
+    fs::write("/proc/self/setgroups", "deny")?;
+    fs::write("/proc/self/uid_map", format!("{uid_target} {host_uid} 1"))?;
+    fs::write("/proc/self/gid_map", format!("{gid_target} {host_gid} 1"))?;
+    Ok(())
+}
+
 /// A closure entry is either a bare CANONICAL store path or `CANONICAL\tON-DISK`.
 /// The canonical half is the `/gnu/store/<base>` path the build must SEE; the
 /// on-disk half is where the tree physically lives on the host to bind FROM. They
@@ -369,9 +384,7 @@ pub fn build(
             )?;
             // Map the guest ids before touching anything else so file
             // creation below happens as 30001/30000, not the overflow id.
-            fs::write("/proc/self/setgroups", "deny")?;
-            fs::write("/proc/self/uid_map", format!("{GUEST_UID} {host_uid} 1"))?;
-            fs::write("/proc/self/gid_map", format!("{GUEST_GID} {host_gid} 1"))?;
+            map_userns_id(host_uid, host_gid, GUEST_UID, GUEST_GID)?;
             // Fork: the child is PID 1 of the new PID namespace and does the mount
             // setup + (via std) exec of the builder; THIS process (the PID-ns
             // parent, still in the outer PID ns) only waits for it and propagates
@@ -668,8 +681,6 @@ pub fn host_shell(
                 sys::warn(b"td-builder host-sandbox: FAILED at unshare(NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS)\n");
                 e
             })?;
-            fs::write("/proc/self/setgroups", "deny")
-                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED writing /proc/self/setgroups\n"); e })?;
             // IDENTITY map (host uid/gid → itself), exactly like `guix shell -C`:
             // the process stays the NON-root host uid inside, so file-permission
             // checks (e.g. sqlite's access(W_OK) on the root-owned store DB)
@@ -677,10 +688,8 @@ pub fn host_shell(
             // then fail on the real write. tmpfs ownership is handled via the
             // `uid=/gid=` mount data instead. The daemon's SO_PEERCRED sees the
             // real host uid either way.
-            fs::write("/proc/self/uid_map", format!("{host_uid} {host_uid} 1"))
-                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED writing /proc/self/uid_map\n"); e })?;
-            fs::write("/proc/self/gid_map", format!("{host_gid} {host_gid} 1"))
-                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED writing /proc/self/gid_map\n"); e })?;
+            map_userns_id(host_uid, host_gid, host_uid, host_gid)
+                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED mapping the identity uid/gid\n"); e })?;
             // Own network namespace (offline by construction, like `guix shell
             // -C`); bring its loopback up to match that posture.
             sys::bring_loopback_up()

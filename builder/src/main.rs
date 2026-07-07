@@ -5934,17 +5934,16 @@ fn main() -> ExitCode {
         Some("userns-private") if args.len() >= 4 && args[2] == "--" => {
             let cmd = args[3].clone();
             let cmd_args: Vec<String> = args[4..].to_vec();
-            let run = || -> Result<(), String> {
+            // Returns Infallible on the Ok side: this only ever ends by exec'ing the
+            // command (which replaces the process and never returns here on success)
+            // or by producing an error — there is no success value to carry.
+            let run = || -> Result<std::convert::Infallible, String> {
                 let host_uid = sys::getuid();
                 let host_gid = sys::getgid();
                 sys::unshare(sys::CLONE_NEWUSER | sys::CLONE_NEWNS)
                     .map_err(|e| format!("unshare(NEWUSER|NEWNS): {e}"))?;
-                std::fs::write("/proc/self/setgroups", "deny")
-                    .map_err(|e| format!("setgroups: {e}"))?;
-                std::fs::write("/proc/self/uid_map", format!("0 {host_uid} 1"))
-                    .map_err(|e| format!("uid_map: {e}"))?;
-                std::fs::write("/proc/self/gid_map", format!("0 {host_gid} 1"))
-                    .map_err(|e| format!("gid_map: {e}"))?;
+                sandbox::map_userns_id(host_uid, host_gid, 0, 0)
+                    .map_err(|e| format!("map_userns_id: {e}"))?;
                 // Make the root mount tree private so a nested mount (e.g. the
                 // caller's `mount --bind ... /var/guix`) never propagates to the
                 // host — `unshare -m`'s actual behavior, not merely a fresh
@@ -5956,7 +5955,6 @@ fn main() -> ExitCode {
                 Err(format!("exec {cmd}: {err}"))
             };
             match run() {
-                Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: userns-private: {e}");
                     ExitCode::FAILURE
