@@ -442,13 +442,17 @@ tracking system, and all working notes live in the git log + PR body.
   AND run a second review with a *different* model driven from its CLI so a
   distinct model audits the same diff (catches blind spots one model shares with
   its own subagent). Run the cross-model reviewer at a strong model + high
-  reasoning effort. Claude runs Codex (gpt-5.5, xhigh):
-  `codex exec --model gpt-5.5-codex -c model_reasoning_effort="xhigh" --ephemeral "Review the current git diff for correctness bugs, regressions, security issues, edge cases, and missing tests. Do not edit files. Return prioritized findings with file/line references where possible."`
+  reasoning effort, and feed it the branch diff on stdin — a bare `git diff`
+  is empty once the branch is committed, so pipe `git diff origin/main...HEAD`
+  so the cross-model reviewer audits the same full branch diff the subagent
+  does. Claude runs Codex (gpt-5.5, xhigh):
+  `git diff origin/main...HEAD | codex exec --model gpt-5.5 -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible."`
   and Codex runs Claude (Opus 4.8, xhigh):
-  `claude -p --model opus --effort xhigh "Review the current git diff for correctness bugs, regressions, security issues, edge cases, and missing tests. Do not edit files. Return prioritized findings with file/line references where possible."`
+  `git diff origin/main...HEAD | claude -p --model opus --effort xhigh "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible."`
   (`--model`/`--effort` for `claude` — effort levels `low|medium|high|xhigh|max`;
-  `--model` + `-c model_reasoning_effort=…` for `codex` — swap in whichever model
-  and effort you want.)
+  `--model` + `-c model_reasoning_effort=…` for `codex`. Use `gpt-5.5`, not
+  `gpt-5.5-codex`, under a ChatGPT-account login; swap in whichever model and
+  effort you want.)
   — **post BOTH reviews' results as comments on the PR**; address their
   findings, posting each resulting fix as a **reply to the review comment and
   resolving the comment once the fix is done** (Workflow step 6 — MANDATORY for AI
