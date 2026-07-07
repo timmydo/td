@@ -9,21 +9,22 @@
 # build-recipes prelude into BASEDIR (content cached via CARGO_TARGET_DIR), then
 # read by cache-lib's `load_recipe_eval` and by every build gate via recipe-emit.sh.
 #
-# Offline + toolchain-only (the cargo-test pattern): `guix shell --no-substitutes
-# --no-offload rust rust:cargo gcc-toolchain` resolves the warm rust toolchain;
-# the crate has NO [dependencies] so `--frozen` touches no network. The rust
-# toolchain is the guix-built SEED (§5, retired last) — same status as the C
-# toolchain; this is `guix shell` provisioning, NOT a `guix build -e (system M) PKG`
-# packager site.
+# Offline + toolchain-only, GUIX-FREE (the cargo-test pattern): the HOST brings the
+# rust + C toolchain (human 2026-07-06), resolved by tools/provision-rust.sh +
+# tools/provision-cc.sh — the SAME resolvers the cargo-test gate uses (a PROVIDED
+# TD_RUST_HOME/TD_CC_HOME, or rustup/system cc, else the pinned lock seed). The
+# crate has NO [dependencies] so `--frozen` touches no network. No `guix shell`.
 set -eu
 
 base="${1:?usage: recipe-eval-tool.sh BASEDIR}"
 root=$(cd "$(dirname "$0")/.." && pwd)
 
+rustpath=`sh "$root/tools/provision-rust.sh"` || { echo "recipe-eval-tool: could not provision a rust toolchain (tools/provision-rust.sh)" >&2; exit 1; }
+ccpath=`sh "$root/tools/provision-cc.sh"` || { echo "recipe-eval-tool: could not provision a C toolchain (tools/provision-cc.sh)" >&2; exit 1; }
+
 mkdir -p "$base/home" "$base/target"
-GUIX="${TD_GUIX:-guix}"
+PATH="$rustpath:$ccpath:$PATH" \
 CARGO_HOME="$base/home" CARGO_TARGET_DIR="$base/target" \
-  $GUIX shell --no-substitutes --no-offload rust "rust:cargo" gcc-toolchain -- \
   cargo build --release --frozen --manifest-path "$root/recipes/Cargo.toml" >"$base/build.log" 2>&1 \
   || { echo "recipe-eval-tool: cargo build failed:" >&2; tail -20 "$base/build.log" >&2; exit 1; }
 

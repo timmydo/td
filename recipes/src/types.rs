@@ -34,6 +34,14 @@ pub enum BuildSystem {
     Cmake,
     Stage0,
     Mesboot,
+    /// The rust-toolchain TRANSFORM (#380): NOT a compile — the recipe's source is
+    /// a pinned upstream Rust release tarball and its inputs are the /td/store
+    /// x86_64 glibc/libgcc/libz; the engine's build::run_rust_toolchain extracts
+    /// rustc/cargo + the rustlib sysroot, co-locates the runtime closure, and
+    /// RELINKS the ELF interpreter onto td's own glibc loader (crate::elf, no
+    /// patchelf). A DECLARED-input, reproducible recipe — the first-class form of
+    /// the retired `toolchain-recipe rust-x86_64` shell subcommand.
+    RustToolchain,
 }
 
 impl BuildSystem {
@@ -44,6 +52,7 @@ impl BuildSystem {
             BuildSystem::Cmake => "cmake",
             BuildSystem::Stage0 => "stage0",
             BuildSystem::Mesboot => "mesboot",
+            BuildSystem::RustToolchain => "rust-toolchain",
         }
     }
 }
@@ -83,6 +92,10 @@ pub enum Step {
     /// Rewrite `#!/bin/sh`-style shebangs under dir to the given shell (the
     /// engine's own patch_shebangs — the sandbox has no /bin/sh).
     PatchShebangs { dir: String, shell: String },
+    /// Rewrite glibc text linker scripts under `dir/*.so`, stripping
+    /// `<prefix>/lib/` from their member names. Real ELF shared objects are
+    /// skipped by the engine's GNU-ld-script marker check.
+    RelocateLdScripts { dir: String, prefix: String },
     /// Assert products exist (and are executable files if exec) — fail HERE with
     /// a named path, not three rungs later.
     Require { paths: Vec<String>, exec: bool },
@@ -164,6 +177,13 @@ impl Step {
                 Json::Obj(vec![
                     ("dir".into(), Json::Str(dir.clone())),
                     ("shell".into(), Json::Str(shell.clone())),
+                ]),
+            )]),
+            Step::RelocateLdScripts { dir, prefix } => Json::Obj(vec![(
+                "relocateLdScripts".into(),
+                Json::Obj(vec![
+                    ("dir".into(), Json::Str(dir.clone())),
+                    ("prefix".into(), Json::Str(prefix.clone())),
                 ]),
             )]),
             Step::Require { paths, exec } => Json::Obj(vec![(
@@ -572,6 +592,12 @@ impl Recipe {
     /// engine's build::run_mesboot; `native_inputs` name the prior rungs.
     pub fn mesboot(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Mesboot)
+    }
+    /// The rust-toolchain TRANSFORM recipe (#380): `source` is the pinned upstream
+    /// Rust release tarball; `inputs` are the /td/store x86_64 glibc/libgcc/libz the
+    /// engine relinks against. No compile — see BuildSystem::RustToolchain.
+    pub fn rust_toolchain(name: &str, version: &str) -> Recipe {
+        Recipe::base(name, version, BuildSystem::RustToolchain)
     }
 
     pub fn native_inputs(mut self, xs: &[&str]) -> Recipe {

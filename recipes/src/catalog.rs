@@ -4,14 +4,14 @@
 //! self-discrimination twins deliberately share a recipe `name` with their base
 //! (e.g. `hello-perturbed` is name `hello`), so the stem is the stable key. The
 //! `recipe-rs` gate proves the surface is self-consistent and keeps the
-//! `tests/recipes-meta.json` census manifest in sync.
+//! `tests/recipes-meta.json` recipe manifest in sync.
 //!
 //! Each recipe lives in its own self-registering file `src/recipes/<stem>.rs`
 //! (github issue #295): the file name IS the stem, `pub fn recipe() -> Recipe`
 //! is the registration, and `build.rs` generates the stem-sorted registry
 //! (module declarations + the `all()` table) included below. Adding a recipe
-//! touches only its new file plus the shared regenerate-on-rebase census files
-//! (`tests/recipes-meta.json`, the guix-dependence baseline — issue #296): no
+//! touches only its new file plus the shared regenerate-on-rebase recipe
+//! manifest (`tests/recipes-meta.json` — issue #296): no
 //! Rust source line is shared, so parallel recipe PRs don't collide on a
 //! central table (the mk/gates/ one-file-per-entry property).
 
@@ -45,21 +45,6 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{stem}: emitted invalid JSON: {e}"));
             assert_eq!(reparsed.to_canonical(), canon, "{stem}: not idempotent");
             assert!(!r.name.is_empty() && !r.version.is_empty(), "{stem}: missing fields");
-        }
-    }
-
-    #[test]
-    fn perturbed_twins_diverge_from_their_base() {
-        // The self-discrimination property the corpus gates rely on: a perturbed
-        // twin must NOT serialise identically to its base.
-        let pairs = [
-            ("hello", "hello-perturbed"),
-            ("pkg-config", "pkg-config-perturbed"),
-        ];
-        for (base, pert) in pairs {
-            let b = lookup(base).unwrap().to_json().to_canonical();
-            let p = lookup(pert).unwrap().to_json().to_canonical();
-            assert_ne!(b, p, "{pert} did not diverge from {base}");
         }
     }
 

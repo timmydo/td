@@ -1,5 +1,5 @@
 //! A minimal, zero-dependency JSON reader — just enough to parse the recipe
-//! PHASE data `system/td-build.scm` hands the builder (DESIGN §7.1; the move
+//! PHASE data the td-native derivation contract hands the builder (DESIGN §7.1; the move
 //! toward td's own tooling: td's builder INTERPRETS the recipe's phases itself,
 //! rather than Guile pre-translating them). In keeping with td-builder's
 //! hand-rolled style (ATerm, NAR, SQLite, SHA-256 are all dependency-free), this

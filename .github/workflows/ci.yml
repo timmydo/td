@@ -1,30 +1,28 @@
 # CI gate for PRs into main (DESIGN §7.2 landing protocol).
 #
-# CI runs the FAST gates only. The full, slow loop runs on the dev machine.
+# Two GitHub-hosted required checks, both host-native — no Guix, no store image:
 #
-#   lint       — GitHub-hosted. Structural checks only (shell syntax, an
-#                unparseable channel pin, tabs in Scheme): no Guix, no warm
-#                store. Catches cheap breakage before anything heavier.
+#   lint       — Structural checks only: shell syntax (tests/ci/.github *.sh),
+#                the heal-revert primitive, and the no-tabs-in-Scheme convention.
+#                Catches cheap breakage before anything heavier.
 #
-#   check-fast — GitHub-hosted. Imports the SMALL td-ci-fast store image (~4G:
-#                the fast-tier closure only) and runs the UNMODIFIED offline
-#                cargo run --release --quiet --manifest-path builder/Cargo.toml -- check check-fast — the cheap derivation-level gates + the
-#                tsc type-check (Makefile FAST_GATES). The real hermetic loop,
-#                fast because the store is warm: import + lower + tsc in minutes,
-#                no KVM, no 41G.
+#   cargo-test — The td-native build ENGINE gate: `cargo test --frozen` over the
+#                dependency-free builder crate (drv parse/emit, store-path
+#                hashing, NAR framing, the SQLite store-db reader, ref-scan, the
+#                userns sandbox helpers). Offline, no deps, no guix, no store
+#                image — the runner's pre-installed Rust runs it in ~seconds.
 #
-# The SLOW gates (the marionette/VM boots, the system/OCI image builds, the
-# boa/td-builder --check rebuilds — everything in HEAVY_GATES not in FAST_GATES)
-# run via the default `./check.sh` ON THE DEV MACHINE, not here. Cold CI cannot
-# reliably rebuild the full closure: substitutes don't fully cover td's packages
-# and upstream sources rot (a GNU mirror served a hash-mismatched hello tarball),
-# so a from-scratch CI build of the 41G image is not dependable. Revisit moving
-# the full gate into CI once we're off the Guix dependency and can solve the
-# substitute/source-availability problem another way.
+# The guix-built CI store image + the `check-fast` sandbox job were retired
+# 2026-07-06 (github issue #415): the fast tier went empty when the guix gates
+# were deleted (#409), so `check-fast` was a vacuous no-op importing a ~4G image;
+# cargo-test is the real per-PR engine gate now. The heavy + daily tiers (the
+# from-source bootstrap ladder, the corpus, the /td/store harness) run on the
+# dev machine via `td-builder check` and nightly via ci/daily-full-suite.sh, not
+# here — cold CI cannot reliably rebuild the full closure.
 #
-# Nothing here weakens the loop: the gate ladder still lives only in the
-# Makefile, and `./check.sh` is unchanged and remains the authoritative gate —
-# it just runs on the dev machine for the heavy gates rather than in CI.
+# Nothing here weakens the loop: the authoritative gate ladder is `td-builder
+# check` (the gate runner), unchanged; CI is the cheap structural + engine
+# backstop, and affected-checks is the dev-machine PR gate.
 
 name: ci
 
@@ -60,15 +58,6 @@ jobs:
         # the revert reverses the suspect and the loop guard refuses to revert a
         # revert (DESIGN §7.2; tests/heal-revert.sh).
         run: bash tests/heal-revert.sh
-      - name: channels.scm carries a parseable 40-hex pin
-        # Same sed check.sh's integrity guard uses; an unparseable pin would
-        # make every runner check fail with a confusing message, so fail it
-        # here with a clear one.
-        run: |
-          set -eu
-          pin=$(sed -n 's/.*(commit *"\([0-9a-f]\{40\}\)").*/\1/p' channels.scm | head -n1)
-          test -n "$pin" || { echo "channels.scm: no parseable pinned commit" >&2; exit 1; }
-          echo "pinned channel commit: $pin"
       - name: convention — no tabs in Scheme sources
         # CLAUDE.md repo conventions: hand-formatted 2-space indentation, no
         # tabs (and never `guix style`). This is td's OWN-Scheme convention;
@@ -83,142 +72,17 @@ jobs:
           fi
           echo "no tabs in Scheme sources (vendored seed/ excluded)"
 
-  check-fast:
-    # Fast feedback gate: import the SMALL td-ci-fast store image and run the
-    # UNMODIFIED offline ./check.sh check-fast (Makefile FAST_GATES = the cheap
-    # derivation-level gates). Same mechanism as the (now local-only) full
-    # check, but a small image (fast-tier closure: no qemu/marionette, no qcow2;
-    # it DOES carry the pinned stage0 rust seed — tests/td-builder-rust.lock —
-    # since check.sh's loop container is provisioned by the cargo-compiled
-    # stage0 td-builder on every tier, workstream E #294) and no KVM — imports
-    # in minutes and runs the real hermetic loop.
-    #
-    # Image: ghcr.io/<owner>/td-ci-fast:<pin>, with the bot-namespace image as
-    # the current source (built on a dev box with ci/build-ci-image.sh
-    # TD_TIER=fast; cold CI can't rebuild it reliably — see header). check.sh
-    # guards `guix describe` == the pin, so a stale image fails loudly.
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: free disk + move /gnu, /var/guix and /tmp to the big partition
-        # The ~4G image + ~9.5G imported store live on /mnt's big partition, not
-        # the ~14G root. No KVM/marionette here, so the full-image headroom the
-        # local ./check.sh needs is not required.
-        run: |
-          set -eu
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-          sudo mkdir -p /mnt/gnu /mnt/var-guix /gnu /var/guix
-          sudo install -d -m 1777 /mnt/tmp
-          sudo mount --bind /mnt/gnu /gnu
-          sudo mount --bind /mnt/var-guix /var/guix
-          sudo mount --bind /mnt/tmp /tmp
-          df -h / /mnt
-      - name: install guix daemon + tools
-        # The distro daemon only BOOTSTRAPS the import; the check runs the pinned
-        # guix from the imported store. Ubuntu 23.10+ restricts unprivileged user
-        # namespaces, which td's own loop sandbox (`td-builder host-sandbox`, the
-        # sole loop container — check.sh runs check-fast inside it too) needs — lift
-        # it. (The fix-the-host policy: the runner runs the unmodified td-sandbox
-        # ./check.sh, no guix-shell-C fallback.)
-        run: |
-          set -eu
-          sudo apt-get update
-          sudo apt-get install -y guix skopeo jq
-          if ! getent group guixbuild >/dev/null; then
-            sudo groupadd --system guixbuild
-            for i in $(seq -w 1 10); do
-              sudo useradd -g guixbuild -G guixbuild -d /var/empty \
-                -s /usr/sbin/nologin -c "Guix build user $i" \
-                --system "guixbuilder$i"
-            done
-          fi
-          sudo systemctl start guix-daemon
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - name: pull the fast-tier CI store image for this pin
-        run: |
-          set -eu
-          pin=$(sed -n 's/.*(commit *"\([0-9a-f]\{40\}\)").*/\1/p' channels.scm | head -n1)
-          test -n "$pin" || { echo "channels.scm: no parseable pinned commit" >&2; exit 1; }
-          echo "pin: $pin"
-          sudo install -d -o "$(id -un)" /mnt/td-ci-fast
-          # Bot-namespace image (dev-box-built, public). The repo-namespace name
-          # is tried first so a future pipeline-published image takes over with
-          # no workflow change.
-          for src in "ghcr.io/${{ github.repository_owner }}/td-ci-fast:$pin" \
-                     "ghcr.io/timmydo-bot/td-ci-fast:$pin"; do
-            if skopeo copy --insecure-policy "docker://$src" "oci:/mnt/td-ci-fast:$pin"; then
-              echo "pulled $src"; exit 0
-            fi
-          done
-          echo "no fast CI store image published for pin $pin (build with ci/build-ci-image.sh TD_TIER=fast)" >&2
-          exit 1
-      - name: import the store
-        run: |
-          set -eu
-          ci/import-store.sh /mnt/td-ci-fast > /tmp/import.out
-          tail -n1 /tmp/import.out > /tmp/channel-out
-          echo "pinned profile: $(cat /tmp/channel-out)"
-          sudo rm -rf /mnt/td-ci-fast
-          df -h /mnt
-      - name: switch the daemon to the imported pinned guix + host-guix shim
-        # Run against the pinned daemon (avoids client/daemon protocol skew) and
-        # put a dev-box-shaped guix on PATH — the imported profile's bin/guix is
-        # a bare symlink that collapses check.sh's dirname-of-readlink guard.
-        run: |
-          set -eu
-          channel_out=$(cat /tmp/channel-out)
-          sudo systemctl stop guix-daemon
-          sudo nohup "$channel_out/bin/guix-daemon" \
-            --build-users-group=guixbuild >/tmp/daemon.log 2>&1 &
-          for i in $(seq 1 50); do
-            [ -S /var/guix/daemon-socket/socket ] && break; sleep 0.2
-          done
-          [ -S /var/guix/daemon-socket/socket ] \
-            || { echo "pinned daemon never came up:" >&2; cat /tmp/daemon.log >&2; exit 1; }
-          export PATH="$channel_out/bin:$PATH"
-          CHANNEL_OUT="$channel_out" guix repl ci/host-guix-shim.scm > /tmp/shim.out
-          host_guix=$(sed -n 's/^HOST_GUIX=//p' /tmp/shim.out)
-          test -x "$host_guix/bin/guix" && test -x "$host_guix/bin/guix-daemon" \
-            || { echo "host-guix shim came out malformed: '$host_guix'" >&2; exit 1; }
-          echo "$host_guix" > /tmp/host-guix
-      - name: warm the pinned stage0 seed into the store (host-prep; the loop is guix-free, #311)
-        # The loop's container-provider prelude (tests/cache-lib.sh provision_stage0)
-        # no longer realizes the stage0 toolchain seed with `guix build` (#311 — it
-        # resolves it from a td-subst store or FAILS CLOSED, no guix fallback). This
-        # guix-HAVING CI runner has no td-subst store, so it warms the seed OUT-OF-BAND
-        # here (tools/warm-stage0-seed.sh) — exactly the escape resolve-seed.sh's
-        # fail-closed message names — keeping the LOOP guix-free while the seed (the
-        # guix-built pin, retired last per the north star) is present when
-        # provision_stage0 runs. The image carries the seed COMPONENTS; gcc-toolchain is
-        # a cheap union guix realizes offline (the one path the image doesn't
-        # pre-materialize).
-        run: |
-          set -euo pipefail
-          export PATH="$(cat /tmp/host-guix)/bin:$PATH"
-          sh tools/warm-stage0-seed.sh
-      - name: run the fast tier (td-builder check check-fast, offline)
-        run: |
-          set -euo pipefail
-          export PATH="$(cat /tmp/host-guix)/bin:$PATH"
-          guix describe
-          cargo run --release --quiet --manifest-path builder/Cargo.toml -- check check-fast
-
   cargo-test:
     # The td-native build ENGINE gate — drv parse/emit, store-path hashing, NAR
     # framing, the SQLite store-db reader, ref-scan, and the userns sandbox helpers
-    # (builder/src/*.rs #[test]s). This is the heart of td (the thing replacing guix),
-    # yet it was in NO required CI check: `check-fast` runs the small td-ci-fast store
-    # image, which historically carried no rust toolchain (it now ships the pinned
-    # stage0 seed for check.sh's loop-container compile, #294 — but importing it just
-    # to `cargo test` would still be minutes of image import for a seconds-long job).
-    # This job closes that gap WITHOUT the image: the builder crate is
-    # dependency-free (builder/Cargo.toml has no [dependencies]), so the runner's
-    # pre-installed Rust runs `cargo test --frozen` (= --locked --offline) with no
-    # network, no guix, no store image — the same unit tests the dev-machine
-    # `cargo-test`/`check-engine` gate runs, now gated on every PR. (Add to the
-    # branch-protection required checks to make it blocking — see BRANCH-PROTECTION.md.)
+    # (builder/src/*.rs #[test]s). This is the heart of td (the thing replacing guix)
+    # and is now a REQUIRED per-PR check (it replaced the retired `check-fast` sandbox
+    # job — github issue #415). No image: the builder crate is dependency-free
+    # (builder/Cargo.toml has no [dependencies]), so the runner's pre-installed Rust
+    # runs `cargo test --frozen` (= --locked --offline) with no network, no guix, no
+    # store image — the same unit tests the dev-machine `cargo-test`/`check-engine`
+    # gate runs. (Required-checks list: .github/setup-branch-protection.sh —
+    # the maintainer applies it; see BRANCH-PROTECTION.md.)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -230,3 +94,17 @@ jobs:
           cargo test --frozen --manifest-path builder/Cargo.toml 2>&1 | tee /tmp/cargo-test.log
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/cargo-test.log \
             || { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }
+
+  check-fast:
+    # TEMPORARY no-op. The guix store-image `check-fast` tier was retired (#415),
+    # but branch protection still lists `check-fast` as a REQUIRED status context,
+    # so a real merge is blocked until an admin re-runs
+    # .github/setup-branch-protection.sh (which drops it, keeping lint + cargo-test).
+    # This placeholder reports the required context green in the meantime — the real
+    # per-PR engine gate is `cargo-test` above. DELETE this job once branch
+    # protection no longer requires `check-fast`.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: check-fast retired — no-op placeholder (#415)
+        run: echo "check-fast is retired (#415); the real per-PR gate is cargo-test. Re-apply .github/setup-branch-protection.sh to drop this required context, then delete this job."

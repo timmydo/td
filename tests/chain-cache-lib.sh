@@ -25,8 +25,8 @@
 # Mechanism (the cache-lib pattern applied to chain bricks — sharing never weakens the
 # gates: every behavioral/repro assertion still runs per gate; only redundant REBUILDS go):
 #   * CHAIN KEY: sha256 over the chain recipe + every pinned input (locks, patches, seed
-#     tree, channels.scm — the host-toolchain pin). ANY change re-keys the whole chain —
-#     a stale brick can never be served across a recipe, pin, or host-toolchain change.
+#     tree — the pinned inputs). ANY change re-keys the whole chain —
+#     a stale brick can never be served across a recipe, lock, or seed change.
 #     `sha256sum --` fails on any unreadable/missing input (never a bogus empty-input key).
 #   * BRICKS build ONCE, at stable paths under $TD_CHECK_CHAIN_CACHE/<key>/ (paths are
 #     baked into later bricks' binaries — interp, symlinks — so bricks must never move;
@@ -42,7 +42,7 @@
 #     replace; a shared-lock fast path is not worth the upgrade races.)
 #   * WHOLE-KEY GC (#326): each key dir carries a `last-used` stamp, re-touched on every
 #     chain_cache_init. A key not used for TD_CHECK_CHAIN_GC_DAYS (default 14) is a
-#     multi-GB orphan from a superseded (recipe, pin, channels.scm) tuple — nothing ever
+#     multi-GB orphan from a superseded (recipe, lock, seed) tuple — nothing ever
 #     prunes INSIDE a key (brick paths are baked into later bricks), so reclamation must be
 #     whole-key. chain_cache_init sweeps stale keys AFTER taking its own lock+stamp; each
 #     candidate is removed ONLY while its own exclusive .lock can be taken non-blocking, so

@@ -41,7 +41,7 @@ export TD_STAGE0_BASE="`pwd`/.td-build-cache/td-shell"
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 export TD_STORE_DIR=/td/store
 snwork=`mktemp -d`
-trap 'rm -rf "$snwork" "${nrout:-}"' EXIT INT TERM
+trap 'rm -rf "$snwork"' EXIT INT TERM
 
 # the closure store: a FRESH /td/store own-root that holds the fetched/built cross closure components
 # (as siblings, so the cross gcc tooldir's relative as/ld symlinks resolve).

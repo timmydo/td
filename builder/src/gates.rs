@@ -33,9 +33,10 @@
 //! parser used to check — a malformed gate is a build error, never a mis-run.
 //!
 //! A GateDef's `script` is PLAIN BASH (no make escaping), executed as one
-//! `bash -c` with cwd = repo root and TD_GUIX exported (the pinned
-//! `guix time-machine -C channels.scm --` prefix the remaining guix-surface
-//! invocations go through). Output is buffered per gate (`--output-sync=target`
+//! `bash -c` with cwd = repo root. (The remaining deferred corpus/seed gates
+//! realize their guix-built seed by calling host `guix` directly — the seed
+//! bytes retire last per the north star / #412.) Output is buffered per gate
+//! (`--output-sync=target`
 //! parity), first red stops new gates while running ones drain, and timing
 //! events keep the exact per-gate START/END line format the native report
 //! reducer (gate_timing.rs) reads.
@@ -47,9 +48,6 @@ use std::process::ExitCode;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// `$TD_GUIX` — the pinned time-machine prefix every remaining guix invocation in
-/// a gate body goes through (exported to every gate).
-pub const GUIX_CMD: &str = "guix time-machine -C channels.scm --";
 /// The synthetic build-phase node (the former Makefile `build-recipes` target).
 const BUILD_RECIPES: &str = "build-recipes";
 
@@ -158,9 +156,10 @@ pub struct GateDef {
     /// Non-blocking (allow-failure) tag: when a tagged gate FAILS the runner
     /// TOLERATES it — no fail-fast, and the run is not reded by it (it is reported
     /// as a non-blocking failure). A tagged gate that PASSES is unaffected (still
-    /// full coverage). Used for the gates that fail when the host guix != the
-    /// channels.scm pin, so a pin-drifted host is not blocked by them while a
-    /// correctly-pinned host still runs and covers them normally.
+    /// full coverage). Used for the deferred corpus/seed gates that depend on
+    /// host guix realizing their guix-built seed (`guix build`): a host that
+    /// cannot satisfy that is not blocked by them, while a host that can still
+    /// runs and covers them normally.
     pub non_blocking: bool,
     /// The gate body: plain bash, run as one `bash -c` from the repo root.
     pub script: &'static str,
@@ -368,8 +367,9 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
         inputs: Vec::new(),
         store: StoreMode::Shared,
         // build-recipes builds the corpus via the guix-seeded daemon — it fails
-        // when host guix != pin, so it is non-blocking too (its SoftFailed still
-        // satisfies its BUILD_GATE dependents' readiness).
+        // on a host that cannot realize the guix-built seed, so it is non-blocking
+        // too (its SoftFailed still satisfies its BUILD_GATE dependents'
+        // readiness).
         non_blocking: true,
     };
     set.index.insert(BUILD_RECIPES.to_string(), set.gates.len());
@@ -439,6 +439,14 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
                     }
                 }
                 "check-fast" => {
+                    // LOCAL-ONLY, VACUOUS: the Cheap + Fast pools are both empty (the
+                    // fast tier's former content — the cheap guix gates
+                    // eval/guix-dependence/guix-surface — is gone, #409), so check-fast
+                    // expands to {} and passes as a no-op (run_selected treats an empty
+                    // selection as a pass). There is no hosted `check-fast` CI job; the
+                    // per-PR engine check is the HOST `cargo-test` job. The keyword is
+                    // kept only so existing tooling/goal-lists don't break; running it
+                    // locally proves nothing.
                     add_pool(&mut sel, Pool::Cheap);
                     add_pool(&mut sel, Pool::Fast);
                 }
@@ -1046,7 +1054,6 @@ fn run_gate(
             c
         };
         cmd.current_dir(root)
-            .env("TD_GUIX", GUIX_CMD)
             .env("TD_GATE_GOALS", goal_words)
             .stdout(std::process::Stdio::from(out))
             .stderr(std::process::Stdio::from(err));
@@ -1292,7 +1299,12 @@ fn lock_sched<'a>(m: &'a Mutex<Sched>) -> std::sync::MutexGuard<'a, Sched> {
 /// Run the selected nodes. Returns Ok(true) if everything passed.
 fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Result<bool, String> {
     if selected.is_empty() {
-        return Err("gate-run: nothing selected".to_string());
+        // A tier keyword can legitimately expand to NO gates — e.g. check-system
+        // after the guix OCI-image gates retired left the System pool empty. Nothing
+        // to run is a PASS, not an error; the REQUIRED check-fast tier is held
+        // non-empty by the every_tier_keyword_* registry test, not by this guard.
+        eprintln!("gate-run: no gates selected for the given goals — nothing to run");
+        return Ok(true);
     }
     std::fs::create_dir_all(&cfg.log_dir)
         .map_err(|e| format!("gate-run: cannot create {}: {e}", cfg.log_dir.display()))?;
@@ -1793,53 +1805,44 @@ mod tests {
         // including the guix td-builder package build (unlike the old
         // repo-tree-reading parser tests, which had to skip there).
         let set = load().unwrap();
-        // The pools the Makefile assembled on the day of the cutover (the counts
-        // only grow as gates are added; membership spot-checks are structural).
-        let cheap = set.names(Pool::Cheap);
-        // Membership + relative order, NOT exact vectors: adding a gate must
-        // never require touching this file (the one-file-per-gate property).
-        let pos = |n: &str| cheap.iter().position(|x| x == n);
-        let (e, gd, gs) = (pos("eval"), pos("guix-dependence"), pos("guix-surface"));
-        assert!(e.is_some() && gd.is_some() && gs.is_some(), "cheap chain lost a member");
-        assert!(e < gd && gd < gs, "cheap chain order changed");
+        // The cheap serial-first tier is currently EMPTY: its only members were the
+        // guix-oracle gates (eval/guix-dependence/guix-surface), retired under the
+        // keep/retire rule (AGENTS.md "Test the feature, not the possibility"). The
+        // scheduler handles an empty cheap pool — last_cheap is None, so heavy gates
+        // carry no serial-barrier dep and start subject to the slot pool. A future
+        // cheap gate may be added without touching this file.
         // The heavy/daily split (the ~10-min per-PR budget, human 2026-07-04):
         // heavy = PR-sized behavioral gates, daily = the slow from-seed rungs +
         // from-source corpus the daily backstop covers. Together they are the
         // full check — the split may move members but never lose one.
         let heavy = set.names(Pool::Heavy);
         let daily = set.names(Pool::Daily);
-        assert!(heavy.len() >= 45, "heavy (PR) pool shrank: {}", heavy.len());
-        assert!(daily.len() >= 40, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 85, "the full check lost gates");
-        for g in ["bootstrap", "td-subst", "cargo-test", "recipe-checks", "td-shell"] {
+        // Thresholds ratchet DOWN as guix gates retire (the guix-removal workstream).
+        // The guix-SEEDED corpus (recipe-checks/recipe-checks-daily + the 35 corpus
+        // recipes) and the guix seed-capture/td-shell/subst gates were deleted — they
+        // built packages on guix's gcc-toolchain/rust, not td's mes-rooted /td/store
+        // toolchain — leaving only the /td/store store-native ladder, the store
+        // primitives, and the engine. These guard against ACCIDENTAL loss, not
+        // deliberate retirement — lower them in the same PR that removes gates.
+        assert!(heavy.len() >= 19, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
+        assert!(daily.len() >= 32, "daily pool shrank: {}", daily.len());
+        assert!(heavy.len() + daily.len() >= 51, "the full check lost gates");
+        for g in ["cargo-test", "store-verify"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
-        for g in ["bootstrap-gcc-mesboot", "recipe-checks-daily", "rust-userland-x86_64-store-native"] {
+        for g in ["bootstrap-gcc-mesboot"] {
             assert!(daily.iter().any(|n| n == g), "missing daily gate {g}");
         }
         assert!(set.names(Pool::Engine).iter().any(|n| n == "cargo-test"));
-        let system = set.names(Pool::System);
-        for g in ["oci-native", "rust-userland-image"] {
-            assert!(system.iter().any(|n| n == g), "missing system gate {g}");
-        }
-        // Fragment-declared specs feed the synthetic build-recipes node.
-        for s in ["hello"] {
-            assert!(set.build_specs.iter().any(|x| x == s), "missing build spec {s}");
-        }
-        // Typed artifact inputs (#353): the first cut-over gate declares its
-        // inputs instead of grepping locks in shell.
-        let tsd = set.gates.iter().find(|g| g.name == "toolchain-subst-default").unwrap();
-        assert_eq!(tsd.inputs.len(), 2, "toolchain-subst-default lost its declared inputs");
-        assert!(tsd.inputs.iter().any(|i| i.name == "coreutils"));
-        assert!(tsd.inputs.iter().any(|i| i.name == "bash-static"));
-        // The explicit fragment dep survived; the derived graph holds.
-        let fs = set.gates.iter().find(|g| g.name == "feed-shared").unwrap();
-        assert!(fs.deps.iter().any(|d| d == "td-feed"));
-        let gs = set.gates.iter().find(|g| g.name == "guix-surface").unwrap();
-        assert!(gs.deps.iter().any(|d| d == "guix-dependence"));
-        let ts = set.gates.iter().find(|g| g.name == "td-subst").unwrap();
-        assert!(ts.deps.iter().any(|d| d == BUILD_RECIPES));
-        assert!(ts.deps.iter().any(|d| d == "guix-surface"));
+        // (The System pool is EMPTY since the guix OCI-image gates retired; check-system
+        // legitimately expands to {}. The build_specs corpus is empty since the
+        // guix-seeded recipe-checks retired — build-recipes is now a corpus-free stage0 +
+        // recipe-eval prelude only.)
+        // Typed artifact inputs (#353): a KEEP store-native gate declares its lock inputs
+        // instead of grepping locks in shell.
+        let sp = set.gates.iter().find(|g| g.name == "store-persist").unwrap();
+        assert!(sp.inputs.iter().any(|i| i.name == "bash-static"), "store-persist lost its declared inputs");
+        // The derived graph holds: the synthetic build-recipes prelude node is present.
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(br.extra_env.iter().any(|(k, _)| k == "TD_BUILD_SPECS"));
         // Every bash body is non-empty plain bash (no make-isms survived
@@ -1876,6 +1879,27 @@ mod tests {
     }
 
     #[test]
+    fn every_tier_keyword_selects_a_nonempty_set_against_the_real_registry() {
+        // A tier keyword that expands to {} makes `run_selected` error with
+        // "nothing selected" and exit non-zero. For check-fast that is fatal —
+        // it is the REQUIRED CI status check (.github/setup-branch-protection.sh),
+        // so an empty expansion reds it on every PR and blocks all merges. The
+        // earlier expand_goals tests use synthetic pools (synth(...)); this one
+        // runs the REAL load() registry so emptying a pool (as retiring the whole
+        // Cheap pool did) cannot slip through. Guards the check-fast → Engine fold.
+        let set = load().unwrap();
+        // check-fast and check-system are intentionally omitted: their pools are empty
+        // since the guix gates that populated them (the cheap fast-tier gates; the OCI
+        // image gates) retired, so both legitimately expand to {} and PASS as a no-op
+        // (run_selected treats empty as a pass). check-engine/check-pr/check MUST stay
+        // non-empty — they carry the real per-PR + full coverage.
+        for goal in ["check-engine", "check-pr", "check"] {
+            let sel = expand_goals(&set, &[goal.to_string()]).unwrap();
+            assert!(!sel.is_empty(), "tier keyword `{goal}` expanded to the empty set");
+        }
+    }
+
+    #[test]
     fn build_recipes_specs_scope_to_the_selection() {
         let br_specs = |set: &GateSet| {
             set.gates
@@ -1885,24 +1909,12 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .unwrap()
         };
-        // A single spec-carrying gate scopes the phase to its own spec.
+        // The guix-seeded corpus (the only spec-carrying gates) retired, so build_specs
+        // is empty and scoping is a no-op — the point now is that the build-recipes
+        // PRELUDE body (stage0 seed + td-recipe-eval; load_recipe_eval fails-fast without
+        // its sentinel) still runs for a build_gate selection, never no-op'd.
         let mut set = load().unwrap();
-        let goals = vec!["recipe-checks".to_string()];
-        let sel = expand_goals(&set, &goals).unwrap();
-        scope_build_recipes(&mut set, &sel, &goals);
-        assert_eq!(br_specs(&set), "hello");
-        // The full check keeps the whole pool, byte-identical to the static env.
-        let mut set = load().unwrap();
-        let all = set.build_specs.join(" ");
-        let goals = vec!["check".to_string()];
-        let sel = expand_goals(&set, &goals).unwrap();
-        scope_build_recipes(&mut set, &sel, &goals);
-        assert_eq!(br_specs(&set), all);
-        // A spec-less selection (a store-DB gate builds its subject in-gate)
-        // scopes the pre-build to nothing, but the BODY still runs — it is the
-        // build-gate prelude (stage0 seed + td-recipe-eval; load_recipe_eval
-        // fails-fast without its sentinel), so it must never be no-op'd.
-        let mut set = load().unwrap();
+        assert!(set.build_specs.is_empty(), "no corpus specs after the guix-corpus retirement");
         let goals = vec!["store-verify".to_string()];
         let sel = expand_goals(&set, &goals).unwrap();
         scope_build_recipes(&mut set, &sel, &goals);
@@ -1997,7 +2009,8 @@ mod tests {
     #[test]
     fn non_blocking_gate_failure_is_tolerated_and_does_not_fail_fast() {
         // A `non_blocking` gate that FAILS must not red the run and must not stop
-        // other gates (the guix-pin gates, on a drifted host).
+        // other gates (the deferred corpus/seed gates, on a host that cannot
+        // realize the guix-built seed).
         let d = tmpdir("nonblock");
         let mut set = synth(
             &d,
@@ -2442,28 +2455,20 @@ mod tests {
         private.sort_unstable();
         // The DELIBERATE cold-store audit (#317): exactly the gates whose feature is
         // clean-slate behavior. Tagging a new gate Private means extending this list in
-        // the same PR — a conscious act, like the one-way guix-surface ratchets.
+        // the same PR — a conscious, reviewed act (directive 3).
         assert_eq!(
             private,
             vec![
                 "bootstrap-seed",
-                "build-hermetic",
                 "chain-cache",
-                "corpus-seed",
-                "harness-seed",
-                "rust-seed",
                 "sandbox-hardening",
-                "seed-build",
-                "seed-unpack",
                 "store-gc",
                 "store-gc-sweep",
-                "td-offline",
-                "td-shell-seed",
             ]
         );
         // The default is Shared — the #317 flip: warm machine-wide state unless a gate
         // declares that cold IS its feature.
-        for g in ["store-persist", "bootstrap", "recipe-checks"] {
+        for g in ["store-persist", "store-verify"] {
             let gate = set.gates.iter().find(|x| x.name == g).unwrap();
             assert_eq!(gate.store, StoreMode::Shared, "{g} must default Shared");
         }

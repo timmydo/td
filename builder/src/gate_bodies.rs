@@ -4,7 +4,7 @@
 //! A gate whose `GateDef.script` is EMPTY is "native": the gate runner
 //! (`gates.rs::run_gate`) execs `<current_exe> gate-body <name>` in the exact
 //! same memory-limited wrapper (`prlimit --data`, the per-gate cgroup, its own
-//! process group, TD_GUIX / TD_CHECK_CHAIN_CACHE / TD_GATE_SPECS env) it uses
+//! process group, TD_CHECK_CHAIN_CACHE / TD_GATE_SPECS env) it uses
 //! for bash gates. `current_exe` is the stage0 td-builder in the loop (the
 //! prelude execs `<stage0> … gate-run`), so a native body gets `tb` = its own
 //! binary for free — no `load_stage0` shell dance for the td-builder under test.
@@ -21,13 +21,8 @@
 //! content scan, and stages a self-contained td-owned store for the gates'
 //! store ops. External tools spawned by these bodies are ORACLES or artifacts
 //! (`sqlite3` validating td's hand-written DB bytes, `cp -a`/`chmod` staging
-//! trees, `guix build` as store-relocate's one-time relocation source) — the
-//! gate LOGIC (every assertion) is typed Rust.
-//!
-//! guix-surface note: store_relocate's `/var/guix/db` read + `guix build`
-//! relocation source moved here VERBATIM from tests/store-relocate.sh — the
-//! existing ratcheted surface relocated, not new surface (directive 6). This
-//! file is IN tests/guix-surface.sh's scan scope so the census keeps seeing it.
+//! trees) — the gate LOGIC (every assertion) is typed Rust. No body spawns a
+//! guix process.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -50,7 +45,6 @@ const NATIVE: &[&str] = &[
     "store-verify",
     "store-backend",
     "store-ns",
-    "store-relocate",
 ];
 
 /// `td-builder gate-body <name>` — run one native gate body. Self-moves into
@@ -78,7 +72,6 @@ pub fn cli(name: &str) -> ExitCode {
         "store-verify" => store_verify(&root),
         "store-backend" => store_backend(&root),
         "store-ns" => store_ns(&root),
-        "store-relocate" => store_relocate(&root),
         other => Err(format!("gate-body: unknown native gate `{other}`")),
     };
     match res {
@@ -115,9 +108,16 @@ fn tb() -> Result<PathBuf, String> {
 /// Run `tb <args...>`, returning trimmed stdout on success. On a non-zero exit
 /// the error carries `<ctx>` and the child's stderr (the bash `2>&1` tail).
 fn tb_out(tb: &Path, args: &[&str], ctx: &str) -> Result<String, String> {
-    let out = Command::new(tb)
-        .args(args)
-        .stdin(Stdio::null())
+    tb_out_env(tb, args, &[], ctx)
+}
+
+fn tb_out_env(tb: &Path, args: &[&str], envs: &[(&str, &str)], ctx: &str) -> Result<String, String> {
+    let mut cmd = Command::new(tb);
+    cmd.args(args).stdin(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd
         .output()
         .map_err(|e| format!("FAIL: {ctx}: cannot spawn td-builder: {e}"))?;
     if !out.status.success() {
@@ -145,7 +145,7 @@ fn tb_ok(tb: &Path, args: &[&str]) -> bool {
 }
 
 /// Run an arbitrary tool, returning trimmed stdout on success (the generic
-/// subprocess oracle spawn — sqlite3, guix build, …).
+/// subprocess oracle spawn for sqlite3 and staging helpers).
 fn run_out(program: &str, args: &[&str], ctx: &str) -> Result<String, String> {
     let out = Command::new(program)
         .args(args)
@@ -570,12 +570,11 @@ fn store_subject(s0: &Stage0, root: &Path, scratch: &Path) -> Result<Subject, St
 // --- the gate bodies ---------------------------------------------------------
 
 /// store-add — td PLACES a text path into its OWN store + registers it (pure
-/// Rust, no daemon in the write path), differential vs the daemon's
-/// addTextToStore. Faithful port of gate_defs/280-store-add.rs's bash.
+/// Rust, no daemon in the write path).
 fn store_add(root: &Path) -> Result<(), String> {
     println!(
-        ">> store-add: td PLACES a text path into its OWN store + registers it (pure Rust, no \
-         daemon in the write path) — differential vs the daemon's addToStore"
+        ">> store-add: td PLACES a /td/store text path into its OWN store + registers it (pure \
+         Rust, no daemon in the write path)"
     );
     let tb = stage0_from_memo(root)?.tb;
 
@@ -589,29 +588,25 @@ fn store_add(root: &Path) -> Result<(), String> {
     let name = "td-store-add-probe";
     let content_s = path_str(&content)?;
 
-    // The daemon (oracle) addTextToStore: writes to /gnu/store, returns the path.
-    let daemon_path =
-        tb_out(&tb, &["store-add", name, &content_s], "the daemon (oracle) addTextToStore")?;
-    if daemon_path.is_empty() {
-        return Err("FAIL: the daemon (oracle) returned no path for addTextToStore".into());
-    }
-    if !Path::new(&daemon_path).is_file() {
-        return Err(format!(
-            "FAIL: the daemon did not write its store file {daemon_path} (oracle missing)"
-        ));
-    }
-    println!(">> daemon (oracle) addTextToStore wrote: {daemon_path}");
-
     // td computes + writes + registers the SAME path itself, no daemon.
     let store_s = path_str(&store)?;
     let tddb = scratch.join("td.db");
     let tddb_s = path_str(&tddb)?;
-    let td_path =
-        tb_out(&tb, &["store-add-text", name, &content_s, &store_s, &tddb_s], "td store-add-text")?;
-    if td_path != daemon_path {
-        return Err(format!("FAIL: td computed {td_path} != the daemon's {daemon_path}"));
+    let td_path = tb_out_env(
+        &tb,
+        &["store-add-text", name, &content_s, &store_s, &tddb_s],
+        &[("TD_STORE_DIR", "/td/store")],
+        "td store-add-text (/td/store)",
+    )?;
+    let content_bytes = std::fs::read(&content)
+        .map_err(|e| format!("FAIL: read {}: {e}", content.display()))?;
+    let expected_path = "/td/store/acs7ncyflz0ms0wfcd0vlvrcirn5fhp1-td-store-add-probe";
+    if td_path != expected_path {
+        return Err(format!(
+            "FAIL: td computed {td_path} != the fixed addTextToStore known vector {expected_path}"
+        ));
     }
-    println!("   td computed the SAME store path as the daemon (no daemon in td's path computation)");
+    println!("   td computed the fixed addTextToStore known-vector path");
 
     let base = base_of(&td_path);
     let td_file = store.join(&base);
@@ -622,29 +617,28 @@ fn store_add(root: &Path) -> Result<(), String> {
     if mode != 0o444 {
         return Err(format!("FAIL: td's store file mode {mode:o} != 444 (canonical read-only)"));
     }
+    let written = std::fs::read(&td_file)
+        .map_err(|e| format!("FAIL: read td store file {}: {e}", td_file.display()))?;
+    if written != content_bytes {
+        return Err("FAIL: td's store file bytes differ from the input content".into());
+    }
     println!("   td WROTE the store file itself, canonical mode 0444 (no daemon in the write path)");
 
-    // Byte-identity by NAR hash (metadata-independent).
+    // NAR hash is metadata-independent over the canonical store file.
     let td_file_s = path_str(&td_file)?;
-    let oracle_hash = tb_out(&tb, &["nar-hash", &daemon_path], "nar-hash of the daemon's store file")?;
     let td_file_hash = tb_out(&tb, &["nar-hash", &td_file_s], "nar-hash of td's store file")?;
-    if td_file_hash != oracle_hash {
-        return Err(format!(
-            "FAIL: td's store bytes NAR-hash {td_file_hash} != the daemon's store file {oracle_hash}"
-        ));
-    }
-    println!("   td's store file is byte-identical (NAR) to the daemon's own: {oracle_hash}");
+    println!("   td's store file NAR hash is {td_file_hash}");
 
     // td's registration, read back by TD'S OWN reader.
     let td_reg = tb_out(&tb, &["store-query", &tddb_s, "info"], "td store-query (td's own reader)")?;
     let mut fields = td_reg.split('|');
     let reg_path = fields.next().unwrap_or("");
     let reg_hash = fields.next().unwrap_or("");
-    if reg_path != daemon_path {
-        return Err(format!("FAIL: td registered path {reg_path} != {daemon_path}"));
+    if reg_path != td_path {
+        return Err(format!("FAIL: td registered path {reg_path} != {td_path}"));
     }
-    if reg_hash != oracle_hash {
-        return Err(format!("FAIL: td registered hash {reg_hash} != the daemon-equivalent {oracle_hash}"));
+    if reg_hash != td_file_hash {
+        return Err(format!("FAIL: td registered hash {reg_hash} != td's NAR hash {td_file_hash}"));
     }
     println!(
         "   td's registration (read back by TD'S OWN reader) records the path + the NAR hash of \
@@ -653,11 +647,10 @@ fn store_add(root: &Path) -> Result<(), String> {
 
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
-        "PASS: td PLACED a path into its OWN store and REGISTERED it ITSELF, in pure Rust with NO \
-         daemon in the write path — td computed the IDENTICAL store path to the daemon's \
-         addTextToStore, WROTE a store file (canonical mode 0444) BYTE-IDENTICAL (by NAR hash) to \
-         the daemon's own store file, and its registration (read back by TD'S OWN reader) records \
-         that path + the hash of what td wrote. The daemon is only the oracle."
+        "PASS: td PLACED a /td/store path into its OWN store and REGISTERED it ITSELF, in pure Rust with NO \
+         daemon in the write path — td computed the addTextToStore path, wrote the exact content \
+         as a canonical 0444 store file, and its registration (read back by TD'S OWN reader) \
+         records that path + the NAR hash of what td wrote."
     );
     Ok(())
 }
@@ -1503,88 +1496,6 @@ fn store_ns(root: &Path) -> Result<(), String> {
         "PASS: td owns its own root with its own store at /td/store — a static package runs from \
          /td/store in a rootless user namespace with /gnu/store and the guix install ABSENT. The \
          unmixed /td/store base the user package manager runs in (user-pm Phase 0)."
-    );
-    Ok(())
-}
-
-/// store-relocate — relocate a DYNAMIC package's closure /gnu/store →
-/// /td/store (size-preserving /td//store rewrite) and run it with /gnu/store
-/// ABSENT. Port of tests/store-relocate.sh (gate 388). guix is only the
-/// one-time relocation SOURCE (`guix build hello` + the /var/guix/db closure
-/// read — the ratcheted surface moved verbatim from the retired shell driver).
-fn store_relocate(root: &Path) -> Result<(), String> {
-    println!(
-        ">> store-relocate: relocate a dynamic package /gnu/store -> /td/store and run it with \
-         /gnu/store ABSENT (the break from guix for dynamic binaries; user-pm Phase 2)"
-    );
-    let tb = tb()?;
-    println!(">> td-builder under test (stage0, guix-free): {}", tb.display());
-    let work = fresh_scratch(root, ".store-relocate-scratch")?;
-
-    let hello = run_out("guix", &["build", "hello"], "guix build hello (the relocation source)")?
-        .lines()
-        .last()
-        .unwrap_or("")
-        .to_string();
-    if hello.is_empty() {
-        return Err("FAIL: guix build hello (the relocation source)".into());
-    }
-    let hbase = base_of(&hello);
-
-    // RELOCATE hello's closure /gnu/store -> /td/store (td's own store-relocate).
-    let dest = work.join("store");
-    let dest_s = path_str(&dest)?;
-    tb_out(
-        &tb,
-        &["store-relocate", "/var/guix/db/db.sqlite", &hello, &dest_s],
-        "store-relocate",
-    )?;
-    let reloc_bin = dest.join(&hbase).join("bin/hello");
-    if !reloc_bin.is_file() {
-        return Err("FAIL: relocated hello binary missing".into());
-    }
-
-    // Leg A: DURABLE behavioral — run the relocated DYNAMIC binary from /td/store.
-    let out = tb_out(
-        &tb,
-        &["store-ns", &dest_s, "--", &format!("/td/store/{hbase}/bin/hello")],
-        "relocated hello did not run in the store-ns",
-    )?;
-    if out != "Hello, world!" {
-        return Err(format!("FAIL: relocated hello printed '{out}'"));
-    }
-    println!(
-        "   [DURABLE behavioral] the relocated dynamic hello ran from /td/store (no /gnu/store) \
-         and greeted"
-    );
-
-    // Leg B: DURABLE structural — no /gnu/store left; rewritten to /td//store.
-    let bytes = std::fs::read(&reloc_bin).map_err(|e| format!("FAIL: read {}: {e}", reloc_bin.display()))?;
-    let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
-    if contains(b"/gnu/store") {
-        return Err("FAIL: the relocated hello binary STILL has /gnu/store references".into());
-    }
-    if !contains(b"/td//store") {
-        return Err(
-            "FAIL: the relocated hello binary has no /td//store references (was it rewritten?)".into(),
-        );
-    }
-    println!("   [DURABLE structural] the relocated binary has NO /gnu/store refs — all rewritten to /td//store");
-
-    // Leg C: REMOVABLE oracle — same greeting as guix's /gnu/store hello.
-    let oracle = run_out(&format!("{hello}/bin/hello"), &[], "guix's hello (oracle)")?;
-    if out != oracle {
-        return Err("FAIL: relocated hello != guix hello".into());
-    }
-    println!("   [REMOVABLE oracle] the relocated hello greets identically to guix's /gnu/store hello");
-
-    let _ = chmod_r_uw(&work);
-    let _ = std::fs::remove_dir_all(&work);
-    println!(
-        "PASS: td relocated a dynamic package's closure from guix's /gnu/store to /td/store \
-         (size-preserving /gnu/store -> /td//store rewrite, no patchelf) and ran it from \
-         /td/store with /gnu/store ABSENT — the break from guix, made real for dynamic binaries \
-         (user-pm Phase 2)."
     );
     Ok(())
 }

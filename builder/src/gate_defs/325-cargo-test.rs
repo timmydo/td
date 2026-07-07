@@ -27,9 +27,8 @@
 //! C toolchain is resolved by tools/provision-rust.sh + tools/provision-cc.sh — the SAME
 //! guix-free resolvers the stage0 td-builder SEED build uses (a PROVIDED TD_RUST_HOME/
 //! TD_CC_HOME, or rustup/system cc on a guix-less host, else the pinned lock seed retired
-//! LAST §5) — NOT a `guix shell` process. No guix is invoked here anymore, so this file
-//! drops OUT of the guix-surface `shell` shrink ratchet (tests/guix-surface-shrink.expected;
-//! a PURE shrink — the same clippy/test assertions run, just without the guix daemon).
+//! LAST §5) — NOT a `guix shell` process. No guix is invoked here anymore (this used to
+//! be tracked by the guix-surface census, since retired with the guix-oracle gates).
 //! 
 //! Offline by construction: the provisioned rust bin dir carries rustc + cargo-clippy +
 //! clippy-driver, the cargo bin dir carries cargo, and the cc bin dir (gcc-toolchain, rust's
@@ -45,12 +44,11 @@
 //! lint it, and run its unit tests, ~2-4 min, no from-source builds. Anything that
 //! builds a package (bootstrap-build/build-plan/td-check/corpus/…) is NOT smoke; it
 //! stays in the full `check` / daily backstop.
-//! Not FAST_GATES: cargo clippy/test needs the rust toolchain, which the small
-//! td-ci-fast image does NOT carry (ci/lower-fast-drvs.sh ships node+tsc+cheap-rung
-//! closures only), so tagging it FAST would red the required offline `check-fast`. It
-//! runs in the dev-machine full ./check.sh (the §7.2 step-2 landing gate) and the
-//! full td-ci validate job — both carry rust. Promote to FAST later by adding the
-//! rust+builder closure to ci/lower-fast-drvs.sh (grows the fast image).
+//! This gate IS the hosted per-PR engine check: the `cargo-test` GitHub job
+//! (.github/workflows/ci.yml) runs `cargo test --frozen` on the runner's own
+//! rust — no store image, and it is a required check (github issue #415). The
+//! deep from-source gates stay on the dev-machine full `td-builder check` (the
+//! §7.2 step-2 landing gate) + the nightly daily suite.
 
 use crate::gates::{GateDef, Pool, StoreMode};
 

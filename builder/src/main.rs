@@ -20,7 +20,6 @@ mod bootstrap;
 mod build;
 mod build_daemon;
 mod check_loop;
-mod daemon;
 mod drv;
 mod elf;
 // The comment-splice static guard (#300) is exercised only by its own `#[test]`
@@ -286,22 +285,6 @@ fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
             .map_err(|e| format!("{}: {e}", dst.display()))?;
     }
     Ok(())
-}
-
-/// Resolve `guix` on the current PATH to its real (symlink-followed) location
-/// and return the directory holding it — the bin dir check.sh prepends to PATH
-/// (under the exposed /gnu/store). None if `guix` is not on PATH.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn host_guix_bin_dir() -> Option<String> {
-    let path = std::env::var("PATH").ok()?;
-    for dir in path.split(':').filter(|s| !s.is_empty()) {
-        let cand = Path::new(dir).join("guix");
-        if cand.is_file() {
-            let real = std::fs::canonicalize(&cand).ok()?;
-            return real.parent().map(|p| p.to_string_lossy().into_owned());
-        }
-    }
-    None
 }
 
 /// One built output's post-build registration facts — the daemon's per-path
@@ -1897,7 +1880,12 @@ fn assemble_recipe_drv(
         // mesboot: the bootstrap-RUNG executor (build::run_mesboot, #378 slices
         // 2+3) — the recipe's typed steps run in the sandbox over staged inputs.
         "mesboot" => "mesboot-build",
-        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot)")),
+        // rust-toolchain: the pinned-upstream-Rust ELF-retarget TRANSFORM (#380,
+        // build::run_rust_toolchain) — extract rustc/cargo + rustlib from TD_SRC,
+        // co-locate the /td/store glibc/libgcc/libz runtime closure, relink the
+        // interp onto td's own glibc loader. Declared inputs, reproducible output.
+        "rust-toolchain" => "rust-toolchain-build",
+        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot, rust-toolchain)")),
     };
     // configure flags + phases (both optional) -> JSON array string. A configure
     // flag may itself contain whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`), so the
@@ -2030,6 +2018,35 @@ fn assemble_recipe_drv(
                 );
             }
             spec.push_str(&format!("env TD_STEPS={}\n", steps.to_json_string()));
+            let map = json::Json::Obj(
+                entries
+                    .iter()
+                    .map(|e| (e.name.clone(), json::Json::Str(e.path.clone())))
+                    .collect(),
+            );
+            spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
+        }
+        // rust-toolchain: the pinned-upstream-Rust ELF-retarget transform (#380).
+        // TD_SRC is the release tarball (the `rust-toolchain-source' lock entry);
+        // the /td/store glibc/libgcc/libz inputs reach build::run_rust_toolchain by
+        // NAME through TD_INPUT_MAP (lock entry name -> canonical store path), the
+        // same resolution mesboot uses. No compile: configureFlags/phases/bins have
+        // no runner here — declaring them is a hard error, never silently ignored.
+        "rust-toolchain" => {
+            if alist.get("configureFlags").is_some()
+                || alist.get("phases").is_some()
+                || alist.get("bins").is_some()
+                || alist.get("steps").is_some()
+            {
+                return Err(
+                    "recipe: buildSystem \"rust-toolchain\" supports no configureFlags/phases/bins/steps — it declares `inputs' (glibc/libgcc/libz) and transforms the release tarball".into(),
+                );
+            }
+            if !vendor.is_empty() || vendor_dir.is_some() {
+                return Err(
+                    "recipe: buildSystem \"rust-toolchain\" takes no vendored crates — the transform extracts a prebuilt release, it does not compile".into(),
+                );
+            }
             let map = json::Json::Obj(
                 entries
                     .iter()
@@ -2452,9 +2469,10 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
 }
 
 /// The pre-provisioned NATIVE `/td/store` toolchain `td shell` builds the Rust userland with,
-/// handed in via the `TD_SHELL_NATIVE_*` environment (gate `td-shell-userland` / host-prep
-/// stages it: fetch-or-build the native x86_64 gcc/binutils/glibc + relinked rust, stage a
-/// combined seed+native store, and expose it). When present, a vendored rust build (ripgrep,
+/// handed in via the `TD_SHELL_NATIVE_*` environment (its provisioning gate `td-shell-userland`
+/// was retired with the #410 rust-toolchain recipe-graph cutover — the native-toolchain +
+/// rust-userland coverage is being re-added on the recipe-graph model; until then no gate stages
+/// this env). When present, a vendored rust build (ripgrep,
 /// fd, …) links this toolchain — never the guix rust/gcc-toolchain: the seed lock is retargeted
 /// (`native_seed_lock_body`), the combined store is the build's STORE-DIR + `TD_SEED_STORE`, the
 /// native store's db rides `TD_EXTRA_DBS`, and `TD_RUST_STORE_{INTERP,RPATH,BDIR}` put run_rust
@@ -2527,7 +2545,7 @@ impl NativeToolchain {
 ///
 /// Config (env): TD_RECIPE_EVAL (td's Rust recipe-catalog evaluator, to emit the
 /// recipe), TD_SHELL_LOCKS (dir of `<pkg>.lock` / `<pkg>-no-guix.lock`, default `tests`),
-/// TD_SHELL_STORE_DB (store DB for the plain seed-package path, default `/var/guix/db/db.sqlite`),
+/// TD_SHELL_STORE_DIR (seed store dir for the plain seed-package path, default `/gnu/store`),
 /// TD_SHELL_NATIVE_* (the pre-provisioned native `/td/store` toolchain for vendored rust builds —
 /// `NativeToolchain::from_env`), TD_SHELL_CACHE (build cache root, default `$HOME/.cache/td-shell`),
 /// TD_BUILDER_PATH/STORE/DB (optional stage0 builder override, so the build's builder
@@ -2547,7 +2565,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
 
     let env_or = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let lock_dir = env_or("TD_SHELL_LOCKS", "tests");
-    let store_db = env_or("TD_SHELL_STORE_DB", "/var/guix/db/db.sqlite");
+    let seed_store_dir = env_or("TD_SHELL_STORE_DIR", "/gnu/store");
     let cache = match std::env::var("TD_SHELL_CACHE") {
         Ok(c) => c,
         Err(_) => format!(
@@ -2613,9 +2631,10 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                     None => {
                         return Err(format!(
                             "build `{pkg}': a vendored rust build needs the native /td/store toolchain, \
-                             but TD_SHELL_NATIVE_STORE is not set. Provision it (gate `td-shell-userland' \
-                             or host-prep stages the native gcc/binutils/glibc + relinked rust). \
-                             The guix rust/gcc-toolchain path is retired for `td shell'."
+                             but TD_SHELL_NATIVE_STORE is not set. Its provisioning gate was retired with \
+                             the #410 rust-toolchain recipe-graph cutover (rust userland re-coverage pending); \
+                             host-prep must stage the native gcc/binutils/glibc + the recipe-graph relinked \
+                             rust. The guix rust/gcc-toolchain path is retired for `td shell'."
                         ));
                     }
                 }
@@ -2629,7 +2648,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                 }
                 bargs.push(lock);
                 bargs.push(sd.clone());
-                bargs.push(store_db.clone());
+                bargs.push(seed_store_dir.clone());
             }
         }
         // BUILD it via the build-recipe subcommand (its content-addressed cache makes
@@ -2639,7 +2658,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         let mut build = Command::new(&self_exe);
         build.args(&bargs);
         if used_native {
-            // Native link mode, exactly as `tests/rust-x86_64-userland-store-native.sh` sets it:
+            // Native link mode, exactly as the retired rust-userland gate (#410 cutover) set it:
             // the combined store is content-scanned for the closure, the native toolchain's own db
             // adds its /td/store refs, and run_rust bakes the /td/store interp/RUNPATH/-B.
             if let Some(nt) = &native {
@@ -2773,7 +2792,7 @@ fn seed_lock_body(lock_body: &str, sourcekey: &str, src_canonical: &str) -> Stri
 /// retired-last build seed (coreutils/bash/tar/gzip) and the interned-source line, then append
 /// `native_lines` (the `/td/store` gcc/binutils/glibc + relinked-rust lock lines the gate
 /// pre-provisioned). Pure (no I/O) so it is unit-tested directly — the same transform
-/// `tests/rust-x86_64-userland-store-native.sh` does with `grep -vE -- '-rust-|-gcc-toolchain-'`.
+/// the retired rust-userland gate (#410) did with `grep -vE -- '-rust-|-gcc-toolchain-'`.
 /// This is the `td shell` cutover: the product command builds the Rust userland with td's OWN
 /// toolchain, never the guix rust/gcc-toolchain.
 fn native_seed_lock_body(seed_body: &str, native_lines: &str) -> String {
@@ -3007,95 +3026,6 @@ fn build_profile(
     Ok(linked)
 }
 
-/// Replace every occurrence of `from` with `to` (SAME length — size-preserving, so ELF
-/// offsets/section sizes are untouched and the substitution is binary-safe). Used to
-/// relocate `/gnu/store` → `/td//store` (both 10 bytes).
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn replace_bytes_same_len(data: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    assert_eq!(from.len(), to.len(), "relocation substitution must be size-preserving");
-    let mut out = data.to_vec();
-    let mut i = 0;
-    while i + from.len() <= out.len() {
-        if &out[i..i + from.len()] == from {
-            out[i..i + from.len()].copy_from_slice(to);
-            i += from.len();
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-/// Rewrite `/gnu/store` → `/td//store` in every file's CONTENT and every symlink TARGET
-/// under `dir`. Size-preserving (10→10 bytes; `/td//store` is the kernel-collapsed form of
-/// `/td/store`), so RUNPATH/interpreter in `.dynstr`, embedded paths in `.rodata`, and
-/// scripts are all handled by one byte substitution — no ELF surgery. Returns the count.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn relocate_tree(dir: &Path, from: &[u8], to: &[u8]) -> Result<usize, String> {
-    use std::os::unix::fs::{symlink, PermissionsExt};
-    let md = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let ft = md.file_type();
-    let mut n = 0;
-    if ft.is_symlink() {
-        // Store-path symlink targets are ASCII; rewrite the prefix textually.
-        let target = std::fs::read_link(dir).map_err(|e| e.to_string())?;
-        let ts = target.to_string_lossy();
-        let from_s = std::str::from_utf8(from).unwrap();
-        let to_s = std::str::from_utf8(to).unwrap();
-        if ts.contains(from_s) {
-            let new = ts.replace(from_s, to_s);
-            std::fs::remove_file(dir).map_err(|e| e.to_string())?;
-            symlink(&new, dir).map_err(|e| e.to_string())?;
-            n += 1;
-        }
-    } else if ft.is_dir() {
-        for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-            n += relocate_tree(&e.map_err(|e| e.to_string())?.path(), from, to)?;
-        }
-    } else if ft.is_file() {
-        let data = std::fs::read(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        if data.windows(from.len()).any(|w| w == from) {
-            let mode = md.permissions().mode();
-            let mut w = md.permissions();
-            w.set_mode(mode | 0o200); // make writable for the rewrite
-            std::fs::set_permissions(dir, w).ok();
-            std::fs::write(dir, replace_bytes_same_len(&data, from, to))
-                .map_err(|e| format!("{}: {e}", dir.display()))?;
-            let mut back = std::fs::metadata(dir).map_err(|e| e.to_string())?.permissions();
-            back.set_mode(mode); // restore the canonical (read-only) mode
-            std::fs::set_permissions(dir, back).ok();
-            n += 1;
-        }
-    }
-    Ok(n)
-}
-
-/// Relocate ROOT's closure (over STORE-DB) from guix's `/gnu/store` into DEST-DIR as a
-/// td-prefixed store: copy each closure member to `DEST-DIR/<base>` and rewrite every
-/// `/gnu/store` reference to `/td//store` (the length-preserving form of `/td/store`, so
-/// the substitution is binary-safe — no patchelf). DEST-DIR bound at `/td/store` (store-ns)
-/// IS the relocated store; binaries' `/td//store` refs resolve into it, with NO `/gnu/store`.
-/// The one-time break from guix (seed captured once, relocated, then td builds/runs from
-/// `/td/store`). Usage: store-relocate STORE-DB ROOT DEST-DIR
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn relocate_closure(store_db: &str, root: &str, dest: &str) -> Result<(usize, usize), String> {
-    let bytes = std::fs::read(store_db).map_err(|e| format!("read store db {store_db}: {e}"))?;
-    let db = store_db_read::Db::open(bytes)?;
-    let closure = db.closure(root)?;
-    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-    let (from, to): (&[u8], &[u8]) = (b"/gnu/store", b"/td//store");
-    let mut files = 0usize;
-    for p in &closure {
-        let base = p.rsplit('/').next().ok_or_else(|| format!("{p}: not a store path"))?;
-        let dst = Path::new(dest).join(base);
-        if !dst.exists() {
-            copy_canonical(Path::new(p), &dst)?;
-            files += relocate_tree(&dst, from, to)?;
-        }
-    }
-    Ok((closure.len(), files))
-}
-
 /// The nice value build work runs at, from `TD_BUILD_NICE` (default 10). Parsed
 /// from the raw env value so the policy is unit-testable without touching real
 /// process state. Clamped to the kernel's -20..=19 range; a missing/garbage value
@@ -3148,7 +3078,8 @@ struct HostSandboxArgs {
     /// `/td/store/ld`). Only meaningful with `--store-from`; when DEST != `/gnu/store`
     /// the host `/gnu/store` is NOT bound at all — the guix-byte-free VM substrate.
     store_at: Option<String>,
-    /// `--no-daemon`: do not bind `/var/guix` (no guix-daemon socket / GC roots).
+    /// `--no-daemon`: accepted for compatibility. The loop sandbox no longer binds
+    /// the host daemon state in either mode.
     no_daemon: bool,
     cmd: String,
     cmd_args: Vec<String>,
@@ -3200,6 +3131,18 @@ fn parse_host_sandbox_args(args: &[String]) -> Result<HostSandboxArgs, String> {
         cmd: args[i + 1].clone(),
         cmd_args: args[i + 2..].to_vec(),
     })
+}
+
+fn host_sandbox_base_binds(store_from: Option<&str>, store_at: Option<&str>) -> Vec<sandbox::Bind> {
+    match store_from {
+        Some(dir) => vec![sandbox::Bind {
+            src: dir.to_string(),
+            dest: Some(store_at.unwrap_or("/gnu/store").to_string()),
+            readonly: true,
+            ro_optional: false,
+        }],
+        None => Vec::new(),
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
@@ -3672,88 +3615,6 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: drv-emit-to {oracle}: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        // td-drv-add: CONSTRUCT the `.drv` (#22) and REGISTER it in the store via
-        // the daemon's addTextToStore — no guile `(derivation …)`. Asserts the
-        // path the daemon returns equals td's own computed path, and prints it.
-        // The socket is TD_DAEMON_SOCKET or the default.
-        Some("drv-add") if args.len() == 3 => {
-            let oracle = &args[2];
-            let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
-            let run = || -> Result<String, String> {
-                let bytes = std::fs::read(oracle).map_err(|e| e.to_string())?;
-                let d = drv::parse(&bytes).map_err(|e| e.to_string())?;
-                let name = store::name_from_store_path(oracle)
-                    .ok_or_else(|| format!("{oracle} is not a store path"))?;
-                let drv_name = name
-                    .strip_suffix(".drv")
-                    .ok_or_else(|| format!("{oracle} is not a .drv"))?;
-                let (computed, content) = store::construct_drv(&d, drv_name, &read)?;
-                let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
-                refs.extend(d.input_srcs.iter().cloned());
-                // The GUIX daemon's worker-protocol socket — deliberately NOT
-                // TD_DAEMON_SOCKET: that env var names td's OWN build daemon (a line
-                // protocol) since the machine-wide limiter landed, and check.sh exports
-                // it loop-wide, so reading it here dialed the wrong daemon and spoke
-                // binary worker-protocol at a line reader — the newline never came and
-                // the td daemon's accept thread blocked forever (the machine-wide wedge
-                // the daemon's read-timeout now bounds; this is the caller-side fix).
-                let socket = std::env::var("TD_GUIX_DAEMON_SOCKET")
-                    .unwrap_or_else(|_| daemon::DEFAULT_SOCKET.to_string());
-                let mut dm = daemon::Daemon::connect(&socket)
-                    .map_err(|e| format!("connect {socket}: {e}"))?;
-                let added = dm
-                    .add_text_to_store(&name, content.as_bytes(), &refs)
-                    .map_err(|e| e.to_string())?;
-                if added != computed {
-                    return Err(format!(
-                        "daemon registered {added} but td computed {computed}"
-                    ));
-                }
-                Ok(added)
-            };
-            match run() {
-                Ok(path) => {
-                    println!("{path}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: drv-add {oracle}: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        // td-drv-add: generic addTextToStore of FILE's bytes under NAME (no
-        // references) — prints the daemon-returned store path. The rung uses it
-        // with a UNIQUE name to prove the daemon actually WRITES td's bytes (a
-        // novel path), not just returns a pre-existing one.
-        Some("store-add") if args.len() == 4 => {
-            let (name, file) = (&args[2], &args[3]);
-            let run = || -> Result<String, String> {
-                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
-                // The GUIX daemon's worker-protocol socket — deliberately NOT
-                // TD_DAEMON_SOCKET: that env var names td's OWN build daemon (a line
-                // protocol) since the machine-wide limiter landed, and check.sh exports
-                // it loop-wide, so reading it here dialed the wrong daemon and spoke
-                // binary worker-protocol at a line reader — the newline never came and
-                // the td daemon's accept thread blocked forever (the machine-wide wedge
-                // the daemon's read-timeout now bounds; this is the caller-side fix).
-                let socket = std::env::var("TD_GUIX_DAEMON_SOCKET")
-                    .unwrap_or_else(|_| daemon::DEFAULT_SOCKET.to_string());
-                let mut dm = daemon::Daemon::connect(&socket)
-                    .map_err(|e| format!("connect {socket}: {e}"))?;
-                dm.add_text_to_store(name, &bytes, &[]).map_err(|e| e.to_string())
-            };
-            match run() {
-                Ok(path) => {
-                    println!("{path}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: store-add {name}: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -5197,54 +5058,6 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // td-drv-assemble: ASSEMBLE the `.drv` from a raw SPEC (Guile resolved the
-        // inputs and emitted it WITHOUT `(derivation …)`) and REGISTER it via the
-        // daemon — so the build derivation enters the store with no guile
-        // `(derivation …)` at all. Asserts the daemon returns td's own computed
-        // path, and prints it.
-        Some("drv-assemble") if args.len() == 3 => {
-            let spec_file = &args[2];
-            let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
-            let run = || -> Result<String, String> {
-                let spec = std::fs::read_to_string(spec_file).map_err(|e| e.to_string())?;
-                let (computed, content) = store::assemble_drv(&spec, &read)?;
-                let d = drv::parse(content.as_bytes()).map_err(|e| e.to_string())?;
-                let name = store::name_from_store_path(&computed)
-                    .ok_or_else(|| format!("computed path {computed} is malformed"))?;
-                let mut refs: Vec<String> = d.input_drvs.iter().map(|(p, _)| p.clone()).collect();
-                refs.extend(d.input_srcs.iter().cloned());
-                // The GUIX daemon's worker-protocol socket — deliberately NOT
-                // TD_DAEMON_SOCKET: that env var names td's OWN build daemon (a line
-                // protocol) since the machine-wide limiter landed, and check.sh exports
-                // it loop-wide, so reading it here dialed the wrong daemon and spoke
-                // binary worker-protocol at a line reader — the newline never came and
-                // the td daemon's accept thread blocked forever (the machine-wide wedge
-                // the daemon's read-timeout now bounds; this is the caller-side fix).
-                let socket = std::env::var("TD_GUIX_DAEMON_SOCKET")
-                    .unwrap_or_else(|_| daemon::DEFAULT_SOCKET.to_string());
-                let mut dm = daemon::Daemon::connect(&socket)
-                    .map_err(|e| format!("connect {socket}: {e}"))?;
-                let added = dm
-                    .add_text_to_store(&name, content.as_bytes(), &refs)
-                    .map_err(|e| e.to_string())?;
-                if added != computed {
-                    return Err(format!(
-                        "daemon registered {added} but td computed {computed}"
-                    ));
-                }
-                Ok(added)
-            };
-            match run() {
-                Ok(path) => {
-                    println!("{path}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: drv-assemble {spec_file}: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         // S3b/S3c — execute the drv in the userns sandbox and register the
         // outputs. CLOSURE is a file listing every store path the build may
         // see, one per line; writes land under SCRATCH/newstore and the v1
@@ -5747,12 +5560,10 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // td-builder shell — td's own `guix shell` (NOT a container; the default,
-        // non-`-C` form): resolve the named packages, compose the command's PATH
-        // from their outputs, run it. Resolution stays on the guix package oracle
-        // for v1; the env composition + exec are td's own (see run_shell). The
-        // durable assertion is behavioral — the command actually runs with the
-        // package on PATH. Usage:
+        // td-builder shell — td's own package shell (NOT a container): resolve
+        // the named recipes, build them with td, compose the command's PATH from
+        // their outputs, and run it. The durable assertion is behavioral — the
+        // command actually runs with the package on PATH. Usage:
         //   shell PKG... [-- CMD ARGS...]
         Some("shell") => match run_shell(&args[2..]) {
             Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
@@ -5794,26 +5605,6 @@ fn main() -> ExitCode {
                         eprintln!("td-builder: profile: {e}");
                         ExitCode::FAILURE
                     }
-                }
-            }
-        }
-        // td-builder store-relocate — relocate ROOT's closure from guix's /gnu/store into
-        // DEST-DIR as a td /td/store seed (size-preserving /gnu/store -> /td//store rewrite;
-        // see relocate_closure). user-pm Phase 2: the one-time break from guix. Usage:
-        //   store-relocate STORE-DB ROOT DEST-DIR
-        Some("store-relocate") if args.len() == 5 => {
-            match relocate_closure(&args[2], &args[3], &args[4]) {
-                Ok((paths, files)) => {
-                    eprintln!(
-                        "td-builder: store-relocate — {paths} store path(s) -> {}, rewrote {files} file(s)/symlink(s) /gnu/store -> /td//store",
-                        args[4]
-                    );
-                    println!("{}", args[4]);
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: store-relocate: {e}");
-                    ExitCode::FAILURE
                 }
             }
         }
@@ -5877,11 +5668,11 @@ fn main() -> ExitCode {
             }
         }
         // loop-sandbox: the DEV-SHELL — run a command inside td's own hermetic
-        // container (pivot into a fresh root exposing the WHOLE /gnu/store (ro),
-        // the daemon socket /var/guix, /proc, /dev; host-guix on PATH; its own
-        // loopback-only netns), toward replacing `guix shell -C`. With
-        // `--expose-cwd` it adds the FULL loop env (worktree + cgroups + guix
-        // cache, caller PATH + TD_SUBST_*/TD_DAEMON_* preserved, chdir into the
+        // container (pivot into a fresh root exposing only the selected store,
+        // synthetic /proc and /dev, and its own loopback-only netns), toward
+        // replacing `guix shell -C`. With
+        // `--expose-cwd` it adds the FULL loop env (worktree + cgroups,
+        // caller PATH + TD_SUBST_*/TD_DAEMON_* preserved, chdir into the
         // cwd) so a real rung runs as under `guix shell -C`.
         //
         // GUIX-LESS provisioning (host-sandbox-stage0 inc2 — the daily-suite VM):
@@ -5890,16 +5681,15 @@ fn main() -> ExitCode {
         //                      sandbox instead of the host /gnu/store, so the loop
         //                      toolchain resolves from the seed and the host store
         //                      is absent — the substrate for a VM with no guix.
-        //   --no-daemon      : do NOT bind /var/guix (no guix-daemon socket/GC
-        //                      roots). The build path uses td-builder's own build
-        //                      jail (its own newstore), not the daemon, so the
-        //                      shell needs no /var/guix.
+        //   --no-daemon      : accepted for compatibility. /var/guix is never
+        //                      bound; the build path uses td-builder's own build
+        //                      jail and shared build daemon.
         //   --store-at DEST  : where --store-from is mounted INSIDE (default
         //                      /gnu/store). Pass /td/store for td's own store-native
         //                      harness (busybox/make/td-builder relinked to
         //                      /td/store/ld); then the host /gnu/store is NOT bound at
         //                      all — the guix-byte-free loop substrate.
-        // Without these flags the binds are byte-identical to before.
+        // Without --store-from the sandbox binds no host store.
         // Usage:
         //   host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--no-daemon] -- CMD ARGS...
         Some("host-sandbox") if args.len() >= 4 => {
@@ -5912,10 +5702,10 @@ fn main() -> ExitCode {
             };
             let HostSandboxArgs { expose_cwd, store_from, store_at, no_daemon, cmd, cmd_args } =
                 parsed;
+            let _daemon_bind_compat = no_daemon;
             let run = || -> Result<std::process::ExitStatus, String> {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/home/td".to_string());
-                // The base exposure set: the whole store (ro) and the daemon
-                // socket + GC roots (rw). /dev is NOT bound — host_shell builds a
+                // The base exposure set is the requested store (ro). /dev is NOT bound — host_shell builds a
                 // minimal synthetic /dev (standard char devices + shm + pts + fd
                 // links, like `guix shell -C`) instead of leaking the host device
                 // tree (kmsg/kvm/disks/input/GPUs). /proc is NOT bound either —
@@ -5923,35 +5713,13 @@ fn main() -> ExitCode {
                 // PID namespace, so the host /proc never leaks in and nested
                 // containers see a private /proc.
                 //
-                // The store bind: by default the host /gnu/store; with
-                // --store-from DIR the UNPACKED store DIR, mounted at DEST
+                // The store bind is explicit: with --store-from DIR, bind the
+                // UNPACKED store DIR, mounted at DEST
                 // (--store-at, default /gnu/store) so its binaries' hardcoded
                 // interpreters resolve. With --store-at /td/store (td's own
                 // store-native harness) the host /gnu/store is then absent — the
-                // guix-byte-free loop substrate. --no-daemon drops /var/guix.
-                let mut binds = Vec::new();
-                match store_from.as_deref() {
-                    Some(dir) => binds.push(sandbox::Bind {
-                        src: dir.to_string(),
-                        dest: Some(store_at.clone().unwrap_or_else(|| "/gnu/store".to_string())),
-                        readonly: true,
-                        ro_optional: false,
-                    }),
-                    None => binds.push(sandbox::Bind {
-                        src: "/gnu/store".to_string(),
-                        dest: None,
-                        readonly: true,
-                        ro_optional: false,
-                    }),
-                }
-                if !no_daemon {
-                    binds.push(sandbox::Bind {
-                        src: "/var/guix".to_string(),
-                        dest: None,
-                        readonly: false,
-                        ro_optional: false,
-                    });
-                }
+                // guix-byte-free loop substrate. /var/guix is never bound.
+                let mut binds = host_sandbox_base_binds(store_from.as_deref(), store_at.as_deref());
                 let mut tmpfs = vec!["/tmp".to_string()];
                 let mut path_env = String::new();
                 let mut workdir = String::new();
@@ -5961,9 +5729,8 @@ fn main() -> ExitCode {
                         .map_err(|e| e.to_string())?
                         .to_string_lossy()
                         .into_owned();
-                    // Worktree (rw, like guix shell -C's shared cwd), the host
-                    // cgroup hierarchy (ro, for crun), and the guix lowering cache
-                    // (rw, check.sh --shares it). HOME is a dir on the writable
+                    // Worktree (rw, like guix shell -C's shared cwd) and the host
+                    // cgroup hierarchy (ro, for crun). HOME is a dir on the writable
                     // root tmpfs (created by these binds), so no HOME tmpfs.
                     binds.push(sandbox::Bind { src: cwd.clone(), dest: None, readonly: false, ro_optional: false });
                     if Path::new("/sys/fs/cgroup").is_dir() {
@@ -5995,10 +5762,6 @@ fn main() -> ExitCode {
                                 });
                             }
                         }
-                    }
-                    let cache = format!("{home}/.cache/guix");
-                    if Path::new(&cache).is_dir() {
-                        binds.push(sandbox::Bind { src: cache, dest: None, readonly: false, ro_optional: false });
                     }
                     // The persistent signed substitute store (~/.td/subst, populated by the daily) —
                     // READ-ONLY: the loop FETCHES the lock-keyed toolchain closure from it
@@ -6055,10 +5818,6 @@ fn main() -> ExitCode {
                         }
                     }
                 } else {
-                    let guix_bin = host_guix_bin_dir().unwrap_or_default();
-                    if !guix_bin.is_empty() {
-                        path_env = format!("{guix_bin}:/run/current-system/profile/bin");
-                    }
                     tmpfs.push(home.clone());
                 }
                 let scratch = std::env::temp_dir()
@@ -6130,66 +5889,12 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // input-resolution: RESOLVE recipe input names -> store paths from a PINNED
-        // lock (one `NAME<whitespace>STORE-PATH` per line, `#` comments allowed) —
-        // the lookup system/td-build.scm does via Guile's `specification->package`
-        // -> `package-derivation` -> output path. Additive equivalence FIRST (the
-        // gate pattern of loop-sandbox/td-check): the `resolve` rung proves
-        // td-builder's lock resolution EQUALS Guile's live resolution (the oracle);
-        // the build is unchanged. The lock is a pinned artifact (regenerated on a
-        // channel bump, like DIGESTS.md); the RESOLVER that computes it stays Guile,
-        // retired package-by-package later (§5: toolchain retired last). Usage:
-        //   resolve LOCKFILE NAME...
-        // Prints one resolved store path per NAME, in order; errors if a NAME is
-        // absent (so a recipe input the pinned lock does not cover fails loudly).
-        Some("resolve") if args.len() >= 4 => {
-            let lockfile = &args[2];
-            let names = &args[3..];
-            let run = || -> Result<Vec<String>, String> {
-                let text =
-                    std::fs::read_to_string(lockfile).map_err(|e| format!("{lockfile}: {e}"))?;
-                let mut map = std::collections::HashMap::new();
-                for (i, line) in text.lines().enumerate() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    let mut it = line.splitn(2, char::is_whitespace);
-                    let name = it.next().unwrap_or_default().trim();
-                    let path = it.next().unwrap_or_default().trim();
-                    if name.is_empty() || path.is_empty() {
-                        return Err(format!("{lockfile}:{}: malformed lock line", i + 1));
-                    }
-                    if map.insert(name.to_string(), path.to_string()).is_some() {
-                        return Err(format!("{lockfile}:{}: duplicate name `{name}'", i + 1));
-                    }
-                }
-                names
-                    .iter()
-                    .map(|n| {
-                        map.get(n)
-                            .cloned()
-                            .ok_or_else(|| format!("name `{n}' not in lock {lockfile}"))
-                    })
-                    .collect()
-            };
-            match run() {
-                Ok(paths) => {
-                    for p in paths {
-                        println!("{p}");
-                    }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: resolve: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        // (the `resolve` subcommand — a Guile-oracle lock resolver — retired with
+        // the guix Guile-lowering gates; native input resolution lives in gate_inputs.rs.)
         // corpus-independence: run AS a derivation's builder, executing the
         // autotools phases in Rust (replaces gnu-build-system). Reads the build
         // environment from env vars (out, TD_SRC, TD_INPUTS, TD_CONFIGURE_FLAGS)
-        // that system/td-build.scm sets on the derivation.
+        // that the td-native derivation contract sets on the derivation.
         Some("autotools-build") if args.len() == 2 => match build::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -6200,7 +5905,7 @@ fn main() -> ExitCode {
         // td's OWN Rust/cargo build system (the cargo-build-system replacement):
         // builds the TD_SRC crate with `cargo build --offline` and installs
         // TD_RUST_BINS into $out/bin. Sibling of autotools-build; same
-        // env-driven derivation-builder contract (system/td-build.scm).
+        // env-driven derivation-builder contract.
         Some("rust-build") if args.len() == 2 => match build::run_rust() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -6211,7 +5916,7 @@ fn main() -> ExitCode {
         // td's OWN cmake build system (the cmake-build-system replacement): runs an
         // out-of-source `cmake` configure -> make -> make install over the TD_SRC
         // tree, installing into $out. Sibling of autotools-build/rust-build; same
-        // env-driven derivation-builder contract (system/td-build.scm).
+        // env-driven derivation-builder contract.
         Some("cmake-build") if args.len() == 2 => match build::run_cmake() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -6234,6 +5939,16 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("td-builder: mesboot-build: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        // td's rust-toolchain ELF-retarget transform (#380): see
+        // build::run_rust_toolchain. Same env-driven derivation-builder contract —
+        // extract+co-locate+relink the pinned upstream Rust release onto /td/store.
+        Some("rust-toolchain-build") if args.len() == 2 => match build::run_rust_toolchain() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: rust-toolchain-build: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -6343,7 +6058,7 @@ memchr-2.7.crate /gnu/store/ddd-memchr.crate
     // native_seed_lock_body is the `td shell` cutover transform: retarget a seed lock onto the
     // native /td/store toolchain — drop the guix rust/gcc-toolchain lines, keep the retired-last
     // build seed + the source pin, append the native toolchain lines. It mirrors what
-    // `tests/rust-x86_64-userland-store-native.sh` does with `grep -vE -- '-rust-|-gcc-toolchain-'`.
+    // the retired rust-userland gate (#410) did with `grep -vE -- '-rust-|-gcc-toolchain-'`.
     #[test]
     fn native_seed_lock_body_retargets_onto_the_td_store_toolchain() {
         // A realistic post-provision seed lock: guix rust + cargo + gcc-toolchain, the retired-last
@@ -6683,6 +6398,19 @@ glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
         // rather than silently bind the host /gnu/store at the wrong place.
         let e = hs(&["--store-at", "/td/store", "--", "true"]).unwrap_err();
         assert!(e.contains("--store-at requires --store-from"), "got: {e}");
+    }
+
+    #[test]
+    fn host_sandbox_base_binds_never_mount_var_guix() {
+        let default = host_sandbox_base_binds(None, None);
+        assert!(default.is_empty());
+        assert!(default.iter().all(|b| b.src != "/var/guix"));
+
+        let harness = host_sandbox_base_binds(Some("/h/store"), Some("/td/store"));
+        assert_eq!(harness.len(), 1);
+        assert_eq!(harness[0].src.as_str(), "/h/store");
+        assert_eq!(harness[0].dest.as_deref(), Some("/td/store"));
+        assert!(harness.iter().all(|b| b.src != "/var/guix"));
     }
 
     #[test]

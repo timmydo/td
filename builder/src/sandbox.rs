@@ -497,7 +497,7 @@ pub struct Bind {
 /// writable tmpfs at each of `tmpfs_dirs`, and a minimal synthetic `/dev` (the
 /// standard char devices + shm + a private devpts + fd symlinks, matching
 /// `guix shell -C` — NOT the host device tree); the host filesystem is otherwise
-/// gone. `path_env` is the full PATH (empty → a default); `home` is HOME;
+/// gone. `path_env` is the full PATH; an empty value stays empty. `home` is HOME;
 /// `workdir` is the cwd to enter after pivot (empty → `/`); `extra_env` is
 /// caller-preserved env (e.g. the `TD_SUBST_*`/`TD_DAEMON_*` knobs). Runs `cmd args` and
 /// returns its exit status. Unshares
@@ -507,8 +507,7 @@ pub struct Bind {
 /// equivalence oracle, the rootless rung) can create their own PID ns + /proc.
 /// uid/gid use the IDENTITY map (host uid → itself) so the host daemon's
 /// peer-cred check still sees the real host uid, and its own network namespace
-/// (loopback brought up) matches `guix shell -C`'s offline posture — the daemon
-/// stays reachable over the Unix socket on the bound /var/guix.
+/// (loopback brought up) matches `guix shell -C`'s offline posture.
 #[allow(clippy::too_many_arguments)]
 pub fn host_shell(
     cmd: &str,
@@ -613,11 +612,6 @@ pub fn host_shell(
         (dev_dir.join("stderr"), "/proc/self/fd/2"),
     ];
 
-    let path_env = if path_env.is_empty() {
-        "/run/current-system/profile/bin:/run/current-system/profile/sbin"
-    } else {
-        path_env
-    };
     let workdir = if workdir.is_empty() { "/" } else { workdir };
     let workdir_owned = workdir.to_string();
 
@@ -631,19 +625,10 @@ pub fn host_shell(
     for (k, v) in extra_env {
         command.env(k, v);
     }
-    // guix reads these: TERM/GUIX_LOCPATH for terminal+locale; USER/LOGNAME so it
-    // finds the per-user profile (/var/guix/profiles/per-user/$USER) — without
-    // them `guix time-machine` falls back to the root-owned default profile and
-    // EPERMs; GUIX_BUILD_OPTIONS carries the loop's --no-substitutes/--no-offload
-    // posture (check.sh sets it for the in-loop `guix build`/`system` calls).
-    // Harmless, and keeps behaviour identical to the outer shell.
-    for k in [
-        "TERM",
-        "GUIX_LOCPATH",
-        "USER",
-        "LOGNAME",
-        "GUIX_BUILD_OPTIONS",
-    ] {
+    // Generic terminal/identity env the gate bodies may read (TERM for terminal
+    // output; USER/LOGNAME for any per-user path). Harmless, and keeps behaviour
+    // identical to the outer shell.
+    for k in ["TERM", "USER", "LOGNAME"] {
         if let Ok(v) = std::env::var(k) {
             command.env(k, v);
         }
@@ -697,9 +682,7 @@ pub fn host_shell(
             fs::write("/proc/self/gid_map", format!("{host_gid} {host_gid} 1"))
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED writing /proc/self/gid_map\n"); e })?;
             // Own network namespace (offline by construction, like `guix shell
-            // -C`); bring its loopback up to match that posture. The daemon
-            // socket is a Unix socket on the bound /var/guix, so it stays
-            // reachable across the netns boundary.
+            // -C`); bring its loopback up to match that posture.
             sys::bring_loopback_up()
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED bringing loopback up\n"); e })?;
             // Fork: the child is PID 1 of the new PID namespace and goes on to set
@@ -764,8 +747,9 @@ pub fn host_shell(
                             // The only ro_optional bind is /sys/fs/cgroup, needed
                             // solely by the crun gates (run/container) which run
                             // locally where the ro-remount SUCCEEDS; they never run
-                            // where this branch fires (CI runs only check-fast), so
-                            // the leftover empty dir is harmless.
+                            // where this branch fires (the hosted CI checks are
+                            // host-native lint + cargo-test, no sandbox), so the
+                            // leftover empty dir is harmless.
                             sys::warn(b"td-builder host-sandbox: ro-remount not permitted for an ro_optional bind; detached (fail-closed, no host exposure)\n");
                             let _ = sys::umount2(target_c, sys::MNT_DETACH);
                         } else {

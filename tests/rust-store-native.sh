@@ -3,7 +3,7 @@
 # ELF rewriter (no patchelf), intern it GUIX-FREE, and assert the durable STRUCTURAL +
 # SUPPLY-CHAIN legs. The bytes are the upstream Rust release tarball (static.rust-lang.org,
 # pinned in seed/sources/rust-*.lock) — NOT a guix build — so this eliminates guix at the
-# source rather than relabeling it (NOT the demoted store-relocate of a guix binary).
+# source rather than relabeling guix bytes.
 #
 # Legs:
 #   [supply-chain]  the warmed tarball's sha256 == the lock pin (upstream Rust, not guix).

@@ -4,8 +4,8 @@
 # (static.rust-lang.org), NOT from a guix build — verified: the rustc/cargo/std ELFs carry
 # ZERO /gnu/store strings and no guix provenance. The rust-store-native gate RELINKS this
 # binary tarball to /td/store (td's own ELF PT_INTERP rewriter, no patchelf), eliminating
-# guix at the source rather than relabeling it (NOT the demoted store-relocate of a guix
-# binary). The sha256 content-address IS the oracle (no guix origin / no differential).
+# guix at the source rather than relabeling guix bytes. The sha256 content-address IS the
+# oracle (no guix origin / no differential).
 #
 # Warmed guix-free by td-feed warm sources (HOST prep, td-fetch + the shared
 # td-feed) into .td-build-cache/sources/<file>; the gate reads it offline and re-verifies the

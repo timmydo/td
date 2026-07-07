@@ -103,10 +103,10 @@ fn main() {
             }
         }
         Some("meta") => {
-            // A canonical JSON manifest of every recipe's census-relevant metadata
-            // (stem, buildSystem, inputs, perturbed). The guix-dependence census
-            // reads the committed tests/recipes-meta.json (rust-free, cheap)
-            // instead of scanning tests/ts/recipe-*.ts; recipe-rs asserts this
+            // A canonical JSON manifest of every recipe's metadata (stem,
+            // buildSystem, inputs, perturbed) — the recipe manifest that recipe-rs
+            // keeps in sync (rust-free, cheap, committed at tests/recipes-meta.json
+            // instead of scanning tests/ts/recipe-*.ts); recipe-rs asserts this
             // command stays in sync with that file.
             use td_recipe::json::Json;
             let mut arr = Vec::new();
@@ -185,20 +185,22 @@ mod tests {
 
     #[test]
     fn tier_filter_counts_recipe_check_bodies() {
+        // sed + hello build ONLY on the /td/store store-native ladder now (their
+        // guix-seeded pr/gnu-version checks retired with the corpus): one daily check each.
         let sed = catalog::lookup("sed").unwrap();
         assert_eq!(recipe_checks(&sed, Some(td_recipe::types::CheckTier::Pr)).len(), 0);
-        assert_eq!(recipe_checks(&sed, Some(td_recipe::types::CheckTier::Daily)).len(), 2);
-        assert_eq!(recipe_checks(&sed, None).len(), 2);
+        assert_eq!(recipe_checks(&sed, Some(td_recipe::types::CheckTier::Daily)).len(), 1);
+        assert_eq!(recipe_checks(&sed, None).len(), 1);
 
         let hello = catalog::lookup("hello").unwrap();
-        assert_eq!(recipe_checks(&hello, Some(td_recipe::types::CheckTier::Pr)).len(), 1);
+        assert_eq!(recipe_checks(&hello, Some(td_recipe::types::CheckTier::Pr)).len(), 0);
         assert_eq!(recipe_checks(&hello, Some(td_recipe::types::CheckTier::Daily)).len(), 1);
-        assert_eq!(recipe_checks(&hello, None).len(), 2);
+        assert_eq!(recipe_checks(&hello, None).len(), 1);
     }
 
     #[test]
     fn unchecked_recipes_have_zero_check_bodies() {
-        let td_builder = catalog::lookup("td-builder").unwrap();
-        assert_eq!(recipe_checks(&td_builder, None).len(), 0);
+        let mes = catalog::lookup("mes").unwrap();
+        assert_eq!(recipe_checks(&mes, None).len(), 0);
     }
 }
