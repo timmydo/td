@@ -136,7 +136,7 @@ struct Selection {
     targets: Vec<String>,
     notes: Vec<String>,
     /// Affected gates that are DAILY/SYSTEM-tier: named for the record but not
-    /// run per-PR — ci/daily-full-suite.sh covers them nightly with
+    /// run per-PR — `td-builder daily` covers them nightly with
     /// fix-or-revert healing (the ~10-min per-PR budget, human 2026-07-04).
     deferred: Vec<String>,
 }
@@ -956,7 +956,7 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
         if !sel.deferred.is_empty() {
             o.push_str(&format!(
                 "Deferred to the daily backstop (daily/system tier — not run per-PR; \
-                 ci/daily-full-suite.sh heals regressions by fix-or-revert PR):\n  {}\n",
+                 `td-builder daily` heals regressions by fix-or-revert PR):\n  {}\n",
                 sel.deferred.join(" ")
             ));
         }

@@ -30,6 +30,40 @@ fn fatal(msg: &str) -> String {
     format!("td-builder check: FATAL: {msg}")
 }
 
+/// Exit code `td-builder check` uses when it aborts because the RUNNER is not
+/// provisioned to run the loop at all (the base loop toolchain does not resolve
+/// on PATH, or the harness tier has no local/fetchable /td/store store) — as
+/// opposed to a gate genuinely going red. It is the stable machine signal the
+/// daily backstop (`td-builder daily`) reads to tell "nothing could run here"
+/// from "a real regression", instead of grepping FATAL prose out of the log
+/// (the coupling that broke twice — #268, then #315). EX_UNAVAILABLE from
+/// sysexits(3): "service unavailable", i.e. this host cannot run the loop.
+pub const EXIT_UNPROVISIONED: i32 = 69;
+
+/// The two ways a check can end unhappily. `Unprovisioned` is a RUNNER-setup gap
+/// (nothing ran — not a code regression); `Fatal` is every other hard error.
+/// `cli()` maps the former to `EXIT_UNPROVISIONED` and the latter to failure, so
+/// the distinction survives as an exit code a caller can branch on. A bare
+/// `String` (already `fatal()`-prefixed) converts to `Fatal` via `?`.
+enum CheckError {
+    Unprovisioned(String),
+    Fatal(String),
+}
+
+impl From<String> for CheckError {
+    fn from(s: String) -> Self {
+        CheckError::Fatal(s)
+    }
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckError::Unprovisioned(m) | CheckError::Fatal(m) => f.write_str(m),
+        }
+    }
+}
+
 /// First `name` on PATH (the child-spawn resolver `Command` itself uses).
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var("PATH").ok()?;
@@ -127,10 +161,10 @@ const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 /// let their gates enforce presence — a host missing crun/sqlite3 must still run
 /// check-engine/check-pr. Fatal ONLY when a CORE tool (sh/bash/make/env) failed
 /// to resolve to an in-store bin dir — without those no gate body runs at all,
-/// and this fatal's `loop toolchain` prefix is what the daily backstop matches to
-/// classify it as a runner-provisioning gap rather than a code regression
-/// (ci/daily-full-suite.sh).
-fn provision_toolchain(root: &Path) -> Result<String, String> {
+/// and that fatal is a `CheckError::Unprovisioned`, so `cli()` exits
+/// `EXIT_UNPROVISIONED`: the machine signal `td-builder daily` reads to classify
+/// this as a runner-provisioning gap rather than a code regression.
+fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
     let list = std::fs::read_to_string(root.join("tools/loop-toolchain.txt"))
         .map_err(|e| fatal(&format!("cannot read tools/loop-toolchain.txt: {e}")))?;
     let tools: Vec<&str> = list
@@ -139,7 +173,7 @@ fn provision_toolchain(root: &Path) -> Result<String, String> {
         .flat_map(str::split_whitespace)
         .collect();
     if tools.is_empty() {
-        return Err(fatal("tools/loop-toolchain.txt lists no tools"));
+        return Err(fatal("tools/loop-toolchain.txt lists no tools").into());
     }
     let path_var = std::env::var("PATH").unwrap_or_default();
     let mut dirs: Vec<String> = Vec::new();
@@ -187,13 +221,13 @@ fn provision_toolchain(root: &Path) -> Result<String, String> {
     // invisible inside the sandbox). A host without them cannot run the loop.
     for core in ["sh", "bash", "make", "env"] {
         if !resolved.contains(core) {
-            return Err(fatal(&format!(
+            return Err(CheckError::Unprovisioned(fatal(&format!(
                 "loop toolchain: core tool `{core}` did not resolve to a path under \
                  {SANDBOX_STORE_PREFIX} on the host PATH — the loop sandbox exposes only \
                  that store (not /usr/bin etc.), so the base userland (bash/coreutils/make) \
                  must be on PATH FROM there, e.g. a guix profile. host-brings-the-tools; \
                  tools/loop-toolchain.txt"
-            )));
+            ))));
         }
     }
     if !missing.is_empty() || !off_store.is_empty() {
@@ -219,9 +253,9 @@ fn provision_toolchain(root: &Path) -> Result<String, String> {
         );
     }
     if dirs.is_empty() {
-        return Err(fatal(
+        return Err(CheckError::Unprovisioned(fatal(
             "loop toolchain: no expected tool resolved to an in-store bin dir on the host PATH",
-        ));
+        )));
     }
     Ok(dirs.join(":"))
 }
@@ -927,14 +961,14 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
 /// Resolve the guix-free stage0 td-builder (the loop-container provider). Both a harness FETCH
 /// (nar-restore) and entering the harness sandbox need it, and it never invokes guix (the stage0
 /// warm path spawns none once placed).
-fn load_stage0_tb(root: &Path) -> Result<String, String> {
+fn load_stage0_tb(root: &Path) -> Result<String, CheckError> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(". tests/cache-lib.sh && load_stage0 1>&2 && printf '%s' \"$TB\"")
         .env("TD_STAGE0_BASE", root.join(".td-build-cache/stage0"))
         .current_dir(root);
     let out = run_capture(&mut cmd)
-        .map_err(|_| fatal("could not build the guix-free stage0 td-builder."))?;
+        .map_err(|_| CheckError::Unprovisioned(fatal("could not build the stage0 td-builder")))?;
     Ok(out.trim().to_string())
 }
 
@@ -994,7 +1028,7 @@ fn try_fetch_harness(root: &Path, hdir: &Path, tb: &str) {
 /// The guix-free `check-harness` tier: enter td's OWN /td/store harness via the
 /// stage0 td-builder — handled BEFORE the host-guix toolchain provisioning so
 /// this tier never invokes guix (the stage0 warm path spawns none once placed).
-fn run_check_harness(root: &Path) -> Result<i32, String> {
+fn run_check_harness(root: &Path) -> Result<i32, CheckError> {
     let hdir = root.join(".td-build-cache/harness");
     let rel_f = hdir.join("rel");
 
@@ -1007,20 +1041,20 @@ fn run_check_harness(root: &Path) -> Result<i32, String> {
         try_fetch_harness(root, &hdir, &tb);
     }
     if !hdir.join("store").is_dir() || !rel_f.is_file() {
-        return Err(fatal(&format!(
+        return Err(CheckError::Unprovisioned(fatal(&format!(
             "no provisioned /td/store harness at {} (and none fetchable from a substitute store).\n  \
-             Provision it on a guix capture host:  td-builder check userland-x86_64-store-native\n  \
+             Provision it with:  td-builder check userland-x86_64-store-native\n  \
              (builds busybox+make + the C toolchain at /td/store, persists them here), then ship the \
-             dir to a guix-less VM — or expose the signed substitute store the daily published the \
+             dir to the runner — or expose the signed substitute store the daily published the \
              harness to (TD_SUBST_STORE + tests/td-subst.pub) so this host FETCHES it.",
             hdir.display()
-        )));
+        ))));
     }
     let hrel = std::fs::read_to_string(&rel_f)
         .map_err(|e| fatal(&format!("cannot read {}: {e}", rel_f.display())))?;
     let hrel = hrel.trim();
     if hrel.is_empty() {
-        return Err(fatal("empty harness rel"));
+        return Err(fatal("empty harness rel").into());
     }
     let hbin = format!("/td/store/{hrel}/bin");
     println!(">> check-harness: entering td's /td/store harness via the guix-free stage0 td-builder ({tb})");
@@ -1051,6 +1085,10 @@ fn run_check_harness(root: &Path) -> Result<i32, String> {
 pub fn cli(args: &[String]) -> ExitCode {
     match run(args) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(e @ CheckError::Unprovisioned(_)) => {
+            eprintln!("{e}");
+            ExitCode::from(EXIT_UNPROVISIONED as u8)
+        }
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE
@@ -1058,10 +1096,10 @@ pub fn cli(args: &[String]) -> ExitCode {
     }
 }
 
-fn run(args: &[String]) -> Result<i32, String> {
+fn run(args: &[String]) -> Result<i32, CheckError> {
     let root = std::env::current_dir().map_err(|e| fatal(&format!("cannot resolve cwd: {e}")))?;
     if !root.join("tests").is_dir() {
-        return Err(fatal("run from the repo root (tests/ not found)"));
+        return Err(fatal("run from the repo root (tests/ not found)").into());
     }
 
     // Parse args LOUDLY: `-j N`/`-jN` overrides the local worker width; any other
@@ -1081,7 +1119,9 @@ fn run(args: &[String]) -> Result<i32, String> {
         if a == "-j" || a == "--jobs" || (a.starts_with("-j") && a.len() > 2) {
             match jv.as_deref().unwrap_or("").trim().parse::<usize>() {
                 Ok(n) if n >= 1 => jobs_flag = Some(n),
-                _ => return Err(fatal(&format!("bad {a} value — -j needs a positive integer"))),
+                _ => {
+                    return Err(fatal(&format!("bad {a} value — -j needs a positive integer")).into())
+                }
             }
         } else if a == "--resume" {
             resume = true;
@@ -1089,7 +1129,8 @@ fn run(args: &[String]) -> Result<i32, String> {
             return Err(fatal(&format!(
                 "unknown flag `{a}` — td-builder check takes goals (tiers/gate names), \
                  -j N, and --resume; there is no make behind this anymore"
-            )));
+            ))
+            .into());
         } else {
             goals.push(a.clone());
         }
@@ -1152,7 +1193,8 @@ fn run(args: &[String]) -> Result<i32, String> {
         None if resume => {
             return Err(fatal(
                 "--resume needs a git working tree to key the verdict journal, and `git` failed here — cannot prove the tree is unchanged, refusing to skip",
-            ))
+            )
+            .into())
         }
         None => {}
     }
@@ -1318,7 +1360,9 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     let tb = provision_stage0(&root).map_err(|e| {
         format!("check-rung: FATAL: could not provision the guix-free stage0 td-builder for the sandbox ({e})")
     })?;
-    let toolchain = provision_toolchain(&root)?;
+    // check-rung is a dev helper, not the loop: it does not branch on the
+    // provisioned/regression distinction, so collapse CheckError back to a string.
+    let toolchain = provision_toolchain(&root).map_err(|e| e.to_string())?;
     eprintln!(
         ">> check-rung: {harness} inside td-builder host-sandbox (cached chain reused; \
          sandbox env matches the gate)"

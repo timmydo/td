@@ -26,7 +26,7 @@ DESIGN §7.2 and CLAUDE.md "Parallel work".
   ~4G image. `cargo-test` is the real per-PR engine gate now. The deep tiers (the
   from-source bootstrap ladder, the corpus, the /td/store harness) are NOT per-PR
   checks — they run on the dev machine via `td-builder check` and nightly via
-  `ci/daily-full-suite.sh`. Cold hosted runners cannot reliably rebuild td's
+  `td-builder daily`. Cold hosted runners cannot reliably rebuild td's
   closure, so a from-scratch CI build of the full store is not dependable.
 - `ci/revert-suspect.sh` — the optimistic-merge heal primitive. Healing is an
   AGENT DUTY (not an automated workflow): when an agent sees `check-fast`… — see
@@ -85,7 +85,7 @@ provision.
 2. **Scope.** Only what the hosted checks see is covered — a lint/engine break.
    A heavy-only break (the from-source bootstrap ladder, the corpus, the
    /td/store harness, reproducibility — invisible to `lint`/`cargo-test`) is not
-   caught per-PR; it surfaces on the nightly `ci/daily-full-suite.sh`, which
+   caught per-PR; it surfaces on the nightly `td-builder daily`, which
    opens a fix-or-revert PR. This is the accepted velocity trade.
 
 ## The review deadlock (why the machine account is mandatory)

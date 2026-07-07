@@ -2,7 +2,7 @@
 # tests/harness-loop.sh — the guix-free inner loop body, run INSIDE td's OWN /td/store
 # harness by `./check.sh check-harness` (via mk/harness.mk). It proves td's loop SUBSTRATE —
 # the busybox + GNU make userland interned at /td/store (gate 420, guix-byte-free) — drives a
-# real build with NO guix and NO /gnu/store. This is the container ci/daily-full-suite.sh uses
+# real build with NO guix and NO /gnu/store. This is the container td-builder daily uses
 # on a VM with no guix installed.
 #
 # This script may use ONLY the harness userland (the busybox applets + make + the staged C

@@ -4,7 +4,7 @@
 # so the loop's resolver (tools/resolve-toolchain.sh) fetches it instead of rebuilding the
 # ~18-rung from-seed chain.
 #
-# Runs in ci/daily-full-suite.sh AFTER the authoritative from-seed build interns the
+# Runs in td-builder daily AFTER the authoritative from-seed build interns the
 # toolchain at the input-addressed path (gate 412's store-add-input-addressed). It exports
 # that path as a NAR + a td-native narinfo and signs the narinfo with the daily-runner's
 # PRIVATE key (whose public half is the pinned tests/td-subst.pub the loop verifies). The

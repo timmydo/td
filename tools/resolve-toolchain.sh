@@ -11,7 +11,7 @@
 #
 # DELIBERATE directive-1 relaxation (human-approved, surfaced in the gate + PR): with
 # this resolver the per-PR/local loop no longer builds the toolchain from source — the
-# DAILY full suite (ci/daily-full-suite.sh, fresh main) is the SOLE remaining from-seed
+# DAILY full suite (td-builder daily, fresh main) is the SOLE remaining from-seed
 # authoritative build AND the publisher of the signed substitute. Trust = the ed25519
 # signature (pinned key) + the input-addressed NAME (the lock-computed StorePath); the
 # toolchain is not byte-reproducible, so repro-equality is NOT the trust basis here

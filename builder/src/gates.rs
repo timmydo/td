@@ -59,7 +59,7 @@ pub enum Pool {
     Heavy,
     /// Daily-only gates (the deep from-seed bootstrap rungs, the from-source
     /// package corpus, the seed-capture family): part of the full `check` the
-    /// daily backstop runs (ci/daily-full-suite.sh, fix-or-revert healing),
+    /// daily backstop runs (`td-builder daily`, fix-or-revert healing),
     /// NOT of `check-pr`. Still runnable by name (`td-builder check <gate>`).
     Daily,
     Fast,
@@ -426,7 +426,7 @@ fn expand_goals(set: &GateSet, goals: &[String]) -> Result<HashSet<usize>, Strin
                 // check-pr is the bounded per-PR tier (~10 min, human
                 // 2026-07-04): the full check MINUS the daily-only pool — one
                 // arm so the subset relation holds by construction. The daily
-                // backstop (ci/daily-full-suite.sh) runs the full `check`, so
+                // backstop (`td-builder daily`) runs the full `check`, so
                 // the daily pool keeps its coverage nightly.
                 "check" | "check-pr" => {
                     add_pool(&mut sel, Pool::Cheap);

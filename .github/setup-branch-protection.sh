@@ -11,7 +11,7 @@
 # host engine gate — clippy + unit tests) is now the mandatory per-PR check — a
 # PR is not mergeable until lint + cargo-test pass. The full hermetic loop is the
 # dev-machine gate (DESIGN §7.2 step 2, `td-builder check` / affected-checks) plus
-# the nightly ci/daily-full-suite.sh; it is NOT a per-PR status check.
+# the nightly td-builder daily; it is NOT a per-PR status check.
 #
 # What the ruleset enforces on main:
 #   - no direct pushes: changes land only via pull request;

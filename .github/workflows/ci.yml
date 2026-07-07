@@ -17,7 +17,7 @@
 # were deleted (#409), so `check-fast` was a vacuous no-op importing a ~4G image;
 # cargo-test is the real per-PR engine gate now. The heavy + daily tiers (the
 # from-source bootstrap ladder, the corpus, the /td/store harness) run on the
-# dev machine via `td-builder check` and nightly via ci/daily-full-suite.sh, not
+# dev machine via `td-builder check` and nightly via td-builder daily, not
 # here — cold CI cannot reliably rebuild the full closure.
 #
 # Nothing here weakens the loop: the authoritative gate ladder is `td-builder
