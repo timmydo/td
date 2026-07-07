@@ -1824,13 +1824,21 @@ mod tests {
         // toolchain — leaving only the /td/store store-native ladder, the store
         // primitives, and the engine. These guard against ACCIDENTAL loss, not
         // deliberate retirement — lower them in the same PR that removes gates.
-        assert!(heavy.len() >= 19, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
-        assert!(daily.len() >= 32, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 51, "the full check lost gates");
+        //
+        // #397 lowered these floors: the 25 duplicate per-rung `bootstrap-<rung>.sh`
+        // shell gates were retired (24 Daily + 1 Heavy — `bootstrap-cc`, the only one
+        // of the 25 in the Heavy pool) — their `build_*` ladders were 80-95% duplicate
+        // of `tests/bootstrap-chain.sh`'s `bootstrap_modern_toolchain()`, which already
+        // builds the whole 20-rung toolchain via one recipe-graph call, and
+        // `recipe-checks-daily`'s store-native hello/sed checks already independently
+        // prove the toolchain works.
+        assert!(heavy.len() >= 16, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
+        assert!(daily.len() >= 7, "daily pool shrank: {}", daily.len());
+        assert!(heavy.len() + daily.len() >= 24, "the full check lost gates");
         for g in ["cargo-test", "store-verify"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
-        for g in ["bootstrap-gcc-mesboot"] {
+        for g in ["recipe-checks-daily"] {
             assert!(daily.iter().any(|n| n == g), "missing daily gate {g}");
         }
         assert!(set.names(Pool::Engine).iter().any(|n| n == "cargo-test"));
