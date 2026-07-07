@@ -45,6 +45,8 @@ mod store_db_read;
 mod sys;
 mod toolchain_x86_64;
 
+use std::ffi::CString;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -5911,6 +5913,52 @@ fn main() -> ExitCode {
                 Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
                 Err(e) => {
                     eprintln!("td-builder: store-ns: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-builder userns-private -- CMD ARGS... — a private mount+user namespace
+        // over the CURRENT root: no pivot_root, no fresh tmpfs, no bind allowlist.
+        // The native replacement for the util-linux `unshare -rm` CLI a gate body
+        // used to shell out to (gate 171 stage0-cold-start's cold leg: it needs the
+        // WHOLE host filesystem visible minus one path hidden by a private bind
+        // mount — the opposite shape from host-sandbox/store-ns, which both pivot
+        // into a FRESH root with an explicit bind allowlist). Maps to ROOT (uid/gid
+        // 0), matching `-r`/`--map-root-user`: the namespace creator holds full
+        // capabilities inside it regardless of the mapped id, so the raw mount(2)
+        // syscall would succeed either way, but the `mount(8)` CLI itself refuses
+        // ("must be superuser") unless its apparent euid is 0 — verified empirically
+        // (an identity map here made a plain `mount --bind` inside fail with that
+        // message even though the syscall-level capability was present).
+        //   userns-private -- CMD ARGS...
+        Some("userns-private") if args.len() >= 4 && args[2] == "--" => {
+            let cmd = args[3].clone();
+            let cmd_args: Vec<String> = args[4..].to_vec();
+            let run = || -> Result<(), String> {
+                let host_uid = sys::getuid();
+                let host_gid = sys::getgid();
+                sys::unshare(sys::CLONE_NEWUSER | sys::CLONE_NEWNS)
+                    .map_err(|e| format!("unshare(NEWUSER|NEWNS): {e}"))?;
+                std::fs::write("/proc/self/setgroups", "deny")
+                    .map_err(|e| format!("setgroups: {e}"))?;
+                std::fs::write("/proc/self/uid_map", format!("0 {host_uid} 1"))
+                    .map_err(|e| format!("uid_map: {e}"))?;
+                std::fs::write("/proc/self/gid_map", format!("0 {host_gid} 1"))
+                    .map_err(|e| format!("gid_map: {e}"))?;
+                // Make the root mount tree private so a nested mount (e.g. the
+                // caller's `mount --bind ... /var/guix`) never propagates to the
+                // host — `unshare -m`'s actual behavior, not merely a fresh
+                // mount-namespace id.
+                let root_c = CString::new("/").map_err(|e| e.to_string())?;
+                sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)
+                    .map_err(|e| format!("mount(/ private): {e}"))?;
+                let err = Command::new(&cmd).args(&cmd_args).exec();
+                Err(format!("exec {cmd}: {err}"))
+            };
+            match run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: userns-private: {e}");
                     ExitCode::FAILURE
                 }
             }
