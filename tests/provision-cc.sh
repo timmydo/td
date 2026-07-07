@@ -12,9 +12,16 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 lock=tests/td-builder-rust.lock
 test -s "$lock" || fail "no lock $lock"
-lg=$(grep -- '-gcc-toolchain-' "$lock" | sed 's/^[^ ]* //' | head -1)
-lr=$(grep -- '-rust-[0-9]' "$lock" | grep -v -- '-cargo' | sed 's/^[^ ]* //' | head -1)
-lc=$(grep -- '-rust-.*-cargo' "$lock" | sed 's/^[^ ]* //' | head -1)
+lg=
+lr=
+lc=
+while IFS=' ' read -r _name _path _rest; do
+  case "$_path" in
+    */*-gcc-toolchain-*) [ -n "$lg" ] || lg="$_path" ;;
+    */*-rust-[0-9]*-cargo) [ -n "$lc" ] || lc="$_path" ;;
+    */*-rust-[0-9]*) [ -n "$lr" ] || lr="$_path" ;;
+  esac
+done < "$lock"
 { [ -n "$lg" ] && { [ -x "$lg/bin/gcc" ] || [ -x "$lg/bin/cc" ]; } && [ -x "$lr/bin/rustc" ] && [ -x "$lc/bin/cargo" ]; } \
   || fail "pinned lock seed not realized (run the full loop; $lg / $lr / $lc)"
 

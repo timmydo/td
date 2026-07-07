@@ -9,8 +9,7 @@
 //!   1. the guix-free `check-harness` tier branch (never touches guix),
 //!   2. the netns-probe discrimination check,
 //!   3. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   4. the loop PATH: core host-provided tools from tools/loop-toolchain.txt
-//!      plus td-declared text tools resolved from tests/hello-no-guix.lock,
+//!   4. the loop PATH: host-provided tools from tools/loop-toolchain.txt,
 //!   5. the warm prelude (subst store, source/crate warms, build daemon),
 //!   6. the machine-wide slot dir, and
 //!   7. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon -- TB gate-run.
@@ -120,11 +119,14 @@ fn guard_netns_probe() -> Result<(), String> {
 fn provision_stage0(root: &Path) -> Result<String, String> {
     let applets = current_binary_native_applet_path(root)?;
     let path = std::env::var("PATH").unwrap_or_default();
+    let self_exe = std::env::current_exe()
+        .map_err(|e| fatal(&format!("could not resolve current td-builder executable: {e}")))?;
     let out = run_capture(
         Command::new("sh")
             .arg("-c")
             .arg(". tests/cache-lib.sh && provision_stage0 1>&2 && printf '%s' \"$TB\"")
             .env("PATH", format!("{applets}:{path}"))
+            .env("TD_BUILDER_SELF", &self_exe)
             .current_dir(root),
     )
     .map_err(|e| {
@@ -269,103 +271,6 @@ fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
         )));
     }
     Ok(dirs.join(":"))
-}
-
-const DECLARED_LOOP_TOOLS_LOCK: &str = "tests/hello-no-guix.lock";
-const DECLARED_LOOP_TOOLS: &[(&str, &str)] =
-    &[("sed", "sed"), ("grep", "grep"), ("findutils", "find")];
-
-#[derive(Debug, PartialEq, Eq)]
-enum DeclaredLoopToolError {
-    Lock(String),
-    MissingBinary(String),
-}
-
-impl std::fmt::Display for DeclaredLoopToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeclaredLoopToolError::Lock(m) | DeclaredLoopToolError::MissingBinary(m) => {
-                f.write_str(m)
-            }
-        }
-    }
-}
-
-/// Text/tree tools are no longer host-PATH loop tools. They are ordinary,
-/// declared seed artifacts pinned by tests/hello-no-guix.lock, so td resolves
-/// that lock and adds the exact bin dirs to the loop PATH. findutils also
-/// carries xargs, which several historical gate scripts use through the same
-/// package even though xargs was never listed as a representative binary.
-fn declared_loop_tool_dirs_from_lock<F>(
-    lock_text: &str,
-    exists: F,
-) -> Result<String, DeclaredLoopToolError>
-where
-    F: Fn(&Path) -> bool,
-{
-    let entries = crate::lock::parse(lock_text, "").map_err(DeclaredLoopToolError::Lock)?;
-    let mut dirs: Vec<String> = Vec::new();
-    for (stem, bin) in DECLARED_LOOP_TOOLS {
-        let mut hits: Vec<&str> = entries
-            .iter()
-            .map(|e| e.path.as_str())
-            .filter(|p| crate::gate_inputs::path_names_stem(p, stem))
-            .collect();
-        hits.sort_unstable();
-        hits.dedup();
-        let path = match hits.as_slice() {
-            [one] => *one,
-            [] => {
-                return Err(DeclaredLoopToolError::Lock(format!(
-                    "{DECLARED_LOOP_TOOLS_LOCK} has no `{stem}` entry"
-                )))
-            }
-            many => {
-                return Err(DeclaredLoopToolError::Lock(format!(
-                    "{DECLARED_LOOP_TOOLS_LOCK} has ambiguous `{stem}` entries: {}",
-                    many.join(", ")
-                )))
-            }
-        };
-        if !path.starts_with(SANDBOX_STORE_PREFIX) {
-            return Err(DeclaredLoopToolError::Lock(format!(
-                "{DECLARED_LOOP_TOOLS_LOCK} `{stem}` resolved to {path}, outside {SANDBOX_STORE_PREFIX}"
-            )));
-        }
-        let bin_path = Path::new(path).join("bin").join(bin);
-        if !exists(&bin_path) {
-            return Err(DeclaredLoopToolError::MissingBinary(format!(
-                "{DECLARED_LOOP_TOOLS_LOCK} `{stem}` resolved to {path}, but {} is not present",
-                bin_path.display()
-            )));
-        }
-        let dir = Path::new(path).join("bin").display().to_string();
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    }
-    Ok(dirs.join(":"))
-}
-
-fn provision_declared_loop_tools(root: &Path) -> Result<String, CheckError> {
-    let lock_path = root.join(DECLARED_LOOP_TOOLS_LOCK);
-    let lock_text = std::fs::read_to_string(&lock_path)
-        .map_err(|e| fatal(&format!("cannot read {}: {e}", lock_path.display())))?;
-    declared_loop_tool_dirs_from_lock(&lock_text, Path::is_file)
-        .map_err(|e| match e {
-            DeclaredLoopToolError::Lock(m) => {
-                CheckError::Fatal(fatal(&format!("declared loop tools: {m}")))
-            }
-            DeclaredLoopToolError::MissingBinary(m) => {
-                CheckError::Unprovisioned(fatal(&format!("declared loop tools: {m}")))
-            }
-        })
-}
-
-fn provision_loop_path(root: &Path) -> Result<String, CheckError> {
-    let declared = provision_declared_loop_tools(root)?;
-    let host = provision_toolchain(root)?;
-    Ok(format!("{declared}:{host}"))
 }
 
 fn native_applet_path(root: &Path, provider: &str) -> Result<String, String> {
@@ -1095,11 +1000,14 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
 fn load_stage0_tb(root: &Path) -> Result<String, CheckError> {
     let applets = current_binary_native_applet_path(root)?;
     let path = std::env::var("PATH").unwrap_or_default();
+    let self_exe = std::env::current_exe()
+        .map_err(|e| CheckError::Fatal(fatal(&format!("could not resolve current td-builder executable: {e}"))))?;
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(". tests/cache-lib.sh && load_stage0 1>&2 && printf '%s' \"$TB\"")
         .env("PATH", format!("{applets}:{path}"))
         .env("TD_STAGE0_BASE", root.join(".td-build-cache/stage0"))
+        .env("TD_BUILDER_SELF", &self_exe)
         .current_dir(root);
     let out = run_capture(&mut cmd)
         .map_err(|_| CheckError::Unprovisioned(fatal("could not build the stage0 td-builder")))?;
@@ -1281,9 +1189,10 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 
     guard_netns_probe()?;
 
-    // No guix process remains: the loop PATH is td-resolved declared text tools
-    // plus the host-PATH core toolchain (provision_loop_path, make/bash/…); no
-    // gate spawns `guix build`.
+    // No guix process remains: the loop PATH is only the host-PATH toolchain
+    // declared in tools/loop-toolchain.txt. Gate text/tree work must invoke
+    // td-builder typed helpers or td-built userland instead of inheriting GNU
+    // sed/grep/findutils from a seed lock.
 
     // Light tiers own no heavy gate — skip the heavy warms + daemon (exactly the
     // shell prelude's goal scan).
@@ -1292,7 +1201,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     });
 
     let tb = provision_stage0(&root)?;
-    let toolchain = provision_loop_path(&root)?;
+    let toolchain = provision_toolchain(&root)?;
     let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain)
         .map_err(|e| CheckError::Fatal(fatal(&format!("could not provision loop native applets ({e})"))))?;
 
@@ -1498,7 +1407,7 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     })?;
     // check-rung is a dev helper, not the loop: it does not branch on the
     // provisioned/regression distinction, so collapse CheckError back to a string.
-    let toolchain = provision_loop_path(&root).map_err(|e| e.to_string())?;
+    let toolchain = provision_toolchain(&root).map_err(|e| e.to_string())?;
     let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain)
         .map_err(|e| format!("check-rung: FATAL: could not provision loop native applets ({e})"))?;
     eprintln!(
@@ -1521,6 +1430,7 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
         .arg(harness)
         .args(rest)
         .env("PATH", toolchain)
+        .env("TD_BUILDER_SELF", &tb)
         .current_dir(&root);
     // Replace this process, exactly as the shell helper's `exec` did.
     use std::os::unix::process::CommandExt as _;
@@ -1672,74 +1582,4 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
         );
     }
 
-    #[test]
-    fn declared_loop_tools_resolve_from_lock() {
-        let lock = "\
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9 /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
-cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
-";
-        let got = declared_loop_tool_dirs_from_lock(lock, |p| {
-            matches!(
-                p.to_str(),
-                Some("/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9/bin/sed")
-                    | Some("/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11/bin/grep")
-                    | Some("/gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0/bin/find")
-            )
-        })
-        .unwrap();
-        assert_eq!(
-            got,
-            "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9/bin:/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11/bin:/gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0/bin"
-        );
-    }
-
-    #[test]
-    fn declared_loop_tools_reject_missing_binary() {
-        let lock = "\
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9 /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
-cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
-";
-        let err = declared_loop_tool_dirs_from_lock(lock, |_| false).unwrap_err();
-        assert!(matches!(err, DeclaredLoopToolError::MissingBinary(_)));
-        assert!(err.to_string().contains("sed"), "got: {err}");
-        assert!(err.to_string().contains("not present"), "got: {err}");
-    }
-
-    #[test]
-    fn declared_loop_tools_must_be_under_bound_store() {
-        let lock = "\
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9 /tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
-cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
-";
-        let err = declared_loop_tool_dirs_from_lock(lock, |_| true).unwrap_err();
-        assert!(matches!(err, DeclaredLoopToolError::Lock(_)));
-        assert!(err.to_string().contains("outside /gnu/store/"), "got: {err}");
-    }
-
-    #[test]
-    fn declared_loop_tools_reject_missing_lock_entry() {
-        let lock = "\
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
-cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
-";
-        let err = declared_loop_tool_dirs_from_lock(lock, |_| true).unwrap_err();
-        assert!(matches!(err, DeclaredLoopToolError::Lock(_)));
-        assert!(err.to_string().contains("no `sed` entry"), "got: {err}");
-    }
-
-    #[test]
-    fn declared_loop_tools_reject_ambiguous_lock_entry() {
-        let lock = "\
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9 /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sed-4.9
-dddddddddddddddddddddddddddddddd-sed-4.8 /gnu/store/dddddddddddddddddddddddddddddddd-sed-4.8
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-grep-3.11
-cccccccccccccccccccccccccccccccc-findutils-4.10.0 /gnu/store/cccccccccccccccccccccccccccccccc-findutils-4.10.0
-";
-        let err = declared_loop_tool_dirs_from_lock(lock, |_| true).unwrap_err();
-        assert!(matches!(err, DeclaredLoopToolError::Lock(_)));
-        assert!(err.to_string().contains("ambiguous `sed` entries"), "got: {err}");
-    }
 }

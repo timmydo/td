@@ -39,7 +39,15 @@
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 sha() { sha256sum "$1" | cut -d' ' -f1; }
-lf() { sed -n "s/^$2 //p" "$1" | head -1; }
+lf() {
+  _want="$2"
+  while IFS=' ' read -r _key _rest; do
+    [ "$_key" = "$_want" ] || continue
+    printf '%s\n' "$_rest"
+    return 0
+  done < "$1"
+  return 1
+}
 
 bootstrap_modern_toolchain() {
 # --- [pinned-input] every chain tarball + vendored boot patch matches its sha256 pin -----------
@@ -65,7 +73,9 @@ for l in "$MES_LOCK" "$NYACC_LOCK" "$TCC_LOCK" "$MAKE_LOCK" "$PATCH_LOCK" "$BU_L
   test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
   test "`sha "$f"`" = "`lf "$l" sha256`" || fail "warmed $f sha256 != lock pin"
 done
-KH_VER=`printf '%s' "\`lf "$LINUX_LOCK" file\`" | sed -n 's/^linux-\(.*\)\.tar\..*$/\1/p'`
+_kh_file=`lf "$LINUX_LOCK" file`
+KH_VER=${_kh_file#linux-}
+KH_VER=${KH_VER%%.tar*}
 KH_TB=".td-build-cache/sources/linux-headers-$KH_VER-i386.tar.gz"
 test -f "$KH_TB" || fail "kernel-headers tarball not warm ($KH_TB) — run 'td-feed warm sources'"
 for pp in binutils-boot-2.20.1a:f6be78a06f2c9905e019ade08f701e5468386cf1934aa27757a64c619571da20 \
@@ -121,7 +131,7 @@ ladder_build glibc-241 >/dev/null || fail "the recipe ladder did not build (see 
 
 # --- tail exports + [no-guix] re-asserts (every run, warm or cold) ----------------------------
 LADDER_TDSTORE="$LWDIR/scratch/tdstore"
-_lout() { _o=`sed -n "s/^STEP $1 //p" "$LWDIR/build-glibc-241.out" | tail -1`; test -n "$_o" || fail "no STEP output for $1"; printf '%s' "${_o##*/}"; }
+_lout() { _o=`"$TB" text extract-prefix-last "STEP $1 " "$LWDIR/build-glibc-241.out"`; test -n "$_o" || fail "no STEP output for $1"; printf '%s' "${_o##*/}"; }
 GCC14_BASE=`_lout gcc-14`; GLIBC241_BASE=`_lout glibc-241`
 BU244_BASE=`_lout binutils-244`; GLSHARED_BASE=`_lout glibc-mesboot-shared`
 GCC14="$LADDER_TDSTORE/$GCC14_BASE/stage/td/store/gcc-14.3.0"
@@ -143,7 +153,7 @@ for b in "$GLIBC241/lib/libc.so.6" "$GCC14/bin/gcc" "$CC1" \
          "$GCCLIBEXEC/libgcc.a" "$GCCLIBEXEC/crtbegin.o" "$GCCLIBEXEC/crtend.o" \
          "$GCC14/lib/libstdc++.a"; do
   test -n "$b" -a -e "$b" || fail "toolchain link input missing ($b)"
-  if grep -q -a '/gnu/store' "$b"; then fail "$b contains /gnu/store bytes"; fi
+  if ! "$TB" text not-contains '/gnu/store' "$b"; then fail "$b contains /gnu/store bytes"; fi
 done
 echo "   [no-guix] recipe ladder: seed → … → gcc 14.3.0 + binutils 2.44 → glibc 2.41; no /gnu/store in libc.so.6 / gcc / cc1 / crt / libgcc / libstdc++"
 }

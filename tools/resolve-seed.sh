@@ -47,7 +47,35 @@ root=${TD_SEED_ROOT:-/gnu/store}
 
 fail() { echo "resolve-seed: FAIL — $1" >&2; exit 1; }
 
-roots=`sed -n 's/^[^ ]* \(\/gnu\/store\/[^ ]*\)$/\1/p' "$lock" 2>/dev/null` || roots=""
+narinfo_field() {
+  _nf_key=$1
+  _nf_file=$2
+  while IFS= read -r _nf_line; do
+    case "$_nf_line" in
+      "$_nf_key":\ *) printf '%s\n' "${_nf_line#*: }"; return 0 ;;
+    esac
+  done < "$_nf_file"
+  return 1
+}
+
+serve_port() {
+  _sp_file=$1
+  while IFS= read -r _sp_line; do
+    case "$_sp_line" in
+      *http://127.0.0.1:*)
+        _sp_rest=${_sp_line#*http://127.0.0.1:}
+        _sp_port=${_sp_rest%%/*}
+        case "$_sp_port" in ''|*[!0-9]*) ;; *) printf '%s\n' "$_sp_port"; return 0 ;; esac
+        ;;
+    esac
+  done < "$_sp_file"
+  return 1
+}
+
+roots=
+while IFS=' ' read -r _name _path _rest; do
+  case "$_path" in /gnu/store/*) roots="$roots $_path" ;; esac
+done < "$lock"
 [ -n "$roots" ] || fail "no /gnu/store seed paths in $lock (missing/malformed lock — regenerate it on a channel bump)"
 
 # The common warm path: every root already present — nothing to fetch, no server spawned.
@@ -95,7 +123,7 @@ spid=$!
 port=
 i=0
 while [ "$i" -lt 100 ]; do
-  port=`sed -n 's#.*http://127.0.0.1:\([0-9]*\)/.*#\1#p' "$work/serve.log" 2>/dev/null || true`
+  port=`serve_port "$work/serve.log" 2>/dev/null || true`
   [ -n "$port" ] && break
   i=$((i + 1)); sleep 0.1
 done
@@ -128,16 +156,16 @@ while :; do
     || fail "fetch/verify of $base failed (bad signature vs $pub, or corrupt nar): $(tail -1 "$work/fetch.err" 2>/dev/null)"
   # The NAME is load-bearing alongside the signature: a validly-signed substitute for a
   # DIFFERENT store path is not the seed we asked for.
-  fsp=`grep '^StorePath: ' "$fd/$base.narinfo" | cut -d' ' -f2`
+  fsp=`narinfo_field StorePath "$fd/$base.narinfo" 2>/dev/null || true`
   [ "x$fsp" = "x/gnu/store/$base" ] || fail "fetched StorePath ($fsp) != the expected /gnu/store/$base"
-  narfile=`grep '^NarFile: ' "$fd/$base.narinfo" | cut -d' ' -f2`
+  narfile=`narinfo_field NarFile "$fd/$base.narinfo" 2>/dev/null || true`
   [ -n "$narfile" ] && [ -f "$fd/$narfile" ] || fail "fetched narinfo for $base names no nar file"
   tmp="$root/.resolve-seed.$$.$base"
   rm -rf "$tmp"
   "$tb" nar-restore "$fd/$narfile" "$tmp" >/dev/null 2>"$work/restore.err" \
     || { rm -rf "$tmp"; fail "nar-restore of $base failed: $(tail -1 "$work/restore.err" 2>/dev/null)"; }
   rm -f "$fd/$narfile"
-  refs=`sed -n 's/^References: //p' "$fd/$base.narinfo"`
+  refs=`narinfo_field References "$fd/$base.narinfo" 2>/dev/null || true`
   [ -n "$refs" ] && queue="$queue $refs"
   case "$rootbases" in
     *" $base "*) rootlist="$rootlist $base" ;;

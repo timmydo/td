@@ -88,12 +88,12 @@ cached_build() {
        "$TB" assemble-recipe \
        "$sd/recipe.json" "$_lock" "$sd/b" > "$sd/bout" 2>"$sd/err"; then :; \
   else echo "FAIL: assemble-recipe $_spec (guix/Guile off PATH):" >&2; tail -20 "$sd/err" >&2; return 1; fi
-  _drvf=`sed -n 's/^DRV=//p' "$sd/bout"`
+  _drvf=`"$TB" text extract-prefix 'DRV=' "$sd/bout"`
   test -n "$_drvf" && [ -f "$_drvf" ] || { echo "FAIL: assemble-recipe produced no .drv for $_spec" >&2; cat "$sd/bout" "$sd/err" >&2; return 1; }
   # [DURABLE structural, brick 3] the assembled drv's builder is the td-bootstrapped stage0,
   # NOT the guix-built td-builder. Non-vacuous: TD_BUILDER_PATH must be the stage0 placement.
   test -n "$TD_BUILDER_PATH" || { echo "FAIL: TD_BUILDER_PATH unset — load_stage0 did not place a stage0 builder" >&2; return 1; }
-  grep -qF "$TD_BUILDER_PATH/bin/td-builder" "$_drvf" \
+  "$TB" text contains "$TD_BUILDER_PATH/bin/td-builder" "$_drvf" \
     || { echo "FAIL: $_spec .drv builder is not the stage0 $TD_BUILDER_PATH — built by the wrong td-builder?" >&2; return 1; }
   # (2) SUBMIT to the shared daemon, carrying the SEED STORE DIR (content-scanned for the
   # input closure — #267 retired the /var/guix/db read) + the per-request builder override

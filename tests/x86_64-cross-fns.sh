@@ -19,6 +19,21 @@ XTARGET=x86_64-pc-linux-gnu
 # endorses -j for exactly these (keep the mesboot base serial). Override with X86_MAKE_J= for serial.
 : "${X86_MAKE_J:=-j4}"
 
+x86_parent_of_first_named() {
+  _xpat=$1
+  _xroot=$2
+  _xf=`"$TB" files-name-first "$_xpat" "$_xroot" 2>/dev/null` || return 1
+  dirname "$_xf"
+}
+
+x86_indent_file() {
+  while IFS= read -r _xline; do printf '   %s\n' "$_xline"; done < "$1"
+}
+
+x86_indent_file_err() {
+  while IFS= read -r _xline; do printf '     %s\n' "$_xline" >&2; done < "$1"
+}
+
 # _store_tool <name> <guix-pkg> — a build-time scaffolding tool, from PATH or the exposed /gnu/store.
 # _xbin <dir> — a bin/ of the autoconf/recursive-make scaffolding (awk/sed/make/bison/flex/…). Kept
 # for the userland gate (busybox's Kbuild) after the cross build_* rungs became recipes.
@@ -76,17 +91,15 @@ run_x86_64_cross() {
   ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
   _x86_64_emit_cross || return 1
   ladder_build gcc-x86-64-stage2 || { echo "the x86_64 cross toolchain ladder failed" >&2; return 1; }
-  _lt="$_lw/scratch/tdstore"
-  _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-gcc-x86-64-stage2.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
   # Export ONLY the cross toolchain trees (run_x86_64_cross's contract, consumed by verify/closure/
   # native): binutils-x86-64, gcc-x86-64-stage2, glibc-x86-64. gcc-14/glibc-mesboot(-shared)/
   # binutils-244 are in the plan as build DEPS but are NOT exported — they were gate-locals for the
   # retired shell repro leg, and glibc-mesboot-shared isn't even in stage2's closure.
-  XBU=`_lo binutils-x86-64` || return 1
-  _b=`_lo gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
-  _b=`_lo glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
-  XLIBGCCDIR=`find "$XGCC2" -name 'libgcc_s.so.1' | head -1 | xargs -r dirname`
-  XSTDCXXDIR=`find "$XGCC2" -name 'libstdc++.so.6*' | head -1 | xargs -r dirname`
+  XBU=`ladder_out binutils-x86-64` || return 1
+  _b=`ladder_out gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
+  _b=`ladder_out glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
+  XLIBGCCDIR=`x86_parent_of_first_named 'libgcc_s.so.1' "$XGCC2"` || return 1
+  XSTDCXXDIR=`x86_parent_of_first_named 'libstdc++.so.6*' "$XGCC2"` || return 1
   X86_WORK="$_lw"; X86_SYSROOT="$_lw/x-sysroot-unused"
   export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR X86_WORK X86_SYSROOT
   echo "   [ladder] x86_64 cross toolchain via build-plan --auto: i686 base (21 rungs) -> cross binutils 2.44 -> gcc stage1 -> glibc 2.41 -> gcc stage2"
@@ -114,14 +127,12 @@ run_x86_64_rust_toolchain() {
   ladder_intern_extra zlib-x86-64-source zlib-1.3.1 || return 1
   ladder_emit zlib-x86-64 rust-toolchain || return 1
   ladder_build rust-toolchain || { echo "the x86_64 rust-toolchain ladder failed" >&2; return 1; }
-  _lt="$_lw/scratch/tdstore"
-  _lo() { _o=`sed -n "s/^STEP $1 //p" "$_lw/build-rust-toolchain.out" | tail -1`; test -n "$_o" || { echo "no STEP output for $1" >&2; return 1; }; printf '%s/%s' "$_lt" "${_o##*/}"; }
-  XBU=`_lo binutils-x86-64` || return 1
-  _b=`_lo gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
-  _b=`_lo glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
-  XLIBGCCDIR=`find "$XGCC2" -name 'libgcc_s.so.1' | head -1 | xargs -r dirname`
-  XSTDCXXDIR=`find "$XGCC2" -name 'libstdc++.so.6*' | head -1 | xargs -r dirname`
-  XRUSTTREE=`_lo rust-toolchain` || return 1
+  XBU=`ladder_out binutils-x86-64` || return 1
+  _b=`ladder_out gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
+  _b=`ladder_out glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
+  XLIBGCCDIR=`x86_parent_of_first_named 'libgcc_s.so.1' "$XGCC2"` || return 1
+  XSTDCXXDIR=`x86_parent_of_first_named 'libstdc++.so.6*' "$XGCC2"` || return 1
+  XRUSTTREE=`ladder_out rust-toolchain` || return 1
   X86_WORK="$_lw"; X86_SYSROOT="$_lw/x-sysroot-unused"
   export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR XRUSTTREE X86_WORK X86_SYSROOT
   echo "   [ladder] x86_64 rust-toolchain via build-plan --auto: cross toolchain -> zlib-x86-64 -> rust-toolchain (relinked rustc/cargo tree $XRUSTTREE)"
@@ -137,10 +148,10 @@ run_x86_64_rust_toolchain() {
 # (the lock-keyed path a consumer fetches as a substitute — x64-toolchain-subst PR2).
 verify_x86_64_ownroot() {
   cpath=$1; snwork=$2; store="$snwork/td-store"; sndb="$snwork/store.db"; mkdir -p "$store"
-  xcc1=`find "$XGCC2" -name cc1 | head -1`
+  xcc1=`"$TB" files-name-first cc1 "$XGCC2"`
   for b in "$XGLIBC/lib/libc.so.6" "$XGCC2/bin/$XTARGET-gcc" "$xcc1"; do
     test -n "$b" -a -e "$b" || { echo "x86_64 output missing ($b)" >&2; return 1; }
-    if grep -q -a '/gnu/store' "$b"; then echo "$b contains /gnu/store bytes" >&2; return 1; fi
+    if "$TB" text contains '/gnu/store' "$b"; then echo "$b contains /gnu/store bytes" >&2; return 1; fi
   done
   echo "   [no-guix] x86_64 glibc 2.41 + cross gcc: no /gnu/store in libc.so.6 / x86_64-gcc / cc1"
   GLP=`"$TB" store-add-recursive glibc-2.41-x86_64 "$XGLIBC" "$store" "$sndb"` || { echo "store-add x86_64 glibc failed" >&2; return 1; }
@@ -159,12 +170,12 @@ verify_x86_64_ownroot() {
   chmod 0555 "$bw/gcc" "$bw/g++"
   ( cd "$snwork/w" && env PATH="$XBU/bin:$cpath" "$bw/gcc" -o c.out c.c ) || { echo "cross gcc did not compile x86_64 C vs glibc 2.41" >&2; return 1; }
   ( cd "$snwork/w" && env PATH="$XBU/bin:$cpath" "$bw/g++" -O2 -o cpp.out cpp.cc ) || { echo "cross g++ did not compile x86_64 C++ vs glibc 2.41" >&2; return 1; }
-  cls=`"$XBU/bin/$XTARGET-readelf" -h "$snwork/w/c.out" 2>/dev/null | grep -i 'class:' | grep -o 'ELF64'`
-  test "$cls" = ELF64 || { echo "verify program not ELF 64-bit (x86_64); got '$cls'" >&2; return 1; }
-  ci=`"$XBU/bin/$XTARGET-readelf" -l "$snwork/w/c.out" 2>/dev/null | grep -o "/td/store/$glrel/lib/ld-linux-x86-64.so.2" | head -1`
-  test -n "$ci" || { echo "C program interp not the /td/store x86_64 ld" >&2; return 1; }
-  if grep -q -a '/gnu/store' "$snwork/w/c.out"; then echo "x86_64 C program contains /gnu/store bytes" >&2; return 1; fi
-  echo "   built x86_64 (ELF 64-bit) C + C++ programs vs glibc 2.41, interp=$ci, no /gnu/store"
+  "$XBU/bin/$XTARGET-readelf" -h "$snwork/w/c.out" > "$snwork/w/c.head" 2>/dev/null
+  "$TB" text contains 'ELF64' "$snwork/w/c.head" || { echo "verify program not ELF 64-bit (x86_64)" >&2; return 1; }
+  "$XBU/bin/$XTARGET-readelf" -l "$snwork/w/c.out" > "$snwork/w/c.prog" 2>/dev/null
+  "$TB" text contains "/td/store/$glrel/lib/ld-linux-x86-64.so.2" "$snwork/w/c.prog" || { echo "C program interp not the /td/store x86_64 ld" >&2; return 1; }
+  if "$TB" text contains '/gnu/store' "$snwork/w/c.out"; then echo "x86_64 C program contains /gnu/store bytes" >&2; return 1; fi
+  echo "   built x86_64 (ELF 64-bit) C + C++ programs vs glibc 2.41, interp=/td/store/$glrel/lib/ld-linux-x86-64.so.2, no /gnu/store"
   mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
   WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || { echo "store-add prog failed" >&2; return 1; }; wprel=${WP#/td/store/}
   # the static-bash fixture is a DECLARED gate input (#353): every gate calling
@@ -175,12 +186,13 @@ verify_x86_64_ownroot() {
   snscript='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 /td/store/'"$wprel"'/bin/c; echo "CRC=$?"
 /td/store/'"$wprel"'/bin/cpp; echo "CPPRC=$?"'
-  snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | sed 's/^/     /' >&2; echo "store-ns x86_64 probe exited nonzero" >&2; return 1; }
-  printf '%s\n' "$snout" | sed 's/^/     /' >&2
-  echo "$snout" | grep -q '^CRC=42$'   || { echo "x86_64 C program did not return 42 in the own-root" >&2; return 1; }
-  echo "$snout" | grep -q '^CPPRC=42$' || { echo "x86_64 C++ program did not return 42 in the own-root" >&2; return 1; }
+  snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" > "$snwork/snout"; x86_indent_file_err "$snwork/snout"; echo "store-ns x86_64 probe exited nonzero" >&2; return 1; }
+  printf '%s\n' "$snout" > "$snwork/snout"
+  x86_indent_file_err "$snwork/snout"
+  "$TB" text line-exact 'CRC=42' "$snwork/snout" || { echo "x86_64 C program did not return 42 in the own-root" >&2; return 1; }
+  "$TB" text line-exact 'CPPRC=42' "$snwork/snout" || { echo "x86_64 C++ program did not return 42 in the own-root" >&2; return 1; }
   echo "   [behavioral] cross gcc 14.3.0 links a DYNAMIC x86_64 C AND C++ program vs MODERN x86_64 glibc 2.41; both run in the own-root → 42"
-  echo "$snout" | grep -q '^GNU-ABSENT$' || { echo "/gnu/store is PRESENT in the own-root" >&2; return 1; }
+  "$TB" text line-exact 'GNU-ABSENT' "$snwork/snout" || { echo "/gnu/store is PRESENT in the own-root" >&2; return 1; }
   echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT"
 
   # --- [input-addressed] (x64-toolchain-subst) intern the REAL x86_64 glibc 2.41 at the
@@ -209,15 +221,16 @@ verify_x86_64_ownroot() {
   chmod 0555 "$bw/gcc-ia"
   ( cd "$snwork/w" && env PATH="$XBU/bin:$cpath" "$bw/gcc-ia" -o cia.out c.c ) \
     || { echo "could not build an x86_64 C program vs the input-addressed glibc" >&2; return 1; }
-  iaci=`"$XBU/bin/$XTARGET-readelf" -l "$snwork/w/cia.out" 2>/dev/null | grep -o "/td/store/$iarel/lib/ld-linux-x86-64.so.2" | head -1`
-  test -n "$iaci" || { echo "input-addressed program interp not the lock-keyed /td/store x86_64 ld" >&2; return 1; }
+  "$XBU/bin/$XTARGET-readelf" -l "$snwork/w/cia.out" > "$snwork/w/cia.prog" 2>/dev/null
+  "$TB" text contains "/td/store/$iarel/lib/ld-linux-x86-64.so.2" "$snwork/w/cia.prog" || { echo "input-addressed program interp not the lock-keyed /td/store x86_64 ld" >&2; return 1; }
   mkdir -p "$store/progia/bin"; cp "$snwork/w/cia.out" "$store/progia/bin/c"; chmod -R u+w "$store"
   WPIA=`"$TB" store-add-recursive progia "$store/progia" "$store" "$sndb"` || { echo "store-add progia failed" >&2; return 1; }; wpiarel=${WPIA#/td/store/}
   snia='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 /td/store/'"$wpiarel"'/bin/c; echo "IARC=$?"'
   snoia=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snia" 2>&1` \
-    || { printf '%s\n' "$snoia" | sed 's/^/     /' >&2; echo "store-ns input-addressed x86_64 probe exited nonzero" >&2; return 1; }
-  echo "$snoia" | grep -q '^IARC=42$' || { printf '%s\n' "$snoia" | sed 's/^/     /' >&2; echo "x86_64 program vs the input-addressed glibc did not return 42 in the own-root" >&2; return 1; }
+    || { printf '%s\n' "$snoia" > "$snwork/snoia"; x86_indent_file_err "$snwork/snoia"; echo "store-ns input-addressed x86_64 probe exited nonzero" >&2; return 1; }
+  printf '%s\n' "$snoia" > "$snwork/snoia"
+  "$TB" text line-exact 'IARC=42' "$snwork/snoia" || { x86_indent_file_err "$snwork/snoia"; echo "x86_64 program vs the input-addressed glibc did not return 42 in the own-root" >&2; return 1; }
   echo "   [behavioral/input-addressed] a DYNAMIC x86_64 program whose interp IS the lock-keyed /td/store glibc runs in the own-root → 42 — real x86_64 bytes at a predictable, fetchable path"
 
 }
@@ -294,14 +307,17 @@ verify_x86_64_native_ownroot() {
   test -n "${XNGCC:-}" -a -d "${XNGCC:-/nonexistent}" || { echo "native gcc tree (XNGCC) unset" >&2; return 1; }
   test -n "${XNBU:-}" -a -d "${XNBU:-/nonexistent}" || { echo "native binutils tree (XNBU) unset" >&2; return 1; }
   test -n "${XGLIBC:-}" -a -d "${XGLIBC:-/nonexistent}" || { echo "x86_64 glibc tree (XGLIBC) unset" >&2; return 1; }
-  ngcc=`"$XNBU/bin/readelf" -h "$XNGCC/bin/gcc" 2>/dev/null`
-  echo "$ngcc" | grep -i 'class:' | grep -q 'ELF64' || { echo "native gcc not ELF64" >&2; return 1; }
-  echo "$ngcc" | grep -i 'machine:' | grep -qi 'x86-64' || { echo "native gcc machine is not x86-64" >&2; return 1; }
+  "$XNBU/bin/readelf" -h "$XNGCC/bin/gcc" > "$snwork/ngcc.head" 2>/dev/null
+  "$TB" text contains 'ELF64' "$snwork/ngcc.head" || { echo "native gcc not ELF64" >&2; return 1; }
+  if ! "$TB" text contains 'X86-64' "$snwork/ngcc.head" && ! "$TB" text contains 'x86-64' "$snwork/ngcc.head"; then
+    echo "native gcc machine is not x86-64" >&2
+    return 1
+  fi
   echo "   [native-arch] the native gcc/binutils ARE ELF 64-bit x86_64 binaries (not the i686 cross gcc)"
-  ncc1=`find "$XNGCC" -name cc1 | head -1`
+  ncc1=`"$TB" files-name-first cc1 "$XNGCC"`
   for b in "$XNGCC/bin/gcc" "$ncc1" "$XNBU/bin/as" "$XNBU/bin/ld" "$XGLIBC/lib/libc.so.6"; do
     test -n "$b" -a -e "$b" || { echo "native output missing ($b)" >&2; return 1; }
-    if grep -q -a '/gnu/store' "$b"; then echo "$b contains /gnu/store bytes" >&2; return 1; fi
+    if "$TB" text contains '/gnu/store' "$b"; then echo "$b contains /gnu/store bytes" >&2; return 1; fi
   done
   echo "   [no-guix] the native gcc/cc1 + native as/ld + the x86_64 libc.so.6 carry no /gnu/store bytes"
   # intern the native toolchain closure as siblings under /td/store: native binutils, native gcc, and the
@@ -354,15 +370,16 @@ case "\$itp" in *"/td/store/$glrel/lib/ld-linux-x86-64.so.2"*) echo CINTERP=OK ;
 [ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 PROBE
   out=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" /td/store/nativeprobe.sh 2>&1` \
-    || { printf '%s\n' "$out" | sed 's/^/     /' >&2; echo "store-ns native-gcc probe exited nonzero" >&2; return 1; }
-  printf '%s\n' "$out" | sed 's/^/     /' >&2
-  echo "$out" | grep -q '^CCLASS=ELF64$' || { echo "the native gcc did not emit an ELF64 program in the own-root" >&2; return 1; }
-  echo "$out" | grep -q '^CMACH=x86-64$' || { echo "the native-gcc-compiled program is not x86-64" >&2; return 1; }
-  echo "$out" | grep -q '^CINTERP=OK$' || { echo "the native-gcc-compiled program's interp is not the /td/store x86_64 ld" >&2; return 1; }
-  echo "$out" | grep -q '^CRC=42$'   || { echo "the native-gcc-compiled C program did not return 42 in the own-root" >&2; return 1; }
-  echo "$out" | grep -q '^CPPRC=42$' || { echo "the native-gcc-compiled C++ program did not return 42 in the own-root" >&2; return 1; }
+    || { printf '%s\n' "$out" > "$snwork/native.out"; x86_indent_file_err "$snwork/native.out"; echo "store-ns native-gcc probe exited nonzero" >&2; return 1; }
+  printf '%s\n' "$out" > "$snwork/native.out"
+  x86_indent_file_err "$snwork/native.out"
+  "$TB" text line-exact 'CCLASS=ELF64' "$snwork/native.out" || { echo "the native gcc did not emit an ELF64 program in the own-root" >&2; return 1; }
+  "$TB" text line-exact 'CMACH=x86-64' "$snwork/native.out" || { echo "the native-gcc-compiled program is not x86-64" >&2; return 1; }
+  "$TB" text line-exact 'CINTERP=OK' "$snwork/native.out" || { echo "the native-gcc-compiled program's interp is not the /td/store x86_64 ld" >&2; return 1; }
+  "$TB" text line-exact 'CRC=42' "$snwork/native.out" || { echo "the native-gcc-compiled C program did not return 42 in the own-root" >&2; return 1; }
+  "$TB" text line-exact 'CPPRC=42' "$snwork/native.out" || { echo "the native-gcc-compiled C++ program did not return 42 in the own-root" >&2; return 1; }
   echo "   [self-host-compile] the NATIVE x86_64 gcc RAN in the own-root and compiled a DYNAMIC ELF64 x86-64 C AND C++ program (interp = the /td/store x86_64 ld) from source → both run → 42"
-  echo "$out" | grep -q '^GNU-ABSENT$' || { echo "/gnu/store is PRESENT in the own-root" >&2; return 1; }
+  "$TB" text line-exact 'GNU-ABSENT' "$snwork/native.out" || { echo "/gnu/store is PRESENT in the own-root" >&2; return 1; }
   echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT"
 }
 
@@ -438,9 +455,9 @@ x86_64_build_self_recipe() {
       TDXS_OUT="$_sout" X86_MAKE_J="${X86_MAKE_J:--j4}" \
       "$TB" toolchain-recipe x86_64-self > "$_sout/recipe.out" 2>&1 \
     || { echo "x86_64_build_self_recipe: toolchain-recipe x86_64-self failed" >&2; tail -40 "$_sout/recipe.out" >&2; return 1; }
-  sed 's/^/   /' "$_sout/recipe.out"
-  XSBU=`sed -n 's/^SELF_BINUTILS=//p' "$_sout/recipe.out"`
-  XSGCC=`sed -n 's/^SELF_GCC=//p' "$_sout/recipe.out"`
+  x86_indent_file "$_sout/recipe.out"
+  XSBU=`"$TB" text extract-prefix 'SELF_BINUTILS=' "$_sout/recipe.out"`
+  XSGCC=`"$TB" text extract-prefix 'SELF_GCC=' "$_sout/recipe.out"`
   test -n "$XSBU" -a -d "$XSBU" || { echo "x86_64_build_self_recipe: recipe returned no self binutils tree" >&2; return 1; }
   test -n "$XSGCC" -a -d "$XSGCC" || { echo "x86_64_build_self_recipe: recipe returned no self gcc tree" >&2; return 1; }
   export XSBU XSGCC

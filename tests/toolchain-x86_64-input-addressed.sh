@@ -34,6 +34,63 @@ ILOCK=tests/td-toolchain.lock
 test -f "$LOCK" || fail "missing $LOCK"
 test -f "$ILOCK" || fail "missing $ILOCK (the i686 lock to compare against)"
 
+source_lock_value() {
+  _slv_key=$1
+  _slv_lock=$2
+  while IFS=' ' read -r _slv_k _slv_rest; do
+    [ "$_slv_k" = "$_slv_key" ] || continue
+    printf '%s\n' "$_slv_rest"
+    return 0
+  done < "$_slv_lock"
+  return 1
+}
+
+copy_pin_lines() {
+  _cpl_lock=$1
+  while IFS= read -r _cpl_line; do
+    case "$_cpl_line" in input\ *|patch\ *) printf '%s\n' "$_cpl_line" ;; esac
+  done < "$_cpl_lock"
+}
+
+validate_directives() {
+  _vd_lock=$1
+  _vd_bad=
+  while IFS= read -r _vd_line; do
+    case "$_vd_line" in ''|\#*) continue ;; esac
+    _vd_key=${_vd_line%% *}
+    case "$_vd_key" in name|recipe-rev|component|input|patch) ;; *) _vd_bad="${_vd_bad}${_vd_bad:+ }$_vd_key" ;; esac
+  done < "$_vd_lock"
+  [ -z "$_vd_bad" ] || { printf '%s\n' "$_vd_bad"; return 1; }
+}
+
+rewrite_recipe_rev() {
+  _rr_in=$1
+  _rr_out=$2
+  _rr_seen=0
+  while IFS= read -r _rr_line; do
+    case "$_rr_line" in
+      'recipe-rev 1') printf 'recipe-rev 2\n'; _rr_seen=1 ;;
+      *) printf '%s\n' "$_rr_line" ;;
+    esac
+  done < "$_rr_in" > "$_rr_out"
+  [ "$_rr_seen" = 1 ]
+}
+
+perturb_glibc_pin() {
+  _pgp_in=$1
+  _pgp_out=$2
+  _pgp_seen=0
+  while IFS= read -r _pgp_line; do
+    case "$_pgp_line" in
+      input\ *\ glibc-2.41.tar.xz)
+        printf 'input 0000000000000000000000000000000000000000000000000000000000000000 glibc-2.41.tar.xz\n'
+        _pgp_seen=1 ;;
+      *) printf '%s\n' "$_pgp_line" ;;
+    esac
+  done < "$_pgp_in" > "$_pgp_out"
+  [ "$_pgp_seen" = 1 ]
+}
+
 . tests/cache-lib.sh
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 echo ">> td-builder (stage0, guix-free): $TB"
@@ -44,8 +101,8 @@ trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 # --- [pinned-sync] every lock pin mirrors the seed source / patch it names ---------------------
 srcsha() {
   for l in seed/sources/*.lock; do
-    f=`sed -n 's/^file //p' "$l" | head -1`
-    [ "$f" = "$1" ] && { sed -n 's/^sha256 //p' "$l" | head -1; return 0; }
+    f=`source_lock_value file "$l" 2>/dev/null || true`
+    [ "$f" = "$1" ] && { source_lock_value sha256 "$l"; return 0; }
   done
   return 1
 }
@@ -64,7 +121,7 @@ while read -r kind shaval file; do
       npatch=$((npatch + 1)) ;;
   esac
 done <<EOF
-`grep -E '^(input|patch) ' "$LOCK"`
+`copy_pin_lines "$LOCK"`
 EOF
 test "$nin" -ge 20 || fail "[pinned-sync] only $nin input pins — the toolchain has more inputs than that"
 test "$npatch" -ge 4 || fail "[pinned-sync] only $npatch patch pins"
@@ -73,11 +130,13 @@ echo "   [pinned-sync] $nin source pins + $npatch patch pins match seed/sources 
 # --- [arch-parity] the x86_64 lock shares i686's exact source set; only arch fields differ -----
 # diff/cmp-free (the loop sandbox has neither): compare the sorted input+patch sets by sha256,
 # and assert every non-comment directive in BOTH locks is one of name/recipe-rev/component/input/patch.
-xh=`grep -E '^(input|patch) ' "$LOCK"  | sort | sha256sum`
-ih=`grep -E '^(input|patch) ' "$ILOCK" | sort | sha256sum`
+copy_pin_lines "$LOCK" | sort | sha256sum > "$work/xh"
+copy_pin_lines "$ILOCK" | sort | sha256sum > "$work/ih"
+xh=`cat "$work/xh"`
+ih=`cat "$work/ih"`
 [ "$xh" = "$ih" ] || fail "[arch-parity] x86_64 input/patch set differs from i686 — the cross must reuse i686's sources"
 for L in "$LOCK" "$ILOCK"; do
-  bad=`grep -vE '^[[:space:]]*(#|$)' "$L" | sed -E 's/^([a-z-]+).*/\1/' | sort -u | grep -vE '^(name|recipe-rev|component|input|patch)$' | tr '\n' ' '`
+  bad=`validate_directives "$L" 2>/dev/null || true`
   [ -z "$bad" ] || fail "[arch-parity] $L has an unexpected non-arch directive: $bad (only name/recipe-rev/component/input/patch allowed)"
 done
 echo "   [arch-parity] x86_64 lock shares i686's exact $nin+$npatch source set; only name/recipe-rev/component differ"
@@ -106,10 +165,9 @@ done
 echo "   [stable-key] key=$KX; cross binutils/gcc/glibc each get a distinct, deterministic x86_64 /td/store path"
 
 # --- [load-bearing] recipe-rev AND an input pin each move the addressing -----------------------
-sed 's/^recipe-rev 1$/recipe-rev 2/' "$LOCK" > "$work/rr.lock"
+rewrite_recipe_rev "$LOCK" "$work/rr.lock" || fail "[load-bearing] could not bump recipe-rev"
 [ "`"$TB" toolchain-key "$work/rr.lock"`" != "$KX" ] || fail "[load-bearing] bumping recipe-rev did NOT move the key"
-sed 's/^input [0-9a-f]* glibc-2.41.tar.xz$/input 0000000000000000000000000000000000000000000000000000000000000000 glibc-2.41.tar.xz/' "$LOCK" > "$work/pin.lock"
-grep -q '^input 0000000000000000000000000000000000000000000000000000000000000000 glibc-2.41.tar.xz$' "$work/pin.lock" || fail "[load-bearing] could not perturb the glibc-2.41 input pin"
+perturb_glibc_pin "$LOCK" "$work/pin.lock" || fail "[load-bearing] could not perturb the glibc-2.41 input pin"
 [ "`"$TB" toolchain-path "$work/pin.lock" glibc-2.41-x86_64`" != "$GLP" ] || fail "[load-bearing] perturbing an input pin did NOT move the path"
 echo "   [load-bearing] recipe-rev bump moves the key; flipping one input pin moves glibc-2.41-x86_64's path"
 
@@ -126,9 +184,10 @@ RUNP=`"$TB" store-add-input-addressed bash-static-x86_64 "$KX" "$bs" "$store" "$
 case "$RUNP" in /td/store/*-bash-static-x86_64) ;; *) fail "fixture not input-addressed at /td/store: $RUNP" ;; esac
 test -x "$store/`basename "$RUNP"`/bin/bash" || fail "interned fixture missing physically"
 out=`"$TB" store-ns "$store" -- "$RUNP/bin/bash" -c '[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT; echo "RAN:$BASH_VERSION"'` \
-  || { printf '%s\n' "$out" | sed 's/^/     /' >&2; fail "store-ns run from the x86_64-keyed input-addressed path exited nonzero"; }
-printf '%s\n' "$out" | grep -q '^RAN:5' || fail "[behavioral] the binary did not run from its x86_64-keyed /td/store path"
-printf '%s\n' "$out" | grep -q '^GNU-ABSENT$' || fail "[structural] /gnu/store is PRESENT in the own-root"
+  || { printf '%s\n' "$out" > "$work/run.out"; while IFS= read -r line; do printf '     %s\n' "$line" >&2; done < "$work/run.out"; fail "store-ns run from the x86_64-keyed input-addressed path exited nonzero"; }
+printf '%s\n' "$out" > "$work/run.out"
+"$TB" text extract-prefix 'RAN:5' "$work/run.out" >/dev/null || fail "[behavioral] the binary did not run from its x86_64-keyed /td/store path"
+"$TB" text line-exact 'GNU-ABSENT' "$work/run.out" || fail "[structural] /gnu/store is PRESENT in the own-root"
 echo "   [behavioral] a real binary placed at the x86_64-keyed path $RUNP RUNS in the own-root, /gnu/store ABSENT"
 
 echo "PASS: toolchain-x86_64-input-addressed — the x86_64 /td/store toolchain has a STABLE input-addressed"

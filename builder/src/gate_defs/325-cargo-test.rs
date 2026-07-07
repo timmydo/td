@@ -63,12 +63,13 @@ pub fn gate() -> GateDef {
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
-echo ">> cargo-test: engine crates lint clean (cargo clippy: no panic surface, .get over indexing, unsafe confined) + td-builder unit tests (cargo test) — offline, guix-free toolchain (tools/provision-{rust,cc}.sh)"
-set -euo pipefail; \
-for crate in builder recipes; do \
-  n=`grep -c '^\[\[package\]\]' "$crate/Cargo.lock"`; \
-  test "$n" -eq 1 || { echo "ERROR: $crate is no longer dependency-free (Cargo.lock lists $n packages; the engine must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
-done; \
+	echo ">> cargo-test: engine crates lint clean (cargo clippy: no panic surface, .get over indexing, unsafe confined) + td-builder unit tests (cargo test) — offline, guix-free toolchain (tools/provision-{rust,cc}.sh)"
+	set -euo pipefail; \
+	td="${TD_BUILDER_SELF:?gate-run exports TD_BUILDER_SELF}"; \
+	for crate in builder recipes; do \
+	  n=`"$td" text count-line-exact '[[package]]' "$crate/Cargo.lock"`; \
+	  test "$n" -eq 1 || { echo "ERROR: $crate is no longer dependency-free (Cargo.lock lists $n packages; the engine must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
+	done; \
 rustpath=`sh tools/provision-rust.sh`; \
 ccpath=`sh tools/provision-cc.sh`; \
 scratch="$PWD/.cargo-test-scratch"; \
@@ -76,12 +77,12 @@ rm -rf "$scratch"; mkdir -p "$scratch/home" "$scratch/target"; \
 log="$scratch/out.log"; \
 PATH="$rustpath:$ccpath:$PATH" \
 CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
-  sh -c 'set -e; \
-    cargo clippy --frozen --manifest-path builder/Cargo.toml; \
-    cargo clippy --frozen --manifest-path recipes/Cargo.toml; \
-    cargo test  --frozen --manifest-path builder/Cargo.toml' 2>&1 | tee "$log"; \
-grep -qE 'test result: ok\. [1-9][0-9]* passed' "$log" || \
-  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
+	  sh -c 'set -e; \
+	    cargo clippy --frozen --manifest-path builder/Cargo.toml; \
+	    cargo clippy --frozen --manifest-path recipes/Cargo.toml; \
+	    cargo test  --frozen --manifest-path builder/Cargo.toml' 2>&1 | tee "$log"; \
+	"$td" text cargo-test-ok "$log" || \
+	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
 rm -rf "$scratch"; \
 echo "PASS: cargo-test — builder + recipes are dependency-free and lint clean; td-builder unit tests pass (guix-free toolchain)."
 "##,

@@ -57,7 +57,7 @@ test "`wc -l < "$counter"`" -eq 1 || fail "second run must cache-hit, but the bu
 printf 'tampered\n' > "$D/out/product"
 pass
 test "`wc -l < "$counter"`" -eq 2 || fail "poisoned cache entry was consumed without a rebuild"
-grep -q 'demo-product-v1' "$D/out/product" || fail "the rebuild did not restore the product"
+"$TB" text contains 'demo-product-v1' "$D/out/product" || fail "the rebuild did not restore the product"
 
 # [cold / Private wiring] TD_CHECK_CHAIN_CACHE empty — the runner's Private setting: the cache is
 # neither read (the poisoned-shared-state differential: a cold gate must not see warm

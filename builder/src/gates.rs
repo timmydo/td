@@ -1055,6 +1055,7 @@ fn run_gate(
         };
         cmd.current_dir(root)
             .env("TD_GATE_GOALS", goal_words)
+            .env("TD_BUILDER_SELF", &self_exe)
             .stdout(std::process::Stdio::from(out))
             .stderr(std::process::Stdio::from(err));
         // The #317 gate-state wiring: Shared (the default) gets the machine-wide

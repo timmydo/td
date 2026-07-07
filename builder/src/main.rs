@@ -104,6 +104,523 @@ fn nar_hash_size_path(path: &Path) -> Result<(String, u64), std::io::Error> {
     Ok((format!("sha256:{}", sha256::to_base16(&w.hasher.finalize())), w.size))
 }
 
+fn read_arg_bytes(path: &str) -> Result<Vec<u8>, String> {
+    if path == "-" {
+        let mut buf = Vec::new();
+        let mut stdin = std::io::stdin();
+        std::io::Read::read_to_end(&mut stdin, &mut buf)
+            .map_err(|e| format!("read stdin: {e}"))?;
+        return Ok(buf);
+    }
+    std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
+}
+
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn first_line_with_prefix(text: &str, prefix: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix).map(str::to_string))
+}
+
+fn last_line_with_prefix(text: &str, prefix: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix(prefix).map(str::to_string))
+        .next()
+}
+
+fn first_line_containing(text: &str, needle: &str) -> Option<String> {
+    text.lines()
+        .find(|line| line.contains(needle))
+        .map(str::to_string)
+}
+
+fn count_line_exact(text: &str, needle: &str) -> usize {
+    text.lines().filter(|line| *line == needle).count()
+}
+
+fn count_nonempty_lines(text: &str) -> usize {
+    text.lines().filter(|line| !line.is_empty()).count()
+}
+
+fn cargo_test_reported_nonzero_tests(text: &str) -> bool {
+    let marker = "test result: ok. ";
+    text.lines().any(|line| {
+        let Some(rest) = line.split_once(marker).map(|(_, r)| r) else {
+            return false;
+        };
+        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return false;
+        }
+        let Some(num_s) = rest.get(..digits) else {
+            return false;
+        };
+        let Some(tail) = rest.get(digits..) else {
+            return false;
+        };
+        tail.starts_with(" passed") && num_s.parse::<u64>().is_ok_and(|n| n > 0)
+    })
+}
+
+fn contains_gcc_lib_ref(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.contains("-gcc-") && line.contains("-lib"))
+}
+
+fn text_cli(args: &[String]) -> ExitCode {
+    let fail = |msg: &str| {
+        eprintln!("td-builder: text: {msg}");
+        ExitCode::FAILURE
+    };
+    match args {
+        [op, needle, file] if op == "contains" => match read_arg_bytes(file) {
+            Ok(bytes) if bytes_contains(&bytes, needle.as_bytes()) => ExitCode::SUCCESS,
+            Ok(_) => ExitCode::FAILURE,
+            Err(e) => fail(&e),
+        },
+        [op, needle, file] if op == "not-contains" => match read_arg_bytes(file) {
+            Ok(bytes) if !bytes_contains(&bytes, needle.as_bytes()) => ExitCode::SUCCESS,
+            Ok(_) => ExitCode::FAILURE,
+            Err(e) => fail(&e),
+        },
+        [op, needle, file] if op == "line-exact" => match read_arg_bytes(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                if text.lines().any(|line| line == needle) {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(e) => fail(&e),
+        },
+        [op, needle, file] if op == "count-line-exact" => match read_arg_bytes(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                println!("{}", count_line_exact(&text, needle));
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
+        [op, file] if op == "count-nonempty" => match read_arg_bytes(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                println!("{}", count_nonempty_lines(&text));
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
+        [op, prefix, file] if op == "extract-prefix" => match read_arg_bytes(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                match first_line_with_prefix(&text, prefix) {
+                    Some(v) => {
+                        println!("{v}");
+                        ExitCode::SUCCESS
+                    }
+                    None => ExitCode::FAILURE,
+                }
+            }
+            Err(e) => fail(&e),
+        },
+        [op, prefix, file] if op == "extract-prefix-last" => match read_arg_bytes(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                match last_line_with_prefix(&text, prefix) {
+                    Some(v) => {
+                        println!("{v}");
+                        ExitCode::SUCCESS
+                    }
+                    None => ExitCode::FAILURE,
+                }
+            }
+            Err(e) => fail(&e),
+        },
+        [op, needle, file] if op == "extract-containing" => match read_arg_bytes(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                match first_line_containing(&text, needle) {
+                    Some(v) => {
+                        println!("{v}");
+                        ExitCode::SUCCESS
+                    }
+                    None => ExitCode::FAILURE,
+                }
+            }
+            Err(e) => fail(&e),
+        },
+        [op, file] if op == "sha256" => match sha256::sha256_file(Path::new(file)) {
+            Ok(h) => {
+                println!("{h}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&format!("sha256 {file}: {e}")),
+        },
+        [op, file] if op == "cargo-test-ok" => match read_arg_bytes(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                if cargo_test_reported_nonzero_tests(&text) {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(e) => fail(&e),
+        },
+        [op, file] if op == "contains-gcc-lib" => match read_arg_bytes(file) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                if contains_gcc_lib_ref(&text) {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(e) => fail(&e),
+        },
+        _ => {
+            eprintln!("usage: td-builder text contains NEEDLE FILE|-");
+            eprintln!("       td-builder text not-contains NEEDLE FILE|-");
+            eprintln!("       td-builder text line-exact LINE FILE|-");
+            eprintln!("       td-builder text count-line-exact LINE FILE|-");
+            eprintln!("       td-builder text count-nonempty FILE|-");
+            eprintln!("       td-builder text extract-prefix PREFIX FILE|-");
+            eprintln!("       td-builder text extract-prefix-last PREFIX FILE|-");
+            eprintln!("       td-builder text extract-containing NEEDLE FILE|-");
+            eprintln!("       td-builder text sha256 FILE");
+            eprintln!("       td-builder text cargo-test-ok FILE");
+            eprintln!("       td-builder text contains-gcc-lib FILE");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn collect_regular_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if meta.is_file() {
+        out.push(path.to_path_buf());
+        return Ok(());
+    }
+    if meta.is_dir() {
+        let mut entries: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(path).map_err(|e| format!("read dir {}: {e}", path.display()))? {
+            let entry = entry.map_err(|e| format!("read dir {}: {e}", path.display()))?;
+            entries.push(entry.path());
+        }
+        entries.sort();
+        for child in entries {
+            collect_regular_files(&child, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn regular_files_under(args: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for arg in args {
+        collect_regular_files(Path::new(arg), &mut files)?;
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn collect_named_file_entries(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if meta.is_dir() {
+        let mut entries: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(path).map_err(|e| format!("read dir {}: {e}", path.display()))? {
+            let entry = entry.map_err(|e| format!("read dir {}: {e}", path.display()))?;
+            entries.push(entry.path());
+        }
+        entries.sort();
+        for child in entries {
+            collect_named_file_entries(&child, out)?;
+        }
+        return Ok(());
+    }
+    let file_type = meta.file_type();
+    if meta.is_file() || file_type.is_symlink() {
+        out.push(path.to_path_buf());
+    }
+    Ok(())
+}
+
+fn named_file_entries_under(args: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for arg in args {
+        collect_named_file_entries(Path::new(arg), &mut files)?;
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+    let starts_with_star = pattern.starts_with('*');
+    let ends_with_star = pattern.ends_with('*');
+    let mut rest = text;
+    let mut first = true;
+    for part in pattern.split('*').filter(|p| !p.is_empty()) {
+        if first && !starts_with_star {
+            let Some(next) = rest.strip_prefix(part) else {
+                return false;
+            };
+            rest = next;
+            first = false;
+            continue;
+        }
+        let Some(pos) = rest.find(part) else {
+            return false;
+        };
+        let Some(next) = rest.get(pos + part.len()..) else {
+            return false;
+        };
+        rest = next;
+        first = false;
+    }
+    ends_with_star || rest.is_empty()
+}
+
+fn first_file_named(pattern: &str, roots: &[String]) -> Result<Option<PathBuf>, String> {
+    for file in named_file_entries_under(roots)? {
+        let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if wildcard_match(pattern, name) {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
+}
+
+fn tree_fingerprint(args: &[String]) -> Result<String, String> {
+    let files = regular_files_under(args)?;
+    let mut h = sha256::Sha256::new();
+    for file in files {
+        let path = file.to_string_lossy();
+        let digest = sha256::sha256_file(&file).map_err(|e| format!("sha256 {}: {e}", file.display()))?;
+        h.update(path.as_bytes());
+        h.update(b"\0");
+        h.update(digest.as_bytes());
+        h.update(b"\n");
+    }
+    Ok(sha256::to_base16(&h.finalize()))
+}
+
+fn tree_first_containing(needle: &str, roots: &[String]) -> Result<Option<PathBuf>, String> {
+    for file in regular_files_under(roots)? {
+        let bytes = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+        if bytes_contains(&bytes, needle.as_bytes()) {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
+}
+
+fn path_older_than(path: &str, days: &str) -> Result<bool, String> {
+    let days = days
+        .parse::<u64>()
+        .map_err(|e| format!("parse days `{days}`: {e}"))?;
+    let secs = days
+        .checked_mul(86_400)
+        .ok_or_else(|| format!("days `{days}` is too large"))?;
+    let modified = std::fs::metadata(path)
+        .map_err(|e| format!("stat {path}: {e}"))?
+        .modified()
+        .map_err(|e| format!("mtime {path}: {e}"))?;
+    let age = std::time::SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+    Ok(age.as_secs() > secs)
+}
+
+fn unique_lock_path(lock_file: &str, stem: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(lock_file).map_err(|e| format!("read {lock_file}: {e}"))?;
+    let entries = lock::parse(&text, "")?;
+    let mut hits: Vec<&str> = entries
+        .iter()
+        .map(|e| e.path.as_str())
+        .filter(|p| gate_inputs::path_names_stem(p, stem))
+        .collect();
+    hits.sort_unstable();
+    hits.dedup();
+    match hits.as_slice() {
+        [one] => Ok((*one).to_string()),
+        [] => Err(format!("{lock_file}: no path names `{stem}`")),
+        many => Err(format!(
+            "{lock_file}: `{stem}` is ambiguous ({} matches: {})",
+            many.len(),
+            many.join(", ")
+        )),
+    }
+}
+
+fn lock_paths(lock_file: &str, prefix: Option<&str>) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(lock_file).map_err(|e| format!("read {lock_file}: {e}"))?;
+    let entries = lock::parse(&text, "")?;
+    let mut out: Vec<String> = entries
+        .into_iter()
+        .map(|e| e.path)
+        .filter(|p| prefix.is_none_or(|pre| p.starts_with(pre)))
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn rewrite_gcc_toolchain_lock_body(text: &str, toolchain: &str, glibc: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut replaced = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            out.push_str(raw);
+            out.push('\n');
+            continue;
+        }
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let is_gcc_toolchain = toks
+            .get(1)
+            .is_some_and(|p| gate_inputs::path_names_stem(p, "gcc-toolchain"))
+            || toks.first().is_some_and(|name| *name == "gcc-toolchain");
+        if is_gcc_toolchain {
+            if !replaced {
+                out.push_str(&format!("gcc-toolchain {toolchain} seed\n"));
+                out.push_str(&format!("glibc-2.41 {glibc} seed\n"));
+                replaced = true;
+            }
+            continue;
+        }
+        out.push_str(raw);
+        out.push('\n');
+    }
+    if replaced {
+        Ok(out)
+    } else {
+        Err("no gcc-toolchain line to rewrite".to_string())
+    }
+}
+
+fn lock_cli(args: &[String]) -> ExitCode {
+    let fail = |msg: String| {
+        eprintln!("td-builder: lock: {msg}");
+        ExitCode::FAILURE
+    };
+    match args {
+        [op, lock_file, stem] if op == "path" => match unique_lock_path(lock_file, stem) {
+            Ok(p) => {
+                println!("{p}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        },
+        [op, lock_file] if op == "paths" => match lock_paths(lock_file, None) {
+            Ok(paths) => {
+                for p in paths {
+                    println!("{p}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        },
+        [op, lock_file, prefix] if op == "paths" => match lock_paths(lock_file, Some(prefix)) {
+            Ok(paths) => {
+                for p in paths {
+                    println!("{p}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        },
+        [op, input, output, toolchain, glibc] if op == "rewrite-gcc-toolchain" => {
+            let run = || -> Result<(), String> {
+                let text = std::fs::read_to_string(input)
+                    .map_err(|e| format!("read {input}: {e}"))?;
+                let body = rewrite_gcc_toolchain_lock_body(&text, toolchain, glibc)?;
+                std::fs::write(output, body).map_err(|e| format!("write {output}: {e}"))
+            };
+            match run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(e),
+            }
+        }
+        _ => {
+            eprintln!("usage: td-builder lock path LOCK STEM");
+            eprintln!("       td-builder lock paths LOCK [PREFIX]");
+            eprintln!("       td-builder lock rewrite-gcc-toolchain IN OUT TOOLCHAIN GLIBC");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn parse_u64_prefix(s: &str) -> Option<(u64, &str)> {
+    let n = s.chars().take_while(|c| c.is_ascii_digit()).count();
+    if n == 0 {
+        return None;
+    }
+    let num = s.get(..n)?.parse::<u64>().ok()?;
+    let rest = s.get(n..)?;
+    Some((num, rest))
+}
+
+fn daemon_budget_stats(text: &str, budget: u64) -> Result<(u64, u64), String> {
+    let budget_msg = format!("budget {budget} concurrent builds");
+    if !text.contains(&budget_msg) {
+        return Err(format!("daemon log does not contain `{budget_msg}`"));
+    }
+    let mut peak = 0u64;
+    let mut starts = 0u64;
+    for line in text.lines() {
+        if line.contains("daemon build START") {
+            starts = starts.saturating_add(1);
+        }
+        let Some(rest) = line.split_once("START (").map(|(_, r)| r) else {
+            continue;
+        };
+        let Some((active, rest)) = parse_u64_prefix(rest) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix('/') else {
+            continue;
+        };
+        let Some((seen_budget, _)) = parse_u64_prefix(rest) else {
+            continue;
+        };
+        if seen_budget == budget {
+            peak = peak.max(active);
+        }
+    }
+    Ok((peak, starts))
+}
+
+fn daemon_budget_check(log_file: &str, budget: &str) -> Result<(u64, u64), String> {
+    let budget = budget
+        .parse::<u64>()
+        .map_err(|e| format!("parse budget `{budget}`: {e}"))?;
+    let text = std::fs::read_to_string(log_file).map_err(|e| format!("read {log_file}: {e}"))?;
+    let (peak, starts) = daemon_budget_stats(&text, budget)?;
+    if peak != budget {
+        return Err(format!("peak active builds = {peak}, expected {budget}"));
+    }
+    let min_starts = budget.saturating_add(1);
+    if starts < min_starts {
+        return Err(format!(
+            "only {starts} build starts observed, expected at least {min_starts}"
+        ));
+    }
+    Ok((peak, starts))
+}
+
 // --- substitute server: export half (store-coupled, dependency-free) ---
 // Write a serve-able directory for a store closure: a td-native `<basename>.narinfo` per
 // member + `nar/<narhash-hex>.nar`. This is the dual of `seed-manifest`/`seed-unpack` —
@@ -3305,6 +3822,144 @@ fn main() -> ExitCode {
         // check-rung HARNESS [ARGS...] — dev-iteration helper: run a cached-chain
         // bootstrap harness inside the loop sandbox (was tools/check-rung.sh).
         Some("check-rung") => check_loop::check_rung_cli(args.get(2..).unwrap_or(&[])),
+        // Narrow td-owned replacements for the loop's pre-userland sed/grep/find
+        // assertions and manifest shuffling. These are intentionally typed, not a
+        // general regex tool clone.
+        Some("text") => text_cli(args.get(2..).unwrap_or(&[])),
+        Some("lock") => lock_cli(args.get(2..).unwrap_or(&[])),
+        Some("files") => match args.get(2..).filter(|rest| !rest.is_empty()) {
+            Some(rest) => match regular_files_under(rest) {
+                Ok(files) => {
+                    for f in files {
+                        println!("{}", f.display());
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: files: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+            None => {
+                eprintln!("usage: td-builder files PATH...");
+                ExitCode::from(2)
+            },
+        },
+        Some("files-name-first") => match (args.get(2), args.get(3..)) {
+            (Some(pattern), Some(roots)) if !roots.is_empty() => {
+                match first_file_named(pattern, roots) {
+                    Ok(Some(p)) => {
+                        println!("{}", p.display());
+                        ExitCode::SUCCESS
+                    }
+                    Ok(None) => ExitCode::FAILURE,
+                    Err(e) => {
+                        eprintln!("td-builder: files-name-first: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            _ => {
+                eprintln!("usage: td-builder files-name-first PATTERN PATH...");
+                ExitCode::from(2)
+            },
+        },
+        Some("tree-fingerprint") => match args.get(2..).filter(|roots| !roots.is_empty()) {
+            Some(roots) => match tree_fingerprint(roots) {
+                Ok(fp) => {
+                    println!("{fp}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: tree-fingerprint: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+            None => {
+                eprintln!("usage: td-builder tree-fingerprint PATH...");
+                ExitCode::from(2)
+            },
+        },
+        Some("tree-contains") => match (args.get(2), args.get(3..)) {
+            (Some(needle), Some(roots)) if !roots.is_empty() => match tree_first_containing(needle, roots) {
+                Ok(Some(_)) => ExitCode::SUCCESS,
+                Ok(None) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("td-builder: tree-contains: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            _ => {
+                eprintln!("usage: td-builder tree-contains NEEDLE PATH...");
+                ExitCode::from(2)
+            },
+        },
+        Some("tree-not-contains") => match (args.get(2), args.get(3..)) {
+            (Some(needle), Some(roots)) if !roots.is_empty() => match tree_first_containing(needle, roots) {
+                Ok(Some(p)) => {
+                    eprintln!("td-builder: tree-not-contains: {} contains {}", p.display(), needle);
+                    ExitCode::FAILURE
+                }
+                Ok(None) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: tree-not-contains: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            _ => {
+                eprintln!("usage: td-builder tree-not-contains NEEDLE PATH...");
+                ExitCode::from(2)
+            },
+        },
+        Some("tree-first-containing") => match (args.get(2), args.get(3..)) {
+            (Some(needle), Some(roots)) if !roots.is_empty() => {
+                match tree_first_containing(needle, roots) {
+                    Ok(Some(p)) => {
+                        println!("{}", p.display());
+                        ExitCode::SUCCESS
+                    }
+                    Ok(None) => ExitCode::FAILURE,
+                    Err(e) => {
+                        eprintln!("td-builder: tree-first-containing: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            _ => {
+                eprintln!("usage: td-builder tree-first-containing NEEDLE PATH...");
+                ExitCode::from(2)
+            },
+        },
+        Some("path-older-than") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(path), Some(days), None) => match path_older_than(path, days) {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("td-builder: path-older-than: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+            _ => {
+                eprintln!("usage: td-builder path-older-than PATH DAYS");
+                ExitCode::from(2)
+            },
+        },
+        Some("daemon-budget-check") => match (args.get(2), args.get(3), args.get(4)) {
+            (Some(log), Some(budget), None) => match daemon_budget_check(log, budget) {
+                Ok((peak, starts)) => {
+                    println!("peak={peak} starts={starts}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: daemon-budget-check: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            _ => {
+                eprintln!("usage: td-builder daemon-budget-check LOG BUDGET");
+                ExitCode::from(2)
+            },
+        },
         // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
         // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
         Some("bootstrap-recipe") => bootstrap::cli(&args),
@@ -3921,9 +4576,10 @@ fn main() -> ExitCode {
         // role, in pure Rust. `store_db_read` parses the SQLite file format that
         // `store-register` writes (no `sqlite3` engine, no daemon, in td's own
         // store-query path). Usage:
-        //   store-query DB info        -> "path|hash|narSize" per fully-registered path
-        //   store-query DB references  -> "referrer|reference" for the full Refs relation
-        //   store-query DB outputs     -> "outpath|deriver|drvpath|id" per DerivationOutputs row
+        //   store-query DB info            -> "path|hash|narSize" per fully-registered path
+        //   store-query DB references      -> "referrer|reference" for the full Refs relation
+        //   store-query DB references-only -> "reference" paths only
+        //   store-query DB outputs         -> "outpath|deriver|drvpath|id" per DerivationOutputs row
         // All sorted, so a set-comparison against the daemon oracle is order-free.
         Some("store-query") if args.len() == 4 => {
             let (db_path, mode) = (&args[2], &args[3]);
@@ -3957,7 +4613,7 @@ fn main() -> ExitCode {
                     }
                     // Resolve Refs(referrer, reference) ids -> paths via the ValidPaths
                     // rowid (= the integer-primary-key id).
-                    "references" => {
+                    "references" | "references-only" => {
                         let mut path_of = std::collections::HashMap::new();
                         for (rowid, cols) in db.table("ValidPaths")? {
                             if let Some(p) = text(&cols[1]) {
@@ -3974,7 +4630,11 @@ fn main() -> ExitCode {
                         for (_rowid, cols) in db.table("Refs")? {
                             match (int(&cols[0]), int(&cols[1])) {
                                 (Some(a), Some(b)) => {
-                                    lines.push(format!("{}|{}", resolve(a)?, resolve(b)?));
+                                    if mode == "references-only" {
+                                        lines.push(resolve(b)?);
+                                    } else {
+                                        lines.push(format!("{}|{}", resolve(a)?, resolve(b)?));
+                                    }
                                 }
                                 _ => return Err("Refs row has non-integer columns".to_string()),
                             }
@@ -4013,10 +4673,11 @@ fn main() -> ExitCode {
                         lines
                     }
                     other => {
-                        return Err(format!("unknown query mode `{other}' (info|references|outputs)"))
+                        return Err(format!("unknown query mode `{other}' (info|references|references-only|outputs)"))
                     }
                 };
                 out.sort();
+                out.dedup();
                 Ok(out)
             };
             match run() {
@@ -6159,6 +6820,16 @@ fn main() -> ExitCode {
             eprintln!("       td-builder check [GOAL...]             # the loop: host prelude + sandboxed gate ladder");
             eprintln!("       td-builder gate-run [-j N] [GOAL...]   # the in-sandbox gate scheduler (src/gate_defs/)");
             eprintln!("       td-builder check-rung HARNESS [ARG...] # dev: run a harness inside the loop sandbox");
+            eprintln!("       td-builder text <op> ...               # typed text assertions/extraction for loop scripts");
+            eprintln!("       td-builder lock <op> ...               # typed lock path extraction/rewrites");
+            eprintln!("       td-builder files PATH...");
+            eprintln!("       td-builder files-name-first PATTERN PATH...");
+            eprintln!("       td-builder tree-fingerprint PATH...");
+            eprintln!("       td-builder tree-contains NEEDLE PATH...");
+            eprintln!("       td-builder tree-not-contains NEEDLE PATH...");
+            eprintln!("       td-builder tree-first-containing NEEDLE PATH...");
+            eprintln!("       td-builder path-older-than PATH DAYS");
+            eprintln!("       td-builder daemon-budget-check LOG BUDGET");
             eprintln!("       td-builder nar-hash PATH");
             eprintln!("       td-builder nar-restore NARFILE DEST");
             eprintln!("       td-builder subst-export DB STORE-DIR OUTDIR ROOT...");
@@ -6167,7 +6838,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder check-drv FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
-            eprintln!("       td-builder store-query DB info|references|outputs");
+            eprintln!("       td-builder store-query DB info|references|references-only|outputs");
             eprintln!("       td-builder store-closure DB ROOT");
             eprintln!("       td-builder store-closure-scan STORE-DIR[,EXTRA-DIR...] ROOT...");
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
@@ -6328,6 +6999,82 @@ glibc-2.41-x86_64 /td/store/gl-glibc-2.41-x86_64 seed
         assert!(!out.contains("-rust-"), "guix rust dropped:\n{out}");
         assert!(out.contains("bbb-coreutils-9.1 /gnu/store/bbb-coreutils-9.1\n"), "coreutils kept:\n{out}");
         assert!(!out.contains("\n\n"), "no stray blank line:\n{out}");
+    }
+
+    #[test]
+    fn loop_text_helpers_extract_and_count() {
+        let text = "alpha\nDRV=/tmp/a.drv\nSTEP gcc /td/store/gcc\nSTEP gcc /td/store/gcc2\n\n";
+        assert_eq!(first_line_with_prefix(text, "DRV="), Some("/tmp/a.drv".to_string()));
+        assert_eq!(last_line_with_prefix(text, "STEP gcc "), Some("/td/store/gcc2".to_string()));
+        assert_eq!(first_line_containing(text, "store/gcc"), Some("STEP gcc /td/store/gcc".to_string()));
+        assert_eq!(count_line_exact(text, "alpha"), 1);
+        assert_eq!(count_nonempty_lines(text), 4);
+        assert!(cargo_test_reported_nonzero_tests("test result: ok. 12 passed; 0 failed"));
+        assert!(!cargo_test_reported_nonzero_tests("test result: ok. 0 passed; 0 failed"));
+    }
+
+    #[test]
+    fn loop_tree_helpers_find_names_and_bytes() {
+        let d = std::env::temp_dir().join(format!("td-loop-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::write(d.join("a/b/libstdc++.so.6.0"), b"hello /td/store").unwrap();
+        std::os::unix::fs::symlink("libstdc++.so.6.0", d.join("a/b/libstdc++.so.6")).unwrap();
+        std::fs::write(d.join("a/cc1"), b"compiler").unwrap();
+        let roots = vec![d.display().to_string()];
+        assert_eq!(
+            first_file_named("libstdc++.so.6", &roots).unwrap().unwrap(),
+            d.join("a/b/libstdc++.so.6")
+        );
+        assert_eq!(
+            first_file_named("libstdc++.so.6*", &roots).unwrap().unwrap(),
+            d.join("a/b/libstdc++.so.6")
+        );
+        assert_eq!(
+            tree_first_containing("/td/store", &roots).unwrap().unwrap(),
+            d.join("a/b/libstdc++.so.6.0")
+        );
+        assert_eq!(first_file_named("cc1", &roots).unwrap().unwrap(), d.join("a/cc1"));
+        assert!(tree_first_containing("/gnu/store", &roots).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn lock_rewrite_replaces_gcc_toolchain_once() {
+        let body = "\
+# keep
+coreutils /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-coreutils-9.1
+old-gcc /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-toolchain-15.2.0
+kept-input /gnu/store/cccccccccccccccccccccccccccccccc-kept-input-1.0
+";
+        let out = rewrite_gcc_toolchain_lock_body(
+            body,
+            "/td/store/tttt-gcc-toolchain-tdstore",
+            "/td/store/gggg-glibc-2.41",
+        )
+        .unwrap();
+        assert!(out.contains("gcc-toolchain /td/store/tttt-gcc-toolchain-tdstore seed\n"));
+        assert!(out.contains("glibc-2.41 /td/store/gggg-glibc-2.41 seed\n"));
+        assert!(!out.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-toolchain"));
+        assert_eq!(out.matches("gcc-toolchain ").count(), 1);
+    }
+
+    #[test]
+    fn daemon_budget_parser_preserves_peak_and_min_start_assertions() {
+        let log = "\
+daemon: budget 2 concurrent builds
+daemon build START (1/2 active)
+daemon build START (2/2 active)
+daemon build START (2/2 active)
+";
+        assert_eq!(daemon_budget_stats(log, 2).unwrap(), (2, 3));
+        let d = std::env::temp_dir().join(format!("td-daemon-budget-{}.log", std::process::id()));
+        std::fs::write(&d, log).unwrap();
+        assert_eq!(daemon_budget_check(d.to_str().unwrap(), "2").unwrap(), (2, 3));
+        std::fs::write(&d, "daemon: budget 2 concurrent builds\ndaemon build START (2/2 active)\n").unwrap();
+        let err = daemon_budget_check(d.to_str().unwrap(), "2").unwrap_err();
+        assert!(err.contains("expected at least 3"), "got: {err}");
+        let _ = std::fs::remove_file(&d);
     }
 
     // ---- persistent accumulating store DB (merge_regs) ----------------------

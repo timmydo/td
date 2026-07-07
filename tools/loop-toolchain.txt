@@ -8,8 +8,8 @@
 # resolving `env` gives the whole coreutils bin dir). A tool absent from the host
 # PATH warns (a misconfigured runner is visible); the gate that needs it then fails
 # loudly. Core tools (sh/bash/make/env) are fatal-if-missing. sed/grep/findutils
-# are not host-PATH tools here: check_loop.rs resolves their pinned /gnu/store
-# paths from tests/hello-no-guix.lock and prepends those declared bin dirs to the
-# sandbox PATH. Native loop applets for syscall-only host tools (`mount --bind`,
-# `flock`) are provided by td-builder itself and prepended by check_loop.rs.
+# are not provisioned here; loop checks must use td-builder typed helpers or
+# td-built userland instead. Native loop applets for syscall-only host tools
+# (`mount --bind`, `flock`) are provided by td-builder itself and prepended by
+# check_loop.rs.
 make bash sh env tar gzip

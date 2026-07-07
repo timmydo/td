@@ -27,8 +27,10 @@ _x86_point() {
   case "$1" in
     binutils-*) XBU="$2" ;;
     gcc-*) XGCC2="$2"
-      XLIBGCCDIR=`find "$2" -name 'libgcc_s.so.1' 2>/dev/null | head -1 | xargs -r dirname`
-      XSTDCXXDIR=`find "$2" -name 'libstdc++.so.6' 2>/dev/null | head -1 | xargs -r dirname` ;;
+      _xlibgcc=`"$TB" files-name-first 'libgcc_s.so.1' "$2"` || return 1
+      _xstdcxx=`"$TB" files-name-first 'libstdc++.so.6' "$2"` || return 1
+      XLIBGCCDIR=`dirname "$_xlibgcc"`
+      XSTDCXXDIR=`dirname "$_xstdcxx"` ;;
     glibc-*) XGLIBC="$2" ;;
   esac
 }
@@ -189,10 +191,10 @@ x86_64_verify_closure() {
   # [no-guix] (DURABLE, runs on BOTH paths — the fetch path's static guix-byte-freeness leg, which
   # verify_x86_64_ownroot only runs on the build path): the closure libc + cross gcc carry no
   # /gnu/store bytes. Cheap (a grep), so a fetched substitute that smuggled guix bytes would red.
-  _xcc1=`find "$XGCC2" -name cc1 2>/dev/null | head -1`
+  _xcc1=`"$TB" files-name-first cc1 "$XGCC2"`
   for _b in "$XGLIBC/lib/libc.so.6" "$XGCC2/bin/$XTARGET-gcc" "$_xcc1"; do
     test -n "$_b" -a -e "$_b" || { echo "verify_closure: closure file missing ($_b)" >&2; return 1; }
-    if grep -q -a '/gnu/store' "$_b"; then echo "verify_closure: [no-guix] $_b contains /gnu/store bytes" >&2; return 1; fi
+    if "$TB" text contains '/gnu/store' "$_b"; then echo "verify_closure: [no-guix] $_b contains /gnu/store bytes" >&2; return 1; fi
   done
   echo "   [no-guix] the closure libc.so.6 + cross gcc/cc1 carry no /gnu/store bytes"
   # [self-contained] DURABLE (no guix oracle): the cross gcc must carry plain as/ld in its OWN tooldir
@@ -213,17 +215,18 @@ x86_64_verify_closure() {
   chmod 0555 "$bw/gcc"
   ( cd "$w" && env PATH="$XBU/bin:$_cpath" "$bw/gcc" -o c.out c.c ) \
     || { echo "verify_closure: closure cross gcc could not compile an x86_64 C program" >&2; return 1; }
-  cls=`"$XBU/bin/$XTARGET-readelf" -h "$w/c.out" 2>/dev/null | grep -i 'class:' | grep -o 'ELF64'`
-  test "$cls" = ELF64 || { echo "verify_closure: program not ELF64 (got '$cls')" >&2; return 1; }
-  ci=`"$XBU/bin/$XTARGET-readelf" -l "$w/c.out" 2>/dev/null | grep -o "/td/store/$glrel/lib/ld-linux-x86-64.so.2" | head -1`
-  test -n "$ci" || { echo "verify_closure: program interp not the lock-keyed /td/store x86_64 ld" >&2; return 1; }
+  "$XBU/bin/$XTARGET-readelf" -h "$w/c.out" > "$w/c.head" 2>/dev/null
+  "$TB" text contains 'ELF64' "$w/c.head" || { echo "verify_closure: program not ELF64" >&2; return 1; }
+  "$XBU/bin/$XTARGET-readelf" -l "$w/c.out" > "$w/c.prog" 2>/dev/null
+  "$TB" text contains "/td/store/$glrel/lib/ld-linux-x86-64.so.2" "$w/c.prog" || { echo "verify_closure: program interp not the lock-keyed /td/store x86_64 ld" >&2; return 1; }
   mkdir -p "$_store/cprog/bin"; cp "$w/c.out" "$_store/cprog/bin/c"; chmod -R u+w "$_store"
   wp=`"$TB" store-add-recursive cprog "$_store/cprog" "$_store" "$_db"` || { echo "verify_closure: store-add cprog failed" >&2; return 1; }
   wprel=${wp#/td/store/}
   sn='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 /td/store/'"$wprel"'/bin/c; echo "CRC=$?"'
   out=`"$TB" store-ns "$_store" -- "/td/store/$_bbase/bin/bash" -c "$sn" 2>&1` \
-    || { printf '%s\n' "$out" | sed 's/^/     /' >&2; echo "verify_closure: store-ns run exited nonzero" >&2; return 1; }
-  echo "$out" | grep -q '^CRC=42$' || { printf '%s\n' "$out" | sed 's/^/     /' >&2; echo "verify_closure: x86_64 program did not return 42 from the closure toolchain" >&2; return 1; }
-  echo "$out" | grep -q '^GNU-ABSENT$' || { echo "verify_closure: /gnu/store present in the own-root" >&2; return 1; }
+    || { printf '%s\n' "$out" > "$w/store-ns.out"; while IFS= read -r line; do printf '     %s\n' "$line" >&2; done < "$w/store-ns.out"; echo "verify_closure: store-ns run exited nonzero" >&2; return 1; }
+  printf '%s\n' "$out" > "$w/store-ns.out"
+  "$TB" text line-exact 'CRC=42' "$w/store-ns.out" || { while IFS= read -r line; do printf '     %s\n' "$line" >&2; done < "$w/store-ns.out"; echo "verify_closure: x86_64 program did not return 42 from the closure toolchain" >&2; return 1; }
+  "$TB" text line-exact 'GNU-ABSENT' "$w/store-ns.out" || { echo "verify_closure: /gnu/store present in the own-root" >&2; return 1; }
 }
