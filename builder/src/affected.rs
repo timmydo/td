@@ -293,7 +293,13 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
 // The i686 mesboot→store-native chain in dependency order. Each "chain" arm adds
 // itself + everything downstream (a contiguous slice); x86_64 hangs off
 // gcc-14/binutils-244/glibc-241, so the pure-i686-userland arms stop before it.
-const CHAIN: [&str; 28] = [
+// Brick 6 (the first dynamic /td/store toolchain, gcc-mesboot1 + binutils-mesboot +
+// glibc-mesboot-shared) is no longer its own chain gate: its behavioral check is the
+// glibc-mesboot-shared-test RECIPE (recipes/src/recipes/glibc-mesboot-shared-test.rs),
+// driven by recipe-checks-daily like every other recipe-owned check — see the
+// `sel.add_target("recipe-checks-daily")` calls added alongside the chain ranges below
+// that used to cover it.
+const CHAIN: [&str; 27] = [
     "bootstrap-seed",
     "bootstrap-cc",
     "bootstrap-mes",
@@ -314,7 +320,6 @@ const CHAIN: [&str; 28] = [
     "bootstrap-glibc-mesboot",
     "bootstrap-gcc-mesboot",
     "bootstrap-toolchain-store-native",
-    "bootstrap-glibc-shared-store-native",
     "bootstrap-gcc-mesboot-wrapper",
     "bootstrap-hello-userland",
     "bootstrap-binutils-244-store-native",
@@ -611,7 +616,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // --- the i686 mesboot→store-native chain: each rung + everything downstream ---
     if pattern_matches("tests/bootstrap-patch.sh|seed/sources/patch-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 7, 28);
+        add_chain(sel, 7, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if pattern_matches(
@@ -619,7 +625,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 8, 28);
+        add_chain(sel, 8, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if pattern_matches(
@@ -627,7 +634,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 9, 28);
+        add_chain(sel, 9, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if pattern_matches(
@@ -635,7 +643,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 10, 28);
+        add_chain(sel, 10, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/bootstrap-gcc-mesboot0.sh" {
@@ -658,17 +667,20 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 14, 28);
+        add_chain(sel, 14, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if pattern_matches("tests/bootstrap-gcc-mesboot1.sh|seed/sources/gcc-g++-4.6.4.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 15, 28);
+        add_chain(sel, 15, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if pattern_matches("tests/bootstrap-binutils-gawk-mesboot.sh|seed/sources/gawk-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 16, 28);
+        add_chain(sel, 16, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if pattern_matches(
@@ -676,48 +688,46 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 17, 28);
+        add_chain(sel, 17, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if pattern_matches("tests/bootstrap-gcc-mesboot.sh|seed/sources/gcc-4.9.4.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 18, 28);
+        add_chain(sel, 18, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/bootstrap-toolchain-store-native.sh" {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 19, 27); // pure i686 userland — stops before x86_64
-        return;
-    }
-    if p == "tests/bootstrap-glibc-shared-store-native.sh" {
-        sel.add_preflight("shell-syntax");
-        add_chain(sel, 20, 27);
+        add_chain(sel, 19, 26); // pure i686 userland — stops before x86_64
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if p == "tests/bootstrap-gcc-mesboot-wrapper.sh" {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 21, 27);
+        add_chain(sel, 20, 26);
         return;
     }
     if pattern_matches("tests/bootstrap-hello-userland.sh|seed/sources/hello-2.10.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 22, 27);
+        add_chain(sel, 21, 26);
         return;
     }
     if p == "tests/repro-lib.sh" {
         // shared reproducibility normalization — exercise the modern repro rungs.
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 23, 27);
+        add_chain(sel, 22, 26);
         return;
     }
     if pattern_matches("tests/bootstrap-binutils-244-store-native.sh|seed/sources/binutils-2.44.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 23, 28);
+        add_chain(sel, 22, 27);
         return;
     }
     if p == "tests/bootstrap-gcc-mesboot-494-store-native.sh" {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 24, 27);
+        add_chain(sel, 23, 26);
         return;
     }
     if pattern_matches(
@@ -725,12 +735,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 25, 28);
+        add_chain(sel, 24, 27);
         return;
     }
     if pattern_matches("tests/bootstrap-glibc-241-store-native.sh|seed/sources/glibc-2.41.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 26, 28);
+        add_chain(sel, 25, 27);
         return;
     }
     // bootstrap-hello-corpus-store-native.sh is hello's store-native recipe-check BODY (run
@@ -772,7 +782,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("bootstrap-hello-userland");
         sel.add_target("store-persist");
         sel.add_target("chain-cache");
-        add_chain(sel, 27, 28);
+        add_chain(sel, 26, 27);
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         sel.add_target("bootstrap-x86_64-self-gcc-store-native");
         sel.add_target("recipe-checks-daily");
@@ -815,7 +825,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 27, 28);
+        add_chain(sel, 26, 27);
         // x86_64-cross-fns.sh also defines the rung-X2 native driver (run_x86_64_native), the shared
         // fetch-or-build obtainers, and the rung-X3 self-host fns — so a change to it must re-run the
         // native gcc gate AND the self-host gate, not only the cross toolchain gate.
@@ -826,27 +836,32 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if glob_match("seed/sources/make-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 5, 28);
+        add_chain(sel, 5, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if glob_match("seed/sources/tcc-0.9.26*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 4, 28);
+        add_chain(sel, 4, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if glob_match("seed/sources/nyacc-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 3, 28);
+        add_chain(sel, 3, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if pattern_matches("seed/sources/mes-*.lock", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 2, 28);
+        add_chain(sel, 2, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
     if glob_match("seed/stage0/*", p) {
         sel.add_preflight("shell-syntax");
-        add_chain(sel, 0, 28);
+        add_chain(sel, 0, 27);
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
