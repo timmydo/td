@@ -1831,10 +1831,13 @@ mod tests {
         // of `tests/bootstrap-chain.sh`'s `bootstrap_modern_toolchain()`, which already
         // builds the whole 20-rung toolchain via one recipe-graph call, and
         // `recipe-checks-daily`'s store-native hello/sed checks already independently
-        // prove the toolchain works.
-        assert!(heavy.len() >= 16, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
-        assert!(daily.len() >= 7, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 24, "the full check lost gates");
+        // prove the toolchain works. Floors are set to the EXACT post-retirement counts
+        // (zero headroom, matching the pre-#397 convention: 19/32/51 were exact matches
+        // too) — these guard against ACCIDENTAL loss, so slack beyond the deliberate
+        // retirement just lets a future PR silently drop more gates unnoticed.
+        assert!(heavy.len() >= 18, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
+        assert!(daily.len() >= 9, "daily pool shrank: {}", daily.len());
+        assert!(heavy.len() + daily.len() >= 27, "the full check lost gates");
         for g in ["cargo-test", "store-verify"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
