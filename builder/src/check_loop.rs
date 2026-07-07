@@ -157,7 +157,7 @@ const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 /// store (so it would vanish inside the sandbox), is reported in one loud warning
 /// line (a misconfigured runner is visible) but is NOT fatal for a heavy-only
 /// tool: the gate that needs it fails loudly, exactly as the best-effort warms
-/// let their gates enforce presence — a host missing sqlite3 must still run
+/// let their gates enforce presence — a host missing mount must still run
 /// check-engine/check-pr. Fatal ONLY when a CORE tool (sh/bash/make/env) failed
 /// to resolve to an in-store bin dir — without those no gate body runs at all,
 /// and that fatal is a `CheckError::Unprovisioned`, so `cli()` exits

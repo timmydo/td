@@ -11,4 +11,4 @@
 # env) are fatal-if-missing. sed/grep/findutils are not host-PATH tools here:
 # check_loop.rs resolves their pinned /gnu/store paths from tests/hello-no-guix.lock
 # and prepends those declared bin dirs to the sandbox PATH.
-make bash sh env tar gzip mount sqlite3
+make bash sh env tar gzip mount

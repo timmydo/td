@@ -3825,7 +3825,8 @@ fn main() -> ExitCode {
         // store-query path). Usage:
         //   store-query DB info        -> "path|hash|narSize" per fully-registered path
         //   store-query DB references  -> "referrer|reference" for the full Refs relation
-        // Both sorted, so a set-comparison against the daemon oracle is order-free.
+        //   store-query DB outputs     -> "outpath|deriver|drvpath|id" per DerivationOutputs row
+        // All sorted, so a set-comparison against the daemon oracle is order-free.
         Some("store-query") if args.len() == 4 => {
             let (db_path, mode) = (&args[2], &args[3]);
             let run = || -> Result<Vec<String>, String> {
@@ -3882,8 +3883,39 @@ fn main() -> ExitCode {
                         }
                         lines
                     }
+                    // DerivationOutputs(drv, id, path): resolve `drv` (the referencing
+                    // ValidPaths rowid) to the drv's OWN path, and the output's OWN
+                    // registered deriver (ValidPaths.deriver where path=output) — the
+                    // daemon's post-build deriver + drv->output registration, dumped for
+                    // every output row (as `references` dumps every Refs edge).
+                    "outputs" => {
+                        let mut path_of = std::collections::HashMap::new();
+                        let mut deriver_of = std::collections::HashMap::new();
+                        for (rowid, cols) in db.table("ValidPaths")? {
+                            if let Some(p) = cols.get(1).and_then(text) {
+                                deriver_of.insert(p.clone(), cols.get(4).and_then(text).unwrap_or_default());
+                                path_of.insert(rowid, p);
+                            }
+                        }
+                        let mut lines = Vec::new();
+                        for (_rowid, cols) in db.table("DerivationOutputs")? {
+                            match (cols.first().and_then(int), cols.get(1).and_then(text), cols.get(2).and_then(text)) {
+                                (Some(drv_id), Some(id), Some(outpath)) => {
+                                    let drvpath = path_of.get(&drv_id).cloned().ok_or_else(|| {
+                                        format!("DerivationOutputs drv {drv_id} has no ValidPaths row")
+                                    })?;
+                                    let deriver = deriver_of.get(&outpath).cloned().ok_or_else(|| {
+                                        format!("DerivationOutputs path {outpath} has no ValidPaths row")
+                                    })?;
+                                    lines.push(format!("{outpath}|{deriver}|{drvpath}|{id}"));
+                                }
+                                _ => return Err("DerivationOutputs row has non-int/text columns".to_string()),
+                            }
+                        }
+                        lines
+                    }
                     other => {
-                        return Err(format!("unknown query mode `{other}' (info|references)"))
+                        return Err(format!("unknown query mode `{other}' (info|references|outputs)"))
                     }
                 };
                 out.sort();
@@ -6037,7 +6069,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder check-drv FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
-            eprintln!("       td-builder store-query DB info|references");
+            eprintln!("       td-builder store-query DB info|references|outputs");
             eprintln!("       td-builder store-closure DB ROOT");
             eprintln!("       td-builder store-closure-scan STORE-DIR[,EXTRA-DIR...] ROOT...");
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
