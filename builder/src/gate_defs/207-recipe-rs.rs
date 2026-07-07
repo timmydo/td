@@ -4,9 +4,8 @@
 //! assembles the registry — issue #295), evaluated by td-recipe-eval.
 //! This gate compiles the dependency-free `td-recipe` crate OFFLINE, runs its unit tests,
 //! then asserts (tests/recipe-rs.sh) the surface is self-consistent — every recipe + spec
-//! emits valid round-tripping JSON, the recipe manifest (tests/recipes-meta.json)
-//! is in sync, and `verify` discriminates a mismatch (negative control). Correctness vs
-//! upstream is recipe-checks' job, not a boa oracle.
+//! emits valid round-tripping JSON and `verify` discriminates a mismatch (negative
+//! control). Correctness vs upstream is recipe-checks' job, not a boa oracle.
 //!
 //! Offline by construction (the cargo-test pattern): the guix-free tools/provision-rust.sh +
 //! tools/provision-cc.sh resolve the warm rust + cc toolchain onto PATH — NOT a `guix shell`
@@ -28,7 +27,7 @@ pub fn gate() -> GateDef {
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
-echo ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent + the census manifest is in sync (rust-recipe-surface)"
+echo ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent (rust-recipe-surface)"
 set -euo pipefail; \
 rustpath=`sh tools/provision-rust.sh`; \
 ccpath=`sh tools/provision-cc.sh`; \
