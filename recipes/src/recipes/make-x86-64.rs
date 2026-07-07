@@ -103,6 +103,26 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/make".into()],
         exec: true,
     });
+    // [native-arch] the produced make is itself an ELF64 x86_64 binary — a NATIVE build
+    // artifact, not an i686 cross one — asserted by the interned native readelf. Catch a
+    // wrong-arch make HERE, at the rung that produced it, with a clear message, rather than
+    // indirectly (a generic failure) in the heavy daily behavioral probe. Parity with
+    // binutils-x86-64-native / gcc-x86-64-native, and directly on-point for a rung whose
+    // whole purpose is proving a native /td/store toolchain build. The static native readelf
+    // runs on the x86_64 sandbox host; grep is on base_path().
+    steps.push(
+        Step::run(
+            "{out}",
+            &[
+                SH,
+                "-c",
+                "h=$('{in:binutils-x86-64-native}/bin/readelf' -h '{out}/bin/make'); \
+                 printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || { echo 'make is not ELF64' >&2; exit 1; }; \
+                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'make is not x86-64' >&2; exit 1; }",
+            ],
+        )
+        .env("PATH", &base_path()),
+    );
     Recipe::mesboot("make-x86-64", "4.4.1")
         .native_inputs(&["gcc-x86-64-native", "binutils-x86-64-native", "glibc-x86-64"])
         .inputs_owned(base_inputs(&[
