@@ -19,29 +19,39 @@ use crate::types::{Recipe, RecipeCheck, Step};
 // host's), and running it returns EXACTLY 42 (not just "exits zero") — the same
 // non-vacuous exit-code assertion the retired shell script made via `RC=$?`.
 //
-// glibc-241 (the FULL modern toolchain, five rungs later) already depends on
-// glibc-mesboot-shared as one of its own native-inputs, so a warm chain-brick cache
-// (#317) makes this recipe's realization a cache hit in the common case; a cold run
-// builds only the rungs glibc-mesboot-shared's own dependency graph needs (through
-// binutils-mesboot0/1 -> gcc-mesboot0/1 -> glibc-mesboot0 -> glibc-mesboot-shared), not
-// the further gcc-14/binutils-244/glibc-241 rungs this recipe doesn't use.
+// This recipe's OWN native_inputs graph (binutils-mesboot0/1 -> gcc-mesboot0/1 ->
+// glibc-mesboot0 -> glibc-mesboot-shared) is a small early prefix of the full chain — but
+// its RecipeCheck::daily body (below) drives through the SHARED bootstrap_modern_toolchain
+// warm-chain function (tests/bootstrap-chain.sh), the same driver every other daily
+// recipe-check shares, which always realizes the full 20-rung graph through glibc-241 (not
+// just this recipe's own prefix). That's intentional, not wasteful in the steady state:
+// the machine-wide chain-brick cache (#317) means whichever daily check runs first pays
+// the full-chain cost once and every other daily check (hello, sed, this one, …) cache-hits
+// it — a genuinely-cold run (e.g. a fresh worktree with no warm cache) pays for the whole
+// chain regardless of which single recipe you're validating.
 pub fn recipe() -> Recipe {
     let glibc = "{in:glibc-mesboot-shared}";
     let gcc = "{in:gcc-mesboot1}/bin/gcc";
     let readelf = "{in:binutils-mesboot}/bin/readelf";
     let mut steps = Vec::new();
 
-    // [no-guix] the shared libc carries zero /gnu/store bytes.
-    steps.push(Step::run(
-        "{root}",
-        &[
-            SH,
-            "-c",
-            &format!(
-                "if grep -q -a /gnu/store '{glibc}/lib/libc.so.6'; then echo 'glibc-mesboot-shared embeds /gnu/store bytes' >&2; exit 1; fi"
-            ),
-        ],
-    ));
+    // [no-guix] the shared libc carries zero /gnu/store bytes. PATH must be set: steps run
+    // env-cleared, and an unresolvable bare `grep` inside a bodyless `if` exits 0 by POSIX
+    // rule (no branch taken -> exit status 0) — that would make this vacuously pass instead
+    // of failing loudly.
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                &format!(
+                    "if grep -q -a /gnu/store '{glibc}/lib/libc.so.6'; then echo 'glibc-mesboot-shared embeds /gnu/store bytes' >&2; exit 1; fi"
+                ),
+            ],
+        )
+        .env("PATH", &base_path()),
+    );
 
     // as/ld/ar/readelf onto {tools} (base_path()'s first component) so gcc's internal
     // assembler/linker invocations — and our own readelf check below — resolve to
@@ -105,14 +115,17 @@ pub fn recipe() -> Recipe {
         ],
     ));
 
-    steps.push(Step::run(
-        "{root}",
-        &[
-            SH,
-            "-c",
-            "mkdir -p '{out}'; printf 'PASS: gcc-mesboot1 linked a DYNAMIC program against glibc-mesboot-shared; it ran, interp=glibc-mesboot-shared, returned 42\\n' > '{out}/result'",
-        ],
-    ));
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                "mkdir -p '{out}'; printf 'PASS: gcc-mesboot1 linked a DYNAMIC program against glibc-mesboot-shared; it ran, interp=glibc-mesboot-shared, returned 42\\n' > '{out}/result'",
+            ],
+        )
+        .env("PATH", &base_path()),
+    );
     steps.push(Step::Require {
         paths: vec!["{out}/result".into()],
         exec: false,
