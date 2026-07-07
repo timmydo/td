@@ -387,8 +387,9 @@ tracking system, and all working notes live in the git log + PR body.
   leave a finished PR in draft (the human reads draft as "don't review yet").
   If the human asks about a draft PR, treat it as the signal your readiness
   state drifted: reconcile immediately (mark ready or say what's missing).
-  **Marking ready REQUIRES the subagent code review to already be POSTED on the
-  PR with its findings addressed** (landing step 2 — waivable only for a
+  **Marking ready REQUIRES both code reviews (the subagent review AND the
+  cross-model CLI review) to already be POSTED on the
+  PR with their findings addressed** (landing step 2 — waivable only for a
   trivial docs/comment-only diff, and only by saying so in the PR). A PR that
   is non-draft with no review comment on it is a protocol violation the human
   should not have to catch (they did once — this sentence is that lesson).
@@ -433,10 +434,19 @@ tracking system, and all working notes live in the git log + PR body.
   under you no longer forces a rebase-onto-tip + re-run. So: (1) validate against
   your own base — run `td-builder affected-checks --committed-only --run`; it
   waives the full loop (nothing escalates), so record the waiver (and any
-  "Deferred to the daily backstop" line) in the PR body; (2) **every PR gets a subagent code review — waivable only for a trivial docs- or comment-only diff, and only if you say so in the PR:** spawn an
-  independent code-review subagent over the full branch diff (`/code-review`) and
-  **post the subagent's review results as a comment on the PR**; address its
-  findings, posting each resulting fix as a **reply to that review comment and
+  "Deferred to the daily backstop" line) in the PR body; (2) **every PR gets TWO
+  independent code reviews — the subagent review AND a cross-model review by a
+  different model's CLI — both waivable only for a trivial docs- or comment-only
+  diff, and only if you say so in the PR:** spawn an
+  independent code-review subagent over the full branch diff (`/code-review`),
+  AND run a second review with a *different* model driven from its CLI so a
+  distinct model audits the same diff (catches blind spots one model shares with
+  its own subagent). Claude runs Codex:
+  `codex exec --ephemeral "Review the current git diff for correctness bugs, regressions, security issues, edge cases, and missing tests. Do not edit files. Return prioritized findings with file/line references where possible."`
+  and Codex runs Claude:
+  `claude -p "Review the current git diff for correctness bugs, regressions, security issues, edge cases, and missing tests. Do not edit files. Return prioritized findings with file/line references where possible."`
+  — **post BOTH reviews' results as comments on the PR**; address their
+  findings, posting each resulting fix as a **reply to the review comment and
   resolving the comment once the fix is done** (Workflow step 6 — MANDATORY for AI
   agents), then push the branch and mark the PR ready — CI runs
   the required hosted gate and a human review approves (main is branch-protected:
