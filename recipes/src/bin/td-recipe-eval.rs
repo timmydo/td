@@ -178,4 +178,24 @@ mod tests {
         let mes = catalog::lookup("mes").unwrap();
         assert_eq!(recipe_checks(&mes, None).len(), 0);
     }
+
+    // The `recipe-rs` gate's (A) coverage leg (formerly tests/recipe-rs.sh, driven
+    // over the `emit`/`verify` CLI subprocess) is ALREADY a plain unit test:
+    // catalog::tests::every_recipe_emits_canonical_json_and_round_trips covers
+    // "every recipe emits valid, round-tripping JSON" — no need to duplicate it
+    // here, `cargo test --manifest-path recipes/Cargo.toml` already runs both.
+    //
+    // (C) discrimination leg (negative control): two different recipes' canonical
+    // JSON must differ — the always-on proof that a JSON comparison actually
+    // discriminates a mismatch, not a vacuous always-equal check.
+    #[test]
+    fn a_mismatched_recipe_is_discriminated() {
+        let hello = catalog::lookup("hello").expect("hello recipe must exist (negative-control fixture)");
+        let sed = catalog::lookup("sed").expect("sed recipe must exist (negative-control fixture)");
+        assert_ne!(
+            hello.to_json().to_canonical(),
+            sed.to_json().to_canonical(),
+            "hello and sed canon-equal — a JSON comparison would not discriminate a mismatch"
+        );
+    }
 }

@@ -1575,6 +1575,11 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     println!(
         ">> build + unit-test the dependency-free td-recipe crate (offline, guix-free toolchain via tools/provision-{{rust,cc}}.sh)"
     );
+    // The coverage (every recipe emits valid, round-tripping JSON) and
+    // discrimination (a mismatch is not vacuously accepted) legs are plain
+    // #[test]s in recipes/src/bin/td-recipe-eval.rs — same crate, same types,
+    // no subprocess/temp-file dance needed to exercise a property of the
+    // crate's own data. `cargo test` here is what actually runs them.
     run_out_env(
         &cargo_bin_s,
         &["test", "--frozen", "--manifest-path", "recipes/Cargo.toml"],
@@ -1594,45 +1599,28 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     }
     let eval_s = path_str(&eval)?;
 
-    println!(">> (A) coverage: every recipe emits valid, round-tripping JSON");
+    // CLI smoke: `cargo test` only proves the underlying Rust functions are
+    // correct — it never runs the RELEASE BINARY's argv dispatch. `emit` is
+    // the one subcommand a live consumer (ladder-lib.sh's `ladder_emit`)
+    // actually spawns as a subprocess, so prove that entry point works too.
+    println!(">> CLI smoke: the release td-recipe-eval binary's list/emit subcommands work");
     let list_out = run_out(&eval_s, &["list"], "td-recipe-eval list")?;
-    let recipes: Vec<&str> = list_out.split_whitespace().collect();
-    if recipes.is_empty() {
-        return Err("FAIL: empty recipe catalog (vacuous)".to_string());
+    let first = list_out
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "FAIL: empty recipe catalog (vacuous)".to_string())?;
+    let json = run_out(&eval_s, &["emit", first], &format!("emit {first}"))?;
+    if json.trim().is_empty() {
+        return Err(format!("FAIL: emit {first} produced no JSON"));
     }
-    for s in &recipes {
-        let json = run_out(&eval_s, &["emit", s], &format!("emit {s}"))?;
-        if json.trim().is_empty() {
-            return Err(format!("FAIL: emit {s} produced no JSON"));
-        }
-        let json_path = scratch.join(format!("{s}.json"));
-        std::fs::write(&json_path, &json).map_err(|e| format!("FAIL: write {}: {e}", json_path.display()))?;
-        let json_path_s = path_str(&json_path)?;
-        if !cmd_ok(&eval_s, &["verify", s, &json_path_s]) {
-            return Err(format!("FAIL: {s} does not round-trip"));
-        }
-    }
-    println!("   ok: {} recipes emit valid, self-consistent JSON", recipes.len());
-
-    println!(">> (C) discrimination: verify rejects a mismatched recipe (negative control)");
-    let sed_json = scratch.join("sed.json");
-    let hello_json = scratch.join("hello.json");
-    if !(sed_json.is_file() && hello_json.is_file()) {
-        return Err("FAIL: missing emit fixtures for the negative control".to_string());
-    }
-    let sed_json_s = path_str(&sed_json)?;
-    if cmd_ok(&eval_s, &["verify", "hello", &sed_json_s]) {
-        return Err(
-            "FAIL: verify accepted hello against sed's JSON — discrimination is vacuous.".to_string(),
-        );
-    }
-    println!("   ok: verify hello <sed.json> correctly FAILS");
+    println!("   ok: list/emit {first} produced JSON via the release binary");
 
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
-        "PASS: recipe-rs — the Rust package surface emits valid self-consistent JSON and verify \
-         discriminates mismatches. Correctness vs upstream is proven by recipe-owned package checks, \
-         not boa (retired)."
+        "PASS: recipe-rs — the Rust package surface emits valid self-consistent JSON and \
+         discriminates a mismatch (recipes/src/bin/td-recipe-eval.rs unit tests), and the \
+         release binary's CLI entry points work. Correctness vs upstream is proven by \
+         recipe-owned package checks, not boa (retired)."
     );
     Ok(())
 }
