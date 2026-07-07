@@ -421,6 +421,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
             "store-verify",
             "store-backend",
             "store-ns",
+            "recipe-rs",
         ] {
             sel.add_target(g);
         }
@@ -861,11 +862,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "tests/recipe-rs.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("recipe-rs");
-        return;
-    }
     if p == "tests/heal-revert.sh" {
         // CI-lint-only test of the heal primitive — git is absent from the loop
         // sandbox, so it is not a ./check.sh gate; shell-syntax suffices locally.
@@ -1255,6 +1251,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("builder/src/gate_bodies.rs", "store-register");
     assert_target!("builder/src/gate_bodies.rs", "store-ns");
     assert_target!("builder/src/gate_bodies.rs", "check-engine");
+    assert_target!("builder/src/gate_bodies.rs", "recipe-rs");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
     // catalog edit runs recipe-rs and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
@@ -1263,7 +1260,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("recipes/src/recipes/hello.rs", "recipe-rs");
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
-    assert_target!("tests/recipe-rs.sh", "recipe-rs");
+    assert_target!("builder/src/gate_defs/207-recipe-rs.rs", "recipe-rs");
     // The surviving pinned inputs: a lock edit routes to the store-native gate that
     // stages it (hello → the store-native hello build; sed → store-persist).
     assert_target!("tests/hello-no-guix.lock", "bootstrap-hello-userland");

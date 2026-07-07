@@ -45,6 +45,7 @@ const NATIVE: &[&str] = &[
     "store-verify",
     "store-backend",
     "store-ns",
+    "recipe-rs",
 ];
 
 /// `td-builder gate-body <name>` — run one native gate body. Self-moves into
@@ -72,6 +73,7 @@ pub fn cli(name: &str) -> ExitCode {
         "store-verify" => store_verify(&root),
         "store-backend" => store_backend(&root),
         "store-ns" => store_ns(&root),
+        "recipe-rs" => recipe_rs(&root),
         other => Err(format!("gate-body: unknown native gate `{other}`")),
     };
     match res {
@@ -131,10 +133,10 @@ fn tb_out_env(tb: &Path, args: &[&str], envs: &[(&str, &str)], ctx: &str) -> Res
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// True if `tb <args...>` exits zero (for the discrimination legs that expect a
-/// NON-zero exit — corruption/verify-fail). stdout+stderr are discarded.
-fn tb_ok(tb: &Path, args: &[&str]) -> bool {
-    Command::new(tb)
+/// True if `<program> <args...>` exits zero (for the discrimination legs that
+/// expect a NON-zero exit — corruption/verify-fail). stdout+stderr discarded.
+fn cmd_ok(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> bool {
+    Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -144,19 +146,49 @@ fn tb_ok(tb: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+fn tb_ok(tb: &Path, args: &[&str]) -> bool {
+    cmd_ok(tb, args)
+}
+
 /// Run an arbitrary tool, returning trimmed stdout on success (the generic
 /// subprocess oracle spawn for sqlite3 and staging helpers).
 fn run_out(program: &str, args: &[&str], ctx: &str) -> Result<String, String> {
-    let out = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
+    run_out_env(program, args, &[], ctx)
+}
+
+/// `run_out`, plus extra env vars set on the child (inheriting the rest of the
+/// current environment — never `env -i`, matching the bash gates' bare
+/// `VAR=val cmd` prefix form).
+fn run_out_env(program: &str, args: &[&str], envs: &[(&str, &str)], ctx: &str) -> Result<String, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdin(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd
         .output()
         .map_err(|e| format!("FAIL: {ctx}: cannot spawn {program}: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("FAIL: {ctx}: {program} {args:?} exited {}\n{err}", out.status));
+        let sout = String::from_utf8_lossy(&out.stdout);
+        return Err(format!(
+            "FAIL: {ctx}: {program} {args:?} exited {}\n{sout}{err}",
+            out.status
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The first `bin`-dir among `frags` (a `:`-joined PATH fragment, as
+/// `tools/provision-{rust,cc}.sh` print) that actually has an executable
+/// named `bin` — resolving the absolute binary path ourselves rather than
+/// leaning on `Command`'s PATH search (which uses the CURRENT process's PATH,
+/// not a child `.env("PATH", ..)` override).
+fn find_in_path_frags(frags: &str, bin: &str) -> Option<PathBuf> {
+    frags.split(':').map(Path::new).find_map(|d| {
+        let p = d.join(bin);
+        p.is_file().then_some(p)
+    })
 }
 
 /// `sqlite3 <db> <sql>` — the PARSER ORACLE for td's hand-written SQLite bytes
@@ -1496,6 +1528,108 @@ fn store_ns(root: &Path) -> Result<(), String> {
         "PASS: td owns its own root with its own store at /td/store — a static package runs from \
          /td/store in a rootless user namespace with /gnu/store and the guix install ABSENT. The \
          unmixed /td/store base the user package manager runs in (user-pm Phase 0)."
+    );
+    Ok(())
+}
+
+// --- recipe-rs (port of tests/recipe-rs.sh) -----------------------------------
+
+/// recipe-rs — the Rust package + spec surface (the `recipes` crate) is
+/// self-consistent (rust-recipe-surface track). Builds + unit-tests the
+/// dependency-free `recipes` crate OFFLINE with a guix-free rust+cc toolchain
+/// (`tools/provision-{rust,cc}.sh` — a host-prep concern, not part of the
+/// rust-recipe-surface itself, so still shelled out to, same as the bash gate
+/// did), then proves `td-recipe-eval`'s catalog is coverage-complete
+/// (every recipe emits valid, round-tripping JSON) and discriminating
+/// (`verify` rejects a mismatched recipe — a negative control, not vacuous).
+fn recipe_rs(root: &Path) -> Result<(), String> {
+    println!(
+        ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent (rust-recipe-surface)"
+    );
+
+    let rustpath = run_out("sh", &["tools/provision-rust.sh"], "provision-rust")?;
+    let ccpath = run_out("sh", &["tools/provision-cc.sh"], "provision-cc")?;
+    let cargo_bin = find_in_path_frags(&rustpath, "cargo")
+        .ok_or_else(|| format!("FAIL: no cargo in provision-rust output ({rustpath})"))?;
+
+    let scratch = fresh_scratch(root, ".recipe-rs-scratch")?;
+    let cargo_home = scratch.join("home");
+    let cargo_target = scratch.join("target");
+    std::fs::create_dir_all(&cargo_home).map_err(|e| format!("FAIL: mkdir {}: {e}", cargo_home.display()))?;
+    std::fs::create_dir_all(&cargo_target).map_err(|e| format!("FAIL: mkdir {}: {e}", cargo_target.display()))?;
+    let cargo_home_s = path_str(&cargo_home)?;
+    let cargo_target_s = path_str(&cargo_target)?;
+    let cargo_bin_s = path_str(&cargo_bin)?;
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{rustpath}:{ccpath}:{old_path}");
+    let envs: [(&str, &str); 3] = [
+        ("PATH", &new_path),
+        ("CARGO_HOME", &cargo_home_s),
+        ("CARGO_TARGET_DIR", &cargo_target_s),
+    ];
+
+    println!(
+        ">> build + unit-test the dependency-free td-recipe crate (offline, guix-free toolchain via tools/provision-{{rust,cc}}.sh)"
+    );
+    run_out_env(
+        &cargo_bin_s,
+        &["test", "--frozen", "--manifest-path", "recipes/Cargo.toml"],
+        &envs,
+        "cargo test recipes",
+    )?;
+    run_out_env(
+        &cargo_bin_s,
+        &["build", "--release", "--frozen", "--manifest-path", "recipes/Cargo.toml"],
+        &envs,
+        "cargo build recipes",
+    )?;
+
+    let eval = cargo_target.join("release/td-recipe-eval");
+    if !eval.is_file() {
+        return Err(format!("FAIL: td-recipe-eval was not built at {}", eval.display()));
+    }
+    let eval_s = path_str(&eval)?;
+
+    println!(">> (A) coverage: every recipe emits valid, round-tripping JSON");
+    let list_out = run_out(&eval_s, &["list"], "td-recipe-eval list")?;
+    let recipes: Vec<&str> = list_out.split_whitespace().collect();
+    if recipes.is_empty() {
+        return Err("FAIL: empty recipe catalog (vacuous)".to_string());
+    }
+    for s in &recipes {
+        let json = run_out(&eval_s, &["emit", s], &format!("emit {s}"))?;
+        if json.trim().is_empty() {
+            return Err(format!("FAIL: emit {s} produced no JSON"));
+        }
+        let json_path = scratch.join(format!("{s}.json"));
+        std::fs::write(&json_path, &json).map_err(|e| format!("FAIL: write {}: {e}", json_path.display()))?;
+        let json_path_s = path_str(&json_path)?;
+        if !cmd_ok(&eval_s, &["verify", s, &json_path_s]) {
+            return Err(format!("FAIL: {s} does not round-trip"));
+        }
+    }
+    println!("   ok: {} recipes emit valid, self-consistent JSON", recipes.len());
+
+    println!(">> (C) discrimination: verify rejects a mismatched recipe (negative control)");
+    let sed_json = scratch.join("sed.json");
+    let hello_json = scratch.join("hello.json");
+    if !(sed_json.is_file() && hello_json.is_file()) {
+        return Err("FAIL: missing emit fixtures for the negative control".to_string());
+    }
+    let sed_json_s = path_str(&sed_json)?;
+    if cmd_ok(&eval_s, &["verify", "hello", &sed_json_s]) {
+        return Err(
+            "FAIL: verify accepted hello against sed's JSON — discrimination is vacuous.".to_string(),
+        );
+    }
+    println!("   ok: verify hello <sed.json> correctly FAILS");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    println!(
+        "PASS: recipe-rs — the Rust package surface emits valid self-consistent JSON and verify \
+         discriminates mismatches. Correctness vs upstream is proven by recipe-owned package checks, \
+         not boa (retired)."
     );
     Ok(())
 }
