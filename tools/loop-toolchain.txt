@@ -9,4 +9,4 @@
 # dir, etc.). A tool absent from the host PATH warns (a misconfigured runner is
 # visible); the gate that needs it then fails loudly. Core tools (sh/bash/make/
 # env) are fatal-if-missing.
-make bash sh env sed grep find tar gzip crun unshare sqlite3
+make bash sh env sed grep find tar gzip unshare sqlite3

@@ -340,7 +340,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("check.sh|builder/build.rs|builder/src/gates.rs|builder/src/check_loop.rs", p) {
+    if pattern_matches(
+        "check.sh|builder/build.rs|builder/src/gates.rs|builder/src/check_loop.rs|tools/loop-toolchain.txt",
+        p,
+    ) {
         // The loop spine used to escalate to the FULL loop; it now validates on
         // the bounded check-pr tier (which exercises the runner/prelude end to
         // end over the whole PR pool) + the engine unit tests — the daily-tier
