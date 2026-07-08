@@ -39,12 +39,11 @@ ladder_map_has() {
 }
 
 # ladder_tool_root NAME PROBE — the store package root providing PROBE. Resolution
-# order: (1) the PINNED committed lock (tests/hello-no-guix.lock — regenerated on
-# channel bumps, so the tool set is pinned, unlike the deleted ladder's bare globs);
+# order: (1) the PINNED committed tool lock (tests/td-subst.lock);
 # (2) the loop PATH (`command -v`); (3) the store glob the old ladder used (flex/
 # bison/m4 are in no committed lock — same hermeticity as before, shrink later).
 ladder_tool_root() {
-  _r=`"$TB" lock path tests/hello-no-guix.lock "$1" 2>/dev/null || true`
+  _r=`"$TB" lock path tests/td-subst.lock "$1" 2>/dev/null || true`
   if [ -z "$_r" ] || [ ! -x "$_r/bin/$2" ]; then
     _bin=`command -v "$2" 2>/dev/null || true`
     if [ -n "$_bin" ]; then
@@ -56,7 +55,7 @@ ladder_tool_root() {
     test -n "$_b" && _r=${_b%/bin/*}
   fi
   test -n "$_r" -a -x "$_r/bin/$2" \
-    || { echo "ladder: cannot resolve the $1 package (probe $2) — not in tests/hello-no-guix.lock, not on PATH, no /gnu/store/*-$1-* on this host" >&2; return 1; }
+    || { echo "ladder: cannot resolve the $1 package (probe $2) — not in tests/td-subst.lock, not on PATH, no /gnu/store/*-$1-* on this host" >&2; return 1; }
   printf '%s\n' "$_r"
 }
 

@@ -1,6 +1,6 @@
 # seed/sources/glibc-2.41.lock — GNU C Library 2.41, the MODERN glibc (guix's glibc-final, channel pin
 # 520785e3) — the final libc at /td/store, built by the modern GCC 14.3.0, replacing the bootstrap glibc
-# 2.16.0. Unblocks the rust-store-native track (#196, needs glibc >= 2.17). Pristine upstream .tar.xz from
+# 2.16.0. Unblocks Rust runtime coverage (needs glibc >= 2.17). Pristine upstream .tar.xz from
 # ftp.gnu.org. Sorts after glibc-2.2.5 so the chain's `ls glibc-*.lock | head -1` (glibc-mesboot0 2.2.5) is
 # unaffected. td-fetched.
 url https://ftp.gnu.org/gnu/glibc/glibc-2.41.tar.xz

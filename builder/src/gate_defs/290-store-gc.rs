@@ -1,5 +1,5 @@
 //! store-gc (DESIGN §7.1; td-store-db track — begin replacing guix-daemon). td computes
-//! the GC-reachable CLOSURE of a td-BUILT hello — the daemon's THIRD role (GC) — TWO
+//! the GC-reachable CLOSURE of a td-BUILT subject — the daemon's THIRD role (GC) — TWO
 //! daemon-free ways, in pure Rust, over a TD-OWNED store:
 //! (1) DB walk: `td-builder store-closure DB ROOT` reads the DB with td's own SQLite
 //! reader (`store_db_read`) and walks the `Refs` graph from ROOT (the GC "mark" set).
@@ -8,7 +8,7 @@
 //! scanForReferences), with NO store DB — the closure query the loop's store-native
 //! gates use to resolve a runtime closure without the guix daemon or its DB.
 //! R3 (guix-retirement ladder → #261): the SUBJECT is now td-BUILT (gate_bodies::store_subject —
-//! `td-builder build-recipe` GNU hello, cache-hit off the build-recipes prelude) and its
+//! a synthetic td-built subject and its
 //! closure is CONTENT-SCANNED, so this gate runs with guix OFF PATH — no `guix build`, no
 //! `guix gc`. The removable guix-comparison oracle (== `guix gc -R`) is DROPPED per CLAUDE.md
 //! directive 3 (called out in the PR): the two TD methods are asserted equal to EACH OTHER and

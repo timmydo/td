@@ -3,11 +3,10 @@
 # whose entries are LOGICAL /td/store symlinks that RESOLVE + RUN inside a store-ns own-root
 # with /gnu/store ABSENT — the .scm-free userspace ASSEMBLY mechanism (no guix operating-system).
 #
-# The tool here is bash-static (from hello's PINNED closure, read by td's own store-closure
-# reader — no guix process), the same cheap static runner the store-ns gate uses; it gives a real
-# multi-entry package (bash + sh). This gate proves the ASSEMBLY + own-root execution; the
-# guix-FREE /td/store-NATIVE userland the toolchain builds (bootstrap-hello-userland #192 /
-# gcc-14 #197) joins this SAME mechanism. The
+# The tool here is the declared bash-static fixture, the same cheap static runner the
+# store-ns gate uses; it gives a real multi-entry package (bash + sh). This gate proves
+# the ASSEMBLY + own-root execution; the
+# guix-FREE /td/store-NATIVE userland follow-up joins this SAME mechanism. The
 # profile --store-native logical-vs-physical link behaviour is unit-tested in builder/src.
 #
 # Legs:
@@ -25,18 +24,10 @@ echo ">> td-builder (stage0, guix-free): $TB"
 work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 
-# A static package from hello's PINNED closure (td's own store-closure reader, no guix process).
-bash=`"$TB" lock path tests/hello-no-guix.lock bash`
-test -n "$bash" || fail "no bash in hello's lock"
-bs=
-while IFS= read -r p; do
-  case "$p" in
-    /gnu/store/*-bash-static-*) [ -n "$bs" ] || bs="$p" ;;
-  esac
-done <<EOF
-`"$TB" store-closure-scan /gnu/store "$bash"`
-EOF
-test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in the closure of $bash"
+# A static package resolved by the gate runner from the declared lock input.
+bs=${TD_GATE_INPUT_BASH_STATIC:-}
+test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run"
+test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"
 
 # Intern it at the LOGICAL /td/store (TD_STORE_DIR); bytes land physically under $store.
 store="$work/td-store"; mkdir -p "$store"; db="$work/db.sqlite"

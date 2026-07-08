@@ -110,7 +110,7 @@ run_x86_64_cross() {
 # transitive closure IS the cross toolchain, so one `ladder_build rust-toolchain` realizes the whole graph
 # (the warm chain cache-hits the cross rungs). Same preamble as run_x86_64_cross; exports the cross trees
 # (XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR) AND the relinked rustc/cargo tree XRUSTTREE. Called by the
-# recipe-owned daily check (tests/rust-toolchain-recipe-check.sh).
+# future recipe-owned daily rust-toolchain coverage.
 run_x86_64_rust_toolchain() {
   . tests/ladder-lib.sh
   TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
@@ -179,7 +179,7 @@ verify_x86_64_ownroot() {
   mkdir -p "$store/prog/bin"; cp "$snwork/w/c.out" "$store/prog/bin/c"; cp "$snwork/w/cpp.out" "$store/prog/bin/cpp"; chmod -R u+w "$store"
   WP=`"$TB" store-add-recursive prog "$store/prog" "$store" "$sndb"` || { echo "store-add prog failed" >&2; return 1; }; wprel=${WP#/td/store/}
   # the static-bash fixture is a DECLARED gate input (#353): every gate calling
-  # this fn declares bash-static; the runner content-scanned hello's bash closure.
+  # this fn declares bash-static; the runner content-scanned the substitute fixture.
   bs=${TD_GATE_INPUT_BASH_STATIC:-}
   test -n "$bs" || { echo "TD_GATE_INPUT_BASH_STATIC unset — the calling gate must declare the bash-static input (#353)" >&2; return 1; }
   bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"
@@ -340,7 +340,7 @@ verify_x86_64_native_ownroot() {
   done
   echo "   [closure-complete] the native binutils as/ld are interned at /td/store/$nbrel beside the native gcc — a complete native toolchain in td's own store"
   # the static-bash fixture is a DECLARED gate input (#353): every gate calling
-  # this fn declares bash-static; the runner content-scanned hello's bash closure.
+  # this fn declares bash-static; the runner content-scanned the substitute fixture.
   bs=${TD_GATE_INPUT_BASH_STATIC:-}
   test -n "$bs" || { echo "TD_GATE_INPUT_BASH_STATIC unset — the calling gate must declare the bash-static input (#353)" >&2; return 1; }
   bbase=`basename "$bs"`; cp -a "$bs" "$store/$bbase"; chmod -R u+w "$store"

@@ -4,8 +4,7 @@
 //! cache-lib's load_stage0, the check prelude, the daemon-ensure probe) places a stage0
 //! from a cold cache with guix's private state HIDDEN. Before #313, store-add-builder
 //! hard-read /var/guix/db/db.sqlite as its reference-scan seed, so any cold start (or any
-//! builder/ edit — a new fingerprint) FATALed on a guix-less host: exactly the machine
-//! `check-harness` exists for. Now the reference-scan candidates come from a readdir of
+//! builder/ edit — a new fingerprint) FATALed on a guix-less host. Now the reference-scan candidates come from a readdir of
 //! the seed store DIRECTORY (scan_candidate_index, the #267 content-scan pattern), and an
 //! absent dir contributes nothing.
 //!
@@ -27,8 +26,8 @@
 //! NO external ref with the seed dir absent and DOES record it with /gnu/store passed —
 //! the readdir candidate source is load-bearing, not decorative.
 //!
-//! The full guix-less VM run (`td-builder check check-harness` on a host with no guix at
-//! all) is the arc this unblocks; this gate pins its cold-start contract inside the loop,
+//! The full guix-less VM run on a host with no guix at all is the arc this unblocks;
+//! this gate pins its cold-start contract inside the loop,
 //! where a guix host can still A/B the warm baseline.
 
 use crate::gates::{GateDef, Pool, StoreMode};
@@ -97,7 +96,7 @@ pb=`"$tbw" store-add-builder probe2-0.1.0 "$scratch/probe2" "$scratch/pstore-b" 
 	  || { echo "FAIL: the embedded ref $g was NOT found by the /gnu/store readdir scan — the candidate source is broken" >&2; exit 1; }; \
 echo "  [DURABLE self-discrimination] same probe bytes: absent dir → self-only; /gnu/store → the embedded glibc ref recorded"; \
 rm -rf "$scratch"; \
-echo "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted empty, a cold tests/stage0-builder.sh run placed a stage0 that runs, at the SAME canonical path with the SAME (non-vacuous: glibc + gcc-lib) builder.db closure as the warm guix-host placement — the reference scan's candidates come from a readdir of the seed store dir, not guix's private db. An absent seed dir (a truly guix-less host) still places with a self-only closure; a non-directory seed dir errors loudly (no silent refless placement); and the same probe tree records an embedded store ref ONLY when the dir is passed — the readdir candidate source is load-bearing. The guix-less check-harness cold start (#313) is unblocked."
+echo "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted empty, a cold tests/stage0-builder.sh run placed a stage0 that runs, at the SAME canonical path with the SAME (non-vacuous: glibc + gcc-lib) builder.db closure as the warm guix-host placement — the reference scan's candidates come from a readdir of the seed store dir, not guix's private db. An absent seed dir (a truly guix-less host) still places with a self-only closure; a non-directory seed dir errors loudly (no silent refless placement); and the same probe tree records an embedded store ref ONLY when the dir is passed — the readdir candidate source is load-bearing. The guix-less cold start (#313) is unblocked."
 "##,
     }
 }

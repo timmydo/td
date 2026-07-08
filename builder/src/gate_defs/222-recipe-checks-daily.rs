@@ -15,23 +15,15 @@ pub fn gate() -> GateDef {
         inputs: &[
             ArtifactInput {
                 name: "coreutils",
-                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "coreutils" },
+                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
             },
             ArtifactInput {
                 name: "bash-static",
                 kind: InputKind::ClosureMember {
-                    lock: "tests/hello-no-guix.lock",
+                    lock: "tests/td-subst.lock",
                     root_stem: "bash",
                     member_stem: "bash-static",
                 },
-            },
-            ArtifactInput {
-                name: "gcc-toolchain",
-                kind: InputKind::LockEntry { lock: "tests/hello-no-guix.lock", stem: "gcc-toolchain" },
-            },
-            ArtifactInput {
-                name: "sed-gcc-toolchain",
-                kind: InputKind::LockEntry { lock: "tests/sed-no-guix.lock", stem: "gcc-toolchain" },
             },
         ],
         store: StoreMode::Shared,

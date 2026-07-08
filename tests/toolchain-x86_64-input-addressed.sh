@@ -172,10 +172,10 @@ perturb_glibc_pin "$LOCK" "$work/pin.lock" || fail "[load-bearing] could not per
 echo "   [load-bearing] recipe-rev bump moves the key; flipping one input pin moves glibc-2.41-x86_64's path"
 
 # --- [behavioral]+[structural] a real binary at the x86_64-keyed path RUNS in the own-root -----
-# A static bash from hello's PINNED closure (td's own store-closure reader, no guix process) is a
-# real runnable FIXTURE — placed at the x86_64-keyed input-addressed path, run in the store-ns own-root.
+# A static bash from the declared td-subst fixture is a real runnable FIXTURE —
+# placed at the x86_64-keyed input-addressed path, run in the store-ns own-root.
 # the static-bash fixture is a DECLARED gate input (#353): the runner
-# content-scanned hello's bash closure and exported the unique bash-static member.
+# content-scanned the substitute fixture and exported the unique bash-static member.
 bs=${TD_GATE_INPUT_BASH_STATIC:-}
 test -n "$bs" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 test -x "$bs/bin/bash" || fail "no static bash fixture at $bs"

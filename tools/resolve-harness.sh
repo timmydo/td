@@ -6,8 +6,7 @@
 # /td/store/ld loader, and the `rel` + `toolchain` metadata — as ONE signed nar from a PERSISTENT
 # substitute store, verified against a PINNED ed25519 public key. On a verified HIT it restores
 # the tree into DEST (atomic swap) and prints DEST (exit 0); on ANY miss (no store, no entry, bad
-# signature, wrong StorePath, corrupt nar, restore failure) it prints nothing and exits 1 so
-# `td-builder check check-harness` FAILS CLOSED with its provisioning message. There is NO
+# signature, wrong StorePath, corrupt nar, restore failure) it prints nothing and exits 1. There is NO
 # from-source fallback on a guix-less runner — shipping the harness IS the provisioning path.
 #
 # Mirrors tools/resolve-toolchain.sh, but the harness is a fixed-name WHOLE-TREE substitute
@@ -101,7 +100,7 @@ fsp=$(narinfo_field StorePath "$work/fetch/$name.narinfo" 2>/dev/null || true)
 narfile=$(narinfo_field NarFile "$work/fetch/$name.narinfo" 2>/dev/null || true)
 
 # Restore the WHOLE tree into a sibling temp, sanity-check the harness shape, then atomically
-# swap it into DEST (mirrors gate 420's persist: assemble beside, then swap into place).
+# swap it into DEST.
 mkdir -p "$(dirname "$dest")"
 htmp="$dest.tmp.$$"
 rm -rf "$htmp"

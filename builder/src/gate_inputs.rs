@@ -88,7 +88,7 @@ fn resolve_lock_entry(root: &Path, lock: &str, stem: &str) -> Result<String, Str
 }
 
 /// Per-process memo for ClosureMember resolutions. Many gates declare the
-/// IDENTICAL triple (9 gates share hello's bash → bash-static today) and every
+/// IDENTICAL triple (many gates share the same bash-static fixture) and every
 /// resolution pays a full store-dir index + a byte-scan of the root's whole
 /// runtime closure, so one gate-run process resolves each distinct triple ONCE.
 /// Keyed by the ABSOLUTE lock path (unit tests run many roots in one process).
@@ -203,7 +203,7 @@ mod tests {
         assert!(path_names_stem(&p("bash"), "bash"));
         assert!(!path_names_stem(&p("bash"), "bas"));
         // a source tarball still names its package (version starts the suffix).
-        assert!(path_names_stem(&p("hello-2.12.2.tar.gz"), "hello"));
+        assert!(path_names_stem(&p("fixture-1.0.tar.gz"), "fixture"));
     }
 
     #[test]

@@ -2,9 +2,8 @@
 # tests/recipe-checks.sh — run the recipe-owned package checks. td-recipe-eval lists the
 # recipes that carry checks (recipes/src/recipes/<stem>.rs) and emits their bodies; each
 # builds its package on td's OWN mes-rooted /td/store toolchain (the store-native ladder),
-# GUIX-FREE. There is no package table and no guix helper lib — the guix-seeded recipe
-# checks (recipe_cached_build / recipe_link_seed against a *-no-guix.lock realized with
-# `guix build`) retired with the guix corpus; every surviving check is store-native.
+# GUIX-FREE. There is no package table and no guix helper lib; the retired
+# guix-seeded corpus path is gone, and every surviving check is store-native.
 
 set -euo pipefail
 

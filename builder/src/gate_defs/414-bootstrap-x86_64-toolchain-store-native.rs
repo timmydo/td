@@ -1,7 +1,7 @@
 //! bootstrap-x86_64-toolchain-store-native — source-bootstrap: CROSS the i686 full-source bootstrap UP to a
 //! native x86_64 toolchain at /td/store (x86_64-toolchain track). The whole existing /td/store toolchain (gcc
 //! 14.3.0 + binutils 2.44 + glibc 2.41) is i686/32-bit (ld-linux.so.2), but the upstream Rust pin is x86_64, so
-//! the rust-store-native (#196) runtime leg is blocked on ARCHITECTURE — not just glibc>=2.17. From the 229-byte
+//! Rust runtime coverage is blocked on ARCHITECTURE — not just glibc>=2.17. From the 229-byte
 //! seed, td builds the i686 chain → gcc 14.3.0, then with it CROSSES UP (LFS/crosstool shape): cross binutils
 //! 2.44 (--target=x86_64) → cross gcc 14 stage1 (C, no libc) → MODERN x86_64 glibc 2.41 (ld-linux-x86-64.so.2 +
 //! libc.so.6) → cross gcc 14 stage2 (c,c++ --enable-shared → libgcc_s.so.1, which rustc needs). The x86_64 glibc
@@ -44,7 +44,7 @@ pub fn gate() -> GateDef {
             ArtifactInput {
                 name: "bash-static",
                 kind: InputKind::ClosureMember {
-                    lock: "tests/hello-no-guix.lock",
+                    lock: "tests/td-subst.lock",
                     root_stem: "bash",
                     member_stem: "bash-static",
                 },
