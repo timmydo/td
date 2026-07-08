@@ -425,6 +425,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    if pattern_matches("tests/recipe-checks.sh", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("recipe-checks-daily");
+        return;
+    }
+
     if pattern_matches("fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock", p) {
         // No gate builds the fetch crate from source (the td-fetch corpus recipe is
         // retired), so a change to it validates on the bounded check-pr tier.
@@ -1003,6 +1009,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/chain-cache-lib.sh", "chain-cache");
     assert_target!("tests/chain-cache.sh", "chain-cache");
     assert_target!("tests/bootstrap-chain.sh", "chain-cache");
+    assert_target!("tests/recipe-checks.sh", "recipe-checks-daily");
     // ladder-lib.sh (#429) is the shared foundation under BOTH the i686 chain and the
     // x86_64 cross/native tracks — a change must re-prove all of those shell consumers,
     // not recipe-checks-daily, which now runs through td-recipe-eval check-run.
