@@ -6,13 +6,12 @@
 //!
 //! What runs here, in order (the exact sequence the shell prelude ran; the
 //! rationale comments live with each step):
-//!   1. the guix-free `check-harness` tier branch (never touches guix),
-//!   2. the netns-probe discrimination check,
-//!   3. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   4. the loop PATH: host-provided tools from tools/loop-toolchain.txt,
-//!   5. the warm prelude (subst store, source/crate warms, build daemon),
-//!   6. the machine-wide slot dir, and
-//!   7. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon -- TB gate-run.
+//!   1. the netns-probe discrimination check,
+//!   2. stage0 provisioning (the guix-free loop-container provider, #294),
+//!   3. the loop PATH: host-provided tools from tools/loop-toolchain.txt,
+//!   4. the warm prelude (subst store, source/crate warms, build daemon),
+//!   5. the machine-wide slot dir, and
+//!   6. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon -- TB gate-run.
 //!
 //! (The host-guix == pinned-channel integrity guard that used to run `guix
 //! describe` was removed in #406 — it only warned on drift, so dropping it is
@@ -30,7 +29,7 @@ fn fatal(msg: &str) -> String {
 
 /// Exit code `td-builder check` uses when it aborts because the RUNNER is not
 /// provisioned to run the loop at all (the base loop toolchain does not resolve
-/// on PATH, or the harness tier has no local/fetchable /td/store store) — as
+/// on PATH) — as
 /// opposed to a gate genuinely going red. It is the stable machine signal the
 /// daily backstop (`td-builder daily`) reads to tell "nothing could run here"
 /// from "a real regression", instead of grepping FATAL prose out of the log
@@ -119,8 +118,11 @@ fn guard_netns_probe() -> Result<(), String> {
 fn provision_stage0(root: &Path) -> Result<String, String> {
     let applets = current_binary_native_applet_path(root)?;
     let path = std::env::var("PATH").unwrap_or_default();
-    let self_exe = std::env::current_exe()
-        .map_err(|e| fatal(&format!("could not resolve current td-builder executable: {e}")))?;
+    let self_exe = std::env::current_exe().map_err(|e| {
+        fatal(&format!(
+            "could not resolve current td-builder executable: {e}"
+        ))
+    })?;
     let out = run_capture(
         Command::new("sh")
             .arg("-c")
@@ -130,7 +132,9 @@ fn provision_stage0(root: &Path) -> Result<String, String> {
             .current_dir(root),
     )
     .map_err(|e| {
-        fatal(&format!("could not provision the guix-free stage0 td-builder for the loop sandbox ({e})"))
+        fatal(&format!(
+            "could not provision the guix-free stage0 td-builder for the loop sandbox ({e})"
+        ))
     })?;
     let tb = out.trim().to_string();
     if tb.is_empty() || !Path::new(&tb).is_file() {
@@ -141,7 +145,11 @@ fn provision_stage0(root: &Path) -> Result<String, String> {
 
 fn current_binary_native_applet_path(root: &Path) -> Result<String, String> {
     let current = std::env::current_exe()
-        .map_err(|e| fatal(&format!("cannot resolve current td-builder executable: {e}")))?
+        .map_err(|e| {
+            fatal(&format!(
+                "cannot resolve current td-builder executable: {e}"
+            ))
+        })?
         .display()
         .to_string();
     native_applet_path(root, &current)
@@ -370,7 +378,11 @@ fn wait_with_deadline(child: &mut std::process::Child, deadline: Option<Instant>
     }
 }
 
-fn spawn_argv(argv: &[String], root: &Path, envs: &[(String, String)]) -> Option<std::process::Child> {
+fn spawn_argv(
+    argv: &[String],
+    root: &Path,
+    envs: &[(String, String)],
+) -> Option<std::process::Child> {
     let (head, rest) = argv.split_first()?;
     let mut cmd = Command::new(head);
     cmd.args(rest).current_dir(root);
@@ -390,7 +402,9 @@ fn warm_status(argv: &[String], root: &Path, envs: &[(String, String)]) -> bool 
 
 fn warm_capture(argv: &[String], root: &Path, envs: &[(String, String)]) -> String {
     let wrapped = warm_argv(argv);
-    let Some((head, rest)) = wrapped.split_first() else { return String::new() };
+    let Some((head, rest)) = wrapped.split_first() else {
+        return String::new();
+    };
     let mut cmd = Command::new(head);
     cmd.args(rest).current_dir(root).stderr(Stdio::null());
     for (k, v) in envs {
@@ -510,8 +524,11 @@ fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
     // (systemd scope) candidate only works if we vacate it FIRST.
     let host_leaf = run.join("host");
     if std::fs::create_dir(&host_leaf).is_err()
-        || std::fs::write(host_leaf.join("cgroup.procs"), std::process::id().to_string())
-            .is_err()
+        || std::fs::write(
+            host_leaf.join("cgroup.procs"),
+            std::process::id().to_string(),
+        )
+        .is_err()
     {
         let _ = std::fs::remove_dir(&host_leaf);
         let _ = std::fs::remove_dir(&run);
@@ -546,7 +563,11 @@ fn cgroup_run_dir(root: &Path) -> Option<PathBuf> {
 /// git is unavailable (resume then refuses to run).
 fn tree_key(root: &Path) -> Option<String> {
     let git = |args: &[&str]| -> Option<Vec<u8>> {
-        let out = Command::new("git").args(args).current_dir(root).output().ok()?;
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
         if !out.status.success() {
             return None;
         }
@@ -609,12 +630,18 @@ fn subst_env_at(store: &Path, pubkey: &Path) -> Vec<(String, String)> {
         return Vec::new();
     }
     let has_narinfo = std::fs::read_dir(store)
-        .map(|rd| rd.flatten().any(|e| e.path().extension().is_some_and(|x| x == "narinfo")))
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "narinfo"))
+        })
         .unwrap_or(false);
     if !has_narinfo {
         return Vec::new();
     }
-    if !std::fs::metadata(pubkey).map(|m| m.is_file() && m.len() > 0).unwrap_or(false) {
+    if !std::fs::metadata(pubkey)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+    {
         return Vec::new();
     }
     vec![
@@ -708,21 +735,30 @@ fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
 fn warm_td_fetch_crates(root: &Path) {
     let lock_path = root.join("fetch/Cargo.lock");
     let Ok(lock) = std::fs::read_to_string(&lock_path) else {
-        eprintln!("td-builder check: warm td-fetch crates: no {} — skipping", lock_path.display());
+        eprintln!(
+            "td-builder check: warm td-fetch crates: no {} — skipping",
+            lock_path.display()
+        );
         return;
     };
     let dest = root.join(".td-build-cache/crate-vendor/td-fetch");
     if std::fs::create_dir_all(&dest).is_err() {
-        eprintln!("td-builder check: warm td-fetch crates: cannot create {} — skipping", dest.display());
+        eprintln!(
+            "td-builder check: warm td-fetch crates: cannot create {} — skipping",
+            dest.display()
+        );
         return;
     }
     // The deadline covers the WHOLE warm including a cargo build of the
     // fetcher, exactly as the shell's one `timeout` over the script did.
     let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
     // Locate or build td-fetch (the fetcher), reused across crates.
-    let Some(tdf) = newstore_bin(root, ".td-build-cache/td-fetch-recipe-check/sd/newstore", "td-fetch")
-        .or_else(|| host_cargo_bin(root, "fetch", "td-fetch", deadline))
-    else {
+    let Some(tdf) = newstore_bin(
+        root,
+        ".td-build-cache/td-fetch-recipe-check/sd/newstore",
+        "td-fetch",
+    )
+    .or_else(|| host_cargo_bin(root, "fetch", "td-fetch", deadline)) else {
         eprintln!(
             "td-builder check: warm td-fetch crates: no td-fetch binary — skipping (PREP best-effort)"
         );
@@ -935,7 +971,9 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     };
     let is_socket = |p: &Path| -> bool {
         use std::os::unix::fs::FileTypeExt as _;
-        std::fs::symlink_metadata(p).map(|m| m.file_type().is_socket()).unwrap_or(false)
+        std::fs::symlink_metadata(p)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
     };
     if pid_alive(&pid_f) && is_socket(&sock) {
         return Ok(sock.display().to_string());
@@ -947,7 +985,8 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     // nice/ionice it so its build children (the corpus builds — the real
     // CPU/IO) yield to interactive work; the global budget bounds how MANY run
     // at once. TD_BUILD_JOBS reaches the daemon by plain env inheritance.
-    let log = std::fs::File::create(&log_f).map_err(|e| format!("create {}: {e}", log_f.display()))?;
+    let log =
+        std::fs::File::create(&log_f).map_err(|e| format!("create {}: {e}", log_f.display()))?;
     let log2 = log.try_clone().map_err(|e| format!("clone log fd: {e}"))?;
     let _ = std::fs::remove_file(&sock);
     let tdnice = std::env::var("TD_NICE").unwrap_or_else(|_| s("10"));
@@ -965,7 +1004,9 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         seed_dir,
         store.display().to_string(),
     ]);
-    let (head, rest) = argv.split_first().ok_or_else(|| s("internal: empty daemon argv"))?;
+    let (head, rest) = argv
+        .split_first()
+        .ok_or_else(|| s("internal: empty daemon argv"))?;
     let mut cmd = Command::new(head);
     cmd.args(rest)
         .current_dir(root)
@@ -976,7 +1017,9 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
     }
-    let mut child = cmd.spawn().map_err(|e| format!("spawn the build daemon: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn the build daemon: {e}"))?;
     let _ = std::fs::write(&pid_f, format!("{}\n", child.id()));
 
     // Wait for it to bind the socket.
@@ -991,137 +1034,10 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
-    Err(format!("the daemon did not bind {}:\n{tail}", sock.display()))
-}
-
-/// Resolve the guix-free stage0 td-builder (the loop-container provider). Both a harness FETCH
-/// (nar-restore) and entering the harness sandbox need it, and it never invokes guix (the stage0
-/// warm path spawns none once placed).
-fn load_stage0_tb(root: &Path) -> Result<String, CheckError> {
-    let applets = current_binary_native_applet_path(root)?;
-    let path = std::env::var("PATH").unwrap_or_default();
-    let self_exe = std::env::current_exe()
-        .map_err(|e| CheckError::Fatal(fatal(&format!("could not resolve current td-builder executable: {e}"))))?;
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(". tests/cache-lib.sh && load_stage0 1>&2 && printf '%s' \"$TB\"")
-        .env("PATH", format!("{applets}:{path}"))
-        .env("TD_STAGE0_BASE", root.join(".td-build-cache/stage0"))
-        .env("TD_BUILDER_SELF", &self_exe)
-        .current_dir(root);
-    let out = run_capture(&mut cmd)
-        .map_err(|_| CheckError::Unprovisioned(fatal("could not build the stage0 td-builder")))?;
-    Ok(out.trim().to_string())
-}
-
-/// A guix-less runner may have an EMPTY .td-build-cache/harness (no local heavy build, and no
-/// guix to run one). If a signed substitute store carries the harness (the daily published it,
-/// #314), FETCH + verify + restore it here rather than FATALing — tools/resolve-harness.sh checks
-/// the ed25519 signature against the pinned tests/td-subst.pub. Best-effort: any MISS (no store,
-/// no entry, bad sig, wrong path) leaves the harness absent so the caller fails CLOSED. There is
-/// no from-source fallback on a guix-less runner — the fetch IS the provisioning path.
-fn try_fetch_harness(root: &Path, hdir: &Path, tb: &str) {
-    // Resolve the substitute store exactly as tools/warm-subst.sh does for the toolchain: the
-    // daily stashes its td-subst binary + the signed narinfos under ~/.td/subst.
-    let store = std::env::var("TD_SUBST_STORE").unwrap_or_else(|_| {
-        std::env::var("HOME")
-            .map(|h| format!("{h}/.td/subst"))
-            .unwrap_or_default()
-    });
-    if store.is_empty() {
-        return;
-    }
-    let bin = std::env::var("TD_SUBST_BIN").unwrap_or_else(|_| format!("{store}/td-subst"));
-    let pub_key = std::env::var("TD_SUBST_PUBKEY")
-        .unwrap_or_else(|_| root.join("tests/td-subst.pub").to_string_lossy().into_owned());
-    // Cheap negatives — a usable store carries the signed harness narinfo + the pinned anchor.
-    // Any missing piece → no fetch (the caller then fails closed). The td-subst bin is NOT
-    // file-checked when it is a bare PATH name (resolve-harness just execs $TD_SUBST_BIN, exactly
-    // like resolve-toolchain); only a path-shaped bin that is absent is a cheap skip.
-    if !Path::new(&store).join("td-harness.narinfo").is_file()
-        || !Path::new(&pub_key).is_file()
-        || (bin.contains('/') && !Path::new(&bin).is_file())
-    {
-        return;
-    }
-    println!(
-        ">> check-harness: no local harness — FETCHING the signed /td/store harness from {store} (verified vs {pub_key})"
-    );
-    let st = Command::new("sh")
-        .arg("tools/resolve-harness.sh")
-        .arg(hdir)
-        .env("TD_SUBST_STORE", &store)
-        .env("TD_SUBST_BIN", &bin)
-        .env("TD_SUBST_PUBKEY", &pub_key)
-        .env("TD_BUILDER", tb)
-        .current_dir(root)
-        .status();
-    match st {
-        Ok(s) if s.success() => println!(
-            "   check-harness: fetched + restored the /td/store harness to {}",
-            hdir.display()
-        ),
-        _ => eprintln!(
-            "   check-harness: no verified harness substitute available at {store} — failing closed"
-        ),
-    }
-}
-
-/// The guix-free `check-harness` tier: enter td's OWN /td/store harness via the
-/// stage0 td-builder — handled BEFORE the host-guix toolchain provisioning so
-/// this tier never invokes guix (the stage0 warm path spawns none once placed).
-fn run_check_harness(root: &Path) -> Result<i32, CheckError> {
-    let hdir = root.join(".td-build-cache/harness");
-    let rel_f = hdir.join("rel");
-
-    // The guix-free stage0 td-builder: nar-restore tool for a FETCH AND the sandbox provider.
-    let tb = load_stage0_tb(root)?;
-
-    // Absent locally? A guix-less runner FETCHES the signed harness from a substitute store (#314)
-    // rather than FATALing. Any miss leaves it absent -> the fail-closed message below.
-    if !hdir.join("store").is_dir() || !rel_f.is_file() {
-        try_fetch_harness(root, &hdir, &tb);
-    }
-    if !hdir.join("store").is_dir() || !rel_f.is_file() {
-        return Err(CheckError::Unprovisioned(fatal(&format!(
-            "no provisioned /td/store harness at {} (and none fetchable from a substitute store).\n  \
-             Provision it with:  td-builder check userland-x86_64-store-native\n  \
-             (builds busybox+make + the C toolchain at /td/store, persists them here), then ship the \
-             dir to the runner — or expose the signed substitute store the daily published the \
-             harness to (TD_SUBST_STORE + tests/td-subst.pub) so this host FETCHES it.",
-            hdir.display()
-        ))));
-    }
-    let hrel = std::fs::read_to_string(&rel_f)
-        .map_err(|e| fatal(&format!("cannot read {}: {e}", rel_f.display())))?;
-    let hrel = hrel.trim();
-    if hrel.is_empty() {
-        return Err(fatal("empty harness rel").into());
-    }
-    let hbin = format!("/td/store/{hrel}/bin");
-    println!(">> check-harness: entering td's /td/store harness via the guix-free stage0 td-builder ({tb})");
-    println!("   harness: {}/store  set: {hrel}  (guix + /gnu/store ABSENT inside)", hdir.display());
-    let st = Command::new(&tb)
-        .args([
-            "host-sandbox",
-            "--expose-cwd",
-            "--store-from",
-            &format!("{}/store", hdir.display()),
-            "--store-at",
-            "/td/store",
-            "--no-daemon",
-            "--",
-            &format!("{hbin}/make"),
-            "-f",
-            "mk/harness.mk",
-            &format!("HBIN={hbin}"),
-            &format!("SHELL={hbin}/sh"),
-            "check-harness-inner",
-        ])
-        .current_dir(root)
-        .status()
-        .map_err(|e| fatal(&format!("could not enter the harness: {e}")))?;
-    Ok(st.code().unwrap_or(1))
+    Err(format!(
+        "the daemon did not bind {}:\n{tail}",
+        sock.display()
+    ))
 }
 
 pub fn cli(args: &[String]) -> ExitCode {
@@ -1162,7 +1078,9 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
             match jv.as_deref().unwrap_or("").trim().parse::<usize>() {
                 Ok(n) if n >= 1 => jobs_flag = Some(n),
                 _ => {
-                    return Err(fatal(&format!("bad {a} value — -j needs a positive integer")).into())
+                    return Err(
+                        fatal(&format!("bad {a} value — -j needs a positive integer")).into(),
+                    )
                 }
             }
         } else if a == "--resume" {
@@ -1181,12 +1099,6 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
         goals.push("check".to_string());
     }
 
-    // The guix-free harness tier still short-circuits here (kept for its
-    // stage0-only provisioning path); the standard tier below is now guix-free too.
-    if goals.first().map(String::as_str) == Some("check-harness") {
-        return run_check_harness(&root);
-    }
-
     guard_netns_probe()?;
 
     // No guix process remains: the loop PATH is only the host-PATH toolchain
@@ -1197,13 +1109,19 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // Light tiers own no heavy gate — skip the heavy warms + daemon (exactly the
     // shell prelude's goal scan).
     let heavy_warm = goals.iter().any(|g| {
-        !matches!(g.as_str(), "check-fast" | "check-engine" | "list-gates" | "gate-timing-report")
+        !matches!(
+            g.as_str(),
+            "check-fast" | "check-engine" | "list-gates" | "gate-timing-report"
+        )
     });
 
     let tb = provision_stage0(&root)?;
     let toolchain = provision_toolchain(&root)?;
-    let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain)
-        .map_err(|e| CheckError::Fatal(fatal(&format!("could not provision loop native applets ({e})"))))?;
+    let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain).map_err(|e| {
+        CheckError::Fatal(fatal(&format!(
+            "could not provision loop native applets ({e})"
+        )))
+    })?;
 
     let mut child_envs: Vec<(String, String)> = vec![(s("PATH"), toolchain)];
     // The runner's knobs must cross the sandbox boundary (host-sandbox
@@ -1427,15 +1345,17 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
         "--",
         "sh",
     ])
-        .arg(harness)
-        .args(rest)
-        .env("PATH", toolchain)
-        .env("TD_BUILDER_SELF", &tb)
-        .current_dir(&root);
+    .arg(harness)
+    .args(rest)
+    .env("PATH", toolchain)
+    .env("TD_BUILDER_SELF", &tb)
+    .current_dir(&root);
     // Replace this process, exactly as the shell helper's `exec` did.
     use std::os::unix::process::CommandExt as _;
     let e = cmd.exec();
-    Err(fatal(&format!("check-rung: could not exec the sandbox: {e}")))
+    Err(fatal(&format!(
+        "check-rung: could not exec the sandbox: {e}"
+    )))
 }
 
 #[cfg(test)]
@@ -1453,8 +1373,11 @@ mod tests {
     fn populate(store: &Path, pubkey: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::write(store.join("td-subst"), b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(store.join("td-subst"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(
+            store.join("td-subst"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         std::fs::write(store.join("x.narinfo"), b"StorePath: /x\n").unwrap();
         std::fs::write(pubkey, b"pinned-trust-anchor\n").unwrap();
     }
@@ -1468,7 +1391,9 @@ mod tests {
         let envs = subst_env_at(&store, &pubkey);
         let keys: Vec<&str> = envs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["TD_SUBST_BIN", "TD_SUBST_STORE", "TD_SUBST_PUBKEY"]);
-        assert!(envs.iter().any(|(k, v)| k == "TD_SUBST_BIN" && v.ends_with("/td-subst")));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == "TD_SUBST_BIN" && v.ends_with("/td-subst")));
     }
 
     #[test]
@@ -1569,17 +1494,19 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
         // the parser must see at least that many in the real fetch/Cargo.lock
         // (drift guard: a lockfile-format change that blinds the parser reds
         // here, not as a silently-cold warm).
-        let lock = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../fetch/Cargo.lock"
-        ))
-        .unwrap();
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../fetch/Cargo.lock"))
+                .unwrap();
         let got = parse_lock_checksums(&lock);
-        assert!(got.len() >= 70, "only {} checksummed packages parsed", got.len());
         assert!(
-            got.iter().all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
+            got.len() >= 70,
+            "only {} checksummed packages parsed",
+            got.len()
+        );
+        assert!(
+            got.iter()
+                .all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
             "malformed triplet parsed from the real lock"
         );
     }
-
 }

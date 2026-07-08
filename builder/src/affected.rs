@@ -24,7 +24,15 @@
 //! git repo), so it is CWD-robust. The library functions take an explicit `root` so
 //! tests are CWD-independent.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -182,11 +190,16 @@ fn gate_files(root: &Path) -> Vec<PathBuf> {
 
 /// The registry def whose file stem (`<NNN>-<gate>`) matches.
 fn def_for_stem(stem: &str) -> Option<crate::gates::GateDef> {
-    crate::gates::defs().into_iter().find(|(s, _)| *s == stem).map(|(_, d)| d)
+    crate::gates::defs()
+        .into_iter()
+        .find(|(s, _)| *s == stem)
+        .map(|(_, d)| d)
 }
 
 fn stem_of(file: &Path) -> Option<String> {
-    file.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+    file.file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
 }
 
 /// The gate target a def file maps to. Engine-only gates return None (the
@@ -197,20 +210,15 @@ fn stem_of(file: &Path) -> Option<String> {
 fn target_from_gate_file(file: &Path) -> Option<String> {
     let stem = stem_of(file)?;
     let def = def_for_stem(&stem)?;
-    let mapped = def.pools.iter().any(|p| !matches!(p, crate::gates::Pool::Engine));
+    let mapped = def
+        .pools
+        .iter()
+        .any(|p| !matches!(p, crate::gates::Pool::Engine));
     if mapped {
         Some(def.name.to_string())
     } else {
         None
     }
-}
-
-/// The def file's spec list (the former `*_SPECS :=` extraction).
-fn specs_in_file(file: &Path) -> Vec<String> {
-    stem_of(file)
-        .and_then(|s| def_for_stem(&s))
-        .map(|d| d.specs.iter().map(|s| s.to_string()).collect())
-        .unwrap_or_default()
 }
 
 fn build_gates(_root: &Path) -> Vec<String> {
@@ -219,14 +227,6 @@ fn build_gates(_root: &Path) -> Vec<String> {
         .filter(|(_, d)| d.build_gate)
         .map(|(_, d)| d.name.to_string())
         .collect()
-}
-
-/// First gate whose `specs` contains `spec` → its target.
-fn target_for_build_spec(_root: &Path, spec: &str) -> Option<String> {
-    crate::gates::defs()
-        .into_iter()
-        .find(|(_, d)| d.specs.iter().any(|s| *s == spec))
-        .map(|(_, d)| d.name.to_string())
 }
 
 /// Would a plain `td-builder check` (cheap+heavy+daily gates + build-recipes)
@@ -261,39 +261,6 @@ fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
     }
 }
 
-fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
-    // Only tests/hello-no-guix.lock and tests/sed-no-guix.lock survive; both are
-    // pinned inputs staged by the store-native gates that consume them. A lock edit
-    // routes to the gate that stages it AND to recipe-checks-daily, which runs the
-    // recipe's store-native /td/store check (recipes/src/recipes/{hello,sed}.rs).
-    match spec {
-        // bootstrap-hello-userland retired (#397 — the 25 duplicate per-rung shell
-        // gates are gone; bootstrap_modern_toolchain() builds the whole i686 ladder
-        // via one recipe-graph call, and recipe-checks-daily's store-native hello
-        // check is what now proves hello end to end). No gate stages this lock
-        // directly anymore, so recipe-checks-daily alone covers it.
-        "hello" => {
-            sel.add_target("recipe-checks-daily");
-        }
-        "sed" => {
-            sel.add_target("store-persist");
-            sel.add_target("recipe-checks-daily");
-        }
-        _ => {
-            if let Some(t) = target_for_build_spec(root, spec) {
-                sel.add_target(&t);
-            } else {
-                sel.add_target("check-pr");
-                sel.add_note(&format!(
-                    "No recipe-specific mapping for '{spec}' — running the bounded check-pr tier; \
-                     the daily backstop covers the daily-tier gates. Update builder/src/affected.rs \
-                     with a mapping for it."
-                ));
-            }
-        }
-    }
-}
-
 // The 25 per-rung `bootstrap-<rung>.sh` gates that used to prove each i686
 // mesboot→store-native rung individually are retired (#397): their `build_*`
 // shell ladders were 80-95% duplicate of `tests/bootstrap-chain.sh`'s
@@ -307,10 +274,9 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
 // What's accepted as lost: per-rung double-build reproducibility, the
 // `store-ns` sandboxed no-guix round-trip, and the `subst-export`/`nar-restore`
 // round-trip that some of the deep store-native rungs' scripts also checked —
-// nothing ports those checks elsewhere. `recipe-checks-daily`'s store-native
-// hello/sed checks (recipes/src/recipes/{hello,sed}.rs) are what now prove the
-// whole ladder works end to end, plus `bootstrap_modern_toolchain()`'s own
-// no-guix/existence assertions at its tail.
+// nothing ports those checks elsewhere. The remaining recipe-owned daily checks
+// and `bootstrap_modern_toolchain()`'s own no-guix/existence assertions keep the
+// ladder covered until the removed external-lock checks are rebuilt properly.
 //
 // The x86_64 cross track hangs off the SAME 20-rung graph (`run_x86_64_cross`,
 // tests/x86_64-cross-fns.sh, ladder_emits the identical stage0..glibc-241
@@ -320,7 +286,6 @@ fn map_recipe_spec(root: &Path, spec: &str, sel: &mut Selection) {
 // duplicate `build_*` shell — this is purely restoring the cascade the old
 // `CHAIN`/`add_chain` slicing gave it.)
 fn add_chain_targets(sel: &mut Selection) {
-    sel.add_target("store-persist");
     sel.add_target("chain-cache");
     sel.add_target("recipe-checks-daily");
     sel.add_target("bootstrap-x86_64-toolchain-store-native");
@@ -487,7 +452,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // #410: the tests/td-toolchain-rust-x86_64.lock mapping was removed with the rust-toolchain
     // recipe-graph cutover — that gate-assembled lock and its consumer gate (416) are retired; the
-    // recipe now carries its source pin (seed/sources/rust-*.lock) routed to recipe-rs / rust-store-native.
+    // recipe now carries its source pin (seed/sources/rust-*.lock) routed to recipe-rs.
     if pattern_matches(
         "tests/toolchain-x86_64-input-addressed.sh|builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         p,
@@ -501,13 +466,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_preflight("shell-syntax");
         sel.add_target("toolchain-input-addressed");
         sel.add_target("toolchain-x86_64-input-addressed");
-        return;
-    }
-
-    if glob_match("tests/*-no-guix.lock", p) {
-        let spec = p.strip_prefix("tests/").unwrap_or(p);
-        let spec = spec.strip_suffix("-no-guix.lock").unwrap_or(spec);
-        map_recipe_spec(root, spec, sel);
         return;
     }
 
@@ -537,47 +495,27 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // tree (seed/stage0/*) and the mes lock (seed/sources/mes-*.lock) route to their own
     // gates below, plus the merged pinned-input arm's target set.
 
-    if pattern_matches("tests/rust-store-native.sh|seed/sources/rust-*.lock", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("rust-store-native");
-        // seed/sources/rust-*.lock is also the rust-toolchain recipe's pinned source; the
-        // recipe validates on the recipe-engine gate + its store-native check runner.
+    if pattern_matches("seed/sources/rust-*.lock", p) {
+        // seed/sources/rust-*.lock is the rust-toolchain recipe's pinned source.
+        sel.add_target("recipe-rs");
+        return;
+    }
+
+    // seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source.
+    if pattern_matches("seed/sources/zlib-*.lock", p) {
+        sel.add_target("recipe-rs");
+        return;
+    }
+
+    if pattern_matches("seed/sources/busybox-*.lock", p) {
         sel.add_target("recipe-rs");
         sel.add_target("recipe-checks-daily");
         return;
     }
 
-    // seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source; rust-toolchain-recipe-check.sh
-    // is the rust-toolchain recipe's store-native check BODY, run by recipe-checks-daily.
-    if pattern_matches("seed/sources/zlib-*.lock|tests/rust-toolchain-recipe-check.sh", p) {
-        sel.add_preflight("shell-syntax");
+    if pattern_matches("seed/sources/make-4.4*.lock", p) {
         sel.add_target("recipe-rs");
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-
-    if pattern_matches(
-        "tests/userland-x86_64-store-native.sh|seed/sources/busybox-*.lock|seed/sources/make-4.4*.lock|builder/src/gate_defs/420-userland-x86_64-store-native.rs",
-        p,
-    ) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("userland-x86_64-store-native");
-        // Gate 420 also PERSISTS the /td/store harness the guix-free tier consumes
-        // (host-sandbox-stage0 inc2c). `check-harness` is a check.sh-intercepted tier
-        // (its own container), not a make gate, so it cannot join the other ./check.sh
-        // targets — run it as its own invocation after provisioning.
-        sel.add_note("run `td-builder check check-harness` separately to validate the guix-free /td/store harness tier (host-sandbox-stage0 inc2c) — it consumes the harness gate 420 persisted.");
-        return;
-    }
-
-    // The guix-free harness loop (host-sandbox-stage0 inc2c): mk/harness.mk + the inner
-    // loop body run by `./check.sh check-harness`. The tier consumes the harness gate 420
-    // persists, so provision it via gate 420; `check-harness` is a check.sh tier (its own
-    // container, not a joinable make gate) and is run as a separate invocation.
-    if pattern_matches("tests/harness-loop.sh|mk/harness.mk", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("userland-x86_64-store-native");
-        sel.add_note("run `td-builder check check-harness` separately to validate the guix-free /td/store harness tier (host-sandbox-stage0 inc2c).");
+        add_chain_targets(sel);
         return;
     }
 
@@ -602,25 +540,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         add_chain_targets(sel);
         return;
     }
-    // bootstrap-hello-corpus-store-native.sh is hello's store-native recipe-check BODY (run
-    // by recipe-checks-daily); the hello source lock also feeds the store-native hello build.
-    // (bootstrap-hello-userland retired #397 — recipe-checks-daily alone now proves hello.)
-    if pattern_matches("tests/bootstrap-hello-corpus-store-native.sh|seed/sources/hello-2.12.2.lock", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-    // bootstrap-sed-corpus-store-native.sh is sed's store-native recipe-check BODY, run by
-    // recipe-checks-daily.
-    if pattern_matches("tests/bootstrap-sed-corpus-store-native.sh", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
     // bootstrap-chain.sh is the SHARED from-seed toolchain chain; its consumers are
-    // store-persist (which stages the sed-no-guix.lock entries) and the chain-cache gate,
-    // plus recipe-checks-daily, whose store-native hello/sed checks are what now prove the
-    // whole ladder built by bootstrap_modern_toolchain() works end to end (#397 — the 25
+    // chain-cache and recipe-checks-daily, which are the remaining bounded consumers
+    // of the ladder until the deleted external-lock checks are rebuilt properly (#397 — the 25
     // per-rung bootstrap-<rung>.sh gates that used to prove each rung individually are
     // retired). Since #317 the chain's bricks persist through the warm chain-brick cache
     // (tests/chain-cache-lib.sh), so a chain/lib change also re-proves the chain-cache gate
@@ -636,8 +558,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // call goes through. A change here can affect every rung's synthesized lock, so map to
     // the UNION of all consumers' targets, not just one track — `add_chain_targets` already
     // is that union (both the i686 chain gates and the x86_64 cross/native gates, plus
-    // recipe-checks-daily, whose rust-toolchain (tests/rust-toolchain-recipe-check.sh ->
-    // run_x86_64_rust_toolchain) and make-test bodies also source this file).
+    // recipe-checks-daily's remaining recipe-owned bodies).
     if pattern_matches("tests/ladder-lib.sh", p) {
         sel.add_preflight("shell-syntax");
         add_chain_targets(sel); // already covers the i686 + x86_64 targets ladder-lib.sh underlies
@@ -648,7 +569,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if pattern_matches("tests/chain-cache.sh|tests/chain-cache-lib.sh", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("chain-cache");
-        sel.add_target("store-persist");
         return;
     }
     // The rung-X2 native gcc gate's consumer test: a native x86_64 gcc/binutils built on top of the
@@ -690,8 +610,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     // seed/sources/{make,tcc-0.9.26,nyacc}-*.lock are also i686 chain pinned inputs — caught
-    // by the merged pinned-input arm above (make-4.4*.lock is intercepted earlier still, by
-    // the userland-x86_64-store-native arm). mes-*.lock and seed/stage0/* additionally select
+    // by the merged pinned-input arm above. mes-*.lock and seed/stage0/* additionally select
     // their own structured-Rust gate (bootstrap-mes / bootstrap-seed), since those two rungs
     // have no shell driver and no pinned-input arm names them.
     if pattern_matches("seed/sources/mes-*.lock", p) {
@@ -713,12 +632,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if p == "tests/store-persist.sh" {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("store-persist");
-        return;
-    }
-
     if p == "tests/heal-revert.sh" {
         // CI-lint-only test of the heal primitive — git is absent from the loop
         // sandbox, so it is not a ./check.sh gate; shell-syntax suffices locally.
@@ -726,10 +639,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches(
-        ".github/setup-branch-protection.sh|.github/workflows/*",
-        p,
-    ) {
+    if pattern_matches(".github/setup-branch-protection.sh|.github/workflows/*", p) {
         // CI/runner-gating files: the local loop never exercises hosted CI, so
         // the honest local check is the syntax preflight — the workflow run after
         // push is the real test.
@@ -777,9 +687,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
 fn preflight_cmd(name: &str) -> Option<&'static str> {
     match name {
-        "shell-syntax" => {
-            Some("  bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh")
-        }
+        "shell-syntax" => Some(
+            "  bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
+        ),
         "cargo-test" => Some("  cargo test --manifest-path builder/Cargo.toml"),
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
@@ -867,7 +777,9 @@ fn daily_tier_only_names() -> HashSet<String> {
         .into_iter()
         .filter(|(_, d)| {
             !d.pools.iter().any(|p| crate::gates::pool_runs_per_pr(*p))
-                && d.pools.iter().any(|p| matches!(p, Pool::Daily | Pool::System))
+                && d.pools
+                    .iter()
+                    .any(|p| matches!(p, Pool::Daily | Pool::System))
         })
         .map(|(_, d)| d.name.to_string())
         .collect()
@@ -923,7 +835,11 @@ fn path_output(root: &Path, path: &str) -> String {
     changed.sort();
     changed.dedup();
     let sel = compute_selection(root, &changed);
-    let header = Header { explicit: true, base: "origin/main", merge_base: "" };
+    let header = Header {
+        explicit: true,
+        base: "origin/main",
+        merge_base: "",
+    };
     format_output(&header, &changed, &sel, false)
 }
 
@@ -966,29 +882,42 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
             || deferred_targets(&out).iter().any(|t| t == target)
     };
     let runs_target = |path: &str, target: &str| -> bool {
-        last_check_targets(&path_output(root, path)).iter().any(|t| t == target)
+        last_check_targets(&path_output(root, path))
+            .iter()
+            .any(|t| t == target)
     };
     let defers_target = |path: &str, target: &str| -> bool {
-        deferred_targets(&path_output(root, path)).iter().any(|t| t == target)
+        deferred_targets(&path_output(root, path))
+            .iter()
+            .any(|t| t == target)
     };
     macro_rules! assert_target {
         ($path:expr, $target:expr) => {
             if !has_target($path, $target) {
-                fail(format!("{}: expected ./check.sh target '{}'", $path, $target));
+                fail(format!(
+                    "{}: expected ./check.sh target '{}'",
+                    $path, $target
+                ));
             }
         };
     }
     macro_rules! assert_runs {
         ($path:expr, $target:expr) => {
             if !runs_target($path, $target) {
-                fail(format!("{}: expected PER-PR (run) target '{}'", $path, $target));
+                fail(format!(
+                    "{}: expected PER-PR (run) target '{}'",
+                    $path, $target
+                ));
             }
         };
     }
     macro_rules! assert_deferred {
         ($path:expr, $target:expr) => {
             if !defers_target($path, $target) {
-                fail(format!("{}: expected DEFERRED-to-daily target '{}'", $path, $target));
+                fail(format!(
+                    "{}: expected DEFERRED-to-daily target '{}'",
+                    $path, $target
+                ));
             }
         };
     }
@@ -1044,13 +973,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
 
     // Every gate file maps (via the builder/src/gate_defs/*.rs arm) to its own gate target.
     for f in gate_files(root) {
-        let rel = format!("builder/src/gate_defs/{}", f.file_name().unwrap().to_string_lossy());
+        let rel = format!(
+            "builder/src/gate_defs/{}",
+            f.file_name().unwrap().to_string_lossy()
+        );
         match target_from_gate_file(&f) {
             Some(gate) if !gate.is_empty() => assert_target!(&rel, &gate),
             _ => fail(format!("{rel}: no gate registration found")),
         }
     }
-
 
     // Every BUILD_GATE is selected by the build-phase arm (build-recipes is the
     // phase itself; cache-lib is its helper).
@@ -1060,48 +991,39 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     }
 
     // The warm chain-brick cache (#317): the lib and its gate map to chain-cache, and
-    // the shared chain re-proves BOTH consumers + the cache gate.
+    // the shared chain re-proves the remaining consumers + the cache gate.
     assert_target!("tests/chain-cache-lib.sh", "chain-cache");
     assert_target!("tests/chain-cache.sh", "chain-cache");
-    assert_target!("tests/bootstrap-chain.sh", "store-persist");
     assert_target!("tests/bootstrap-chain.sh", "chain-cache");
-    // recipe-checks-daily's store-native hello/sed checks are what now prove the whole
-    // ladder built by bootstrap_modern_toolchain() works end to end (#397 — the 25
-    // per-rung bootstrap-<rung>.sh gates that used to prove each rung individually are
-    // retired), so a chain change must re-prove it too.
     assert_target!("tests/bootstrap-chain.sh", "recipe-checks-daily");
     // ladder-lib.sh (#429) is the shared foundation under BOTH the i686 chain and the
-    // x86_64 cross/native tracks, plus recipe-checks-daily's rust-toolchain/make-test
+    // x86_64 cross/native tracks, plus recipe-checks-daily's remaining recipe-owned
     // bodies — a change must re-prove all of them, not just one track.
-    assert_target!("tests/ladder-lib.sh", "store-persist");
     assert_target!("tests/ladder-lib.sh", "chain-cache");
-    assert_target!("tests/ladder-lib.sh", "bootstrap-x86_64-toolchain-store-native");
-    assert_target!("tests/ladder-lib.sh", "bootstrap-x86_64-native-gcc-store-native");
-    assert_target!("tests/ladder-lib.sh", "bootstrap-x86_64-self-gcc-store-native");
-    assert_target!("tests/ladder-lib.sh", "recipe-checks-daily");
     assert_target!(
-        "tests/bootstrap-hello-corpus-store-native.sh",
-        "recipe-checks-daily"
+        "tests/ladder-lib.sh",
+        "bootstrap-x86_64-toolchain-store-native"
     );
-
-    // Spec→gate routing: a recipe/lock for a gate's SPEC selects that gate.
-    for f in gate_files(root) {
-        let gate = match target_from_gate_file(&f) {
-            Some(g) if !g.is_empty() => g,
-            _ => continue,
-        };
-        for spec in specs_in_file(&f) {
-            let lock = format!("tests/{spec}-no-guix.lock");
-            if root.join(&lock).is_file() {
-                assert_target!(&lock, &gate);
-            }
-        }
-    }
+    assert_target!(
+        "tests/ladder-lib.sh",
+        "bootstrap-x86_64-native-gcc-store-native"
+    );
+    assert_target!(
+        "tests/ladder-lib.sh",
+        "bootstrap-x86_64-self-gcc-store-native"
+    );
+    assert_target!("tests/ladder-lib.sh", "recipe-checks-daily");
 
     // A gate-file change still selects the dispatcher's own self-test preflight
     // (now the in-process `td-builder affected-checks --self-test`) and is waived.
-    assert_contains!("builder/src/gate_defs/325-cargo-test.rs", "td-builder affected-checks --self-test");
-    assert_branch_policy!("builder/src/gate_defs/325-cargo-test.rs", "the full check would be waived");
+    assert_contains!(
+        "builder/src/gate_defs/325-cargo-test.rs",
+        "td-builder affected-checks --self-test"
+    );
+    assert_branch_policy!(
+        "builder/src/gate_defs/325-cargo-test.rs",
+        "the full check would be waived"
+    );
     assert_target!("tests/repro-lib.sh", "recipe-checks-daily");
     assert_branch_policy!("tests/repro-lib.sh", "the full check would be waived");
     // Native (typed-Rust) gate bodies (#318 axis 3): a body change runs its gates
@@ -1115,24 +1037,32 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("recipes/src/catalog.rs", "recipe-rs");
     // Recipes are one self-registering file each under src/recipes/ (issue #295);
     // the nested path must select the same gate (glob `*` crosses `/`).
-    assert_target!("recipes/src/recipes/hello.rs", "recipe-rs");
+    assert_target!("recipes/src/recipes/make-test.rs", "recipe-rs");
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("builder/src/gate_defs/207-recipe-rs.rs", "recipe-rs");
-    // The surviving pinned inputs: a lock edit routes to the gate that stages it (hello →
-    // recipe-checks-daily, since bootstrap-hello-userland retired #397; sed → store-persist).
-    assert_target!("tests/hello-no-guix.lock", "recipe-checks-daily");
-    assert_target!("tests/sed-no-guix.lock", "store-persist");
     // No gate builds the fetch crate from source (the td-fetch corpus recipe is
     // retired), so a change to it validates on the bounded check-pr tier.
     assert_target!("fetch/Cargo.lock", "check-pr");
     // A feed/src change smokes the warm-sources consumer — the i686 chain's proof target set.
     assert_target!("feed/src/main.rs", "recipe-checks-daily");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");
-    assert_target!("tests/td-toolchain.lock", "toolchain-x86_64-input-addressed");
-    assert_target!("tests/td-toolchain-x86_64.lock", "toolchain-x86_64-input-addressed");
-    assert_target!("tests/td-toolchain-x86_64.lock", "bootstrap-x86_64-toolchain-store-native");
-    assert_target!("tests/x86_64-subst-lib.sh", "bootstrap-x86_64-toolchain-store-native");
+    assert_target!(
+        "tests/td-toolchain.lock",
+        "toolchain-x86_64-input-addressed"
+    );
+    assert_target!(
+        "tests/td-toolchain-x86_64.lock",
+        "toolchain-x86_64-input-addressed"
+    );
+    assert_target!(
+        "tests/td-toolchain-x86_64.lock",
+        "bootstrap-x86_64-toolchain-store-native"
+    );
+    assert_target!(
+        "tests/x86_64-subst-lib.sh",
+        "bootstrap-x86_64-toolchain-store-native"
+    );
     assert_target!(
         "tests/bootstrap-x86_64-native-gcc-store-native.sh",
         "bootstrap-x86_64-native-gcc-store-native"
@@ -1141,7 +1071,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "tests/bootstrap-x86_64-self-gcc-store-native.sh",
         "bootstrap-x86_64-self-gcc-store-native"
     );
-    assert_target!("tests/x86_64-cross-fns.sh", "bootstrap-x86_64-self-gcc-store-native");
+    assert_target!(
+        "tests/x86_64-cross-fns.sh",
+        "bootstrap-x86_64-self-gcc-store-native"
+    );
     assert_target!(
         "builder/src/gate_defs/426-bootstrap-x86_64-self-gcc-store-native.rs",
         "bootstrap-x86_64-self-gcc-store-native"
@@ -1150,33 +1083,23 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "builder/src/gate_defs/422-bootstrap-x86_64-native-gcc-store-native.rs",
         "bootstrap-x86_64-native-gcc-store-native"
     );
-    assert_target!("tests/x86_64-cross-fns.sh", "bootstrap-x86_64-native-gcc-store-native");
-    assert_target!("tests/toolchain-x86_64-input-addressed.sh", "toolchain-x86_64-input-addressed");
+    assert_target!(
+        "tests/x86_64-cross-fns.sh",
+        "bootstrap-x86_64-native-gcc-store-native"
+    );
+    assert_target!(
+        "tests/toolchain-x86_64-input-addressed.sh",
+        "toolchain-x86_64-input-addressed"
+    );
     assert_target!(
         "builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         "toolchain-x86_64-input-addressed"
     );
-    // #410: the rust-x86_64 runtime/userland/td-shell-userland gates were retired with the
-    // rust-toolchain recipe-graph cutover; the recipe check + its zlib source lock route to
-    // the recipe-engine gate, and the rust source lock also drives the rust-store-native gate.
-    assert_target!("tests/rust-toolchain-recipe-check.sh", "recipe-rs");
+    // The rust-toolchain recipe and zlib source lock route to the recipe-engine gate.
     assert_target!("seed/sources/zlib-1.3.1.lock", "recipe-rs");
-    assert_target!("seed/sources/rust-1.96.0.lock", "rust-store-native");
-    assert_target!(
-        "tests/userland-x86_64-store-native.sh",
-        "userland-x86_64-store-native"
-    );
-    assert_target!("seed/sources/busybox-1.37.0.lock", "userland-x86_64-store-native");
-    assert_target!("seed/sources/make-4.4.1.lock", "userland-x86_64-store-native");
-    assert_target!(
-        "builder/src/gate_defs/420-userland-x86_64-store-native.rs",
-        "userland-x86_64-store-native"
-    );
-    // The store-native recipe checks (hello/sed/rust-toolchain build on the /td/store
-    // mes ladder) run via recipe-checks-daily; a change to a check BODY selects it.
-    assert_target!("tests/bootstrap-hello-corpus-store-native.sh", "recipe-checks-daily");
-    assert_target!("tests/bootstrap-sed-corpus-store-native.sh", "recipe-checks-daily");
-    assert_target!("tests/rust-toolchain-recipe-check.sh", "recipe-checks-daily");
+    assert_target!("seed/sources/rust-1.96.0.lock", "recipe-rs");
+    assert_target!("seed/sources/busybox-1.37.0.lock", "recipe-checks-daily");
+    assert_target!("seed/sources/make-4.4.1.lock", "recipe-checks-daily");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
     // the seed tree + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
@@ -1241,7 +1164,10 @@ fn git_ok(root: &Path, args: &[&str]) -> bool {
 /// `git rev-parse --show-toplevel` when git is present, else CWD. Keeps the
 /// subcommand CWD-robust like the oracle; outside a git repo it falls back to CWD.
 fn resolve_root() -> PathBuf {
-    if let Ok(o) = Command::new("git").args(["rev-parse", "--show-toplevel"]).output() {
+    if let Ok(o) = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
         if o.status.success() {
             let top = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if !top.is_empty() {
@@ -1262,7 +1188,9 @@ fn sort_unique(mut v: Vec<String>) -> Vec<String> {
 /// Run the loop entry — THIS binary's `check` subcommand (check.sh is retired;
 /// the td programs are called directly, #318).
 fn run_self_check(root: &Path, targets: &[String]) -> i32 {
-    let Ok(me) = std::env::current_exe() else { return 1 };
+    let Ok(me) = std::env::current_exe() else {
+        return 1;
+    };
     let mut args: Vec<String> = vec!["check".to_string()];
     args.extend(targets.iter().cloned());
     run_command(root, &me.display().to_string(), &args)
@@ -1378,7 +1306,10 @@ pub fn main(args: &[String]) -> ExitCode {
     let changed: Vec<String> = if explicit {
         sort_unique(explicit_paths.clone())
     } else {
-        if !git_ok(&root, &["rev-parse", "--verify", &format!("{base}^{{commit}}")]) {
+        if !git_ok(
+            &root,
+            &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+        ) {
             if base == "origin/main" && git_ok(&root, &["rev-parse", "--verify", "main^{commit}"]) {
                 base = "main".to_string();
             } else {
@@ -1395,7 +1326,11 @@ pub fn main(args: &[String]) -> ExitCode {
             .output()
         {
             Ok(o) if o.status.success() => {
-                merge_base = String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string();
+                merge_base = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
             }
             Ok(o) => {
                 eprint!("{}", String::from_utf8_lossy(&o.stderr));
@@ -1410,7 +1345,10 @@ pub fn main(args: &[String]) -> ExitCode {
         if !committed_only {
             all.extend(git_lines(&root, &["diff", "--name-only"]));
             all.extend(git_lines(&root, &["diff", "--cached", "--name-only"]));
-            all.extend(git_lines(&root, &["ls-files", "--others", "--exclude-standard"]));
+            all.extend(git_lines(
+                &root,
+                &["ls-files", "--others", "--exclude-standard"],
+            ));
         }
         sort_unique(all)
     };
@@ -1421,7 +1359,11 @@ pub fn main(args: &[String]) -> ExitCode {
     }
 
     let sel = compute_selection(&root, &changed);
-    let header = Header { explicit, base: &base, merge_base: &merge_base };
+    let header = Header {
+        explicit,
+        base: &base,
+        merge_base: &merge_base,
+    };
     print!("{}", format_output(&header, &changed, &sel, run));
 
     if !run {
@@ -1456,7 +1398,10 @@ mod tests {
 
     fn repo_root() -> PathBuf {
         // builder/ → repo root.
-        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf()
     }
 
     /// The repo fixtures the self-test reads (`tests/` + the gate-def files) are present only
@@ -1473,19 +1418,20 @@ mod tests {
     fn glob_basics() {
         assert!(glob_match("builder/src/*", "builder/src/a/b.rs")); // '*' spans '/'
         assert!(glob_match("*.md", "a/b.md"));
-        assert!(glob_match("seed/sources/make-*.lock", "seed/sources/make-4.4.lock"));
-        assert!(!glob_match("seed/sources/make-*.lock", "seed/sources/make-4.4.lockX"));
+        assert!(glob_match(
+            "seed/sources/make-*.lock",
+            "seed/sources/make-4.4.lock"
+        ));
+        assert!(!glob_match(
+            "seed/sources/make-*.lock",
+            "seed/sources/make-4.4.lockX"
+        ));
         assert!(!glob_match("CHEAP_GATES", "CHEAP_GATESX"));
         assert!(pattern_matches("check.sh|builder/src/gates.rs", "check.sh"));
-        assert!(!pattern_matches("check.sh|builder/src/gates.rs", "check.sh2"));
-    }
-
-    #[test]
-    fn spec_extraction_matches_shell_word_ops() {
-        // tests/<spec>-no-guix.lock → <spec> (shell `${p##tests/}` then `${p%-no-guix.lock}`).
-        let p = "tests/td-russh-demo-no-guix.lock";
-        let spec = p.strip_prefix("tests/").unwrap().strip_suffix("-no-guix.lock").unwrap();
-        assert_eq!(spec, "td-russh-demo");
+        assert!(!pattern_matches(
+            "check.sh|builder/src/gates.rs",
+            "check.sh2"
+        ));
     }
 
     // DURABLE: the dispatcher's own policy, exercised over the real gate_defs +
@@ -1495,7 +1441,10 @@ mod tests {
     fn self_test_passes_against_repo() {
         let root = repo_root();
         if !repo_tree_present(&root) {
-            eprintln!("SKIP self-test: repo tree absent at {} (builder-only sandbox)", root.display());
+            eprintln!(
+                "SKIP self-test: repo tree absent at {} (builder-only sandbox)",
+                root.display()
+            );
             return;
         }
         let failures = run_self_test(&root);

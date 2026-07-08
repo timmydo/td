@@ -477,9 +477,9 @@ mod tests {
     #[test]
     fn name_extraction() {
         assert_eq!(
-            name_from_store_path("/gnu/store/2nfg943asrl9dv64zrr1a4kpb25mfafd-hello-2.12.2.drv")
+            name_from_store_path("/gnu/store/2nfg943asrl9dv64zrr1a4kpb25mfafd-fixture-1.0.drv")
                 .unwrap(),
-            "hello-2.12.2.drv"
+            "fixture-1.0.drv"
         );
         assert_eq!(name_from_store_path("/gnu/store/short").is_none(), true);
     }
@@ -496,11 +496,11 @@ mod tests {
         // user-pm Phase 1: the store prefix is configurable. /td/store paths share the
         // 32-char digest WIDTH but are a DISTINCT store — the prefix is in the fingerprint,
         // so the digest differs from /gnu/store's for the same content. (Break from guix.)
-        let (ty, h, name) = ("source", "abc123", "hello-2.12.2");
+        let (ty, h, name) = ("source", "abc123", "fixture-1.0");
         let guix = make_store_path_in("/gnu/store", ty, h, name);
         let td = make_store_path_in("/td/store", ty, h, name);
-        assert!(guix.starts_with("/gnu/store/") && guix.ends_with("-hello-2.12.2"));
-        assert!(td.starts_with("/td/store/") && td.ends_with("-hello-2.12.2"));
+        assert!(guix.starts_with("/gnu/store/") && guix.ends_with("-fixture-1.0"));
+        assert!(td.starts_with("/td/store/") && td.ends_with("-fixture-1.0"));
         // Same name, same 32-char digest width — but a DIFFERENT digest (the prefix is hashed).
         assert_eq!(name_from_store_path(&guix).unwrap(), name_from_store_path(&td).unwrap());
         assert_ne!(

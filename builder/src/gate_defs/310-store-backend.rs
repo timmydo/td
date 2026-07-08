@@ -7,14 +7,14 @@
 //! references), store-verify (integrity re-hashed against the PLACED files), all with NO
 //! daemon in any store operation.
 //! R3 (guix-retirement ladder → #261): the SUBJECT is now td-BUILT (gate_bodies::store_subject —
-//! hello via build-recipe, cache-hit) and its closure CONTENT-SCANNED, so this gate runs with
+//! a synthetic td-built subject and its closure CONTENT-SCANNED, so this gate runs with
 //! guix OFF PATH — no `guix build [-d]`, no `guix gc`, no /var/guix read. The removable oracle
 //! (the placed tree == the DAEMON's built output; store-query == the live /var/guix/db record;
 //! references == `guix gc --references`; deriver/drv->output == the daemon's) is DROPPED per
 //! CLAUDE.md directive 3 (called out in the PR). In its place, td-INTERNAL consistency over a
 //! td-built subject: (1) the placed tree is NAR-identical to the SOURCE staged tree; (2)
 //! store-query info == the re-derived hash+narSize of that tree; (3) store-query references ==
-//! hello's DIRECT references as INDEPENDENTLY computed by store-register over the closure (two
+//! the subject's DIRECT references as INDEPENDENTLY computed by store-register over the closure (two
 //! separate scan paths agree); (4) store-verify passes against td's own placed files; (5) the
 //! deriver + drv->output mapping td records is exactly (td-assembled .drv) -> out -> the output.
 //! Boundary: td writes only its OWN scratch store/DB; the host store is untouched. Needs

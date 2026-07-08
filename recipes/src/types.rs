@@ -747,13 +747,13 @@ mod tests {
 
     #[test]
     fn leaf_recipe_emits_expected_shape() {
-        let r = Recipe::gnu("hello", "2.12.2").source(Source::one(
-            "mirror://gnu/hello/hello-2.12.2.tar.gz",
+        let r = Recipe::gnu("fixture", "1.0").source(Source::one(
+            "mirror://gnu/fixture/fixture-1.0.tar.gz",
             "1aqq1379syjckf0wdn9vs6wfbapnj9zfikhiykf29k4jq9nrk6js",
         ));
         assert_eq!(
             r.to_json().to_canonical(),
-            r#"{"buildSystem":"gnu","name":"hello","source":{"sha256":"1aqq1379syjckf0wdn9vs6wfbapnj9zfikhiykf29k4jq9nrk6js","uri":"mirror://gnu/hello/hello-2.12.2.tar.gz"},"version":"2.12.2"}"#
+            r#"{"buildSystem":"gnu","name":"fixture","source":{"sha256":"1aqq1379syjckf0wdn9vs6wfbapnj9zfikhiykf29k4jq9nrk6js","uri":"mirror://gnu/fixture/fixture-1.0.tar.gz"},"version":"1.0"}"#
         );
     }
 
@@ -769,10 +769,10 @@ mod tests {
 
     #[test]
     fn recipe_checks_are_not_build_json() {
-        let r = Recipe::gnu("hello", "2.12.2").checks(vec![RecipeCheck::pr("echo ok")]);
+        let r = Recipe::gnu("fixture", "1.0").checks(vec![RecipeCheck::pr("echo ok")]);
         assert_eq!(
             r.to_json().to_canonical(),
-            r#"{"buildSystem":"gnu","name":"hello","version":"2.12.2"}"#
+            r#"{"buildSystem":"gnu","name":"fixture","version":"1.0"}"#
         );
     }
 }

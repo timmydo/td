@@ -24,13 +24,12 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        // Typed artifact input (#353): the runnable static-bash fixture from
-        // hello's pinned closure — resolved by the runner, no lock-grepping or
-        // store-closure-scan in the body.
+        // Typed artifact input (#353): the runnable static-bash fixture resolved
+        // by the runner, no lock-grepping or store-closure-scan in the body.
         inputs: &[ArtifactInput {
             name: "bash-static",
             kind: InputKind::ClosureMember {
-                lock: "tests/hello-no-guix.lock",
+                lock: "tests/td-subst.lock",
                 root_stem: "bash",
                 member_stem: "bash-static",
             },

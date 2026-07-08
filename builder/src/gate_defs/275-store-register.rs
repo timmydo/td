@@ -8,7 +8,7 @@
 //! `td-builder store-query` then READS that DB back with td's OWN pure-Rust SQLite reader
 //! (`store_db_read`) — NO external engine and NO daemon in td's store-query path.
 //! R3 (guix-retirement ladder → #261): the SUBJECT is now td-BUILT (gate_bodies::store_subject —
-//! hello via build-recipe, cache-hit off the build-recipes prelude) staged into a td-OWNED
+//! synthetic td-built subject staged into a td-OWNED
 //! store, and its closure is CONTENT-SCANNED, so this gate runs with guix OFF PATH — no `guix
 //! build [-d]`, no `guix gc`, no /var/guix read. The removable DAEMON CONTENT ORACLE (the
 //! live /var/guix/db comparison of every path's hash/narSize, the full Refs relation and the

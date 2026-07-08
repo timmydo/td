@@ -10,22 +10,15 @@ PR (no auto-merge — a human merges)**. This note is how that agent is run.
 ## The two halves
 
 - **Mechanical runner — `td-builder daily`** (`builder/src/daily.rs`): fetches fresh
-  main, runs `td-builder check` (heavy+daily) + `check-system`, and ALWAYS also attempts
-  the `check-harness` leg (the /td/store harness tier) — its precondition is "harness
-  locally persisted or fetchable from a substitute store", independent of whether
-  heavy/system ran. Writes `.td-daily-verdict` (machine-readable) and, on all-green,
+  main, runs `td-builder check` (heavy+daily) + `check-system`. Writes
+  `.td-daily-verdict` (machine-readable) and, on all-green,
   records `.td-last-green`.
-  - **Exit is a bitfield** over REAL regressions: 1 heavy red, 2 system red, 4 harness
-    red. A leg the runner isn't provisioned for does not set its bit — its
+  - **Exit is a bitfield** over REAL regressions: 1 heavy red, 2 system red.
+    A leg the runner isn't provisioned for does not set its bit — its
     `td-builder check` exits `69` (`EXIT_UNPROVISIONED`, a stable signal, not FATAL
-    prose), recorded as `env_error` (heavy/system: loop toolchain unresolved) or
-    `harness_env_error` (no local/fetchable harness) in the verdict.
+    prose), recorded as `env_error` (heavy/system: loop toolchain unresolved) in the verdict.
   - **Exit 10**: unprovisioned for EVERY leg — nothing ran anywhere, nothing to triage.
   - **Exit 8/9**: bad CLI arg / `git fetch origin main` failed (or no td-builder to run).
-  - A runner unprovisioned for heavy/system but with a reachable harness does NOT hit
-    exit 10: heavy/system are marked `unprovisioned` (not regressions) while the harness
-    leg's own green/red reaches the verdict — printed as `PARTIAL` (harness green, nothing
-    to revert, `.td-last-green` NOT recorded) or a real `rc` bit (harness red).
 - **The agent** — judgment: runs the runner, and on a real (non-unprovisioned) red
   triages the suspect range and opens a fix-or-revert PR. Run it daily as a fresh
   headless agent (NOT inside a working session).

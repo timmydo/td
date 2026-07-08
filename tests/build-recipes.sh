@@ -28,9 +28,9 @@ nspecs=$(set -- $TD_BUILD_SPECS; echo $#)
 
 echo ">> build-recipes: the build_gate PRELUDE — stage0 td-builder (env rust) + td-recipe-eval, GUIX-FREE"
 : "${TD_DAEMON_SOCKET:?the shared build daemon is not running — the \`td-builder check\` host prelude starts it (ensure_build_daemon)}"
-# The guix-seeded corpus (recipe-checks + the *-no-guix.lock packages) retired — every
-# package now builds on td's mes-rooted /td/store toolchain via the store-native gates,
-# not guix's gcc-toolchain. So build-recipes is a corpus-free prelude: it places the stage0
+# The guix-seeded corpus retired — every package now builds on td's mes-rooted
+# /td/store toolchain via the store-native gates, not guix's gcc-toolchain.
+# So build-recipes is a corpus-free prelude: it places the stage0
 # td-builder (compiled from builder/ source with the ENVIRONMENT's rust — no guix seed) and
 # builds td-recipe-eval, which the build_gate store primitives reuse. There is no per-spec
 # corpus pre-build (TD_BUILD_SPECS is empty) and no `guix build`.

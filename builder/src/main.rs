@@ -3013,8 +3013,8 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
 /// fd, …) links this toolchain — never the guix rust/gcc-toolchain: the seed lock is retargeted
 /// (`native_seed_lock_body`), the combined store is the build's STORE-DIR + `TD_SEED_STORE`, the
 /// native store's db rides `TD_EXTRA_DBS`, and `TD_RUST_STORE_{INTERP,RPATH,BDIR}` put run_rust
-/// in native link mode. Absence is fine for a plain seed package (hello); a *vendored rust* build
-/// with no native toolchain provisioned is a hard error (no guix-rust fallback — the cutover).
+/// in native link mode. A package build with no native toolchain provisioned is a hard error
+/// (no guix-rust fallback — the cutover).
 struct NativeToolchain {
     /// The combined seed+native store dir (guix build seed + the `/td/store` toolchain trees):
     /// the build's STORE-DIR and `TD_SEED_STORE`.
@@ -3077,12 +3077,10 @@ impl NativeToolchain {
 /// for PKG"), it does NOT fall back to guix. The package that lands on PATH is td's
 /// own build at td's own store path. A vendored rust build (ripgrep, fd, …) links the
 /// NATIVE `/td/store` toolchain provisioned via `TD_SHELL_NATIVE_*` (see `NativeToolchain`),
-/// never the guix rust/gcc-toolchain — that path is retired for `td shell`; a plain seed
-/// package (hello) still links the pinned build seed from its `<pkg>-no-guix.lock`.
+/// never the guix rust/gcc-toolchain.
 ///
 /// Config (env): TD_RECIPE_EVAL (td's Rust recipe-catalog evaluator, to emit the
-/// recipe), TD_SHELL_LOCKS (dir of `<pkg>.lock` / `<pkg>-no-guix.lock`, default `tests`),
-/// TD_SHELL_STORE_DIR (seed store dir for the plain seed-package path, default `/gnu/store`),
+/// recipe), TD_SHELL_LOCKS (dir of `<pkg>.lock`, default `tests`),
 /// TD_SHELL_NATIVE_* (the pre-provisioned native `/td/store` toolchain for vendored rust builds —
 /// `NativeToolchain::from_env`), TD_SHELL_CACHE (build cache root, default `$HOME/.cache/td-shell`),
 /// TD_BUILDER_PATH/STORE/DB (optional stage0 builder override, so the build's builder
@@ -3102,7 +3100,6 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
 
     let env_or = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let lock_dir = env_or("TD_SHELL_LOCKS", "tests");
-    let seed_store_dir = env_or("TD_SHELL_STORE_DIR", "/gnu/store");
     let cache = match std::env::var("TD_SHELL_CACHE") {
         Ok(c) => c,
         Err(_) => format!(
@@ -3137,77 +3134,61 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         // whole crate closure provisioned GUIX-FREE: td interns the warmed source + crate
         // set and feeds build-recipe's 11-arg form (TD_VENDOR_DIR), exactly as the
         // crate-free corpus gates do — but here from the real `td shell` product command,
-        // not a bespoke harness. A seed package (hello) has no warmed closure ⇒ the plain
-        // 4-arg path on its `<pkg>-no-guix.lock`.
+        // not a bespoke harness.
         let mut bargs: Vec<String> = vec!["build-recipe".into(), json_file.clone()];
         // A vendored rust build links the native /td/store toolchain when it is provisioned; a
-        // plain seed package (hello) never does. Track it so the build-recipe subprocess gets the
-        // native env (TD_SEED_STORE/TD_EXTRA_DBS/TD_RUST_STORE_*) only for the vendored-rust case.
-        let mut used_native = false;
-        match provision_rust_inputs(pkg, &lock_dir, &sd, &self_exe)? {
+        // package without warmed inputs cannot use the retired legacy shell path. Keep the chosen
+        // native env so the build-recipe subprocess gets TD_SEED_STORE/TD_EXTRA_DBS/
+        // TD_RUST_STORE_* for the vendored-rust case.
+        let native_env = match provision_rust_inputs(pkg, &lock_dir, &sd, &self_exe)? {
             Some((seedlock, extra)) => {
-                match &native {
-                    // CUTOVER: retarget the seed lock onto the native /td/store toolchain (drop the
-                    // guix rust/gcc-toolchain lines) and build against the combined seed+native
-                    // store — never the guix rust/gcc-toolchain. This is the `td shell` product
-                    // command building the Rust userland with td's OWN toolchain.
-                    Some(nt) => {
-                        let body = std::fs::read_to_string(&seedlock)
-                            .map_err(|e| format!("read seed lock {seedlock}: {e}"))?;
-                        let retargeted = native_seed_lock_body(&body, &nt.lock_lines);
-                        std::fs::write(&seedlock, &retargeted)
-                            .map_err(|e| format!("write seed lock {seedlock}: {e}"))?;
-                        bargs.push(seedlock);
-                        bargs.push(sd.clone());
-                        bargs.push(nt.store.clone());
-                        used_native = true;
-                    }
-                    // No native toolchain provisioned ⇒ this vendored rust build has no toolchain.
-                    // The guix rust/gcc-toolchain path is RETIRED for `td shell` (the cutover): fail
-                    // loudly rather than silently fall back to guix.
-                    None => {
-                        return Err(format!(
-                            "build `{pkg}': a vendored rust build needs the native /td/store toolchain, \
-                             but TD_SHELL_NATIVE_STORE is not set. Its provisioning gate was retired with \
-                             the #410 rust-toolchain recipe-graph cutover (rust userland re-coverage pending); \
-                             host-prep must stage the native gcc/binutils/glibc + the recipe-graph relinked \
-                             rust. The guix rust/gcc-toolchain path is retired for `td shell'."
-                        ));
-                    }
-                }
+                let Some(nt) = &native else {
+                    return Err(format!(
+                        "build `{pkg}': a vendored rust build needs the native /td/store toolchain, \
+                         but TD_SHELL_NATIVE_STORE is not set. Its provisioning gate was retired with \
+                         the #410 rust-toolchain recipe-graph cutover (rust userland re-coverage pending); \
+                         host-prep must stage the native gcc/binutils/glibc + the recipe-graph relinked \
+                         rust. The guix rust/gcc-toolchain path is retired for `td shell'."
+                    ));
+                };
+                // CUTOVER: retarget the seed lock onto the native /td/store toolchain (drop the
+                // guix rust/gcc-toolchain lines) and build against the combined seed+native
+                // store — never the guix rust/gcc-toolchain. This is the `td shell` product
+                // command building the Rust userland with td's OWN toolchain.
+                let body = std::fs::read_to_string(&seedlock)
+                    .map_err(|e| format!("read seed lock {seedlock}: {e}"))?;
+                let retargeted = native_seed_lock_body(&body, &nt.lock_lines);
+                std::fs::write(&seedlock, &retargeted)
+                    .map_err(|e| format!("write seed lock {seedlock}: {e}"))?;
+                bargs.push(seedlock);
+                bargs.push(sd.clone());
+                bargs.push(nt.store.clone());
                 bargs.extend(extra);
+                nt
             }
             None => {
-                // PKG needs a lock (its pinned toolchain seed). No lock ⇒ loud error.
-                let lock = format!("{lock_dir}/{pkg}-no-guix.lock");
-                if !Path::new(&lock).is_file() {
-                    return Err(format!("no lock for `{pkg}' ({lock} not found)"));
-                }
-                bargs.push(lock);
-                bargs.push(sd.clone());
-                bargs.push(seed_store_dir.clone());
+                return Err(format!(
+                    "build `{pkg}': no warmed vendored source/crate closure found under \
+                     TD_SHELL_VENDOR_ROOT; the legacy shell build path is retired"
+                ));
             }
-        }
+        };
         // BUILD it via the build-recipe subcommand (its content-addressed cache makes
         // an unchanged recipe a HIT — build-on-demand + cached). A subprocess keeps the
         // build's chatter off the command's stdout, and rides the inherited
         // TD_BUILDER_* override so the builder is the td-placed stage0 too.
         let mut build = Command::new(&self_exe);
         build.args(&bargs);
-        if used_native {
-            // Native link mode, exactly as the retired rust-userland gate (#410 cutover) set it:
-            // the combined store is content-scanned for the closure, the native toolchain's own db
-            // adds its /td/store refs, and run_rust bakes the /td/store interp/RUNPATH/-B.
-            if let Some(nt) = &native {
-                build
-                    .env("TD_SEED_STORE", &nt.store)
-                    .env("TD_SEED_DB", &nt.seed_db)
-                    .env("TD_EXTRA_DBS", &nt.extra_dbs)
-                    .env("TD_RUST_STORE_INTERP", &nt.interp)
-                    .env("TD_RUST_STORE_RPATH", &nt.rpath)
-                    .env("TD_RUST_STORE_BDIR", &nt.bdir);
-            }
-        }
+        // Native link mode, exactly as the retired rust-userland gate (#410 cutover) set it:
+        // the combined store is content-scanned for the closure, the native toolchain's own db
+        // adds its /td/store refs, and run_rust bakes the /td/store interp/RUNPATH/-B.
+        build
+            .env("TD_SEED_STORE", &native_env.store)
+            .env("TD_SEED_DB", &native_env.seed_db)
+            .env("TD_EXTRA_DBS", &native_env.extra_dbs)
+            .env("TD_RUST_STORE_INTERP", &native_env.interp)
+            .env("TD_RUST_STORE_RPATH", &native_env.rpath)
+            .env("TD_RUST_STORE_BDIR", &native_env.bdir);
         let out = build
             .output()
             .map_err(|e| format!("build `{pkg}': spawn td-builder build-recipe: {e}"))?;
@@ -3370,7 +3351,8 @@ fn native_seed_lock_body(seed_body: &str, native_lines: &str) -> String {
 /// vendor-db])` — the extra positional args build-recipe's 11-arg form takes.
 ///
 /// Returns `Ok(None)` when no warmed closure exists for PKG (`TD_SHELL_VENDOR_ROOT` unset,
-/// or no `<pkg>/vendor` under it) ⇒ the caller uses the plain seed-package path (e.g. hello).
+/// or no `<pkg>/vendor` under it); the caller fails closed because the legacy
+/// shell fallback was retired with the corpus.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn provision_rust_inputs(
     pkg: &str,
@@ -4192,7 +4174,7 @@ fn main() -> ExitCode {
         // (.td-build-cache/harness: store/ + rel + toolchain) to a guix-less runner as ONE nar +
         // a fixed-name `td-harness.narinfo` (issue #314). The daily signs it
         // (tools/publish-harness-subst.sh); a runner with an empty `.td-build-cache/harness`
-        // fetches+verifies+restores it (tools/resolve-harness.sh) and runs check-harness.
+        // can fetch+verify+restore it with tools/resolve-harness.sh.
         Some("harness-subst-export") if args.len() == 4 => {
             let (outdir, harness_dir) = (&args[2], &args[3]);
             match harness_subst_export(Path::new(outdir), Path::new(harness_dir)) {
@@ -6442,7 +6424,7 @@ fn main() -> ExitCode {
         // the existing slot, else GROWN (string appended at EOF, mapped by repurposing the
         // PT_NOTE segment into a covering PT_LOAD — see elf::set_interp), so a full hashed
         // /td/store/<hash>-glibc.../ld loader path fits. The one patchelf feature the
-        // rust-store-native relink needs, owned by td in Rust so the build path adds NO guix tool.
+        // Rust toolchain relinking needs, owned by td in Rust so the build path adds NO guix tool.
         Some("elf-set-interp") if args.len() == 4 => {
             match elf::set_interp(Path::new(&args[2]), &args[3]) {
                 Ok(()) => {
@@ -7080,8 +7062,7 @@ daemon build START (2/2 active)
     // ---- persistent accumulating store DB (merge_regs) ----------------------
     // These are the durable, daemon-free proof that a td store ACCUMULATES across
     // builds: merge_regs takes the existing db bytes + new outputs and returns a db
-    // that holds BOTH, by store path. (The heavy `store-persist` gate exercises the
-    // same path end-to-end with a real build across separate invocations.)
+    // that holds BOTH, by store path.
 
     fn reg(path: &str, hash: &str, refs: &[&str]) -> OutputReg {
         OutputReg {
@@ -7594,8 +7575,8 @@ daemon build START (2/2 active)
         let _ = std::fs::remove_dir_all(&base);
         let hdir = base.join("harness");
         // A harness-shaped fixture: store/<rel>/bin/busybox (exec), a loose store/ld loader,
-        // plus the rel + toolchain manifest the check-harness loop reads.
-        let rel = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-userland-x86_64-store-native";
+        // plus the rel + toolchain manifest.
+        let rel = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-td-harness-fixture";
         let bind = hdir.join("store").join(rel).join("bin");
         std::fs::create_dir_all(&bind).unwrap();
         std::fs::write(bind.join("busybox"), b"#!/bin/sh\necho hi\n").unwrap();
@@ -7922,17 +7903,17 @@ daemon build START (2/2 active)
         let dir = std::env::temp_dir().join(format!("td-gcctc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let lock = dir.join("hello.lock");
+        let lock = dir.join("fixture.lock");
         // A minimal recipe lock: source + guix gcc-toolchain + glibc + make (2-field seed inputs).
         std::fs::write(
             &lock,
-            "hello-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2.tar.gz source\n\
+            "fixture-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixture-1.0.tar.gz source\n\
              /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-toolchain-15.2.0 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-gcc-toolchain-15.2.0\n\
              /gnu/store/cccccccccccccccccccccccccccccccc-glibc-2.41 /gnu/store/cccccccccccccccccccccccccccccccc-glibc-2.41\n\
              /gnu/store/dddddddddddddddddddddddddddddddd-make-4.4.1 /gnu/store/dddddddddddddddddddddddddddddddd-make-4.4.1\n",
         )
         .unwrap();
-        let recipe = r#"{"name":"hello","version":"2.12.2","buildSystem":"gnu"}"#;
+        let recipe = r#"{"name":"fixture","version":"1.0","buildSystem":"gnu"}"#;
         let lockp = lock.to_str().unwrap();
         let builder = "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-td-builder-0.1.0";
         let tc = "/td/store/ffffffffffffffffffffffffffffffff-gcc-toolchain-tdstore";
@@ -8139,19 +8120,19 @@ daemon build START (2/2 active)
     fn multi_store_scan_spans_seed_and_newstore() {
         use std::collections::HashMap;
         let glibc_h = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let hello_h = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let subject_h = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let base = std::env::temp_dir().join(format!("td-multiscan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let seed = base.join("seed"); // the canonical /gnu/store stand-in (deps live here)
         let newstore = base.join("newstore"); // a build scratch's newstore (the output only)
         std::fs::create_dir_all(&seed).unwrap();
         std::fs::create_dir_all(&newstore).unwrap();
-        // glibc is a leaf in the seed; hello is the SUBJECT output, present ONLY in newstore,
+        // glibc is a leaf in the seed; subject is the output, present ONLY in newstore,
         // and its bytes reference glibc by hash (the daemon's own reference criterion).
         std::fs::write(seed.join(format!("{glibc_h}-glibc-2.41")), b"a libc leaf\n").unwrap();
         std::fs::write(
-            newstore.join(format!("{hello_h}-hello-2.12.2")),
-            format!("hello links /gnu/store/{glibc_h}-glibc-2.41/lib/libc.so\n").as_bytes(),
+            newstore.join(format!("{subject_h}-subject-1.0")),
+            format!("subject links /gnu/store/{glibc_h}-glibc-2.41/lib/libc.so\n").as_bytes(),
         )
         .unwrap();
 
@@ -8161,25 +8142,25 @@ daemon build START (2/2 active)
         // The FIRST dir is the canonical prefix; both dirs are byte sources.
         let (candidates, on_disk) =
             scan_candidate_index(&[seed_s.clone(), newstore_s.clone()], "/gnu/store").unwrap();
-        // hello's canonical path uses the /gnu/store prefix, but its BYTES come from newstore.
-        let hello_c = canon(&format!("{hello_h}-hello-2.12.2"));
+        // The subject's canonical path uses the /gnu/store prefix, but its BYTES come from newstore.
+        let subject_c = canon(&format!("{subject_h}-subject-1.0"));
         let glibc_c = canon(&format!("{glibc_h}-glibc-2.41"));
-        assert!(candidates.contains(&hello_c) && candidates.contains(&glibc_c));
-        assert_eq!(on_disk[&hello_c], newstore.join(format!("{hello_h}-hello-2.12.2")).to_string_lossy());
+        assert!(candidates.contains(&subject_c) && candidates.contains(&glibc_c));
+        assert_eq!(on_disk[&subject_c], newstore.join(format!("{subject_h}-subject-1.0")).to_string_lossy());
         assert_eq!(on_disk[&glibc_c], seed.join(format!("{glibc_h}-glibc-2.41")).to_string_lossy());
 
         let mut scanner = scan::Scanner::new(&candidates).unwrap();
         let empty: HashMap<String, Vec<String>> = HashMap::new();
         // Closing from the subject root pulls glibc out of the OTHER store dir, by hash.
         let mut cl: Vec<String> =
-            scan_closure_hybrid(&mut scanner, &on_disk, &empty, &[hello_c.clone()]).unwrap().into_iter().collect();
+            scan_closure_hybrid(&mut scanner, &on_disk, &empty, &[subject_c.clone()]).unwrap().into_iter().collect();
         cl.sort();
-        assert_eq!(cl, vec![glibc_c, hello_c], "multi-store closure must span both stores");
+        assert_eq!(cl, vec![glibc_c, subject_c], "multi-store closure must span both stores");
         let _ = std::fs::remove_dir_all(&base);
     }
 
     // ---- #292: roots whose canonical prefix differs from the candidate index's ----------
-    // Gate 377 (store-persist) builds at TD_STORE_DIR=/td/store from a lock whose seed roots
+    // TD_STORE_DIR=/td/store builds from locks whose seed roots
     // are /gnu/store paths. The walk only content-scans a path whose CANONICAL form is an
     // index key — so a /gnu/store root against a single-prefix-canonicalized index collapsed
     // to "roots only" and dropped every transitive runtime dep (coreutils → gmp: expr died

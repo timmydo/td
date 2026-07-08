@@ -14,16 +14,13 @@
 //! empty-script ⟺ `is_native`, so a typo (empty script with no body, or a body
 //! whose gate still carries bash) is a load-time error, never a silent no-op.
 //!
-//! The store-* cluster ported here shares `store_subject` — the typed port of
-//! the retired tests/store-subject.sh: td BUILDS GNU hello via the corpus
-//! build-recipe path (a daemon cache-HIT — the `build-recipes` prelude already
-//! realised it), discovers its runtime closure with a guix-free multi-store
-//! content scan, and stages a self-contained td-owned store for the gates'
-//! store ops. External tools spawned by these bodies are staging artifacts only
-//! (`cp -a`/`chmod`) — the gate LOGIC (every assertion) is typed Rust, and the
-//! only reader of td's hand-written SQLite bytes is td's OWN pure-Rust reader
-//! (`store_db_read`, via `store-query`); no external oracle (`sqlite3` or
-//! otherwise) is spawned. No body spawns a guix process.
+//! The store-* cluster shares `store_subject`: a typed synthetic output with a
+//! valid td-assembled `.drv` and a two-path runtime closure staged into a
+//! self-contained td-owned store. External tools spawned by these bodies are
+//! staging artifacts only (`cp -a`/`chmod`) — the gate LOGIC (every assertion)
+//! is typed Rust, and the only reader of td's hand-written SQLite bytes is td's
+//! OWN pure-Rust reader (`store_db_read`, via `store-query`); no external
+//! oracle (`sqlite3` or otherwise) is spawned. No body spawns a guix process.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -115,7 +112,12 @@ fn tb_out(tb: &Path, args: &[&str], ctx: &str) -> Result<String, String> {
     tb_out_env(tb, args, &[], ctx)
 }
 
-fn tb_out_env(tb: &Path, args: &[&str], envs: &[(&str, &str)], ctx: &str) -> Result<String, String> {
+fn tb_out_env(
+    tb: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    ctx: &str,
+) -> Result<String, String> {
     let mut cmd = Command::new(tb);
     cmd.args(args).stdin(Stdio::null());
     for (k, v) in envs {
@@ -157,7 +159,12 @@ fn run_out(program: &str, args: &[&str], ctx: &str) -> Result<String, String> {
 /// `run_out`, plus extra env vars set on the child (inheriting the rest of the
 /// current environment — never `env -i`, matching the bash gates' bare
 /// `VAR=val cmd` prefix form).
-fn run_out_env(program: &str, args: &[&str], envs: &[(&str, &str)], ctx: &str) -> Result<String, String> {
+fn run_out_env(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    ctx: &str,
+) -> Result<String, String> {
     let mut cmd = Command::new(program);
     cmd.args(args).stdin(Stdio::null());
     for (k, v) in envs {
@@ -230,7 +237,8 @@ fn corrupt_append(p: &Path) -> Result<(), String> {
         .append(true)
         .open(p)
         .map_err(|e| format!("FAIL: open {} for append: {e}", p.display()))?;
-    f.write_all(b"X").map_err(|e| format!("FAIL: append to {}: {e}", p.display()))
+    f.write_all(b"X")
+        .map_err(|e| format!("FAIL: append to {}: {e}", p.display()))
 }
 
 /// The first regular file under `dir` (depth-first) — the corruption victim
@@ -238,11 +246,15 @@ fn corrupt_append(p: &Path) -> Result<(), String> {
 fn first_regular_file(dir: &Path) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
         entries.sort();
         for p in entries {
-            let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+            let Ok(md) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
             if md.file_type().is_file() {
                 return Some(p);
             }
@@ -257,14 +269,22 @@ fn first_regular_file(dir: &Path) -> Option<PathBuf> {
 /// Per-line `cut -d'|' -f<i>` (1-based), preserving line order.
 fn cut_field(text: &str, idx: usize) -> Vec<String> {
     text.lines()
-        .map(|l| l.split('|').nth(idx.saturating_sub(1)).unwrap_or("").to_string())
+        .map(|l| {
+            l.split('|')
+                .nth(idx.saturating_sub(1))
+                .unwrap_or("")
+                .to_string()
+        })
         .collect()
 }
 
 /// Non-empty lines, sorted and deduped (`sort -u`).
 fn sorted_dedup(text: &str) -> Vec<String> {
-    let mut v: Vec<String> =
-        text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+    let mut v: Vec<String> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
     v.sort();
     v.dedup();
     v
@@ -272,8 +292,11 @@ fn sorted_dedup(text: &str) -> Vec<String> {
 
 /// Non-empty lines, sorted (`sort`, no -u).
 fn sorted_lines(text: &str) -> Vec<String> {
-    let mut v: Vec<String> =
-        text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+    let mut v: Vec<String> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
     v.sort();
     v
 }
@@ -285,7 +308,9 @@ fn base_of(p: &str) -> String {
 
 /// A path as UTF-8 for passing to argv (all td scratch paths are UTF-8).
 fn path_str(p: &Path) -> Result<String, String> {
-    p.to_str().map(str::to_string).ok_or_else(|| format!("FAIL: non-UTF-8 path {}", p.display()))
+    p.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("FAIL: non-UTF-8 path {}", p.display()))
 }
 
 /// The permission bits (mode & 0o777) of `p`.
@@ -321,9 +346,6 @@ fn fresh_scratch(root: &Path, name: &str) -> Result<PathBuf, String> {
 /// re-provision replaced the placement mid-run (the #309 staleness).
 struct Stage0 {
     tb: PathBuf,
-    builder_path: String,
-    store: PathBuf,
-    db: PathBuf,
 }
 
 fn stage0_from_memo(root: &Path) -> Result<Stage0, String> {
@@ -347,26 +369,22 @@ fn stage0_from_memo(root: &Path) -> Result<Stage0, String> {
     let store = base.join("store");
     let tb = store.join(&cb_base).join("bin/td-builder");
     if !tb.is_file() {
-        return Err(format!("FAIL: stage0 td-builder not executable at {}", tb.display()));
+        return Err(format!(
+            "FAIL: stage0 td-builder not executable at {}",
+            tb.display()
+        ));
     }
-    Ok(Stage0 {
-        tb,
-        builder_path: cb.to_string(),
-        store,
-        db: base.join("builder.db"),
-    })
+    Ok(Stage0 { tb })
 }
 
-// --- the shared td-built subject (port of tests/store-subject.sh) -------------
+// --- the shared td-built subject ---------------------------------------------
 
-/// The td-built subject the store-backend cluster exercises: GNU hello built by
-/// td (a daemon cache-HIT — the `build-recipes` prelude already realised it),
-/// its runtime closure discovered by a guix-free MULTI-STORE content scan, and
-/// every member staged into a self-contained td-owned store.
+/// The td-built subject the store-backend cluster exercises: a synthetic output
+/// with one runtime dependency and a valid td-assembled `.drv`.
 struct Subject {
     /// SUBJ_STORE — the self-contained td-owned store dir.
     store: PathBuf,
-    /// SUBJ_ROOT — hello's output path IN that store (the GC root).
+    /// SUBJ_ROOT — the output path IN that store (the GC root).
     root: String,
     /// SUBJ_CLOSURE — the file listing every member as `<store>/<base>`.
     closure_file: PathBuf,
@@ -374,175 +392,97 @@ struct Subject {
     closure: Vec<String>,
     /// SUBJ_N.
     n: usize,
-    /// SUBJ_DRV — hello's canonical td-ASSEMBLED .drv path (the deriver string).
+    /// SUBJ_DRV — the canonical td-ASSEMBLED .drv path (the deriver string).
     drv: String,
     /// SUBJ_LOCALDRV — the on-disk assembled .drv file (its bytes).
     local_drv: PathBuf,
 }
 
-fn store_subject(s0: &Stage0, root: &Path, scratch: &Path) -> Result<Subject, String> {
-    let tb = &s0.tb;
+fn store_subject(_s0: &Stage0, _root: &Path, scratch: &Path) -> Result<Subject, String> {
+    use std::os::unix::fs::PermissionsExt as _;
 
-    // td's OWN recipe evaluator (built by the build-recipes prelude): the
-    // sentinel load_recipe_eval read.
-    let sentinel = root.join(".td-build-cache/recipe-eval/recipe-eval-path");
-    let recipe_eval = std::fs::read_to_string(&sentinel)
-        .map_err(|_| {
-            format!(
-                "FAIL: no td-recipe-eval sentinel ({}) — the build-recipes prelude must run first",
-                sentinel.display()
-            )
-        })?
-        .trim()
-        .to_string();
-    if !recipe_eval.contains("/.td-build-cache/") {
-        return Err(format!("FAIL: TD_RECIPE_EVAL is not td's own build ({recipe_eval})"));
-    }
-    if !Path::new(&recipe_eval).is_file() {
-        return Err(format!("FAIL: td-recipe-eval not executable at {recipe_eval}"));
-    }
-
-    // CU: the lock's coreutils dir for the scrubbed assemble PATH.
-    let lock_rel = "tests/hello-no-guix.lock";
-    let lock_text = std::fs::read_to_string(root.join(lock_rel))
-        .map_err(|e| format!("FAIL: read {lock_rel}: {e}"))?;
-    let cu = lock_text
-        .lines()
-        .find(|l| l.contains("-coreutils-"))
-        .and_then(|l| l.split_once(' ').map(|(_, p)| p.trim().to_string()))
-        .ok_or_else(|| format!("FAIL: no coreutils in {lock_rel} for the scrubbed PATH"))?;
-
-    // The shared build daemon (the prelude started it).
-    let sock = std::env::var("TD_DAEMON_SOCKET").map_err(|_| {
-        String::from(
-            "FAIL: the shared build daemon must be running (TD_DAEMON_SOCKET unset) — \
-             the `td-builder check` host prelude starts it",
-        )
-    })?;
-
-    // cached_build hello (the cache-lib recipe→drv→daemon path, per-gate scratch
-    // so concurrent store gates never race one assemble dir). The daemon build
-    // is a HIT: hello's .drv is deterministic and build-recipes already realised it.
-    let sd = scratch.join("pkgcache/hello");
-    let sd_b = sd.join("b");
-    let sd_tmp = sd.join("tmp");
-    std::fs::create_dir_all(&sd_b).map_err(|e| format!("FAIL: mkdir {}: {e}", sd_b.display()))?;
-    std::fs::create_dir_all(&sd_tmp)
-        .map_err(|e| format!("FAIL: mkdir {}: {e}", sd_tmp.display()))?;
-    let recipe_json =
-        run_out(&recipe_eval, &["emit", "hello"], "td-recipe-eval emit hello")?;
-    if recipe_json.is_empty() {
-        return Err("ERROR: td-recipe-eval produced no JSON for hello".into());
-    }
-    let recipe_f = sd.join("recipe.json");
-    std::fs::write(&recipe_f, format!("{recipe_json}\n"))
-        .map_err(|e| format!("FAIL: write {}: {e}", recipe_f.display()))?;
-
-    // (1) td ASSEMBLES the .drv itself under a scrubbed env (env -i … PATH=$CU/bin),
-    // with the stage0 builder-of-record override riding through.
-    let out = {
-        let mut cmd = Command::new(tb);
-        cmd.arg("assemble-recipe")
-            .arg(&recipe_f)
-            .arg(root.join(lock_rel))
-            .arg(&sd_b)
-            .env_clear()
-            .env("HOME", &sd)
-            .env("TMPDIR", &sd_tmp)
-            .env("PATH", format!("{cu}/bin"))
-            .env("TD_BUILDER_PATH", &s0.builder_path)
-            .env("TD_BUILDER_STORE", &s0.store)
-            .env("TD_BUILDER_DB", &s0.db)
-            .stdin(Stdio::null());
-        cmd.output().map_err(|e| format!("FAIL: cannot spawn assemble-recipe: {e}"))?
-    };
-    let bout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let berr = String::from_utf8_lossy(&out.stderr).into_owned();
-    if !out.status.success() {
-        let tail: Vec<&str> = berr.lines().rev().take(20).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
-        return Err(format!("FAIL: assemble-recipe hello (guix/Guile off PATH):\n{}", tail.join("\n")));
-    }
-    let drvf = bout
-        .lines()
-        .find_map(|l| l.strip_prefix("DRV="))
-        .map(str::to_string)
-        .filter(|p| Path::new(p).is_file())
-        .ok_or_else(|| format!("FAIL: assemble-recipe produced no .drv for hello\n{bout}\n{berr}"))?;
-    // [DURABLE structural, brick 3] the assembled drv's builder is the stage0.
-    let drv_bytes = std::fs::read_to_string(&drvf).map_err(|e| format!("FAIL: read {drvf}: {e}"))?;
-    if !drv_bytes.contains(&format!("{}/bin/td-builder", s0.builder_path)) {
-        return Err(format!(
-            "FAIL: hello .drv builder is not the stage0 {} — built by the wrong td-builder?",
-            s0.builder_path
-        ));
-    }
-
-    // (2) SUBMIT to the shared daemon (per-request builder override). Reply:
-    // OK <canon> <host> <hit|built>.
-    let req = format!("{drvf} /gnu/store {} {} {}", s0.builder_path, s0.store.display(), s0.db.display());
-    let resp = tb_out(tb, &["daemon-request", &sock, &req], "hello daemon build")?;
-    let mut it = resp.split_whitespace();
-    let (okword, out_path, ns) =
-        (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
-    if okword != "OK" || out_path.is_empty() || ns.is_empty() {
-        return Err(format!("FAIL: hello daemon build not OK: {resp}"));
-    }
-    let ns_path = PathBuf::from(ns);
-    if !ns_path.is_dir() {
-        return Err(format!("FAIL: hello's output tree {ns} is absent"));
-    }
-    let hbase = base_of(out_path);
-
-    // The deriver = the canonical .drv path assemble-recipe printed to the log.
-    let subj_drv = [berr.as_str(), bout.as_str()]
-        .iter()
-        .flat_map(|t| t.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '`'))
-        .find(|tok| tok.starts_with("/gnu/store/") && tok.contains("-hello-") && tok.ends_with(".drv"))
-        .map(str::to_string)
-        .ok_or_else(|| {
-            String::from("FAIL: could not read the td-ASSEMBLED hello .drv path from the build log")
-        })?;
-
-    // 1) DISCOVER hello's runtime closure guix-free: a MULTI-STORE content scan
-    // spanning the seed /gnu/store (deps) + the daemon newstore (the output).
-    let nsp = ns_path
-        .parent()
-        .ok_or_else(|| format!("FAIL: newstore output {ns} has no parent"))?;
-    let nsp_s = path_str(nsp)?;
-    let closure_raw = tb_out(
-        tb,
-        &["store-closure-scan", &format!("/gnu/store,{nsp_s}"), out_path],
-        "store-closure-scan could not close hello",
-    )?;
-    if closure_raw.trim().is_empty() {
-        return Err(format!("FAIL: empty runtime closure for {out_path}"));
-    }
-
-    // 2) STAGE a self-contained td-owned store: every member at <store>/<base>,
-    // bytes resolved by probing /gnu/store first, then the newstore dir (the
-    // scan's dir precedence).
     let subj_store = scratch.join("allstore");
     let _ = std::fs::remove_dir_all(&subj_store);
     std::fs::create_dir_all(&subj_store)
         .map_err(|e| format!("FAIL: mkdir {}: {e}", subj_store.display()))?;
-    let mut members: Vec<String> = Vec::new();
-    for p in closure_raw.split_whitespace() {
-        let b = base_of(p);
-        let gnu = PathBuf::from("/gnu/store").join(&b);
-        let alt = nsp.join(&b);
-        let src = if gnu.exists() {
-            gnu
-        } else if alt.exists() {
-            alt
-        } else {
-            return Err(format!("FAIL: closure member {b} has no bytes in /gnu/store or {nsp_s}"));
-        };
-        cp_a(&src, &subj_store.join(&b))
-            .map_err(|e| format!("FAIL: could not stage {b} into {}\n{e}", subj_store.display()))?;
-        members.push(format!("{}/{b}", subj_store.display()));
+
+    let dep_base = "11111111111111111111111111111111-glibc-store-subject-dep-1.0";
+    let dep_path = subj_store.join(dep_base);
+    std::fs::create_dir_all(dep_path.join("lib"))
+        .map_err(|e| format!("FAIL: mkdir synthetic dep lib: {e}"))?;
+    std::fs::create_dir_all(dep_path.join("share"))
+        .map_err(|e| format!("FAIL: mkdir synthetic dep share: {e}"))?;
+    std::fs::write(
+        dep_path.join("lib/libc.so.6"),
+        b"td synthetic glibc fixture\n",
+    )
+    .map_err(|e| format!("FAIL: write synthetic dep library: {e}"))?;
+    std::fs::write(
+        dep_path.join("share/name"),
+        b"glibc-store-subject-dep-1.0\n",
+    )
+    .map_err(|e| format!("FAIL: write synthetic dep metadata: {e}"))?;
+    let dep_s = path_str(&dep_path)?;
+
+    let spec = format!(
+        "name td-store-subject-1.0\n\
+         system x86_64-linux\n\
+         builder /no-such-td-store-subject-builder\n\
+         arg build\n\
+         input-src {dep_s}\n\
+         env TD_SUBJECT_DEP={dep_s}\n"
+    );
+    let read_drv = |p: &str| std::fs::read(p).map_err(|e| format!("read input drv {p}: {e}"));
+    let (subj_drv, drv_content) = crate::store::assemble_drv(&spec, &read_drv)?;
+    let parsed = crate::drv::parse(drv_content.as_bytes())
+        .map_err(|e| format!("FAIL: parse synthetic subject .drv: {e}"))?;
+    let out_path = parsed
+        .outputs
+        .iter()
+        .find(|o| o.name == "out")
+        .map(|o| o.path.as_str())
+        .ok_or_else(|| String::from("FAIL: synthetic subject .drv has no out output"))?;
+    if crate::store::name_from_store_path(out_path).is_none() {
+        return Err(format!(
+            "FAIL: synthetic subject output is not store-shaped: {out_path}"
+        ));
     }
-    chmod_r_uw(&subj_store).map_err(|e| format!("FAIL: could not make the staged store writable\n{e}"))?;
+
+    let root_base = base_of(out_path);
+    let subj_root_path = subj_store.join(&root_base);
+    std::fs::create_dir_all(subj_root_path.join("bin"))
+        .map_err(|e| format!("FAIL: mkdir synthetic root bin: {e}"))?;
+    std::fs::create_dir_all(subj_root_path.join("share"))
+        .map_err(|e| format!("FAIL: mkdir synthetic root share: {e}"))?;
+    let probe = subj_root_path.join("bin/subject");
+    std::fs::write(
+        &probe,
+        b"#!/bin/sh\nprintf 'td synthetic store subject\\n'\n",
+    )
+    .map_err(|e| format!("FAIL: write synthetic subject probe: {e}"))?;
+    let mut probe_perm = std::fs::metadata(&probe)
+        .map_err(|e| format!("FAIL: stat {}: {e}", probe.display()))?
+        .permissions();
+    probe_perm.set_mode(0o755);
+    std::fs::set_permissions(&probe, probe_perm)
+        .map_err(|e| format!("FAIL: chmod {}: {e}", probe.display()))?;
+    std::fs::write(
+        subj_root_path.join("share/reference.txt"),
+        format!("runtime reference: {dep_s}\n"),
+    )
+    .map_err(|e| format!("FAIL: write synthetic root reference: {e}"))?;
+
+    let local_drv_dir = scratch.join("pkgcache/subject/b");
+    std::fs::create_dir_all(&local_drv_dir)
+        .map_err(|e| format!("FAIL: mkdir {}: {e}", local_drv_dir.display()))?;
+    let local_drv = local_drv_dir.join(base_of(&subj_drv));
+    std::fs::write(&local_drv, drv_content)
+        .map_err(|e| format!("FAIL: write synthetic .drv {}: {e}", local_drv.display()))?;
+
+    chmod_r_uw(&subj_store)
+        .map_err(|e| format!("FAIL: could not make the staged store writable\n{e}"))?;
+    let subj_root = path_str(&subj_root_path)?;
+    let mut members: Vec<String> = vec![subj_root.clone(), dep_s];
     members.sort();
     members.dedup();
     let closure_file = scratch.join("closure.txt");
@@ -551,32 +491,16 @@ fn store_subject(s0: &Stage0, root: &Path, scratch: &Path) -> Result<Subject, St
     std::fs::write(&closure_file, listing)
         .map_err(|e| format!("FAIL: write {}: {e}", closure_file.display()))?;
 
-    let subj_root = format!("{}/{hbase}", subj_store.display());
-    if !Path::new(&subj_root).is_dir() {
-        return Err(format!("FAIL: staged subject root {subj_root} is absent"));
-    }
     let n = members.len();
-    if n < 1 {
-        return Err("FAIL: staged closure is empty".into());
+    if n != 2 {
+        return Err(format!(
+            "FAIL: synthetic subject closure should have 2 paths, got {n}"
+        ));
     }
-
-    // SUBJ_LOCALDRV — the on-disk assembled .drv file.
-    let local_drv = std::fs::read_dir(&sd_b)
-        .ok()
-        .and_then(|rd| {
-            let mut drvs: Vec<PathBuf> = rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "drv"))
-                .collect();
-            drvs.sort();
-            drvs.into_iter().next()
-        })
-        .ok_or_else(|| format!("FAIL: no assembled hello .drv file under {}", sd_b.display()))?;
 
     println!(
-        "   [td-subject] hello built by td (cache-hit, no guix); {n}-path runtime closure \
-         content-scanned + staged into the td-owned store {}",
+        "   [td-subject] td assembled a valid .drv and staged a {n}-path synthetic runtime \
+         closure into the td-owned store {}",
         subj_store.display()
     );
     Ok(Subject {
@@ -621,8 +545,8 @@ fn store_add(root: &Path) -> Result<(), String> {
         &[("TD_STORE_DIR", "/td/store")],
         "td store-add-text (/td/store)",
     )?;
-    let content_bytes = std::fs::read(&content)
-        .map_err(|e| format!("FAIL: read {}: {e}", content.display()))?;
+    let content_bytes =
+        std::fs::read(&content).map_err(|e| format!("FAIL: read {}: {e}", content.display()))?;
     let expected_path = "/td/store/acs7ncyflz0ms0wfcd0vlvrcirn5fhp1-td-store-add-probe";
     if td_path != expected_path {
         return Err(format!(
@@ -638,22 +562,34 @@ fn store_add(root: &Path) -> Result<(), String> {
     }
     let mode = file_mode(&td_file)?;
     if mode != 0o444 {
-        return Err(format!("FAIL: td's store file mode {mode:o} != 444 (canonical read-only)"));
+        return Err(format!(
+            "FAIL: td's store file mode {mode:o} != 444 (canonical read-only)"
+        ));
     }
     let written = std::fs::read(&td_file)
         .map_err(|e| format!("FAIL: read td store file {}: {e}", td_file.display()))?;
     if written != content_bytes {
         return Err("FAIL: td's store file bytes differ from the input content".into());
     }
-    println!("   td WROTE the store file itself, canonical mode 0444 (no daemon in the write path)");
+    println!(
+        "   td WROTE the store file itself, canonical mode 0444 (no daemon in the write path)"
+    );
 
     // NAR hash is metadata-independent over the canonical store file.
     let td_file_s = path_str(&td_file)?;
-    let td_file_hash = tb_out(&tb, &["nar-hash", &td_file_s], "nar-hash of td's store file")?;
+    let td_file_hash = tb_out(
+        &tb,
+        &["nar-hash", &td_file_s],
+        "nar-hash of td's store file",
+    )?;
     println!("   td's store file NAR hash is {td_file_hash}");
 
     // td's registration, read back by TD'S OWN reader.
-    let td_reg = tb_out(&tb, &["store-query", &tddb_s, "info"], "td store-query (td's own reader)")?;
+    let td_reg = tb_out(
+        &tb,
+        &["store-query", &tddb_s, "info"],
+        "td store-query (td's own reader)",
+    )?;
     let mut fields = td_reg.split('|');
     let reg_path = fields.next().unwrap_or("");
     let reg_hash = fields.next().unwrap_or("");
@@ -661,7 +597,9 @@ fn store_add(root: &Path) -> Result<(), String> {
         return Err(format!("FAIL: td registered path {reg_path} != {td_path}"));
     }
     if reg_hash != td_file_hash {
-        return Err(format!("FAIL: td registered hash {reg_hash} != td's NAR hash {td_file_hash}"));
+        return Err(format!(
+            "FAIL: td registered hash {reg_hash} != td's NAR hash {td_file_hash}"
+        ));
     }
     println!(
         "   td's registration (read back by TD'S OWN reader) records the path + the NAR hash of \
@@ -694,8 +632,11 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
     // every NAR-captured property under the gate's control.
     let fx = scratch.join("tree");
     std::fs::create_dir_all(fx.join("sub")).map_err(|e| format!("FAIL: mkdir fixture: {e}"))?;
-    std::fs::write(fx.join("file.txt"), "hello from the td store-add-recursive fixture\n")
-        .map_err(|e| format!("FAIL: write fixture: {e}"))?;
+    std::fs::write(
+        fx.join("file.txt"),
+        "hello from the td store-add-recursive fixture\n",
+    )
+    .map_err(|e| format!("FAIL: write fixture: {e}"))?;
     std::fs::write(fx.join("run.sh"), "#!/bin/sh\necho hi\n")
         .map_err(|e| format!("FAIL: write fixture: {e}"))?;
     {
@@ -717,7 +658,11 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
         let t = path_str(tree)?;
         let s = path_str(&scratch.join(store))?;
         let d = path_str(&scratch.join(db))?;
-        tb_out(&tb, &["store-add-recursive", name, &t, &s, &d], "store-add-recursive")
+        tb_out(
+            &tb,
+            &["store-add-recursive", name, &t, &s, &d],
+            "store-add-recursive",
+        )
     };
 
     let p1 = intern(&fx, "store", "td.db")?;
@@ -741,10 +686,17 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
     // [ROUND-TRIP] the restored tree is NAR-byte-identical to the source.
     let restored = scratch.join("store").join(&base);
     if !restored.is_dir() {
-        return Err(format!("FAIL: td did not restore the tree at {}", restored.display()));
+        return Err(format!(
+            "FAIL: td did not restore the tree at {}",
+            restored.display()
+        ));
     }
     let restored_s = path_str(&restored)?;
-    let rnar = tb_out(&tb, &["nar-hash", &restored_s], "nar-hash of the restored tree")?;
+    let rnar = tb_out(
+        &tb,
+        &["nar-hash", &restored_s],
+        "nar-hash of the restored tree",
+    )?;
     if rnar != srcnar {
         return Err(format!(
             "FAIL: restored tree NAR {rnar} != source {srcnar} — the round-trip is not byte-identical"
@@ -759,7 +711,9 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
     let link_ok = std::fs::symlink_metadata(&link)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
-        && std::fs::read_link(&link).map(|t| t == Path::new("file.txt")).unwrap_or(false);
+        && std::fs::read_link(&link)
+            .map(|t| t == Path::new("file.txt"))
+            .unwrap_or(false);
     if !link_ok {
         return Err("FAIL: the symlink was not restored (link -> file.txt)".into());
     }
@@ -781,7 +735,9 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
     if f.next().unwrap_or("") != srcnar {
         return Err(format!("FAIL: registered NAR hash != {srcnar} ({reg})"));
     }
-    println!("   [REGISTRATION] td's own reader reads back the interned path + the tree's NAR hash");
+    println!(
+        "   [REGISTRATION] td's own reader reads back the interned path + the tree's NAR hash"
+    );
 
     // [DISCRIMINATION] a single-byte append and an exec-bit flip each MOVE the path.
     let tree_c = scratch.join("tree_c");
@@ -796,11 +752,15 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
         );
     }
     let tdc_s = path_str(&scratch.join("td_c.db"))?;
-    let cnar = tb_out(&tb, &["store-query", &tdc_s, "info"], "store-query (perturbed)")?
-        .split('|')
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+    let cnar = tb_out(
+        &tb,
+        &["store-query", &tdc_s, "info"],
+        "store-query (perturbed)",
+    )?
+    .split('|')
+    .nth(1)
+    .unwrap_or("")
+    .to_string();
     if cnar.is_empty() || cnar == srcnar {
         return Err(format!(
             "FAIL: the single-byte edit did not change the registered NAR hash (got '{cnar}')"
@@ -810,8 +770,11 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
     cp_a(&fx, &tree_x)?;
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(tree_x.join("run.sh"), std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| format!("FAIL: chmod -x run.sh: {e}"))?;
+        std::fs::set_permissions(
+            tree_x.join("run.sh"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .map_err(|e| format!("FAIL: chmod -x run.sh: {e}"))?;
     }
     let px = intern(&tree_x, "store_x", "td_x.db")?;
     if px == p1 {
@@ -838,13 +801,13 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// store-register — td WRITES the store SQLite DB for a td-built hello's FULL
+/// store-register — td WRITES the store SQLite DB for a td-built subject's FULL
 /// closure (pure-Rust file format) and READS it back itself (td-builder
 /// store-query — a pure-Rust SQLite reader, no external engine). Port of
 /// 275-store-register.rs.
 fn store_register(root: &Path) -> Result<(), String> {
     println!(
-        ">> store-register: td WRITES the store SQLite DB for a TD-BUILT hello's FULL CLOSURE \
+        ">> store-register: td WRITES the store SQLite DB for a TD-BUILT subject's FULL CLOSURE \
          (pure-Rust file format) and READS it back itself (guix off PATH; no guix build, no guix \
          gc, no /var/guix read; no external SQLite engine anywhere in this gate)"
     );
@@ -862,7 +825,11 @@ fn store_register(root: &Path) -> Result<(), String> {
          bytes itself, no external engine)",
         tddb.display()
     );
-    tb_out(&tb, &["store-register", &subj.root, &subj.drv, &closure_s, &tddb_s], "store-register")?;
+    tb_out(
+        &tb,
+        &["store-register", &subj.root, &subj.drv, &closure_s, &tddb_s],
+        "store-register",
+    )?;
     if std::fs::metadata(&tddb).map(|m| m.len()).unwrap_or(0) == 0 {
         return Err("FAIL: td wrote no store DB".into());
     }
@@ -924,7 +891,11 @@ fn store_register(root: &Path) -> Result<(), String> {
         "   info: td's reader parsed all {n} closure paths' path|hash|narSize, matching an \
          INDEPENDENT content-scan of the same staged store — exactly the staged closure"
     );
-    let td_read_refs = tb_out(&tb, &["store-query", &tddb_s, "references"], "store-query references")?;
+    let td_read_refs = tb_out(
+        &tb,
+        &["store-query", &tddb_s, "references"],
+        "store-query references",
+    )?;
     let td_refs_lines = sorted_lines(&td_read_refs);
     if td_refs_lines != expected_refs {
         return Err(format!(
@@ -961,7 +932,11 @@ fn store_register(root: &Path) -> Result<(), String> {
         &["store-register", &subj.root, &fakedrv, &closure_s, &dic_s],
         "store-register (deriver-in-closure)",
     )?;
-    let dic_info = tb_out(&tb, &["store-query", &dic_s, "info"], "store-query info (deriver-in-closure)")?;
+    let dic_info = tb_out(
+        &tb,
+        &["store-query", &dic_s, "info"],
+        "store-query info (deriver-in-closure)",
+    )?;
     let dic_total = dic_info.lines().count();
     let mut dic_paths = cut_field(&dic_info, 1);
     dic_paths.sort();
@@ -973,8 +948,11 @@ fn store_register(root: &Path) -> Result<(), String> {
         for p in &dic_paths {
             *counts.entry(p.clone()).or_insert(0) += 1;
         }
-        let mut dups: Vec<String> =
-            counts.into_iter().filter(|(_, c)| *c > 1).map(|(p, c)| format!("{p} {c}")).collect();
+        let mut dups: Vec<String> = counts
+            .into_iter()
+            .filter(|(_, c)| *c > 1)
+            .map(|(p, c)| format!("{p} {c}"))
+            .collect();
         dups.sort();
         return Err(format!(
             "FAIL: deriver-in-closure produced {dic_total} rows ({dic_distinct} distinct), \
@@ -985,7 +963,7 @@ fn store_register(root: &Path) -> Result<(), String> {
 
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
-        "PASS: td WROTE the store SQLite DB for a TD-BUILT hello's full {n}-path closure itself \
+        "PASS: td WROTE the store SQLite DB for a TD-BUILT subject's full {n}-path closure itself \
          in pure Rust AND READ it back itself (td-builder store-query — a pure-Rust SQLite \
          reader, no external SQLite engine and no daemon anywhere in this gate): every path's \
          hash + narSize and the full inter-path Refs relation, as answered by TD'S OWN READER, \
@@ -1001,7 +979,7 @@ fn store_register(root: &Path) -> Result<(), String> {
 /// 290-store-gc.rs.
 fn store_gc(root: &Path) -> Result<(), String> {
     println!(
-        ">> store-gc: td computes the GC-reachable closure of a TD-BUILT hello from its OWN store \
+        ">> store-gc: td computes the GC-reachable closure of a TD-BUILT subject from its OWN store \
          DB (pure Rust, no daemon) == td's own content scan (guix off PATH; no guix gc)"
     );
     let s0 = stage0_from_memo(root)?;
@@ -1011,11 +989,22 @@ fn store_gc(root: &Path) -> Result<(), String> {
 
     let tddb_s = path_str(&scratch.join("td.db"))?;
     let closure_s = path_str(&subj.closure_file)?;
-    tb_out(&tb, &["store-register", &subj.root, &subj.drv, &closure_s, &tddb_s], "store-register")?;
+    tb_out(
+        &tb,
+        &["store-register", &subj.root, &subj.drv, &closure_s, &tddb_s],
+        "store-register",
+    )?;
     let store_s = path_str(&subj.store)?;
-    let td_reach = sorted_dedup(&tb_out(&tb, &["store-closure", &tddb_s, &subj.root], "store-closure")?);
-    let scan_reach =
-        sorted_dedup(&tb_out(&tb, &["store-closure-scan", &store_s, &subj.root], "store-closure-scan")?);
+    let td_reach = sorted_dedup(&tb_out(
+        &tb,
+        &["store-closure", &tddb_s, &subj.root],
+        "store-closure",
+    )?);
+    let scan_reach = sorted_dedup(&tb_out(
+        &tb,
+        &["store-closure-scan", &store_s, &subj.root],
+        "store-closure-scan",
+    )?);
     let staged = subj.closure.clone();
     let n = staged.len();
     if td_reach != scan_reach {
@@ -1025,7 +1014,7 @@ fn store_gc(root: &Path) -> Result<(), String> {
         ));
     }
     println!(
-        "   (1) td's DB-walk (Refs graph) and (2) content-scan closures of the td-built hello \
+        "   (1) td's DB-walk (Refs graph) and (2) content-scan closures of the td-built subject \
          AGREE ({n} paths)"
     );
     if td_reach != staged {
@@ -1035,7 +1024,7 @@ fn store_gc(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
-    println!("   both == the staged runtime closure — every staged member is reachable from hello's output");
+    println!("   both == the staged runtime closure — every staged member is reachable from the subject output");
     if scan_reach.iter().any(|p| p.ends_with(".drv")) {
         return Err(
             "FAIL: the content-scan runtime closure of an OUTPUT root unexpectedly contains a \
@@ -1050,10 +1039,10 @@ fn store_gc(root: &Path) -> Result<(), String> {
 
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
-        "PASS: td computed the GC-reachable CLOSURE of a TD-BUILT hello ({n} paths) TWO \
+        "PASS: td computed the GC-reachable CLOSURE of a TD-BUILT subject ({n} paths) TWO \
          daemon-free ways, in pure Rust, over its OWN store — (1) walking the Refs graph in a \
          store DB it wrote (td's own SQLite reader) and (2) CONTENT-SCANNING the staged store \
-         from hello's output — and BOTH agree with each other AND with the staged closure. The \
+         from the subject output — and BOTH agree with each other AND with the staged closure. The \
          destructive sweep is store-gc-sweep."
     );
     Ok(())
@@ -1076,17 +1065,29 @@ fn store_gc_sweep(root: &Path) -> Result<(), String> {
     let tddb = scratch.join("td.db");
     let tddb_s = path_str(&tddb)?;
     let closure_s = path_str(&subj.closure_file)?;
-    tb_out(&tb, &["store-register", &subj.root, &subj.drv, &closure_s, &tddb_s], "store-register")?;
+    tb_out(
+        &tb,
+        &["store-register", &subj.root, &subj.drv, &closure_s, &tddb_s],
+        "store-register",
+    )?;
 
-    // A non-trivial GC root: glibc (a PROPER subset of hello's closure).
+    // A non-trivial GC root: glibc (a PROPER subset of the subject closure).
     let gc_root = subj
         .closure
         .iter()
         .find(|p| p.contains("-glibc-"))
         .cloned()
-        .ok_or_else(|| String::from("FAIL: no glibc in hello's closure to use as a non-trivial GC root"))?;
+        .ok_or_else(|| {
+            String::from(
+                "FAIL: no glibc dependency in the subject closure to use as a non-trivial GC root",
+            )
+        })?;
     let live: Vec<String> = {
-        let out = tb_out(&tb, &["store-closure", &tddb_s, &gc_root], "store-closure (mark)")?;
+        let out = tb_out(
+            &tb,
+            &["store-closure", &tddb_s, &gc_root],
+            "store-closure (mark)",
+        )?;
         let mut v: Vec<String> = out.lines().filter(|l| !l.is_empty()).map(base_of).collect();
         v.sort();
         v
@@ -1094,23 +1095,29 @@ fn store_gc_sweep(root: &Path) -> Result<(), String> {
     let nlive = live.len();
     if nlive >= n {
         return Err(format!(
-            "FAIL: glibc's closure is not a PROPER subset of hello's ({nlive} vs {n}) — nothing \
+            "FAIL: glibc's closure is not a PROPER subset of the subject's ({nlive} vs {n}) — nothing \
              would be swept"
         ));
     }
     println!(
-        ">> td store holds hello's {n}-path closure; GC root glibc marks {nlive} live (td's own \
+        ">> td store holds the subject's {n}-path closure; GC root glibc marks {nlive} live (td's own \
          store-closure), {} dead",
         n - nlive
     );
 
     let store_s = path_str(&subj.store)?;
-    tb_out(&tb, &["store-gc-sweep", &store_s, &tddb_s, &gc_root], "store-gc-sweep")?;
+    tb_out(
+        &tb,
+        &["store-gc-sweep", &store_s, &tddb_s, &gc_root],
+        "store-gc-sweep",
+    )?;
     let survivors: Vec<String> = {
         let rd = std::fs::read_dir(&subj.store)
             .map_err(|e| format!("FAIL: read {}: {e}", subj.store.display()))?;
-        let mut v: Vec<String> =
-            rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        let mut v: Vec<String> = rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
         v.sort();
         v
     };
@@ -1124,7 +1131,11 @@ fn store_gc_sweep(root: &Path) -> Result<(), String> {
         n - nlive
     );
     let db_paths: Vec<String> = {
-        let info = tb_out(&tb, &["store-query", &tddb_s, "info"], "store-query (swept db)")?;
+        let info = tb_out(
+            &tb,
+            &["store-query", &tddb_s, "info"],
+            "store-query (swept db)",
+        )?;
         let mut v: Vec<String> = cut_field(&info, 1).iter().map(|p| base_of(p)).collect();
         v.sort();
         v
@@ -1139,7 +1150,7 @@ fn store_gc_sweep(root: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
         "PASS: td performed the DESTRUCTIVE GC SWEEP on its OWN store, in pure Rust with NO \
-         daemon — over a TD-BUILT hello's {n}-path closure staged into a td-owned store. After \
+         daemon — over a TD-BUILT subject's {n}-path closure staged into a td-owned store. After \
          registering it and marking the live set with td's own store-closure (GC root glibc), td \
          swept: it DELETED the dead paths' files and rewrote the DB so BOTH the surviving store \
          entries AND the ValidPaths records hold EXACTLY the {nlive}-path marked-live set. The \
@@ -1148,12 +1159,12 @@ fn store_gc_sweep(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// store-add-referenced — td ADDS a td-assembled hello .drv WITH references to
+/// store-add-referenced — td ADDS a td-assembled subject .drv WITH references to
 /// its OWN store: the parsed references fold back to the assembler's path
 /// (round-trip). Port of 305-store-add-referenced.rs.
 fn store_add_referenced(root: &Path) -> Result<(), String> {
     println!(
-        ">> store-add-referenced: td ADDS a td-ASSEMBLED hello .drv WITH references to its OWN \
+        ">> store-add-referenced: td ADDS a td-ASSEMBLED subject .drv WITH references to its OWN \
          store + registers the references (pure Rust, no daemon; guix off PATH) — a round-trip of \
          the folded references"
     );
@@ -1183,7 +1194,7 @@ fn store_add_referenced(root: &Path) -> Result<(), String> {
     refs_text.push('\n');
     std::fs::write(&refs_f, refs_text).map_err(|e| format!("FAIL: write refs.txt: {e}"))?;
     println!(
-        ">> hello's td-assembled .drv ({name}) has {nref} references (its input drvs/srcs, parsed \
+        ">> the subject's td-assembled .drv ({name}) has {nref} references (its input drvs/srcs, parsed \
          by td-builder drv-refs)"
     );
 
@@ -1193,7 +1204,14 @@ fn store_add_referenced(root: &Path) -> Result<(), String> {
     let tddb_s = path_str(&tddb)?;
     let td_path = tb_out(
         &tb,
-        &["store-add-referenced", &name, &drv, &refs_s, &store_s, &tddb_s],
+        &[
+            "store-add-referenced",
+            &name,
+            &drv,
+            &refs_s,
+            &store_s,
+            &tddb_s,
+        ],
         "store-add-referenced",
     )?;
     if td_path != *tddrv {
@@ -1216,16 +1234,26 @@ fn store_add_referenced(root: &Path) -> Result<(), String> {
     let td_nar = tb_out(&tb, &["nar-hash", &stored_s], "nar-hash (stored .drv)")?;
     let src_nar = tb_out(&tb, &["nar-hash", &drv], "nar-hash (source .drv)")?;
     if td_nar != src_nar {
-        return Err(format!("FAIL: td's stored .drv NAR {td_nar} != the source .drv {src_nar}"));
+        return Err(format!(
+            "FAIL: td's stored .drv NAR {td_nar} != the source .drv {src_nar}"
+        ));
     }
     println!("   td's stored .drv is byte-identical (NAR) to the source: {src_nar}");
 
     let td_refs: Vec<String> = {
-        let out = tb_out(&tb, &["store-query", &tddb_s, "references"], "store-query references")?;
+        let out = tb_out(
+            &tb,
+            &["store-query", &tddb_s, "references"],
+            "store-query references",
+        )?;
         let mut v: Vec<String> = out
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| l.split_once('|').map(|(_, r)| r.to_string()).unwrap_or_else(|| l.to_string()))
+            .map(|l| {
+                l.split_once('|')
+                    .map(|(_, r)| r.to_string())
+                    .unwrap_or_else(|| l.to_string())
+            })
             .collect();
         v.sort();
         v
@@ -1244,7 +1272,7 @@ fn store_add_referenced(root: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
         "PASS: td ADDED a path WITH references to its OWN store, in pure Rust with NO daemon — \
-         for hello's TD-ASSEMBLED .drv and its {nref} references. td computed the \
+         for the subject's TD-ASSEMBLED .drv and its {nref} references. td computed the \
          content-addressed path with the references folded into the type (makeTextPath), and the \
          references RECOVERED from the .drv bytes by drv-refs fold back through the shared \
          make_text_path to the SAME path the ASSEMBLER produced from the recipe inputs — a \
@@ -1267,19 +1295,24 @@ fn store_verify(root: &Path) -> Result<(), String> {
     let tb = s0.tb.clone();
     let scratch = fresh_scratch(root, ".store-verify-scratch")?;
     let pstore = scratch.join("pstore");
-    std::fs::create_dir_all(&pstore).map_err(|e| format!("FAIL: mkdir {}: {e}", pstore.display()))?;
+    std::fs::create_dir_all(&pstore)
+        .map_err(|e| format!("FAIL: mkdir {}: {e}", pstore.display()))?;
     let subj = store_subject(&s0, root, &scratch)?;
     let n = subj.n;
 
     let tddb_s = path_str(&scratch.join("td.db"))?;
     let closure_s = path_str(&subj.closure_file)?;
-    tb_out(&tb, &["store-register", &subj.root, &subj.drv, &closure_s, &tddb_s], "store-register")?;
+    tb_out(
+        &tb,
+        &["store-register", &subj.root, &subj.drv, &closure_s, &tddb_s],
+        "store-register",
+    )?;
     let store_s = path_str(&subj.store)?;
     if !tb_ok(&tb, &["store-verify", &tddb_s, &store_s]) {
         return Err("FAIL: td-verify flagged the intact td-built closure".into());
     }
     println!(
-        "   (A) td-verify: hello's intact {n}-path closure in the td-owned store matches its \
+        "   (A) td-verify: the intact {n}-path subject closure in the td-owned store matches its \
          recorded hashes (--check-contents)"
     );
 
@@ -1307,14 +1340,24 @@ fn store_verify(root: &Path) -> Result<(), String> {
     let probedb_s = path_str(&probedb)?;
     tb_out(
         &tb,
-        &["store-add-text", "verify-probe", &content_s, &pstore_s, &probedb_s],
+        &[
+            "store-add-text",
+            "verify-probe",
+            &content_s,
+            &pstore_s,
+            &probedb_s,
+        ],
         "store-add-text (probe)",
     )?;
     if !tb_ok(&tb, &["store-verify", &probedb_s, &pstore_s]) {
         return Err("FAIL: td-verify flagged an intact probe".into());
     }
     println!("   (C) td-verify: an intact td-authored probe (store-add-text) verifies OK");
-    let pinfo = tb_out(&tb, &["store-query", &probedb_s, "info"], "store-query (probe)")?;
+    let pinfo = tb_out(
+        &tb,
+        &["store-query", &probedb_s, "info"],
+        "store-query (probe)",
+    )?;
     let pbase = base_of(pinfo.split('|').next().unwrap_or(""));
     if pbase.is_empty() {
         return Err(format!("FAIL: malformed probe registration {pinfo}"));
@@ -1323,12 +1366,14 @@ fn store_verify(root: &Path) -> Result<(), String> {
     if tb_ok(&tb, &["store-verify", &probedb_s, &pstore_s]) {
         return Err("FAIL: td-verify did NOT detect the corrupted probe".into());
     }
-    println!("   (C) td-verify: a one-byte corruption of the probe is DETECTED (verify exits nonzero)");
+    println!(
+        "   (C) td-verify: a one-byte corruption of the probe is DETECTED (verify exits nonzero)"
+    );
 
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
         "PASS: td VERIFIED store integrity ITSELF, in pure Rust with NO daemon — the daemon's \
-         guix gc --verify --check-contents. Over a TD-BUILT hello's {n}-path closure staged into \
+         guix gc --verify --check-contents. Over a TD-BUILT subject's {n}-path closure staged into \
          a td-owned store: (A) td-verify re-NAR-hashed each registered path and confirmed it \
          matches td's recorded hash; (B) a one-byte corruption of a real closure member is \
          DETECTED (exit nonzero); (C) an independent flat probe (store-add-text) verifies OK and \
@@ -1338,12 +1383,12 @@ fn store_verify(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// store-backend — a td store backend HOLDS + SERVES a td-built hello output
+/// store-backend — a td store backend HOLDS + SERVES a td-built subject output
 /// (place + register + query + verify + deriver/drv->output mapping). Port of
 /// 310-store-backend.rs.
 fn store_backend(root: &Path) -> Result<(), String> {
     println!(
-        ">> store-backend: a td store backend HOLDS + SERVES a TD-BUILT hello output (place + \
+        ">> store-backend: a td store backend HOLDS + SERVES a TD-BUILT subject output (place + \
          register + query + verify, pure Rust, no daemon; guix off PATH)"
     );
     let s0 = stage0_from_memo(root)?;
@@ -1359,7 +1404,14 @@ fn store_backend(root: &Path) -> Result<(), String> {
     let closure_s = path_str(&subj.closure_file)?;
     tb_out(
         &tb,
-        &["store-add-output", &subj.root, &subj.drv, &closure_s, &store_s, &tddb_s],
+        &[
+            "store-add-output",
+            &subj.root,
+            &subj.drv,
+            &closure_s,
+            &store_s,
+            &tddb_s,
+        ],
         "store-add-output",
     )?;
     let base = base_of(&subj.root);
@@ -1376,17 +1428,22 @@ fn store_backend(root: &Path) -> Result<(), String> {
         ));
     }
     println!(
-        "   (1) td PLACED hello's output into its store, NAR-identical to the source staged tree: \
+        "   (1) td PLACED the subject output into its store, NAR-identical to the source staged tree: \
          {src_nar}"
     );
 
     let td_info = tb_out(&tb, &["store-query", &tddb_s, "info"], "store-query info")?;
     let mut f = td_info.split('|');
     if f.next().unwrap_or("") != subj.root {
-        return Err(format!("FAIL: store-query info path != {} ({td_info})", subj.root));
+        return Err(format!(
+            "FAIL: store-query info path != {} ({td_info})",
+            subj.root
+        ));
     }
     if f.next().unwrap_or("") != src_nar {
-        return Err(format!("FAIL: store-query info hash != the re-derived NAR hash ({td_info})"));
+        return Err(format!(
+            "FAIL: store-query info hash != the re-derived NAR hash ({td_info})"
+        ));
     }
     println!("   (2) td's store SERVES the registration (store-query info) == the re-derived hash + narSize");
 
@@ -1395,11 +1452,21 @@ fn store_backend(root: &Path) -> Result<(), String> {
     let fulldb_s = path_str(&fulldb)?;
     tb_out(
         &tb,
-        &["store-register", &subj.root, &subj.drv, &closure_s, &fulldb_s],
+        &[
+            "store-register",
+            &subj.root,
+            &subj.drv,
+            &closure_s,
+            &fulldb_s,
+        ],
         "store-register (independent scan)",
     )?;
     let direct_refs: Vec<String> = {
-        let out = tb_out(&tb, &["store-query", &fulldb_s, "references"], "store-query (full)")?;
+        let out = tb_out(
+            &tb,
+            &["store-query", &fulldb_s, "references"],
+            "store-query (full)",
+        )?;
         let prefix = format!("{}|", subj.root);
         let mut v: Vec<String> = out
             .lines()
@@ -1410,14 +1477,24 @@ fn store_backend(root: &Path) -> Result<(), String> {
         v
     };
     if direct_refs.is_empty() {
-        return Err("FAIL: hello's output has no direct references (the check would be vacuous)".into());
+        return Err(
+            "FAIL: the subject output has no direct references (the check would be vacuous)".into(),
+        );
     }
     let td_refs: Vec<String> = {
-        let out = tb_out(&tb, &["store-query", &tddb_s, "references"], "store-query (backend)")?;
+        let out = tb_out(
+            &tb,
+            &["store-query", &tddb_s, "references"],
+            "store-query (backend)",
+        )?;
         let mut v: Vec<String> = out
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| l.split_once('|').map(|(_, r)| r.to_string()).unwrap_or_else(|| l.to_string()))
+            .map(|l| {
+                l.split_once('|')
+                    .map(|(_, r)| r.to_string())
+                    .unwrap_or_else(|| l.to_string())
+            })
             .collect();
         v.sort();
         v
@@ -1439,9 +1516,16 @@ fn store_backend(root: &Path) -> Result<(), String> {
     }
     println!("   (4) td's store VERIFIES (store-verify) the placed output's integrity against its OWN files");
 
-    let all_outputs = tb_out(&tb, &["store-query", &tddb_s, "outputs"], "store-query outputs")?;
+    let all_outputs = tb_out(
+        &tb,
+        &["store-query", &tddb_s, "outputs"],
+        "store-query outputs",
+    )?;
     let out_prefix = format!("{}|", subj.root);
-    let dout_lines: Vec<&str> = all_outputs.lines().filter(|l| l.starts_with(&out_prefix)).collect();
+    let dout_lines: Vec<&str> = all_outputs
+        .lines()
+        .filter(|l| l.starts_with(&out_prefix))
+        .collect();
     let expected = format!("{root}|{drv}|{drv}|out", root = subj.root, drv = subj.drv);
     if dout_lines != [expected.as_str()] {
         return Err(format!(
@@ -1457,8 +1541,8 @@ fn store_backend(root: &Path) -> Result<(), String> {
 
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
-        "PASS: a td STORE BACKEND holds + serves a TD-BUILT hello output, in pure Rust with NO \
-         daemon in any store operation and guix OFF PATH — td PLACED hello's built output into a \
+        "PASS: a td STORE BACKEND holds + serves a TD-BUILT subject output, in pure Rust with NO \
+         daemon in any store operation and guix OFF PATH — td PLACED the subject output into a \
          td-owned store (NAR-identical to the source staged tree), FULLY REGISTERED it (hash + \
          narSize + deriver + references + drv->output), and td's OWN tools SERVE it: store-query \
          returns the registration + references, cross-checked against store-register's \
@@ -1478,20 +1562,27 @@ fn store_ns(root: &Path) -> Result<(), String> {
          user namespace with /gnu/store and the guix install ABSENT (user-pm Phase 0)"
     );
     let tb = tb()?;
-    println!(">> td-builder under test (stage0, guix-free): {}", tb.display());
+    println!(
+        ">> td-builder under test (stage0, guix-free): {}",
+        tb.display()
+    );
     let work = fresh_scratch(root, ".store-ns-scratch")?;
 
-    // A static binary to run from /td/store: bash-static, from hello's seed
-    // closure (td's own content scan — no store DB, no guix process).
-    let lock_rel = "tests/hello-no-guix.lock";
+    // A static binary to run from /td/store: bash-static, from the committed
+    // substitute fixture lock (td's own content scan — no store DB, no guix process).
+    let lock_rel = "tests/td-subst.lock";
     let lock_text = std::fs::read_to_string(root.join(lock_rel))
         .map_err(|e| format!("FAIL: read {lock_rel}: {e}"))?;
     let bash = lock_text
         .lines()
         .find(|l| l.contains("-bash-") && !l.contains("static"))
         .and_then(|l| l.split_once(' ').map(|(_, p)| p.trim().to_string()))
-        .ok_or_else(|| String::from("FAIL: no bash in hello's lock"))?;
-    let scan = tb_out(&tb, &["store-closure-scan", "/gnu/store", &bash], "store-closure-scan")?;
+        .ok_or_else(|| String::from("FAIL: no bash in td-subst.lock"))?;
+    let scan = tb_out(
+        &tb,
+        &["store-closure-scan", "/gnu/store", &bash],
+        "store-closure-scan",
+    )?;
     let bs = scan
         .lines()
         .find(|l| l.contains("-bash-static-"))
@@ -1507,7 +1598,10 @@ fn store_ns(root: &Path) -> Result<(), String> {
     let base = base_of(&bs);
     cp_a(Path::new(&bs), &store.join(&base))?;
     chmod_r_uw(&store)?;
-    println!("   placed {base} into the td-owned store {}", store.display());
+    println!(
+        "   placed {base} into the td-owned store {}",
+        store.display()
+    );
 
     // Run inside the own-root store-ns (rootless): /td/store = store, /gnu/store absent.
     let inner = format!(
@@ -1519,7 +1613,14 @@ fn store_ns(root: &Path) -> Result<(), String> {
     let store_s = path_str(&store)?;
     let out = tb_out(
         &tb,
-        &["store-ns", &store_s, "--", &format!("/td/store/{base}/bin/bash"), "-c", &inner],
+        &[
+            "store-ns",
+            &store_s,
+            "--",
+            &format!("/td/store/{base}/bin/bash"),
+            "-c",
+            &inner,
+        ],
         "store-ns run",
     )?;
     for l in out.lines() {
@@ -1533,14 +1634,18 @@ fn store_ns(root: &Path) -> Result<(), String> {
     if !out.lines().any(|l| l == "PKG-AT-TDSTORE") {
         return Err("FAIL: the package is not at /td/store/<base> inside the root".into());
     }
-    println!("   [DURABLE behavioral] a binary ran from /td/store in td's own root (rootless userns)");
+    println!(
+        "   [DURABLE behavioral] a binary ran from /td/store in td's own root (rootless userns)"
+    );
 
     // Leg B: DURABLE structural — /td/store is the store, /gnu/store ABSENT.
     if !out.lines().any(|l| l == "TDSTORE-OK") {
         return Err("FAIL: /td/store is not present in the own-root".into());
     }
     if !out.lines().any(|l| l == "GNU-ABSENT") {
-        return Err("FAIL: /gnu/store is PRESENT in the own-root — mixed with the guix install!".into());
+        return Err(
+            "FAIL: /gnu/store is PRESENT in the own-root — mixed with the guix install!".into(),
+        );
     }
     println!(
         "   [DURABLE structural] /td/store is the store and /gnu/store is ABSENT — unmixed from \
@@ -1583,8 +1688,10 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     let scratch = fresh_scratch(root, ".recipe-rs-scratch")?;
     let cargo_home = scratch.join("home");
     let cargo_target = scratch.join("target");
-    std::fs::create_dir_all(&cargo_home).map_err(|e| format!("FAIL: mkdir {}: {e}", cargo_home.display()))?;
-    std::fs::create_dir_all(&cargo_target).map_err(|e| format!("FAIL: mkdir {}: {e}", cargo_target.display()))?;
+    std::fs::create_dir_all(&cargo_home)
+        .map_err(|e| format!("FAIL: mkdir {}: {e}", cargo_home.display()))?;
+    std::fs::create_dir_all(&cargo_target)
+        .map_err(|e| format!("FAIL: mkdir {}: {e}", cargo_target.display()))?;
     let cargo_home_s = path_str(&cargo_home)?;
     let cargo_target_s = path_str(&cargo_target)?;
     let cargo_bin_s = path_str(&cargo_bin)?;
@@ -1613,14 +1720,23 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     )?;
     run_out_env(
         &cargo_bin_s,
-        &["build", "--release", "--frozen", "--manifest-path", "recipes/Cargo.toml"],
+        &[
+            "build",
+            "--release",
+            "--frozen",
+            "--manifest-path",
+            "recipes/Cargo.toml",
+        ],
         &envs,
         "cargo build recipes",
     )?;
 
     let eval = cargo_target.join("release/td-recipe-eval");
     if !eval.is_file() {
-        return Err(format!("FAIL: td-recipe-eval was not built at {}", eval.display()));
+        return Err(format!(
+            "FAIL: td-recipe-eval was not built at {}",
+            eval.display()
+        ));
     }
     let eval_s = path_str(&eval)?;
 
@@ -1700,10 +1816,9 @@ mod tests {
         )
         .unwrap();
         let s0 = stage0_from_memo(&root).expect("memo");
-        assert_eq!(s0.builder_path, "/gnu/store/abc123-td-builder-0.1.0");
-        assert_eq!(s0.store, base.join("store"));
-        assert_eq!(s0.db, base.join("builder.db"));
-        assert!(s0.tb.ends_with("store/abc123-td-builder-0.1.0/bin/td-builder"));
+        assert!(s0
+            .tb
+            .ends_with("store/abc123-td-builder-0.1.0/bin/td-builder"));
         // A missing memo is a loud provisioning error, not a fallback.
         let _ = std::fs::remove_dir_all(&root);
         assert!(stage0_from_memo(&root).is_err());

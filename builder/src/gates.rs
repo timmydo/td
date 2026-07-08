@@ -1831,14 +1831,14 @@ mod tests {
         // of the 25 in the Heavy pool) — their `build_*` ladders were 80-95% duplicate
         // of `tests/bootstrap-chain.sh`'s `bootstrap_modern_toolchain()`, which already
         // builds the whole 20-rung toolchain via one recipe-graph call, and
-        // `recipe-checks-daily`'s store-native hello/sed checks already independently
-        // prove the toolchain works. Floors are set to the EXACT post-retirement counts
+        // the remaining recipe-owned daily checks and chain gates are the surviving
+        // coverage. Floors are set to the EXACT post-retirement counts
         // (zero headroom, matching the pre-#397 convention: 19/32/51 were exact matches
         // too) — these guard against ACCIDENTAL loss, so slack beyond the deliberate
         // retirement just lets a future PR silently drop more gates unnoticed.
-        assert!(heavy.len() >= 18, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
-        assert!(daily.len() >= 9, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 27, "the full check lost gates");
+        assert!(heavy.len() >= 17, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
+        assert!(daily.len() >= 6, "daily pool shrank: {}", daily.len());
+        assert!(heavy.len() + daily.len() >= 23, "the full check lost gates");
         for g in ["cargo-test", "store-verify"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
@@ -1852,8 +1852,8 @@ mod tests {
         // recipe-eval prelude only.)
         // Typed artifact inputs (#353): a KEEP store-native gate declares its lock inputs
         // instead of grepping locks in shell.
-        let sp = set.gates.iter().find(|g| g.name == "store-persist").unwrap();
-        assert!(sp.inputs.iter().any(|i| i.name == "bash-static"), "store-persist lost its declared inputs");
+        let snp = set.gates.iter().find(|g| g.name == "store-native-profile").unwrap();
+        assert!(snp.inputs.iter().any(|i| i.name == "bash-static"), "store-native-profile lost its declared inputs");
         // The derived graph holds: the synthetic build-recipes prelude node is present.
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(br.extra_env.iter().any(|(k, _)| k == "TD_BUILD_SPECS"));
@@ -2488,7 +2488,7 @@ mod tests {
         );
         // The default is Shared — the #317 flip: warm machine-wide state unless a gate
         // declares that cold IS its feature.
-        for g in ["store-persist", "store-verify"] {
+        for g in ["store-verify"] {
             let gate = set.gates.iter().find(|x| x.name == g).unwrap();
             assert_eq!(gate.store, StoreMode::Shared, "{g} must default Shared");
         }

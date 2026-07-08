@@ -2,7 +2,7 @@
 # tests/bootstrap-x86_64-toolchain-store-native.sh — source-bootstrap: CROSS the i686 full-source
 # bootstrap UP to a native x86_64 toolchain at /td/store (x86_64-toolchain track). The whole existing
 # /td/store toolchain is i686/32-bit (gcc 14.3.0 + binutils 2.44 + glibc 2.41 all ship ld-linux.so.2),
-# but the upstream Rust pin is x86_64 — so the rust-store-native (#196) runtime leg is blocked on
+# but the upstream Rust pin is x86_64 — so Rust runtime coverage is blocked on
 # ARCHITECTURE. The i686-first shape was deliberate from the mes/tcc-era bootstrap bricks (guix's
 # mes-boot: "Built i686 (32-bit) … gcc later cross-builds to 64-bit"; the x86_64 MesCC self-host
 # path is immature). This gate takes that cross-build step.

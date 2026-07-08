@@ -133,17 +133,15 @@ mod tests {
 
     #[test]
     fn tier_filter_counts_recipe_check_bodies() {
-        // sed + hello build ONLY on the /td/store store-native ladder now (their
-        // guix-seeded pr/gnu-version checks retired with the corpus): one daily check each.
-        let sed = catalog::lookup("sed").unwrap();
-        assert_eq!(recipe_checks(&sed, Some(td_recipe::types::CheckTier::Pr)).len(), 0);
-        assert_eq!(recipe_checks(&sed, Some(td_recipe::types::CheckTier::Daily)).len(), 1);
-        assert_eq!(recipe_checks(&sed, None).len(), 1);
+        let make = catalog::lookup("make-test").unwrap();
+        assert_eq!(recipe_checks(&make, Some(td_recipe::types::CheckTier::Pr)).len(), 0);
+        assert_eq!(recipe_checks(&make, Some(td_recipe::types::CheckTier::Daily)).len(), 1);
+        assert_eq!(recipe_checks(&make, None).len(), 1);
 
-        let hello = catalog::lookup("hello").unwrap();
-        assert_eq!(recipe_checks(&hello, Some(td_recipe::types::CheckTier::Pr)).len(), 0);
-        assert_eq!(recipe_checks(&hello, Some(td_recipe::types::CheckTier::Daily)).len(), 1);
-        assert_eq!(recipe_checks(&hello, None).len(), 1);
+        let busybox = catalog::lookup("busybox-test").unwrap();
+        assert_eq!(recipe_checks(&busybox, Some(td_recipe::types::CheckTier::Pr)).len(), 0);
+        assert_eq!(recipe_checks(&busybox, Some(td_recipe::types::CheckTier::Daily)).len(), 1);
+        assert_eq!(recipe_checks(&busybox, None).len(), 1);
     }
 
     #[test]
@@ -165,12 +163,12 @@ mod tests {
     // discriminates a mismatch, not a vacuous always-equal check.
     #[test]
     fn a_mismatched_recipe_is_discriminated() {
-        let hello = catalog::lookup("hello").expect("hello recipe must exist (negative-control fixture)");
-        let sed = catalog::lookup("sed").expect("sed recipe must exist (negative-control fixture)");
+        let make = catalog::lookup("make-test").expect("make-test recipe must exist (negative-control fixture)");
+        let busybox = catalog::lookup("busybox-test").expect("busybox-test recipe must exist (negative-control fixture)");
         assert_ne!(
-            hello.to_json().to_canonical(),
-            sed.to_json().to_canonical(),
-            "hello and sed canon-equal — a JSON comparison would not discriminate a mismatch"
+            make.to_json().to_canonical(),
+            busybox.to_json().to_canonical(),
+            "make-test and busybox-test canon-equal — a JSON comparison would not discriminate a mismatch"
         );
     }
 }

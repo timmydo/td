@@ -1,7 +1,0 @@
-# seed/sources/hello-2.12.2.lock — GNU hello 2.12.2, the EXACT version the corpus builds the guix way
-# (hello-no-guix.lock's hello-source). Brick 8 step 1: the /td/store MODERN toolchain (gcc 14.3.0 + binutils
-# 2.44 + glibc 2.41) builds this real corpus package from source, replacing guix's gcc-toolchain-15.2.0.
-# Pristine upstream .tar.gz from ftp.gnu.org. td-fetched.
-url https://ftp.gnu.org/gnu/hello/hello-2.12.2.tar.gz
-sha256 5a9a996dc292cc24dcf411cee87e92f6aae5b8d13bd9c6819b4c7a9dce0818ab
-file hello-2.12.2.tar.gz

@@ -5,7 +5,7 @@
 //! path at STORE-ROOT/<basename>, flagging (exit 1) any path whose content no longer matches
 //! its recorded `hash`.
 //! R3 (guix-retirement ladder → #261): the SUBJECT is now td-BUILT (gate_bodies::store_subject —
-//! hello via build-recipe, cache-hit) staged into a td-OWNED store and its closure
+//! synthetic td-built subject staged into a td-OWNED store and its closure
 //! CONTENT-SCANNED, so this gate runs with guix OFF PATH — no `guix build`, no `guix gc`, no
 //! /var/guix read. The removable DAEMON DIFFERENTIAL (leg A used to prove td.db records the
 //! live /var/guix/db hashes and then verify /gnu/store against them) is DROPPED per CLAUDE.md

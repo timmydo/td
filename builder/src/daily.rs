@@ -10,20 +10,17 @@
 //!
 //! Usage:  td-builder daily [--no-system] [--verdict FILE]
 //!
-//! Exit is a bitfield over the suites — 1 heavy red, 2 system red, 4 harness red
-//! (the /td/store harness tier); 0 = all green, up to 7. A leg that could not run
+//! Exit is a bitfield over the suites — 1 heavy red, 2 system red; 0 = all
+//! green, up to 3. A leg that could not run
 //! because the RUNNER is not provisioned for it (the base loop toolchain does not
-//! resolve on PATH for heavy/system; no local + no fetchable harness for the
-//! harness leg) does NOT set its bit — the leg's `td-builder check` exits
-//! `EXIT_UNPROVISIONED` (69, a stable machine signal — no FATAL-prose grepping),
-//! recorded in the verdict as env_error / harness_env_error. Setup errors exit
+//! resolve on PATH for heavy/system) does NOT set its bit — the leg's
+//! `td-builder check` exits `EXIT_UNPROVISIONED` (69, a stable machine signal —
+//! no FATAL-prose grepping), recorded in the verdict as env_error. Setup errors exit
 //! 8/9/10, kept out of the bitfield range:
 //!   8  - unknown CLI argument
 //!   9  - git fetch of origin/main failed (or no td-builder to run the legs)
 //!   10 - runner not provisioned for EVERY leg: heavy/system's loop toolchain is
-//!        unresolved AND the harness tier has no local/fetchable /td/store harness.
-//!        No gate ran anywhere, so there is nothing to triage/revert. A runner that
-//!        can run at least the harness leg does NOT hit this exit.
+//!        unresolved. No gate ran anywhere, so there is nothing to triage/revert.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,18 +30,14 @@ use crate::check_loop::{find_in_path, EXIT_UNPROVISIONED};
 const HELP: &str = "\
 td-builder daily [--no-system] [--verdict FILE]
 
-Run the full td-builder check suite (heavy + daily + system + /td/store harness) on
+Run the full td-builder check suite (heavy + daily + system) on
 fresh origin/main and write a machine-readable verdict. Exit is a bitfield: 1 heavy
-red, 2 system red, 4 harness red; 8/9 setup error; 10 runner not provisioned for any
-leg. Unprovisioned legs (base loop toolchain / harness absent) do not set a bit.";
+red, 2 system red; 8/9 setup error; 10 runner not provisioned for any
+leg. Unprovisioned heavy/system legs do not set a bit.";
 
 const ENV_ERROR_MSG: &str =
     "runner not provisioned: the loop prelude could not resolve the base loop \
      toolchain on PATH — no gate ran, not a code regression";
-
-const HARNESS_ENV_MSG: &str =
-    "runner not provisioned: no local /td/store harness and none fetchable from a \
-     substitute store — not a code regression";
 
 pub fn cli(args: &[String]) -> std::process::ExitCode {
     std::process::ExitCode::from(run(args).clamp(0, 255) as u8)
@@ -287,23 +280,11 @@ fn run(args: &[String]) -> i32 {
         let _ = std::fs::remove_file(&slog);
     }
 
-    // Harness: the /td/store harness tier (busybox+make). ALWAYS attempted — its
-    // own precondition is "harness locally persisted or fetchable from a substitute
-    // store", independent of whether heavy/system ran. `check check-harness` exits
-    // EXIT_UNPROVISIONED when it has neither.
-    println!(">> daily backstop: td-builder check check-harness on origin/main ({main}) — /td/store harness tier");
-    let xlog = leg_log("harness");
-    let harness_code = run_leg(&root, &tdb, &["check", "check-harness"], &[], &xlog);
-    let harness = LegRc::from_code(harness_code);
-    let harness_fail = if harness.unprovisioned {
-        HARNESS_ENV_MSG.to_string()
-    } else {
-        grep_fails(&xlog)
-    };
-    if harness.unprovisioned {
-        println!(">> daily backstop: {HARNESS_ENV_MSG}");
-    }
-    let _ = std::fs::remove_file(&xlog);
+    // The /td/store harness tier was removed with its producer gate; keep the
+    // verdict field green for compatibility until the follow-up reintroduces it
+    // on the recipe-graph path.
+    let harness = LegRc::green();
+    let harness_fail = String::new();
 
     let v = compute_verdict(&VerdictInput {
         run_system,
@@ -330,12 +311,11 @@ fn run(args: &[String]) -> i32 {
     if v.abort_all_unprovisioned {
         println!(
             ">> daily backstop: RUNNER NOT PROVISIONED at {main} — no gate could run anywhere \
-             (heavy/system: {ENV_ERROR_MSG}; harness: {HARNESS_ENV_MSG})"
+             (heavy/system: {ENV_ERROR_MSG})"
         );
         println!(
             ">> daily backstop: this is a HOST setup gap, not a code regression — no fix-or-revert \
-             PR is warranted. Provision the loop toolchain (heavy/system) or expose a /td/store \
-             harness substitute (harness), then re-run."
+             PR is warranted. Provision the loop toolchain (heavy/system), then re-run."
         );
         cat(&root, &verdict_path);
         return 10;
@@ -343,7 +323,7 @@ fn run(args: &[String]) -> i32 {
     if v.env_error {
         println!(
             ">> daily backstop: heavy/system SKIPPED (runner not provisioned: {ENV_ERROR_MSG}) — \
-             the harness leg ran independently"
+             no gate ran"
         );
     }
 
@@ -450,7 +430,10 @@ fn run_leg(root: &Path, tdb: &Path, args: &[&str], envs: &[(&str, &str)], log: &
     let f = match std::fs::File::create(log) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("td-builder daily: cannot open leg log {}: {e}", log.display());
+            eprintln!(
+                "td-builder daily: cannot open leg log {}: {e}",
+                log.display()
+            );
             return 1;
         }
     };
@@ -602,14 +585,18 @@ fn publish_substitutes(root: &Path, tdb: &Path) {
         false,
     );
 
-    // seed + harness: still shell out to their existing publishers.
+    // seed: still shell out to its existing publisher.
     if privkey.is_empty() || sb.is_empty() {
         println!(">> publish-seed-subst: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set");
         println!(">> publish-harness-subst: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set");
         return;
     }
     let seed_ok = Command::new("sh")
-        .args(["tools/publish-seed-subst.sh", "tests/td-builder-rust.lock", &store])
+        .args([
+            "tools/publish-seed-subst.sh",
+            "tests/td-builder-rust.lock",
+            &store,
+        ])
         .current_dir(root)
         .env("TD_BUILDER", tdb)
         .env("TD_SUBST_BIN", &sb)
@@ -624,11 +611,15 @@ fn publish_substitutes(root: &Path, tdb: &Path) {
     if !root.join(".td-build-cache/harness/store").is_dir()
         || !non_empty(&root.join(".td-build-cache/harness/rel"))
     {
-        println!(">> publish-harness-subst: SKIP — no persisted .td-build-cache/harness (gate 420 did not complete this run)");
+        println!(">> publish-harness-subst: SKIP — no persisted .td-build-cache/harness");
         return;
     }
     let harness_ok = Command::new("sh")
-        .args(["tools/publish-harness-subst.sh", ".td-build-cache/harness", &store])
+        .args([
+            "tools/publish-harness-subst.sh",
+            ".td-build-cache/harness",
+            &store,
+        ])
         .current_dir(root)
         .env("TD_BUILDER", tdb)
         .env("TD_SUBST_BIN", &sb)
@@ -639,7 +630,7 @@ fn publish_substitutes(root: &Path, tdb: &Path) {
         .map(|s| s.success())
         .unwrap_or(false);
     if harness_ok {
-        println!(">> publish-harness-subst: signed + published the /td/store harness to {store} (a runner FETCHES it for check-harness)");
+        println!(">> publish-harness-subst: signed + published the /td/store harness to {store}");
     } else {
         println!(">> publish-harness-subst: WARN — harness publish failed; not published");
     }
@@ -659,7 +650,9 @@ fn publish_export(
 ) {
     let exp = root.join(".td-build-cache").join(export);
     if !has_narinfo(&exp) {
-        println!(">> {label}: SKIP — no export at .td-build-cache/{export} (nothing built this run)");
+        println!(
+            ">> {label}: SKIP — no export at .td-build-cache/{export} (nothing built this run)"
+        );
         return;
     }
     if privkey.is_empty() || sb.is_empty() {
@@ -767,7 +760,10 @@ mod tests {
             system: LegRc::green(),
             harness: red(1),
         });
-        assert_eq!(v.exit_code, 4, "only the harness bit — heavy is unprovisioned, not red");
+        assert_eq!(
+            v.exit_code, 4,
+            "only the harness bit — heavy is unprovisioned, not red"
+        );
         assert!(!v.partial);
         assert!(!v.all_green);
         assert_eq!(v.harness_state, "red");

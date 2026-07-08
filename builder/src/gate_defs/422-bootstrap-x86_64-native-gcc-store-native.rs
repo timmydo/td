@@ -39,7 +39,7 @@ pub fn gate() -> GateDef {
             ArtifactInput {
                 name: "bash-static",
                 kind: InputKind::ClosureMember {
-                    lock: "tests/hello-no-guix.lock",
+                    lock: "tests/td-subst.lock",
                     root_stem: "bash",
                     member_stem: "bash-static",
                 },

@@ -5,7 +5,7 @@
 //! toolchain builds (#192/#197) joins this same mechanism.
 //! Heavy: builds the guix-free stage0 td-builder + runs a rootless userns (like store-ns 386).
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -14,7 +14,14 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        inputs: &[ArtifactInput {
+            name: "bash-static",
+            kind: InputKind::ClosureMember {
+                lock: "tests/td-subst.lock",
+                root_stem: "bash",
+                member_stem: "bash-static",
+            },
+        }],
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"

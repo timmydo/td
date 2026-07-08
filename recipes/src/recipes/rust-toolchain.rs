@@ -1,5 +1,5 @@
 use crate::ladder::base_inputs;
-use crate::types::{Recipe, RecipeCheck, Source};
+use crate::types::{Recipe, Source};
 
 // rust-toolchain — the /td/store Rust toolchain, as a first-class RECIPE fully in the
 // recipe-graph model (#410, building on #380).
@@ -29,14 +29,8 @@ use crate::types::{Recipe, RecipeCheck, Source};
 // is the raw tarball. Same pinned source + same inputs => byte-identical tree (the
 // `td-builder check` double-build oracle proves it); a missing input reds at drv-assembly.
 //
-// Validation is a recipe-owned RecipeCheck::daily (below): `build-plan --auto rust-toolchain`
-// builds the tree, rustc RUNS from /td/store in an own-root (/gnu/store absent), and a missing
-// declared input reds the recipe (byte-for-byte reproducibility is the daily force-cold backstop,
-// per the mesboot-rung precedent — see tests/rust-toolchain-recipe-check.sh). The
-// rustc-COMPILES-a-real-program proof + the `td shell` userland cutover (which need the NATIVE
-// x86_64 gcc, a deliberately non-reproducible subcommand, not a recipe) lived on the
-// rust-userland-x86_64-store-native / td-shell-userland gates; those were DISABLED with this
-// cutover (maintainer-directed) pending re-coverage on the recipe-graph model (follow-up issue).
+// The old recipe-owned daily check was removed with the legacy corpus cleanup. The
+// follow-up should re-cover rustc runtime/compile behavior on the recipe-graph model.
 pub fn recipe() -> Recipe {
     Recipe::rust_toolchain("rust-toolchain", "1.96.0")
         .source(Source::one(
@@ -51,10 +45,4 @@ pub fn recipe() -> Recipe {
         // synthesized lock now only carries what the recipe itself declares, so they must
         // be genuine inputs here (matching every other mesboot-family rung's base_inputs()).
         .inputs_owned(base_inputs(&[]))
-        .checks(vec![RecipeCheck::daily(
-            r#"
-echo ">> recipe-check rust-toolchain: build-plan --auto builds the /td/store rust toolchain (glibc-x86-64 + gcc-x86-64-stage2 + zlib-x86-64); rustc runs from /td/store in an own-root (/gnu/store absent); byte-reproducible; verified-red on a missing declared input"
-sh tests/rust-toolchain-recipe-check.sh
-"#,
-        )])
 }

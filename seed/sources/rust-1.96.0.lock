@@ -1,8 +1,8 @@
 # seed/sources/rust-1.96.0.lock — the UPSTREAM Rust 1.96.0 release tarball (rustc + cargo +
-# std for x86_64-unknown-linux-gnu), the GUIX-FREE seed for td's /td/store Rust toolchain
-# (rust-store-native track). These bytes come from the Rust project's OWN CDN
+# std for x86_64-unknown-linux-gnu), the GUIX-FREE seed for td's /td/store Rust toolchain.
+# These bytes come from the Rust project's OWN CDN
 # (static.rust-lang.org), NOT from a guix build — verified: the rustc/cargo/std ELFs carry
-# ZERO /gnu/store strings and no guix provenance. The rust-store-native gate RELINKS this
+# ZERO /gnu/store strings and no guix provenance. The recipe transform relinks this
 # binary tarball to /td/store (td's own ELF PT_INTERP rewriter, no patchelf), eliminating
 # guix at the source rather than relabeling guix bytes. The sha256 content-address IS the
 # oracle (no guix origin / no differential).
