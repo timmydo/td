@@ -46,6 +46,7 @@ mod sys;
 mod toolchain_x86_64;
 
 use std::ffi::CString;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -3164,9 +3165,106 @@ fn host_sandbox_base_binds(store_from: Option<&str>, store_at: Option<&str>) -> 
     }
 }
 
+fn run_mount_applet(args: &[String]) -> Result<i32, String> {
+    if args.get(1).map(String::as_str) != Some("--bind") || args.len() != 4 {
+        return Err("usage: mount --bind SRC DEST".to_string());
+    }
+    let src = args.get(2).ok_or_else(|| "missing bind source".to_string())?;
+    let dest = args.get(3).ok_or_else(|| "missing bind target".to_string())?;
+    if !Path::new(dest).exists() && std::env::var("TD_HOST_SANDBOX").as_deref() == Ok("1") {
+        let src_md = std::fs::metadata(src).map_err(|e| format!("bind source `{src}`: {e}"))?;
+        if src_md.is_dir() {
+            std::fs::create_dir_all(dest)
+                .map_err(|e| format!("create sandbox bind target dir `{dest}`: {e}"))?;
+        } else {
+            if let Some(parent) = Path::new(dest).parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create sandbox bind target parent `{}`: {e}", parent.display()))?;
+            }
+            std::fs::File::create(dest)
+                .map_err(|e| format!("create sandbox bind target file `{dest}`: {e}"))?;
+        }
+    }
+    let src_c = CString::new(src.as_str()).map_err(|e| format!("bind source `{src}`: {e}"))?;
+    let dest_c = CString::new(dest.as_str()).map_err(|e| format!("bind target `{dest}`: {e}"))?;
+    sys::mount(Some(&src_c), &dest_c, None, sys::MS_BIND, None)
+        .map_err(|e| format!("bind-mount `{src}` on `{dest}`: {e}"))?;
+    Ok(0)
+}
+
+fn take_flock(fd: i32, nonblock: bool) -> Result<bool, String> {
+    if nonblock {
+        sys::flock_try_exclusive(fd).map_err(|e| format!("flock fd {fd}: {e}"))
+    } else {
+        sys::flock_exclusive(fd).map_err(|e| format!("flock fd {fd}: {e}"))?;
+        Ok(true)
+    }
+}
+
+fn run_flock_applet(args: &[String]) -> Result<i32, String> {
+    let mut i = 1usize;
+    let nonblock = if args.get(i).map(String::as_str) == Some("-n") {
+        i += 1;
+        true
+    } else {
+        false
+    };
+    let target = args
+        .get(i)
+        .ok_or_else(|| "usage: flock [-n] FD | flock [-n] PATH COMMAND [ARG...]".to_string())?;
+    i += 1;
+
+    if let Ok(fd) = target.parse::<i32>() {
+        if i != args.len() {
+            return Err("usage: flock [-n] FD".to_string());
+        }
+        return Ok(if take_flock(fd, nonblock)? { 0 } else { 1 });
+    }
+
+    let cmd = args
+        .get(i)
+        .ok_or_else(|| "usage: flock [-n] PATH COMMAND [ARG...]".to_string())?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(target)
+        .map_err(|e| format!("open lock `{target}`: {e}"))?;
+    if !take_flock(lock.as_raw_fd(), nonblock)? {
+        return Ok(1);
+    }
+    let cmd_args = args
+        .get(i + 1..)
+        .ok_or_else(|| "usage: flock [-n] PATH COMMAND [ARG...]".to_string())?;
+    let status = Command::new(cmd)
+        .args(cmd_args)
+        .status()
+        .map_err(|e| format!("run `{cmd}` under flock `{target}`: {e}"))?;
+    Ok(status.code().map_or(1, |code| code))
+}
+
+fn applet_exit(name: &str, result: Result<i32, String>) -> ExitCode {
+    match result {
+        Ok(code) => ExitCode::from(code as u8),
+        Err(e) => {
+            eprintln!("td-builder {name} applet: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    let applet = Path::new(args.first().map_or("", String::as_str))
+        .file_name()
+        .and_then(|n| n.to_str());
+    match applet {
+        Some("mount") => return applet_exit("mount", run_mount_applet(&args)),
+        Some("flock") => return applet_exit("flock", run_flock_applet(&args)),
+        _ => {}
+    }
     // Builds run nicer than the loop's other work so a shared desktop stays smooth.
     // Scope to the build-executing subcommands; their spawned compilers inherit it.
     if matches!(args.get(1).map(String::as_str), Some("build" | "realize" | "autotools-build")) {

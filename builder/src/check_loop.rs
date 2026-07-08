@@ -118,10 +118,13 @@ fn guard_netns_probe() -> Result<(), String> {
 /// Provision the guix-free stage0 td-builder (the loop-container provider,
 /// workstream E #294) via the existing shell machinery and return $TB.
 fn provision_stage0(root: &Path) -> Result<String, String> {
+    let applets = current_binary_native_applet_path(root)?;
+    let path = std::env::var("PATH").unwrap_or_default();
     let out = run_capture(
         Command::new("sh")
             .arg("-c")
             .arg(". tests/cache-lib.sh && provision_stage0 1>&2 && printf '%s' \"$TB\"")
+            .env("PATH", format!("{applets}:{path}"))
             .current_dir(root),
     )
     .map_err(|e| {
@@ -132,6 +135,15 @@ fn provision_stage0(root: &Path) -> Result<String, String> {
         return Err(fatal("stage0 provisioning returned no usable $TB"));
     }
     Ok(tb)
+}
+
+fn current_binary_native_applet_path(root: &Path) -> Result<String, String> {
+    let current = std::env::current_exe()
+        .map_err(|e| fatal(&format!("cannot resolve current td-builder executable: {e}")))?
+        .display()
+        .to_string();
+    native_applet_path(root, &current)
+        .map_err(|e| fatal(&format!("could not provision stage0 native applets ({e})")))
 }
 
 /// The store prefix the loop sandbox binds over its fresh-tmpfs root: the loop
@@ -354,6 +366,29 @@ fn provision_loop_path(root: &Path) -> Result<String, CheckError> {
     let declared = provision_declared_loop_tools(root)?;
     let host = provision_toolchain(root)?;
     Ok(format!("{declared}:{host}"))
+}
+
+fn native_applet_path(root: &Path, provider: &str) -> Result<String, String> {
+    let bin = root
+        .join(".td-build-cache/loop-applets")
+        .join(std::process::id().to_string())
+        .join("bin");
+    std::fs::create_dir_all(&bin).map_err(|e| format!("mkdir {}: {e}", bin.display()))?;
+    for applet in ["mount", "flock"] {
+        let path = bin.join(applet);
+        let tmp = bin.join(format!(".{applet}.tmp.{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(provider, &tmp)
+            .map_err(|e| format!("symlink {} -> {provider}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+    }
+    Ok(bin.display().to_string())
+}
+
+fn loop_path_with_native_applets(root: &Path, tb: &str, toolchain: &str) -> Result<String, String> {
+    let applets = native_applet_path(root, tb)?;
+    Ok(format!("{applets}:{toolchain}"))
 }
 
 /// A timeout(1)-style duration: bare integer seconds or an integer with an
@@ -1012,10 +1047,10 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     let _ = std::fs::remove_file(&sock);
     let tdnice = std::env::var("TD_NICE").unwrap_or_else(|_| s("10"));
     let mut argv: Vec<String> = Vec::new();
-    if find_in_path("nice").is_some() {
-        argv.extend([s("nice"), s("-n"), tdnice]);
-        if find_in_path("ionice").is_some() {
-            argv.extend([s("ionice"), s("-c2"), s("-n7")]);
+    if let Some(nice) = find_in_path("nice") {
+        argv.extend([nice.display().to_string(), s("-n"), tdnice]);
+        if let Some(ionice) = find_in_path("ionice") {
+            argv.extend([ionice.display().to_string(), s("-c2"), s("-n7")]);
         }
     }
     argv.extend([
@@ -1058,9 +1093,12 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
 /// (nar-restore) and entering the harness sandbox need it, and it never invokes guix (the stage0
 /// warm path spawns none once placed).
 fn load_stage0_tb(root: &Path) -> Result<String, CheckError> {
+    let applets = current_binary_native_applet_path(root)?;
+    let path = std::env::var("PATH").unwrap_or_default();
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(". tests/cache-lib.sh && load_stage0 1>&2 && printf '%s' \"$TB\"")
+        .env("PATH", format!("{applets}:{path}"))
         .env("TD_STAGE0_BASE", root.join(".td-build-cache/stage0"))
         .current_dir(root);
     let out = run_capture(&mut cmd)
@@ -1255,6 +1293,8 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 
     let tb = provision_stage0(&root)?;
     let toolchain = provision_loop_path(&root)?;
+    let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain)
+        .map_err(|e| CheckError::Fatal(fatal(&format!("could not provision loop native applets ({e})"))))?;
 
     let mut child_envs: Vec<(String, String)> = vec![(s("PATH"), toolchain)];
     // The runner's knobs must cross the sandbox boundary (host-sandbox
@@ -1358,10 +1398,10 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // and daemon budget bound how MUCH runs, nice bounds its priority.
     let tdnice = std::env::var("TD_NICE").unwrap_or_else(|_| "10".to_string());
     let mut argv: Vec<String> = Vec::new();
-    if find_in_path("nice").is_some() {
-        argv.extend([s("nice"), s("-n"), tdnice]);
-        if find_in_path("ionice").is_some() {
-            argv.extend([s("ionice"), s("-c2"), s("-n7")]);
+    if let Some(nice) = find_in_path("nice") {
+        argv.extend([nice.display().to_string(), s("-n"), tdnice]);
+        if let Some(ionice) = find_in_path("ionice") {
+            argv.extend([ionice.display().to_string(), s("-c2"), s("-n7")]);
         }
     }
     let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
@@ -1459,6 +1499,8 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     // check-rung is a dev helper, not the loop: it does not branch on the
     // provisioned/regression distinction, so collapse CheckError back to a string.
     let toolchain = provision_loop_path(&root).map_err(|e| e.to_string())?;
+    let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain)
+        .map_err(|e| format!("check-rung: FATAL: could not provision loop native applets ({e})"))?;
     eprintln!(
         ">> check-rung: {harness} inside td-builder host-sandbox (cached chain reused; \
          sandbox env matches the gate)"

@@ -276,6 +276,11 @@ pub fn flock_try_exclusive(fd: i32) -> io::Result<bool> {
     Err(io::Error::from_raw_os_error(errno))
 }
 
+/// Take an exclusive flock on FD, blocking until it is available.
+pub fn flock_exclusive(fd: i32) -> io::Result<()> {
+    check(unsafe { syscall5(SYS_FLOCK, fd as usize, LOCK_EX, 0, 0, 0) })
+}
+
 /// fork(2): returns the child PID in the parent and 0 in the child. The
 /// host-sandbox forks AFTER unshare(CLONE_NEWUSER|CLONE_NEWPID) so the child is
 /// PID 1 of the fresh PID namespace (the namespace's first process), which then
