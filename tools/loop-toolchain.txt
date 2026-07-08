@@ -5,10 +5,11 @@
 # brings these, exactly as it brings the rust/cc toolchain the stage0 seed build
 # resolves via tools/provision-{rust,cc}.sh. Was a guix PACKAGE list fed to
 # `guix shell`; it is now a list of representative BINARIES (one per package —
-# resolving `env` gives the whole coreutils bin dir, `mount` the util-linux
-# dir, etc.). A tool absent from the host PATH warns (a misconfigured runner is
-# visible); the gate that needs it then fails loudly. Core tools (sh/bash/make/
-# env) are fatal-if-missing. sed/grep/findutils are not host-PATH tools here:
-# check_loop.rs resolves their pinned /gnu/store paths from tests/hello-no-guix.lock
-# and prepends those declared bin dirs to the sandbox PATH.
-make bash sh env tar gzip mount
+# resolving `env` gives the whole coreutils bin dir). A tool absent from the host
+# PATH warns (a misconfigured runner is visible); the gate that needs it then fails
+# loudly. Core tools (sh/bash/make/env) are fatal-if-missing. sed/grep/findutils
+# are not host-PATH tools here: check_loop.rs resolves their pinned /gnu/store
+# paths from tests/hello-no-guix.lock and prepends those declared bin dirs to the
+# sandbox PATH. Native loop applets for syscall-only host tools (`mount --bind`,
+# `flock`) are provided by td-builder itself and prepended by check_loop.rs.
+make bash sh env tar gzip

@@ -634,6 +634,7 @@ pub fn host_shell(
     command.env("PATH", path_env);
     command.env("HOME", home);
     command.env("TMPDIR", "/tmp");
+    command.env("TD_HOST_SANDBOX", "1");
     // Caller-preserved env (e.g. the TD_SUBST_*/TD_DAEMON_* knobs).
     for (k, v) in extra_env {
         command.env(k, v);
