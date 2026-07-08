@@ -392,6 +392,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
             "store-backend",
             "store-ns",
             "recipe-rs",
+            "recipe-checks-daily",
         ] {
             sel.add_target(g);
         }
@@ -425,8 +426,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("tests/recipe-checks.sh", p) {
-        sel.add_preflight("shell-syntax");
+    if p == "tests/recipe-checks.sh" {
         sel.add_target("recipe-checks-daily");
         return;
     }
@@ -1045,6 +1045,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("builder/src/gate_bodies.rs", "store-ns");
     assert_target!("builder/src/gate_bodies.rs", "check-engine");
     assert_target!("builder/src/gate_bodies.rs", "recipe-rs");
+    assert_target!("builder/src/gate_bodies.rs", "recipe-checks-daily");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
     // catalog edit runs recipe-rs and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");

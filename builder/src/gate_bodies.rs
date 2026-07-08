@@ -45,6 +45,7 @@ const NATIVE: &[&str] = &[
     "store-backend",
     "store-ns",
     "recipe-rs",
+    "recipe-checks-daily",
 ];
 
 /// `td-builder gate-body <name>` — run one native gate body. Self-moves into
@@ -73,6 +74,7 @@ pub fn cli(name: &str) -> ExitCode {
         "store-backend" => store_backend(&root),
         "store-ns" => store_ns(&root),
         "recipe-rs" => recipe_rs(&root),
+        "recipe-checks-daily" => recipe_checks_daily(&root),
         other => Err(format!("gate-body: unknown native gate `{other}`")),
     };
     match res {
@@ -1660,6 +1662,145 @@ fn store_ns(root: &Path) -> Result<(), String> {
          unmixed /td/store base the user package manager runs in (user-pm Phase 0)."
     );
     Ok(())
+}
+
+// --- recipe-checks-daily (formerly tests/recipe-checks.sh) ----------------------
+
+fn recipe_checks_daily(root: &Path) -> Result<(), String> {
+    let scope = "daily";
+    println!(
+        ">> recipe-checks: recipe-owned /td/store package checks (scope={scope}; goals=recipe-checks-daily)"
+    );
+
+    let eval = resolve_recipe_eval(root)?;
+    let eval_s = path_str(&eval)?;
+    let stage0_base = std::env::var("TD_STAGE0_BASE")
+        .unwrap_or_else(|_| root.join(".td-build-cache/stage0").display().to_string());
+    let envs: [(&str, &str); 3] = [
+        ("TD_RECIPE_EVAL", &eval_s),
+        ("TD_RECIPE_CHECK_SCOPE", scope),
+        ("TD_STAGE0_BASE", &stage0_base),
+    ];
+
+    let checks = run_out_env(
+        &eval_s,
+        &["check-list", scope],
+        &envs,
+        "td-recipe-eval check-list",
+    )?;
+    if checks.trim().is_empty() {
+        return Err(format!("FAIL: no recipe checks selected for scope={scope}"));
+    }
+
+    let mut ran = 0usize;
+    let mut failures = 0usize;
+    for spec in checks.split_whitespace() {
+        let count_text = run_out_env(
+            &eval_s,
+            &["check-count", spec, scope],
+            &envs,
+            &format!("td-recipe-eval check-count {spec}"),
+        )?;
+        let count = count_text.trim().parse::<usize>().map_err(|e| {
+            format!(
+                "FAIL: non-numeric check-count for {spec}: '{}': {e}",
+                count_text.trim()
+            )
+        })?;
+        if count == 0 {
+            return Err(format!(
+                "FAIL: check-list selected {spec} but check-count is 0"
+            ));
+        }
+        for index in 1..=count {
+            ran += 1;
+            println!("================ recipe-check {spec}#{index} ({scope}) ================");
+            if run_recipe_check(&eval, spec, scope, index, &eval_s, &stage0_base)? {
+                println!(
+                    "================ recipe-check {spec}#{index} ({scope}): PASS ================"
+                );
+            } else {
+                failures += 1;
+                eprintln!(
+                    "================ recipe-check {spec}#{index} ({scope}): FAIL ================"
+                );
+            }
+        }
+    }
+
+    if failures != 0 {
+        return Err(format!(
+            "FAIL: recipe-checks - {failures} of {ran} recipe-owned check(s) failed (scope={scope})"
+        ));
+    }
+    println!(
+        "PASS: recipe-checks - ran {ran} recipe-owned /td/store check(s) from the Rust recipe catalog (scope={scope}); package behavior/repro assertions live with the package recipes."
+    );
+    Ok(())
+}
+
+fn resolve_recipe_eval(root: &Path) -> Result<PathBuf, String> {
+    let path = match std::env::var_os("TD_RECIPE_EVAL") {
+        Some(value) => PathBuf::from(value),
+        None => {
+            let sentinel = root.join(".td-build-cache/recipe-eval/recipe-eval-path");
+            let text = std::fs::read_to_string(&sentinel).map_err(|_| {
+                format!(
+                    "FAIL: no td-recipe-eval sentinel ({}) - the build-recipes prelude must run first",
+                    sentinel.display()
+                )
+            })?;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "FAIL: empty td-recipe-eval sentinel {}",
+                    sentinel.display()
+                ));
+            }
+            PathBuf::from(trimmed)
+        }
+    };
+    if !is_executable_file(&path) {
+        return Err(format!(
+            "FAIL: td-recipe-eval not executable at {}",
+            path.display()
+        ));
+    }
+    let eval_s = path_str(&path)?;
+    if !eval_s.contains(".td-build-cache/") {
+        return Err(format!(
+            "FAIL: TD_RECIPE_EVAL is not td's own build ({eval_s})"
+        ));
+    }
+    Ok(path)
+}
+
+fn run_recipe_check(
+    eval: &Path,
+    spec: &str,
+    scope: &str,
+    index: usize,
+    eval_s: &str,
+    stage0_base: &str,
+) -> Result<bool, String> {
+    let index_s = index.to_string();
+    let status = Command::new(eval)
+        .arg("check-run")
+        .arg(spec)
+        .arg(scope)
+        .arg(&index_s)
+        .env("TD_RECIPE_EVAL", eval_s)
+        .env("TD_RECIPE_CHECK_SCOPE", scope)
+        .env("TD_RECIPE_CHECK_SPEC", spec)
+        .env("TD_RECIPE_CHECK_INDEX", &index_s)
+        .env("TD_STAGE0_BASE", stage0_base)
+        .status()
+        .map_err(|e| format!("FAIL: cannot spawn td-recipe-eval check-run {spec}: {e}"))?;
+    Ok(status.success())
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file() && file_mode(path).ok().is_some_and(|mode| mode & 0o111 != 0)
 }
 
 // --- recipe-rs (formerly tests/recipe-rs.sh) ----------------------------------

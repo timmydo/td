@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -5,91 +6,9 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use td_recipe::catalog;
+use td_recipe::{catalog, types::Recipe};
 
 const TD_STORE_DIR: &str = "/td/store";
-const TOOL_SPECS: &[(&str, &str)] = &[
-    ("bash", "bash"),
-    ("coreutils", "ls"),
-    ("sed", "sed"),
-    ("grep", "grep"),
-    ("gawk", "awk"),
-    ("tar", "tar"),
-    ("gzip", "gzip"),
-    ("bzip2", "bzip2"),
-    ("xz", "xz"),
-    ("findutils", "find"),
-    ("diffutils", "diff"),
-    ("flex", "flex"),
-    ("bison", "bison"),
-    ("m4", "m4"),
-    ("make", "make"),
-    ("python", "python3"),
-];
-
-const BASE_SOURCES: &[(&str, &str)] = &[
-    ("mes-0.27.1", "mes-source"),
-    ("nyacc-1.00.2", "nyacc"),
-    ("tcc-0.9.26", "tcc-source"),
-    ("make-3.80", "make-mesboot0-source"),
-    ("patch-2.5.9", "patch-mesboot-source"),
-    ("binutils-2.20.1a", "binutils-mesboot-source"),
-    ("gcc-core-2.95.3", "gcc-core-source"),
-    ("glibc-2.2.5", "glibc-mesboot0-source"),
-    ("make-3.82", "make-mesboot-source"),
-    ("gcc-core-4.6.4", "gcc-464-core"),
-    ("gcc-g++-4.6.4", "gcc-464-gpp"),
-    ("gmp-4.3.2", "gmp"),
-    ("mpfr-2.4.2", "mpfr"),
-    ("mpc-1.0.3", "mpc"),
-    ("gawk-3.1.8", "gawk-mesboot-source"),
-    ("glibc-mesboot-2.16.0", "glibc-216-source"),
-    ("gcc-4.9.4", "gcc-494-source"),
-    ("gcc-14.3.0", "gcc-14-source"),
-    ("gcc14-gmp-6.3.0", "gmp63"),
-    ("gcc14-mpfr-4.2.1", "mpfr421"),
-    ("gcc14-mpc-1.3.1", "mpc131"),
-    ("binutils-2.44", "binutils-244-source"),
-    ("glibc-2.41", "glibc-241-source"),
-];
-
-const PATCHES: &[&str] = &[
-    "binutils-boot-2.20.1a",
-    "gcc-boot-2.95.3",
-    "glibc-boot-2.2.5",
-    "glibc-bootstrap-system-2.2.5",
-    "gcc-boot-4.6.4",
-    "glibc-boot-2.16.0",
-    "glibc-bootstrap-system-2.16.0",
-];
-
-const CROSS_RECIPES: &[&str] = &[
-    "stage0",
-    "mes",
-    "tcc",
-    "make-mesboot0",
-    "patch-mesboot",
-    "binutils-mesboot0",
-    "gcc-core-mesboot0",
-    "mesboot-headers",
-    "glibc-mesboot0",
-    "gcc-mesboot0",
-    "binutils-mesboot1",
-    "make-mesboot",
-    "gcc-mesboot1",
-    "binutils-mesboot",
-    "gawk-mesboot",
-    "glibc-mesboot",
-    "gcc-mesboot",
-    "glibc-mesboot-shared",
-    "gcc-14",
-    "binutils-244",
-    "glibc-241",
-    "binutils-x86-64",
-    "gcc-x86-64-stage1",
-    "glibc-x86-64",
-    "gcc-x86-64-stage2",
-];
 
 pub fn cli(args: &[String]) -> Result<(), String> {
     let stem = args.first().ok_or_else(usage)?.as_str();
@@ -198,6 +117,29 @@ struct RecipeCheckRunner {
     scratch: PathBuf,
 }
 
+struct RecipeNode {
+    stem: String,
+    recipe: Recipe,
+}
+
+enum SeedInput {
+    Stage0 { key: String },
+    Source { key: String, lock_stem: String },
+    LinuxHeaders { key: String, arch: &'static str },
+    Patch { key: String, patch: String },
+}
+
+impl SeedInput {
+    fn key(&self) -> &str {
+        match self {
+            SeedInput::Stage0 { key }
+            | SeedInput::Source { key, .. }
+            | SeedInput::LinuxHeaders { key, .. }
+            | SeedInput::Patch { key, .. } => key,
+        }
+    }
+}
+
 impl RecipeCheckRunner {
     fn new(root: PathBuf) -> Result<Self, String> {
         let stage0_base = env::var_os("TD_STAGE0_BASE")
@@ -265,62 +207,27 @@ impl RecipeCheckRunner {
             .map_err(|e| format!("mkdir {}: {e}", self.recipes.display()))?;
         fs::create_dir_all(&self.scratch)
             .map_err(|e| format!("mkdir {}: {e}", self.scratch.display()))?;
-        self.write_tools_map()?;
         let pinsum = self.setup_pinsum()?;
         let setup_ok = self.lw.join("setup-ok");
         let warm = fs::read_to_string(&setup_ok)
             .map(|s| s == pinsum)
             .unwrap_or(false)
-            && self.lw.join("srcs.map").is_file();
+            && self.lw.join("srcs.map").is_file()
+            && self.lw.join("tools.map").is_file();
         if warm {
-            if !self.map_has("linux-headers-x86-64")? {
-                self.intern_linux_headers("linux-headers-x86-64", "x86_64")?;
-            }
-            self.stage_tdstore()?;
             return Ok(());
         }
 
         remove_path_if_exists(&self.store)?;
         remove_path_if_exists(&self.db)?;
         remove_path_if_exists(&self.lw.join("srcs.map"))?;
+        remove_path_if_exists(&self.lw.join("tools.map"))?;
         remove_path_if_exists(&setup_ok)?;
         fs::create_dir_all(&self.store)
             .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
         File::create(self.lw.join("srcs.map")).map_err(|e| format!("create srcs.map: {e}"))?;
-
-        for (stem, name) in BASE_SOURCES {
-            self.intern_source(name, stem)?;
-        }
-        self.intern_linux_headers("linux-headers", "i386")?;
-        self.intern_linux_headers("linux-headers-x86-64", "x86_64")?;
-        for patch in PATCHES {
-            let file = self
-                .root
-                .join("seed")
-                .join("patches")
-                .join(format!("{patch}.patch"));
-            if !file.is_file() {
-                return Err(format!("ladder: missing {}", file.display()));
-            }
-            let path = self.store_add_recursive(&format!("patch-{patch}"), &file)?;
-            self.append_src_map(&format!("patch-{patch}"), &path)?;
-        }
-        let stage0 = self.root.join("seed/stage0");
-        let path = self.store_add_recursive("stage0-source", &stage0)?;
-        self.append_src_map("stage0-source", &path)?;
+        File::create(self.lw.join("tools.map")).map_err(|e| format!("create tools.map: {e}"))?;
         fs::write(&setup_ok, pinsum).map_err(|e| format!("write {}: {e}", setup_ok.display()))?;
-        self.stage_tdstore()
-    }
-
-    fn write_tools_map(&self) -> Result<(), String> {
-        let path = self.lw.join("tools.map");
-        let mut file =
-            File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
-        for (name, probe) in TOOL_SPECS {
-            let root = self.tool_root(name, probe)?;
-            writeln!(file, "{name} {}", root.display())
-                .map_err(|e| format!("write {}: {e}", path.display()))?;
-        }
         Ok(())
     }
 
@@ -406,15 +313,6 @@ impl RecipeCheckRunner {
         self.append_src_map(intern_name, &path)
     }
 
-    fn intern_extra(&self, intern_name: &str, lock_stem: &str) -> Result<(), String> {
-        if self.map_has(intern_name)? {
-            return Ok(());
-        }
-        self.intern_source(intern_name, lock_stem)?;
-        let path = self.map_value(intern_name)?;
-        self.stage_store_path(&path)
-    }
-
     fn intern_linux_headers(&self, intern_name: &str, arch: &str) -> Result<(), String> {
         let lock = self.source_lock("linux-")?;
         let file_name = lock_value(&lock, "file")?;
@@ -430,6 +328,25 @@ impl RecipeCheckRunner {
             ));
         }
         let path = self.store_add_recursive(intern_name, &file)?;
+        self.append_src_map(intern_name, &path)
+    }
+
+    fn intern_patch(&self, intern_name: &str, patch: &str) -> Result<(), String> {
+        let file = self
+            .root
+            .join("seed")
+            .join("patches")
+            .join(format!("{patch}.patch"));
+        if !file.is_file() {
+            return Err(format!("ladder: missing {}", file.display()));
+        }
+        let path = self.store_add_recursive(intern_name, &file)?;
+        self.append_src_map(intern_name, &path)
+    }
+
+    fn intern_stage0_source(&self, intern_name: &str) -> Result<(), String> {
+        let stage0 = self.root.join("seed/stage0");
+        let path = self.store_add_recursive(intern_name, &stage0)?;
         self.append_src_map(intern_name, &path)
     }
 
@@ -460,6 +377,17 @@ impl RecipeCheckRunner {
             .open(&map)
             .map_err(|e| format!("open {}: {e}", map.display()))?;
         writeln!(file, "{name} {path}").map_err(|e| format!("write {}: {e}", map.display()))
+    }
+
+    fn append_tools_map(&self, name: &str, root: &Path) -> Result<(), String> {
+        let map = self.lw.join("tools.map");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&map)
+            .map_err(|e| format!("open {}: {e}", map.display()))?;
+        writeln!(file, "{name} {}", root.display())
+            .map_err(|e| format!("write {}: {e}", map.display()))
     }
 
     fn map_has(&self, name: &str) -> Result<bool, String> {
@@ -524,23 +452,218 @@ impl RecipeCheckRunner {
         })
     }
 
-    fn emit_recipes(&self, names: &[&str]) -> Result<(), String> {
+    fn emit_recipe_graph(&self, nodes: &[RecipeNode]) -> Result<(), String> {
         fs::create_dir_all(&self.recipes)
             .map_err(|e| format!("mkdir {}: {e}", self.recipes.display()))?;
-        for name in names {
-            let recipe = catalog::lookup(name)
-                .ok_or_else(|| format!("ladder: no td recipe for `{name}'"))?;
+        for node in nodes {
             fs::write(
-                self.recipes.join(format!("{name}.json")),
-                recipe.to_json().to_canonical(),
+                self.recipes.join(format!("{}.json", node.stem)),
+                node.recipe.to_json().to_canonical(),
             )
-            .map_err(|e| format!("ladder: emit {name}: {e}"))?;
+            .map_err(|e| format!("ladder: emit {}: {e}", node.stem))?;
         }
         Ok(())
     }
 
-    fn emit_cross(&self) -> Result<(), String> {
-        self.emit_recipes(CROSS_RECIPES)
+    fn prepare_recipe_target(&self, target: &str) -> Result<(), String> {
+        let graph = recipe_closure(&[target])?;
+        self.ensure_graph_inputs(&graph)?;
+        self.emit_recipe_graph(&graph)?;
+        self.stage_tdstore()
+    }
+
+    fn ensure_graph_inputs(&self, nodes: &[RecipeNode]) -> Result<(), String> {
+        let mut seen_seed_inputs = HashSet::new();
+        let mut seed_inputs = Vec::new();
+        let mut host_tools = Vec::new();
+
+        for node in nodes {
+            if let Some(key) = &node.recipe.source_input {
+                let input = self.seed_input_for_recipe_source(key, &node.recipe)?;
+                push_seed_input(&mut seed_inputs, &mut seen_seed_inputs, input);
+            }
+            if let Some(inputs) = &node.recipe.inputs {
+                for input in inputs {
+                    if catalog::lookup(input).is_some() {
+                        continue;
+                    }
+                    if let Some(seed_input) = self.seed_input_for_recipe_input(input)? {
+                        push_seed_input(&mut seed_inputs, &mut seen_seed_inputs, seed_input);
+                    } else {
+                        self.assert_host_tool(input)?;
+                        push_unique_string(&mut host_tools, input);
+                    }
+                }
+            }
+        }
+
+        for input in seed_inputs {
+            self.ensure_seed_input(&input)?;
+        }
+        for tool in host_tools {
+            self.ensure_host_tool(&tool)?;
+        }
+        Ok(())
+    }
+
+    fn seed_input_for_recipe_source(
+        &self,
+        key: &str,
+        recipe: &Recipe,
+    ) -> Result<SeedInput, String> {
+        match special_seed_input(key)? {
+            Some(input) => Ok(input),
+            None => {
+                let lock_stem = self.source_lock_for_recipe_source(key, recipe)?;
+                Ok(SeedInput::Source {
+                    key: key.to_string(),
+                    lock_stem,
+                })
+            }
+        }
+    }
+
+    fn seed_input_for_recipe_input(&self, key: &str) -> Result<Option<SeedInput>, String> {
+        if let Some(input) = special_seed_input(key)? {
+            return Ok(Some(input));
+        }
+        if self.host_tool_probe(key).is_some() {
+            return Ok(None);
+        }
+        self.source_lock_for_input_key(key).map(|lock_stem| {
+            lock_stem.map(|stem| SeedInput::Source {
+                key: key.to_string(),
+                lock_stem: stem,
+            })
+        })
+    }
+
+    fn ensure_seed_input(&self, input: &SeedInput) -> Result<(), String> {
+        if self.map_has(input.key())? {
+            let path = self.map_value(input.key())?;
+            return self.stage_store_path(&path);
+        }
+        match input {
+            SeedInput::Stage0 { key } => self.intern_stage0_source(key)?,
+            SeedInput::Source { key, lock_stem } => self.intern_source(key, lock_stem)?,
+            SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch)?,
+            SeedInput::Patch { key, patch } => self.intern_patch(key, patch)?,
+        }
+        let path = self.map_value(input.key())?;
+        self.stage_store_path(&path)
+    }
+
+    fn ensure_host_tool(&self, name: &str) -> Result<(), String> {
+        if self.map_has(name)? {
+            return Ok(());
+        }
+        let probe = self.assert_host_tool(name)?;
+        let root = self.tool_root(name, probe)?;
+        self.append_tools_map(name, &root)
+    }
+
+    fn assert_host_tool<'a>(&self, name: &'a str) -> Result<&'a str, String> {
+        self.host_tool_probe(name).ok_or_else(|| {
+            format!(
+                "ladder: input `{name}' is neither a recipe, source/patch input, nor a known host tool"
+            )
+        })
+    }
+
+    fn host_tool_probe<'a>(&self, name: &'a str) -> Option<&'a str> {
+        match name {
+            "coreutils" => Some("ls"),
+            "gawk" => Some("awk"),
+            "findutils" => Some("find"),
+            "diffutils" => Some("diff"),
+            "python" => Some("python3"),
+            "bash" | "sed" | "grep" | "tar" | "gzip" | "bzip2" | "xz" | "flex" | "bison" | "m4"
+            | "make" => Some(name),
+            _ => None,
+        }
+    }
+
+    fn source_lock_for_recipe_source(&self, key: &str, recipe: &Recipe) -> Result<String, String> {
+        let suffix = format!("-{}", recipe.version);
+        let stems = self.source_lock_stems()?;
+        let mut version_matches: Vec<String> = stems
+            .into_iter()
+            .filter(|stem| stem.ends_with(&suffix))
+            .collect();
+        if version_matches.len() == 1 {
+            return version_matches
+                .pop()
+                .ok_or_else(|| format!("ladder: no seed/sources lock for {key}"));
+        }
+
+        let hints = source_lock_hints(key, &recipe.name);
+        for hint in &hints {
+            let mut hinted: Vec<String> = version_matches
+                .iter()
+                .filter(|stem| lock_stem_matches_prefix(stem, hint))
+                .cloned()
+                .collect();
+            if hinted.len() == 1 {
+                return hinted
+                    .pop()
+                    .ok_or_else(|| format!("ladder: no seed/sources lock for {key}"));
+            }
+        }
+        match version_matches.len() {
+            1 => version_matches
+                .pop()
+                .ok_or_else(|| format!("ladder: no seed/sources lock for {key}")),
+            0 => Err(format!(
+                "ladder: cannot resolve sourceInput `{key}' for {}-{} to a seed/sources lock",
+                recipe.name, recipe.version
+            )),
+            _ => Err(format!(
+                "ladder: sourceInput `{key}' for {}-{} is ambiguous: {}",
+                recipe.name,
+                recipe.version,
+                version_matches.join(", ")
+            )),
+        }
+    }
+
+    fn source_lock_for_input_key(&self, key: &str) -> Result<Option<String>, String> {
+        if let Some(prefix) = source_key_lock_prefix_alias(key) {
+            return self.source_lock_by_prefix(prefix).map(Some);
+        }
+        let stems = self.source_lock_stems()?;
+        let mut matches: Vec<String> = stems
+            .into_iter()
+            .filter(|stem| lock_stem_matches_prefix(stem, key))
+            .collect();
+        match matches.len() {
+            0 => Ok(None),
+            1 => matches
+                .pop()
+                .map(Some)
+                .ok_or_else(|| format!("ladder: no seed/sources lock for source input `{key}'")),
+            _ => Err(format!(
+                "ladder: source input `{key}' is ambiguous: {}",
+                matches.join(", ")
+            )),
+        }
+    }
+
+    fn source_lock_by_prefix(&self, prefix: &str) -> Result<String, String> {
+        let stems = self.source_lock_stems()?;
+        let mut matches: Vec<String> = stems
+            .into_iter()
+            .filter(|stem| lock_stem_matches_prefix(stem, prefix))
+            .collect();
+        match matches.len() {
+            1 => matches
+                .pop()
+                .ok_or_else(|| format!("ladder: no seed/sources lock for prefix {prefix}")),
+            0 => Err(format!("ladder: no seed/sources lock for prefix {prefix}")),
+            _ => Err(format!(
+                "ladder: source input prefix `{prefix}' is ambiguous: {}",
+                matches.join(", ")
+            )),
+        }
     }
 
     fn build_plan(&self, target: &str) -> Result<(), String> {
@@ -622,50 +745,8 @@ impl RecipeCheckRunner {
         Ok(self.scratch.join("tdstore").join(base))
     }
 
-    fn run_x86_64_native(&self) -> Result<(), String> {
-        self.emit_cross()?;
-        self.emit_recipes(&["binutils-x86-64-native", "gcc-x86-64-native"])?;
-        self.build_plan("gcc-x86-64-native")?;
-        let xnbu = self.ladder_out("binutils-x86-64-native")?;
-        let xngcc = self
-            .ladder_out("gcc-x86-64-native")?
-            .join("stage/td/store/gcc-14.3.0-x86_64-native");
-        if !xnbu.is_dir() {
-            return Err(format!(
-                "run_x86_64_native: no native binutils tree ({})",
-                xnbu.display()
-            ));
-        }
-        if !xngcc.is_dir() {
-            return Err(format!(
-                "run_x86_64_native: no native gcc tree ({})",
-                xngcc.display()
-            ));
-        }
-        println!(
-            "   [ladder] x86_64 NATIVE toolchain via build-plan --auto: cross graph -> native binutils 2.44 -> native gcc 14.3.0 (ELF64 x86_64)"
-        );
-        Ok(())
-    }
-
-    fn run_x86_64_rust_toolchain(&self) -> Result<PathBuf, String> {
-        self.emit_cross()?;
-        self.intern_extra("rust-toolchain-source", "rust-1.96.0")?;
-        self.intern_extra("zlib-x86-64-source", "zlib-1.3.1")?;
-        self.emit_recipes(&["zlib-x86-64", "rust-toolchain"])?;
-        self.build_plan("rust-toolchain")?;
-        let rust_tree = self.ladder_out("rust-toolchain")?;
-        println!(
-            "   [ladder] x86_64 rust-toolchain via build-plan --auto: cross toolchain -> zlib-x86-64 -> rust-toolchain (relinked rustc/cargo tree {})",
-            rust_tree.display()
-        );
-        Ok(rust_tree)
-    }
-
     fn run_make_test(&self) -> Result<(), String> {
-        self.run_x86_64_native()?;
-        self.intern_extra("make-x86-64-source", "make-4.4.1")?;
-        self.emit_recipes(&["make-x86-64", "make-test"])?;
+        self.prepare_recipe_target("make-test")?;
         self.build_plan("make-test")?;
         println!(
             "PASS: make-test - GNU make 4.4.1 built on the native /td/store toolchain drove a real build in the recipe sandbox"
@@ -674,10 +755,7 @@ impl RecipeCheckRunner {
     }
 
     fn run_busybox_test(&self) -> Result<(), String> {
-        self.run_x86_64_native()?;
-        self.intern_extra("make-x86-64-source", "make-4.4.1")?;
-        self.intern_extra("busybox-x86-64-source", "busybox-1.37.0")?;
-        self.emit_recipes(&["make-x86-64", "busybox-x86-64", "busybox-test"])?;
+        self.prepare_recipe_target("busybox-test")?;
         self.build_plan("busybox-test")?;
         println!(
             "PASS: busybox-test - BusyBox 1.37.0 built by make-x86-64 on the native /td/store toolchain ran installed sh/ls/grep/sed applet links"
@@ -686,7 +764,13 @@ impl RecipeCheckRunner {
     }
 
     fn run_rust_toolchain_check(&self) -> Result<(), String> {
-        let rust_tree = self.run_x86_64_rust_toolchain()?;
+        self.prepare_recipe_target("rust-toolchain")?;
+        self.build_plan("rust-toolchain")?;
+        let rust_tree = self.ladder_out("rust-toolchain")?;
+        println!(
+            "   [ladder] x86_64 rust-toolchain via build-plan --auto: catalog dependency closure -> rust-toolchain (relinked rustc/cargo tree {})",
+            rust_tree.display()
+        );
         let rustc = rust_tree.join("bin/rustc");
         let cargo = rust_tree.join("bin/cargo");
         if !is_executable(&rustc) {
@@ -770,6 +854,21 @@ impl RecipeCheckRunner {
             .ok_or_else(|| format!("ladder: no seed/sources lock for {stem}"))
     }
 
+    fn source_lock_stems(&self) -> Result<Vec<String>, String> {
+        let mut stems = Vec::new();
+        for file in read_dir_sorted(&self.root.join("seed/sources"))? {
+            let stem = match file.file_name().and_then(|n| n.to_str()) {
+                Some(name) => match name.strip_suffix(".lock") {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                },
+                None => continue,
+            };
+            stems.push(stem);
+        }
+        Ok(stems)
+    }
+
     fn builder_command(&self) -> Command {
         let mut cmd = Command::new(&self.tb);
         cmd.current_dir(&self.root)
@@ -787,6 +886,149 @@ impl RecipeCheckRunner {
         }
         command_output(&mut cmd, label)
     }
+}
+
+fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
+    let mut visiting = HashSet::new();
+    let mut emitted = HashSet::new();
+    let mut out = Vec::new();
+    for target in targets {
+        visit_recipe(target, &mut visiting, &mut emitted, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn visit_recipe(
+    stem: &str,
+    visiting: &mut HashSet<String>,
+    emitted: &mut HashSet<String>,
+    out: &mut Vec<RecipeNode>,
+) -> Result<(), String> {
+    if emitted.contains(stem) {
+        return Ok(());
+    }
+    if !visiting.insert(stem.to_string()) {
+        return Err(format!("ladder: cycle in recipe nativeInputs at `{stem}'"));
+    }
+    let recipe =
+        catalog::lookup(stem).ok_or_else(|| format!("ladder: no td recipe for `{stem}'"))?;
+    if let Some(native_inputs) = &recipe.native_inputs {
+        for dep in native_inputs {
+            if catalog::lookup(dep).is_some() {
+                visit_recipe(dep, visiting, emitted, out)?;
+            }
+        }
+    }
+    if let Some(inputs) = &recipe.inputs {
+        for dep in inputs {
+            if catalog::lookup(dep).is_some() {
+                visit_recipe(dep, visiting, emitted, out)?;
+            }
+        }
+    }
+    visiting.remove(stem);
+    emitted.insert(stem.to_string());
+    out.push(RecipeNode {
+        stem: stem.to_string(),
+        recipe,
+    });
+    Ok(())
+}
+
+fn push_seed_input(inputs: &mut Vec<SeedInput>, seen: &mut HashSet<String>, input: SeedInput) {
+    if seen.insert(input.key().to_string()) {
+        inputs.push(input);
+    }
+}
+
+fn push_unique_string(v: &mut Vec<String>, item: &str) {
+    if !v.iter().any(|existing| existing == item) {
+        v.push(item.to_string());
+    }
+}
+
+fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
+    if key == "stage0-source" {
+        return Ok(Some(SeedInput::Stage0 {
+            key: key.to_string(),
+        }));
+    }
+    if key == "linux-headers" {
+        return Ok(Some(SeedInput::LinuxHeaders {
+            key: key.to_string(),
+            arch: "i386",
+        }));
+    }
+    if key == "linux-headers-x86-64" {
+        return Ok(Some(SeedInput::LinuxHeaders {
+            key: key.to_string(),
+            arch: "x86_64",
+        }));
+    }
+    if let Some(patch) = key.strip_prefix("patch-") {
+        if patch.is_empty() {
+            return Err(format!("ladder: malformed patch input `{key}'"));
+        }
+        return Ok(Some(SeedInput::Patch {
+            key: key.to_string(),
+            patch: patch.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+fn source_lock_hints(key: &str, recipe_name: &str) -> Vec<String> {
+    let mut hints = Vec::new();
+    push_source_hint(&mut hints, key);
+    if let Some(stripped) = key.strip_suffix("-source") {
+        push_source_hint(&mut hints, stripped);
+    }
+    push_source_hint(&mut hints, recipe_name);
+    if let Some(alias) = source_key_lock_prefix_alias(key) {
+        push_source_hint(&mut hints, alias);
+    }
+    hints
+}
+
+fn push_source_hint(hints: &mut Vec<String>, value: &str) {
+    let mut candidates = vec![value.to_string()];
+    for suffix in [
+        "-source",
+        "-x86-64-native",
+        "-x86-64",
+        "-mesboot0",
+        "-mesboot1",
+        "-mesboot",
+        "-stage1",
+        "-stage2",
+        "-244",
+    ] {
+        if let Some(stripped) = value.strip_suffix(suffix) {
+            candidates.push(stripped.to_string());
+        }
+    }
+    for candidate in candidates {
+        if !candidate.is_empty() && !hints.iter().any(|hint| hint == &candidate) {
+            hints.push(candidate);
+        }
+    }
+}
+
+fn source_key_lock_prefix_alias(key: &str) -> Option<&'static str> {
+    match key {
+        "gcc-464-core" => Some("gcc-core"),
+        "gcc-464-gpp" => Some("gcc-g++"),
+        "gmp63" => Some("gcc14-gmp"),
+        "mpfr421" => Some("gcc14-mpfr"),
+        "mpc131" => Some("gcc14-mpc"),
+        _ => None,
+    }
+}
+
+fn lock_stem_matches_prefix(stem: &str, prefix: &str) -> bool {
+    stem.strip_prefix(prefix)
+        .map(|rest| rest.starts_with('-'))
+        .unwrap_or(false)
 }
 
 fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
@@ -1030,4 +1272,80 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
     let mut selected: Vec<&str> = text.lines().rev().take(lines).collect();
     selected.reverse();
     selected.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recipe_closure_is_derived_from_catalog_edges() {
+        let graph = recipe_closure(&["busybox-test"]).unwrap();
+        let stems: Vec<&str> = graph.iter().map(|node| node.stem.as_str()).collect();
+
+        for expected in [
+            "stage0",
+            "mes",
+            "gcc-x86-64-stage2",
+            "gcc-x86-64-native",
+            "binutils-x86-64-native",
+            "make-x86-64",
+            "busybox-x86-64",
+            "busybox-test",
+        ] {
+            assert!(
+                stems.iter().any(|stem| stem == &expected),
+                "missing {expected} from busybox-test closure: {stems:?}"
+            );
+        }
+
+        let busybox_pos = stems
+            .iter()
+            .position(|stem| stem == &"busybox-x86-64")
+            .unwrap();
+        let test_pos = stems
+            .iter()
+            .position(|stem| stem == &"busybox-test")
+            .unwrap();
+        assert!(
+            busybox_pos < test_pos,
+            "dependency should be emitted before dependent: {stems:?}"
+        );
+    }
+
+    #[test]
+    fn selected_check_closures_resolve_their_declared_seed_inputs() {
+        let recipes_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = recipes_dir.parent().unwrap();
+        let runner = RecipeCheckRunner {
+            root: root.to_path_buf(),
+            tb: PathBuf::new(),
+            builder_path: String::new(),
+            builder_store: PathBuf::new(),
+            builder_db: PathBuf::new(),
+            lw: PathBuf::new(),
+            store: PathBuf::new(),
+            db: PathBuf::new(),
+            recipes: PathBuf::new(),
+            scratch: PathBuf::new(),
+        };
+
+        for target in ["make-test", "busybox-test", "rust-toolchain"] {
+            let graph = recipe_closure(&[target]).unwrap();
+            for node in graph {
+                if let Some(key) = &node.recipe.source_input {
+                    runner
+                        .seed_input_for_recipe_source(key, &node.recipe)
+                        .unwrap();
+                }
+                if let Some(inputs) = &node.recipe.inputs {
+                    for input in inputs {
+                        if catalog::lookup(input).is_none() {
+                            let _ = runner.seed_input_for_recipe_input(input).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
