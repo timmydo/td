@@ -30,12 +30,13 @@ You are the td daily full-suite backstop. The repo is at <REPO>. Steps:
 1. cd <REPO>; build the engine: cargo build --release --manifest-path builder/Cargo.toml
 2. Run: builder/target/release/td-builder daily --verdict .td-daily-verdict
 3. Read .td-daily-verdict.
-   - Exit 10: unprovisioned for every leg — a HOST setup gap, not a code regression.
+   - Exit 10: no current leg ran — a HOST setup gap, not a code regression.
      Report it and stop; no PR.
-   - env_error=1 with harness green (PARTIAL): heavy/system didn't run (loop toolchain
-     unresolved) but nothing that DID run is red — report it and stop; no PR.
-   - Any leg genuinely red (heavy_rc/system_rc/harness_rc nonzero and NOT explained by
-     env_error / harness_env_error): a real regression — proceed to step 4.
+   - env_error=1: heavy/system didn't run (loop toolchain unresolved) — report it
+     and stop; no PR.
+   - Any current leg genuinely red (heavy_rc/system_rc nonzero and NOT explained by
+     env_error): a real regression — proceed to step 4. The retired harness field is
+     compatibility output, not a current regression leg.
    - Otherwise (all green): report green, stop.
 4. On a real red: the suspect is in `git log $(cat .td-last-green 2>/dev/null || echo origin/main~10)..origin/main`.
    Reproduce the failing gate (the *_fail field names it) to confirm it is a real

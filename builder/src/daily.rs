@@ -85,8 +85,8 @@ struct Verdict {
     exit_code: i32,
     /// Every leg unprovisioned — nothing ran anywhere, print the abort and stop.
     abort_all_unprovisioned: bool,
-    /// Harness green but heavy/system unprovisioned: a partial, not a full-suite
-    /// proof — do NOT record `.td-last-green` or publish.
+    /// A current leg was unprovisioned after another leg ran: a partial, not a
+    /// full-suite proof — do NOT record `.td-last-green` or publish.
     partial: bool,
     /// Full suite green: record `.td-last-green` and publish substitutes.
     all_green: bool,
@@ -94,11 +94,12 @@ struct Verdict {
 
 /// The verdict/exit contract, as a pure function so the scenario matrix is a unit
 /// test (the shell could only verify it by stubbing td-builder). Every leg is
-/// symmetric: an unprovisioned leg (its `td-builder check` exited
+/// symmetric: an unprovisioned current leg (its `td-builder check` exited
 /// `EXIT_UNPROVISIONED`) never sets a red bit AND never counts toward a full-suite
 /// green — a tier that could not run means this is not a full-suite proof, so the
 /// run is PARTIAL and `.td-last-green` is withheld. (`env_error` = heavy
-/// unprovisioned, which also skips system.)
+/// unprovisioned, which also skips system.) The retired harness field stays in
+/// the verdict for compatibility but no longer contributes to the exit decision.
 fn compute_verdict(inp: &VerdictInput) -> Verdict {
     let env_error = inp.heavy.unprovisioned;
     // system is only attempted when heavy is provisioned; if it ran and came back
@@ -130,9 +131,10 @@ fn compute_verdict(inp: &VerdictInput) -> Verdict {
         "red"
     };
 
-    // Every attemptable leg unprovisioned → nothing ran; abort 10, no triage.
-    // (heavy unprovisioned ⇒ system skipped, so it is not "attemptable" here.)
-    if env_error && harness_env_error {
+    // Heavy is the first current leg. If it is unprovisioned, system is skipped
+    // and the retired harness producer no longer exists, so no gate ran anywhere:
+    // abort 10, no triage/revert.
+    if env_error {
         return Verdict {
             heavy_state,
             system_state,
@@ -154,14 +156,11 @@ fn compute_verdict(inp: &VerdictInput) -> Verdict {
     if inp.run_system && !env_error && !system_unprov && inp.system.rc != 0 {
         rc += 2;
     }
-    if !harness_env_error && inp.harness.rc != 0 {
-        rc += 4;
-    }
 
-    // Any leg unprovisioned (heavy/system/harness) means this is not a full-suite
+    // Any current leg unprovisioned (heavy/system) means this is not a full-suite
     // proof: PARTIAL, and `.td-last-green` / publish are withheld. all_green requires
     // every attempted leg to have actually run green.
-    let any_unprovisioned = env_error || system_unprov || harness_env_error;
+    let any_unprovisioned = env_error || system_unprov;
     let partial = rc == 0 && any_unprovisioned;
     let all_green = rc == 0 && !any_unprovisioned;
 
@@ -540,8 +539,8 @@ fn is_exec(p: &Path) -> bool {
 /// On all-green: sign + publish the from-seed exports this run produced so the
 /// per-PR loop FETCHES prebuilt closures instead of rebuilding. Guarded — each
 /// block is a clear no-op unless the daily runner supplies TD_SUBST_PRIVKEY + a
-/// td-subst binary. (The seed/harness publishers still shell out to their
-/// tools/publish-*.sh; porting those is a separate rust-migration slice.)
+/// td-subst binary. (The seed publisher still shells out to its existing helper;
+/// porting it is a separate rust-migration slice.)
 fn publish_substitutes(root: &Path, tdb: &Path) {
     let store = std::env::var("TD_SUBST_STORE").unwrap_or_else(|_| {
         std::env::var("HOME")
@@ -588,7 +587,6 @@ fn publish_substitutes(root: &Path, tdb: &Path) {
     // seed: still shell out to its existing publisher.
     if privkey.is_empty() || sb.is_empty() {
         println!(">> publish-seed-subst: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set");
-        println!(">> publish-harness-subst: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set");
         return;
     }
     let seed_ok = Command::new("sh")
@@ -606,33 +604,6 @@ fn publish_substitutes(root: &Path, tdb: &Path) {
         .unwrap_or(false);
     if !seed_ok {
         println!(">> publish-seed-subst: WARN — seed publish failed; not published");
-    }
-
-    if !root.join(".td-build-cache/harness/store").is_dir()
-        || !non_empty(&root.join(".td-build-cache/harness/rel"))
-    {
-        println!(">> publish-harness-subst: SKIP — no persisted .td-build-cache/harness");
-        return;
-    }
-    let harness_ok = Command::new("sh")
-        .args([
-            "tools/publish-harness-subst.sh",
-            ".td-build-cache/harness",
-            &store,
-        ])
-        .current_dir(root)
-        .env("TD_BUILDER", tdb)
-        .env("TD_SUBST_BIN", &sb)
-        .env("TD_SUBST_PRIVKEY", &privkey)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if harness_ok {
-        println!(">> publish-harness-subst: signed + published the /td/store harness to {store}");
-    } else {
-        println!(">> publish-harness-subst: WARN — harness publish failed; not published");
     }
 }
 
@@ -703,10 +674,6 @@ fn has_narinfo(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn non_empty(p: &Path) -> bool {
-    std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,35 +704,33 @@ mod tests {
     }
 
     #[test]
-    fn heavy_unprovisioned_harness_green_is_partial() {
+    fn heavy_unprovisioned_aborts_10_because_no_current_leg_ran() {
         let v = compute_verdict(&VerdictInput {
             run_system: true,
             heavy: unprov(),
             system: LegRc::green(), // never ran; ignored because env_error
             harness: LegRc::green(),
         });
-        assert_eq!(v.exit_code, 0);
-        assert!(v.partial, "harness green + heavy unprovisioned => PARTIAL");
-        assert!(!v.all_green, "PARTIAL must NOT record .td-last-green");
+        assert_eq!(v.exit_code, 10);
+        assert!(v.abort_all_unprovisioned);
+        assert!(!v.partial);
+        assert!(!v.all_green, "abort must NOT record .td-last-green");
         assert_eq!(v.heavy_state, "unprovisioned");
         assert_eq!(v.system_state, "unprovisioned");
         assert_eq!(v.harness_state, "green");
     }
 
     #[test]
-    fn heavy_unprovisioned_harness_red_sets_only_bit_4() {
+    fn retired_harness_red_does_not_set_a_bit() {
         let v = compute_verdict(&VerdictInput {
             run_system: true,
-            heavy: unprov(),
+            heavy: LegRc::green(),
             system: LegRc::green(),
             harness: red(1),
         });
-        assert_eq!(
-            v.exit_code, 4,
-            "only the harness bit — heavy is unprovisioned, not red"
-        );
+        assert_eq!(v.exit_code, 0);
         assert!(!v.partial);
-        assert!(!v.all_green);
+        assert!(v.all_green);
         assert_eq!(v.harness_state, "red");
     }
 
@@ -822,11 +787,10 @@ mod tests {
         assert!(v.all_green);
     }
 
-    // Cross-model review (codex P1 / subagent): heavy+system green but the harness
-    // tier unprovisioned must NOT record .td-last-green — the harness is part of the
-    // full-suite proof, so it is PARTIAL, not ALL GREEN.
+    // The harness tier is retired. Keep reporting its compatibility field, but do
+    // not let it block the current heavy+system daily proof.
     #[test]
-    fn heavy_green_harness_unprovisioned_is_partial_not_all_green() {
+    fn retired_harness_unprovisioned_does_not_block_all_green() {
         let v = compute_verdict(&VerdictInput {
             run_system: true,
             heavy: LegRc::green(),
@@ -834,8 +798,8 @@ mod tests {
             harness: unprov(),
         });
         assert_eq!(v.exit_code, 0);
-        assert!(v.partial, "an unprovisioned harness tier => PARTIAL");
-        assert!(!v.all_green, "must NOT record .td-last-green / publish");
+        assert!(!v.partial);
+        assert!(v.all_green);
         assert_eq!(v.harness_state, "unprovisioned");
     }
 

@@ -1,14 +1,14 @@
 #!/bin/sh
-# tools/publish-harness-subst.sh — the PRODUCER half of shipping the /td/store harness to
+# tools/publish-harness-subst.sh — dormant producer half of shipping the /td/store harness to
 # guix-less runners (#314): publish the whole harness tree as a SIGNED substitute so a runner
 # with an empty .td-build-cache/harness fetches it (tools/resolve-harness.sh) instead of needing a
-# local guix-hosted heavy build to have produced it first.
+# local heavy build to have produced it first.
 #
-# Runs in td-builder daily when .td-build-cache/harness has been persisted. It exports that
-# tree as ONE nar + a fixed-name `td-harness` narinfo (td-builder harness-subst-export) and signs
-# it with the daily-runner's PRIVATE key (whose public half is the pinned tests/td-subst.pub the
-# runner verifies). The daily's from-seed build remains the provenance of these bytes; this only
-# packages them for the cache, exactly as tools/publish-toolchain-subst.sh does for the toolchain.
+# The old td-builder daily caller is retired because the Guix-hosted harness producer is gone. Keep
+# this script as an inert helper until the recipe-graph harness path has a current producer again.
+# It exports a tree as ONE nar + a fixed-name `td-harness` narinfo (td-builder harness-subst-export)
+# and signs it with the runner's PRIVATE key (whose public half is the pinned tests/td-subst.pub the
+# runner verifies).
 #
 # Usage: tools/publish-harness-subst.sh HARNESS_DIR OUT_STORE
 #   HARNESS_DIR  the persisted harness tree (.td-build-cache/harness: store/ + rel + toolchain)

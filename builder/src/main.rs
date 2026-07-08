@@ -744,9 +744,9 @@ const HARNESS_SUBST_STORE_PATH: &str = "/td/store/td-harness";
 /// Export the harness tree at `harness_dir` (the `.td-build-cache/harness` layout: `store/` +
 /// `rel` + `toolchain`) as a single substitute: one nar of the WHOLE tree + a `td-harness.narinfo`
 /// (StorePath == `HARNESS_SUBST_STORE_PATH`, no References), written under `outdir`. No store DB is
-/// needed — the harness is content-addressed by its NarHash, not by a lock. The daily signs the
-/// narinfo (tools/publish-harness-subst.sh) and the guix-less runner fetches+verifies+restores it
-/// (tools/resolve-harness.sh). Returns the written basenames (exactly one: `td-harness`).
+/// needed — the harness is content-addressed by its NarHash, not by a lock. The old daily
+/// publisher is retired; this helper is dormant until the recipe-graph harness path has a current
+/// producer again. Returns the written basenames (exactly one: `td-harness`).
 fn harness_subst_export(outdir: &Path, harness_dir: &Path) -> Result<Vec<String>, String> {
     if !harness_dir.join("store").is_dir() || !harness_dir.join("rel").is_file() {
         return Err(format!(
@@ -4172,9 +4172,9 @@ fn main() -> ExitCode {
         }
         // harness-subst-export OUTDIR HARNESS-DIR — ship the whole /td/store harness tree
         // (.td-build-cache/harness: store/ + rel + toolchain) to a guix-less runner as ONE nar +
-        // a fixed-name `td-harness.narinfo` (issue #314). The daily signs it
-        // (tools/publish-harness-subst.sh); a runner with an empty `.td-build-cache/harness`
-        // can fetch+verify+restore it with tools/resolve-harness.sh.
+        // a fixed-name `td-harness.narinfo` (issue #314). The old daily publisher is retired;
+        // keep the export helper dormant until the recipe-graph harness path has a current
+        // producer again.
         Some("harness-subst-export") if args.len() == 4 => {
             let (outdir, harness_dir) = (&args[2], &args[3]);
             match harness_subst_export(Path::new(outdir), Path::new(harness_dir)) {

@@ -1,5 +1,5 @@
 use crate::ladder::base_inputs;
-use crate::types::{Recipe, Source};
+use crate::types::{Recipe, RecipeCheck, Source};
 
 // rust-toolchain — the /td/store Rust toolchain, as a first-class RECIPE fully in the
 // recipe-graph model (#410, building on #380).
@@ -29,8 +29,6 @@ use crate::types::{Recipe, Source};
 // is the raw tarball. Same pinned source + same inputs => byte-identical tree (the
 // `td-builder check` double-build oracle proves it); a missing input reds at drv-assembly.
 //
-// The old recipe-owned daily check was removed with the legacy corpus cleanup. The
-// follow-up should re-cover rustc runtime/compile behavior on the recipe-graph model.
 pub fn recipe() -> Recipe {
     Recipe::rust_toolchain("rust-toolchain", "1.96.0")
         .source(Source::one(
@@ -45,4 +43,37 @@ pub fn recipe() -> Recipe {
         // synthesized lock now only carries what the recipe itself declares, so they must
         // be genuine inputs here (matching every other mesboot-family rung's base_inputs()).
         .inputs_owned(base_inputs(&[]))
+        .checks(vec![RecipeCheck::daily(
+            r#"
+echo ">> recipe-check rust-toolchain: build-plan --auto builds+validates the relinked /td/store Rust 1.96.0 toolchain"
+sh <<'CHECK'
+set -eu
+ROOT=$(pwd)
+fail() { echo "FAIL: $*" >&2; exit 1; }
+. tests/cache-lib.sh
+. tests/x86_64-cross-fns.sh
+. tests/ladder-lib.sh
+export TD_STAGE0_BASE="$PWD/.td-build-cache/td-shell"
+load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
+load_recipe_eval || fail "no td-recipe-eval"
+export TD_STORE_DIR=/td/store
+run_x86_64_rust_toolchain || fail "the /td/store rust-toolchain recipe graph failed to build"
+rbase=${XRUSTTREE##*/}
+rpath=/td/store/$rbase
+test -x "$XRUSTTREE/bin/rustc" || fail "rustc missing from rust-toolchain output"
+test -x "$XRUSTTREE/bin/cargo" || fail "cargo missing from rust-toolchain output"
+"$TB" store-ns "$X86_WORK/scratch/tdstore" -- "$rpath/bin/rustc" --version > "$X86_WORK/rustc.version" \
+  || fail "rustc --version failed in the /td/store own-root"
+"$TB" text extract-prefix 'rustc 1.96.0' "$X86_WORK/rustc.version" >/dev/null \
+  || { cat "$X86_WORK/rustc.version" >&2; fail "rustc version did not match the pinned 1.96.0 release"; }
+"$TB" store-ns "$X86_WORK/scratch/tdstore" -- "$rpath/bin/cargo" --version > "$X86_WORK/cargo.version" \
+  || fail "cargo --version failed in the /td/store own-root"
+printf '%s\n' 'pub fn td_rust_smoke() -> u32 { 42 }' \
+  | "$TB" store-ns "$X86_WORK/scratch/tdstore" -- "$rpath/bin/rustc" \
+  --crate-name td_rust_smoke --crate-type=lib --edition=2021 - -o /tmp/librust_smoke.rlib \
+  || fail "rustc could not compile a simple library in the /td/store own-root"
+echo "PASS: rust-toolchain: Rust 1.96.0 relinked onto /td/store runs rustc/cargo and compiles a simple library"
+CHECK
+"#,
+        )])
 }
