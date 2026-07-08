@@ -144,7 +144,7 @@ impl RecipeCheckRunner {
     fn new(root: PathBuf) -> Result<Self, String> {
         let stage0_base = env::var_os("TD_STAGE0_BASE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| root.join(".td-build-cache/td-shell"));
+            .unwrap_or_else(|| root.join(".td-build-cache/stage0"));
         let td_builder_self = find_td_builder_self(&root)?;
         let cb = place_stage0_builder(&root, &stage0_base, &td_builder_self)?;
         let cb_base = path_basename_str(&cb)?;
