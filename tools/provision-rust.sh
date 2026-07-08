@@ -33,8 +33,14 @@ fi
 
 # 2. The pinned (guix seed) lock — only when its store paths are present on disk.
 if [ -s "$lock" ]; then
-  r=$(grep -- '-rust-[0-9]' "$lock" | grep -v -- '-cargo' | sed 's/^[^ ]* //' | head -1 || true)
-  c=$(grep -- '-rust-.*-cargo' "$lock" | sed 's/^[^ ]* //' | head -1 || true)
+  r=
+  c=
+  while IFS=' ' read -r _name _path _rest; do
+    case "$_path" in
+      */*-rust-[0-9]*-cargo) [ -n "$c" ] || c="$_path" ;;
+      */*-rust-[0-9]*) [ -n "$r" ] || r="$_path" ;;
+    esac
+  done < "$lock"
   if [ -n "$r" ] && [ -n "$c" ] && [ -x "$r/bin/rustc" ] && [ -x "$c/bin/cargo" ]; then
     emit "$r/bin" "$c/bin"; exit 0
   fi

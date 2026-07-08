@@ -33,7 +33,8 @@ done
 #      store-closure + NAR serializer + Refs reader (no daemon). seed-unpack consumes it.
 "$tb" seed-manifest "$db" "$@" > "$out/seed.manifest" \
   || { echo "build-seed-tarball: seed-manifest failed" >&2; exit 1; }
-n=`grep -c . "$out/seed.manifest" || true`
+n=`"$tb" text count-nonempty "$out/seed.manifest"` \
+  || { echo "build-seed-tarball: could not count seed manifest entries" >&2; exit 1; }
 test "$n" -ge 1 || { echo "build-seed-tarball: empty closure" >&2; exit 1; }
 # The tar file-list is column 1 of the manifest (the closure members, sorted).
 cut -d' ' -f1 "$out/seed.manifest" > "$out/closure.txt"

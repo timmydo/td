@@ -29,7 +29,12 @@ fi
 
 # 2. The pinned (guix seed) gcc-toolchain — only when its store path is present on disk.
 if [ -s "$lock" ]; then
-  g=$(grep -- '-gcc-toolchain-' "$lock" | sed 's/^[^ ]* //' | head -1 || true)
+  g=
+  while IFS=' ' read -r _name _path _rest; do
+    case "$_path" in
+      */*-gcc-toolchain-*) [ -n "$g" ] || g="$_path" ;;
+    esac
+  done < "$lock"
   if [ -n "$g" ] && has_cc "$g/bin"; then printf '%s\n' "$g/bin"; exit 0; fi
 fi
 

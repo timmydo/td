@@ -38,6 +38,31 @@ dest=${3:?usage: resolve-toolchain.sh LOCK NAME DEST}
 # MISS — log to stderr (never stdout: stdout carries ONLY a HIT path) and fall back.
 miss() { [ -n "${1:-}" ] && echo "resolve-toolchain: MISS — $1" >&2; exit 1; }
 
+narinfo_field() {
+  _nf_key=$1
+  _nf_file=$2
+  while IFS= read -r _nf_line; do
+    case "$_nf_line" in
+      "$_nf_key":\ *) printf '%s\n' "${_nf_line#*: }"; return 0 ;;
+    esac
+  done < "$_nf_file"
+  return 1
+}
+
+serve_port() {
+  _sp_file=$1
+  while IFS= read -r _sp_line; do
+    case "$_sp_line" in
+      *http://127.0.0.1:*)
+        _sp_rest=${_sp_line#*http://127.0.0.1:}
+        _sp_port=${_sp_rest%%/*}
+        case "$_sp_port" in ''|*[!0-9]*) ;; *) printf '%s\n' "$_sp_port"; return 0 ;; esac
+        ;;
+    esac
+  done < "$_sp_file"
+  return 1
+}
+
 : "${TD_SUBST_BIN:?TD_SUBST_BIN unset}"
 : "${TD_BUILDER:?TD_BUILDER unset}"
 pub=${TD_SUBST_PUBKEY:-tests/td-subst.pub}
@@ -67,7 +92,7 @@ spid=$!
 port=
 i=0
 while [ "$i" -lt 100 ]; do
-  port=$(sed -n 's#.*http://127.0.0.1:\([0-9]*\)/.*#\1#p' "$work/serve.log" 2>/dev/null)
+  port=$(serve_port "$work/serve.log" 2>/dev/null || true)
   [ -n "$port" ] && break
   i=$((i + 1)); sleep 0.1
 done
@@ -79,11 +104,11 @@ done
 # 4. The fetched narinfo's StorePath MUST equal the lock-computed path — the
 #    input-addressed NAME is load-bearing alongside the signature (a validly-signed
 #    substitute for a DIFFERENT path is not the toolchain we asked for).
-fsp=$(grep '^StorePath: ' "$work/fetch/$base.narinfo" | cut -d' ' -f2)
+fsp=$(narinfo_field StorePath "$work/fetch/$base.narinfo" 2>/dev/null || true)
 [ "x$fsp" = "x$path" ] || miss "fetched StorePath ($fsp) != lock-computed path ($path)"
 
 # 5. Restore the verified nar into DEST and hand the caller the path.
-narfile=$(grep '^NarFile: ' "$work/fetch/$base.narinfo" | cut -d' ' -f2)
+narfile=$(narinfo_field NarFile "$work/fetch/$base.narinfo" 2>/dev/null || true)
 mkdir -p "$dest"
 "$TD_BUILDER" nar-restore "$work/fetch/$narfile" "$dest/$base" >/dev/null 2>"$work/restore.err" \
   || miss "nar-restore failed: $(tail -1 "$work/restore.err" 2>/dev/null)"

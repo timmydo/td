@@ -28,6 +28,49 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 LOCK=tests/td-toolchain.lock
 test -f "$LOCK" || fail "missing $LOCK"
 
+source_lock_value() {
+  _slv_key=$1
+  _slv_lock=$2
+  while IFS=' ' read -r _slv_k _slv_rest; do
+    [ "$_slv_k" = "$_slv_key" ] || continue
+    printf '%s\n' "$_slv_rest"
+    return 0
+  done < "$_slv_lock"
+  return 1
+}
+
+copy_pin_lines() {
+  _cpl_lock=$1
+  while IFS= read -r _cpl_line; do
+    case "$_cpl_line" in input\ *|patch\ *) printf '%s\n' "$_cpl_line" ;; esac
+  done < "$_cpl_lock"
+}
+
+registered_hash() {
+  _rh_db=$1
+  _rh_path=$2
+  "$TB" store-query "$_rh_db" info | while IFS='|' read -r _rh_p _rh_h _rh_size; do
+    [ "$_rh_p" = "$_rh_path" ] || continue
+    printf '%s\n' "$_rh_h"
+    return 0
+  done
+}
+
+perturb_glibc_pin() {
+  _pgp_in=$1
+  _pgp_out=$2
+  _pgp_seen=0
+  while IFS= read -r _pgp_line; do
+    case "$_pgp_line" in
+      input\ *\ glibc-2.41.tar.xz)
+        printf 'input 0000000000000000000000000000000000000000000000000000000000000000 glibc-2.41.tar.xz\n'
+        _pgp_seen=1 ;;
+      *) printf '%s\n' "$_pgp_line" ;;
+    esac
+  done < "$_pgp_in" > "$_pgp_out"
+  [ "$_pgp_seen" = 1 ]
+}
+
 . tests/cache-lib.sh
 load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
 echo ">> td-builder (stage0, guix-free): $TB"
@@ -39,8 +82,8 @@ trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 # Build a FILE->sha256 map from seed/sources/*.lock (the `file`/`sha256` fields).
 srcsha() {
   for l in seed/sources/*.lock; do
-    f=`sed -n 's/^file //p' "$l" | head -1`
-    [ "$f" = "$1" ] && { sed -n 's/^sha256 //p' "$l" | head -1; return 0; }
+    f=`source_lock_value file "$l" 2>/dev/null || true`
+    [ "$f" = "$1" ] && { source_lock_value sha256 "$l"; return 0; }
   done
   return 1
 }
@@ -59,7 +102,7 @@ while read -r kind shaval file; do
       npatch=$((npatch + 1)) ;;
   esac
 done <<EOF
-`grep -E '^(input|patch) ' "$LOCK"`
+`copy_pin_lines "$LOCK"`
 EOF
 test "$nin" -ge 20 || fail "[pinned-sync] only $nin input pins — the toolchain has more inputs than that"
 test "$npatch" -ge 4 || fail "[pinned-sync] only $npatch patch pins"
@@ -92,17 +135,15 @@ CA1=`"$TB" store-add-recursive glibc-2.41 "$work/v1" "$work/caA" "$work/caA.db"`
 CA2=`"$TB" store-add-recursive glibc-2.41 "$work/v2" "$work/caB" "$work/caB.db"` || fail "store-add-recursive v2"
 [ "$CA1" != "$CA2" ] || fail "[content-indep] content-addressed paths did NOT move — fixture bytes are equal?"
 # both input-addressed adds registered the REAL (differing) NAR hash, naming notwithstanding.
-HA=`"$TB" store-query "$work/iaA.db" info | grep -F "$IA1|" | cut -d'|' -f2`
-HB=`"$TB" store-query "$work/iaB.db" info | grep -F "$IA2|" | cut -d'|' -f2`
+HA=`registered_hash "$work/iaA.db" "$IA1"`
+HB=`registered_hash "$work/iaB.db" "$IA2"`
 test -n "$HA" -a -n "$HB" || fail "[content-indep] input-addressed adds did not register a NAR hash"
 [ "$HA" != "$HB" ] || fail "[content-indep] registered NAR hashes are equal — content integrity not recorded"
 echo "   [content-indep] same key+different bytes -> same path $IA1 (content-addressed would split: $CA1 vs $CA2)"
 
 # --- [load-bearing] perturbing one input pin moves the path ----------------------------------
-# (sed, not awk — the loop sandbox has no awk; zero out the glibc-2.41 source pin.)
 pert="$work/perturbed.lock"
-sed 's/^input [0-9a-f]* glibc-2.41.tar.xz$/input 0000000000000000000000000000000000000000000000000000000000000000 glibc-2.41.tar.xz/' "$LOCK" > "$pert"
-grep -q '^input 0000000000000000000000000000000000000000000000000000000000000000 glibc-2.41.tar.xz$' "$pert" || fail "[load-bearing] could not perturb the lock (glibc-2.41 input line not found)"
+perturb_glibc_pin "$LOCK" "$pert" || fail "[load-bearing] could not perturb the lock (glibc-2.41 input line not found)"
 GLP_P=`"$TB" toolchain-path "$pert" glibc-2.41`
 [ "$GLP_P" != "$GLP" ] || fail "[load-bearing] perturbing an input pin did NOT change the path"
 echo "   [load-bearing] flipping one declared input pin moves glibc-2.41's path ($GLP -> $GLP_P)"
@@ -120,10 +161,11 @@ RUNP=`"$TB" store-add-input-addressed bash-static "$K1" "$bs" "$store" "$work/st
 case "$RUNP" in /td/store/*-bash-static) ;; *) fail "bash-static not input-addressed at /td/store: $RUNP" ;; esac
 test -x "$store/`basename "$RUNP"`/bin/bash" || fail "interned bash-static missing physically"
 out=`"$TB" store-ns "$store" -- "$RUNP/bin/bash" -c '[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT; echo "RAN:$BASH_VERSION"'` \
-  || { printf '%s\n' "$out" | sed 's/^/     /' >&2; fail "store-ns run from the input-addressed path exited nonzero"; }
-printf '%s\n' "$out" | grep -q '^RAN:5' || fail "[behavioral] the binary did not run from its input-addressed /td/store path"
+  || { printf '%s\n' "$out" > "$work/run.out"; while IFS= read -r line; do printf '     %s\n' "$line" >&2; done < "$work/run.out"; fail "store-ns run from the input-addressed path exited nonzero"; }
+printf '%s\n' "$out" > "$work/run.out"
+"$TB" text extract-prefix 'RAN:5' "$work/run.out" >/dev/null || fail "[behavioral] the binary did not run from its input-addressed /td/store path"
 echo "   [behavioral] a real binary placed at the input-addressed path $RUNP RUNS in the own-root"
-printf '%s\n' "$out" | grep -q '^GNU-ABSENT$' || fail "[structural] /gnu/store is PRESENT in the own-root"
+"$TB" text line-exact 'GNU-ABSENT' "$work/run.out" || fail "[structural] /gnu/store is PRESENT in the own-root"
 echo "   [structural] /gnu/store is ABSENT in the own-root"
 
 echo "PASS: toolchain-input-addressed — the /td/store modern toolchain has a STABLE input-addressed"

@@ -57,9 +57,11 @@ repro_normalize_tree() {
   chmod u+rwx "$_rn_tmp/strip"
   _rn_strip="$_rn_tmp/strip"
   # (3) drop libtool .la archives (link metadata; leak the build path via relink_command).
-  find "$_rn_dir" -type f -name '*.la' -exec rm -f {} +
+  "$TB" files "$_rn_dir" | while IFS= read -r _rn_f; do
+    case "$_rn_f" in *.la) rm -f "$_rn_f" ;; esac
+  done
   # (1)+(2) strip debug + deterministic archives over every ELF / ar archive.
-  if find "$_rn_dir" -type f -print | while IFS= read -r _rn_f; do
+  if "$TB" files "$_rn_dir" | while IFS= read -r _rn_f; do
        # Sniff the first 4 bytes: ELF (7f 45 4c 46) or ar archive ("!<ar" = 21 3c 61 72).
        _rn_m=$(od -An -tx1 -N4 "$_rn_f" 2>/dev/null | tr -d ' \n')
        case "$_rn_m" in

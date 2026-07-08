@@ -34,6 +34,31 @@ dest=${1:?usage: resolve-harness.sh DEST}
 # MISS — log to stderr (never stdout: stdout carries ONLY a HIT path) and fail closed.
 miss() { [ -n "${1:-}" ] && echo "resolve-harness: MISS — $1" >&2; exit 1; }
 
+narinfo_field() {
+  _nf_key=$1
+  _nf_file=$2
+  while IFS= read -r _nf_line; do
+    case "$_nf_line" in
+      "$_nf_key":\ *) printf '%s\n' "${_nf_line#*: }"; return 0 ;;
+    esac
+  done < "$_nf_file"
+  return 1
+}
+
+serve_port() {
+  _sp_file=$1
+  while IFS= read -r _sp_line; do
+    case "$_sp_line" in
+      *http://127.0.0.1:*)
+        _sp_rest=${_sp_line#*http://127.0.0.1:}
+        _sp_port=${_sp_rest%%/*}
+        case "$_sp_port" in ''|*[!0-9]*) ;; *) printf '%s\n' "$_sp_port"; return 0 ;; esac
+        ;;
+    esac
+  done < "$_sp_file"
+  return 1
+}
+
 : "${TD_SUBST_BIN:?TD_SUBST_BIN unset}"
 : "${TD_BUILDER:?TD_BUILDER unset}"
 pub=${TD_SUBST_PUBKEY:-tests/td-subst.pub}
@@ -59,7 +84,7 @@ spid=$!
 port=
 i=0
 while [ "$i" -lt 100 ]; do
-  port=$(sed -n 's#.*http://127.0.0.1:\([0-9]*\)/.*#\1#p' "$work/serve.log" 2>/dev/null)
+  port=$(serve_port "$work/serve.log" 2>/dev/null || true)
   [ -n "$port" ] && break
   i=$((i + 1)); sleep 0.1
 done
@@ -70,10 +95,10 @@ done
 
 # The fetched narinfo's StorePath MUST equal the fixed harness name — a validly-signed
 # substitute for a DIFFERENT path is not the harness we asked for.
-fsp=$(grep '^StorePath: ' "$work/fetch/$name.narinfo" | cut -d' ' -f2)
+fsp=$(narinfo_field StorePath "$work/fetch/$name.narinfo" 2>/dev/null || true)
 [ "x$fsp" = "x$want" ] || miss "fetched StorePath ($fsp) != $want"
 
-narfile=$(grep '^NarFile: ' "$work/fetch/$name.narinfo" | cut -d' ' -f2)
+narfile=$(narinfo_field NarFile "$work/fetch/$name.narinfo" 2>/dev/null || true)
 
 # Restore the WHOLE tree into a sibling temp, sanity-check the harness shape, then atomically
 # swap it into DEST (mirrors gate 420's persist: assemble beside, then swap into place).

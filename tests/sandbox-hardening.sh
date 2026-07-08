@@ -14,7 +14,7 @@
 # Runs INSIDE the loop sandbox (the gate already nests one); the nested
 # td-builder's processes are visible in this PID namespace, so a /proc cmdline
 # scan can confirm they are gone after the kill. No pgrep (absent from the
-# toolchain) — pure bash + coreutils + grep.
+# toolchain) — pure bash + coreutils + td text checks.
 set -euo pipefail
 tb=${1:?usage: sandbox-hardening.sh TD_BUILDER}
 realbash=$(readlink -f "$(command -v bash)")
@@ -58,7 +58,7 @@ scan() {                          # count procs whose cmdline contains $marker
   local n=0 f
   for f in /proc/[0-9]*/cmdline; do
     [ -r "$f" ] || continue
-    if tr '\0' ' ' < "$f" 2>/dev/null | grep -q -- "$marker"; then n=$((n + 1)); fi
+    if tr '\0' ' ' < "$f" 2>/dev/null | "$tb" text contains "$marker" -; then n=$((n + 1)); fi
   done
   printf %s "$n"
 }
@@ -66,7 +66,7 @@ sweep() {                         # SIGKILL any leftover marker-carrying procs
   local f p
   for f in /proc/[0-9]*/cmdline; do
     [ -r "$f" ] || continue
-    if tr '\0' ' ' < "$f" 2>/dev/null | grep -q -- "$marker"; then
+    if tr '\0' ' ' < "$f" 2>/dev/null | "$tb" text contains "$marker" -; then
       p=${f#/proc/}; p=${p%/cmdline}; kill -9 "$p" 2>/dev/null || true
     fi
   done

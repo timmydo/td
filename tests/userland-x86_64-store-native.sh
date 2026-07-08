@@ -66,6 +66,30 @@ emit_cc() {
   chmod 0555 "$1"
 }
 
+rewrite_bin_sh_shebangs() {
+  _rbs_dir=$1
+  _rbs_shell=$2
+  "$TB" files "$_rbs_dir" | while IFS= read -r _rbs_f; do
+    [ -f "$_rbs_f" ] || continue
+    IFS= read -r _rbs_first < "$_rbs_f" || continue
+    case "$_rbs_first" in
+      '#!'*'/bin/sh'*)
+        _rbs_tmp="$_rbs_f.td-shebang.$$"
+        { printf '#!%s\n' "$_rbs_shell"; tail -n +2 "$_rbs_f"; } > "$_rbs_tmp" && mv "$_rbs_tmp" "$_rbs_f"
+        ;;
+    esac
+  done
+}
+
+pin_autotools_mtime() {
+  _pam_dir=$1
+  "$TB" files "$_pam_dir" | while IFS= read -r _pam_f; do
+    case "$_pam_f" in
+      *.in|*.am|*.ac|*.m4|*/configure) touch -t 202601010101 "$_pam_f" ;;
+    esac
+  done
+}
+
 # build_make_x86_64 <cpath> <xgcc2> <xglibc> <xlibgccdir> <xbu> <out> — GNU make 4.4.1, the
 # build driver. Configure+build with the runnable cc; output: $out/make (interp relinked later).
 build_make_x86_64() {
@@ -76,15 +100,15 @@ build_make_x86_64() {
   tar -xzf "$MK_TB" -C "$src" --strip-components=1 || { echo "make unpack failed" >&2; return 1; }
   # The sandbox has NO /bin/sh: run configure THROUGH the curated shell (its #!/bin/sh shebang
   # would otherwise fail "No such file or directory"), and rewrite any #!/bin/sh helper shebangs.
-  find "$src" -type f -exec sed -i "1s|^#! */bin/sh\b|#!$csh|" {} + 2>/dev/null || true
+  rewrite_bin_sh_shebangs "$src" "$csh" || true
   # Tarball mtime ordering makes `make` try to re-run automake/autoconf (absent → Error 127).
   # Pin all autotools build-system files to ONE mtime so none is strictly newer than another
   # (a target is only rebuilt when a prerequisite is *strictly* newer) → no regeneration.
-  find "$src" -type f \( -name '*.in' -o -name '*.am' -o -name '*.ac' -o -name '*.m4' -o -name configure \) -exec touch -t 202601010101 {} + 2>/dev/null || true
+  pin_autotools_mtime "$src" || true
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
   ( cd "$src"; bp="$xb/bin:$XBIN:$mc"   # $XBIN = the cross-fns _xbin scaffolding (awk/m4/bison/flex/cmp/...); target binaries find glibc via the absolute build-dir rpath the cc wrapper bakes (NO LD_LIBRARY_PATH — it would poison the host gawk)
     env PATH="$bp" CC="$wb/cc" CPP="$wb/cc -E" CONFIG_SHELL="$csh" SHELL="$csh" "$csh" ./configure --build="$XTARGET" --host="$XTARGET" --disable-dependency-tracking >cfg.log 2>&1 \
-      || { echo "make configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_makex-cfg.log" 2>/dev/null||true; cp config.log "$ROOT/.td-build-cache/_makex-config.log" 2>/dev/null||true; echo "--- config.log CPP/conftest tail ---" >&2; grep -iE 'cpp|conftest|preprocess|cc1|No such|error|cannot' config.log 2>/dev/null | tail -30 >&2; return 1; }
+      || { echo "make configure failed" >&2; cp cfg.log "$ROOT/.td-build-cache/_makex-cfg.log" 2>/dev/null||true; cp config.log "$ROOT/.td-build-cache/_makex-config.log" 2>/dev/null||true; echo "--- config.log tail ---" >&2; tail -60 config.log >&2; return 1; }
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= make SHELL="$csh" CONFIG_SHELL="$csh" >build.log 2>&1 \
       || { echo "make build failed" >&2; cp build.log "$ROOT/.td-build-cache/_makex-build.log" 2>/dev/null||true; tail -25 build.log >&2; return 1; }
     cp -a make "$out/make" ) || return 1
@@ -104,13 +128,20 @@ build_busybox_x86_64() {
   "$bz" -dc "$BB_TB" | tar -xf - -C "$src" --strip-components=1 || { echo "busybox unpack failed" >&2; return 1; }
   # The sandbox has NO /bin/sh: busybox's Kbuild + gen scripts (#!/bin/sh) would fail. Rewrite the
   # shebangs to the curated shell and pass SHELL/CONFIG_SHELL to every make so recipes use it too.
-  find "$src" -type f -exec sed -i "1s|^#! */bin/sh\b|#!$csh|" {} + 2>/dev/null || true
+  rewrite_bin_sh_shebangs "$src" "$csh" || true
   wb=`mktemp -d`/wb; mkdir -p "$wb"; emit_cc "$wb/cc" "$xg" "$xgl" "$xlg"
   ( cd "$src"; bp="$xb/bin:$XBIN:$mc"   # $XBIN = the cross-fns _xbin scaffolding (awk/m4/bison/flex/cmp/...); target binaries find glibc via the absolute build-dir rpath the cc wrapper bakes (NO LD_LIBRARY_PATH — it would poison the host gawk)
     env PATH="$bp" make CC="$wb/cc" HOSTCC="$wb/cc" SHELL="$csh" CONFIG_SHELL="$csh" defconfig >cfg.log 2>&1 \
       || { echo "busybox defconfig failed" >&2; tail -20 cfg.log >&2; return 1; }
     # dynamic (not CONFIG_STATIC), non-PIE, point the linker at the build-dir glibc archives.
-    sed -i -E '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d' .config
+    _cfg=.config.td
+    while IFS= read -r _line; do
+      case "$_line" in
+        CONFIG_STATIC*|'# CONFIG_STATIC'*|CONFIG_PIE*|'# CONFIG_PIE'*|CONFIG_EXTRA_LDFLAGS*|'# CONFIG_EXTRA_LDFLAGS'*) continue ;;
+        *) printf '%s\n' "$_line" ;;
+      esac
+    done < .config > "$_cfg"
+    mv "$_cfg" .config
     { echo '# CONFIG_STATIC is not set'; echo '# CONFIG_PIE is not set'; echo "CONFIG_EXTRA_LDFLAGS=\"-L$xgl/lib -L$xlg\""; } >> .config
     yes "" | env PATH="$bp" make CC="$wb/cc" HOSTCC="$wb/cc" SHELL="$csh" CONFIG_SHELL="$csh" oldconfig >/dev/null 2>&1
     env PATH="$bp" MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= MAKELEVEL= \
@@ -202,7 +233,7 @@ test -e /bin/sh || fail "could not provide /bin/sh for popen() in the sandbox (r
 build_make_x86_64    "$cpath" "$XGCC2" "$XGLIBC" "$XLIBGCCDIR" "$XBU" "$MKX" || fail "the cross gcc did not build GNU make 4.4.1"
 build_busybox_x86_64 "$cpath" "$XGCC2" "$XGLIBC" "$XLIBGCCDIR" "$XBU" "$BBX" || fail "the cross gcc did not build busybox 1.37.0"
 for b in "$MKX/make" "$BBX/busybox"; do
-  ! grep -q -a '/gnu/store' "$b" || fail "$b contains /gnu/store bytes — not guix-free"
+  "$TB" text not-contains '/gnu/store' "$b" || fail "$b contains /gnu/store bytes — not guix-free"
 done
 echo "   [provenance] built busybox + make carry zero /gnu/store bytes"
 
@@ -231,12 +262,12 @@ out=`"$TB" store-add-recursive userland-x86_64-store-native "$tree" "$ustore" "$
 case "$out" in /td/store/*-userland-x86_64-store-native) ;; *) fail "interned path not content-addressed under /td/store (got: $out)" ;; esac
 phys="$ustore/`basename "$out"`"; rel=${out#/td/store/}
 test -x "$phys/bin/busybox" -a -x "$phys/bin/make" || fail "interned tree missing busybox/make"
-if grep -r -a -q '/gnu/store' "$phys" 2>/dev/null; then fail "interned set contains /gnu/store: `grep -r -a -l '/gnu/store' "$phys" 2>/dev/null | head -1`"; fi
+"$TB" tree-not-contains '/gnu/store' "$phys" || fail "interned set contains /gnu/store"
 echo "   [no-guix] interned $out — zero /gnu/store (busybox/make + td-built glibc/libgcc)"
 for need in libc.so.6 libm.so.6 libgcc_s.so.1; do ls "$phys"/lib/*"$need"* >/dev/null 2>&1 || fail "interned lib/ missing $need"; done
 echo "   [structural] the interned lib/ holds the userland runtime closure"
 cp -L "$XGLIBC/lib/ld-linux-x86-64.so.2" "$ustore/ld" || fail "could not place the x86_64 loader at /td/store/ld"
-! grep -q -a '/gnu/store' "$ustore/ld" || fail "the /td/store/ld loader contains /gnu/store bytes"
+"$TB" text not-contains '/gnu/store' "$ustore/ld" || fail "the /td/store/ld loader contains /gnu/store bytes"
 
 # --- RUN busybox sh + make from /td/store in the store-ns own-root ---------------------------
 cat > "$ustore/probe.sh" <<PROBE
@@ -248,13 +279,14 @@ make --version > /tmp/mv 2>&1 && echo MAKE-RAN   # MAKE-RAN reflects make's OWN 
 head -1 /tmp/mv
 PROBE
 out2=`"$TB" store-ns "$ustore" -- "/td/store/$rel/bin/busybox" sh /td/store/probe.sh 2>&1` \
-  || { printf '%s\n' "$out2" | sed 's/^/     /' >&2; fail "store-ns userland run exited nonzero"; }
-printf '%s\n' "$out2" | sed 's/^/     /'
-printf '%s\n' "$out2" | grep -q '^BUSYBOX-RAN$' || fail "busybox did not run from /td/store"
-printf '%s\n' "$out2" | grep -q '^GNU Make 4\.4' || fail "make did not print its version from /td/store"
-printf '%s\n' "$out2" | grep -q '^MAKE-RAN$'     || fail "make --version did not run cleanly from /td/store"
+  || { printf '%s\n' "$out2" > "$snwork/userland.out"; while IFS= read -r line; do printf '     %s\n' "$line" >&2; done < "$snwork/userland.out"; fail "store-ns userland run exited nonzero"; }
+printf '%s\n' "$out2" > "$snwork/userland.out"
+while IFS= read -r line; do printf '     %s\n' "$line"; done < "$snwork/userland.out"
+"$TB" text line-exact 'BUSYBOX-RAN' "$snwork/userland.out" || fail "busybox did not run from /td/store"
+"$TB" text extract-prefix 'GNU Make 4.4' "$snwork/userland.out" >/dev/null || fail "make did not print its version from /td/store"
+"$TB" text line-exact 'MAKE-RAN' "$snwork/userland.out" || fail "make --version did not run cleanly from /td/store"
 echo "   [behavioral] busybox + make RAN from /td/store in the store-ns own-root → GNU Make 4.4.1"
-printf '%s\n' "$out2" | grep -q '^GNU-ABSENT$'   || fail "/gnu/store is PRESENT in the own-root"
+"$TB" text line-exact 'GNU-ABSENT' "$snwork/userland.out" || fail "/gnu/store is PRESENT in the own-root"
 echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT"
 
 # --- Increment 3: stage the C TOOLCHAIN into the harness so the guix-free loop can BUILD
@@ -272,10 +304,10 @@ chmod -R u+w "$ustore"
 # guix-byte-free check on the COMPILE-PATH binaries (as x86_64_verify_closure does), NOT a
 # recursive grep — the latter reds on seed utility SCRIPTS (gcc install-tools, glibc mtrace
 # shebangs) that are scaffolding, not the deliverable ([[td-x86-64-fetch-path-gotchas]]).
-_xcc1=`find "$ustore/$gccb" -name cc1 2>/dev/null | head -1`
+_xcc1=`"$TB" files-name-first cc1 "$ustore/$gccb"`
 for _b in "$ustore/$glibcb/lib/libc.so.6" "$ustore/$gccb/bin/$XTARGET-gcc" "$_xcc1"; do
   { [ -n "$_b" ] && [ -e "$_b" ]; } || fail "staged toolchain missing a compile-path binary ($_b)"
-  ! grep -q -a '/gnu/store' "$_b" || fail "staged harness toolchain binary $_b contains /gnu/store bytes"
+  "$TB" text not-contains '/gnu/store' "$_b" || fail "staged harness toolchain binary $_b contains /gnu/store bytes"
 done
 test -x "$ustore/$gccb/bin/$XTARGET-gcc" || fail "staged toolchain missing $XTARGET-gcc"
 echo "   [inc3] staged the C toolchain {binutils,gcc,glibc} into the harness — the guix-free loop can now COMPILE (not just drive text)"

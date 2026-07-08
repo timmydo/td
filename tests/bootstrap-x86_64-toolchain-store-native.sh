@@ -41,7 +41,15 @@ GLIBC_P2="$ROOT/seed/patches/glibc-bootstrap-system-2.2.5.patch"
 GLIBC_P2_SHA=a8a214f78c96723fee3d9d26b59249029e617bc720880ca2789a66ed73e2c7d0
 
 # --- [pinned-input] all source tarballs + the vendored boot patch match their pins ----------------
-lf() { sed -n "s/^$2 //p" "$1" | head -1; }
+lf() {
+  _want=$2
+  while IFS=' ' read -r _key _rest; do
+    [ "$_key" = "$_want" ] || continue
+    printf '%s\n' "$_rest"
+    return 0
+  done < "$1"
+  return 1
+}
 MES_LOCK=`ls seed/sources/mes-*.lock | head -1`;       NYACC_LOCK=`ls seed/sources/nyacc-*.lock | head -1`
 TCC_LOCK=`ls seed/sources/tcc-0.9.26*.lock | head -1`; MAKE_LOCK=`ls seed/sources/make-*.lock | head -1`
 PATCH_LOCK=`ls seed/sources/patch-*.lock | head -1`;   BU_LOCK=`ls seed/sources/binutils-*.lock | head -1`
@@ -54,7 +62,9 @@ PATCH_TB=".td-build-cache/sources/`lf "$PATCH_LOCK" file`"; BU_TB=".td-build-cac
 GCC_TB=".td-build-cache/sources/`lf "$GCC_LOCK" file`";     GLIBC_TB=".td-build-cache/sources/`lf "$GLIBC_LOCK" file`"
 LINUX_TB=".td-build-cache/sources/`lf "$LINUX_LOCK" file`"
 # the host-produced kernel-headers tarball (td-feed warm kernel-headers i386; derived from the pinned linux src)
-KH_VER=`printf '%s' "\`lf "$LINUX_LOCK" file\`" | sed -n 's/^linux-\(.*\)\.tar\..*$/\1/p'`
+_kh_file=`lf "$LINUX_LOCK" file`
+KH_VER=${_kh_file#linux-}
+KH_VER=${KH_VER%%.tar*}
 KH_TB=".td-build-cache/sources/linux-headers-$KH_VER-i386.tar.gz"
 for pair in "$MES_TB:`lf "$MES_LOCK" sha256`" "$NYACC_TB:`lf "$NYACC_LOCK" sha256`" "$TCC_TB:`lf "$TCC_LOCK" sha256`" \
             "$MAKE_TB:`lf "$MAKE_LOCK" sha256`" "$PATCH_TB:`lf "$PATCH_LOCK" sha256`" "$BU_TB:`lf "$BU_LOCK" sha256`" \

@@ -32,7 +32,15 @@ set -eu
 ROOT=$(pwd)
 fail() { echo "FAIL: $*" >&2; exit 1; }
 sha() { sha256sum "$1" | cut -d' ' -f1; }
-lf() { sed -n "s/^$2 //p" "$1" | head -1; }
+lf() {
+  _want=$2
+  while IFS=' ' read -r _key _rest; do
+    [ "$_key" = "$_want" ] || continue
+    printf '%s\n' "$_rest"
+    return 0
+  done < "$1"
+  return 1
+}
 
 # --- [supply-chain] the pinned Rust release tarball matches its sha256 pin --------------------
 RUST_LOCK=$(ls seed/sources/rust-1.96.0*.lock 2>/dev/null | head -1)
@@ -64,9 +72,7 @@ echo "   [recipe-graph] build-plan --auto rust-toolchain built the relinked, con
 # co-located libc/libgcc_s/libz), as the retired gate 416 did. This is the north-star "zero guix
 # bytes" leg: the co-located libgcc_s/libz come from the td-built gcc-x86-64-stage2 / zlib-x86-64
 # rungs, and libLLVM/rustlib from the upstream-not-guix release — none may embed a /gnu/store path.
-if grep -r -a -q '/gnu/store' "$XRUSTTREE" 2>/dev/null; then
-  fail "the interned rust tree contains /gnu/store bytes: $(grep -r -a -l '/gnu/store' "$XRUSTTREE" 2>/dev/null | head -1)"
-fi
+"$TB" tree-not-contains '/gnu/store' "$XRUSTTREE" || fail "the interned rust tree contains /gnu/store bytes"
 echo "   [no-guix] the whole relinked rust deliverable (rustc/cargo/libLLVM/rustlib + co-located libc/libgcc_s/libz) carries zero /gnu/store bytes"
 
 # --- [behavioral] rustc + cargo RUN from /td/store in a store-ns own-root, /gnu/store ABSENT ---
@@ -90,13 +96,14 @@ cat > "$store/probe.sh" <<PROBE
 /td/store/$rustbase/bin/cargo --version && echo CARGO-OK
 PROBE
 out=$("$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" /td/store/probe.sh 2>&1) \
-  || { printf '%s\n' "$out" | sed 's/^/     /' >&2; fail "store-ns rustc/cargo probe exited nonzero"; }
-printf '%s\n' "$out" | sed 's/^/     /'
-printf '%s\n' "$out" | grep -q '^GNU-ABSENT$'  || fail "/gnu/store is PRESENT in the own-root"
-printf '%s\n' "$out" | grep -q '^rustc 1\.96\.0' || fail "rustc did not report 1.96.0 from /td/store"
-printf '%s\n' "$out" | grep -q '^RUSTC-VV-OK$'  || fail "rustc -vV did not run cleanly from /td/store"
-printf '%s\n' "$out" | grep -q '^cargo 1\.96\.0' || fail "cargo did not report 1.96.0 from /td/store"
-printf '%s\n' "$out" | grep -q '^CARGO-OK$'     || fail "cargo --version did not run cleanly from /td/store"
+  || { printf '%s\n' "$out" > "$snwork/probe.out"; while IFS= read -r line; do printf '     %s\n' "$line" >&2; done < "$snwork/probe.out"; fail "store-ns rustc/cargo probe exited nonzero"; }
+printf '%s\n' "$out" > "$snwork/probe.out"
+while IFS= read -r line; do printf '     %s\n' "$line"; done < "$snwork/probe.out"
+"$TB" text line-exact 'GNU-ABSENT' "$snwork/probe.out" || fail "/gnu/store is PRESENT in the own-root"
+"$TB" text extract-prefix 'rustc 1.96.0' "$snwork/probe.out" >/dev/null || fail "rustc did not report 1.96.0 from /td/store"
+"$TB" text line-exact 'RUSTC-VV-OK' "$snwork/probe.out" || fail "rustc -vV did not run cleanly from /td/store"
+"$TB" text extract-prefix 'cargo 1.96.0' "$snwork/probe.out" >/dev/null || fail "cargo did not report 1.96.0 from /td/store"
+"$TB" text line-exact 'CARGO-OK' "$snwork/probe.out" || fail "cargo --version did not run cleanly from /td/store"
 echo "   [behavioral] rustc + cargo RUN from /td/store in the own-root (/gnu/store ABSENT), reporting 1.96.0"
 
 # --- [verified-red] the transform reds naming a declared input absent from TD_INPUT_MAP --------
@@ -105,7 +112,7 @@ badmap='{"gcc-x86-64-stage2":"/nonexistent","zlib-x86-64":"/nonexistent","tar":"
 if env TD_SRC="$RUST_TB" TD_INPUT_MAP="$badmap" out="$snwork/vr" "$TB" rust-toolchain-build 2>"$snwork/vr.err"; then
   fail "verified-red: the transform SUCCEEDED with glibc-x86-64 absent from TD_INPUT_MAP"
 fi
-grep -q 'glibc-x86-64' "$snwork/vr.err" || { cat "$snwork/vr.err" >&2; fail "verified-red: the transform red did not name glibc-x86-64"; }
+"$TB" text contains 'glibc-x86-64' "$snwork/vr.err" || { cat "$snwork/vr.err" >&2; fail "verified-red: the transform red did not name glibc-x86-64"; }
 echo "   [verified-red] the transform reds naming glibc-x86-64 when its input is absent from TD_INPUT_MAP"
 
 echo "PASS: rust-toolchain recipe check — build-plan --auto builds the /td/store rust toolchain over"

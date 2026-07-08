@@ -101,7 +101,7 @@ chain_cache_init() {
 
 # chain_gc NAMESPACE — whole-key eviction. A key is stale when its `last-used` stamp is
 # older than TD_CHECK_CHAIN_GC_DAYS (default 14; non-numeric ⇒ GC off), or absent (a
-# partial/legacy key). `find -mtime +N` buckets age into whole 24h periods, so the
+# partial/legacy key). `td-builder path-older-than` compares whole seconds, so the
 # effective cutoff is the first N-day-plus boundary (a hair conservative — keeps a key
 # up to a day longer, never sweeps too soon). Each stale candidate is removed ONLY while
 # its own exclusive .lock is takeable non-blocking — a key another agent is mid-build or
@@ -121,7 +121,7 @@ chain_gc() {
     [ "$_gcd" = "$CHAIN_DIR" ] && continue             # never sweep the key we just took
     # Keep a key whose stamp EXISTS and is fresh; everything else is a candidate.
     if [ -f "$_gcd/last-used" ] && \
-       [ -z "`find "$_gcd/last-used" -mtime +"$_gcdays" -print 2>/dev/null`" ]; then
+       ! "$TB" path-older-than "$_gcd/last-used" "$_gcdays" 2>/dev/null; then
       continue
     fi
     # Confinement: only ever a dir the glob produced under the cache root (defensive —
@@ -143,7 +143,7 @@ chain_gc() {
 
 # chain_path NAME — the recorded brick dir (empty when absent).
 chain_path() {
-  sed -n 's/^dir //p' "$CHAIN_DIR/.brick-$1" 2>/dev/null | head -1
+  "$TB" text extract-prefix 'dir ' "$CHAIN_DIR/.brick-$1" 2>/dev/null || true
 }
 
 # chain_hit NAME — verified reuse. Every recorded product must exist AND nar-hash to its

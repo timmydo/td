@@ -27,8 +27,15 @@ echo ">> relink driver (stage0 td-builder, guix-free): $TB"
 # --- [supply-chain] the warmed upstream tarball matches the lock sha256 (upstream, not guix) -
 LOCK=`ls seed/sources/rust-*.lock 2>/dev/null | head -1`
 test -n "$LOCK" || fail "no seed/sources/rust-*.lock pin"
-SHA=`sed -n 's/^sha256 //p' "$LOCK" | head -1`
-FILE=`sed -n 's/^file //p' "$LOCK" | head -1`
+SHA=
+FILE=
+while IFS=' ' read -r _key _rest; do
+  case "$_key" in
+    sha256) [ -n "$SHA" ] || SHA="$_rest" ;;
+    file) [ -n "$FILE" ] || FILE="$_rest" ;;
+  esac
+done < "$LOCK"
+test -n "$SHA" -a -n "$FILE" || fail "lock $LOCK is missing file/sha256"
 TARBALL=".td-build-cache/sources/$FILE"
 test -f "$TARBALL" || fail "warmed $TARBALL absent — run td-feed warm sources (host PREP)"
 test "`sha "$TARBALL"`" = "$SHA" || fail "warmed $TARBALL sha256 != lock pin ($SHA) — corrupt fetch or stale lock"
@@ -49,8 +56,7 @@ cp "$scratch/$top"/rustc/lib/*.so "$tree/lib/" 2>/dev/null || true
 
 # --- [provenance] the upstream binaries carry NO /gnu/store (the point of upstream-not-guix) -
 for b in "$tree/bin/rustc" "$tree/bin/cargo"; do
-  n=`grep -c -a '/gnu/store' "$b" || true`
-  test "$n" = 0 || fail "$b contains $n /gnu/store reference(s) — not guix-free upstream"
+  "$TB" text not-contains '/gnu/store' "$b" || fail "$b contains /gnu/store reference(s) — not guix-free upstream"
 done
 echo "   [provenance] upstream rustc + cargo carry zero /gnu/store bytes"
 
@@ -85,10 +91,7 @@ test -d "$phys" || fail "interned tree missing physically at $phys"
 echo "   [structural] interned content-addressed at $out (guix-free, td's own store_db)"
 
 # --- [structural] the INTERNED tree has zero /gnu/store anywhere; interp still under /td/store
-# (grep -q, not awk: the loop sandbox userland has no awk)
-if grep -r -a -q '/gnu/store' "$phys" 2>/dev/null; then
-  fail "interned tree contains a /gnu/store reference: `grep -r -a -l '/gnu/store' "$phys" 2>/dev/null | head -1`"
-fi
+"$TB" tree-not-contains '/gnu/store' "$phys" || fail "interned tree contains a /gnu/store reference"
 ri=`"$TB" elf-interp "$phys/bin/rustc"`
 case "$ri" in /td/store/*) ;; *) fail "interned rustc interp not under /td/store (got: $ri)" ;; esac
 echo "   [structural] interned tree: zero /gnu/store, rustc interp ∈ /td/store ($ri)"

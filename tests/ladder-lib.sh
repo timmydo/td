@@ -12,14 +12,39 @@
 # TD_RECIPE_EVAL (load_recipe_eval), and the td-fetched tarballs warm under
 # .td-build-cache/sources (td-feed warm sources).
 
+ladder_lock_value() {
+  _llv_key=$1
+  _llv_lock=$2
+  while IFS=' ' read -r _llv_k _llv_rest; do
+    [ "$_llv_k" = "$_llv_key" ] || continue
+    printf '%s\n' "$_llv_rest"
+    return 0
+  done < "$_llv_lock"
+  return 1
+}
+
+ladder_linux_version() {
+  _llv_file=`ladder_lock_value file "$1"` || return 1
+  _llv_ver=${_llv_file#linux-}
+  printf '%s\n' "${_llv_ver%%.tar*}"
+}
+
+ladder_map_has() {
+  _lmh_name=$1
+  [ -f "$LW/srcs.map" ] || return 1
+  while IFS=' ' read -r _lmh_n _lmh_rest; do
+    [ "$_lmh_n" = "$_lmh_name" ] && return 0
+  done < "$LW/srcs.map"
+  return 1
+}
+
 # ladder_tool_root NAME PROBE — the store package root providing PROBE. Resolution
 # order: (1) the PINNED committed lock (tests/hello-no-guix.lock — regenerated on
 # channel bumps, so the tool set is pinned, unlike the deleted ladder's bare globs);
 # (2) the loop PATH (`command -v`); (3) the store glob the old ladder used (flex/
 # bison/m4 are in no committed lock — same hermeticity as before, shrink later).
 ladder_tool_root() {
-  _r=`grep " /gnu/store/" tests/hello-no-guix.lock 2>/dev/null | sed 's/^[^ ]* //; s/ .*$//' \
-      | grep -E "/[a-z0-9]{32}-$1-[0-9]" | head -1`
+  _r=`"$TB" lock path tests/hello-no-guix.lock "$1" 2>/dev/null || true`
   if [ -z "$_r" ] || [ ! -x "$_r/bin/$2" ]; then
     _bin=`command -v "$2" 2>/dev/null || true`
     if [ -n "$_bin" ]; then
@@ -56,14 +81,18 @@ ladder_setup() {
   # EACCESes, so they run ONCE per pin-set — keyed on the source locks + patches +
   # the seed tree; a pin change wipes and re-interns.
   # LADDER_SETUP_V bumps force a re-setup when the source SET grows.
-  _pinsum=`{ echo ladder-setup-v2; cat seed/sources/*.lock seed/patches/*.patch; find seed/stage0 -type f | sort | xargs cat; } 2>/dev/null | sha256sum | cut -d' ' -f1`
+  _pinsum=`{
+    echo ladder-setup-v3
+    cat seed/sources/*.lock seed/patches/*.patch
+    "$TB" files seed/stage0 | while IFS= read -r _sf; do cat "$_sf"; done
+  } 2>/dev/null | sha256sum | cut -d' ' -f1`
   if [ -f "$LW/setup-ok" ] && [ "`cat "$LW/setup-ok"`" = "$_pinsum" ]; then
     # slice 4: add the x86_64 kernel headers to an already-warm ladder WITHOUT a full
     # re-setup (idempotent — interns only if absent, a NEW store path so no EACCES). This
     # is why adding the x86_64 rungs did NOT need a LADDER_SETUP_V bump.
-    if ! grep -q '^linux-headers-x86-64 ' "$LW/srcs.map" 2>/dev/null; then
+    if ! ladder_map_has linux-headers-x86-64; then
       _lkv=`ls seed/sources/linux-*.lock | head -1`
-      _vv=`sed -n 's/^file linux-\(.*\)\.tar\..*$/\1/p' "$_lkv" | head -1`
+      _vv=`ladder_linux_version "$_lkv"` || { echo "ladder: no linux source file in $_lkv" >&2; return 1; }
       _khx=".td-build-cache/sources/linux-headers-$_vv-x86_64.tar.gz"
       test -f "$_khx" || { echo "ladder: x86_64 kernel-headers tarball not warm ($_khx)" >&2; return 1; }
       _p=`TD_STORE_DIR=/td/store "$TB" store-add-recursive linux-headers-x86-64 "$_khx" "$LW/store" "$LW/db"` \
@@ -92,7 +121,7 @@ ladder_setup() {
     _stem=${spec%%:*}; _name=${spec##*:}
     _lock=`ls seed/sources/$_stem*.lock 2>/dev/null | head -1`
     test -n "$_lock" || { echo "ladder: no seed/sources lock for $_stem" >&2; return 1; }
-    _file=".td-build-cache/sources/`sed -n 's/^file //p' "$_lock" | head -1`"
+    _file=".td-build-cache/sources/`ladder_lock_value file "$_lock"`"
     test -f "$_file" || { echo "ladder: pinned tarball not warm ($_file) — run 'td-feed warm sources'" >&2; return 1; }
     _p=`TD_STORE_DIR=/td/store "$TB" store-add-recursive "$_name" "$_file" "$LW/store" "$LW/db"` \
       || { echo "ladder: intern $_name failed" >&2; return 1; }
@@ -100,7 +129,7 @@ ladder_setup() {
   done
   # the host-produced kernel-headers tarball (td-feed warm sources)
   _lk=`ls seed/sources/linux-*.lock | head -1`
-  _v=`sed -n 's/^file linux-\(.*\)\.tar\..*$/\1/p' "$_lk" | head -1`
+  _v=`ladder_linux_version "$_lk"` || { echo "ladder: no linux source file in $_lk" >&2; return 1; }
   _kh=".td-build-cache/sources/linux-headers-$_v-i386.tar.gz"
   test -f "$_kh" || { echo "ladder: kernel-headers tarball not warm ($_kh)" >&2; return 1; }
   _p=`TD_STORE_DIR=/td/store "$TB" store-add-recursive linux-headers "$_kh" "$LW/store" "$LW/db"` \
@@ -152,10 +181,10 @@ ladder_stage_tdstore() {
 # to the cross-toolchain gates). Requires ladder_setup already ran ($LW set).
 ladder_intern_extra() {
   _name=$1; _stem=$2
-  grep -q "^$_name " "$LW/srcs.map" 2>/dev/null && return 0
+  ladder_map_has "$_name" && return 0
   _lock=`ls seed/sources/$_stem*.lock 2>/dev/null | head -1`
   test -n "$_lock" || { echo "ladder: no seed/sources lock for $_stem" >&2; return 1; }
-  _file=".td-build-cache/sources/`sed -n 's/^file //p' "$_lock" | head -1`"
+  _file=".td-build-cache/sources/`ladder_lock_value file "$_lock"`"
   test -f "$_file" || { echo "ladder: pinned tarball not warm ($_file) — run 'td-feed warm sources'" >&2; return 1; }
   _p=`TD_STORE_DIR=/td/store "$TB" store-add-recursive "$_name" "$_file" "$LW/store" "$LW/db"` \
     || { echo "ladder: intern $_name failed" >&2; return 1; }
@@ -169,7 +198,16 @@ ladder_intern_extra() {
 
 # ladder_map NAME — the interned path (srcs.map) or tool root (tools.map).
 ladder_map() {
-  _v=`sed -n "s/^$1 //p" "$LW/srcs.map" "$LW/tools.map" 2>/dev/null | head -1`
+  _v=
+  for _mf in "$LW/srcs.map" "$LW/tools.map"; do
+    [ -f "$_mf" ] || continue
+    while IFS=' ' read -r _mn _mr; do
+      [ "$_mn" = "$1" ] || continue
+      _v=$_mr
+      break
+    done < "$_mf"
+    [ -n "$_v" ] && break
+  done
   test -n "$_v" || { echo "ladder: no map entry for \`$1'" >&2; return 1; }
   printf '%s\n' "$_v"
 }
@@ -200,7 +238,12 @@ ladder_build() {
 # ladder_out RUNG — the built output dir for RUNG from the last plan run (the shared
 # td-store the plan stages through).
 ladder_out() {
-  _o=`sed -n "s/^STEP $1 //p" "$LW"/build-*.out 2>/dev/null | tail -1`
+  _o=
+  for _of in "$LW"/build-*.out; do
+    [ -f "$_of" ] || continue
+    _got=`"$TB" text extract-prefix-last "STEP $1 " "$_of" 2>/dev/null || true`
+    [ -n "$_got" ] && _o=$_got
+  done
   test -n "$_o" || { echo "ladder: no STEP output recorded for $1" >&2; return 1; }
   printf '%s/tdstore/%s\n' "$LW/scratch" "${_o##*/}"
 }

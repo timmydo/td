@@ -22,15 +22,18 @@ store="$base/store"
 db="$base/builder.db"
 meta="$base/.stage0-meta"
 test -s "$lock" || { echo "stage0-builder: no toolchain lock $lock" >&2; exit 1; }
+td_self="${TD_BUILDER_SELF:?stage0-builder requires TD_BUILDER_SELF for source fingerprinting}"
+test -x "$td_self" || { echo "stage0-builder: TD_BUILDER_SELF is not executable: $td_self" >&2; exit 1; }
 
 # Fingerprint the builder source the stage0 is compiled from — reuse only if unchanged.
-fp=`find builder/src builder/build.rs builder/Cargo.toml builder/Cargo.lock -type f -exec sha256sum {} + \
-     | sort | sha256sum | cut -d' ' -f1`
+fp=`"$td_self" tree-fingerprint builder/src builder/build.rs builder/Cargo.toml builder/Cargo.lock`
 # A valid memo: the fingerprint matches AND the placement + db are present. Sets $cb.
 memo_hit() {
   [ -f "$meta" ] || return 1
-  oldfp=`sed -n 1p "$meta"`
-  cb=`sed -n 2p "$meta"`
+  {
+    IFS= read -r oldfp || oldfp=
+    IFS= read -r cb || cb=
+  } < "$meta"
   [ "$oldfp" = "$fp" ] && [ -n "$cb" ] \
     && [ -x "$store/`basename "$cb"`/bin/td-builder" ] && [ -s "$db" ]
 }

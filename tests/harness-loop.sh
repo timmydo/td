@@ -34,7 +34,7 @@ bb=`command -v busybox` || fail "busybox not resolvable on the harness PATH"
 case "$bb" in /td/store/*) echo "  STORE-IS-TDSTORE ($bb)" ;; *) fail "busybox is not from /td/store: $bb" ;; esac
 mk=`command -v make` || fail "make not resolvable on the harness PATH"
 case "$mk" in /td/store/*) : ;; *) fail "make is not from /td/store: $mk" ;; esac
-mv=`make --version 2>/dev/null | sed -n '1p'`
+mv=`make --version 2>/dev/null | { IFS= read -r line || line=; printf '%s\n' "$line"; }`
 case "$mv" in "GNU Make 4."*) echo "  MAKE-OK ($mv)" ;; *) fail "harness make did not report GNU Make 4.x: '$mv'" ;; esac
 
 # [behavioral] the /td/store GNU make drives a REAL build graph over the busybox userland.
@@ -78,8 +78,11 @@ echo "  MAKE-BUILD-OK (graph produced ALPHA/BETA/GAMMA from src via busybox tr+c
 
 # 2. Incremental no-op — nothing changed, make must rebuild nothing.
 run_make >"$work/log2" 2>&1 || { cat "$work/log2" >&2; fail "harness make: second build failed"; }
-grep -q 'Nothing to be done\|is up to date' "$work/log2" \
-  || fail "harness make: a no-op rebuild was not detected (incremental logic broken): `cat "$work/log2"`"
+log2=`cat "$work/log2"`
+case "$log2" in
+  *"Nothing to be done"*|*"is up to date"*) ;;
+  *) fail "harness make: a no-op rebuild was not detected (incremental logic broken): $log2" ;;
+esac
 echo "  MAKE-INCREMENTAL-NOOP-OK (make rebuilt nothing on an unchanged tree)"
 
 # 3. Incremental change — touch ONE input; only its path (a.up) and the report rebuild.
@@ -90,7 +93,10 @@ want=`printf 'DELTA\nBETA\nGAMMA\n'`
 [ "$got" = "$want" ] || fail "harness make: report wrong after changing a.txt (got '$got')"
 # The rebuild signature is a chapter's `tr` recipe READING its src/*.txt; the report's `cat`
 # line lists build/b.up build/c.up as prerequisites but that is not a rebuild of b/c.
-grep -q 'src/b.txt\|src/c.txt' "$work/log3" && fail "harness make: rebuilt an UNCHANGED chapter (b/c) — incremental tracking is wrong: `cat "$work/log3"`"
+log3=`cat "$work/log3"`
+case "$log3" in
+  *src/b.txt*|*src/c.txt*) fail "harness make: rebuilt an UNCHANGED chapter (b/c) — incremental tracking is wrong: $log3" ;;
+esac
 echo "  MAKE-INCREMENTAL-REBUILD-OK (changed a.txt → report=DELTA/BETA/GAMMA; b,c not rebuilt)"
 
 # [behavioral] the harness COMPILES + RUNS real SOFTWARE with the staged /td/store gcc

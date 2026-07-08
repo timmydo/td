@@ -76,7 +76,7 @@ exec "\$d/gcc/bin/$cc" "\$@"
 WRAP
 done
 chmod 0555 "$tc/bin/gcc" "$tc/bin/g++"
-find "$tc" -type f | while read -r t; do
+"$TB" files "$tc" | while read -r t; do
   if "$TB" elf-interp "$t" >/dev/null 2>&1; then "$TB" elf-set-interp "$t" "$GLP8/lib/ld-linux.so.2" >/dev/null 2>&1 || true; fi
 done
 mkdir -p "$tc/bin/.real"
@@ -99,11 +99,13 @@ echo "   [toolchain] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
 oldtc=${TD_GATE_INPUT_GCC_TOOLCHAIN:-}
 test -n "$oldtc" || fail "TD_GATE_INPUT_GCC_TOOLCHAIN unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 newlock="$b8/sed.lock"
-sed "s|^[^ ]*-gcc-toolchain-[^ ]* .*|gcc-toolchain $TCP seed\nglibc-2.41 $GLP8 seed|" tests/sed-no-guix.lock > "$newlock"
-grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
-"$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
+"$TB" lock rewrite-gcc-toolchain tests/sed-no-guix.lock "$newlock" "$TCP" "$GLP8" || fail "rewrite sed lock onto the /td/store toolchain"
+"$TB" lock paths "$newlock" /gnu/store > "$b8/roots"
+"$TB" store-query "$TD_BUILDER_DB" references-only 2>/dev/null | while IFS= read -r p; do
+  case "$p" in /gnu/store/*) printf '%s\n' "$p" ;; esac
+done >> "$b8/roots" || true
 sort -u "$b8/roots" -o "$b8/roots"
-sed 's|^|seed |' "$b8/roots" > "$b8/roots.lock"
+while IFS= read -r p; do printf 'seed %s\n' "$p"; done < "$b8/roots" > "$b8/roots.lock"
 sh tools/resolve-seed.sh "$b8/roots.lock" >/dev/null 2>&1 || fail "could not resolve the seed closure (guix-free resolve-seed — present paths are trusted; else warm ~/.td/subst / run the daily publish-seed-subst.sh)"
 seedline=`TB="$TB" TD_SEED_DB=/gnu/store sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-persist" $(cat "$b8/roots")` || fail "warm-seed failed"
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
@@ -111,7 +113,7 @@ for p in "$TCP" "$GLP8"; do cp -a "$bstore/`basename "$p"`" "$WSTORE/`basename "
 chmod -R u+w "$WSTORE/`basename "$TCP"`" "$WSTORE/`basename "$GLP8"`" 2>/dev/null || true
 load_recipe_eval || fail "no td-recipe-eval (the build-recipes prelude must run first)"
 sh tests/recipe-emit.sh sed > "$b8/sed.json" || fail "recipe-emit sed"
-cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`; mkdir -p "$b8/tmp"
+cu=`"$TB" lock path "$newlock" coreutils`; mkdir -p "$b8/tmp"
 
 # === Persistent /td/store P — the incremental store the loop builds into. ===
 P="$b8/P"; mkdir -p "$P/store"
@@ -126,8 +128,8 @@ build_sed() {   # build sed at /td/store into the persistent store P; $1 = scrat
 
 # --- Invocation 1: BUILD sed at /td/store, interning into the fresh persistent store P -------
 build_sed "$b8/sb" >"$b8/sb.out" 2>"$b8/sb.err" || { tail -25 "$b8/sb.err" >&2; fail "invocation 1: build-recipe sed at /td/store"; }
-grep -qx 'CACHE=miss' "$b8/sb.out" || { cat "$b8/sb.out" >&2; fail "invocation 1 should be a build (CACHE=miss)"; }
-o=`sed -n 's/^OUT=out //p' "$b8/sb.out"`; test -n "$o" || fail "sed produced no output"
+"$TB" text line-exact 'CACHE=miss' "$b8/sb.out" || { cat "$b8/sb.out" >&2; fail "invocation 1 should be a build (CACHE=miss)"; }
+o=`"$TB" text extract-prefix 'OUT=out ' "$b8/sb.out"`; test -n "$o" || fail "sed produced no output"
 case "$o" in /td/store/*-sed*) ;; *) fail "sed output is not canonically at /td/store: $o" ;; esac
 sbase=`basename "$o"`
 test -d "$P/store/$sbase" || fail "build-into: sed not interned into the persistent /td/store P"
@@ -136,14 +138,14 @@ echo "   [DURABLE build-into] build-recipe built sed at /td/store ($o) and inter
 
 # --- Invocation 2 (SEPARATE process, FRESH scratch): SKIP — read sed back from P -------------
 build_sed "$b8/sb2" >"$b8/sb2.out" 2>"$b8/sb2.err" || { tail -25 "$b8/sb2.err" >&2; fail "invocation 2: build-recipe sed (expected a persistent-store skip)"; }
-grep -qx 'CACHE=persist' "$b8/sb2.out" || { cat "$b8/sb2.out" >&2; fail "invocation 2 should SKIP from the persistent store (CACHE=persist), not rebuild"; }
-o2=`sed -n 's/^OUT=out //p' "$b8/sb2.out"`; test "$o" = "$o2" || fail "the skipped output ($o2) differs from the built one ($o)"
+"$TB" text line-exact 'CACHE=persist' "$b8/sb2.out" || { cat "$b8/sb2.out" >&2; fail "invocation 2 should SKIP from the persistent store (CACHE=persist), not rebuild"; }
+o2=`"$TB" text extract-prefix 'OUT=out ' "$b8/sb2.out"`; test "$o" = "$o2" || fail "the skipped output ($o2) differs from the built one ($o)"
 echo "   [DURABLE skip/read-back] a SEPARATE invocation SKIPPED the build (CACHE=persist) — the build path read sed back from P at the same /td/store path"
 
 # --- [DURABLE behavioral] run the sed READ BACK FROM P in the own-root (/gnu/store ABSENT) ----
-si=`"$TB" elf-interp "$P/store/$sbase/bin/sed" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
-test -n "$si" || fail "the persisted sed is not linked vs the /td/store glibc 2.41"
-if grep -q -a -- "$oldtc" "$P/store/$sbase/bin/sed"; then fail "the persisted sed references the substituted-out gcc-toolchain $oldtc"; fi
+si=`"$TB" elf-interp "$P/store/$sbase/bin/sed" 2>/dev/null`
+test "$si" = "$GLP8/lib/ld-linux.so.2" || fail "the persisted sed is not linked vs the /td/store glibc 2.41"
+"$TB" text not-contains "$oldtc" "$P/store/$sbase/bin/sed" || fail "the persisted sed references the substituted-out gcc-toolchain $oldtc"
 vs="$b8/verify"; mkdir -p "$vs"; glb=`basename "$GLP8"`
 cp -a "$bstore/$glb" "$vs/$glb"
 cp -a "$P/store/$sbase" "$vs/$sbase"        # <-- from the PERSISTENT store P, not the build scratch
@@ -156,12 +158,13 @@ test -n "$bs8" || fail "TD_GATE_INPUT_BASH_STATIC unset — run via td-builder g
 bb8=`basename "$bs8"`; cp -a "$bs8" "$vs/$bb8"; chmod -R u+w "$vs"
 sedrun='[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT
 printf "foo\nbaz\n" | /td/store/'"$sbase"'/bin/sed "s/foo/bar/"'
-g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "$sedrun" 2>&1` || { echo "$g8" | sed 's/^/     /' >&2; fail "store-ns sed run rc"; }
-printf '%s\n' "$g8" | sed 's/^/     /' >&2
-echo "$g8" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root"
-echo "$g8" | grep -q '^bar$' || fail "the persisted sed did not substitute foo->bar from /td/store: $g8"
-echo "$g8" | grep -q '^baz$' || fail "the persisted sed dropped the unmatched line: $g8"
-if echo "$g8" | grep -q '^foo$'; then fail "the persisted sed left its input unchanged: $g8"; fi
+g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "$sedrun" 2>&1` || { printf '%s\n' "$g8" | while IFS= read -r line; do printf '     %s\n' "$line" >&2; done; fail "store-ns sed run rc"; }
+printf '%s\n' "$g8" > "$b8/g8.out"
+while IFS= read -r line; do printf '     %s\n' "$line" >&2; done < "$b8/g8.out"
+"$TB" text line-exact 'GNU-ABSENT' "$b8/g8.out" || fail "/gnu/store is PRESENT in the own-root"
+"$TB" text line-exact 'bar' "$b8/g8.out" || fail "the persisted sed did not substitute foo->bar from /td/store: $g8"
+"$TB" text line-exact 'baz' "$b8/g8.out" || fail "the persisted sed dropped the unmatched line: $g8"
+if "$TB" text line-exact 'foo' "$b8/g8.out"; then fail "the persisted sed left its input unchanged: $g8"; fi
 echo "   [DURABLE behavioral] the sed READ BACK FROM the persistent /td/store P runs in the own-root (/gnu/store ABSENT) and transforms foo->bar"
 rm -rf "$ROOT/.td-build-cache/seed-persist" 2>/dev/null || true
 

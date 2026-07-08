@@ -77,15 +77,16 @@ export PATH
 ./g++ -O2 -o /tmp/cpp.out cpp.cc || echo COMPILE-CPP-FAILED
 /tmp/c.out; echo "CRC=$?"
 /tmp/cpp.out; echo "CPPRC=$?"'
-snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | sed 's/^/     /' >&2; fail "store-ns glibc-2.41 build+run probe exited nonzero"; }
-printf '%s\n' "$snout" | tail -6 | sed 's/^/     /' >&2
-echo "$snout" | grep -q 'COMPILE-C-FAILED'   && fail "gcc 14.3.0 did not compile a C program vs glibc 2.41 in the own-root"
-echo "$snout" | grep -q 'COMPILE-CPP-FAILED' && fail "g++ 14.3.0 did not compile a C++ program vs glibc 2.41 in the own-root"
-echo "$snout" | grep -q '^CRC=42$'   || fail "the C program (vs glibc 2.41) did not return 42 in the own-root"
-echo "$snout" | grep -q '^CPPRC=42$' || fail "the C++ program (vs glibc 2.41) did not return 42 in the own-root"
+snout=`"$TB" store-ns "$store" -- "/td/store/$bbase/bin/bash" -c "$snscript" 2>&1` || { printf '%s\n' "$snout" | while IFS= read -r line; do printf '     %s\n' "$line" >&2; done; fail "store-ns glibc-2.41 build+run probe exited nonzero"; }
+printf '%s\n' "$snout" > "$store/snout"
+tail -6 "$store/snout" | while IFS= read -r line; do printf '     %s\n' "$line" >&2; done
+"$TB" text contains 'COMPILE-C-FAILED' "$store/snout" && fail "gcc 14.3.0 did not compile a C program vs glibc 2.41 in the own-root"
+"$TB" text contains 'COMPILE-CPP-FAILED' "$store/snout" && fail "g++ 14.3.0 did not compile a C++ program vs glibc 2.41 in the own-root"
+"$TB" text line-exact 'CRC=42' "$store/snout" || fail "the C program (vs glibc 2.41) did not return 42 in the own-root"
+"$TB" text line-exact 'CPPRC=42' "$store/snout" || fail "the C++ program (vs glibc 2.41) did not return 42 in the own-root"
 echo "   [behavioral] gcc 14.3.0 COMPILED AND LINKED a dynamic C and C++ (libstdc++) program against the"
 echo "   MODERN glibc 2.41 INSIDE td's own root (binutils 2.44 as/ld from /td/store); both RAN → 42 — the exec itself proves the /td/store interp+libc chain"
-echo "$snout" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root — mixed with guix"
+"$TB" text line-exact 'GNU-ABSENT' "$store/snout" || fail "/gnu/store is PRESENT in the own-root — mixed with guix"
 echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store is ABSENT (unmixed from guix)"
 
 # =====================================================================================================
@@ -97,7 +98,7 @@ echo "   [structural] inside td's own root /td/store IS the store AND /gnu/store
 echo "   --- brick 8: build-recipe builds corpus GNU sed 4.9 with the /td/store toolchain ---"
 b8=`mktemp -d`; bstore="$b8/seed-store"; bgdb="$b8/glibc.db"; btdb="$b8/toolchain.db"; mkdir -p "$bstore"
 BMB="$BMB244SB"
-BUILDBASH=`grep -- '-bash-5.2.37 ' tests/sed-no-guix.lock | grep -v -e static -e minimal | sed 's/^[^ ]* //' | head -1`/bin/bash
+BUILDBASH=`"$TB" lock path tests/sed-no-guix.lock bash`/bin/bash
 case "$BUILDBASH" in /gnu/store/*-bash-*/bin/bash) ;; *) fail "brick8: could not resolve the lock's bash" ;; esac
 GLP8=`"$TB" store-add-recursive glibc-2.41 "$GLIBC241" "$bstore" "$bgdb"` || fail "brick8: store-add glibc-2.41 failed"
 # Assemble a guix-gcc-toolchain-SHAPED /td/store toolchain: gcc 14 WRAPPER (--sysroot glibc 2.41 so gcc-internal
@@ -122,7 +123,7 @@ exec "\$d/gcc/bin/$cc" "\$@"
 WRAP
 done
 chmod 0555 "$tc/bin/gcc" "$tc/bin/g++"
-find "$tc" -type f | while read -r t; do
+"$TB" files "$tc" | while read -r t; do
   if "$TB" elf-interp "$t" >/dev/null 2>&1; then "$TB" elf-set-interp "$t" "$GLP8/lib/ld-linux.so.2" >/dev/null 2>&1 || true; fi
 done
 mkdir -p "$tc/bin/.real"
@@ -140,18 +141,19 @@ done
 TCP=`"$TB" store-add-recursive gcc-toolchain-tdstore "$tc" "$bstore" "$btdb"` || fail "brick8: store-add gcc-toolchain failed"
 echo "   [brick8] assembled /td/store gcc-toolchain: $TCP (glibc $GLP8)"
 # Substitute the gcc-toolchain entry in sed's lock; glibc 2.41 stays in the closure via the toolchain's ref.
-# Use grep/sed (both in the declared loop toolchain) rather than awk — awk/gawk is NOT in the loop profile
-# (it is only on PATH via the host guix dir, an undeclared dependency), so grep/sed keeps this hermetic.
+# Use td-builder typed helpers here: the loop PATH no longer provisions GNU sed/grep/find.
 # the gcc-toolchain entry is a DECLARED gate input (#353): the runner resolved it.
-oldtc=${TD_GATE_INPUT_GCC_TOOLCHAIN:-}
-test -n "$oldtc" || fail "TD_GATE_INPUT_GCC_TOOLCHAIN unset — run via td-builder gate-run, which resolves the gate's declared inputs"
+oldtc=${TD_GATE_INPUT_SED_GCC_TOOLCHAIN:-}
+test -n "$oldtc" || fail "TD_GATE_INPUT_SED_GCC_TOOLCHAIN unset — run via td-builder gate-run, which resolves the gate's declared inputs"
 newlock="$b8/sed.lock"
 # rewrite the lone gcc-toolchain line into the /td/store toolchain ref + glibc 2.41 (paths are /td/store/<base32>-…, no sed-special chars; | delimiter avoids the path slashes).
-sed "s|^[^ ]*-gcc-toolchain-[^ ]* .*|gcc-toolchain $TCP seed\nglibc-2.41 $GLP8 seed|" tests/sed-no-guix.lock > "$newlock"
-grep ' /gnu/store/' "$newlock" | sed 's/^[^ ]* //' > "$b8/roots"
-"$TB" store-query "$TD_BUILDER_DB" references 2>/dev/null | sed 's/^[^|]*|//' | grep '^/gnu/store/' >> "$b8/roots" || true
+"$TB" lock rewrite-gcc-toolchain tests/sed-no-guix.lock "$newlock" "$TCP" "$GLP8" || fail "brick8: rewrite sed lock onto the /td/store toolchain"
+"$TB" lock paths "$newlock" /gnu/store > "$b8/roots"
+"$TB" store-query "$TD_BUILDER_DB" references-only 2>/dev/null | while IFS= read -r p; do
+  case "$p" in /gnu/store/*) printf '%s\n' "$p" ;; esac
+done >> "$b8/roots" || true
 sort -u "$b8/roots" -o "$b8/roots"
-sed 's|^|seed |' "$b8/roots" > "$b8/roots.lock"
+while IFS= read -r p; do printf 'seed %s\n' "$p"; done < "$b8/roots" > "$b8/roots.lock"
 sh tools/resolve-seed.sh "$b8/roots.lock" >/dev/null 2>&1 || fail "brick8: could not resolve the seed closure (guix-free resolve-seed — present paths are trusted; else warm ~/.td/subst / run the daily publish-seed-subst.sh)"
 seedline=`TB="$TB" TD_SEED_DB=/gnu/store sh tools/warm-seed.sh "$ROOT/.td-build-cache/seed-b8" $(cat "$b8/roots")` || fail "brick8: warm-seed failed"
 WSTORE=`echo "$seedline" | cut -d' ' -f1`; WDB=`echo "$seedline" | cut -d' ' -f2`
@@ -167,7 +169,7 @@ load_recipe_eval 2>/dev/null || {
   load_recipe_eval || fail "brick8: no td-recipe-eval after recipe-eval-tool"
 }
 sh tests/recipe-emit.sh sed > "$b8/sed.json" || fail "brick8: recipe-emit sed"
-mkdir -p "$b8/sb" "$b8/tmp"; cu=`grep -- '-coreutils-' "$newlock" | sed 's/^[^ ]* //' | head -1`
+mkdir -p "$b8/sb" "$b8/tmp"; cu=`"$TB" lock path "$newlock" coreutils`
 env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
   TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
   TD_SEED_STORE="$WSTORE" TD_SEED_DB="$WDB" TD_EXTRA_DBS="$bgdb:$btdb" \
@@ -177,13 +179,13 @@ env -i HOME="$b8" TMPDIR="$b8/tmp" PATH="$cu/bin:$csh" \
   #   on a configure failure lands in the gate log — #366's socklen_t flake was
   #   undiagnosable because the conftest cause (a compiler killed under memory pressure)
   #   was never captured (autoconf logs it to config.log, not the terminal).
-o=`sed -n 's/^OUT=out //p' "$b8/sb.out"`; test -n "$o" || fail "brick8: sed produced no output"
+o=`"$TB" text extract-prefix 'OUT=out ' "$b8/sb.out"`; test -n "$o" || fail "brick8: sed produced no output"
 sdir="$b8/sb/newstore/`basename "$o"`"; sbin="$sdir/bin/sed"; test -x "$sbin" || fail "brick8: no sed binary"
 # (a) the /td/store toolchain linked it: interp is the /td/store glibc 2.41.
-si=`"$TB" elf-interp "$sbin" 2>/dev/null | grep -o "$GLP8/lib/ld-linux.so.2" | head -1`
-test -n "$si" || fail "brick8: sed not linked vs the /td/store glibc 2.41"
+si=`"$TB" elf-interp "$sbin" 2>/dev/null`
+test "$si" = "$GLP8/lib/ld-linux.so.2" || fail "brick8: sed not linked vs the /td/store glibc 2.41"
 # (b) [no-guix-toolchain] NO reference to guix's gcc-toolchain (the substituted-OUT compiler).
-if grep -q -a -- "$oldtc" "$sbin"; then fail "brick8: sed references the guix gcc-toolchain $oldtc"; fi
+if "$TB" text contains "$oldtc" "$sbin"; then fail "brick8: sed references the guix gcc-toolchain $oldtc"; fi
 echo "   [brick8 no-guix-toolchain] build-recipe built sed 4.9 with the /td/store toolchain; interp=$si; no guix gcc-toolchain ref"
 # (c) [DURABLE behavioral] sed runs in an own-root holding the /td/store glibc 2.41 + a static bash, and
 # performs a real text substitution: s/foo/bar/ on "foo\nbaz" must yield "bar\nbaz" (a transform, not a print).
@@ -193,11 +195,12 @@ cp -a "$bstore/$glb" "$vs/$glb"; cp -a "$sdir" "$vs/$sb2"
 bs8="$bs"
 bb8=`basename "$bs8"`; cp -a "$bs8" "$vs/$bb8"; chmod -R u+w "$vs"
 sedrun='printf "foo\nbaz\n" | /td/store/'"$sb2"'/bin/sed "s/foo/bar/"'
-g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "$sedrun" 2>&1` || { echo "$g8" | sed 's/^/     /' >&2; fail "brick8: store-ns sed run rc"; }
-printf '%s\n' "$g8" | sed 's/^/     /' >&2
-echo "$g8" | grep -q '^bar$' || fail "brick8: sed did not substitute foo->bar from /td/store: $g8"
-echo "$g8" | grep -q '^baz$' || fail "brick8: sed dropped the unmatched line from /td/store: $g8"
-if echo "$g8" | grep -q '^foo$'; then fail "brick8: sed left its input unchanged (no substitution) from /td/store: $g8"; fi
+g8=`"$TB" store-ns "$vs" -- "/td/store/$bb8/bin/bash" -c "$sedrun" 2>&1` || { printf '%s\n' "$g8" | while IFS= read -r line; do printf '     %s\n' "$line" >&2; done; fail "brick8: store-ns sed run rc"; }
+printf '%s\n' "$g8" > "$b8/g8.out"
+while IFS= read -r line; do printf '     %s\n' "$line" >&2; done < "$b8/g8.out"
+"$TB" text line-exact 'bar' "$b8/g8.out" || fail "brick8: sed did not substitute foo->bar from /td/store: $g8"
+"$TB" text line-exact 'baz' "$b8/g8.out" || fail "brick8: sed dropped the unmatched line from /td/store: $g8"
+if "$TB" text line-exact 'foo' "$b8/g8.out"; then fail "brick8: sed left its input unchanged (no substitution) from /td/store: $g8"; fi
 echo "   [brick8 DURABLE behavioral] corpus sed runs from /td/store and transforms foo->bar (a real text substitution)"
 rm -rf "$ROOT/.td-build-cache/seed-b8" 2>/dev/null || true
 

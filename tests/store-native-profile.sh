@@ -26,9 +26,16 @@ work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 
 # A static package from hello's PINNED closure (td's own store-closure reader, no guix process).
-bash=`grep -- '-bash-' tests/hello-no-guix.lock | grep -v static | sed 's/^[^ ]* //' | head -1`
+bash=`"$TB" lock path tests/hello-no-guix.lock bash`
 test -n "$bash" || fail "no bash in hello's lock"
-bs=`"$TB" store-closure-scan /gnu/store "$bash" | grep -- '-bash-static-' | head -1`
+bs=
+while IFS= read -r p; do
+  case "$p" in
+    /gnu/store/*-bash-static-*) [ -n "$bs" ] || bs="$p" ;;
+  esac
+done <<EOF
+`"$TB" store-closure-scan /gnu/store "$bash"`
+EOF
 test -n "$bs" -a -x "$bs/bin/bash" || fail "no static bash in the closure of $bash"
 
 # Intern it at the LOGICAL /td/store (TD_STORE_DIR); bytes land physically under $store.
@@ -66,16 +73,17 @@ bash -c 'echo "BASH-RAN:$BASH_VERSION"'
 sh -c 'echo SH-RAN-OK'
 PROBE
 out=$("$TB" store-ns "$store" -- "/td/store/profile/bin/bash" /td/store/probe.sh) \
-  || { printf '%s\n' "$out" | sed 's/^/     /' >&2; fail "store-ns profile run exited nonzero"; }
-printf '%s\n' "$out" | sed 's/^/     /'
+  || { printf '%s\n' "$out" | while IFS= read -r line; do printf '     %s\n' "$line" >&2; done; fail "store-ns profile run exited nonzero"; }
+printf '%s\n' "$out" > "$work/profile.out"
+while IFS= read -r line; do printf '     %s\n' "$line"; done < "$work/profile.out"
 
 # --- [behavioral] + [structural] -------------------------------------------------------------
-printf '%s\n' "$out" | grep -q '^BASH-VIA-PROFILE$' || fail "bash did not resolve via /td/store/profile/bin"
-printf '%s\n' "$out" | grep -q '^SH-VIA-PROFILE$' || fail "sh did not resolve via /td/store/profile/bin"
-printf '%s\n' "$out" | grep -q '^BASH-RAN:5' || fail "the profiled bash did not run from /td/store"
-printf '%s\n' "$out" | grep -q '^SH-RAN-OK$' || fail "the profiled sh did not run from /td/store"
+"$TB" text line-exact 'BASH-VIA-PROFILE' "$work/profile.out" || fail "bash did not resolve via /td/store/profile/bin"
+"$TB" text line-exact 'SH-VIA-PROFILE' "$work/profile.out" || fail "sh did not resolve via /td/store/profile/bin"
+"$TB" text extract-prefix 'BASH-RAN:5' "$work/profile.out" >/dev/null || fail "the profiled bash did not run from /td/store"
+"$TB" text line-exact 'SH-RAN-OK' "$work/profile.out" || fail "the profiled sh did not run from /td/store"
 echo "   [behavioral] the profiled tools resolve via /td/store/profile/bin and RUN from /td/store"
-printf '%s\n' "$out" | grep -q '^GNU-ABSENT$' || fail "/gnu/store is PRESENT in the own-root — mixed with the guix install"
+"$TB" text line-exact 'GNU-ABSENT' "$work/profile.out" || fail "/gnu/store is PRESENT in the own-root — mixed with the guix install"
 echo "   [structural] /gnu/store is ABSENT in the own-root (unmixed from the guix install)"
 
 echo "PASS: store-native-profile — td-builder profile --store-native builds a profile of LOGICAL"
