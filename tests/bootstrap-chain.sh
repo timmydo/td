@@ -1,7 +1,7 @@
 #!/bin/sh
 # tests/bootstrap-chain.sh — the SHARED from-seed modern-toolchain driver. #397 retired the
 # last per-rung bootstrap-*.sh consumers (their build_* ladders duplicated this driver); the
-# surviving consumers are tests/chain-cache.sh, recipe-checks-daily, and tests/x86_64-cross-fns.sh (via
+# surviving shell consumers are tests/chain-cache.sh and tests/x86_64-cross-fns.sh (via
 # tests/ladder-lib.sh / tests/chain-cache-lib.sh). The caller sets `set -eu` + ROOT=$(pwd),
 # runs load_stage0 ($TB + TD_BUILDER_*), sources this, then calls `bootstrap_modern_toolchain`.
 #

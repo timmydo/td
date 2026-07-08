@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# tests/recipe-checks.sh — run the recipe-owned package checks. td-recipe-eval lists the
-# recipes that carry checks (recipes/src/recipes/<stem>.rs) and emits their bodies; each
-# builds its package on td's OWN mes-rooted /td/store toolchain (the store-native ladder),
-# GUIX-FREE. There is no package table and no guix helper lib; the retired
-# guix-seeded corpus path is gone, and every surviving check is store-native.
+# tests/recipe-checks.sh — run the recipe-owned package checks. td-recipe-eval lists
+# the recipes that carry checks (recipes/src/recipes/<stem>.rs) and runs each one
+# through its Rust check runner; each builds its package on td's OWN mes-rooted
+# /td/store toolchain (the store-native ladder), GUIX-FREE. There is no package table
+# and no guix helper lib; the retired guix-seeded corpus path is gone, and every
+# surviving check is store-native.
 
 set -euo pipefail
 
@@ -17,24 +18,18 @@ esac
 
 echo ">> recipe-checks: recipe-owned /td/store package checks (scope=$scope; goals=$TD_GATE_GOALS)"
 
-# The prelude the check bodies need: the stage0 td-builder ($TB / $TD_BUILDER_*, compiled
-# from source with the environment's rust — no guix) and td's Rust recipe evaluator
-# ($TD_RECIPE_EVAL). CU/ROOT are exported for the store-native bodies (which stage the
-# gate's declared coreutils input and resolve paths against the repo root).
-. tests/cache-lib.sh
-export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"
-load_stage0
-load_recipe_eval
+if [ -z "${TD_RECIPE_EVAL:-}" ]; then
+  re="${TD_RECIPE_EVAL_BASE:-$PWD/.td-build-cache/recipe-eval}/recipe-eval-path"
+  test -s "$re" || { echo "FAIL: no td-recipe-eval sentinel ($re) — the build-recipes prelude must run first" >&2; exit 1; }
+  TD_RECIPE_EVAL=`cat "$re"`
+fi
+test -x "$TD_RECIPE_EVAL" || { echo "FAIL: td-recipe-eval not executable at $TD_RECIPE_EVAL" >&2; exit 1; }
 case "$TD_RECIPE_EVAL" in
   *.td-build-cache/*) : ;;
   *) echo "FAIL: TD_RECIPE_EVAL is not td's own build ($TD_RECIPE_EVAL)" >&2; exit 1 ;;
 esac
-export CU="${TD_GATE_INPUT_COREUTILS:-}" CACHE="$PWD/.td-build-cache/pkg" ROOT="$PWD"
-mkdir -p "$CACHE"
-
-scratch="$PWD/.td-build-cache/recipe-checks/$scope-$$"
-rm -rf "$scratch"
-mkdir -p "$scratch/scripts"
+export TD_RECIPE_EVAL
+export TD_STAGE0_BASE="${TD_STAGE0_BASE:-$PWD/.td-build-cache/stage0}"
 
 checks=`"$TD_RECIPE_EVAL" check-list "$scope"`
 test -n "$checks" || { echo "FAIL: no recipe checks selected for scope=$scope" >&2; exit 1; }
@@ -52,14 +47,8 @@ for spec in $checks; do
     n=$((n + 1))
     label="$spec#$i"
     echo "================ recipe-check $label ($scope) ================"
-    script="$scratch/scripts/$spec-$i.sh"
-    "$TD_RECIPE_EVAL" check-script "$spec" "$scope" "$i" > "$script"
-    test -s "$script" || { echo "FAIL: empty check script for $label" >&2; exit 1; }
-    if (
-      set -euo pipefail
-      export TD_RECIPE_CHECK_SPEC="$spec" TD_RECIPE_CHECK_INDEX="$i"
-      . "$script"
-    ); then
+    if TD_RECIPE_CHECK_SPEC="$spec" TD_RECIPE_CHECK_INDEX="$i" \
+      "$TD_RECIPE_EVAL" check-run "$spec" "$scope" "$i"; then
       echo "================ recipe-check $label ($scope): PASS ================"
     else
       rc=$?

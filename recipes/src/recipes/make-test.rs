@@ -92,28 +92,8 @@ pub fn recipe() -> Recipe {
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check make-test: build-plan --auto builds+validates make-test — GNU make 4.4.1, built on the native /td/store toolchain (make-x86-64), RUNS a real build; a broken make reds make-test's build"
-sh <<'CHECK'
-set -eu
-ROOT=$(pwd)
-fail() { echo "FAIL: $*" >&2; exit 1; }
-. tests/cache-lib.sh
-. tests/x86_64-cross-fns.sh
-. tests/ladder-lib.sh
-export TD_STAGE0_BASE="$PWD/.td-build-cache/td-shell"
-load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-load_recipe_eval || fail "no td-recipe-eval"
-export TD_STORE_DIR=/td/store
-# build-plan --auto make-test realizes the whole graph: the native /td/store x86_64 toolchain
-# (run_x86_64_native emits it), make-x86-64, and make-test. Every rung's lock is SYNTHESIZED
-# from its recipe JSON (#429) — make-x86-64's declared sourceInput resolves the pinned make
-# 4.4.1 tarball; make-test declares NO sourceInput (it only RUNS the built make, no source of
-# its own), so the synthesizer emits no source line for it. make-test's steps RUN make.
-run_x86_64_native || fail "the native /td/store x86_64 toolchain failed to build (build-plan --auto)"
-ladder_intern_extra make-x86-64-source make-4.4.1 || fail "intern the pinned make 4.4.1 source"
-ladder_emit make-x86-64 make-test || fail "emit the make-x86-64/make-test recipes"
-ladder_build make-test || fail "build-plan --auto make-test — the built make failed its own build test"
-echo "PASS: make-test — GNU make 4.4.1 built on the native /td/store toolchain drove a real build in the recipe sandbox (a broken make would red this)"
-CHECK
+: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+exec "$TD_RECIPE_EVAL" check-run make-test daily 1
 "#,
         )])
 }
