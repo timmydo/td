@@ -7,7 +7,7 @@
 # self-registering file per recipe), so the loop evaluates recipes with `td-recipe-eval`
 # instead of transpiling+evaluating `.ts` through tsgo+boa. Built ONCE by the
 # build-recipes prelude into BASEDIR (content cached via CARGO_TARGET_DIR), then
-# read by cache-lib's `load_recipe_eval` and by every build gate via recipe-emit.sh.
+# read by cache-lib's `load_recipe_eval` and invoked directly by build gates.
 #
 # Offline + toolchain-only, GUIX-FREE (the cargo-test pattern): the HOST brings the
 # rust + C toolchain (human 2026-07-06), resolved by tools/provision-rust.sh +

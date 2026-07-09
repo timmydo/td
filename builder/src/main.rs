@@ -2982,10 +2982,10 @@ fn build_plan_auto(
 /// Emit PKG's recipe JSON from td's Rust catalog via `td-recipe-eval emit` — the
 /// dependency-free evaluator (recipes/), set in TD_RECIPE_EVAL by the caller (placed,
 /// td-built). This REPLACES the old `tsgo`+`td-ts-eval` `.ts` emit (the TypeScript
-/// recipe surface was deleted in rust-recipe-surface, #224); `tests/recipe-emit.sh`
-/// is the shell sibling of this call. td-recipe-eval `die`s with a non-zero exit on an
-/// unknown stem, which we surface as the loud "no td recipe for PKG" error — td shell
-/// resolves PKG to a td recipe or fails; it never falls back to guix.
+/// recipe surface was deleted in rust-recipe-surface, #224). td-recipe-eval `die`s
+/// with a non-zero exit on an unknown stem, which we surface as the loud "no td
+/// recipe for PKG" error — td shell resolves PKG to a td recipe or fails; it never
+/// falls back to guix.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn emit_recipe_json(pkg: &str) -> Result<String, String> {
     let eval = std::env::var("TD_RECIPE_EVAL").map_err(|_| {

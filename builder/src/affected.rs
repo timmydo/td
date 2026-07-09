@@ -422,8 +422,16 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // Tombstone for the deleted recipe emit wrapper. The live path invokes
+    // td-recipe-eval directly; this path exists only in branch diffs that
+    // remove the legacy shell wrapper.
+    if p == "tests/recipe-emit.sh" {
+        sel.add_preflight("shell-syntax");
+        return;
+    }
+
     if pattern_matches(
-        "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipe-emit.sh|tests/recipe-eval-tool.sh",
+        "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipe-eval-tool.sh",
         p,
     ) {
         // The td-recipe crate IS the package + system-spec surface (boa/TS retired).
