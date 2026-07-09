@@ -38,6 +38,8 @@ pub fn extract_tar_reader<R: Read>(
             ensure_no_pending_long_name(&pending_path, &pending_link)?;
             break;
         }
+        validate_header_checksum(&header)
+            .map_err(|e| format!("validate tar header from {source_name}: {e}"))?;
 
         let mut entry = Entry::parse(&header)?;
         match &entry.kind {
@@ -226,6 +228,27 @@ fn parse_octal(bytes: &[u8]) -> Result<u64, String> {
         return Ok(0);
     }
     u64::from_str_radix(trimmed, 8).map_err(|e| format!("bad tar octal field `{trimmed}`: {e}"))
+}
+
+fn validate_header_checksum(header: &[u8; BLOCK]) -> Result<(), String> {
+    let stored = parse_octal(field(header, 148, 8)?)?;
+    let computed: u64 = header
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if (148..156).contains(&i) {
+                u64::from(b' ')
+            } else {
+                u64::from(*b)
+            }
+        })
+        .sum();
+    if stored != computed {
+        return Err(format!(
+            "tar header checksum mismatch: stored {stored:o}, computed {computed:o}"
+        ));
+    }
+    Ok(())
 }
 
 fn safe_join(root: &Path, rel: &Path) -> Result<PathBuf, String> {
@@ -425,6 +448,25 @@ mod tests {
             fs::read_link(out.join("gnu/store/symlink")).unwrap(),
             PathBuf::from("/gnu/store/absolute-target")
         );
+    }
+
+    #[test]
+    fn refuses_bad_header_checksum() {
+        let tmp = temp_dir("td-tar-checksum-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "file", b'0', 0o644, 5, "");
+        append_data(&mut bytes, b"hello");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        let first = bytes.get_mut(0).unwrap();
+        *first = b'F';
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("corrupt header should fail");
+
+        assert!(err.contains("checksum mismatch"));
+        assert!(!out.join("File").exists());
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
