@@ -268,19 +268,16 @@ impl RecipeCheckRunner {
 
     fn setup_pinsum(&self) -> Result<String, String> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"ladder-setup-v4\n");
+        bytes.extend_from_slice(b"ladder-setup-v5\n");
         append_file_bytes(&self.root.join("tests/td-subst.lock"), &mut bytes)?;
+        let stage0_lock = self.stage0_lock();
+        append_file_bytes(&stage0_lock, &mut bytes)?;
+        append_file_bytes(&self.stage0_tarball()?, &mut bytes)?;
         for file in files_with_suffix(&self.root.join("seed/sources"), ".lock")? {
             append_file_bytes(&file, &mut bytes)?;
         }
         for file in files_with_suffix(&self.root.join("seed/patches"), ".patch")? {
             append_file_bytes(&file, &mut bytes)?;
-        }
-        let files_out =
-            self.builder_output(&["files", "seed/stage0"], "td-builder files seed/stage0")?;
-        for line in files_out.lines() {
-            let path = self.root.join(line);
-            append_file_bytes(&path, &mut bytes)?;
         }
         sha256sum(&bytes)
     }
@@ -381,9 +378,54 @@ impl RecipeCheckRunner {
     }
 
     fn intern_stage0_source(&self, intern_name: &str) -> Result<(), String> {
-        let stage0 = self.root.join("seed/stage0");
+        let tarball = self.stage0_tarball()?;
+        let stage0 = self.scratch.join("stage0-source");
+        remove_path_if_exists(&stage0)?;
+        fs::create_dir_all(&stage0).map_err(|e| format!("mkdir {}: {e}", stage0.display()))?;
+        let tar_s = path_str(&tarball)?;
+        let stage0_s = path_str(&stage0)?;
+        let mut cmd = self.builder_command();
+        cmd.arg("tar-extract").arg(tar_s).arg(stage0_s);
+        command_output(&mut cmd, "td-builder tar-extract stage0 source")?;
+        if !stage0
+            .join("bootstrap-seeds/POSIX/AMD64/hex0-seed")
+            .is_file()
+            || !stage0.join("AMD64/mescc-tools-seed-kaem.kaem").is_file()
+        {
+            return Err(format!(
+                "{} did not unpack to the expected stage0 source tree",
+                tarball.display()
+            ));
+        }
         let path = self.store_add_recursive(intern_name, &stage0)?;
         self.append_src_map(intern_name, &path)
+    }
+
+    fn stage0_lock(&self) -> PathBuf {
+        self.root.join("seed/stage0.lock")
+    }
+
+    fn stage0_tarball(&self) -> Result<PathBuf, String> {
+        let lock = self.stage0_lock();
+        let file = lock_value(&lock, "file")?;
+        if file.contains('/') {
+            return Err(format!("{}: file must be a basename, got `{file}`", lock.display()));
+        }
+        let want = lock_value(&lock, "sha256")?;
+        let tarball = self.root.join("seed").join(&file);
+        if !tarball.is_file() {
+            return Err(format!("ladder: missing stage0 seed tarball {}", tarball.display()));
+        }
+        let mut bytes = Vec::new();
+        append_file_bytes(&tarball, &mut bytes)?;
+        let got = sha256sum(&bytes)?;
+        if got != want {
+            return Err(format!(
+                "{} sha256 {got} != lock pin {want}",
+                tarball.display()
+            ));
+        }
+        Ok(tarball)
     }
 
     fn store_add_recursive(&self, name: &str, src: &Path) -> Result<String, String> {
@@ -927,13 +969,6 @@ impl RecipeCheckRunner {
         cmd
     }
 
-    fn builder_output(&self, args: &[&str], label: &str) -> Result<String, String> {
-        let mut cmd = self.builder_command();
-        for arg in args {
-            cmd.arg(arg);
-        }
-        command_output(&mut cmd, label)
-    }
 }
 
 fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {

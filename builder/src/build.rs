@@ -1572,9 +1572,9 @@ fn require_no_gnu_store(dir: &Path) -> Result<(), String> {
 }
 
 /// stage0-build — td's stage0-posix SEED build "system" (#378 slice 1; sibling of
-/// `run`/`run_rust`/`run_cmake`). TD_SRC is the interned seed/stage0 tree: place a
+/// `run`/`run_rust`/`run_cmake`). TD_SRC is the interned unpacked stage0 seed tree: place a
 /// writable copy, mark the two binary seeds executable, exec the kaem interpreter
-/// over the two vendored scripts (hex0-seed → … → M2, blood-elf-0, kaem-0 → M1,
+/// over the two pinned scripts (hex0-seed → … → M2, blood-elf-0, kaem-0 → M1,
 /// hex2, kaem), install AMD64/{bin,artifact} into $out. The ONLY place a raw
 /// binary seed is exec'd — an engine BuildSystem, so the recipe graph is total.
 ///
@@ -1588,7 +1588,7 @@ pub fn run_stage0() -> Result<(), String> {
     let out = env::var("out").map_err(|_| "out not set".to_string())?;
     let src = env::var("TD_SRC").map_err(|_| "TD_SRC not set".to_string())?;
     if !Path::new(&src).is_dir() {
-        return Err(format!("TD_SRC {src} is not a directory (want the interned seed/stage0 tree)"));
+        return Err(format!("TD_SRC {src} is not a directory (want the interned unpacked stage0 seed tree)"));
     }
 
     // Writable working copy — the kaem build writes artifacts INTO its tree.

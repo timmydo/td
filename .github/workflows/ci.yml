@@ -61,16 +61,15 @@ jobs:
       - name: convention — no tabs in Scheme sources
         # CLAUDE.md repo conventions: hand-formatted 2-space indentation, no
         # tabs (and never `guix style`). This is td's OWN-Scheme convention;
-        # vendored upstream sources under seed/ (e.g. the GNU Mes Scheme library
-        # of the source-bootstrap, pinned byte-for-byte) are excluded — their
-        # formatting is upstream's, and re-tabbing them would corrupt the pin.
+        # pinned seed inputs under seed/ are excluded — their bytes are pinned,
+        # and reformatting them would corrupt the pin.
         run: |
           set -eu
           if grep -rPl '\t' --include='*.scm' --exclude-dir=seed .; then
             echo "tab characters found in .scm files (convention: 2-space, no tabs)" >&2
             exit 1
           fi
-          echo "no tabs in Scheme sources (vendored seed/ excluded)"
+          echo "no tabs in Scheme sources (pinned seed/ excluded)"
 
   cargo-test:
     # The td-native build ENGINE gate — drv parse/emit, store-path hashing, NAR
