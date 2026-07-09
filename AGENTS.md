@@ -133,11 +133,21 @@ and Codex runs Claude (Opus 4.8, xhigh):
 git diff origin/main...HEAD | claude -p --model opus --effort xhigh "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible. Post the review as comment on PR #<insert number>"
 ``` 
 
+Codex can also run Antigravity (Gemini 3.1 Pro High) as a distinct
+cross-model CLI reviewer. `agy --print` reads stdin but does not post
+to GitHub itself in plan mode, so post its raw output unchanged:
+
+```
+git diff origin/main...HEAD | agy --model "Gemini 3.1 Pro (High)" --mode plan --print-timeout 10m --print "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/agy-review.md
+gh pr comment <insert number> --body-file /tmp/agy-review.md
+```
+
 Use (`--model`/`--effort` for `claude` — effort levels `xhigh`;
-`--model` + `-c model_reasoning_effort=…` for `codex`. Use `gpt-5.5`,
-not `gpt-5.5-codex`, under a ChatGPT-account login) `codex` is
-installed and on `$PATH` — do NOT drop it for a second `claude` CLI
-run, which varies only the model, not the harness.
+`--model` + `-c model_reasoning_effort=…` for `codex`, and
+`--model`/`--mode plan` for `agy`. Use `gpt-5.5`, not
+`gpt-5.5-codex`, under a ChatGPT-account login) `codex` is installed
+and on `$PATH` — do NOT drop it for a second `claude` CLI run, which
+varies only the model, not the harness.
 
 
 # Rust code
@@ -183,4 +193,3 @@ td's Rust is defensive and minimal-surface.
   (#292, closed by the unrelated #291 squash whose body said "for whoever fixes #292").
   Write `re #N` / `see #N` / `until #N is fixed` when referring to an issue you are NOT
   resolving; reserve the closing keywords for the issue your PR actually closes.
-
