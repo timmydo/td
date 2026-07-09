@@ -2,8 +2,9 @@
 //!
 //! The package-specific assertions still live on recipes; this wrapper exists
 //! only to preserve the PR/daily partition in the gate runner and affected-checks.
+//! The loop body is native Rust in `builder/src/gate_bodies.rs`.
 
-use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
+use crate::gates::{GateDef, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -12,24 +13,9 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[
-            ArtifactInput {
-                name: "coreutils",
-                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
-            },
-            ArtifactInput {
-                name: "bash-static",
-                kind: InputKind::ClosureMember {
-                    lock: "tests/td-subst.lock",
-                    root_stem: "bash",
-                    member_stem: "bash-static",
-                },
-            },
-        ],
+        inputs: &[],
         store: StoreMode::Shared,
         non_blocking: true,
-        script: r##"
-TD_RECIPE_CHECK_SCOPE=daily bash tests/recipe-checks.sh
-"##,
+        script: "",
     }
 }

@@ -11,6 +11,9 @@
 //!   check-script STEM [pr|daily|all] [INDEX]
 //!                         print STEM's owned check bodies for the requested tier;
 //!                         INDEX is 1-based and emits a single body
+//!   check-run STEM [pr|daily|all] [INDEX]
+//!                         run one recipe-owned package check through the Rust
+//!                         runner instead of sourcing tests/ ladder helpers
 //! This is the loop tool the `recipe-rs` gate drives AND the corpus consumer
 //! entry (replacing `ts-emit` on the boa path). (The system-spec subcommands —
 //! list-specs/emit-spec/verify-spec — were retired with the guix-system museum
@@ -19,6 +22,9 @@
 use std::process::exit;
 
 use td_recipe::catalog;
+
+#[path = "td_recipe_eval/check_runner.rs"]
+mod check_runner;
 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn die(msg: &str) -> ! {
@@ -123,7 +129,13 @@ fn main() {
                 }
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script ..."),
+        Some("check-run") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::cli(rest) {
+                die(&e);
+            }
+        }
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run ..."),
     }
 }
 
@@ -148,6 +160,20 @@ mod tests {
     fn unchecked_recipes_have_zero_check_bodies() {
         let mes = catalog::lookup("mes").unwrap();
         assert_eq!(recipe_checks(&mes, None).len(), 0);
+    }
+
+    #[test]
+    fn recipe_check_bodies_delegate_to_the_rust_runner() {
+        for stem in ["make-test", "busybox-test", "rust-toolchain"] {
+            let recipe = catalog::lookup(stem).unwrap();
+            let checks = recipe_checks(&recipe, Some(td_recipe::types::CheckTier::Daily));
+            assert_eq!(checks.len(), 1);
+            let script = &checks.first().unwrap().script;
+            assert!(script.contains(&format!("check-run {stem} daily 1")));
+            assert!(!script.contains(". tests/cache-lib.sh"));
+            assert!(!script.contains(". tests/ladder-lib.sh"));
+            assert!(!script.contains(". tests/x86_64-cross-fns.sh"));
+        }
     }
 
     // The `recipe-rs` gate's (A) coverage leg (formerly tests/recipe-rs.sh, driven

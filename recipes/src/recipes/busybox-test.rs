@@ -75,24 +75,8 @@ pub fn recipe() -> Recipe {
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check busybox-test: build-plan --auto builds+validates busybox-test: BusyBox 1.37.0, built by make-x86-64 on the native /td/store toolchain, RUNS installed applet links"
-sh <<'CHECK'
-set -eu
-ROOT=$(pwd)
-fail() { echo "FAIL: $*" >&2; exit 1; }
-. tests/cache-lib.sh
-. tests/x86_64-cross-fns.sh
-. tests/ladder-lib.sh
-export TD_STAGE0_BASE="$PWD/.td-build-cache/td-shell"
-load_stage0 || fail "stage0-builder could not place a guix-free stage0 td-builder"
-load_recipe_eval || fail "no td-recipe-eval"
-export TD_STORE_DIR=/td/store
-run_x86_64_native || fail "the native /td/store x86_64 toolchain failed to build (build-plan --auto)"
-ladder_intern_extra make-x86-64-source make-4.4.1 || fail "intern the pinned make 4.4.1 source"
-ladder_intern_extra busybox-x86-64-source busybox-1.37.0 || fail "intern the pinned BusyBox 1.37.0 source"
-ladder_emit make-x86-64 busybox-x86-64 busybox-test || fail "emit the make-x86-64/busybox-x86-64/busybox-test recipes"
-ladder_build busybox-test || fail "build-plan --auto busybox-test: the built BusyBox applet links failed their build test"
-echo "PASS: busybox-test: BusyBox 1.37.0 built by make-x86-64 on the native /td/store toolchain ran installed sh/ls/grep/sed applet links"
-CHECK
+: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+exec "$TD_RECIPE_EVAL" check-run busybox-test daily 1
 "#,
         )])
 }
