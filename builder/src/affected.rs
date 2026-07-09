@@ -508,12 +508,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     if pattern_matches("seed/sources/rust-*.lock", p) {
         // seed/sources/rust-*.lock is the rust-toolchain recipe's pinned source.
         sel.add_target("recipe-rs");
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
     // seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source.
     if pattern_matches("seed/sources/zlib-*.lock", p) {
         sel.add_target("recipe-rs");
+        sel.add_target("recipe-checks-daily");
         return;
     }
 
@@ -1112,6 +1114,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // The rust-toolchain recipe and zlib source lock route to the recipe-engine gate.
     assert_target!("seed/sources/zlib-1.3.1.lock", "recipe-rs");
     assert_target!("seed/sources/rust-1.96.0.lock", "recipe-rs");
+    assert_target!("seed/sources/zlib-1.3.1.lock", "recipe-checks-daily");
+    assert_target!("seed/sources/rust-1.96.0.lock", "recipe-checks-daily");
     assert_target!("seed/sources/busybox-1.37.0.lock", "recipe-checks-daily");
     assert_target!("seed/sources/make-4.4.1.lock", "recipe-checks-daily");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):

@@ -115,6 +115,7 @@ struct RecipeCheckRunner {
     db: PathBuf,
     recipes: PathBuf,
     scratch: PathBuf,
+    force_cold: bool,
 }
 
 struct RecipeNode {
@@ -193,6 +194,7 @@ impl RecipeCheckRunner {
             db,
             recipes,
             scratch,
+            force_cold: chain_cache.is_empty(),
         })
     }
 
@@ -201,6 +203,9 @@ impl RecipeCheckRunner {
     }
 
     fn setup(&self) -> Result<(), String> {
+        if self.force_cold {
+            remove_path_if_exists(&self.lw)?;
+        }
         fs::create_dir_all(&self.store)
             .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
         fs::create_dir_all(&self.recipes)
@@ -233,7 +238,8 @@ impl RecipeCheckRunner {
 
     fn setup_pinsum(&self) -> Result<String, String> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"ladder-setup-v3\n");
+        bytes.extend_from_slice(b"ladder-setup-v4\n");
+        append_file_bytes(&self.root.join("tests/td-subst.lock"), &mut bytes)?;
         for file in files_with_suffix(&self.root.join("seed/sources"), ".lock")? {
             append_file_bytes(&file, &mut bytes)?;
         }
@@ -554,10 +560,15 @@ impl RecipeCheckRunner {
     }
 
     fn ensure_host_tool(&self, name: &str) -> Result<(), String> {
-        if self.map_has(name)? {
-            return Ok(());
-        }
         let probe = self.assert_host_tool(name)?;
+        let tools_map = self.lw.join("tools.map");
+        if let Some(root) = map_value_in(&tools_map, name)? {
+            let path = PathBuf::from(&root);
+            if is_executable(&path.join("bin").join(probe)) {
+                return Ok(());
+            }
+            remove_map_entry(&tools_map, name)?;
+        }
         let root = self.tool_root(name, probe)?;
         self.append_tools_map(name, &root)
     }
@@ -1178,6 +1189,37 @@ fn lock_value(lock: &Path, key: &str) -> Result<String, String> {
     Err(format!("{}: no {key} entry", lock.display()))
 }
 
+fn map_value_in(map: &Path, name: &str) -> Result<Option<String>, String> {
+    if !map.is_file() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(map).map_err(|e| format!("read {}: {e}", map.display()))?;
+    for line in contents.lines() {
+        let mut cols = line.splitn(2, ' ');
+        if cols.next() == Some(name) {
+            return Ok(cols.next().map(str::trim).map(str::to_string));
+        }
+    }
+    Ok(None)
+}
+
+fn remove_map_entry(map: &Path, name: &str) -> Result<(), String> {
+    if !map.is_file() {
+        return Ok(());
+    }
+    let contents = fs::read_to_string(map).map_err(|e| format!("read {}: {e}", map.display()))?;
+    let mut out = String::new();
+    for line in contents.lines() {
+        let mut cols = line.splitn(2, ' ');
+        if cols.next() == Some(name) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    fs::write(map, out).map_err(|e| format!("write {}: {e}", map.display()))
+}
+
 fn linux_version_from_file(file_name: &str) -> Result<String, String> {
     let rest = file_name
         .strip_prefix("linux-")
@@ -1328,6 +1370,7 @@ mod tests {
             db: PathBuf::new(),
             recipes: PathBuf::new(),
             scratch: PathBuf::new(),
+            force_cold: false,
         };
 
         for target in ["make-test", "busybox-test", "rust-toolchain"] {
