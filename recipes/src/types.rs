@@ -614,9 +614,6 @@ pub struct RecipeCheck {
 pub enum CheckRunner {
     BuildOnly,
     RustToolchain,
-    X8664CrossToolchain,
-    X8664NativeGcc,
-    X8664SelfGcc,
 }
 
 impl RecipeCheck {

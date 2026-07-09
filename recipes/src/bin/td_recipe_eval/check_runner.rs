@@ -793,43 +793,6 @@ impl RecipeCheckRunner {
         Ok(())
     }
 
-    pub(crate) fn fresh_scratch(&self, name: &str) -> Result<PathBuf, String> {
-        let dir = self.scratch.join(name);
-        remove_path_if_exists(&dir)?;
-        fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-        Ok(dir)
-    }
-
-    pub(crate) fn logical_tdstore_path(&self, path: &Path) -> Result<String, String> {
-        let root = self.scratch.join("tdstore");
-        let rel = path
-            .strip_prefix(&root)
-            .map_err(|_| format!("{} is not under {}", path.display(), root.display()))?;
-        Ok(format!("{TD_STORE_DIR}/{}", path_str(rel)?))
-    }
-
-    pub(crate) fn stage_tree_under_tdstore(&self, tree: &Path) -> Result<PathBuf, String> {
-        let base = tree
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("tree has no UTF-8 basename: {}", tree.display()))?;
-        let dst = self.scratch.join("tdstore").join(base);
-        if tree == dst {
-            return Ok(dst);
-        }
-        remove_path_if_exists(&dst)?;
-        copy_tree(tree, &dst).map_err(|e| {
-            format!(
-                "stage {} under tdstore failed ({} -> {}): {e}",
-                base,
-                tree.display(),
-                dst.display()
-            )
-        })?;
-        Ok(dst)
-    }
-
     pub(crate) fn store_ns_output(
         &self,
         argv: &[&str],
@@ -848,18 +811,6 @@ impl RecipeCheckRunner {
         }
     }
 
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub(crate) fn scratch(&self) -> &Path {
-        &self.scratch
-    }
-
-    pub(crate) fn tdstore_path(&self) -> PathBuf {
-        self.scratch.join("tdstore")
-    }
-
     pub(crate) fn builder_command(&self) -> Command {
         let mut cmd = Command::new(&self.tb);
         cmd.current_dir(&self.root)
@@ -869,92 +820,6 @@ impl RecipeCheckRunner {
             .env("TD_BUILDER_DB", &self.builder_db);
         cmd
     }
-}
-
-pub(crate) fn require_exec(path: &Path, label: &str) -> Result<(), String> {
-    if is_executable(path) {
-        Ok(())
-    } else {
-        Err(format!("{label} is not executable: {}", path.display()))
-    }
-}
-
-pub(crate) fn require_file(path: &Path, label: &str) -> Result<(), String> {
-    if path.is_file() {
-        Ok(())
-    } else {
-        Err(format!("{label} is missing: {}", path.display()))
-    }
-}
-
-pub(crate) fn reject_embedded_gnu_store(path: &Path) -> Result<(), String> {
-    if file_contains(path, b"/gnu/store")? {
-        Err(format!("{} contains /gnu/store bytes", path.display()))
-    } else {
-        Ok(())
-    }
-}
-
-fn file_contains(path: &Path, needle: &[u8]) -> Result<bool, String> {
-    if needle.is_empty() {
-        return Ok(true);
-    }
-    let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    Ok(bytes.windows(needle.len()).any(|window| window == needle))
-}
-
-pub(crate) fn require_output_line(text: &str, line: &str, msg: &str) -> Result<(), String> {
-    if text.lines().any(|got| got == line) {
-        Ok(())
-    } else {
-        Err(format!("{msg}; output was:\n{text}"))
-    }
-}
-
-pub(crate) fn find_first_named(root: &Path, name: &str) -> Result<PathBuf, String> {
-    find_first_named_opt(root, name)?
-        .ok_or_else(|| format!("no file named {name} under {}", root.display()))
-}
-
-fn find_first_named_opt(root: &Path, name: &str) -> Result<Option<PathBuf>, String> {
-    for path in read_dir_sorted(root)? {
-        if path.file_name().and_then(|n| n.to_str()) == Some(name) {
-            return Ok(Some(path));
-        }
-        let meta =
-            fs::symlink_metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-        if meta.is_dir() {
-            if let Some(found) = find_first_named_opt(&path, name)? {
-                return Ok(Some(found));
-            }
-        }
-    }
-    Ok(None)
-}
-
-pub(crate) fn set_executable(path: &Path) -> Result<(), String> {
-    let mut perms = fs::metadata(path)
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .permissions();
-    perms.set_mode(perms.mode() | 0o111);
-    fs::set_permissions(path, perms).map_err(|e| format!("chmod +x {}: {e}", path.display()))
-}
-
-pub(crate) fn extract_line_value(text: &str, prefix: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        line.strip_prefix(prefix)
-            .map(|value| value.trim().to_string())
-    })
-}
-
-pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    append_file_bytes(path, &mut bytes)?;
-    sha256sum(&bytes)
-}
-
-pub(crate) fn command_ok(cmd: &mut Command, label: &str) -> Result<(), String> {
-    command_output(cmd, label).map(|_| ())
 }
 
 fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
@@ -1046,11 +911,11 @@ fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
     Ok(None)
 }
 
-pub(crate) fn source_pin_for_key(key: &str) -> Result<SourcePin, String> {
+fn source_pin_for_key(key: &str) -> Result<SourcePin, String> {
     source_pins::by_key(key).ok_or_else(|| format!("no recipe source pin for `{key}'"))
 }
 
-pub(crate) fn validate_source_file_basename(pin: &SourcePin) -> Result<(), String> {
+fn validate_source_file_basename(pin: &SourcePin) -> Result<(), String> {
     if pin.file.is_empty() || pin.file.contains('/') {
         return Err(format!(
             "recipe source pin `{}` has non-basename file `{}`",
@@ -1060,7 +925,7 @@ pub(crate) fn validate_source_file_basename(pin: &SourcePin) -> Result<(), Strin
     Ok(())
 }
 
-pub(crate) fn verify_source_pin(path: &Path, pin: &SourcePin) -> Result<(), String> {
+fn verify_source_pin(path: &Path, pin: &SourcePin) -> Result<(), String> {
     let mut bytes = Vec::new();
     append_file_bytes(path, &mut bytes)?;
     let got = sha256sum(&bytes)?;
@@ -1114,7 +979,7 @@ fn place_stage0_builder(
         .ok_or_else(|| "stage0-builder produced no output".to_string())
 }
 
-pub(crate) fn command_output(cmd: &mut Command, label: &str) -> Result<String, String> {
+fn command_output(cmd: &mut Command, label: &str) -> Result<String, String> {
     let out = cmd.output().map_err(|e| format!("spawn {label}: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -1192,7 +1057,7 @@ fn files_with_suffix(dir: &Path, suffix: &str) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-pub(crate) fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>, String> {
+fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for entry in fs::read_dir(dir).map_err(|e| format!("read dir {}: {e}", dir.display()))? {
         out.push(
@@ -1255,7 +1120,7 @@ fn path_basename_str(path: &str) -> Result<&str, String> {
         .ok_or_else(|| format!("path has no UTF-8 basename: {path}"))
 }
 
-pub(crate) fn path_str(path: &Path) -> Result<&str, String> {
+fn path_str(path: &Path) -> Result<&str, String> {
     path.to_str()
         .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))
 }
@@ -1345,7 +1210,7 @@ fn clean_stage0_build_dirs(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
     let ftype = meta.file_type();
     if ftype.is_symlink() {
@@ -1450,8 +1315,9 @@ mod tests {
             "make-test",
             "busybox-test",
             "rust-toolchain",
-            "gcc-x86-64-stage2",
-            "gcc-x86-64-native",
+            "gcc-x86-64-stage2-test",
+            "gcc-x86-64-native-test",
+            "gcc-x86-64-self-test",
         ] {
             let graph = recipe_closure(&[target]).unwrap();
             for node in graph {

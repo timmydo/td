@@ -12,8 +12,8 @@
 //! input-addressed (x64-toolchain-subst: the x86_64 glibc is ALSO interned at the LOCK-KEYED path from
 //! tests/td-toolchain-x86_64.lock — the stable path a consumer fetches as a signed substitute, not a
 //! content-addressed throwaway — and a program whose interp IS that path runs in the own-root → 42).
-//! The package behavior assertion is owned by the `gcc-x86-64-stage2` recipe check; this gate is only
-//! the daily scheduling boundary for that check. NOT a BUILD_GATE.
+//! The package behavior assertion is owned by the `gcc-x86-64-stage2-test` recipe check; this gate is
+//! only the daily scheduling boundary for that check. NOT a BUILD_GATE.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
@@ -35,12 +35,12 @@ pub fn gate() -> GateDef {
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
-echo ">> recipe-check gcc-x86-64-stage2: build the x86_64 cross toolchain recipe graph and assert its output"
+echo ">> recipe-check gcc-x86-64-stage2-test: build the x86_64 cross toolchain recipe graph and assert its output"
 : "${TD_RECIPE_EVAL:=}"
 if [ -z "$TD_RECIPE_EVAL" ] || [ ! -x "$TD_RECIPE_EVAL" ]; then
   TD_RECIPE_EVAL=$(sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval")
 fi
-exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-stage2 daily 1
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-stage2-test daily 1
 "##,
     }
 }

@@ -221,7 +221,7 @@ mod tests {
         );
         assert_eq!(recipe_checks(&busybox, None).len(), 1);
 
-        let x86_cross = catalog::lookup("gcc-x86-64-stage2").unwrap();
+        let x86_cross = catalog::lookup("gcc-x86-64-stage2-test").unwrap();
         assert_eq!(
             recipe_checks(&x86_cross, Some(td_recipe::types::CheckTier::Pr)).len(),
             0
@@ -232,16 +232,27 @@ mod tests {
         );
         assert_eq!(recipe_checks(&x86_cross, None).len(), 1);
 
-        let x86_native = catalog::lookup("gcc-x86-64-native").unwrap();
+        let x86_native = catalog::lookup("gcc-x86-64-native-test").unwrap();
         assert_eq!(
             recipe_checks(&x86_native, Some(td_recipe::types::CheckTier::Pr)).len(),
             0
         );
         assert_eq!(
             recipe_checks(&x86_native, Some(td_recipe::types::CheckTier::Daily)).len(),
-            2
+            1
         );
-        assert_eq!(recipe_checks(&x86_native, None).len(), 2);
+        assert_eq!(recipe_checks(&x86_native, None).len(), 1);
+
+        let x86_self = catalog::lookup("gcc-x86-64-self-test").unwrap();
+        assert_eq!(
+            recipe_checks(&x86_self, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&x86_self, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&x86_self, None).len(), 1);
     }
 
     #[test]
@@ -256,8 +267,9 @@ mod tests {
             ("make-test", 1),
             ("busybox-test", 1),
             ("rust-toolchain", 1),
-            ("gcc-x86-64-stage2", 1),
-            ("gcc-x86-64-native", 2),
+            ("gcc-x86-64-stage2-test", 1),
+            ("gcc-x86-64-native-test", 1),
+            ("gcc-x86-64-self-test", 1),
         ] {
             let recipe = catalog::lookup(stem).unwrap();
             let checks = recipe_checks(&recipe, Some(td_recipe::types::CheckTier::Daily));

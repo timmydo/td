@@ -12,7 +12,7 @@
 //! (the native gcc RUNS and compiles+links a C AND C++ program -> 42), structural (own-root /td/store, no
 //! /gnu/store). The NATIVE gcc is ALWAYS BUILT (never fetched); only its cross-toolchain prerequisite may
 //! be fetched. HEAVY (the native gcc build is ~45 min; from-seed adds the ~98-min cross build). NOT a
-//! BUILD_GATE. The output assertions live with the `gcc-x86-64-native` recipe check; the native
+//! BUILD_GATE. The output assertions live with the `gcc-x86-64-native-test` recipe check; the native
 //! binutils/gcc BUILD is the recipe ladder `binutils-x86-64-native` -> `gcc-x86-64-native`
 //! (recipes/src/recipes/, driven by td-recipe-eval check-run) — the retirement of the
 //! former `td-builder toolchain-recipe x86_64-native` imperative Rust path.
@@ -37,12 +37,12 @@ pub fn gate() -> GateDef {
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
-echo ">> recipe-check gcc-x86-64-native: build the native x86_64 gcc recipe graph and assert its output"
+echo ">> recipe-check gcc-x86-64-native-test: build the native x86_64 gcc recipe graph and assert its output"
 : "${TD_RECIPE_EVAL:=}"
 if [ -z "$TD_RECIPE_EVAL" ] || [ ! -x "$TD_RECIPE_EVAL" ]; then
   TD_RECIPE_EVAL=$(sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval")
 fi
-exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-native daily 1
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-native-test daily 1
 "##,
     }
 }

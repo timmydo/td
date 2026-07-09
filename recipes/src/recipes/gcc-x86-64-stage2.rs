@@ -1,5 +1,5 @@
 use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
-use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
+use crate::types::{Recipe, Step};
 
 // GCC 14.3.0 cross STAGE2 (#378 slice 4, guix's cross gcc final): the FULL cross
 // compiler — c,c++ --enable-shared --enable-threads=posix against the x86_64
@@ -159,7 +159,13 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("gcc-x86-64-stage2", "14.3.0")
         .source_input("gcc-14-source")
-        .native_inputs(&["gcc-14", "glibc-mesboot", "binutils-x86-64", "glibc-x86-64", "binutils-244"])
+        .native_inputs(&[
+            "gcc-14",
+            "glibc-mesboot",
+            "binutils-x86-64",
+            "glibc-x86-64",
+            "binutils-244",
+        ])
         .inputs_owned(base_inputs(&[
             "gmp63",
             "mpfr421",
@@ -171,12 +177,4 @@ pub fn recipe() -> Recipe {
             "make",
         ]))
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
-            r#"
-echo ">> recipe-check gcc-x86-64-stage2: build-plan --auto builds+validates the x86_64 cross toolchain"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-stage2 daily 1
-"#,
-        )
-        .with_runner(CheckRunner::X8664CrossToolchain)])
 }
