@@ -672,6 +672,13 @@ fn have_cmd(cmd: &str) -> bool {
     })
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 /// Count `*.crate` files directly under `dir`.
 fn count_crates(dir: &Path) -> usize {
     std::fs::read_dir(dir)
@@ -983,6 +990,55 @@ fn parse_source_pins(text: &str) -> Result<Vec<SourcePin>, String> {
     Ok(pins)
 }
 
+fn recipe_eval_path_from_output(root: &Path, text: &str) -> Result<PathBuf, String> {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let Some(path) = lines.next() else {
+        return Err("recipe-eval-tool.sh printed no evaluator path".into());
+    };
+    if lines.next().is_some() {
+        return Err("recipe-eval-tool.sh printed multiple evaluator paths".into());
+    }
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(root.join(path))
+    }
+}
+
+fn recipe_eval_tool(root: &Path) -> Result<PathBuf, String> {
+    let script = root.join("tests/recipe-eval-tool.sh");
+    if !script.is_file() {
+        return Err(format!(
+            "no tests/recipe-eval-tool.sh under {} to resolve recipe source pins",
+            root.display()
+        ));
+    }
+    let out = Command::new("sh")
+        .arg(&script)
+        .arg(root.join(".td-build-cache/recipe-eval"))
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("spawn {}: {e}", script.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "recipe-eval-tool.sh failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let text = String::from_utf8(out.stdout)
+        .map_err(|e| format!("recipe-eval-tool.sh output not UTF-8: {e}"))?;
+    let eval = recipe_eval_path_from_output(root, &text)?;
+    if !is_executable_file(&eval) {
+        return Err(format!(
+            "recipe-eval-tool.sh returned a non-executable evaluator: {}",
+            eval.display()
+        ));
+    }
+    Ok(eval)
+}
+
 fn recipe_source_pins_result(root: &Path) -> Result<Vec<SourcePin>, String> {
     if !root.join("recipes/Cargo.toml").is_file() {
         return Err(format!(
@@ -990,20 +1046,12 @@ fn recipe_source_pins_result(root: &Path) -> Result<Vec<SourcePin>, String> {
             root.display()
         ));
     }
-    let out = Command::new("cargo")
-        .arg("run")
-        .arg("--quiet")
-        .arg("--manifest-path")
-        .arg("recipes/Cargo.toml")
-        .arg("--target-dir")
-        .arg(root.join(".td-build-cache/recipe-source-pins/target"))
-        .arg("--bin")
-        .arg("td-recipe-eval")
-        .arg("--")
+    let eval = recipe_eval_tool(root)?;
+    let out = Command::new(&eval)
         .arg("source-pins")
         .current_dir(root)
         .output()
-        .map_err(|e| format!("spawn cargo run td-recipe-eval source-pins: {e}"))?;
+        .map_err(|e| format!("spawn {} source-pins: {e}", eval.display()))?;
     if !out.status.success() {
         return Err(format!(
             "td-recipe-eval source-pins failed\nstdout:\n{}\nstderr:\n{}",
@@ -1050,8 +1098,7 @@ fn warm_sources(root: &Path) -> Result<(), String> {
     if pins.is_empty() {
         return Err("td-recipe-eval source-pins returned no pins".into());
     }
-    std::fs::create_dir_all(&dest)
-        .map_err(|e| format!("create {}: {e}", dest.display()))?;
+    std::fs::create_dir_all(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
 
     let feed = shared_feed();
     if let Some((addr, store)) = &feed {
@@ -1273,6 +1320,17 @@ fn warm_selftest() {
     }
     if parse_source_pins("").is_ok() {
         die("warm-selftest: parse_source_pins accepted an empty source-pin set".into());
+    }
+    let eval = recipe_eval_path_from_output(Path::new("/repo"), "target/release/td-recipe-eval\n")
+        .unwrap_or_else(|e| die(format!("warm-selftest: recipe eval path rejected: {e}")));
+    if eval != PathBuf::from("/repo/target/release/td-recipe-eval") {
+        die("warm-selftest: relative recipe eval path was not rooted".into());
+    }
+    if recipe_eval_path_from_output(Path::new("/repo"), "").is_ok() {
+        die("warm-selftest: empty recipe eval path accepted".into());
+    }
+    if recipe_eval_path_from_output(Path::new("/repo"), "a\nb\n").is_ok() {
+        die("warm-selftest: ambiguous recipe eval path accepted".into());
     }
     if strip_scheme("https://h/p") != "h/p" || strip_scheme("http://h/p") != "h/p" {
         die("warm-selftest: strip_scheme wrong".into());
