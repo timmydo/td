@@ -15,7 +15,7 @@
 //! RUNS in the store-ns own-root and compiles a C AND C++ program → both run → 42), structural
 //! (own-root /td/store, /gnu/store ABSENT). HEAVY (~45 min self build on a native-closure fetch HIT;
 //! a MISS adds the ~45-min native build, from-seed adds the ~98-min cross build). NOT a BUILD_GATE.
-//! The shared fetch-or-build ladder + the X3 fns live in tests/x86_64-cross-fns.sh.
+//! The self-hosting assertion is the second daily check owned by the `gcc-x86-64-native` recipe.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
@@ -26,30 +26,23 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        // Typed artifact inputs (#353): resolved by the runner — the shared
-        // x86_64 resolve/verify fns consume TD_GATE_INPUT_{COREUTILS,BASH_STATIC}.
-        inputs: &[
-            // coreutils: the x86_64_obtain_* wrappers call the subst-lib
-            // resolve fns, which consume TD_GATE_INPUT_COREUTILS (#353 review
-            // find — the wrapper call path was missed in the first cut).
-            ArtifactInput {
-                name: "coreutils",
-                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
+        inputs: &[ArtifactInput {
+            name: "bash-static",
+            kind: InputKind::ClosureMember {
+                lock: "tests/td-subst.lock",
+                root_stem: "bash",
+                member_stem: "bash-static",
             },
-            ArtifactInput {
-                name: "bash-static",
-                kind: InputKind::ClosureMember {
-                    lock: "tests/td-subst.lock",
-                    root_stem: "bash",
-                    member_stem: "bash-static",
-                },
-            },
-        ],
+        }],
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
-echo ">> bootstrap-x86_64-self-gcc-store-native: the NATIVE /td/store toolchain rebuilds binutils 2.44 + GCC 14.3.0 (gcc-rebuilds-gcc, rung X3) — builder is ELF64 x86_64 by assertion, the rebuilt gcc emits byte-identical -O2 -S assembly to its builder, is interned at /td/store as gcc-14.3.0-x86_64-self, and compiles+runs C/C++ in the own-root -> 42, /gnu/store ABSENT"
-sh tests/bootstrap-x86_64-self-gcc-store-native.sh
+echo ">> recipe-check gcc-x86-64-native: rebuild gcc with the native recipe output and assert self-hosting"
+: "${TD_RECIPE_EVAL:=}"
+if [ -z "$TD_RECIPE_EVAL" ] || [ ! -x "$TD_RECIPE_EVAL" ]; then
+  TD_RECIPE_EVAL=$(sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval")
+fi
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-native daily 2
 "##,
     }
 }

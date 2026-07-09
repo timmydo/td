@@ -1,5 +1,5 @@
 use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, RecipeCheck, Step};
 
 // GCC 14.3.0 cross STAGE2 (#378 slice 4, guix's cross gcc final): the FULL cross
 // compiler — c,c++ --enable-shared --enable-threads=posix against the x86_64
@@ -168,4 +168,11 @@ pub fn recipe() -> Recipe {
             "make",
         ]))
         .steps(steps)
+        .checks(vec![RecipeCheck::daily(
+            r#"
+echo ">> recipe-check gcc-x86-64-stage2: build-plan --auto builds+validates the x86_64 cross toolchain"
+: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-stage2 daily 1
+"#,
+        )])
 }

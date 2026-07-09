@@ -1,6 +1,6 @@
 //! toolchain-x86_64-input-addressed — the x86_64 /td/store toolchain (cross binutils-2.44 +
-//! cross gcc-14.3.0 + x86_64 glibc-2.41 + libgcc_s, built from the seed via
-//! run_x86_64_cross in tests/x86_64-cross-fns.sh, #201) gets a STABLE
+//! cross gcc-14.3.0 + x86_64 glibc-2.41 + libgcc_s, built from the seed via the
+//! recipe graph and validated by recipe-owned checks) gets a STABLE
 //! INPUT-ADDRESSED key — the x86_64 parallel of toolchain-input-addressed (#204, i686). The
 //! toolchain is not byte-reproducible, so store-add-recursive's content-addressed path varies
 //! build-to-build; tests/td-toolchain-x86_64.lock + `td-builder toolchain-key/toolchain-path`

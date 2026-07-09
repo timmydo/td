@@ -1,5 +1,5 @@
 use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, RecipeCheck, Step};
 
 // GCC 14.3.0, NATIVE x86_64 (x86_64-toolchain rung X2, the port of the shell
 // build_gcc_x86_64_native): --build=--host=--target=x86_64-pc-linux-gnu, so
@@ -227,4 +227,20 @@ pub fn recipe() -> Recipe {
             "make",
         ]))
         .steps(steps)
+        .checks(vec![
+            RecipeCheck::daily(
+                r#"
+echo ">> recipe-check gcc-x86-64-native: build-plan --auto builds+validates the native x86_64 gcc toolchain"
+: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-native daily 1
+"#,
+            ),
+            RecipeCheck::daily(
+                r#"
+echo ">> recipe-check gcc-x86-64-native self-host: rebuild gcc with the native x86_64 recipe output and validate the result"
+: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-native daily 2
+"#,
+            ),
+        ])
 }

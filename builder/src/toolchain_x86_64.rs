@@ -1,7 +1,7 @@
 //! Structured Rust port of the x86_64 SELF-HOST + rust toolchain builds. Rung X2 (the
 //! NATIVE binutils 2.44 + gcc 14.3.0) has since become the `binutils-x86-64-native` →
-//! `gcc-x86-64-native` recipe graph (recipes/src/recipes/, driven by build-plan --auto
-//! via run_x86_64_native) — the `toolchain-recipe x86_64-native` path is retired. What
+//! `gcc-x86-64-native` recipe graph (recipes/src/recipes/, driven by td-recipe-eval
+//! check-run) — the `toolchain-recipe x86_64-native` path is retired. What
 //! remains here: `td-builder toolchain-recipe x86_64-self` rebuilds the SAME binutils +
 //! gcc with the NATIVE /td/store toolchain as the builder (rung X3 — self-hosting,
 //! gcc-rebuilds-gcc: the compiler that compiles the compiler is itself a td-built ELF64
@@ -13,10 +13,8 @@
 //! Neither flavor is byte-reproducible (trust = the input-addressed lock name +
 //! the ed25519 substitute signature, see `tests/td-toolchain-x86_64-native.lock`), so
 //! this is deliberately NOT a `bootstrap::Recipe` (whose leg skeleton double-builds and
-//! asserts byte-identity). It is the build half only; the gate keeps interning the
-//! outputs (content-addressed, or at their lock-keyed paths), running the own-root
-//! behavioral verify, and `subst-export`ing them — those are generic `td-builder`
-//! subcommands, not ad-hoc build logic. (The X3 gate adds a `[codegen]` agreement leg
+//! asserts byte-identity). It is the build half only; the recipe check owns the
+//! output assertions and own-root behavioral verify. (The X3 check adds a `[codegen]` agreement leg
 //! in shell: the INPUT native gcc — now built by the `gcc-x86-64-native` recipe (rung
 //! X2) — and the self-rebuilt gcc (this module's `build_gcc_x86_64`, rung X3) must emit
 //! byte-identical `-O2 -S` assembly. That fixpoint SILENTLY DEPENDS on the two builds

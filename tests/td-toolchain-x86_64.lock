@@ -1,7 +1,7 @@
 # tests/td-toolchain-x86_64.lock — the x86_64 /td/store toolchain's stable INPUT-ADDRESSED
 # key (cross binutils-2.44 + cross gcc-14.3.0 + x86_64 glibc-2.41 + libgcc_s), built from the
-# 229-byte seed by the x86_64-toolchain gates via run_x86_64_cross (tests/x86_64-cross-fns.sh,
-# #201): the i686 chain → gcc 14.3.0 is crossed UP to a native x86_64 toolchain. It
+# 229-byte seed by the recipe graph: the i686 chain → gcc 14.3.0 is crossed UP to a native
+# x86_64 toolchain. It
 # consumes the SAME pinned source set as the i686 toolchain (tests/td-toolchain.lock) — the
 # cross is a BUILD configuration (--target=x86_64-pc-linux-gnu) over identical sources, plus
 # x86_64 UAPI headers DERIVED from the already-pinned linux-4.14.67 — so the ARCH is the
@@ -15,8 +15,8 @@
 #
 # The `input`/`patch` pins MIRROR recipe-owned source pins + seed/patches/* (identical to the i686
 # lock — same sources); the toolchain-x86_64-input-addressed gate asserts they stay in SYNC and
-# match the i686 lock's source set. Bump `recipe-rev` when the x86_64 cross RECIPE
-# (tests/x86_64-cross-fns.sh) changes without an input pin change, so a recipe change re-keys it.
+# match the i686 lock's source set. Bump `recipe-rev` when the x86_64 cross recipe
+# orchestration changes without an input pin change, so a recipe change re-keys it.
 name td-toolchain-x86_64
 recipe-rev 1
 component binutils-2.44-x86_64

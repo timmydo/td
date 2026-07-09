@@ -280,7 +280,7 @@ fn add_recipe_graph_targets(sel: &mut Selection) {
 // `store-ns` sandboxed no-guix round-trip, and the `subst-export`/`nar-restore`
 // round-trip that some of the deep store-native rungs' scripts also checked —
 // nothing ports those checks elsewhere. The remaining recipe-owned daily checks
-// and the x86_64 gate verifiers are the live coverage.
+// are the live coverage.
 fn add_chain_targets(sel: &mut Selection) {
     add_recipe_graph_targets(sel);
 }
@@ -441,6 +441,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // museum tier; the guix-dependence census retired with the guix-oracle gates.)
         sel.add_preflight("shell-syntax");
         sel.add_target("recipe-rs");
+        if glob_match("recipes/src/recipes/*.rs", p) {
+            sel.add_target("recipe-checks-daily");
+        }
         add_build_gate_targets(root, sel);
         return;
     }
@@ -545,17 +548,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         add_chain_targets(sel);
         return;
     }
-    // The rung-X2 native gcc gate's consumer test: a native x86_64 gcc/binutils built on top of the
-    // cross toolchain. Maps only to gate 422 (the native build is downstream of the cross rungs). The
-    // gate's gate_defs/422-*.rs file is already handled by the generic gate_defs arm above.
+    // Tombstones for the retired x86_64 shell drivers/libs. The live orchestration is
+    // recipe-owned; these deleting diffs still route to the daily gates that delegate
+    // into td-recipe-eval check-run.
     if pattern_matches("tests/bootstrap-x86_64-native-gcc-store-native.sh", p) {
-        sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         return;
     }
-    // The rung-X3 self-hosting gate's own driver (gcc-rebuilds-gcc, #298): maps only to gate 426.
     if pattern_matches("tests/bootstrap-x86_64-self-gcc-store-native.sh", p) {
-        sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-x86_64-self-gcc-store-native");
         return;
     }
@@ -573,11 +573,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         "tests/bootstrap-x86_64-toolchain-store-native.sh|tests/x86_64-cross-fns.sh|tests/x86_64-subst-lib.sh|builder/src/gate_defs/414-bootstrap-x86_64-toolchain-store-native.rs",
         p,
     ) {
-        sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-x86_64-toolchain-store-native");
-        // x86_64-cross-fns.sh also defines the rung-X2 native driver (run_x86_64_native), the shared
-        // fetch-or-build obtainers, and the rung-X3 self-host fns — so a change to it must re-run the
-        // native gcc gate AND the self-host gate, not only the cross toolchain gate.
+        // The old shared libs also defined the rung-X2 native driver, fetch-or-build
+        // obtainers, and rung-X3 self-host helpers; their deletion still routes to
+        // all three daily x86_64 gates.
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         sel.add_target("bootstrap-x86_64-self-gcc-store-native");
         return;
@@ -652,7 +651,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 fn preflight_cmd(name: &str) -> Option<&'static str> {
     match name {
         "shell-syntax" => Some(
-            "  bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
+            "  bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
         ),
         "cargo-test" => Some("  cargo test --manifest-path builder/Cargo.toml"),
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
@@ -992,6 +991,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // Recipes are one self-registering file each under src/recipes/ (issue #295);
     // the nested path must select the same gate (glob `*` crosses `/`).
     assert_target!("recipes/src/recipes/make-test.rs", "recipe-rs");
+    assert_target!("recipes/src/recipes/make-test.rs", "recipe-checks-daily");
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("builder/src/gate_defs/207-recipe-rs.rs", "recipe-rs");
@@ -1451,7 +1451,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  bash -n check.sh tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
+                "  bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
                 "  cargo test --manifest-path builder/Cargo.toml",
                 "  td-builder check check-pr",
                 "",
