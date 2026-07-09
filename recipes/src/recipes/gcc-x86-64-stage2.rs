@@ -1,5 +1,5 @@
 use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
-use crate::types::{Recipe, RecipeCheck, Step};
+use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // GCC 14.3.0 cross STAGE2 (#378 slice 4, guix's cross gcc final): the FULL cross
 // compiler — c,c++ --enable-shared --enable-threads=posix against the x86_64
@@ -17,8 +17,11 @@ pub fn recipe() -> Recipe {
     let mut steps = unpack_into("gcc-x86-64-stage2-source", "{src}");
     for t in ["gmp63", "mpfr421", "mpc131"] {
         steps.push(
-            Step::run("{src}", &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")])
-                .env("PATH", &base_path()),
+            Step::run(
+                "{src}",
+                &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")],
+            )
+            .env("PATH", &base_path()),
         );
     }
     steps.push(Step::Symlink {
@@ -174,5 +177,6 @@ echo ">> recipe-check gcc-x86-64-stage2: build-plan --auto builds+validates the 
 : "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-stage2 daily 1
 "#,
-        )])
+        )
+        .with_runner(CheckRunner::X8664CrossToolchain)])
 }

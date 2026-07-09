@@ -607,6 +607,16 @@ pub enum CheckTier {
 pub struct RecipeCheck {
     pub tier: CheckTier,
     pub script: String,
+    pub runner: Option<CheckRunner>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CheckRunner {
+    BuildOnly,
+    RustToolchain,
+    X8664CrossToolchain,
+    X8664NativeGcc,
+    X8664SelfGcc,
 }
 
 impl RecipeCheck {
@@ -614,6 +624,7 @@ impl RecipeCheck {
         RecipeCheck {
             tier: CheckTier::Pr,
             script: script.into(),
+            runner: None,
         }
     }
 
@@ -621,7 +632,13 @@ impl RecipeCheck {
         RecipeCheck {
             tier: CheckTier::Daily,
             script: script.into(),
+            runner: None,
         }
+    }
+
+    pub fn with_runner(mut self, runner: CheckRunner) -> RecipeCheck {
+        self.runner = Some(runner);
+        self
     }
 }
 

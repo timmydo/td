@@ -30,6 +30,8 @@ use td_recipe::catalog;
 
 #[path = "td_recipe_eval/check_runner.rs"]
 mod check_runner;
+#[path = "td_recipe_eval/checks/mod.rs"]
+mod checks;
 
 #[allow(
     clippy::unwrap_used,
@@ -263,6 +265,7 @@ mod tests {
             for (index, check) in checks.iter().enumerate() {
                 let check_index = index + 1;
                 let script = &check.script;
+                assert!(check.runner.is_some());
                 assert!(script.contains(&format!("check-run {stem} daily {check_index}")));
                 assert!(!script.contains(". tests/cache-lib.sh"));
                 assert!(!script.contains(". tests/ladder-lib.sh"));

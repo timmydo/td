@@ -1,5 +1,5 @@
 use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
-use crate::types::{Recipe, RecipeCheck, Step};
+use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // GCC 14.3.0, NATIVE x86_64 (x86_64-toolchain rung X2, the port of the shell
 // build_gcc_x86_64_native): --build=--host=--target=x86_64-pc-linux-gnu, so
@@ -16,8 +16,10 @@ use crate::types::{Recipe, RecipeCheck, Step};
 // as/ld), binutils-x86-64 (the cross as/ld the builder gcc resolves absolutely),
 // glibc-x86-64 (the x86_64 libc + the sysroot source).
 pub fn recipe() -> Recipe {
-    let xgcc = "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-gcc";
-    let xgpp = "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-g++";
+    let xgcc =
+        "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-gcc";
+    let xgpp =
+        "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-g++";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let nbin = "{in:binutils-x86-64-native}/bin";
     let path = format!("{nbin}:{{in:binutils-x86-64}}/bin:{}", base_path());
@@ -29,8 +31,11 @@ pub fn recipe() -> Recipe {
     let mut steps = unpack_into("gcc-x86-64-native-source", "{src}");
     for t in ["gmp63", "mpfr421", "mpc131"] {
         steps.push(
-            Step::run("{src}", &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")])
-                .env("PATH", &base_path()),
+            Step::run(
+                "{src}",
+                &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")],
+            )
+            .env("PATH", &base_path()),
         );
     }
     steps.push(Step::Symlink {
@@ -52,7 +57,10 @@ pub fn recipe() -> Recipe {
         from: format!("{xglibc}/include"),
         dest: "{root}/sysroot/include".into(),
     });
-    steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/sysroot/include"));
+    steps.extend(unpack_keep_top(
+        "linux-headers-x86-64",
+        "{root}/sysroot/include",
+    ));
     steps.push(Step::CopyTree {
         from: format!("{xglibc}/lib"),
         dest: "{root}/sysroot/lib".into(),
@@ -234,13 +242,15 @@ echo ">> recipe-check gcc-x86-64-native: build-plan --auto builds+validates the 
 : "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-native daily 1
 "#,
-            ),
+            )
+            .with_runner(CheckRunner::X8664NativeGcc),
             RecipeCheck::daily(
                 r#"
 echo ">> recipe-check gcc-x86-64-native self-host: rebuild gcc with the native x86_64 recipe output and validate the result"
 : "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-native daily 2
 "#,
-            ),
+            )
+            .with_runner(CheckRunner::X8664SelfGcc),
         ])
 }

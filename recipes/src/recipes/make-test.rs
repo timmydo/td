@@ -1,5 +1,5 @@
 use crate::ladder::{base_inputs, base_path, SH};
-use crate::types::{Recipe, RecipeCheck, Step};
+use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // make-test — the behavioral validation of make-x86-64 (issue #388 rung 1), modeled as a
 // RECIPE rather than a bespoke tests/ check script: it DEPENDS on make-x86-64 and, in its
@@ -50,13 +50,8 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     // [behavioral] RUN the built make → it drives the build (produces greeting.txt).
-    steps.push(
-        Step::run(
-            "{root}/t",
-            &[make, "SHELL={in:bash}/bin/bash"],
-        )
-        .env("PATH", &base_path()),
-    );
+    steps
+        .push(Step::run("{root}/t", &[make, "SHELL={in:bash}/bin/bash"]).env("PATH", &base_path()));
     // assert make actually produced the expected output (not just exited 0).
     steps.push(
         Step::run(
@@ -95,5 +90,6 @@ echo ">> recipe-check make-test: build-plan --auto builds+validates make-test �
 : "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run make-test daily 1
 "#,
-        )])
+        )
+        .with_runner(CheckRunner::BuildOnly)])
 }
