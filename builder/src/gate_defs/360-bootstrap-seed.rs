@@ -39,6 +39,7 @@ set -euo pipefail; \
 . tests/cache-lib.sh; export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; load_stage0; tb="$TB"; \
 case "$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($tb)" >&2; exit 1 ;; esac; \
 test -x "$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
+TD_RECIPE_EVAL=`sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval"`; export TD_RECIPE_EVAL; \
 "$tb" bootstrap-recipe seed
 "##,
     }

@@ -43,13 +43,10 @@ GLIBC_P2_SHA=a8a214f78c96723fee3d9d26b59249029e617bc720880ca2789a66ed73e2c7d0
 recipe_source_pins() {
   _rsp_eval=${TD_RECIPE_EVAL:-}
   if [ -z "$_rsp_eval" ]; then
-    for _rsp_candidate in recipes/target/release/td-recipe-eval recipes/target/debug/td-recipe-eval; do
-      [ -x "$_rsp_candidate" ] || continue
-      _rsp_eval=$_rsp_candidate
-      break
-    done
+    _rsp_eval=`sh tests/recipe-eval-tool.sh "$ROOT/.td-build-cache/recipe-eval"` \
+      || fail "could not build td-recipe-eval from the current worktree"
   fi
-  [ -n "$_rsp_eval" ] || fail "td-recipe-eval is not built; run the build-recipes prelude"
+  [ -x "$_rsp_eval" ] || fail "td-recipe-eval is not executable: $_rsp_eval"
   "$_rsp_eval" source-pins
 }
 SOURCE_PINS=`recipe_source_pins`

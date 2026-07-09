@@ -31,13 +31,10 @@ test -f "$LOCK" || fail "missing $LOCK"
 recipe_source_pins() {
   _rsp_eval=${TD_RECIPE_EVAL:-}
   if [ -z "$_rsp_eval" ]; then
-    for _rsp_candidate in recipes/target/release/td-recipe-eval recipes/target/debug/td-recipe-eval; do
-      [ -x "$_rsp_candidate" ] || continue
-      _rsp_eval=$_rsp_candidate
-      break
-    done
+    _rsp_eval=`sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval"` \
+      || fail "could not build td-recipe-eval from the current worktree"
   fi
-  [ -n "$_rsp_eval" ] || fail "td-recipe-eval is not built; run the build-recipes prelude"
+  [ -x "$_rsp_eval" ] || fail "td-recipe-eval is not executable: $_rsp_eval"
   "$_rsp_eval" source-pins
 }
 

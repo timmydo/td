@@ -59,13 +59,12 @@ for lock in "$root"/tests/*.lock; do
   emit "$path" "$url" "$sha"
   nblob=$((nblob+1))
 done
-eval_bin=
-for candidate in "$root"/recipes/target/release/td-recipe-eval "$root"/recipes/target/debug/td-recipe-eval; do
-  test -x "$candidate" || continue
-  eval_bin=$candidate
-  break
-done
-test -n "$eval_bin" || { echo "gen-feed-index: no td-recipe-eval binary; run the build-recipes prelude" >&2; exit 1; }
+eval_bin=${TD_RECIPE_EVAL:-}
+if test -z "$eval_bin"; then
+  eval_bin=`sh "$root/tests/recipe-eval-tool.sh" "$root/.td-build-cache/recipe-eval"` \
+    || { echo "gen-feed-index: could not build td-recipe-eval from the current worktree" >&2; exit 1; }
+fi
+test -x "$eval_bin" || { echo "gen-feed-index: td-recipe-eval is not executable: $eval_bin" >&2; exit 1; }
 while read -r key url sha file; do
   test -n "$key" -a -n "$url" -a -n "$sha" -a -n "$file" || continue
   path=$(printf '%s' "$url" | sed -E 's,^https?://,,')

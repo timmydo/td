@@ -38,24 +38,14 @@ use crate::tar;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// stage0-posix seed pins.
-const STAGE0_PIN: SourcePin = SourcePin {
-    url: "https://github.com/oriansj/stage0-posix/releases/download/Release_1.9.1/stage0-posix-1.9.1.tar.gz",
-    sha256: "f4fdda675de90ab034fd3467ef43cddff61b3d372f8e0e5c2d25d145f224226f",
-    file: "stage0-posix-1.9.1.tar.gz",
-};
 const HEX0_PIN: &str = "66c95985e668f20f2465c2b876f83fef066fd7c8c2dd3adb51a969f2d7120c8b";
 const KAEM_PIN: &str = "153b8915b73bd07132b59538d10fe53d26578eb160a67db72af07aaa61c51b3b";
-// The pinned GNU Mes source pin (one place — the pin check and the build read it).
-const MES_PIN: SourcePin = SourcePin {
-    url: "https://ftp.gnu.org/gnu/mes/mes-0.27.1.tar.gz",
-    sha256: "183a40ea47ea49f8a1e3bd1b9d12e676374d64d63bc79e7bc1ae7d673dfdf25d",
-    file: "mes-0.27.1.tar.gz",
-};
+const STAGE0_SOURCE_KEY: &str = "stage0-source";
+const MES_SOURCE_KEY: &str = "mes-source";
 
 /// Where a recipe finds its warmed-source cache (`.td-build-cache/sources/`,
 /// populated by
@@ -63,31 +53,139 @@ const MES_PIN: SourcePin = SourcePin {
 /// never egresses).
 pub struct Ctx {
     pub sources_dir: PathBuf,
+    source_pins: Vec<SourcePin>,
 }
 
 impl Ctx {
     /// Default context: repo root = CWD (the gate runs from there), sources =
     /// `<root>/.td-build-cache/sources` unless `TD_SOURCES_DIR` overrides it.
-    pub fn discover() -> io::Result<Ctx> {
-        let repo_root = std::env::current_dir()?;
-        Ok(Ctx::rooted(repo_root))
+    pub fn discover() -> Result<Ctx, String> {
+        let repo_root = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+        Ctx::rooted(repo_root)
     }
-    pub fn rooted(repo_root: PathBuf) -> Ctx {
+    pub fn rooted(repo_root: PathBuf) -> Result<Ctx, String> {
         let sources_dir = std::env::var_os("TD_SOURCES_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| repo_root.join(".td-build-cache/sources"));
-        Ctx { sources_dir }
+        let source_pins = load_recipe_source_pins(&repo_root)?;
+        Ok(Ctx {
+            sources_dir,
+            source_pins,
+        })
     }
+    fn source_pin(&self, key: &str) -> Result<&SourcePin, String> {
+        self.source_pins
+            .iter()
+            .find(|pin| pin.key == key)
+            .ok_or_else(|| format!("recipe source pin `{key}` is missing from td-recipe-eval source-pins"))
+    }
+}
+
+fn load_recipe_source_pins(repo_root: &Path) -> Result<Vec<SourcePin>, String> {
+    let out = recipe_source_pins_output(repo_root)?;
+    if !out.status.success() {
+        return Err(format!(
+            "td-recipe-eval source-pins failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let text =
+        String::from_utf8(out.stdout).map_err(|e| format!("source-pins output not UTF-8: {e}"))?;
+    parse_source_pins(&text)
+}
+
+fn recipe_source_pins_output(repo_root: &Path) -> Result<Output, String> {
+    if let Some(eval) = std::env::var_os("TD_RECIPE_EVAL").filter(|v| !v.is_empty()) {
+        let eval = PathBuf::from(eval);
+        if !is_executable_file(&eval) {
+            return Err(format!(
+                "TD_RECIPE_EVAL is not an executable file: {}",
+                eval.display()
+            ));
+        }
+        return Command::new(&eval)
+            .arg("source-pins")
+            .current_dir(repo_root)
+            .output()
+            .map_err(|e| format!("spawn {} source-pins: {e}", eval.display()));
+    }
+
+    if !repo_root.join("recipes/Cargo.toml").is_file() {
+        return Err(format!(
+            "no recipes/Cargo.toml under {} to resolve recipe source pins",
+            repo_root.display()
+        ));
+    }
+    Command::new("cargo")
+        .arg("run")
+        .arg("--quiet")
+        .arg("--manifest-path")
+        .arg("recipes/Cargo.toml")
+        .arg("--target-dir")
+        .arg(repo_root.join(".td-build-cache/recipe-source-pins/target"))
+        .arg("--bin")
+        .arg("td-recipe-eval")
+        .arg("--")
+        .arg("source-pins")
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| format!("spawn cargo run td-recipe-eval source-pins: {e}"))
+}
+
+fn parse_source_pins(text: &str) -> Result<Vec<SourcePin>, String> {
+    let mut pins = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let (Some(key), Some(url), Some(sha256), Some(file), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return Err(format!(
+                "source-pins line {} is not four TSV fields",
+                idx + 1
+            ));
+        };
+        if key.is_empty() || url.is_empty() || sha256.is_empty() || file.is_empty() {
+            return Err(format!("source-pins line {} has an empty field", idx + 1));
+        }
+        if file.contains('/') {
+            return Err(format!(
+                "source-pins line {} has non-basename file `{file}`",
+                idx + 1
+            ));
+        }
+        if pins.iter().any(|pin: &SourcePin| pin.key == key) {
+            return Err(format!("source-pins line {} duplicates key `{key}`", idx + 1));
+        }
+        pins.push(SourcePin {
+            key: key.to_string(),
+            url: url.to_string(),
+            sha256: sha256.to_lowercase(),
+            file: file.to_string(),
+        });
+    }
+    if pins.is_empty() {
+        return Err("td-recipe-eval source-pins returned no pins".into());
+    }
+    Ok(pins)
 }
 
 /// A pinned input — the `[pinned-input]` leg's flavours.
 pub enum Pin {
     /// A td-fetched upstream stage0 source tarball, plus the two binary seed
     /// files inside matching their per-file pins.
-    Stage0Source { pin: SourcePin },
+    Stage0Source { key: &'static str },
     /// A td-fetched tarball keyed by a recipe-owned fixed-output source pin:
     /// the warmed `.td-build-cache/sources/<file>` must match the pin sha256.
-    Source { pin: SourcePin },
+    Source { key: &'static str },
 }
 
 /// A durable post-build assertion — the rung-specific `[behavioral]` (and, for the
@@ -215,7 +313,8 @@ fn require_artifacts(b: &Built, artifacts: &[&str]) -> Result<(), String> {
 
 fn verify_pin(cx: &Ctx, pin: &Pin) -> Result<String, String> {
     match pin {
-        Pin::Stage0Source { pin } => {
+        Pin::Stage0Source { key } => {
+            let pin = cx.source_pin(key)?;
             let (_, _) = verified_source_tarball(cx, pin)?;
             let root = unpack_stage0_source(cx, pin)?;
             let _cleanup = Cleanup(root.clone());
@@ -230,7 +329,8 @@ fn verify_pin(cx: &Ctx, pin: &Pin) -> Result<String, String> {
                 pin.file, pin.sha256
             ))
         }
-        Pin::Source { pin } => {
+        Pin::Source { key } => {
+            let pin = cx.source_pin(key)?;
             let (pin, _) = verified_source_tarball(cx, pin)?;
             Ok(format!(
                 "td-fetched {} matches the source pin sha256 ({}) — building from the pinned upstream bytes, not vendored/guix-fetched",
@@ -240,8 +340,11 @@ fn verify_pin(cx: &Ctx, pin: &Pin) -> Result<String, String> {
     }
 }
 
-fn verified_source_tarball(cx: &Ctx, pin: &SourcePin) -> Result<(SourcePin, PathBuf), String> {
-    let tarball = cx.sources_dir.join(pin.file);
+fn verified_source_tarball<'a>(
+    cx: &Ctx,
+    pin: &'a SourcePin,
+) -> Result<(&'a SourcePin, PathBuf), String> {
+    let tarball = cx.sources_dir.join(&pin.file);
     if !tarball.exists() {
         return Err(format!(
             "the pinned tarball is not warm ({}) — run 'td-feed warm sources' to td-fetch {} (needs network); check.sh's prelude does this",
@@ -256,7 +359,7 @@ fn verified_source_tarball(cx: &Ctx, pin: &SourcePin) -> Result<(SourcePin, Path
             pin.file, pin.sha256
         ));
     }
-    Ok((*pin, tarball))
+    Ok((pin, tarball))
 }
 
 fn unpack_stage0_source(cx: &Ctx, pin: &SourcePin) -> Result<PathBuf, String> {
@@ -290,11 +393,12 @@ fn verify_seed_binary(root: &Path, rel: &str, sha256: &str) -> Result<(), String
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourcePin {
-    pub url: &'static str,
-    pub sha256: &'static str,
-    pub file: &'static str,
+    pub key: String,
+    pub url: String,
+    pub sha256: String,
+    pub file: String,
 }
 
 // --- the seed recipe (brick 0) ---------------------------------------------------
@@ -303,7 +407,9 @@ fn seed_recipe() -> Recipe {
     Recipe {
         name: "seed",
         brick: 0,
-        pins: vec![Pin::Stage0Source { pin: STAGE0_PIN }],
+        pins: vec![Pin::Stage0Source {
+            key: STAGE0_SOURCE_KEY,
+        }],
         build: build_seed,
         artifacts: vec!["AMD64/artifact/hex0", "AMD64/artifact/kaem-0"],
         checks: vec![
@@ -325,7 +431,7 @@ fn seed_recipe() -> Recipe {
 /// env-cleared. Returns the scratch dir. Shared by brick 0 (`build_seed`) and
 /// brick 2's toolchain (`mes_toolchain`, which drives a second kaem step on top).
 fn seed_stage0_tree(cx: &Ctx) -> Result<PathBuf, String> {
-    let out = unpack_stage0_source(cx, &STAGE0_PIN)?;
+    let out = unpack_stage0_source(cx, cx.source_pin(STAGE0_SOURCE_KEY)?)?;
     let amd = "bootstrap-seeds/POSIX/AMD64";
     make_executable(&out.join(format!("{amd}/hex0-seed"))).map_err(io_err("chmod hex0-seed"))?;
     make_executable(&out.join(format!("{amd}/kaem-optional-seed")))
@@ -400,7 +506,9 @@ fn mes_recipe() -> Recipe {
     Recipe {
         name: "mes",
         brick: 2,
-        pins: vec![Pin::Source { pin: MES_PIN }],
+        pins: vec![Pin::Source {
+            key: MES_SOURCE_KEY,
+        }],
         build: build_mes,
         artifacts: vec!["bin/mes-m2"],
         checks: vec![Check {
@@ -487,7 +595,7 @@ fn build_mes(cx: &Ctx) -> Result<Built, String> {
     }
 
     // Unpack the warmed, pin-verified tarball into a fresh scratch dir.
-    let (_, tarball) = verified_source_tarball(cx, &MES_PIN)?;
+    let (_, tarball) = verified_source_tarball(cx, cx.source_pin(MES_SOURCE_KEY)?)?;
     let work = scratch_dir("td-bootstrap-mes").map_err(io_err("scratch dir"))?;
     extract_tar_gz(&tarball, &work)?;
     let m = single_subdir(&work)?;
@@ -700,6 +808,13 @@ fn io_err(ctx: &'static str) -> impl Fn(io::Error) -> String {
     move |e| format!("{ctx}: {e}")
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 // pub(crate): also the per-file half of build::require_no_gnu_store (#378) —
 // ONE copy of the north-star "no guix bytes" predicate.
 pub(crate) fn contains_gnu_store(p: &Path) -> io::Result<bool> {
@@ -849,10 +964,27 @@ mod tests {
     /// crate is staged; when a developer has not warmed sources, the tarball is
     /// absent. Those tests skip there; the bootstrap-seed / bootstrap-mes gates
     /// run the full source-backed proof.
-    fn require_repo_tree() -> Option<PathBuf> {
+    fn require_repo_tree() -> Option<Ctx> {
         let root = repo_root();
-        let cx = Ctx::rooted(root.clone());
-        let tarball = cx.sources_dir.join(STAGE0_PIN.file);
+        if !root.join("recipes/Cargo.toml").is_file() {
+            eprintln!("skip: repo recipe catalog absent at {}", root.display());
+            return None;
+        }
+        let cx = match Ctx::rooted(root.clone()) {
+            Ok(cx) => cx,
+            Err(e) => {
+                eprintln!("skip: could not load recipe source pins: {e}");
+                return None;
+            }
+        };
+        let stage0 = match cx.source_pin(STAGE0_SOURCE_KEY) {
+            Ok(pin) => pin,
+            Err(e) => {
+                eprintln!("skip: {e}");
+                return None;
+            }
+        };
+        let tarball = cx.sources_dir.join(&stage0.file);
         if !tarball.is_file() {
             eprintln!(
                 "skip: stage0 source tarball absent ({}) — run td-feed warm sources",
@@ -860,7 +992,14 @@ mod tests {
             );
             return None;
         }
-        Some(root)
+        Some(cx)
+    }
+
+    fn synth_ctx() -> Ctx {
+        Ctx {
+            sources_dir: repo_root().join(".td-build-cache/sources"),
+            source_pins: Vec::new(),
+        }
     }
 
     #[test]
@@ -899,10 +1038,9 @@ M2-Planet \\\n\
     // check-engine. Verified-red by perturbing each pin/leg (see plan notes).
     #[test]
     fn seed_recipe_builds_and_passes_all_legs() {
-        let Some(root) = require_repo_tree() else {
+        let Some(cx) = require_repo_tree() else {
             return;
         };
-        let cx = Ctx::rooted(root);
         let recipe = seed_recipe();
         let report = run(&cx, &recipe).expect("seed recipe should pass all legs");
         assert!(report.contains("[pinned-input]"), "report:\n{report}");
@@ -919,19 +1057,21 @@ M2-Planet \\\n\
     // Verified-red harness as a test: a wrong source pin must red the pinned-input leg.
     #[test]
     fn wrong_stage0_source_pin_reds_pinned_input() {
-        let Some(root) = require_repo_tree() else {
+        let Some(mut cx) = require_repo_tree() else {
             return;
         };
-        let real = Ctx::rooted(root);
-        let bad_pin = SourcePin {
-            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-            ..STAGE0_PIN
-        };
-        let cx = Ctx {
-            sources_dir: real.sources_dir,
-        };
+        let mut bad_pin = cx
+            .source_pin(STAGE0_SOURCE_KEY)
+            .expect("stage0 pin loaded")
+            .clone();
+        bad_pin.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string();
+        cx.source_pins.retain(|pin| pin.key != STAGE0_SOURCE_KEY);
+        cx.source_pins.push(bad_pin);
         let recipe = Recipe {
-            pins: vec![Pin::Stage0Source { pin: bad_pin }],
+            pins: vec![Pin::Stage0Source {
+                key: STAGE0_SOURCE_KEY,
+            }],
             ..seed_recipe()
         };
         let e = run(&cx, &recipe).unwrap_err();
@@ -981,27 +1121,27 @@ M2-Planet \\\n\
 
     #[test]
     fn green_synthetic_passes() {
-        let cx = Ctx::rooted(repo_root());
+        let cx = synth_ctx();
         run(&cx, &synth(build_deterministic, vec![])).expect("deterministic synth passes");
     }
 
     #[test]
     fn nondeterministic_build_reds_repro() {
-        let cx = Ctx::rooted(repo_root());
+        let cx = synth_ctx();
         let e = run(&cx, &synth(build_nondeterministic, vec![])).unwrap_err();
         assert!(e.contains("NOT reproducible"), "got: {e}");
     }
 
     #[test]
     fn gnu_store_in_artifact_reds_no_guix() {
-        let cx = Ctx::rooted(repo_root());
+        let cx = synth_ctx();
         let e = run(&cx, &synth(build_with_gnu_store, vec![])).unwrap_err();
         assert!(e.contains("/gnu/store"), "got: {e}");
     }
 
     #[test]
     fn failing_check_reds_run() {
-        let cx = Ctx::rooted(repo_root());
+        let cx = synth_ctx();
         let recipe = synth(
             build_deterministic,
             vec![Check {

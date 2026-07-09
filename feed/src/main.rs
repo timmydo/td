@@ -991,26 +991,27 @@ fn recipe_source_pins(root: &Path) -> Vec<SourcePin> {
 }
 
 fn recipe_source_pins_result(root: &Path) -> Result<Vec<SourcePin>, String> {
-    let release = root.join("recipes/target/release/td-recipe-eval");
-    let debug = root.join("recipes/target/debug/td-recipe-eval");
-    let out = if release.is_file() {
-        Command::new(&release)
+    let out = if let Some(eval) = std::env::var_os("TD_RECIPE_EVAL").filter(|v| !v.is_empty()) {
+        let eval = PathBuf::from(eval);
+        if !is_executable_file(&eval) {
+            return Err(format!(
+                "TD_RECIPE_EVAL is not an executable file: {}",
+                eval.display()
+            ));
+        }
+        Command::new(&eval)
             .arg("source-pins")
             .current_dir(root)
             .output()
-            .map_err(|e| format!("spawn {} source-pins: {e}", release.display()))?
-    } else if debug.is_file() {
-        Command::new(&debug)
-            .arg("source-pins")
-            .current_dir(root)
-            .output()
-            .map_err(|e| format!("spawn {} source-pins: {e}", debug.display()))?
+            .map_err(|e| format!("spawn {} source-pins: {e}", eval.display()))?
     } else {
         Command::new("cargo")
             .arg("run")
             .arg("--quiet")
             .arg("--manifest-path")
             .arg("recipes/Cargo.toml")
+            .arg("--target-dir")
+            .arg(root.join(".td-build-cache/recipe-source-pins/target"))
             .arg("--bin")
             .arg("td-recipe-eval")
             .arg("--")
@@ -1037,6 +1038,13 @@ fn strip_scheme(url: &str) -> String {
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url)
         .to_string()
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// The shared feed `(addr, store)` if TD_FEED_BASE is set (the loop prelude runs
