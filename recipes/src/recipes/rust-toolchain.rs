@@ -7,7 +7,7 @@ use crate::types::{Recipe, RecipeCheck, Source};
 // The maintainer scope decision: the rust toolchain td uses to build rust packages is NOT
 // part of the full-source bootstrap. It enters as a PINNED UPSTREAM Rust release (rustc +
 // cargo + rust-std for x86_64-unknown-linux-gnu, a declared fixed-output fetch — the
-// `.source()` below, mirrored by seed/sources/rust-1.96.0.lock, guix-free) TRANSFORMED by
+// `.source()` below, mirrored by the recipe-owned rust-toolchain-source pin, guix-free) TRANSFORMED by
 // this recipe: unpack the release tarball IN-SANDBOX, extract rustc/cargo + the rustlib
 // sysroot, co-locate the runtime closure (glibc sonames + libgcc_s + libz, found via the
 // upstream $ORIGIN/../lib RUNPATH), and RELINK rustc/cargo's ELF interpreter onto td's own

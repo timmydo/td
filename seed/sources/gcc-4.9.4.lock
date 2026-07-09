@@ -1,8 +1,0 @@
-# seed/sources/gcc-4.9.4.lock — GCC 4.9.4, the source-bootstrap brick 5 FINAL mesboot gcc (guix's
-# gcc-mesboot): built by gcc-mesboot1 (4.6.4) + binutils-mesboot + glibc-mesboot 2.16.0, with
-# gmp-4.3.2/mpfr-2.4.2/mpc-1.0.3 unpacked into the tree. The last mesboot gcc — capable enough to
-# (re)build the modern toolchain at --prefix=/td/store. td-fetched (td-feed warm sources).
-# nix-base32 cross-checks guix's pin 14l06m7nvcvb0igkbip58x59w3nq6315k6jcz3wr9ch1rn9d44bc.
-url https://ftp.gnu.org/gnu/gcc/gcc-4.9.4/gcc-4.9.4.tar.bz2
-sha256 6c11d292cd01b294f9f84c9a59c230d80e9e4a47e5c6355f046bb36d4f358092
-file gcc-4.9.4.tar.bz2

@@ -1,6 +1,0 @@
-# seed/sources/patch-2.5.9.lock — GNU patch 2.5.9, the mesboot `patch` (guix's patch-mesboot).
-# The seed-built tcc compiles it, driven by the tcc-built GNU Make (brick-5 make rung). patch is
-# the tool the binutils/gcc rungs need to apply guix's bootstrap patches. td-fetched.
-url https://ftp.gnu.org/gnu/patch/patch-2.5.9.tar.gz
-sha256 ecb5c6469d732bcf01d6ec1afe9e64f1668caba5bfdb103c28d7f537ba3cdb8a
-file patch-2.5.9.tar.gz

@@ -13,7 +13,7 @@
 # the prereq for td-subst chain-caching so a consumer (rust compile/userland rungs 3/4) FETCHES
 # the x86_64 toolchain instead of the ~90-min from-seed rebuild.
 #
-# The `input`/`patch` pins MIRROR seed/sources/*.lock + seed/patches/* (identical to the i686
+# The `input`/`patch` pins MIRROR recipe-owned source pins + seed/patches/* (identical to the i686
 # lock — same sources); the toolchain-x86_64-input-addressed gate asserts they stay in SYNC and
 # match the i686 lock's source set. Bump `recipe-rev` when the x86_64 cross RECIPE
 # (tests/x86_64-cross-fns.sh) changes without an input pin change, so a recipe change re-keys it.
@@ -22,7 +22,7 @@ recipe-rev 1
 component binutils-2.44-x86_64
 component gcc-14.3.0-x86_64
 component glibc-2.41-x86_64
-# --- pinned sources (mirror seed/sources/*.lock — IDENTICAL to tests/td-toolchain.lock) ---
+# --- pinned sources (mirror recipe source pins — IDENTICAL to tests/td-toolchain.lock) ---
 input 183a40ea47ea49f8a1e3bd1b9d12e676374d64d63bc79e7bc1ae7d673dfdf25d mes-0.27.1.tar.gz
 input f36e4fb7dd524dc3f4b354d3d5313f69e7ce5a6ae93711e8cf6d51eaa8d2b318 nyacc-1.00.2.tar.gz
 input f4f6ce121ac631a234af080753fb9d645d2334d20160b37abbe75b574a1e1d19 tcc-0.9.26-1149-g46a75d0c.tar.gz

@@ -1,7 +1,0 @@
-# seed/sources/glibc-2.2.5.lock — GNU C Library 2.2.5, guix's glibc-mesboot0 — the most recent glibc
-# buildable with gcc-2.95.3 (the seed gcc). Built with gcc-core-mesboot0 + binutils-mesboot0 + the
-# Linux 4.14.67 kernel headers, patched with seed/patches/glibc-boot-2.2.5.patch +
-# glibc-bootstrap-system-2.2.5.patch. The first C library in the /td/store toolchain. td-fetched.
-url https://ftp.gnu.org/gnu/glibc/glibc-2.2.5.tar.gz
-sha256 58dc8df59aed1e4d9d50eef9e4c4c0789fa283b50f7a093932d0f467424484ee
-file glibc-2.2.5.tar.gz

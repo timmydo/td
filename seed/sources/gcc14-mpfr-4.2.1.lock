@@ -1,5 +1,0 @@
-# seed/sources/gcc14-mpfr-4.2.1.lock — MPFR 4.2.1, gcc 14.3.0's in-tree prerequisite. Named gcc14-* so the
-# chain gates' `ls mpfr-*.lock` glob (old mpfr 2.4.2) does NOT match it. td-fetched.
-url https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz
-sha256 277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2
-file mpfr-4.2.1.tar.xz

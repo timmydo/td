@@ -9,7 +9,15 @@
 //! lowering bridge is unchanged (camelCase keys; an optional field is emitted iff
 //! it is present, matching boa's "keys present in the object literal").
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use crate::json::Json;
 
@@ -76,7 +84,9 @@ pub enum Step {
     },
     /// Symlink name → target under {tools} (the rung's PATH farm; replaces the
     /// ladder's per-rung `bin/` symlink dirs + `ls /gnu/store/*pkg*` scavenging).
-    ToolFarm { links: Vec<(String, String)> },
+    ToolFarm {
+        links: Vec<(String, String)>,
+    },
     /// Write a file (wrapper scripts, config.cache, stub makefiles).
     WriteFile {
         path: String,
@@ -84,21 +94,41 @@ pub enum Step {
         exec: bool,
     },
     /// Copy files (flat) into dest, made user-writable (build trees are written into).
-    CopyFiles { files: Vec<String>, dest: String },
+    CopyFiles {
+        files: Vec<String>,
+        dest: String,
+    },
     /// Recursive tree copy (kernel-header overlays, module trees).
-    CopyTree { from: String, dest: String },
-    Symlink { target: String, link: String },
-    MkDir { path: String },
+    CopyTree {
+        from: String,
+        dest: String,
+    },
+    Symlink {
+        target: String,
+        link: String,
+    },
+    MkDir {
+        path: String,
+    },
     /// Rewrite `#!/bin/sh`-style shebangs under dir to the given shell (the
     /// engine's own patch_shebangs — the sandbox has no /bin/sh).
-    PatchShebangs { dir: String, shell: String },
+    PatchShebangs {
+        dir: String,
+        shell: String,
+    },
     /// Rewrite glibc text linker scripts under `dir/*.so`, stripping
     /// `<prefix>/lib/` from their member names. Real ELF shared objects are
     /// skipped by the engine's GNU-ld-script marker check.
-    RelocateLdScripts { dir: String, prefix: String },
+    RelocateLdScripts {
+        dir: String,
+        prefix: String,
+    },
     /// Assert products exist (and are executable files if exec) — fail HERE with
     /// a named path, not three rungs later.
-    Require { paths: Vec<String>, exec: bool },
+    Require {
+        paths: Vec<String>,
+        exec: bool,
+    },
 }
 
 impl Step {
@@ -137,10 +167,12 @@ impl Step {
                     ("dir".into(), Json::Str(dir.clone())),
                 ]),
             )]),
-            Step::ToolFarm { links } => {
-                Json::Obj(vec![("toolFarm".into(), pair_arr(links))])
-            }
-            Step::WriteFile { path, content, exec } => Json::Obj(vec![(
+            Step::ToolFarm { links } => Json::Obj(vec![("toolFarm".into(), pair_arr(links))]),
+            Step::WriteFile {
+                path,
+                content,
+                exec,
+            } => Json::Obj(vec![(
                 "writeFile".into(),
                 Json::Obj(vec![
                     ("path".into(), Json::Str(path.clone())),
@@ -169,9 +201,7 @@ impl Step {
                     ("link".into(), Json::Str(link.clone())),
                 ]),
             )]),
-            Step::MkDir { path } => {
-                Json::Obj(vec![("mkDir".into(), Json::Str(path.clone()))])
-            }
+            Step::MkDir { path } => Json::Obj(vec![("mkDir".into(), Json::Str(path.clone()))]),
             Step::PatchShebangs { dir, shell } => Json::Obj(vec![(
                 "patchShebangs".into(),
                 Json::Obj(vec![
@@ -239,6 +269,29 @@ impl Source {
             ("uri".into(), self.uri.to_json()),
             ("sha256".into(), Json::Str(self.sha256.clone())),
         ])
+    }
+}
+
+/// A td-owned fixed-output source pin. These are the URL/sha256/file triples
+/// that used to live in the external source lock directory; recipes carry them as
+/// metadata so warmers/checks resolve from the typed catalog instead of an
+/// external lock directory. They are intentionally not emitted into build JSON.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SourcePin {
+    pub key: String,
+    pub url: String,
+    pub sha256: String,
+    pub file: String,
+}
+
+impl SourcePin {
+    pub fn new(key: &str, url: &str, sha256: &str, file: &str) -> SourcePin {
+        SourcePin {
+            key: key.into(),
+            url: url.into(),
+            sha256: sha256.into(),
+            file: file.into(),
+        }
     }
 }
 
@@ -512,7 +565,7 @@ pub struct Recipe {
     /// The MAP KEY (in the `build-plan --auto` tool/source map `ladder_setup`
     /// interns) that resolves to this recipe's OWN `<name>-source` lock entry
     /// (#429) — distinct from `source` (an actual declared upstream fetch): a
-    /// mesboot rung's source is a seed/sources-pinned tarball ALREADY interned
+    /// mesboot rung's source is a recipe-pinned tarball ALREADY interned
     /// under some other name (e.g. gcc-mesboot1 builds from the map key
     /// `gcc-464-core`, not `gcc-mesboot1-source`), so this just names which
     /// interned entry to alias in. `None` means the recipe has no source of its
@@ -538,6 +591,10 @@ pub struct Recipe {
     /// Package-owned behavioral/reproducibility checks. The gate runner consumes
     /// these through `td-recipe-eval check-*`; the build path ignores them.
     pub checks: Option<Vec<RecipeCheck>>,
+    /// Recipe-owned fixed-output source pins. The recipe/check/feed surfaces
+    /// consume these; the build JSON deliberately omits them because `sourceInput`
+    /// is the staged input key the builder already understands.
+    pub source_pins: Option<Vec<SourcePin>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -554,11 +611,17 @@ pub struct RecipeCheck {
 
 impl RecipeCheck {
     pub fn pr(script: &str) -> RecipeCheck {
-        RecipeCheck { tier: CheckTier::Pr, script: script.into() }
+        RecipeCheck {
+            tier: CheckTier::Pr,
+            script: script.into(),
+        }
     }
 
     pub fn daily(script: &str) -> RecipeCheck {
-        RecipeCheck { tier: CheckTier::Daily, script: script.into() }
+        RecipeCheck {
+            tier: CheckTier::Daily,
+            script: script.into(),
+        }
     }
 }
 
@@ -582,6 +645,7 @@ impl Recipe {
             no_default_features: None,
             features: None,
             checks: None,
+            source_pins: None,
         }
     }
     pub fn gnu(name: &str, version: &str) -> Recipe {
@@ -629,15 +693,18 @@ impl Recipe {
     /// source of its own (make-test) simply never calls this.
     pub fn source_input(mut self, key: &str) -> Recipe {
         self.source_input = Some(key.into());
+        self.add_source_pin_for_key(key);
         self
     }
     pub fn inputs(mut self, xs: &[&str]) -> Recipe {
         self.inputs = Some(vs(xs));
+        self.add_source_pins_for_keys(xs.iter().copied());
         self
     }
     /// Owned-string variant of `inputs`, for `ladder::base_inputs(...)` which
     /// assembles the extras + BASE_TOOLS list at runtime.
     pub fn inputs_owned(mut self, xs: Vec<String>) -> Recipe {
+        self.add_source_pins_for_keys(xs.iter().map(String::as_str));
         self.inputs = Some(xs);
         self
     }
@@ -676,6 +743,39 @@ impl Recipe {
     pub fn checks(mut self, xs: Vec<RecipeCheck>) -> Recipe {
         self.checks = Some(xs);
         self
+    }
+    pub fn source_pin(mut self, pin: SourcePin) -> Recipe {
+        self.push_source_pin(pin);
+        self
+    }
+    pub fn source_pins(mut self, pins: Vec<SourcePin>) -> Recipe {
+        for pin in pins {
+            self.push_source_pin(pin);
+        }
+        self
+    }
+
+    fn add_source_pins_for_keys<'a, I>(&mut self, keys: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        for key in keys {
+            self.add_source_pin_for_key(key);
+        }
+    }
+
+    fn add_source_pin_for_key(&mut self, key: &str) {
+        if let Some(pin) = crate::source_pins::by_key(key) {
+            self.push_source_pin(pin);
+        }
+    }
+
+    fn push_source_pin(&mut self, pin: SourcePin) {
+        let pins = self.source_pins.get_or_insert_with(Vec::new);
+        if pins.iter().any(|existing| existing.key == pin.key) {
+            return;
+        }
+        pins.push(pin);
     }
 
     /// The build system as its JSON/lowering token ("gnu"/"rust"/"cmake"/"stage0").
@@ -773,6 +873,16 @@ mod tests {
         assert_eq!(
             r.to_json().to_canonical(),
             r#"{"buildSystem":"gnu","name":"fixture","version":"1.0"}"#
+        );
+    }
+
+    #[test]
+    fn source_pins_are_recipe_metadata_not_build_json() {
+        let r = Recipe::gnu("stage0", "1.9.1").source_input("stage0-source");
+        assert_eq!(r.source_pins.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            r.to_json().to_canonical(),
+            r#"{"buildSystem":"gnu","name":"stage0","sourceInput":"stage0-source","version":"1.9.1"}"#
         );
     }
 }

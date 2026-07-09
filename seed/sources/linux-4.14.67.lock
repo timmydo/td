@@ -1,6 +1,0 @@
-# seed/sources/linux-4.14.67.lock — Linux 4.14.67 source, for the mesboot kernel headers (guix's
-# %bootstrap-linux-libre-headers is a prebuilt guix blob — rejected by the north star, so td produces
-# the headers FROM SOURCE via `make headers_install`). glibc-mesboot0 builds against these. td-fetched.
-url https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz
-sha256 3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba
-file linux-4.14.67.tar.xz

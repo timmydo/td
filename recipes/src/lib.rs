@@ -10,4 +10,5 @@
 pub mod catalog;
 pub mod json;
 pub mod ladder;
+pub mod source_pins;
 pub mod types;

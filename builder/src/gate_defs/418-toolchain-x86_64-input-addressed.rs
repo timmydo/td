@@ -7,7 +7,7 @@
 //! derive the path from the DECLARED inputs (a pure function), so it is identical across
 //! rebuilds and predictable from the lock — the prereq for fetching the x86_64 toolchain
 //! instead of the ~90-min from-seed rebuild (the rust compile/userland rungs 3/4).
-//! DURABLE, td-native end to end (no guix oracle): pinned-sync (lock pins == seed pins),
+//! DURABLE, td-native end to end (no guix oracle): pinned-sync (lock pins == recipe source pins),
 //! arch-parity (shares i686's exact source set; only name/recipe-rev/component differ),
 //! distinct-key (arch re-keys -> no collision with i686), stable-key (deterministic, distinct
 //! component paths), load-bearing (recipe-rev + a pin move the addressing), behavioral (a real

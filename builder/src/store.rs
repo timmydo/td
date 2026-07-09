@@ -4,7 +4,15 @@
 //! store path (and, later, derivation output paths) WITHOUT guile — the
 //! evaluator-as-library track.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use crate::sha256::{self, Sha256};
 
@@ -178,7 +186,11 @@ fn hash_derivation_modulo(
             .iter()
             .map(|o| Output {
                 name: o.name.clone(),
-                path: if mask_outputs { String::new() } else { o.path.clone() },
+                path: if mask_outputs {
+                    String::new()
+                } else {
+                    o.path.clone()
+                },
                 hash_algo: o.hash_algo.clone(),
                 hash: o.hash.clone(),
             })
@@ -211,7 +223,11 @@ pub fn output_path(
 ) -> Result<String, String> {
     let mut cache = HashMap::new();
     let h = hash_derivation_modulo(d, true, &mut cache, read)?;
-    Ok(output_path_from_modulo(&sha256::to_base16(&h), drv_name, out_name))
+    Ok(output_path_from_modulo(
+        &sha256::to_base16(&h),
+        drv_name,
+        out_name,
+    ))
 }
 
 fn output_path_from_modulo(modulo_hex: &str, drv_name: &str, out_name: &str) -> String {
@@ -239,9 +255,9 @@ pub fn input_addressed_path(key_hex: &str, name: &str) -> String {
 
 /// The parsed `td-toolchain.lock` — the toolchain's declared INPUT set, the source of
 /// truth for its stable input-addressed key. The lock is line-based (`field value`,
-/// like the seed/source locks): one `name`, one `recipe-rev`, one or more `component`
+/// like the recipe source pins): one `name`, one `recipe-rev`, one or more `component`
 /// (the toolchain's parts, e.g. gcc-14.3.0), and the pinned `input`/`patch`
-/// `<sha256> <file>` lines (mirrors of seed/sources/*.lock + the vendored boot
+/// `<sha256> <file>` lines (mirrors of recipe source pins + the vendored boot
 /// patches — the gate asserts they stay in sync). The KEY hashes ALL of these, so the
 /// input-addressed path changes iff a declared input changes (load-bearing) and is
 /// content-independent (stable across non-reproducible rebuilds).
@@ -264,7 +280,10 @@ impl ToolchainLock {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (key, val) = line.split_once(' ').map(|(k, v)| (k, v.trim())).unwrap_or((line, ""));
+            let (key, val) = line
+                .split_once(' ')
+                .map(|(k, v)| (k, v.trim()))
+                .unwrap_or((line, ""));
             match key {
                 "name" => {
                     if !name.is_empty() {
@@ -305,7 +324,13 @@ impl ToolchainLock {
         if inputs.is_empty() {
             return Err("td-toolchain.lock: needs at least one `input`".into());
         }
-        Ok(ToolchainLock { name, recipe_rev, components, inputs, patches })
+        Ok(ToolchainLock {
+            name,
+            recipe_rev,
+            components,
+            inputs,
+            patches,
+        })
     }
 
     /// The toolchain's stable INPUT key: sha256 (base-16) over a canonical, ORDER-
@@ -365,7 +390,12 @@ pub fn construct_drv(
     let out_paths: HashMap<String, String> = d
         .outputs
         .iter()
-        .map(|o| (o.name.clone(), output_path_from_modulo(&modulo_hex, drv_name, &o.name)))
+        .map(|o| {
+            (
+                o.name.clone(),
+                output_path_from_modulo(&modulo_hex, drv_name, &o.name),
+            )
+        })
         .collect();
 
     let rebuilt = Derivation {
@@ -502,7 +532,10 @@ mod tests {
         assert!(guix.starts_with("/gnu/store/") && guix.ends_with("-fixture-1.0"));
         assert!(td.starts_with("/td/store/") && td.ends_with("-fixture-1.0"));
         // Same name, same 32-char digest width — but a DIFFERENT digest (the prefix is hashed).
-        assert_eq!(name_from_store_path(&guix).unwrap(), name_from_store_path(&td).unwrap());
+        assert_eq!(
+            name_from_store_path(&guix).unwrap(),
+            name_from_store_path(&td).unwrap()
+        );
         assert_ne!(
             guix.rsplit('/').next().unwrap(),
             td.rsplit('/').next().unwrap(),
@@ -518,7 +551,10 @@ mod tests {
         // path; a different key ⇒ a different path (the inputs are load-bearing).
         let a = input_addressed_path("deadbeef", "td-toolchain");
         let b = input_addressed_path("deadbeef", "td-toolchain");
-        assert_eq!(a, b, "same key+name must yield the same input-addressed path");
+        assert_eq!(
+            a, b,
+            "same key+name must yield the same input-addressed path"
+        );
         assert!(a.ends_with("-td-toolchain"));
         assert_ne!(
             a,
@@ -568,7 +604,10 @@ mod tests {
         assert!(ToolchainLock::parse("name x\ncomponent y\ninput a f\n").is_err()); // no recipe-rev
         assert!(ToolchainLock::parse("name x\nrecipe-rev 1\ninput a f\n").is_err()); // no component
         assert!(ToolchainLock::parse("name x\nrecipe-rev 1\ncomponent y\n").is_err()); // no input
-        assert!(ToolchainLock::parse("name x\nrecipe-rev 1\ncomponent y\ninput a f\nbogus z\n").is_err());
+        assert!(
+            ToolchainLock::parse("name x\nrecipe-rev 1\ncomponent y\ninput a f\nbogus z\n")
+                .is_err()
+        );
         assert!(ToolchainLock::parse("name x\nrecipe-rev 1\ncomponent y\ninput nosha\n").is_err());
     }
 }

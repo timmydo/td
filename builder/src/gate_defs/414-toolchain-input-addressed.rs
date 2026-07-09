@@ -5,7 +5,7 @@
 //! fetch. tests/td-toolchain.lock + `td-builder toolchain-key/toolchain-path` derive the path
 //! from the toolchain's DECLARED inputs (a pure function of inputs), so it is identical across
 //! rebuilds and predictable from the lock — the prereq for td-subst chain-caching (2b/2c).
-//! Durable, td-native end to end (no guix oracle): pinned-sync (lock pins == seed pins),
+//! Durable, td-native end to end (no guix oracle): pinned-sync (lock pins == recipe source pins),
 //! stable-key (deterministic, distinct component paths), content-indep (same key+different
 //! bytes -> same path, vs content-addressed which splits), load-bearing (a pin moves the
 //! path), behavioral+structural (a real binary at an input-addressed path runs in the

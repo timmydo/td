@@ -1,7 +1,0 @@
-# seed/sources/tcc-0.9.26-1149-g46a75d0c.lock — the mes-patched TinyCC, the source-bootstrap
-# brick 4 input. The 30-patch mes fork of tcc 0.9.26 that MesCC can compile (pristine tcc cannot);
-# this is exactly what guix's tcc-boot0 builds. NOT vendored, NOT guix-fetched: td-fetch warms it
-# from the pinned url + sha256 (td-feed warm sources, check.sh prelude).
-url https://lilypond.org/janneke/tcc/tcc-0.9.26-1149-g46a75d0c.tar.gz
-sha256 f4f6ce121ac631a234af080753fb9d645d2334d20160b37abbe75b574a1e1d19
-file tcc-0.9.26-1149-g46a75d0c.tar.gz

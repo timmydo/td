@@ -399,6 +399,29 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    if p == "recipes/src/source_pins.rs" {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("recipe-rs");
+        sel.add_target("bootstrap-seed");
+        sel.add_target("bootstrap-mes");
+        add_build_gate_targets(root, sel);
+        add_chain_targets(sel);
+        return;
+    }
+
+    // Tombstones for the deleted external source-pin side table. These paths
+    // exist only in the branch diff that removes them; the live owner is
+    // recipes/src/source_pins.rs.
+    if pattern_matches("seed/sources/*.lock", p) {
+        sel.add_preflight("shell-syntax");
+        sel.add_target("recipe-rs");
+        sel.add_target("bootstrap-seed");
+        sel.add_target("bootstrap-mes");
+        add_build_gate_targets(root, sel);
+        add_chain_targets(sel);
+        return;
+    }
+
     if pattern_matches(
         "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipe-emit.sh|tests/recipe-eval-tool.sh",
         p,
@@ -433,6 +456,13 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    if p == "tests/td-feed.index" {
+        // The shared feed index is a pinned manifest for the source/crate bytes
+        // consumed by recipe graph warmers.
+        add_chain_targets(sel);
+        return;
+    }
+
     if p == "tests/toolchain-input-addressed.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_target("toolchain-input-addressed");
@@ -447,8 +477,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     // #410: the tests/td-toolchain-rust-x86_64.lock mapping was removed with the rust-toolchain
-    // recipe-graph cutover — that gate-assembled lock and its consumer gate (416) are retired; the
-    // recipe now carries its source pin (seed/sources/rust-*.lock) routed to recipe-rs.
+    // recipe-graph cutover — that gate-assembled lock and its consumer gate (416) are retired.
     if pattern_matches(
         "tests/toolchain-x86_64-input-addressed.sh|builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         p,
@@ -485,37 +514,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // bootstrap-seed / bootstrap-mes have NO shell driver — they are STRUCTURED Rust
     // recipes (`td-builder bootstrap-recipe {seed,mes}`, builder/src/bootstrap.rs,
-    // rust-migration C2; the old tests/bootstrap-{seed,mes}.sh were deleted). A
-    // recipe-code change routes via the builder/src/* arm above (check-engine smoke +
-    // the cargo-test preflight, which builds brick 0 end-to-end on every PR); the seed
-    // archive and the mes lock (seed/sources/mes-*.lock) route to their own
-    // gates below, plus the merged pinned-input arm's target set.
-
-    if pattern_matches("seed/sources/rust-*.lock", p) {
-        // seed/sources/rust-*.lock is the rust-toolchain recipe's pinned source.
-        sel.add_target("recipe-rs");
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-
-    // seed/sources/zlib-*.lock is the zlib-x86-64 recipe's source.
-    if pattern_matches("seed/sources/zlib-*.lock", p) {
-        sel.add_target("recipe-rs");
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-
-    if pattern_matches("seed/sources/busybox-*.lock", p) {
-        sel.add_target("recipe-rs");
-        sel.add_target("recipe-checks-daily");
-        return;
-    }
-
-    if pattern_matches("seed/sources/make-4.4*.lock", p) {
-        sel.add_target("recipe-rs");
-        add_chain_targets(sel);
-        return;
-    }
+    // rust-migration C2; the old tests/bootstrap-{seed,mes}.sh were deleted). Source
+    // pin edits now live in recipes/src/source_pins.rs and route through the recipe
+    // crate arm above, which selects the recipe engine plus all build gates.
 
     // Tombstones for the deleted shell recipe-graph compatibility helpers. The
     // deleting diff maps to the current Rust recipe-graph consumers.
@@ -527,14 +528,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // --- the i686 mesboot→store-native recipe graph's pinned inputs (#397) ---
-    // Source pin changes route to the live graph consumers: recipe-owned checks
-    // and the x86_64 daily gates.
-    if pattern_matches("seed/sources/gzip-*.lock|seed/sources/tcc-0.9.27*.lock|seed/sources/patch-*.lock|seed/sources/binutils-2.20*.lock|seed/patches/binutils-boot-*.patch", p)
-        || pattern_matches("seed/sources/gcc-core-2.95.3.lock|seed/patches/gcc-boot-2.95.3.patch|seed/sources/glibc-2.2.5.lock|seed/sources/linux-*.lock|seed/patches/glibc-boot-2.2.5.patch|seed/patches/glibc-bootstrap-system-2.2.5.patch", p)
-        || pattern_matches("seed/sources/gcc-core-4.6.4.lock|seed/sources/gmp-*.lock|seed/sources/mpfr-*.lock|seed/sources/mpc-*.lock|seed/patches/gcc-boot-4.6.4.patch|seed/sources/gcc-g++-4.6.4.lock|seed/sources/gawk-*.lock", p)
-        || pattern_matches("seed/sources/glibc-mesboot-2.16.0.lock|seed/patches/glibc-boot-2.16.0.patch|seed/patches/glibc-bootstrap-system-2.16.0.patch|seed/sources/gcc-4.9.4.lock|seed/sources/hello-2.10.lock", p)
-        || pattern_matches("seed/sources/binutils-2.44.lock|seed/sources/gcc-14.3.0.lock|seed/sources/gcc14-*.lock|seed/sources/glibc-2.41.lock|seed/sources/tcc-0.9.26*.lock|seed/sources/nyacc-*.lock|seed/sources/make-*.lock", p)
+    // --- the i686 mesboot→store-native recipe graph's vendored patches (#397) ---
+    // Source pin changes are recipe edits now; patch byte changes still route to
+    // the live graph consumers: recipe-owned checks and the x86_64 daily gates.
+    if pattern_matches("seed/patches/binutils-boot-*.patch|seed/patches/gcc-boot-2.95.3.patch|seed/patches/glibc-boot-2.2.5.patch|seed/patches/glibc-bootstrap-system-2.2.5.patch|seed/patches/gcc-boot-4.6.4.patch|seed/patches/glibc-boot-2.16.0.patch|seed/patches/glibc-bootstrap-system-2.16.0.patch", p)
     {
         sel.add_preflight("shell-syntax");
         add_chain_targets(sel);
@@ -578,17 +575,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // seed/sources/{make,tcc-0.9.26,nyacc}-*.lock are also i686 chain pinned inputs — caught
-    // by the merged pinned-input arm above. mes-*.lock and the stage0-posix source lock
-    // additionally select their own structured-Rust gate (bootstrap-mes / bootstrap-seed),
-    // since those two rungs have no shell driver and no pinned-input arm names them.
-    if pattern_matches("seed/sources/mes-*.lock", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("bootstrap-mes");
-        add_chain_targets(sel);
-        return;
-    }
-    if glob_match("seed/stage0/*", p) || pattern_matches("seed/sources/stage0-posix-*.lock", p) {
+    if glob_match("seed/stage0/*", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-seed");
         add_chain_targets(sel);
@@ -1054,19 +1041,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
         "toolchain-x86_64-input-addressed"
     );
-    // The rust-toolchain recipe and zlib source lock route to the recipe-engine gate.
-    assert_target!("seed/sources/zlib-1.3.1.lock", "recipe-rs");
-    assert_target!("seed/sources/rust-1.96.0.lock", "recipe-rs");
-    assert_target!("seed/sources/zlib-1.3.1.lock", "recipe-checks-daily");
-    assert_target!("seed/sources/rust-1.96.0.lock", "recipe-checks-daily");
-    assert_target!("seed/sources/busybox-1.37.0.lock", "recipe-checks-daily");
-    assert_target!("seed/sources/make-4.4.1.lock", "recipe-checks-daily");
+    // Recipe-owned source pins route through the recipe-engine gate and the build gates.
+    assert_target!("recipes/src/source_pins.rs", "recipe-rs");
+    assert_target!("recipes/src/source_pins.rs", "recipe-checks-daily");
+    assert_target!("recipes/src/source_pins.rs", "bootstrap-seed");
+    assert_target!("recipes/src/source_pins.rs", "bootstrap-mes");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
-    // the stage0 source lock + the mes lock route to the gates via the chain; the recipe code
+    // source-pin edits route via the recipe crate; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
     assert_target!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
-    assert_target!("seed/sources/stage0-posix-1.9.1.lock", "bootstrap-seed");
-    assert_target!("seed/sources/mes-0.27.1.lock", "bootstrap-mes");
     assert_target!("builder/src/bootstrap.rs", "check-engine");
     assert_branch_policy!("builder/src/bootstrap.rs", "the full check would be waived");
     // The td-builder build engine validates on the check-engine SMOKE tier.
@@ -1091,11 +1074,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // catalog edit RUNS the recipe-engine gate per-PR.
     assert_runs!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
     assert_deferred!("seed/stage0/AMD64/hex0_AMD64.hex0", "recipe-checks-daily");
-    assert_runs!("seed/sources/stage0-posix-1.9.1.lock", "bootstrap-seed");
-    assert_deferred!(
-        "seed/sources/stage0-posix-1.9.1.lock",
-        "recipe-checks-daily"
-    );
+    assert_runs!("recipes/src/source_pins.rs", "recipe-rs");
     assert_runs!("recipes/src/catalog.rs", "recipe-rs");
 
     failures
@@ -1385,13 +1364,10 @@ mod tests {
     fn glob_basics() {
         assert!(glob_match("builder/src/*", "builder/src/a/b.rs")); // '*' spans '/'
         assert!(glob_match("*.md", "a/b.md"));
-        assert!(glob_match(
-            "seed/sources/make-*.lock",
-            "seed/sources/make-4.4.lock"
-        ));
+        assert!(glob_match("recipes/src/*.rs", "recipes/src/source_pins.rs"));
         assert!(!glob_match(
-            "seed/sources/make-*.lock",
-            "seed/sources/make-4.4.lockX"
+            "recipes/src/*.rs",
+            "recipes/src/source_pins.rsX"
         ));
         assert!(!glob_match("CHEAP_GATES", "CHEAP_GATESX"));
         assert!(pattern_matches("check.sh|builder/src/gates.rs", "check.sh"));

@@ -6,10 +6,12 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use td_recipe::{catalog, types::Recipe};
+use td_recipe::{
+    catalog, source_pins,
+    types::{Recipe, SourcePin},
+};
 
 const TD_STORE_DIR: &str = "/td/store";
-const STAGE0_SOURCE_LOCK_STEM: &str = "stage0-posix-1.9.1";
 
 pub fn cli(args: &[String]) -> Result<(), String> {
     let stem = args.first().ok_or_else(usage)?.as_str();
@@ -155,7 +157,7 @@ struct RecipeNode {
 
 enum SeedInput {
     Stage0 { key: String },
-    Source { key: String, lock_stem: String },
+    Source { key: String, pin: SourcePin },
     LinuxHeaders { key: String, arch: &'static str },
     Patch { key: String, patch: String },
 }
@@ -269,10 +271,17 @@ impl RecipeCheckRunner {
 
     fn setup_pinsum(&self) -> Result<String, String> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"ladder-setup-v5\n");
+        bytes.extend_from_slice(b"ladder-setup-v6\n");
         append_file_bytes(&self.root.join("tests/td-subst.lock"), &mut bytes)?;
-        for file in files_with_suffix(&self.root.join("seed/sources"), ".lock")? {
-            append_file_bytes(&file, &mut bytes)?;
+        for pin in source_pins::all() {
+            bytes.extend_from_slice(pin.key.as_bytes());
+            bytes.push(b'\t');
+            bytes.extend_from_slice(pin.url.as_bytes());
+            bytes.push(b'\t');
+            bytes.extend_from_slice(pin.sha256.as_bytes());
+            bytes.push(b'\t');
+            bytes.extend_from_slice(pin.file.as_bytes());
+            bytes.push(b'\n');
         }
         for file in files_with_suffix(&self.root.join("seed/patches"), ".patch")? {
             append_file_bytes(&file, &mut bytes)?;
@@ -330,24 +339,24 @@ impl RecipeCheckRunner {
         ))
     }
 
-    fn intern_source(&self, intern_name: &str, lock_stem: &str) -> Result<(), String> {
-        let lock = self.source_lock(lock_stem)?;
-        let file_name = lock_value(&lock, "file")?;
-        let file = self.root.join(".td-build-cache/sources").join(&file_name);
+    fn intern_source(&self, intern_name: &str, pin: &SourcePin) -> Result<(), String> {
+        validate_source_file_basename(pin)?;
+        let file = self.root.join(".td-build-cache/sources").join(&pin.file);
         if !file.is_file() {
             return Err(format!(
                 "ladder: pinned tarball not warm ({}) - run 'td-feed warm sources'",
                 file.display()
             ));
         }
+        verify_source_pin(&file, pin)?;
         let path = self.store_add_recursive(intern_name, &file)?;
         self.append_src_map(intern_name, &path)
     }
 
     fn intern_linux_headers(&self, intern_name: &str, arch: &str) -> Result<(), String> {
-        let lock = self.source_lock("linux-")?;
-        let file_name = lock_value(&lock, "file")?;
-        let version = linux_version_from_file(&file_name)?;
+        let pin = source_pin_for_key("linux-source")?;
+        validate_source_file_basename(&pin)?;
+        let version = linux_version_from_file(&pin.file)?;
         let file = self
             .root
             .join(".td-build-cache/sources")
@@ -402,31 +411,16 @@ impl RecipeCheckRunner {
     }
 
     fn stage0_source_tarball(&self) -> Result<PathBuf, String> {
-        let lock = self.source_lock(STAGE0_SOURCE_LOCK_STEM)?;
-        let file = lock_value(&lock, "file")?;
-        if file.contains('/') {
-            return Err(format!(
-                "{}: file must be a basename, got `{file}`",
-                lock.display()
-            ));
-        }
-        let want = lock_value(&lock, "sha256")?;
-        let tarball = self.root.join(".td-build-cache/sources").join(&file);
+        let pin = source_pin_for_key("stage0-source")?;
+        validate_source_file_basename(&pin)?;
+        let tarball = self.root.join(".td-build-cache/sources").join(&pin.file);
         if !tarball.is_file() {
             return Err(format!(
                 "ladder: pinned stage0 source not warm ({}) - run 'td-feed warm sources'",
                 tarball.display()
             ));
         }
-        let mut bytes = Vec::new();
-        append_file_bytes(&tarball, &mut bytes)?;
-        let got = sha256sum(&bytes)?;
-        if got != want {
-            return Err(format!(
-                "{} sha256 {got} != lock pin {want}",
-                tarball.display()
-            ));
-        }
+        verify_source_pin(&tarball, &pin)?;
         Ok(tarball)
     }
 
@@ -594,10 +588,10 @@ impl RecipeCheckRunner {
         match special_seed_input(key)? {
             Some(input) => Ok(input),
             None => {
-                let lock_stem = self.source_lock_for_recipe_source(key, recipe)?;
+                let pin = self.source_pin_for_recipe_source(key, recipe)?;
                 Ok(SeedInput::Source {
                     key: key.to_string(),
-                    lock_stem,
+                    pin,
                 })
             }
         }
@@ -610,12 +604,12 @@ impl RecipeCheckRunner {
         if self.host_tool_probe(key).is_some() {
             return Ok(None);
         }
-        self.source_lock_for_input_key(key).map(|lock_stem| {
-            lock_stem.map(|stem| SeedInput::Source {
+        Ok(self
+            .source_pin_for_input_key(key)?
+            .map(|pin| SeedInput::Source {
                 key: key.to_string(),
-                lock_stem: stem,
-            })
-        })
+                pin,
+            }))
     }
 
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<(), String> {
@@ -625,7 +619,7 @@ impl RecipeCheckRunner {
         }
         match input {
             SeedInput::Stage0 { key } => self.intern_stage0_source(key)?,
-            SeedInput::Source { key, lock_stem } => self.intern_source(key, lock_stem)?,
+            SeedInput::Source { key, pin } => self.intern_source(key, pin)?,
             SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch)?,
             SeedInput::Patch { key, patch } => self.intern_patch(key, patch)?,
         }
@@ -668,86 +662,23 @@ impl RecipeCheckRunner {
         }
     }
 
-    fn source_lock_for_recipe_source(&self, key: &str, recipe: &Recipe) -> Result<String, String> {
-        let suffix = format!("-{}", recipe.version);
-        let stems = self.source_lock_stems()?;
-        let mut version_matches: Vec<String> = stems
-            .into_iter()
-            .filter(|stem| stem.ends_with(&suffix))
-            .collect();
-        if version_matches.len() == 1 {
-            return version_matches
-                .pop()
-                .ok_or_else(|| format!("ladder: no seed/sources lock for {key}"));
-        }
-
-        let hints = source_lock_hints(key, &recipe.name);
-        for hint in &hints {
-            let mut hinted: Vec<String> = version_matches
-                .iter()
-                .filter(|stem| lock_stem_matches_prefix(stem, hint))
-                .cloned()
-                .collect();
-            if hinted.len() == 1 {
-                return hinted
-                    .pop()
-                    .ok_or_else(|| format!("ladder: no seed/sources lock for {key}"));
-            }
-        }
-        match version_matches.len() {
-            1 => version_matches
-                .pop()
-                .ok_or_else(|| format!("ladder: no seed/sources lock for {key}")),
-            0 => Err(format!(
-                "ladder: cannot resolve sourceInput `{key}' for {}-{} to a seed/sources lock",
+    fn source_pin_for_recipe_source(
+        &self,
+        key: &str,
+        recipe: &Recipe,
+    ) -> Result<SourcePin, String> {
+        source_pin_for_key(key).map_err(|e| {
+            format!(
+                "ladder: cannot resolve sourceInput `{key}' for {}-{} to a recipe source pin: {e}",
                 recipe.name, recipe.version
-            )),
-            _ => Err(format!(
-                "ladder: sourceInput `{key}' for {}-{} is ambiguous: {}",
-                recipe.name,
-                recipe.version,
-                version_matches.join(", ")
-            )),
-        }
+            )
+        })
     }
 
-    fn source_lock_for_input_key(&self, key: &str) -> Result<Option<String>, String> {
-        if let Some(prefix) = source_key_lock_prefix_alias(key) {
-            return self.source_lock_by_prefix(prefix).map(Some);
-        }
-        let stems = self.source_lock_stems()?;
-        let mut matches: Vec<String> = stems
-            .into_iter()
-            .filter(|stem| lock_stem_matches_prefix(stem, key))
-            .collect();
-        match matches.len() {
-            0 => Ok(None),
-            1 => matches
-                .pop()
-                .map(Some)
-                .ok_or_else(|| format!("ladder: no seed/sources lock for source input `{key}'")),
-            _ => Err(format!(
-                "ladder: source input `{key}' is ambiguous: {}",
-                matches.join(", ")
-            )),
-        }
-    }
-
-    fn source_lock_by_prefix(&self, prefix: &str) -> Result<String, String> {
-        let stems = self.source_lock_stems()?;
-        let mut matches: Vec<String> = stems
-            .into_iter()
-            .filter(|stem| lock_stem_matches_prefix(stem, prefix))
-            .collect();
-        match matches.len() {
-            1 => matches
-                .pop()
-                .ok_or_else(|| format!("ladder: no seed/sources lock for prefix {prefix}")),
-            0 => Err(format!("ladder: no seed/sources lock for prefix {prefix}")),
-            _ => Err(format!(
-                "ladder: source input prefix `{prefix}' is ambiguous: {}",
-                matches.join(", ")
-            )),
+    fn source_pin_for_input_key(&self, key: &str) -> Result<Option<SourcePin>, String> {
+        match source_pins::by_key(key) {
+            Some(pin) => Ok(Some(pin)),
+            None => Ok(None),
         }
     }
 
@@ -929,38 +860,6 @@ impl RecipeCheckRunner {
         }
     }
 
-    fn source_lock(&self, stem: &str) -> Result<PathBuf, String> {
-        let mut matches = Vec::new();
-        for file in read_dir_sorted(&self.root.join("seed/sources"))? {
-            let name = match file.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            if name.starts_with(stem) && name.ends_with(".lock") {
-                matches.push(file);
-            }
-        }
-        matches
-            .first()
-            .cloned()
-            .ok_or_else(|| format!("ladder: no seed/sources lock for {stem}"))
-    }
-
-    fn source_lock_stems(&self) -> Result<Vec<String>, String> {
-        let mut stems = Vec::new();
-        for file in read_dir_sorted(&self.root.join("seed/sources"))? {
-            let stem = match file.file_name().and_then(|n| n.to_str()) {
-                Some(name) => match name.strip_suffix(".lock") {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                },
-                None => continue,
-            };
-            stems.push(stem);
-        }
-        Ok(stems)
-    }
-
     fn builder_command(&self) -> Command {
         let mut cmd = Command::new(&self.tb);
         cmd.current_dir(&self.root)
@@ -1061,58 +960,32 @@ fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
     Ok(None)
 }
 
-fn source_lock_hints(key: &str, recipe_name: &str) -> Vec<String> {
-    let mut hints = Vec::new();
-    push_source_hint(&mut hints, key);
-    if let Some(stripped) = key.strip_suffix("-source") {
-        push_source_hint(&mut hints, stripped);
-    }
-    push_source_hint(&mut hints, recipe_name);
-    if let Some(alias) = source_key_lock_prefix_alias(key) {
-        push_source_hint(&mut hints, alias);
-    }
-    hints
+fn source_pin_for_key(key: &str) -> Result<SourcePin, String> {
+    source_pins::by_key(key).ok_or_else(|| format!("no recipe source pin for `{key}'"))
 }
 
-fn push_source_hint(hints: &mut Vec<String>, value: &str) {
-    let mut candidates = vec![value.to_string()];
-    for suffix in [
-        "-source",
-        "-x86-64-native",
-        "-x86-64",
-        "-mesboot0",
-        "-mesboot1",
-        "-mesboot",
-        "-stage1",
-        "-stage2",
-        "-244",
-    ] {
-        if let Some(stripped) = value.strip_suffix(suffix) {
-            candidates.push(stripped.to_string());
-        }
+fn validate_source_file_basename(pin: &SourcePin) -> Result<(), String> {
+    if pin.file.is_empty() || pin.file.contains('/') {
+        return Err(format!(
+            "recipe source pin `{}` has non-basename file `{}`",
+            pin.key, pin.file
+        ));
     }
-    for candidate in candidates {
-        if !candidate.is_empty() && !hints.iter().any(|hint| hint == &candidate) {
-            hints.push(candidate);
-        }
-    }
+    Ok(())
 }
 
-fn source_key_lock_prefix_alias(key: &str) -> Option<&'static str> {
-    match key {
-        "gcc-464-core" => Some("gcc-core"),
-        "gcc-464-gpp" => Some("gcc-g++"),
-        "gmp63" => Some("gcc14-gmp"),
-        "mpfr421" => Some("gcc14-mpfr"),
-        "mpc131" => Some("gcc14-mpc"),
-        _ => None,
+fn verify_source_pin(path: &Path, pin: &SourcePin) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    append_file_bytes(path, &mut bytes)?;
+    let got = sha256sum(&bytes)?;
+    if got != pin.sha256 {
+        return Err(format!(
+            "{} sha256 {got} != recipe source pin {}",
+            path.display(),
+            pin.sha256
+        ));
     }
-}
-
-fn lock_stem_matches_prefix(stem: &str, prefix: &str) -> bool {
-    stem.strip_prefix(prefix)
-        .map(|rest| rest.starts_with('-'))
-        .unwrap_or(false)
+    Ok(())
 }
 
 fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
@@ -1244,22 +1117,6 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>, String> {
     }
     out.sort();
     Ok(out)
-}
-
-fn lock_value(lock: &Path, key: &str) -> Result<String, String> {
-    let contents = fs::read_to_string(lock).map_err(|e| format!("read {}: {e}", lock.display()))?;
-    for line in contents.lines() {
-        let mut cols = line.splitn(2, ' ');
-        if cols.next() == Some(key) {
-            return cols
-                .next()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-                .ok_or_else(|| format!("{}: key {key} has no value", lock.display()));
-        }
-    }
-    Err(format!("{}: no {key} entry", lock.display()))
 }
 
 fn map_value_in(map: &Path, name: &str) -> Result<Option<String>, String> {

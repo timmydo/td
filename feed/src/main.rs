@@ -1,4 +1,12 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md). This single-file network tool is not linted in the loop (the cargo-test gate's clippy leg covers only the dependency-free engine crates); the [lints] table still guards new unsafe (forbid) and enforces under a local `cargo clippy`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md). This single-file network tool is not linted in the loop (the cargo-test gate's clippy leg covers only the dependency-free engine crates); the [lints] table still guards new unsafe (forbid) and enforces under a local `cargo clippy`.
 
 // td-feed — td's OWN local HTTP mirror of the artifacts this repo downloads over the
 // network. A sibling of fetch/ (td-fetch) reusing the same pure-Rust HTTP(S)+sha256 stack
@@ -37,6 +45,14 @@ struct Entry {
     sha256: String,
 }
 
+#[derive(Clone)]
+struct SourcePin {
+    key: String,
+    url: String,
+    sha256: String,
+    file: String,
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -68,7 +84,10 @@ fn store_path(store: &Path, rel: &str) -> Option<PathBuf> {
     if rel.is_empty() || rel.starts_with('/') {
         return None;
     }
-    if rel.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+    if rel
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == "..")
+    {
         return None;
     }
     Some(store.join(rel))
@@ -94,7 +113,9 @@ fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// GET `url` (http/https), returning the body or an error string.
 fn try_get(url: &str) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url).call().map_err(|e| format!("GET {url}: {e}"))?;
+    let resp = ureq::get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
     let mut body = Vec::new();
     resp.into_reader()
         .read_to_end(&mut body)
@@ -105,7 +126,8 @@ fn try_get(url: &str) -> Result<Vec<u8>, String> {
 /// Warm one entry into `store` (+ its sidecar); Ok(true) if fetched, Ok(false) if already
 /// warm + verified. Never egresses for an entry already present + matching.
 fn warm_one(e: &Entry, store: &Path) -> Result<bool, String> {
-    let dst = store_path(store, &e.path).ok_or_else(|| format!("unsafe index path {:?}", e.path))?;
+    let dst =
+        store_path(store, &e.path).ok_or_else(|| format!("unsafe index path {:?}", e.path))?;
     let side = sidecar_path(&dst);
     if let Ok(have) = std::fs::read(&dst) {
         if hex_sha256(&have) == e.sha256 {
@@ -128,7 +150,8 @@ fn warm_one(e: &Entry, store: &Path) -> Result<bool, String> {
         ));
     }
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| format!("mkdir {}: {err}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("mkdir {}: {err}", parent.display()))?;
     }
     write_atomic(&dst, &body)?;
     write_atomic(&side, format!("{got}\n").as_bytes())?;
@@ -177,7 +200,12 @@ fn handle_conn(mut conn: TcpStream, store: &Path) -> io::Result<()> {
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     if method != "GET" {
-        return respond(&mut conn, 405, "Method Not Allowed", b"method not allowed\n");
+        return respond(
+            &mut conn,
+            405,
+            "Method Not Allowed",
+            b"method not allowed\n",
+        );
     }
     let path = target.trim_start_matches('/');
     // The integrity sidecars are internal — never serve them.
@@ -199,7 +227,12 @@ fn handle_conn(mut conn: TcpStream, store: &Path) -> io::Result<()> {
     };
     if hex_sha256(&bytes) != want {
         // verify-on-serve: the store drifted from the warmed hash — refuse to serve.
-        return respond(&mut conn, 500, "Integrity Failure", b"store sha256 mismatch\n");
+        return respond(
+            &mut conn,
+            500,
+            "Integrity Failure",
+            b"store sha256 mismatch\n",
+        );
     }
     respond(&mut conn, 200, "OK", &bytes)
 }
@@ -221,7 +254,8 @@ fn die(msg: String) -> ! {
 }
 
 fn read_index(path: &str) -> Vec<Entry> {
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("read index {path}: {e}")));
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("read index {path}: {e}")));
     parse_index(&text).unwrap_or_else(|e| die(e))
 }
 
@@ -297,7 +331,8 @@ fn selftest() {
         url: format!("http://127.0.0.1:{origin_port}/blob"),
         sha256: "0".repeat(64),
     }];
-    let bad_store = std::env::temp_dir().join(format!("td-feed-selftest-bad-{}", std::process::id()));
+    let bad_store =
+        std::env::temp_dir().join(format!("td-feed-selftest-bad-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&bad_store);
     if warm(&bad_index, &bad_store).is_ok() {
         die("warm ACCEPTED a wrong sha256 — verification is not load-bearing".into());
@@ -408,7 +443,9 @@ fn serve_crate(store: &Path, cr: &str, ver: &str) -> Result<Vec<u8>, String> {
     let url = format!("{}/crates/{cr}/{cr}-{ver}.crate", crates_base());
     let body = try_get(&url)?;
     if hex_sha256(&body) != cksum {
-        return Err(format!("sha256 mismatch for {cr} {ver}: index cksum {cksum}"));
+        return Err(format!(
+            "sha256 mismatch for {cr} {ver}: index cksum {cksum}"
+        ));
     }
     if let Some(p) = cache.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
@@ -420,7 +457,9 @@ fn serve_crate(store: &Path, cr: &str, ver: &str) -> Result<Vec<u8>, String> {
 /// Route one cargo sparse-registry request. `base` is HOST:PORT for the config URLs.
 fn cargo_route(store: &Path, base: &str, path: &str) -> Result<Vec<u8>, String> {
     if path == "/config.json" {
-        return Ok(format!("{{\"dl\":\"http://{base}/dl\",\"api\":\"http://{base}\"}}").into_bytes());
+        return Ok(
+            format!("{{\"dl\":\"http://{base}/dl\",\"api\":\"http://{base}\"}}").into_bytes(),
+        );
     }
     // The download endpoint is `/dl/<crate>/<version>/download`. A crate whose name starts with
     // "dl" has a sparse-index path that ALSO starts with `dl/` (e.g. `dlv-list` -> `dl/v-/dlv-list`),
@@ -430,7 +469,11 @@ fn cargo_route(store: &Path, base: &str, path: &str) -> Result<Vec<u8>, String> 
     // is such an index path — fall through to serve_index, don't 404 it.
     if let Some(rest) = path.strip_prefix("/dl/") {
         let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() == 3 && parts[2] == "download" && !parts[0].is_empty() && !parts[1].is_empty() {
+        if parts.len() == 3
+            && parts[2] == "download"
+            && !parts[0].is_empty()
+            && !parts[1].is_empty()
+        {
             return serve_crate(store, parts[0], parts[1]);
         }
     }
@@ -453,7 +496,12 @@ fn handle_cargo_conn(mut conn: TcpStream, store: &Path, base: &str) -> io::Resul
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     if method != "GET" {
-        return respond(&mut conn, 405, "Method Not Allowed", b"method not allowed\n");
+        return respond(
+            &mut conn,
+            405,
+            "Method Not Allowed",
+            b"method not allowed\n",
+        );
     }
     match cargo_route(store, base, target) {
         Ok(bytes) => respond(&mut conn, 200, "OK", &bytes),
@@ -527,7 +575,8 @@ fn cargo_proxy_selftest() {
     std::env::set_var("TD_INDEX_BASE", &ubase);
     std::env::set_var("TD_CRATES_BASE", &ubase);
 
-    let store = std::env::temp_dir().join(format!("td-cargo-proxy-selftest-{}", std::process::id()));
+    let store =
+        std::env::temp_dir().join(format!("td-cargo-proxy-selftest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&store);
     std::fs::create_dir_all(&store).expect("mkdir store");
     let plist = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
@@ -538,7 +587,8 @@ fn cargo_proxy_selftest() {
     }
     let proxy = format!("http://127.0.0.1:{pport}");
 
-    let cfg = try_get(&format!("{proxy}/config.json")).unwrap_or_else(|e| die(format!("config.json: {e}")));
+    let cfg = try_get(&format!("{proxy}/config.json"))
+        .unwrap_or_else(|e| die(format!("config.json: {e}")));
     if !String::from_utf8_lossy(&cfg).contains("\"dl\"") {
         die("config.json missing dl".into());
     }
@@ -553,8 +603,11 @@ fn cargo_proxy_selftest() {
     // Cache-integrity: a CACHE HIT is re-verified against the index cksum, not trusted
     // blindly. Corrupt the cached crate, then fetch again — the proxy must reject the bad
     // cached bytes, refetch from upstream, serve the correct bytes, and heal the cache.
-    std::fs::write(store.join("crates/unarray-0.1.0.crate"), b"corrupted-cache-bytes")
-        .unwrap_or_else(|e| die(format!("corrupt cache: {e}")));
+    std::fs::write(
+        store.join("crates/unarray-0.1.0.crate"),
+        b"corrupted-cache-bytes",
+    )
+    .unwrap_or_else(|e| die(format!("corrupt cache: {e}")));
     let healed = try_get(&format!("{proxy}/dl/unarray/0.1.0/download"))
         .unwrap_or_else(|e| die(format!("dl unarray after cache corruption: {e}")));
     if healed != cbytes {
@@ -569,8 +622,11 @@ fn cargo_proxy_selftest() {
     // Regression (the dlv-list bug): a crate whose name starts with "dl" has a sparse-index path
     // starting with `dl/` (dltest -> /dl/te/dltest). The proxy must serve it as an INDEX, not
     // mis-route it to the `/dl/<crate>/<version>/download` handler and 404 it.
-    let idx = try_get(&format!("{proxy}/dl/te/dltest"))
-        .unwrap_or_else(|e| die(format!("dl-prefixed sparse-index path failed (the dlv-list collision): {e}")));
+    let idx = try_get(&format!("{proxy}/dl/te/dltest")).unwrap_or_else(|e| {
+        die(format!(
+            "dl-prefixed sparse-index path failed (the dlv-list collision): {e}"
+        ))
+    });
     if !String::from_utf8_lossy(&idx).contains("\"name\":\"dltest\"") {
         die("proxy did not serve the dl-prefixed path as a sparse index (download/index route collision)".into());
     }
@@ -605,7 +661,9 @@ fn repo_root() -> PathBuf {
 /// Is `cmd` an executable on PATH? (best-effort `command -v` equivalent).
 fn have_cmd(cmd: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(path) = std::env::var("PATH") else { return false };
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
     path.split(':').filter(|d| !d.is_empty()).any(|dir| {
         let p = Path::new(dir).join(cmd);
         std::fs::metadata(&p)
@@ -659,7 +717,8 @@ fn run_quiet(cmd: &mut Command) -> bool {
 /// already-bound listener's backlog, so no readiness wait is needed.
 fn start_cargo_proxy(store: &Path) -> Result<String, String> {
     std::fs::create_dir_all(store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind cargo-proxy: {e}"))?;
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind cargo-proxy: {e}"))?;
     let addr = listener
         .local_addr()
         .map_err(|e| format!("cargo-proxy local_addr: {e}"))?
@@ -763,17 +822,28 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     // 2) Extract the source crate -> the source tree.
     let _ = std::fs::remove_dir_all(&srcparent);
     if std::fs::create_dir_all(&srcparent).is_err()
-        || !run_quiet(Command::new("tar").arg("-xzf").arg(&srccrate).arg("-C").arg(&srcparent))
+        || !run_quiet(
+            Command::new("tar")
+                .arg("-xzf")
+                .arg(&srccrate)
+                .arg("-C")
+                .arg(&srcparent),
+        )
     {
         eprintln!("td-feed warm crate: could not extract the source crate for {krate}-{ver}");
         return;
     }
     if !srcdir.join("Cargo.toml").is_file() {
-        eprintln!("td-feed warm crate: extracted source has no Cargo.toml at {}", srcdir.display());
+        eprintln!(
+            "td-feed warm crate: extracted source has no Cargo.toml at {}",
+            srcdir.display()
+        );
         return;
     }
     if !srcdir.join("Cargo.lock").is_file() {
-        eprintln!("td-feed warm crate: source {krate}-{ver} ships no Cargo.lock — cannot pin the closure");
+        eprintln!(
+            "td-feed warm crate: source {krate}-{ver} ships no Cargo.lock — cannot pin the closure"
+        );
         return;
     }
 
@@ -831,7 +901,9 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
         return;
     }
 
-    let work = root.join(".td-build-cache/crate-vendor").join(format!("{dest}.work"));
+    let work = root
+        .join(".td-build-cache/crate-vendor")
+        .join(format!("{dest}.work"));
     let _ = std::fs::remove_dir_all(&work);
     let proxy_store = work.join("proxy-store");
     let addr = match start_cargo_proxy(&proxy_store) {
@@ -843,7 +915,10 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
     };
     let ch = work.join("cargo-home");
     if write_cargo_home(&ch, &addr).is_err() || !cargo_fetch_locked(&srcdir, &ch) {
-        eprintln!("td-feed warm crate-local: locked dep fetch failed for {dest} (in {})", srcdir.display());
+        eprintln!(
+            "td-feed warm crate-local: locked dep fetch failed for {dest} (in {})",
+            srcdir.display()
+        );
         return;
     }
     let _ = std::fs::remove_dir_all(&vendor);
@@ -865,19 +940,95 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
     );
 }
 
-/// Parse a `seed/sources/*.lock`: the first `url`/`sha256`/`file` line of each kind.
-fn parse_source_lock(text: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let (mut url, mut sha, mut file) = (None, None, None);
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("url ") {
-            url.get_or_insert_with(|| v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("sha256 ") {
-            sha.get_or_insert_with(|| v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("file ") {
-            file.get_or_insert_with(|| v.trim().to_string());
+/// Parse `td-recipe-eval source-pins`: `<key>\t<url>\t<sha256>\t<file>`.
+fn parse_source_pins(text: &str) -> Result<Vec<SourcePin>, String> {
+    let mut pins = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let (Some(key), Some(url), Some(sha256), Some(file), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return Err(format!(
+                "source-pins line {} is not four TSV fields",
+                idx + 1
+            ));
+        };
+        if key.is_empty() || url.is_empty() || sha256.is_empty() || file.is_empty() {
+            return Err(format!("source-pins line {} has an empty field", idx + 1));
+        }
+        if file.contains('/') {
+            return Err(format!(
+                "source-pins line {} has non-basename file `{file}`",
+                idx + 1
+            ));
+        }
+        pins.push(SourcePin {
+            key: key.to_string(),
+            url: url.to_string(),
+            sha256: sha256.to_lowercase(),
+            file: file.to_string(),
+        });
+    }
+    Ok(pins)
+}
+
+fn recipe_source_pins(root: &Path) -> Vec<SourcePin> {
+    match recipe_source_pins_result(root) {
+        Ok(pins) => pins,
+        Err(e) => {
+            eprintln!(">> td-feed warm sources: cannot read recipe source pins: {e}");
+            Vec::new()
         }
     }
-    (url, sha, file)
+}
+
+fn recipe_source_pins_result(root: &Path) -> Result<Vec<SourcePin>, String> {
+    let release = root.join("recipes/target/release/td-recipe-eval");
+    let debug = root.join("recipes/target/debug/td-recipe-eval");
+    let out = if release.is_file() {
+        Command::new(&release)
+            .arg("source-pins")
+            .current_dir(root)
+            .output()
+            .map_err(|e| format!("spawn {} source-pins: {e}", release.display()))?
+    } else if debug.is_file() {
+        Command::new(&debug)
+            .arg("source-pins")
+            .current_dir(root)
+            .output()
+            .map_err(|e| format!("spawn {} source-pins: {e}", debug.display()))?
+    } else {
+        Command::new("cargo")
+            .arg("run")
+            .arg("--quiet")
+            .arg("--manifest-path")
+            .arg("recipes/Cargo.toml")
+            .arg("--bin")
+            .arg("td-recipe-eval")
+            .arg("--")
+            .arg("source-pins")
+            .current_dir(root)
+            .output()
+            .map_err(|e| format!("spawn cargo run td-recipe-eval source-pins: {e}"))?
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "td-recipe-eval source-pins failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let text =
+        String::from_utf8(out.stdout).map_err(|e| format!("source-pins output not UTF-8: {e}"))?;
+    parse_source_pins(&text)
 }
 
 /// `https://h/p` / `http://h/p` -> `h/p` (the feed serves a URL-path mirror at `GET /<h>/<p>`).
@@ -891,7 +1042,9 @@ fn strip_scheme(url: &str) -> String {
 /// The shared feed `(addr, store)` if TD_FEED_BASE is set (the loop prelude runs
 /// `td-feed ensure-serve` for the daemon lifecycle and exports it). Else None (direct).
 fn shared_feed() -> Option<(String, PathBuf)> {
-    let base = std::env::var("TD_FEED_BASE").ok().filter(|s| !s.is_empty())?;
+    let base = std::env::var("TD_FEED_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     let addr = strip_scheme(&base);
     let feed_dir = std::env::var("TD_FEED_DIR")
         .map(PathBuf::from)
@@ -902,47 +1055,36 @@ fn shared_feed() -> Option<(String, PathBuf)> {
     Some((addr, feed_dir.join("store")))
 }
 
-/// warm sources — fetch the pinned source-bootstrap tarballs (seed/sources/*.lock) into
+/// warm sources — fetch the recipe-owned pinned source-bootstrap tarballs into
 /// .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates, then produce the i386
 /// + x86_64 Linux UAPI headers. Prefers the shared feed (TD_FEED_BASE), else a direct GET.
-/// td OWNS the fetch (no guix-as-fetcher); each tarball is verified against its lock sha256.
+/// td OWNS the fetch (no guix-as-fetcher); each tarball is verified against its recipe sha256.
 fn warm_sources(root: &Path) {
-    let srcdir = root.join("seed/sources");
+    let pins = recipe_source_pins(root);
     let dest = root.join(".td-build-cache/sources");
-    let mut locks: Vec<PathBuf> = match std::fs::read_dir(&srcdir) {
-        Ok(rd) => rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "lock"))
-            .collect(),
-        Err(_) => return, // no sources dir -> nothing to warm
-    };
-    if locks.is_empty() {
+    if pins.is_empty() {
         return;
     }
-    locks.sort();
     if std::fs::create_dir_all(&dest).is_err() {
-        eprintln!(">> td-feed warm sources: could not create {}", dest.display());
+        eprintln!(
+            ">> td-feed warm sources: could not create {}",
+            dest.display()
+        );
         return;
     }
 
     let feed = shared_feed();
     if let Some((addr, store)) = &feed {
-        eprintln!(">> td-feed warm sources: using the shared feed at http://{addr} (store {})", store.display());
+        eprintln!(
+            ">> td-feed warm sources: using the shared feed at http://{addr} (store {})",
+            store.display()
+        );
     }
 
-    for lock in &locks {
-        let text = std::fs::read_to_string(lock).unwrap_or_default();
-        let (url, sha, file) = match parse_source_lock(&text) {
-            (Some(u), Some(s), Some(f)) => (u, s, f),
-            _ => {
-                eprintln!(">> td-feed warm sources: {} malformed (need url/sha256/file) — skipping", lock.display());
-                continue;
-            }
-        };
-        let out = dest.join(&file);
+    for pin in &pins {
+        let out = dest.join(&pin.file);
         if let Ok(b) = std::fs::read(&out) {
-            if hex_sha256(&b) == sha {
+            if hex_sha256(&b) == pin.sha256 {
                 continue; // already warm + verified
             }
         }
@@ -952,19 +1094,23 @@ fn warm_sources(root: &Path) {
         // shared store is cold — another worktree may already hold it), then GET it back from
         // the feed (offline once warm). So the egress happens ONCE across all worktrees.
         if let Some((addr, store)) = &feed {
-            let path = strip_scheme(&url);
-            let e = Entry { path: path.clone(), url: url.clone(), sha256: sha.clone() };
+            let path = strip_scheme(&pin.url);
+            let e = Entry {
+                path: path.clone(),
+                url: pin.url.clone(),
+                sha256: pin.sha256.clone(),
+            };
             let _ = warm_one(&e, store);
             if let Ok(b) = try_get(&format!("http://{addr}/{path}")) {
-                if hex_sha256(&b) == sha && write_atomic(&out, &b).is_ok() {
+                if hex_sha256(&b) == pin.sha256 && write_atomic(&out, &b).is_ok() {
                     via = Some(format!("the shared feed (http://{addr})"));
                 }
             }
         }
         // Fallback: a direct GET (feed unavailable, or a cold-feed miss).
         if via.is_none() {
-            if let Ok(b) = try_get(&url) {
-                if hex_sha256(&b) == sha && write_atomic(&out, &b).is_ok() {
+            if let Ok(b) = try_get(&pin.url) {
+                if hex_sha256(&b) == pin.sha256 && write_atomic(&out, &b).is_ok() {
                     via = Some("a direct fetch".to_string());
                 }
             }
@@ -972,15 +1118,17 @@ fn warm_sources(root: &Path) {
         match via {
             Some(v) => eprintln!(">> td-feed warm sources: warmed {} via {v} (sha256 verified)", out.display()),
             None => eprintln!(
-                ">> td-feed warm sources: could not warm {file} (feed + direct both failed) — skipping (the bootstrap gate will report if it runs)"
+                ">> td-feed warm sources: could not warm {} ({}) (feed + direct both failed) — skipping (the bootstrap gate will report if it runs)",
+                pin.file,
+                pin.key
             ),
         }
     }
 
     // Derived inputs: the sanitized Linux UAPI headers for the glibc rungs, produced FROM the
     // pinned linux source (the sandbox can't run the kernel build). Both lanes, best-effort.
-    warm_kernel_headers(root, "i386");
-    warm_kernel_headers(root, "x86_64");
+    warm_kernel_headers_from_pins(root, "i386", &pins);
+    warm_kernel_headers_from_pins(root, "x86_64", &pins);
 }
 
 /// `LINUX_VERSION_CODE` for a `maj.min.sub` version (e.g. 4.14.67 -> 265795).
@@ -1017,7 +1165,9 @@ fn extract_xz_tar(src: &Path, dest: &Path) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let Some(xzout) = xz.stdout.take() else { return false };
+    let Some(xzout) = xz.stdout.take() else {
+        return false;
+    };
     let tar_ok = Command::new("tar")
         .arg("-xf")
         .arg("-")
@@ -1039,31 +1189,23 @@ fn extract_xz_tar(src: &Path, dest: &Path) -> bool {
 /// .td-build-cache/sources/linux-headers-<ver>-<ARCH>.tar.gz (+ a hand-written version.h).
 /// guix ships a prebuilt header BLOB; td produces the same headers FROM canonical source.
 fn warm_kernel_headers(root: &Path, arch: &str) {
-    let srcdir = root.join("seed/sources");
-    let mut linux_locks: Vec<PathBuf> = match std::fs::read_dir(&srcdir) {
-        Ok(rd) => rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("linux-") && n.ends_with(".lock"))
-            })
-            .collect(),
-        Err(_) => return,
+    let pins = recipe_source_pins(root);
+    warm_kernel_headers_from_pins(root, arch, &pins);
+}
+
+fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
+    let Some(pin) = pins.iter().find(|pin| pin.key == "linux-source") else {
+        return;
     };
-    if linux_locks.is_empty() {
-        return; // no linux lock -> nothing to do
-    }
-    linux_locks.sort();
-    let text = std::fs::read_to_string(&linux_locks[0]).unwrap_or_default();
-    let Some(file) = parse_source_lock(&text).2 else { return };
-    let Some(ver) = linux_ver_from_file(&file) else {
-        eprintln!(">> td-feed warm kernel-headers ({arch}): cannot parse version from {file} — skipping");
+    let file = pin.file.as_str();
+    let Some(ver) = linux_ver_from_file(file) else {
+        eprintln!(
+            ">> td-feed warm kernel-headers ({arch}): cannot parse version from {file} — skipping"
+        );
         return;
     };
     let cache = root.join(".td-build-cache/sources");
-    let src = cache.join(&file);
+    let src = cache.join(file);
     let out = cache.join(format!("linux-headers-{ver}-{arch}.tar.gz"));
     if out.exists() {
         return; // already produced
@@ -1131,17 +1273,18 @@ fn warm_kernel_headers(root: &Path, arch: &str) {
 /// that need NO cargo/make/network). The cargo/make/network legs stay best-effort host PREP,
 /// proven by the consuming heavy gates (as the shell scripts were). std::net loopback only.
 fn warm_selftest() {
-    // 1) parse_source_lock: a well-formed lock parses; a malformed one yields no fields.
-    let lk = "url https://ftp.gnu.org/x.tar.xz\nsha256 deadbeef\nfile x.tar.xz\n";
-    let (u, s, f) = parse_source_lock(lk);
-    if u.as_deref() != Some("https://ftp.gnu.org/x.tar.xz")
-        || s.as_deref() != Some("deadbeef")
-        || f.as_deref() != Some("x.tar.xz")
+    // 1) parse_source_pins: well-formed recipe TSV parses; malformed input reds.
+    let pins = parse_source_pins("x-source\thttps://ftp.gnu.org/x.tar.xz\tdeadbeef\tx.tar.xz\n")
+        .unwrap_or_else(|e| die(format!("warm-selftest: source pin TSV rejected: {e}")));
+    if pins.len() != 1
+        || pins[0].url != "https://ftp.gnu.org/x.tar.xz"
+        || pins[0].sha256 != "deadbeef"
+        || pins[0].file != "x.tar.xz"
     {
-        die("warm-selftest: parse_source_lock did not parse a well-formed lock".into());
+        die("warm-selftest: parse_source_pins did not parse a well-formed line".into());
     }
-    if parse_source_lock("garbage\nno fields here\n").0.is_some() {
-        die("warm-selftest: parse_source_lock accepted a malformed lock".into());
+    if parse_source_pins("garbage\nno fields here\n").is_ok() {
+        die("warm-selftest: parse_source_pins accepted malformed TSV".into());
     }
     if strip_scheme("https://h/p") != "h/p" || strip_scheme("http://h/p") != "h/p" {
         die("warm-selftest: strip_scheme wrong".into());
@@ -1149,7 +1292,10 @@ fn warm_selftest() {
 
     // 2) linux_version_code + version.h (the glibc "TOO OLD!" guard).
     if linux_version_code("4.14.67") != 265795 {
-        die(format!("warm-selftest: linux_version_code(4.14.67)={} != 265795", linux_version_code("4.14.67")));
+        die(format!(
+            "warm-selftest: linux_version_code(4.14.67)={} != 265795",
+            linux_version_code("4.14.67")
+        ));
     }
     if linux_ver_from_file("linux-4.14.67.tar.xz").as_deref() != Some("4.14.67") {
         die("warm-selftest: linux_ver_from_file wrong".into());
@@ -1160,7 +1306,9 @@ fn warm_selftest() {
 
     // 3) cargo_config: routes crates.io at the proxy via sparse source replacement.
     let cfg = cargo_config("127.0.0.1:4321");
-    if !cfg.contains("replace-with = \"td-proxy\"") || !cfg.contains("registry = \"sparse+http://127.0.0.1:4321/\"") {
+    if !cfg.contains("replace-with = \"td-proxy\"")
+        || !cfg.contains("registry = \"sparse+http://127.0.0.1:4321/\"")
+    {
         die("warm-selftest: cargo_config does not route crates.io through the proxy".into());
     }
 
@@ -1205,8 +1353,11 @@ fn warm_selftest() {
     let store = std::env::temp_dir().join(format!("td-warm-selftest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&store);
     let addr = start_cargo_proxy(&store).unwrap_or_else(|e| die(format!("warm-selftest: {e}")));
-    let got = try_get(&format!("http://{addr}/dl/warmcrate/0.1.0/download"))
-        .unwrap_or_else(|e| die(format!("warm-selftest: source-crate GET through the in-process proxy failed: {e}")));
+    let got = try_get(&format!("http://{addr}/dl/warmcrate/0.1.0/download")).unwrap_or_else(|e| {
+        die(format!(
+            "warm-selftest: source-crate GET through the in-process proxy failed: {e}"
+        ))
+    });
     if got != good || hex_sha256(&got) != cksum {
         die("warm-selftest: the in-process proxy served a source crate that differs from upstream / its index cksum".into());
     }
@@ -1216,7 +1367,7 @@ fn warm_selftest() {
     let _ = std::fs::remove_dir_all(&store);
 
     println!(
-        "td-feed: warm selftest OK — parse_source_lock (+malformed reject), linux_version_code/version.h \
+        "td-feed: warm selftest OK — parse_source_pins (+malformed reject), linux_version_code/version.h \
          (the glibc TOO-OLD guard), cargo_config (sparse source replacement), and the IN-PROCESS cargo-proxy \
          round-trip a verifying source-crate GET over loopback (mock upstream 127.0.0.1:{uport}); a crate whose \
          bytes mismatch its index cksum is refused (the verifying egress is load-bearing)"
@@ -1353,12 +1504,16 @@ fn ensure_serve() -> ! {
         }
         if child.try_wait().ok().flatten().is_some() {
             let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
-            die(format!("ensure-serve: daemon exited before binding:\n{tail}"));
+            die(format!(
+                "ensure-serve: daemon exited before binding:\n{tail}"
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
-    die(format!("ensure-serve: daemon did not report an address:\n{tail}"));
+    die(format!(
+        "ensure-serve: daemon did not report an address:\n{tail}"
+    ));
 }
 
 fn main() {
@@ -1394,7 +1549,10 @@ fn main() {
                 // reports usage instead of being misread as an index path.
                 Some(kw)
                     if a.len() == 4
-                        && !matches!(kw, "index" | "crate" | "crate-local" | "sources" | "kernel-headers") =>
+                        && !matches!(
+                            kw,
+                            "index" | "crate" | "crate-local" | "sources" | "kernel-headers"
+                        ) =>
                 {
                     warm_index(&a[2], &a[3])
                 }
@@ -1404,19 +1562,26 @@ fn main() {
         Some("warm-selftest") if a.len() == 2 => warm_selftest(),
         Some("serve") if a.len() == 4 => {
             let (store, addr) = (PathBuf::from(&a[2]), &a[3]);
-            let listener =
-                TcpListener::bind(addr.as_str()).unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
-            let bound = listener.local_addr().unwrap_or_else(|e| die(format!("local_addr: {e}")));
+            let listener = TcpListener::bind(addr.as_str())
+                .unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
+            let bound = listener
+                .local_addr()
+                .unwrap_or_else(|e| die(format!("local_addr: {e}")));
             println!("td-feed: serving {} on http://{}/", store.display(), bound);
             let _ = io::stdout().flush();
             serve_loop(listener, Arc::new(store));
         }
         Some("cargo-proxy") if a.len() == 4 => {
             let (store, addr) = (PathBuf::from(&a[2]), &a[3]);
-            let listener =
-                TcpListener::bind(addr.as_str()).unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
-            let bound = listener.local_addr().unwrap_or_else(|e| die(format!("local_addr: {e}")));
-            println!("td-feed: cargo-proxy on http://{bound}/ (store {})", store.display());
+            let listener = TcpListener::bind(addr.as_str())
+                .unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
+            let bound = listener
+                .local_addr()
+                .unwrap_or_else(|e| die(format!("local_addr: {e}")));
+            println!(
+                "td-feed: cargo-proxy on http://{bound}/ (store {})",
+                store.display()
+            );
             let _ = io::stdout().flush();
             cargo_proxy_loop(listener, Arc::new(store), bound.to_string());
         }
@@ -1451,7 +1616,10 @@ mod tests {
     fn rejects_non_announcement_lines() {
         // A daemon-startup error, a blank line, and a malformed URL must NOT be
         // mistaken for an address (ensure-serve would otherwise print garbage).
-        assert_eq!(parse_serve_addr("bind 127.0.0.1:0: Address already in use"), None);
+        assert_eq!(
+            parse_serve_addr("bind 127.0.0.1:0: Address already in use"),
+            None
+        );
         assert_eq!(parse_serve_addr(""), None);
         assert_eq!(parse_serve_addr("on http://127.0.0.1/"), None); // no port
         assert_eq!(parse_serve_addr("on http://:8080/"), None); // no host

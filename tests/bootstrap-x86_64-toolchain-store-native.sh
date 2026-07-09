@@ -40,38 +40,61 @@ GLIBC_P2="$ROOT/seed/patches/glibc-bootstrap-system-2.2.5.patch"
 GLIBC_P2_SHA=a8a214f78c96723fee3d9d26b59249029e617bc720880ca2789a66ed73e2c7d0
 
 # --- [pinned-input] all source tarballs + the vendored boot patch match their pins ----------------
-lf() {
-  _want=$2
-  while IFS=' ' read -r _key _rest; do
-    [ "$_key" = "$_want" ] || continue
-    printf '%s\n' "$_rest"
-    return 0
-  done < "$1"
-  return 1
+recipe_source_pins() {
+  _rsp_eval=${TD_RECIPE_EVAL:-}
+  if [ -z "$_rsp_eval" ]; then
+    for _rsp_candidate in recipes/target/release/td-recipe-eval recipes/target/debug/td-recipe-eval; do
+      [ -x "$_rsp_candidate" ] || continue
+      _rsp_eval=$_rsp_candidate
+      break
+    done
+  fi
+  [ -n "$_rsp_eval" ] || fail "td-recipe-eval is not built; run the build-recipes prelude"
+  "$_rsp_eval" source-pins
 }
-MES_LOCK=`ls seed/sources/mes-*.lock | head -1`;       NYACC_LOCK=`ls seed/sources/nyacc-*.lock | head -1`
-TCC_LOCK=`ls seed/sources/tcc-0.9.26*.lock | head -1`; MAKE_LOCK=`ls seed/sources/make-*.lock | head -1`
-PATCH_LOCK=`ls seed/sources/patch-*.lock | head -1`;   BU_LOCK=`ls seed/sources/binutils-*.lock | head -1`
-GCC_LOCK=`ls seed/sources/gcc-core-*.lock | head -1`
-GLIBC_LOCK=`ls seed/sources/glibc-*.lock | head -1`; LINUX_LOCK=`ls seed/sources/linux-*.lock | head -1`
-for l in "$MES_LOCK" "$NYACC_LOCK" "$TCC_LOCK" "$MAKE_LOCK" "$PATCH_LOCK" "$BU_LOCK" "$GCC_LOCK" "$GLIBC_LOCK" "$LINUX_LOCK"; do test -n "$l" || fail "missing a seed/sources/*.lock"; done
-MES_TB=".td-build-cache/sources/`lf "$MES_LOCK" file`";     NYACC_TB=".td-build-cache/sources/`lf "$NYACC_LOCK" file`"
-TCC_TB=".td-build-cache/sources/`lf "$TCC_LOCK" file`";     MAKE_TB=".td-build-cache/sources/`lf "$MAKE_LOCK" file`"
-PATCH_TB=".td-build-cache/sources/`lf "$PATCH_LOCK" file`"; BU_TB=".td-build-cache/sources/`lf "$BU_LOCK" file`"
-GCC_TB=".td-build-cache/sources/`lf "$GCC_LOCK" file`";     GLIBC_TB=".td-build-cache/sources/`lf "$GLIBC_LOCK" file`"
-LINUX_TB=".td-build-cache/sources/`lf "$LINUX_LOCK" file`"
+SOURCE_PINS=`recipe_source_pins`
+pin_field() {
+  _pf_key=$1
+  _pf_field=$2
+  while read -r _pf_k _pf_url _pf_sha _pf_file; do
+    [ "$_pf_k" = "$_pf_key" ] || continue
+    case "$_pf_field" in
+      url) printf '%s\n' "$_pf_url" ;;
+      sha256) printf '%s\n' "$_pf_sha" ;;
+      file) printf '%s\n' "$_pf_file" ;;
+      *) fail "unknown source pin field $_pf_field" ;;
+    esac
+    return 0
+  done <<EOF
+$SOURCE_PINS
+EOF
+  fail "missing recipe source pin $_pf_key"
+}
+pin_file() { pin_field "$1" file; }
+pin_sha() { pin_field "$1" sha256; }
+pin_tb() { printf '.td-build-cache/sources/%s\n' "`pin_file "$1"`"; }
+pin_pair() { printf '%s:%s\n' "`pin_tb "$1"`" "`pin_sha "$1"`"; }
+verify_pin_pairs() {
+  for pair in "$@"; do
+    f=${pair%:*}; want=${pair##*:}
+    test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
+    test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != recipe source pin ($want)"
+  done
+}
+
+MES_TB=`pin_tb mes-source`;       NYACC_TB=`pin_tb nyacc`
+TCC_TB=`pin_tb tcc-source`;       MAKE_TB=`pin_tb make-mesboot0-source`
+PATCH_TB=`pin_tb patch-mesboot-source`; BU_TB=`pin_tb binutils-mesboot-source`
+GCC_TB=`pin_tb gcc-core-source`;  GLIBC_TB=`pin_tb glibc-mesboot0-source`
+LINUX_TB=`pin_tb linux-source`
 # the host-produced kernel-headers tarball (td-feed warm kernel-headers i386; derived from the pinned linux src)
-_kh_file=`lf "$LINUX_LOCK" file`
+_kh_file=`pin_file linux-source`
 KH_VER=${_kh_file#linux-}
 KH_VER=${KH_VER%%.tar*}
 KH_TB=".td-build-cache/sources/linux-headers-$KH_VER-i386.tar.gz"
-for pair in "$MES_TB:`lf "$MES_LOCK" sha256`" "$NYACC_TB:`lf "$NYACC_LOCK" sha256`" "$TCC_TB:`lf "$TCC_LOCK" sha256`" \
-            "$MAKE_TB:`lf "$MAKE_LOCK" sha256`" "$PATCH_TB:`lf "$PATCH_LOCK" sha256`" "$BU_TB:`lf "$BU_LOCK" sha256`" \
-            "$GCC_TB:`lf "$GCC_LOCK" sha256`" "$GLIBC_TB:`lf "$GLIBC_LOCK" sha256`" "$LINUX_TB:`lf "$LINUX_LOCK" sha256`"; do
-  f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
-  test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
-done
+verify_pin_pairs "`pin_pair mes-source`" "`pin_pair nyacc`" "`pin_pair tcc-source`" \
+                 "`pin_pair make-mesboot0-source`" "`pin_pair patch-mesboot-source`" "`pin_pair binutils-mesboot-source`" \
+                 "`pin_pair gcc-core-source`" "`pin_pair glibc-mesboot0-source`" "`pin_pair linux-source`"
 for pp in "$BOOT_PATCH:$BOOT_PATCH_SHA" "$GCC_PATCH:$GCC_PATCH_SHA" "$GLIBC_P1:$GLIBC_P1_SHA" "$GLIBC_P2:$GLIBC_P2_SHA"; do
   pf=${pp%:*}; pw=${pp##*:}
   test -f "$pf" || fail "vendored patch missing ($pf)"
@@ -81,46 +104,34 @@ echo "   [pinned-input] td-fetched mes/nyacc/tcc/make/patch/binutils/gcc/glibc/l
 
 # --- curated build-driver PATH (gcc/cc/guile/guix DENIED) -------------------------------------
 # --- [pinned-input] extras: the gcc-mesboot1 chain sources + gawk + glibc-2.16.0 + 2 patches + gcc-4.9.4 -
-MAKE382_LOCK=`ls seed/sources/make-3.82.lock`; MAKE382_TB=".td-build-cache/sources/`lf "$MAKE382_LOCK" file`"
-GCC464_LOCK=`ls seed/sources/gcc-core-4.6.4.lock`; GCC464_TB=".td-build-cache/sources/`lf "$GCC464_LOCK" file`"
-GPP464_LOCK=`ls seed/sources/gcc-g++-4.6.4.lock`;  GPP464_TB=".td-build-cache/sources/`lf "$GPP464_LOCK" file`"
-GMP_LOCK=`ls seed/sources/gmp-*.lock`;   GMP_TB=".td-build-cache/sources/`lf "$GMP_LOCK" file`"
-MPFR_LOCK=`ls seed/sources/mpfr-*.lock`; MPFR_TB=".td-build-cache/sources/`lf "$MPFR_LOCK" file`"
-MPC_LOCK=`ls seed/sources/mpc-*.lock`;   MPC_TB=".td-build-cache/sources/`lf "$MPC_LOCK" file`"
-GAWK_LOCK=`ls seed/sources/gawk-*.lock`; GAWK_TB=".td-build-cache/sources/`lf "$GAWK_LOCK" file`"
-GLIBC216_LOCK=`ls seed/sources/glibc-mesboot-2.16.0.lock`; GLIBC216_TB=".td-build-cache/sources/`lf "$GLIBC216_LOCK" file`"
-GCC494_LOCK=`ls seed/sources/gcc-4.9.4.lock`; GCC494_TB=".td-build-cache/sources/`lf "$GCC494_LOCK" file`"
+MAKE382_TB=`pin_tb make-mesboot-source`
+GCC464_TB=`pin_tb gcc-464-core`
+GPP464_TB=`pin_tb gcc-464-gpp`
+GMP_TB=`pin_tb gmp`
+MPFR_TB=`pin_tb mpfr`
+MPC_TB=`pin_tb mpc`
+GAWK_TB=`pin_tb gawk-mesboot-source`
+GLIBC216_TB=`pin_tb glibc-216-source`
+GCC494_TB=`pin_tb gcc-494-source`
 GCC464_PATCH="$ROOT/seed/patches/gcc-boot-4.6.4.patch";          GCC464_PATCH_SHA=0dfcb1813ca54eafad0d3bbec17b423d6e50ab76d730b35eb6df7018ed43edff
 GLIBC216_P1="$ROOT/seed/patches/glibc-boot-2.16.0.patch";        GLIBC216_P1_SHA=3de61d25fff5924723ec8fb0a57d37305f8e25b9e65d3d67a6535dbe08ac0e88
 GLIBC216_P2="$ROOT/seed/patches/glibc-bootstrap-system-2.16.0.patch"; GLIBC216_P2_SHA=061cf1269b9d497962389c8b0c52659f8294ae16e0963d146b6599f096bb50ff
-for pair in "$MAKE382_TB:`lf "$MAKE382_LOCK" sha256`" "$GCC464_TB:`lf "$GCC464_LOCK" sha256`" "$GPP464_TB:`lf "$GPP464_LOCK" sha256`" \
-            "$GMP_TB:`lf "$GMP_LOCK" sha256`" "$MPFR_TB:`lf "$MPFR_LOCK" sha256`" "$MPC_TB:`lf "$MPC_LOCK" sha256`" \
-            "$GAWK_TB:`lf "$GAWK_LOCK" sha256`" "$GLIBC216_TB:`lf "$GLIBC216_LOCK" sha256`" "$GCC494_TB:`lf "$GCC494_LOCK" sha256`"; do
-  f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
-  test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
-done
+verify_pin_pairs "`pin_pair make-mesboot-source`" "`pin_pair gcc-464-core`" "`pin_pair gcc-464-gpp`" \
+                 "`pin_pair gmp`" "`pin_pair mpfr`" "`pin_pair mpc`" \
+                 "`pin_pair gawk-mesboot-source`" "`pin_pair glibc-216-source`" "`pin_pair gcc-494-source`"
 for pp in "$GCC464_PATCH:$GCC464_PATCH_SHA" "$GLIBC216_P1:$GLIBC216_P1_SHA" "$GLIBC216_P2:$GLIBC216_P2_SHA"; do
   pf=${pp%:*}; pw=${pp##*:}; test -f "$pf" || fail "vendored patch missing ($pf)"; test "`sha "$pf"`" = "$pw" || fail "vendored patch sha256 != pin ($pf)"
 done
 echo "   [pinned-input] + gcc-4.6.4/gcc-g++/gmp/mpfr/mpc/gawk-3.1.8/glibc-2.16.0/gcc-4.9.4 + the boot patches match their pins"
-GCC14_LOCK=`ls seed/sources/gcc-14.3.0.lock`; GCC14_TB=".td-build-cache/sources/`lf "$GCC14_LOCK" file`"
-GMP63_LOCK=`ls seed/sources/gcc14-gmp-*.lock`; GMP63_TB=".td-build-cache/sources/`lf "$GMP63_LOCK" file`"
-MPFR421_LOCK=`ls seed/sources/gcc14-mpfr-*.lock`; MPFR421_TB=".td-build-cache/sources/`lf "$MPFR421_LOCK" file`"
-MPC131_LOCK=`ls seed/sources/gcc14-mpc-*.lock`; MPC131_TB=".td-build-cache/sources/`lf "$MPC131_LOCK" file`"
-for pair in "$GCC14_TB:`lf "$GCC14_LOCK" sha256`" "$GMP63_TB:`lf "$GMP63_LOCK" sha256`" "$MPFR421_TB:`lf "$MPFR421_LOCK" sha256`" "$MPC131_TB:`lf "$MPC131_LOCK" sha256`"; do
-  f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
-  test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
-done
+GCC14_TB=`pin_tb gcc-14-source`
+GMP63_TB=`pin_tb gmp63`
+MPFR421_TB=`pin_tb mpfr421`
+MPC131_TB=`pin_tb mpc131`
+verify_pin_pairs "`pin_pair gcc-14-source`" "`pin_pair gmp63`" "`pin_pair mpfr421`" "`pin_pair mpc131`"
 echo "   [pinned-input] + gcc-14.3.0/gmp-6.3.0/mpfr-4.2.1/mpc-1.3.1 (the modern gcc prereqs) match their pins"
-BU244_LOCK=`ls seed/sources/binutils-2.44.lock`; BU244_TB=".td-build-cache/sources/`lf "$BU244_LOCK" file`"
-GLIBC241_LOCK=`ls seed/sources/glibc-2.41.lock`; GLIBC241_TB=".td-build-cache/sources/`lf "$GLIBC241_LOCK" file`"
-for pair in "$BU244_TB:`lf "$BU244_LOCK" sha256`" "$GLIBC241_TB:`lf "$GLIBC241_LOCK" sha256`"; do
-  f=${pair%:*}; want=${pair##*:}
-  test -f "$f" || fail "pinned tarball not warm ($f) — run 'td-feed warm sources'"
-  test "`sha "$f"`" = "$want" || fail "warmed $f sha256 != lock pin ($want)"
-done
+BU244_TB=`pin_tb binutils-244-source`
+GLIBC241_TB=`pin_tb glibc-241-source`
+verify_pin_pairs "`pin_pair binutils-244-source`" "`pin_pair glibc-241-source`"
 echo "   [pinned-input] + binutils-2.44/glibc-2.41 (the modern toolchain final pieces) match their pins"
 
 # --- [pinned-input] the x86_64 kernel headers (host warm-prep) -------------------------------------

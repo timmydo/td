@@ -1,5 +1,0 @@
-# seed/sources/tcc-0.9.27.lock — pristine TinyCC 0.9.27, the fuller tcc (guix's tcc-boot). The
-# brick-4 tcc (the 0.9.26 mes fork) compiles pristine 0.9.27; binutils builds with this. td-fetched.
-url https://download.savannah.nongnu.org/releases/tinycc/tcc-0.9.27.tar.bz2
-sha256 de23af78fca90ce32dff2dd45b3432b2334740bb9bb7b05bf60fdbfc396ceb9c
-file tcc-0.9.27.tar.bz2

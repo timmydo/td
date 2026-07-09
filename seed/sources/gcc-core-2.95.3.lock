@@ -1,7 +1,0 @@
-# seed/sources/gcc-core-2.95.3.lock — GNU GCC 2.95.3 (C front end), guix's gcc-core-mesboot0 — the
-# most recent gcc the Mes C Library supports. Built with binutils-mesboot0 (as/ld/ar) + the seed tcc +
-# make, patched with seed/patches/gcc-boot-2.95.3.patch to build under tcc + Mes libc. The first real
-# C compiler in the /td/store toolchain (gcc-mesboot1 4.6.4 → gcc-mesboot 4.7.4 build on it). td-fetched.
-url https://ftp.gnu.org/gnu/gcc/gcc-2.95.3/gcc-core-2.95.3.tar.gz
-sha256 56811ee60990b4660d54c2a66f5e0253a487e330ee53b499d8a565882ff16ef7
-file gcc-core-2.95.3.tar.gz

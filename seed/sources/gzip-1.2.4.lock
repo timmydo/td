@@ -1,5 +1,0 @@
-# seed/sources/gzip-1.2.4.lock — GNU gzip 1.2.4, a mesboot userland tool toward binutils. The
-# seed-built tcc (brick 4) compiles it via a scripted build (guix's gzip-mesboot). td-fetched.
-url https://ftp.gnu.org/gnu/gzip/gzip-1.2.4.tar
-sha256 4d2ce9f314f39c9575f913503b0178d6fb2c92920db8e7b7b176b7bab7980fe6
-file gzip-1.2.4.tar

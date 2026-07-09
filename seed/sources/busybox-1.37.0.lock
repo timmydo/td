@@ -1,9 +1,0 @@
-# seed/sources/busybox-1.37.0.lock — BusyBox 1.37.0, the POSIX userland for the guix-less
-# daily-suite captured set (host-sandbox-stage0 inc2): one binary providing sh + sed/grep/
-# awk/find/tar/gzip + the coreutils applets. Built FROM SOURCE by the /td/store gcc 14.3.0,
-# dynamic vs the /td/store glibc 2.41 (no guix bytes). td-fetched UPSTREAM (busybox.net),
-# NOT guix's repacked source. Using busybox (a POSIX userland) is deliberate — a silent
-# dependency on a GNUism surfaces as a loud failure.
-url https://busybox.net/downloads/busybox-1.37.0.tar.bz2
-sha256 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4
-file busybox-1.37.0.tar.bz2
