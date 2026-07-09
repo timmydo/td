@@ -17,6 +17,8 @@
 //!   build-run TARGET [OUTPUT_STEM ...]
 //!                         build a catalog target through the same Rust recipe
 //!                         runner and print machine-readable local output paths
+//!   source-pins           print recipe-owned fixed-output source pins as:
+//!                         <key>\t<url>\t<sha256>\t<file>
 //! This is the loop tool the `recipe-rs` gate drives AND the corpus consumer
 //! entry (replacing `ts-emit` on the boa path). (The system-spec subcommands —
 //! list-specs/emit-spec/verify-spec — were retired with the guix-system museum
@@ -29,13 +31,29 @@ use td_recipe::catalog;
 #[path = "td_recipe_eval/check_runner.rs"]
 mod check_runner;
 
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn die(msg: &str) -> ! {
     eprintln!("td-recipe-eval: {msg}");
     exit(2);
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn lookup_or_die(stem: &str) -> td_recipe::types::Recipe {
     match catalog::lookup(stem) {
         Some(r) => r,
@@ -48,11 +66,16 @@ fn tier_filter(arg: Option<&String>) -> Option<td_recipe::types::CheckTier> {
         "all" => None,
         "pr" => Some(td_recipe::types::CheckTier::Pr),
         "daily" => Some(td_recipe::types::CheckTier::Daily),
-        other => die(&format!("unknown check tier '{other}' (expected pr|daily|all)")),
+        other => die(&format!(
+            "unknown check tier '{other}' (expected pr|daily|all)"
+        )),
     }
 }
 
-fn recipe_has_check(r: &td_recipe::types::Recipe, tier: Option<td_recipe::types::CheckTier>) -> bool {
+fn recipe_has_check(
+    r: &td_recipe::types::Recipe,
+    tier: Option<td_recipe::types::CheckTier>,
+) -> bool {
     !recipe_checks(r, tier).is_empty()
 }
 
@@ -70,6 +93,12 @@ fn recipe_checks(
         .unwrap_or_default()
 }
 
+fn print_source_pins() {
+    for pin in td_recipe::source_pins::all() {
+        println!("{}\t{}\t{}\t{}", pin.key, pin.url, pin.sha256, pin.file);
+    }
+}
+
 fn check_index(arg: Option<&String>) -> Option<usize> {
     let s = arg?;
     let n = s
@@ -81,7 +110,15 @@ fn check_index(arg: Option<&String>) -> Option<usize> {
     Some(n)
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -144,7 +181,13 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run ..."),
+        Some("source-pins") => {
+            if args.get(2).is_some() {
+                die("usage: source-pins");
+            }
+            print_source_pins();
+        }
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|source-pins ..."),
     }
 }
 
@@ -155,13 +198,25 @@ mod tests {
     #[test]
     fn tier_filter_counts_recipe_check_bodies() {
         let make = catalog::lookup("make-test").unwrap();
-        assert_eq!(recipe_checks(&make, Some(td_recipe::types::CheckTier::Pr)).len(), 0);
-        assert_eq!(recipe_checks(&make, Some(td_recipe::types::CheckTier::Daily)).len(), 1);
+        assert_eq!(
+            recipe_checks(&make, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&make, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
         assert_eq!(recipe_checks(&make, None).len(), 1);
 
         let busybox = catalog::lookup("busybox-test").unwrap();
-        assert_eq!(recipe_checks(&busybox, Some(td_recipe::types::CheckTier::Pr)).len(), 0);
-        assert_eq!(recipe_checks(&busybox, Some(td_recipe::types::CheckTier::Daily)).len(), 1);
+        assert_eq!(
+            recipe_checks(&busybox, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&busybox, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
         assert_eq!(recipe_checks(&busybox, None).len(), 1);
     }
 
@@ -186,6 +241,14 @@ mod tests {
     }
 
     #[test]
+    fn source_pins_cli_surface_has_the_legacy_lock_count() {
+        let pins = td_recipe::source_pins::all();
+        assert_eq!(pins.len(), 32);
+        assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
+        assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
+    }
+
+    #[test]
     fn build_run_rejects_unknown_targets_before_setup() {
         let err = check_runner::build_cli(&["not-a-recipe".to_string()]).unwrap_err();
         assert!(err.contains("unknown recipe stem 'not-a-recipe'"));
@@ -204,8 +267,10 @@ mod tests {
     // discriminates a mismatch, not a vacuous always-equal check.
     #[test]
     fn a_mismatched_recipe_is_discriminated() {
-        let make = catalog::lookup("make-test").expect("make-test recipe must exist (negative-control fixture)");
-        let busybox = catalog::lookup("busybox-test").expect("busybox-test recipe must exist (negative-control fixture)");
+        let make = catalog::lookup("make-test")
+            .expect("make-test recipe must exist (negative-control fixture)");
+        let busybox = catalog::lookup("busybox-test")
+            .expect("busybox-test recipe must exist (negative-control fixture)");
         assert_ne!(
             make.to_json().to_canonical(),
             busybox.to_json().to_canonical(),

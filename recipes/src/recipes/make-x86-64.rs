@@ -14,7 +14,7 @@ use crate::types::{Recipe, Step};
 // ({in:make}/bin/make, a `tool:` lock entry) — the new make does not build itself; its
 // OUTPUT is the /td/store make. No guix bytes in the output.
 //
-// STATIC vs dynamic (directive-3-style callout, see PR): seed/sources/make-4.4.1.lock's
+// STATIC vs dynamic (directive-3-style callout, see PR): the make-x86-64-source pin's
 // comment describes the loop-driver make as "dynamic vs /td/store glibc 2.41". This rung
 // deliberately builds it STATIC — the lowest-risk, fewest-moving-parts proof of a
 // /td/store userland tool built on the native toolchain (a static bin needs no interp
@@ -124,10 +124,11 @@ pub fn recipe() -> Recipe {
     );
     Recipe::mesboot("make-x86-64", "4.4.1")
         .source_input("make-x86-64-source")
-        .native_inputs(&["gcc-x86-64-native", "binutils-x86-64-native", "glibc-x86-64"])
-        .inputs_owned(base_inputs(&[
-            "linux-headers-x86-64",
-            "make",
-        ]))
+        .native_inputs(&[
+            "gcc-x86-64-native",
+            "binutils-x86-64-native",
+            "glibc-x86-64",
+        ])
+        .inputs_owned(base_inputs(&["linux-headers-x86-64", "make"]))
         .steps(steps)
 }

@@ -1,8 +1,0 @@
-# seed/sources/gawk-3.1.8.lock — GNU awk 3.1.8, the source-bootstrap brick 5 (gcc-toolchain) rung
-# alongside binutils-mesboot: GNU awk built by gcc-mesboot1 (guix's gawk-mesboot). Needed because the
-# next C library (glibc-mesboot 2.16.0) has a versions.awk script too complex for the seed's gash-utils
-# awk. td-fetched (td-feed warm sources). nix-base32 cross-checks guix's pin
-# 03d5y7jabq7p2s7ys9alay9446mm7i5g2wvy8nlicardgb6b6ii1.
-url https://ftp.gnu.org/gnu/gawk/gawk-3.1.8.tar.gz
-sha256 2146b3cc7a2d2b16a9457e73f14a3cb51a4292575425ed8f16f7e0a5e4f1a50d
-file gawk-3.1.8.tar.gz

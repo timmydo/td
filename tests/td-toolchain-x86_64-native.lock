@@ -19,7 +19,7 @@
 # the prereq for td-subst chain-caching so a consumer (rust userland rung 4 / #258) FETCHES the
 # native x86_64 toolchain instead of the ~45-min from-cross rebuild.
 #
-# The `input`/`patch` pins MIRROR seed/sources/*.lock + seed/patches/* (IDENTICAL to
+# The `input`/`patch` pins MIRROR recipe-owned source pins + seed/patches/* (IDENTICAL to
 # tests/td-toolchain-x86_64.lock — the native gcc is a BUILD configuration over the same
 # sources). The toolchain-x86_64-native-input-addressed gate asserts they stay in SYNC with the
 # cross lock's source set. Bump `recipe-rev` when the native RECIPE (recipes/src/recipes/
@@ -31,7 +31,7 @@ name td-toolchain-x86_64-native
 recipe-rev 1
 component binutils-2.44-x86_64-native
 component gcc-14.3.0-x86_64-native
-# --- pinned sources (mirror seed/sources/*.lock — IDENTICAL to tests/td-toolchain-x86_64.lock) ---
+# --- pinned sources (mirror recipe source pins — IDENTICAL to tests/td-toolchain-x86_64.lock) ---
 input 183a40ea47ea49f8a1e3bd1b9d12e676374d64d63bc79e7bc1ae7d673dfdf25d mes-0.27.1.tar.gz
 input f36e4fb7dd524dc3f4b354d3d5313f69e7ce5a6ae93711e8cf6d51eaa8d2b318 nyacc-1.00.2.tar.gz
 input f4f6ce121ac631a234af080753fb9d645d2334d20160b37abbe75b574a1e1d19 tcc-0.9.26-1149-g46a75d0c.tar.gz

@@ -1,0 +1,272 @@
+//! Fixed-output source pins owned by the recipe catalog.
+//!
+//! This replaces the old external source lock directory. The keys are the
+//! staged input names recipes declare through `source_input(...)` or `inputs`.
+
+use crate::types::SourcePin;
+
+struct PinDef {
+    key: &'static str,
+    aliases: &'static [&'static str],
+    url: &'static str,
+    sha256: &'static str,
+    file: &'static str,
+}
+
+const PINS: &[PinDef] = &[
+    PinDef {
+        key: "binutils-mesboot-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/binutils/binutils-2.20.1a.tar.bz2",
+        sha256: "71d37c96451333c5c0b84b170169fdcb138bbb27397dc06281905d9717c8ed64",
+        file: "binutils-2.20.1a.tar.bz2",
+    },
+    PinDef {
+        key: "binutils-244-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/binutils/binutils-2.44.tar.xz",
+        sha256: "ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237",
+        file: "binutils-2.44.tar.xz",
+    },
+    PinDef {
+        key: "busybox-x86-64-source",
+        aliases: &[],
+        url: "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
+        sha256: "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4",
+        file: "busybox-1.37.0.tar.bz2",
+    },
+    PinDef {
+        key: "gawk-mesboot-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/gawk/gawk-3.1.8.tar.gz",
+        sha256: "2146b3cc7a2d2b16a9457e73f14a3cb51a4292575425ed8f16f7e0a5e4f1a50d",
+        file: "gawk-3.1.8.tar.gz",
+    },
+    PinDef {
+        key: "gcc-14-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/gcc/gcc-14.3.0/gcc-14.3.0.tar.xz",
+        sha256: "e0dc77297625631ac8e50fa92fffefe899a4eb702592da5c32ef04e2293aca3a",
+        file: "gcc-14.3.0.tar.xz",
+    },
+    PinDef {
+        key: "gcc-494-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/gcc/gcc-4.9.4/gcc-4.9.4.tar.bz2",
+        sha256: "6c11d292cd01b294f9f84c9a59c230d80e9e4a47e5c6355f046bb36d4f358092",
+        file: "gcc-4.9.4.tar.bz2",
+    },
+    PinDef {
+        key: "gcc-core-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/gcc/gcc-2.95.3/gcc-core-2.95.3.tar.gz",
+        sha256: "56811ee60990b4660d54c2a66f5e0253a487e330ee53b499d8a565882ff16ef7",
+        file: "gcc-core-2.95.3.tar.gz",
+    },
+    PinDef {
+        key: "gcc-464-core",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/gcc/gcc-4.6.4/gcc-core-4.6.4.tar.gz",
+        sha256: "e534a5cb05ab839d7cf7b2496fd5df42e76352926c1cf0d94de76184c26a739c",
+        file: "gcc-core-4.6.4.tar.gz",
+    },
+    PinDef {
+        key: "gcc-464-gpp",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/gcc/gcc-4.6.4/gcc-g++-4.6.4.tar.gz",
+        sha256: "690a5d4f664180640db28079e3461468192c484c37d6f671dde4b53a7f9918bb",
+        file: "gcc-g++-4.6.4.tar.gz",
+    },
+    PinDef {
+        key: "gmp63",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz",
+        sha256: "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898",
+        file: "gmp-6.3.0.tar.xz",
+    },
+    PinDef {
+        key: "mpc131",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz",
+        sha256: "ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8",
+        file: "mpc-1.3.1.tar.gz",
+    },
+    PinDef {
+        key: "mpfr421",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz",
+        sha256: "277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2",
+        file: "mpfr-4.2.1.tar.xz",
+    },
+    PinDef {
+        key: "glibc-mesboot0-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/glibc/glibc-2.2.5.tar.gz",
+        sha256: "58dc8df59aed1e4d9d50eef9e4c4c0789fa283b50f7a093932d0f467424484ee",
+        file: "glibc-2.2.5.tar.gz",
+    },
+    PinDef {
+        key: "glibc-241-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/glibc/glibc-2.41.tar.xz",
+        sha256: "a5a26b22f545d6b7d7b3dd828e11e428f24f4fac43c934fb071b6a7d0828e901",
+        file: "glibc-2.41.tar.xz",
+    },
+    PinDef {
+        key: "glibc-216-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/glibc/glibc-2.16.0.tar.gz",
+        sha256: "a75be51658cc1cfb6324ec6dbdbed416526c44c14814823129f0fcc74c279f6e",
+        file: "glibc-2.16.0.tar.gz",
+    },
+    PinDef {
+        key: "gmp",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/gmp/gmp-4.3.2.tar.gz",
+        sha256: "7be3ad1641b99b17f6a8be6a976f1f954e997c41e919ad7e0c418fe848c13c97",
+        file: "gmp-4.3.2.tar.gz",
+    },
+    PinDef {
+        key: "gzip-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/gzip/gzip-1.2.4.tar",
+        sha256: "4d2ce9f314f39c9575f913503b0178d6fb2c92920db8e7b7b176b7bab7980fe6",
+        file: "gzip-1.2.4.tar",
+    },
+    PinDef {
+        key: "hello-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/hello/hello-2.10.tar.gz",
+        sha256: "31e066137a962676e89f69d1b65382de95a7ef7d914b8cb956f41ea72e0f516b",
+        file: "hello-2.10.tar.gz",
+    },
+    PinDef {
+        key: "linux-source",
+        aliases: &["linux-headers", "linux-headers-x86-64"],
+        url: "https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz",
+        sha256: "3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba",
+        file: "linux-4.14.67.tar.xz",
+    },
+    PinDef {
+        key: "make-mesboot0-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/make/make-3.80.tar.gz",
+        sha256: "64b30b41fde2ebf669e6af489883fb1df6a06ac30555a96cfa3c39ecce7267dd",
+        file: "make-3.80.tar.gz",
+    },
+    PinDef {
+        key: "make-mesboot-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/make/make-3.82.tar.gz",
+        sha256: "3d991b33e604187c5881a0abc2e102d5b9776da5569640e73778f85d617242e7",
+        file: "make-3.82.tar.gz",
+    },
+    PinDef {
+        key: "make-x86-64-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz",
+        sha256: "dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3",
+        file: "make-4.4.1.tar.gz",
+    },
+    PinDef {
+        key: "mes-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/mes/mes-0.27.1.tar.gz",
+        sha256: "183a40ea47ea49f8a1e3bd1b9d12e676374d64d63bc79e7bc1ae7d673dfdf25d",
+        file: "mes-0.27.1.tar.gz",
+    },
+    PinDef {
+        key: "mpc",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/mpc/mpc-1.0.3.tar.gz",
+        sha256: "617decc6ea09889fb08ede330917a00b16809b8db88c29c31bfbb49cbf88ecc3",
+        file: "mpc-1.0.3.tar.gz",
+    },
+    PinDef {
+        key: "mpfr",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/mpfr/mpfr-2.4.2.tar.gz",
+        sha256: "246d7e184048b1fc48d3696dd302c9774e24e921204221540745e5464022b637",
+        file: "mpfr-2.4.2.tar.gz",
+    },
+    PinDef {
+        key: "nyacc",
+        aliases: &[],
+        url: "https://download.savannah.nongnu.org/releases/nyacc/nyacc-1.00.2.tar.gz",
+        sha256: "f36e4fb7dd524dc3f4b354d3d5313f69e7ce5a6ae93711e8cf6d51eaa8d2b318",
+        file: "nyacc-1.00.2.tar.gz",
+    },
+    PinDef {
+        key: "patch-mesboot-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/patch/patch-2.5.9.tar.gz",
+        sha256: "ecb5c6469d732bcf01d6ec1afe9e64f1668caba5bfdb103c28d7f537ba3cdb8a",
+        file: "patch-2.5.9.tar.gz",
+    },
+    PinDef {
+        key: "rust-toolchain-source",
+        aliases: &[],
+        url: "https://static.rust-lang.org/dist/rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz",
+        sha256: "c1130e4f7976f230766ab062b105b1fb050d6a78177db2246a5878fd6a589680",
+        file: "rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz",
+    },
+    PinDef {
+        key: "stage0-source",
+        aliases: &[],
+        url: "https://github.com/oriansj/stage0-posix/releases/download/Release_1.9.1/stage0-posix-1.9.1.tar.gz",
+        sha256: "f4fdda675de90ab034fd3467ef43cddff61b3d372f8e0e5c2d25d145f224226f",
+        file: "stage0-posix-1.9.1.tar.gz",
+    },
+    PinDef {
+        key: "tcc-source",
+        aliases: &[],
+        url: "https://lilypond.org/janneke/tcc/tcc-0.9.26-1149-g46a75d0c.tar.gz",
+        sha256: "f4f6ce121ac631a234af080753fb9d645d2334d20160b37abbe75b574a1e1d19",
+        file: "tcc-0.9.26-1149-g46a75d0c.tar.gz",
+    },
+    PinDef {
+        key: "tcc-0.9.27-source",
+        aliases: &[],
+        url: "https://download.savannah.nongnu.org/releases/tinycc/tcc-0.9.27.tar.bz2",
+        sha256: "de23af78fca90ce32dff2dd45b3432b2334740bb9bb7b05bf60fdbfc396ceb9c",
+        file: "tcc-0.9.27.tar.bz2",
+    },
+    PinDef {
+        key: "zlib-x86-64-source",
+        aliases: &[],
+        url: "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
+        sha256: "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+        file: "zlib-1.3.1.tar.gz",
+    },
+];
+
+pub fn all() -> Vec<SourcePin> {
+    PINS.iter().map(|pin| materialize(pin, pin.key)).collect()
+}
+
+pub fn by_key(key: &str) -> Option<SourcePin> {
+    PINS.iter()
+        .find(|pin| pin.key == key || pin.aliases.iter().any(|alias| *alias == key))
+        .map(|pin| materialize(pin, key))
+}
+
+fn materialize(pin: &PinDef, key: &str) -> SourcePin {
+    SourcePin::new(key, pin.url, pin.sha256, pin.file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_carries_all_legacy_source_locks() {
+        assert_eq!(all().len(), 32);
+    }
+
+    #[test]
+    fn linux_header_inputs_resolve_to_the_linux_source_pin() {
+        let linux = by_key("linux-headers-x86-64").unwrap();
+        assert_eq!(linux.file, "linux-4.14.67.tar.xz");
+        assert_eq!(linux.key, "linux-headers-x86-64");
+    }
+}

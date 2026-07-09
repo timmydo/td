@@ -1,8 +1,0 @@
-# seed/sources/make-4.4.1.lock — GNU Make 4.4.1, the loop's build driver for the guix-less
-# daily-suite captured set (host-sandbox-stage0 inc2). GNU make is the explicit, DECLARED
-# build tool (the loop Makefile uses GNU-make features; busybox has no make) — distinct from
-# the tcc-built GNU Make 3.80 used inside the from-source bootstrap. Built FROM SOURCE by the
-# /td/store gcc 14.3.0, dynamic vs /td/store glibc 2.41 (no guix bytes). td-fetched UPSTREAM.
-url https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz
-sha256 dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3
-file make-4.4.1.tar.gz

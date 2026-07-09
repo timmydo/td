@@ -1,6 +1,0 @@
-# seed/sources/mpc-1.0.3.lock — GNU MPC 1.0.3, a math-library dependency of GCC 4.6.4
-# (gcc-core-mesboot1). Unpacked INTO the gcc source tree and built in-tree (guix's mpc-boot).
-# td-fetched. nix-base32 cross-checks guix's pin 1hzci2zrrd7v3g1jk35qindq05hbl0bhjcyyisq9z209xb3fqzb1.
-url https://ftp.gnu.org/gnu/mpc/mpc-1.0.3.tar.gz
-sha256 617decc6ea09889fb08ede330917a00b16809b8db88c29c31bfbb49cbf88ecc3
-file mpc-1.0.3.tar.gz

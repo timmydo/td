@@ -14,7 +14,7 @@
 # + x86_64 `component` names re-key it. The gate proves exactly that, with no source dup.
 #
 # Legs (ALL DURABLE — no guix oracle in any; td-native addressing end to end):
-#   [pinned-sync]   the x86_64 lock's input/patch pins match seed/sources + seed/patches
+#   [pinned-sync]   the x86_64 lock's input/patch pins match recipe source pins + seed/patches
 #                   (the lock can't drift from the real toolchain inputs).
 #   [arch-parity]   the x86_64 lock's input+patch SET is byte-identical to the i686 lock's,
 #                   and the two locks differ ONLY in name / recipe-rev / component — so the
@@ -34,15 +34,14 @@ ILOCK=tests/td-toolchain.lock
 test -f "$LOCK" || fail "missing $LOCK"
 test -f "$ILOCK" || fail "missing $ILOCK (the i686 lock to compare against)"
 
-source_lock_value() {
-  _slv_key=$1
-  _slv_lock=$2
-  while IFS=' ' read -r _slv_k _slv_rest; do
-    [ "$_slv_k" = "$_slv_key" ] || continue
-    printf '%s\n' "$_slv_rest"
-    return 0
-  done < "$_slv_lock"
-  return 1
+recipe_source_pins() {
+  _rsp_eval=${TD_RECIPE_EVAL:-}
+  if [ -z "$_rsp_eval" ]; then
+    _rsp_eval=`sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval"` \
+      || fail "could not build td-recipe-eval from the current worktree"
+  fi
+  [ -x "$_rsp_eval" ] || fail "td-recipe-eval is not executable: $_rsp_eval"
+  "$_rsp_eval" source-pins
 }
 
 copy_pin_lines() {
@@ -98,20 +97,23 @@ echo ">> td-builder (stage0, guix-free): $TB"
 work=`mktemp -d`
 trap 'chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 
-# --- [pinned-sync] every lock pin mirrors the seed source / patch it names ---------------------
+# --- [pinned-sync] every lock pin mirrors the recipe source pin / patch it names ---------------
+SOURCE_PINS=`recipe_source_pins`
 srcsha() {
-  for l in seed/sources/*.lock; do
-    f=`source_lock_value file "$l" 2>/dev/null || true`
-    [ "$f" = "$1" ] && { source_lock_value sha256 "$l"; return 0; }
-  done
+  _srcsha_file=$1
+  while read -r _srcsha_key _srcsha_url _srcsha_sha _srcsha_name; do
+    [ "$_srcsha_name" = "$_srcsha_file" ] && { printf '%s\n' "$_srcsha_sha"; return 0; }
+  done <<EOF
+$SOURCE_PINS
+EOF
   return 1
 }
 nin=0; npatch=0
 while read -r kind shaval file; do
   case "$kind" in
     input)
-      want=`srcsha "$file"` || fail "[pinned-sync] no seed/sources/*.lock declares file `$file`"
-      [ "$shaval" = "$want" ] || fail "[pinned-sync] $file: lock pin $shaval != seed pin $want"
+      want=`srcsha "$file"` || fail "[pinned-sync] no recipe source pin declares file `$file`"
+      [ "$shaval" = "$want" ] || fail "[pinned-sync] $file: lock pin $shaval != recipe source pin $want"
       nin=$((nin + 1)) ;;
     patch)
       pf="seed/patches/$file"
@@ -125,7 +127,7 @@ done <<EOF
 EOF
 test "$nin" -ge 20 || fail "[pinned-sync] only $nin input pins — the toolchain has more inputs than that"
 test "$npatch" -ge 4 || fail "[pinned-sync] only $npatch patch pins"
-echo "   [pinned-sync] $nin source pins + $npatch patch pins match seed/sources + seed/patches"
+echo "   [pinned-sync] $nin source pins + $npatch patch pins match recipe source pins + seed/patches"
 
 # --- [arch-parity] the x86_64 lock shares i686's exact source set; only arch fields differ -----
 # diff/cmp-free (the loop sandbox has neither): compare the sorted input+patch sets by sha256,
