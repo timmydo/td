@@ -8,11 +8,7 @@
 //! 2.41 is interned content-addressed at /td/store, and the cross gcc links a DYNAMIC x86_64 C AND C++ program
 //! against it (interp = /td/store x86_64 ld-linux-x86-64.so.2) that runs in the own-root → 42, /gnu/store ABSENT.
 //! DURABLE: pinned-input, no-guix (no /gnu/store in the x86_64 libc.so.6 NOR the cross gcc/cc1), content-addr,
-//! repro (gcc14-repro: the cross gcc 14.3.0 is BYTE-REPRODUCIBLE — `--with-as`/`--with-ld`/`--with-sysroot` are
-//! pinned to deterministic paths, NOT per-build mktemp, so the gcc driver's .rodata is stable; two independent
-//! from-source builds, normalized by tests/repro-lib.sh, land on the SAME bytes → a stable input-addressed
-//! artifact; intrinsic double-build, no guix oracle), behavioral (an ELF 64-bit C + C++ program runs vs the
-//! x86_64 glibc 2.41 from /td/store → 42), structural,
+//! behavioral (an ELF 64-bit C + C++ program runs vs the x86_64 glibc 2.41 from /td/store → 42), structural,
 //! input-addressed (x64-toolchain-subst: the x86_64 glibc is ALSO interned at the LOCK-KEYED path from
 //! tests/td-toolchain-x86_64.lock — the stable path a consumer fetches as a signed substitute, not a
 //! content-addressed throwaway — and a program whose interp IS that path runs in the own-root → 42), and

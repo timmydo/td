@@ -261,40 +261,28 @@ fn add_build_gate_targets(root: &Path, sel: &mut Selection) {
     }
 }
 
-fn add_shell_ladder_targets(sel: &mut Selection) {
-    sel.add_target("chain-cache");
+fn add_recipe_graph_targets(sel: &mut Selection) {
     sel.add_target("bootstrap-x86_64-toolchain-store-native");
     sel.add_target("bootstrap-x86_64-native-gcc-store-native");
     sel.add_target("bootstrap-x86_64-self-gcc-store-native");
+    sel.add_target("recipe-checks-daily");
 }
 
 // The 25 per-rung `bootstrap-<rung>.sh` gates that used to prove each i686
 // mesboot→store-native rung individually are retired (#397): their `build_*`
-// shell ladders were 80-95% duplicate of `tests/bootstrap-chain.sh`'s
-// `bootstrap_modern_toolchain()`, which already builds the ENTIRE 20-rung
-// toolchain (stage0→mes→tcc→…→gcc-14→binutils-244→glibc-241) via ONE
-// recipe-graph call. There is now exactly one consumer of every rung's pinned
-// input (lock/patch): `tests/bootstrap-chain.sh` itself. So the old "downstream
-// slice" concept (CHAIN + add_chain, a 28-entry dependency array sliced per
-// arm) is gone — every pinned input the ladder consumes routes to the SAME
-// target set `tests/bootstrap-chain.sh` routes to below (`add_chain_targets`).
+// shell ladders were 80-95% duplicate of the recipe graph runner. There are now
+// two live consumers of the i686 base graph's pinned inputs: recipe-owned
+// checks, and the x86_64 gates whose cross/native/self rungs sit on top of the
+// same stage0→mes→tcc→…→gcc-14→binutils-244→glibc-241 graph. The old
+// "downstream slice" concept (CHAIN + add_chain, a 28-entry dependency array
+// sliced per arm) is gone — every pinned input routes to that consumer set.
 // What's accepted as lost: per-rung double-build reproducibility, the
 // `store-ns` sandboxed no-guix round-trip, and the `subst-export`/`nar-restore`
 // round-trip that some of the deep store-native rungs' scripts also checked —
 // nothing ports those checks elsewhere. The remaining recipe-owned daily checks
-// and `bootstrap_modern_toolchain()`'s own no-guix/existence assertions keep the
-// ladder covered until the removed external-lock checks are rebuilt properly.
-//
-// The x86_64 cross track hangs off the SAME 20-rung graph (`run_x86_64_cross`,
-// tests/x86_64-cross-fns.sh, ladder_emits the identical stage0..glibc-241
-// prefix before appending its own 4 rungs) — every pinned input here also
-// feeds it, so it belongs in the shared target set too, not just the i686
-// gates. (x86_64 itself is untouched by #397 — its gates never carried
-// duplicate `build_*` shell — this is purely restoring the cascade the old
-// `CHAIN`/`add_chain` slicing gave it.)
+// and the x86_64 gate verifiers are the live coverage.
 fn add_chain_targets(sel: &mut Selection) {
-    add_shell_ladder_targets(sel);
-    sel.add_target("recipe-checks-daily");
+    add_recipe_graph_targets(sel);
 }
 
 // ---------------------------------------------------------------------------
@@ -439,10 +427,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches("feed/*|feed/src/*|feed/Cargo.toml|feed/Cargo.lock", p) {
-        // main.rs holds the host-PREP warm that feeds the bootstrap gates (`warm sources` +
-        // `warm kernel-headers`), so smoke the ladder that consumes it — the same target set
-        // tests/bootstrap-chain.sh routes to (bootstrap-glibc, a former individual per-rung
-        // gate that consumed this warm, retired #397; the whole ladder is now one consumer).
+        // main.rs holds the host-PREP warm that feeds the recipe graph consumers
+        // (`warm sources` + `warm kernel-headers`).
         add_chain_targets(sel);
         return;
     }
@@ -531,22 +517,19 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // --- the i686 mesboot→store-native chain's pinned inputs (#397) ---
-    // Every lock/patch every rung of `bootstrap_modern_toolchain()` consumes, plus
-    // `tests/repro-lib.sh` (the modern rungs' shared reproducibility-normalization lib:
-    // currently unreferenced by any surviving script, since all 3 scripts that used to
-    // source it — bootstrap-{binutils-244,gcc-14,glibc-241}-store-native.sh — were
-    // retired with their per-rung gates. It stays as sanctioned shared plumbing for a
-    // future modern-rung consumer; routed conservatively through the ladder's own proof
-    // target set in the meantime). All route to the SAME target set
-    if pattern_matches("tests/repro-lib.sh", p) {
-        sel.add_preflight("shell-syntax");
-        add_shell_ladder_targets(sel);
+    // Tombstones for the deleted shell recipe-graph compatibility helpers. The
+    // deleting diff maps to the current Rust recipe-graph consumers.
+    if pattern_matches(
+        "tests/bootstrap-chain.sh|tests/ladder-lib.sh|tests/chain-cache.sh|tests/chain-cache-lib.sh|tests/repro-lib.sh",
+        p,
+    ) {
+        add_chain_targets(sel);
         return;
     }
-    // `tests/bootstrap-chain.sh` itself routes to the shell ladder targets below; source
-    // pin changes also route to recipe-checks-daily because the Rust recipe-check runner
-    // interns the same pinned source set.
+
+    // --- the i686 mesboot→store-native recipe graph's pinned inputs (#397) ---
+    // Source pin changes route to the live graph consumers: recipe-owned checks
+    // and the x86_64 daily gates.
     if pattern_matches("seed/sources/gzip-*.lock|seed/sources/tcc-0.9.27*.lock|seed/sources/patch-*.lock|seed/sources/binutils-2.20*.lock|seed/patches/binutils-boot-*.patch", p)
         || pattern_matches("seed/sources/gcc-core-2.95.3.lock|seed/patches/gcc-boot-2.95.3.patch|seed/sources/glibc-2.2.5.lock|seed/sources/linux-*.lock|seed/patches/glibc-boot-2.2.5.patch|seed/patches/glibc-bootstrap-system-2.2.5.patch", p)
         || pattern_matches("seed/sources/gcc-core-4.6.4.lock|seed/sources/gmp-*.lock|seed/sources/mpfr-*.lock|seed/sources/mpc-*.lock|seed/patches/gcc-boot-4.6.4.patch|seed/sources/gcc-g++-4.6.4.lock|seed/sources/gawk-*.lock", p)
@@ -555,36 +538,6 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     {
         sel.add_preflight("shell-syntax");
         add_chain_targets(sel);
-        return;
-    }
-    // bootstrap-chain.sh is the SHARED from-seed toolchain chain; its consumers are
-    // chain-cache and the x86_64 tracks, which are the remaining shell consumers
-    // of the ladder until the deleted external-lock checks are rebuilt properly (#397 — the 25
-    // per-rung bootstrap-<rung>.sh gates that used to prove each rung individually are
-    // retired). Since #317 the chain's bricks persist through the warm chain-brick cache
-    // (tests/chain-cache-lib.sh), so a chain/lib change also re-proves the chain-cache gate
-    // (hit/poison/cold semantics).
-    if pattern_matches("tests/bootstrap-chain.sh", p) {
-        sel.add_preflight("shell-syntax");
-        add_shell_ladder_targets(sel);
-        return;
-    }
-    // ladder-lib.sh is the SHARED plumbing UNDER both bootstrap-chain.sh (the i686 base) and
-    // x86_64-cross-fns.sh (the x86_64 cross/native tracks) — intern/tool-resolve/emit/drive
-    // build-plan --auto, including the #429 lock synthesis every consumer's `ladder_build`
-    // call goes through. A change here can affect every rung's synthesized lock, so map to
-    // the UNION of all consumers' targets, not just one track — `add_chain_targets` already
-    // is that union (both the i686 chain gates and the x86_64 cross/native gates).
-    if pattern_matches("tests/ladder-lib.sh", p) {
-        sel.add_preflight("shell-syntax");
-        add_shell_ladder_targets(sel);
-        return;
-    }
-    // The warm chain-brick cache itself (#317): the chain-cache gate drives the real lib's
-    // hit/build/save/poison/cold paths; the chain consumers exercise the reuse path in anger.
-    if pattern_matches("tests/chain-cache.sh|tests/chain-cache-lib.sh", p) {
-        sel.add_preflight("shell-syntax");
-        sel.add_target("chain-cache");
         return;
     }
     // The rung-X2 native gcc gate's consumer test: a native x86_64 gcc/binutils built on top of the
@@ -1006,28 +959,19 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         assert_target!("tests/cache-lib.sh", &bg);
     }
 
-    // The warm chain-brick cache (#317): the lib and its gate map to chain-cache, and
-    // the shared chain re-proves the remaining consumers + the cache gate.
-    assert_target!("tests/chain-cache-lib.sh", "chain-cache");
-    assert_target!("tests/chain-cache.sh", "chain-cache");
-    assert_target!("tests/bootstrap-chain.sh", "chain-cache");
     assert_target!("tests/recipe-checks.sh", "recipe-checks-daily");
-    // ladder-lib.sh (#429) is the shared foundation under BOTH the i686 chain and the
-    // x86_64 cross/native tracks — a change must re-prove all of those shell consumers,
-    // not recipe-checks-daily, which now runs through td-recipe-eval check-run.
-    assert_target!("tests/ladder-lib.sh", "chain-cache");
-    assert_target!(
+    for tombstone in [
+        "tests/chain-cache-lib.sh",
+        "tests/chain-cache.sh",
+        "tests/bootstrap-chain.sh",
         "tests/ladder-lib.sh",
-        "bootstrap-x86_64-toolchain-store-native"
-    );
-    assert_target!(
-        "tests/ladder-lib.sh",
-        "bootstrap-x86_64-native-gcc-store-native"
-    );
-    assert_target!(
-        "tests/ladder-lib.sh",
-        "bootstrap-x86_64-self-gcc-store-native"
-    );
+        "tests/repro-lib.sh",
+    ] {
+        assert_target!(tombstone, "recipe-checks-daily");
+        assert_target!(tombstone, "bootstrap-x86_64-toolchain-store-native");
+        assert_target!(tombstone, "bootstrap-x86_64-native-gcc-store-native");
+        assert_target!(tombstone, "bootstrap-x86_64-self-gcc-store-native");
+    }
 
     // A gate-file change still selects the dispatcher's own self-test preflight
     // (now the in-process `td-builder affected-checks --self-test`) and is waived.
@@ -1039,7 +983,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "builder/src/gate_defs/325-cargo-test.rs",
         "the full check would be waived"
     );
-    assert_target!("tests/repro-lib.sh", "chain-cache");
     assert_branch_policy!("tests/repro-lib.sh", "the full check would be waived");
     // Native (typed-Rust) gate bodies (#318 axis 3): a body change runs its gates
     // (the former tests/store-*.sh / gate-script mapping) + the engine smoke.

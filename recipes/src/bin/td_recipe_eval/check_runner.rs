@@ -33,8 +33,37 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     }
 }
 
+pub fn build_cli(args: &[String]) -> Result<(), String> {
+    let target = args.first().ok_or_else(build_usage)?.as_str();
+    if catalog::lookup(target).is_none() {
+        return Err(format!("unknown recipe stem '{target}' (try `list`)"));
+    }
+    let outputs: Vec<&str> = if args.get(1).is_some() {
+        args.iter().skip(1).map(String::as_str).collect()
+    } else {
+        vec![target]
+    };
+    for output in &outputs {
+        if catalog::lookup(output).is_none() {
+            return Err(format!(
+                "unknown output recipe stem '{output}' (try `list`)"
+            ));
+        }
+    }
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let runner = RecipeCheckRunner::new(root)?;
+    let _lock = lock_file(&runner.lock_path())?;
+    runner.setup()?;
+    runner.build_recipe_target(target, &outputs)
+}
+
 fn usage() -> String {
     "usage: check-run STEM [pr|daily|all] [INDEX]".to_string()
+}
+
+fn build_usage() -> String {
+    "usage: build-run TARGET [OUTPUT_STEM ...]".to_string()
 }
 
 fn parse_index(arg: Option<&String>) -> Result<usize, String> {
@@ -194,7 +223,8 @@ impl RecipeCheckRunner {
             db,
             recipes,
             scratch,
-            force_cold: chain_cache.is_empty(),
+            force_cold: chain_cache.is_empty()
+                && env::var_os("TD_RECIPE_CHECK_PRESERVE_WORK").is_none(),
         })
     }
 
@@ -677,7 +707,7 @@ impl RecipeCheckRunner {
         }
     }
 
-    fn build_plan(&self, target: &str) -> Result<(), String> {
+    fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
         let srcs = fs::read(self.lw.join("srcs.map")).map_err(|e| format!("read srcs.map: {e}"))?;
         let tools =
             fs::read(self.lw.join("tools.map")).map_err(|e| format!("read tools.map: {e}"))?;
@@ -729,26 +759,18 @@ impl RecipeCheckRunner {
         }
         io::stdout()
             .write_all(&out.stdout)
-            .map_err(|e| format!("write build-plan stdout: {e}"))
+            .map_err(|e| format!("write build-plan stdout: {e}"))?;
+        Ok(out_file)
     }
 
-    fn ladder_out(&self, rung: &str) -> Result<PathBuf, String> {
+    fn ladder_out_from(&self, build_out: &Path, rung: &str) -> Result<PathBuf, String> {
         let prefix = format!("STEP {rung} ");
         let mut got = None;
-        let mut files = read_dir_sorted(&self.lw)?;
-        files.retain(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("build-") && n.ends_with(".out"))
-                .unwrap_or(false)
-        });
-        for file in files {
-            let contents =
-                fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
-            for line in contents.lines() {
-                if let Some(rest) = line.strip_prefix(&prefix) {
-                    got = Some(rest.trim().to_string());
-                }
+        let contents = fs::read_to_string(build_out)
+            .map_err(|e| format!("read {}: {e}", build_out.display()))?;
+        for line in contents.lines() {
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                got = Some(rest.trim().to_string());
             }
         }
         let path = got.ok_or_else(|| format!("ladder: no STEP output recorded for {rung}"))?;
@@ -774,10 +796,25 @@ impl RecipeCheckRunner {
         Ok(())
     }
 
+    fn build_recipe_target(&self, target: &str, outputs: &[&str]) -> Result<(), String> {
+        self.prepare_recipe_target(target)?;
+        let build_out = self.build_plan(target)?;
+        println!("TD_RECIPE_RUN_WORK {}", self.lw.display());
+        println!(
+            "TD_RECIPE_RUN_TDSTORE {}",
+            self.scratch.join("tdstore").display()
+        );
+        for output in outputs {
+            let path = self.ladder_out_from(&build_out, output)?;
+            println!("TD_RECIPE_RUN_OUT {output} {}", path.display());
+        }
+        Ok(())
+    }
+
     fn run_rust_toolchain_check(&self) -> Result<(), String> {
         self.prepare_recipe_target("rust-toolchain")?;
-        self.build_plan("rust-toolchain")?;
-        let rust_tree = self.ladder_out("rust-toolchain")?;
+        let build_out = self.build_plan("rust-toolchain")?;
+        let rust_tree = self.ladder_out_from(&build_out, "rust-toolchain")?;
         println!(
             "   [ladder] x86_64 rust-toolchain via build-plan --auto: catalog dependency closure -> rust-toolchain (relinked rustc/cargo tree {})",
             rust_tree.display()
@@ -1390,5 +1427,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn output_lookup_uses_the_current_build_log_only() {
+        let tmp = env::temp_dir().join(format!(
+            "td-recipe-runner-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let old = tmp.join("build-old.out");
+        let current = tmp.join("build-current.out");
+        fs::write(&old, "STEP rust-toolchain /td/store/stale-rust\n").unwrap();
+        fs::write(&current, "STEP rust-toolchain /td/store/current-rust\n").unwrap();
+        let runner = RecipeCheckRunner {
+            root: PathBuf::new(),
+            tb: PathBuf::new(),
+            builder_path: String::new(),
+            builder_store: PathBuf::new(),
+            builder_db: PathBuf::new(),
+            lw: tmp.clone(),
+            store: PathBuf::new(),
+            db: PathBuf::new(),
+            recipes: PathBuf::new(),
+            scratch: tmp.join("scratch"),
+            force_cold: false,
+        };
+
+        let got = runner
+            .ladder_out_from(&current, "rust-toolchain")
+            .unwrap();
+
+        assert_eq!(got, tmp.join("scratch/tdstore/current-rust"));
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

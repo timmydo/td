@@ -1,8 +1,9 @@
 #!/bin/sh
-# tests/x86_64-cross-fns.sh — the x86_64 CROSS rungs of the x86_64-toolchain track, SOURCED by both
-# the authoritative gate (tests/bootstrap-x86_64-toolchain-store-native.sh) and the dev harness
-# (.td-build-cache/sbdev1/x86-harness.sh). Built BY the existing i686 gcc 14.3.0 + binutils 2.44
-# (the modern /td/store toolchain — all i686). The cross flow (LFS / crosstool-NG shape):
+# tests/x86_64-cross-fns.sh — verification and substitute helpers for the x86_64 toolchain track,
+# SOURCED by the authoritative gates. The recipe builds themselves are driven by
+# `td-recipe-eval build-run`; this file keeps the x86_64-specific output wiring and own-root
+# behavioral checks. Built BY the existing i686 gcc 14.3.0 + binutils 2.44 (the modern /td/store
+# toolchain — all i686). The cross flow (LFS / crosstool-NG shape):
 #
 #   cross binutils 2.44 (--target=x86_64-pc-linux-gnu)
 #     -> cross gcc 14.3.0 stage1 (C only, --without-headers, all-gcc + all-target-libgcc)
@@ -12,8 +13,7 @@
 # The cross TOOLS are i686 build tools (run in the sandbox/own-root, linked -static vs glibc 2.16);
 # their OUTPUT targets x86_64 /td/store. The build-time scaffolding (awk/sed/make/bison/flex from
 # the exposed /gnu/store) is guarded by the gate's [no-guix] leg (it checks the OUTPUT, not the
-# build tools). Requires globals the chain defines: GCC14_TB GMP63_TB MPFR421_TB MPC131_TB BU244_TB
-# GLIBC241_TB ROOT + fail().
+# build tools). Requires the gate caller's ROOT, fail(), and stage0 td-builder exports.
 XTARGET=x86_64-pc-linux-gnu
 # The MODERN cross builds (binutils 2.44 / gcc 14 / glibc 2.41) parallelize safely — PLAN task #1
 # endorses -j for exactly these (keep the mesboot base serial). Override with X86_MAKE_J= for serial.
@@ -58,82 +58,86 @@ make_curated_path() {
   IFS=$oldifs; echo "$cdir"
 }
 
-# _x86_64_emit_cross — emit the i686 base (21 rungs) + the 4 cross rungs (binutils-x86-64 →
-# gcc-x86-64-stage1 → glibc-x86-64 → gcc-x86-64-stage2) recipe JSONs into the already-
-# `ladder_setup`'d $_lw. Locks are no longer written here (#429): `ladder_build` drives
-# `build-plan --auto`, which SYNTHESIZES each rung's lock straight from its recipe JSON's
-# declared `inputs`/`nativeInputs`/`sourceInput`. Shared by run_x86_64_cross (which then
-# builds gcc-x86-64-stage2) and run_x86_64_native (which appends the two native rungs).
-# Idempotent — re-emits the same JSON, so run_x86_64_native can call it after
-# run_x86_64_cross already did without disturbing the built graph.
-_x86_64_emit_cross() {
-  ladder_emit stage0 mes tcc make-mesboot0 patch-mesboot binutils-mesboot0 gcc-core-mesboot0 mesboot-headers glibc-mesboot0 gcc-mesboot0 binutils-mesboot1 make-mesboot gcc-mesboot1 binutils-mesboot gawk-mesboot glibc-mesboot gcc-mesboot glibc-mesboot-shared gcc-14 binutils-244 glibc-241 binutils-x86-64 gcc-x86-64-stage1 glibc-x86-64 gcc-x86-64-stage2 || return 1
+ensure_recipe_eval() {
+  if [ -n "${TD_RECIPE_EVAL:-}" ] && [ -x "$TD_RECIPE_EVAL" ]; then return 0; fi
+  command -v load_recipe_eval >/dev/null 2>&1 || . tests/cache-lib.sh
+  load_recipe_eval 2>/dev/null && return 0
+  sh tests/recipe-eval-tool.sh "$ROOT/.td-build-cache/recipe-eval" >/dev/null \
+    || { echo "could not build td-recipe-eval (tests/recipe-eval-tool.sh)" >&2; return 1; }
+  load_recipe_eval || { echo "no td-recipe-eval sentinel after recipe-eval-tool" >&2; return 1; }
 }
 
-# run_x86_64_cross — build the x86_64 CROSS toolchain via the recipe ladder (build-plan --auto), the
-# #378 slice-4 replacement for the deleted shell build_* rungs. The i686 base (21 rungs) AND the 4
+recipe_build_target() {
+  _rbt_target=$1; _rbt_out=$2; shift 2
+  ensure_recipe_eval || return 1
+  "$TD_RECIPE_EVAL" build-run "$_rbt_target" "$@" > "$_rbt_out" 2>&1 \
+    || { tail -40 "$_rbt_out" >&2; echo "recipe build-run $_rbt_target failed" >&2; return 1; }
+  cat "$_rbt_out"
+}
+
+recipe_build_target_preserve_work() {
+  _rbtp_work=$1; shift
+  (
+    export TD_RECIPE_CHECK_WORK="$_rbtp_work"
+    export TD_RECIPE_CHECK_PRESERVE_WORK=1
+    recipe_build_target "$@"
+  )
+}
+
+recipe_build_output() {
+  "$TB" text extract-prefix-last "TD_RECIPE_RUN_OUT $2 " "$1"
+}
+
+recipe_build_workdir() {
+  "$TB" text extract-prefix-last "TD_RECIPE_RUN_WORK " "$1"
+}
+
+# run_x86_64_cross — build the x86_64 CROSS toolchain via the Rust recipe runner
+# (`td-recipe-eval build-run`, which drives build-plan --auto). The i686 base (21 rungs) AND the 4
 # cross rungs (binutils-x86-64 → gcc-x86-64-stage1 → glibc-x86-64 → gcc-x86-64-stage2) are recipes;
-# one `ladder_build gcc-x86-64-stage2` realizes the whole graph (the warm ladder cache-hits the i686
-# base). The positional args (the old shell driver's cpath/gcc14/gst/…) are IGNORED — every rung
-# input is resolved from its lock — but kept so the gate call sites need no change. Exports the same
+# one target build realizes the whole graph. The positional args (the old shell driver's
+# cpath/gcc14/gst/…) are IGNORED — every rung input is resolved from the recipe graph — but kept so
+# the gate call sites need no change. Exports the same
 # vars run_x86_64_cross always did: XBU XGCC2
 # XGLIBC XLIBGCCDIR XSTDCXXDIR (the cross toolchain, for verify + closure + the native recipe).
 run_x86_64_cross() {
-  . tests/ladder-lib.sh
-  TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
-  if [ -n "$TD_CHECK_CHAIN_CACHE" ]; then _lw="$HOME/.td/build-daemon/ladder"; else _lw="$ROOT/.td-build-cache/ladder-cold"; fi
-  mkdir -p "`dirname "$_lw"`"
-  # STABLE sibling lock, taken before the cold wipe (the bootstrap-chain.sh #378-s3 fix); held for the
-  # body so a peer can't race the tail's _lo reads of build-*.out.
-  exec 9>"$_lw.lock"; flock 9 || { echo "ladder: flock failed" >&2; return 1; }
-  test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$_lw"
-  mkdir -p "$_lw"
-  ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
-  _x86_64_emit_cross || return 1
-  ladder_build gcc-x86-64-stage2 || { echo "the x86_64 cross toolchain ladder failed" >&2; return 1; }
+  _rbo=`mktemp`
+  recipe_build_target gcc-x86-64-stage2 "$_rbo" binutils-x86-64 gcc-x86-64-stage2 glibc-x86-64 \
+    || { rm -f "$_rbo"; echo "the x86_64 cross toolchain recipe build failed" >&2; return 1; }
   # Export ONLY the cross toolchain trees (run_x86_64_cross's contract, consumed by verify/closure/
   # native): binutils-x86-64, gcc-x86-64-stage2, glibc-x86-64. gcc-14/glibc-mesboot(-shared)/
   # binutils-244 are in the plan as build DEPS but are NOT exported — they were gate-locals for the
   # retired shell repro leg, and glibc-mesboot-shared isn't even in stage2's closure.
-  XBU=`ladder_out binutils-x86-64` || return 1
-  _b=`ladder_out gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
-  _b=`ladder_out glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
+  XBU=`recipe_build_output "$_rbo" binutils-x86-64` || { rm -f "$_rbo"; return 1; }
+  _b=`recipe_build_output "$_rbo" gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || { rm -f "$_rbo"; return 1; }
+  _b=`recipe_build_output "$_rbo" glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || { rm -f "$_rbo"; return 1; }
   XLIBGCCDIR=`x86_parent_of_first_named 'libgcc_s.so.1' "$XGCC2"` || return 1
   XSTDCXXDIR=`x86_parent_of_first_named 'libstdc++.so.6*' "$XGCC2"` || return 1
-  X86_WORK="$_lw"; X86_SYSROOT="$_lw/x-sysroot-unused"
-  export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR X86_WORK X86_SYSROOT
+  X86_WORK=`recipe_build_workdir "$_rbo"` || { rm -f "$_rbo"; return 1; }
+  rm -f "$_rbo"
+  X86_SYSROOT="$X86_WORK/x-sysroot-unused"
+  X86_CROSS_BUILT=1
+  export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR X86_WORK X86_SYSROOT X86_CROSS_BUILT
   echo "   [ladder] x86_64 cross toolchain via build-plan --auto: i686 base (21 rungs) -> cross binutils 2.44 -> gcc stage1 -> glibc 2.41 -> gcc stage2"
 }
 
-# run_x86_64_rust_toolchain — build the /td/store rust-toolchain via build-plan --auto (#410): the
-# cross ladder (_x86_64_emit_cross) + the zlib-x86-64 + rust-toolchain rungs on top. rust-toolchain's
-# transitive closure IS the cross toolchain, so one `ladder_build rust-toolchain` realizes the whole graph
-# (the warm chain cache-hits the cross rungs). Same preamble as run_x86_64_cross; exports the cross trees
-# (XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR) AND the relinked rustc/cargo tree XRUSTTREE. Called by the
-# future recipe-owned daily rust-toolchain coverage.
+# run_x86_64_rust_toolchain — build the /td/store rust-toolchain via the Rust recipe runner (#410).
+# The rust-toolchain recipe's transitive closure includes the cross toolchain and zlib-x86-64, so one
+# target build realizes the whole graph. Exports the cross trees (XBU XGCC2 XGLIBC
+# XLIBGCCDIR XSTDCXXDIR) AND the relinked rustc/cargo tree XRUSTTREE.
 run_x86_64_rust_toolchain() {
-  . tests/ladder-lib.sh
-  TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
-  if [ -n "$TD_CHECK_CHAIN_CACHE" ]; then _lw="$HOME/.td/build-daemon/ladder"; else _lw="$ROOT/.td-build-cache/ladder-cold"; fi
-  mkdir -p "`dirname "$_lw"`"
-  exec 9>"$_lw.lock"; flock 9 || { echo "ladder: flock failed" >&2; return 1; }
-  test -n "$TD_CHECK_CHAIN_CACHE" || rm -rf "$_lw"
-  mkdir -p "$_lw"
-  ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
-  _x86_64_emit_cross || return 1
-  # rust/zlib sources are NOT in the base ladder_setup spec set — intern them now (idempotent),
-  # so the zlib/rust rungs' synthesized locks resolve their declared sourceInput.
-  ladder_intern_extra rust-toolchain-source rust-1.96.0 || return 1
-  ladder_intern_extra zlib-x86-64-source zlib-1.3.1 || return 1
-  ladder_emit zlib-x86-64 rust-toolchain || return 1
-  ladder_build rust-toolchain || { echo "the x86_64 rust-toolchain ladder failed" >&2; return 1; }
-  XBU=`ladder_out binutils-x86-64` || return 1
-  _b=`ladder_out gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || return 1
-  _b=`ladder_out glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || return 1
+  _rbo=`mktemp`
+  recipe_build_target rust-toolchain "$_rbo" binutils-x86-64 gcc-x86-64-stage2 glibc-x86-64 rust-toolchain \
+    || { rm -f "$_rbo"; echo "the x86_64 rust-toolchain recipe build failed" >&2; return 1; }
+  XBU=`recipe_build_output "$_rbo" binutils-x86-64` || { rm -f "$_rbo"; return 1; }
+  _b=`recipe_build_output "$_rbo" gcc-x86-64-stage2` && XGCC2="$_b/stage/td/store/gcc-14.3.0-x86_64" || { rm -f "$_rbo"; return 1; }
+  _b=`recipe_build_output "$_rbo" glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || { rm -f "$_rbo"; return 1; }
   XLIBGCCDIR=`x86_parent_of_first_named 'libgcc_s.so.1' "$XGCC2"` || return 1
   XSTDCXXDIR=`x86_parent_of_first_named 'libstdc++.so.6*' "$XGCC2"` || return 1
-  XRUSTTREE=`ladder_out rust-toolchain` || return 1
-  X86_WORK="$_lw"; X86_SYSROOT="$_lw/x-sysroot-unused"
+  XRUSTTREE=`recipe_build_output "$_rbo" rust-toolchain` || { rm -f "$_rbo"; return 1; }
+  X86_WORK=`recipe_build_workdir "$_rbo"` || { rm -f "$_rbo"; return 1; }
+  rm -f "$_rbo"
+  X86_SYSROOT="$X86_WORK/x-sysroot-unused"
   export XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR XRUSTTREE X86_WORK X86_SYSROOT
   echo "   [ladder] x86_64 rust-toolchain via build-plan --auto: cross toolchain -> zlib-x86-64 -> rust-toolchain (relinked rustc/cargo tree $XRUSTTREE)"
 }
@@ -246,47 +250,31 @@ verify_x86_64_ownroot() {
 # (a from-source gcc-rebuilds-gcc bootstrap is a separate, much heavier milestone, not claimed here).
 # ---------------------------------------------------------------------------------------------------
 
-# run_x86_64_native — build the NATIVE x86_64 binutils 2.44 + gcc 14.3.0 via the recipe ladder
+# run_x86_64_native — build the NATIVE x86_64 binutils 2.44 + gcc 14.3.0 via the Rust recipe runner
 # (build-plan --auto over binutils-x86-64-native → gcc-x86-64-native), the retirement of the
-# `toolchain-recipe x86_64-native` imperative Rust path (builder/src/toolchain_x86_64.rs). The two
-# native rungs are appended to the SAME base+cross ladder run_x86_64_cross builds, so on the from-seed
-# native gate — where x86_64_obtain_cross_toolchain already ran run_x86_64_cross into $_lw — the cross
-# graph cache-hits and only the two native rungs build; on the fetched-cross MISS-native path (no prior
-# cross build in $_lw) build-plan realizes the whole graph from the seed (directive 1). It does NOT
-# re-wipe $_lw — the cold-slate wipe is run_x86_64_cross's alone, so appending native never throws away
-# obtain_cross's just-built cross toolchain. Sets + exports XNBU (native binutils tree) and XNGCC
-# (native gcc staged prefix) from the ladder outputs, exactly as the deleted x86_64_build_native_recipe
-# did, so verify_x86_64_native_ownroot / the closure-export consume them unchanged. The native gcc is
+# `toolchain-recipe x86_64-native` imperative Rust path (builder/src/toolchain_x86_64.rs). Sets +
+# exports XNBU (native binutils tree), XNGCC (native gcc staged prefix), and the x86_64 glibc tree from
+# the same build-run output, so a forced-cold native build cannot leave XGLIBC pointing at a wiped prior
+# cross workdir. The native gcc is
 # NOT byte-reproducible (trust = the input-addressed lock name + the substitute signature), so this is
 # a build+behavioral rung, not a bootstrap::Recipe repro rung.
 run_x86_64_native() {
-  # td-recipe-eval drives ladder_emit — self-load it (the bootstrap-chain.sh pattern). run_x86_64_cross
-  # inherits TD_RECIPE_EVAL from the check prelude on its cross-BUILD path, but the native build is
-  # reached on the cross-FETCH path too (run_x86_64_cross skipped), where the prelude's export may be
-  # absent; ensure it here so build-plan can emit the rung recipes.
-  command -v load_recipe_eval >/dev/null 2>&1 || . tests/cache-lib.sh
-  load_recipe_eval 2>/dev/null || {
-    sh tests/recipe-eval-tool.sh "$ROOT/.td-build-cache/recipe-eval" >/dev/null \
-      || { echo "run_x86_64_native: could not build td-recipe-eval (tests/recipe-eval-tool.sh)" >&2; return 1; }
-    load_recipe_eval || { echo "run_x86_64_native: no td-recipe-eval sentinel after recipe-eval-tool" >&2; return 1; }
-  }
-  . tests/ladder-lib.sh
-  TD_CHECK_CHAIN_CACHE="${TD_CHECK_CHAIN_CACHE-${HOME:+$HOME/.td/build-daemon/chain}}"
-  if [ -n "$TD_CHECK_CHAIN_CACHE" ]; then _lw="$HOME/.td/build-daemon/ladder"; else _lw="$ROOT/.td-build-cache/ladder-cold"; fi
-  mkdir -p "`dirname "$_lw"`"
-  exec 9>"$_lw.lock"; flock 9 || { echo "ladder: flock failed" >&2; return 1; }
-  # NO cold wipe here (run_x86_64_cross owns it): appending the native rungs must not discard the
-  # cross toolchain obtain_cross already built into $_lw. ladder_setup is idempotent/self-healing.
-  mkdir -p "$_lw"
-  ladder_setup "$_lw" || { echo "ladder_setup failed" >&2; return 1; }
-  _x86_64_emit_cross || return 1
-  ladder_emit binutils-x86-64-native gcc-x86-64-native || return 1
-  ladder_build gcc-x86-64-native || { echo "the x86_64 native toolchain ladder failed" >&2; return 1; }
-  XNBU=`ladder_out binutils-x86-64-native` || return 1
-  _b=`ladder_out gcc-x86-64-native` && XNGCC="$_b/stage/td/store/gcc-14.3.0-x86_64-native" || return 1
+  _rbo=`mktemp`
+  if [ "${X86_CROSS_BUILT:-0}" = 1 ] && [ -n "${X86_WORK:-}" ]; then
+    recipe_build_target_preserve_work "$X86_WORK" gcc-x86-64-native "$_rbo" binutils-x86-64-native gcc-x86-64-native glibc-x86-64 \
+      || { rm -f "$_rbo"; echo "the x86_64 native toolchain recipe build failed" >&2; return 1; }
+  else
+    recipe_build_target gcc-x86-64-native "$_rbo" binutils-x86-64-native gcc-x86-64-native glibc-x86-64 \
+      || { rm -f "$_rbo"; echo "the x86_64 native toolchain recipe build failed" >&2; return 1; }
+  fi
+  XNBU=`recipe_build_output "$_rbo" binutils-x86-64-native` || { rm -f "$_rbo"; return 1; }
+  _b=`recipe_build_output "$_rbo" gcc-x86-64-native` && XNGCC="$_b/stage/td/store/gcc-14.3.0-x86_64-native" || { rm -f "$_rbo"; return 1; }
+  _b=`recipe_build_output "$_rbo" glibc-x86-64` && XGLIBC="$_b/stage/td/store/glibc-2.41-x86_64" || { rm -f "$_rbo"; return 1; }
+  rm -f "$_rbo"
   test -n "$XNBU" -a -d "$XNBU" || { echo "run_x86_64_native: no native binutils tree ($XNBU)" >&2; return 1; }
   test -n "$XNGCC" -a -d "$XNGCC" || { echo "run_x86_64_native: no native gcc tree ($XNGCC)" >&2; return 1; }
-  export XNBU XNGCC
+  test -n "$XGLIBC" -a -d "$XGLIBC" || { echo "run_x86_64_native: no x86_64 glibc tree ($XGLIBC)" >&2; return 1; }
+  export XNBU XNGCC XGLIBC
   echo "   [ladder] x86_64 NATIVE toolchain via build-plan --auto: cross graph -> native binutils 2.44 -> native gcc 14.3.0 (ELF64 x86_64)"
 }
 
@@ -398,12 +386,16 @@ PROBE
 x86_64_obtain_cross_toolchain() {
   _occp=$1; _occstore=$2; _occdb=$3
   if x86_64_resolve_closure "$_occstore" "$_occdb"; then
+    X86_CROSS_BUILT=0
+    export X86_CROSS_BUILT
     echo ">> [subst/SKIP] fetched the x86_64 cross toolchain closure {binutils,gcc,glibc} — SKIPPED the ~98-min from-seed build"
   else
     echo ">> [subst/MISS] no exposed substitute store — building the cross toolchain from the 229-byte seed (directive 1)"
     # i686 base (21 rungs) + the 4 cross rungs are recipes (#378 slice 4); run_x86_64_cross drives
     # the whole graph via build-plan --auto and exports XBU XGCC2 XGLIBC XLIBGCCDIR XSTDCXXDIR.
     run_x86_64_cross "$_occp" || fail "the x86_64 cross toolchain (recipe ladder) failed to build from the seed"
+    X86_CROSS_BUILT=1
+    export X86_CROSS_BUILT
   fi
   test -n "${XGCC2:-}" -a -n "${XGLIBC:-}" -a -n "${XBU:-}" || fail "cross toolchain vars unset after fetch/build"
 }
