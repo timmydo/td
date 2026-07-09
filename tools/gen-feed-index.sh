@@ -59,20 +59,26 @@ for lock in "$root"/tests/*.lock; do
   emit "$path" "$url" "$sha"
   nblob=$((nblob+1))
 done
-eval_bin=${TD_RECIPE_EVAL:-}
-if test -z "$eval_bin"; then
-  eval_bin=`sh "$root/tests/recipe-eval-tool.sh" "$root/.td-build-cache/recipe-eval"` \
-    || { echo "gen-feed-index: could not build td-recipe-eval from the current worktree" >&2; exit 1; }
-fi
+eval_bin=`sh "$root/tests/recipe-eval-tool.sh" "$root/.td-build-cache/recipe-eval"` \
+  || { echo "gen-feed-index: could not build td-recipe-eval from the current worktree" >&2; exit 1; }
 test -x "$eval_bin" || { echo "gen-feed-index: td-recipe-eval is not executable: $eval_bin" >&2; exit 1; }
-while read -r key url sha file; do
-  test -n "$key" -a -n "$url" -a -n "$sha" -a -n "$file" || continue
+source_pins=`"$eval_bin" source-pins` \
+  || { echo "gen-feed-index: td-recipe-eval source-pins failed" >&2; exit 1; }
+test -n "$source_pins" || { echo "gen-feed-index: td-recipe-eval source-pins returned no pins" >&2; exit 1; }
+npin=0
+while read -r key url sha file extra; do
+  test -n "$key" -a -n "$url" -a -n "$sha" -a -n "$file" \
+    || { echo "gen-feed-index: malformed source pin line from td-recipe-eval" >&2; exit 1; }
+  test -z "$extra" \
+    || { echo "gen-feed-index: source pin line has extra fields: $key" >&2; exit 1; }
   path=$(printf '%s' "$url" | sed -E 's,^https?://,,')
   emit "$path" "$url" "$sha"
   nblob=$((nblob+1))
+  npin=$((npin+1))
 done <<EOF
-`"$eval_bin" source-pins`
+$source_pins
 EOF
+test "$npin" -gt 0 || { echo "gen-feed-index: no recipe source pins emitted" >&2; exit 1; }
 
 # --- write the pinned index (sorted, deduped) ------------------------------------------
 {

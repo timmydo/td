@@ -977,49 +977,33 @@ fn parse_source_pins(text: &str) -> Result<Vec<SourcePin>, String> {
             file: file.to_string(),
         });
     }
+    if pins.is_empty() {
+        return Err("td-recipe-eval source-pins returned no pins".into());
+    }
     Ok(pins)
 }
 
-fn recipe_source_pins(root: &Path) -> Vec<SourcePin> {
-    match recipe_source_pins_result(root) {
-        Ok(pins) => pins,
-        Err(e) => {
-            eprintln!(">> td-feed warm sources: cannot read recipe source pins: {e}");
-            Vec::new()
-        }
-    }
-}
-
 fn recipe_source_pins_result(root: &Path) -> Result<Vec<SourcePin>, String> {
-    let out = if let Some(eval) = std::env::var_os("TD_RECIPE_EVAL").filter(|v| !v.is_empty()) {
-        let eval = PathBuf::from(eval);
-        if !is_executable_file(&eval) {
-            return Err(format!(
-                "TD_RECIPE_EVAL is not an executable file: {}",
-                eval.display()
-            ));
-        }
-        Command::new(&eval)
-            .arg("source-pins")
-            .current_dir(root)
-            .output()
-            .map_err(|e| format!("spawn {} source-pins: {e}", eval.display()))?
-    } else {
-        Command::new("cargo")
-            .arg("run")
-            .arg("--quiet")
-            .arg("--manifest-path")
-            .arg("recipes/Cargo.toml")
-            .arg("--target-dir")
-            .arg(root.join(".td-build-cache/recipe-source-pins/target"))
-            .arg("--bin")
-            .arg("td-recipe-eval")
-            .arg("--")
-            .arg("source-pins")
-            .current_dir(root)
-            .output()
-            .map_err(|e| format!("spawn cargo run td-recipe-eval source-pins: {e}"))?
-    };
+    if !root.join("recipes/Cargo.toml").is_file() {
+        return Err(format!(
+            "no recipes/Cargo.toml under {} to resolve recipe source pins",
+            root.display()
+        ));
+    }
+    let out = Command::new("cargo")
+        .arg("run")
+        .arg("--quiet")
+        .arg("--manifest-path")
+        .arg("recipes/Cargo.toml")
+        .arg("--target-dir")
+        .arg(root.join(".td-build-cache/recipe-source-pins/target"))
+        .arg("--bin")
+        .arg("td-recipe-eval")
+        .arg("--")
+        .arg("source-pins")
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("spawn cargo run td-recipe-eval source-pins: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "td-recipe-eval source-pins failed\nstdout:\n{}\nstderr:\n{}",
@@ -1038,13 +1022,6 @@ fn strip_scheme(url: &str) -> String {
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url)
         .to_string()
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 /// The shared feed `(addr, store)` if TD_FEED_BASE is set (the loop prelude runs
@@ -1067,19 +1044,14 @@ fn shared_feed() -> Option<(String, PathBuf)> {
 /// .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates, then produce the i386
 /// + x86_64 Linux UAPI headers. Prefers the shared feed (TD_FEED_BASE), else a direct GET.
 /// td OWNS the fetch (no guix-as-fetcher); each tarball is verified against its recipe sha256.
-fn warm_sources(root: &Path) {
-    let pins = recipe_source_pins(root);
+fn warm_sources(root: &Path) -> Result<(), String> {
+    let pins = recipe_source_pins_result(root)?;
     let dest = root.join(".td-build-cache/sources");
     if pins.is_empty() {
-        return;
+        return Err("td-recipe-eval source-pins returned no pins".into());
     }
-    if std::fs::create_dir_all(&dest).is_err() {
-        eprintln!(
-            ">> td-feed warm sources: could not create {}",
-            dest.display()
-        );
-        return;
-    }
+    std::fs::create_dir_all(&dest)
+        .map_err(|e| format!("create {}: {e}", dest.display()))?;
 
     let feed = shared_feed();
     if let Some((addr, store)) = &feed {
@@ -1137,6 +1109,7 @@ fn warm_sources(root: &Path) {
     // pinned linux source (the sandbox can't run the kernel build). Both lanes, best-effort.
     warm_kernel_headers_from_pins(root, "i386", &pins);
     warm_kernel_headers_from_pins(root, "x86_64", &pins);
+    Ok(())
 }
 
 /// `LINUX_VERSION_CODE` for a `maj.min.sub` version (e.g. 4.14.67 -> 265795).
@@ -1197,8 +1170,12 @@ fn extract_xz_tar(src: &Path, dest: &Path) -> bool {
 /// .td-build-cache/sources/linux-headers-<ver>-<ARCH>.tar.gz (+ a hand-written version.h).
 /// guix ships a prebuilt header BLOB; td produces the same headers FROM canonical source.
 fn warm_kernel_headers(root: &Path, arch: &str) {
-    let pins = recipe_source_pins(root);
-    warm_kernel_headers_from_pins(root, arch, &pins);
+    match recipe_source_pins_result(root) {
+        Ok(pins) => warm_kernel_headers_from_pins(root, arch, &pins),
+        Err(e) => eprintln!(
+            ">> td-feed warm kernel-headers ({arch}): cannot read recipe source pins: {e}"
+        ),
+    }
 }
 
 fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
@@ -1293,6 +1270,9 @@ fn warm_selftest() {
     }
     if parse_source_pins("garbage\nno fields here\n").is_ok() {
         die("warm-selftest: parse_source_pins accepted malformed TSV".into());
+    }
+    if parse_source_pins("").is_ok() {
+        die("warm-selftest: parse_source_pins accepted an empty source-pin set".into());
     }
     if strip_scheme("https://h/p") != "h/p" || strip_scheme("http://h/p") != "h/p" {
         die("warm-selftest: strip_scheme wrong".into());
@@ -1550,7 +1530,11 @@ fn main() {
                 Some("crate") if a.len() == 5 => warm_crate(&root, &a[3], &a[4], &a[3]),
                 Some("crate") if a.len() == 6 => warm_crate(&root, &a[3], &a[4], &a[5]),
                 Some("crate-local") if a.len() == 5 => warm_crate_local(&root, &a[3], &a[4]),
-                Some("sources") if a.len() == 3 => warm_sources(&root),
+                Some("sources") if a.len() == 3 => {
+                    if let Err(e) = warm_sources(&root) {
+                        die(format!("warm sources: {e}"));
+                    }
+                }
                 Some("kernel-headers") if a.len() == 4 => warm_kernel_headers(&root, &a[3]),
                 // Legacy: `warm INDEX STORE` (a[2] is an index path, not an action keyword).
                 // Exclude every action keyword so a mis-argc'd action (e.g. `warm crate X`)
