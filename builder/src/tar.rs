@@ -4,6 +4,8 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 const BLOCK: usize = 512;
+const MAX_TAR_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_GNU_LONG_FIELD_BYTES: u64 = 1024 * 1024;
 
 pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
     let mut file = File::open(tar).map_err(|e| format!("open {}: {e}", tar.display()))?;
@@ -42,6 +44,7 @@ pub fn extract_tar_reader<R: Read>(
             .map_err(|e| format!("validate tar header from {source_name}: {e}"))?;
 
         let mut entry = Entry::parse(&header)?;
+        validate_entry_size(&entry)?;
         match &entry.kind {
             EntryKind::LongName => {
                 pending_path =
@@ -247,6 +250,41 @@ fn validate_header_checksum(header: &[u8; BLOCK]) -> Result<(), String> {
         return Err(format!(
             "tar header checksum mismatch: stored {stored:o}, computed {computed:o}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_entry_size(entry: &Entry) -> Result<(), String> {
+    match &entry.kind {
+        EntryKind::Regular => {
+            if entry.size > MAX_TAR_ENTRY_BYTES {
+                return Err(format!(
+                    "tar entry {} is too large: {} bytes exceeds {} byte limit",
+                    entry.path.display(),
+                    entry.size,
+                    MAX_TAR_ENTRY_BYTES
+                ));
+            }
+        }
+        EntryKind::LongName | EntryKind::LongLink => {
+            if entry.size > MAX_GNU_LONG_FIELD_BYTES {
+                return Err(format!(
+                    "GNU tar long-name field {} is too large: {} bytes exceeds {} byte limit",
+                    entry.path.display(),
+                    entry.size,
+                    MAX_GNU_LONG_FIELD_BYTES
+                ));
+            }
+        }
+        EntryKind::Directory | EntryKind::Hardlink { .. } | EntryKind::Symlink { .. } => {
+            if entry.size != 0 {
+                return Err(format!(
+                    "tar entry {} of this type must not carry {} data bytes",
+                    entry.path.display(),
+                    entry.size
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -467,6 +505,60 @@ mod tests {
 
         assert!(err.contains("checksum mismatch"));
         assert!(!out.join("File").exists());
+    }
+
+    #[test]
+    fn refuses_oversized_regular_entry_before_writing() {
+        let tmp = temp_dir("td-tar-oversized-regular-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "huge", b'0', 0o644, MAX_TAR_ENTRY_BYTES + 1, "");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("oversized entry should fail");
+
+        assert!(err.contains("too large"), "got: {err}");
+        assert!(!out.join("huge").exists());
+    }
+
+    #[test]
+    fn refuses_oversized_gnu_long_name_before_allocating() {
+        let tmp = temp_dir("td-tar-oversized-long-name-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_header(
+            &mut bytes,
+            "././@LongLink",
+            b'L',
+            0o644,
+            MAX_GNU_LONG_FIELD_BYTES + 1,
+            "",
+        );
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("oversized long name should fail");
+
+        assert!(err.contains("long-name field"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_data_payload_on_links_and_directories() {
+        let tmp = temp_dir("td-tar-link-size-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "link", b'2', 0o777, 1, "target");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("symlink payload should fail");
+
+        assert!(err.contains("must not carry 1 data bytes"), "got: {err}");
+        assert!(!out.join("link").exists());
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

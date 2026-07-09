@@ -8,6 +8,8 @@ use std::io::Read;
 use std::path::Path;
 
 const MAX_BITS: usize = 15;
+const MAX_GZIP_INPUT_BYTES: u64 = 257 * 1024 * 1024;
+const MAX_GZIP_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
 const LENGTH_BASE: [usize; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
@@ -29,14 +31,46 @@ const CODE_LENGTH_ORDER: [usize; 19] = [
 ];
 
 pub fn decompress_file(path: &Path) -> Result<Vec<u8>, String> {
-    let mut input = Vec::new();
-    File::open(path)
-        .and_then(|mut f| f.read_to_end(&mut input))
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    if len > MAX_GZIP_INPUT_BYTES {
+        return Err(format!(
+            "gzip input {} is too large: {len} bytes exceeds {} byte limit",
+            path.display(),
+            MAX_GZIP_INPUT_BYTES
+        ));
+    }
+    let cap =
+        usize::try_from(len).map_err(|_| "gzip input length did not fit usize".to_string())?;
+    let mut input = Vec::with_capacity(cap);
+    let mut limited = file.take(
+        MAX_GZIP_INPUT_BYTES
+            .checked_add(1)
+            .ok_or_else(|| "gzip input limit overflow".to_string())?,
+    );
+    limited
+        .read_to_end(&mut input)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let read_len =
+        u64::try_from(input.len()).map_err(|_| "gzip input length did not fit u64".to_string())?;
+    if read_len > MAX_GZIP_INPUT_BYTES {
+        return Err(format!(
+            "gzip input {} grew past {} byte limit while reading",
+            path.display(),
+            MAX_GZIP_INPUT_BYTES
+        ));
+    }
     decompress_bytes(&input).map_err(|e| format!("decompress {}: {e}", path.display()))
 }
 
 pub fn decompress_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
+    decompress_bytes_with_limit(input, MAX_GZIP_OUTPUT_BYTES)
+}
+
+fn decompress_bytes_with_limit(input: &[u8], max_output_bytes: usize) -> Result<Vec<u8>, String> {
     if input.is_empty() {
         return Err("empty gzip stream".to_string());
     }
@@ -47,7 +81,10 @@ pub fn decompress_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
         let payload = range_from(input, payload_start)?;
         let mut bits = BitReader::new(payload);
         let mut member = Vec::new();
-        inflate(&mut bits, &mut member)?;
+        let remaining = max_output_bytes
+            .checked_sub(out.len())
+            .ok_or_else(|| "gzip output exceeded configured limit".to_string())?;
+        inflate(&mut bits, &mut member, remaining)?;
         let trailer_pos = payload_start
             .checked_add(bits.byte_position())
             .ok_or_else(|| "gzip member offset overflow".to_string())?;
@@ -60,12 +97,19 @@ pub fn decompress_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
                 "gzip CRC mismatch: got {got_crc:08x}, want {want_crc:08x}"
             ));
         }
-        let got_size = u32::try_from(member.len() & 0xffff_ffff)
+        let got_size = u32::try_from(member.len())
             .map_err(|_| "gzip member size did not fit u32".to_string())?;
         if got_size != want_size {
             return Err(format!(
                 "gzip size mismatch: got {got_size}, want {want_size}"
             ));
+        }
+        let new_len = out
+            .len()
+            .checked_add(member.len())
+            .ok_or_else(|| "gzip output length overflow".to_string())?;
+        if new_len > max_output_bytes {
+            return Err(format!("gzip output exceeds {max_output_bytes} byte limit"));
         }
         out.extend_from_slice(&member);
         pos = trailer_pos
@@ -121,18 +165,22 @@ fn parse_gzip_header(input: &[u8], start: usize) -> Result<usize, String> {
     Ok(pos)
 }
 
-fn inflate(bits: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), String> {
+fn inflate(
+    bits: &mut BitReader<'_>,
+    out: &mut Vec<u8>,
+    max_output_bytes: usize,
+) -> Result<(), String> {
     loop {
         let final_block = bits.read_bits(1)? != 0;
         match bits.read_bits(2)? {
-            0 => inflate_stored(bits, out)?,
+            0 => inflate_stored(bits, out, max_output_bytes)?,
             1 => {
                 let (lit, dist) = fixed_trees()?;
-                inflate_huffman(bits, out, &lit, &dist)?;
+                inflate_huffman(bits, out, &lit, &dist, max_output_bytes)?;
             }
             2 => {
                 let (lit, dist) = dynamic_trees(bits)?;
-                inflate_huffman(bits, out, &lit, &dist)?;
+                inflate_huffman(bits, out, &lit, &dist, max_output_bytes)?;
             }
             _ => return Err("reserved DEFLATE block type".to_string()),
         }
@@ -143,7 +191,11 @@ fn inflate(bits: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
-fn inflate_stored(bits: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), String> {
+fn inflate_stored(
+    bits: &mut BitReader<'_>,
+    out: &mut Vec<u8>,
+    max_output_bytes: usize,
+) -> Result<(), String> {
     bits.align_to_byte();
     let len = bits.read_aligned_u16()?;
     let nlen = bits.read_aligned_u16()?;
@@ -151,7 +203,8 @@ fn inflate_stored(bits: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), Str
         return Err("stored DEFLATE block length check failed".to_string());
     }
     for _ in 0..usize::from(len) {
-        out.push(bits.read_aligned_u8()?);
+        let b = bits.read_aligned_u8()?;
+        push_output(out, b, max_output_bytes)?;
     }
     Ok(())
 }
@@ -161,20 +214,21 @@ fn inflate_huffman(
     out: &mut Vec<u8>,
     lit: &Huffman,
     dist: &Huffman,
+    max_output_bytes: usize,
 ) -> Result<(), String> {
     loop {
         let sym = lit.decode(bits)?;
         match sym {
             0..=255 => {
                 let byte = u8::try_from(sym).map_err(|_| "literal did not fit u8".to_string())?;
-                out.push(byte);
+                push_output(out, byte, max_output_bytes)?;
             }
             256 => break,
             257..=285 => {
                 let len = decode_length(sym, bits)?;
                 let dist_sym = dist.decode(bits)?;
                 let distance = decode_distance(dist_sym, bits)?;
-                copy_match(out, distance, len)?;
+                copy_match(out, distance, len, max_output_bytes)?;
             }
             _ => return Err(format!("invalid DEFLATE literal/length symbol {sym}")),
         }
@@ -316,9 +370,29 @@ fn decode_distance(sym: u16, bits: &mut BitReader<'_>) -> Result<usize, String> 
     Ok(base + usize::from(bits.read_bits(extra)?))
 }
 
-fn copy_match(out: &mut Vec<u8>, distance: usize, len: usize) -> Result<(), String> {
+fn push_output(out: &mut Vec<u8>, byte: u8, max_output_bytes: usize) -> Result<(), String> {
+    if out.len() >= max_output_bytes {
+        return Err(format!("gzip output exceeds {max_output_bytes} byte limit"));
+    }
+    out.push(byte);
+    Ok(())
+}
+
+fn copy_match(
+    out: &mut Vec<u8>,
+    distance: usize,
+    len: usize,
+    max_output_bytes: usize,
+) -> Result<(), String> {
     if distance == 0 || distance > out.len() {
         return Err(format!("invalid DEFLATE distance {distance}"));
+    }
+    let new_len = out
+        .len()
+        .checked_add(len)
+        .ok_or_else(|| "DEFLATE output length overflow".to_string())?;
+    if new_len > max_output_bytes {
+        return Err(format!("gzip output exceeds {max_output_bytes} byte limit"));
     }
     for _ in 0..len {
         let src = out
@@ -635,6 +709,22 @@ mod tests {
         gz[21] ^= 0xff;
         let err = decompress_bytes(&gz).unwrap_err();
         assert!(err.contains("CRC mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn output_limit_errors_before_inflating_past_bound() {
+        let gz = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x01, 0x06, 0x00, 0xf9,
+            0xff, b'h', b'e', b'l', b'l', b'o', b'\n', 0x20, 0x30, 0x3a, 0x36, 0x06, 0x00, 0x00,
+            0x00,
+        ];
+
+        let err = decompress_bytes_with_limit(&gz, 5).unwrap_err();
+
+        assert!(
+            err.contains("gzip output exceeds 5 byte limit"),
+            "got: {err}"
+        );
     }
 
     fn hex_bytes(hex: &str) -> Vec<u8> {
