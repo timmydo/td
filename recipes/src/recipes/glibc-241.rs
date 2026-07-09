@@ -101,7 +101,7 @@ pub fn recipe() -> Recipe {
         .env("SHELL", SH)
         .env("LD_LIBRARY_PATH", "{in:glibc-mesboot-shared}/lib"),
     );
-    // FINALIZE (was bootstrap_modern_toolchain's brick-8 epilogue): relocate
+    // FINALIZE (was the shell bootstrap chain's brick-8 epilogue): relocate
     // every GNU ld script under lib/*.so from absolute member paths to bare
     // names (ld finds them via -L); real ELFs and absent scripts are skipped.
     steps.push(relocate_ld_scripts(stage, "/td/store/glibc-2.41"));

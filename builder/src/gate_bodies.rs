@@ -1813,9 +1813,9 @@ fn is_executable_file(path: &Path) -> bool {
 /// coverage (every recipe emits valid, round-tripping JSON) and
 /// discrimination (a mismatch is not vacuously accepted) legs are `#[test]`s
 /// in the `recipes` crate itself (`catalog::tests`, `td-recipe-eval::tests`)
-/// — `cargo test` below is what runs them; this function only additionally
-/// smokes the RELEASE binary's `list`/`emit` entry points (the CLI surface a
-/// live consumer, `ladder-lib.sh`'s `ladder_emit`, actually spawns).
+/// — `cargo test` below is what runs them; this function additionally smokes
+/// representative RELEASE binary argv dispatch, including the `build-run`
+/// surface used by the x86_64 gates.
 fn recipe_rs(root: &Path) -> Result<(), String> {
     println!(
         ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent (rust-recipe-surface)"
@@ -1889,8 +1889,6 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     // dispatch doesn't branch per-stem, so one representative stem is enough
     // to prove it — looping over the whole catalog here would just re-run
     // `cargo test`'s own per-recipe assertion via a slower subprocess path.
-    // `emit` is also the one subcommand a live consumer (ladder-lib.sh's
-    // `ladder_emit`) actually spawns, so it's the entry point worth smoking.
     println!(">> CLI smoke: the release td-recipe-eval binary's list/emit subcommands work");
     let list_out = run_out(&eval_s, &["list"], "td-recipe-eval list")?;
     let first = list_out
@@ -1902,6 +1900,25 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
         return Err(format!("FAIL: emit {first} produced no JSON"));
     }
     println!("   ok: list/emit {first} produced JSON via the release binary");
+
+    let bad_build = Command::new(&eval)
+        .args(["build-run", "not-a-recipe"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("FAIL: cannot spawn td-recipe-eval build-run smoke: {e}"))?;
+    if bad_build.status.success() {
+        return Err(
+            "FAIL: td-recipe-eval build-run unknown-target smoke unexpectedly succeeded"
+                .to_string(),
+        );
+    }
+    let bad_err = String::from_utf8_lossy(&bad_build.stderr);
+    if !bad_err.contains("unknown recipe stem 'not-a-recipe'") {
+        return Err(format!(
+            "FAIL: td-recipe-eval build-run unknown-target smoke did not reach the build-run dispatch: {bad_err}"
+        ));
+    }
+    println!("   ok: build-run dispatch rejects an unknown target before setup");
 
     let _ = std::fs::remove_dir_all(&scratch);
     println!(

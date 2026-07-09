@@ -14,6 +14,9 @@
 //!   check-run STEM [pr|daily|all] [INDEX]
 //!                         run one recipe-owned package check through the Rust
 //!                         runner instead of sourcing tests/ ladder helpers
+//!   build-run TARGET [OUTPUT_STEM ...]
+//!                         build a catalog target through the same Rust recipe
+//!                         runner and print machine-readable local output paths
 //! This is the loop tool the `recipe-rs` gate drives AND the corpus consumer
 //! entry (replacing `ts-emit` on the boa path). (The system-spec subcommands —
 //! list-specs/emit-spec/verify-spec — were retired with the guix-system museum
@@ -135,7 +138,13 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run ..."),
+        Some("build-run") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::build_cli(rest) {
+                die(&e);
+            }
+        }
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run ..."),
     }
 }
 
@@ -174,6 +183,12 @@ mod tests {
             assert!(!script.contains(". tests/ladder-lib.sh"));
             assert!(!script.contains(". tests/x86_64-cross-fns.sh"));
         }
+    }
+
+    #[test]
+    fn build_run_rejects_unknown_targets_before_setup() {
+        let err = check_runner::build_cli(&["not-a-recipe".to_string()]).unwrap_err();
+        assert!(err.contains("unknown recipe stem 'not-a-recipe'"));
     }
 
     // The `recipe-rs` gate's (A) coverage leg (formerly tests/recipe-rs.sh, driven

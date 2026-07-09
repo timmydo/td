@@ -1828,17 +1828,16 @@ mod tests {
         //
         // #397 lowered these floors: the 25 duplicate per-rung `bootstrap-<rung>.sh`
         // shell gates were retired (24 Daily + 1 Heavy — `bootstrap-cc`, the only one
-        // of the 25 in the Heavy pool) — their `build_*` ladders were 80-95% duplicate
-        // of `tests/bootstrap-chain.sh`'s `bootstrap_modern_toolchain()`, which already
-        // builds the whole 20-rung toolchain via one recipe-graph call, and
-        // the remaining recipe-owned daily checks and chain gates are the surviving
-        // coverage. Floors are set to the EXACT post-retirement counts
+        // of the 25 in the Heavy pool). The shell-helper cleanup then removed the
+        // compatibility-only chain-cache gate; recipe-owned daily checks and the x86_64
+        // gates are the surviving recipe-graph coverage. Floors are set to the EXACT
+        // post-retirement counts
         // (zero headroom, matching the pre-#397 convention: 19/32/51 were exact matches
         // too) — these guard against ACCIDENTAL loss, so slack beyond the deliberate
         // retirement just lets a future PR silently drop more gates unnoticed.
-        assert!(heavy.len() >= 17, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
+        assert!(heavy.len() >= 16, "heavy (PR) pool shrank below the retirement floor: {}", heavy.len());
         assert!(daily.len() >= 6, "daily pool shrank: {}", daily.len());
-        assert!(heavy.len() + daily.len() >= 23, "the full check lost gates");
+        assert!(heavy.len() + daily.len() >= 22, "the full check lost gates");
         for g in ["cargo-test", "store-verify"] {
             assert!(heavy.iter().any(|n| n == g), "missing heavy gate {g}");
         }
@@ -2480,7 +2479,6 @@ mod tests {
             private,
             vec![
                 "bootstrap-seed",
-                "chain-cache",
                 "sandbox-hardening",
                 "store-gc",
                 "store-gc-sweep",
