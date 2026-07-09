@@ -5,8 +5,8 @@
 //! Every `tests/bootstrap-*.sh` is the SAME leg skeleton:
 //!
 //! ```text
-//! [pinned-input]  the input bytes == the pin (a vendored sha, or a td-fetched
-//!                 tarball == its seed/sources/*.lock sha256)
+//! [pinned-input]  the input bytes == the pin (a td-fetched tarball ==
+//!                 its seed/sources/*.lock sha256)
 //! build           rung-specific: drive the seed / prior-rung tools over the source
 //! [no-guix]       the artifact carries no /gnu/store bytes; the build ran guix-off-env
 //! [behavioral]    the artifact does its job (assembles, evaluates, returns 42, …)
@@ -24,9 +24,18 @@
 //! asserts. The shell `tests/bootstrap-*.sh` stay the live driver + removable
 //! differential oracle (no cutover — same scoping as C1 #226).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use crate::sha256::sha256_file;
+use crate::tar;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,13 +43,14 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// stage0-posix x86 3b9c2bb seed pins (mirror tests/bootstrap-seed.sh).
+// stage0-posix seed pins.
+const STAGE0_LOCK: &str = "stage0-posix-1.9.1.lock";
 const HEX0_PIN: &str = "66c95985e668f20f2465c2b876f83fef066fd7c8c2dd3adb51a969f2d7120c8b";
 const KAEM_PIN: &str = "153b8915b73bd07132b59538d10fe53d26578eb160a67db72af07aaa61c51b3b";
 // The pinned GNU Mes source lock (one place — the pin check and the build read it).
 const MES_LOCK: &str = "mes-0.27.1.lock";
 
-/// Where a recipe finds its inputs: the repo root (vendored seed, lock files) and
+/// Where a recipe finds its inputs: the repo root (lock files) and
 /// the warmed-source cache (`.td-build-cache/sources/`, populated by
 /// `td-feed warm sources` in check.sh's HOST prelude — the offline loop
 /// never egresses).
@@ -67,14 +77,11 @@ impl Ctx {
     }
 }
 
-/// A pinned input — the `[pinned-input]` leg's two flavours.
+/// A pinned input — the `[pinned-input]` leg's flavours.
 pub enum Pin {
-    /// In-repo auditable bytes (the seed bricks): `<repo>/path` sha256 == `sha256`,
-    /// and (the seed's own `no-guix` assertion) no `/gnu/store` byte in it.
-    Vendored {
-        path: &'static str,
-        sha256: &'static str,
-    },
+    /// A td-fetched upstream stage0 source tarball, plus the two binary seed
+    /// files inside matching their per-file pins.
+    Stage0Source { lock: &'static str },
     /// A td-fetched tarball keyed by `seed/sources/<lock>` (url/sha256/file): the
     /// warmed `.td-build-cache/sources/<file>` must match the lock sha256.
     Source { lock: &'static str },
@@ -147,7 +154,9 @@ pub fn run(cx: &Ctx, recipe: &Recipe) -> Result<String, String> {
     // [no-guix] — no /gnu/store byte reached any artifact (the build ran env-cleared).
     for a in &recipe.artifacts {
         if contains_gnu_store(&r1.dir.join(a)).map_err(io_err("read artifact"))? {
-            return Err(format!("{a} contains /gnu/store bytes — not a clean non-guix build"));
+            return Err(format!(
+                "{a} contains /gnu/store bytes — not a clean non-guix build"
+            ));
         }
     }
     leg(
@@ -203,40 +212,80 @@ fn require_artifacts(b: &Built, artifacts: &[&str]) -> Result<(), String> {
 
 fn verify_pin(cx: &Ctx, pin: &Pin) -> Result<String, String> {
     match pin {
-        Pin::Vendored { path, sha256 } => {
-            let p = cx.repo_root.join(path);
-            let got = sha256_file(&p).map_err(|e| format!("read vendored {path}: {e}"))?;
-            if got != *sha256 {
-                return Err(format!("vendored {path} sha256 {got} != pin {sha256} (seed drifted?)"));
-            }
-            if contains_gnu_store(&p).map_err(|e| format!("scan vendored {path}: {e}"))? {
-                return Err(format!("vendored {path} contains /gnu/store bytes — not a clean non-guix seed"));
-            }
-            Ok(format!("vendored {path} matches pin sha256 ({sha256}) — auditable, NOT guix-built, no /gnu/store bytes"))
+        Pin::Stage0Source { lock } => {
+            let (pin, _) = verified_source_tarball(cx, lock)?;
+            let root = unpack_stage0_source(cx, lock)?;
+            let _cleanup = Cleanup(root.clone());
+            verify_seed_binary(&root, "bootstrap-seeds/POSIX/AMD64/hex0-seed", HEX0_PIN)?;
+            verify_seed_binary(
+                &root,
+                "bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
+                KAEM_PIN,
+            )?;
+            Ok(format!(
+                "td-fetched {} matches the lock sha256 ({}) and contains the pinned binary seeds — auditable, NOT guix-built, no /gnu/store bytes",
+                pin.file, pin.sha256
+            ))
         }
         Pin::Source { lock } => {
-            let pin = source_pin(cx, lock)?;
-            let tarball = cx.sources_dir.join(&pin.file);
-            if !tarball.exists() {
-                return Err(format!(
-                    "the pinned tarball is not warm ({}) — run 'td-feed warm sources' to td-fetch {} (needs network); check.sh's prelude does this",
-                    tarball.display(),
-                    pin.url
-                ));
-            }
-            let got = sha256_file(&tarball).map_err(|e| format!("read {}: {e}", tarball.display()))?;
-            if got != pin.sha256 {
-                return Err(format!(
-                    "warmed {} sha256 {got} != lock pin {} — corrupt fetch or stale lock",
-                    pin.file, pin.sha256
-                ));
-            }
+            let (pin, _) = verified_source_tarball(cx, lock)?;
             Ok(format!(
                 "td-fetched {} matches the lock sha256 ({}) — building from the pinned upstream bytes, not vendored/guix-fetched",
                 pin.file, pin.sha256
             ))
         }
     }
+}
+
+fn verified_source_tarball(cx: &Ctx, lock: &str) -> Result<(SourcePin, PathBuf), String> {
+    let pin = source_pin(cx, lock)?;
+    let tarball = cx.sources_dir.join(&pin.file);
+    if !tarball.exists() {
+        return Err(format!(
+            "the pinned tarball is not warm ({}) — run 'td-feed warm sources' to td-fetch {} (needs network); check.sh's prelude does this",
+            tarball.display(),
+            pin.url
+        ));
+    }
+    let got = sha256_file(&tarball).map_err(|e| format!("read {}: {e}", tarball.display()))?;
+    if got != pin.sha256 {
+        return Err(format!(
+            "warmed {} sha256 {got} != lock pin {} — corrupt fetch or stale lock",
+            pin.file, pin.sha256
+        ));
+    }
+    Ok((pin, tarball))
+}
+
+fn unpack_stage0_source(cx: &Ctx, lock: &str) -> Result<PathBuf, String> {
+    let (pin, tarball) = verified_source_tarball(cx, lock)?;
+    let out = scratch_dir("td-bootstrap-stage0").map_err(io_err("scratch dir"))?;
+    tar::extract_tar_gz(&tarball, &out)?;
+    let root = single_subdir(&out)?;
+    clean_stage0_build_dirs(&root)?;
+    let seed = root.join("bootstrap-seeds/POSIX/AMD64/hex0-seed");
+    let kaem = root.join("AMD64/mescc-tools-seed-kaem.kaem");
+    if !seed.is_file() || !kaem.is_file() {
+        return Err(format!(
+            "{} did not unpack to the expected stage0 source tree",
+            pin.file
+        ));
+    }
+    Ok(root)
+}
+
+fn verify_seed_binary(root: &Path, rel: &str, sha256: &str) -> Result<(), String> {
+    let path = root.join(rel);
+    let got = sha256_file(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if got != sha256 {
+        return Err(format!("{rel} sha256 {got} != pin {sha256}"));
+    }
+    if contains_gnu_store(&path).map_err(|e| format!("scan {}: {e}", path.display()))? {
+        return Err(format!(
+            "{rel} contains /gnu/store bytes — not a clean non-guix seed"
+        ));
+    }
+    Ok(())
 }
 
 /// Read + parse `seed/sources/<lock>`.
@@ -287,16 +336,7 @@ fn seed_recipe() -> Recipe {
     Recipe {
         name: "seed",
         brick: 0,
-        pins: vec![
-            Pin::Vendored {
-                path: "seed/stage0/bootstrap-seeds/POSIX/AMD64/hex0-seed",
-                sha256: HEX0_PIN,
-            },
-            Pin::Vendored {
-                path: "seed/stage0/bootstrap-seeds/POSIX/AMD64/kaem-optional-seed",
-                sha256: KAEM_PIN,
-            },
-        ],
+        pins: vec![Pin::Stage0Source { lock: STAGE0_LOCK }],
         build: build_seed,
         artifacts: vec!["AMD64/artifact/hex0", "AMD64/artifact/kaem-0"],
         checks: vec![
@@ -313,20 +353,16 @@ fn seed_recipe() -> Recipe {
     }
 }
 
-/// Copy the vendored seed tree to a fresh scratch dir, chmod the two seeds, and run
-/// the FIRST kaem step (seed → `AMD64/artifact/{hex0,kaem-0}`) env-cleared. Returns
-/// the scratch dir. Shared by brick 0 (`build_seed`) and brick 2's toolchain
-/// (`mes_toolchain`, which drives a second kaem step on top).
+/// Unpack the pinned stage0 source to a fresh scratch dir, chmod the two seeds,
+/// and run the FIRST kaem step (seed → `AMD64/artifact/{hex0,kaem-0}`)
+/// env-cleared. Returns the scratch dir. Shared by brick 0 (`build_seed`) and
+/// brick 2's toolchain (`mes_toolchain`, which drives a second kaem step on top).
 fn seed_stage0_tree(cx: &Ctx) -> Result<PathBuf, String> {
-    let seed = cx.repo_root.join("seed/stage0");
-    let out = scratch_dir("td-bootstrap-seed").map_err(io_err("scratch dir"))?;
-    copy_tree(&seed, &out).map_err(io_err("copy seed tree"))?;
+    let out = unpack_stage0_source(cx, STAGE0_LOCK)?;
     let amd = "bootstrap-seeds/POSIX/AMD64";
     make_executable(&out.join(format!("{amd}/hex0-seed"))).map_err(io_err("chmod hex0-seed"))?;
     make_executable(&out.join(format!("{amd}/kaem-optional-seed")))
         .map_err(io_err("chmod kaem-optional-seed"))?;
-    fs::create_dir_all(out.join("AMD64/artifact")).map_err(io_err("mkdir artifact"))?;
-    fs::create_dir_all(out.join("AMD64/bin")).map_err(io_err("mkdir bin"))?;
 
     let kaem = out.join(format!("{amd}/kaem-optional-seed"));
     let status = scrubbed(&kaem)
@@ -359,7 +395,9 @@ fn seed_self_reproduction(_cx: &Ctx, b: &Built) -> Result<(), String> {
     }
     let kaem = sha256_file(&b.dir.join("AMD64/artifact/kaem-0")).map_err(io_err("sha kaem-0"))?;
     if kaem != KAEM_PIN {
-        return Err(format!("seed-built kaem-0 {kaem} != kaem-optional-seed {KAEM_PIN}"));
+        return Err(format!(
+            "seed-built kaem-0 {kaem} != kaem-optional-seed {KAEM_PIN}"
+        ));
     }
     Ok(())
 }
@@ -382,7 +420,9 @@ fn seed_behavioral(_cx: &Ctx, b: &Built) -> Result<(), String> {
     }
     let got = sha256_file(&out).map_err(io_err("sha kaem-0b"))?;
     if got != KAEM_PIN {
-        return Err(format!("the seed-built hex0 assembled a wrong kaem-0 ({got})"));
+        return Err(format!(
+            "the seed-built hex0 assembled a wrong kaem-0 ({got})"
+        ));
     }
     Ok(())
 }
@@ -420,7 +460,10 @@ fn mes_toolchain(cx: &Ctx) -> Result<PathBuf, String> {
         .status()
         .map_err(io_err("exec mescc-tools-mini-kaem"))?;
     if !status.success() {
-        return Err(format!("the seed toolchain (M2-Planet + mescc-tools) build failed in {}", tc.display()));
+        return Err(format!(
+            "the seed toolchain (M2-Planet + mescc-tools) build failed in {}",
+            tc.display()
+        ));
     }
     Ok(tc)
 }
@@ -483,7 +526,10 @@ fn build_mes(cx: &Ctx) -> Result<Built, String> {
     extract_tar_gz(&tarball, &work)?;
     let m = single_subdir(&work)?;
     if !m.join("kaem.run").is_file() || !m.join("src/mes.c").is_file() {
-        return Err(format!("unpacked Mes tree missing kaem.run/src ({})", m.display()));
+        return Err(format!(
+            "unpacked Mes tree missing kaem.run/src ({})",
+            m.display()
+        ));
     }
 
     // Generated, exactly as configure.sh does for the non-system-libc path.
@@ -529,20 +575,35 @@ fn build_mes(cx: &Ctx) -> Result<Built, String> {
 
     run_step(
         &be,
-        &["--64", "--little-endian", "-f", "m2/mes.M1", "-o", "m2/mes.blood-elf-M1"],
+        &[
+            "--64",
+            "--little-endian",
+            "-f",
+            "m2/mes.M1",
+            "-o",
+            "m2/mes.blood-elf-M1",
+        ],
         &m,
         "blood-elf",
     )?;
     run_step(
         &m1,
         &[
-            "--architecture", "amd64", "--little-endian",
-            "-f", "lib/m2/x86_64/x86_64_defs.M1",
-            "-f", "lib/x86_64-mes/x86_64.M1",
-            "-f", "lib/linux/x86_64-mes-m2/crt1.M1",
-            "-f", "m2/mes.M1",
-            "-f", "m2/mes.blood-elf-M1",
-            "-o", "m2/mes.hex2",
+            "--architecture",
+            "amd64",
+            "--little-endian",
+            "-f",
+            "lib/m2/x86_64/x86_64_defs.M1",
+            "-f",
+            "lib/x86_64-mes/x86_64.M1",
+            "-f",
+            "lib/linux/x86_64-mes-m2/crt1.M1",
+            "-f",
+            "m2/mes.M1",
+            "-f",
+            "m2/mes.blood-elf-M1",
+            "-o",
+            "m2/mes.hex2",
         ],
         &m,
         "M1 assemble",
@@ -550,10 +611,17 @@ fn build_mes(cx: &Ctx) -> Result<Built, String> {
     run_step(
         &hex2,
         &[
-            "--architecture", "amd64", "--little-endian", "--base-address", "0x1000000",
-            "-f", "lib/m2/x86_64/ELF-x86_64.hex2",
-            "-f", "m2/mes.hex2",
-            "-o", "bin/mes-m2",
+            "--architecture",
+            "amd64",
+            "--little-endian",
+            "--base-address",
+            "0x1000000",
+            "-f",
+            "lib/m2/x86_64/ELF-x86_64.hex2",
+            "-f",
+            "m2/mes.hex2",
+            "-o",
+            "bin/mes-m2",
         ],
         &m,
         "hex2 link",
@@ -582,13 +650,18 @@ fn mes_behavioral(_cx: &Ctx, b: &Built) -> Result<(), String> {
             .map_err(io_err("exec mes-m2"))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            return Err(format!("mes-m2 failed to evaluate `{code}`: {}", err.trim()));
+            return Err(format!(
+                "mes-m2 failed to evaluate `{code}`: {}",
+                err.trim()
+            ));
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
     let hello = eval("(display 'Hello,M2-mes!) (newline)")?;
     if hello != "Hello,M2-mes!" {
-        return Err(format!("mes-m2 display gave [{hello}], want [Hello,M2-mes!]"));
+        return Err(format!(
+            "mes-m2 display gave [{hello}], want [Hello,M2-mes!]"
+        ));
     }
     let arith = eval("(display (+ 1 2 3 4)) (newline)")?;
     if arith != "10" {
@@ -693,20 +766,9 @@ fn run_step(prog: &Path, args: &[&str], dir: &Path, what: &str) -> Result<(), St
     Ok(())
 }
 
-/// Extract a `.tar.gz` into `dest` via the harness `tar` (offline; the build TOOLS
-/// run scrubbed, but unpacking the source is harness work — as the shell does).
+/// Extract a `.tar.gz` into `dest` with td's std-only gzip + tar readers.
 fn extract_tar_gz(tarball: &Path, dest: &Path) -> Result<(), String> {
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(tarball)
-        .arg("-C")
-        .arg(dest)
-        .status()
-        .map_err(|e| format!("exec tar: {e}"))?;
-    if !status.success() {
-        return Err(format!("could not unpack {}", tarball.display()));
-    }
-    Ok(())
+    tar::extract_tar_gz(tarball, dest)
 }
 
 /// The single top-level subdirectory of a freshly-unpacked tarball dir.
@@ -718,8 +780,36 @@ fn single_subdir(dir: &Path) -> Result<PathBuf, String> {
         .map(|e| e.path())
         .collect();
     match subdirs.len() {
-        1 => Ok(subdirs.pop().unwrap()),
-        n => Err(format!("expected one top-level dir under {}, found {n}", dir.display())),
+        1 => subdirs
+            .pop()
+            .ok_or_else(|| format!("expected one top-level dir under {}", dir.display())),
+        n => Err(format!(
+            "expected one top-level dir under {}, found {n}",
+            dir.display()
+        )),
+    }
+}
+
+fn clean_stage0_build_dirs(root: &Path) -> Result<(), String> {
+    for dir in ["AMD64/artifact", "AMD64/bin"] {
+        let path = root.join(dir);
+        remove_path_if_exists(&path)?;
+        fs::create_dir_all(&path).map_err(|e| format!("mkdir {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_dir() {
+                fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+            } else {
+                fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("stat {}: {e}", path.display())),
     }
 }
 
@@ -741,24 +831,6 @@ pub(crate) fn make_executable(p: &Path) -> io::Result<()> {
     let mut perm = fs::metadata(p)?.permissions();
     perm.set_mode(perm.mode() | 0o755);
     fs::set_permissions(p, perm)
-}
-
-/// Recursively copy a directory tree (files + dirs, permission bits preserved by
-/// `fs::copy`). The seed/source trees carry no symlinks.
-fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if ft.is_dir() {
-            copy_tree(&from, &to)?;
-        } else if ft.is_file() {
-            fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
 }
 
 fn scratch_dir(prefix: &str) -> io::Result<PathBuf> {
@@ -804,21 +876,37 @@ mod tests {
             .to_path_buf()
     }
 
-    /// The repo-tree integration tests need the vendored `seed/stage0`. When
-    /// `cargo test` runs INSIDE the hermetic td-builder derivation build
-    /// (check-engine compiles td-builder as a reproducible package and runs its unit
-    /// tests there), only the `builder/` crate is staged — the repo tree is absent.
-    /// Those tests skip there; they run for real in the repo-rooted cargo-test job on
-    /// every PR (affected-checks) and via the bootstrap-seed / bootstrap-mes gates in
-    /// the loop sandbox. Pure-logic tests below have no such dependency.
+    /// The repo-tree integration tests need the stage0 source lock and its warmed
+    /// fixed-output tarball. When `cargo test` runs INSIDE the hermetic
+    /// td-builder derivation build (check-engine compiles td-builder as a
+    /// reproducible package and runs its unit tests there), only the `builder/`
+    /// crate is staged; when a developer has not warmed sources, the tarball is
+    /// absent. Those tests skip there; the bootstrap-seed / bootstrap-mes gates
+    /// run the full source-backed proof.
     fn require_repo_tree() -> Option<PathBuf> {
         let root = repo_root();
-        if root.join("seed/stage0").is_dir() {
-            Some(root)
-        } else {
-            eprintln!("skip: seed/stage0 absent (hermetic crate build) — runs in the repo-rooted cargo-test job + the -rs gates");
-            None
+        let lock = root.join("seed/sources").join(STAGE0_LOCK);
+        if !lock.is_file() {
+            eprintln!("skip: stage0 source lock absent (hermetic crate build)");
+            return None;
         }
+        let cx = Ctx::rooted(root.clone());
+        let pin = match source_pin(&cx, STAGE0_LOCK) {
+            Ok(pin) => pin,
+            Err(e) => {
+                eprintln!("skip: cannot parse stage0 source lock: {e}");
+                return None;
+            }
+        };
+        let tarball = cx.sources_dir.join(&pin.file);
+        if !tarball.is_file() {
+            eprintln!(
+                "skip: stage0 source tarball absent ({}) — run td-feed warm sources",
+                tarball.display()
+            );
+            return None;
+        }
+        Some(root)
     }
 
     #[test]
@@ -875,7 +963,9 @@ M2-Planet \\\n\
     // check-engine. Verified-red by perturbing each pin/leg (see plan notes).
     #[test]
     fn seed_recipe_builds_and_passes_all_legs() {
-        let Some(root) = require_repo_tree() else { return };
+        let Some(root) = require_repo_tree() else {
+            return;
+        };
         let cx = Ctx::rooted(root);
         let recipe = seed_recipe();
         let report = run(&cx, &recipe).expect("seed recipe should pass all legs");
@@ -884,23 +974,41 @@ M2-Planet \\\n\
         assert!(report.contains("[self-reproduction]"), "report:\n{report}");
         assert!(report.contains("[behavioral]"), "report:\n{report}");
         assert!(report.contains("[repro]"), "report:\n{report}");
-        assert!(report.contains("PASS: source-bootstrap brick 0"), "report:\n{report}");
+        assert!(
+            report.contains("PASS: source-bootstrap brick 0"),
+            "report:\n{report}"
+        );
     }
 
-    // Verified-red harness as a test: a wrong pin must red the pinned-input leg.
+    // Verified-red harness as a test: a wrong source pin must red the pinned-input leg.
     #[test]
-    fn wrong_vendored_pin_reds_pinned_input() {
-        let Some(root) = require_repo_tree() else { return };
-        let cx = Ctx::rooted(root);
+    fn wrong_stage0_source_pin_reds_pinned_input() {
+        let Some(root) = require_repo_tree() else {
+            return;
+        };
+        let real = Ctx::rooted(root);
+        let pin = source_pin(&real, STAGE0_LOCK).expect("real stage0 pin");
+        let tmp = scratch_dir("td-bootstrap-wrong-stage0-pin").expect("scratch");
+        let _cleanup = Cleanup(tmp.clone());
+        fs::create_dir_all(tmp.join("seed/sources")).expect("seed sources dir");
+        fs::write(
+            tmp.join("seed/sources").join(STAGE0_LOCK),
+            format!(
+                "url {}\nsha256 0000000000000000000000000000000000000000000000000000000000000000\nfile {}\n",
+                pin.url, pin.file
+            ),
+        )
+        .expect("write bad lock");
+        let cx = Ctx {
+            repo_root: tmp,
+            sources_dir: real.sources_dir,
+        };
         let recipe = Recipe {
-            pins: vec![Pin::Vendored {
-                path: "seed/stage0/bootstrap-seeds/POSIX/AMD64/hex0-seed",
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-            }],
+            pins: vec![Pin::Stage0Source { lock: STAGE0_LOCK }],
             ..seed_recipe()
         };
         let e = run(&cx, &recipe).unwrap_err();
-        assert!(e.contains("!= pin"), "got: {e}");
+        assert!(e.contains("!= lock pin"), "got: {e}");
     }
 
     // --- per-leg verified-red, via tiny synthetic recipes (no guix, no network) ---

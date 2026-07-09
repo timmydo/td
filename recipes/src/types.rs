@@ -593,9 +593,9 @@ impl Recipe {
     pub fn cmake(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Cmake)
     }
-    /// The stage0 SEED build system (#378): no upstream `Source` — the pinned
-    /// seed tree is vendored in-repo (seed/stage0) and rides in through the
-    /// lock's `<name>-source` entry, interned by the caller.
+    /// The stage0 SEED build system (#378): the pinned upstream source tarball
+    /// rides in through the lock's `<name>-source` entry, unpacked and interned
+    /// by the caller.
     pub fn stage0(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Stage0)
     }

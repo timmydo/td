@@ -29,7 +29,6 @@ set -eu
 ROOT=$(pwd)
 fail() { echo "FAIL: $*" >&2; exit 1; }
 sha() { sha256sum "$1" | cut -d' ' -f1; }
-STAGE0=seed/stage0
 A=AMD64
 BOOT_PATCH="$ROOT/seed/patches/binutils-boot-2.20.1a.patch"
 BOOT_PATCH_SHA=f6be78a06f2c9905e019ade08f701e5468386cf1934aa27757a64c619571da20

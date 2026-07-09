@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use td_recipe::{catalog, types::Recipe};
 
 const TD_STORE_DIR: &str = "/td/store";
+const STAGE0_SOURCE_LOCK_STEM: &str = "stage0-posix-1.9.1";
 
 pub fn cli(args: &[String]) -> Result<(), String> {
     let stem = args.first().ok_or_else(usage)?.as_str();
@@ -268,19 +269,13 @@ impl RecipeCheckRunner {
 
     fn setup_pinsum(&self) -> Result<String, String> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"ladder-setup-v4\n");
+        bytes.extend_from_slice(b"ladder-setup-v5\n");
         append_file_bytes(&self.root.join("tests/td-subst.lock"), &mut bytes)?;
         for file in files_with_suffix(&self.root.join("seed/sources"), ".lock")? {
             append_file_bytes(&file, &mut bytes)?;
         }
         for file in files_with_suffix(&self.root.join("seed/patches"), ".patch")? {
             append_file_bytes(&file, &mut bytes)?;
-        }
-        let files_out =
-            self.builder_output(&["files", "seed/stage0"], "td-builder files seed/stage0")?;
-        for line in files_out.lines() {
-            let path = self.root.join(line);
-            append_file_bytes(&path, &mut bytes)?;
         }
         sha256sum(&bytes)
     }
@@ -381,9 +376,58 @@ impl RecipeCheckRunner {
     }
 
     fn intern_stage0_source(&self, intern_name: &str) -> Result<(), String> {
-        let stage0 = self.root.join("seed/stage0");
+        let tarball = self.stage0_source_tarball()?;
+        let extract = self.scratch.join("stage0-source-extract");
+        remove_path_if_exists(&extract)?;
+        fs::create_dir_all(&extract).map_err(|e| format!("mkdir {}: {e}", extract.display()))?;
+        let tar_s = path_str(&tarball)?;
+        let extract_s = path_str(&extract)?;
+        let mut cmd = self.builder_command();
+        cmd.arg("tar-gz-extract").arg(tar_s).arg(extract_s);
+        command_output(&mut cmd, "td-builder tar-gz-extract stage0 source")?;
+        let stage0 = single_subdir_path(&extract)?;
+        clean_stage0_build_dirs(&stage0)?;
+        if !stage0
+            .join("bootstrap-seeds/POSIX/AMD64/hex0-seed")
+            .is_file()
+            || !stage0.join("AMD64/mescc-tools-seed-kaem.kaem").is_file()
+        {
+            return Err(format!(
+                "{} did not unpack to the expected stage0 source tree",
+                tarball.display()
+            ));
+        }
         let path = self.store_add_recursive(intern_name, &stage0)?;
         self.append_src_map(intern_name, &path)
+    }
+
+    fn stage0_source_tarball(&self) -> Result<PathBuf, String> {
+        let lock = self.source_lock(STAGE0_SOURCE_LOCK_STEM)?;
+        let file = lock_value(&lock, "file")?;
+        if file.contains('/') {
+            return Err(format!(
+                "{}: file must be a basename, got `{file}`",
+                lock.display()
+            ));
+        }
+        let want = lock_value(&lock, "sha256")?;
+        let tarball = self.root.join(".td-build-cache/sources").join(&file);
+        if !tarball.is_file() {
+            return Err(format!(
+                "ladder: pinned stage0 source not warm ({}) - run 'td-feed warm sources'",
+                tarball.display()
+            ));
+        }
+        let mut bytes = Vec::new();
+        append_file_bytes(&tarball, &mut bytes)?;
+        let got = sha256sum(&bytes)?;
+        if got != want {
+            return Err(format!(
+                "{} sha256 {got} != lock pin {want}",
+                tarball.display()
+            ));
+        }
+        Ok(tarball)
     }
 
     fn store_add_recursive(&self, name: &str, src: &Path) -> Result<String, String> {
@@ -926,14 +970,6 @@ impl RecipeCheckRunner {
             .env("TD_BUILDER_DB", &self.builder_db);
         cmd
     }
-
-    fn builder_output(&self, args: &[&str], label: &str) -> Result<String, String> {
-        let mut cmd = self.builder_command();
-        for arg in args {
-            cmd.arg(arg);
-        }
-        command_output(&mut cmd, label)
-    }
 }
 
 fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
@@ -1309,6 +1345,33 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     }
 }
 
+fn single_subdir_path(dir: &Path) -> Result<PathBuf, String> {
+    let mut subdirs = Vec::new();
+    for path in read_dir_sorted(dir)? {
+        if path.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    match subdirs.len() {
+        1 => subdirs
+            .pop()
+            .ok_or_else(|| format!("expected one top-level dir under {}", dir.display())),
+        n => Err(format!(
+            "expected one top-level dir under {}, found {n}",
+            dir.display()
+        )),
+    }
+}
+
+fn clean_stage0_build_dirs(root: &Path) -> Result<(), String> {
+    for dir in ["AMD64/artifact", "AMD64/bin"] {
+        let path = root.join(dir);
+        remove_path_if_exists(&path)?;
+        fs::create_dir_all(&path).map_err(|e| format!("mkdir {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
     let ftype = meta.file_type();
@@ -1431,10 +1494,7 @@ mod tests {
 
     #[test]
     fn output_lookup_uses_the_current_build_log_only() {
-        let tmp = env::temp_dir().join(format!(
-            "td-recipe-runner-test-{}",
-            std::process::id()
-        ));
+        let tmp = env::temp_dir().join(format!("td-recipe-runner-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let old = tmp.join("build-old.out");
@@ -1455,9 +1515,7 @@ mod tests {
             force_cold: false,
         };
 
-        let got = runner
-            .ladder_out_from(&current, "rust-toolchain")
-            .unwrap();
+        let got = runner.ladder_out_from(&current, "rust-toolchain").unwrap();
 
         assert_eq!(got, tmp.join("scratch/tdstore/current-rust"));
         let _ = fs::remove_dir_all(&tmp);

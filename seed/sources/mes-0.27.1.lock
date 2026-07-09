@@ -3,7 +3,7 @@
 # the pinned url + sha256 into .td-build-cache/sources/ (td-feed warm sources, run in
 # check.sh's HOST prelude — the offline loop has no egress). The bootstrap-mes gate reads the
 # warmed tarball, re-checks this sha256, and builds mes-m2 from it. Version 0.27.1 is the release
-# version-matched to stage0-posix 3b9c2bb (its lib/m2/x86_64/x86_64_defs.M1 carries the
+# version-matched to this stage0-posix seed (its lib/m2/x86_64/x86_64_defs.M1 carries the
 # xor_eax,eax vocabulary the stage0 M2-Planet emits; the 0.27 release predates it).
 url https://ftp.gnu.org/gnu/mes/mes-0.27.1.tar.gz
 sha256 183a40ea47ea49f8a1e3bd1b9d12e676374d64d63bc79e7bc1ae7d673dfdf25d
