@@ -579,7 +579,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     // seed/sources/{make,tcc-0.9.26,nyacc}-*.lock are also i686 chain pinned inputs — caught
-    // by the merged pinned-input arm above. mes-*.lock and the stage0 seed archive
+    // by the merged pinned-input arm above. mes-*.lock and the stage0-posix source lock
     // additionally select their own structured-Rust gate (bootstrap-mes / bootstrap-seed),
     // since those two rungs have no shell driver and no pinned-input arm names them.
     if pattern_matches("seed/sources/mes-*.lock", p) {
@@ -588,9 +588,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         add_chain_targets(sel);
         return;
     }
-    if glob_match("seed/stage0/*", p)
-        || pattern_matches("seed/stage0.lock|seed/stage0-*.tar", p)
-    {
+    if glob_match("seed/stage0/*", p) || pattern_matches("seed/sources/stage0-posix-*.lock", p) {
         sel.add_preflight("shell-syntax");
         sel.add_target("bootstrap-seed");
         add_chain_targets(sel);
@@ -1064,11 +1062,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("seed/sources/busybox-1.37.0.lock", "recipe-checks-daily");
     assert_target!("seed/sources/make-4.4.1.lock", "recipe-checks-daily");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
-    // the seed archive + the mes lock route to the gates via the chain; the recipe code
+    // the stage0 source lock + the mes lock route to the gates via the chain; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
     assert_target!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
-    assert_target!("seed/stage0.lock", "bootstrap-seed");
-    assert_target!("seed/stage0-3b9c2bb.tar", "bootstrap-seed");
+    assert_target!("seed/sources/stage0-posix-1.9.1.lock", "bootstrap-seed");
     assert_target!("seed/sources/mes-0.27.1.lock", "bootstrap-mes");
     assert_target!("builder/src/bootstrap.rs", "check-engine");
     assert_branch_policy!("builder/src/bootstrap.rs", "the full check would be waived");
@@ -1094,8 +1091,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // catalog edit RUNS the recipe-engine gate per-PR.
     assert_runs!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
     assert_deferred!("seed/stage0/AMD64/hex0_AMD64.hex0", "recipe-checks-daily");
-    assert_runs!("seed/stage0.lock", "bootstrap-seed");
-    assert_deferred!("seed/stage0.lock", "recipe-checks-daily");
+    assert_runs!("seed/sources/stage0-posix-1.9.1.lock", "bootstrap-seed");
+    assert_deferred!(
+        "seed/sources/stage0-posix-1.9.1.lock",
+        "recipe-checks-daily"
+    );
     assert_runs!("recipes/src/catalog.rs", "recipe-rs");
 
     failures

@@ -32,6 +32,7 @@ mod gate_bodies;
 mod gate_inputs;
 mod gate_timing;
 mod gates;
+mod gzip;
 mod json;
 mod lock;
 mod nar;
@@ -4972,15 +4973,39 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // tar-extract: extract a plain POSIX tar archive with td's std-only extractor.
-        // This is intentionally small: enough for source seed archives and frozen seed
-        // closure tars, without adding a decompressor dependency or requiring host tar.
+        // gzip-decompress: expand a gzip member stream with td's std-only reader.
+        Some("gzip-decompress") if args.len() == 4 => {
+            let (gzip_file, out_file) = (&args[2], &args[3]);
+            match gzip::decompress_file(Path::new(gzip_file))
+                .and_then(|bytes| std::fs::write(out_file, bytes).map_err(|e| e.to_string()))
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: gzip-decompress: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // tar-extract / tar-gz-extract: extract POSIX tar archives with td's
+        // std-only extractor and gzip reader. This is intentionally small: enough
+        // for source seed archives and frozen seed closure tars, without adding an
+        // unpacker dependency or requiring host tar/gzip.
         Some("tar-extract") if args.len() == 4 => {
             let (tarball, dest) = (&args[2], &args[3]);
             match tar::extract_tar(Path::new(tarball), Path::new(dest)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: tar-extract: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("tar-gz-extract") if args.len() == 4 => {
+            let (tarball, dest) = (&args[2], &args[3]);
+            match tar::extract_tar_gz(Path::new(tarball), Path::new(dest)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: tar-gz-extract: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -6819,9 +6844,11 @@ fn main() -> ExitCode {
             eprintln!("       td-builder tree-first-containing NEEDLE PATH...");
             eprintln!("       td-builder path-older-than PATH DAYS");
             eprintln!("       td-builder daemon-budget-check LOG BUDGET");
+            eprintln!("       td-builder gzip-decompress GZFILE OUTFILE");
             eprintln!("       td-builder nar-hash PATH");
             eprintln!("       td-builder nar-restore NARFILE DEST");
             eprintln!("       td-builder tar-extract TARFILE DEST");
+            eprintln!("       td-builder tar-gz-extract TAR_GZ_FILE DEST");
             eprintln!("       td-builder subst-export DB STORE-DIR OUTDIR ROOT...");
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder drv-refs FILE.drv");

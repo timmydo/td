@@ -1,13 +1,27 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 const BLOCK: usize = 512;
 
 pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
-    fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
     let mut file = File::open(tar).map_err(|e| format!("open {}: {e}", tar.display()))?;
+    extract_tar_reader(&mut file, &tar.display().to_string(), dest)
+}
+
+pub fn extract_tar_gz(tar_gz: &Path, dest: &Path) -> Result<(), String> {
+    let bytes = crate::gzip::decompress_file(tar_gz)?;
+    let mut reader = Cursor::new(bytes);
+    extract_tar_reader(&mut reader, &tar_gz.display().to_string(), dest)
+}
+
+pub fn extract_tar_reader<R: Read>(
+    file: &mut R,
+    source_name: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
     let mut pending_path: Option<PathBuf> = None;
     let mut pending_link: Option<PathBuf> = None;
     loop {
@@ -18,7 +32,7 @@ pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
                 ensure_no_pending_long_name(&pending_path, &pending_link)?;
                 break;
             }
-            Err(e) => return Err(format!("read tar header from {}: {e}", tar.display())),
+            Err(e) => return Err(format!("read tar header from {source_name}: {e}")),
         }
         if header.iter().all(|b| *b == 0) {
             ensure_no_pending_long_name(&pending_path, &pending_link)?;
@@ -28,21 +42,21 @@ pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
         let mut entry = Entry::parse(&header)?;
         match &entry.kind {
             EntryKind::LongName => {
-                pending_path = Some(read_entry_string(&mut file, entry.size).map_err(|e| {
-                    format!("read GNU long name {}: {e}", entry.path.display())
-                })?);
-                skip_padding(&mut file, entry.size).map_err(|e| {
-                    format!("skip padding after {}: {e}", entry.path.display())
-                })?;
+                pending_path =
+                    Some(read_entry_string(file, entry.size).map_err(|e| {
+                        format!("read GNU long name {}: {e}", entry.path.display())
+                    })?);
+                skip_padding(file, entry.size)
+                    .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
                 continue;
             }
             EntryKind::LongLink => {
-                pending_link = Some(read_entry_string(&mut file, entry.size).map_err(|e| {
-                    format!("read GNU long link {}: {e}", entry.path.display())
-                })?);
-                skip_padding(&mut file, entry.size).map_err(|e| {
-                    format!("skip padding after {}: {e}", entry.path.display())
-                })?;
+                pending_link =
+                    Some(read_entry_string(file, entry.size).map_err(|e| {
+                        format!("read GNU long link {}: {e}", entry.path.display())
+                    })?);
+                skip_padding(file, entry.size)
+                    .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
                 continue;
             }
             _ => {}
@@ -73,7 +87,7 @@ pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
         match entry.kind {
             EntryKind::Directory => {
                 ensure_directory(dest, &entry.path, &out)?;
-                skip_entry_data(&mut file, entry.size)
+                skip_entry_data(file, entry.size)
                     .map_err(|e| format!("skip {}: {e}", entry.path.display()))?;
             }
             EntryKind::Regular => {
@@ -81,7 +95,7 @@ pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
                 remove_existing_non_dir(&out)?;
                 let mut out_file =
                     File::create(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
-                copy_exact(&mut file, &mut out_file, entry.size)
+                copy_exact(file, &mut out_file, entry.size)
                     .map_err(|e| format!("extract {}: {e}", entry.path.display()))?;
                 fs::set_permissions(&out, fs::Permissions::from_mode(entry.mode))
                     .map_err(|e| format!("chmod {}: {e}", out.display()))?;
@@ -92,7 +106,7 @@ pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
                 symlink(&target, &out).map_err(|e| {
                     format!("symlink {} -> {}: {e}", out.display(), target.display())
                 })?;
-                skip_entry_data(&mut file, entry.size)
+                skip_entry_data(file, entry.size)
                     .map_err(|e| format!("skip {}: {e}", entry.path.display()))?;
             }
             EntryKind::Hardlink { target } => {
@@ -113,7 +127,7 @@ pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
                         target_out.display()
                     )
                 })?;
-                skip_entry_data(&mut file, entry.size)
+                skip_entry_data(file, entry.size)
                     .map_err(|e| format!("skip {}: {e}", entry.path.display()))?;
             }
             EntryKind::LongName | EntryKind::LongLink => {
@@ -123,7 +137,7 @@ pub fn extract_tar(tar: &Path, dest: &Path) -> Result<(), String> {
                 ));
             }
         }
-        skip_padding(&mut file, entry.size)
+        skip_padding(file, entry.size)
             .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
     }
     Ok(())
@@ -347,14 +361,12 @@ fn read_entry_string<R: Read>(reader: &mut R, bytes: u64) -> io::Result<PathBuf>
     while matches!(buf.last(), Some(0)) {
         let _ = buf.pop();
     }
-    String::from_utf8(buf)
-        .map(PathBuf::from)
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("tar string is not utf-8: {e}"),
-            )
-        })
+    String::from_utf8(buf).map(PathBuf::from).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tar string is not utf-8: {e}"),
+        )
+    })
 }
 
 fn skip_padding<R: Read>(reader: &mut R, size: u64) -> io::Result<()> {
@@ -382,7 +394,10 @@ mod tests {
         let tmp = temp_dir("td-tar-test");
         let tar = tmp.join("test.tar");
         let out = tmp.join("out");
-        let long_target = format!("gnu/store/{}-target/bin/very-long-file-name", "a".repeat(90));
+        let long_target = format!(
+            "gnu/store/{}-target/bin/very-long-file-name",
+            "a".repeat(90)
+        );
         let long_link = format!("gnu/store/{}-link/bin/very-long-file-name", "b".repeat(90));
         let mut bytes = Vec::new();
         append_long_name(&mut bytes, &long_target);
@@ -427,7 +442,14 @@ mod tests {
     }
 
     fn append_long_link(out: &mut Vec<u8>, target: &str) {
-        append_header(out, "././@LongLink", b'K', 0o644, long_field_len(target), "");
+        append_header(
+            out,
+            "././@LongLink",
+            b'K',
+            0o644,
+            long_field_len(target),
+            "",
+        );
         append_long_value(out, target);
     }
 

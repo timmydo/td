@@ -1,0 +1,10 @@
+# seed/sources/stage0-posix-1.9.1.lock - upstream stage0-posix source-bootstrap seed.
+#
+# This replaces the previously vendored seed/stage0 tree with the public upstream
+# source release. The bootstrap code re-checks this sha256, unpacks the tarball
+# with td-builder's std-only gzip/tar readers, removes upstream build-output dirs,
+# and then verifies the two AMD64 binary seeds against their per-file pins before
+# building.
+url https://github.com/oriansj/stage0-posix/releases/download/Release_1.9.1/stage0-posix-1.9.1.tar.gz
+sha256 f4fdda675de90ab034fd3467ef43cddff61b3d372f8e0e5c2d25d145f224226f
+file stage0-posix-1.9.1.tar.gz
