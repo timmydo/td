@@ -630,9 +630,9 @@ fn seed_store_dir(roots: &[String]) -> Option<String> {
     dirs.into_iter().next()
 }
 
-/// A parsed `.td-build-cache/loop-closure.list`: the scanned host-built
-/// binaries as `(path, mtime_ns, len, store refs)`, the merged closure ROOTS,
-/// and the resulting closure ITEMS.
+/// A parsed loop-closure cache (see `loop_closure_cache_path`): the scanned
+/// host-built binaries as `(path, mtime_ns, len, store refs)`, the merged
+/// closure ROOTS, and the resulting closure ITEMS.
 struct ClosureCache {
     files: Vec<(String, u64, u64, Vec<String>)>,
     roots: std::collections::BTreeSet<String>,
@@ -653,11 +653,20 @@ struct ClosureCache {
 /// The candidate store dir is DERIVED from the lock paths (`seed_store_dir`),
 /// never hardcoded. The closure walk is the same no-DB content scan
 /// realize_drv uses (`scan_candidate_index` + `scan_closure_hybrid`; never
-/// /var/guix). The result is CACHED in `.td-build-cache/loop-closure.list`:
-/// store items are immutable, so the cache holds while the root set matches,
-/// every scanned file's (mtime, len) matches, and every item still exists — a
-/// rebuilt stage0 re-scans one file; a changed root set or a GC'd item
-/// re-scans the closure. Returns the sorted item paths (roots included).
+/// /var/guix). The result is CACHED under `loop_userland_dir()` — NOT in the
+/// worktree: the list names the exact `--store-item` binds of the NEXT run,
+/// and the worktree is bound read-write into every gate sandbox, so an
+/// in-tree cache was a channel a gate body could use to smuggle an
+/// undeclared executable input into the following run (cross-model review,
+/// round 5; re #469). The userland dir is never bound into any sandbox, and
+/// the file is keyed by the worktree path so concurrent worktrees keep
+/// separate caches. Store items are immutable, so the cache holds while the
+/// root set matches, every scanned file's (mtime, len) matches, and every
+/// item still exists AND is a declared root or a top-level item of the seed
+/// store (anything else — a host path, a nested path — is a cache miss, and
+/// the re-scan can only produce store items) — a rebuilt stage0 re-scans one
+/// file; a changed root set or a GC'd item re-scans the closure. Returns the
+/// sorted item paths (roots included).
 fn loop_store_items(
     root: &Path,
     roots: &[String],
@@ -674,8 +683,18 @@ fn loop_store_items(
         return Ok(Vec::new());
     };
     let store_dir = store_dir.as_str();
-    let cache_path = root.join(".td-build-cache/loop-closure.list");
-    let cached = read_closure_cache(&cache_path);
+    // The pre-round-5 location was `root/.td-build-cache/…` — inside the tree
+    // every gate sandbox mounts read-write. Sweep it unconditionally so a
+    // poisoned leftover can never be re-read by an older binary.
+    let _ = std::fs::remove_file(root.join(".td-build-cache/loop-closure.list"));
+    let cache_path = loop_closure_cache_path(root).ok();
+    if cache_path.is_none() {
+        eprintln!(
+            "td-builder check: WARNING: no loop-userland dir for the loop-closure cache — \
+             re-scanning every run"
+        );
+    }
+    let cached = cache_path.as_deref().and_then(read_closure_cache);
 
     // The scanner (a readdir of the whole seed store + the candidate index) is
     // built lazily, at most once — the warm path (nothing changed) never pays it.
@@ -713,18 +732,24 @@ fn loop_store_items(
         files.push((f.clone(), mtime, len, refs));
     }
 
-    if let Some(c) = &cached {
+    if let Some((c, cache_path)) = cached.as_ref().zip(cache_path.as_deref()) {
         // Hit iff the root set matches, every root made it into the cached
         // items (belt-and-braces against a torn cache — the write is atomic,
-        // see write_closure_cache), and every item still exists (store GC).
+        // see write_closure_cache), and every item still exists (store GC)
+        // AND has the only shape a rescan could produce — a declared root or
+        // a top-level seed-store item. The cache is an accelerator, never an
+        // authority: an entry the scanner could not have written (a host
+        // path, a nested path) is a miss, not a bind.
         if c.roots == all_roots
             && all_roots.iter().all(|r| c.items.contains(r))
-            && c.items.iter().all(|i| Path::new(i).exists())
+            && c.items
+                .iter()
+                .all(|i| cached_item_admissible(&all_roots, store_dir, i) && Path::new(i).exists())
         {
             // Same closure; refresh the signatures if only those moved (e.g. a
             // rebuilt stage0 whose refs did not change).
             if c.files != files {
-                if let Err(e) = write_closure_cache(&cache_path, &files, &all_roots, &c.items) {
+                if let Err(e) = write_closure_cache(cache_path, &files, &all_roots, &c.items) {
                     eprintln!("td-builder check: WARNING: loop-closure cache not written ({e})");
                 }
             }
@@ -734,7 +759,7 @@ fn loop_store_items(
 
     eprintln!(
         "td-builder check: content-scanning the loop's seed-lock closure ({} roots; \
-         cached in .td-build-cache/loop-closure.list for later runs)",
+         cached under the loop-userland dir for later runs)",
         all_roots.len()
     );
     let st = ensure_scanner(&mut scan_state, store_dir)?;
@@ -742,8 +767,10 @@ fn loop_store_items(
     let root_list: Vec<String> = all_roots.iter().cloned().collect();
     let seen = crate::scan_closure_hybrid(&mut st.0, &st.1, &empty, &root_list)?;
     let items: Vec<String> = seen.into_iter().collect();
-    if let Err(e) = write_closure_cache(&cache_path, &files, &all_roots, &items) {
-        eprintln!("td-builder check: WARNING: loop-closure cache not written ({e})");
+    if let Some(cache_path) = cache_path.as_deref() {
+        if let Err(e) = write_closure_cache(cache_path, &files, &all_roots, &items) {
+            eprintln!("td-builder check: WARNING: loop-closure cache not written ({e})");
+        }
     }
     Ok(items)
 }
@@ -801,6 +828,34 @@ fn file_sig(path: &str) -> Result<(u64, u64), String> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0));
     Ok((mtime, md.len()))
+}
+
+/// Where the loop-closure cache lives: under `loop_userland_dir()` — the one
+/// state dir the loop NEVER binds into any sandbox — keyed by a hash of the
+/// worktree path so concurrent worktrees keep separate caches. It must not
+/// live in the worktree: the cache names the exact `--store-item` binds of
+/// the NEXT run, and the worktree is bound read-write into every gate
+/// sandbox, so an in-tree cache was writable by the very code it later
+/// admits (cross-model review, round 5; re #469).
+fn loop_closure_cache_path(root: &Path) -> Result<PathBuf, String> {
+    let mut h = crate::sha256::Sha256::new();
+    h.update(root.display().to_string().as_bytes());
+    let key = crate::sha256::to_base16(&h.finalize());
+    let key = key.get(..16).unwrap_or(&key);
+    Ok(loop_userland_dir()?.join(format!("loop-closure.{key}.list")))
+}
+
+/// A cached closure item is admissible only in the shapes a live re-scan can
+/// produce: a declared root, or a TOP-LEVEL item of the seed store (the
+/// scanner's candidate index is a readdir of `store_dir`). Anything else —
+/// a host path, a path nested inside an item — cannot have come from the
+/// scanner, so it is a cache miss, never a bind.
+fn cached_item_admissible(
+    all_roots: &std::collections::BTreeSet<String>,
+    store_dir: &str,
+    item: &str,
+) -> bool {
+    all_roots.contains(item) || Path::new(item).parent() == Some(Path::new(store_dir))
 }
 
 /// Read the loop-closure cache (tab-separated `file`/`fref`/`root`/`item`
@@ -2217,6 +2272,45 @@ ccc-relative not/absolute
         assert!(read_closure_cache(&path).is_none());
         // A missing cache file is simply a miss.
         assert!(read_closure_cache(&d.join("absent.list")).is_none());
+    }
+
+    #[test]
+    fn closure_cache_items_must_be_roots_or_top_level_store_items() {
+        // The cache-hit gate: only shapes a live re-scan could produce are
+        // admissible. A well-formed cache line naming a host binary or a
+        // nested path is a MISS (re-scan), never a bind (re #469).
+        let roots: std::collections::BTreeSet<String> = [
+            "/td/store/aaa-bash-5.2.37".to_string(),
+            // A root is admissible wherever it lives — the caller declared it.
+            "/opt/seed/bbb-stage0".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let store = "/td/store";
+        assert!(cached_item_admissible(&roots, store, "/td/store/aaa-bash-5.2.37"));
+        assert!(cached_item_admissible(&roots, store, "/opt/seed/bbb-stage0"));
+        assert!(cached_item_admissible(&roots, store, "/td/store/ggg-glibc-2.41"));
+        // Host paths, nested paths, the store dir itself, and near-miss
+        // prefixes ("/td/store2") are all inadmissible.
+        assert!(!cached_item_admissible(&roots, store, "/bin/sh"));
+        assert!(!cached_item_admissible(&roots, store, "/usr/bin/env"));
+        assert!(!cached_item_admissible(&roots, store, "/td/store/ggg-glibc-2.41/lib/libc.so.6"));
+        assert!(!cached_item_admissible(&roots, store, "/td/store"));
+        assert!(!cached_item_admissible(&roots, store, "/td/store2/evil-item"));
+    }
+
+    #[test]
+    fn closure_cache_path_is_outside_the_worktree_and_keyed_by_it() {
+        // The cache must live under loop_userland_dir() (never bound into a
+        // sandbox), not under the gate-writable worktree, and two worktrees
+        // must not share a cache file.
+        let a = loop_closure_cache_path(Path::new("/w/one")).unwrap();
+        let b = loop_closure_cache_path(Path::new("/w/two")).unwrap();
+        assert_ne!(a, b);
+        assert!(!a.starts_with("/w/one"));
+        let dir = loop_userland_dir().unwrap();
+        assert!(a.starts_with(&dir));
+        assert!(b.starts_with(&dir));
     }
 
     #[test]

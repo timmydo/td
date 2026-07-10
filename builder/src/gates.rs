@@ -34,7 +34,13 @@
 //!
 //! A GateDef's `script` is PLAIN POSIX SHELL (no make escaping), executed as
 //! one `sh -c` with cwd = repo root — inside the loop sandbox `sh` is the
-//! td-built busybox ash, so no bashisms. (The remaining deferred corpus/seed gates
+//! td-built busybox ash, so no bashisms. One deliberate extension: gate
+//! bodies rely on `set -o pipefail` (POSIX.1-2024, not in older POSIX sh) to
+//! keep a red left of a pipe from being greened by the right side — safe
+//! because the interpreter is not "whatever sh" but the PINNED busybox
+//! (1.37.0) ash the loop itself built, which supports it; a shell without
+//! pipefail errors on the `set` line (fail-closed), never mis-greens.
+//! (The remaining deferred corpus/seed gates
 //! realize their guix-built seed by calling host `guix` directly — the seed
 //! bytes retire last per the north star / #412.) Output is buffered per gate
 //! (`--output-sync=target`

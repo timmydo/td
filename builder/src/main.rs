@@ -3156,6 +3156,15 @@ fn auto_synthesize_lock(
 /// GUIX-STORE (the plan's seed store), so the map cannot smuggle a host path in as a
 /// `seed` lock entry (re #469).
 ///
+/// TRUST BOUNDARY: this arm is the runner's PRIVATE BACKEND, not a production
+/// entrance. Origin authority lives in the calling td-recipe-eval runner,
+/// which re-derives every seed from its COMPILED pin table each run and hands
+/// this arm an already-reconciled MAP/SEED-STORE/SEED-DB. The gates here
+/// (self-authenticating content addresses, typed lock classes, strict
+/// staging) are defense in depth against a drifted or tampered store — an
+/// operator invoking this arm directly with a forged map is outside the
+/// boundary, the same trust class as pointing TD_RECIPE_EVAL at old code.
+///
 /// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_plan_auto(
