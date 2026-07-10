@@ -1,0 +1,45 @@
+# seed/seed-digests.txt — the compiled seed-digest table (re #469).
+# Every admissible seed input's expected store basename, derived from its
+# compiled pin. Compiled into td-recipe-eval (enforced after every seed
+# derivation) and td-builder (enforced at build-plan lock synthesis).
+# Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`
+# (warm source cache required) when a pin, seed patch, or the stage0
+# source changes. Hand-editing a row is self-defeating: the runner
+# re-derives from the pins every run and reds on disagreement.
+binutils-244-source 8xzd2kk7j2pj9fhkmab3ajhgpmccgidj-binutils-244-source
+binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
+busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
+gawk-mesboot-source 128bh62a669ds6v5q6v2sih5a1qk51wj-gawk-mesboot-source
+gcc-14-source 2h3c0xxmf2jf5hywqbmlsnww6cwkq4nq-gcc-14-source
+gcc-464-core 50l0crhlqjqajvfkvjj31bxz842h5fkm-gcc-464-core
+gcc-464-gpp 364rq9bch5a1cli1ifbhihic3vdl52ch-gcc-464-gpp
+gcc-494-source c5ddkcv6f1k52y8za3b6sbq04lpf191p-gcc-494-source
+gcc-core-source vf4mh5x4hyynyi9j8bah0frd4fsyxpp3-gcc-core-source
+glibc-216-source wvrdmqvnxn33akmzz6h5zr1k5s07dx14-glibc-216-source
+glibc-241-source 2lavxgwvm5ppn98l05pqa7sszb4kfkk4-glibc-241-source
+glibc-mesboot0-source 534qradv895g6ygp2dmrniyzpvz4sc5a-glibc-mesboot0-source
+gmp kb9mnqdvrr77gcgsc746pa1xmpaiazc0-gmp
+gmp63 a1sfm9d525pjz2if348xssl3wprnr21f-gmp63
+linux-headers fy4caw4q7lsgdisqwz8dhfdgiwky9pxw-linux-headers
+linux-headers-x86-64 8makj3qb694bws0bdvqhm74az3i3ip58-linux-headers-x86-64
+make-mesboot-source rsml6snylx4zpf1isi6h9mi1v3g6qya7-make-mesboot-source
+make-mesboot0-source prv2pgbxapfby18j22f39al25q2ava5i-make-mesboot0-source
+make-x86-64-source 957gwrna22f6idxmqsi36mnl2syy4wiy-make-x86-64-source
+mes-source lfcpi8i0ibf60snpa02jxs02dqva7aw1-mes-source
+mpc 0yri90zk0l2pf6g3id2bji6mbmxf8clv-mpc
+mpc131 n09rmavjm1bn6gdc1s22n98g9hi10yah-mpc131
+mpfr fmix8a94cf9k1pljgqbaxd2xb2826k72-mpfr
+mpfr421 q1q1frz86nxa7p76pl3r8lb01hv51b6v-mpfr421
+nyacc 6rs0scnal207ixn5sd1li8r8yk7cyp6i-nyacc
+patch-binutils-boot-2.20.1a 93pjhga2p78scynm6nbfbzb69rk7ckr2-patch-binutils-boot-2.20.1a
+patch-gcc-boot-2.95.3 srn2fpr2p2rny43l2j7218hsmwijk1rq-patch-gcc-boot-2.95.3
+patch-gcc-boot-4.6.4 sv9nwgy6k421ivq29j9pyvrvjwgjay1x-patch-gcc-boot-4.6.4
+patch-glibc-boot-2.16.0 rrxkmri38krpp2lcq17d3r6iy5syq9qk-patch-glibc-boot-2.16.0
+patch-glibc-boot-2.2.5 qcs888irnnqm8bybmlbgapyvbbc844ka-patch-glibc-boot-2.2.5
+patch-glibc-bootstrap-system-2.16.0 nggbvl93zgr74xf9x50331yfgsw4hh0r-patch-glibc-bootstrap-system-2.16.0
+patch-glibc-bootstrap-system-2.2.5 wjhcnyy2wspd9bf312ql84gfmvivixs2-patch-glibc-bootstrap-system-2.2.5
+patch-mesboot-source r3w1jmlradg89l3av29y1ifp7y312pk9-patch-mesboot-source
+rust-toolchain-source 853r9awaviv9yfgdrcqv1wrv3qn4g56p-rust-toolchain-source
+stage0-source ma16im40lnb5dldxwglzzs7iqpzfiz4m-stage0-source
+tcc-source mhwyc6lcd16pxbln8kwvc4ia5zisf8fn-tcc-source
+zlib-x86-64-source bpbym1fyb9bbzs3398h55hqnj4lxp47c-zlib-x86-64-source

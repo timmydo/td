@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -83,6 +83,71 @@ pub fn build_cli(args: &[String]) -> Result<(), String> {
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     runner.build_recipe_target(target, &outputs)
+}
+
+/// The full pinned-seed universe of the catalog: every seed input ANY recipe
+/// declares, classified PER INPUT — a sibling input with no admissible
+/// provenance (which reds the whole graph at planning) does not hide the
+/// pinned seeds the same recipe declares. Shared by the `seed-digests`
+/// generator and the table-coverage test so both walk the same universe.
+fn catalog_seed_universe() -> Result<Vec<SeedInput>, String> {
+    let mut seen = HashSet::new();
+    let mut seeds = Vec::new();
+    for (_, recipe) in catalog::all() {
+        if let Some(key) = &recipe.source_input {
+            push_seed_input(&mut seeds, &mut seen, seed_input_for_recipe_source(key, &recipe)?);
+        }
+        for input in recipe
+            .inputs
+            .iter()
+            .chain(recipe.native_inputs.iter())
+            .flatten()
+        {
+            if catalog::lookup(input).is_some() {
+                continue;
+            }
+            if let Some(seed) = seed_input_for_recipe_input(input)? {
+                push_seed_input(&mut seeds, &mut seen, seed);
+            }
+        }
+    }
+    Ok(seeds)
+}
+
+/// seed-digests: derive the catalog's whole pinned-seed universe
+/// (`catalog_seed_universe` — every seed any recipe declares, including
+/// recipes whose graphs currently red at planning on OTHER inputs) from the
+/// compiled pins, through the exact `derive_seed_input` path the runner
+/// enforces, and print the full seed/seed-digests.txt content — header
+/// comment plus sorted `key basename` rows — on stdout. Requires the warm
+/// source cache, like any ladder run.
+pub fn seed_digests_cli() -> Result<(), String> {
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let runner = RecipeCheckRunner::new(root, "seed-digests")?;
+    let _lock = lock_file(&runner.lock_path())?;
+    runner.setup()?;
+    let mut rows: BTreeMap<String, String> = BTreeMap::new();
+    for input in catalog_seed_universe()? {
+        let derived = runner.derive_seed_input(&input)?;
+        rows.insert(
+            input.key().to_string(),
+            path_basename_str(&derived)?.to_string(),
+        );
+    }
+    println!(
+        "# seed/seed-digests.txt — the compiled seed-digest table (re #469).\n\
+         # Every admissible seed input's expected store basename, derived from its\n\
+         # compiled pin. Compiled into td-recipe-eval (enforced after every seed\n\
+         # derivation) and td-builder (enforced at build-plan lock synthesis).\n\
+         # Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`\n\
+         # (warm source cache required) when a pin, seed patch, or the stage0\n\
+         # source changes. Hand-editing a row is self-defeating: the runner\n\
+         # re-derives from the pins every run and reds on disagreement."
+    );
+    for (k, b) in &rows {
+        println!("{k} {b}");
+    }
+    Ok(())
 }
 
 fn usage() -> String {
@@ -557,12 +622,14 @@ impl RecipeCheckRunner {
     /// recorded re-hash-every-step decision as the StageManifest, trading
     /// warm-run time for a boundary with no trusted mutable state.
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<(), String> {
-        let derived = match input {
-            SeedInput::Stage0 { key } => self.intern_stage0_source(key)?,
-            SeedInput::Source { key, pin } => self.intern_source(key, pin)?,
-            SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch)?,
-            SeedInput::Patch { key, patch } => self.intern_patch(key, patch)?,
-        };
+        let derived = self.derive_seed_input(input)?;
+        // The COMPILED table must vouch for the derivation (re #469): pin
+        // verification proves the fetched artifact, but a GENERATED seed (the
+        // kernel-headers tarball) has no upstream pin — the compiled expected
+        // digest is what binds its bytes; and every seed's expected basename
+        // being compiled in is what lets td-builder reject a forged map even
+        // when invoked directly.
+        crate::seed_digests::require(input.key(), path_basename_str(&derived)?)?;
         if reconcile_seed_map_entry(
             input.key(),
             self.map_value_opt(input.key())?.as_deref(),
@@ -571,6 +638,20 @@ impl RecipeCheckRunner {
             self.append_src_map(input.key(), &derived)?;
         }
         self.stage_store_path(&derived)
+    }
+
+    /// Derive ONE classified seed from its compiled pin — verify, intern, and
+    /// return the content-addressed store path. Shared by the enforcement
+    /// path (`ensure_seed_input`) and the table generator (`seed-digests`),
+    /// so the printed table is produced by the exact derivation the runner
+    /// later enforces.
+    fn derive_seed_input(&self, input: &SeedInput) -> Result<String, String> {
+        match input {
+            SeedInput::Stage0 { key } => self.intern_stage0_source(key),
+            SeedInput::Source { key, pin } => self.intern_source(key, pin),
+            SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch),
+            SeedInput::Patch { key, patch } => self.intern_patch(key, patch),
+        }
     }
 
     pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
@@ -1197,6 +1278,30 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The compiled seed-digest table and the catalog must agree EXACTLY
+    // (re #469): a seed key any recipe declares without a compiled digest
+    // would red at derivation, and an orphan row pins nothing. Cold-safe:
+    // walks the compiled catalog + pins only, no warm sources. On mismatch,
+    // regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`.
+    #[test]
+    fn seed_digest_table_covers_the_catalog_seed_universe() {
+        let universe: std::collections::BTreeSet<String> = catalog_seed_universe()
+            .unwrap()
+            .iter()
+            .map(|s| s.key().to_string())
+            .collect();
+        let table: std::collections::BTreeSet<String> = crate::seed_digests::rows()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| (*k).to_string())
+            .collect();
+        assert_eq!(
+            universe, table,
+            "seed/seed-digests.txt must pin exactly the catalog's pinned-seed universe — \
+             regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`"
+        );
+    }
 
     // The srcs.map is a cache, never an authority (re #469): a fresh
     // pin-derivation must agree with a prior entry or planning reds — the

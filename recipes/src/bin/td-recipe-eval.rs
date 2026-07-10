@@ -32,6 +32,8 @@ use td_recipe::catalog;
 mod check_runner;
 #[path = "td_recipe_eval/checks/mod.rs"]
 mod checks;
+#[path = "td_recipe_eval/seed_digests.rs"]
+mod seed_digests;
 #[path = "td_recipe_eval/sha256.rs"]
 mod sha256;
 
@@ -204,7 +206,15 @@ fn main() {
             }
             print_source_pins();
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|source-pins ..."),
+        Some("seed-digests") => {
+            if args.get(2).is_some() {
+                die("usage: seed-digests");
+            }
+            if let Err(e) = check_runner::seed_digests_cli() {
+                die_runner(&e);
+            }
+        }
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|source-pins|seed-digests ..."),
     }
 }
 

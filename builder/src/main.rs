@@ -3050,19 +3050,51 @@ fn auto_map_lookup(map: &std::collections::BTreeMap<String, String>, name: &str)
 /// be SELF-AUTHENTICATING: seeds are interned content-addressed
 /// (`make_store_path("source", sha256(NAR), name)`), so the on-disk bytes are
 /// re-hashed here and the path is recomputed from them — a name whose digest its own
-/// bytes cannot reproduce reds. That is an INTEGRITY gate, not origin proof:
-/// it kills renamed items, post-intern tampering, and any lock/map entry that
-/// names bytes other than the ones on disk, but bytes honestly interned
-/// through the public `store-add-recursive` verb carry their own valid
-/// content address by construction. Origin authority is the CALLING
-/// td-recipe-eval runner, which re-derives every seed from its compiled pin
-/// table each run and reconciles srcs.map against the derivation
-/// (`reconcile_seed_map_entry`) before this arm ever sees the map — see the
-/// trust-boundary note on `build_plan_auto`. (Cost: one NAR hash per seed
+/// bytes cannot reproduce reds. AND the key→basename binding must match the
+/// COMPILED seed-digest table (`seed_digests`, the same repo file
+/// td-recipe-eval compiles in): the table pins which basename each seed key
+/// may resolve to, so a forged MAP/SEED-STORE/SEED-DB triple — internally
+/// consistent but never derived from the pins — reds here even when
+/// td-builder is invoked directly with caller-supplied files. Origin
+/// authority is compiled in; the content-address recomputation then proves
+/// the on-disk bytes ARE the pinned bytes. (Cost: one NAR hash per seed
 /// entry per synthesis — the same recorded re-hash-every-step decision as
 /// `StageManifest`.) A bare host path (`/usr/bin/env`), a foreign store path
 /// (`/gnu/store/…`), or a never-interned name all red here too — the MAP file is
 /// NOT a channel that can type arbitrary host paths as seeds.
+/// The COMPILED seed-digest table (re #469): `seed/seed-digests.txt`, the
+/// same audited repo file td-recipe-eval compiles in — key → the store
+/// basename its pinned bytes derive. Compiled into the binary so the
+/// authority travels with td-builder itself; a caller-supplied map/store/db
+/// cannot substitute for it. Malformed rows are a hard error (trust anchor,
+/// never best-effort).
+const SEED_DIGESTS: &str = include_str!("../../seed/seed-digests.txt");
+
+/// The compiled expected basename for a seed key, if pinned.
+fn seed_digests_expected(key: &str) -> Result<Option<&'static str>, String> {
+    for (n, line) in SEED_DIGESTS.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next(), it.next()) {
+            (Some(k), Some(base), None) if !base.contains('/') => {
+                if k == key {
+                    return Ok(Some(base));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "seed/seed-digests.txt line {}: malformed row `{line}' (want `key basename')",
+                    n + 1
+                ))
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn auto_seed_provenance(
     store_prefix: &str,
     seed_store: &Path,
@@ -3081,6 +3113,27 @@ fn auto_seed_provenance(
              input, re #469)"
         ));
     };
+    // COMPILED origin binding first (cheap, no IO): the seed-digest table
+    // pins which basename this key may resolve to. A key the table does not
+    // pin, or a basename the pins never derived, is inadmissible regardless
+    // of how self-consistent the caller's store and db are.
+    match seed_digests_expected(key)? {
+        None => {
+            return Err(format!(
+                "--auto: provenance rejected: recipe `{name}' input `{key}' has no compiled \
+                 expected digest (seed/seed-digests.txt) — an unpinned seed key is not \
+                 admissible, whatever the map resolves it to (re #469)"
+            ))
+        }
+        Some(exp) if exp != base => {
+            return Err(format!(
+                "--auto: provenance rejected: recipe `{name}' input `{key}' resolves to \
+                 `{base}' but the compiled table pins `{exp}' — the map names bytes the \
+                 pinned seed never derived (re #469)"
+            ))
+        }
+        Some(_) => {}
+    }
     let on_disk = seed_store.join(base);
     if !on_disk.exists() {
         return Err(format!(
@@ -7779,6 +7832,68 @@ daemon build START (2/2 active)
         path
     }
 
+    fn seed_repo_root() -> PathBuf {
+        // builder/ → repo root.
+        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    }
+
+    // Intern the REAL repo bytes of a compiled-table PATCH seed under its key —
+    // the one seed class whose bytes live in the repo (cold-CI safe), so
+    // green-path tests exercise the same compiled seed-digest gate production
+    // does: the derived basename must agree with seed/seed-digests.txt.
+    fn intern_real_patch_seed(seeds: &Path, key: &str) -> String {
+        let stem = key.strip_prefix("patch-").unwrap();
+        let bytes = std::fs::read(
+            seed_repo_root().join("seed/patches").join(format!("{stem}.patch")),
+        )
+        .unwrap();
+        let path = intern_test_seed(seeds, key, &bytes);
+        let base = path.rsplit('/').next().unwrap();
+        assert_eq!(
+            seed_digests_expected(key).unwrap(),
+            Some(base),
+            "repo patch bytes must derive the pinned basename for {key} — regenerate \
+             seed/seed-digests.txt if the patch changed"
+        );
+        path
+    }
+
+    // Every compiled-table row backed by an in-repo patch file must recompute
+    // from those bytes — the cold-CI freshness gate for the table: a changed
+    // patch without a regenerated table reds here, not first at ladder time.
+    #[test]
+    fn seed_digest_patch_rows_recompute_from_the_repo_bytes() {
+        let mut verified = 0usize;
+        for line in SEED_DIGESTS.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            let (Some(key), Some(pinned)) = (it.next(), it.next()) else {
+                panic!("malformed row {line}");
+            };
+            let Some(stem) = key.strip_prefix("patch-") else {
+                continue;
+            };
+            let file = seed_repo_root().join("seed/patches").join(format!("{stem}.patch"));
+            if !file.is_file() {
+                continue; // a `patch-`-prefixed SOURCE pin (tarball), not a repo patch
+            }
+            let nar = nar_hash_path(&file).unwrap();
+            let hex = nar.strip_prefix("sha256:").unwrap();
+            let derived = store::make_store_path_in("/td/store", "source", hex, key);
+            let derived_base = derived.rsplit('/').next().unwrap();
+            assert_eq!(
+                derived_base, pinned,
+                "seed/seed-digests.txt row for {key} does not match the repo patch bytes — \
+                 regenerate with `td-recipe-eval seed-digests`"
+            );
+            verified += 1;
+        }
+        assert!(verified > 0, "no in-repo patch rows verified — table missing patches?");
+    }
+
     // --auto: synthesize a recipe's WHOLE lock straight from its declared graph — no
     // hand-written base lock (#429). An owned dep (its own recipe JSON exists) becomes a
     // `td-recipe-output` pending placeholder; every other declared input resolves through
@@ -7790,46 +7905,52 @@ daemon build START (2/2 active)
         let d = std::env::temp_dir().join(format!("td-auto-synth-{}", std::process::id()));
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
+        // Seed inputs must be REAL compiled-table keys with their audited repo
+        // bytes — the table gate reds anything else at synthesis now.
         std::fs::write(
             d.join("gcc-mesboot0.json"),
-            r#"{"name":"gcc-mesboot0","sourceInput":"gcc-core-source","nativeInputs":["binutils-mesboot0"],"inputs":["flex","bison"]}"#,
+            r#"{"name":"gcc-mesboot0","sourceInput":"patch-gcc-boot-2.95.3","nativeInputs":["binutils-mesboot0"],"inputs":["patch-glibc-boot-2.16.0","patch-glibc-boot-2.2.5"]}"#,
         )
         .unwrap();
         std::fs::write(d.join("binutils-mesboot0.json"), r#"{"name":"binutils-mesboot0"}"#).unwrap();
         let mut map = std::collections::BTreeMap::new();
-        let gcc = intern_test_seed(&seeds, "gcc-core-2.95.3", b"gcc bytes");
-        let flex = intern_test_seed(&seeds, "flex-2.6", b"flex bytes");
-        let bison = intern_test_seed(&seeds, "bison-3.8", b"bison bytes");
-        map.insert("gcc-core-source".to_string(), gcc.clone());
-        map.insert("flex".to_string(), flex.clone());
-        map.insert("bison".to_string(), bison.clone());
+        let src = intern_real_patch_seed(&seeds, "patch-gcc-boot-2.95.3");
+        let in_a = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.16.0");
+        let in_b = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.2.5");
+        map.insert("patch-gcc-boot-2.95.3".to_string(), src.clone());
+        map.insert("patch-glibc-boot-2.16.0".to_string(), in_a.clone());
+        map.insert("patch-glibc-boot-2.2.5".to_string(), in_b.clone());
         let got =
             auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds)
                 .unwrap();
-        assert!(got.contains(&format!("gcc-mesboot0-source {gcc} source")));
+        assert!(got.contains(&format!("gcc-mesboot0-source {src} source")));
         assert!(got.contains("binutils-mesboot0 /td/store/pending-binutils-mesboot0 td-recipe-output"));
-        assert!(got.contains(&format!("flex {flex} seed")));
-        assert!(got.contains(&format!("bison {bison} seed")));
+        assert!(got.contains(&format!("patch-glibc-boot-2.16.0 {in_a} seed")));
+        assert!(got.contains(&format!("patch-glibc-boot-2.2.5 {in_b} seed")));
         std::fs::remove_dir_all(&d).ok();
     }
 
-    // The registered-host-item behavioral red (re #469): `store-add-recursive` is a
+    // The registered-host-item behavioral reds (re #469): `store-add-recursive` is a
     // public verb, so a seed store + db pair can be MADE to vouch for arbitrary host
-    // bytes. Planning must therefore not accept existence as authority: an item whose
-    // bytes do not content-address to its own name — a host binary parked under a
-    // canonical-looking basename, or an interned item whose bytes were swapped after
-    // registration — reds at synthesis even though the file exists (and even though a
-    // matching db row could be forged beside it). Verified red: before the
-    // self-authentication check, both cases below PASSED `auto_seed_provenance`.
+    // bytes. Planning must therefore not accept existence — or even honest
+    // self-consistency — as authority. Three layers, each red separately below:
+    // an UNPINNED key reds against the compiled seed-digest table whatever it
+    // resolves to; a pinned key resolving to an honestly content-addressed item
+    // the pins never derived (the forged-but-self-consistent store) reds against
+    // the table's basename; and an item whose bytes were swapped after interning
+    // reds at the NAR recompute. Verified red: before these checks, every case
+    // below PASSED `auto_seed_provenance`.
     #[test]
     fn auto_seed_provenance_rejects_self_registered_and_tampered_items() {
         let d = std::env::temp_dir().join(format!("td-auto-selfreg-{}", std::process::id()));
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
-        // Green: a genuinely content-addressed item passes.
-        let good = intern_test_seed(&seeds, "mes-0.27.1", b"pinned source bytes");
-        auto_seed_provenance("/td/store", &seeds, "mes", "mes-source", &good).unwrap();
-        // Red 1: arbitrary bytes parked under a canonical-LOOKING name.
+        // Green: the audited repo bytes at the pinned basename pass.
+        let good = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.16.0");
+        auto_seed_provenance("/td/store", &seeds, "glibc-mesboot0", "patch-glibc-boot-2.16.0", &good)
+            .unwrap();
+        // Red 1: an unpinned key — arbitrary bytes parked under a
+        // canonical-LOOKING name red before any IO.
         let fake = format!("{}-bash-5.2", "0".repeat(32));
         std::fs::write(seeds.join(&fake), b"#!/bin/sh\nhost bash\n").unwrap();
         let err = auto_seed_provenance(
@@ -7841,13 +7962,35 @@ daemon build START (2/2 active)
         )
         .unwrap_err();
         assert!(err.contains("provenance rejected"), "{err}");
-        assert!(err.contains("content-address"), "{err}");
-        // Red 2: a real item whose bytes were swapped after interning.
+        assert!(err.contains("no compiled expected digest"), "{err}");
+        // Red 2: a pinned key resolving to an item that content-addresses
+        // honestly but was never derived from the pins — the forged
+        // map/store/db triple `build-plan --auto` used to accept.
+        let forged = intern_test_seed(&seeds, "patch-glibc-boot-2.2.5", b"not the audited patch");
+        let err = auto_seed_provenance(
+            "/td/store",
+            &seeds,
+            "glibc-mesboot0",
+            "patch-glibc-boot-2.2.5",
+            &forged,
+        )
+        .unwrap_err();
+        assert!(err.contains("provenance rejected"), "{err}");
+        assert!(err.contains("the compiled table pins"), "{err}");
+        // Red 3: the real item whose bytes were swapped after interning — the
+        // pinned basename no longer reproduces from its own bytes.
         let base = good.rsplit('/').next().unwrap();
         std::fs::write(seeds.join(base), b"tampered bytes").unwrap();
-        let err =
-            auto_seed_provenance("/td/store", &seeds, "mes", "mes-source", &good).unwrap_err();
+        let err = auto_seed_provenance(
+            "/td/store",
+            &seeds,
+            "glibc-mesboot0",
+            "patch-glibc-boot-2.16.0",
+            &good,
+        )
+        .unwrap_err();
         assert!(err.contains("provenance rejected"), "{err}");
+        assert!(err.contains("content-address"), "{err}");
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -8011,17 +8154,23 @@ daemon build START (2/2 active)
         std::fs::remove_dir_all(&d).ok();
     }
 
-    // --auto: a canonical-looking store path whose item was never interned in the seed
-    // store also reds at synthesis — the map cannot name seeds the classified planning
-    // pass didn't produce.
+    // --auto: even the exact PINNED basename reds at synthesis when the item was
+    // never interned in the seed store — the map cannot name seeds the classified
+    // planning pass didn't produce (uses a real table key so the compiled-table
+    // gate passes and the not-interned arm is what fires).
     #[test]
     fn auto_synthesize_lock_rejects_uninterned_seeds_at_planning() {
         let d = std::env::temp_dir().join(format!("td-auto-unintern-{}", std::process::id()));
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
-        std::fs::write(d.join("mes.json"), r#"{"name":"mes","inputs":["bash"]}"#).unwrap();
+        std::fs::write(
+            d.join("mes.json"),
+            r#"{"name":"mes","inputs":["patch-glibc-boot-2.16.0"]}"#,
+        )
+        .unwrap();
+        let pinned = seed_digests_expected("patch-glibc-boot-2.16.0").unwrap().unwrap();
         let mut map = std::collections::BTreeMap::new();
-        map.insert("bash".to_string(), "/td/store/aaa-bash".to_string());
+        map.insert("patch-glibc-boot-2.16.0".to_string(), format!("/td/store/{pinned}"));
         let err = auto_synthesize_lock(&d.to_string_lossy(), &map, "mes", "/td/store", &seeds)
             .unwrap_err();
         assert!(err.contains("provenance rejected"), "{err}");
@@ -8068,25 +8217,29 @@ daemon build START (2/2 active)
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         let mut map = std::collections::BTreeMap::new();
-        let flex = intern_test_seed(&seeds, "flex-2.6", b"flex bytes");
-        let bison = intern_test_seed(&seeds, "bison-3.8", b"bison bytes");
-        map.insert("flex".to_string(), flex);
-        map.insert("bison".to_string(), bison.clone());
-        std::fs::write(d.join("gcc-mesboot0.json"), r#"{"name":"gcc-mesboot0","inputs":["flex"]}"#).unwrap();
+        let in_a = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.16.0");
+        let in_b = intern_real_patch_seed(&seeds, "patch-glibc-boot-2.2.5");
+        map.insert("patch-glibc-boot-2.16.0".to_string(), in_a);
+        map.insert("patch-glibc-boot-2.2.5".to_string(), in_b.clone());
+        std::fs::write(
+            d.join("gcc-mesboot0.json"),
+            r#"{"name":"gcc-mesboot0","inputs":["patch-glibc-boot-2.16.0"]}"#,
+        )
+        .unwrap();
         let before =
             auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds)
                 .unwrap();
-        assert!(before.contains("flex"));
-        assert!(!before.contains("bison"));
+        assert!(before.contains("patch-glibc-boot-2.16.0"));
+        assert!(!before.contains("patch-glibc-boot-2.2.5"));
         std::fs::write(
             d.join("gcc-mesboot0.json"),
-            r#"{"name":"gcc-mesboot0","inputs":["flex","bison"]}"#,
+            r#"{"name":"gcc-mesboot0","inputs":["patch-glibc-boot-2.16.0","patch-glibc-boot-2.2.5"]}"#,
         )
         .unwrap();
         let after =
             auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds)
                 .unwrap();
-        assert!(after.contains(&format!("bison {bison} seed")));
+        assert!(after.contains(&format!("patch-glibc-boot-2.2.5 {in_b} seed")));
         assert_ne!(before, after, "synthesized lock did not change when declared inputs changed");
         std::fs::remove_dir_all(&d).ok();
     }
