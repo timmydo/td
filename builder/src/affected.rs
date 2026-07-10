@@ -1370,22 +1370,23 @@ pub fn main(args: &[String]) -> ExitCode {
     if !sel.targets.is_empty() {
         let code = run_self_check(&root, &sel.targets);
         // EXIT_UNPROVISIONED is the loop's documented "nothing could run
-        // here" machine signal — the daily's LegRc treats it as PARTIAL with
-        // no red bit, and the per-PR runner adopts the same policy. Today
-        // EVERY host is in that state: the bootstrap graph cannot build the
-        // loop userland without host scaffolding, which planning rejects
-        // (re #469) — the preflights above (cargo test, on the AGENTS.md
-        // rust-toolchain control plane) are the per-PR validation until the
-        // chain is self-hosting. Reported loudly, never silently green.
+        // here" machine signal (the daily's LegRc treats it as PARTIAL with
+        // no red bit). It is explained loudly here but PROPAGATED UNCHANGED —
+        // never rewritten to success: the run did not validate the targets,
+        // and the exit code must say so (PR review); the caller decides what
+        // PARTIAL means for its tier. Today EVERY host is in that state: the
+        // bootstrap graph cannot build the loop userland without host
+        // scaffolding, which planning rejects (re #469) — the preflights
+        // above (cargo test, on the AGENTS.md rust-toolchain control plane)
+        // are the per-PR validation until the chain is self-hosting.
         if code == crate::check_loop::EXIT_UNPROVISIONED {
             println!(
                 "affected-checks: check targets [{}] exited UNPROVISIONED (69) — the loop \
                  cannot run until the bootstrap graph builds its own userland (re #469); \
                  preflights above are the per-PR coverage, the daily backstop records the \
-                 gap as PARTIAL",
+                 gap as PARTIAL; exit code 69 propagated unchanged",
                 sel.targets.join(" ")
             );
-            return ExitCode::SUCCESS;
         }
         return ExitCode::from(code as u8);
     }

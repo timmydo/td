@@ -3852,6 +3852,18 @@ struct HostSandboxArgs {
     /// the declared items (not a boundary against a hostile gate, which owns
     /// the sandbox namespaces); only the DEST-mapped items' /td/store parent
     /// stays writable — the loop's working store prefix.
+    ///
+    /// NOT a host-ingress channel (re #469): `--store-item` binds whatever
+    /// path its CALLER names, but the callers are contained. Recipe builds
+    /// never reach this verb — they stage through `realize_drv`'s
+    /// hash-verified StageManifest. Gate bodies invoking it run INSIDE the
+    /// loop sandbox, whose mount namespace holds only the already-admitted
+    /// inputs (per-item binds + the worktree + /td/store), so any path a
+    /// nested invocation can name is already inside the boundary — host
+    /// paths do not exist there to be named. An operator running
+    /// `td-builder host-sandbox` directly on the host is the operator
+    /// debugging the sandbox itself: operator trust, outside the boundary,
+    /// same class as pointing TD_RECIPE_EVAL at old code.
     store_items: Vec<(String, Option<String>)>,
     /// `--no-daemon`: accepted for compatibility. The loop sandbox no longer binds
     /// the host daemon state in either mode.

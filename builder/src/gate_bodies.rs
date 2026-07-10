@@ -1975,13 +1975,21 @@ fn gate_input(name: &str) -> Result<String, String> {
 /// canonicalized. Resolves the absolute binary ourselves (Command's PATH search
 /// uses the CURRENT process env, not a child override).
 fn which_canon(bin: &str) -> Option<PathBuf> {
+    which_path(bin).and_then(|p| std::fs::canonicalize(p).ok())
+}
+
+/// PATH lookup WITHOUT canonicalizing: the entry as the caller would exec it.
+/// Multi-call userlands (a symlink farm at one binary) dispatch on argv[0], so
+/// a probe must exec THIS path — canonicalizing first would erase the program
+/// name. Which layout provides a program is the userland's business, never
+/// assumed here.
+fn which_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
+    std::env::split_paths(&path).find(|dir| {
         let p = dir.join(bin);
-        (p.is_file() && file_mode(&p).ok().is_some_and(|m| m & 0o111 != 0))
-            .then(|| std::fs::canonicalize(&p).ok())
-            .flatten()
+        p.is_file() && file_mode(&p).ok().is_some_and(|m| m & 0o111 != 0)
     })
+    .map(|dir| dir.join(bin))
 }
 
 /// The store root `/td/store` of a `/<first>/store/...` path (the shell's
@@ -2488,9 +2496,12 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
 /// userland items, the declared seed store holds the bounded seed-lock closure,
 /// and a bound item rejects writes).
 /// Port of tests/sandbox-hardening.sh (gate 272). Runs INSIDE the loop sandbox
-/// under the td-built userland — sh IS the static busybox, so probes needing an
-/// applet outside its farm (sleep) exec the busybox binary with the applet name
-/// as its first argument. The nested td-builder's processes are visible in this
+/// under the td-built userland. The probes resolve their programs (`sh`,
+/// `sleep`) from PATH like any consumer and bind the store item(s) those
+/// entries canonicalize into — NOTHING here assumes which package provides
+/// them (a multi-call farm today, discrete binaries tomorrow): the PATH entry
+/// itself is exec'd, so argv[0] keeps the program name and any layout
+/// dispatches correctly. The nested td-builder's processes are visible in this
 /// PID namespace, so a /proc cmdline scan confirms they are gone after the kill.
 fn sandbox_hardening(root: &Path) -> Result<(), String> {
     println!(
@@ -2500,21 +2511,52 @@ fn sandbox_hardening(root: &Path) -> Result<(), String> {
     let tb = tb()?;
     println!(">> td-builder (stage0, guix-free): {}", tb.display());
 
-    // PATH's sh canonicalizes to the td-built static busybox (the applet farm
-    // symlinks at it) — one item is the whole userland the probes need, and
-    // being static it drags no library closure into the nested sandboxes.
-    let busybox = which_canon("sh").ok_or_else(|| String::from("FAIL: no sh on PATH"))?;
-    let busybox_s = path_str(&busybox)?;
-    let sroot = store_root_for(&busybox_s)?;
-    let sh_item = Path::new(&busybox_s)
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| format!("FAIL: no package root above {busybox_s}"))?;
-    let sh_item_s = path_str(sh_item)?;
+    // Resolve the probes' programs from PATH — exec paths are the PATH
+    // entries themselves (argv[0] keeps the program name), bind targets are
+    // the store item(s) they canonicalize into. Derived per program; if a
+    // future userland provides sh and sleep from different packages, both
+    // items are bound.
+    let sh_exec = which_path("sh").ok_or_else(|| String::from("FAIL: no sh on PATH"))?;
+    let sh_exec_s = path_str(&sh_exec)?;
+    let sh_canon = which_canon("sh").ok_or_else(|| String::from("FAIL: no sh on PATH"))?;
+    let sh_canon_s = path_str(&sh_canon)?;
+    let sleep_exec = which_path("sleep").ok_or_else(|| String::from("FAIL: no sleep on PATH"))?;
+    let sleep_exec_s = path_str(&sleep_exec)?;
+    let sleep_canon =
+        which_canon("sleep").ok_or_else(|| String::from("FAIL: no sleep on PATH"))?;
+    let sleep_canon_s = path_str(&sleep_canon)?;
+    let sroot = store_root_for(&sh_canon_s)?;
+    let item_of = |canon: &str| -> Result<String, String> {
+        Path::new(canon)
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| format!("FAIL: no package root above {canon}"))
+            .and_then(path_str)
+    };
+    let sh_item_s = item_of(&sh_canon_s)?;
+    let sh_item = Path::new(&sh_item_s);
+    let sleep_item_s = item_of(&sleep_canon_s)?;
+    // The exec paths must live inside the bound items — a PATH entry outside
+    // any store item would exec on the host but not in the nested sandbox.
+    for (exec, canon, item) in [
+        (&sh_exec_s, &sh_canon_s, &sh_item_s),
+        (&sleep_exec_s, &sleep_canon_s, &sleep_item_s),
+    ] {
+        if !exec.starts_with(&format!("{item}/")) && !canon.starts_with(&format!("{item}/")) {
+            return Err(format!(
+                "FAIL: {exec} (-> {canon}) is not inside its own store item {item}"
+            ));
+        }
+    }
+    let mut bind_flags: Vec<&str> = vec!["--store-item", &sh_item_s];
+    if sleep_item_s != sh_item_s {
+        bind_flags.push("--store-item");
+        bind_flags.push(&sleep_item_s);
+    }
 
     // (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input
-    // absent. The nested sandbox binds ONLY the sh item — the same per-item
-    // input-only model the loop itself uses.
+    // absent. The nested sandbox binds ONLY the probes' own item(s) — the
+    // same per-item input-only model the loop itself uses.
     println!(
         ">> (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input absent"
     );
@@ -2526,18 +2568,12 @@ for leak in kmsg kvm mem sda sdb nvme0n1 input/event0; do
 done
 exit 0
 ";
+    let mut dev_args: Vec<&str> = vec!["host-sandbox"];
+    dev_args.extend_from_slice(&bind_flags);
+    dev_args.extend_from_slice(&["--", &sh_exec_s, "-c", dev_probe]);
     tb_out(
         &tb,
-        &[
-            "host-sandbox",
-            "--store-item",
-            &sh_item_s,
-            "--",
-            &busybox_s,
-            "sh",
-            "-c",
-            dev_probe,
-        ],
+        &dev_args,
         "minimal-/dev assertion — the sandbox /dev is not minimal (host device leak)",
     )?;
     println!("   /dev exposes the standard nodes; kmsg/kvm/mem/disks/input are absent");
@@ -2655,18 +2691,12 @@ exit 0
     // duration, so it must be a large integer (≈ sleeps forever); derive it from
     // this process's pid (unique in this PID namespace, no RNG needed).
     let marker = (1_000_000u64 + u64::from(std::process::id()) % 1_000_000).to_string();
-    let inner = format!("{busybox_s} sleep {marker} & {busybox_s} sleep {marker} & wait");
+    let inner = format!("{sleep_exec_s} {marker} & {sleep_exec_s} {marker} & wait");
+    let mut reap_args: Vec<&str> = vec!["host-sandbox"];
+    reap_args.extend_from_slice(&bind_flags);
+    reap_args.extend_from_slice(&["--", &sh_exec_s, "-c", &inner]);
     let mut child = Command::new(&tb)
-        .args([
-            "host-sandbox",
-            "--store-item",
-            &sh_item_s,
-            "--",
-            &busybox_s,
-            "sh",
-            "-c",
-            &inner,
-        ])
+        .args(&reap_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
