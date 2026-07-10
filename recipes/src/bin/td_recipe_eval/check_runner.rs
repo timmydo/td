@@ -13,6 +13,28 @@ use td_recipe::{
 
 pub(crate) const TD_STORE_DIR: &str = "/td/store";
 
+/// The stable in-crate marker for a planning-time provenance rejection.
+/// `main` maps an error carrying it to exit 69 (EX_UNAVAILABLE — the same
+/// "nothing can run here" signal td-builder's loop uses for
+/// EXIT_UNPROVISIONED): the graph is structurally unbuildable on EVERY host
+/// until the rejected input exists as a td recipe output — a bootstrap gap,
+/// not a code regression. The cross-process contract is the exit code; this
+/// prose never crosses a process boundary as an interface.
+pub(crate) const PROVENANCE_REJECTED: &str = "provenance rejected: ";
+
+/// A graph input with no admissible provenance (issue #469): not a recipe
+/// output, not a pinned seed source. Names the recipe and the input so the
+/// gap is actionable — the fix is always "build it as a rung", never "point
+/// at a host path".
+fn provenance_rejection(stem: &str, input: &str) -> String {
+    format!(
+        "{PROVENANCE_REJECTED}recipe {stem}: input `{input}' is neither a td recipe \
+         output (catalog) nor a pinned seed source/patch. Host executables are not \
+         admissible bootstrap inputs (re #469) — the chain must build `{input}' as a \
+         recipe output before anything can declare it."
+    )
+}
+
 pub fn cli(args: &[String]) -> Result<(), String> {
     let stem = args.first().ok_or_else(usage)?.as_str();
     let scope = args.get(1).map(String::as_str).unwrap_or("daily");
@@ -275,8 +297,7 @@ impl RecipeCheckRunner {
         let warm = fs::read_to_string(&setup_ok)
             .map(|s| s == pinsum)
             .unwrap_or(false)
-            && self.lw.join("srcs.map").is_file()
-            && self.lw.join("tools.map").is_file();
+            && self.lw.join("srcs.map").is_file();
         if warm {
             return Ok(());
         }
@@ -284,21 +305,24 @@ impl RecipeCheckRunner {
         remove_path_if_exists(&self.store)?;
         remove_path_if_exists(&self.db)?;
         remove_path_if_exists(&self.lw.join("srcs.map"))?;
+        // tools.map: nothing writes it anymore (the host-tool resolution it
+        // carried is deleted, re #469) — scrub the stale pre-v8 artifact.
         remove_path_if_exists(&self.lw.join("tools.map"))?;
         remove_path_if_exists(&setup_ok)?;
         fs::create_dir_all(&self.store)
             .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
         File::create(self.lw.join("srcs.map")).map_err(|e| format!("create srcs.map: {e}"))?;
-        File::create(self.lw.join("tools.map")).map_err(|e| format!("create tools.map: {e}"))?;
         fs::write(&setup_ok, pinsum).map_err(|e| format!("write {}: {e}", setup_ok.display()))?;
         Ok(())
     }
 
+    // v8: the seed-tools lock (and with it every host-tool ladder input) is
+    // DELETED — the pinsum keys only what the chain may consume: the pinned
+    // sources and the in-repo seed patches. The bump itself wipes every ladder
+    // store built with host scaffolding, so nothing tainted is grandfathered.
     fn setup_pinsum(&self) -> Result<String, String> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"ladder-setup-v7\n");
-        append_file_bytes(&self.root.join("tests/td-subst.lock"), &mut bytes)?;
-        append_file_bytes(&self.root.join("tests/td-seed-tools.lock"), &mut bytes)?;
+        bytes.extend_from_slice(b"ladder-setup-v8\n");
         for pin in source_pins::all() {
             bytes.extend_from_slice(pin.key.as_bytes());
             bytes.push(b'\t');
@@ -313,40 +337,6 @@ impl RecipeCheckRunner {
             append_file_bytes(&file, &mut bytes)?;
         }
         sha256sum(&bytes)
-    }
-
-    /// Resolve a build-scaffolding tool to its package root — through the
-    /// DECLARED seed only: the seed-tools lock (the recipe rungs' pinned
-    /// scaffolding), then the td-subst lock (its pinned build closure), then
-    /// PATH (which inside the loop sandbox is the td-built userland — the only
-    /// tools there are declared ones). Host store discovery is forbidden: the
-    /// loop sandbox is input-only (builder/src/check_loop.rs), so anything a
-    /// scavenge could find would be an undeclared dependency.
-    fn tool_root(&self, name: &str, probe: &str) -> Result<PathBuf, String> {
-        for lock in ["tests/td-seed-tools.lock", "tests/td-subst.lock"] {
-            let mut lock_cmd = self.builder_command();
-            lock_cmd.arg("lock").arg("path").arg(lock).arg(name);
-            if let Ok(out) = command_output(&mut lock_cmd, "td-builder lock path") {
-                let path = PathBuf::from(out.trim());
-                if is_executable(&path.join("bin").join(probe)) {
-                    return Ok(path);
-                }
-            }
-        }
-
-        if let Some(bin) = find_in_path(probe) {
-            let real = fs::canonicalize(&bin).unwrap_or(bin);
-            if let Some(root) = real.parent().and_then(Path::parent).map(Path::to_path_buf) {
-                if is_executable(&root.join("bin").join(probe)) {
-                    return Ok(root);
-                }
-            }
-        }
-
-        Err(format!(
-            "ladder: cannot resolve the {name} package (probe {probe}) - not in \
-             tests/td-seed-tools.lock or tests/td-subst.lock, not on PATH"
-        ))
     }
 
     fn intern_source(&self, intern_name: &str, pin: &SourcePin) -> Result<(), String> {
@@ -463,17 +453,6 @@ impl RecipeCheckRunner {
         writeln!(file, "{name} {path}").map_err(|e| format!("write {}: {e}", map.display()))
     }
 
-    fn append_tools_map(&self, name: &str, root: &Path) -> Result<(), String> {
-        let map = self.lw.join("tools.map");
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&map)
-            .map_err(|e| format!("open {}: {e}", map.display()))?;
-        writeln!(file, "{name} {}", root.display())
-            .map_err(|e| format!("write {}: {e}", map.display()))
-    }
-
     fn map_has(&self, name: &str) -> Result<bool, String> {
         Ok(self.map_value_opt(name)?.is_some())
     }
@@ -484,21 +463,20 @@ impl RecipeCheckRunner {
     }
 
     fn map_value_opt(&self, name: &str) -> Result<Option<String>, String> {
-        for map in [self.lw.join("srcs.map"), self.lw.join("tools.map")] {
-            if !map.is_file() {
-                continue;
-            }
-            let contents =
-                fs::read_to_string(&map).map_err(|e| format!("read {}: {e}", map.display()))?;
-            for line in contents.lines() {
-                let mut cols = line.splitn(2, ' ');
-                let key = match cols.next() {
-                    Some(k) => k,
-                    None => continue,
-                };
-                if key == name {
-                    return Ok(cols.next().map(str::trim).map(str::to_string));
-                }
+        let map = self.lw.join("srcs.map");
+        if !map.is_file() {
+            return Ok(None);
+        }
+        let contents =
+            fs::read_to_string(&map).map_err(|e| format!("read {}: {e}", map.display()))?;
+        for line in contents.lines() {
+            let mut cols = line.splitn(2, ' ');
+            let key = match cols.next() {
+                Some(k) => k,
+                None => continue,
+            };
+            if key == name {
+                return Ok(cols.next().map(str::trim).map(str::to_string));
             }
         }
         Ok(None)
@@ -556,10 +534,23 @@ impl RecipeCheckRunner {
         self.stage_tdstore()
     }
 
+    /// Classify then realize every input in the graph. Exactly TWO input
+    /// provenances are admissible (issue #469's trust boundary):
+    ///
+    ///   - **RecipeOutput** — the input names another td recipe in the
+    ///     catalog, realized by an earlier plan step;
+    ///   - **AuditedSeed** — the input names a pinned, hash-verified source /
+    ///     seed patch / stage0 artifact, interned into the ladder store by
+    ///     td's own addToStore.
+    ///
+    /// ANYTHING else is rejected HERE, during planning, before any build
+    /// starts — there is no host-tool class, no lock of store paths, no PATH
+    /// lookup, and no store discovery. A rung that declares scaffolding the
+    /// chain has not built (bash, coreutils, make, …) fails closed with
+    /// `PROVENANCE_REJECTED` until that tool exists as a recipe output.
     fn ensure_graph_inputs(&self, nodes: &[RecipeNode]) -> Result<(), String> {
         let mut seen_seed_inputs = HashSet::new();
         let mut seed_inputs = Vec::new();
-        let mut host_tools = Vec::new();
 
         for node in nodes {
             if let Some(key) = &node.recipe.source_input {
@@ -571,11 +562,11 @@ impl RecipeCheckRunner {
                     if catalog::lookup(input).is_some() {
                         continue;
                     }
-                    if let Some(seed_input) = self.seed_input_for_recipe_input(input)? {
-                        push_seed_input(&mut seed_inputs, &mut seen_seed_inputs, seed_input);
-                    } else {
-                        self.assert_host_tool(input)?;
-                        push_unique_string(&mut host_tools, input);
+                    match self.seed_input_for_recipe_input(input)? {
+                        Some(seed_input) => {
+                            push_seed_input(&mut seed_inputs, &mut seen_seed_inputs, seed_input)
+                        }
+                        None => return Err(provenance_rejection(&node.stem, input)),
                     }
                 }
             }
@@ -583,9 +574,6 @@ impl RecipeCheckRunner {
 
         for input in seed_inputs {
             self.ensure_seed_input(&input)?;
-        }
-        for tool in host_tools {
-            self.ensure_host_tool(&tool)?;
         }
         Ok(())
     }
@@ -611,9 +599,6 @@ impl RecipeCheckRunner {
         if let Some(input) = special_seed_input(key)? {
             return Ok(Some(input));
         }
-        if self.host_tool_probe(key).is_some() {
-            return Ok(None);
-        }
         Ok(self
             .source_pin_for_input_key(key)?
             .map(|pin| SeedInput::Source {
@@ -637,44 +622,6 @@ impl RecipeCheckRunner {
         self.stage_store_path(&path)
     }
 
-    fn ensure_host_tool(&self, name: &str) -> Result<(), String> {
-        let probe = self.assert_host_tool(name)?;
-        let tools_map = self.lw.join("tools.map");
-        if let Some(root) = map_value_in(&tools_map, name)? {
-            let path = PathBuf::from(&root);
-            if is_executable(&path.join("bin").join(probe)) {
-                return Ok(());
-            }
-            remove_map_entry(&tools_map, name)?;
-        }
-        let root = self.tool_root(name, probe)?;
-        self.append_tools_map(name, &root)
-    }
-
-    fn assert_host_tool<'a>(&self, name: &'a str) -> Result<&'a str, String> {
-        self.host_tool_probe(name).ok_or_else(|| {
-            format!(
-                "ladder: input `{name}' is neither a recipe, source/patch input, nor a known host tool"
-            )
-        })
-    }
-
-    // A tool named here must also be pinned in tests/td-seed-tools.lock (the
-    // declared seed tool_root resolves through) or the input-only loop sandbox
-    // will not have it bound.
-    fn host_tool_probe<'a>(&self, name: &'a str) -> Option<&'a str> {
-        match name {
-            "coreutils" => Some("ls"),
-            "gawk" => Some("awk"),
-            "findutils" => Some("find"),
-            "diffutils" => Some("diff"),
-            "python" => Some("python3"),
-            "bash" | "sed" | "grep" | "tar" | "gzip" | "bzip2" | "xz" | "flex" | "bison" | "m4"
-            | "make" => Some(name),
-            _ => None,
-        }
-    }
-
     fn source_pin_for_recipe_source(
         &self,
         key: &str,
@@ -695,51 +642,16 @@ impl RecipeCheckRunner {
         }
     }
 
-    /// The seed store DIR build-plan content-scans for the closure of seed
-    /// inputs — DERIVED from the resolved tools.map roots (their unique
-    /// parent), never a hardcoded prefix. tools.map records what the declared
-    /// locks actually resolved to, so its parent IS the store the seed items'
-    /// references point into; a lock re-captured on another host derives that
-    /// host's store with no code change.
-    fn seed_scan_dir(&self) -> Result<String, String> {
-        let map = self.lw.join("tools.map");
-        let contents =
-            fs::read_to_string(&map).map_err(|e| format!("read {}: {e}", map.display()))?;
-        let mut dirs: Vec<String> = Vec::new();
-        for line in contents.lines() {
-            let Some((_, path)) = line.split_once(' ') else {
-                continue;
-            };
-            let Some(parent) = Path::new(path.trim()).parent() else {
-                continue;
-            };
-            let d = parent.display().to_string();
-            if !d.is_empty() && d != "/" && !dirs.contains(&d) {
-                dirs.push(d);
-            }
-        }
-        if dirs.len() > 1 {
-            eprintln!(
-                "ladder: WARNING: tools.map roots span {} store dirs ({}); scanning only the first",
-                dirs.len(),
-                dirs.join(" ")
-            );
-        }
-        dirs.into_iter().next().ok_or_else(|| {
-            "ladder: no resolved tool roots in tools.map to derive the seed scan dir".to_string()
-        })
-    }
-
     pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
+        // The auto map is srcs.map verbatim: every non-owned input is an
+        // interned seed source. There is no tools map — a host executable is
+        // not an admissible input, so build-plan's content-scan candidate dir
+        // is the ladder's OWN store of interned seeds, never a host store.
         let srcs = fs::read(self.lw.join("srcs.map")).map_err(|e| format!("read srcs.map: {e}"))?;
-        let tools =
-            fs::read(self.lw.join("tools.map")).map_err(|e| format!("read tools.map: {e}"))?;
         let auto_map = self.scratch.join("auto-map");
         let mut map =
             File::create(&auto_map).map_err(|e| format!("create {}: {e}", auto_map.display()))?;
         map.write_all(&srcs)
-            .map_err(|e| format!("write {}: {e}", auto_map.display()))?;
-        map.write_all(&tools)
             .map_err(|e| format!("write {}: {e}", auto_map.display()))?;
 
         let home = path_str(&self.lw)?;
@@ -763,7 +675,7 @@ impl RecipeCheckRunner {
             .arg(target)
             .arg(recipes)
             .arg(auto_map_s)
-            .arg(self.seed_scan_dir()?)
+            .arg(path_str(&self.store)?)
             .arg(scratch);
         let out = cmd
             .output()
@@ -895,12 +807,6 @@ fn visit_recipe(
 fn push_seed_input(inputs: &mut Vec<SeedInput>, seen: &mut HashSet<String>, input: SeedInput) {
     if seen.insert(input.key().to_string()) {
         inputs.push(input);
-    }
-}
-
-fn push_unique_string(v: &mut Vec<String>, item: &str) {
-    if !v.iter().any(|existing| existing == item) {
-        v.push(item.to_string());
     }
 }
 
@@ -1100,37 +1006,6 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-fn map_value_in(map: &Path, name: &str) -> Result<Option<String>, String> {
-    if !map.is_file() {
-        return Ok(None);
-    }
-    let contents = fs::read_to_string(map).map_err(|e| format!("read {}: {e}", map.display()))?;
-    for line in contents.lines() {
-        let mut cols = line.splitn(2, ' ');
-        if cols.next() == Some(name) {
-            return Ok(cols.next().map(str::trim).map(str::to_string));
-        }
-    }
-    Ok(None)
-}
-
-fn remove_map_entry(map: &Path, name: &str) -> Result<(), String> {
-    if !map.is_file() {
-        return Ok(());
-    }
-    let contents = fs::read_to_string(map).map_err(|e| format!("read {}: {e}", map.display()))?;
-    let mut out = String::new();
-    for line in contents.lines() {
-        let mut cols = line.splitn(2, ' ');
-        if cols.next() == Some(name) {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    fs::write(map, out).map_err(|e| format!("write {}: {e}", map.display()))
-}
-
 pub(crate) fn linux_version_from_file(file_name: &str) -> Result<String, String> {
     let rest = file_name
         .strip_prefix("linux-")
@@ -1159,14 +1034,6 @@ pub(crate) fn is_executable(path: &Path) -> bool {
     path.metadata()
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|dir| dir.join(name))
-            .find(|candidate| is_executable(candidate))
-    })
 }
 
 pub(crate) fn remove_path_if_exists(path: &Path) -> Result<(), String> {
@@ -1340,12 +1207,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selected_check_closures_resolve_their_declared_seed_inputs() {
-        let recipes_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let root = recipes_dir.parent().unwrap();
-        let runner = RecipeCheckRunner {
-            root: root.to_path_buf(),
+    /// A planning-only runner: every path empty, so any test reaching the
+    /// filesystem or the builder binary fails loudly — provenance
+    /// classification must decide BEFORE either is touched.
+    fn planning_runner() -> RecipeCheckRunner {
+        RecipeCheckRunner {
+            root: PathBuf::new(),
             tb: PathBuf::new(),
             builder_path: String::new(),
             builder_store: PathBuf::new(),
@@ -1356,32 +1223,83 @@ mod tests {
             recipes: PathBuf::new(),
             scratch: PathBuf::new(),
             force_cold: false,
-        };
+        }
+    }
 
+    /// #469 structural test, verified RED against the pre-cutover code: the
+    /// old runner classified `bash`/`coreutils`/… as a "seed tool" class and
+    /// resolved them through tests/td-seed-tools.lock (then ambient PATH), so
+    /// planning ACCEPTED this graph. Now the graph fails closed at planning —
+    /// before any intern/build — until the scaffolding rungs exist as recipe
+    /// outputs. When the chain becomes self-hosting, this test flips to
+    /// asserting acceptance (delete it in the same PR that adds the rungs).
+    #[test]
+    fn bootstrap_graph_with_host_scaffolding_is_rejected_at_planning() {
+        let runner = planning_runner();
         for target in [
             "make-test",
             "busybox-test",
-            "rust-toolchain",
             "gcc-x86-64-stage2-test",
             "gcc-x86-64-native-test",
             "gcc-x86-64-self-test",
         ] {
             let graph = recipe_closure(&[target]).unwrap();
-            for node in graph {
-                if let Some(key) = &node.recipe.source_input {
-                    runner
-                        .seed_input_for_recipe_source(key, &node.recipe)
-                        .unwrap();
-                }
-                if let Some(inputs) = &node.recipe.inputs {
-                    for input in inputs {
-                        if catalog::lookup(input).is_none() {
-                            let _ = runner.seed_input_for_recipe_input(input).unwrap();
-                        }
-                    }
-                }
-            }
+            let err = runner.ensure_graph_inputs(&graph).unwrap_err();
+            assert!(
+                err.starts_with(PROVENANCE_REJECTED),
+                "{target}: expected a provenance rejection, got: {err}"
+            );
         }
+    }
+
+    /// #469 structural test: a synthetic recipe declaring a host tool, an
+    /// absolute host path, or a host-store path is rejected during planning.
+    /// The classifier admits exactly catalog outputs and pinned seeds; no
+    /// name, path string, or store prefix is provenance.
+    #[test]
+    fn synthetic_recipes_with_forbidden_inputs_are_rejected_at_planning() {
+        let runner = planning_runner();
+        for forbidden in [
+            "bash",
+            "make",
+            "python",
+            "/usr/bin/env",
+            "/gnu/store/abc123-gcc-toolchain-15.2.0",
+        ] {
+            let recipe = Recipe::mesboot("synthetic-red", "0")
+                .inputs_owned(vec![forbidden.to_string()]);
+            let nodes = vec![RecipeNode {
+                stem: "synthetic-red".to_string(),
+                recipe,
+            }];
+            let err = runner.ensure_graph_inputs(&nodes).unwrap_err();
+            assert!(
+                err.starts_with(PROVENANCE_REJECTED) && err.contains(forbidden),
+                "input `{forbidden}': expected a provenance rejection, got: {err}"
+            );
+        }
+    }
+
+    /// The classifier itself: a non-special, non-pinned input has NO seed
+    /// interpretation (the caller rejects it); pinned sources and the special
+    /// seed keys still classify as AuditedSeed.
+    #[test]
+    fn only_pinned_seeds_classify_as_seed_inputs() {
+        let runner = planning_runner();
+        for tool in ["bash", "coreutils", "sed", "make", "python", "flex"] {
+            assert!(
+                runner.seed_input_for_recipe_input(tool).unwrap().is_none(),
+                "`{tool}' must not classify as a seed input"
+            );
+        }
+        assert!(runner
+            .seed_input_for_recipe_input("stage0-source")
+            .unwrap()
+            .is_some());
+        assert!(runner
+            .seed_input_for_recipe_input("linux-headers-x86-64")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

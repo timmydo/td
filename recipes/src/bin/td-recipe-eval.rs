@@ -47,6 +47,19 @@ fn die(msg: &str) -> ! {
     exit(2);
 }
 
+/// check-run/build-run errors: a planning-time provenance rejection exits 69
+/// (EX_UNAVAILABLE) so callers — td-builder's loop prelude provisioning the
+/// userland — can branch on "the bootstrap graph cannot be realized with
+/// admissible inputs anywhere" (re #469) without parsing stderr prose. Every
+/// other error keeps the usage exit (2).
+fn die_runner(msg: &str) -> ! {
+    eprintln!("td-recipe-eval: {msg}");
+    if msg.starts_with(check_runner::PROVENANCE_REJECTED) {
+        exit(69);
+    }
+    exit(2);
+}
+
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -174,13 +187,13 @@ fn main() {
         Some("check-run") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::cli(rest) {
-                die(&e);
+                die_runner(&e);
             }
         }
         Some("build-run") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::build_cli(rest) {
-                die(&e);
+                die_runner(&e);
             }
         }
         Some("source-pins") => {

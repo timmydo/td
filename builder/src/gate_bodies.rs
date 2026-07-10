@@ -2572,9 +2572,12 @@ exit 0
     );
     // The declared SEED store (whatever dir the seed locks name — derived,
     // never hardcoded, exactly like the prelude derives it): also a bounded
-    // per-item closure, also read-only.
+    // per-item closure, also read-only. The only remaining seed locks are the
+    // pinned RUST toolchain's (td-subst.lock / td-builder-rust.lock — the
+    // AGENTS.md control plane); the recipe rungs' seed-tools lock is DELETED
+    // (host executables are not admissible bootstrap inputs, re #469).
     let lock_text =
-        std::fs::read_to_string(root.join("tests/td-seed-tools.lock")).unwrap_or_default();
+        std::fs::read_to_string(root.join("tests/td-subst.lock")).unwrap_or_default();
     let seed_item = lock_text
         .lines()
         .map(str::trim)
@@ -2605,8 +2608,23 @@ exit 0
                     probe.display()
                 ));
             }
+            // The seed dir ITSELF must reject entry creation (host_shell
+            // ro_dirs): the items being ro is not enough — a writable parent
+            // would let a gate plant a fake sibling "store item" next to the
+            // declared inputs. (/td/store is the documented exception: it is
+            // the loop's WORKING store prefix and stays writable.)
+            let sibling = seed_dir.join(".td-sibling-probe");
+            if std::fs::File::create(&sibling).is_ok() {
+                let _ = std::fs::remove_file(&sibling);
+                return Err(format!(
+                    "FAIL: created {} — the seed store dir accepts NEW entries inside the \
+                     sandbox (a fake sibling store item is plantable)",
+                    sibling.display()
+                ));
+            }
             println!(
-                "   {} exposes {seed_entries} bound items (not the host store); {item} rejects writes",
+                "   {} exposes {seed_entries} bound items (not the host store); {item} rejects \
+                 writes; the dir rejects new entries",
                 seed_dir.display()
             );
         }

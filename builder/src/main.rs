@@ -2867,10 +2867,9 @@ fn auto_topo(
 }
 
 /// Parse a --auto MAP file: `NAME PATH` per line (blank/`#`-comment lines skipped) —
-/// the merged host-tool + pinned-source resolution `ladder_setup` interns (its
-/// `srcs.map` then `tools.map`, concatenated by the caller). The FIRST occurrence of
-/// a name wins (mirrors the shell `ladder_map`'s `head -1` over the same two files in
-/// the same order), so a name present in both keeps the source-map's entry.
+/// the pinned-source resolution `ladder_setup` interns (its `srcs.map`; the
+/// host-tool `tools.map` half is deleted, re #469). The FIRST occurrence of a
+/// name wins, so a duplicated name keeps its earliest entry.
 fn auto_parse_map(text: &str) -> std::collections::BTreeMap<String, String> {
     let mut m = std::collections::BTreeMap::new();
     for line in text.lines() {
@@ -3612,10 +3611,12 @@ struct HostSandboxArgs {
     /// /td/store path). Together these are the loop's input-only store
     /// exposure (`td-builder check` passes its declared input set item by
     /// item; no store DIRECTORY is ever mounted, mirroring the drv build
-    /// jail's staged-closure model). The store dir holding the mountpoints is
-    /// a plain dir on the sandbox's ephemeral tmpfs root — writable like the
-    /// rest of that tmpfs (gates create /td/store there the same way); each
-    /// ITEM's read-only remount is load-bearing.
+    /// jail's staged-closure model). Each ITEM's read-only remount is
+    /// load-bearing, and the dir holding the own-path (`--store-item`)
+    /// mountpoints is itself remounted READ-ONLY after binding (host_shell
+    /// ro_dirs) so no sibling entry can be planted next to the declared
+    /// items; only the DEST-mapped items' /td/store parent stays writable —
+    /// the loop's working store prefix.
     store_items: Vec<(String, Option<String>)>,
     /// `--no-daemon`: accepted for compatibility. The loop sandbox no longer binds
     /// the host daemon state in either mode.
@@ -6340,8 +6341,9 @@ fn main() -> ExitCode {
         // closure, SYNTHESIZE each owned recipe's lock straight from its declared
         // `inputs`/`nativeInputs`/`sourceInput` (owned deps `td-recipe-output`,
         // everything else resolved through MAP-FILE), and run it. An input is owned iff
-        // RECIPE-DIR/<name>.json exists. MAP-FILE is `NAME PATH` per line — the host-tool
-        // + pinned seed/source paths `ladder_setup` interned (tools.map + srcs.map).
+        // RECIPE-DIR/<name>.json exists. MAP-FILE is `NAME PATH` per line — the pinned
+        // seed/source paths `ladder_setup` interned (srcs.map; host tools are not
+        // admissible inputs, re #469).
         // Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE GUIX-STORE SCRATCH
         Some("build-plan") if args.len() == 8 && args[2] == "--auto" => {
             let (target, recipe_dir, map_file, guix_store, scratch) =
@@ -6610,6 +6612,27 @@ fn main() -> ExitCode {
                         ro_optional: false,
                     });
                 }
+                // The parent dirs holding the own-path (--store-item) bind
+                // mountpoints — e.g. the seed store dir — are remounted
+                // READ-ONLY after binding (host_shell ro_dirs): the items are
+                // already ro, and this closes the remaining hole of CREATING a
+                // sibling entry next to them in the writable tmpfs dir (a
+                // plantable fake "store item"). The DEST-mapped items'
+                // /td/store parent deliberately stays writable — it is the
+                // loop's WORKING store prefix (store gates create entries
+                // under it; their own nested jails guard those trees).
+                let mut ro_dirs: Vec<String> = Vec::new();
+                for (src, dest) in &store_items {
+                    if dest.is_some() {
+                        continue;
+                    }
+                    if let Some(parent) = Path::new(src).parent() {
+                        let d = parent.to_string_lossy().into_owned();
+                        if !d.is_empty() && d != "/" && !ro_dirs.contains(&d) {
+                            ro_dirs.push(d);
+                        }
+                    }
+                }
                 let mut tmpfs = vec!["/tmp".to_string()];
                 let mut path_env = String::new();
                 let mut workdir = String::new();
@@ -6718,7 +6741,7 @@ fn main() -> ExitCode {
                 std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
                 let result = sandbox::host_shell(
                     &cmd, &cmd_args, &binds, &tmpfs, &path_env, &home, &workdir, &extra_env,
-                    &scratch,
+                    &ro_dirs, &scratch,
                 )
                 .map_err(|e| e.to_string());
                 // Remove the scratch tree (the sandbox's mounts lived in the
@@ -6767,7 +6790,7 @@ fn main() -> ExitCode {
                 let _ = std::fs::remove_dir_all(&scratch);
                 std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
                 let result = sandbox::host_shell(
-                    &cmd, &cmd_args, &binds, &tmpfs, &path_env, &home, "", &[], &scratch,
+                    &cmd, &cmd_args, &binds, &tmpfs, &path_env, &home, "", &[], &[], &scratch,
                 )
                 .map_err(|e| e.to_string());
                 let _ = std::fs::remove_dir_all(&scratch);
@@ -6825,6 +6848,9 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // (the gate runner's per-process memory cap needs no subcommand here:
+        // gates.rs applies setrlimit(RLIMIT_DATA) in the child via
+        // sandbox::cap_child_data_rlimit — td's native prlimit(1) replacement.)
         // (the `resolve` subcommand — a Guile-oracle lock resolver — retired with
         // the guix Guile-lowering gates; native input resolution lives in gate_inputs.rs.)
         // corpus-independence: run AS a derivation's builder, executing the
@@ -7550,8 +7576,7 @@ daemon build START (2/2 active)
     }
 
     // --auto MAP file: `NAME PATH` per line, blank/`#`-comment lines skipped, and the
-    // FIRST occurrence of a repeated name wins (mirrors the shell `ladder_map`'s
-    // `head -1` over srcs.map then tools.map, in that order).
+    // FIRST occurrence of a repeated name wins.
     #[test]
     fn auto_parse_map_skips_blanks_and_comments_first_wins() {
         let text = "# a comment\n\nbash /gnu/store/aaa-bash\nbash /gnu/store/zzz-bash-dup\nmake /gnu/store/bbb-make\n";

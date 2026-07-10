@@ -166,6 +166,20 @@ fn setup_build_cgroup(cap: u64) -> Option<PathBuf> {
     Some(leaf)
 }
 
+/// Cap `cmd`'s child — and everything it forks/execs — at `bytes` of data
+/// segment via a pre_exec setrlimit(RLIMIT_DATA). td's own prlimit(1)
+/// replacement for the gate-runner per-process memory backstop (#319): no
+/// host util-linux binary, so it works inside the loop sandbox. Fail-closed:
+/// a refused setrlimit fails the spawn (the gate reds) rather than running
+/// the body uncapped.
+pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
+    // Post-fork safe: set_rlimit is one raw syscall; its error path is
+    // io::Error::from_raw_os_error (no allocation).
+    unsafe {
+        cmd.pre_exec(move || sys::set_rlimit(sys::RLIMIT_DATA, bytes, bytes));
+    }
+}
+
 /// Run the drv's builder inside the namespace sandbox. `closure` lists every
 /// store path the build may see (the staged store's contents); `scratch` is
 /// a writable host directory. On success returns (output name, host-side
@@ -524,6 +538,14 @@ pub struct Bind {
 /// uid/gid use the IDENTITY map (host uid → itself) so the host daemon's
 /// peer-cred check still sees the real host uid, and its own network namespace
 /// (loopback brought up) matches `guix shell -C`'s offline posture.
+///
+/// `ro_dirs`: absolute in-sandbox directories to remount READ-ONLY (non-
+/// recursively) after all binds land — the tmpfs dirs that HOLD per-item bind
+/// mountpoints (e.g. the seed store dir holding `--store-item` mounts). The
+/// items' own bind mounts are separate vfsmounts and keep their own state; the
+/// parent dir itself rejects entry creation afterwards, so nothing in the
+/// sandbox can plant a NEW sibling next to the declared inputs. A listed dir
+/// that no bind created is skipped.
 #[allow(clippy::too_many_arguments)]
 pub fn host_shell(
     cmd: &str,
@@ -534,6 +556,7 @@ pub fn host_shell(
     home: &str,
     workdir: &str,
     extra_env: &[(String, String)],
+    ro_dirs: &[String],
     scratch: &Path,
 ) -> io::Result<std::process::ExitStatus> {
     let newroot = scratch.join("root");
@@ -596,6 +619,26 @@ pub fn host_shell(
             fail_msg: format!(
                 "td-builder host-sandbox: FAILED bind-mounting {} -> {inside}\n",
                 b.src
+            )
+            .into_bytes(),
+        });
+    }
+    // Read-only parent-dir remounts (see the doc comment): precomputed like the
+    // binds — the in-sandbox path, its C string, and a named failure line.
+    struct RoDirSpec {
+        target_dir: PathBuf,
+        target: CString,
+        fail_msg: Vec<u8>,
+    }
+    let mut ro_dir_specs: Vec<RoDirSpec> = Vec::with_capacity(ro_dirs.len());
+    for d in ro_dirs {
+        let target = newroot.join(d.strip_prefix('/').unwrap_or(d));
+        ro_dir_specs.push(RoDirSpec {
+            target_dir: target.clone(),
+            target: CString::new(target.as_os_str().as_encoded_bytes())
+                .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
+            fail_msg: format!(
+                "td-builder host-sandbox: FAILED ro-remounting the bind parent dir {d}\n"
             )
             .into_bytes(),
         });
@@ -803,6 +846,28 @@ pub fn host_shell(
                         }
                     }
                 }
+            }
+            // Lock each bind-holding parent dir read-only, AFTER every bind has
+            // landed: self-bind (making the plain tmpfs dir its own vfsmount)
+            // then a NON-recursive ro-remount — the per-item child mounts are
+            // untouched, but creating a sibling entry in the dir itself now
+            // fails EROFS. These dirs are sandbox-owned tmpfs, so the remount is
+            // never the host-owned-EPERM case: a failure here is fatal (the
+            // read-only is load-bearing, exactly like the item binds').
+            for spec in &ro_dir_specs {
+                if !spec.target_dir.is_dir() {
+                    continue; // no bind created it — nothing to lock
+                }
+                sys::mount(Some(&spec.target), &spec.target, None, sys::MS_BIND, None)
+                    .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
+                sys::mount(
+                    None,
+                    &spec.target,
+                    None,
+                    sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY,
+                    None,
+                )
+                .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
             }
             // Minimal /dev (replaces the dropped blanket host /dev bind): a fresh
             // tmpfs with only the standard char devices (bind-mounted from the

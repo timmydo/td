@@ -799,15 +799,6 @@ impl SlotPool {
     }
 }
 
-/// Is util-linux `prlimit` resolvable on PATH? (The loop toolchain provisions
-/// util-linux, so inside the sandbox this is normally true.)
-fn prlimit_available() -> bool {
-    let Ok(path) = std::env::var("PATH") else { return false };
-    path.split(':')
-        .filter(|d| !d.is_empty())
-        .any(|d| Path::new(d).join("prlimit").is_file())
-}
-
 pub(crate) fn nproc() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
@@ -888,9 +879,10 @@ fn timing_event(log: Option<&Path>, gate: &str, kind: &str) {
     }
 }
 
-/// Run one gate's body under `sh -c` (through `prlimit --data` when a
-/// per-process memory cap is configured), stdout+stderr appended in order to
-/// LOG_PATH (the per-gate output buffer). Returns success.
+/// Run one gate's body under `sh -c` (capped by a pre_exec
+/// setrlimit(RLIMIT_DATA) when a per-process memory cap is configured),
+/// stdout+stderr appended in order to LOG_PATH (the per-gate output buffer).
+/// Returns success.
 /// Sum the resident bytes of every process in PGID's process group
 /// (/proc/*/stat field 5 == pgid; RSS from /proc/*/statm resident pages).
 fn pgroup_rss_bytes(pgid: u32) -> u64 {
@@ -1007,7 +999,7 @@ fn run_gate(
     };
     // A native (typed-Rust) gate carries an empty body: run it as `<current_exe>
     // gate-body <name>` instead of `sh -c <script>` (#318 axis 3). Same
-    // wrapper (prlimit/cgroup/pgroup/env); the native body self-moves into the
+    // wrapper (rlimit/cgroup/pgroup/env); the native body self-moves into the
     // gate cgroup itself (gate_bodies::cli), so the shell cgroup prelude — which
     // is shell-only — is skipped for it.
     let native = g.body.trim().is_empty();
@@ -1035,17 +1027,11 @@ fn run_gate(
             _ => return false,
         };
         // The inner program is `sh -c <body>` (shell gate) or `<self> gate-body
-        // <name>` (native gate); prlimit --data wraps either when mem_mib > 0.
-        let mut cmd = if mem_mib > 0 {
-            let mut c = std::process::Command::new("prlimit");
-            c.arg(format!("--data={}", mem_mib.saturating_mul(1024 * 1024)));
-            if native {
-                c.arg(&self_exe).arg("gate-body").arg(&g.name);
-            } else {
-                c.arg("sh").arg("-c").arg(&body);
-            }
-            c
-        } else if native {
+        // <name>` (native gate). When mem_mib > 0, a pre_exec
+        // setrlimit(RLIMIT_DATA) caps the child and everything it forks/execs —
+        // td's own prlimit(1) replacement (the unsafe lives in sandbox.rs), so
+        // the memory backstop needs no host binary inside the loop sandbox.
+        let mut cmd = if native {
             let mut c = std::process::Command::new(&self_exe);
             c.arg("gate-body").arg(&g.name);
             c
@@ -1054,6 +1040,9 @@ fn run_gate(
             c.arg("-c").arg(&body);
             c
         };
+        if mem_mib > 0 {
+            crate::sandbox::cap_child_data_rlimit(&mut cmd, mem_mib.saturating_mul(1024 * 1024));
+        }
         cmd.current_dir(root)
             .env("TD_GATE_GOALS", goal_words)
             .env("TD_BUILDER_SELF", &self_exe)
@@ -1261,10 +1250,11 @@ struct RunCfg {
     /// the host delegates a subtree.
     gate_tree_mem_mib: u64,
     /// Per-PROCESS RLIMIT_DATA cap for gate bodies, in MiB (0 = off). Applied
-    /// via util-linux `prlimit` from the provisioned toolchain: with the pool
-    /// over-provisioned past nproc (#319), one runaway allocator must die by
-    /// its own limit — a clean red gate — instead of triggering the box
-    /// OOM-killer. Per-process, so a make -jN tree of modest compilers passes.
+    /// via a pre_exec setrlimit in the spawned body (sys::set_rlimit — no host
+    /// util-linux anywhere): with the pool over-provisioned past nproc (#319),
+    /// one runaway allocator must die by its own limit — a clean red gate —
+    /// instead of triggering the box OOM-killer. Per-process, so a make -jN
+    /// tree of modest compilers passes.
     gate_mem_mib: u64,
     /// The warm chain-brick cache exported to Shared gates (#317): the ambient
     /// TD_CHECK_CHAIN_CACHE if the caller set one (empty = the operator's force-cold
@@ -1724,16 +1714,12 @@ pub fn cli(args: &[String]) -> ExitCode {
         Some(root.join(format!(".td-build-cache/gate-timing/run-{}.log", now_ns())))
     };
     // TD_CHECK_GATE_MEM_MIB: per-process gate memory cap (default 8192; 0 off).
-    let mut gate_mem_mib: u64 = std::env::var("TD_CHECK_GATE_MEM_MIB")
+    // Enforced natively (a pre_exec setrlimit on each gate body), so it is
+    // ALWAYS available — no PATH probe, no host util-linux.
+    let gate_mem_mib: u64 = std::env::var("TD_CHECK_GATE_MEM_MIB")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(8192);
-    if gate_mem_mib > 0 && !prlimit_available() {
-        eprintln!(
-            "gate-run: no `prlimit` on PATH — running WITHOUT the per-gate memory backstop (TD_CHECK_GATE_MEM_MIB={gate_mem_mib} requested)"
-        );
-        gate_mem_mib = 0;
-    }
     let tree_key = std::env::var("TD_CHECK_TREE").ok().filter(|k| !k.is_empty());
     if resume && tree_key.is_none() {
         eprintln!(
@@ -2252,9 +2238,7 @@ mod tests {
 
     #[test]
     fn gate_mem_backstop_contains_a_runaway_allocator() {
-        if !prlimit_available() {
-            return; // dev host without util-linux prlimit; the sandbox has it
-        }
+        // Native pre_exec setrlimit — no host prlimit needed, so no host guard.
         let d = tmpdir("rlimit");
         // ~64 MiB heap allocation in bash (command substitution buffers it).
         let hog = r#"x=$(head -c 67108864 /dev/zero | tr '\0' a); echo grew ${#x}"#;
