@@ -1635,6 +1635,64 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         return Ok(sock.display().to_string());
     }
 
+    // BLESS the declared seed closure once per root set (re #469): strict
+    // staging manifests are unconditional, so the daemon's build children need
+    // a td-owned db vouching the pinned toolchain closure they stage from the
+    // seed dir. The db is keyed by the declared roots (store paths embed
+    // content hashes, so a pin bump derives a new key and re-blesses); an
+    // existing db is REUSED, never rewritten — re-blessing would re-trust
+    // whatever is currently on disk, the existence-as-authority hole the
+    // manifest closes. Handed to the daemon via TD_EXTRA_DBS below; the
+    // children inherit it.
+    let roots = seed_lock_roots(root);
+    let bless_db = if roots.is_empty() {
+        eprintln!(
+            "td-builder check: WARNING: no declared seed-lock roots to bless — daemon \
+             builds will red on unvouched closure items (re #469)"
+        );
+        None
+    } else {
+        let mut h = crate::sha256::Sha256::new();
+        h.update(seed_dir.as_bytes());
+        for r in &roots {
+            h.update(b"\n");
+            h.update(r.as_bytes());
+        }
+        let bfull = crate::sha256::to_base16(&h.finalize());
+        let bkey: String = bfull.chars().take(16).collect();
+        let db = daemon_dir.join(format!("seed-bless.{bkey}.db"));
+        if !db.exists() {
+            eprintln!(
+                "td-builder check: blessing the declared seed closure ({} roots) into {} — \
+                 a one-time hash of the pinned toolchain (re #469)",
+                roots.len(),
+                db.display()
+            );
+            let roots_f = daemon_dir.join(format!("seed-bless.{bkey}.roots"));
+            std::fs::write(&roots_f, roots.join("\n"))
+                .map_err(|e| format!("write {}: {e}", roots_f.display()))?;
+            let tmp = daemon_dir.join(format!("seed-bless.{bkey}.db.tmp"));
+            let out = Command::new(&daemon_tb)
+                .args(["seed-bless", &seed_dir])
+                .arg(&roots_f)
+                .arg(&tmp)
+                .current_dir(root)
+                .output()
+                .map_err(|e| format!("spawn seed-bless: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "seed-bless failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            // Atomic placement: a concurrent ensure (other daemon key) or a
+            // crash never leaves a half-written db under the blessed name.
+            std::fs::rename(&tmp, &db)
+                .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), db.display()))?;
+        }
+        Some(db)
+    };
+
     // Start a fresh daemon, detached in its OWN process group so it outlives
     // this check AND survives the terminal's ^C/hangup signals (the machine-
     // wide limiter must persist across checks — the shell's `nohup` role).
@@ -1669,6 +1727,18 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log2));
+    // The blessed seed-closure db rides to every build child via the daemon's
+    // env (re #469) — composed BEFORE any operator-supplied TD_EXTRA_DBS so
+    // both vouch.
+    if let Some(db) = &bless_db {
+        let mut dbs = db.display().to_string();
+        if let Ok(prev) = std::env::var("TD_EXTRA_DBS") {
+            if !prev.trim().is_empty() {
+                dbs = format!("{dbs}:{prev}");
+            }
+        }
+        cmd.env("TD_EXTRA_DBS", dbs);
+    }
     {
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);

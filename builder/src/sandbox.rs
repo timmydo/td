@@ -191,9 +191,9 @@ pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
 /// The staged-input provenance manifest (re #469): canonical store path →
 /// expected NAR hash (`sha256:<hex>`), assembled by the planner from td-owned
 /// store DBs ONLY (interned-seed registrations, prior build-plan steps'
-/// td.dbs, the source/builder placement dbs). When a build carries one, every
-/// closure item must have a record and its on-disk bytes must hash to it — an
-/// unmanifested or tampered item refuses to stage. A caller-supplied store
+/// td.dbs, the source/builder placement dbs). EVERY build carries one — there
+/// is no non-strict mode: each closure item must have a record and its on-disk
+/// bytes must hash to it, or it refuses to stage. A caller-supplied store
 /// DIRECTORY is thereby a byte source, never an authority: the bytes bind only
 /// if a td-owned registration vouches for them.
 ///
@@ -249,8 +249,9 @@ pub fn verify_staged_item(
 
 /// Run the drv's builder inside the namespace sandbox. `closure` lists every
 /// store path the build may see (the staged store's contents); `scratch` is
-/// a writable host directory. `manifest`, when present, is the #469 staging
-/// gate: every closure item is provenance-verified (`verify_staged_item`)
+/// a writable host directory. `manifest` is the #469 staging gate — REQUIRED,
+/// not optional: no engine path may stage inputs a td-owned db does not vouch
+/// for. Every closure item is provenance-verified (`verify_staged_item`)
 /// BEFORE its bind target is staged; the item binds are then locked
 /// READ-ONLY in the child, so the verified bytes cannot be rewritten through
 /// a live bind for the build's duration (the hash runs in the parent and the
@@ -262,7 +263,7 @@ pub fn build(
     drv_path: &str,
     closure: &[String],
     scratch: &Path,
-    manifest: Option<&StageManifest>,
+    manifest: &StageManifest,
 ) -> io::Result<Vec<(String, PathBuf)>> {
     if drv.platform != "x86_64-linux" {
         return Err(err(format!(
@@ -286,9 +287,7 @@ pub fn build(
         // CANONICAL is the store path the build SEES; ON-DISK is where to bind FROM
         // (== canonical for daemon-resident items, a td store dir for td-interned ones).
         let (canonical, on_disk) = split_closure_entry(entry);
-        if let Some(m) = manifest {
-            verify_staged_item(m, canonical, on_disk)?;
-        }
+        verify_staged_item(manifest, canonical, on_disk)?;
         let meta = fs::symlink_metadata(on_disk)
             .map_err(|e| err(format!("closure item {canonical} (on disk {on_disk}): {e}")))?;
         // BASENAME-keyed: a closure can span MULTIPLE store prefixes (/gnu/store deps +
