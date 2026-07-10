@@ -405,6 +405,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if p == "recipes/src/source_pins.rs" {
         sel.add_preflight("shell-syntax");
+        sel.add_preflight("cargo-test");
         sel.add_target("recipe-rs");
         sel.add_target("bootstrap-seed");
         sel.add_target("bootstrap-mes");
@@ -443,7 +444,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // catalog change can affect ANY built package. Run recipe-rs (self-consistency
         // + manifest sync) and the package build gates. (spec-diff retired with the
         // museum tier; the guix-dependence census retired with the guix-oracle gates.)
+        // The cargo-test preflight carries the crate's unit tests + clippy while the
+        // in-loop gates are unprovisionable (re #469).
         sel.add_preflight("shell-syntax");
+        sel.add_preflight("cargo-test");
         sel.add_target("recipe-rs");
         if glob_match("recipes/src/recipes/*.rs", p) {
             sel.add_target("recipe-checks-daily");
@@ -659,7 +663,7 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
         "shell-syntax" => Some(
             "  bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
         ),
-        "cargo-test" => Some("  cargo test --manifest-path builder/Cargo.toml"),
+        "cargo-test" => Some("  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml"),
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
     }
@@ -1188,7 +1192,25 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             root,
             "bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
         ),
-        "cargo-test" => run_shell(root, "cargo test --manifest-path builder/Cargo.toml"),
+        // BOTH engine crates, tests AND clippy: the AGENTS.md deny-lints only
+        // fire under the clippy driver, and the in-loop cargo-test gate (325)
+        // is unreachable while the loop is UNPROVISIONED (re #469) — this
+        // host preflight is the per-PR enforcement in the meantime (review
+        // finding: recipes tests + clippy ran in NO automated per-PR tier).
+        "cargo-test" => {
+            for cmd in [
+                "cargo test --manifest-path builder/Cargo.toml",
+                "cargo test --manifest-path recipes/Cargo.toml",
+                "cargo clippy --frozen --manifest-path builder/Cargo.toml",
+                "cargo clippy --frozen --manifest-path recipes/Cargo.toml",
+            ] {
+                let code = run_shell(root, cmd);
+                if code != 0 {
+                    return code;
+                }
+            }
+            0
+        }
         // The dispatcher's own self-test — run IN-PROCESS (the shell oracle is gone,
         // and this binary IS the dispatcher), so no `td-builder` re-resolution.
         "affected-self-test" => {
@@ -1456,7 +1478,7 @@ mod tests {
                 "  builder/src/main.rs",
                 "",
                 "Selected checks:",
-                "  cargo test --manifest-path builder/Cargo.toml",
+                "  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml",
                 "  td-builder check check-engine",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -1481,7 +1503,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
-                "  cargo test --manifest-path builder/Cargo.toml",
+                "  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml",
                 "  td-builder check check-pr",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",

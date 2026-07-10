@@ -3,9 +3,9 @@
 //!
 //! A gate whose `GateDef.script` is EMPTY is "native": the gate runner
 //! (`gates.rs::run_gate`) execs `<current_exe> gate-body <name>` in the exact
-//! same memory-limited wrapper (`prlimit --data`, the per-gate cgroup, its own
-//! process group, TD_CHECK_CHAIN_CACHE / TD_GATE_SPECS env) it uses
-//! for bash gates. `current_exe` is the stage0 td-builder in the loop (the
+//! same memory-limited wrapper (the pre_exec setrlimit(RLIMIT_DATA), the
+//! per-gate cgroup, its own process group, TD_CHECK_CHAIN_CACHE /
+//! TD_GATE_SPECS env) it uses for shell gates. `current_exe` is the stage0 td-builder in the loop (the
 //! prelude execs `<stage0> … gate-run`), so a native body gets `tb` = its own
 //! binary for free — no `load_stage0` shell dance for the td-builder under test.
 //!
@@ -2600,6 +2600,21 @@ exit 0
                     seed_dir.display()
                 ));
             }
+            // The bound item's CONTENT must be visible, not just its mountpoint:
+            // ro_dirs locks the parent via a recursive self-bind + ro remount,
+            // and a non-recursive self-bind there would clone only the top
+            // mount, shadowing every item bind with its empty mountpoint dir
+            // (review finding — the loop would see empty store items).
+            let item_entries = std::fs::read_dir(item)
+                .map_err(|e| format!("FAIL: cannot read the bound seed item {item}: {e}"))?
+                .count();
+            if item_entries == 0 {
+                return Err(format!(
+                    "FAIL: {item} is EMPTY inside the sandbox — the item bind is shadowed \
+                     by the parent dir's read-only lock (host_shell ro_dirs must self-bind \
+                     recursively so child mounts stay visible)"
+                ));
+            }
             let probe = Path::new(item).join(".td-ro-probe");
             if std::fs::File::create(&probe).is_ok() {
                 let _ = std::fs::remove_file(&probe);
@@ -2623,8 +2638,8 @@ exit 0
                 ));
             }
             println!(
-                "   {} exposes {seed_entries} bound items (not the host store); {item} rejects \
-                 writes; the dir rejects new entries",
+                "   {} exposes {seed_entries} bound items (not the host store); {item} shows \
+                 {item_entries} entries and rejects writes; the dir rejects new entries",
                 seed_dir.display()
             );
         }

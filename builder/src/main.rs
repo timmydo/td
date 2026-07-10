@@ -3613,10 +3613,11 @@ struct HostSandboxArgs {
     /// item; no store DIRECTORY is ever mounted, mirroring the drv build
     /// jail's staged-closure model). Each ITEM's read-only remount is
     /// load-bearing, and the dir holding the own-path (`--store-item`)
-    /// mountpoints is itself remounted READ-ONLY after binding (host_shell
-    /// ro_dirs) so no sibling entry can be planted next to the declared
-    /// items; only the DEST-mapped items' /td/store parent stays writable —
-    /// the loop's working store prefix.
+    /// mountpoints is itself locked READ-ONLY after binding (host_shell
+    /// ro_dirs) so an accidental write can't plant a sibling entry next to
+    /// the declared items (not a boundary against a hostile gate, which owns
+    /// the sandbox namespaces); only the DEST-mapped items' /td/store parent
+    /// stays writable — the loop's working store prefix.
     store_items: Vec<(String, Option<String>)>,
     /// `--no-daemon`: accepted for compatibility. The loop sandbox no longer binds
     /// the host daemon state in either mode.
@@ -6613,11 +6614,13 @@ fn main() -> ExitCode {
                     });
                 }
                 // The parent dirs holding the own-path (--store-item) bind
-                // mountpoints — e.g. the seed store dir — are remounted
+                // mountpoints — e.g. the seed store dir — are locked
                 // READ-ONLY after binding (host_shell ro_dirs): the items are
-                // already ro, and this closes the remaining hole of CREATING a
-                // sibling entry next to them in the writable tmpfs dir (a
-                // plantable fake "store item"). The DEST-mapped items'
+                // already ro, and this closes the remaining hole of an
+                // ACCIDENTAL write creating a sibling entry next to them in
+                // the writable tmpfs dir (a fake "store item"; a hostile gate
+                // owning the sandbox namespaces could still over-mount — same
+                // trust model as every mount here). The DEST-mapped items'
                 // /td/store parent deliberately stays writable — it is the
                 // loop's WORKING store prefix (store gates create entries
                 // under it; their own nested jails guard those trees).

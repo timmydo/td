@@ -220,6 +220,14 @@ fn loop_userland_dir() -> Result<PathBuf, String> {
 /// it declares, re #469). Any recipe/pin/evaluator change re-keys the map, so
 /// a stale machine-wide userland — including one built before host
 /// scaffolding was outlawed — can never false-green the change under review.
+///
+/// Known limits (freshness mechanism, not a security boundary): the hash is
+/// taken before build-run execs the binary, so a concurrent rebuild of the
+/// evaluator between the two can mis-key one provision (self-healing — the
+/// next run re-keys and re-provisions); and `TD_RECIPE_EVAL` is an operator
+/// override that can cache whatever ITS binary builds under its own
+/// fingerprint — pointing it at a pre-cutover evaluator is the operator
+/// running old code deliberately, the same trust as any explicit override.
 fn userland_fingerprint(eval: &str) -> Result<String, String> {
     let bytes = std::fs::read(eval).map_err(|e| format!("read {eval}: {e}"))?;
     let mut h = crate::sha256::Sha256::new();
@@ -256,7 +264,7 @@ fn userland_fingerprint(eval: &str) -> Result<String, String> {
 /// (`CheckError::Unprovisioned`), not a code regression.
 fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
     let dir = loop_userland_dir().map_err(|e| CheckError::Fatal(fatal(&e)))?;
-    let eval = resolve_recipe_eval_bin(root).map_err(CheckError::Unprovisioned)?;
+    let eval = resolve_recipe_eval_bin(root)?;
     let fingerprint = userland_fingerprint(&eval).map_err(|e| CheckError::Fatal(fatal(&e)))?;
     let map_path = dir.join(format!("loop-userland.{fingerprint}.map"));
     if let Some(ul) = read_userland_map(&dir, &map_path, &fingerprint) {
@@ -402,14 +410,38 @@ fn read_userland_map(dir: &Path, map_path: &Path, fingerprint: &str) -> Option<L
 /// it can lag the tree by a loop iteration, and a stale evaluator would both
 /// build and fingerprint yesterday's userland). The sentinel is the last
 /// resort for a cargo-less host running a pre-built loop.
-fn resolve_recipe_eval_bin(root: &Path) -> Result<String, String> {
+///
+/// The error variants are load-bearing (review finding): a host WITHOUT cargo
+/// is a provisioning gap (`Unprovisioned` → exit 69, PARTIAL in the tiers),
+/// but a host WITH cargo whose recipes/ tree fails to COMPILE is a code
+/// regression and must red (`Fatal`) — conflating them would let a broken
+/// recipes crate exit 0 through affected-checks.
+fn resolve_recipe_eval_bin(root: &Path) -> Result<String, CheckError> {
     if let Ok(v) = std::env::var("TD_RECIPE_EVAL") {
         if !v.trim().is_empty() && Path::new(&v).is_file() {
             return Ok(v);
         }
     }
-    if let Some(p) = host_cargo_bin(root, "recipes", "td-recipe-eval", None) {
-        return Ok(p.display().to_string());
+    if find_in_path("cargo").is_some() {
+        let status = Command::new("cargo")
+            .args(["build", "--release", "--quiet"])
+            .current_dir(root.join("recipes"))
+            .status()
+            .map_err(|e| CheckError::Fatal(fatal(&format!("spawn cargo build (recipes): {e}"))))?;
+        if !status.success() {
+            return Err(CheckError::Fatal(fatal(
+                "the recipes crate does not compile (`cargo build --release` in recipes/ \
+                 failed) — a code regression, not a provisioning gap",
+            )));
+        }
+        let p = root.join("recipes/target/release/td-recipe-eval");
+        if p.is_file() {
+            return Ok(p.display().to_string());
+        }
+        return Err(CheckError::Fatal(fatal(&format!(
+            "cargo build succeeded but {} is missing",
+            p.display()
+        ))));
     }
     let sentinel = root.join(".td-build-cache/recipe-eval/recipe-eval-path");
     let path = std::fs::read_to_string(&sentinel)
@@ -418,10 +450,10 @@ fn resolve_recipe_eval_bin(root: &Path) -> Result<String, String> {
     if !path.is_empty() && Path::new(&path).is_file() {
         return Ok(path);
     }
-    Err(fatal(
+    Err(CheckError::Unprovisioned(fatal(
         "no td-recipe-eval to resolve the loop userland: set TD_RECIPE_EVAL or run \
          `cargo build --release --manifest-path recipes/Cargo.toml` and re-run",
-    ))
+    )))
 }
 
 /// Copy a tree preserving file modes and symlinks AS symlinks — the userland

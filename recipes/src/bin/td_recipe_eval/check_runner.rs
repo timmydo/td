@@ -557,17 +557,24 @@ impl RecipeCheckRunner {
                 let input = self.seed_input_for_recipe_source(key, &node.recipe)?;
                 push_seed_input(&mut seed_inputs, &mut seen_seed_inputs, input);
             }
-            if let Some(inputs) = &node.recipe.inputs {
-                for input in inputs {
-                    if catalog::lookup(input).is_some() {
-                        continue;
+            // Every declaration channel is classified — `inputs` AND
+            // `nativeInputs` (a forbidden name must not sail through planning
+            // on the native channel and surface later at lock synthesis).
+            for input in node
+                .recipe
+                .inputs
+                .iter()
+                .chain(node.recipe.native_inputs.iter())
+                .flatten()
+            {
+                if catalog::lookup(input).is_some() {
+                    continue;
+                }
+                match self.seed_input_for_recipe_input(input)? {
+                    Some(seed_input) => {
+                        push_seed_input(&mut seed_inputs, &mut seen_seed_inputs, seed_input)
                     }
-                    match self.seed_input_for_recipe_input(input)? {
-                        Some(seed_input) => {
-                            push_seed_input(&mut seed_inputs, &mut seen_seed_inputs, seed_input)
-                        }
-                        None => return Err(provenance_rejection(&node.stem, input)),
-                    }
+                    None => return Err(provenance_rejection(&node.stem, input)),
                 }
             }
         }
@@ -1228,8 +1235,9 @@ mod tests {
 
     /// #469 structural test, verified RED against the pre-cutover code: the
     /// old runner classified `bash`/`coreutils`/… as a "seed tool" class and
-    /// resolved them through tests/td-seed-tools.lock (then ambient PATH), so
-    /// planning ACCEPTED this graph. Now the graph fails closed at planning —
+    /// resolved them through tests/td-seed-tools.lock, then td-subst.lock,
+    /// then ambient PATH, so planning ACCEPTED this graph. Now the graph
+    /// fails closed at planning —
     /// before any intern/build — until the scaffolding rungs exist as recipe
     /// outputs. When the chain becomes self-hosting, this test flips to
     /// asserting acceptance (delete it in the same PR that adds the rungs).
@@ -1253,9 +1261,11 @@ mod tests {
     }
 
     /// #469 structural test: a synthetic recipe declaring a host tool, an
-    /// absolute host path, or a host-store path is rejected during planning.
-    /// The classifier admits exactly catalog outputs and pinned seeds; no
-    /// name, path string, or store prefix is provenance.
+    /// absolute host path, or a host-store path is rejected during planning —
+    /// on the `inputs` channel AND the `nativeInputs` channel (review finding:
+    /// the native channel must not sail through planning and surface later at
+    /// lock synthesis). The classifier admits exactly catalog outputs and
+    /// pinned seeds; no name, path string, or store prefix is provenance.
     #[test]
     fn synthetic_recipes_with_forbidden_inputs_are_rejected_at_planning() {
         let runner = planning_runner();
@@ -1266,17 +1276,24 @@ mod tests {
             "/usr/bin/env",
             "/gnu/store/abc123-gcc-toolchain-15.2.0",
         ] {
-            let recipe = Recipe::mesboot("synthetic-red", "0")
-                .inputs_owned(vec![forbidden.to_string()]);
-            let nodes = vec![RecipeNode {
-                stem: "synthetic-red".to_string(),
-                recipe,
-            }];
-            let err = runner.ensure_graph_inputs(&nodes).unwrap_err();
-            assert!(
-                err.starts_with(PROVENANCE_REJECTED) && err.contains(forbidden),
-                "input `{forbidden}': expected a provenance rejection, got: {err}"
-            );
+            for native in [false, true] {
+                let recipe = Recipe::mesboot("synthetic-red", "0");
+                let recipe = if native {
+                    recipe.native_inputs(&[forbidden])
+                } else {
+                    recipe.inputs_owned(vec![forbidden.to_string()])
+                };
+                let nodes = vec![RecipeNode {
+                    stem: "synthetic-red".to_string(),
+                    recipe,
+                }];
+                let err = runner.ensure_graph_inputs(&nodes).unwrap_err();
+                assert!(
+                    err.starts_with(PROVENANCE_REJECTED) && err.contains(forbidden),
+                    "input `{forbidden}' (native={native}): expected a provenance \
+                     rejection, got: {err}"
+                );
+            }
         }
     }
 

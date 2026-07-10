@@ -169,10 +169,18 @@ fn setup_build_cgroup(cap: u64) -> Option<PathBuf> {
 /// Cap `cmd`'s child — and everything it forks/execs — at `bytes` of data
 /// segment via a pre_exec setrlimit(RLIMIT_DATA). td's own prlimit(1)
 /// replacement for the gate-runner per-process memory backstop (#319): no
-/// host util-linux binary, so it works inside the loop sandbox. Fail-closed:
-/// a refused setrlimit fails the spawn (the gate reds) rather than running
-/// the body uncapped.
+/// host util-linux binary, so it works inside the loop sandbox. The requested
+/// cap is clamped to the ambient HARD limit (raising a hard limit is EPERM
+/// for an unprivileged process, and a host whose hard limit sits below the
+/// default cap would otherwise red every gate with an opaque spawn error —
+/// review finding; the tighter-than-requested cap is still fail-closed).
+/// A refused setrlimit still fails the spawn (the gate reds) rather than
+/// running the body uncapped.
 pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
+    let bytes = match sys::get_rlimit(sys::RLIMIT_DATA) {
+        Ok((_, hard)) => bytes.min(hard),
+        Err(_) => bytes,
+    };
     // Post-fork safe: set_rlimit is one raw syscall; its error path is
     // io::Error::from_raw_os_error (no allocation).
     unsafe {
@@ -539,13 +547,16 @@ pub struct Bind {
 /// peer-cred check still sees the real host uid, and its own network namespace
 /// (loopback brought up) matches `guix shell -C`'s offline posture.
 ///
-/// `ro_dirs`: absolute in-sandbox directories to remount READ-ONLY (non-
-/// recursively) after all binds land — the tmpfs dirs that HOLD per-item bind
-/// mountpoints (e.g. the seed store dir holding `--store-item` mounts). The
-/// items' own bind mounts are separate vfsmounts and keep their own state; the
-/// parent dir itself rejects entry creation afterwards, so nothing in the
-/// sandbox can plant a NEW sibling next to the declared inputs. A listed dir
-/// that no bind created is skipped.
+/// `ro_dirs`: absolute in-sandbox directories to lock READ-ONLY (a recursive
+/// self-bind, then a non-recursive ro remount of the top mount) after all
+/// binds land — the tmpfs dirs that HOLD per-item bind mountpoints (e.g. the
+/// seed store dir holding `--store-item` mounts). The items' own bind mounts
+/// ride along visible and keep their own ro state; the parent dir itself
+/// rejects entry creation afterwards, so an ACCIDENTAL write can't plant a
+/// sibling next to the declared inputs. Not a security boundary against a
+/// hostile gate: the gate body owns the sandbox's user/mount namespaces
+/// (CAP_SYS_ADMIN inside) and can over-mount the parent — same trust model as
+/// every mount in this sandbox. A listed dir that no bind created is skipped.
 #[allow(clippy::too_many_arguments)]
 pub fn host_shell(
     cmd: &str,
@@ -848,18 +859,29 @@ pub fn host_shell(
                 }
             }
             // Lock each bind-holding parent dir read-only, AFTER every bind has
-            // landed: self-bind (making the plain tmpfs dir its own vfsmount)
-            // then a NON-recursive ro-remount — the per-item child mounts are
-            // untouched, but creating a sibling entry in the dir itself now
-            // fails EROFS. These dirs are sandbox-owned tmpfs, so the remount is
-            // never the host-owned-EPERM case: a failure here is fatal (the
-            // read-only is load-bearing, exactly like the item binds').
+            // landed: a RECURSIVE self-bind (making the plain tmpfs dir its own
+            // vfsmount) then a NON-recursive ro-remount of just that top mount —
+            // the per-item child mounts ride along visible (already ro from
+            // their own remounts), but creating a sibling entry in the dir
+            // itself now fails EROFS. MS_REC is load-bearing: a NON-recursive
+            // self-bind would clone only the top mount, SHADOWING every item
+            // bind under it with the empty mountpoint dirs (review finding —
+            // every store item would read as an empty dir). These dirs are
+            // sandbox-owned tmpfs, so the remount is never the host-owned-EPERM
+            // case: a failure here is fatal (the read-only is load-bearing,
+            // exactly like the item binds').
             for spec in &ro_dir_specs {
                 if !spec.target_dir.is_dir() {
                     continue; // no bind created it — nothing to lock
                 }
-                sys::mount(Some(&spec.target), &spec.target, None, sys::MS_BIND, None)
-                    .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
+                sys::mount(
+                    Some(&spec.target),
+                    &spec.target,
+                    None,
+                    sys::MS_BIND | sys::MS_REC,
+                    None,
+                )
+                .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
                 sys::mount(
                     None,
                     &spec.target,

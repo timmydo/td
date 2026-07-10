@@ -2240,7 +2240,7 @@ mod tests {
     fn gate_mem_backstop_contains_a_runaway_allocator() {
         // Native pre_exec setrlimit — no host prlimit needed, so no host guard.
         let d = tmpdir("rlimit");
-        // ~64 MiB heap allocation in bash (command substitution buffers it).
+        // ~64 MiB heap allocation in the shell (command substitution buffers it).
         let hog = r#"x=$(head -c 67108864 /dev/zero | tr '\0' a); echo grew ${#x}"#;
         let set = synth(&d, &[("hog", Pool::Heavy, hog, &[])]);
         let sel = expand_goals(&set, &["hog".to_string()]).unwrap();
