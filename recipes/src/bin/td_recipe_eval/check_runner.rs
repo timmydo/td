@@ -65,10 +65,24 @@ pub fn build_cli(args: &[String]) -> Result<(), String> {
     } else {
         vec![target]
     };
+    // Every requested output must be a rung of TARGET's own recipe closure:
+    // build-run plans ONE graph (`build-plan --auto TARGET`) and reads each
+    // output's STEP line from that single build log, so a stem outside the
+    // closure could only red AFTER the whole build ran. Refuse it up front.
+    let members: HashSet<String> = recipe_closure(&[target])?
+        .into_iter()
+        .map(|n| n.stem)
+        .collect();
     for output in &outputs {
         if catalog::lookup(output).is_none() {
             return Err(format!(
                 "unknown output recipe stem '{output}' (try `list`)"
+            ));
+        }
+        if !members.contains(*output) {
+            return Err(format!(
+                "output stem '{output}' is not in the recipe closure of '{target}', \
+                 so the '{target}' build plan cannot produce it"
             ));
         }
     }
@@ -1296,6 +1310,19 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // build-run reads every requested output's STEP line from the ONE plan it
+    // builds (`build-plan --auto TARGET`), so a stem outside TARGET's recipe
+    // closure must refuse at argv validation — not red after the whole build.
+    #[test]
+    fn build_cli_refuses_output_outside_target_closure() {
+        let err = build_cli(&["stage0".to_string(), "mes".to_string()])
+            .expect_err("mes is not in stage0's closure");
+        assert!(
+            err.contains("not in the recipe closure of 'stage0'"),
+            "got: {err}"
+        );
+    }
 
     // The compiled seed-digest table and the catalog must agree EXACTLY
     // (re #469): a seed key any recipe declares without a compiled digest

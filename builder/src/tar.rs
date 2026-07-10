@@ -43,11 +43,9 @@ pub fn unpack_archive(tarball: &Path, dest: &Path, keep_top: bool) -> Result<(),
         let mut magic = [0u8; 6];
         let n = f.read(&mut magic).map_err(|e| format!("read {}: {e}", tarball.display()))?;
         match magic.get(..n).unwrap_or(&[]) {
-            m if m.starts_with(&[0x1f, 0x8b]) => extract_tar_gz(tarball, d),
-            m if m.starts_with(b"BZh") => extract_tar_bz2(tarball, d),
-            m if m.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) => {
-                extract_tar_xz(tarball, d)
-            }
+            [0x1f, 0x8b, ..] => extract_tar_gz(tarball, d),
+            [b'B', b'Z', b'h', ..] => extract_tar_bz2(tarball, d),
+            [0xfd, b'7', b'z', b'X', b'Z', 0x00, ..] => extract_tar_xz(tarball, d),
             _ => extract_tar(tarball, d),
         }
     };
@@ -76,14 +74,43 @@ pub fn unpack_archive(tarball: &Path, dest: &Path, keep_top: bool) -> Result<(),
         }
     };
     fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
-    for ent in fs::read_dir(&top).map_err(|e| format!("read {}: {e}", top.display()))? {
-        let ent = ent.map_err(|e| format!("read {}: {e}", top.display()))?;
-        let to = dest.join(ent.file_name());
-        fs::rename(ent.path(), &to).map_err(|e| {
-            format!("move {} -> {}: {e}", ent.path().display(), to.display())
-        })?;
-    }
+    merge_move(&top, dest)?;
     fs::remove_dir_all(&tmp).map_err(|e| format!("clear {}: {e}", tmp.display()))?;
+    Ok(())
+}
+
+/// Move FROM's children into DEST, MERGING into existing directories (the
+/// `tar --strip-components=1` overlay semantics some rungs rely on — e.g. a
+/// g++ add-on tarball unpacked over its gcc tree). Files/symlinks rename over
+/// an existing file; a file/directory kind clash is a hard error.
+fn merge_move(from: &Path, dest: &Path) -> Result<(), String> {
+    for ent in fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))? {
+        let ent = ent.map_err(|e| format!("read {}: {e}", from.display()))?;
+        let src = ent.path();
+        let to = dest.join(ent.file_name());
+        let src_is_dir = ent
+            .file_type()
+            .map_err(|e| format!("stat {}: {e}", src.display()))?
+            .is_dir();
+        let to_meta = fs::symlink_metadata(&to);
+        match (src_is_dir, to_meta) {
+            // Nothing at the target: a plain move either way.
+            (_, Err(_)) => fs::rename(&src, &to)
+                .map_err(|e| format!("move {} -> {}: {e}", src.display(), to.display()))?,
+            // Dir onto dir: recurse-merge.
+            (true, Ok(m)) if m.is_dir() => merge_move(&src, &to)?,
+            // File/symlink onto file/symlink: replace (rename semantics).
+            (false, Ok(m)) if !m.is_dir() => fs::rename(&src, &to)
+                .map_err(|e| format!("move {} -> {}: {e}", src.display(), to.display()))?,
+            _ => {
+                return Err(format!(
+                    "unpack merge: {} and {} disagree on file vs directory",
+                    src.display(),
+                    to.display()
+                ))
+            }
+        }
+    }
     Ok(())
 }
 
@@ -628,6 +655,60 @@ mod tests {
 
         assert!(err.contains("must not carry 1 data bytes"), "got: {err}");
         assert!(!out.join("link").exists());
+    }
+
+    #[test]
+    fn strip_top_unpack_merges_an_overlay_tree() {
+        let tmp = temp_dir("td-tar-overlay-test");
+        let dest = tmp.join("src");
+        let core = tmp.join("core.tar");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "core-1.0/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "core-1.0/gcc/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "core-1.0/gcc/common.c", b'0', 0o644, 4, "");
+        append_data(&mut bytes, b"core");
+        append_header(&mut bytes, "core-1.0/README", b'0', 0o644, 4, "");
+        append_data(&mut bytes, b"core");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&core, bytes).unwrap();
+        let gpp = tmp.join("gpp.tar");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "gpp-1.0/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "gpp-1.0/gcc/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "gpp-1.0/gcc/cp.c", b'0', 0o644, 3, "");
+        append_data(&mut bytes, b"gpp");
+        append_header(&mut bytes, "gpp-1.0/README", b'0', 0o644, 3, "");
+        append_data(&mut bytes, b"gpp");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&gpp, bytes).unwrap();
+
+        unpack_archive(&core, &dest, false).unwrap();
+        unpack_archive(&gpp, &dest, false).unwrap();
+
+        // The overlay MERGED into the existing tree (the g++ add-on tarball
+        // over its gcc core tree): the core file survives beside the
+        // overlay's, and the colliding file is replaced by the overlay.
+        assert_eq!(fs::read(dest.join("gcc/common.c")).unwrap(), b"core");
+        assert_eq!(fs::read(dest.join("gcc/cp.c")).unwrap(), b"gpp");
+        assert_eq!(fs::read(dest.join("README")).unwrap(), b"gpp");
+    }
+
+    #[test]
+    fn strip_top_unpack_refuses_file_directory_kind_clash() {
+        let tmp = temp_dir("td-tar-overlay-clash-test");
+        let dest = tmp.join("src");
+        fs::create_dir_all(dest.join("gcc")).unwrap();
+        let tar = tmp.join("clash.tar");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "x-1.0/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "x-1.0/gcc", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"x");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = unpack_archive(&tar, &dest, false).expect_err("kind clash must red");
+
+        assert!(err.contains("disagree on file vs directory"), "got: {err}");
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
