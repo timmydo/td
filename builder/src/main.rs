@@ -1518,19 +1518,31 @@ fn receipt_outputs(
     let mut builder = None;
     let mut producer = None;
     let mut outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // A duplicated field is a CONTRADICTORY receipt, not a hit — last-wins
+    // would let a second `output`/`producer` line quietly override the first.
     for l in lines {
         if let Some(v) = l.strip_prefix("drv-sha256 ") {
-            drv_sha = Some(v);
+            if drv_sha.replace(v).is_some() {
+                return None;
+            }
         } else if let Some(v) = l.strip_prefix("manifest-sha256 ") {
-            manifest_sha = Some(v);
+            if manifest_sha.replace(v).is_some() {
+                return None;
+            }
         } else if let Some(v) = l.strip_prefix("builder ") {
-            builder = Some(v);
+            if builder.replace(v).is_some() {
+                return None;
+            }
         } else if let Some(v) = l.strip_prefix("producer ") {
-            producer = Some(v);
+            if producer.replace(v).is_some() {
+                return None;
+            }
         } else if let Some(v) = l.strip_prefix("output ") {
             let mut f = v.split_whitespace();
             let (p, h) = (f.next()?, f.next()?);
-            outputs.insert(p.to_string(), h.to_string());
+            if outputs.insert(p.to_string(), h.to_string()).is_some() {
+                return None;
+            }
         } else if !l.trim().is_empty() {
             return None; // an unknown line is a malformed receipt, not a hit
         }
@@ -2285,6 +2297,14 @@ fn manifest_from_typed_dbs(
 /// rows, so this is one source/builder tree per build, the recorded
 /// re-hash-every-step decision. Verified (db, items_dir) pairs are memoized
 /// per process (the same db is assembled for the reuse gate AND the realize).
+///
+/// Honest limit, same trust domain as the receipt layer: authentication reads
+/// the db here, and `manifest_from_typed_dbs` re-reads it at assembly — a
+/// same-user writer swapping the file between the two (or after the memo hit)
+/// is not stopped, though `verify_staged_item` still re-hashes the ITEM bytes
+/// at the bind boundary, so a swap can at most re-point rows at other
+/// already-CA-valid items. Closing the window means one read feeding both
+/// authentication and assembly from a daemon-owned db — the #472 follow-on.
 fn authenticate_ca_db(dbp: &str, items_dir: &Path, label: &str) -> Result<(), String> {
     use std::sync::{Mutex, OnceLock};
     static VERIFIED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
@@ -8709,6 +8729,32 @@ daemon build START (2/2 active)
         let err = authenticate_ca_db(&alien_db.to_string_lossy(), &items3, "test").unwrap_err();
         assert!(err.contains("do not reproduce its own name"), "{err}");
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    // A duplicated receipt field is a CONTRADICTION, not a last-wins update:
+    // a second `output` line for the same path (or a second producer) must
+    // make the whole receipt a non-hit.
+    #[test]
+    fn receipt_outputs_rejects_duplicated_fields() {
+        let expect = ReceiptExpect {
+            drv_sha256: "d".repeat(64),
+            manifest_sha256: "m".repeat(64),
+            builder: "sha256:bb".to_string(),
+        };
+        let base = format!(
+            "td-receipt v1\ndrv-sha256 {}\nmanifest-sha256 {}\nbuilder {}\nproducer local-build\n",
+            expect.drv_sha256, expect.manifest_sha256, expect.builder
+        );
+        let good = format!("{base}output /td/store/x-1.0 sha256:{}\n", "a".repeat(64));
+        assert!(receipt_outputs(&good, &expect).is_some());
+        let dup_output = format!(
+            "{base}output /td/store/x-1.0 sha256:{}\noutput /td/store/x-1.0 sha256:{}\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        assert!(receipt_outputs(&dup_output, &expect).is_none());
+        let dup_producer = format!("{base}producer local-build\n");
+        assert!(receipt_outputs(&dup_producer, &expect).is_none());
     }
 
     // authenticate_recipe_output_db (re #469 round-8): `--recipe-output-db` is

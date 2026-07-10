@@ -54,8 +54,24 @@ pub fn unpack_archive(tarball: &Path, dest: &Path, keep_top: bool) -> Result<(),
     }
     // Strip the top-level dir: extract beside dest (same filesystem, so the
     // child renames below are atomic moves), then hoist the unique top dir's
-    // children into dest.
-    let tmp = dest.with_extension("unpack-tmp");
+    // children into dest. The tmp name APPENDS to dest's file name —
+    // `with_extension` would replace an existing extension, letting two
+    // distinct dests collide on one tmp path (and the pre-clean below would
+    // then delete the other unpack's tree).
+    let tmp = match dest.file_name() {
+        Some(name) => {
+            let mut t = name.to_os_string();
+            t.push(".unpack-tmp");
+            dest.with_file_name(t)
+        }
+        None => {
+            return Err(format!(
+                "unpack {}: destination {} has no file name to place a tmp dir beside",
+                tarball.display(),
+                dest.display()
+            ))
+        }
+    };
     if tmp.exists() {
         fs::remove_dir_all(&tmp).map_err(|e| format!("clear {}: {e}", tmp.display()))?;
     }
@@ -64,8 +80,12 @@ pub fn unpack_archive(tarball: &Path, dest: &Path, keep_top: bool) -> Result<(),
         .map_err(|e| format!("read {}: {e}", tmp.display()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read {}: {e}", tmp.display()))?;
+    // The sole top entry must be a REAL directory — `file_type()` does not
+    // follow symlinks. A symlink-to-dir top would make the hoist read and
+    // rename through the link's target, moving files out of a tree OUTSIDE
+    // the extracted archive.
     let top = match (tops.pop(), tops.is_empty()) {
-        (Some(t), true) if t.path().is_dir() => t.path(),
+        (Some(t), true) if t.file_type().is_ok_and(|ft| ft.is_dir()) => t.path(),
         _ => {
             return Err(format!(
                 "unpack {}: stripping the top level needs exactly one top-level directory",
@@ -691,6 +711,27 @@ mod tests {
         assert_eq!(fs::read(dest.join("gcc/common.c")).unwrap(), b"core");
         assert_eq!(fs::read(dest.join("gcc/cp.c")).unwrap(), b"gpp");
         assert_eq!(fs::read(dest.join("README")).unwrap(), b"gpp");
+    }
+
+    #[test]
+    fn strip_top_unpack_refuses_a_symlink_top() {
+        let tmp = temp_dir("td-tar-symlink-top-test");
+        let outside = tmp.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"k").unwrap();
+        let tar = tmp.join("test.tar");
+        let dest = tmp.join("src");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "top", b'2', 0o777, 0, outside.to_str().unwrap());
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        // A sole top-level SYMLINK (even to a real directory) must refuse:
+        // following it would hoist files out of the link's target tree.
+        let err = unpack_archive(&tar, &dest, false).expect_err("symlink top must red");
+
+        assert!(err.contains("exactly one top-level directory"), "got: {err}");
+        assert!(outside.join("keep").exists());
     }
 
     #[test]

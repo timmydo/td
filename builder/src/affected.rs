@@ -1247,8 +1247,8 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
         // finding: recipes tests + clippy ran in NO automated per-PR tier).
         "cargo-test" => {
             for cmd in [
-                "cargo test --manifest-path builder/Cargo.toml",
-                "cargo test --manifest-path recipes/Cargo.toml",
+                "cargo test --frozen --manifest-path builder/Cargo.toml",
+                "cargo test --frozen --manifest-path recipes/Cargo.toml",
                 "cargo clippy --frozen --manifest-path builder/Cargo.toml",
                 "cargo clippy --frozen --manifest-path recipes/Cargo.toml",
             ] {
