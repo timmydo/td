@@ -188,21 +188,70 @@ pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
     }
 }
 
+/// WHO issued the authority for a staged input's hash — its provenance CLASS
+/// (re #469). Integrity and provenance are distinct: integrity is "the bytes
+/// match a recorded hash"; provenance is "the authority that recorded that
+/// hash is allowed to do so". An `InputOrigin` is constructed ONLY at the
+/// planner's typed db-intake sites — the plan's seed db, a prior step's
+/// td.db, a td-interned source/vendor placement db, the stage0 builder
+/// placement db, the daemon's blessed seed-lock closure db — each declared
+/// with its class in code where the planner hands it over. A raw path,
+/// environment variable, database row, or cache file can locate bytes, but
+/// no production function turns one directly into an `InputOrigin`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputOrigin {
+    /// A pinned, hash-verified seed registration: the interned seed db whose
+    /// entries the compiled seed-digest table gated at synthesis, or a
+    /// td-interned source/vendored-crate placement db (a declared
+    /// fixed-output fetch td restored itself).
+    AuditedSeed,
+    /// A prior td recipe output: a build-plan step's td.db row, written by
+    /// the engine after that step's own verified build (deriver recorded).
+    RecipeOutput,
+    /// The control-plane td-builder staged as the drv's builder — the stage0
+    /// placement db `store-add-builder` wrote for the binary driving this
+    /// build.
+    ControlPlaneBuilder,
+    /// The daemon flow's blessed seed-lock closure: the `seed-bless` db over
+    /// the REPO-DECLARED roots (`seed_lock_roots`), hashed once per root set.
+    BlessedSeedClosure,
+}
+
+impl InputOrigin {
+    /// The audit token (`provenance.manifest`'s origin column).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InputOrigin::AuditedSeed => "audited-seed",
+            InputOrigin::RecipeOutput => "recipe-output",
+            InputOrigin::ControlPlaneBuilder => "control-plane-builder",
+            InputOrigin::BlessedSeedClosure => "blessed-seed-closure",
+        }
+    }
+}
+
+/// One staged input's authority record: the expected NAR hash
+/// (`sha256:<hex>`, the `ValidPaths.hash` wire format) plus WHO issued it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StagedInput {
+    pub nar_hash: String,
+    pub origin: InputOrigin,
+}
+
 /// The staged-input provenance manifest (re #469): canonical store path →
-/// expected NAR hash (`sha256:<hex>`), assembled by the planner from td-owned
-/// store DBs ONLY (interned-seed registrations, prior build-plan steps'
-/// td.dbs, the source/builder placement dbs). EVERY build carries one — there
-/// is no non-strict mode: each closure item must have a record and its on-disk
-/// bytes must hash to it, or it refuses to stage. A caller-supplied store
-/// DIRECTORY is thereby a byte source, never an authority: the bytes bind only
-/// if a td-owned registration vouches for them.
+/// (expected NAR hash, origin class), assembled by the planner from TYPED
+/// td-owned store DBs ONLY (interned-seed registrations, prior build-plan
+/// steps' td.dbs, the source/builder placement dbs). EVERY build carries one —
+/// there is no non-strict mode: each closure item must have a record and its
+/// on-disk bytes must hash to it, or it refuses to stage. A caller-supplied
+/// store DIRECTORY is thereby a byte source, never an authority: the bytes
+/// bind only if a td-owned registration vouches for them.
 ///
 /// Cost, decided deliberately: verification re-hashes every closure item at
 /// EVERY strict step — O(closure bytes) per step, not amortized. The bootstrap
 /// rungs are small, a streaming SHA-256 is cheap next to the build it guards,
 /// and trusting a prior step's verification is exactly the assume-the-cache
 /// hole this manifest exists to close.
-pub type StageManifest = std::collections::BTreeMap<String, String>;
+pub type StageManifest = std::collections::BTreeMap<String, StagedInput>;
 
 /// Stream-hash a tree/file in NAR form — `sha256:<hex>`, the `ValidPaths.hash`
 /// wire format every td store registration records. `pub(crate)` because the
@@ -239,9 +288,11 @@ pub fn verify_staged_item(
         )));
     };
     let got = nar_hash_of(Path::new(on_disk))?;
-    if got != *want {
+    if got != want.nar_hash {
         return Err(err(format!(
-            "provenance rejected: closure item {canonical} (on disk {on_disk}) hashes {got} but its td-owned registration records {want} — refusing to stage tampered bytes (re #469)"
+            "provenance rejected: closure item {canonical} (on disk {on_disk}) hashes {got} but its td-owned registration ({}) records {} — refusing to stage tampered bytes (re #469)",
+            want.origin.as_str(),
+            want.nar_hash
         )));
     }
     Ok(())
@@ -1059,13 +1110,19 @@ mod tests {
 
         // A record whose hash the on-disk bytes do not match → refused.
         let mut tampered = StageManifest::new();
-        tampered.insert(canonical.to_string(), "sha256:0000".to_string());
+        tampered.insert(
+            canonical.to_string(),
+            StagedInput { nar_hash: "sha256:0000".to_string(), origin: InputOrigin::AuditedSeed },
+        );
         let err = verify_staged_item(&tampered, canonical, on_disk).unwrap_err();
         assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
 
         // The vouched bytes pass.
         let mut vouched = StageManifest::new();
-        vouched.insert(canonical.to_string(), good_hash);
+        vouched.insert(
+            canonical.to_string(),
+            StagedInput { nar_hash: good_hash, origin: InputOrigin::AuditedSeed },
+        );
         verify_staged_item(&vouched, canonical, on_disk).unwrap();
 
         // …and stop passing the moment the bytes change under the same record.

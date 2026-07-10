@@ -1662,6 +1662,7 @@ fn daemon_realize_one(
     drv: &str,
     seed_dir: &str,
     scratch_base: &Path,
+    bless_db: Option<&str>,
 ) -> Result<(String, String, bool), String> {
     let ov = builder_override_from_env()?;
     let content = std::fs::read(drv).map_err(|e| format!("read {drv}: {e}"))?;
@@ -1687,11 +1688,15 @@ fn daemon_realize_one(
     eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
     let seed_dirs = [seed_dir.to_string()];
     // The daemon scans the live store dir: entries are canonical where they sit.
-    // Strict manifests are unconditional (re #469): the vouching dbs arrive via
-    // TD_EXTRA_DBS, inherited from the daemon — ensure_build_daemon blesses the
-    // DECLARED seed-lock closure into a db and sets it there, so every staged
-    // item must match the hash recorded at bless time.
-    let extra_dbs = extra_dbs_from_env();
+    // Strict manifests are unconditional (re #469): the vouching db is the blessed
+    // seed-closure db, handed down as an EXPLICIT `daemon-build` argument —
+    // ensure_build_daemon blesses the REPO-DECLARED seed-lock closure once and
+    // passes the db through the daemon's argv, so every staged item must match
+    // the hash recorded at bless time. There is no env channel that can add
+    // manifest authority (re #469 typed origins).
+    let extra_dbs: Vec<(String, sandbox::InputOrigin)> = bless_db
+        .map(|d| vec![(d.to_string(), sandbox::InputOrigin::BlessedSeedClosure)])
+        .unwrap_or_default();
     let regs = realize_drv(drv, &seed_dirs, &store::store_dir(), &extra_dbs, &scr, &[], ov.as_ref(), None)?;
     let (c, h) = mk(&regs)?;
     Ok((c, h, false))
@@ -1715,6 +1720,7 @@ fn daemon_check_one(
     drv: &str,
     seed_dir: &str,
     scratch_base: &Path,
+    bless_db: Option<&str>,
 ) -> Result<(String, String), String> {
     let ov = builder_override_from_env()?;
     let seed_dirs = [seed_dir.to_string()];
@@ -1722,7 +1728,10 @@ fn daemon_check_one(
     let scr = scratch_base.join(format!("{key}-chk"));
     let _ = std::fs::remove_dir_all(&scr); // the rebuild here must be fresh, never a cache reuse
     let r1 = scr.join("r1");
-    let extra_dbs = extra_dbs_from_env();
+    // Same explicit-argument channel as daemon_realize_one (re #469 typed origins).
+    let extra_dbs: Vec<(String, sandbox::InputOrigin)> = bless_db
+        .map(|d| vec![(d.to_string(), sandbox::InputOrigin::BlessedSeedClosure)])
+        .unwrap_or_default();
     let regs1 = realize_drv(drv, &seed_dirs, &store::store_dir(), &extra_dbs, &r1, &[], ov.as_ref(), None)?;
     // Baseline for the comparison: the build verb's already-realized output at
     // scratch_base/<key> when every output tree is present there (the loop's normal path,
@@ -1816,12 +1825,12 @@ fn scan_candidate_index(
 /// coreutils' gmp vanished and `expr` died on libgmp.so.10).
 ///
 /// PRECONDITION: an entry whose true canonical differs from the stamped seed prefix must
-/// be visible as a drv root or via a TD_EXTRA_DBS registration, or it keeps the stamp.
+/// be visible as a drv root or via a typed extra-db registration, or it keeps the stamp.
 /// Callers satisfy this by construction — every td-built tree is created WITH its OUT-DB
 /// (store-add-recursive/store-add-builder/write_output_db), and the paths that stage one
-/// into a seed dir (gate 377's toolchain pair, the td-shell native store) pass that DB in
-/// TD_EXTRA_DBS and/or name the tree as a lock root. Don't stage an unregistered td-built
-/// tree into a seed dir.
+/// into a seed dir (gate 377's toolchain pair, the td-shell native store) pass that DB as
+/// a typed extra db and/or name the tree as a lock root. Don't stage an unregistered
+/// td-built tree into a seed dir.
 fn recanonicalize_candidates(
     candidates: &mut [String],
     on_disk: &mut std::collections::HashMap<String, String>,
@@ -1883,17 +1892,18 @@ fn scan_closure_hybrid(
     Ok(seen)
 }
 
-/// Merge the DIRECT-reference graph of one or more td-OWNED store DBs (build-plan's td.dbs /
-/// TD_EXTRA_DBS) into a single `path -> direct refs` map, for `scan_closure_hybrid`. These
-/// DBs are td's OWN registration (never `/var/guix`); they carry a td-built dep whose bytes
-/// live outside the content-scanned seed dirs, so its refs are read from the DB it wrote.
+/// Merge the DIRECT-reference graph of one or more typed td-OWNED store DBs
+/// (build-plan's td.dbs / the blessed seed-closure db) into a single `path -> direct refs`
+/// map, for `scan_closure_hybrid`. These DBs are td's OWN registration (never `/var/guix`);
+/// they carry a td-built dep whose bytes live outside the content-scanned seed dirs, so
+/// its refs are read from the DB it wrote.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_extra_refs(
-    extra_dbs: &[String],
+    extra_dbs: &[(String, sandbox::InputOrigin)],
 ) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
     let mut extra_refs: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for dbp in extra_dbs {
+    for (dbp, _) in extra_dbs {
         let data = std::fs::read(dbp).map_err(|e| format!("read store db {dbp}: {e}"))?;
         let db = store_db_read::Db::open(data)?;
         for (from, tos) in db.refs_by_path()? {
@@ -1903,46 +1913,47 @@ fn merge_extra_refs(
     Ok(extra_refs)
 }
 
-/// TD_EXTRA_DBS (colon-separated td-owned store DBs) as a path list — the
-/// vouching-db channel for the engine arms that take no db argument (the
-/// daemon children, `realize`, `build`, `check-drv`). Strict manifests are
-/// unconditional (re #469), so an arm with no other db source reads this;
-/// `ensure_build_daemon` sets it to the blessed seed-closure db.
-fn extra_dbs_from_env() -> Vec<String> {
-    std::env::var("TD_EXTRA_DBS")
-        .map(|v| v.split(':').filter(|s| !s.is_empty()).map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
 /// Fold one td-owned store DB's full registrations (path → NAR hash) into the
-/// staged-input manifest. A path registered under two DIFFERENT hashes is a
-/// contradiction, never a merge — refuse to build on it.
+/// staged-input manifest, stamping every row with the ORIGIN class the caller
+/// declared for this db at its typed intake site (re #469). A path registered
+/// under two DIFFERENT hashes is a contradiction, never a merge — refuse to
+/// build on it; the same path re-registered under the SAME hash keeps the
+/// first record's origin.
 fn manifest_add_db(
     m: &mut sandbox::StageManifest,
     db: &store_db_read::Db,
     label: &str,
+    origin: sandbox::InputOrigin,
 ) -> Result<(), String> {
     for (p, h) in db.hashes_by_path()? {
-        if let Some(prev) = m.get(&p) {
-            if prev != &h {
+        match m.get(&p) {
+            Some(prev) if prev.nar_hash != h => {
                 return Err(format!(
-                    "provenance conflict: {p} is registered with hash {prev} and {h} ({label}) — refusing to build on a contradictory record"
+                    "provenance conflict: {p} is registered with hash {} and {h} ({label}) — refusing to build on a contradictory record",
+                    prev.nar_hash
                 ));
             }
+            Some(_) => {}
+            None => {
+                m.insert(p, sandbox::StagedInput { nar_hash: h, origin });
+            }
         }
-        m.insert(p, h);
     }
     Ok(())
 }
 
-/// Assemble a staged-input manifest from td-owned store DB FILES — the strict
-/// staging authority (re #469) for the arms whose only db source is a path
-/// list (TD_EXTRA_DBS / a caller argument).
-fn manifest_from_db_paths(db_paths: &[String]) -> Result<sandbox::StageManifest, String> {
+/// Assemble a staged-input manifest from TYPED td-owned store DB files — each
+/// db paired, in code at the planner's intake site, with the `InputOrigin`
+/// class of the rows it contributes (re #469). This is the only constructor
+/// of manifest authority: there is no path from an untyped db list, an
+/// environment variable, or a cache file to a manifest entry.
+fn manifest_from_typed_dbs(
+    dbs: &[(String, sandbox::InputOrigin)],
+) -> Result<sandbox::StageManifest, String> {
     let mut m = sandbox::StageManifest::new();
-    for dbp in db_paths {
+    for (dbp, origin) in dbs {
         let data = std::fs::read(dbp).map_err(|e| format!("read store db {dbp}: {e}"))?;
-        manifest_add_db(&mut m, &store_db_read::Db::open(data)?, dbp)?;
+        manifest_add_db(&mut m, &store_db_read::Db::open(data)?, dbp, *origin)?;
     }
     Ok(m)
 }
@@ -1958,7 +1969,10 @@ fn manifest_from_db_paths(db_paths: &[String]) -> Result<sandbox::StageManifest,
 /// the daemon children's realize exactly. Bless ONCE per declared root set and
 /// keep the db (the caller keys it by the roots): re-blessing would re-trust
 /// whatever bytes are currently on disk, which is exactly the
-/// existence-as-authority hole the manifest closes.
+/// existence-as-authority hole the manifest closes. The PUBLIC verb derives
+/// ROOTS itself from the repo's checked-in seed-lock declarations
+/// (`seed_lock_roots`) so a caller cannot mint authority for arbitrary paths;
+/// this function takes them as a parameter for the engine and its tests.
 fn bless_seed_closure(seed_dir: &str, roots: &[String], out_db: &Path) -> Result<usize, String> {
     if roots.is_empty() {
         return Err("seed-bless: no roots to bless".to_string());
@@ -2004,8 +2018,10 @@ fn bless_seed_closure(seed_dir: &str, roots: &[String], out_db: &Path) -> Result
 /// supplies the recipe source from a td-owned store instead of the daemon store (no `guix
 /// repl` interning). SEED_STORE_DIRS is the set of store DIRECTORIES the seed/toolchain
 /// closure is content-scanned over (`/gnu/store`, or the unpacked seed store); EXTRA_DBS is
-/// the set of td-OWNED store DBs whose td-built deps live outside those dirs (build-plan
-/// passes the prior steps' td.dbs so a downstream build's closure spans both). BUILDER_OVERRIDE,
+/// the set of td-OWNED store DBs whose td-built deps live outside those dirs, each TYPED
+/// with the `InputOrigin` class its rows carry into the staging manifest (build-plan
+/// passes the seed db as `AuditedSeed` + the prior steps' td.dbs as `RecipeOutput` so a
+/// downstream build's closure spans both). BUILDER_OVERRIDE,
 /// when set, supplies the drv's `builder` from a td-owned store (a td-bootstrapped stage0, not
 /// the guix-built td-builder) — the builder entry binds from the builder DB and its direct
 /// refs' TRANSITIVE closures come from the seed content-scan. TD_STORE, when set, names td's
@@ -2021,7 +2037,7 @@ fn realize_drv(
     drv_path: &str,
     seed_store_dirs: &[String],
     seed_canonical_prefix: &str,
-    extra_dbs: &[String],
+    extra_dbs: &[(String, sandbox::InputOrigin)],
     scratch: &Path,
     src_overrides: &[SrcOverride],
     builder_override: Option<&BuilderOverride>,
@@ -2182,31 +2198,34 @@ fn realize_drv(
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     std::fs::write(scratch.join("closure.txt"), closure.join("\n")).map_err(|e| e.to_string())?;
     // STRICT PROVENANCE — the ONLY mode (re #469): assemble the staged-input
-    // manifest from td-OWNED store DBs ONLY — the interned-seed/extra dbs, each source
-    // placement's db, the builder placement's db — and require EVERY closure item to be
-    // accounted for before anything is staged. The content-scanned seed DIRECTORY thereby
-    // contributes bytes, never authority: an item the dbs don't vouch for reds HERE, and
-    // sandbox::build re-hashes each item against the manifest at the bind boundary.
-    // Scaffolding rows (hashless placement refs) vouch for nothing by construction.
-    let mut manifest = manifest_from_db_paths(extra_dbs)?;
+    // manifest from TYPED td-OWNED store DBs ONLY — the interned-seed/extra dbs (typed at
+    // the caller's intake site), each source placement's db (`AuditedSeed` — a td-interned
+    // pinned fetch), the builder placement's db (`ControlPlaneBuilder`) — and require
+    // EVERY closure item to be accounted for before anything is staged. The
+    // content-scanned seed DIRECTORY thereby contributes bytes, never authority: an item
+    // the dbs don't vouch for reds HERE, and sandbox::build re-hashes each item against
+    // the manifest at the bind boundary. Scaffolding rows (hashless placement refs) vouch
+    // for nothing by construction.
+    let mut manifest = manifest_from_typed_dbs(extra_dbs)?;
     for (ov, sdb) in &src_dbs {
-        manifest_add_db(&mut manifest, sdb, &ov.db)?;
+        manifest_add_db(&mut manifest, sdb, &ov.db, sandbox::InputOrigin::AuditedSeed)?;
     }
     if let (Some(ov), Some(bdb)) = (builder_override, &builder_db) {
-        manifest_add_db(&mut manifest, bdb, &ov.db)?;
+        manifest_add_db(&mut manifest, bdb, &ov.db, sandbox::InputOrigin::ControlPlaneBuilder)?;
     }
     for e in &closure {
         let (canonical, _) = sandbox::split_closure_entry(e);
         if !manifest.contains_key(canonical) {
             return Err(format!(
-                "provenance rejected: closure item {canonical} has no td-owned store-db record (re #469) — every staged input must be vouched for by the plan's seed db, a prior step's td.db, a source/builder placement db, or the blessed seed-closure db (TD_EXTRA_DBS)"
+                "provenance rejected: closure item {canonical} has no td-owned store-db record (re #469) — every staged input must be vouched for by the plan's seed db, a prior step's td.db, a source/builder placement db, or the blessed seed-closure db"
             ));
         }
     }
-    // The audit record beside closure.txt: what may stage, under which hash.
+    // The audit record beside closure.txt: what may stage, under which hash,
+    // issued by WHICH provenance class (the origin column).
     let mut lines = String::new();
-    for (p, h) in &manifest {
-        lines.push_str(&format!("{p} {h}\n"));
+    for (p, si) in &manifest {
+        lines.push_str(&format!("{p} {} {}\n", si.nar_hash, si.origin.as_str()));
     }
     std::fs::write(scratch.join("provenance.manifest"), lines).map_err(|e| e.to_string())?;
     let regs = build_and_register(drv_path, &closure, scratch, &manifest)?;
@@ -2268,7 +2287,7 @@ fn build_recipe(
     scratch: &Path,
     seed_store_dirs: &[String],
     seed_canonical_prefix: &str,
-    extra_dbs: &[String],
+    extra_dbs: &[(String, sandbox::InputOrigin)],
     src_store: Option<(&str, &str)>,
     vendor_store: Option<(&str, &str, &str)>,
     builder_store: Option<(&str, &str, &str)>,
@@ -2790,11 +2809,13 @@ fn build_plan(
     // recipe name -> its (single) output store path; and each step's td.db, fed
     // into the closure of later steps so a td-built dep resolves. The db set is
     // SEEDED with the plan's seed db (the registrations `store-add-recursive`
-    // wrote when the seeds were interned) — under strict provenance every staged
-    // item must be vouched for by one of these dbs, so the seed STORE directory
-    // contributes bytes, never authority (re #469).
+    // wrote when the seeds were interned), typed `AuditedSeed`; each step's
+    // td.db joins typed `RecipeOutput` — under strict provenance every staged
+    // item must be vouched for by one of these TYPED dbs, so the seed STORE
+    // directory contributes bytes, never authority (re #469).
     let mut built: BTreeMap<String, String> = BTreeMap::new();
-    let mut td_dbs: Vec<String> = vec![seed_db.to_string()];
+    let mut td_dbs: Vec<(String, sandbox::InputOrigin)> =
+        vec![(seed_db.to_string(), sandbox::InputOrigin::AuditedSeed)];
     let store_prefix = store::store_dir();
 
     for raw in plan.lines() {
@@ -2902,7 +2923,10 @@ fn build_plan(
             copy_canonical(&physical, &dest)?;
         }
         built.insert(name.to_string(), out.store_path.clone());
-        td_dbs.push(step_scratch.join("td.db").to_string_lossy().into_owned());
+        td_dbs.push((
+            step_scratch.join("td.db").to_string_lossy().into_owned(),
+            sandbox::InputOrigin::RecipeOutput,
+        ));
         println!("STEP {name} {}", out.store_path);
         eprintln!(
             "td-builder: build-plan step `{name}': out {} (staged into td-store {})",
@@ -3261,9 +3285,9 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
 /// this env). When present, a vendored rust build (ripgrep,
 /// fd, …) links this toolchain — never the guix rust/gcc-toolchain: the seed lock is retargeted
 /// (`native_seed_lock_body`), the combined store is the build's STORE-DIR + `TD_SEED_STORE`, the
-/// native store's db rides `TD_EXTRA_DBS`, and `TD_RUST_STORE_{INTERP,RPATH,BDIR}` put run_rust
-/// in native link mode. A package build with no native toolchain provisioned is a hard error
-/// (no guix-rust fallback — the cutover).
+/// native store's db rides the `--recipe-output-db` argv (typed origins, re #469), and
+/// `TD_RUST_STORE_{INTERP,RPATH,BDIR}` put run_rust in native link mode. A package build with no
+/// native toolchain provisioned is a hard error (no guix-rust fallback — the cutover).
 struct NativeToolchain {
     /// The combined seed+native store dir (guix build seed + the `/td/store` toolchain trees):
     /// the build's STORE-DIR and `TD_SEED_STORE`.
@@ -3271,7 +3295,8 @@ struct NativeToolchain {
     /// A placeholder `TD_SEED_DB` companion (the engine content-scans `store`; this is the legacy
     /// set-together companion, never `/var/guix/db`).
     seed_db: String,
-    /// The native toolchain's own td store db (its `/td/store` outputs + refs) → `TD_EXTRA_DBS`.
+    /// The native toolchain's own td store db(s) (its `/td/store` outputs + refs), colon-
+    /// separated → passed to build-recipe as `--recipe-output-db` argv (typed, re #469).
     extra_dbs: String,
     /// Native link mode: the `/td/store` glibc loader, RUNPATH, and `-B` dir baked by run_rust.
     interp: String,
@@ -3387,8 +3412,8 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         let mut bargs: Vec<String> = vec!["build-recipe".into(), json_file.clone()];
         // A vendored rust build links the native /td/store toolchain when it is provisioned; a
         // package without warmed inputs cannot use the retired legacy shell path. Keep the chosen
-        // native env so the build-recipe subprocess gets TD_SEED_STORE/TD_EXTRA_DBS/
-        // TD_RUST_STORE_* for the vendored-rust case.
+        // native env so the build-recipe subprocess gets TD_SEED_STORE/TD_RUST_STORE_* (and the
+        // native db as `--recipe-output-db` argv) for the vendored-rust case.
         let native_env = match provision_rust_inputs(pkg, &lock_dir, &sd, &self_exe)? {
             Some((seedlock, extra)) => {
                 let Some(nt) = &native else {
@@ -3413,6 +3438,13 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                 bargs.push(sd.clone());
                 bargs.push(nt.store.clone());
                 bargs.extend(extra);
+                // The native toolchain's own store db(s): prior td recipe outputs,
+                // passed as the TYPED `--recipe-output-db` argv channel (the
+                // TD_EXTRA_DBS env authority channel is deleted, re #469).
+                for db in nt.extra_dbs.split(':').filter(|s| !s.is_empty()) {
+                    bargs.push("--recipe-output-db".into());
+                    bargs.push(db.to_string());
+                }
                 nt
             }
             None => {
@@ -3430,11 +3462,11 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         build.args(&bargs);
         // Native link mode, exactly as the retired rust-userland gate (#410 cutover) set it:
         // the combined store is content-scanned for the closure, the native toolchain's own db
-        // adds its /td/store refs, and run_rust bakes the /td/store interp/RUNPATH/-B.
+        // arrives as `--recipe-output-db` argv (typed origins, re #469), and run_rust bakes
+        // the /td/store interp/RUNPATH/-B.
         build
             .env("TD_SEED_STORE", &native_env.store)
             .env("TD_SEED_DB", &native_env.seed_db)
-            .env("TD_EXTRA_DBS", &native_env.extra_dbs)
             .env("TD_RUST_STORE_INTERP", &native_env.interp)
             .env("TD_RUST_STORE_RPATH", &native_env.rpath)
             .env("TD_RUST_STORE_BDIR", &native_env.bdir);
@@ -6122,81 +6154,14 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // S3b/S3c — execute the drv in the userns sandbox and register the
-        // outputs. CLOSURE is a file listing every store path the build may
-        // see, one per line; writes land under SCRATCH/newstore and the v1
-        // registration record under
-        // SCRATCH/registration.
-        Some("build") if args.len() == 5 => {
-            let (drv_path, closure_file, scratch) = (&args[2], &args[3], &args[4]);
-            let run = || -> Result<(), String> {
-                let closure: Vec<String> = std::fs::read_to_string(closure_file)
-                    .map_err(|e| e.to_string())?
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                // Strict manifests are unconditional (re #469): a caller-supplied
-                // closure FILE is a byte list, never an authority — the td-owned
-                // db(s) in TD_EXTRA_DBS must vouch for every staged item.
-                let dbs = extra_dbs_from_env();
-                if dbs.is_empty() {
-                    return Err(
-                        "no td-owned store db vouches this closure — strict staging \
-                         manifests are unconditional (re #469); set TD_EXTRA_DBS to the \
-                         db(s) that registered the closure's items"
-                            .to_string(),
-                    );
-                }
-                let manifest = manifest_from_db_paths(&dbs)?;
-                build_and_register(drv_path, &closure, Path::new(scratch), &manifest).map(|_| ())
-            };
-            match run() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("td-builder: build {drv_path}: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        // td-builder realize: REALIZE a derivation with NO guix-daemon in the path.
-        // td computes the build's input closure ITSELF — its own SQLite reader
-        // (store_db_read) over the store DB's `Refs` graph, the job `guix gc -R`
-        // (the daemon) used to do (gate td-drv-build, line "stage the input
-        // closure"). It then executes the build in its userns sandbox and writes
-        // the registration record (via build_and_register). STORE-DB supplies the
-        // reference graph of the already-realized inputs — the Guix toolchain,
-        // retired LAST (§5) — so td realizes only the TOP derivation; reading guix's
-        // live /var/guix/db/db.sqlite with td's OWN reader is "own, then diverge"
-        // (the store is shared; the reader is td's, no daemon process). The
-        // guix-daemon is no longer in the realize path, and neither is its store DB:
-        // the input closure is CONTENT-SCANNED from the seed STORE-DIR (no /var/guix/db).
-        // Usage:
-        //   realize DRV STORE-DIR SCRATCH
-        Some("realize") if args.len() == 5 => {
-            let (drv_path, store_dir, scratch) = (&args[2], &args[3], &args[4]);
-            let run = || -> Result<(), String> {
-                // Honor the optional td-OWNED stage0 builder override (TD_BUILDER_PATH/STORE/DB)
-                // exactly as the daemon's realize path does — a td-ASSEMBLED drv (e.g. corpus
-                // hello) names the stage0 td-builder as its builder, which is NOT in /gnu/store,
-                // so without the override the content-scanned closure can't stage it. Unset env
-                // ⇒ None ⇒ identical to the prior behavior. The override rides into closure.txt,
-                // so a later `td-builder build`/`check` of this drv stages the builder too.
-                let ov = builder_override_from_env()?;
-                // Strict manifests are unconditional (re #469): the vouching db(s)
-                // arrive via TD_EXTRA_DBS (e.g. the blessed seed-closure db).
-                let extra_dbs = extra_dbs_from_env();
-                realize_drv(drv_path, std::slice::from_ref(store_dir), &store::store_dir(), &extra_dbs, Path::new(scratch), &[], ov.as_ref(), None)
-                    .map(|_| ())
-            };
-            match run() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("td-builder: realize {drv_path}: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        // The generic `build DRV CLOSURE SCRATCH` and `realize DRV STORE-DIR SCRATCH`
+        // arms are DELETED (re #469 typed origins): both took their entire staging
+        // manifest from the caller-writable TD_EXTRA_DBS env — self-issued authority
+        // the reviewer's finding named — and no gate, test, or tool invoked either.
+        // Every production realize path is a TYPED planner site now: `build-plan
+        // --auto` (compiled-digest-gated seed db + step td.dbs), `build-recipe`
+        // (seed db + `--recipe-output-db` argv), and the daemon children (the
+        // blessed seed-closure db as an explicit argument).
         // td-builder daemon — td's OWN persistent build daemon: a long-running
         // process that realizes derivations served over a Unix socket, instead of
         // guix-daemon (own-builder-daemon track). Each request realizes via the
@@ -6216,7 +6181,9 @@ fn main() -> ExitCode {
         // one, and needs no new `guix build -e' packager site. The override is matched by
         // PATH (only the drv root equal to its canonical is re-keyed), so it is a harmless
         // no-op for a drv that does not name the stage0 (e.g. the guile probes of gate 358).
-        // Usage:  daemon SOCKET STORE-DIR SCRATCH-BASE
+        // Usage:  daemon SOCKET STORE-DIR SCRATCH-BASE [BLESS-DB]
+        // BLESS-DB (optional) is the blessed seed-closure db — the manifest
+        // authority every build child receives as an explicit argument (re #469).
         // td-builder stage0-place — compile + place the guix-free stage0 td-builder
         // under BASEDIR and print its canonical store path (the one entry point every
         // stage0 consumer goes through; the Rust port of tests/stage0-builder.sh —
@@ -6276,23 +6243,23 @@ fn main() -> ExitCode {
             }
         }
         // td-builder seed-bless — record the DECLARED seed closure's hashes into a
-        // td-owned store db (re #469): content-scan SEED-DIR for ROOTS-FILE's
-        // transitive closure and fully register every member (path/hash/size/refs).
-        // The db is the strict staging manifest's authority for the daemon flow
-        // (`ensure_build_daemon` blesses the seed-lock roots once and hands the db
-        // to the daemon via TD_EXTRA_DBS). Bless ONCE per root set — see
-        // `bless_seed_closure` on why re-blessing would defeat the gate.
-        // Usage: seed-bless SEED-DIR ROOTS-FILE OUT-DB
-        Some("seed-bless") if args.len() == 5 => {
-            let (seed_dir, roots_file, out_db) = (&args[2], &args[3], &args[4]);
+        // td-owned store db (re #469): derive the roots ITSELF from the repo's
+        // checked-in seed-lock declarations (`seed_lock_roots` over the cwd — the
+        // caller cannot select them), content-scan SEED-DIR for their transitive
+        // closure, and fully register every member (path/hash/size/refs). The db is
+        // the strict staging manifest's authority for the daemon flow
+        // (`ensure_build_daemon` blesses once per root set and hands the db to the
+        // daemon as an explicit argument). Bless ONCE per root set — see
+        // `bless_seed_closure` on why re-blessing would defeat the gate. A verb that
+        // blessed arbitrary caller-supplied roots would mint manifest authority for
+        // whatever bytes occupy those paths, exactly the self-issued-provenance hole
+        // typed origins close.
+        // Usage: seed-bless SEED-DIR OUT-DB   (cwd must be the repo root)
+        Some("seed-bless") if args.len() == 4 => {
+            let (seed_dir, out_db) = (&args[2], &args[3]);
             let run = || -> Result<usize, String> {
-                let roots: Vec<String> = std::fs::read_to_string(roots_file)
-                    .map_err(|e| format!("read {roots_file}: {e}"))?
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(str::to_string)
-                    .collect();
+                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+                let roots = check_loop::seed_lock_roots(&root);
                 bless_seed_closure(seed_dir, &roots, Path::new(out_db))
             };
             match run() {
@@ -6306,8 +6273,12 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some("daemon") if args.len() == 5 => {
+        Some("daemon") if args.len() == 5 || args.len() == 6 => {
             let (socket, seed_dir, scratch) = (args[2].clone(), args[3].clone(), args[4].clone());
+            // The blessed seed-closure db (optional 5th arg): the daemon's ONLY
+            // manifest-authority source, threaded to every build child as an explicit
+            // `daemon-build`/`daemon-check` argument — never env (re #469 typed origins).
+            let bless_db = args.get(5).cloned();
             // Fail fast on a half-set builder override (the children re-read the same env).
             if let Err(e) = builder_override_from_env() {
                 eprintln!("td-builder: daemon: {e}");
@@ -6381,6 +6352,11 @@ fn main() -> ExitCode {
                     .arg(&seed_dir_req)
                     .arg(&scratch)
                     .stderr(std::process::Stdio::inherit());
+                // The blessed seed-closure db rides as an EXPLICIT child argument —
+                // the child's whole manifest authority, never ambient env (re #469).
+                if let Some(db) = &bless_db {
+                    cmd.arg(db);
+                }
                 for (k, v) in &override_env {
                     cmd.env(k, v);
                 }
@@ -6417,9 +6393,16 @@ fn main() -> ExitCode {
         // one drv into a content-addressed keyed scratch (guix-daemon-parity cache reuse) and
         // prints `OK <canonical> <host>`; daemon-check reproducibility-double-builds it and
         // prints `OK repro <canonical> <host>`. Both read the td-owned builder from
-        // TD_BUILDER_* (inherited from the daemon). Usage: daemon-build|daemon-check DRV STORE-DB SCRATCH-BASE
-        Some("daemon-build") if args.len() == 5 => {
-            match daemon_realize_one(&args[2], &args[3], Path::new(&args[4])) {
+        // TD_BUILDER_* (inherited from the daemon). BLESS-DB (optional) is the blessed
+        // seed-closure db — the child's manifest authority, an explicit argument (re #469).
+        // Usage: daemon-build|daemon-check DRV SEED-DIR SCRATCH-BASE [BLESS-DB]
+        Some("daemon-build") if args.len() == 5 || args.len() == 6 => {
+            match daemon_realize_one(
+                &args[2],
+                &args[3],
+                Path::new(&args[4]),
+                args.get(5).map(String::as_str),
+            ) {
                 Ok((canon, host, hit)) => {
                     println!("OK {canon} {host} {}", if hit { "hit" } else { "built" });
                     ExitCode::SUCCESS
@@ -6430,8 +6413,13 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some("daemon-check") if args.len() == 5 => {
-            match daemon_check_one(&args[2], &args[3], Path::new(&args[4])) {
+        Some("daemon-check") if args.len() == 5 || args.len() == 6 => {
+            match daemon_check_one(
+                &args[2],
+                &args[3],
+                Path::new(&args[4]),
+                args.get(5).map(String::as_str),
+            ) {
                 Ok((canon, host)) => {
                     println!("OK repro {canon} {host}");
                     ExitCode::SUCCESS
@@ -6511,10 +6499,33 @@ fn main() -> ExitCode {
         // daemon-resident source path, as before. STORE-DIR is the seed store DIRECTORY
         // whose bytes the input closure is CONTENT-SCANNED over (no /var/guix/db). Usage:
         //   build-recipe RECIPE-JSON-FILE LOCK SCRATCH STORE-DIR [SRC-STORE-DIR SRC-DB]
-        Some("build-recipe") if args.len() == 6 || args.len() == 8 || args.len() == 11 => {
+        //     [--recipe-output-db DB]...
+        Some("build-recipe") if args.len() >= 6 => {
+            // Trailing repeatable `--recipe-output-db DB` pairs: ADDITIONAL td-OWNED
+            // store DBs of PRIOR td recipe outputs (e.g. the /td/store native
+            // toolchain's own db, brick 8) — an explicit, typed argv channel; their
+            // rows join the staging manifest as `RecipeOutput`. This replaces the
+            // deleted TD_EXTRA_DBS env channel: manifest authority arrives only as a
+            // declared argument, never ambiently (re #469 typed origins).
+            let mut pos_len = args.len();
+            let mut recipe_output_dbs: Vec<(String, sandbox::InputOrigin)> = Vec::new();
+            while pos_len >= 8 && args[pos_len - 2] == "--recipe-output-db" {
+                recipe_output_dbs
+                    .push((args[pos_len - 1].clone(), sandbox::InputOrigin::RecipeOutput));
+                pos_len -= 2;
+            }
+            recipe_output_dbs.reverse();
+            if !(pos_len == 6 || pos_len == 8 || pos_len == 11) {
+                eprintln!(
+                    "td-builder: build-recipe: usage: build-recipe RECIPE-JSON-FILE LOCK \
+                     SCRATCH STORE-DIR [SRC-STORE-DIR SRC-DB [VENDOR-CANONICAL VENDOR-STORE \
+                     VENDOR-DB]] [--recipe-output-db DB]..."
+                );
+                return ExitCode::FAILURE;
+            }
             let (recipe_file, lock, scratch, store_dir) =
                 (&args[2], &args[3], &args[4], &args[5]);
-            let src_store = if args.len() >= 8 {
+            let src_store = if pos_len >= 8 {
                 Some((args[6].as_str(), args[7].as_str()))
             } else {
                 None
@@ -6524,7 +6535,7 @@ fn main() -> ExitCode {
             // VENDOR-STORE the td store dir, VENDOR-DB its db. run_rust vendors from it
             // (TD_VENDOR_DIR) — no `/gnu/store` crate, no guix-daemon FOD.
             //   build-recipe RECIPE LOCK SCRATCH STORE-DB [SRC-STORE SRC-DB [VENDOR-CANONICAL VENDOR-STORE VENDOR-DB]]
-            let vendor_store = if args.len() == 11 {
+            let vendor_store = if pos_len == 11 {
                 Some((args[8].as_str(), args[9].as_str(), args[10].as_str()))
             } else {
                 None
@@ -6572,26 +6583,23 @@ fn main() -> ExitCode {
                 // The seed staging dir's entries are guix-captured bytes whose canonical
                 // home is /gnu/store even when the BUILD targets TD_STORE_DIR=/td/store
                 // (#292 — gate 377's collapse); td-built copies inside it are restored to
-                // their /td/store canonicals from the roots + TD_EXTRA_DBS. Without a seed,
-                // the scanned dir IS the live store, canonical where it sits.
+                // their /td/store canonicals from the roots + the typed recipe-output dbs.
+                // Without a seed, the scanned dir IS the live store, canonical where it sits.
                 let (seed_store_dirs, seed_prefix, td_store): (Vec<String>, &str, Option<&Path>) =
                     match (&seed_store, &seed_db) {
                         (Some(s), Some(_d)) => (vec![s.clone()], store::STORE_DIR, Some(Path::new(s))),
                         (None, None) => (vec![store_dir.clone()], store_dir.as_str(), None),
                         _ => return Err("TD_SEED_STORE/TD_SEED_DB must be set together".into()),
                     };
-                // TD_EXTRA_DBS (colon-separated) merges ADDITIONAL td-OWNED store DBs alongside the
-                // content-scanned seed dir — e.g. a td-BUILT toolchain's own db (its /td/store outputs
-                // + refs) chained beside the guix seed, so a corpus recipe builds with the /td/store
-                // toolchain (brick 8). Those deps' bytes live OUTSIDE the seed dir, so their refs come
-                // from the db they wrote; the FILES are staged from td_store/<base> like any td dep.
-                // This only ADDS closure edges. Empty/unset → pure seed content-scan.
-                let mut extra_dbs: Vec<String> = extra_dbs_from_env();
-                // The seed's own vouching db joins the manifest sources — under
-                // unconditional strict staging (re #469) the unpacked seed's items
-                // are admitted by ITS registrations, not by being on disk.
+                // The typed db set: the argv `--recipe-output-db` entries (prior td
+                // recipe outputs whose bytes live OUTSIDE the seed dir — their refs
+                // come from the db they wrote; the FILES stage from td_store/<base>),
+                // plus the seed's own vouching db — under unconditional strict staging
+                // (re #469) the unpacked seed's items are admitted by ITS
+                // registrations, typed `AuditedSeed`, not by being on disk.
+                let mut extra_dbs: Vec<(String, sandbox::InputOrigin)> = recipe_output_dbs.clone();
                 if let Some(d) = &seed_db {
-                    extra_dbs.push(d.clone());
+                    extra_dbs.push((d.clone(), sandbox::InputOrigin::AuditedSeed));
                 }
                 let recipe_json =
                     std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
@@ -6656,83 +6664,11 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // td-check: td OWNS the reproducibility oracle. Execute the SAME .drv
-        // TWICE in two independent userns sandbox runs and compare the per-output
-        // NAR hashes — td's own `guix build --check`, with no daemon in the
-        // verdict. CLOSURE lists every store path the build may see (one per
-        // line); the two builds land under SCRATCH/r1 and SCRATCH/r2. Exits 0 if
-        // every output is bit-for-bit identical across the two builds, 3 if any
-        // output diverges (NON-REPRODUCIBLE — a FAILING test per prime directive 1).
-        // The drv reproducibility double-build. RENAMED from `check` when the
-        // loop entry (`td-builder check [GOAL...]`) took that verb — every
-        // caller (tests/*.sh + the gate bodies) was switched in the same change,
-        // so there is no argument-shape sniffing between the two features.
-        Some("check-drv") if args.len() == 5 => {
-            let (drv_path, closure_file, scratch) = (&args[2], &args[3], &args[4]);
-            let run = || -> Result<bool, String> {
-                let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
-                let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
-                let closure: Vec<String> = std::fs::read_to_string(closure_file)
-                    .map_err(|e| e.to_string())?
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                let scratch1 = Path::new(scratch).join("r1");
-                let scratch2 = Path::new(scratch).join("r2");
-                // Strict manifests are unconditional (re #469): the caller-supplied
-                // closure file is a byte list; TD_EXTRA_DBS must vouch its items.
-                let dbs = extra_dbs_from_env();
-                if dbs.is_empty() {
-                    return Err(
-                        "no td-owned store db vouches this closure — strict staging \
-                         manifests are unconditional (re #469); set TD_EXTRA_DBS to the \
-                         db(s) that registered the closure's items"
-                            .to_string(),
-                    );
-                }
-                let manifest = manifest_from_db_paths(&dbs)?;
-                // Two independent builds of the same derivation.
-                let out1 = sandbox::build(&parsed, drv_path, &closure, &scratch1, &manifest)
-                    .map_err(|e| e.to_string())?;
-                let out2 = sandbox::build(&parsed, drv_path, &closure, &scratch2, &manifest)
-                    .map_err(|e| e.to_string())?;
-                let mut reproducible = true;
-                for (name, host1) in &out1 {
-                    let host2 = &out2
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .ok_or_else(|| format!("output `{name}' missing from the second build"))?
-                        .1;
-                    let store_path = &parsed
-                        .outputs
-                        .iter()
-                        .find(|o| &o.name == name)
-                        .expect("output came from this drv")
-                        .path;
-                    let h1 = nar_hash_path(host1).map_err(|e| e.to_string())?;
-                    let h2 = nar_hash_path(host2).map_err(|e| e.to_string())?;
-                    if h1 == h2 {
-                        println!("CHECK {name} {store_path} {h1} reproducible");
-                    } else {
-                        println!("CHECK {name} {store_path} {h1} != {h2} NON-REPRODUCIBLE");
-                        reproducible = false;
-                    }
-                }
-                Ok(reproducible)
-            };
-            match run() {
-                Ok(true) => ExitCode::SUCCESS,
-                Ok(false) => {
-                    eprintln!("td-builder: check {drv_path}: NOT reproducible");
-                    ExitCode::from(3)
-                }
-                Err(e) => {
-                    eprintln!("td-builder: check {drv_path}: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        // The `check-drv DRV CLOSURE SCRATCH` reproducibility arm is DELETED
+        // (re #469 typed origins): like `build`/`realize` it manifested from the
+        // caller-writable TD_EXTRA_DBS env, and nothing invoked it — the live
+        // reproducibility oracle is the daemon's CHECK verb (`daemon_check_one`),
+        // whose two independent builds run the typed realize_drv path.
         // td-builder shell — td's own package shell (NOT a container): resolve
         // the named recipes, build them with td, compose the command's PATH from
         // their outputs, and run it. The durable assertion is behavioral — the
@@ -7243,8 +7179,6 @@ fn main() -> ExitCode {
             eprintln!("       td-builder subst-export DB STORE-DIR OUTDIR ROOT...");
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder drv-refs FILE.drv");
-            eprintln!("       td-builder build FILE.drv CLOSURE-FILE SCRATCH-DIR");
-            eprintln!("       td-builder check-drv FILE.drv CLOSURE-FILE SCRATCH-DIR");
             eprintln!("       td-builder store-register STORE-PATH DERIVER CANDIDATES-FILE OUT-DB");
             eprintln!("       td-builder store-query DB info|references|references-only|outputs");
             eprintln!("       td-builder store-closure DB ROOT");
@@ -7256,8 +7190,8 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
-            eprintln!("       td-builder realize FILE.drv STORE-DB SCRATCH-DIR");
-            eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DB [SRC-STORE-DIR SRC-DB]");
+            eprintln!("       td-builder seed-bless SEED-DIR OUT-DB");
+            eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DIR [SRC-STORE-DIR SRC-DB] [--recipe-output-db DB]...");
             eprintln!("       td-builder build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH");
             eprintln!("       td-builder stage0-place BASEDIR        # compile+place the guix-free stage0 (memoized)");
             eprintln!("       td-builder provision-rust              # print the guix-free rust toolchain PATH fragment");
@@ -7962,9 +7896,18 @@ daemon build START (2/2 active)
         )
         .unwrap();
         assert_eq!(n, 2, "the scan must pull lib into the blessed closure via tool's bytes");
-        let manifest = manifest_from_db_paths(&[db.to_string_lossy().into_owned()]).unwrap();
+        let manifest = manifest_from_typed_dbs(&[(
+            db.to_string_lossy().into_owned(),
+            sandbox::InputOrigin::BlessedSeedClosure,
+        )])
+        .unwrap();
         for (canon, base) in [(&tool_canon, &tool_base), (&lib_canon, &lib_base)] {
             assert!(manifest.contains_key(canon.as_str()), "{canon} not vouched");
+            assert_eq!(
+                manifest.get(canon.as_str()).map(|si| si.origin),
+                Some(sandbox::InputOrigin::BlessedSeedClosure),
+                "{canon} must carry the intake site's declared origin class"
+            );
             sandbox::verify_staged_item(&manifest, canon, &d.join(base).to_string_lossy())
                 .unwrap();
         }
@@ -9055,7 +8998,7 @@ daemon build START (2/2 active)
         // roots + the td-owned DB registrations (glibc rides bgdb in the gate) override
         // per hash; everything else keeps the seed prefix.
         let mut overrides: HashMap<String, String> = HashMap::new();
-        overrides.insert(gl_h.to_string(), gl_c.clone()); // TD_EXTRA_DBS registration
+        overrides.insert(gl_h.to_string(), gl_c.clone()); // a typed recipe-output-db registration
         for r in &roots {
             overrides.insert(store::hash_from_store_path(r).unwrap().to_string(), r.clone());
         }

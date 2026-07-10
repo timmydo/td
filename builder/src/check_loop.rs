@@ -536,7 +536,7 @@ fn copy_tree_preserving(src: &Path, dst: &Path) -> Result<(), String> {
 /// DECLARED loop input and joins the closure roots. An absent path is skipped
 /// — the consumers fall through / fail loudly the same way they do today on a
 /// host without it.
-fn seed_lock_roots(root: &Path) -> Vec<String> {
+pub(crate) fn seed_lock_roots(root: &Path) -> Vec<String> {
     let mut roots: Vec<String> = Vec::new();
     for lock in ["tests/td-builder-rust.lock", "tests/td-subst.lock"] {
         let Ok(content) = std::fs::read_to_string(root.join(lock)) else {
@@ -1608,12 +1608,15 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     // BLESS the declared seed closure once per root set (re #469): strict
     // staging manifests are unconditional, so the daemon's build children need
     // a td-owned db vouching the pinned toolchain closure they stage from the
-    // seed dir. The db is keyed by the declared roots (store paths embed
-    // content hashes, so a pin bump derives a new key and re-blesses); an
-    // existing db is REUSED, never rewritten — re-blessing would re-trust
-    // whatever is currently on disk, the existence-as-authority hole the
-    // manifest closes. Handed to the daemon via TD_EXTRA_DBS below; the
-    // children inherit it.
+    // seed dir. The `seed-bless` verb derives the roots ITSELF from the repo's
+    // checked-in seed-lock declarations (cwd = root below) — no caller-supplied
+    // roots file exists to tamper with. The db is keyed by those declared roots
+    // (store paths embed content hashes, so a pin bump derives a new key and
+    // re-blesses); an existing db is REUSED, never rewritten — re-blessing
+    // would re-trust whatever is currently on disk, the existence-as-authority
+    // hole the manifest closes. Handed to the daemon as an EXPLICIT argument
+    // below; the daemon threads it to every build child's argv (the
+    // TD_EXTRA_DBS env channel is deleted, re #469 typed origins).
     let roots = seed_lock_roots(root);
     let bless_db = if roots.is_empty() {
         eprintln!(
@@ -1638,13 +1641,9 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
                 roots.len(),
                 db.display()
             );
-            let roots_f = daemon_dir.join(format!("seed-bless.{bkey}.roots"));
-            std::fs::write(&roots_f, roots.join("\n"))
-                .map_err(|e| format!("write {}: {e}", roots_f.display()))?;
             let tmp = daemon_dir.join(format!("seed-bless.{bkey}.db.tmp"));
             let out = Command::new(&daemon_tb)
                 .args(["seed-bless", &seed_dir])
-                .arg(&roots_f)
                 .arg(&tmp)
                 .current_dir(root)
                 .output()
@@ -1688,6 +1687,12 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         seed_dir,
         store.display().to_string(),
     ]);
+    // The blessed seed-closure db rides as an EXPLICIT daemon argument; the
+    // daemon threads it to every build child's argv. There is no env channel
+    // through which a caller can add manifest authority (re #469 typed origins).
+    if let Some(db) = &bless_db {
+        argv.push(db.display().to_string());
+    }
     let (head, rest) = argv
         .split_first()
         .ok_or_else(|| s("internal: empty daemon argv"))?;
@@ -1697,18 +1702,6 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log2));
-    // The blessed seed-closure db rides to every build child via the daemon's
-    // env (re #469) — composed BEFORE any operator-supplied TD_EXTRA_DBS so
-    // both vouch.
-    if let Some(db) = &bless_db {
-        let mut dbs = db.display().to_string();
-        if let Ok(prev) = std::env::var("TD_EXTRA_DBS") {
-            if !prev.trim().is_empty() {
-                dbs = format!("{dbs}:{prev}");
-            }
-        }
-        cmd.env("TD_EXTRA_DBS", dbs);
-    }
     {
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
