@@ -12,9 +12,9 @@
 //! (the native gcc RUNS and compiles+links a C AND C++ program -> 42), structural (own-root /td/store, no
 //! /gnu/store). The NATIVE gcc is ALWAYS BUILT (never fetched); only its cross-toolchain prerequisite may
 //! be fetched. HEAVY (the native gcc build is ~45 min; from-seed adds the ~98-min cross build). NOT a
-//! BUILD_GATE. The cross rungs + own-root verify live in tests/x86_64-cross-fns.sh; the native
+//! BUILD_GATE. The output assertions live with the `gcc-x86-64-native-test` recipe check; the native
 //! binutils/gcc BUILD is the recipe ladder `binutils-x86-64-native` -> `gcc-x86-64-native`
-//! (recipes/src/recipes/, driven by build-plan --auto via run_x86_64_native) — the retirement of the
+//! (recipes/src/recipes/, driven by td-recipe-eval check-run) — the retirement of the
 //! former `td-builder toolchain-recipe x86_64-native` imperative Rust path.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
@@ -26,30 +26,23 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        // Typed artifact inputs (#353): resolved by the runner — the shared
-        // x86_64 resolve/verify fns consume TD_GATE_INPUT_{COREUTILS,BASH_STATIC}.
-        inputs: &[
-            // coreutils: the x86_64_obtain_* wrappers call the subst-lib
-            // resolve fns, which consume TD_GATE_INPUT_COREUTILS (#353 review
-            // find — the wrapper call path was missed in the first cut).
-            ArtifactInput {
-                name: "coreutils",
-                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
+        inputs: &[ArtifactInput {
+            name: "bash-static",
+            kind: InputKind::ClosureMember {
+                lock: "tests/td-subst.lock",
+                root_stem: "bash",
+                member_stem: "bash-static",
             },
-            ArtifactInput {
-                name: "bash-static",
-                kind: InputKind::ClosureMember {
-                    lock: "tests/td-subst.lock",
-                    root_stem: "bash",
-                    member_stem: "bash-static",
-                },
-            },
-        ],
+        }],
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
-echo ">> bootstrap-x86_64-native-gcc-store-native: build a NATIVE x86_64 gcc 14.3.0 + binutils 2.44 (ELF 64-bit) with the cross toolchain, intern the native gcc at /td/store, and RUN it in the store-ns own-root where it compiles a C AND C++ program from source -> both 42, /gnu/store ABSENT (x86_64-toolchain rung X2 — the native, self-hosting-arch compiler)"
-sh tests/bootstrap-x86_64-native-gcc-store-native.sh
+echo ">> recipe-check gcc-x86-64-native-test: build the native x86_64 gcc recipe graph and assert its output"
+: "${TD_RECIPE_EVAL:=}"
+if [ -z "$TD_RECIPE_EVAL" ] || [ ! -x "$TD_RECIPE_EVAL" ]; then
+  TD_RECIPE_EVAL=$(sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval")
+fi
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-native-test daily 1
 "##,
     }
 }

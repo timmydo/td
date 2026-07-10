@@ -1,34 +1,17 @@
 use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
-// GCC 14.3.0, NATIVE x86_64 (x86_64-toolchain rung X2, the port of the shell
-// build_gcc_x86_64_native): --build=--host=--target=x86_64-pc-linux-gnu, so
-// gcc/cc1/g++ are themselves ELF64 x86_64 binaries that run natively (host ==
-// target), NOT the i686 CROSS gcc that emits x86_64. Built STATIC (like the i686
-// gcc-14 rung) by the CROSS gcc stage2 (an i686 binary) vs the /td/store x86_64
-// glibc 2.41 — the architectural self-hosting rung (a from-source gcc-rebuilds-gcc
-// bootstrap is rung X3, not this). as/ld = the freshly built sibling native
-// binutils (--with-as/--with-ld); gmp/mpfr/mpc in-tree; a build sysroot assembled
-// from the x86_64 glibc 2.41 + kernel UAPI headers, with the glibc GNU ld scripts
-// relocated to bare names so the fully-static host link resolves libm.a's GROUP.
-// --prefix=/td/store/gcc-14.3.0-x86_64-native + DESTDIR={out}/stage. native_inputs:
-// gcc-x86-64-stage2 (the cross builder gcc/g++), binutils-x86-64-native (the native
-// as/ld), binutils-x86-64 (the cross as/ld the builder gcc resolves absolutely),
-// glibc-x86-64 (the x86_64 libc + the sysroot source).
 pub fn recipe() -> Recipe {
-    let xgcc =
-        "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-gcc";
-    let xgpp =
-        "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-g++";
-    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
+    let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
+    let ngpp = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/g++";
+    let sbin = "{in:binutils-x86-64-self}/bin";
     let nbin = "{in:binutils-x86-64-native}/bin";
-    let path = format!("{nbin}:{{in:binutils-x86-64}}/bin:{}", base_path());
-    // headers reach the compiler via the wrapper's -idirafter (NOT C_INCLUDE_PATH —
-    // that breaks libstdc++'s <cstdlib> #include_next); CIP carries only the in-tree
-    // mpfr src, LIBRARY_PATH the relocated sysroot lib.
+    let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
+    let path = format!("{sbin}:{nbin}:{}", base_path());
     let cip = "{src}/mpfr/src";
     let lp = "{root}/sysroot/lib";
-    let mut steps = unpack_into("gcc-x86-64-native-source", "{src}");
+    let mut steps = unpack_into("gcc-x86-64-self-source", "{src}");
+
     for t in ["gmp63", "mpfr421", "mpc131"] {
         steps.push(
             Step::run(
@@ -50,9 +33,6 @@ pub fn recipe() -> Recipe {
         target: "mpc-1.3.1".into(),
         link: "{src}/mpc".into(),
     });
-    // build sysroot: x86_64 glibc 2.41 headers + kernel UAPI headers (overlay) into
-    // include, glibc libs into lib. --with-native-system-header-dir=/include reads
-    // {sysroot}/include; the static host link reads {sysroot}/lib.
     steps.push(Step::CopyTree {
         from: format!("{xglibc}/include"),
         dest: "{root}/sysroot/include".into(),
@@ -65,13 +45,6 @@ pub fn recipe() -> Recipe {
         from: format!("{xglibc}/lib"),
         dest: "{root}/sysroot/lib".into(),
     });
-    // relocate glibc's GNU ld scripts to bare names (ld finds the members via -B):
-    // libc.so/libm.so AND libm.a — a fully-static host link pulls libm.a, whose
-    // GROUP script else points at the absolute /td/store configure prefix (which
-    // is not the input-addressed store path here). GUARDED (existence + first-80-bytes
-    // "GNU ld script"), mirroring the ported Rust relocate_ld_scripts, so a pin where a
-    // name is absent or a real binary archive is skipped rather than errored/corrupted
-    // (re #401, the general glob+guard for the glibc-x86-64/glibc-241 recipes too).
     steps.push(
         Step::run(
             "{root}",
@@ -86,16 +59,12 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &base_path()),
     );
-    // -shared-aware STATIC wrappers (port of _mk_native_static_wrapper): -static for
-    // executables/conftests, DROPPED when the link is -shared; -idirafter (not
-    // -isystem) so libstdc++'s <cstdlib> #include_next resolves after gcc's own C++
-    // dirs; -B at the relocated sysroot lib.
     steps.push(Step::WriteFile {
         path: "{root}/wb/gcc".into(),
         content: format!(
             "#!{SH}\n\
-             for a in \"$@\"; do case \"$a\" in -shared) exec \"{xgcc}\" -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\";; esac; done\n\
-             exec \"{xgcc}\" -static -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\"\n"
+             for a in \"$@\"; do case \"$a\" in -shared) exec \"{ngcc}\" -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\";; esac; done\n\
+             exec \"{ngcc}\" -static -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\"\n"
         ),
         exec: true,
     });
@@ -103,8 +72,8 @@ pub fn recipe() -> Recipe {
         path: "{root}/wb/g++".into(),
         content: format!(
             "#!{SH}\n\
-             for a in \"$@\"; do case \"$a\" in -shared) exec \"{xgpp}\" -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\";; esac; done\n\
-             exec \"{xgpp}\" -static -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\"\n"
+             for a in \"$@\"; do case \"$a\" in -shared) exec \"{ngpp}\" -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\";; esac; done\n\
+             exec \"{ngpp}\" -static -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib \"$@\"\n"
         ),
         exec: true,
     });
@@ -132,12 +101,12 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "../configure",
-                "--prefix=/td/store/gcc-14.3.0-x86_64-native",
+                "--prefix=/td/store/gcc-14.3.0-x86_64-self",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
                 "--target=x86_64-pc-linux-gnu",
-                &format!("--with-as={nbin}/as"),
-                &format!("--with-ld={nbin}/ld"),
+                &format!("--with-as={sbin}/as"),
+                &format!("--with-ld={sbin}/ld"),
                 "--with-build-sysroot={root}/sysroot",
                 "--with-native-system-header-dir=/include",
                 "--disable-bootstrap",
@@ -211,17 +180,18 @@ pub fn recipe() -> Recipe {
     );
     steps.push(Step::Require {
         paths: vec![
-            "{out}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc".into(),
-            "{out}/stage/td/store/gcc-14.3.0-x86_64-native/bin/g++".into(),
+            "{out}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc".into(),
+            "{out}/stage/td/store/gcc-14.3.0-x86_64-self/bin/g++".into(),
         ],
         exec: true,
     });
-    Recipe::mesboot("gcc-x86-64-native", "14.3.0")
+
+    Recipe::mesboot("gcc-x86-64-self", "14.3.0")
         .source_input("gcc-14-source")
         .native_inputs(&[
-            "gcc-x86-64-stage2",
+            "gcc-x86-64-native",
+            "binutils-x86-64-self",
             "binutils-x86-64-native",
-            "binutils-x86-64",
             "glibc-x86-64",
         ])
         .inputs_owned(base_inputs(&[

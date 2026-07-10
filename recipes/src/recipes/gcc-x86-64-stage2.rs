@@ -17,8 +17,11 @@ pub fn recipe() -> Recipe {
     let mut steps = unpack_into("gcc-x86-64-stage2-source", "{src}");
     for t in ["gmp63", "mpfr421", "mpc131"] {
         steps.push(
-            Step::run("{src}", &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")])
-                .env("PATH", &base_path()),
+            Step::run(
+                "{src}",
+                &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")],
+            )
+            .env("PATH", &base_path()),
         );
     }
     steps.push(Step::Symlink {
@@ -156,7 +159,13 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("gcc-x86-64-stage2", "14.3.0")
         .source_input("gcc-14-source")
-        .native_inputs(&["gcc-14", "glibc-mesboot", "binutils-x86-64", "glibc-x86-64", "binutils-244"])
+        .native_inputs(&[
+            "gcc-14",
+            "glibc-mesboot",
+            "binutils-x86-64",
+            "glibc-x86-64",
+            "binutils-244",
+        ])
         .inputs_owned(base_inputs(&[
             "gmp63",
             "mpfr421",

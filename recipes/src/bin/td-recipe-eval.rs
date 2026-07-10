@@ -30,6 +30,8 @@ use td_recipe::catalog;
 
 #[path = "td_recipe_eval/check_runner.rs"]
 mod check_runner;
+#[path = "td_recipe_eval/checks/mod.rs"]
+mod checks;
 
 #[allow(
     clippy::unwrap_used,
@@ -218,6 +220,39 @@ mod tests {
             1
         );
         assert_eq!(recipe_checks(&busybox, None).len(), 1);
+
+        let x86_cross = catalog::lookup("gcc-x86-64-stage2-test").unwrap();
+        assert_eq!(
+            recipe_checks(&x86_cross, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&x86_cross, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&x86_cross, None).len(), 1);
+
+        let x86_native = catalog::lookup("gcc-x86-64-native-test").unwrap();
+        assert_eq!(
+            recipe_checks(&x86_native, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&x86_native, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&x86_native, None).len(), 1);
+
+        let x86_self = catalog::lookup("gcc-x86-64-self-test").unwrap();
+        assert_eq!(
+            recipe_checks(&x86_self, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&x86_self, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&x86_self, None).len(), 1);
     }
 
     #[test]
@@ -228,15 +263,26 @@ mod tests {
 
     #[test]
     fn recipe_check_bodies_delegate_to_the_rust_runner() {
-        for stem in ["make-test", "busybox-test", "rust-toolchain"] {
+        for (stem, count) in [
+            ("make-test", 1),
+            ("busybox-test", 1),
+            ("rust-toolchain", 1),
+            ("gcc-x86-64-stage2-test", 1),
+            ("gcc-x86-64-native-test", 1),
+            ("gcc-x86-64-self-test", 1),
+        ] {
             let recipe = catalog::lookup(stem).unwrap();
             let checks = recipe_checks(&recipe, Some(td_recipe::types::CheckTier::Daily));
-            assert_eq!(checks.len(), 1);
-            let script = &checks.first().unwrap().script;
-            assert!(script.contains(&format!("check-run {stem} daily 1")));
-            assert!(!script.contains(". tests/cache-lib.sh"));
-            assert!(!script.contains(". tests/ladder-lib.sh"));
-            assert!(!script.contains(". tests/x86_64-cross-fns.sh"));
+            assert_eq!(checks.len(), count);
+            for (index, check) in checks.iter().enumerate() {
+                let check_index = index + 1;
+                let script = &check.script;
+                assert!(check.runner.is_some());
+                assert!(script.contains(&format!("check-run {stem} daily {check_index}")));
+                assert!(!script.contains(". tests/cache-lib.sh"));
+                assert!(!script.contains(". tests/ladder-lib.sh"));
+                assert!(!script.contains(". tests/x86_64-cross-fns.sh"));
+            }
         }
     }
 

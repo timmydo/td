@@ -11,15 +11,9 @@
 //! behavioral (an ELF 64-bit C + C++ program runs vs the x86_64 glibc 2.41 from /td/store → 42), structural,
 //! input-addressed (x64-toolchain-subst: the x86_64 glibc is ALSO interned at the LOCK-KEYED path from
 //! tests/td-toolchain-x86_64.lock — the stable path a consumer fetches as a signed substitute, not a
-//! content-addressed throwaway — and a program whose interp IS that path runs in the own-root → 42), and
-//! subst FETCH (x64-toolchain-subst, human 2026-06-28: the loop builds td-subst from source, PUBLISHES that
-//! real x86_64 glibc at its lock-keyed path as a SIGNED substitute, then a consumer FETCHES it via
-//! tools/resolve-toolchain.sh — ed25519 sig + StorePath == the lock path + NarHash verified — and RUNS the
-//! fetched-not-rebuilt bytes in the own-root → 42, with cold-store/wrong-key/wrong-StorePath self-discrimination;
-//! DELIBERATE directive-1 relaxation, human-approved). This gate still BUILDS from seed AND fetches — it proves the
-//! consumer CAPABILITY (the loop can obtain the real x86_64 toolchain by fetching); the actual per-PR build-SKIP
-//! needs the whole-toolchain closure fetch + a populated persistent store and is the PR3b follow-up. The subst round-trip lives in tests/x86_64-subst-lib.sh. NOT a BUILD_GATE. The
-//! cross rungs live in tests/x86_64-cross-fns.sh.
+//! content-addressed throwaway — and a program whose interp IS that path runs in the own-root → 42).
+//! The package behavior assertion is owned by the `gcc-x86-64-stage2-test` recipe check; this gate is
+//! only the daily scheduling boundary for that check. NOT a BUILD_GATE.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
@@ -30,27 +24,23 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        // Typed artifact inputs (#353): resolved by the runner — the shared
-        // x86_64 libs consume TD_GATE_INPUT_{COREUTILS,BASH_STATIC}.
-        inputs: &[
-            ArtifactInput {
-                name: "coreutils",
-                kind: InputKind::LockEntry { lock: "tests/td-subst.lock", stem: "coreutils" },
+        inputs: &[ArtifactInput {
+            name: "bash-static",
+            kind: InputKind::ClosureMember {
+                lock: "tests/td-subst.lock",
+                root_stem: "bash",
+                member_stem: "bash-static",
             },
-            ArtifactInput {
-                name: "bash-static",
-                kind: InputKind::ClosureMember {
-                    lock: "tests/td-subst.lock",
-                    root_stem: "bash",
-                    member_stem: "bash-static",
-                },
-            },
-        ],
+        }],
         store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
-echo ">> bootstrap-x86_64-toolchain-store-native: cross the i686 bootstrap up to a native x86_64 toolchain at /td/store — cross binutils 2.44 + cross gcc 14.3.0 + MODERN x86_64 glibc 2.41 (libgcc_s.so.1); a DYNAMIC x86_64 C AND C++ program runs in the own-root → 42, /gnu/store ABSENT (unblocks the x86_64 Rust runtime leg)"
-sh tests/bootstrap-x86_64-toolchain-store-native.sh
+echo ">> recipe-check gcc-x86-64-stage2-test: build the x86_64 cross toolchain recipe graph and assert its output"
+: "${TD_RECIPE_EVAL:=}"
+if [ -z "$TD_RECIPE_EVAL" ] || [ ! -x "$TD_RECIPE_EVAL" ]; then
+  TD_RECIPE_EVAL=$(sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval")
+fi
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-stage2-test daily 1
 "##,
     }
 }

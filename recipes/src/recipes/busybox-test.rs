@@ -1,5 +1,5 @@
 use crate::ladder::{base_inputs, base_path, SH};
-use crate::types::{Recipe, RecipeCheck, Step};
+use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // busybox-test: behavioral validation of busybox-x86-64 (#388 rung 2), modeled
 // as a recipe rather than a bespoke tests/ check script. It depends on the built
@@ -78,5 +78,6 @@ echo ">> recipe-check busybox-test: build-plan --auto builds+validates busybox-t
 : "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run busybox-test daily 1
 "#,
-        )])
+        )
+        .with_runner(CheckRunner::BuildOnly)])
 }

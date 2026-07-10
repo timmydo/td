@@ -1,5 +1,5 @@
 use crate::ladder::base_inputs;
-use crate::types::{Recipe, RecipeCheck, Source};
+use crate::types::{CheckRunner, Recipe, RecipeCheck, Source};
 
 // rust-toolchain — the /td/store Rust toolchain, as a first-class RECIPE fully in the
 // recipe-graph model (#410, building on #380).
@@ -49,5 +49,6 @@ echo ">> recipe-check rust-toolchain: build-plan --auto builds+validates the rel
 : "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-toolchain daily 1
 "#,
-        )])
+        )
+        .with_runner(CheckRunner::RustToolchain)])
 }

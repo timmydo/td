@@ -4,14 +4,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{self, Command, Stdio};
 
 use td_recipe::{
     catalog, source_pins,
-    types::{Recipe, SourcePin},
+    types::{CheckRunner, Recipe, SourcePin},
 };
 
-const TD_STORE_DIR: &str = "/td/store";
+pub(crate) const TD_STORE_DIR: &str = "/td/store";
 
 pub fn cli(args: &[String]) -> Result<(), String> {
     let stem = args.first().ok_or_else(usage)?.as_str();
@@ -20,20 +20,14 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     if args.get(3).is_some() {
         return Err(usage());
     }
-    assert_selected_check(stem, scope, index)?;
+    let check_runner = selected_check_runner(stem, scope, index)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
-    let runner = RecipeCheckRunner::new(root)?;
+    let scratch_name = scratch_name("check", &[stem, scope, &index.to_string()]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
-    match stem {
-        "make-test" => runner.run_make_test(),
-        "busybox-test" => runner.run_busybox_test(),
-        "rust-toolchain" => runner.run_rust_toolchain_check(),
-        other => Err(format!(
-            "{other} has a recipe-owned check, but no Rust check-runner implementation yet"
-        )),
-    }
+    crate::checks::run(check_runner, &runner, stem)
 }
 
 pub fn build_cli(args: &[String]) -> Result<(), String> {
@@ -55,7 +49,8 @@ pub fn build_cli(args: &[String]) -> Result<(), String> {
     }
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
-    let runner = RecipeCheckRunner::new(root)?;
+    let scratch_name = scratch_name("build", &[target]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     runner.build_recipe_target(target, &outputs)
@@ -95,29 +90,58 @@ fn parse_tier(arg: &str) -> Result<Option<td_recipe::types::CheckTier>, String> 
     }
 }
 
-fn assert_selected_check(stem: &str, scope: &str, index: usize) -> Result<(), String> {
+fn scratch_name(prefix: &str, parts: &[&str]) -> String {
+    let mut out = sanitize_scratch_component(prefix);
+    for part in parts {
+        out.push('-');
+        out.push_str(&sanitize_scratch_component(part));
+    }
+    out.push('-');
+    out.push_str(&process::id().to_string());
+    out
+}
+
+fn sanitize_scratch_component(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+            out.push(c);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "x".to_string()
+    } else {
+        out
+    }
+}
+
+fn selected_check_runner(stem: &str, scope: &str, index: usize) -> Result<CheckRunner, String> {
     let tier = parse_tier(scope)?;
     let recipe = catalog::lookup(stem)
         .ok_or_else(|| format!("unknown recipe stem '{stem}' (try `list`)"))?;
-    let count = recipe
-        .checks
-        .as_ref()
-        .map(|checks| {
-            checks
-                .iter()
-                .filter(|check| tier.map(|t| check.tier == t).unwrap_or(true))
-                .count()
-        })
-        .unwrap_or(0);
+    let mut count = 0;
+    if let Some(checks) = &recipe.checks {
+        for check in checks {
+            if tier.map(|t| check.tier == t).unwrap_or(true) {
+                count += 1;
+                if count == index {
+                    return check.runner.ok_or_else(|| {
+                        format!(
+                            "{stem} check index {index} has no Rust check-runner implementation"
+                        )
+                    });
+                }
+            }
+        }
+    }
     if count == 0 {
         return Err(format!("{stem} has no checks in the requested tier"));
     }
-    if index > count {
-        return Err(format!(
-            "{stem} has only {count} check(s) in the requested tier; index {index} is out of range"
-        ));
-    }
-    Ok(())
+    Err(format!(
+        "{stem} has only {count} check(s) in the requested tier; index {index} is out of range"
+    ))
 }
 
 fn lock_file(path: &Path) -> Result<File, String> {
@@ -136,7 +160,7 @@ fn lock_file(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-struct RecipeCheckRunner {
+pub(crate) struct RecipeCheckRunner {
     root: PathBuf,
     tb: PathBuf,
     builder_path: String,
@@ -174,7 +198,7 @@ impl SeedInput {
 }
 
 impl RecipeCheckRunner {
-    fn new(root: PathBuf) -> Result<Self, String> {
+    fn new(root: PathBuf, scratch_name: &str) -> Result<Self, String> {
         let stage0_base = env::var_os("TD_STAGE0_BASE")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join(".td-build-cache/stage0"));
@@ -214,7 +238,7 @@ impl RecipeCheckRunner {
         let store = lw.join("store");
         let db = lw.join("db");
         let recipes = lw.join("recipes");
-        let scratch = lw.join("scratch");
+        let scratch = lw.join("scratch").join(scratch_name);
         Ok(Self {
             root,
             tb,
@@ -231,11 +255,11 @@ impl RecipeCheckRunner {
         })
     }
 
-    fn lock_path(&self) -> PathBuf {
+    pub(crate) fn lock_path(&self) -> PathBuf {
         self.lw.with_extension("lock")
     }
 
-    fn setup(&self) -> Result<(), String> {
+    pub(crate) fn setup(&self) -> Result<(), String> {
         if self.force_cold {
             remove_path_if_exists(&self.lw)?;
         }
@@ -243,6 +267,7 @@ impl RecipeCheckRunner {
             .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
         fs::create_dir_all(&self.recipes)
             .map_err(|e| format!("mkdir {}: {e}", self.recipes.display()))?;
+        remove_path_if_exists(&self.scratch)?;
         fs::create_dir_all(&self.scratch)
             .map_err(|e| format!("mkdir {}: {e}", self.scratch.display()))?;
         let pinsum = self.setup_pinsum()?;
@@ -539,7 +564,7 @@ impl RecipeCheckRunner {
         Ok(())
     }
 
-    fn prepare_recipe_target(&self, target: &str) -> Result<(), String> {
+    pub(crate) fn prepare_recipe_target(&self, target: &str) -> Result<(), String> {
         let graph = recipe_closure(&[target])?;
         self.ensure_graph_inputs(&graph)?;
         self.emit_recipe_graph(&graph)?;
@@ -682,11 +707,11 @@ impl RecipeCheckRunner {
         }
     }
 
-    fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
+    pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
         let srcs = fs::read(self.lw.join("srcs.map")).map_err(|e| format!("read srcs.map: {e}"))?;
         let tools =
             fs::read(self.lw.join("tools.map")).map_err(|e| format!("read tools.map: {e}"))?;
-        let auto_map = self.lw.join("auto-map");
+        let auto_map = self.scratch.join("auto-map");
         let mut map =
             File::create(&auto_map).map_err(|e| format!("create {}: {e}", auto_map.display()))?;
         map.write_all(&srcs)
@@ -720,8 +745,8 @@ impl RecipeCheckRunner {
         let out = cmd
             .output()
             .map_err(|e| format!("spawn build-plan --auto {target}: {e}"))?;
-        let out_file = self.lw.join(format!("build-{target}.out"));
-        let err_file = self.lw.join(format!("build-{target}.err"));
+        let out_file = self.scratch.join(format!("build-{target}.out"));
+        let err_file = self.scratch.join(format!("build-{target}.err"));
         fs::write(&out_file, &out.stdout)
             .map_err(|e| format!("write {}: {e}", out_file.display()))?;
         fs::write(&err_file, &out.stderr)
@@ -738,7 +763,7 @@ impl RecipeCheckRunner {
         Ok(out_file)
     }
 
-    fn ladder_out_from(&self, build_out: &Path, rung: &str) -> Result<PathBuf, String> {
+    pub(crate) fn ladder_out_from(&self, build_out: &Path, rung: &str) -> Result<PathBuf, String> {
         let prefix = format!("STEP {rung} ");
         let mut got = None;
         let contents = fs::read_to_string(build_out)
@@ -751,24 +776,6 @@ impl RecipeCheckRunner {
         let path = got.ok_or_else(|| format!("ladder: no STEP output recorded for {rung}"))?;
         let base = path_basename_str(&path)?;
         Ok(self.scratch.join("tdstore").join(base))
-    }
-
-    fn run_make_test(&self) -> Result<(), String> {
-        self.prepare_recipe_target("make-test")?;
-        self.build_plan("make-test")?;
-        println!(
-            "PASS: make-test - GNU make 4.4.1 built on the native /td/store toolchain drove a real build in the recipe sandbox"
-        );
-        Ok(())
-    }
-
-    fn run_busybox_test(&self) -> Result<(), String> {
-        self.prepare_recipe_target("busybox-test")?;
-        self.build_plan("busybox-test")?;
-        println!(
-            "PASS: busybox-test - BusyBox 1.37.0 built by make-x86-64 on the native /td/store toolchain ran installed sh/ls/grep/sed applet links"
-        );
-        Ok(())
     }
 
     fn build_recipe_target(&self, target: &str, outputs: &[&str]) -> Result<(), String> {
@@ -786,67 +793,11 @@ impl RecipeCheckRunner {
         Ok(())
     }
 
-    fn run_rust_toolchain_check(&self) -> Result<(), String> {
-        self.prepare_recipe_target("rust-toolchain")?;
-        let build_out = self.build_plan("rust-toolchain")?;
-        let rust_tree = self.ladder_out_from(&build_out, "rust-toolchain")?;
-        println!(
-            "   [ladder] x86_64 rust-toolchain via build-plan --auto: catalog dependency closure -> rust-toolchain (relinked rustc/cargo tree {})",
-            rust_tree.display()
-        );
-        let rustc = rust_tree.join("bin/rustc");
-        let cargo = rust_tree.join("bin/cargo");
-        if !is_executable(&rustc) {
-            return Err(format!(
-                "rustc missing from rust-toolchain output ({})",
-                rustc.display()
-            ));
-        }
-        if !is_executable(&cargo) {
-            return Err(format!(
-                "cargo missing from rust-toolchain output ({})",
-                cargo.display()
-            ));
-        }
-        let rbase = rust_tree
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                format!(
-                    "malformed rust-toolchain output path {}",
-                    rust_tree.display()
-                )
-            })?;
-        let rpath = format!("{TD_STORE_DIR}/{rbase}");
-        let rustc_version =
-            self.store_ns_output(&[&format!("{rpath}/bin/rustc"), "--version"], None)?;
-        if !rustc_version.starts_with("rustc 1.96.0") {
-            return Err(format!(
-                "rustc version did not match the pinned 1.96.0 release: {}",
-                rustc_version.trim()
-            ));
-        }
-        self.store_ns_output(&[&format!("{rpath}/bin/cargo"), "--version"], None)?;
-        self.store_ns_output(
-            &[
-                &format!("{rpath}/bin/rustc"),
-                "--crate-name",
-                "td_rust_smoke",
-                "--crate-type=lib",
-                "--edition=2021",
-                "-",
-                "-o",
-                "/tmp/librust_smoke.rlib",
-            ],
-            Some("pub fn td_rust_smoke() -> u32 { 42 }\n"),
-        )?;
-        println!(
-            "PASS: rust-toolchain: Rust 1.96.0 relinked onto /td/store runs rustc/cargo and compiles a simple library"
-        );
-        Ok(())
-    }
-
-    fn store_ns_output(&self, argv: &[&str], stdin: Option<&str>) -> Result<String, String> {
+    pub(crate) fn store_ns_output(
+        &self,
+        argv: &[&str],
+        stdin: Option<&str>,
+    ) -> Result<String, String> {
         let store_path = self.scratch.join("tdstore");
         let store = path_str(&store_path)?;
         let mut cmd = self.builder_command();
@@ -860,7 +811,7 @@ impl RecipeCheckRunner {
         }
     }
 
-    fn builder_command(&self) -> Command {
+    pub(crate) fn builder_command(&self) -> Command {
         let mut cmd = Command::new(&self.tb);
         cmd.current_dir(&self.root)
             .env("TD_STORE_DIR", TD_STORE_DIR)
@@ -1150,7 +1101,7 @@ fn remove_map_entry(map: &Path, name: &str) -> Result<(), String> {
     fs::write(map, out).map_err(|e| format!("write {}: {e}", map.display()))
 }
 
-fn linux_version_from_file(file_name: &str) -> Result<String, String> {
+pub(crate) fn linux_version_from_file(file_name: &str) -> Result<String, String> {
     let rest = file_name
         .strip_prefix("linux-")
         .ok_or_else(|| format!("linux source file name is malformed: {file_name}"))?;
@@ -1174,7 +1125,7 @@ fn path_str(path: &Path) -> Result<&str, String> {
         .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))
 }
 
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     path.metadata()
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
@@ -1188,18 +1139,48 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     })
 }
 
-fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+pub(crate) fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.is_dir() {
+                make_user_writable(path)?;
                 fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
             } else {
+                make_file_user_writable(path, &meta)?;
                 fs::remove_file(path).map_err(|e| format!("remove {}: {e}", path.display()))
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("stat {}: {e}", path.display())),
     }
+}
+
+fn make_user_writable(path: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() | 0o700);
+        fs::set_permissions(path, perms)
+            .map_err(|e| format!("chmod u+rwx {}: {e}", path.display()))?;
+        for child in read_dir_sorted(path)? {
+            make_user_writable(&child)?;
+        }
+    } else {
+        make_file_user_writable(path, &meta)?;
+    }
+    Ok(())
+}
+
+fn make_file_user_writable(path: &Path, meta: &fs::Metadata) -> Result<(), String> {
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    let mut perms = meta.permissions();
+    perms.set_mode(perms.mode() | 0o600);
+    fs::set_permissions(path, perms).map_err(|e| format!("chmod u+rw {}: {e}", path.display()))
 }
 
 fn single_subdir_path(dir: &Path) -> Result<PathBuf, String> {
@@ -1330,7 +1311,14 @@ mod tests {
             force_cold: false,
         };
 
-        for target in ["make-test", "busybox-test", "rust-toolchain"] {
+        for target in [
+            "make-test",
+            "busybox-test",
+            "rust-toolchain",
+            "gcc-x86-64-stage2-test",
+            "gcc-x86-64-native-test",
+            "gcc-x86-64-self-test",
+        ] {
             let graph = recipe_closure(&[target]).unwrap();
             for node in graph {
                 if let Some(key) = &node.recipe.source_input {
