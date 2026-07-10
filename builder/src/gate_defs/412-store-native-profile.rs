@@ -4,6 +4,9 @@
 //! bash-static (the cheap store-ns runner pattern); the guix-FREE /td/store-native userland the
 //! toolchain builds (#192/#197) joins this same mechanism.
 //! Heavy: builds the guix-free stage0 td-builder + runs a rootless userns (like store-ns 386).
+//!
+//! Native (#318 axis 3): the gate body is typed Rust in `gate_bodies::store_native_profile`;
+//! `script: ""` marks it native, so the runner execs `td-builder gate-body store-native-profile`.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
@@ -24,9 +27,6 @@ pub fn gate() -> GateDef {
         }],
         store: StoreMode::Shared,
         non_blocking: false,
-        script: r##"
-echo ">> store-native-profile: td-builder profile --store-native builds a profile of logical /td/store links that resolve + run in the store-ns own-root, /gnu/store ABSENT (the .scm-free userspace assembly mechanism)"
-sh tests/store-native-profile.sh
-"##,
+        script: "",
     }
 }

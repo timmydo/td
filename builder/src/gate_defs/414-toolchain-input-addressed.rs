@@ -11,6 +11,9 @@
 //! path), behavioral+structural (a real binary at an input-addressed path runs in the
 //! store-ns own-root, /gnu/store absent). Heavy: builds the guix-free stage0 td-builder +
 //! runs a rootless userns (like store-native-profile). NOT a BUILD_GATE.
+//!
+//! Native (#318 axis 3): the gate body is typed Rust in `gate_bodies::toolchain_input_addressed`;
+//! `script: ""` marks it native, so the runner execs `td-builder gate-body toolchain-input-addressed`.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
@@ -33,9 +36,6 @@ pub fn gate() -> GateDef {
         }],
         store: StoreMode::Shared,
         non_blocking: false,
-        script: r##"
-echo ">> toolchain-input-addressed: the /td/store modern toolchain gets a STABLE input-addressed key (td-toolchain.lock + toolchain-key/path) — identical across non-reproducible rebuilds, predictable from the lock; a real binary placed there runs, /gnu/store absent (task 2a — td-subst chain-caching prereq)"
-sh tests/toolchain-input-addressed.sh
-"##,
+        script: "",
     }
 }

@@ -9,6 +9,9 @@
 //! not left running on a CI cancel/timeout. Drop the pdeathsig arming and (B)
 //! reds (descendants survive the kill).
 //! Heavy (a td-builder compile + nested-sandbox probes), in the heavy pool.
+//!
+//! Native (#318 axis 3): the gate body is typed Rust in `gate_bodies::sandbox_hardening`;
+//! `script: ""` marks it native, so the runner execs `td-builder gate-body sandbox-hardening`.
 
 use crate::gates::{GateDef, Pool, StoreMode};
 
@@ -22,13 +25,6 @@ pub fn gate() -> GateDef {
         inputs: &[],
         store: StoreMode::Private, // cold by design (#317 audit): the sandbox isolation probe must not see warm state
         non_blocking: true,
-        script: r##"
-echo ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak) and reaps its inner tree when killed"
-set -euo pipefail; \
-. tests/cache-lib.sh; export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; load_stage0; tb="$TB"; \
-case "$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($tb)" >&2; exit 1 ;; esac; \
-test -x "$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
-bash tests/sandbox-hardening.sh "$tb"
-"##,
+        script: "",
     }
 }
