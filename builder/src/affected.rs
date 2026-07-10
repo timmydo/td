@@ -435,6 +435,19 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // seed/seed-digests.txt — the compiled seed-digest table (re #469),
+    // include_str!-compiled into BOTH planners (td-recipe-eval's
+    // seed_digests.rs and td-builder's auto_seed_provenance). The
+    // digest-coverage unit tests in both crates are the direct check
+    // (cargo-test); a row change shifts what the planners ADMIT, so the
+    // recipe self-consistency and package build gates run too.
+    if p == "seed/seed-digests.txt" {
+        sel.add_preflight("cargo-test");
+        sel.add_target("recipe-rs");
+        add_build_gate_targets(root, sel);
+        return;
+    }
+
     if pattern_matches(
         "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipe-eval-tool.sh",
         p,
@@ -626,12 +639,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // (The td-builder SEED-build resolver scripts tools/provision-{rust,cc}.sh +
-    // tools/bootstrap-td-builder.sh and tests/provision-{rust,cc}.sh were ported
-    // into builder/src/stage0.rs (`td-builder provision-{rust,cc}` / `stage0-place`,
-    // re #469) and deleted; their gates (bootstrap/provision-rust/provision-cc) had
-    // already retired with the guix-invoking gates. The deleting diffs fall through
-    // to the shell-syntax preflight below.)
+    // Tombstones for the deleted SEED-build resolver behavioral tests: the
+    // resolvers (tools/provision-{rust,cc}.sh + tools/bootstrap-td-builder.sh)
+    // were ported into builder/src/stage0.rs (`td-builder provision-{rust,cc}`
+    // / `stage0-place`, re #469), unit-tested there via cargo-test; the shell
+    // tests' gates had already retired with the guix-invoking gates. These
+    // paths exist only in deleting diffs. (The deleted tools/*.sh route
+    // through the tools arm below.)
+    if pattern_matches("tests/provision-rust.sh|tests/provision-cc.sh", p) {
+        sel.add_preflight("cargo-test");
+        return;
+    }
     if pattern_matches("ci/*.sh|tools/*.sh", p) {
         sel.add_preflight("shell-syntax");
         return;
