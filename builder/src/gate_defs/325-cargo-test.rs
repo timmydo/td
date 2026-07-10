@@ -21,7 +21,9 @@
 //! parse/emit, the store-db SQLite encode/decode + reader, scan, sandbox) otherwise
 //! run ONLY inside the cargo-build-system package build — a full release rebuild that
 //! ~15 heavy gates trigger. Running them here reds a Rust-logic regression in seconds
-//! instead of deep in the td-builder/store/drv ladder.
+//! instead of deep in the td-builder/store/drv ladder. recipes/ tests run too —
+//! the evaluator's provenance classification and SHA-256 are enforcement code
+//! (re #469), and its regressions must red in-loop, not only in CI.
 //! 
 //! GUIX-FREE toolchain (R1 of the guix-retirement ladder, github issue #274): the Rust +
 //! C toolchain is resolved by tools/provision-rust.sh + tools/provision-cc.sh — the SAME
@@ -80,11 +82,12 @@ CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	  sh -c 'set -e; \
 	    cargo clippy --frozen --manifest-path builder/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path recipes/Cargo.toml; \
-	    cargo test  --frozen --manifest-path builder/Cargo.toml' 2>&1 | tee "$log"; \
+	    cargo test  --frozen --manifest-path builder/Cargo.toml; \
+	    cargo test  --frozen --manifest-path recipes/Cargo.toml' 2>&1 | tee "$log"; \
 	"$td" text cargo-test-ok "$log" || \
 	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
 rm -rf "$scratch"; \
-echo "PASS: cargo-test — builder + recipes are dependency-free and lint clean; td-builder unit tests pass (guix-free toolchain)."
+echo "PASS: cargo-test — builder + recipes are dependency-free and lint clean; builder + recipes unit tests pass (guix-free toolchain)."
 "##,
     }
 }

@@ -196,11 +196,19 @@ pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
 /// unmanifested or tampered item refuses to stage. A caller-supplied store
 /// DIRECTORY is thereby a byte source, never an authority: the bytes bind only
 /// if a td-owned registration vouches for them.
+///
+/// Cost, decided deliberately: verification re-hashes every closure item at
+/// EVERY strict step — O(closure bytes) per step, not amortized. The bootstrap
+/// rungs are small, a streaming SHA-256 is cheap next to the build it guards,
+/// and trusting a prior step's verification is exactly the assume-the-cache
+/// hole this manifest exists to close.
 pub type StageManifest = std::collections::BTreeMap<String, String>;
 
 /// Stream-hash a tree/file in NAR form — `sha256:<hex>`, the `ValidPaths.hash`
-/// wire format every td store registration records.
-fn nar_hash_of(path: &Path) -> io::Result<String> {
+/// wire format every td store registration records. `pub(crate)` because the
+/// loop-userland cache (check_loop.rs) verifies its durable items with the
+/// same hash before mounting them.
+pub(crate) fn nar_hash_of(path: &Path) -> io::Result<String> {
     struct W(crate::sha256::Sha256);
     impl io::Write for W {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -243,9 +251,12 @@ pub fn verify_staged_item(
 /// store path the build may see (the staged store's contents); `scratch` is
 /// a writable host directory. `manifest`, when present, is the #469 staging
 /// gate: every closure item is provenance-verified (`verify_staged_item`)
-/// BEFORE its bind target is staged. On success returns (output name,
-/// host-side path under scratch/newstore) for every drv output, each verified
-/// to exist.
+/// BEFORE its bind target is staged; the item binds are then locked
+/// READ-ONLY in the child, so the verified bytes cannot be rewritten through
+/// a live bind for the build's duration (the hash runs in the parent and the
+/// mount in the child, so the lock — not the hash — is what holds after
+/// staging). On success returns (output name, host-side path under
+/// scratch/newstore) for every drv output, each verified to exist.
 pub fn build(
     drv: &Derivation,
     drv_path: &str,
@@ -488,8 +499,24 @@ pub fn build(
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)?;
             // Stage each closure item into newstore (host scratch, OUTSIDE the new
             // root), then rbind newstore over the new root's /gnu/store below.
+            // Each INPUT bind is locked read-only immediately (remount of the
+            // bind just created — load-bearing, so a failure is fatal): the
+            // builder runs as the mapped owner uid and could otherwise write
+            // straight through the live bind into the on-disk store the
+            // manifest verified at staging, so the verify-then-bind boundary
+            // would hold only for an instant (re #469). newstore itself stays
+            // writable — outputs land as NEW entries beside the binds, never
+            // through one — and the /gnu/store rbind below carries each
+            // child's ro flag along.
             for (src, dst) in &binds {
                 sys::mount(Some(src), dst, None, sys::MS_BIND, None)?;
+                sys::mount(
+                    None,
+                    dst,
+                    None,
+                    sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY,
+                    None,
+                )?;
             }
             // The fresh minimal root, then its skeleton dirs.
             sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, None)?;

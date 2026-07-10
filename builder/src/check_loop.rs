@@ -217,9 +217,15 @@ fn loop_userland_dir() -> Result<PathBuf, String> {
 /// The userland's freshness key: sha256 over the resolved td-recipe-eval
 /// binary — the recipe catalog IS that binary (every recipe body, source pin,
 /// and applet list is compiled in, and the chain admits no input beyond what
-/// it declares, re #469). Any recipe/pin/evaluator change re-keys the map, so
-/// a stale machine-wide userland — including one built before host
-/// scaffolding was outlawed — can never false-green the change under review.
+/// it declares, re #469) — PLUS every in-repo seed patch
+/// (`seed/patches/*.patch`, sorted, name and bytes). Patches are the one
+/// chain input the runner reads from the TREE at build time rather than from
+/// the compiled catalog (its pinsum keys them for the same reason), so a
+/// patch-only change must re-key the userland even though the evaluator
+/// binary is byte-identical. Any recipe/pin/patch/evaluator change re-keys
+/// the map, so a stale machine-wide userland — including one built before
+/// host scaffolding was outlawed — can never false-green the change under
+/// review.
 ///
 /// Known limits (freshness mechanism, not a security boundary): the hash is
 /// taken before build-run execs the binary, so a concurrent rebuild of the
@@ -228,23 +234,47 @@ fn loop_userland_dir() -> Result<PathBuf, String> {
 /// override that can cache whatever ITS binary builds under its own
 /// fingerprint — pointing it at a pre-cutover evaluator is the operator
 /// running old code deliberately, the same trust as any explicit override.
-fn userland_fingerprint(eval: &str) -> Result<String, String> {
+fn userland_fingerprint(root: &Path, eval: &str) -> Result<String, String> {
     let bytes = std::fs::read(eval).map_err(|e| format!("read {eval}: {e}"))?;
     let mut h = crate::sha256::Sha256::new();
     h.update(&bytes);
+    let patches = root.join("seed/patches");
+    let mut names: Vec<String> = match std::fs::read_dir(&patches) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.ends_with(".patch"))
+            .collect(),
+        // No patch dir: the binary alone keys the userland (a tree that
+        // GAINS the dir re-keys by growing the hashed list).
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    for name in &names {
+        let p = patches.join(name);
+        let bytes = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+        h.update(name.as_bytes());
+        h.update(&[0]);
+        h.update(&bytes);
+        h.update(&[0]);
+    }
     Ok(crate::sha256::to_base16(&h.finalize()))
 }
 
 /// Resolve the td-built loop userland, provisioning it if needed.
 ///
 /// Warm path: `loop-userland.<fingerprint>.map` opens with `fingerprint
-/// <sha256>` matching `userland_fingerprint` (the CURRENT evaluator — a
-/// recipe, pin, or applet change re-keys it) and names a host copy under
-/// `loop_userland_dir()` for every stem, each with an existing `bin/`. The
-/// map FILENAME carries the fingerprint so concurrent worktrees — whose
-/// evaluator binaries fingerprint differently — never clobber each other's
-/// map between one provision's write and its validating re-read, and each
-/// keeps its own warm path instead of re-provisioning on every alternation.
+/// <sha256>` matching `userland_fingerprint` (the CURRENT evaluator + seed
+/// patches — a recipe, pin, patch, or applet change re-keys it) and names a
+/// host copy under `loop_userland_dir()` for every stem, each with an
+/// existing `bin/` and on-disk bytes NAR-hashing to the hash recorded at
+/// publication — the same content check `verify_staged_item` applies to
+/// build inputs, because these items are mounted and EXECUTED by every gate
+/// (re #469). The map FILENAME carries the fingerprint so concurrent
+/// worktrees — whose evaluator binaries fingerprint differently — never
+/// clobber each other's map between one provision's write and its validating
+/// re-read, and each keeps its own warm path instead of re-provisioning on
+/// every alternation.
 ///
 /// Cold path: run `td-recipe-eval build-run busybox-x86-64 <stems…>`, which
 /// realizes the recipe chain (replayed from the warm chain cache when
@@ -256,16 +286,18 @@ fn userland_fingerprint(eval: &str) -> Result<String, String> {
 /// `TD_RECIPE_RUN_OUT` item
 /// into the durable dir and rewrite the map atomically. Items are
 /// input-addressed (the basename embeds the recipe+input key), so an
-/// already-present basename is REUSED as-is — never removed or replaced —
-/// which also makes concurrent cold provisions from parallel worktrees safe:
-/// whoever publishes first wins, nobody yanks a path another prelude is about
-/// to mount. td-recipe-eval itself resolves via `TD_RECIPE_EVAL` or a fresh
+/// already-present basename whose bytes HASH to the fresh build's is reused
+/// as-is — concurrent cold provisions from parallel worktrees stay safe
+/// (whoever publishes first wins) — while a mismatching copy is quarantined
+/// aside and republished; either way the map records only bytes verified
+/// against this chain's own build. td-recipe-eval itself resolves via
+/// `TD_RECIPE_EVAL` or a fresh
 /// host `cargo build`; a host with neither is a provisioning gap
 /// (`CheckError::Unprovisioned`), not a code regression.
 fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
     let dir = loop_userland_dir().map_err(|e| CheckError::Fatal(fatal(&e)))?;
     let eval = resolve_recipe_eval_bin(root)?;
-    let fingerprint = userland_fingerprint(&eval).map_err(|e| CheckError::Fatal(fatal(&e)))?;
+    let fingerprint = userland_fingerprint(root, &eval).map_err(|e| CheckError::Fatal(fatal(&e)))?;
     let map_path = dir.join(format!("loop-userland.{fingerprint}.map"));
     if let Some(ul) = read_userland_map(&dir, &map_path, &fingerprint) {
         return Ok(ul);
@@ -337,11 +369,30 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
             .file_name()
             .and_then(|b| b.to_str())
             .ok_or_else(|| fatal(&format!("loop userland: unusable output path {built}")))?;
+        // The recipe chain's freshly built bytes are the authority: their NAR
+        // hash is what the map will vouch for, and whatever ends up at the
+        // durable path must hash to it before it is mapped (re #469).
+        let want = crate::sandbox::nar_hash_of(Path::new(built))
+            .map_err(|e| fatal(&format!("loop userland: hash {built}: {e}")))?;
         let durable = dir.join(base);
-        // Input-addressed basename: an existing durable copy IS this content —
-        // reuse it untouched. Publish a new one via scratch-copy + rename; a
-        // rename that loses to a concurrent publisher (EEXIST/ENOTEMPTY) is
-        // that same reuse, not an error.
+        // Input-addressed basename: an existing durable copy SHOULD be this
+        // content, but only its hash proves it — a matching copy is reused
+        // untouched; a mismatching one (corruption, or bytes published before
+        // hashes were recorded) is renamed aside, never mounted. The rename's
+        // own failure is ignored: a leftover bad copy just fails the final
+        // verify below, which is the fail-closed path anyway.
+        if durable.is_dir() {
+            let have = crate::sandbox::nar_hash_of(&durable)
+                .map_err(|e| fatal(&format!("loop userland: hash {}: {e}", durable.display())))?;
+            if have != want {
+                let quarantine = dir.join(format!(".bad.{base}.{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&quarantine);
+                let _ = std::fs::rename(&durable, &quarantine);
+            }
+        }
+        // Publish via scratch-copy + rename; a rename that loses to a
+        // concurrent publisher (EEXIST/ENOTEMPTY) leaves THEIR copy in place,
+        // and the verify below only maps it if it matches our build.
         if !durable.is_dir() {
             let tmp = dir.join(format!(".tmp.{base}.{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&tmp);
@@ -357,7 +408,16 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
                 }
             }
         }
-        map.push_str(&format!("{stem} {base}\n"));
+        let have = crate::sandbox::nar_hash_of(&durable)
+            .map_err(|e| fatal(&format!("loop userland: hash {}: {e}", durable.display())))?;
+        if have != want {
+            return Err(CheckError::Fatal(fatal(&format!(
+                "loop userland: published {} hashes {have} but the fresh build hashes {want} — \
+                 refusing to map executable bytes the chain did not produce (re #469)",
+                durable.display()
+            ))));
+        }
+        map.push_str(&format!("{stem} {base} {want}\n"));
     }
     let tmp_map = map_path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp_map, &map).map_err(|e| fatal(&format!("write loop-userland.map: {e}")))?;
@@ -371,8 +431,12 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
 }
 
 /// Parse + validate the durable userland map against the CURRENT fingerprint:
-/// the `fingerprint` line matches, every stem present, every item dir present
-/// with a `bin/`. Any miss returns None (the caller re-provisions).
+/// the `fingerprint` line matches, every stem present with a recorded NAR
+/// hash, every item dir present with a `bin/`, and every item's on-disk bytes
+/// re-hash to the record — CONTENT is verified, not existence, so a corrupted
+/// or tampered durable copy is a cache miss (the caller re-provisions), never
+/// a mount (re #469). Any miss returns None. Hash-less lines (pre-hash map
+/// format) fail to parse, so old maps self-invalidate.
 fn read_userland_map(dir: &Path, map_path: &Path, fingerprint: &str) -> Option<LoopUserland> {
     let content = std::fs::read_to_string(map_path).ok()?;
     let fp = content
@@ -385,12 +449,20 @@ fn read_userland_map(dir: &Path, map_path: &Path, fingerprint: &str) -> Option<L
     let mut items: Vec<(String, String)> = Vec::new();
     let mut bins: Vec<String> = Vec::new();
     for stem in LOOP_USERLAND_STEMS {
-        let base = content.lines().find_map(|l| {
-            let (k, v) = l.split_once(' ')?;
-            (k == *stem && !v.trim().is_empty() && !v.contains('/')).then(|| v.trim().to_string())
+        let (base, want) = content.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            let (k, base, want) = (f.next()?, f.next()?, f.next()?);
+            (k == *stem
+                && f.next().is_none()
+                && !base.contains('/')
+                && want.starts_with("sha256:"))
+            .then(|| (base.to_string(), want.to_string()))
         })?;
         let host = dir.join(&base);
         if !host.join("bin").is_dir() {
+            return None;
+        }
+        if crate::sandbox::nar_hash_of(&host).ok()? != want {
             return None;
         }
         let canon = format!("{TD_STORE_DIR}/{base}");
@@ -2016,12 +2088,15 @@ ccc-relative not/absolute
         let map = d.join("loop-userland.map");
         let fp = "f".repeat(64);
         // A valid map: the current fingerprint, every stem present, each item
-        // dir with a bin/.
+        // dir with a bin/ and a recorded NAR hash its bytes verify against.
         let mut content = format!("fingerprint {fp}\n");
         for (i, stem) in LOOP_USERLAND_STEMS.iter().enumerate() {
             let base = format!("hash{i}-{stem}-1.0");
-            std::fs::create_dir_all(d.join(&base).join("bin")).unwrap();
-            content.push_str(&format!("{stem} {base}\n"));
+            let bin = d.join(&base).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("tool"), format!("#!{stem}\n")).unwrap();
+            let want = crate::sandbox::nar_hash_of(&d.join(&base)).unwrap();
+            content.push_str(&format!("{stem} {base} {want}\n"));
         }
         std::fs::write(&map, &content).unwrap();
         let ul = read_userland_map(&d, &map, &fp).expect("valid map resolves");
@@ -2036,26 +2111,73 @@ ccc-relative not/absolute
         // by any other evaluator — e.g. one that still admitted host
         // scaffolding — is never grandfathered in.
         assert!(read_userland_map(&d, &map, &"0".repeat(64)).is_none());
+        // TAMPERED bytes are a cache miss, not a mount: flip one byte in an
+        // item and the recorded NAR hash no longer verifies (re #469).
+        let item0 = d.join(format!("hash0-{}-1.0", LOOP_USERLAND_STEMS[0]));
+        std::fs::write(item0.join("bin/tool"), b"#!poisoned\n").unwrap();
+        assert!(read_userland_map(&d, &map, &fp).is_none());
+        std::fs::write(
+            item0.join("bin/tool"),
+            format!("#!{}\n", LOOP_USERLAND_STEMS[0]),
+        )
+        .unwrap();
+        assert!(read_userland_map(&d, &map, &fp).is_some(), "restored bytes verify again");
         // A stem whose item lost its bin/ invalidates the whole map (the
         // caller re-provisions) — no partial userland.
-        std::fs::remove_dir_all(
-            d.join(format!("hash0-{}-1.0", LOOP_USERLAND_STEMS[0])).join("bin"),
-        )
-        .unwrap();
+        std::fs::remove_dir_all(item0.join("bin")).unwrap();
         assert!(read_userland_map(&d, &map, &fp).is_none());
-        // A path-carrying value is rejected (the map holds basenames only),
-        // as is a map with no fingerprint line at all (pre-fingerprint maps
-        // self-invalidate).
+        // A path-carrying value is rejected (the map holds basenames only), as
+        // is a hash-less line (the pre-hash map format self-invalidates) and a
+        // map with no fingerprint line at all.
         std::fs::write(
             &map,
-            format!("fingerprint {fp}\nbusybox-x86-64 ../escape\nmake-x86-64 x\n"),
+            format!("fingerprint {fp}\nbusybox-x86-64 ../escape sha256:aa\nmake-x86-64 x sha256:aa\n"),
         )
         .unwrap();
         assert!(read_userland_map(&d, &map, &fp).is_none());
-        std::fs::write(&map, "busybox-x86-64 x\nmake-x86-64 x\n").unwrap();
+        std::fs::write(
+            &map,
+            format!("fingerprint {fp}\nbusybox-x86-64 x\nmake-x86-64 x\n"),
+        )
+        .unwrap();
+        assert!(read_userland_map(&d, &map, &fp).is_none());
+        std::fs::write(&map, "busybox-x86-64 x sha256:aa\nmake-x86-64 x sha256:aa\n").unwrap();
         assert!(read_userland_map(&d, &map, &fp).is_none());
         // A missing map is simply cold.
         assert!(read_userland_map(&d, &d.join("absent.map"), &fp).is_none());
+    }
+
+    // The userland freshness key covers the evaluator binary AND the in-repo
+    // seed patches: patches are chain inputs the runner reads from the TREE at
+    // build time, so a patch-only change (binary byte-identical) must re-key
+    // the userland — a stale one could false-green the patch under review.
+    #[test]
+    fn userland_fingerprint_keys_on_evaluator_and_seed_patches() {
+        let d = scratch("userland-fp");
+        let eval = d.join("td-recipe-eval");
+        std::fs::write(&eval, b"evaluator-v1").unwrap();
+        let eval_s = eval.to_str().unwrap().to_string();
+        let root = d.join("tree");
+        std::fs::create_dir_all(root.join("seed/patches")).unwrap();
+        let fp0 = userland_fingerprint(&root, &eval_s).unwrap();
+        // A patch appearing re-keys; its CONTENT changing re-keys again.
+        std::fs::write(root.join("seed/patches/a.patch"), b"-x\n+y\n").unwrap();
+        let fp1 = userland_fingerprint(&root, &eval_s).unwrap();
+        assert_ne!(fp0, fp1, "a new seed patch re-keys the userland");
+        std::fs::write(root.join("seed/patches/a.patch"), b"-x\n+z\n").unwrap();
+        let fp2 = userland_fingerprint(&root, &eval_s).unwrap();
+        assert_ne!(fp1, fp2, "a patch-only change re-keys the userland");
+        // Non-.patch files in the dir do not key; a tree with NO patch dir
+        // keys on the binary alone.
+        std::fs::write(root.join("seed/patches/README"), b"notes").unwrap();
+        assert_eq!(fp2, userland_fingerprint(&root, &eval_s).unwrap());
+        let bare = d.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let fp_bare = userland_fingerprint(&bare, &eval_s).unwrap();
+        assert_ne!(fp_bare, fp2);
+        // The evaluator's bytes still key.
+        std::fs::write(&eval, b"evaluator-v2").unwrap();
+        assert_ne!(fp2, userland_fingerprint(&root, &eval_s).unwrap());
     }
 
     #[test]

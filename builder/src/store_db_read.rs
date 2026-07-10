@@ -83,14 +83,21 @@ impl Db {
     /// `ValidPaths` as a `path -> recorded NAR hash` map — the provenance oracle
     /// the staging boundary verifies staged bytes against (re #469). Scaffolding
     /// rows (path-only, NULL hash — a builder placement's external refs) carry no
-    /// hash and are omitted: they assert reachability, not content. Two dbs
-    /// recording DIFFERENT hashes for one path is caller-detectable (merge and
-    /// compare), not silently last-write-wins here — this reads ONE db.
+    /// hash and are omitted: they assert reachability, not content. A single db
+    /// registering one path under two DIFFERENT hashes is corrupt (no writer does
+    /// this) and errors rather than silently letting the later row win; cross-db
+    /// conflicts are the caller's merge to detect.
     pub fn hashes_by_path(&self) -> Result<HashMap<String, String>, String> {
         let mut out: HashMap<String, String> = HashMap::new();
         for (_rid, cols) in self.table("ValidPaths")? {
             if let (Some(Value::Text(p)), Some(Value::Text(h))) = (cols.get(1), cols.get(2)) {
-                out.insert(p.clone(), h.clone());
+                if let Some(prev) = out.insert(p.clone(), h.clone()) {
+                    if prev != *h {
+                        return Err(format!(
+                            "store db registers {p} under conflicting hashes ({prev} vs {h}) — refusing a corrupt provenance oracle (re #469)"
+                        ));
+                    }
+                }
             }
         }
         Ok(out)

@@ -53,25 +53,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-/// Adapter: stream Write into the hasher.
-struct HashWriter(sha256::Sha256);
-
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-impl std::io::Write for HashWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.update(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+/// Stream-hash a tree/file in NAR form — one implementation, shared with the
+/// staging boundary's verifier (`sandbox::verify_staged_item`) and the
+/// loop-userland cache so every `sha256:<hex>` record is produced identically.
 fn nar_hash_path(path: &Path) -> Result<String, std::io::Error> {
-    let mut w = HashWriter(sha256::Sha256::new());
-    nar::write_nar(&mut w, path)?;
-    Ok(format!("sha256:{}", sha256::to_base16(&w.0.finalize())))
+    sandbox::nar_hash_of(path)
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
@@ -1064,6 +1050,69 @@ fn merge_output_db(dest_db: &Path, new_regs: &[OutputReg]) -> Result<(), String>
     };
     let bytes = merge_regs(existing.as_deref(), new_regs)?;
     std::fs::write(dest_db, bytes).map_err(|e| format!("write {}: {e}", dest_db.display()))
+}
+
+/// The `store-add-recursive` body, factored so the merge semantics unit-test:
+/// intern SRC as a content-addressed `source` item under STORE-DIR and MERGE
+/// its registration into OUT-DB (a missing file is the first intern — see the
+/// CLI arm's doc for why merging is load-bearing, re #469). Prints nothing;
+/// returns the computed store path.
+fn store_add_recursive(
+    name: &str,
+    src: &str,
+    store_dir: &str,
+    out_db: &str,
+) -> Result<String, String> {
+    // Content-addressed path from the source tree's recursive NAR sha256.
+    let nar = nar_hash(src).map_err(|e| e.to_string())?;
+    let hex = nar
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("nar-hash returned `{nar}', expected sha256:<hex>"))?;
+    let path = store::make_store_path("source", hex, name);
+    let base = path
+        .rsplit('/')
+        .next()
+        .filter(|_| store::name_from_store_path(&path).is_some())
+        .ok_or_else(|| format!("computed path {path} is malformed"))?
+        .to_string();
+    // Canonically restore the tree into the td-owned store. The path is
+    // content-addressed, so an EXISTING tree there must already BE this
+    // content: verify it instead of copying over it (idempotent re-intern —
+    // the runner re-interns every seed on warm runs); a hash mismatch is a
+    // corrupt store item, never a reuse.
+    std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+    let disk = Path::new(store_dir).join(&base);
+    if disk.symlink_metadata().is_ok() {
+        let got = nar_hash_path(&disk).map_err(|e| e.to_string())?;
+        if got != nar {
+            return Err(format!(
+                "store item {} exists but hashes {got}, expected {nar} — corrupt content-addressed item; refusing to re-register it (re #469)",
+                disk.display()
+            ));
+        }
+    } else {
+        copy_canonical(Path::new(src), &disk)?;
+    }
+    // Register: NAR hash + size of the tree td restored (the `build`
+    // machinery), references scanned among the single-path closure.
+    let closure = vec![path.clone()];
+    let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
+    nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
+    let (hash, size, refs) = s.finish();
+    if !refs.is_empty() && refs != [path.clone()] {
+        return Err(format!(
+            "source {name} has references {refs:?}; referenced sources are a later increment"
+        ));
+    }
+    let reg = OutputReg {
+        store_path: path.clone(),
+        nar_hash: hash,
+        nar_size: size,
+        refs,
+        deriver: String::new(), // a source add has none
+    };
+    merge_output_db(Path::new(out_db), std::slice::from_ref(&reg))?;
+    Ok(path)
 }
 
 /// Execute DRV in a userns sandbox against CLOSURE (the staged input store paths,
@@ -2359,6 +2408,19 @@ fn build_recipe(
     // SUBSTITUTE-OR-BUILD (opt-in, TD_SUBST_URL): fetch the outputs from a substitute
     // server instead of building. OFF for the verification loop — it never sets the env,
     // so this is a no-op there (directive 1: the loop always builds from source + --check).
+    // A STRICT-provenance step refuses the channel outright rather than ignoring it:
+    // substituted bytes come vouched by a remote server's signature, not by the audited
+    // seed/recipe chain the staging manifest certifies, so a strict plan with the env
+    // set is a configuration error, never a silent download (re #469).
+    if strict_provenance && std::env::var_os("TD_SUBST_URL").is_some() {
+        return Err(
+            "provenance rejected: TD_SUBST_URL is set for a strict-provenance build-plan \
+             step — a substitute server is not an admissible executable-input provenance \
+             (only audited seeds and prior td recipe outputs are, re #469); unset \
+             TD_SUBST_URL to build from source"
+                .to_string(),
+        );
+    }
     if let Some(regs) = try_substitute(&parsed, &drv_path, scratch)? {
         eprintln!(
             "td-builder: build-recipe SUBSTITUTED {} output(s) for {drv_path} (verified signature + NarHash); skipping the build",
@@ -2713,6 +2775,23 @@ fn assemble_recipe_drv(
     Ok((drv_path, drv_file, parsed, source))
 }
 
+/// The optional td-OWNED stage0 builder override from TD_BUILDER_PATH/STORE/DB — all
+/// three set together (a `store-add-builder` placement) → the drv's builder is that
+/// td-placed stage0, staged from its own store + db; none set → the running binary
+/// (self_store_path). Any partial set is a loud error. Returns owned strings; borrow
+/// them into the `(&str, &str, &str)` build_recipe/build_plan expects at the call site.
+fn builder_store_env() -> Result<Option<(String, String, String)>, String> {
+    match (
+        std::env::var("TD_BUILDER_PATH").ok(),
+        std::env::var("TD_BUILDER_STORE").ok(),
+        std::env::var("TD_BUILDER_DB").ok(),
+    ) {
+        (Some(p), Some(s), Some(d)) => Ok(Some((p, s, d))),
+        (None, None, None) => Ok(None),
+        _ => Err("TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together".into()),
+    }
+}
+
 /// build-plan: realize a TOPO-ordered chain of recipes where a downstream step
 /// consumes an UPSTREAM step's td-BUILT output instead of a guix store path. This
 /// is the edge the per-package locks could not express: `recipe-checks` builds
@@ -2731,24 +2810,6 @@ fn assemble_recipe_drv(
 /// be vouched for by one of those dbs and NAR-hash-match it at the sandbox staging
 /// boundary. The output of each step is copied into the shared TD-STORE and its
 /// store path recorded for downstream steps.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-/// The optional td-OWNED stage0 builder override from TD_BUILDER_PATH/STORE/DB — all
-/// three set together (a `store-add-builder` placement) → the drv's builder is that
-/// td-placed stage0, staged from its own store + db; none set → the running binary
-/// (self_store_path). Any partial set is a loud error. Returns owned strings; borrow
-/// them into the `(&str, &str, &str)` build_recipe/build_plan expects at the call site.
-fn builder_store_env() -> Result<Option<(String, String, String)>, String> {
-    match (
-        std::env::var("TD_BUILDER_PATH").ok(),
-        std::env::var("TD_BUILDER_STORE").ok(),
-        std::env::var("TD_BUILDER_DB").ok(),
-    ) {
-        (Some(p), Some(s), Some(d)) => Ok(Some((p, s, d))),
-        (None, None, None) => Ok(None),
-        _ => Err("TD_BUILDER_PATH/TD_BUILDER_STORE/TD_BUILDER_DB must be set together".into()),
-    }
-}
-
 fn build_plan(
     plan_file: &str,
     guix_store: &str,
@@ -3072,7 +3133,7 @@ fn auto_synthesize_lock(
 /// GUIX-STORE (the plan's seed store), so the map cannot smuggle a host path in as a
 /// `seed` lock entry (re #469).
 ///
-/// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE GUIX-STORE SCRATCH
+/// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_plan_auto(
     target: &str,
@@ -5277,77 +5338,19 @@ fn main() -> ExitCode {
         // makeFixedOutputPath for recursive-sha256, no references), CANONICALLY restores
         // the tree into a td-owned store dir (`copy_canonical`: structure + contents +
         // exec bit + symlinks, the NAR-relevant properties), and REGISTERS it in a td
-        // store DB (`store_db`). No daemon in the write path. Usage:
+        // store DB (`store_db`). The registration MERGES into OUT-DB (a missing file is
+        // the first intern): the runner interns MANY seeds into ONE db and passes that
+        // db as build-plan's strict-provenance SEED-DB, so every interned seed must stay
+        // vouched — a clobbering single-row write would silently un-vouch all earlier
+        // seeds and red the first multi-seed rung (re #469). No daemon in the write
+        // path. Usage:
         //   store-add-recursive NAME SRC STORE-DIR OUT-DB
         // Prints the store path. No-reference sources (this increment); referenced
         // sources are a later increment.
         Some("store-add-recursive") if args.len() == 6 => {
             let (name, src, store_dir, out_db) =
                 (&args[2], &args[3], &args[4], &args[5]);
-            let run = || -> Result<String, String> {
-                use store_db::{Table, Value};
-                // Content-addressed path from the source tree's recursive NAR sha256.
-                let nar = nar_hash(src).map_err(|e| e.to_string())?;
-                let hex = nar
-                    .strip_prefix("sha256:")
-                    .ok_or_else(|| format!("nar-hash returned `{nar}', expected sha256:<hex>"))?;
-                let path = store::make_store_path("source", hex, name);
-                let base = path
-                    .rsplit('/')
-                    .next()
-                    .filter(|_| store::name_from_store_path(&path).is_some())
-                    .ok_or_else(|| format!("computed path {path} is malformed"))?
-                    .to_string();
-                // Canonically restore the tree into the td-owned store.
-                std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
-                let disk = Path::new(store_dir).join(&base);
-                copy_canonical(Path::new(src), &disk)?;
-                // Register: NAR hash + size of the tree td restored (the `build`
-                // machinery), references scanned among the single-path closure.
-                let closure = vec![path.clone()];
-                let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
-                nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
-                let (hash, size, refs) = s.finish();
-                if !refs.is_empty() && refs != [path.clone()] {
-                    return Err(format!(
-                        "source {name} has references {refs:?}; referenced sources are a later increment"
-                    ));
-                }
-                let valid = vec![(
-                    1i64,
-                    vec![
-                        Value::Null,
-                        Value::Text(path.clone()),
-                        Value::Text(hash),
-                        Value::Int(1),
-                        Value::Null, // deriver — a source add has none
-                        Value::Int(size as i64),
-                    ],
-                )];
-                let mut ref_rows = Vec::new();
-                let mut rid = 1i64;
-                for r in &refs {
-                    if r == &path {
-                        ref_rows.push((rid, vec![Value::Int(1), Value::Int(1)]));
-                        rid += 1;
-                    }
-                }
-                let tables = [
-                    Table {
-                        name: "ValidPaths",
-                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
-                        rows: valid,
-                    },
-                    Table {
-                        name: "Refs",
-                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
-                        rows: ref_rows,
-                    },
-                ];
-                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
-                Ok(path)
-            };
-            match run() {
+            match store_add_recursive(name, src, store_dir, out_db) {
                 Ok(path) => {
                     println!("{path}");
                     ExitCode::SUCCESS
@@ -7076,7 +7079,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder resolve LOCKFILE NAME...");
             eprintln!("       td-builder realize FILE.drv STORE-DB SCRATCH-DIR");
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DB [SRC-STORE-DIR SRC-DB]");
-            eprintln!("       td-builder build-plan PLAN GUIX-DB SCRATCH-DIR");
+            eprintln!("       td-builder build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             eprintln!("       td-builder rust-build        # as a derivation builder (cargo)");
             eprintln!("       td-builder cmake-build       # as a derivation builder (cmake)");
@@ -7824,6 +7827,75 @@ daemon build START (2/2 active)
             hashes.get("/td/store/aaa-mes-0.27.1").map(String::as_str),
             Some("sha256:deadbeef")
         );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // store-add-recursive MERGES into OUT-DB: the runner interns EVERY seed into
+    // one db and passes it as build-plan's strict-provenance SEED-DB, so a later
+    // intern must never un-vouch an earlier one — the pre-fix clobber left only
+    // the LAST seed registered, which would red the manifest completeness gate
+    // on every multi-seed rung (subagent review, round 4; re #469).
+    #[test]
+    fn store_add_recursive_accumulates_every_interned_seed_in_one_db() {
+        let d = std::env::temp_dir().join(format!("td-seed-db-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for (name, bytes) in [("one", "alpha\n"), ("two", "beta\n")] {
+            let s = d.join(name);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(s.join("file"), bytes).unwrap();
+        }
+        let (store, db) = (d.join("store"), d.join("seed.db"));
+        let (store_s, db_s) = (
+            store.to_string_lossy().to_string(),
+            db.to_string_lossy().to_string(),
+        );
+        let one = d.join("one").to_string_lossy().to_string();
+        let two = d.join("two").to_string_lossy().to_string();
+        let p1 = store_add_recursive("seed-one", &one, &store_s, &db_s).unwrap();
+        let p2 = store_add_recursive("seed-two", &two, &store_s, &db_s).unwrap();
+        // Re-interning is idempotent — same path, no duplicate row.
+        assert_eq!(p1, store_add_recursive("seed-one", &one, &store_s, &db_s).unwrap());
+        let hashes = store_db_read::Db::open(std::fs::read(&db).unwrap())
+            .unwrap()
+            .hashes_by_path()
+            .unwrap();
+        assert_eq!(hashes.len(), 2, "both seeds stay vouched: {hashes:?}");
+        for p in [&p1, &p2] {
+            assert!(
+                hashes.get(p.as_str()).is_some_and(|h| h.starts_with("sha256:")),
+                "{p} missing from the merged seed db: {hashes:?}"
+            );
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // A single db registering one path under two DIFFERENT hashes is corrupt: the
+    // provenance oracle errors instead of silently letting the later row win.
+    // Duplicate rows with the SAME hash are merely redundant, not corrupt.
+    #[test]
+    fn hashes_by_path_rejects_intra_db_hash_conflicts() {
+        let d = std::env::temp_dir().join(format!("td-dup-hash-db-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mk = |h: &str| OutputReg {
+            store_path: "/td/store/aaa-mes-0.27.1".to_string(),
+            nar_hash: h.to_string(),
+            nar_size: 1,
+            refs: vec![],
+            deriver: String::new(),
+        };
+        let db_path = d.join("dup.db");
+        write_output_db(&[mk("sha256:aa"), mk("sha256:bb")], &db_path).unwrap();
+        let err = store_db_read::Db::open(std::fs::read(&db_path).unwrap())
+            .unwrap()
+            .hashes_by_path()
+            .unwrap_err();
+        assert!(err.contains("conflicting hashes"), "{err}");
+        write_output_db(&[mk("sha256:aa"), mk("sha256:aa")], &db_path).unwrap();
+        let hashes = store_db_read::Db::open(std::fs::read(&db_path).unwrap())
+            .unwrap()
+            .hashes_by_path()
+            .unwrap();
+        assert_eq!(hashes.len(), 1);
         std::fs::remove_dir_all(&d).ok();
     }
 
