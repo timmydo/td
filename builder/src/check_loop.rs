@@ -229,10 +229,14 @@ fn userland_fingerprint(eval: &str) -> Result<String, String> {
 
 /// Resolve the td-built loop userland, provisioning it if needed.
 ///
-/// Warm path: `loop-userland.map` opens with `fingerprint <sha256>` matching
-/// `userland_fingerprint` (the CURRENT evaluator — a recipe, pin, or applet
-/// change re-keys it) and names a host copy under `loop_userland_dir()` for
-/// every stem, each with an existing `bin/`.
+/// Warm path: `loop-userland.<fingerprint>.map` opens with `fingerprint
+/// <sha256>` matching `userland_fingerprint` (the CURRENT evaluator — a
+/// recipe, pin, or applet change re-keys it) and names a host copy under
+/// `loop_userland_dir()` for every stem, each with an existing `bin/`. The
+/// map FILENAME carries the fingerprint so concurrent worktrees — whose
+/// evaluator binaries fingerprint differently — never clobber each other's
+/// map between one provision's write and its validating re-read, and each
+/// keeps its own warm path instead of re-provisioning on every alternation.
 ///
 /// Cold path: run `td-recipe-eval build-run busybox-x86-64 <stems…>`, which
 /// realizes the recipe chain (replayed from the warm chain cache when
@@ -252,9 +256,9 @@ fn userland_fingerprint(eval: &str) -> Result<String, String> {
 /// (`CheckError::Unprovisioned`), not a code regression.
 fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
     let dir = loop_userland_dir().map_err(|e| CheckError::Fatal(fatal(&e)))?;
-    let map_path = dir.join("loop-userland.map");
     let eval = resolve_recipe_eval_bin(root).map_err(CheckError::Unprovisioned)?;
     let fingerprint = userland_fingerprint(&eval).map_err(|e| CheckError::Fatal(fatal(&e)))?;
+    let map_path = dir.join(format!("loop-userland.{fingerprint}.map"));
     if let Some(ul) = read_userland_map(&dir, &map_path, &fingerprint) {
         return Ok(ul);
     }
