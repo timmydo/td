@@ -80,6 +80,22 @@ impl Db {
         self.closure_roots(std::slice::from_ref(&root.to_string()))
     }
 
+    /// `ValidPaths` as a `path -> recorded NAR hash` map — the provenance oracle
+    /// the staging boundary verifies staged bytes against (re #469). Scaffolding
+    /// rows (path-only, NULL hash — a builder placement's external refs) carry no
+    /// hash and are omitted: they assert reachability, not content. Two dbs
+    /// recording DIFFERENT hashes for one path is caller-detectable (merge and
+    /// compare), not silently last-write-wins here — this reads ONE db.
+    pub fn hashes_by_path(&self) -> Result<HashMap<String, String>, String> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        for (_rid, cols) in self.table("ValidPaths")? {
+            if let (Some(Value::Text(p)), Some(Value::Text(h))) = (cols.get(1), cols.get(2)) {
+                out.insert(p.clone(), h.clone());
+            }
+        }
+        Ok(out)
+    }
+
     /// The UNION of the GC-reachable closures of every path in `roots` (each root
     /// included), sorted and deduped — the daemon's `guix gc --requisites root…`
     /// over the same `Refs` graph. Errors if ANY root is not a `ValidPaths` entry

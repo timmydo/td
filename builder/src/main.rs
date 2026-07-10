@@ -1079,6 +1079,7 @@ fn build_and_register(
     drv_path: &str,
     closure: &[String],
     scratch: &Path,
+    manifest: Option<&sandbox::StageManifest>,
 ) -> Result<Vec<OutputReg>, String> {
     let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
     let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
@@ -1103,7 +1104,7 @@ fn build_and_register(
         store::drv_store_path(&drv_name, &bytes, &refs)
     };
     let outputs =
-        sandbox::build(&parsed, drv_path, closure, scratch).map_err(|e| e.to_string())?;
+        sandbox::build(&parsed, drv_path, closure, scratch, manifest).map_err(|e| e.to_string())?;
     // Reference candidates: the staged closure plus the drv's own outputs
     // (self-references), the daemon's candidate shape. A closure entry may carry an
     // on-disk override (`CANONICAL\tON-DISK`); reference scanning matches the
@@ -1743,7 +1744,7 @@ fn daemon_realize_one(
     eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
     let seed_dirs = [seed_dir.to_string()];
     // The daemon scans the live store dir: entries are canonical where they sit.
-    let regs = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &scr, &[], ov.as_ref(), None)?;
+    let regs = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &scr, &[], ov.as_ref(), None, false)?;
     let (c, h) = mk(&regs)?;
     Ok((c, h, false))
 }
@@ -1773,7 +1774,7 @@ fn daemon_check_one(
     let scr = scratch_base.join(format!("{key}-chk"));
     let _ = std::fs::remove_dir_all(&scr); // the rebuild here must be fresh, never a cache reuse
     let r1 = scr.join("r1");
-    let regs1 = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &r1, &[], ov.as_ref(), None)?;
+    let regs1 = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &r1, &[], ov.as_ref(), None, false)?;
     // Baseline for the comparison: the build verb's already-realized output at
     // scratch_base/<key> when every output tree is present there (the loop's normal path,
     // ⇒ 2 builds total), else a SECOND fresh build (bare-CHECK fallback ⇒ the original 3).
@@ -1783,7 +1784,7 @@ fn daemon_check_one(
         built
     } else {
         let r2 = scr.join("r2");
-        let _ = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &r2, &[], ov.as_ref(), None)?;
+        let _ = realize_drv(drv, &seed_dirs, &store::store_dir(), &[], &r2, &[], ov.as_ref(), None, false)?;
         r2
     };
     for reg in &regs1 {
@@ -1983,6 +1984,7 @@ fn realize_drv(
     src_overrides: &[SrcOverride],
     builder_override: Option<&BuilderOverride>,
     td_store: Option<&Path>,
+    strict_provenance: bool,
 ) -> Result<Vec<OutputReg>, String> {
     let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
     let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
@@ -2138,7 +2140,58 @@ fn realize_drv(
     );
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     std::fs::write(scratch.join("closure.txt"), closure.join("\n")).map_err(|e| e.to_string())?;
-    let regs = build_and_register(drv_path, &closure, scratch)?;
+    // STRICT PROVENANCE (the bootstrap-chain mode, re #469): assemble the staged-input
+    // manifest from td-OWNED store DBs ONLY — the interned-seed/extra dbs, each source
+    // placement's db, the builder placement's db — and require EVERY closure item to be
+    // accounted for before anything is staged. The content-scanned seed DIRECTORY thereby
+    // contributes bytes, never authority: an item the dbs don't vouch for reds HERE, and
+    // sandbox::build re-hashes each item against the manifest at the bind boundary.
+    // Scaffolding rows (hashless placement refs) vouch for nothing by construction.
+    let manifest: Option<sandbox::StageManifest> = if strict_provenance {
+        let mut m = sandbox::StageManifest::new();
+        let mut add_db = |db: &store_db_read::Db, label: &str| -> Result<(), String> {
+            for (p, h) in db.hashes_by_path()? {
+                if let Some(prev) = m.get(&p) {
+                    if prev != &h {
+                        return Err(format!(
+                            "provenance conflict: {p} is registered with hash {prev} and {h} ({label}) — refusing to build on a contradictory record"
+                        ));
+                    }
+                }
+                m.insert(p, h);
+            }
+            Ok(())
+        };
+        for dbp in extra_dbs {
+            let data = std::fs::read(dbp).map_err(|e| format!("read store db {dbp}: {e}"))?;
+            add_db(&store_db_read::Db::open(data)?, dbp)?;
+        }
+        for (ov, sdb) in &src_dbs {
+            add_db(sdb, &ov.db)?;
+        }
+        if let (Some(ov), Some(bdb)) = (builder_override, &builder_db) {
+            add_db(bdb, &ov.db)?;
+        }
+        for e in &closure {
+            let (canonical, _) = sandbox::split_closure_entry(e);
+            if !m.contains_key(canonical) {
+                return Err(format!(
+                    "provenance rejected: closure item {canonical} has no td-owned store-db record (re #469) — every staged input must be vouched for by the plan's seed db, a prior step's td.db, or a source/builder placement db"
+                ));
+            }
+        }
+        // The audit record beside closure.txt: what may stage, under which hash.
+        let mut lines = String::new();
+        for (p, h) in &m {
+            lines.push_str(&format!("{p} {h}\n"));
+        }
+        std::fs::write(scratch.join("provenance.manifest"), lines)
+            .map_err(|e| e.to_string())?;
+        Some(m)
+    } else {
+        None
+    };
+    let regs = build_and_register(drv_path, &closure, scratch, manifest.as_ref())?;
     // td OWNS the store record of its build: write a td store-db registering the
     // realized output(s) — the daemon's post-build registration, in pure Rust.
     write_output_db(&regs, &scratch.join("td.db"))?;
@@ -2203,6 +2256,7 @@ fn build_recipe(
     builder_store: Option<(&str, &str, &str)>,
     td_store: Option<&Path>,
     persist: Option<(&str, &str)>,
+    strict_provenance: bool,
 ) -> Result<Vec<OutputReg>, String> {
     // A td-OWNED builder (optional, bootstrap brick 2): the drv's `builder` is a stage0
     // td-builder td placed at `canonical` (store-add-builder), restored under store_dir,
@@ -2328,6 +2382,7 @@ fn build_recipe(
         &src_overrides,
         builder_override.as_ref(),
         td_store,
+        strict_provenance,
     )?;
     // PERSISTENT-STORE build-into: commit the freshly-built output(s) into the
     // incremental store so a LATER invocation reads them back (the skip above) —
@@ -2664,15 +2719,18 @@ fn assemble_recipe_drv(
 /// grep's own derivation Guile-free but still links GUIX's pcre2; here grep links
 /// the pcre2 td just built.
 ///
+/// Reached ONLY through `build-plan --auto` (the raw-plan CLI arm is deleted,
+/// re #469 — a hand-written plan/lock was an untyped host-path ingress channel).
 /// PLAN is line-based — `step RECIPE-JSON LOCK` per step, in dependency order. For
-/// each step: any `td-recipe-output` lock entry is SUBSTITUTED with the matching
-/// earlier step's output path (matched by the entry NAME == the producing recipe's
-/// `name`); the recipe is built with `build_recipe` over a closure that spans
-/// GUIX-DB (the transitive seeds) ∪ every prior step's `td.db` (the td-built deps),
-/// staging those deps from a shared TD-STORE the steps populate. The output of each
-/// step is copied into TD-STORE and its store path recorded for downstream steps.
-///
-/// Usage: build-plan PLAN GUIX-DB SCRATCH
+/// each step every lock entry is CLASS-GATED: a `td-recipe-output` is SUBSTITUTED
+/// with the matching earlier step's output (matched by NAME == the producing
+/// recipe's `name`), a `seed`/`source` must pass `auto_seed_provenance` against
+/// the plan's seed store, and anything else is rejected. The recipe is built with
+/// `build_recipe` under STRICT PROVENANCE: the closure spans SEED-DB (the interned
+/// seeds' registrations) ∪ every prior step's `td.db`, and every staged item must
+/// be vouched for by one of those dbs and NAR-hash-match it at the sandbox staging
+/// boundary. The output of each step is copied into the shared TD-STORE and its
+/// store path recorded for downstream steps.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 /// The optional td-OWNED stage0 builder override from TD_BUILDER_PATH/STORE/DB — all
 /// three set together (a `store-add-builder` placement) → the drv's builder is that
@@ -2694,6 +2752,7 @@ fn builder_store_env() -> Result<Option<(String, String, String)>, String> {
 fn build_plan(
     plan_file: &str,
     guix_store: &str,
+    seed_db: &str,
     scratch: &Path,
     builder_store: Option<(&str, &str, &str)>,
 ) -> Result<(), String> {
@@ -2710,9 +2769,14 @@ fn build_plan(
     std::fs::create_dir_all(&tdstore).map_err(|e| e.to_string())?;
 
     // recipe name -> its (single) output store path; and each step's td.db, fed
-    // into the closure of later steps so a td-built dep resolves.
+    // into the closure of later steps so a td-built dep resolves. The db set is
+    // SEEDED with the plan's seed db (the registrations `store-add-recursive`
+    // wrote when the seeds were interned) — under strict provenance every staged
+    // item must be vouched for by one of these dbs, so the seed STORE directory
+    // contributes bytes, never authority (re #469).
     let mut built: BTreeMap<String, String> = BTreeMap::new();
-    let mut td_dbs: Vec<String> = Vec::new();
+    let mut td_dbs: Vec<String> = vec![seed_db.to_string()];
+    let store_prefix = store::store_dir();
 
     for raw in plan.lines() {
         let line = raw.trim();
@@ -2742,14 +2806,36 @@ fn build_plan(
         let mut resolved = String::new();
         let mut substituted: Vec<String> = Vec::new();
         for e in &entries {
-            let path = if e.class == lock::Class::TdRecipeOutput {
-                let p = built.get(&e.name).ok_or_else(|| {
-                    format!("step `{name}': lock entry `{}' is td-recipe-output but no earlier step built it (plan out of topo order?)", e.name)
-                })?;
-                substituted.push(format!("{}={}", e.name, p));
-                p.clone()
-            } else {
-                e.path.clone()
+            // Class-typed provenance gate (re #469): a td-recipe-output MUST be an
+            // earlier step's build; a seed/source MUST be a canonical store item
+            // interned in the plan's seed store; nothing else is admissible. This
+            // holds for ANY lock this function is handed, not only the ones
+            // auto_synthesize_lock produced — the plan file is not an ingress
+            // channel that can type arbitrary host paths as seeds.
+            let path = match e.class {
+                lock::Class::TdRecipeOutput => {
+                    let p = built.get(&e.name).ok_or_else(|| {
+                        format!("step `{name}': lock entry `{}' is td-recipe-output but no earlier step built it (plan out of topo order?)", e.name)
+                    })?;
+                    substituted.push(format!("{}={}", e.name, p));
+                    p.clone()
+                }
+                lock::Class::Seed | lock::Class::Source => {
+                    auto_seed_provenance(
+                        &store_prefix,
+                        Path::new(guix_store),
+                        name,
+                        &e.name,
+                        &e.path,
+                    )?;
+                    e.path.clone()
+                }
+                lock::Class::Crate => {
+                    return Err(format!(
+                        "step `{name}': provenance rejected: lock entry `{}' is a vendored crate — a bootstrap plan admits only interned seeds and prior recipe outputs (re #469)",
+                        e.name
+                    ));
+                }
             };
             // Re-emit 2-field; build_recipe re-infers the class. A substituted td
             // path infers `seed` → an input-src, exactly the intent (it IS now a
@@ -2779,6 +2865,7 @@ fn build_plan(
             builder_store,   // builder_store: the td-placed stage0 (TD_BUILDER_*), or None → self
             Some(&tdstore),  // td_store: stage td-built deps from the shared td-store
             None,            // persist: build-plan owns its own in-run td-store
+            true,            // strict provenance: every staged item db-vouched + hash-verified (re #469)
         )?;
         // Single-output recipes (the gnu corpus): the dep is regs[0].
         let out = regs
@@ -2992,6 +3079,7 @@ fn build_plan_auto(
     recipe_dir: &str,
     map_file: &str,
     guix_store: &str,
+    seed_db: &str,
     scratch: &Path,
     builder_store: Option<(&str, &str, &str)>,
 ) -> Result<(), String> {
@@ -3025,7 +3113,7 @@ fn build_plan_auto(
     }
     let plan_path = scratch.join("auto.plan");
     std::fs::write(&plan_path, &plan).map_err(|e| e.to_string())?;
-    build_plan(&plan_path.to_string_lossy(), guix_store, scratch, builder_store)
+    build_plan(&plan_path.to_string_lossy(), guix_store, seed_db, scratch, builder_store)
 }
 
 /// Emit PKG's recipe JSON from td's Rust catalog via `td-recipe-eval emit` — the
@@ -5984,7 +6072,7 @@ fn main() -> ExitCode {
                     .filter(|l| !l.is_empty())
                     .map(str::to_string)
                     .collect();
-                build_and_register(drv_path, &closure, Path::new(scratch)).map(|_| ())
+                build_and_register(drv_path, &closure, Path::new(scratch), None).map(|_| ())
             };
             match run() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -6018,7 +6106,7 @@ fn main() -> ExitCode {
                 // ⇒ None ⇒ identical to the prior behavior. The override rides into closure.txt,
                 // so a later `td-builder build`/`check` of this drv stages the builder too.
                 let ov = builder_override_from_env()?;
-                realize_drv(drv_path, std::slice::from_ref(store_dir), &store::store_dir(), &[], Path::new(scratch), &[], ov.as_ref(), None)
+                realize_drv(drv_path, std::slice::from_ref(store_dir), &store::store_dir(), &[], Path::new(scratch), &[], ov.as_ref(), None, false)
                     .map(|_| ())
             };
             match run() {
@@ -6348,6 +6436,7 @@ fn main() -> ExitCode {
                     builder_store,
                     td_store,
                     persist,
+                    false, // standalone build-recipe: the pre-existing seed-oracle flow
                 )
                 .map(|_| ())
             };
@@ -6359,30 +6448,12 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // td-builder build-plan — realize a TOPO chain of recipes where a
-        // downstream step consumes an UPSTREAM step's td-BUILT output instead of a
-        // guix store path (a `td-recipe-output` lock entry). PLAN is `step
-        // RECIPE-JSON LOCK` per line, in dependency order; the closure of each step
-        // content-scans GUIX-STORE ∪ the prior steps' td.dbs, staged from a shared td-store.
-        // Usage: build-plan PLAN GUIX-STORE SCRATCH
-        Some("build-plan") if args.len() == 5 => {
-            let (plan_file, guix_store, scratch) = (&args[2], &args[3], &args[4]);
-            let bov = match builder_store_env() {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("td-builder: build-plan {plan_file}: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let builder_store = bov.as_ref().map(|(p, s, d)| (p.as_str(), s.as_str(), d.as_str()));
-            match build_plan(plan_file, guix_store, Path::new(scratch), builder_store) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("td-builder: build-plan {plan_file}: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        // The raw `build-plan PLAN STORE SCRATCH` arm is DELETED (re #469): a
+        // hand-written plan/lock pair was an untyped ingress channel that could
+        // stage arbitrary host paths as `seed` entries. The only plan entrance is
+        // `--auto` below — locks synthesized from the recipe graph, seed paths
+        // provenance-gated at synthesis AND per-entry in build_plan, every staged
+        // item db-vouched + NAR-verified at the sandbox boundary.
         // td-builder build-plan --auto — GENERATE the plan from the recipe GRAPH (no
         // hand-written lock, plan, or manifest, #429): topo-sort TARGET's owned-input
         // closure, SYNTHESIZE each owned recipe's lock straight from its declared
@@ -6391,11 +6462,14 @@ fn main() -> ExitCode {
         // RECIPE-DIR/<name>.json exists. MAP-FILE is `NAME PATH` per line — the pinned
         // seed/source paths `ladder_setup` interned (srcs.map; host tools are not
         // admissible inputs, and each PATH must be a canonical store item interned in
-        // GUIX-STORE or synthesis reds with `provenance rejected`, re #469).
-        // Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE GUIX-STORE SCRATCH
-        Some("build-plan") if args.len() == 8 && args[2] == "--auto" => {
-            let (target, recipe_dir, map_file, guix_store, scratch) =
-                (&args[3], &args[4], &args[5], &args[6], &args[7]);
+        // SEED-STORE or synthesis reds with `provenance rejected`, re #469). SEED-DB is
+        // the td-owned db those interns registered into — under strict provenance every
+        // staged closure item must be vouched for by it (or a prior step's td.db) and
+        // NAR-hash-match at the sandbox staging boundary.
+        // Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH
+        Some("build-plan") if args.len() == 9 && args[2] == "--auto" => {
+            let (target, recipe_dir, map_file, guix_store, seed_db, scratch) =
+                (&args[3], &args[4], &args[5], &args[6], &args[7], &args[8]);
             let bov = match builder_store_env() {
                 Ok(b) => b,
                 Err(e) => {
@@ -6404,7 +6478,7 @@ fn main() -> ExitCode {
                 }
             };
             let builder_store = bov.as_ref().map(|(p, s, d)| (p.as_str(), s.as_str(), d.as_str()));
-            match build_plan_auto(target, recipe_dir, map_file, guix_store, Path::new(scratch), builder_store) {
+            match build_plan_auto(target, recipe_dir, map_file, guix_store, seed_db, Path::new(scratch), builder_store) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build-plan --auto {target}: {e}");
@@ -6437,9 +6511,9 @@ fn main() -> ExitCode {
                 let scratch1 = Path::new(scratch).join("r1");
                 let scratch2 = Path::new(scratch).join("r2");
                 // Two independent builds of the same derivation.
-                let out1 = sandbox::build(&parsed, drv_path, &closure, &scratch1)
+                let out1 = sandbox::build(&parsed, drv_path, &closure, &scratch1, None)
                     .map_err(|e| e.to_string())?;
-                let out2 = sandbox::build(&parsed, drv_path, &closure, &scratch2)
+                let out2 = sandbox::build(&parsed, drv_path, &closure, &scratch2, None)
                     .map_err(|e| e.to_string())?;
                 let mut reproducible = true;
                 for (name, host1) in &out1 {
@@ -7687,6 +7761,69 @@ daemon build START (2/2 active)
             assert!(err.contains("provenance rejected"), "`{bad}': {err}");
             assert!(err.contains("not a canonical /td/store item"), "`{bad}': {err}");
         }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // build_plan gates EVERY lock entry by class before anything is staged or built
+    // (re #469): a hand-authored lock naming a host path as `seed` reds with
+    // `provenance rejected`, and a vendored-crate entry is inadmissible in a
+    // bootstrap plan outright. Verified red against the pre-gate build_plan, which
+    // copied any non-td-recipe-output path through unchanged.
+    #[test]
+    fn build_plan_rejects_host_path_and_crate_lock_entries() {
+        let d = std::env::temp_dir().join(format!("td-plan-gate-{}", std::process::id()));
+        let seeds = d.join("seed-store");
+        std::fs::create_dir_all(&seeds).unwrap();
+        std::fs::write(d.join("mes.json"), r#"{"name":"mes"}"#).unwrap();
+        for (lock_body, want) in [
+            ("bash /usr/bin/env seed\n", "provenance rejected"),
+            ("bash /gnu/store/aaa-bash seed\n", "provenance rejected"),
+            ("mes-source /gnu/store/bbb-mes.tar.gz source\n", "provenance rejected"),
+            ("itoa-1.0.11.crate /td/store/ccc-itoa.crate crate\n", "vendored crate"),
+        ] {
+            let lock = d.join("gate.lock");
+            std::fs::write(&lock, lock_body).unwrap();
+            let plan = d.join("gate.plan");
+            std::fs::write(
+                &plan,
+                format!("step {} {}\n", d.join("mes.json").display(), lock.display()),
+            )
+            .unwrap();
+            let err = build_plan(
+                &plan.to_string_lossy(),
+                &seeds.to_string_lossy(),
+                &d.join("seed.db").to_string_lossy(),
+                &d.join("scratch"),
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains(want), "lock `{lock_body}': {err}");
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // The provenance manifest's oracle round-trips: a registration written by
+    // write_output_db is read back by hashes_by_path with the exact recorded NAR
+    // hash — the same record realize_drv assembles the staging manifest from.
+    #[test]
+    fn output_db_hashes_round_trip_for_the_staging_manifest() {
+        let d = std::env::temp_dir().join(format!("td-manifest-db-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let reg = OutputReg {
+            store_path: "/td/store/aaa-mes-0.27.1".to_string(),
+            nar_hash: "sha256:deadbeef".to_string(),
+            nar_size: 7,
+            refs: vec![],
+            deriver: "/td/store/bbb-mes-0.27.1.drv".to_string(),
+        };
+        let db_path = d.join("td.db");
+        write_output_db(std::slice::from_ref(&reg), &db_path).unwrap();
+        let db = store_db_read::Db::open(std::fs::read(&db_path).unwrap()).unwrap();
+        let hashes = db.hashes_by_path().unwrap();
+        assert_eq!(
+            hashes.get("/td/store/aaa-mes-0.27.1").map(String::as_str),
+            Some("sha256:deadbeef")
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 

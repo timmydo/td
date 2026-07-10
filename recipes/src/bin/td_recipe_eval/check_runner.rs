@@ -601,6 +601,7 @@ impl RecipeCheckRunner {
             .arg(recipes)
             .arg(auto_map_s)
             .arg(path_str(&self.store)?)
+            .arg(path_str(&self.db)?)
             .arg(scratch);
         let out = cmd
             .output()

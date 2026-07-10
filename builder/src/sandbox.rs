@@ -188,16 +188,70 @@ pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
     }
 }
 
+/// The staged-input provenance manifest (re #469): canonical store path →
+/// expected NAR hash (`sha256:<hex>`), assembled by the planner from td-owned
+/// store DBs ONLY (interned-seed registrations, prior build-plan steps'
+/// td.dbs, the source/builder placement dbs). When a build carries one, every
+/// closure item must have a record and its on-disk bytes must hash to it — an
+/// unmanifested or tampered item refuses to stage. A caller-supplied store
+/// DIRECTORY is thereby a byte source, never an authority: the bytes bind only
+/// if a td-owned registration vouches for them.
+pub type StageManifest = std::collections::BTreeMap<String, String>;
+
+/// Stream-hash a tree/file in NAR form — `sha256:<hex>`, the `ValidPaths.hash`
+/// wire format every td store registration records.
+fn nar_hash_of(path: &Path) -> io::Result<String> {
+    struct W(crate::sha256::Sha256);
+    impl io::Write for W {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = W(crate::sha256::Sha256::new());
+    crate::nar::write_nar(&mut w, path)?;
+    Ok(format!("sha256:{}", crate::sha256::to_base16(&w.0.finalize())))
+}
+
+/// Verify ONE closure item against the provenance manifest — split out of
+/// `build` so the rejection paths unit-test without a namespace. Refuses (a)
+/// an item no td-owned db vouches for and (b) on-disk bytes that do not hash
+/// to the recorded NAR hash.
+pub fn verify_staged_item(
+    manifest: &StageManifest,
+    canonical: &str,
+    on_disk: &str,
+) -> io::Result<()> {
+    let Some(want) = manifest.get(canonical) else {
+        return Err(err(format!(
+            "provenance rejected: closure item {canonical} has no td-owned store-db record — refusing to stage it (re #469)"
+        )));
+    };
+    let got = nar_hash_of(Path::new(on_disk))?;
+    if got != *want {
+        return Err(err(format!(
+            "provenance rejected: closure item {canonical} (on disk {on_disk}) hashes {got} but its td-owned registration records {want} — refusing to stage tampered bytes (re #469)"
+        )));
+    }
+    Ok(())
+}
+
 /// Run the drv's builder inside the namespace sandbox. `closure` lists every
 /// store path the build may see (the staged store's contents); `scratch` is
-/// a writable host directory. On success returns (output name, host-side
-/// path under scratch/newstore) for every drv output, each verified to
-/// exist.
+/// a writable host directory. `manifest`, when present, is the #469 staging
+/// gate: every closure item is provenance-verified (`verify_staged_item`)
+/// BEFORE its bind target is staged. On success returns (output name,
+/// host-side path under scratch/newstore) for every drv output, each verified
+/// to exist.
 pub fn build(
     drv: &Derivation,
     drv_path: &str,
     closure: &[String],
     scratch: &Path,
+    manifest: Option<&StageManifest>,
 ) -> io::Result<Vec<(String, PathBuf)>> {
     if drv.platform != "x86_64-linux" {
         return Err(err(format!(
@@ -221,6 +275,9 @@ pub fn build(
         // CANONICAL is the store path the build SEES; ON-DISK is where to bind FROM
         // (== canonical for daemon-resident items, a td store dir for td-interned ones).
         let (canonical, on_disk) = split_closure_entry(entry);
+        if let Some(m) = manifest {
+            verify_staged_item(m, canonical, on_disk)?;
+        }
         let meta = fs::symlink_metadata(on_disk)
             .map_err(|e| err(format!("closure item {canonical} (on disk {on_disk}): {e}")))?;
         // BASENAME-keyed: a closure can span MULTIPLE store prefixes (/gnu/store deps +
@@ -954,6 +1011,43 @@ pub fn host_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The #469 staging gate, exercised at the unit level (no namespace needed):
+    // an item no td-owned db vouches for refuses to stage, tampered bytes refuse
+    // to stage, and vouched bytes pass. Verified red against the pre-manifest
+    // boundary, which bind-mounted any existing on-disk path a closure named.
+    #[test]
+    fn staging_rejects_unmanifested_and_tampered_items() {
+        let dir = std::env::temp_dir().join(format!("td-stage-verify-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let item = dir.join("aaa-tool-1.0");
+        fs::write(&item, b"trusted bytes").unwrap();
+        let on_disk = item.to_str().unwrap();
+        let canonical = "/td/store/aaa-tool-1.0";
+        let good_hash = nar_hash_of(&item).unwrap();
+
+        // No record at all → refused before any hashing.
+        let empty = StageManifest::new();
+        let err = verify_staged_item(&empty, canonical, on_disk).unwrap_err();
+        assert!(err.to_string().contains("no td-owned store-db record"), "{err}");
+
+        // A record whose hash the on-disk bytes do not match → refused.
+        let mut tampered = StageManifest::new();
+        tampered.insert(canonical.to_string(), "sha256:0000".to_string());
+        let err = verify_staged_item(&tampered, canonical, on_disk).unwrap_err();
+        assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
+
+        // The vouched bytes pass.
+        let mut vouched = StageManifest::new();
+        vouched.insert(canonical.to_string(), good_hash);
+        verify_staged_item(&vouched, canonical, on_disk).unwrap();
+
+        // …and stop passing the moment the bytes change under the same record.
+        fs::write(&item, b"tampered bytes").unwrap();
+        let err = verify_staged_item(&vouched, canonical, on_disk).unwrap_err();
+        assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn parse_mem_max_handles_suffixes_and_off_by_default() {
