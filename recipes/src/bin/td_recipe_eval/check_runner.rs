@@ -266,6 +266,12 @@ pub(crate) struct RecipeCheckRunner {
     recipes: PathBuf,
     scratch: PathBuf,
     force_cold: bool,
+    /// The REAL daemon runtime dir (`TD_DAEMON_DIR` or the OUTER
+    /// `$HOME/.td/build-daemon`), forwarded to spawned td-builders whose HOME
+    /// is re-pointed at the ladder work dir — the derived blessed-seed-db
+    /// lookup (re #469 round-8) keys on this dir, and without the forward it
+    /// would resolve under the ladder HOME where nothing was ever blessed.
+    daemon_dir: Option<String>,
 }
 
 struct RecipeNode {
@@ -313,6 +319,12 @@ impl RecipeCheckRunner {
         }
 
         let home = env::var_os("HOME").map(PathBuf::from);
+        let daemon_dir = match env::var("TD_DAEMON_DIR") {
+            Ok(v) if !v.trim().is_empty() => Some(v),
+            _ => home
+                .as_ref()
+                .map(|h| h.join(".td/build-daemon").display().to_string()),
+        };
         let chain_cache = match env::var("TD_CHECK_CHAIN_CACHE") {
             Ok(v) => v,
             Err(_) => home
@@ -347,6 +359,7 @@ impl RecipeCheckRunner {
             scratch,
             force_cold: chain_cache.is_empty()
                 && env::var_os("TD_RECIPE_CHECK_PRESERVE_WORK").is_none(),
+            daemon_dir,
         })
     }
 
@@ -681,8 +694,14 @@ impl RecipeCheckRunner {
             .env("TD_STORE_DIR", TD_STORE_DIR)
             .env("TD_BUILDER_PATH", &self.builder_path)
             .env("TD_BUILDER_STORE", builder_store)
-            .env("TD_BUILDER_DB", builder_db)
-            .arg("build-plan")
+            .env("TD_BUILDER_DB", builder_db);
+        // The derived blessed-seed-db lookup keys on the REAL daemon dir; the
+        // ladder HOME override above would otherwise re-point it at a dir
+        // where nothing was blessed (re #469 round-8).
+        if let Some(d) = &self.daemon_dir {
+            cmd.env("TD_DAEMON_DIR", d);
+        }
+        cmd.arg("build-plan")
             .arg("--auto")
             .arg(target)
             .arg(recipes)
@@ -1491,6 +1510,7 @@ mod tests {
             recipes: PathBuf::new(),
             scratch: tmp.join("scratch"),
             force_cold: false,
+            daemon_dir: None,
         };
 
         let got = runner.ladder_out_from(&current, "rust-toolchain").unwrap();

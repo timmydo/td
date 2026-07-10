@@ -1628,6 +1628,58 @@ pub fn run_stage0() -> Result<(), String> {
         &WATCH_PHASE,
     )?;
 
+    // Phases 12-23 of upstream's AMD64/kaem.run, driven directly (kaem.run
+    // itself is a bash wrapper; its whole job is these two kaem invocations
+    // plus the env block reproduced here). Full-kaem rebuilds M2-Planet from
+    // its C sources and builds M2-Mesoplanet, blood-elf, and get_machine into
+    // AMD64/bin; mescc-tools-extra then compiles the POSIX file tools (cp,
+    // chmod, mkdir, rm, replace, match, catm, untar, ungz, unbz2, unxz, wrap,
+    // sha256sum) with M2-Mesoplanet — the tools the mes/tcc rungs need so
+    // their build scripts stop depending on host coreutils (re #469).
+    let env_kv = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    };
+    let full_env = env_kv(&[
+        ("ARCH", "amd64"),
+        ("ARCH_DIR", "AMD64"),
+        ("BASE_ADDRESS", "0x00600000"),
+        ("BLOOD_FLAG", "--64"),
+        ("ENDIAN_FLAG", "--little-endian"),
+    ]);
+    run_cmd(
+        "./AMD64/bin/kaem",
+        &["--verbose", "--strict", "--file", "AMD64/mescc-tools-full-kaem.kaem"],
+        &cwd,
+        &full_env,
+        &WATCH_PHASE,
+    )?;
+    let extra_env = env_kv(&[
+        ("ARCH", "amd64"),
+        ("M2LIBC", "../M2libc"),
+        ("TOOLS", "../AMD64/bin"),
+        ("BINDIR", "../AMD64/bin"),
+        ("OPERATING_SYSTEM", "Linux"),
+        ("EXE_SUFFIX", ""),
+    ]);
+    let extra_cwd = tree.join("mescc-tools-extra");
+    run_cmd(
+        "../AMD64/bin/kaem",
+        &["--verbose", "--strict", "--file", "mescc-tools-extra.kaem"],
+        &extra_cwd.to_string_lossy(),
+        &extra_env,
+        &WATCH_PHASE,
+    )?;
+    // Upstream's own pinned answer file: every binary the chain produced must
+    // sha256-match the stage0-posix release's recorded hashes — the strongest
+    // output check available, and it runs with the just-built sha256sum.
+    run_cmd(
+        "./AMD64/bin/sha256sum",
+        &["-c", "amd64.answers"],
+        &cwd,
+        &[],
+        &WATCH_PHASE,
+    )?;
+
     // Install the built tool dirs — the exact paths the chain's downstream rungs
     // read ($tc/AMD64/bin/{M1,hex2,kaem}, $tc/AMD64/artifact/{M2,blood-elf-0,…}).
     for d in ["AMD64/bin", "AMD64/artifact"] {
@@ -1638,6 +1690,23 @@ pub fn run_stage0() -> Result<(), String> {
         "AMD64/bin/M1",
         "AMD64/bin/hex2",
         "AMD64/bin/kaem",
+        "AMD64/bin/M2-Planet",
+        "AMD64/bin/M2-Mesoplanet",
+        "AMD64/bin/blood-elf",
+        "AMD64/bin/get_machine",
+        "AMD64/bin/cp",
+        "AMD64/bin/chmod",
+        "AMD64/bin/mkdir",
+        "AMD64/bin/rm",
+        "AMD64/bin/replace",
+        "AMD64/bin/match",
+        "AMD64/bin/catm",
+        "AMD64/bin/untar",
+        "AMD64/bin/ungz",
+        "AMD64/bin/unbz2",
+        "AMD64/bin/unxz",
+        "AMD64/bin/wrap",
+        "AMD64/bin/sha256sum",
         "AMD64/artifact/M2",
         "AMD64/artifact/blood-elf-0",
         "AMD64/artifact/kaem-0",

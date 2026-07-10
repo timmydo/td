@@ -1947,6 +1947,21 @@ fn derived_bless_db(seed_dir: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// `derived_bless_db` with the SEED-DIR derived too (`daemon_seed_dir`: the
+/// operator env override or the declared seed-lock parent) — the ladder
+/// entrances (`build-plan`, `build-recipe`) take no seed-dir argv, and must
+/// not grow one for this: the whole point of the derived channel is that no
+/// caller input selects the db. The authority it adds is what vouches the
+/// control-plane builder's host-seed runtime closure (glibc/gcc-lib) in
+/// strict staging manifests.
+fn derived_bless_db_auto() -> Result<Option<String>, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+    match check_loop::daemon_seed_dir(&cwd) {
+        Some(seed_dir) => derived_bless_db(&seed_dir),
+        None => Ok(None),
+    }
+}
+
 /// (canonical store path, host output path). Run in a child process by `daemon-build`.
 fn daemon_realize_one(
     drv: &str,
@@ -3275,6 +3290,14 @@ fn build_plan(
     let mut built: BTreeMap<String, String> = BTreeMap::new();
     let mut td_dbs: Vec<(String, sandbox::InputOrigin)> =
         vec![(seed_db.to_string(), sandbox::InputOrigin::AuditedSeed)];
+    // The DERIVED blessed seed-closure db (re #469 round-8): vouches the
+    // control-plane builder's host-seed runtime closure (glibc/gcc-lib — the
+    // §5 toolchain td-builder itself links against until it self-hosts).
+    // Derived, never an argument; absent means that authority is simply not
+    // there and staging reds on any closure item that needed it.
+    if let Some(bless) = derived_bless_db_auto()? {
+        td_dbs.push((bless, sandbox::InputOrigin::BlessedSeedClosure));
+    }
     let store_prefix = store::store_dir();
 
     for raw in plan.lines() {
@@ -7236,6 +7259,13 @@ fn main() -> ExitCode {
                 if let Some(d) = &seed_db {
                     authenticate_seed_capture_db(d)?;
                     extra_dbs.push((d.clone(), sandbox::InputOrigin::AuditedSeed));
+                }
+                // The DERIVED blessed seed-closure db (re #469 round-8): the
+                // control-plane builder's own runtime closure (host glibc/
+                // gcc-lib until td-builder self-hosts) needs vouching in the
+                // strict manifest, and its authority is derived — never argv.
+                if let Some(bless) = derived_bless_db_auto()? {
+                    extra_dbs.push((bless, sandbox::InputOrigin::BlessedSeedClosure));
                 }
                 let recipe_json =
                     std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
