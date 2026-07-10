@@ -3605,14 +3605,18 @@ struct HostSandboxArgs {
     /// the host `/gnu/store` is NOT bound at all — the guix-byte-free VM substrate.
     store_at: Option<String>,
     /// `--store-item PATH` (repeatable): bind ONE store item (dir or file)
-    /// read-only at its own path — the loop's input-only store exposure
-    /// (`td-builder check` passes the resolved toolchain closure item by item;
-    /// no store DIRECTORY is ever mounted, mirroring the drv build jail's
-    /// staged-closure model). The store dir holding the mountpoints is a plain
-    /// dir on the sandbox's ephemeral tmpfs root — writable like the rest of
-    /// that tmpfs (gates create /td/store there the same way); each ITEM's
-    /// read-only remount is load-bearing.
-    store_items: Vec<String>,
+    /// read-only at its own path, and `--store-item-at SRC DEST` (repeatable):
+    /// bind SRC read-only at DEST — for items whose durable host home is not
+    /// their canonical store path (the td-built loop userland lives in a
+    /// loop-owned host dir but is hashed for, and must appear at, its
+    /// /td/store path). Together these are the loop's input-only store
+    /// exposure (`td-builder check` passes its declared input set item by
+    /// item; no store DIRECTORY is ever mounted, mirroring the drv build
+    /// jail's staged-closure model). The store dir holding the mountpoints is
+    /// a plain dir on the sandbox's ephemeral tmpfs root — writable like the
+    /// rest of that tmpfs (gates create /td/store there the same way); each
+    /// ITEM's read-only remount is load-bearing.
+    store_items: Vec<(String, Option<String>)>,
     /// `--no-daemon`: accepted for compatibility. The loop sandbox no longer binds
     /// the host daemon state in either mode.
     no_daemon: bool,
@@ -3628,7 +3632,7 @@ fn parse_host_sandbox_args(args: &[String]) -> Result<HostSandboxArgs, String> {
     let mut expose_cwd = false;
     let mut store_from: Option<String> = None;
     let mut store_at: Option<String> = None;
-    let mut store_items: Vec<String> = Vec::new();
+    let mut store_items: Vec<(String, Option<String>)> = Vec::new();
     let mut no_daemon = false;
     while i < args.len() && args[i] != "--" {
         match args[i].as_str() {
@@ -3653,7 +3657,14 @@ fn parse_host_sandbox_args(args: &[String]) -> Result<HostSandboxArgs, String> {
                 if i >= args.len() || args[i] == "--" {
                     return Err("--store-item needs a PATH".to_string());
                 }
-                store_items.push(args[i].clone());
+                store_items.push((args[i].clone(), None));
+            }
+            "--store-item-at" => {
+                if i + 2 >= args.len() || args[i + 1] == "--" || args[i + 2] == "--" {
+                    return Err("--store-item-at needs SRC and DEST".to_string());
+                }
+                store_items.push((args[i + 1].clone(), Some(args[i + 2].clone())));
+                i += 2;
             }
             other => return Err(format!("unknown flag `{other}'")),
         }
@@ -3664,7 +3675,7 @@ fn parse_host_sandbox_args(args: &[String]) -> Result<HostSandboxArgs, String> {
     }
     // args[i] is now "--" (or we ran off the end); the command follows it.
     if i >= args.len() || i + 1 >= args.len() {
-        return Err("usage: td-builder host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--store-item PATH]... [--no-daemon] -- CMD ARGS...".to_string());
+        return Err("usage: td-builder host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--store-item PATH]... [--store-item-at SRC DEST]... [--no-daemon] -- CMD ARGS...".to_string());
     }
     Ok(HostSandboxArgs {
         expose_cwd,
@@ -6548,13 +6559,17 @@ fn main() -> ExitCode {
         //                      loop substrate.
         //   --store-item PATH: bind ONE store item read-only at its own path
         //                      (repeatable). The loop's input-only exposure:
-        //                      `td-builder check` passes the resolved toolchain
-        //                      closure item by item, so NO store directory is
-        //                      ever mounted — only declared inputs, like the drv
+        //                      `td-builder check` passes its declared input set
+        //                      item by item, so NO store directory is ever
+        //                      mounted — only declared inputs, like the drv
         //                      build jail.
+        //   --store-item-at SRC DEST: like --store-item, but bound at DEST
+        //                      (repeatable) — the td-built loop userland's
+        //                      durable host copy appears at its canonical
+        //                      /td/store path.
         // Without --store-from/--store-item the sandbox binds no host store.
         // Usage:
-        //   host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--store-item PATH]... [--no-daemon] -- CMD ARGS...
+        //   host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--store-item PATH]... [--store-item-at SRC DEST]... [--no-daemon] -- CMD ARGS...
         Some("host-sandbox") if args.len() >= 4 => {
             let parsed = match parse_host_sandbox_args(&args) {
                 Ok(p) => p,
@@ -6583,13 +6598,14 @@ fn main() -> ExitCode {
                 // store-native harness) the host /gnu/store is then absent — the
                 // guix-byte-free loop substrate. /var/guix is never bound.
                 let mut binds = host_sandbox_base_binds(store_from.as_deref(), store_at.as_deref());
-                // Per-item store inputs (--store-item): each declared input bound
-                // READ-ONLY at its own path — the input-only exposure the loop
-                // uses instead of mounting any store directory.
-                for it in &store_items {
+                // Per-item store inputs (--store-item / --store-item-at): each
+                // declared input bound READ-ONLY at its own path (or the given
+                // DEST) — the input-only exposure the loop uses instead of
+                // mounting any store directory.
+                for (src, dest) in &store_items {
                     binds.push(sandbox::Bind {
-                        src: it.clone(),
-                        dest: None,
+                        src: src.clone(),
+                        dest: dest.clone(),
                         readonly: true,
                         ro_optional: false,
                     });
@@ -7427,22 +7443,28 @@ daemon build START (2/2 active)
         assert!(hs(&["--store-from", "--", "true"]).unwrap_err().contains("--store-from needs a DIR"));
         assert!(hs(&["--store-at", "--", "true"]).unwrap_err().contains("--store-at needs a DIR"));
         assert!(hs(&["--store-item", "--", "true"]).unwrap_err().contains("--store-item needs a PATH"));
+        assert!(hs(&["--store-item-at", "/src", "--", "true"]).unwrap_err().contains("--store-item-at needs SRC and DEST"));
         assert!(hs(&["--bogus", "--", "true"]).unwrap_err().contains("unknown flag"));
         // a `--` with no command after it is a usage error (no vacuous empty cmd).
         assert!(hs(&["--expose-cwd", "--"]).unwrap_err().contains("usage:"));
     }
 
-    // --store-item (the loop's input-only store exposure): repeatable, order
-    // preserved, and independent of --store-from (no store DIRECTORY implied).
+    // --store-item / --store-item-at (the loop's input-only store exposure):
+    // repeatable, order preserved, and independent of --store-from (no store
+    // DIRECTORY implied). --store-item-at carries a distinct in-sandbox DEST
+    // (the td-built userland's durable host copy appears at its /td/store path).
     #[test]
     fn host_sandbox_store_items_repeat_and_stay_directory_free() {
         let p = hs(&["--expose-cwd", "--no-daemon",
-                     "--store-item", "/gnu/store/aaa-bash-5.2",
-                     "--store-item", "/gnu/store/bbb-glibc-2.39",
+                     "--store-item", "/seed/store/aaa-rust-1.93.0",
+                     "--store-item-at", "/home/u/.td/loop/bbb-busybox-1.37.0",
+                                        "/td/store/bbb-busybox-1.37.0",
                      "--", "gate-run"])
             .expect("valid");
         assert_eq!(p.store_items,
-                   vec!["/gnu/store/aaa-bash-5.2", "/gnu/store/bbb-glibc-2.39"]);
+                   vec![("/seed/store/aaa-rust-1.93.0".to_string(), None),
+                        ("/home/u/.td/loop/bbb-busybox-1.37.0".to_string(),
+                         Some("/td/store/bbb-busybox-1.37.0".to_string()))]);
         assert_eq!(p.store_from, None, "per-item exposure implies no store-dir bind");
         assert_eq!(p.cmd, "gate-run");
     }

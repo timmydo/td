@@ -1592,9 +1592,16 @@ fn store_ns(root: &Path) -> Result<(), String> {
         .find(|l| l.contains("-bash-") && !l.contains("static"))
         .and_then(|l| l.split_once(' ').map(|(_, p)| p.trim().to_string()))
         .ok_or_else(|| String::from("FAIL: no bash in td-subst.lock"))?;
+    // The candidate dir for the closure scan is the lock entry's OWN store
+    // (its parent dir) — derived, never a hardcoded prefix.
+    let seed_scan = Path::new(&bash)
+        .parent()
+        .and_then(Path::to_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("FAIL: no store dir above {bash}"))?;
     let scan = tb_out(
         &tb,
-        &["store-closure-scan", "/gnu/store", &bash],
+        &["store-closure-scan", &seed_scan, &bash],
         "store-closure-scan",
     )?;
     let bs = scan
@@ -2476,14 +2483,16 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
 /// sandbox-hardening — behavioral self-tests that td's loop sandbox
 /// (`td-builder host-sandbox`) exposes only a MINIMAL /dev (no host device leak),
 /// REAPS its inner tree when the top td-builder is killed (PR_SET_PDEATHSIG),
-/// and mounts the store INPUT-ONLY (per-item read-only binds, never a whole
-/// store directory — the visible entry count is the loop's bounded closure,
+/// and exposes the store INPUT-ONLY (per-item read-only binds, never a whole
+/// store directory: /td/store holds exactly the loop's provisioned td-built
+/// userland items, the declared seed store holds the bounded seed-lock closure,
 /// and a bound item rejects writes).
-/// Port of tests/sandbox-hardening.sh (gate 272). Runs INSIDE the loop sandbox,
-/// so the nested td-builder's processes are visible in this PID namespace and a
-/// /proc cmdline scan confirms they are gone after the kill.
+/// Port of tests/sandbox-hardening.sh (gate 272). Runs INSIDE the loop sandbox
+/// under the td-built userland — sh IS the static busybox, so probes needing an
+/// applet outside its farm (sleep) exec the busybox binary with the applet name
+/// as its first argument. The nested td-builder's processes are visible in this
+/// PID namespace, so a /proc cmdline scan confirms they are gone after the kill.
 fn sandbox_hardening(root: &Path) -> Result<(), String> {
-    let _ = root;
     println!(
         ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak), \
          reaps its inner tree when killed, and exposes the store input-only"
@@ -2491,19 +2500,21 @@ fn sandbox_hardening(root: &Path) -> Result<(), String> {
     let tb = tb()?;
     println!(">> td-builder (stage0, guix-free): {}", tb.display());
 
-    let realbash = which_canon("bash").ok_or_else(|| String::from("FAIL: no bash on PATH"))?;
-    let realsleep = which_canon("sleep").ok_or_else(|| String::from("FAIL: no sleep on PATH"))?;
-    let realbash_s = path_str(&realbash)?;
-    let realsleep_s = path_str(&realsleep)?;
-    let sroot = store_root_for(&realbash_s)?;
-    let sleep_root = store_root_for(&realsleep_s)?;
-    if sroot != sleep_root {
-        return Err(format!(
-            "FAIL: bash and sleep resolved under different store roots: {realbash_s} / {realsleep_s}"
-        ));
-    }
+    // PATH's sh canonicalizes to the td-built static busybox (the applet farm
+    // symlinks at it) — one item is the whole userland the probes need, and
+    // being static it drags no library closure into the nested sandboxes.
+    let busybox = which_canon("sh").ok_or_else(|| String::from("FAIL: no sh on PATH"))?;
+    let busybox_s = path_str(&busybox)?;
+    let sroot = store_root_for(&busybox_s)?;
+    let sh_item = Path::new(&busybox_s)
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| format!("FAIL: no package root above {busybox_s}"))?;
+    let sh_item_s = path_str(sh_item)?;
 
-    // (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input absent.
+    // (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input
+    // absent. The nested sandbox binds ONLY the sh item — the same per-item
+    // input-only model the loop itself uses.
     println!(
         ">> (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input absent"
     );
@@ -2519,12 +2530,11 @@ exit 0
         &tb,
         &[
             "host-sandbox",
-            "--store-from",
-            &sroot,
-            "--store-at",
-            &sroot,
+            "--store-item",
+            &sh_item_s,
             "--",
-            &realbash_s,
+            &busybox_s,
+            "sh",
             "-c",
             dev_probe,
         ],
@@ -2533,26 +2543,23 @@ exit 0
     println!("   /dev exposes the standard nodes; kmsg/kvm/mem/disks/input are absent");
 
     // (C) input-only store exposure: the loop sandbox binds store ITEMS, never
-    // a store directory. A whole-store bind would expose the host's full store
-    // (hundreds of thousands of entries); the per-item closure is a few dozen
-    // to a few hundred. And a bound item is READ-ONLY (its ro-remount is
-    // load-bearing, sandbox::Bind), so a write into bash's own package must
+    // a store directory. /td/store holds exactly the provisioned userland
+    // items (a handful); the seed store holds the seed-lock closure (a few
+    // dozen to a few hundred) — never a whole host store (hundreds of
+    // thousands of entries). And a bound item is READ-ONLY (its ro-remount is
+    // load-bearing, sandbox::Bind), so a write into a bound package must
     // fail. Probed directly — this body already runs inside the loop sandbox.
-    println!(">> (C) input-only store: bounded item count, items read-only");
+    println!(">> (C) input-only store: bounded item counts, items read-only");
     let entries = std::fs::read_dir(&sroot)
         .map_err(|e| format!("FAIL: cannot read {sroot}: {e}"))?
         .count();
     if entries == 0 || entries > 4096 {
         return Err(format!(
-            "FAIL: {sroot} exposes {entries} entries — expected the loop's bounded per-item \
-             closure, not a whole-store bind"
+            "FAIL: {sroot} exposes {entries} entries — expected the loop's provisioned \
+             userland items, not a whole-store bind"
         ));
     }
-    let bash_item = Path::new(&realbash_s)
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| format!("FAIL: no package root above {realbash_s}"))?;
-    let probe = bash_item.join(".td-ro-probe");
+    let probe = sh_item.join(".td-ro-probe");
     if std::fs::File::create(&probe).is_ok() {
         let _ = std::fs::remove_file(&probe);
         return Err(format!(
@@ -2561,8 +2568,53 @@ exit 0
         ));
     }
     println!(
-        "   {sroot} exposes {entries} bound items (not the host store); bash's package rejects writes"
+        "   {sroot} exposes {entries} bound items; the sh package rejects writes"
     );
+    // The declared SEED store (whatever dir the seed locks name — derived,
+    // never hardcoded, exactly like the prelude derives it): also a bounded
+    // per-item closure, also read-only.
+    let lock_text =
+        std::fs::read_to_string(root.join("tests/td-seed-tools.lock")).unwrap_or_default();
+    let seed_item = lock_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .filter(|p| p.starts_with('/'))
+        .find(|p| Path::new(p).is_dir());
+    match seed_item {
+        Some(item) => {
+            let seed_dir = Path::new(item)
+                .parent()
+                .ok_or_else(|| format!("FAIL: no parent dir above the seed item {item}"))?;
+            let seed_entries = std::fs::read_dir(seed_dir)
+                .map_err(|e| format!("FAIL: cannot read {}: {e}", seed_dir.display()))?
+                .count();
+            if seed_entries == 0 || seed_entries > 4096 {
+                return Err(format!(
+                    "FAIL: {} exposes {seed_entries} entries — expected the loop's bounded \
+                     seed-lock closure, not a whole-store bind",
+                    seed_dir.display()
+                ));
+            }
+            let probe = Path::new(item).join(".td-ro-probe");
+            if std::fs::File::create(&probe).is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                return Err(format!(
+                    "FAIL: created {} — a bound seed item is WRITABLE inside the sandbox",
+                    probe.display()
+                ));
+            }
+            println!(
+                "   {} exposes {seed_entries} bound items (not the host store); {item} rejects writes",
+                seed_dir.display()
+            );
+        }
+        None => println!(
+            "   (no seed-lock item present in the sandbox — seed-store leg skipped, matching \
+             a seed-less prelude)"
+        ),
+    }
 
     // (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree.
     println!(">> (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree");
@@ -2570,16 +2622,15 @@ exit 0
     // duration, so it must be a large integer (≈ sleeps forever); derive it from
     // this process's pid (unique in this PID namespace, no RNG needed).
     let marker = (1_000_000u64 + u64::from(std::process::id()) % 1_000_000).to_string();
-    let inner = format!("{realsleep_s} {marker} & {realsleep_s} {marker} & wait");
+    let inner = format!("{busybox_s} sleep {marker} & {busybox_s} sleep {marker} & wait");
     let mut child = Command::new(&tb)
         .args([
             "host-sandbox",
-            "--store-from",
-            &sroot,
-            "--store-at",
-            &sroot,
+            "--store-item",
+            &sh_item_s,
             "--",
-            &realbash_s,
+            &busybox_s,
+            "sh",
             "-c",
             &inner,
         ])
@@ -3025,7 +3076,7 @@ mod tests {
         std::fs::write(bin.join("td-builder"), b"#!bin\n").unwrap();
         std::fs::write(
             base.join(".stage0-meta"),
-            "fingerprintline\n/gnu/store/abc123-td-builder-0.1.0\n",
+            "fingerprintline\n/td/store/abc123-td-builder-0.1.0\n",
         )
         .unwrap();
         let s0 = stage0_from_memo(&root).expect("memo");
@@ -3142,7 +3193,8 @@ input aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gcc-14.3.
     #[test]
     fn store_root_for_takes_the_first_component_store() {
         assert_eq!(store_root_for("/td/store/abc-bash/bin/bash").unwrap(), "/td/store");
-        assert_eq!(store_root_for("/gnu/store/abc-sleep/bin/sleep").unwrap(), "/gnu/store");
+        // First-component agnostic: any /<x>/store root derives, none is hardcoded.
+        assert_eq!(store_root_for("/seed/store/abc-sleep/bin/sleep").unwrap(), "/seed/store");
         assert!(store_root_for("/not-a-store-path").is_err());
         assert!(store_root_for("relative/store/x").is_err());
     }

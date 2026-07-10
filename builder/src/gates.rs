@@ -32,8 +32,9 @@
 //! mk/gates/*.mk fragments carried, and the compiler enforces the structure a
 //! parser used to check — a malformed gate is a build error, never a mis-run.
 //!
-//! A GateDef's `script` is PLAIN BASH (no make escaping), executed as one
-//! `bash -c` with cwd = repo root. (The remaining deferred corpus/seed gates
+//! A GateDef's `script` is PLAIN POSIX SHELL (no make escaping), executed as
+//! one `sh -c` with cwd = repo root — inside the loop sandbox `sh` is the
+//! td-built busybox ash, so no bashisms. (The remaining deferred corpus/seed gates
 //! realize their guix-built seed by calling host `guix` directly — the seed
 //! bytes retire last per the north star / #412.) Output is buffered per gate
 //! (`--output-sync=target`
@@ -161,7 +162,7 @@ pub struct GateDef {
     /// cannot satisfy that is not blocked by them, while a host that can still
     /// runs and covers them normally.
     pub non_blocking: bool,
-    /// The gate body: plain bash, run as one `bash -c` from the repo root.
+    /// The gate body: plain POSIX shell, run as one `sh -c` from the repo root.
     pub script: &'static str,
 }
 
@@ -173,7 +174,7 @@ mod registry {
 struct Gate {
     name: String,
     pools: Vec<Pool>,
-    /// The plain-bash body (everything after `run:`), executed as one `bash -c`.
+    /// The plain-shell body (everything after `run:`), executed as one `sh -c`.
     body: String,
     /// Ordering prerequisites (gate names). All gates are phony, so make's old
     /// normal-vs-order-only (`|`) distinction collapses to "runs before".
@@ -280,10 +281,10 @@ fn load() -> Result<GateSet, String> {
             return Err(format!("gate-run: gate `{}` is in no pool", def.name));
         }
         // Empty script ⟺ native (typed-Rust) gate (#318 axis 3): a native gate
-        // carries no bash and is run via `td-builder gate-body <name>`; a bash
+        // carries no shell and is run via `td-builder gate-body <name>`; a shell
         // gate must carry a script. Mismatch either way is a load-time error, so
         // a typo (empty script with no registered body, or a body-registered
-        // gate that still ships bash) can never silently no-op.
+        // gate that still ships shell) can never silently no-op.
         let native = crate::gate_bodies::is_native(def.name);
         if def.script.trim().is_empty() != native {
             return Err(if native {
@@ -360,7 +361,7 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
     let br = Gate {
         name: BUILD_RECIPES.to_string(),
         pools: Vec::new(),
-        body: "bash tests/build-recipes.sh".to_string(),
+        body: "sh tests/build-recipes.sh".to_string(),
         deps: last_cheap.iter().cloned().collect(),
         extra_env: vec![("TD_BUILD_SPECS".to_string(), set.build_specs.join(" "))],
         specs: Vec::new(),
@@ -887,7 +888,7 @@ fn timing_event(log: Option<&Path>, gate: &str, kind: &str) {
     }
 }
 
-/// Run one gate's body under `bash -c` (through `prlimit --data` when a
+/// Run one gate's body under `sh -c` (through `prlimit --data` when a
 /// per-process memory cap is configured), stdout+stderr appended in order to
 /// LOG_PATH (the per-gate output buffer). Returns success.
 /// Sum the resident bytes of every process in PGID's process group
@@ -1005,12 +1006,12 @@ fn run_gate(
         _ => None,
     };
     // A native (typed-Rust) gate carries an empty body: run it as `<current_exe>
-    // gate-body <name>` instead of `bash -c <script>` (#318 axis 3). Same
+    // gate-body <name>` instead of `sh -c <script>` (#318 axis 3). Same
     // wrapper (prlimit/cgroup/pgroup/env); the native body self-moves into the
-    // gate cgroup itself (gate_bodies::cli), so the bash cgroup prelude — which
-    // is bash-only — is skipped for it.
+    // gate cgroup itself (gate_bodies::cli), so the shell cgroup prelude — which
+    // is shell-only — is skipped for it.
     let native = g.body.trim().is_empty();
-    // The enter path travels via env, NEVER interpolated into the bash text:
+    // The enter path travels via env, NEVER interpolated into the shell text:
     // an env-derived run dir containing a quote would otherwise escape the
     // quoting and execute as code (review finding).
     let body = match &gate_cg {
@@ -1033,7 +1034,7 @@ fn run_gate(
             (Ok(o), Ok(e)) => (o, e),
             _ => return false,
         };
-        // The inner program is `bash -c <body>` (bash gate) or `<self> gate-body
+        // The inner program is `sh -c <body>` (shell gate) or `<self> gate-body
         // <name>` (native gate); prlimit --data wraps either when mem_mib > 0.
         let mut cmd = if mem_mib > 0 {
             let mut c = std::process::Command::new("prlimit");
@@ -1041,7 +1042,7 @@ fn run_gate(
             if native {
                 c.arg(&self_exe).arg("gate-body").arg(&g.name);
             } else {
-                c.arg("bash").arg("-c").arg(&body);
+                c.arg("sh").arg("-c").arg(&body);
             }
             c
         } else if native {
@@ -1049,7 +1050,7 @@ fn run_gate(
             c.arg("gate-body").arg(&g.name);
             c
         } else {
-            let mut c = std::process::Command::new("bash");
+            let mut c = std::process::Command::new("sh");
             c.arg("-c").arg(&body);
             c
         };
@@ -2118,14 +2119,14 @@ mod tests {
         // TD_GATE_INPUT_<NAME> and asserts it equals the lock's entry.
         let d = tmpdir("inputs-env");
         const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /gnu/store/{H}-make-4.4.1\n"))
+        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /td/store/{H}-make-4.4.1\n"))
             .unwrap();
         let mut set = synth(
             &d,
             &[(
                 "uses-input",
                 Pool::Cheap,
-                "test \"$TD_GATE_INPUT_MAKE\" = \"/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-make-4.4.1\" && touch {D}/env.ok",
+                "test \"$TD_GATE_INPUT_MAKE\" = \"/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-make-4.4.1\" && touch {D}/env.ok",
                 &[],
             )],
         );
@@ -2145,7 +2146,7 @@ mod tests {
         // does not carry) fails the gate BEFORE the body starts.
         let d = tmpdir("inputs-red");
         const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /gnu/store/{H}-make-4.4.1\n"))
+        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /td/store/{H}-make-4.4.1\n"))
             .unwrap();
         let mut set = synth(&d, &[("bad-input", Pool::Cheap, "touch {D}/ran", &[])]);
         let gi = *set.index.get("bad-input").unwrap();

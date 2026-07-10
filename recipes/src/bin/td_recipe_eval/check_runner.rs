@@ -296,8 +296,9 @@ impl RecipeCheckRunner {
 
     fn setup_pinsum(&self) -> Result<String, String> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"ladder-setup-v6\n");
+        bytes.extend_from_slice(b"ladder-setup-v7\n");
         append_file_bytes(&self.root.join("tests/td-subst.lock"), &mut bytes)?;
+        append_file_bytes(&self.root.join("tests/td-seed-tools.lock"), &mut bytes)?;
         for pin in source_pins::all() {
             bytes.extend_from_slice(pin.key.as_bytes());
             bytes.push(b'\t');
@@ -314,17 +315,22 @@ impl RecipeCheckRunner {
         sha256sum(&bytes)
     }
 
+    /// Resolve a build-scaffolding tool to its package root — through the
+    /// DECLARED seed only: the seed-tools lock (the recipe rungs' pinned
+    /// scaffolding), then the td-subst lock (its pinned build closure), then
+    /// PATH (which inside the loop sandbox is the td-built userland — the only
+    /// tools there are declared ones). Host store discovery is forbidden: the
+    /// loop sandbox is input-only (builder/src/check_loop.rs), so anything a
+    /// scavenge could find would be an undeclared dependency.
     fn tool_root(&self, name: &str, probe: &str) -> Result<PathBuf, String> {
-        let mut lock_cmd = self.builder_command();
-        lock_cmd
-            .arg("lock")
-            .arg("path")
-            .arg("tests/td-subst.lock")
-            .arg(name);
-        if let Ok(out) = command_output(&mut lock_cmd, "td-builder lock path") {
-            let path = PathBuf::from(out.trim());
-            if is_executable(&path.join("bin").join(probe)) {
-                return Ok(path);
+        for lock in ["tests/td-seed-tools.lock", "tests/td-subst.lock"] {
+            let mut lock_cmd = self.builder_command();
+            lock_cmd.arg("lock").arg("path").arg(lock).arg(name);
+            if let Ok(out) = command_output(&mut lock_cmd, "td-builder lock path") {
+                let path = PathBuf::from(out.trim());
+                if is_executable(&path.join("bin").join(probe)) {
+                    return Ok(path);
+                }
             }
         }
 
@@ -337,30 +343,9 @@ impl RecipeCheckRunner {
             }
         }
 
-        let mut candidates = Vec::new();
-        if let Ok(entries) = fs::read_dir("/gnu/store") {
-            for entry in entries {
-                let entry = entry.map_err(|e| format!("read /gnu/store entry: {e}"))?;
-                let root = entry.path();
-                let base = match root.file_name().and_then(|b| b.to_str()) {
-                    Some(b) => b,
-                    None => continue,
-                };
-                let normal = format!("-{name}-");
-                let minimal = format!("-{name}-minimal-");
-                if (base.contains(&normal) || base.contains(&minimal))
-                    && is_executable(&root.join("bin").join(probe))
-                {
-                    candidates.push(root);
-                }
-            }
-        }
-        candidates.sort();
-        if let Some(root) = candidates.first() {
-            return Ok(root.clone());
-        }
         Err(format!(
-            "ladder: cannot resolve the {name} package (probe {probe}) - not in tests/td-subst.lock, not on PATH, no /gnu/store/*-{name}-* on this host"
+            "ladder: cannot resolve the {name} package (probe {probe}) - not in \
+             tests/td-seed-tools.lock or tests/td-subst.lock, not on PATH"
         ))
     }
 
@@ -674,10 +659,9 @@ impl RecipeCheckRunner {
         })
     }
 
-    // MIRRORED by the loop prelude's RECIPE_HOST_TOOLS (builder/src/check_loop.rs):
-    // the input-only loop sandbox binds only what the prelude resolves, so a tool
-    // added here must be added there too or tool_root's in-sandbox scavenge will
-    // never see the package.
+    // A tool named here must also be pinned in tests/td-seed-tools.lock (the
+    // declared seed tool_root resolves through) or the input-only loop sandbox
+    // will not have it bound.
     fn host_tool_probe<'a>(&self, name: &'a str) -> Option<&'a str> {
         match name {
             "coreutils" => Some("ls"),
@@ -709,6 +693,41 @@ impl RecipeCheckRunner {
             Some(pin) => Ok(Some(pin)),
             None => Ok(None),
         }
+    }
+
+    /// The seed store DIR build-plan content-scans for the closure of seed
+    /// inputs — DERIVED from the resolved tools.map roots (their unique
+    /// parent), never a hardcoded prefix. tools.map records what the declared
+    /// locks actually resolved to, so its parent IS the store the seed items'
+    /// references point into; a lock re-captured on another host derives that
+    /// host's store with no code change.
+    fn seed_scan_dir(&self) -> Result<String, String> {
+        let map = self.lw.join("tools.map");
+        let contents =
+            fs::read_to_string(&map).map_err(|e| format!("read {}: {e}", map.display()))?;
+        let mut dirs: Vec<String> = Vec::new();
+        for line in contents.lines() {
+            let Some((_, path)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some(parent) = Path::new(path.trim()).parent() else {
+                continue;
+            };
+            let d = parent.display().to_string();
+            if !d.is_empty() && d != "/" && !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        if dirs.len() > 1 {
+            eprintln!(
+                "ladder: WARNING: tools.map roots span {} store dirs ({}); scanning only the first",
+                dirs.len(),
+                dirs.join(" ")
+            );
+        }
+        dirs.into_iter().next().ok_or_else(|| {
+            "ladder: no resolved tool roots in tools.map to derive the seed scan dir".to_string()
+        })
     }
 
     pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
@@ -744,7 +763,7 @@ impl RecipeCheckRunner {
             .arg(target)
             .arg(recipes)
             .arg(auto_map_s)
-            .arg("/gnu/store")
+            .arg(self.seed_scan_dir()?)
             .arg(scratch);
         let out = cmd
             .output()
@@ -907,10 +926,17 @@ fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
         if patch.is_empty() {
             return Err(format!("ladder: malformed patch input `{key}'"));
         }
-        return Ok(Some(SeedInput::Patch {
-            key: key.to_string(),
-            patch: patch.to_string(),
-        }));
+        // A pinned source whose key happens to start with `patch-` (the GNU
+        // patch program's own `patch-mesboot-source`) is a Source, not a
+        // seed/patches/*.patch file — the pin table wins over the prefix
+        // convention. Warm hosts never hit this (the src map short-circuits
+        // before intern_patch); a cold host fails the whole chain on it.
+        if source_pins::by_key(key).is_none() {
+            return Ok(Some(SeedInput::Patch {
+                key: key.to_string(),
+                patch: patch.to_string(),
+            }));
+        }
     }
     Ok(None)
 }
@@ -1261,6 +1287,23 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_patch_prefixed_source_is_a_source_not_a_seed_patch() {
+        // `patch-mesboot-source` pins the GNU patch PROGRAM's tarball; the
+        // `patch-` prefix convention must not shadow it into a (nonexistent)
+        // seed/patches/mesboot-source.patch — that broke every cold-host
+        // chain build at the first mesboot rung.
+        assert!(special_seed_input("patch-mesboot-source")
+            .unwrap()
+            .is_none());
+        match special_seed_input("patch-binutils-boot-2.20.1a").unwrap() {
+            Some(SeedInput::Patch { patch, .. }) => {
+                assert_eq!(patch, "binutils-boot-2.20.1a")
+            }
+            _ => panic!("expected the binutils-boot seed patch input"),
+        }
+    }
 
     #[test]
     fn recipe_closure_is_derived_from_catalog_edges() {

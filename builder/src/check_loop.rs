@@ -8,14 +8,16 @@
 //! rationale comments live with each step):
 //!   1. the netns-probe discrimination check,
 //!   2. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   3. the loop PATH: host-provided tools from `LOOP_TOOLCHAIN`,
+//!   3. the loop userland: td-BUILT busybox + make from the recipe graph
+//!      (`provision_userland`) — host tools are forbidden,
 //!   4. the warm prelude (subst store, source/crate warms, build daemon),
 //!   5. the machine-wide slot dir, and
 //!   6. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon
-//!      --store-item ITEM… -- TB gate-run. The sandbox mounts NO store
-//!      directory: only the loop's declared input ITEMS — the resolved
-//!      toolchain closure (`loop_store_items`) — each bound read-only at its
-//!      own path, the drv build jail's input-only model.
+//!      --store-item ITEM… --store-item-at SRC DEST… -- TB gate-run. The
+//!      sandbox mounts NO store directory: only the loop's declared inputs —
+//!      the seed-lock closure (`loop_store_items`) at its own paths and the
+//!      td-built userland at /td/store — each bound read-only, the drv build
+//!      jail's input-only model.
 //!
 //! (The host-guix == pinned-channel integrity guard that used to run `guix
 //! describe` was removed in #406 — it only warned on drift, so dropping it is
@@ -160,177 +162,239 @@ fn current_binary_native_applet_path(root: &Path) -> Result<String, String> {
         .map_err(|e| fatal(&format!("could not provision stage0 native applets ({e})")))
 }
 
-/// The host store prefix the loop toolchain must resolve under. The loop
-/// sandbox never mounts this (or any) store DIRECTORY: the prelude computes
-/// the resolved toolchain's runtime closure (`loop_store_items`) and binds
-/// each closure ITEM read-only at its own path (`--store-item`), and binds
-/// NOTHING else of the host FS (no /usr, /bin, /home). A toolchain bin dir is
-/// therefore reachable INSIDE the sandbox only if it physically lies under
-/// this prefix — a `/usr/bin` tool on a foreign-distro guix host would vanish.
-const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
+/// td's own store prefix — where the loop userland's items are hashed for and
+/// must appear inside the sandbox (the recipe graph builds everything with
+/// `TD_STORE_DIR=/td/store`). The loop never mounts a store DIRECTORY and
+/// never resolves a tool from the host: its userland is td-BUILT
+/// (`LOOP_USERLAND_STEMS`), and the only other store bytes it exposes are the
+/// DECLARED seed-lock closures (`seed_lock_roots`) — each bound read-only,
+/// item by item, at its own path.
+const TD_STORE_DIR: &str = "/td/store";
 
-/// The loop toolchain: the host-PATH tools the loop sandbox needs to run its
-/// gate bodies (make/sh/…). A list of representative BINARIES, one per package —
-/// resolving `env` gives the whole coreutils bin dir. sed/grep/findutils are
-/// deliberately absent; loop checks must use td-builder typed helpers or
-/// td-built userland instead. tar/gzip are absent too: no gate body spawns
-/// them — loop-level unpacking is td-builder's own native tar.rs/gzip.rs, and
-/// the drv-sandbox tar runs from a derivation's DECLARED inputs, never this
-/// PATH. Native loop applets for syscall-only host tools (`mount --bind`,
-/// `flock`) are provided by td-builder itself and prepended by
-/// `loop_path_with_native_applets`.
-const LOOP_TOOLCHAIN: &[&str] = &["make", "bash", "sh", "env"];
+/// The td-built loop userland: the recipe stems whose outputs provide every
+/// process-driving tool on the loop sandbox PATH. `busybox-x86-64` (static; sh,
+/// env, ls, sed, grep, awk, tar, gzip, cat, …) and `make-x86-64` (static GNU
+/// make) are built FROM SOURCE by the recipe chain (stage0 → mes → tcc → … →
+/// gcc-x86-64-native). Being static they carry no runtime closure — two items
+/// are the whole userland. bash and the GNU text tools are deliberately NOT
+/// here: gate bodies run under busybox sh, and recipe BUILD scaffolding comes
+/// from the declared seed locks (tests/td-seed-tools.lock), never the loop
+/// PATH.
+const LOOP_USERLAND_STEMS: &[&str] = &["busybox-x86-64", "make-x86-64"];
 
-/// The resolved loop toolchain: the sandbox PATH (deduped in-store bin dirs,
-/// colon-joined) plus the store ITEMS those dirs live under — the closure
-/// ROOTS `loop_store_items` expands into the sandbox's per-item binds.
-struct LoopToolchain {
+/// The resolved loop userland: `(durable host copy, canonical /td/store item
+/// path)` per stem — the `--store-item-at` binds — plus the colon-joined
+/// in-sandbox bin dirs that become the sandbox PATH.
+struct LoopUserland {
+    items: Vec<(String, String)>,
     path: String,
-    roots: Vec<String>,
 }
 
-/// The core loop toolchain, resolved from the HOST PATH: the host brings
-/// only the base process-driving tools (the "check the right tools are on $PATH"
-/// model), exactly as it already brings the rust/cc toolchain the stage0 seed
-/// build resolves via tools/provision-{rust,cc}.sh — no `guix shell` subprocess.
-/// For each expected tool in `LOOP_TOOLCHAIN` we find it on PATH and
-/// CANONICALIZE to its real bin dir. Canonicalization + the store-prefix check
-/// matter — the loop sandbox binds ONLY the resolved toolchain's closure items
-/// (under SANDBOX_STORE_PREFIX) over a fresh tmpfs, so a profile-symlink dir
-/// (~/.guix-home/profile/bin) OR a distro dir (/usr/bin on a Debian+guix host)
-/// would not resolve inside; only the real `/gnu/store/<pkg>/bin` target does.
-/// The deduped in-store dirs become the sandbox PATH; their store items become
-/// closure roots.
+/// The durable home of the loop userland's host copies + its resolution map:
+/// `$TD_DAEMON_DIR|~/.td/build-daemon/loop-userland`. Recipe builds
+/// materialize outputs in per-run scratch dirs, so the prelude copies the
+/// resolved items here once and reuses them until the map goes stale.
+fn loop_userland_dir() -> Result<PathBuf, String> {
+    let base = match std::env::var("TD_DAEMON_DIR") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var("HOME").map_err(|_| s("no HOME for TD_DAEMON_DIR"))?;
+            Path::new(&home).join(".td/build-daemon")
+        }
+    };
+    Ok(base.join("loop-userland"))
+}
+
+/// Resolve the td-built loop userland, provisioning it if needed.
 ///
-/// A tool that is ABSENT from the host PATH, or that resolves OUTSIDE the bound
-/// store (so it would vanish inside the sandbox), is reported in one loud warning
-/// line (a misconfigured runner is visible) but is NOT fatal for a heavy-only
-/// tool: the gate that needs it fails loudly, exactly as the best-effort warms
-/// let their gates enforce presence — a host missing mount must still run
-/// check-engine/check-pr. (With the list currently equal to the core set, the
-/// heavy-only warn branch is vacuous; it is the contract for the next heavy
-/// addition, not a live path.) Fatal ONLY when a CORE tool (sh/bash/make/env) failed
-/// to resolve to an in-store bin dir — without those no gate body runs at all,
-/// and that fatal is a `CheckError::Unprovisioned`, so `cli()` exits
-/// `EXIT_UNPROVISIONED`: the machine signal `td-builder daily` reads to classify
-/// this as a runner-provisioning gap rather than a code regression.
-fn provision_toolchain() -> Result<LoopToolchain, CheckError> {
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    let mut dirs: Vec<String> = Vec::new();
-    let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut missing: Vec<&str> = Vec::new(); // not on PATH at all
-    let mut off_store: Vec<&str> = Vec::new(); // on PATH but NEVER under the bound store
-    for &t in LOOP_TOOLCHAIN {
-        // Scan EVERY PATH entry for the tool and take the FIRST whose REAL dir is under the
-        // store the sandbox binds — not just the first PATH hit. On a guix-on-foreign-distro
-        // host /usr/bin/env may precede the in-store env; the first hit is off-store but a
-        // usable in-store copy is later on PATH, so stopping at the first match would
-        // false-fatal a loop the sandbox could actually run. A dir the sandbox never exposes
-        // is worse than useless (Ok now, `command not found` for every gate later).
-        let mut found_on_path = false;
-        let mut in_store: Option<String> = None;
-        for dir in path_var.split(':').filter(|d| !d.is_empty()) {
-            let p = Path::new(dir).join(t);
-            if !p.is_file() {
-                continue;
-            }
-            found_on_path = true;
-            if let Some(real) = std::fs::canonicalize(&p)
-                .ok()
-                .and_then(|c| c.parent().map(|d| d.display().to_string()))
-            {
-                if real.starts_with(SANDBOX_STORE_PREFIX) {
-                    in_store = Some(real);
-                    break;
-                }
-            }
-        }
-        match in_store {
-            Some(dir) => {
-                resolved.insert(t);
-                if !dirs.contains(&dir) {
-                    dirs.push(dir); // dedupe (e.g. sh + bash share one bin dir)
-                }
-            }
-            None if found_on_path => off_store.push(t),
-            None => missing.push(t),
-        }
+/// Warm path: `loop-userland.map` (lines `STEM <item-basename>`) names a host
+/// copy under `loop_userland_dir()` for every stem, each with an existing
+/// `bin/` — a few stats.
+///
+/// Cold path: run `td-recipe-eval build-run busybox-x86-64 <stems…>`, which
+/// realizes the recipe chain (replayed from the warm chain cache when
+/// provisioned; built from the seed when not — that first build is the
+/// long one and says so loudly), then copy each `TD_RECIPE_RUN_OUT` item into
+/// the durable dir and rewrite the map atomically. td-recipe-eval itself
+/// resolves via `TD_RECIPE_EVAL` or the build-recipes prelude's sentinel; a
+/// host with neither is a provisioning gap (`CheckError::Unprovisioned`), not
+/// a code regression.
+fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
+    let dir = loop_userland_dir().map_err(|e| CheckError::Fatal(fatal(&e)))?;
+    let map_path = dir.join("loop-userland.map");
+    if let Some(ul) = read_userland_map(&dir, &map_path) {
+        return Ok(ul);
     }
-    // Core tools every gate body needs — checked against what ACTUALLY resolved to
-    // an in-store dir (mere presence on PATH is not enough: a /usr/bin bash is
-    // invisible inside the sandbox). A host without them cannot run the loop.
-    for core in ["sh", "bash", "make", "env"] {
-        if !resolved.contains(core) {
-            return Err(CheckError::Unprovisioned(fatal(&format!(
-                "loop toolchain: core tool `{core}` did not resolve to a path under \
-                 {SANDBOX_STORE_PREFIX} on the host PATH — the loop sandbox exposes only \
-                 the resolved toolchain's store items (not /usr/bin etc.), so the base \
-                 userland (bash/coreutils/make) must be on PATH FROM there, e.g. a guix \
-                 profile. host-brings-the-tools; LOOP_TOOLCHAIN in check_loop.rs"
-            ))));
-        }
+
+    let eval = resolve_recipe_eval_bin(root).map_err(CheckError::Unprovisioned)?;
+    eprintln!(
+        "td-builder check: provisioning the td-built loop userland ({}) via the recipe \
+         chain — a warm chain cache replays in minutes; a cold host builds the bootstrap \
+         chain from the seed first (hours, once)",
+        LOOP_USERLAND_STEMS.join(" ")
+    );
+    let mut cmd = Command::new(&eval);
+    cmd.arg("build-run").arg("busybox-x86-64");
+    for stem in LOOP_USERLAND_STEMS {
+        cmd.arg(stem);
     }
-    if !missing.is_empty() || !off_store.is_empty() {
-        let mut why = String::new();
-        if !missing.is_empty() {
-            why.push_str(&format!("not on PATH: {}", missing.join(" ")));
-        }
-        if !off_store.is_empty() {
-            if !why.is_empty() {
-                why.push_str("; ");
-            }
-            why.push_str(&format!(
-                "on PATH but outside {SANDBOX_STORE_PREFIX} (invisible in the sandbox): {}",
-                off_store.join(" ")
-            ));
-        }
-        eprintln!(
-            "td-builder check: loop toolchain: {} heavy-only tool(s) unavailable ({why}); \
-             the gates that need them will fail loudly — expose them under \
-             {SANDBOX_STORE_PREFIX} on the runner PATH (host-brings-the-tools; \
-             LOOP_TOOLCHAIN in check_loop.rs)",
-            missing.len() + off_store.len()
-        );
+    let out = cmd
+        .current_dir(root)
+        .output()
+        .map_err(|e| fatal(&format!("could not run {eval} build-run: {e}")))?;
+    if !out.status.success() {
+        let tail: Vec<&str> = std::str::from_utf8(&out.stderr)
+            .unwrap_or("")
+            .lines()
+            .rev()
+            .take(8)
+            .collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        return Err(CheckError::Fatal(fatal(&format!(
+            "loop userland build failed (td-recipe-eval build-run busybox-x86-64):\n{}",
+            tail.join("\n")
+        ))));
     }
-    if dirs.is_empty() {
-        return Err(CheckError::Unprovisioned(fatal(
-            "loop toolchain: no expected tool resolved to an in-store bin dir on the host PATH",
-        )));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| fatal(&format!("mkdir {}: {e}", dir.display())))?;
+    let mut map = String::new();
+    for stem in LOOP_USERLAND_STEMS {
+        let prefix = format!("TD_RECIPE_RUN_OUT {stem} ");
+        let built = stdout
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .map(str::trim)
+            .ok_or_else(|| {
+                fatal(&format!(
+                    "loop userland: build-run reported no output path for {stem}"
+                ))
+            })?;
+        let base = Path::new(built)
+            .file_name()
+            .and_then(|b| b.to_str())
+            .ok_or_else(|| fatal(&format!("loop userland: unusable output path {built}")))?;
+        let durable = dir.join(base);
+        // Refresh the durable copy via a scratch dir + rename so a killed
+        // prelude never leaves a half-copied userland behind the map's back.
+        let tmp = dir.join(format!(".tmp.{base}.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        copy_tree_preserving(Path::new(built), &tmp)
+            .map_err(|e| fatal(&format!("loop userland: copy {built}: {e}")))?;
+        let _ = std::fs::remove_dir_all(&durable);
+        std::fs::rename(&tmp, &durable)
+            .map_err(|e| fatal(&format!("loop userland: place {}: {e}", durable.display())))?;
+        map.push_str(&format!("{stem} {base}\n"));
     }
-    let mut roots: Vec<String> = Vec::new();
-    for d in &dirs {
-        if let Some(item) = store_item_of(d) {
-            if !roots.contains(&item) {
-                roots.push(item);
-            }
-        }
-    }
-    Ok(LoopToolchain {
-        path: dirs.join(":"),
-        roots,
+    let tmp_map = map_path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp_map, &map).map_err(|e| fatal(&format!("write loop-userland.map: {e}")))?;
+    std::fs::rename(&tmp_map, &map_path)
+        .map_err(|e| fatal(&format!("place loop-userland.map: {e}")))?;
+    read_userland_map(&dir, &map_path).ok_or_else(|| {
+        CheckError::Fatal(fatal(
+            "loop userland: the freshly written map did not validate — refusing a userland-less loop",
+        ))
     })
 }
 
-/// The store ITEM a resolved bin dir lives under: `/gnu/store/<item>/bin` →
-/// `/gnu/store/<item>` — the whole package is the closure root, not just its
-/// bin dir (the package's lib/, libexec/, share/ are runtime surface too).
-fn store_item_of(dir: &str) -> Option<String> {
-    let rest = dir.strip_prefix(SANDBOX_STORE_PREFIX)?;
-    let item = rest.split('/').next().filter(|c| !c.is_empty())?;
-    Some(format!("{SANDBOX_STORE_PREFIX}{item}"))
+/// Parse + validate the durable userland map: every stem present, every item
+/// dir present with a `bin/`. Any miss returns None (the caller re-provisions).
+fn read_userland_map(dir: &Path, map_path: &Path) -> Option<LoopUserland> {
+    let content = std::fs::read_to_string(map_path).ok()?;
+    let mut items: Vec<(String, String)> = Vec::new();
+    let mut bins: Vec<String> = Vec::new();
+    for stem in LOOP_USERLAND_STEMS {
+        let base = content.lines().find_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            (k == *stem && !v.trim().is_empty() && !v.contains('/')).then(|| v.trim().to_string())
+        })?;
+        let host = dir.join(&base);
+        if !host.join("bin").is_dir() {
+            return None;
+        }
+        let canon = format!("{TD_STORE_DIR}/{base}");
+        bins.push(format!("{canon}/bin"));
+        items.push((host.display().to_string(), canon));
+    }
+    Some(LoopUserland {
+        items,
+        path: bins.join(":"),
+    })
+}
+
+/// The td-recipe-eval binary: `TD_RECIPE_EVAL`, the build-recipes node's
+/// sentinel (`.td-build-cache/recipe-eval/recipe-eval-path`), or — first run
+/// on a fresh host, before any loop has built the sentinel — a host `cargo
+/// build` of recipes/ (the same host-brings-cargo seed the stage0 provision
+/// uses). Only when all three fail is the loop unprovisionable.
+fn resolve_recipe_eval_bin(root: &Path) -> Result<String, String> {
+    if let Ok(v) = std::env::var("TD_RECIPE_EVAL") {
+        if !v.trim().is_empty() && Path::new(&v).is_file() {
+            return Ok(v);
+        }
+    }
+    let sentinel = root.join(".td-build-cache/recipe-eval/recipe-eval-path");
+    let path = std::fs::read_to_string(&sentinel)
+        .map(|t| t.trim().to_string())
+        .unwrap_or_default();
+    if !path.is_empty() && Path::new(&path).is_file() {
+        return Ok(path);
+    }
+    if let Some(p) = host_cargo_bin(root, "recipes", "td-recipe-eval", None) {
+        return Ok(p.display().to_string());
+    }
+    Err(fatal(
+        "no td-recipe-eval to resolve the loop userland: set TD_RECIPE_EVAL or run \
+         `cargo build --release --manifest-path recipes/Cargo.toml` and re-run",
+    ))
+}
+
+/// Copy a tree preserving file modes and symlinks AS symlinks — the userland
+/// items are busybox applet farms (symlinks at the busybox binary) whose links
+/// must survive the copy byte-identically.
+fn copy_tree_preserving(src: &Path, dst: &Path) -> Result<(), String> {
+    let md = std::fs::symlink_metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        let target =
+            std::fs::read_link(src).map_err(|e| format!("readlink {}: {e}", src.display()))?;
+        std::os::unix::fs::symlink(&target, dst)
+            .map_err(|e| format!("symlink {}: {e}", dst.display()))?;
+        return Ok(());
+    }
+    if ft.is_dir() {
+        std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+        let rd = std::fs::read_dir(src).map_err(|e| format!("readdir {}: {e}", src.display()))?;
+        for entry in rd {
+            let entry = entry.map_err(|e| format!("readdir {}: {e}", src.display()))?;
+            copy_tree_preserving(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        std::fs::set_permissions(dst, md.permissions())
+            .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
+        return Ok(());
+    }
+    std::fs::copy(src, dst).map_err(|e| format!("copy {}: {e}", src.display()))?;
+    Ok(())
 }
 
 /// The store paths of the SEED locks that gate bodies resolve INSIDE the
 /// sandbox (format `NAME <store-path>`): tests/td-builder-rust.lock
-/// (tools/provision-{rust,cc}.sh branch 2 execs its rust/cc paths directly)
-/// and tests/td-subst.lock (td-recipe-eval's tool_root resolves host tools
-/// through `td-builder lock path` over it). Every lock path present on the
+/// (tools/provision-{rust,cc}.sh branch 2 execs its rust/cc paths directly),
+/// tests/td-subst.lock (td-subst's pinned build closure), and
+/// tests/td-seed-tools.lock (the recipe rungs' declared build scaffolding —
+/// td-recipe-eval's tool_root resolves ONLY through these locks and the
+/// sandbox PATH; there is no host discovery). Every lock path present on the
 /// host is a DECLARED loop input and joins the closure roots. An absent path
 /// is skipped — the consumers fall through / fail loudly the same way they do
 /// today on a host without it.
 fn seed_lock_roots(root: &Path) -> Vec<String> {
     let mut roots: Vec<String> = Vec::new();
-    for lock in ["tests/td-builder-rust.lock", "tests/td-subst.lock"] {
+    for lock in [
+        "tests/td-builder-rust.lock",
+        "tests/td-subst.lock",
+        "tests/td-seed-tools.lock",
+    ] {
         let Ok(content) = std::fs::read_to_string(root.join(lock)) else {
             continue;
         };
@@ -343,79 +407,10 @@ fn seed_lock_roots(root: &Path) -> Vec<String> {
     roots
 }
 
-/// The recipe layer's host-tool packages — a MIRROR of td-recipe-eval's
-/// `check_runner::host_tool_probe` set (keep the two in sync): `(name, probe
-/// binary under <pkg>/bin/)`. Recipe checks running INSIDE the loop sandbox
-/// resolve these via lock → PATH → a store-readdir scavenge (`tool_root`), so
-/// the loop prelude runs the SAME scavenge HOST-SIDE (`scavenge_recipe_tools`)
-/// and binds each winner's closure — the input-only sandbox then shows
-/// tool_root exactly the candidate it would have picked on the host (the
-/// host-wide sorted-first is bound, so the in-sandbox sorted-first is the same
-/// item; the lock/PATH branches win before the scavenge for the tools they
-/// cover, also unchanged).
-const RECIPE_HOST_TOOLS: &[(&str, &str)] = &[
-    ("bash", "bash"),
-    ("coreutils", "ls"),
-    ("sed", "sed"),
-    ("grep", "grep"),
-    ("gawk", "awk"),
-    ("tar", "tar"),
-    ("gzip", "gzip"),
-    ("bzip2", "bzip2"),
-    ("xz", "xz"),
-    ("findutils", "find"),
-    ("diffutils", "diff"),
-    ("flex", "flex"),
-    ("bison", "bison"),
-    ("m4", "m4"),
-    ("make", "make"),
-    ("python", "python3"),
-];
-
-/// tool_root's readdir scavenge, host-side: for each RECIPE_HOST_TOOLS entry,
-/// the lexicographically FIRST store item whose basename contains `-<name>-`
-/// (or `-<name>-minimal-`) with an executable `bin/<probe>` — one readdir pass
-/// over the store, every pattern matched per entry. A name with no candidate
-/// is skipped (the recipe gate that needs it fails loudly, exactly as
-/// tool_root does today on a host without the package). The caller caches the
-/// result keyed by the store dir's mtime (`loop_store_items`).
-fn scavenge_recipe_tools(store_dir: &str) -> Vec<String> {
-    // (winning basename, its full path) per tool — basenames compare exactly
-    // like tool_root's sorted PathBuf candidates (same dir prefix).
-    let mut winners: Vec<Option<(String, String)>> = vec![None; RECIPE_HOST_TOOLS.len()];
-    let Ok(rd) = std::fs::read_dir(store_dir) else {
-        return Vec::new();
-    };
-    for e in rd.flatten() {
-        let base = e.file_name().to_string_lossy().into_owned();
-        for (i, (name, probe)) in RECIPE_HOST_TOOLS.iter().enumerate() {
-            let Some(w) = winners.get_mut(i) else { continue };
-            let normal = format!("-{name}-");
-            let minimal = format!("-{name}-minimal-");
-            if !(base.contains(&normal) || base.contains(&minimal)) {
-                continue;
-            }
-            if w.as_ref().is_some_and(|(cur, _)| cur.as_str() <= base.as_str()) {
-                continue; // current winner already sorts first
-            }
-            let root = format!("{store_dir}/{base}");
-            if is_exec(&Path::new(&root).join("bin").join(probe)) {
-                *w = Some((base.clone(), root));
-            }
-        }
-    }
-    winners.into_iter().flatten().map(|(_, root)| root).collect()
-}
-
-fn is_exec(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-/// Parse the seed lock's `NAME <store-path>` lines (comments/blank skipped) into
-/// the deduped path list, keeping only paths under the loop's store prefix.
+/// Parse the seed lock's `NAME <store-path>` lines (comments/blank skipped)
+/// into the deduped path list. Only absolute paths qualify — the lock is the
+/// DECLARED seed, whatever store its paths live in; there is no hardcoded
+/// prefix to check against.
 fn parse_seed_lock(content: &str) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     for line in content.lines() {
@@ -426,67 +421,96 @@ fn parse_seed_lock(content: &str) -> Vec<String> {
         let Some(path) = line.split_whitespace().nth(1) else {
             continue;
         };
-        if path.starts_with(SANDBOX_STORE_PREFIX) && !paths.iter().any(|p| p == path) {
+        if path.starts_with('/') && !paths.iter().any(|p| p == path) {
             paths.push(path.to_string());
         }
     }
     paths
 }
 
+/// The seed store DIRECTORY, DERIVED from the declared lock paths (the unique
+/// parent of the lock items) — never a hardcoded prefix. This is the candidate
+/// dir the closure scan indexes and the build daemon's default seed dir; on a
+/// guix host the locks point under /gnu/store so that is what derives, and a
+/// re-captured lock on another host derives that host's store with no code
+/// change. Locks spanning several parents keep the FIRST (warned) — the seed
+/// is one store by construction.
+fn seed_store_dir(roots: &[String]) -> Option<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for r in roots {
+        if let Some(parent) = Path::new(r).parent() {
+            let d = parent.display().to_string();
+            if !d.is_empty() && d != "/" && !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    if dirs.len() > 1 {
+        eprintln!(
+            "td-builder check: WARNING: seed locks span {} store dirs ({}); scanning only \
+             the first",
+            dirs.len(),
+            dirs.join(" ")
+        );
+    }
+    dirs.into_iter().next()
+}
+
 /// A parsed `.td-build-cache/loop-closure.list`: the scanned host-built
-/// binaries as `(path, mtime_ns, len, store refs)`, the recipe host-tool
-/// scavenge result keyed by the store dir's mtime, the merged closure ROOTS,
+/// binaries as `(path, mtime_ns, len, store refs)`, the merged closure ROOTS,
 /// and the resulting closure ITEMS.
 struct ClosureCache {
     files: Vec<(String, u64, u64, Vec<String>)>,
-    scav: Option<(u64, Vec<String>)>,
     roots: std::collections::BTreeSet<String>,
     items: Vec<String>,
 }
 
-/// Everything the loop sandbox mounts from the host store — the full input set,
-/// computed so the sandbox never mounts a store DIRECTORY, only declared items:
+/// Everything the loop sandbox mounts from the SEED store — the full declared
+/// input set, computed so the sandbox never mounts a store DIRECTORY, only
+/// declared items (the td-built userland is separate — `provision_userland`):
 ///
-///   1. the runtime CLOSURE of `roots` (the resolved LOOP_TOOLCHAIN packages +
-///      the seed lock's rust/cc toolchain — see `seed_lock_roots`), and
+///   1. the runtime CLOSURE of `roots` (the seed locks' declared paths —
+///      see `seed_lock_roots`), and
 ///   2. the closure of each `scan_files` binary: host-built ELF executables
 ///      that RUN INSIDE the sandbox (the stage0 td-builder, the daily's stashed
-///      td-subst), whose glibc/gcc-lib references are found by content-scanning
+///      td-subst), whose libc/gcc-lib references are found by content-scanning
 ///      the binary itself — declared, not assumed to coincide with (1).
 ///
-/// The closure walk is the same no-DB content scan realize_drv uses
-/// (`scan_candidate_index` + `scan_closure_hybrid`; never /var/guix). The
-/// result is CACHED in `.td-build-cache/loop-closure.list`: store items are
-/// immutable, so the cache holds while the root set matches, every scanned
-/// file's (mtime, len) matches, and every item still exists — a rebuilt stage0
-/// re-scans one file; a changed root set or a GC'd item re-scans the closure.
-/// Returns the sorted item paths (roots included).
+/// The candidate store dir is DERIVED from the lock paths (`seed_store_dir`),
+/// never hardcoded. The closure walk is the same no-DB content scan
+/// realize_drv uses (`scan_candidate_index` + `scan_closure_hybrid`; never
+/// /var/guix). The result is CACHED in `.td-build-cache/loop-closure.list`:
+/// store items are immutable, so the cache holds while the root set matches,
+/// every scanned file's (mtime, len) matches, and every item still exists — a
+/// rebuilt stage0 re-scans one file; a changed root set or a GC'd item
+/// re-scans the closure. Returns the sorted item paths (roots included).
 fn loop_store_items(
     root: &Path,
     roots: &[String],
     scan_files: &[String],
 ) -> Result<Vec<String>, String> {
-    let store_dir = SANDBOX_STORE_PREFIX.trim_end_matches('/');
+    let Some(store_dir) = seed_store_dir(roots) else {
+        // No declared seed at all: nothing to scan, nothing to bind. The
+        // sandbox still gets the td-built userland; anything that needed the
+        // seed (a dynamically linked stage0) fails loudly inside.
+        eprintln!(
+            "td-builder check: WARNING: no seed-lock paths exist on this host — binding \
+             no seed store items (tests/td-*.lock)"
+        );
+        return Ok(Vec::new());
+    };
+    let store_dir = store_dir.as_str();
     let cache_path = root.join(".td-build-cache/loop-closure.list");
     let cached = read_closure_cache(&cache_path);
 
-    // The scanner (a readdir of the whole host store + the candidate index) is
+    // The scanner (a readdir of the whole seed store + the candidate index) is
     // built lazily, at most once — the warm path (nothing changed) never pays it.
     let mut scan_state: Option<(
         crate::scan::Scanner,
         std::collections::HashMap<String, String>,
     )> = None;
 
-    // The recipe host-tool scavenge, reused while the store dir's mtime holds
-    // (entries added/removed touch it). mtime 0 (unreadable) never matches.
-    let store_mtime = dir_mtime_ns(store_dir);
-    let scav: Vec<String> = match cached.as_ref().and_then(|c| c.scav.as_ref()) {
-        Some((m, paths)) if store_mtime != 0 && *m == store_mtime => paths.clone(),
-        _ => scavenge_recipe_tools(store_dir),
-    };
-
     let mut all_roots: std::collections::BTreeSet<String> = roots.iter().cloned().collect();
-    all_roots.extend(scav.iter().cloned());
     let mut files: Vec<(String, u64, u64, Vec<String>)> = Vec::with_capacity(scan_files.len());
     for f in scan_files {
         let (mtime, len) = file_sig(f)?;
@@ -524,12 +548,9 @@ fn loop_store_items(
             && c.items.iter().all(|i| Path::new(i).exists())
         {
             // Same closure; refresh the signatures if only those moved (e.g. a
-            // rebuilt stage0 whose refs did not change, or a store-mtime bump).
-            let scav_current = (store_mtime, scav.clone());
-            if c.files != files || c.scav.as_ref() != Some(&scav_current) {
-                if let Err(e) =
-                    write_closure_cache(&cache_path, &files, &scav_current, &all_roots, &c.items)
-                {
+            // rebuilt stage0 whose refs did not change).
+            if c.files != files {
+                if let Err(e) = write_closure_cache(&cache_path, &files, &all_roots, &c.items) {
                     eprintln!("td-builder check: WARNING: loop-closure cache not written ({e})");
                 }
             }
@@ -538,7 +559,7 @@ fn loop_store_items(
     }
 
     eprintln!(
-        "td-builder check: content-scanning the loop toolchain closure ({} roots; \
+        "td-builder check: content-scanning the loop's seed-lock closure ({} roots; \
          cached in .td-build-cache/loop-closure.list for later runs)",
         all_roots.len()
     );
@@ -547,9 +568,7 @@ fn loop_store_items(
     let root_list: Vec<String> = all_roots.iter().cloned().collect();
     let seen = crate::scan_closure_hybrid(&mut st.0, &st.1, &empty, &root_list)?;
     let items: Vec<String> = seen.into_iter().collect();
-    if let Err(e) =
-        write_closure_cache(&cache_path, &files, &(store_mtime, scav), &all_roots, &items)
-    {
+    if let Err(e) = write_closure_cache(&cache_path, &files, &all_roots, &items) {
         eprintln!("td-builder check: WARNING: loop-closure cache not written ({e})");
     }
     Ok(items)
@@ -570,17 +589,7 @@ fn loop_scan_files(root: &Path, tb: &str) -> Vec<String> {
     files
 }
 
-/// The store dir's mtime in ns (0 when unreadable — never matches the cache,
-/// so the scavenge just re-runs).
-fn dir_mtime_ns(dir: &str) -> u64 {
-    std::fs::metadata(dir)
-        .ok()
-        .and_then(|md| md.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0))
-}
-
-/// Build the store scanner once: the candidate index over the host store dir +
+/// Build the store scanner once: the candidate index over the seed store dir +
 /// the on-disk map, exactly the `store-closure-scan` machinery.
 fn ensure_scanner<'a>(
     state: &'a mut Option<(
@@ -620,16 +629,14 @@ fn file_sig(path: &str) -> Result<(u64, u64), String> {
     Ok((mtime, md.len()))
 }
 
-/// Read the loop-closure cache (tab-separated `file`/`fref`/`scavmtime`/
-/// `stool`/`root`/`item` lines; `#` comments). Any malformed line invalidates
-/// the WHOLE cache (None → rescan) — the cache is an accelerator, never
-/// authority. (A path containing a tab would round-trip truncated, never match
-/// its live counterpart, and merely force a rescan every run — safe, slower.)
+/// Read the loop-closure cache (tab-separated `file`/`fref`/`root`/`item`
+/// lines; `#` comments). Any malformed line invalidates the WHOLE cache
+/// (None → rescan) — the cache is an accelerator, never authority. (A path
+/// containing a tab would round-trip truncated, never match its live
+/// counterpart, and merely force a rescan every run — safe, slower.)
 fn read_closure_cache(path: &Path) -> Option<ClosureCache> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut files: Vec<(String, u64, u64, Vec<String>)> = Vec::new();
-    let mut scav_mtime: Option<u64> = None;
-    let mut stools: Vec<String> = Vec::new();
     let mut roots = std::collections::BTreeSet::new();
     let mut items: Vec<String> = Vec::new();
     for line in content.lines() {
@@ -644,8 +651,6 @@ fn read_closure_cache(path: &Path) -> Option<ClosureCache> {
                 files.push((parts.next()?.to_string(), mtime, len, Vec::new()));
             }
             "fref" => files.last_mut()?.3.push(parts.next()?.to_string()),
-            "scavmtime" => scav_mtime = Some(parts.next()?.parse::<u64>().ok()?),
-            "stool" => stools.push(parts.next()?.to_string()),
             "root" => {
                 roots.insert(parts.next()?.to_string());
             }
@@ -655,7 +660,6 @@ fn read_closure_cache(path: &Path) -> Option<ClosureCache> {
     }
     Some(ClosureCache {
         files,
-        scav: scav_mtime.map(|m| (m, stools)),
         roots,
         items,
     })
@@ -668,7 +672,6 @@ fn read_closure_cache(path: &Path) -> Option<ClosureCache> {
 fn write_closure_cache(
     path: &Path,
     files: &[(String, u64, u64, Vec<String>)],
-    scav: &(u64, Vec<String>),
     roots: &std::collections::BTreeSet<String>,
     items: &[String],
 ) -> Result<(), String> {
@@ -679,11 +682,6 @@ fn write_closure_cache(
         for r in refs {
             out.push_str(&format!("fref\t{r}\n"));
         }
-    }
-    let (scav_mtime, stools) = scav;
-    out.push_str(&format!("scavmtime\t{scav_mtime}\n"));
-    for t in stools {
-        out.push_str(&format!("stool\t{t}\n"));
     }
     for r in roots {
         out.push_str(&format!("root\t{r}\n"));
@@ -1339,8 +1337,8 @@ fn heavy_warms(root: &Path) {
 ///
 /// Env: TD_DAEMON_DIR (shared dir, default ~/.td/build-daemon),
 /// TD_DAEMON_BUILDER (daemon binary override), TD_DAEMON_SEED_DIR (the
-/// start-time seed store DIR, default: the loop's host store
-/// (SANDBOX_STORE_PREFIX) — content-scanned host-side for the
+/// start-time seed store DIR, default: derived from the declared seed-lock
+/// paths (`seed_store_dir`) — content-scanned host-side for the
 /// input closure, #267; only bare-drv requests use it), TD_BUILD_JOBS (the
 /// global budget — inherited by the spawned daemon), TD_NICE (nice level for
 /// the daemon + its build children, default 10).
@@ -1354,11 +1352,16 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     };
     let store = daemon_dir.join("store");
     std::fs::create_dir_all(&store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
-    // Default seed store = the loop's host store, read HOST-SIDE by the daemon
-    // (the ONE remaining host-store coupling, deleted with SANDBOX_STORE_PREFIX
-    // when the loop's userland goes td-built). The loop SANDBOX never mounts it.
-    let seed_dir = std::env::var("TD_DAEMON_SEED_DIR")
-        .unwrap_or_else(|_| s(SANDBOX_STORE_PREFIX.trim_end_matches('/')));
+    // Default seed store = DERIVED from the declared seed-lock paths, read
+    // HOST-SIDE by the daemon (never a hardcoded prefix; the loop SANDBOX
+    // never mounts it). A lock-less host must say where its seed lives.
+    let seed_dir = match std::env::var("TD_DAEMON_SEED_DIR") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => seed_store_dir(&seed_lock_roots(root)).ok_or_else(|| {
+            s("no seed store dir: the seed locks name no existing paths and \
+               TD_DAEMON_SEED_DIR is unset")
+        })?,
+    };
     let daemon_tb = match std::env::var("TD_DAEMON_BUILDER") {
         Ok(v) if !v.trim().is_empty() && Path::new(&v).is_file() => v,
         _ => tb.to_string(),
@@ -1525,10 +1528,10 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 
     guard_netns_probe()?;
 
-    // No guix process remains: the loop PATH is only the host-PATH toolchain
-    // declared in LOOP_TOOLCHAIN. Gate text/tree work must invoke
-    // td-builder typed helpers or td-built userland instead of inheriting GNU
-    // sed/grep/findutils from a seed lock.
+    // No guix process and no host tool remains: the loop PATH is only the
+    // td-BUILT userland (busybox/make) plus td-builder's native applets. Gate
+    // text/tree work must invoke td-builder typed helpers or that userland —
+    // never GNU sed/grep/findutils from a seed lock.
 
     // Light tiers own no heavy gate — skip the heavy warms + daemon (exactly the
     // shell prelude's goal scan).
@@ -1540,8 +1543,8 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     });
 
     let tb = provision_stage0(&root)?;
-    let tc = provision_toolchain()?;
-    let toolchain = loop_path_with_native_applets(&root, &tb, &tc.path).map_err(|e| {
+    let ul = provision_userland(&root)?;
+    let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path).map_err(|e| {
         CheckError::Fatal(fatal(&format!(
             "could not provision loop native applets ({e})"
         )))
@@ -1655,14 +1658,13 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
             argv.extend([ionice.display().to_string(), s("-c2"), s("-n7")]);
         }
     }
-    // The sandbox mounts NO store directory — only the loop's declared input
-    // ITEMS, each bound read-only at its own path (the drv build jail's
-    // input-only model): the resolved toolchain closure, the seed locks'
-    // rust/cc closure, the recipe host-tool scavenge winners, and the closures
-    // of the host-built binaries that run inside (the stage0 td-builder; the
-    // stashed td-subst when exposed).
-    let mut roots = tc.roots.clone();
-    roots.extend(seed_lock_roots(&root));
+    // The sandbox mounts NO store directory and NO host tool — only the loop's
+    // declared input ITEMS, each bound read-only (the drv build jail's
+    // input-only model): the td-BUILT userland at its /td/store paths, the
+    // seed locks' declared closures, and the closures of the host-built
+    // binaries that run inside (the stage0 td-builder; the stashed td-subst
+    // when exposed).
+    let roots = seed_lock_roots(&root);
     let items = loop_store_items(&root, &roots, &loop_scan_files(&root, &tb)).map_err(|e| {
         fatal(&format!(
             "could not compute the loop sandbox's store-item inputs ({e})"
@@ -1676,6 +1678,9 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     ]);
     for it in &items {
         argv.extend([s("--store-item"), it.clone()]);
+    }
+    for (src, dest) in &ul.items {
+        argv.extend([s("--store-item-at"), src.clone(), dest.clone()]);
     }
     argv.extend([s("--"), tb, s("gate-run")]);
     argv.extend([s("-j"), jobs.to_string()]);
@@ -1729,9 +1734,9 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 /// whole chain from the seed with substitutes off (prime directive 1). Once a
 /// harness is green here, run the real `td-builder check bootstrap-<rung>`.
 ///
-/// The sandbox + toolchain provisioning is EXACTLY the loop prelude's (same
-/// stage0 container provider, same `LOOP_TOOLCHAIN` list — notably WITHOUT
-/// bzip2, so a missing-bzip2 bug still reproduces).
+/// The sandbox + userland provisioning is EXACTLY the loop prelude's (same
+/// stage0 container provider, same td-built busybox/make userland — notably
+/// WITHOUT bzip2, so a missing-bzip2 bug still reproduces).
 pub fn check_rung_cli(args: &[String]) -> ExitCode {
     match check_rung(args) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -1758,13 +1763,12 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     })?;
     // check-rung is a dev helper, not the loop: it does not branch on the
     // provisioned/regression distinction, so collapse CheckError back to a string.
-    let tc = provision_toolchain().map_err(|e| e.to_string())?;
-    let toolchain = loop_path_with_native_applets(&root, &tb, &tc.path)
+    let ul = provision_userland(&root).map_err(|e| e.to_string())?;
+    let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path)
         .map_err(|e| format!("check-rung: FATAL: could not provision loop native applets ({e})"))?;
     // The same input-only store exposure as the loop (per-item binds, no store
     // directory mounted; same scan-file set so the closure cache is shared).
-    let mut roots = tc.roots.clone();
-    roots.extend(seed_lock_roots(&root));
+    let roots = seed_lock_roots(&root);
     let items = loop_store_items(&root, &roots, &loop_scan_files(&root, &tb))
         .map_err(|e| format!("check-rung: FATAL: {e}"))?;
     eprintln!(
@@ -1776,6 +1780,9 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
         vec![s("host-sandbox"), s("--expose-cwd"), s("--no-daemon")];
     for it in &items {
         sandbox_args.extend([s("--store-item"), it.clone()]);
+    }
+    for (src, dest) in &ul.items {
+        sandbox_args.extend([s("--store-item-at"), src.clone(), dest.clone()]);
     }
     sandbox_args.extend([s("--"), s("sh")]);
     cmd.args(sandbox_args)
@@ -1860,39 +1867,79 @@ mod tests {
     }
 
     #[test]
-    fn store_item_of_takes_the_package_not_the_bin_dir() {
-        // The closure root is the whole store ITEM (its lib/, libexec/, share/
-        // are runtime surface), never just the resolved bin dir.
-        assert_eq!(
-            store_item_of("/gnu/store/abc123-bash-5.2.37/bin").as_deref(),
-            Some("/gnu/store/abc123-bash-5.2.37")
-        );
-        assert_eq!(
-            store_item_of("/gnu/store/abc123-make-4.4").as_deref(),
-            Some("/gnu/store/abc123-make-4.4")
-        );
-        assert_eq!(store_item_of("/usr/bin"), None, "off-store dir has no item");
-        assert_eq!(store_item_of("/gnu/store/"), None, "the bare prefix is not an item");
-    }
-
-    #[test]
-    fn parse_seed_lock_keeps_in_store_paths_deduped() {
+    fn parse_seed_lock_keeps_absolute_paths_deduped() {
+        // The lock is the DECLARED seed, whatever store its paths live in —
+        // any absolute path qualifies; only relative/malformed lines drop.
         let lock = "\
 # comment line
-aaa-rust-1.93.0 /gnu/store/aaa-rust-1.93.0
-bbb-cargo /gnu/store/bbb-rust-1.93.0-cargo extra-field
-bbb-again /gnu/store/bbb-rust-1.93.0-cargo
+aaa-rust-1.93.0 /td/store/aaa-rust-1.93.0
+bbb-cargo /td/store/bbb-rust-1.93.0-cargo extra-field
+bbb-again /td/store/bbb-rust-1.93.0-cargo
 
 malformed-line-without-path
-ccc-off-store /opt/rust-1.93.0
+ccc-relative not/absolute
 ";
         assert_eq!(
             parse_seed_lock(lock),
             vec![
-                "/gnu/store/aaa-rust-1.93.0".to_string(),
-                "/gnu/store/bbb-rust-1.93.0-cargo".to_string(),
+                "/td/store/aaa-rust-1.93.0".to_string(),
+                "/td/store/bbb-rust-1.93.0-cargo".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn seed_store_dir_derives_the_unique_parent() {
+        // The candidate store dir comes from the declared lock paths, never a
+        // hardcoded prefix.
+        let roots = vec![
+            "/td/store/aaa-bash-5.2.37".to_string(),
+            "/td/store/bbb-make-4.4.1".to_string(),
+        ];
+        assert_eq!(seed_store_dir(&roots), Some("/td/store".to_string()));
+        // Several parents: the FIRST wins (warned) — the seed is one store.
+        let mixed = vec![
+            "/td/store/aaa-bash-5.2.37".to_string(),
+            "/other/store/ccc-sed-4.9".to_string(),
+        ];
+        assert_eq!(seed_store_dir(&mixed), Some("/td/store".to_string()));
+        // No roots, or roots with no usable parent: no store dir.
+        assert_eq!(seed_store_dir(&[]), None);
+        assert_eq!(seed_store_dir(&["/toplevel".to_string()]), None);
+    }
+
+    #[test]
+    fn userland_map_validates_every_stem_or_reprovisions() {
+        let d = scratch("loop-userland");
+        let map = d.join("loop-userland.map");
+        // A valid map: every stem present, each item dir with a bin/.
+        let mut content = String::new();
+        for (i, stem) in LOOP_USERLAND_STEMS.iter().enumerate() {
+            let base = format!("hash{i}-{stem}-1.0");
+            std::fs::create_dir_all(d.join(&base).join("bin")).unwrap();
+            content.push_str(&format!("{stem} {base}\n"));
+        }
+        std::fs::write(&map, &content).unwrap();
+        let ul = read_userland_map(&d, &map).expect("valid map resolves");
+        assert_eq!(ul.items.len(), LOOP_USERLAND_STEMS.len());
+        for ((host, canon), stem) in ul.items.iter().zip(LOOP_USERLAND_STEMS) {
+            assert!(host.starts_with(d.to_str().unwrap()), "host copy under the durable dir");
+            assert_eq!(canon, &format!("{TD_STORE_DIR}/hash{}-{stem}-1.0",
+                LOOP_USERLAND_STEMS.iter().position(|s| s == stem).unwrap()));
+            assert!(ul.path.contains(&format!("{canon}/bin")), "bin dir on the PATH");
+        }
+        // A stem whose item lost its bin/ invalidates the WHOLE map (the
+        // caller re-provisions) — no partial userland.
+        std::fs::remove_dir_all(
+            d.join(format!("hash0-{}-1.0", LOOP_USERLAND_STEMS[0])).join("bin"),
+        )
+        .unwrap();
+        assert!(read_userland_map(&d, &map).is_none());
+        // A path-carrying value is rejected (the map holds basenames only).
+        std::fs::write(&map, "busybox-x86-64 ../escape\nmake-x86-64 x\n").unwrap();
+        assert!(read_userland_map(&d, &map).is_none());
+        // A missing map is simply cold.
+        assert!(read_userland_map(&d, &d.join("absent.map")).is_none());
     }
 
     #[test]
@@ -1903,70 +1950,35 @@ ccc-off-store /opt/rust-1.93.0
             "/repo/.td-build-cache/stage0/td-builder".to_string(),
             123u64,
             456u64,
-            vec!["/gnu/store/ggg-glibc-2.39".to_string()],
+            vec!["/td/store/ggg-glibc-2.41".to_string()],
         )];
-        let scav = (
-            789u64,
-            vec!["/gnu/store/sss-sed-4.9".to_string()],
-        );
         let roots: std::collections::BTreeSet<String> = [
-            "/gnu/store/aaa-bash-5.2.37".to_string(),
-            "/gnu/store/ggg-glibc-2.39".to_string(),
-            "/gnu/store/sss-sed-4.9".to_string(),
+            "/td/store/aaa-bash-5.2.37".to_string(),
+            "/td/store/ggg-glibc-2.41".to_string(),
         ]
         .into_iter()
         .collect();
         let items = vec![
-            "/gnu/store/aaa-bash-5.2.37".to_string(),
-            "/gnu/store/ggg-glibc-2.39".to_string(),
-            "/gnu/store/sss-sed-4.9".to_string(),
+            "/td/store/aaa-bash-5.2.37".to_string(),
+            "/td/store/ggg-glibc-2.41".to_string(),
         ];
-        write_closure_cache(&path, &files, &scav, &roots, &items).unwrap();
+        write_closure_cache(&path, &files, &roots, &items).unwrap();
         let c = read_closure_cache(&path).expect("cache parses back");
         assert_eq!(c.files, files);
-        assert_eq!(c.scav, Some(scav));
         assert_eq!(c.roots, roots);
         assert_eq!(c.items, items);
         // The write is temp+rename: no stray temp file survives.
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
 
         // Any malformed line invalidates the WHOLE cache — accelerator, never
-        // authority.
-        std::fs::write(&path, "item\t/gnu/store/x\nbogus-line\n").unwrap();
+        // authority. (This includes the retired scavenge-era `scavmtime`/
+        // `stool` lines, so pre-cutover caches self-invalidate.)
+        std::fs::write(&path, "item\t/td/store/x\nbogus-line\n").unwrap();
+        assert!(read_closure_cache(&path).is_none());
+        std::fs::write(&path, "scavmtime\t789\nstool\t/td/store/sss-sed-4.9\n").unwrap();
         assert!(read_closure_cache(&path).is_none());
         // A missing cache file is simply a miss.
         assert!(read_closure_cache(&d.join("absent.list")).is_none());
-    }
-
-    #[test]
-    fn scavenge_picks_the_sorted_first_candidate_with_the_probe() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let d = scratch("scavenge");
-        let store = d.join("store");
-        let mk = |base: &str, probe: Option<&str>| {
-            let bin = store.join(base).join("bin");
-            std::fs::create_dir_all(&bin).unwrap();
-            if let Some(p) = probe {
-                let f = bin.join(p);
-                std::fs::write(&f, b"#!/bin/sh\n").unwrap();
-                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-        };
-        // Two gawk candidates with the probe — the sorted-FIRST basename wins
-        // (tool_root's candidates.sort() pick, so the in-sandbox scavenge over
-        // the bound set finds the same winner the host scavenge saw).
-        mk("bbbb-gawk-5.3.1", Some("awk"));
-        mk("aaaa-gawk-5.1.0", Some("awk"));
-        // A sed candidate WITHOUT the probe binary — not a winner.
-        mk("cccc-sed-4.9", None);
-        // A name that only prefix-matches (-gawkish- is not -gawk-) — ignored.
-        mk("dddd-gawkish-1.0", Some("awk"));
-        let store_s = store.to_string_lossy().into_owned();
-        let got = scavenge_recipe_tools(&store_s);
-        assert_eq!(got, vec![format!("{store_s}/aaaa-gawk-5.1.0")]);
-        // An unreadable store dir scavenges nothing (the recipe gate that
-        // needs a tool fails loudly, exactly like tool_root).
-        assert!(scavenge_recipe_tools("/nonexistent-store-dir").is_empty());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # tests/build-recipes.sh — the build phase (DESIGN §7.1 move-off-Guile §5). Extracted
 # VERBATIM from the Makefile's `build-recipes` recipe when the gate runner
 # (`td-builder gate-run`, builder/src/gates.rs) replaced make as the loop scheduler.

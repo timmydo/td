@@ -151,7 +151,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "for a in sh ls sed grep awk tar gzip cat echo mkdir rm cp true false env printf; do ln -sf busybox \"$a\"; done",
+                "for a in sh ls sed grep awk tar gzip cat echo mkdir rm cp true false env printf sleep sort head tail basename dirname mktemp; do ln -sf busybox \"$a\"; done",
             ],
         )
         .env("PATH", &base_path()),
