@@ -381,6 +381,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
             "store-ns",
             "recipe-rs",
             "recipe-checks-daily",
+            "store-native-profile",
+            "sandbox-hardening",
+            "toolchain-input-addressed",
+            "toolchain-x86_64-input-addressed",
         ] {
             sel.add_target(g);
         }
@@ -474,8 +478,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // Tombstone (#460): the shell body became the native gate_bodies::toolchain_input_addressed;
+    // the deleting diff still routes to the gate that absorbed the logic.
     if p == "tests/toolchain-input-addressed.sh" {
-        sel.add_preflight("shell-syntax");
         sel.add_target("toolchain-input-addressed");
         return;
     }
@@ -489,11 +494,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // #410: the tests/td-toolchain-rust-x86_64.lock mapping was removed with the rust-toolchain
     // recipe-graph cutover — that gate-assembled lock and its consumer gate (416) are retired.
-    if pattern_matches(
-        "tests/toolchain-x86_64-input-addressed.sh|builder/src/gate_defs/418-toolchain-x86_64-input-addressed.rs",
-        p,
-    ) {
-        sel.add_preflight("shell-syntax");
+    // Tombstone (#460): the shell body became gate_bodies::toolchain_x86_64_input_addressed. The
+    // gate def (418-*.rs) is handled by the generic gate_defs/*.rs arm above; the deleted shell
+    // still routes to the gate that absorbed the logic.
+    if p == "tests/toolchain-x86_64-input-addressed.sh" {
         sel.add_target("toolchain-x86_64-input-addressed");
         return;
     }
@@ -517,8 +521,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // Tombstone (#460): the shell body became the native gate_bodies::sandbox_hardening;
+    // the deleting diff still routes to the gate that absorbed the logic.
     if p == "tests/sandbox-hardening.sh" {
-        sel.add_preflight("shell-syntax");
         sel.add_target("sandbox-hardening");
         return;
     }
@@ -589,8 +594,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // Tombstone (#460): the shell body became the native gate_bodies::store_native_profile;
+    // the deleting diff still routes to the gate that absorbed the logic.
     if p == "tests/store-native-profile.sh" {
-        sel.add_preflight("shell-syntax");
         sel.add_target("store-native-profile");
         return;
     }
@@ -985,6 +991,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("builder/src/gate_bodies.rs", "check-engine");
     assert_target!("builder/src/gate_bodies.rs", "recipe-rs");
     assert_target!("builder/src/gate_bodies.rs", "recipe-checks-daily");
+    // #460: the four former tests/*.sh gate bodies became native gate_bodies fns.
+    assert_target!("builder/src/gate_bodies.rs", "store-native-profile");
+    assert_target!("builder/src/gate_bodies.rs", "sandbox-hardening");
+    assert_target!("builder/src/gate_bodies.rs", "toolchain-input-addressed");
+    assert_target!("builder/src/gate_bodies.rs", "toolchain-x86_64-input-addressed");
+    // Their deleted shell drivers are tombstoned to the gate that absorbed each.
+    assert_target!("tests/store-native-profile.sh", "store-native-profile");
+    assert_target!("tests/sandbox-hardening.sh", "sandbox-hardening");
+    assert_target!("tests/toolchain-input-addressed.sh", "toolchain-input-addressed");
     // The Rust td-recipe crate IS the package + spec surface (boa/TS retired): a
     // catalog edit runs recipe-rs and the package build gates.
     assert_target!("recipes/src/catalog.rs", "recipe-rs");

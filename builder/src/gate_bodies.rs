@@ -46,6 +46,10 @@ const NATIVE: &[&str] = &[
     "store-ns",
     "recipe-rs",
     "recipe-checks-daily",
+    "store-native-profile",
+    "sandbox-hardening",
+    "toolchain-input-addressed",
+    "toolchain-x86_64-input-addressed",
 ];
 
 /// `td-builder gate-body <name>` — run one native gate body. Self-moves into
@@ -75,6 +79,10 @@ pub fn cli(name: &str) -> ExitCode {
         "store-ns" => store_ns(&root),
         "recipe-rs" => recipe_rs(&root),
         "recipe-checks-daily" => recipe_checks_daily(&root),
+        "store-native-profile" => store_native_profile(&root),
+        "sandbox-hardening" => sandbox_hardening(&root),
+        "toolchain-input-addressed" => toolchain_input_addressed(&root),
+        "toolchain-x86_64-input-addressed" => toolchain_x86_64_input_addressed(&root),
         other => Err(format!("gate-body: unknown native gate `{other}`")),
     };
     match res {
@@ -1930,6 +1938,990 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// --- shared helpers for the own-root / lock-addressed gates -------------------
+
+/// `mkdir -p p`.
+fn mkdirp(p: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(p).map_err(|e| format!("FAIL: mkdir {}: {e}", p.display()))
+}
+
+/// Write `data` to `p` (the scratch-file staging the gates do before a tool call).
+fn writef(p: &Path, data: &str) -> Result<(), String> {
+    std::fs::write(p, data).map_err(|e| format!("FAIL: write {}: {e}", p.display()))
+}
+
+/// A declared artifact input's resolved path — the runner exported it as
+/// `TD_GATE_INPUT_<NAME>` before the body ran (#353). The env-var name is
+/// computed by the SAME function the runner uses, so the two can't drift.
+fn gate_input(name: &str) -> Result<String, String> {
+    let var = crate::gate_inputs::env_var(name);
+    std::env::var(&var).map_err(|_| {
+        format!("FAIL: {var} unset — run via td-builder gate-run, which resolves the gate's declared inputs")
+    })
+}
+
+/// `readlink -f $(command -v BIN)` — the first executable `bin` on PATH,
+/// canonicalized. Resolves the absolute binary ourselves (Command's PATH search
+/// uses the CURRENT process env, not a child override).
+fn which_canon(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let p = dir.join(bin);
+        (p.is_file() && file_mode(&p).ok().is_some_and(|m| m & 0o111 != 0))
+            .then(|| std::fs::canonicalize(&p).ok())
+            .flatten()
+    })
+}
+
+/// The store root `/td/store` of a `/<first>/store/...` path (the shell's
+/// `store_root_for`): take the first path component and append `/store`, then
+/// confirm the path is actually under it.
+fn store_root_for(p: &str) -> Result<String, String> {
+    let rest = p
+        .strip_prefix('/')
+        .ok_or_else(|| format!("FAIL: {p} is not an absolute store path"))?;
+    let first = rest.split('/').next().unwrap_or("");
+    let root = format!("/{first}/store");
+    if !p.starts_with(&format!("{root}/")) {
+        return Err(format!("FAIL: {p} is not under a store root"));
+    }
+    Ok(root)
+}
+
+/// Count the processes whose `/proc/<pid>/cmdline` carries `marker` (NULs read as
+/// spaces). A zombie's cmdline is empty, so a killed-but-unreaped parent is not
+/// counted — exactly why the reaping check can poll for zero without racing the
+/// wait. cmdline bytes are ASCII (argv paths + a decimal marker).
+fn scan_marker_procs(marker: &str) -> usize {
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    rd.flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .filter(|e| proc_cmdline_has(&e.path().join("cmdline"), marker))
+        .count()
+}
+
+/// SIGKILL every process whose cmdline still carries `marker` — the failure-path
+/// sweep so a red reaping check never leaks a marker process into the shared PID
+/// namespace.
+fn sweep_marker_procs(marker: &str) {
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<i64>().ok()) else {
+            continue;
+        };
+        if proc_cmdline_has(&e.path().join("cmdline"), marker) {
+            let _ = crate::sys::kill_pid(pid, crate::sys::SIGKILL);
+        }
+    }
+}
+
+/// True if `cmdline` (NUL-separated argv) contains `marker` as a substring.
+fn proc_cmdline_has(cmdline: &Path, marker: &str) -> bool {
+    let Ok(bytes) = std::fs::read(cmdline) else {
+        return false;
+    };
+    let text: String = bytes
+        .iter()
+        .map(|&b| if b == 0 { ' ' } else { b as char })
+        .collect();
+    text.contains(marker)
+}
+
+// --- lock / source-pin parsing (unit-tested; #460) ---------------------------
+
+/// A fixed-output pin line in a toolchain lock: `input <sha> <file>` (an upstream
+/// source tarball) or `patch <sha> <file>` (a vendored `seed/patches/<file>`).
+enum PinKind {
+    Input,
+    Patch,
+}
+struct PinLine {
+    kind: PinKind,
+    sha: String,
+    file: String,
+}
+
+/// Parse the `input`/`patch` pin lines of a lock into (kind, sha, file). Lines
+/// with fewer than three fields, and every non-pin directive, are skipped —
+/// the shell's `copy_pin_lines` filter followed by `read -r kind sha file`.
+fn parse_pin_lines(lock_text: &str) -> Vec<PinLine> {
+    lock_text
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let kind = match f.next()? {
+                "input" => PinKind::Input,
+                "patch" => PinKind::Patch,
+                _ => return None,
+            };
+            let sha = f.next()?.to_string();
+            let file = f.next()?.to_string();
+            Some(PinLine { kind, sha, file })
+        })
+        .collect()
+}
+
+/// The RAW `input`/`patch` lines of a lock (the shell's `copy_pin_lines`) — used
+/// for the arch-parity set comparison, which is a comparison of the source SET
+/// verbatim (the shell hashed the sorted lines; we compare the sorted lines
+/// directly).
+fn filter_pin_lines(lock_text: &str) -> Vec<String> {
+    lock_text
+        .lines()
+        .filter(|l| matches!(l.split_whitespace().next(), Some("input") | Some("patch")))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The lock directives allowed in an arch-parametrized toolchain lock.
+const ARCH_DIRECTIVES: &[&str] = &["name", "recipe-rev", "component", "input", "patch"];
+
+/// The distinct directive keys in `lock_text` that are NOT in the arch-lock
+/// allowlist (empty ⟹ the lock is well-formed) — the shell's
+/// `validate_directives`. Blank and `#`-comment lines are ignored.
+fn bad_directive_keys(lock_text: &str) -> Vec<String> {
+    let mut bad: Vec<String> = Vec::new();
+    for line in lock_text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(key) = line.split_whitespace().next() else {
+            continue;
+        };
+        if !ARCH_DIRECTIVES.contains(&key) && !bad.iter().any(|b| b == key) {
+            bad.push(key.to_string());
+        }
+    }
+    bad
+}
+
+/// Rewrite the `input <sha> glibc-2.41.tar.xz` pin to an all-zero digest — the
+/// load-bearing perturbation. `None` if no such pin exists (the perturbation
+/// would be vacuous).
+fn perturb_glibc_pin(lock_text: &str) -> Option<String> {
+    let zeros = "0".repeat(64);
+    let mut seen = false;
+    let mut out = String::new();
+    for line in lock_text.lines() {
+        let is_glibc_input = line.split_whitespace().next() == Some("input")
+            && line.ends_with(" glibc-2.41.tar.xz");
+        if is_glibc_input {
+            out.push_str(&format!("input {zeros} glibc-2.41.tar.xz\n"));
+            seen = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    seen.then_some(out)
+}
+
+/// Bump the `recipe-rev 1` directive to `recipe-rev 2` — the load-bearing
+/// recipe-rev perturbation. `None` if the lock has no `recipe-rev 1` line.
+fn rewrite_recipe_rev(lock_text: &str) -> Option<String> {
+    let mut seen = false;
+    let mut out = String::new();
+    for line in lock_text.lines() {
+        if line == "recipe-rev 1" {
+            out.push_str("recipe-rev 2\n");
+            seen = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    seen.then_some(out)
+}
+
+/// The sha256 a recipe source pin declares for `file`, from `td-recipe-eval
+/// source-pins` output (`<key>\t<url>\t<sha256>\t<file>` per line).
+fn source_pin_sha(pins_text: &str, file: &str) -> Option<String> {
+    pins_text.lines().find_map(|line| {
+        let mut f = line.split_whitespace();
+        let _key = f.next()?;
+        let _url = f.next()?;
+        let sha = f.next()?;
+        let name = f.next()?;
+        (name == file).then(|| sha.to_string())
+    })
+}
+
+/// The recipe-owned source pins (`td-recipe-eval source-pins`). Resolves the
+/// evaluator from `$TD_RECIPE_EVAL` when set, else builds td's OWN dependency-free
+/// td-recipe-eval via `tests/recipe-eval-tool.sh` (the guix-free host-prep the
+/// recipe-rs gate also shells out to). The pin PARSING + comparison is typed Rust.
+fn recipe_eval_source_pins(root: &Path) -> Result<String, String> {
+    let eval = match std::env::var_os("TD_RECIPE_EVAL") {
+        Some(v) if is_executable_file(Path::new(&v)) => PathBuf::from(v),
+        _ => {
+            let base = root.join(".td-build-cache/recipe-eval");
+            let base_s = path_str(&base)?;
+            let printed = run_out(
+                "sh",
+                &["tests/recipe-eval-tool.sh", &base_s],
+                "recipe-eval-tool.sh (build td-recipe-eval from the current worktree)",
+            )?;
+            let bin = printed.lines().last().unwrap_or("").trim();
+            if bin.is_empty() {
+                return Err("FAIL: recipe-eval-tool.sh printed no td-recipe-eval path".into());
+            }
+            PathBuf::from(bin)
+        }
+    };
+    if !is_executable_file(&eval) {
+        return Err(format!(
+            "FAIL: td-recipe-eval is not executable: {}",
+            eval.display()
+        ));
+    }
+    let eval_s = path_str(&eval)?;
+    run_out(&eval_s, &["source-pins"], "td-recipe-eval source-pins")
+}
+
+/// The registered NAR hash for `path` in the store DB `db`, read by td's OWN
+/// store-query (`path|hash|narSize` rows). `None` if the path is not registered.
+fn registered_hash(tb: &Path, db: &str, path: &str) -> Result<Option<String>, String> {
+    let info = tb_out(tb, &["store-query", db, "info"], "store-query info")?;
+    Ok(info.lines().find_map(|line| {
+        let mut f = line.split('|');
+        let p = f.next().unwrap_or("");
+        let h = f.next().unwrap_or("");
+        (p == path).then(|| h.to_string())
+    }))
+}
+
+/// The [pinned-sync] leg shared by both input-addressed gates: every lock
+/// `input` pin equals the recipe source pin for that file, every `patch` pin
+/// equals the sha256 of `seed/patches/<file>`, and the toolchain has the
+/// expected floor of inputs/patches. Returns (input-count, patch-count).
+fn check_pinned_sync(
+    root: &Path,
+    lock_text: &str,
+    source_pins: &str,
+) -> Result<(usize, usize), String> {
+    let mut nin = 0usize;
+    let mut npatch = 0usize;
+    for pin in parse_pin_lines(lock_text) {
+        match pin.kind {
+            PinKind::Input => {
+                let want = source_pin_sha(source_pins, &pin.file).ok_or_else(|| {
+                    format!(
+                        "FAIL: [pinned-sync] no recipe source pin declares file `{}`",
+                        pin.file
+                    )
+                })?;
+                if pin.sha != want {
+                    return Err(format!(
+                        "FAIL: [pinned-sync] {}: lock pin {} != recipe source pin {want}",
+                        pin.file, pin.sha
+                    ));
+                }
+                nin += 1;
+            }
+            PinKind::Patch => {
+                let pf = root.join("seed/patches").join(&pin.file);
+                if !pf.is_file() {
+                    return Err(format!(
+                        "FAIL: [pinned-sync] vendored patch missing: {}",
+                        pf.display()
+                    ));
+                }
+                let got = crate::sha256::sha256_file(&pf)
+                    .map_err(|e| format!("FAIL: sha256 {}: {e}", pf.display()))?;
+                if pin.sha != got {
+                    return Err(format!(
+                        "FAIL: [pinned-sync] {}: lock pin {} != file sha {got}",
+                        pin.file, pin.sha
+                    ));
+                }
+                npatch += 1;
+            }
+        }
+    }
+    if nin < 20 {
+        return Err(format!(
+            "FAIL: [pinned-sync] only {nin} input pins — the toolchain has more inputs than that"
+        ));
+    }
+    if npatch < 4 {
+        return Err(format!("FAIL: [pinned-sync] only {npatch} patch pins"));
+    }
+    Ok((nin, npatch))
+}
+
+/// The [behavioral]+[structural] leg shared by both input-addressed gates: place
+/// the static-bash fixture at the arch-keyed input-addressed /td/store path and
+/// run it in the store-ns own-root with /gnu/store ABSENT. `name_stem` is the
+/// input-addressed name (`bash-static` / `bash-static-x86_64`).
+fn run_input_addressed_bash(
+    tb: &Path,
+    work: &Path,
+    bs: &str,
+    key: &str,
+    name_stem: &str,
+) -> Result<(), String> {
+    let store = work.join("store");
+    mkdirp(&store)?;
+    let store_s = path_str(&store)?;
+    let db_s = path_str(&work.join("store.db"))?;
+    let runp = tb_out_env(
+        tb,
+        &["store-add-input-addressed", name_stem, key, bs, &store_s, &db_s],
+        &[("TD_STORE_DIR", "/td/store")],
+        &format!("store-add-input-addressed {name_stem}"),
+    )?;
+    let suffix = format!("-{name_stem}");
+    if !(runp.starts_with("/td/store/") && runp.ends_with(&suffix)) {
+        return Err(format!(
+            "FAIL: {name_stem} not input-addressed at /td/store: {runp}"
+        ));
+    }
+    if !is_executable_file(&store.join(base_of(&runp)).join("bin/bash")) {
+        return Err(format!("FAIL: interned {name_stem} missing physically"));
+    }
+    let run_bin = format!("{runp}/bin/bash");
+    let out = tb_out(
+        tb,
+        &[
+            "store-ns",
+            &store_s,
+            "--",
+            &run_bin,
+            "-c",
+            "[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT; echo \"RAN:$BASH_VERSION\"",
+        ],
+        "store-ns run from the input-addressed path",
+    )?;
+    for l in out.lines() {
+        println!("     {l}");
+    }
+    if !out.lines().any(|l| l.starts_with("RAN:5")) {
+        return Err(
+            "FAIL: [behavioral] the binary did not run from its input-addressed /td/store path"
+                .into(),
+        );
+    }
+    println!("   [behavioral] a real binary placed at the input-addressed path {runp} RUNS in the own-root");
+    if !out.lines().any(|l| l == "GNU-ABSENT") {
+        return Err("FAIL: [structural] /gnu/store is PRESENT in the own-root".into());
+    }
+    println!("   [structural] /gnu/store is ABSENT in the own-root");
+    Ok(())
+}
+
+// --- store-native-profile (formerly tests/store-native-profile.sh) ------------
+
+/// store-native-profile — `td-builder profile --store-native` assembles a profile
+/// of LOGICAL /td/store symlinks that RESOLVE + RUN inside a store-ns own-root
+/// with /gnu/store ABSENT (the .scm-free userspace assembly mechanism). Port of
+/// tests/store-native-profile.sh (gate 412).
+fn store_native_profile(root: &Path) -> Result<(), String> {
+    println!(
+        ">> store-native-profile: td-builder profile --store-native builds a profile of logical \
+         /td/store links that resolve + run in the store-ns own-root, /gnu/store ABSENT (the \
+         .scm-free userspace assembly mechanism)"
+    );
+    let tb = tb()?;
+    println!(">> td-builder (stage0, guix-free): {}", tb.display());
+    let work = fresh_scratch(root, ".store-native-profile-scratch")?;
+
+    // The declared bash-static fixture (#353): a real multi-entry static package.
+    let bs = gate_input("bash-static")?;
+    if !is_executable_file(&Path::new(&bs).join("bin/bash")) {
+        return Err(format!("FAIL: no static bash fixture at {bs}"));
+    }
+
+    // Intern it at the LOGICAL /td/store; bytes land physically under `store`.
+    let store = work.join("td-store");
+    mkdirp(&store)?;
+    let store_s = path_str(&store)?;
+    let db_s = path_str(&work.join("db.sqlite"))?;
+    let pkg = tb_out_env(
+        &tb,
+        &["store-add-recursive", "bash-static", &bs, &store_s, &db_s],
+        &[("TD_STORE_DIR", "/td/store")],
+        "store-add-recursive bash-static",
+    )?;
+    if !(pkg.starts_with("/td/store/") && pkg.ends_with("-bash-static")) {
+        return Err(format!(
+            "FAIL: bash-static not content-addressed at /td/store: {pkg}"
+        ));
+    }
+    let physpkg = store.join(base_of(&pkg));
+    let physpkg_s = path_str(&physpkg)?;
+    if !is_executable_file(&physpkg.join("bin/bash")) {
+        return Err(format!(
+            "FAIL: interned bash-static missing physically at {}",
+            physpkg.display()
+        ));
+    }
+
+    // A STORE-NATIVE profile: the links target the LOGICAL /td/store path.
+    let prof = store.join("profile");
+    let prof_s = path_str(&prof)?;
+    tb_out_env(
+        &tb,
+        &["profile", "--store-native", &prof_s, &physpkg_s],
+        &[("TD_STORE_DIR", "/td/store")],
+        "profile --store-native",
+    )?;
+
+    // [structural] the profile entries are LOGICAL /td/store symlinks.
+    for t in ["bash", "sh"] {
+        let link = prof.join("bin").join(t);
+        let tgt = std::fs::read_link(&link)
+            .map_err(|_| format!("FAIL: no profile entry for {t}"))?;
+        let tgt_s = tgt.to_string_lossy();
+        let want = format!("-bash-static/bin/{t}");
+        if !(tgt_s.starts_with("/td/store/") && tgt_s.ends_with(&want)) {
+            return Err(format!(
+                "FAIL: profile/bin/{t} is not a logical /td/store link (got: {tgt_s})"
+            ));
+        }
+    }
+    println!("   [structural] profile entries (bash, sh) are logical /td/store symlinks");
+
+    // Run the profiled tools in the own-root via a probe FILE bound in the store
+    // (no nested quoting between the outer capture and the inner script).
+    let probe = store.join("probe.sh");
+    writef(
+        &probe,
+        "export PATH=/td/store/profile/bin\n\
+         [ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT\n\
+         case \"$(command -v bash)\" in /td/store/profile/bin/bash) echo BASH-VIA-PROFILE ;; esac\n\
+         case \"$(command -v sh)\" in /td/store/profile/bin/sh) echo SH-VIA-PROFILE ;; esac\n\
+         bash -c 'echo \"BASH-RAN:$BASH_VERSION\"'\n\
+         sh -c 'echo SH-RAN-OK'\n",
+    )?;
+    let out = tb_out(
+        &tb,
+        &[
+            "store-ns",
+            &store_s,
+            "--",
+            "/td/store/profile/bin/bash",
+            "/td/store/probe.sh",
+        ],
+        "store-ns profile run",
+    )?;
+    for l in out.lines() {
+        println!("     {l}");
+    }
+
+    let has = |s: &str| out.lines().any(|l| l == s);
+    if !has("BASH-VIA-PROFILE") {
+        return Err("FAIL: bash did not resolve via /td/store/profile/bin".into());
+    }
+    if !has("SH-VIA-PROFILE") {
+        return Err("FAIL: sh did not resolve via /td/store/profile/bin".into());
+    }
+    if !out.lines().any(|l| l.starts_with("BASH-RAN:5")) {
+        return Err("FAIL: the profiled bash did not run from /td/store".into());
+    }
+    if !has("SH-RAN-OK") {
+        return Err("FAIL: the profiled sh did not run from /td/store".into());
+    }
+    println!(
+        "   [behavioral] the profiled tools resolve via /td/store/profile/bin and RUN from /td/store"
+    );
+    if !has("GNU-ABSENT") {
+        return Err(
+            "FAIL: /gnu/store is PRESENT in the own-root — mixed with the guix install".into(),
+        );
+    }
+    println!("   [structural] /gnu/store is ABSENT in the own-root (unmixed from the guix install)");
+
+    let _ = chmod_r_uw(&work);
+    let _ = std::fs::remove_dir_all(&work);
+    println!(
+        "PASS: store-native-profile — td-builder profile --store-native builds a profile of \
+         LOGICAL /td/store links that resolve + RUN in the store-ns own-root, /gnu/store ABSENT. \
+         The .scm-free userspace assembly mechanism the /td/store-native userland slots into."
+    );
+    Ok(())
+}
+
+// --- sandbox-hardening (formerly tests/sandbox-hardening.sh) -------------------
+
+/// sandbox-hardening — behavioral self-tests that td's loop sandbox
+/// (`td-builder host-sandbox`) exposes only a MINIMAL /dev (no host device leak)
+/// and REAPS its inner tree when the top td-builder is killed (PR_SET_PDEATHSIG).
+/// Port of tests/sandbox-hardening.sh (gate 272). Runs INSIDE the loop sandbox,
+/// so the nested td-builder's processes are visible in this PID namespace and a
+/// /proc cmdline scan confirms they are gone after the kill.
+fn sandbox_hardening(root: &Path) -> Result<(), String> {
+    let _ = root;
+    println!(
+        ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak) and \
+         reaps its inner tree when killed"
+    );
+    let tb = tb()?;
+    println!(">> td-builder (stage0, guix-free): {}", tb.display());
+
+    let realbash = which_canon("bash").ok_or_else(|| String::from("FAIL: no bash on PATH"))?;
+    let realsleep = which_canon("sleep").ok_or_else(|| String::from("FAIL: no sleep on PATH"))?;
+    let realbash_s = path_str(&realbash)?;
+    let realsleep_s = path_str(&realsleep)?;
+    let sroot = store_root_for(&realbash_s)?;
+    let sleep_root = store_root_for(&realsleep_s)?;
+    if sroot != sleep_root {
+        return Err(format!(
+            "FAIL: bash and sleep resolved under different store roots: {realbash_s} / {realsleep_s}"
+        ));
+    }
+
+    // (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input absent.
+    println!(
+        ">> (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input absent"
+    );
+    let dev_probe = "\
+[ -e /dev/null ] && [ -w /dev/null ]    || { echo \"  no writable /dev/null\";   exit 11; }
+[ -e /dev/zero ] && [ -e /dev/urandom ] || { echo \"  missing /dev/zero|urandom\"; exit 12; }
+for leak in kmsg kvm mem sda sdb nvme0n1 input/event0; do
+  [ -e \"/dev/$leak\" ] && { echo \"  LEAK: /dev/$leak is reachable\"; exit 21; }
+done
+exit 0
+";
+    tb_out(
+        &tb,
+        &[
+            "host-sandbox",
+            "--store-from",
+            &sroot,
+            "--store-at",
+            &sroot,
+            "--",
+            &realbash_s,
+            "-c",
+            dev_probe,
+        ],
+        "minimal-/dev assertion — the sandbox /dev is not minimal (host device leak)",
+    )?;
+    println!("   /dev exposes the standard nodes; kmsg/kvm/mem/disks/input are absent");
+
+    // (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree.
+    println!(">> (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree");
+    // A distinctive token carried in every inner cmdline. It doubles as the sleep
+    // duration, so it must be a large integer (≈ sleeps forever); derive it from
+    // this process's pid (unique in this PID namespace, no RNG needed).
+    let marker = (1_000_000u64 + u64::from(std::process::id()) % 1_000_000).to_string();
+    let inner = format!("{realsleep_s} {marker} & {realsleep_s} {marker} & wait");
+    let mut child = Command::new(&tb)
+        .args([
+            "host-sandbox",
+            "--store-from",
+            &sroot,
+            "--store-at",
+            &sroot,
+            "--",
+            &realbash_s,
+            "-c",
+            &inner,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("FAIL: cannot spawn the host-sandbox reaping probe: {e}"))?;
+    let top = i64::from(child.id());
+
+    let poll = std::time::Duration::from_millis(100);
+    for _ in 0..100 {
+        if scan_marker_procs(&marker) >= 2 {
+            break;
+        }
+        std::thread::sleep(poll);
+    }
+    let before = scan_marker_procs(&marker);
+    println!("   inner procs carrying the marker before kill: {before}");
+    if before < 2 {
+        let _ = crate::sys::kill_pid(top, crate::sys::SIGTERM);
+        sweep_marker_procs(&marker);
+        let _ = child.wait();
+        return Err(format!(
+            "FAIL: the inner sandbox tree never started (marker={marker})"
+        ));
+    }
+
+    crate::sys::kill_pid(top, crate::sys::SIGTERM)
+        .map_err(|e| format!("FAIL: cannot SIGTERM the top td-builder ({top}): {e}"))?;
+    for _ in 0..100 {
+        if scan_marker_procs(&marker) == 0 {
+            break;
+        }
+        std::thread::sleep(poll);
+    }
+    let after = scan_marker_procs(&marker);
+    let _ = child.wait();
+    println!("   inner procs carrying the marker after killing td-builder ({top}): {after}");
+    if after != 0 {
+        sweep_marker_procs(&marker);
+        return Err(format!(
+            "FAIL: {after} sandbox descendant(s) survived td-builder termination — orphaned \
+             (PR_SET_PDEATHSIG reaping broken)"
+        ));
+    }
+
+    println!(
+        "PASS: minimal /dev (no host device leak) + the inner sandbox tree is fully reaped when \
+         td-builder is killed."
+    );
+    Ok(())
+}
+
+// --- toolchain-input-addressed (formerly tests/toolchain-input-addressed.sh) ---
+
+/// toolchain-input-addressed — the /td/store modern toolchain (gcc-14.3.0 +
+/// binutils-2.44 + glibc-2.41) gets a STABLE input-addressed key derived from its
+/// DECLARED inputs, so its path is identical across non-reproducible rebuilds and
+/// predictable from the lock — the prereq for td-subst chain-caching. Port of
+/// tests/toolchain-input-addressed.sh (gate 414, i686).
+fn toolchain_input_addressed(root: &Path) -> Result<(), String> {
+    println!(
+        ">> toolchain-input-addressed: the /td/store modern toolchain gets a STABLE \
+         input-addressed key (td-toolchain.lock + toolchain-key/path) — a pure function of its \
+         declared inputs, identical across non-reproducible rebuilds, predictable from the lock"
+    );
+    let tb = tb()?;
+    println!(">> td-builder (stage0, guix-free): {}", tb.display());
+    let lock = root.join("tests/td-toolchain.lock");
+    let lock_s = path_str(&lock)?;
+    let lock_text = std::fs::read_to_string(&lock)
+        .map_err(|_| String::from("FAIL: missing tests/td-toolchain.lock"))?;
+    let work = fresh_scratch(root, ".toolchain-input-addressed-scratch")?;
+    let env = [("TD_STORE_DIR", "/td/store")];
+
+    // [pinned-sync] every lock pin mirrors the recipe source pin / patch it names.
+    let source_pins = recipe_eval_source_pins(root)?;
+    let (nin, npatch) = check_pinned_sync(root, &lock_text, &source_pins)?;
+    println!(
+        "   [pinned-sync] {nin} source pins + {npatch} patch pins match recipe source pins + \
+         seed/patches"
+    );
+
+    // [stable-key] the key + component paths are deterministic and distinct.
+    let k1 = tb_out_env(&tb, &["toolchain-key", &lock_s], &env, "toolchain-key")?;
+    let k2 = tb_out_env(&tb, &["toolchain-key", &lock_s], &env, "toolchain-key (repeat)")?;
+    if k1 != k2 {
+        return Err(format!(
+            "FAIL: [stable-key] toolchain-key not deterministic ({k1} vs {k2})"
+        ));
+    }
+    if k1.is_empty() || !k1.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("FAIL: [stable-key] key is not a hex digest: {k1}"));
+    }
+    let gccp = tb_out_env(&tb, &["toolchain-path", &lock_s, "gcc-14.3.0"], &env, "toolchain-path gcc")?;
+    let bup = tb_out_env(&tb, &["toolchain-path", &lock_s, "binutils-2.44"], &env, "toolchain-path binutils")?;
+    let glp = tb_out_env(&tb, &["toolchain-path", &lock_s, "glibc-2.41"], &env, "toolchain-path glibc")?;
+    for p in [&gccp, &bup, &glp] {
+        if !p.starts_with("/td/store/") {
+            return Err(format!("FAIL: [stable-key] not a /td/store path: {p}"));
+        }
+    }
+    let gccp_again =
+        tb_out_env(&tb, &["toolchain-path", &lock_s, "gcc-14.3.0"], &env, "toolchain-path gcc (repeat)")?;
+    if gccp_again != gccp {
+        return Err("FAIL: [stable-key] toolchain-path not deterministic".into());
+    }
+    if gccp == bup || gccp == glp || bup == glp {
+        return Err("FAIL: [stable-key] components collide".into());
+    }
+    println!(
+        "   [stable-key] key={k1}; gcc/binutils/glibc each get a distinct, deterministic /td/store \
+         path"
+    );
+
+    // [content-indep] same key, different bytes -> SAME input-addressed path
+    // (content-addressed store-add-recursive of the same two bytes splits).
+    let v1 = work.join("v1");
+    let v2 = work.join("v2");
+    mkdirp(&v1.join("bin"))?;
+    mkdirp(&v2.join("bin"))?;
+    writef(&v1.join("bin/x"), "AAAAA\n")?;
+    writef(&v2.join("bin/x"), "BBBBB-different\n")?;
+    let v1_s = path_str(&v1)?;
+    let v2_s = path_str(&v2)?;
+    let iaa = path_str(&work.join("iaA"))?;
+    let iab = path_str(&work.join("iaB"))?;
+    let iaa_db = path_str(&work.join("iaA.db"))?;
+    let iab_db = path_str(&work.join("iaB.db"))?;
+    let ia1 = tb_out_env(
+        &tb,
+        &["store-add-input-addressed", "glibc-2.41", &k1, &v1_s, &iaa, &iaa_db],
+        &env,
+        "store-add-input-addressed v1",
+    )?;
+    let ia2 = tb_out_env(
+        &tb,
+        &["store-add-input-addressed", "glibc-2.41", &k1, &v2_s, &iab, &iab_db],
+        &env,
+        "store-add-input-addressed v2",
+    )?;
+    if ia1 != ia2 {
+        return Err(format!(
+            "FAIL: [content-indep] input-addressed path moved with content ({ia1} vs {ia2})"
+        ));
+    }
+    if ia1 != glp {
+        return Err(format!(
+            "FAIL: [content-indep] producer path {ia1} != toolchain-path {glp} (consumer can't \
+             predict it)"
+        ));
+    }
+    let caa = path_str(&work.join("caA"))?;
+    let cab = path_str(&work.join("caB"))?;
+    let caa_db = path_str(&work.join("caA.db"))?;
+    let cab_db = path_str(&work.join("caB.db"))?;
+    let ca1 = tb_out_env(
+        &tb,
+        &["store-add-recursive", "glibc-2.41", &v1_s, &caa, &caa_db],
+        &env,
+        "store-add-recursive v1",
+    )?;
+    let ca2 = tb_out_env(
+        &tb,
+        &["store-add-recursive", "glibc-2.41", &v2_s, &cab, &cab_db],
+        &env,
+        "store-add-recursive v2",
+    )?;
+    if ca1 == ca2 {
+        return Err(
+            "FAIL: [content-indep] content-addressed paths did NOT move — fixture bytes are equal?"
+                .into(),
+        );
+    }
+    let (ha, hb) = match (registered_hash(&tb, &iaa_db, &ia1)?, registered_hash(&tb, &iab_db, &ia2)?) {
+        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => (a, b),
+        _ => {
+            return Err(
+                "FAIL: [content-indep] input-addressed adds did not register a NAR hash".into(),
+            )
+        }
+    };
+    if ha == hb {
+        return Err(
+            "FAIL: [content-indep] registered NAR hashes are equal — content integrity not recorded"
+                .into(),
+        );
+    }
+    println!(
+        "   [content-indep] same key+different bytes -> same path {ia1} (content-addressed would \
+         split: {ca1} vs {ca2})"
+    );
+
+    // [load-bearing] perturbing one input pin moves the path.
+    let pert_text = perturb_glibc_pin(&lock_text).ok_or_else(|| {
+        String::from("FAIL: [load-bearing] could not perturb the lock (glibc-2.41 input line not found)")
+    })?;
+    let pert = work.join("perturbed.lock");
+    writef(&pert, &pert_text)?;
+    let pert_s = path_str(&pert)?;
+    let glp_p =
+        tb_out_env(&tb, &["toolchain-path", &pert_s, "glibc-2.41"], &env, "toolchain-path (perturbed)")?;
+    if glp_p == glp {
+        return Err("FAIL: [load-bearing] perturbing an input pin did NOT change the path".into());
+    }
+    println!(
+        "   [load-bearing] flipping one declared input pin moves glibc-2.41's path ({glp} -> \
+         {glp_p})"
+    );
+
+    // [behavioral]+[structural] a real binary at an input-addressed path RUNS.
+    let bs = gate_input("bash-static")?;
+    if !is_executable_file(&Path::new(&bs).join("bin/bash")) {
+        return Err(format!("FAIL: no static bash fixture at {bs}"));
+    }
+    run_input_addressed_bash(&tb, &work, &bs, &k1, "bash-static")?;
+
+    let _ = chmod_r_uw(&work);
+    let _ = std::fs::remove_dir_all(&work);
+    println!(
+        "PASS: toolchain-input-addressed — the /td/store modern toolchain has a STABLE \
+         input-addressed key (td-toolchain.lock + toolchain-key/path): a pure function of its \
+         declared inputs, so its path is identical across non-reproducible rebuilds and \
+         predictable from the lock — the prereq for td-subst chain-caching (2b/2c). A real binary \
+         placed there runs, /gnu/store absent."
+    );
+    Ok(())
+}
+
+// --- toolchain-x86_64-input-addressed (formerly tests/toolchain-x86_64-input-addressed.sh) ---
+
+/// toolchain-x86_64-input-addressed — the x86_64 /td/store toolchain gets a STABLE
+/// input-addressed key that SHARES i686's exact source set with ARCH (name +
+/// component names) as the sole discriminator. Port of
+/// tests/toolchain-x86_64-input-addressed.sh (gate 418).
+fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
+    println!(
+        ">> toolchain-x86_64-input-addressed: the x86_64 /td/store toolchain gets a STABLE \
+         input-addressed key (td-toolchain-x86_64.lock + toolchain-key/path) — sharing i686's \
+         source set with ARCH as the sole discriminator, predictable from the lock"
+    );
+    let tb = tb()?;
+    println!(">> td-builder (stage0, guix-free): {}", tb.display());
+    let lock = root.join("tests/td-toolchain-x86_64.lock");
+    let ilock = root.join("tests/td-toolchain.lock");
+    let lock_s = path_str(&lock)?;
+    let ilock_s = path_str(&ilock)?;
+    let lock_text = std::fs::read_to_string(&lock)
+        .map_err(|_| String::from("FAIL: missing tests/td-toolchain-x86_64.lock"))?;
+    let ilock_text = std::fs::read_to_string(&ilock).map_err(|_| {
+        String::from("FAIL: missing tests/td-toolchain.lock (the i686 lock to compare against)")
+    })?;
+    let work = fresh_scratch(root, ".toolchain-x86_64-input-addressed-scratch")?;
+    let env = [("TD_STORE_DIR", "/td/store")];
+
+    // [pinned-sync] every lock pin mirrors the recipe source pin / patch it names.
+    let source_pins = recipe_eval_source_pins(root)?;
+    let (nin, npatch) = check_pinned_sync(root, &lock_text, &source_pins)?;
+    println!(
+        "   [pinned-sync] {nin} source pins + {npatch} patch pins match recipe source pins + \
+         seed/patches"
+    );
+
+    // [arch-parity] the x86_64 lock shares i686's EXACT source set; only the arch
+    // directives (name/recipe-rev/component) differ. Compare the sorted pin sets
+    // directly, and assert both locks carry only arch directives.
+    let mut xset = filter_pin_lines(&lock_text);
+    let mut iset = filter_pin_lines(&ilock_text);
+    xset.sort();
+    iset.sort();
+    if xset != iset {
+        return Err(
+            "FAIL: [arch-parity] x86_64 input/patch set differs from i686 — the cross must reuse \
+             i686's sources"
+                .into(),
+        );
+    }
+    for (name, text) in [
+        ("tests/td-toolchain-x86_64.lock", &lock_text),
+        ("tests/td-toolchain.lock", &ilock_text),
+    ] {
+        let bad = bad_directive_keys(text);
+        if !bad.is_empty() {
+            return Err(format!(
+                "FAIL: [arch-parity] {name} has an unexpected non-arch directive: {} (only \
+                 name/recipe-rev/component/input/patch allowed)",
+                bad.join(" ")
+            ));
+        }
+    }
+    println!(
+        "   [arch-parity] x86_64 lock shares i686's exact {nin}+{npatch} source set; only \
+         name/recipe-rev/component differ"
+    );
+
+    // [distinct-key] ARCH is the discriminator: distinct key, no path collision.
+    let kx = tb_out_env(&tb, &["toolchain-key", &lock_s], &env, "toolchain-key x86_64")?;
+    let ki = tb_out_env(&tb, &["toolchain-key", &ilock_s], &env, "toolchain-key i686")?;
+    if kx == ki {
+        return Err(format!(
+            "FAIL: [distinct-key] x86_64 key collides with i686 ({kx}) — arch did not re-key"
+        ));
+    }
+    println!(
+        "   [distinct-key] x86_64 key {kx} != i686 key {ki} (arch re-keys with zero source \
+         duplication)"
+    );
+
+    // [stable-key] deterministic, distinct, x86_64-suffixed /td/store paths.
+    let k2 = tb_out_env(&tb, &["toolchain-key", &lock_s], &env, "toolchain-key x86_64 (repeat)")?;
+    if kx != k2 {
+        return Err(format!(
+            "FAIL: [stable-key] toolchain-key not deterministic ({kx} vs {k2})"
+        ));
+    }
+    if kx.is_empty() || !kx.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("FAIL: [stable-key] key is not a hex digest: {kx}"));
+    }
+    let bup = tb_out_env(&tb, &["toolchain-path", &lock_s, "binutils-2.44-x86_64"], &env, "toolchain-path binutils x86_64")?;
+    let gccp = tb_out_env(&tb, &["toolchain-path", &lock_s, "gcc-14.3.0-x86_64"], &env, "toolchain-path gcc x86_64")?;
+    let glp = tb_out_env(&tb, &["toolchain-path", &lock_s, "glibc-2.41-x86_64"], &env, "toolchain-path glibc x86_64")?;
+    for p in [&bup, &gccp, &glp] {
+        if !(p.starts_with("/td/store/") && p.ends_with("-x86_64")) {
+            return Err(format!("FAIL: [stable-key] not an x86_64 /td/store path: {p}"));
+        }
+    }
+    let gccp_again = tb_out_env(
+        &tb,
+        &["toolchain-path", &lock_s, "gcc-14.3.0-x86_64"],
+        &env,
+        "toolchain-path gcc x86_64 (repeat)",
+    )?;
+    if gccp_again != gccp {
+        return Err("FAIL: [stable-key] toolchain-path not deterministic".into());
+    }
+    if gccp == bup || gccp == glp || bup == glp {
+        return Err("FAIL: [stable-key] components collide".into());
+    }
+    let i_gcc = tb_out_env(&tb, &["toolchain-path", &ilock_s, "gcc-14.3.0"], &env, "toolchain-path i686 gcc")?;
+    if gccp == i_gcc {
+        return Err("FAIL: [distinct-key] x86_64 gcc path == i686 gcc path".into());
+    }
+    println!(
+        "   [stable-key] key={kx}; cross binutils/gcc/glibc each get a distinct, deterministic \
+         x86_64 /td/store path"
+    );
+
+    // [load-bearing] recipe-rev bump moves the key; an input pin moves a path.
+    let rr_text = rewrite_recipe_rev(&lock_text)
+        .ok_or_else(|| String::from("FAIL: [load-bearing] could not bump recipe-rev"))?;
+    let rr = work.join("rr.lock");
+    writef(&rr, &rr_text)?;
+    let rr_s = path_str(&rr)?;
+    let kr = tb_out_env(&tb, &["toolchain-key", &rr_s], &env, "toolchain-key (recipe-rev bumped)")?;
+    if kr == kx {
+        return Err("FAIL: [load-bearing] bumping recipe-rev did NOT move the key".into());
+    }
+    let pin_text = perturb_glibc_pin(&lock_text).ok_or_else(|| {
+        String::from("FAIL: [load-bearing] could not perturb the glibc-2.41 input pin")
+    })?;
+    let pin = work.join("pin.lock");
+    writef(&pin, &pin_text)?;
+    let pin_s = path_str(&pin)?;
+    let glp_p = tb_out_env(
+        &tb,
+        &["toolchain-path", &pin_s, "glibc-2.41-x86_64"],
+        &env,
+        "toolchain-path (perturbed)",
+    )?;
+    if glp_p == glp {
+        return Err("FAIL: [load-bearing] perturbing an input pin did NOT move the path".into());
+    }
+    println!(
+        "   [load-bearing] recipe-rev bump moves the key; flipping one input pin moves \
+         glibc-2.41-x86_64's path"
+    );
+
+    // [behavioral]+[structural] a real binary at the x86_64-keyed path RUNS.
+    let bs = gate_input("bash-static")?;
+    if !is_executable_file(&Path::new(&bs).join("bin/bash")) {
+        return Err(format!("FAIL: no static bash fixture at {bs}"));
+    }
+    run_input_addressed_bash(&tb, &work, &bs, &kx, "bash-static-x86_64")?;
+
+    let _ = chmod_r_uw(&work);
+    let _ = std::fs::remove_dir_all(&work);
+    println!(
+        "PASS: toolchain-x86_64-input-addressed — the x86_64 /td/store toolchain has a STABLE \
+         input-addressed key (td-toolchain-x86_64.lock + toolchain-key/path): a pure function of \
+         its declared inputs, sharing i686's exact source set with ARCH (name+components) as the \
+         sole discriminator — distinct from i686, predictable from the lock across \
+         non-reproducible rebuilds. The prereq for fetching the x86_64 toolchain instead of the \
+         ~90-min from-seed rebuild (rust compile/userland rungs 3/4)."
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1980,5 +2972,93 @@ mod tests {
         // A missing memo is a loud provisioning error, not a fallback.
         let _ = std::fs::remove_dir_all(&root);
         assert!(stage0_from_memo(&root).is_err());
+    }
+
+    // A representative toolchain-lock fixture: the arch directives, two input
+    // pins (one of them glibc), one patch pin, plus a comment/blank to exercise
+    // the skip paths.
+    const LOCK_FIXTURE: &str = "\
+# a comment
+name td-toolchain-x86_64
+recipe-rev 1
+component gcc-14.3.0-x86_64 gcc-14.3.0
+
+input aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gcc-14.3.0.tar.xz
+input bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb glibc-2.41.tar.xz
+patch cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc glibc-boot-2.16.0.patch
+";
+
+    #[test]
+    fn parse_pin_lines_splits_input_and_patch_only() {
+        let pins = parse_pin_lines(LOCK_FIXTURE);
+        assert_eq!(pins.len(), 3, "two inputs + one patch, no directives");
+        assert!(matches!(pins[0].kind, PinKind::Input));
+        assert_eq!(pins[0].file, "gcc-14.3.0.tar.xz");
+        assert_eq!(
+            pins[1].sha,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert!(matches!(pins[2].kind, PinKind::Patch));
+        assert_eq!(pins[2].file, "glibc-boot-2.16.0.patch");
+    }
+
+    #[test]
+    fn filter_pin_lines_keeps_raw_pin_lines_for_set_compare() {
+        let raw = filter_pin_lines(LOCK_FIXTURE);
+        assert_eq!(raw.len(), 3);
+        assert!(raw.iter().all(|l| l.starts_with("input ") || l.starts_with("patch ")));
+        // Reordering the SAME pins yields an equal sorted set (arch-parity's crux).
+        let reordered = "\
+patch cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc glibc-boot-2.16.0.patch
+input bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb glibc-2.41.tar.xz
+input aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gcc-14.3.0.tar.xz
+";
+        let (mut a, mut b) = (raw, filter_pin_lines(reordered));
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn bad_directive_keys_flags_only_non_arch_directives() {
+        assert!(bad_directive_keys(LOCK_FIXTURE).is_empty());
+        let bad = bad_directive_keys("name x\nbogus 1\ninput s f\nweird 2\n");
+        assert_eq!(bad, vec!["bogus".to_string(), "weird".to_string()]);
+    }
+
+    #[test]
+    fn perturb_glibc_pin_zeroes_the_glibc_input() {
+        let out = perturb_glibc_pin(LOCK_FIXTURE).expect("glibc input present");
+        assert!(out.contains(&format!("input {} glibc-2.41.tar.xz", "0".repeat(64))));
+        // The gcc pin and the arch directives are untouched.
+        assert!(out.contains("input aaaa"));
+        assert!(out.contains("recipe-rev 1"));
+        // No glibc pin -> None (a vacuous perturbation is a hard error upstream).
+        assert!(perturb_glibc_pin("name x\ninput s gcc-14.3.0.tar.xz\n").is_none());
+    }
+
+    #[test]
+    fn rewrite_recipe_rev_bumps_one_to_two() {
+        let out = rewrite_recipe_rev(LOCK_FIXTURE).expect("recipe-rev 1 present");
+        assert!(out.contains("recipe-rev 2"));
+        assert!(!out.contains("recipe-rev 1"));
+        assert!(rewrite_recipe_rev("name x\nrecipe-rev 3\n").is_none());
+    }
+
+    #[test]
+    fn source_pin_sha_matches_on_the_file_field() {
+        let pins = "gcc\thttps://x/gcc.tar.xz\tdeadbeef\tgcc-14.3.0.tar.xz\n\
+                    glibc\thttps://x/glibc.tar.xz\tfeedface\tglibc-2.41.tar.xz\n";
+        assert_eq!(source_pin_sha(pins, "glibc-2.41.tar.xz").as_deref(), Some("feedface"));
+        assert_eq!(source_pin_sha(pins, "gcc-14.3.0.tar.xz").as_deref(), Some("deadbeef"));
+        assert_eq!(source_pin_sha(pins, "not-there.tar.xz"), None);
+    }
+
+    #[test]
+    fn store_root_for_takes_the_first_component_store() {
+        assert_eq!(store_root_for("/td/store/abc-bash/bin/bash").unwrap(), "/td/store");
+        assert_eq!(store_root_for("/gnu/store/abc-sleep/bin/sleep").unwrap(), "/gnu/store");
+        assert!(store_root_for("/not-a-store-path").is_err());
+        assert!(store_root_for("relative/store/x").is_err());
     }
 }

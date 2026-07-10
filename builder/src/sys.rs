@@ -56,6 +56,10 @@ const PR_SET_PDEATHSIG: usize = 1;
 /// SIGKILL — the parent-death signal the host-sandbox arms (uncatchable, so a
 /// wedged inner build cannot ignore it).
 pub const SIGKILL: usize = 9;
+/// SIGTERM — a graceful termination request (the signal a CI cancel/timeout
+/// sends). The sandbox-hardening gate SIGTERMs the top td-builder to prove the
+/// PR_SET_PDEATHSIG cascade reaps the inner tree even on a soft kill.
+pub const SIGTERM: usize = 15;
 
 // Bring a loopback interface up via SIOCSIFFLAGS on a dgram socket.
 const AF_INET: usize = 2;
@@ -260,6 +264,14 @@ const SYS_KILL: usize = 62;
 pub fn kill_process_group(pgid: u32, sig: usize) -> io::Result<()> {
     let neg = -(i64::from(pgid));
     check(unsafe { syscall5(SYS_KILL, neg as usize, sig, 0, 0, 0) })
+}
+
+/// kill(2) to a single PID (positive) — the sandbox-hardening gate SIGTERMs the
+/// top td-builder (proving PR_SET_PDEATHSIG reaps the inner tree) and SIGKILLs
+/// any stray marker process left behind on a failure path. Distinct from
+/// `kill_process_group`, which targets a whole group via a negative pid.
+pub fn kill_pid(pid: i64, sig: usize) -> io::Result<()> {
+    check(unsafe { syscall5(SYS_KILL, pid as usize, sig, 0, 0, 0) })
 }
 
 /// Try to take an exclusive, non-blocking flock on FD. `Ok(true)` = acquired (held

@@ -14,6 +14,10 @@
 //! binary placed at the x86_64-keyed path runs in the store-ns own-root, /gnu/store absent).
 //! Heavy: builds the guix-free stage0 td-builder + runs a rootless userns (like #204) — NOT a
 //! ~90-min toolchain build, NOT a BUILD_GATE.
+//!
+//! Native (#318 axis 3): the gate body is typed Rust in
+//! `gate_bodies::toolchain_x86_64_input_addressed`; `script: ""` marks it native, so the runner
+//! execs `td-builder gate-body toolchain-x86_64-input-addressed`.
 
 use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
@@ -36,9 +40,6 @@ pub fn gate() -> GateDef {
         }],
         store: StoreMode::Shared,
         non_blocking: false,
-        script: r##"
-echo ">> toolchain-x86_64-input-addressed: the x86_64 /td/store toolchain gets a STABLE input-addressed key (td-toolchain-x86_64.lock + toolchain-key/path) — sharing i686's source set with ARCH as the sole discriminator, predictable from the lock across non-reproducible rebuilds; a real binary placed there runs, /gnu/store absent (the x86_64 parallel of #204 — the x86_64 td-subst chain-caching prereq)"
-sh tests/toolchain-x86_64-input-addressed.sh
-"##,
+        script: "",
     }
 }
