@@ -42,9 +42,6 @@ const LEN_SYMBOLS: usize = 8;
 
 /// Decode a complete .xz file (one or more concatenated streams with
 /// optional stream padding) to its uncompressed bytes.
-// Not yet called from the unpack path (that cut-over rides re #469); until
-// then only the tests exercise it, so keep the release build warning-free.
-#[allow(dead_code)]
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     decompress_with_limit(data, MAX_XZ_OUTPUT_BYTES)
 }

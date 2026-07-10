@@ -2024,6 +2024,17 @@ pub fn run_mesboot() -> Result<(), String> {
             let mode = if exec { 0o755 } else { 0o644 };
             fs::set_permissions(&path, fs::Permissions::from_mode(mode))
                 .map_err(|e| err(format!("chmod {path}: {e}")))?;
+        } else if let Some(o) = step.get("unpack") {
+            // Engine-native source unpack (re #469): td's own std-only
+            // tar/gzip/bzip2/xz readers — the rungs declare no unpacker
+            // packages, so `{in:tar}`-shaped host edges are gone from the
+            // graph. keepTop=false strips the unique top-level dir
+            // (`--strip-components=1`); anything else is a hard error.
+            let input = ctx.expand(&field(o, "input")?).map_err(err)?;
+            let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
+            let keep_top = o.get("keepTop").is_some_and(Json::is_true);
+            crate::tar::unpack_archive(Path::new(&input), Path::new(&dest), keep_top)
+                .map_err(err)?;
         } else if let Some(o) = step.get("copyFiles") {
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             for f in ctx.expand_all(&strs(o, "files")?).map_err(err)? {

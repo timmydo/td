@@ -93,6 +93,17 @@ pub enum Step {
         content: String,
         exec: bool,
     },
+    /// Unpack a source tarball (`.tar`/`.tar.gz`/`.tar.bz2`/`.tar.xz` by
+    /// magic bytes) into dest with the ENGINE's own std-only readers — no
+    /// tar/gzip/bzip2/xz package in the sandbox at all (re #469: an unpacker
+    /// was every rung's excuse for host-tool inputs). `keep_top: false`
+    /// strips the single top-level directory (`tar --strip-components=1`);
+    /// the engine hard-errors if the tarball has no unique top-level dir.
+    Unpack {
+        input: String,
+        dest: String,
+        keep_top: bool,
+    },
     /// Copy files (flat) into dest, made user-writable (build trees are written into).
     CopyFiles {
         files: Vec<String>,
@@ -178,6 +189,18 @@ impl Step {
                     ("path".into(), Json::Str(path.clone())),
                     ("content".into(), Json::Str(content.clone())),
                     ("exec".into(), Json::Bool(*exec)),
+                ]),
+            )]),
+            Step::Unpack {
+                input,
+                dest,
+                keep_top,
+            } => Json::Obj(vec![(
+                "unpack".into(),
+                Json::Obj(vec![
+                    ("input".into(), Json::Str(input.clone())),
+                    ("dest".into(), Json::Str(dest.clone())),
+                    ("keepTop".into(), Json::Bool(*keep_top)),
                 ]),
             )]),
             Step::CopyFiles { files, dest } => Json::Obj(vec![(

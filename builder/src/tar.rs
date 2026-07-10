@@ -24,6 +24,69 @@ pub fn extract_tar_bz2(tar_bz2: &Path, dest: &Path) -> Result<(), String> {
     extract_tar_reader(&mut reader, &tar_bz2.display().to_string(), dest)
 }
 
+pub fn extract_tar_xz(tar_xz: &Path, dest: &Path) -> Result<(), String> {
+    let data = fs::read(tar_xz).map_err(|e| format!("read {}: {e}", tar_xz.display()))?;
+    let bytes = crate::xz::decompress(&data)?;
+    let mut reader = Cursor::new(bytes);
+    extract_tar_reader(&mut reader, &tar_xz.display().to_string(), dest)
+}
+
+/// Unpack a tarball by MAGIC BYTES (gzip 1f8b, bzip2 "BZh", xz fd377a585a00;
+/// anything else is read as plain tar) — the engine-native `unpack` step's
+/// entry, so no rung declares tar/gzip/bzip2/xz packages just to open its
+/// source (re #469). `keep_top: false` = `tar --strip-components=1`: the
+/// archive must have a UNIQUE top-level directory, which is elided; multiple
+/// top-level entries under strip is a hard error, never a silent mangle.
+pub fn unpack_archive(tarball: &Path, dest: &Path, keep_top: bool) -> Result<(), String> {
+    let extract_into = |d: &Path| -> Result<(), String> {
+        let mut f = File::open(tarball).map_err(|e| format!("open {}: {e}", tarball.display()))?;
+        let mut magic = [0u8; 6];
+        let n = f.read(&mut magic).map_err(|e| format!("read {}: {e}", tarball.display()))?;
+        match magic.get(..n).unwrap_or(&[]) {
+            m if m.starts_with(&[0x1f, 0x8b]) => extract_tar_gz(tarball, d),
+            m if m.starts_with(b"BZh") => extract_tar_bz2(tarball, d),
+            m if m.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) => {
+                extract_tar_xz(tarball, d)
+            }
+            _ => extract_tar(tarball, d),
+        }
+    };
+    if keep_top {
+        return extract_into(dest);
+    }
+    // Strip the top-level dir: extract beside dest (same filesystem, so the
+    // child renames below are atomic moves), then hoist the unique top dir's
+    // children into dest.
+    let tmp = dest.with_extension("unpack-tmp");
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp).map_err(|e| format!("clear {}: {e}", tmp.display()))?;
+    }
+    extract_into(&tmp)?;
+    let mut tops = fs::read_dir(&tmp)
+        .map_err(|e| format!("read {}: {e}", tmp.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read {}: {e}", tmp.display()))?;
+    let top = match (tops.pop(), tops.is_empty()) {
+        (Some(t), true) if t.path().is_dir() => t.path(),
+        _ => {
+            return Err(format!(
+                "unpack {}: stripping the top level needs exactly one top-level directory",
+                tarball.display()
+            ))
+        }
+    };
+    fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    for ent in fs::read_dir(&top).map_err(|e| format!("read {}: {e}", top.display()))? {
+        let ent = ent.map_err(|e| format!("read {}: {e}", top.display()))?;
+        let to = dest.join(ent.file_name());
+        fs::rename(ent.path(), &to).map_err(|e| {
+            format!("move {} -> {}: {e}", ent.path().display(), to.display())
+        })?;
+    }
+    fs::remove_dir_all(&tmp).map_err(|e| format!("clear {}: {e}", tmp.display()))?;
+    Ok(())
+}
+
 pub fn extract_tar_reader<R: Read>(
     file: &mut R,
     source_name: &str,
