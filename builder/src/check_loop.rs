@@ -1333,14 +1333,55 @@ fn heavy_warms(root: &Path) {
 /// input closure, #267; only bare-drv requests use it), TD_BUILD_JOBS (the
 /// global budget — inherited by the spawned daemon), TD_NICE (nice level for
 /// the daemon + its build children, default 10).
-fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
-    let daemon_dir = match std::env::var("TD_DAEMON_DIR") {
-        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+/// The daemon's runtime dir (sockets, pid files, the blessed seed-closure db):
+/// `TD_DAEMON_DIR` or `$HOME/.td/build-daemon`. Shared by `ensure_build_daemon`
+/// (which creates state here) and the daemon/child verbs (which RE-DERIVE the
+/// same paths rather than trusting an argv, re #469 round-8).
+pub(crate) fn daemon_runtime_dir() -> Result<PathBuf, String> {
+    match std::env::var("TD_DAEMON_DIR") {
+        Ok(v) if !v.trim().is_empty() => Ok(PathBuf::from(v)),
         _ => {
             let home = std::env::var("HOME").map_err(|_| s("no HOME for TD_DAEMON_DIR"))?;
-            Path::new(&home).join(".td/build-daemon")
+            Ok(Path::new(&home).join(".td/build-daemon"))
         }
-    };
+    }
+}
+
+/// The DERIVED path of the blessed seed-closure db for (repo ROOT, SEED-DIR):
+/// keyed by the repo's own checked-in seed-lock declarations, never by a
+/// caller-supplied path. This is the round-8 origin-authentication fix for the
+/// `BlessedSeedClosure` intake: the daemon and its `daemon-build`/`daemon-check`
+/// children re-derive the db location from the same repo-declared inputs
+/// `ensure_build_daemon` blessed under, so NO public interface accepts a
+/// caller-selected db path as manifest authority — a raw path can no longer
+/// become a typed origin. (A same-user writer can still forge the file at the
+/// derived location; that trust-domain limit is the same one recorded on the
+/// receipt layer, and a daemon-owned provenance db remains the follow-on,
+/// re #472.) `None` when the repo declares no seed-lock roots — there is
+/// nothing to bless, and strict staging fails closed on unvouched items.
+pub(crate) fn blessed_seed_db_path(
+    root: &Path,
+    seed_dir: &str,
+) -> Result<Option<PathBuf>, String> {
+    let roots = seed_lock_roots(root);
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let mut h = crate::sha256::Sha256::new();
+    h.update(seed_dir.as_bytes());
+    for r in &roots {
+        h.update(b"\n");
+        h.update(r.as_bytes());
+    }
+    let bfull = crate::sha256::to_base16(&h.finalize());
+    let bkey: String = bfull.chars().take(16).collect();
+    Ok(Some(
+        daemon_runtime_dir()?.join(format!("seed-bless.{bkey}.db")),
+    ))
+}
+
+fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
+    let daemon_dir = daemon_runtime_dir()?;
     let store = daemon_dir.join("store");
     std::fs::create_dir_all(&store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
     // Default seed store = DERIVED from the declared seed-lock paths, read
@@ -1402,57 +1443,48 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     // a td-owned db vouching the pinned toolchain closure they stage from the
     // seed dir. The `seed-bless` verb derives the roots ITSELF from the repo's
     // checked-in seed-lock declarations (cwd = root below) — no caller-supplied
-    // roots file exists to tamper with. The db is keyed by those declared roots
-    // (store paths embed content hashes, so a pin bump derives a new key and
+    // roots file exists to tamper with. The db lives at the DERIVED
+    // `blessed_seed_db_path` location, keyed by those declared roots (store
+    // paths embed content hashes, so a pin bump derives a new key and
     // re-blesses); an existing db is REUSED, never rewritten — re-blessing
     // would re-trust whatever is currently on disk, the existence-as-authority
-    // hole the manifest closes. Handed to the daemon as an EXPLICIT argument
-    // below; the daemon threads it to every build child's argv (the
-    // TD_EXTRA_DBS env channel is deleted, re #469 typed origins).
-    let roots = seed_lock_roots(root);
-    let bless_db = if roots.is_empty() {
-        eprintln!(
-            "td-builder check: WARNING: no declared seed-lock roots to bless — daemon \
-             builds will red on unvouched closure items (re #469)"
-        );
-        None
-    } else {
-        let mut h = crate::sha256::Sha256::new();
-        h.update(seed_dir.as_bytes());
-        for r in &roots {
-            h.update(b"\n");
-            h.update(r.as_bytes());
-        }
-        let bfull = crate::sha256::to_base16(&h.finalize());
-        let bkey: String = bfull.chars().take(16).collect();
-        let db = daemon_dir.join(format!("seed-bless.{bkey}.db"));
-        if !db.exists() {
+    // hole the manifest closes. NOT handed to the daemon: the daemon's build
+    // children RE-DERIVE the same path from the same repo-declared inputs
+    // (re #469 round-8 — a caller-selected db path is no longer an intake).
+    match blessed_seed_db_path(root, &seed_dir)? {
+        None => {
             eprintln!(
-                "td-builder check: blessing the declared seed closure ({} roots) into {} — \
-                 a one-time hash of the pinned toolchain (re #469)",
-                roots.len(),
-                db.display()
+                "td-builder check: WARNING: no declared seed-lock roots to bless — daemon \
+                 builds will red on unvouched closure items (re #469)"
             );
-            let tmp = daemon_dir.join(format!("seed-bless.{bkey}.db.tmp"));
-            let out = Command::new(&daemon_tb)
-                .args(["seed-bless", &seed_dir])
-                .arg(&tmp)
-                .current_dir(root)
-                .output()
-                .map_err(|e| format!("spawn seed-bless: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "seed-bless failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                ));
-            }
-            // Atomic placement: a concurrent ensure (other daemon key) or a
-            // crash never leaves a half-written db under the blessed name.
-            std::fs::rename(&tmp, &db)
-                .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), db.display()))?;
         }
-        Some(db)
-    };
+        Some(db) => {
+            if !db.exists() {
+                eprintln!(
+                    "td-builder check: blessing the declared seed closure into {} — \
+                     a one-time hash of the pinned toolchain (re #469)",
+                    db.display()
+                );
+                let tmp = db.with_extension("db.tmp");
+                let out = Command::new(&daemon_tb)
+                    .args(["seed-bless", &seed_dir])
+                    .arg(&tmp)
+                    .current_dir(root)
+                    .output()
+                    .map_err(|e| format!("spawn seed-bless: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "seed-bless failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                // Atomic placement: a concurrent ensure (other daemon key) or a
+                // crash never leaves a half-written db under the blessed name.
+                std::fs::rename(&tmp, &db)
+                    .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), db.display()))?;
+            }
+        }
+    }
 
     // Start a fresh daemon, detached in its OWN process group so it outlives
     // this check AND survives the terminal's ^C/hangup signals (the machine-
@@ -1479,12 +1511,11 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         seed_dir,
         store.display().to_string(),
     ]);
-    // The blessed seed-closure db rides as an EXPLICIT daemon argument; the
-    // daemon threads it to every build child's argv. There is no env channel
-    // through which a caller can add manifest authority (re #469 typed origins).
-    if let Some(db) = &bless_db {
-        argv.push(db.display().to_string());
-    }
+    // The blessed seed-closure db is NOT an argument: the daemon's build
+    // children re-derive its location from the repo's own seed-lock
+    // declarations (`blessed_seed_db_path` over their cwd = root, spawned
+    // below with `current_dir(root)`), so no argv or env channel can add
+    // manifest authority (re #469 round-8 origin authentication).
     let (head, rest) = argv
         .split_first()
         .ok_or_else(|| s("internal: empty daemon argv"))?;
@@ -1889,6 +1920,58 @@ mod tests {
         assert!(envs
             .iter()
             .any(|(k, v)| k == "TD_SUBST_BIN" && v.ends_with("/td-subst")));
+    }
+
+    // The blessed-seed db location is a PURE FUNCTION of the repo's seed-lock
+    // declarations + the seed dir (re #469 round-8): the daemon and its
+    // children DERIVE it — there is no argv/env channel that can point the
+    // BlessedSeedClosure origin at a caller-selected db. Same declarations →
+    // same basename; different seed dir or root set → different basename; no
+    // declarations → no bless db at all.
+    #[test]
+    fn blessed_seed_db_path_derives_from_declarations_only() {
+        let d = scratch("bless-derive");
+        // Two fake declared seed roots that exist on disk (seed_lock_roots
+        // keeps only existing absolute paths).
+        let (r1, r2) = (d.join("store").join("aaa-tool"), d.join("store").join("bbb-lib"));
+        std::fs::create_dir_all(d.join("store")).unwrap();
+        std::fs::write(&r1, b"t").unwrap();
+        std::fs::write(&r2, b"l").unwrap();
+        let repo = d.join("repo");
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(
+            repo.join("tests/td-builder-rust.lock"),
+            format!("tool {}\nlib {}\n", r1.display(), r2.display()),
+        )
+        .unwrap();
+        let name_at = |root: &Path, seed_dir: &str| {
+            blessed_seed_db_path(root, seed_dir)
+                .unwrap()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        };
+        let a = name_at(&repo, "/seed/dir").unwrap();
+        assert_eq!(a, name_at(&repo, "/seed/dir").unwrap(), "must be deterministic");
+        assert!(
+            a.starts_with("seed-bless.") && a.ends_with(".db"),
+            "derived name shape: {a}"
+        );
+        assert_ne!(
+            a,
+            name_at(&repo, "/other/dir").unwrap(),
+            "a different seed dir must derive a different bless db"
+        );
+        // Dropping a declared root changes the derivation too.
+        std::fs::write(
+            repo.join("tests/td-builder-rust.lock"),
+            format!("tool {}\n", r1.display()),
+        )
+        .unwrap();
+        assert_ne!(a, name_at(&repo, "/seed/dir").unwrap());
+        // No declarations → None: nothing to bless, nothing to derive.
+        let bare = d.join("bare-repo");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(blessed_seed_db_path(&bare, "/seed/dir").unwrap(), None);
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

@@ -1540,6 +1540,97 @@ fn receipt_outputs(
     if ok { Some(outputs) } else { None }
 }
 
+/// AUTHENTICATE a `--recipe-output-db DB` before its rows can be typed
+/// `RecipeOutput` (re #469 round-8): the db path is a public argv, so presence
+/// of a registration row is not authority — every hashed row must be backed by
+/// an ENGINE-ISSUED receipt in `<DB>.receipts/` (written by
+/// `commit_scratch_to_store` after a real local build) whose `output` line
+/// records exactly that (path, NAR hash) and whose producer is `local-build`.
+/// A db `store-register`'d over arbitrary bytes has no receipts and refuses
+/// intake; a receipt disagreeing with the row refuses intake. Same honest
+/// limit as the receipt layer: a same-user writer can forge both files —
+/// the daemon-owned provenance db is the follow-on (re #472); what this
+/// removes is the cheaper forgery the review named, a raw db path minting a
+/// typed origin.
+fn authenticate_recipe_output_db(dbp: &str) -> Result<(), String> {
+    let receipts_dir = format!("{dbp}.receipts");
+    let mut backed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    match std::fs::read_dir(&receipts_dir) {
+        Err(e) => {
+            return Err(format!(
+                "recipe-output db {dbp}: provenance rejected: no engine-issued receipts at \
+                 {receipts_dir} ({e}) — a registration db alone cannot be typed RecipeOutput; \
+                 rebuild through the receipt-writing path (re #469 round-8)"
+            ))
+        }
+        Ok(rd) => {
+            for ent in rd {
+                let ent = ent.map_err(|e| format!("read {receipts_dir}: {e}"))?;
+                let p = ent.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("receipt") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&p)
+                    .map_err(|e| format!("read receipt {}: {e}", p.display()))?;
+                let mut lines = text.lines();
+                if lines.next() != Some("td-receipt v1") {
+                    return Err(format!(
+                        "recipe-output db {dbp}: malformed receipt {} (bad header)",
+                        p.display()
+                    ));
+                }
+                let mut producer_ok = false;
+                let mut outs: Vec<(String, String)> = Vec::new();
+                for l in lines {
+                    if let Some(v) = l.strip_prefix("producer ") {
+                        producer_ok = v == "local-build";
+                    } else if let Some(v) = l.strip_prefix("output ") {
+                        let mut f = v.split_whitespace();
+                        if let (Some(pth), Some(h)) = (f.next(), f.next()) {
+                            outs.push((pth.to_string(), h.to_string()));
+                        }
+                    }
+                }
+                if !producer_ok {
+                    continue; // a receipt that is not a local build backs nothing
+                }
+                for (pth, h) in outs {
+                    if let Some(prev) = backed.get(&pth) {
+                        if prev != &h {
+                            return Err(format!(
+                                "recipe-output db {dbp}: receipts disagree on {pth} \
+                                 ({prev} vs {h}) — refusing a contradictory record"
+                            ));
+                        }
+                    }
+                    backed.insert(pth, h);
+                }
+            }
+        }
+    }
+    let data = std::fs::read(dbp).map_err(|e| format!("read recipe-output db {dbp}: {e}"))?;
+    let db = store_db_read::Db::open(data)?;
+    for (path, hash) in db.hashes_by_path()? {
+        match backed.get(&path) {
+            Some(h) if *h == hash => {}
+            Some(h) => {
+                return Err(format!(
+                    "recipe-output db {dbp}: provenance rejected: `{path}' is registered with \
+                     hash {hash} but its receipt records {h} (re #469 round-8)"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "recipe-output db {dbp}: provenance rejected: no engine-issued receipt \
+                     vouches for `{path}' — a registration row alone cannot be typed \
+                     RecipeOutput (re #469 round-8)"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Content-addressed build cache, RECEIPT-GATED (re #469 round-7). The assembled
 /// `.drv` path is deterministic (its hash covers the inputs + builder + env), so
 /// if every output of PARSED is already present under SCRATCH/newstore, recorded
@@ -1831,6 +1922,29 @@ fn output_trees_present(dir: &Path, canons: &[String]) -> bool {
 
 /// Realize ONE drv into a content-addressed keyed scratch under `scratch_base`, with
 /// guix-daemon-parity cache reuse (a valid prior output is not rebuilt). Returns
+/// DERIVE the blessed seed-closure db for this process's repo root (cwd) and
+/// SEED-DIR — the round-8 replacement for the deleted `[BLESS-DB]` argv: the
+/// db's location is a pure function of the repo's checked-in seed-lock
+/// declarations, so a public caller cannot point the `BlessedSeedClosure`
+/// origin at a db of their choosing. A derived path with no db on disk means
+/// "nothing blessed": the build proceeds without that authority and strict
+/// staging fails closed on unvouched closure items.
+fn derived_bless_db(seed_dir: &str) -> Result<Option<String>, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+    match check_loop::blessed_seed_db_path(&cwd, seed_dir)? {
+        Some(db) if db.is_file() => Ok(Some(db.display().to_string())),
+        Some(db) => {
+            eprintln!(
+                "td-builder: no blessed seed-closure db at the derived {} — staging has no \
+                 BlessedSeedClosure authority (run `td-builder check` to bless; re #469)",
+                db.display()
+            );
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
 /// (canonical store path, host output path). Run in a child process by `daemon-build`.
 fn daemon_realize_one(
     drv: &str,
@@ -1853,11 +1967,11 @@ fn daemon_realize_one(
     };
     // The daemon scans the live store dir: entries are canonical where they sit.
     // Strict manifests are unconditional (re #469): the vouching db is the blessed
-    // seed-closure db, handed down as an EXPLICIT `daemon-build` argument —
-    // ensure_build_daemon blesses the REPO-DECLARED seed-lock closure once and
-    // passes the db through the daemon's argv, so every staged item must match
-    // the hash recorded at bless time. There is no env channel that can add
-    // manifest authority (re #469 typed origins).
+    // seed-closure db at its DERIVED location (`derived_bless_db` in the arm) —
+    // ensure_build_daemon blesses the REPO-DECLARED seed-lock closure once, and
+    // the child re-derives where that record must live, so every staged item must
+    // match the hash recorded at bless time and neither env nor argv can add
+    // manifest authority (re #469 round-8 origin authentication).
     let extra_dbs: Vec<(String, sandbox::InputOrigin)> = bless_db
         .map(|d| vec![(d.to_string(), sandbox::InputOrigin::BlessedSeedClosure)])
         .unwrap_or_default();
@@ -1910,7 +2024,7 @@ fn daemon_check_one(
     let scr = scratch_base.join(format!("{key}-chk"));
     let _ = std::fs::remove_dir_all(&scr); // the rebuild here must be fresh, never a cache reuse
     let r1 = scr.join("r1");
-    // Same explicit-argument channel as daemon_realize_one (re #469 typed origins).
+    // Same derived-location channel as daemon_realize_one (re #469 round-8).
     let extra_dbs: Vec<(String, sandbox::InputOrigin)> = bless_db
         .map(|d| vec![(d.to_string(), sandbox::InputOrigin::BlessedSeedClosure)])
         .unwrap_or_default();
@@ -2140,6 +2254,75 @@ fn manifest_from_typed_dbs(
     Ok(m)
 }
 
+/// AUTHENTICATE a content-addressed placement db before its rows join the
+/// typed staging manifest (re #469 round-8): a typed origin must be a VERIFIED
+/// claim, not a label a caller minted by handing the engine a path. Every
+/// hashed row must describe a store item whose on-disk bytes — read from
+/// `items_dir/<basename>` — reproduce BOTH the recorded NAR hash and the
+/// row's own canonical path (`make_store_path_in` over the item's name, the
+/// same recomputation `auto_seed_provenance` performs on seeds). A db that
+/// `store-register`/`store-add-recursive` wrote over foreign bytes fails the
+/// recomputation: the db can locate bytes, but only bytes that content-address
+/// to their claimed name can carry authority. Cost: one NAR hash per row per
+/// process — placement dbs hold the placed item plus hashless scaffolding-ref
+/// rows, so this is one source/builder tree per build, the recorded
+/// re-hash-every-step decision. Verified (db, items_dir) pairs are memoized
+/// per process (the same db is assembled for the reuse gate AND the realize).
+fn authenticate_ca_db(dbp: &str, items_dir: &Path, label: &str) -> Result<(), String> {
+    use std::sync::{Mutex, OnceLock};
+    static VERIFIED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let memo_key = format!("{dbp}\x1f{}", items_dir.display());
+    let memo = VERIFIED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if let Ok(seen) = memo.lock() {
+        if seen.contains(&memo_key) {
+            return Ok(());
+        }
+    }
+    let data = std::fs::read(dbp).map_err(|e| format!("read {label} db {dbp}: {e}"))?;
+    let db = store_db_read::Db::open(data)?;
+    for (path, hash) in db.hashes_by_path()? {
+        let base = path.rsplit('/').next().unwrap_or(path.as_str());
+        let prefix = path
+            .strip_suffix(base)
+            .and_then(|p| p.strip_suffix('/'))
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                format!("{label} db {dbp}: row `{path}' is not a canonical store path")
+            })?;
+        let on_disk = items_dir.join(base);
+        let got = nar_hash_path(&on_disk).map_err(|e| {
+            format!(
+                "{label} db {dbp}: authenticate `{path}': hash {}: {e}",
+                on_disk.display()
+            )
+        })?;
+        if got != hash {
+            return Err(format!(
+                "{label} db {dbp}: provenance rejected: `{path}' is recorded with hash {hash} \
+                 but the bytes at {} hash to {got} — a placement db vouches only for bytes it \
+                 can reproduce (re #469 round-8)",
+                on_disk.display()
+            ));
+        }
+        let hex = got.strip_prefix("sha256:").ok_or_else(|| {
+            format!("{label} db {dbp}: unexpected NAR hash format for `{path}': {got}")
+        })?;
+        let item_name = base.split_once('-').map_or(base, |(_, n)| n);
+        let expect = store::make_store_path_in(prefix, "source", hex, item_name);
+        if expect != path {
+            return Err(format!(
+                "{label} db {dbp}: provenance rejected: `{path}' content-addresses to \
+                 `{expect}' — the item's bytes do not reproduce its own name (self-registered \
+                 under a foreign address or tampered post-intern; re #469 round-8)"
+            ));
+        }
+    }
+    if let Ok(mut seen) = memo.lock() {
+        seen.insert(memo_key);
+    }
+    Ok(())
+}
+
 /// Assemble the COMPLETE typed staging manifest a realize of this plan would
 /// stage from: the caller's typed extra dbs, each td-interned source/vendor
 /// placement db (`AuditedSeed` — a declared fixed-output fetch td restored
@@ -2148,6 +2331,10 @@ fn manifest_from_typed_dbs(
 /// `ReceiptExpect.manifest_sha256` — which is computed from THIS assembly
 /// BEFORE any cache is consulted, so a reuse decision is bound to exactly the
 /// authority set a fresh build would stage from (re #469 round-7).
+/// The source and builder placement dbs are AUTHENTICATED here (round-8):
+/// their rows must content-address to themselves (`authenticate_ca_db`) — a
+/// caller-supplied SRC-DB/TD_BUILDER_DB path locates bytes but cannot type
+/// foreign bytes `AuditedSeed`/`ControlPlaneBuilder`.
 fn assemble_input_manifest(
     extra_dbs: &[(String, sandbox::InputOrigin)],
     src_overrides: &[SrcOverride],
@@ -2155,6 +2342,10 @@ fn assemble_input_manifest(
 ) -> Result<sandbox::StageManifest, String> {
     let mut manifest = manifest_from_typed_dbs(extra_dbs)?;
     for ov in src_overrides {
+        let items_dir = Path::new(&ov.on_disk).parent().ok_or_else(|| {
+            format!("source placement {} has no parent store dir", ov.on_disk)
+        })?;
+        authenticate_ca_db(&ov.db, items_dir, "source placement")?;
         let data =
             std::fs::read(&ov.db).map_err(|e| format!("read source db {}: {e}", ov.db))?;
         manifest_add_db(
@@ -2165,6 +2356,10 @@ fn assemble_input_manifest(
         )?;
     }
     if let Some(ov) = builder_override {
+        let items_dir = Path::new(&ov.on_disk).parent().ok_or_else(|| {
+            format!("builder placement {} has no parent store dir", ov.on_disk)
+        })?;
+        authenticate_ca_db(&ov.db, items_dir, "builder placement")?;
         let data =
             std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?;
         manifest_add_db(
@@ -2264,6 +2459,20 @@ fn realize_drv(
 ) -> Result<Vec<OutputReg>, String> {
     let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
     let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
+    // BIND the builder override to THIS drv (re #469 round-8): the override's
+    // db may vouch only for the builder the drv actually names — a
+    // `ControlPlaneBuilder` record for some other binary is authority for
+    // nothing here, whatever its rows contain.
+    if let Some(ov) = builder_override {
+        let under = format!("{}/", ov.canonical);
+        if parsed.builder != ov.canonical && !parsed.builder.starts_with(&under) {
+            return Err(format!(
+                "builder override {} does not match the drv's builder {} — a builder \
+                 placement db carries authority only for the drv's own builder (re #469)",
+                ov.canonical, parsed.builder
+            ));
+        }
+    }
     // Input ROOTS: the drv's source inputs, plus each input derivation's requested
     // output paths (resolved by reading that input .drv).
     let mut roots: Vec<String> = parsed.input_srcs.clone();
@@ -3055,6 +3264,12 @@ fn build_plan(
     // td.db joins typed `RecipeOutput` — under strict provenance every staged
     // item must be vouched for by one of these TYPED dbs, so the seed STORE
     // directory contributes bytes, never authority (re #469).
+    // The seed db is AUTHENTICATED before it carries any (round-8): SEED-DB is
+    // a caller path (and may pre-exist warm across runs), so every row must
+    // content-address to itself AND land on a basename the compiled seed-digest
+    // table pins — a store-register'd row over foreign bytes, or a CA-valid
+    // item the pins never derived, cannot be typed `AuditedSeed`.
+    authenticate_seed_db(seed_db, Path::new(guix_store))?;
     let mut built: BTreeMap<String, String> = BTreeMap::new();
     let mut td_dbs: Vec<(String, sandbox::InputOrigin)> =
         vec![(seed_db.to_string(), sandbox::InputOrigin::AuditedSeed)];
@@ -3316,6 +3531,134 @@ fn seed_digests_expected(key: &str) -> Result<Option<&'static str>, String> {
         }
     }
     Ok(None)
+}
+
+/// The COMPILED control-plane seed-capture pins (re #469 round-8):
+/// `seed/control-plane-seed-pins.txt`, sha256 of each ADMISSIBLE frozen seed
+/// tarball (the `seed-manifest`/`seed-unpack` capture of the pinned §5
+/// toolchain). Compiled in so the authority travels with td-builder itself;
+/// pinning a new capture is a reviewed commit, never a runtime side effect.
+const CONTROL_PLANE_SEED_PINS: &str = include_str!("../../seed/control-plane-seed-pins.txt");
+
+/// AUTHENTICATE a `TD_SEED_DB` seed-capture db (re #469 round-8): the env var
+/// is public, so the db is not trusted by presence — `seed-unpack` binds the
+/// db to the tarball it restored from via the `<db>.seed-tarball` sidecar
+/// (sha256 of the tarball bytes), and that sha256 must be one the COMPILED
+/// pins file admits. The unforgeable core is the compiled pin: it names ONE
+/// exact audited capture. (The sidecar itself is same-user-writable — the
+/// standing trust-domain limit recorded on the receipt layer; the daemon-owned
+/// provenance db is the follow-on, re #472.) A db with no sidecar (any db not
+/// written by the current `seed-unpack`) or an unpinned capture refuses intake.
+fn authenticate_seed_capture_db(dbp: &str) -> Result<(), String> {
+    authenticate_seed_capture_db_with(dbp, CONTROL_PLANE_SEED_PINS)
+}
+
+/// The pins-parameterized core of `authenticate_seed_capture_db` — production
+/// always passes the COMPILED pins; tests pass synthetic pins to drive the
+/// green path without a repo-pinned capture existing yet.
+fn authenticate_seed_capture_db_with(dbp: &str, pins: &str) -> Result<(), String> {
+    let sidecar = format!("{dbp}.seed-tarball");
+    let text = std::fs::read_to_string(&sidecar).map_err(|e| {
+        format!(
+            "seed db {dbp}: provenance rejected: no seed-tarball binding at {sidecar} ({e}) — \
+             re-run `td-builder seed-unpack` (it records the capture the db restores) and pin \
+             the capture in seed/control-plane-seed-pins.txt (re #469 round-8)"
+        )
+    })?;
+    let sha = text
+        .lines()
+        .find_map(|l| l.strip_prefix("sha256 "))
+        .map(|rest| rest.split_whitespace().next().unwrap_or(""))
+        .filter(|s| s.len() == 64)
+        .ok_or_else(|| format!("seed db {dbp}: malformed sidecar {sidecar}"))?;
+    // The sidecar also fixes the db BYTES seed-unpack wrote: a row added or
+    // edited after the restore breaks this leg even with a pinned capture —
+    // the pin vouches for what the tarball restored, not for later edits.
+    let want_db_sha = text
+        .lines()
+        .find_map(|l| l.strip_prefix("db-sha256 "))
+        .map(str::trim)
+        .filter(|s| s.len() == 64)
+        .ok_or_else(|| format!("seed db {dbp}: sidecar {sidecar} has no db-sha256 binding"))?;
+    let got_db_sha = sha256::sha256_file(Path::new(dbp))
+        .map_err(|e| format!("sha256 {dbp}: {e}"))?;
+    if got_db_sha != want_db_sha {
+        return Err(format!(
+            "seed db {dbp}: provenance rejected: the db was modified after seed-unpack wrote \
+             it (sidecar db-sha256 {want_db_sha}, current {got_db_sha}) — re-run seed-unpack \
+             (re #469 round-8)"
+        ));
+    }
+    for (n, line) in pins.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let pin = line.split_whitespace().next().unwrap_or("");
+        if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "seed/control-plane-seed-pins.txt line {}: malformed pin `{line}'",
+                n + 1
+            ));
+        }
+        if pin == sha {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "seed db {dbp}: provenance rejected: its capture sha256 {sha} is not pinned in \
+         seed/control-plane-seed-pins.txt — an unaudited seed capture cannot be typed \
+         AuditedSeed; pin the capture via a reviewed commit (re #469 round-8)"
+    ))
+}
+
+/// AUTHENTICATE a plan's seed db (re #469 round-8): the db path is
+/// caller-supplied (and reused warm across `--auto` runs), so its rows are not
+/// trusted by presence — every row must (a) content-address to its own on-disk
+/// bytes (`authenticate_ca_db`) and (b) land on a basename the COMPILED
+/// seed-digest table pins for some seed key. (a) kills rows registered over
+/// foreign bytes; (b) kills self-consistent CA items the audited pins never
+/// derived — together the db can only vouch for the pinned seed universe.
+/// An ABSENT db authenticates vacuously: authority rides rows, and a missing
+/// file has none to grant — any step that actually needs seed items then reds
+/// at per-entry provenance or manifest assembly, never silently succeeds.
+fn authenticate_seed_db(dbp: &str, items_dir: &Path) -> Result<(), String> {
+    if !Path::new(dbp).is_file() {
+        return Ok(());
+    }
+    authenticate_ca_db(dbp, items_dir, "plan seed")?;
+    let mut pinned: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    for (n, line) in SEED_DIGESTS.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next(), it.next()) {
+            (Some(_k), Some(base), None) if !base.contains('/') => {
+                pinned.insert(base);
+            }
+            _ => {
+                return Err(format!(
+                    "seed/seed-digests.txt line {}: malformed row `{line}' (want `key basename')",
+                    n + 1
+                ))
+            }
+        }
+    }
+    let data = std::fs::read(dbp).map_err(|e| format!("read plan seed db {dbp}: {e}"))?;
+    let db = store_db_read::Db::open(data)?;
+    for (path, _hash) in db.hashes_by_path()? {
+        let base = path.rsplit('/').next().unwrap_or(path.as_str());
+        if !pinned.contains(base) {
+            return Err(format!(
+                "plan seed db {dbp}: provenance rejected: `{path}' is not a basename the \
+                 compiled seed-digest table pins — an unpinned item cannot be typed \
+                 AuditedSeed, however self-consistent its bytes (re #469 round-8)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn auto_seed_provenance(
@@ -5527,6 +5870,20 @@ fn main() -> ExitCode {
                     },
                 ];
                 std::fs::write(dest_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
+                // BIND the db to the capture it restores (re #469 round-8): the
+                // `<db>.seed-tarball` sidecar records the tarball's sha256, and
+                // `authenticate_seed_capture_db` admits the db as AuditedSeed only
+                // if that sha256 is pinned in seed/control-plane-seed-pins.txt.
+                let tb_sha = sha256::sha256_file(Path::new(tarball))
+                    .map_err(|e| format!("sha256 {tarball}: {e}"))?;
+                let db_sha = sha256::sha256_file(Path::new(dest_db))
+                    .map_err(|e| format!("sha256 {dest_db}: {e}"))?;
+                let tb_base = tarball.rsplit('/').next().unwrap_or(tarball);
+                std::fs::write(
+                    format!("{dest_db}.seed-tarball"),
+                    format!("sha256 {tb_sha} {tb_base}\ndb-sha256 {db_sha}\n"),
+                )
+                .map_err(|e| format!("write {dest_db}.seed-tarball: {e}"))?;
                 Ok(entries.len())
             };
             match run() {
@@ -6403,7 +6760,7 @@ fn main() -> ExitCode {
         // Every production realize path is a TYPED planner site now: `build-plan
         // --auto` (compiled-digest-gated seed db + step td.dbs), `build-recipe`
         // (seed db + `--recipe-output-db` argv), and the daemon children (the
-        // blessed seed-closure db as an explicit argument).
+        // blessed seed-closure db at its derived location).
         // td-builder daemon — td's OWN persistent build daemon: a long-running
         // process that realizes derivations served over a Unix socket, instead of
         // guix-daemon (own-builder-daemon track). Each request realizes via the
@@ -6423,9 +6780,10 @@ fn main() -> ExitCode {
         // one, and needs no new `guix build -e' packager site. The override is matched by
         // PATH (only the drv root equal to its canonical is re-keyed), so it is a harmless
         // no-op for a drv that does not name the stage0 (e.g. the guile probes of gate 358).
-        // Usage:  daemon SOCKET STORE-DIR SCRATCH-BASE [BLESS-DB]
-        // BLESS-DB (optional) is the blessed seed-closure db — the manifest
-        // authority every build child receives as an explicit argument (re #469).
+        // Usage:  daemon SOCKET STORE-DIR SCRATCH-BASE
+        // The blessed seed-closure db is never an argument: build children
+        // derive its location from the repo's seed-lock declarations
+        // (re #469 round-8 origin authentication).
         // td-builder stage0-place — compile + place the guix-free stage0 td-builder
         // under BASEDIR and print its canonical store path (the one entry point every
         // stage0 consumer goes through; the Rust port of tests/stage0-builder.sh —
@@ -6490,8 +6848,9 @@ fn main() -> ExitCode {
         // caller cannot select them), content-scan SEED-DIR for their transitive
         // closure, and fully register every member (path/hash/size/refs). The db is
         // the strict staging manifest's authority for the daemon flow
-        // (`ensure_build_daemon` blesses once per root set and hands the db to the
-        // daemon as an explicit argument). Bless ONCE per root set — see
+        // (`ensure_build_daemon` blesses once per root set into the DERIVED
+        // `blessed_seed_db_path` location the build children re-derive). Bless
+        // ONCE per root set — see
         // `bless_seed_closure` on why re-blessing would defeat the gate. A verb that
         // blessed arbitrary caller-supplied roots would mint manifest authority for
         // whatever bytes occupy those paths, exactly the self-issued-provenance hole
@@ -6515,12 +6874,13 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some("daemon") if args.len() == 5 || args.len() == 6 => {
+        Some("daemon") if args.len() == 5 => {
             let (socket, seed_dir, scratch) = (args[2].clone(), args[3].clone(), args[4].clone());
-            // The blessed seed-closure db (optional 5th arg): the daemon's ONLY
-            // manifest-authority source, threaded to every build child as an explicit
-            // `daemon-build`/`daemon-check` argument — never env (re #469 typed origins).
-            let bless_db = args.get(5).cloned();
+            // The blessed seed-closure db is NOT an argument (re #469 round-8):
+            // each build child RE-DERIVES its location from the repo's own
+            // seed-lock declarations (`check_loop::blessed_seed_db_path` over
+            // the child's cwd + its request's seed dir), so no caller-selected
+            // path can be typed `BlessedSeedClosure`.
             // Fail fast on a half-set builder override (the children re-read the same env).
             if let Err(e) = builder_override_from_env() {
                 eprintln!("td-builder: daemon: {e}");
@@ -6594,11 +6954,8 @@ fn main() -> ExitCode {
                     .arg(&seed_dir_req)
                     .arg(&scratch)
                     .stderr(std::process::Stdio::inherit());
-                // The blessed seed-closure db rides as an EXPLICIT child argument —
-                // the child's whole manifest authority, never ambient env (re #469).
-                if let Some(db) = &bless_db {
-                    cmd.arg(db);
-                }
+                // No bless-db argument: the child derives the blessed
+                // seed-closure db's location itself (re #469 round-8).
                 for (k, v) in &override_env {
                     cmd.env(k, v);
                 }
@@ -6635,15 +6992,24 @@ fn main() -> ExitCode {
         // one drv into a content-addressed keyed scratch (guix-daemon-parity cache reuse) and
         // prints `OK <canonical> <host>`; daemon-check reproducibility-double-builds it and
         // prints `OK repro <canonical> <host>`. Both read the td-owned builder from
-        // TD_BUILDER_* (inherited from the daemon). BLESS-DB (optional) is the blessed
-        // seed-closure db — the child's manifest authority, an explicit argument (re #469).
-        // Usage: daemon-build|daemon-check DRV SEED-DIR SCRATCH-BASE [BLESS-DB]
-        Some("daemon-build") if args.len() == 5 || args.len() == 6 => {
+        // TD_BUILDER_* (inherited from the daemon). The blessed seed-closure db is
+        // NOT an argument: the child DERIVES its location from the repo's own
+        // seed-lock declarations (cwd + the request's seed dir) — a caller-selected
+        // db path can no longer be typed `BlessedSeedClosure` (re #469 round-8).
+        // Usage: daemon-build|daemon-check DRV SEED-DIR SCRATCH-BASE
+        Some("daemon-build") if args.len() == 5 => {
+            let bless = match derived_bless_db(&args[3]) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("td-builder: daemon-build {}: {e}", args[2]);
+                    return ExitCode::FAILURE;
+                }
+            };
             match daemon_realize_one(
                 &args[2],
                 &args[3],
                 Path::new(&args[4]),
-                args.get(5).map(String::as_str),
+                bless.as_deref(),
             ) {
                 Ok((canon, host, hit)) => {
                     println!("OK {canon} {host} {}", if hit { "hit" } else { "built" });
@@ -6655,12 +7021,19 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some("daemon-check") if args.len() == 5 || args.len() == 6 => {
+        Some("daemon-check") if args.len() == 5 => {
+            let bless = match derived_bless_db(&args[3]) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("td-builder: daemon-check {}: {e}", args[2]);
+                    return ExitCode::FAILURE;
+                }
+            };
             match daemon_check_one(
                 &args[2],
                 &args[3],
                 Path::new(&args[4]),
-                args.get(5).map(String::as_str),
+                bless.as_deref(),
             ) {
                 Ok((canon, host)) => {
                     println!("OK repro {canon} {host}");
@@ -6839,8 +7212,16 @@ fn main() -> ExitCode {
                 // plus the seed's own vouching db — under unconditional strict staging
                 // (re #469) the unpacked seed's items are admitted by ITS
                 // registrations, typed `AuditedSeed`, not by being on disk.
+                // Both channels are AUTHENTICATED at intake (round-8): recipe-output
+                // rows must be engine-receipt-backed, and the seed db must bind to a
+                // COMPILED-pinned seed capture — a raw path/env value cannot mint a
+                // typed origin.
+                for (dbp, _) in &recipe_output_dbs {
+                    authenticate_recipe_output_db(dbp)?;
+                }
                 let mut extra_dbs: Vec<(String, sandbox::InputOrigin)> = recipe_output_dbs.clone();
                 if let Some(d) = &seed_db {
+                    authenticate_seed_capture_db(d)?;
                     extra_dbs.push((d.clone(), sandbox::InputOrigin::AuditedSeed));
                 }
                 let recipe_json =
@@ -8228,6 +8609,197 @@ daemon build START (2/2 active)
         )
         .unwrap_err();
         assert!(err.contains("is not in the seed dir"), "{err}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // authenticate_ca_db (re #469 round-8): a placement db carries authority
+    // only for rows whose on-disk bytes reproduce BOTH the recorded NAR hash
+    // and the row's own content-addressed name. Green: a properly interned
+    // item. Red: bytes tampered after registration (hash leg); a self-
+    // consistent item registered under a name its bytes do not derive
+    // (name leg — the store-register-over-chosen-bytes forgery the round-8
+    // review named).
+    #[test]
+    fn authenticate_ca_db_admits_only_self_addressing_rows() {
+        let d = std::env::temp_dir().join(format!("td-auth-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        // Green: interned bytes, canonical name, matching db row.
+        let items = d.join("items");
+        std::fs::create_dir_all(&items).unwrap();
+        let path = intern_test_seed(&items, "thing-1.0", b"payload");
+        let base = path.rsplit('/').next().unwrap();
+        let hash = nar_hash_path(&items.join(base)).unwrap();
+        let reg = |p: &str, h: &str| OutputReg {
+            store_path: p.to_string(),
+            nar_hash: h.to_string(),
+            nar_size: 7,
+            refs: vec![],
+            deriver: "/td/store/x.drv".to_string(),
+        };
+        let good_db = d.join("ca-good.db");
+        write_output_db(std::slice::from_ref(&reg(&path, &hash)), &good_db).unwrap();
+        authenticate_ca_db(&good_db.to_string_lossy(), &items, "test").unwrap();
+        // Red (hash leg): same registration, bytes rewritten after intern.
+        // Fresh db path + items dir — authenticate_ca_db memoizes verified
+        // (db, items_dir) pairs per process.
+        let items2 = d.join("items2");
+        std::fs::create_dir_all(&items2).unwrap();
+        let path2 = intern_test_seed(&items2, "thing-1.0", b"payload");
+        let base2 = path2.rsplit('/').next().unwrap();
+        let tamper_db = d.join("ca-tamper.db");
+        write_output_db(std::slice::from_ref(&reg(&path2, &hash)), &tamper_db).unwrap();
+        std::fs::write(items2.join(base2), b"tampered").unwrap();
+        let err = authenticate_ca_db(&tamper_db.to_string_lossy(), &items2, "test").unwrap_err();
+        assert!(err.contains("vouches only for bytes it can reproduce"), "{err}");
+        // Red (name leg): bytes hash correctly but the claimed store name is
+        // not the one those bytes derive — a valid-looking db over chosen
+        // bytes at a chosen address.
+        let items3 = d.join("items3");
+        std::fs::create_dir_all(&items3).unwrap();
+        let alien_path = format!("/td/store/{}-alien-1.0", "e".repeat(32));
+        let alien_base = alien_path.rsplit('/').next().unwrap();
+        std::fs::write(items3.join(alien_base), b"alien bytes").unwrap();
+        let alien_hash = nar_hash_path(&items3.join(alien_base)).unwrap();
+        let alien_db = d.join("ca-alien.db");
+        write_output_db(std::slice::from_ref(&reg(&alien_path, &alien_hash)), &alien_db).unwrap();
+        let err = authenticate_ca_db(&alien_db.to_string_lossy(), &items3, "test").unwrap_err();
+        assert!(err.contains("do not reproduce its own name"), "{err}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // authenticate_recipe_output_db (re #469 round-8): `--recipe-output-db` is
+    // public argv, so a registration db types RecipeOutput only when every row
+    // is backed by an engine-issued `producer local-build` receipt recording
+    // exactly that (path, hash). Red: no receipts dir (a store-register'd db);
+    // an unbacked row; a receipt disagreeing with the row; a non-local
+    // producer. Green: the receipt commit_scratch_to_store writes.
+    #[test]
+    fn authenticate_recipe_output_db_requires_receipt_backing() {
+        let d = std::env::temp_dir().join(format!("td-auth-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let out_path = format!("/td/store/{}-out-1.0", "a".repeat(32));
+        let db = d.join("ro.db");
+        write_output_db(
+            std::slice::from_ref(&OutputReg {
+                store_path: out_path.clone(),
+                nar_hash: "sha256:deadbeef".to_string(),
+                nar_size: 7,
+                refs: vec![],
+                deriver: "/td/store/x.drv".to_string(),
+            }),
+            &db,
+        )
+        .unwrap();
+        let dbp = db.to_string_lossy().into_owned();
+        // Red: no receipts at all — the exact store-register forgery shape.
+        let err = authenticate_recipe_output_db(&dbp).unwrap_err();
+        assert!(err.contains("no engine-issued receipts"), "{err}");
+        // Red: receipts dir exists but nothing vouches for the row.
+        let rdir = d.join("ro.db.receipts");
+        std::fs::create_dir_all(&rdir).unwrap();
+        let err = authenticate_recipe_output_db(&dbp).unwrap_err();
+        assert!(err.contains("no engine-issued receipt vouches"), "{err}");
+        // Red: a receipt exists but records a different hash for the path.
+        let receipt = rdir.join("x.receipt");
+        let body = |hash: &str, producer: &str| {
+            format!(
+                "td-receipt v1\ndrv-sha256 d\nmanifest-sha256 m\nbuilder b\n\
+                 producer {producer}\noutput {out_path} {hash} 7\n"
+            )
+        };
+        std::fs::write(&receipt, body("sha256:beefdead", "local-build")).unwrap();
+        let err = authenticate_recipe_output_db(&dbp).unwrap_err();
+        assert!(err.contains("but its receipt records"), "{err}");
+        // Red: right hash, wrong producer — a non-local record backs nothing.
+        std::fs::write(&receipt, body("sha256:deadbeef", "substitute")).unwrap();
+        let err = authenticate_recipe_output_db(&dbp).unwrap_err();
+        assert!(err.contains("no engine-issued receipt vouches"), "{err}");
+        // Green: the engine-issued local-build receipt backing the row.
+        std::fs::write(&receipt, body("sha256:deadbeef", "local-build")).unwrap();
+        authenticate_recipe_output_db(&dbp).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // authenticate_seed_db (re #469 round-8): the plan seed db can vouch only
+    // for the pinned seed universe — every row must content-address to itself
+    // AND land on a basename the compiled seed-digest table derives. Green:
+    // a real repo patch seed (its basename IS pinned). Red: a CA-valid item
+    // the table never pinned. Absent db: vacuous (no rows, no authority).
+    #[test]
+    fn authenticate_seed_db_rejects_unpinned_rows_and_passes_pinned_ones() {
+        let d = std::env::temp_dir().join(format!("td-auth-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let reg = |p: &str, h: &str| OutputReg {
+            store_path: p.to_string(),
+            nar_hash: h.to_string(),
+            nar_size: 7,
+            refs: vec![],
+            deriver: "/td/store/x.drv".to_string(),
+        };
+        // Green: the interned repo patch derives a pinned basename.
+        let items = d.join("items");
+        std::fs::create_dir_all(&items).unwrap();
+        let path = intern_real_patch_seed(&items, "patch-glibc-boot-2.16.0");
+        let base = path.rsplit('/').next().unwrap();
+        let hash = nar_hash_path(&items.join(base)).unwrap();
+        let good_db = d.join("seed-good.db");
+        write_output_db(std::slice::from_ref(&reg(&path, &hash)), &good_db).unwrap();
+        authenticate_seed_db(&good_db.to_string_lossy(), &items).unwrap();
+        // Red: CA-valid but the compiled table never pinned this basename.
+        let items2 = d.join("items2");
+        std::fs::create_dir_all(&items2).unwrap();
+        let upath = intern_test_seed(&items2, "unpinned-1.0", b"x");
+        let ubase = upath.rsplit('/').next().unwrap();
+        let uhash = nar_hash_path(&items2.join(ubase)).unwrap();
+        let bad_db = d.join("seed-bad.db");
+        write_output_db(std::slice::from_ref(&reg(&upath, &uhash)), &bad_db).unwrap();
+        let err = authenticate_seed_db(&bad_db.to_string_lossy(), &items2).unwrap_err();
+        assert!(err.contains("not a basename the compiled seed-digest table pins"), "{err}");
+        // Absent db: authenticates vacuously — no rows means no authority.
+        authenticate_seed_db(&d.join("absent.db").to_string_lossy(), &items).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // authenticate_seed_capture_db (re #469 round-8): TD_SEED_DB types
+    // AuditedSeed only through the seed-unpack sidecar binding the db to a
+    // capture tarball whose sha256 the COMPILED pins file admits, with the db
+    // bytes themselves fixed by the sidecar. Red: no sidecar; a post-write db
+    // edit; an unpinned capture (including against the SHIPPED pins file,
+    // which pins nothing yet — the fail-closed default). Green: pinned
+    // capture + untouched db, via the pins-parameterized core.
+    #[test]
+    fn authenticate_seed_capture_db_binds_capture_and_db_bytes() {
+        let d = std::env::temp_dir().join(format!("td-auth-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let db = d.join("cap.db");
+        std::fs::write(&db, b"db bytes").unwrap();
+        let dbp = db.to_string_lossy().into_owned();
+        // Red: a db with no sidecar (any db seed-unpack did not write).
+        let err = authenticate_seed_capture_db(&dbp).unwrap_err();
+        assert!(err.contains("no seed-tarball binding"), "{err}");
+        let tb_sha = sha256_hex(b"tarball bytes");
+        let db_sha = sha256_hex(b"db bytes");
+        std::fs::write(
+            d.join("cap.db.seed-tarball"),
+            format!("sha256 {tb_sha} seed.tar\ndb-sha256 {db_sha}\n"),
+        )
+        .unwrap();
+        // Red: the SHIPPED pins file admits nothing yet — fail closed.
+        let err = authenticate_seed_capture_db(&dbp).unwrap_err();
+        assert!(err.contains("is not pinned"), "{err}");
+        // Green: a pins file that admits this capture.
+        let pins = format!("# audited\n{tb_sha} frozen seed capture\n");
+        authenticate_seed_capture_db_with(&dbp, &pins).unwrap();
+        // Red: db bytes changed after seed-unpack wrote the sidecar.
+        std::fs::write(&db, b"db bytes edited").unwrap();
+        let err = authenticate_seed_capture_db_with(&dbp, &pins).unwrap_err();
+        assert!(err.contains("modified after seed-unpack"), "{err}");
+        std::fs::write(&db, b"db bytes").unwrap();
+        // Red: a malformed pin line is a hard error, not a skip.
+        let err = authenticate_seed_capture_db_with(&dbp, "not-a-sha admit-all\n").unwrap_err();
+        assert!(err.contains("malformed pin"), "{err}");
         std::fs::remove_dir_all(&d).ok();
     }
 
