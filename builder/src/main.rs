@@ -3604,10 +3604,14 @@ struct HostSandboxArgs {
     /// `/td/store/ld`). Only meaningful with `--store-from`; when DEST != `/gnu/store`
     /// the host `/gnu/store` is NOT bound at all — the guix-byte-free VM substrate.
     store_at: Option<String>,
-    /// `--store-item PATH` (repeatable): bind ONE store item read-only at its own
-    /// path — the loop's input-only store exposure (`td-builder check` passes the
-    /// resolved toolchain closure item by item; no store DIRECTORY is ever
-    /// mounted, mirroring the drv build jail's staged-closure model).
+    /// `--store-item PATH` (repeatable): bind ONE store item (dir or file)
+    /// read-only at its own path — the loop's input-only store exposure
+    /// (`td-builder check` passes the resolved toolchain closure item by item;
+    /// no store DIRECTORY is ever mounted, mirroring the drv build jail's
+    /// staged-closure model). The store dir holding the mountpoints is a plain
+    /// dir on the sandbox's ephemeral tmpfs root — writable like the rest of
+    /// that tmpfs (gates create /td/store there the same way); each ITEM's
+    /// read-only remount is load-bearing.
     store_items: Vec<String>,
     /// `--no-daemon`: accepted for compatibility. The loop sandbox no longer binds
     /// the host daemon state in either mode.

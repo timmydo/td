@@ -485,7 +485,10 @@ pub fn build(
 }
 
 /// A host path to expose inside the loop sandbox (rbind-mounted at the same
-/// path in the new root). `readonly` remounts it read-only after binding.
+/// path in the new root). `src` may be a directory or a regular file — the
+/// mountpoint is created to match (a file store item, e.g. a pinned `.crate`,
+/// binds onto a created empty file). `readonly` remounts it read-only after
+/// binding.
 pub struct Bind {
     pub src: String,
     /// Mount `src` at this absolute path inside the new root instead of at `src`
@@ -558,21 +561,44 @@ pub fn host_shell(
     let oldroot_rel_c = CString::new(oldroot_rel.as_os_str().as_encoded_bytes()).unwrap();
     let oldroot_abs_c = CString::new("/oldroot").unwrap();
 
-    // (src_c, target_dir, target_c, readonly, ro_optional) for each bind.
-    let mut bind_specs: Vec<(CString, PathBuf, CString, bool, bool)> =
-        Vec::with_capacity(binds.len());
+    // Everything the child's pre_exec needs per bind, precomputed in the
+    // parent: the C paths, whether the source is a directory (the mountpoint
+    // is created to MATCH — a regular-file source, e.g. a pinned `.crate`
+    // store item, binds onto a created empty file, mirroring the mount
+    // applet), and a NAMED failure line (the child can only sys::warn a
+    // preformatted byte string — a bare "FAILED bind-mounting" with no path
+    // made failures undiagnosable).
+    struct BindSpec {
+        src: CString,
+        target_dir: PathBuf,
+        target: CString,
+        readonly: bool,
+        ro_optional: bool,
+        src_is_dir: bool,
+        fail_msg: Vec<u8>,
+    }
+    let mut bind_specs: Vec<BindSpec> = Vec::with_capacity(binds.len());
     for b in binds {
         // Bind `src` at `dest` inside the new root (dest defaults to src).
         let inside = b.dest.as_deref().unwrap_or(&b.src);
         let target = newroot.join(inside.strip_prefix('/').unwrap_or(inside));
-        bind_specs.push((
-            CString::new(b.src.as_str()).map_err(|_| err(format!("{}: NUL in path", b.src)))?,
-            target.clone(),
-            CString::new(target.as_os_str().as_encoded_bytes())
+        bind_specs.push(BindSpec {
+            src: CString::new(b.src.as_str())
+                .map_err(|_| err(format!("{}: NUL in path", b.src)))?,
+            target_dir: target.clone(),
+            target: CString::new(target.as_os_str().as_encoded_bytes())
                 .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
-            b.readonly,
-            b.ro_optional,
-        ));
+            readonly: b.readonly,
+            ro_optional: b.ro_optional,
+            // An unreadable source keeps the directory default; the mount then
+            // fails exactly as before, now with the path named.
+            src_is_dir: fs::metadata(&b.src).map(|m| m.is_dir()).unwrap_or(true),
+            fail_msg: format!(
+                "td-builder host-sandbox: FAILED bind-mounting {} -> {inside}\n",
+                b.src
+            )
+            .into_bytes(),
+        });
     }
     // (target_dir, target_c) for each writable tmpfs mount.
     let mut tmpfs_specs: Vec<(PathBuf, CString)> = Vec::with_capacity(tmpfs_dirs.len());
@@ -728,14 +754,24 @@ pub fn host_shell(
             sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, Some(&tmpfs_data))
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED mounting the tmpfs root\n"); e })?;
             // Expose each requested host path (rbind), read-only where asked.
-            for (src_c, target_dir, target_c, readonly, ro_optional) in &bind_specs {
-                fs::create_dir_all(target_dir)?;
-                sys::mount(Some(src_c), target_c, None, sys::MS_BIND | sys::MS_REC, None)
-                    .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED bind-mounting an exposed path\n"); e })?;
-                if *readonly {
+            // The mountpoint matches the source kind: dir → dir, file → file.
+            for spec in &bind_specs {
+                if spec.src_is_dir {
+                    fs::create_dir_all(&spec.target_dir)?;
+                } else {
+                    if let Some(parent) = spec.target_dir.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    if !spec.target_dir.exists() {
+                        fs::File::create(&spec.target_dir)?;
+                    }
+                }
+                sys::mount(Some(&spec.src), &spec.target, None, sys::MS_BIND | sys::MS_REC, None)
+                    .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
+                if spec.readonly {
                     let ro = sys::mount(
                         None,
-                        target_c,
+                        &spec.target,
                         None,
                         sys::MS_REMOUNT | sys::MS_BIND | sys::MS_REC | sys::MS_RDONLY,
                         None,
@@ -747,7 +783,7 @@ pub fn host_shell(
                     // every other ro bind (the store) the read-only is load-bearing
                     // — a failed remount is fatal.
                     if let Err(e) = ro {
-                        if *ro_optional {
+                        if spec.ro_optional {
                             // Can't make it read-only (a child userns cannot
                             // remount-ro a mount owned by the host userns, e.g.
                             // cgroup2 on the azure runner). Rather than leave the
@@ -759,9 +795,10 @@ pub fn host_shell(
                             // (most local/dev hosts) it stays bound, so the leftover
                             // empty dir here is harmless.
                             sys::warn(b"td-builder host-sandbox: ro-remount not permitted for an ro_optional bind; detached (fail-closed, no host exposure)\n");
-                            let _ = sys::umount2(target_c, sys::MNT_DETACH);
+                            let _ = sys::umount2(&spec.target, sys::MNT_DETACH);
                         } else {
-                            sys::warn(b"td-builder host-sandbox: FAILED ro-remounting an exposed path\n");
+                            sys::warn(&spec.fail_msg);
+                            sys::warn(b"td-builder host-sandbox: (FAILED ro-remounting the exposed path above)\n");
                             return Err(e);
                         }
                     }

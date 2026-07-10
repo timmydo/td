@@ -674,6 +674,10 @@ impl RecipeCheckRunner {
         })
     }
 
+    // MIRRORED by the loop prelude's RECIPE_HOST_TOOLS (builder/src/check_loop.rs):
+    // the input-only loop sandbox binds only what the prelude resolves, so a tool
+    // added here must be added there too or tool_root's in-sandbox scavenge will
+    // never see the package.
     fn host_tool_probe<'a>(&self, name: &'a str) -> Option<&'a str> {
         match name {
             "coreutils" => Some("ls"),

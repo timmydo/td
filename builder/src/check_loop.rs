@@ -320,20 +320,98 @@ fn store_item_of(dir: &str) -> Option<String> {
     Some(format!("{SANDBOX_STORE_PREFIX}{item}"))
 }
 
-/// The store paths of the rust/cc SEED toolchain lock (tests/td-builder-rust.lock,
-/// format `NAME <store-path>`): gate bodies resolve these INSIDE the sandbox
-/// (tools/provision-{rust,cc}.sh branch 2 reads the lock and execs its paths
-/// directly), so every lock path present on the host is a DECLARED loop input
-/// and joins the closure roots. An absent path is skipped — the provision
-/// scripts fall through the same way, and the gate that needs it fails loudly.
+/// The store paths of the SEED locks that gate bodies resolve INSIDE the
+/// sandbox (format `NAME <store-path>`): tests/td-builder-rust.lock
+/// (tools/provision-{rust,cc}.sh branch 2 execs its rust/cc paths directly)
+/// and tests/td-subst.lock (td-recipe-eval's tool_root resolves host tools
+/// through `td-builder lock path` over it). Every lock path present on the
+/// host is a DECLARED loop input and joins the closure roots. An absent path
+/// is skipped — the consumers fall through / fail loudly the same way they do
+/// today on a host without it.
 fn seed_lock_roots(root: &Path) -> Vec<String> {
-    let Ok(content) = std::fs::read_to_string(root.join("tests/td-builder-rust.lock")) else {
+    let mut roots: Vec<String> = Vec::new();
+    for lock in ["tests/td-builder-rust.lock", "tests/td-subst.lock"] {
+        let Ok(content) = std::fs::read_to_string(root.join(lock)) else {
+            continue;
+        };
+        for p in parse_seed_lock(&content) {
+            if Path::new(&p).exists() && !roots.contains(&p) {
+                roots.push(p);
+            }
+        }
+    }
+    roots
+}
+
+/// The recipe layer's host-tool packages — a MIRROR of td-recipe-eval's
+/// `check_runner::host_tool_probe` set (keep the two in sync): `(name, probe
+/// binary under <pkg>/bin/)`. Recipe checks running INSIDE the loop sandbox
+/// resolve these via lock → PATH → a store-readdir scavenge (`tool_root`), so
+/// the loop prelude runs the SAME scavenge HOST-SIDE (`scavenge_recipe_tools`)
+/// and binds each winner's closure — the input-only sandbox then shows
+/// tool_root exactly the candidate it would have picked on the host (the
+/// host-wide sorted-first is bound, so the in-sandbox sorted-first is the same
+/// item; the lock/PATH branches win before the scavenge for the tools they
+/// cover, also unchanged).
+const RECIPE_HOST_TOOLS: &[(&str, &str)] = &[
+    ("bash", "bash"),
+    ("coreutils", "ls"),
+    ("sed", "sed"),
+    ("grep", "grep"),
+    ("gawk", "awk"),
+    ("tar", "tar"),
+    ("gzip", "gzip"),
+    ("bzip2", "bzip2"),
+    ("xz", "xz"),
+    ("findutils", "find"),
+    ("diffutils", "diff"),
+    ("flex", "flex"),
+    ("bison", "bison"),
+    ("m4", "m4"),
+    ("make", "make"),
+    ("python", "python3"),
+];
+
+/// tool_root's readdir scavenge, host-side: for each RECIPE_HOST_TOOLS entry,
+/// the lexicographically FIRST store item whose basename contains `-<name>-`
+/// (or `-<name>-minimal-`) with an executable `bin/<probe>` — one readdir pass
+/// over the store, every pattern matched per entry. A name with no candidate
+/// is skipped (the recipe gate that needs it fails loudly, exactly as
+/// tool_root does today on a host without the package). The caller caches the
+/// result keyed by the store dir's mtime (`loop_store_items`).
+fn scavenge_recipe_tools(store_dir: &str) -> Vec<String> {
+    // (winning basename, its full path) per tool — basenames compare exactly
+    // like tool_root's sorted PathBuf candidates (same dir prefix).
+    let mut winners: Vec<Option<(String, String)>> = vec![None; RECIPE_HOST_TOOLS.len()];
+    let Ok(rd) = std::fs::read_dir(store_dir) else {
         return Vec::new();
     };
-    parse_seed_lock(&content)
-        .into_iter()
-        .filter(|p| Path::new(p).is_dir())
-        .collect()
+    for e in rd.flatten() {
+        let base = e.file_name().to_string_lossy().into_owned();
+        for (i, (name, probe)) in RECIPE_HOST_TOOLS.iter().enumerate() {
+            let Some(w) = winners.get_mut(i) else { continue };
+            let normal = format!("-{name}-");
+            let minimal = format!("-{name}-minimal-");
+            if !(base.contains(&normal) || base.contains(&minimal)) {
+                continue;
+            }
+            if w.as_ref().is_some_and(|(cur, _)| cur.as_str() <= base.as_str()) {
+                continue; // current winner already sorts first
+            }
+            let root = format!("{store_dir}/{base}");
+            if is_exec(&Path::new(&root).join("bin").join(probe)) {
+                *w = Some((base.clone(), root));
+            }
+        }
+    }
+    winners.into_iter().flatten().map(|(_, root)| root).collect()
+}
+
+fn is_exec(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// Parse the seed lock's `NAME <store-path>` lines (comments/blank skipped) into
@@ -356,10 +434,12 @@ fn parse_seed_lock(content: &str) -> Vec<String> {
 }
 
 /// A parsed `.td-build-cache/loop-closure.list`: the scanned host-built
-/// binaries as `(path, mtime_ns, len, store refs)`, the merged closure ROOTS,
+/// binaries as `(path, mtime_ns, len, store refs)`, the recipe host-tool
+/// scavenge result keyed by the store dir's mtime, the merged closure ROOTS,
 /// and the resulting closure ITEMS.
 struct ClosureCache {
     files: Vec<(String, u64, u64, Vec<String>)>,
+    scav: Option<(u64, Vec<String>)>,
     roots: std::collections::BTreeSet<String>,
     items: Vec<String>,
 }
@@ -397,16 +477,30 @@ fn loop_store_items(
         std::collections::HashMap<String, String>,
     )> = None;
 
+    // The recipe host-tool scavenge, reused while the store dir's mtime holds
+    // (entries added/removed touch it). mtime 0 (unreadable) never matches.
+    let store_mtime = dir_mtime_ns(store_dir);
+    let scav: Vec<String> = match cached.as_ref().and_then(|c| c.scav.as_ref()) {
+        Some((m, paths)) if store_mtime != 0 && *m == store_mtime => paths.clone(),
+        _ => scavenge_recipe_tools(store_dir),
+    };
+
     let mut all_roots: std::collections::BTreeSet<String> = roots.iter().cloned().collect();
+    all_roots.extend(scav.iter().cloned());
     let mut files: Vec<(String, u64, u64, Vec<String>)> = Vec::with_capacity(scan_files.len());
     for f in scan_files {
         let (mtime, len) = file_sig(f)?;
-        let cached_refs = cached.as_ref().and_then(|c| {
-            c.files
-                .iter()
-                .find(|(p, m, l, _)| p == f && *m == mtime && *l == len)
-                .map(|(_, _, _, refs)| refs.clone())
-        });
+        let cached_refs = cached
+            .as_ref()
+            .and_then(|c| {
+                c.files
+                    .iter()
+                    .find(|(p, m, l, _)| p == f && mtime != 0 && *m == mtime && *l == len)
+                    .map(|(_, _, _, refs)| refs.clone())
+            })
+            // A GC'd ref would re-enter the closure as an unbindable ghost
+            // every run: reuse cached refs only while every one still exists.
+            .filter(|refs| refs.iter().all(|r| Path::new(r).exists()));
         let refs = match cached_refs {
             Some(refs) => refs,
             None => {
@@ -422,11 +516,22 @@ fn loop_store_items(
     }
 
     if let Some(c) = &cached {
-        if c.roots == all_roots && c.items.iter().all(|i| Path::new(i).exists()) {
-            // Same closure; refresh the file signatures if only those moved
-            // (e.g. a rebuilt stage0 whose refs did not change).
-            if c.files != files {
-                let _ = write_closure_cache(&cache_path, &files, &all_roots, &c.items);
+        // Hit iff the root set matches, every root made it into the cached
+        // items (belt-and-braces against a torn cache — the write is atomic,
+        // see write_closure_cache), and every item still exists (store GC).
+        if c.roots == all_roots
+            && all_roots.iter().all(|r| c.items.contains(r))
+            && c.items.iter().all(|i| Path::new(i).exists())
+        {
+            // Same closure; refresh the signatures if only those moved (e.g. a
+            // rebuilt stage0 whose refs did not change, or a store-mtime bump).
+            let scav_current = (store_mtime, scav.clone());
+            if c.files != files || c.scav.as_ref() != Some(&scav_current) {
+                if let Err(e) =
+                    write_closure_cache(&cache_path, &files, &scav_current, &all_roots, &c.items)
+                {
+                    eprintln!("td-builder check: WARNING: loop-closure cache not written ({e})");
+                }
             }
             return Ok(c.items.clone());
         }
@@ -442,10 +547,37 @@ fn loop_store_items(
     let root_list: Vec<String> = all_roots.iter().cloned().collect();
     let seen = crate::scan_closure_hybrid(&mut st.0, &st.1, &empty, &root_list)?;
     let items: Vec<String> = seen.into_iter().collect();
-    if let Err(e) = write_closure_cache(&cache_path, &files, &all_roots, &items) {
+    if let Err(e) =
+        write_closure_cache(&cache_path, &files, &(store_mtime, scav), &all_roots, &items)
+    {
         eprintln!("td-builder check: WARNING: loop-closure cache not written ({e})");
     }
     Ok(items)
+}
+
+/// The host-built binaries that RUN INSIDE the loop sandbox and whose store
+/// references must therefore be closure roots: the stage0 td-builder (gate-run
+/// itself) and, when the substitute store is usable, its stashed td-subst (the
+/// toolchain gates exec it). `check` and `check-rung` share this so the
+/// closure cache stays stable across both.
+fn loop_scan_files(root: &Path, tb: &str) -> Vec<String> {
+    let mut files = vec![tb.to_string()];
+    for (k, v) in subst_env(root) {
+        if k == "TD_SUBST_BIN" {
+            files.push(v);
+        }
+    }
+    files
+}
+
+/// The store dir's mtime in ns (0 when unreadable — never matches the cache,
+/// so the scavenge just re-runs).
+fn dir_mtime_ns(dir: &str) -> u64 {
+    std::fs::metadata(dir)
+        .ok()
+        .and_then(|md| md.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0))
 }
 
 /// Build the store scanner once: the candidate index over the host store dir +
@@ -475,8 +607,9 @@ fn ensure_scanner<'a>(
 }
 
 /// `(mtime in ns since epoch, byte length)` — the change signature of a scanned
-/// host-built binary. An unreadable mtime degrades to 0 (never matches, so the
-/// file is just re-scanned — safe, only slower).
+/// host-built binary. An unreadable mtime degrades to 0, and the cache lookup
+/// treats 0 as never-matching (`mtime != 0` in `loop_store_items`) so the file
+/// is re-scanned every run rather than matched on length alone — safe, slower.
 fn file_sig(path: &str) -> Result<(u64, u64), String> {
     let md = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
     let mtime = md
@@ -487,12 +620,16 @@ fn file_sig(path: &str) -> Result<(u64, u64), String> {
     Ok((mtime, md.len()))
 }
 
-/// Read the loop-closure cache (tab-separated `file`/`fref`/`root`/`item`
-/// lines; `#` comments). Any malformed line invalidates the WHOLE cache
-/// (None → rescan) — the cache is an accelerator, never authority.
+/// Read the loop-closure cache (tab-separated `file`/`fref`/`scavmtime`/
+/// `stool`/`root`/`item` lines; `#` comments). Any malformed line invalidates
+/// the WHOLE cache (None → rescan) — the cache is an accelerator, never
+/// authority. (A path containing a tab would round-trip truncated, never match
+/// its live counterpart, and merely force a rescan every run — safe, slower.)
 fn read_closure_cache(path: &Path) -> Option<ClosureCache> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut files: Vec<(String, u64, u64, Vec<String>)> = Vec::new();
+    let mut scav_mtime: Option<u64> = None;
+    let mut stools: Vec<String> = Vec::new();
     let mut roots = std::collections::BTreeSet::new();
     let mut items: Vec<String> = Vec::new();
     for line in content.lines() {
@@ -507,6 +644,8 @@ fn read_closure_cache(path: &Path) -> Option<ClosureCache> {
                 files.push((parts.next()?.to_string(), mtime, len, Vec::new()));
             }
             "fref" => files.last_mut()?.3.push(parts.next()?.to_string()),
+            "scavmtime" => scav_mtime = Some(parts.next()?.parse::<u64>().ok()?),
+            "stool" => stools.push(parts.next()?.to_string()),
             "root" => {
                 roots.insert(parts.next()?.to_string());
             }
@@ -516,14 +655,20 @@ fn read_closure_cache(path: &Path) -> Option<ClosureCache> {
     }
     Some(ClosureCache {
         files,
+        scav: scav_mtime.map(|m| (m, stools)),
         roots,
         items,
     })
 }
 
+/// Write the cache ATOMICALLY (temp file + rename): a concurrent reader sees
+/// the old or the new cache, never a torn one — a truncated items section
+/// would otherwise parse cleanly and pin a SUBSET closure (missing binds)
+/// until the file were deleted by hand.
 fn write_closure_cache(
     path: &Path,
     files: &[(String, u64, u64, Vec<String>)],
+    scav: &(u64, Vec<String>),
     roots: &std::collections::BTreeSet<String>,
     items: &[String],
 ) -> Result<(), String> {
@@ -535,6 +680,11 @@ fn write_closure_cache(
             out.push_str(&format!("fref\t{r}\n"));
         }
     }
+    let (scav_mtime, stools) = scav;
+    out.push_str(&format!("scavmtime\t{scav_mtime}\n"));
+    for t in stools {
+        out.push_str(&format!("stool\t{t}\n"));
+    }
     for r in roots {
         out.push_str(&format!("root\t{r}\n"));
     }
@@ -544,7 +694,10 @@ fn write_closure_cache(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, out).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
 }
 
 fn native_applet_path(root: &Path, provider: &str) -> Result<String, String> {
@@ -1504,16 +1657,13 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     }
     // The sandbox mounts NO store directory — only the loop's declared input
     // ITEMS, each bound read-only at its own path (the drv build jail's
-    // input-only model): the resolved toolchain closure, the seed lock's
-    // rust/cc closure, and the closures of the host-built binaries that run
-    // inside (the stage0 td-builder; the stashed td-subst when exposed).
+    // input-only model): the resolved toolchain closure, the seed locks'
+    // rust/cc closure, the recipe host-tool scavenge winners, and the closures
+    // of the host-built binaries that run inside (the stage0 td-builder; the
+    // stashed td-subst when exposed).
     let mut roots = tc.roots.clone();
     roots.extend(seed_lock_roots(&root));
-    let mut scan_files = vec![tb.clone()];
-    if let Some((_, bin)) = child_envs.iter().find(|(k, _)| k == "TD_SUBST_BIN") {
-        scan_files.push(bin.clone());
-    }
-    let items = loop_store_items(&root, &roots, &scan_files).map_err(|e| {
+    let items = loop_store_items(&root, &roots, &loop_scan_files(&root, &tb)).map_err(|e| {
         fatal(&format!(
             "could not compute the loop sandbox's store-item inputs ({e})"
         ))
@@ -1612,11 +1762,10 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     let toolchain = loop_path_with_native_applets(&root, &tb, &tc.path)
         .map_err(|e| format!("check-rung: FATAL: could not provision loop native applets ({e})"))?;
     // The same input-only store exposure as the loop (per-item binds, no store
-    // directory mounted): toolchain closure + seed lock closure + the stage0
-    // td-builder's own closure (harnesses run it via TD_BUILDER_SELF).
+    // directory mounted; same scan-file set so the closure cache is shared).
     let mut roots = tc.roots.clone();
     roots.extend(seed_lock_roots(&root));
-    let items = loop_store_items(&root, &roots, std::slice::from_ref(&tb))
+    let items = loop_store_items(&root, &roots, &loop_scan_files(&root, &tb))
         .map_err(|e| format!("check-rung: FATAL: {e}"))?;
     eprintln!(
         ">> check-rung: {harness} inside td-builder host-sandbox (cached chain reused; \
@@ -1756,21 +1905,30 @@ ccc-off-store /opt/rust-1.93.0
             456u64,
             vec!["/gnu/store/ggg-glibc-2.39".to_string()],
         )];
+        let scav = (
+            789u64,
+            vec!["/gnu/store/sss-sed-4.9".to_string()],
+        );
         let roots: std::collections::BTreeSet<String> = [
             "/gnu/store/aaa-bash-5.2.37".to_string(),
             "/gnu/store/ggg-glibc-2.39".to_string(),
+            "/gnu/store/sss-sed-4.9".to_string(),
         ]
         .into_iter()
         .collect();
         let items = vec![
             "/gnu/store/aaa-bash-5.2.37".to_string(),
             "/gnu/store/ggg-glibc-2.39".to_string(),
+            "/gnu/store/sss-sed-4.9".to_string(),
         ];
-        write_closure_cache(&path, &files, &roots, &items).unwrap();
+        write_closure_cache(&path, &files, &scav, &roots, &items).unwrap();
         let c = read_closure_cache(&path).expect("cache parses back");
         assert_eq!(c.files, files);
+        assert_eq!(c.scav, Some(scav));
         assert_eq!(c.roots, roots);
         assert_eq!(c.items, items);
+        // The write is temp+rename: no stray temp file survives.
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
 
         // Any malformed line invalidates the WHOLE cache — accelerator, never
         // authority.
@@ -1778,6 +1936,37 @@ ccc-off-store /opt/rust-1.93.0
         assert!(read_closure_cache(&path).is_none());
         // A missing cache file is simply a miss.
         assert!(read_closure_cache(&d.join("absent.list")).is_none());
+    }
+
+    #[test]
+    fn scavenge_picks_the_sorted_first_candidate_with_the_probe() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = scratch("scavenge");
+        let store = d.join("store");
+        let mk = |base: &str, probe: Option<&str>| {
+            let bin = store.join(base).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            if let Some(p) = probe {
+                let f = bin.join(p);
+                std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        // Two gawk candidates with the probe — the sorted-FIRST basename wins
+        // (tool_root's candidates.sort() pick, so the in-sandbox scavenge over
+        // the bound set finds the same winner the host scavenge saw).
+        mk("bbbb-gawk-5.3.1", Some("awk"));
+        mk("aaaa-gawk-5.1.0", Some("awk"));
+        // A sed candidate WITHOUT the probe binary — not a winner.
+        mk("cccc-sed-4.9", None);
+        // A name that only prefix-matches (-gawkish- is not -gawk-) — ignored.
+        mk("dddd-gawkish-1.0", Some("awk"));
+        let store_s = store.to_string_lossy().into_owned();
+        let got = scavenge_recipe_tools(&store_s);
+        assert_eq!(got, vec![format!("{store_s}/aaaa-gawk-5.1.0")]);
+        // An unreadable store dir scavenges nothing (the recipe gate that
+        // needs a tool fails loudly, exactly like tool_root).
+        assert!(scavenge_recipe_tools("/nonexistent-store-dir").is_empty());
     }
 
     #[test]

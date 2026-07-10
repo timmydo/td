@@ -2474,16 +2474,19 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
 // --- sandbox-hardening (formerly tests/sandbox-hardening.sh) -------------------
 
 /// sandbox-hardening — behavioral self-tests that td's loop sandbox
-/// (`td-builder host-sandbox`) exposes only a MINIMAL /dev (no host device leak)
-/// and REAPS its inner tree when the top td-builder is killed (PR_SET_PDEATHSIG).
+/// (`td-builder host-sandbox`) exposes only a MINIMAL /dev (no host device leak),
+/// REAPS its inner tree when the top td-builder is killed (PR_SET_PDEATHSIG),
+/// and mounts the store INPUT-ONLY (per-item read-only binds, never a whole
+/// store directory — the visible entry count is the loop's bounded closure,
+/// and a bound item rejects writes).
 /// Port of tests/sandbox-hardening.sh (gate 272). Runs INSIDE the loop sandbox,
 /// so the nested td-builder's processes are visible in this PID namespace and a
 /// /proc cmdline scan confirms they are gone after the kill.
 fn sandbox_hardening(root: &Path) -> Result<(), String> {
     let _ = root;
     println!(
-        ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak) and \
-         reaps its inner tree when killed"
+        ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak), \
+         reaps its inner tree when killed, and exposes the store input-only"
     );
     let tb = tb()?;
     println!(">> td-builder (stage0, guix-free): {}", tb.display());
@@ -2528,6 +2531,38 @@ exit 0
         "minimal-/dev assertion — the sandbox /dev is not minimal (host device leak)",
     )?;
     println!("   /dev exposes the standard nodes; kmsg/kvm/mem/disks/input are absent");
+
+    // (C) input-only store exposure: the loop sandbox binds store ITEMS, never
+    // a store directory. A whole-store bind would expose the host's full store
+    // (hundreds of thousands of entries); the per-item closure is a few dozen
+    // to a few hundred. And a bound item is READ-ONLY (its ro-remount is
+    // load-bearing, sandbox::Bind), so a write into bash's own package must
+    // fail. Probed directly — this body already runs inside the loop sandbox.
+    println!(">> (C) input-only store: bounded item count, items read-only");
+    let entries = std::fs::read_dir(&sroot)
+        .map_err(|e| format!("FAIL: cannot read {sroot}: {e}"))?
+        .count();
+    if entries == 0 || entries > 4096 {
+        return Err(format!(
+            "FAIL: {sroot} exposes {entries} entries — expected the loop's bounded per-item \
+             closure, not a whole-store bind"
+        ));
+    }
+    let bash_item = Path::new(&realbash_s)
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| format!("FAIL: no package root above {realbash_s}"))?;
+    let probe = bash_item.join(".td-ro-probe");
+    if std::fs::File::create(&probe).is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        return Err(format!(
+            "FAIL: created {} — a bound store item is WRITABLE inside the sandbox",
+            probe.display()
+        ));
+    }
+    println!(
+        "   {sroot} exposes {entries} bound items (not the host store); bash's package rejects writes"
+    );
 
     // (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree.
     println!(">> (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree");
