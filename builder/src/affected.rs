@@ -464,6 +464,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // glob `*` crosses `/`, so this one pattern covers the whole crate dir.
+    if pattern_matches("sh/*", p) {
+        // td-sh (the brush-wrapped seed shell, re #469) carries crates, so no
+        // OFFLINE gate builds it. The blocking build+lint+test coverage is the
+        // td-sh-test PREFLIGHT (clippy + cargo test over sh/ — the dev loop has
+        // network for the lock-pinned closure, like the hosted td-sh workflow);
+        // the bounded check-pr tier rides along like fetch's mapping.
+        sel.add_preflight("td-sh-test");
+        sel.add_target("check-pr");
+        return;
+    }
+
     if pattern_matches("feed/*|feed/src/*|feed/Cargo.toml|feed/Cargo.lock", p) {
         // main.rs holds the host-PREP warm that feeds the recipe graph consumers
         // (`warm sources` + `warm kernel-headers`).
@@ -660,6 +672,9 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
             "  bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
         ),
         "cargo-test" => Some("  cargo test --manifest-path builder/Cargo.toml"),
+        "td-sh-test" => Some(
+            "  cargo clippy --all-targets --manifest-path sh/Cargo.toml && cargo test --manifest-path sh/Cargo.toml",
+        ),
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
     }
@@ -1013,6 +1028,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // No gate builds the fetch crate from source (the td-fetch corpus recipe is
     // retired), so a change to it validates on the bounded check-pr tier.
     assert_target!("fetch/Cargo.lock", "check-pr");
+    // td-sh (the brush-wrapped seed shell) carries crates: no offline gate builds
+    // it; the blocking dev-loop coverage is the td-sh-test preflight (clippy +
+    // test), plus the bounded check-pr tier and the hosted td-sh workflow.
+    assert_target!("sh/src/main.rs", "check-pr");
+    assert_target!("sh/tests/scripts.rs", "check-pr");
+    assert_target!("sh/Cargo.lock", "check-pr");
+    assert_contains!(
+        "sh/src/main.rs",
+        "cargo clippy --all-targets --manifest-path sh/Cargo.toml"
+    );
     // A feed/src change smokes the warm-sources consumer — the i686 chain's proof target set.
     assert_target!("feed/src/main.rs", "recipe-checks-daily");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");
@@ -1189,6 +1214,13 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             "bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
         ),
         "cargo-test" => run_shell(root, "cargo test --manifest-path builder/Cargo.toml"),
+        // The blocking dev-loop coverage for the dependency-carrying seed shell:
+        // clippy enforces sh/Cargo.toml's [lints] denies (cargo test alone would
+        // ignore them), then the script-compat tests run.
+        "td-sh-test" => run_shell(
+            root,
+            "cargo clippy --all-targets --manifest-path sh/Cargo.toml && cargo test --manifest-path sh/Cargo.toml",
+        ),
         // The dispatcher's own self-test — run IN-PROCESS (the shell oracle is gone,
         // and this binary IS the dispatcher), so no `td-builder` re-resolution.
         "affected-self-test" => {
