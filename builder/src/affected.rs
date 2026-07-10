@@ -464,6 +464,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    if pattern_matches("sh/*|sh/src/*|sh/tests/*|sh/Cargo.toml|sh/Cargo.lock", p) {
+        // td-sh (the brush-wrapped seed shell, re #469) carries crates, so no
+        // offline gate builds it; the hosted td-sh CI job runs its script-compat
+        // tests, and locally it validates on the bounded check-pr tier like fetch.
+        sel.add_target("check-pr");
+        return;
+    }
+
     if pattern_matches("feed/*|feed/src/*|feed/Cargo.toml|feed/Cargo.lock", p) {
         // main.rs holds the host-PREP warm that feeds the recipe graph consumers
         // (`warm sources` + `warm kernel-headers`).
@@ -1013,6 +1021,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // No gate builds the fetch crate from source (the td-fetch corpus recipe is
     // retired), so a change to it validates on the bounded check-pr tier.
     assert_target!("fetch/Cargo.lock", "check-pr");
+    // td-sh (the brush-wrapped seed shell) carries crates: no offline gate builds
+    // it; hosted CI runs its tests, locally it rides the bounded check-pr tier.
+    assert_target!("sh/src/main.rs", "check-pr");
+    assert_target!("sh/tests/scripts.rs", "check-pr");
+    assert_target!("sh/Cargo.lock", "check-pr");
     // A feed/src change smokes the warm-sources consumer — the i686 chain's proof target set.
     assert_target!("feed/src/main.rs", "recipe-checks-daily");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");

@@ -15,6 +15,9 @@
 .recipe-rs-scratch/
 recipes/target/
 
+# td-sh (the brush-wrapped seed shell): local cargo build target.
+sh/target/
+
 # check-memo verdicts (constraint 2): host-local state,
 # NEVER committed — a verdict greens only the environment that recorded it.
 .check-verdicts/

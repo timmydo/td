@@ -165,10 +165,13 @@ td's Rust is defensive and minimal-surface.
   `forbid`s `unsafe_code`. Do not add `unsafe` anywhere else.
 - **The engine is dependency-free.** `builder` and `recipes` carry **zero crates**
   (pure `std`) and must stay that way — the gate fails if either `Cargo.lock` grows
-  past its one self-entry. The network tools (`fetch`/`feed`/`subst`) are the *only*
-  crates allowed dependencies, and only the vendored-through-the-cargo-proxy FSDG
-  set they already have (`ureq`/`rustls`/`sha2`/`ring`); a *new* dependency anywhere
-  is a reviewed decision (directive 6 territory), never casual.
+  past its one self-entry. Two crate tiers are allowed dependencies: the network
+  tools (`fetch`/`feed`/`subst`) with the vendored-through-the-cargo-proxy FSDG
+  set they already have (`ureq`/`rustls`/`sha2`/`ring`), and the seed shell
+  (`sh/` → `td-sh`), a thin wrapper over `brush-shell` (the pure-Rust MIT
+  bash-compatible shell) so bootstrap rungs can declare a td shell instead of a
+  host bash (re #469). A *new* dependency anywhere is a reviewed decision
+  (directive 6 territory), never casual.
 - **`std`, not `no_std`.** These are OS-driving userspace programs
   (`std::fs`/`std::process`/namespace syscalls); `no_std` is out of scope.
 - **Prefer allocating off the hot path** — set buffers/collections up once rather
