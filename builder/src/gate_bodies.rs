@@ -195,7 +195,7 @@ fn run_out_env(
 }
 
 /// The first `bin`-dir among `frags` (a `:`-joined PATH fragment, as
-/// `tools/provision-{rust,cc}.sh` print) that actually has an executable
+/// `stage0::provision_rust`/`provision_cc` return) that actually has an executable
 /// named `bin` — resolving the absolute binary path ourselves rather than
 /// leaning on `Command`'s PATH search (which uses the CURRENT process's PATH,
 /// not a child `.env("PATH", ..)` override).
@@ -1827,8 +1827,8 @@ fn is_executable_file(path: &Path) -> bool {
 /// recipe-rs — the Rust package + spec surface (the `recipes` crate) is
 /// self-consistent (rust-recipe-surface track). Builds + unit-tests the
 /// dependency-free `recipes` crate OFFLINE with a guix-free rust+cc toolchain
-/// (`tools/provision-{rust,cc}.sh` — a host-prep concern, not part of the
-/// rust-recipe-surface itself, so still shelled out to). The catalog's
+/// (`stage0::provision_rust`/`provision_cc` — a host-prep concern, resolved
+/// in-process; no ambient host sh, re #469). The catalog's
 /// coverage (every recipe emits valid, round-tripping JSON) and
 /// discrimination (a mismatch is not vacuously accepted) legs are `#[test]`s
 /// in the `recipes` crate itself (`catalog::tests`, `td-recipe-eval::tests`)
@@ -1840,8 +1840,11 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
         ">> recipe-rs: the Rust package + spec surface (td-recipe crate) is self-consistent (rust-recipe-surface)"
     );
 
-    let rustpath = run_out("sh", &["tools/provision-rust.sh"], "provision-rust")?;
-    let ccpath = run_out("sh", &["tools/provision-cc.sh"], "provision-cc")?;
+    let penv = crate::stage0::ProvisionEnv::from_env(root);
+    let rustpath = crate::stage0::provision_rust(&penv)
+        .map_err(|e| format!("FAIL: provision-rust: {e}"))?;
+    let ccpath =
+        crate::stage0::provision_cc(&penv).map_err(|e| format!("FAIL: provision-cc: {e}"))?;
     let cargo_bin = find_in_path_frags(&rustpath, "cargo")
         .ok_or_else(|| format!("FAIL: no cargo in provision-rust output ({rustpath})"))?;
 
@@ -2201,9 +2204,16 @@ fn recipe_eval_source_pins(root: &Path) -> Result<String, String> {
         _ => {
             let base = root.join(".td-build-cache/recipe-eval");
             let base_s = path_str(&base)?;
-            let printed = run_out(
+            // The tool resolves its toolchain via `$TD_BUILDER_SELF provision-{rust,cc}`;
+            // we ARE a td-builder, so pass ourselves explicitly rather than relying on
+            // the gate-run export (this body is also reachable from dev invocations).
+            let self_exe = std::env::current_exe()
+                .map_err(|e| format!("FAIL: cannot resolve current td-builder: {e}"))?;
+            let self_s = path_str(&self_exe)?;
+            let printed = run_out_env(
                 "sh",
                 &["tests/recipe-eval-tool.sh", &base_s],
+                &[("TD_BUILDER_SELF", &self_s)],
                 "recipe-eval-tool.sh (build td-recipe-eval from the current worktree)",
             )?;
             let bin = printed.lines().last().unwrap_or("").trim();

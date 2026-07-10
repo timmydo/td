@@ -85,17 +85,6 @@ pub(crate) fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn run_capture(cmd: &mut Command) -> Result<String, String> {
-    let out = cmd
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| format!("could not spawn {:?}: {e}", cmd.get_program()))?;
-    if !out.status.success() {
-        return Err(format!("{:?} exited {}", cmd.get_program(), out.status));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// --- Offline-isolation control: the netns probe mechanism must discriminate ---
 /// The offline probes assert "only `lo` in /proc/net/dev" inside builders; that
 /// only has teeth if the same mechanism reports a non-loopback interface where
@@ -123,46 +112,27 @@ fn guard_netns_probe() -> Result<(), String> {
 }
 
 /// Provision the guix-free stage0 td-builder (the loop-container provider,
-/// workstream E #294) via the existing shell machinery and return $TB.
+/// workstream E #294) and return $TB — a direct `stage0::stage0_place` call
+/// (no ambient host sh anywhere in setup, re #469). The base default matches
+/// cache-lib's load_stage0, so the prelude and the gates share one placement.
 fn provision_stage0(root: &Path) -> Result<String, String> {
-    let applets = current_binary_native_applet_path(root)?;
-    let path = std::env::var("PATH").unwrap_or_default();
-    let self_exe = std::env::current_exe().map_err(|e| {
-        fatal(&format!(
-            "could not resolve current td-builder executable: {e}"
-        ))
-    })?;
-    let out = run_capture(
-        Command::new("sh")
-            .arg("-c")
-            .arg(". tests/cache-lib.sh && provision_stage0 1>&2 && printf '%s' \"$TB\"")
-            .env("PATH", format!("{applets}:{path}"))
-            .env("TD_BUILDER_SELF", &self_exe)
-            .current_dir(root),
-    )
-    .map_err(|e| {
+    let base = match std::env::var("TD_STAGE0_BASE") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => root.join(".td-build-cache/stage0"),
+    };
+    let cb = crate::stage0::stage0_place(root, &base).map_err(|e| {
         fatal(&format!(
             "could not provision the guix-free stage0 td-builder for the loop sandbox ({e})"
         ))
     })?;
-    let tb = out.trim().to_string();
-    if tb.is_empty() || !Path::new(&tb).is_file() {
+    let placed = Path::new(&cb)
+        .file_name()
+        .ok_or_else(|| fatal("stage0 placement returned a malformed store path"))?;
+    let tb = base.join("store").join(placed).join("bin/td-builder");
+    if !tb.is_file() {
         return Err(fatal("stage0 provisioning returned no usable $TB"));
     }
-    Ok(tb)
-}
-
-fn current_binary_native_applet_path(root: &Path) -> Result<String, String> {
-    let current = std::env::current_exe()
-        .map_err(|e| {
-            fatal(&format!(
-                "cannot resolve current td-builder executable: {e}"
-            ))
-        })?
-        .display()
-        .to_string();
-    native_applet_path(root, &current)
-        .map_err(|e| fatal(&format!("could not provision stage0 native applets ({e})")))
+    Ok(tb.display().to_string())
 }
 
 /// td's own store prefix — where the loop userland's items are hashed for and

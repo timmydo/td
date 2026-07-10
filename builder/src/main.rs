@@ -40,6 +40,7 @@ mod oci;
 mod sandbox;
 mod scan;
 mod sha256;
+mod stage0;
 mod store;
 mod store_db;
 mod store_db_read;
@@ -6216,6 +6217,64 @@ fn main() -> ExitCode {
         // PATH (only the drv root equal to its canonical is re-keyed), so it is a harmless
         // no-op for a drv that does not name the stage0 (e.g. the guile probes of gate 358).
         // Usage:  daemon SOCKET STORE-DIR SCRATCH-BASE
+        // td-builder stage0-place — compile + place the guix-free stage0 td-builder
+        // under BASEDIR and print its canonical store path (the one entry point every
+        // stage0 consumer goes through; the Rust port of tests/stage0-builder.sh —
+        // the setup path runs no ambient host sh, re #469). Memoized on the builder
+        // source fingerprint; see stage0::stage0_place.
+        // Usage: stage0-place BASEDIR   (cwd must be the repo root)
+        Some("stage0-place") if args.len() == 3 => {
+            let run = || -> Result<String, String> {
+                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+                stage0::stage0_place(&root, Path::new(&args[2]))
+            };
+            match run() {
+                Ok(cb) => {
+                    println!("{cb}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: stage0-place: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // td-builder provision-rust / provision-cc — resolve the SEED build's
+        // guix-free toolchain and print a PATH fragment (the Rust port of
+        // tools/provision-{rust,cc}.sh; resolution order in stage0.rs). Exit 3 when
+        // nothing resolves — operator guidance, distinct from a hard failure.
+        Some("provision-rust") if args.len() == 2 => {
+            let run = || -> Result<String, String> {
+                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+                stage0::provision_rust(&stage0::ProvisionEnv::from_env(&root))
+            };
+            match run() {
+                Ok(frag) => {
+                    println!("{frag}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: provision-rust: {e}");
+                    ExitCode::from(3)
+                }
+            }
+        }
+        Some("provision-cc") if args.len() == 2 => {
+            let run = || -> Result<String, String> {
+                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+                stage0::provision_cc(&stage0::ProvisionEnv::from_env(&root))
+            };
+            match run() {
+                Ok(frag) => {
+                    println!("{frag}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: provision-cc: {e}");
+                    ExitCode::from(3)
+                }
+            }
+        }
         // td-builder seed-bless — record the DECLARED seed closure's hashes into a
         // td-owned store db (re #469): content-scan SEED-DIR for ROOTS-FILE's
         // transitive closure and fully register every member (path/hash/size/refs).
@@ -7200,6 +7259,9 @@ fn main() -> ExitCode {
             eprintln!("       td-builder realize FILE.drv STORE-DB SCRATCH-DIR");
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DB [SRC-STORE-DIR SRC-DB]");
             eprintln!("       td-builder build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH");
+            eprintln!("       td-builder stage0-place BASEDIR        # compile+place the guix-free stage0 (memoized)");
+            eprintln!("       td-builder provision-rust              # print the guix-free rust toolchain PATH fragment");
+            eprintln!("       td-builder provision-cc                # print the guix-free C toolchain PATH fragment");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             eprintln!("       td-builder rust-build        # as a derivation builder (cargo)");
             eprintln!("       td-builder cmake-build       # as a derivation builder (cmake)");

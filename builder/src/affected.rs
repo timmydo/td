@@ -515,7 +515,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // tests/build-recipes.sh IS the build phase (the former Makefile build-recipes
     // recipe, run by the gate runner) — a change to it affects every build gate,
-    // exactly like the build-phase helpers below.
+    // exactly like the build-phase helpers below. (tests/stage0-builder.sh is a
+    // tombstone: the placement logic became builder/src/stage0.rs — `td-builder
+    // stage0-place`, re #469; the deleting diff still routes to the build gates
+    // that consume the placement.)
     if pattern_matches(
         "tests/build-recipes.sh|tests/cache-lib.sh|tests/stage0-builder.sh",
         p,
@@ -624,9 +627,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     // (The td-builder SEED-build resolver scripts tools/provision-{rust,cc}.sh +
-    // tools/bootstrap-td-builder.sh and tests/provision-{rust,cc}.sh fall through to
-    // the shell-syntax preflight below — their gates (bootstrap/provision-rust/
-    // provision-cc) retired with the guix-invoking gates.)
+    // tools/bootstrap-td-builder.sh and tests/provision-{rust,cc}.sh were ported
+    // into builder/src/stage0.rs (`td-builder provision-{rust,cc}` / `stage0-place`,
+    // re #469) and deleted; their gates (bootstrap/provision-rust/provision-cc) had
+    // already retired with the guix-invoking gates. The deleting diffs fall through
+    // to the shell-syntax preflight below.)
     if pattern_matches("ci/*.sh|tools/*.sh", p) {
         sel.add_preflight("shell-syntax");
         return;

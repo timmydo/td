@@ -1028,12 +1028,11 @@ fn place_stage0_builder(
     td_builder_self: &Path,
 ) -> Result<String, String> {
     fs::create_dir_all(base).map_err(|e| format!("mkdir {}: {e}", base.display()))?;
-    let mut cmd = Command::new("sh");
-    cmd.current_dir(root)
-        .arg("tests/stage0-builder.sh")
-        .arg(base)
-        .env("TD_BUILDER_SELF", td_builder_self);
-    let out = command_output(&mut cmd, "stage0-builder.sh")?;
+    // `td-builder stage0-place` — the one stage0 entry point (the placement
+    // logic lives in builder/src/stage0.rs; no ambient host sh, re #469).
+    let mut cmd = Command::new(td_builder_self);
+    cmd.current_dir(root).arg("stage0-place").arg(base);
+    let out = command_output(&mut cmd, "td-builder stage0-place")?;
     out.lines()
         .rev()
         .map(str::trim)
