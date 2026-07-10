@@ -1246,16 +1246,48 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
         committed.push(r.store_path.clone());
     }
     merge_output_db(db, &regs)?;
+    // Persist the engine-issued receipt beside the db, keyed by the producing drv
+    // (re #469 round-7): a later persistent_realization reuse of these outputs
+    // requires it to match the then-current plan identity. A scratch without a
+    // receipt (a plain store-commit of interned trees) commits bytes + rows only —
+    // such entries are simply never receipt-reusable.
+    if let Ok(receipt) = std::fs::read_to_string(scratch.join("receipt")) {
+        if let Some(rp) = regs
+            .first()
+            .filter(|r| !r.deriver.is_empty())
+            .and_then(|r| persist_receipt_path(db, &r.deriver))
+        {
+            if let Some(dir) = rp.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&rp, receipt).map_err(|e| format!("write {}: {e}", rp.display()))?;
+        }
+    }
     Ok(committed)
+}
+
+/// The receipt SIDECAR of a persistent store db: `<db>.receipts/<drv-basename>.receipt`,
+/// written by `commit_scratch_to_store` from the receipt the engine issued at build
+/// time, keyed by the producing drv's store basename (content-addressed, so one
+/// receipt per distinct derivation).
+fn persist_receipt_path(persist_db: &Path, deriver: &str) -> Option<std::path::PathBuf> {
+    let base = deriver.rsplit('/').next().filter(|b| !b.is_empty())?;
+    let mut dir = persist_db.as_os_str().to_owned();
+    dir.push(".receipts");
+    Some(Path::new(&dir).join(base))
 }
 
 /// Persistent-store build cache — like `cached_realization`, but keyed on a PERSISTENT
 /// store (dir + accumulating DB) that survives ACROSS invocations (the incremental
-/// /td/store). If EVERY output of PARSED is a full valid path in PERSIST_DB whose tree
-/// under PERSIST_STORE re-serializes to the recorded NAR hash, a PRIOR invocation already
-/// built it: stage each output tree into SCRATCH/newstore, and return the read-back regs
-/// (the caller writes SCRATCH/registration + td.db from them) — so the build is SKIPPED.
-/// Any missing/mismatched output ⇒ None (rebuild), and any tree staged so far is unwound.
+/// /td/store), and RECEIPT-GATED the same way (re #469 round-7): the reuse requires
+/// the engine-issued receipt sidecar for THIS derivation to match the CURRENT plan's
+/// identity (`ReceiptExpect`), every ValidPaths row to record THIS drv as its deriver
+/// (EXPECTED_DERIVER — a row minted for some other derivation, or with no deriver,
+/// vouches nothing here), the row hash to equal the receipt's, and the tree under
+/// PERSIST_STORE to re-serialize to it. Then each output tree is staged into
+/// SCRATCH/newstore and the read-back regs returned (the caller writes
+/// SCRATCH/registration + td.db from them) — so the build is SKIPPED. Any
+/// missing/mismatched leg ⇒ None (rebuild), and any tree staged so far is unwound.
 /// The daemon's valid-path skip, sourced across process boundaries from an on-disk store.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn persistent_realization(
@@ -1263,12 +1295,25 @@ fn persistent_realization(
     persist_store: &str,
     persist_db: &Path,
     scratch: &Path,
+    expect: &ReceiptExpect,
+    expected_deriver: &str,
 ) -> Result<Option<Vec<OutputReg>>, String> {
     use store_db_read::{Db, Value as RV};
     let bytes = match std::fs::read(persist_db) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", persist_db.display())),
+    };
+    // The receipt gate: the sidecar for THIS derivation must exist and match the
+    // CURRENT plan's identity, or the persistent entry is a miss (rebuild).
+    let receipt_hashes = match persist_receipt_path(persist_db, expected_deriver)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+    {
+        Some(text) => match receipt_outputs(&text, expect) {
+            Some(h) => h,
+            None => return Ok(None),
+        },
+        None => return Ok(None),
     };
     let db = Db::open(bytes)?;
     // Fully-registered paths (hash present) → (hash, narSize, deriver).
@@ -1310,6 +1355,14 @@ fn persistent_realization(
                 return Ok(None);
             }
         };
+        // Deriver binding (re #469 round-7): the row must have been registered FOR
+        // this derivation — a row carrying another drv's deriver (or none) cannot
+        // vouch this drv's output, however plausible its path looks. And the row's
+        // hash must be the one the engine's receipt recorded at build time.
+        if deriver != expected_deriver || receipt_hashes.get(&o.path) != Some(&hash) {
+            unwind(&staged);
+            return Ok(None);
+        }
         let base = match o.path.rsplit('/').next() {
             Some(b) => b,
             None => {
@@ -1386,23 +1439,139 @@ fn parse_registration_blocks(text: &str) -> Vec<OutputReg> {
     recs
 }
 
-/// Content-addressed build cache. The assembled `.drv` path is DETERMINISTIC (its
-/// hash covers the inputs + builder + env), so if every output of PARSED is already
-/// present under SCRATCH/newstore AND recorded in SCRATCH/registration with a NAR
-/// hash that RE-VERIFIES, the build was already done — same drv ⇒ same result, the
-/// guix-daemon valid-path skip. Returns the recorded outputs to reuse, or None to
-/// (re)build. Re-hashing the cached output (cheap vs a rebuild) guards a corrupted /
-/// partially-deleted entry. This is consulted ONLY by `build-recipe`; the
-/// reproducibility `check` is a separate command that force-rebuilds, so reuse here
-/// never weakens the repro proof.
+/// The reuse identity the CURRENT plan derives, independent of anything a cache
+/// stores (re #469): the SHA-256 of the assembled `.drv` FILE BYTES (they cover
+/// inputs, builder path, args, env), the digest of the TYPED staging manifest
+/// (`manifest_digest` — every admissible input's hash AND origin class), and the
+/// drv's builder path. A cache entry is reusable only if the receipt the ENGINE
+/// wrote at build time matches ALL of these recomputed-now values — so metadata
+/// stored beside an output is never its own authority: a forged record must
+/// reproduce the exact identity the planner derives today, and a stale one
+/// (changed drv, changed input set, changed builder) can never hit. The staged
+/// builder BYTES are covered via `manifest_sha256` (the manifest's
+/// `ControlPlaneBuilder` row). Honest limit, stated: receipts live in the same
+/// user-writable cache as the outputs, so an attacker who can rewrite both and
+/// can read the current plan can still forge a hit — closing THAT requires a
+/// daemon-owned provenance database (or no reuse at all), which is follow-on
+/// work, not this increment.
+#[derive(Clone)]
+struct ReceiptExpect {
+    drv_sha256: String,
+    manifest_sha256: String,
+    builder: String,
+}
+
+/// Digest of the typed staging manifest: SHA-256 over its `path hash origin`
+/// lines (BTreeMap iteration is sorted, so the digest is canonical). Binds a
+/// receipt to the exact input-authority set the plan derives.
+fn manifest_digest(m: &sandbox::StageManifest) -> String {
+    let mut h = sha256::Sha256::new();
+    for (p, si) in m {
+        h.update(p.as_bytes());
+        h.update(b" ");
+        h.update(si.nar_hash.as_bytes());
+        h.update(b" ");
+        h.update(si.origin.as_str().as_bytes());
+        h.update(b"\n");
+    }
+    sha256::to_base16(&h.finalize())
+}
+
+/// SHA-256 (hex) of a byte blob — the drv-file leg of `ReceiptExpect`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = sha256::Sha256::new();
+    h.update(bytes);
+    sha256::to_base16(&h.finalize())
+}
+
+/// Serialize the engine-issued build receipt `realize_drv` writes beside the
+/// registration after a REAL build: the current-plan identity plus every
+/// output's (name, store path, NAR hash, NAR size) and `producer local-build`.
+fn receipt_text(expect: &ReceiptExpect, regs: &[OutputReg]) -> String {
+    let mut t = String::from("td-receipt v1\n");
+    t.push_str(&format!("drv-sha256 {}\n", expect.drv_sha256));
+    t.push_str(&format!("manifest-sha256 {}\n", expect.manifest_sha256));
+    t.push_str(&format!("builder {}\n", expect.builder));
+    t.push_str("producer local-build\n");
+    for r in regs {
+        t.push_str(&format!("output {} {} {}\n", r.store_path, r.nar_hash, r.nar_size));
+    }
+    t
+}
+
+/// Parse + verify a receipt against the CURRENT plan's `ReceiptExpect`. Returns
+/// the receipt's per-output `store path -> NAR hash` map iff the version,
+/// producer, and every identity field match exactly; any anomaly is `None`
+/// (the caller treats it as a cache MISS — rebuild, never trust).
+fn receipt_outputs(
+    text: &str,
+    expect: &ReceiptExpect,
+) -> Option<std::collections::HashMap<String, String>> {
+    let mut lines = text.lines();
+    if lines.next() != Some("td-receipt v1") {
+        return None;
+    }
+    let mut drv_sha = None;
+    let mut manifest_sha = None;
+    let mut builder = None;
+    let mut producer = None;
+    let mut outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for l in lines {
+        if let Some(v) = l.strip_prefix("drv-sha256 ") {
+            drv_sha = Some(v);
+        } else if let Some(v) = l.strip_prefix("manifest-sha256 ") {
+            manifest_sha = Some(v);
+        } else if let Some(v) = l.strip_prefix("builder ") {
+            builder = Some(v);
+        } else if let Some(v) = l.strip_prefix("producer ") {
+            producer = Some(v);
+        } else if let Some(v) = l.strip_prefix("output ") {
+            let mut f = v.split_whitespace();
+            let (p, h) = (f.next()?, f.next()?);
+            outputs.insert(p.to_string(), h.to_string());
+        } else if !l.trim().is_empty() {
+            return None; // an unknown line is a malformed receipt, not a hit
+        }
+    }
+    let ok = drv_sha == Some(expect.drv_sha256.as_str())
+        && manifest_sha == Some(expect.manifest_sha256.as_str())
+        && builder == Some(expect.builder.as_str())
+        && producer == Some("local-build");
+    if ok { Some(outputs) } else { None }
+}
+
+/// Content-addressed build cache, RECEIPT-GATED (re #469 round-7). The assembled
+/// `.drv` path is deterministic (its hash covers the inputs + builder + env), so
+/// if every output of PARSED is already present under SCRATCH/newstore, recorded
+/// in SCRATCH/registration, AND the engine-issued SCRATCH/receipt matches the
+/// CURRENT plan's identity (`ReceiptExpect`: drv bytes, typed-manifest digest,
+/// builder) with the on-disk bytes re-verifying against the RECEIPT's NAR hash,
+/// the build was already done — same drv ⇒ same result, the guix-daemon
+/// valid-path skip. Returns the recorded outputs to reuse, or None to (re)build.
+/// A registration without a matching receipt is a MISS: a record beside the
+/// bytes is not its own authority. Re-hashing the cached output (cheap vs a
+/// rebuild) guards a corrupted / partially-deleted entry. Consulted only by
+/// `build-recipe` and the daemon build verb — AFTER manifest assembly, so the
+/// reuse decision is bound to the same typed authority a fresh build would
+/// stage from; the reproducibility `check` force-rebuilds, so reuse here never
+/// weakens the repro proof.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn cached_realization(
     parsed: &drv::Derivation,
     scratch: &Path,
+    expect: &ReceiptExpect,
 ) -> Result<Option<Vec<OutputReg>>, String> {
     let reg = match std::fs::read_to_string(scratch.join("registration")) {
         Ok(s) => s,
         Err(_) => return Ok(None), // never built here
+    };
+    // The receipt gate: no engine-issued receipt matching the CURRENT plan ⇒ miss.
+    let receipt = match std::fs::read_to_string(scratch.join("receipt")) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let Some(receipt_hashes) = receipt_outputs(&receipt, expect) else {
+        return Ok(None);
     };
     let recs: std::collections::HashMap<String, OutputReg> = parse_registration_blocks(&reg)
         .into_iter()
@@ -1416,6 +1585,11 @@ fn cached_realization(
             Some(r) if !r.nar_hash.is_empty() => r.clone(),
             _ => return Ok(None),
         };
+        // The registration must agree with the RECEIPT's hash for this output —
+        // the record that vouches downstream is the one the receipt binds.
+        if receipt_hashes.get(&o.path) != Some(&rec.nar_hash) {
+            return Ok(None);
+        }
         let base = o.path.rsplit('/').next().unwrap_or("");
         let physical = newstore.join(base);
         if !physical.exists() {
@@ -1677,16 +1851,6 @@ fn daemon_realize_one(
         let host = daemon_host_path(&scr, &canon)?;
         Ok((canon, host))
     };
-    if let Some(regs) = cached_realization(&parsed, &scr)? {
-        eprintln!(
-            "td-builder: daemon CACHE HIT for {drv} — output already valid under {}, not rebuilding",
-            scr.display()
-        );
-        let (c, h) = mk(&regs)?;
-        return Ok((c, h, true));
-    }
-    eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
-    let seed_dirs = [seed_dir.to_string()];
     // The daemon scans the live store dir: entries are canonical where they sit.
     // Strict manifests are unconditional (re #469): the vouching db is the blessed
     // seed-closure db, handed down as an EXPLICIT `daemon-build` argument —
@@ -1697,6 +1861,24 @@ fn daemon_realize_one(
     let extra_dbs: Vec<(String, sandbox::InputOrigin)> = bless_db
         .map(|d| vec![(d.to_string(), sandbox::InputOrigin::BlessedSeedClosure)])
         .unwrap_or_default();
+    // The reuse identity comes BEFORE the cache read (re #469 round-7): the typed
+    // manifest is assembled first and the prior realization must carry a receipt
+    // matching it — the daemon's pre-manifest cache hit is gone.
+    let expect = ReceiptExpect {
+        drv_sha256: sha256_hex(&content),
+        manifest_sha256: manifest_digest(&assemble_input_manifest(&extra_dbs, &[], ov.as_ref())?),
+        builder: parsed.builder.clone(),
+    };
+    if let Some(regs) = cached_realization(&parsed, &scr, &expect)? {
+        eprintln!(
+            "td-builder: daemon CACHE HIT for {drv} — output already valid under {}, not rebuilding",
+            scr.display()
+        );
+        let (c, h) = mk(&regs)?;
+        return Ok((c, h, true));
+    }
+    eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
+    let seed_dirs = [seed_dir.to_string()];
     let regs = realize_drv(drv, &seed_dirs, &store::store_dir(), &extra_dbs, &scr, &[], ov.as_ref(), None)?;
     let (c, h) = mk(&regs)?;
     Ok((c, h, false))
@@ -1958,6 +2140,43 @@ fn manifest_from_typed_dbs(
     Ok(m)
 }
 
+/// Assemble the COMPLETE typed staging manifest a realize of this plan would
+/// stage from: the caller's typed extra dbs, each td-interned source/vendor
+/// placement db (`AuditedSeed` — a declared fixed-output fetch td restored
+/// itself), and the builder placement db (`ControlPlaneBuilder`). Shared by
+/// `realize_drv` (enforcement at the bind boundary) and the reuse gates'
+/// `ReceiptExpect.manifest_sha256` — which is computed from THIS assembly
+/// BEFORE any cache is consulted, so a reuse decision is bound to exactly the
+/// authority set a fresh build would stage from (re #469 round-7).
+fn assemble_input_manifest(
+    extra_dbs: &[(String, sandbox::InputOrigin)],
+    src_overrides: &[SrcOverride],
+    builder_override: Option<&BuilderOverride>,
+) -> Result<sandbox::StageManifest, String> {
+    let mut manifest = manifest_from_typed_dbs(extra_dbs)?;
+    for ov in src_overrides {
+        let data =
+            std::fs::read(&ov.db).map_err(|e| format!("read source db {}: {e}", ov.db))?;
+        manifest_add_db(
+            &mut manifest,
+            &store_db_read::Db::open(data)?,
+            &ov.db,
+            sandbox::InputOrigin::AuditedSeed,
+        )?;
+    }
+    if let Some(ov) = builder_override {
+        let data =
+            std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?;
+        manifest_add_db(
+            &mut manifest,
+            &store_db_read::Db::open(data)?,
+            &ov.db,
+            sandbox::InputOrigin::ControlPlaneBuilder,
+        )?;
+    }
+    Ok(manifest)
+}
+
 /// BLESS the declared seed closure (re #469): compute the transitive closure
 /// of ROOTS by content-scanning SEED-DIR, NAR-hash every member, and write a
 /// td-owned store db recording (path, hash, size, refs). This is the explicit
@@ -2205,14 +2424,9 @@ fn realize_drv(
     // content-scanned seed DIRECTORY thereby contributes bytes, never authority: an item
     // the dbs don't vouch for reds HERE, and sandbox::build re-hashes each item against
     // the manifest at the bind boundary. Scaffolding rows (hashless placement refs) vouch
-    // for nothing by construction.
-    let mut manifest = manifest_from_typed_dbs(extra_dbs)?;
-    for (ov, sdb) in &src_dbs {
-        manifest_add_db(&mut manifest, sdb, &ov.db, sandbox::InputOrigin::AuditedSeed)?;
-    }
-    if let (Some(ov), Some(bdb)) = (builder_override, &builder_db) {
-        manifest_add_db(&mut manifest, bdb, &ov.db, sandbox::InputOrigin::ControlPlaneBuilder)?;
-    }
+    // for nothing by construction. The SAME assembly (assemble_input_manifest) feeds the
+    // reuse gates' manifest digest, so a cache hit binds to this exact authority set.
+    let manifest = assemble_input_manifest(extra_dbs, src_overrides, builder_override)?;
     for e in &closure {
         let (canonical, _) = sandbox::split_closure_entry(e);
         if !manifest.contains_key(canonical) {
@@ -2232,6 +2446,16 @@ fn realize_drv(
     // td OWNS the store record of its build: write a td store-db registering the
     // realized output(s) — the daemon's post-build registration, in pure Rust.
     write_output_db(&regs, &scratch.join("td.db"))?;
+    // The engine-issued build RECEIPT (re #469 round-7): bind these outputs to the
+    // identity of the plan that produced them — drv bytes, typed-manifest digest,
+    // builder — so a later reuse must re-derive the same identity to hit.
+    let expect = ReceiptExpect {
+        drv_sha256: sha256_hex(&bytes),
+        manifest_sha256: manifest_digest(&manifest),
+        builder: parsed.builder.clone(),
+    };
+    std::fs::write(scratch.join("receipt"), receipt_text(&expect, &regs))
+        .map_err(|e| e.to_string())?;
     eprintln!(
         "td-builder: realize registered {} output(s) into td's store-db {}",
         regs.len(),
@@ -2349,11 +2573,25 @@ fn build_recipe(
     // Both no-ref td-interned trees go to realize_drv as src-overrides.
     let src_overrides: Vec<SrcOverride> =
         src_override.into_iter().chain(vendor_override).collect();
+    // The reuse identity, derived from the CURRENT plan BEFORE any cache is read
+    // (re #469 round-7): the typed staging manifest is assembled FIRST — the same
+    // assembly realize_drv enforces at the bind boundary — so a reuse decision is
+    // bound to the drv bytes, the exact typed input-authority set, and the builder.
+    // A cache record can only confirm this identity, never substitute for it.
+    let drv_bytes = std::fs::read(&drv_file).map_err(|e| e.to_string())?;
+    let manifest_now =
+        assemble_input_manifest(extra_dbs, &src_overrides, builder_override.as_ref())?;
+    let expect = ReceiptExpect {
+        drv_sha256: sha256_hex(&drv_bytes),
+        manifest_sha256: manifest_digest(&manifest_now),
+        builder: parsed.builder.clone(),
+    };
     // Content-addressed build cache: if SCRATCH already holds a valid realization of
-    // this exact (deterministic) drv, reuse it — skip the build. The gate points
+    // this exact (deterministic) drv, RECEIPT-verified against the identity above,
+    // reuse it — skip the build. The gate points
     // SCRATCH at a persistent cache, so an unchanged recipe is a cache HIT and only a
     // CHANGED recipe (⇒ different drv hash ⇒ different output path, a miss) rebuilds.
-    if let Some(regs) = cached_realization(&parsed, scratch)? {
+    if let Some(regs) = cached_realization(&parsed, scratch, &expect)? {
         eprintln!(
             "td-builder: build-recipe CACHE HIT for {drv_path} — {} output(s) already realized + NAR-verified under {}; skipping the build",
             regs.len(),
@@ -2372,10 +2610,14 @@ fn build_recipe(
     // PERSISTENT-STORE skip (opt-in, TD_PERSIST_STORE/TD_PERSIST_DB): an incremental
     // store that survives ACROSS invocations (the /td/store the loop builds into). If
     // this exact (deterministic) drv's output is already a valid path there — a PRIOR
-    // invocation built it — and its tree re-verifies, read it back instead of rebuilding.
-    // The daemon's valid-path skip, backed by an on-disk store across process boundaries.
+    // invocation built it, its receipt sidecar matches the identity above, its rows
+    // name THIS drv as deriver — and its tree re-verifies, read it back instead of
+    // rebuilding. The daemon's valid-path skip, backed by an on-disk store across
+    // process boundaries.
     if let Some((ps, pd)) = persist {
-        if let Some(regs) = persistent_realization(&parsed, ps, Path::new(pd), scratch)? {
+        if let Some(regs) =
+            persistent_realization(&parsed, ps, Path::new(pd), scratch, &expect, &drv_path)?
+        {
             eprintln!(
                 "td-builder: build-recipe PERSISTENT-STORE HIT for {drv_path} — {} output(s) already valid under {ps}; skipping the build",
                 regs.len()
@@ -7560,14 +7802,19 @@ daemon build START (2/2 active)
 
     #[test]
     fn persistent_realization_hits_stages_and_rejects_miss_or_corrupt() {
-        // The cross-invocation SKIP: an output already valid in a persistent store (DB +
-        // a tree that re-verifies) is read back (staged into scratch/newstore); an unknown
-        // output or a tampered tree is a MISS (rebuild), and a corrupt miss stages nothing.
+        // The cross-invocation SKIP is RECEIPT-GATED (re #469 round-7): reuse needs
+        // (a) the engine receipt sidecar for THIS drv matching the CURRENT plan
+        // identity, (b) rows whose deriver IS this drv, and (c) a tree that
+        // re-verifies. A valid row+tree without a receipt, a receipt for a
+        // different plan identity, rows minted for another deriver, an unknown
+        // output, or a tampered tree is a MISS (rebuild) — and a corrupt miss
+        // stages nothing.
         let tmp = std::env::temp_dir().join(format!("td-persist-real-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = tmp.join("store");
         let base = "00000000000000000000000000000abc-persist-demo-1";
         let path = format!("/td/store/{base}");
+        let deriver = format!("{path}.drv");
         let tree = store.join(base);
         std::fs::create_dir_all(tree.join("bin")).unwrap();
         std::fs::write(tree.join("bin/run"), b"#!/bin/sh\necho hi\n").unwrap();
@@ -7580,20 +7827,61 @@ daemon build START (2/2 active)
             nar_hash: hash,
             nar_size: size,
             refs: vec![],
-            deriver: format!("{path}.drv"),
+            deriver: deriver.clone(),
         };
         let db = tmp.join("db");
-        std::fs::write(&db, merge_regs(None, &[reg]).unwrap()).unwrap();
+        std::fs::write(&db, merge_regs(None, std::slice::from_ref(&reg)).unwrap()).unwrap();
         let sd = store.to_str().unwrap();
+        let expect = ReceiptExpect {
+            drv_sha256: "11".repeat(32),
+            manifest_sha256: "22".repeat(32),
+            builder: "/td/store/33333333333333333333333333333333-b/bin/td-builder".to_string(),
+        };
+
+        // NO receipt sidecar → MISS even though DB row + tree are valid: a record
+        // beside the bytes is not its own authority.
+        let s0 = tmp.join("s-noreceipt");
+        std::fs::create_dir_all(&s0).unwrap();
+        let no_receipt =
+            persistent_realization(&one_output_drv(&path), sd, &db, &s0, &expect, &deriver)
+                .unwrap();
+        assert!(no_receipt.is_none(), "a valid row+tree without an engine receipt must MISS");
+
+        // Write the engine receipt sidecar for this deriver.
+        let rp = persist_receipt_path(&db, &deriver).unwrap();
+        std::fs::create_dir_all(rp.parent().unwrap()).unwrap();
+        std::fs::write(&rp, receipt_text(&expect, std::slice::from_ref(&reg))).unwrap();
 
         // HIT: staged into scratch/newstore + the reg returned.
         let s1 = tmp.join("s-hit");
         std::fs::create_dir_all(&s1).unwrap();
-        let regs = persistent_realization(&one_output_drv(&path), sd, &db, &s1)
+        let regs = persistent_realization(&one_output_drv(&path), sd, &db, &s1, &expect, &deriver)
             .unwrap()
             .expect("expected a persistent-store HIT");
         assert_eq!(regs[0].store_path, path);
         assert!(s1.join("newstore").join(base).join("bin/run").exists(), "output tree staged into newstore");
+
+        // A DIFFERENT current plan identity (the typed-manifest digest moved) → MISS:
+        // the stored receipt cannot vouch a plan it was not issued for.
+        let s_id = tmp.join("s-wrong-identity");
+        std::fs::create_dir_all(&s_id).unwrap();
+        let other = ReceiptExpect { manifest_sha256: "99".repeat(32), ..expect.clone() };
+        let wrong_id =
+            persistent_realization(&one_output_drv(&path), sd, &db, &s_id, &other, &deriver)
+                .unwrap();
+        assert!(wrong_id.is_none(), "a receipt issued for another plan identity must MISS");
+
+        // Rows minted for a DIFFERENT deriver → MISS even with a matching sidecar:
+        // the ValidPaths row must itself record THIS drv as its producer.
+        let alien = "/td/store/00000000000000000000000000000abc-alien.drv";
+        let ap = persist_receipt_path(&db, alien).unwrap();
+        std::fs::write(&ap, receipt_text(&expect, std::slice::from_ref(&reg))).unwrap();
+        let s_al = tmp.join("s-alien-deriver");
+        std::fs::create_dir_all(&s_al).unwrap();
+        let alien_hit =
+            persistent_realization(&one_output_drv(&path), sd, &db, &s_al, &expect, alien)
+                .unwrap();
+        assert!(alien_hit.is_none(), "rows derived by another drv must not vouch this one");
 
         // MISS: an output path not registered in the persistent DB.
         let s2 = tmp.join("s-miss");
@@ -7603,6 +7891,8 @@ daemon build START (2/2 active)
             sd,
             &db,
             &s2,
+            &expect,
+            &deriver,
         )
         .unwrap();
         assert!(miss.is_none(), "an unregistered output must be a MISS");
@@ -7611,7 +7901,9 @@ daemon build START (2/2 active)
         std::fs::write(tree.join("bin/run"), b"tampered\n").unwrap();
         let s3 = tmp.join("s-corrupt");
         std::fs::create_dir_all(&s3).unwrap();
-        let corrupt = persistent_realization(&one_output_drv(&path), sd, &db, &s3).unwrap();
+        let corrupt =
+            persistent_realization(&one_output_drv(&path), sd, &db, &s3, &expect, &deriver)
+                .unwrap();
         assert!(corrupt.is_none(), "a tree that no longer matches its hash must be a MISS");
         assert!(!s3.join("newstore").join(base).exists(), "a corrupt miss must not leave a staged tree");
 
@@ -8556,10 +8848,12 @@ daemon build START (2/2 active)
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    // The build cache hits only on a present + NAR-verified output, and misses on a
-    // corrupted, deleted, or never-recorded one — so a CHANGED recipe (different drv ⇒
-    // different output path, never recorded) always rebuilds, and a corrupted cache
-    // entry rebuilds rather than serving garbage.
+    // The build cache hits only on a present + NAR-verified output whose engine
+    // RECEIPT matches the CURRENT plan identity (re #469 round-7), and misses on a
+    // corrupted, deleted, never-recorded, receipt-less, or identity-mismatched one —
+    // so a CHANGED recipe (different drv ⇒ different identity AND output path)
+    // always rebuilds, a forged registration without the current-plan receipt is
+    // never served, and a corrupted cache entry rebuilds rather than serving garbage.
     #[test]
     fn cached_realization_hits_only_on_a_present_and_nar_verified_output() {
         let base = std::env::temp_dir().join(format!("td-cache-{}", std::process::id()));
@@ -8587,6 +8881,11 @@ daemon build START (2/2 active)
             args: vec![],
             env: vec![],
         };
+        let expect = ReceiptExpect {
+            drv_sha256: "aa".repeat(32),
+            manifest_sha256: "bb".repeat(32),
+            builder: String::new(), // matches the test drv's builder field
+        };
         let write_reg = |h: &str| {
             std::fs::write(
                 scratch.join("registration"),
@@ -8594,23 +8893,74 @@ daemon build START (2/2 active)
             )
             .unwrap();
         };
+        let write_receipt = |e: &ReceiptExpect, h: &str| {
+            let reg = OutputReg {
+                store_path: store_path.to_string(),
+                nar_hash: h.to_string(),
+                nar_size: size,
+                refs: vec![],
+                deriver: "x.drv".to_string(),
+            };
+            std::fs::write(scratch.join("receipt"), receipt_text(e, std::slice::from_ref(&reg)))
+                .unwrap();
+        };
 
-        // (a) present + matching hash recorded -> HIT.
+        // (a0) valid registration + bytes but NO engine receipt -> MISS: a record
+        // beside the bytes is not its own authority.
         write_reg(&hash);
-        assert!(cached_realization(&drv, &scratch).unwrap().is_some(), "valid entry must hit");
+        assert!(
+            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            "a registration without the engine receipt must miss"
+        );
 
-        // (b) recorded hash wrong (output content changed under us) -> MISS.
+        // (a) present + matching hash + current-plan receipt -> HIT.
+        write_receipt(&expect, &hash);
+        assert!(
+            cached_realization(&drv, &scratch, &expect).unwrap().is_some(),
+            "valid entry must hit"
+        );
+
+        // (a1) the CURRENT plan moved (input-manifest digest changed) -> MISS: the
+        // stored receipt cannot vouch a plan it was not issued for.
+        let moved = ReceiptExpect { manifest_sha256: "cc".repeat(32), ..expect.clone() };
+        assert!(
+            cached_realization(&drv, &scratch, &moved).unwrap().is_none(),
+            "an identity-mismatched receipt must miss"
+        );
+
+        // (a2) registration hash diverges from the receipt's (forged record beside
+        // honest receipt) -> MISS.
+        write_reg("sha256:0123");
+        write_receipt(&expect, &hash);
+        assert!(
+            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            "a registration disagreeing with the receipt must miss"
+        );
+
+        // (b) recorded hash wrong everywhere (output content changed under us) -> MISS
+        // at NAR re-verification.
         write_reg("sha256:deadbeef");
-        assert!(cached_realization(&drv, &scratch).unwrap().is_none(), "hash mismatch must miss");
+        write_receipt(&expect, "sha256:deadbeef");
+        assert!(
+            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            "hash mismatch must miss"
+        );
 
         // (c) output directory gone -> MISS.
         write_reg(&hash);
+        write_receipt(&expect, &hash);
         std::fs::remove_dir_all(&outdir).unwrap();
-        assert!(cached_realization(&drv, &scratch).unwrap().is_none(), "absent output must miss");
+        assert!(
+            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            "absent output must miss"
+        );
 
         // (d) never built here (no registration) -> MISS.
         std::fs::remove_file(scratch.join("registration")).unwrap();
-        assert!(cached_realization(&drv, &scratch).unwrap().is_none(), "no registration must miss");
+        assert!(
+            cached_realization(&drv, &scratch, &expect).unwrap().is_none(),
+            "no registration must miss"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
