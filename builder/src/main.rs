@@ -19,6 +19,7 @@ mod affected;
 mod bootstrap;
 mod build;
 mod build_daemon;
+mod bzip2;
 mod check_loop;
 mod daily;
 mod drv;
@@ -47,6 +48,7 @@ mod store_db_read;
 mod sys;
 mod tar;
 mod toolchain_x86_64;
+mod xz;
 
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
@@ -5911,10 +5913,11 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // tar-extract / tar-gz-extract: extract POSIX tar archives with td's
-        // std-only extractor and gzip reader. This is intentionally small: enough
-        // for source seed archives and frozen seed closure tars, without adding an
-        // unpacker dependency or requiring host tar/gzip.
+        // tar-extract / tar-gz-extract / tar-bz2-extract: extract POSIX tar
+        // archives with td's std-only extractor and gzip/bzip2 readers. This is
+        // intentionally small: enough for source seed archives and frozen seed
+        // closure tars, without adding an unpacker dependency or requiring host
+        // tar/gzip/bzip2.
         Some("tar-extract") if args.len() == 4 => {
             let (tarball, dest) = (&args[2], &args[3]);
             match tar::extract_tar(Path::new(tarball), Path::new(dest)) {
@@ -5931,6 +5934,16 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: tar-gz-extract: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("tar-bz2-extract") if args.len() == 4 => {
+            let (tarball, dest) = (&args[2], &args[3]);
+            match tar::extract_tar_bz2(Path::new(tarball), Path::new(dest)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("td-builder: tar-bz2-extract: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -7799,6 +7812,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder nar-restore NARFILE DEST");
             eprintln!("       td-builder tar-extract TARFILE DEST");
             eprintln!("       td-builder tar-gz-extract TAR_GZ_FILE DEST");
+            eprintln!("       td-builder tar-bz2-extract TAR_BZ2_FILE DEST");
             eprintln!("       td-builder subst-export DB STORE-DIR OUTDIR ROOT...");
             eprintln!("       td-builder drv-parse FILE.drv");
             eprintln!("       td-builder drv-refs FILE.drv");

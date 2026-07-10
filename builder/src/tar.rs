@@ -18,6 +18,12 @@ pub fn extract_tar_gz(tar_gz: &Path, dest: &Path) -> Result<(), String> {
     extract_tar_reader(&mut reader, &tar_gz.display().to_string(), dest)
 }
 
+pub fn extract_tar_bz2(tar_bz2: &Path, dest: &Path) -> Result<(), String> {
+    let bytes = crate::bzip2::decompress_file(tar_bz2)?;
+    let mut reader = Cursor::new(bytes);
+    extract_tar_reader(&mut reader, &tar_bz2.display().to_string(), dest)
+}
+
 pub fn extract_tar_reader<R: Read>(
     file: &mut R,
     source_name: &str,

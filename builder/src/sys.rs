@@ -419,16 +419,23 @@ mod tests {
         // Lower the SOFT data limit to a finite value below the (typically
         // infinite) hard limit and read it back. Proves prlimit64 set+get are
         // real syscalls, not stubs — a no-op would leave the original soft
-        // limit, which we assert against. Lowering only the soft limit and only
-        // for THIS test process is harmless: RLIMIT_DATA blocks future heap
-        // GROWTH, and 1 GiB is far above the test's footprint.
-        let (_, hard) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
-        let target = 1u64 << 30; // 1 GiB, comfortably under the hard limit
-        assert!(hard == RLIM_INFINITY || hard >= target, "hard limit too low for the test");
+        // limit, which we assert against. RLIMIT_DATA is per-PROCESS and the
+        // cargo-test harness runs every #[test] in this one process, so pick
+        // a target far above any test's heap footprint (a 1 GiB target once
+        // aborted the xz real-tarball decode running on a sibling thread) and
+        // restore the original soft limit afterwards.
+        let (orig_soft, hard) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
+        let target = if hard == RLIM_INFINITY {
+            1u64 << 36 // 64 GiB — finite, but never binding for a test
+        } else {
+            hard.min(1u64 << 36)
+        };
         set_rlimit(RLIMIT_DATA, target, hard).expect("lowering the soft data limit must succeed");
         let (soft_after, hard_after) = get_rlimit(RLIMIT_DATA).expect("getrlimit");
         assert_eq!(soft_after, target, "soft data limit should be exactly the set value");
         assert_eq!(hard_after, hard, "hard limit must be unchanged");
+        set_rlimit(RLIMIT_DATA, orig_soft, hard)
+            .expect("restoring the soft data limit must succeed");
     }
 
     #[test]
