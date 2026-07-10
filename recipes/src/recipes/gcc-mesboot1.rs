@@ -13,25 +13,12 @@ pub fn recipe() -> Recipe {
     let lp = "{in:glibc-mesboot0}/lib:{in:gcc-mesboot0}/lib";
     let ldf = "-static -B{in:glibc-mesboot0}/lib";
     let mut steps = unpack_into("gcc-mesboot1-source", "{src}");
-    // the g++ front-end OVERLAY into the same tree (strip-components=1, same dir)
-    steps.push(
-        Step::run(
-            "{src}",
-            &[
-                "{in:tar}/bin/tar",
-                "-xf",
-                "{in:gcc-464-gpp}",
-                "--strip-components=1",
-            ],
-        )
-        .env("PATH", &base_path()),
-    );
+    // the g++ front-end OVERLAY into the same tree (strip-top MERGES, the
+    // engine unpack's `tar --strip-components=1` semantics)
+    steps.extend(unpack_into("gcc-464-gpp", "{src}"));
     steps.push(apply_patch("patch-mesboot", "patch-gcc-boot-4.6.4"));
     for t in ["gmp", "mpfr", "mpc"] {
-        steps.push(
-            Step::run("{src}", &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")])
-                .env("PATH", &base_path()),
-        );
+        steps.extend(unpack_keep_top(t, "{src}"));
     }
     steps.push(Step::Symlink {
         target: "gmp-4.3.2".into(),

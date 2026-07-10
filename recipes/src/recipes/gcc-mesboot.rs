@@ -14,10 +14,7 @@ pub fn recipe() -> Recipe {
     let ldf = "-static -B{in:glibc-mesboot}/lib";
     let mut steps = unpack_into("gcc-mesboot-source", "{src}");
     for t in ["gmp", "mpfr", "mpc"] {
-        steps.push(
-            Step::run("{src}", &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")])
-                .env("PATH", &base_path()),
-        );
+        steps.extend(unpack_keep_top(t, "{src}"));
     }
     steps.push(Step::Symlink {
         target: "gmp-4.3.2".into(),

@@ -7,22 +7,20 @@
 //!   and the curated-PATH farm): shell, coreutils, text tools, unpackers.
 //! - `base_path()` is the PATH template for Run steps: the rung's own {tools}
 //!   farm first (prior-rung compilers/tools), then the base tool packages.
-//! - Compression: gnu tar auto-detects by suffix and execs gzip/bzip2/xz from
-//!   PATH, so the unpack helper rides on `base_path()`.
+//! - Unpacking is ENGINE-NATIVE (`Step::Unpack` — td's own std-only
+//!   tar/gzip/bzip2/xz readers), so no rung declares an unpacker package.
 
 use crate::types::Step;
 
-/// The host-tool packages every rung declares (lock input names).
+/// The host-tool packages every rung declares (lock input names). Shrinks as
+/// the cutover (re #469) replaces each host edge with a recipe output or an
+/// engine-native step; tar/gzip/bzip2/xz already left with `Step::Unpack`.
 pub const BASE_TOOLS: &[&str] = &[
     "bash",
     "coreutils",
     "sed",
     "grep",
     "gawk",
-    "tar",
-    "gzip",
-    "bzip2",
-    "xz",
     "findutils",
     "diffutils",
 ];
@@ -69,31 +67,24 @@ pub fn link_bins(binutils_rung: &str) -> Step {
 /// The declared shell (the sandbox has no /bin/sh).
 pub const SH: &str = "{in:bash}/bin/bash";
 
-/// Unpack tarball input NAME into DEST (top-level dir stripped).
+/// Unpack tarball input NAME into DEST (top-level dir stripped) with the
+/// ENGINE's own readers — no unpacker packages in the sandbox (re #469).
 pub fn unpack_into(input: &str, dest: &str) -> Vec<Step> {
-    vec![
-        Step::MkDir { path: dest.into() },
-        Step::run(
-            dest,
-            &[
-                "{in:tar}/bin/tar",
-                "-xf",
-                &format!("{{in:{input}}}"),
-                "--strip-components=1",
-            ],
-        )
-        .env("PATH", &base_path()),
-    ]
+    vec![Step::Unpack {
+        input: format!("{{in:{input}}}"),
+        dest: dest.into(),
+        keep_top: false,
+    }]
 }
 
 /// Unpack tarball input NAME into DEST with the top-level dir KEPT (the gcc
 /// prereqs land as gmp-X.Y.Z/ subdirs that then get version-free symlinks).
 pub fn unpack_keep_top(input: &str, dest: &str) -> Vec<Step> {
-    vec![
-        Step::MkDir { path: dest.into() },
-        Step::run(dest, &["{in:tar}/bin/tar", "-xf", &format!("{{in:{input}}}")])
-            .env("PATH", &base_path()),
-    ]
+    vec![Step::Unpack {
+        input: format!("{{in:{input}}}"),
+        dest: dest.into(),
+        keep_top: true,
+    }]
 }
 
 /// Apply a patch input with the td-built patch rung: `patch --force -p1 -i X`

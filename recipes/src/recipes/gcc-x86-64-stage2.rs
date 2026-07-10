@@ -16,13 +16,7 @@ pub fn recipe() -> Recipe {
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let mut steps = unpack_into("gcc-x86-64-stage2-source", "{src}");
     for t in ["gmp63", "mpfr421", "mpc131"] {
-        steps.push(
-            Step::run(
-                "{src}",
-                &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")],
-            )
-            .env("PATH", &base_path()),
-        );
+        steps.extend(unpack_keep_top(t, "{src}"));
     }
     steps.push(Step::Symlink {
         target: "gmp-6.3.0".into(),
