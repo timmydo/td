@@ -11,7 +11,11 @@
 //!   3. the loop PATH: host-provided tools from `LOOP_TOOLCHAIN`,
 //!   4. the warm prelude (subst store, source/crate warms, build daemon),
 //!   5. the machine-wide slot dir, and
-//!   6. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon -- TB gate-run.
+//!   6. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon
+//!      --store-item ITEM… -- TB gate-run. The sandbox mounts NO store
+//!      directory: only the loop's declared input ITEMS — the resolved
+//!      toolchain closure (`loop_store_items`) — each bound read-only at its
+//!      own path, the drv build jail's input-only model.
 //!
 //! (The host-guix == pinned-channel integrity guard that used to run `guix
 //! describe` was removed in #406 — it only warned on drift, so dropping it is
@@ -156,11 +160,13 @@ fn current_binary_native_applet_path(root: &Path) -> Result<String, String> {
         .map_err(|e| fatal(&format!("could not provision stage0 native applets ({e})")))
 }
 
-/// The store prefix the loop sandbox binds over its fresh-tmpfs root: the loop
-/// prelude passes `--store-from`/`--store-at` explicitly and binds NOTHING else
-/// of the host FS (no /usr, /bin, /home). A toolchain bin dir is therefore
-/// reachable INSIDE the sandbox only if it physically lies under this prefix —
-/// a `/usr/bin` tool on a foreign-distro guix host would vanish.
+/// The host store prefix the loop toolchain must resolve under. The loop
+/// sandbox never mounts this (or any) store DIRECTORY: the prelude computes
+/// the resolved toolchain's runtime closure (`loop_store_items`) and binds
+/// each closure ITEM read-only at its own path (`--store-item`), and binds
+/// NOTHING else of the host FS (no /usr, /bin, /home). A toolchain bin dir is
+/// therefore reachable INSIDE the sandbox only if it physically lies under
+/// this prefix — a `/usr/bin` tool on a foreign-distro guix host would vanish.
 const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 
 /// The loop toolchain: the host-PATH tools the loop sandbox needs to run its
@@ -175,17 +181,26 @@ const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 /// `loop_path_with_native_applets`.
 const LOOP_TOOLCHAIN: &[&str] = &["make", "bash", "sh", "env"];
 
-/// The core loop toolchain PATH, resolved from the HOST PATH: the host brings
+/// The resolved loop toolchain: the sandbox PATH (deduped in-store bin dirs,
+/// colon-joined) plus the store ITEMS those dirs live under — the closure
+/// ROOTS `loop_store_items` expands into the sandbox's per-item binds.
+struct LoopToolchain {
+    path: String,
+    roots: Vec<String>,
+}
+
+/// The core loop toolchain, resolved from the HOST PATH: the host brings
 /// only the base process-driving tools (the "check the right tools are on $PATH"
 /// model), exactly as it already brings the rust/cc toolchain the stage0 seed
 /// build resolves via tools/provision-{rust,cc}.sh — no `guix shell` subprocess.
 /// For each expected tool in `LOOP_TOOLCHAIN` we find it on PATH and
 /// CANONICALIZE to its real bin dir. Canonicalization + the store-prefix check
-/// matter — the loop sandbox binds ONLY `/gnu/store` (SANDBOX_STORE_PREFIX) over
-/// a fresh tmpfs, so a profile-symlink dir (~/.guix-home/profile/bin) OR a
-/// distro dir (/usr/bin on a Debian+guix host) would not resolve inside; only
-/// the real `/gnu/store/<pkg>/bin` target does. The deduped in-store dirs become
-/// the sandbox PATH.
+/// matter — the loop sandbox binds ONLY the resolved toolchain's closure items
+/// (under SANDBOX_STORE_PREFIX) over a fresh tmpfs, so a profile-symlink dir
+/// (~/.guix-home/profile/bin) OR a distro dir (/usr/bin on a Debian+guix host)
+/// would not resolve inside; only the real `/gnu/store/<pkg>/bin` target does.
+/// The deduped in-store dirs become the sandbox PATH; their store items become
+/// closure roots.
 ///
 /// A tool that is ABSENT from the host PATH, or that resolves OUTSIDE the bound
 /// store (so it would vanish inside the sandbox), is reported in one loud warning
@@ -199,7 +214,7 @@ const LOOP_TOOLCHAIN: &[&str] = &["make", "bash", "sh", "env"];
 /// and that fatal is a `CheckError::Unprovisioned`, so `cli()` exits
 /// `EXIT_UNPROVISIONED`: the machine signal `td-builder daily` reads to classify
 /// this as a runner-provisioning gap rather than a code regression.
-fn provision_toolchain() -> Result<String, CheckError> {
+fn provision_toolchain() -> Result<LoopToolchain, CheckError> {
     let path_var = std::env::var("PATH").unwrap_or_default();
     let mut dirs: Vec<String> = Vec::new();
     let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -249,9 +264,9 @@ fn provision_toolchain() -> Result<String, CheckError> {
             return Err(CheckError::Unprovisioned(fatal(&format!(
                 "loop toolchain: core tool `{core}` did not resolve to a path under \
                  {SANDBOX_STORE_PREFIX} on the host PATH — the loop sandbox exposes only \
-                 that store (not /usr/bin etc.), so the base userland (bash/coreutils/make) \
-                 must be on PATH FROM there, e.g. a guix profile. host-brings-the-tools; \
-                 LOOP_TOOLCHAIN in check_loop.rs"
+                 the resolved toolchain's store items (not /usr/bin etc.), so the base \
+                 userland (bash/coreutils/make) must be on PATH FROM there, e.g. a guix \
+                 profile. host-brings-the-tools; LOOP_TOOLCHAIN in check_loop.rs"
             ))));
         }
     }
@@ -282,7 +297,254 @@ fn provision_toolchain() -> Result<String, CheckError> {
             "loop toolchain: no expected tool resolved to an in-store bin dir on the host PATH",
         )));
     }
-    Ok(dirs.join(":"))
+    let mut roots: Vec<String> = Vec::new();
+    for d in &dirs {
+        if let Some(item) = store_item_of(d) {
+            if !roots.contains(&item) {
+                roots.push(item);
+            }
+        }
+    }
+    Ok(LoopToolchain {
+        path: dirs.join(":"),
+        roots,
+    })
+}
+
+/// The store ITEM a resolved bin dir lives under: `/gnu/store/<item>/bin` →
+/// `/gnu/store/<item>` — the whole package is the closure root, not just its
+/// bin dir (the package's lib/, libexec/, share/ are runtime surface too).
+fn store_item_of(dir: &str) -> Option<String> {
+    let rest = dir.strip_prefix(SANDBOX_STORE_PREFIX)?;
+    let item = rest.split('/').next().filter(|c| !c.is_empty())?;
+    Some(format!("{SANDBOX_STORE_PREFIX}{item}"))
+}
+
+/// The store paths of the rust/cc SEED toolchain lock (tests/td-builder-rust.lock,
+/// format `NAME <store-path>`): gate bodies resolve these INSIDE the sandbox
+/// (tools/provision-{rust,cc}.sh branch 2 reads the lock and execs its paths
+/// directly), so every lock path present on the host is a DECLARED loop input
+/// and joins the closure roots. An absent path is skipped — the provision
+/// scripts fall through the same way, and the gate that needs it fails loudly.
+fn seed_lock_roots(root: &Path) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(root.join("tests/td-builder-rust.lock")) else {
+        return Vec::new();
+    };
+    parse_seed_lock(&content)
+        .into_iter()
+        .filter(|p| Path::new(p).is_dir())
+        .collect()
+}
+
+/// Parse the seed lock's `NAME <store-path>` lines (comments/blank skipped) into
+/// the deduped path list, keeping only paths under the loop's store prefix.
+fn parse_seed_lock(content: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(path) = line.split_whitespace().nth(1) else {
+            continue;
+        };
+        if path.starts_with(SANDBOX_STORE_PREFIX) && !paths.iter().any(|p| p == path) {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
+/// A parsed `.td-build-cache/loop-closure.list`: the scanned host-built
+/// binaries as `(path, mtime_ns, len, store refs)`, the merged closure ROOTS,
+/// and the resulting closure ITEMS.
+struct ClosureCache {
+    files: Vec<(String, u64, u64, Vec<String>)>,
+    roots: std::collections::BTreeSet<String>,
+    items: Vec<String>,
+}
+
+/// Everything the loop sandbox mounts from the host store — the full input set,
+/// computed so the sandbox never mounts a store DIRECTORY, only declared items:
+///
+///   1. the runtime CLOSURE of `roots` (the resolved LOOP_TOOLCHAIN packages +
+///      the seed lock's rust/cc toolchain — see `seed_lock_roots`), and
+///   2. the closure of each `scan_files` binary: host-built ELF executables
+///      that RUN INSIDE the sandbox (the stage0 td-builder, the daily's stashed
+///      td-subst), whose glibc/gcc-lib references are found by content-scanning
+///      the binary itself — declared, not assumed to coincide with (1).
+///
+/// The closure walk is the same no-DB content scan realize_drv uses
+/// (`scan_candidate_index` + `scan_closure_hybrid`; never /var/guix). The
+/// result is CACHED in `.td-build-cache/loop-closure.list`: store items are
+/// immutable, so the cache holds while the root set matches, every scanned
+/// file's (mtime, len) matches, and every item still exists — a rebuilt stage0
+/// re-scans one file; a changed root set or a GC'd item re-scans the closure.
+/// Returns the sorted item paths (roots included).
+fn loop_store_items(
+    root: &Path,
+    roots: &[String],
+    scan_files: &[String],
+) -> Result<Vec<String>, String> {
+    let store_dir = SANDBOX_STORE_PREFIX.trim_end_matches('/');
+    let cache_path = root.join(".td-build-cache/loop-closure.list");
+    let cached = read_closure_cache(&cache_path);
+
+    // The scanner (a readdir of the whole host store + the candidate index) is
+    // built lazily, at most once — the warm path (nothing changed) never pays it.
+    let mut scan_state: Option<(
+        crate::scan::Scanner,
+        std::collections::HashMap<String, String>,
+    )> = None;
+
+    let mut all_roots: std::collections::BTreeSet<String> = roots.iter().cloned().collect();
+    let mut files: Vec<(String, u64, u64, Vec<String>)> = Vec::with_capacity(scan_files.len());
+    for f in scan_files {
+        let (mtime, len) = file_sig(f)?;
+        let cached_refs = cached.as_ref().and_then(|c| {
+            c.files
+                .iter()
+                .find(|(p, m, l, _)| p == f && *m == mtime && *l == len)
+                .map(|(_, _, _, refs)| refs.clone())
+        });
+        let refs = match cached_refs {
+            Some(refs) => refs,
+            None => {
+                let st = ensure_scanner(&mut scan_state, store_dir)?;
+                st.0.reset();
+                crate::nar::write_nar(&mut st.0, Path::new(f))
+                    .map_err(|e| format!("content-scan {f}: {e}"))?;
+                st.0.refs()
+            }
+        };
+        all_roots.extend(refs.iter().cloned());
+        files.push((f.clone(), mtime, len, refs));
+    }
+
+    if let Some(c) = &cached {
+        if c.roots == all_roots && c.items.iter().all(|i| Path::new(i).exists()) {
+            // Same closure; refresh the file signatures if only those moved
+            // (e.g. a rebuilt stage0 whose refs did not change).
+            if c.files != files {
+                let _ = write_closure_cache(&cache_path, &files, &all_roots, &c.items);
+            }
+            return Ok(c.items.clone());
+        }
+    }
+
+    eprintln!(
+        "td-builder check: content-scanning the loop toolchain closure ({} roots; \
+         cached in .td-build-cache/loop-closure.list for later runs)",
+        all_roots.len()
+    );
+    let st = ensure_scanner(&mut scan_state, store_dir)?;
+    let empty = std::collections::HashMap::new();
+    let root_list: Vec<String> = all_roots.iter().cloned().collect();
+    let seen = crate::scan_closure_hybrid(&mut st.0, &st.1, &empty, &root_list)?;
+    let items: Vec<String> = seen.into_iter().collect();
+    if let Err(e) = write_closure_cache(&cache_path, &files, &all_roots, &items) {
+        eprintln!("td-builder check: WARNING: loop-closure cache not written ({e})");
+    }
+    Ok(items)
+}
+
+/// Build the store scanner once: the candidate index over the host store dir +
+/// the on-disk map, exactly the `store-closure-scan` machinery.
+fn ensure_scanner<'a>(
+    state: &'a mut Option<(
+        crate::scan::Scanner,
+        std::collections::HashMap<String, String>,
+    )>,
+    store_dir: &str,
+) -> Result<
+    &'a mut (
+        crate::scan::Scanner,
+        std::collections::HashMap<String, String>,
+    ),
+    String,
+> {
+    if state.is_none() {
+        let (candidates, on_disk) =
+            crate::scan_candidate_index(&[store_dir.to_string()], store_dir)?;
+        let scanner = crate::scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+        *state = Some((scanner, on_disk));
+    }
+    state
+        .as_mut()
+        .ok_or_else(|| fatal("internal: loop-closure scanner missing after init"))
+}
+
+/// `(mtime in ns since epoch, byte length)` — the change signature of a scanned
+/// host-built binary. An unreadable mtime degrades to 0 (never matches, so the
+/// file is just re-scanned — safe, only slower).
+fn file_sig(path: &str) -> Result<(u64, u64), String> {
+    let md = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(0));
+    Ok((mtime, md.len()))
+}
+
+/// Read the loop-closure cache (tab-separated `file`/`fref`/`root`/`item`
+/// lines; `#` comments). Any malformed line invalidates the WHOLE cache
+/// (None → rescan) — the cache is an accelerator, never authority.
+fn read_closure_cache(path: &Path) -> Option<ClosureCache> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut files: Vec<(String, u64, u64, Vec<String>)> = Vec::new();
+    let mut roots = std::collections::BTreeSet::new();
+    let mut items: Vec<String> = Vec::new();
+    for line in content.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        match parts.next()? {
+            "file" => {
+                let mtime = parts.next()?.parse::<u64>().ok()?;
+                let len = parts.next()?.parse::<u64>().ok()?;
+                files.push((parts.next()?.to_string(), mtime, len, Vec::new()));
+            }
+            "fref" => files.last_mut()?.3.push(parts.next()?.to_string()),
+            "root" => {
+                roots.insert(parts.next()?.to_string());
+            }
+            "item" => items.push(parts.next()?.to_string()),
+            _ => return None,
+        }
+    }
+    Some(ClosureCache {
+        files,
+        roots,
+        items,
+    })
+}
+
+fn write_closure_cache(
+    path: &Path,
+    files: &[(String, u64, u64, Vec<String>)],
+    roots: &std::collections::BTreeSet<String>,
+    items: &[String],
+) -> Result<(), String> {
+    let mut out = String::new();
+    out.push_str("# td loop-closure cache — regenerated by `td-builder check`; do not edit.\n");
+    for (p, mtime, len, refs) in files {
+        out.push_str(&format!("file\t{mtime}\t{len}\t{p}\n"));
+        for r in refs {
+            out.push_str(&format!("fref\t{r}\n"));
+        }
+    }
+    for r in roots {
+        out.push_str(&format!("root\t{r}\n"));
+    }
+    for i in items {
+        out.push_str(&format!("item\t{i}\n"));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 fn native_applet_path(root: &Path, provider: &str) -> Result<String, String> {
@@ -924,8 +1186,8 @@ fn heavy_warms(root: &Path) {
 ///
 /// Env: TD_DAEMON_DIR (shared dir, default ~/.td/build-daemon),
 /// TD_DAEMON_BUILDER (daemon binary override), TD_DAEMON_SEED_DIR (the
-/// start-time seed store DIR, default: the store the loop sandbox binds
-/// (SANDBOX_STORE_PREFIX) — content-scanned for the
+/// start-time seed store DIR, default: the loop's host store
+/// (SANDBOX_STORE_PREFIX) — content-scanned host-side for the
 /// input closure, #267; only bare-drv requests use it), TD_BUILD_JOBS (the
 /// global budget — inherited by the spawned daemon), TD_NICE (nice level for
 /// the daemon + its build children, default 10).
@@ -939,9 +1201,9 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     };
     let store = daemon_dir.join("store");
     std::fs::create_dir_all(&store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
-    // Default seed store = the store the loop sandbox binds (the ONE remaining
-    // host-store coupling, deleted with SANDBOX_STORE_PREFIX when the loop's
-    // userland goes td-built).
+    // Default seed store = the loop's host store, read HOST-SIDE by the daemon
+    // (the ONE remaining host-store coupling, deleted with SANDBOX_STORE_PREFIX
+    // when the loop's userland goes td-built). The loop SANDBOX never mounts it.
     let seed_dir = std::env::var("TD_DAEMON_SEED_DIR")
         .unwrap_or_else(|_| s(SANDBOX_STORE_PREFIX.trim_end_matches('/')));
     let daemon_tb = match std::env::var("TD_DAEMON_BUILDER") {
@@ -1125,8 +1387,8 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     });
 
     let tb = provision_stage0(&root)?;
-    let toolchain = provision_toolchain()?;
-    let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain).map_err(|e| {
+    let tc = provision_toolchain()?;
+    let toolchain = loop_path_with_native_applets(&root, &tb, &tc.path).map_err(|e| {
         CheckError::Fatal(fatal(&format!(
             "could not provision loop native applets ({e})"
         )))
@@ -1240,20 +1502,32 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
             argv.extend([ionice.display().to_string(), s("-c2"), s("-n7")]);
         }
     }
-    let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
+    // The sandbox mounts NO store directory — only the loop's declared input
+    // ITEMS, each bound read-only at its own path (the drv build jail's
+    // input-only model): the resolved toolchain closure, the seed lock's
+    // rust/cc closure, and the closures of the host-built binaries that run
+    // inside (the stage0 td-builder; the stashed td-subst when exposed).
+    let mut roots = tc.roots.clone();
+    roots.extend(seed_lock_roots(&root));
+    let mut scan_files = vec![tb.clone()];
+    if let Some((_, bin)) = child_envs.iter().find(|(k, _)| k == "TD_SUBST_BIN") {
+        scan_files.push(bin.clone());
+    }
+    let items = loop_store_items(&root, &roots, &scan_files).map_err(|e| {
+        fatal(&format!(
+            "could not compute the loop sandbox's store-item inputs ({e})"
+        ))
+    })?;
     argv.extend([
         tb.clone(),
         s("host-sandbox"),
         s("--expose-cwd"),
         s("--no-daemon"),
-        s("--store-from"),
-        s(sandbox_store),
-        s("--store-at"),
-        s(sandbox_store),
-        s("--"),
-        tb,
-        s("gate-run"),
     ]);
+    for it in &items {
+        argv.extend([s("--store-item"), it.clone()]);
+    }
+    argv.extend([s("--"), tb, s("gate-run")]);
     argv.extend([s("-j"), jobs.to_string()]);
     if resume {
         argv.push(s("--resume"));
@@ -1294,7 +1568,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 /// gate, NOT part of the loop; native since #318 axis 2 — was
 /// tools/check-rung.sh). Run a cached-chain bootstrap dev harness INSIDE td's
 /// loop sandbox, so sandbox-only failures (no `bzip2`/no `/bin/sh` on PATH,
-/// env_clear + C locale, the read-only /gnu/store) surface in MINUTES against
+/// env_clear + C locale, the read-only per-item store binds) surface in MINUTES against
 /// the already-built chain in .td-build-cache/ — instead of a ~40-min
 /// from-the-seed gate round-trip just to discover a one-line unpack/shebang
 /// bug. The dev harnesses otherwise run on the HOST (which has bzip2, /bin/sh,
@@ -1334,26 +1608,28 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     })?;
     // check-rung is a dev helper, not the loop: it does not branch on the
     // provisioned/regression distinction, so collapse CheckError back to a string.
-    let toolchain = provision_toolchain().map_err(|e| e.to_string())?;
-    let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain)
+    let tc = provision_toolchain().map_err(|e| e.to_string())?;
+    let toolchain = loop_path_with_native_applets(&root, &tb, &tc.path)
         .map_err(|e| format!("check-rung: FATAL: could not provision loop native applets ({e})"))?;
+    // The same input-only store exposure as the loop (per-item binds, no store
+    // directory mounted): toolchain closure + seed lock closure + the stage0
+    // td-builder's own closure (harnesses run it via TD_BUILDER_SELF).
+    let mut roots = tc.roots.clone();
+    roots.extend(seed_lock_roots(&root));
+    let items = loop_store_items(&root, &roots, std::slice::from_ref(&tb))
+        .map_err(|e| format!("check-rung: FATAL: {e}"))?;
     eprintln!(
         ">> check-rung: {harness} inside td-builder host-sandbox (cached chain reused; \
          sandbox env matches the gate)"
     );
     let mut cmd = Command::new(&tb);
-    let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
-    cmd.args([
-        "host-sandbox",
-        "--expose-cwd",
-        "--no-daemon",
-        "--store-from",
-        sandbox_store,
-        "--store-at",
-        sandbox_store,
-        "--",
-        "sh",
-    ])
+    let mut sandbox_args: Vec<String> =
+        vec![s("host-sandbox"), s("--expose-cwd"), s("--no-daemon")];
+    for it in &items {
+        sandbox_args.extend([s("--store-item"), it.clone()]);
+    }
+    sandbox_args.extend([s("--"), s("sh")]);
+    cmd.args(sandbox_args)
     .arg(harness)
     .args(rest)
     .env("PATH", toolchain)
@@ -1432,6 +1708,76 @@ mod tests {
                 "missing {missing} must expose nothing"
             );
         }
+    }
+
+    #[test]
+    fn store_item_of_takes_the_package_not_the_bin_dir() {
+        // The closure root is the whole store ITEM (its lib/, libexec/, share/
+        // are runtime surface), never just the resolved bin dir.
+        assert_eq!(
+            store_item_of("/gnu/store/abc123-bash-5.2.37/bin").as_deref(),
+            Some("/gnu/store/abc123-bash-5.2.37")
+        );
+        assert_eq!(
+            store_item_of("/gnu/store/abc123-make-4.4").as_deref(),
+            Some("/gnu/store/abc123-make-4.4")
+        );
+        assert_eq!(store_item_of("/usr/bin"), None, "off-store dir has no item");
+        assert_eq!(store_item_of("/gnu/store/"), None, "the bare prefix is not an item");
+    }
+
+    #[test]
+    fn parse_seed_lock_keeps_in_store_paths_deduped() {
+        let lock = "\
+# comment line
+aaa-rust-1.93.0 /gnu/store/aaa-rust-1.93.0
+bbb-cargo /gnu/store/bbb-rust-1.93.0-cargo extra-field
+bbb-again /gnu/store/bbb-rust-1.93.0-cargo
+
+malformed-line-without-path
+ccc-off-store /opt/rust-1.93.0
+";
+        assert_eq!(
+            parse_seed_lock(lock),
+            vec![
+                "/gnu/store/aaa-rust-1.93.0".to_string(),
+                "/gnu/store/bbb-rust-1.93.0-cargo".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn closure_cache_round_trips_and_rejects_garbage() {
+        let d = scratch("loop-closure");
+        let path = d.join("loop-closure.list");
+        let files = vec![(
+            "/repo/.td-build-cache/stage0/td-builder".to_string(),
+            123u64,
+            456u64,
+            vec!["/gnu/store/ggg-glibc-2.39".to_string()],
+        )];
+        let roots: std::collections::BTreeSet<String> = [
+            "/gnu/store/aaa-bash-5.2.37".to_string(),
+            "/gnu/store/ggg-glibc-2.39".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let items = vec![
+            "/gnu/store/aaa-bash-5.2.37".to_string(),
+            "/gnu/store/ggg-glibc-2.39".to_string(),
+        ];
+        write_closure_cache(&path, &files, &roots, &items).unwrap();
+        let c = read_closure_cache(&path).expect("cache parses back");
+        assert_eq!(c.files, files);
+        assert_eq!(c.roots, roots);
+        assert_eq!(c.items, items);
+
+        // Any malformed line invalidates the WHOLE cache — accelerator, never
+        // authority.
+        std::fs::write(&path, "item\t/gnu/store/x\nbogus-line\n").unwrap();
+        assert!(read_closure_cache(&path).is_none());
+        // A missing cache file is simply a miss.
+        assert!(read_closure_cache(&d.join("absent.list")).is_none());
     }
 
     #[test]
