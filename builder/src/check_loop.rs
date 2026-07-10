@@ -8,7 +8,7 @@
 //! rationale comments live with each step):
 //!   1. the netns-probe discrimination check,
 //!   2. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   3. the loop PATH: host-provided tools from tools/loop-toolchain.txt,
+//!   3. the loop PATH: host-provided tools from `LOOP_TOOLCHAIN`,
 //!   4. the warm prelude (subst store, source/crate warms, build daemon),
 //!   5. the machine-wide slot dir, and
 //!   6. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon -- TB gate-run.
@@ -163,11 +163,20 @@ fn current_binary_native_applet_path(root: &Path) -> Result<String, String> {
 /// a `/usr/bin` tool on a foreign-distro guix host would vanish.
 const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 
+/// The loop toolchain: the host-PATH tools the loop sandbox needs to run its
+/// gate bodies (make/sh/…). A list of representative BINARIES, one per package —
+/// resolving `env` gives the whole coreutils bin dir. sed/grep/findutils are
+/// deliberately absent; loop checks must use td-builder typed helpers or
+/// td-built userland instead. Native loop applets for syscall-only host tools
+/// (`mount --bind`, `flock`) are provided by td-builder itself and prepended by
+/// `loop_path_with_native_applets`.
+const LOOP_TOOLCHAIN: &[&str] = &["make", "bash", "sh", "env", "tar", "gzip"];
+
 /// The core loop toolchain PATH, resolved from the HOST PATH: the host brings
 /// only the base process-driving tools (the "check the right tools are on $PATH"
 /// model), exactly as it already brings the rust/cc toolchain the stage0 seed
 /// build resolves via tools/provision-{rust,cc}.sh — no `guix shell` subprocess.
-/// For each expected tool in tools/loop-toolchain.txt we find it on PATH and
+/// For each expected tool in `LOOP_TOOLCHAIN` we find it on PATH and
 /// CANONICALIZE to its real bin dir. Canonicalization + the store-prefix check
 /// matter — the loop sandbox binds ONLY `/gnu/store` (SANDBOX_STORE_PREFIX) over
 /// a fresh tmpfs, so a profile-symlink dir (~/.guix-home/profile/bin) OR a
@@ -185,23 +194,14 @@ const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 /// and that fatal is a `CheckError::Unprovisioned`, so `cli()` exits
 /// `EXIT_UNPROVISIONED`: the machine signal `td-builder daily` reads to classify
 /// this as a runner-provisioning gap rather than a code regression.
-fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
-    let list = std::fs::read_to_string(root.join("tools/loop-toolchain.txt"))
-        .map_err(|e| fatal(&format!("cannot read tools/loop-toolchain.txt: {e}")))?;
-    let tools: Vec<&str> = list
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("")) // strip `# comment` tails
-        .flat_map(str::split_whitespace)
-        .collect();
-    if tools.is_empty() {
-        return Err(fatal("tools/loop-toolchain.txt lists no tools").into());
-    }
+fn provision_toolchain() -> Result<String, CheckError> {
+    let tools = LOOP_TOOLCHAIN;
     let path_var = std::env::var("PATH").unwrap_or_default();
     let mut dirs: Vec<String> = Vec::new();
     let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut missing: Vec<&str> = Vec::new(); // not on PATH at all
     let mut off_store: Vec<&str> = Vec::new(); // on PATH but NEVER under the bound store
-    for t in &tools {
+    for &t in tools {
         // Scan EVERY PATH entry for the tool and take the FIRST whose REAL dir is under the
         // store the sandbox binds — not just the first PATH hit. On a guix-on-foreign-distro
         // host /usr/bin/env may precede the in-store env; the first hit is off-store but a
@@ -247,7 +247,7 @@ fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
                  {SANDBOX_STORE_PREFIX} on the host PATH — the loop sandbox exposes only \
                  that store (not /usr/bin etc.), so the base userland (bash/coreutils/make) \
                  must be on PATH FROM there, e.g. a guix profile. host-brings-the-tools; \
-                 tools/loop-toolchain.txt"
+                 LOOP_TOOLCHAIN in check_loop.rs"
             ))));
         }
     }
@@ -269,7 +269,7 @@ fn provision_toolchain(root: &Path) -> Result<String, CheckError> {
             "td-builder check: loop toolchain: {} heavy-only tool(s) unavailable ({why}); \
              the gates that need them will fail loudly — expose them under \
              {SANDBOX_STORE_PREFIX} on the runner PATH (host-brings-the-tools; \
-             tools/loop-toolchain.txt)",
+             LOOP_TOOLCHAIN in check_loop.rs)",
             missing.len() + off_store.len()
         );
     }
@@ -1102,7 +1102,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     guard_netns_probe()?;
 
     // No guix process remains: the loop PATH is only the host-PATH toolchain
-    // declared in tools/loop-toolchain.txt. Gate text/tree work must invoke
+    // declared in LOOP_TOOLCHAIN. Gate text/tree work must invoke
     // td-builder typed helpers or td-built userland instead of inheriting GNU
     // sed/grep/findutils from a seed lock.
 
@@ -1116,7 +1116,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     });
 
     let tb = provision_stage0(&root)?;
-    let toolchain = provision_toolchain(&root)?;
+    let toolchain = provision_toolchain()?;
     let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain).map_err(|e| {
         CheckError::Fatal(fatal(&format!(
             "could not provision loop native applets ({e})"
@@ -1297,7 +1297,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 /// harness is green here, run the real `td-builder check bootstrap-<rung>`.
 ///
 /// The sandbox + toolchain provisioning is EXACTLY the loop prelude's (same
-/// stage0 container provider, same loop-toolchain list — notably WITHOUT
+/// stage0 container provider, same `LOOP_TOOLCHAIN` list — notably WITHOUT
 /// bzip2, so a missing-bzip2 bug still reproduces).
 pub fn check_rung_cli(args: &[String]) -> ExitCode {
     match check_rung(args) {
@@ -1325,7 +1325,7 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     })?;
     // check-rung is a dev helper, not the loop: it does not branch on the
     // provisioned/regression distinction, so collapse CheckError back to a string.
-    let toolchain = provision_toolchain(&root).map_err(|e| e.to_string())?;
+    let toolchain = provision_toolchain().map_err(|e| e.to_string())?;
     let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain)
         .map_err(|e| format!("check-rung: FATAL: could not provision loop native applets ({e})"))?;
     eprintln!(

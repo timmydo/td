@@ -296,7 +296,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches(
-        "check.sh|builder/build.rs|builder/src/gates.rs|builder/src/check_loop.rs|tools/loop-toolchain.txt",
+        "check.sh|builder/build.rs|builder/src/gates.rs|builder/src/check_loop.rs",
         p,
     ) {
         // The loop spine used to escalate to the FULL loop; it now validates on
@@ -1070,10 +1070,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // daily/system-tier gates are named but deferred.
     assert_runs!("builder/src/gates.rs", "check-pr");
     assert_branch_policy!("builder/src/gates.rs", "the full check would be waived");
-    // tools/loop-toolchain.txt is a direct input to check_loop.rs::provision_toolchain —
-    // it shares the loop-spine mapping, not the generic unmapped-path fallback.
-    assert_runs!("tools/loop-toolchain.txt", "check-pr");
-    assert_branch_policy!("tools/loop-toolchain.txt", "the full check would be waived");
     assert_runs!("new/unmapped.file", "check-pr");
     assert_branch_policy!("new/unmapped.file", "the full check would be waived");
     // The run/defer partition: a chain diff RUNS its PR-sized target (bootstrap-seed,
