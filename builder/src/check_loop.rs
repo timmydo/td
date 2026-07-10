@@ -167,10 +167,13 @@ const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
 /// gate bodies (make/sh/…). A list of representative BINARIES, one per package —
 /// resolving `env` gives the whole coreutils bin dir. sed/grep/findutils are
 /// deliberately absent; loop checks must use td-builder typed helpers or
-/// td-built userland instead. Native loop applets for syscall-only host tools
-/// (`mount --bind`, `flock`) are provided by td-builder itself and prepended by
+/// td-built userland instead. tar/gzip are absent too: no gate body spawns
+/// them — loop-level unpacking is td-builder's own native tar.rs/gzip.rs, and
+/// the drv-sandbox tar runs from a derivation's DECLARED inputs, never this
+/// PATH. Native loop applets for syscall-only host tools (`mount --bind`,
+/// `flock`) are provided by td-builder itself and prepended by
 /// `loop_path_with_native_applets`.
-const LOOP_TOOLCHAIN: &[&str] = &["make", "bash", "sh", "env", "tar", "gzip"];
+const LOOP_TOOLCHAIN: &[&str] = &["make", "bash", "sh", "env"];
 
 /// The core loop toolchain PATH, resolved from the HOST PATH: the host brings
 /// only the base process-driving tools (the "check the right tools are on $PATH"
@@ -195,13 +198,12 @@ const LOOP_TOOLCHAIN: &[&str] = &["make", "bash", "sh", "env", "tar", "gzip"];
 /// `EXIT_UNPROVISIONED`: the machine signal `td-builder daily` reads to classify
 /// this as a runner-provisioning gap rather than a code regression.
 fn provision_toolchain() -> Result<String, CheckError> {
-    let tools = LOOP_TOOLCHAIN;
     let path_var = std::env::var("PATH").unwrap_or_default();
     let mut dirs: Vec<String> = Vec::new();
     let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut missing: Vec<&str> = Vec::new(); // not on PATH at all
     let mut off_store: Vec<&str> = Vec::new(); // on PATH but NEVER under the bound store
-    for &t in tools {
+    for &t in LOOP_TOOLCHAIN {
         // Scan EVERY PATH entry for the tool and take the FIRST whose REAL dir is under the
         // store the sandbox binds — not just the first PATH hit. On a guix-on-foreign-distro
         // host /usr/bin/env may precede the in-store env; the first hit is off-store but a
