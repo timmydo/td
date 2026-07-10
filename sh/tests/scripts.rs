@@ -195,8 +195,7 @@ fn pipeline_and_exit_status() -> Result<(), String> {
     Ok(())
 }
 
-/// `--sh` runs in sh/POSIX compatibility mode — the mode a `bin/sh` alias of
-/// td-sh would use for strictly-POSIX rungs.
+/// `--sh` runs in sh/POSIX compatibility mode.
 #[test]
 fn sh_mode_runs_posix_scripts() -> Result<(), String> {
     let out = td_sh()
@@ -209,6 +208,63 @@ fn sh_mode_runs_posix_scripts() -> Result<(), String> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     if stdout.trim() != "ok" {
         return Err(format!("--sh mode: got {stdout:?}"));
+    }
+    Ok(())
+}
+
+/// A `sh` SYMLINK to td-sh (the eventual `bin/sh` alias) must get sh mode,
+/// not silently keep full bash semantics: brush itself does no argv[0]
+/// detection (cross-model review finding on the introducing PR), so the
+/// wrapper re-execs with --sh injected. `shopt` is a bash-only builtin —
+/// resolvable in bash mode, unknown in sh mode.
+#[test]
+fn sh_alias_switches_to_sh_mode() -> Result<(), String> {
+    let dir = env!("CARGO_TARGET_TMPDIR");
+    let alias = format!("{dir}/sh");
+    let _ = std::fs::remove_file(&alias);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_td-sh"), &alias)
+        .map_err(|e| format!("symlink {alias}: {e}"))?;
+    let probe = "if type shopt >/dev/null 2>&1; then echo bash-mode; else echo sh-mode; fi";
+    let out = Command::new(&alias)
+        .args(["-c", probe])
+        .output()
+        .map_err(|e| format!("spawn sh alias: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.trim() != "sh-mode" {
+        return Err(format!("sh alias: expected sh-mode, got {stdout:?}"));
+    }
+    // The plain td-sh name stays in bash mode — the rungs replace bash.
+    let out = run_c(probe)?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.trim() != "bash-mode" {
+        return Err(format!("td-sh name: expected bash-mode, got {stdout:?}"));
+    }
+    Ok(())
+}
+
+/// The alias re-exec must preserve script arguments across the boundary.
+#[test]
+fn sh_alias_preserves_args() -> Result<(), String> {
+    let dir = env!("CARGO_TARGET_TMPDIR");
+    let alias = format!("{dir}/sh-args-alias/sh");
+    let _ = std::fs::remove_dir_all(format!("{dir}/sh-args-alias"));
+    std::fs::create_dir_all(format!("{dir}/sh-args-alias"))
+        .map_err(|e| format!("mkdir: {e}"))?;
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_td-sh"), &alias)
+        .map_err(|e| format!("symlink {alias}: {e}"))?;
+    let script = format!("{dir}/sh-args-alias/probe.sh");
+    std::fs::write(&script, "echo \"n=$# one=$1 two=$2\"\n")
+        .map_err(|e| format!("write {script}: {e}"))?;
+    let out = Command::new(&alias)
+        .args([script.as_str(), "alpha", "beta"])
+        .output()
+        .map_err(|e| format!("spawn sh alias: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("sh alias script failed: {:?}", out.status));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.trim() != "n=2 one=alpha two=beta" {
+        return Err(format!("sh alias args: got {stdout:?}"));
     }
     Ok(())
 }
