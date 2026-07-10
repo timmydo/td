@@ -20,16 +20,24 @@ fn run_c(script: &str) -> Result<Output, String> {
         .map_err(|e| format!("spawn td-sh: {e}"))
 }
 
-fn stdout_of(script: &str) -> Result<String, String> {
-    let out = run_c(script)?;
+/// Run td-sh with ARGS, require success, return stdout.
+fn stdout_of_args(args: &[&str]) -> Result<String, String> {
+    let out = td_sh()
+        .args(args)
+        .output()
+        .map_err(|e| format!("spawn td-sh: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "td-sh -c {script:?} failed: {:?}\nstderr: {}",
+            "td-sh {args:?} failed: {:?}\nstderr: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn stdout_of(script: &str) -> Result<String, String> {
+    stdout_of_args(&["-c", script])
 }
 
 /// `make` runs every recipe line as `$(SHELL) -c '…'`.
@@ -116,8 +124,10 @@ fn eval_with_redirect_string() -> Result<(), String> {
     let dir = env!("CARGO_TARGET_TMPDIR");
     let log = format!("{dir}/td-sh-eval-test.log");
     let _ = std::fs::remove_file(&log);
+    // The redirect target is quoted inside the eval'd string: a tmpdir path
+    // containing a space must not word-split (subagent review finding).
     let out = run_c(&format!(
-        "LOG=' >{log} 2>&1'; cmd='echo traced'; eval $cmd $LOG"
+        "LOG=' >\"{log}\" 2>&1'; cmd='echo traced'; eval $cmd $LOG"
     ))?;
     if !out.status.success() {
         return Err("eval with redirect string failed".into());
@@ -137,17 +147,9 @@ fn script_file_with_args() -> Result<(), String> {
     let path = format!("{dir}/td-sh-script-test.sh");
     std::fs::write(&path, "echo \"argc=$# first=$1\"\nexit 0\n")
         .map_err(|e| format!("write {path}: {e}"))?;
-    let out = td_sh()
-        .arg(&path)
-        .args(["--prefix=/td/store", "--host=i686-linux-gnu"])
-        .output()
-        .map_err(|e| format!("spawn td-sh: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("script file run failed: {:?}", out.status));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if stdout.trim() != "argc=2 first=--prefix=/td/store" {
-        return Err(format!("script args: got {stdout:?}"));
+    let out = stdout_of_args(&[&path, "--prefix=/td/store", "--host=i686-linux-gnu"])?;
+    if out.trim() != "argc=2 first=--prefix=/td/store" {
+        return Err(format!("script args: got {out:?}"));
     }
     Ok(())
 }
@@ -195,28 +197,26 @@ fn pipeline_and_exit_status() -> Result<(), String> {
     Ok(())
 }
 
-/// `--sh` runs in sh/POSIX compatibility mode.
+/// `--sh` runs in sh/POSIX compatibility mode — asserted by a probe that
+/// DIFFERS between the modes (`shopt` is a bash-only builtin), not by a
+/// script that would pass identically in bash mode.
 #[test]
 fn sh_mode_runs_posix_scripts() -> Result<(), String> {
-    let out = td_sh()
-        .args(["--sh", "-c", "x=posix; test \"$x\" = posix && echo ok"])
-        .output()
-        .map_err(|e| format!("spawn td-sh: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("--sh mode script failed: {:?}", out.status));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if stdout.trim() != "ok" {
-        return Err(format!("--sh mode: got {stdout:?}"));
+    let out = stdout_of_args(&["--sh", "-c", MODE_PROBE])?;
+    if out.trim() != "sh-mode" {
+        return Err(format!("--sh: expected sh-mode, got {out:?}"));
     }
     Ok(())
 }
 
+/// A mode probe that DIFFERS between bash and sh mode: `shopt` is a bash-only
+/// builtin — resolvable in bash mode, unknown in sh mode.
+const MODE_PROBE: &str = "if type shopt >/dev/null 2>&1; then echo bash-mode; else echo sh-mode; fi";
+
 /// A `sh` SYMLINK to td-sh (the eventual `bin/sh` alias) must get sh mode,
 /// not silently keep full bash semantics: brush itself does no argv[0]
 /// detection (cross-model review finding on the introducing PR), so the
-/// wrapper re-execs with --sh injected. `shopt` is a bash-only builtin —
-/// resolvable in bash mode, unknown in sh mode.
+/// wrapper re-execs with --sh injected.
 #[test]
 fn sh_alias_switches_to_sh_mode() -> Result<(), String> {
     let dir = env!("CARGO_TARGET_TMPDIR");
@@ -224,9 +224,8 @@ fn sh_alias_switches_to_sh_mode() -> Result<(), String> {
     let _ = std::fs::remove_file(&alias);
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_td-sh"), &alias)
         .map_err(|e| format!("symlink {alias}: {e}"))?;
-    let probe = "if type shopt >/dev/null 2>&1; then echo bash-mode; else echo sh-mode; fi";
     let out = Command::new(&alias)
-        .args(["-c", probe])
+        .args(["-c", MODE_PROBE])
         .output()
         .map_err(|e| format!("spawn sh alias: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -234,10 +233,9 @@ fn sh_alias_switches_to_sh_mode() -> Result<(), String> {
         return Err(format!("sh alias: expected sh-mode, got {stdout:?}"));
     }
     // The plain td-sh name stays in bash mode — the rungs replace bash.
-    let out = run_c(probe)?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if stdout.trim() != "bash-mode" {
-        return Err(format!("td-sh name: expected bash-mode, got {stdout:?}"));
+    let out = stdout_of(MODE_PROBE)?;
+    if out.trim() != "bash-mode" {
+        return Err(format!("td-sh name: expected bash-mode, got {out:?}"));
     }
     Ok(())
 }

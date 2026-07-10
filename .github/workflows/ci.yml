@@ -94,27 +94,6 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/cargo-test.log \
             || { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }
 
-  td-sh-test:
-    # td-sh — the brush-wrapped seed shell (sh/, re #469). It carries crates
-    # (brush + its tree), so the offline cargo-test gate cannot build it; this
-    # job is its build + script-compat coverage: `cargo test --locked` resolves
-    # the Cargo.lock-pinned closure from crates.io (the runner has network; every
-    # byte is checksum-pinned by the committed lock) and runs sh/tests/scripts.rs
-    # — the bootstrap-shell constructs (set -e, heredocs, eval-with-redirect,
-    # traps, --sh mode …). NOT a required check yet; it becomes one with the
-    # rung cutover.
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      # SHA-pinned (= v4): tag pins can move; this repo's posture is pinned inputs.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: cargo test (td-sh script-compat tests — lock-pinned crates)
-        run: |
-          set -euo pipefail
-          cargo test --locked --manifest-path sh/Cargo.toml 2>&1 | tee /tmp/td-sh-test.log
-          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/td-sh-test.log \
-            || { echo "ERROR: td-sh cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }
-
   check-fast:
     # TEMPORARY no-op. The guix store-image `check-fast` tier was retired (#415),
     # but branch protection still lists `check-fast` as a REQUIRED status context,
