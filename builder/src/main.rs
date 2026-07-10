@@ -3050,13 +3050,17 @@ fn auto_map_lookup(map: &std::collections::BTreeMap<String, String>, name: &str)
 /// be SELF-AUTHENTICATING: seeds are interned content-addressed
 /// (`make_store_path("source", sha256(NAR), name)`), so the on-disk bytes are
 /// re-hashed here and the path is recomputed from them — a name whose digest its own
-/// bytes cannot reproduce reds. That last check is what makes the seed store an
-/// AUTHORITY rather than a caller assertion: `store-add-recursive` is a public verb,
-/// so mere existence (or a matching db row) proves only that somebody interned
-/// SOMETHING — arbitrary host bytes self-registered under a canonical-looking name
-/// red here because their true content address is a different path. (Cost: one NAR
-/// hash per seed entry per synthesis — the same recorded re-hash-every-step decision
-/// as `StageManifest`.) A bare host path (`/usr/bin/env`), a foreign store path
+/// bytes cannot reproduce reds. That is an INTEGRITY gate, not origin proof:
+/// it kills renamed items, post-intern tampering, and any lock/map entry that
+/// names bytes other than the ones on disk, but bytes honestly interned
+/// through the public `store-add-recursive` verb carry their own valid
+/// content address by construction. Origin authority is the CALLING
+/// td-recipe-eval runner, which re-derives every seed from its compiled pin
+/// table each run and reconciles srcs.map against the derivation
+/// (`reconcile_seed_map_entry`) before this arm ever sees the map — see the
+/// trust-boundary note on `build_plan_auto`. (Cost: one NAR hash per seed
+/// entry per synthesis — the same recorded re-hash-every-step decision as
+/// `StageManifest`.) A bare host path (`/usr/bin/env`), a foreign store path
 /// (`/gnu/store/…`), or a never-interned name all red here too — the MAP file is
 /// NOT a channel that can type arbitrary host paths as seeds.
 fn auto_seed_provenance(
@@ -3087,15 +3091,18 @@ fn auto_seed_provenance(
     }
     let nar = nar_hash_path(&on_disk)
         .map_err(|e| format!("--auto: hash seed item {}: {e}", on_disk.display()))?;
-    let hex = nar.strip_prefix("sha256:").unwrap_or(&nar);
+    let hex = nar
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("--auto: unexpected NAR hash format for {}: {nar}", on_disk.display()))?;
     let item_name = base.split_once('-').map_or(base, |(_, n)| n);
     let expect = store::make_store_path_in(store_prefix, "source", hex, item_name);
     if expect != path {
         return Err(format!(
             "--auto: provenance rejected: recipe `{name}' input `{key}' resolves to `{path}' \
-             but the interned bytes content-address to `{expect}' — the item does not derive \
-             from its own name, so no compiled pin vouches for it (self-registered or \
-             tampered bytes, re #469)"
+             but the interned bytes content-address to `{expect}' — the item's bytes do not \
+             reproduce its own name (renamed, self-registered under the wrong address, or \
+             tampered post-intern; origin authority is the calling runner's compiled pins, \
+             re #469)"
         ));
     }
     Ok(())

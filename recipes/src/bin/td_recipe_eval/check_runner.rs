@@ -549,9 +549,13 @@ impl RecipeCheckRunner {
     /// idempotent: it NAR-verifies an existing content-addressed item instead
     /// of copying over it), so the derived path is bound to the compiled pin
     /// on every run; a pre-existing map entry must AGREE with the derivation
-    /// or planning reds. Cost: per run, one pin sha256 + NAR hash per seed and
-    /// one small stage0 unpack — deliberate, same recorded decision as the
-    /// StageManifest per-step re-hash.
+    /// or planning reds. Cost, stated honestly: per run, each seed's bytes
+    /// are read several times (the pin sha256, the NAR hash at synthesis,
+    /// and store-add-recursive's NAR verify of the existing item) and stage0
+    /// is re-extracted — on the order of the full seed set re-hashed every
+    /// warm run, minutes not seconds on a cold cache. Deliberate: the same
+    /// recorded re-hash-every-step decision as the StageManifest, trading
+    /// warm-run time for a boundary with no trusted mutable state.
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<(), String> {
         let derived = match input {
             SeedInput::Stage0 { key } => self.intern_stage0_source(key)?,
@@ -893,6 +897,14 @@ fn verify_source_pin(path: &Path, pin: &SourcePin) -> Result<(), String> {
 /// map names a different path: the map is mutable state, so an entry the
 /// compiled pin cannot re-derive is exactly the self-registered-host-bytes
 /// ingress #469 forbids — never silently prefer either side (re #469).
+///
+/// Deliberately NO self-heal: rewriting the mismatched entry to the derived
+/// value would be safe for the honest causes (a pin bump against a stale
+/// work dir; a torn append from an interrupted run) but would also silently
+/// absorb tampering, and the map feeds build-plan --auto's lock synthesis
+/// downstream. Tampering must be LOUD; the honest causes cost one
+/// work-dir delete (the dir is disposable derived state, and the error says
+/// exactly that).
 fn reconcile_seed_map_entry(
     key: &str,
     prior: Option<&str>,
@@ -1189,8 +1201,13 @@ mod tests {
     // The srcs.map is a cache, never an authority (re #469): a fresh
     // pin-derivation must agree with a prior entry or planning reds — the
     // mismatch arm is exactly a self-registered/stale item the compiled pin
-    // cannot reproduce. Verified red: the pre-fix warm path staged the mapped
-    // path without any derivation at all.
+    // cannot reproduce. Scope, precisely: this exercises the pure helper
+    // only. It is the SOLE decision point — ensure_seed_input calls it
+    // unconditionally after every intern (the pre-fix warm short-circuit
+    // that staged the mapped path without deriving anything is DELETED, not
+    // gated), so there is no warm path left to integration-test; the
+    // structural guarantee is the absence of any other map read before
+    // staging (grep `map_value_opt`).
     #[test]
     fn seed_map_entries_must_agree_with_the_pin_derivation() {
         // Unmapped key: derive and append.
