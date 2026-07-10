@@ -2050,22 +2050,34 @@ struct PinLine {
     file: String,
 }
 
-/// Parse the `input`/`patch` pin lines of a lock into (kind, sha, file). Lines
-/// with fewer than three fields, and every non-pin directive, are skipped —
-/// the shell's `copy_pin_lines` filter followed by `read -r kind sha file`.
+/// Parse the `input`/`patch` pin lines of a lock into (kind, sha, file), matching
+/// `store::ToolchainLock::parse` byte-for-byte on the field split (and the shell's
+/// `read -r kind sha file`): the line is trimmed, blank/`#`-comment and non-pin
+/// directive lines are skipped, and `file` is the REST of the line after the sha
+/// (trimmed) — trailing content is part of the field the key hashes, so pinned-sync
+/// must validate it too, not silently drop it. An `input`/`patch` line with no sha
+/// or no file is skipped; the authoritative key parser rejects it, so the stable-key
+/// leg fails loudly on it.
 fn parse_pin_lines(lock_text: &str) -> Vec<PinLine> {
     lock_text
         .lines()
         .filter_map(|l| {
-            let mut f = l.split_whitespace();
-            let kind = match f.next()? {
+            let line = l.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, val) = line.split_once(' ').map(|(k, v)| (k, v.trim()))?;
+            let kind = match key {
                 "input" => PinKind::Input,
                 "patch" => PinKind::Patch,
                 _ => return None,
             };
-            let sha = f.next()?.to_string();
-            let file = f.next()?.to_string();
-            Some(PinLine { kind, sha, file })
+            let (sha, file) = val.split_once(' ')?;
+            Some(PinLine {
+                kind,
+                sha: sha.trim().to_string(),
+                file: file.trim().to_string(),
+            })
         })
         .collect()
 }
@@ -2161,7 +2173,12 @@ fn source_pin_sha(pins_text: &str, file: &str) -> Option<String> {
 /// recipe-rs gate also shells out to). The pin PARSING + comparison is typed Rust.
 fn recipe_eval_source_pins(root: &Path) -> Result<String, String> {
     let eval = match std::env::var_os("TD_RECIPE_EVAL") {
-        Some(v) if is_executable_file(Path::new(&v)) => PathBuf::from(v),
+        // Set to a non-empty value: use it VERBATIM — no fallback. A non-executable
+        // override then fails loudly at the `-x` check below (the shell's `[ -x ] ||
+        // fail`), rather than being silently masked by a freshly built evaluator.
+        // `${TD_RECIPE_EVAL:-}` treats unset and empty identically, so an empty value
+        // falls through to the build path.
+        Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => {
             let base = root.join(".td-build-cache/recipe-eval");
             let base_s = path_str(&base)?;
@@ -2552,8 +2569,15 @@ exit 0
         ));
     }
 
-    crate::sys::kill_pid(top, crate::sys::SIGTERM)
-        .map_err(|e| format!("FAIL: cannot SIGTERM the top td-builder ({top}): {e}"))?;
+    // SIGTERM to our own live child cannot realistically fail (ESRCH/EPERM don't
+    // apply to a child we just spawned), but if it somehow does, clean up the
+    // marker tree and reap the child before failing loudly — symmetric with the
+    // `before < 2` path above, so no path leaves a zombie or stray marker proc.
+    if let Err(e) = crate::sys::kill_pid(top, crate::sys::SIGTERM) {
+        sweep_marker_procs(&marker);
+        let _ = child.wait();
+        return Err(format!("FAIL: cannot SIGTERM the top td-builder ({top}): {e}"));
+    }
     for _ in 0..100 {
         if scan_marker_procs(&marker) == 0 {
             break;
@@ -3000,6 +3024,28 @@ patch cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc glibc-boo
         );
         assert!(matches!(pins[2].kind, PinKind::Patch));
         assert_eq!(pins[2].file, "glibc-boot-2.16.0.patch");
+    }
+
+    #[test]
+    fn parse_pin_lines_file_is_rest_of_line_like_toolchain_lock() {
+        // `file` is the REST of the line after the sha (trimmed), exactly what
+        // `store::ToolchainLock::parse` canonicalizes and hashes into the key —
+        // trailing content is NOT dropped, so pinned-sync validates the same
+        // bytes the store path is keyed on. A leading-whitespace line still
+        // parses (the line is trimmed first). A line with no file is skipped.
+        let pins = parse_pin_lines(
+            "  input dddd glibc-2.41.tar.xz # trailing note\ninput eeee\npatch ffff a b.patch\n",
+        );
+        assert_eq!(pins.len(), 2, "the file-less `input eeee` row is skipped");
+        assert_eq!(pins[0].file, "glibc-2.41.tar.xz # trailing note");
+        assert_eq!(pins[0].sha, "dddd");
+        assert_eq!(pins[1].file, "a b.patch");
+        // Parity witness: ToolchainLock canonicalizes the same file remainder.
+        let lock = crate::store::ToolchainLock::parse(
+            "name x\nrecipe-rev 1\ncomponent c\ninput dddd glibc-2.41.tar.xz # trailing note\n",
+        )
+        .expect("well-formed lock");
+        assert_eq!(lock.inputs, vec!["dddd glibc-2.41.tar.xz # trailing note".to_string()]);
     }
 
     #[test]
