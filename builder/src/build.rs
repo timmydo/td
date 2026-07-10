@@ -60,12 +60,14 @@ fn find_in_path(path: &str, name: &str) -> Option<String> {
 /// patch-source-shebangs (in Rust) — gnu-build-system rewrites `#!/bin/sh` (and
 /// friends) across the unpacked tree to a real interpreter, because the pure
 /// build sandbox has no /bin/sh. td does the same: any file whose shebang names
-/// an absolute `sh`/`bash` NOT already under /gnu/store is rewritten to the seed
+/// an absolute `sh`/`bash` NOT already under the active store is rewritten to the seed
 /// bash (sh-compatible). This is what lets a package's OWN build scripts execute
 /// in the sandbox — e.g. gawk's `build-aux/install-sh`, run directly by its
 /// install rule, whose `#!/bin/sh` would otherwise fail with "required file not
 /// found". Deterministic (the bash path is pinned), so it stays reproducible.
 fn patch_shebangs(dir: &Path, bash: &str) -> Result<(), String> {
+    // The active-store prefix, computed once for the whole tree walk (not per file).
+    let store_prefix = format!("{}/", crate::store::store_dir());
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let rd = match fs::read_dir(&d) {
@@ -81,16 +83,17 @@ fn patch_shebangs(dir: &Path, bash: &str) -> Result<(), String> {
             if ft.is_dir() {
                 stack.push(entry.path());
             } else if ft.is_file() {
-                patch_one_shebang(&entry.path(), bash)?;
+                patch_one_shebang(&entry.path(), bash, &store_prefix)?;
             }
         }
     }
     Ok(())
 }
 
-/// Rewrite one file's shebang iff it names an absolute sh/bash outside the store.
+/// Rewrite one file's shebang iff it names an absolute sh/bash outside the store
+/// (`store_prefix` — the slash-terminated active store dir, hoisted by the caller).
 /// Peeks two bytes first, so non-scripts (incl. big binaries) are not slurped.
-fn patch_one_shebang(path: &Path, bash: &str) -> Result<(), String> {
+fn patch_one_shebang(path: &Path, bash: &str, store_prefix: &str) -> Result<(), String> {
     use std::io::Read;
     let mut head = [0u8; 2];
     match fs::File::open(path).and_then(|mut f| f.read(&mut head)) {
@@ -108,8 +111,8 @@ fn patch_one_shebang(path: &Path, bash: &str) -> Result<(), String> {
     let mut it = after.splitn(2, char::is_whitespace);
     let interp = it.next().unwrap_or("");
     let trailing = it.next().map(|s| format!(" {s}")).unwrap_or_default();
-    if !interp.starts_with('/') || interp.starts_with("/gnu/store/") {
-        return Ok(()); // relative, or already a store interpreter
+    if !interp.starts_with('/') || interp.starts_with(store_prefix) {
+        return Ok(()); // relative, or already an active-store interpreter
     }
     match interp.rsplit('/').next() {
         Some("sh") | Some("bash") => {} // only the toolchain shell

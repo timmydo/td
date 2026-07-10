@@ -1686,10 +1686,14 @@ fn drv_scratch_key(drv: &str) -> Result<String, String> {
 }
 
 /// Host path of `canon`'s output tree under a keyed scratch dir (`<scr>/newstore/<base>`).
+/// The prefix stripped is the ACTIVE store (`store::store_dir()`), not a hardcoded
+/// `/gnu/store/` — under `TD_STORE_DIR=/td/store` the daemon's canonical output
+/// paths are `/td/store/...` and a hardcoded strip would reject every one of them.
 fn daemon_host_path(scr: &Path, canon: &str) -> Result<String, String> {
+    let prefix = format!("{}/", store::store_dir());
     let base = canon
-        .strip_prefix("/gnu/store/")
-        .ok_or_else(|| format!("{canon}: not a store path"))?;
+        .strip_prefix(&prefix)
+        .ok_or_else(|| format!("{canon}: not a store path (active store: {prefix})"))?;
     Ok(scr.join("newstore").join(base).to_string_lossy().into_owned())
 }
 
@@ -3594,8 +3598,9 @@ struct HostSandboxArgs {
     /// `/td/store` harness) instead of the host `/gnu/store`.
     store_from: Option<String>,
     /// `--store-at DEST`: the in-sandbox mount point for `--store-from`. Defaults to
-    /// `/gnu/store` (a guix-captured seed's binaries hardcode that interpreter path);
-    /// pass `/td/store` for td's own store-native harness (interp relinked to
+    /// the ACTIVE store dir (`store::store_dir()` — a guix-captured seed's binaries
+    /// hardcode that interpreter path under the `/gnu/store` default); pass
+    /// `/td/store` for td's own store-native harness (interp relinked to
     /// `/td/store/ld`). Only meaningful with `--store-from`; when DEST != `/gnu/store`
     /// the host `/gnu/store` is NOT bound at all — the guix-byte-free VM substrate.
     store_at: Option<String>,
@@ -3658,7 +3663,9 @@ fn host_sandbox_base_binds(store_from: Option<&str>, store_at: Option<&str>) -> 
     match store_from {
         Some(dir) => vec![sandbox::Bind {
             src: dir.to_string(),
-            dest: Some(store_at.unwrap_or("/gnu/store").to_string()),
+            // --store-at omitted → mount at the ACTIVE store dir (TD_STORE_DIR
+            // or the default), not a hardcoded /gnu/store.
+            dest: Some(store_at.map_or_else(store::store_dir, str::to_string)),
             readonly: true,
             ro_optional: false,
         }],
@@ -6515,11 +6522,12 @@ fn main() -> ExitCode {
         //   --no-daemon      : accepted for compatibility. /var/guix is never
         //                      bound; the build path uses td-builder's own build
         //                      jail and shared build daemon.
-        //   --store-at DEST  : where --store-from is mounted INSIDE (default
-        //                      /gnu/store). Pass /td/store for td's own store-native
-        //                      harness (busybox/make/td-builder relinked to
-        //                      /td/store/ld); then the host /gnu/store is NOT bound at
-        //                      all — the guix-byte-free loop substrate.
+        //   --store-at DEST  : where --store-from is mounted INSIDE (default: the
+        //                      active store dir, store::store_dir()). Pass /td/store
+        //                      for td's own store-native harness (busybox/make/
+        //                      td-builder relinked to /td/store/ld); then the host
+        //                      /gnu/store is NOT bound at all — the guix-byte-free
+        //                      loop substrate.
         // Without --store-from the sandbox binds no host store.
         // Usage:
         //   host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--no-daemon] -- CMD ARGS...
@@ -6546,8 +6554,8 @@ fn main() -> ExitCode {
                 //
                 // The store bind is explicit: with --store-from DIR, bind the
                 // UNPACKED store DIR, mounted at DEST
-                // (--store-at, default /gnu/store) so its binaries' hardcoded
-                // interpreters resolve. With --store-at /td/store (td's own
+                // (--store-at, default: the active store dir) so its binaries'
+                // hardcoded interpreters resolve. With --store-at /td/store (td's own
                 // store-native harness) the host /gnu/store is then absent — the
                 // guix-byte-free loop substrate. /var/guix is never bound.
                 let mut binds = host_sandbox_base_binds(store_from.as_deref(), store_at.as_deref());
@@ -7344,13 +7352,14 @@ daemon build START (2/2 active)
 
     #[test]
     fn host_sandbox_back_compat_no_store_at() {
-        // inc2a back-compat: --store-from alone still means "mount at /gnu/store"
-        // (store_at None — the handler defaults the dest), and the daemon/cwd flags
-        // parse as before. Asserting store_at==None keeps the default wired here.
+        // inc2a back-compat: --store-from alone still means "mount at the active
+        // store dir" (store_at None — the handler defaults the dest via
+        // store::store_dir()), and the daemon/cwd flags parse as before.
+        // Asserting store_at==None keeps the default wired here.
         let p = hs(&["--expose-cwd", "--store-from", "/seed", "--", "make", "check"])
             .expect("valid");
         assert_eq!(p.store_from.as_deref(), Some("/seed"));
-        assert_eq!(p.store_at, None, "no --store-at -> handler binds at /gnu/store");
+        assert_eq!(p.store_at, None, "no --store-at -> handler binds at the active store dir");
         assert!(p.expose_cwd);
         assert!(!p.no_daemon);
         assert_eq!(p.cmd, "make");
