@@ -1686,10 +1686,14 @@ fn drv_scratch_key(drv: &str) -> Result<String, String> {
 }
 
 /// Host path of `canon`'s output tree under a keyed scratch dir (`<scr>/newstore/<base>`).
+/// The prefix stripped is the ACTIVE store (`store::store_dir()`), not a hardcoded
+/// `/gnu/store/` — under `TD_STORE_DIR=/td/store` the daemon's canonical output
+/// paths are `/td/store/...` and a hardcoded strip would reject every one of them.
 fn daemon_host_path(scr: &Path, canon: &str) -> Result<String, String> {
+    let prefix = format!("{}/", store::store_dir());
     let base = canon
-        .strip_prefix("/gnu/store/")
-        .ok_or_else(|| format!("{canon}: not a store path"))?;
+        .strip_prefix(&prefix)
+        .ok_or_else(|| format!("{canon}: not a store path (active store: {prefix})"))?;
     Ok(scr.join("newstore").join(base).to_string_lossy().into_owned())
 }
 
@@ -3658,7 +3662,9 @@ fn host_sandbox_base_binds(store_from: Option<&str>, store_at: Option<&str>) -> 
     match store_from {
         Some(dir) => vec![sandbox::Bind {
             src: dir.to_string(),
-            dest: Some(store_at.unwrap_or("/gnu/store").to_string()),
+            // --store-at omitted → mount at the ACTIVE store dir (TD_STORE_DIR
+            // or the default), not a hardcoded /gnu/store.
+            dest: Some(store_at.map_or_else(store::store_dir, str::to_string)),
             readonly: true,
             ro_optional: false,
         }],

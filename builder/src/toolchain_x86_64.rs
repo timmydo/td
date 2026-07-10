@@ -64,7 +64,7 @@ impl Flavor {
 /// Everything the self rung needs. The gate populates it (from the fetched-or-built
 /// native builder closure + the warmed pinned sources) via `TDXS_*` env vars.
 pub struct BuildInputs {
-    /// Scaffolding PATH tail (coreutils/bash/… — the exposed /gnu/store build tools).
+    /// Scaffolding PATH tail (coreutils/bash/… — the host-PATH build tools).
     pub cpath: String,
     /// The DRIVING C compiler, full path: td's own native plain `gcc` (SelfHost; ELF64).
     pub builder_cc: PathBuf,
@@ -489,7 +489,7 @@ fn relink_rust_interp(tree: &Path, glibc_interp: &str) -> Result<(), String> {
 fn build_binutils_x86_64(inp: &BuildInputs) -> Result<PathBuf, String> {
     let out = inp.out.join("binutils");
     reset_dir(&out)?;
-    let xz = store_tool("xz", "xz-").ok_or("no xz")?;
+    let xz = which("xz").ok_or("no xz on PATH")?;
     let csh = shell();
 
     // x86_64 kernel UAPI headers beside the glibc headers (glibc headers #include <linux/…>).
@@ -579,7 +579,7 @@ fn build_binutils_x86_64(inp: &BuildInputs) -> Result<PathBuf, String> {
 fn build_gcc_x86_64(inp: &BuildInputs, fresh_binutils: &Path) -> Result<PathBuf, String> {
     let out = inp.out.join("gcc");
     reset_dir(&out)?;
-    let xz = store_tool("xz", "xz-").ok_or("no xz")?;
+    let xz = which("xz").ok_or("no xz on PATH")?;
     let csh = shell();
 
     // gcc + gmp/mpfr/mpc unpacked in-tree (gmp/mpfr/mpc NOT strip-components).
@@ -753,29 +753,17 @@ fn mk_native_static_wrapper(cc: &Path, glibc: &Path, dst: &Path, hdr: Option<&Pa
     set_mode(dst, 0o555)
 }
 
-/// Port of `_xbin`: a bin/ of build-time scaffolding tools (from PATH or the exposed
-/// /gnu/store) the autoconf/recursive-make builds need. Symlinks lex→flex, yacc→bison.
+/// Port of `_xbin`: a bin/ of build-time scaffolding tools (resolved from the host
+/// PATH — the host brings them, like the rust/cc seed; no host-store scavenging)
+/// the autoconf/recursive-make builds need. Symlinks lex→flex, yacc→bison.
 fn xbin(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(ioerr("mkdir xbin"))?;
-    // (tool, guix-pkg-substring)
     let tools = [
-        ("awk", "gawk"),
-        ("gawk", "gawk"),
-        ("sed", "sed"),
-        ("grep", "grep"),
-        ("make", "make"),
-        ("m4", "m4"),
-        ("bison", "bison"),
-        ("flex", "flex"),
-        ("cmp", "diffutils"),
-        ("diff", "diffutils"),
-        ("msgfmt", "gettext"),
-        ("makeinfo", "texinfo"),
-        ("python3", "python"),
-        ("gzip", "gzip"),
+        "awk", "gawk", "sed", "grep", "make", "m4", "bison", "flex", "cmp", "diff", "msgfmt",
+        "makeinfo", "python3", "gzip",
     ];
-    for (name, pkg) in tools {
-        if let Some(b) = store_tool(name, pkg) {
+    for name in tools {
+        if let Some(b) = which(name) {
             symlink_force_abs(&b, &dir.join(name))?;
         }
     }
@@ -787,30 +775,6 @@ fn xbin(dir: &Path) -> Result<(), String> {
         symlink_force("bison", &dir.join("yacc"))?;
     }
     Ok(())
-}
-
-/// Port of `_store_tool`: `command -v NAME`, else the first `/gnu/store/*PKG*/bin/NAME`.
-fn store_tool(name: &str, pkg: &str) -> Option<PathBuf> {
-    if let Some(p) = which(name) {
-        return Some(p);
-    }
-    // ls /gnu/store/*pkg*/bin/name | sort | head -1
-    let store = Path::new("/gnu/store");
-    let mut hits: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = fs::read_dir(store) {
-        for e in rd.flatten() {
-            let fname = e.file_name();
-            let s = fname.to_string_lossy();
-            if s.contains(pkg) {
-                let cand = e.path().join("bin").join(name);
-                if cand.exists() {
-                    hits.push(cand);
-                }
-            }
-        }
-    }
-    hits.sort();
-    hits.into_iter().next()
 }
 
 /// `command -v NAME` over `$PATH`.

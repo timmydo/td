@@ -108,8 +108,8 @@ fn patch_one_shebang(path: &Path, bash: &str) -> Result<(), String> {
     let mut it = after.splitn(2, char::is_whitespace);
     let interp = it.next().unwrap_or("");
     let trailing = it.next().map(|s| format!(" {s}")).unwrap_or_default();
-    if !interp.starts_with('/') || interp.starts_with("/gnu/store/") {
-        return Ok(()); // relative, or already a store interpreter
+    if !interp.starts_with('/') || interp.starts_with(&format!("{}/", crate::store::store_dir())) {
+        return Ok(()); // relative, or already an active-store interpreter
     }
     match interp.rsplit('/').next() {
         Some("sh") | Some("bash") => {} // only the toolchain shell

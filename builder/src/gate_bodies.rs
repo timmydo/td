@@ -668,7 +668,11 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
     };
 
     let p1 = intern(&fx, "store", "td.db")?;
-    if !(p1.starts_with("/gnu/store/") && p1.ends_with(&format!("-{name}"))) {
+    // The placement prefix follows the ACTIVE store (TD_STORE_DIR or the
+    // default), not a hardcoded /gnu/store.
+    if !(p1.starts_with(&format!("{}/", crate::store::store_dir()))
+        && p1.ends_with(&format!("-{name}")))
+    {
         return Err(format!(
             "FAIL: store-add-recursive did not return a content-addressed source path (got '{p1}')"
         ));

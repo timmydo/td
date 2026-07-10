@@ -924,7 +924,8 @@ fn heavy_warms(root: &Path) {
 ///
 /// Env: TD_DAEMON_DIR (shared dir, default ~/.td/build-daemon),
 /// TD_DAEMON_BUILDER (daemon binary override), TD_DAEMON_SEED_DIR (the
-/// start-time seed store DIR, default /gnu/store — content-scanned for the
+/// start-time seed store DIR, default: the store the loop sandbox binds
+/// (SANDBOX_STORE_PREFIX) — content-scanned for the
 /// input closure, #267; only bare-drv requests use it), TD_BUILD_JOBS (the
 /// global budget — inherited by the spawned daemon), TD_NICE (nice level for
 /// the daemon + its build children, default 10).
@@ -938,7 +939,11 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
     };
     let store = daemon_dir.join("store");
     std::fs::create_dir_all(&store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
-    let seed_dir = std::env::var("TD_DAEMON_SEED_DIR").unwrap_or_else(|_| s("/gnu/store"));
+    // Default seed store = the store the loop sandbox binds (the ONE remaining
+    // host-store coupling, deleted with SANDBOX_STORE_PREFIX when the loop's
+    // userland goes td-built).
+    let seed_dir = std::env::var("TD_DAEMON_SEED_DIR")
+        .unwrap_or_else(|_| s(SANDBOX_STORE_PREFIX.trim_end_matches('/')));
     let daemon_tb = match std::env::var("TD_DAEMON_BUILDER") {
         Ok(v) if !v.trim().is_empty() && Path::new(&v).is_file() => v,
         _ => tb.to_string(),
