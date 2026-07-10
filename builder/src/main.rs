@@ -2894,22 +2894,61 @@ fn auto_map_lookup(map: &std::collections::BTreeMap<String, String>, name: &str)
     })
 }
 
+/// Enforce the #469 provenance boundary on a MAP-resolved `seed`/`source` lock entry
+/// AT SYNTHESIS (the plan's planning step, before anything is staged or executed):
+/// the path must be a canonical top-level item of the active store prefix, AND that
+/// item must already be interned in the plan's seed store (SEED-STORE/<basename>
+/// exists — the store td-recipe-eval's classified planning pass populated). A bare
+/// host path (`/usr/bin/env`), a foreign store path (`/gnu/store/…`), or a
+/// never-interned name all red here — the MAP file is NOT a channel that can type
+/// arbitrary host paths as seeds.
+fn auto_seed_provenance(
+    store_prefix: &str,
+    seed_store: &Path,
+    name: &str,
+    key: &str,
+    path: &str,
+) -> Result<(), String> {
+    let base = path
+        .strip_prefix(store_prefix)
+        .and_then(|r| r.strip_prefix('/'))
+        .filter(|b| !b.is_empty() && !b.contains('/'));
+    let Some(base) = base else {
+        return Err(format!(
+            "--auto: provenance rejected: recipe `{name}' input `{key}' resolves to `{path}' — \
+             not a canonical {store_prefix} item (a host path is not an admissible bootstrap \
+             input, re #469)"
+        ));
+    };
+    if !seed_store.join(base).exists() {
+        return Err(format!(
+            "--auto: provenance rejected: recipe `{name}' input `{key}' resolves to `{path}' \
+             but `{base}' is not interned in the seed store {} (re #469)",
+            seed_store.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Synthesize NAME's whole lock text FROM ITS RECIPE JSON — the #429 replacement for
 /// the hand-written `ladder_lock` shell calls (which re-declared, per rung, exactly
 /// what the recipe's own `inputs`/`nativeInputs`/`sourceInput` already say). Every
 /// declared `inputs`/`nativeInputs` entry that is itself OWNED (has a recipe JSON)
 /// becomes a `td-recipe-output` PENDING placeholder — build_plan substitutes the real
 /// path once that step has run; every other declared input is resolved through MAP
-/// (the tool/source paths `ladder_setup` interned) and written `seed`. The recipe's
-/// own declared `sourceInput` (if any) becomes the required `<name>-source` line,
-/// resolved through MAP the same way; a recipe with no `sourceInput` (e.g. make-test,
-/// which only RUNS a sibling rung's output, not compiles one) gets no source line.
-/// Reads + parses NAME's recipe JSON exactly once (shared between the sourceInput
-/// check and the declared-inputs loop below).
+/// (the pinned seed/source paths `ladder_setup` interned) and written `seed`, gated
+/// by `auto_seed_provenance` (canonical store item, present in SEED-STORE — re #469).
+/// The recipe's own declared `sourceInput` (if any) becomes the required
+/// `<name>-source` line, resolved and gated the same way; a recipe with no
+/// `sourceInput` (e.g. make-test, which only RUNS a sibling rung's output, not
+/// compiles one) gets no source line. Reads + parses NAME's recipe JSON exactly once
+/// (shared between the sourceInput check and the declared-inputs loop below).
 fn auto_synthesize_lock(
     recipe_dir: &str,
     map: &std::collections::BTreeMap<String, String>,
     name: &str,
+    store_prefix: &str,
+    seed_store: &Path,
 ) -> Result<String, String> {
     let p = format!("{recipe_dir}/{name}.json");
     let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
@@ -2918,6 +2957,7 @@ fn auto_synthesize_lock(
     if let Some(key) = alist.get("sourceInput").and_then(json::Json::as_str) {
         let path = auto_map_lookup(map, key)
             .map_err(|e| format!("--auto: recipe `{name}' sourceInput `{key}': {e}"))?;
+        auto_seed_provenance(store_prefix, seed_store, name, key, &path)?;
         out.push_str(&format!("{name}-source {path} source\n"));
     }
     for inp in inputs_from_recipe_json(&alist) {
@@ -2926,6 +2966,7 @@ fn auto_synthesize_lock(
         } else {
             let path = auto_map_lookup(map, &inp)
                 .map_err(|e| format!("--auto: recipe `{name}' input `{inp}': {e}"))?;
+            auto_seed_provenance(store_prefix, seed_store, name, &inp, &path)?;
             out.push_str(&format!("{inp} {path} seed\n"));
         }
     }
@@ -2939,7 +2980,10 @@ fn auto_synthesize_lock(
 /// `td-recipe-output`, everything else resolved through MAP-FILE, the recipe's declared
 /// `sourceInput` if any), and feed the generated plan to build_plan. No hand-written
 /// lock, plan, or manifest (#429) — a recipe's edges chain automatically as the owned
-/// set grows.
+/// set grows. MAP-resolved seed paths are provenance-gated at synthesis
+/// (`auto_seed_provenance`): each must be a canonical store item interned in
+/// GUIX-STORE (the plan's seed store), so the map cannot smuggle a host path in as a
+/// `seed` lock entry (re #469).
 ///
 /// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE GUIX-STORE SCRATCH
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
@@ -2968,8 +3012,10 @@ fn build_plan_auto(
         order.join(" -> ")
     );
     let mut plan = String::new();
+    let store_prefix = store::store_dir();
     for name in &order {
-        let synthesized = auto_synthesize_lock(recipe_dir, &map, name)?;
+        let synthesized =
+            auto_synthesize_lock(recipe_dir, &map, name, &store_prefix, Path::new(guix_store))?;
         let lock_path = scratch.join(format!("{name}-auto.lock"));
         std::fs::write(&lock_path, &synthesized).map_err(|e| e.to_string())?;
         plan.push_str(&format!(
@@ -6344,7 +6390,8 @@ fn main() -> ExitCode {
         // everything else resolved through MAP-FILE), and run it. An input is owned iff
         // RECIPE-DIR/<name>.json exists. MAP-FILE is `NAME PATH` per line — the pinned
         // seed/source paths `ladder_setup` interned (srcs.map; host tools are not
-        // admissible inputs, re #469).
+        // admissible inputs, and each PATH must be a canonical store item interned in
+        // GUIX-STORE or synthesis reds with `provenance rejected`, re #469).
         // Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE GUIX-STORE SCRATCH
         Some("build-plan") if args.len() == 8 && args[2] == "--auto" => {
             let (target, recipe_dir, map_file, guix_store, scratch) =
@@ -7582,21 +7629,23 @@ daemon build START (2/2 active)
     // FIRST occurrence of a repeated name wins.
     #[test]
     fn auto_parse_map_skips_blanks_and_comments_first_wins() {
-        let text = "# a comment\n\nbash /gnu/store/aaa-bash\nbash /gnu/store/zzz-bash-dup\nmake /gnu/store/bbb-make\n";
+        let text = "# a comment\n\nbash /td/store/aaa-bash\nbash /td/store/zzz-bash-dup\nmake /td/store/bbb-make\n";
         let m = auto_parse_map(text);
-        assert_eq!(m.get("bash").map(String::as_str), Some("/gnu/store/aaa-bash"));
-        assert_eq!(m.get("make").map(String::as_str), Some("/gnu/store/bbb-make"));
+        assert_eq!(m.get("bash").map(String::as_str), Some("/td/store/aaa-bash"));
+        assert_eq!(m.get("make").map(String::as_str), Some("/td/store/bbb-make"));
         assert_eq!(m.len(), 2);
     }
 
     // --auto: synthesize a recipe's WHOLE lock straight from its declared graph — no
     // hand-written base lock (#429). An owned dep (its own recipe JSON exists) becomes a
     // `td-recipe-output` pending placeholder; every other declared input resolves through
-    // MAP as `seed`; the declared `sourceInput` becomes the `<name>-source` line.
+    // MAP as `seed` — and only if its path is a canonical store item actually interned
+    // in the seed store; the declared `sourceInput` becomes the `<name>-source` line.
     #[test]
     fn auto_synthesize_lock_marks_owned_deps_and_resolves_the_rest() {
         let d = std::env::temp_dir().join(format!("td-auto-synth-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let seeds = d.join("seed-store");
+        std::fs::create_dir_all(&seeds).unwrap();
         std::fs::write(
             d.join("gcc-mesboot0.json"),
             r#"{"name":"gcc-mesboot0","sourceInput":"gcc-core-source","nativeInputs":["binutils-mesboot0"],"inputs":["flex","bison"]}"#,
@@ -7604,14 +7653,58 @@ daemon build START (2/2 active)
         .unwrap();
         std::fs::write(d.join("binutils-mesboot0.json"), r#"{"name":"binutils-mesboot0"}"#).unwrap();
         let mut map = std::collections::BTreeMap::new();
-        map.insert("gcc-core-source".to_string(), "/gnu/store/aaa-gcc-core-2.95.3".to_string());
-        map.insert("flex".to_string(), "/gnu/store/bbb-flex-2.6".to_string());
-        map.insert("bison".to_string(), "/gnu/store/ccc-bison-3.8".to_string());
-        let got = auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0").unwrap();
-        assert!(got.contains("gcc-mesboot0-source /gnu/store/aaa-gcc-core-2.95.3 source"));
+        map.insert("gcc-core-source".to_string(), "/td/store/aaa-gcc-core-2.95.3".to_string());
+        map.insert("flex".to_string(), "/td/store/bbb-flex-2.6".to_string());
+        map.insert("bison".to_string(), "/td/store/ccc-bison-3.8".to_string());
+        for base in ["aaa-gcc-core-2.95.3", "bbb-flex-2.6", "ccc-bison-3.8"] {
+            std::fs::write(seeds.join(base), b"interned").unwrap();
+        }
+        let got =
+            auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds)
+                .unwrap();
+        assert!(got.contains("gcc-mesboot0-source /td/store/aaa-gcc-core-2.95.3 source"));
         assert!(got.contains("binutils-mesboot0 /td/store/pending-binutils-mesboot0 td-recipe-output"));
-        assert!(got.contains("flex /gnu/store/bbb-flex-2.6 seed"));
-        assert!(got.contains("bison /gnu/store/ccc-bison-3.8 seed"));
+        assert!(got.contains("flex /td/store/bbb-flex-2.6 seed"));
+        assert!(got.contains("bison /td/store/ccc-bison-3.8 seed"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // --auto: the MAP file is NOT a host-path ingress channel (re #469). A map value
+    // outside the canonical store prefix (`/usr/bin/env`, `/gnu/store/…`) reds at
+    // SYNTHESIS with `provenance rejected` — verified red against the pre-gate
+    // behavior, which admitted exactly these strings as `seed` lock entries.
+    #[test]
+    fn auto_synthesize_lock_rejects_host_paths_at_planning() {
+        let d = std::env::temp_dir().join(format!("td-auto-hostpath-{}", std::process::id()));
+        let seeds = d.join("seed-store");
+        std::fs::create_dir_all(&seeds).unwrap();
+        std::fs::write(d.join("mes.json"), r#"{"name":"mes","inputs":["bash"]}"#).unwrap();
+        for bad in ["/usr/bin/env", "/gnu/store/aaa-bash", "bash", "/td/store/a/b"] {
+            let mut map = std::collections::BTreeMap::new();
+            map.insert("bash".to_string(), bad.to_string());
+            let err = auto_synthesize_lock(&d.to_string_lossy(), &map, "mes", "/td/store", &seeds)
+                .unwrap_err();
+            assert!(err.contains("provenance rejected"), "`{bad}': {err}");
+            assert!(err.contains("not a canonical /td/store item"), "`{bad}': {err}");
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // --auto: a canonical-looking store path whose item was never interned in the seed
+    // store also reds at synthesis — the map cannot name seeds the classified planning
+    // pass didn't produce.
+    #[test]
+    fn auto_synthesize_lock_rejects_uninterned_seeds_at_planning() {
+        let d = std::env::temp_dir().join(format!("td-auto-unintern-{}", std::process::id()));
+        let seeds = d.join("seed-store");
+        std::fs::create_dir_all(&seeds).unwrap();
+        std::fs::write(d.join("mes.json"), r#"{"name":"mes","inputs":["bash"]}"#).unwrap();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("bash".to_string(), "/td/store/aaa-bash".to_string());
+        let err = auto_synthesize_lock(&d.to_string_lossy(), &map, "mes", "/td/store", &seeds)
+            .unwrap_err();
+        assert!(err.contains("provenance rejected"), "{err}");
+        assert!(err.contains("not interned in the seed store"), "{err}");
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -7624,7 +7717,8 @@ daemon build START (2/2 active)
         std::fs::write(d.join("make-test.json"), r#"{"name":"make-test","nativeInputs":["make-x86-64"]}"#).unwrap();
         std::fs::write(d.join("make-x86-64.json"), r#"{"name":"make-x86-64"}"#).unwrap();
         let map = std::collections::BTreeMap::new();
-        let got = auto_synthesize_lock(&d.to_string_lossy(), &map, "make-test").unwrap();
+        let got =
+            auto_synthesize_lock(&d.to_string_lossy(), &map, "make-test", "/td/store", &d).unwrap();
         assert!(!got.contains("-source"), "unexpected source line: {got}");
         assert!(got.contains("make-x86-64 /td/store/pending-make-x86-64 td-recipe-output"));
         std::fs::remove_dir_all(&d).ok();
@@ -7638,7 +7732,8 @@ daemon build START (2/2 active)
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("tcc.json"), r#"{"name":"tcc","inputs":["mystery-tool"]}"#).unwrap();
         let map = std::collections::BTreeMap::new();
-        let err = auto_synthesize_lock(&d.to_string_lossy(), &map, "tcc").unwrap_err();
+        let err =
+            auto_synthesize_lock(&d.to_string_lossy(), &map, "tcc", "/td/store", &d).unwrap_err();
         assert!(err.contains("mystery-tool"), "unexpected error: {err}");
         std::fs::remove_dir_all(&d).ok();
     }
@@ -7649,12 +7744,18 @@ daemon build START (2/2 active)
     #[test]
     fn auto_synthesize_lock_changes_when_declared_inputs_change() {
         let d = std::env::temp_dir().join(format!("td-auto-synth-perturb-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let seeds = d.join("seed-store");
+        std::fs::create_dir_all(&seeds).unwrap();
         let mut map = std::collections::BTreeMap::new();
-        map.insert("flex".to_string(), "/gnu/store/bbb-flex-2.6".to_string());
-        map.insert("bison".to_string(), "/gnu/store/ccc-bison-3.8".to_string());
+        map.insert("flex".to_string(), "/td/store/bbb-flex-2.6".to_string());
+        map.insert("bison".to_string(), "/td/store/ccc-bison-3.8".to_string());
+        for base in ["bbb-flex-2.6", "ccc-bison-3.8"] {
+            std::fs::write(seeds.join(base), b"interned").unwrap();
+        }
         std::fs::write(d.join("gcc-mesboot0.json"), r#"{"name":"gcc-mesboot0","inputs":["flex"]}"#).unwrap();
-        let before = auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0").unwrap();
+        let before =
+            auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds)
+                .unwrap();
         assert!(before.contains("flex"));
         assert!(!before.contains("bison"));
         std::fs::write(
@@ -7662,8 +7763,10 @@ daemon build START (2/2 active)
             r#"{"name":"gcc-mesboot0","inputs":["flex","bison"]}"#,
         )
         .unwrap();
-        let after = auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0").unwrap();
-        assert!(after.contains("bison /gnu/store/ccc-bison-3.8 seed"));
+        let after =
+            auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds)
+                .unwrap();
+        assert!(after.contains("bison /td/store/ccc-bison-3.8 seed"));
         assert_ne!(before, after, "synthesized lock did not change when declared inputs changed");
         std::fs::remove_dir_all(&d).ok();
     }

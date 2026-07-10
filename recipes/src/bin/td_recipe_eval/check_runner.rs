@@ -43,6 +43,9 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         return Err(usage());
     }
     let check_runner = selected_check_runner(stem, scope, index)?;
+    // Provenance planning FIRST — before the runner exists, so a rejected
+    // graph spawns no subprocess at all (re #469).
+    ensure_targets_provenance(&[stem])?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("check", &[stem, scope, &index.to_string()]);
@@ -69,6 +72,10 @@ pub fn build_cli(args: &[String]) -> Result<(), String> {
             ));
         }
     }
+
+    // Provenance planning FIRST — before the runner exists, so a rejected
+    // graph spawns no subprocess at all (re #469).
+    ensure_targets_provenance(&[target])?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("build", &[target]);
@@ -201,6 +208,7 @@ struct RecipeNode {
     recipe: Recipe,
 }
 
+#[derive(Debug)]
 enum SeedInput {
     Stage0 { key: String },
     Source { key: String, pin: SourcePin },
@@ -336,7 +344,7 @@ impl RecipeCheckRunner {
         for file in files_with_suffix(&self.root.join("seed/patches"), ".patch")? {
             append_file_bytes(&file, &mut bytes)?;
         }
-        sha256sum(&bytes)
+        Ok(sha256sum(&bytes))
     }
 
     fn intern_source(&self, intern_name: &str, pin: &SourcePin) -> Result<(), String> {
@@ -534,84 +542,14 @@ impl RecipeCheckRunner {
         self.stage_tdstore()
     }
 
-    /// Classify then realize every input in the graph. Exactly TWO input
-    /// provenances are admissible (issue #469's trust boundary):
-    ///
-    ///   - **RecipeOutput** — the input names another td recipe in the
-    ///     catalog, realized by an earlier plan step;
-    ///   - **AuditedSeed** — the input names a pinned, hash-verified source /
-    ///     seed patch / stage0 artifact, interned into the ladder store by
-    ///     td's own addToStore.
-    ///
-    /// ANYTHING else is rejected HERE, during planning, before any build
-    /// starts — there is no host-tool class, no lock of store paths, no PATH
-    /// lookup, and no store discovery. A rung that declares scaffolding the
-    /// chain has not built (bash, coreutils, make, …) fails closed with
-    /// `PROVENANCE_REJECTED` until that tool exists as a recipe output.
+    /// Classify then realize every input in the graph: `classify_graph_inputs`
+    /// (the pure planning pass — see its doc for the #469 trust boundary),
+    /// then intern each admitted seed into the ladder store.
     fn ensure_graph_inputs(&self, nodes: &[RecipeNode]) -> Result<(), String> {
-        let mut seen_seed_inputs = HashSet::new();
-        let mut seed_inputs = Vec::new();
-
-        for node in nodes {
-            if let Some(key) = &node.recipe.source_input {
-                let input = self.seed_input_for_recipe_source(key, &node.recipe)?;
-                push_seed_input(&mut seed_inputs, &mut seen_seed_inputs, input);
-            }
-            // Every declaration channel is classified — `inputs` AND
-            // `nativeInputs` (a forbidden name must not sail through planning
-            // on the native channel and surface later at lock synthesis).
-            for input in node
-                .recipe
-                .inputs
-                .iter()
-                .chain(node.recipe.native_inputs.iter())
-                .flatten()
-            {
-                if catalog::lookup(input).is_some() {
-                    continue;
-                }
-                match self.seed_input_for_recipe_input(input)? {
-                    Some(seed_input) => {
-                        push_seed_input(&mut seed_inputs, &mut seen_seed_inputs, seed_input)
-                    }
-                    None => return Err(provenance_rejection(&node.stem, input)),
-                }
-            }
-        }
-
-        for input in seed_inputs {
+        for input in classify_graph_inputs(nodes)? {
             self.ensure_seed_input(&input)?;
         }
         Ok(())
-    }
-
-    fn seed_input_for_recipe_source(
-        &self,
-        key: &str,
-        recipe: &Recipe,
-    ) -> Result<SeedInput, String> {
-        match special_seed_input(key)? {
-            Some(input) => Ok(input),
-            None => {
-                let pin = self.source_pin_for_recipe_source(key, recipe)?;
-                Ok(SeedInput::Source {
-                    key: key.to_string(),
-                    pin,
-                })
-            }
-        }
-    }
-
-    fn seed_input_for_recipe_input(&self, key: &str) -> Result<Option<SeedInput>, String> {
-        if let Some(input) = special_seed_input(key)? {
-            return Ok(Some(input));
-        }
-        Ok(self
-            .source_pin_for_input_key(key)?
-            .map(|pin| SeedInput::Source {
-                key: key.to_string(),
-                pin,
-            }))
     }
 
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<(), String> {
@@ -627,26 +565,6 @@ impl RecipeCheckRunner {
         }
         let path = self.map_value(input.key())?;
         self.stage_store_path(&path)
-    }
-
-    fn source_pin_for_recipe_source(
-        &self,
-        key: &str,
-        recipe: &Recipe,
-    ) -> Result<SourcePin, String> {
-        source_pin_for_key(key).map_err(|e| {
-            format!(
-                "ladder: cannot resolve sourceInput `{key}' for {}-{} to a recipe source pin: {e}",
-                recipe.name, recipe.version
-            )
-        })
-    }
-
-    fn source_pin_for_input_key(&self, key: &str) -> Result<Option<SourcePin>, String> {
-        match source_pins::by_key(key) {
-            Some(pin) => Ok(Some(pin)),
-            None => Ok(None),
-        }
     }
 
     pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
@@ -817,6 +735,89 @@ fn push_seed_input(inputs: &mut Vec<SeedInput>, seen: &mut HashSet<String>, inpu
     }
 }
 
+/// The PURE planning pass (issue #469's trust boundary): classify every input
+/// of every node into exactly TWO admissible provenances —
+///
+///   - **RecipeOutput** — the input names another td recipe in the catalog,
+///     realized by an earlier plan step;
+///   - **AuditedSeed** — the input names a pinned, hash-verified source /
+///     seed patch / stage0 artifact, interned into the ladder store by td's
+///     own addToStore.
+///
+/// ANYTHING else is rejected HERE, during planning — there is no host-tool
+/// class, no lock of store paths, no PATH lookup, and no store discovery.
+/// Every declaration channel is classified: `sourceInput`, `inputs`, AND
+/// `nativeInputs`. A rung that declares scaffolding the chain has not built
+/// (bash, coreutils, make, …) fails closed with `PROVENANCE_REJECTED` until
+/// that tool exists as a recipe output. Deliberately pure — no subprocess, no
+/// filesystem — so the entry points run it BEFORE any ambient execution
+/// (stage0 placement, interning): a rejected graph executes NOTHING.
+fn classify_graph_inputs(nodes: &[RecipeNode]) -> Result<Vec<SeedInput>, String> {
+    let mut seen = HashSet::new();
+    let mut seed_inputs = Vec::new();
+    for node in nodes {
+        if let Some(key) = &node.recipe.source_input {
+            let input = seed_input_for_recipe_source(key, &node.recipe)?;
+            push_seed_input(&mut seed_inputs, &mut seen, input);
+        }
+        for input in node
+            .recipe
+            .inputs
+            .iter()
+            .chain(node.recipe.native_inputs.iter())
+            .flatten()
+        {
+            if catalog::lookup(input).is_some() {
+                continue;
+            }
+            match seed_input_for_recipe_input(input)? {
+                Some(seed_input) => push_seed_input(&mut seed_inputs, &mut seen, seed_input),
+                None => return Err(provenance_rejection(&node.stem, input)),
+            }
+        }
+    }
+    Ok(seed_inputs)
+}
+
+fn seed_input_for_recipe_source(key: &str, recipe: &Recipe) -> Result<SeedInput, String> {
+    match special_seed_input(key)? {
+        Some(input) => Ok(input),
+        None => {
+            let pin = source_pin_for_key(key).map_err(|e| {
+                format!(
+                    "ladder: cannot resolve sourceInput `{key}' for {}-{} to a recipe source \
+                     pin: {e}",
+                    recipe.name, recipe.version
+                )
+            })?;
+            Ok(SeedInput::Source {
+                key: key.to_string(),
+                pin,
+            })
+        }
+    }
+}
+
+fn seed_input_for_recipe_input(key: &str) -> Result<Option<SeedInput>, String> {
+    if let Some(input) = special_seed_input(key)? {
+        return Ok(Some(input));
+    }
+    Ok(source_pins::by_key(key).map(|pin| SeedInput::Source {
+        key: key.to_string(),
+        pin,
+    }))
+}
+
+/// Planning-only provenance gate over TARGETS' full recipe closures — the
+/// FIRST act of `check-run` and `build-run`, before the runner exists and
+/// before ANY subprocess (stage0 placement, source interning, builds): a
+/// graph with a forbidden input reds here and nothing ambient ever executes
+/// for it (re #469).
+fn ensure_targets_provenance(targets: &[&str]) -> Result<(), String> {
+    let graph = recipe_closure(targets)?;
+    classify_graph_inputs(&graph).map(|_| ())
+}
+
 fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
     if key == "stage0-source" {
         return Ok(Some(SeedInput::Stage0 {
@@ -871,7 +872,7 @@ fn validate_source_file_basename(pin: &SourcePin) -> Result<(), String> {
 fn verify_source_pin(path: &Path, pin: &SourcePin) -> Result<(), String> {
     let mut bytes = Vec::new();
     append_file_bytes(path, &mut bytes)?;
-    let got = sha256sum(&bytes)?;
+    let got = sha256sum(&bytes);
     if got != pin.sha256 {
         return Err(format!(
             "{} sha256 {got} != recipe source pin {}",
@@ -972,13 +973,10 @@ fn command_output_with_stdin_bytes(
     String::from_utf8(out.stdout).map_err(|e| format!("{label} output not UTF-8: {e}"))
 }
 
-fn sha256sum(bytes: &[u8]) -> Result<String, String> {
-    let mut cmd = Command::new("sha256sum");
-    let out = command_output_with_stdin_bytes(&mut cmd, "sha256sum", bytes)?;
-    out.split_whitespace()
-        .next()
-        .map(str::to_string)
-        .ok_or_else(|| "sha256sum produced no digest".to_string())
+/// Hex SHA-256 of a byte string. In-process (`crate::sha256`) — pin
+/// verification must not depend on an ambient host `sha256sum` (re #469).
+fn sha256sum(bytes: &[u8]) -> String {
+    crate::sha256::hex_digest(bytes)
 }
 
 fn append_file_bytes(path: &Path, out: &mut Vec<u8>) -> Result<(), String> {
@@ -1214,36 +1212,20 @@ mod tests {
         );
     }
 
-    /// A planning-only runner: every path empty, so any test reaching the
-    /// filesystem or the builder binary fails loudly — provenance
-    /// classification must decide BEFORE either is touched.
-    fn planning_runner() -> RecipeCheckRunner {
-        RecipeCheckRunner {
-            root: PathBuf::new(),
-            tb: PathBuf::new(),
-            builder_path: String::new(),
-            builder_store: PathBuf::new(),
-            builder_db: PathBuf::new(),
-            lw: PathBuf::new(),
-            store: PathBuf::new(),
-            db: PathBuf::new(),
-            recipes: PathBuf::new(),
-            scratch: PathBuf::new(),
-            force_cold: false,
-        }
-    }
-
     /// #469 structural test, verified RED against the pre-cutover code: the
     /// old runner classified `bash`/`coreutils`/… as a "seed tool" class and
     /// resolved them through tests/td-seed-tools.lock, then td-subst.lock,
     /// then ambient PATH, so planning ACCEPTED this graph. Now the graph
     /// fails closed at planning —
     /// before any intern/build — until the scaffolding rungs exist as recipe
-    /// outputs. When the chain becomes self-hosting, this test flips to
-    /// asserting acceptance (delete it in the same PR that adds the rungs).
+    /// outputs. The classification is a FREE function needing no runner (and
+    /// therefore no stage0 placement, no subprocess): the check-run/build-run
+    /// entry points call it before constructing the runner, so a rejected
+    /// graph executes nothing ambient. When the chain becomes self-hosting,
+    /// this test flips to asserting acceptance (delete it in the same PR that
+    /// adds the rungs).
     #[test]
     fn bootstrap_graph_with_host_scaffolding_is_rejected_at_planning() {
-        let runner = planning_runner();
         for target in [
             "make-test",
             "busybox-test",
@@ -1251,8 +1233,7 @@ mod tests {
             "gcc-x86-64-native-test",
             "gcc-x86-64-self-test",
         ] {
-            let graph = recipe_closure(&[target]).unwrap();
-            let err = runner.ensure_graph_inputs(&graph).unwrap_err();
+            let err = ensure_targets_provenance(&[target]).unwrap_err();
             assert!(
                 err.starts_with(PROVENANCE_REJECTED),
                 "{target}: expected a provenance rejection, got: {err}"
@@ -1268,7 +1249,6 @@ mod tests {
     /// pinned seeds; no name, path string, or store prefix is provenance.
     #[test]
     fn synthetic_recipes_with_forbidden_inputs_are_rejected_at_planning() {
-        let runner = planning_runner();
         for forbidden in [
             "bash",
             "make",
@@ -1287,7 +1267,7 @@ mod tests {
                     stem: "synthetic-red".to_string(),
                     recipe,
                 }];
-                let err = runner.ensure_graph_inputs(&nodes).unwrap_err();
+                let err = classify_graph_inputs(&nodes).unwrap_err();
                 assert!(
                     err.starts_with(PROVENANCE_REJECTED) && err.contains(forbidden),
                     "input `{forbidden}' (native={native}): expected a provenance \
@@ -1302,19 +1282,16 @@ mod tests {
     /// seed keys still classify as AuditedSeed.
     #[test]
     fn only_pinned_seeds_classify_as_seed_inputs() {
-        let runner = planning_runner();
         for tool in ["bash", "coreutils", "sed", "make", "python", "flex"] {
             assert!(
-                runner.seed_input_for_recipe_input(tool).unwrap().is_none(),
+                seed_input_for_recipe_input(tool).unwrap().is_none(),
                 "`{tool}' must not classify as a seed input"
             );
         }
-        assert!(runner
-            .seed_input_for_recipe_input("stage0-source")
+        assert!(seed_input_for_recipe_input("stage0-source")
             .unwrap()
             .is_some());
-        assert!(runner
-            .seed_input_for_recipe_input("linux-headers-x86-64")
+        assert!(seed_input_for_recipe_input("linux-headers-x86-64")
             .unwrap()
             .is_some());
     }

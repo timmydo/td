@@ -276,7 +276,7 @@ impl Source {
 /// that used to live in the external source lock directory; recipes carry them as
 /// metadata so warmers/checks resolve from the typed catalog instead of an
 /// external lock directory. They are intentionally not emitted into build JSON.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourcePin {
     pub key: String,
     pub url: String,

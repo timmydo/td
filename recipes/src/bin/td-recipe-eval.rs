@@ -32,6 +32,8 @@ use td_recipe::catalog;
 mod check_runner;
 #[path = "td_recipe_eval/checks/mod.rs"]
 mod checks;
+#[path = "td_recipe_eval/sha256.rs"]
+mod sha256;
 
 #[allow(
     clippy::unwrap_used,
