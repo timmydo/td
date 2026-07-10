@@ -3044,12 +3044,21 @@ fn auto_map_lookup(map: &std::collections::BTreeMap<String, String>, name: &str)
 
 /// Enforce the #469 provenance boundary on a MAP-resolved `seed`/`source` lock entry
 /// AT SYNTHESIS (the plan's planning step, before anything is staged or executed):
-/// the path must be a canonical top-level item of the active store prefix, AND that
-/// item must already be interned in the plan's seed store (SEED-STORE/<basename>
-/// exists — the store td-recipe-eval's classified planning pass populated). A bare
-/// host path (`/usr/bin/env`), a foreign store path (`/gnu/store/…`), or a
-/// never-interned name all red here — the MAP file is NOT a channel that can type
-/// arbitrary host paths as seeds.
+/// the path must be a canonical top-level item of the active store prefix, the item
+/// must already be interned in the plan's seed store (SEED-STORE/<basename> exists —
+/// the store td-recipe-eval's classified planning pass populated), AND the item must
+/// be SELF-AUTHENTICATING: seeds are interned content-addressed
+/// (`make_store_path("source", sha256(NAR), name)`), so the on-disk bytes are
+/// re-hashed here and the path is recomputed from them — a name whose digest its own
+/// bytes cannot reproduce reds. That last check is what makes the seed store an
+/// AUTHORITY rather than a caller assertion: `store-add-recursive` is a public verb,
+/// so mere existence (or a matching db row) proves only that somebody interned
+/// SOMETHING — arbitrary host bytes self-registered under a canonical-looking name
+/// red here because their true content address is a different path. (Cost: one NAR
+/// hash per seed entry per synthesis — the same recorded re-hash-every-step decision
+/// as `StageManifest`.) A bare host path (`/usr/bin/env`), a foreign store path
+/// (`/gnu/store/…`), or a never-interned name all red here too — the MAP file is
+/// NOT a channel that can type arbitrary host paths as seeds.
 fn auto_seed_provenance(
     store_prefix: &str,
     seed_store: &Path,
@@ -3068,11 +3077,25 @@ fn auto_seed_provenance(
              input, re #469)"
         ));
     };
-    if !seed_store.join(base).exists() {
+    let on_disk = seed_store.join(base);
+    if !on_disk.exists() {
         return Err(format!(
             "--auto: provenance rejected: recipe `{name}' input `{key}' resolves to `{path}' \
              but `{base}' is not interned in the seed store {} (re #469)",
             seed_store.display()
+        ));
+    }
+    let nar = nar_hash_path(&on_disk)
+        .map_err(|e| format!("--auto: hash seed item {}: {e}", on_disk.display()))?;
+    let hex = nar.strip_prefix("sha256:").unwrap_or(&nar);
+    let item_name = base.split_once('-').map_or(base, |(_, n)| n);
+    let expect = store::make_store_path_in(store_prefix, "source", hex, item_name);
+    if expect != path {
+        return Err(format!(
+            "--auto: provenance rejected: recipe `{name}' input `{key}' resolves to `{path}' \
+             but the interned bytes content-address to `{expect}' — the item does not derive \
+             from its own name, so no compiled pin vouches for it (self-registered or \
+             tampered bytes, re #469)"
         ));
     }
     Ok(())
@@ -7713,11 +7736,27 @@ daemon build START (2/2 active)
         assert_eq!(m.len(), 2);
     }
 
+    // Intern BYTES into a test seed store the way the ladder does: content-address
+    // them (`make_store_path_in("source", sha256(NAR), name)`) and place them at
+    // their own basename — the only shape `auto_seed_provenance` accepts, now that
+    // seed items must self-authenticate.
+    fn intern_test_seed(seeds: &Path, name: &str, bytes: &[u8]) -> String {
+        let tmp = seeds.join(format!(".tmp-{name}"));
+        std::fs::write(&tmp, bytes).unwrap();
+        let nar = nar_hash_path(&tmp).unwrap();
+        let hex = nar.strip_prefix("sha256:").unwrap();
+        let path = store::make_store_path_in("/td/store", "source", hex, name);
+        let base = path.rsplit('/').next().unwrap();
+        std::fs::rename(&tmp, seeds.join(base)).unwrap();
+        path
+    }
+
     // --auto: synthesize a recipe's WHOLE lock straight from its declared graph — no
     // hand-written base lock (#429). An owned dep (its own recipe JSON exists) becomes a
     // `td-recipe-output` pending placeholder; every other declared input resolves through
     // MAP as `seed` — and only if its path is a canonical store item actually interned
-    // in the seed store; the declared `sourceInput` becomes the `<name>-source` line.
+    // in the seed store AND its bytes content-address to that path; the declared
+    // `sourceInput` becomes the `<name>-source` line.
     #[test]
     fn auto_synthesize_lock_marks_owned_deps_and_resolves_the_rest() {
         let d = std::env::temp_dir().join(format!("td-auto-synth-{}", std::process::id()));
@@ -7730,19 +7769,57 @@ daemon build START (2/2 active)
         .unwrap();
         std::fs::write(d.join("binutils-mesboot0.json"), r#"{"name":"binutils-mesboot0"}"#).unwrap();
         let mut map = std::collections::BTreeMap::new();
-        map.insert("gcc-core-source".to_string(), "/td/store/aaa-gcc-core-2.95.3".to_string());
-        map.insert("flex".to_string(), "/td/store/bbb-flex-2.6".to_string());
-        map.insert("bison".to_string(), "/td/store/ccc-bison-3.8".to_string());
-        for base in ["aaa-gcc-core-2.95.3", "bbb-flex-2.6", "ccc-bison-3.8"] {
-            std::fs::write(seeds.join(base), b"interned").unwrap();
-        }
+        let gcc = intern_test_seed(&seeds, "gcc-core-2.95.3", b"gcc bytes");
+        let flex = intern_test_seed(&seeds, "flex-2.6", b"flex bytes");
+        let bison = intern_test_seed(&seeds, "bison-3.8", b"bison bytes");
+        map.insert("gcc-core-source".to_string(), gcc.clone());
+        map.insert("flex".to_string(), flex.clone());
+        map.insert("bison".to_string(), bison.clone());
         let got =
             auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds)
                 .unwrap();
-        assert!(got.contains("gcc-mesboot0-source /td/store/aaa-gcc-core-2.95.3 source"));
+        assert!(got.contains(&format!("gcc-mesboot0-source {gcc} source")));
         assert!(got.contains("binutils-mesboot0 /td/store/pending-binutils-mesboot0 td-recipe-output"));
-        assert!(got.contains("flex /td/store/bbb-flex-2.6 seed"));
-        assert!(got.contains("bison /td/store/ccc-bison-3.8 seed"));
+        assert!(got.contains(&format!("flex {flex} seed")));
+        assert!(got.contains(&format!("bison {bison} seed")));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // The registered-host-item behavioral red (re #469): `store-add-recursive` is a
+    // public verb, so a seed store + db pair can be MADE to vouch for arbitrary host
+    // bytes. Planning must therefore not accept existence as authority: an item whose
+    // bytes do not content-address to its own name — a host binary parked under a
+    // canonical-looking basename, or an interned item whose bytes were swapped after
+    // registration — reds at synthesis even though the file exists (and even though a
+    // matching db row could be forged beside it). Verified red: before the
+    // self-authentication check, both cases below PASSED `auto_seed_provenance`.
+    #[test]
+    fn auto_seed_provenance_rejects_self_registered_and_tampered_items() {
+        let d = std::env::temp_dir().join(format!("td-auto-selfreg-{}", std::process::id()));
+        let seeds = d.join("seed-store");
+        std::fs::create_dir_all(&seeds).unwrap();
+        // Green: a genuinely content-addressed item passes.
+        let good = intern_test_seed(&seeds, "mes-0.27.1", b"pinned source bytes");
+        auto_seed_provenance("/td/store", &seeds, "mes", "mes-source", &good).unwrap();
+        // Red 1: arbitrary bytes parked under a canonical-LOOKING name.
+        let fake = format!("{}-bash-5.2", "0".repeat(32));
+        std::fs::write(seeds.join(&fake), b"#!/bin/sh\nhost bash\n").unwrap();
+        let err = auto_seed_provenance(
+            "/td/store",
+            &seeds,
+            "mes",
+            "bash",
+            &format!("/td/store/{fake}"),
+        )
+        .unwrap_err();
+        assert!(err.contains("provenance rejected"), "{err}");
+        assert!(err.contains("content-address"), "{err}");
+        // Red 2: a real item whose bytes were swapped after interning.
+        let base = good.rsplit('/').next().unwrap();
+        std::fs::write(seeds.join(base), b"tampered bytes").unwrap();
+        let err =
+            auto_seed_provenance("/td/store", &seeds, "mes", "mes-source", &good).unwrap_err();
+        assert!(err.contains("provenance rejected"), "{err}");
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -7783,6 +7860,13 @@ daemon build START (2/2 active)
             ("bash /gnu/store/aaa-bash seed\n", "provenance rejected"),
             ("mes-source /gnu/store/bbb-mes.tar.gz source\n", "provenance rejected"),
             ("itoa-1.0.11.crate /td/store/ccc-itoa.crate crate\n", "vendored crate"),
+            // The unavailable-prior-output red (re #469): a td-recipe-output
+            // entry whose producing step never ran is a loud planning error,
+            // never a silent fall-through to some other resolution.
+            (
+                "tcc /td/store/pending-tcc td-recipe-output\n",
+                "no earlier step built it",
+            ),
         ] {
             let lock = d.join("gate.lock");
             std::fs::write(&lock, lock_body).unwrap();
@@ -7956,11 +8040,10 @@ daemon build START (2/2 active)
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         let mut map = std::collections::BTreeMap::new();
-        map.insert("flex".to_string(), "/td/store/bbb-flex-2.6".to_string());
-        map.insert("bison".to_string(), "/td/store/ccc-bison-3.8".to_string());
-        for base in ["bbb-flex-2.6", "ccc-bison-3.8"] {
-            std::fs::write(seeds.join(base), b"interned").unwrap();
-        }
+        let flex = intern_test_seed(&seeds, "flex-2.6", b"flex bytes");
+        let bison = intern_test_seed(&seeds, "bison-3.8", b"bison bytes");
+        map.insert("flex".to_string(), flex);
+        map.insert("bison".to_string(), bison.clone());
         std::fs::write(d.join("gcc-mesboot0.json"), r#"{"name":"gcc-mesboot0","inputs":["flex"]}"#).unwrap();
         let before =
             auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds)
@@ -7975,7 +8058,7 @@ daemon build START (2/2 active)
         let after =
             auto_synthesize_lock(&d.to_string_lossy(), &map, "gcc-mesboot0", "/td/store", &seeds)
                 .unwrap();
-        assert!(after.contains("bison /td/store/ccc-bison-3.8 seed"));
+        assert!(after.contains(&format!("bison {bison} seed")));
         assert_ne!(before, after, "synthesized lock did not change when declared inputs changed");
         std::fs::remove_dir_all(&d).ok();
     }

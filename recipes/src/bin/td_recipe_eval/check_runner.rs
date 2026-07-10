@@ -347,7 +347,7 @@ impl RecipeCheckRunner {
         Ok(sha256sum(&bytes))
     }
 
-    fn intern_source(&self, intern_name: &str, pin: &SourcePin) -> Result<(), String> {
+    fn intern_source(&self, intern_name: &str, pin: &SourcePin) -> Result<String, String> {
         validate_source_file_basename(pin)?;
         let file = self.root.join(".td-build-cache/sources").join(&pin.file);
         if !file.is_file() {
@@ -357,11 +357,10 @@ impl RecipeCheckRunner {
             ));
         }
         verify_source_pin(&file, pin)?;
-        let path = self.store_add_recursive(intern_name, &file)?;
-        self.append_src_map(intern_name, &path)
+        self.store_add_recursive(intern_name, &file)
     }
 
-    fn intern_linux_headers(&self, intern_name: &str, arch: &str) -> Result<(), String> {
+    fn intern_linux_headers(&self, intern_name: &str, arch: &str) -> Result<String, String> {
         let pin = source_pin_for_key("linux-source")?;
         validate_source_file_basename(&pin)?;
         let version = linux_version_from_file(&pin.file)?;
@@ -375,11 +374,10 @@ impl RecipeCheckRunner {
                 file.display()
             ));
         }
-        let path = self.store_add_recursive(intern_name, &file)?;
-        self.append_src_map(intern_name, &path)
+        self.store_add_recursive(intern_name, &file)
     }
 
-    fn intern_patch(&self, intern_name: &str, patch: &str) -> Result<(), String> {
+    fn intern_patch(&self, intern_name: &str, patch: &str) -> Result<String, String> {
         let file = self
             .root
             .join("seed")
@@ -388,11 +386,10 @@ impl RecipeCheckRunner {
         if !file.is_file() {
             return Err(format!("ladder: missing {}", file.display()));
         }
-        let path = self.store_add_recursive(intern_name, &file)?;
-        self.append_src_map(intern_name, &path)
+        self.store_add_recursive(intern_name, &file)
     }
 
-    fn intern_stage0_source(&self, intern_name: &str) -> Result<(), String> {
+    fn intern_stage0_source(&self, intern_name: &str) -> Result<String, String> {
         let tarball = self.stage0_source_tarball()?;
         let extract = self.scratch.join("stage0-source-extract");
         remove_path_if_exists(&extract)?;
@@ -414,8 +411,7 @@ impl RecipeCheckRunner {
                 tarball.display()
             ));
         }
-        let path = self.store_add_recursive(intern_name, &stage0)?;
-        self.append_src_map(intern_name, &path)
+        self.store_add_recursive(intern_name, &stage0)
     }
 
     fn stage0_source_tarball(&self) -> Result<PathBuf, String> {
@@ -459,15 +455,6 @@ impl RecipeCheckRunner {
             .open(&map)
             .map_err(|e| format!("open {}: {e}", map.display()))?;
         writeln!(file, "{name} {path}").map_err(|e| format!("write {}: {e}", map.display()))
-    }
-
-    fn map_has(&self, name: &str) -> Result<bool, String> {
-        Ok(self.map_value_opt(name)?.is_some())
-    }
-
-    fn map_value(&self, name: &str) -> Result<String, String> {
-        self.map_value_opt(name)?
-            .ok_or_else(|| format!("ladder: no map entry for `{name}'"))
     }
 
     fn map_value_opt(&self, name: &str) -> Result<Option<String>, String> {
@@ -552,19 +539,34 @@ impl RecipeCheckRunner {
         Ok(())
     }
 
+    /// Realize one classified seed input by RE-DERIVING it from the compiled
+    /// pin EVERY run — never by trusting a prior map entry. srcs.map is a
+    /// mutable file, so it is a CACHE of derived paths, not an authority: the
+    /// warm path used to stage whatever the map named without re-verifying
+    /// the declared pin, which let a matching mutable store+db pair vouch for
+    /// self-registered host bytes (re #469, PR review). Each intern_* verifies
+    /// the pinned artifact and re-interns it (`store-add-recursive` is
+    /// idempotent: it NAR-verifies an existing content-addressed item instead
+    /// of copying over it), so the derived path is bound to the compiled pin
+    /// on every run; a pre-existing map entry must AGREE with the derivation
+    /// or planning reds. Cost: per run, one pin sha256 + NAR hash per seed and
+    /// one small stage0 unpack — deliberate, same recorded decision as the
+    /// StageManifest per-step re-hash.
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<(), String> {
-        if self.map_has(input.key())? {
-            let path = self.map_value(input.key())?;
-            return self.stage_store_path(&path);
-        }
-        match input {
+        let derived = match input {
             SeedInput::Stage0 { key } => self.intern_stage0_source(key)?,
             SeedInput::Source { key, pin } => self.intern_source(key, pin)?,
             SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch)?,
             SeedInput::Patch { key, patch } => self.intern_patch(key, patch)?,
+        };
+        if reconcile_seed_map_entry(
+            input.key(),
+            self.map_value_opt(input.key())?.as_deref(),
+            &derived,
+        )? {
+            self.append_src_map(input.key(), &derived)?;
         }
-        let path = self.map_value(input.key())?;
-        self.stage_store_path(&path)
+        self.stage_store_path(&derived)
     }
 
     pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
@@ -844,8 +846,9 @@ fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
         // A pinned source whose key happens to start with `patch-` (the GNU
         // patch program's own `patch-mesboot-source`) is a Source, not a
         // seed/patches/*.patch file — the pin table wins over the prefix
-        // convention. Warm hosts never hit this (the src map short-circuits
-        // before intern_patch); a cold host fails the whole chain on it.
+        // convention. Every run hits this (seeds re-derive from their pins
+        // each run; there is no map short-circuit): the misclassification
+        // fails the whole chain on intern_patch's missing-file check.
         if source_pins::by_key(key).is_none() {
             return Ok(Some(SeedInput::Patch {
                 key: key.to_string(),
@@ -882,6 +885,28 @@ fn verify_source_pin(path: &Path, pin: &SourcePin) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Reconcile a freshly PIN-DERIVED seed path against the srcs.map cache entry
+/// (None = key not yet mapped). Returns Ok(true) when the caller should append
+/// the new entry, Ok(false) when the cache already agrees, and REDS when the
+/// map names a different path: the map is mutable state, so an entry the
+/// compiled pin cannot re-derive is exactly the self-registered-host-bytes
+/// ingress #469 forbids — never silently prefer either side (re #469).
+fn reconcile_seed_map_entry(
+    key: &str,
+    prior: Option<&str>,
+    derived: &str,
+) -> Result<bool, String> {
+    match prior {
+        None => Ok(true),
+        Some(p) if p == derived => Ok(false),
+        Some(p) => Err(format!(
+            "provenance rejected: srcs.map maps `{key}' to {p}, but the compiled pin derives \
+             {derived} — a map entry the pinned seed cannot reproduce is not admissible \
+             (self-registered or stale bytes; delete the ladder work dir to re-derive, re #469)"
+        )),
+    }
 }
 
 fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
@@ -1160,6 +1185,33 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The srcs.map is a cache, never an authority (re #469): a fresh
+    // pin-derivation must agree with a prior entry or planning reds — the
+    // mismatch arm is exactly a self-registered/stale item the compiled pin
+    // cannot reproduce. Verified red: the pre-fix warm path staged the mapped
+    // path without any derivation at all.
+    #[test]
+    fn seed_map_entries_must_agree_with_the_pin_derivation() {
+        // Unmapped key: derive and append.
+        assert!(reconcile_seed_map_entry("mes-source", None, "/td/store/aaa-mes").unwrap());
+        // Cache agrees: no append, no error.
+        assert!(!reconcile_seed_map_entry(
+            "mes-source",
+            Some("/td/store/aaa-mes"),
+            "/td/store/aaa-mes"
+        )
+        .unwrap());
+        // Cache names bytes the pin cannot re-derive: provenance rejected.
+        let err = reconcile_seed_map_entry(
+            "mes-source",
+            Some("/td/store/zzz-host-bash"),
+            "/td/store/aaa-mes",
+        )
+        .unwrap_err();
+        assert!(err.contains("provenance rejected"), "{err}");
+        assert!(err.contains("zzz-host-bash"), "{err}");
+    }
 
     #[test]
     fn pinned_patch_prefixed_source_is_a_source_not_a_seed_patch() {
