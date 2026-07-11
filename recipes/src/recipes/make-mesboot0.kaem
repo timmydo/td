@@ -1,0 +1,58 @@
+# td make-mesboot0 rung build script (re #469).
+#
+# Runs under stage0's audited `kaem` seed (invoked by the engine), replacing GNU
+# Make 3.80's ./configure + ./build.sh (POSIX sh, which kaem cannot run). It is a
+# faithful transcription of the build.sh that configure emits for the tcc +
+# mes-libc target (srcdir=., CC='tcc -static', CFLAGS=-g, ALLOCA/LOADLIBES empty,
+# extras=getloadavg.o, REMOTE=stub, GLOBLIB non-empty -> glob/{fnmatch,glob}.o,
+# globinc=-I./glob): compile each object with tcc, then link them into `make`.
+# The engine does only generic orchestration (unpack, write config.h + this
+# script, copy tcc's crt/libc beside the sources, run kaem, copy `make`, assert
+# it). The only executable invoked is tcc, a recipe output.
+#
+# tcc finds its crt/libc/libtcc1 via the store paths baked into it at build time
+# (CONFIG_TCC_CRTPREFIX/LIBPATHS/CONFIG_TCCDIR = {in:tcc}/lib...), so no -B is
+# needed here; crt/libc are ALSO copied into `.` (which those search paths list)
+# to mirror build.sh exactly. -DHAVE_CONFIG_H is quote-free and stays on the
+# command line; the string -D block (INCLUDEDIR/LIBDIR/LOCALEDIR) lives in
+# config.h because kaem strips C string-literal quotes. The lseek redeclaration
+# the old recipe sed'd out of make.h does not arise with this config.h + mes
+# headers (build proven clean), so no make.h patch is applied.
+
+# ---- compile every object (build.sh's compile loop, one line per file) ------
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o ar.o ./ar.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o arscan.o ./arscan.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o commands.o ./commands.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o default.o ./default.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o dir.o ./dir.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o expand.o ./expand.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o file.o ./file.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o function.o ./function.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o getopt.o ./getopt.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o getopt1.o ./getopt1.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o implicit.o ./implicit.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o job.o ./job.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o main.o ./main.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o misc.o ./misc.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o read.o ./read.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o remake.o ./remake.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o rule.o ./rule.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o signame.o ./signame.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o variable.o ./variable.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o version.o ./version.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o vpath.o ./vpath.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o hash.o ./hash.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o remote-stub.o ./remote-stub.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o getloadavg.o ./getloadavg.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o fnmatch.o ./glob/fnmatch.c
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -DHAVE_CONFIG_H -g -c -I. -I. -I./glob -o glob.o ./glob/glob.c
+
+# ---- link make (build.sh's final $CC $objs -o make.new; LDFLAGS/LOADLIBES empty)
+{in:tcc}/bin/tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86 -o make ar.o arscan.o commands.o default.o dir.o expand.o file.o function.o getopt.o getopt1.o implicit.o job.o main.o misc.o read.o remake.o rule.o signame.o variable.o version.o vpath.o hash.o remote-stub.o getloadavg.o fnmatch.o glob.o
+
+# ---- smoke: the built make must EXECUTE (proves the i386 static ELF runs) and
+# PARSE a makefile + resolve a target. Both are shell-free: --version short-
+# circuits; -n dry-runs (prints the recipe, never invokes $(SHELL) -c). kaem
+# --strict reds the rung if either exits non-zero, so a broken make fails closed.
+./make --version
+./make -n -f td-smoke.mk smoke
