@@ -117,6 +117,26 @@ fn sanitize_scratch_component(s: &str) -> String {
     }
 }
 
+/// The trailing `-<pid>` a `scratch_name` appends. Returns the pid iff the last
+/// `-`-separated component is a non-empty all-ASCII-digit run — so a reaper can tell
+/// an abandoned scratch tree apart from any other directory. None for anything that
+/// does not end in a numeric pid (never touched by the reaper).
+fn trailing_pid(name: &str) -> Option<u32> {
+    let last = name.rsplit('-').next()?;
+    if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    last.parse::<u32>().ok()
+}
+
+/// A pid is live iff `/proc/<pid>` exists. Used ONLY to decide reaping: a live pid is
+/// a concurrent run on the shared ladder and its scratch is never removed. Pid reuse
+/// can only make a dead scratch LOOK live (skip → under-reap, harmless); it can never
+/// make a live run's scratch look dead, so a running build is never reaped.
+fn pid_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
 fn selected_check_runner(stem: &str, scope: &str, index: usize) -> Result<CheckRunner, String> {
     let tier = parse_tier(scope)?;
     let recipe = catalog::lookup(stem)
@@ -270,6 +290,10 @@ impl RecipeCheckRunner {
         remove_path_if_exists(&self.scratch)?;
         fs::create_dir_all(&self.scratch)
             .map_err(|e| format!("mkdir {}: {e}", self.scratch.display()))?;
+        // Reclaim disk from ABANDONED predecessors: only THIS pid's scratch was ever
+        // removed, so dead runs' trees accumulated (95 GB observed). We hold the ladder
+        // lock here, so this is race-free (re #469 build speed).
+        self.reap_dead_scratch();
         let pinsum = self.setup_pinsum()?;
         let setup_ok = self.lw.join("setup-ok");
         let warm = fs::read_to_string(&setup_ok)
@@ -292,6 +316,35 @@ impl RecipeCheckRunner {
         File::create(self.lw.join("tools.map")).map_err(|e| format!("create tools.map: {e}"))?;
         fs::write(&setup_ok, pinsum).map_err(|e| format!("write {}: {e}", setup_ok.display()))?;
         Ok(())
+    }
+
+    /// Best-effort removal of ABANDONED per-pid scratch trees under `scratch/`. Each
+    /// build-/check-run works in `scratch/<name>-<pid>` and never removes it on exit, so
+    /// dead runs' trees pile up. Remove only trees whose trailing `-<pid>` names a DEAD
+    /// process; a LIVE pid is a concurrent ladder run (or ours) and is left untouched, so
+    /// a running build is never reaped. Never fails setup — any error leaves the tree for
+    /// a later pass.
+    fn reap_dead_scratch(&self) {
+        let dir = match self.scratch.parent() {
+            Some(d) => d,
+            None => return,
+        };
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            match trailing_pid(&name) {
+                Some(pid) if !pid_is_alive(pid) => {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+                _ => {}
+            }
+        }
     }
 
     fn setup_pinsum(&self) -> Result<String, String> {
@@ -742,6 +795,21 @@ impl RecipeCheckRunner {
             .arg(auto_map_s)
             .arg("/gnu/store")
             .arg(scratch);
+        // Opt-in cross-run reuse (re #469 build speed). Default (TD_BUILD_REUSE unset):
+        // build-plan owns its own in-run td-store and rebuilds the whole chain from
+        // stage0 every run — the clean-room proof. When set, point the chain at the
+        // ladder's OWN persistent store+db (self.store/self.db): each UNCHANGED rung is
+        // reused from a prior run (a receipt+NAR-verified persistent_realization hit,
+        // bit-identical to a fresh build) instead of rebuilt, and a freshly-built rung
+        // commits its output back. A CHANGED rung has a different drv ⇒ different output
+        // path ⇒ a miss ⇒ still rebuilds, so the rung under development always rebuilds.
+        // The store rides the same setup warmth as the seeds: a pin change cold-wipes it.
+        // Safe under the global ladder lock (build-runs are serialized — no concurrent
+        // writer to the store).
+        if env::var_os("TD_BUILD_REUSE").is_some_and(|v| !v.is_empty()) {
+            cmd.env("TD_PERSIST_STORE", path_str(&self.store)?)
+                .env("TD_PERSIST_DB", path_str(&self.db)?);
+        }
         let out = cmd
             .output()
             .map_err(|e| format!("spawn build-plan --auto {target}: {e}"))?;
@@ -1257,6 +1325,29 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trailing_pid_parses_only_a_numeric_suffix() {
+        // scratch_name appends `-<pid>` — the reaper keys on exactly that.
+        assert_eq!(trailing_pid("build-oyacc-4059"), Some(4059));
+        assert_eq!(trailing_pid("check-make-test-daily-1-12345"), Some(12345));
+        assert_eq!(trailing_pid("seed-digests-7"), Some(7));
+        // No numeric suffix ⇒ not a reapable scratch dir (never touched).
+        assert_eq!(trailing_pid("build-oyacc"), None);
+        assert_eq!(trailing_pid("build-oyacc-"), None);
+        assert_eq!(trailing_pid("build-oyacc-4059abc"), None);
+        assert_eq!(trailing_pid("recipes"), None);
+        assert_eq!(trailing_pid(""), None);
+    }
+
+    #[test]
+    fn scratch_name_round_trips_through_trailing_pid() {
+        // Whatever scratch_name emits, the reaper must recover this pid from it
+        // (so our OWN live scratch is always identified as live, never reaped).
+        let n = scratch_name("build", &["oyacc"]);
+        assert_eq!(trailing_pid(&n), Some(process::id()));
+        assert!(pid_is_alive(process::id()));
+    }
 
     #[test]
     fn recipe_closure_is_derived_from_catalog_edges() {
