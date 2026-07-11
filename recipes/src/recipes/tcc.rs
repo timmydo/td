@@ -17,6 +17,18 @@ pub fn recipe() -> Recipe {
             .env("prefix", "{out}")
     };
     let mut steps = unpack_into("tcc-source", "{src}");
+    // mes's installed mescc wrapper ships a neutral /bin/sh shebang (the mes
+    // rung declares no shell, re #469); this rung still declares bash, so
+    // stage a private COPY with the shebang patched onto it — the store input
+    // itself is read-only. The farm links mescc to that copy.
+    steps.push(Step::CopyFiles {
+        files: vec!["{in:mes}/bin/mescc".into()],
+        dest: "{root}/mescc-bin".into(),
+    });
+    steps.push(Step::PatchShebangs {
+        dir: "{root}/mescc-bin".into(),
+        shell: SH.into(),
+    });
     steps.push(Step::ToolFarm {
         links: vec![
             ("M2-Planet".into(), "{in:stage0}/AMD64/artifact/M2".into()),
@@ -27,7 +39,7 @@ pub fn recipe() -> Recipe {
             ("M1".into(), "{in:stage0}/AMD64/bin/M1".into()),
             ("hex2".into(), "{in:stage0}/AMD64/bin/hex2".into()),
             ("kaem".into(), "{in:stage0}/AMD64/bin/kaem".into()),
-            ("mescc".into(), "{in:mes}/bin/mescc".into()),
+            ("mescc".into(), "{root}/mescc-bin/mescc".into()),
             ("mes".into(), "{in:mes}/bin/mes".into()),
         ],
     });

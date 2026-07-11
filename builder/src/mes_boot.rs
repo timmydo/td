@@ -1,0 +1,903 @@
+//! Engine-native GNU Mes bootstrap rung (re #469): the Rust port of the mes
+//! tarball's `configure.sh` + generated `bootstrap.sh` + `install.sh` under
+//! td's fixed rung configuration — x86-linux-mes, mes libc, compiler mescc,
+//! bootstrap mode, in-tree build (`srcdir=.`, `srcdest=""`), exactly what the
+//! deleted shell-driven recipe ran with `--host=i686-linux-gnu` and CC unset.
+//!
+//! Why a port and not the scripts: the scripts' only host needs were a shell
+//! and coreutils/sed for ORCHESTRATION (template subst, object-name mangling,
+//! `cat`-built archives, tree copies). The compilation itself is done by
+//! recipe outputs: stage0's kaem drives upstream's own `kaem.run` (M2-Planet →
+//! blood-elf → M1 → hex2 → `bin/mes-m2`), and the mescc phases run upstream's
+//! `scripts/mescc.scm` under the just-built mes. This module does the
+//! orchestration in std::fs and spawns ONLY those recipe-built binaries, so
+//! the rung declares no host tool at all.
+//!
+//! The x86 (32-bit) target is the chain's: mes feeds MesCC-built x86 archives
+//! (`lib/x86-mes/libc+tcc.a`) to the tcc rung, mirroring guix's mes-boot.
+//!
+//! Fixed-config fidelity: the `*_SOURCES` lists are `build-aux/
+//! configure-lib.sh`'s, evaluated for (libc=mes, kernel=linux, cpu=x86) and
+//! parameterized by compiler exactly where the script parameterizes
+//! (`$mes_cpu-mes-$compiler`); a pin bump that changes the lists reds here on
+//! the missing file, named. `@BASH@`/`@SHELL@` substitute to `/bin/sh` — the
+//! installed `bin/mescc`/`bin/mesar` wrappers are DATA in this rung's output
+//! (consumers exec them through their own declared shell; the tcc rung
+//! patches the shebang into its tool farm), never a host store path.
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+const MES_CPU: &str = "x86";
+const CC_CPU: &str = "i386";
+const STAGE0_CPU: &str = "x86";
+const MES_KERNEL: &str = "linux";
+const MES_BITS: &str = "32";
+const MES_LIBC: &str = "mes";
+const MES_SYSTEM: &str = "x86-linux-mes";
+const HOST: &str = "i686-linux-gnu";
+const GUILE_EFFECTIVE_VERSION: &str = "2.2";
+// The neutral shebang for installed wrapper scripts (see module doc).
+const SHELL: &str = "/bin/sh";
+// The recipe's mes interpreter limits (the deleted recipe's exact env).
+const MES_ARENA: &str = "100000000";
+const MES_STACK: &str = "8000000";
+
+fn s_vec(xs: &[&str]) -> Vec<String> {
+    xs.iter().map(|s| (*s).to_string()).collect()
+}
+
+// ---- build-aux/configure-lib.sh, evaluated for (mes, linux, x86) ----------
+
+fn libc_mini_shared_sources(compiler: &str) -> Vec<String> {
+    let mut v = s_vec(&[
+        "lib/mes/__init_io.c",
+        "lib/mes/eputs.c",
+        "lib/mes/oputs.c",
+        // mes_libc = mes:
+        "lib/mes/globals.c",
+        "lib/stdlib/exit.c",
+    ]);
+    v.push(format!("lib/linux/x86-mes-{compiler}/_exit.c"));
+    v.push(format!("lib/linux/x86-mes-{compiler}/_write.c"));
+    v.extend(s_vec(&["lib/stdlib/puts.c", "lib/string/strlen.c"]));
+    v
+}
+
+fn libc_mini_sources(compiler: &str) -> Vec<String> {
+    let mut v = libc_mini_shared_sources(compiler);
+    v.push("lib/mes/write.c".to_string());
+    v
+}
+
+fn libmescc_sources(compiler: &str) -> Vec<String> {
+    vec![
+        "lib/mes/globals.c".to_string(),
+        format!("lib/linux/x86-mes-{compiler}/syscall-internal.c"),
+    ]
+}
+
+fn libmes_sources(compiler: &str) -> Vec<String> {
+    let mut v = libc_mini_shared_sources(compiler);
+    v.extend(s_vec(&[
+        "lib/ctype/isnumber.c",
+        "lib/mes/abtol.c",
+        "lib/mes/cast.c",
+        "lib/mes/eputc.c",
+        "lib/mes/fdgetc.c",
+        "lib/mes/fdputc.c",
+        "lib/mes/fdputs.c",
+        "lib/mes/fdungetc.c",
+        "lib/mes/itoa.c",
+        "lib/mes/ltoa.c",
+        "lib/mes/ltoab.c",
+        "lib/mes/mes_open.c",
+        "lib/mes/ntoab.c",
+        "lib/mes/oputc.c",
+        "lib/mes/ultoa.c",
+        "lib/mes/utoa.c",
+        "lib/stub/__raise.c",
+        // mes_libc = mes:
+        "lib/ctype/isdigit.c",
+        "lib/ctype/isspace.c",
+        "lib/ctype/isxdigit.c",
+        "lib/mes/assert_msg.c",
+        "lib/posix/write.c",
+        "lib/stdlib/atoi.c",
+        // mes_kernel = linux:
+        "lib/linux/lseek.c",
+    ]));
+    v
+}
+
+fn libc_sources(compiler: &str) -> Vec<String> {
+    let mut v = libmes_sources(compiler);
+    v.extend(s_vec(&[
+        "lib/dirent/__getdirentries.c",
+        "lib/dirent/closedir.c",
+        "lib/dirent/opendir.c",
+        "lib/mes/__assert_fail.c",
+        "lib/mes/__buffered_read.c",
+        "lib/mes/__mes_debug.c",
+        "lib/posix/execv.c",
+        "lib/posix/getcwd.c",
+        "lib/posix/getenv.c",
+        "lib/posix/isatty.c",
+        "lib/posix/open.c",
+        "lib/posix/buffered-read.c",
+        "lib/posix/setenv.c",
+        "lib/posix/wait.c",
+        "lib/stdio/fgetc.c",
+        "lib/stdio/fputc.c",
+        "lib/stdio/fputs.c",
+        "lib/stdio/getc.c",
+        "lib/stdio/getchar.c",
+        "lib/stdio/putc.c",
+        "lib/stdio/putchar.c",
+        "lib/stdio/ungetc.c",
+        "lib/stdlib/calloc.c",
+        "lib/stdlib/free.c",
+        "lib/stdlib/realloc.c",
+        "lib/string/memchr.c",
+        "lib/string/memcmp.c",
+        "lib/string/memcpy.c",
+        "lib/string/memmove.c",
+        "lib/string/memset.c",
+        "lib/string/strcmp.c",
+        "lib/string/strcpy.c",
+        "lib/string/strncmp.c",
+        "lib/posix/raise.c",
+        // mes_kernel = linux:
+        "lib/linux/access.c",
+        "lib/linux/brk.c",
+        "lib/linux/chdir.c",
+        "lib/linux/chmod.c",
+        "lib/linux/clock_gettime.c",
+        "lib/linux/close.c",
+        "lib/linux/dup.c",
+        "lib/linux/dup2.c",
+        "lib/linux/execve.c",
+        "lib/linux/fcntl.c",
+        "lib/linux/fork.c",
+        "lib/linux/fstat.c",
+        "lib/linux/fsync.c",
+        "lib/linux/_getcwd.c",
+        "lib/linux/getdents.c",
+        "lib/linux/gettimeofday.c",
+        "lib/linux/ioctl3.c",
+        "lib/linux/link.c",
+        "lib/linux/lstat.c",
+        "lib/linux/_open3.c",
+        "lib/linux/malloc.c",
+        "lib/linux/mkdir.c",
+        "lib/linux/nanosleep.c",
+        "lib/linux/pipe.c",
+        "lib/linux/_read.c",
+        "lib/linux/readdir.c",
+        "lib/linux/rename.c",
+        "lib/linux/rmdir.c",
+        "lib/linux/stat.c",
+        "lib/linux/symlink.c",
+        "lib/linux/time.c",
+        "lib/linux/umask.c",
+        "lib/linux/uname.c",
+        "lib/linux/unlink.c",
+        "lib/linux/utimensat.c",
+        "lib/linux/wait4.c",
+        "lib/linux/waitpid.c",
+    ]));
+    v.push(format!("lib/linux/x86-mes-{compiler}/syscall.c"));
+    v.extend(s_vec(&["lib/linux/getpid.c", "lib/linux/kill.c"]));
+    v
+}
+
+fn libc_tcc_sources(compiler: &str) -> Vec<String> {
+    let mut v = libc_sources(compiler);
+    v.extend(s_vec(&[
+        "lib/ctype/islower.c",
+        "lib/ctype/isupper.c",
+        "lib/ctype/tolower.c",
+        "lib/ctype/toupper.c",
+        "lib/mes/abtod.c",
+        "lib/mes/dtoab.c",
+        "lib/mes/search-path.c",
+        "lib/posix/execvp.c",
+        "lib/stdio/fclose.c",
+        "lib/stdio/fdopen.c",
+        "lib/stdio/ferror.c",
+        "lib/stdio/fflush.c",
+        "lib/stdio/fopen.c",
+        "lib/stdio/fprintf.c",
+        "lib/stdio/fread.c",
+        "lib/stdio/fseek.c",
+        "lib/stdio/ftell.c",
+        "lib/stdio/fwrite.c",
+        "lib/stdio/printf.c",
+        "lib/stdio/remove.c",
+        "lib/stdio/snprintf.c",
+        "lib/stdio/sprintf.c",
+        "lib/stdio/sscanf.c",
+        "lib/stdio/vfprintf.c",
+        "lib/stdio/vprintf.c",
+        "lib/stdio/vsnprintf.c",
+        "lib/stdio/vsprintf.c",
+        "lib/stdio/vsscanf.c",
+        "lib/stdlib/qsort.c",
+        "lib/stdlib/strtod.c",
+        "lib/stdlib/strtof.c",
+        "lib/stdlib/strtol.c",
+        "lib/stdlib/strtold.c",
+        "lib/stdlib/strtoll.c",
+        "lib/stdlib/strtoul.c",
+        "lib/stdlib/strtoull.c",
+        "lib/string/memmem.c",
+        "lib/string/strcat.c",
+        "lib/string/strchr.c",
+        "lib/string/strlwr.c",
+        "lib/string/strncpy.c",
+        "lib/string/strrchr.c",
+        "lib/string/strstr.c",
+        "lib/string/strupr.c",
+        "lib/stub/sigaction.c",
+        "lib/stub/ldexp.c",
+        "lib/stub/mprotect.c",
+        "lib/stub/localtime.c",
+        "lib/stub/putenv.c",
+        "lib/stub/realpath.c",
+        "lib/stub/sigemptyset.c",
+    ]));
+    v.push(format!("lib/x86-mes-{compiler}/setjmp.c"));
+    v
+}
+
+fn libc_gnu_sources(compiler: &str) -> Vec<String> {
+    let mut v = libc_tcc_sources(compiler);
+    v.extend(s_vec(&[
+        "lib/ctype/isalnum.c",
+        "lib/ctype/isalpha.c",
+        "lib/ctype/isascii.c",
+        "lib/ctype/iscntrl.c",
+        "lib/ctype/isgraph.c",
+        "lib/ctype/isprint.c",
+        "lib/ctype/ispunct.c",
+        "lib/math/ceil.c",
+        "lib/math/fabs.c",
+        "lib/math/floor.c",
+        "lib/mes/fdgets.c",
+        "lib/posix/alarm.c",
+        "lib/posix/execl.c",
+        "lib/posix/execlp.c",
+        "lib/posix/mktemp.c",
+        "lib/posix/pathconf.c",
+        "lib/posix/sbrk.c",
+        "lib/posix/sleep.c",
+        "lib/posix/unsetenv.c",
+        "lib/stdio/clearerr.c",
+        "lib/stdio/feof.c",
+        "lib/stdio/fgets.c",
+        "lib/stdio/fileno.c",
+        "lib/stdio/freopen.c",
+        "lib/stdio/fscanf.c",
+        "lib/stdio/perror.c",
+        "lib/stdio/vfscanf.c",
+        "lib/stdlib/__exit.c",
+        "lib/stdlib/abort.c",
+        "lib/stdlib/abs.c",
+        "lib/stdlib/alloca.c",
+        "lib/stdlib/atexit.c",
+        "lib/stdlib/atof.c",
+        "lib/stdlib/atol.c",
+        "lib/stdlib/mbstowcs.c",
+        "lib/string/bcmp.c",
+        "lib/string/bcopy.c",
+        "lib/string/bzero.c",
+        "lib/string/index.c",
+        "lib/string/rindex.c",
+        "lib/string/strcspn.c",
+        "lib/string/strdup.c",
+        "lib/string/strerror.c",
+        "lib/string/strncat.c",
+        "lib/string/strpbrk.c",
+        "lib/string/strspn.c",
+        "lib/stub/__cleanup.c",
+        "lib/stub/atan2.c",
+        "lib/stub/bsearch.c",
+        "lib/stub/chown.c",
+        "lib/stub/cos.c",
+        "lib/stub/ctime.c",
+        "lib/stub/exp.c",
+        "lib/stub/fpurge.c",
+        "lib/stub/freadahead.c",
+        "lib/stub/frexp.c",
+        "lib/stub/getgrgid.c",
+        "lib/stub/getgrnam.c",
+        "lib/stub/getlogin.c",
+        "lib/stub/getpgid.c",
+        "lib/stub/getpgrp.c",
+        "lib/stub/getpwnam.c",
+        "lib/stub/getpwuid.c",
+        "lib/stub/gmtime.c",
+        "lib/stub/log.c",
+        "lib/stub/mktime.c",
+        "lib/stub/modf.c",
+        "lib/stub/pclose.c",
+        "lib/stub/popen.c",
+        "lib/stub/pow.c",
+        "lib/stub/rand.c",
+        "lib/stub/rewind.c",
+        "lib/stub/setbuf.c",
+        "lib/stub/setgrent.c",
+        "lib/stub/setlocale.c",
+        "lib/stub/setvbuf.c",
+        "lib/stub/sigaddset.c",
+        "lib/stub/sigblock.c",
+        "lib/stub/sigdelset.c",
+        "lib/stub/sigsetmask.c",
+        "lib/stub/sin.c",
+        "lib/stub/sqrt.c",
+        "lib/stub/strftime.c",
+        "lib/stub/sys_siglist.c",
+        "lib/stub/system.c",
+        "lib/stub/times.c",
+        "lib/stub/ttyname.c",
+        "lib/stub/utime.c",
+        // mes_kernel = linux:
+        "lib/linux/getegid.c",
+        "lib/linux/geteuid.c",
+        "lib/linux/getgid.c",
+        "lib/linux/getppid.c",
+        "lib/linux/getrusage.c",
+        "lib/linux/getuid.c",
+        "lib/linux/ioctl.c",
+        "lib/linux/mknod.c",
+        "lib/linux/readlink.c",
+        "lib/linux/setgid.c",
+        "lib/linux/settimer.c",
+        "lib/linux/setuid.c",
+        "lib/linux/signal.c",
+        "lib/linux/sigprogmask.c",
+    ]));
+    v
+}
+
+fn libtcc1_sources() -> Vec<String> {
+    s_vec(&["lib/libtcc1.c"])
+}
+
+fn mes_sources() -> Vec<String> {
+    s_vec(&[
+        "src/builtins.c",
+        "src/cc.c",
+        "src/core.c",
+        "src/display.c",
+        "src/eval-apply.c",
+        "src/gc.c",
+        "src/globals.c",
+        "src/hash.c",
+        "src/lib.c",
+        "src/math.c",
+        "src/mes.c",
+        "src/module.c",
+        "src/posix.c",
+        "src/reader.c",
+        "src/stack.c",
+        "src/string.c",
+        "src/struct.c",
+        "src/symbol.c",
+        "src/variable.c",
+        "src/vector.c",
+    ])
+}
+
+// ---- shared plumbing ------------------------------------------------------
+
+struct Cfg {
+    /// The unpacked mes tree — srcdir, builddir, and MES_PREFIX all at once
+    /// (the in-tree build the deleted recipe ran).
+    top: PathBuf,
+    /// The unpacked nyacc tree (mescc's C parser rides GUILE_LOAD_PATH).
+    nyacc: PathBuf,
+    /// The staged stage0 rung output (kaem/M2-Planet/M1/hex2/blood-elf + the
+    /// mescc-tools-extra file tools, all under AMD64/bin).
+    stage0: PathBuf,
+    out: String,
+    version: String,
+}
+
+fn ps(p: &Path) -> Result<&str, String> {
+    p.to_str()
+        .ok_or_else(|| format!("non-UTF-8 path: {}", p.display()))
+}
+
+fn read(p: &Path) -> Result<Vec<u8>, String> {
+    fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))
+}
+
+fn write(p: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    fs::write(p, data).map_err(|e| format!("write {}: {e}", p.display()))
+}
+
+fn chmod_x(p: &Path) -> Result<(), String> {
+    fs::set_permissions(p, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod {}: {e}", p.display()))
+}
+
+fn cp(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    fs::copy(from, to)
+        .map(|_| ())
+        .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))
+}
+
+/// `sed -re s,^[.]+/,, -e s,/,-,g -e s,[.]c$,,` + `.o` — bootstrap.sh's
+/// object-name mangling.
+fn obj_name(c: &str) -> String {
+    let c = c.trim_start_matches("./");
+    let stem = c.strip_suffix(".c").unwrap_or(c);
+    format!("{}.o", stem.replace('/', "-"))
+}
+
+/// configure.sh's `subst`: replace each `@KEY@` with its value. Keys absent
+/// from the map stay literal, exactly like a sed expression list.
+fn subst(template: &Path, dest: &Path, map: &[(String, String)]) -> Result<(), String> {
+    let body = String::from_utf8(read(template)?)
+        .map_err(|_| format!("template {} is not UTF-8", template.display()))?;
+    let mut out = body;
+    for (k, v) in map {
+        out = out.replace(&format!("@{k}@"), v);
+    }
+    write(dest, out.as_bytes())?;
+    chmod_x(dest)
+}
+
+// ---- the rung -------------------------------------------------------------
+
+/// Build + install the mes rung: SOURCE/NYACC are the staged tarballs, STAGE0
+/// the staged stage0 output, OUT the store output dir. Runs in the sandbox
+/// cwd ({root}): the mes tree unpacks to `{root}/mes-src`, nyacc to
+/// `{root}/nyacc` (the recipe's guile-site CopyTree reads it there).
+pub(crate) fn run(source: &str, nyacc: &str, stage0: &str, out: &str) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let top = cwd.join("mes-src");
+    crate::tar::unpack_archive(Path::new(source), &top, false)?;
+    let nyacc_dir = cwd.join("nyacc");
+    crate::tar::unpack_archive(Path::new(nyacc), &nyacc_dir, false)?;
+
+    let version = read_configure_version(&top.join("configure.sh"))?;
+    let cfg = Cfg {
+        top,
+        nyacc: nyacc_dir,
+        stage0: PathBuf::from(stage0),
+        out: out.to_string(),
+        version,
+    };
+
+    configure(&cfg)?;
+    kaem_phase(&cfg)?;
+    mescc_lib_phase(&cfg)?;
+    mes_link_phase(&cfg)?;
+    gcc_source_lib_phase(&cfg)?;
+    install_phase(&cfg)
+}
+
+/// `VERSION=x.y.z` from configure.sh — the tarball states its own version.
+fn read_configure_version(configure: &Path) -> Result<String, String> {
+    let body = String::from_utf8(read(configure)?)
+        .map_err(|_| format!("{} is not UTF-8", configure.display()))?;
+    body.lines()
+        .find_map(|l| l.strip_prefix("VERSION="))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("no VERSION= line in {}", configure.display()))
+}
+
+/// configure.sh's work under the rung's fixed flags (`--prefix=$out
+/// --host=i686-linux-gnu`, CC unset → compiler=mescc, GUILE=true →
+/// effective version 2.2): the generated `include/mes/config.h`, the three
+/// arch headers, and the @VAR@ substitution of the INSTALLED scripts
+/// (mescc, mescc.scm, mesar). The other templates (GNUmakefile, config.sh,
+/// bootstrap.sh, …) exist only to orchestrate — this module IS that
+/// orchestration, so they are not generated.
+fn configure(cfg: &Cfg) -> Result<(), String> {
+    let out = &cfg.out;
+    let top = ps(&cfg.top)?.to_string();
+    let site = format!("{out}/share/guile/site/{GUILE_EFFECTIVE_VERSION}");
+    let ccache = format!("{out}/lib/guile/{GUILE_EFFECTIVE_VERSION}/site-ccache");
+    let pairs: Vec<(String, String)> = [
+        ("VERSION", cfg.version.as_str()),
+        ("PACKAGE", "mes"),
+        ("PACKAGE_NAME", "GNU Mes"),
+        ("PACKAGE_BUGREPORT", "bug-mes@gnu.org"),
+        ("bootstrap", "true"),
+        ("build", HOST),
+        ("host", HOST),
+        ("compiler", "mescc"),
+        ("courageous", "false"),
+        ("mes_bits", MES_BITS),
+        ("mes_kernel", MES_KERNEL),
+        ("mes_cpu", MES_CPU),
+        ("mes_libc", MES_LIBC),
+        ("mes_system", MES_SYSTEM),
+        ("abs_top_srcdir", top.as_str()),
+        ("abs_top_builddir", top.as_str()),
+        ("top_builddir", "."),
+        ("srcdest", ""),
+        ("srcdir", "."),
+        ("prefix", out.as_str()),
+        ("program_prefix", ""),
+        ("GUILE_EFFECTIVE_VERSION", GUILE_EFFECTIVE_VERSION),
+        ("GUILE_LOAD_PATH", ""),
+        ("guile_site_dir", site.as_str()),
+        ("guile_site_ccache_dir", ccache.as_str()),
+        ("V", ""),
+        ("BASH", SHELL),
+        ("SHELL", SHELL),
+        ("GUILD", "true"),
+        ("GUILE", "true"),
+        ("MES_FOR_BUILD", "mes"),
+        ("GIT", ""),
+        ("PERL", ""),
+        ("CFLAGS", ""),
+        ("CPPFLAGS", ""),
+        ("LDFLAGS", ""),
+        ("HEX2FLAGS", ""),
+        ("M1FLAGS", ""),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+    .chain(
+        [
+            ("bindir", format!("{out}/bin")),
+            ("datadir", format!("{out}/share")),
+            ("docdir", format!("{out}/share/doc/mes")),
+            ("infodir", format!("{out}/share/info")),
+            ("includedir", format!("{out}/include")),
+            ("libdir", format!("{out}/lib")),
+            ("pkgdatadir", format!("{out}/share/mes")),
+            ("mandir", format!("{out}/share/man")),
+            ("AR", format!("{top}/pre-inst-env mesar")),
+            ("CC", format!("{top}/pre-inst-env mescc")),
+            ("DIFF", format!("{top}/pre-inst-env diff.scm")),
+            ("BLOOD_ELF", ps(&cfg.stage0)?.to_string() + "/AMD64/artifact/blood-elf-0"),
+            ("HEX2", ps(&cfg.stage0)?.to_string() + "/AMD64/bin/hex2"),
+            ("M1", ps(&cfg.stage0)?.to_string() + "/AMD64/bin/M1"),
+            ("M2_PLANET", ps(&cfg.stage0)?.to_string() + "/AMD64/bin/M2-Planet"),
+            ("KAEM", ps(&cfg.stage0)?.to_string() + "/AMD64/bin/kaem"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v)),
+    )
+    .collect();
+
+    for script in ["mescc", "mescc.scm", "mesar"] {
+        let template = cfg.top.join("scripts").join(format!("{script}.in"));
+        let dest = cfg.top.join("scripts").join(script);
+        subst(&template, &dest, &pairs)?;
+    }
+
+    write(
+        &cfg.top.join("include/mes/config.h"),
+        format!("#undef SYSTEM_LIBC\n#define MES_VERSION \"{}\"\n", cfg.version).as_bytes(),
+    )?;
+    for h in ["kernel-stat.h", "signal.h", "syscall.h"] {
+        cp(
+            &cfg.top.join(format!("include/{MES_KERNEL}/{MES_CPU}/{h}")),
+            &cfg.top.join(format!("include/arch/{h}")),
+        )?;
+    }
+    Ok(())
+}
+
+/// bootstrap.sh phase 1: upstream's own `kaem.run` under stage0's kaem —
+/// M2-Planet → blood-elf → M1 → hex2 → `bin/mes-m2` (x86, base 0x1000000),
+/// the in-script `mes-m2 -c '(display …)'` self-test, and `cp bin/mes-m2
+/// bin/mes`. PATH is stage0's bin (kaem resolves M2-Planet/M1/hex2/blood-elf
+/// and the mkdir/cp file tools there); the cpu vars pin the x86 target the
+/// script otherwise defaults.
+fn kaem_phase(cfg: &Cfg) -> Result<(), String> {
+    let stage0_bin = cfg.stage0.join("AMD64/bin");
+    let envs: Vec<(String, String)> = vec![
+        ("PATH".to_string(), ps(&stage0_bin)?.to_string()),
+        ("mes_cpu".to_string(), MES_CPU.to_string()),
+        ("cc_cpu".to_string(), CC_CPU.to_string()),
+        ("stage0_cpu".to_string(), STAGE0_CPU.to_string()),
+        ("blood_elf_flag".to_string(), "--little-endian".to_string()),
+        ("srcdest".to_string(), String::new()),
+        ("GUILE_LOAD_PATH".to_string(), String::new()),
+    ];
+    let kaem = cfg.stage0.join("AMD64/bin/kaem");
+    crate::build::run_cmd_phase(
+        ps(&kaem)?,
+        &["--verbose", "--strict", "-f", "kaem.run"],
+        ps(&cfg.top)?,
+        &envs,
+    )?;
+    // kaem.run's final `cp bin/mes-m2 bin/mes` uses stage0's cp, which creates
+    // the copy 0600 (the bash ladder had coreutils cp first on PATH, which
+    // carried mes-m2's exec bit over) — re-grant it or the mescc phase can't
+    // spawn bin/mes.
+    chmod_x(&cfg.top.join("bin/mes"))
+}
+
+/// One mescc invocation, exactly as `pre-inst-env mescc` composes it: the
+/// just-built mes runs upstream's `scripts/mescc.scm`; M1/HEX2/BLOOD_ELF are
+/// stage0's assembler/linker; MES_PREFIX/GUILE_LOAD_PATH make the in-tree
+/// modules (+ nyacc, mescc's C parser) resolvable.
+fn mescc(cfg: &Cfg, dir: &Path, args: &[String]) -> Result<(), String> {
+    let out = &cfg.out;
+    let top = ps(&cfg.top)?;
+    let nyacc = ps(&cfg.nyacc)?;
+    let stage0 = ps(&cfg.stage0)?;
+    let envs: Vec<(String, String)> = vec![
+        ("MES_ARENA".to_string(), MES_ARENA.to_string()),
+        ("MES_MAX_ARENA".to_string(), MES_ARENA.to_string()),
+        ("MES_STACK".to_string(), MES_STACK.to_string()),
+        ("MES_PREFIX".to_string(), top.to_string()),
+        ("MES_UNINSTALLED".to_string(), "1".to_string()),
+        ("includedir".to_string(), format!("{top}/include")),
+        ("libdir".to_string(), format!("{top}/lib")),
+        (
+            "GUILE_LOAD_PATH".to_string(),
+            format!(
+                "{top}/module:{top}/mes:{top}/guix:{nyacc}/module:{top}/mes/module:{top}/module"
+            ),
+        ),
+        (
+            "GUILE_LOAD_COMPILED_PATH".to_string(),
+            format!("{top}/scripts:{top}/module"),
+        ),
+        ("MES".to_string(), format!("{top}/bin/mes")),
+        ("M1".to_string(), format!("{stage0}/AMD64/bin/M1")),
+        ("HEX2".to_string(), format!("{stage0}/AMD64/bin/hex2")),
+        (
+            "BLOOD_ELF".to_string(),
+            format!("{stage0}/AMD64/artifact/blood-elf-0"),
+        ),
+        ("PATH".to_string(), format!("{stage0}/AMD64/bin")),
+        ("LANG".to_string(), String::new()),
+        ("LC_ALL".to_string(), String::new()),
+    ];
+    let mes = format!("{top}/bin/mes");
+    let mescc_scm = format!("{top}/scripts/mescc.scm");
+    let site = format!("{out}/share/guile/site/{GUILE_EFFECTIVE_VERSION}");
+    let ccache = format!("{out}/lib/guile/{GUILE_EFFECTIVE_VERSION}/site-ccache");
+    let mut argv: Vec<&str> = vec![
+        "--no-auto-compile",
+        "-e",
+        "main",
+        "-L",
+        &site,
+        "-C",
+        &ccache,
+        &mescc_scm,
+        "--",
+    ];
+    argv.extend(args.iter().map(String::as_str));
+    crate::build::run_cmd_phase(&mes, &argv, ps(dir)?, &envs)
+}
+
+/// bootstrap.sh's mescc-lib flag block (cwd `mescc-lib`, `srcdest=../`):
+/// `$AM_CPPFLAGS $CPPFLAGS $AM_CFLAGS $CFLAGS` word-split in that order.
+fn mescc_lib_flags() -> Vec<String> {
+    s_vec(&[
+        "-D", "HAVE_CONFIG_H=1", "-I", "../include", "-I", "../include", "-I", "include",
+        "-D", "HAVE_CONFIG_H=1", "-I", "include", "-L", "../lib",
+    ])
+}
+
+/// scripts/mesar's whole job, in fs: the `.a` is the concatenation of the
+/// member `.o` files (mescc objects are text), and the sibling `.s` archive
+/// is the concatenation of the members' `.s` companions.
+fn mesar(dir: &Path, archive: &str, objects: &[String]) -> Result<(), String> {
+    let arch_path = dir.join(archive);
+    let m1_path = dir.join(format!(
+        "{}.s",
+        archive.strip_suffix(".a").unwrap_or(archive)
+    ));
+    let mut a: Vec<u8> = Vec::new();
+    let mut s: Vec<u8> = Vec::new();
+    for o in objects {
+        a.extend_from_slice(&read(&dir.join(o))?);
+        let os = format!("{}.s", o.strip_suffix(".o").unwrap_or(o));
+        s.extend_from_slice(&read(&dir.join(os))?);
+    }
+    write(&m1_path, &s)?;
+    write(&arch_path, &a)
+}
+
+/// Compile every source in LIST (mescc -c, bootstrap.sh's loop) and archive
+/// the objects as ARCHIVE under `x86-mes/`.
+fn compile_archive(cfg: &Cfg, dir: &Path, list: &[String], archive: &str) -> Result<(), String> {
+    let mut objects = Vec::with_capacity(list.len());
+    for c in list {
+        let src = format!("../{c}");
+        if !dir.join(&src).is_file() {
+            return Err(format!(
+                "mes bootstrap: configure-lib source {c} is missing from the tarball \
+                 (pin bump changed build-aux/configure-lib.sh? update mes_boot.rs's lists)"
+            ));
+        }
+        let o = obj_name(c);
+        let mut args = vec!["-c".to_string()];
+        args.extend(mescc_lib_flags());
+        args.extend(["-o".to_string(), o.clone(), src]);
+        mescc(cfg, dir, &args)?;
+        objects.push(o);
+    }
+    mesar(dir, &format!("{MES_CPU}-mes/{archive}"), &objects)
+}
+
+/// bootstrap.sh phase 2 (cwd `mescc-lib`): crt1 + the four MesCC archives —
+/// libc-mini.a, libmescc.a, libc.a, and libc+tcc.a (the tcc rung's input).
+fn mescc_lib_phase(cfg: &Cfg) -> Result<(), String> {
+    let lib = cfg.top.join("mescc-lib");
+    fs::create_dir_all(lib.join(format!("{MES_CPU}-mes")))
+        .map_err(|e| format!("mkdir mescc-lib: {e}"))?;
+    for link in ["mes", "module", "src"] {
+        let l = lib.join(link);
+        let _ = fs::remove_file(&l);
+        std::os::unix::fs::symlink(format!("../{link}"), &l)
+            .map_err(|e| format!("symlink mescc-lib/{link}: {e}"))?;
+    }
+
+    cp(
+        &cfg.top.join(format!("lib/linux/{MES_CPU}-mes-mescc/crt1.c")),
+        &lib.join("crt1.c"),
+    )?;
+    let mut crt_args = vec!["-c".to_string()];
+    crt_args.extend(mescc_lib_flags());
+    crt_args.push("crt1.c".to_string());
+    mescc(cfg, &lib, &crt_args)?;
+    for f in ["crt1.o", "crt1.s"] {
+        cp(&lib.join(f), &lib.join(format!("{MES_CPU}-mes/{f}")))?;
+    }
+
+    compile_archive(cfg, &lib, &libc_mini_sources("mescc"), "libc-mini.a")?;
+    compile_archive(cfg, &lib, &libmescc_sources("mescc"), "libmescc.a")?;
+    compile_archive(cfg, &lib, &libc_sources("mescc"), "libc.a")?;
+    compile_archive(cfg, &lib, &libc_tcc_sources("mescc"), "libc+tcc.a")
+}
+
+/// bootstrap.sh phase 3 (cwd top, `srcdest=""`): compile mes_SOURCES with
+/// MesCC and link `bin/mes-mescc` — the self-hosted mes — then `cp` it over
+/// `bin/mes` (which until now was mes-m2).
+fn mes_link_phase(cfg: &Cfg) -> Result<(), String> {
+    let flags = s_vec(&[
+        "-D", "HAVE_CONFIG_H=1", "-I", "include", "-I", "../include", "-I", "include",
+        "-D", "HAVE_CONFIG_H=1", "-I", "include", "-L", "lib",
+    ]);
+    let mut objects = Vec::new();
+    for c in &mes_sources() {
+        let o = obj_name(c);
+        let mut args = vec!["-c".to_string()];
+        args.extend(flags.clone());
+        args.extend(["-o".to_string(), o.clone(), c.clone()]);
+        mescc(cfg, &cfg.top, &args)?;
+        objects.push(o);
+    }
+    let mut link = s_vec(&[
+        "-L", "lib", "-nostdlib", "-o", "bin/mes-mescc", "-L", "mescc-lib",
+        "mescc-lib/crt1.o",
+    ]);
+    link.extend(objects);
+    link.extend(s_vec(&["-lc", "-lmescc"]));
+    mescc(cfg, &cfg.top, &link)?;
+    let mes_mescc = cfg.top.join("bin/mes-mescc");
+    chmod_x(&mes_mescc)?;
+    cp(&mes_mescc, &cfg.top.join("bin/mes"))?;
+    chmod_x(&cfg.top.join("bin/mes"))
+}
+
+/// build-aux/build-source-lib.sh (the bootstrap.sh gcc-lib subshell,
+/// compiler=gcc): the SOURCE library later gcc rungs compile for themselves —
+/// crt*.c copies, the concatenated libc+gnu.c and libtcc1.c, and libgetopt.c,
+/// all under gcc-lib/x86-mes/.
+fn gcc_source_lib_phase(cfg: &Cfg) -> Result<(), String> {
+    let gcc_lib = cfg.top.join("gcc-lib");
+    let dest = gcc_lib.join(format!("{MES_CPU}-mes"));
+    fs::create_dir_all(&dest).map_err(|e| format!("mkdir gcc-lib: {e}"))?;
+
+    let crt_dir = cfg.top.join(format!("lib/{MES_KERNEL}/{MES_CPU}-mes-gcc"));
+    let mut found_crt = false;
+    for ent in
+        fs::read_dir(&crt_dir).map_err(|e| format!("read {}: {e}", crt_dir.display()))?
+    {
+        let ent = ent.map_err(|e| format!("read {}: {e}", crt_dir.display()))?;
+        let name = ent.file_name();
+        let n = name.to_string_lossy();
+        if n.starts_with("crt") && n.ends_with(".c") {
+            cp(&ent.path(), &dest.join(name.as_os_str()))?;
+            found_crt = true;
+        }
+    }
+    if !found_crt {
+        return Err(format!("no crt*.c under {}", crt_dir.display()));
+    }
+
+    let header = |compiler: &str| {
+        format!(
+            "// Generated from Mes -- do not edit\n\
+             // compiler: {compiler}\n\
+             // cpu:      {MES_CPU}\n\
+             // bits:     {MES_BITS}\n\
+             // libc:     {MES_LIBC}\n\
+             // kernel:   {MES_KERNEL}\n\
+             // system:   {MES_SYSTEM}\n\n"
+        )
+    };
+    for (name, list) in [
+        ("libc+gnu.c", libc_gnu_sources("gcc")),
+        ("libtcc1.c", libtcc1_sources()),
+    ] {
+        let mut body = header("gcc").into_bytes();
+        for c in &list {
+            body.extend_from_slice(format!("// {c}\n").as_bytes());
+            body.extend_from_slice(&read(&cfg.top.join(c))?);
+            body.push(b'\n');
+        }
+        write(&gcc_lib.join(name), &body)?;
+        cp(&gcc_lib.join(name), &dest.join(name))?;
+    }
+    cp(&cfg.top.join("lib/posix/getopt.c"), &dest.join("libgetopt.c"))
+}
+
+/// install.sh under the rung's config: the bins and wrapper scripts, the doc
+/// set, the include tree, the x86-mes/linux trees + the MesCC archives + the
+/// gcc source lib into lib/, the module trees into share/mes and the guile
+/// site/ccache dirs. The info/man/perl-ChangeLog conditionals are dead in a
+/// bootstrap build (nothing generates them) and install.sh itself skips
+/// absent files.
+fn install_phase(cfg: &Cfg) -> Result<(), String> {
+    let out = Path::new(&cfg.out);
+    let top = &cfg.top;
+    let bindir = out.join("bin");
+
+    for (from, to) in [
+        ("bin/mes", "mes"),
+        ("bin/mes-m2", "mes-m2"),
+        ("bin/mes-mescc", "mes-mescc"),
+        ("scripts/mesar", "mesar"),
+        ("scripts/mescc.scm", "mescc.scm"),
+        ("scripts/mescc", "mescc"),
+        ("scripts/diff.scm", "diff.scm"),
+    ] {
+        let dest = bindir.join(to);
+        cp(&top.join(from), &dest)?;
+        chmod_x(&dest)?;
+    }
+
+    let docdir = out.join("share/doc/mes");
+    for doc in [
+        "AUTHORS", "BOOTSTRAP", "COPYING", "HACKING", "NEWS", "README", "ROADMAP", "ChangeLog",
+    ] {
+        cp(&top.join(doc), &docdir.join(doc))?;
+    }
+
+    let t = crate::build::copy_tree_writable;
+    t(&top.join("include"), &out.join("include"))?;
+    t(
+        &top.join(format!("lib/{MES_CPU}-mes")),
+        &out.join(format!("lib/{MES_CPU}-mes")),
+    )?;
+    t(
+        &top.join(format!("lib/{MES_KERNEL}/{MES_CPU}-mes")),
+        &out.join(format!("lib/{MES_KERNEL}/{MES_CPU}-mes")),
+    )?;
+    t(&top.join(format!("gcc-lib/{MES_CPU}-mes")), &out.join("lib"))?;
+    t(
+        &top.join(format!("mescc-lib/{MES_CPU}-mes")),
+        &out.join(format!("lib/{MES_CPU}-mes")),
+    )?;
+    t(&top.join("module"), &out.join("share/mes/module"))?;
+    t(&top.join("mes/module"), &out.join("share/mes/module"))?;
+    let site = out.join(format!("share/guile/site/{GUILE_EFFECTIVE_VERSION}"));
+    t(&top.join("module"), &site)?;
+    let ccache = out.join(format!("lib/guile/{GUILE_EFFECTIVE_VERSION}/site-ccache"));
+    t(&top.join("module"), &ccache)
+}

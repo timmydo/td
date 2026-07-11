@@ -470,6 +470,17 @@ fn tee_stream(
 /// pgroup). The gate runner's FALLBACK pgroup-RSS sampler, used only where no
 /// delegated cgroup exists, does lose sight of phase children for a build run
 /// in-gate — the per-process RLIMIT_DATA cap still binds each of them.
+/// A phase-watched run_cmd for sibling modules (mes_boot): same supervision
+/// as every mesboot Run step, without exporting the Watch type.
+pub(crate) fn run_cmd_phase(
+    prog: &str,
+    args: &[&str],
+    cwd: &str,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    run_cmd(prog, args, cwd, envs, &WATCH_PHASE)
+}
+
 fn run_cmd(
     prog: &str,
     args: &[&str],
@@ -1502,7 +1513,7 @@ pub fn run_cmake() -> Result<(), String> {
 /// trees are read-only; the kaem build writes its artifacts INTO its tree). File
 /// exec bits are preserved; symlinks are recreated. Pure `std` — the stage0 rung
 /// has NO build inputs, so there is no coreutils `cp` in its sandbox to shell to.
-fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
+pub(crate) fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
@@ -2035,6 +2046,14 @@ pub fn run_mesboot() -> Result<(), String> {
             let keep_top = o.get("keepTop").is_some_and(Json::is_true);
             crate::tar::unpack_archive(Path::new(&input), Path::new(&dest), keep_top)
                 .map_err(err)?;
+        } else if let Some(o) = step.get("mesBoot") {
+            // The engine-native mes rung (re #469): configure + bootstrap +
+            // install of the pinned mes tarball, spawning only stage0 recipe
+            // outputs and the just-built mes — no host shell or coreutils.
+            let source = ctx.expand(&field(o, "source")?).map_err(err)?;
+            let nyacc = ctx.expand(&field(o, "nyacc")?).map_err(err)?;
+            let stage0 = ctx.expand(&field(o, "stage0")?).map_err(err)?;
+            crate::mes_boot::run(&source, &nyacc, &stage0, &ctx.out).map_err(err)?;
         } else if let Some(o) = step.get("copyFiles") {
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             for f in ctx.expand_all(&strs(o, "files")?).map_err(err)? {

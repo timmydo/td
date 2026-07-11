@@ -36,6 +36,7 @@ mod gates;
 mod gzip;
 mod json;
 mod lock;
+mod mes_boot;
 mod nar;
 mod oci;
 mod sandbox;

@@ -104,6 +104,16 @@ pub enum Step {
         dest: String,
         keep_top: bool,
     },
+    /// The ENGINE-NATIVE mes bootstrap rung (builder's `mes_boot::run`, re
+    /// #469): the Rust port of the mes tarball's configure.sh, bootstrap.sh,
+    /// and install.sh. The only subprocesses are stage0 recipe outputs (kaem
+    /// driving upstream's own kaem.run) and the just-built mes running
+    /// upstream's mescc.scm — the rung declares NO host shell or coreutils.
+    MesBoot {
+        source: String,
+        nyacc: String,
+        stage0: String,
+    },
     /// Copy files (flat) into dest, made user-writable (build trees are written into).
     CopyFiles {
         files: Vec<String>,
@@ -201,6 +211,18 @@ impl Step {
                     ("input".into(), Json::Str(input.clone())),
                     ("dest".into(), Json::Str(dest.clone())),
                     ("keepTop".into(), Json::Bool(*keep_top)),
+                ]),
+            )]),
+            Step::MesBoot {
+                source,
+                nyacc,
+                stage0,
+            } => Json::Obj(vec![(
+                "mesBoot".into(),
+                Json::Obj(vec![
+                    ("source".into(), Json::Str(source.clone())),
+                    ("nyacc".into(), Json::Str(nyacc.clone())),
+                    ("stage0".into(), Json::Str(stage0.clone())),
                 ]),
             )]),
             Step::CopyFiles { files, dest } => Json::Obj(vec![(
