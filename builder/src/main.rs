@@ -48,6 +48,7 @@ mod store_db;
 mod store_db_read;
 mod sys;
 mod tar;
+mod tcc_boot;
 mod toolchain_x86_64;
 mod xz;
 

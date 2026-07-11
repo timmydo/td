@@ -2054,6 +2054,15 @@ pub fn run_mesboot() -> Result<(), String> {
             let nyacc = ctx.expand(&field(o, "nyacc")?).map_err(err)?;
             let stage0 = ctx.expand(&field(o, "stage0")?).map_err(err)?;
             crate::mes_boot::run(&source, &nyacc, &stage0, &ctx.out).map_err(err)?;
+        } else if let Some(o) = step.get("tccBoot") {
+            // The engine-native tcc rung (re #469): configure + bootstrap +
+            // boot self-host of the pinned tcc tarball, spawning only recipe
+            // outputs (mes running mescc.scm, stage0's file tools, and the
+            // just-built tcc binaries) — no host shell or coreutils.
+            let source = ctx.expand(&field(o, "source")?).map_err(err)?;
+            let mes = ctx.expand(&field(o, "mes")?).map_err(err)?;
+            let stage0 = ctx.expand(&field(o, "stage0")?).map_err(err)?;
+            crate::tcc_boot::run(&source, &mes, &stage0, &ctx.out).map_err(err)?;
         } else if let Some(o) = step.get("copyFiles") {
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             for f in ctx.expand_all(&strs(o, "files")?).map_err(err)? {
