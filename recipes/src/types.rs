@@ -155,11 +155,13 @@ pub enum Step {
     /// stage0's `replace` cannot carry the space-bearing, multi-line strings a
     /// real patch hunk needs through kaem's quote-stripping tokenizer). Each
     /// edit replaces EVERY occurrence of `from` with `to`, requiring exactly
-    /// `expect` occurrences first, so a drift in the pinned source — or a
+    /// `expect` (≥ 1) occurrences first, so a drift in the pinned source — or a
     /// transcription slip — reds the rung instead of silently doing nothing.
     /// Edits apply in order (an edit sees the previous edits' result). Only
     /// `file` is template-expanded; `from`/`to` are LITERAL source text, so C
-    /// braces and `{…}` pass through untouched.
+    /// braces and `{…}` pass through untouched. The engine also reds an empty
+    /// `from`, an `expect` of 0, or any non-ASCII byte in `from`/`to` (the
+    /// build-JSON wire reader is Latin-1, so only ASCII round-trips faithfully).
     SubstituteText {
         file: String,
         edits: Vec<TextEdit>,
@@ -167,7 +169,8 @@ pub enum Step {
 }
 
 /// One literal edit within a [`Step::SubstituteText`]: replace every occurrence
-/// of `from` with `to`, requiring exactly `expect` occurrences.
+/// of `from` with `to`, requiring exactly `expect` (≥ 1) occurrences. `from`/`to`
+/// must be ASCII (the build-JSON wire reader is Latin-1).
 #[derive(Clone)]
 pub struct TextEdit {
     pub from: String,

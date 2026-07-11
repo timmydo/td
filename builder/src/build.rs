@@ -1817,20 +1817,42 @@ impl StepCtx {
     }
 }
 
+/// One literal `SubstituteText` edit as the engine consumes it: `(from, to,
+/// expect)`. The recipe-side `TextEdit` struct serializes to this tuple over the
+/// build-JSON wire.
+type TextEdit = (String, String, usize);
+
 /// Apply a `Step::SubstituteText`'s literal, count-checked edits to `content`
 /// (re #469's host-free `patch`/`sed`). Each `(from, to, expect)` requires
-/// EXACTLY `expect` occurrences of `from` — an empty `from` or a count mismatch
-/// reds the rung — then replaces them all. Edits apply in order, so a later
-/// edit sees the earlier ones' result. `file` names the file only for errors.
+/// EXACTLY `expect` (≥ 1) occurrences of `from`, then replaces them all. Edits
+/// apply in order, so a later edit sees the earlier ones' result. `file` names
+/// the file only for errors. Fail-closed — any of these reds the rung:
+///   * an empty `from` (would match everywhere / be meaningless);
+///   * `expect == 0` (every declared edit must change something — this catches
+///     a `1`→`0` typo instead of silently no-op'ing on an assert-absent);
+///   * a non-ASCII byte in `from`/`to` (see below);
+///   * an actual occurrence count that differs from `expect` (source drift).
+///
+/// `from`/`to` are restricted to ASCII: the build-JSON reader (`json.rs::string`)
+/// decodes each wire byte as Latin-1 (`byte as char`), so a non-ASCII edit would
+/// not survive the recipe→engine round-trip intact — a non-ASCII `to` would write
+/// mangled bytes. ASCII is byte-identical through that path; anything else fails
+/// closed here rather than silently corrupting the patched output.
 fn apply_text_edits(
     file: &str,
     mut content: String,
-    edits: &[(String, String, usize)],
+    edits: &[TextEdit],
 ) -> Result<String, String> {
     for (j, (from, to, expect)) in edits.iter().enumerate() {
         let at = |m: String| format!("substituteText {file} edit {}: {m}", j + 1);
         if from.is_empty() {
             return Err(at("empty `from' string".into()));
+        }
+        if !from.is_ascii() || !to.is_ascii() {
+            return Err(at("`from'/`to' must be ASCII (the build-JSON reader is Latin-1)".into()));
+        }
+        if *expect == 0 {
+            return Err(at("`expect' is 0 — every edit must change at least one occurrence".into()));
         }
         let n = content.matches(from.as_str()).count();
         if n != *expect {
@@ -1839,6 +1861,45 @@ fn apply_text_edits(
         content = content.replace(from.as_str(), to);
     }
     Ok(content)
+}
+
+/// Parse a `substituteText` step: expand ONLY `file` (the target path) with
+/// `ctx`; read every edit's `from`/`to`/`expect` LITERALLY. `from`/`to` are
+/// source text — a `{in:…}`/`{src}` inside a patched hunk must survive verbatim,
+/// so they are NEVER template-expanded (only `file` is). Returns the expanded
+/// path and the literal edits (validated for content by `apply_text_edits`).
+fn parse_substitute_edits(
+    ctx: &StepCtx,
+    o: &Json,
+) -> Result<(String, Vec<TextEdit>), String> {
+    let file = ctx.expand(
+        o.get("file")
+            .and_then(Json::as_str)
+            .ok_or("substituteText: missing/non-string `file'")?,
+    )?;
+    let edits_json = o
+        .get("edits")
+        .and_then(Json::as_arr)
+        .ok_or("substituteText: `edits' not an array")?;
+    let mut edits: Vec<TextEdit> = Vec::with_capacity(edits_json.len());
+    for (j, e) in edits_json.iter().enumerate() {
+        let where_ = |m: String| format!("substituteText edit {}: {m}", j + 1);
+        let from = e
+            .get("from")
+            .and_then(Json::as_str)
+            .ok_or_else(|| where_("`from' missing or not a string".into()))?;
+        let to = e
+            .get("to")
+            .and_then(Json::as_str)
+            .ok_or_else(|| where_("`to' missing or not a string".into()))?;
+        let expect: usize = e
+            .get("expect")
+            .and_then(Json::as_str)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| where_("`expect' missing or not a count".into()))?;
+        edits.push((from.to_string(), to.to_string(), expect));
+    }
+    Ok((file, edits))
 }
 
 /// Minimal glob for mesboot `glob:` argv elements: exactly one `*`, in the LAST
@@ -2122,34 +2183,12 @@ pub fn run_mesboot() -> Result<(), String> {
             }
         } else if let Some(o) = step.get("substituteText") {
             // Host-free `patch`/`sed` (re #469): literal, fail-closed text edits
-            // in pure Rust. Only `file` is template-expanded; `from`/`to` are
-            // literal source text (C braces / `{…}` pass through untouched).
-            // Each edit requires an exact occurrence count, so a drift in the
-            // pinned source reds the rung instead of silently no-op'ing; edits
-            // apply in order (each sees the previous edits' result).
-            let file = ctx.expand(&field(o, "file")?).map_err(err)?;
-            let edits_json = o
-                .get("edits")
-                .and_then(Json::as_arr)
-                .ok_or_else(|| err("substituteText: `edits' not an array".into()))?;
-            let mut edits: Vec<(String, String, usize)> = Vec::with_capacity(edits_json.len());
-            for (j, e) in edits_json.iter().enumerate() {
-                let where_ = |m: String| err(format!("substituteText edit {}: {m}", j + 1));
-                let from = e
-                    .get("from")
-                    .and_then(Json::as_str)
-                    .ok_or_else(|| where_("`from' missing or not a string".into()))?;
-                let to = e
-                    .get("to")
-                    .and_then(Json::as_str)
-                    .ok_or_else(|| where_("`to' missing or not a string".into()))?;
-                let expect: usize = e
-                    .get("expect")
-                    .and_then(Json::as_str)
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| where_("`expect' missing or not a count".into()))?;
-                edits.push((from.to_string(), to.to_string(), expect));
-            }
+            // in pure Rust. `parse_substitute_edits` expands ONLY `file`; the
+            // `from`/`to` source text stays literal (C braces / `{…}` pass
+            // through untouched). `apply_text_edits` requires each edit's exact
+            // occurrence count, so a drift in the pinned source reds the rung
+            // instead of silently no-op'ing; edits apply in order.
+            let (file, edits) = parse_substitute_edits(&ctx, o).map_err(err)?;
             let content = fs::read_to_string(&file)
                 .map_err(|e| err(format!("substituteText: read {file}: {e}")))?;
             let out = apply_text_edits(&file, content, &edits).map_err(err)?;
@@ -2226,6 +2265,54 @@ mod tests {
     fn text_edits_reject_empty_from() {
         let e = apply_text_edits("f", "x".to_string(), &[edit("", "y", 1)]).unwrap_err();
         assert!(e.contains("empty `from'"), "{e}");
+    }
+
+    #[test]
+    fn text_edits_reject_expect_zero() {
+        // `expect: 0` is a `1`→`0` typo trap (silently no-ops when absent), not a
+        // supported assert-absent — every declared edit must change something.
+        let e = apply_text_edits("f", "no match here".to_string(), &[edit("gone", "x", 0)])
+            .unwrap_err();
+        assert!(e.contains("`expect' is 0"), "{e}");
+    }
+
+    #[test]
+    fn text_edits_reject_non_ascii() {
+        // The build-JSON reader is Latin-1, so a non-ASCII edit can't round-trip:
+        // a non-ASCII `to` would write mangled bytes. Fail closed, don't corrupt.
+        let e_to = apply_text_edits("f", "cafe".to_string(), &[edit("cafe", "café", 1)])
+            .unwrap_err();
+        assert!(e_to.contains("must be ASCII"), "{e_to}");
+        let e_from = apply_text_edits("f", "x".to_string(), &[edit("café", "cafe", 1)])
+            .unwrap_err();
+        assert!(e_from.contains("must be ASCII"), "{e_from}");
+    }
+
+    #[test]
+    fn substitute_edits_expand_only_the_file_path_not_from_to() {
+        // The executor-level guarantee: `parse_substitute_edits` expands `{src}`
+        // in the FILE path, but `from`/`to` are literal source text — a `{in:…}`
+        // / `{src}` inside a hunk must NOT be template-expanded (it is real C
+        // that happens to contain braces). Pins the arm the 5 helper tests can't.
+        let ctx = StepCtx {
+            root: "/r".into(),
+            src: "/r/src".into(),
+            out: "/o".into(),
+            tools: "/r/tools".into(),
+            jobs: "4".into(),
+            inputs: vec![("mes".into(), "/td/store/abc-mes".into())],
+        };
+        let o = crate::json::parse(
+            r#"{"file":"{src}/x.c","edits":[{"from":"a{in:mes}b","to":"c{src}d","expect":"1"}]}"#,
+        )
+        .unwrap();
+        let (file, edits) = parse_substitute_edits(&ctx, &o).unwrap();
+        assert_eq!(file, "/r/src/x.c", "the file path IS expanded");
+        assert_eq!(
+            edits,
+            vec![("a{in:mes}b".to_string(), "c{src}d".to_string(), 1)],
+            "from/to stay literal — no template expansion"
+        );
     }
 
     /// The test-process bash + a PATH env for the child (scripts use sleep etc.).
