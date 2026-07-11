@@ -40,11 +40,10 @@ const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
 const PF_R: u32 = 4; // segment readable
 const DT_NULL: u64 = 0; // end of the dynamic array
-// Backs the pub `read_needed`/`assert_static` DT_NEEDED query; its first in-crate caller is
-// the forthcoming td-sh static-build verifier (re #469, this PR), so it reads as dead code
-// until then. `pub` items above (read_needed/assert_static) are exempt from the lint; these
-// private helpers are not. Drop the allows when the td-sh build wires them in.
-#[allow(dead_code)]
+// Backs the `read_needed`/`assert_static` DT_NEEDED query. assert_static is now
+// live in-crate: the bootstrap rungs' `Step::AssertStatic` calls it to reject a
+// host loader/libc leak (re #469), so needed_slots → read_needed → assert_static
+// is reachable and DT_NEEDED is used — no dead-code allow needed.
 const DT_NEEDED: u64 = 1; // .dynstr offset of a required shared-object name
 const DT_STRTAB: u64 = 5; // vaddr of the .dynstr string table
 const DT_RPATH: u64 = 15; // legacy run-path (string offset into .dynstr)
@@ -532,13 +531,15 @@ pub fn read_needed(path: &Path) -> Result<Vec<String>, String> {
 }
 
 /// Assert an ELF is FULLY STATIC — no program interpreter (`PT_INTERP`), no `DT_NEEDED`
-/// shared libraries, and no `DT_RPATH`/`DT_RUNPATH` run-path. This is the td-sh musl-seed
-/// contract (re #469): td-sh is built by the root-seed Rust (the control plane), so a
-/// *dynamically* linked td-sh would drag a host `/gnu/store` loader + glibc back in at run
-/// time — exactly the host-runtime ingress #469 closes. A `x86_64-unknown-linux-musl` build
-/// with a static C runtime has none of these; this check fails the build loudly (naming the
-/// offending entry) if a regression reintroduces any of them.
-#[allow(dead_code)] // see DT_NEEDED: staged for the td-sh static-build verifier (this PR)
+/// shared libraries, and no `DT_RPATH`/`DT_RUNPATH` run-path. This is a runtime-provenance
+/// contract (re #469): a *dynamically* linked binary drags a host loader + glibc back in at
+/// run time — exactly the host-runtime ingress #469 closes. Two consumers rely on it:
+///   * the pre-libc bootstrap rungs — tcc/make/yacc are linked `-static`, and the
+///     `Step::AssertStatic` step fails the rung if one regresses to a host loader/libc;
+///   * the td-sh musl seed — an `x86_64-unknown-linux-musl` static build has none of these.
+///
+/// The check fails loudly (naming the offending entry) if a regression reintroduces any of
+/// them; a non-ELF file reds too (the parser rejects bad magic).
 pub fn assert_static(path: &Path) -> Result<(), String> {
     if let Some(interp) = read_interp(path)? {
         return Err(format!(

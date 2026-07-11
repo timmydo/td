@@ -2181,6 +2181,14 @@ pub fn run_mesboot() -> Result<(), String> {
                     return Err(err(format!("required product not an executable file: {p}")));
                 }
             }
+        } else if let Some(o) = step.get("assertStatic") {
+            // Runtime-provenance gate (re #469): each product must be a fully
+            // static ELF -- no host loader (PT_INTERP), no host libc (DT_NEEDED),
+            // no run-path. A dynamically linked tcc/make/yacc would pull a host
+            // loader + glibc in at run time; fail closed here naming the leak.
+            for p in ctx.expand_all(&strs(o, "paths")?).map_err(err)? {
+                crate::elf::assert_static(Path::new(&p)).map_err(err)?;
+            }
         } else if let Some(o) = step.get("substituteText") {
             // Host-free `patch`/`sed` (re #469): literal, fail-closed text edits
             // in pure Rust. `parse_substitute_edits` expands ONLY `file`; the

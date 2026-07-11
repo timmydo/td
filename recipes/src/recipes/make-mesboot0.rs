@@ -1,5 +1,5 @@
 use crate::ladder::unpack_into;
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, Step, TextEdit};
 
 // GNU Make 3.80 — bootstrap rung 4 (#378), the SECOND rung cut off host
 // executables (re #469). tcc builds the first make (guix's make-mesboot0).
@@ -21,7 +21,8 @@ use crate::types::{Recipe, Step};
 // -B is needed; crt/libc are still copied into the source tree to mirror
 // build.sh's `-L.`. The lseek redeclaration the old recipe sed'd out of make.h
 // does not arise with this config.h + mes 0.27.1 headers (build proven clean),
-// so no make.h patch is applied — and stage0 ships no sed/replace anyway.
+// so no make.h patch is applied — and were one needed, the host-free
+// SubstituteText step would carry it, not host sed.
 const CONFIG_H: &str = include_str!("make-mesboot0-config.h");
 const BUILD_KAEM: &str = include_str!("make-mesboot0.kaem");
 // A shell-free smoke makefile: `make -n` prints the recipe without running it,
@@ -30,6 +31,31 @@ const SMOKE_MK: &str = "smoke:\n\tprintf 'make-mesboot0 ok\\n'\n";
 
 pub fn recipe() -> Recipe {
     let mut steps = unpack_into("make-mesboot0-source", "{src}");
+    // Host-search-path patch (re #469, priority 2). config.h points make's
+    // INCLUDEDIR/LIBDIR at {out}, but GNU Make ALSO hardcodes host defaults that
+    // config.h never overrides: read.c's default_include_directories[] appends
+    // /usr/gnu/include, /usr/local/include, /usr/include after INCLUDEDIR, and
+    // remake.c's library_search dirs[] prepends /lib, /usr/lib before LIBDIR. A
+    // built make would carry those host paths in its .rodata and search them at
+    // run time. Delete the hardcoded entries (host-free, via SubstituteText — no
+    // sed), leaving each array = { <macro>, 0 } so the ONLY search path is the
+    // {out} one config.h supplies. Count-checked: each block is unique (expect 1).
+    steps.push(Step::substitute_text(
+        "{src}/read.c",
+        vec![TextEdit::new(
+            "#ifndef _AMIGA\n    \"/usr/gnu/include\",\n    \"/usr/local/include\",\n    \"/usr/include\",\n#endif\n",
+            "",
+            1,
+        )],
+    ));
+    steps.push(Step::substitute_text(
+        "{src}/remake.c",
+        vec![TextEdit::new(
+            "#ifndef _AMIGA\n      \"/lib\",\n      \"/usr/lib\",\n#endif\n",
+            "",
+            1,
+        )],
+    ));
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
     });
@@ -88,6 +114,10 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/make".into()],
         exec: true,
     });
+    // Runtime provenance (re #469): config.h builds make with `CC='tcc -static'`,
+    // so it must carry no host loader (PT_INTERP) or host libc (DT_NEEDED) — a
+    // dynamically linked make would pull a host glibc in at run time. Red here.
+    steps.push(Step::assert_static(&["{out}/bin/make"]));
     Recipe::mesboot("make-mesboot0", "3.80")
         .source_input("make-mesboot0-source")
         .native_inputs(&["stage0", "mes", "tcc"])

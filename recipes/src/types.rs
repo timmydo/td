@@ -166,6 +166,17 @@ pub enum Step {
         file: String,
         edits: Vec<TextEdit>,
     },
+    /// Assert each product is a FULLY STATIC ELF — no `PT_INTERP` (host loader),
+    /// no `DT_NEEDED` (host libc), no `DT_RPATH`/`DT_RUNPATH` — the runtime-
+    /// provenance gate for the pre-libc rungs (re #469). tcc/make/yacc are all
+    /// linked `-static`; a regression that reintroduced a program interpreter or
+    /// a `libc.so` dependency would drag a host loader + glibc back in at run
+    /// time — exactly the host-runtime ingress #469 closes. This reds the rung,
+    /// naming the offending binary and leak, so the leak never reaches a later
+    /// rung. Fails closed on a non-ELF too (the parser rejects bad magic).
+    AssertStatic {
+        paths: Vec<String>,
+    },
 }
 
 /// One literal edit within a [`Step::SubstituteText`]: replace every occurrence
@@ -213,6 +224,10 @@ impl Step {
             file: file.into(),
             edits,
         }
+    }
+    /// Assert `paths` are fully static ELF binaries (no host loader/libc/run-path).
+    pub fn assert_static(paths: &[&str]) -> Step {
+        Step::AssertStatic { paths: vs(paths) }
     }
     fn to_json(&self) -> Json {
         let pair_arr = |xs: &[(String, String)]| {
@@ -310,6 +325,10 @@ impl Step {
                     ("paths".into(), arr(paths)),
                     ("exec".into(), Json::Bool(*exec)),
                 ]),
+            )]),
+            Step::AssertStatic { paths } => Json::Obj(vec![(
+                "assertStatic".into(),
+                Json::Obj(vec![("paths".into(), arr(paths))]),
             )]),
             Step::SubstituteText { file, edits } => Json::Obj(vec![(
                 "substituteText".into(),

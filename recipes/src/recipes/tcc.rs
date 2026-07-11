@@ -83,6 +83,10 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/tcc".into()],
         exec: true,
     });
+    // Runtime provenance (re #469): the built tcc is linked `-static`, so it must
+    // carry no host loader (PT_INTERP) or host libc (DT_NEEDED) — else it would
+    // drag a host glibc in at run time. Red the rung here if that regresses.
+    steps.push(Step::assert_static(&["{out}/bin/tcc"]));
     Recipe::mesboot("tcc", "0.9.26-1149-g46a75d0c")
         .source_input("tcc-source")
         .native_inputs(&["stage0", "mes"])

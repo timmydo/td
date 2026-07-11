@@ -99,6 +99,10 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/yacc".into()],
         exec: true,
     });
+    // Runtime provenance (re #469): the oyacc.mk link line is `-static`, so yacc
+    // must carry no host loader (PT_INTERP) or host libc (DT_NEEDED) — else it
+    // would drag a host glibc in at run time. Red the rung here if that regresses.
+    steps.push(Step::assert_static(&["{out}/bin/yacc"]));
 
     // Smoke: the installed yacc must RUN and regenerate a parser from a grammar
     // (writes its scratch under the sandbox's /tmp, then y.tab.{c,h} in cwd).
