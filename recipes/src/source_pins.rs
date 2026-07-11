@@ -197,6 +197,15 @@ const PINS: &[PinDef] = &[
         file: "nyacc-1.00.2.tar.gz",
     },
     PinDef {
+        key: "oyacc-source",
+        aliases: &[],
+        // OpenBSD yacc, portable release (ibara/yacc). Same version live-bootstrap
+        // builds under tcc+mes-libc to regenerate bash's parser (re #469).
+        url: "https://github.com/ibara/yacc/releases/download/oyacc-6.6/oyacc-6.6.tar.gz",
+        sha256: "eb0866e740b79bd3a23e0ca47885eb3148aab18d77a4bedba96e979d8b4ebfe1",
+        file: "oyacc-6.6.tar.gz",
+    },
+    PinDef {
         key: "patch-mesboot-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/patch/patch-2.5.9.tar.gz",
@@ -260,7 +269,9 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        assert_eq!(all().len(), 32);
+        // 32 migrated legacy locks + oyacc-6.6 (the from-source `yacc` the bash
+        // bootstrap shell needs to regenerate its parser, re #469).
+        assert_eq!(all().len(), 33);
     }
 
     #[test]
