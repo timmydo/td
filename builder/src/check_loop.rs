@@ -1127,32 +1127,38 @@ fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
     out
 }
 
-/// td-fetch's OWN crate closure (native since this port — was
+/// Warm a td crate's OWN dependency closure (native since this port — was
 /// tools/warm-td-fetch-crates.sh, the prelude's last `sh tools/…` spawn;
 /// #318 axis 2): host-side NETWORK PREP that GETs each `.crate` of
-/// fetch/Cargo.lock GUIX-FREE with td's OWN fetcher (td-fetch), pinned by the
-/// UPSTREAM lock checksum (NOT a guix artifact), into the flat vendor dir the
-/// td-fetch recipe check interns and builds td-fetch from (TD_VENDOR_DIR).
-/// td-fetch does every GET — td dogfoods its own fetcher, and td-fetch honors
+/// `LOCK_REL`'s Cargo.lock GUIX-FREE with td's OWN fetcher (td-fetch), pinned
+/// by the UPSTREAM lock checksum (NOT a guix artifact), into the flat vendor
+/// dir the crate's recipe check interns and builds from (TD_VENDOR_DIR):
+/// `.td-build-cache/crate-vendor/NAME`. The fetcher is always td-fetch — td
+/// dogfoods its own fetcher for every td-tool closure — and it honors
 /// TD_FEED_BASE so the reads route through the shared feed when it is up.
 /// Best-effort like every warm (no td-fetch binary / no network → warn and
 /// return; the gate reports if it actually runs cold), and the whole warm —
 /// cargo fallback included — shares ONE warm_timeout_secs budget exactly as
 /// the shell's single `timeout` over the script did: one hung mirror must
 /// not stall the prelude.
-fn warm_td_fetch_crates(root: &Path) {
-    let lock_path = root.join("fetch/Cargo.lock");
+///
+/// NAME selects both the vendor subdir and the log label ("td-fetch",
+/// "td-sh"). td-sh (the brush-shell wrapper, re #469) rides this exact path so
+/// its 316-crate closure is a declared offline vendor set before any rung
+/// declares td-sh — a live crates.io resolution is not a fixed-output fetch.
+fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
+    let lock_path = root.join(lock_rel);
     let Ok(lock) = std::fs::read_to_string(&lock_path) else {
         eprintln!(
-            "td-builder check: warm td-fetch crates: no {} — skipping",
+            "td-builder check: warm {name} crates: no {} — skipping",
             lock_path.display()
         );
         return;
     };
-    let dest = root.join(".td-build-cache/crate-vendor/td-fetch");
+    let dest = root.join(format!(".td-build-cache/crate-vendor/{name}"));
     if std::fs::create_dir_all(&dest).is_err() {
         eprintln!(
-            "td-builder check: warm td-fetch crates: cannot create {} — skipping",
+            "td-builder check: warm {name} crates: cannot create {} — skipping",
             dest.display()
         );
         return;
@@ -1168,23 +1174,23 @@ fn warm_td_fetch_crates(root: &Path) {
     )
     .or_else(|| host_cargo_bin(root, "fetch", "td-fetch", deadline)) else {
         eprintln!(
-            "td-builder check: warm td-fetch crates: no td-fetch binary — skipping (PREP best-effort)"
+            "td-builder check: warm {name} crates: no td-fetch binary — skipping (PREP best-effort)"
         );
         return;
     };
     let mut complete = true;
-    for (name, ver, sum) in parse_lock_checksums(&lock) {
-        let nv = format!("{name}-{ver}");
+    for (crate_name, ver, sum) in parse_lock_checksums(&lock) {
+        let nv = format!("{crate_name}-{ver}");
         let out = dest.join(format!("{nv}.crate"));
         if crate::sha256::sha256_file(&out).ok().as_deref() == Some(sum.as_str()) {
             continue; // already warm + verified
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            eprintln!("td-builder check: warm td-fetch crates: TD_WARM_TIMEOUT budget exhausted — stopping");
+            eprintln!("td-builder check: warm {name} crates: TD_WARM_TIMEOUT budget exhausted — stopping");
             complete = false;
             break;
         }
-        let url = format!("https://static.crates.io/crates/{name}/{nv}.crate");
+        let url = format!("https://static.crates.io/crates/{crate_name}/{nv}.crate");
         // Pid-suffixed tmp: concurrent preludes (normal on this box) each
         // write their own, so one warm's rename never publishes bytes another
         // warm is still writing.
@@ -1209,7 +1215,7 @@ fn warm_td_fetch_crates(root: &Path) {
             let _ = std::fs::rename(&tmp, &out);
         } else {
             let _ = std::fs::remove_file(&tmp);
-            eprintln!("td-builder check: warm td-fetch crates: could not td-fetch/verify {nv}");
+            eprintln!("td-builder check: warm {name} crates: could not td-fetch/verify {nv}");
         }
     }
     let n = std::fs::read_dir(&dest)
@@ -1220,7 +1226,7 @@ fn warm_td_fetch_crates(root: &Path) {
         })
         .unwrap_or(0);
     eprintln!(
-        "td-builder check: warm td-fetch crates: {n} crates in {} (td-fetched, Cargo.lock-pinned, guix-free){}",
+        "td-builder check: warm {name} crates: {n} crates in {} (td-fetched, Cargo.lock-pinned, guix-free){}",
         dest.display(),
         if complete { "" } else { " — INCOMPLETE (TD_WARM_TIMEOUT exhausted)" }
     );
@@ -1231,7 +1237,10 @@ fn warm_td_fetch_crates(root: &Path) {
 /// batches of TD_WARM_JOBS exactly as the shell prelude did.
 fn heavy_warms(root: &Path) {
     // td-fetch's own crate closure (its own warm — not the cargo-proxy).
-    warm_td_fetch_crates(root);
+    warm_crate_closure(root, "fetch/Cargo.lock", "td-fetch");
+    // td-sh's brush closure (re #469): the offline vendor set a td-sh recipe
+    // builds from, warmed before any rung declares td-sh.
+    warm_crate_closure(root, "sh/Cargo.lock", "td-sh");
 
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
     // cargo build of feed/.
@@ -2263,6 +2272,33 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
             got.len() >= 70,
             "only {} checksummed packages parsed",
             got.len()
+        );
+        assert!(
+            got.iter()
+                .all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
+            "malformed triplet parsed from the real lock"
+        );
+    }
+
+    #[test]
+    fn parse_lock_checksums_covers_the_real_td_sh_lock() {
+        // td-sh's brush closure rides the same warm path (warm_crate_closure,
+        // re #469). The parser must see the large checksummed set — a lockfile
+        // that silently parsed empty would warm zero crates and the td-sh
+        // recipe build would run cold. The local `td-sh` package has no
+        // checksum, so the count is one short of the [[package]] total.
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../sh/Cargo.lock"))
+                .unwrap();
+        let got = parse_lock_checksums(&lock);
+        assert!(
+            got.len() >= 200,
+            "only {} checksummed packages parsed from sh/Cargo.lock",
+            got.len()
+        );
+        assert!(
+            got.iter().any(|(n, _, _)| n == "brush-shell"),
+            "brush-shell (td-sh's sole dependency) missing from the parsed closure"
         );
         assert!(
             got.iter()
