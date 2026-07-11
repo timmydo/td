@@ -944,4 +944,19 @@ mod tests {
             r#"{"buildSystem":"gnu","name":"stage0","sourceInput":"stage0-source","version":"1.9.1"}"#
         );
     }
+
+    // The wire contract builder::build::run_mesboot dispatches on ("mesBoot"
+    // + the three expandable fields) — a drift here strands the step.
+    #[test]
+    fn mes_boot_step_emits_the_engine_dispatch_shape() {
+        let s = Step::MesBoot {
+            source: "{in:mes-source}".into(),
+            nyacc: "{in:nyacc}".into(),
+            stage0: "{in:stage0}".into(),
+        };
+        assert_eq!(
+            s.to_json().to_canonical(),
+            r#"{"mesBoot":{"nyacc":"{in:nyacc}","source":"{in:mes-source}","stage0":"{in:stage0}"}}"#
+        );
+    }
 }

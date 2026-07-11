@@ -454,6 +454,17 @@ fn tee_stream(
     }
 }
 
+/// A phase-watched run_cmd for sibling modules (mes_boot): same supervision
+/// as every mesboot Run step, without exporting the Watch type.
+pub(crate) fn run_cmd_phase(
+    prog: &str,
+    args: &[&str],
+    cwd: &str,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    run_cmd(prog, args, cwd, envs, &WATCH_PHASE)
+}
+
 /// Run a command with a CLEAN environment (`envs` only), in `cwd`, echoing it to
 /// the build log. Fail-closed: a non-zero exit aborts the build. Supervised by
 /// `watch` (#308): the child runs in its OWN process group with stdout/stderr
@@ -470,17 +481,6 @@ fn tee_stream(
 /// pgroup). The gate runner's FALLBACK pgroup-RSS sampler, used only where no
 /// delegated cgroup exists, does lose sight of phase children for a build run
 /// in-gate — the per-process RLIMIT_DATA cap still binds each of them.
-/// A phase-watched run_cmd for sibling modules (mes_boot): same supervision
-/// as every mesboot Run step, without exporting the Watch type.
-pub(crate) fn run_cmd_phase(
-    prog: &str,
-    args: &[&str],
-    cwd: &str,
-    envs: &[(String, String)],
-) -> Result<(), String> {
-    run_cmd(prog, args, cwd, envs, &WATCH_PHASE)
-}
-
 fn run_cmd(
     prog: &str,
     args: &[&str],

@@ -444,7 +444,10 @@ fn obj_name(c: &str) -> String {
 }
 
 /// configure.sh's `subst`: replace each `@KEY@` with its value. Keys absent
-/// from the map stay literal, exactly like a sed expression list.
+/// from the map stay literal, exactly like a sed expression list. (This is
+/// replace-ALL where sed's unflagged `s,,,` replaces the first match per
+/// line — no pinned template repeats a key on a line, and the template pins
+/// red before the semantics could ever diverge.)
 fn subst(template: &Path, dest: &Path, map: &[(String, String)]) -> Result<(), String> {
     let body = String::from_utf8(read(template)?)
         .map_err(|_| format!("template {} is not UTF-8", template.display()))?;
@@ -458,6 +461,66 @@ fn subst(template: &Path, dest: &Path, map: &[(String, String)]) -> Result<(), S
 
 // ---- the rung -------------------------------------------------------------
 
+/// The upstream scripts this port TRANSCRIBES, pinned to the audited bytes
+/// (round-9 review): the port hardcodes what these files say — the
+/// `*_SOURCES` lists and their order, the flag blocks, the install tree, the
+/// `@VAR@` template keys, kaem.run's env contract and its final
+/// exec-bit-dropping `cp`. A REMOVED source already reds on the missing file,
+/// but an ADDED or REORDERED entry, a new flag, or a new template key would
+/// otherwise build silently against the stale transcription. So a source-pin
+/// bump that changes any of these refuses here, before anything compiles;
+/// re-audit the port against the new script, then update its pin.
+const PORTED_SCRIPT_PINS: [(&str, &str); 8] = [
+    (
+        "configure.sh",
+        "3f79a202ed711a1247eacded9ec31fc22d4e3b33bf6bb0e4ac2a318c8a89e6ae",
+    ),
+    (
+        "kaem.run",
+        "1de53bcdcadeb0555b79047b26cb70357c75079de848ad503f9d38631b8a440d",
+    ),
+    (
+        "build-aux/configure-lib.sh",
+        "3257f4f32f4314047475d17bc609e04b19fc2fbc89a600c169d083fb93f5bb2a",
+    ),
+    (
+        "build-aux/bootstrap.sh.in",
+        "0f508b40cb362cb3518cf3d8856cbaa30b5dc1667b8f429244aa3099dd16909f",
+    ),
+    (
+        "build-aux/install.sh.in",
+        "a3937a84783ad599d92846d3119efa0f21bffb1d5e76391bbeeefa16eaa11490",
+    ),
+    (
+        "scripts/mescc.in",
+        "0a1fc4e29aeed3dd4a2a7e025d3db717f522995e25e4cf46ff0f7ea68efa1bb1",
+    ),
+    (
+        "scripts/mesar.in",
+        "d0bae4ad0f74fd41278df15177951ea2ba5a9e64e7c0bb01c3a8ef79d13ef2fe",
+    ),
+    (
+        "scripts/mescc.scm.in",
+        "4eb5b4a139e940c2c0dc8bd1346cad58daeef7efb0e7e0eed2be3debc5b2b35f",
+    ),
+];
+
+fn verify_ported_scripts(top: &Path) -> Result<(), String> {
+    for (rel, want) in PORTED_SCRIPT_PINS {
+        let p = top.join(rel);
+        let got =
+            crate::sha256::sha256_file(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+        if got != want {
+            return Err(format!(
+                "mes tarball script {rel} hashes {got}, not the transcription baseline \
+                 {want}: mes_boot transcribes this script's contents, so a changed script \
+                 means the port must be re-audited (and its pin updated) before building"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build + install the mes rung: SOURCE/NYACC are the staged tarballs, STAGE0
 /// the staged stage0 output, OUT the store output dir. Runs in the sandbox
 /// cwd ({root}): the mes tree unpacks to `{root}/mes-src`, nyacc to
@@ -469,6 +532,7 @@ pub(crate) fn run(source: &str, nyacc: &str, stage0: &str, out: &str) -> Result<
     let nyacc_dir = cwd.join("nyacc");
     crate::tar::unpack_archive(Path::new(nyacc), &nyacc_dir, false)?;
 
+    verify_ported_scripts(&top)?;
     let version = read_configure_version(&top.join("configure.sh"))?;
     let cfg = Cfg {
         top,
@@ -599,7 +663,12 @@ fn configure(cfg: &Cfg) -> Result<(), String> {
 /// the in-script `mes-m2 -c '(display …)'` self-test, and `cp bin/mes-m2
 /// bin/mes`. PATH is stage0's bin (kaem resolves M2-Planet/M1/hex2/blood-elf
 /// and the mkdir/cp file tools there); the cpu vars pin the x86 target the
-/// script otherwise defaults.
+/// script otherwise defaults. Note the deleted recipe's tool farm linked
+/// M2-Planet/blood-elf to stage0's DISTRIBUTED `artifact/{M2,blood-elf-0}`;
+/// PATH here resolves them to the `bin/` copies stage0's own kaem run REBUILT
+/// from source — stronger provenance, and the resulting mes-m2 is
+/// byte-identical to the bash ladder's (mescc keeps `artifact/blood-elf-0`,
+/// matching what the deleted recipe's configure detected — see `mescc()`).
 fn kaem_phase(cfg: &Cfg) -> Result<(), String> {
     let stage0_bin = cfg.stage0.join("AMD64/bin");
     let envs: Vec<(String, String)> = vec![
@@ -810,7 +879,9 @@ fn gcc_source_lib_phase(cfg: &Cfg) -> Result<(), String> {
     {
         let ent = ent.map_err(|e| format!("read {}: {e}", crt_dir.display()))?;
         let name = ent.file_name();
-        let n = name.to_string_lossy();
+        let n = name
+            .to_str()
+            .ok_or_else(|| format!("non-UTF-8 name under {}", crt_dir.display()))?;
         if n.starts_with("crt") && n.ends_with(".c") {
             cp(&ent.path(), &dest.join(name.as_os_str()))?;
             found_crt = true;
@@ -900,4 +971,27 @@ fn install_phase(cfg: &Cfg) -> Result<(), String> {
     t(&top.join("module"), &site)?;
     let ccache = out.join(format!("lib/guile/{GUILE_EFFECTIVE_VERSION}/site-ccache"));
     t(&top.join("module"), &ccache)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The transcription tripwire refuses BEFORE building: a pinned script
+    // whose bytes drift from the audited baseline reds naming the file and
+    // the baseline, so a source-pin bump forces a port re-audit.
+    #[test]
+    fn ported_script_pins_refuse_a_drifted_script() {
+        let base = std::env::temp_dir().join(format!("td-mesboot-pins-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for (rel, _) in PORTED_SCRIPT_PINS {
+            let p = base.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, b"drifted\n").unwrap();
+        }
+        let err = verify_ported_scripts(&base).unwrap_err();
+        assert!(err.contains("transcription baseline"), "{err}");
+        assert!(err.contains("configure.sh"), "names the file: {err}");
+        let _ = fs::remove_dir_all(&base);
+    }
 }
