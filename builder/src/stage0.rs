@@ -340,6 +340,79 @@ pub(crate) fn bootstrap_stage0(
     Ok(dest)
 }
 
+/// The DERIVED builder-lineage registry dir (re #469 round-10 P0 #2): one
+/// record per NAR hash of a builder tree that `stage0_place` ITSELF compiled
+/// from this repo's builder/ source and placed. `ControlPlaneBuilder` typing
+/// REQUIRES a record here (`verify_builder_lineage` in main): content
+/// addressing (`authenticate_ca_db`) proves a TD_BUILDER_* tree's INTEGRITY,
+/// not its ORIGIN — `store-add-builder` is placement mechanics anyone can run
+/// over any self-addressed tree, so the origin claim must come from the one
+/// code path that actually produced the builder. Derived like the blessed
+/// seed-closure db (no argv/env-of-the-moment selects it per request), and in
+/// the same trust domain: a same-user writer can forge a record at the derived
+/// location; the daemon-owned provenance db is the #472 follow-on.
+pub(crate) fn builder_lineage_dir() -> Result<PathBuf, String> {
+    Ok(crate::check_loop::daemon_runtime_dir()?.join("builder-lineage"))
+}
+
+/// The registry filename for a `sha256:<hex>` NAR hash — validated so a db-
+/// supplied hash can never traverse out of the registry dir.
+fn lineage_key(nar_hash: &str) -> Result<String, String> {
+    let hex = nar_hash
+        .strip_prefix("sha256:")
+        .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| format!("builder lineage: malformed NAR hash `{nar_hash}'"))?;
+    Ok(hex.to_string())
+}
+
+/// Record lineage for a placed builder tree, keyed by its NAR hash. Idempotent
+/// (tmp + atomic rename): concurrent placers of the same bytes converge on the
+/// same record; a pre-existing record is left untouched.
+pub(crate) fn record_builder_lineage_in(
+    dir: &Path,
+    nar_hash: &str,
+    canonical: &str,
+    source_fp: &str,
+) -> Result<(), String> {
+    let key = lineage_key(nar_hash)?;
+    let f = dir.join(&key);
+    if f.is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let tmp = dir.join(format!("{key}.tmp.{}", std::process::id()));
+    std::fs::write(
+        &tmp,
+        format!("td-builder-lineage v1\ncanonical {canonical}\nsource-fp {source_fp}\n"),
+    )
+    .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &f)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), f.display()))
+}
+
+/// Is a lineage record present (and well-formed) for this NAR hash?
+pub(crate) fn builder_lineage_recorded_in(dir: &Path, nar_hash: &str) -> Result<bool, String> {
+    let f = dir.join(lineage_key(nar_hash)?);
+    match std::fs::read_to_string(&f) {
+        Ok(t) => Ok(t.starts_with("td-builder-lineage v1")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("read {}: {e}", f.display())),
+    }
+}
+
+/// Ensure the placed builder's lineage record exists: read the placement db's
+/// hashed row for CB and record it. Runs on BOTH the memo-hit and slow paths of
+/// `stage0_place`, so a placement made before the lineage registry existed is
+/// enrolled the next time it is resolved (warm caches keep working).
+fn ensure_builder_lineage(db: &Path, cb: &str, source_fp: &str) -> Result<(), String> {
+    let data = std::fs::read(db).map_err(|e| format!("read {}: {e}", db.display()))?;
+    let rows = crate::store_db_read::Db::open(data)?.hashes_by_path()?;
+    let hash = rows
+        .get(cb)
+        .ok_or_else(|| format!("builder db {} has no hashed row for {cb}", db.display()))?;
+    record_builder_lineage_in(&builder_lineage_dir()?, hash, cb, source_fp)
+}
+
 /// A valid memo: the recorded fingerprint matches AND the placement + db are
 /// present and intact. Returns the memoized canonical store path.
 fn stage0_memo_hit(meta: &Path, fp: &str, store: &Path, db: &Path) -> Option<String> {
@@ -386,6 +459,7 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
     // Fast path: a valid memo needs no lock (warm loops skip the compile AND
     // the lock wait).
     if let Some(cb) = stage0_memo_hit(&meta, &fp, &store, &db) {
+        ensure_builder_lineage(&db, &cb, &fp)?;
         return Ok(cb);
     }
 
@@ -404,6 +478,7 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
     // Double-checked: a placer that waited for the lock may now find the
     // holder's fresh memo — reuse it rather than rebuild+re-place.
     if let Some(cb) = stage0_memo_hit(&meta, &fp, &store, &db) {
+        ensure_builder_lineage(&db, &cb, &fp)?;
         return Ok(cb);
     }
 
@@ -449,6 +524,11 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
     }
     std::fs::write(&meta, format!("{fp}\n{cb}\n"))
         .map_err(|e| format!("write {}: {e}", meta.display()))?;
+    // The LINEAGE record (re #469 round-10 P0 #2): this is the only writer —
+    // the placement above was compiled from THIS repo's builder/ source by
+    // this very fn, which is exactly the origin claim `ControlPlaneBuilder`
+    // typing verifies against. `store-add-builder` alone mints no authority.
+    ensure_builder_lineage(&db, &cb, &fp)?;
 
     // 3. GC stale placements (#309): this slow path just placed the CURRENT
     //    stage0 and store-add-builder rewrote builder.db to reference ONLY it,
@@ -600,6 +680,27 @@ mod tests {
         // A memo whose placement bytes are gone must rebuild, not be trusted.
         std::fs::remove_dir_all(store.join("abc123-td-builder-0.1.0")).unwrap();
         assert_eq!(stage0_memo_hit(&meta, "fp1", &store, &db), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // re #469 round-10 P0 #2: the lineage registry round-trip — absent reads
+    // false (the verifier fails closed on it), a record persists idempotently,
+    // and a malformed hash can neither write nor read (no path traversal out
+    // of the registry dir).
+    #[test]
+    fn builder_lineage_registry_roundtrip_and_fail_closed() {
+        let d = scratch("lineage");
+        let dir = d.join("registry");
+        let h = format!("sha256:{}", "cd".repeat(32));
+        assert!(!builder_lineage_recorded_in(&dir, &h).unwrap());
+        record_builder_lineage_in(&dir, &h, "/gnu/store/x-td-builder-0.1.0", "fp").unwrap();
+        assert!(builder_lineage_recorded_in(&dir, &h).unwrap());
+        // Idempotent: a re-record of the same bytes is a no-op, never an error.
+        record_builder_lineage_in(&dir, &h, "/gnu/store/x-td-builder-0.1.0", "fp").unwrap();
+        // Malformed hashes are rejected before any filesystem access.
+        assert!(record_builder_lineage_in(&dir, "sha256:../escape", "c", "f").is_err());
+        assert!(builder_lineage_recorded_in(&dir, "md5:00").is_err());
+        assert!(builder_lineage_recorded_in(&dir, "sha256:").is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

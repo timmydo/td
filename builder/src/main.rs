@@ -1272,12 +1272,15 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
 /// The receipt SIDECAR of a persistent store db: `<db>.receipts/<drv-basename>.receipt`,
 /// written by `commit_scratch_to_store` from the receipt the engine issued at build
 /// time, keyed by the producing drv's store basename (content-addressed, so one
-/// receipt per distinct derivation).
+/// receipt per distinct derivation). The `.receipt` suffix is LOAD-BEARING:
+/// `authenticate_recipe_output_db` reads only `*.receipt` files, so a bare
+/// `<drv-basename>` name (the round-9 P1) made every engine-produced db fail
+/// `--recipe-output-db` intake — written and read paths must stay this one fn.
 fn persist_receipt_path(persist_db: &Path, deriver: &str) -> Option<std::path::PathBuf> {
     let base = deriver.rsplit('/').next().filter(|b| !b.is_empty())?;
     let mut dir = persist_db.as_os_str().to_owned();
     dir.push(".receipts");
-    Some(Path::new(&dir).join(base))
+    Some(Path::new(&dir).join(format!("{base}.receipt")))
 }
 
 /// Persistent-store build cache — like `cached_realization`, but keyed on a PERSISTENT
@@ -1869,9 +1872,44 @@ fn mem_available_gib() -> Option<f64> {
     None
 }
 
+/// LINEAGE-verify a builder override before it can carry `ControlPlaneBuilder`
+/// authority (re #469 round-10 P0 #2): `store-add-builder` + TD_BUILDER_* could
+/// register ANY self-content-addressed tree as the control-plane builder —
+/// content addressing (`authenticate_ca_db`) proves the tree's INTEGRITY, not
+/// that its bytes came from the permitted stage0 build. The placed tree's NAR
+/// hash (read from the placement db the caller supplied; the bind boundary
+/// re-hashes the staged bytes against that same db row, so a record for other
+/// bytes is authority for nothing) must have a lineage record that
+/// `stage0_place` — the one code path that compiles the builder from this
+/// repo's builder/ source — wrote at the DERIVED registry. Absent → fail
+/// closed. Called at BOTH `BuilderOverride` intake sites (the TD_BUILDER_* env
+/// read and build-recipe's argv triple), so no public channel mints the origin.
+fn verify_builder_lineage(ov: &BuilderOverride) -> Result<(), String> {
+    let data = std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?;
+    let rows = store_db_read::Db::open(data)?.hashes_by_path()?;
+    let hash = rows.get(&ov.canonical).ok_or_else(|| {
+        format!("builder db {} has no hashed row for {}", ov.db, ov.canonical)
+    })?;
+    let dir = stage0::builder_lineage_dir()?;
+    if stage0::builder_lineage_recorded_in(&dir, hash)? {
+        return Ok(());
+    }
+    Err(format!(
+        "provenance rejected: builder {} ({hash}) has no stage0 lineage record under {} — \
+         content addressing proves integrity, not origin: only a placement `td-builder \
+         stage0-place` itself compiled from this repo's builder/ source may be typed \
+         ControlPlaneBuilder (re #469)",
+        ov.canonical,
+        dir.display()
+    ))
+}
+
 /// The optional td-owned builder override from TD_BUILDER_PATH/STORE/DB (all three set
 /// together, or none) — the stage0 td-builder that a corpus drv names as its builder.
 /// Shared by the daemon and its spawned per-build children (which re-read the same env).
+/// The override is LINEAGE-verified here at intake (`verify_builder_lineage`): a
+/// self-content-addressed tree that `stage0-place` never produced cannot become
+/// the drv's builder, whatever env a daemon request carries.
 fn builder_override_from_env() -> Result<Option<BuilderOverride>, String> {
     let bp = std::env::var("TD_BUILDER_PATH").ok();
     let bs = std::env::var("TD_BUILDER_STORE").ok();
@@ -1879,11 +1917,13 @@ fn builder_override_from_env() -> Result<Option<BuilderOverride>, String> {
     match (&bp, &bs, &bd) {
         (Some(canonical), Some(store_dir), Some(db)) => {
             let base = canonical.rsplit('/').next().unwrap_or(canonical);
-            Ok(Some(BuilderOverride {
+            let ov = BuilderOverride {
                 canonical: canonical.clone(),
                 on_disk: format!("{store_dir}/{base}"),
                 db: db.clone(),
-            }))
+            };
+            verify_builder_lineage(&ov)?;
+            Ok(Some(ov))
         }
         (None, None, None) => Ok(None),
         _ => {
@@ -2462,6 +2502,82 @@ fn bless_seed_closure(seed_dir: &str, roots: &[String], out_db: &Path) -> Result
     Ok(regs.len())
 }
 
+/// The staging-boundary input policy (re #469 round-10 — the host-tool
+/// mandate): the builder accepts NO host tools. Enforced HERE at the one
+/// choke point every realize path goes through (build-plan, build-recipe, the
+/// daemon children) — not in any planner, because the daemon realizes drvs a
+/// planner never saw (the round-10 P0 #1: a crafted drv could select host
+/// bash/coreutils/tar/gzip from the blessed seed closure, or name host bash
+/// as its builder outright).
+///
+/// Three rules over the typed manifest:
+///   1. every closure item is vouched by a typed td-owned db (unchanged);
+///   2. the drv's BUILDER must itself be admissible executable provenance —
+///      the lineage-verified stage0 placement (`ControlPlaneBuilder`), a td
+///      recipe output (`RecipeOutput` — the td-sh direction: td-built tools
+///      may drive builds), or this very engine binary (SELF_TREE, the engine
+///      realizing with itself). A seed-store path — blessed or merely
+///      scannable — is never a builder;
+///   3. `BlessedSeedClosure` rows vouch ONLY the builder's own runtime
+///      closure (BUILDER_REACH — the glibc/gcc-lib the control-plane builder
+///      links until it self-hosts), never a drv input: host tools stopped
+///      being reachable as inputs when their only authority was the bless db.
+fn enforce_realize_input_policy(
+    drv_builder: &str,
+    roots: &[String],
+    closure: &[String],
+    builder_reach: &std::collections::BTreeSet<String>,
+    manifest: &sandbox::StageManifest,
+    self_tree: Option<&str>,
+) -> Result<(), String> {
+    let owns = |r: &str| {
+        drv_builder == r || drv_builder.strip_prefix(r).is_some_and(|t| t.starts_with('/'))
+    };
+    if !self_tree.is_some_and(owns) {
+        let admissible = roots.iter().any(|r| {
+            owns(r)
+                && manifest.get(r.as_str()).is_some_and(|si| {
+                    matches!(
+                        si.origin,
+                        sandbox::InputOrigin::ControlPlaneBuilder
+                            | sandbox::InputOrigin::RecipeOutput
+                    )
+                })
+        });
+        if !admissible {
+            return Err(format!(
+                "provenance rejected: drv builder {drv_builder} is not admissible executable \
+                 provenance (re #469) — a build may be driven only by the lineage-verified \
+                 control-plane builder, a td recipe output, or the engine itself; a host tool \
+                 is never a builder"
+            ));
+        }
+    }
+    for e in closure {
+        let (canonical, _) = sandbox::split_closure_entry(e);
+        match manifest.get(canonical) {
+            None => {
+                return Err(format!(
+                    "provenance rejected: closure item {canonical} has no td-owned store-db record (re #469) — every staged input must be vouched for by the plan's seed db, a prior step's td.db, a source/builder placement db, or the blessed seed-closure db"
+                ));
+            }
+            Some(si)
+                if matches!(si.origin, sandbox::InputOrigin::BlessedSeedClosure)
+                    && !builder_reach.contains(canonical) =>
+            {
+                return Err(format!(
+                    "provenance rejected: closure item {canonical} is blessed-seed bytes outside \
+                     the builder's own runtime closure (re #469) — host tools are not admissible \
+                     build inputs: a build may stage only td recipe outputs, pinned sources, and \
+                     the control-plane builder's runtime libs"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Realize DRV with NO guix-daemon and NO guix store DB: compute the input closure ITSELF by
 /// CONTENT-SCANNING the seed store dir(s) (the daemon's scanForReferences / `guix gc -R`,
 /// gate 290) — no `/var/guix/db` read — build it in the userns sandbox (build_and_register),
@@ -2576,6 +2692,14 @@ fn realize_drv(
         None => None,
     };
     let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // The closure slice reachable FROM THE DRV'S BUILDER (the builder tree plus
+    // its refs' transitive closures) — the ONLY slice `BlessedSeedClosure` rows
+    // may vouch (`enforce_realize_input_policy`, re #469 round-10): the blessed
+    // db exists to vouch the control-plane builder's own host-seed runtime
+    // closure (glibc/gcc-lib), never a host tool a drv selects as an input.
+    let mut builder_reach: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let builder_owns =
+        |r: &str| parsed.builder == r || parsed.builder.strip_prefix(r).is_some_and(|t| t.starts_with('/'));
     for r in &roots {
         // A td-interned tree (the recipe source OR the vendored-crate tree): no-ref
         // closure from its OWN db, the entry bound FROM on_disk (canonical\ton-disk).
@@ -2601,6 +2725,7 @@ fn realize_drv(
             (Some(ov), Some(bdb)) if r == &ov.canonical => {
                 for p in bdb.closure(r)? {
                     if p == ov.canonical {
+                        builder_reach.insert(p.clone());
                         closure.insert(format!("{p}\t{}", ov.on_disk));
                     } else {
                         for q in scan_closure_hybrid(
@@ -2609,18 +2734,25 @@ fn realize_drv(
                             &extra_refs,
                             std::slice::from_ref(&p),
                         )? {
+                            let (canon, _) = sandbox::split_closure_entry(&q);
+                            builder_reach.insert(canon.to_string());
                             closure.insert(q);
                         }
                     }
                 }
             }
             _ => {
+                let track = builder_owns(r);
                 for q in scan_closure_hybrid(
                     &mut scanner,
                     &on_disk,
                     &extra_refs,
                     std::slice::from_ref(r),
                 )? {
+                    if track {
+                        let (canon, _) = sandbox::split_closure_entry(&q);
+                        builder_reach.insert(canon.to_string());
+                    }
                     closure.insert(q);
                 }
             }
@@ -2674,14 +2806,14 @@ fn realize_drv(
     // for nothing by construction. The SAME assembly (assemble_input_manifest) feeds the
     // reuse gates' manifest digest, so a cache hit binds to this exact authority set.
     let manifest = assemble_input_manifest(extra_dbs, src_overrides, builder_override)?;
-    for e in &closure {
-        let (canonical, _) = sandbox::split_closure_entry(e);
-        if !manifest.contains_key(canonical) {
-            return Err(format!(
-                "provenance rejected: closure item {canonical} has no td-owned store-db record (re #469) — every staged input must be vouched for by the plan's seed db, a prior step's td.db, a source/builder placement db, or the blessed seed-closure db"
-            ));
-        }
-    }
+    enforce_realize_input_policy(
+        &parsed.builder,
+        &roots,
+        &closure,
+        &builder_reach,
+        &manifest,
+        self_store_path().ok().as_deref(),
+    )?;
     // The audit record beside closure.txt: what may stage, under which hash,
     // issued by WHICH provenance class (the origin column).
     let mut lines = String::new();
@@ -2769,14 +2901,20 @@ fn build_recipe(
     // td-builder td placed at `canonical` (store-add-builder), restored under store_dir,
     // refs in db — a binary guix never produced. The on-disk tree is the canonical
     // basename under store_dir. Omitted → the running guix-built binary.
-    let builder_override = builder_store.map(|(canonical, store_dir, db)| {
-        let base = canonical.rsplit('/').next().unwrap_or(canonical);
-        BuilderOverride {
-            canonical: canonical.to_string(),
-            on_disk: format!("{store_dir}/{base}"),
-            db: db.to_string(),
-        }
-    });
+    // LINEAGE-verified at this intake (`verify_builder_lineage`, re #469): the
+    // argv triple locates bytes but cannot type a tree `stage0-place` never
+    // produced as the control-plane builder.
+    let builder_override = builder_store
+        .map(|(canonical, store_dir, db)| {
+            let base = canonical.rsplit('/').next().unwrap_or(canonical);
+            let ov = BuilderOverride {
+                canonical: canonical.to_string(),
+                on_disk: format!("{store_dir}/{base}"),
+                db: db.to_string(),
+            };
+            verify_builder_lineage(&ov).map(|()| ov)
+        })
+        .transpose()?;
     // The builder store path: the td-placed stage0 (override) or, by default, the
     // running binary (self_store_path — the guix-built td-builder).
     let builder_path = match &builder_override {
@@ -6200,7 +6338,12 @@ fn main() -> ExitCode {
         // an empty reference set. This lets the loop use a td-BOOTSTRAPPED builder (stage0,
         // NEVER produced by guix) as a recipe's builder-of-record: build-recipe reads its
         // closure as OUT-DB.closure(path) (the builder + its DIRECT refs) ∪ the seed
-        // content-scan (those refs' transitive closures). No daemon, no guix. Usage:
+        // content-scan (those refs' transitive closures). No daemon, no guix.
+        // PLACEMENT ONLY — this verb mints NO authority (re #469 round-10 P0 #2):
+        // typing the placed tree `ControlPlaneBuilder` additionally requires the
+        // stage0 LINEAGE record only `stage0-place` writes (verify_builder_lineage
+        // at both BuilderOverride intakes), so registering an arbitrary
+        // self-content-addressed tree here gains a caller nothing. Usage:
         //   store-add-builder NAME TREE STORE-DIR OUT-DB SEED-STORE-DIR  (prints the store path)
         Some("store-add-builder") if args.len() == 7 => {
             let (name, tree, store_dir, out_db, seed_store) =
@@ -6837,6 +6980,11 @@ fn main() -> ExitCode {
         // one, and needs no new `guix build -e' packager site. The override is matched by
         // PATH (only the drv root equal to its canonical is re-keyed), so it is a harmless
         // no-op for a drv that does not name the stage0 (e.g. the guile probes of gate 358).
+        // The triple is LINEAGE-verified at intake (re #469 round-10): a per-request
+        // TD_BUILDER_* naming a tree `stage0-place` never produced fails closed, and
+        // the children's realize enforces the staging-boundary host-tool policy
+        // (enforce_realize_input_policy) — an arbitrary drv over the socket can no
+        // longer select blessed host tools as inputs or name one as its builder.
         // Usage:  daemon SOCKET STORE-DIR SCRATCH-BASE
         // The blessed seed-closure db is never an argument: build children
         // derive its location from the repo's seed-lock declarations
@@ -8809,6 +8957,150 @@ daemon build START (2/2 active)
         // Green: the engine-issued local-build receipt backing the row.
         std::fs::write(&receipt, body("sha256:deadbeef", "local-build")).unwrap();
         authenticate_recipe_output_db(&dbp).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // Round-9 P1 regression: the sidecar the ENGINE writes (persist_receipt_path)
+    // must be the very file authenticate_recipe_output_db reads — the reader
+    // accepts only `*.receipt`, and the pre-fix writer used the bare drv
+    // basename, so every engine-produced db failed `--recipe-output-db` intake.
+    #[test]
+    fn engine_written_receipts_pass_recipe_output_db_intake() {
+        let d = std::env::temp_dir().join(format!("td-receipt-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let out_path = format!("/td/store/{}-out-1.0", "b".repeat(32));
+        let deriver = format!("/td/store/{}-out-1.0.drv", "c".repeat(32));
+        let reg = OutputReg {
+            store_path: out_path.clone(),
+            nar_hash: "sha256:deadbeef".to_string(),
+            nar_size: 7,
+            refs: vec![],
+            deriver: deriver.clone(),
+        };
+        let db = d.join("ro.db");
+        write_output_db(std::slice::from_ref(&reg), &db).unwrap();
+        let expect = ReceiptExpect {
+            drv_sha256: "11".repeat(32),
+            manifest_sha256: "22".repeat(32),
+            builder: "b".to_string(),
+        };
+        let rp = persist_receipt_path(&db, &deriver).unwrap();
+        assert_eq!(
+            rp.extension().and_then(|e| e.to_str()),
+            Some("receipt"),
+            "the engine sidecar must carry the .receipt suffix the intake reader requires"
+        );
+        std::fs::create_dir_all(rp.parent().unwrap()).unwrap();
+        std::fs::write(&rp, receipt_text(&expect, std::slice::from_ref(&reg))).unwrap();
+        authenticate_recipe_output_db(&db.to_string_lossy()).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // re #469 round-10 P0 #1: the staging-boundary host-tool policy. The daemon
+    // realizes drvs no planner saw, so a crafted drv could (a) SELECT blessed
+    // host tools (bash/coreutils/tar/gzip live in the blessed seed closure) as
+    // inputs, or (b) name one as its BUILDER. Both must red at the bind
+    // boundary; the builder's own runtime closure (glibc/gcc-lib) must stay
+    // green — that is the only slice the bless db exists to vouch.
+    #[test]
+    fn blessed_seed_items_vouch_only_the_builder_runtime_closure() {
+        let builder_tree = format!("/gnu/store/{}-td-builder-0.1.0", "a".repeat(32));
+        let builder = format!("{builder_tree}/bin/td-builder");
+        let glibc = format!("/gnu/store/{}-glibc-2.41", "b".repeat(32));
+        let bash = format!("/gnu/store/{}-bash-5.2.37", "c".repeat(32));
+        let si = |origin| sandbox::StagedInput { nar_hash: "sha256:00".to_string(), origin };
+        let mut manifest = sandbox::StageManifest::new();
+        manifest.insert(builder_tree.clone(), si(sandbox::InputOrigin::ControlPlaneBuilder));
+        manifest.insert(glibc.clone(), si(sandbox::InputOrigin::BlessedSeedClosure));
+        manifest.insert(bash.clone(), si(sandbox::InputOrigin::BlessedSeedClosure));
+        let roots = vec![builder_tree.clone(), bash.clone()];
+        let reach: std::collections::BTreeSet<String> =
+            [builder_tree.clone(), glibc.clone()].into_iter().collect();
+        // Green: the builder plus its glibc runtime — the legitimate bless slice.
+        let ok_closure = vec![builder_tree.clone(), glibc.clone()];
+        enforce_realize_input_policy(&builder, &roots, &ok_closure, &reach, &manifest, None)
+            .unwrap();
+        // Red: the drv additionally selected blessed host bash as an INPUT.
+        let bad_closure = vec![builder_tree, glibc, bash];
+        let err =
+            enforce_realize_input_policy(&builder, &roots, &bad_closure, &reach, &manifest, None)
+                .unwrap_err();
+        assert!(err.contains("host tools are not admissible"), "{err}");
+    }
+
+    // re #469 round-10: builder-identity leg of the policy. A blessed host tool
+    // named as the drv's BUILDER reds even though its bytes are vouched and
+    // reachable; a RecipeOutput-typed executable (the td-sh direction) and the
+    // engine's own tree stay admissible.
+    #[test]
+    fn a_host_tool_is_never_a_drv_builder() {
+        let bash_tree = format!("/gnu/store/{}-bash-5.2.37", "c".repeat(32));
+        let builder = format!("{bash_tree}/bin/bash");
+        let si = |origin| sandbox::StagedInput { nar_hash: "sha256:00".to_string(), origin };
+        let mut manifest = sandbox::StageManifest::new();
+        manifest.insert(bash_tree.clone(), si(sandbox::InputOrigin::BlessedSeedClosure));
+        let roots = vec![bash_tree.clone()];
+        let reach: std::collections::BTreeSet<String> =
+            [bash_tree.clone()].into_iter().collect();
+        let closure = vec![bash_tree.clone()];
+        let err = enforce_realize_input_policy(&builder, &roots, &closure, &reach, &manifest, None)
+            .unwrap_err();
+        assert!(err.contains("not admissible executable provenance"), "{err}");
+        // A td recipe output IS an admissible builder.
+        let sh_tree = format!("/gnu/store/{}-td-sh-1.0", "d".repeat(32));
+        let sh = format!("{sh_tree}/bin/sh");
+        let mut m2 = sandbox::StageManifest::new();
+        m2.insert(sh_tree.clone(), si(sandbox::InputOrigin::RecipeOutput));
+        enforce_realize_input_policy(
+            &sh,
+            std::slice::from_ref(&sh_tree),
+            std::slice::from_ref(&sh_tree),
+            &std::collections::BTreeSet::new(),
+            &m2,
+            None,
+        )
+        .unwrap();
+        // The engine realizing with ITSELF is admissible (the self carve-out).
+        let self_tree = format!("/gnu/store/{}-td-builder-0.1.0", "e".repeat(32));
+        let self_builder = format!("{self_tree}/bin/td-builder");
+        enforce_realize_input_policy(
+            &self_builder,
+            &[],
+            &[],
+            &std::collections::BTreeSet::new(),
+            &sandbox::StageManifest::new(),
+            Some(&self_tree),
+        )
+        .unwrap();
+    }
+
+    // re #469 round-10 P0 #2: a self-content-addressed tree with NO stage0
+    // lineage record cannot be typed `ControlPlaneBuilder` — content addressing
+    // proves integrity, not that the bytes came from `stage0-place`'s own
+    // compile of this repo's builder/ source.
+    #[test]
+    fn an_unrecorded_builder_tree_cannot_be_typed_control_plane() {
+        let d = std::env::temp_dir().join(format!("td-lineage-intake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let canonical = format!("/gnu/store/{}-not-a-stage0-1.0", "f".repeat(32));
+        let reg = OutputReg {
+            store_path: canonical.clone(),
+            nar_hash: format!("sha256:{}", "ab".repeat(32)),
+            nar_size: 1,
+            refs: vec![],
+            deriver: String::new(),
+        };
+        let db = d.join("builder.db");
+        write_output_db(std::slice::from_ref(&reg), &db).unwrap();
+        let ov = BuilderOverride {
+            canonical,
+            on_disk: d.join("tree").display().to_string(),
+            db: db.display().to_string(),
+        };
+        let err = verify_builder_lineage(&ov).unwrap_err();
+        assert!(err.contains("no stage0 lineage record"), "{err}");
         std::fs::remove_dir_all(&d).ok();
     }
 
