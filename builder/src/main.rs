@@ -1276,6 +1276,9 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
 /// `authenticate_recipe_output_db` reads only `*.receipt` files, so a bare
 /// `<drv-basename>` name (the round-9 P1) made every engine-produced db fail
 /// `--recipe-output-db` intake — written and read paths must stay this one fn.
+/// A warm `/td/store` cache whose receipts predate this suffix simply MISSes
+/// once (the bare-named sidecar is no longer found) and rebuilds — safe and
+/// self-healing under content addressing, not a regression to chase.
 fn persist_receipt_path(persist_db: &Path, deriver: &str) -> Option<std::path::PathBuf> {
     let base = deriver.rsplit('/').next().filter(|b| !b.is_empty())?;
     let mut dir = persist_db.as_os_str().to_owned();
@@ -2530,10 +2533,16 @@ fn enforce_realize_input_policy(
     manifest: &sandbox::StageManifest,
     self_tree: Option<&str>,
 ) -> Result<(), String> {
+    // `r` owns the builder iff the builder path IS `r` or lives under `r/…`; the
+    // `starts_with('/')` guard blocks prefix confusion (`/gnu/store/abc` does not
+    // own `/gnu/store/abcd/…`), and the `!r.is_empty()` guard blocks the empty
+    // root, which would else own every absolute builder (`strip_prefix("")` is the
+    // whole path) — defensive: an empty root is not an admissible manifest entry.
     let owns = |r: &str| {
-        drv_builder == r || drv_builder.strip_prefix(r).is_some_and(|t| t.starts_with('/'))
+        !r.is_empty()
+            && (drv_builder == r || drv_builder.strip_prefix(r).is_some_and(|t| t.starts_with('/')))
     };
-    if !self_tree.is_some_and(owns) {
+    if !self_tree.filter(|t| !t.is_empty()).is_some_and(owns) {
         let admissible = roots.iter().any(|r| {
             owns(r)
                 && manifest.get(r.as_str()).is_some_and(|si| {
@@ -2698,8 +2707,14 @@ fn realize_drv(
     // db exists to vouch the control-plane builder's own host-seed runtime
     // closure (glibc/gcc-lib), never a host tool a drv selects as an input.
     let mut builder_reach: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let builder_owns =
-        |r: &str| parsed.builder == r || parsed.builder.strip_prefix(r).is_some_and(|t| t.starts_with('/'));
+    // Same prefix-safe + non-empty ownership test as enforce_realize_input_policy's
+    // `owns`: only a root that is (or contains) the drv's builder tree tracks into
+    // builder_reach, so the bless db vouches exactly the builder's runtime closure.
+    let builder_owns = |r: &str| {
+        !r.is_empty()
+            && (parsed.builder == r
+                || parsed.builder.strip_prefix(r).is_some_and(|t| t.starts_with('/')))
+    };
     for r in &roots {
         // A td-interned tree (the recipe source OR the vendored-crate tree): no-ref
         // closure from its OWN db, the entry bound FROM on_disk (canonical\ton-disk).

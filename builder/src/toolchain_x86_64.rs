@@ -309,6 +309,10 @@ impl RustInputs {
 /// `assemble_rust_tree` never reads (docs, rustfmt, clippy, …); the full unpack writes
 /// them to the build scratch only — the assemble step copies rustc/, cargo/, and
 /// rust-std-*/ into `$out`, so the extra members cost scratch bytes, never output bytes.
+/// NOTE at the next rust-pin bump: the engine tar reader caps a single entry at
+/// `tar::MAX_TAR_ENTRY_BYTES` (256 MiB) — a limit host `tar` never imposed. Today's
+/// members are well under it; a future release with a >256 MiB member (a fat
+/// libLLVM/debuginfo blob) would red here, and the cap would need raising in lockstep.
 fn unpack_rust_release(tarball: &Path, dest: &Path) -> Result<(), String> {
     crate::tar::unpack_archive(tarball, dest, false)?;
     // Guard the layout: every consumed member must have landed (a release-layout drift
@@ -1095,6 +1099,73 @@ mod tests {
 
     fn tmp(prefix: &str) -> PathBuf {
         mktemp_dir(prefix).expect("mktemp")
+    }
+
+    // A minimal uncompressed ustar archive of `(path, contents)` members —
+    // `unpack_archive` dispatches to its raw-tar reader when there is no
+    // compression magic, so this drives `unpack_rust_release` end to end with
+    // no gzip writer. One 512-byte header per member + content padded to 512,
+    // then two zero blocks.
+    fn ustar(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (path, body) in members {
+            let mut h = [0u8; 512];
+            let name = path.as_bytes();
+            h.get_mut(..name.len()).map(|s| s.copy_from_slice(name));
+            let put = |h: &mut [u8; 512], off: usize, s: &str| {
+                let b = s.as_bytes();
+                h.get_mut(off..off + b.len()).map(|d| d.copy_from_slice(b));
+            };
+            put(&mut h, 100, "0000644\0"); // mode
+            put(&mut h, 108, "0000000\0"); // uid
+            put(&mut h, 116, "0000000\0"); // gid
+            put(&mut h, 124, &format!("{:011o}\0", body.len())); // size
+            put(&mut h, 136, "00000000000\0"); // mtime
+            h.get_mut(156).map(|b| *b = b'0'); // typeflag: regular file
+            put(&mut h, 257, "ustar\0"); // magic
+            put(&mut h, 263, "00"); // version
+            // Checksum: sum of all bytes with the checksum field taken as spaces.
+            h.get_mut(148..156).map(|s| s.fill(b' '));
+            let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+            put(&mut h, 148, &format!("{sum:06o}\0 "));
+            out.extend_from_slice(&h);
+            out.extend_from_slice(body);
+            let pad = (512 - body.len() % 512) % 512;
+            out.extend(std::iter::repeat_n(0u8, pad));
+        }
+        out.extend(std::iter::repeat_n(0u8, 1024));
+        out
+    }
+
+    // re #469 round-10 P2: PR-tier coverage for the engine-native rust unpack
+    // (the recipe check is daily-tier). A well-formed release strips its top
+    // dir and lands rustc/cargo; a release missing cargo reds at the guard
+    // instead of three rungs later.
+    #[test]
+    fn unpack_rust_release_strips_top_and_guards_layout() {
+        let d = tmp("td-rust-unpack");
+        let top = "rust-1.96.0-x86_64-unknown-linux-gnu";
+        let good = d.join("good.tar");
+        fs::write(
+            &good,
+            ustar(&[
+                (&format!("{top}/rustc/bin/rustc"), b"#!rustc\n"),
+                (&format!("{top}/cargo/bin/cargo"), b"#!cargo\n"),
+            ]),
+        )
+        .expect("write good tar");
+        let out = d.join("good-out");
+        unpack_rust_release(&good, &out).expect("well-formed release unpacks");
+        assert!(out.join("rustc/bin/rustc").is_file(), "rustc not stripped into place");
+        assert!(out.join("cargo/bin/cargo").is_file(), "cargo not stripped into place");
+
+        // A release missing cargo reds at the existence guard.
+        let bad = d.join("bad.tar");
+        fs::write(&bad, ustar(&[(&format!("{top}/rustc/bin/rustc"), b"#!rustc\n")]))
+            .expect("write bad tar");
+        let err = unpack_rust_release(&bad, &d.join("bad-out")).unwrap_err();
+        assert!(err.contains("missing cargo/bin/cargo"), "{err}");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
