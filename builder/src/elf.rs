@@ -293,13 +293,11 @@ fn rpath_slots(b: &[u8]) -> Result<Option<RpathSlots>, String> {
 /// names a shared object the loader would pull in at run time), or `None` if the ELF has no
 /// PT_DYNAMIC or no DT_NEEDED at all. Mirrors `rpath_slots`: a fully static binary — the
 /// td-sh musl-seed contract — has neither a dynamic section nor any needed library.
-#[allow(dead_code)] // see DT_NEEDED: backs the pub API, dead until the td-sh verifier calls it
 struct NeededSlots {
     strtab_off: usize,  // file offset of .dynstr (DT_STRTAB vaddr mapped through PT_LOAD)
     offsets: Vec<u64>,  // string offset into .dynstr of each DT_NEEDED name
 }
 
-#[allow(dead_code)] // see DT_NEEDED: backs the pub API, dead until the td-sh verifier calls it
 fn needed_slots(b: &[u8]) -> Result<Option<NeededSlots>, String> {
     let elf = Elf::parse(b)?;
     let (doff, dsize) = match elf.segment_slot(PT_DYNAMIC, "PT_DYNAMIC")? {
@@ -513,7 +511,6 @@ pub fn set_rpath(path: &Path, new_rpath: &str) -> Result<(), String> {
 /// dynamic ELF that declares no needed libraries. This is td's OWN DT_NEEDED query so the
 /// td-sh musl-seed verification asserts "this binary links nothing" without shelling out to a
 /// host `readelf` (which would itself be host-executable ingress, re #469).
-#[allow(dead_code)] // see DT_NEEDED: staged for the td-sh static-build verifier (this PR)
 pub fn read_needed(path: &Path) -> Result<Vec<String>, String> {
     let b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let slots = match needed_slots(&b)? {
