@@ -150,6 +150,39 @@ pub enum Step {
         paths: Vec<String>,
         exec: bool,
     },
+    /// Apply literal, fail-closed text edits to a file in place — the host-free
+    /// stand-in for `patch`/`sed` (re #469: the sandbox ships neither, and
+    /// stage0's `replace` cannot carry the space-bearing, multi-line strings a
+    /// real patch hunk needs through kaem's quote-stripping tokenizer). Each
+    /// edit replaces EVERY occurrence of `from` with `to`, requiring exactly
+    /// `expect` occurrences first, so a drift in the pinned source — or a
+    /// transcription slip — reds the rung instead of silently doing nothing.
+    /// Edits apply in order (an edit sees the previous edits' result). Only
+    /// `file` is template-expanded; `from`/`to` are LITERAL source text, so C
+    /// braces and `{…}` pass through untouched.
+    SubstituteText {
+        file: String,
+        edits: Vec<TextEdit>,
+    },
+}
+
+/// One literal edit within a [`Step::SubstituteText`]: replace every occurrence
+/// of `from` with `to`, requiring exactly `expect` occurrences.
+#[derive(Clone)]
+pub struct TextEdit {
+    pub from: String,
+    pub to: String,
+    pub expect: usize,
+}
+
+impl TextEdit {
+    pub fn new(from: &str, to: &str, expect: usize) -> TextEdit {
+        TextEdit {
+            from: from.into(),
+            to: to.into(),
+            expect,
+        }
+    }
 }
 
 impl Step {
@@ -169,6 +202,13 @@ impl Step {
                 Step::Run { argv, env, dir }
             }
             other => other,
+        }
+    }
+    /// Apply a list of literal, count-checked [`TextEdit`]s to `file` in place.
+    pub fn substitute_text(file: &str, edits: Vec<TextEdit>) -> Step {
+        Step::SubstituteText {
+            file: file.into(),
+            edits,
         }
     }
     fn to_json(&self) -> Json {
@@ -266,6 +306,31 @@ impl Step {
                 Json::Obj(vec![
                     ("paths".into(), arr(paths)),
                     ("exec".into(), Json::Bool(*exec)),
+                ]),
+            )]),
+            Step::SubstituteText { file, edits } => Json::Obj(vec![(
+                "substituteText".into(),
+                Json::Obj(vec![
+                    ("file".into(), Json::Str(file.clone())),
+                    (
+                        "edits".into(),
+                        Json::Arr(
+                            edits
+                                .iter()
+                                .map(|e| {
+                                    Json::Obj(vec![
+                                        ("from".into(), Json::Str(e.from.clone())),
+                                        ("to".into(), Json::Str(e.to.clone())),
+                                        // The count rides as a string: the builder's
+                                        // JSON reader exposes only string/array/bool
+                                        // (numbers are parsed-but-unused), and this is
+                                        // an internal recipe→builder protocol.
+                                        ("expect".into(), Json::Str(e.expect.to_string())),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
                 ]),
             )]),
         }

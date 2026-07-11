@@ -1817,6 +1817,30 @@ impl StepCtx {
     }
 }
 
+/// Apply a `Step::SubstituteText`'s literal, count-checked edits to `content`
+/// (re #469's host-free `patch`/`sed`). Each `(from, to, expect)` requires
+/// EXACTLY `expect` occurrences of `from` — an empty `from` or a count mismatch
+/// reds the rung — then replaces them all. Edits apply in order, so a later
+/// edit sees the earlier ones' result. `file` names the file only for errors.
+fn apply_text_edits(
+    file: &str,
+    mut content: String,
+    edits: &[(String, String, usize)],
+) -> Result<String, String> {
+    for (j, (from, to, expect)) in edits.iter().enumerate() {
+        let at = |m: String| format!("substituteText {file} edit {}: {m}", j + 1);
+        if from.is_empty() {
+            return Err(at("empty `from' string".into()));
+        }
+        let n = content.matches(from.as_str()).count();
+        if n != *expect {
+            return Err(at(format!("`from' occurs {n}× (expected {expect})")));
+        }
+        content = content.replace(from.as_str(), to);
+    }
+    Ok(content)
+}
+
 /// Minimal glob for mesboot `glob:` argv elements: exactly one `*`, in the LAST
 /// path component (`DIR/PRE*SUF`). Returns full paths of matching entries.
 fn glob_one_star(pat: &str) -> Result<Vec<String>, String> {
@@ -2096,6 +2120,40 @@ pub fn run_mesboot() -> Result<(), String> {
                     return Err(err(format!("required product not an executable file: {p}")));
                 }
             }
+        } else if let Some(o) = step.get("substituteText") {
+            // Host-free `patch`/`sed` (re #469): literal, fail-closed text edits
+            // in pure Rust. Only `file` is template-expanded; `from`/`to` are
+            // literal source text (C braces / `{…}` pass through untouched).
+            // Each edit requires an exact occurrence count, so a drift in the
+            // pinned source reds the rung instead of silently no-op'ing; edits
+            // apply in order (each sees the previous edits' result).
+            let file = ctx.expand(&field(o, "file")?).map_err(err)?;
+            let edits_json = o
+                .get("edits")
+                .and_then(Json::as_arr)
+                .ok_or_else(|| err("substituteText: `edits' not an array".into()))?;
+            let mut edits: Vec<(String, String, usize)> = Vec::with_capacity(edits_json.len());
+            for (j, e) in edits_json.iter().enumerate() {
+                let where_ = |m: String| err(format!("substituteText edit {}: {m}", j + 1));
+                let from = e
+                    .get("from")
+                    .and_then(Json::as_str)
+                    .ok_or_else(|| where_("`from' missing or not a string".into()))?;
+                let to = e
+                    .get("to")
+                    .and_then(Json::as_str)
+                    .ok_or_else(|| where_("`to' missing or not a string".into()))?;
+                let expect: usize = e
+                    .get("expect")
+                    .and_then(Json::as_str)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| where_("`expect' missing or not a count".into()))?;
+                edits.push((from.to_string(), to.to_string(), expect));
+            }
+            let content = fs::read_to_string(&file)
+                .map_err(|e| err(format!("substituteText: read {file}: {e}")))?;
+            let out = apply_text_edits(&file, content, &edits).map_err(err)?;
+            fs::write(&file, out).map_err(|e| err(format!("substituteText: write {file}: {e}")))?;
         } else {
             return Err(err("unknown step kind".into()));
         }
@@ -2107,6 +2165,68 @@ pub fn run_mesboot() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn edit(from: &str, to: &str, expect: usize) -> (String, String, usize) {
+        (from.to_string(), to.to_string(), expect)
+    }
+
+    #[test]
+    fn text_edits_apply_in_order_and_are_literal() {
+        // A patch-shaped edit set: single-line swap, a multi-line hunk, and a
+        // replacement whose `from` contains C braces / `{…}` that must NOT be
+        // treated as templates.
+        let src = "extern char *__progname;\nif (x) { g(); }\n#include <paths.h>\nvolatile sig_atomic_t s;\n";
+        let out = apply_text_edits(
+            "defs.h",
+            src.to_string(),
+            &[
+                edit("extern char *__progname;", "char *__progname;", 1),
+                edit("if (x) { g(); }", "if (x) { h(); }", 1),
+                edit("#include <paths.h>", "#include <getopt.h>", 1),
+                edit("volatile sig_atomic_t s;", "volatile int s;", 1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "char *__progname;\nif (x) { h(); }\n#include <getopt.h>\nvolatile int s;\n"
+        );
+    }
+
+    #[test]
+    fn text_edits_replace_every_occurrence_when_count_matches() {
+        let out = apply_text_edits("f", "a a a".to_string(), &[edit("a", "b", 3)]).unwrap();
+        assert_eq!(out, "b b b");
+    }
+
+    #[test]
+    fn text_edits_sequential_edits_see_prior_result() {
+        // Edit 2's `from` only exists after edit 1 has run.
+        let out = apply_text_edits(
+            "f",
+            "one".to_string(),
+            &[edit("one", "two", 1), edit("two", "three", 1)],
+        )
+        .unwrap();
+        assert_eq!(out, "three");
+    }
+
+    #[test]
+    fn text_edits_fail_closed_on_count_mismatch() {
+        // Pinned source drifted (0 matches) — must red, not silently no-op.
+        let e = apply_text_edits("main.c", "nothing here".to_string(), &[edit("mkstemp", "mktemp", 1)])
+            .unwrap_err();
+        assert!(e.contains("occurs 0×") && e.contains("expected 1"), "{e}");
+        // Under-counted expectation (2 present, said 1) also reds.
+        let e2 = apply_text_edits("main.c", "fd fd".to_string(), &[edit("fd", "fname", 1)]).unwrap_err();
+        assert!(e2.contains("occurs 2×"), "{e2}");
+    }
+
+    #[test]
+    fn text_edits_reject_empty_from() {
+        let e = apply_text_edits("f", "x".to_string(), &[edit("", "y", 1)]).unwrap_err();
+        assert!(e.contains("empty `from'"), "{e}");
+    }
 
     /// The test-process bash + a PATH env for the child (scripts use sleep etc.).
     fn bash_and_env() -> (String, Vec<(String, String)>) {
