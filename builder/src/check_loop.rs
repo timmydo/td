@@ -1235,12 +1235,27 @@ fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
 /// The heavy-tier warm prelude: source-bootstrap tarballs + rust crate closures
 /// (td-feed), all BEST-EFFORT (the gates enforce presence), fanned out in
 /// batches of TD_WARM_JOBS exactly as the shell prelude did.
-fn heavy_warms(root: &Path) {
+/// The td-tool crate-closure warms (td-fetch, td-sh): host-side network PREP
+/// that populates the offline vendor sets `.td-build-cache/crate-vendor/{name}`
+/// BEFORE the chain that consumes them is provisioned. These MUST run ahead of
+/// `provision_userland` — the loop userland realizes the bootstrap chain
+/// (mes → tcc → … → busybox/make), and once tcc declares td-sh as its shell
+/// (re #469) that build reads the warmed `sh/Cargo.lock` closure. Gating the
+/// warm behind provisioning is the deadlock the review flagged: provisioning
+/// fails at the first host-bash rung, so a warm placed after it never runs and
+/// the cold bootstrap exits 69 with an empty td-sh vendor set. Best-effort
+/// (a missing fetcher / no network warns; the recipe checks enforce presence).
+fn warm_td_crate_closures(root: &Path) {
     // td-fetch's own crate closure (its own warm — not the cargo-proxy).
     warm_crate_closure(root, "fetch/Cargo.lock", "td-fetch");
     // td-sh's brush closure (re #469): the offline vendor set a td-sh recipe
     // builds from, warmed before any rung declares td-sh.
     warm_crate_closure(root, "sh/Cargo.lock", "td-sh");
+}
+
+fn heavy_warms(root: &Path) {
+    // The td-tool crate closures (td-fetch, td-sh) are warmed earlier, before
+    // provision_userland (warm_td_crate_closures) — not here.
 
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
     // cargo build of feed/.
@@ -1680,6 +1695,14 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // host-seed runtime closure (glibc/gcc-lib) — blessing only at daemon
     // ensure time (after userland) deadlocked a cold host (re #469 round-8).
     ensure_seed_bless(&root, &tb)?;
+    // Warm the td-tool crate closures (td-fetch, td-sh) BEFORE provisioning the
+    // userland: provisioning realizes the bootstrap chain that (re #469) builds
+    // td-sh as tcc's shell from the warmed closure, so the warm cannot be gated
+    // behind a step that fails at the first host-bash rung. Heavy tiers only,
+    // best-effort (recipe checks enforce presence).
+    if heavy_warm {
+        warm_td_crate_closures(&root);
+    }
     let ul = provision_userland(&root)?;
     let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path).map_err(|e| {
         CheckError::Fatal(fatal(&format!(
