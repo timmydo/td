@@ -1,0 +1,101 @@
+# td tcc rung build script (re #469).
+#
+# Runs under stage0's audited `kaem` seed (invoked by the engine), replacing the
+# tarball's bootstrap.sh/boot.sh (POSIX sh, which kaem cannot run: case/$()/test).
+# The engine does only generic orchestration (unpack, write config.h + this
+# script, mkdir the output dirs, copy the final tcc, assert it); the build
+# PROCEDURE is here. No host shell or coreutils: the only executables are the mes
+# rung's `mes` running upstream mescc.scm, and the tcc binaries this builds.
+#
+# Fixed target (recipe host=i686 -> mes_cpu=x86, tcc_cpu=i386, ONE_SOURCE): the
+# scripts collapse to one tcc.c compile unit per generation. Absolute {in:mes}/
+# {out} paths are td-expanded at stage time. MES_ARENA/MES_STACK/MES_PREFIX/
+# GUILE_LOAD_PATH/M1/HEX2/BLOOD_ELF/PATH are set by the step env. Compiles read
+# mes libc sources from {in:mes}/lib and write objects/archives straight into
+# {out}/lib (+ {out}/lib/tcc), which tcc's baked CONFIG_TCC_* search then finds --
+# so no cp/mkdir/rm applet is needed inside the script.
+#
+# Every tcc.c compile carries the quote-free -D block that bootstrap.sh/boot.sh
+# pass on the command line: inline= (mescc has no `inline` keyword), the four
+# CONFIG_* mode flags, and ONE_SOURCE=1. ONE_SOURCE MUST be a command-line -D,
+# not a config.h define: tcc.c tests `#ifdef ONE_SOURCE` (tcc.c:21) to #include
+# libtcc.c BEFORE it includes tcc.h/config.h, so a config.h define lands too late
+# and the link fails on an undefined tcc_realloc. The CONFIG_TCC_* string search
+# paths stay in config.h because kaem strips their C string-literal quotes.
+
+# ---- Phase 1: MesCC compiles tcc.c -> tcc.s, links tcc-mes ------------------
+{in:mes}/bin/mes --no-auto-compile -e main -L {in:mes}/share/guile/site/3.0 {in:mes}/bin/mescc.scm -- -S -o tcc.s -I . -I {in:mes}/lib -I {in:mes}/include -D BOOTSTRAP=1 -D TCC_TARGET_I386=1 -D inline= -D CONFIG_TCCBOOT=1 -D CONFIG_TCC_STATIC=1 -D CONFIG_USE_LIBGCC=1 -D TCC_MES_LIBC=1 -D ONE_SOURCE=1 tcc.c
+{in:mes}/bin/mes --no-auto-compile -e main -L {in:mes}/share/guile/site/3.0 {in:mes}/bin/mescc.scm -- -o tcc-mes -L {in:mes}/lib/x86-mes -L {in:mes}/lib tcc.s -l c+tcc
+
+# ---- Phase 2: rebuild crt/libc/libtcc1/libgetopt with tcc-mes into {out}/lib -
+./tcc-mes -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -static -nostdlib -nostdinc -c -o {out}/lib/crt1.o {in:mes}/lib/crt1.c
+./tcc-mes -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -static -nostdlib -nostdinc -c -o {out}/lib/crti.o {in:mes}/lib/crti.c
+./tcc-mes -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -static -nostdlib -nostdinc -c -o {out}/lib/crtn.o {in:mes}/lib/crtn.c
+./tcc-mes -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -c -o libc.o {in:mes}/lib/libc+gnu.c
+./tcc-mes -ar cr {out}/lib/libc.a libc.o
+./tcc-mes -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -c -o libtcc1.o {in:mes}/lib/libtcc1.c
+./tcc-mes -ar cr {out}/lib/tcc/libtcc1.a libtcc1.o
+./tcc-mes -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -c -o libgetopt.o {in:mes}/lib/libgetopt.c
+./tcc-mes -ar cr {out}/lib/libgetopt.a libgetopt.o
+
+# ---- Phase 3: self-host through boot.sh's generations ----------------------
+# Each generation links tcc from tcc.c with the prior tcc, then the new tcc
+# rebuilds crt/libtcc1 into {out}/lib. The -D ladder is boot.sh's program_suffix
+# logic: boot0 long-long STUB; boot1 real long-long + bitfield; boot2 float
+# STUB; boot3+ real float; every generation carries setjmp.
+
+# gen boot0 (caller tcc-mes)
+./tcc-mes -g -v -static -o tcc-boot0 -D BOOTSTRAP=1 -D HAVE_LONG_LONG_STUB=1 -D HAVE_SETJMP=1 -I . -I {in:mes}/lib -I {in:mes}/include -D TCC_TARGET_I386=1 -D inline= -D CONFIG_TCCBOOT=1 -D CONFIG_TCC_STATIC=1 -D CONFIG_USE_LIBGCC=1 -D TCC_MES_LIBC=1 -D ONE_SOURCE=1 -L . tcc.c
+./tcc-boot0 -c -g -o {out}/lib/crt1.o {in:mes}/lib/crt1.c
+./tcc-boot0 -c -g -o {out}/lib/crti.o {in:mes}/lib/crti.c
+./tcc-boot0 -c -g -o {out}/lib/crtn.o {in:mes}/lib/crtn.c
+./tcc-boot0 -c -g -D TCC_TARGET_I386=1 -D HAVE_FLOAT=1 -o libtcc1.o {in:mes}/lib/libtcc1.c
+./tcc-boot0 -ar cr {out}/lib/tcc/libtcc1.a libtcc1.o
+
+# gen boot1 (caller tcc-boot0)
+./tcc-boot0 -g -v -static -o tcc-boot1 -D BOOTSTRAP=1 -D HAVE_BITFIELD=1 -D HAVE_LONG_LONG=1 -D HAVE_SETJMP=1 -I . -I {in:mes}/lib -I {in:mes}/include -D TCC_TARGET_I386=1 -D inline= -D CONFIG_TCCBOOT=1 -D CONFIG_TCC_STATIC=1 -D CONFIG_USE_LIBGCC=1 -D TCC_MES_LIBC=1 -D ONE_SOURCE=1 -L . tcc.c
+./tcc-boot1 -c -g -o {out}/lib/crt1.o {in:mes}/lib/crt1.c
+./tcc-boot1 -c -g -o {out}/lib/crti.o {in:mes}/lib/crti.c
+./tcc-boot1 -c -g -o {out}/lib/crtn.o {in:mes}/lib/crtn.c
+./tcc-boot1 -c -g -D TCC_TARGET_I386=1 -D HAVE_FLOAT=1 -o libtcc1.o {in:mes}/lib/libtcc1.c
+./tcc-boot1 -ar cr {out}/lib/tcc/libtcc1.a libtcc1.o
+
+# gen boot2 (caller tcc-boot1)
+./tcc-boot1 -g -v -static -o tcc-boot2 -D BOOTSTRAP=1 -D HAVE_BITFIELD=1 -D HAVE_FLOAT_STUB=1 -D HAVE_LONG_LONG=1 -D HAVE_SETJMP=1 -I . -I {in:mes}/lib -I {in:mes}/include -D TCC_TARGET_I386=1 -D inline= -D CONFIG_TCCBOOT=1 -D CONFIG_TCC_STATIC=1 -D CONFIG_USE_LIBGCC=1 -D TCC_MES_LIBC=1 -D ONE_SOURCE=1 -L . tcc.c
+./tcc-boot2 -c -g -o {out}/lib/crt1.o {in:mes}/lib/crt1.c
+./tcc-boot2 -c -g -o {out}/lib/crti.o {in:mes}/lib/crti.c
+./tcc-boot2 -c -g -o {out}/lib/crtn.o {in:mes}/lib/crtn.c
+./tcc-boot2 -c -g -D TCC_TARGET_I386=1 -D HAVE_FLOAT=1 -o libtcc1.o {in:mes}/lib/libtcc1.c
+./tcc-boot2 -ar cr {out}/lib/tcc/libtcc1.a libtcc1.o
+
+# gen boot3 (caller tcc-boot2)
+./tcc-boot2 -g -v -static -o tcc-boot3 -D BOOTSTRAP=1 -D HAVE_BITFIELD=1 -D HAVE_FLOAT=1 -D HAVE_LONG_LONG=1 -D HAVE_SETJMP=1 -I . -I {in:mes}/lib -I {in:mes}/include -D TCC_TARGET_I386=1 -D inline= -D CONFIG_TCCBOOT=1 -D CONFIG_TCC_STATIC=1 -D CONFIG_USE_LIBGCC=1 -D TCC_MES_LIBC=1 -D ONE_SOURCE=1 -L . tcc.c
+./tcc-boot3 -c -g -o {out}/lib/crt1.o {in:mes}/lib/crt1.c
+./tcc-boot3 -c -g -o {out}/lib/crti.o {in:mes}/lib/crti.c
+./tcc-boot3 -c -g -o {out}/lib/crtn.o {in:mes}/lib/crtn.c
+./tcc-boot3 -c -g -D TCC_TARGET_I386=1 -D HAVE_FLOAT=1 -o libtcc1.o {in:mes}/lib/libtcc1.c
+./tcc-boot3 -ar cr {out}/lib/tcc/libtcc1.a libtcc1.o
+
+# gen boot4 (caller tcc-boot3)
+./tcc-boot3 -g -v -static -o tcc-boot4 -D BOOTSTRAP=1 -D HAVE_BITFIELD=1 -D HAVE_FLOAT=1 -D HAVE_LONG_LONG=1 -D HAVE_SETJMP=1 -I . -I {in:mes}/lib -I {in:mes}/include -D TCC_TARGET_I386=1 -D inline= -D CONFIG_TCCBOOT=1 -D CONFIG_TCC_STATIC=1 -D CONFIG_USE_LIBGCC=1 -D TCC_MES_LIBC=1 -D ONE_SOURCE=1 -L . tcc.c
+./tcc-boot4 -c -g -o {out}/lib/crt1.o {in:mes}/lib/crt1.c
+./tcc-boot4 -c -g -o {out}/lib/crti.o {in:mes}/lib/crti.c
+./tcc-boot4 -c -g -o {out}/lib/crtn.o {in:mes}/lib/crtn.c
+./tcc-boot4 -c -g -D TCC_TARGET_I386=1 -D HAVE_FLOAT=1 -o libtcc1.o {in:mes}/lib/libtcc1.c
+./tcc-boot4 -ar cr {out}/lib/tcc/libtcc1.a libtcc1.o
+
+# final gen -> tcc (caller tcc-boot4); tcc-boot5 in boot.sh, installed as tcc
+./tcc-boot4 -g -v -static -o tcc -D BOOTSTRAP=1 -D HAVE_BITFIELD=1 -D HAVE_FLOAT=1 -D HAVE_LONG_LONG=1 -D HAVE_SETJMP=1 -I . -I {in:mes}/lib -I {in:mes}/include -D TCC_TARGET_I386=1 -D inline= -D CONFIG_TCCBOOT=1 -D CONFIG_TCC_STATIC=1 -D CONFIG_USE_LIBGCC=1 -D TCC_MES_LIBC=1 -D ONE_SOURCE=1 -L . tcc.c
+
+# ---- Phase 4: final lib rebuild with the installed tcc ---------------------
+# libtcc1 now from tcc's own lib/libtcc1.c (bootstrap.sh tail).
+./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -g -static -nostdlib -nostdinc -c -o {out}/lib/crt1.o {in:mes}/lib/crt1.c
+./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -g -static -nostdlib -nostdinc -c -o {out}/lib/crti.o {in:mes}/lib/crti.c
+./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -g -static -nostdlib -nostdinc -c -o {out}/lib/crtn.o {in:mes}/lib/crtn.c
+./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -c -g -o libc.o {in:mes}/lib/libc+gnu.c
+./tcc -ar cr {out}/lib/libc.a libc.o
+./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -c -g -D TCC_TARGET_I386=1 -o libtcc1.o lib/libtcc1.c
+./tcc -ar cr {out}/lib/tcc/libtcc1.a libtcc1.o
+./tcc -ar cr {out}/lib/libtcc1.a libtcc1.o
+./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -c -g -o libgetopt.o {in:mes}/lib/libgetopt.c
+./tcc -ar cr {out}/lib/libgetopt.a libgetopt.o
