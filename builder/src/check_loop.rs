@@ -279,6 +279,15 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
          chain from the seed first (hours, once)",
         LOOP_USERLAND_STEMS.join(" ")
     );
+    // Cold-cache branch (map miss): warm the td-tool crate closures (td-fetch,
+    // td-sh) BEFORE the build-run that consumes them. This is where cold runs
+    // of EVERY tier pass — light tiers too — so the td-sh brush closure is
+    // vendored offline whenever the chain is (re-)provisioned from cold, not
+    // only on the heavy warm prelude. A warm-map hit returned above, so this
+    // never re-warms an already-provisioned userland. Best-effort (the recipe
+    // check enforces presence); once tcc declares td-sh as its shell the
+    // build-run below reads this warmed closure.
+    warm_td_crate_closures(root);
     let mut cmd = Command::new(&eval);
     cmd.arg("build-run").arg("busybox-x86-64");
     for stem in LOOP_USERLAND_STEMS {
@@ -1695,14 +1704,6 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // host-seed runtime closure (glibc/gcc-lib) — blessing only at daemon
     // ensure time (after userland) deadlocked a cold host (re #469 round-8).
     ensure_seed_bless(&root, &tb)?;
-    // Warm the td-tool crate closures (td-fetch, td-sh) BEFORE provisioning the
-    // userland: provisioning realizes the bootstrap chain that (re #469) builds
-    // td-sh as tcc's shell from the warmed closure, so the warm cannot be gated
-    // behind a step that fails at the first host-bash rung. Heavy tiers only,
-    // best-effort (recipe checks enforce presence).
-    if heavy_warm {
-        warm_td_crate_closures(&root);
-    }
     let ul = provision_userland(&root)?;
     let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path).map_err(|e| {
         CheckError::Fatal(fatal(&format!(
