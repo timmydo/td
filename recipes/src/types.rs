@@ -114,17 +114,6 @@ pub enum Step {
         nyacc: String,
         stage0: String,
     },
-    /// The ENGINE-NATIVE tcc bootstrap rung (builder's `tcc_boot::run`, re
-    /// #469): the Rust port of the tcc tarball's configure, bootstrap.sh, and
-    /// boot.sh. MesCC (the mes rung output) compiles the first tcc, which
-    /// self-hosts through six generations. The only subprocesses are recipe
-    /// outputs (mes running mescc.scm, stage0's M1/hex2/blood-elf, and the
-    /// just-built tcc binaries) — the rung declares NO host shell or coreutils.
-    TccBoot {
-        source: String,
-        mes: String,
-        stage0: String,
-    },
     /// Copy files (flat) into dest, made user-writable (build trees are written into).
     CopyFiles {
         files: Vec<String>,
@@ -233,18 +222,6 @@ impl Step {
                 Json::Obj(vec![
                     ("source".into(), Json::Str(source.clone())),
                     ("nyacc".into(), Json::Str(nyacc.clone())),
-                    ("stage0".into(), Json::Str(stage0.clone())),
-                ]),
-            )]),
-            Step::TccBoot {
-                source,
-                mes,
-                stage0,
-            } => Json::Obj(vec![(
-                "tccBoot".into(),
-                Json::Obj(vec![
-                    ("source".into(), Json::Str(source.clone())),
-                    ("mes".into(), Json::Str(mes.clone())),
                     ("stage0".into(), Json::Str(stage0.clone())),
                 ]),
             )]),

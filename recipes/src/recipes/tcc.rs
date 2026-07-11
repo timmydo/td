@@ -1,35 +1,88 @@
+use crate::ladder::{SH, base_inputs, base_path, sed_i, unpack_into};
 use crate::types::{Recipe, Step};
 
-// TinyCC (mes fork, 0.9.26-1149-g46a75d0c) — bootstrap rung 3 (#378), guix's
-// tcc-boot0. The build is the ENGINE's tcc_boot::run (re #469): the Rust port of
-// the tcc tarball's configure/bootstrap.sh/boot.sh. MesCC (the mes rung output)
-// compiles the first tcc, which self-hosts through six generations to the
-// installed tcc + libc.a/libtcc1.a/crt objects at {out}. The rung declares NO
-// host tools — its only inputs are the stage0 and mes recipe outputs (and the
-// tcc source), the second rung with an empty BASE_TOOLS footprint.
+// TinyCC (mes fork, 0.9.26-1149-g46a75d0c) — bootstrap rung 3 (#378): MesCC
+// builds tcc (guix's tcc-boot0). Faithful port of the deleted build_tcc fn.
+// prefix={out} bakes tcc's crt search at {out}/lib (the binutils rung's proven
+// contract: crt via the baked prefix, libc via LIBRARY_PATH, headers via
+// C_INCLUDE_PATH); the built tcc + libs install there.
 pub fn recipe() -> Recipe {
-    let steps = vec![
-        Step::TccBoot {
-            source: "{in:tcc-source}".into(),
-            mes: "{in:mes}".into(),
-            stage0: "{in:stage0}".into(),
-        },
-        Step::Require {
-            paths: vec![
-                "{out}/bin/tcc".into(),
-                "{out}/lib/libc.a".into(),
-                "{out}/lib/libtcc1.a".into(),
-                "{out}/lib/crt1.o".into(),
-            ],
-            exec: false,
-        },
-        Step::Require {
-            paths: vec!["{out}/bin/tcc".into()],
-            exec: true,
-        },
-    ];
+    let path = base_path();
+    let common = |s: Step| -> Step {
+        s.env("PATH", &path)
+            .env("MES_PREFIX", "{in:mes}")
+            .env("GUILE_LOAD_PATH", "{in:mes}/share/guile/site/3.0")
+            .env("host", "i686-linux-gnu")
+            .env("ONE_SOURCE", "true")
+            .env("prefix", "{out}")
+    };
+    let mut steps = unpack_into("tcc-source", "{src}");
+    // mes's installed mescc wrapper ships a neutral /bin/sh shebang (the mes
+    // rung declares no shell, re #469); this rung still declares bash, so
+    // stage a private COPY with the shebang patched onto it — the store input
+    // itself is read-only. The farm links mescc to that copy.
+    steps.push(Step::CopyFiles {
+        files: vec!["{in:mes}/bin/mescc".into()],
+        dest: "{root}/mescc-bin".into(),
+    });
+    steps.push(Step::PatchShebangs {
+        dir: "{root}/mescc-bin".into(),
+        shell: SH.into(),
+    });
+    steps.push(Step::ToolFarm {
+        links: vec![
+            ("M2-Planet".into(), "{in:stage0}/AMD64/artifact/M2".into()),
+            (
+                "blood-elf".into(),
+                "{in:stage0}/AMD64/artifact/blood-elf-0".into(),
+            ),
+            ("M1".into(), "{in:stage0}/AMD64/bin/M1".into()),
+            ("hex2".into(), "{in:stage0}/AMD64/bin/hex2".into()),
+            ("kaem".into(), "{in:stage0}/AMD64/bin/kaem".into()),
+            ("mescc".into(), "{root}/mescc-bin/mescc".into()),
+            ("mes".into(), "{in:mes}/bin/mes".into()),
+        ],
+    });
+    steps.push(sed_i("s/volatile//", &["conftest.c"]));
+    steps.push(common(Step::run(
+        "{src}",
+        &[
+            SH,
+            "./configure",
+            "--cc=mescc",
+            "--prefix={out}",
+            "--elfinterp=/lib/mes-loader",
+            "--crtprefix=.",
+            "--tccdir=.",
+        ],
+    )));
+    steps.push(
+        common(Step::run("{src}", &[SH, "bootstrap.sh"]))
+            .env("MES_ARENA", "20000000")
+            .env("MES_MAX_ARENA", "20000000")
+            .env("MES_STACK", "6000000"),
+    );
+    steps.push(Step::CopyFiles {
+        files: vec!["{src}/tcc".into()],
+        dest: "{out}/bin".into(),
+    });
+    steps.push(Step::CopyFiles {
+        files: vec![
+            "{src}/libc.a".into(),
+            "{src}/libtcc1.a".into(),
+            "{src}/crt1.o".into(),
+            "{src}/crti.o".into(),
+            "{src}/crtn.o".into(),
+        ],
+        dest: "{out}/lib".into(),
+    });
+    steps.push(Step::Require {
+        paths: vec!["{out}/bin/tcc".into()],
+        exec: true,
+    });
     Recipe::mesboot("tcc", "0.9.26-1149-g46a75d0c")
         .source_input("tcc-source")
         .native_inputs(&["stage0", "mes"])
+        .inputs_owned(base_inputs(&[]))
         .steps(steps)
 }
