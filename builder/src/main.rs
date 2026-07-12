@@ -2022,22 +2022,46 @@ fn realize_drv(
             roots.push(o.path.clone());
         }
     }
-    // The drv names the STABLE ABI builder-identity path (store::builder_identity_path)
-    // as its builder + builder input-src — keyed on the ABI, not the builder ELF. To
-    // STAGE it, resolve it to the REAL builder here: substitute it in `roots` so the
-    // existing closure logic (which keys its builder branch on the override's canonical)
-    // runs UNCHANGED over the real path, then re-key that ONE entry back to the stable id
-    // after the closure is built (below) — so the sandbox binds the real builder bytes AT
-    // the path the drv execs. The real builder is this realize's override, else its own
-    // running binary; both are ABI-compatible with the token by construction.
+    // A recipe drv (assemble_recipe_drv) names the STABLE ABI builder-identity path
+    // (store::builder_identity_path) as its builder + builder input-src — keyed on the
+    // ABI, not the builder ELF. To STAGE it, resolve it to the REAL builder here:
+    // substitute it in `roots` so the existing closure logic (which keys its builder
+    // branch on the override's canonical) runs UNCHANGED over the real path, then re-key
+    // that ONE entry back to the stable id after the closure is built (below) — so the
+    // sandbox binds the real builder bytes AT the path the drv execs. The real builder is
+    // this realize's override, else its own running binary; both are ABI-compatible with
+    // the token by construction.
+    //
+    // Guard against ABI SKEW: the drv's `builder` line is `<identity>/bin/td-builder`, and
+    // that identity MUST be this realize's ABI token path — assemble and realize must agree
+    // on BUILDER_ABI/TD_BUILDER_ABI. A stale on-disk drv, or the daemon's separate assemble
+    // and realize processes disagreeing on the env override, would otherwise leave the
+    // unresolved token path to be content-scanned, not found, and fail deep in staging with
+    // a confusing "No such file". Catch it CLEARLY here. A drv whose builder is NOT a
+    // td-builder identity (a non-td/guix drv) is left untouched — real_builder_cb is None,
+    // so the substitution and the re-key below are both no-ops.
     let stable_builder_id = store::builder_identity_path();
-    let real_builder_cb = match builder_override {
-        Some(ov) => ov.canonical.clone(),
-        None => self_store_path()?,
+    let real_builder_cb: Option<String> = match parsed.builder.strip_suffix("/bin/td-builder") {
+        Some(drv_builder_id) => {
+            if drv_builder_id != stable_builder_id {
+                return Err(format!(
+                    "realize: drv builder identity `{drv_builder_id}` != this builder's ABI \
+                     identity `{stable_builder_id}` — the drv was assembled under a different \
+                     BUILDER_ABI/TD_BUILDER_ABI than this realize"
+                ));
+            }
+            Some(match builder_override {
+                Some(ov) => ov.canonical.clone(),
+                None => self_store_path()?,
+            })
+        }
+        None => None,
     };
-    for r in roots.iter_mut() {
-        if *r == stable_builder_id {
-            *r = real_builder_cb.clone();
+    if let Some(real) = &real_builder_cb {
+        for r in roots.iter_mut() {
+            if *r == stable_builder_id {
+                *r = real.clone();
+            }
         }
     }
     // Compute the input closure with NO guix store DB: CONTENT-SCAN the seed store dir(s)
@@ -2173,8 +2197,12 @@ fn realize_drv(
     // identity path the drv names (its runtime refs keep their real canonical paths). The
     // sandbox binds the real builder bytes (the on-disk half) at that path and execs
     // `{stable_id}/bin/td-builder` there — so the recipe's identity dropped the builder
-    // ELF but the build still runs the real builder.
-    let closure = rekey_builder_entry(closure, &real_builder_cb, &stable_builder_id);
+    // ELF but the build still runs the real builder. A non-td drv (real_builder_cb None)
+    // has no builder entry to re-key — pass through unchanged.
+    let closure = match &real_builder_cb {
+        Some(real) => rekey_builder_entry(closure, real, &stable_builder_id),
+        None => closure,
+    };
     eprintln!(
         "td-builder: realize computed the input closure ITSELF — {} paths by CONTENT-SCANNING {} seed store dir(s) (+ {} td-owned db(s)); no /var/guix/db, no guix gc, no daemon",
         closure.len(),
@@ -2184,6 +2212,25 @@ fn realize_drv(
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     std::fs::write(scratch.join("closure.txt"), closure.join("\n")).map_err(|e| e.to_string())?;
     let regs = build_and_register(drv_path, &closure, scratch)?;
+    // The builder identity path is a VIRTUAL mount alias: the real builder bytes are
+    // registered under the builder's OWN content-addressed path, never under this token
+    // path (which has no materialized store member / NAR). An output must therefore not
+    // retain it as a reference, or its registered closure would carry a dangling store
+    // path that later gc/verify/export cannot resolve. A real recipe never references the
+    // build DRIVER (the builder is not a runtime input), so reject it loudly here rather
+    // than register an unresolvable ref. Scoped to an ABI drv (real_builder_cb Some).
+    if real_builder_cb.is_some() {
+        for r in &regs {
+            if r.refs.iter().any(|rf| rf == &stable_builder_id) {
+                return Err(format!(
+                    "realize: output {} references the builder identity path {stable_builder_id}, \
+                     a virtual mount alias with no materialized store path — a recipe must not \
+                     embed the build driver",
+                    r.store_path
+                ));
+            }
+        }
+    }
     // td OWNS the store record of its build: write a td store-db registering the
     // realized output(s) — the daemon's post-build registration, in pure Rust.
     write_output_db(&regs, &scratch.join("td.db"))?;
