@@ -2005,6 +2005,15 @@ fn bytes_replace_all(hay: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Strip the absolute configure prefix (`{prefix}/lib/`) from GNU ld scripts in
+/// `dir` so their GROUP/AS_NEEDED members resolve via `-L`/`-B` instead of the
+/// build-time store path. Both `*.so` and `*.a` are considered: glibc ships ld
+/// scripts under both extensions (e.g. `libc.so`, and a `libm.a` that is a GNU
+/// ld script, not a real archive). The `head -c 80` "GNU ld script" content
+/// guard is what actually gates a rewrite, so a genuine `ar` archive named
+/// `*.a` is skipped untouched — the extension is only a cheap prefilter. This
+/// matches the x86_64 toolchain relocator (`toolchain_x86_64.rs`), which has
+/// always handled both extensions.
 fn relocate_ld_scripts(dir: &Path, prefix: &str) -> Result<(), String> {
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -2015,7 +2024,8 @@ fn relocate_ld_scripts(dir: &Path, prefix: &str) -> Result<(), String> {
     for entry in rd {
         let entry = entry.map_err(|e| format!("relocate ld scripts: read {}: {e}", dir.display()))?;
         let path = entry.path();
-        if path.extension() != Some(OsStr::new("so")) {
+        let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
+        if ext != "so" && ext != "a" {
             continue;
         }
         let bytes = fs::read(&path)
@@ -2475,14 +2485,20 @@ mod tests {
     }
 
     #[test]
-    fn mesboot_ld_script_relocation_rewrites_only_marked_so_scripts() {
+    fn mesboot_ld_script_relocation_rewrites_marked_so_and_a_scripts() {
         let d = std::env::temp_dir().join(format!("td-ldscripts-{}", std::process::id()));
         let lib = d.join("lib");
         fs::create_dir_all(&lib).unwrap();
         let script = "/* GNU ld script */\nGROUP ( /td/store/glibc-test/lib/libc.so.6 /td/store/glibc-test/lib/libc_nonshared.a )\n";
         fs::write(lib.join("libc.so"), script).unwrap();
         fs::write(lib.join("libextra.so"), b"not a linker script /td/store/glibc-test/lib/keep").unwrap();
-        fs::write(lib.join("libm.a"), b"/* GNU ld script */ /td/store/glibc-test/lib/keep").unwrap();
+        // A `.a` that IS a GNU ld script (glibc's libm.a) — must be relocated too,
+        // matching the busybox static-link fixup that this typed step replaces.
+        let marchive = "/* GNU ld script */\nGROUP ( /td/store/glibc-test/lib/libm.so.6 /td/store/glibc-test/lib/libmvec.a )\n";
+        fs::write(lib.join("libm.a"), marchive).unwrap();
+        // A `.a` that is a genuine `ar` archive — the "GNU ld script" content guard
+        // must leave it byte-for-byte untouched even though the extension matches.
+        fs::write(lib.join("libreal.a"), b"!<arch>\n/td/store/glibc-test/lib/keep").unwrap();
         fs::write(lib.join("libc.so.6"), b"\x7fELF /td/store/glibc-test/lib/keep").unwrap();
 
         relocate_ld_scripts(&lib, "/td/store/glibc-test").unwrap();
@@ -2490,10 +2506,13 @@ mod tests {
         let got = fs::read_to_string(lib.join("libc.so")).unwrap();
         assert!(got.contains("GROUP ( libc.so.6 libc_nonshared.a )"), "got: {got}");
         assert!(!got.contains("/td/store/glibc-test/lib/"), "prefix not stripped: {got}");
+        let mgot = fs::read_to_string(lib.join("libm.a")).unwrap();
+        assert!(mgot.contains("GROUP ( libm.so.6 libmvec.a )"), "got: {mgot}");
+        assert!(!mgot.contains("/td/store/glibc-test/lib/"), "prefix not stripped: {mgot}");
         let unmarked = fs::read(lib.join("libextra.so")).unwrap();
         assert!(bytes_contains(&unmarked, b"/td/store/glibc-test/lib/keep"));
-        let archive = fs::read(lib.join("libm.a")).unwrap();
-        assert!(bytes_contains(&archive, b"/td/store/glibc-test/lib/keep"));
+        let real = fs::read(lib.join("libreal.a")).unwrap();
+        assert!(bytes_contains(&real, b"/td/store/glibc-test/lib/keep"), "real ar archive was rewritten");
         let versioned = fs::read(lib.join("libc.so.6")).unwrap();
         assert!(bytes_contains(&versioned, b"/td/store/glibc-test/lib/keep"));
         fs::remove_dir_all(&d).unwrap();
