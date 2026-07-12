@@ -3411,6 +3411,24 @@ fn builder_store_env() -> Result<Option<(String, String, String)>, String> {
     }
 }
 
+/// The OPTIONAL persistent store the build-plan chain reads-back-or-commits into
+/// (re #469 build speed): TD_PERSIST_STORE + TD_PERSIST_DB, set together, name a
+/// store+db that survive ACROSS invocations. With them set, each build_recipe step
+/// reuses a prior run's output for an UNCHANGED rung (a persistent_realization HIT,
+/// receipt+NAR-verified) and commits a freshly-built rung's output back — so a
+/// CHANGED rung (different drv ⇒ different output path) still rebuilds. Unset →
+/// None → build-plan owns its own in-run td-store and rebuilds the whole chain (the
+/// clean-room default). Mirrors the `store-build` subcommand's persist convention.
+fn persist_store_env() -> Result<Option<(String, String)>, String> {
+    let ps = std::env::var("TD_PERSIST_STORE").ok().filter(|s| !s.is_empty());
+    let pd = std::env::var("TD_PERSIST_DB").ok().filter(|s| !s.is_empty());
+    match (ps, pd) {
+        (Some(s), Some(d)) => Ok(Some((s, d))),
+        (None, None) => Ok(None),
+        _ => Err("TD_PERSIST_STORE/TD_PERSIST_DB must be set together".into()),
+    }
+}
+
 /// build-plan: realize a TOPO-ordered chain of recipes where a downstream step
 /// consumes an UPSTREAM step's td-BUILT output instead of a guix store path. This
 /// is the edge the per-package locks could not express: `recipe-checks` builds
@@ -3435,6 +3453,7 @@ fn build_plan(
     seed_db: &str,
     scratch: &Path,
     builder_store: Option<(&str, &str, &str)>,
+    persist: Option<(&str, &str)>,
 ) -> Result<(), String> {
     use std::collections::BTreeMap;
     let plan = std::fs::read_to_string(plan_file)
@@ -3560,7 +3579,7 @@ fn build_plan(
             None,            // vendor_store: build-plan deps are not vendored-crate trees
             builder_store,   // builder_store: the td-placed stage0 (TD_BUILDER_*), or None → self
             Some(&tdstore),  // td_store: stage td-built deps from the shared td-store
-            None,            // persist: build-plan owns its own in-run td-store
+            persist,         // persist: reuse-or-commit each rung across runs (re #469), or None → clean-room in-run store
         )?;
         // Single-output recipes (the gnu corpus): the dep is regs[0].
         let out = regs
@@ -3992,6 +4011,7 @@ fn auto_synthesize_lock(
 ///
 /// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(clippy::too_many_arguments)] // seed_db (#468) + persist (#474 cache) both thread through this arm
 fn build_plan_auto(
     target: &str,
     recipe_dir: &str,
@@ -4000,6 +4020,7 @@ fn build_plan_auto(
     seed_db: &str,
     scratch: &Path,
     builder_store: Option<(&str, &str, &str)>,
+    persist: Option<(&str, &str)>,
 ) -> Result<(), String> {
     if !auto_is_owned(recipe_dir, target) {
         return Err(format!("--auto target `{target}': need {recipe_dir}/{target}.json"));
@@ -4031,7 +4052,7 @@ fn build_plan_auto(
     }
     let plan_path = scratch.join("auto.plan");
     std::fs::write(&plan_path, &plan).map_err(|e| e.to_string())?;
-    build_plan(&plan_path.to_string_lossy(), guix_store, seed_db, scratch, builder_store)
+    build_plan(&plan_path.to_string_lossy(), guix_store, seed_db, scratch, builder_store, persist)
 }
 
 /// Emit PKG's recipe JSON from td's Rust catalog via `td-recipe-eval emit` — the
@@ -7397,14 +7418,12 @@ fn main() -> ExitCode {
             // set TD_PERSIST_STORE + TD_PERSIST_DB together and the build reads an
             // already-built output back from there (skip) or, on a miss, commits its fresh
             // output into it (build-into) — build-into / read-back across invocations.
-            let persist_store = std::env::var("TD_PERSIST_STORE").ok().filter(|s| !s.is_empty());
-            let persist_db = std::env::var("TD_PERSIST_DB").ok().filter(|s| !s.is_empty());
             let run = || -> Result<(), String> {
-                let persist = match (&persist_store, &persist_db) {
-                    (Some(s), Some(d)) => Some((s.as_str(), d.as_str())),
-                    (None, None) => None,
-                    _ => return Err("TD_PERSIST_STORE/TD_PERSIST_DB must be set together".into()),
-                };
+                // Parsed by the shared persist_store_env helper (same set-together
+                // convention as the build-plan dispatch); `?` defers the partial-set
+                // error into run() exactly as the prior inline match did.
+                let pov = persist_store_env()?;
+                let persist = pov.as_ref().map(|(s, d)| (s.as_str(), d.as_str()));
                 let builder_store = match (&bp, &bs, &bd) {
                     (Some(p), Some(s), Some(d)) => Some((p.as_str(), s.as_str(), d.as_str())),
                     (None, None, None) => None,
@@ -7506,7 +7525,15 @@ fn main() -> ExitCode {
                 }
             };
             let builder_store = bov.as_ref().map(|(p, s, d)| (p.as_str(), s.as_str(), d.as_str()));
-            match build_plan_auto(target, recipe_dir, map_file, guix_store, seed_db, Path::new(scratch), builder_store) {
+            let pov = match persist_store_env() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("td-builder: build-plan --auto {target}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let persist = pov.as_ref().map(|(s, d)| (s.as_str(), d.as_str()));
+            match build_plan_auto(target, recipe_dir, map_file, guix_store, seed_db, Path::new(scratch), builder_store, persist) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build-plan --auto {target}: {e}");
@@ -9395,6 +9422,7 @@ daemon build START (2/2 active)
                 &seeds.to_string_lossy(),
                 &d.join("seed.db").to_string_lossy(),
                 &d.join("scratch"),
+                None,
                 None,
             )
             .unwrap_err();
