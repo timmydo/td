@@ -521,11 +521,105 @@ fn verify_ported_scripts(top: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The running kernel's ability to execute 32-bit (i386/x86) ELF binaries.
+/// The mes rung's first artifact, `bin/mes-m2`, is x86/ELFCLASS32 (mes is a
+/// 32-bit interpreter, `--host=i686-linux-gnu`), as is the whole i686 mesboot
+/// toolchain up to the x86-64 cross transition — so the build kernel needs
+/// Linux `CONFIG_IA32_EMULATION`.
+enum Ia32Verdict {
+    /// The kernel config sets `CONFIG_IA32_EMULATION=y` (or an older-kernel
+    /// equivalent) — 32-bit ELF execution is compiled in.
+    Supported,
+    /// The kernel config explicitly disables it (`# … is not set` / `=n`) — a
+    /// definitive NO; the i686 chain cannot execute here.
+    Unsupported,
+    /// No readable kernel config — capability cannot be PROVEN without an exec
+    /// probe, so the caller must not hard-fail on this.
+    Unknown,
+}
+
+/// Classify a kernel `.config` text (the `/proc/config.gz` or
+/// `/boot/config-<release>` body). Split out from the file reads so the
+/// three verdicts unit-test without a kernel: `CONFIG_IA32_EMULATION=y` (or
+/// the `CONFIG_COMPAT_32`/`CONFIG_X86_32` equivalents) → Supported; an
+/// explicit not-set/`=n` → Unsupported; neither present → Unknown. (A kernel
+/// built `=y` but booted `ia32_emulation=0` reads Supported here — a rare
+/// runtime override the config alone can't see; that path still ENOEXECs at
+/// the exec below, just with a less specific message.)
+fn ia32_from_kconfig(text: &str) -> Ia32Verdict {
+    if ["CONFIG_IA32_EMULATION=y", "CONFIG_COMPAT_32=y", "CONFIG_X86_32=y"]
+        .iter()
+        .any(|k| text.contains(k))
+    {
+        return Ia32Verdict::Supported;
+    }
+    if text.contains("# CONFIG_IA32_EMULATION is not set")
+        || text.contains("CONFIG_IA32_EMULATION=n")
+    {
+        return Ia32Verdict::Unsupported;
+    }
+    Ia32Verdict::Unknown
+}
+
+/// Read the running kernel's config (pure std, no syscall) and classify its
+/// 32-bit-ELF support: `/proc/config.gz` first (the definitive live signal,
+/// needs `CONFIG_IKCONFIG_PROC`), then `/boot/config-<osrelease>` as a
+/// fallback. A read/decompress error or an inconclusive body yields Unknown —
+/// never a false negative.
+fn detect_ia32() -> Ia32Verdict {
+    // /proc/config.gz reports size 0 in procfs, so read-to-EOF then decompress
+    // (the engine's own gzip reader — no host `zcat`).
+    if let Ok(gz) = std::fs::read("/proc/config.gz") {
+        if let Ok(raw) = crate::gzip::decompress_bytes(&gz) {
+            if let Ok(text) = String::from_utf8(raw) {
+                match ia32_from_kconfig(&text) {
+                    Ia32Verdict::Unknown => {}
+                    v => return v,
+                }
+            }
+        }
+    }
+    if let Ok(rel) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        let rel = rel.trim();
+        if !rel.is_empty() {
+            if let Ok(text) = std::fs::read_to_string(format!("/boot/config-{rel}")) {
+                return ia32_from_kconfig(&text);
+            }
+        }
+    }
+    Ia32Verdict::Unknown
+}
+
+/// Fail fast, with actionable guidance, if the build kernel PROVABLY cannot run
+/// 32-bit ELF binaries — so the operator gets a named cause here instead of a
+/// bare ENOEXEC deep in the kaem run. Only an EXPLICIT negative reds; an
+/// unreadable/absent kernel config passes through (the exec itself is the
+/// backstop) so a locked-down `/proc` never manufactures a false failure.
+fn preflight_ia32() -> Result<(), String> {
+    match detect_ia32() {
+        Ia32Verdict::Unsupported => Err(
+            "the build kernel cannot execute 32-bit ELF binaries \
+             (CONFIG_IA32_EMULATION is not set): the mes rung builds and runs bin/mes-m2, an \
+             i686/ELFCLASS32 binary, and every i686 mesboot rung up to the x86-64 cross \
+             transition the same — none can execute on this kernel. Build on a kernel with \
+             CONFIG_IA32_EMULATION=y (and without the ia32_emulation=0 boot parameter)."
+                .to_string(),
+        ),
+        // Supported, or Unknown (unproven — do not hard-fail; the exec is the backstop).
+        Ia32Verdict::Supported | Ia32Verdict::Unknown => Ok(()),
+    }
+}
+
 /// Build + install the mes rung: SOURCE/NYACC are the staged tarballs, STAGE0
 /// the staged stage0 output, OUT the store output dir. Runs in the sandbox
 /// cwd ({root}): the mes tree unpacks to `{root}/mes-src`, nyacc to
 /// `{root}/nyacc` (the recipe's guile-site CopyTree reads it there).
 pub(crate) fn run(source: &str, nyacc: &str, stage0: &str, out: &str) -> Result<(), String> {
+    // The first i686/ELFCLASS32 execution in the whole toolchain is this rung's
+    // bin/mes-m2 — red early with a named cause if the kernel provably lacks
+    // 32-bit ELF support, rather than ENOEXEC mid-kaem (re #469 bootstrap
+    // robustness).
+    preflight_ia32()?;
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let top = cwd.join("mes-src");
     crate::tar::unpack_archive(Path::new(source), &top, false)?;
@@ -993,5 +1087,51 @@ mod tests {
         assert!(err.contains("transcription baseline"), "{err}");
         assert!(err.contains("configure.sh"), "names the file: {err}");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // The i686-ELF32 kernel-capability classifier (re #469): a `=y` (or an
+    // older-kernel equivalent) is Supported, an explicit not-set/`=n` is a
+    // definitive Unsupported, and anything else is Unknown — the caller only
+    // hard-fails on Unsupported, so an unreadable/quiet config never false-fails.
+    #[test]
+    fn ia32_kconfig_classifies_enabled_disabled_and_unknown() {
+        // Enabled — the common x86-64 kernel (mirrors this repo's build host).
+        assert!(matches!(
+            ia32_from_kconfig("CONFIG_COMPAT=y\nCONFIG_IA32_EMULATION=y\nCONFIG_X86_X32_ABI=y\n"),
+            Ia32Verdict::Supported
+        ));
+        // Older/other configs where the compat symbols carry 32-bit support.
+        assert!(matches!(ia32_from_kconfig("CONFIG_COMPAT_32=y\n"), Ia32Verdict::Supported));
+        assert!(matches!(ia32_from_kconfig("CONFIG_X86_32=y\n"), Ia32Verdict::Supported));
+        // Explicitly disabled — both Kconfig spellings are a definitive NO.
+        assert!(matches!(
+            ia32_from_kconfig("# CONFIG_IA32_EMULATION is not set\n"),
+            Ia32Verdict::Unsupported
+        ));
+        assert!(matches!(ia32_from_kconfig("CONFIG_IA32_EMULATION=n\n"), Ia32Verdict::Unsupported));
+        // Neither present — cannot prove a negative, so Unknown (caller passes).
+        assert!(matches!(ia32_from_kconfig("CONFIG_SMP=y\n"), Ia32Verdict::Unknown));
+        assert!(matches!(ia32_from_kconfig(""), Ia32Verdict::Unknown));
+        // The "is not set" comment must NOT be read as enabled by a loose
+        // substring match: an enabled `=y` line elsewhere still wins.
+        assert!(matches!(
+            ia32_from_kconfig("# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set\nCONFIG_IA32_EMULATION=y\n"),
+            Ia32Verdict::Supported
+        ));
+    }
+
+    // The preflight reds ONLY on a proven-negative config; Supported and Unknown
+    // both pass (the exec is the backstop for the unprovable case).
+    #[test]
+    fn preflight_ia32_reds_only_on_a_proven_negative() {
+        let msg = match ia32_from_kconfig("# CONFIG_IA32_EMULATION is not set\n") {
+            Ia32Verdict::Unsupported => "unsupported",
+            _ => "other",
+        };
+        assert_eq!(msg, "unsupported");
+        // The live-kernel preflight must not spuriously fail this build host,
+        // which has CONFIG_IA32_EMULATION=y (Supported) — or, on a config-less
+        // host, Unknown; both are Ok. It must never hard-fail here.
+        assert!(preflight_ia32().is_ok(), "preflight must not false-fail a capable/unknown host");
     }
 }
