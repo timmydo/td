@@ -33,6 +33,10 @@ const EI_MAG: &[u8] = b"\x7fELF";
 const EI_CLASS: usize = 4; // 1 = ELFCLASS32, 2 = ELFCLASS64
 const EI_DATA: usize = 5; // 1 = ELFDATA2LSB
 
+// e_type values (Elf*_Half at file offset 0x10 in both classes).
+const ET_EXEC: u16 = 2; // a position-dependent executable
+const ET_DYN: u16 = 3; // a shared object OR a PIE executable
+
 // Program-header types and dynamic-section tags (class-independent values).
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -343,6 +347,38 @@ pub fn read_interp(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// True iff `path` is a runnable **program** — a file the sandbox could execute, directly
+/// or through the staged dynamic loader, to run code. Three shapes qualify: an ELF
+/// executable (`ET_EXEC`); an ELF PIE executable (`ET_DYN` that carries a `PT_INTERP`, which
+/// the loader runs); and a non-ELF file bearing an execute bit (a `#!`-script or similar).
+///
+/// A shared library and the dynamic loader itself (`ET_DYN`, NO `PT_INTERP`), and
+/// relocatable objects / archive members (`ET_REL`), are NOT programs. `executable` is the
+/// file's execute-bit test; it is consulted ONLY for the non-ELF case — an ELF executable is
+/// a program even without `+x`, because the staged loader can map and run it regardless.
+///
+/// Only the ELF header + program-header table (both at the file's front) are read, so a
+/// multi-megabyte library is classified from a bounded prefix. Used to bound the
+/// builder-runtime staging surface to libraries, never a program (re #469).
+pub fn is_runnable_program(path: &Path, executable: bool) -> Result<bool, String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut b = Vec::new();
+    f.take(128 * 1024)
+        .read_to_end(&mut b)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let elf = match Elf::parse(&b) {
+        Ok(e) => e,
+        Err(_) => return Ok(executable), // non-ELF: a program iff it carries an execute bit
+    };
+    match u16le(&b, 0x10)? {
+        ET_EXEC => Ok(true),
+        // A shared library has no PT_INTERP; a PIE *executable* (also ET_DYN) does.
+        ET_DYN => Ok(elf.segment_slot(PT_INTERP, "PT_INTERP")?.is_some()),
+        _ => Ok(false), // ET_REL (.o/.a), ET_CORE, … — not a runnable program
+    }
+}
+
 /// Rewrite the program interpreter (`PT_INTERP`) string. A path that fits the existing slot
 /// (plus its NUL) is written IN PLACE (remaining bytes NUL-padded). A LONGER path is handled
 /// by GROWING: the new path (NUL-terminated) is appended to the end of the file, the
@@ -613,6 +649,46 @@ pub fn assert_static(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_runnable_program_separates_programs_from_libraries() {
+        fn with_etype(mut b: Vec<u8>, et: u16) -> Vec<u8> {
+            b[16..18].copy_from_slice(&et.to_le_bytes()); // e_type @ 0x10
+            b
+        }
+        let dir = std::env::temp_dir().join(format!("td-runnable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A shared object (ET_DYN, no PT_INTERP) is NOT a program — even with +x, which
+        // real `.so`/loader files carry.
+        let lib = dir.join("libfoo.so");
+        std::fs::write(&lib, with_etype(synth_dyn_elf("/x/lib", true, true), ET_DYN)).unwrap();
+        assert!(!is_runnable_program(&lib, true).unwrap());
+
+        // A PIE executable (ET_DYN WITH PT_INTERP) IS a program — even without +x, because
+        // the staged loader can run it.
+        let pie = dir.join("pie");
+        std::fs::write(&pie, with_etype(synth_interp_elf("/lib/ld.so", true), ET_DYN)).unwrap();
+        assert!(is_runnable_program(&pie, false).unwrap());
+
+        // A classic executable (ET_EXEC) IS a program.
+        let exe = dir.join("prog");
+        std::fs::write(&exe, with_etype(synth_interp_elf("/lib/ld.so", true), ET_EXEC)).unwrap();
+        assert!(is_runnable_program(&exe, false).unwrap());
+
+        // A relocatable object (ET_REL — a `.o`/`.a` member) is NOT a program.
+        let obj = dir.join("crt1.o");
+        std::fs::write(&obj, with_etype(synth_dyn_elf("/x/lib", true, true), 1 /* ET_REL */)).unwrap();
+        assert!(!is_runnable_program(&obj, true).unwrap());
+
+        // A non-ELF file is a program iff it carries an execute bit (a `#!`-script).
+        let script = dir.join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho hi\n").unwrap();
+        assert!(is_runnable_program(&script, true).unwrap());
+        assert!(!is_runnable_program(&script, false).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // A minimal little-endian ELF buffer with exactly one PT_INTERP program header whose
     // string slot holds `interp` (NUL-terminated). `is64` selects ELFCLASS64 (x86-64) or
