@@ -7,9 +7,13 @@
  * make recipe line containing a shell metacharacter makes GNU Make fall back to
  * $(SHELL) — which does not exist in td's sandbox (re #469, the same no-shell
  * fast-path constraint oyacc.mk documents). So td moves EVERY define here into
- * config.h, which bash `#include`s unconditionally at the top of all 36 .c files
- * (shell.c:27, before any code). The baked Makefiles then carry only `-I`/`-L`
- * paths, keeping every recipe line metacharacter-free.
+ * config.h. Every bash source `#include <config.h>` (found via the Makefiles'
+ * -I. / -I.. and COMMON_CFLAGS), so populating this file feeds them all — with
+ * one wrinkle: test.c and xmalloc.c gate that include behind
+ * `#if defined (HAVE_CONFIG_H)`, so common.mk also passes a bare (metacharacter-
+ * free) `-DHAVE_CONFIG_H` to fire those two. The baked Makefiles then carry only
+ * `-I`/`-L` paths plus that one flag, keeping every recipe line
+ * metacharacter-free.
  *
  * Each macro below is the exact live-bootstrap `-D` flag transcribed: bare
  * feature macros define to 1 (tcc's `-DNAME` == `-DNAME=1`); valued/string/
