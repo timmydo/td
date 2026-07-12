@@ -6236,14 +6236,12 @@ fn main() -> ExitCode {
             // set TD_PERSIST_STORE + TD_PERSIST_DB together and the build reads an
             // already-built output back from there (skip) or, on a miss, commits its fresh
             // output into it (build-into) — build-into / read-back across invocations.
-            let persist_store = std::env::var("TD_PERSIST_STORE").ok().filter(|s| !s.is_empty());
-            let persist_db = std::env::var("TD_PERSIST_DB").ok().filter(|s| !s.is_empty());
             let run = || -> Result<(), String> {
-                let persist = match (&persist_store, &persist_db) {
-                    (Some(s), Some(d)) => Some((s.as_str(), d.as_str())),
-                    (None, None) => None,
-                    _ => return Err("TD_PERSIST_STORE/TD_PERSIST_DB must be set together".into()),
-                };
+                // Parsed by the shared persist_store_env helper (same set-together
+                // convention as the build-plan dispatch); `?` defers the partial-set
+                // error into run() exactly as the prior inline match did.
+                let pov = persist_store_env()?;
+                let persist = pov.as_ref().map(|(s, d)| (s.as_str(), d.as_str()));
                 let builder_store = match (&bp, &bs, &bd) {
                     (Some(p), Some(s), Some(d)) => Some((p.as_str(), s.as_str(), d.as_str())),
                     (None, None, None) => None,

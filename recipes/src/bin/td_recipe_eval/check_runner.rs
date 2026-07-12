@@ -129,10 +129,12 @@ fn trailing_pid(name: &str) -> Option<u32> {
     last.parse::<u32>().ok()
 }
 
-/// A pid is live iff `/proc/<pid>` exists. Used ONLY to decide reaping: a live pid is
-/// a concurrent run on the shared ladder and its scratch is never removed. Pid reuse
-/// can only make a dead scratch LOOK live (skip → under-reap, harmless); it can never
-/// make a live run's scratch look dead, so a running build is never reaped.
+/// A pid is live iff `/proc/<pid>` exists. The reaper runs under the ladder lock, so no
+/// other same-ladder run is mid-build when it fires; this check's load-bearing job is to
+/// never reap OUR OWN just-created scratch, with defense-in-depth for a leftover tree of
+/// some still-alive process. Pid reuse can only make a dead scratch LOOK live (skip →
+/// under-reap, harmless); it can never make our live scratch look dead, so an in-progress
+/// build is never reaped.
 fn pid_is_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
@@ -320,10 +322,11 @@ impl RecipeCheckRunner {
 
     /// Best-effort removal of ABANDONED per-pid scratch trees under `scratch/`. Each
     /// build-/check-run works in `scratch/<name>-<pid>` and never removes it on exit, so
-    /// dead runs' trees pile up. Remove only trees whose trailing `-<pid>` names a DEAD
-    /// process; a LIVE pid is a concurrent ladder run (or ours) and is left untouched, so
-    /// a running build is never reaped. Never fails setup — any error leaves the tree for
-    /// a later pass.
+    /// dead runs' trees pile up. Runs under the ladder lock (setup holds it), so no other
+    /// same-ladder run is mid-build; remove only trees whose trailing `-<pid>` names a DEAD
+    /// process. A LIVE pid is ours (never reap our own in-progress scratch) or some other
+    /// still-alive process whose tree we defer — so a running build is never reaped. Never
+    /// fails setup — any error leaves the tree for a later pass.
     fn reap_dead_scratch(&self) {
         let dir = match self.scratch.parent() {
             Some(d) => d,
