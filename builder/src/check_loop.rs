@@ -1141,12 +1141,16 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // chain-brick default — the daily backstop uses it to stay authoritative.
     // TD_CHECK_DISABLE forwards the gate-disable list (gate names / `pool:<name>`
     // tokens) so `TD_CHECK_DISABLE=… td-builder check` reaches the in-sandbox runner.
+    // TD_CHECK_BUILD_REUSE is the opt-in cross-run build cache (re #469): forwarded so
+    // `TD_CHECK_BUILD_REUSE=1 td-builder check` reaches a gate's in-sandbox
+    // `td-recipe-eval check-run` (default unset ⇒ the clean-room full rebuild).
     for k in [
         "TD_CHECK_SLOTS",
         "TD_CHECK_SLOTS_DIR",
         "TD_CHECK_JOBS",
         "TD_CHECK_CHAIN_CACHE",
         "TD_CHECK_DISABLE",
+        "TD_CHECK_BUILD_REUSE",
     ] {
         if let Ok(v) = std::env::var(k) {
             child_envs.push((k.to_string(), v));
