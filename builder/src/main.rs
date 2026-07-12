@@ -10643,6 +10643,117 @@ daemon build START (2/2 active)
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Integration boundary (re #469 round-10 P0 #1): FREEZE the host-shell provenance boundary
+    // by driving the REAL staging-decision pipeline against an on-disk synthetic seed — the
+    // builder arm's DYNAMIC-LINKAGE closure computation (`resolve_link_closure`, mirrored from
+    // realize_drv line-for-line) feeding both `enforce_realize_input_policy` (the choke point
+    // every realize path goes through) and the sandbox's `verify_staged_item` bind check.
+    // `resolve_link_closure_excludes_a_string_only_host_shell` and
+    // `blessed_seed_items_vouch_only_the_builder_runtime_closure` each prove ONE half with
+    // hand-authored inputs; this proves their COMPOSITION — the tightened `builder_reach` the
+    // linkage pass actually PRODUCES is exactly the slice the gate vouches — so no seam hides a
+    // divergence between what resolution computes and what enforcement checks. A host shell a
+    // drv could name by absolute `Step::Run` is thereby BOTH absent from the staged closure AND
+    // rejected before any bind if a future content edge re-injects it: the reviewer's "absent or
+    // rejected" criterion, held by the code paths a real build runs.
+    #[test]
+    fn host_shell_is_absent_from_and_rejected_by_the_realize_staging_boundary() {
+        // A realistic synthetic seed: glibc NAMES bash (its `_PATH_BSHELL` constant + a bin/ldd
+        // shebang) but the loader never LINKS it; the builder links only glibc + gcc-lib.
+        let dir = std::env::temp_dir().join(format!("hsb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let seed = dir.join("seed");
+        let cp = "/gnu/store";
+        let glibc = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.41";
+        let bash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bash-static-5.2.37";
+        let gcclib = "cccccccccccccccccccccccccccccccc-gcc-14.3.0-lib";
+        let bld = "dddddddddddddddddddddddddddddddd-td-builder-0.1.0";
+        std::fs::create_dir_all(seed.join(glibc).join("lib")).unwrap();
+        std::fs::create_dir_all(seed.join(glibc).join("bin")).unwrap();
+        std::fs::create_dir_all(seed.join(bash).join("bin")).unwrap();
+        std::fs::create_dir_all(seed.join(gcclib).join("lib")).unwrap();
+        std::fs::create_dir_all(seed.join(bld).join("bin")).unwrap();
+        let ld = format!("/gnu/store/{glibc}/lib/ld-linux-x86-64.so.2");
+        let bash_bin = format!("/gnu/store/{bash}/bin/bash");
+        // libc.so.6: interp -> ld, EMBEDS the bash path (the leak the content scan followed).
+        std::fs::write(seed.join(glibc).join("lib/libc.so.6"), synth_link_elf(Some(&ld), None, &[&bash_bin])).unwrap();
+        std::fs::write(seed.join(glibc).join("lib/ld-linux-x86-64.so.2"), synth_link_elf(None, None, &[])).unwrap();
+        // glibc bin/ldd: a helper SCRIPT shebanging bash (a content ref, not a link edge).
+        std::fs::write(seed.join(glibc).join("bin/ldd"), format!("#!{bash_bin}\nexec ...\n").into_bytes()).unwrap();
+        // libgcc_s.so.1: run-path -> glibc/lib (the real cross-package link edge).
+        std::fs::write(seed.join(gcclib).join("lib/libgcc_s.so.1"), synth_link_elf(None, Some(&format!("/gnu/store/{glibc}/lib")), &[])).unwrap();
+        // bash-static: the runnable host shell — the regression target.
+        std::fs::write(seed.join(bash).join("bin/bash"), b"a runnable host shell").unwrap();
+        // The builder ELF links its real direct runtime refs (glibc + gcc-lib) and nothing else.
+        std::fs::write(seed.join(bld).join("bin/td-builder"), synth_link_elf(Some(&ld), Some(&format!("/gnu/store/{glibc}/lib:/gnu/store/{gcclib}/lib")), &[])).unwrap();
+
+        let seed_dir = seed.to_string_lossy().into_owned();
+        let od = |p: &str| seed.join(p).to_string_lossy().into_owned();
+        let sp = |p: &str| format!("/gnu/store/{p}");
+        let mut on_disk = std::collections::HashMap::new();
+        for p in [glibc, bash, gcclib, bld] {
+            on_disk.insert(sp(p), od(p));
+        }
+
+        // Compute the builder closure EXACTLY as realize_drv's builder arm does: the builder
+        // tree binds `canonical\ton-disk` and tracks into builder_reach; its DIRECT runtime refs
+        // (glibc, gcc-lib) are then expanded by DYNAMIC LINKAGE into BOTH the staged closure and
+        // builder_reach.
+        let direct_refs = vec![sp(glibc), sp(gcclib)];
+        let mut closure: Vec<String> = vec![format!("{}\t{}", sp(bld), od(bld))];
+        let mut builder_reach: std::collections::BTreeSet<String> = std::iter::once(sp(bld)).collect();
+        for canon in resolve_link_closure(&direct_refs, std::slice::from_ref(&seed_dir), cp, &on_disk).unwrap() {
+            builder_reach.insert(canon.clone());
+            closure.push(canon);
+        }
+
+        // (1) ABSENT: the host shell is neither staged nor vouchable; the real runtime libs are.
+        assert!(builder_reach.contains(&sp(glibc)) && builder_reach.contains(&sp(gcclib)), "runtime libs reachable: {builder_reach:?}");
+        assert!(!builder_reach.contains(&sp(bash)), "host shell absent from builder_reach: {builder_reach:?}");
+        assert!(!closure.iter().any(|e| e.contains(bash)), "host shell absent from the staged closure: {closure:?}");
+
+        // The manifest the seed's dbs issue: builder ControlPlaneBuilder, runtime libs
+        // BlessedSeedClosure. (The content scan the fix removed WOULD also have blessed bash.)
+        let si = |o| sandbox::StagedInput { nar_hash: "sha256:00".to_string(), origin: o };
+        let mut manifest = sandbox::StageManifest::new();
+        manifest.insert(sp(bld), si(sandbox::InputOrigin::ControlPlaneBuilder));
+        manifest.insert(sp(glibc), si(sandbox::InputOrigin::BlessedSeedClosure));
+        manifest.insert(sp(gcclib), si(sandbox::InputOrigin::BlessedSeedClosure));
+        let builder_exec = format!("{}/bin/td-builder", sp(bld));
+        let roots = vec![sp(bld)];
+
+        // (2) POSITIVE CONTROL: the honest linkage closure — builder + its runtime libs — passes.
+        enforce_realize_input_policy(&builder_exec, &roots, &closure, &builder_reach, &manifest, None)
+            .expect("builder + its dynamic-linkage runtime closure is admissible");
+
+        // (3) REJECTED: a future content edge / crafted drv re-drags bash into the closure as a
+        // blessed-seed row. Against the TIGHTENED builder_reach it is no longer vouched, so rule
+        // 3 reds BEFORE any bind.
+        let mut leaked = closure.clone();
+        leaked.push(sp(bash));
+        let mut m2 = manifest.clone();
+        m2.insert(sp(bash), si(sandbox::InputOrigin::BlessedSeedClosure));
+        let err = enforce_realize_input_policy(&builder_exec, &roots, &leaked, &builder_reach, &m2, None)
+            .expect_err("a blessed host shell outside the builder's runtime closure must be rejected");
+        assert!(err.contains(bash) && err.contains("host tools are not admissible"), "rejection names the host-tool rule: {err}");
+
+        // (4) LOAD-BEARING: the tightening is WHAT rejects it. Had builder_reach still vouched
+        // bash (the pre-fix content-scan leak), the SAME gate would ACCEPT the SAME closure — so
+        // removing bash from builder_reach is exactly the fix, not incidental.
+        let mut pre_fix_reach = builder_reach.clone();
+        pre_fix_reach.insert(sp(bash));
+        enforce_realize_input_policy(&builder_exec, &roots, &leaked, &pre_fix_reach, &m2, None)
+            .expect("counterfactual: a builder_reach still vouching bash ACCEPTS it — the pre-fix leak");
+
+        // (5) BIND-BOUNDARY BELT: even past the gate, the sandbox re-hashes every item against
+        // the manifest; a host shell with no honest record can never bind (verify_staged_item).
+        let err = sandbox::verify_staged_item(&manifest, &sp(bash), &od(bash))
+            .expect_err("the sandbox refuses to stage an item no td-owned db vouches for");
+        assert!(err.to_string().contains("no td-owned store-db record"), "bind-boundary rejection: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn rekey_builder_entry_remaps_only_the_builder() {
         let real = "/gnu/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-td-builder-0.1.0";
