@@ -1863,28 +1863,40 @@ fn apply_text_edits(
     Ok(content)
 }
 
-/// Write `bytes` to `path`, preserving its ORIGINAL permission mode even when
-/// the file is read-only. Some GNU tarballs ship source files 0444 (GNU patch's
-/// `pch.c`, less's `mkinstalldirs`), and a plain `fs::write` would then fail
-/// EACCES. Grant owner-write for the rewrite and restore the original mode, so
-/// the on-disk tree differs only in content — a source file's mode never reaches
-/// `$out` (install/copy sets output modes), so this stays reproducibility-safe.
-/// The mode restore runs even when the write itself fails, so an error never
-/// leaves a 0444 source at 0644. (`patch_shebangs` open-codes the same grant/
-/// restore inline because it must also restore mtimes *between* the write and the
-/// mode restore, which this helper deliberately does not.)
+/// Write `bytes` to a REGULAR file `path`, preserving its ORIGINAL permission
+/// mode even when the file is read-only. Some GNU tarballs ship source files 0444
+/// (GNU patch's `pch.c`, less's `mkinstalldirs`), and a plain `fs::write` would
+/// then fail EACCES. Grant owner-write for the rewrite and restore the original
+/// mode, so the on-disk tree differs only in content — a source file's mode never
+/// reaches `$out` (install/copy sets output modes), so this stays reproducibility-
+/// safe. `symlink_metadata` (no symlink follow) fixes the target BEFORE granting
+/// write, so the grant/write/restore cannot land on a different file than the
+/// caller validated; a non-regular target is rejected. The restore runs even when
+/// the write fails (an error never leaves a 0444 source at 0644), the grant is
+/// skipped when the file is already writable, and a restore failure is surfaced,
+/// not swallowed (the write error takes precedence). (`patch_shebangs` open-codes
+/// a similar grant/restore inline because it must also restore mtimes *between*
+/// the write and the mode restore, which this helper deliberately does not.)
 fn write_preserving_mode(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let orig_mode = fs::metadata(path).ok().map(|m| m.permissions().mode());
-    if let Some(mode) = orig_mode {
-        if mode & 0o200 == 0 {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o200));
-        }
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}: not a regular file", path.display()),
+        ));
     }
-    let res = fs::write(path, bytes);
-    if let Some(mode) = orig_mode {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    let orig_mode = meta.permissions().mode();
+    let granted = orig_mode & 0o200 == 0;
+    if granted {
+        fs::set_permissions(path, fs::Permissions::from_mode(orig_mode | 0o200))?;
     }
-    res
+    let wrote = fs::write(path, bytes);
+    let restored = if granted {
+        fs::set_permissions(path, fs::Permissions::from_mode(orig_mode))
+    } else {
+        Ok(())
+    };
+    wrote.and(restored)
 }
 
 /// Parse a `substituteText` step: expand ONLY `file` (the target path) with
@@ -2358,6 +2370,7 @@ mod tests {
         // guards). PR-tier coverage: patch-mesboot's full build is UNPROVISIONED,
         // so this is the only per-PR gate on the read-only rewrite path.
         let d = std::env::temp_dir().join(format!("td-writero-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d); // clear any 0444 leftover from a crashed prior run
         fs::create_dir_all(&d).unwrap();
         let f = d.join("ro.c");
         fs::write(&f, b"before").unwrap();
@@ -2371,6 +2384,33 @@ mod tests {
             0o444,
             "original 0444 mode restored"
         );
+
+        // A writable target is rewritten too, mode left 0644 (grant skipped).
+        let w = d.join("rw.c");
+        fs::write(&w, b"x").unwrap();
+        fs::set_permissions(&w, fs::Permissions::from_mode(0o644)).unwrap();
+        write_preserving_mode(&w, b"y").unwrap();
+        assert_eq!(fs::read_to_string(&w).unwrap(), "y");
+        assert_eq!(fs::metadata(&w).unwrap().permissions().mode() & 0o777, 0o644);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn write_preserving_mode_rejects_symlink_target() {
+        // A symlinked target must be rejected (not followed) so the grant/write
+        // cannot land on a different file than substituteText validated.
+        let d = std::env::temp_dir().join(format!("td-writesym-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let real = d.join("real.c");
+        fs::write(&real, b"keep").unwrap();
+        let link = d.join("link.c");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let e = write_preserving_mode(&link, b"clobber").unwrap_err();
+
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        assert_eq!(fs::read_to_string(&real).unwrap(), "keep", "real file untouched");
         fs::remove_dir_all(&d).unwrap();
     }
 
