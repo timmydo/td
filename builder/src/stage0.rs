@@ -449,11 +449,23 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
     let meta = base.join(".stage0-meta");
 
     // Fingerprint the builder source the stage0 is compiled from — reuse only
-    // if unchanged. Absolute roots: the caller's cwd must not matter.
-    let fp_roots: Vec<String> = ["builder/src", "builder/build.rs", "builder/Cargo.toml", "builder/Cargo.lock"]
-        .iter()
-        .map(|p| root.join(p).to_string_lossy().into_owned())
-        .collect();
+    // if unchanged. Absolute roots: the caller's cwd must not matter. The two
+    // seed tables are `include_str!`-compiled INTO the builder (main.rs
+    // SEED_DIGESTS / CONTROL_PLANE_SEED_PINS), so they are genuine compile
+    // inputs to the placed binary and MUST be fingerprinted too — otherwise
+    // adding a source pin (a new seed-digests row) leaves the prior placement's
+    // compiled table in force and the new pin reads as an unpinned seed (re #469).
+    let fp_roots: Vec<String> = [
+        "builder/src",
+        "builder/build.rs",
+        "builder/Cargo.toml",
+        "builder/Cargo.lock",
+        "seed/seed-digests.txt",
+        "seed/control-plane-seed-pins.txt",
+    ]
+    .iter()
+    .map(|p| root.join(p).to_string_lossy().into_owned())
+    .collect();
     let fp = crate::tree_fingerprint(&fp_roots)?;
 
     // Fast path: a valid memo needs no lock (warm loops skip the compile AND
