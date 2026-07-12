@@ -3718,11 +3718,16 @@ fn build_plan(
                     p.clone()
                 }
                 lock::Class::Seed | lock::Class::Source => {
+                    // Digest-gate by the SOURCE KEY, not the lock entry name (see
+                    // seed_gate_key): the recipe's own source entry is named
+                    // `{name}-source` but pinned under its `sourceInput` key, which may
+                    // be a shared seed.
+                    let gate_key = seed_gate_key(&e.name, &src_key, &alist);
                     auto_seed_provenance(
                         &store_prefix,
                         Path::new(guix_store),
                         name,
-                        &e.name,
+                        gate_key,
                         &e.path,
                     )?;
                     e.path.clone()
@@ -3798,6 +3803,25 @@ fn build_plan(
 /// A recipe's declared inputs — the JSON `inputs` array UNION `nativeInputs`
 /// (#378 staged builders: a rung's compiler is a prior rung's output; --auto
 /// chains both edge kinds identically).
+/// The compiled-seed-digest key a build-plan lock entry is gated by. A recipe's
+/// OWN source entry is named `{name}-source` (`src_key`) so its steps can reference
+/// `{in:{name}-source}` uniformly, but its digest is pinned under the recipe's
+/// `sourceInput` KEY — which may be a shared seed the rung renames locally
+/// (gcc-mesboot0-source <- patch-gcc-boot-2.95.3, mesboot-headers-source <-
+/// linux-headers). Resolve that source entry to its pin key; gate every other seed
+/// by its own name. For a conventional rung (sourceInput == `{name}-source`) the two
+/// coincide, so this is a no-op. `alist` is the entry's own recipe JSON.
+fn seed_gate_key<'a>(entry_name: &'a str, src_key: &str, alist: &'a json::Json) -> &'a str {
+    if entry_name == src_key {
+        alist
+            .get("sourceInput")
+            .and_then(json::Json::as_str)
+            .unwrap_or(entry_name)
+    } else {
+        entry_name
+    }
+}
+
 fn inputs_from_recipe_json(alist: &json::Json) -> Vec<String> {
     let mut xs: Vec<String> = Vec::new();
     for key in ["inputs", "nativeInputs"] {
@@ -4155,6 +4179,11 @@ fn auto_synthesize_lock(
         let path = auto_map_lookup(map, key)
             .map_err(|e| format!("--auto: recipe `{name}' sourceInput `{key}': {e}"))?;
         auto_seed_provenance(store_prefix, seed_store, name, key, &path)?;
+        // The source lock entry is named `{name}-source` — the recipe references its
+        // own source as `{in:{name}-source}` regardless of which pinned seed provides
+        // it (gcc-mesboot0-source <- patch-gcc-boot-2.95.3, mesboot-headers-source <-
+        // linux-headers). The sourceInput KEY it is digest-gated by is recovered at the
+        // build-plan re-gate from the recipe's own sourceInput (see the Seed|Source arm).
         out.push_str(&format!("{name}-source {path} source\n"));
     }
     for inp in inputs_from_recipe_json(&alist) {
@@ -9477,6 +9506,34 @@ daemon build START (2/2 active)
         assert!(got.contains(&format!("patch-glibc-boot-2.16.0 {in_a} seed")));
         assert!(got.contains(&format!("patch-glibc-boot-2.2.5 {in_b} seed")));
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    // build_plan re-gates every seed/source lock entry by its digest key. A recipe's
+    // own source is named `{name}-source` in the lock (so steps reference
+    // `{in:{name}-source}`) but pinned under its `sourceInput` key — which for a
+    // shared/renamed seed differs (gcc-mesboot0-source <- patch-gcc-boot-2.95.3,
+    // mesboot-headers-source <- linux-headers). seed_gate_key must recover the pin key
+    // for that entry, and gate every other seed by its own name; else the re-gate reds
+    // a valid rung with "no compiled expected digest" for `{name}-source`.
+    #[test]
+    fn seed_gate_key_resolves_a_recipe_source_to_its_pin_key() {
+        let renamed = json::parse(r#"{"name":"mesboot-headers","sourceInput":"linux-headers"}"#).unwrap();
+        // The rung's own source entry gates by the sourceInput pin key, not its name.
+        assert_eq!(
+            seed_gate_key("mesboot-headers-source", "mesboot-headers-source", &renamed),
+            "linux-headers"
+        );
+        // A sibling seed entry gates by its OWN name even though a sourceInput exists.
+        assert_eq!(
+            seed_gate_key("patch-glibc-boot-2.16.0", "mesboot-headers-source", &renamed),
+            "patch-glibc-boot-2.16.0"
+        );
+        // A conventional rung (sourceInput == `{name}-source`) is unchanged.
+        let conventional = json::parse(r#"{"name":"mes","sourceInput":"mes-source"}"#).unwrap();
+        assert_eq!(seed_gate_key("mes-source", "mes-source", &conventional), "mes-source");
+        // A recipe with no sourceInput falls back to the entry name.
+        let none = json::parse(r#"{"name":"make-test"}"#).unwrap();
+        assert_eq!(seed_gate_key("make-test-source", "make-test-source", &none), "make-test-source");
     }
 
     // The registered-host-item behavioral reds (re #469): `store-add-recursive` is a
