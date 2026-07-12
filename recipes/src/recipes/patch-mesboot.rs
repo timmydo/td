@@ -14,6 +14,12 @@ use crate::types::{Recipe, Step, TextEdit};
 //     only mes + tcc headers as the sandbox does) and pinned as
 //     patch-mesboot-config.h. That eliminates the host shell AND the host
 //     coreutils/sed/grep configure invoked for feature detection.
+//   * configure also GENERATES a replacement <stdbool.h> for this target (mes's
+//     is the nonconforming `typedef int bool`); that generated file is pinned as
+//     patch-mesboot-stdbool.h, and the Makefile's -I. precedes the mes includes
+//     so patch's OWN headers (stdbool.h, getopt.h) win — exactly as configure's
+//     DEFAULT_INCLUDES (`-I. -I$(srcdir)`) resolves them. Without both, patch
+//     silently compiled against mes's bool == int.
 //   * No host make shell: td's Make 3.80 drives the build with a baked,
 //     metacharacter-free Makefile (patch-mesboot.mk), so make execs tcc via its
 //     no-shell fast path. configure's compile rule embeds -Ded_PROGRAM=\"ed\"
@@ -27,6 +33,12 @@ use crate::types::{Recipe, Step, TextEdit};
 // -static, reports 2.5.9, and applies a unified diff.
 const CONFIG_H: &str = include_str!("patch-mesboot-config.h");
 const MAKEFILE: &str = include_str!("patch-mesboot.mk");
+// configure emits HAVE_STDBOOL_H undef (mes's <stdbool.h> is the nonconforming
+// `typedef int bool`) with HAVE__BOOL=1 (tcc has _Bool), so its make GENERATES a
+// replacement <stdbool.h> (bool == _Bool) from stdbool.h.in. We bake that exact
+// generated file; the Makefile's -I. (first) makes it win over mes's, as the
+// real configure+make build does. Dropping it silently used mes's bool == int.
+const STDBOOL_H: &str = include_str!("patch-mesboot-stdbool.h");
 
 // Smoke inputs: a two-line file and the unified diff that rewrites its second
 // line. `patch orig diff` exits 0 only if the hunk applies, so the run proves
@@ -74,6 +86,14 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{src}/Makefile".into(),
         content: MAKEFILE.into(),
+        exec: false,
+    });
+    // The configure-generated replacement <stdbool.h> (see STDBOOL_H). patch's
+    // common.h does `#include <stdbool.h>`; the Makefile's -I. (before the mes
+    // includes) resolves it to THIS file, so bool == _Bool as configure intends.
+    steps.push(Step::WriteFile {
+        path: "{src}/stdbool.h".into(),
+        content: STDBOOL_H.into(),
         exec: false,
     });
 
