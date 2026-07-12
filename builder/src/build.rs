@@ -1863,6 +1863,30 @@ fn apply_text_edits(
     Ok(content)
 }
 
+/// Write `bytes` to `path`, preserving its ORIGINAL permission mode even when
+/// the file is read-only. Some GNU tarballs ship source files 0444 (GNU patch's
+/// `pch.c`, less's `mkinstalldirs`), and a plain `fs::write` would then fail
+/// EACCES. Grant owner-write for the rewrite and restore the original mode, so
+/// the on-disk tree differs only in content — a source file's mode never reaches
+/// `$out` (install/copy sets output modes), so this stays reproducibility-safe.
+/// The mode restore runs even when the write itself fails, so an error never
+/// leaves a 0444 source at 0644. (`patch_shebangs` open-codes the same grant/
+/// restore inline because it must also restore mtimes *between* the write and the
+/// mode restore, which this helper deliberately does not.)
+fn write_preserving_mode(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let orig_mode = fs::metadata(path).ok().map(|m| m.permissions().mode());
+    if let Some(mode) = orig_mode {
+        if mode & 0o200 == 0 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o200));
+        }
+    }
+    let res = fs::write(path, bytes);
+    if let Some(mode) = orig_mode {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    }
+    res
+}
+
 /// Parse a `substituteText` step: expand ONLY `file` (the target path) with
 /// `ctx`; read every edit's `from`/`to`/`expect` LITERALLY. `from`/`to` are
 /// source text — a `{in:…}`/`{src}` inside a patched hunk must survive verbatim,
@@ -2200,7 +2224,11 @@ pub fn run_mesboot() -> Result<(), String> {
             let content = fs::read_to_string(&file)
                 .map_err(|e| err(format!("substituteText: read {file}: {e}")))?;
             let out = apply_text_edits(&file, content, &edits).map_err(err)?;
-            fs::write(&file, out).map_err(|e| err(format!("substituteText: write {file}: {e}")))?;
+            // Some tarballs ship source files READ-ONLY (GNU patch's pch.c is
+            // 0444); write_preserving_mode grants owner-write for the rewrite and
+            // restores the original mode, so the tree differs only in content.
+            write_preserving_mode(Path::new(&file), out.as_bytes())
+                .map_err(|e| err(format!("substituteText: write {file}: {e}")))?;
         } else {
             return Err(err("unknown step kind".into()));
         }
@@ -2321,6 +2349,29 @@ mod tests {
             vec![("a{in:mes}b".to_string(), "c{src}d".to_string(), 1)],
             "from/to stay literal — no template expansion"
         );
+    }
+
+    #[test]
+    fn write_preserving_mode_rewrites_readonly_and_restores_mode() {
+        // GNU patch ships pch.c 0444; substituteText must still rewrite it and
+        // leave the mode untouched — a plain fs::write would EACCES (the bug this
+        // guards). PR-tier coverage: patch-mesboot's full build is UNPROVISIONED,
+        // so this is the only per-PR gate on the read-only rewrite path.
+        let d = std::env::temp_dir().join(format!("td-writero-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let f = d.join("ro.c");
+        fs::write(&f, b"before").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
+
+        write_preserving_mode(&f, b"after").unwrap();
+
+        assert_eq!(fs::read_to_string(&f).unwrap(), "after", "read-only file rewritten");
+        assert_eq!(
+            fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "original 0444 mode restored"
+        );
+        fs::remove_dir_all(&d).unwrap();
     }
 
     /// The test-process bash + a PATH env for the child (scripts use sleep etc.).
