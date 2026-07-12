@@ -1141,6 +1141,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // source-pin edits route via the recipe crate; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
     assert_target!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
+    // seed/control-plane-seed-pins.txt — the frozen seed-capture allow-list (re #469): an
+    // isolated edit must select the cargo-test preflight (the include_str! recompile +
+    // authenticate_seed_capture_db unit tests + clippy) AND the stage0-cold-start
+    // provenance target — NOT bare check-pr, which exits 69 before any gate runs. Asserted
+    // both ways: the preflight COMMAND string is rendered, and stage0-cold-start is selected.
+    assert_contains!(
+        "seed/control-plane-seed-pins.txt",
+        "cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml"
+    );
+    assert_target!("seed/control-plane-seed-pins.txt", "stage0-cold-start");
     assert_target!("builder/src/bootstrap.rs", "check-engine");
     assert_branch_policy!("builder/src/bootstrap.rs", "the full check would be waived");
     // The td-builder build engine validates on the check-engine SMOKE tier.
