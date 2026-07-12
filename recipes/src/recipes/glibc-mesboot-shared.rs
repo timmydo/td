@@ -45,7 +45,7 @@ pub fn recipe() -> Recipe {
     ));
     steps.push(sed_i("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
     steps.push(sed_i(
-        "s,^SHELL := /bin/sh,SHELL := {in:bash}/bin/bash,",
+        "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
     steps.push(Step::PatchShebangs {
@@ -86,13 +86,13 @@ pub fn recipe() -> Recipe {
         .env("LD", "gcc"),
     );
     steps.push(sed_i(
-        "$aSHELL := {in:bash}/bin/bash",
+        "$aSHELL := {in:bash-mesboot}/bin/bash",
         &["build/Makefile"],
     ));
     for target in [None, Some("install")] {
         let mut argv: Vec<&str> = vec![
             "{in:make-mesboot}/bin/make",
-            "SHELL={in:bash}/bin/bash",
+            "SHELL={in:bash-mesboot}/bin/bash",
         ];
         if let Some(t) = target {
             argv.push(t);

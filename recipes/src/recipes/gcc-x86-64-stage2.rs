@@ -122,8 +122,8 @@ pub fn recipe() -> Recipe {
             &[
                 "{in:make}/bin/make",
                 "-j{jobs}",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
             ],
         )
@@ -135,7 +135,7 @@ pub fn recipe() -> Recipe {
             "{src}/bld",
             &[
                 "{in:make}/bin/make",
-                "SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install",
                 "DESTDIR={out}/stage",

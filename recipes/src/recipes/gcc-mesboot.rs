@@ -101,8 +101,8 @@ pub fn recipe() -> Recipe {
             "{src}/bld",
             &[
                 "{in:make-mesboot}/bin/make",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "CC_FOR_BUILD={in:gcc-mesboot1}/bin/gcc -static",
                 "MAKEINFO=true",
                 &format!("LDFLAGS={ldf}"),
@@ -121,7 +121,7 @@ pub fn recipe() -> Recipe {
             "{src}/bld",
             &[
                 "{in:make-mesboot}/bin/make",
-                "SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install",
             ],

@@ -94,8 +94,8 @@ pub fn recipe() -> Recipe {
             "{src}",
             &[
                 "{in:make-mesboot0}/bin/make",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "CC=tcc -static -D __GLIBC_MINOR__=6",
                 "OLDCC=tcc -static -D __GLIBC_MINOR__=6",
                 "CC_FOR_BUILD=tcc -static -D __GLIBC_MINOR__=6",
@@ -115,8 +115,8 @@ pub fn recipe() -> Recipe {
             "{src}",
             &[
                 "{in:make-mesboot0}/bin/make",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "AR=ar",
                 "RANLIB=ranlib",
                 "LANGUAGES=c",

@@ -53,8 +53,8 @@ pub fn recipe() -> Recipe {
     for target in [None, Some("install")] {
         let mut argv: Vec<&str> = vec![
             "{in:make-mesboot}/bin/make",
-            "SHELL={in:bash}/bin/bash",
-            "CONFIG_SHELL={in:bash}/bin/bash",
+            "SHELL={in:bash-mesboot}/bin/bash",
+            "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
         ];
         if let Some(t) = target {
             argv.push(t);

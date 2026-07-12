@@ -114,8 +114,8 @@ pub fn recipe() -> Recipe {
             &[
                 "{in:make}/bin/make",
                 "-j{jobs}",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "all-gcc",
                 "all-target-libgcc",
@@ -129,7 +129,7 @@ pub fn recipe() -> Recipe {
             "{src}/bld",
             &[
                 "{in:make}/bin/make",
-                "SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install-gcc",
                 "install-target-libgcc",

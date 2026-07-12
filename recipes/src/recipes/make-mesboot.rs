@@ -46,8 +46,8 @@ pub fn recipe() -> Recipe {
             "{src}",
             &[
                 "{in:make-mesboot0}/bin/make",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 cc,
                 "AR=ar",
                 "RANLIB=ranlib",

@@ -100,8 +100,8 @@ pub fn recipe() -> Recipe {
             "{src}",
             &[
                 "{in:make-mesboot}/bin/make",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 &format!("LDFLAGS={ldf}"),
                 &format!("LDFLAGS_FOR_TARGET={ldf}"),
@@ -118,7 +118,7 @@ pub fn recipe() -> Recipe {
             "{src}",
             &[
                 "{in:make-mesboot}/bin/make",
-                "SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install",
             ],

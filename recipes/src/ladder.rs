@@ -2,21 +2,31 @@
 //!
 //! Every rung recipe (recipes/src/recipes/{mes,tcc,…}.rs) composes its typed
 //! `Step` list from these helpers. Conventions:
-//! - `BASE_TOOLS` are the guix-seed host tools EVERY rung declares as lock
-//!   inputs (replacing the deleted ladder's `ls /gnu/store/*pkg*` scavenging
-//!   and the curated-PATH farm): shell, coreutils, text tools, unpackers.
+//! - `BASH` is the td-built bootstrap shell (`bash-mesboot`, bash 2.05b built
+//!   entirely from source — no host tools). Every rung that needs a POSIX shell
+//!   declares it as a typed RecipeOutput edge, never the leaked host bash (#469).
+//! - `BASE_TOOLS` are the remaining guix-seed host tools EVERY rung declares as
+//!   lock inputs (replacing the deleted ladder's `ls /gnu/store/*pkg*`
+//!   scavenging and the curated-PATH farm): coreutils, text tools.
 //! - `base_path()` is the PATH template for Run steps: the rung's own {tools}
-//!   farm first (prior-rung compilers/tools), then the base tool packages.
+//!   farm first (prior-rung compilers/tools), then the td shell, then the base
+//!   tool packages.
 //! - Unpacking is ENGINE-NATIVE (`Step::Unpack` — td's own std-only
 //!   tar/gzip/bzip2/xz readers), so no rung declares an unpacker package.
 
 use crate::types::Step;
 
+/// The td-built bootstrap shell (catalog stem). `bash-mesboot` is bash 2.05b
+/// built from source with no host tools (baked Makefiles + engine-native
+/// patches + `oyacc`), so every rung declares it as a RecipeOutput edge — the
+/// first host tool retired from `BASE_TOOLS` in the #469 cutover.
+pub const BASH: &str = "bash-mesboot";
+
 /// The host-tool packages every rung declares (lock input names). Shrinks as
 /// the cutover (re #469) replaces each host edge with a recipe output or an
-/// engine-native step; tar/gzip/bzip2/xz already left with `Step::Unpack`.
+/// engine-native step; the shell already left for `BASH` (bash-mesboot) and
+/// tar/gzip/bzip2/xz already left with `Step::Unpack`.
 pub const BASE_TOOLS: &[&str] = &[
-    "bash",
     "coreutils",
     "sed",
     "grep",
@@ -25,9 +35,11 @@ pub const BASE_TOOLS: &[&str] = &[
     "diffutils",
 ];
 
-/// The rung PATH template: the {tools} farm first, then the base packages.
+/// The rung PATH template: the {tools} farm first, then the td shell, then the
+/// base packages.
 pub fn base_path() -> String {
     let mut p = String::from("{tools}");
+    p.push_str(&format!(":{{in:{BASH}}}/bin"));
     for t in BASE_TOOLS {
         p.push_str(&format!(":{{in:{t}}}/bin"));
     }
@@ -35,15 +47,18 @@ pub fn base_path() -> String {
 }
 
 /// A rung's full lock-input list: the rung-specific `extras` FIRST, then the
-/// shared `BASE_TOOLS` — the exact order every recipe declared by hand. Keeping
-/// the base set here (not re-typed per recipe) closes the drift hazard: a rung's
-/// inputs must stay in lockstep with the constant `base_path()` templates
-/// `{in:X}/bin` for, or the missing tool reds only at execution, deep in the
-/// chain. Pair with `Recipe::inputs_owned`.
+/// td shell `BASH`, then the shared `BASE_TOOLS` — in lockstep with the order
+/// `base_path()` lays down (`{tools}` then `{in:BASH}/bin` then the base
+/// packages). Keeping the base set here (not re-typed per recipe) closes the
+/// drift hazard: a rung's inputs must stay in lockstep with the constant
+/// `base_path()` templates `{in:X}/bin` for, or the missing tool reds only at
+/// execution, deep in the chain. Pair with `Recipe::inputs_owned`.
 pub fn base_inputs(extras: &[&str]) -> Vec<String> {
     extras
         .iter()
-        .chain(BASE_TOOLS.iter())
+        .copied()
+        .chain(std::iter::once(BASH))
+        .chain(BASE_TOOLS.iter().copied())
         .map(|s| s.to_string())
         .collect()
 }
@@ -64,8 +79,9 @@ pub fn link_bins(binutils_rung: &str) -> Step {
     .env("PATH", &base_path())
 }
 
-/// The declared shell (the sandbox has no /bin/sh).
-pub const SH: &str = "{in:bash}/bin/bash";
+/// The declared shell (the sandbox has no /bin/sh): the td-built `bash-mesboot`
+/// output, not a host bash.
+pub const SH: &str = "{in:bash-mesboot}/bin/bash";
 
 /// Unpack tarball input NAME into DEST (top-level dir stripped) with the
 /// ENGINE's own readers — no unpacker packages in the sandbox (re #469).

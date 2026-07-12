@@ -64,7 +64,7 @@ pub fn recipe() -> Recipe {
         &["config.make"],
     ));
     steps.push(sed_i(
-        "s,^BASH = ,SHELL = {in:bash}/bin/bash\\n         BASH = ,",
+        "s,^BASH = ,SHELL = {in:bash-mesboot}/bin/bash\\n         BASH = ,",
         &["config.make"],
     ));
     steps.push(Step::PatchShebangs {
@@ -75,7 +75,7 @@ pub fn recipe() -> Recipe {
         let ccarg = format!("CC={cc}");
         let mut argv: Vec<&str> = vec![
             "{in:make-mesboot0}/bin/make",
-            "SHELL={in:bash}/bin/bash",
+            "SHELL={in:bash-mesboot}/bin/bash",
             &ccarg,
         ];
         if let Some(t) = target {

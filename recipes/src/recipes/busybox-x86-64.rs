@@ -58,7 +58,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "if [ ! -e /bin/sh ]; then mkdir -p /bin && ln -sf \"{in:bash}/bin/bash\" /bin/sh; fi",
+                "if [ ! -e /bin/sh ]; then mkdir -p /bin && ln -sf \"{in:bash-mesboot}/bin/bash\" /bin/sh; fi",
             ],
         )
         .env("PATH", &base_path()),
@@ -78,8 +78,8 @@ pub fn recipe() -> Recipe {
                 "{in:make-x86-64}/bin/make",
                 "CC={root}/wb/cc",
                 "HOSTCC={root}/wb/cc",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "defconfig",
             ],
         )
@@ -106,7 +106,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "yes '' | \"{in:make-x86-64}/bin/make\" CC=\"{root}/wb/cc\" HOSTCC=\"{root}/wb/cc\" SHELL=\"{in:bash}/bin/bash\" CONFIG_SHELL=\"{in:bash}/bin/bash\" oldconfig >/dev/null",
+                "yes '' | \"{in:make-x86-64}/bin/make\" CC=\"{root}/wb/cc\" HOSTCC=\"{root}/wb/cc\" SHELL=\"{in:bash-mesboot}/bin/bash\" CONFIG_SHELL=\"{in:bash-mesboot}/bin/bash\" oldconfig >/dev/null",
             ],
         )
         .env("PATH", &path)
@@ -124,8 +124,8 @@ pub fn recipe() -> Recipe {
                 "CC={root}/wb/cc",
                 "HOSTCC={root}/wb/cc",
                 "SKIP_STRIP=y",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
             ],
         )
         .env("PATH", &path)
