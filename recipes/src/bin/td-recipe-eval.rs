@@ -314,11 +314,13 @@ mod tests {
     #[test]
     fn source_pins_cli_surface_has_the_legacy_lock_count() {
         let pins = td_recipe::source_pins::all();
-        // 32 migrated legacy locks + oyacc-6.6 (re #469, the bash shell's `yacc`).
-        assert_eq!(pins.len(), 33);
+        // 32 migrated legacy locks + oyacc-6.6 (the bash shell's `yacc`) +
+        // bash-2.05b (the from-source bootstrap shell, re #469).
+        assert_eq!(pins.len(), 34);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
+        assert!(pins.iter().any(|pin| pin.key == "bash-mesboot-source"));
     }
 
     #[test]
