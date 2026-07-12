@@ -139,6 +139,29 @@ fn pid_is_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
+/// The pid of a reapable scratch tree, or None. A tree is reapable only if it is one of
+/// OUR trees — `scratch_name` emits `build-…-<pid>` / `check-…-<pid>` — AND ends in a
+/// numeric pid. The prefix guard means a coincidental sibling such as `gcc-14` or
+/// `glibc-241` can never be reaped (belt-and-braces: this dir holds only our scratch
+/// trees anyway). Split out so the reaper's eligibility rule is unit-testable.
+fn reapable_dead_pid(name: &str) -> Option<u32> {
+    if !name.starts_with("build-") && !name.starts_with("check-") {
+        return None;
+    }
+    trailing_pid(name)
+}
+
+/// The DEDICATED persistent build-output cache (store, db) under the ladder work dir.
+/// Deliberately DISTINCT from the seed store/db (`<lw>/store`, `<lw>/db`): those hold
+/// interned seed inputs and #468 authenticates the seed db as a seed-only authority, so a
+/// recipe OUTPUT committed there would be rejected as an unpinned seed. The cache lives in
+/// its own subtree so reuse never pollutes the seed authority. Cold-wiped with the seed
+/// store on a pin change (setup's cold path removes the whole `build-cache/`).
+fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
+    let base = lw.join("build-cache");
+    (base.join("store"), base.join("db"))
+}
+
 fn selected_check_runner(stem: &str, scope: &str, index: usize) -> Result<CheckRunner, String> {
     let tier = parse_tier(scope)?;
     let recipe = catalog::lookup(stem)
@@ -281,6 +304,11 @@ impl RecipeCheckRunner {
         self.lw.with_extension("lock")
     }
 
+    /// This ladder's dedicated build-output cache (store, db) — see `build_cache_paths`.
+    fn build_cache_paths(&self) -> (PathBuf, PathBuf) {
+        build_cache_paths(&self.lw)
+    }
+
     pub(crate) fn setup(&self) -> Result<(), String> {
         if self.force_cold {
             remove_path_if_exists(&self.lw)?;
@@ -309,6 +337,9 @@ impl RecipeCheckRunner {
 
         remove_path_if_exists(&self.store)?;
         remove_path_if_exists(&self.db)?;
+        // Cold-wipe the dedicated build-output cache with the seeds: a pin change
+        // invalidates prior outputs, so stale reuse never survives a pin bump.
+        remove_path_if_exists(&self.lw.join("build-cache"))?;
         remove_path_if_exists(&self.lw.join("srcs.map"))?;
         remove_path_if_exists(&self.lw.join("tools.map"))?;
         remove_path_if_exists(&setup_ok)?;
@@ -341,7 +372,7 @@ impl RecipeCheckRunner {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            match trailing_pid(&name) {
+            match reapable_dead_pid(&name) {
                 Some(pid) if !pid_is_alive(pid) => {
                     let _ = fs::remove_dir_all(entry.path());
                 }
@@ -798,20 +829,33 @@ impl RecipeCheckRunner {
             .arg(auto_map_s)
             .arg("/gnu/store")
             .arg(scratch);
-        // Opt-in cross-run reuse (re #469 build speed). Default (TD_BUILD_REUSE unset):
-        // build-plan owns its own in-run td-store and rebuilds the whole chain from
-        // stage0 every run — the clean-room proof. When set, point the chain at the
-        // ladder's OWN persistent store+db (self.store/self.db): each UNCHANGED rung is
-        // reused from a prior run (a receipt+NAR-verified persistent_realization hit,
+        // Opt-in cross-run reuse (re #469 build speed). Default (TD_CHECK_BUILD_REUSE
+        // unset): build-plan owns its own in-run td-store and rebuilds the whole chain
+        // from stage0 every run — the clean-room proof. When set, point the chain at a
+        // DEDICATED build-output cache (build_cache_paths, under the ladder work dir),
+        // kept SEPARATE from the seed store/db (self.store/self.db): each UNCHANGED rung
+        // is reused from a prior run (a NAR-verified persistent_realization hit,
         // bit-identical to a fresh build) instead of rebuilt, and a freshly-built rung
         // commits its output back. A CHANGED rung has a different drv ⇒ different output
         // path ⇒ a miss ⇒ still rebuilds, so the rung under development always rebuilds.
-        // The store rides the same setup warmth as the seeds: a pin change cold-wipes it.
+        // The cache rides the same setup warmth as the seeds: a pin change cold-wipes it.
         // Safe under the global ladder lock (build-runs are serialized — no concurrent
-        // writer to the store).
-        if env::var_os("TD_BUILD_REUSE").is_some_and(|v| !v.is_empty()) {
-            cmd.env("TD_PERSIST_STORE", path_str(&self.store)?)
-                .env("TD_PERSIST_DB", path_str(&self.db)?);
+        // writer to the cache).
+        //
+        // The cache MUST NOT be self.store/self.db: those are the SEED store/db (interned
+        // seed inputs), and #468 authenticates self.db as a seed-only authority — a recipe
+        // OUTPUT committed there would be rejected as an unpinned seed. Keeping the cache a
+        // distinct store/db pair keeps the seed authority clean and makes reuse compatible
+        // with #468 (which then reuses through the same persistent_realization).
+        //
+        // The toggle is TD_CHECK_BUILD_REUSE (not TD_BUILD_REUSE) so it rides the existing
+        // TD_CHECK_ contract: the `td-builder check` sandbox forwards TD_CHECK_* by prefix
+        // and check_loop's child allowlist carries it, so the opt-in survives to a gate's
+        // in-sandbox `td-recipe-eval check-run` instead of being stripped at the boundary.
+        if env::var_os("TD_CHECK_BUILD_REUSE").is_some_and(|v| !v.is_empty()) {
+            let (cache_store, cache_db) = self.build_cache_paths();
+            cmd.env("TD_PERSIST_STORE", path_str(&cache_store)?)
+                .env("TD_PERSIST_DB", path_str(&cache_db)?);
         }
         let out = cmd
             .output()
@@ -1350,6 +1394,43 @@ mod tests {
         let n = scratch_name("build", &["oyacc"]);
         assert_eq!(trailing_pid(&n), Some(process::id()));
         assert!(pid_is_alive(process::id()));
+    }
+
+    #[test]
+    fn reapable_dead_pid_requires_our_scratch_prefix() {
+        // Our own trees are reapable...
+        assert_eq!(reapable_dead_pid("build-oyacc-4059"), Some(4059));
+        assert_eq!(reapable_dead_pid("check-make-test-daily-1-12345"), Some(12345));
+        // ...but a coincidental numeric-suffixed sibling is NEVER reaped.
+        assert_eq!(reapable_dead_pid("gcc-14"), None);
+        assert_eq!(reapable_dead_pid("glibc-241"), None);
+        assert_eq!(reapable_dead_pid("binutils-244"), None);
+        assert_eq!(reapable_dead_pid("build-cache"), None); // the cache dir, no pid
+        assert_eq!(reapable_dead_pid("store"), None);
+        // And a real scratch name always round-trips (our live tree stays identified).
+        assert_eq!(
+            reapable_dead_pid(&scratch_name("build", &["oyacc"])),
+            Some(process::id())
+        );
+    }
+
+    #[test]
+    fn build_cache_is_a_distinct_authority_from_the_seed_store() {
+        // The opt-in reuse cache MUST live apart from the seed store/db: recipe OUTPUTS
+        // committed to the cache must never land in the seed authority (#468
+        // authenticates the seed db as seed-only). Assert the cache pair is under
+        // build-cache/ and shares no path with the seed store (<lw>/store) or db.
+        let lw = Path::new("/example/ladder");
+        let (cache_store, cache_db) = build_cache_paths(lw);
+        assert_eq!(cache_store, lw.join("build-cache").join("store"));
+        assert_eq!(cache_db, lw.join("build-cache").join("db"));
+        let seed_store = lw.join("store");
+        let seed_db = lw.join("db");
+        assert_ne!(cache_store, seed_store);
+        assert_ne!(cache_db, seed_db);
+        // Not even nested under the seed store — a fully separate subtree.
+        assert!(!cache_store.starts_with(&seed_store));
+        assert!(!cache_db.starts_with(&seed_db));
     }
 
     #[test]
