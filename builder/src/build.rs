@@ -454,6 +454,17 @@ fn tee_stream(
     }
 }
 
+/// A phase-watched run_cmd for sibling modules (mes_boot): same supervision
+/// as every mesboot Run step, without exporting the Watch type.
+pub(crate) fn run_cmd_phase(
+    prog: &str,
+    args: &[&str],
+    cwd: &str,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    run_cmd(prog, args, cwd, envs, &WATCH_PHASE)
+}
+
 /// Run a command with a CLEAN environment (`envs` only), in `cwd`, echoing it to
 /// the build log. Fail-closed: a non-zero exit aborts the build. Supervised by
 /// `watch` (#308): the child runs in its OWN process group with stdout/stderr
@@ -1502,7 +1513,7 @@ pub fn run_cmake() -> Result<(), String> {
 /// trees are read-only; the kaem build writes its artifacts INTO its tree). File
 /// exec bits are preserved; symlinks are recreated. Pure `std` — the stage0 rung
 /// has NO build inputs, so there is no coreutils `cp` in its sandbox to shell to.
-fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
+pub(crate) fn copy_tree_writable(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
@@ -1628,6 +1639,58 @@ pub fn run_stage0() -> Result<(), String> {
         &WATCH_PHASE,
     )?;
 
+    // Phases 12-23 of upstream's AMD64/kaem.run, driven directly (kaem.run
+    // itself is a bash wrapper; its whole job is these two kaem invocations
+    // plus the env block reproduced here). Full-kaem rebuilds M2-Planet from
+    // its C sources and builds M2-Mesoplanet, blood-elf, and get_machine into
+    // AMD64/bin; mescc-tools-extra then compiles the POSIX file tools (cp,
+    // chmod, mkdir, rm, replace, match, catm, untar, ungz, unbz2, unxz, wrap,
+    // sha256sum) with M2-Mesoplanet — the tools the mes/tcc rungs need so
+    // their build scripts stop depending on host coreutils (re #469).
+    let env_kv = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    };
+    let full_env = env_kv(&[
+        ("ARCH", "amd64"),
+        ("ARCH_DIR", "AMD64"),
+        ("BASE_ADDRESS", "0x00600000"),
+        ("BLOOD_FLAG", "--64"),
+        ("ENDIAN_FLAG", "--little-endian"),
+    ]);
+    run_cmd(
+        "./AMD64/bin/kaem",
+        &["--verbose", "--strict", "--file", "AMD64/mescc-tools-full-kaem.kaem"],
+        &cwd,
+        &full_env,
+        &WATCH_PHASE,
+    )?;
+    let extra_env = env_kv(&[
+        ("ARCH", "amd64"),
+        ("M2LIBC", "../M2libc"),
+        ("TOOLS", "../AMD64/bin"),
+        ("BINDIR", "../AMD64/bin"),
+        ("OPERATING_SYSTEM", "Linux"),
+        ("EXE_SUFFIX", ""),
+    ]);
+    let extra_cwd = tree.join("mescc-tools-extra");
+    run_cmd(
+        "../AMD64/bin/kaem",
+        &["--verbose", "--strict", "--file", "mescc-tools-extra.kaem"],
+        &extra_cwd.to_string_lossy(),
+        &extra_env,
+        &WATCH_PHASE,
+    )?;
+    // Upstream's own pinned answer file: every binary the chain produced must
+    // sha256-match the stage0-posix release's recorded hashes — the strongest
+    // output check available, and it runs with the just-built sha256sum.
+    run_cmd(
+        "./AMD64/bin/sha256sum",
+        &["-c", "amd64.answers"],
+        &cwd,
+        &[],
+        &WATCH_PHASE,
+    )?;
+
     // Install the built tool dirs — the exact paths the chain's downstream rungs
     // read ($tc/AMD64/bin/{M1,hex2,kaem}, $tc/AMD64/artifact/{M2,blood-elf-0,…}).
     for d in ["AMD64/bin", "AMD64/artifact"] {
@@ -1638,6 +1701,23 @@ pub fn run_stage0() -> Result<(), String> {
         "AMD64/bin/M1",
         "AMD64/bin/hex2",
         "AMD64/bin/kaem",
+        "AMD64/bin/M2-Planet",
+        "AMD64/bin/M2-Mesoplanet",
+        "AMD64/bin/blood-elf",
+        "AMD64/bin/get_machine",
+        "AMD64/bin/cp",
+        "AMD64/bin/chmod",
+        "AMD64/bin/mkdir",
+        "AMD64/bin/rm",
+        "AMD64/bin/replace",
+        "AMD64/bin/match",
+        "AMD64/bin/catm",
+        "AMD64/bin/untar",
+        "AMD64/bin/ungz",
+        "AMD64/bin/unbz2",
+        "AMD64/bin/unxz",
+        "AMD64/bin/wrap",
+        "AMD64/bin/sha256sum",
         "AMD64/artifact/M2",
         "AMD64/artifact/blood-elf-0",
         "AMD64/artifact/kaem-0",
@@ -1737,6 +1817,127 @@ impl StepCtx {
     }
 }
 
+/// One literal `SubstituteText` edit as the engine consumes it: `(from, to,
+/// expect)`. The recipe-side `TextEdit` struct serializes to this tuple over the
+/// build-JSON wire.
+type TextEdit = (String, String, usize);
+
+/// Apply a `Step::SubstituteText`'s literal, count-checked edits to `content`
+/// (re #469's host-free `patch`/`sed`). Each `(from, to, expect)` requires
+/// EXACTLY `expect` (≥ 1) occurrences of `from`, then replaces them all. Edits
+/// apply in order, so a later edit sees the earlier ones' result. `file` names
+/// the file only for errors. Fail-closed — any of these reds the rung:
+///   * an empty `from` (would match everywhere / be meaningless);
+///   * `expect == 0` (every declared edit must change something — this catches
+///     a `1`→`0` typo instead of silently no-op'ing on an assert-absent);
+///   * a non-ASCII byte in `from`/`to` (see below);
+///   * an actual occurrence count that differs from `expect` (source drift).
+///
+/// `from`/`to` are restricted to ASCII: the build-JSON reader (`json.rs::string`)
+/// decodes each wire byte as Latin-1 (`byte as char`), so a non-ASCII edit would
+/// not survive the recipe→engine round-trip intact — a non-ASCII `to` would write
+/// mangled bytes. ASCII is byte-identical through that path; anything else fails
+/// closed here rather than silently corrupting the patched output.
+fn apply_text_edits(
+    file: &str,
+    mut content: String,
+    edits: &[TextEdit],
+) -> Result<String, String> {
+    for (j, (from, to, expect)) in edits.iter().enumerate() {
+        let at = |m: String| format!("substituteText {file} edit {}: {m}", j + 1);
+        if from.is_empty() {
+            return Err(at("empty `from' string".into()));
+        }
+        if !from.is_ascii() || !to.is_ascii() {
+            return Err(at("`from'/`to' must be ASCII (the build-JSON reader is Latin-1)".into()));
+        }
+        if *expect == 0 {
+            return Err(at("`expect' is 0 — every edit must change at least one occurrence".into()));
+        }
+        let n = content.matches(from.as_str()).count();
+        if n != *expect {
+            return Err(at(format!("`from' occurs {n}× (expected {expect})")));
+        }
+        content = content.replace(from.as_str(), to);
+    }
+    Ok(content)
+}
+
+/// Write `bytes` to a REGULAR file `path`, preserving its ORIGINAL permission
+/// mode even when the file is read-only. Some GNU tarballs ship source files 0444
+/// (GNU patch's `pch.c`, less's `mkinstalldirs`), and a plain `fs::write` would
+/// then fail EACCES. Grant owner-write for the rewrite and restore the original
+/// mode, so the on-disk tree differs only in content — a source file's mode never
+/// reaches `$out` (install/copy sets output modes), so this stays reproducibility-
+/// safe. `symlink_metadata` (no symlink follow) fixes the target BEFORE granting
+/// write, so the grant/write/restore cannot land on a different file than the
+/// caller validated; a non-regular target is rejected. The restore runs even when
+/// the write fails (an error never leaves a 0444 source at 0644), the grant is
+/// skipped when the file is already writable, and a restore failure is surfaced,
+/// not swallowed (the write error takes precedence). (`patch_shebangs` open-codes
+/// a similar grant/restore inline because it must also restore mtimes *between*
+/// the write and the mode restore, which this helper deliberately does not.)
+fn write_preserving_mode(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}: not a regular file", path.display()),
+        ));
+    }
+    let orig_mode = meta.permissions().mode();
+    let granted = orig_mode & 0o200 == 0;
+    if granted {
+        fs::set_permissions(path, fs::Permissions::from_mode(orig_mode | 0o200))?;
+    }
+    let wrote = fs::write(path, bytes);
+    let restored = if granted {
+        fs::set_permissions(path, fs::Permissions::from_mode(orig_mode))
+    } else {
+        Ok(())
+    };
+    wrote.and(restored)
+}
+
+/// Parse a `substituteText` step: expand ONLY `file` (the target path) with
+/// `ctx`; read every edit's `from`/`to`/`expect` LITERALLY. `from`/`to` are
+/// source text — a `{in:…}`/`{src}` inside a patched hunk must survive verbatim,
+/// so they are NEVER template-expanded (only `file` is). Returns the expanded
+/// path and the literal edits (validated for content by `apply_text_edits`).
+fn parse_substitute_edits(
+    ctx: &StepCtx,
+    o: &Json,
+) -> Result<(String, Vec<TextEdit>), String> {
+    let file = ctx.expand(
+        o.get("file")
+            .and_then(Json::as_str)
+            .ok_or("substituteText: missing/non-string `file'")?,
+    )?;
+    let edits_json = o
+        .get("edits")
+        .and_then(Json::as_arr)
+        .ok_or("substituteText: `edits' not an array")?;
+    let mut edits: Vec<TextEdit> = Vec::with_capacity(edits_json.len());
+    for (j, e) in edits_json.iter().enumerate() {
+        let where_ = |m: String| format!("substituteText edit {}: {m}", j + 1);
+        let from = e
+            .get("from")
+            .and_then(Json::as_str)
+            .ok_or_else(|| where_("`from' missing or not a string".into()))?;
+        let to = e
+            .get("to")
+            .and_then(Json::as_str)
+            .ok_or_else(|| where_("`to' missing or not a string".into()))?;
+        let expect: usize = e
+            .get("expect")
+            .and_then(Json::as_str)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| where_("`expect' missing or not a count".into()))?;
+        edits.push((from.to_string(), to.to_string(), expect));
+    }
+    Ok((file, edits))
+}
+
 /// Minimal glob for mesboot `glob:` argv elements: exactly one `*`, in the LAST
 /// path component (`DIR/PRE*SUF`). Returns full paths of matching entries.
 fn glob_one_star(pat: &str) -> Result<Vec<String>, String> {
@@ -1804,6 +2005,15 @@ fn bytes_replace_all(hay: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Strip the absolute configure prefix (`{prefix}/lib/`) from GNU ld scripts in
+/// `dir` so their GROUP/AS_NEEDED members resolve via `-L`/`-B` instead of the
+/// build-time store path. Both `*.so` and `*.a` are considered: glibc ships ld
+/// scripts under both extensions (e.g. `libc.so`, and a `libm.a` that is a GNU
+/// ld script, not a real archive). The `head -c 80` "GNU ld script" content
+/// guard is what actually gates a rewrite, so a genuine `ar` archive named
+/// `*.a` is skipped untouched — the extension is only a cheap prefilter. This
+/// matches the x86_64 toolchain relocator (`toolchain_x86_64.rs`), which has
+/// always handled both extensions.
 fn relocate_ld_scripts(dir: &Path, prefix: &str) -> Result<(), String> {
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -1814,7 +2024,8 @@ fn relocate_ld_scripts(dir: &Path, prefix: &str) -> Result<(), String> {
     for entry in rd {
         let entry = entry.map_err(|e| format!("relocate ld scripts: read {}: {e}", dir.display()))?;
         let path = entry.path();
-        if path.extension() != Some(OsStr::new("so")) {
+        let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
+        if ext != "so" && ext != "a" {
             continue;
         }
         let bytes = fs::read(&path)
@@ -1955,6 +2166,25 @@ pub fn run_mesboot() -> Result<(), String> {
             let mode = if exec { 0o755 } else { 0o644 };
             fs::set_permissions(&path, fs::Permissions::from_mode(mode))
                 .map_err(|e| err(format!("chmod {path}: {e}")))?;
+        } else if let Some(o) = step.get("unpack") {
+            // Engine-native source unpack (re #469): td's own std-only
+            // tar/gzip/bzip2/xz readers — the rungs declare no unpacker
+            // packages, so `{in:tar}`-shaped host edges are gone from the
+            // graph. keepTop=false strips the unique top-level dir
+            // (`--strip-components=1`); anything else is a hard error.
+            let input = ctx.expand(&field(o, "input")?).map_err(err)?;
+            let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
+            let keep_top = o.get("keepTop").is_some_and(Json::is_true);
+            crate::tar::unpack_archive(Path::new(&input), Path::new(&dest), keep_top)
+                .map_err(err)?;
+        } else if let Some(o) = step.get("mesBoot") {
+            // The engine-native mes rung (re #469): configure + bootstrap +
+            // install of the pinned mes tarball, spawning only stage0 recipe
+            // outputs and the just-built mes — no host shell or coreutils.
+            let source = ctx.expand(&field(o, "source")?).map_err(err)?;
+            let nyacc = ctx.expand(&field(o, "nyacc")?).map_err(err)?;
+            let stage0 = ctx.expand(&field(o, "stage0")?).map_err(err)?;
+            crate::mes_boot::run(&source, &nyacc, &stage0, &ctx.out).map_err(err)?;
         } else if let Some(o) = step.get("copyFiles") {
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             for f in ctx.expand_all(&strs(o, "files")?).map_err(err)? {
@@ -1997,6 +2227,30 @@ pub fn run_mesboot() -> Result<(), String> {
                     return Err(err(format!("required product not an executable file: {p}")));
                 }
             }
+        } else if let Some(o) = step.get("assertStatic") {
+            // Runtime-provenance gate (re #469): each product must be a fully
+            // static ELF -- no host loader (PT_INTERP), no host libc (DT_NEEDED),
+            // no run-path. A dynamically linked tcc/make/yacc would pull a host
+            // loader + glibc in at run time; fail closed here naming the leak.
+            for p in ctx.expand_all(&strs(o, "paths")?).map_err(err)? {
+                crate::elf::assert_static(Path::new(&p)).map_err(err)?;
+            }
+        } else if let Some(o) = step.get("substituteText") {
+            // Host-free `patch`/`sed` (re #469): literal, fail-closed text edits
+            // in pure Rust. `parse_substitute_edits` expands ONLY `file`; the
+            // `from`/`to` source text stays literal (C braces / `{…}` pass
+            // through untouched). `apply_text_edits` requires each edit's exact
+            // occurrence count, so a drift in the pinned source reds the rung
+            // instead of silently no-op'ing; edits apply in order.
+            let (file, edits) = parse_substitute_edits(&ctx, o).map_err(err)?;
+            let content = fs::read_to_string(&file)
+                .map_err(|e| err(format!("substituteText: read {file}: {e}")))?;
+            let out = apply_text_edits(&file, content, &edits).map_err(err)?;
+            // Some tarballs ship source files READ-ONLY (GNU patch's pch.c is
+            // 0444); write_preserving_mode grants owner-write for the rewrite and
+            // restores the original mode, so the tree differs only in content.
+            write_preserving_mode(Path::new(&file), out.as_bytes())
+                .map_err(|e| err(format!("substituteText: write {file}: {e}")))?;
         } else {
             return Err(err("unknown step kind".into()));
         }
@@ -2008,6 +2262,167 @@ pub fn run_mesboot() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn edit(from: &str, to: &str, expect: usize) -> (String, String, usize) {
+        (from.to_string(), to.to_string(), expect)
+    }
+
+    #[test]
+    fn text_edits_apply_in_order_and_are_literal() {
+        // A patch-shaped edit set: single-line swap, a multi-line hunk, and a
+        // replacement whose `from` contains C braces / `{…}` that must NOT be
+        // treated as templates.
+        let src = "extern char *__progname;\nif (x) { g(); }\n#include <paths.h>\nvolatile sig_atomic_t s;\n";
+        let out = apply_text_edits(
+            "defs.h",
+            src.to_string(),
+            &[
+                edit("extern char *__progname;", "char *__progname;", 1),
+                edit("if (x) { g(); }", "if (x) { h(); }", 1),
+                edit("#include <paths.h>", "#include <getopt.h>", 1),
+                edit("volatile sig_atomic_t s;", "volatile int s;", 1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "char *__progname;\nif (x) { h(); }\n#include <getopt.h>\nvolatile int s;\n"
+        );
+    }
+
+    #[test]
+    fn text_edits_replace_every_occurrence_when_count_matches() {
+        let out = apply_text_edits("f", "a a a".to_string(), &[edit("a", "b", 3)]).unwrap();
+        assert_eq!(out, "b b b");
+    }
+
+    #[test]
+    fn text_edits_sequential_edits_see_prior_result() {
+        // Edit 2's `from` only exists after edit 1 has run.
+        let out = apply_text_edits(
+            "f",
+            "one".to_string(),
+            &[edit("one", "two", 1), edit("two", "three", 1)],
+        )
+        .unwrap();
+        assert_eq!(out, "three");
+    }
+
+    #[test]
+    fn text_edits_fail_closed_on_count_mismatch() {
+        // Pinned source drifted (0 matches) — must red, not silently no-op.
+        let e = apply_text_edits("main.c", "nothing here".to_string(), &[edit("mkstemp", "mktemp", 1)])
+            .unwrap_err();
+        assert!(e.contains("occurs 0×") && e.contains("expected 1"), "{e}");
+        // Under-counted expectation (2 present, said 1) also reds.
+        let e2 = apply_text_edits("main.c", "fd fd".to_string(), &[edit("fd", "fname", 1)]).unwrap_err();
+        assert!(e2.contains("occurs 2×"), "{e2}");
+    }
+
+    #[test]
+    fn text_edits_reject_empty_from() {
+        let e = apply_text_edits("f", "x".to_string(), &[edit("", "y", 1)]).unwrap_err();
+        assert!(e.contains("empty `from'"), "{e}");
+    }
+
+    #[test]
+    fn text_edits_reject_expect_zero() {
+        // `expect: 0` is a `1`→`0` typo trap (silently no-ops when absent), not a
+        // supported assert-absent — every declared edit must change something.
+        let e = apply_text_edits("f", "no match here".to_string(), &[edit("gone", "x", 0)])
+            .unwrap_err();
+        assert!(e.contains("`expect' is 0"), "{e}");
+    }
+
+    #[test]
+    fn text_edits_reject_non_ascii() {
+        // The build-JSON reader is Latin-1, so a non-ASCII edit can't round-trip:
+        // a non-ASCII `to` would write mangled bytes. Fail closed, don't corrupt.
+        let e_to = apply_text_edits("f", "cafe".to_string(), &[edit("cafe", "café", 1)])
+            .unwrap_err();
+        assert!(e_to.contains("must be ASCII"), "{e_to}");
+        let e_from = apply_text_edits("f", "x".to_string(), &[edit("café", "cafe", 1)])
+            .unwrap_err();
+        assert!(e_from.contains("must be ASCII"), "{e_from}");
+    }
+
+    #[test]
+    fn substitute_edits_expand_only_the_file_path_not_from_to() {
+        // The executor-level guarantee: `parse_substitute_edits` expands `{src}`
+        // in the FILE path, but `from`/`to` are literal source text — a `{in:…}`
+        // / `{src}` inside a hunk must NOT be template-expanded (it is real C
+        // that happens to contain braces). Pins the arm the 5 helper tests can't.
+        let ctx = StepCtx {
+            root: "/r".into(),
+            src: "/r/src".into(),
+            out: "/o".into(),
+            tools: "/r/tools".into(),
+            jobs: "4".into(),
+            inputs: vec![("mes".into(), "/td/store/abc-mes".into())],
+        };
+        let o = crate::json::parse(
+            r#"{"file":"{src}/x.c","edits":[{"from":"a{in:mes}b","to":"c{src}d","expect":"1"}]}"#,
+        )
+        .unwrap();
+        let (file, edits) = parse_substitute_edits(&ctx, &o).unwrap();
+        assert_eq!(file, "/r/src/x.c", "the file path IS expanded");
+        assert_eq!(
+            edits,
+            vec![("a{in:mes}b".to_string(), "c{src}d".to_string(), 1)],
+            "from/to stay literal — no template expansion"
+        );
+    }
+
+    #[test]
+    fn write_preserving_mode_rewrites_readonly_and_restores_mode() {
+        // GNU patch ships pch.c 0444; substituteText must still rewrite it and
+        // leave the mode untouched — a plain fs::write would EACCES (the bug this
+        // guards). PR-tier coverage: patch-mesboot's full build is UNPROVISIONED,
+        // so this is the only per-PR gate on the read-only rewrite path.
+        let d = std::env::temp_dir().join(format!("td-writero-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d); // clear any 0444 leftover from a crashed prior run
+        fs::create_dir_all(&d).unwrap();
+        let f = d.join("ro.c");
+        fs::write(&f, b"before").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
+
+        write_preserving_mode(&f, b"after").unwrap();
+
+        assert_eq!(fs::read_to_string(&f).unwrap(), "after", "read-only file rewritten");
+        assert_eq!(
+            fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "original 0444 mode restored"
+        );
+
+        // A writable target is rewritten too, mode left 0644 (grant skipped).
+        let w = d.join("rw.c");
+        fs::write(&w, b"x").unwrap();
+        fs::set_permissions(&w, fs::Permissions::from_mode(0o644)).unwrap();
+        write_preserving_mode(&w, b"y").unwrap();
+        assert_eq!(fs::read_to_string(&w).unwrap(), "y");
+        assert_eq!(fs::metadata(&w).unwrap().permissions().mode() & 0o777, 0o644);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn write_preserving_mode_rejects_symlink_target() {
+        // A symlinked target must be rejected (not followed) so the grant/write
+        // cannot land on a different file than substituteText validated.
+        let d = std::env::temp_dir().join(format!("td-writesym-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let real = d.join("real.c");
+        fs::write(&real, b"keep").unwrap();
+        let link = d.join("link.c");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let e = write_preserving_mode(&link, b"clobber").unwrap_err();
+
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        assert_eq!(fs::read_to_string(&real).unwrap(), "keep", "real file untouched");
+        fs::remove_dir_all(&d).unwrap();
+    }
 
     /// The test-process bash + a PATH env for the child (scripts use sleep etc.).
     fn bash_and_env() -> (String, Vec<(String, String)>) {
@@ -2070,14 +2485,20 @@ mod tests {
     }
 
     #[test]
-    fn mesboot_ld_script_relocation_rewrites_only_marked_so_scripts() {
+    fn mesboot_ld_script_relocation_rewrites_marked_so_and_a_scripts() {
         let d = std::env::temp_dir().join(format!("td-ldscripts-{}", std::process::id()));
         let lib = d.join("lib");
         fs::create_dir_all(&lib).unwrap();
         let script = "/* GNU ld script */\nGROUP ( /td/store/glibc-test/lib/libc.so.6 /td/store/glibc-test/lib/libc_nonshared.a )\n";
         fs::write(lib.join("libc.so"), script).unwrap();
         fs::write(lib.join("libextra.so"), b"not a linker script /td/store/glibc-test/lib/keep").unwrap();
-        fs::write(lib.join("libm.a"), b"/* GNU ld script */ /td/store/glibc-test/lib/keep").unwrap();
+        // A `.a` that IS a GNU ld script (glibc's libm.a) — must be relocated too,
+        // matching the busybox static-link fixup that this typed step replaces.
+        let marchive = "/* GNU ld script */\nGROUP ( /td/store/glibc-test/lib/libm.so.6 /td/store/glibc-test/lib/libmvec.a )\n";
+        fs::write(lib.join("libm.a"), marchive).unwrap();
+        // A `.a` that is a genuine `ar` archive — the "GNU ld script" content guard
+        // must leave it byte-for-byte untouched even though the extension matches.
+        fs::write(lib.join("libreal.a"), b"!<arch>\n/td/store/glibc-test/lib/keep").unwrap();
         fs::write(lib.join("libc.so.6"), b"\x7fELF /td/store/glibc-test/lib/keep").unwrap();
 
         relocate_ld_scripts(&lib, "/td/store/glibc-test").unwrap();
@@ -2085,10 +2506,13 @@ mod tests {
         let got = fs::read_to_string(lib.join("libc.so")).unwrap();
         assert!(got.contains("GROUP ( libc.so.6 libc_nonshared.a )"), "got: {got}");
         assert!(!got.contains("/td/store/glibc-test/lib/"), "prefix not stripped: {got}");
+        let mgot = fs::read_to_string(lib.join("libm.a")).unwrap();
+        assert!(mgot.contains("GROUP ( libm.so.6 libmvec.a )"), "got: {mgot}");
+        assert!(!mgot.contains("/td/store/glibc-test/lib/"), "prefix not stripped: {mgot}");
         let unmarked = fs::read(lib.join("libextra.so")).unwrap();
         assert!(bytes_contains(&unmarked, b"/td/store/glibc-test/lib/keep"));
-        let archive = fs::read(lib.join("libm.a")).unwrap();
-        assert!(bytes_contains(&archive, b"/td/store/glibc-test/lib/keep"));
+        let real = fs::read(lib.join("libreal.a")).unwrap();
+        assert!(bytes_contains(&real, b"/td/store/glibc-test/lib/keep"), "real ar archive was rewritten");
         let versioned = fs::read(lib.join("libc.so.6")).unwrap();
         assert!(bytes_contains(&versioned, b"/td/store/glibc-test/lib/keep"));
         fs::remove_dir_all(&d).unwrap();

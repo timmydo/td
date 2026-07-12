@@ -9,8 +9,8 @@
 //! a boa oracle (boa/the `verify`-against-boa CLI subcommand are both retired — nothing
 //! left to diff against).
 //!
-//! Offline by construction (the cargo-test pattern): the guix-free tools/provision-rust.sh +
-//! tools/provision-cc.sh resolve the warm rust + cc toolchain onto PATH — NOT a `guix shell`
+//! Offline by construction (the cargo-test pattern): the guix-free in-process resolvers
+//! (`stage0::provision_rust`/`provision_cc`) put the warm rust + cc toolchain onto PATH — NOT a `guix shell`
 //! process (R1, github issue #274); the crate has NO [dependencies] so `--frozen` touches no
 //! network. No guix package is built via `guix build -e (system M) PKG` either — this gate
 //! adds no new guix packager surface (directive 6).

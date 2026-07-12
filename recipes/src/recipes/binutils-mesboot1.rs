@@ -20,10 +20,6 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot0}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
             ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
         ],
     });
     steps.push(
@@ -55,8 +51,8 @@ pub fn recipe() -> Recipe {
     for target in [None, Some("install")] {
         let mut argv: Vec<&str> = vec![
             "{in:make-mesboot0}/bin/make",
-            "SHELL={in:bash}/bin/bash",
-            "CONFIG_SHELL={in:bash}/bin/bash",
+            "SHELL={in:bash-mesboot}/bin/bash",
+            "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
         ];
         if let Some(t) = target {
             argv.push(t);
@@ -84,6 +80,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot0",
             "glibc-mesboot0",
         ])
-        .inputs_owned(base_inputs(&["patch-binutils-boot-2.20.1a", "linux-headers", "flex", "bison"]))
+        .inputs_owned(base_inputs(&["patch-binutils-boot-2.20.1a", "linux-headers"]))
         .steps(steps)
 }

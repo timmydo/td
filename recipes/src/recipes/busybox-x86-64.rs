@@ -1,4 +1,4 @@
-use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{base_inputs, base_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // BusyBox 1.37.0, rung 2 of the #388 build userland: built FROM SOURCE by the
@@ -26,7 +26,10 @@ pub fn recipe() -> Recipe {
         shell: SH.into(),
     });
     // Static BusyBox links libm.a, which is a GNU ld script in glibc. Relocate a
-    // private sysroot copy so the script's GROUP members resolve via -B/-L.
+    // private sysroot copy so the script's GROUP members resolve via -B/-L. The
+    // typed RelocateLdScripts step is the host-tool-free equivalent of the old
+    // `head|grep|sed` loop: it strips `{prefix}/lib/` from every `*.so`/`*.a`
+    // whose first 80 bytes mark it a GNU ld script (real archives are skipped).
     steps.push(Step::CopyTree {
         from: format!("{xglibc}/include"),
         dest: "{root}/sysroot/include".into(),
@@ -35,20 +38,7 @@ pub fn recipe() -> Recipe {
         from: format!("{xglibc}/lib"),
         dest: "{root}/sysroot/lib".into(),
     });
-    steps.push(
-        Step::run(
-            "{root}",
-            &[
-                SH,
-                "-c",
-                "for p in {root}/sysroot/lib/*.so {root}/sysroot/lib/*.a; do \
-                 [ -f \"$p\" ] || continue; \
-                 head -c 80 \"$p\" | grep -q 'GNU ld script' || continue; \
-                 sed -i 's,/td/store/glibc-2.41-x86_64/lib/,,g' \"$p\"; done",
-            ],
-        )
-        .env("PATH", &base_path()),
-    );
+    steps.push(relocate_ld_scripts("{root}/sysroot", "/td/store/glibc-2.41-x86_64"));
     // BusyBox's Kbuild builds host helpers, then runs them during the build. glibc
     // popen(3) in those helpers hardcodes /bin/sh, so provide it inside the
     // ephemeral build sandbox from the declared bash input.
@@ -58,7 +48,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "if [ ! -e /bin/sh ]; then mkdir -p /bin && ln -sf \"{in:bash}/bin/bash\" /bin/sh; fi",
+                "if [ ! -e /bin/sh ]; then mkdir -p /bin && ln -sf \"{in:bash-mesboot}/bin/bash\" /bin/sh; fi",
             ],
         )
         .env("PATH", &base_path()),
@@ -78,8 +68,8 @@ pub fn recipe() -> Recipe {
                 "{in:make-x86-64}/bin/make",
                 "CC={root}/wb/cc",
                 "HOSTCC={root}/wb/cc",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "defconfig",
             ],
         )
@@ -106,7 +96,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "yes '' | \"{in:make-x86-64}/bin/make\" CC=\"{root}/wb/cc\" HOSTCC=\"{root}/wb/cc\" SHELL=\"{in:bash}/bin/bash\" CONFIG_SHELL=\"{in:bash}/bin/bash\" oldconfig >/dev/null",
+                "yes '' | \"{in:make-x86-64}/bin/make\" CC=\"{root}/wb/cc\" HOSTCC=\"{root}/wb/cc\" SHELL=\"{in:bash-mesboot}/bin/bash\" CONFIG_SHELL=\"{in:bash-mesboot}/bin/bash\" oldconfig >/dev/null",
             ],
         )
         .env("PATH", &path)
@@ -124,8 +114,8 @@ pub fn recipe() -> Recipe {
                 "CC={root}/wb/cc",
                 "HOSTCC={root}/wb/cc",
                 "SKIP_STRIP=y",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
             ],
         )
         .env("PATH", &path)
@@ -151,7 +141,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "for a in sh ls sed grep awk tar gzip cat echo mkdir rm cp true false env printf; do ln -sf busybox \"$a\"; done",
+                "for a in sh ls sed grep awk tar gzip cat echo mkdir rm cp true false env printf sleep sort head tail basename dirname mktemp tee touch tr test pwd comm; do ln -sf busybox \"$a\"; done",
             ],
         )
         .env("PATH", &base_path()),

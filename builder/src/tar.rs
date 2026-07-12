@@ -18,6 +18,122 @@ pub fn extract_tar_gz(tar_gz: &Path, dest: &Path) -> Result<(), String> {
     extract_tar_reader(&mut reader, &tar_gz.display().to_string(), dest)
 }
 
+pub fn extract_tar_bz2(tar_bz2: &Path, dest: &Path) -> Result<(), String> {
+    let bytes = crate::bzip2::decompress_file(tar_bz2)?;
+    let mut reader = Cursor::new(bytes);
+    extract_tar_reader(&mut reader, &tar_bz2.display().to_string(), dest)
+}
+
+pub fn extract_tar_xz(tar_xz: &Path, dest: &Path) -> Result<(), String> {
+    let data = fs::read(tar_xz).map_err(|e| format!("read {}: {e}", tar_xz.display()))?;
+    let bytes = crate::xz::decompress(&data)?;
+    let mut reader = Cursor::new(bytes);
+    extract_tar_reader(&mut reader, &tar_xz.display().to_string(), dest)
+}
+
+/// Unpack a tarball by MAGIC BYTES (gzip 1f8b, bzip2 "BZh", xz fd377a585a00;
+/// anything else is read as plain tar) — the engine-native `unpack` step's
+/// entry, so no rung declares tar/gzip/bzip2/xz packages just to open its
+/// source (re #469). `keep_top: false` = `tar --strip-components=1`: the
+/// archive must have a UNIQUE top-level directory, which is elided; multiple
+/// top-level entries under strip is a hard error, never a silent mangle.
+pub fn unpack_archive(tarball: &Path, dest: &Path, keep_top: bool) -> Result<(), String> {
+    let extract_into = |d: &Path| -> Result<(), String> {
+        let mut f = File::open(tarball).map_err(|e| format!("open {}: {e}", tarball.display()))?;
+        let mut magic = [0u8; 6];
+        let n = f.read(&mut magic).map_err(|e| format!("read {}: {e}", tarball.display()))?;
+        match magic.get(..n).unwrap_or(&[]) {
+            [0x1f, 0x8b, ..] => extract_tar_gz(tarball, d),
+            [b'B', b'Z', b'h', ..] => extract_tar_bz2(tarball, d),
+            [0xfd, b'7', b'z', b'X', b'Z', 0x00, ..] => extract_tar_xz(tarball, d),
+            _ => extract_tar(tarball, d),
+        }
+    };
+    if keep_top {
+        return extract_into(dest);
+    }
+    // Strip the top-level dir: extract beside dest (same filesystem, so the
+    // child renames below are atomic moves), then hoist the unique top dir's
+    // children into dest. The tmp name APPENDS to dest's file name —
+    // `with_extension` would replace an existing extension, letting two
+    // distinct dests collide on one tmp path (and the pre-clean below would
+    // then delete the other unpack's tree).
+    let tmp = match dest.file_name() {
+        Some(name) => {
+            let mut t = name.to_os_string();
+            t.push(".unpack-tmp");
+            dest.with_file_name(t)
+        }
+        None => {
+            return Err(format!(
+                "unpack {}: destination {} has no file name to place a tmp dir beside",
+                tarball.display(),
+                dest.display()
+            ))
+        }
+    };
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp).map_err(|e| format!("clear {}: {e}", tmp.display()))?;
+    }
+    extract_into(&tmp)?;
+    let mut tops = fs::read_dir(&tmp)
+        .map_err(|e| format!("read {}: {e}", tmp.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read {}: {e}", tmp.display()))?;
+    // The sole top entry must be a REAL directory — `file_type()` does not
+    // follow symlinks. A symlink-to-dir top would make the hoist read and
+    // rename through the link's target, moving files out of a tree OUTSIDE
+    // the extracted archive.
+    let top = match (tops.pop(), tops.is_empty()) {
+        (Some(t), true) if t.file_type().is_ok_and(|ft| ft.is_dir()) => t.path(),
+        _ => {
+            return Err(format!(
+                "unpack {}: stripping the top level needs exactly one top-level directory",
+                tarball.display()
+            ))
+        }
+    };
+    fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    merge_move(&top, dest)?;
+    fs::remove_dir_all(&tmp).map_err(|e| format!("clear {}: {e}", tmp.display()))?;
+    Ok(())
+}
+
+/// Move FROM's children into DEST, MERGING into existing directories (the
+/// `tar --strip-components=1` overlay semantics some rungs rely on — e.g. a
+/// g++ add-on tarball unpacked over its gcc tree). Files/symlinks rename over
+/// an existing file; a file/directory kind clash is a hard error.
+fn merge_move(from: &Path, dest: &Path) -> Result<(), String> {
+    for ent in fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))? {
+        let ent = ent.map_err(|e| format!("read {}: {e}", from.display()))?;
+        let src = ent.path();
+        let to = dest.join(ent.file_name());
+        let src_is_dir = ent
+            .file_type()
+            .map_err(|e| format!("stat {}: {e}", src.display()))?
+            .is_dir();
+        let to_meta = fs::symlink_metadata(&to);
+        match (src_is_dir, to_meta) {
+            // Nothing at the target: a plain move either way.
+            (_, Err(_)) => fs::rename(&src, &to)
+                .map_err(|e| format!("move {} -> {}: {e}", src.display(), to.display()))?,
+            // Dir onto dir: recurse-merge.
+            (true, Ok(m)) if m.is_dir() => merge_move(&src, &to)?,
+            // File/symlink onto file/symlink: replace (rename semantics).
+            (false, Ok(m)) if !m.is_dir() => fs::rename(&src, &to)
+                .map_err(|e| format!("move {} -> {}: {e}", src.display(), to.display()))?,
+            _ => {
+                return Err(format!(
+                    "unpack merge: {} and {} disagree on file vs directory",
+                    src.display(),
+                    to.display()
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn extract_tar_reader<R: Read>(
     file: &mut R,
     source_name: &str,
@@ -559,6 +675,81 @@ mod tests {
 
         assert!(err.contains("must not carry 1 data bytes"), "got: {err}");
         assert!(!out.join("link").exists());
+    }
+
+    #[test]
+    fn strip_top_unpack_merges_an_overlay_tree() {
+        let tmp = temp_dir("td-tar-overlay-test");
+        let dest = tmp.join("src");
+        let core = tmp.join("core.tar");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "core-1.0/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "core-1.0/gcc/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "core-1.0/gcc/common.c", b'0', 0o644, 4, "");
+        append_data(&mut bytes, b"core");
+        append_header(&mut bytes, "core-1.0/README", b'0', 0o644, 4, "");
+        append_data(&mut bytes, b"core");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&core, bytes).unwrap();
+        let gpp = tmp.join("gpp.tar");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "gpp-1.0/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "gpp-1.0/gcc/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "gpp-1.0/gcc/cp.c", b'0', 0o644, 3, "");
+        append_data(&mut bytes, b"gpp");
+        append_header(&mut bytes, "gpp-1.0/README", b'0', 0o644, 3, "");
+        append_data(&mut bytes, b"gpp");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&gpp, bytes).unwrap();
+
+        unpack_archive(&core, &dest, false).unwrap();
+        unpack_archive(&gpp, &dest, false).unwrap();
+
+        // The overlay MERGED into the existing tree (the g++ add-on tarball
+        // over its gcc core tree): the core file survives beside the
+        // overlay's, and the colliding file is replaced by the overlay.
+        assert_eq!(fs::read(dest.join("gcc/common.c")).unwrap(), b"core");
+        assert_eq!(fs::read(dest.join("gcc/cp.c")).unwrap(), b"gpp");
+        assert_eq!(fs::read(dest.join("README")).unwrap(), b"gpp");
+    }
+
+    #[test]
+    fn strip_top_unpack_refuses_a_symlink_top() {
+        let tmp = temp_dir("td-tar-symlink-top-test");
+        let outside = tmp.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"k").unwrap();
+        let tar = tmp.join("test.tar");
+        let dest = tmp.join("src");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "top", b'2', 0o777, 0, outside.to_str().unwrap());
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        // A sole top-level SYMLINK (even to a real directory) must refuse:
+        // following it would hoist files out of the link's target tree.
+        let err = unpack_archive(&tar, &dest, false).expect_err("symlink top must red");
+
+        assert!(err.contains("exactly one top-level directory"), "got: {err}");
+        assert!(outside.join("keep").exists());
+    }
+
+    #[test]
+    fn strip_top_unpack_refuses_file_directory_kind_clash() {
+        let tmp = temp_dir("td-tar-overlay-clash-test");
+        let dest = tmp.join("src");
+        fs::create_dir_all(dest.join("gcc")).unwrap();
+        let tar = tmp.join("clash.tar");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "x-1.0/", b'5', 0o755, 0, "");
+        append_header(&mut bytes, "x-1.0/gcc", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"x");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = unpack_archive(&tar, &dest, false).expect_err("kind clash must red");
+
+        assert!(err.contains("disagree on file vs directory"), "got: {err}");
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

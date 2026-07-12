@@ -31,7 +31,6 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::io::BufRead;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -287,10 +286,11 @@ impl RustInputs {
         let libz_dir = pick("zlib-x86-64")?.join(ZLIB_X86_64_LIB);
         let glibc_interp = format!("{}/lib/ld-linux-x86-64.so.2", glibc.display());
         // unpack the pinned release tarball IN-SANDBOX (TD_SRC is the raw .tar.gz — the
-        // recipe's .source()) with the declared tar/gzip inputs, as ladder::unpack_into does.
+        // recipe's .source()) with the ENGINE's own readers: no unpacker inputs, no
+        // subprocess (tar/gzip left BASE_TOOLS with Step::Unpack, re #469).
         let tarball = PathBuf::from(g("TD_SRC")?);
         let extract = mktemp_dir("td-rust-src")?;
-        unpack_rust_release(&map, &tarball, &extract)?;
+        unpack_rust_release(&tarball, &extract)?;
         Ok(RustInputs {
             src: extract,
             glibc,
@@ -302,102 +302,30 @@ impl RustInputs {
     }
 }
 
-/// Unpack the pinned Rust release `.tar.gz` into `dest` (top-level dir stripped) using the
-/// declared tar/gzip inputs (resolved from TD_INPUT_MAP by name) — no host PATH dependency,
-/// mirroring `untar`'s Xz pipe form: `gzip -dc TARBALL | tar -xf - --strip-components=1`.
-fn unpack_rust_release(map: &crate::json::Json, tarball: &Path, dest: &Path) -> Result<(), String> {
-    let pick_bin = |name: &str, bin: &str| -> Result<PathBuf, String> {
-        map.get(name)
-            .and_then(crate::json::Json::as_str)
-            .map(|p| Path::new(p).join("bin").join(bin))
-            .ok_or_else(|| format!("rust-toolchain: lock is missing the `{name}' input (needed to unpack the release tarball in-sandbox)"))
-    };
-    let tar = pick_bin("tar", "tar")?;
-    let gzip = pick_bin("gzip", "gzip")?;
-    fs::create_dir_all(dest).map_err(ioerr("mkdir rust src dest"))?;
-    let what = format!("unpack {}", tarball.display());
-    // The release is the COMBINED installer tarball (rustc + cargo + rust-std + docs + rustfmt +
-    // clippy + rls + analysis + …); assemble_rust_tree consumes ONLY rustc/, cargo/, and
-    // rust-std-<triple>/. Extract just those top-level dirs (tar extracts a named directory
-    // recursively) to avoid writing ~1 GB of unused components — as the retired shell path's
-    // selective member extraction did. Derive the single top-level dir from the first archive entry.
-    let top = gz_tar_top(&gzip, &tar, tarball)?;
-    let members = [
-        format!("{top}/rustc"),
-        format!("{top}/cargo"),
-        format!("{top}/rust-std-x86_64-unknown-linux-gnu"),
-    ];
-    let mut dec = Command::new(&gzip)
-        .arg("-dc")
-        .arg(tarball)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{what}: spawn gzip: {e}"))?;
-    let stdout = dec.stdout.take().ok_or_else(|| format!("{what}: gzip produced no stdout"))?;
-    let mut tarc = Command::new(&tar);
-    tarc.arg("-xf").arg("-").arg("--strip-components=1").arg("-C").arg(dest);
-    for m in &members {
-        tarc.arg(m);
-    }
-    // GNU tar reads to EOF selecting the named members (no --occurrence), so gzip decompresses
-    // the whole stream and exits 0 on a good archive; a corrupt/truncated .tar.gz makes gzip fail
-    // while tar can still exit 0 on the partial stream, so check BOTH (as untar's Xz path does).
-    let status = tarc
-        .stdin(Stdio::from(stdout))
-        .status()
-        .map_err(|e| format!("{what}: spawn tar: {e}"))?;
-    let dec_status = dec.wait().map_err(|e| format!("{what}: wait gzip: {e}"))?;
-    if !status.success() {
-        return Err(format!("{what}: tar failed"));
-    }
-    if !dec_status.success() {
-        return Err(format!("{what}: gzip decompression failed"));
-    }
-    // Guard the selection: every consumed member must have landed (a layout drift would else
-    // surface three rungs later as a confusing "cp rustc" copy error).
+/// Unpack the pinned Rust release `.tar.gz` into `dest` (top-level dir stripped) with the
+/// ENGINE's own gzip/tar readers (`crate::tar::unpack_archive`) — no subprocess, no
+/// unpacker inputs at all: tar/gzip left `BASE_TOOLS` with `Step::Unpack`, and the
+/// transform admits no host tool (re #469). The combined installer carries components
+/// `assemble_rust_tree` never reads (docs, rustfmt, clippy, …); the full unpack writes
+/// them to the build scratch only — the assemble step copies rustc/, cargo/, and
+/// rust-std-*/ into `$out`, so the extra members cost scratch bytes, never output bytes.
+/// NOTE at the next rust-pin bump: the engine tar reader caps a single entry at
+/// `tar::MAX_TAR_ENTRY_BYTES` (256 MiB) — a limit host `tar` never imposed. Today's
+/// members are well under it; a future release with a >256 MiB member (a fat
+/// libLLVM/debuginfo blob) would red here, and the cap would need raising in lockstep.
+fn unpack_rust_release(tarball: &Path, dest: &Path) -> Result<(), String> {
+    crate::tar::unpack_archive(tarball, dest, false)?;
+    // Guard the layout: every consumed member must have landed (a release-layout drift
+    // would else surface three rungs later as a confusing "cp rustc" copy error).
     for sub in ["rustc/bin/rustc", "cargo/bin/cargo"] {
         if !dest.join(sub).exists() {
-            return Err(format!("{what}: extracted release is missing {sub} (top dir `{top}'?)"));
+            return Err(format!(
+                "unpack {}: extracted release is missing {sub} (release layout drift?)",
+                tarball.display()
+            ));
         }
     }
     Ok(())
-}
-
-/// The single top-level directory name inside the gz tarball (e.g.
-/// `rust-1.96.0-x86_64-unknown-linux-gnu`), read from its FIRST entry (stop after one line — no
-/// full-archive decompress). Used to name the members `unpack_rust_release` selectively extracts.
-fn gz_tar_top(gzip: &Path, tar: &Path, tarball: &Path) -> Result<String, String> {
-    let mut dec = Command::new(gzip)
-        .arg("-dc")
-        .arg(tarball)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("list {}: spawn gzip: {e}", tarball.display()))?;
-    let gout = dec.stdout.take().ok_or("list: gzip produced no stdout")?;
-    let mut tarc = Command::new(tar)
-        .arg("-tf")
-        .arg("-")
-        .stdin(Stdio::from(gout))
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("list: spawn tar: {e}"))?;
-    let tout = tarc.stdout.take().ok_or("list: tar produced no stdout")?;
-    let mut first = String::new();
-    io::BufReader::new(tout)
-        .read_line(&mut first)
-        .map_err(|e| format!("list: read tar listing: {e}"))?;
-    // Stop early: reap both children (tar/gzip get SIGPIPE once we drop the read side — expected).
-    let _ = tarc.kill();
-    let _ = tarc.wait();
-    let _ = dec.kill();
-    let _ = dec.wait();
-    let top = first
-        .trim_end_matches(['\n', '\r'])
-        .split('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("list: no top-level dir in {}", tarball.display()))?;
-    Ok(top.to_string())
 }
 
 /// `rust-toolchain-build` phase runner (#380): assemble + relink the /td/store rust tree
@@ -1171,6 +1099,73 @@ mod tests {
 
     fn tmp(prefix: &str) -> PathBuf {
         mktemp_dir(prefix).expect("mktemp")
+    }
+
+    // A minimal uncompressed ustar archive of `(path, contents)` members —
+    // `unpack_archive` dispatches to its raw-tar reader when there is no
+    // compression magic, so this drives `unpack_rust_release` end to end with
+    // no gzip writer. One 512-byte header per member + content padded to 512,
+    // then two zero blocks.
+    fn ustar(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (path, body) in members {
+            let mut h = [0u8; 512];
+            let name = path.as_bytes();
+            h.get_mut(..name.len()).map(|s| s.copy_from_slice(name));
+            let put = |h: &mut [u8; 512], off: usize, s: &str| {
+                let b = s.as_bytes();
+                h.get_mut(off..off + b.len()).map(|d| d.copy_from_slice(b));
+            };
+            put(&mut h, 100, "0000644\0"); // mode
+            put(&mut h, 108, "0000000\0"); // uid
+            put(&mut h, 116, "0000000\0"); // gid
+            put(&mut h, 124, &format!("{:011o}\0", body.len())); // size
+            put(&mut h, 136, "00000000000\0"); // mtime
+            h.get_mut(156).map(|b| *b = b'0'); // typeflag: regular file
+            put(&mut h, 257, "ustar\0"); // magic
+            put(&mut h, 263, "00"); // version
+            // Checksum: sum of all bytes with the checksum field taken as spaces.
+            h.get_mut(148..156).map(|s| s.fill(b' '));
+            let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+            put(&mut h, 148, &format!("{sum:06o}\0 "));
+            out.extend_from_slice(&h);
+            out.extend_from_slice(body);
+            let pad = (512 - body.len() % 512) % 512;
+            out.extend(std::iter::repeat_n(0u8, pad));
+        }
+        out.extend(std::iter::repeat_n(0u8, 1024));
+        out
+    }
+
+    // re #469 round-10 P2: PR-tier coverage for the engine-native rust unpack
+    // (the recipe check is daily-tier). A well-formed release strips its top
+    // dir and lands rustc/cargo; a release missing cargo reds at the guard
+    // instead of three rungs later.
+    #[test]
+    fn unpack_rust_release_strips_top_and_guards_layout() {
+        let d = tmp("td-rust-unpack");
+        let top = "rust-1.96.0-x86_64-unknown-linux-gnu";
+        let good = d.join("good.tar");
+        fs::write(
+            &good,
+            ustar(&[
+                (&format!("{top}/rustc/bin/rustc"), b"#!rustc\n"),
+                (&format!("{top}/cargo/bin/cargo"), b"#!cargo\n"),
+            ]),
+        )
+        .expect("write good tar");
+        let out = d.join("good-out");
+        unpack_rust_release(&good, &out).expect("well-formed release unpacks");
+        assert!(out.join("rustc/bin/rustc").is_file(), "rustc not stripped into place");
+        assert!(out.join("cargo/bin/cargo").is_file(), "cargo not stripped into place");
+
+        // A release missing cargo reds at the existence guard.
+        let bad = d.join("bad.tar");
+        fs::write(&bad, ustar(&[(&format!("{top}/rustc/bin/rustc"), b"#!rustc\n")]))
+            .expect("write bad tar");
+        let err = unpack_rust_release(&bad, &d.join("bad-out")).unwrap_err();
+        assert!(err.contains("missing cargo/bin/cargo"), "{err}");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

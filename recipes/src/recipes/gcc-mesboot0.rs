@@ -80,8 +80,8 @@ pub fn recipe() -> Recipe {
             "{src}",
             &[
                 "{in:make-mesboot0}/bin/make",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "CC={in:gcc-core-mesboot0}/bin/gcc",
                 "RANLIB=true",
                 "LIBGCC2_INCLUDES=-I {in:gcc-core-mesboot0}/include",
@@ -97,7 +97,7 @@ pub fn recipe() -> Recipe {
             "{src}",
             &[
                 "{in:make-mesboot0}/bin/make",
-                "SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
                 "CC={in:gcc-core-mesboot0}/bin/gcc",
                 "RANLIB=true",
                 "LANGUAGES=c",

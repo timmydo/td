@@ -32,6 +32,10 @@ use td_recipe::catalog;
 mod check_runner;
 #[path = "td_recipe_eval/checks/mod.rs"]
 mod checks;
+#[path = "td_recipe_eval/seed_digests.rs"]
+mod seed_digests;
+#[path = "td_recipe_eval/sha256.rs"]
+mod sha256;
 
 #[allow(
     clippy::unwrap_used,
@@ -44,6 +48,19 @@ mod checks;
 )] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn die(msg: &str) -> ! {
     eprintln!("td-recipe-eval: {msg}");
+    exit(2);
+}
+
+/// check-run/build-run errors: a planning-time provenance rejection exits 69
+/// (EX_UNAVAILABLE) so callers — td-builder's loop prelude provisioning the
+/// userland — can branch on "the bootstrap graph cannot be realized with
+/// admissible inputs anywhere" (re #469) without parsing stderr prose. Every
+/// other error keeps the usage exit (2).
+fn die_runner(msg: &str) -> ! {
+    eprintln!("td-recipe-eval: {msg}");
+    if msg.starts_with(check_runner::PROVENANCE_REJECTED) {
+        exit(69);
+    }
     exit(2);
 }
 
@@ -174,13 +191,13 @@ fn main() {
         Some("check-run") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::cli(rest) {
-                die(&e);
+                die_runner(&e);
             }
         }
         Some("build-run") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::build_cli(rest) {
-                die(&e);
+                die_runner(&e);
             }
         }
         Some("source-pins") => {
@@ -189,7 +206,15 @@ fn main() {
             }
             print_source_pins();
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|source-pins ..."),
+        Some("seed-digests") => {
+            if args.get(2).is_some() {
+                die("usage: seed-digests");
+            }
+            if let Err(e) = check_runner::seed_digests_cli() {
+                die_runner(&e);
+            }
+        }
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|source-pins|seed-digests ..."),
     }
 }
 
@@ -289,9 +314,13 @@ mod tests {
     #[test]
     fn source_pins_cli_surface_has_the_legacy_lock_count() {
         let pins = td_recipe::source_pins::all();
-        assert_eq!(pins.len(), 32);
+        // 32 migrated legacy locks + oyacc-6.6 (the bash shell's `yacc`) +
+        // bash-2.05b (the from-source bootstrap shell, re #469).
+        assert_eq!(pins.len(), 34);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
+        assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
+        assert!(pins.iter().any(|pin| pin.key == "bash-mesboot-source"));
     }
 
     #[test]

@@ -93,6 +93,27 @@ pub enum Step {
         content: String,
         exec: bool,
     },
+    /// Unpack a source tarball (`.tar`/`.tar.gz`/`.tar.bz2`/`.tar.xz` by
+    /// magic bytes) into dest with the ENGINE's own std-only readers — no
+    /// tar/gzip/bzip2/xz package in the sandbox at all (re #469: an unpacker
+    /// was every rung's excuse for host-tool inputs). `keep_top: false`
+    /// strips the single top-level directory (`tar --strip-components=1`);
+    /// the engine hard-errors if the tarball has no unique top-level dir.
+    Unpack {
+        input: String,
+        dest: String,
+        keep_top: bool,
+    },
+    /// The ENGINE-NATIVE mes bootstrap rung (builder's `mes_boot::run`, re
+    /// #469): the Rust port of the mes tarball's configure.sh, bootstrap.sh,
+    /// and install.sh. The only subprocesses are stage0 recipe outputs (kaem
+    /// driving upstream's own kaem.run) and the just-built mes running
+    /// upstream's mescc.scm — the rung declares NO host shell or coreutils.
+    MesBoot {
+        source: String,
+        nyacc: String,
+        stage0: String,
+    },
     /// Copy files (flat) into dest, made user-writable (build trees are written into).
     CopyFiles {
         files: Vec<String>,
@@ -129,6 +150,53 @@ pub enum Step {
         paths: Vec<String>,
         exec: bool,
     },
+    /// Apply literal, fail-closed text edits to a file in place — the host-free
+    /// stand-in for `patch`/`sed` (re #469: the sandbox ships neither, and
+    /// stage0's `replace` cannot carry the space-bearing, multi-line strings a
+    /// real patch hunk needs through kaem's quote-stripping tokenizer). Each
+    /// edit replaces EVERY occurrence of `from` with `to`, requiring exactly
+    /// `expect` (≥ 1) occurrences first, so a drift in the pinned source — or a
+    /// transcription slip — reds the rung instead of silently doing nothing.
+    /// Edits apply in order (an edit sees the previous edits' result). Only
+    /// `file` is template-expanded; `from`/`to` are LITERAL source text, so C
+    /// braces and `{…}` pass through untouched. The engine also reds an empty
+    /// `from`, an `expect` of 0, or any non-ASCII byte in `from`/`to` (the
+    /// build-JSON wire reader is Latin-1, so only ASCII round-trips faithfully).
+    SubstituteText {
+        file: String,
+        edits: Vec<TextEdit>,
+    },
+    /// Assert each product is a FULLY STATIC ELF — no `PT_INTERP` (host loader),
+    /// no `DT_NEEDED` (host libc), no `DT_RPATH`/`DT_RUNPATH` — the runtime-
+    /// provenance gate for the pre-libc rungs (re #469). tcc/make/yacc are all
+    /// linked `-static`; a regression that reintroduced a program interpreter or
+    /// a `libc.so` dependency would drag a host loader + glibc back in at run
+    /// time — exactly the host-runtime ingress #469 closes. This reds the rung,
+    /// naming the offending binary and leak, so the leak never reaches a later
+    /// rung. Fails closed on a non-ELF too (the parser rejects bad magic).
+    AssertStatic {
+        paths: Vec<String>,
+    },
+}
+
+/// One literal edit within a [`Step::SubstituteText`]: replace every occurrence
+/// of `from` with `to`, requiring exactly `expect` (≥ 1) occurrences. `from`/`to`
+/// must be ASCII (the build-JSON wire reader is Latin-1).
+#[derive(Clone)]
+pub struct TextEdit {
+    pub from: String,
+    pub to: String,
+    pub expect: usize,
+}
+
+impl TextEdit {
+    pub fn new(from: &str, to: &str, expect: usize) -> TextEdit {
+        TextEdit {
+            from: from.into(),
+            to: to.into(),
+            expect,
+        }
+    }
 }
 
 impl Step {
@@ -149,6 +217,17 @@ impl Step {
             }
             other => other,
         }
+    }
+    /// Apply a list of literal, count-checked [`TextEdit`]s to `file` in place.
+    pub fn substitute_text(file: &str, edits: Vec<TextEdit>) -> Step {
+        Step::SubstituteText {
+            file: file.into(),
+            edits,
+        }
+    }
+    /// Assert `paths` are fully static ELF binaries (no host loader/libc/run-path).
+    pub fn assert_static(paths: &[&str]) -> Step {
+        Step::AssertStatic { paths: vs(paths) }
     }
     fn to_json(&self) -> Json {
         let pair_arr = |xs: &[(String, String)]| {
@@ -178,6 +257,30 @@ impl Step {
                     ("path".into(), Json::Str(path.clone())),
                     ("content".into(), Json::Str(content.clone())),
                     ("exec".into(), Json::Bool(*exec)),
+                ]),
+            )]),
+            Step::Unpack {
+                input,
+                dest,
+                keep_top,
+            } => Json::Obj(vec![(
+                "unpack".into(),
+                Json::Obj(vec![
+                    ("input".into(), Json::Str(input.clone())),
+                    ("dest".into(), Json::Str(dest.clone())),
+                    ("keepTop".into(), Json::Bool(*keep_top)),
+                ]),
+            )]),
+            Step::MesBoot {
+                source,
+                nyacc,
+                stage0,
+            } => Json::Obj(vec![(
+                "mesBoot".into(),
+                Json::Obj(vec![
+                    ("source".into(), Json::Str(source.clone())),
+                    ("nyacc".into(), Json::Str(nyacc.clone())),
+                    ("stage0".into(), Json::Str(stage0.clone())),
                 ]),
             )]),
             Step::CopyFiles { files, dest } => Json::Obj(vec![(
@@ -221,6 +324,35 @@ impl Step {
                 Json::Obj(vec![
                     ("paths".into(), arr(paths)),
                     ("exec".into(), Json::Bool(*exec)),
+                ]),
+            )]),
+            Step::AssertStatic { paths } => Json::Obj(vec![(
+                "assertStatic".into(),
+                Json::Obj(vec![("paths".into(), arr(paths))]),
+            )]),
+            Step::SubstituteText { file, edits } => Json::Obj(vec![(
+                "substituteText".into(),
+                Json::Obj(vec![
+                    ("file".into(), Json::Str(file.clone())),
+                    (
+                        "edits".into(),
+                        Json::Arr(
+                            edits
+                                .iter()
+                                .map(|e| {
+                                    Json::Obj(vec![
+                                        ("from".into(), Json::Str(e.from.clone())),
+                                        ("to".into(), Json::Str(e.to.clone())),
+                                        // The count rides as a string: the builder's
+                                        // JSON reader exposes only string/array/bool
+                                        // (numbers are parsed-but-unused), and this is
+                                        // an internal recipe→builder protocol.
+                                        ("expect".into(), Json::Str(e.expect.to_string())),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
                 ]),
             )]),
         }
@@ -276,7 +408,7 @@ impl Source {
 /// that used to live in the external source lock directory; recipes carry them as
 /// metadata so warmers/checks resolve from the typed catalog instead of an
 /// external lock directory. They are intentionally not emitted into build JSON.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourcePin {
     pub key: String,
     pub url: String,
@@ -897,6 +1029,21 @@ mod tests {
         assert_eq!(
             r.to_json().to_canonical(),
             r#"{"buildSystem":"gnu","name":"stage0","sourceInput":"stage0-source","version":"1.9.1"}"#
+        );
+    }
+
+    // The wire contract builder::build::run_mesboot dispatches on ("mesBoot"
+    // + the three expandable fields) — a drift here strands the step.
+    #[test]
+    fn mes_boot_step_emits_the_engine_dispatch_shape() {
+        let s = Step::MesBoot {
+            source: "{in:mes-source}".into(),
+            nyacc: "{in:nyacc}".into(),
+            stage0: "{in:stage0}".into(),
+        };
+        assert_eq!(
+            s.to_json().to_canonical(),
+            r#"{"mesBoot":{"nyacc":"{in:nyacc}","source":"{in:mes-source}","stage0":"{in:stage0}"}}"#
         );
     }
 }

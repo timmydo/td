@@ -8,10 +8,18 @@
 //! rationale comments live with each step):
 //!   1. the netns-probe discrimination check,
 //!   2. stage0 provisioning (the guix-free loop-container provider, #294),
-//!   3. the loop PATH: host-provided tools from `LOOP_TOOLCHAIN`,
+//!   3. the loop userland: td-BUILT busybox + make from the recipe graph
+//!      (`provision_userland`) — host tools are forbidden, and the loop fails
+//!      CLOSED (exit `EXIT_UNPROVISIONED`) while the bootstrap graph still
+//!      declares scaffolding the chain has not built (re #469),
 //!   4. the warm prelude (subst store, source/crate warms, build daemon),
 //!   5. the machine-wide slot dir, and
-//!   6. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon -- TB gate-run.
+//!   6. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon
+//!      --store-item ITEM… --store-item-at SRC DEST… -- TB gate-run. The
+//!      sandbox mounts NO store directory: only the loop's declared inputs —
+//!      the seed-lock closure (`loop_store_items`) at its own paths and the
+//!      td-built userland at /td/store — each bound read-only, the drv build
+//!      jail's input-only model.
 //!
 //! (The host-guix == pinned-channel integrity guard that used to run `guix
 //! describe` was removed in #406 — it only warned on drift, so dropping it is
@@ -27,9 +35,10 @@ fn fatal(msg: &str) -> String {
     format!("td-builder check: FATAL: {msg}")
 }
 
-/// Exit code `td-builder check` uses when it aborts because the RUNNER is not
-/// provisioned to run the loop at all (the base loop toolchain does not resolve
-/// on PATH) — as
+/// Exit code `td-builder check` uses when it aborts because the loop cannot be
+/// provisioned at all — today: the td-built userland is unbuildable because the
+/// bootstrap graph still declares host scaffolding, which planning rejects (re
+/// #469) — as
 /// opposed to a gate genuinely going red. It is the stable machine signal the
 /// daily backstop (`td-builder daily`) reads to tell "nothing could run here"
 /// from "a real regression", instead of grepping FATAL prose out of the log
@@ -76,17 +85,6 @@ pub(crate) fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn run_capture(cmd: &mut Command) -> Result<String, String> {
-    let out = cmd
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| format!("could not spawn {:?}: {e}", cmd.get_program()))?;
-    if !out.status.success() {
-        return Err(format!("{:?} exited {}", cmd.get_program(), out.status));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// --- Offline-isolation control: the netns probe mechanism must discriminate ---
 /// The offline probes assert "only `lo` in /proc/net/dev" inside builders; that
 /// only has teeth if the same mechanism reports a non-loopback interface where
@@ -114,175 +112,590 @@ fn guard_netns_probe() -> Result<(), String> {
 }
 
 /// Provision the guix-free stage0 td-builder (the loop-container provider,
-/// workstream E #294) via the existing shell machinery and return $TB.
+/// workstream E #294) and return $TB — a direct `stage0::stage0_place` call
+/// (no ambient host sh anywhere in setup, re #469). The base default matches
+/// cache-lib's load_stage0, so the prelude and the gates share one placement.
 fn provision_stage0(root: &Path) -> Result<String, String> {
-    let applets = current_binary_native_applet_path(root)?;
-    let path = std::env::var("PATH").unwrap_or_default();
-    let self_exe = std::env::current_exe().map_err(|e| {
-        fatal(&format!(
-            "could not resolve current td-builder executable: {e}"
-        ))
-    })?;
-    let out = run_capture(
-        Command::new("sh")
-            .arg("-c")
-            .arg(". tests/cache-lib.sh && provision_stage0 1>&2 && printf '%s' \"$TB\"")
-            .env("PATH", format!("{applets}:{path}"))
-            .env("TD_BUILDER_SELF", &self_exe)
-            .current_dir(root),
-    )
-    .map_err(|e| {
+    let base = match std::env::var("TD_STAGE0_BASE") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => root.join(".td-build-cache/stage0"),
+    };
+    let cb = crate::stage0::stage0_place(root, &base).map_err(|e| {
         fatal(&format!(
             "could not provision the guix-free stage0 td-builder for the loop sandbox ({e})"
         ))
     })?;
-    let tb = out.trim().to_string();
-    if tb.is_empty() || !Path::new(&tb).is_file() {
+    let placed = Path::new(&cb)
+        .file_name()
+        .ok_or_else(|| fatal("stage0 placement returned a malformed store path"))?;
+    let tb = base.join("store").join(placed).join("bin/td-builder");
+    if !tb.is_file() {
         return Err(fatal("stage0 provisioning returned no usable $TB"));
     }
-    Ok(tb)
+    Ok(tb.display().to_string())
 }
 
-fn current_binary_native_applet_path(root: &Path) -> Result<String, String> {
-    let current = std::env::current_exe()
-        .map_err(|e| {
-            fatal(&format!(
-                "cannot resolve current td-builder executable: {e}"
-            ))
-        })?
-        .display()
-        .to_string();
-    native_applet_path(root, &current)
-        .map_err(|e| fatal(&format!("could not provision stage0 native applets ({e})")))
+/// td's own store prefix — where the loop userland's items are hashed for and
+/// must appear inside the sandbox (the recipe graph builds everything with
+/// `TD_STORE_DIR=/td/store`). The loop never mounts a store DIRECTORY and
+/// never resolves a tool from the host: its userland is td-BUILT
+/// (`LOOP_USERLAND_STEMS`), and the only other store bytes it exposes are the
+/// DECLARED seed-lock closures (`seed_lock_roots`) — each bound read-only,
+/// item by item, at its own path.
+const TD_STORE_DIR: &str = "/td/store";
+
+/// The td-built loop userland: the recipe stems whose outputs provide every
+/// process-driving tool on the loop sandbox PATH. `busybox-x86-64` (static; sh,
+/// env, ls, sed, grep, awk, tar, gzip, cat, …) and `make-x86-64` (static GNU
+/// make) are built FROM SOURCE by the recipe chain (stage0 → mes → tcc → … →
+/// gcc-x86-64-native). Being static they carry no runtime closure — two items
+/// are the whole userland. bash and the GNU text tools are deliberately NOT
+/// here: gate bodies run under busybox sh, and recipe rung builds admit NO
+/// host executable at all — an input is a prior recipe output or a pinned
+/// seed source, or planning rejects it (re #469).
+const LOOP_USERLAND_STEMS: &[&str] = &["busybox-x86-64", "make-x86-64"];
+
+/// The resolved loop userland: `(durable host copy, canonical /td/store item
+/// path)` per stem — the `--store-item-at` binds — plus the colon-joined
+/// in-sandbox bin dirs that become the sandbox PATH.
+struct LoopUserland {
+    items: Vec<(String, String)>,
+    path: String,
 }
 
-/// The store prefix the loop sandbox binds over its fresh-tmpfs root: the loop
-/// prelude passes `--store-from`/`--store-at` explicitly and binds NOTHING else
-/// of the host FS (no /usr, /bin, /home). A toolchain bin dir is therefore
-/// reachable INSIDE the sandbox only if it physically lies under this prefix —
-/// a `/usr/bin` tool on a foreign-distro guix host would vanish.
-const SANDBOX_STORE_PREFIX: &str = "/gnu/store/";
-
-/// The loop toolchain: the host-PATH tools the loop sandbox needs to run its
-/// gate bodies (make/sh/…). A list of representative BINARIES, one per package —
-/// resolving `env` gives the whole coreutils bin dir. sed/grep/findutils are
-/// deliberately absent; loop checks must use td-builder typed helpers or
-/// td-built userland instead. tar/gzip are absent too: no gate body spawns
-/// them — loop-level unpacking is td-builder's own native tar.rs/gzip.rs, and
-/// the drv-sandbox tar runs from a derivation's DECLARED inputs, never this
-/// PATH. Native loop applets for syscall-only host tools (`mount --bind`,
-/// `flock`) are provided by td-builder itself and prepended by
-/// `loop_path_with_native_applets`.
-const LOOP_TOOLCHAIN: &[&str] = &["make", "bash", "sh", "env"];
-
-/// The core loop toolchain PATH, resolved from the HOST PATH: the host brings
-/// only the base process-driving tools (the "check the right tools are on $PATH"
-/// model), exactly as it already brings the rust/cc toolchain the stage0 seed
-/// build resolves via tools/provision-{rust,cc}.sh — no `guix shell` subprocess.
-/// For each expected tool in `LOOP_TOOLCHAIN` we find it on PATH and
-/// CANONICALIZE to its real bin dir. Canonicalization + the store-prefix check
-/// matter — the loop sandbox binds ONLY `/gnu/store` (SANDBOX_STORE_PREFIX) over
-/// a fresh tmpfs, so a profile-symlink dir (~/.guix-home/profile/bin) OR a
-/// distro dir (/usr/bin on a Debian+guix host) would not resolve inside; only
-/// the real `/gnu/store/<pkg>/bin` target does. The deduped in-store dirs become
-/// the sandbox PATH.
+/// The durable home of the loop userland's host copies + its resolution map:
+/// `$TD_LOOP_USERLAND_DIR|~/.td/loop-userland`. Recipe builds materialize
+/// outputs in per-run scratch dirs, so the prelude copies the resolved items
+/// here once and reuses them while the fingerprint matches.
 ///
-/// A tool that is ABSENT from the host PATH, or that resolves OUTSIDE the bound
-/// store (so it would vanish inside the sandbox), is reported in one loud warning
-/// line (a misconfigured runner is visible) but is NOT fatal for a heavy-only
-/// tool: the gate that needs it fails loudly, exactly as the best-effort warms
-/// let their gates enforce presence — a host missing mount must still run
-/// check-engine/check-pr. (With the list currently equal to the core set, the
-/// heavy-only warn branch is vacuous; it is the contract for the next heavy
-/// addition, not a live path.) Fatal ONLY when a CORE tool (sh/bash/make/env) failed
-/// to resolve to an in-store bin dir — without those no gate body runs at all,
-/// and that fatal is a `CheckError::Unprovisioned`, so `cli()` exits
-/// `EXIT_UNPROVISIONED`: the machine signal `td-builder daily` reads to classify
-/// this as a runner-provisioning gap rather than a code regression.
-fn provision_toolchain() -> Result<String, CheckError> {
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    let mut dirs: Vec<String> = Vec::new();
-    let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut missing: Vec<&str> = Vec::new(); // not on PATH at all
-    let mut off_store: Vec<&str> = Vec::new(); // on PATH but NEVER under the bound store
-    for &t in LOOP_TOOLCHAIN {
-        // Scan EVERY PATH entry for the tool and take the FIRST whose REAL dir is under the
-        // store the sandbox binds — not just the first PATH hit. On a guix-on-foreign-distro
-        // host /usr/bin/env may precede the in-store env; the first hit is off-store but a
-        // usable in-store copy is later on PATH, so stopping at the first match would
-        // false-fatal a loop the sandbox could actually run. A dir the sandbox never exposes
-        // is worse than useless (Ok now, `command not found` for every gate later).
-        let mut found_on_path = false;
-        let mut in_store: Option<String> = None;
-        for dir in path_var.split(':').filter(|d| !d.is_empty()) {
-            let p = Path::new(dir).join(t);
-            if !p.is_file() {
-                continue;
-            }
-            found_on_path = true;
-            if let Some(real) = std::fs::canonicalize(&p)
-                .ok()
-                .and_then(|c| c.parent().map(|d| d.display().to_string()))
-            {
-                if real.starts_with(SANDBOX_STORE_PREFIX) {
-                    in_store = Some(real);
-                    break;
-                }
-            }
-        }
-        match in_store {
-            Some(dir) => {
-                resolved.insert(t);
-                if !dirs.contains(&dir) {
-                    dirs.push(dir); // dedupe (e.g. sh + bash share one bin dir)
-                }
-            }
-            None if found_on_path => off_store.push(t),
-            None => missing.push(t),
+/// Deliberately NOT under `~/.td/build-daemon`: that dir is bound READ-WRITE
+/// into every loop sandbox (the daemon socket + output store), so a userland
+/// living there would have a writable in-sandbox alias behind the read-only
+/// `/td/store/<item>` mounts — a gate could poison the current and future
+/// loops' executable bytes. This dir is not bound at all; only the sandbox
+/// setup (host-side) reads it.
+fn loop_userland_dir() -> Result<PathBuf, String> {
+    match std::env::var("TD_LOOP_USERLAND_DIR") {
+        Ok(v) if !v.trim().is_empty() => Ok(PathBuf::from(v)),
+        _ => {
+            let home = std::env::var("HOME").map_err(|_| s("no HOME for TD_LOOP_USERLAND_DIR"))?;
+            Ok(Path::new(&home).join(".td/loop-userland"))
         }
     }
-    // Core tools every gate body needs — checked against what ACTUALLY resolved to
-    // an in-store dir (mere presence on PATH is not enough: a /usr/bin bash is
-    // invisible inside the sandbox). A host without them cannot run the loop.
-    for core in ["sh", "bash", "make", "env"] {
-        if !resolved.contains(core) {
+}
+
+/// The userland's freshness key: sha256 over the resolved td-recipe-eval
+/// binary — the recipe catalog IS that binary (every recipe body, source pin,
+/// and applet list is compiled in, and the chain admits no input beyond what
+/// it declares, re #469) — PLUS every in-repo seed patch
+/// (`seed/patches/*.patch`, sorted, name and bytes). Patches are the one
+/// chain input the runner reads from the TREE at build time rather than from
+/// the compiled catalog (its pinsum keys them for the same reason), so a
+/// patch-only change must re-key the userland even though the evaluator
+/// binary is byte-identical. Any recipe/pin/patch/evaluator change re-keys
+/// the map, so a stale machine-wide userland — including one built before
+/// host scaffolding was outlawed — can never false-green the change under
+/// review.
+///
+/// Known limits (freshness mechanism, not a security boundary): the hash is
+/// taken before build-run execs the binary, so a concurrent rebuild of the
+/// evaluator between the two can mis-key one provision (self-healing — the
+/// next run re-keys and re-provisions); and `TD_RECIPE_EVAL` is an operator
+/// override that can cache whatever ITS binary builds under its own
+/// fingerprint — pointing it at a pre-cutover evaluator is the operator
+/// running old code deliberately, the same trust as any explicit override.
+fn userland_fingerprint(root: &Path, eval: &str) -> Result<String, String> {
+    let bytes = std::fs::read(eval).map_err(|e| format!("read {eval}: {e}"))?;
+    let mut h = crate::sha256::Sha256::new();
+    h.update(&bytes);
+    let patches = root.join("seed/patches");
+    let mut names: Vec<String> = match std::fs::read_dir(&patches) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.ends_with(".patch"))
+            .collect(),
+        // No patch dir: the binary alone keys the userland (a tree that
+        // GAINS the dir re-keys by growing the hashed list).
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    for name in &names {
+        let p = patches.join(name);
+        let bytes = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+        h.update(name.as_bytes());
+        h.update(&[0]);
+        h.update(&bytes);
+        h.update(&[0]);
+    }
+    Ok(crate::sha256::to_base16(&h.finalize()))
+}
+
+/// Resolve the td-built loop userland, provisioning it if needed.
+///
+/// Warm path: `loop-userland.<fingerprint>.map` opens with `fingerprint
+/// <sha256>` matching `userland_fingerprint` (the CURRENT evaluator + seed
+/// patches — a recipe, pin, patch, or applet change re-keys it) and names a
+/// host copy under `loop_userland_dir()` for every stem, each with an
+/// existing `bin/` and on-disk bytes NAR-hashing to the hash recorded at
+/// publication — the same content check `verify_staged_item` applies to
+/// build inputs, because these items are mounted and EXECUTED by every gate
+/// (re #469). The map FILENAME carries the fingerprint so concurrent
+/// worktrees — whose evaluator binaries fingerprint differently — never
+/// clobber each other's map between one provision's write and its validating
+/// re-read, and each keeps its own warm path instead of re-provisioning on
+/// every alternation.
+///
+/// Cold path: run `td-recipe-eval build-run busybox-x86-64 <stems…>`, which
+/// realizes the recipe chain (replayed from the warm chain cache when
+/// provisioned; built from the seed when not — that first build is the
+/// long one and says so loudly). The evaluator REJECTS the graph at planning
+/// while any rung still declares host scaffolding (exit 69 → Unprovisioned
+/// here): the loop fails closed until busybox/make build solely from audited
+/// seeds and prior td recipe outputs (re #469). On success, publish each
+/// `TD_RECIPE_RUN_OUT` item
+/// into the durable dir and rewrite the map atomically. Items are
+/// input-addressed (the basename embeds the recipe+input key), so an
+/// already-present basename whose bytes HASH to the fresh build's is reused
+/// as-is — concurrent cold provisions from parallel worktrees stay safe
+/// (whoever publishes first wins) — while a mismatching copy is quarantined
+/// aside and republished; either way the map records only bytes verified
+/// against this chain's own build. td-recipe-eval itself resolves via
+/// `TD_RECIPE_EVAL` or a fresh
+/// host `cargo build`; a host with neither is a provisioning gap
+/// (`CheckError::Unprovisioned`), not a code regression.
+fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
+    let dir = loop_userland_dir().map_err(|e| CheckError::Fatal(fatal(&e)))?;
+    let eval = resolve_recipe_eval_bin(root)?;
+    let fingerprint = userland_fingerprint(root, &eval).map_err(|e| CheckError::Fatal(fatal(&e)))?;
+    let map_path = dir.join(format!("loop-userland.{fingerprint}.map"));
+    if let Some(ul) = read_userland_map(&dir, &map_path, &fingerprint) {
+        return Ok(ul);
+    }
+
+    eprintln!(
+        "td-builder check: provisioning the td-built loop userland ({}) via the recipe \
+         chain — a warm chain cache replays in minutes; a cold host builds the bootstrap \
+         chain from the seed first (hours, once)",
+        LOOP_USERLAND_STEMS.join(" ")
+    );
+    // Cold-cache branch (map miss): warm the td-tool crate closures (td-fetch,
+    // td-sh) BEFORE the build-run that consumes them. This is where cold runs
+    // of EVERY tier pass — light tiers too — so the td-sh brush closure is
+    // vendored offline whenever the chain is (re-)provisioned from cold, not
+    // only on the heavy warm prelude. A warm-map hit returned above, so this
+    // never re-warms an already-provisioned userland. Best-effort (the recipe
+    // check enforces presence); once tcc declares td-sh as its shell the
+    // build-run below reads this warmed closure.
+    warm_td_crate_closures(root);
+    let mut cmd = Command::new(&eval);
+    cmd.arg("build-run").arg("busybox-x86-64");
+    for stem in LOOP_USERLAND_STEMS {
+        cmd.arg(stem);
+    }
+    let out = cmd
+        .current_dir(root)
+        .output()
+        .map_err(|e| fatal(&format!("could not run {eval} build-run: {e}")))?;
+    if !out.status.success() {
+        let tail: Vec<&str> = std::str::from_utf8(&out.stderr)
+            .unwrap_or("")
+            .lines()
+            .rev()
+            .take(8)
+            .collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        // Exit 69 (EX_UNAVAILABLE) is td-recipe-eval's PLANNING-time
+        // provenance rejection: the bootstrap graph still declares host
+        // scaffolding, which is no longer an admissible input class (re
+        // #469), so NO host can provision this userland. The loop fails
+        // CLOSED as Unprovisioned — there is no host-tool fallback and no
+        // grandfathered userland (the fingerprint keys the map to the
+        // current, rejecting evaluator).
+        if out.status.code() == Some(69) {
             return Err(CheckError::Unprovisioned(fatal(&format!(
-                "loop toolchain: core tool `{core}` did not resolve to a path under \
-                 {SANDBOX_STORE_PREFIX} on the host PATH — the loop sandbox exposes only \
-                 that store (not /usr/bin etc.), so the base userland (bash/coreutils/make) \
-                 must be on PATH FROM there, e.g. a guix profile. host-brings-the-tools; \
-                 LOOP_TOOLCHAIN in check_loop.rs"
+                "the loop userland ({}) cannot be provisioned: the recipe chain rejected \
+                 its own inputs' provenance — the bootstrap rungs still declare host \
+                 scaffolding, and only audited seeds and prior td recipe outputs are \
+                 admissible (re #469). The loop runs NO gates until the chain builds \
+                 its scaffolding as recipe outputs:\n{}",
+                LOOP_USERLAND_STEMS.join(" "),
+                tail.join("\n")
             ))));
         }
+        return Err(CheckError::Fatal(fatal(&format!(
+            "loop userland build failed (td-recipe-eval build-run busybox-x86-64):\n{}",
+            tail.join("\n")
+        ))));
     }
-    if !missing.is_empty() || !off_store.is_empty() {
-        let mut why = String::new();
-        if !missing.is_empty() {
-            why.push_str(&format!("not on PATH: {}", missing.join(" ")));
-        }
-        if !off_store.is_empty() {
-            if !why.is_empty() {
-                why.push_str("; ");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| fatal(&format!("mkdir {}: {e}", dir.display())))?;
+    let mut map = format!("fingerprint {fingerprint}\n");
+    for stem in LOOP_USERLAND_STEMS {
+        let prefix = format!("TD_RECIPE_RUN_OUT {stem} ");
+        let built = stdout
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .map(str::trim)
+            .ok_or_else(|| {
+                fatal(&format!(
+                    "loop userland: build-run reported no output path for {stem}"
+                ))
+            })?;
+        let base = Path::new(built)
+            .file_name()
+            .and_then(|b| b.to_str())
+            .ok_or_else(|| fatal(&format!("loop userland: unusable output path {built}")))?;
+        // The recipe chain's freshly built bytes are the authority: their NAR
+        // hash is what the map will vouch for, and whatever ends up at the
+        // durable path must hash to it before it is mapped (re #469).
+        let want = crate::sandbox::nar_hash_of(Path::new(built))
+            .map_err(|e| fatal(&format!("loop userland: hash {built}: {e}")))?;
+        let durable = dir.join(base);
+        // Input-addressed basename: an existing durable copy SHOULD be this
+        // content, but only its hash proves it — a matching copy is reused
+        // untouched; a mismatching one (corruption, or bytes published before
+        // hashes were recorded) is renamed aside, never mounted. The rename's
+        // own failure is ignored: a leftover bad copy just fails the final
+        // verify below, which is the fail-closed path anyway.
+        if durable.is_dir() {
+            let have = crate::sandbox::nar_hash_of(&durable)
+                .map_err(|e| fatal(&format!("loop userland: hash {}: {e}", durable.display())))?;
+            if have != want {
+                let quarantine = dir.join(format!(".bad.{base}.{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&quarantine);
+                let _ = std::fs::rename(&durable, &quarantine);
             }
-            why.push_str(&format!(
-                "on PATH but outside {SANDBOX_STORE_PREFIX} (invisible in the sandbox): {}",
-                off_store.join(" ")
-            ));
         }
+        // Publish via scratch-copy + rename; a rename that loses to a
+        // concurrent publisher (EEXIST/ENOTEMPTY) leaves THEIR copy in place,
+        // and the verify below only maps it if it matches our build.
+        if !durable.is_dir() {
+            let tmp = dir.join(format!(".tmp.{base}.{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&tmp);
+            copy_tree_preserving(Path::new(built), &tmp)
+                .map_err(|e| fatal(&format!("loop userland: copy {built}: {e}")))?;
+            if let Err(e) = std::fs::rename(&tmp, &durable) {
+                let _ = std::fs::remove_dir_all(&tmp);
+                if !durable.is_dir() {
+                    return Err(CheckError::Fatal(fatal(&format!(
+                        "loop userland: place {}: {e}",
+                        durable.display()
+                    ))));
+                }
+            }
+        }
+        let have = crate::sandbox::nar_hash_of(&durable)
+            .map_err(|e| fatal(&format!("loop userland: hash {}: {e}", durable.display())))?;
+        if have != want {
+            return Err(CheckError::Fatal(fatal(&format!(
+                "loop userland: published {} hashes {have} but the fresh build hashes {want} — \
+                 refusing to map executable bytes the chain did not produce (re #469)",
+                durable.display()
+            ))));
+        }
+        map.push_str(&format!("{stem} {base} {want}\n"));
+    }
+    let tmp_map = map_path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp_map, &map).map_err(|e| fatal(&format!("write loop-userland.map: {e}")))?;
+    std::fs::rename(&tmp_map, &map_path)
+        .map_err(|e| fatal(&format!("place loop-userland.map: {e}")))?;
+    read_userland_map(&dir, &map_path, &fingerprint).ok_or_else(|| {
+        CheckError::Fatal(fatal(
+            "loop userland: the freshly written map did not validate — refusing a userland-less loop",
+        ))
+    })
+}
+
+/// Parse + validate the durable userland map against the CURRENT fingerprint:
+/// the `fingerprint` line matches, every stem present with a recorded NAR
+/// hash, every item dir present with a `bin/`, and every item's on-disk bytes
+/// re-hash to the record — CONTENT is verified, not existence, so a corrupted
+/// or tampered durable copy is a cache miss (the caller re-provisions), never
+/// a mount (re #469). Any miss returns None. Hash-less lines (pre-hash map
+/// format) fail to parse, so old maps self-invalidate.
+fn read_userland_map(dir: &Path, map_path: &Path, fingerprint: &str) -> Option<LoopUserland> {
+    let content = std::fs::read_to_string(map_path).ok()?;
+    let fp = content
+        .lines()
+        .find_map(|l| l.strip_prefix("fingerprint "))?
+        .trim();
+    if fp != fingerprint {
+        return None;
+    }
+    let mut items: Vec<(String, String)> = Vec::new();
+    let mut bins: Vec<String> = Vec::new();
+    for stem in LOOP_USERLAND_STEMS {
+        let (base, want) = content.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            let (k, base, want) = (f.next()?, f.next()?, f.next()?);
+            (k == *stem
+                && f.next().is_none()
+                && !base.contains('/')
+                && want.starts_with("sha256:"))
+            .then(|| (base.to_string(), want.to_string()))
+        })?;
+        let host = dir.join(&base);
+        if !host.join("bin").is_dir() {
+            return None;
+        }
+        if crate::sandbox::nar_hash_of(&host).ok()? != want {
+            return None;
+        }
+        let canon = format!("{TD_STORE_DIR}/{base}");
+        bins.push(format!("{canon}/bin"));
+        items.push((host.display().to_string(), canon));
+    }
+    Some(LoopUserland {
+        items,
+        path: bins.join(":"),
+    })
+}
+
+/// The td-recipe-eval binary: `TD_RECIPE_EVAL` (explicit override), else a
+/// host `cargo build` of recipes/ — the same host-brings-cargo seed the stage0
+/// provision uses, and ALWAYS the current tree (a no-change rebuild is
+/// seconds; the build-recipes sentinel is deliberately NOT consulted first —
+/// it can lag the tree by a loop iteration, and a stale evaluator would both
+/// build and fingerprint yesterday's userland). The sentinel is the last
+/// resort for a cargo-less host running a pre-built loop.
+///
+/// The error variants are load-bearing (review finding): a host WITHOUT cargo
+/// is a provisioning gap (`Unprovisioned` → exit 69, PARTIAL in the tiers),
+/// but a host WITH cargo whose recipes/ tree fails to COMPILE is a code
+/// regression and must red (`Fatal`) — conflating them would let a broken
+/// recipes crate exit 0 through affected-checks.
+fn resolve_recipe_eval_bin(root: &Path) -> Result<String, CheckError> {
+    if let Ok(v) = std::env::var("TD_RECIPE_EVAL") {
+        if !v.trim().is_empty() && Path::new(&v).is_file() {
+            return Ok(v);
+        }
+    }
+    if find_in_path("cargo").is_some() {
+        let status = Command::new("cargo")
+            .args(["build", "--release", "--quiet"])
+            .current_dir(root.join("recipes"))
+            .status()
+            .map_err(|e| CheckError::Fatal(fatal(&format!("spawn cargo build (recipes): {e}"))))?;
+        if !status.success() {
+            return Err(CheckError::Fatal(fatal(
+                "the recipes crate does not compile (`cargo build --release` in recipes/ \
+                 failed) — a code regression, not a provisioning gap",
+            )));
+        }
+        let p = root.join("recipes/target/release/td-recipe-eval");
+        if p.is_file() {
+            return Ok(p.display().to_string());
+        }
+        return Err(CheckError::Fatal(fatal(&format!(
+            "cargo build succeeded but {} is missing",
+            p.display()
+        ))));
+    }
+    let sentinel = root.join(".td-build-cache/recipe-eval/recipe-eval-path");
+    let path = std::fs::read_to_string(&sentinel)
+        .map(|t| t.trim().to_string())
+        .unwrap_or_default();
+    if !path.is_empty() && Path::new(&path).is_file() {
+        return Ok(path);
+    }
+    Err(CheckError::Unprovisioned(fatal(
+        "no td-recipe-eval to resolve the loop userland: set TD_RECIPE_EVAL or run \
+         `cargo build --release --manifest-path recipes/Cargo.toml` and re-run",
+    )))
+}
+
+/// Copy a tree preserving file modes and symlinks AS symlinks — the userland
+/// items are busybox applet farms (symlinks at the busybox binary) whose links
+/// must survive the copy byte-identically.
+fn copy_tree_preserving(src: &Path, dst: &Path) -> Result<(), String> {
+    let md = std::fs::symlink_metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        let target =
+            std::fs::read_link(src).map_err(|e| format!("readlink {}: {e}", src.display()))?;
+        std::os::unix::fs::symlink(&target, dst)
+            .map_err(|e| format!("symlink {}: {e}", dst.display()))?;
+        return Ok(());
+    }
+    if ft.is_dir() {
+        std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+        let rd = std::fs::read_dir(src).map_err(|e| format!("readdir {}: {e}", src.display()))?;
+        for entry in rd {
+            let entry = entry.map_err(|e| format!("readdir {}: {e}", src.display()))?;
+            copy_tree_preserving(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        std::fs::set_permissions(dst, md.permissions())
+            .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
+        return Ok(());
+    }
+    std::fs::copy(src, dst).map_err(|e| format!("copy {}: {e}", src.display()))?;
+    Ok(())
+}
+
+/// The store paths of the SEED locks that gate bodies resolve INSIDE the
+/// sandbox (format `NAME <store-path>`): tests/td-builder-rust.lock
+/// (tools/provision-{rust,cc}.sh branch 2 execs its rust/cc paths directly)
+/// and tests/td-subst.lock (td-subst's pinned build closure) — both serve the
+/// pinned RUST toolchain seed (AGENTS.md's allowed control plane), never a
+/// bootstrap build: recipe rungs admit NO host executable at all (planning
+/// rejects the provenance, re #469). Every lock path present on the host is a
+/// DECLARED loop input and joins the closure roots. An absent path is skipped
+/// — the consumers fall through / fail loudly the same way they do today on a
+/// host without it.
+pub(crate) fn seed_lock_roots(root: &Path) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    for lock in ["tests/td-builder-rust.lock", "tests/td-subst.lock"] {
+        let Ok(content) = std::fs::read_to_string(root.join(lock)) else {
+            continue;
+        };
+        for p in parse_seed_lock(&content) {
+            if Path::new(&p).exists() && !roots.contains(&p) {
+                roots.push(p);
+            }
+        }
+    }
+    roots
+}
+
+/// Parse the seed lock's `NAME <store-path>` lines (comments/blank skipped)
+/// into the deduped path list. Only absolute paths qualify — the lock is the
+/// DECLARED seed, whatever store its paths live in; there is no hardcoded
+/// prefix to check against.
+fn parse_seed_lock(content: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(path) = line.split_whitespace().nth(1) else {
+            continue;
+        };
+        if path.starts_with('/') && !paths.iter().any(|p| p == path) {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
+/// The seed store DIRECTORY, DERIVED from the declared lock paths (the unique
+/// parent of the lock items) — never a hardcoded prefix. This is the candidate
+/// dir the closure scan indexes and the build daemon's default seed dir; on a
+/// guix host the locks point under /gnu/store so that is what derives, and a
+/// re-captured lock on another host derives that host's store with no code
+/// change. Locks spanning several parents keep the FIRST (warned) — the seed
+/// is one store by construction.
+fn seed_store_dir(roots: &[String]) -> Option<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for r in roots {
+        if let Some(parent) = Path::new(r).parent() {
+            let d = parent.display().to_string();
+            if !d.is_empty() && d != "/" && !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    if dirs.len() > 1 {
         eprintln!(
-            "td-builder check: loop toolchain: {} heavy-only tool(s) unavailable ({why}); \
-             the gates that need them will fail loudly — expose them under \
-             {SANDBOX_STORE_PREFIX} on the runner PATH (host-brings-the-tools; \
-             LOOP_TOOLCHAIN in check_loop.rs)",
-            missing.len() + off_store.len()
+            "td-builder check: WARNING: seed locks span {} store dirs ({}); scanning only \
+             the first",
+            dirs.len(),
+            dirs.join(" ")
         );
     }
-    if dirs.is_empty() {
-        return Err(CheckError::Unprovisioned(fatal(
-            "loop toolchain: no expected tool resolved to an in-store bin dir on the host PATH",
-        )));
+    dirs.into_iter().next()
+}
+
+/// Everything the loop sandbox mounts from the SEED store — the full declared
+/// input set, computed so the sandbox never mounts a store DIRECTORY, only
+/// declared items (the td-built userland is separate — `provision_userland`):
+///
+///   1. the runtime CLOSURE of `roots` (the seed locks' declared paths —
+///      see `seed_lock_roots`), and
+///   2. the closure of each `scan_files` binary: host-built ELF executables
+///      that RUN INSIDE the sandbox (the stage0 td-builder, the daily's stashed
+///      td-subst), whose libc/gcc-lib references are found by content-scanning
+///      the binary itself — declared, not assumed to coincide with (1).
+///
+/// The candidate store dir is DERIVED from the lock paths (`seed_store_dir`),
+/// never hardcoded. The closure walk is the same no-DB content scan
+/// realize_drv uses (`scan_candidate_index` + `scan_closure_hybrid`; never
+/// /var/guix), and it is RECOMPUTED FROM THE SCAN ON EVERY RUN: the
+/// loop-closure CACHE is deleted (re #469, round-7 review). Its hit path
+/// accepted any superset of items whose extras merely looked like top-level
+/// seed-store children — path-shape validation, not proof of membership in
+/// the actual reference closure — so stale or edited host state could add
+/// undeclared executable store items to the next loop sandbox. This list
+/// names the exact `--store-item` binds of the run: nothing but the live
+/// scan may produce it. Until an audited seed carries an explicit closure
+/// manifest, the recompute — O(seed-store bytes), once per `check`
+/// invocation, small next to the gate ladder it admits — is the price of
+/// that authority. Returns the sorted item paths (roots included).
+fn loop_store_items(
+    root: &Path,
+    roots: &[String],
+    scan_files: &[String],
+) -> Result<Vec<String>, String> {
+    let Some(store_dir) = seed_store_dir(roots) else {
+        // No declared seed at all: nothing to scan, nothing to bind. The
+        // sandbox still gets the td-built userland; anything that needed the
+        // seed (a dynamically linked stage0) fails loudly inside.
+        eprintln!(
+            "td-builder check: WARNING: no seed-lock paths exist on this host — binding \
+             no seed store items (tests/td-*.lock)"
+        );
+        return Ok(Vec::new());
+    };
+    let store_dir = store_dir.as_str();
+    // Sweep the RETIRED cache locations unconditionally, so a poisoned or stale
+    // leftover can never be re-read by an older binary: the pre-round-5 in-tree
+    // file (inside the tree every gate sandbox mounts read-write) and the
+    // round-6 per-worktree file under the loop-userland dir.
+    let _ = std::fs::remove_file(root.join(".td-build-cache/loop-closure.list"));
+    if let Ok(dir) = loop_userland_dir() {
+        let mut h = crate::sha256::Sha256::new();
+        h.update(root.display().to_string().as_bytes());
+        let key = crate::sha256::to_base16(&h.finalize());
+        let key = key.get(..16).unwrap_or(&key);
+        let _ = std::fs::remove_file(dir.join(format!("loop-closure.{key}.list")));
     }
-    Ok(dirs.join(":"))
+    let (candidates, on_disk) =
+        crate::scan_candidate_index(&[store_dir.to_string()], store_dir)?;
+    let mut scanner = crate::scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+    let mut all_roots: std::collections::BTreeSet<String> = roots.iter().cloned().collect();
+    for f in scan_files {
+        scanner.reset();
+        crate::nar::write_nar(&mut scanner, Path::new(f))
+            .map_err(|e| format!("content-scan {f}: {e}"))?;
+        all_roots.extend(scanner.refs());
+    }
+    eprintln!(
+        "td-builder check: content-scanning the loop's seed-lock closure ({} roots; \
+         recomputed every run — no closure cache, re #469)",
+        all_roots.len()
+    );
+    let empty = std::collections::HashMap::new();
+    let root_list: Vec<String> = all_roots.iter().cloned().collect();
+    let seen = crate::scan_closure_hybrid(&mut scanner, &on_disk, &empty, &root_list)?;
+    Ok(seen.into_iter().collect())
+}
+
+/// The host-built binaries that RUN INSIDE the loop sandbox and whose store
+/// references must therefore be closure roots: the stage0 td-builder (gate-run
+/// itself) and, when the substitute store is usable, its stashed td-subst (the
+/// toolchain gates exec it). `check` and `check-rung` share this so the
+/// closure cache stays stable across both.
+fn loop_scan_files(root: &Path, tb: &str) -> Vec<String> {
+    let mut files = vec![tb.to_string()];
+    for (k, v) in subst_env(root) {
+        if k == "TD_SUBST_BIN" {
+            files.push(v);
+        }
+    }
+    files
 }
 
 fn native_applet_path(root: &Path, provider: &str) -> Result<String, String> {
@@ -723,32 +1136,38 @@ fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
     out
 }
 
-/// td-fetch's OWN crate closure (native since this port — was
+/// Warm a td crate's OWN dependency closure (native since this port — was
 /// tools/warm-td-fetch-crates.sh, the prelude's last `sh tools/…` spawn;
 /// #318 axis 2): host-side NETWORK PREP that GETs each `.crate` of
-/// fetch/Cargo.lock GUIX-FREE with td's OWN fetcher (td-fetch), pinned by the
-/// UPSTREAM lock checksum (NOT a guix artifact), into the flat vendor dir the
-/// td-fetch recipe check interns and builds td-fetch from (TD_VENDOR_DIR).
-/// td-fetch does every GET — td dogfoods its own fetcher, and td-fetch honors
+/// `LOCK_REL`'s Cargo.lock GUIX-FREE with td's OWN fetcher (td-fetch), pinned
+/// by the UPSTREAM lock checksum (NOT a guix artifact), into the flat vendor
+/// dir the crate's recipe check interns and builds from (TD_VENDOR_DIR):
+/// `.td-build-cache/crate-vendor/NAME`. The fetcher is always td-fetch — td
+/// dogfoods its own fetcher for every td-tool closure — and it honors
 /// TD_FEED_BASE so the reads route through the shared feed when it is up.
 /// Best-effort like every warm (no td-fetch binary / no network → warn and
 /// return; the gate reports if it actually runs cold), and the whole warm —
 /// cargo fallback included — shares ONE warm_timeout_secs budget exactly as
 /// the shell's single `timeout` over the script did: one hung mirror must
 /// not stall the prelude.
-fn warm_td_fetch_crates(root: &Path) {
-    let lock_path = root.join("fetch/Cargo.lock");
+///
+/// NAME selects both the vendor subdir and the log label ("td-fetch",
+/// "td-sh"). td-sh (the brush-shell wrapper, re #469) rides this exact path so
+/// its 316-crate closure is a declared offline vendor set before any rung
+/// declares td-sh — a live crates.io resolution is not a fixed-output fetch.
+fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
+    let lock_path = root.join(lock_rel);
     let Ok(lock) = std::fs::read_to_string(&lock_path) else {
         eprintln!(
-            "td-builder check: warm td-fetch crates: no {} — skipping",
+            "td-builder check: warm {name} crates: no {} — skipping",
             lock_path.display()
         );
         return;
     };
-    let dest = root.join(".td-build-cache/crate-vendor/td-fetch");
+    let dest = root.join(format!(".td-build-cache/crate-vendor/{name}"));
     if std::fs::create_dir_all(&dest).is_err() {
         eprintln!(
-            "td-builder check: warm td-fetch crates: cannot create {} — skipping",
+            "td-builder check: warm {name} crates: cannot create {} — skipping",
             dest.display()
         );
         return;
@@ -764,23 +1183,23 @@ fn warm_td_fetch_crates(root: &Path) {
     )
     .or_else(|| host_cargo_bin(root, "fetch", "td-fetch", deadline)) else {
         eprintln!(
-            "td-builder check: warm td-fetch crates: no td-fetch binary — skipping (PREP best-effort)"
+            "td-builder check: warm {name} crates: no td-fetch binary — skipping (PREP best-effort)"
         );
         return;
     };
     let mut complete = true;
-    for (name, ver, sum) in parse_lock_checksums(&lock) {
-        let nv = format!("{name}-{ver}");
+    for (crate_name, ver, sum) in parse_lock_checksums(&lock) {
+        let nv = format!("{crate_name}-{ver}");
         let out = dest.join(format!("{nv}.crate"));
         if crate::sha256::sha256_file(&out).ok().as_deref() == Some(sum.as_str()) {
             continue; // already warm + verified
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            eprintln!("td-builder check: warm td-fetch crates: TD_WARM_TIMEOUT budget exhausted — stopping");
+            eprintln!("td-builder check: warm {name} crates: TD_WARM_TIMEOUT budget exhausted — stopping");
             complete = false;
             break;
         }
-        let url = format!("https://static.crates.io/crates/{name}/{nv}.crate");
+        let url = format!("https://static.crates.io/crates/{crate_name}/{nv}.crate");
         // Pid-suffixed tmp: concurrent preludes (normal on this box) each
         // write their own, so one warm's rename never publishes bytes another
         // warm is still writing.
@@ -805,7 +1224,7 @@ fn warm_td_fetch_crates(root: &Path) {
             let _ = std::fs::rename(&tmp, &out);
         } else {
             let _ = std::fs::remove_file(&tmp);
-            eprintln!("td-builder check: warm td-fetch crates: could not td-fetch/verify {nv}");
+            eprintln!("td-builder check: warm {name} crates: could not td-fetch/verify {nv}");
         }
     }
     let n = std::fs::read_dir(&dest)
@@ -816,7 +1235,7 @@ fn warm_td_fetch_crates(root: &Path) {
         })
         .unwrap_or(0);
     eprintln!(
-        "td-builder check: warm td-fetch crates: {n} crates in {} (td-fetched, Cargo.lock-pinned, guix-free){}",
+        "td-builder check: warm {name} crates: {n} crates in {} (td-fetched, Cargo.lock-pinned, guix-free){}",
         dest.display(),
         if complete { "" } else { " — INCOMPLETE (TD_WARM_TIMEOUT exhausted)" }
     );
@@ -825,9 +1244,27 @@ fn warm_td_fetch_crates(root: &Path) {
 /// The heavy-tier warm prelude: source-bootstrap tarballs + rust crate closures
 /// (td-feed), all BEST-EFFORT (the gates enforce presence), fanned out in
 /// batches of TD_WARM_JOBS exactly as the shell prelude did.
-fn heavy_warms(root: &Path) {
+/// The td-tool crate-closure warms (td-fetch, td-sh): host-side network PREP
+/// that populates the offline vendor sets `.td-build-cache/crate-vendor/{name}`
+/// BEFORE the chain that consumes them is provisioned. These MUST run ahead of
+/// `provision_userland` — the loop userland realizes the bootstrap chain
+/// (mes → tcc → … → busybox/make), and once tcc declares td-sh as its shell
+/// (re #469) that build reads the warmed `sh/Cargo.lock` closure. Gating the
+/// warm behind provisioning is the deadlock the review flagged: provisioning
+/// fails at the first host-bash rung, so a warm placed after it never runs and
+/// the cold bootstrap exits 69 with an empty td-sh vendor set. Best-effort
+/// (a missing fetcher / no network warns; the recipe checks enforce presence).
+fn warm_td_crate_closures(root: &Path) {
     // td-fetch's own crate closure (its own warm — not the cargo-proxy).
-    warm_td_fetch_crates(root);
+    warm_crate_closure(root, "fetch/Cargo.lock", "td-fetch");
+    // td-sh's brush closure (re #469): the offline vendor set a td-sh recipe
+    // builds from, warmed before any rung declares td-sh.
+    warm_crate_closure(root, "sh/Cargo.lock", "td-sh");
+}
+
+fn heavy_warms(root: &Path) {
+    // The td-tool crate closures (td-fetch, td-sh) are warmed earlier, before
+    // provision_userland (warm_td_crate_closures) — not here.
 
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
     // cargo build of feed/.
@@ -924,26 +1361,152 @@ fn heavy_warms(root: &Path) {
 ///
 /// Env: TD_DAEMON_DIR (shared dir, default ~/.td/build-daemon),
 /// TD_DAEMON_BUILDER (daemon binary override), TD_DAEMON_SEED_DIR (the
-/// start-time seed store DIR, default: the store the loop sandbox binds
-/// (SANDBOX_STORE_PREFIX) — content-scanned for the
+/// start-time seed store DIR, default: derived from the declared seed-lock
+/// paths (`seed_store_dir`) — content-scanned host-side for the
 /// input closure, #267; only bare-drv requests use it), TD_BUILD_JOBS (the
 /// global budget — inherited by the spawned daemon), TD_NICE (nice level for
 /// the daemon + its build children, default 10).
-fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
-    let daemon_dir = match std::env::var("TD_DAEMON_DIR") {
-        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+/// The daemon's runtime dir (sockets, pid files, the blessed seed-closure db):
+/// `TD_DAEMON_DIR` or `$HOME/.td/build-daemon`. Shared by `ensure_build_daemon`
+/// (which creates state here) and the daemon/child verbs (which RE-DERIVE the
+/// same paths rather than trusting an argv, re #469 round-8).
+pub(crate) fn daemon_runtime_dir() -> Result<PathBuf, String> {
+    match std::env::var("TD_DAEMON_DIR") {
+        Ok(v) if !v.trim().is_empty() => Ok(PathBuf::from(v)),
         _ => {
             let home = std::env::var("HOME").map_err(|_| s("no HOME for TD_DAEMON_DIR"))?;
-            Path::new(&home).join(".td/build-daemon")
+            Ok(Path::new(&home).join(".td/build-daemon"))
         }
+    }
+}
+
+/// The DERIVED path of the blessed seed-closure db for (repo ROOT, SEED-DIR):
+/// keyed by the repo's own checked-in seed-lock declarations, never by a
+/// caller-supplied path. This is the round-8 origin-authentication fix for the
+/// `BlessedSeedClosure` intake: the daemon and its `daemon-build`/`daemon-check`
+/// children re-derive the db location from the same repo-declared inputs
+/// `ensure_build_daemon` blessed under, so NO public interface accepts a
+/// caller-selected db path as manifest authority — a raw path can no longer
+/// become a typed origin. (A same-user writer can still forge the file at the
+/// derived location; that trust-domain limit is the same one recorded on the
+/// receipt layer, and a daemon-owned provenance db remains the follow-on,
+/// re #472.) `None` when the repo declares no seed-lock roots — there is
+/// nothing to bless, and strict staging fails closed on unvouched items.
+pub(crate) fn blessed_seed_db_path(
+    root: &Path,
+    seed_dir: &str,
+) -> Result<Option<PathBuf>, String> {
+    let roots = seed_lock_roots(root);
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let mut h = crate::sha256::Sha256::new();
+    h.update(seed_dir.as_bytes());
+    for r in &roots {
+        h.update(b"\n");
+        h.update(r.as_bytes());
+    }
+    let bfull = crate::sha256::to_base16(&h.finalize());
+    let bkey: String = bfull.chars().take(16).collect();
+    Ok(Some(
+        daemon_runtime_dir()?.join(format!("seed-bless.{bkey}.db")),
+    ))
+}
+
+/// The host seed-store DIRECTORY every derived-bless consumer keys on:
+/// `TD_DAEMON_SEED_DIR` (operator override) or the unique parent of the
+/// repo's declared seed-lock paths. ONE derivation shared by the blesser
+/// (`ensure_seed_bless`), the daemon (`ensure_build_daemon`), and the ladder
+/// entrances' derived-db lookup (`derived_bless_db_auto` in main) — the
+/// bless-db key includes this string, so every consumer must derive it the
+/// same way or fail closed on a db that is not there.
+pub(crate) fn daemon_seed_dir(root: &Path) -> Option<String> {
+    match std::env::var("TD_DAEMON_SEED_DIR") {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => seed_store_dir(&seed_lock_roots(root)),
+    }
+}
+
+/// BLESS the declared seed closure once per root set (re #469): strict
+/// staging manifests are unconditional, so every build that stages the
+/// host-provisioned toolchain — the daemon's children AND the ladder's
+/// `build-plan`/`build-recipe`, whose control-plane builder carries the §5
+/// seed's glibc/gcc-lib in its runtime closure — needs a td-owned db
+/// vouching that closure. The `seed-bless` verb derives the roots ITSELF
+/// from the repo's checked-in seed-lock declarations (cwd = root below) —
+/// no caller-supplied roots file exists to tamper with. The db lives at the
+/// DERIVED `blessed_seed_db_path` location, keyed by those declared roots
+/// (store paths embed content hashes, so a pin bump derives a new key and
+/// re-blesses); an existing db is REUSED, never rewritten — re-blessing
+/// would re-trust whatever is currently on disk, the existence-as-authority
+/// hole the manifest closes. Never handed around: every consumer RE-DERIVES
+/// the path from the same repo-declared inputs (re #469 round-8 — a
+/// caller-selected db path is no longer an intake). Runs in the check
+/// prelude BEFORE userland provisioning (whose recipe builds already need
+/// the authority), and again from `ensure_build_daemon` (idempotent).
+pub(crate) fn ensure_seed_bless(root: &Path, tb: &str) -> Result<(), String> {
+    let Some(seed_dir) = daemon_seed_dir(root) else {
+        eprintln!(
+            "td-builder check: WARNING: no seed store dir (no declared seed-lock roots and \
+             TD_DAEMON_SEED_DIR unset) — nothing to bless (re #469)"
+        );
+        return Ok(());
     };
+    match blessed_seed_db_path(root, &seed_dir)? {
+        None => {
+            eprintln!(
+                "td-builder check: WARNING: no declared seed-lock roots to bless — strict \
+                 builds will red on unvouched closure items (re #469)"
+            );
+        }
+        Some(db) => {
+            if !db.exists() {
+                eprintln!(
+                    "td-builder check: blessing the declared seed closure into {} — \
+                     a one-time hash of the pinned toolchain (re #469)",
+                    db.display()
+                );
+                if let Some(parent) = db.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+                }
+                // Pid-unique tmp + atomic rename: concurrent blessers (two
+                // agents' preludes) each write their own tmp of the SAME
+                // deterministic closure; whichever renames last wins with
+                // identical content, and no reader ever sees a partial db.
+                let tmp = db.with_extension(format!("db.tmp.{}", std::process::id()));
+                let out = Command::new(tb)
+                    .args(["seed-bless", &seed_dir])
+                    .arg(&tmp)
+                    .current_dir(root)
+                    .output()
+                    .map_err(|e| format!("spawn seed-bless: {e}"))?;
+                if !out.status.success() {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(format!(
+                        "seed-bless failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                std::fs::rename(&tmp, &db)
+                    .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), db.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
+    let daemon_dir = daemon_runtime_dir()?;
     let store = daemon_dir.join("store");
     std::fs::create_dir_all(&store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
-    // Default seed store = the store the loop sandbox binds (the ONE remaining
-    // host-store coupling, deleted with SANDBOX_STORE_PREFIX when the loop's
-    // userland goes td-built).
-    let seed_dir = std::env::var("TD_DAEMON_SEED_DIR")
-        .unwrap_or_else(|_| s(SANDBOX_STORE_PREFIX.trim_end_matches('/')));
+    // Default seed store = DERIVED from the declared seed-lock paths, read
+    // HOST-SIDE by the daemon (never a hardcoded prefix; the loop SANDBOX
+    // never mounts it). A lock-less host must say where its seed lives.
+    let seed_dir = daemon_seed_dir(root).ok_or_else(|| {
+        s("no seed store dir: the seed locks name no existing paths and \
+           TD_DAEMON_SEED_DIR is unset")
+    })?;
     let daemon_tb = match std::env::var("TD_DAEMON_BUILDER") {
         Ok(v) if !v.trim().is_empty() && Path::new(&v).is_file() => v,
         _ => tb.to_string(),
@@ -988,6 +1551,11 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         return Ok(sock.display().to_string());
     }
 
+    // The blessed seed closure must exist before this daemon's children build
+    // (idempotent — `ensure_seed_bless` reuses an existing db; the prelude
+    // normally blessed already, but the daemon path stays self-sufficient).
+    ensure_seed_bless(root, &daemon_tb)?;
+
     // Start a fresh daemon, detached in its OWN process group so it outlives
     // this check AND survives the terminal's ^C/hangup signals (the machine-
     // wide limiter must persist across checks — the shell's `nohup` role).
@@ -1013,6 +1581,11 @@ fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
         seed_dir,
         store.display().to_string(),
     ]);
+    // The blessed seed-closure db is NOT an argument: the daemon's build
+    // children re-derive its location from the repo's own seed-lock
+    // declarations (`blessed_seed_db_path` over their cwd = root, spawned
+    // below with `current_dir(root)`), so no argv or env channel can add
+    // manifest authority (re #469 round-8 origin authentication).
     let (head, rest) = argv
         .split_first()
         .ok_or_else(|| s("internal: empty daemon argv"))?;
@@ -1110,10 +1683,10 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 
     guard_netns_probe()?;
 
-    // No guix process remains: the loop PATH is only the host-PATH toolchain
-    // declared in LOOP_TOOLCHAIN. Gate text/tree work must invoke
-    // td-builder typed helpers or td-built userland instead of inheriting GNU
-    // sed/grep/findutils from a seed lock.
+    // No guix process and no host tool remains: the loop PATH is only the
+    // td-BUILT userland (busybox/make) plus td-builder's native applets. Gate
+    // text/tree work must invoke td-builder typed helpers or that userland —
+    // never GNU sed/grep/findutils from a seed lock.
 
     // Light tiers own no heavy gate — skip the heavy warms + daemon (exactly the
     // shell prelude's goal scan).
@@ -1125,8 +1698,14 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     });
 
     let tb = provision_stage0(&root)?;
-    let toolchain = provision_toolchain()?;
-    let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain).map_err(|e| {
+    // Bless the declared seed closure BEFORE any recipe build: userland
+    // provisioning realizes the chain through build-plan, whose staging
+    // manifest needs the blessed db to vouch the control-plane builder's
+    // host-seed runtime closure (glibc/gcc-lib) — blessing only at daemon
+    // ensure time (after userland) deadlocked a cold host (re #469 round-8).
+    ensure_seed_bless(&root, &tb)?;
+    let ul = provision_userland(&root)?;
+    let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path).map_err(|e| {
         CheckError::Fatal(fatal(&format!(
             "could not provision loop native applets ({e})"
         )))
@@ -1244,20 +1823,31 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
             argv.extend([ionice.display().to_string(), s("-c2"), s("-n7")]);
         }
     }
-    let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
+    // The sandbox mounts NO store directory and NO host tool — only the loop's
+    // declared input ITEMS, each bound read-only (the drv build jail's
+    // input-only model): the td-BUILT userland at its /td/store paths, the
+    // seed locks' declared closures, and the closures of the host-built
+    // binaries that run inside (the stage0 td-builder; the stashed td-subst
+    // when exposed).
+    let roots = seed_lock_roots(&root);
+    let items = loop_store_items(&root, &roots, &loop_scan_files(&root, &tb)).map_err(|e| {
+        fatal(&format!(
+            "could not compute the loop sandbox's store-item inputs ({e})"
+        ))
+    })?;
     argv.extend([
         tb.clone(),
         s("host-sandbox"),
         s("--expose-cwd"),
         s("--no-daemon"),
-        s("--store-from"),
-        s(sandbox_store),
-        s("--store-at"),
-        s(sandbox_store),
-        s("--"),
-        tb,
-        s("gate-run"),
     ]);
+    for it in &items {
+        argv.extend([s("--store-item"), it.clone()]);
+    }
+    for (src, dest) in &ul.items {
+        argv.extend([s("--store-item-at"), src.clone(), dest.clone()]);
+    }
+    argv.extend([s("--"), tb, s("gate-run")]);
     argv.extend([s("-j"), jobs.to_string()]);
     if resume {
         argv.push(s("--resume"));
@@ -1298,7 +1888,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 /// gate, NOT part of the loop; native since #318 axis 2 — was
 /// tools/check-rung.sh). Run a cached-chain bootstrap dev harness INSIDE td's
 /// loop sandbox, so sandbox-only failures (no `bzip2`/no `/bin/sh` on PATH,
-/// env_clear + C locale, the read-only /gnu/store) surface in MINUTES against
+/// env_clear + C locale, the read-only per-item store binds) surface in MINUTES against
 /// the already-built chain in .td-build-cache/ — instead of a ~40-min
 /// from-the-seed gate round-trip just to discover a one-line unpack/shebang
 /// bug. The dev harnesses otherwise run on the HOST (which has bzip2, /bin/sh,
@@ -1309,9 +1899,9 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 /// whole chain from the seed with substitutes off (prime directive 1). Once a
 /// harness is green here, run the real `td-builder check bootstrap-<rung>`.
 ///
-/// The sandbox + toolchain provisioning is EXACTLY the loop prelude's (same
-/// stage0 container provider, same `LOOP_TOOLCHAIN` list — notably WITHOUT
-/// bzip2, so a missing-bzip2 bug still reproduces).
+/// The sandbox + userland provisioning is EXACTLY the loop prelude's (same
+/// stage0 container provider, same td-built busybox/make userland — notably
+/// WITHOUT bzip2, so a missing-bzip2 bug still reproduces).
 pub fn check_rung_cli(args: &[String]) -> ExitCode {
     match check_rung(args) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -1338,26 +1928,29 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     })?;
     // check-rung is a dev helper, not the loop: it does not branch on the
     // provisioned/regression distinction, so collapse CheckError back to a string.
-    let toolchain = provision_toolchain().map_err(|e| e.to_string())?;
-    let toolchain = loop_path_with_native_applets(&root, &tb, &toolchain)
+    let ul = provision_userland(&root).map_err(|e| e.to_string())?;
+    let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path)
         .map_err(|e| format!("check-rung: FATAL: could not provision loop native applets ({e})"))?;
+    // The same input-only store exposure as the loop (per-item binds, no store
+    // directory mounted; same scan-file set, recomputed from the live scan).
+    let roots = seed_lock_roots(&root);
+    let items = loop_store_items(&root, &roots, &loop_scan_files(&root, &tb))
+        .map_err(|e| format!("check-rung: FATAL: {e}"))?;
     eprintln!(
         ">> check-rung: {harness} inside td-builder host-sandbox (cached chain reused; \
          sandbox env matches the gate)"
     );
     let mut cmd = Command::new(&tb);
-    let sandbox_store = SANDBOX_STORE_PREFIX.trim_end_matches('/');
-    cmd.args([
-        "host-sandbox",
-        "--expose-cwd",
-        "--no-daemon",
-        "--store-from",
-        sandbox_store,
-        "--store-at",
-        sandbox_store,
-        "--",
-        "sh",
-    ])
+    let mut sandbox_args: Vec<String> =
+        vec![s("host-sandbox"), s("--expose-cwd"), s("--no-daemon")];
+    for it in &items {
+        sandbox_args.extend([s("--store-item"), it.clone()]);
+    }
+    for (src, dest) in &ul.items {
+        sandbox_args.extend([s("--store-item-at"), src.clone(), dest.clone()]);
+    }
+    sandbox_args.extend([s("--"), s("sh")]);
+    cmd.args(sandbox_args)
     .arg(harness)
     .args(rest)
     .env("PATH", toolchain)
@@ -1409,6 +2002,58 @@ mod tests {
             .any(|(k, v)| k == "TD_SUBST_BIN" && v.ends_with("/td-subst")));
     }
 
+    // The blessed-seed db location is a PURE FUNCTION of the repo's seed-lock
+    // declarations + the seed dir (re #469 round-8): the daemon and its
+    // children DERIVE it — there is no argv/env channel that can point the
+    // BlessedSeedClosure origin at a caller-selected db. Same declarations →
+    // same basename; different seed dir or root set → different basename; no
+    // declarations → no bless db at all.
+    #[test]
+    fn blessed_seed_db_path_derives_from_declarations_only() {
+        let d = scratch("bless-derive");
+        // Two fake declared seed roots that exist on disk (seed_lock_roots
+        // keeps only existing absolute paths).
+        let (r1, r2) = (d.join("store").join("aaa-tool"), d.join("store").join("bbb-lib"));
+        std::fs::create_dir_all(d.join("store")).unwrap();
+        std::fs::write(&r1, b"t").unwrap();
+        std::fs::write(&r2, b"l").unwrap();
+        let repo = d.join("repo");
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(
+            repo.join("tests/td-builder-rust.lock"),
+            format!("tool {}\nlib {}\n", r1.display(), r2.display()),
+        )
+        .unwrap();
+        let name_at = |root: &Path, seed_dir: &str| {
+            blessed_seed_db_path(root, seed_dir)
+                .unwrap()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        };
+        let a = name_at(&repo, "/seed/dir").unwrap();
+        assert_eq!(a, name_at(&repo, "/seed/dir").unwrap(), "must be deterministic");
+        assert!(
+            a.starts_with("seed-bless.") && a.ends_with(".db"),
+            "derived name shape: {a}"
+        );
+        assert_ne!(
+            a,
+            name_at(&repo, "/other/dir").unwrap(),
+            "a different seed dir must derive a different bless db"
+        );
+        // Dropping a declared root changes the derivation too.
+        std::fs::write(
+            repo.join("tests/td-builder-rust.lock"),
+            format!("tool {}\n", r1.display()),
+        )
+        .unwrap();
+        assert_ne!(a, name_at(&repo, "/seed/dir").unwrap());
+        // No declarations → None: nothing to bless, nothing to derive.
+        let bare = d.join("bare-repo");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(blessed_seed_db_path(&bare, "/seed/dir").unwrap(), None);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn subst_env_is_empty_when_any_piece_is_missing() {
         // Each missing piece independently means "expose nothing" — the gate
@@ -1436,6 +2081,146 @@ mod tests {
                 "missing {missing} must expose nothing"
             );
         }
+    }
+
+    #[test]
+    fn parse_seed_lock_keeps_absolute_paths_deduped() {
+        // The lock is the DECLARED seed, whatever store its paths live in —
+        // any absolute path qualifies; only relative/malformed lines drop.
+        let lock = "\
+# comment line
+aaa-rust-1.93.0 /td/store/aaa-rust-1.93.0
+bbb-cargo /td/store/bbb-rust-1.93.0-cargo extra-field
+bbb-again /td/store/bbb-rust-1.93.0-cargo
+
+malformed-line-without-path
+ccc-relative not/absolute
+";
+        assert_eq!(
+            parse_seed_lock(lock),
+            vec![
+                "/td/store/aaa-rust-1.93.0".to_string(),
+                "/td/store/bbb-rust-1.93.0-cargo".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn seed_store_dir_derives_the_unique_parent() {
+        // The candidate store dir comes from the declared lock paths, never a
+        // hardcoded prefix.
+        let roots = vec![
+            "/td/store/aaa-bash-5.2.37".to_string(),
+            "/td/store/bbb-make-4.4.1".to_string(),
+        ];
+        assert_eq!(seed_store_dir(&roots), Some("/td/store".to_string()));
+        // Several parents: the FIRST wins (warned) — the seed is one store.
+        let mixed = vec![
+            "/td/store/aaa-bash-5.2.37".to_string(),
+            "/other/store/ccc-sed-4.9".to_string(),
+        ];
+        assert_eq!(seed_store_dir(&mixed), Some("/td/store".to_string()));
+        // No roots, or roots with no usable parent: no store dir.
+        assert_eq!(seed_store_dir(&[]), None);
+        assert_eq!(seed_store_dir(&["/toplevel".to_string()]), None);
+    }
+
+    #[test]
+    fn userland_map_validates_every_stem_or_reprovisions() {
+        let d = scratch("loop-userland");
+        let map = d.join("loop-userland.map");
+        let fp = "f".repeat(64);
+        // A valid map: the current fingerprint, every stem present, each item
+        // dir with a bin/ and a recorded NAR hash its bytes verify against.
+        let mut content = format!("fingerprint {fp}\n");
+        for (i, stem) in LOOP_USERLAND_STEMS.iter().enumerate() {
+            let base = format!("hash{i}-{stem}-1.0");
+            let bin = d.join(&base).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("tool"), format!("#!{stem}\n")).unwrap();
+            let want = crate::sandbox::nar_hash_of(&d.join(&base)).unwrap();
+            content.push_str(&format!("{stem} {base} {want}\n"));
+        }
+        std::fs::write(&map, &content).unwrap();
+        let ul = read_userland_map(&d, &map, &fp).expect("valid map resolves");
+        assert_eq!(ul.items.len(), LOOP_USERLAND_STEMS.len());
+        for ((host, canon), stem) in ul.items.iter().zip(LOOP_USERLAND_STEMS) {
+            assert!(host.starts_with(d.to_str().unwrap()), "host copy under the durable dir");
+            assert_eq!(canon, &format!("{TD_STORE_DIR}/hash{}-{stem}-1.0",
+                LOOP_USERLAND_STEMS.iter().position(|s| s == stem).unwrap()));
+            assert!(ul.path.contains(&format!("{canon}/bin")), "bin dir on the PATH");
+        }
+        // A fingerprint mismatch invalidates the WHOLE map: a userland built
+        // by any other evaluator — e.g. one that still admitted host
+        // scaffolding — is never grandfathered in.
+        assert!(read_userland_map(&d, &map, &"0".repeat(64)).is_none());
+        // TAMPERED bytes are a cache miss, not a mount: flip one byte in an
+        // item and the recorded NAR hash no longer verifies (re #469).
+        let item0 = d.join(format!("hash0-{}-1.0", LOOP_USERLAND_STEMS[0]));
+        std::fs::write(item0.join("bin/tool"), b"#!poisoned\n").unwrap();
+        assert!(read_userland_map(&d, &map, &fp).is_none());
+        std::fs::write(
+            item0.join("bin/tool"),
+            format!("#!{}\n", LOOP_USERLAND_STEMS[0]),
+        )
+        .unwrap();
+        assert!(read_userland_map(&d, &map, &fp).is_some(), "restored bytes verify again");
+        // A stem whose item lost its bin/ invalidates the whole map (the
+        // caller re-provisions) — no partial userland.
+        std::fs::remove_dir_all(item0.join("bin")).unwrap();
+        assert!(read_userland_map(&d, &map, &fp).is_none());
+        // A path-carrying value is rejected (the map holds basenames only), as
+        // is a hash-less line (the pre-hash map format self-invalidates) and a
+        // map with no fingerprint line at all.
+        std::fs::write(
+            &map,
+            format!("fingerprint {fp}\nbusybox-x86-64 ../escape sha256:aa\nmake-x86-64 x sha256:aa\n"),
+        )
+        .unwrap();
+        assert!(read_userland_map(&d, &map, &fp).is_none());
+        std::fs::write(
+            &map,
+            format!("fingerprint {fp}\nbusybox-x86-64 x\nmake-x86-64 x\n"),
+        )
+        .unwrap();
+        assert!(read_userland_map(&d, &map, &fp).is_none());
+        std::fs::write(&map, "busybox-x86-64 x sha256:aa\nmake-x86-64 x sha256:aa\n").unwrap();
+        assert!(read_userland_map(&d, &map, &fp).is_none());
+        // A missing map is simply cold.
+        assert!(read_userland_map(&d, &d.join("absent.map"), &fp).is_none());
+    }
+
+    // The userland freshness key covers the evaluator binary AND the in-repo
+    // seed patches: patches are chain inputs the runner reads from the TREE at
+    // build time, so a patch-only change (binary byte-identical) must re-key
+    // the userland — a stale one could false-green the patch under review.
+    #[test]
+    fn userland_fingerprint_keys_on_evaluator_and_seed_patches() {
+        let d = scratch("userland-fp");
+        let eval = d.join("td-recipe-eval");
+        std::fs::write(&eval, b"evaluator-v1").unwrap();
+        let eval_s = eval.to_str().unwrap().to_string();
+        let root = d.join("tree");
+        std::fs::create_dir_all(root.join("seed/patches")).unwrap();
+        let fp0 = userland_fingerprint(&root, &eval_s).unwrap();
+        // A patch appearing re-keys; its CONTENT changing re-keys again.
+        std::fs::write(root.join("seed/patches/a.patch"), b"-x\n+y\n").unwrap();
+        let fp1 = userland_fingerprint(&root, &eval_s).unwrap();
+        assert_ne!(fp0, fp1, "a new seed patch re-keys the userland");
+        std::fs::write(root.join("seed/patches/a.patch"), b"-x\n+z\n").unwrap();
+        let fp2 = userland_fingerprint(&root, &eval_s).unwrap();
+        assert_ne!(fp1, fp2, "a patch-only change re-keys the userland");
+        // Non-.patch files in the dir do not key; a tree with NO patch dir
+        // keys on the binary alone.
+        std::fs::write(root.join("seed/patches/README"), b"notes").unwrap();
+        assert_eq!(fp2, userland_fingerprint(&root, &eval_s).unwrap());
+        let bare = d.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let fp_bare = userland_fingerprint(&bare, &eval_s).unwrap();
+        assert_ne!(fp_bare, fp2);
+        // The evaluator's bytes still key.
+        std::fs::write(&eval, b"evaluator-v2").unwrap();
+        assert_ne!(fp2, userland_fingerprint(&root, &eval_s).unwrap());
     }
 
     #[test]
@@ -1515,6 +2300,33 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
             got.len() >= 70,
             "only {} checksummed packages parsed",
             got.len()
+        );
+        assert!(
+            got.iter()
+                .all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
+            "malformed triplet parsed from the real lock"
+        );
+    }
+
+    #[test]
+    fn parse_lock_checksums_covers_the_real_td_sh_lock() {
+        // td-sh's brush closure rides the same warm path (warm_crate_closure,
+        // re #469). The parser must see the large checksummed set — a lockfile
+        // that silently parsed empty would warm zero crates and the td-sh
+        // recipe build would run cold. The local `td-sh` package has no
+        // checksum, so the count is one short of the [[package]] total.
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../sh/Cargo.lock"))
+                .unwrap();
+        let got = parse_lock_checksums(&lock);
+        assert!(
+            got.len() >= 200,
+            "only {} checksummed packages parsed from sh/Cargo.lock",
+            got.len()
+        );
+        assert!(
+            got.iter().any(|(n, _, _)| n == "brush-shell"),
+            "brush-shell (td-sh's sole dependency) missing from the parsed closure"
         );
         assert!(
             got.iter()

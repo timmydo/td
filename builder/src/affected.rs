@@ -405,6 +405,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     if p == "recipes/src/source_pins.rs" {
         sel.add_preflight("shell-syntax");
+        sel.add_preflight("cargo-test");
         sel.add_target("recipe-rs");
         sel.add_target("bootstrap-seed");
         sel.add_target("bootstrap-mes");
@@ -434,6 +435,35 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // seed/seed-digests.txt — the compiled seed-digest table (re #469),
+    // include_str!-compiled into BOTH planners (td-recipe-eval's
+    // seed_digests.rs and td-builder's auto_seed_provenance). The
+    // digest-coverage unit tests in both crates are the direct check
+    // (cargo-test); a row change shifts what the planners ADMIT, so the
+    // recipe self-consistency and package build gates run too.
+    if p == "seed/seed-digests.txt" {
+        sel.add_preflight("cargo-test");
+        sel.add_target("recipe-rs");
+        add_build_gate_targets(root, sel);
+        return;
+    }
+
+    // seed/control-plane-seed-pins.txt — the sha256 allow-list of ADMISSIBLE frozen
+    // control-plane seed captures (the pinned §5 rust/gcc toolchain that seed-unpack
+    // restores), include_str!-compiled into td-builder as CONTROL_PLANE_SEED_PINS and
+    // consulted by authenticate_seed_capture_db (which seed-capture db may be TYPED
+    // admissible). Without a mapping an isolated edit selected only check-pr (which
+    // exits before running gates) — no coverage at all. The per-PR coverage is the
+    // cargo-test preflight: the include_str! recompile, the authenticate_seed_capture_db
+    // unit tests (the provenance-authentication logic), and clippy — plus stage0-cold-start,
+    // the seed-placement provenance gate. A full from-frozen-seed toolchain build (the pin
+    // in a real admission) is the DAILY backstop, like the toolchain gates.
+    if p == "seed/control-plane-seed-pins.txt" {
+        sel.add_preflight("cargo-test");
+        sel.add_target("stage0-cold-start");
+        return;
+    }
+
     if pattern_matches(
         "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipe-eval-tool.sh",
         p,
@@ -443,7 +473,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // catalog change can affect ANY built package. Run recipe-rs (self-consistency
         // + manifest sync) and the package build gates. (spec-diff retired with the
         // museum tier; the guix-dependence census retired with the guix-oracle gates.)
+        // The cargo-test preflight carries the crate's unit tests + clippy while the
+        // in-loop gates are unprovisionable (re #469).
         sel.add_preflight("shell-syntax");
+        sel.add_preflight("cargo-test");
         sel.add_target("recipe-rs");
         if glob_match("recipes/src/recipes/*.rs", p) {
             sel.add_target("recipe-checks-daily");
@@ -523,7 +556,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // tests/build-recipes.sh IS the build phase (the former Makefile build-recipes
     // recipe, run by the gate runner) — a change to it affects every build gate,
-    // exactly like the build-phase helpers below.
+    // exactly like the build-phase helpers below. (tests/stage0-builder.sh is a
+    // tombstone: the placement logic became builder/src/stage0.rs — `td-builder
+    // stage0-place`, re #469; the deleting diff still routes to the build gates
+    // that consume the placement.)
     if pattern_matches(
         "tests/build-recipes.sh|tests/cache-lib.sh|tests/stage0-builder.sh",
         p,
@@ -631,10 +667,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // (The td-builder SEED-build resolver scripts tools/provision-{rust,cc}.sh +
-    // tools/bootstrap-td-builder.sh and tests/provision-{rust,cc}.sh fall through to
-    // the shell-syntax preflight below — their gates (bootstrap/provision-rust/
-    // provision-cc) retired with the guix-invoking gates.)
+    // Tombstones for the deleted SEED-build resolver behavioral tests: the
+    // resolvers (tools/provision-{rust,cc}.sh + tools/bootstrap-td-builder.sh)
+    // were ported into builder/src/stage0.rs (`td-builder provision-{rust,cc}`
+    // / `stage0-place`, re #469), unit-tested there via cargo-test; the shell
+    // tests' gates had already retired with the guix-invoking gates. These
+    // paths exist only in deleting diffs. (The deleted tools/*.sh route
+    // through the tools arm below.)
+    if pattern_matches("tests/provision-rust.sh|tests/provision-cc.sh", p) {
+        sel.add_preflight("cargo-test");
+        return;
+    }
     if pattern_matches("ci/*.sh|tools/*.sh", p) {
         sel.add_preflight("shell-syntax");
         return;
@@ -671,7 +714,7 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
         "shell-syntax" => Some(
             "  bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
         ),
-        "cargo-test" => Some("  cargo test --manifest-path builder/Cargo.toml"),
+        "cargo-test" => Some("  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml"),
         "td-sh-test" => Some(
             "  cargo clippy --all-targets --manifest-path sh/Cargo.toml && cargo test --manifest-path sh/Cargo.toml",
         ),
@@ -1098,6 +1141,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // source-pin edits route via the recipe crate; the recipe code
     // (builder/src/bootstrap.rs) validates on the check-engine smoke + cargo-test.
     assert_target!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
+    // seed/control-plane-seed-pins.txt — the frozen seed-capture allow-list (re #469): an
+    // isolated edit must select the cargo-test preflight (the include_str! recompile +
+    // authenticate_seed_capture_db unit tests + clippy) AND the stage0-cold-start
+    // provenance target — NOT bare check-pr, which exits 69 before any gate runs. Asserted
+    // both ways: the preflight COMMAND string is rendered, and stage0-cold-start is selected.
+    assert_contains!(
+        "seed/control-plane-seed-pins.txt",
+        "cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml"
+    );
+    assert_target!("seed/control-plane-seed-pins.txt", "stage0-cold-start");
     assert_target!("builder/src/bootstrap.rs", "check-engine");
     assert_branch_policy!("builder/src/bootstrap.rs", "the full check would be waived");
     // The td-builder build engine validates on the check-engine SMOKE tier.
@@ -1213,7 +1266,25 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             root,
             "bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
         ),
-        "cargo-test" => run_shell(root, "cargo test --manifest-path builder/Cargo.toml"),
+        // BOTH engine crates, tests AND clippy: the AGENTS.md deny-lints only
+        // fire under the clippy driver, and the in-loop cargo-test gate (325)
+        // is unreachable while the loop is UNPROVISIONED (re #469) — this
+        // host preflight is the per-PR enforcement in the meantime (review
+        // finding: recipes tests + clippy ran in NO automated per-PR tier).
+        "cargo-test" => {
+            for cmd in [
+                "cargo test --frozen --manifest-path builder/Cargo.toml",
+                "cargo test --frozen --manifest-path recipes/Cargo.toml",
+                "cargo clippy --frozen --manifest-path builder/Cargo.toml",
+                "cargo clippy --frozen --manifest-path recipes/Cargo.toml",
+            ] {
+                let code = run_shell(root, cmd);
+                if code != 0 {
+                    return code;
+                }
+            }
+            0
+        }
         // The blocking dev-loop coverage for the dependency-carrying seed shell:
         // clippy enforces sh/Cargo.toml's [lints] denies (cargo test alone would
         // ignore them), then the script-compat tests run.
@@ -1379,6 +1450,25 @@ pub fn main(args: &[String]) -> ExitCode {
     // targets; daily/system-tier gates it affects are named + deferred above.
     if !sel.targets.is_empty() {
         let code = run_self_check(&root, &sel.targets);
+        // EXIT_UNPROVISIONED is the loop's documented "nothing could run
+        // here" machine signal (the daily's LegRc treats it as PARTIAL with
+        // no red bit). It is explained loudly here but PROPAGATED UNCHANGED —
+        // never rewritten to success: the run did not validate the targets,
+        // and the exit code must say so (PR review); the caller decides what
+        // PARTIAL means for its tier. Today EVERY host is in that state: the
+        // bootstrap graph cannot build the loop userland without host
+        // scaffolding, which planning rejects (re #469) — the preflights
+        // above (cargo test, on the AGENTS.md rust-toolchain control plane)
+        // are the per-PR validation until the chain is self-hosting.
+        if code == crate::check_loop::EXIT_UNPROVISIONED {
+            println!(
+                "affected-checks: check targets [{}] exited UNPROVISIONED (69) — the loop \
+                 cannot run until the bootstrap graph builds its own userland (re #469); \
+                 preflights above are the per-PR coverage, the daily backstop records the \
+                 gap as PARTIAL; exit code 69 propagated unchanged",
+                sel.targets.join(" ")
+            );
+        }
         return ExitCode::from(code as u8);
     }
 
@@ -1470,7 +1560,7 @@ mod tests {
                 "  builder/src/main.rs",
                 "",
                 "Selected checks:",
-                "  cargo test --manifest-path builder/Cargo.toml",
+                "  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml",
                 "  td-builder check check-engine",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -1495,7 +1585,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
-                "  cargo test --manifest-path builder/Cargo.toml",
+                "  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml",
                 "  td-builder check check-pr",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",

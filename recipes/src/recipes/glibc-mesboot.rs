@@ -55,7 +55,7 @@ pub fn recipe() -> Recipe {
     ));
     steps.push(sed_i("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
     steps.push(sed_i(
-        "s,^SHELL := /bin/sh,SHELL := {in:bash}/bin/bash,",
+        "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
     steps.push(Step::PatchShebangs {
@@ -93,7 +93,7 @@ pub fn recipe() -> Recipe {
         );
         // fixmk: append SHELL to the generated Makefile so recipes use the shell
         steps.push(sed_i(
-            "$aSHELL := {in:bash}/bin/bash",
+            "$aSHELL := {in:bash-mesboot}/bin/bash",
             &[&format!("{bdir}/Makefile")],
         ));
         if bdir == "build-hdr" {
@@ -102,7 +102,7 @@ pub fn recipe() -> Recipe {
                     "{src}/build-hdr",
                     &[
                         "{in:make-mesboot}/bin/make",
-                        "SHELL={in:bash}/bin/bash",
+                        "SHELL={in:bash-mesboot}/bin/bash",
                         "install-bootstrap-headers=yes",
                         "install-headers",
                     ],
@@ -121,7 +121,7 @@ pub fn recipe() -> Recipe {
                     "{src}/build",
                     &[
                         "{in:make-mesboot}/bin/make",
-                        "SHELL={in:bash}/bin/bash",
+                        "SHELL={in:bash-mesboot}/bin/bash",
                     ],
                 )
                 .env("PATH", &path)
@@ -139,7 +139,7 @@ pub fn recipe() -> Recipe {
                     "{src}/build",
                     &[
                         "{in:make-mesboot}/bin/make",
-                        "SHELL={in:bash}/bin/bash",
+                        "SHELL={in:bash-mesboot}/bin/bash",
                         "install",
                     ],
                 )

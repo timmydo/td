@@ -1,15 +1,68 @@
-use crate::ladder::{SH, base_inputs, base_path, sed_i, unpack_into};
-use crate::types::{Recipe, Step};
+use crate::ladder::unpack_into;
+use crate::types::{Recipe, Step, TextEdit};
 
-// GNU Make 3.80 — bootstrap rung 4 (#378): tcc builds the first make (guix's
-// make-mesboot0). Faithful port of the deleted build_make fn: crt/libs copied
-// beside the sources (CC=tcc -static -L.), build.sh.in stubs, the lseek
-// declaration commented out of make.h.
+// GNU Make 3.80 — bootstrap rung 4 (#378), the SECOND rung cut off host
+// executables (re #469). tcc builds the first make (guix's make-mesboot0).
+//
+// The tarball's configure + build.sh are POSIX sh that kaem cannot run, so this
+// rung does NOT run them; it runs a pinned kaem BUILD SCRIPT (build.kaem) under
+// stage0's audited `kaem` seed, compiling each object with tcc and linking
+// `make` — a faithful transcription of the build.sh that configure emits for
+// the tcc + mes-libc target. config.h is the EXACT file that configure produces
+// for that target, captured once and pinned (make-mesboot0-config.h), so no
+// host shell regenerates it. The engine performs only generic orchestration,
+// exactly as the tcc rung does: unpack, copy tcc's crt/libc beside the sources,
+// write config.h + the kaem script + a smoke makefile, run kaem, copy `make`,
+// assert it. Inputs are stage0 + mes + tcc only — NO base tools.
+//
+// The only executable the build invokes is tcc (a recipe output); it is a
+// self-contained native compiler (no mescc/M1/hex2), so the step needs no mes
+// env. tcc finds its crt/libc/libtcc1 via the store paths baked into it, so no
+// -B is needed; crt/libc are still copied into the source tree to mirror
+// build.sh's `-L.`. The lseek redeclaration the old recipe sed'd out of make.h
+// does not arise with this config.h + mes 0.27.1 headers (build proven clean),
+// so no make.h patch is applied — and were one needed, the host-free
+// SubstituteText step would carry it, not host sed.
+const CONFIG_H: &str = include_str!("make-mesboot0-config.h");
+const BUILD_KAEM: &str = include_str!("make-mesboot0.kaem");
+// A shell-free smoke makefile: `make -n` prints the recipe without running it,
+// so no POSIX shell is needed to prove make parses a file and resolves a target.
+const SMOKE_MK: &str = "smoke:\n\tprintf 'make-mesboot0 ok\\n'\n";
+
 pub fn recipe() -> Recipe {
-    let path = base_path();
-    let cc = "CC=tcc -static -L. -I{in:mes}/include -I{in:mes}/include/x86";
-    let cpp = "CPP=tcc -E -I{in:mes}/include -I{in:mes}/include/x86";
     let mut steps = unpack_into("make-mesboot0-source", "{src}");
+    // Host-search-path patch (re #469, priority 2). config.h points make's
+    // INCLUDEDIR/LIBDIR at {out}, but GNU Make ALSO hardcodes host defaults that
+    // config.h never overrides: read.c's default_include_directories[] appends
+    // /usr/gnu/include, /usr/local/include, /usr/include after INCLUDEDIR, and
+    // remake.c's library_search dirs[] prepends /lib, /usr/lib before LIBDIR. A
+    // built make would carry those host paths in its .rodata and search them at
+    // run time. Delete the hardcoded entries (host-free, via SubstituteText — no
+    // sed), leaving each array = { <macro>, 0 } so the ONLY search path is the
+    // {out} one config.h supplies. Count-checked: each block is unique (expect 1).
+    steps.push(Step::substitute_text(
+        "{src}/read.c",
+        vec![TextEdit::new(
+            "#ifndef _AMIGA\n    \"/usr/gnu/include\",\n    \"/usr/local/include\",\n    \"/usr/include\",\n#endif\n",
+            "",
+            1,
+        )],
+    ));
+    steps.push(Step::substitute_text(
+        "{src}/remake.c",
+        vec![TextEdit::new(
+            "#ifndef _AMIGA\n      \"/lib\",\n      \"/usr/lib\",\n#endif\n",
+            "",
+            1,
+        )],
+    ));
+    steps.push(Step::MkDir {
+        path: "{out}/bin".into(),
+    });
+    // tcc's crt/libc beside the sources so build.kaem's `-L.` + the `.` entry in
+    // tcc's baked CRTPREFIX/LIBPATHS resolve them (mirrors build.sh; the baked
+    // {in:tcc}/lib paths resolve too, so this is belt-and-suspenders). libtcc1.a
+    // is auto-linked from tcc's baked CONFIG_TCCDIR.
     steps.push(Step::CopyFiles {
         files: vec![
             "{in:tcc}/lib/crt1.o".into(),
@@ -20,35 +73,38 @@ pub fn recipe() -> Recipe {
         ],
         dest: "{src}".into(),
     });
-    steps.push(Step::ToolFarm {
-        links: vec![("tcc".into(), "{in:tcc}/bin/tcc".into())],
+    steps.push(Step::WriteFile {
+        path: "{src}/config.h".into(),
+        content: CONFIG_H.into(),
+        exec: false,
     });
-    steps.push(sed_i(
-        "s/@LIBOBJS@/getloadavg.o/; s/@REMOTE@/stub/",
-        &["build.sh.in"],
-    ));
+    steps.push(Step::WriteFile {
+        path: "{src}/build.kaem".into(),
+        content: BUILD_KAEM.into(),
+        exec: false,
+    });
+    steps.push(Step::WriteFile {
+        path: "{src}/td-smoke.mk".into(),
+        content: SMOKE_MK.into(),
+        exec: false,
+    });
+    // Drive the build under stage0's kaem. --strict fails the rung on the first
+    // non-zero command (fail-closed). tcc needs no mes env; PATH points only at
+    // the stage0 seed bin and the locale is neutralized for determinism.
     steps.push(
         Step::run(
             "{src}",
             &[
-                SH,
-                "./configure",
-                cc,
-                cpp,
-                "LD=tcc",
-                "--build=i686-unknown-linux-gnu",
-                "--host=i686-unknown-linux-gnu",
-                "--disable-nls",
+                "{in:stage0}/AMD64/bin/kaem",
+                "--verbose",
+                "--strict",
+                "--file",
+                "build.kaem",
             ],
         )
-        .env("PATH", &path)
-        .env("CONFIG_SHELL", SH),
-    );
-    steps.push(sed_i("s,^extern long int lseek.*,// &,", &["make.h"]));
-    steps.push(
-        Step::run("{src}", &[SH, "./build.sh"])
-            .env("PATH", &path)
-            .env("CONFIG_SHELL", SH),
+        .env("PATH", "{in:stage0}/AMD64/bin")
+        .env("LANG", "")
+        .env("LC_ALL", ""),
     );
     steps.push(Step::CopyFiles {
         files: vec!["{src}/make".into()],
@@ -58,9 +114,12 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/make".into()],
         exec: true,
     });
+    // Runtime provenance (re #469): config.h builds make with `CC='tcc -static'`,
+    // so it must carry no host loader (PT_INTERP) or host libc (DT_NEEDED) — a
+    // dynamically linked make would pull a host glibc in at run time. Red here.
+    steps.push(Step::assert_static(&["{out}/bin/make"]));
     Recipe::mesboot("make-mesboot0", "3.80")
         .source_input("make-mesboot0-source")
-        .native_inputs(&["mes", "tcc"])
-        .inputs_owned(base_inputs(&[]))
+        .native_inputs(&["stage0", "mes", "tcc"])
         .steps(steps)
 }

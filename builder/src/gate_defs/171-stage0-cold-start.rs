@@ -1,8 +1,8 @@
 //! stage0-cold-start — a COLD stage0 placement needs NO guix state (#313). Gate 170
 //! proved td-builder needs no guix to be COMPILED; this gate proves the PLACEMENT half:
-//! `tests/stage0-builder.sh` (the one entry point every stage0 consumer goes through —
-//! cache-lib's load_stage0, the check prelude, the daemon-ensure probe) places a stage0
-//! from a cold cache with guix's private state HIDDEN. Before #313, store-add-builder
+//! `td-builder stage0-place` (builder/src/stage0.rs — the one entry point every stage0
+//! consumer goes through: cache-lib's load_stage0, the check prelude, the daemon-ensure
+//! probe) places a stage0 from a cold cache with guix's private state HIDDEN. Before #313, store-add-builder
 //! hard-read /var/guix/db/db.sqlite as its reference-scan seed, so any cold start (or any
 //! builder/ edit — a new fingerprint) FATALed on a guix-less host. Now the reference-scan candidates come from a readdir of
 //! the seed store DIRECTORY (scan_candidate_index, the #267 content-scan pattern), and an
@@ -10,7 +10,7 @@
 //!
 //! Per the differential+durable discipline:
 //! [DURABLE behavioral] with /var/guix bind-mounted EMPTY in a private mount ns, a cold
-//! `tests/stage0-builder.sh` places a stage0 that RUNS its sentinel.
+//! `td-builder stage0-place` places a stage0 that RUNS its sentinel.
 //! [DURABLE no-drift] the cold placement is IDENTICAL to the warm guix-host placement:
 //! same canonical path, same builder.db closure — and the closure is NON-VACUOUS (the
 //! glibc + gcc-lib refs the stage0 links were found WITHOUT the guix db, from the
@@ -54,7 +54,7 @@ echo ">> cold leg (the feature): fresh cache, /var/guix bind-mounted EMPTY in a 
 	printf '%s\n' 'mkdir -p /var/guix || exit 9' \
 	              'mount --bind "$1" /var/guix || exit 9' \
               'test -z "$(ls -A /var/guix)" || { echo "cold leg: /var/guix not hidden" >&2; exit 9; }' \
-              'TD_BUILDER_SELF="$3" exec sh tests/stage0-builder.sh "$2"' > "$scratch/cold.sh"; \
+              'exec "$3" stage0-place "$2"' > "$scratch/cold.sh"; \
 	cbc=`"$tbw" userns-private -- sh "$scratch/cold.sh" "$scratch/empty" "$scratch/cold" "$tbw"` \
   || { echo "FAIL: cold stage0 placement with /var/guix hidden failed — the guix-less cold start is broken (#313)" >&2; exit 1; }; \
 test "$cbw" = "$cbc" || { echo "FAIL: cold placement $cbc != warm placement $cbw — provenance drift" >&2; exit 1; }; \
@@ -96,7 +96,7 @@ pb=`"$tbw" store-add-builder probe2-0.1.0 "$scratch/probe2" "$scratch/pstore-b" 
 	  || { echo "FAIL: the embedded ref $g was NOT found by the /gnu/store readdir scan — the candidate source is broken" >&2; exit 1; }; \
 echo "  [DURABLE self-discrimination] same probe bytes: absent dir → self-only; /gnu/store → the embedded glibc ref recorded"; \
 rm -rf "$scratch"; \
-echo "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted empty, a cold tests/stage0-builder.sh run placed a stage0 that runs, at the SAME canonical path with the SAME (non-vacuous: glibc + gcc-lib) builder.db closure as the warm guix-host placement — the reference scan's candidates come from a readdir of the seed store dir, not guix's private db. An absent seed dir (a truly guix-less host) still places with a self-only closure; a non-directory seed dir errors loudly (no silent refless placement); and the same probe tree records an embedded store ref ONLY when the dir is passed — the readdir candidate source is load-bearing. The guix-less cold start (#313) is unblocked."
+echo "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted empty, a cold td-builder stage0-place run placed a stage0 that runs, at the SAME canonical path with the SAME (non-vacuous: glibc + gcc-lib) builder.db closure as the warm guix-host placement — the reference scan's candidates come from a readdir of the seed store dir, not guix's private db. An absent seed dir (a truly guix-less host) still places with a self-only closure; a non-directory seed dir errors loudly (no silent refless placement); and the same probe tree records an embedded store ref ONLY when the dir is passed — the readdir candidate source is load-bearing. The guix-less cold start (#313) is unblocked."
 "##,
     }
 }

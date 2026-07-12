@@ -32,8 +32,15 @@
 //! mk/gates/*.mk fragments carried, and the compiler enforces the structure a
 //! parser used to check — a malformed gate is a build error, never a mis-run.
 //!
-//! A GateDef's `script` is PLAIN BASH (no make escaping), executed as one
-//! `bash -c` with cwd = repo root. (The remaining deferred corpus/seed gates
+//! A GateDef's `script` is PLAIN POSIX SHELL (no make escaping), executed as
+//! one `sh -c` with cwd = repo root — inside the loop sandbox `sh` is the
+//! td-built busybox ash, so no bashisms. One deliberate extension: gate
+//! bodies rely on `set -o pipefail` (POSIX.1-2024, not in older POSIX sh) to
+//! keep a red left of a pipe from being greened by the right side — safe
+//! because the interpreter is not "whatever sh" but the PINNED busybox
+//! (1.37.0) ash the loop itself built, which supports it; a shell without
+//! pipefail errors on the `set` line (fail-closed), never mis-greens.
+//! (The remaining deferred corpus/seed gates
 //! realize their guix-built seed by calling host `guix` directly — the seed
 //! bytes retire last per the north star / #412.) Output is buffered per gate
 //! (`--output-sync=target`
@@ -161,7 +168,7 @@ pub struct GateDef {
     /// cannot satisfy that is not blocked by them, while a host that can still
     /// runs and covers them normally.
     pub non_blocking: bool,
-    /// The gate body: plain bash, run as one `bash -c` from the repo root.
+    /// The gate body: plain POSIX shell, run as one `sh -c` from the repo root.
     pub script: &'static str,
 }
 
@@ -173,7 +180,7 @@ mod registry {
 struct Gate {
     name: String,
     pools: Vec<Pool>,
-    /// The plain-bash body (everything after `run:`), executed as one `bash -c`.
+    /// The plain-shell body (everything after `run:`), executed as one `sh -c`.
     body: String,
     /// Ordering prerequisites (gate names). All gates are phony, so make's old
     /// normal-vs-order-only (`|`) distinction collapses to "runs before".
@@ -280,10 +287,10 @@ fn load() -> Result<GateSet, String> {
             return Err(format!("gate-run: gate `{}` is in no pool", def.name));
         }
         // Empty script ⟺ native (typed-Rust) gate (#318 axis 3): a native gate
-        // carries no bash and is run via `td-builder gate-body <name>`; a bash
+        // carries no shell and is run via `td-builder gate-body <name>`; a shell
         // gate must carry a script. Mismatch either way is a load-time error, so
         // a typo (empty script with no registered body, or a body-registered
-        // gate that still ships bash) can never silently no-op.
+        // gate that still ships shell) can never silently no-op.
         let native = crate::gate_bodies::is_native(def.name);
         if def.script.trim().is_empty() != native {
             return Err(if native {
@@ -360,7 +367,7 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
     let br = Gate {
         name: BUILD_RECIPES.to_string(),
         pools: Vec::new(),
-        body: "bash tests/build-recipes.sh".to_string(),
+        body: "sh tests/build-recipes.sh".to_string(),
         deps: last_cheap.iter().cloned().collect(),
         extra_env: vec![("TD_BUILD_SPECS".to_string(), set.build_specs.join(" "))],
         specs: Vec::new(),
@@ -798,15 +805,6 @@ impl SlotPool {
     }
 }
 
-/// Is util-linux `prlimit` resolvable on PATH? (The loop toolchain provisions
-/// util-linux, so inside the sandbox this is normally true.)
-fn prlimit_available() -> bool {
-    let Ok(path) = std::env::var("PATH") else { return false };
-    path.split(':')
-        .filter(|d| !d.is_empty())
-        .any(|d| Path::new(d).join("prlimit").is_file())
-}
-
 pub(crate) fn nproc() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
@@ -887,9 +885,10 @@ fn timing_event(log: Option<&Path>, gate: &str, kind: &str) {
     }
 }
 
-/// Run one gate's body under `bash -c` (through `prlimit --data` when a
-/// per-process memory cap is configured), stdout+stderr appended in order to
-/// LOG_PATH (the per-gate output buffer). Returns success.
+/// Run one gate's body under `sh -c` (capped by a pre_exec
+/// setrlimit(RLIMIT_DATA) when a per-process memory cap is configured),
+/// stdout+stderr appended in order to LOG_PATH (the per-gate output buffer).
+/// Returns success.
 /// Sum the resident bytes of every process in PGID's process group
 /// (/proc/*/stat field 5 == pgid; RSS from /proc/*/statm resident pages).
 fn pgroup_rss_bytes(pgid: u32) -> u64 {
@@ -1005,12 +1004,12 @@ fn run_gate(
         _ => None,
     };
     // A native (typed-Rust) gate carries an empty body: run it as `<current_exe>
-    // gate-body <name>` instead of `bash -c <script>` (#318 axis 3). Same
-    // wrapper (prlimit/cgroup/pgroup/env); the native body self-moves into the
-    // gate cgroup itself (gate_bodies::cli), so the bash cgroup prelude — which
-    // is bash-only — is skipped for it.
+    // gate-body <name>` instead of `sh -c <script>` (#318 axis 3). Same
+    // wrapper (rlimit/cgroup/pgroup/env); the native body self-moves into the
+    // gate cgroup itself (gate_bodies::cli), so the shell cgroup prelude — which
+    // is shell-only — is skipped for it.
     let native = g.body.trim().is_empty();
-    // The enter path travels via env, NEVER interpolated into the bash text:
+    // The enter path travels via env, NEVER interpolated into the shell text:
     // an env-derived run dir containing a quote would otherwise escape the
     // quoting and execute as code (review finding).
     let body = match &gate_cg {
@@ -1033,26 +1032,23 @@ fn run_gate(
             (Ok(o), Ok(e)) => (o, e),
             _ => return false,
         };
-        // The inner program is `bash -c <body>` (bash gate) or `<self> gate-body
-        // <name>` (native gate); prlimit --data wraps either when mem_mib > 0.
-        let mut cmd = if mem_mib > 0 {
-            let mut c = std::process::Command::new("prlimit");
-            c.arg(format!("--data={}", mem_mib.saturating_mul(1024 * 1024)));
-            if native {
-                c.arg(&self_exe).arg("gate-body").arg(&g.name);
-            } else {
-                c.arg("bash").arg("-c").arg(&body);
-            }
-            c
-        } else if native {
+        // The inner program is `sh -c <body>` (shell gate) or `<self> gate-body
+        // <name>` (native gate). When mem_mib > 0, a pre_exec
+        // setrlimit(RLIMIT_DATA) caps the child and everything it forks/execs —
+        // td's own prlimit(1) replacement (the unsafe lives in sandbox.rs), so
+        // the memory backstop needs no host binary inside the loop sandbox.
+        let mut cmd = if native {
             let mut c = std::process::Command::new(&self_exe);
             c.arg("gate-body").arg(&g.name);
             c
         } else {
-            let mut c = std::process::Command::new("bash");
+            let mut c = std::process::Command::new("sh");
             c.arg("-c").arg(&body);
             c
         };
+        if mem_mib > 0 {
+            crate::sandbox::cap_child_data_rlimit(&mut cmd, mem_mib.saturating_mul(1024 * 1024));
+        }
         cmd.current_dir(root)
             .env("TD_GATE_GOALS", goal_words)
             .env("TD_BUILDER_SELF", &self_exe)
@@ -1260,10 +1256,11 @@ struct RunCfg {
     /// the host delegates a subtree.
     gate_tree_mem_mib: u64,
     /// Per-PROCESS RLIMIT_DATA cap for gate bodies, in MiB (0 = off). Applied
-    /// via util-linux `prlimit` from the provisioned toolchain: with the pool
-    /// over-provisioned past nproc (#319), one runaway allocator must die by
-    /// its own limit — a clean red gate — instead of triggering the box
-    /// OOM-killer. Per-process, so a make -jN tree of modest compilers passes.
+    /// via a pre_exec setrlimit in the spawned body (sys::set_rlimit — no host
+    /// util-linux anywhere): with the pool over-provisioned past nproc (#319),
+    /// one runaway allocator must die by its own limit — a clean red gate —
+    /// instead of triggering the box OOM-killer. Per-process, so a make -jN
+    /// tree of modest compilers passes.
     gate_mem_mib: u64,
     /// The warm chain-brick cache exported to Shared gates (#317): the ambient
     /// TD_CHECK_CHAIN_CACHE if the caller set one (empty = the operator's force-cold
@@ -1723,16 +1720,12 @@ pub fn cli(args: &[String]) -> ExitCode {
         Some(root.join(format!(".td-build-cache/gate-timing/run-{}.log", now_ns())))
     };
     // TD_CHECK_GATE_MEM_MIB: per-process gate memory cap (default 8192; 0 off).
-    let mut gate_mem_mib: u64 = std::env::var("TD_CHECK_GATE_MEM_MIB")
+    // Enforced natively (a pre_exec setrlimit on each gate body), so it is
+    // ALWAYS available — no PATH probe, no host util-linux.
+    let gate_mem_mib: u64 = std::env::var("TD_CHECK_GATE_MEM_MIB")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(8192);
-    if gate_mem_mib > 0 && !prlimit_available() {
-        eprintln!(
-            "gate-run: no `prlimit` on PATH — running WITHOUT the per-gate memory backstop (TD_CHECK_GATE_MEM_MIB={gate_mem_mib} requested)"
-        );
-        gate_mem_mib = 0;
-    }
     let tree_key = std::env::var("TD_CHECK_TREE").ok().filter(|k| !k.is_empty());
     if resume && tree_key.is_none() {
         eprintln!(
@@ -2118,14 +2111,14 @@ mod tests {
         // TD_GATE_INPUT_<NAME> and asserts it equals the lock's entry.
         let d = tmpdir("inputs-env");
         const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /gnu/store/{H}-make-4.4.1\n"))
+        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /td/store/{H}-make-4.4.1\n"))
             .unwrap();
         let mut set = synth(
             &d,
             &[(
                 "uses-input",
                 Pool::Cheap,
-                "test \"$TD_GATE_INPUT_MAKE\" = \"/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-make-4.4.1\" && touch {D}/env.ok",
+                "test \"$TD_GATE_INPUT_MAKE\" = \"/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-make-4.4.1\" && touch {D}/env.ok",
                 &[],
             )],
         );
@@ -2145,7 +2138,7 @@ mod tests {
         // does not carry) fails the gate BEFORE the body starts.
         let d = tmpdir("inputs-red");
         const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /gnu/store/{H}-make-4.4.1\n"))
+        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /td/store/{H}-make-4.4.1\n"))
             .unwrap();
         let mut set = synth(&d, &[("bad-input", Pool::Cheap, "touch {D}/ran", &[])]);
         let gi = *set.index.get("bad-input").unwrap();
@@ -2251,11 +2244,9 @@ mod tests {
 
     #[test]
     fn gate_mem_backstop_contains_a_runaway_allocator() {
-        if !prlimit_available() {
-            return; // dev host without util-linux prlimit; the sandbox has it
-        }
+        // Native pre_exec setrlimit — no host prlimit needed, so no host guard.
         let d = tmpdir("rlimit");
-        // ~64 MiB heap allocation in bash (command substitution buffers it).
+        // ~64 MiB heap allocation in the shell (command substitution buffers it).
         let hog = r#"x=$(head -c 67108864 /dev/zero | tr '\0' a); echo grew ${#x}"#;
         let set = synth(&d, &[("hog", Pool::Heavy, hog, &[])]);
         let sel = expand_goals(&set, &["hog".to_string()]).unwrap();

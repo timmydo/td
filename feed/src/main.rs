@@ -1284,8 +1284,20 @@ fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
         return;
     }
     let tmp = cache.join(format!("linux-headers-{ver}-{arch}.tar.gz.tmp"));
+    // NORMALIZED packing: sorted names, zeroed mtimes, no ownership, and a
+    // stream-compressed gzip (no embedded mtime) — the tarball bytes are then
+    // a pure function of the headers CONTENT, so the same pinned linux source
+    // yields the same tarball on any host and the runner's compiled expected
+    // digest (seed/seed-digests.txt) can vouch for it (re #469). Unnormalized
+    // host-tar output embeds build-time mtimes and never reproduces.
     let ok = run_quiet(
         Command::new("tar")
+            .arg("--format=gnu")
+            .arg("--sort=name")
+            .arg("--mtime=@0")
+            .arg("--owner=0")
+            .arg("--group=0")
+            .arg("--numeric-owner")
             .arg("-czf")
             .arg(&tmp)
             .arg("-C")

@@ -15,18 +15,20 @@
 # the guix-built td-builder. cached_build/cached_check set/use the shell vars: sd (this
 # spec's cache dir), out (store path), ns (newstore output dir), hit (non-empty on a hit).
 
-# load_stage0 — ensure a td-bootstrapped stage0 td-builder is placed (tests/stage0-builder.sh:
-# cargo-compiled guix-free, stage0 places ITSELF via its own store-add-builder) and export
+# load_stage0 — ensure a td-bootstrapped stage0 td-builder is placed (`td-builder
+# stage0-place`, builder/src/stage0.rs: cargo-compiled guix-free, stage0 places ITSELF via
+# its own store-add-builder; no ambient host sh, re #469) and export
 # it as the td-builder cache-lib uses to build AND check: TB (the stage0 binary) +
 # TD_BUILDER_PATH/STORE/DB (the in-store builder-of-record the assembled drv names). So
 # the package gates build with stage0, never `guix build -e '(@ (system td-builder)
 # td-builder)'`. The placement is shared under .td-build-cache/stage0 (build-recipes
 # populates it once before its fan-out; the gates reuse it). The toolchain SEED stays the
-# guix-built pin (§5, retired last) — realized by the caller, read by stage0-builder as
+# guix-built pin (§5, retired last) — realized by the caller, read by stage0-place as
 # strings.
 load_stage0() {
   _s0base="${TD_STAGE0_BASE:-$(pwd)/.td-build-cache/stage0}"
-  _cb=`sh tests/stage0-builder.sh "$_s0base"` || { echo "FAIL: stage0-builder could not place a stage0 td-builder" >&2; return 1; }
+  _tb_self="${TD_BUILDER_SELF:?load_stage0 requires TD_BUILDER_SELF (gate-run exports it)}"
+  _cb=`"$_tb_self" stage0-place "$_s0base"` || { echo "FAIL: td-builder stage0-place could not place a stage0 td-builder" >&2; return 1; }
   TB="$_s0base/store/`basename "$_cb"`/bin/td-builder"
   TD_BUILDER_PATH="$_cb"
   TD_BUILDER_STORE="$_s0base/store"
@@ -37,14 +39,12 @@ load_stage0() {
 
 # provision_stage0 — the HOST prelude for the loop-container provider (td-builder
 # check + check-rung; workstream E #294). The stage0 td-builder compiles from
-# builder/ source with the ENVIRONMENT's rust + cc (tools/provision-{rust,cc}.sh),
-# so there is no guix-built toolchain seed to realize/fetch here — it is just
-# load_stage0. On a guix host with the pinned lock paths present, provision-rust/cc
-# use them (a guix-free PROCESS); on a guix-less host they use rustup / system cc.
+# builder/ source with the ENVIRONMENT's rust + cc (`td-builder provision-{rust,cc}`,
+# builder/src/stage0.rs), so there is no guix-built toolchain seed to realize/fetch
+# here — it is just load_stage0. On a guix host with the pinned lock paths present,
+# provision-rust/cc use them (a guix-free PROCESS); on a guix-less host they use
+# rustup / system cc.
 provision_stage0() {
-  # The stage0 td-builder compiles from builder/ source with the ENVIRONMENT's rust +
-  # cc (tools/provision-{rust,cc}.sh — TD_RUST_HOME / rust on PATH / rustup), so there is
-  # no guix-built toolchain seed to realize here. load_stage0 does the whole job.
   load_stage0
 }
 

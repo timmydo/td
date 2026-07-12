@@ -18,10 +18,7 @@ pub fn recipe() -> Recipe {
     let path = format!("{xbin}:{{in:binutils-244}}/bin:{}", base_path());
     let mut steps = unpack_into("gcc-x86-64-stage1-source", "{src}");
     for t in ["gmp63", "mpfr421", "mpc131"] {
-        steps.push(
-            Step::run("{src}", &["{in:tar}/bin/tar", "-xf", &format!("{{in:{t}}}")])
-                .env("PATH", &base_path()),
-        );
+        steps.extend(unpack_keep_top(t, "{src}"));
     }
     steps.push(Step::Symlink {
         target: "gmp-6.3.0".into(),
@@ -117,8 +114,8 @@ pub fn recipe() -> Recipe {
             &[
                 "{in:make}/bin/make",
                 "-j{jobs}",
-                "SHELL={in:bash}/bin/bash",
-                "CONFIG_SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
+                "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "all-gcc",
                 "all-target-libgcc",
@@ -132,7 +129,7 @@ pub fn recipe() -> Recipe {
             "{src}/bld",
             &[
                 "{in:make}/bin/make",
-                "SHELL={in:bash}/bin/bash",
+                "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install-gcc",
                 "install-target-libgcc",

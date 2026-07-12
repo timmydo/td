@@ -33,6 +33,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -166,16 +167,305 @@ fn setup_build_cgroup(cap: u64) -> Option<PathBuf> {
     Some(leaf)
 }
 
+/// Cap `cmd`'s child — and everything it forks/execs — at `bytes` of data
+/// segment via a pre_exec setrlimit(RLIMIT_DATA). td's own prlimit(1)
+/// replacement for the gate-runner per-process memory backstop (#319): no
+/// host util-linux binary, so it works inside the loop sandbox. The requested
+/// cap is clamped to the ambient HARD limit (raising a hard limit is EPERM
+/// for an unprivileged process, and a host whose hard limit sits below the
+/// default cap would otherwise red every gate with an opaque spawn error —
+/// review finding; the tighter-than-requested cap is still fail-closed).
+/// A refused setrlimit still fails the spawn (the gate reds) rather than
+/// running the body uncapped.
+pub fn cap_child_data_rlimit(cmd: &mut Command, bytes: u64) {
+    let bytes = match sys::get_rlimit(sys::RLIMIT_DATA) {
+        Ok((_, hard)) => bytes.min(hard),
+        Err(_) => bytes,
+    };
+    // Post-fork safe: set_rlimit is one raw syscall; its error path is
+    // io::Error::from_raw_os_error (no allocation).
+    unsafe {
+        cmd.pre_exec(move || sys::set_rlimit(sys::RLIMIT_DATA, bytes, bytes));
+    }
+}
+
+/// WHO issued the authority for a staged input's hash — its provenance CLASS
+/// (re #469). Integrity and provenance are distinct: integrity is "the bytes
+/// match a recorded hash"; provenance is "the authority that recorded that
+/// hash is allowed to do so". An `InputOrigin` is constructed ONLY at the
+/// planner's typed db-intake sites — the plan's seed db, a prior step's
+/// td.db, a td-interned source/vendor placement db, the stage0 builder
+/// placement db, the daemon's blessed seed-lock closure db — each declared
+/// with its class in code where the planner hands it over. A raw path,
+/// environment variable, database row, or cache file can locate bytes, but
+/// no production function turns one directly into an `InputOrigin`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputOrigin {
+    /// A pinned, hash-verified seed registration: the interned seed db whose
+    /// entries the compiled seed-digest table gated at synthesis, or a
+    /// td-interned source/vendored-crate placement db (a declared
+    /// fixed-output fetch td restored itself).
+    AuditedSeed,
+    /// A prior td recipe output: a build-plan step's td.db row, written by
+    /// the engine after that step's own verified build (deriver recorded).
+    RecipeOutput,
+    /// The control-plane td-builder staged as the drv's builder — the stage0
+    /// placement db `store-add-builder` wrote for the binary driving this
+    /// build.
+    ControlPlaneBuilder,
+    /// The daemon flow's blessed seed-lock closure: the `seed-bless` db over
+    /// the REPO-DECLARED roots (`seed_lock_roots`), hashed once per root set.
+    BlessedSeedClosure,
+}
+
+impl InputOrigin {
+    /// The audit token (`provenance.manifest`'s origin column).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InputOrigin::AuditedSeed => "audited-seed",
+            InputOrigin::RecipeOutput => "recipe-output",
+            InputOrigin::ControlPlaneBuilder => "control-plane-builder",
+            InputOrigin::BlessedSeedClosure => "blessed-seed-closure",
+        }
+    }
+}
+
+/// One staged input's authority record: the expected NAR hash
+/// (`sha256:<hex>`, the `ValidPaths.hash` wire format) plus WHO issued it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StagedInput {
+    pub nar_hash: String,
+    pub origin: InputOrigin,
+}
+
+/// The staged-input provenance manifest (re #469): canonical store path →
+/// (expected NAR hash, origin class), assembled by the planner from TYPED
+/// td-owned store DBs ONLY (interned-seed registrations, prior build-plan
+/// steps' td.dbs, the source/builder placement dbs). EVERY build carries one —
+/// there is no non-strict mode: each closure item must have a record and its
+/// on-disk bytes must hash to it, or it refuses to stage. A caller-supplied
+/// store DIRECTORY is thereby a byte source, never an authority: the bytes
+/// bind only if a td-owned registration vouches for them.
+///
+/// Cost, decided deliberately: verification re-hashes every closure item at
+/// EVERY strict step — O(closure bytes) per step, not amortized. The bootstrap
+/// rungs are small, a streaming SHA-256 is cheap next to the build it guards,
+/// and trusting a prior step's verification is exactly the assume-the-cache
+/// hole this manifest exists to close.
+pub type StageManifest = std::collections::BTreeMap<String, StagedInput>;
+
+/// Stream-hash a tree/file in NAR form — `sha256:<hex>`, the `ValidPaths.hash`
+/// wire format every td store registration records. `pub(crate)` because the
+/// loop-userland cache (check_loop.rs) verifies its durable items with the
+/// same hash before mounting them.
+pub(crate) fn nar_hash_of(path: &Path) -> io::Result<String> {
+    struct W(crate::sha256::Sha256);
+    impl io::Write for W {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = W(crate::sha256::Sha256::new());
+    crate::nar::write_nar(&mut w, path)?;
+    Ok(format!("sha256:{}", crate::sha256::to_base16(&w.0.finalize())))
+}
+
+/// Verify ONE closure item against the provenance manifest — split out of
+/// `build` so the rejection paths unit-test without a namespace. Refuses (a)
+/// an item no td-owned db vouches for and (b) on-disk bytes that do not hash
+/// to the recorded NAR hash.
+pub fn verify_staged_item(
+    manifest: &StageManifest,
+    canonical: &str,
+    on_disk: &str,
+) -> io::Result<()> {
+    let Some(want) = manifest.get(canonical) else {
+        return Err(err(format!(
+            "provenance rejected: closure item {canonical} has no td-owned store-db record — refusing to stage it (re #469)"
+        )));
+    };
+    let got = nar_hash_of(Path::new(on_disk))?;
+    if got != want.nar_hash {
+        return Err(err(format!(
+            "provenance rejected: closure item {canonical} (on disk {on_disk}) hashes {got} but its td-owned registration ({}) records {} — refusing to stage tampered bytes (re #469)",
+            want.origin.as_str(),
+            want.nar_hash
+        )));
+    }
+    Ok(())
+}
+
 /// Run the drv's builder inside the namespace sandbox. `closure` lists every
 /// store path the build may see (the staged store's contents); `scratch` is
-/// a writable host directory. On success returns (output name, host-side
-/// path under scratch/newstore) for every drv output, each verified to
-/// exist.
+/// a writable host directory. `manifest` is the #469 staging gate — REQUIRED,
+/// not optional: no engine path may stage inputs a td-owned db does not vouch
+/// for. Every closure item is provenance-verified (`verify_staged_item`)
+/// BEFORE its bind target is staged; the item binds are then locked
+/// READ-ONLY in the child, so the verified bytes cannot be rewritten through
+/// a live bind for the build's duration (the hash runs in the parent and the
+/// mount in the child, so the lock — not the hash — is what holds after
+/// staging). On success returns (output name, host-side path under
+/// scratch/newstore) for every drv output, each verified to exist.
+/// Plan (and materialise the newstore skeleton for) ONE verified closure item's
+/// bind mounts — the `(on-disk source, in-newstore target)` pairs the child will
+/// `mount --bind`, basename-keyed under `newstore/<store-hash>`. A declared
+/// input, a source, or the builder tree binds WHOLE. The control-plane builder's
+/// OWN runtime closure (glibc/gcc-lib — origin `BlessedSeedClosure`, never a
+/// declared build input) binds LIBRARY-ONLY: only its `lib/` (and `lib64/`)
+/// subtree, so the loader and every shared object — including glibc's own
+/// dlopen'd NSS/gconv modules — stay present, but the store output's RUNNABLE
+/// PROGRAMS do not. A Guix glibc ships `bin/getconf`, `bin/getent`, `bin/iconv`
+/// and `sbin/ldconfig`; whole-tree mounting let a `Step::Run` invoke them by
+/// absolute path without declaring them — an undeclared host executable the #469
+/// boundary must deny. The caller's `verify_staged_item` still hashes the FULL
+/// vouched tree, so authenticity is proven over every byte; only the EXPOSED
+/// surface narrows. Split out of `build` so the exposure policy unit-tests
+/// without a namespace.
+///
+/// Resolve `on_disk/<sub>` (`lib` or `lib64`) to the real directory to bind, or `None` if it
+/// is absent. NEVER follows a symlink OUT of the NAR-verified tree: a real directory binds
+/// as-is; a symlink is resolved and accepted ONLY when it stays within `on_disk` (e.g. a
+/// `lib64 → lib` redirect); a symlink escaping the tree — or any non-directory — is refused.
+/// The previous `Path::is_dir()` dereferenced the link first, so an escaping `lib/` symlink
+/// would have bind-mounted bytes the verifier never hashed (re #469, PR review).
+fn resolve_runtime_lib_dir(
+    on_disk: &Path,
+    sub: &str,
+    canonical: &str,
+) -> io::Result<Option<PathBuf>> {
+    let src = on_disk.join(sub);
+    let md = match fs::symlink_metadata(&src) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if md.is_dir() {
+        return Ok(Some(src));
+    }
+    if md.file_type().is_symlink() {
+        // Resolve the link CHAIN and require the target to be a directory that stays
+        // under the verified root — a contained `lib64 → lib` is fine; an escape is not.
+        let root = fs::canonicalize(on_disk)?;
+        let real = fs::canonicalize(&src)?; // errors on a dangling link
+        if real.is_dir() && real.starts_with(&root) {
+            return Ok(Some(real));
+        }
+        return Err(err(format!(
+            "builder-runtime closure item {canonical}: {sub}/ resolves outside its \
+             NAR-verified tree — refusing to stage unverified bytes (re #469)"
+        )));
+    }
+    Err(err(format!(
+        "builder-runtime closure item {canonical}: {sub}/ is neither a directory nor a \
+         contained symlink ({:?}) — refusing to stage it",
+        md.file_type()
+    )))
+}
+
+/// Recursively prove a staged runtime library directory (bind-mounted WHOLE into the
+/// sandbox) exposes NO runnable program. Every regular file must be an ELF shared object /
+/// the dynamic loader, a relocatable object or archive, or non-executable data — never an
+/// ELF executable, a PIE executable, or an executable script the sandbox could run (via the
+/// staged loader or directly). Fails closed on the first program found. Symlinks are NOT
+/// traversed: a link cannot smuggle a program in, because only `lib/`/`lib64/` are mounted
+/// for this item, so its target resolves to a staged library path or dangles. This turns
+/// "arbitrary programs beneath lib/ remain admissible" into "we proved there are none"
+/// (re #469, PR review).
+fn assert_libraries_only(dir: &Path, canonical: &str) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if ft.is_dir() {
+            assert_libraries_only(&path, canonical)?;
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        let executable = entry.metadata()?.permissions().mode() & 0o111 != 0;
+        let is_program = crate::elf::is_runnable_program(&path, executable)
+            .map_err(|e| err(format!("classifying {}: {e}", path.display())))?;
+        if is_program {
+            return Err(err(format!(
+                "builder-runtime closure item {canonical}: {} under a staged library dir is a \
+                 runnable program — refusing to admit an undeclared executable into the \
+                 sandbox (re #469)",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn plan_staged_item(
+    newstore: &Path,
+    canonical: &str,
+    on_disk: &str,
+    meta: &fs::Metadata,
+    origin: Option<InputOrigin>,
+) -> io::Result<Vec<(String, PathBuf)>> {
+    // BASENAME-keyed: a closure can span MULTIPLE store prefixes (/gnu/store deps +
+    // /td/store td-built deps, e.g. a chained toolchain — brick 8). Each item is staged
+    // flat under newstore/<base> (store hashes are unique); newstore is then mounted at
+    // EVERY prefix the closure spans below, so /gnu/store/<b> and /td/store/<b> both
+    // resolve to their item. For a single-prefix closure this is exactly the old layout.
+    let base = canonical
+        .rsplit('/')
+        .next()
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| err(format!("closure item {canonical}: not a store path")))?;
+    let target = newstore.join(base);
+    if meta.is_dir() && origin == Some(InputOrigin::BlessedSeedClosure) {
+        fs::create_dir_all(&target)?;
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        for sub in ["lib", "lib64"] {
+            // Resolve WITHOUT following a symlink out of the verified tree (the old
+            // `Path::is_dir()` silently dereferenced an escaping link), then prove the
+            // subtree we are about to bind WHOLE exposes libraries only — never a
+            // runnable program (re #469, PR review).
+            let src = match resolve_runtime_lib_dir(Path::new(on_disk), sub, canonical)? {
+                Some(dir) => dir,
+                None => continue,
+            };
+            assert_libraries_only(&src, canonical)?;
+            let dst = target.join(sub);
+            fs::create_dir_all(&dst)?;
+            out.push((src.to_string_lossy().into_owned(), dst));
+        }
+        if out.is_empty() {
+            return Err(err(format!(
+                "builder-runtime closure item {canonical} (on disk {on_disk}) has neither \
+                 lib/ nor lib64/ — cannot stage its loader/libraries"
+            )));
+        }
+        return Ok(out);
+    }
+    if meta.is_dir() {
+        fs::create_dir_all(&target)?;
+    } else if meta.is_file() {
+        fs::File::create(&target)?;
+    } else {
+        // A symlink cannot be bind-mounted; no pinned-channel closure
+        // has top-level symlink store items — refuse rather than guess.
+        return Err(err(format!("closure item {canonical}: unsupported file type")));
+    }
+    Ok(vec![(on_disk.to_string(), target)])
+}
+
 pub fn build(
     drv: &Derivation,
     drv_path: &str,
     closure: &[String],
     scratch: &Path,
+    manifest: &StageManifest,
 ) -> io::Result<Vec<(String, PathBuf)>> {
     if drv.platform != "x86_64-linux" {
         return Err(err(format!(
@@ -199,33 +489,17 @@ pub fn build(
         // CANONICAL is the store path the build SEES; ON-DISK is where to bind FROM
         // (== canonical for daemon-resident items, a td store dir for td-interned ones).
         let (canonical, on_disk) = split_closure_entry(entry);
+        verify_staged_item(manifest, canonical, on_disk)?;
         let meta = fs::symlink_metadata(on_disk)
             .map_err(|e| err(format!("closure item {canonical} (on disk {on_disk}): {e}")))?;
-        // BASENAME-keyed: a closure can span MULTIPLE store prefixes (/gnu/store deps +
-        // /td/store td-built deps, e.g. a chained toolchain — brick 8). Each item is staged
-        // flat under newstore/<base> (store hashes are unique); newstore is then mounted at
-        // EVERY prefix the closure spans below, so /gnu/store/<b> and /td/store/<b> both
-        // resolve to their item. For a single-prefix closure this is exactly the old layout.
-        let base = canonical
-            .rsplit('/')
-            .next()
-            .filter(|b| !b.is_empty())
-            .ok_or_else(|| err(format!("closure item {canonical}: not a store path")))?;
-        let target = newstore.join(base);
-        if meta.is_dir() {
-            fs::create_dir_all(&target)?;
-        } else if meta.is_file() {
-            fs::File::create(&target)?;
-        } else {
-            // A symlink cannot be bind-mounted; no pinned-channel closure
-            // has top-level symlink store items — refuse rather than guess.
-            return Err(err(format!("closure item {canonical}: unsupported file type")));
+        let origin = manifest.get(canonical).map(|s| s.origin);
+        for (src, dst) in plan_staged_item(&newstore, canonical, on_disk, &meta, origin)? {
+            binds.push((
+                CString::new(src.as_str()).map_err(|_| err(format!("{src}: NUL in path")))?,
+                CString::new(dst.as_os_str().as_encoded_bytes())
+                    .map_err(|_| err(format!("{}: NUL in path", dst.display())))?,
+            ));
         }
-        binds.push((
-            CString::new(on_disk).map_err(|_| err(format!("{on_disk}: NUL in path")))?,
-            CString::new(target.as_os_str().as_encoded_bytes())
-                .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
-        ));
     }
 
     // The build dir is `guix-build-<drvName>-0`. For a store-path drv that is
@@ -409,8 +683,24 @@ pub fn build(
             sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)?;
             // Stage each closure item into newstore (host scratch, OUTSIDE the new
             // root), then rbind newstore over the new root's /gnu/store below.
+            // Each INPUT bind is locked read-only immediately (remount of the
+            // bind just created — load-bearing, so a failure is fatal): the
+            // builder runs as the mapped owner uid and could otherwise write
+            // straight through the live bind into the on-disk store the
+            // manifest verified at staging, so the verify-then-bind boundary
+            // would hold only for an instant (re #469). newstore itself stays
+            // writable — outputs land as NEW entries beside the binds, never
+            // through one — and the /gnu/store rbind below carries each
+            // child's ro flag along.
             for (src, dst) in &binds {
                 sys::mount(Some(src), dst, None, sys::MS_BIND, None)?;
+                sys::mount(
+                    None,
+                    dst,
+                    None,
+                    sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY,
+                    None,
+                )?;
             }
             // The fresh minimal root, then its skeleton dirs.
             sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, None)?;
@@ -485,7 +775,10 @@ pub fn build(
 }
 
 /// A host path to expose inside the loop sandbox (rbind-mounted at the same
-/// path in the new root). `readonly` remounts it read-only after binding.
+/// path in the new root). `src` may be a directory or a regular file — the
+/// mountpoint is created to match (a file store item, e.g. a pinned `.crate`,
+/// binds onto a created empty file). `readonly` remounts it read-only after
+/// binding.
 pub struct Bind {
     pub src: String,
     /// Mount `src` at this absolute path inside the new root instead of at `src`
@@ -521,6 +814,17 @@ pub struct Bind {
 /// uid/gid use the IDENTITY map (host uid → itself) so the host daemon's
 /// peer-cred check still sees the real host uid, and its own network namespace
 /// (loopback brought up) matches `guix shell -C`'s offline posture.
+///
+/// `ro_dirs`: absolute in-sandbox directories to lock READ-ONLY (a recursive
+/// self-bind, then a non-recursive ro remount of the top mount) after all
+/// binds land — the tmpfs dirs that HOLD per-item bind mountpoints (e.g. the
+/// seed store dir holding `--store-item` mounts). The items' own bind mounts
+/// ride along visible and keep their own ro state; the parent dir itself
+/// rejects entry creation afterwards, so an ACCIDENTAL write can't plant a
+/// sibling next to the declared inputs. Not a security boundary against a
+/// hostile gate: the gate body owns the sandbox's user/mount namespaces
+/// (CAP_SYS_ADMIN inside) and can over-mount the parent — same trust model as
+/// every mount in this sandbox. A listed dir that no bind created is skipped.
 #[allow(clippy::too_many_arguments)]
 pub fn host_shell(
     cmd: &str,
@@ -531,6 +835,7 @@ pub fn host_shell(
     home: &str,
     workdir: &str,
     extra_env: &[(String, String)],
+    ro_dirs: &[String],
     scratch: &Path,
 ) -> io::Result<std::process::ExitStatus> {
     let newroot = scratch.join("root");
@@ -558,21 +863,64 @@ pub fn host_shell(
     let oldroot_rel_c = CString::new(oldroot_rel.as_os_str().as_encoded_bytes()).unwrap();
     let oldroot_abs_c = CString::new("/oldroot").unwrap();
 
-    // (src_c, target_dir, target_c, readonly, ro_optional) for each bind.
-    let mut bind_specs: Vec<(CString, PathBuf, CString, bool, bool)> =
-        Vec::with_capacity(binds.len());
+    // Everything the child's pre_exec needs per bind, precomputed in the
+    // parent: the C paths, whether the source is a directory (the mountpoint
+    // is created to MATCH — a regular-file source, e.g. a pinned `.crate`
+    // store item, binds onto a created empty file, mirroring the mount
+    // applet), and a NAMED failure line (the child can only sys::warn a
+    // preformatted byte string — a bare "FAILED bind-mounting" with no path
+    // made failures undiagnosable).
+    struct BindSpec {
+        src: CString,
+        target_dir: PathBuf,
+        target: CString,
+        readonly: bool,
+        ro_optional: bool,
+        src_is_dir: bool,
+        fail_msg: Vec<u8>,
+    }
+    let mut bind_specs: Vec<BindSpec> = Vec::with_capacity(binds.len());
     for b in binds {
         // Bind `src` at `dest` inside the new root (dest defaults to src).
         let inside = b.dest.as_deref().unwrap_or(&b.src);
         let target = newroot.join(inside.strip_prefix('/').unwrap_or(inside));
-        bind_specs.push((
-            CString::new(b.src.as_str()).map_err(|_| err(format!("{}: NUL in path", b.src)))?,
-            target.clone(),
-            CString::new(target.as_os_str().as_encoded_bytes())
+        bind_specs.push(BindSpec {
+            src: CString::new(b.src.as_str())
+                .map_err(|_| err(format!("{}: NUL in path", b.src)))?,
+            target_dir: target.clone(),
+            target: CString::new(target.as_os_str().as_encoded_bytes())
                 .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
-            b.readonly,
-            b.ro_optional,
-        ));
+            readonly: b.readonly,
+            ro_optional: b.ro_optional,
+            // An unreadable source keeps the directory default; the mount then
+            // fails exactly as before, now with the path named.
+            src_is_dir: fs::metadata(&b.src).map(|m| m.is_dir()).unwrap_or(true),
+            fail_msg: format!(
+                "td-builder host-sandbox: FAILED bind-mounting {} -> {inside}\n",
+                b.src
+            )
+            .into_bytes(),
+        });
+    }
+    // Read-only parent-dir remounts (see the doc comment): precomputed like the
+    // binds — the in-sandbox path, its C string, and a named failure line.
+    struct RoDirSpec {
+        target_dir: PathBuf,
+        target: CString,
+        fail_msg: Vec<u8>,
+    }
+    let mut ro_dir_specs: Vec<RoDirSpec> = Vec::with_capacity(ro_dirs.len());
+    for d in ro_dirs {
+        let target = newroot.join(d.strip_prefix('/').unwrap_or(d));
+        ro_dir_specs.push(RoDirSpec {
+            target_dir: target.clone(),
+            target: CString::new(target.as_os_str().as_encoded_bytes())
+                .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
+            fail_msg: format!(
+                "td-builder host-sandbox: FAILED ro-remounting the bind parent dir {d}\n"
+            )
+            .into_bytes(),
+        });
     }
     // (target_dir, target_c) for each writable tmpfs mount.
     let mut tmpfs_specs: Vec<(PathBuf, CString)> = Vec::with_capacity(tmpfs_dirs.len());
@@ -728,14 +1076,24 @@ pub fn host_shell(
             sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, Some(&tmpfs_data))
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED mounting the tmpfs root\n"); e })?;
             // Expose each requested host path (rbind), read-only where asked.
-            for (src_c, target_dir, target_c, readonly, ro_optional) in &bind_specs {
-                fs::create_dir_all(target_dir)?;
-                sys::mount(Some(src_c), target_c, None, sys::MS_BIND | sys::MS_REC, None)
-                    .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED bind-mounting an exposed path\n"); e })?;
-                if *readonly {
+            // The mountpoint matches the source kind: dir → dir, file → file.
+            for spec in &bind_specs {
+                if spec.src_is_dir {
+                    fs::create_dir_all(&spec.target_dir)?;
+                } else {
+                    if let Some(parent) = spec.target_dir.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    if !spec.target_dir.exists() {
+                        fs::File::create(&spec.target_dir)?;
+                    }
+                }
+                sys::mount(Some(&spec.src), &spec.target, None, sys::MS_BIND | sys::MS_REC, None)
+                    .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
+                if spec.readonly {
                     let ro = sys::mount(
                         None,
-                        target_c,
+                        &spec.target,
                         None,
                         sys::MS_REMOUNT | sys::MS_BIND | sys::MS_REC | sys::MS_RDONLY,
                         None,
@@ -747,7 +1105,7 @@ pub fn host_shell(
                     // every other ro bind (the store) the read-only is load-bearing
                     // — a failed remount is fatal.
                     if let Err(e) = ro {
-                        if *ro_optional {
+                        if spec.ro_optional {
                             // Can't make it read-only (a child userns cannot
                             // remount-ro a mount owned by the host userns, e.g.
                             // cgroup2 on the azure runner). Rather than leave the
@@ -759,13 +1117,47 @@ pub fn host_shell(
                             // (most local/dev hosts) it stays bound, so the leftover
                             // empty dir here is harmless.
                             sys::warn(b"td-builder host-sandbox: ro-remount not permitted for an ro_optional bind; detached (fail-closed, no host exposure)\n");
-                            let _ = sys::umount2(target_c, sys::MNT_DETACH);
+                            let _ = sys::umount2(&spec.target, sys::MNT_DETACH);
                         } else {
-                            sys::warn(b"td-builder host-sandbox: FAILED ro-remounting an exposed path\n");
+                            sys::warn(&spec.fail_msg);
+                            sys::warn(b"td-builder host-sandbox: (FAILED ro-remounting the exposed path above)\n");
                             return Err(e);
                         }
                     }
                 }
+            }
+            // Lock each bind-holding parent dir read-only, AFTER every bind has
+            // landed: a RECURSIVE self-bind (making the plain tmpfs dir its own
+            // vfsmount) then a NON-recursive ro-remount of just that top mount —
+            // the per-item child mounts ride along visible (already ro from
+            // their own remounts), but creating a sibling entry in the dir
+            // itself now fails EROFS. MS_REC is load-bearing: a NON-recursive
+            // self-bind would clone only the top mount, SHADOWING every item
+            // bind under it with the empty mountpoint dirs (review finding —
+            // every store item would read as an empty dir). These dirs are
+            // sandbox-owned tmpfs, so the remount is never the host-owned-EPERM
+            // case: a failure here is fatal (the read-only is load-bearing,
+            // exactly like the item binds').
+            for spec in &ro_dir_specs {
+                if !spec.target_dir.is_dir() {
+                    continue; // no bind created it — nothing to lock
+                }
+                sys::mount(
+                    Some(&spec.target),
+                    &spec.target,
+                    None,
+                    sys::MS_BIND | sys::MS_REC,
+                    None,
+                )
+                .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
+                sys::mount(
+                    None,
+                    &spec.target,
+                    None,
+                    sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY,
+                    None,
+                )
+                .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
             }
             // Minimal /dev (replaces the dropped blanket host /dev bind): a fresh
             // tmpfs with only the standard char devices (bind-mounted from the
@@ -830,6 +1222,201 @@ pub fn host_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The #469 staging gate, exercised at the unit level (no namespace needed):
+    // an item no td-owned db vouches for refuses to stage, tampered bytes refuse
+    // to stage, and vouched bytes pass. Verified red against the pre-manifest
+    // boundary, which bind-mounted any existing on-disk path a closure named.
+    #[test]
+    fn staging_rejects_unmanifested_and_tampered_items() {
+        let dir = std::env::temp_dir().join(format!("td-stage-verify-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let item = dir.join("aaa-tool-1.0");
+        fs::write(&item, b"trusted bytes").unwrap();
+        let on_disk = item.to_str().unwrap();
+        let canonical = "/td/store/aaa-tool-1.0";
+        let good_hash = nar_hash_of(&item).unwrap();
+
+        // No record at all → refused before any hashing.
+        let empty = StageManifest::new();
+        let err = verify_staged_item(&empty, canonical, on_disk).unwrap_err();
+        assert!(err.to_string().contains("no td-owned store-db record"), "{err}");
+
+        // A record whose hash the on-disk bytes do not match → refused.
+        let mut tampered = StageManifest::new();
+        tampered.insert(
+            canonical.to_string(),
+            StagedInput { nar_hash: "sha256:0000".to_string(), origin: InputOrigin::AuditedSeed },
+        );
+        let err = verify_staged_item(&tampered, canonical, on_disk).unwrap_err();
+        assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
+
+        // The vouched bytes pass.
+        let mut vouched = StageManifest::new();
+        vouched.insert(
+            canonical.to_string(),
+            StagedInput { nar_hash: good_hash, origin: InputOrigin::AuditedSeed },
+        );
+        verify_staged_item(&vouched, canonical, on_disk).unwrap();
+
+        // …and stop passing the moment the bytes change under the same record.
+        fs::write(&item, b"tampered bytes").unwrap();
+        let err = verify_staged_item(&vouched, canonical, on_disk).unwrap_err();
+        assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // P0 (re #469): the control-plane builder's runtime root (glibc/gcc-lib, a
+    // BlessedSeedClosure item) must stage LIBRARY-ONLY — its `lib/`/`lib64/`
+    // subtree, never the store output's runnable host PROGRAMS. A Guix glibc
+    // ships bin/getconf, bin/getent, bin/iconv, sbin/ldconfig; whole-tree mounting
+    // let a Step::Run exec them by absolute path. This mounts a synthetic runtime
+    // root and proves an executable CONTAINED inside it is excluded, while a
+    // DECLARED input (RecipeOutput) with the identical layout still binds whole.
+    #[test]
+    fn builder_runtime_root_stages_libraries_only_never_its_host_programs() {
+        let root = std::env::temp_dir().join(format!("td-runtime-stage-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let newstore = root.join("newstore");
+        fs::create_dir_all(&newstore).unwrap();
+        // A synthetic glibc output: loader + libc under lib/, a dlopen'd gconv
+        // module (proving library subtrees ride along), plus the runnable host
+        // programs the finding named under bin/ and sbin/.
+        let glibc = root.join("wzxy-glibc-2.41");
+        for d in ["lib", "lib/gconv", "lib64", "bin", "sbin"] {
+            fs::create_dir_all(glibc.join(d)).unwrap();
+        }
+        fs::write(glibc.join("lib/libc.so.6"), b"\x7fELF libc").unwrap();
+        fs::write(glibc.join("lib/ld-linux-x86-64.so.2"), b"\x7fELF loader").unwrap();
+        fs::write(glibc.join("lib/gconv/UTF-16.so"), b"\x7fELF gconv").unwrap();
+        fs::write(glibc.join("lib64/libc.so.6"), b"\x7fELF libc").unwrap();
+        let getconf = glibc.join("bin/getconf");
+        fs::write(&getconf, b"\x7fELF getconf").unwrap();
+        fs::write(glibc.join("sbin/ldconfig"), b"\x7fELF ldconfig").unwrap();
+        let canonical = "/gnu/store/wzxy-glibc-2.41";
+        let on_disk = glibc.to_str().unwrap();
+        let meta = fs::symlink_metadata(&glibc).unwrap();
+
+        // As the builder's runtime root: only lib/ and lib64/ bind.
+        let binds =
+            plan_staged_item(&newstore, canonical, on_disk, &meta, Some(InputOrigin::BlessedSeedClosure))
+                .unwrap();
+        let srcs: Vec<&String> = binds.iter().map(|(s, _)| s).collect();
+        assert_eq!(binds.len(), 2, "exactly lib/ and lib64/ bind: {srcs:?}");
+        for (src, _) in &binds {
+            assert!(
+                src.ends_with("/lib") || src.ends_with("/lib64"),
+                "a runtime bind source must be a library dir, got {src}"
+            );
+        }
+        // The whole tree is NOT a bind source, so no bind exposes bin/ or sbin/:
+        // the getconf/ldconfig host programs contained in the root are excluded.
+        assert!(
+            !binds.iter().any(|(s, _)| s.as_str() == on_disk),
+            "the whole runtime tree must not be staged"
+        );
+        for prog in [glibc.join("bin/getconf"), glibc.join("sbin/ldconfig")] {
+            assert!(
+                !binds.iter().any(|(s, _)| prog.starts_with(s)),
+                "a runnable host program ({}) must not be reachable through any bind",
+                prog.display()
+            );
+        }
+        // The loader and the dlopen'd gconv module DO ride along (via lib/).
+        assert!(
+            binds.iter().any(|(s, _)| Path::new(s).join("ld-linux-x86-64.so.2").exists()),
+            "the loader must be staged"
+        );
+
+        // A DECLARED input (RecipeOutput) with the SAME layout binds WHOLE — the
+        // lib-only narrowing is specific to the builder's own runtime closure, not
+        // a package a rung legitimately declares (which may ship its own programs).
+        let decl =
+            plan_staged_item(&newstore, canonical, on_disk, &meta, Some(InputOrigin::RecipeOutput))
+                .unwrap();
+        assert_eq!(decl.len(), 1);
+        assert_eq!(decl[0].0.as_str(), on_disk, "a declared input stages its whole tree");
+
+        // A runtime root missing BOTH library dirs cannot stage its loader — refuse.
+        let empty_root = root.join("aaaa-empty-runtime");
+        fs::create_dir_all(empty_root.join("bin")).unwrap();
+        let m2 = fs::symlink_metadata(&empty_root).unwrap();
+        let e = plan_staged_item(
+            &newstore,
+            "/gnu/store/aaaa-empty-runtime",
+            empty_root.to_str().unwrap(),
+            &m2,
+            Some(InputOrigin::BlessedSeedClosure),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("neither lib/ nor lib64/"), "{e}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // P1 (re #469, PR review): the lib-only staging must (a) NEVER follow a symlinked
+    // lib/lib64 out of the NAR-verified tree — `Path::is_dir()` silently dereferenced an
+    // escaping link — and (b) admit NO runnable program hiding under lib/. Both are
+    // fail-closed refusals; a contained `lib64 → lib` redirect still stages.
+    #[test]
+    fn runtime_root_staging_refuses_symlink_escapes_and_lib_programs() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("td-runtime-guard-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let newstore = root.join("newstore");
+        fs::create_dir_all(&newstore).unwrap();
+        let blessed = Some(InputOrigin::BlessedSeedClosure);
+
+        // (a) A program under lib/ is refused, not silently admitted. libc.so.6 (non-exec
+        // data stub) is fine; the +x `getconf` script is the undeclared executable.
+        let withprog = root.join("aaaa-glibc-prog");
+        fs::create_dir_all(withprog.join("lib")).unwrap();
+        fs::write(withprog.join("lib/libc.so.6"), b"\x7fELF libc").unwrap();
+        let getconf = withprog.join("lib/getconf");
+        fs::write(&getconf, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&getconf, fs::Permissions::from_mode(0o755)).unwrap();
+        let mp = fs::symlink_metadata(&withprog).unwrap();
+        let e = plan_staged_item(
+            &newstore, "/gnu/store/aaaa-glibc-prog", withprog.to_str().unwrap(), &mp, blessed,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("runnable program"), "{e}");
+
+        // (b) A lib/ that is a symlink ESCAPING the tree is refused (is_dir would follow it).
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("libc.so.6"), b"\x7fELF libc").unwrap();
+        let esc = root.join("bbbb-glibc-escape");
+        fs::create_dir_all(&esc).unwrap();
+        symlink(&outside, esc.join("lib")).unwrap();
+        let me = fs::symlink_metadata(&esc).unwrap();
+        let e2 = plan_staged_item(
+            &newstore, "/gnu/store/bbbb-glibc-escape", esc.to_str().unwrap(), &me, blessed,
+        )
+        .unwrap_err();
+        assert!(e2.to_string().contains("outside its"), "{e2}");
+
+        // A CONTAINED `lib64 → lib` redirect is accepted: both binds resolve to the real
+        // lib dir (which holds only non-program library data).
+        let okroot = root.join("cccc-glibc-lib64link");
+        fs::create_dir_all(okroot.join("lib")).unwrap();
+        fs::write(okroot.join("lib/libc.so.6"), b"\x7fELF libc").unwrap();
+        symlink("lib", okroot.join("lib64")).unwrap();
+        let mo = fs::symlink_metadata(&okroot).unwrap();
+        let binds = plan_staged_item(
+            &newstore, "/gnu/store/cccc-glibc-lib64link", okroot.to_str().unwrap(), &mo, blessed,
+        )
+        .unwrap();
+        assert_eq!(binds.len(), 2, "lib + contained lib64 both stage");
+        for (src, _) in &binds {
+            assert!(
+                Path::new(src).join("libc.so.6").exists(),
+                "each bind must resolve to the real, verified lib dir: {src}"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn parse_mem_max_handles_suffixes_and_off_by_default() {

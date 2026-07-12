@@ -1,4 +1,3 @@
-use crate::ladder::base_inputs;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Source};
 
 // rust-toolchain — the /td/store Rust toolchain, as a first-class RECIPE fully in the
@@ -37,12 +36,13 @@ pub fn recipe() -> Recipe {
         ))
         .source_input("rust-toolchain-source")
         .native_inputs(&["glibc-x86-64", "gcc-x86-64-stage2", "zlib-x86-64"])
-        // #429: the transform unpacks the release tarball in-sandbox with the declared
-        // tar/gzip inputs (unpack_rust_release, builder/src/toolchain_x86_64.rs) — under
-        // the OLD hand-written ladder_lock these rode in unconditionally via `$_bt`; the
-        // synthesized lock now only carries what the recipe itself declares, so they must
-        // be genuine inputs here (matching every other mesboot-family rung's base_inputs()).
-        .inputs_owned(base_inputs(&[]))
+        // The transform declares NO host tools at all (re #469): the engine unpacks the
+        // release tarball with its own gzip/tar readers (unpack_rust_release →
+        // crate::tar::unpack_archive) and the relink is pure Rust (crate::elf), so the
+        // only inputs are the three recipe outputs above plus the pinned source.
+        // (BASE_TOOLS left this rung when tar/gzip left the engine's unpack path — a
+        // stale tar/gzip pick_bin here was the round-9 P1: BASE_TOOLS no longer carries
+        // them, so the old subprocess unpack could never resolve its tools.)
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check rust-toolchain: build-plan --auto builds+validates the relinked /td/store Rust 1.96.0 toolchain"
