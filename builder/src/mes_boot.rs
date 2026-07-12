@@ -596,7 +596,15 @@ fn detect_ia32() -> Ia32Verdict {
 /// unreadable/absent kernel config passes through (the exec itself is the
 /// backstop) so a locked-down `/proc` never manufactures a false failure.
 fn preflight_ia32() -> Result<(), String> {
-    match detect_ia32() {
+    ia32_preflight_result(detect_ia32())
+}
+
+/// The preflight POLICY, factored out of the live-kernel probe so it is pure
+/// (no `/proc` read) and unit-testable on any host: only a PROVEN negative
+/// reds; Supported and Unknown both pass (the exec is the backstop for the
+/// unprovable case).
+fn ia32_preflight_result(verdict: Ia32Verdict) -> Result<(), String> {
+    match verdict {
         Ia32Verdict::Unsupported => Err(
             "the build kernel cannot execute 32-bit ELF binaries \
              (CONFIG_IA32_EMULATION is not set): the mes rung builds and runs bin/mes-m2, an \
@@ -1120,18 +1128,25 @@ mod tests {
         ));
     }
 
-    // The preflight reds ONLY on a proven-negative config; Supported and Unknown
-    // both pass (the exec is the backstop for the unprovable case).
+    // The preflight POLICY reds ONLY on a proven-negative verdict; Supported and
+    // Unknown both pass (the exec is the backstop for the unprovable case). This
+    // exercises the pure mapping, NOT the live `/proc` probe — so it is
+    // deterministic on every host, including a kernel with IA32 emulation
+    // disabled, where a live `preflight_ia32()` would (correctly) red and must
+    // not fail `cargo test` for a build that requested no i686 rung.
     #[test]
     fn preflight_ia32_reds_only_on_a_proven_negative() {
-        let msg = match ia32_from_kconfig("# CONFIG_IA32_EMULATION is not set\n") {
-            Ia32Verdict::Unsupported => "unsupported",
-            _ => "other",
-        };
-        assert_eq!(msg, "unsupported");
-        // The live-kernel preflight must not spuriously fail this build host,
-        // which has CONFIG_IA32_EMULATION=y (Supported) — or, on a config-less
-        // host, Unknown; both are Ok. It must never hard-fail here.
-        assert!(preflight_ia32().is_ok(), "preflight must not false-fail a capable/unknown host");
+        assert!(
+            ia32_preflight_result(Ia32Verdict::Unsupported).is_err(),
+            "a proven-negative kernel must red"
+        );
+        assert!(
+            ia32_preflight_result(Ia32Verdict::Supported).is_ok(),
+            "a capable kernel must pass"
+        );
+        assert!(
+            ia32_preflight_result(Ia32Verdict::Unknown).is_ok(),
+            "an unprovable kernel must pass (the exec is the backstop)"
+        );
     }
 }

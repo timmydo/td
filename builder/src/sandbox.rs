@@ -309,6 +309,70 @@ pub fn verify_staged_item(
 /// mount in the child, so the lock — not the hash — is what holds after
 /// staging). On success returns (output name, host-side path under
 /// scratch/newstore) for every drv output, each verified to exist.
+/// Plan (and materialise the newstore skeleton for) ONE verified closure item's
+/// bind mounts — the `(on-disk source, in-newstore target)` pairs the child will
+/// `mount --bind`, basename-keyed under `newstore/<store-hash>`. A declared
+/// input, a source, or the builder tree binds WHOLE. The control-plane builder's
+/// OWN runtime closure (glibc/gcc-lib — origin `BlessedSeedClosure`, never a
+/// declared build input) binds LIBRARY-ONLY: only its `lib/` (and `lib64/`)
+/// subtree, so the loader and every shared object — including glibc's own
+/// dlopen'd NSS/gconv modules — stay present, but the store output's RUNNABLE
+/// PROGRAMS do not. A Guix glibc ships `bin/getconf`, `bin/getent`, `bin/iconv`
+/// and `sbin/ldconfig`; whole-tree mounting let a `Step::Run` invoke them by
+/// absolute path without declaring them — an undeclared host executable the #469
+/// boundary must deny. The caller's `verify_staged_item` still hashes the FULL
+/// vouched tree, so authenticity is proven over every byte; only the EXPOSED
+/// surface narrows. Split out of `build` so the exposure policy unit-tests
+/// without a namespace.
+fn plan_staged_item(
+    newstore: &Path,
+    canonical: &str,
+    on_disk: &str,
+    meta: &fs::Metadata,
+    origin: Option<InputOrigin>,
+) -> io::Result<Vec<(String, PathBuf)>> {
+    // BASENAME-keyed: a closure can span MULTIPLE store prefixes (/gnu/store deps +
+    // /td/store td-built deps, e.g. a chained toolchain — brick 8). Each item is staged
+    // flat under newstore/<base> (store hashes are unique); newstore is then mounted at
+    // EVERY prefix the closure spans below, so /gnu/store/<b> and /td/store/<b> both
+    // resolve to their item. For a single-prefix closure this is exactly the old layout.
+    let base = canonical
+        .rsplit('/')
+        .next()
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| err(format!("closure item {canonical}: not a store path")))?;
+    let target = newstore.join(base);
+    if meta.is_dir() && origin == Some(InputOrigin::BlessedSeedClosure) {
+        fs::create_dir_all(&target)?;
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        for sub in ["lib", "lib64"] {
+            let src = format!("{on_disk}/{sub}");
+            if Path::new(&src).is_dir() {
+                let dst = target.join(sub);
+                fs::create_dir_all(&dst)?;
+                out.push((src, dst));
+            }
+        }
+        if out.is_empty() {
+            return Err(err(format!(
+                "builder-runtime closure item {canonical} (on disk {on_disk}) has neither \
+                 lib/ nor lib64/ — cannot stage its loader/libraries"
+            )));
+        }
+        return Ok(out);
+    }
+    if meta.is_dir() {
+        fs::create_dir_all(&target)?;
+    } else if meta.is_file() {
+        fs::File::create(&target)?;
+    } else {
+        // A symlink cannot be bind-mounted; no pinned-channel closure
+        // has top-level symlink store items — refuse rather than guess.
+        return Err(err(format!("closure item {canonical}: unsupported file type")));
+    }
+    Ok(vec![(on_disk.to_string(), target)])
+}
+
 pub fn build(
     drv: &Derivation,
     drv_path: &str,
@@ -341,31 +405,14 @@ pub fn build(
         verify_staged_item(manifest, canonical, on_disk)?;
         let meta = fs::symlink_metadata(on_disk)
             .map_err(|e| err(format!("closure item {canonical} (on disk {on_disk}): {e}")))?;
-        // BASENAME-keyed: a closure can span MULTIPLE store prefixes (/gnu/store deps +
-        // /td/store td-built deps, e.g. a chained toolchain — brick 8). Each item is staged
-        // flat under newstore/<base> (store hashes are unique); newstore is then mounted at
-        // EVERY prefix the closure spans below, so /gnu/store/<b> and /td/store/<b> both
-        // resolve to their item. For a single-prefix closure this is exactly the old layout.
-        let base = canonical
-            .rsplit('/')
-            .next()
-            .filter(|b| !b.is_empty())
-            .ok_or_else(|| err(format!("closure item {canonical}: not a store path")))?;
-        let target = newstore.join(base);
-        if meta.is_dir() {
-            fs::create_dir_all(&target)?;
-        } else if meta.is_file() {
-            fs::File::create(&target)?;
-        } else {
-            // A symlink cannot be bind-mounted; no pinned-channel closure
-            // has top-level symlink store items — refuse rather than guess.
-            return Err(err(format!("closure item {canonical}: unsupported file type")));
+        let origin = manifest.get(canonical).map(|s| s.origin);
+        for (src, dst) in plan_staged_item(&newstore, canonical, on_disk, &meta, origin)? {
+            binds.push((
+                CString::new(src.as_str()).map_err(|_| err(format!("{src}: NUL in path")))?,
+                CString::new(dst.as_os_str().as_encoded_bytes())
+                    .map_err(|_| err(format!("{}: NUL in path", dst.display())))?,
+            ));
         }
-        binds.push((
-            CString::new(on_disk).map_err(|_| err(format!("{on_disk}: NUL in path")))?,
-            CString::new(target.as_os_str().as_encoded_bytes())
-                .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
-        ));
     }
 
     // The build dir is `guix-build-<drvName>-0`. For a store-path drv that is
@@ -1130,6 +1177,94 @@ mod tests {
         let err = verify_staged_item(&vouched, canonical, on_disk).unwrap_err();
         assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // P0 (re #469): the control-plane builder's runtime root (glibc/gcc-lib, a
+    // BlessedSeedClosure item) must stage LIBRARY-ONLY — its `lib/`/`lib64/`
+    // subtree, never the store output's runnable host PROGRAMS. A Guix glibc
+    // ships bin/getconf, bin/getent, bin/iconv, sbin/ldconfig; whole-tree mounting
+    // let a Step::Run exec them by absolute path. This mounts a synthetic runtime
+    // root and proves an executable CONTAINED inside it is excluded, while a
+    // DECLARED input (RecipeOutput) with the identical layout still binds whole.
+    #[test]
+    fn builder_runtime_root_stages_libraries_only_never_its_host_programs() {
+        let root = std::env::temp_dir().join(format!("td-runtime-stage-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let newstore = root.join("newstore");
+        fs::create_dir_all(&newstore).unwrap();
+        // A synthetic glibc output: loader + libc under lib/, a dlopen'd gconv
+        // module (proving library subtrees ride along), plus the runnable host
+        // programs the finding named under bin/ and sbin/.
+        let glibc = root.join("wzxy-glibc-2.41");
+        for d in ["lib", "lib/gconv", "lib64", "bin", "sbin"] {
+            fs::create_dir_all(glibc.join(d)).unwrap();
+        }
+        fs::write(glibc.join("lib/libc.so.6"), b"\x7fELF libc").unwrap();
+        fs::write(glibc.join("lib/ld-linux-x86-64.so.2"), b"\x7fELF loader").unwrap();
+        fs::write(glibc.join("lib/gconv/UTF-16.so"), b"\x7fELF gconv").unwrap();
+        fs::write(glibc.join("lib64/libc.so.6"), b"\x7fELF libc").unwrap();
+        let getconf = glibc.join("bin/getconf");
+        fs::write(&getconf, b"\x7fELF getconf").unwrap();
+        fs::write(glibc.join("sbin/ldconfig"), b"\x7fELF ldconfig").unwrap();
+        let canonical = "/gnu/store/wzxy-glibc-2.41";
+        let on_disk = glibc.to_str().unwrap();
+        let meta = fs::symlink_metadata(&glibc).unwrap();
+
+        // As the builder's runtime root: only lib/ and lib64/ bind.
+        let binds =
+            plan_staged_item(&newstore, canonical, on_disk, &meta, Some(InputOrigin::BlessedSeedClosure))
+                .unwrap();
+        let srcs: Vec<&String> = binds.iter().map(|(s, _)| s).collect();
+        assert_eq!(binds.len(), 2, "exactly lib/ and lib64/ bind: {srcs:?}");
+        for (src, _) in &binds {
+            assert!(
+                src.ends_with("/lib") || src.ends_with("/lib64"),
+                "a runtime bind source must be a library dir, got {src}"
+            );
+        }
+        // The whole tree is NOT a bind source, so no bind exposes bin/ or sbin/:
+        // the getconf/ldconfig host programs contained in the root are excluded.
+        assert!(
+            !binds.iter().any(|(s, _)| s.as_str() == on_disk),
+            "the whole runtime tree must not be staged"
+        );
+        for prog in [glibc.join("bin/getconf"), glibc.join("sbin/ldconfig")] {
+            assert!(
+                !binds.iter().any(|(s, _)| prog.starts_with(s)),
+                "a runnable host program ({}) must not be reachable through any bind",
+                prog.display()
+            );
+        }
+        // The loader and the dlopen'd gconv module DO ride along (via lib/).
+        assert!(
+            binds.iter().any(|(s, _)| Path::new(s).join("ld-linux-x86-64.so.2").exists()),
+            "the loader must be staged"
+        );
+
+        // A DECLARED input (RecipeOutput) with the SAME layout binds WHOLE — the
+        // lib-only narrowing is specific to the builder's own runtime closure, not
+        // a package a rung legitimately declares (which may ship its own programs).
+        let decl =
+            plan_staged_item(&newstore, canonical, on_disk, &meta, Some(InputOrigin::RecipeOutput))
+                .unwrap();
+        assert_eq!(decl.len(), 1);
+        assert_eq!(decl[0].0.as_str(), on_disk, "a declared input stages its whole tree");
+
+        // A runtime root missing BOTH library dirs cannot stage its loader — refuse.
+        let empty_root = root.join("aaaa-empty-runtime");
+        fs::create_dir_all(empty_root.join("bin")).unwrap();
+        let m2 = fs::symlink_metadata(&empty_root).unwrap();
+        let e = plan_staged_item(
+            &newstore,
+            "/gnu/store/aaaa-empty-runtime",
+            empty_root.to_str().unwrap(),
+            &m2,
+            Some(InputOrigin::BlessedSeedClosure),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("neither lib/ nor lib64/"), "{e}");
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
