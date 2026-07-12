@@ -506,6 +506,55 @@ pub fn set_rpath(path: &Path, new_rpath: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The dynamic-linkage SEARCH references of a file: its program interpreter (`PT_INTERP`)
+/// and every colon-separated entry of its `DT_RUNPATH`/`DT_RPATH` run-path — i.e. the paths
+/// the loader consults to find the interpreter and the DT_NEEDED libraries. A NON-ELF file
+/// (a shell script, a header, a static archive) yields `(None, [])`; a static ELF yields its
+/// interp (`None`) and empty run-path. Reads the file at most once.
+///
+/// This is the loader's OWN view, and it is deliberately NARROWER than a content scan
+/// (`guix gc -R` / `scan::Scanner`): a store item can NAME another store path in a string
+/// CONSTANT the loader never links — glibc's `libc.so.6` bakes the absolute bash-static
+/// path into its `_PATH_BSHELL` constant (the default shell of `system()`/`popen()`), so a
+/// content scan drags a runnable host shell into the control-plane builder's runtime closure
+/// and thus the sandbox. Resolving the builder's closure by THIS search set instead stages
+/// exactly the interpreter + run-path dirs the loader uses — glibc/gcc-lib — and leaves the
+/// host shell absent (re #469). The run-path entries are returned verbatim (absolute store
+/// dirs for a Guix binary, possibly with unnormalized `..` tails or `$ORIGIN`); the caller
+/// extracts the store PATH, for which the `..` tail is irrelevant.
+pub fn runtime_link_search(path: &Path) -> Result<(Option<String>, Vec<String>), String> {
+    let b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if b.len() < 4 || &b[0..4] != EI_MAG {
+        return Ok((None, Vec::new())); // not an ELF — no dynamic-linkage search set
+    }
+    let interp = match interp_slot(&b)? {
+        None => None,
+        Some((off, sz)) => {
+            let raw = b.get(off..off + sz).unwrap_or(&[]);
+            let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+            Some(String::from_utf8_lossy(&raw[..end]).into_owned())
+        }
+    };
+    let mut dirs: Vec<String> = Vec::new();
+    if let Some(slots) = rpath_slots(&b)? {
+        // Every DT_RPATH and DT_RUNPATH slot (the loader prefers RUNPATH, but a closure over
+        // ALL run-path store dirs is the safe superset — it never DROPS a real provider dir).
+        for (_tag, v) in &slots.entries {
+            let off = slots.strtab_off + *v as usize;
+            let raw = b
+                .get(off..)
+                .ok_or("DT_RPATH/DT_RUNPATH string offset past end of file")?;
+            let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+            for entry in String::from_utf8_lossy(&raw[..end]).split(':') {
+                if !entry.is_empty() {
+                    dirs.push(entry.to_string());
+                }
+            }
+        }
+    }
+    Ok((interp, dirs))
+}
+
 /// Read the DT_NEEDED shared-object names of a dynamic ELF — the libraries the loader would
 /// pull in at run time. Returns an EMPTY vector for a fully static binary (no PT_DYNAMIC) or a
 /// dynamic ELF that declares no needed libraries. This is td's OWN DT_NEEDED query so the
@@ -913,6 +962,31 @@ mod tests {
         // ELF32 reads back too
         std::fs::write(&f, synth_needed_elf(&["ld-linux.so.2"], false)).unwrap();
         assert_eq!(read_needed(&f).unwrap(), vec!["ld-linux.so.2".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn runtime_link_search_returns_interp_and_splits_runpath() {
+        let dir = std::env::temp_dir().join(format!("elf-test-rls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a");
+        // A run-path-only dynamic ELF (no interp): the colon-separated entries split out.
+        std::fs::write(&f, synth_dyn_elf("/gnu/store/aaa/lib:/gnu/store/bbb/lib", true, true)).unwrap();
+        let (interp, dirs) = runtime_link_search(&f).unwrap();
+        assert_eq!(interp, None);
+        assert_eq!(dirs, vec!["/gnu/store/aaa/lib".to_string(), "/gnu/store/bbb/lib".to_string()]);
+        // An interp-only ELF (no PT_DYNAMIC): interp out, no run-path.
+        std::fs::write(&f, synth_elf("/gnu/store/ccc/lib/ld-linux-x86-64.so.2")).unwrap();
+        let (interp, dirs) = runtime_link_search(&f).unwrap();
+        assert_eq!(interp.as_deref(), Some("/gnu/store/ccc/lib/ld-linux-x86-64.so.2"));
+        assert!(dirs.is_empty());
+        // A NON-ELF file (a script, a header) has NO dynamic-linkage search set — this is
+        // exactly why a store path named only in such a file (bash-static in glibc's
+        // bin/ldd or include/paths.h) never enters the builder's runtime closure (re #469).
+        std::fs::write(&f, b"#!/gnu/store/ddd-bash/bin/sh\necho hi\n").unwrap();
+        let (interp, dirs) = runtime_link_search(&f).unwrap();
+        assert_eq!(interp, None);
+        assert!(dirs.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

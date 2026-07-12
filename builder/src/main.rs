@@ -2290,6 +2290,107 @@ fn scan_closure_hybrid(
     Ok(seen)
 }
 
+/// The transitive closure of the control-plane builder's runtime libraries by DYNAMIC
+/// LINKAGE — the store paths the loader consults to run the builder — computed from the
+/// loader's OWN search structure (`PT_INTERP` + `DT_RUNPATH`/`DT_RPATH`), NOT a content
+/// scan. ROOTS are the builder's DIRECT runtime refs (the vouched builder-placement db's
+/// closure minus the builder tree — glibc/gcc-lib). For each store path reached, EVERY ELF
+/// object in it contributes its interp + run-path store dirs; the walk recurses to fixpoint.
+///
+/// This is narrower than `scan_closure_hybrid` (`guix gc -R`) on purpose: glibc's
+/// `libc.so.6` bakes the absolute bash-static path into its `_PATH_BSHELL` STRING CONSTANT,
+/// so a content scan pulls that runnable host shell into the builder's blessed closure and
+/// stages it into the sandbox — an undeclared host executable an absolute `Step::Run` could
+/// invoke (re #469). bash-static is nobody's DT_NEEDED and lives in nobody's run-path, so it
+/// never appears here. SAFE direction: a Guix ELF's run-path lists a store dir for every
+/// library it links (`validate-runpath`), and we take the store path of EVERY run-path entry
+/// of EVERY object, so the result never UNDER-stages a real runtime lib — it can only
+/// over-approximate (bind an extra store dir that ships an unused run-path entry), which the
+/// blessed-seed manifest still vouches. `on_disk` maps a seed canonical store path to its
+/// on-disk dir (the #292 re-canonicalization); a path with no row falls back to
+/// `<store_dir>/<basename>`.
+fn resolve_link_closure(
+    roots: &[String],
+    store_dirs: &[String],
+    canonical_prefix: &str,
+    on_disk: &std::collections::HashMap<String, String>,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    // The canonical store PATH that a canonical file path / run-path dir lives in:
+    // `<canonical_prefix>/<first component after the prefix>`. The `lib/x.so` or unnormalized
+    // `../lib` tail is irrelevant to the store path, so no `..`/symlink normalization is
+    // needed. A path outside the seed prefix ($ORIGIN-relative, or a host default like
+    // /lib) yields None and is skipped — it names no seed store path.
+    let store_path_of = |p: &str| -> Option<String> {
+        let rest = p.strip_prefix(canonical_prefix)?.strip_prefix('/')?;
+        let base = rest.split('/').next().filter(|b| !b.is_empty())?;
+        Some(format!("{canonical_prefix}/{base}"))
+    };
+    let on_disk_dir = |canon: &str| -> Option<PathBuf> {
+        if let Some(od) = on_disk.get(canon) {
+            return Some(PathBuf::from(od));
+        }
+        let base = canon.strip_prefix(canonical_prefix)?.strip_prefix('/')?;
+        for sd in store_dirs {
+            let cand = Path::new(sd).join(base);
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+        None
+    };
+    let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut stack: Vec<String> = roots.to_vec();
+    while let Some(canon) = stack.pop() {
+        if !closure.insert(canon.clone()) {
+            continue;
+        }
+        let Some(dir) = on_disk_dir(&canon) else {
+            continue; // no bytes on disk for this canonical — nothing to walk
+        };
+        let mut refs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut walk: Vec<PathBuf> = vec![dir];
+        while let Some(d) = walk.pop() {
+            let rd = match std::fs::read_dir(&d) {
+                Ok(rd) => rd,
+                Err(_) => continue, // an unreadable subdir contributes no link edges
+            };
+            for entry in rd {
+                let entry = entry.map_err(|e| format!("walk {}: {e}", d.display()))?;
+                let ft = entry
+                    .file_type()
+                    .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+                if ft.is_dir() {
+                    walk.push(entry.path());
+                    continue;
+                }
+                // A symlink's TEXT is not a link edge — the loader resolves it to a real ELF
+                // in some store path whose OWN run-path we already parse — so only regular
+                // files are inspected.
+                if !ft.is_file() {
+                    continue;
+                }
+                let (interp, rpaths) = elf::runtime_link_search(&entry.path())?;
+                if let Some(i) = interp {
+                    if let Some(sp) = store_path_of(&i) {
+                        refs.insert(sp);
+                    }
+                }
+                for rp in rpaths {
+                    if let Some(sp) = store_path_of(&rp) {
+                        refs.insert(sp);
+                    }
+                }
+            }
+        }
+        for r in refs {
+            if !closure.contains(&r) {
+                stack.push(r);
+            }
+        }
+    }
+    Ok(closure)
+}
+
 /// Merge the DIRECT-reference graph of one or more typed td-OWNED store DBs
 /// (build-plan's td.dbs / the blessed seed-closure db) into a single `path -> direct refs`
 /// map, for `scan_closure_hybrid`. These DBs are td's OWN registration (never `/var/guix`);
@@ -2866,27 +2967,32 @@ fn realize_drv(
         // The td-placed builder gets its closure from the builder DB; every other
         // root from the seed content-scan (∪ any td-owned extra dbs).
         match (builder_override, &builder_db) {
-            // The td-placed builder: builder DB gives {builder} ∪ its DIRECT refs;
-            // the builder entry binds from on_disk (canonical\ton-disk), and each
-            // direct ref's TRANSITIVE closure is CONTENT-SCANNED from the seed store
-            // (the pinned toolchain lives there — glibc/gcc-lib + their deps).
+            // The td-placed builder: the builder DB gives {builder} ∪ its DIRECT runtime
+            // refs (glibc/gcc-lib). The builder tree binds from on_disk (canonical\ton-disk).
+            // Each direct ref is then expanded by DYNAMIC LINKAGE (PT_INTERP + DT_RUNPATH),
+            // NOT a content scan: content-scanning glibc drags bash-static into the sandbox
+            // (its libc.so.6 bakes the bash path into the `_PATH_BSHELL` string constant), a
+            // runnable host shell the loader never links (re #469). Linkage resolution stages
+            // exactly the loader's search set — the pinned glibc/gcc-lib — and nothing a
+            // glibc helper SCRIPT (bin/ldd) or HEADER (paths.h) merely names.
             (Some(ov), Some(bdb)) if r == &ov.canonical => {
+                let mut lib_roots: Vec<String> = Vec::new();
                 for p in bdb.closure(r)? {
                     if p == ov.canonical {
                         builder_reach.insert(p.clone());
                         closure.insert(format!("{p}\t{}", ov.on_disk));
                     } else {
-                        for q in scan_closure_hybrid(
-                            &mut scanner,
-                            &on_disk,
-                            &extra_refs,
-                            std::slice::from_ref(&p),
-                        )? {
-                            let (canon, _) = sandbox::split_closure_entry(&q);
-                            builder_reach.insert(canon.to_string());
-                            closure.insert(q);
-                        }
+                        lib_roots.push(p);
                     }
+                }
+                for canon in resolve_link_closure(
+                    &lib_roots,
+                    seed_store_dirs,
+                    seed_canonical_prefix,
+                    &on_disk,
+                )? {
+                    builder_reach.insert(canon.clone());
+                    closure.insert(canon);
                 }
             }
             _ => {
@@ -10412,6 +10518,131 @@ daemon build START (2/2 active)
     // realize re-keys ONLY the builder's own closure entry from its real content path to
     // the stable identity path (binding the real bytes there); its runtime refs and every
     // build input pass through untouched. Both entry shapes (bare, and canonical\ton-disk).
+    // A minimal little-endian ELF64: an optional PT_INTERP, a whole-file identity PT_LOAD,
+    // and a PT_DYNAMIC carrying DT_STRTAB, an optional DT_RUNPATH, and DT_NULL. `embed`
+    // strings are appended raw AFTER the .dynstr — they are in the file bytes (a content scan
+    // sees them) but are NOT reachable through PT_INTERP or DT_RUNPATH, mirroring glibc's
+    // libc.so.6 baking the bash-static path into its `_PATH_BSHELL` string constant.
+    fn synth_link_elf(interp: Option<&str>, runpath: Option<&str>, embed: &[&str]) -> Vec<u8> {
+        fn le64(b: &mut [u8], off: usize, v: u64) { b[off..off + 8].copy_from_slice(&v.to_le_bytes()); }
+        fn le32(b: &mut [u8], off: usize, v: u32) { b[off..off + 4].copy_from_slice(&v.to_le_bytes()); }
+        fn le16(b: &mut [u8], off: usize, v: u16) { b[off..off + 2].copy_from_slice(&v.to_le_bytes()); }
+        let (ehdr, phent) = (64usize, 56usize);
+        let phnum = if interp.is_some() { 3 } else { 2 };
+        let ph_off = ehdr;
+        let interp_off = ehdr + phnum * phent;
+        let mut interp_bytes: Vec<u8> = Vec::new();
+        if let Some(s) = interp { interp_bytes.extend_from_slice(s.as_bytes()); interp_bytes.push(0); }
+        let dyn_off = interp_off + interp_bytes.len();
+        let n_dyn = 2 + usize::from(runpath.is_some());
+        let dyn_size = n_dyn * 16;
+        let strtab_off = dyn_off + dyn_size;
+        let mut dynstr: Vec<u8> = vec![0]; // index 0: the conventional empty string
+        let rp_off = dynstr.len();
+        if let Some(rp) = runpath { dynstr.extend_from_slice(rp.as_bytes()); dynstr.push(0); }
+        let embed_off = strtab_off + dynstr.len();
+        let mut embed_bytes: Vec<u8> = Vec::new();
+        for s in embed { embed_bytes.extend_from_slice(s.as_bytes()); embed_bytes.push(0); }
+        let total = embed_off + embed_bytes.len();
+
+        let mut b = vec![0u8; total];
+        b[0..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2; // ELFCLASS64
+        b[5] = 1; // ELFDATA2LSB
+        le64(&mut b, 0x20, ph_off as u64);
+        le16(&mut b, 0x36, phent as u16);
+        le16(&mut b, 0x38, phnum as u16);
+        let mut pi = ph_off;
+        if !interp_bytes.is_empty() {
+            le32(&mut b, pi, 3); // PT_INTERP
+            le64(&mut b, pi + 8, interp_off as u64); // p_offset
+            le64(&mut b, pi + 32, interp_bytes.len() as u64); // p_filesz
+            pi += phent;
+        }
+        le32(&mut b, pi, 1); // PT_LOAD, identity-mapped over the whole file
+        le64(&mut b, pi + 8, 0);
+        le64(&mut b, pi + 16, 0);
+        le64(&mut b, pi + 32, total as u64);
+        pi += phent;
+        le32(&mut b, pi, 2); // PT_DYNAMIC
+        le64(&mut b, pi + 8, dyn_off as u64);
+        le64(&mut b, pi + 16, dyn_off as u64);
+        le64(&mut b, pi + 32, dyn_size as u64);
+        let mut de = dyn_off;
+        le64(&mut b, de, 5); le64(&mut b, de + 8, strtab_off as u64); de += 16; // DT_STRTAB
+        if runpath.is_some() {
+            le64(&mut b, de, 29); le64(&mut b, de + 8, rp_off as u64); de += 16; // DT_RUNPATH
+        }
+        le64(&mut b, de, 0); le64(&mut b, de + 8, 0); // DT_NULL
+        b[strtab_off..strtab_off + dynstr.len()].copy_from_slice(&dynstr);
+        b[embed_off..embed_off + embed_bytes.len()].copy_from_slice(&embed_bytes);
+        b
+    }
+
+    // The P0 regression (re #469): the control-plane builder's runtime closure must be
+    // computed by DYNAMIC LINKAGE, not a content scan, so a runnable host shell that glibc
+    // merely NAMES in a string constant / a helper script never enters the sandbox. This
+    // reproduces the real leak — glibc's libc.so.6 embeds the absolute bash-static path in
+    // its `_PATH_BSHELL` constant, and glibc's bin/ldd shebangs it — and asserts the
+    // link-closure excludes bash-static while a content scan of the SAME store would include
+    // it (so the two genuinely differ and the fix is load-bearing).
+    #[test]
+    fn resolve_link_closure_excludes_a_string_only_host_shell() {
+        let dir = std::env::temp_dir().join(format!("rlc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let seed = dir.join("seed");
+        let cp = "/gnu/store";
+        let glibc = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.41";
+        let bash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bash-static-5.2.37";
+        let gcclib = "cccccccccccccccccccccccccccccccc-gcc-14.3.0-lib";
+        std::fs::create_dir_all(seed.join(glibc).join("lib")).unwrap();
+        std::fs::create_dir_all(seed.join(glibc).join("bin")).unwrap();
+        std::fs::create_dir_all(seed.join(bash).join("bin")).unwrap();
+        std::fs::create_dir_all(seed.join(gcclib).join("lib")).unwrap();
+        let ld = format!("/gnu/store/{glibc}/lib/ld-linux-x86-64.so.2");
+        let bash_bin = format!("/gnu/store/{bash}/bin/bash");
+        // libc.so.6: interp -> ld, NO run-path, but EMBEDS the bash path (the leak).
+        std::fs::write(seed.join(glibc).join("lib/libc.so.6"), synth_link_elf(Some(&ld), None, &[&bash_bin])).unwrap();
+        // ld-linux: fully static — no interp, no run-path.
+        std::fs::write(seed.join(glibc).join("lib/ld-linux-x86-64.so.2"), synth_link_elf(None, None, &[])).unwrap();
+        // glibc bin/ldd: a helper SCRIPT that shebangs bash (a content ref, not a link edge).
+        std::fs::write(seed.join(glibc).join("bin/ldd"), format!("#!{bash_bin}\nexec ...\n").into_bytes()).unwrap();
+        // libgcc_s.so.1: run-path -> glibc/lib (the real cross-package link edge).
+        std::fs::write(seed.join(gcclib).join("lib/libgcc_s.so.1"), synth_link_elf(None, Some(&format!("/gnu/store/{glibc}/lib")), &[])).unwrap();
+        // bash-static: the runnable host shell — the regression target.
+        std::fs::write(seed.join(bash).join("bin/bash"), b"a runnable host shell").unwrap();
+
+        let seed_dir = seed.to_string_lossy().into_owned();
+        let od = |p: &str| seed.join(p).to_string_lossy().into_owned();
+        let mut on_disk = std::collections::HashMap::new();
+        on_disk.insert(format!("/gnu/store/{glibc}"), od(glibc));
+        on_disk.insert(format!("/gnu/store/{bash}"), od(bash));
+        on_disk.insert(format!("/gnu/store/{gcclib}"), od(gcclib));
+
+        // The builder DB's direct runtime refs (glibc + gcc-lib).
+        let roots = vec![format!("/gnu/store/{glibc}"), format!("/gnu/store/{gcclib}")];
+        let link = resolve_link_closure(&roots, std::slice::from_ref(&seed_dir), cp, &on_disk).unwrap();
+        assert!(link.contains(&format!("/gnu/store/{glibc}")), "glibc is a real runtime lib: {link:?}");
+        assert!(link.contains(&format!("/gnu/store/{gcclib}")), "gcc-lib is a real runtime lib: {link:?}");
+        assert!(
+            !link.contains(&format!("/gnu/store/{bash}")),
+            "bash-static (a string-only reference) must be ABSENT from the builder runtime closure: {link:?}"
+        );
+
+        // Prove the fix is load-bearing: a CONTENT scan of the same roots DOES pull bash-static
+        // in (via libc.so.6's constant + bin/ldd), which is exactly what used to stage a host
+        // shell into the sandbox.
+        let candidates = vec![format!("/gnu/store/{glibc}"), format!("/gnu/store/{bash}"), format!("/gnu/store/{gcclib}")];
+        let mut scanner = scan::Scanner::new(&candidates).unwrap();
+        let content = scan_closure_hybrid(&mut scanner, &on_disk, &std::collections::HashMap::new(), &roots).unwrap();
+        assert!(
+            content.contains(&format!("/gnu/store/{bash}")),
+            "a content scan SHOULD leak bash-static (the pre-fix behavior) — otherwise this test proves nothing: {content:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn rekey_builder_entry_remaps_only_the_builder() {
         let real = "/gnu/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-td-builder-0.1.0";
