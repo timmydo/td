@@ -18,10 +18,6 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
             ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
         ],
     });
     steps.push(
@@ -82,6 +78,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot1",
             "glibc-mesboot0",
         ])
-        .inputs_owned(base_inputs(&["patch-binutils-boot-2.20.1a", "linux-headers", "flex", "bison"]))
+        .inputs_owned(base_inputs(&["patch-binutils-boot-2.20.1a", "linux-headers"]))
         .steps(steps)
 }
