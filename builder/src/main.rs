@@ -1953,6 +1953,24 @@ fn merge_extra_refs(
     Ok(extra_refs)
 }
 
+/// Re-key the builder's OWN closure entry from its real content-addressed path to the
+/// stable ABI builder-identity path the drv names. An entry whose CANONICAL half is
+/// `real_cb` (`real_cb`, or `real_cb\tON-DISK`) becomes `stable_id\tON-DISK`, so the
+/// sandbox binds the real builder bytes at the stable path and execs it there; a bare
+/// entry (daemon-resident, no on-disk override) uses `real_cb` itself as the bind source.
+/// Every other closure entry — the builder's runtime refs and every build input — is
+/// untouched. A no-op on a closure with no `real_cb` entry.
+fn rekey_builder_entry(closure: Vec<String>, real_cb: &str, stable_id: &str) -> Vec<String> {
+    closure
+        .into_iter()
+        .map(|e| match e.split_once('\t') {
+            Some((canon, on_disk)) if canon == real_cb => format!("{stable_id}\t{on_disk}"),
+            None if e == real_cb => format!("{stable_id}\t{real_cb}"),
+            _ => e,
+        })
+        .collect()
+}
+
 /// Realize DRV with NO guix-daemon and NO guix store DB: compute the input closure ITSELF by
 /// CONTENT-SCANNING the seed store dir(s) (the daemon's scanForReferences / `guix gc -R`,
 /// gate 290) — no `/var/guix/db` read — build it in the userns sandbox (build_and_register),
@@ -1962,10 +1980,13 @@ fn merge_extra_refs(
 /// repl` interning). SEED_STORE_DIRS is the set of store DIRECTORIES the seed/toolchain
 /// closure is content-scanned over (`/gnu/store`, or the unpacked seed store); EXTRA_DBS is
 /// the set of td-OWNED store DBs whose td-built deps live outside those dirs (build-plan
-/// passes the prior steps' td.dbs so a downstream build's closure spans both). BUILDER_OVERRIDE,
-/// when set, supplies the drv's `builder` from a td-owned store (a td-bootstrapped stage0, not
-/// the guix-built td-builder) — the builder entry binds from the builder DB and its direct
-/// refs' TRANSITIVE closures come from the seed content-scan. TD_STORE, when set, names td's
+/// passes the prior steps' td.dbs so a downstream build's closure spans both). The drv's
+/// `builder` is the STABLE ABI identity path (store::builder_identity_path), so realize
+/// resolves the REAL builder to stage + bind at it: BUILDER_OVERRIDE, when set, names a
+/// td-owned builder (a td-bootstrapped stage0, not the guix-built td-builder) — its entry
+/// binds from the builder DB and its direct refs' TRANSITIVE closures come from the seed
+/// content-scan — else the realize's own running binary (self_store_path). Either way the
+/// builder's closure entry is re-keyed onto the stable identity path (rekey_builder_entry). TD_STORE, when set, names td's
 /// own store dir holding td-BUILT deps: a closure path whose tree lives under TD_STORE/<base>
 /// is emitted `canonical\ton-disk` so the sandbox binds it FROM THERE (the build-plan chaining
 /// edge) — the same on-disk encoding SRC_OVERRIDE uses. SEED_CANONICAL_PREFIX is the canonical
@@ -1999,6 +2020,24 @@ fn realize_drv(
                 .find(|o| &o.name == on)
                 .ok_or_else(|| format!("input drv {idrv} has no output `{on}'"))?;
             roots.push(o.path.clone());
+        }
+    }
+    // The drv names the STABLE ABI builder-identity path (store::builder_identity_path)
+    // as its builder + builder input-src — keyed on the ABI, not the builder ELF. To
+    // STAGE it, resolve it to the REAL builder here: substitute it in `roots` so the
+    // existing closure logic (which keys its builder branch on the override's canonical)
+    // runs UNCHANGED over the real path, then re-key that ONE entry back to the stable id
+    // after the closure is built (below) — so the sandbox binds the real builder bytes AT
+    // the path the drv execs. The real builder is this realize's override, else its own
+    // running binary; both are ABI-compatible with the token by construction.
+    let stable_builder_id = store::builder_identity_path();
+    let real_builder_cb = match builder_override {
+        Some(ov) => ov.canonical.clone(),
+        None => self_store_path()?,
+    };
+    for r in roots.iter_mut() {
+        if *r == stable_builder_id {
+            *r = real_builder_cb.clone();
         }
     }
     // Compute the input closure with NO guix store DB: CONTENT-SCAN the seed store dir(s)
@@ -2130,6 +2169,12 @@ fn realize_drv(
             e
         })
         .collect();
+    // Re-key the builder's OWN closure entry from its real content path to the stable ABI
+    // identity path the drv names (its runtime refs keep their real canonical paths). The
+    // sandbox binds the real builder bytes (the on-disk half) at that path and execs
+    // `{stable_id}/bin/td-builder` there — so the recipe's identity dropped the builder
+    // ELF but the build still runs the real builder.
+    let closure = rekey_builder_entry(closure, &real_builder_cb, &stable_builder_id);
     eprintln!(
         "td-builder: realize computed the input closure ITSELF — {} paths by CONTENT-SCANNING {} seed store dir(s) (+ {} td-owned db(s)); no /var/guix/db, no guix gc, no daemon",
         closure.len(),
@@ -2216,20 +2261,15 @@ fn build_recipe(
             db: db.to_string(),
         }
     });
-    // The builder store path: the td-placed stage0 (override) or, by default, the
-    // running binary (self_store_path — the guix-built td-builder).
-    let builder_path = match &builder_override {
-        Some(ov) => ov.canonical.clone(),
-        None => self_store_path()?,
-    };
     // td assembles the .drv ITSELF (pure Rust, no guix (derivation …), no Guile, no
     // daemon) and writes it to SCRATCH — the SAME assembly `assemble-recipe` uses, so a
-    // separate process (the build daemon) realizes a byte-identical td-assembled drv.
+    // separate process (the build daemon) realizes a byte-identical td-assembled drv. The
+    // drv's builder is the stable ABI-token identity path; the real builder (this
+    // override, or the running binary) is resolved + bound at realize.
     let (drv_path, drv_file, parsed, source) = assemble_recipe_drv(
         recipe_json,
         lock_file,
         scratch,
-        &builder_path,
         vendor_store.map(|(canonical, _, _)| canonical),
     )?;
     // A td-OWNED source store (optional): the `<name>-source` path was interned by td
@@ -2384,7 +2424,6 @@ fn assemble_recipe_drv(
     recipe_json: &str,
     lock_file: &str,
     scratch: &Path,
-    builder_path: &str,
     vendor_dir: Option<&str>,
 ) -> Result<(String, std::path::PathBuf, drv::Derivation, String), String> {
     let alist = json::parse(recipe_json).map_err(|e| format!("recipe JSON: {e}"))?;
@@ -2484,7 +2523,13 @@ fn assemble_recipe_drv(
     // same path; the input-src loop + TD_INPUTS below must not carry it twice.
     inputs.dedup();
     vendor.sort();
-    let builder = format!("{builder_path}/bin/td-builder");
+    // The drv's builder identity is the STABLE ABI-token path, NOT the builder binary's
+    // content-addressed store path — so the recipe's drv AND output hash are keyed on the
+    // ABI revision, not the builder ELF (store::builder_identity_path). realize resolves
+    // this to the real builder and binds its bytes here, so the sandbox execs the real
+    // builder at this path; a builder-binary change no longer re-hashes every recipe.
+    let builder_id = store::builder_identity_path();
+    let builder = format!("{builder_id}/bin/td-builder");
     // Assemble the .drv spec: inputs as input-SOURCES (already-realized seed paths,
     // no input-derivations — so this diverges from guix's nano, by design).
     let mut spec = String::new();
@@ -2495,7 +2540,11 @@ fn assemble_recipe_drv(
     if !source.is_empty() {
         spec.push_str(&format!("input-src {source}\n"));
     }
-    spec.push_str(&format!("input-src {builder_path}\n"));
+    // The builder input-src is the SAME stable identity path (not the real builder Cb):
+    // it makes the builder a closure ROOT so realize stages it, and it enters the hash as
+    // the ABI token. realize substitutes the real builder for it when computing the
+    // closure, then re-keys that entry back to this path so the real bytes bind here.
+    spec.push_str(&format!("input-src {builder_id}\n"));
     for p in &inputs {
         spec.push_str(&format!("input-src {p}\n"));
     }
@@ -6154,22 +6203,19 @@ fn main() -> ExitCode {
         // NO realize (own-builder-daemon §5): read RECIPE-JSON + LOCK and assemble the
         // `.drv` (store::assemble_drv) to SCRATCH/<name>-<version>.drv, WITHOUT building
         // it — so a SEPARATE process (the persistent build daemon) realizes the
-        // td-assembled drv. The drv's builder is td's stage0 td-builder when
-        // TD_BUILDER_PATH is set (matching the daemon's TD_BUILDER_* override), else the
-        // running binary (self_store_path). Prints `DRV=<file>` then one
-        // `OUT=<name> <store-path>` per output. Usage:
+        // td-assembled drv. The drv's builder is the STABLE ABI-token identity path
+        // (store::builder_identity_path), independent of which td-builder binary
+        // assembles or realizes it; the realizing process binds the real builder (its
+        // TD_BUILDER_* override, else its own binary) at that path. Prints `DRV=<file>`
+        // then one `OUT=<name> <store-path>` per output. Usage:
         //   assemble-recipe RECIPE-JSON-FILE LOCK SCRATCH
         Some("assemble-recipe") if args.len() == 5 => {
             let (recipe_file, lock, scratch) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<(), String> {
                 let recipe_json =
                     std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
-                let builder_path = match std::env::var("TD_BUILDER_PATH").ok() {
-                    Some(p) => p,
-                    None => self_store_path()?,
-                };
                 let (drv_path, drv_file, parsed, _source) =
-                    assemble_recipe_drv(&recipe_json, lock, Path::new(scratch), &builder_path, None)?;
+                    assemble_recipe_drv(&recipe_json, lock, Path::new(scratch), None)?;
                 eprintln!(
                     "td-builder: assemble-recipe assembled {drv_path} (no guix (derivation), no Guile, no realize)"
                 );
@@ -7993,7 +8039,6 @@ daemon build START (2/2 active)
         .unwrap();
         let recipe = r#"{"name":"fixture","version":"1.0","buildSystem":"gnu"}"#;
         let lockp = lock.to_str().unwrap();
-        let builder = "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-td-builder-0.1.0";
         let tc = "/td/store/ffffffffffffffffffffffffffffffff-gcc-toolchain-tdstore";
         let td_inputs = |drv: &drv::Derivation| {
             drv.env.iter().find(|(k, _)| k == "TD_INPUTS").map(|(_, v)| v.clone()).unwrap()
@@ -8001,7 +8046,7 @@ daemon build START (2/2 active)
 
         // WITH the override: the guix gcc-toolchain is swapped for the /td/store toolchain.
         std::env::set_var("TD_GCC_TOOLCHAIN", tc);
-        let (_p, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, builder, None).unwrap();
+        let (_p, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
         std::env::remove_var("TD_GCC_TOOLCHAIN");
         let ti = td_inputs(&drv);
         assert!(ti.contains(tc), "TD_INPUTS carries the /td/store toolchain: {ti}");
@@ -8015,11 +8060,85 @@ daemon build START (2/2 active)
         );
 
         // WITHOUT the override (default): unchanged — the guix gcc-toolchain stays.
-        let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, builder, None).unwrap();
+        let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
         let ti0 = td_inputs(&drv0);
         assert!(ti0.contains("gcc-toolchain-15.2.0"), "default keeps the guix gcc-toolchain: {ti0}");
         assert!(!ti0.contains(tc), "default has no /td/store toolchain: {ti0}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ABI-token-in-drv: a recipe's drv is keyed on the STABLE builder-identity path
+    // (store::builder_identity_path), NOT the builder binary. So the `builder` line and
+    // the builder input-src are that path, no real builder Cb appears anywhere in the drv,
+    // and re-assembly is byte-deterministic — a builder-binary change can no longer move
+    // the recipe's drv path or output path. That is the whole point of the migration.
+    #[test]
+    fn assemble_recipe_drv_keys_the_builder_on_the_abi_identity_path() {
+        let dir = std::env::temp_dir().join(format!("td-abi-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("fixture.lock");
+        std::fs::write(
+            &lock,
+            "fixture-source /gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fixture-1.0.tar.gz source\n\
+             /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.41 /gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.41\n",
+        )
+        .unwrap();
+        let recipe = r#"{"name":"fixture","version":"1.0","buildSystem":"gnu"}"#;
+        let lockp = lock.to_str().unwrap();
+
+        let id = store::builder_identity_path();
+        let (drv_path, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
+
+        // The builder line is the stable identity path's td-builder — not a real Cb.
+        assert_eq!(drv.builder, format!("{id}/bin/td-builder"), "builder line is the ABI identity");
+        // The identity path is a builder input-src (the closure root realize stages)...
+        assert!(drv.input_srcs.iter().any(|s| s == &id), "identity path is a builder input-src");
+        // ...and NO builder BINARY path (only the identity DIR) is baked into the drv.
+        assert!(
+            !drv.input_srcs.iter().any(|s| s.contains("/bin/td-builder")),
+            "no builder binary path among input-srcs: {:?}",
+            drv.input_srcs
+        );
+
+        // Re-assembly is byte-deterministic — same drv path AND same output path — so a
+        // builder-binary change (absent from the spec now) cannot move either.
+        let (drv_path2, _f2, drv2, _s2) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
+        assert_eq!(drv_path, drv_path2, "drv store path is stable across re-assembly");
+        assert_eq!(
+            drv.outputs.first().map(|o| &o.path),
+            drv2.outputs.first().map(|o| &o.path),
+            "recipe output path is stable across re-assembly"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // realize re-keys ONLY the builder's own closure entry from its real content path to
+    // the stable identity path (binding the real bytes there); its runtime refs and every
+    // build input pass through untouched. Both entry shapes (bare, and canonical\ton-disk).
+    #[test]
+    fn rekey_builder_entry_remaps_only_the_builder() {
+        let real = "/gnu/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-td-builder-0.1.0";
+        let stable = "/td/store/ssssssssssssssssssssssssssssssss-td-builder";
+        // Bare, daemon-resident builder: binds from its own real path.
+        let closure = vec![
+            real.to_string(),
+            "/gnu/store/gggggggggggggggggggggggggggggggg-glibc-2.41".to_string(),
+            "/td/store/tttttttttttttttttttttttttttttttt-make-4.4.1\t/cache/tttttttttttttttttttttttttttttttt-make-4.4.1".to_string(),
+        ];
+        let out = rekey_builder_entry(closure, real, stable);
+        assert_eq!(out.first().map(String::as_str), Some(format!("{stable}\t{real}").as_str()), "bare builder -> stable\\treal");
+        assert_eq!(out.get(1).map(String::as_str), Some("/gnu/store/gggggggggggggggggggggggggggggggg-glibc-2.41"), "runtime ref untouched");
+        assert!(out.get(2).is_some_and(|e| e.starts_with("/td/store/tttt")), "other on-disk entry untouched");
+
+        // The override form: `real\ton-disk` -> `stable\ton-disk` (real bytes at stable).
+        let ov = vec![format!("{real}\t/bstore/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-td-builder-0.1.0")];
+        let ovo = rekey_builder_entry(ov, real, stable);
+        assert_eq!(ovo.first().map(String::as_str), Some(format!("{stable}\t/bstore/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-td-builder-0.1.0").as_str()));
+
+        // No builder entry present -> a no-op.
+        let none = vec!["/gnu/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-foo".to_string()];
+        assert_eq!(rekey_builder_entry(none.clone(), real, stable), none, "no builder entry -> unchanged");
     }
 
     // #258 ripgrep cutover: the native /td/store gcc is a PLAIN gcc (no ld-wrapper), so run_rust must
@@ -8042,7 +8161,6 @@ daemon build START (2/2 active)
         .unwrap();
         let recipe = r#"{"name":"ripgrep","version":"14.1.1","buildSystem":"rust","bins":["rg"]}"#;
         let lockp = lock.to_str().unwrap();
-        let builder = "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-td-builder-0.1.0";
         let env_of = |drv: &drv::Derivation, k: &str| {
             drv.env.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
         };
@@ -8054,7 +8172,7 @@ daemon build START (2/2 active)
         std::env::set_var("TD_RUST_STORE_INTERP", interp);
         std::env::set_var("TD_RUST_STORE_RPATH", rpath);
         std::env::set_var("TD_RUST_STORE_BDIR", bdir);
-        let (_p, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, builder, None).unwrap();
+        let (_p, _f, drv, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
         std::env::remove_var("TD_RUST_STORE_INTERP");
         std::env::remove_var("TD_RUST_STORE_RPATH");
         std::env::remove_var("TD_RUST_STORE_BDIR");
@@ -8063,7 +8181,7 @@ daemon build START (2/2 active)
         assert_eq!(env_of(&drv, "TD_RUST_STORE_BDIR").as_deref(), Some(bdir), "bdir forwarded");
 
         // WITHOUT the vars (default): none emitted ⇒ the guix ld-wrapper path, unchanged.
-        let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, builder, None).unwrap();
+        let (_p, _f, drv0, _s) = assemble_recipe_drv(recipe, lockp, &dir, None).unwrap();
         assert!(env_of(&drv0, "TD_RUST_STORE_INTERP").is_none(), "no interp in the drv env by default");
         assert!(env_of(&drv0, "TD_RUST_STORE_RPATH").is_none(), "no rpath by default");
         assert!(env_of(&drv0, "TD_RUST_STORE_BDIR").is_none(), "no bdir by default");
@@ -8086,9 +8204,8 @@ daemon build START (2/2 active)
         )
         .unwrap();
         let recipe = r#"{"name":"make-test","version":"1.0","buildSystem":"mesboot","nativeInputs":["make-x86-64"],"steps":[]}"#;
-        let builder = "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-td-builder-0.1.0";
         let (_p, _f, _drv, source) =
-            assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, builder, None).unwrap();
+            assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap();
         assert_eq!(source, "", "make-test has no source (none declared)");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8112,8 +8229,7 @@ daemon build START (2/2 active)
         )
         .unwrap();
         let recipe = r#"{"name":"gcc-14","version":"14.3.0","buildSystem":"mesboot","sourceInput":"gcc-14-source","nativeInputs":["binutils-mesboot"],"steps":[]}"#;
-        let builder = "/gnu/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-td-builder-0.1.0";
-        let err = assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, builder, None).unwrap_err();
+        let err = assemble_recipe_drv(recipe, lock.to_str().unwrap(), &dir, None).unwrap_err();
         assert!(err.contains("lock has no `gcc-14-source' entry"), "unexpected error: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
