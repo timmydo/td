@@ -448,6 +448,22 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // seed/control-plane-seed-pins.txt — the sha256 allow-list of ADMISSIBLE frozen
+    // control-plane seed captures (the pinned §5 rust/gcc toolchain that seed-unpack
+    // restores), include_str!-compiled into td-builder as CONTROL_PLANE_SEED_PINS and
+    // consulted by authenticate_seed_capture_db (which seed-capture db may be TYPED
+    // admissible). Without a mapping an isolated edit selected only check-pr (which
+    // exits before running gates) — no coverage at all. The per-PR coverage is the
+    // cargo-test preflight: the include_str! recompile, the authenticate_seed_capture_db
+    // unit tests (the provenance-authentication logic), and clippy — plus stage0-cold-start,
+    // the seed-placement provenance gate. A full from-frozen-seed toolchain build (the pin
+    // in a real admission) is the DAILY backstop, like the toolchain gates.
+    if p == "seed/control-plane-seed-pins.txt" {
+        sel.add_preflight("cargo-test");
+        sel.add_target("stage0-cold-start");
+        return;
+    }
+
     if pattern_matches(
         "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipe-eval-tool.sh",
         p,

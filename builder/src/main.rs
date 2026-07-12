@@ -800,6 +800,36 @@ fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Commit a freshly-built output tree to a store DESTINATION that may already exist, safely
+/// under ABI-token addressing. Pre-ABI an already-present store path was guaranteed to hold
+/// the same bytes (the path WAS the content hash), so a commit was a pure idempotent skip.
+/// Output paths are now keyed on the ABI token (store::builder_identity_path), NOT their
+/// content, so an already-present path is NOT guaranteed identical: a builder change that
+/// alters OUTPUTS without a matching BUILDER_ABI bump would land different bytes at the SAME
+/// path. So when `dest` exists, re-hash it and FAIL CLOSED on a mismatch — rather than skip
+/// the copy and let the caller's `merge_output_db`/receipt-write describe bytes that are not
+/// there (a stale tree with a fresh DB record). `expected` is the NAR hash the current build
+/// recorded for this output (`sha256:<hex>`). Absent dest → a plain copy; matching dest → an
+/// idempotent skip; mismatching dest → the ABI-bump demand.
+fn commit_tree_checked(src: &Path, dest: &Path, expected: &str) -> Result<(), String> {
+    if !dest.exists() {
+        return copy_canonical(src, dest);
+    }
+    let have = nar_hash_path(dest)
+        .map_err(|e| format!("re-hash existing store dest {}: {e}", dest.display()))?;
+    if have != expected {
+        return Err(format!(
+            "store commit: {} already holds a tree hashing {have}, but this build produced \
+             {expected} — an output path is keyed on the ABI token, so identical paths MUST be \
+             identical bytes. An output changed without a BUILDER_ABI bump: bump store::BUILDER_ABI \
+             (or set TD_BUILDER_ABI) so the changed output takes a fresh path. Refusing to overwrite \
+             the store record over stale bytes.",
+            dest.display()
+        ));
+    }
+    Ok(())
+}
+
 /// One built output's post-build registration facts — the daemon's per-path
 /// record (the `build`/`realize` NAR scan computes these).
 #[derive(Clone)]
@@ -1241,11 +1271,10 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
             return Err(format!("output tree missing under {}", src.display()));
         }
         let dest = Path::new(store_dir).join(base);
-        // The store path is content-addressed, so an entry already present is the same
-        // bytes — committing is idempotent (skip the copy).
-        if !dest.exists() {
-            copy_canonical(&src, &dest)?;
-        }
+        // Under ABI-token addressing an already-present path is NOT guaranteed to hold the
+        // same bytes, so re-hash it and fail closed on a mismatch rather than skip the copy
+        // and let merge_output_db/the receipt below describe a stale tree (re #469 ABI merge).
+        commit_tree_checked(&src, &dest, &r.nar_hash)?;
         committed.push(r.store_path.clone());
     }
     merge_output_db(db, &regs)?;
@@ -2937,13 +2966,6 @@ fn realize_drv(
         &manifest,
         self_store_path().ok().as_deref(),
     )?;
-    // The audit record beside closure.txt: what may stage, under which hash,
-    // issued by WHICH provenance class (the origin column).
-    let mut lines = String::new();
-    for (p, si) in &manifest {
-        lines.push_str(&format!("{p} {} {}\n", si.nar_hash, si.origin.as_str()));
-    }
-    std::fs::write(scratch.join("provenance.manifest"), lines).map_err(|e| e.to_string())?;
     // ABI: provenance is now enforced over the real builder path, so re-key the builder's
     // OWN closure entry from its real content path to the stable ABI identity path the drv
     // names (its runtime refs keep their real canonical paths). The sandbox binds the real
@@ -2961,6 +2983,16 @@ fn realize_drv(
     // half); mirror the real builder's record onto it. The authority `manifest` is left
     // untouched, so the reuse digest below stays keyed on the real, vouched builder.
     let staging_manifest = manifest_with_builder_alias(&manifest, &real_builder_cb, &stable_builder_id);
+    // The durable audit beside closure.txt: what may stage, under which hash + provenance
+    // class (the origin column). Written from the STAGING manifest so the two files DESCRIBE
+    // each other — the re-keyed builder entry's stable-id path in closure.txt appears here
+    // too, as the mirror of the real builder's record (same hash + origin), not only the real
+    // path. The un-mirrored authority `manifest` still feeds the reuse digest (manifest_digest).
+    let mut lines = String::new();
+    for (p, si) in &staging_manifest {
+        lines.push_str(&format!("{p} {} {}\n", si.nar_hash, si.origin.as_str()));
+    }
+    std::fs::write(scratch.join("provenance.manifest"), lines).map_err(|e| e.to_string())?;
     let regs = build_and_register(drv_path, &closure, scratch, &staging_manifest)?;
     // The builder identity path is a VIRTUAL mount alias: the real builder bytes are
     // registered under the builder's OWN content-addressed path, never under this token
@@ -3741,12 +3773,12 @@ fn build_plan(
             .next()
             .ok_or_else(|| format!("step `{name}': output is not a store path"))?;
         // Copy the step's output into the shared td-store so a downstream step can
-        // stage it (a real dir — sandbox::build bind-mounts it, so no symlink).
+        // stage it (a real dir — sandbox::build bind-mounts it, so no symlink). An
+        // already-present dest is re-hashed (ABI-token paths are not content addresses,
+        // so same path ≠ same bytes without an ABI bump) and fails closed on a mismatch.
         let physical = step_scratch.join("newstore").join(base);
         let dest = tdstore.join(base);
-        if !dest.exists() {
-            copy_canonical(&physical, &dest)?;
-        }
+        commit_tree_checked(&physical, &dest, &out.nar_hash)?;
         built.insert(name.to_string(), out.store_path.clone());
         td_dbs.push((
             step_scratch.join("td.db").to_string_lossy().into_owned(),
@@ -10145,6 +10177,40 @@ daemon build START (2/2 active)
         assert_eq!(mode & 0o111, 0o111, "exec bit preserved on dst");
         // The symlink is recreated as a symlink, not followed.
         assert!(std::fs::symlink_metadata(dst.join("link")).unwrap().file_type().is_symlink());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // commit_tree_checked guards the ABI-token invariant: output paths are keyed on the ABI
+    // token, not content, so an already-present dest is re-hashed and a MISMATCH (an output
+    // changed without a BUILDER_ABI bump) fails closed with an ABI-bump demand instead of
+    // silently keeping stale bytes under a fresh store record.
+    #[test]
+    fn commit_tree_checked_rejects_mismatched_existing_dest() {
+        let base = std::env::temp_dir().join(format!("td-ctc-{}", std::process::id()));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("out"), b"built-bytes").unwrap();
+        let want = nar_hash_path(&src).unwrap();
+
+        // Absent dest -> a plain copy, NAR-identical to the source.
+        commit_tree_checked(&src, &dst, &want).unwrap();
+        assert_eq!(nar_hash_path(&dst).unwrap(), want, "absent dest copied");
+
+        // Present dest with the SAME bytes -> idempotent skip, no error, no change.
+        commit_tree_checked(&src, &dst, &want).unwrap();
+        assert_eq!(nar_hash_path(&dst).unwrap(), want, "matching dest unchanged");
+
+        // Present dest with DIFFERENT bytes at the SAME (ABI-token) path -> fail closed with
+        // an ABI-bump demand, and the stale tree is left intact (never silently replaced).
+        let stale = base.join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("out"), b"stale-different-bytes").unwrap();
+        let err = commit_tree_checked(&src, &stale, &want).unwrap_err();
+        assert!(err.contains("BUILDER_ABI"), "mismatch must demand an ABI bump: {err}");
+        assert_ne!(nar_hash_path(&stale).unwrap(), want, "stale dest left intact");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
