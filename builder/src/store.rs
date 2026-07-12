@@ -253,6 +253,50 @@ pub fn input_addressed_path(key_hex: &str, name: &str) -> String {
     output_path_from_modulo(key_hex, name, "out")
 }
 
+/// The td-builder ABI revision — the EXPLICIT identity that keys every recipe drv, in
+/// place of the builder binary's content hash. Before this, a recipe's drv named the
+/// builder by its content-addressed store path, so ANY builder-source change rebuilt
+/// the whole world; now the drv names the stable identity path below, and the world
+/// rebuilds only when THIS is bumped.
+///
+/// BUMP it (and only it) when a td-builder change alters BUILD OUTPUTS — a new/changed
+/// phase runner, a build step whose bytes reach an output, a sandbox change a build can
+/// observe. A change that CANNOT affect any output (a refactor, a log-message tweak, an
+/// unrelated subcommand) leaves it, so the world is not rebuilt. That is the soundness
+/// burden of dropping the content hash: forgetting to bump on an output-affecting change
+/// yields stale reuse. The `tree_fingerprint` builder-source drift record and the daily
+/// rebuild-the-world are the backstops.
+pub const BUILDER_ABI: u64 = 1;
+
+/// The ABI token string, `td-builder-abi-<rev>`. `TD_BUILDER_ABI` (set + non-empty)
+/// OVERRIDES the compiled revision — an escape hatch to force a distinct builder
+/// identity (bisecting, a local builder variant) with no source edit. The env value is
+/// the revision, formatted into the same token so the shape stays uniform.
+pub fn builder_abi_token() -> String {
+    builder_abi_token_for(std::env::var("TD_BUILDER_ABI").ok().as_deref())
+}
+
+/// The pure token derivation: the override string when it is `Some` + non-empty, else
+/// the compiled `BUILDER_ABI`. Split out from the env read so it is directly testable.
+pub fn builder_abi_token_for(override_rev: Option<&str>) -> String {
+    match override_rev {
+        Some(v) if !v.is_empty() => format!("td-builder-abi-{v}"),
+        _ => format!("td-builder-abi-{BUILDER_ABI}"),
+    }
+}
+
+/// The STABLE builder identity store path — input-addressed on the ABI token, so its
+/// digest is a pure function of the ABI (content-INDEPENDENT): identical across every
+/// builder-binary rebuild, and different iff the ABI (or `TD_BUILDER_ABI`) changes. A
+/// recipe drv names THIS as its `builder` and builder input-src, so the recipe's output
+/// path is keyed on the ABI, not the builder ELF. realize binds the REAL builder bytes
+/// at this path (the on-disk half of its closure entry), so the sandbox execs the real
+/// builder here.
+pub fn builder_identity_path() -> String {
+    let key = sha256::to_base16(&sha256_bytes(builder_abi_token().as_bytes()));
+    input_addressed_path(&key, "td-builder")
+}
+
 /// The parsed `td-toolchain.lock` — the toolchain's declared INPUT set, the source of
 /// truth for its stable input-addressed key. The lock is line-based (`field value`,
 /// like the recipe source pins): one `name`, one `recipe-rev`, one or more `component`
@@ -596,6 +640,42 @@ mod tests {
         )
         .unwrap();
         assert_ne!(l1.key(), l4.key(), "bumping recipe-rev must change the key");
+    }
+
+    #[test]
+    fn builder_abi_token_prefers_a_nonempty_override() {
+        // The pure derivation (no env): the override string wins when Some + non-empty,
+        // else the compiled BUILDER_ABI. An empty override falls through to the default.
+        assert_eq!(builder_abi_token_for(None), format!("td-builder-abi-{BUILDER_ABI}"));
+        assert_eq!(builder_abi_token_for(Some("")), format!("td-builder-abi-{BUILDER_ABI}"));
+        assert_eq!(builder_abi_token_for(Some("7")), "td-builder-abi-7");
+        assert_eq!(builder_abi_token_for(Some("dev-x")), "td-builder-abi-dev-x");
+    }
+
+    #[test]
+    fn builder_identity_path_is_a_stable_store_path_keyed_on_the_abi() {
+        // A well-formed store path under the active store dir, named `td-builder`, whose
+        // digest is a pure function of the ABI token — identical across calls (no builder
+        // content in it), and DIFFERENT for a different token. This is what decouples a
+        // recipe's identity from the builder ELF.
+        let p = builder_identity_path();
+        assert!(p.starts_with(&format!("{}/", store_dir())), "under the store dir: {p}");
+        assert_eq!(name_from_store_path(&p).as_deref(), Some("td-builder"), "named td-builder: {p}");
+        assert!(hash_from_store_path(&p).is_some(), "well-formed store digest: {p}");
+        // Determinism: recomputing the same token gives the same path (no env set here, so
+        // the token is the compiled default both times).
+        assert_eq!(p, builder_identity_path(), "identity path is deterministic");
+        // Token-sensitivity, checked WITHOUT env (directly on the derivation): a different
+        // ABI token yields a different identity path.
+        let path_for = |tok: &str| {
+            input_addressed_path(&sha256::to_base16(&sha256_bytes(tok.as_bytes())), "td-builder")
+        };
+        assert_eq!(p, path_for(&format!("td-builder-abi-{BUILDER_ABI}")), "default == abi token path");
+        assert_ne!(
+            path_for("td-builder-abi-1"),
+            path_for("td-builder-abi-2"),
+            "bumping the ABI must move the identity path"
+        );
     }
 
     #[test]
