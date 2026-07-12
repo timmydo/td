@@ -37,7 +37,19 @@ pub(crate) fn parse(text: &str) -> Result<Vec<(&str, &str)>, String> {
         }
         let mut it = line.split_whitespace();
         match (it.next(), it.next(), it.next()) {
-            (Some(key), Some(base), None) if !base.contains('/') => rows.push((key, base)),
+            (Some(key), Some(base), None) if !base.contains('/') => {
+                // A duplicate key would let `expected()` silently vouch by the FIRST row
+                // while a second, disagreeing row sat unused — an ambiguous trust anchor.
+                // The table pins each seed exactly once; a repeat is a hard error (re #469).
+                if rows.iter().any(|(k, _)| *k == key) {
+                    return Err(format!(
+                        "seed/seed-digests.txt line {}: duplicate key `{key}' — the \
+                         trust-anchor table must pin each seed exactly once (re #469)",
+                        n + 1
+                    ));
+                }
+                rows.push((key, base));
+            }
             _ => {
                 return Err(format!(
                     "seed/seed-digests.txt line {}: malformed row `{line}' (want `key basename')",
@@ -93,6 +105,7 @@ mod tests {
         assert!(parse("k1\n").is_err(), "missing basename must red");
         assert!(parse("k1 a b\n").is_err(), "extra field must red");
         assert!(parse("k1 /td/store/aaa-x\n").is_err(), "a path is not a basename");
+        assert!(parse("k1 aaa-x\nk1 bbb-y\n").is_err(), "a duplicate key must red");
     }
 
     #[test]
