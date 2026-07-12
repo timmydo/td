@@ -128,7 +128,9 @@ pub fn recipe() -> Recipe {
     ));
 
     // dev-tty.patch (shell.c): there is no /dev/tty at this bootstrap stage, and
-    // bash is not interactive here — drop the check (also its extern reference).
+    // bash is not interactive here — drop the sole check_dev_tty() call. The
+    // function is never defined at this stage, so removing the one call is enough
+    // (a leftover extern decl that is never referenced links clean).
     steps.push(Step::substitute_text(
         "{src}/shell.c",
         vec![TextEdit::new("  check_dev_tty ();", "  ;", 1)],
