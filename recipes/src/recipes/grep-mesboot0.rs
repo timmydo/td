@@ -41,12 +41,17 @@ use crate::types::{Recipe, Step};
 const CONFIG_H: &str = include_str!("grep-mesboot0-config.h");
 const MAKEFILE: &str = include_str!("grep-mesboot0.mk");
 
-// Smoke input: four lines the matcher must discriminate. `ap` matches
-// apple/apricot but NOT banana/cherry, so grep and grep -v of the same pattern
-// both select a non-empty set (both exit 0). That pair is the discrimination
-// proof: a miscompiled matcher that matched everything would empty the -v run
-// (exit 1 -> red), and one that matched nothing would empty the plain run.
-const SMOKE_TXT: &str = "apple\nbanana\ncherry\napricot\n";
+// Smoke input the matcher must discriminate. `ap` matches apple/apricot but NOT
+// banana/cherry/a.*b, so grep and grep -v of the same pattern both select a
+// non-empty set (both exit 0). That pair is the discrimination proof: a
+// miscompiled matcher that matched everything would empty the -v run (exit 1 ->
+// red), and one that matched nothing would empty the plain run. The literal
+// `a.*b` line makes the -F (fixed-string) check mode-sensitive: `.*` is a
+// regex-metacharacter string that matches EVERY line under BRE but only the one
+// literal line under -F, so -F/-F -v of `.*` discriminate exactly when the kwset
+// fixed matcher is really selected (a silent -F -> BRE fallback would match all,
+// emptying the -v run -> red).
+const SMOKE_TXT: &str = "apple\nbanana\ncherry\napricot\na.*b\n";
 
 pub fn recipe() -> Recipe {
     let mut steps = unpack_into("grep-mesboot0-source", "{src}");
@@ -115,9 +120,13 @@ pub fn recipe() -> Recipe {
     // check is exit-code based (a Run reds the rung on any non-zero exit): a
     // matched pattern and its `-v` inversion both exit 0 only if grep selects a
     // proper non-empty subset for that engine.
-    //   * BRE `ap`: matches apple/apricot, inverts to banana/cherry.
-    //   * ERE `a(pp|pr)` (-E): exercises the dfa/regex ERE engine both ways.
-    //   * fixed `apple` (-F): exercises the kwset literal matcher.
+    //   * BRE `ap`: matches apple/apricot, inverts to banana/cherry/a.*b.
+    //   * ERE `a(pp|pr)` (-E): mode-sensitive on its own -- BRE reads `(`/`|` as
+    //     literals and matches nothing (exit 1 -> red), so a passing -E run
+    //     proves the ERE dfa/regex engine is active; -v confirms discrimination.
+    //   * fixed `.*` (-F): mode-sensitive via the literal a.*b line -- correct
+    //     fixed matching selects that one line and inverts to the other four,
+    //     whereas a -F -> BRE fallback matches all and empties the -v run (red).
     //   * --version prints the banner (proves config.h's VERSION reached grep.c).
     //   * egrep/fgrep run through the symlinks (BRE-default, as installed).
     steps.push(Step::WriteFile {
@@ -135,13 +144,10 @@ pub fn recipe() -> Recipe {
         "{src}",
         &["{out}/bin/grep", "-E", "-v", "a(pp|pr)", "fruit.txt"],
     ));
+    steps.push(Step::run("{src}", &["{out}/bin/grep", "-F", ".*", "fruit.txt"]));
     steps.push(Step::run(
         "{src}",
-        &["{out}/bin/grep", "-F", "apple", "fruit.txt"],
-    ));
-    steps.push(Step::run(
-        "{src}",
-        &["{out}/bin/grep", "-F", "-v", "apple", "fruit.txt"],
+        &["{out}/bin/grep", "-F", "-v", ".*", "fruit.txt"],
     ));
     steps.push(Step::run("{src}", &["{out}/bin/grep", "--version"]));
     steps.push(Step::run("{src}", &["{out}/bin/egrep", "ap", "fruit.txt"]));
