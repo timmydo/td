@@ -23,7 +23,7 @@
 #   * The per-object sources compile through make's built-in %.o:%.c rule (as in
 #     sed-mesboot0.mk / oyacc.mk), which passes CFLAGS.
 #
-# The engine expands the {in:...}/{out} placeholders when it writes this file.
+# The engine expands the store-path placeholders below when it writes this file.
 
 CC      = {in:tcc}/bin/tcc
 LD      = {in:tcc}/bin/tcc
@@ -101,6 +101,11 @@ LIB_OBJECTS = $(addprefix $(LIB_DIR)/, $(addsuffix .o, $(LIB_SRC)))
 $(LIB_DIR)/libfettish.a: $(LIB_OBJECTS)
 	$(AR) cr $@ $^
 
+# live-bootstrap's static pattern rule verbatim (mk/main.mk): link each
+# single-obj binary `src/X` from `src/X.o` + libfettish.a. td's Make 3.80 (a
+# minimal mescc build) drives the `targets: tpattern: pprereq` static-pattern
+# syntax correctly. The multi-obj binaries below (cp/install/ls/md5sum/mv/rm/
+# sha1sum) have explicit rules that override this for their targets.
 $(BINARIES) : % : %.o $(LIB_DIR)/libfettish.a
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 

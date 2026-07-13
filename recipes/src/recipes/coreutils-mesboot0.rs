@@ -140,10 +140,16 @@ pub fn recipe() -> Recipe {
         ));
     }
 
-    // Build all 61 binaries (default `all` target). LANG/LC_ALL neutralized for
-    // determinism; make finds tcc via the baked absolute CC path, so no PATH.
+    // Build all 61 binaries (default `all` target). `-f Makefile` is load-bearing:
+    // coreutils-5.0 ships a maintainer GNUmakefile, and GNU make reads GNUmakefile
+    // in preference to Makefile — that GNUmakefile `include`s absent Makefile.cfg/
+    // Makefile.maint, and remaking those missing includes is what drove make to the
+    // (nonexistent) $(SHELL). `-f Makefile` pins our baked Makefile and ignores the
+    // GNUmakefile, exactly as live-bootstrap's pass1.kaem does (`make -f Makefile`).
+    // LANG/LC_ALL neutralized for determinism; make finds tcc via the baked
+    // absolute CC path, so no PATH.
     steps.push(
-        Step::run("{src}", &["{in:make-mesboot0}/bin/make"])
+        Step::run("{src}", &["{in:make-mesboot0}/bin/make", "-f", "Makefile"])
             .env("LANG", "")
             .env("LC_ALL", ""),
     );
@@ -158,7 +164,13 @@ pub fn recipe() -> Recipe {
     steps.push(
         Step::run(
             "{src}",
-            &["{in:make-mesboot0}/bin/make", "install", "PREFIX={out}"],
+            &[
+                "{in:make-mesboot0}/bin/make",
+                "-f",
+                "Makefile",
+                "install",
+                "PREFIX={out}",
+            ],
         )
         .env("LANG", "")
         .env("LC_ALL", ""),
