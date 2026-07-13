@@ -12,9 +12,12 @@
 //! [DURABLE behavioral] with /var/guix bind-mounted EMPTY in a private mount ns, a cold
 //! `td-builder stage0-place` places a stage0 that RUNS its sentinel.
 //! [DURABLE no-drift] the cold placement is IDENTICAL to the warm guix-host placement:
-//! same canonical path, same builder.db closure — and the closure is NON-VACUOUS (the
-//! glibc + gcc-lib refs the stage0 links were found WITHOUT the guix db, from the
-//! store-dir readdir), so the parity is not two empty sets agreeing.
+//! same canonical path, same builder.db closure — and the closure is NON-VACUOUS (a
+//! glibc ref, embedded via the static builder's crt objects, was found WITHOUT the guix
+//! db, from the store-dir readdir), so the parity is not two empty sets agreeing. It
+//! carries NO gcc-lib ref: the stage0 builder is STATICALLY linked (builder/src/stage0.rs),
+//! so it no longer drags the gcc runtime lib dir — and the +x `libasan.la` libtool archive
+//! beside it (#468) — into the sandbox (re #469).
 //! [DURABLE guix-less arm] store-add-builder with an ABSENT seed dir (a truly guix-less
 //! host: no /gnu/store at all) still places, recording a self-only closure — the arm the
 //! rustup/system-cc cold start takes (its stage0 embeds no store paths).
@@ -68,8 +71,8 @@ echo "  [DURABLE behavioral] the cold-placed stage0 runs its sentinel ($cbc)"; \
 	  comm -3 "$scratch/cl.warm" "$scratch/cl.cold" >&2; exit 1; \
 	fi; \
 	"$tbw" text contains '-glibc-' "$scratch/cl.cold" || { echo "FAIL: no glibc ref in the cold closure — the seed-store readdir scan found nothing (vacuous parity)" >&2; exit 1; }; \
-	"$tbw" text contains-gcc-lib "$scratch/cl.cold" || { echo "FAIL: no gcc-lib ref in the cold closure — the seed-store readdir scan missed the link deps" >&2; exit 1; }; \
-echo "  [DURABLE no-drift] cold (guix state hidden) and warm closures are IDENTICAL and non-vacuous (glibc + gcc-lib found from the store-dir readdir alone)"; \
+	if "$tbw" text contains-gcc-lib "$scratch/cl.cold"; then echo "FAIL: a gcc-lib ref is in the cold closure — the stage0 builder is not statically linked; its gcc runtime lib dir (with the +x libasan.la libtool archive, #468) would leak into the sandbox (re #469)" >&2; exit 1; fi; \
+echo "  [DURABLE no-drift] cold (guix state hidden) and warm closures are IDENTICAL, non-vacuous (glibc found via the static builder's crt objects from the store-dir readdir alone), and carry NO gcc-lib ref — the static link keeps the gcc runtime lib dir out of the sandbox (re #469)"; \
 echo ">> guix-less arm: an ABSENT seed dir (no /gnu/store at all) must still place, with a self-only closure"; \
 mkdir -p "$scratch/probe/bin"; printf 'no store refs in this tree\n' > "$scratch/probe/bin/tool"; \
 pa=`"$tbw" store-add-builder probe-0.1.0 "$scratch/probe" "$scratch/pstore-a" "$scratch/pa.db" "$scratch/ABSENT"` \
@@ -96,7 +99,7 @@ pb=`"$tbw" store-add-builder probe2-0.1.0 "$scratch/probe2" "$scratch/pstore-b" 
 	  || { echo "FAIL: the embedded ref $g was NOT found by the /gnu/store readdir scan — the candidate source is broken" >&2; exit 1; }; \
 echo "  [DURABLE self-discrimination] same probe bytes: absent dir → self-only; /gnu/store → the embedded glibc ref recorded"; \
 rm -rf "$scratch"; \
-echo "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted empty, a cold td-builder stage0-place run placed a stage0 that runs, at the SAME canonical path with the SAME (non-vacuous: glibc + gcc-lib) builder.db closure as the warm guix-host placement — the reference scan's candidates come from a readdir of the seed store dir, not guix's private db. An absent seed dir (a truly guix-less host) still places with a self-only closure; a non-directory seed dir errors loudly (no silent refless placement); and the same probe tree records an embedded store ref ONLY when the dir is passed — the readdir candidate source is load-bearing. The guix-less cold start (#313) is unblocked."
+echo "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted empty, a cold td-builder stage0-place run placed a stage0 that runs, at the SAME canonical path with the SAME (non-vacuous: a glibc ref via the static builder's crt objects; NO gcc-lib ref — the static link keeps the gcc runtime lib dir out, re #469) builder.db closure as the warm guix-host placement — the reference scan's candidates come from a readdir of the seed store dir, not guix's private db. An absent seed dir (a truly guix-less host) still places with a self-only closure; a non-directory seed dir errors loudly (no silent refless placement); and the same probe tree records an embedded store ref ONLY when the dir is passed — the readdir candidate source is load-bearing. The guix-less cold start (#313) is unblocked."
 "##,
     }
 }

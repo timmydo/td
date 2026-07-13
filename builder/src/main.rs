@@ -2926,14 +2926,6 @@ fn realize_drv(
             Ok::<_, String>((ov, store_db_read::Db::open(data)?))
         })
         .collect::<Result<_, _>>()?;
-    // The td-owned builder likewise has its own DB (store-add-builder wrote the builder
-    // + its DIRECT refs there); the seed store has no row for the builder itself.
-    let builder_db = match builder_override {
-        Some(ov) => Some(store_db_read::Db::open(
-            std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?,
-        )?),
-        None => None,
-    };
     let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // The closure slice reachable FROM THE DRV'S BUILDER (the builder tree plus
     // its refs' transitive closures) — the ONLY slice `BlessedSeedClosure` rows
@@ -2964,33 +2956,48 @@ fn realize_drv(
             }
             continue;
         }
-        // The td-placed builder gets its closure from the builder DB; every other
-        // root from the seed content-scan (∪ any td-owned extra dbs).
-        match (builder_override, &builder_db) {
-            // The td-placed builder: the builder DB gives {builder} ∪ its DIRECT runtime
-            // refs (glibc/gcc-lib). The builder tree binds from on_disk (canonical\ton-disk).
-            // Each direct ref is then expanded by DYNAMIC LINKAGE (PT_INTERP + DT_RUNPATH),
-            // NOT a content scan: content-scanning glibc drags bash-static into the sandbox
-            // (its libc.so.6 bakes the bash path into the `_PATH_BSHELL` string constant), a
-            // runnable host shell the loader never links (re #469). Linkage resolution stages
-            // exactly the loader's search set — the pinned glibc/gcc-lib — and nothing a
-            // glibc helper SCRIPT (bin/ldd) or HEADER (paths.h) merely names.
-            (Some(ov), Some(bdb)) if r == &ov.canonical => {
-                let mut lib_roots: Vec<String> = Vec::new();
-                for p in bdb.closure(r)? {
-                    if p == ov.canonical {
-                        builder_reach.insert(p.clone());
-                        closure.insert(format!("{p}\t{}", ov.on_disk));
-                    } else {
-                        lib_roots.push(p);
-                    }
-                }
-                for canon in resolve_link_closure(
-                    &lib_roots,
+        // The td-placed builder gets its STAGED closure from its own DYNAMIC LINKAGE;
+        // every other root from the seed content-scan (∪ any td-owned extra dbs).
+        match builder_override {
+            // The td-placed builder: the tree binds from on_disk (canonical\ton-disk), and
+            // its runtime deps are resolved by DYNAMIC LINKAGE (PT_INTERP + DT_RUNPATH) from
+            // the builder BINARY itself — NOT from a content scan of it. A content scan drags
+            // bash-static into the sandbox (glibc's libc.so.6 bakes the bash path into its
+            // `_PATH_BSHELL` string constant — a runnable host shell the loader never links),
+            // and a STATIC builder inlines that very .rodata, so its own content-scan direct
+            // refs would name glibc + bash-static even though it links NOTHING (re #469).
+            // Linkage stages exactly the loader's search set — empty for a static builder,
+            // the pinned glibc/gcc-lib for a dynamic one — and nothing a glibc helper SCRIPT
+            // (bin/ldd) or HEADER (paths.h) merely names.
+            Some(ov) if r == &ov.canonical => {
+                // Bind the builder tree itself from on_disk.
+                builder_reach.insert(ov.canonical.clone());
+                closure.insert(format!("{}\t{}", ov.canonical, ov.on_disk));
+                // Stage its runtime deps by LINKAGE from the builder binary ITSELF, not
+                // from the builder db's content-scanned DIRECT refs. A STATIC stage0
+                // builder (builder/src/stage0.rs) has NO link deps — but it inlines
+                // glibc's `.rodata`, i.e. glibc's own store path AND glibc's
+                // `_PATH_BSHELL` bash-static path, which a CONTENT scan records as direct
+                // refs the loader never links. Walking the builder tree's PT_INTERP +
+                // DT_RUNPATH stages EXACTLY the loader search set: empty for a fully
+                // static builder (no host bytes leak, no unvouched bash-static), the
+                // pinned glibc/gcc-lib for a dynamic one (re #469). The builder's own
+                // store db (ov.db, content-scanned direct refs — which DO name bash-static
+                // for a static builder) is still read+authenticated by
+                // assemble_input_manifest to record ControlPlaneBuilder provenance; it no
+                // longer sources what gets STAGED, so those extra names never reach a sandbox.
+                let mut od = on_disk.clone();
+                od.insert(ov.canonical.clone(), ov.on_disk.clone());
+                let mut linkage = resolve_link_closure(
+                    std::slice::from_ref(&ov.canonical),
                     seed_store_dirs,
                     seed_canonical_prefix,
-                    &on_disk,
-                )? {
+                    &od,
+                )?;
+                // resolve_link_closure SEEDS its root into the output; the builder tree
+                // is already bound (canonical\ton-disk) above, so drop the bare entry.
+                linkage.remove(&ov.canonical);
+                for canon in linkage {
                     builder_reach.insert(canon.clone());
                     closure.insert(canon);
                 }
@@ -10696,13 +10703,17 @@ daemon build START (2/2 active)
         }
 
         // Compute the builder closure EXACTLY as realize_drv's builder arm does: the builder
-        // tree binds `canonical\ton-disk` and tracks into builder_reach; its DIRECT runtime refs
-        // (glibc, gcc-lib) are then expanded by DYNAMIC LINKAGE into BOTH the staged closure and
-        // builder_reach.
-        let direct_refs = vec![sp(glibc), sp(gcclib)];
+        // tree binds `canonical\ton-disk` and tracks into builder_reach; its runtime deps are
+        // resolved by DYNAMIC LINKAGE from the BUILDER TREE ITSELF (the arm's root), then the
+        // bare self-entry is dropped (the tree is bound tabbed). glibc + gcc-lib flow into BOTH
+        // the staged closure and builder_reach; bash (glibc merely names it) does not.
         let mut closure: Vec<String> = vec![format!("{}\t{}", sp(bld), od(bld))];
         let mut builder_reach: std::collections::BTreeSet<String> = std::iter::once(sp(bld)).collect();
-        for canon in resolve_link_closure(&direct_refs, std::slice::from_ref(&seed_dir), cp, &on_disk).unwrap() {
+        let mut linkage =
+            resolve_link_closure(std::slice::from_ref(&sp(bld)), std::slice::from_ref(&seed_dir), cp, &on_disk)
+                .unwrap();
+        linkage.remove(&sp(bld));
+        for canon in linkage {
             builder_reach.insert(canon.clone());
             closure.push(canon);
         }
@@ -10750,6 +10761,75 @@ daemon build START (2/2 active)
         let err = sandbox::verify_staged_item(&manifest, &sp(bash), &od(bash))
             .expect_err("the sandbox refuses to stage an item no td-owned db vouches for");
         assert!(err.to_string().contains("no td-owned store-db record"), "bind-boundary rejection: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A STATICALLY-linked stage0 builder (builder/src/stage0.rs) stages NOTHING host — even
+    // though it INLINES glibc's `.rodata` and so its own bytes name glibc's store path AND
+    // glibc's `_PATH_BSHELL` bash-static path (re #469). The realize builder arm roots its
+    // DYNAMIC-LINKAGE walk on the builder binary itself: a static builder links nothing, so
+    // its staged closure is just the builder tree. This is the completion of the static-link
+    // fix — the reason the content-scanned bash-static/glibc no longer reach the sandbox.
+    #[test]
+    fn static_builder_stages_nothing_even_when_it_embeds_glibc_host_paths() {
+        let dir = std::env::temp_dir().join(format!("sbn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let seed = dir.join("seed");
+        let cp = "/gnu/store";
+        let glibc = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.41";
+        let bash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bash-static-5.2.37";
+        let bld = "dddddddddddddddddddddddddddddddd-td-builder-0.1.0";
+        std::fs::create_dir_all(seed.join(glibc).join("lib")).unwrap();
+        std::fs::create_dir_all(seed.join(bash).join("bin")).unwrap();
+        std::fs::create_dir_all(seed.join(bld).join("bin")).unwrap();
+        std::fs::write(seed.join(bash).join("bin/bash"), b"a runnable host shell").unwrap();
+        std::fs::write(seed.join(glibc).join("lib/libc.a"), b"!<arch>\n").unwrap();
+        // The STATIC builder: NO interp, NO run-path (links nothing) — but its bytes EMBED
+        // glibc's own store path AND glibc's bash-static path (the inlined `.rodata`).
+        let glibc_sp = format!("/gnu/store/{glibc}");
+        let bash_bin = format!("/gnu/store/{bash}/bin/bash");
+        std::fs::write(
+            seed.join(bld).join("bin/td-builder"),
+            synth_link_elf(None, None, &[&glibc_sp, &bash_bin]),
+        )
+        .unwrap();
+
+        let seed_dir = seed.to_string_lossy().into_owned();
+        let od = |p: &str| seed.join(p).to_string_lossy().into_owned();
+        let sp = |p: &str| format!("/gnu/store/{p}");
+        let mut on_disk = std::collections::HashMap::new();
+        for p in [glibc, bash, bld] {
+            on_disk.insert(sp(p), od(p));
+        }
+
+        // The arm: root the LINKAGE walk on the builder tree, drop the bare self.
+        let mut linkage =
+            resolve_link_closure(std::slice::from_ref(&sp(bld)), std::slice::from_ref(&seed_dir), cp, &on_disk)
+                .unwrap();
+        linkage.remove(&sp(bld));
+        assert!(
+            linkage.is_empty(),
+            "a static builder links NOTHING, so nothing host is staged — not the glibc path nor \
+             the bash-static path it merely embeds: {linkage:?}"
+        );
+
+        // Load-bearing: a CONTENT scan of the SAME static builder DOES pull both in — which is
+        // exactly what used to fail provenance (bash-static) and leak glibc.
+        let candidates = vec![sp(glibc), sp(bash), sp(bld)];
+        let mut scanner = scan::Scanner::new(&candidates).unwrap();
+        let content = scan_closure_hybrid(
+            &mut scanner,
+            &on_disk,
+            &std::collections::HashMap::new(),
+            std::slice::from_ref(&sp(bld)),
+        )
+        .unwrap();
+        assert!(
+            content.iter().any(|e| e.contains(bash)) && content.iter().any(|e| e.contains(glibc)),
+            "a content scan SHOULD surface the embedded glibc + bash-static paths (the pre-fix \
+             leak) — else this proves nothing: {content:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
