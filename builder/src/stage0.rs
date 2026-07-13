@@ -325,16 +325,22 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
         if let Some(cc) = find_in_path(ccpath, "cc").or_else(|| find_in_path(ccpath, "gcc")) {
             if let Ok(out) = Command::new(&cc)
                 .arg("-print-file-name=libc.a")
-                // Probe under a CLEARED env — exactly the env the real static link
-                // runs in (bootstrap_stage0's `.env_clear()`). Otherwise ambient
-                // LIBRARY_PATH / GCC_EXEC_PREFIX / COMPILER_PATH could steer a
+                // Probe under the SAME env the real static link runs in
+                // (bootstrap_stage0: `.env_clear()` + `PATH=bootpath`). Clearing the
+                // ambient library-search vars (LIBRARY_PATH / GCC_EXEC_PREFIX /
+                // COMPILER_PATH) is load-bearing: otherwise they could steer a
                 // NON-lock cc to print some OTHER glibc's libc.a (e.g. the lock's
                 // guix glibc:static) that the env_cleared build would never link —
                 // silently reintroducing the mismatched-glibc pairing the leg-3
-                // matched-pair guard exists to close (Codex P2). `-print-file-name`
-                // is a self-contained spec query (no PATH/HOME needed); a wrapper cc
-                // that DOES need PATH just errors here and falls through to leg 3.
+                // matched-pair guard exists to close (Codex P2). But PATH is RESTORED
+                // to the cc's own bin dir (ccpath): a WRAPPER cc that execs a sibling
+                // `gcc` by name must resolve it exactly as the real link does (whose
+                // PATH=bootpath ⊇ ccpath), or a valid TD_CC_HOME wrapper toolchain
+                // would be wrongly rejected here (a non-lock cc has no leg-3 fallback).
+                // PATH does not feed gcc's -print-file-name library search, so keeping
+                // it is safe w.r.t. P2.
                 .env_clear()
+                .env("PATH", ccpath)
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -981,6 +987,49 @@ mod tests {
         assert_eq!(
             provision_glibc_static(&base_env(&lock_gcc)).unwrap(),
             format!("{}/lib", pin.display())
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn provision_glibc_static_probes_a_wrapper_cc_via_its_own_bin_dir() {
+        // A TD_CC_HOME whose bin/cc is a WRAPPER that execs a sibling `gcc` by BARE
+        // NAME (relying on PATH) — the real static link finds gcc via PATH=bootpath
+        // (⊇ the cc bin dir), so the probe must resolve it the same way. Regression
+        // guard: the P2 env_clear fix must RESTORE PATH=ccpath, not clear it away —
+        // else a valid wrapper toolchain is wrongly rejected with "no static glibc"
+        // (a non-lock cc has no leg-3 fallback).
+        let d = scratch("glibc-static-wrapper");
+        let ar = |p: &Path| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"!<arch>\n").unwrap();
+        };
+        // The static libc the wrapper's sibling gcc reports.
+        let cc_libdir = d.join("ccglibc/lib");
+        ar(&cc_libdir.join("libc.a"));
+        let bin = d.join("cc/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // bin/cc: a wrapper that forwards to `gcc` found on PATH (its own sibling).
+        let ccbin = bin.join("cc");
+        std::fs::write(&ccbin, "#!/bin/sh\nexec gcc \"$@\"\n").unwrap();
+        std::fs::set_permissions(&ccbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // bin/gcc: the sibling that answers with the ABSOLUTE libc.a path.
+        let gccbin = bin.join("gcc");
+        std::fs::write(
+            &gccbin,
+            format!("#!/bin/sh\necho {}\n", cc_libdir.join("libc.a").display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gccbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut env = base_env(&d.join("absent-lock"));
+        env.cc_home = Some(d.join("cc").to_string_lossy().into_owned());
+        // The wrapper resolves its sibling gcc via the restored PATH=ccpath, so leg 2
+        // uses the reported libc.a. (Without the PATH restore this unwrap would panic
+        // on the erroneous "no static glibc" rejection.)
+        assert_eq!(
+            provision_glibc_static(&env).unwrap(),
+            cc_libdir.to_string_lossy().into_owned()
         );
         let _ = std::fs::remove_dir_all(&d);
     }
