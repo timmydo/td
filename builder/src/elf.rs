@@ -298,7 +298,7 @@ fn rpath_slots(b: &[u8]) -> Result<Option<RpathSlots>, String> {
 /// The .dynstr file offset plus the `.dynstr` string offset of every DT_NEEDED entry (each
 /// names a shared object the loader would pull in at run time), or `None` if the ELF has no
 /// PT_DYNAMIC or no DT_NEEDED at all. Mirrors `rpath_slots`: a fully static binary — the
-/// td-sh musl-seed contract — has neither a dynamic section nor any needed library.
+/// static-bootstrap contract — has neither a dynamic section nor any needed library.
 struct NeededSlots {
     strtab_off: usize,  // file offset of .dynstr (DT_STRTAB vaddr mapped through PT_LOAD)
     offsets: Vec<u64>,  // string offset into .dynstr of each DT_NEEDED name
@@ -619,7 +619,7 @@ pub fn runtime_link_search(path: &Path) -> Result<(Option<String>, Vec<String>),
 /// Read the DT_NEEDED shared-object names of a dynamic ELF — the libraries the loader would
 /// pull in at run time. Returns an EMPTY vector for a fully static binary (no PT_DYNAMIC) or a
 /// dynamic ELF that declares no needed libraries. This is td's OWN DT_NEEDED query so the
-/// td-sh musl-seed verification asserts "this binary links nothing" without shelling out to a
+/// static-binary verification asserts "this binary links nothing" without shelling out to a
 /// host `readelf` (which would itself be host-executable ingress, re #469).
 pub fn read_needed(path: &Path) -> Result<Vec<String>, String> {
     let b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -640,10 +640,9 @@ pub fn read_needed(path: &Path) -> Result<Vec<String>, String> {
 /// Assert an ELF is FULLY STATIC — no program interpreter (`PT_INTERP`), no `DT_NEEDED`
 /// shared libraries, and no `DT_RPATH`/`DT_RUNPATH` run-path. This is a runtime-provenance
 /// contract (re #469): a *dynamically* linked binary drags a host loader + glibc back in at
-/// run time — exactly the host-runtime ingress #469 closes. Two consumers rely on it:
-///   * the pre-libc bootstrap rungs — tcc/make/yacc are linked `-static`, and the
-///     `Step::AssertStatic` step fails the rung if one regresses to a host loader/libc;
-///   * the td-sh musl seed — an `x86_64-unknown-linux-musl` static build has none of these.
+/// run time — exactly the host-runtime ingress #469 closes. Its consumer is the pre-libc
+/// bootstrap rungs — tcc/make/yacc are linked `-static`, and the `Step::AssertStatic` step
+/// fails the rung if one regresses to a host loader/libc.
 ///
 /// The check fails loudly (naming the offending entry) if a regression reintroduces any of
 /// them; a non-ELF file reds too (the parser rejects bad magic).
@@ -947,7 +946,7 @@ mod tests {
     }
 
     // A minimal ELF with a single identity-mapped PT_LOAD and NO PT_INTERP / PT_DYNAMIC —
-    // a fully static, non-dynamic executable (the shape the td-sh musl seed must produce).
+    // a fully static, non-dynamic executable (the shape a static bootstrap rung must produce).
     fn synth_static_elf(is64: bool) -> Vec<u8> {
         let (ehdr, phentsize) = if is64 { (64usize, 56usize) } else { (52usize, 32usize) };
         let phnum = 1usize;
@@ -1184,7 +1183,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("elf-test-as-ok-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
-        // the td-sh musl-seed shape: no interpreter, no needed libs, no run-path — x86-64…
+        // the fully-static shape: no interpreter, no needed libs, no run-path — x86-64…
         std::fs::write(&f, synth_static_elf(true)).unwrap();
         assert!(assert_static(&f).is_ok());
         // …and i686 (the class check is class-independent)

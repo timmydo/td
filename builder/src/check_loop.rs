@@ -279,14 +279,13 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
          chain from the seed first (hours, once)",
         LOOP_USERLAND_STEMS.join(" ")
     );
-    // Cold-cache branch (map miss): warm the td-tool crate closures (td-fetch,
-    // td-sh) BEFORE the build-run that consumes them. This is where cold runs
-    // of EVERY tier pass — light tiers too — so the td-sh brush closure is
-    // vendored offline whenever the chain is (re-)provisioned from cold, not
-    // only on the heavy warm prelude. A warm-map hit returned above, so this
-    // never re-warms an already-provisioned userland. Best-effort (the recipe
-    // check enforces presence); once tcc declares td-sh as its shell the
-    // build-run below reads this warmed closure.
+    // Cold-cache branch (map miss): warm the td-tool crate closure (td-fetch)
+    // BEFORE the build-run that consumes it. This is where cold runs of EVERY
+    // tier pass — light tiers too — so the closure is vendored offline whenever
+    // the chain is (re-)provisioned from cold, not only on the heavy warm
+    // prelude. A warm-map hit returned above, so this never re-warms an
+    // already-provisioned userland. Best-effort (the recipe check enforces
+    // presence).
     warm_td_crate_closures(root);
     let mut cmd = Command::new(&eval);
     cmd.arg("build-run").arg("busybox-x86-64");
@@ -1151,10 +1150,9 @@ fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
 /// the shell's single `timeout` over the script did: one hung mirror must
 /// not stall the prelude.
 ///
-/// NAME selects both the vendor subdir and the log label ("td-fetch",
-/// "td-sh"). td-sh (the brush-shell wrapper, re #469) rides this exact path so
-/// its 316-crate closure is a declared offline vendor set before any rung
-/// declares td-sh — a live crates.io resolution is not a fixed-output fetch.
+/// NAME selects both the vendor subdir and the log label ("td-fetch"): the
+/// crate closure is a declared offline vendor set warmed before the chain that
+/// consumes it — a live crates.io resolution is not a fixed-output fetch.
 fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
     let lock_path = root.join(lock_rel);
     let Ok(lock) = std::fs::read_to_string(&lock_path) else {
@@ -1244,26 +1242,21 @@ fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
 /// The heavy-tier warm prelude: source-bootstrap tarballs + rust crate closures
 /// (td-feed), all BEST-EFFORT (the gates enforce presence), fanned out in
 /// batches of TD_WARM_JOBS exactly as the shell prelude did.
-/// The td-tool crate-closure warms (td-fetch, td-sh): host-side network PREP
-/// that populates the offline vendor sets `.td-build-cache/crate-vendor/{name}`
-/// BEFORE the chain that consumes them is provisioned. These MUST run ahead of
+/// The td-tool crate-closure warm (td-fetch): host-side network PREP that
+/// populates the offline vendor set `.td-build-cache/crate-vendor/{name}`
+/// BEFORE the chain that consumes it is provisioned. This MUST run ahead of
 /// `provision_userland` — the loop userland realizes the bootstrap chain
-/// (mes → tcc → … → busybox/make), and once tcc declares td-sh as its shell
-/// (re #469) that build reads the warmed `sh/Cargo.lock` closure. Gating the
-/// warm behind provisioning is the deadlock the review flagged: provisioning
-/// fails at the first host-bash rung, so a warm placed after it never runs and
-/// the cold bootstrap exits 69 with an empty td-sh vendor set. Best-effort
-/// (a missing fetcher / no network warns; the recipe checks enforce presence).
+/// (mes → tcc → … → busybox/make). Gating the warm behind provisioning is the
+/// deadlock the review flagged: provisioning fails at the first host-bash rung,
+/// so a warm placed after it never runs. Best-effort (a missing fetcher / no
+/// network warns; the recipe checks enforce presence).
 fn warm_td_crate_closures(root: &Path) {
     // td-fetch's own crate closure (its own warm — not the cargo-proxy).
     warm_crate_closure(root, "fetch/Cargo.lock", "td-fetch");
-    // td-sh's brush closure (re #469): the offline vendor set a td-sh recipe
-    // builds from, warmed before any rung declares td-sh.
-    warm_crate_closure(root, "sh/Cargo.lock", "td-sh");
 }
 
 fn heavy_warms(root: &Path) {
-    // The td-tool crate closures (td-fetch, td-sh) are warmed earlier, before
+    // The td-tool crate closure (td-fetch) is warmed earlier, before
     // provision_userland (warm_td_crate_closures) — not here.
 
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
@@ -2308,30 +2301,4 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
         );
     }
 
-    #[test]
-    fn parse_lock_checksums_covers_the_real_td_sh_lock() {
-        // td-sh's brush closure rides the same warm path (warm_crate_closure,
-        // re #469). The parser must see the large checksummed set — a lockfile
-        // that silently parsed empty would warm zero crates and the td-sh
-        // recipe build would run cold. The local `td-sh` package has no
-        // checksum, so the count is one short of the [[package]] total.
-        let lock =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../sh/Cargo.lock"))
-                .unwrap();
-        let got = parse_lock_checksums(&lock);
-        assert!(
-            got.len() >= 200,
-            "only {} checksummed packages parsed from sh/Cargo.lock",
-            got.len()
-        );
-        assert!(
-            got.iter().any(|(n, _, _)| n == "brush-shell"),
-            "brush-shell (td-sh's sole dependency) missing from the parsed closure"
-        );
-        assert!(
-            got.iter()
-                .all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
-            "malformed triplet parsed from the real lock"
-        );
-    }
 }

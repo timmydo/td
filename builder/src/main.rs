@@ -2647,8 +2647,8 @@ fn bless_seed_closure(seed_dir: &str, roots: &[String], out_db: &Path) -> Result
 ///   1. every closure item is vouched by a typed td-owned db (unchanged);
 ///   2. the drv's BUILDER must itself be admissible executable provenance —
 ///      the lineage-verified stage0 placement (`ControlPlaneBuilder`), a td
-///      recipe output (`RecipeOutput` — the td-sh direction: td-built tools
-///      may drive builds), or this very engine binary (SELF_TREE, the engine
+///      recipe output (`RecipeOutput` — a td-built tool may drive
+///      builds), or this very engine binary (SELF_TREE, the engine
 ///      realizing with itself). A seed-store path — blessed or merely
 ///      scannable — is never a builder;
 ///   3. `BlessedSeedClosure` rows vouch ONLY the builder's own runtime
@@ -9387,7 +9387,7 @@ daemon build START (2/2 active)
 
     // re #469 round-10: builder-identity leg of the policy. A blessed host tool
     // named as the drv's BUILDER reds even though its bytes are vouched and
-    // reachable; a RecipeOutput-typed executable (the td-sh direction) and the
+    // reachable; a RecipeOutput-typed executable (a td-built tool) and the
     // engine's own tree stay admissible.
     #[test]
     fn a_host_tool_is_never_a_drv_builder() {
@@ -9404,14 +9404,14 @@ daemon build START (2/2 active)
             .unwrap_err();
         assert!(err.contains("not admissible executable provenance"), "{err}");
         // A td recipe output IS an admissible builder.
-        let sh_tree = format!("/gnu/store/{}-td-sh-1.0", "d".repeat(32));
-        let sh = format!("{sh_tree}/bin/sh");
+        let tool_tree = format!("/gnu/store/{}-td-tool-1.0", "d".repeat(32));
+        let tool = format!("{tool_tree}/bin/td-tool");
         let mut m2 = sandbox::StageManifest::new();
-        m2.insert(sh_tree.clone(), si(sandbox::InputOrigin::RecipeOutput));
+        m2.insert(tool_tree.clone(), si(sandbox::InputOrigin::RecipeOutput));
         enforce_realize_input_policy(
-            &sh,
-            std::slice::from_ref(&sh_tree),
-            std::slice::from_ref(&sh_tree),
+            &tool,
+            std::slice::from_ref(&tool_tree),
+            std::slice::from_ref(&tool_tree),
             &std::collections::BTreeSet::new(),
             &m2,
             None,
