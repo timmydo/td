@@ -12,7 +12,7 @@
    same string-define move sed-mesboot0 / coreutils-mesboot0 / bash-mesboot make.
 
    grep-2.4's sources reach config.h through the autoconf guard
-   `#ifdef HAVE_CONFIG_H / # include <config.h>` (lib/savedir.c uses the
+   `#ifdef HAVE_CONFIG_H / # include <config.h>` (src/savedir.c uses the
    equivalent `#if HAVE_CONFIG_H`); grep-mesboot0.mk's CFLAGS set -DHAVE_CONFIG_H,
    so the include fires and config.h reaches every translation unit that
    references either macro. HAVE_CONFIG_H's ONLY effect in these sources is that

@@ -17,22 +17,27 @@
 #     and `ln -sf`, neither of which exists in this sandbox (that is what the
 #     bootstrap is building). grep-mesboot0.rs installs the one `grep` binary and
 #     its egrep/fgrep symlinks with engine-native Steps instead.
-#   * live-bootstrap's mk defines AR (`tcc -ar`) but grep-2.4 links its objects
-#     directly ($(CC) ... $^), never archiving, so AR is dead here and omitted.
+#   * LDFLAGS = -static is a td addition: live-bootstrap's grep mk leaves LDFLAGS
+#     empty, but this rung's AssertStatic (re #469) requires a fully static grep
+#     (no host loader/libc at run time), so the link is forced static -- the same
+#     -static LDFLAGS sed-mesboot0.mk / coreutils-mesboot0.mk carry.
+#   * live-bootstrap's mk defines AR (`tcc -ar`) and LD (`tcc`), but grep-2.4
+#     links its objects directly through $(CC) ($(CC) ... $^) and never archives,
+#     so both AR and LD are dead here and omitted.
 #   * The per-object sources compile through make's built-in %.o:%.c rule (as in
 #     sed-mesboot0.mk / coreutils-mesboot0.mk), which passes CFLAGS.
 #
 # The engine expands the store-path placeholders below when it writes this file.
 
 CC      = {in:tcc}/bin/tcc
-LD      = {in:tcc}/bin/tcc
 LDFLAGS = -static
 
 # -DHAVE_CONFIG_H activates config.h (the two string-valued PACKAGE/VERSION
-# defines). -I. FIRST so grep's own src/config.h resolves before mes's libc
-# headers. The mes include dirs mirror coreutils-mesboot0.mk (tcc bakes the same
-# paths, so this is explicit belt-and-suspenders). The remaining four defines are
-# live-bootstrap's quote-free CFLAGS verbatim.
+# defines). -I. FIRST so grep's own config.h -- written to the build root at
+# {src}/config.h, and the compile runs with cwd={src} -- resolves before mes's
+# libc headers. The mes include dirs mirror coreutils-mesboot0.mk (tcc bakes the
+# same paths, so this is explicit belt-and-suspenders). The remaining four defines
+# are live-bootstrap's quote-free CFLAGS verbatim.
 CFLAGS  = -DHAVE_CONFIG_H -I. \
           -I{in:mes}/include -I{in:mes}/include/x86 \
           -DHAVE_DIRENT_H=1 \
