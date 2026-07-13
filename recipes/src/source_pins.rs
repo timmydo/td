@@ -46,6 +46,16 @@ const PINS: &[PinDef] = &[
         file: "busybox-1.37.0.tar.bz2",
     },
     PinDef {
+        key: "coreutils-mesboot0-source",
+        aliases: &[],
+        // GNU coreutils 5.0 — the tcc-era coreutils provider (re #469). The exact
+        // version live-bootstrap builds under tcc + mes libc (its coreutils-5.0
+        // pass1), a cycle-breaker below the first BASE_TOOLS consumer.
+        url: "https://ftp.gnu.org/gnu/coreutils/coreutils-5.0.tar.bz2",
+        sha256: "c25b36b8af6e0ad2a875daf4d6196bd0df28a62be7dd252e5f99a4d5d7288d95",
+        file: "coreutils-5.0.tar.bz2",
+    },
+    PinDef {
         key: "gawk-mesboot-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/gawk/gawk-3.1.8.tar.gz",
@@ -305,8 +315,9 @@ mod tests {
         // 32 migrated legacy locks + oyacc-6.6 (the from-source `yacc`) +
         // bash-2.05b (the from-source bootstrap shell it regenerates, re #469) +
         // sed-4.2.2 (the gcc-mesboot1-era `sed` provider, re #469) +
-        // sed-4.0.9 (the tcc-era `sed` cycle-breaker, re #469).
-        assert_eq!(all().len(), 36);
+        // sed-4.0.9 (the tcc-era `sed` cycle-breaker, re #469) +
+        // coreutils-5.0 (the tcc-era coreutils cycle-breaker, re #469).
+        assert_eq!(all().len(), 37);
     }
 
     #[test]
