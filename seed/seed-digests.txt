@@ -43,6 +43,7 @@ patch-glibc-bootstrap-system-2.2.5 wjhcnyy2wspd9bf312ql84gfmvivixs2-patch-glibc-
 patch-mesboot-source r3w1jmlradg89l3av29y1ifp7y312pk9-patch-mesboot-source
 rust-toolchain-source 853r9awaviv9yfgdrcqv1wrv3qn4g56p-rust-toolchain-source
 sed-mesboot-source 331jp1sj5iyjhnb35391k2sjjkqrawk1-sed-mesboot-source
+sed-mesboot0-source i6y1c09pssxjdc60wmdf96vf11hxa56c-sed-mesboot0-source
 stage0-source ma16im40lnb5dldxwglzzs7iqpzfiz4m-stage0-source
 tcc-source mhwyc6lcd16pxbln8kwvc4ia5zisf8fn-tcc-source
 zlib-x86-64-source bpbym1fyb9bbzs3398h55hqnj4lxp47c-zlib-x86-64-source
