@@ -26,12 +26,20 @@ pub const BASH: &str = "bash-mesboot";
 /// the cutover (re #469) replaces each host edge with a recipe output or an
 /// engine-native step; the shell already left for `BASH` (bash-mesboot) and
 /// tar/gzip/bzip2/xz already left with `Step::Unpack`.
+///
+/// `findutils` was retired here as an evidenced DEAD axis (re #469): no rung
+/// declares `{in:findutils}`, no ToolFarm links `find`/`xargs`, and no baked
+/// script, patch, or Makefile fragment invokes either — `find`/`xargs` are not
+/// in the autoconf `configure`/`make` vocabulary these tarballs drive, so the
+/// PATH node and the per-rung lock declaration were pure phantom ingress. The
+/// `no_bootstrap_step_invokes_host_find_or_xargs` guard below locks it out.
+/// (The remaining five — coreutils/sed/grep/gawk/diffutils — are load-bearing;
+/// each waits on a td-built provider recipe, #469's follow-up.)
 pub const BASE_TOOLS: &[&str] = &[
     "coreutils",
     "sed",
     "grep",
     "gawk",
-    "findutils",
     "diffutils",
 ];
 
@@ -132,5 +140,108 @@ pub fn relocate_ld_scripts(stage: &str, store_prefix: &str) -> Step {
     Step::RelocateLdScripts {
         dir: format!("{stage}/lib"),
         prefix: store_prefix.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::catalog;
+    use crate::types::Step;
+
+    /// True if `cmd` appears in `s` as a whole command word. Splitting on every
+    /// non-alphanumeric char means `/usr/bin/find`, `find`, and `find;` all
+    /// surface the word `find`, while `findutils`, `found`, and `x86-64` do not.
+    fn invokes(s: &str, cmd: &str) -> bool {
+        s.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == cmd)
+    }
+
+    /// Every catalog-authored text of a step that becomes a command or an
+    /// interpreted script/Makefile: Run argv, ANY WriteFile body (baked
+    /// Makefiles/kaem scripts are written `exec: false` and then run over by a
+    /// Run step), ToolFarm links, and the literal SubstituteText edits (the
+    /// host-free `patch`/`sed` stand-in). Engine-native steps that carry only
+    /// paths (Unpack/CopyTree/Symlink/PatchShebangs/…) cannot invoke a tool, so
+    /// they contribute nothing. Shared by the catalog-walk guard and its
+    /// coverage test so both exercise exactly the same extraction.
+    fn command_texts(step: &Step) -> Vec<&str> {
+        match step {
+            Step::Run { argv, .. } => argv.iter().map(String::as_str).collect(),
+            Step::WriteFile { content, .. } => vec![content.as_str()],
+            Step::ToolFarm { links } => links
+                .iter()
+                .flat_map(|(a, b)| [a.as_str(), b.as_str()])
+                .collect(),
+            Step::SubstituteText { edits, .. } => edits
+                .iter()
+                .flat_map(|e| [e.from.as_str(), e.to.as_str()])
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// re #469 dead-axis lock. `findutils` was dropped from `BASE_TOOLS` after an
+    /// exhaustive sweep found no rung invokes `find`/`xargs` (not in any Run
+    /// argv, WriteFile body, ToolFarm link, or SubstituteText edit — and neither
+    /// is in the autoconf `configure`/`make` vocabulary these tarballs drive).
+    /// This walks the WHOLE catalog and fails if any rung reintroduces a host
+    /// `find`/`xargs` invocation, which would silently need the removed PATH node
+    /// back. A future rung that legitimately needs `find` must declare a td-built
+    /// provider output (findutils/busybox), never the host tool, and update this
+    /// guard deliberately.
+    ///
+    /// Coverage note: it scans every catalog-authored surface that becomes a
+    /// command or an interpreted script/Makefile — Run argv, ANY WriteFile body
+    /// (baked Makefiles/kaem scripts are written `exec: false` and then run over
+    /// by a Run step), ToolFarm links, and the literal SubstituteText edits (the
+    /// host-free `patch`/`sed` stand-in). Engine-native steps that carry only
+    /// paths (Unpack/CopyTree/Symlink/PatchShebangs/…) cannot invoke a tool.
+    #[test]
+    fn no_bootstrap_step_invokes_host_find_or_xargs() {
+        for (stem, recipe) in catalog::all() {
+            let Some(steps) = &recipe.steps else {
+                continue;
+            };
+            for step in steps {
+                for text in command_texts(step) {
+                    for cmd in ["find", "xargs"] {
+                        assert!(
+                            !invokes(text, cmd),
+                            "recipe `{stem}' invokes `{cmd}' in `{text}' — \
+                             findutils was retired from BASE_TOOLS as a dead axis \
+                             (re #469); a rung that needs it must declare a td-built \
+                             provider output (findutils/busybox) and update this \
+                             guard deliberately, never lean on a host tool on PATH"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Proof that `command_texts` — the extraction the guard above runs — covers
+    /// the interpreted-text surfaces that are NOT a `Run` argv: a baked
+    /// Makefile/kaem script (`WriteFile`, `exec: false`) and a literal patch/sed
+    /// edit (`SubstituteText`). Without this, a `find`/`xargs` reintroduced in one
+    /// of those would slip past the guard (re #469, the P2 both reviews raised).
+    #[test]
+    fn guard_scans_nonexec_writefile_and_substitutetext() {
+        use crate::types::TextEdit;
+
+        let baked_makefile = Step::WriteFile {
+            path: "Makefile".into(),
+            content: "clean:\n\tfind . -name '*.o' -delete\n".into(),
+            exec: false,
+        };
+        let literal_edit = Step::SubstituteText {
+            file: "configure".into(),
+            edits: vec![TextEdit::new("rm -f x", "xargs rm -f", 1)],
+        };
+        for (step, cmd) in [(&baked_makefile, "find"), (&literal_edit, "xargs")] {
+            assert!(
+                command_texts(step).iter().any(|t| invokes(t, cmd)),
+                "command_texts must scan this surface for `{cmd}'"
+            );
+        }
     }
 }
