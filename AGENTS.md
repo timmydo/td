@@ -53,10 +53,11 @@ executables created by the current build may execute inside a target
 build sandbox. Host `/bin`, `/usr`, ambient `PATH`, and arbitrary host
 store paths are never target inputs.
 
-`td-builder build` stages those declared inputs and sets `NIX_STORE`
-at the active `store::store_dir()`. A `TD_STORE_DIR=/td/store` build is
-native: it is hashed for and built at `/td/store`, with no post-hoc
-store-prefix rewrite.
+`td-builder build` stages those declared inputs and sets the
+compatibility `NIX_STORE` variable to the active td store directory;
+this does not introduce a Nix dependency. A
+`TD_STORE_DIR=/td/store` build is native: it is hashed for and built at
+`/td/store`, with no post-hoc store-prefix rewrite.
 
 ## Rust bridge
 
@@ -67,12 +68,12 @@ GCC/glibc build platform and its GNU build userland exist.
 The Rust seed is a pinned upstream release containing rustc, Cargo,
 rust-std, and the compiler sysroot. It is a declared fixed-output
 source transformed by a td recipe. The recipe unpacks the release with
-the dependency-free td engine, rewrites rustc and Cargo's ELF
-interpreter with `builder/src/elf.rs::set_interp`, and supplies the
-declared td-built runtime closure (including glibc, libgcc_s, and
-zlib). The result is a normal content-addressed `/td/store` recipe
-output. The upstream compiler and prebuilt standard library remain an
-explicit binary trust root.
+the dependency-free `td-builder`, rewrites rustc and Cargo's ELF
+interpreter with td's in-process ELF editor, and supplies the declared
+td-built runtime closure (including glibc, libgcc_s, and zlib). The
+result is a normal content-addressed `/td/store` recipe output. The
+upstream compiler and prebuilt standard library remain an explicit
+binary trust root.
 
 The transformed toolchain must run without host `/bin`, `/usr`, or
 libraries; resolve every dynamic dependency from its declared closure;
