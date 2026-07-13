@@ -325,6 +325,16 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
         if let Some(cc) = find_in_path(ccpath, "cc").or_else(|| find_in_path(ccpath, "gcc")) {
             if let Ok(out) = Command::new(&cc)
                 .arg("-print-file-name=libc.a")
+                // Probe under a CLEARED env — exactly the env the real static link
+                // runs in (bootstrap_stage0's `.env_clear()`). Otherwise ambient
+                // LIBRARY_PATH / GCC_EXEC_PREFIX / COMPILER_PATH could steer a
+                // NON-lock cc to print some OTHER glibc's libc.a (e.g. the lock's
+                // guix glibc:static) that the env_cleared build would never link —
+                // silently reintroducing the mismatched-glibc pairing the leg-3
+                // matched-pair guard exists to close (Codex P2). `-print-file-name`
+                // is a self-contained spec query (no PATH/HOME needed); a wrapper cc
+                // that DOES need PATH just errors here and falls through to leg 3.
+                .env_clear()
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
