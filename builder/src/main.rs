@@ -2926,14 +2926,6 @@ fn realize_drv(
             Ok::<_, String>((ov, store_db_read::Db::open(data)?))
         })
         .collect::<Result<_, _>>()?;
-    // The td-owned builder likewise has its own DB (store-add-builder wrote the builder
-    // + its DIRECT refs there); the seed store has no row for the builder itself.
-    let builder_db = match builder_override {
-        Some(ov) => Some(store_db_read::Db::open(
-            std::fs::read(&ov.db).map_err(|e| format!("read builder db {}: {e}", ov.db))?,
-        )?),
-        None => None,
-    };
     let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // The closure slice reachable FROM THE DRV'S BUILDER (the builder tree plus
     // its refs' transitive closures) — the ONLY slice `BlessedSeedClosure` rows
@@ -2966,7 +2958,7 @@ fn realize_drv(
         }
         // The td-placed builder gets its STAGED closure from its own DYNAMIC LINKAGE;
         // every other root from the seed content-scan (∪ any td-owned extra dbs).
-        match (builder_override, &builder_db) {
+        match builder_override {
             // The td-placed builder: the tree binds from on_disk (canonical\ton-disk), and
             // its runtime deps are resolved by DYNAMIC LINKAGE (PT_INTERP + DT_RUNPATH) from
             // the builder BINARY itself — NOT from a content scan of it. A content scan drags
@@ -2977,7 +2969,7 @@ fn realize_drv(
             // Linkage stages exactly the loader's search set — empty for a static builder,
             // the pinned glibc/gcc-lib for a dynamic one — and nothing a glibc helper SCRIPT
             // (bin/ldd) or HEADER (paths.h) merely names.
-            (Some(ov), Some(_bdb)) if r == &ov.canonical => {
+            Some(ov) if r == &ov.canonical => {
                 // Bind the builder tree itself from on_disk.
                 builder_reach.insert(ov.canonical.clone());
                 closure.insert(format!("{}\t{}", ov.canonical, ov.on_disk));
@@ -2989,8 +2981,11 @@ fn realize_drv(
                 // refs the loader never links. Walking the builder tree's PT_INTERP +
                 // DT_RUNPATH stages EXACTLY the loader search set: empty for a fully
                 // static builder (no host bytes leak, no unvouched bash-static), the
-                // pinned glibc/gcc-lib for a dynamic one (re #469). `_bdb` (the content
-                // scan) still records provenance; it no longer sources the STAGED set.
+                // pinned glibc/gcc-lib for a dynamic one (re #469). The builder's own
+                // store db (ov.db, content-scanned direct refs — which DO name bash-static
+                // for a static builder) is still read+authenticated by
+                // assemble_input_manifest to record ControlPlaneBuilder provenance; it no
+                // longer sources what gets STAGED, so those extra names never reach a sandbox.
                 let mut od = on_disk.clone();
                 od.insert(ov.canonical.clone(), ov.on_disk.clone());
                 let mut linkage = resolve_link_closure(

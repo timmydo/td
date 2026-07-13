@@ -152,6 +152,17 @@ fn lock_rust_frag(lock: &Path) -> Option<String> {
         .then(|| emit_frag(&rb, &cb))
 }
 
+/// The lock's pinned gcc-toolchain bin dir (`<path>/bin`), if the lock names one.
+/// The single source of truth for "the lock's C toolchain" — `provision_cc`'s
+/// lock leg and `provision_glibc_static`'s matched-pair check both go through it,
+/// so the two computations can never drift.
+fn lock_gcc_bin(lock: &Path) -> Option<String> {
+    lock_paths(lock)
+        .into_iter()
+        .find(|p| p.contains('/') && p.contains("-gcc-toolchain-"))
+        .map(|g| format!("{g}/bin"))
+}
+
 fn find_in_path(search_path: &str, bin: &str) -> Option<PathBuf> {
     search_path
         .split(':')
@@ -245,11 +256,7 @@ pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, String> {
     }
 
     // 2. The pinned (guix seed) gcc-toolchain — only when present on disk.
-    if let Some(g) = lock_paths(&env.lock)
-        .into_iter()
-        .find(|p| p.contains('/') && p.contains("-gcc-toolchain-"))
-    {
-        let gb = format!("{g}/bin");
+    if let Some(gb) = lock_gcc_bin(&env.lock) {
         if has_cc(Path::new(&gb)) {
             return Ok(gb);
         }
@@ -282,8 +289,12 @@ pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, String> {
 ///   2. the RESOLVED cc's OWN static libc (`cc -print-file-name=libc.a`) —
 ///      matched by construction (it is the archive the same linker driver would
 ///      pick), covering the system / `TD_CC_HOME` compilers;
-///   3. a `-glibc-*-static` lock pin (the guix seed; its gcc-toolchain does not
-///      expose a static libc of its own, so it needs the pinned one).
+///   3. a `-glibc-*-static` lock pin (the guix seed) — but ONLY when the resolved
+///      cc IS the lock's gcc-toolchain, the matched pair pinned together. The lock
+///      gcc-toolchain exposes no static libc of its OWN (leg 2 falls through), so
+///      it needs the pinned one; a NON-lock cc (system / `TD_CC_HOME`) that also
+///      lacks a static libc must NOT borrow the guix glibc — its crt objects come
+///      from a different glibc and the static link SIGSEGVs at startup.
 /// Fail-closed: without any of these the builder would link dynamically and leak
 /// its host `lib/` into every sandbox (re #469).
 pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, String> {
@@ -299,6 +310,10 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
         }
         return Ok(lib.to_string_lossy().into_owned());
     }
+    // Resolve the C toolchain ONCE — both the ask-cc leg (2) and the
+    // matched-pair check (3) key off the same cc, so they can never disagree
+    // about which compiler will actually link the builder.
+    let cc_bin_dir = provision_cc(env).ok();
     // 2. The resolved cc's own static libc.a. `cc -print-file-name=libc.a` prints
     //    an ABSOLUTE path when the linker driver can see a static libc (a
     //    guix-less build-essential host, or a TD_CC_HOME toolchain that ships
@@ -306,8 +321,8 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
     //    the cc rustc links with — dodging the mismatched-glibc startup crash.
     //    The guix gcc-toolchain returns the bare name (no static libc of its
     //    own), so a guix build falls through to the pinned lock leg below.
-    if let Ok(ccpath) = provision_cc(env) {
-        if let Some(cc) = find_in_path(&ccpath, "cc").or_else(|| find_in_path(&ccpath, "gcc")) {
+    if let Some(ccpath) = &cc_bin_dir {
+        if let Some(cc) = find_in_path(ccpath, "cc").or_else(|| find_in_path(ccpath, "gcc")) {
             if let Ok(out) = Command::new(&cc)
                 .arg("-print-file-name=libc.a")
                 .stdin(Stdio::null())
@@ -326,14 +341,23 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
             }
         }
     }
-    // 3. The pinned (guix seed) glibc:static — only when present on disk.
-    if let Some(lib) = lock_paths(&env.lock)
-        .into_iter()
-        .filter(|p| p.contains('/') && p.contains("-glibc-") && p.ends_with("-static"))
-        .map(|p| Path::new(&p).join("lib"))
-        .find(|lib| has_static_libc(lib))
-    {
-        return Ok(lib.to_string_lossy().into_owned());
+    // 3. The pinned (guix seed) glibc:static — the matched partner of the LOCK
+    //    gcc-toolchain, and ONLY that. The lock pins the pair together, so this
+    //    fires only when the resolved cc IS the lock gcc-toolchain (leg 2 above
+    //    fell through because that toolchain ships no static libc of its own). A
+    //    NON-lock cc (system / TD_CC_HOME) that also lacked a static libc must
+    //    never be paired with the guix glibc: mismatched crt objects link cleanly
+    //    but SIGSEGV at startup. Such a host fails closed here (set
+    //    TD_GLIBC_STATIC_HOME to the matching static glibc).
+    if cc_bin_dir.is_some() && cc_bin_dir.as_deref() == lock_gcc_bin(&env.lock).as_deref() {
+        if let Some(lib) = lock_paths(&env.lock)
+            .into_iter()
+            .filter(|p| p.contains('/') && p.contains("-glibc-") && p.ends_with("-static"))
+            .map(|p| Path::new(&p).join("lib"))
+            .find(|lib| has_static_libc(lib))
+        {
+            return Ok(lib.to_string_lossy().into_owned());
+        }
     }
     Err("no static glibc found — set TD_GLIBC_STATIC_HOME to a glibc `static` output (with \
          lib/libc.a) matching the C toolchain, install a system cc that ships libc.a \
@@ -846,15 +870,36 @@ mod tests {
             .unwrap_err()
             .contains("TD_GLIBC_STATIC_HOME"));
 
-        // 2. Lock leg: a `-glibc-*-static` pin whose lib/libc.a exists.
+        // 2. Lock leg: a `-glibc-*-static` pin whose lib/libc.a exists — resolved
+        //    ONLY because the lock ALSO pins the gcc-toolchain it is matched to,
+        //    which provision_cc selects. The gcc stub prints nothing for
+        //    -print-file-name=libc.a (the guix gcc-toolchain ships no static libc
+        //    of its own), so leg 2 falls through and the pinned glibc — its
+        //    matched partner — is used.
+        let gcc = d.join("store/ccc-gcc-toolchain-15.2.0");
+        exec_file(&gcc.join("bin/gcc"));
         let g = d.join("store/ggg-glibc-2.41-static");
         touch(&g.join("lib/libc.a"));
         let lock = d.join("lock");
-        std::fs::write(&lock, format!("glibc-static {}\n", g.display())).unwrap();
+        std::fs::write(
+            &lock,
+            format!("gcc-toolchain {}\nglibc-static {}\n", gcc.display(), g.display()),
+        )
+        .unwrap();
         assert_eq!(
             provision_glibc_static(&base_env(&lock)).unwrap(),
             format!("{}/lib", g.display())
         );
+
+        // A lock pinning the glibc:static but NOT the matched gcc-toolchain must
+        // NOT hand the guix glibc to whatever cc happens to resolve (Codex P1):
+        // with no gcc-toolchain pinned and an empty search path there is no cc at
+        // all, so it fails closed rather than pairing a mismatched compiler.
+        let lock_no_gcc = d.join("lock-no-gcc");
+        std::fs::write(&lock_no_gcc, format!("glibc-static {}\n", g.display())).unwrap();
+        assert!(provision_glibc_static(&base_env(&lock_no_gcc))
+            .unwrap_err()
+            .contains("no static glibc"));
 
         // 3. No home, no lock match → reds with operator guidance (fail-closed).
         assert!(provision_glibc_static(&base_env(&d.join("absent-lock")))
@@ -898,12 +943,33 @@ mod tests {
             cc_libdir.to_string_lossy().into_owned()
         );
 
-        // A cc that answers the BARE name (the guix gcc-toolchain: no static libc
-        // of its own) → fall through to the lock pin.
+        // A NON-lock cc (this TD_CC_HOME) that answers the BARE name must NOT be
+        // paired with the lock's guix glibc:static — its crt objects are a
+        // DIFFERENT glibc, so a static link SIGSEGVs at startup (Codex P1). It
+        // fails closed rather than silently mismatching.
         std::fs::write(&ccbin, "#!/bin/sh\necho libc.a\n").unwrap();
         std::fs::set_permissions(&ccbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(provision_glibc_static(&env)
+            .unwrap_err()
+            .contains("no static glibc"));
+
+        // The LOCK's OWN gcc-toolchain answering the bare name (the real guix
+        // case) IS the matched partner of the lock glibc:static — the pair pinned
+        // together — so THAT does fall through to the pin.
+        let gcc = d.join("store/ggg-gcc-toolchain-15.2.0");
+        let gccbin = gcc.join("bin/gcc");
+        std::fs::create_dir_all(gccbin.parent().unwrap()).unwrap();
+        std::fs::write(&gccbin, "#!/bin/sh\necho libc.a\n").unwrap();
+        std::fs::set_permissions(&gccbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lock_gcc = d.join("lock-gcc");
+        std::fs::write(
+            &lock_gcc,
+            format!("gcc-toolchain {}\nglibc-static {}\n", gcc.display(), pin.display()),
+        )
+        .unwrap();
+        // No cc_home → provision_cc selects the lock gcc-toolchain, so the pair matches.
         assert_eq!(
-            provision_glibc_static(&env).unwrap(),
+            provision_glibc_static(&base_env(&lock_gcc)).unwrap(),
             format!("{}/lib", pin.display())
         );
         let _ = std::fs::remove_dir_all(&d);
