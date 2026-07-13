@@ -3,12 +3,12 @@
    live-bootstrap builds coreutils-5.0 under tcc + mes libc with an EMPTY
    config.h (`catm config.h`), passing every feature macro on the tcc command
    line (mk/main.mk CFLAGS). Most of those are quote/paren-free and stay on td's
-   CFLAGS command line unchanged (global, exactly as live-bootstrap has them —
+   CFLAGS command line unchanged (global, exactly as live-bootstrap has them --
    see coreutils-mesboot0.mk). The TEN below cannot: each carries a shell
    metacharacter (an escaped `"`, an escaped space, or escaped `()`), and td's
    Make 3.80 drives tcc through its NO-SHELL fast path (the sandbox has no
    $(SHELL)); a `"` or `(` on a recipe line would force the nonexistent shell.
-   td therefore moves these into config.h — the same move sed-mesboot0 /
+   td therefore moves these into config.h -- the same move sed-mesboot0 /
    bash-mesboot make for their string-valued -D.
 
    Every coreutils-5.0 source file reaches config.h either by an unconditional
@@ -36,7 +36,7 @@
    it (to locate a charset.alias that does not exist under mes libc, so the
    lookup fails harmlessly); the value is cosmetic but must be a valid string.
    {out} is template-expanded to td's own store path when the engine writes this
-   file — the same pattern make-mesboot0-config.h uses for its LIBDIR. */
+   file -- the same pattern make-mesboot0-config.h uses for its LIBDIR. */
 #define LIBDIR "{out}/lib/mes"
 
 /* mes libc has no locale support; live-bootstrap substitutes the "C" locale

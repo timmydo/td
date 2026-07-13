@@ -78,17 +78,33 @@ const COPIED_HEADERS: &[(&str, &str)] = &[
     ("search_.h", "search.h"),
 ];
 
-// Binaries proven to exist + run after install. A representative slice: every
-// distinct link rule (single-obj plus the multi-obj cp/ls/install/md5sum/mv/rm/
-// sha1sum families) and every patched tool (sort/tac/expr/uniq/touch).
-const REQUIRED_BINS: &[&str] = &[
-    "cat", "echo", "true", "false", "wc", "sort", "tac", "expr", "uniq", "touch",
+// Every binary this rung installs (the .mk COREUTILS list + the seven multi-obj
+// binaries) — all 61 are asserted to exist, be executable, and be fully static
+// (re #469: a host loader/DT_NEEDED on any one would drag in a host libc at run
+// time). Asserting the whole set, not a slice, is the strong provenance claim.
+const ALL_BINS: &[&str] = &[
+    // The 54 single-obj COREUTILS (built by the static pattern rule), in .mk order.
+    "basename", "cat", "chmod", "cksum", "csplit", "cut", "dirname", "echo",
+    "expand", "expr", "factor", "false", "fmt", "fold", "head", "hostname", "id",
+    "join", "kill", "link", "ln", "logname", "mkfifo", "mkdir", "mknod", "nl",
+    "od", "paste", "pathchk", "pr", "printf", "ptx", "pwd", "readlink", "rmdir",
+    "seq", "sleep", "sort", "split", "sum", "tail", "tee", "tr", "tsort",
+    "unexpand", "uniq", "unlink", "wc", "whoami", "tac", "test", "touch", "true",
+    "yes",
+    // The seven multi-obj binaries (their own explicit .mk rules).
     "cp", "ls", "install", "md5sum", "mv", "rm", "sha1sum",
 ];
 
 // Smoke input: three unsorted lines the transform reorders. `sort -o proof`
 // writes the sorted stream to `proof` (sort's own `-o`, no shell redirection).
 const SMOKE_TXT: &str = "3\n1\n2\n";
+
+// Known-good digests of SMOKE_TXT, verified against upstream coreutils. `md5sum
+// -c` / `sha1sum -c` recompute over smoke.txt and exit non-zero on any mismatch
+// — a functional check of the shared md5sum.o driver in both modes, with no
+// shell (the checkfile format is `<digest>  <file>`, two spaces).
+const SMOKE_MD5: &str = "6aedf78b5040f95db16c33d40e836165  smoke.txt\n";
+const SMOKE_SHA1: &str = "b910a63eeea5ebafbf5564fc004ead6a7518f098  smoke.txt\n";
 
 pub fn recipe() -> Recipe {
     let mut steps = unpack_into("coreutils-mesboot0-source", "{src}");
@@ -176,27 +192,20 @@ pub fn recipe() -> Recipe {
         .env("LC_ALL", ""),
     );
 
-    // Products exist and are executable.
-    let required: Vec<String> = REQUIRED_BINS
+    // All 61 installed binaries exist and are executable.
+    let bins: Vec<String> = ALL_BINS
         .iter()
         .map(|b| format!("{{out}}/bin/{b}"))
         .collect();
     steps.push(Step::Require {
-        paths: required.clone(),
+        paths: bins.clone(),
         exec: true,
     });
 
     // Runtime provenance (re #469): every binary is linked -static (LDFLAGS), so
-    // none may carry a host loader (PT_INTERP) or host libc (DT_NEEDED) — else it
-    // would drag a host glibc in at run time. Assert the representative slice.
-    let static_paths: Vec<&str> = REQUIRED_BINS.to_vec();
-    let static_owned: Vec<String> = static_paths
-        .iter()
-        .map(|b| format!("{{out}}/bin/{b}"))
-        .collect();
-    steps.push(Step::AssertStatic {
-        paths: static_owned,
-    });
+    // none may carry a host loader (PT_INTERP) or host libc (DT_NEEDED) -- else it
+    // would drag a host glibc in at run time. Assert it for all 61, not a slice.
+    steps.push(Step::AssertStatic { paths: bins });
 
     // Smoke: the static mes-libc ELFs must actually run.
     //   * `true` exits 0 (a trivial static ELF runs).
@@ -205,6 +214,10 @@ pub fn recipe() -> Recipe {
     //     (the memcoll/sort-locale strcmp path), and writes the exact bytes:
     //     "3\n1\n2\n" must become "1\n2\n3\n" or the follow-up SubstituteText
     //     reds. `wc`/`cat` add plain liveness.
+    //   * `md5sum -c`/`sha1sum -c` recompute the digest of smoke.txt and exit
+    //     non-zero on mismatch -- a functional check of the shared md5sum.o
+    //     driver in both modes (exists+static alone would not catch a miscompiled
+    //     hash), with no shell needed.
     steps.push(Step::run("{src}", &["{out}/bin/true"]));
     steps.push(Step::run("{src}", &["{out}/bin/test", "1", "=", "1"]));
     steps.push(Step::run("{src}", &["{out}/bin/expr", "a", "=", "a"]));
@@ -223,6 +236,18 @@ pub fn recipe() -> Recipe {
     ));
     steps.push(Step::run("{src}", &["{out}/bin/wc", "-l", "smoke.txt"]));
     steps.push(Step::run("{src}", &["{out}/bin/cat", "smoke.txt"]));
+    steps.push(Step::WriteFile {
+        path: "{src}/smoke.md5".into(),
+        content: SMOKE_MD5.into(),
+        exec: false,
+    });
+    steps.push(Step::run("{src}", &["{out}/bin/md5sum", "-c", "smoke.md5"]));
+    steps.push(Step::WriteFile {
+        path: "{src}/smoke.sha1".into(),
+        content: SMOKE_SHA1.into(),
+        exec: false,
+    });
+    steps.push(Step::run("{src}", &["{out}/bin/sha1sum", "-c", "smoke.sha1"]));
 
     Recipe::mesboot("coreutils-mesboot0", "5.0")
         .source_input("coreutils-mesboot0-source")

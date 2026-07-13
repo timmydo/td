@@ -1,8 +1,8 @@
-# td coreutils-5.0 Makefile (re #469) — live-bootstrap's coreutils-5.0
+# td coreutils-5.0 Makefile (re #469) -- live-bootstrap's coreutils-5.0
 # mk/main.mk (its pass1/LIBC=mes build) with td's tcc/mes store paths baked in.
 # Driven by td's Make 3.80: every recipe line is metacharacter-free, so make's
 # no-shell fast path execs tcc directly (the sandbox has no $(SHELL)). This is
-# load-bearing — make falls back to $(SHELL) (which does not exist here) the
+# load-bearing -- make falls back to $(SHELL) (which does not exist here) the
 # moment a recipe line contains a shell metacharacter, so keep every flag value
 # metacharacter-free.
 #
@@ -104,8 +104,9 @@ $(LIB_DIR)/libfettish.a: $(LIB_OBJECTS)
 # live-bootstrap's static pattern rule verbatim (mk/main.mk): link each
 # single-obj binary `src/X` from `src/X.o` + libfettish.a. td's Make 3.80 (a
 # minimal mescc build) drives the `targets: tpattern: pprereq` static-pattern
-# syntax correctly. The multi-obj binaries below (cp/install/ls/md5sum/mv/rm/
-# sha1sum) have explicit rules that override this for their targets.
+# syntax correctly. This rule matches only the $(BINARIES) targets; the seven
+# multi-obj binaries below (cp/install/ls/md5sum/mv/rm/sha1sum) are NOT in
+# $(BINARIES) and are built by their own explicit rules.
 $(BINARIES) : % : %.o $(LIB_DIR)/libfettish.a
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
