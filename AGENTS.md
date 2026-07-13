@@ -3,29 +3,103 @@
 You are one of possibly several agents building a functional Linux
 distribution.
 
-# Build
+# Build and trust model
 
-The root seed is brought by the host builder in the form of a rust
-toolchain. From there we build the td build tools (td builder, td
-fetch, etc.), which are used to bootstrap the rest of the distro.
+td has two bootstrap graphs. Do not confuse the host control plane
+with the target distribution artifact graph.
 
-We start with a mes bootstrap. The units are called recipies. They are
-built like Nix/Guix to `/td/store`. So td's toolchain is **built from
-source at `/td/store`** from a tiny auditable seed — the
-bootstrappable-builds chain (stage0-posix `hex0` → `mes` →
-`mescc-tools` → `tinycc` → `gcc` → `glibc` →
-binutils/coreutils/bash/make/…), every stage `--prefix=/td/store`.
+## Control plane
 
-The build engine it targets already exists: `td-builder build` stages
-inputs and sets `NIX_STORE` at the active `store::store_dir()`, so a
-`TD_STORE_DIR=/td/store` build is **native** — re-hashed at
-`/td/store`, no post-hoc rewrite.
+The host builder supplies a pinned Rust toolchain used to compile td's
+control-plane programs (`td-builder`, `td-recipe-eval`, `td-fetch`,
+and related tools). These programs may evaluate recipes, fetch
+declared fixed-output sources, construct sandboxes, and place outputs.
+They are not target build inputs and must never be staged as executable
+inputs to a target derivation.
 
-The rust toolchain td uses to build rust packages is NOT part of the
-full-source-bootstrap requirement. It enters as a **pinned upstream
-rust release** (a declared fixed-output fetch) transformed by a td
-**recipe** that rewrites the ELF binaries (PT_INTERP/RUNPATH via
-`builder/src/elf.rs::set_interp`) onto td's own `/td/store` glibc.
+The host Rust toolchain is therefore a control-plane seed, not the
+distribution's bootstrap seed. After td has a target Rust toolchain,
+the shipped copies of td's own programs are rebuilt as target recipes;
+host-built control-plane binaries do not enter the final image.
+
+## Target artifact graph
+
+The target distribution begins with the tiny, auditable stage0-posix
+seed. Recipes build the artifact graph directly into `/td/store`:
+
+```text
+stage0-posix (hex0/kaem lineage)
+  -> Mes/MesCC
+  -> TinyCC
+  -> early Make/Patch/Bash
+  -> iterative binutils/GCC/glibc bootstrap
+  -> native binutils/GCC/glibc and GNU build userland
+  -> transformed upstream Rust toolchain
+  -> target-built td tools and Rust userland
+  -> uutils-based distribution closure and image
+```
+
+The GCC/binutils/glibc portion is an iterative ladder, not a single
+linear build: early compiler and libc generations build later,
+increasingly native generations until the native toolchain can rebuild
+itself. The bootstrap uses source-built GNU userland packages,
+including coreutils, sed, grep, gawk, findutils, diffutils, Bash, Make,
+and the required archive/compression tools. They remain available as
+declared recipe outputs until the Rust toolchain and Rust userland have
+been built.
+
+Only audited seed executables, outputs of earlier recipes, and
+executables created by the current build may execute inside a target
+build sandbox. Host `/bin`, `/usr`, ambient `PATH`, and arbitrary host
+store paths are never target inputs.
+
+`td-builder build` stages those declared inputs and sets `NIX_STORE`
+at the active `store::store_dir()`. A `TD_STORE_DIR=/td/store` build is
+native: it is hashed for and built at `/td/store`, with no post-hoc
+store-prefix rewrite.
+
+## Rust bridge
+
+Bootstrapping Rust from source is not currently part of td's
+full-source-bootstrap requirement. Rust enters only after the native
+GCC/glibc build platform and its GNU build userland exist.
+
+The Rust seed is a pinned upstream release containing rustc, Cargo,
+rust-std, and the compiler sysroot. It is a declared fixed-output
+source transformed by a td recipe. The recipe unpacks the release with
+the dependency-free td engine, rewrites rustc and Cargo's ELF
+interpreter with `builder/src/elf.rs::set_interp`, and supplies the
+declared td-built runtime closure (including glibc, libgcc_s, and
+zlib). The result is a normal content-addressed `/td/store` recipe
+output. The upstream compiler and prebuilt standard library remain an
+explicit binary trust root.
+
+The transformed toolchain must run without host `/bin`, `/usr`, or
+libraries; resolve every dynamic dependency from its declared closure;
+and compile, link, and run a program against td's native toolchain and
+glibc.
+
+## Rust dependencies and final userland
+
+Rust dependency sources are fixed-output inputs, not ambient network
+access. Registry crates are selected by committed `Cargo.lock` entries
+and verified against their checksums; git dependencies are pinned by
+commit and fixed-output archive hash. Fetching may populate this source
+closure before the Rust compiler exists, but compilation happens only
+after the transformed Rust toolchain is available.
+
+Cargo builds run offline. Build scripts, proc macros, and crates that
+contain C or assembly are part of the declared build graph and may use
+only td-built tools. Native crate code is compiled by td's GCC/binutils
+and links against td's runtime closure, never a host compiler or host
+library.
+
+After the Rust bridge, td is Rust-first. The final distribution image
+uses uutils for its core userland rather than carrying the GNU
+bootstrap userland forward. The source-bootstrap toolchain, glibc,
+Linux kernel, boot/firmware components, and explicitly reviewed
+non-Rust packages are exceptions; new td-owned shipped userland should
+be Rust built with the transformed `/td/store` toolchain.
 
 # Principles
 
