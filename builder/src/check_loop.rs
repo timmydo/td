@@ -286,7 +286,7 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
     // prelude. A warm-map hit returned above, so this never re-warms an
     // already-provisioned userland. Best-effort (the recipe check enforces
     // presence).
-    warm_td_crate_closures(root);
+    warm_td_crate_closure(root);
     let mut cmd = Command::new(&eval);
     cmd.arg("build-run").arg("busybox-x86-64");
     for stem in LOOP_USERLAND_STEMS {
@@ -1250,14 +1250,14 @@ fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
 /// deadlock the review flagged: provisioning fails at the first host-bash rung,
 /// so a warm placed after it never runs. Best-effort (a missing fetcher / no
 /// network warns; the recipe checks enforce presence).
-fn warm_td_crate_closures(root: &Path) {
+fn warm_td_crate_closure(root: &Path) {
     // td-fetch's own crate closure (its own warm — not the cargo-proxy).
     warm_crate_closure(root, "fetch/Cargo.lock", "td-fetch");
 }
 
 fn heavy_warms(root: &Path) {
     // The td-tool crate closure (td-fetch) is warmed earlier, before
-    // provision_userland (warm_td_crate_closures) — not here.
+    // provision_userland (warm_td_crate_closure) — not here.
 
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
     // cargo build of feed/.
@@ -2300,5 +2300,4 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
             "malformed triplet parsed from the real lock"
         );
     }
-
 }
