@@ -27,6 +27,11 @@ AR =		{in:tcc}/bin/tcc -ar
 # HAVE_CONFIG_H activates config.h: sed.h / lib gate `#include "config.h"` on it
 # (as autoconf'd trees do), and config.h carries the three string defines moved
 # off the command line — the same `DEFS = -DHAVE_CONFIG_H` patch-mesboot.mk sets.
+# This is global, so lib/*.c (which also gate on HAVE_CONFIG_H) now include
+# config.h too — but it holds ONLY those three string macros and no feature
+# macros, so every `#if HAVE_*` in a lib file evaluates identically to
+# live-bootstrap's empty-config.h build (all still undefined); only the two
+# sed/*.c that reference the strings are actually affected.
 # Quote-free feature defines + include paths follow. -I. and -Ilib FIRST so sed's
 # own headers and the generated lib/regex.h (see the recipe's regex.h symlink)
 # resolve before mes's libc headers, exactly as live-bootstrap's `-I . -I lib`

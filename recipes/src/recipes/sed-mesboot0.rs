@@ -33,12 +33,15 @@ use crate::types::{Recipe, Step, TextEdit};
 const CONFIG_H: &str = include_str!("sed-mesboot0-config.h");
 const MAKEFILE: &str = include_str!("sed-mesboot0.mk");
 
-// Smoke input: one line the transform rewrites. `sed -n 's/hello/world/w proof'`
+// Smoke input: one line the transform rewrites. `sed -n 's/h.llo/world/w proof'`
 // writes the substituted line to `proof` (sed's own `w` flag — no shell
-// redirection). The follow-up SubstituteText then REQUIRES exactly one "world"
-// in `proof`, so the rung reds unless the built i386 static ELF actually RAN and
-// performed the substitution (a crash reds at the run step; a mis-substitution
-// reds at the content check).
+// redirection). The `.` makes it a real regex match (exercising the bundled
+// regex engine, not a literal compare), and `w` writes the pattern space plus a
+// trailing newline, so `proof` must be exactly "world\n". The follow-up
+// SubstituteText REQUIRES exactly one "world\n" there, so the rung reds unless
+// the built i386 static ELF actually RAN and produced that exact line: a crash
+// reds at the run step; a mis-substitution or a mangled/absent newline reds at
+// the content check.
 const SMOKE_TXT: &str = "hello\n";
 
 pub fn recipe() -> Recipe {
@@ -102,11 +105,11 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::run(
         "{src}",
-        &["{out}/bin/sed", "-n", "s/hello/world/w proof", "smoke.txt"],
+        &["{out}/bin/sed", "-n", "s/h.llo/world/w proof", "smoke.txt"],
     ));
     steps.push(Step::substitute_text(
         "{src}/proof",
-        vec![TextEdit::new("world", "world", 1)],
+        vec![TextEdit::new("world\n", "world\n", 1)],
     ));
 
     Recipe::mesboot("sed-mesboot0", "4.0.9")
