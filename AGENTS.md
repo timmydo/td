@@ -14,8 +14,11 @@ The host builder supplies a pinned Rust toolchain used to compile td's
 control-plane programs (`td-builder`, `td-recipe-eval`, `td-fetch`,
 and related tools). These programs may evaluate recipes, fetch
 declared fixed-output sources, construct sandboxes, and place outputs.
-They are not target build inputs and must never be staged as executable
-inputs to a target derivation.
+The derivation builder itself is staged and executed with explicit
+`ControlPlaneBuilder` provenance solely to implement the build. That
+typed exception does not make it a recipe tool, target artifact, or
+runtime dependency, and no other host-built program may be exposed to
+recipe steps.
 
 The host Rust toolchain is therefore a control-plane seed, not the
 distribution's bootstrap seed. After td has a target Rust toolchain,
@@ -23,6 +26,10 @@ the shipped copies of td's own programs are rebuilt as target recipes;
 host-built control-plane binaries do not enter the final image.
 
 ## Target artifact graph
+
+This section is the normative target architecture. Transitional
+mechanisms still present in the tree are migration state, not
+architectural direction; issues and PRs record their current status.
 
 The target distribution begins with the tiny, auditable stage0-posix
 seed. Recipes build the artifact graph directly into `/td/store`:
@@ -48,10 +55,12 @@ and the required archive/compression tools. They remain available as
 declared recipe outputs until the Rust toolchain and Rust userland have
 been built.
 
-Only audited seed executables, outputs of earlier recipes, and
-executables created by the current build may execute inside a target
-build sandbox. Host `/bin`, `/usr`, ambient `PATH`, and arbitrary host
-store paths are never target inputs.
+Recipe steps may execute only audited seed executables, outputs of
+earlier recipes, and executables created by the current build. The
+typed control-plane builder is the sole sandbox exception and executes
+only as the derivation implementation, never from a recipe's `PATH` or
+argv. Host `/bin`, `/usr`, ambient `PATH`, and arbitrary host store
+paths are never target inputs.
 
 `td-builder build` stages those declared inputs and sets the
 compatibility `NIX_STORE` variable to the active td store directory;
@@ -84,10 +93,12 @@ glibc.
 
 Rust dependency sources are fixed-output inputs, not ambient network
 access. Registry crates are selected by committed `Cargo.lock` entries
-and verified against their checksums; git dependencies are pinned by
-commit and fixed-output archive hash. Fetching may populate this source
-closure before the Rust compiler exists, but compilation happens only
-after the transformed Rust toolchain is available.
+and verified against their checksums. Git dependencies are not
+currently supported; introducing one requires explicit dependency
+sign-off and a fixed-output representation pinned by commit and archive
+hash before any build may use it. Fetching may populate the supported
+source closure before the Rust compiler exists, but compilation happens
+only after the transformed Rust toolchain is available.
 
 Cargo builds run offline. Build scripts, proc macros, and crates that
 contain C or assembly are part of the declared build graph and may use
