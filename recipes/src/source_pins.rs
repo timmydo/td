@@ -242,6 +242,17 @@ const PINS: &[PinDef] = &[
         file: "sed-4.2.2.tar.gz",
     },
     PinDef {
+        key: "sed-mesboot0-source",
+        aliases: &[],
+        // GNU sed 4.0.9 — the tcc-era `sed` provider (re #469). The exact
+        // version live-bootstrap builds under tcc + mes libc (its LIBC=mes mk
+        // branch), a cycle-breaker below the first BASE_TOOLS consumer. NOT the
+        // heavier sed 4.2.2 the gcc-mesboot1-era `sed-mesboot` rung uses.
+        url: "https://ftp.gnu.org/gnu/sed/sed-4.0.9.tar.gz",
+        sha256: "c365874794187f8444e5d22998cd5888ffa47f36def4b77517a808dec27c0600",
+        file: "sed-4.0.9.tar.gz",
+    },
+    PinDef {
         key: "stage0-source",
         aliases: &[],
         url: "https://github.com/oriansj/stage0-posix/releases/download/Release_1.9.1/stage0-posix-1.9.1.tar.gz",
@@ -293,8 +304,9 @@ mod tests {
     fn catalog_carries_all_legacy_source_locks() {
         // 32 migrated legacy locks + oyacc-6.6 (the from-source `yacc`) +
         // bash-2.05b (the from-source bootstrap shell it regenerates, re #469) +
-        // sed-4.2.2 (the from-source `sed` provider, re #469).
-        assert_eq!(all().len(), 35);
+        // sed-4.2.2 (the gcc-mesboot1-era `sed` provider, re #469) +
+        // sed-4.0.9 (the tcc-era `sed` cycle-breaker, re #469).
+        assert_eq!(all().len(), 36);
     }
 
     #[test]
