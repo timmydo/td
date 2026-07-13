@@ -317,8 +317,9 @@ mod tests {
         // 32 migrated legacy locks + oyacc-6.6 (the bash shell's `yacc`) +
         // bash-2.05b (the from-source bootstrap shell, re #469) + sed-4.2.2
         // (the gcc-mesboot1-era `sed` provider, re #469) + sed-4.0.9 (the
-        // tcc-era `sed` cycle-breaker, re #469).
-        assert_eq!(pins.len(), 36);
+        // tcc-era `sed` cycle-breaker, re #469) + coreutils-5.0 (the tcc-era
+        // coreutils cycle-breaker, re #469).
+        assert_eq!(pins.len(), 37);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
