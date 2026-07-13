@@ -230,6 +230,18 @@ const PINS: &[PinDef] = &[
         file: "rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz",
     },
     PinDef {
+        key: "sed-mesboot-source",
+        aliases: &[],
+        // GNU sed 4.2.2 — the from-source `sed` provider (re #469), a sibling of
+        // the gawk-mesboot rung: gcc-mesboot1 + glibc-mesboot0 build it exactly as
+        // gawk 3.1.8 is built one tier down. Its gnulib papers over glibc 2.2.5
+        // gaps the same way gawk's does, so no host `sed` need leak onto a rung
+        // that can reach this output.
+        url: "https://ftp.gnu.org/gnu/sed/sed-4.2.2.tar.gz",
+        sha256: "fea0a94d4b605894f3e2d5572e3f96e4413bcad3a085aae7367c2cf07908b2ff",
+        file: "sed-4.2.2.tar.gz",
+    },
+    PinDef {
         key: "stage0-source",
         aliases: &[],
         url: "https://github.com/oriansj/stage0-posix/releases/download/Release_1.9.1/stage0-posix-1.9.1.tar.gz",
@@ -280,8 +292,9 @@ mod tests {
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
         // 32 migrated legacy locks + oyacc-6.6 (the from-source `yacc`) +
-        // bash-2.05b (the from-source bootstrap shell it regenerates, re #469).
-        assert_eq!(all().len(), 34);
+        // bash-2.05b (the from-source bootstrap shell it regenerates, re #469) +
+        // sed-4.2.2 (the from-source `sed` provider, re #469).
+        assert_eq!(all().len(), 35);
     }
 
     #[test]
