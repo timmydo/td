@@ -318,8 +318,9 @@ mod tests {
         // bash-2.05b (the from-source bootstrap shell, re #469) + sed-4.2.2
         // (the gcc-mesboot1-era `sed` provider, re #469) + sed-4.0.9 (the
         // tcc-era `sed` cycle-breaker, re #469) + coreutils-5.0 (the tcc-era
-        // coreutils cycle-breaker, re #469).
-        assert_eq!(pins.len(), 37);
+        // coreutils cycle-breaker, re #469) + grep-2.4 (the tcc-era `grep`
+        // cycle-breaker, re #469).
+        assert_eq!(pins.len(), 38);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));

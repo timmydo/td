@@ -63,6 +63,16 @@ const PINS: &[PinDef] = &[
         file: "gawk-3.1.8.tar.gz",
     },
     PinDef {
+        key: "grep-mesboot0-source",
+        aliases: &[],
+        // GNU grep 2.4 — the tcc-era grep provider (re #469). The exact version
+        // live-bootstrap builds under tcc + mes libc (its grep-2.4 step), a
+        // cycle-breaker below the first BASE_TOOLS consumer.
+        url: "https://ftp.gnu.org/gnu/grep/grep-2.4.tar.gz",
+        sha256: "a32032bab36208509466654df12f507600dfe0313feebbcd218c32a70bf72a16",
+        file: "grep-2.4.tar.gz",
+    },
+    PinDef {
         key: "gcc-14-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/gcc/gcc-14.3.0/gcc-14.3.0.tar.xz",
@@ -316,8 +326,9 @@ mod tests {
         // bash-2.05b (the from-source bootstrap shell it regenerates, re #469) +
         // sed-4.2.2 (the gcc-mesboot1-era `sed` provider, re #469) +
         // sed-4.0.9 (the tcc-era `sed` cycle-breaker, re #469) +
-        // coreutils-5.0 (the tcc-era coreutils cycle-breaker, re #469).
-        assert_eq!(all().len(), 37);
+        // coreutils-5.0 (the tcc-era coreutils cycle-breaker, re #469) +
+        // grep-2.4 (the tcc-era `grep` cycle-breaker, re #469).
+        assert_eq!(all().len(), 38);
     }
 
     #[test]
