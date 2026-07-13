@@ -14,11 +14,11 @@ The host builder supplies a pinned Rust toolchain used to compile td's
 control-plane programs (`td-builder`, `td-recipe-eval`, `td-fetch`,
 and related tools). These programs may evaluate recipes, fetch
 declared fixed-output sources, construct sandboxes, and place outputs.
-The derivation builder itself is staged and executed with explicit
-`ControlPlaneBuilder` provenance solely to implement the build. That
-typed exception does not make it a recipe tool, target artifact, or
-runtime dependency, and no other host-built program may be exposed to
-recipe steps.
+The `td-builder` executable that implements a derivation is staged and
+executed with explicit `ControlPlaneBuilder` provenance solely to run
+that build. This typed exception does not make it a recipe tool, target
+artifact, or runtime dependency, and no other host-built program may be
+exposed to recipe steps.
 
 The host Rust toolchain is therefore a control-plane seed, not the
 distribution's bootstrap seed. After td has a target Rust toolchain,
@@ -42,8 +42,8 @@ stage0-posix (hex0/kaem lineage)
   -> iterative binutils/GCC/glibc bootstrap
   -> native binutils/GCC/glibc and GNU build userland
   -> transformed upstream Rust bootstrap snapshot
-  -> source-built stage1 Rust compiler and standard library
-  -> source-built stage2 Rust toolchain
+  -> source-built stage1 Rust compiler and in-tree standard library
+  -> full-bootstrap source-built stage2 Rust toolchain
   -> target-built td tools and Rust userland
   -> uutils-based distribution closure and image
 ```
@@ -77,27 +77,35 @@ build userland exist. td pins both a Rust source release and the exact
 upstream bootstrap snapshot required by that source; "latest" is never
 resolved ambiently, and changing either pin is a reviewed update.
 
-The bootstrap snapshot contains rustc, Cargo, rust-std, and the
-compiler sysroot. It is a declared fixed-output source transformed by a
-td recipe. The recipe unpacks the snapshot with the dependency-free
-`td-builder`, rewrites rustc and Cargo's ELF interpreters with td's
-in-process ELF editor, and supplies the declared td-built runtime
-closure (including glibc, libgcc_s, and zlib). The result is a normal
-content-addressed `/td/store` recipe output used only as Rust stage0.
+The bootstrap snapshot contains rustc, Cargo, rust-std, the compiler
+sysroot, and compiler runtime libraries such as its prebuilt LLVM. It
+is a declared fixed-output source transformed by a td recipe. The
+recipe unpacks the snapshot with the dependency-free `td-builder`,
+rewrites rustc and Cargo's ELF interpreters with td's in-process ELF
+editor, and supplies the declared td-built runtime closure (including
+glibc, libgcc_s, and zlib). The result is a normal content-addressed
+`/td/store` recipe output used only as Rust stage0.
 
 The retargeted stage0 compiler builds compiler artifacts from the
 pinned Rust source and assembles them as stage1. Stage1 builds the
 in-tree standard library, then rebuilds the compiler against that
-source-built library as stage2. Source-built stage2 rustc, rust-std,
-and Cargo form td's shipped `/td/store` Rust toolchain; the downloaded
-stage0 tree is excluded from final distribution closures. The Rust
-source tree, its Cargo source closure, LLVM, and every native build tool
-are declared inputs built or fetched under the same recipe rules. A
-prebuilt LLVM would be a separate binary trust exception and requires
-explicit sign-off.
+source-built library as stage2. td enables Rust's full-bootstrap mode:
+stage2 rebuilds the final rust-std rather than uplifting the stage1
+library, and in-tree Cargo is built with the source-built toolchain.
+Those stage2 rustc, rust-std, and Cargo outputs form td's shipped
+`/td/store` Rust toolchain; no downloaded Cargo, library, or other
+stage0 byte enters a final distribution closure.
 
-The downloaded compiler and prebuilt standard library remain an
-explicit bootstrap trust root: rebuilding stage2 from source improves
+The Rust source tree, its Cargo source closure, LLVM source, and every
+native build tool are declared inputs built or fetched under the same
+recipe rules. Using a prebuilt LLVM in the shipped stage2 toolchain
+would be a separate binary trust exception and requires explicit
+sign-off; the prebuilt LLVM used by the bootstrap snapshot is already
+part of the stage0 trust root and is excluded from final closures.
+
+The entire downloaded stage0 closure remains an explicit bootstrap
+trust root, including its compiler, Cargo, standard library, compiler
+runtime, and LLVM libraries. Rebuilding stage2 from source improves
 artifact provenance but does not by itself defeat a trusting-trust
 compiler. A stronger claim requires a separately specified diverse
 bootstrap or diverse-double-compilation proof.
@@ -105,9 +113,10 @@ bootstrap or diverse-double-compilation proof.
 Both the bootstrap snapshot and source-built toolchain must run without
 host `/bin`, `/usr`, or libraries and resolve every dynamic dependency
 from their declared closures. The Rust bridge test builds stage2,
-excludes stage0 from its runtime closure, and uses stage2 to compile,
-link, and run a program against td's native toolchain and glibc. An
-optional stage3 rebuild is the same-result backstop.
+asserts that full-bootstrap did not uplift stage1 or copy any stage0
+bytes, and uses stage2 to compile, link, and run a program against td's
+native toolchain and glibc. An optional stage3 rebuild is the
+same-result backstop.
 
 ## Rust dependencies and final userland
 
@@ -117,8 +126,10 @@ and verified against their checksums. Git dependencies are not
 currently supported; introducing one requires explicit dependency
 sign-off and a fixed-output representation pinned by commit and archive
 hash before any build may use it. Fetching may populate the supported
-source closure before the Rust compiler exists, but compilation happens
-only after the source-built stage2 Rust toolchain is available.
+source closure before the Rust compiler exists. Rust's own pinned
+compiler and standard-library sources are compiled during the staged
+Rust bootstrap; compilation of td tools and distribution packages
+happens only after the source-built stage2 Rust toolchain is available.
 
 Cargo builds run offline. Build scripts, proc macros, and crates that
 contain C or assembly are part of the declared build graph and may use
