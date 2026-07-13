@@ -18,7 +18,8 @@ use crate::types::{Recipe, Step, TextEdit};
 //     `make LIBC=mes`. td bakes that Makefile (sed-mesboot0.mk) with tcc/mes
 //     paths, and a config.h holding only the three string-valued defines
 //     live-bootstrap passes as -D (their escaped quotes can't cross td's
-//     no-shell make — see sed-mesboot0-config.h).
+//     no-shell make; sed.h / lib include config.h under -DHAVE_CONFIG_H, which
+//     the Makefile's CFLAGS set — see sed-mesboot0-config.h).
 //   * No host make shell: td's Make 3.80 drives the build; every recipe line is
 //     metacharacter-free, so make execs tcc via its no-shell fast path.
 //   * No `cp`: the one generated file live-bootstrap's mk makes with a `cp`

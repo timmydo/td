@@ -12,8 +12,9 @@
 #
 #   * Its CPPFLAGS carry three STRING-valued defines (VERSION, PACKAGE,
 #     SED_FEATURE_VERSION) whose escaped quotes ARE a metacharacter; those move
-#     into config.h (sed.h #includes it unconditionally). See
-#     sed-mesboot0-config.h. Only the quote-free defines stay below.
+#     into config.h, which sed.h / lib include under -DHAVE_CONFIG_H (set in
+#     CFLAGS below). See sed-mesboot0-config.h. Only the quote-free defines stay
+#     on the command line.
 #   * All compile flags live in CFLAGS (not split into CPPFLAGS). The per-object
 #     sources compile through make's built-in %.o:%.c rule — as in oyacc.mk,
 #     which relies on the same built-in — and that rule is guaranteed to pass
@@ -23,12 +24,15 @@
 CC =		{in:tcc}/bin/tcc
 AR =		{in:tcc}/bin/tcc -ar
 
-# Quote-free defines + include paths. -I. and -Ilib FIRST so sed's own headers
-# and the generated lib/regex.h (see the recipe's regex.h symlink) resolve
-# before mes's libc headers, exactly as live-bootstrap's `-I . -I lib` intends.
-# ENABLE_NLS=0 compiles out sed.c's setlocale/bindtextdomain/textdomain (mes
-# libc has no locale/gettext); HAVE_FCNTL_H/HAVE_ALLOCA_H match mes libc.
-CFLAGS =	-DENABLE_NLS=0 -DHAVE_FCNTL_H -DHAVE_ALLOCA_H -I. -Ilib -I{in:mes}/include -I{in:mes}/include/x86
+# HAVE_CONFIG_H activates config.h: sed.h / lib gate `#include "config.h"` on it
+# (as autoconf'd trees do), and config.h carries the three string defines moved
+# off the command line — the same `DEFS = -DHAVE_CONFIG_H` patch-mesboot.mk sets.
+# Quote-free feature defines + include paths follow. -I. and -Ilib FIRST so sed's
+# own headers and the generated lib/regex.h (see the recipe's regex.h symlink)
+# resolve before mes's libc headers, exactly as live-bootstrap's `-I . -I lib`
+# intends. ENABLE_NLS=0 compiles out sed.c's setlocale/bindtextdomain/textdomain
+# (mes libc has no locale/gettext); HAVE_FCNTL_H/HAVE_ALLOCA_H match mes libc.
+CFLAGS =	-DHAVE_CONFIG_H -DENABLE_NLS=0 -DHAVE_FCNTL_H -DHAVE_ALLOCA_H -I. -Ilib -I{in:mes}/include -I{in:mes}/include/x86
 
 # -L. -lsed pulls the just-built libsed.a; -static because mes libc is
 # static-only and the rung asserts a fully static ELF. tcc finds its own

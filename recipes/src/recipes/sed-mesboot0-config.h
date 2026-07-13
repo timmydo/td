@@ -11,10 +11,11 @@
    and leaves only the quote-free defines on the command line (see
    sed-mesboot0.mk CFLAGS).
 
-   sed.h #includes "config.h" unconditionally (sed.h:21), and every sed/*.c
-   #includes "sed.h", so all three defines reach the two files that use them:
-   PACKAGE (sed.c usage banner), VERSION (sed.c --version), and
-   SED_FEATURE_VERSION (compile.c's script-version check). */
+   sed.h #includes "config.h" under `#ifdef HAVE_CONFIG_H` (sed.h:20), and the
+   Makefile's CFLAGS set -DHAVE_CONFIG_H; every sed/*.c #includes "sed.h", so all
+   three defines reach the two files that use them: PACKAGE (sed.c usage banner),
+   VERSION (sed.c --version), and SED_FEATURE_VERSION (compile.c's script-version
+   check). */
 #define VERSION "4.0.9"
 #define PACKAGE "sed"
 #define SED_FEATURE_VERSION "4.0"
