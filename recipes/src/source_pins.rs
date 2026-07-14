@@ -63,6 +63,18 @@ const PINS: &[PinDef] = &[
         file: "gawk-3.1.8.tar.gz",
     },
     PinDef {
+        key: "gawk-mesboot0-source",
+        aliases: &[],
+        // GNU awk 3.0.4 — the tcc-era `gawk` provider (re #469). The exact
+        // version live-bootstrap builds under tcc + mes libc (its gawk-3.0.4
+        // step), a cycle-breaker below the first BASE_TOOLS consumer — NOT the
+        // heavier gcc-mesboot1-era gawk 3.1.8 the separate `gawk-mesboot` rung
+        // uses.
+        url: "https://ftp.gnu.org/gnu/gawk/gawk-3.0.4.tar.gz",
+        sha256: "5cc35def1ff4375a8b9a98c2ff79e95e80987d24f0d42fdbb7b7039b3ddb3fb0",
+        file: "gawk-3.0.4.tar.gz",
+    },
+    PinDef {
         key: "grep-mesboot0-source",
         aliases: &[],
         // GNU grep 2.4 — the tcc-era grep provider (re #469). The exact version
@@ -327,8 +339,9 @@ mod tests {
         // sed-4.2.2 (the gcc-mesboot1-era `sed` provider, re #469) +
         // sed-4.0.9 (the tcc-era `sed` cycle-breaker, re #469) +
         // coreutils-5.0 (the tcc-era coreutils cycle-breaker, re #469) +
-        // grep-2.4 (the tcc-era `grep` cycle-breaker, re #469).
-        assert_eq!(all().len(), 38);
+        // grep-2.4 (the tcc-era `grep` cycle-breaker, re #469) +
+        // gawk-3.0.4 (the tcc-era `gawk` cycle-breaker, re #469).
+        assert_eq!(all().len(), 39);
     }
 
     #[test]
