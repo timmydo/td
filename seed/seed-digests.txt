@@ -12,6 +12,7 @@ binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
 busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 gawk-mesboot-source 128bh62a669ds6v5q6v2sih5a1qk51wj-gawk-mesboot-source
+gawk-mesboot0-source zdx7nfqxa7pddqpip7bpa13d79d5p7q2-gawk-mesboot0-source
 gcc-14-source 2h3c0xxmf2jf5hywqbmlsnww6cwkq4nq-gcc-14-source
 gcc-464-core 50l0crhlqjqajvfkvjj31bxz842h5fkm-gcc-464-core
 gcc-464-gpp 364rq9bch5a1cli1ifbhihic3vdl52ch-gcc-464-gpp
