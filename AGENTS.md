@@ -216,8 +216,8 @@ marks it ready — never ask the human to look at a PR still labeled
 draft, and never leave a finished PR in draft (the human reads draft
 as "don't review yet").  If the human asks about a draft PR, treat it
 as the signal your readiness state drifted: reconcile immediately
-(mark ready or say what's missing).  Marking ready REQUIRES both code
-reviews (the subagent review AND the cross-model CLI review) to
+(mark ready or say what's missing).  Marking ready REQUIRES all three
+code reviews (the subagent review AND both cross-model CLI reviews) to
 already be POSTED on the PR with their findings addressed
 
 Work in your own git worktree/branch.
@@ -225,30 +225,44 @@ Work in your own git worktree/branch.
 Never `git stash` in this repo. The stash stack (`refs/stash`) is
   repo-*global*.
 
-Every PR gets TWO independent code reviews — the subagent review AND a
-cross-model review by a different model's CLI — both waivable only for
-documentation changes, and only if you say so in the PR. Run the
-cross-model reviewer at a strong model + high reasoning effort, and
-feed it the branch diff on stdin — a bare `git diff` is empty once the
-branch is committed, so pipe `git diff origin/main...HEAD` so the
-cross-model reviewer audits the same full branch diff the subagent
-does. Subagents MUST post their review findings to the PR as a comment
-(unfiltered by the main agent requesting it).
+Every PR gets THREE independent code reviews — a subagent review AND
+two cross-model reviews, each by a different model's CLI — waivable
+only for documentation changes, and only if you say so in the PR:
+spawn an independent code-review subagent over the full branch diff
+(`/code-review`), AND run two further reviews with *different* models
+driven from their CLIs so two distinct models each audit the same diff
+(catches blind spots one model shares with its own subagent). Which
+three reviewer identities apply depends on which model is the acting
+agent for the PR:
 
-Claude runs Codex (gpt-5.6-sol, xhigh): 
+- **Acting agent is Claude:** subagent review at Opus 4.8, plus a
+  Codex CLI review and an Agy (Antigravity) CLI review.
+- **Acting agent is Codex:** subagent review at gpt-5.6-sol, plus a
+  Claude CLI review and an Agy CLI review.
+
+Run every cross-model reviewer at a strong model + high reasoning
+effort, and feed it the branch diff on stdin — a bare `git diff` is
+empty once the branch is committed, so pipe `git diff
+origin/main...HEAD` so each cross-model reviewer audits the same full
+branch diff the subagent does. Subagents MUST post their review
+findings to the PR as a comment (unfiltered by the main agent
+requesting it).
+
+Claude runs Codex (gpt-5.6-sol, xhigh):
 
 ```
 git diff origin/main...HEAD | codex exec --model gpt-5.6-sol -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible. Post the review as comment on PR #<insert number>"
 ```
 
-and Codex runs Claude (Opus 4.8, xhigh): 
+Codex runs Claude (Opus 4.8, xhigh):
 ```
 git diff origin/main...HEAD | claude -p --model opus --effort xhigh "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible. Post the review as comment on PR #<insert number>"
 ``` 
 
-Codex can also run Antigravity (Gemini 3.1 Pro High) as a distinct
-cross-model CLI reviewer. `agy --print` reads stdin but does not post
-to GitHub itself in plan mode, so post its raw output unchanged:
+Either acting agent also runs Antigravity (Gemini 3.1 Pro High) as the
+third, shared cross-model reviewer. `agy --print` reads stdin but does
+not post to GitHub itself in plan mode, so post its raw output
+unchanged:
 
 ```
 git diff origin/main...HEAD | agy --model "Gemini 3.1 Pro (High)" --mode plan --print-timeout 10m --print "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/agy-review.md
