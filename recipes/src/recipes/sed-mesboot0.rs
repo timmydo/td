@@ -35,8 +35,8 @@ use crate::types::{Recipe, Step, TextEdit};
 //     by an `input->fp' test alone, from "no open stream". sed's test_eof() and
 //     last_file_with_data_p() both make exactly that test, so an open stdin is
 //     misread as EOF and the `N'/`n'/`$' commands fire a false EOF on stdin's
-//     FIRST line. That silently truncates config.status's subs.awk (built with two
-//     stdin-reading seds, the second doing `/.../{N;s/\n//}'). The two
+//     FIRST line. That silently truncates config.status's subs.awk (assembled by a
+//     sed pipeline whose stages read stdin and join lines with `N'). The two
 //     SubstituteTexts below switch both guards to sed's own no-stream sentinel
 //     (read_fn == read_always_fail); see the steps for the rationale, and the
 //     stdin smoke tests at the tail for the regression that catches it.
@@ -70,15 +70,18 @@ pub fn recipe() -> Recipe {
     // OR a `<file' redirect — ALSO has input->fp == NULL and is misread as
     // end-of-file. That makes `N', `n', and `$' fire a false EOF on the FIRST line
     // whenever sed reads stdin, so e.g. `printf 'a\nb\n' | sed N' emits only "a".
-    // autoconf-2.64 config.status builds subs.awk with
-    // `sed -n <conf.subs | sed '/^[^""]/{N;s/\n//}'' (BOTH seds reading stdin — the
-    // first via `n', the second via `N'), so binutils/gcc-core config.status
-    // silently produces a truncated, unparsable subs.awk.
+    // autoconf-2.64 config.status assembles subs.awk by feeding conf.subs through a
+    // sed pipeline whose stages read stdin (a `<file' redirect into a pipe) and join
+    // lines with `N', so on mes those stages false-EOF on their first line and
+    // binutils/gcc-core config.status silently produces a truncated, unparsable
+    // subs.awk.
     //
     // Fix both sites by testing sed's OWN no-stream sentinel instead of fp:
     // read_fn == read_always_fail. open_next_file() sets read_fn = read_always_fail
-    // ONLY on a failed open (its "a redundancy" line) and closedown() sets it with
-    // fp=NULL; every successful open — a named file OR stdin — sets
+    // ONLY on a failed open (its "a redundancy" line), and closedown() sets it up
+    // front (execute.c:555) — BEFORE its own `!input->fp' early-out, which on an
+    // open mes stdin skips the later fp=NULL, so read_fn is the MORE reliable
+    // sentinel; every successful open — a named file OR stdin — sets
     // read_fn = read_file_line. So `read_fn == read_always_fail' means exactly "no
     // valid open stream": equivalent to `!fp' on glibc and correct on mes.
     // read_always_fail is a static fn declared above both call sites. A named FILE
@@ -177,13 +180,15 @@ pub fn recipe() -> Recipe {
 
     // stdin regression (re #469): the file-fed smoke above never exercises the mes
     // stdin==NULL bug — a named FILE has a real fp. Drive the exact idioms that
-    // tripped config.status over a real pipe (and a `file -' list), using the
-    // td-built bash-mesboot only to supply stdin. Each sub-test writes its output
-    // to a file that the follow-up SubstituteText pins to the byte-exact expected
-    // value, so an UNPATCHED sed — which false-EOFs on stdin's first line — reds
-    // the rung: run 1 would emit "a\n", run 2 "1\n", run 3 "2\n". The bash `-c'
-    // lines deliberately use `|'/`>' (metacharacters) — that is bash's job here,
-    // not make's no-shell path. printf is a bash-mesboot builtin.
+    // tripped config.status, using the td-built bash-mesboot only to supply stdin.
+    // Each sub-test compares sed's output to the expected with the `test' builtin:
+    // a mismatch exits non-zero and reds the rung. Command substitution `$(…)'
+    // captures the WHOLE output (bar trailing newlines) and `test STR = STR' is a
+    // full-string compare, so leading/embedded garbage cannot slip past (a plain
+    // substring check would let e.g. "14" satisfy "4"). An UNPATCHED sed — which
+    // false-EOFs on stdin's first line — yields "a", "1", "2" respectively and
+    // reds. The bash `-c' lines use `|' (a metacharacter) — that is bash's job
+    // here, not make's no-shell path. printf and test are bash-mesboot builtins.
     //
     //   1. `N'-join over a stdin PIPE  → test_eof / `N' (the subs.awk failure mode)
     steps.push(
@@ -192,16 +197,12 @@ pub fn recipe() -> Recipe {
             &[
                 "{in:bash-mesboot}/bin/bash",
                 "-c",
-                "printf 'a\\nb\\nc\\nd\\n' | {out}/bin/sed 'N;s/\\n/-/' > r_join",
+                "exp=$(printf 'a-b\\nc-d'); out=$(printf 'a\\nb\\nc\\nd\\n' | {out}/bin/sed 'N;s/\\n/-/'); test \"$out\" = \"$exp\"",
             ],
         )
         .env("LANG", "")
         .env("LC_ALL", ""),
     );
-    steps.push(Step::substitute_text(
-        "{src}/r_join",
-        vec![TextEdit::new("a-b\nc-d\n", "a-b\nc-d\n", 1)],
-    ));
     //   2. `$=' last-line count over a stdin PIPE → test_eof / `$'
     steps.push(
         Step::run(
@@ -209,16 +210,12 @@ pub fn recipe() -> Recipe {
             &[
                 "{in:bash-mesboot}/bin/bash",
                 "-c",
-                "printf 'a\\nb\\nc\\nd\\n' | {out}/bin/sed -n '$=' > r_nlines",
+                "out=$(printf 'a\\nb\\nc\\nd\\n' | {out}/bin/sed -n '$='); test \"$out\" = 4",
             ],
         )
         .env("LANG", "")
         .env("LC_ALL", ""),
     );
-    steps.push(Step::substitute_text(
-        "{src}/r_nlines",
-        vec![TextEdit::new("4\n", "4\n", 1)],
-    ));
     //   3. `$p' across a `file -' list — stdin is the LAST input, so the correct
     //      last line is stdin's "x" (a buggy last_file_with_data_p prints f1.txt's
     //      "2" and never reads stdin). f1.txt is the earlier, non-stdin input.
@@ -233,16 +230,12 @@ pub fn recipe() -> Recipe {
             &[
                 "{in:bash-mesboot}/bin/bash",
                 "-c",
-                "printf 'x\\n' | {out}/bin/sed -n '$p' f1.txt - > r_lastp",
+                "out=$(printf 'x\\n' | {out}/bin/sed -n '$p' f1.txt -); test \"$out\" = x",
             ],
         )
         .env("LANG", "")
         .env("LC_ALL", ""),
     );
-    steps.push(Step::substitute_text(
-        "{src}/r_lastp",
-        vec![TextEdit::new("x\n", "x\n", 1)],
-    ));
 
     Recipe::mesboot("sed-mesboot0", "4.0.9")
         .source_input("sed-mesboot0-source")
