@@ -78,16 +78,22 @@ exit 0 }";
 // binutils-mesboot0 / gcc-core-mesboot0 rungs generate. Its `split`/`length`/
 // `substr(line, 1, len)` / `substr(line, len + keylen + 3)` / `len += ...`
 // arithmetic on string lengths and indices is exactly what a miscompiled gawk
-// (broken double->int) would corrupt, producing garbled Makefiles. The engine is
-// verbatim config.status; the ONLY adaptation is the output sink — `print line`
-// writes to the file `subs.out` (via mes's correct Linux O_* fcntl.h) instead of
-// stdout, so the rung asserts exact bytes with SubstituteText and needs no shell.
+// (broken double->int) would corrupt, producing garbled Makefiles. The seeding
+// is config.status's own idiom too: the S[] values are assigned, then
+// `for (key in S) S_is_set[key] = 1` derives the membership set by iterating the
+// array (NOT hand-seeded) -- so this also exercises gawk's `for (key in array)`,
+// the load-bearing statement that decides which @VAR@ markers get substituted.
+// The adaptations from real config.status are two, both immaterial to the
+// arithmetic: the output sink -- `print line` writes to the file `subs.out` (via
+// mes's correct Linux O_* fcntl.h) instead of stdout, so the rung asserts exact
+// bytes with SubstituteText and needs no shell -- and dropping config.status's
+// trailing `FS = ""` (the split passes an explicit "@" separator, so FS never
+// participates, and gawk 3.0.4's empty-FS handling is beside the point here).
 const SUBS_AWK: &str = "\
 BEGIN {\n\
-S_is_set[\"CC\"] = 1\n\
 S[\"CC\"] = \"tcc\"\n\
-S_is_set[\"PREFIX\"] = 1\n\
 S[\"PREFIX\"] = \"/td/store\"\n\
+for (key in S) S_is_set[key] = 1\n\
 }\n\
 {\n\
   line = $0\n\
