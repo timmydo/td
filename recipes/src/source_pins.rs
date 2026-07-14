@@ -56,6 +56,17 @@ const PINS: &[PinDef] = &[
         file: "coreutils-5.0.tar.bz2",
     },
     PinDef {
+        key: "diffutils-mesboot0-source",
+        aliases: &[],
+        // GNU diffutils 2.7 — the tcc-era `diffutils` provider (re #469). The exact
+        // version live-bootstrap builds under tcc + mes libc (its diffutils-2.7
+        // step), a cycle-breaker below the first BASE_TOOLS consumer. Ships `cmp`
+        // and `diff`, the last of the five BASE_TOOLS host tools to gain a provider.
+        url: "https://ftp.gnu.org/gnu/diffutils/diffutils-2.7.tar.gz",
+        sha256: "d5f2489c4056a31528e3ada4adacc23d498532b0af1a980f2f76158162b139d6",
+        file: "diffutils-2.7.tar.gz",
+    },
+    PinDef {
         key: "gawk-mesboot-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/gawk/gawk-3.1.8.tar.gz",
@@ -340,8 +351,9 @@ mod tests {
         // sed-4.0.9 (the tcc-era `sed` cycle-breaker, re #469) +
         // coreutils-5.0 (the tcc-era coreutils cycle-breaker, re #469) +
         // grep-2.4 (the tcc-era `grep` cycle-breaker, re #469) +
-        // gawk-3.0.4 (the tcc-era `gawk` cycle-breaker, re #469).
-        assert_eq!(all().len(), 39);
+        // gawk-3.0.4 (the tcc-era `gawk` cycle-breaker, re #469) +
+        // diffutils-2.7 (the tcc-era `diffutils` cycle-breaker, re #469).
+        assert_eq!(all().len(), 40);
     }
 
     #[test]
