@@ -84,11 +84,28 @@
 ./tcc-boot4 -c -g -D TCC_TARGET_I386=1 -D HAVE_FLOAT=1 -o libtcc1.o {in:mes}/lib/libtcc1.c
 ./tcc-boot4 -ar cr {out}/lib/tcc/libtcc1.a libtcc1.o
 
-# final gen -> tcc (caller tcc-boot4); tcc-boot5 in boot.sh, installed as tcc
+# final gen -> tcc (caller tcc-boot4); tcc-boot5 in boot.sh, installed as tcc.
+#
+# The mescc->tcc ladder does NOT converge to a correct constant folder. boot4's
+# folder was miscompiled by an earlier generation: it mis-folds the 64-bit
+# constant left-shift `(long long)1 << 52` (the shift COUNT lands in the high
+# dword instead of 2^52). Continuing the ladder does not help -- boot5 and every
+# further self-compile (boot6/7/8) mis-fold it IDENTICALLY (verified: all four
+# fold const_hi=52, and boot7 == boot8), so the ladder reaches a byte-identical
+# but still-broken fixed point. The RUNTIME 64-bit shift codegen is correct; only
+# the compile-time fold is wrong (re #469, see #488).
+#
+# That one mis-folded constant is libtcc1's `HIDDEND_LL ((long long)1 << 52)`
+# mantissa mask, so tcc's soft-float `__fixdfdi`/`__fixunsdfdi` return 0 and every
+# runtime double->int converts to 0. tcc.rs patches HIDDEND_LL to a fold-safe
+# 64-bit literal before this build, so the shipped libtcc1 (rebuilt from
+# lib/libtcc1.c in Phase 4) converts correctly. The general compiler fold bug is
+# NOT fixed here and is tracked in #491.
 ./tcc-boot4 -g -v -static -o tcc -D BOOTSTRAP=1 -D HAVE_BITFIELD=1 -D HAVE_FLOAT=1 -D HAVE_LONG_LONG=1 -D HAVE_SETJMP=1 -I . -I {in:mes}/lib -I {in:mes}/include -D TCC_TARGET_I386=1 -D inline= -D CONFIG_TCCBOOT=1 -D CONFIG_TCC_STATIC=1 -D CONFIG_USE_LIBGCC=1 -D TCC_MES_LIBC=1 -D ONE_SOURCE=1 -L . tcc.c
 
 # ---- Phase 4: final lib rebuild with the installed tcc ---------------------
-# libtcc1 now from tcc's own lib/libtcc1.c (bootstrap.sh tail).
+# libtcc1 now from tcc's own lib/libtcc1.c (bootstrap.sh tail), with HIDDEND_LL
+# patched fold-safe (tcc.rs) so the shipped __fixdfdi converts correctly.
 ./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -g -static -nostdlib -nostdinc -c -o {out}/lib/crt1.o {in:mes}/lib/crt1.c
 ./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -g -static -nostdlib -nostdinc -c -o {out}/lib/crti.o {in:mes}/lib/crti.c
 ./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -g -static -nostdlib -nostdinc -c -o {out}/lib/crtn.o {in:mes}/lib/crtn.c
@@ -99,3 +116,12 @@
 ./tcc -ar cr {out}/lib/libtcc1.a libtcc1.o
 ./tcc -I {in:mes}/include -I {in:mes}/lib -D BOOTSTRAP=1 -c -g -o libgetopt.o {in:mes}/lib/libgetopt.c
 ./tcc -ar cr {out}/lib/libgetopt.a libgetopt.o
+
+# ---- Phase 4 tail: fail-closed runtime double->int self-test ---------------
+# Compile + run a runtime double->int / double->long long probe with the final
+# tcc and the libtcc1 just rebuilt above. `volatile` forces the RUNTIME
+# __fixdfdi path (not the separate compile-time (int)5.0 fold, #491); the probe
+# exits 1 on any wrong result, so kaem --strict reds the rung if the shipped
+# __fixdfdi ever regresses to the pre-patch (double->int == 0) symptom (re #469).
+./tcc -g -static -I {in:mes}/include -I {in:mes}/lib -o tcc-dttest tcc-dttest.c
+./tcc-dttest
