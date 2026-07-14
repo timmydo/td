@@ -1,5 +1,5 @@
 use crate::ladder::unpack_into;
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, Step, TextEdit};
 
 // TinyCC (mes fork, 0.9.26-1149-g46a75d0c) — bootstrap rung 3 (#378), the FIRST
 // rung cut off host executables (re #469).
@@ -29,6 +29,11 @@ use crate::types::{Recipe, Step};
 // there, so no cp/mkdir applet is needed.
 const CONFIG_H: &str = include_str!("tcc-config.h");
 const BUILD_KAEM: &str = include_str!("tcc.kaem");
+// A tiny helper the kaem script compiles with the rung's own tcc: a fail-closed
+// runtime double->int self-test that reds the rung if libtcc1's __fixdfdi
+// regresses to the pre-patch (double->int == 0) symptom (re #469; rationale in
+// tcc.kaem and in the HIDDEND_LL patch below).
+const DTTEST_C: &str = include_str!("tcc-dttest.c");
 
 pub fn recipe() -> Recipe {
     let mut steps = unpack_into("tcc-source", "{src}");
@@ -47,6 +52,34 @@ pub fn recipe() -> Recipe {
         content: BUILD_KAEM.into(),
         exec: false,
     });
+    steps.push(Step::WriteFile {
+        path: "{src}/tcc-dttest.c".into(),
+        content: DTTEST_C.into(),
+        exec: false,
+    });
+    // Fold-safe HIDDEND_LL (re #469, see #488; general fold bug tracked in #491).
+    //
+    // This tcc-0.9.26 closure mis-folds the 64-bit constant left-shift
+    // `(long long)1 << 52`: the shift COUNT lands in the high dword instead of
+    // 2^52. libtcc1.c uses that shift as the mantissa mask
+    //   #define HIDDEND_LL   ((long long)1 << 52)
+    // in the soft-float helpers `__fixunsdfdi`/`__fixdfdi` that i386 tcc calls
+    // for every double->int, so a corrupt mask makes them return 0. The bug is a
+    // compile-time FOLD defect (the runtime shift codegen is correct) and it does
+    // NOT converge away: boot5 and every further self-compile (boot6/7/8) mis-fold
+    // it identically. Rewrite the one shipped consequence to a fold-safe literal
+    // (same value, no shift to mis-fold) so the shipped __fixdfdi converts
+    // correctly. The count is checked (exactly one define), and the fail-closed
+    // double->int self-test in tcc.kaem's Phase 4 reds the rung if this ever stops
+    // working. This does NOT fix the compiler's general 64-bit fold (see #491).
+    steps.push(Step::substitute_text(
+        "{src}/lib/libtcc1.c",
+        vec![TextEdit::new(
+            "#define HIDDEND_LL\t((long long)1 << 52)",
+            "#define HIDDEND_LL\t0x0010000000000000LL",
+            1,
+        )],
+    ));
     // Drive the build under stage0's kaem. --strict fails the rung on the first
     // non-zero command (fail-closed). MES_*/M1/HEX2/BLOOD_ELF are the env mes's
     // mescc.scm reads; PATH points only at the stage0 seed bin.
