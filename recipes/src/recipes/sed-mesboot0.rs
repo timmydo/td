@@ -6,9 +6,10 @@ use crate::types::{Recipe, Step, TextEdit};
 // binutils-mesboot0 up still name the HOST guix `sed` (via base_inputs); that is
 // host-executable ingress the bootstrap must close. This rung builds `sed` from
 // source under tcc + mes libc — the tcc/make/oyacc/patch pattern — so those
-// rungs can consume a td-built `sed` instead. It sits with oyacc and
-// patch-mesboot on {mes, tcc, make-mesboot0}, below bash-mesboot, so nothing it
-// depends on can depend on it.
+// rungs can consume a td-built `sed` instead. Its BUILD inputs are {mes, tcc,
+// make-mesboot0} — the same set as its siblings oyacc and patch-mesboot — plus a
+// test-only dependency on bash-mesboot (which supplies stdin for the regression
+// smoke). None of those, transitively, depends on sed, so there is no cycle.
 //
 // This is live-bootstrap's sed-4.0.9 (the exact tcc-era version it builds, NOT
 // the heavier gcc-mesboot1-era sed-4.2.2 the separate `sed-mesboot` rung uses),
@@ -25,11 +26,25 @@ use crate::types::{Recipe, Step, TextEdit};
 //   * No `cp`: the one generated file live-bootstrap's mk makes with a `cp`
 //     rule — lib/regex.h, a copy of lib/regex_.h that lib/regex.c and sed.h
 //     #include — is created here as an engine-native relative symlink.
-//   * No source patches: live-bootstrap applies none to sed-4.0.9, and td uses
-//     the same pinned tcc 0.9.26 + mes 0.27.1, so the sources compile as-is.
+//   * One td-originated source fix, at two sentinel sites: live-bootstrap applies
+//     no patch to sed-4.0.9, but it never routes a stdin-reading autoconf
+//     `config.status' pipe through this tcc-era sed. td does (re #469: the
+//     binutils/gcc-core rungs' configure), which trips a latent sed 4.0.9 +
+//     mes-0.27.1 bug. mes defines `stdin' as (FILE*)0 == NULL, so an OPEN stdin
+//     (a pipe or a `<file' redirect) has input->fp == NULL — indistinguishable,
+//     by an `input->fp' test alone, from "no open stream". sed's test_eof() and
+//     last_file_with_data_p() both make exactly that test, so an open stdin is
+//     misread as EOF and the `N'/`n'/`$' commands fire a false EOF on stdin's
+//     FIRST line. That silently truncates config.status's subs.awk (assembled by a
+//     sed pipeline whose stages read stdin and join lines with `N'). The two
+//     SubstituteTexts below switch both guards to sed's own no-stream sentinel
+//     (read_fn == read_always_fail); see the steps for the rationale, and the
+//     stdin smoke tests at the tail for the regression that catches it.
 //
-// Inputs are mes (headers + libc), tcc (compiler), and make-mesboot0 (`make`) —
-// no host tools.
+// Build inputs are mes (headers + libc), tcc (compiler), and make-mesboot0
+// (`make`) — no host tools. bash-mesboot is a test-only input: it supplies the
+// stdin PIPE / `file -' list for the regression smoke below (it depends on none
+// of sed's consumers, so it adds no cycle), and never touches the build itself.
 const CONFIG_H: &str = include_str!("sed-mesboot0-config.h");
 const MAKEFILE: &str = include_str!("sed-mesboot0.mk");
 
@@ -46,6 +61,57 @@ const SMOKE_TXT: &str = "hello\n";
 
 pub fn recipe() -> Recipe {
     let mut steps = unpack_into("sed-mesboot0-source", "{src}");
+
+    // td-originated source fix (re #469), at the two sites that share one bug.
+    // sed 4.0.9 uses an `input->fp' test as its "no open stream" sentinel:
+    // test_eof() checks `!input->fp' and last_file_with_data_p() checks
+    // `input->fp'. On glibc that is correct — a closed/absent stream has a NULL fp.
+    // But mes-0.27.1 defines `stdin' as (FILE*)0 == NULL, so an OPEN stdin — a pipe
+    // OR a `<file' redirect — ALSO has input->fp == NULL and is misread as
+    // end-of-file. That makes `N', `n', and `$' fire a false EOF on the FIRST line
+    // whenever sed reads stdin, so e.g. `printf 'a\nb\n' | sed N' emits only "a".
+    // autoconf-2.64 config.status assembles subs.awk by feeding conf.subs through a
+    // sed pipeline whose stages read stdin (a `<file' redirect into a pipe) and join
+    // lines with `N', so on mes those stages false-EOF on their first line and
+    // binutils/gcc-core config.status silently produces a truncated, unparsable
+    // subs.awk.
+    //
+    // Fix both sites by testing sed's OWN no-stream sentinel instead of fp:
+    // read_fn == read_always_fail. open_next_file() sets read_fn = read_always_fail
+    // ONLY on a failed open (its "a redundancy" line), and closedown() sets it up
+    // front (execute.c:555) — BEFORE its own `!input->fp' early-out, which on an
+    // open mes stdin skips the later fp=NULL, so read_fn is the MORE reliable
+    // sentinel; every successful open — a named file OR stdin — sets
+    // read_fn = read_file_line. So `read_fn == read_always_fail' means exactly "no
+    // valid open stream": equivalent to `!fp' on glibc and correct on mes.
+    // read_always_fail is a static fn declared above both call sites. A named FILE
+    // argument was never affected (fp is a real fd, non-NULL) — which is why the
+    // file-fed smoke never caught this; the stdin smoke tests at the tail drive the
+    // exact `N'/`$' idioms over a pipe and a `file -' list, the paths that red an
+    // unpatched sed.
+    steps.push(Step::substitute_text(
+        "{src}/sed/execute.c",
+        vec![TextEdit::new(
+            "  if (!input->fp)\n    return separate_files || last_file_with_data_p(input);",
+            "  if (input->read_fn == read_always_fail) /* mes stdin is (FILE*)0, so an open stdin has fp==NULL; use sed's own no-stream sentinel */\n    return separate_files || last_file_with_data_p(input);",
+            1,
+        )],
+    ));
+    // The companion site: last_file_with_data_p() peeks whether any REMAINING input
+    // (the next file, which may be stdin `-') still has data, to decide if `$'
+    // matches now. Its `if (input->fp)' has the same mes blind spot — an open stdin
+    // (fp==NULL) is skipped as "no stream", so `$' matches the PREVIOUS file's last
+    // line and stdin is never read. Same sentinel, inverted sense (a valid stream
+    // is read_fn != read_always_fail). The tab before `{' matches the source's own
+    // indentation, keeping the match unique to this site.
+    steps.push(Step::substitute_text(
+        "{src}/sed/execute.c",
+        vec![TextEdit::new(
+            "      if (input->fp)\n\t{",
+            "      if (input->read_fn != read_always_fail) /* mes: an open stdin has fp==NULL; test sed's no-stream sentinel, not fp */\n\t{",
+            1,
+        )],
+    ));
 
     // lib/regex.h is live-bootstrap's `cp lib/regex_.h lib/regex.h` (its mk's
     // only generated file): lib/regex.c does `#include <regex.h>` and sed.h does
@@ -112,8 +178,67 @@ pub fn recipe() -> Recipe {
         vec![TextEdit::new("world\n", "world\n", 1)],
     ));
 
+    // stdin regression (re #469): the file-fed smoke above never exercises the mes
+    // stdin==NULL bug — a named FILE has a real fp. Drive the exact idioms that
+    // tripped config.status, using the td-built bash-mesboot only to supply stdin.
+    // Each sub-test compares sed's output to the expected with the `test' builtin:
+    // a mismatch exits non-zero and reds the rung. Command substitution `$(…)'
+    // captures the WHOLE output (bar trailing newlines) and `test STR = STR' is a
+    // full-string compare, so leading/embedded garbage cannot slip past (a plain
+    // substring check would let e.g. "14" satisfy "4"). An UNPATCHED sed — which
+    // false-EOFs on stdin's first line — yields "a", "1", "2" respectively and
+    // reds. The bash `-c' lines use `|' (a metacharacter) — that is bash's job
+    // here, not make's no-shell path. printf and test are bash-mesboot builtins.
+    //
+    //   1. `N'-join over a stdin PIPE  → test_eof / `N' (the subs.awk failure mode)
+    steps.push(
+        Step::run(
+            "{src}",
+            &[
+                "{in:bash-mesboot}/bin/bash",
+                "-c",
+                "exp=$(printf 'a-b\\nc-d'); out=$(printf 'a\\nb\\nc\\nd\\n' | {out}/bin/sed 'N;s/\\n/-/'); test \"$out\" = \"$exp\"",
+            ],
+        )
+        .env("LANG", "")
+        .env("LC_ALL", ""),
+    );
+    //   2. `$=' last-line count over a stdin PIPE → test_eof / `$'
+    steps.push(
+        Step::run(
+            "{src}",
+            &[
+                "{in:bash-mesboot}/bin/bash",
+                "-c",
+                "out=$(printf 'a\\nb\\nc\\nd\\n' | {out}/bin/sed -n '$='); test \"$out\" = 4",
+            ],
+        )
+        .env("LANG", "")
+        .env("LC_ALL", ""),
+    );
+    //   3. `$p' across a `file -' list — stdin is the LAST input, so the correct
+    //      last line is stdin's "x" (a buggy last_file_with_data_p prints f1.txt's
+    //      "2" and never reads stdin). f1.txt is the earlier, non-stdin input.
+    steps.push(Step::WriteFile {
+        path: "{src}/f1.txt".into(),
+        content: "1\n2\n".into(),
+        exec: false,
+    });
+    steps.push(
+        Step::run(
+            "{src}",
+            &[
+                "{in:bash-mesboot}/bin/bash",
+                "-c",
+                "out=$(printf 'x\\n' | {out}/bin/sed -n '$p' f1.txt -); test \"$out\" = x",
+            ],
+        )
+        .env("LANG", "")
+        .env("LC_ALL", ""),
+    );
+
     Recipe::mesboot("sed-mesboot0", "4.0.9")
         .source_input("sed-mesboot0-source")
-        .native_inputs(&["mes", "tcc", "make-mesboot0"])
+        .native_inputs(&["mes", "tcc", "make-mesboot0", "bash-mesboot"])
         .steps(steps)
 }
