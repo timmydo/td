@@ -45,12 +45,34 @@ const MAKEFILE: &str = include_str!("diffutils-mesboot0.mk");
 // Acceptance fixtures. `cmp` and `diff` are pure byte/line comparators with no
 // floating point, so the tcc double->int fold that gated gawk (re #469) does not
 // apply here; the risk this rung guards is instead that a comparator built under
-// tcc + mes libc actually WALKS the bytes and honours its filter flags. Every
-// test below is fail-closed on exit code: the CORRECT answer is "equal" (exit 0),
-// but reaching exit 0 requires the comparison logic — byte walk, whitespace/case
-// folding, initial-offset skip — to be intact. If the line/byte comparator were
-// broken to always-differ, or a filter (-w/-i/-i N) failed to fold, the tool
-// would report a difference and exit 1, and the Run step would red the rung.
+// tcc + mes libc actually WALKS the bytes and honours its filter flags.
+//
+// COVERAGE (and its one honest blind spot). Every acceptance invocation compares
+// inputs whose CORRECT outcome is "equal" (exit 0) -- plain-equal, or -w/-i/-i N
+// folded-equal. So the suite fail-closes on the FALSE-DIFFERENCE direction: an
+// always-differ comparator, or a fold flag (-w/-i) or offset skip (-i N) that
+// fails to do its job, reports a difference, exits 1, and reds the Run step. It
+// does NOT cover the FALSE-NEGATIVE direction: a `cmp`/`diff` miscompiled to
+// ALWAYS report equal (or an over-aggressive -w/-i that folds away a real
+// difference) reaches exit 0 with no real byte walk and passes every step. That
+// gap is STRUCTURAL under the current Step vocabulary, not an oversight: `Run`
+// treats any nonzero exit as failure (there is no expect-nonzero step), so the
+// "a real difference is detected" case (cmp/diff exit 1) cannot be asserted as a
+// pass; and cmp/diff write their result to STDOUT with no file-output flag, so
+// -- unlike the siblings, which pinned exact output bytes (gawk via
+// SubstituteText on subs.out, coreutils via `sort -o` + `md5sum -c`) -- there is
+// no host-free way to capture and byte-assert a genuine diff here. It is
+// mitigated: the double->int class that could silently corrupt a comparator does
+// not apply to straight-line byte/line comparison, the binaries demonstrably
+// build and run, and the definitive always-equal-vs-always-differ coverage
+// arrives at #469's consumer cutover, where cmp/diff gate real generated-file
+// comparisons end to end. When the engine grows a stdout-capture or
+// expect-nonzero step, add one negative discriminator (a genuinely differing
+// pair) to close the false-negative direction too.
+//
+// So each test below is fail-closed on exit code for the false-difference
+// direction: the CORRECT answer is "equal" (exit 0), and for the folded/offset
+// cases reaching exit 0 requires the fold/skip logic to be intact.
 //
 // A_TXT and its byte-identical twin B_TXT: the plain-equal case.
 const A_TXT: &str = "alpha one\nbeta two\ngamma three\n";

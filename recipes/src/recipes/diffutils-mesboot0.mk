@@ -33,17 +33,35 @@
 #   * -DHAVE_SYS_WAIT_H=1 / -DHAVE_STDLIB_H=1 / -DHAVE_TIME_H=1 are ADDED
 #     (correctness, mes ships all three headers): the first gives util.c the
 #     correct WEXITSTATUS for its waitpid, the second proper malloc/free/exit
-#     prototypes, the third context.c/diff.c their ctime()/time() declarations
-#     (mes's ctime is a stub -- fine, it feeds only diff's context-header
-#     timestamps, never the comparison result).
+#     prototypes, the third context.c/diff.c their ctime()/time() declarations.
+#     mes's ctime is a STUB that returns the literal "now" WITHOUT ctime's
+#     trailing newline (mes-0.27.1 lib/stub/ctime.c). It feeds only the
+#     `diff -c`/`-u` context/unified header timestamp (context.c:49-53,
+#     `fprintf(..., "%s %s\t%s", mark, name, ctime(&mtime))`), so under those two
+#     formats a differing file's `*** `/`--- `/`+++ ` header line loses its
+#     newline and the next line runs on -- a cosmetic malformation of `-c`/`-u`
+#     output on DIFFERING inputs only. It never affects the comparison RESULT
+#     (the exit code), plain `diff`/`diff -q`/`cmp` (which never call ctime), or
+#     any acceptance test here (all compare EQUAL inputs, so no header prints).
+#     It is also off the bootstrap's critical path: the consumers gate on
+#     `cmp`/plain-`diff` exit codes and apply pre-made patches with `patch`
+#     rather than generating `-u`/`-c` diffs. (Flagged by the cross-model review;
+#     a real fix is a newline-terminated mes ctime, a separate mes change.)
 #   * LDFLAGS = -static is a td addition: live-bootstrap leaves LDFLAGS empty, but
 #     this rung's AssertStatic (re #469) requires fully static cmp/diff (no host
 #     loader/libc at run time) -- the same -static grep/sed/coreutils/gawk carry.
-#   * alloca is DROPPED from DIFF_SRC. mes-0.27.1 provides the GNU C alloca, and
-#     diffutils's alloca.c would duplicate-define it (as gawk's did). With
-#     -DREGEX_MALLOC the bundled regex allocates with malloc; its only residual
-#     alloca(0) cleanup calls resolve to mes's alloca. This mirrors upstream's
-#     configure leaving $(ALLOCA) empty when the libc has alloca.
+#   * alloca is DROPPED from DIFF_SRC. The operative reason is duplicate-symbol:
+#     mes-0.27.1 already provides the GNU C alloca, so linking diffutils's own
+#     alloca.c would define `alloca` twice and fail the link (as gawk's did).
+#     Dropping it is safe because NO compiled diff/cmp source actually references
+#     alloca: -DREGEX_MALLOC selects regex.c's malloc path (regex.c:197, so the
+#     `#else` alloca branch at :202-230 is compiled out), and regex.c's only
+#     alloca-based cleanup (:908) is additionally gated on `emacs`/`REL_ALLOC`,
+#     neither of which is defined here, so it too compiles out; none of the other
+#     DIFF_SRC/CMP_SRC files call alloca. So alloca.o is an unused, conflict-prone
+#     object -- exactly what upstream's configure omits (leaving $(ALLOCA) empty)
+#     when the libc supplies alloca. (The EXIT=0 static link confirms no alloca
+#     symbol is left unresolved.)
 #   * The `install:` target is dropped: live-bootstrap's runs host `install`,
 #     absent in this sandbox (that is what the bootstrap is building).
 #     diffutils-mesboot0.rs installs the `cmp` and `diff` binaries with engine-
