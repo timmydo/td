@@ -320,8 +320,9 @@ mod tests {
         // tcc-era `sed` cycle-breaker, re #469) + coreutils-5.0 (the tcc-era
         // coreutils cycle-breaker, re #469) + grep-2.4 (the tcc-era `grep`
         // cycle-breaker, re #469) + gawk-3.0.4 (the tcc-era `gawk`
+        // cycle-breaker, re #469) + diffutils-2.7 (the tcc-era `diffutils`
         // cycle-breaker, re #469).
-        assert_eq!(pins.len(), 39);
+        assert_eq!(pins.len(), 40);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
