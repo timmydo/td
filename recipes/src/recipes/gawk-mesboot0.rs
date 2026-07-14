@@ -65,10 +65,10 @@ exit 0 }";
 
 // The two capability probes autoconf-2.64 config.status runs before it trusts
 // `awk` (config.status: `$AWK 'BEGIN { getline <"..." }'` and
-// `$AWK 'BEGIN { print "a\rb" }'`), reproduced fail-closed: read the 4-line
-// subs.in with getline (must count 4) and confirm the CR escape is one char.
+// `$AWK 'BEGIN { print "a\rb" }'`), reproduced fail-closed: read the 5-line
+// subs.in with getline (must count 5) and confirm the CR escape is one char.
 const PROBE_AWK: &str = "BEGIN { \
-n = 0; while ((getline line < \"subs.in\") > 0) n++; if (n != 4) exit 1; \
+n = 0; while ((getline line < \"subs.in\") > 0) n++; if (n != 5) exit 1; \
 if (length(\"a\\rb\") != 3) exit 1; \
 exit 0 }";
 
@@ -113,22 +113,27 @@ for (key in S) S_is_set[key] = 1\n\
   print line > \"subs.out\"\n\
 }\n";
 
-// A Makefile.in-shaped template with @VAR@ markers: two substituted (@CC@,
-// @PREFIX@, including two on one line), and one unset (@NOPE@) that must survive
-// verbatim. Exercises the splice's found and not-found branches and the running
-// `len` offset arithmetic across multiple markers per line.
+// A Makefile.in-shaped template with @VAR@ markers exercising every branch and
+// offset case: a lone found marker (@CC@, @PREFIX@); two found on one line (the
+// running-offset case); an UNSET-then-found line (@NOPE@ then @CC@ -- the unset
+// marker's `len += 1 + keylen` must leave the running offset correct so the later
+// @CC@ still splices at the right index); and a lone unset (@NOPE@) that survives
+// verbatim. This is exactly the substr/len arithmetic a miscompiled gawk corrupts.
 const SUBS_IN: &str = "CC = @CC@\n\
 prefix = @PREFIX@\n\
 both = @CC@ in @PREFIX@\n\
+mix = @NOPE@ then @CC@\n\
 unset = @NOPE@\n";
 
 // The exact output the splice must produce (traced by hand): @CC@ -> tcc,
 // @PREFIX@ -> /td/store, both markers on line 3 spliced with correct running
-// offsets, @NOPE@ left intact. A broken double->int corrupts the substr indices
-// and this block never appears -> the SubstituteText assertion (expect 1) reds.
+// offsets, the mixed line's @NOPE@ kept while its @CC@ -> tcc at the right index,
+// and the lone @NOPE@ left intact. A broken double->int corrupts the substr
+// indices and this block never appears -> the SubstituteText (expect 1) reds.
 const SUBS_EXPECTED: &str = "CC = tcc\n\
 prefix = /td/store\n\
 both = tcc in /td/store\n\
+mix = @NOPE@ then tcc\n\
 unset = @NOPE@\n";
 
 pub fn recipe() -> Recipe {
