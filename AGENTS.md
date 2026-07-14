@@ -225,15 +225,15 @@ Work in your own git worktree/branch.
 Never `git stash` in this repo. The stash stack (`refs/stash`) is
   repo-*global*.
 
-Every PR gets TWO independent code reviews: two cross-model review by
-a different model's CLI — both waivable only for documentation
-changes, and only if you say so in the PR. Run the cross-model reviewer at a
-strong model + high reasoning effort, and feed it the branch diff on
-stdin — a bare `git diff` is empty once the branch is committed, so
-pipe `git diff origin/main...HEAD` so the cross-model reviewer audits
-the same full branch diff the subagent does. Subagents MUST post their
-review findings to the PR as a comment (unfiltered by the main agent
-requesting it).
+Every PR gets TWO independent code reviews — the subagent review AND a
+cross-model review by a different model's CLI — both waivable only for
+documentation changes, and only if you say so in the PR. Run the
+cross-model reviewer at a strong model + high reasoning effort, and
+feed it the branch diff on stdin — a bare `git diff` is empty once the
+branch is committed, so pipe `git diff origin/main...HEAD` so the
+cross-model reviewer audits the same full branch diff the subagent
+does. Subagents MUST post their review findings to the PR as a comment
+(unfiltered by the main agent requesting it).
 
 Claude runs Codex (gpt-5.6-sol, xhigh): 
 
