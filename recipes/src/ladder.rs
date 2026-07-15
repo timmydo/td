@@ -71,6 +71,55 @@ pub fn base_inputs(extras: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// The td-built tcc-era userland (catalog stems) that replaces the host
+/// `BASE_TOOLS` for rungs cut over to recipe-output tools (re #469). Each is the
+/// `-mesboot0` provider recipe built from source under tcc + mes libc — the same
+/// tool at the same generation `BASE_TOOLS` named as a host package, now an
+/// `AuditedSeed`/`RecipeOutput` edge instead of a bare host name.
+///
+/// This is the migration bridge: a rung moves from `base_inputs`/`base_path`
+/// (host) to `mesboot0_inputs`/`mesboot0_path` (td-built) as it is cut over,
+/// exactly as the shell already moved to `BASH`. `BASE_TOOLS`/`base_path`/
+/// `base_inputs` are deleted in the final atomic cutover PR once the last
+/// consumer has moved off them; until then the two tiers coexist by design (the
+/// #469 follow-up is staged: providers, then per-rung declared inputs, then the
+/// shared-mechanism deletion).
+pub const MESBOOT0_TOOLS: &[&str] = &[
+    "coreutils-mesboot0",
+    "sed-mesboot0",
+    "grep-mesboot0",
+    "gawk-mesboot0",
+    "diffutils-mesboot0",
+];
+
+/// The rung PATH template for a `-mesboot0`-cutover rung: the `{tools}` farm
+/// first, then the td shell, then the td-built `MESBOOT0_TOOLS` packages. Mirrors
+/// `base_path()` node-for-node with the host packages swapped for their
+/// `-mesboot0` providers, so a cutover is a one-call swap (`base_path()` ->
+/// `mesboot0_path()`) that keeps the PATH order the build already expects.
+pub fn mesboot0_path() -> String {
+    let mut p = String::from("{tools}");
+    p.push_str(&format!(":{{in:{BASH}}}/bin"));
+    for t in MESBOOT0_TOOLS {
+        p.push_str(&format!(":{{in:{t}}}/bin"));
+    }
+    p
+}
+
+/// A cutover rung's lock-input list: the rung-specific `extras` FIRST, then the
+/// td shell `BASH`, then the td-built `MESBOOT0_TOOLS` — in lockstep with the
+/// order `mesboot0_path()` lays down, the same drift-closing discipline as
+/// `base_inputs()`. Pair with `Recipe::inputs_owned`.
+pub fn mesboot0_inputs(extras: &[&str]) -> Vec<String> {
+    extras
+        .iter()
+        .copied()
+        .chain(std::iter::once(BASH))
+        .chain(MESBOOT0_TOOLS.iter().copied())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// The tool-farm step that symlinks a prior binutils rung's whole `bin/` into
 /// `{tools}` (as/ld/ar/ranlib/nm/strip/…) with the declared coreutils `ln`, on
 /// `base_path()`. The `glob:` argv element expands sorted in the engine.
