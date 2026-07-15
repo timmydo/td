@@ -9,8 +9,13 @@ use crate::types::{Recipe, Step};
 //
 // Host-tool ingress closed (re #469): mechanical cutover to the `-mesboot0`
 // providers — mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, and the
-// binutils link_bins_mesboot0 farm. No flex/bison/tar edges here. Per-rung
-// cutover for #469; the shared host mechanism goes in the final atomic PR.
+// binutils link_bins_mesboot0 farm. `make all` recurses into `binutils/`, whose
+// `configure` runs `AM_PROG_LEX`; with no flex this far down the ladder autoconf
+// falls back to the automake `missing` wrapper to stub `lex.yy.c` and exec's it
+// DIRECTLY, so once the sandbox is host-free the PatchShebangs rewrite of
+// `missing`'s dead `#! /bin/sh` is required (the same rewrite binutils-mesboot0
+// rung 9 applies). Per-rung cutover for #469; the shared host mechanism goes in
+// the final atomic PR.
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
     let cip = "{in:glibc-mesboot0}/include:{root}/kh";
@@ -19,6 +24,14 @@ pub fn recipe() -> Recipe {
     let mut steps = unpack_into("binutils-mesboot1-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-binutils-boot-2.20.1a"));
     steps.extend(unpack_keep_top("linux-headers", "{root}/kh"));
+    // Retarget every `#! /bin/sh` shebang to the declared shell — the host-free
+    // sandbox has no /bin/sh, and `binutils/configure`'s AM_PROG_LEX exec's the
+    // automake `missing` wrapper directly to stub lex.yy.c (see the header note).
+    // Mirrors binutils-mesboot0.rs (rung 9); must precede configure.
+    steps.push(Step::PatchShebangs {
+        dir: "{src}".into(),
+        shell: SH.into(),
+    });
     steps.push(Step::ToolFarm {
         links: vec![
             ("cpp".into(), "{in:gcc-mesboot0}/bin/cpp".into()),
