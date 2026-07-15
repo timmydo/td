@@ -1,4 +1,4 @@
-use crate::ladder::{SH, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU sed 4.2.2 — rung 14 tier (re #469, sibling of gawk-mesboot): gcc-mesboot1
@@ -10,16 +10,17 @@ use crate::types::{Recipe, Step};
 // carry). sed's bundled gnulib papers over the glibc 2.2.5 gaps exactly as gawk
 // 3.1.8's does.
 //
-// Scope (re #469): this recipe still BUILDS with the shared BASE_TOOLS host `sed`
-// — autoconf `configure` and the generated `lib/Makefile` invoke `sed` — so like
-// gawk-mesboot it is a provider-first artifact, not a self-host-free rung. It
-// hands a host-free `sed` to consumers ABOVE this tier (a cycle-free win); making
-// `sed` itself host-free needs a `sed-mesboot0` cycle-breaker (a `sed` built with
-// no `sed` on PATH, as binutils/gcc do with their `-mesboot0` rungs). BASE_TOOLS
-// is unchanged here. Output contract: the binary must exist, be fully static (no
-// host loader/libc leaked in, re #469), and actually perform a substitution.
+// Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers —
+// mesboot0_path()/mesboot0_inputs() and the binutils link_bins_mesboot0 farm.
+// sed's own `configure` and generated `lib/Makefile` invoke `sed`; that `sed`
+// now resolves to the `sed-mesboot0` cycle-breaker (GNU sed 4.0.9, built with no
+// `sed` on PATH) which mesboot0_path() puts ahead of any host tool — the exact
+// cycle-break this recipe's earlier scope note called for. Per-rung cutover for
+// #469; the shared host mechanism goes in the final atomic PR. Output contract:
+// the binary must exist, be fully static (no host loader/libc leaked in, re
+// #469), and actually perform a substitution.
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:gcc-mesboot1}}/bin:{}", base_path());
+    let path = format!("{{in:gcc-mesboot1}}/bin:{}", mesboot0_path());
     let cip = "{in:glibc-mesboot0}/include:{root}/kh";
     let lp = "{in:glibc-mesboot0}/lib:{in:gcc-mesboot1}/lib/gcc/i686-unknown-linux-gnu/4.6.4";
     let cc = "CC={in:gcc-mesboot1}/bin/gcc -static";
@@ -31,7 +32,7 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
-    steps.push(link_bins("binutils-mesboot1"));
+    steps.push(link_bins_mesboot0("binutils-mesboot1"));
     steps.push(
         Step::run(
             "{src}",
@@ -107,6 +108,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot1",
             "glibc-mesboot0",
         ])
-        .inputs_owned(base_inputs(&["linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&["linux-headers"]))
         .steps(steps)
 }

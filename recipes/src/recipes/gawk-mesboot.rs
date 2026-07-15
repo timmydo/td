@@ -1,11 +1,18 @@
-use crate::ladder::{SH, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU awk 3.1.8 — rung 14 (#378, guix's gawk-mesboot): gcc-mesboot1 builds the
 // awk glibc-mesboot 2.16.0's versions.awk needs (the seed gash awk is too
 // weak). No sockets (ac_cv_func_connect=no); only the gawk binary is made.
+//
+// Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers —
+// mesboot0_path()/mesboot0_inputs() and the binutils link_bins_mesboot0 farm. Any
+// `awk`/`sed` gawk's own `configure`/Makefile invokes now resolves to the
+// `-mesboot0` cycle-breakers (gawk-mesboot0 3.0.4, sed-mesboot0 4.0.9) that
+// mesboot0_path() puts ahead of any host tool. Per-rung cutover for #469; the
+// shared host mechanism goes in the final atomic PR.
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:gcc-mesboot1}}/bin:{}", base_path());
+    let path = format!("{{in:gcc-mesboot1}}/bin:{}", mesboot0_path());
     let cip = "{in:glibc-mesboot0}/include:{root}/kh";
     let lp = "{in:glibc-mesboot0}/lib:{in:gcc-mesboot1}/lib/gcc/i686-unknown-linux-gnu/4.6.4";
     let cc = "CC={in:gcc-mesboot1}/bin/gcc -static";
@@ -17,9 +24,7 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
-    steps.push(
-        link_bins("binutils-mesboot1"),
-    );
+    steps.push(link_bins_mesboot0("binutils-mesboot1"));
     steps.push(
         Step::run(
             "{src}",
@@ -78,6 +83,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot1",
             "glibc-mesboot0",
         ])
-        .inputs_owned(base_inputs(&["linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&["linux-headers"]))
         .steps(steps)
 }
