@@ -10,8 +10,9 @@ use crate::types::{Recipe, Step};
 // Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers —
 // mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, the binutils-mesboot1
 // link_bins_mesboot0 farm, and flex/bison dropped as dead edges (4.6.4 ships its
-// pre-generated parsers and #496 keeps them newer than their sources). gcc 4.x
-// installs headers via install-mkheaders, not the 2.95 tar pipe, so no tar edge.
+// pre-generated parsers and #496 keeps them newer than their sources). The tar
+// ingress in `make install` (config.build defaults i686-linux to
+// install-headers-tar) is closed with INSTALL_HEADERS_DIR=install-headers-cp.
 // Per-rung cutover for #469; the shared host mechanism goes in the final atomic PR.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:gcc-mesboot0}}/bin:{}", mesboot0_path());
@@ -121,6 +122,11 @@ pub fn recipe() -> Recipe {
                 "{in:make-mesboot}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
+                // config.build has no i686-linux arm, so build_install_headers_dir
+                // defaults to install-headers-tar, which pipes headers through `tar`
+                // (a fatal, tab-prefixed recipe line). mesboot0 ships no tar; override
+                // to install-headers-cp, which copies with `cp` (coreutils-mesboot0).
+                "INSTALL_HEADERS_DIR=install-headers-cp",
                 "install",
             ],
         )
