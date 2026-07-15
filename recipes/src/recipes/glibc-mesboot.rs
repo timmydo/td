@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, sed_i, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, sed_i_mesboot0, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // glibc 2.16.0 STATIC — rung 15 (#378, guix's glibc-headers-mesboot +
@@ -7,8 +7,18 @@ use crate::types::{Recipe, Step};
 // All the deleted fn's fixups ride as steps: remove-bashism, de.po, /bin/pwd,
 // nscd/manual drops, Makeconfig SHELL, shebangs, the soversions.mk stub
 // (--disable-shared omits it but install wants it), the kernel-header overlay.
+//
+// Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers —
+// mesboot0_path()/mesboot0_inputs(), the coreutils-mesboot0 `ln` farm
+// (link_bins_mesboot0), and sed_i_mesboot0 for every in-place tree fixup, so the
+// generic `coreutils`/`sed`/`grep`/`diffutils` this build reaches for now resolve
+// to the td-built MESBOOT0_TOOLS ahead of any host tool. The awk/gawk ToolFarm
+// already point at the td `gawk-mesboot` (3.1.8) that glibc's versions.awk needs,
+// so no host `gawk` edge remains. Per-rung cutover for #469; the shared host
+// mechanism (BASE_TOOLS/base_path/base_inputs/link_bins/sed_i) goes in the final
+// atomic PR.
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:gcc-mesboot1}}/bin:{}", base_path());
+    let path = format!("{{in:gcc-mesboot1}}/bin:{}", mesboot0_path());
     let btinc = "{in:glibc-mesboot0}/include:{root}/kh";
     let btlib = "{in:glibc-mesboot0}/lib";
     let cc = "{in:gcc-mesboot1}/bin/gcc -I {src}/nptl/sysdeps/pthread/bits -D BOOTSTRAP_GLIBC=1 -L {src} -L {in:glibc-mesboot0}/lib";
@@ -40,21 +50,21 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        link_bins("binutils-mesboot"),
+        link_bins_mesboot0("binutils-mesboot"),
     );
     // the deleted fn's source fixups, verbatim
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0(
         "s,\\${vdso_symver//\\./_},$(echo $vdso_symver | sed -e \"s/\\\\./_/g\"),",
         &["sysdeps/unix/make-syscalls.sh"],
     ));
-    steps.push(sed_i("s,de\\.po,en_GB.po,", &["catgets/Makefile", "intl/Makefile"]));
-    steps.push(sed_i("s,/bin/pwd,pwd,", &["configure"]));
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0("s,de\\.po,en_GB.po,", &["catgets/Makefile", "intl/Makefile"]));
+    steps.push(sed_i_mesboot0("s,/bin/pwd,pwd,", &["configure"]));
+    steps.push(sed_i_mesboot0(
         "/^others *+= *nscd/d; /^others-pie *+= *nscd/d; /^install-sbin *:= *nscd/d",
         &["nscd/Makefile"],
     ));
-    steps.push(sed_i("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
+    steps.push(sed_i_mesboot0(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
@@ -92,7 +102,7 @@ pub fn recipe() -> Recipe {
                 .env("LD", "gcc"),
         );
         // fixmk: append SHELL to the generated Makefile so recipes use the shell
-        steps.push(sed_i(
+        steps.push(sed_i_mesboot0(
             "$aSHELL := {in:bash-mesboot}/bin/bash",
             &[&format!("{bdir}/Makefile")],
         ));
@@ -167,6 +177,6 @@ pub fn recipe() -> Recipe {
             "glibc-mesboot0",
             "gawk-mesboot",
         ])
-        .inputs_owned(base_inputs(&["patch-glibc-boot-2.16.0", "patch-glibc-bootstrap-system-2.16.0", "linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&["patch-glibc-boot-2.16.0", "patch-glibc-bootstrap-system-2.16.0", "linux-headers"]))
         .steps(steps)
 }
