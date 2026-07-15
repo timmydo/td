@@ -78,11 +78,6 @@ pub fn recipe() -> Recipe {
                 "--with-headers={root}/kh",
                 "--enable-shared",
                 "--disable-obsolete-rpc",
-                // build != host keeps configure's cross_compiling=yes (glibc
-                // skips run-tests). Prior builds let config.guess derive x86_64
-                // from host uname -m; pin it so mesboot0 PATH needs no uname
-                // (re #469).
-                "--build=x86_64-unknown-linux-gnu",
                 "--host=i686-unknown-linux-gnu",
                 "--enable-static-nss",
                 "--with-pthread",
@@ -95,6 +90,13 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
+        // Seed the build triplet so configure skips config.guess, which shells
+        // out to host `uname -m` and is coreutils-mesboot0's only hard
+        // dependency here (re #469). This reproduces the prior builds'
+        // `build=x86_64-unknown-linux-gnu` exactly while leaving build_alias
+        // empty, so cross_compiling stays `maybe` (passing --build would force
+        // it to `yes` and change the Makefile paths).
+        .env("ac_cv_build", "x86_64-unknown-linux-gnu")
         .env("libc_cv_friendly_stddef", "yes")
         .env("libc_cv_ssp", "false")
         .env("C_INCLUDE_PATH", btinc)
