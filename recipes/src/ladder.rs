@@ -199,6 +199,17 @@ pub fn sed_i(expr: &str, files: &[&str]) -> Step {
     Step::run("{src}", &argv).env("PATH", &base_path())
 }
 
+/// `sed_i` for a `-mesboot0`-cutover rung: the td-built `sed-mesboot0` on
+/// `mesboot0_path()`, mirroring `sed_i` with host `{in:sed}` swapped for its
+/// `-mesboot0` provider (re #469). `sed -i` writes a temp file and renames, so
+/// it never touches stdin or a non-syncable fd — the mes-libc bugs sed-mesboot0
+/// patches don't apply here. Folds back into `sed_i` in the final cutover PR.
+pub fn sed_i_mesboot0(expr: &str, files: &[&str]) -> Step {
+    let mut argv: Vec<&str> = vec!["{in:sed-mesboot0}/bin/sed", "-i", expr];
+    argv.extend_from_slice(files);
+    Step::run("{src}", &argv).env("PATH", &mesboot0_path())
+}
+
 /// Relocate every staged glibc GNU ld script under `lib/*.so` to bare member
 /// names by stripping the configured store prefix. Real ELF shared objects are
 /// left untouched.
