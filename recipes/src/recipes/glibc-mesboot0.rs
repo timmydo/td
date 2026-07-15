@@ -1,7 +1,7 @@
 use crate::ladder::{
     SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, sed_i_mesboot0, unpack_into,
 };
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, Step, TextEdit};
 
 // glibc 2.2.5 — bootstrap rung 8 (#378, guix's glibc-mesboot0): the first gcc
 // (gcc-core-mesboot0) builds the first real libc against the kernel headers.
@@ -25,6 +25,17 @@ pub fn recipe() -> Recipe {
     let mut steps = unpack_into("glibc-mesboot0-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-glibc-boot-2.2.5"));
     steps.push(apply_patch("patch-mesboot", "patch-glibc-bootstrap-system-2.2.5"));
+    // Host-gzip-free locale charmap install (re #469). glibc 2.2.5's
+    // localedata/Makefile installs each charmap by copying it uncompressed then
+    // `gzip -9`-ing it in place onto the `.gz` target. td ships no gzip
+    // executable (the builder decompresses in-process), and the bootstrap
+    // toolchain never reads locale charmaps, so replace the compress with a
+    // plain rename to the `.gz` name — the install target is still produced,
+    // just uncompressed. mv is coreutils-mesboot0, already on mesboot0_path().
+    steps.push(Step::substitute_text(
+        "{src}/localedata/Makefile",
+        vec![TextEdit::new("\tgzip -9 $(@:.gz=)", "\tmv $(@:.gz=) $@", 1)],
+    ));
     steps.push(Step::ToolFarm {
         links: vec![
             ("gcc".into(), "{in:gcc-core-mesboot0}/bin/gcc".into()),
