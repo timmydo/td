@@ -1,5 +1,5 @@
-use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, sed_i, unpack_into, unpack_keep_top};
-use crate::types::{Recipe, Step};
+use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, sed_i_mesboot0, unpack_into, unpack_keep_top};
+use crate::types::{Recipe, Step, TextEdit};
 
 // glibc 2.16.0 STATIC — rung 15 (#378, guix's glibc-headers-mesboot +
 // glibc-mesboot): gcc-mesboot1 + binutils-mesboot + gawk-mesboot build the
@@ -8,7 +8,7 @@ use crate::types::{Recipe, Step};
 // nscd/manual drops, Makeconfig SHELL, shebangs, the soversions.mk stub
 // (--disable-shared omits it but install wants it), the kernel-header overlay.
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:gcc-mesboot1}}/bin:{}", base_path());
+    let path = format!("{{in:gcc-mesboot1}}/bin:{}", mesboot0_path());
     let btinc = "{in:glibc-mesboot0}/include:{root}/kh";
     let btlib = "{in:glibc-mesboot0}/lib";
     let cc = "{in:gcc-mesboot1}/bin/gcc -I {src}/nptl/sysdeps/pthread/bits -D BOOTSTRAP_GLIBC=1 -L {src} -L {in:glibc-mesboot0}/lib";
@@ -40,23 +40,36 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        link_bins("binutils-mesboot"),
+        link_bins_mesboot0("binutils-mesboot"),
     );
     // the deleted fn's source fixups, verbatim
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0(
         "s,\\${vdso_symver//\\./_},$(echo $vdso_symver | sed -e \"s/\\\\./_/g\"),",
         &["sysdeps/unix/make-syscalls.sh"],
     ));
-    steps.push(sed_i("s,de\\.po,en_GB.po,", &["catgets/Makefile", "intl/Makefile"]));
-    steps.push(sed_i("s,/bin/pwd,pwd,", &["configure"]));
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0("s,de\\.po,en_GB.po,", &["catgets/Makefile", "intl/Makefile"]));
+    steps.push(sed_i_mesboot0("s,/bin/pwd,pwd,", &["configure"]));
+    steps.push(sed_i_mesboot0(
         "/^others *+= *nscd/d; /^others-pie *+= *nscd/d; /^install-sbin *:= *nscd/d",
         &["nscd/Makefile"],
     ));
-    steps.push(sed_i("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
+    steps.push(sed_i_mesboot0(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
+    ));
+    // csu/Makefile's version-info.h banner rule shells out to host uname/date
+    // and can read /proc/version; coreutils-mesboot0 ships no uname/date, so pin
+    // all three to deterministic tool-free values (re #469). Kernel version
+    // still comes from the declared linux-headers via linux/version.h.
+    steps.push(Step::substitute_text(
+        "{src}/csu/Makefile",
+        vec![
+            TextEdit::new("os=`uname -s 2> /dev/null`", "os=Linux", 1),
+            TextEdit::new("\"`date +%Y-%m-%d`\"", "\"\"", 1),
+            TextEdit::new("[ -r /proc/version ]", "false", 1),
+            TextEdit::new("version=`uname -r`", "version=unknown", 1),
+        ],
     ));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
@@ -83,6 +96,13 @@ pub fn recipe() -> Recipe {
                 .env("PATH", &path)
                 .env("CONFIG_SHELL", SH)
                 .env("SHELL", SH)
+                // Seed the build triplet so configure skips config.guess, which
+                // shells out to host `uname -m` and is coreutils-mesboot0's only
+                // hard dependency here (re #469). This reproduces the prior
+                // builds' `build=x86_64-unknown-linux-gnu` exactly while leaving
+                // build_alias empty, so cross_compiling stays `maybe` (passing
+                // --build would force it to `yes` and change the Makefile paths).
+                .env("ac_cv_build", "x86_64-unknown-linux-gnu")
                 .env("libc_cv_friendly_stddef", "yes")
                 .env("libc_cv_ssp", "false")
                 .env("C_INCLUDE_PATH", btinc)
@@ -92,7 +112,7 @@ pub fn recipe() -> Recipe {
                 .env("LD", "gcc"),
         );
         // fixmk: append SHELL to the generated Makefile so recipes use the shell
-        steps.push(sed_i(
+        steps.push(sed_i_mesboot0(
             "$aSHELL := {in:bash-mesboot}/bin/bash",
             &[&format!("{bdir}/Makefile")],
         ));
@@ -167,6 +187,6 @@ pub fn recipe() -> Recipe {
             "glibc-mesboot0",
             "gawk-mesboot",
         ])
-        .inputs_owned(base_inputs(&["patch-glibc-boot-2.16.0", "patch-glibc-bootstrap-system-2.16.0", "linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&["patch-glibc-boot-2.16.0", "patch-glibc-bootstrap-system-2.16.0", "linux-headers"]))
         .steps(steps)
 }
