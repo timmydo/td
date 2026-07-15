@@ -1,4 +1,6 @@
-use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, sed_i, unpack_into};
+use crate::ladder::{
+    SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, sed_i_mesboot0, unpack_into,
+};
 use crate::types::{Recipe, Step};
 
 // glibc 2.2.5 — bootstrap rung 8 (#378, guix's glibc-mesboot0): the first gcc
@@ -6,8 +8,15 @@ use crate::types::{Recipe, Step};
 // Faithful port of the deleted build_glibc fn: the two boot patches, the
 // config.make INSTALL/BASH fixups, shebang rewrite, the seed gcc's cpp on PATH
 // (glibc's scripts/cpp does `which cpp`), serial make + install.
+//
+// Host-tool ingress closed (re #469): cut over to the td-built `-mesboot0`
+// providers — mesboot0_path()/mesboot0_inputs() supply coreutils/sed/grep/gawk/
+// diffutils, the `awk` ToolFarm points at gawk-mesboot0, the binutils
+// link_bins_mesboot0 farm uses coreutils-mesboot0's `ln`, and the two config.make
+// fixups run sed_i_mesboot0 (sed-mesboot0's `sed -i`). Per-rung cutover for #469;
+// BASE_TOOLS/base_path/base_inputs/link_bins/sed_i go in the final atomic PR.
 pub fn recipe() -> Recipe {
-    let path = base_path();
+    let path = mesboot0_path();
     let gccdir = "{in:gcc-core-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
     let cip = format!("{{in:gcc-core-mesboot0}}/include:{gccdir}/include:{{in:mesboot-headers}}/include");
     let lp = format!("{{in:gcc-core-mesboot0}}/lib:{gccdir}:{{in:tcc}}/lib");
@@ -21,12 +30,10 @@ pub fn recipe() -> Recipe {
             ("gcc".into(), "{in:gcc-core-mesboot0}/bin/gcc".into()),
             ("cpp".into(), "{in:gcc-core-mesboot0}/bin/cpp".into()),
             ("make".into(), "{in:make-mesboot0}/bin/make".into()),
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(
-        link_bins("binutils-mesboot0"),
-    );
+    steps.push(link_bins_mesboot0("binutils-mesboot0"));
     steps.push(
         Step::run(
             "{src}",
@@ -59,11 +66,11 @@ pub fn recipe() -> Recipe {
         paths: vec!["{src}/config.make".into()],
         exec: false,
     });
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0(
         "s,INSTALL = scripts/,INSTALL = $(..)./scripts/,",
         &["config.make"],
     ));
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0(
         "s,^BASH = ,SHELL = {in:bash-mesboot}/bin/bash\\n         BASH = ,",
         &["config.make"],
     ));
@@ -103,6 +110,9 @@ pub fn recipe() -> Recipe {
             "gcc-core-mesboot0",
             "mesboot-headers",
         ])
-        .inputs_owned(base_inputs(&["patch-glibc-boot-2.2.5", "patch-glibc-bootstrap-system-2.2.5"]))
+        .inputs_owned(mesboot0_inputs(&[
+            "patch-glibc-boot-2.2.5",
+            "patch-glibc-bootstrap-system-2.2.5",
+        ]))
         .steps(steps)
 }
