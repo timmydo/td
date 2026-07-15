@@ -6,13 +6,6 @@ use crate::types::{Recipe, Step};
 // guix's glibc-mesboot phases (the two-stage variant defeated the boot patch's
 // sunrpc un-hiding); the nis subdir ships no libs (guix-as-oracle: no
 // libnsl.so); build TOOLS take <rpc/types.h> from the tree's own sunrpc.
-//
-// Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers —
-// mesboot0_path()/mesboot0_inputs(), the coreutils-mesboot0 `ln` farm
-// (link_bins_mesboot0), and sed_i_mesboot0 for every in-place tree fixup (same
-// axis as the static glibc-mesboot sibling). awk/gawk already resolve to the td
-// `gawk-mesboot`, so no host `gawk` edge remains. Per-rung cutover for #469; the
-// shared host mechanism goes in the final atomic PR.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:gcc-mesboot1}}/bin:{}", mesboot0_path());
     let btinc = "{src}/sunrpc:{in:glibc-mesboot0}/include:{root}/kh";

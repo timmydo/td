@@ -7,16 +7,6 @@ use crate::types::{Recipe, Step};
 // All the deleted fn's fixups ride as steps: remove-bashism, de.po, /bin/pwd,
 // nscd/manual drops, Makeconfig SHELL, shebangs, the soversions.mk stub
 // (--disable-shared omits it but install wants it), the kernel-header overlay.
-//
-// Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers —
-// mesboot0_path()/mesboot0_inputs(), the coreutils-mesboot0 `ln` farm
-// (link_bins_mesboot0), and sed_i_mesboot0 for every in-place tree fixup, so the
-// generic `coreutils`/`sed`/`grep`/`diffutils` this build reaches for now resolve
-// to the td-built MESBOOT0_TOOLS ahead of any host tool. The awk/gawk ToolFarm
-// already point at the td `gawk-mesboot` (3.1.8) that glibc's versions.awk needs,
-// so no host `gawk` edge remains. Per-rung cutover for #469; the shared host
-// mechanism (BASE_TOOLS/base_path/base_inputs/link_bins/sed_i) goes in the final
-// atomic PR.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:gcc-mesboot1}}/bin:{}", mesboot0_path());
     let btinc = "{in:glibc-mesboot0}/include:{root}/kh";
