@@ -34,7 +34,9 @@ pub fn recipe() -> Recipe {
     // make target is bookkeeping only. Do NOT install raw bytes under the `.gz`
     // suffix — localedef's charmap-dir.c treats `.gz` as gzip and would spawn gzip
     // to decode it, a malformed output. The bootstrap never reads these charmaps
-    // regardless. `true` is a builtin of the make SHELL (bash-mesboot).
+    // regardless. `true` is NOT reached as a shell builtin here: GNU Make execs a
+    // metacharacter-free recipe line directly via execvp, bypassing SHELL, so this
+    // resolves to coreutils-mesboot0's standalone `true` on the mesboot0 PATH.
     steps.push(Step::substitute_text(
         "{src}/localedata/Makefile",
         vec![TextEdit::new("\tgzip -9 $(@:.gz=)", "\ttrue", 1)],

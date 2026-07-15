@@ -11,8 +11,12 @@ use crate::types::{Recipe, Step, TextEdit};
 // mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, `rm` ->
 // coreutils-mesboot0, link_bins_mesboot0, the install-headers-tar pipe -> `cp`
 // (td ships no tar), and flex/bison dropped as dead edges (2.95.3 ships its
-// pre-generated parsers and #496 keeps them newer than their sources). Per-rung
-// cutover for #469; the shared host mechanism goes in the final atomic PR.
+// pre-generated parsers and #496 keeps them newer than their sources). No
+// PatchShebangs step (unlike binutils-mesboot1/make-mesboot): 2.95.3's build
+// directly execs no `#! /bin/sh` script — it predates automake's `missing`/
+// AM_PROG_LEX wrapper, and with flex/bison dead the `missing lex` edge never
+// fires; confirmed by a green host-free from-source build. Per-rung cutover for
+// #469; the shared host mechanism goes in the final atomic PR.
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
     let gccdir1 = "{in:gcc-core-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
