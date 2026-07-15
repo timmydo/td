@@ -9,12 +9,15 @@ use crate::types::{Recipe, Step};
 // tools. Out-of-tree bld/ subdir; no boot patch (guix deletes that phase).
 //
 // Dead flex/bison host-tool edges dropped (re #469, mirrors binutils 9a4621c):
-// GCC 4.9.4 ships every generated parser (gcc/gengtype-lex.c, intl/plural.c)
-// with archive mtimes newer than their .l/.y (preserved on unpack since #496),
-// gcc/Makefile.in empties the .l.c/.y.c suffix rules, and the c,c++ front ends
-// are recursive-descent — so flex/bison are never invoked (verified: both
-// generated files are byte-for-byte unchanged in a real build tree). configure
-// falls back to the automake `missing` stub via the explicit CONFIG_SHELL.
+// their generated parsers ship pre-built and are not regenerated here, so the
+// generators are unnecessary. Under --enable-languages=c,c++ only two are
+// reachable (the c/c++ front ends are recursive-descent): gcc/gengtype-lex.c
+// ships newer than its .l and gcc/Makefile.in empties the .l.c/.y.c suffix rules
+// (its one explicit rule is mtime-guarded and `-`-prefixed); intl/plural.c keeps
+// an active .y.c rule but ships mtime-EQUAL to plural.y, and make rebuilds only
+// on a strictly-newer prereq. td preserves archive mtimes on unpack (#496), so
+// neither is remade. With the inputs gone, intl/configure sets INTLBISON=: and
+// flex is only existence-probed — so neither generator ever runs.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:gcc-mesboot1}}/bin:{}", base_path());
     let cip = "{in:gcc-mesboot1}/lib/gcc/i686-unknown-linux-gnu/4.6.4/include:{root}/kh:{in:glibc-mesboot}/include:{src}/mpfr/src";
