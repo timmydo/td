@@ -55,7 +55,10 @@ use crate::types::{Recipe, Step, TextEdit};
 //
 //     See the steps for the per-site rationale, and the smoke tests at the tail
 //     for the regressions: stdin pipes / `file -' lists catch (a); a `w /dev/null'
-//     write and a `w /dev/fd/3' pipe catch (b).
+//     write catches (b) — /dev/null is a non-syncable char device that returns the
+//     same fsync EINVAL a pipe does, so it exercises the identical ck_fflush path
+//     config.status's Makefile-writing sed hits, and (unlike a pipe capture) its
+//     bare `Step::run' asserts on sed's exit status, which is what actually reds.
 //
 // Build inputs are mes (headers + libc), tcc (compiler), and make-mesboot0
 // (`make`) — no host tools. bash-mesboot is a test-only input: it supplies the
@@ -295,33 +298,20 @@ pub fn recipe() -> Recipe {
     // whose fsync() returns EINVAL. An UNPATCHED sed turns that into a "Couldn't
     // flush" panic + exit(4) on the FIRST line; the run step then reds. A patched
     // sed ignores the benign EINVAL and exits 0. No stdin/bash needed — a bare
-    // run whose sole failure mode is the panic. This is the same fsync-EINVAL
-    // code path config.status's Makefile-writing sed PIPE hits (a pipe is
-    // non-syncable exactly as /dev/null is).
+    // run whose sole failure mode is the panic, so the run step's exit code IS
+    // sed's (that exit-code assertion is what actually reds an unpatched sed).
+    // This is the same fsync-EINVAL code path config.status's Makefile-writing sed
+    // PIPE hits (a pipe is non-syncable exactly as /dev/null is), so a separate
+    // pipe smoke would exercise no new code path; and because unbuffered mes
+    // delivers each `w' byte to its target at the write(2) in ck_fwrite BEFORE the
+    // flush's fsync panics, a pipe smoke that compared CAPTURED OUTPUT would be a
+    // false green (the bytes arrive whether or not sed then panics, and the panic's
+    // exit(4) is swallowed inside a `$(... | ...)' capture). /dev/null with the
+    // exit-code assertion is therefore the canonical regression for bug (b).
     steps.push(
         Step::run("{src}", &["{out}/bin/sed", "-n", "w /dev/null", "smoke.txt"])
             .env("LANG", "")
             .env("LC_ALL", ""),
-    );
-    // The same OUTPUT-side bug over a real PIPE — the literal config.status shape.
-    // `w /dev/fd/3' with fd 3 rigged (3>&1) to the command-substitution capture
-    // pipe, and sed's own stdout sent to /dev/null: sed opens the pipe via
-    // /dev/fd (-> /proc/self/fd, present under the sandbox's fresh procfs), writes
-    // "x" there, and fsync()s the PIPE — EINVAL, just like /dev/null. Reds an
-    // unpatched sed (panic -> empty capture -> compare fails); a patched sed
-    // delivers "x" to the capture. Exercises the fd juggling config.status uses,
-    // via the td-built bash-mesboot (stdin/pipe supplier only).
-    steps.push(
-        Step::run(
-            "{src}",
-            &[
-                "{in:bash-mesboot}/bin/bash",
-                "-c",
-                "out=$(printf 'x\\n' | { {out}/bin/sed -n 'w /dev/fd/3'; } 3>&1 1>/dev/null); test \"$out\" = x",
-            ],
-        )
-        .env("LANG", "")
-        .env("LC_ALL", ""),
     );
 
     Recipe::mesboot("sed-mesboot0", "4.0.9")

@@ -11,10 +11,17 @@ use crate::types::{Recipe, Step, TextEdit};
 // Host-tool ingress closed (re #469): cut over to the td-built `-mesboot0`
 // providers — `mesboot0_path()`/`mesboot0_inputs()` supply coreutils/sed/grep/
 // gawk/diffutils, the `awk` ToolFarm points at `gawk-mesboot0`, `rm` and the
-// binutils `link_bins_mesboot0` farm use `coreutils-mesboot0`. The one remaining
-// host executable this rung reached for was `tar` (gcc's install-headers-tar);
-// it is replaced below with a coreutils-mesboot0 `cp' so nothing outside the
-// td store is invoked.
+// binutils `link_bins_mesboot0` farm use `coreutils-mesboot0`. The one host tool
+// this rung actually depended on was `tar` (gcc's install-headers-tar, which
+// copies the built headers into place); it is replaced below with a
+// coreutils-mesboot0 `cp'. gcc's `make install' also NAMES a host `find' in the
+// install-headers fix-absolute-symlinks step (gcc/Makefile.in:2637), but that is
+// a dead edge like flex/bison below: the make line is error-ignored (`-' prefix)
+// and gated on the find's `$?', and the installed include tree has no absolute
+// symlinks to relativize (SYSTEM_HEADER_DIR=/usr/include is absent from the
+// sandbox, so fixinc creates none -- verified: zero symlinks in the output). With
+// `find' off the mesboot0 PATH the assignment yields empty, the `$?' gate fails
+// closed, and the fixup no-ops. No authored step invokes a host executable.
 //
 // No flex or bison: gcc-2.95.3 SHIPS its pre-generated bison parsers
 // (c-parse.c/c-parse.h from c-parse.y, cexp.c from cexp.y) and its gperf table
@@ -45,8 +52,9 @@ pub fn recipe() -> Recipe {
     // tar, and the historical green build got one only from the ambient host PATH
     // #469 removes. Replace the tar pipe with `cp -a include/. $(libsubdir)/include'
     // using the td-built coreutils-mesboot0 `cp' (already on mesboot0_path, already
-    // used here for `rm'); `cp -a' copies the same tree and preserves the include
-    // symlinks the rule's own follow-up fix-symlinks step expects. Patched in
+    // used here for `rm'); `cp -a' copies the same tree and, like the tar pipe,
+    // preserves any symlinks in it (the installed include tree in fact has none --
+    // see the host-`find' dead-edge note in the module header). Patched in
     // Makefile.in BEFORE configure so config.status (the now-flush-fixed
     // sed-mesboot0) copies the cp rule verbatim into gcc/Makefile — $(libsubdir)
     // and the rule name are plain make text, untouched by autoconf @-substitution.
