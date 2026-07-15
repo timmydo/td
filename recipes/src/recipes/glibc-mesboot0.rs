@@ -26,15 +26,18 @@ pub fn recipe() -> Recipe {
     steps.push(apply_patch("patch-mesboot", "patch-glibc-boot-2.2.5"));
     steps.push(apply_patch("patch-mesboot", "patch-glibc-bootstrap-system-2.2.5"));
     // Host-gzip-free locale charmap install (re #469). glibc 2.2.5's
-    // localedata/Makefile installs each charmap by copying it uncompressed then
-    // `gzip -9`-ing it in place onto the `.gz` target. td ships no gzip
-    // executable (the builder decompresses in-process), and the bootstrap
-    // toolchain never reads locale charmaps, so replace the compress with a
-    // plain rename to the `.gz` name — the install target is still produced,
-    // just uncompressed. mv is coreutils-mesboot0, already on mesboot0_path().
+    // localedata/Makefile installs each charmap by copying it uncompressed to the
+    // raw name ($(INSTALL_DATA) $< $(@:.gz=)) then `gzip -9`-ing it onto the `.gz`
+    // target. td ships no gzip executable (the builder decompresses in-process),
+    // so drop the compress step to a no-op: the charmap stays under its raw,
+    // unsuffixed name, which glibc's charmap_open reads directly, and the `.gz`
+    // make target is bookkeeping only. Do NOT install raw bytes under the `.gz`
+    // suffix — localedef's charmap-dir.c treats `.gz` as gzip and would spawn gzip
+    // to decode it, a malformed output. The bootstrap never reads these charmaps
+    // regardless. `true` is a builtin of the make SHELL (bash-mesboot).
     steps.push(Step::substitute_text(
         "{src}/localedata/Makefile",
-        vec![TextEdit::new("\tgzip -9 $(@:.gz=)", "\tmv $(@:.gz=) $@", 1)],
+        vec![TextEdit::new("\tgzip -9 $(@:.gz=)", "\ttrue", 1)],
     ));
     steps.push(Step::ToolFarm {
         links: vec![
