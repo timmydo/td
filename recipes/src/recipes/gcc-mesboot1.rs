@@ -1,5 +1,5 @@
 use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 4.6.4 (c,c++) — rung 12 (#378, guix's gcc-mesboot1): gcc-mesboot0 builds
 // the first C++-capable gcc. The g++ front-end tarball overlays the core tree;
@@ -12,7 +12,8 @@ use crate::types::{Recipe, Step};
 // link_bins_mesboot0 farm, and flex/bison dropped as dead edges (4.6.4 ships its
 // pre-generated parsers and #496 keeps them newer than their sources). The tar
 // ingress in `make install` (config.build defaults i686-linux to
-// install-headers-tar) is closed with INSTALL_HEADERS_DIR=install-headers-cp.
+// install-headers-tar) is closed by repointing gcc/Makefile.in's
+// INSTALL_HEADERS_DIR at install-headers-cp before configure (see below).
 // Per-rung cutover for #469; the shared host mechanism goes in the final atomic PR.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:gcc-mesboot0}}/bin:{}", mesboot0_path());
@@ -54,6 +55,23 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    // Close the `tar` host-tool ingress in `make install`: config.build has no
+    // i686-*-linux-gnu arm, so @build_install_headers_dir@ falls through to its
+    // default install-headers-tar, whose recipe pipes headers through `tar` on a
+    // fatal (tab-prefixed) line. mesboot0 ships no tar. Repoint INSTALL_HEADERS_DIR
+    // at GCC's own install-headers-cp target (cp -p -r, coreutils-mesboot0). A
+    // command-line make override cannot do this: GCC 4.6.4's top-level Makefile
+    // sets `MAKEOVERRIDES=` ("Don't pass command-line variables to submakes"), so
+    // the value must be baked into gcc/Makefile.in before configure generates the
+    // Makefile. Patched before configure — plain autoconf text.
+    steps.push(Step::substitute_text(
+        "{src}/gcc/Makefile.in",
+        vec![TextEdit::new(
+            "INSTALL_HEADERS_DIR = @build_install_headers_dir@",
+            "INSTALL_HEADERS_DIR = install-headers-cp",
+            1,
+        )],
+    ));
     steps.push(
         Step::run(
             "{src}",
@@ -122,11 +140,6 @@ pub fn recipe() -> Recipe {
                 "{in:make-mesboot}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
-                // config.build has no i686-linux arm, so build_install_headers_dir
-                // defaults to install-headers-tar, which pipes headers through `tar`
-                // (a fatal, tab-prefixed recipe line). mesboot0 ships no tar; override
-                // to install-headers-cp, which copies with `cp` (coreutils-mesboot0).
-                "INSTALL_HEADERS_DIR=install-headers-cp",
                 "install",
             ],
         )
