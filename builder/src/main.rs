@@ -1479,15 +1479,20 @@ fn parse_registration_blocks(text: &str) -> Vec<OutputReg> {
 
 /// The reuse identity the CURRENT plan derives, independent of anything a cache
 /// stores (re #469): the SHA-256 of the assembled `.drv` FILE BYTES (they cover
-/// inputs, builder path, args, env), the digest of the TYPED staging manifest
-/// (`manifest_digest` — every admissible input's hash AND origin class), and the
+/// inputs, builder path, args, env), the CLOSURE-SCOPED manifest digest
+/// (`reuse_key_manifest_digest` — the hash AND origin class of every input in
+/// THIS drv's own transitive input closure, plus the real builder), and the
 /// drv's builder path. A cache entry is reusable only if the receipt the ENGINE
 /// wrote at build time matches ALL of these recomputed-now values — so metadata
 /// stored beside an output is never its own authority: a forged record must
 /// reproduce the exact identity the planner derives today, and a stale one
-/// (changed drv, changed input set, changed builder) can never hit. The staged
-/// builder BYTES are covered via `manifest_sha256` (the manifest's
-/// `ControlPlaneBuilder` row). Honest limit, stated: receipts live in the same
+/// (changed drv, changed input set, changed builder) can never hit. The digest
+/// is scoped to the drv's OWN closure, NOT the plan-wide manifest union
+/// enforcement uses, so the SAME drv keys the same under any build target (a
+/// higher target's unrelated seeds do not drift the key); the staged builder
+/// BYTES are covered by folding the real builder into that digest (its
+/// `ControlPlaneBuilder` row when a placement db vouches it, else its content
+/// path). Honest limit, stated: receipts live in the same
 /// user-writable cache as the outputs, so an attacker who can rewrite both and
 /// can read the current plan can still forge a hit — closing THAT requires a
 /// daemon-owned provenance database (or no reuse at all), which is follow-on
@@ -1512,6 +1517,89 @@ fn manifest_digest(m: &sandbox::StageManifest) -> String {
         h.update(si.origin.as_str().as_bytes());
         h.update(b"\n");
     }
+    sha256::to_base16(&h.finalize())
+}
+
+/// The DRV's declared input ROOTS — its input-srcs plus each input derivation's
+/// requested output paths, in file order (input-srcs first). The seed of the
+/// transitive-closure scan `stage_input_closure` computes; factored out so the
+/// input-drv resolution (read the input `.drv`, look up the named output) is a
+/// single, unit-testable routine. The builder-identity token, if present as an
+/// input-src, rides through verbatim; `stage_input_closure` substitutes the real
+/// builder for it.
+fn drv_declared_inputs(parsed: &drv::Derivation) -> Result<Vec<String>, String> {
+    let mut roots: Vec<String> = parsed.input_srcs.clone();
+    for (idrv, outnames) in &parsed.input_drvs {
+        // The input `.drv` path is a LOCAL store file: td's daemon is local per-worktree
+        // and each input drv was written (assemble) before this drv could reference it, so
+        // it is on disk at every reuse-key read site as well as at realize. (td-assembled
+        // RECIPE drvs carry no input-drvs — input-srcs only — so this loop is a no-op there;
+        // it exists for a general drv the daemon may realize.) A missing file reds here.
+        let ib = std::fs::read(idrv).map_err(|e| format!("read input drv {idrv}: {e}"))?;
+        let ip = drv::parse(&ib).map_err(|e| format!("parse input drv {idrv}: {e}"))?;
+        for on in outnames {
+            let o = ip
+                .outputs
+                .iter()
+                .find(|o| &o.name == on)
+                .ok_or_else(|| format!("input drv {idrv} has no output `{on}'"))?;
+            roots.push(o.path.clone());
+        }
+    }
+    Ok(roots)
+}
+
+/// The reuse-key digest (`ReceiptExpect.manifest_sha256`), SCOPED to the
+/// derivation's OWN input CLOSURE instead of the plan-wide manifest union
+/// (re #469). `manifest` is the full authority manifest a fresh realize
+/// assembles — the union of EVERY typed td-owned db the plan carries (the whole
+/// seed db, the bless db, and every prior step's td.db). Digesting that union
+/// keyed the reuse identity to the WHOLE PLAN: the seed db is interned per
+/// TARGET graph, so building a higher target folds unrelated seeds into a low
+/// rung's key, and the SAME drv then gets a DIFFERENT key under a different
+/// target — a receipt-identity miss that rebuilds an already-valid output and,
+/// because the rebuild need not be bit-identical, collides with the cached tree
+/// and fails the plan. A sandboxed build cannot be influenced by inputs outside
+/// its own closure, so those inputs must not be in its reuse key.
+///
+/// So the key digests ONLY the manifest entries whose path is in `closure` — the
+/// EXACT transitive input set `realize_drv` stages and enforces over, computed by
+/// the shared `stage_input_closure` at both the write site and every read site
+/// (identical routine ⇒ identical set ⇒ no asymmetry miss). `closure` is the
+/// PRE-builder-rekey closure, so its builder entry is still at the real builder's
+/// content path; when a placement db vouches that builder its `ControlPlaneBuilder`
+/// row is scoped in, and `builder_exec` is ALSO folded into the digest so a
+/// builder-ELF change moves the key even for the running builder (which is no
+/// manifest key). A change to — or removal of — any real input still moves the
+/// key. ENFORCEMENT is deliberately left FULL-manifest (`enforce_realize_input_policy`
+/// runs over the un-scoped `manifest`): it only LOOKS UP each closure item, so a
+/// superset is correct — scoping it would instead drop the vouching rows the build
+/// stages. Scoping the KEY narrows what a cache hit must match; it does not weaken
+/// what a build may stage.
+fn reuse_key_manifest_digest(
+    closure: &[String],
+    manifest: &sandbox::StageManifest,
+    builder_exec: &str,
+) -> String {
+    // The manifest is keyed by CANONICAL store path; each closure entry is
+    // `canonical` or `canonical\ton-disk`, so scope by the canonical (left) half.
+    let mut paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for e in closure {
+        paths.insert(sandbox::split_closure_entry(e).0);
+    }
+    let mut scoped = sandbox::StageManifest::new();
+    for (p, si) in manifest {
+        if paths.contains(p.as_str()) {
+            scoped.insert(p.clone(), si.clone());
+        }
+    }
+    let mut h = sha256::Sha256::new();
+    h.update(manifest_digest(&scoped).as_bytes());
+    // Bind the RESOLVED real builder (re #469): for a builder-override it is also a
+    // scoped `ControlPlaneBuilder` row, but the running builder is NOT a manifest key,
+    // so this leg is what moves the key when the builder ELF changes.
+    h.update(b"\nbuilder ");
+    h.update(builder_exec.as_bytes());
     sha256::to_base16(&h.finalize())
 }
 
@@ -2079,10 +2167,17 @@ fn daemon_realize_one(
         .unwrap_or_default();
     // The reuse identity comes BEFORE the cache read (re #469 round-7): the typed
     // manifest is assembled first and the prior realization must carry a receipt
-    // matching it — the daemon's pre-manifest cache hit is gone.
+    // matching it — the daemon's pre-manifest cache hit is gone. The reuse-key digest
+    // is CLOSURE-SCOPED to this drv's own transitive input closure (reuse_key_manifest_digest),
+    // computed by the SAME shared routine realize uses (stage_input_closure) with the SAME
+    // args realize_drv is called with below, so the daemon's read key matches the write; the
+    // full manifest remains what realize_drv enforces.
+    let manifest_now = assemble_input_manifest(&extra_dbs, &[], ov.as_ref())?;
+    let seed_dirs = [seed_dir.to_string()];
+    let ic = stage_input_closure(&parsed, &seed_dirs, &store::store_dir(), &extra_dbs, &[], ov.as_ref(), None)?;
     let expect = ReceiptExpect {
         drv_sha256: sha256_hex(&content),
-        manifest_sha256: manifest_digest(&assemble_input_manifest(&extra_dbs, &[], ov.as_ref())?),
+        manifest_sha256: reuse_key_manifest_digest(&ic.closure, &manifest_now, &ic.builder_exec),
         builder: parsed.builder.clone(),
     };
     if let Some(regs) = cached_realization(&parsed, &scr, &expect)? {
@@ -2094,7 +2189,6 @@ fn daemon_realize_one(
         return Ok((c, h, true));
     }
     eprintln!("td-builder: daemon CACHE MISS for {drv} — realizing");
-    let seed_dirs = [seed_dir.to_string()];
     let regs = realize_drv(drv, &seed_dirs, &store::store_dir(), &extra_dbs, &scr, &[], ov.as_ref(), None)?;
     let (c, h) = mk(&regs)?;
     Ok((c, h, false))
@@ -2537,11 +2631,14 @@ fn authenticate_ca_db(dbp: &str, items_dir: &Path, label: &str) -> Result<(), St
 /// Assemble the COMPLETE typed staging manifest a realize of this plan would
 /// stage from: the caller's typed extra dbs, each td-interned source/vendor
 /// placement db (`AuditedSeed` — a declared fixed-output fetch td restored
-/// itself), and the builder placement db (`ControlPlaneBuilder`). Shared by
-/// `realize_drv` (enforcement at the bind boundary) and the reuse gates'
-/// `ReceiptExpect.manifest_sha256` — which is computed from THIS assembly
-/// BEFORE any cache is consulted, so a reuse decision is bound to exactly the
-/// authority set a fresh build would stage from (re #469 round-7).
+/// itself), and the builder placement db (`ControlPlaneBuilder`). This FULL
+/// union is the ENFORCEMENT input — `enforce_realize_input_policy` looks up each
+/// closure item in it, so it must be a superset. The reuse gates'
+/// `ReceiptExpect.manifest_sha256` is a DIFFERENT thing: `reuse_key_manifest_digest`
+/// scopes THIS union down to the drv's own transitive input closure (a subset,
+/// computed by `stage_input_closure`) BEFORE any cache is consulted — so a reuse
+/// decision is bound to the drv's real closure, NOT to unrelated plan-wide seeds
+/// that would drift the key across build targets (re #469).
 /// The source and builder placement dbs are AUTHENTICATED here (round-8):
 /// their rows must content-address to themselves (`authenticate_ca_db`) — a
 /// caller-supplied SRC-DB/TD_BUILDER_DB path locates bytes but cannot type
@@ -2760,46 +2857,53 @@ fn manifest_with_builder_alias(
     m
 }
 
-/// Realize DRV with NO guix-daemon and NO guix store DB: compute the input closure ITSELF by
-/// CONTENT-SCANNING the seed store dir(s) (the daemon's scanForReferences / `guix gc -R`,
-/// gate 290) — no `/var/guix/db` read — build it in the userns sandbox (build_and_register),
-/// and register the output(s) into a td store-db at SCRATCH/td.db. Returns the per-output
-/// records. Shared by `realize`, `build-recipe` and the build daemon. SRC_OVERRIDE, when set,
-/// supplies the recipe source from a td-owned store instead of the daemon store (no `guix
-/// repl` interning). SEED_STORE_DIRS is the set of store DIRECTORIES the seed/toolchain
-/// closure is content-scanned over (`/gnu/store`, or the unpacked seed store); EXTRA_DBS is
-/// the set of td-OWNED store DBs whose td-built deps live outside those dirs, each TYPED
-/// with the `InputOrigin` class its rows carry into the staging manifest (build-plan
-/// passes the seed db as `AuditedSeed` + the prior steps' td.dbs as `RecipeOutput` so a
-/// downstream build's closure spans both). The drv's `builder` is the STABLE ABI identity
-/// path (store::builder_identity_path), so realize resolves the REAL builder to stage +
-/// bind at it: BUILDER_OVERRIDE, when set, names a td-owned builder (a td-bootstrapped
-/// stage0, not the guix-built td-builder) — its entry binds from the builder DB and its
-/// direct refs' TRANSITIVE closures come from the seed content-scan — else the realize's
-/// own running binary (self_store_path). Provenance is enforced against the RESOLVED real
-/// builder; the builder's closure entry is then re-keyed onto the stable identity path
-/// (rekey_builder_entry) so the sandbox binds the real bytes AT the path the drv execs.
-/// TD_STORE, when set, names td's
-/// own store dir holding td-BUILT deps: a closure path whose tree lives under TD_STORE/<base>
-/// is emitted `canonical\ton-disk` so the sandbox binds it FROM THERE (the build-plan chaining
-/// edge) — the same on-disk encoding SRC_OVERRIDE uses. SEED_CANONICAL_PREFIX is the canonical
-/// home of the seed dirs' entries — `/gnu/store` for a guix-captured seed/warm-seed staging
-/// dir, the live `store::store_dir()` when scanning the active store itself; per-entry truth
-/// (a td-built copy inside a guix seed dir, or vice versa) is restored from the drv roots +
-/// td-owned DBs by `recanonicalize_candidates` (#292).
+/// A drv's staged input closure plus the resolved real builder — everything the
+/// reuse-key digest and `realize_drv`'s staging need that is a pure function of the
+/// drv and its declared input authority (NOT of the build's OUTPUT). Computed by
+/// `stage_input_closure` so the WRITE site (`realize_drv`) and the reuse-key READ
+/// sites (`build_recipe`, `daemon_realize_one`) derive the IDENTICAL closure from
+/// the same routine — any asymmetry reintroduces the very cache miss the
+/// closure-scoped reuse key exists to remove.
+struct InputClosure {
+    /// The resolved real builder's content path (`ov.canonical` / `self_store_path`),
+    /// or None for a non-td drv. The closure's builder entry sits at THIS path
+    /// (pre-rekey); realize re-keys it onto the ABI identity after enforcement.
+    real_builder_cb: Option<String>,
+    /// The real builder EXEC path (`{real}/bin/td-builder`, or `parsed.builder` for a
+    /// non-td drv) — what actually runs, what #469 enforces, and what the reuse key
+    /// folds in so a builder-ELF change moves it.
+    builder_exec: String,
+    /// The drv's input roots (input-srcs + input-drv outputs), the ABI builder token
+    /// substituted to the real builder.
+    roots: Vec<String>,
+    /// The transitive input closure, PRE builder-rekey: each entry `canonical` or
+    /// `canonical\ton-disk`. The exact set realize stages, enforces over, and the
+    /// reuse key scopes to.
+    closure: Vec<String>,
+    /// The closure slice reachable from the builder — the only slice a
+    /// `BlessedSeedClosure` row may vouch (`enforce_realize_input_policy`).
+    builder_reach: std::collections::BTreeSet<String>,
+}
+
+/// Compute a drv's staged input closure with NO guix store DB: resolve the real
+/// builder behind the drv's ABI-token builder, then CONTENT-SCAN the seed store
+/// dir(s) for the drv's roots (`guix gc -R`, gate 290) unioned with any td-owned
+/// db refs, the td-placed builder's dynamic-linkage closure, and each td-interned
+/// source/vendor tree's own-db closure. Shared by `realize_drv` (which then
+/// enforces + stages + re-keys the builder entry) and the reuse-key read sites
+/// (which scope the reuse digest to it BEFORE the cache read). Reads only INPUT
+/// trees/dbs — all materialized before this step's build — so read and write see
+/// the same bytes and derive the same closure.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-fn realize_drv(
-    drv_path: &str,
+fn stage_input_closure(
+    parsed: &drv::Derivation,
     seed_store_dirs: &[String],
     seed_canonical_prefix: &str,
     extra_dbs: &[(String, sandbox::InputOrigin)],
-    scratch: &Path,
     src_overrides: &[SrcOverride],
     builder_override: Option<&BuilderOverride>,
     td_store: Option<&Path>,
-) -> Result<Vec<OutputReg>, String> {
-    let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
-    let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
+) -> Result<InputClosure, String> {
     // A recipe drv (assemble_recipe_drv) names the STABLE ABI builder-identity path
     // (store::builder_identity_path) as its builder + builder input-src — keyed on the
     // ABI, not the builder ELF. Resolve it to the REAL builder up front so BOTH the #469
@@ -2860,19 +2964,7 @@ fn realize_drv(
     }
     // Input ROOTS: the drv's source inputs, plus each input derivation's requested
     // output paths (resolved by reading that input .drv).
-    let mut roots: Vec<String> = parsed.input_srcs.clone();
-    for (idrv, outnames) in &parsed.input_drvs {
-        let ib = std::fs::read(idrv).map_err(|e| format!("read input drv {idrv}: {e}"))?;
-        let ip = drv::parse(&ib).map_err(|e| format!("parse input drv {idrv}: {e}"))?;
-        for on in outnames {
-            let o = ip
-                .outputs
-                .iter()
-                .find(|o| &o.name == on)
-                .ok_or_else(|| format!("input drv {idrv} has no output `{on}'"))?;
-            roots.push(o.path.clone());
-        }
-    }
+    let mut roots: Vec<String> = drv_declared_inputs(parsed)?;
     // Substitute the stable ABI builder-identity path in `roots` with the REAL builder, so
     // the closure logic (which keys its builder branch on the override's canonical) runs
     // UNCHANGED over the real path; the ONE builder entry is re-keyed back to the stable id
@@ -3048,6 +3140,65 @@ fn realize_drv(
             e
         })
         .collect();
+    Ok(InputClosure { real_builder_cb, builder_exec, roots, closure, builder_reach })
+}
+
+/// Realize DRV with NO guix-daemon and NO guix store DB: compute the input closure ITSELF by
+/// CONTENT-SCANNING the seed store dir(s) (the daemon's scanForReferences / `guix gc -R`,
+/// gate 290) — no `/var/guix/db` read — build it in the userns sandbox (build_and_register),
+/// and register the output(s) into a td store-db at SCRATCH/td.db. Returns the per-output
+/// records. Shared by `realize`, `build-recipe` and the build daemon. SRC_OVERRIDE, when set,
+/// supplies the recipe source from a td-owned store instead of the daemon store (no `guix
+/// repl` interning). SEED_STORE_DIRS is the set of store DIRECTORIES the seed/toolchain
+/// closure is content-scanned over (`/gnu/store`, or the unpacked seed store); EXTRA_DBS is
+/// the set of td-OWNED store DBs whose td-built deps live outside those dirs, each TYPED
+/// with the `InputOrigin` class its rows carry into the staging manifest (build-plan
+/// passes the seed db as `AuditedSeed` + the prior steps' td.dbs as `RecipeOutput` so a
+/// downstream build's closure spans both). The drv's `builder` is the STABLE ABI identity
+/// path (store::builder_identity_path), so realize resolves the REAL builder to stage +
+/// bind at it: BUILDER_OVERRIDE, when set, names a td-owned builder (a td-bootstrapped
+/// stage0, not the guix-built td-builder) — its entry binds from the builder DB and its
+/// direct refs' TRANSITIVE closures come from the seed content-scan — else the realize's
+/// own running binary (self_store_path). Provenance is enforced against the RESOLVED real
+/// builder; the builder's closure entry is then re-keyed onto the stable identity path
+/// (rekey_builder_entry) so the sandbox binds the real bytes AT the path the drv execs.
+/// TD_STORE, when set, names td's
+/// own store dir holding td-BUILT deps: a closure path whose tree lives under TD_STORE/<base>
+/// is emitted `canonical\ton-disk` so the sandbox binds it FROM THERE (the build-plan chaining
+/// edge) — the same on-disk encoding SRC_OVERRIDE uses. SEED_CANONICAL_PREFIX is the canonical
+/// home of the seed dirs' entries — `/gnu/store` for a guix-captured seed/warm-seed staging
+/// dir, the live `store::store_dir()` when scanning the active store itself; per-entry truth
+/// (a td-built copy inside a guix seed dir, or vice versa) is restored from the drv roots +
+/// td-owned DBs by `recanonicalize_candidates` (#292).
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+fn realize_drv(
+    drv_path: &str,
+    seed_store_dirs: &[String],
+    seed_canonical_prefix: &str,
+    extra_dbs: &[(String, sandbox::InputOrigin)],
+    scratch: &Path,
+    src_overrides: &[SrcOverride],
+    builder_override: Option<&BuilderOverride>,
+    td_store: Option<&Path>,
+) -> Result<Vec<OutputReg>, String> {
+    let bytes = std::fs::read(drv_path).map_err(|e| e.to_string())?;
+    let parsed = drv::parse(&bytes).map_err(|e| e.to_string())?;
+    // Resolve the real builder + compute this drv's transitive input CLOSURE with the
+    // SHARED routine the reuse-key read sites also call (stage_input_closure), so read and
+    // write scope the reuse key to an identical closure — any asymmetry reintroduces the
+    // very cache miss the scoping removes. Destructured into the same locals the enforce /
+    // stage / builder-re-key logic below has always used.
+    let stable_builder_id = store::builder_identity_path();
+    let InputClosure { real_builder_cb, builder_exec, roots, closure, builder_reach } =
+        stage_input_closure(
+            &parsed,
+            seed_store_dirs,
+            seed_canonical_prefix,
+            extra_dbs,
+            src_overrides,
+            builder_override,
+            td_store,
+        )?;
     eprintln!(
         "td-builder: realize computed the input closure ITSELF — {} paths by CONTENT-SCANNING {} seed store dir(s) (+ {} td-owned db(s)); no /var/guix/db, no guix gc, no daemon",
         closure.len(),
@@ -3079,6 +3230,12 @@ fn realize_drv(
         &manifest,
         self_store_path().ok().as_deref(),
     )?;
+    // The reuse-key digest (re #469): scope the plan-wide `manifest` to THIS drv's own
+    // transitive input closure and fold in the real builder. Computed here — over the
+    // PRE-re-key `closure`, whose builder entry is still at the real builder's content
+    // path the manifest vouches — so a later reuse re-derives the identical key. The full
+    // `manifest` above stays the ENFORCEMENT input, untouched.
+    let reuse_manifest_sha256 = reuse_key_manifest_digest(&closure, &manifest, &builder_exec);
     // ABI: provenance is now enforced over the real builder path, so re-key the builder's
     // OWN closure entry from its real content path to the stable ABI identity path the drv
     // names (its runtime refs keep their real canonical paths). The sandbox binds the real
@@ -3094,13 +3251,13 @@ fn realize_drv(
     // The manifest the SANDBOX verifies against must cover the builder at the stable identity
     // path the re-keyed closure entry now names (verify_staged_item keys on the canonical
     // half); mirror the real builder's record onto it. The authority `manifest` is left
-    // untouched, so the reuse digest below stays keyed on the real, vouched builder.
+    // untouched, and the reuse digest was already taken (above) over the real, vouched builder.
     let staging_manifest = manifest_with_builder_alias(&manifest, &real_builder_cb, &stable_builder_id);
     // The durable audit beside closure.txt: what may stage, under which hash + provenance
     // class (the origin column). Written from the STAGING manifest so the two files DESCRIBE
     // each other — the re-keyed builder entry's stable-id path in closure.txt appears here
     // too, as the mirror of the real builder's record (same hash + origin), not only the real
-    // path. The un-mirrored authority `manifest` still feeds the reuse digest (manifest_digest).
+    // path. The un-mirrored authority `manifest` already fed the reuse digest above.
     let mut lines = String::new();
     for (p, si) in &staging_manifest {
         lines.push_str(&format!("{p} {} {}\n", si.nar_hash, si.origin.as_str()));
@@ -3130,11 +3287,13 @@ fn realize_drv(
     // realized output(s) — the daemon's post-build registration, in pure Rust.
     write_output_db(&regs, &scratch.join("td.db"))?;
     // The engine-issued build RECEIPT (re #469 round-7): bind these outputs to the
-    // identity of the plan that produced them — drv bytes, typed-manifest digest,
-    // builder — so a later reuse must re-derive the same identity to hit.
+    // identity of the plan that produced them — drv bytes, CLOSURE-SCOPED manifest
+    // digest (computed above, over the drv's own input closure — NOT the plan-wide
+    // `manifest` union enforcement uses — so a higher target's extra unrelated seeds do
+    // not drift the key), builder — so a later reuse must re-derive the same identity to hit.
     let expect = ReceiptExpect {
         drv_sha256: sha256_hex(&bytes),
-        manifest_sha256: manifest_digest(&manifest),
+        manifest_sha256: reuse_manifest_sha256,
         builder: parsed.builder.clone(),
     };
     std::fs::write(scratch.join("receipt"), receipt_text(&expect, &regs))
@@ -3267,9 +3426,25 @@ fn build_recipe(
     let drv_bytes = std::fs::read(&drv_file).map_err(|e| e.to_string())?;
     let manifest_now =
         assemble_input_manifest(extra_dbs, &src_overrides, builder_override.as_ref())?;
+    // Compute THIS drv's transitive input closure with the SAME shared routine realize
+    // uses (stage_input_closure) BEFORE the cache read, so the reuse key is scoped to the
+    // drv's real closure IDENTICALLY at read + write (any asymmetry reintroduces the miss
+    // the scoping removes). Every input tree/db the scan reads is materialized: the
+    // preceding plan steps built + committed their outputs before this step's cache check,
+    // so the closure is available now. The plan-wide `manifest_now` union stays the
+    // ENFORCEMENT input; only the reuse KEY is closure-scoped.
+    let ic = stage_input_closure(
+        &parsed,
+        seed_store_dirs,
+        seed_canonical_prefix,
+        extra_dbs,
+        &src_overrides,
+        builder_override.as_ref(),
+        td_store,
+    )?;
     let expect = ReceiptExpect {
         drv_sha256: sha256_hex(&drv_bytes),
-        manifest_sha256: manifest_digest(&manifest_now),
+        manifest_sha256: reuse_key_manifest_digest(&ic.closure, &manifest_now, &ic.builder_exec),
         builder: parsed.builder.clone(),
     };
     // Content-addressed build cache: if SCRATCH already holds a valid realization of
@@ -9267,6 +9442,155 @@ daemon build START (2/2 active)
         assert!(receipt_outputs(&dup_output, &expect).is_none());
         let dup_producer = format!("{base}producer local-build\n");
         assert!(receipt_outputs(&dup_producer, &expect).is_none());
+    }
+
+    // re #469: the reuse-key digest (`ReceiptExpect.manifest_sha256`) is
+    // CLOSURE-SCOPED to the drv's OWN transitive input closure, not the plan-wide
+    // manifest union. The seed db is interned per TARGET graph, so a higher target
+    // folds unrelated seeds into the shared manifest; under the old plan-wide digest
+    // the SAME drv got a DIFFERENT reuse key across targets — a receipt-identity miss
+    // that rebuilt an already-valid rung and then collided with its cached tree. The
+    // scoped key must be IDENTICAL across the two plans, yet still MOVE when a real
+    // input of THIS drv — or the real builder — changes.
+    #[test]
+    fn reuse_key_digest_is_scoped_to_the_drvs_own_closure() {
+        let src = format!("/td/store/{}-mes-source", "a".repeat(32));
+        let seed_a = format!("/td/store/{}-tinycc-seed", "b".repeat(32));
+        let builder = format!("/td/store/{}-td-builder", "9".repeat(32));
+        let builder_exec = format!("{builder}/bin/td-builder");
+        // seed_x/seed_y are OTHER rungs' seeds a higher target interns into the shared
+        // seed db — outside THIS drv's closure.
+        let seed_x = format!("/gnu/store/{}-gcc-seed", "c".repeat(32));
+        let seed_y = format!("/gnu/store/{}-glibc-seed", "d".repeat(32));
+
+        // THIS drv's transitive input closure: src, a seed (with an on-disk half, to
+        // exercise split_closure_entry's canonical extraction), and the real builder.
+        let closure = vec![
+            src.clone(),
+            format!("{seed_a}\t/seed/on-disk/tinycc"),
+            format!("{builder}\t/td/store-disk/td-builder"),
+        ];
+
+        let si = |h: &str, o: sandbox::InputOrigin| sandbox::StagedInput {
+            nar_hash: format!("sha256:{h}"),
+            origin: o,
+        };
+        // The LOW target's manifest: exactly the drv's own closure.
+        let mut low: sandbox::StageManifest = sandbox::StageManifest::new();
+        low.insert(src.clone(), si("11", sandbox::InputOrigin::AuditedSeed));
+        low.insert(seed_a.clone(), si("22", sandbox::InputOrigin::AuditedSeed));
+        low.insert(builder.clone(), si("bb", sandbox::InputOrigin::ControlPlaneBuilder));
+        // The HIGH target's manifest: the same closure PLUS unrelated seeds folded into
+        // the shared seed db.
+        let mut high = low.clone();
+        high.insert(seed_x, si("33", sandbox::InputOrigin::AuditedSeed));
+        high.insert(seed_y.clone(), si("44", sandbox::InputOrigin::AuditedSeed));
+
+        // The OLD bug: the plan-wide digest DIFFERS across targets even though the drv
+        // and its own closure are identical — the receipt-identity miss.
+        assert_ne!(
+            manifest_digest(&low),
+            manifest_digest(&high),
+            "the plan-wide digest drifts with unrelated seeds — the bug this scopes away"
+        );
+        // The FIX: the closure-scoped reuse key is IDENTICAL across the two plans.
+        let low_key = reuse_key_manifest_digest(&closure, &low, &builder_exec);
+        let high_key = reuse_key_manifest_digest(&closure, &high, &builder_exec);
+        assert_eq!(
+            low_key, high_key,
+            "the reuse key must not drift with inputs outside the drv's own closure"
+        );
+        // An unrelated seed ADDED to the plan (outside the closure) never moves the key.
+        let mut plus_outside = low.clone();
+        plus_outside.insert(
+            format!("/gnu/store/{}-unrelated", "e".repeat(32)),
+            si("ee", sandbox::InputOrigin::AuditedSeed),
+        );
+        assert_eq!(
+            low_key,
+            reuse_key_manifest_digest(&closure, &plus_outside, &builder_exec),
+            "an input outside the closure must not move the key"
+        );
+
+        // Binding preserved: CHANGING an in-closure input's hash moves the key.
+        let mut changed = low.clone();
+        changed.insert(seed_a.clone(), si("ff", sandbox::InputOrigin::AuditedSeed));
+        assert_ne!(
+            low_key,
+            reuse_key_manifest_digest(&closure, &changed, &builder_exec),
+            "a changed hash on an in-closure input must move the key"
+        );
+        // REMOVING an in-closure input moves the key too — the binding to real inputs stands.
+        let mut removed = low.clone();
+        removed.remove(seed_a.as_str());
+        assert_ne!(
+            low_key,
+            reuse_key_manifest_digest(&closure, &removed, &builder_exec),
+            "dropping an in-closure input must move the key"
+        );
+
+        // P1-B: the RESOLVED real builder is folded into the key. Changing builder_exec
+        // moves it even when the manifest is byte-identical — so a builder-ELF change
+        // (⇒ different content path) invalidates reuse. This holds even for the RUNNING
+        // builder, which is no manifest key: with a closure carrying no builder row, the
+        // fold is the only leg that binds it.
+        let other_builder = format!("/td/store/{}-td-builder/bin/td-builder", "8".repeat(32));
+        assert_ne!(
+            low_key,
+            reuse_key_manifest_digest(&closure, &low, &other_builder),
+            "the resolved real builder must bind the key"
+        );
+        let bare = vec![src.clone(), seed_a.clone()]; // no builder in the closure/manifest
+        assert_ne!(
+            reuse_key_manifest_digest(&bare, &low, &builder_exec),
+            reuse_key_manifest_digest(&bare, &low, &other_builder),
+            "the running builder path binds the key even when it is no manifest row"
+        );
+    }
+
+    // drv_declared_inputs (the reuse-key/closure ROOTS): input-srcs pass through in
+    // order, and each input-drv is resolved by READING the input .drv and looking up
+    // the NAMED output; an unknown output name is an error (not a silent skip).
+    #[test]
+    fn drv_declared_inputs_resolves_srcs_and_input_drvs() {
+        let tmp = std::env::temp_dir().join(format!("td-declared-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A real input .drv with two named outputs, serialized the way drv::parse reads.
+        let dep_out = format!("/td/store/{}-dep-out", "1".repeat(32));
+        let dep_lib = format!("/td/store/{}-dep-lib", "2".repeat(32));
+        let dep = drv::Derivation {
+            outputs: vec![
+                drv::Output { name: "out".to_string(), path: dep_out.clone(), hash_algo: String::new(), hash: String::new() },
+                drv::Output { name: "lib".to_string(), path: dep_lib.clone(), hash_algo: String::new(), hash: String::new() },
+            ],
+            input_drvs: vec![],
+            input_srcs: vec![],
+            platform: "x86_64-linux".to_string(),
+            builder: String::new(),
+            args: vec![],
+            env: vec![],
+        };
+        let dep_path = tmp.join("dep.drv");
+        std::fs::write(&dep_path, drv::serialize(&dep)).unwrap();
+
+        let src = format!("/td/store/{}-src", "a".repeat(32));
+        let mut parent = one_output_drv(&format!("/td/store/{}-parent", "e".repeat(32)));
+        parent.input_srcs = vec![src.clone()];
+        // Request BOTH the `lib` and `out` outputs of the dep (order as written).
+        parent.input_drvs =
+            vec![(dep_path.to_string_lossy().into_owned(), vec!["lib".to_string(), "out".to_string()])];
+
+        let roots = drv_declared_inputs(&parent).unwrap();
+        // input-srcs first (verbatim), then the resolved input-drv outputs in request order.
+        assert_eq!(roots, vec![src.clone(), dep_lib.clone(), dep_out.clone()]);
+
+        // An unknown output NAME is a hard error, never a silent drop.
+        parent.input_drvs =
+            vec![(dep_path.to_string_lossy().into_owned(), vec!["nope".to_string()])];
+        let err = drv_declared_inputs(&parent).unwrap_err();
+        assert!(err.contains("has no output `nope'"), "{err}");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // authenticate_recipe_output_db (re #469 round-8): `--recipe-output-db` is
