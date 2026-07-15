@@ -7,6 +7,14 @@ use crate::types::{Recipe, Step};
 // configure LINK test must be static (LDFLAGS), CC stays clean of -static/-B
 // (autoconf stderr poisoning), and CC_FOR_BUILD links static to RUN its build
 // tools. Out-of-tree bld/ subdir; no boot patch (guix deletes that phase).
+//
+// Dead flex/bison host-tool edges dropped (re #469, mirrors binutils 9a4621c):
+// GCC 4.9.4 ships every generated parser (gcc/gengtype-lex.c, intl/plural.c)
+// with archive mtimes newer than their .l/.y (preserved on unpack since #496),
+// gcc/Makefile.in empties the .l.c/.y.c suffix rules, and the c,c++ front ends
+// are recursive-descent — so flex/bison are never invoked (verified: both
+// generated files are byte-for-byte unchanged in a real build tree). configure
+// falls back to the automake `missing` stub via the explicit CONFIG_SHELL.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:gcc-mesboot1}}/bin:{}", base_path());
     let cip = "{in:gcc-mesboot1}/lib/gcc/i686-unknown-linux-gnu/4.6.4/include:{root}/kh:{in:glibc-mesboot}/include:{src}/mpfr/src";
@@ -35,10 +43,6 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
             ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
         ],
     });
     steps.push(
@@ -145,6 +149,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot1",
             "glibc-mesboot",
         ])
-        .inputs_owned(base_inputs(&["gmp", "mpfr", "mpc", "linux-headers", "flex", "bison"]))
+        .inputs_owned(base_inputs(&["gmp", "mpfr", "mpc", "linux-headers"]))
         .steps(steps)
 }
