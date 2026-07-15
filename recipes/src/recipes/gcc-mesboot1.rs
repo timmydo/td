@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GCC 4.6.4 (c,c++) — rung 12 (#378, guix's gcc-mesboot1): gcc-mesboot0 builds
@@ -6,8 +6,15 @@ use crate::types::{Recipe, Step};
 // gmp/mpfr/mpc unpack in-tree with version-free symlinks; LDFLAGS are static at
 // glibc-mesboot0's lib; CPLUS_INCLUDE_PATH mirrors C_INCLUDE_PATH (guix's
 // setenv) so libstdc++ finds the C headers. gcc-mesboot0's bin leads PATH.
+//
+// Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers —
+// mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, the binutils-mesboot1
+// link_bins_mesboot0 farm, and flex/bison dropped as dead edges (4.6.4 ships its
+// pre-generated parsers and #496 keeps them newer than their sources). gcc 4.x
+// installs headers via install-mkheaders, not the 2.95 tar pipe, so no tar edge.
+// Per-rung cutover for #469; the shared host mechanism goes in the final atomic PR.
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:gcc-mesboot0}}/bin:{}", base_path());
+    let path = format!("{{in:gcc-mesboot0}}/bin:{}", mesboot0_path());
     let gccdir1 = "{in:gcc-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
     let cip = format!("{gccdir1}/include:{{root}}/kh:{{in:glibc-mesboot0}}/include:{{src}}/mpfr/src");
     let lp = "{in:glibc-mesboot0}/lib:{in:gcc-mesboot0}/lib";
@@ -38,16 +45,10 @@ pub fn recipe() -> Recipe {
             ("cpp".into(), "{in:gcc-mesboot0}/bin/cpp".into()),
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(
-        link_bins("binutils-mesboot1"),
-    );
+    steps.push(link_bins_mesboot0("binutils-mesboot1"));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
         shell: SH.into(),
@@ -143,6 +144,6 @@ pub fn recipe() -> Recipe {
             "glibc-mesboot0",
             "make-mesboot",
         ])
-        .inputs_owned(base_inputs(&["gcc-464-gpp", "patch-gcc-boot-4.6.4", "gmp", "mpfr", "mpc", "linux-headers", "flex", "bison"]))
+        .inputs_owned(mesboot0_inputs(&["gcc-464-gpp", "patch-gcc-boot-4.6.4", "gmp", "mpfr", "mpc", "linux-headers"]))
         .steps(steps)
 }

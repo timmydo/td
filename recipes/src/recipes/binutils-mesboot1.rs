@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.20.1a #2 — rung 10 (#378, guix's binutils-mesboot1): rebuilt
@@ -6,8 +6,13 @@ use crate::types::{Recipe, Step};
 // proven constraints from the deleted fn: NO -B in CC (gcc 2.95's "prefix never
 // used" stderr poisons autoconf's header probes → fibheap loses LONG_MIN), and
 // the PURE headers, never the mes-merged set (its limits.h shadows gcc's).
+//
+// Host-tool ingress closed (re #469): mechanical cutover to the `-mesboot0`
+// providers — mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, and the
+// binutils link_bins_mesboot0 farm. No flex/bison/tar edges here. Per-rung
+// cutover for #469; the shared host mechanism goes in the final atomic PR.
 pub fn recipe() -> Recipe {
-    let path = base_path();
+    let path = mesboot0_path();
     let cip = "{in:glibc-mesboot0}/include:{root}/kh";
     let lp = "{in:glibc-mesboot0}/lib:{in:gcc-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
     let cc = "CC={in:gcc-mesboot0}/bin/gcc -static";
@@ -19,12 +24,10 @@ pub fn recipe() -> Recipe {
             ("cpp".into(), "{in:gcc-mesboot0}/bin/cpp".into()),
             ("make".into(), "{in:make-mesboot0}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(
-        link_bins("binutils-mesboot0"),
-    );
+    steps.push(link_bins_mesboot0("binutils-mesboot0"));
     steps.push(
         Step::run(
             "{src}",
@@ -80,6 +83,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot0",
             "glibc-mesboot0",
         ])
-        .inputs_owned(base_inputs(&["patch-binutils-boot-2.20.1a", "linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&["patch-binutils-boot-2.20.1a", "linux-headers"]))
         .steps(steps)
 }

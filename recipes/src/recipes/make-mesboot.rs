@@ -1,11 +1,16 @@
-use crate::ladder::{SH, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU Make 3.82 — rung 11 (#378, guix's make-mesboot): gcc-mesboot0 rebuilds
 // make against glibc-mesboot0; the tcc-built make 3.80 drives it. The static
 // glibc names its nss/resolv archives explicitly (LIBS), as guix does.
+//
+// Host-tool ingress closed (re #469): mechanical cutover to the `-mesboot0`
+// providers — mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, and the
+// binutils link_bins_mesboot0 farm. Per-rung cutover for #469; the shared host
+// mechanism goes in the final atomic PR.
 pub fn recipe() -> Recipe {
-    let path = base_path();
+    let path = mesboot0_path();
     let cip = "{in:glibc-mesboot0}/include:{root}/kh";
     let lp = "{in:glibc-mesboot0}/lib:{in:gcc-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
     let cc = "CC={in:gcc-mesboot0}/bin/gcc -static";
@@ -15,12 +20,10 @@ pub fn recipe() -> Recipe {
         links: vec![
             ("cpp".into(), "{in:gcc-mesboot0}/bin/cpp".into()),
             ("make".into(), "{in:make-mesboot0}/bin/make".into()),
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(
-        link_bins("binutils-mesboot0"),
-    );
+    steps.push(link_bins_mesboot0("binutils-mesboot0"));
     steps.push(
         Step::run(
             "{src}",
@@ -73,6 +76,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot0",
             "glibc-mesboot0",
         ])
-        .inputs_owned(base_inputs(&["linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&["linux-headers"]))
         .steps(steps)
 }
