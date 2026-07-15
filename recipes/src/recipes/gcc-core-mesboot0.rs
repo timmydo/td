@@ -9,33 +9,25 @@ use crate::types::{Recipe, Step, TextEdit};
 // so the compiler can link on its own.
 //
 // Host-tool ingress closed (re #469): cut over to the td-built `-mesboot0`
-// providers — `mesboot0_path()`/`mesboot0_inputs()` supply coreutils/sed/grep/
-// gawk/diffutils, the `awk` ToolFarm points at `gawk-mesboot0`, `rm` and the
-// binutils `link_bins_mesboot0` farm use `coreutils-mesboot0`. The one host tool
-// this rung actually depended on was `tar` (gcc's install-headers-tar, which
-// copies the built headers into place); it is replaced below with a
-// coreutils-mesboot0 `cp'. gcc's `make install' also NAMES a host `find' in the
-// install-headers fix-absolute-symlinks step (gcc/Makefile.in:2637), but that is
-// a dead edge like flex/bison below: the make line is error-ignored (`-' prefix)
-// and gated on the find's `$?', and the installed include tree has no absolute
-// symlinks to relativize (SYSTEM_HEADER_DIR=/usr/include is absent from the
-// sandbox, so fixinc creates none -- verified: zero symlinks in the output). With
-// `find' off the mesboot0 PATH the assignment yields empty, the `$?' gate fails
-// closed, and the fixup no-ops. No authored step invokes a host executable.
+// providers — mesboot0_path()/mesboot0_inputs() supply coreutils/sed/grep/gawk/
+// diffutils, the `awk` ToolFarm points at gawk-mesboot0, and `rm`/`cp`/the
+// binutils link_bins_mesboot0 farm use coreutils-mesboot0. The one host tool this
+// rung depended on was `tar` (install-headers-tar), replaced below with `cp -a`.
+// `make install` also NAMES host `find` in install-headers' fix-symlinks step,
+// but that is a dead edge like flex/bison: the line is error-ignored + `$?`-gated
+// and the installed include tree has zero absolute symlinks to fix
+// (SYSTEM_HEADER_DIR=/usr/include is absent, so fixinc makes none — verified), so
+// with `find` off PATH the fixup no-ops. No authored step invokes a host tool.
 //
-// No flex or bison: gcc-2.95.3 SHIPS its pre-generated bison parsers
-// (c-parse.c/c-parse.h from c-parse.y, cexp.c from cexp.y) and its gperf table
-// (c-gperf.h). The Makefile's `$(BISON)`/`$(GPERF)` rules fire only if a source
-// is NEWER than its generated file. td's unpacker now preserves tar mtimes (as
-// GNU tar/guix do), so the shipped generated files stay newer than their
-// sources and make treats them as up-to-date — bison, flex (no `.l` sources at
-// all), and gperf are all dead edges here, exactly as upstream guix/live-boot
-// build this rung with none of them on PATH. Before the mtime fix every
-// extracted file got a "now" mtime in extraction order, which put c-parse.y
-// after c-parse.c and spuriously demanded bison; that was the sole reason this
-// rung named host flex/bison, and it is gone. Per-rung cutover for #469;
-// `BASE_TOOLS`/`base_path`/`base_inputs`/`link_bins` are deleted in the final
-// atomic PR once every rung has moved off them.
+// No flex or bison: gcc-2.95.3 SHIPS its pre-generated bison parsers and gperf
+// table, and the Makefile's `$(BISON)`/`$(GPERF)` rules fire only if a source is
+// newer than its generated file. td's unpacker now preserves tar mtimes (#496),
+// so the shipped files stay newer and make treats them as up-to-date — bison,
+// flex (no `.l` sources at all), and gperf are dead edges, as upstream guix/
+// live-boot build this rung with none on PATH. (Pre-#496, "now"-in-extraction-
+// order mtimes put c-parse.y after c-parse.c and spuriously demanded bison — the
+// sole reason this rung once named host flex/bison.) Per-rung cutover for #469;
+// BASE_TOOLS/base_path/base_inputs/link_bins go in the final atomic PR.
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
     let cip = "{in:mes}/include:{in:mes}/include/x86";
@@ -43,21 +35,16 @@ pub fn recipe() -> Recipe {
     let gccdir = "{out}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
     let mut steps = unpack_into("gcc-core-mesboot0-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-gcc-boot-2.95.3"));
-    // Host-tar-free header install (re #469). gcc-2.95.3 on i686-linux hard-wires
-    // INSTALL_HEADERS_DIR to install-headers-tar, whose recipe copies the built
-    // gcc/include tree into $(libsubdir)/include with a `tar -cf - . | tar -xf -'
-    // pipe (the only other method, install-headers-cpio, needs cpio). td ships no
-    // tar or cpio executable: the control-plane builder unpacks sources with its
-    // own in-process tar (builder/src/tar.rs), so the build sandbox never had a
-    // tar, and the historical green build got one only from the ambient host PATH
-    // #469 removes. Replace the tar pipe with `cp -a include/. $(libsubdir)/include'
-    // using the td-built coreutils-mesboot0 `cp' (already on mesboot0_path, already
-    // used here for `rm'); `cp -a' copies the same tree and, like the tar pipe,
-    // preserves any symlinks in it (the installed include tree in fact has none --
-    // see the host-`find' dead-edge note in the module header). Patched in
-    // Makefile.in BEFORE configure so config.status (the now-flush-fixed
-    // sed-mesboot0) copies the cp rule verbatim into gcc/Makefile — $(libsubdir)
-    // and the rule name are plain make text, untouched by autoconf @-substitution.
+    // Host-tar-free header install (re #469). gcc-2.95.3 hard-wires
+    // INSTALL_HEADERS_DIR to install-headers-tar, which copies the built gcc/include
+    // tree via a `tar -cf - . | tar -xf -' pipe (the only alternative,
+    // install-headers-cpio, needs cpio). td ships no tar/cpio executable — the
+    // control-plane builder unpacks with its own in-process tar (builder/src/tar.rs)
+    // — so the historical green build got tar only from the host PATH #469 removes.
+    // Replace the pipe with coreutils-mesboot0 `cp -a include/. $(libsubdir)/include'
+    // (same tree, symlinks preserved like tar; the tree in fact has none). Patched
+    // BEFORE configure so config.status copies the rule verbatim — $(libsubdir) and
+    // the rule name are plain make text, untouched by autoconf @-substitution.
     steps.push(Step::substitute_text(
         "{src}/gcc/Makefile.in",
         vec![TextEdit::new(
