@@ -1,5 +1,5 @@
-use crate::ladder::{SH, apply_patch, base_inputs, base_path, link_bins, unpack_into};
-use crate::types::{Recipe, Step};
+use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 2.95.3 — bootstrap rung 7 (#378, guix's gcc-core-mesboot0): tcc + the
 // binutils-mesboot0 as/ld build the first gcc against the mes libc. Faithful
@@ -7,13 +7,57 @@ use crate::types::{Recipe, Step};
 // hint, texinfo stubs, shebang rewrite, BOOT_LDFLAGS at tcc's crt dir, and the
 // install2 ar-assembly of libgcc.a/libc.a into gcc-lib (+ crt/libgcc2.a copies)
 // so the compiler can link on its own.
+//
+// Host-tool ingress closed (re #469): cut over to the td-built `-mesboot0`
+// providers — `mesboot0_path()`/`mesboot0_inputs()` supply coreutils/sed/grep/
+// gawk/diffutils, the `awk` ToolFarm points at `gawk-mesboot0`, `rm` and the
+// binutils `link_bins_mesboot0` farm use `coreutils-mesboot0`. The one remaining
+// host executable this rung reached for was `tar` (gcc's install-headers-tar);
+// it is replaced below with a coreutils-mesboot0 `cp' so nothing outside the
+// td store is invoked.
+//
+// No flex or bison: gcc-2.95.3 SHIPS its pre-generated bison parsers
+// (c-parse.c/c-parse.h from c-parse.y, cexp.c from cexp.y) and its gperf table
+// (c-gperf.h). The Makefile's `$(BISON)`/`$(GPERF)` rules fire only if a source
+// is NEWER than its generated file. td's unpacker now preserves tar mtimes (as
+// GNU tar/guix do), so the shipped generated files stay newer than their
+// sources and make treats them as up-to-date — bison, flex (no `.l` sources at
+// all), and gperf are all dead edges here, exactly as upstream guix/live-boot
+// build this rung with none of them on PATH. Before the mtime fix every
+// extracted file got a "now" mtime in extraction order, which put c-parse.y
+// after c-parse.c and spuriously demanded bison; that was the sole reason this
+// rung named host flex/bison, and it is gone. Per-rung cutover for #469;
+// `BASE_TOOLS`/`base_path`/`base_inputs`/`link_bins` are deleted in the final
+// atomic PR once every rung has moved off them.
 pub fn recipe() -> Recipe {
-    let path = base_path();
+    let path = mesboot0_path();
     let cip = "{in:mes}/include:{in:mes}/include/x86";
     let lp = "{in:tcc}/lib";
     let gccdir = "{out}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
     let mut steps = unpack_into("gcc-core-mesboot0-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-gcc-boot-2.95.3"));
+    // Host-tar-free header install (re #469). gcc-2.95.3 on i686-linux hard-wires
+    // INSTALL_HEADERS_DIR to install-headers-tar, whose recipe copies the built
+    // gcc/include tree into $(libsubdir)/include with a `tar -cf - . | tar -xf -'
+    // pipe (the only other method, install-headers-cpio, needs cpio). td ships no
+    // tar or cpio executable: the control-plane builder unpacks sources with its
+    // own in-process tar (builder/src/tar.rs), so the build sandbox never had a
+    // tar, and the historical green build got one only from the ambient host PATH
+    // #469 removes. Replace the tar pipe with `cp -a include/. $(libsubdir)/include'
+    // using the td-built coreutils-mesboot0 `cp' (already on mesboot0_path, already
+    // used here for `rm'); `cp -a' copies the same tree and preserves the include
+    // symlinks the rule's own follow-up fix-symlinks step expects. Patched in
+    // Makefile.in BEFORE configure so config.status (the now-flush-fixed
+    // sed-mesboot0) copies the cp rule verbatim into gcc/Makefile — $(libsubdir)
+    // and the rule name are plain make text, untouched by autoconf @-substitution.
+    steps.push(Step::substitute_text(
+        "{src}/gcc/Makefile.in",
+        vec![TextEdit::new(
+            "\t(cd `pwd`/include ; \\\n\t tar -cf - .; exit 0) | (cd $(libsubdir)/include; tar $(TAROUTOPTS) - )",
+            "\tcp -a include/. $(libsubdir)/include",
+            1,
+        )],
+    ));
     steps.push(Step::CopyFiles {
         files: vec![
             "{in:tcc}/lib/crt1.o".into(),
@@ -29,17 +73,11 @@ pub fn recipe() -> Recipe {
             ("tcc".into(), "{in:tcc}/bin/tcc".into()),
             ("make".into(), "{in:make-mesboot0}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
     // binutils' whole bin dir onto the farm (as/ld/ar/ranlib/nm/strip/…).
-    steps.push(
-        link_bins("binutils-mesboot0"),
-    );
+    steps.push(link_bins_mesboot0("binutils-mesboot0"));
     steps.push(Step::WriteFile {
         path: "{src}/config.cache".into(),
         content: "ac_cv_c_float_format='IEEE (little-endian)'\n".into(),
@@ -73,7 +111,7 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     steps.push(
-        Step::run("{src}", &["{in:coreutils}/bin/rm", "-rf", "texinfo"]).env("PATH", &path),
+        Step::run("{src}", &["{in:coreutils-mesboot0}/bin/rm", "-rf", "texinfo"]).env("PATH", &path),
     );
     steps.push(Step::MkDir {
         path: "{src}/gcc".into(),
@@ -129,7 +167,7 @@ pub fn recipe() -> Recipe {
     );
     // install2 (guix gcc-core-mesboot0): libgcc.a = libgcc2.a ∪ libtcc1.a and
     // libc.a = libc.o ∪ libtcc1.o, assembled with binutils' ar into gcc-lib.
-    steps.push(Step::MkDir { path: format!("{gccdir}") });
+    steps.push(Step::MkDir { path: gccdir.into() });
     for d in ["{root}/tg", "{root}/tc2"] {
         steps.push(Step::MkDir { path: d.into() });
     }
@@ -171,6 +209,6 @@ pub fn recipe() -> Recipe {
             "patch-mesboot",
             "binutils-mesboot0",
         ])
-        .inputs_owned(base_inputs(&["patch-gcc-boot-2.95.3", "flex", "bison"]))
+        .inputs_owned(mesboot0_inputs(&["patch-gcc-boot-2.95.3"]))
         .steps(steps)
 }

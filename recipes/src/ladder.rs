@@ -136,6 +136,23 @@ pub fn link_bins(binutils_rung: &str) -> Step {
     .env("PATH", &base_path())
 }
 
+/// `link_bins` for a `-mesboot0`-cutover rung: the td-built `coreutils-mesboot0`
+/// `ln` on `mesboot0_path()`, mirroring `link_bins` node-for-node with the host
+/// coreutils swapped for its `-mesboot0` provider (re #469). Folds back into a
+/// single `link_bins` on the chosen provider in the final atomic cutover PR.
+pub fn link_bins_mesboot0(binutils_rung: &str) -> Step {
+    Step::run(
+        "{root}",
+        &[
+            "{in:coreutils-mesboot0}/bin/ln",
+            "-sf",
+            &format!("glob:{{in:{binutils_rung}}}/bin/*"),
+            "{tools}",
+        ],
+    )
+    .env("PATH", &mesboot0_path())
+}
+
 /// The declared shell (the sandbox has no /bin/sh): the td-built `bash-mesboot`
 /// output, not a host bash.
 pub const SH: &str = "{in:bash-mesboot}/bin/bash";
