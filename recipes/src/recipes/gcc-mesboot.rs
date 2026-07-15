@@ -35,10 +35,6 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
             ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
         ],
     });
     steps.push(
@@ -145,6 +141,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot1",
             "glibc-mesboot",
         ])
-        .inputs_owned(base_inputs(&["gmp", "mpfr", "mpc", "linux-headers", "flex", "bison"]))
+        .inputs_owned(base_inputs(&["gmp", "mpfr", "mpc", "linux-headers"]))
         .steps(steps)
 }
