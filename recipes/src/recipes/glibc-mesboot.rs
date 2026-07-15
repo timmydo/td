@@ -1,5 +1,5 @@
 use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, sed_i_mesboot0, unpack_into, unpack_keep_top};
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, Step, TextEdit};
 
 // glibc 2.16.0 STATIC — rung 15 (#378, guix's glibc-headers-mesboot +
 // glibc-mesboot): gcc-mesboot1 + binutils-mesboot + gawk-mesboot build the
@@ -57,6 +57,18 @@ pub fn recipe() -> Recipe {
     steps.push(sed_i_mesboot0(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
+    ));
+    // csu/Makefile's version-info.h banner rule shells out to host uname/date,
+    // which coreutils-mesboot0 does not provide; pin them to deterministic,
+    // tool-free values so the banner is host-free and reproducible (re #469).
+    // Kernel version still comes from the declared linux-headers (UTS_RELEASE).
+    steps.push(Step::substitute_text(
+        "{src}/csu/Makefile",
+        vec![
+            TextEdit::new("os=`uname -s 2> /dev/null`", "os=Linux", 1),
+            TextEdit::new("\"`date +%Y-%m-%d`\"", "\"\"", 1),
+            TextEdit::new("version=`uname -r`", "version=unknown", 1),
+        ],
     ));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
