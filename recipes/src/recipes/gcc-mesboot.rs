@@ -1,5 +1,5 @@
-use crate::ladder::{SH, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
-use crate::types::{Recipe, Step};
+use crate::ladder::{SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 4.9.4 — rung 16 (#378, guix's gcc-mesboot): gcc-mesboot1 (4.6.4 c,c++) +
 // binutils-mesboot + the static glibc 2.16.0 build the final mesboot gcc.
@@ -8,7 +8,7 @@ use crate::types::{Recipe, Step};
 // (autoconf stderr poisoning), and CC_FOR_BUILD links static to RUN its build
 // tools. Out-of-tree bld/ subdir; no boot patch (guix deletes that phase).
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:gcc-mesboot1}}/bin:{}", base_path());
+    let path = format!("{{in:gcc-mesboot1}}/bin:{}", mesboot0_path());
     let cip = "{in:gcc-mesboot1}/lib/gcc/i686-unknown-linux-gnu/4.6.4/include:{root}/kh:{in:glibc-mesboot}/include:{src}/mpfr/src";
     let lp = "{in:glibc-mesboot}/lib:{in:gcc-mesboot1}/lib";
     let ldf = "-static -B{in:glibc-mesboot}/lib";
@@ -34,16 +34,29 @@ pub fn recipe() -> Recipe {
             ("cpp".into(), "{in:gcc-mesboot1}/bin/cpp".into()),
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
     steps.push(
-        link_bins("binutils-mesboot"),
+        link_bins_mesboot0("binutils-mesboot"),
     );
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    // Close the `tar` host-tool ingress in `make install`: config.build has no
+    // i686-*-linux-gnu arm, so INSTALL_HEADERS_DIR defaults to
+    // install-headers-tar (a `tar` pipeline); mesboot0 ships no tar. Repoint it
+    // at install-headers-cp (cp -p -r, coreutils-mesboot0) before configure —
+    // same fix as gcc-mesboot1.
+    steps.push(Step::substitute_text(
+        "{src}/gcc/Makefile.in",
+        vec![TextEdit::new(
+            "INSTALL_HEADERS_DIR = @build_install_headers_dir@",
+            "INSTALL_HEADERS_DIR = install-headers-cp",
+            1,
+        )],
+    ));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });
@@ -141,6 +154,6 @@ pub fn recipe() -> Recipe {
             "gcc-mesboot1",
             "glibc-mesboot",
         ])
-        .inputs_owned(base_inputs(&["gmp", "mpfr", "mpc", "linux-headers"]))
+        .inputs_owned(mesboot0_inputs(&["gmp", "mpfr", "mpc", "linux-headers"]))
         .steps(steps)
 }
