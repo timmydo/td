@@ -234,7 +234,11 @@ pub fn extract_tar_reader<R: Read>(
                     set_file_mtime(&out_file, mtime)
                         .map_err(|e| format!("set mtime on {}: {e}", out.display()))?;
                 }
-                fs::set_permissions(&out, fs::Permissions::from_mode(entry.mode))
+                // chmod through the open fd (fchmod), not a second path lookup —
+                // we already hold the descriptor, and it can't be swapped for a
+                // symlink between create and chmod the way `&out` could.
+                out_file
+                    .set_permissions(fs::Permissions::from_mode(entry.mode))
                     .map_err(|e| format!("chmod {}: {e}", out.display()))?;
             }
             EntryKind::Symlink { target } => {
@@ -351,13 +355,17 @@ impl Entry {
 }
 
 /// Stamp an extracted regular file's mtime from its tar header, via the still-open
-/// fd (unaffected by the file's mode). A 12-octal-digit tar mtime maxes near year
-/// 2242, well inside `SystemTime` range, so `checked_add` only guards against a
-/// pathological header rather than any real source tarball.
+/// fd (unaffected by the file's mode). An out-of-range value — a pathological
+/// far-future header, or any post-2038 time on a 32-bit `time_t` platform where
+/// `SystemTime` tops out — is SKIPPED (the file keeps its extraction-time mtime)
+/// rather than failing the whole unpack, mirroring the base-256 `None` fallback in
+/// `Entry::parse`. A genuine `set_times` syscall failure still propagates, so a
+/// real regression in mtime preservation reds loudly rather than silently
+/// reverting to "now".
 fn set_file_mtime(file: &File, secs: u64) -> Result<(), String> {
-    let when = SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_secs(secs))
-        .ok_or_else(|| format!("tar mtime {secs} out of range"))?;
+    let Some(when) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs)) else {
+        return Ok(());
+    };
     file.set_times(fs::FileTimes::new().set_modified(when))
         .map_err(|e| e.to_string())
 }
@@ -764,6 +772,70 @@ mod tests {
             generated > source,
             "generated parser must stay newer than its source"
         );
+    }
+
+    #[test]
+    fn preserves_mtime_even_on_read_only_file() {
+        // The mtime is set through the still-open fd BEFORE chmod drops
+        // owner-write, so a 0o444 file still gets its archived mtime (futimens on
+        // our own fd is unaffected by the file's mode). This exercises the exact
+        // rationale the extraction code comments on.
+        let tmp = temp_dir("td-tar-readonly-mtime-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mtime = 1_111_111_111u64;
+        let mut bytes = Vec::new();
+        append_header_mtime(&mut bytes, "ro", b'0', 0o444, 5, "", mtime);
+        append_data(&mut bytes, b"hello");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        extract_tar(&tar, &out).unwrap();
+
+        let meta = fs::metadata(out.join("ro")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o444);
+        let secs = meta
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(secs, mtime);
+    }
+
+    #[test]
+    fn base256_mtime_falls_back_without_failing_extraction() {
+        // A GNU base-256 mtime (high bit set in the field) is not octal; parse_octal
+        // rejects it and Entry::parse falls back to None. Extraction must still
+        // SUCCEED — the file keeps its extraction-time mtime — rather than error.
+        let tmp = temp_dir("td-tar-base256-mtime-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut header = [0u8; BLOCK];
+        write_bytes(&mut header, 0, 100, b"base256");
+        write_octal(&mut header, 100, 8, 0o644);
+        write_octal(&mut header, 108, 8, 0);
+        write_octal(&mut header, 116, 8, 0);
+        write_octal(&mut header, 124, 12, 5);
+        // base-256 mtime: high-bit marker + magnitude bytes, deliberately NOT octal.
+        header[136] = 0x80;
+        header[147] = 0x2a;
+        for byte in &mut header[148..156] {
+            *byte = b' ';
+        }
+        header[156] = b'0';
+        write_bytes(&mut header, 257, 6, b"ustar");
+        write_bytes(&mut header, 263, 2, b"00");
+        let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
+        write_checksum(&mut header, sum);
+        let mut bytes = header.to_vec();
+        append_data(&mut bytes, b"hello");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        extract_tar(&tar, &out).unwrap();
+
+        assert_eq!(fs::read(out.join("base256")).unwrap(), b"hello");
     }
 
     #[test]
