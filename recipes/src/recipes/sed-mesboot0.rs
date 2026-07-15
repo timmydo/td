@@ -26,20 +26,36 @@ use crate::types::{Recipe, Step, TextEdit};
 //   * No `cp`: the one generated file live-bootstrap's mk makes with a `cp`
 //     rule — lib/regex.h, a copy of lib/regex_.h that lib/regex.c and sed.h
 //     #include — is created here as an engine-native relative symlink.
-//   * One td-originated source fix, at two sentinel sites: live-bootstrap applies
-//     no patch to sed-4.0.9, but it never routes a stdin-reading autoconf
-//     `config.status' pipe through this tcc-era sed. td does (re #469: the
-//     binutils/gcc-core rungs' configure), which trips a latent sed 4.0.9 +
-//     mes-0.27.1 bug. mes defines `stdin' as (FILE*)0 == NULL, so an OPEN stdin
-//     (a pipe or a `<file' redirect) has input->fp == NULL — indistinguishable,
-//     by an `input->fp' test alone, from "no open stream". sed's test_eof() and
-//     last_file_with_data_p() both make exactly that test, so an open stdin is
-//     misread as EOF and the `N'/`n'/`$' commands fire a false EOF on stdin's
-//     FIRST line. That silently truncates config.status's subs.awk (assembled by a
-//     sed pipeline whose stages read stdin and join lines with `N'). The two
-//     SubstituteTexts below switch both guards to sed's own no-stream sentinel
-//     (read_fn == read_always_fail); see the steps for the rationale, and the
-//     stdin smoke tests at the tail for the regression that catches it.
+//   * td-originated source fixes for two INDEPENDENT sed-4.0.9 + mes-0.27.1 bugs
+//     that only surface because td routes an autoconf `config.status' through
+//     this tcc-era sed; live-bootstrap never does, so it ships no patch (re #469:
+//     the binutils/gcc-core rungs' configure). Three SubstituteTexts below, two
+//     for bug (a) and one for bug (b):
+//
+//     (a) INPUT side (two sites). mes defines `stdin' as (FILE*)0 == NULL, so an
+//     OPEN stdin (a pipe or a `<file' redirect) has input->fp == NULL —
+//     indistinguishable, by an `input->fp' test alone, from "no open stream".
+//     sed's test_eof() and last_file_with_data_p() both make exactly that test,
+//     so an open stdin is misread as EOF and the `N'/`n'/`$' commands fire a
+//     false EOF on stdin's FIRST line. That silently truncates config.status's
+//     subs.awk (assembled by a sed pipeline whose stages read stdin and join
+//     lines with `N'). Two SubstituteTexts switch both guards to sed's own
+//     no-stream sentinel (read_fn == read_always_fail).
+//
+//     (b) OUTPUT side (one site). mes stdio is UNBUFFERED (fwrite writes straight
+//     through write(2)), yet its fflush() does a gratuitous fsync() for any
+//     fd >= 3, and fsync() is EINVAL on a non-syncable fd (a pipe, or a char
+//     device like /dev/null). sed's ck_fflush() panics + exit(4)s on any
+//     fflush()==EOF whose errno isn't EBADF, so when config.status pipes gcc's
+//     Makefile through sed that spurious fsync EINVAL aborts sed mid-write and
+//     truncates the Makefile (surfacing as `No rule to make target all.indirect').
+//     A third SubstituteText widens ck_fflush()'s benign-errno guard to also
+//     ignore EINVAL — safe because unbuffered mes already wrote every byte at the
+//     write(2) in fwrite, so the fsync carries no data-integrity signal.
+//
+//     See the steps for the per-site rationale, and the smoke tests at the tail
+//     for the regressions: stdin pipes / `file -' lists catch (a); a `w /dev/null'
+//     write and a `w /dev/fd/3' pipe catch (b).
 //
 // Build inputs are mes (headers + libc), tcc (compiler), and make-mesboot0
 // (`make`) — no host tools. bash-mesboot is a test-only input: it supplies the
@@ -109,6 +125,39 @@ pub fn recipe() -> Recipe {
         vec![TextEdit::new(
             "      if (input->fp)\n\t{",
             "      if (input->read_fn != read_always_fail) /* mes: an open stdin has fp==NULL; test sed's no-stream sentinel, not fp */\n\t{",
+            1,
+        )],
+    ));
+
+    // OUTPUT-side fix (re #469), a third site sharing the mes root cause but a
+    // different mechanism than the two above. mes stdio is UNBUFFERED: fwrite()
+    // writes straight through the write(2) syscall, so a FILE* holds no pending
+    // bytes and fflush() has nothing to flush. mes's fflush() nonetheless does a
+    // gratuitous fsync() for any fd >= 3 (fd < 3 — stdin/out/err — it no-ops),
+    // and fsync() returns -1/EINVAL on a NON-syncable fd: a pipe, a socket, or a
+    // char device like /dev/null. sed routes output through ck_fflush() — per
+    // line for a `w'-command / in-place target (output_line: fp != stdout), and
+    // for every tracked file at closedown (ck_fclose(NULL)). ck_fflush() panics
+    // ("Couldn't flush %s: %s") and exit(4)s on any fflush()==EOF whose errno is
+    // not EBADF. So the moment gcc's config.status pipes its Makefile through
+    // this sed, that spurious fsync EINVAL aborts sed mid-write, truncating the
+    // generated gcc/Makefile — which surfaces two steps later as `make: *** No
+    // rule to make target all.indirect'. (The literal `%s' in the message is a
+    // second tell: td's minimal config.h defines neither HAVE_VFPRINTF nor
+    // HAVE_DOPRNT, so panic() fputs() the raw format — confirming the abort is
+    // this ck_fflush(), not a formatting bug.) Widen the benign-errno guard to
+    // also ignore EINVAL, exactly as it already ignores EBADF. This loses no
+    // error detection: under unbuffered mes every byte reached the kernel at the
+    // write(2) in fwrite (a genuine write failure already panics there, in
+    // ck_fwrite), so fflush()'s fsync carries no data-integrity signal — EINVAL
+    // means only "this fd cannot be fsync()ed", never "data was lost". A real
+    // fsync EIO would still panic. errno.h (EINVAL == 22 in mes) is already
+    // included here. The `w /dev/null' smoke at the tail reds an unpatched sed.
+    steps.push(Step::substitute_text(
+        "{src}/lib/utils.c",
+        vec![TextEdit::new(
+            "  if (fflush(stream) == EOF && errno != EBADF)",
+            "  if (fflush(stream) == EOF && errno != EBADF && errno != EINVAL) /* mes stdio is unbuffered; fflush() only does a gratuitous fsync() that is EINVAL on a non-syncable fd (pipe/char-dev) - nothing was pending, so treat EINVAL like the already-ignored EBADF */",
             1,
         )],
     ));
@@ -231,6 +280,44 @@ pub fn recipe() -> Recipe {
                 "{in:bash-mesboot}/bin/bash",
                 "-c",
                 "out=$(printf 'x\\n' | {out}/bin/sed -n '$p' f1.txt -); test \"$out\" = x",
+            ],
+        )
+        .env("LANG", "")
+        .env("LC_ALL", ""),
+    );
+
+    // OUTPUT-side regression (re #469): the fflush/fsync panic the ck_fflush
+    // patch above fixes. sed's `w' command ck_fopen()s its target and, because
+    // the target is not stdout, ck_fflush()es it PER LINE (output_line). A
+    // regular-file target — the `w proof' smoke above — fsync()s fine and so
+    // never exercised this; a NON-syncable target does. `w /dev/null' writes each
+    // line of smoke.txt to the char device /dev/null (rbind'd into the sandbox),
+    // whose fsync() returns EINVAL. An UNPATCHED sed turns that into a "Couldn't
+    // flush" panic + exit(4) on the FIRST line; the run step then reds. A patched
+    // sed ignores the benign EINVAL and exits 0. No stdin/bash needed — a bare
+    // run whose sole failure mode is the panic. This is the same fsync-EINVAL
+    // code path config.status's Makefile-writing sed PIPE hits (a pipe is
+    // non-syncable exactly as /dev/null is).
+    steps.push(
+        Step::run("{src}", &["{out}/bin/sed", "-n", "w /dev/null", "smoke.txt"])
+            .env("LANG", "")
+            .env("LC_ALL", ""),
+    );
+    // The same OUTPUT-side bug over a real PIPE — the literal config.status shape.
+    // `w /dev/fd/3' with fd 3 rigged (3>&1) to the command-substitution capture
+    // pipe, and sed's own stdout sent to /dev/null: sed opens the pipe via
+    // /dev/fd (-> /proc/self/fd, present under the sandbox's fresh procfs), writes
+    // "x" there, and fsync()s the PIPE — EINVAL, just like /dev/null. Reds an
+    // unpatched sed (panic -> empty capture -> compare fails); a patched sed
+    // delivers "x" to the capture. Exercises the fd juggling config.status uses,
+    // via the td-built bash-mesboot (stdin/pipe supplier only).
+    steps.push(
+        Step::run(
+            "{src}",
+            &[
+                "{in:bash-mesboot}/bin/bash",
+                "-c",
+                "out=$(printf 'x\\n' | { {out}/bin/sed -n 'w /dev/fd/3'; } 3>&1 1>/dev/null); test \"$out\" = x",
             ],
         )
         .env("LANG", "")
