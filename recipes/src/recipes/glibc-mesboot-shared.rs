@@ -48,15 +48,16 @@ pub fn recipe() -> Recipe {
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
-    // csu/Makefile's version-info.h banner rule shells out to host uname/date,
-    // which coreutils-mesboot0 does not provide; pin them to deterministic,
-    // tool-free values so the banner is host-free and reproducible (re #469).
-    // Kernel version still comes from the declared linux-headers (UTS_RELEASE).
+    // csu/Makefile's version-info.h banner rule shells out to host uname/date
+    // and can read /proc/version; coreutils-mesboot0 ships no uname/date, so pin
+    // all three to deterministic tool-free values (re #469). Kernel version
+    // still comes from the declared linux-headers via linux/version.h.
     steps.push(Step::substitute_text(
         "{src}/csu/Makefile",
         vec![
             TextEdit::new("os=`uname -s 2> /dev/null`", "os=Linux", 1),
             TextEdit::new("\"`date +%Y-%m-%d`\"", "\"\"", 1),
+            TextEdit::new("[ -r /proc/version ]", "false", 1),
             TextEdit::new("version=`uname -r`", "version=unknown", 1),
         ],
     ));
@@ -77,6 +78,11 @@ pub fn recipe() -> Recipe {
                 "--with-headers={root}/kh",
                 "--enable-shared",
                 "--disable-obsolete-rpc",
+                // build != host keeps configure's cross_compiling=yes (glibc
+                // skips run-tests). Prior builds let config.guess derive x86_64
+                // from host uname -m; pin it so mesboot0 PATH needs no uname
+                // (re #469).
+                "--build=x86_64-unknown-linux-gnu",
                 "--host=i686-unknown-linux-gnu",
                 "--enable-static-nss",
                 "--with-pthread",
