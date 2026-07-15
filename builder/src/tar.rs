@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 const BLOCK: usize = 512;
 const MAX_TAR_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
@@ -218,6 +219,21 @@ pub fn extract_tar_reader<R: Read>(
                     File::create(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
                 copy_exact(file, &mut out_file, entry.size)
                     .map_err(|e| format!("extract {}: {e}", entry.path.display()))?;
+                // Restore the archived mtime (like GNU tar/Guix), BEFORE the
+                // chmod below may drop owner-write — futimens on the still-open
+                // fd is unaffected by the file's mode. Preserving mtimes keeps a
+                // tarball's shipped generated files (e.g. gcc's pre-built bison
+                // parser c-parse.c) NEWER than their sources, so `make` treats
+                // them as up-to-date and never invokes the maintainer-mode
+                // regenerators (bison/flex/gperf) absent from the seed. Without
+                // this every extracted file got a "now" mtime in EXTRACTION
+                // order, inverting that relationship whenever the generated file
+                // is stored before its source and forcing a spurious rebuild
+                // (re #469).
+                if let Some(mtime) = entry.mtime {
+                    set_file_mtime(&out_file, mtime)
+                        .map_err(|e| format!("set mtime on {}: {e}", out.display()))?;
+                }
                 fs::set_permissions(&out, fs::Permissions::from_mode(entry.mode))
                     .map_err(|e| format!("chmod {}: {e}", out.display()))?;
             }
@@ -268,6 +284,7 @@ struct Entry {
     path: PathBuf,
     size: u64,
     mode: u32,
+    mtime: Option<u64>,
     kind: EntryKind,
 }
 
@@ -295,6 +312,12 @@ impl Entry {
         let size = parse_octal(field(header, 124, 12)?)?;
         let mode = u32::try_from(parse_octal(field(header, 100, 8)?)? & 0o7777)
             .map_err(|_| "tar mode did not fit u32".to_string())?;
+        // mtime: octal seconds since the epoch. GNU base-256 encodes far-future
+        // or negative times as high-bit bytes that are not octal; parse_octal
+        // rejects those, and `.ok()` falls back to `None` (leave the file's
+        // extraction-time mtime) rather than fail an otherwise-valid archive —
+        // the same octal-only limitation `size`/`mode` above already carry.
+        let mtime = parse_octal(field(header, 136, 12)?).ok();
         let typeflag = *header
             .get(156)
             .ok_or_else(|| "tar header missing typeflag".to_string())?;
@@ -321,9 +344,22 @@ impl Entry {
             path,
             size,
             mode,
+            mtime,
             kind,
         })
     }
+}
+
+/// Stamp an extracted regular file's mtime from its tar header, via the still-open
+/// fd (unaffected by the file's mode). A 12-octal-digit tar mtime maxes near year
+/// 2242, well inside `SystemTime` range, so `checked_add` only guards against a
+/// pathological header rather than any real source tarball.
+fn set_file_mtime(file: &File, secs: u64) -> Result<(), String> {
+    let when = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(secs))
+        .ok_or_else(|| format!("tar mtime {secs} out of range"))?;
+    file.set_times(fs::FileTimes::new().set_modified(when))
+        .map_err(|e| e.to_string())
 }
 
 fn field(header: &[u8; BLOCK], start: usize, len: usize) -> Result<&[u8], String> {
@@ -678,6 +714,59 @@ mod tests {
     }
 
     #[test]
+    fn preserves_regular_file_mtime() {
+        let tmp = temp_dir("td-tar-mtime-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mtime = 1_234_567_890u64; // 2009-02-13
+        let mut bytes = Vec::new();
+        append_header_mtime(&mut bytes, "stamped", b'0', 0o644, 5, "", mtime);
+        append_data(&mut bytes, b"hello");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        extract_tar(&tar, &out).unwrap();
+
+        let secs = fs::metadata(out.join("stamped"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(secs, mtime);
+    }
+
+    #[test]
+    fn preserves_mtime_order_regardless_of_extraction_order() {
+        // The exact gcc-2.95.3 shape: the generated bison parser `c-parse.c`
+        // ships in the tarball BEFORE its source `c-parse.y`, but with a NEWER
+        // mtime. GNU tar/Guix preserve that so `make` sees the parser as
+        // up-to-date and never runs bison. If the unpacker stamped "now" in
+        // extraction order the parser (written first) would end up OLDER than
+        // its source and force a spurious bison run.
+        let tmp = temp_dir("td-tar-mtime-order-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_header_mtime(&mut bytes, "c-parse.c", b'0', 0o644, 3, "", 2_000);
+        append_data(&mut bytes, b"gen");
+        append_header_mtime(&mut bytes, "c-parse.y", b'0', 0o644, 3, "", 1_000);
+        append_data(&mut bytes, b"src");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        extract_tar(&tar, &out).unwrap();
+
+        let generated = fs::metadata(out.join("c-parse.c")).unwrap().modified().unwrap();
+        let source = fs::metadata(out.join("c-parse.y")).unwrap().modified().unwrap();
+        assert!(
+            generated > source,
+            "generated parser must stay newer than its source"
+        );
+    }
+
+    #[test]
     fn strip_top_unpack_merges_an_overlay_tree() {
         let tmp = temp_dir("td-tar-overlay-test");
         let dest = tmp.join("src");
@@ -796,13 +885,26 @@ mod tests {
         size: u64,
         link: &str,
     ) {
+        append_header_mtime(out, name, typeflag, mode, size, link, 0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_header_mtime(
+        out: &mut Vec<u8>,
+        name: &str,
+        typeflag: u8,
+        mode: u32,
+        size: u64,
+        link: &str,
+        mtime: u64,
+    ) {
         let mut header = [0u8; BLOCK];
         write_bytes(&mut header, 0, 100, name.as_bytes());
         write_octal(&mut header, 100, 8, u64::from(mode));
         write_octal(&mut header, 108, 8, 0);
         write_octal(&mut header, 116, 8, 0);
         write_octal(&mut header, 124, 12, size);
-        write_octal(&mut header, 136, 12, 0);
+        write_octal(&mut header, 136, 12, mtime);
         for byte in &mut header[148..156] {
             *byte = b' ';
         }
