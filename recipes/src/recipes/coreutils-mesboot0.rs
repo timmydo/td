@@ -1,14 +1,13 @@
 use crate::ladder::unpack_into;
 use crate::types::{Recipe, Step, TextEdit};
 
-// GNU coreutils 5.0 — the tcc-era coreutils provider (re #469), a cycle-breaker
-// below the first host-tool consumer. The GCC/binutils rungs from
-// binutils-mesboot0 up once named the HOST guix `coreutils`; that host-executable
-// ingress is now closed (re #469). This rung builds the
-// coreutils userland from source under tcc + mes libc — the same tcc/make/patch
-// pattern as sed-mesboot0/bash-mesboot — so those rungs can consume td-built
-// coreutils instead. It sits with sed-mesboot0/bash-mesboot below
-// binutils-mesboot0, so nothing it depends on can depend on it.
+// GNU coreutils 5.0 — the tcc-era coreutils provider, a cycle-breaker below the
+// first host-tool consumer. This rung builds the coreutils userland from source
+// under tcc + mes libc — the same tcc/make/patch pattern as
+// sed-mesboot0/bash-mesboot — so the GCC/binutils rungs from binutils-mesboot0
+// up consume td-built coreutils instead of a host tool. It sits with
+// sed-mesboot0/bash-mesboot below binutils-mesboot0, so nothing it depends on
+// can depend on it.
 //
 // This is live-bootstrap's coreutils-5.0 pass1 (steps/coreutils-5.0,
 // pass1.kaem + mk/main.mk), host-tool-free the same way its siblings are:

@@ -4,13 +4,11 @@
 //! `Step` list from these helpers. Conventions:
 //! - `BASH` is the td-built bootstrap shell (`bash-mesboot`, bash 2.05b built
 //!   entirely from source — no host tools). Every rung that needs a POSIX shell
-//!   declares it as a typed RecipeOutput edge, never the leaked host bash (#469).
+//!   declares it as a typed RecipeOutput edge, never the leaked host bash.
 //! - `MESBOOT0_TOOLS` are the td-built tcc-era userland (coreutils/sed/grep/
 //!   gawk/diffutils `-mesboot0` providers) EVERY rung declares as lock inputs;
 //!   `mesboot0_path()` / `mesboot0_inputs()` lay them onto a rung's PATH and
-//!   input list ({tools} farm first, then the td shell, then the providers). The
-//!   host-tool tier they replaced (`BASE_TOOLS`/`base_path`/`base_inputs`/
-//!   `link_bins`/`sed_i`) is deleted — #469's host-executable ingress is closed.
+//!   input list ({tools} farm first, then the td shell, then the providers).
 //! - Unpacking is ENGINE-NATIVE (`Step::Unpack` — td's own std-only
 //!   tar/gzip/bzip2/xz readers), so no rung declares an unpacker package.
 
@@ -18,20 +16,17 @@ use crate::types::Step;
 
 /// The td-built bootstrap shell (catalog stem). `bash-mesboot` is bash 2.05b
 /// built from source with no host tools (baked Makefiles + engine-native
-/// patches + `oyacc`), so every rung declares it as a RecipeOutput edge — the
-/// first host tool retired from the host-tool tier in the #469 cutover.
+/// patches + `oyacc`), so every rung declares it as a RecipeOutput edge.
 pub const BASH: &str = "bash-mesboot";
 
 /// The td-built tcc-era userland (catalog stems) EVERY rung declares as its
-/// scripting toolset (re #469). Each is the `-mesboot0` provider recipe built
-/// from source under tcc + mes libc — coreutils/sed/grep/gawk/diffutils as
-/// `AuditedSeed`/`RecipeOutput` edges, never bare host names. This is the sole
-/// tier: the host-tool tier it replaced (`BASE_TOOLS`/`base_path`/`base_inputs`/
-/// `link_bins`/`sed_i`) is deleted, closing #469's host-executable ingress.
+/// scripting toolset. Each is the `-mesboot0` provider recipe built from source
+/// under tcc + mes libc — coreutils/sed/grep/gawk/diffutils as
+/// `AuditedSeed`/`RecipeOutput` edges, never bare host names.
 ///
-/// `findutils` is deliberately absent as an evidenced DEAD axis (re #469): no
-/// rung declares it, no ToolFarm links `find`/`xargs`, and no baked script,
-/// patch, or Makefile fragment invokes either — they are not in the autoconf
+/// `findutils` is deliberately absent as an evidenced DEAD axis: no rung
+/// declares it, no ToolFarm links `find`/`xargs`, and no baked script, patch, or
+/// Makefile fragment invokes either — they are not in the autoconf
 /// `configure`/`make` vocabulary these tarballs drive, so the PATH node would be
 /// pure phantom ingress. The `no_bootstrap_step_invokes_host_find_or_xargs`
 /// guard below locks it out.
@@ -45,7 +40,7 @@ pub const MESBOOT0_TOOLS: &[&str] = &[
 
 /// The rung PATH template: the `{tools}` farm first, then the td shell, then the
 /// td-built `MESBOOT0_TOOLS` packages. Every Run step that needs the scripting
-/// userland uses this (re #469 retired the host-tool `base_path` it replaced).
+/// userland uses this.
 pub fn mesboot0_path() -> String {
     let mut p = String::from("{tools}");
     p.push_str(&format!(":{{in:{BASH}}}/bin"));
@@ -73,9 +68,8 @@ pub fn mesboot0_inputs(extras: &[&str]) -> Vec<String> {
 /// The tool-farm step that symlinks a prior binutils rung's whole `bin/` into
 /// `{tools}` (as/ld/ar/ranlib/nm/strip/…) with the td-built `coreutils-mesboot0`
 /// `ln`, on `mesboot0_path()`. The `glob:` argv element expands sorted in the
-/// engine. (The `_mesboot0` suffix is now redundant — the host `link_bins` it
-/// mirrored is deleted, re #469 — but renaming its consumers is deferred to a
-/// pure mechanical follow-up to keep this cutover's diff scoped.)
+/// engine. (The `_mesboot0` suffix is now redundant; renaming consumers is a
+/// deferred mechanical cleanup.)
 pub fn link_bins_mesboot0(binutils_rung: &str) -> Step {
     Step::run(
         "{root}",
@@ -94,7 +88,7 @@ pub fn link_bins_mesboot0(binutils_rung: &str) -> Step {
 pub const SH: &str = "{in:bash-mesboot}/bin/bash";
 
 /// Unpack tarball input NAME into DEST (top-level dir stripped) with the
-/// ENGINE's own readers — no unpacker packages in the sandbox (re #469).
+/// ENGINE's own readers — no unpacker packages in the sandbox.
 pub fn unpack_into(input: &str, dest: &str) -> Vec<Step> {
     vec![Step::Unpack {
         input: format!("{{in:{input}}}"),
@@ -129,7 +123,7 @@ pub fn apply_patch(patch_rung: &str, patch_input: &str) -> Step {
 }
 
 /// `sed -i EXPR FILE…` via the td-built `sed-mesboot0` on `mesboot0_path()` (dir
-/// {src} unless absolute; re #469 retired the host `sed_i` it replaced). `sed -i`
+/// {src} unless absolute). `sed -i`
 /// writes a temp file and renames, so it never touches stdin or a non-syncable
 /// fd — the mes-libc bugs sed-mesboot0 patches don't apply here. (The `_mesboot0`
 /// suffix is now redundant; renaming consumers is a deferred mechanical cleanup.)
@@ -186,7 +180,7 @@ mod tests {
         }
     }
 
-    /// re #469 dead-axis lock. `findutils` is absent from the tool tier after an
+    /// Dead-axis lock: `findutils` is absent from the tool tier after an
     /// exhaustive sweep found no rung invokes `find`/`xargs` (not in any Run
     /// argv, WriteFile body, ToolFarm link, or SubstituteText edit — and neither
     /// is in the autoconf `configure`/`make` vocabulary these tarballs drive).
@@ -215,7 +209,7 @@ mod tests {
                             !invokes(text, cmd),
                             "recipe `{stem}' invokes `{cmd}' in `{text}' — \
                              findutils was retired from the tool tier as a dead \
-                             axis (re #469); a rung that needs it must declare a \
+                             axis; a rung that needs it must declare a \
                              td-built provider output (findutils/busybox) and update \
                              this guard deliberately, never lean on a host tool on PATH"
                         );
@@ -229,7 +223,7 @@ mod tests {
     /// the interpreted-text surfaces that are NOT a `Run` argv: a baked
     /// Makefile/kaem script (`WriteFile`, `exec: false`) and a literal patch/sed
     /// edit (`SubstituteText`). Without this, a `find`/`xargs` reintroduced in one
-    /// of those would slip past the guard (re #469, the P2 both reviews raised).
+    /// of those would slip past the guard.
     #[test]
     fn guard_scans_nonexec_writefile_and_substitutetext() {
         use crate::types::TextEdit;

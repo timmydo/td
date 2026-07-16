@@ -1607,20 +1607,12 @@ mod tests {
         );
     }
 
-    /// #469 achieved: the real bootstrap graph is now host-free. This test was
-    /// once the negative guard — it asserted these same targets were REJECTED at
-    /// planning while the scaffolding rungs still named host tools (`bash`/
-    /// `coreutils`/`flex`/…), verified RED against the pre-cutover code where the
-    /// runner resolved those through a seed-tools lock and then ambient PATH. The
-    /// last host-executable ingress (glibc's `flex`/`bison`/`m4`/`make`/`python`)
-    /// has been cut over to the td-built gcc-14-tier providers and the host-tool
-    /// tier deleted, so the chain is self-hosting: every rung in every target's
-    /// closure resolves each input to a catalog recipe output or a pinned seed.
-    /// The test now flips to the POSITIVE invariant — planning provenance ACCEPTS
-    /// the whole graph — locking the closed state against any regression that
-    /// reintroduces a host input (that input would red here, before any build).
-    /// The `synthetic_recipes_with_forbidden_inputs_are_rejected_at_planning`
-    /// test below keeps the negative direction covered.
+    /// The real bootstrap graph is host-free: planning provenance ACCEPTS every
+    /// real target, because each rung in every target's closure resolves each
+    /// input to a catalog recipe output or a pinned seed. This is a regression
+    /// guard — a reintroduced host input would red here, before any build. The
+    /// `synthetic_recipes_with_forbidden_inputs_are_rejected_at_planning` test
+    /// below keeps the negative direction covered.
     #[test]
     fn real_bootstrap_graph_is_host_free_at_planning() {
         for target in [

@@ -13,14 +13,13 @@ use crate::types::{Recipe, Step};
 // steps: the ld-script relocation (strip the configure prefix to bare names)
 // and the kernel-header overlay into the staged include dir.
 //
-// Host-tool ingress closed (re #469): the build tools glibc's configure/make
-// need are the td-built gcc-14-tier providers — bison-mesboot, m4-mesboot,
-// python-mesboot (dynamic vs glibc-mesboot-shared, run via the LD_LIBRARY_PATH
-// this build already sets), gawk-mesboot (3.1.8, glibc needs gawk >= 3.1.2),
-// and make-441 (GNU Make 4.4.1, glibc's critical make >= 4.0 gate) — with the
-// mesboot0 scripting userland (mesboot0_path/mesboot0_inputs) and the
-// binutils-244 link_bins_mesboot0 farm. `flex` is dropped: glibc's build never
-// invokes lex/flex, so it was pure phantom host ingress.
+// The build tools glibc's configure/make need are the td-built gcc-14-tier
+// providers — bison-mesboot, m4-mesboot, python-mesboot (dynamic vs
+// glibc-mesboot-shared, run via the LD_LIBRARY_PATH this build already sets),
+// gawk-mesboot (3.1.8, glibc needs gawk >= 3.1.2), and make-441 (GNU Make
+// 4.4.1, glibc's critical make >= 4.0 gate) — with the mesboot0 scripting
+// userland (mesboot0_path/mesboot0_inputs) and the binutils-244
+// link_bins_mesboot0 farm. glibc's build never invokes lex/flex, so no flex.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:binutils-244}}/bin:{}", mesboot0_path());
     let stage = "{out}/stage/td/store/glibc-2.41";
@@ -60,7 +59,7 @@ pub fn recipe() -> Recipe {
     // redirect, so a shell is required). CPython hardcodes /bin/sh for shell=True
     // and ignores SHELL/CONFIG_SHELL/PatchShebangs, but the host-free sandbox has
     // no /bin/sh — so pin that subprocess shell to the declared bash-mesboot via
-    // `executable=` (re #469; both call sites, lines 63/93 upstream).
+    // `executable=` (both call sites).
     steps.push(sed_i_mesboot0(
         "s|subprocess\\.check_call(cmd, shell=True)|subprocess.check_call(cmd, shell=True, executable=\"{in:bash-mesboot}/bin/bash\")|g",
         &["scripts/glibcextract.py"],

@@ -1,12 +1,11 @@
 use crate::ladder::unpack_into;
 use crate::types::{Recipe, Step, TextEdit};
 
-// GNU sed 4.0.9 — the tcc-era `sed` provider (re #469), a cycle-breaker one tier
-// below the first host-tool consumer. The GCC/binutils rungs from
-// binutils-mesboot0 up once named the HOST guix `sed`; that host-executable
-// ingress is now closed (re #469). This rung builds `sed` from
-// source under tcc + mes libc — the tcc/make/oyacc/patch pattern — so those
-// rungs can consume a td-built `sed` instead. Its BUILD inputs are {mes, tcc,
+// GNU sed 4.0.9 — the tcc-era `sed` provider, a cycle-breaker one tier below the
+// first host-tool consumer. This rung builds `sed` from source under tcc + mes
+// libc — the tcc/make/oyacc/patch pattern — so the GCC/binutils rungs from
+// binutils-mesboot0 up consume a td-built `sed` instead of a host tool. Its
+// BUILD inputs are {mes, tcc,
 // make-mesboot0} — the same set as its siblings oyacc and patch-mesboot — plus a
 // test-only dependency on bash-mesboot (which supplies stdin for the regression
 // smoke). None of those, transitively, depends on sed, so there is no cycle.
