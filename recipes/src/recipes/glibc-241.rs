@@ -24,6 +24,9 @@ use crate::types::{Recipe, Step};
 pub fn recipe() -> Recipe {
     let path = format!("{{in:binutils-244}}/bin:{}", mesboot0_path());
     let stage = "{out}/stage/td/store/glibc-2.41";
+    // python-mesboot (the only dynamic build tool) resolves its shared glibc 2.16
+    // from here; the static build tools ignore it.
+    let lp = "{in:glibc-mesboot-shared}/lib";
     let mut steps = unpack_into("glibc-241-source", "{src}");
     steps.extend(unpack_keep_top("linux-headers", "{root}/kh"));
     steps.push(Step::ToolFarm {
@@ -52,6 +55,16 @@ pub fn recipe() -> Recipe {
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
+    // gen-as-const.py -> scripts/glibcextract.py shells the compiler through
+    // Python `subprocess.check_call(cmd, shell=True)` (the cmd uses a `< file`
+    // redirect, so a shell is required). CPython hardcodes /bin/sh for shell=True
+    // and ignores SHELL/CONFIG_SHELL/PatchShebangs, but the host-free sandbox has
+    // no /bin/sh — so pin that subprocess shell to the declared bash-mesboot via
+    // `executable=` (re #469; both call sites, lines 63/93 upstream).
+    steps.push(sed_i_mesboot0(
+        "s|subprocess\\.check_call(cmd, shell=True)|subprocess.check_call(cmd, shell=True, executable=\"{in:bash-mesboot}/bin/bash\")|g",
+        &["scripts/glibcextract.py"],
+    ));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });
@@ -76,7 +89,7 @@ pub fn recipe() -> Recipe {
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
         .env("CC", "{root}/wb/gcc")
-        .env("LD_LIBRARY_PATH", "{in:glibc-mesboot-shared}/lib"),
+        .env("LD_LIBRARY_PATH", lp),
     );
     steps.push(
         Step::run(
@@ -91,7 +104,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
-        .env("LD_LIBRARY_PATH", "{in:glibc-mesboot-shared}/lib"),
+        .env("LD_LIBRARY_PATH", lp),
     );
     steps.push(
         Step::run(
@@ -106,7 +119,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
-        .env("LD_LIBRARY_PATH", "{in:glibc-mesboot-shared}/lib"),
+        .env("LD_LIBRARY_PATH", lp),
     );
     // FINALIZE (was the shell bootstrap chain's brick-8 epilogue): relocate
     // every GNU ld script under lib/*.so from absolute member paths to bare

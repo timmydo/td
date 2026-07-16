@@ -59,6 +59,16 @@ pub fn recipe() -> Recipe {
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
+    // gen-as-const.py -> scripts/glibcextract.py shells the compiler through
+    // Python `subprocess.check_call(cmd, shell=True)` (the cmd uses a `< file`
+    // redirect, so a shell is required). CPython hardcodes /bin/sh for shell=True
+    // and ignores SHELL/CONFIG_SHELL/PatchShebangs, but the host-free sandbox has
+    // no /bin/sh — so pin that subprocess shell to the declared bash-mesboot via
+    // `executable=` (re #469; both call sites, lines 63/93 upstream).
+    steps.push(sed_i_mesboot0(
+        "s|subprocess\\.check_call(cmd, shell=True)|subprocess.check_call(cmd, shell=True, executable=\"{in:bash-mesboot}/bin/bash\")|g",
+        &["scripts/glibcextract.py"],
+    ));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });
