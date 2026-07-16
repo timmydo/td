@@ -72,6 +72,22 @@ pub fn recipe() -> Recipe {
             1,
         )],
     ));
+    // Detect the C++ front end without a non-terminal glob. configure builds its
+    // language set by globbing `${srcdir}/gcc/*/config-lang.in` (a `*` in a
+    // NON-terminal path component). bash-mesboot (bash 2.05b on mes libc) expands
+    // terminal-component globs but returns a non-terminal one unexpanded, so the
+    // loop matches no fragments and configure drops every non-C language
+    // ("Supported languages are: c"). Pre-expand both loop headers to the tree's
+    // actual fragments — the pinned core+g++ 4.6.4 source has exactly cp and lto —
+    // so language detection no longer depends on the glob.
+    steps.push(Step::substitute_text(
+        "{src}/configure",
+        vec![TextEdit::new(
+            "${srcdir}/gcc/*/config-lang.in",
+            "${srcdir}/gcc/cp/config-lang.in ${srcdir}/gcc/lto/config-lang.in",
+            2,
+        )],
+    ));
     steps.push(
         Step::run(
             "{src}",
