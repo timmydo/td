@@ -1,5 +1,5 @@
 use crate::ladder::{
-    SH, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i_mesboot0, unpack_into,
+    SH, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i, unpack_into,
     unpack_keep_top,
 };
 use crate::types::{Recipe, Step};
@@ -55,7 +55,7 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
@@ -65,7 +65,7 @@ pub fn recipe() -> Recipe {
     // and ignores SHELL/CONFIG_SHELL/PatchShebangs, but the host-free sandbox has
     // no /bin/sh — so pin that subprocess shell to the declared bash-mesboot via
     // `executable=` (both call sites).
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "s|subprocess\\.check_call(cmd, shell=True)|subprocess.check_call(cmd, shell=True, executable=\"{in:bash-mesboot}/bin/bash\")|g",
         &["scripts/glibcextract.py"],
     ));

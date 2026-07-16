@@ -1,4 +1,4 @@
-use crate::ladder::{SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0 — rung 18 (#378, guix's gcc-boot0/gcc-final version): gcc-mesboot
@@ -38,7 +38,7 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
-    steps.push(link_bins_mesboot0("binutils-mesboot"));
+    steps.push(link_bins("binutils-mesboot"));
     // single-token static wrappers (see header): CC/CXX survive gcc's munging
     for (name, real) in [("gcc", "gcc"), ("g++", "g++")] {
         steps.push(Step::WriteFile {

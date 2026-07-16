@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, sed_i_mesboot0, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, sed_i, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step, TextEdit};
 
 // glibc 2.16.0 STATIC — rung 15 (#378, guix's glibc-headers-mesboot +
@@ -39,22 +39,20 @@ pub fn recipe() -> Recipe {
             ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
         ],
     });
-    steps.push(
-        link_bins_mesboot0("binutils-mesboot"),
-    );
+    steps.push(link_bins("binutils-mesboot"));
     // the deleted fn's source fixups, verbatim
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "s,\\${vdso_symver//\\./_},$(echo $vdso_symver | sed -e \"s/\\\\./_/g\"),",
         &["sysdeps/unix/make-syscalls.sh"],
     ));
-    steps.push(sed_i_mesboot0("s,de\\.po,en_GB.po,", &["catgets/Makefile", "intl/Makefile"]));
-    steps.push(sed_i_mesboot0("s,/bin/pwd,pwd,", &["configure"]));
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i("s,de\\.po,en_GB.po,", &["catgets/Makefile", "intl/Makefile"]));
+    steps.push(sed_i("s,/bin/pwd,pwd,", &["configure"]));
+    steps.push(sed_i(
         "/^others *+= *nscd/d; /^others-pie *+= *nscd/d; /^install-sbin *:= *nscd/d",
         &["nscd/Makefile"],
     ));
-    steps.push(sed_i_mesboot0("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
+    steps.push(sed_i(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
@@ -112,7 +110,7 @@ pub fn recipe() -> Recipe {
                 .env("LD", "gcc"),
         );
         // fixmk: append SHELL to the generated Makefile so recipes use the shell
-        steps.push(sed_i_mesboot0(
+        steps.push(sed_i(
             "$aSHELL := {in:bash-mesboot}/bin/bash",
             &[&format!("{bdir}/Makefile")],
         ));

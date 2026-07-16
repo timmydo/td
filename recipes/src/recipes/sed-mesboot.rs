@@ -1,4 +1,4 @@
-use crate::ladder::{SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU sed 4.2.2 — rung 14 tier (re #469, sibling of gawk-mesboot): gcc-mesboot1
@@ -11,7 +11,7 @@ use crate::types::{Recipe, Step};
 // 3.1.8's does.
 //
 // Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers —
-// mesboot0_path()/mesboot0_inputs() and the binutils link_bins_mesboot0 farm.
+// mesboot0_path()/mesboot0_inputs() and the binutils link_bins farm.
 // sed's own `configure` and generated `lib/Makefile` invoke `sed`; that `sed`
 // now resolves to the `sed-mesboot0` cycle-breaker (GNU sed 4.0.9, built with no
 // `sed` on PATH) which mesboot0_path() puts ahead of any host tool — the exact
@@ -32,7 +32,7 @@ pub fn recipe() -> Recipe {
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
-    steps.push(link_bins_mesboot0("binutils-mesboot1"));
+    steps.push(link_bins("binutils-mesboot1"));
     steps.push(
         Step::run(
             "{src}",

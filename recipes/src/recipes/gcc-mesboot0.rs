@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into};
 use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 2.95.3 #2 — bootstrap rung 9 (#378, guix's gcc-mesboot0): the FIRST gcc
@@ -9,7 +9,7 @@ use crate::types::{Recipe, Step, TextEdit};
 // Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers, the
 // same way as gcc-core-mesboot0 (which shares this GCC 2.95.3 source) —
 // mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, `rm` ->
-// coreutils-mesboot0, link_bins_mesboot0, the install-headers-tar pipe -> `cp`
+// coreutils-mesboot0, link_bins, the install-headers-tar pipe -> `cp`
 // (td ships no tar), and flex/bison dropped as dead edges (2.95.3 ships its
 // pre-generated parsers and #496 keeps them newer than their sources). No
 // PatchShebangs step (unlike binutils-mesboot1/make-mesboot): 2.95.3's build
@@ -46,7 +46,7 @@ pub fn recipe() -> Recipe {
             ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(link_bins_mesboot0("binutils-mesboot0"));
+    steps.push(link_bins("binutils-mesboot0"));
     steps.push(Step::WriteFile {
         path: "{src}/config.cache".into(),
         content: "ac_cv_c_float_format='IEEE (little-endian)'\n".into(),
