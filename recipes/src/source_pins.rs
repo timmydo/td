@@ -39,6 +39,20 @@ const PINS: &[PinDef] = &[
         file: "binutils-2.44.tar.xz",
     },
     PinDef {
+        key: "bison-mesboot-source",
+        aliases: &[],
+        // GNU Bison 3.8.2 — the parser generator glibc 2.41's configure requires
+        // (>= 2.7, critical; used to regenerate intl/plural.c from plural.y, re
+        // #469). Latest 3.x, exactly what live-bootstrap builds. The pristine
+        // tarball ships the pre-generated parser/scanner C (src/parse-gram.c,
+        // src/scan-gram.c), so no bootstrap bison and no flex are needed to
+        // build it. Built at the gcc-14 tier, static; execs m4-mesboot at
+        // runtime (M4 baked at configure).
+        url: "https://ftp.gnu.org/gnu/bison/bison-3.8.2.tar.xz",
+        sha256: "9bba0214ccf7f1079c5d59210045227bcf619519840ebfa80cd3849cff5a5bf2",
+        file: "bison-3.8.2.tar.xz",
+    },
+    PinDef {
         key: "busybox-x86-64-source",
         aliases: &[],
         url: "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
@@ -201,6 +215,19 @@ const PINS: &[PinDef] = &[
         file: "linux-4.14.67.tar.xz",
     },
     PinDef {
+        key: "m4-mesboot-source",
+        aliases: &[],
+        // GNU M4 1.4.19 — the macro processor the glibc-rung `bison` provider
+        // needs at build and runtime (re #469). Latest stable; the release
+        // tarball ships pre-generated files so no host m4/autotools are needed
+        // to build it (m4 does not require m4 to bootstrap). Built at the
+        // gcc-14 tier, static against glibc-mesboot, like every glibc-rung
+        // build tool.
+        url: "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz",
+        sha256: "63aede5c6d33b6d9b13511cd0be2cac046f2e70fd0a07aa9573a04a82783af96",
+        file: "m4-1.4.19.tar.xz",
+    },
+    PinDef {
         key: "make-mesboot0-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/make/make-3.80.tar.gz",
@@ -264,6 +291,21 @@ const PINS: &[PinDef] = &[
         url: "https://ftp.gnu.org/gnu/patch/patch-2.5.9.tar.gz",
         sha256: "ecb5c6469d732bcf01d6ec1afe9e64f1668caba5bfdb103c28d7f537ba3cdb8a",
         file: "patch-2.5.9.tar.gz",
+    },
+    PinDef {
+        key: "python-mesboot-source",
+        aliases: &[],
+        // CPython 3.11.1 — the python3 glibc 2.41's configure requires (>= 3.4,
+        // critical; scripts/gen-as-const.py generates core headers, re #469).
+        // Exactly what live-bootstrap builds. A NATIVE (build==host) build needs
+        // NO pre-existing python: CPython's C tools _freeze_module +
+        // _bootstrap_python generate the frozen/deepfreeze sources during the
+        // build. Minimal: only the always-built C modules (no ssl/zlib/ffi),
+        // which is all gen-as-const.py imports (argparse/re/subprocess/…). Built
+        // at the gcc-14 tier vs the shared glibc 2.16.0 (glibc-mesboot-shared).
+        url: "https://www.python.org/ftp/python/3.11.1/Python-3.11.1.tar.xz",
+        sha256: "85879192f2cffd56cb16c092905949ebf3e5e394b7f764723529637901dfb58f",
+        file: "Python-3.11.1.tar.xz",
     },
     PinDef {
         key: "rust-toolchain-source",
@@ -352,8 +394,11 @@ mod tests {
         // coreutils-5.0 (the tcc-era coreutils cycle-breaker, re #469) +
         // grep-2.4 (the tcc-era `grep` cycle-breaker, re #469) +
         // gawk-3.0.4 (the tcc-era `gawk` cycle-breaker, re #469) +
-        // diffutils-2.7 (the tcc-era `diffutils` cycle-breaker, re #469).
-        assert_eq!(all().len(), 40);
+        // diffutils-2.7 (the tcc-era `diffutils` cycle-breaker, re #469) +
+        // m4-1.4.19 (the glibc-rung `bison` provider's macro processor, re #469) +
+        // bison-3.8.2 (the glibc-rung parser generator, re #469) +
+        // Python-3.11.1 (the glibc-rung python3, re #469).
+        assert_eq!(all().len(), 43);
     }
 
     #[test]

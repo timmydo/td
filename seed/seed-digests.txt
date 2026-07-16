@@ -9,6 +9,7 @@
 bash-mesboot-source 0w2mkw1b4ll6wfq48nsmp9l13b3za98g-bash-mesboot-source
 binutils-244-source 8xzd2kk7j2pj9fhkmab3ajhgpmccgidj-binutils-244-source
 binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
+bison-mesboot-source 091gccsyc4qcsnk4r6p99mqkk259f3ar-bison-mesboot-source
 busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
@@ -27,6 +28,7 @@ gmp63 a1sfm9d525pjz2if348xssl3wprnr21f-gmp63
 grep-mesboot0-source 664n3hm5dz2hyn5py2frds5cc3r4nid4-grep-mesboot0-source
 linux-headers fy4caw4q7lsgdisqwz8dhfdgiwky9pxw-linux-headers
 linux-headers-x86-64 8makj3qb694bws0bdvqhm74az3i3ip58-linux-headers-x86-64
+m4-mesboot-source 6n6m3fhhqcdnmkf92nw1a1q8pakzflx5-m4-mesboot-source
 make-mesboot-source rsml6snylx4zpf1isi6h9mi1v3g6qya7-make-mesboot-source
 make-mesboot0-source prv2pgbxapfby18j22f39al25q2ava5i-make-mesboot0-source
 make-x86-64-source 957gwrna22f6idxmqsi36mnl2syy4wiy-make-x86-64-source
@@ -45,6 +47,7 @@ patch-glibc-boot-2.2.5 qcs888irnnqm8bybmlbgapyvbbc844ka-patch-glibc-boot-2.2.5
 patch-glibc-bootstrap-system-2.16.0 nggbvl93zgr74xf9x50331yfgsw4hh0r-patch-glibc-bootstrap-system-2.16.0
 patch-glibc-bootstrap-system-2.2.5 wjhcnyy2wspd9bf312ql84gfmvivixs2-patch-glibc-bootstrap-system-2.2.5
 patch-mesboot-source r3w1jmlradg89l3av29y1ifp7y312pk9-patch-mesboot-source
+python-mesboot-source 460ch0an5nlsgs5i9ppdk6b890fnvw1y-python-mesboot-source
 rust-toolchain-source 853r9awaviv9yfgdrcqv1wrv3qn4g56p-rust-toolchain-source
 sed-mesboot-source 331jp1sj5iyjhnb35391k2sjjkqrawk1-sed-mesboot-source
 sed-mesboot0-source i6y1c09pssxjdc60wmdf96vf11hxa56c-sed-mesboot0-source
