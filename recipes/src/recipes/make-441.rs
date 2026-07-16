@@ -52,6 +52,11 @@ pub fn recipe() -> Recipe {
                 // No guile input; build $(guile …) support out for a glibc-only
                 // closure (same as make-x86-64).
                 "--without-guile",
+                // No dynamic `load' extension: it links dlopen/libdl, which a
+                // static glibc binary cannot use at runtime without the matching
+                // shared glibc (absent from the glibc-free sandbox), and glibc's
+                // build never uses `load'. Keeps the static closure clean.
+                "--disable-load",
             ],
         )
         .env("PATH", &path)
@@ -88,16 +93,20 @@ pub fn recipe() -> Recipe {
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH),
     );
-    // Smoke-test the built make: it must run and report GNU Make 4.4.1, or glibc
-    // 2.41's critical make-version gate would reject it (fail-closed in-build, like
-    // busybox's readelf check).
+    // Smoke-test the built make: it must run and report GNU Make 4.4.1, the
+    // version glibc 2.41's critical gate needs (fail-closed in-build, like
+    // busybox's readelf check). Capture make's OWN exit status (not just grep's,
+    // which a crashed make + buffered output could mask) and match the version
+    // literally (escaped dots, so `4.4.1' is not a wildcard).
     steps.push(
         Step::run(
             "{out}",
             &[
                 SH,
                 "-c",
-                "'{out}/bin/make' --version | grep -q 'GNU Make 4.4.1' \
+                "v=$('{out}/bin/make' --version) \
+                 || { echo 'make-441: make --version failed' >&2; exit 1; }; \
+                 printf '%s\\n' \"$v\" | grep -q 'GNU Make 4\\.4\\.1' \
                  || { echo 'make-441: built make is not GNU Make 4.4.1' >&2; exit 1; }",
             ],
         )
@@ -107,6 +116,25 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/bin/make".into()],
         exec: true,
     });
+    // Static contract (engine-native, re #469): no PT_INTERP, DT_NEEDED, or run-
+    // path, so the make runs in the glibc-free glibc sandboxes with no host loader.
+    steps.push(Step::assert_static(&["{out}/bin/make"]));
+    // Arch contract: the make must be i686 (ELF32 / Intel 80386), NOT the wrong-
+    // arch x86_64 that would also run on this kernel and silently pass --version.
+    // Mirrors make-x86-64's ELF64 assertion, with binutils-244's i686 readelf.
+    steps.push(
+        Step::run(
+            "{out}",
+            &[
+                SH,
+                "-c",
+                "h=$('{in:binutils-244}/bin/readelf' -h '{out}/bin/make'); \
+                 printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF32' || { echo 'make-441: make is not ELF32' >&2; exit 1; }; \
+                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -q  '80386' || { echo 'make-441: make is not i686 (80386)' >&2; exit 1; }",
+            ],
+        )
+        .env("PATH", &path),
+    );
     Recipe::mesboot("make-441", "4.4.1")
         .source_input("make-x86-64-source")
         .native_inputs(&["gcc-14", "glibc-mesboot", "binutils-244", "make-mesboot"])
