@@ -1,21 +1,22 @@
-use crate::ladder::{base_inputs, base_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // BusyBox 1.37.0, rung 2 of the #388 build userland: built FROM SOURCE by the
 // /td/store NATIVE x86_64 toolchain and driven by the td-built make-x86-64 rung.
 // Static, matching the make-x86-64 rung: the output has no ELF interpreter. The
-// remaining shell/core tools in base_inputs are declared bootstrap scaffolding
+// remaining shell/core tools in mesboot0_inputs are declared bootstrap scaffolding
 // for Kbuild; the output becomes the POSIX userland tool that later rungs can
 // consume instead of that scaffolding.
 //
 // This recipe only BUILDS BusyBox. Its behavior is validated by the sibling
 // `busybox-test` recipe, which depends on this one and RUNS the installed applet
 // links through the recipe-check feature, mirroring make-x86-64/make-test.
+// Host-free tools: mesboot0 (incl. sed-mesboot0 for the .config edit); make-x86-64 drives. re #469.
 pub fn recipe() -> Recipe {
     let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let nbin = "{in:binutils-x86-64-native}/bin";
-    let path = format!("{{in:make-x86-64}}/bin:{nbin}:{}", base_path());
+    let path = format!("{{in:make-x86-64}}/bin:{nbin}:{}", mesboot0_path());
     let cip = "{root}/sysroot/include:{root}/kh";
     let lib = "{root}/sysroot/lib";
 
@@ -51,7 +52,7 @@ pub fn recipe() -> Recipe {
                 "if [ ! -e /bin/sh ]; then mkdir -p /bin && ln -sf \"{in:bash-mesboot}/bin/bash\" /bin/sh; fi",
             ],
         )
-        .env("PATH", &base_path()),
+        .env("PATH", &mesboot0_path()),
     );
     steps.push(Step::WriteFile {
         path: "{root}/wb/cc".into(),
@@ -85,10 +86,10 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "{in:sed}/bin/sed -i -E '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d' .config && printf '%s\\n' 'CONFIG_STATIC=y' '# CONFIG_PIE is not set' 'CONFIG_EXTRA_LDFLAGS=\"-static\"' >> .config",
+                "{in:sed-mesboot0}/bin/sed -i -r '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d' .config && printf '%s\\n' 'CONFIG_STATIC=y' '# CONFIG_PIE is not set' 'CONFIG_EXTRA_LDFLAGS=\"-static\"' >> .config",
             ],
         )
-        .env("PATH", &base_path()),
+        .env("PATH", &mesboot0_path()),
     );
     steps.push(
         Step::run(
@@ -144,7 +145,7 @@ pub fn recipe() -> Recipe {
                 "for a in sh ls sed grep awk tar gzip cat echo mkdir rm cp true false env printf sleep sort head tail basename dirname mktemp tee touch tr test pwd comm; do ln -sf busybox \"$a\"; done",
             ],
         )
-        .env("PATH", &base_path()),
+        .env("PATH", &mesboot0_path()),
     );
     steps.push(Step::Require {
         paths: vec!["{out}/bin/busybox".into()],
@@ -161,7 +162,7 @@ pub fn recipe() -> Recipe {
                  printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'busybox is not x86-64' >&2; exit 1; }",
             ],
         )
-        .env("PATH", &base_path()),
+        .env("PATH", &mesboot0_path()),
     );
 
     Recipe::mesboot("busybox-x86-64", "1.37.0")
@@ -172,6 +173,6 @@ pub fn recipe() -> Recipe {
             "glibc-x86-64",
             "make-x86-64",
         ])
-        .inputs_owned(base_inputs(&["linux-headers-x86-64"]))
+        .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
 }

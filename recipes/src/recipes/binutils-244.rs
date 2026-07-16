@@ -1,4 +1,4 @@
-use crate::ladder::{SH, base_inputs, base_path, unpack_into};
+use crate::ladder::{SH, mesboot0_inputs, mesboot0_path, unpack_into};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.44 — rung 19 (#378): the modern binutils glibc 2.41 needs
@@ -9,17 +9,14 @@ use crate::types::{Recipe, Step};
 // rung sandboxes, store-ns own-roots — with no interp/RUNPATH story at all.
 // -std=gnu99 (2.44 is C99+; 4.6.4 defaults gnu89); deterministic archives;
 // install prefix={out}.
+// Host-free build tools: mesboot0 + make-mesboot; flex/bison dead (binutils-244-source). re #469.
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:binutils-mesboot}}/bin:{}", base_path());
+    let path = format!("{{in:binutils-mesboot}}/bin:{}", mesboot0_path());
     let mut steps = unpack_into("binutils-244-source", "{src}");
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
-            ("make".into(), "{in:make}/bin/make".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
     // single-token static wrapper (the gcc-14 rung's proven shape): gcc 4.6.4
@@ -60,7 +57,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "-j{jobs}",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
@@ -75,7 +72,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install",
@@ -92,7 +89,7 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("binutils-244", "2.44")
         .source_input("binutils-244-source")
-        .native_inputs(&["gcc-mesboot1", "glibc-mesboot", "binutils-mesboot"])
-        .inputs_owned(base_inputs(&["flex", "bison", "make"]))
+        .native_inputs(&["gcc-mesboot1", "glibc-mesboot", "binutils-mesboot", "make-mesboot"])
+        .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }

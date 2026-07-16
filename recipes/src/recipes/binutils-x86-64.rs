@@ -1,4 +1,4 @@
-use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.44, CROSS to x86_64 (#378 slice 4, guix's cross-binutils):
@@ -11,8 +11,9 @@ use crate::types::{Recipe, Step};
 // build path (the shell fn's fixed-/tmp dance is retired, like #389's TMPDIR
 // hack). native_inputs: the i686 gcc-14 (builder) + glibc-mesboot (the static
 // libc its host binaries link) + binutils-244 (the i686 host as/ld/ar).
+// Host-free build tools: mesboot0 + make-mesboot; flex/bison dead (binutils-244-source). re #469.
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:binutils-244}}/bin:{}", base_path());
+    let path = format!("{{in:binutils-244}}/bin:{}", mesboot0_path());
     let mut steps = unpack_into("binutils-x86-64-source", "{src}");
     // the x86_64 kernel UAPI headers → a sysroot (--with-sysroot); the tarball
     // top level is {linux,asm,…}, landing at usr/include/*.
@@ -22,12 +23,8 @@ pub fn recipe() -> Recipe {
     ));
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
-            ("make".into(), "{in:make}/bin/make".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
     // single-token static i686 gcc-14 wrapper vs the static glibc 2.16.0.
@@ -72,7 +69,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "-j{jobs}",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
@@ -87,7 +84,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install",
@@ -107,12 +104,7 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("binutils-x86-64", "2.44")
         .source_input("binutils-244-source")
-        .native_inputs(&["gcc-14", "glibc-mesboot", "binutils-244"])
-        .inputs_owned(base_inputs(&[
-            "linux-headers-x86-64",
-            "flex",
-            "bison",
-            "make",
-        ]))
+        .native_inputs(&["gcc-14", "glibc-mesboot", "binutils-244", "make-mesboot"])
+        .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
 }

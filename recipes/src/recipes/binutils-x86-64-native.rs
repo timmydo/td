@@ -1,4 +1,4 @@
-use crate::ladder::{base_inputs, base_path, unpack_keep_top, unpack_into, SH};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_keep_top, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.44, NATIVE x86_64 (x86_64-toolchain rung X2, the port of the
@@ -12,10 +12,11 @@ use crate::types::{Recipe, Step};
 // CROSS gcc stage2 (builder CC, referenced absolutely as x86_64-pc-linux-gnu-gcc),
 // binutils-x86-64 (the cross as/ld its baked-in --with-as resolves), glibc-x86-64
 // (the x86_64 libc the static link pulls).
+// Host-free build tools: mesboot0 + make-mesboot; flex/bison dead (binutils-244-source). re #469.
 pub fn recipe() -> Recipe {
     let xgcc = "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let path = format!("{{in:binutils-x86-64}}/bin:{}", base_path());
+    let path = format!("{{in:binutils-x86-64}}/bin:{}", mesboot0_path());
     // glibc 2.41 headers + the x86_64 kernel UAPI headers (glibc headers #include
     // <linux/…>); the native gcc reads headers via the wrapper, binutils via CIP.
     let cip = format!("{xglibc}/include:{{root}}/kh");
@@ -24,12 +25,8 @@ pub fn recipe() -> Recipe {
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
-            ("make".into(), "{in:make}/bin/make".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
     // -shared-aware STATIC wrapper (port of _mk_native_static_wrapper): -static for
@@ -75,7 +72,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "-j{jobs}",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
@@ -91,7 +88,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install",
@@ -128,16 +125,11 @@ pub fn recipe() -> Recipe {
                  printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'native binutils as is not x86-64' >&2; exit 1; }",
             ],
         )
-        .env("PATH", &base_path()),
+        .env("PATH", &mesboot0_path()),
     );
     Recipe::mesboot("binutils-x86-64-native", "2.44")
         .source_input("binutils-244-source")
-        .native_inputs(&["gcc-x86-64-stage2", "binutils-x86-64", "glibc-x86-64"])
-        .inputs_owned(base_inputs(&[
-            "linux-headers-x86-64",
-            "flex",
-            "bison",
-            "make",
-        ]))
+        .native_inputs(&["gcc-x86-64-stage2", "binutils-x86-64", "glibc-x86-64", "make-mesboot"])
+        .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
 }

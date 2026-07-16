@@ -1,4 +1,4 @@
-use crate::ladder::{base_inputs, base_path, SH};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // busybox-test: behavioral validation of busybox-x86-64 (#388 rung 2), modeled
@@ -9,6 +9,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // BusyBox is static, so a byte grep of the busybox binary is the no-guix runtime
 // leg; there is no interpreter/RUNPATH closure to stage in an own root. The
 // applet-link behavior is the user-facing feature later rungs consume.
+// Host-free scripting tools: mesboot0 (grep-mesboot0 for the no-guix byte grep). re #469.
 pub fn recipe() -> Recipe {
     let bb = "{in:busybox-x86-64}/bin";
     let mut steps = Vec::new();
@@ -24,7 +25,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &base_path()),
+        .env("PATH", &mesboot0_path()),
     );
     steps.push(Step::MkDir {
         path: "{root}/t".into(),
@@ -70,7 +71,7 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("busybox-test", "1.0")
         .native_inputs(&["busybox-x86-64"])
-        .inputs_owned(base_inputs(&[]))
+        .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
         .checks(vec![RecipeCheck::daily(
             r#"
