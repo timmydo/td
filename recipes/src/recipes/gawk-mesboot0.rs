@@ -2,18 +2,16 @@ use crate::ladder::unpack_into;
 use crate::types::{Recipe, Step, TextEdit};
 
 // GNU awk 3.0.4 — the tcc-era `gawk` provider (re #469), a cycle-breaker one tier
-// below the first BASE_TOOLS consumer. The GCC/binutils rungs from
-// binutils-mesboot0 up still name the HOST guix `gawk` (base_inputs stages it and
-// each rung farms it in as `awk`, e.g. binutils-mesboot0.rs's ToolFarm
-// `("awk", "{in:gawk}/bin/awk")`); that is host-executable ingress the bootstrap
-// must close. This rung builds `gawk` from source under tcc + mes libc — the same
+// below the first host-tool consumer. The GCC/binutils rungs from
+// binutils-mesboot0 up once named the HOST guix `gawk` (farmed in as `awk`); that
+// host-executable ingress is now closed (re #469, the ToolFarm points at
+// gawk-mesboot0). This rung builds `gawk` from source under tcc + mes libc — the same
 // tcc/make pattern as grep-mesboot0/sed-mesboot0/coreutils-mesboot0 — so those
 // rungs can consume a td-built `awk` instead. It sits with its siblings below
 // binutils-mesboot0, depending only on {mes, tcc, make-mesboot0}, none of which
-// (transitively) depends on gawk, so there is no cycle. (The consumer rewiring —
-// flipping `{in:gawk}` to `{in:gawk-mesboot0}` and dropping `gawk` from
-// BASE_TOOLS — is #469's later atomic cutover, not this provider PR, exactly as
-// grep/sed/coreutils landed their providers first.)
+// (transitively) depends on gawk, so there is no cycle. (The consumer rewiring
+// and the host-tier deletion have since landed in #469's atomic cutover; this
+// provider landed first, alongside grep/sed/coreutils.)
 //
 // This is live-bootstrap's gawk-3.0.4 (steps/gawk-3.0.4, mk/main.mk — its tcc +
 // mes-libc build), NOT the heavier gcc-mesboot1-era gawk 3.1.8 the separate

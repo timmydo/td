@@ -6,8 +6,8 @@ use crate::types::{Recipe, Step};
 // this rung's source) merged with the mes includes. Pure placement, no build.
 //
 // Host-tool-free (re #469): every step is engine-native (Unpack, CopyTree,
-// Require) — the rung shells out to nothing — so it declares NO BASE_TOOLS. The
-// prior `base_inputs(&[])` staged bash/coreutils/sed/grep/gawk/findutils/diffutils
+// Require) — the rung shells out to nothing — so it declares no host tools. The
+// prior host-tool input set staged bash/coreutils/sed/grep/gawk/findutils/diffutils
 // that no step referenced: dead host-executable ingress, now dropped. Inputs are
 // exactly the pinned header source plus the td-built `mes` include tree.
 pub fn recipe() -> Recipe {

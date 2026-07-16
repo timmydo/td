@@ -2,9 +2,9 @@ use crate::ladder::unpack_into;
 use crate::types::{Recipe, Step};
 
 // GNU grep 2.4 — the tcc-era grep provider (re #469), a cycle-breaker below the
-// first BASE_TOOLS consumer. The GCC/binutils rungs from binutils-mesboot0 up
-// still name the HOST guix `grep` (via base_inputs); that is host-executable
-// ingress the bootstrap must close. This rung builds grep from source under tcc
+// first host-tool consumer. The GCC/binutils rungs from binutils-mesboot0 up
+// once named the HOST guix `grep`; that host-executable ingress is now closed
+// (re #469). This rung builds grep from source under tcc
 // + mes libc — the same tcc/make pattern as sed-mesboot0/coreutils-mesboot0 — so
 // those rungs can consume td-built grep instead. It sits with its siblings below
 // binutils-mesboot0, so nothing it depends on can depend on it.

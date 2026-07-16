@@ -64,7 +64,7 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // GNU coreutils 5.0 — the tcc-era coreutils provider (re #469). The exact
         // version live-bootstrap builds under tcc + mes libc (its coreutils-5.0
-        // pass1), a cycle-breaker below the first BASE_TOOLS consumer.
+        // pass1), a cycle-breaker below the first host-tool consumer.
         url: "https://ftp.gnu.org/gnu/coreutils/coreutils-5.0.tar.bz2",
         sha256: "c25b36b8af6e0ad2a875daf4d6196bd0df28a62be7dd252e5f99a4d5d7288d95",
         file: "coreutils-5.0.tar.bz2",
@@ -74,8 +74,8 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // GNU diffutils 2.7 — the tcc-era `diffutils` provider (re #469). The exact
         // version live-bootstrap builds under tcc + mes libc (its diffutils-2.7
-        // step), a cycle-breaker below the first BASE_TOOLS consumer. Ships `cmp`
-        // and `diff`, the last of the five BASE_TOOLS host tools to gain a provider.
+        // step), a cycle-breaker below the first host-tool consumer. Ships `cmp`
+        // and `diff`, the last of the five host tools to gain a provider.
         url: "https://ftp.gnu.org/gnu/diffutils/diffutils-2.7.tar.gz",
         sha256: "d5f2489c4056a31528e3ada4adacc23d498532b0af1a980f2f76158162b139d6",
         file: "diffutils-2.7.tar.gz",
@@ -92,7 +92,7 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // GNU awk 3.0.4 — the tcc-era `gawk` provider (re #469). The exact
         // version live-bootstrap builds under tcc + mes libc (its gawk-3.0.4
-        // step), a cycle-breaker below the first BASE_TOOLS consumer — NOT the
+        // step), a cycle-breaker below the first host-tool consumer — NOT the
         // heavier gcc-mesboot1-era gawk 3.1.8 the separate `gawk-mesboot` rung
         // uses.
         url: "https://ftp.gnu.org/gnu/gawk/gawk-3.0.4.tar.gz",
@@ -104,7 +104,7 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // GNU grep 2.4 — the tcc-era grep provider (re #469). The exact version
         // live-bootstrap builds under tcc + mes libc (its grep-2.4 step), a
-        // cycle-breaker below the first BASE_TOOLS consumer.
+        // cycle-breaker below the first host-tool consumer.
         url: "https://ftp.gnu.org/gnu/grep/grep-2.4.tar.gz",
         sha256: "a32032bab36208509466654df12f507600dfe0313feebbcd218c32a70bf72a16",
         file: "grep-2.4.tar.gz",
@@ -331,7 +331,7 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // GNU sed 4.0.9 — the tcc-era `sed` provider (re #469). The exact
         // version live-bootstrap builds under tcc + mes libc (its LIBC=mes mk
-        // branch), a cycle-breaker below the first BASE_TOOLS consumer. NOT the
+        // branch), a cycle-breaker below the first host-tool consumer. NOT the
         // heavier sed 4.2.2 the gcc-mesboot1-era `sed-mesboot` rung uses.
         url: "https://ftp.gnu.org/gnu/sed/sed-4.0.9.tar.gz",
         sha256: "c365874794187f8444e5d22998cd5888ffa47f36def4b77517a808dec27c0600",

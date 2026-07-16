@@ -40,9 +40,10 @@ pub fn recipe() -> Recipe {
         // release tarball with its own gzip/tar readers (unpack_rust_release →
         // crate::tar::unpack_archive) and the relink is pure Rust (crate::elf), so the
         // only inputs are the three recipe outputs above plus the pinned source.
-        // (BASE_TOOLS left this rung when tar/gzip left the engine's unpack path — a
-        // stale tar/gzip pick_bin here was the round-9 P1: BASE_TOOLS no longer carries
-        // them, so the old subprocess unpack could never resolve its tools.)
+        // (the host-tool inputs left this rung when tar/gzip left the engine's unpack
+        // path — a stale tar/gzip pick_bin here was the round-9 P1: the host-tool tier
+        // no longer carries them, so the old subprocess unpack could never resolve its
+        // tools.)
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check rust-toolchain: build-plan --auto builds+validates the relinked /td/store Rust 1.96.0 toolchain"

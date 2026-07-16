@@ -5,12 +5,12 @@
 //! - `BASH` is the td-built bootstrap shell (`bash-mesboot`, bash 2.05b built
 //!   entirely from source — no host tools). Every rung that needs a POSIX shell
 //!   declares it as a typed RecipeOutput edge, never the leaked host bash (#469).
-//! - `BASE_TOOLS` are the remaining guix-seed host tools EVERY rung declares as
-//!   lock inputs (replacing the deleted ladder's `ls /gnu/store/*pkg*`
-//!   scavenging and the curated-PATH farm): coreutils, text tools.
-//! - `base_path()` is the PATH template for Run steps: the rung's own {tools}
-//!   farm first (prior-rung compilers/tools), then the td shell, then the base
-//!   tool packages.
+//! - `MESBOOT0_TOOLS` are the td-built tcc-era userland (coreutils/sed/grep/
+//!   gawk/diffutils `-mesboot0` providers) EVERY rung declares as lock inputs;
+//!   `mesboot0_path()` / `mesboot0_inputs()` lay them onto a rung's PATH and
+//!   input list ({tools} farm first, then the td shell, then the providers). The
+//!   host-tool tier they replaced (`BASE_TOOLS`/`base_path`/`base_inputs`/
+//!   `link_bins`/`sed_i`) is deleted — #469's host-executable ingress is closed.
 //! - Unpacking is ENGINE-NATIVE (`Step::Unpack` — td's own std-only
 //!   tar/gzip/bzip2/xz readers), so no rung declares an unpacker package.
 
@@ -19,71 +19,22 @@ use crate::types::Step;
 /// The td-built bootstrap shell (catalog stem). `bash-mesboot` is bash 2.05b
 /// built from source with no host tools (baked Makefiles + engine-native
 /// patches + `oyacc`), so every rung declares it as a RecipeOutput edge — the
-/// first host tool retired from `BASE_TOOLS` in the #469 cutover.
+/// first host tool retired from the host-tool tier in the #469 cutover.
 pub const BASH: &str = "bash-mesboot";
 
-/// The host-tool packages every rung declares (lock input names). Shrinks as
-/// the cutover (re #469) replaces each host edge with a recipe output or an
-/// engine-native step; the shell already left for `BASH` (bash-mesboot) and
-/// tar/gzip/bzip2/xz already left with `Step::Unpack`.
+/// The td-built tcc-era userland (catalog stems) EVERY rung declares as its
+/// scripting toolset (re #469). Each is the `-mesboot0` provider recipe built
+/// from source under tcc + mes libc — coreutils/sed/grep/gawk/diffutils as
+/// `AuditedSeed`/`RecipeOutput` edges, never bare host names. This is the sole
+/// tier: the host-tool tier it replaced (`BASE_TOOLS`/`base_path`/`base_inputs`/
+/// `link_bins`/`sed_i`) is deleted, closing #469's host-executable ingress.
 ///
-/// `findutils` was retired here as an evidenced DEAD axis (re #469): no rung
-/// declares `{in:findutils}`, no ToolFarm links `find`/`xargs`, and no baked
-/// script, patch, or Makefile fragment invokes either — `find`/`xargs` are not
-/// in the autoconf `configure`/`make` vocabulary these tarballs drive, so the
-/// PATH node and the per-rung lock declaration were pure phantom ingress. The
-/// `no_bootstrap_step_invokes_host_find_or_xargs` guard below locks it out.
-/// (The remaining five — coreutils/sed/grep/gawk/diffutils — are load-bearing;
-/// each waits on a td-built provider recipe, #469's follow-up.)
-pub const BASE_TOOLS: &[&str] = &[
-    "coreutils",
-    "sed",
-    "grep",
-    "gawk",
-    "diffutils",
-];
-
-/// The rung PATH template: the {tools} farm first, then the td shell, then the
-/// base packages.
-pub fn base_path() -> String {
-    let mut p = String::from("{tools}");
-    p.push_str(&format!(":{{in:{BASH}}}/bin"));
-    for t in BASE_TOOLS {
-        p.push_str(&format!(":{{in:{t}}}/bin"));
-    }
-    p
-}
-
-/// A rung's full lock-input list: the rung-specific `extras` FIRST, then the
-/// td shell `BASH`, then the shared `BASE_TOOLS` — in lockstep with the order
-/// `base_path()` lays down (`{tools}` then `{in:BASH}/bin` then the base
-/// packages). Keeping the base set here (not re-typed per recipe) closes the
-/// drift hazard: a rung's inputs must stay in lockstep with the constant
-/// `base_path()` templates `{in:X}/bin` for, or the missing tool reds only at
-/// execution, deep in the chain. Pair with `Recipe::inputs_owned`.
-pub fn base_inputs(extras: &[&str]) -> Vec<String> {
-    extras
-        .iter()
-        .copied()
-        .chain(std::iter::once(BASH))
-        .chain(BASE_TOOLS.iter().copied())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// The td-built tcc-era userland (catalog stems) that replaces the host
-/// `BASE_TOOLS` for rungs cut over to recipe-output tools (re #469). Each is the
-/// `-mesboot0` provider recipe built from source under tcc + mes libc — the same
-/// tool at the same generation `BASE_TOOLS` named as a host package, now an
-/// `AuditedSeed`/`RecipeOutput` edge instead of a bare host name.
-///
-/// This is the migration bridge: a rung moves from `base_inputs`/`base_path`
-/// (host) to `mesboot0_inputs`/`mesboot0_path` (td-built) as it is cut over,
-/// exactly as the shell already moved to `BASH`. `BASE_TOOLS`/`base_path`/
-/// `base_inputs` are deleted in the final atomic cutover PR once the last
-/// consumer has moved off them; until then the two tiers coexist by design (the
-/// #469 follow-up is staged: providers, then per-rung declared inputs, then the
-/// shared-mechanism deletion).
+/// `findutils` is deliberately absent as an evidenced DEAD axis (re #469): no
+/// rung declares it, no ToolFarm links `find`/`xargs`, and no baked script,
+/// patch, or Makefile fragment invokes either — they are not in the autoconf
+/// `configure`/`make` vocabulary these tarballs drive, so the PATH node would be
+/// pure phantom ingress. The `no_bootstrap_step_invokes_host_find_or_xargs`
+/// guard below locks it out.
 pub const MESBOOT0_TOOLS: &[&str] = &[
     "coreutils-mesboot0",
     "sed-mesboot0",
@@ -92,11 +43,9 @@ pub const MESBOOT0_TOOLS: &[&str] = &[
     "diffutils-mesboot0",
 ];
 
-/// The rung PATH template for a `-mesboot0`-cutover rung: the `{tools}` farm
-/// first, then the td shell, then the td-built `MESBOOT0_TOOLS` packages. Mirrors
-/// `base_path()` node-for-node with the host packages swapped for their
-/// `-mesboot0` providers, so a cutover is a one-call swap (`base_path()` ->
-/// `mesboot0_path()`) that keeps the PATH order the build already expects.
+/// The rung PATH template: the `{tools}` farm first, then the td shell, then the
+/// td-built `MESBOOT0_TOOLS` packages. Every Run step that needs the scripting
+/// userland uses this (re #469 retired the host-tool `base_path` it replaced).
 pub fn mesboot0_path() -> String {
     let mut p = String::from("{tools}");
     p.push_str(&format!(":{{in:{BASH}}}/bin"));
@@ -106,10 +55,11 @@ pub fn mesboot0_path() -> String {
     p
 }
 
-/// A cutover rung's lock-input list: the rung-specific `extras` FIRST, then the
-/// td shell `BASH`, then the td-built `MESBOOT0_TOOLS` — in lockstep with the
-/// order `mesboot0_path()` lays down, the same drift-closing discipline as
-/// `base_inputs()`. Pair with `Recipe::inputs_owned`.
+/// A rung's full lock-input list: the rung-specific `extras` FIRST, then the td
+/// shell `BASH`, then the td-built `MESBOOT0_TOOLS` — in lockstep with the order
+/// `mesboot0_path()` lays down, so a rung's inputs cannot drift out of step with
+/// the PATH nodes and red only at execution deep in the chain. Pair with
+/// `Recipe::inputs_owned`.
 pub fn mesboot0_inputs(extras: &[&str]) -> Vec<String> {
     extras
         .iter()
@@ -121,25 +71,11 @@ pub fn mesboot0_inputs(extras: &[&str]) -> Vec<String> {
 }
 
 /// The tool-farm step that symlinks a prior binutils rung's whole `bin/` into
-/// `{tools}` (as/ld/ar/ranlib/nm/strip/…) with the declared coreutils `ln`, on
-/// `base_path()`. The `glob:` argv element expands sorted in the engine.
-pub fn link_bins(binutils_rung: &str) -> Step {
-    Step::run(
-        "{root}",
-        &[
-            "{in:coreutils}/bin/ln",
-            "-sf",
-            &format!("glob:{{in:{binutils_rung}}}/bin/*"),
-            "{tools}",
-        ],
-    )
-    .env("PATH", &base_path())
-}
-
-/// `link_bins` for a `-mesboot0`-cutover rung: the td-built `coreutils-mesboot0`
-/// `ln` on `mesboot0_path()`, mirroring `link_bins` node-for-node with the host
-/// coreutils swapped for its `-mesboot0` provider (re #469). Folds back into a
-/// single `link_bins` on the chosen provider in the final atomic cutover PR.
+/// `{tools}` (as/ld/ar/ranlib/nm/strip/…) with the td-built `coreutils-mesboot0`
+/// `ln`, on `mesboot0_path()`. The `glob:` argv element expands sorted in the
+/// engine. (The `_mesboot0` suffix is now redundant — the host `link_bins` it
+/// mirrored is deleted, re #469 — but renaming its consumers is deferred to a
+/// pure mechanical follow-up to keep this cutover's diff scoped.)
 pub fn link_bins_mesboot0(binutils_rung: &str) -> Step {
     Step::run(
         "{root}",
@@ -192,18 +128,11 @@ pub fn apply_patch(patch_rung: &str, patch_input: &str) -> Step {
     )
 }
 
-/// `sed -i EXPR FILE…` via the declared sed (dir {src} unless absolute).
-pub fn sed_i(expr: &str, files: &[&str]) -> Step {
-    let mut argv: Vec<&str> = vec!["{in:sed}/bin/sed", "-i", expr];
-    argv.extend_from_slice(files);
-    Step::run("{src}", &argv).env("PATH", &base_path())
-}
-
-/// `sed_i` for a `-mesboot0`-cutover rung: the td-built `sed-mesboot0` on
-/// `mesboot0_path()`, mirroring `sed_i` with host `{in:sed}` swapped for its
-/// `-mesboot0` provider (re #469). `sed -i` writes a temp file and renames, so
-/// it never touches stdin or a non-syncable fd — the mes-libc bugs sed-mesboot0
-/// patches don't apply here. Folds back into `sed_i` in the final cutover PR.
+/// `sed -i EXPR FILE…` via the td-built `sed-mesboot0` on `mesboot0_path()` (dir
+/// {src} unless absolute; re #469 retired the host `sed_i` it replaced). `sed -i`
+/// writes a temp file and renames, so it never touches stdin or a non-syncable
+/// fd — the mes-libc bugs sed-mesboot0 patches don't apply here. (The `_mesboot0`
+/// suffix is now redundant; renaming consumers is a deferred mechanical cleanup.)
 pub fn sed_i_mesboot0(expr: &str, files: &[&str]) -> Step {
     let mut argv: Vec<&str> = vec!["{in:sed-mesboot0}/bin/sed", "-i", expr];
     argv.extend_from_slice(files);
@@ -257,7 +186,7 @@ mod tests {
         }
     }
 
-    /// re #469 dead-axis lock. `findutils` was dropped from `BASE_TOOLS` after an
+    /// re #469 dead-axis lock. `findutils` is absent from the tool tier after an
     /// exhaustive sweep found no rung invokes `find`/`xargs` (not in any Run
     /// argv, WriteFile body, ToolFarm link, or SubstituteText edit — and neither
     /// is in the autoconf `configure`/`make` vocabulary these tarballs drive).
@@ -285,10 +214,10 @@ mod tests {
                         assert!(
                             !invokes(text, cmd),
                             "recipe `{stem}' invokes `{cmd}' in `{text}' — \
-                             findutils was retired from BASE_TOOLS as a dead axis \
-                             (re #469); a rung that needs it must declare a td-built \
-                             provider output (findutils/busybox) and update this \
-                             guard deliberately, never lean on a host tool on PATH"
+                             findutils was retired from the tool tier as a dead \
+                             axis (re #469); a rung that needs it must declare a \
+                             td-built provider output (findutils/busybox) and update \
+                             this guard deliberately, never lean on a host tool on PATH"
                         );
                     }
                 }

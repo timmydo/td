@@ -13,8 +13,9 @@ use crate::types::{Recipe, Step, TextEdit};
 // providers — mesboot0_path()/mesboot0_inputs() supply coreutils/sed/grep/gawk/
 // diffutils, the `awk` ToolFarm points at gawk-mesboot0, the binutils
 // link_bins_mesboot0 farm uses coreutils-mesboot0's `ln`, and the two config.make
-// fixups run sed_i_mesboot0 (sed-mesboot0's `sed -i`). Per-rung cutover for #469;
-// BASE_TOOLS/base_path/base_inputs/link_bins/sed_i go in the final atomic PR.
+// fixups run sed_i_mesboot0 (sed-mesboot0's `sed -i`). Cut over for #469; the
+// host-tool tier (BASE_TOOLS/base_path/base_inputs/link_bins/sed_i) has since
+// been deleted.
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
     let gccdir = "{in:gcc-core-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";

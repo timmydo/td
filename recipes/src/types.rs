@@ -847,8 +847,8 @@ impl Recipe {
         self.add_source_pins_for_keys(xs.iter().copied());
         self
     }
-    /// Owned-string variant of `inputs`, for `ladder::base_inputs(...)` which
-    /// assembles the extras + BASE_TOOLS list at runtime.
+    /// Owned-string variant of `inputs`, for `ladder::mesboot0_inputs(...)` which
+    /// assembles the extras + MESBOOT0_TOOLS list at runtime.
     pub fn inputs_owned(mut self, xs: Vec<String>) -> Recipe {
         self.add_source_pins_for_keys(xs.iter().map(String::as_str));
         self.inputs = Some(xs);
