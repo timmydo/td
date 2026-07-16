@@ -99,6 +99,26 @@ pub fn recipe() -> Recipe {
             2,
         )],
     ));
+    // Run the dependency-style probe without `env`. The mesboot userland ships no
+    // `env` binary — coreutils-mesboot0 builds only live-bootstrap's curated
+    // 61-binary subset (see coreutils-mesboot0.rs), which omits it, and `env` is
+    // not a bash builtin. GCC 4.6.4's libcpp is the ONE subdir whose automake
+    // dependency-style probe was generated from the old config/depstand.m4
+    // ZW_PROG_COMPILER_DEPENDENCIES macro, which runs each depmode as `env $depcmd`
+    // (every other subdir — zlib/intl/gmp/mpfr/mpc/lto-plugin — inlines the VAR=VAL
+    // pairs as shell assignment prefixes and needs no `env`). With no `env` on PATH
+    // every depmode exits 127, so the probe finds none and the macro's
+    // unconditional `test x$type = xnone` aborts with "no usable dependency style
+    // found" — and unlike stock automake this variant has no
+    // --disable-dependency-tracking guard, so that flag cannot skip it. `eval`
+    // re-parses the $depcmd string so its leading VAR=VAL become real assignment
+    // prefixes (the exact effect `env` provided, using only a POSIX builtin), after
+    // which depmode `gcc` is selected just as in the other subdirs. Count is 2: the
+    // C branch and the inert `--disable-build-with-cxx` C++ branch.
+    steps.push(Step::substitute_text(
+        "{src}/libcpp/configure",
+        vec![TextEdit::new("env $depcmd", "eval \"$depcmd\"", 2)],
+    ));
     steps.push(
         Step::run(
             "{src}",
