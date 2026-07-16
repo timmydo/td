@@ -35,7 +35,6 @@ pub fn recipe() -> Recipe {
         links: vec![
             ("cpp".into(), "{in:gcc-mesboot}/bin/cpp".into()),
             ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("m4".into(), "{in:m4}/bin/m4".into()),
             ("make".into(), "{in:make}/bin/make".into()),
         ],
     });
@@ -148,6 +147,6 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("gcc-14", "14.3.0")
         .source_input("gcc-14-source")
         .native_inputs(&["binutils-mesboot", "gcc-mesboot", "glibc-mesboot"])
-        .inputs_owned(base_inputs(&["gmp63", "mpfr421", "mpc131", "linux-headers", "m4", "make"]))
+        .inputs_owned(base_inputs(&["gmp63", "mpfr421", "mpc131", "linux-headers", "make"]))
         .steps(steps)
 }
