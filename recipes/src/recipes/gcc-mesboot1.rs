@@ -72,19 +72,30 @@ pub fn recipe() -> Recipe {
             1,
         )],
     ));
-    // Detect the C++ front end without a non-terminal glob. configure builds its
-    // language set by globbing `${srcdir}/gcc/*/config-lang.in` (a `*` in a
-    // NON-terminal path component). bash-mesboot (bash 2.05b on mes libc) expands
-    // terminal-component globs but returns a non-terminal one unexpanded, so the
-    // loop matches no fragments and configure drops every non-C language
-    // ("Supported languages are: c"). Pre-expand both loop headers to the tree's
-    // actual fragments — the pinned core+g++ 4.6.4 source has exactly cp and lto —
-    // so language detection no longer depends on the glob.
+    // Detect the C++ front end without a non-terminal glob. GCC 4.6.4 discovers
+    // language fragments by globbing `.../*/config-lang.in` (a `*` in a
+    // NON-terminal path component) in BOTH the top-level configure (two scan
+    // loops) and the gcc/ subdir configure (run from `make`, one scan loop).
+    // bash-mesboot (bash 2.05b on mes libc) expands terminal-component globs but
+    // returns a non-terminal one unexpanded, so the loops match no fragments: the
+    // top level drops every non-C language ("Supported languages are: c"), and
+    // gcc/configure would silently omit the C++ makefile hookup (no cc1plus/g++).
+    // Pre-expand every such glob to the tree's actual fragments — the pinned
+    // core+g++ 4.6.4 source has exactly cp and lto — so language detection never
+    // depends on the glob (matching a working shell's expansion verbatim).
     steps.push(Step::substitute_text(
         "{src}/configure",
         vec![TextEdit::new(
             "${srcdir}/gcc/*/config-lang.in",
             "${srcdir}/gcc/cp/config-lang.in ${srcdir}/gcc/lto/config-lang.in",
+            2,
+        )],
+    ));
+    steps.push(Step::substitute_text(
+        "{src}/gcc/configure",
+        vec![TextEdit::new(
+            "${srcdir}/*/config-lang.in",
+            "${srcdir}/cp/config-lang.in ${srcdir}/lto/config-lang.in",
             2,
         )],
     ));
