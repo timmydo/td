@@ -46,7 +46,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "./configure",
-                "--build=i686-pc-linux-gnu",
+                "--build=i686-unknown-linux-gnu",
                 "--host=i686-unknown-linux-gnu",
                 "--prefix={out}",
                 "--disable-nls",

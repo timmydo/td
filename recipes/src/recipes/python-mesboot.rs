@@ -20,10 +20,13 @@ use crate::types::{Recipe, Step};
 // --without-ensurepip, --disable-test-modules; the optional extension modules
 // (ssl/zlib/ffi/readline/sqlite/curses) are skipped for want of their libs —
 // gen-as-const.py needs only always-built C modules (argparse/re/subprocess/
-// tempfile/os/collections). SOURCE_DATE_EPOCH=1 (sandbox default, honored by
-// gcc-14) keeps __DATE__/__TIME__ reproducible, so no -U__DATE__ is needed.
-// Host-free build tools: mesboot0 + make-mesboot; binutils-244 supplies
-// as/ld/ar/ranlib.
+// tempfile/os/collections). Modules/getbuildinfo.c bakes __DATE__/__TIME__ into
+// the interpreter's build string, so SOURCE_DATE_EPOCH=1 is set EXPLICITLY on
+// the compile/install steps — recipe Run steps execute under a cleared env
+// (build.rs run_mesboot -> run_cmd), so there is no ambient default; gcc-14
+// honors the var and pins those macros, keeping python3 reproducible. m4/bison
+// reference neither macro, so they need no such override. Host-free build
+// tools: mesboot0 + make-mesboot; binutils-244 supplies as/ld/ar/ranlib.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:binutils-244}}/bin:{}", mesboot0_path());
     let lp = "{in:glibc-mesboot-shared}/lib";
@@ -87,7 +90,9 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
-        .env("LD_LIBRARY_PATH", lp),
+        .env("LD_LIBRARY_PATH", lp)
+        // getbuildinfo.c compiles here; pin __DATE__/__TIME__ (gcc-14 honors it).
+        .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(
         Step::run(
@@ -102,7 +107,9 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
-        .env("LD_LIBRARY_PATH", lp),
+        .env("LD_LIBRARY_PATH", lp)
+        // install may relink getbuildinfo.o; keep the epoch pinned here too.
+        .env("SOURCE_DATE_EPOCH", "1"),
     );
     // Smoke-test the minimal interpreter: it must import exactly the always-built
     // modules glibc 2.41's gen-as-const.py chain uses, or the build failed to

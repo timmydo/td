@@ -286,6 +286,13 @@ const PINS: &[PinDef] = &[
         file: "oyacc-6.6.tar.gz",
     },
     PinDef {
+        key: "patch-mesboot-source",
+        aliases: &[],
+        url: "https://ftp.gnu.org/gnu/patch/patch-2.5.9.tar.gz",
+        sha256: "ecb5c6469d732bcf01d6ec1afe9e64f1668caba5bfdb103c28d7f537ba3cdb8a",
+        file: "patch-2.5.9.tar.gz",
+    },
+    PinDef {
         key: "python-mesboot-source",
         aliases: &[],
         // CPython 3.11.1 — the python3 glibc 2.41's configure requires (>= 3.4,
@@ -299,13 +306,6 @@ const PINS: &[PinDef] = &[
         url: "https://www.python.org/ftp/python/3.11.1/Python-3.11.1.tar.xz",
         sha256: "85879192f2cffd56cb16c092905949ebf3e5e394b7f764723529637901dfb58f",
         file: "Python-3.11.1.tar.xz",
-    },
-    PinDef {
-        key: "patch-mesboot-source",
-        aliases: &[],
-        url: "https://ftp.gnu.org/gnu/patch/patch-2.5.9.tar.gz",
-        sha256: "ecb5c6469d732bcf01d6ec1afe9e64f1668caba5bfdb103c28d7f537ba3cdb8a",
-        file: "patch-2.5.9.tar.gz",
     },
     PinDef {
         key: "rust-toolchain-source",
