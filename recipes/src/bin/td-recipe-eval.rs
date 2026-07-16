@@ -323,8 +323,9 @@ mod tests {
         // cycle-breaker, re #469) + diffutils-2.7 (the tcc-era `diffutils`
         // cycle-breaker, re #469) + m4-1.4.19 (the glibc-rung `bison`
         // provider's macro processor, re #469) + bison-3.8.2 (the glibc-rung
-        // parser generator, re #469).
-        assert_eq!(pins.len(), 42);
+        // parser generator, re #469) + Python-3.11.1 (the glibc-rung python3,
+        // re #469).
+        assert_eq!(pins.len(), 43);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));

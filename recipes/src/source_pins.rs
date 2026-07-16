@@ -286,6 +286,21 @@ const PINS: &[PinDef] = &[
         file: "oyacc-6.6.tar.gz",
     },
     PinDef {
+        key: "python-mesboot-source",
+        aliases: &[],
+        // CPython 3.11.1 — the python3 glibc 2.41's configure requires (>= 3.4,
+        // critical; scripts/gen-as-const.py generates core headers, re #469).
+        // Exactly what live-bootstrap builds. A NATIVE (build==host) build needs
+        // NO pre-existing python: CPython's C tools _freeze_module +
+        // _bootstrap_python generate the frozen/deepfreeze sources during the
+        // build. Minimal: only the always-built C modules (no ssl/zlib/ffi),
+        // which is all gen-as-const.py imports (argparse/re/subprocess/…). Built
+        // at the gcc-14 tier vs the shared glibc 2.16.0 (glibc-mesboot-shared).
+        url: "https://www.python.org/ftp/python/3.11.1/Python-3.11.1.tar.xz",
+        sha256: "85879192f2cffd56cb16c092905949ebf3e5e394b7f764723529637901dfb58f",
+        file: "Python-3.11.1.tar.xz",
+    },
+    PinDef {
         key: "patch-mesboot-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/patch/patch-2.5.9.tar.gz",
@@ -381,8 +396,9 @@ mod tests {
         // gawk-3.0.4 (the tcc-era `gawk` cycle-breaker, re #469) +
         // diffutils-2.7 (the tcc-era `diffutils` cycle-breaker, re #469) +
         // m4-1.4.19 (the glibc-rung `bison` provider's macro processor, re #469) +
-        // bison-3.8.2 (the glibc-rung parser generator, re #469).
-        assert_eq!(all().len(), 42);
+        // bison-3.8.2 (the glibc-rung parser generator, re #469) +
+        // Python-3.11.1 (the glibc-rung python3, re #469).
+        assert_eq!(all().len(), 43);
     }
 
     #[test]
