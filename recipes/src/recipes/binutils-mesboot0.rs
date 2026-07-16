@@ -10,18 +10,12 @@ use crate::types::{Recipe, Step};
 // the ladder's cross-brick out/lib mutation); libc via LIBRARY_PATH; headers
 // via C_INCLUDE_PATH (guix's tcc-boot0 search-path setup).
 //
-// Host-tool ingress closed (re #469): this rung is the FIRST BASE_TOOLS consumer
-// (guix stages host coreutils/sed/grep/gawk/diffutils and this rung farmed host
-// `gawk` as `awk`) and the exact recipe the loop's `UNPROVISIONED (69)` gap named
-// ("input `coreutils' is neither a td recipe output nor a pinned seed"). It now
-// resolves its userland entirely through the td-built `-mesboot0` providers:
-// `mesboot0_path()`/`mesboot0_inputs()` supply coreutils/sed/grep/gawk/diffutils
-// as `RecipeOutput` edges (built from source under tcc + mes libc), and the `awk`
-// ToolFarm points at `gawk-mesboot0`. binutils-2.20.1a builds against exactly
-// this tool generation upstream (guix/live-bootstrap), so the `-mesboot0` subset
-// is a faithful drop-in. First step of #469's per-rung cutover; `BASE_TOOLS`/
-// `base_path`/`base_inputs` are deleted in the final atomic PR once every rung
-// has moved off them.
+// This rung resolves its userland entirely through the td-built `-mesboot0`
+// providers: `mesboot0_path()`/`mesboot0_inputs()` supply
+// coreutils/sed/grep/gawk/diffutils as `RecipeOutput` edges (built from source
+// under tcc + mes libc), and the `awk` ToolFarm points at `gawk-mesboot0`.
+// binutils-2.20.1a builds against exactly this tool generation upstream
+// (guix/live-bootstrap), so the `-mesboot0` subset is a faithful drop-in.
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
     let cip = "{in:mes}/include:{in:mes}/include/x86";

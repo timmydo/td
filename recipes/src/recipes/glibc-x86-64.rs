@@ -1,5 +1,6 @@
 use crate::ladder::{
-    SH, base_inputs, base_path, relocate_ld_scripts, sed_i, unpack_into, unpack_keep_top,
+    SH, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i_mesboot0, unpack_into,
+    unpack_keep_top,
 };
 use crate::types::{Recipe, Step};
 
@@ -11,22 +12,35 @@ use crate::types::{Recipe, Step};
 // DESTDIR={out}/stage. Relocate the ld scripts to bare names + overlay the
 // kernel UAPI headers into the staged include (a --sysroot corpus build needs
 // <linux/*>). native_inputs: gcc-x86-64-stage1 (the cross CC), gcc-14 +
-// glibc-mesboot (the i686 BUILD_CC wrapper), binutils-x86-64 (the cross as/ld).
+// glibc-mesboot (the i686 static BUILD_CC wrapper), binutils-x86-64 (the cross
+// as/ld).
+//
+// The i686 build tools glibc's configure/make invoke are the td-built
+// gcc-14-tier providers — bison-mesboot, m4-mesboot, python-mesboot,
+// gawk-mesboot (3.1.8, glibc needs gawk >= 3.1.2), and make-441 (GNU Make
+// 4.4.1, glibc's critical make >= 4.0 gate) — over the mesboot0 scripting
+// userland. glibc's build never invokes lex/flex, so no flex. The static-BUILD_CC
+// helpers need no runtime lib path, but python-mesboot is DYNAMIC against the
+// shared glibc 2.16 (a fully-static CPython is the finicky dlopen/NSS path), so
+// this rung additionally declares glibc-mesboot-shared and sets LD_LIBRARY_PATH
+// to its lib on every step that may run python3 (gen-as-const.py during make;
+// configure's python probe) — the only dynamic build tool; the static ones
+// ignore it.
 pub fn recipe() -> Recipe {
     let xgccbin = "{in:gcc-x86-64-stage1}/stage/td/store/gcc-14.3.0-x86_64/bin";
-    let path = format!("{xgccbin}:{{in:binutils-x86-64}}/bin:{}", base_path());
+    let path = format!("{xgccbin}:{{in:binutils-x86-64}}/bin:{}", mesboot0_path());
     let stage = "{out}/stage/td/store/glibc-2.41-x86_64";
+    let lp = "{in:glibc-mesboot-shared}/lib";
     let mut steps = unpack_into("glibc-x86-64-source", "{src}");
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("gawk".into(), "{in:gawk}/bin/gawk".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("m4".into(), "{in:m4}/bin/m4".into()),
-            ("make".into(), "{in:make}/bin/make".into()),
-            ("python3".into(), "{in:python}/bin/python3".into()),
+            ("awk".into(), "{in:gawk-mesboot}/bin/awk".into()),
+            ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
+            ("bison".into(), "{in:bison-mesboot}/bin/bison".into()),
+            ("m4".into(), "{in:m4-mesboot}/bin/m4".into()),
+            ("make".into(), "{in:make-441}/bin/make".into()),
+            ("python3".into(), "{in:python-mesboot}/bin/python3".into()),
         ],
     });
     // the i686 BUILD_CC: static gcc-14 vs glibc-mesboot (build-time helpers are i686).
@@ -41,9 +55,19 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
+    ));
+    // gen-as-const.py -> scripts/glibcextract.py shells the compiler through
+    // Python `subprocess.check_call(cmd, shell=True)` (the cmd uses a `< file`
+    // redirect, so a shell is required). CPython hardcodes /bin/sh for shell=True
+    // and ignores SHELL/CONFIG_SHELL/PatchShebangs, but the host-free sandbox has
+    // no /bin/sh — so pin that subprocess shell to the declared bash-mesboot via
+    // `executable=` (both call sites).
+    steps.push(sed_i_mesboot0(
+        "s|subprocess\\.check_call(cmd, shell=True)|subprocess.check_call(cmd, shell=True, executable=\"{in:bash-mesboot}/bin/bash\")|g",
+        &["scripts/glibcextract.py"],
     ));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
@@ -71,13 +95,14 @@ pub fn recipe() -> Recipe {
         .env("CC", "x86_64-pc-linux-gnu-gcc")
         .env("BUILD_CC", "{root}/wb/build-cc")
         .env("AR", "x86_64-pc-linux-gnu-ar")
-        .env("RANLIB", "x86_64-pc-linux-gnu-ranlib"),
+        .env("RANLIB", "x86_64-pc-linux-gnu-ranlib")
+        .env("LD_LIBRARY_PATH", lp),
     );
     steps.push(
         Step::run(
             "{src}/bld",
             &[
-                "{in:make}/bin/make",
+                "{in:make-441}/bin/make",
                 "-j{jobs}",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
@@ -85,13 +110,14 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
-        .env("SHELL", SH),
+        .env("SHELL", SH)
+        .env("LD_LIBRARY_PATH", lp),
     );
     steps.push(
         Step::run(
             "{src}/bld",
             &[
-                "{in:make}/bin/make",
+                "{in:make-441}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "install",
                 "DESTDIR={out}/stage",
@@ -99,7 +125,8 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
-        .env("SHELL", SH),
+        .env("SHELL", SH)
+        .env("LD_LIBRARY_PATH", lp),
     );
     // Relocate every GNU ld script under lib/*.so from absolute member paths to
     // bare names (ld finds them via -L); real ELFs and absent scripts are skipped.
@@ -134,14 +161,18 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("glibc-x86-64", "2.41")
         .source_input("glibc-241-source")
-        .native_inputs(&["gcc-x86-64-stage1", "gcc-14", "glibc-mesboot", "binutils-x86-64"])
-        .inputs_owned(base_inputs(&[
-            "linux-headers-x86-64",
-            "flex",
-            "bison",
-            "m4",
-            "make",
-            "python",
-        ]))
+        .native_inputs(&[
+            "gcc-x86-64-stage1",
+            "gcc-14",
+            "glibc-mesboot",
+            "glibc-mesboot-shared",
+            "binutils-x86-64",
+            "gawk-mesboot",
+            "bison-mesboot",
+            "m4-mesboot",
+            "python-mesboot",
+            "make-441",
+        ])
+        .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
 }

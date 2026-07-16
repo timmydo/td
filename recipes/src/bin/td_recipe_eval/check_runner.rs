@@ -1607,20 +1607,14 @@ mod tests {
         );
     }
 
-    /// #469 structural test, verified RED against the pre-cutover code: the
-    /// old runner classified `bash`/`coreutils`/… as a "seed tool" class and
-    /// resolved them through tests/td-seed-tools.lock, then td-subst.lock,
-    /// then ambient PATH, so planning ACCEPTED this graph. Now the graph
-    /// fails closed at planning —
-    /// before any intern/build — until the scaffolding rungs exist as recipe
-    /// outputs. The classification is a FREE function needing no runner (and
-    /// therefore no stage0 placement, no subprocess): the check-run/build-run
-    /// entry points call it before constructing the runner, so a rejected
-    /// graph executes nothing ambient. When the chain becomes self-hosting,
-    /// this test flips to asserting acceptance (delete it in the same PR that
-    /// adds the rungs).
+    /// The real bootstrap graph is host-free: planning provenance ACCEPTS every
+    /// real target, because each rung in every target's closure resolves each
+    /// input to a catalog recipe output or a pinned seed. This is a regression
+    /// guard — a reintroduced host input would red here, before any build. The
+    /// `synthetic_recipes_with_forbidden_inputs_are_rejected_at_planning` test
+    /// below keeps the negative direction covered.
     #[test]
-    fn bootstrap_graph_with_host_scaffolding_is_rejected_at_planning() {
+    fn real_bootstrap_graph_is_host_free_at_planning() {
         for target in [
             "make-test",
             "busybox-test",
@@ -1628,11 +1622,9 @@ mod tests {
             "gcc-x86-64-native-test",
             "gcc-x86-64-self-test",
         ] {
-            let err = ensure_targets_provenance(&[target]).unwrap_err();
-            assert!(
-                err.starts_with(PROVENANCE_REJECTED),
-                "{target}: expected a provenance rejection, got: {err}"
-            );
+            if let Err(err) = ensure_targets_provenance(&[target]) {
+                panic!("{target}: expected host-free provenance to pass, got: {err}");
+            }
         }
     }
 

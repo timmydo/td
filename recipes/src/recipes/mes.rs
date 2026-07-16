@@ -5,7 +5,7 @@ use crate::types::{Recipe, Step};
 // #469) — the Rust port of configure.sh/bootstrap.sh/install.sh — so the rung
 // declares NO host tools at all: stage0 (a recipe output) compiles and links,
 // the just-built mes runs upstream's mescc.scm, and the engine does the file
-// orchestration. First rung with an empty BASE_TOOLS footprint.
+// orchestration. First rung with an empty host-tool footprint.
 pub fn recipe() -> Recipe {
     let mut steps = vec![Step::MesBoot {
         source: "{in:mes-source}".into(),

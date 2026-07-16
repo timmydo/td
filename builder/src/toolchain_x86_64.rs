@@ -287,7 +287,7 @@ impl RustInputs {
         let glibc_interp = format!("{}/lib/ld-linux-x86-64.so.2", glibc.display());
         // unpack the pinned release tarball IN-SANDBOX (TD_SRC is the raw .tar.gz — the
         // recipe's .source()) with the ENGINE's own readers: no unpacker inputs, no
-        // subprocess (tar/gzip left BASE_TOOLS with Step::Unpack, re #469).
+        // subprocess (tar/gzip left the host-tool tier with Step::Unpack, re #469).
         let tarball = PathBuf::from(g("TD_SRC")?);
         let extract = mktemp_dir("td-rust-src")?;
         unpack_rust_release(&tarball, &extract)?;
@@ -304,7 +304,7 @@ impl RustInputs {
 
 /// Unpack the pinned Rust release `.tar.gz` into `dest` (top-level dir stripped) with the
 /// ENGINE's own gzip/tar readers (`crate::tar::unpack_archive`) — no subprocess, no
-/// unpacker inputs at all: tar/gzip left `BASE_TOOLS` with `Step::Unpack`, and the
+/// unpacker inputs at all: tar/gzip left the host-tool tier with `Step::Unpack`, and the
 /// transform admits no host tool (re #469). The combined installer carries components
 /// `assemble_rust_tree` never reads (docs, rustfmt, clippy, …); the full unpack writes
 /// them to the build scratch only — the assemble step copies rustc/, cargo/, and

@@ -3,7 +3,7 @@ use crate::types::{Recipe, Step};
 
 // GNU sed 4.2.2 — rung 14 tier (re #469, sibling of gawk-mesboot): gcc-mesboot1
 // builds the from-source `sed` provider so a rung that can reach this output can
-// consume a td-built `sed` instead of the host one (BASE_TOOLS). Same toolchain,
+// consume a td-built `sed` instead of the host one. Same toolchain,
 // env, and configure shape as the gawk-mesboot rung one axis over — static CC
 // against glibc-mesboot0 + the kernel headers, NLS off, only the `sed` binary
 // made (its `doc/` manpage wants help2man/makeinfo, which the sandbox does not

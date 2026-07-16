@@ -1,5 +1,6 @@
 use crate::ladder::{
-    SH, base_inputs, base_path, link_bins, relocate_ld_scripts, sed_i, unpack_into, unpack_keep_top,
+    SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i_mesboot0,
+    unpack_into, unpack_keep_top,
 };
 use crate::types::{Recipe, Step};
 
@@ -11,25 +12,33 @@ use crate::types::{Recipe, Step};
 // chain-tail stage shape). The deleted chain's FINALIZE moves in here as
 // steps: the ld-script relocation (strip the configure prefix to bare names)
 // and the kernel-header overlay into the staged include dir.
+//
+// The build tools glibc's configure/make need are the td-built gcc-14-tier
+// providers — bison-mesboot, m4-mesboot, python-mesboot (dynamic vs
+// glibc-mesboot-shared, run via the LD_LIBRARY_PATH this build already sets),
+// gawk-mesboot (3.1.8, glibc needs gawk >= 3.1.2), and make-441 (GNU Make
+// 4.4.1, glibc's critical make >= 4.0 gate) — with the mesboot0 scripting
+// userland (mesboot0_path/mesboot0_inputs) and the binutils-244
+// link_bins_mesboot0 farm. glibc's build never invokes lex/flex, so no flex.
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:binutils-244}}/bin:{}", base_path());
+    let path = format!("{{in:binutils-244}}/bin:{}", mesboot0_path());
     let stage = "{out}/stage/td/store/glibc-2.41";
+    // python-mesboot (the only dynamic build tool) resolves its shared glibc 2.16
+    // from here; the static build tools ignore it.
+    let lp = "{in:glibc-mesboot-shared}/lib";
     let mut steps = unpack_into("glibc-241-source", "{src}");
     steps.extend(unpack_keep_top("linux-headers", "{root}/kh"));
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("gawk".into(), "{in:gawk}/bin/gawk".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("m4".into(), "{in:m4}/bin/m4".into()),
-            ("make".into(), "{in:make}/bin/make".into()),
-            ("python3".into(), "{in:python}/bin/python3".into()),
+            ("awk".into(), "{in:gawk-mesboot}/bin/awk".into()),
+            ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
+            ("bison".into(), "{in:bison-mesboot}/bin/bison".into()),
+            ("m4".into(), "{in:m4-mesboot}/bin/m4".into()),
+            ("make".into(), "{in:make-441}/bin/make".into()),
+            ("python3".into(), "{in:python-mesboot}/bin/python3".into()),
         ],
     });
-    steps.push(
-        link_bins("binutils-244"),
-    );
+    steps.push(link_bins_mesboot0("binutils-244"));
     steps.push(Step::WriteFile {
         path: "{root}/wb/gcc".into(),
         content: format!(
@@ -41,9 +50,19 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
-    steps.push(sed_i(
+    steps.push(sed_i_mesboot0(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
+    ));
+    // gen-as-const.py -> scripts/glibcextract.py shells the compiler through
+    // Python `subprocess.check_call(cmd, shell=True)` (the cmd uses a `< file`
+    // redirect, so a shell is required). CPython hardcodes /bin/sh for shell=True
+    // and ignores SHELL/CONFIG_SHELL/PatchShebangs, but the host-free sandbox has
+    // no /bin/sh — so pin that subprocess shell to the declared bash-mesboot via
+    // `executable=` (both call sites).
+    steps.push(sed_i_mesboot0(
+        "s|subprocess\\.check_call(cmd, shell=True)|subprocess.check_call(cmd, shell=True, executable=\"{in:bash-mesboot}/bin/bash\")|g",
+        &["scripts/glibcextract.py"],
     ));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
@@ -69,13 +88,13 @@ pub fn recipe() -> Recipe {
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
         .env("CC", "{root}/wb/gcc")
-        .env("LD_LIBRARY_PATH", "{in:glibc-mesboot-shared}/lib"),
+        .env("LD_LIBRARY_PATH", lp),
     );
     steps.push(
         Step::run(
             "{src}/bld",
             &[
-                "{in:make}/bin/make",
+                "{in:make-441}/bin/make",
                 "-j{jobs}",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
@@ -84,13 +103,13 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
-        .env("LD_LIBRARY_PATH", "{in:glibc-mesboot-shared}/lib"),
+        .env("LD_LIBRARY_PATH", lp),
     );
     steps.push(
         Step::run(
             "{src}/bld",
             &[
-                "{in:make}/bin/make",
+                "{in:make-441}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "install",
                 "DESTDIR={out}/stage",
@@ -99,7 +118,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
-        .env("LD_LIBRARY_PATH", "{in:glibc-mesboot-shared}/lib"),
+        .env("LD_LIBRARY_PATH", lp),
     );
     // FINALIZE (was the shell bootstrap chain's brick-8 epilogue): relocate
     // every GNU ld script under lib/*.so from absolute member paths to bare
@@ -136,7 +155,16 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("glibc-241", "2.41")
         .source_input("glibc-241-source")
-        .native_inputs(&["gcc-14", "glibc-mesboot-shared", "binutils-244"])
-        .inputs_owned(base_inputs(&["linux-headers", "flex", "bison", "m4", "make", "python"]))
+        .native_inputs(&[
+            "gcc-14",
+            "glibc-mesboot-shared",
+            "binutils-244",
+            "gawk-mesboot",
+            "bison-mesboot",
+            "m4-mesboot",
+            "python-mesboot",
+            "make-441",
+        ])
+        .inputs_owned(mesboot0_inputs(&["linux-headers"]))
         .steps(steps)
 }

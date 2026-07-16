@@ -1,20 +1,14 @@
 use crate::ladder::unpack_into;
 use crate::types::{Recipe, Step};
 
-// GNU diffutils 2.7 — the tcc-era `diffutils` provider (re #469), the LAST of the
-// five BASE_TOOLS host tools to gain a provider (after grep/sed/coreutils/gawk).
-// It ships `cmp` and `diff`. The GCC/binutils rungs from binutils-mesboot0 up
-// still name the HOST guix `diffutils` (base_inputs stages it and each rung farms
-// `cmp`/`diff` in from `{in:diffutils}/bin`); that is host-executable ingress the
-// bootstrap must close. This rung builds `cmp` and `diff` from source under tcc +
-// mes libc — the same tcc/make pattern as grep-mesboot0/sed-mesboot0/
-// coreutils-mesboot0/gawk-mesboot0 — so those rungs can consume td-built
-// `cmp`/`diff` instead. It sits with its siblings below binutils-mesboot0,
+// GNU diffutils 2.7 — the tcc-era `diffutils` provider, a cycle-breaker below the
+// first host-tool consumer. It ships `cmp` and `diff`. This rung builds `cmp`
+// and `diff` from source under tcc + mes libc — the same tcc/make pattern as
+// grep-mesboot0/sed-mesboot0/coreutils-mesboot0/gawk-mesboot0 — so the
+// GCC/binutils rungs from binutils-mesboot0 up consume td-built `cmp`/`diff`
+// instead of a host tool. It sits with its siblings below binutils-mesboot0,
 // depending only on {mes, tcc, make-mesboot0}, none of which (transitively)
-// depends on diffutils, so there is no cycle. (The consumer rewiring — flipping
-// `{in:diffutils}` to `{in:diffutils-mesboot0}` and dropping `diffutils` from
-// BASE_TOOLS — is #469's later atomic cutover, not this provider PR, exactly as
-// grep/sed/coreutils/gawk landed their providers first.)
+// depends on diffutils, so there is no cycle.
 //
 // This is live-bootstrap's diffutils-2.7 (steps/diffutils-2.7, mk/main.mk — its
 // tcc + mes-libc build). Host-tool-free the same way its siblings are:

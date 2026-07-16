@@ -26,8 +26,7 @@ use crate::types::{Recipe, Step, TextEdit};
 // flex (no `.l` sources at all), and gperf are dead edges, as upstream guix/
 // live-boot build this rung with none on PATH. (Pre-#496, "now"-in-extraction-
 // order mtimes put c-parse.y after c-parse.c and spuriously demanded bison — the
-// sole reason this rung once named host flex/bison.) Per-rung cutover for #469;
-// BASE_TOOLS/base_path/base_inputs/link_bins go in the final atomic PR.
+// sole reason this rung once named host flex/bison.)
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
     let cip = "{in:mes}/include:{in:mes}/include/x86";
