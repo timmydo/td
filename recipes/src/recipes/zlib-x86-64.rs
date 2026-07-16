@@ -1,4 +1,4 @@
-use crate::ladder::{base_inputs, base_path, unpack_into, SH};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
 // zlib 1.3.1 for x86_64 (#410): the shared libz.so.1 the /td/store Rust toolchain needs
@@ -19,6 +19,7 @@ use crate::types::{Recipe, Step};
 // soname `rust-toolchain`'s transform co-locates. native_inputs: gcc-x86-64-stage2 (the cross
 // CC + its libgcc), glibc-x86-64 (headers+libs), binutils-x86-64 (ar/ranlib + the as/ld the
 // cross gcc's baked --with-as/--with-ld resolve to).
+// Host-free build tools: mesboot0 + make-mesboot. re #469.
 pub fn recipe() -> Recipe {
     let xgcc = "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
@@ -42,7 +43,7 @@ pub fn recipe() -> Recipe {
             "{src}",
             &[SH, "./configure", "--prefix=/td/store/zlib-1.3.1", "--shared"],
         )
-        .env("PATH", &base_path())
+        .env("PATH", &mesboot0_path())
         .env("CC", "{root}/wb/cc")
         .env("CHOST", "x86_64-pc-linux-gnu")
         .env("AR", xar)
@@ -55,9 +56,9 @@ pub fn recipe() -> Recipe {
     steps.push(
         Step::run(
             "{src}",
-            &["{in:make}/bin/make", "-j{jobs}", "libz.so.1.3.1", &format!("SHELL={SH}"), &format!("CONFIG_SHELL={SH}")],
+            &["{in:make-mesboot}/bin/make", "-j{jobs}", "libz.so.1.3.1", &format!("SHELL={SH}"), &format!("CONFIG_SHELL={SH}")],
         )
-        .env("PATH", &base_path())
+        .env("PATH", &mesboot0_path())
         .env("CC", "{root}/wb/cc")
         .env("AR", xar)
         .env("RANLIB", xranlib),
@@ -78,7 +79,7 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("zlib-x86-64", "1.3.1")
         .source_input("zlib-x86-64-source")
-        .native_inputs(&["gcc-x86-64-stage2", "glibc-x86-64", "binutils-x86-64"])
-        .inputs_owned(base_inputs(&["make"]))
+        .native_inputs(&["gcc-x86-64-stage2", "glibc-x86-64", "binutils-x86-64", "make-mesboot"])
+        .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }

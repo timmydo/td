@@ -1,4 +1,4 @@
-use crate::ladder::{SH, base_inputs, base_path, link_bins, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0 — rung 18 (#378, guix's gcc-boot0/gcc-final version): gcc-mesboot
@@ -7,10 +7,10 @@ use crate::types::{Recipe, Step};
 // wrapper scripts (gcc derives CC_FOR_BUILD from CC and strips trailing flags,
 // so a bare `gcc -static …` would come apart — the deleted fn's proven trick).
 // --prefix=/td/store/gcc-14.3.0 + DESTDIR={out}/stage: the host-consumable
-// stage shape the chain tail reads. Host make -j{jobs} (the modern rungs
-// parallelize; the mesboot base stays serial).
+// stage shape the chain tail reads. make-mesboot -j{jobs} (the modern rungs
+// parallelize; the mesboot base stays serial). Host-free, re #469.
 pub fn recipe() -> Recipe {
-    let path = format!("{{in:gcc-mesboot}}/bin:{}", base_path());
+    let path = format!("{{in:gcc-mesboot}}/bin:{}", mesboot0_path());
     let cip = "{in:gcc-mesboot}/lib/gcc/i686-unknown-linux-gnu/4.9.4/include:{root}/kh:{in:glibc-mesboot}/include:{src}/mpfr/src";
     let lp = "{in:glibc-mesboot}/lib:{in:gcc-mesboot}/lib";
     let ldf = "-static -B{in:glibc-mesboot}/lib";
@@ -34,13 +34,11 @@ pub fn recipe() -> Recipe {
     steps.push(Step::ToolFarm {
         links: vec![
             ("cpp".into(), "{in:gcc-mesboot}/bin/cpp".into()),
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("make".into(), "{in:make}/bin/make".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
-    steps.push(
-        link_bins("binutils-mesboot"),
-    );
+    steps.push(link_bins_mesboot0("binutils-mesboot"));
     // single-token static wrappers (see header): CC/CXX survive gcc's munging
     for (name, real) in [("gcc", "gcc"), ("g++", "g++")] {
         steps.push(Step::WriteFile {
@@ -105,7 +103,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}/bld",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "-j{jobs}",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
@@ -124,7 +122,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}/bld",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install",
@@ -146,7 +144,7 @@ pub fn recipe() -> Recipe {
     });
     Recipe::mesboot("gcc-14", "14.3.0")
         .source_input("gcc-14-source")
-        .native_inputs(&["binutils-mesboot", "gcc-mesboot", "glibc-mesboot"])
-        .inputs_owned(base_inputs(&["gmp63", "mpfr421", "mpc131", "linux-headers", "make"]))
+        .native_inputs(&["binutils-mesboot", "gcc-mesboot", "glibc-mesboot", "make-mesboot"])
+        .inputs_owned(mesboot0_inputs(&["gmp63", "mpfr421", "mpc131", "linux-headers"]))
         .steps(steps)
 }

@@ -1,4 +1,4 @@
-use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Make 4.4.1 — the FIRST td-native build-userland tool, built FROM SOURCE by the
@@ -10,9 +10,9 @@ use crate::types::{Recipe, Step};
 // against the /td/store x86_64 glibc 2.41 (glibc-x86-64): a static make has no ELF
 // interp, so it runs in any sandbox with NO glibc staging — the self-contained shape a
 // hermetic build userland wants (and how guix's own bootstrap make + the sibling native
-// toolchain rungs are built). The build DRIVER make is the seed host make
-// ({in:make}/bin/make, a `tool:` lock entry) — the new make does not build itself; its
-// OUTPUT is the /td/store make. No guix bytes in the output.
+// toolchain rungs are built). The build DRIVER make is the td-built make-mesboot
+// ({in:make-mesboot}/bin/make) — the new make does not build itself; its OUTPUT is
+// the /td/store make. No guix bytes in the output.
 //
 // STATIC vs dynamic (directive-3-style callout, see PR): the make-x86-64-source pin's
 // comment describes the loop-driver make as "dynamic vs /td/store glibc 2.41". This rung
@@ -24,11 +24,12 @@ use crate::types::{Recipe, Step};
 // This recipe only BUILDS make. Its behavior is validated by the sibling `make-test`
 // recipe (which depends on this one and RUNS the built make via the recipe check
 // feature) — so make-x86-64 stays a pure build rung, like binutils-x86-64-native.
+// Host-free build tools: mesboot0 + make-mesboot (the driver). re #469.
 pub fn recipe() -> Recipe {
     let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let nbin = "{in:binutils-x86-64-native}/bin";
-    let path = format!("{nbin}:{}", base_path());
+    let path = format!("{nbin}:{}", mesboot0_path());
     // glibc 2.41 headers + the x86_64 kernel UAPI headers (glibc's <sys/…> #include
     // <linux/…>) via C_INCLUDE_PATH — make is pure C, so C_INCLUDE_PATH is safe here
     // (the libstdc++ <cstdlib> #include_next hazard that bars it for gcc/g++ does not
@@ -73,7 +74,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "-j{jobs}",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
@@ -89,7 +90,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install",
@@ -120,7 +121,7 @@ pub fn recipe() -> Recipe {
                  printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'make is not x86-64' >&2; exit 1; }",
             ],
         )
-        .env("PATH", &base_path()),
+        .env("PATH", &mesboot0_path()),
     );
     Recipe::mesboot("make-x86-64", "4.4.1")
         .source_input("make-x86-64-source")
@@ -128,7 +129,8 @@ pub fn recipe() -> Recipe {
             "gcc-x86-64-native",
             "binutils-x86-64-native",
             "glibc-x86-64",
+            "make-mesboot",
         ])
-        .inputs_owned(base_inputs(&["linux-headers-x86-64", "make"]))
+        .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
 }

@@ -1,4 +1,4 @@
-use crate::ladder::{base_inputs, base_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0, NATIVE x86_64 (x86_64-toolchain rung X2, the port of the shell
@@ -15,6 +15,7 @@ use crate::types::{Recipe, Step};
 // gcc-x86-64-stage2 (the cross builder gcc/g++), binutils-x86-64-native (the native
 // as/ld), binutils-x86-64 (the cross as/ld the builder gcc resolves absolutely),
 // glibc-x86-64 (the x86_64 libc + the sysroot source).
+// Host-free build tools: mesboot0 + make-mesboot; flex/bison/m4 dead (gcc-14-source). re #469.
 pub fn recipe() -> Recipe {
     let xgcc =
         "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-gcc";
@@ -22,7 +23,7 @@ pub fn recipe() -> Recipe {
         "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-g++";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let nbin = "{in:binutils-x86-64-native}/bin";
-    let path = format!("{nbin}:{{in:binutils-x86-64}}/bin:{}", base_path());
+    let path = format!("{nbin}:{{in:binutils-x86-64}}/bin:{}", mesboot0_path());
     // headers reach the compiler via the wrapper's -idirafter (NOT C_INCLUDE_PATH —
     // that breaks libstdc++'s <cstdlib> #include_next); CIP carries only the in-tree
     // mpfr src, LIBRARY_PATH the relocated sysroot lib.
@@ -78,7 +79,7 @@ pub fn recipe() -> Recipe {
                  sed -i 's,/td/store/glibc-2.41-x86_64/lib/,,g' \"$p\"; done",
             ],
         )
-        .env("PATH", &base_path()),
+        .env("PATH", &mesboot0_path()),
     );
     // -shared-aware STATIC wrappers (port of _mk_native_static_wrapper): -static for
     // executables/conftests, DROPPED when the link is -shared; -idirafter (not
@@ -104,13 +105,8 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk}/bin/awk".into()),
-            ("flex".into(), "{in:flex}/bin/flex".into()),
-            ("lex".into(), "{in:flex}/bin/flex".into()),
-            ("bison".into(), "{in:bison}/bin/bison".into()),
-            ("yacc".into(), "{in:bison}/bin/bison".into()),
-            ("m4".into(), "{in:m4}/bin/m4".into()),
-            ("make".into(), "{in:make}/bin/make".into()),
+            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
     steps.push(Step::PatchShebangs {
@@ -171,7 +167,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}/bld",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "-j{jobs}",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
@@ -190,7 +186,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}/bld",
             &[
-                "{in:make}/bin/make",
+                "{in:make-mesboot}/bin/make",
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "MAKEINFO=true",
                 "install",
@@ -217,16 +213,13 @@ pub fn recipe() -> Recipe {
             "binutils-x86-64-native",
             "binutils-x86-64",
             "glibc-x86-64",
+            "make-mesboot",
         ])
-        .inputs_owned(base_inputs(&[
+        .inputs_owned(mesboot0_inputs(&[
             "gmp63",
             "mpfr421",
             "mpc131",
             "linux-headers-x86-64",
-            "flex",
-            "bison",
-            "m4",
-            "make",
         ]))
         .steps(steps)
 }
