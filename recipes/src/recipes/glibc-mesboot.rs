@@ -39,9 +39,7 @@ pub fn recipe() -> Recipe {
             ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
         ],
     });
-    steps.push(
-        link_bins("binutils-mesboot"),
-    );
+    steps.push(link_bins("binutils-mesboot"));
     // the deleted fn's source fixups, verbatim
     steps.push(sed_i(
         "s,\\${vdso_symver//\\./_},$(echo $vdso_symver | sed -e \"s/\\\\./_/g\"),",
