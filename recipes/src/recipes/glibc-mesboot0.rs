@@ -1,5 +1,5 @@
 use crate::ladder::{
-    SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, sed_i_mesboot0, unpack_into,
+    SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, sed_i, unpack_into,
 };
 use crate::types::{Recipe, Step, TextEdit};
 
@@ -11,9 +11,9 @@ use crate::types::{Recipe, Step, TextEdit};
 //
 // The build tools resolve through the td-built `-mesboot0` providers —
 // mesboot0_path()/mesboot0_inputs() supply coreutils/sed/grep/gawk/diffutils, the
-// `awk` ToolFarm points at gawk-mesboot0, the binutils link_bins_mesboot0 farm
+// `awk` ToolFarm points at gawk-mesboot0, the binutils link_bins farm
 // uses coreutils-mesboot0's `ln`, and the two config.make fixups run
-// sed_i_mesboot0 (sed-mesboot0's `sed -i`).
+// sed_i (sed-mesboot0's `sed -i`).
 pub fn recipe() -> Recipe {
     let path = mesboot0_path();
     let gccdir = "{in:gcc-core-mesboot0}/lib/gcc-lib/i686-unknown-linux-gnu/2.95.3";
@@ -48,7 +48,7 @@ pub fn recipe() -> Recipe {
             ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(link_bins_mesboot0("binutils-mesboot0"));
+    steps.push(link_bins("binutils-mesboot0"));
     steps.push(
         Step::run(
             "{src}",
@@ -81,11 +81,11 @@ pub fn recipe() -> Recipe {
         paths: vec!["{src}/config.make".into()],
         exec: false,
     });
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "s,INSTALL = scripts/,INSTALL = $(..)./scripts/,",
         &["config.make"],
     ));
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "s,^BASH = ,SHELL = {in:bash-mesboot}/bin/bash\\n         BASH = ,",
         &["config.make"],
     ));

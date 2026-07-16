@@ -1,4 +1,4 @@
-use crate::ladder::{SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU Make 3.82 — rung 11 (#378, guix's make-mesboot): gcc-mesboot0 rebuilds
@@ -7,7 +7,7 @@ use crate::types::{Recipe, Step};
 //
 // Host-tool ingress closed (re #469): mechanical cutover to the `-mesboot0`
 // providers — mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, and the
-// binutils link_bins_mesboot0 farm. Once the sandbox is host-free (no /bin/sh) the
+// binutils link_bins farm. Once the sandbox is host-free (no /bin/sh) the
 // PatchShebangs rewrite is required so any `#! /bin/sh` helper the configure/make
 // invokes directly — the automake `missing` wrapper and friends — runs under the
 // declared shell, the same rewrite every other host-free rung applies. Per-rung
@@ -34,7 +34,7 @@ pub fn recipe() -> Recipe {
             ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(link_bins_mesboot0("binutils-mesboot0"));
+    steps.push(link_bins("binutils-mesboot0"));
     steps.push(
         Step::run(
             "{src}",

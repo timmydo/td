@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, sed_i_mesboot0, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, sed_i, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step, TextEdit};
 
 // glibc 2.16.0 SHARED — rung 17 (#378): the runtime libc dynamic /td/store
@@ -27,24 +27,24 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        link_bins_mesboot0("binutils-mesboot"),
+        link_bins("binutils-mesboot"),
     );
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "s,\\${vdso_symver//\\./_},$(echo $vdso_symver | sed -e \"s/\\\\./_/g\"),",
         &["sysdeps/unix/make-syscalls.sh"],
     ));
-    steps.push(sed_i_mesboot0("s,de\\.po,en_GB.po,", &["catgets/Makefile", "intl/Makefile"]));
-    steps.push(sed_i_mesboot0("s,/bin/pwd,pwd,", &["configure"]));
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i("s,de\\.po,en_GB.po,", &["catgets/Makefile", "intl/Makefile"]));
+    steps.push(sed_i("s,/bin/pwd,pwd,", &["configure"]));
+    steps.push(sed_i(
         "/^others *+= *nscd/d; /^others-pie *+= *nscd/d; /^install-sbin *:= *nscd/d",
         &["nscd/Makefile"],
     ));
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "s/^extra-libs[[:space:]]*=.*/extra-libs =/; s/^extra-libs-others[[:space:]]*=.*/extra-libs-others =/",
         &["nis/Makefile"],
     ));
-    steps.push(sed_i_mesboot0("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i("s/wctype manual shadow/wctype shadow/", &["Makeconfig"]));
+    steps.push(sed_i(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
@@ -105,7 +105,7 @@ pub fn recipe() -> Recipe {
         .env("CC", cc)
         .env("LD", "gcc"),
     );
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "$aSHELL := {in:bash-mesboot}/bin/bash",
         &["build/Makefile"],
     ));

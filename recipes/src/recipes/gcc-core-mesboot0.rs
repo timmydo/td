@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into};
+use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into};
 use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 2.95.3 — bootstrap rung 7 (#378, guix's gcc-core-mesboot0): tcc + the
@@ -11,7 +11,7 @@ use crate::types::{Recipe, Step, TextEdit};
 // Host-tool ingress closed (re #469): cut over to the td-built `-mesboot0`
 // providers — mesboot0_path()/mesboot0_inputs() supply coreutils/sed/grep/gawk/
 // diffutils, the `awk` ToolFarm points at gawk-mesboot0, and `rm`/`cp`/the
-// binutils link_bins_mesboot0 farm use coreutils-mesboot0. The one host tool this
+// binutils link_bins farm use coreutils-mesboot0. The one host tool this
 // rung depended on was `tar` (install-headers-tar), replaced below with `cp -a`.
 // `make install` also NAMES host `find` in install-headers' fix-symlinks step,
 // but that is a dead edge like flex/bison: the line is error-ignored + `$?`-gated
@@ -71,7 +71,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     // binutils' whole bin dir onto the farm (as/ld/ar/ranlib/nm/strip/…).
-    steps.push(link_bins_mesboot0("binutils-mesboot0"));
+    steps.push(link_bins("binutils-mesboot0"));
     steps.push(Step::WriteFile {
         path: "{src}/config.cache".into(),
         content: "ac_cv_c_float_format='IEEE (little-endian)'\n".into(),

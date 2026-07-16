@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 4.6.4 (c,c++) — rung 12 (#378, guix's gcc-mesboot1): gcc-mesboot0 builds
@@ -9,7 +9,7 @@ use crate::types::{Recipe, Step, TextEdit};
 //
 // Host-tool ingress closed (re #469): cut over to the `-mesboot0` providers —
 // mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, the binutils-mesboot1
-// link_bins_mesboot0 farm, and flex/bison dropped as dead edges (4.6.4 ships its
+// link_bins farm, and flex/bison dropped as dead edges (4.6.4 ships its
 // pre-generated parsers and #496 keeps them newer than their sources). The tar
 // ingress in `make install` (config.build defaults i686-linux to
 // install-headers-tar) is closed by repointing gcc/Makefile.in's
@@ -50,7 +50,7 @@ pub fn recipe() -> Recipe {
             ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(link_bins_mesboot0("binutils-mesboot1"));
+    steps.push(link_bins("binutils-mesboot1"));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
         shell: SH.into(),

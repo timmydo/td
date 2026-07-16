@@ -1,4 +1,4 @@
-use crate::ladder::{SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step, TextEdit};
 
 // GCC 4.9.4 — rung 16 (#378, guix's gcc-mesboot): gcc-mesboot1 (4.6.4 c,c++) +
@@ -38,7 +38,7 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(
-        link_bins_mesboot0("binutils-mesboot"),
+        link_bins("binutils-mesboot"),
     );
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),

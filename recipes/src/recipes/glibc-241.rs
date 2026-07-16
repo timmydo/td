@@ -1,5 +1,5 @@
 use crate::ladder::{
-    SH, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i_mesboot0,
+    SH, link_bins, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i,
     unpack_into, unpack_keep_top,
 };
 use crate::types::{Recipe, Step};
@@ -19,7 +19,7 @@ use crate::types::{Recipe, Step};
 // gawk-mesboot (3.1.8, glibc needs gawk >= 3.1.2), and make-441 (GNU Make
 // 4.4.1, glibc's critical make >= 4.0 gate) — with the mesboot0 scripting
 // userland (mesboot0_path/mesboot0_inputs) and the binutils-244
-// link_bins_mesboot0 farm. glibc's build never invokes lex/flex, so no flex.
+// link_bins farm. glibc's build never invokes lex/flex, so no flex.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:binutils-244}}/bin:{}", mesboot0_path());
     let stage = "{out}/stage/td/store/glibc-2.41";
@@ -38,7 +38,7 @@ pub fn recipe() -> Recipe {
             ("python3".into(), "{in:python-mesboot}/bin/python3".into()),
         ],
     });
-    steps.push(link_bins_mesboot0("binutils-244"));
+    steps.push(link_bins("binutils-244"));
     steps.push(Step::WriteFile {
         path: "{root}/wb/gcc".into(),
         content: format!(
@@ -50,7 +50,7 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
@@ -60,7 +60,7 @@ pub fn recipe() -> Recipe {
     // and ignores SHELL/CONFIG_SHELL/PatchShebangs, but the host-free sandbox has
     // no /bin/sh — so pin that subprocess shell to the declared bash-mesboot via
     // `executable=` (both call sites).
-    steps.push(sed_i_mesboot0(
+    steps.push(sed_i(
         "s|subprocess\\.check_call(cmd, shell=True)|subprocess.check_call(cmd, shell=True, executable=\"{in:bash-mesboot}/bin/bash\")|g",
         &["scripts/glibcextract.py"],
     ));

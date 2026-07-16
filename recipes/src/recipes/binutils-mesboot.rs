@@ -1,4 +1,4 @@
-use crate::ladder::{SH, apply_patch, link_bins_mesboot0, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{SH, apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.20.1a #3 — rung 13 (#378, guix's binutils-mesboot): rebuilt by
@@ -7,7 +7,7 @@ use crate::types::{Recipe, Step};
 //
 // Host-tool ingress closed (re #469): mechanical cutover to the `-mesboot0`
 // providers — mesboot0_path()/mesboot0_inputs(), `awk` -> gawk-mesboot0, and the
-// binutils link_bins_mesboot0 farm — identical to the binutils-mesboot1 rung one
+// binutils link_bins farm — identical to the binutils-mesboot1 rung one
 // generation down (same 2.20.1a source). `make all` recurses into `binutils/`,
 // whose `configure` runs `AM_PROG_LEX`; with no flex this far down the ladder
 // autoconf falls back to the automake `missing` wrapper to stub `lex.yy.c` and
@@ -38,7 +38,7 @@ pub fn recipe() -> Recipe {
             ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
         ],
     });
-    steps.push(link_bins_mesboot0("binutils-mesboot1"));
+    steps.push(link_bins("binutils-mesboot1"));
     steps.push(
         Step::run(
             "{src}",

@@ -68,9 +68,8 @@ pub fn mesboot0_inputs(extras: &[&str]) -> Vec<String> {
 /// The tool-farm step that symlinks a prior binutils rung's whole `bin/` into
 /// `{tools}` (as/ld/ar/ranlib/nm/strip/…) with the td-built `coreutils-mesboot0`
 /// `ln`, on `mesboot0_path()`. The `glob:` argv element expands sorted in the
-/// engine. (The `_mesboot0` suffix is now redundant; renaming consumers is a
-/// deferred mechanical cleanup.)
-pub fn link_bins_mesboot0(binutils_rung: &str) -> Step {
+/// engine.
+pub fn link_bins(binutils_rung: &str) -> Step {
     Step::run(
         "{root}",
         &[
@@ -123,11 +122,10 @@ pub fn apply_patch(patch_rung: &str, patch_input: &str) -> Step {
 }
 
 /// `sed -i EXPR FILE…` via the td-built `sed-mesboot0` on `mesboot0_path()` (dir
-/// {src} unless absolute). `sed -i`
-/// writes a temp file and renames, so it never touches stdin or a non-syncable
-/// fd — the mes-libc bugs sed-mesboot0 patches don't apply here. (The `_mesboot0`
-/// suffix is now redundant; renaming consumers is a deferred mechanical cleanup.)
-pub fn sed_i_mesboot0(expr: &str, files: &[&str]) -> Step {
+/// {src} unless absolute). `sed -i` writes a temp file and renames, so it never
+/// touches stdin or a non-syncable fd — the mes-libc bugs sed-mesboot0 patches
+/// don't apply here.
+pub fn sed_i(expr: &str, files: &[&str]) -> Step {
     let mut argv: Vec<&str> = vec!["{in:sed-mesboot0}/bin/sed", "-i", expr];
     argv.extend_from_slice(files);
     Step::run("{src}", &argv).env("PATH", &mesboot0_path())
