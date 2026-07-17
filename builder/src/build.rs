@@ -242,8 +242,12 @@ struct Watch {
 /// with nothing else to interleave output, a healthy build is legitimately
 /// silent well past 30 minutes (the previous bound false-killed it at 2187s on
 /// a shared box), and the heavier x86_64 stage2/native rungs recompile the same
-/// giants. 2 hours covers that under contention while still bounding a
-/// truly-wedged phase. No COUNT repeat bound (`tar xf` repeats a warning per
+/// giants. 4 hours is a deliberately generous ceiling: a legitimate single
+/// giant-file compile on a heavily shared box has no tight, known upper bound,
+/// and re-tuning this constant is expensive (a builder rebuild changes the
+/// reuse-key builder leg, forcing the whole ladder to rebuild), so the bound
+/// errs toward NEVER false-killing a live build. It still bounds a truly-wedged
+/// phase. No COUNT repeat bound (`tar xf` repeats a warning per
 /// member); the `repeat_secs` DURATION bound (5 min of the same line still
 /// arriving) is the #339 make-nested chatty-spin catch — comfortably above any
 /// real burst (a tar of a huge tarball finishes in a minute or two, its warning
@@ -254,7 +258,7 @@ struct Watch {
 /// phase emits, so it is NOT an output-affecting change and does NOT bump
 /// BUILDER_ABI (a healthy build produces identical output at any threshold).
 const WATCH_PHASE: Watch = Watch {
-    silence: Duration::from_secs(7200),
+    silence: Duration::from_secs(14400),
     repeat_limit: 0,
     repeat_secs: Duration::from_secs(300),
     drain_grace: Duration::from_secs(15),
