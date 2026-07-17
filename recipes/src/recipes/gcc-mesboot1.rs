@@ -113,8 +113,12 @@ pub fn recipe() -> Recipe {
     // --disable-dependency-tracking guard, so that flag cannot skip it. `eval`
     // re-parses the $depcmd string so its leading VAR=VAL become real assignment
     // prefixes (the exact effect `env` provided, using only a POSIX builtin), after
-    // which depmode `gcc` is selected just as in the other subdirs. Count is 2: the
-    // C branch and the inert `--disable-build-with-cxx` C++ branch.
+    // which depmode `gcc` is selected just as in the other subdirs. Count is 2:
+    // libcpp's configure runs this probe for BOTH its C (am_cv_CC_dependencies)
+    // and C++ (am_cv_CXX_dependencies) compilers, each with its own `env $depcmd`.
+    // Both are gated only by `test -f "$am_depcomp"` (depcomp is present) and both
+    // abort unconditionally on no style found, so both sites are load-bearing —
+    // `--disable-build-with-cxx` governs GCC's own build, not this automake probe.
     steps.push(Step::substitute_text(
         "{src}/libcpp/configure",
         vec![TextEdit::new("env $depcmd", "eval \"$depcmd\"", 2)],
