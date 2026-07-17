@@ -229,18 +229,32 @@ struct Watch {
     drain_grace: Duration,
 }
 
-/// Default phase bound: make can legitimately be silent for minutes while one
-/// big translation unit compiles; 30 minutes is comfortably past the corpus'
-/// worst single-file case (the /td/store bootstrap chain does NOT run through
-/// run_cmd — bootstrap.rs/toolchain_x86_64.rs have their own runners), while
-/// still bounding a truly-wedged phase. No COUNT repeat bound (`tar xf` repeats
-/// a warning per member); the `repeat_secs` DURATION bound (5 min of the same
-/// line still arriving) is the #339 make-nested chatty-spin catch — comfortably
-/// above any real burst (a tar of a huge tarball finishes in a minute or two,
-/// its warning does not keep arriving for five straight minutes) yet well under
-/// the 30-min silence backstop, so a broken sub-configure reds in minutes.
+/// Default phase bound: make can legitimately be silent for a long stretch
+/// while one big translation unit compiles. The recipe mesboot rungs run their
+/// phase commands through this bound (the `run` step dispatch calls
+/// `run_cmd(..., &WATCH_PHASE)`); the older shell-ported /td/store bootstrap
+/// chain (bootstrap.rs/toolchain_x86_64.rs) has its own runners. Those recipe
+/// rungs set the worst single-file case: GCC 14.3.0's generated insn-recog.cc /
+/// insn-automata.cc are multi-megabyte translation units, and gcc-mesboot 4.9.4
+/// (a 2015 compiler, itself unoptimized/static) compiles each in a single
+/// SILENT codegen pass — after the parse-time rtl.h warning there is no output
+/// until the .o lands. At the tail of `make -j`, when only those giants remain
+/// with nothing else to interleave output, a healthy build is legitimately
+/// silent well past 30 minutes (the previous bound false-killed it at 2187s on
+/// a shared box), and the heavier x86_64 stage2/native rungs recompile the same
+/// giants. 2 hours covers that under contention while still bounding a
+/// truly-wedged phase. No COUNT repeat bound (`tar xf` repeats a warning per
+/// member); the `repeat_secs` DURATION bound (5 min of the same line still
+/// arriving) is the #339 make-nested chatty-spin catch — comfortably above any
+/// real burst (a tar of a huge tarball finishes in a minute or two, its warning
+/// does not keep arriving for five straight minutes). The #292 CPU-spin class
+/// is a configure phenomenon caught far sooner by WATCH_CONFIGURE (600s), so
+/// widening this SILENT-make backstop does not weaken the spin catches. This
+/// bound tunes only WHEN a wedged phase is killed, never the bytes a completed
+/// phase emits, so it is NOT an output-affecting change and does NOT bump
+/// BUILDER_ABI (a healthy build produces identical output at any threshold).
 const WATCH_PHASE: Watch = Watch {
-    silence: Duration::from_secs(1800),
+    silence: Duration::from_secs(7200),
     repeat_limit: 0,
     repeat_secs: Duration::from_secs(300),
     drain_grace: Duration::from_secs(15),
