@@ -59,6 +59,62 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    // Detect the C++ front end without a non-terminal glob (same defect and fix as
+    // gcc-mesboot1/#501). GCC 4.9.4 discovers language fragments by globbing
+    // `.../*/config-lang.in` (a `*` in a NON-terminal path component) in both the
+    // top-level configure (two scan loops) and the gcc/ subdir configure (one scan
+    // loop plus its no-match guard). bash-mesboot (bash 2.05b on mes libc) returns
+    // a non-terminal glob unexpanded, so the loops match no fragments: the top
+    // level drops every non-C language ("The following requested languages could
+    // not be built: c++"), and gcc/configure omits the C++ makefile hookup. Unlike
+    // the trimmed 4.6.4 core+g++ tarball (cp + lto only), the pinned 4.9.4 source
+    // is a full release, so a working shell would expand these to all nine language
+    // fragments alphabetically; pre-expand to that exact set so detection never
+    // depends on the glob and matches a working shell verbatim. --enable-languages
+    // still selects only c,c++ from the discovered set.
+    steps.push(Step::substitute_text(
+        "{src}/configure",
+        vec![TextEdit::new(
+            "${srcdir}/gcc/*/config-lang.in",
+            "${srcdir}/gcc/ada/config-lang.in ${srcdir}/gcc/c/config-lang.in \
+             ${srcdir}/gcc/cp/config-lang.in ${srcdir}/gcc/fortran/config-lang.in \
+             ${srcdir}/gcc/go/config-lang.in ${srcdir}/gcc/java/config-lang.in \
+             ${srcdir}/gcc/lto/config-lang.in ${srcdir}/gcc/objc/config-lang.in \
+             ${srcdir}/gcc/objcp/config-lang.in",
+            2,
+        )],
+    ));
+    steps.push(Step::substitute_text(
+        "{src}/gcc/configure",
+        vec![TextEdit::new(
+            "${srcdir}/*/config-lang.in",
+            "${srcdir}/ada/config-lang.in ${srcdir}/c/config-lang.in \
+             ${srcdir}/cp/config-lang.in ${srcdir}/fortran/config-lang.in \
+             ${srcdir}/go/config-lang.in ${srcdir}/java/config-lang.in \
+             ${srcdir}/lto/config-lang.in ${srcdir}/objc/config-lang.in \
+             ${srcdir}/objcp/config-lang.in",
+            2,
+        )],
+    ));
+    // Run the automake dependency-style probe without `env` (same defect and fix
+    // as gcc-mesboot1). The probe runs each candidate depmode as `env $depcmd`, but
+    // the mesboot userland ships no `env` binary (coreutils-mesboot0 builds only
+    // live-bootstrap's curated subset, which omits it, and `env` is not a bash
+    // builtin), so every depmode exits 127, the probe finds none, and the macro's
+    // unconditional abort fires ("configure: error: no usable dependency style
+    // found") -- this automake variant has no --disable-dependency-tracking guard,
+    // so that flag cannot skip it. `eval` re-parses the $depcmd string so its
+    // leading VAR=VAL become real shell assignment prefixes (the exact effect `env`
+    // provided, using only a POSIX builtin), after which depmode `gcc` is selected.
+    // GCC 4.9.4 emits this probe in gcc/configure (the configure-gcc failure) and
+    // libcpp/configure, one occurrence each -- unlike 4.6.4, whose gcc/ subdir
+    // inlined the assignments and whose libcpp ran the probe twice (C + C++).
+    for cfg_with_env in ["{src}/gcc/configure", "{src}/libcpp/configure"] {
+        steps.push(Step::substitute_text(
+            cfg_with_env,
+            vec![TextEdit::new("env $depcmd", "eval \"$depcmd\"", 1)],
+        ));
+    }
     // Close the `tar` host-tool ingress in `make install`: config.build has no
     // i686-*-linux-gnu arm, so INSTALL_HEADERS_DIR defaults to
     // install-headers-tar (a `tar` pipeline); mesboot0 ships no tar. Repoint it
