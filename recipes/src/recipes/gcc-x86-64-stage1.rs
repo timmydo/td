@@ -1,4 +1,6 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{
+    gcc14_configure_fixups, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0 cross STAGE1 (#378 slice 4, guix's cross gcc stage1): C only,
@@ -58,6 +60,10 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    // Same bash-mesboot configure fixups as gcc-14 (this is the same GCC 14.3.0
+    // source configured under bash-mesboot). No libtool find fix: stage1 is
+    // --disable-libstdcxx (--enable-languages=c), so it builds no libstdc++.
+    steps.extend(gcc14_configure_fixups());
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });

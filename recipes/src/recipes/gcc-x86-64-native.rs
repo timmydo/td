@@ -1,4 +1,7 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{
+    gcc14_configure_fixups, libtool_extract_without_find, mesboot0_inputs, mesboot0_path,
+    unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0, NATIVE x86_64 (x86_64-toolchain rung X2, the port of the shell
@@ -113,6 +116,10 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    // Same bash-mesboot configure fixups as gcc-14, plus the libtool find fix so
+    // this stage's native x86_64 libstdc++.a is assembled complete (re #469).
+    steps.extend(gcc14_configure_fixups());
+    steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });

@@ -1,4 +1,7 @@
-use crate::ladder::{SH, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
+use crate::ladder::{
+    SH, gcc14_configure_fixups, libtool_extract_without_find, link_bins, mesboot0_inputs,
+    mesboot0_path, unpack_into, unpack_keep_top,
+};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0 — rung 18 (#378, guix's gcc-boot0/gcc-final version): gcc-mesboot
@@ -39,12 +42,28 @@ pub fn recipe() -> Recipe {
         ],
     });
     steps.push(link_bins("binutils-mesboot"));
-    // single-token static wrappers (see header): CC/CXX survive gcc's munging
-    for (name, real) in [("gcc", "gcc"), ("g++", "g++")] {
+    // single-token static wrappers (see header): CC/CXX survive gcc's munging.
+    // The g++ wrapper also appends -lsupc++ AFTER "$@". gcc-mesboot 4.9.4's
+    // libstdc++.a is a stub -- it was built --with-host-libstdcxx=-lsupc++
+    // --disable-build-with-cxx, so the supc++ runtime (operator new/delete,
+    // __cxa_pure_virtual, the __cxxabiv1 type_info vtables) lives only in
+    // libsupc++.a, not libstdc++.a. GCC 14 dropped --disable-build-with-cxx, so
+    // its build-side generator programs are unavoidably C++ and are linked with
+    // $(LINKER_FOR_BUILD) = $(CXX_FOR_BUILD) = this wrapper, whose g++ driver
+    // appends only -lstdc++ and leaves those symbols undefined (build/genenums
+    // &c.; binutils-mesboot 2.20.1a's old ld then also spews spurious "Dwarf
+    // Error: found dwarf version 4" noise as it reads 4.9.4's DWARF-4 to locate
+    // the failed refs -- gone once the refs resolve). Appending -lsupc++ last
+    // resolves them on every C++ link: both the host cc1plus (HOST_LIBS is empty
+    // here, so GCC links host C++ programs with $(CXX)) and the build gen tools.
+    // It is silently ignored on -c/-E compiles (verified), so a single always-on
+    // append is safe. CXX stays the single token {root}/wb/g++, so gcc's
+    // CXX_FOR_BUILD munging is unaffected.
+    for (name, real, tail) in [("gcc", "gcc", ""), ("g++", "g++", " -lsupc++")] {
         steps.push(Step::WriteFile {
             path: format!("{{root}}/wb/{name}"),
             content: format!(
-                "#!{SH}\nexec \"{{in:gcc-mesboot}}/bin/{real}\" -static -B{{in:glibc-mesboot}}/lib \"$@\"\n"
+                "#!{SH}\nexec \"{{in:gcc-mesboot}}/bin/{real}\" -static -B{{in:glibc-mesboot}}/lib \"$@\"{tail}\n"
             ),
             exec: true,
         });
@@ -53,6 +72,17 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    // GCC 14.3.0 configures under bash-mesboot: pre-expand the non-terminal
+    // `*/config-lang.in` globs and rewrite the `env $depcmd` dep-probe (shared
+    // helper -- same fixups every GCC 14.3.0 rung needs). --enable-languages
+    // still selects only c,c++.
+    steps.extend(gcc14_configure_fixups());
+    // Assemble this gcc's libstdc++.a WITHOUT `find` (re #469): the same libtool
+    // convenience-archive `find` that broke gcc-mesboot's libstdc++.a would break
+    // gcc-14's too, leaving it partial. gcc-14's i686 libstdc++ is what the C++
+    // build-side generator programs of gcc-x86-64-stage1/stage2/native link
+    // against (CXX_FOR_BUILD = this gcc-14 g++), so it must be complete.
+    steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });
