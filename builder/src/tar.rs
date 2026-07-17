@@ -143,18 +143,25 @@ pub fn extract_tar_reader<R: Read>(
     fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
     let mut pending_path: Option<PathBuf> = None;
     let mut pending_link: Option<PathBuf> = None;
+    // A pax extended ('x') header MUST be followed by an ordinary entry it
+    // describes. Unlike GNU 'L'/'K' this is tracked separately, because an 'x'
+    // header can carry only records we ignore (e.g. `mtime`) or an unset that
+    // leaves both name slots empty -- so a dangling 'x' at end-of-archive would
+    // otherwise pass unnoticed. A global ('g') header is archive-wide and does
+    // NOT require a following entry, so it never sets this.
+    let mut pending_extended = false;
     loop {
         let mut header = [0u8; BLOCK];
         match file.read_exact(&mut header) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                ensure_no_pending_long_name(&pending_path, &pending_link)?;
+                ensure_no_dangling_header(&pending_path, &pending_link, pending_extended)?;
                 break;
             }
             Err(e) => return Err(format!("read tar header from {source_name}: {e}")),
         }
         if header.iter().all(|b| *b == 0) {
-            ensure_no_pending_long_name(&pending_path, &pending_link)?;
+            ensure_no_dangling_header(&pending_path, &pending_link, pending_extended)?;
             break;
         }
         validate_header_checksum(&header)
@@ -207,12 +214,17 @@ pub fn extract_tar_reader<R: Read>(
                     format!("read pax extended header {}: {e}", entry.path.display())
                 })?;
                 apply_pax(&records, false, &mut pending_path, &mut pending_link)?;
+                pending_extended = true;
                 skip_padding(file, entry.size)
                     .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
                 continue;
             }
             _ => {}
         }
+        // An ordinary entry: it consumes any pax extended header that preceded
+        // it (only 'L'/'K'/'g'/'x' arms `continue` above, so reaching here means
+        // a real file/dir/link is being extracted).
+        pending_extended = false;
         if let Some(path) = pending_path.take() {
             if path.as_os_str().is_empty() {
                 return Err("GNU long name entry had an empty path".to_string());
@@ -503,15 +515,19 @@ fn has_parent_component(path: &Path) -> bool {
     path.components().any(|c| matches!(c, Component::ParentDir))
 }
 
-fn ensure_no_pending_long_name(
+fn ensure_no_dangling_header(
     pending_path: &Option<PathBuf>,
     pending_link: &Option<PathBuf>,
+    pending_extended: bool,
 ) -> Result<(), String> {
     if pending_path.is_some() {
         return Err("tar ended after GNU long name without a following entry".to_string());
     }
     if pending_link.is_some() {
         return Err("tar ended after GNU long link without a following entry".to_string());
+    }
+    if pending_extended {
+        return Err("tar ended after a pax extended header without a following entry".to_string());
     }
     Ok(())
 }
@@ -721,6 +737,12 @@ fn apply_pax(
             }
             b"path" if !global => set_or_clear(pending_path, value)?,
             b"linkpath" if !global => set_or_clear(pending_link, value)?,
+            // A global `path`/`linkpath` with an empty value is the pax "unset"
+            // directive: it installs no archive-wide default, so it is a no-op
+            // here (we retain no global naming state) rather than an error.
+            b"path" | b"linkpath" if value.is_empty() => {}
+            // A non-empty global `path`/`linkpath` is an archive-wide default we
+            // cannot faithfully apply per entry, so surface it.
             b"path" | b"linkpath" => {
                 return Err("pax global `path`/`linkpath` override is unsupported".to_string());
             }
@@ -1284,6 +1306,83 @@ mod tests {
         let err = extract_tar(&tar, &out).expect_err("pax path traversal should fail");
 
         assert!(err.contains("unsafe tar path"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_dangling_pax_extended_header_at_eof() {
+        // An 'x' header carrying only an ignored record (mtime) with no entry
+        // after it: a truncated archive must red, not silently succeed. The
+        // pending name slots stay empty here, so this is only caught by the
+        // separate pending-extended tracking.
+        let tmp = temp_dir("td-tar-pax-dangling-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &pax_record("mtime", "1700000000.0"));
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("dangling pax extended header should fail");
+
+        assert!(
+            err.contains("pax extended header without a following entry"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_empty_global_naming_unset() {
+        // A global `path=` with an empty value is the pax "unset" directive: a
+        // no-op that installs no archive-wide override, so it must NOT red (a
+        // non-empty global path/linkpath still does).
+        let tmp = temp_dir("td-tar-pax-global-unset-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'g', &pax_record("path", ""));
+        append_header(&mut bytes, "file", b'0', 0o644, 2, "");
+        append_data(&mut bytes, b"hi");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        extract_tar(&tar, &out).unwrap();
+
+        assert_eq!(fs::read(out.join("file")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn refuses_pax_non_numeric_length() {
+        let tmp = temp_dir("td-tar-pax-nan-len-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', b"XX path=y\n");
+        append_header(&mut bytes, "file", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"z");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("non-numeric pax length should fail");
+
+        assert!(err.contains("bad length"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_pax_record_missing_length_separator() {
+        // A record body with no space: the length/keyword separator is missing.
+        let tmp = temp_dir("td-tar-pax-nospace-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', b"12path=value\n");
+        append_header(&mut bytes, "file", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"z");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("missing length separator should fail");
+
+        assert!(err.contains("missing length separator"), "got: {err}");
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
