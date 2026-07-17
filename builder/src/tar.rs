@@ -181,6 +181,32 @@ pub fn extract_tar_reader<R: Read>(
                     .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
                 continue;
             }
+            EntryKind::PaxGlobal => {
+                // Archive-wide pax defaults — e.g. the `comment=<sha>` global
+                // header git-archive prepends to every tarball it makes. We
+                // apply none of them: path/linkpath are per-entry concerns, and
+                // the fields we honour (size/mode/mtime) come from each entry's
+                // own ustar header. Read past the record stream and move on.
+                skip_entry_data(file, entry.size).map_err(|e| {
+                    format!("skip pax global header {}: {e}", entry.path.display())
+                })?;
+                skip_padding(file, entry.size)
+                    .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
+                continue;
+            }
+            EntryKind::PaxExtended => {
+                // Per-entry pax overrides for the entry that follows. We honour
+                // `path`/`linkpath` (long or non-ASCII names — the pax analogue
+                // of GNU 'L'/'K'); other records (size/mtime/uid/...) are left to
+                // the following entry's ustar header.
+                let records = read_entry_bytes(file, entry.size).map_err(|e| {
+                    format!("read pax extended header {}: {e}", entry.path.display())
+                })?;
+                apply_pax_overrides(&records, &mut pending_path, &mut pending_link)?;
+                skip_padding(file, entry.size)
+                    .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
+                continue;
+            }
             _ => {}
         }
         if let Some(path) = pending_path.take() {
@@ -271,9 +297,12 @@ pub fn extract_tar_reader<R: Read>(
                 skip_entry_data(file, entry.size)
                     .map_err(|e| format!("skip {}: {e}", entry.path.display()))?;
             }
-            EntryKind::LongName | EntryKind::LongLink => {
+            EntryKind::LongName
+            | EntryKind::LongLink
+            | EntryKind::PaxGlobal
+            | EntryKind::PaxExtended => {
                 return Err(format!(
-                    "internal tar long-name state error at {}",
+                    "internal tar metadata-header state error at {}",
                     entry.path.display()
                 ));
             }
@@ -299,6 +328,11 @@ enum EntryKind {
     Symlink { target: PathBuf },
     LongName,
     LongLink,
+    // POSIX pax extended headers. `PaxExtended` (typeflag 'x') carries records
+    // that override the NEXT entry's fields; `PaxGlobal` (typeflag 'g') carries
+    // archive-wide defaults. Both have a record-stream body of `size` bytes.
+    PaxGlobal,
+    PaxExtended,
 }
 
 impl Entry {
@@ -336,6 +370,8 @@ impl Entry {
             },
             b'L' => EntryKind::LongName,
             b'K' => EntryKind::LongLink,
+            b'g' => EntryKind::PaxGlobal,
+            b'x' => EntryKind::PaxExtended,
             other => {
                 return Err(format!(
                     "unsupported tar entry type {} for {}",
@@ -426,10 +462,13 @@ fn validate_entry_size(entry: &Entry) -> Result<(), String> {
                 ));
             }
         }
-        EntryKind::LongName | EntryKind::LongLink => {
+        EntryKind::LongName
+        | EntryKind::LongLink
+        | EntryKind::PaxGlobal
+        | EntryKind::PaxExtended => {
             if entry.size > MAX_GNU_LONG_FIELD_BYTES {
                 return Err(format!(
-                    "GNU tar long-name field {} is too large: {} bytes exceeds {} byte limit",
+                    "tar metadata-header field {} is too large: {} bytes exceeds {} byte limit",
                     entry.path.display(),
                     entry.size,
                     MAX_GNU_LONG_FIELD_BYTES
@@ -599,6 +638,86 @@ fn skip_padding<R: Read>(reader: &mut R, size: u64) -> io::Result<()> {
     skip_entry_data(reader, pad)
 }
 
+/// Read a metadata-header body (a pax record stream) into memory verbatim —
+/// unlike `read_entry_string` it neither strips trailing NULs nor requires the
+/// whole body be UTF-8, since a pax stream is length-delimited records.
+/// `validate_entry_size` has already bounded `bytes` to `MAX_GNU_LONG_FIELD_BYTES`.
+fn read_entry_bytes<R: Read>(reader: &mut R, bytes: u64) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "tar pax header too large"))?;
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Apply the `path` and `linkpath` records of a pax extended header to the
+/// pending long-name/long-link slots that the next entry consumes. Records are
+/// `"<len> <key>=<value>\n"`, where `<len>` is the whole record's byte length
+/// including its own digits and the trailing newline. Records we do not model
+/// (size, mtime, uid, gid, uname, gname, comment, ...) are skipped; the
+/// following entry's ustar header supplies those fields. An empty value (a pax
+/// "unset" directive) leaves the ustar name in force. A malformed length or a
+/// record that overruns the buffer reds the unpack rather than mis-parsing.
+fn apply_pax_overrides(
+    records: &[u8],
+    pending_path: &mut Option<PathBuf>,
+    pending_link: &mut Option<PathBuf>,
+) -> Result<(), String> {
+    let mut pos = 0usize;
+    while let Some(rest) = records.get(pos..) {
+        if rest.is_empty() {
+            break;
+        }
+        let space = rest
+            .iter()
+            .position(|b| *b == b' ')
+            .ok_or_else(|| "pax record missing length separator".to_string())?;
+        let len_bytes = rest.get(..space).unwrap_or(&[]);
+        let len_str =
+            std::str::from_utf8(len_bytes).map_err(|_| "pax record length is not ascii".to_string())?;
+        let rec_len = len_str
+            .parse::<usize>()
+            .map_err(|_| format!("pax record has a bad length `{len_str}`"))?;
+        if rec_len <= space || pos + rec_len > records.len() {
+            return Err(format!(
+                "pax record length {rec_len} overruns the {}-byte header",
+                records.len()
+            ));
+        }
+        let record = records.get(pos..pos + rec_len).unwrap_or(&[]);
+        if record.last() != Some(&b'\n') {
+            return Err("pax record is not newline-terminated".to_string());
+        }
+        // Payload `<key>=<value>` sits between the length's space and the newline.
+        let kv = record.get(space + 1..rec_len - 1).unwrap_or(&[]);
+        if let Some(eq) = kv.iter().position(|b| *b == b'=') {
+            let key = kv.get(..eq).unwrap_or(&[]);
+            let value = kv.get(eq + 1..).unwrap_or(&[]);
+            match key {
+                b"path" => {
+                    let s = pax_value_string(value)?;
+                    if !s.is_empty() {
+                        *pending_path = Some(PathBuf::from(s));
+                    }
+                }
+                b"linkpath" => {
+                    let s = pax_value_string(value)?;
+                    if !s.is_empty() {
+                        *pending_link = Some(PathBuf::from(s));
+                    }
+                }
+                _ => {}
+            }
+        }
+        pos += rec_len;
+    }
+    Ok(())
+}
+
+fn pax_value_string(value: &[u8]) -> Result<String, String> {
+    String::from_utf8(value.to_vec()).map_err(|e| format!("pax value is not utf-8: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,7 +821,8 @@ mod tests {
 
         let err = extract_tar(&tar, &out).expect_err("oversized long name should fail");
 
-        assert!(err.contains("long-name field"), "got: {err}");
+        assert!(err.contains("metadata-header field"), "got: {err}");
+        assert!(err.contains("too large"), "got: {err}");
     }
 
     #[test]
@@ -913,6 +1033,88 @@ mod tests {
         assert!(err.contains("disagree on file vs directory"), "got: {err}");
     }
 
+    #[test]
+    fn extracts_pax_global_and_extended_headers() {
+        // The exact git-archive shape (glibc 2.16.0's source tarball is one):
+        // a leading `pax_global_header` carrying `comment=<sha>`, then ustar
+        // entries. Plus per-entry pax 'x' headers overriding a long `path` and a
+        // long symlink `linkpath` beyond the 100-byte ustar name fields.
+        let tmp = temp_dir("td-tar-pax-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_pax(
+            &mut bytes,
+            b'g',
+            &pax_record("comment", "0123456789abcdef0123456789abcdef01234567"),
+        );
+        append_header(&mut bytes, "README", b'0', 0o644, 5, "");
+        append_data(&mut bytes, b"hello");
+        let long_path = format!("glibc-2.16.0/{}/locale.c", "sysdeps/unix".repeat(10));
+        append_pax(&mut bytes, b'x', &pax_record("path", &long_path));
+        append_header(&mut bytes, "ustar-fallback", b'0', 0o644, 3, "");
+        append_data(&mut bytes, b"loc");
+        let long_target = format!("{}/libc.so", "a".repeat(120));
+        append_pax(&mut bytes, b'x', &pax_record("linkpath", &long_target));
+        append_header(&mut bytes, "libc-link", b'2', 0o777, 0, "placeholder");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        extract_tar(&tar, &out).unwrap();
+
+        // The global header was skipped and the plain entry landed under its name.
+        assert_eq!(fs::read(out.join("README")).unwrap(), b"hello");
+        // The pax `path` override won over the ustar "ustar-fallback" name.
+        assert_eq!(fs::read(out.join(&long_path)).unwrap(), b"loc");
+        assert!(!out.join("ustar-fallback").exists());
+        // The pax `linkpath` override won over the ustar "placeholder" target.
+        assert_eq!(
+            fs::read_link(out.join("libc-link")).unwrap(),
+            PathBuf::from(&long_target)
+        );
+    }
+
+    #[test]
+    fn refuses_oversized_pax_header_before_allocating() {
+        let tmp = temp_dir("td-tar-oversized-pax-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_header(
+            &mut bytes,
+            "pax_global_header",
+            b'g',
+            0o644,
+            MAX_GNU_LONG_FIELD_BYTES + 1,
+            "",
+        );
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("oversized pax header should fail");
+
+        assert!(err.contains("metadata-header field"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_malformed_pax_record_length() {
+        let tmp = temp_dir("td-tar-bad-pax-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        // A record whose declared length runs past the header body.
+        let bad = b"999 path=x\n".to_vec();
+        append_pax(&mut bytes, b'x', &bad);
+        append_header(&mut bytes, "file", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"y");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("bad pax record should fail");
+
+        assert!(err.contains("pax record length"), "got: {err}");
+    }
+
     fn temp_dir(prefix: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -943,6 +1145,25 @@ mod tests {
         out.extend_from_slice(value.as_bytes());
         out.push(0);
         pad(out);
+    }
+
+    // A pax header block (typeflag 'g' or 'x') followed by its record-stream body.
+    fn append_pax(out: &mut Vec<u8>, typeflag: u8, records: &[u8]) {
+        let size = u64::try_from(records.len()).unwrap();
+        append_header(out, "pax_header", typeflag, 0o644, size, "");
+        out.extend_from_slice(records);
+        pad(out);
+    }
+
+    // Build one `"<len> <key>=<value>\n"` pax record whose self-referential
+    // length field counts its own digits.
+    fn pax_record(key: &str, value: &str) -> Vec<u8> {
+        let fixed = key.len() + value.len() + 3; // ' ' + '=' + '\n'
+        let mut len = fixed + 1;
+        while len.to_string().len() + fixed != len {
+            len = len.to_string().len() + fixed;
+        }
+        format!("{len} {key}={value}\n").into_bytes()
     }
 
     fn long_field_len(value: &str) -> u64 {
