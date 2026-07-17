@@ -123,6 +123,34 @@ pub fn recipe() -> Recipe {
         "{src}/libcpp/configure",
         vec![TextEdit::new("env $depcmd", "eval \"$depcmd\"", 2)],
     ));
+    // Emit cl_options[].neg_index without asking gawk-mesboot0 to stringify a
+    // negative (fixes #515). gawk-mesboot0 is gawk 3.0.4 built by tcc, and tcc's
+    // general 64-bit constant fold bug (#491, the same class the HIDDEND_LL
+    // rewrite works around in tcc.rs) miscompiles gawk's number->string path:
+    // gawk stores every scalar as a C double, and converting a NEGATIVE double to
+    // its string form yields garbage (`printf "%s",-1` -> "0"; `int(-1)` -> 998),
+    // while the numeric value and integer comparisons stay correct. optc-gen.awk
+    // prints each option's neg_index with `printf(" %d,\n", idx)`; the 354
+    // non-negatable options carry idx=-1, which the buggy gawk writes as `0`. A
+    // neg_index of 0 (or self) turns the option into a self-cancelling cycle, so
+    // cc1's cancel_option() — which walks the neg_index chain to prune cancelled
+    // options — recurses forever and overflows the stack on EVERY real compile
+    // (xgcc always passes -dumpbase/-auxbase, which drives prune_options ->
+    // cancel_option). That was the segfault: cc1 ran standalone but died the
+    // instant the driver invoked it. Emit the literal `-1` for the only-negative
+    // case so the value never round-trips through gawk's broken double->string;
+    // the `idx < 0` test uses the intact numeric value, and non-negative indices
+    // keep the working `%d`. Verified: the patched script under gawk-mesboot0
+    // reproduces host awk's neg_index column byte-for-byte (354 `-1` entries).
+    // A proper root fix is tcc's #491 fold bug; that is a separate, larger change.
+    steps.push(Step::substitute_text(
+        "{src}/gcc/optc-gen.awk",
+        vec![TextEdit::new(
+            "printf(\" %d,\\n\", idx)",
+            "if (idx < 0) printf(\" -1,\\n\"); else printf(\" %d,\\n\", idx)",
+            1,
+        )],
+    ));
     steps.push(
         Step::run(
             "{src}",
