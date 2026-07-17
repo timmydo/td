@@ -184,12 +184,15 @@ pub fn extract_tar_reader<R: Read>(
             EntryKind::PaxGlobal => {
                 // Archive-wide pax defaults — e.g. the `comment=<sha>` global
                 // header git-archive prepends to every tarball it makes. We
-                // apply none of them: path/linkpath are per-entry concerns, and
-                // the fields we honour (size/mode/mtime) come from each entry's
-                // own ustar header. Read past the record stream and move on.
-                skip_entry_data(file, entry.size).map_err(|e| {
-                    format!("skip pax global header {}: {e}", entry.path.display())
+                // apply none of them (path/linkpath are per-entry concerns and
+                // size/mode/mtime come from each entry's own ustar header), but
+                // we still parse the stream so a global `size` or `path`/
+                // `linkpath` default we cannot faithfully honour reds the unpack
+                // rather than being silently ignored.
+                let records = read_entry_bytes(file, entry.size).map_err(|e| {
+                    format!("read pax global header {}: {e}", entry.path.display())
                 })?;
+                apply_pax(&records, true, &mut pending_path, &mut pending_link)?;
                 skip_padding(file, entry.size)
                     .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
                 continue;
@@ -197,12 +200,13 @@ pub fn extract_tar_reader<R: Read>(
             EntryKind::PaxExtended => {
                 // Per-entry pax overrides for the entry that follows. We honour
                 // `path`/`linkpath` (long or non-ASCII names — the pax analogue
-                // of GNU 'L'/'K'); other records (size/mtime/uid/...) are left to
-                // the following entry's ustar header.
+                // of GNU 'L'/'K'); other records (mtime/uid/...) are left to the
+                // following entry's ustar header, and a `size` override is
+                // rejected because ignoring it would desync the block stream.
                 let records = read_entry_bytes(file, entry.size).map_err(|e| {
                     format!("read pax extended header {}: {e}", entry.path.display())
                 })?;
-                apply_pax_overrides(&records, &mut pending_path, &mut pending_link)?;
+                apply_pax(&records, false, &mut pending_path, &mut pending_link)?;
                 skip_padding(file, entry.size)
                     .map_err(|e| format!("skip padding after {}: {e}", entry.path.display()))?;
                 continue;
@@ -650,16 +654,25 @@ fn read_entry_bytes<R: Read>(reader: &mut R, bytes: u64) -> io::Result<Vec<u8>> 
     Ok(buf)
 }
 
-/// Apply the `path` and `linkpath` records of a pax extended header to the
-/// pending long-name/long-link slots that the next entry consumes. Records are
-/// `"<len> <key>=<value>\n"`, where `<len>` is the whole record's byte length
-/// including its own digits and the trailing newline. Records we do not model
-/// (size, mtime, uid, gid, uname, gname, comment, ...) are skipped; the
-/// following entry's ustar header supplies those fields. An empty value (a pax
-/// "unset" directive) leaves the ustar name in force. A malformed length or a
+/// Apply the records of a pax header. Records are `"<len> <key>=<value>\n"`,
+/// where `<len>` is the whole record's byte length including its own digits and
+/// the trailing newline. For an extended header (`global == false`) we honour
+/// `path`/`linkpath` into the pending long-name/long-link slots the next entry
+/// consumes — the pax analogue of GNU 'L'/'K'. Records we do not model (mtime,
+/// uid, gid, uname, gname, comment, ...) are skipped; the following entry's
+/// ustar header supplies those fields.
+///
+/// Two records are rejected rather than ignored, because ignoring them would
+/// silently mis-extract: a `size` record overrides the following entry's byte
+/// count, so skipping it would desync the block stream for any file too large
+/// for the 12-byte ustar size field; and a `path`/`linkpath` in a *global*
+/// header (`global == true`) is an archive-wide default we cannot faithfully
+/// apply per entry. An empty value is the pax "unset" directive: it clears any
+/// pending name so the ustar header stays in force. A malformed length or a
 /// record that overruns the buffer reds the unpack rather than mis-parsing.
-fn apply_pax_overrides(
+fn apply_pax(
     records: &[u8],
+    global: bool,
     pending_path: &mut Option<PathBuf>,
     pending_link: &mut Option<PathBuf>,
 ) -> Result<(), String> {
@@ -678,7 +691,11 @@ fn apply_pax_overrides(
         let rec_len = len_str
             .parse::<usize>()
             .map_err(|_| format!("pax record has a bad length `{len_str}`"))?;
-        if rec_len <= space || pos + rec_len > records.len() {
+        // `rec_len` must cover at least "<len> =\n" and stay within the buffer.
+        // Written as `rec_len > records.len() - pos` (never `pos + rec_len`,
+        // which can wrap in debug builds when `rec_len` nears `usize::MAX`);
+        // `records.len() - pos` cannot underflow because `rest` is non-empty.
+        if rec_len <= space + 1 || rec_len > records.len() - pos {
             return Err(format!(
                 "pax record length {rec_len} overruns the {}-byte header",
                 records.len()
@@ -690,27 +707,39 @@ fn apply_pax_overrides(
         }
         // Payload `<key>=<value>` sits between the length's space and the newline.
         let kv = record.get(space + 1..rec_len - 1).unwrap_or(&[]);
-        if let Some(eq) = kv.iter().position(|b| *b == b'=') {
-            let key = kv.get(..eq).unwrap_or(&[]);
-            let value = kv.get(eq + 1..).unwrap_or(&[]);
-            match key {
-                b"path" => {
-                    let s = pax_value_string(value)?;
-                    if !s.is_empty() {
-                        *pending_path = Some(PathBuf::from(s));
-                    }
-                }
-                b"linkpath" => {
-                    let s = pax_value_string(value)?;
-                    if !s.is_empty() {
-                        *pending_link = Some(PathBuf::from(s));
-                    }
-                }
-                _ => {}
+        let eq = kv
+            .iter()
+            .position(|b| *b == b'=')
+            .ok_or_else(|| "pax record is missing '='".to_string())?;
+        let key = kv.get(..eq).unwrap_or(&[]);
+        let value = kv.get(eq + 1..).unwrap_or(&[]);
+        match key {
+            b"size" => {
+                return Err(
+                    "pax `size` override is unsupported (would desync the entry stream)".to_string(),
+                );
             }
+            b"path" if !global => set_or_clear(pending_path, value)?,
+            b"linkpath" if !global => set_or_clear(pending_link, value)?,
+            b"path" | b"linkpath" => {
+                return Err("pax global `path`/`linkpath` override is unsupported".to_string());
+            }
+            _ => {}
         }
         pos += rec_len;
     }
+    Ok(())
+}
+
+/// Set a pending long-name slot from a pax value, or clear it when the value is
+/// empty (the pax "unset" directive).
+fn set_or_clear(slot: &mut Option<PathBuf>, value: &[u8]) -> Result<(), String> {
+    let s = pax_value_string(value)?;
+    *slot = if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    };
     Ok(())
 }
 
@@ -1113,6 +1142,148 @@ mod tests {
         let err = extract_tar(&tar, &out).expect_err("bad pax record should fail");
 
         assert!(err.contains("pax record length"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_overflowing_pax_record_length() {
+        // A declared length near `usize::MAX` at a non-zero offset: the old
+        // `pos + rec_len` bound wrapped (a debug-build overflow panic). The
+        // overflow-safe `rec_len > records.len() - pos` reds it cleanly instead.
+        let tmp = temp_dir("td-tar-overflow-pax-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut records = pax_record("path", "ok");
+        records.extend_from_slice(format!("{} x=y\n", usize::MAX).as_bytes());
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &records);
+        append_header(&mut bytes, "file", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"y");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("overflowing pax length should fail");
+
+        assert!(err.contains("pax record length"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_pax_size_override() {
+        // A `size` record would override the following entry's byte count;
+        // ignoring it desyncs the block stream, so we reject rather than skip.
+        let tmp = temp_dir("td-tar-pax-size-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &pax_record("size", "999999"));
+        append_header(&mut bytes, "file", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"y");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("pax size override should fail");
+
+        assert!(err.contains("`size` override is unsupported"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_pax_global_naming_override() {
+        // A `path`/`linkpath` in a GLOBAL header is an archive-wide default we
+        // cannot faithfully apply per entry; surface it rather than mis-extract.
+        let tmp = temp_dir("td-tar-pax-global-name-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'g', &pax_record("path", "archive-wide"));
+        append_header(&mut bytes, "file", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"y");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("global naming override should fail");
+
+        assert!(err.contains("global `path`/`linkpath`"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_pax_record_missing_equals() {
+        let tmp = temp_dir("td-tar-pax-noeq-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', b"7 nope\n");
+        append_header(&mut bytes, "file", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"y");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("record without '=' should fail");
+
+        assert!(err.contains("missing '='"), "got: {err}");
+    }
+
+    #[test]
+    fn pax_empty_value_unsets_a_pending_name() {
+        // A `path` record followed by an empty `path=` (the pax "unset"
+        // directive) leaves the ustar name in force.
+        let tmp = temp_dir("td-tar-pax-unset-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut records = pax_record("path", "override-name");
+        records.extend_from_slice(&pax_record("path", ""));
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &records);
+        append_header(&mut bytes, "real-ustar-name", b'0', 0o644, 3, "");
+        append_data(&mut bytes, b"abc");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        extract_tar(&tar, &out).unwrap();
+
+        assert_eq!(fs::read(out.join("real-ustar-name")).unwrap(), b"abc");
+        assert!(!out.join("override-name").exists());
+    }
+
+    #[test]
+    fn extracts_pax_multi_record_extended_header() {
+        // One 'x' header carrying several records: an ignored `mtime`, then a
+        // `path` and a `linkpath` that both apply to the following symlink.
+        let tmp = temp_dir("td-tar-pax-multi-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut records = pax_record("mtime", "1700000000.0");
+        records.extend_from_slice(&pax_record("path", "long/sym/name"));
+        records.extend_from_slice(&pax_record("linkpath", "long/target/path"));
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &records);
+        append_header(&mut bytes, "ustar-sym", b'2', 0o777, 0, "placeholder");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        extract_tar(&tar, &out).unwrap();
+
+        assert_eq!(
+            fs::read_link(out.join("long/sym/name")).unwrap(),
+            PathBuf::from("long/target/path")
+        );
+    }
+
+    #[test]
+    fn refuses_pax_path_traversal() {
+        // A pax `path` override runs through the same safe_join guard as a
+        // ustar name, so `../escape` is refused.
+        let tmp = temp_dir("td-tar-pax-traversal-test");
+        let tar = tmp.join("test.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_pax(&mut bytes, b'x', &pax_record("path", "../escape"));
+        append_header(&mut bytes, "innocent", b'0', 0o644, 1, "");
+        append_data(&mut bytes, b"z");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        let err = extract_tar(&tar, &out).expect_err("pax path traversal should fail");
+
+        assert!(err.contains("unsafe tar path"), "got: {err}");
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
