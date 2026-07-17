@@ -42,9 +42,16 @@ pub fn recipe() -> Recipe {
             // (the #515 gcc-mesboot1 segfault; GCC 4.9.4 has the identical
             // generator, #517). Use gawk-mesboot 3.1.8 instead: it is built by
             // gcc-mesboot1, not tcc, so it lacks the fold bug, and it is already
-            // in this closure (glibc-mesboot builds with it). Same choice glibc
-            // makes; removes the exposure rather than patching around it.
+            // in this closure (glibc-mesboot builds with it).
+            //
+            // BOTH `awk` and `gawk` must point at it: GCC's configure resolves
+            // AWK via autoconf AC_PROG_AWK = AC_CHECK_PROGS([AWK],[gawk mawk
+            // nawk awk]), which PREFERS `gawk`, and mesboot0_path() still carries
+            // {in:gawk-mesboot0}/bin, so a `gawk`-only-missing ToolFarm would let
+            // the options.c rule run under the buggy 3.0.4 anyway. glibc-mesboot
+            // links both names for exactly this reason; mirror it.
             ("awk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
+            ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
         ],
     });
     steps.push(link_bins("binutils-mesboot"));
