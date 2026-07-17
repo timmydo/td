@@ -1,5 +1,6 @@
 use crate::ladder::{
-    gcc14_configure_fixups, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+    gcc14_configure_fixups, gcc_disable_selftest, mesboot0_inputs, mesboot0_path, unpack_into,
+    unpack_keep_top, SH,
 };
 use crate::types::{Recipe, Step};
 
@@ -42,7 +43,8 @@ pub fn recipe() -> Recipe {
     ));
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            ("awk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
+            ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
@@ -64,6 +66,7 @@ pub fn recipe() -> Recipe {
     // source configured under bash-mesboot). No libtool find fix: stage1 is
     // --disable-libstdcxx (--enable-languages=c), so it builds no libstdc++.
     steps.extend(gcc14_configure_fixups());
+    steps.push(gcc_disable_selftest());
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });
@@ -152,6 +155,7 @@ pub fn recipe() -> Recipe {
             "glibc-mesboot",
             "binutils-x86-64",
             "binutils-244",
+            "gawk-mesboot",
             "make-mesboot",
         ])
         .inputs_owned(mesboot0_inputs(&[

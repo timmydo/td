@@ -246,6 +246,17 @@ mod tests {
         );
         assert_eq!(recipe_checks(&busybox, None).len(), 1);
 
+        let gcc_bridge = catalog::lookup("gcc-10-bridge-test").unwrap();
+        assert_eq!(
+            recipe_checks(&gcc_bridge, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&gcc_bridge, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&gcc_bridge, None).len(), 1);
+
         let x86_cross = catalog::lookup("gcc-x86-64-stage2-test").unwrap();
         assert_eq!(
             recipe_checks(&x86_cross, Some(td_recipe::types::CheckTier::Pr)).len(),
@@ -292,6 +303,7 @@ mod tests {
             ("make-test", 1),
             ("busybox-test", 1),
             ("rust-toolchain", 1),
+            ("gcc-10-bridge-test", 1),
             ("gcc-x86-64-stage2-test", 1),
             ("gcc-x86-64-native-test", 1),
             ("gcc-x86-64-self-test", 1),
@@ -324,8 +336,9 @@ mod tests {
         // cycle-breaker, re #469) + m4-1.4.19 (the glibc-rung `bison`
         // provider's macro processor, re #469) + bison-3.8.2 (the glibc-rung
         // parser generator, re #469) + Python-3.11.1 (the glibc-rung python3,
-        // re #469).
-        assert_eq!(pins.len(), 43);
+        // re #469) + GCC 10.5.0 (the compatibility bridge between
+        // gcc-mesboot 4.9.4 and GCC 14.3.0).
+        assert_eq!(pins.len(), 44);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));

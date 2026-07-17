@@ -110,6 +110,17 @@ const PINS: &[PinDef] = &[
         file: "grep-2.4.tar.gz",
     },
     PinDef {
+        key: "gcc-10-bridge-source",
+        aliases: &[],
+        // GCC 10.5.0 is the compatibility bridge from gcc-mesboot 4.9.4 to
+        // GCC 14.3.0. live-bootstrap uses the same release between GCC 4.7.4
+        // and its current compiler; keeping it as a declared fixed-output
+        // source makes the extra trust/provenance edge explicit and offline.
+        url: "https://ftp.gnu.org/gnu/gcc/gcc-10.5.0/gcc-10.5.0.tar.xz",
+        sha256: "25109543fdf46f397c347b5d8b7a2c7e5694a5a51cce4b9c6e1ea8a71ca307c1",
+        file: "gcc-10.5.0.tar.xz",
+    },
+    PinDef {
         key: "gcc-14-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/gcc/gcc-14.3.0/gcc-14.3.0.tar.xz",
@@ -397,8 +408,9 @@ mod tests {
         // diffutils-2.7 (the tcc-era `diffutils` cycle-breaker, re #469) +
         // m4-1.4.19 (the glibc-rung `bison` provider's macro processor, re #469) +
         // bison-3.8.2 (the glibc-rung parser generator, re #469) +
-        // Python-3.11.1 (the glibc-rung python3, re #469).
-        assert_eq!(all().len(), 43);
+        // Python-3.11.1 (the glibc-rung python3, re #469) + GCC 10.5.0 (the
+        // compatibility bridge between gcc-mesboot 4.9.4 and GCC 14.3.0).
+        assert_eq!(all().len(), 44);
     }
 
     #[test]

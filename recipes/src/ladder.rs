@@ -179,27 +179,24 @@ pub fn libtool_extract_without_find(ltmain: &str) -> Step {
     )
 }
 
-/// The bash-mesboot `configure` fixups EVERY GCC 14.3.0 rung needs before its
+/// The bash-mesboot `configure` fixups every modern GCC rung needs before its
 /// `configure` runs (re #469). bash 2.05b (mes libc) cannot expand the
 /// non-terminal `*/config-lang.in` globs configure uses to discover language
 /// front-ends, and its automake dependency-style probe runs each depmode as
 /// `env $depcmd` but the mesboot userland ships no `env` (so every depmode exits
-/// 127 and the probe aborts with "no usable dependency style found"). Pre-expand
-/// both globs to GCC 14.3.0's twelve actual fragments (a working shell's
-/// expansion verbatim) and rewrite the probe to the POSIX builtin `eval
-/// "$depcmd"`. `--enable-languages` still selects only what each rung asks for.
-/// Identical across gcc-14 and every gcc-x86-64 stage (same tarball, same
-/// configure bytes), so the counts fail-closed if a future source bump drifts.
-pub fn gcc14_configure_fixups() -> Vec<Step> {
-    const LANGS: [&str; 12] = [
-        "ada", "c", "cp", "d", "fortran", "go", "jit", "lto", "m2", "objc", "objcp", "rust",
-    ];
-    let top = LANGS
+/// 127 and the probe aborts with "no usable dependency style found"). `LANGS`
+/// is the exact, sorted set of language fragments shipped by the selected GCC
+/// tarball. Pre-expand both globs to that set (a working shell's expansion
+/// verbatim) and rewrite the probe to the POSIX builtin `eval "$depcmd"`.
+/// `--enable-languages` still selects only what each rung asks for. The edit
+/// counts fail-closed if a future source bump drifts.
+pub fn gcc_configure_fixups(langs: &[&str]) -> Vec<Step> {
+    let top = langs
         .iter()
         .map(|l| format!("${{srcdir}}/gcc/{l}/config-lang.in"))
         .collect::<Vec<_>>()
         .join(" ");
-    let gcc = LANGS
+    let gcc = langs
         .iter()
         .map(|l| format!("${{srcdir}}/{l}/config-lang.in"))
         .collect::<Vec<_>>()
@@ -222,6 +219,30 @@ pub fn gcc14_configure_fixups() -> Vec<Step> {
             vec![TextEdit::new("env $depcmd", "eval \"$depcmd\"", 1)],
         ),
     ]
+}
+
+/// GCC 14.3.0 ships twelve language fragments. Every GCC 14 rung uses the same
+/// release tarball, so this wrapper keeps their call sites declarative while the
+/// shared implementation also serves the GCC 10.5.0 bridge.
+pub fn gcc14_configure_fixups() -> Vec<Step> {
+    gcc_configure_fixups(&[
+        "ada", "c", "cp", "d", "fortran", "go", "jit", "lto", "m2", "objc", "objcp", "rust",
+    ])
+}
+
+/// Disable GCC's build-host signal-name self-test. The bootstrap libc's
+/// `sys_siglist` is deliberately a stub, so executing this development-only
+/// diagnostic crashes even when the compiler itself is sound. Installed
+/// compiler behavior is covered by rung-specific checks and downstream builds.
+pub fn gcc_disable_selftest() -> Step {
+    Step::substitute_text(
+        "{src}/gcc/Makefile.in",
+        vec![TextEdit::new(
+            "all.internal: start.encap rest.encap doc selftest",
+            "all.internal: start.encap rest.encap doc",
+            1,
+        )],
+    )
 }
 
 #[cfg(test)]
@@ -259,9 +280,7 @@ mod tests {
                 .iter()
                 .flat_map(|(a, b)| [a.as_str(), b.as_str()])
                 .collect(),
-            Step::SubstituteText { edits, .. } => {
-                edits.iter().map(|e| e.to.as_str()).collect()
-            }
+            Step::SubstituteText { edits, .. } => edits.iter().map(|e| e.to.as_str()).collect(),
             _ => Vec::new(),
         }
     }
