@@ -34,7 +34,17 @@ pub fn recipe() -> Recipe {
             ("cpp".into(), "{in:gcc-mesboot1}/bin/cpp".into()),
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
-            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            // awk regenerates gcc/options.c via optc-gen.awk. gawk-mesboot0
+            // (GNU Awk 3.0.4) is tcc-built and miscompiles its double->string
+            // path for negatives (tcc 64-bit fold bug, #491), writing the 354
+            // non-negatable options' neg_index of -1 as 0 -- a self-cycle that
+            // makes cc1's cancel_option() recurse until the stack overflows
+            // (the #515 gcc-mesboot1 segfault; GCC 4.9.4 has the identical
+            // generator, #517). Use gawk-mesboot 3.1.8 instead: it is built by
+            // gcc-mesboot1, not tcc, so it lacks the fold bug, and it is already
+            // in this closure (glibc-mesboot builds with it). Same choice glibc
+            // makes; removes the exposure rather than patching around it.
+            ("awk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
         ],
     });
     steps.push(link_bins("binutils-mesboot"));
@@ -151,6 +161,7 @@ pub fn recipe() -> Recipe {
             "binutils-mesboot",
             "gcc-mesboot1",
             "glibc-mesboot",
+            "gawk-mesboot",
         ])
         .inputs_owned(mesboot0_inputs(&["gmp", "mpfr", "mpc", "linux-headers"]))
         .steps(steps)
