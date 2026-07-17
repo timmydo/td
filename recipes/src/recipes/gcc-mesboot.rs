@@ -34,7 +34,24 @@ pub fn recipe() -> Recipe {
             ("cpp".into(), "{in:gcc-mesboot1}/bin/cpp".into()),
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
             ("patch".into(), "{in:patch-mesboot}/bin/patch".into()),
-            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            // awk regenerates gcc/options.c via optc-gen.awk. gawk-mesboot0
+            // (GNU Awk 3.0.4) is tcc-built and miscompiles its double->string
+            // path for negatives (tcc 64-bit fold bug, #491), writing the 354
+            // non-negatable options' neg_index of -1 as 0 -- a self-cycle that
+            // makes cc1's cancel_option() recurse until the stack overflows
+            // (the #515 gcc-mesboot1 segfault; GCC 4.9.4 has the identical
+            // generator, #517). Use gawk-mesboot 3.1.8 instead: it is built by
+            // gcc-mesboot1, not tcc, so it lacks the fold bug, and it is already
+            // in this closure (glibc-mesboot builds with it).
+            //
+            // BOTH `awk` and `gawk` must point at it: GCC's configure resolves
+            // AWK via autoconf AC_PROG_AWK = AC_CHECK_PROGS([AWK],[gawk mawk
+            // nawk awk]), which PREFERS `gawk`, and mesboot0_path() still carries
+            // {in:gawk-mesboot0}/bin, so a `gawk`-only-missing ToolFarm would let
+            // the options.c rule run under the buggy 3.0.4 anyway. glibc-mesboot
+            // links both names for exactly this reason; mirror it.
+            ("awk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
+            ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
         ],
     });
     steps.push(link_bins("binutils-mesboot"));
@@ -151,6 +168,7 @@ pub fn recipe() -> Recipe {
             "binutils-mesboot",
             "gcc-mesboot1",
             "glibc-mesboot",
+            "gawk-mesboot",
         ])
         .inputs_owned(mesboot0_inputs(&["gmp", "mpfr", "mpc", "linux-headers"]))
         .steps(steps)
