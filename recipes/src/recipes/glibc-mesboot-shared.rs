@@ -46,6 +46,21 @@ pub fn recipe() -> Recipe {
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
+    // Host-gzip-free locale charmap install (re #469), the same fix glibc-mesboot0
+    // and glibc-mesboot carry. This shared build runs the identical glibc 2.16.0
+    // `make install`, whose localedata/Makefile installs each charmap uncompressed
+    // to its raw name ($(INSTALL_DATA) $< $(@:.gz=)) then `gzip -9n`-s it onto the
+    // `.gz` target. td ships no gzip executable (the builder decompresses
+    // in-process), so drop the compress step to a no-op: the charmap stays under
+    // its raw, unsuffixed name, which glibc's charmap_open reads directly, and the
+    // `.gz` make target is bookkeeping only. Do NOT install raw bytes under the
+    // `.gz` suffix -- localedef's charmap-dir.c treats `.gz` as gzip and would
+    // spawn gzip to decode it, a malformed output. The bootstrap never reads these
+    // charmaps.
+    steps.push(Step::substitute_text(
+        "{src}/localedata/Makefile",
+        vec![TextEdit::new("\tgzip -9n $(@:.gz=)", "\ttrue", 1)],
+    ));
     // csu/Makefile's version-info.h banner rule shells out to host uname/date
     // and can read /proc/version; coreutils-mesboot0 ships no uname/date, so pin
     // all three to deterministic tool-free values (re #469). Kernel version
