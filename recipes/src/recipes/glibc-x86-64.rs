@@ -2,7 +2,7 @@ use crate::ladder::{
     SH, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i, unpack_into,
     unpack_keep_top,
 };
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, Step, TextEdit};
 
 // glibc 2.41 for x86_64 (#378 slice 4, guix's cross glibc): the MODERN shared
 // libc, cross-compiled by the stage1 cross-gcc. CC = x86_64-pc-linux-gnu-gcc
@@ -68,6 +68,20 @@ pub fn recipe() -> Recipe {
     steps.push(sed_i(
         "s|subprocess\\.check_call(cmd, shell=True)|subprocess.check_call(cmd, shell=True, executable=\"{in:bash-mesboot}/bin/bash\")|g",
         &["scripts/glibcextract.py"],
+    ));
+    // Host-gzip-free locale charmap install (re #469), the same fix the mesboot
+    // glibc rungs carry. localedata/Makefile installs each charmap uncompressed to
+    // its raw name ($(INSTALL_DATA) $< $(@:.gz=)) then `gzip -9n`-s it onto the
+    // `.gz` target. td ships no gzip executable (the builder decompresses
+    // in-process), so drop the compress step to a no-op: the charmap stays under
+    // its raw, unsuffixed name, which glibc's charmap_open reads directly, and the
+    // `.gz` make target is bookkeeping only. glibc 2.41's rule is byte-identical to
+    // 2.16.0's (`gzip -9n $(@:.gz=)`, one occurrence). Do NOT install raw bytes
+    // under the `.gz` suffix -- localedef treats `.gz` as gzip. Charmaps are never
+    // read during the bootstrap.
+    steps.push(Step::substitute_text(
+        "{src}/localedata/Makefile",
+        vec![TextEdit::new("\tgzip -9n $(@:.gz=)", "\ttrue", 1)],
     ));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
