@@ -1,61 +1,271 @@
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
 use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
+use crate::sha256::Sha256;
+
+const GCC_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64-self";
+const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     runner.prepare_recipe_target("rust-toolchain")?;
     let build_out = runner.build_plan("rust-toolchain")?;
     let rust_tree = runner.ladder_out_from(&build_out, "rust-toolchain")?;
+    let stage0_tree = runner.ladder_out_from(&build_out, "rust-stage0")?;
+    let gcc_tree = runner.ladder_out_from(&build_out, "gcc-x86-64-self")?;
+    let binutils_tree = runner.ladder_out_from(&build_out, "binutils-x86-64-self")?;
+    let glibc_tree = runner.ladder_out_from(&build_out, "glibc-x86-64")?;
+    let busybox_tree = runner.ladder_out_from(&build_out, "busybox-x86-64")?;
     println!(
-        "   [ladder] x86_64 rust-toolchain via build-plan --auto: catalog dependency closure -> rust-toolchain (relinked rustc/cargo tree {})",
+        "   [ladder] x86_64 Rust bridge via build-plan --auto: exact stage0 snapshot -> source-built rustc/std/Cargo ({})",
         rust_tree.display()
     );
-    let rustc = rust_tree.join("bin/rustc");
-    let cargo = rust_tree.join("bin/cargo");
-    if !is_executable(&rustc) {
-        return Err(format!(
-            "rustc missing from rust-toolchain output ({})",
-            rustc.display()
-        ));
+    for binary in ["rustc", "rustdoc", "cargo"] {
+        let path = rust_tree.join("bin").join(binary);
+        if !is_executable(&path) {
+            return Err(format!(
+                "{binary} missing from rust-toolchain output ({})",
+                path.display()
+            ));
+        }
     }
-    if !is_executable(&cargo) {
-        return Err(format!(
-            "cargo missing from rust-toolchain output ({})",
-            cargo.display()
-        ));
-    }
-    let rbase = rust_tree
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| {
-            format!(
-                "malformed rust-toolchain output path {}",
-                rust_tree.display()
-            )
-        })?;
-    let rpath = format!("{TD_STORE_DIR}/{rbase}");
+
+    reject_stage0_artifacts(&stage0_tree, &rust_tree)?;
+    reject_shared_llvm(&rust_tree)?;
+
+    let rust_base = path_basename(&rust_tree)?;
+    let gcc_base = path_basename(&gcc_tree)?;
+    let binutils_base = path_basename(&binutils_tree)?;
+    let glibc_base = path_basename(&glibc_tree)?;
+    let busybox_base = path_basename(&busybox_tree)?;
+    let rust_path = format!("{TD_STORE_DIR}/{rust_base}");
+    let gcc_path = format!("{TD_STORE_DIR}/{gcc_base}/{GCC_STAGE}");
+    let binutils_path = format!("{TD_STORE_DIR}/{binutils_base}/bin");
+    let glibc_path = format!("{TD_STORE_DIR}/{glibc_base}/{GLIBC_STAGE}");
+    let busybox_path = format!("{TD_STORE_DIR}/{busybox_base}/bin/busybox");
+
     let rustc_version =
-        runner.store_ns_output(&[&format!("{rpath}/bin/rustc"), "--version"], None)?;
+        runner.store_ns_output(&[&format!("{rust_path}/bin/rustc"), "--version"], None)?;
     if !rustc_version.starts_with("rustc 1.96.0") {
         return Err(format!(
             "rustc version did not match the pinned 1.96.0 release: {}",
             rustc_version.trim()
         ));
     }
-    runner.store_ns_output(&[&format!("{rpath}/bin/cargo"), "--version"], None)?;
-    runner.store_ns_output(
-        &[
-            &format!("{rpath}/bin/rustc"),
-            "--crate-name",
-            "td_rust_smoke",
-            "--crate-type=lib",
-            "--edition=2021",
-            "-",
-            "-o",
-            "/tmp/librust_smoke.rlib",
-        ],
-        Some("pub fn td_rust_smoke() -> u32 { 42 }\n"),
-    )?;
+    let cargo_version =
+        runner.store_ns_output(&[&format!("{rust_path}/bin/cargo"), "--version"], None)?;
+    if !cargo_version.starts_with("cargo 1.96.0") {
+        return Err(format!(
+            "Cargo version did not match the source-built 1.96.0 release: {}",
+            cargo_version.trim()
+        ));
+    }
+
+    let smoke = format!(
+        "set -eu\n\
+         test ! -e /gnu/store\n\
+         printf '%s\\n' 'fn main() {{ println!(\"42\"); }}' >/tmp/td-rust-smoke.rs\n\
+         '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs \
+           -C linker={gcc_path}/bin/gcc \
+           -C link-arg=-B{binutils_path}/ \
+           -C link-arg=-B{glibc_path}/lib \
+           -C link-arg=-L{glibc_path}/lib \
+           -C link-arg=-static-libgcc \
+           -C link-arg=-Wl,--dynamic-linker,{glibc_path}/lib/ld-linux-x86-64.so.2 \
+           -C link-arg=-Wl,--enable-new-dtags \
+           -C link-arg=-Wl,-rpath,{glibc_path}/lib \
+           -o /tmp/td-rust-smoke\n\
+         test \"$(/tmp/td-rust-smoke)\" = 42\n\
+         printf '%s\\n' RUST-BRIDGE-OK\n"
+    );
+    let smoke_out = runner.store_ns_output(&[&busybox_path, "sh", "-c", &smoke], None)?;
+    if !smoke_out.lines().any(|line| line == "RUST-BRIDGE-OK") {
+        return Err(format!(
+            "source-built stage2 executable did not complete its td-native smoke test: {}",
+            smoke_out.trim()
+        ));
+    }
     println!(
-        "PASS: rust-toolchain: Rust 1.96.0 relinked onto /td/store runs rustc/cargo and compiles a simple library"
+        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo contain no stage0 artifacts and compile, link, and run against td GCC/glibc with /gnu/store absent"
     );
     Ok(())
+}
+
+fn path_basename(path: &Path) -> Result<&str, String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("path has no UTF-8 basename: {}", path.display()))
+}
+
+/// Reject both direct references to the stage0 store path and byte-for-byte copies
+/// of compiled stage0 artifacts. Text/debugger helpers may legitimately be
+/// reproduced from the same Rust source, so the equality oracle is deliberately
+/// scoped to executables and compiler/linker artifacts.
+fn reject_stage0_artifacts(stage0: &Path, final_tree: &Path) -> Result<(), String> {
+    let stage0_base = path_basename(stage0)?.as_bytes();
+    let mut stage0_hashes = HashMap::new();
+    for path in regular_files(stage0)? {
+        let meta = fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if is_compiled_artifact(&path, &meta) {
+            stage0_hashes.insert(hash_file(&path)?, path);
+        }
+    }
+    for path in tree_entries(final_tree)? {
+        let meta =
+            fs::symlink_metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            let target =
+                fs::read_link(&path).map_err(|e| format!("readlink {}: {e}", path.display()))?;
+            if target
+                .as_os_str()
+                .as_encoded_bytes()
+                .windows(stage0_base.len())
+                .any(|part| part == stage0_base)
+            {
+                return Err(format!(
+                    "final Rust toolchain symlink {} references rust-stage0 ({})",
+                    path.display(),
+                    target.display()
+                ));
+            }
+        } else if meta.is_file() {
+            if file_contains(&path, stage0_base)? {
+                return Err(format!(
+                    "final Rust toolchain file {} contains the rust-stage0 store basename",
+                    path.display()
+                ));
+            }
+            let digest = hash_file(&path)?;
+            if let Some(source) = stage0_hashes.get(&digest) {
+                return Err(format!(
+                    "final Rust toolchain copied compiled stage0 artifact {} byte-for-byte as {}",
+                    source.display(),
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_shared_llvm(root: &Path) -> Result<(), String> {
+    for path in tree_entries(root)? {
+        let name = path
+            .file_name()
+            .and_then(|part| part.to_str())
+            .unwrap_or("");
+        if name.starts_with("libLLVM") && name.contains(".so") {
+            return Err(format!(
+                "final Rust toolchain contains shared/prebuilt LLVM artifact {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_compiled_artifact(path: &Path, meta: &fs::Metadata) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|part| part.to_str())
+        .unwrap_or("");
+    meta.permissions().mode() & 0o111 != 0
+        || name.ends_with(".rlib")
+        || name.ends_with(".a")
+        || name.ends_with(".o")
+        || name.ends_with(".so")
+        || name.contains(".so.")
+}
+
+fn regular_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for path in tree_entries(root)? {
+        let meta =
+            fs::symlink_metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if meta.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn tree_entries(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let mut children = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| format!("read dir {}: {e}", dir.display()))? {
+            children.push(
+                entry
+                    .map_err(|e| format!("read dir {} entry: {e}", dir.display()))?
+                    .path(),
+            );
+        }
+        children.sort();
+        for path in children {
+            let meta =
+                fs::symlink_metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+            if meta.is_dir() {
+                pending.push(path.clone());
+            }
+            entries.push(path);
+        }
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+fn hash_file(path: &Path) -> Result<[u8; 32], String> {
+    let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let len = file
+            .read(buffer.as_mut_slice())
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        if len == 0 {
+            break;
+        }
+        let bytes = buffer
+            .get(..len)
+            .ok_or_else(|| format!("invalid read length {len} for {}", path.display()))?;
+        hasher.update(bytes);
+    }
+    Ok(hasher.finalize())
+}
+
+fn file_contains(path: &Path, needle: &[u8]) -> Result<bool, String> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+    let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut carry = Vec::new();
+    loop {
+        let len = file
+            .read(buffer.as_mut_slice())
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        if len == 0 {
+            break;
+        }
+        let bytes = buffer
+            .get(..len)
+            .ok_or_else(|| format!("invalid read length {len} for {}", path.display()))?;
+        let mut scan = Vec::with_capacity(carry.len() + bytes.len());
+        scan.extend_from_slice(&carry);
+        scan.extend_from_slice(bytes);
+        if scan.windows(needle.len()).any(|part| part == needle) {
+            return Ok(true);
+        }
+        let keep = needle.len().saturating_sub(1).min(scan.len());
+        carry.clear();
+        if let Some(tail) = scan.get(scan.len().saturating_sub(keep)..) {
+            carry.extend_from_slice(tail);
+        }
+    }
+    Ok(false)
 }

@@ -250,9 +250,12 @@ int main(void) {
 
 fn cxx_probe_source() -> &'static str {
     r#"#include <unistd.h>
+#include <mutex>
 #include <vector>
 
 int main(void) {
+    std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
     std::vector<int> values;
     for (int i = 0; i < 64; ++i) {
         values.push_back(i);

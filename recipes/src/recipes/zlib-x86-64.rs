@@ -1,12 +1,11 @@
 use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, SH};
 use crate::types::{Recipe, Step};
 
-// zlib 1.3.1 for x86_64 (#410): the shared libz.so.1 the /td/store Rust toolchain needs
-// at RUN time — the upstream rustc's libLLVM.so dynamically NEEDs libz.so.1 (LLVM
-// compresses with zlib), but the /td/store x86_64 toolchain (glibc 2.41 + cross gcc
-// 14.3.0) ships no zlib. Built FROM SOURCE by the cross gcc 14.3.0 vs the /td/store x86_64
-// glibc 2.41 (from-source, not a guix package, not a binary → no guix bytes), so
-// `rust-toolchain` can co-locate a td-built libz.so.1 instead of a gate-interned one.
+// zlib 1.3.1 for x86_64 (#410): the shared libz.so.1 needed by the downloaded
+// Rust stage0 snapshot's prebuilt LLVM. The /td/store x86_64 toolchain (glibc
+// 2.41 + cross gcc 14.3.0) otherwise ships no zlib. `rust-stage0` co-locates this
+// source-built soname in its explicit bootstrap trust-root closure; the shipped
+// source-built stage2 LLVM is configured without zlib.
 //
 // This is the recipe port of the shell `build_zlib_x86_64` that lived in the gate-416
 // script (tests/rust-x86_64-runtime-store-native.sh), retired with #410: CC is a wrapper around the cross gcc
@@ -16,7 +15,7 @@ use crate::types::{Recipe, Step};
 // required (the shell path needed one only because it built against the header-less FETCHED
 // glibc closure). AR/RANLIB are the cross binutils. Produces
 // {out}/stage/td/store/zlib-1.3.1/lib/libz.so.1.3.1 + the libz.so.1 soname link — exactly the
-// soname `rust-toolchain`'s transform co-locates. native_inputs: gcc-x86-64-stage2 (the cross
+// soname `rust-stage0`'s transform co-locates. native_inputs: gcc-x86-64-stage2 (the cross
 // CC + its libgcc), glibc-x86-64 (headers+libs), binutils-x86-64 (ar/ranlib + the as/ld the
 // cross gcc's baked --with-as/--with-ld resolve to).
 // Host-free build tools: mesboot0 + make-mesboot. re #469.

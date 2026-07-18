@@ -3702,12 +3702,10 @@ fn assemble_recipe_drv(
         // mesboot: the bootstrap-RUNG executor (build::run_mesboot, #378 slices
         // 2+3) — the recipe's typed steps run in the sandbox over staged inputs.
         "mesboot" => "mesboot-build",
-        // rust-toolchain: the pinned-upstream-Rust ELF-retarget TRANSFORM (#380,
-        // build::run_rust_toolchain) — extract rustc/cargo + rustlib from TD_SRC,
-        // co-locate the /td/store glibc/libgcc/libz runtime closure, relink the
-        // interp onto td's own glibc loader. Declared inputs, reproducible output.
-        "rust-toolchain" => "rust-toolchain-build",
-        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot, rust-toolchain)")),
+        // rust-stage0: assemble the exact upstream rustc/rust-std/Cargo bootstrap
+        // components and retarget them to td's declared runtime closure.
+        "rust-stage0" => "rust-stage0-build",
+        other => return Err(format!("recipe: unknown buildSystem `{other}' (known: gnu, rust, cmake, stage0, mesboot, rust-stage0)")),
     };
     // configure flags + phases (both optional) -> JSON array string. A configure
     // flag may itself contain whitespace (e.g. `CFLAGS=-O2 -g -Wno-foo`), so the
@@ -3872,25 +3870,22 @@ fn assemble_recipe_drv(
             );
             spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
         }
-        // rust-toolchain: the pinned-upstream-Rust ELF-retarget transform (#380).
-        // TD_SRC is the release tarball (the `rust-toolchain-source' lock entry);
-        // the /td/store glibc/libgcc/libz inputs reach build::run_rust_toolchain by
-        // NAME through TD_INPUT_MAP (lock entry name -> canonical store path), the
-        // same resolution mesboot uses. No compile: configureFlags/phases/bins have
-        // no runner here — declaring them is a hard error, never silently ignored.
-        "rust-toolchain" => {
+        // rust-stage0: the exact upstream bootstrap-component ELF-retarget transform.
+        // TD_SRC is the rustc component; rust-std/Cargo sources and the td runtime
+        // closure resolve by NAME through TD_INPUT_MAP. No compilation occurs here.
+        "rust-stage0" => {
             if alist.get("configureFlags").is_some()
                 || alist.get("phases").is_some()
                 || alist.get("bins").is_some()
                 || alist.get("steps").is_some()
             {
                 return Err(
-                    "recipe: buildSystem \"rust-toolchain\" supports no configureFlags/phases/bins/steps — it declares `inputs' (glibc/libgcc/libz) and transforms the release tarball".into(),
+                    "recipe: buildSystem \"rust-stage0\" supports no configureFlags/phases/bins/steps — it transforms exact rustc/rust-std/Cargo component tarballs against declared runtime inputs".into(),
                 );
             }
             if !vendor.is_empty() || vendor_dir.is_some() {
                 return Err(
-                    "recipe: buildSystem \"rust-toolchain\" takes no vendored crates — the transform extracts a prebuilt release, it does not compile".into(),
+                    "recipe: buildSystem \"rust-stage0\" takes no vendored crates — the transform extracts prebuilt bootstrap components, it does not compile".into(),
                 );
             }
             let map = json::Json::Obj(
@@ -4824,8 +4819,9 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                         "build `{pkg}': a vendored rust build needs the native /td/store toolchain, \
                          but TD_SHELL_NATIVE_STORE is not set. Its provisioning gate was retired with \
                          the #410 rust-toolchain recipe-graph cutover (rust userland re-coverage pending); \
-                         host-prep must stage the native gcc/binutils/glibc + the recipe-graph relinked \
-                         rust. The guix rust/gcc-toolchain path is retired for `td shell'."
+                         host-prep must stage the native gcc/binutils/glibc + the recipe-graph \
+                         source-built stage2 Rust toolchain. The guix rust/gcc-toolchain path is \
+                         retired for `td shell'."
                     ));
                 };
                 // CUTOVER: retarget the seed lock onto the native /td/store toolchain (drop the
@@ -8618,13 +8614,12 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        // td's rust-toolchain ELF-retarget transform (#380): see
-        // build::run_rust_toolchain. Same env-driven derivation-builder contract —
-        // extract+co-locate+relink the pinned upstream Rust release onto /td/store.
-        Some("rust-toolchain-build") if args.len() == 2 => match build::run_rust_toolchain() {
+        // td's Rust bootstrap-snapshot transform: see build::run_rust_stage0.
+        // Same env-driven derivation-builder contract as the other phase runners.
+        Some("rust-stage0-build") if args.len() == 2 => match build::run_rust_stage0() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("td-builder: rust-toolchain-build: {e}");
+                eprintln!("td-builder: rust-stage0-build: {e}");
                 ExitCode::FAILURE
             }
         },

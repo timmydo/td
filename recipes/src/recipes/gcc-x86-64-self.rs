@@ -114,7 +114,10 @@ pub fn recipe() -> Recipe {
                 "--disable-shared",
                 "--enable-static",
                 "--enable-languages=c,c++",
-                "--enable-threads=single",
+                // This self-hosted rung is the native build platform consumed by
+                // CMake/LLVM/Rust. The earlier native bootstrap compiler remains
+                // single-threaded; the final libstdc++ must provide std::mutex.
+                "--enable-threads=posix",
                 "--disable-libstdcxx-pch",
                 "--disable-libatomic",
                 "--disable-libgomp",

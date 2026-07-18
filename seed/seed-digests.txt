@@ -11,6 +11,7 @@ binutils-244-source 8xzd2kk7j2pj9fhkmab3ajhgpmccgidj-binutils-244-source
 binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
 bison-mesboot-source 091gccsyc4qcsnk4r6p99mqkk259f3ar-bison-mesboot-source
 busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
+cmake-x86-64-source arcs0qgnqjhfljjd69mpgnjnanpcrlid-cmake-x86-64-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
 gawk-mesboot-source 128bh62a669ds6v5q6v2sih5a1qk51wj-gawk-mesboot-source
@@ -50,7 +51,10 @@ patch-glibc-bootstrap-system-2.16.0 nggbvl93zgr74xf9x50331yfgsw4hh0r-patch-glibc
 patch-glibc-bootstrap-system-2.2.5 wjhcnyy2wspd9bf312ql84gfmvivixs2-patch-glibc-bootstrap-system-2.2.5
 patch-mesboot-source r3w1jmlradg89l3av29y1ifp7y312pk9-patch-mesboot-source
 python-mesboot-source 460ch0an5nlsgs5i9ppdk6b890fnvw1y-python-mesboot-source
-rust-toolchain-source 853r9awaviv9yfgdrcqv1wrv3qn4g56p-rust-toolchain-source
+rust-source cm16nyx12gdvnbm868xrrfcyaij9xqi1-rust-source
+rust-stage0-cargo-source gsd6q27xf6sv3js5hy0ngi3d5hp0s73l-rust-stage0-cargo-source
+rust-stage0-rustc-source 5jhmhhjm2dc9k0xp2xcyn37f6mm548nb-rust-stage0-rustc-source
+rust-stage0-std-source cq2l2plp6jfcqzchh4zczg8g6sy6syvg-rust-stage0-std-source
 sed-mesboot-source 331jp1sj5iyjhnb35391k2sjjkqrawk1-sed-mesboot-source
 sed-mesboot0-source i6y1c09pssxjdc60wmdf96vf11hxa56c-sed-mesboot0-source
 stage0-source ma16im40lnb5dldxwglzzs7iqpzfiz4m-stage0-source
