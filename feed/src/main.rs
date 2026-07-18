@@ -1202,6 +1202,11 @@ fn extract_xz_tar(src: &Path, dest: &Path) -> bool {
         .arg("-C")
         .arg(dest)
         .arg("--strip-components=1")
+        // Scrub the ambient TAR_OPTIONS: GNU tar prepends it, and e.g. `TAR_OPTIONS=-z`
+        // would make this xz-piped `-xf` try to gunzip an already-decompressed stream and
+        // fail, aborting the whole host-free warm on such a host. Removing it keeps the
+        // extraction (and therefore the warm) host-env-independent, like the pack step.
+        .env_remove("TAR_OPTIONS")
         .stdin(Stdio::from(xzout))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1287,6 +1292,26 @@ const KERNEL_HEADERS_TAR_FLAGS: &[&str] = &[
     "--numeric-owner",
     "-cf",
 ];
+
+/// Build the `tar` command that packs the normalized, uncompressed kernel-headers
+/// seed (`KERNEL_HEADERS_TAR_FLAGS` into `out`, from the tree at `include_dir`).
+/// `TAR_OPTIONS` is scrubbed from the child environment: GNU tar reads that variable
+/// and PREPENDS its contents to every invocation, so an ambient `TAR_OPTIONS=-z`
+/// (silently re-adds gzip) or `--blocking-factor=N` (changes archive padding) on the
+/// warming host would re-key the seed digest despite the fixed flags above (re #469).
+/// `LC_ALL=C` pins byte-order sorting/formatting so a host locale cannot reorder or
+/// reformat the archive either.
+fn kernel_headers_pack_command(out: &Path, include_dir: &Path) -> Command {
+    let mut c = Command::new("tar");
+    c.args(KERNEL_HEADERS_TAR_FLAGS)
+        .arg(out)
+        .arg("-C")
+        .arg(include_dir)
+        .arg(".")
+        .env_remove("TAR_OPTIONS")
+        .env("LC_ALL", "C");
+    c
+}
 
 /// warm kernel-headers ARCH — produce the sanitized Linux UAPI headers for `ARCH` (i386 /
 /// x86_64) FROM the pinned linux source via `make headers_install`, into
@@ -1390,15 +1415,9 @@ fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
     // layer; the seed universe unpacks it via magic-byte sniffing (builder
     // tar::unpack_archive falls through to plain-tar for a non-gzip/xz/bzip2
     // magic), so no consumer changes. Unnormalized host-tar output embeds
-    // build-time mtimes and never reproduces either.
-    let ok = run_quiet(
-        Command::new("tar")
-            .args(KERNEL_HEADERS_TAR_FLAGS)
-            .arg(&tmp)
-            .arg("-C")
-            .arg(hdr.join("include"))
-            .arg("."),
-    );
+    // build-time mtimes and never reproduces either. kernel_headers_pack_command also
+    // scrubs the ambient TAR_OPTIONS (and pins LC_ALL=C) so host env cannot re-key it.
+    let ok = run_quiet(&mut kernel_headers_pack_command(&tmp, &hdr.join("include")));
     if ok && std::fs::rename(&tmp, &out).is_ok() {
         eprintln!(">> td-feed warm kernel-headers ({arch}): produced {} (LINUX_VERSION_CODE={code}) from the pinned {file}", out.display());
     } else {
@@ -1762,6 +1781,18 @@ fn main() {
 mod tests {
     use super::parse_serve_addr;
 
+    /// A per-invocation-unique temp dir under $TMPDIR. `cargo test` runs tests
+    /// concurrently in ONE process, so `std::process::id()` alone is shared across
+    /// threads; a monotonic counter makes each call's path distinct regardless of
+    /// how many tests (present or future) allocate one.
+    #[cfg(test)]
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("td-feed-{tag}-{}-{n}", std::process::id()))
+    }
+
     #[test]
     fn kernel_headers_tar_is_uncompressed_and_normalized() {
         // The kernel-headers seed is GENERATED (no upstream sha256 pin): its
@@ -1796,6 +1827,32 @@ mod tests {
     }
 
     #[test]
+    fn pack_command_scrubs_host_tar_env_and_stays_uncompressed() {
+        use std::path::Path;
+        // GNU tar PREPENDS $TAR_OPTIONS to every run, so an ambient `TAR_OPTIONS=-z`
+        // or `--blocking-factor=N` on the warming host would re-key the seed digest
+        // despite KERNEL_HEADERS_TAR_FLAGS. Lock that the packing command removes it
+        // (and pins LC_ALL=C), and still carries the uncompressed normalized flags.
+        let cmd = super::kernel_headers_pack_command(Path::new("/x/out.tar"), Path::new("/x/inc"));
+        let removes_tar_options = cmd
+            .get_envs()
+            .any(|(k, v)| k == "TAR_OPTIONS" && v.is_none());
+        assert!(removes_tar_options, "packing must scrub ambient TAR_OPTIONS");
+        let pins_c_locale = cmd
+            .get_envs()
+            .any(|(k, v)| k == "LC_ALL" && v == Some(std::ffi::OsStr::new("C")));
+        assert!(pins_c_locale, "packing must pin LC_ALL=C");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"-cf".to_string()), "must stay uncompressed (-cf)");
+        for bad in ["-z", "--gzip", "-czf"] {
+            assert!(!args.iter().any(|a| a == bad), "must not pack with {bad}");
+        }
+    }
+
+    #[test]
     fn strips_kbuild_byproducts_but_keeps_headers() {
         use std::fs;
         use std::path::Path;
@@ -1807,8 +1864,7 @@ mod tests {
 
         // Recursive strip on a mock headers_install tree: byproducts (which carry
         // the non-reproducible build/store paths) go; the headers stay.
-        let root =
-            std::env::temp_dir().join(format!("td-feed-strip-{}", std::process::id()));
+        let root = unique_tmp_dir("strip");
         let _ = fs::remove_dir_all(&root);
         let asm = root.join("asm");
         fs::create_dir_all(&asm).unwrap();
@@ -1847,7 +1903,7 @@ mod tests {
         // digest per host even for identical header CONTENT (re #469). Simulate that
         // restrictive tree and assert normalize_header_modes rewrites EVERY dir to 0755
         // and EVERY file to 0644, the canonical umask-independent set.
-        let root = std::env::temp_dir().join(format!("td-feed-mode-{}", std::process::id()));
+        let root = unique_tmp_dir("mode");
         let _ = fs::remove_dir_all(&root);
         let asm = root.join("asm");
         fs::create_dir_all(&asm).unwrap();
