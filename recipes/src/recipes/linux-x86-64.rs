@@ -12,10 +12,11 @@ use crate::types::{Recipe, Step};
 // bootable `bzImage`. bzImage's self-extracting payload is gzip-compressed
 // (kbuild's `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz`); td ships no
 // gzip executable — the builder only DEcompresses, in-process — so the compressor
-// is the busybox gzip applet behind a thin flag-dropping wrapper (see the gzip
-// block below). CONFIG_KERNEL_GZIP is pinned so the compressor is always gzip
-// (never xz/zstd, which would need a different tool). A qemu boot of the bzImage
-// is a separate later rung (re #529, re #469).
+// is the busybox gzip applet's `bin/gzip` link, which accepts the kernel's exact
+// `-n -f -9` directly (busybox gzip's options include `-n` and `-1..-9`).
+// CONFIG_KERNEL_GZIP is pinned so the compressor is always gzip (never xz/zstd,
+// which would need a different tool). A qemu boot of the bzImage is a separate
+// later rung (re #529, re #469).
 //
 // A modern (>= 4.18) kernel needs host tools the 4.14 rung dodged; each is now a
 // td recipe (AGENTS.md directive 3, pre-authorized as part of this migration):
@@ -109,32 +110,29 @@ pub fn recipe() -> Recipe {
     );
 
     // gzip compressor for the bzImage payload. The pinned CONFIG_KERNEL_GZIP rule
-    // is `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz` (KGZIP defaults to
-    // `gzip`), and the payload is always piped stdin->stdout. td ships no gzip
-    // executable — only the builder's in-process DECOMPRESSORS — so the compressor
-    // is the busybox gzip applet. BusyBox 1.37 gzip does NOT accept GNU gzip's
-    // `-n` (its options are only `-cfkdt123456789`), so a bare `gzip -> busybox`
-    // symlink would die on `gzip -n`. This thin wrapper drops the kernel's flags
-    // and forces `busybox gzip -c`, compressing its stdin to stdout — exactly what
-    // cmd_gzip pipes. The discarded `-9`/`-n` only affect image size/mtime, never
-    // bootability. Wired in as KGZIP= on the build step below.
-    steps.push(Step::WriteFile {
-        path: "{root}/wb/gzip".into(),
-        content: format!("#!{SH}\nexec \"{bb}\" gzip -c\n"),
-        exec: true,
-    });
-    // Fail FAST (parity with the bc probe) if that wrapper cannot emit a gzip
-    // stream: compress a probe string and assert the gzip magic `1f 8b 08`
-    // (id1/id2 + CM=deflate). A missing/broken busybox gzip applet would otherwise
-    // surface as a confusing failure deep inside arch/x86/boot/compressed.
+    // is `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz`. td ships no gzip
+    // executable — only the builder's in-process DECOMPRESSORS — so KGZIP is the
+    // busybox gzip applet's `bin/gzip` link (busybox is already a kernel input).
+    // BusyBox 1.37 gzip's option set includes `-n` (a GNU-compat no-op), `-f`, and
+    // `-1..-9`, so it accepts the kernel's exact `-n -f -9` invocation directly —
+    // no wrapper needed, and this keeps real max compression, `-n` reproducibility
+    // (alongside SOURCE_DATE_EPOCH), and fail-closed behaviour on an unexpected
+    // operand. cmd_gzip always pipes the payload stdin->stdout (no file operand),
+    // exactly what the applet expects when invoked with no file. Wired as KGZIP=
+    // on the build step below.
+    //
+    // Fail FAST (parity with the bc probe) with the EXACT flags kbuild uses, so a
+    // busybox that lacked the gzip applet or rejected `-n -f -9` reds HERE with a
+    // named error instead of deep inside arch/x86/boot/compressed. Assert the
+    // output carries the gzip magic `1f 8b 08` (id1/id2 + CM=deflate).
     steps.push(
         Step::run(
             "{root}",
             &[
                 SH,
                 "-c",
-                "printf 'td-gzip-probe' | {root}/wb/gzip > {root}/gzprobe.gz 2>/dev/null || true; \
-                 [ -s {root}/gzprobe.gz ] || { echo 'gzip probe: wrapper produced no output (busybox gzip applet unavailable)' >&2; exit 1; }; \
+                "if ! printf 'td-gzip-probe' | '{in:busybox-x86-64}/bin/gzip' -n -f -9 > {root}/gzprobe.gz 2>/dev/null; then echo 'gzip probe: busybox gzip -n -f -9 failed (applet missing or rejects the kernel flags)' >&2; exit 1; fi; \
+                 [ -s {root}/gzprobe.gz ] || { echo 'gzip probe: busybox gzip produced no output' >&2; exit 1; }; \
                  set -- $(od -An -tx1 -N3 {root}/gzprobe.gz); \
                  [ \"$1$2$3\" = 1f8b08 ] || { echo \"gzip probe: not a gzip/deflate stream (magic $1$2$3, want 1f8b08)\" >&2; exit 1; }",
             ],
@@ -316,7 +314,7 @@ pub fn recipe() -> Recipe {
 
     // 5) Build vmlinux + the bootable bzImage. binutils tools passed explicitly
     //    (native as/ld/ar/nm/…), host make env scrubbed (busybox parity), and
-    //    KGZIP pointed at the busybox-backed gzip wrapper for the bzImage payload.
+    //    KGZIP pointed at the busybox gzip applet link for the bzImage payload.
     //    (`bzImage` builds `vmlinux` as a prerequisite; both are listed so a
     //    kbuild change that stops re-emitting the raw ELF still lands it.)
     steps.push(
@@ -328,7 +326,7 @@ pub fn recipe() -> Recipe {
             &format!("OBJCOPY={nbin}/objcopy"),
             &format!("OBJDUMP={nbin}/objdump"),
             &format!("STRIP={nbin}/strip"),
-            "KGZIP={root}/wb/gzip",
+            "KGZIP={in:busybox-x86-64}/bin/gzip",
             "vmlinux",
             "bzImage",
         ])
@@ -373,15 +371,21 @@ pub fn recipe() -> Recipe {
     );
     // [bzImage] the compressed image must carry the x86 boot-setup header: the
     // 0xAA55 boot signature at 0x1fe and the "HdrS" (48 64 72 53) magic at 0x202
-    // (arch/x86/boot/header.S). Asserted here at the producer rung with od's
-    // offset read (mesboot0 ships no dd); the sibling test re-checks it.
+    // (arch/x86/boot/header.S), read with od's offset seek (mesboot0 ships no dd).
+    // A size floor first rejects a header-only/truncated image that would carry
+    // those two constants but no kernel payload (a real allnoconfig bzImage is
+    // megabytes; 64 KiB cleanly separates it from a <1 KiB truncation). Asserted
+    // here at the producer rung; the sibling test re-checks and also scans for the
+    // embedded gzip payload.
     steps.push(
         Step::run(
             "{out}",
             &[
                 SH,
                 "-c",
-                "set -- $(od -An -tx1 -j 510 -N 2 '{out}/bzImage'); \
+                "sz=$(wc -c < '{out}/bzImage'); \
+                 [ \"$sz\" -ge 65536 ] || { echo \"bzImage: implausibly small ($sz bytes) — header-only/truncated image\" >&2; exit 1; }; \
+                 set -- $(od -An -tx1 -j 510 -N 2 '{out}/bzImage'); \
                  [ \"$1$2\" = 55aa ] || { echo 'bzImage: missing 0xAA55 boot signature at 0x1fe' >&2; exit 1; }; \
                  set -- $(od -An -tx1 -j 514 -N 4 '{out}/bzImage'); \
                  [ \"$1$2$3$4\" = 48647253 ] || { echo 'bzImage: missing HdrS setup-header magic at 0x202' >&2; exit 1; }",

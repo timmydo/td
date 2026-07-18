@@ -16,10 +16,12 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //   3. vmlinux embeds no `/gnu/store` bytes — the no-guix host-free leg, mirroring
 //      busybox-test (td's native toolchain is /td/store; a /gnu/store byte would
 //      mean a host-guix compiler/lib leaked into the image),
-//   4. bzImage carries the x86 boot-setup header — the 0xAA55 boot signature at
-//      offset 0x1fe and the "HdrS" magic at 0x202 (arch/x86/boot/header.S) — proof
-//      the gzip-compressed, self-extracting boot image was assembled, not just the
-//      raw ELF. Read with od's offset seek (mesboot0 ships no dd).
+//   4. bzImage is well-formed: a size floor (>= 64 KiB) rejects a header-only or
+//      truncated image; the 0xAA55 boot signature at 0x1fe and the "HdrS" magic at
+//      0x202 (arch/x86/boot/header.S, read with od's offset seek since mesboot0
+//      ships no dd) prove the boot-setup header; and the gzip magic `1f 8b 08`
+//      appears somewhere in the file, proving the CONFIG_KERNEL_GZIP payload was
+//      actually compressed and embedded — not just the raw ELF wrapped in a stub.
 pub fn recipe() -> Recipe {
     let vmlinux = "{in:linux-x86-64}/vmlinux";
     let bzimage = "{in:linux-x86-64}/bzImage";
@@ -75,10 +77,13 @@ pub fn recipe() -> Recipe {
                 SH,
                 "-c",
                 &format!(
-                    "set -- $(od -An -tx1 -j 510 -N 2 '{bzimage}'); \
+                    "sz=$(wc -c < '{bzimage}'); \
+                     [ \"$sz\" -ge 65536 ] || {{ echo \"bzImage is implausibly small ($sz bytes) — a header-only/truncated image\" >&2; exit 1; }}; \
+                     set -- $(od -An -tx1 -j 510 -N 2 '{bzimage}'); \
                      [ \"$1$2\" = 55aa ] || {{ echo 'bzImage is missing the 0xAA55 boot signature at 0x1fe' >&2; exit 1; }}; \
                      set -- $(od -An -tx1 -j 514 -N 4 '{bzimage}'); \
-                     [ \"$1$2$3$4\" = 48647253 ] || {{ echo 'bzImage is missing the HdrS setup-header magic at 0x202' >&2; exit 1; }}"
+                     [ \"$1$2$3$4\" = 48647253 ] || {{ echo 'bzImage is missing the HdrS setup-header magic at 0x202' >&2; exit 1; }}; \
+                     od -An -tx1 -v '{bzimage}' | tr -d '\\n' | grep -q ' 1f 8b 08' || {{ echo 'bzImage embeds no gzip payload (1f 8b 08) — CONFIG_KERNEL_GZIP payload missing' >&2; exit 1; }}"
                 ),
             ],
         )
