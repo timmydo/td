@@ -1245,6 +1245,33 @@ fn strip_kbuild_byproducts(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Force fixed permission bits across the header tree — directories 0755, regular
+/// files 0644 — so the packed seed is a pure function of the header CONTENT and does
+/// NOT depend on the warming host's umask. `make headers_install` creates its dirs
+/// (`mkdir -p`) and files (shell redirection), and the generated `version.h` write,
+/// all honor the ambient umask: 0022 yields 0755/0644 but 0077 yields 0700/0600, and
+/// `tar` records those mode bits — so without this the SAME header bytes would hash to
+/// a DIFFERENT seed digest on a host with a different umask (re #469). Every UAPI
+/// header is non-executable text, so 0644 (files) / 0755 (dirs) is the canonical set.
+/// Symlinks (if any) are skipped: `file_type()` does not follow them and their mode is
+/// not meaningful to tar. Fails closed (Err) so an un-chmod-able entry aborts the warm
+/// rather than blessing a umask-dependent tarball.
+fn normalize_header_modes(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            normalize_header_modes(&p)?;
+        } else if ft.is_file() {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644))?;
+        }
+    }
+    Ok(())
+}
+
 /// Reproducible, UNCOMPRESSED tar flags for the generated kernel-headers seed.
 /// The committed digest in seed/seed-digests.txt binds the packed bytes, so they
 /// must be a host-free function of the header content: `--sort=name` +
@@ -1340,12 +1367,21 @@ fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
         cleanup();
         return;
     }
+    // Force fixed 0755/0644 modes so the seed digest is umask-independent — the tar
+    // flags below zero mtime/owner but NOT the permission bits, which headers_install
+    // inherits from the ambient umask (re #469).
+    if let Err(e) = normalize_header_modes(&hdr.join("include")) {
+        eprintln!(">> td-feed warm kernel-headers ({arch}): could not normalize header modes ({e}) — skipping");
+        cleanup();
+        return;
+    }
     let tmp = cache.join(format!("linux-headers-{ver}-{arch}.tar.tmp"));
     // NORMALIZED, UNCOMPRESSED packing (KERNEL_HEADERS_TAR_FLAGS): sorted names,
-    // zeroed mtimes, no ownership, GNU format — the tar bytes are a pure
-    // function of the header CONTENT, so the same pinned linux source yields the
-    // same tarball on any host and the runner's compiled expected digest
-    // (seed/seed-digests.txt) can vouch for it (re #469). NO gzip: a `-z`
+    // zeroed mtimes, no ownership, GNU format — plus the fixed 0755/0644 modes forced
+    // above (tar records mode bits but these flags do not normalize them). Together the
+    // tar bytes are a pure function of the header CONTENT, so the same pinned linux
+    // source yields the same tarball on any host and under any umask, and the runner's
+    // compiled expected digest (seed/seed-digests.txt) can vouch for it (re #469). NO gzip: a `-z`
     // DEFLATE stream is NOT reproducible across zlib/gzip versions, so a
     // compressed tarball hashed to a DIFFERENT seed digest on every host whose
     // gzip differed from the one that blessed the table — reddening the
@@ -1787,14 +1823,59 @@ mod tests {
 
         super::strip_kbuild_byproducts(&root).unwrap();
 
-        assert!(asm.join("types.h").is_file(), "must keep a real UAPI header");
-        assert!(root.join("version.h").is_file(), "must keep version.h");
-        assert!(!asm.join(".install").exists(), "must remove the .install marker");
-        assert!(
-            !asm.join("..install.cmd").exists(),
-            "must remove the ..install.cmd command record"
-        );
+        // Collect results, clean up, THEN assert — so a failing assertion cannot leak
+        // the temp tree (the cleanup runs before any panic unwinds the test).
+        let kept_header = asm.join("types.h").is_file();
+        let kept_version = root.join("version.h").is_file();
+        let dropped_install = !asm.join(".install").exists();
+        let dropped_cmd = !asm.join("..install.cmd").exists();
         let _ = fs::remove_dir_all(&root);
+
+        assert!(kept_header, "must keep a real UAPI header");
+        assert!(kept_version, "must keep version.h");
+        assert!(dropped_install, "must remove the .install marker");
+        assert!(dropped_cmd, "must remove the ..install.cmd command record");
+    }
+
+    #[test]
+    fn normalize_header_modes_forces_umask_independent_bits() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        // headers_install honors the ambient umask, so a restrictive warm (umask 0077)
+        // yields 0700 dirs / 0600 files, and tar records those bits — re-keying the seed
+        // digest per host even for identical header CONTENT (re #469). Simulate that
+        // restrictive tree and assert normalize_header_modes rewrites EVERY dir to 0755
+        // and EVERY file to 0644, the canonical umask-independent set.
+        let root = std::env::temp_dir().join(format!("td-feed-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let asm = root.join("asm");
+        fs::create_dir_all(&asm).unwrap();
+        fs::write(asm.join("types.h"), b"typedef int x;").unwrap();
+        fs::write(root.join("version.h"), b"#define V 1").unwrap();
+        for (p, mode) in [
+            (root.as_path(), 0o700),
+            (asm.as_path(), 0o700),
+            (asm.join("types.h").as_path(), 0o600),
+            (root.join("version.h").as_path(), 0o600),
+        ] {
+            fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        super::normalize_header_modes(&root).unwrap();
+
+        // Read modes, clean up, THEN assert (no temp-tree leak on a failing assertion).
+        let mode_of = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let root_mode = mode_of(&root);
+        let asm_mode = mode_of(&asm);
+        let header_mode = mode_of(&asm.join("types.h"));
+        let version_mode = mode_of(&root.join("version.h"));
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(root_mode, 0o755, "root dir must be forced to 0755");
+        assert_eq!(asm_mode, 0o755, "subdir must be forced to 0755");
+        assert_eq!(header_mode, 0o644, "header file must be forced to 0644");
+        assert_eq!(version_mode, 0o644, "version.h must be forced to 0644");
     }
 
     #[test]
