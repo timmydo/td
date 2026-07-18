@@ -1212,9 +1212,58 @@ fn extract_xz_tar(src: &Path, dest: &Path) -> bool {
     tar_ok && xz_ok
 }
 
+/// True for a Kbuild byproduct — an install marker (`.install`) or a command
+/// record (`*.cmd`, e.g. `..install.cmd`). Never true for a real UAPI header (no
+/// header is named `.install` or ends in `.cmd`).
+fn is_kbuild_byproduct(p: &Path) -> bool {
+    match p.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name == ".install" || name.ends_with(".cmd"),
+        None => false,
+    }
+}
+
+/// Recursively delete the Kbuild byproducts `make headers_install` scatters
+/// through the header tree (per-dir `.install` markers and `..install.cmd`
+/// command records). They are NOT UAPI headers: each `..install.cmd` embeds the
+/// absolute build path — a PID-bearing temp dir AND the host `sh` store path — so
+/// leaving them in the packed seed makes its digest non-reproducible both
+/// run-to-run (the PID) and across hosts (the store path), defeating the entire
+/// point of a host-free seed. Only the sanitized `*.h` headers (plus the
+/// generated version.h) are real, host-free content. Fails closed (Err) so an
+/// un-removable byproduct aborts the warm rather than blessing an unstable
+/// tarball.
+fn strip_kbuild_byproducts(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        if entry.file_type()?.is_dir() {
+            strip_kbuild_byproducts(&p)?;
+        } else if is_kbuild_byproduct(&p) {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reproducible, UNCOMPRESSED tar flags for the generated kernel-headers seed.
+/// The committed digest in seed/seed-digests.txt binds the packed bytes, so they
+/// must be a host-free function of the header content: `--sort=name` +
+/// `--mtime=@0` + zeroed numeric owner + GNU format fix the layout, and `-cf`
+/// (NOT `-czf`) keeps out the gzip layer, whose DEFLATE stream varies by zlib
+/// version and would re-key the digest per host (re #469).
+const KERNEL_HEADERS_TAR_FLAGS: &[&str] = &[
+    "--format=gnu",
+    "--sort=name",
+    "--mtime=@0",
+    "--owner=0",
+    "--group=0",
+    "--numeric-owner",
+    "-cf",
+];
+
 /// warm kernel-headers ARCH — produce the sanitized Linux UAPI headers for `ARCH` (i386 /
 /// x86_64) FROM the pinned linux source via `make headers_install`, into
-/// .td-build-cache/sources/linux-headers-<ver>-<ARCH>.tar.gz (+ a hand-written version.h).
+/// .td-build-cache/sources/linux-headers-<ver>-<ARCH>.tar (+ a hand-written version.h).
 /// guix ships a prebuilt header BLOB; td produces the same headers FROM canonical source.
 fn warm_kernel_headers(root: &Path, arch: &str) {
     match recipe_source_pins_result(root) {
@@ -1238,7 +1287,7 @@ fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
     };
     let cache = root.join(".td-build-cache/sources");
     let src = cache.join(file);
-    let out = cache.join(format!("linux-headers-{ver}-{arch}.tar.gz"));
+    let out = cache.join(format!("linux-headers-{ver}-{arch}.tar"));
     if out.exists() {
         return; // already produced
     }
@@ -1283,22 +1332,32 @@ fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
         cleanup();
         return;
     }
-    let tmp = cache.join(format!("linux-headers-{ver}-{arch}.tar.gz.tmp"));
-    // NORMALIZED packing: sorted names, zeroed mtimes, no ownership, and a
-    // stream-compressed gzip (no embedded mtime) — the tarball bytes are then
-    // a pure function of the headers CONTENT, so the same pinned linux source
-    // yields the same tarball on any host and the runner's compiled expected
-    // digest (seed/seed-digests.txt) can vouch for it (re #469). Unnormalized
-    // host-tar output embeds build-time mtimes and never reproduces.
+    // Drop Kbuild byproducts before packing — they embed the PID-bearing build
+    // path and the host `sh` store path, which would re-key the seed digest on
+    // every run and every host (re #469). Only the sanitized headers survive.
+    if let Err(e) = strip_kbuild_byproducts(&hdr.join("include")) {
+        eprintln!(">> td-feed warm kernel-headers ({arch}): could not strip Kbuild byproducts ({e}) — skipping");
+        cleanup();
+        return;
+    }
+    let tmp = cache.join(format!("linux-headers-{ver}-{arch}.tar.tmp"));
+    // NORMALIZED, UNCOMPRESSED packing (KERNEL_HEADERS_TAR_FLAGS): sorted names,
+    // zeroed mtimes, no ownership, GNU format — the tar bytes are a pure
+    // function of the header CONTENT, so the same pinned linux source yields the
+    // same tarball on any host and the runner's compiled expected digest
+    // (seed/seed-digests.txt) can vouch for it (re #469). NO gzip: a `-z`
+    // DEFLATE stream is NOT reproducible across zlib/gzip versions, so a
+    // compressed tarball hashed to a DIFFERENT seed digest on every host whose
+    // gzip differed from the one that blessed the table — reddening the
+    // seed-provenance gate off that host (the daily backstop, any dev box) even
+    // though the header content was identical. The uncompressed tar has no such
+    // layer; the seed universe unpacks it via magic-byte sniffing (builder
+    // tar::unpack_archive falls through to plain-tar for a non-gzip/xz/bzip2
+    // magic), so no consumer changes. Unnormalized host-tar output embeds
+    // build-time mtimes and never reproduces either.
     let ok = run_quiet(
         Command::new("tar")
-            .arg("--format=gnu")
-            .arg("--sort=name")
-            .arg("--mtime=@0")
-            .arg("--owner=0")
-            .arg("--group=0")
-            .arg("--numeric-owner")
-            .arg("-czf")
+            .args(KERNEL_HEADERS_TAR_FLAGS)
             .arg(&tmp)
             .arg("-C")
             .arg(hdr.join("include"))
@@ -1666,6 +1725,77 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::parse_serve_addr;
+
+    #[test]
+    fn kernel_headers_tar_is_uncompressed_and_normalized() {
+        // The kernel-headers seed is GENERATED (no upstream sha256 pin): its
+        // committed row in seed/seed-digests.txt binds the packed bytes, so the
+        // bytes must be a host-free function of the header CONTENT. A gzip layer
+        // is NOT host-free — its DEFLATE stream varies by zlib/gzip version — so
+        // a compressed tarball re-keyed the seed digest on every host whose gzip
+        // differed from the one that blessed the table, reddening the seed
+        // provenance gate off that host (re #469). Lock both invariants so a
+        // future edit cannot silently reintroduce compression or drop a
+        // normalization flag.
+        let flags = super::KERNEL_HEADERS_TAR_FLAGS;
+        assert!(
+            flags.contains(&"-cf"),
+            "must create an UNCOMPRESSED tar (-cf), got {flags:?}"
+        );
+        for bad in ["-z", "-czf", "-cJf", "-cjf", "--gzip", "--xz", "--bzip2", "--zstd"] {
+            assert!(
+                !flags.contains(&bad),
+                "compression flag {bad} reintroduces host-dependent (non-reproducible) bytes"
+            );
+        }
+        for need in [
+            "--sort=name",
+            "--mtime=@0",
+            "--owner=0",
+            "--group=0",
+            "--numeric-owner",
+        ] {
+            assert!(flags.contains(&need), "missing normalization flag {need}");
+        }
+    }
+
+    #[test]
+    fn strips_kbuild_byproducts_but_keeps_headers() {
+        use std::fs;
+        use std::path::Path;
+        // Classification: markers/command-records are byproducts; headers are not.
+        assert!(super::is_kbuild_byproduct(Path::new("/k/asm/.install")));
+        assert!(super::is_kbuild_byproduct(Path::new("/k/asm/..install.cmd")));
+        assert!(!super::is_kbuild_byproduct(Path::new("/k/asm/types.h")));
+        assert!(!super::is_kbuild_byproduct(Path::new("/k/linux/version.h")));
+
+        // Recursive strip on a mock headers_install tree: byproducts (which carry
+        // the non-reproducible build/store paths) go; the headers stay.
+        let root =
+            std::env::temp_dir().join(format!("td-feed-strip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let asm = root.join("asm");
+        fs::create_dir_all(&asm).unwrap();
+        fs::write(asm.join("types.h"), b"typedef int x;").unwrap();
+        fs::write(asm.join(".install"), b"asm/types.h\n").unwrap();
+        fs::write(
+            asm.join("..install.cmd"),
+            b"cmd_/tmp/td-feed-kh-i386-27905/hdr := /gnu/store/abc-bash/bin/sh ...",
+        )
+        .unwrap();
+        fs::write(root.join("version.h"), b"#define LINUX_VERSION_CODE 265795").unwrap();
+
+        super::strip_kbuild_byproducts(&root).unwrap();
+
+        assert!(asm.join("types.h").is_file(), "must keep a real UAPI header");
+        assert!(root.join("version.h").is_file(), "must keep version.h");
+        assert!(!asm.join(".install").exists(), "must remove the .install marker");
+        assert!(
+            !asm.join("..install.cmd").exists(),
+            "must remove the ..install.cmd command record"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn parses_the_serve_announcement_line() {
