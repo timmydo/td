@@ -298,6 +298,20 @@ pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, String> {
 /// Fail-closed: without any of these the builder would link dynamically and leak
 /// its host `lib/` into every sandbox (re #469).
 pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, String> {
+    // The resolved lib dir travels through RUSTFLAGS as `-L <dir>` (static_rustflags
+    // / the recipe-eval shell), and cargo/rustc whitespace-SPLIT RUSTFLAGS — a dir
+    // containing whitespace cannot be expressed that way, so fail closed here
+    // rather than silently mis-link (Codex P2). Guix store paths never contain
+    // whitespace; only an explicit TD_GLIBC_STATIC_HOME could.
+    let finish = |dir: String| -> Result<String, String> {
+        if dir.bytes().any(|b| b.is_ascii_whitespace()) {
+            return Err(format!(
+                "static glibc lib dir {dir:?} contains whitespace — it cannot be passed through \
+                 RUSTFLAGS `-L`; move the static glibc to a whitespace-free path"
+            ));
+        }
+        Ok(dir)
+    };
     let has_static_libc =
         |lib: &Path| std::fs::metadata(lib.join("libc.a")).is_ok_and(|m| m.is_file());
     // 1. Explicitly provided static glibc.
@@ -308,7 +322,7 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
                 "TD_GLIBC_STATIC_HOME={home} has no lib/libc.a — not a glibc `static` output"
             ));
         }
-        return Ok(lib.to_string_lossy().into_owned());
+        return finish(lib.to_string_lossy().into_owned());
     }
     // Resolve the C toolchain ONCE — both the ask-cc leg (2) and the
     // matched-pair check (3) key off the same cc, so they can never disagree
@@ -350,7 +364,7 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
                 if libc_a.is_absolute() {
                     if let Some(dir) = libc_a.parent() {
                         if has_static_libc(dir) {
-                            return Ok(dir.to_string_lossy().into_owned());
+                            return finish(dir.to_string_lossy().into_owned());
                         }
                     }
                 }
@@ -372,7 +386,7 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
             .map(|p| Path::new(&p).join("lib"))
             .find(|lib| has_static_libc(lib))
         {
-            return Ok(lib.to_string_lossy().into_owned());
+            return finish(lib.to_string_lossy().into_owned());
         }
     }
     Err("no static glibc found — set TD_GLIBC_STATIC_HOME to a glibc `static` output (with \
@@ -397,6 +411,32 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
 /// the source rather than pinning a runpath).
 pub(crate) fn static_rustflags(glibc_static_lib: &str) -> String {
     format!("-C target-feature=+crt-static -C relocation-model=static -L {glibc_static_lib}")
+}
+
+/// The same static flags as `static_rustflags`, but in `CARGO_ENCODED_RUSTFLAGS`
+/// form: one rustc ARGUMENT per `\x1f`-separated field. Two properties the
+/// space-split `RUSTFLAGS` lacks, both flagged in review (PR #534). First, it is
+/// cargo's HIGHEST-precedence rustflags source, so an ambient `RUSTFLAGS` or
+/// `CARGO_ENCODED_RUSTFLAGS` on the build host cannot silently outrank it and drop
+/// the static flags (which would relink dynamic — caught by `assert_static`, but a
+/// spurious failure re-introducing an env-dependent flake). Second, the `-L` field
+/// is a single unit, so a glibc path is never whitespace-split (belt-and-suspenders
+/// with `provision_glibc_static`'s no-whitespace guard).
+///
+/// For the env_clear'd `bootstrap_stage0` and the `--target` per-target var in
+/// `host_cargo_bin` (which removes the higher-tier ambient vars itself), the plain
+/// `static_rustflags` is sufficient; this form is for the sites that overlay onto
+/// an inherited environment (the recipe-eval gate/shell).
+pub(crate) fn static_encoded_rustflags(glibc_static_lib: &str) -> String {
+    [
+        "-C",
+        "target-feature=+crt-static",
+        "-C",
+        "relocation-model=static",
+        "-L",
+        glibc_static_lib,
+    ]
+    .join("\u{1f}")
 }
 
 /// A scratch dir under the system temp dir, unique per process (pid + a

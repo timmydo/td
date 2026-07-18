@@ -1871,12 +1871,22 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     // at the SOURCE (crt-static) supersedes pinning a runpath (re #469). The recipes
     // crate is dependency-free (pure std, no proc-macros) so the flags apply
     // cleanly to the whole build; see stage0::static_rustflags.
+    //
+    // Pass the flags via CARGO_ENCODED_RUSTFLAGS, not RUSTFLAGS: run_out_env
+    // OVERLAYS onto this gate's inherited environment, and cargo reads exactly
+    // ONE rustflags source (first-set wins, no merge). An ambient RUSTFLAGS or
+    // CARGO_ENCODED_RUSTFLAGS on the build host would otherwise outrank a
+    // tier-2 RUSTFLAGS we set here and drop the static flags — assert_static
+    // would then fail the gate (fail-closed, but a spurious env-dependent red,
+    // the very failure mode this PR removes). CARGO_ENCODED_RUSTFLAGS is cargo's
+    // highest-precedence source, so setting it here wins unconditionally; see
+    // stage0::static_encoded_rustflags.
     let glibc_static = crate::stage0::provision_glibc_static(&penv)
         .map_err(|e| format!("FAIL: provision static glibc for a crt-static evaluator: {e}"))?;
-    let rustflags = crate::stage0::static_rustflags(&glibc_static);
+    let encoded_rustflags = crate::stage0::static_encoded_rustflags(&glibc_static);
     let envs: [(&str, &str); 4] = [
         ("PATH", &new_path),
-        ("RUSTFLAGS", &rustflags),
+        ("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags),
         ("CARGO_HOME", &cargo_home_s),
         ("CARGO_TARGET_DIR", &cargo_target_s),
     ];

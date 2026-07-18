@@ -31,11 +31,19 @@ ccpath=`"$td" provision-cc` || { echo "recipe-eval-tool: could not provision a C
 # ("error while loading shared libraries: libgcc_s.so.1", exit 127), flaking
 # this control-plane tool and reddening the daily backstop. Fixing it at the
 # SOURCE (crt-static) supersedes pinning a runpath (re #469). The recipes crate
-# is dependency-free (pure std, no proc-macros) so the flags apply cleanly. The
-# `-L` store path has no spaces, so the double-quoted RUSTFLAGS never splits.
+# is dependency-free (pure std, no proc-macros) so the flags apply cleanly.
+# provision-glibc-static rejects a whitespace $gstatic, so the double-quoted
+# `-L $gstatic` never splits.
+#
+# cargo reads exactly ONE rustflags source (first-set wins, no merge), and
+# CARGO_ENCODED_RUSTFLAGS outranks the RUSTFLAGS we set below. Unset any ambient
+# one on the build host so our static flags cannot be silently dropped (which
+# would relink dynamic — caught by assert-static below, but a spurious
+# env-dependent red, the failure mode this test removes).
 gstatic=`"$td" provision-glibc-static` || { echo "recipe-eval-tool: no matched static glibc (td-builder provision-glibc-static) — set TD_GLIBC_STATIC_HOME, install a build-essential cc, or pin one in the lock" >&2; exit 1; }
 
 mkdir -p "$base/home" "$base/target"
+unset CARGO_ENCODED_RUSTFLAGS
 PATH="$rustpath:$ccpath:$PATH" \
 RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static -L $gstatic" \
 CARGO_HOME="$base/home" CARGO_TARGET_DIR="$base/target" \
