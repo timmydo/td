@@ -1601,13 +1601,22 @@ fn reuse_key_manifest_digest(
     }
     let mut scoped = sandbox::StageManifest::new();
     for (p, si) in manifest {
-        // EXCLUDE the builder's OWN content row (`real_builder_cb`): its hash tracks the
-        // builder ELF, and folding the ABI identity below is what binds the builder instead.
-        // Without this the ladder busts the key on every recompile — it stages the builder as
-        // a content-addressed override (`TD_BUILDER_PATH`), so this row is in-closure and its
-        // nar_hash moves each build even though the output path (ABI-keyed) does not. Only the
-        // builder's OWN row is dropped; its runtime-linkage inputs keep their rows and bind.
-        if real_builder_cb == Some(p.as_str()) {
+        // EXCLUDE the builder's OWN control-plane DRIVER row (`real_builder_cb` AND origin
+        // `ControlPlaneBuilder`): its hash tracks the builder ELF, and folding the ABI identity
+        // below is what binds the builder instead. Without this the ladder busts the key on
+        // every recompile — it stages the builder as a content-addressed override
+        // (`TD_BUILDER_PATH`), so this row is in-closure and its nar_hash moves each build even
+        // though the output path (ABI-keyed) does not. The origin gate keeps the exclusion
+        // PRECISE: it drops ONLY the row the builder placement db vouched as the DRIVER, never
+        // a DATA input. The builder is architecturally never a recipe data input (a recipe
+        // names the virtual ABI identity, which has no materialized bytes, and realize rejects
+        // an output that references it), so today `real_builder_cb` is ALWAYS a
+        // `ControlPlaneBuilder` row; the origin gate is defense-in-depth so that if that ever
+        // changed a data row at the same path would keep binding rather than silently drop. The
+        // builder's runtime-linkage inputs keep their rows and bind normally regardless.
+        if real_builder_cb == Some(p.as_str())
+            && si.origin == sandbox::InputOrigin::ControlPlaneBuilder
+        {
             continue;
         }
         if paths.contains(p.as_str()) {
@@ -9674,6 +9683,24 @@ daemon build START (2/2 active)
             reuse_key_manifest_digest(&cl1, &m1, &identity, Some(&builder_v1)),
             reuse_key_manifest_digest(&cl1, &m1b, &identity, Some(&builder_v1)),
             "a real (non-builder) input change must still move the key"
+        );
+
+        // The exclusion's ORIGIN GATE is precise (Agy finding #1): the row is dropped ONLY
+        // when its origin is ControlPlaneBuilder (the DRIVER). A row AT the builder path but
+        // with a DATA origin (AuditedSeed) is NOT excluded — so were the builder ever a genuine
+        // recipe data input, its bytes would still bind. Same path, data origin, different hash
+        // → key MOVES (unlike the driver-origin recompile above, which does not).
+        let data_at_builder = |h: &str| {
+            let mut m: sandbox::StageManifest = sandbox::StageManifest::new();
+            m.insert(src.clone(), si("11", sandbox::InputOrigin::AuditedSeed));
+            m.insert(seed.clone(), si("22", sandbox::InputOrigin::AuditedSeed));
+            m.insert(builder_v1.clone(), si(h, sandbox::InputOrigin::AuditedSeed));
+            m
+        };
+        assert_ne!(
+            reuse_key_manifest_digest(&cl1, &data_at_builder("d1"), &identity, Some(&builder_v1)),
+            reuse_key_manifest_digest(&cl1, &data_at_builder("d2"), &identity, Some(&builder_v1)),
+            "a DATA-origin row at the builder path must NOT be excluded — it must still bind"
         );
     }
 
