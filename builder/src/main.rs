@@ -1581,50 +1581,76 @@ fn drv_declared_inputs(parsed: &drv::Derivation) -> Result<Vec<String>, String> 
 /// or is staged as an override (row excluded); a BUILDER_ABI bump moves BOTH the identity
 /// and the output path. A change to — or removal of — any OTHER real input still moves
 /// the key; the builder's runtime-linkage inputs (its libc etc.) are NOT the excluded
-/// row — they keep their rows and bind normally. ENFORCEMENT is deliberately left
-/// FULL-manifest (`enforce_realize_input_policy` runs over the un-scoped `manifest`,
-/// which KEEPS the real builder row): it only LOOKS UP each closure item, so a superset
-/// is correct — scoping it would instead drop the vouching rows the build stages.
-/// Scoping (and builder-excluding) the KEY narrows what a cache hit must match; it does
-/// not weaken what a build may stage or #469 enforces.
+/// row — they keep their rows and bind normally. The digest is built CLOSURE-DRIVEN (it
+/// iterates the closure and looks up each row), so a closure member with NO manifest row is
+/// recorded as `absent` and still moves the key — an unvouched member (a builder runtime dep
+/// a recompile pulled in) cannot yield a spurious hit at the read sites, which do not run
+/// enforcement (Codex P1); `absent` is empty in every valid build. ENFORCEMENT is deliberately
+/// left FULL-manifest (`enforce_realize_input_policy` runs over the un-scoped `manifest`, which
+/// KEEPS the real builder row): it only LOOKS UP each closure item, so a superset is correct —
+/// scoping it would instead drop the vouching rows the build stages. Scoping (and
+/// builder-excluding) the KEY narrows what a cache hit must match; it does not weaken what a
+/// build may stage or #469 enforces.
 fn reuse_key_manifest_digest(
     closure: &[String],
     manifest: &sandbox::StageManifest,
     builder_identity: &str,
     real_builder_cb: Option<&str>,
 ) -> String {
-    // The manifest is keyed by CANONICAL store path; each closure entry is
-    // `canonical` or `canonical\ton-disk`, so scope by the canonical (left) half.
-    let mut paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for e in closure {
-        paths.insert(sandbox::split_closure_entry(e).0);
-    }
+    // Build the scoped digest CLOSURE-DRIVEN (iterate the closure, look up each row), NOT
+    // manifest-driven — so a closure member with NO manifest row cannot silently contribute
+    // nothing (Codex P1). Each non-excluded closure path is folded via its manifest row when
+    // vouched, or recorded in `absent` when not, so an unvouched closure member (e.g. a new,
+    // undeclared builder runtime dep a same-ABI recompile pulled in) MOVES the key and forces a
+    // miss → the rebuild runs `enforce_realize_input_policy`, which rejects it. The read sites do
+    // NOT run enforcement, so without this they could return a spurious hit. `absent` is EMPTY in
+    // every valid build (enforce requires every closure member vouched), so this never causes a
+    // spurious miss — it only fires on the anomalous unvouched case.
     let mut scoped = sandbox::StageManifest::new();
-    for (p, si) in manifest {
-        // EXCLUDE the builder's OWN control-plane DRIVER row (`real_builder_cb` AND origin
-        // `ControlPlaneBuilder`): its hash tracks the builder ELF, and folding the ABI identity
-        // below is what binds the builder instead. Without this the ladder busts the key on
-        // every recompile — it stages the builder as a content-addressed override
-        // (`TD_BUILDER_PATH`), so this row is in-closure and its nar_hash moves each build even
-        // though the output path (ABI-keyed) does not. The origin gate keeps the exclusion
-        // PRECISE: it drops ONLY the row the builder placement db vouched as the DRIVER, never
-        // a DATA input. The builder is architecturally never a recipe data input (a recipe
-        // names the virtual ABI identity, which has no materialized bytes, and realize rejects
-        // an output that references it), so today `real_builder_cb` is ALWAYS a
-        // `ControlPlaneBuilder` row; the origin gate is defense-in-depth so that if that ever
-        // changed a data row at the same path would keep binding rather than silently drop. The
-        // builder's runtime-linkage inputs keep their rows and bind normally regardless.
-        if real_builder_cb == Some(p.as_str())
-            && si.origin == sandbox::InputOrigin::ControlPlaneBuilder
+    let mut absent: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for e in closure {
+        // The manifest is keyed by CANONICAL store path; each closure entry is `canonical` or
+        // `canonical\ton-disk`, so scope by the canonical (left) half.
+        let p = sandbox::split_closure_entry(e).0;
+        let row = manifest.get(p);
+        // EXCLUDE the builder's OWN control-plane DRIVER row: `real_builder_cb` (the resolved
+        // builder path, BY CONSTRUCTION) AND a row vouched `ControlPlaneBuilder`. Its hash tracks
+        // the builder ELF, and folding the ABI identity below binds the builder instead — without
+        // this the ladder busts the key on every recompile (it stages the builder as a
+        // content-addressed override, so this row is in-closure and its nar_hash moves each build
+        // even though the ABI-keyed output path does not). The origin gate keeps the exclusion
+        // PRECISE (Agy #1 / Codex P2): `manifest_add_db` keeps the FIRST writer's origin on a
+        // same-hash collision and the extra/src dbs merge BEFORE the builder db, so a row at this
+        // path with a DATA origin is NOT the driver and stays. The builder is architecturally never
+        // a recipe data input (a recipe names the virtual ABI identity, which has no materialized
+        // bytes, and realize rejects an output referencing it), so today this is always the driver
+        // row; the gate is fail-safe either way — a foreign-origin builder row STAYS → the key
+        // moves → a rebuild that re-enforces, never a silent stale-output hit. The builder's
+        // runtime-linkage inputs keep their rows and bind normally.
+        if real_builder_cb == Some(p)
+            && row.is_some_and(|si| si.origin == sandbox::InputOrigin::ControlPlaneBuilder)
         {
             continue;
         }
-        if paths.contains(p.as_str()) {
-            scoped.insert(p.clone(), si.clone());
+        match row {
+            Some(si) => {
+                scoped.insert(p.to_string(), si.clone());
+            }
+            None => {
+                absent.insert(p);
+            }
         }
     }
     let mut h = sha256::Sha256::new();
     h.update(manifest_digest(&scoped).as_bytes());
+    // Fold the sorted set of closure members with NO manifest row (Codex P1) so an unvouched
+    // member still moves the key. Deterministic (BTreeSet) and symmetric across read/write (the
+    // closure is derived by the shared `stage_input_closure`). Empty in every valid build.
+    h.update(b"\nabsent");
+    for p in &absent {
+        h.update(b"\n");
+        h.update(p.as_bytes());
+    }
     // Bind the drv's DECLARED builder IDENTITY (`parsed.builder`) IN PLACE OF the excluded
     // builder row — for a recipe drv the ABI-keyed `store::builder_identity_path()/bin/td-builder`,
     // content-INDEPENDENT, the SAME string `ReceiptExpect.builder` records. The output path already
@@ -9701,6 +9727,22 @@ daemon build START (2/2 active)
             reuse_key_manifest_digest(&cl1, &data_at_builder("d1"), &identity, Some(&builder_v1)),
             reuse_key_manifest_digest(&cl1, &data_at_builder("d2"), &identity, Some(&builder_v1)),
             "a DATA-origin row at the builder path must NOT be excluded — it must still bind"
+        );
+
+        // Codex P1: an UNVOUCHED closure member (in the closure, NO manifest row — e.g. a new
+        // builder runtime dep a same-ABI recompile pulled in) MOVES the key, so the read sites
+        // (which skip enforcement) cannot return a spurious hit; the forced miss rebuilds and
+        // re-runs enforce_realize_input_policy, which rejects the unvouched member. The digest is
+        // closure-driven, so the extra path lands in `absent` and perturbs the key even with no
+        // row of its own.
+        let dep = format!("/td/store/{}-newlib", "7".repeat(32));
+        let mut cl_with_dep = cl1.clone();
+        cl_with_dep.push(dep.clone()); // in the closure, but deliberately absent from m1
+        assert!(!m1.contains_key(&dep), "dep must be unvouched for this test");
+        assert_ne!(
+            reuse_key_manifest_digest(&cl1, &m1, &identity, Some(&builder_v1)),
+            reuse_key_manifest_digest(&cl_with_dep, &m1, &identity, Some(&builder_v1)),
+            "an unvouched closure member must move the key (forces a miss → enforcement)"
         );
     }
 
