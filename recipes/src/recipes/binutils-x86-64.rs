@@ -1,4 +1,6 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{
+    libtool_extract_without_find, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.44, CROSS to x86_64 (#378 slice 4, guix's cross-binutils):
@@ -37,6 +39,10 @@ pub fn recipe() -> Recipe {
         ),
         exec: true,
     });
+    // libbfd absorbs libsframe as a convenience archive. Without find, bundled
+    // libtool otherwise drops every extracted SFrame object and gas fails to
+    // link as-new with unresolved sframe_* symbols.
+    steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
     steps.push(
         Step::run(
             "{src}",
@@ -55,6 +61,11 @@ pub fn recipe() -> Recipe {
                 "--disable-plugins",
                 "--disable-gprofng",
                 "--disable-multilib",
+                // The compiler wrapper's implicit -static is invisible to
+                // libtool. Declare the mode so libbfd's static libsframe
+                // dependency is propagated when gas links as-new.
+                "--disable-shared",
+                "--enable-static",
             ],
         )
         .env("PATH", &path)
