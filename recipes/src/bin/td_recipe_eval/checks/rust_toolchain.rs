@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
@@ -109,8 +108,7 @@ fn reject_stage0_artifacts(stage0: &Path, final_tree: &Path) -> Result<(), Strin
     let stage0_base = path_basename(stage0)?.as_bytes();
     let mut stage0_hashes = HashMap::new();
     for path in regular_files(stage0)? {
-        let meta = fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-        if is_compiled_artifact(&path, &meta) {
+        if is_compiled_artifact(&path)? {
             stage0_hashes.insert(hash_file(&path)?, path);
         }
     }
@@ -133,6 +131,7 @@ fn reject_stage0_artifacts(stage0: &Path, final_tree: &Path) -> Result<(), Strin
                 ));
             }
         } else if meta.is_file() {
+            let compiled = is_compiled_artifact(&path)?;
             let (digest, contains_stage0) = hash_file_and_contains(&path, stage0_base)?;
             if contains_stage0 {
                 return Err(format!(
@@ -140,12 +139,14 @@ fn reject_stage0_artifacts(stage0: &Path, final_tree: &Path) -> Result<(), Strin
                     path.display()
                 ));
             }
-            if let Some(source) = stage0_hashes.get(&digest) {
-                return Err(format!(
-                    "final Rust toolchain copied compiled stage0 artifact {} byte-for-byte as {}",
-                    source.display(),
-                    path.display()
-                ));
+            if compiled {
+                if let Some(source) = stage0_hashes.get(&digest) {
+                    return Err(format!(
+                        "final Rust toolchain copied compiled stage0 artifact {} byte-for-byte as {}",
+                        source.display(),
+                        path.display()
+                    ));
+                }
             }
         }
     }
@@ -168,17 +169,25 @@ fn reject_shared_llvm(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn is_compiled_artifact(path: &Path, meta: &fs::Metadata) -> bool {
+fn is_compiled_artifact(path: &Path) -> Result<bool, String> {
     let name = path
         .file_name()
         .and_then(|part| part.to_str())
         .unwrap_or("");
-    meta.permissions().mode() & 0o111 != 0
-        || name.ends_with(".rlib")
+    if name.ends_with(".rlib")
         || name.ends_with(".a")
         || name.ends_with(".o")
         || name.ends_with(".so")
         || name.contains(".so.")
+    {
+        return Ok(true);
+    }
+    let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let len = file
+        .read(magic.as_mut_slice())
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(len == magic.len() && magic == *b"\x7fELF")
 }
 
 fn regular_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -260,8 +269,9 @@ fn hash_file_and_contains(path: &Path, needle: &[u8]) -> Result<([u8; 32], bool)
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_file_and_contains, Sha256};
+    use super::{hash_file_and_contains, is_compiled_artifact, Sha256};
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn combined_hash_scan_finds_a_needle_across_buffer_chunks() {
@@ -279,5 +289,21 @@ mod tests {
         assert!(!absent);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn compiled_artifact_classifier_uses_format_not_exec_bit() {
+        let base = std::env::temp_dir().join(format!("td-rust-artifact-{}", std::process::id()));
+        let script = base.with_extension("sh");
+        let elf = base.with_extension("bin");
+        fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&elf, b"\x7fELFtest").unwrap();
+
+        assert!(!is_compiled_artifact(&script).unwrap());
+        assert!(is_compiled_artifact(&elf).unwrap());
+
+        fs::remove_file(script).unwrap();
+        fs::remove_file(elf).unwrap();
     }
 }

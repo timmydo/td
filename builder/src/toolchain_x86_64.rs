@@ -1125,7 +1125,7 @@ mod tests {
 
     // A minimal uncompressed ustar archive of `(path, contents)` members —
     // `unpack_archive` dispatches to its raw-tar reader when there is no
-    // compression magic, so this drives `unpack_rust_release` end to end with
+    // compression magic, so this drives `unpack_rust_component` end to end with
     // no gzip writer. One 512-byte header per member + content padded to 512,
     // then two zero blocks.
     fn ustar(members: &[(&str, &[u8])]) -> Vec<u8> {

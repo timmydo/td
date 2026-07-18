@@ -311,7 +311,7 @@ jemalloc = false
                  test -x '{root}/rust-build/x86_64-unknown-linux-gnu/stage2/bin/rustc' && \
                  ls '{root}'/rust-build/x86_64-unknown-linux-gnu/stage1/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib >/dev/null && \
                  ls '{root}'/rust-build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib >/dev/null && \
-                 test -x '{root}/rust-build/x86_64-unknown-linux-gnu/stage2-tools-bin/cargo' && \
+                 test -x '{root}/rust-build/x86_64-unknown-linux-gnu/stage2-tools-bin/cargo' || { echo 'full-bootstrap did not produce all stage1/stage2 rustc, std, and Cargo outputs' >&2; exit 1; }; \
                  ! cmp -s '{root}/rust-build/x86_64-unknown-linux-gnu/stage1/bin/rustc' '{root}/rust-build/x86_64-unknown-linux-gnu/stage2/bin/rustc' || { echo 'full-bootstrap uplifted stage1 rustc as stage2' >&2; exit 1; }; \
                  for s1 in '{root}'/rust-build/x86_64-unknown-linux-gnu/stage1/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib; do \
                    for s2 in '{root}'/rust-build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib; do \
