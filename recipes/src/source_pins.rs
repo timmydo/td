@@ -60,6 +60,16 @@ const PINS: &[PinDef] = &[
         file: "busybox-1.37.0.tar.bz2",
     },
     PinDef {
+        key: "cmake-x86-64-source",
+        aliases: &[],
+        // CMake is the one explicitly approved new build-only dependency for the
+        // Rust bridge (PR #533). LLVM 22 requires CMake >= 3.20; the maintained
+        // 3.31 line is new enough without adopting a moving latest release.
+        url: "https://cmake.org/files/v3.31/cmake-3.31.12.tar.gz",
+        sha256: "5f3fd5a54dfa65602bdbed64f981a72673cc19f2d304cc2955cf0dfa0cfd8272",
+        file: "cmake-3.31.12.tar.gz",
+    },
+    PinDef {
         key: "coreutils-mesboot0-source",
         aliases: &[],
         // GNU coreutils 5.0 — the tcc-era coreutils provider (re #469). The exact
@@ -319,11 +329,35 @@ const PINS: &[PinDef] = &[
         file: "Python-3.11.1.tar.xz",
     },
     PinDef {
-        key: "rust-toolchain-source",
+        key: "rust-source",
         aliases: &[],
-        url: "https://static.rust-lang.org/dist/rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz",
-        sha256: "c1130e4f7976f230766ab062b105b1fb050d6a78177db2246a5878fd6a589680",
-        file: "rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz",
+        // The upstream source release is comprehensive: vendored Cargo sources,
+        // in-tree Cargo, and llvm-project are all inside this fixed-output input.
+        url: "https://static.rust-lang.org/dist/rustc-1.96.0-src.tar.xz",
+        sha256: "b99ce16cdf0ecfc761b585ac84d131b46733465a02f8ecd0ff2de9713c62ee09",
+        file: "rustc-1.96.0-src.tar.xz",
+    },
+    PinDef {
+        key: "rust-stage0-rustc-source",
+        aliases: &[],
+        // Exact bootstrap compiler selected by rustc 1.96.0's src/stage0.
+        url: "https://static.rust-lang.org/dist/2026-04-16/rustc-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "8426a3d170a5879f5682f5fbdd024a1779b3951e7baba685af2d6dc32a6dfc15",
+        file: "rustc-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
+    },
+    PinDef {
+        key: "rust-stage0-std-source",
+        aliases: &[],
+        url: "https://static.rust-lang.org/dist/2026-04-16/rust-std-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "047ea7098803d3500fa1072e9cee5392697e21525559e4458128a2bf874aa382",
+        file: "rust-std-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
+    },
+    PinDef {
+        key: "rust-stage0-cargo-source",
+        aliases: &[],
+        url: "https://static.rust-lang.org/dist/2026-04-16/cargo-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
+        sha256: "e74edd2cf7d0f1f1383b4f00eb90c843750bc489e2ccf7214e6476678a907425",
+        file: "cargo-1.95.0-x86_64-unknown-linux-gnu.tar.xz",
     },
     PinDef {
         key: "sed-mesboot-source",
@@ -409,8 +443,10 @@ mod tests {
         // m4-1.4.19 (the glibc-rung `bison` provider's macro processor, re #469) +
         // bison-3.8.2 (the glibc-rung parser generator, re #469) +
         // Python-3.11.1 (the glibc-rung python3, re #469) + GCC 10.5.0 (the
-        // compatibility bridge between gcc-mesboot 4.9.4 and GCC 14.3.0).
-        assert_eq!(all().len(), 44);
+        // compatibility bridge between gcc-mesboot 4.9.4 and GCC 14.3.0) +
+        // CMake 3.31.12 + Rust 1.96.0 source and its exact three-component
+        // Rust 1.95.0 bootstrap snapshot.
+        assert_eq!(all().len(), 48);
     }
 
     #[test]

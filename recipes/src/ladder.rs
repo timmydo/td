@@ -24,12 +24,11 @@ pub const BASH: &str = "bash-mesboot";
 /// under tcc + mes libc — coreutils/sed/grep/gawk/diffutils as
 /// `AuditedSeed`/`RecipeOutput` edges, never bare host names.
 ///
-/// `findutils` is deliberately absent as an evidenced DEAD axis: no rung
-/// declares it, no ToolFarm links `find`/`xargs`, and no baked script, patch, or
-/// Makefile fragment invokes either — they are not in the autoconf
-/// `configure`/`make` vocabulary these tarballs drive, so the PATH node would be
-/// pure phantom ingress. The `no_bootstrap_step_invokes_host_find_or_xargs`
-/// guard below locks it out.
+/// GNU findutils is deliberately absent as an evidenced DEAD axis for this
+/// bootstrap toolset. A later source build may expose BusyBox `find`/`xargs`
+/// through a ToolFarm only when it declares `busybox-x86-64`; the
+/// `no_bootstrap_step_invokes_host_find_or_xargs` guard below enforces that
+/// provenance instead of permitting an ambient PATH lookup.
 pub const MESBOOT0_TOOLS: &[&str] = &[
     "coreutils-mesboot0",
     "sed-mesboot0",
@@ -388,15 +387,14 @@ mod tests {
         }
     }
 
-    /// Dead-axis lock: `findutils` is absent from the tool tier after an
-    /// exhaustive sweep found no rung invokes `find`/`xargs` (not in any Run
+    /// Dead-axis lock: GNU findutils is absent from the tool tier after an
+    /// exhaustive sweep found no rung invokes ambient `find`/`xargs` (not in any Run
     /// argv, WriteFile body, ToolFarm link, or SubstituteText edit — and neither
     /// is in the autoconf `configure`/`make` vocabulary these tarballs drive).
     /// This walks the WHOLE catalog and fails if any rung reintroduces a host
     /// `find`/`xargs` invocation, which would silently need the removed PATH node
-    /// back. A future rung that legitimately needs `find` must declare a td-built
-    /// provider output (findutils/busybox), never the host tool, and update this
-    /// guard deliberately.
+    /// back. A rung may expose one only through a ToolFarm link to an explicitly
+    /// declared td-built BusyBox input; the Rust source build needs those tools.
     ///
     /// Coverage note: it scans every catalog-authored surface that becomes a
     /// command or an interpreted script/Makefile — Run argv, ANY WriteFile body
@@ -413,13 +411,24 @@ mod tests {
             for step in steps {
                 for text in command_texts(step) {
                     for cmd in ["find", "xargs"] {
+                        let declared_busybox_tool =
+                            recipe.native_inputs.as_ref().is_some_and(|inputs| {
+                                inputs.iter().any(|input| input == "busybox-x86-64")
+                            }) && matches!(
+                                step,
+                                Step::ToolFarm { links }
+                                    if links.iter().any(|(name, target)| {
+                                        name == cmd
+                                            && target
+                                                == "{in:busybox-x86-64}/bin/busybox"
+                                    })
+                            );
                         assert!(
-                            !invokes(text, cmd),
+                            !invokes(text, cmd) || declared_busybox_tool,
                             "recipe `{stem}' invokes `{cmd}' in `{text}' — \
-                             findutils was retired from the tool tier as a dead \
-                             axis; a rung that needs it must declare a \
-                             td-built provider output (findutils/busybox) and update \
-                             this guard deliberately, never lean on a host tool on PATH"
+                             GNU findutils was retired from the tool tier; a rung \
+                             must expose this command through a ToolFarm link to \
+                             its declared td-built busybox-x86-64 input"
                         );
                     }
                 }

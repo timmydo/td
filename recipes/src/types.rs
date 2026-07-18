@@ -42,14 +42,11 @@ pub enum BuildSystem {
     Cmake,
     Stage0,
     Mesboot,
-    /// The rust-toolchain TRANSFORM (#380): NOT a compile — the recipe's source is
-    /// a pinned upstream Rust release tarball and its inputs are the /td/store
-    /// x86_64 glibc/libgcc/libz; the engine's build::run_rust_toolchain extracts
-    /// rustc/cargo + the rustlib sysroot, co-locates the runtime closure, and
-    /// RELINKS the ELF interpreter onto td's own glibc loader (crate::elf, no
-    /// patchelf). A DECLARED-input, reproducible recipe — the first-class form of
-    /// the retired `toolchain-recipe rust-x86_64` shell subcommand.
-    RustToolchain,
+    /// The Rust stage0 TRANSFORM: NOT a compile. It assembles the exact upstream
+    /// rustc/rust-std/Cargo snapshot selected by the pinned Rust source, co-locates
+    /// its declared runtime closure, and retargets rustc/rustdoc/Cargo onto td's
+    /// glibc. Only the source-built stage2 recipe may consume this trust root.
+    RustStage0,
 }
 
 impl BuildSystem {
@@ -60,7 +57,7 @@ impl BuildSystem {
             BuildSystem::Cmake => "cmake",
             BuildSystem::Stage0 => "stage0",
             BuildSystem::Mesboot => "mesboot",
-            BuildSystem::RustToolchain => "rust-toolchain",
+            BuildSystem::RustStage0 => "rust-stage0",
         }
     }
 }
@@ -814,11 +811,10 @@ impl Recipe {
     pub fn mesboot(name: &str, version: &str) -> Recipe {
         Recipe::base(name, version, BuildSystem::Mesboot)
     }
-    /// The rust-toolchain TRANSFORM recipe (#380): `source` is the pinned upstream
-    /// Rust release tarball; `inputs` are the /td/store x86_64 glibc/libgcc/libz the
-    /// engine relinks against. No compile — see BuildSystem::RustToolchain.
-    pub fn rust_toolchain(name: &str, version: &str) -> Recipe {
-        Recipe::base(name, version, BuildSystem::RustToolchain)
+    /// The stage0-only Rust snapshot transform. The final `rust-toolchain` is a
+    /// separate source build and must never use this build-system constructor.
+    pub fn rust_stage0(name: &str, version: &str) -> Recipe {
+        Recipe::base(name, version, BuildSystem::RustStage0)
     }
 
     pub fn native_inputs(mut self, xs: &[&str]) -> Recipe {

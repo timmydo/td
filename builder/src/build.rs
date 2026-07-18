@@ -1409,14 +1409,12 @@ pub fn run_rust() -> Result<(), String> {
 ///                      carry internal whitespace, the same drv-safe encoding the
 ///                      autotools path uses.
 ///
-/// rust-toolchain-build — the pinned-upstream-Rust ELF-retarget TRANSFORM (#380).
-/// The declared-input, reproducible recipe form of the retired `toolchain-recipe
-/// rust-x86_64` subcommand: extract-and-relink the upstream Rust release onto the
-/// /td/store x86_64 glibc loader. Reads the drv env (out, TD_SRC, TD_INPUT_MAP);
-/// the transform itself lives beside its ELF helpers in `crate::toolchain_x86_64`.
-/// Sibling of run/run_rust/run_cmake/run_stage0/run_mesboot; same env-driven contract.
-pub fn run_rust_toolchain() -> Result<(), String> {
-    crate::toolchain_x86_64::run_rust_toolchain_build()
+/// rust-stage0-build — assemble the exact upstream Rust bootstrap components and
+/// retarget their ELF interpreters to td's declared runtime closure. This is the
+/// explicit bootstrap trust-root transform; `rust-toolchain` is a separate recipe
+/// that source-builds the shipped stage2 compiler, standard library, and Cargo.
+pub fn run_rust_stage0() -> Result<(), String> {
+    crate::toolchain_x86_64::run_rust_stage0_build()
 }
 
 /// Determinism: the configure pins CMAKE_BUILD_TYPE=Release and the build dir is a

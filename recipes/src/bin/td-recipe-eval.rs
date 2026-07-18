@@ -349,10 +349,15 @@ mod tests {
         // provider's macro processor, re #469) + bison-3.8.2 (the glibc-rung
         // parser generator, re #469) + Python-3.11.1 (the glibc-rung python3,
         // re #469) + GCC 10.5.0 (the compatibility bridge between
-        // gcc-mesboot 4.9.4 and GCC 14.3.0).
-        assert_eq!(pins.len(), 44);
+        // gcc-mesboot 4.9.4 and GCC 14.3.0) + CMake 3.31.12 + Rust 1.96.0
+        // source and its exact three-component Rust 1.95.0 stage0 snapshot.
+        assert_eq!(pins.len(), 48);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
-        assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
+        assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
+        assert!(pins.iter().any(|pin| pin.key == "rust-source"));
+        assert!(pins.iter().any(|pin| pin.key == "rust-stage0-rustc-source"));
+        assert!(pins.iter().any(|pin| pin.key == "rust-stage0-std-source"));
+        assert!(pins.iter().any(|pin| pin.key == "rust-stage0-cargo-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
         assert!(pins.iter().any(|pin| pin.key == "bash-mesboot-source"));
     }
