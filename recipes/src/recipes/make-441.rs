@@ -17,7 +17,9 @@ use crate::types::{Recipe, Step};
 // binutils-244 supplies as/ld/ar/ranlib.
 pub fn recipe() -> Recipe {
     let path = format!("{{in:binutils-244}}/bin:{}", mesboot0_path());
-    let mut steps = unpack_into("make-x86-64-source", "{src}");
+    // build-plan exposes a recipe's source under its local `<name>-source`
+    // alias even when sourceInput reuses a differently named shared pin.
+    let mut steps = unpack_into("make-441-source", "{src}");
     // Retarget every `#! /bin/sh` shebang to the declared shell — the host-free
     // sandbox has no /bin/sh for a directly-exec'd build helper to fall back on.
     steps.push(Step::PatchShebangs {
