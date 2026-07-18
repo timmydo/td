@@ -5,7 +5,7 @@
 # 1838 crates (static.crates.io) + 35 source blob(s).
 busybox.net/downloads/busybox-1.37.0.tar.bz2 https://busybox.net/downloads/busybox-1.37.0.tar.bz2 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4
 cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz 3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba
-cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.39.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.39.tar.xz a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0
+cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.4.tar.xz https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.4.tar.xz 1c63922a119675d38e3ae0f8f6ee07f15c41a786ab9ed66563749bb8c9a08e2e
 download.savannah.nongnu.org/releases/nyacc/nyacc-1.00.2.tar.gz https://download.savannah.nongnu.org/releases/nyacc/nyacc-1.00.2.tar.gz f36e4fb7dd524dc3f4b354d3d5313f69e7ce5a6ae93711e8cf6d51eaa8d2b318
 download.savannah.nongnu.org/releases/tinycc/tcc-0.9.27.tar.bz2 https://download.savannah.nongnu.org/releases/tinycc/tcc-0.9.27.tar.bz2 de23af78fca90ce32dff2dd45b3432b2334740bb9bb7b05bf60fdbfc396ceb9c
 ftp.gnu.org/gnu/binutils/binutils-2.20.1a.tar.bz2 https://ftp.gnu.org/gnu/binutils/binutils-2.20.1a.tar.bz2 71d37c96451333c5c0b84b170169fdcb138bbb27397dc06281905d9717c8ed64

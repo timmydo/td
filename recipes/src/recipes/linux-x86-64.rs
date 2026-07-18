@@ -3,9 +3,10 @@ use crate::ladder::{
 };
 use crate::types::{Recipe, Step};
 
-// linux-x86-64 (Linux 6.18.39 `vmlinux`): the capstone of the x86_64 ladder
-// (#529). Source-builds an uncompressed `vmlinux` ELF for the CURRENT LTS kernel
-// with td's OWN bootstrapped native toolchain — gcc-x86-64-native (GCC 14.3.0)
+// linux-x86-64 (Linux 7.1.4 `vmlinux`): the capstone of the x86_64 ladder
+// (#529). Source-builds an uncompressed `vmlinux` ELF for the latest STABLE
+// mainline kernel (not a longterm/LTS line) with td's OWN bootstrapped native
+// toolchain — gcc-x86-64-native (GCC 14.3.0)
 // as `CC`, binutils-x86-64-native as `LD/AR/NM/OBJCOPY`, driven by make-x86-64 —
 // proving the GCC/glibc ladder produces a real, modern-kernel-capable compiler.
 // `vmlinux` (not `bzImage`) is landed FIRST: the raw ELF target invokes no
@@ -19,7 +20,7 @@ use crate::types::{Recipe, Step};
 //     are generated during the build — the `*_shipped` parsers the 4.14 rung
 //     relied on are gone. Both are passed as LEX/YACC and are on PATH; each
 //     execs m4 (m4-mesboot, baked at their configure).
-//   - libelf (elfutils-x86-64): objtool is force-selected on x86_64 in 6.18
+//   - libelf (elfutils-x86-64): objtool is force-selected on x86_64 in 7.x
 //     (HAVE_STATIC_CALL_INLINE + HAVE_UACCESS_VALIDATION both `select OBJTOOL`
 //     unconditionally — no .config flip removes it), and objtool links libelf.
 //     td's static libelf.a is not self-contained, so a pkg-config shim feeds
@@ -35,8 +36,9 @@ use crate::types::{Recipe, Step};
 // 2.41 sysroot, plus the libelf headers. CC (the kernel target compiler) is the
 // BARE native gcc: kernel code is `-nostdinc` freestanding with its own headers,
 // and vmlinux is linked by `LD` (not gcc), so no glibc byte enters the image.
-// GCC 14 builds this 2025 source clean — no version-skew shim is needed (unlike
-// the retired 4.14 rung).
+// GCC 14.3.0 builds this modern (2026) source with no version-skew shim (unlike
+// the retired 4.14 rung); the daily backstop is the build-truth for a kernel bump
+// and surfaces any new GCC-14 warning or host-tool requirement a 7.x source adds.
 pub fn recipe() -> Recipe {
     let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
@@ -76,7 +78,7 @@ pub fn recipe() -> Recipe {
 
     // bc (busybox applet) for timeconst.h, linked into the {tools} farm that
     // mesboot0_path() lays on PATH, so Kbuild's parse-time `bc -q timeconst.bc`
-    // resolves it (Kbuild:21 in 6.18). BusyBox dispatches on argv[0].
+    // resolves it (the top-level Kbuild in 7.x). BusyBox dispatches on argv[0].
     steps.push(Step::ToolFarm {
         links: vec![("bc".into(), bb.into())],
     });
@@ -249,7 +251,7 @@ pub fn recipe() -> Recipe {
 
     // 4) Guard: the minimal invariant must hold before the full build. Fail HERE,
     //    with a named symbol, if the unwinder flip or the no-modules pin did not
-    //    take. (objtool IS expected on x86_64 6.18 — not asserted absent.)
+    //    take. (objtool IS expected on x86_64 7.x — not asserted absent.)
     steps.push(
         Step::run(
             "{src}",
@@ -313,7 +315,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &mesboot0_path()),
     );
 
-    Recipe::mesboot("linux-x86-64", "6.18.39")
+    Recipe::mesboot("linux-x86-64", "7.1.4")
         .source_input("linux-kernel-source")
         .native_inputs(&[
             "gcc-x86-64-native",

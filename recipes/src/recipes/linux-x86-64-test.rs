@@ -10,7 +10,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      type EXEC) — the EXEC assertion proves it was linked, so a stray
 //      relocatable `.o` (which would still be ELF64/x86-64 and carry the banner
 //      via init/version.o) cannot satisfy the check,
-//   2. it carries the `Linux version 6.18.39` banner (init/version.o's
+//   2. it carries the `Linux version 7.1.4` banner (init/version.o's
 //      linux_banner[], always obj-y) — proof the kernel actually compiled and
 //      linked, not just that some ELF exists,
 //   3. it embeds no `/gnu/store` bytes — the no-guix host-free leg, mirroring
@@ -44,7 +44,7 @@ pub fn recipe() -> Recipe {
                 SH,
                 "-c",
                 &format!(
-                    "grep -q -a 'Linux version 6.18.39' '{vmlinux}' || {{ echo 'vmlinux is missing the Linux 6.18.39 banner' >&2; exit 1; }}"
+                    "grep -q -a 'Linux version 7.1.4' '{vmlinux}' || {{ echo 'vmlinux is missing the Linux 7.1.4 banner' >&2; exit 1; }}"
                 ),
             ],
         )
@@ -69,7 +69,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Linux 6.18.39 vmlinux, source-built by the native /td/store x86_64 toolchain, is a well-formed ELF64 x86-64 image carrying the Linux banner\n".into(),
+        content: "PASS: Linux 7.1.4 vmlinux, source-built by the native /td/store x86_64 toolchain, is a well-formed ELF64 x86-64 image carrying the Linux banner\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -83,7 +83,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::daily(
             r#"
-echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 6.18.39 vmlinux, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 image with the Linux banner"
+echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 image with the Linux banner"
 : "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run linux-x86-64-test daily 1
 "#,

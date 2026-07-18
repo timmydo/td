@@ -95,9 +95,9 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // elfutils 0.192 — the source of `libelf`, which the modern Linux kernel's
         // objtool host tool links against (re #529). objtool is force-selected on
-        // x86_64 in 6.18 (HAVE_STATIC_CALL_INLINE + HAVE_UACCESS_VALIDATION both
-        // `select OBJTOOL` unconditionally), so libelf is not avoidable the way it
-        // was in the 4.14 rung. The `elfutils-x86-64` recipe builds ONLY libelf.a
+        // x86_64 in current kernels (7.x: HAVE_STATIC_CALL_INLINE +
+        // HAVE_UACCESS_VALIDATION both `select OBJTOOL` unconditionally), so libelf
+        // is not avoidable the way it was in the 4.14 rung. The `elfutils-x86-64` recipe builds ONLY libelf.a
         // + headers from this tarball with td's native x86_64 toolchain; objtool
         // tolerates old libelf (it defines LIBELF_USE_DEPRECATED), so the exact
         // version is not load-bearing. 0.192 is a deliberate stable pin (a
@@ -277,15 +277,17 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "linux-kernel-source",
         aliases: &[],
-        // Linux 6.18.39 — the current LTS kernel the `linux-x86-64` rung
-        // source-builds into a bootable x86_64 `vmlinux` with td's native
-        // toolchain (re #529). DISTINCT from the `linux-source` pin above: this is
-        // the full kernel tree to compile, kept current; that one is the frozen
-        // 4.14 UAPI-header source for the toolchain. Keeping them separate confines
-        // a kernel bump to this one rung instead of the whole ladder.
-        url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.39.tar.xz",
-        sha256: "a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0",
-        file: "linux-6.18.39.tar.xz",
+        // Linux 7.1.4 — the latest STABLE mainline kernel (not a longterm/LTS
+        // line) the `linux-x86-64` rung source-builds into a bootable x86_64
+        // `vmlinux` with td's native toolchain (re #529). DISTINCT from the
+        // `linux-source` pin above: this is the full kernel tree to compile, kept
+        // current; that one is the frozen 4.14 UAPI-header source for the
+        // toolchain. Keeping them separate confines a kernel bump to this one rung
+        // instead of the whole ladder. A reviewed update bumps version + sha256 +
+        // the seed-digests.txt row together.
+        url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.4.tar.xz",
+        sha256: "1c63922a119675d38e3ae0f8f6ee07f15c41a786ab9ed66563749bb8c9a08e2e",
+        file: "linux-7.1.4.tar.xz",
     },
     PinDef {
         key: "m4-mesboot-source",
