@@ -1,0 +1,163 @@
+# Daily full-suite backstop, as a scheduled GitHub Action.
+#
+# This is the MECHANICAL half of the daily backstop (ci/daily-backstop.md): once a
+# day it runs `td-builder daily` on fresh main and PUBLISHES the machine-readable
+# verdict (+ run log) as a workflow artifact, so the SEPARATE daily healing
+# automation (a scheduled agent) can read the run and open a fix-or-revert PR. This
+# workflow does NOT triage or open PRs itself — it only produces the verdict and,
+# on a REAL regression, a signal (a rolling `daily-red` tracking issue + a red job).
+#
+# RUNNER (deliberate — github-hosted by the setup decision, repointable in one var):
+#   A from-seed daily (stage0-posix -> Mes -> TinyCC -> the GCC/glibc ladder -> the
+#   Rust bridge) needs the warm loop prelude + a resolvable loop toolchain. A COLD
+#   github-hosted runner has neither, so `td-builder daily` here will either
+#   fast-exit 10 (EXIT_UNPROVISIONED -> "runner not provisioned": a HOST SETUP GAP,
+#   not a regression) or attempt a multi-hour cold from-seed build and hit the
+#   timeout. Neither is an authoritative daily. For that, set the repo/org variable
+#   DAILY_RUNNER to a WARM self-hosted runner label (see ci/daily-backstop.md) — no
+#   workflow edit needed; `runs-on` falls back to `ubuntu-latest` when unset.
+#
+# EXIT-CODE CONTRACT (builder/src/daily.rs), mapped to the job conclusion:
+#   0        all green                                   -> success (record only)
+#   1|2|3    REAL regression (bitfield: 1 heavy, 2 sys)  -> signal red (issue + fail)
+#   8|9      setup/infra error (bad arg / git fetch)     -> fail the job
+#   10       runner unprovisioned for every leg          -> NEUTRAL (no signal, pass)
+# Exit 10 is the EXPECTED outcome on a cold hosted runner; it is a host gap, not a
+# code regression, so the schedule is not failed and no issue is opened (no crying
+# wolf). The issue-signal path is therefore dormant on hosted and lights up once
+# DAILY_RUNNER points at a provisioned runner that can actually run the gates.
+
+name: daily
+
+on:
+  schedule:
+    # 11:17 UTC (~04:17 America/Los_Angeles). Off the :00 mark so GitHub's
+    # scheduled-run congestion / a synchronized fleet doesn't stampede. cron is
+    # UTC only (no DST tracking); the exact minute is not load-bearing.
+    - cron: '17 11 * * *'
+  # Manual runs for testing / on-demand backstops.
+  workflow_dispatch: {}
+
+# One daily at a time; do not cancel an in-flight from-seed run when the next
+# schedule (or a manual dispatch) fires — let it finish.
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write   # the rolling `daily-red` tracking issue (real-regression signal)
+
+jobs:
+  daily:
+    # Repointable to a warm self-hosted runner via the DAILY_RUNNER repo/org
+    # variable (a label, e.g. `self-hosted`); falls back to github-hosted.
+    runs-on: ${{ vars.DAILY_RUNNER || 'ubuntu-latest' }}
+    # Bounds a wasted cold hosted run AND a warm self-hosted run (~30 min there;
+    # the daily forces a cold chain cache + subst rebuild, so it is the real
+    # from-seed proof, not a cache replay). Raise this if a fully-cold self-hosted
+    # box needs the multi-hour first build.
+    timeout-minutes: 120
+    steps:
+      # SHA-pinned (= actions/checkout v4): matches this repo's pinned-inputs
+      # posture (.github/workflows/ci.yml). Full history: the verdict's suspect
+      # range and the healing agent's `git log <last-green>..main` triage need it.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: build the engine (dependency-free, offline)
+        # The builder crate carries zero crates (AGENTS.md), so --frozen
+        # (= --locked --offline) builds with no network, like the ci.yml gate.
+        run: cargo build --release --frozen --manifest-path builder/Cargo.toml
+
+      - name: run the daily backstop (capture the exit bitfield)
+        id: daily
+        run: |
+          set -uo pipefail
+          jobs="$(nproc 2>/dev/null || echo 4)"
+          set +e
+          TD_BUILD_JOBS="$jobs" builder/target/release/td-builder daily \
+            --verdict .td-daily-verdict 2>&1 | tee daily-run.log
+          rc="${PIPESTATUS[0]}"
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "td-builder daily exit code: $rc"
+
+      - name: publish the verdict + run log (the automation's input)
+        if: always()
+        # SHA-pinned (= actions/upload-artifact v4).
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: daily-verdict
+          path: |
+            .td-daily-verdict
+            daily-run.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: interpret the verdict + signal on a real regression
+        if: always()
+        env:
+          RC: ${{ steps.daily.outputs.rc }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rc="${RC:-99}"
+
+          # Job Summary: always show the exit code + the verdict.
+          {
+            echo "## Daily backstop verdict"
+            echo
+            echo "\`td-builder daily\` exit code: **$rc**"
+            echo
+            echo '```'
+            cat .td-daily-verdict 2>/dev/null || echo "(no .td-daily-verdict written)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$rc" in
+            0)
+              echo "ALL GREEN — main is clean at this run."
+              ;;
+            1|2|3)
+              echo "REAL REGRESSION (bitfield rc=$rc) — signalling via the daily-red issue."
+              {
+                echo "The scheduled daily backstop is RED (\`td-builder daily\` exit $rc)."
+                echo
+                echo "Verdict:"
+                echo '```'
+                cat .td-daily-verdict 2>/dev/null || true
+                echo '```'
+                echo
+                echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+                echo
+                # Single-quoted: the $(...) / backticks below are LITERAL triage
+                # instructions for the healing agent, not evaluated here.
+                echo 'Healing agent: triage `git log $(cat .td-last-green 2>/dev/null || echo origin/main~10)..origin/main`, reproduce the failing gate (the `*_fail` field names it) to confirm it is a real regression (not host contention), and open a FIX-OR-REVERT PR (no auto-merge — a human merges). Revert helper: `ci/revert-suspect.sh --ref <sha> --open-pr`. Close this issue when the fix/revert lands.'
+              } > issue-body.md
+              # One rolling open issue: comment if present, else create.
+              existing="$(gh issue list --label daily-red --state open --json number --jq '.[0].number' 2>/dev/null || true)"
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --body-file issue-body.md
+              else
+                gh label create daily-red --color b60205 \
+                  --description "Daily full-suite backstop regression" 2>/dev/null || true
+                gh issue create --title "Daily backstop RED" --label daily-red --body-file issue-body.md
+              fi
+              exit 1
+              ;;
+            8|9)
+              echo "SETUP/INFRA ERROR (rc=$rc: bad arg / git fetch failed / no engine) — failing."
+              exit 1
+              ;;
+            10)
+              echo "RUNNER UNPROVISIONED (rc=10) — a HOST SETUP GAP on a cold github-hosted runner,"
+              echo "NOT a code regression. Neutral outcome; no issue opened. Point DAILY_RUNNER at a"
+              echo "warm self-hosted runner for an authoritative daily (see ci/daily-backstop.md)."
+              ;;
+            *)
+              echo "UNEXPECTED exit code rc=$rc — failing so it is not silently ignored."
+              exit 1
+              ;;
+          esac
