@@ -383,6 +383,22 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
         .to_string())
 }
 
+/// The RUSTFLAGS that statically link a pure-`std` control-plane binary against
+/// a MATCHED static glibc (`glibc_static_lib` = a glibc `static` output's `lib/`,
+/// as `provision_glibc_static` resolves): `+crt-static` pulls in `libc.a`/`libm.a`;
+/// the NON-pie relocation model dodges a static-PIE glibc startup crash; `-L`
+/// points the linker at the matched static glibc's archives (its crt objects come
+/// from the gcc driver — only the archives need the search path). Shared by every
+/// host-side control-plane build site (`bootstrap_stage0`, the recipe-eval gate,
+/// `tests/recipe-eval-tool.sh` via the `provision-glibc-static` verb) so each
+/// links IDENTICALLY: an empty runtime closure, no DT_RUNPATH into a mutable
+/// host/guix-home profile whose libgcc_s.so.1/libc.so.6 vanish mid-GC and flake
+/// the tool with exit 127 (re #469; fixes the daily backstop libgcc_s flake at
+/// the source rather than pinning a runpath).
+pub(crate) fn static_rustflags(glibc_static_lib: &str) -> String {
+    format!("-C target-feature=+crt-static -C relocation-model=static -L {glibc_static_lib}")
+}
+
 /// A scratch dir under the system temp dir, unique per process (pid + a
 /// counter — no clock/randomness), removed by `RemoveOnDrop`.
 fn scratch_dir(tag: &str) -> Result<PathBuf, String> {
@@ -450,14 +466,10 @@ pub(crate) fn bootstrap_stage0(
     // any ambient lookup.
     let cargo = find_in_path(&bootpath, "cargo")
         .ok_or_else(|| format!("no cargo on the provisioned toolchain PATH ({bootpath})"))?;
-    // Static link (re #469): `+crt-static` links glibc's `libc.a`/`libm.a`; the
-    // NON-pie relocation model dodges a static-PIE glibc startup crash; `-L`
-    // points the linker at the MATCHED static glibc (its crt objects come from
-    // the gcc driver — only the archives need the search path). RUSTFLAGS is
-    // added to the CLEARED env; it applies to the build script too, which then
-    // also links + runs static (proven fine with the non-pie model).
-    let rustflags =
-        format!("-C target-feature=+crt-static -C relocation-model=static -L {glibc_static_lib}");
+    // Static link (re #469) — see `static_rustflags`. RUSTFLAGS is added to the
+    // CLEARED env; it applies to the build script too, which then also links +
+    // runs static (proven fine with the non-pie model).
+    let rustflags = static_rustflags(glibc_static_lib);
     let build = Command::new(&cargo)
         .env_clear()
         .env("PATH", &bootpath)

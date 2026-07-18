@@ -1861,37 +1861,22 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
 
     let old_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{rustpath}:{ccpath}:{old_path}");
-    // Bake an IMMUTABLE runpath into the built evaluator (and its cargo
-    // build-script binaries): guix's gcc ld-wrapper turns each LIBRARY_PATH
-    // entry into a DT_RUNPATH -rpath. Left at the ambient ~/.guix-home/profile/lib
-    // the binaries load libgcc_s/libc from a MUTABLE guix-home profile that
-    // disappears while guix-home reconfigures or GCs ("error while loading
-    // shared libraries: libgcc_s.so.1", exit 127). Prepend the content-addressed
-    // provision-cc toolchain lib dir(s) — each ".../bin" has a sibling ".../lib"
-    // holding the toolchain's libc/libgcc_s — so resolution stays stable.
-    let cc_libdirs = ccpath
-        .split(':')
-        .filter(|d| !d.is_empty())
-        .map(|d| match d.strip_suffix("/bin") {
-            Some(base) => format!("{base}/lib"),
-            None => d.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(":");
-    // Prepend the immutable toolchain lib dir(s), keeping any ambient
-    // LIBRARY_PATH as a lower-priority fallback: loader search is first-match,
-    // so libc/libgcc_s resolve from the immutable /lib and do not depend on the
-    // mutable guix-home profile. Guard the empty cases so the result never has a
-    // leading/lone ':' — LIBRARY_PATH reads an empty entry as the CWD.
-    let old_library_path = std::env::var("LIBRARY_PATH").unwrap_or_default();
-    let new_library_path = match (cc_libdirs.is_empty(), old_library_path.is_empty()) {
-        (true, _) => old_library_path,
-        (false, true) => cc_libdirs,
-        (false, false) => format!("{cc_libdirs}:{old_library_path}"),
-    };
+    // STATICALLY link the evaluator (and its cargo build-script/test binaries)
+    // against a MATCHED static glibc. A static binary has an EMPTY runtime closure
+    // — no DT_NEEDED, no DT_RUNPATH — so it can never load libgcc_s.so.1/libc.so.6
+    // from the MUTABLE ~/.guix-home/profile/lib that guix's gcc ld-wrapper would
+    // otherwise bake in as a runpath and that vanishes while guix-home reconfigures
+    // or GCs ("error while loading shared libraries: libgcc_s.so.1", exit 127),
+    // flaking this control-plane tool and reddening the daily backstop. Fixing it
+    // at the SOURCE (crt-static) supersedes pinning a runpath (re #469). The recipes
+    // crate is dependency-free (pure std, no proc-macros) so the flags apply
+    // cleanly to the whole build; see stage0::static_rustflags.
+    let glibc_static = crate::stage0::provision_glibc_static(&penv)
+        .map_err(|e| format!("FAIL: provision static glibc for a crt-static evaluator: {e}"))?;
+    let rustflags = crate::stage0::static_rustflags(&glibc_static);
     let envs: [(&str, &str); 4] = [
         ("PATH", &new_path),
-        ("LIBRARY_PATH", &new_library_path),
+        ("RUSTFLAGS", &rustflags),
         ("CARGO_HOME", &cargo_home_s),
         ("CARGO_TARGET_DIR", &cargo_target_s),
     ];
@@ -1930,6 +1915,10 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
             eval.display()
         ));
     }
+    // Fail closed if the toolchain silently linked the evaluator dynamically: a
+    // dynamic control-plane binary drags a host runtime closure (and a mutable
+    // guix-home runpath) that the #469 sandbox boundary must deny.
+    crate::elf::assert_static(&eval)?;
     let eval_s = path_str(&eval)?;
 
     // CLI smoke: `cargo test` proves EVERY recipe's data is correct

@@ -23,41 +23,32 @@ td="${TD_BUILDER_SELF:?recipe-eval-tool requires TD_BUILDER_SELF (gate-run expor
 rustpath=`"$td" provision-rust` || { echo "recipe-eval-tool: could not provision a rust toolchain (td-builder provision-rust)" >&2; exit 1; }
 ccpath=`"$td" provision-cc` || { echo "recipe-eval-tool: could not provision a C toolchain (td-builder provision-cc)" >&2; exit 1; }
 
-# Bake an IMMUTABLE runpath into the evaluator (and its cargo build-script
-# binaries). guix's gcc ld-wrapper turns every LIBRARY_PATH entry into a
-# DT_RUNPATH -rpath; the ambient value is ~/.guix-home/profile/lib, a MUTABLE
-# guix-home profile whose libgcc_s.so.1/libc.so.6 vanish while guix-home
-# reconfigures or GCs — which flakes this control-plane tool with "error while
-# loading shared libraries: libgcc_s.so.1" (exit 127) and reddened the daily
-# backstop. Point the runpath at the content-addressed provision-cc toolchain
-# lib dir(s) instead: each ".../bin" on the cc PATH has a sibling ".../lib"
-# holding the toolchain's libc/libgcc_s, so the loaded libraries no longer
-# depend on the mutable guix-home profile being present.
-cclib=""
-old_ifs=$IFS
-set -f            # split $ccpath on ':' only — never glob these store paths
-IFS=:
-for _d in $ccpath; do
-  [ -n "$_d" ] || continue
-  case $_d in */bin) _d="${_d%/bin}/lib" ;; esac
-  cclib="${cclib:+$cclib:}$_d"
-done
-IFS=$old_ifs
-set +f
+# STATICALLY link the evaluator (and its cargo build-script binaries) against a
+# MATCHED static glibc. A static binary has an EMPTY runtime closure — no
+# DT_NEEDED, no DT_RUNPATH — so it never loads libgcc_s.so.1/libc.so.6 from the
+# MUTABLE ~/.guix-home/profile/lib that guix's gcc ld-wrapper would otherwise
+# bake in as a runpath and that vanishes while guix-home reconfigures or GCs
+# ("error while loading shared libraries: libgcc_s.so.1", exit 127), flaking
+# this control-plane tool and reddening the daily backstop. Fixing it at the
+# SOURCE (crt-static) supersedes pinning a runpath (re #469). The recipes crate
+# is dependency-free (pure std, no proc-macros) so the flags apply cleanly. The
+# `-L` store path has no spaces, so the double-quoted RUSTFLAGS never splits.
+gstatic=`"$td" provision-glibc-static` || { echo "recipe-eval-tool: no matched static glibc (td-builder provision-glibc-static) — set TD_GLIBC_STATIC_HOME, install a build-essential cc, or pin one in the lock" >&2; exit 1; }
 
 mkdir -p "$base/home" "$base/target"
-# Prepend the immutable toolchain lib dir(s), keeping any ambient LIBRARY_PATH as
-# a lower-priority fallback (loader search is first-match). Guard the empty case
-# so the value never has a leading ':', which LIBRARY_PATH reads as the CWD.
-libpath="${cclib:+$cclib${LIBRARY_PATH:+:}}${LIBRARY_PATH:-}"
 PATH="$rustpath:$ccpath:$PATH" \
-LIBRARY_PATH="$libpath" \
+RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static -L $gstatic" \
 CARGO_HOME="$base/home" CARGO_TARGET_DIR="$base/target" \
   cargo build --release --frozen --manifest-path "$root/recipes/Cargo.toml" >"$base/build.log" 2>&1 \
   || { echo "recipe-eval-tool: cargo build failed:" >&2; tail -20 "$base/build.log" >&2; exit 1; }
 
 bin="$base/target/release/td-recipe-eval"
 test -x "$bin" || { echo "recipe-eval-tool: no td-recipe-eval at $bin" >&2; exit 1; }
+
+# Fail closed if the toolchain silently linked the evaluator dynamically: a
+# dynamic control-plane binary drags a host runtime closure (and a mutable
+# guix-home runpath) that the #469 sandbox boundary must deny.
+"$td" assert-static "$bin" >/dev/null || { echo "recipe-eval-tool: td-recipe-eval is not statically linked" >&2; exit 1; }
 
 printf '%s\n' "$bin" > "$base/recipe-eval-path"
 echo "$bin"

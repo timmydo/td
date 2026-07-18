@@ -1091,18 +1091,105 @@ fn newstore_bin(root: &Path, newstore_rel: &str, bin: &str) -> Option<PathBuf> {
 /// build fails, or it outlives the warm deadline (a hung cargo — e.g. a stale
 /// target-dir lock — must not stall the prelude; every warm is best-effort,
 /// the gates enforce presence).
+/// Resolve `bin` in a `:`-joined PATH fragment (the form `stage0::provision_*`
+/// return) to an absolute executable: the child runs under a provisioned
+/// toolchain PATH, so the binary must come from THERE, not an ambient lookup.
+fn find_in_frags(frags: &str, bin: &str) -> Option<PathBuf> {
+    frags.split(':').filter(|f| !f.is_empty()).find_map(|d| {
+        let p = Path::new(d).join(bin);
+        p.is_file().then_some(p)
+    })
+}
+
+/// Build a td network tool (`dir` = feed/fetch/subst) with the HOST cargo,
+/// STATICALLY linked (crt-static against a matched glibc), and return the
+/// binary. Best-effort: any missing piece (no toolchain, no static glibc, a
+/// non-static result) logs and returns `None` so the warm degrades to the
+/// td-built binary or is skipped — it never returns a DYNAMICALLY linked
+/// control-plane tool, which would drag a mutable host/guix-home runpath and
+/// flake with `libgcc_s.so.1` exit 127 (re #469).
+///
+/// Unlike the pure-std tools, the network crates (ureq/rustls/ring) pull in
+/// PROC-MACROS that must compile for the host compiler, so `+crt-static` cannot
+/// go in a global RUSTFLAGS (it would try to statically link the proc-macro
+/// dylibs — "does not support these crate types"). Instead pass `--target
+/// <host-triple>` and set the PER-TARGET rustflags env: cargo then applies the
+/// static flags to the final binary + its normal deps only, leaving host-kind
+/// build scripts / proc-macros dynamic. ring's `cc-rs` build script needs a
+/// `cc`, which the gcc-toolchain provides as `gcc` — pointed at via CC/HOST_CC,
+/// with AR alongside.
 fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) -> Option<PathBuf> {
-    find_in_path("cargo")?;
-    let mut child = Command::new("cargo")
-        .args(["build", "--release", "--quiet"])
+    let penv = crate::stage0::ProvisionEnv::from_env(root);
+    let rustpath = crate::stage0::provision_rust(&penv).ok()?;
+    let ccpath = crate::stage0::provision_cc(&penv).ok()?;
+    let glibc_static = match crate::stage0::provision_glibc_static(&penv) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "td-builder check: static {bin}: no matched static glibc ({e}) — skipping host build"
+            );
+            return None;
+        }
+    };
+    let cargo = find_in_frags(&rustpath, "cargo")?;
+    let rustc = find_in_frags(&rustpath, "rustc")?;
+    let cc = find_in_frags(&ccpath, "cc").or_else(|| find_in_frags(&ccpath, "gcc"))?;
+    let ar = find_in_frags(&ccpath, "ar")?;
+
+    // Host target triple from `rustc -vV`'s `host:` line, and the matching
+    // per-target rustflags env var (`CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, triple
+    // uppercased with '-' → '_').
+    let vv = Command::new(&rustc)
+        .arg("-vV")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let vv_text = String::from_utf8_lossy(&vv.stdout);
+    let triple = vv_text
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .map(str::trim)?
+        .to_string();
+    let target_flags_var = format!(
+        "CARGO_TARGET_{}_RUSTFLAGS",
+        triple.to_uppercase().replace('-', "_")
+    );
+    let rustflags = crate::stage0::static_rustflags(&glibc_static);
+    let ambient_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{rustpath}:{ccpath}:{ambient_path}");
+
+    let mut child = Command::new(&cargo)
+        .args(["build", "--release", "--quiet", "--target", &triple])
         .current_dir(root.join(dir))
+        .env("PATH", &new_path)
+        .env("CC", &cc)
+        .env("HOST_CC", &cc)
+        .env("AR", &ar)
+        .env(&target_flags_var, &rustflags)
+        .stdin(Stdio::null())
         .spawn()
         .ok()?;
     if !wait_with_deadline(&mut child, deadline) {
         return None;
     }
-    let p = root.join(dir).join("target/release").join(bin);
-    p.is_file().then_some(p)
+    let p = root
+        .join(dir)
+        .join("target")
+        .join(&triple)
+        .join("release")
+        .join(bin);
+    if !p.is_file() {
+        return None;
+    }
+    // Fail closed on a non-static result rather than hand a dynamic control-plane
+    // binary to the warm (re #469).
+    if let Err(e) = crate::elf::assert_static(&p) {
+        eprintln!(
+            "td-builder check: static {bin}: host build produced a non-static binary ({e}) — skipping"
+        );
+        return None;
+    }
+    Some(p)
 }
 
 /// One `[[package]]` entry of a Cargo.lock that carries a checksum — `(name,
