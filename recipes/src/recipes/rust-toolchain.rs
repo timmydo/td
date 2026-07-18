@@ -52,7 +52,7 @@ pub fn recipe() -> Recipe {
             "#!{SH}\nexec \"{ngcc}\" -idirafter \"{xglibc}/include\" \
              -idirafter \"{{root}}/kh\" -B\"{nbin}/\" -B\"{xglibc}/lib\" \
              -L\"{xglibc}/lib\" -static-libgcc \
-             -Wl,--dynamic-linker -Wl,\"{xglibc}/lib/ld-linux-x86-64.so.2\" \
+             -Wl,--dynamic-linker=\"{xglibc}/lib/ld-linux-x86-64.so.2\" \
              -Wl,--enable-new-dtags -Wl,-rpath -Wl,\"{xglibc}/lib\" \"$@\"\n"
         ),
         exec: true,
@@ -63,7 +63,7 @@ pub fn recipe() -> Recipe {
             "#!{SH}\nexec \"{ngpp}\" -idirafter \"{xglibc}/include\" \
              -idirafter \"{{root}}/kh\" -B\"{nbin}/\" -B\"{xglibc}/lib\" \
              -L\"{xglibc}/lib\" -static-libgcc -static-libstdc++ \
-             -Wl,--dynamic-linker -Wl,\"{xglibc}/lib/ld-linux-x86-64.so.2\" \
+             -Wl,--dynamic-linker=\"{xglibc}/lib/ld-linux-x86-64.so.2\" \
              -Wl,--enable-new-dtags -Wl,-rpath -Wl,\"{xglibc}/lib\" \"$@\"\n"
         ),
         exec: true,

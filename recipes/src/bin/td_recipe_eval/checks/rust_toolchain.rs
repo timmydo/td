@@ -133,13 +133,13 @@ fn reject_stage0_artifacts(stage0: &Path, final_tree: &Path) -> Result<(), Strin
                 ));
             }
         } else if meta.is_file() {
-            if file_contains(&path, stage0_base)? {
+            let (digest, contains_stage0) = hash_file_and_contains(&path, stage0_base)?;
+            if contains_stage0 {
                 return Err(format!(
                     "final Rust toolchain file {} contains the rust-stage0 store basename",
                     path.display()
                 ));
             }
-            let digest = hash_file(&path)?;
             if let Some(source) = stage0_hashes.get(&digest) {
                 return Err(format!(
                     "final Rust toolchain copied compiled stage0 artifact {} byte-for-byte as {}",
@@ -220,9 +220,18 @@ fn tree_entries(root: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn hash_file(path: &Path) -> Result<[u8; 32], String> {
+    Ok(hash_file_and_contains(path, &[])?.0)
+}
+
+/// Hash a file and scan for a byte sequence in one pass. Final Rust/LLVM
+/// artifacts are large enough that reading each once keeps the daily trust-root
+/// check bounded without weakening either oracle.
+fn hash_file_and_contains(path: &Path, needle: &[u8]) -> Result<([u8; 32], bool), String> {
     let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
+    let mut carry = Vec::new();
+    let mut contains = needle.is_empty();
     loop {
         let len = file
             .read(buffer.as_mut_slice())
@@ -234,38 +243,41 @@ fn hash_file(path: &Path) -> Result<[u8; 32], String> {
             .get(..len)
             .ok_or_else(|| format!("invalid read length {len} for {}", path.display()))?;
         hasher.update(bytes);
+        if !contains {
+            let mut scan = Vec::with_capacity(carry.len() + bytes.len());
+            scan.extend_from_slice(&carry);
+            scan.extend_from_slice(bytes);
+            contains = scan.windows(needle.len()).any(|part| part == needle);
+            let keep = needle.len().saturating_sub(1).min(scan.len());
+            carry.clear();
+            if let Some(tail) = scan.get(scan.len().saturating_sub(keep)..) {
+                carry.extend_from_slice(tail);
+            }
+        }
     }
-    Ok(hasher.finalize())
+    Ok((hasher.finalize(), contains))
 }
 
-fn file_contains(path: &Path, needle: &[u8]) -> Result<bool, String> {
-    if needle.is_empty() {
-        return Ok(true);
+#[cfg(test)]
+mod tests {
+    use super::{hash_file_and_contains, Sha256};
+    use std::fs;
+
+    #[test]
+    fn combined_hash_scan_finds_a_needle_across_buffer_chunks() {
+        let path = std::env::temp_dir().join(format!("td-rust-hash-scan-{}", std::process::id()));
+        let mut bytes = vec![b'x'; 64 * 1024 - 2];
+        bytes.extend_from_slice(b"stage0-store-name");
+        fs::write(&path, &bytes).unwrap();
+
+        let mut expected = Sha256::new();
+        expected.update(&bytes);
+        let (digest, found) = hash_file_and_contains(&path, b"stage0-store-name").unwrap();
+        let (_, absent) = hash_file_and_contains(&path, b"not-present").unwrap();
+        assert_eq!(digest, expected.finalize());
+        assert!(found);
+        assert!(!absent);
+
+        fs::remove_file(path).unwrap();
     }
-    let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut buffer = [0u8; 64 * 1024];
-    let mut carry = Vec::new();
-    loop {
-        let len = file
-            .read(buffer.as_mut_slice())
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        if len == 0 {
-            break;
-        }
-        let bytes = buffer
-            .get(..len)
-            .ok_or_else(|| format!("invalid read length {len} for {}", path.display()))?;
-        let mut scan = Vec::with_capacity(carry.len() + bytes.len());
-        scan.extend_from_slice(&carry);
-        scan.extend_from_slice(bytes);
-        if scan.windows(needle.len()).any(|part| part == needle) {
-            return Ok(true);
-        }
-        let keep = needle.len().saturating_sub(1).min(scan.len());
-        carry.clear();
-        if let Some(tail) = scan.get(scan.len().saturating_sub(keep)..) {
-            carry.extend_from_slice(tail);
-        }
-    }
-    Ok(false)
 }
