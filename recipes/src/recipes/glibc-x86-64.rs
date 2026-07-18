@@ -1,6 +1,6 @@
 use crate::ladder::{
-    SH, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i, unpack_into,
-    unpack_keep_top,
+    SH, glibc241_host_free_fixups, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i,
+    unpack_into, unpack_keep_top,
 };
 use crate::types::{Recipe, Step, TextEdit};
 
@@ -32,6 +32,7 @@ pub fn recipe() -> Recipe {
     let stage = "{out}/stage/td/store/glibc-2.41-x86_64";
     let lp = "{in:glibc-mesboot-shared}/lib";
     let mut steps = unpack_into("glibc-x86-64-source", "{src}");
+    steps.extend(glibc241_host_free_fixups());
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
     steps.push(Step::ToolFarm {
         links: vec![

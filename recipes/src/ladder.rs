@@ -282,6 +282,72 @@ pub fn gcc_disable_selftest() -> Step {
     )
 }
 
+/// Make glibc 2.41's architecture selection and syscall generation work with
+/// the mesboot shell/userland. Its configure asks bash-mesboot to expand the
+/// non-terminal `sysdeps/*/preconfigure` glob; that shell leaves it literal, so
+/// x86_64 never becomes x86_64/64 and the matching arch-syscall.h is omitted.
+/// Pre-expand the exact sorted fragment set shipped by the pinned release.
+///
+/// make-syscalls.sh also uses GNU grep's newer `-o` option to enumerate the
+/// byte offsets of `U` argument markers, while the declared grep-mesboot0 2.4
+/// predates that option. The awk loop emits the identical zero-based `N:U`
+/// records from the same colon-prefixed signature using the already-declared
+/// gawk provider. Finally, elf/Makefile repeats the non-terminal
+/// `build/*/stamp.os` glob while generating librtld.mk; GNU make's wildcard
+/// function supplies the same existing-file set without relying on the shell.
+pub fn glibc241_host_free_fixups() -> Vec<Step> {
+    let preconfigure = [
+        "aarch64",
+        "alpha",
+        "arc",
+        "arm",
+        "csky",
+        "hppa",
+        "i386",
+        "loongarch",
+        "m68k",
+        "microblaze",
+        "mips",
+        "or1k",
+        "powerpc",
+        "riscv",
+        "s390",
+        "sh",
+        "sparc",
+        "x86_64",
+    ]
+    .iter()
+    .map(|arch| format!("${{srcdir}}/sysdeps/{arch}/preconfigure"))
+    .collect::<Vec<_>>()
+    .join(" ");
+    vec![
+        Step::substitute_text(
+            "{src}/configure",
+            vec![TextEdit::new(
+                "$srcdir/sysdeps/*/preconfigure",
+                &preconfigure,
+                1,
+            )],
+        ),
+        Step::substitute_text(
+            "{src}/sysdeps/unix/make-syscalls.sh",
+            vec![TextEdit::new(
+                "grep -ob U",
+                r#"awk '{ for (i = 1; i <= length($0); ++i) if (substr($0, i, 1) == "U") print i - 1 ":U" }'"#,
+                1,
+            )],
+        ),
+        Step::substitute_text(
+            "{src}/elf/Makefile",
+            vec![TextEdit::new(
+                "$(common-objpfx)*/stamp.os",
+                "$(wildcard $(common-objpfx)*/stamp.os)",
+                1,
+            )],
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use crate::catalog;
