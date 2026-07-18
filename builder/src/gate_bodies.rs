@@ -1861,8 +1861,31 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
 
     let old_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{rustpath}:{ccpath}:{old_path}");
-    let envs: [(&str, &str); 3] = [
+    // Bake an IMMUTABLE runpath into the built evaluator (and its cargo
+    // build-script binaries): guix's gcc ld-wrapper turns each LIBRARY_PATH
+    // entry into a DT_RUNPATH -rpath. Left at the ambient ~/.guix-home/profile/lib
+    // the binaries load libgcc_s/libc from a MUTABLE guix-home profile that
+    // disappears while guix-home reconfigures or GCs ("error while loading
+    // shared libraries: libgcc_s.so.1", exit 127). Prepend the content-addressed
+    // provision-cc toolchain lib dir(s) — each ".../bin" has a sibling ".../lib"
+    // holding the toolchain's libc/libgcc_s — so resolution stays stable.
+    let cc_libdirs = ccpath
+        .split(':')
+        .map(|d| match d.strip_suffix("/bin") {
+            Some(base) => format!("{base}/lib"),
+            None => d.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(":");
+    let old_library_path = std::env::var("LIBRARY_PATH").unwrap_or_default();
+    let new_library_path = if old_library_path.is_empty() {
+        cc_libdirs
+    } else {
+        format!("{cc_libdirs}:{old_library_path}")
+    };
+    let envs: [(&str, &str); 4] = [
         ("PATH", &new_path),
+        ("LIBRARY_PATH", &new_library_path),
         ("CARGO_HOME", &cargo_home_s),
         ("CARGO_TARGET_DIR", &cargo_target_s),
     ];

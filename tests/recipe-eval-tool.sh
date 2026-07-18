@@ -23,8 +23,27 @@ td="${TD_BUILDER_SELF:?recipe-eval-tool requires TD_BUILDER_SELF (gate-run expor
 rustpath=`"$td" provision-rust` || { echo "recipe-eval-tool: could not provision a rust toolchain (td-builder provision-rust)" >&2; exit 1; }
 ccpath=`"$td" provision-cc` || { echo "recipe-eval-tool: could not provision a C toolchain (td-builder provision-cc)" >&2; exit 1; }
 
+# Bake an IMMUTABLE runpath into the evaluator (and its cargo build-script
+# binaries). guix's gcc ld-wrapper turns every LIBRARY_PATH entry into a
+# DT_RUNPATH -rpath; the ambient value is ~/.guix-home/profile/lib, a MUTABLE
+# guix-home profile whose libgcc_s.so.1/libc.so.6 vanish while guix-home
+# reconfigures or GCs — which flakes this control-plane tool with "error while
+# loading shared libraries: libgcc_s.so.1" (exit 127) and reddened the daily
+# backstop. Point the runpath at the content-addressed provision-cc toolchain
+# lib dir(s) instead: each ".../bin" on the cc PATH has a sibling ".../lib"
+# holding the toolchain's libc/libgcc_s, so the loaded libraries no longer
+# depend on the mutable guix-home profile being present.
+cclib=""
+IFS=:
+for _d in $ccpath; do
+  case $_d in */bin) _d="${_d%/bin}/lib" ;; esac
+  cclib="${cclib:+$cclib:}$_d"
+done
+unset IFS
+
 mkdir -p "$base/home" "$base/target"
 PATH="$rustpath:$ccpath:$PATH" \
+LIBRARY_PATH="${cclib}${LIBRARY_PATH:+:$LIBRARY_PATH}" \
 CARGO_HOME="$base/home" CARGO_TARGET_DIR="$base/target" \
   cargo build --release --frozen --manifest-path "$root/recipes/Cargo.toml" >"$base/build.log" 2>&1 \
   || { echo "recipe-eval-tool: cargo build failed:" >&2; tail -20 "$base/build.log" >&2; exit 1; }
