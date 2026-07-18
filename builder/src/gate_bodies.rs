@@ -1847,6 +1847,18 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
         crate::stage0::provision_cc(&penv).map_err(|e| format!("FAIL: provision-cc: {e}"))?;
     let cargo_bin = find_in_path_frags(&rustpath, "cargo")
         .ok_or_else(|| format!("FAIL: no cargo in provision-rust output ({rustpath})"))?;
+    // Pin the compiler and linker to the provisioned toolchain (Codex P2): the
+    // rustc the build actually uses, and the gcc that owns the matched static
+    // glibc, so no inherited RUSTC / CARGO_TARGET_<triple>_LINKER substitutes a
+    // different one and pairs the static glibc's crt objects with a mismatched
+    // driver (which links clean yet SIGSEGVs at startup).
+    let rustc_bin = find_in_path_frags(&rustpath, "rustc")
+        .ok_or_else(|| format!("FAIL: no rustc in provision-rust output ({rustpath})"))?;
+    let cc_bin = find_in_path_frags(&ccpath, "cc")
+        .or_else(|| find_in_path_frags(&ccpath, "gcc"))
+        .ok_or_else(|| format!("FAIL: no cc/gcc in provision-cc output ({ccpath})"))?;
+    let rustc_s = path_str(&rustc_bin)?;
+    let cc_s = path_str(&cc_bin)?;
 
     let scratch = fresh_scratch(root, ".recipe-rs-scratch")?;
     let cargo_home = scratch.join("home");
@@ -1879,16 +1891,22 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     // tier-2 RUSTFLAGS we set here and drop the static flags — assert_static
     // would then fail the gate (fail-closed, but a spurious env-dependent red,
     // the very failure mode this PR removes). CARGO_ENCODED_RUSTFLAGS is cargo's
-    // highest-precedence source, so setting it here wins unconditionally; see
-    // stage0::static_encoded_rustflags.
+    // highest-precedence source, so setting it here wins unconditionally, and it
+    // carries the linker pin (`-C linker=<cc>`); see stage0::static_encoded_rustflags.
+    // RUSTC pins the compiler; RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER are neutralized
+    // (empty = "no wrapper" to cargo) so no inherited rustc or sccache-style wrapper
+    // interposes on this control-plane build.
     let glibc_static = crate::stage0::provision_glibc_static(&penv)
         .map_err(|e| format!("FAIL: provision static glibc for a crt-static evaluator: {e}"))?;
-    let encoded_rustflags = crate::stage0::static_encoded_rustflags(&glibc_static);
-    let envs: [(&str, &str); 4] = [
+    let encoded_rustflags = crate::stage0::static_encoded_rustflags(&glibc_static, Some(&cc_s));
+    let envs: [(&str, &str); 7] = [
         ("PATH", &new_path),
         ("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags),
         ("CARGO_HOME", &cargo_home_s),
         ("CARGO_TARGET_DIR", &cargo_target_s),
+        ("RUSTC", &rustc_s),
+        ("RUSTC_WRAPPER", ""),
+        ("RUSTC_WORKSPACE_WRAPPER", ""),
     ];
 
     println!(

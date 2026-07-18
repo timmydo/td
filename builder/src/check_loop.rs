@@ -1133,11 +1133,16 @@ fn find_in_frags(frags: &str, bin: &str) -> Option<PathBuf> {
 /// static flags to the final binary + its normal deps only, leaving host-kind
 /// build scripts / proc-macros dynamic. Ambient RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS
 /// are removed so they cannot win over the per-target var (cargo's flag-source
-/// precedence) and silently defeat the static flags. ring's `cc-rs` build script
-/// needs a `cc` (CC/HOST_CC → the gcc-toolchain's `gcc`, AR alongside), and the
-/// rustc LINKER is pinned to that SAME gcc so the link uses the compiler matched
-/// with the static glibc — else a mismatched-glibc binary links + passes
-/// assert_static yet SIGSEGVs at startup (this path has no smoke-run to catch it).
+/// precedence) and silently defeat the static flags. The compiler is pinned too:
+/// RUSTC to the provisioned rustc (the one the triple was read from) and
+/// RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER removed, so no ambient rustc or wrapper
+/// interposes on the control-plane build. ring's `cc-rs` build script needs a `cc`
+/// (CC/HOST_CC/TARGET_CC and the per-target CC_<triple> forms → the gcc-toolchain's
+/// `gcc`, AR alongside — every form cc-rs consults is pinned so an ambient one
+/// cannot outrank them), and the rustc LINKER is pinned to that SAME gcc so the
+/// link uses the compiler matched with the static glibc — else a mismatched-glibc
+/// binary links + passes assert_static yet SIGSEGVs at startup (this path has no
+/// smoke-run to catch it).
 fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) -> Option<PathBuf> {
     let penv = crate::stage0::ProvisionEnv::from_env(root);
     let rustpath = match crate::stage0::provision_rust(&penv) {
@@ -1204,7 +1209,20 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
     let tvar = triple.to_uppercase().replace(['-', '.'], "_");
     let target_flags_var = format!("CARGO_TARGET_{tvar}_RUSTFLAGS");
     let target_linker_var = format!("CARGO_TARGET_{tvar}_LINKER");
-    let rustflags = crate::stage0::static_rustflags(&glibc_static);
+    // The rustc linker is pinned via target_linker_var below (not `-C linker` in
+    // the rustflags), so pass None here.
+    let rustflags = crate::stage0::static_rustflags(&glibc_static, None);
+    // cc-rs (ring's C build) resolves the compiler/archiver from the FIRST of
+    // several env forms, and the per-target-suffixed forms outrank the plain
+    // CC/HOST_CC/AR we set. Pin every form cc-rs consults to the matched
+    // toolchain so an ambient CC_<triple>/AR_<triple>/HOST_AR cannot slip a
+    // different compiler into a control-plane binary (review PR #534, Codex P2).
+    // cc-rs reads both the dash and underscore triple spellings.
+    let triple_us = triple.replace('-', "_");
+    let cc_target = format!("CC_{triple}");
+    let cc_target_us = format!("CC_{triple_us}");
+    let ar_target = format!("AR_{triple}");
+    let ar_target_us = format!("AR_{triple_us}");
     let ambient_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{rustpath}:{ccpath}:{ambient_path}");
 
@@ -1212,9 +1230,22 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
         .args(["build", "--release", "--quiet", "--target", &triple])
         .current_dir(root.join(dir))
         .env("PATH", &new_path)
+        // Pin the compiler itself: an inherited RUSTC would build with a
+        // different rustc than the one we read the triple from, and an inherited
+        // RUSTC_WRAPPER (e.g. sccache) would interpose on the control-plane build.
+        .env("RUSTC", &rustc)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("CC", &cc)
         .env("HOST_CC", &cc)
+        .env("TARGET_CC", &cc)
+        .env(&cc_target, &cc)
+        .env(&cc_target_us, &cc)
         .env("AR", &ar)
+        .env("HOST_AR", &ar)
+        .env("TARGET_AR", &ar)
+        .env(&ar_target, &ar)
+        .env(&ar_target_us, &ar)
         .env(&target_linker_var, &cc)
         .env(&target_flags_var, &rustflags)
         .env_remove("RUSTFLAGS")

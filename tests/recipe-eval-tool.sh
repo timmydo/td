@@ -42,10 +42,18 @@ ccpath=`"$td" provision-cc` || { echo "recipe-eval-tool: could not provision a C
 # env-dependent red, the failure mode this test removes).
 gstatic=`"$td" provision-glibc-static` || { echo "recipe-eval-tool: no matched static glibc (td-builder provision-glibc-static) — set TD_GLIBC_STATIC_HOME, install a build-essential cc, or pin one in the lock" >&2; exit 1; }
 
+# Pin the compiler and linker to the provisioned toolchain (Codex P2): resolve the
+# gcc that owns the matched static glibc and pass it as `-C linker=` so an inherited
+# CARGO_TARGET_<triple>_LINKER cannot pair the static glibc's crt objects with a
+# mismatched driver (links clean, SIGSEGVs at startup). Unset RUSTC and any
+# rustc wrapper so the provisioned rustc (first on PATH) is what builds.
+cc=`PATH="$ccpath" command -v cc 2>/dev/null || PATH="$ccpath" command -v gcc 2>/dev/null` \
+  || { echo "recipe-eval-tool: no cc/gcc in provisioned C toolchain ($ccpath)" >&2; exit 1; }
+
 mkdir -p "$base/home" "$base/target"
-unset CARGO_ENCODED_RUSTFLAGS
+unset CARGO_ENCODED_RUSTFLAGS RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
 PATH="$rustpath:$ccpath:$PATH" \
-RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static -L $gstatic" \
+RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static -L $gstatic -C linker=$cc" \
 CARGO_HOME="$base/home" CARGO_TARGET_DIR="$base/target" \
   cargo build --release --frozen --manifest-path "$root/recipes/Cargo.toml" >"$base/build.log" 2>&1 \
   || { echo "recipe-eval-tool: cargo build failed:" >&2; tail -20 "$base/build.log" >&2; exit 1; }
