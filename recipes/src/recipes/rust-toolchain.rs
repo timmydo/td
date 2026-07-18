@@ -37,10 +37,32 @@ pub fn recipe() -> Recipe {
     ] {
         steps.push(Step::MkDir { path: dir.into() });
     }
+    // Cargo verifies every vendored file against each crate's
+    // .cargo-checksum.json. Keep that closure byte-identical while rewriting
+    // upstream Rust/LLVM shell entry points, then restore it before the
+    // intentional manifest + checksum edits below.
+    steps.push(Step::run(
+        "{root}",
+        &[
+            "{in:busybox-x86-64}/bin/busybox",
+            "mv",
+            "{src}/vendor",
+            "{root}/vendor",
+        ],
+    ));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    steps.push(Step::run(
+        "{root}",
+        &[
+            "{in:busybox-x86-64}/bin/busybox",
+            "mv",
+            "{root}/vendor",
+            "{src}/vendor",
+        ],
+    ));
 
     // Native compiler/linker wrappers for LLVM, rustc, std, Cargo build scripts,
     // and every build-time executable. Outputs are dynamic against td glibc with
@@ -380,4 +402,50 @@ exec "$TD_RECIPE_EVAL" check-run rust-toolchain daily 1
 "#,
         )
         .with_runner(CheckRunner::RustToolchain)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recipe;
+    use crate::types::Step;
+
+    #[test]
+    fn vendored_crates_are_held_out_of_the_recursive_shebang_rewrite() {
+        let steps = recipe().steps.expect("rust recipe steps");
+        let patch = steps
+            .iter()
+            .position(|step| {
+                matches!(
+                    step,
+                    Step::PatchShebangs { dir, .. } if dir == "{src}"
+                )
+            })
+            .expect("source shebang rewrite");
+        let before = steps.get(patch.saturating_sub(1)).expect("vendor hold-out");
+        let after = steps.get(patch + 1).expect("vendor restore");
+        assert!(matches!(
+            before,
+            Step::Run { argv, .. }
+                if matches!(
+                    argv.as_slice(),
+                    [busybox, mv, from, to]
+                        if busybox == "{in:busybox-x86-64}/bin/busybox"
+                            && mv == "mv"
+                            && from == "{src}/vendor"
+                            && to == "{root}/vendor"
+                )
+        ));
+        assert!(matches!(
+            after,
+            Step::Run { argv, .. }
+                if matches!(
+                    argv.as_slice(),
+                    [busybox, mv, from, to]
+                        if busybox == "{in:busybox-x86-64}/bin/busybox"
+                            && mv == "mv"
+                            && from == "{root}/vendor"
+                            && to == "{src}/vendor"
+                )
+        ));
+    }
 }

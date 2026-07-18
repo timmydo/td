@@ -78,12 +78,26 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
            -C link-arg=-Wl,-rpath,{glibc_path}/lib \
            -o /tmp/td-rust-smoke\n\
          test \"$(/tmp/td-rust-smoke)\" = 42\n\
+         '{busybox_path}' mkdir -p /tmp/td-cargo-smoke/src /tmp/td-cargo-home /tmp/td-cargo-target\n\
+         printf '%s\\n' '[package]' 'name = \"td-cargo-smoke\"' 'version = \"0.0.0\"' 'edition = \"2021\"' >/tmp/td-cargo-smoke/Cargo.toml\n\
+         printf '%s\\n' 'fn main() {{ println!(\"43\"); }}' >/tmp/td-cargo-smoke/src/main.rs\n\
+         export PATH='{rust_path}/bin'\n\
+         RUSTC='{rust_path}/bin/rustc' \
+         CARGO_HOME=/tmp/td-cargo-home \
+         HOME=/tmp/td-cargo-home \
+         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER='{gcc_path}/bin/gcc' \
+         RUSTFLAGS='-C link-arg=-B{binutils_path}/ -C link-arg=-B{glibc_path}/lib -C link-arg=-L{glibc_path}/lib -C link-arg=-static-libgcc -C link-arg=-Wl,--dynamic-linker,{glibc_path}/lib/ld-linux-x86-64.so.2 -C link-arg=-Wl,--enable-new-dtags -C link-arg=-Wl,-rpath,{glibc_path}/lib' \
+         '{rust_path}/bin/cargo' build --offline --manifest-path /tmp/td-cargo-smoke/Cargo.toml --target-dir /tmp/td-cargo-target\n\
+         test \"$(/tmp/td-cargo-target/debug/td-cargo-smoke)\" = 43\n\
+         printf '%s\\n' CARGO-BRIDGE-OK\n\
          printf '%s\\n' RUST-BRIDGE-OK\n"
     );
     let smoke_out = runner.store_ns_output(&[&busybox_path, "sh", "-c", &smoke], None)?;
-    if !smoke_out.lines().any(|line| line == "RUST-BRIDGE-OK") {
+    if !smoke_out.lines().any(|line| line == "RUST-BRIDGE-OK")
+        || !smoke_out.lines().any(|line| line == "CARGO-BRIDGE-OK")
+    {
         return Err(format!(
-            "source-built stage2 executable did not complete its td-native smoke test: {}",
+            "source-built stage2 rustc/Cargo did not complete their td-native smoke tests: {}",
             smoke_out.trim()
         ));
     }
