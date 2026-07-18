@@ -24,8 +24,8 @@ pub fn recipe() -> Recipe {
         links: [
             "awk", "basename", "cat", "chmod", "cmp", "comm", "cp", "cut", "date", "diff",
             "dirname", "echo", "env", "expr", "false", "grep", "head", "install", "ln", "ls",
-            "mkdir", "mktemp", "mv", "printf", "pwd", "rm", "sed", "sleep", "sort", "tail",
-            "tee", "touch", "tr", "true", "uname", "wc", "which", "yes",
+            "mkdir", "mktemp", "mv", "printf", "pwd", "rm", "sed", "sleep", "sort", "tail", "tee",
+            "touch", "tr", "true", "uname", "wc", "which", "yes",
         ]
         .iter()
         .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))

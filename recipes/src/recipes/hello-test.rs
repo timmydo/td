@@ -20,13 +20,20 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "[ -d /td/store ] || {{ echo '/td/store is not the active store' >&2; exit 1; }}; \
-                     [ ! -e /gnu/store ] || {{ echo '/gnu/store is visible in the hello sandbox' >&2; exit 1; }}; \
-                     if grep -q -a /gnu/store '{hello}'; then echo 'hello embeds /gnu/store bytes' >&2; exit 1; fi; \
+                     {{ [ ! -e /gnu/store ] && [ ! -L /gnu/store ]; }} || {{ echo '/gnu/store is visible in the hello sandbox' >&2; exit 1; }}; \
+                     if grep -Fq -a /gnu/store '{hello}'; then echo 'hello embeds /gnu/store bytes' >&2; exit 1; fi; \
                      h=$('{readelf}' -h '{hello}'); \
                      printf '%s\\n' \"$h\" | grep -i 'class:' | grep -qi ELF64 || {{ echo 'hello is not ELF64' >&2; exit 1; }}; \
                      printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi x86-64 || {{ echo 'hello is not x86-64' >&2; exit 1; }}; \
                      p=$('{readelf}' -l '{hello}'); \
-                     printf '%s\\n' \"$p\" | grep -q '{xglibc}/lib/ld-linux-x86-64.so.2' || {{ echo 'hello does not use td glibc as its interpreter' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$p\" | grep -Fq '{xglibc}/lib/ld-linux-x86-64.so.2' || {{ echo 'hello does not use td glibc as its interpreter' >&2; exit 1; }}; \
+                     d=$('{readelf}' -d '{hello}'); \
+                     needed=$(printf '%s\\n' \"$d\" | sed -n 's/^.*(NEEDED).*Shared library: \\[\\([^]]*\\)\\].*$/\\1/p'); \
+                     [ \"$needed\" = 'libc.so.6' ] || {{ echo \"hello has an unexpected DT_NEEDED closure: $needed\" >&2; exit 1; }}; \
+                     runpath=$(printf '%s\\n' \"$d\" | sed -n 's/^.*(RUNPATH).*Library runpath: \\[\\([^]]*\\)\\].*$/\\1/p'); \
+                     [ \"$runpath\" = '{xglibc}/lib' ] || {{ echo \"hello has an unexpected DT_RUNPATH: $runpath\" >&2; exit 1; }}; \
+                     rpath=$(printf '%s\\n' \"$d\" | sed -n 's/^.*(RPATH).*Library rpath: \\[\\([^]]*\\)\\].*$/\\1/p'); \
+                     [ -z \"$rpath\" ] || {{ echo \"hello has a legacy DT_RPATH: $rpath\" >&2; exit 1; }}; \
                      actual=$('{hello}'); \
                      [ \"$actual\" = 'Hello, world!' ] || {{ echo \"hello output is wrong: $actual\" >&2; exit 1; }}"
                 ),

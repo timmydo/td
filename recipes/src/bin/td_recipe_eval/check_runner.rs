@@ -1621,6 +1621,7 @@ mod tests {
             "gcc-x86-64-stage2-test",
             "gcc-x86-64-native-test",
             "gcc-x86-64-self-test",
+            "hello-test",
         ] {
             if let Err(err) = ensure_targets_provenance(&[target]) {
                 panic!("{target}: expected host-free provenance to pass, got: {err}");
