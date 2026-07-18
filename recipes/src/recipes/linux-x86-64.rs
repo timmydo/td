@@ -3,16 +3,19 @@ use crate::ladder::{
 };
 use crate::types::{Recipe, Step};
 
-// linux-x86-64 (Linux 7.1.4 `vmlinux`): the capstone of the x86_64 ladder
-// (#529). Source-builds an uncompressed `vmlinux` ELF for the latest STABLE
-// mainline kernel (not a longterm/LTS line) with td's OWN bootstrapped native
-// toolchain — gcc-x86-64-native (GCC 14.3.0)
-// as `CC`, binutils-x86-64-native as `LD/AR/NM/OBJCOPY`, driven by make-x86-64 —
+// linux-x86-64 (Linux 7.1.4): the capstone of the x86_64 ladder (#529).
+// Source-builds the latest STABLE mainline kernel (not a longterm/LTS line) with
+// td's OWN bootstrapped native toolchain — gcc-x86-64-native (GCC 14.3.0) as
+// `CC`, binutils-x86-64-native as `LD/AR/NM/OBJCOPY`, driven by make-x86-64 —
 // proving the GCC/glibc ladder produces a real, modern-kernel-capable compiler.
-// `vmlinux` (not `bzImage`) is landed FIRST: the raw ELF target invokes no
-// compressor, and td ships no gzip/xz executable (the builder decompresses
-// in-process), so bzImage + qemu boot are a separate later rung (re #529, re
-// #469).
+// Two artifacts land in {out}: the uncompressed `vmlinux` ELF and the compressed,
+// bootable `bzImage`. bzImage's self-extracting payload is gzip-compressed
+// (kbuild's `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz`); td ships no
+// gzip executable — the builder only DEcompresses, in-process — so the compressor
+// is the busybox gzip applet behind a thin flag-dropping wrapper (see the gzip
+// block below). CONFIG_KERNEL_GZIP is pinned so the compressor is always gzip
+// (never xz/zstd, which would need a different tool). A qemu boot of the bzImage
+// is a separate later rung (re #529, re #469).
 //
 // A modern (>= 4.18) kernel needs host tools the 4.14 rung dodged; each is now a
 // td recipe (AGENTS.md directive 3, pre-authorized as part of this migration):
@@ -28,8 +31,10 @@ use crate::types::{Recipe, Step};
 //     the bundled static zlib).
 //   - bc (busybox-x86-64 applet): timeconst.h, as in the 4.14 rung.
 // Avoided by config (audited): perl (C recordmcount; ftrace off), openssl (no
-// module signing / trusted keys), pahole (BTF off), python/cpio/compressors/
-// rsync (no initramfs, no IKHEADERS, uncompressed vmlinux, no modules).
+// module signing / trusted keys), pahole (BTF off), python/cpio/rsync (no
+// initramfs, no IKHEADERS, no modules). The ONE compressor used is gzip (busybox
+// applet) for the bzImage payload — CONFIG_KERNEL_GZIP pinned; xz/lzma/zstd and
+// their host tools stay off.
 //
 // HOSTCC (the Kbuild host programs fixdep/conf/objtool/modpost — ordinary
 // userspace) is a STATIC wrapper over the native gcc against the x86_64 glibc
@@ -98,6 +103,40 @@ pub fn recipe() -> Recipe {
                 "-c",
                 "out=$(printf '%s\\n' 7 | bc -q {root}/bcprobe/probe.bc) || { echo 'bc probe: bc failed to run (GNU-extension bc for timeconst.h unavailable)' >&2; exit 1; }; \
                  [ \"$out\" = 22 ] || { echo \"bc probe: wrong result (got '$out', want 22) — bc is not the GNU-extension bc timeconst.h needs\" >&2; exit 1; }",
+            ],
+        )
+        .env("PATH", &mesboot0_path()),
+    );
+
+    // gzip compressor for the bzImage payload. The pinned CONFIG_KERNEL_GZIP rule
+    // is `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz` (KGZIP defaults to
+    // `gzip`), and the payload is always piped stdin->stdout. td ships no gzip
+    // executable — only the builder's in-process DECOMPRESSORS — so the compressor
+    // is the busybox gzip applet. BusyBox 1.37 gzip does NOT accept GNU gzip's
+    // `-n` (its options are only `-cfkdt123456789`), so a bare `gzip -> busybox`
+    // symlink would die on `gzip -n`. This thin wrapper drops the kernel's flags
+    // and forces `busybox gzip -c`, compressing its stdin to stdout — exactly what
+    // cmd_gzip pipes. The discarded `-9`/`-n` only affect image size/mtime, never
+    // bootability. Wired in as KGZIP= on the build step below.
+    steps.push(Step::WriteFile {
+        path: "{root}/wb/gzip".into(),
+        content: format!("#!{SH}\nexec \"{bb}\" gzip -c\n"),
+        exec: true,
+    });
+    // Fail FAST (parity with the bc probe) if that wrapper cannot emit a gzip
+    // stream: compress a probe string and assert the gzip magic `1f 8b 08`
+    // (id1/id2 + CM=deflate). A missing/broken busybox gzip applet would otherwise
+    // surface as a confusing failure deep inside arch/x86/boot/compressed.
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                "printf 'td-gzip-probe' | {root}/wb/gzip > {root}/gzprobe.gz 2>/dev/null || true; \
+                 [ -s {root}/gzprobe.gz ] || { echo 'gzip probe: wrapper produced no output (busybox gzip applet unavailable)' >&2; exit 1; }; \
+                 set -- $(od -An -tx1 -N3 {root}/gzprobe.gz); \
+                 [ \"$1$2$3\" = 1f8b08 ] || { echo \"gzip probe: not a gzip/deflate stream (magic $1$2$3, want 1f8b08)\" >&2; exit 1; }",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -227,6 +266,13 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_FTRACE[ =]/d; \
                   /^#? *CONFIG_GCC_PLUGINS[ =]/d; \
                   /^#? *CONFIG_IKHEADERS[ =]/d; \
+                  /^#? *CONFIG_KERNEL_GZIP[ =]/d; \
+                  /^#? *CONFIG_KERNEL_BZIP2[ =]/d; \
+                  /^#? *CONFIG_KERNEL_LZMA[ =]/d; \
+                  /^#? *CONFIG_KERNEL_XZ[ =]/d; \
+                  /^#? *CONFIG_KERNEL_LZO[ =]/d; \
+                  /^#? *CONFIG_KERNEL_LZ4[ =]/d; \
+                  /^#? *CONFIG_KERNEL_ZSTD[ =]/d; \
                   /^#? *CONFIG_INITRAMFS_SOURCE[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -239,6 +285,7 @@ pub fn recipe() -> Recipe {
                    '# CONFIG_FTRACE is not set' \
                    '# CONFIG_GCC_PLUGINS is not set' \
                    '# CONFIG_IKHEADERS is not set' \
+                   'CONFIG_KERNEL_GZIP=y' \
                    'CONFIG_INITRAMFS_SOURCE=\"\"' >> .config",
             ],
         )
@@ -259,6 +306,7 @@ pub fn recipe() -> Recipe {
                 SH,
                 "-c",
                 "grep -q '^CONFIG_UNWINDER_FRAME_POINTER=y' .config || { echo 'frame-pointer unwinder not selected' >&2; exit 1; }; \
+                 grep -q '^CONFIG_KERNEL_GZIP=y' .config || { echo 'gzip kernel compression not selected (bzImage would need another compressor)' >&2; exit 1; }; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi",
             ],
@@ -266,8 +314,11 @@ pub fn recipe() -> Recipe {
         .env("PATH", &mesboot0_path()),
     );
 
-    // 5) Build vmlinux. binutils tools passed explicitly (native as/ld/ar/nm/…),
-    //    host make env scrubbed (busybox parity).
+    // 5) Build vmlinux + the bootable bzImage. binutils tools passed explicitly
+    //    (native as/ld/ar/nm/…), host make env scrubbed (busybox parity), and
+    //    KGZIP pointed at the busybox-backed gzip wrapper for the bzImage payload.
+    //    (`bzImage` builds `vmlinux` as a prerequisite; both are listed so a
+    //    kbuild change that stops re-emitting the raw ELF still lands it.)
     steps.push(
         mk(&[
             "-j{jobs}",
@@ -277,7 +328,9 @@ pub fn recipe() -> Recipe {
             &format!("OBJCOPY={nbin}/objcopy"),
             &format!("OBJDUMP={nbin}/objdump"),
             &format!("STRIP={nbin}/strip"),
+            "KGZIP={root}/wb/gzip",
             "vmlinux",
+            "bzImage",
         ])
         .env("MAKEFLAGS", "")
         .env("MFLAGS", "")
@@ -285,16 +338,20 @@ pub fn recipe() -> Recipe {
         .env("MAKELEVEL", ""),
     );
 
-    // Land the uncompressed ELF + its symbol map.
+    // Land the uncompressed ELF + its symbol map + the bootable bzImage.
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
     steps.push(Step::CopyFiles {
-        files: vec!["{src}/vmlinux".into(), "{src}/System.map".into()],
+        files: vec![
+            "{src}/vmlinux".into(),
+            "{src}/System.map".into(),
+            "{src}/arch/x86/boot/bzImage".into(),
+        ],
         dest: "{out}".into(),
     });
     steps.push(Step::Require {
-        paths: vec!["{out}/vmlinux".into()],
+        paths: vec!["{out}/vmlinux".into(), "{out}/bzImage".into()],
         exec: false,
     });
     // [native-arch] vmlinux must be an ELF64 x86-64 linked executable (EXEC, not a
@@ -310,6 +367,24 @@ pub fn recipe() -> Recipe {
                  printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || { echo 'vmlinux is not ELF64' >&2; exit 1; }; \
                  printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'vmlinux is not x86-64' >&2; exit 1; }; \
                  printf '%s\\n' \"$h\" | grep -i 'type:'    | grep -qi 'EXEC'   || { echo 'vmlinux is not a linked ELF executable (EXEC)' >&2; exit 1; }",
+            ],
+        )
+        .env("PATH", &mesboot0_path()),
+    );
+    // [bzImage] the compressed image must carry the x86 boot-setup header: the
+    // 0xAA55 boot signature at 0x1fe and the "HdrS" (48 64 72 53) magic at 0x202
+    // (arch/x86/boot/header.S). Asserted here at the producer rung with od's
+    // offset read (mesboot0 ships no dd); the sibling test re-checks it.
+    steps.push(
+        Step::run(
+            "{out}",
+            &[
+                SH,
+                "-c",
+                "set -- $(od -An -tx1 -j 510 -N 2 '{out}/bzImage'); \
+                 [ \"$1$2\" = 55aa ] || { echo 'bzImage: missing 0xAA55 boot signature at 0x1fe' >&2; exit 1; }; \
+                 set -- $(od -An -tx1 -j 514 -N 4 '{out}/bzImage'); \
+                 [ \"$1$2$3$4\" = 48647253 ] || { echo 'bzImage: missing HdrS setup-header magic at 0x202' >&2; exit 1; }",
             ],
         )
         .env("PATH", &mesboot0_path()),
