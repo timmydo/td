@@ -27,6 +27,7 @@ glibc-mesboot0-source 534qradv895g6ygp2dmrniyzpvz4sc5a-glibc-mesboot0-source
 gmp kb9mnqdvrr77gcgsc746pa1xmpaiazc0-gmp
 gmp63 a1sfm9d525pjz2if348xssl3wprnr21f-gmp63
 grep-mesboot0-source 664n3hm5dz2hyn5py2frds5cc3r4nid4-grep-mesboot0-source
+hello-source r2gr5vy54san8vw8ry4mmjm93ivybbpv-hello-source
 linux-headers fy4caw4q7lsgdisqwz8dhfdgiwky9pxw-linux-headers
 linux-headers-x86-64 8makj3qb694bws0bdvqhm74az3i3ip58-linux-headers-x86-64
 m4-mesboot-source 6n6m3fhhqcdnmkf92nw1a1q8pakzflx5-m4-mesboot-source

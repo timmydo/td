@@ -108,7 +108,11 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
-        .env("SHELL", SH),
+        .env("SHELL", SH)
+        // `make install` may rebuild ld objects after the parallel build. Keep
+        // the same declared glibc/kernel header search path as configure/build
+        // so that rebuild cannot fall through to absent host headers.
+        .env("C_INCLUDE_PATH", &cip),
     );
     // plain-named native tools (no x86_64-pc-linux-gnu- prefix — host==target).
     steps.push(Step::Require {
