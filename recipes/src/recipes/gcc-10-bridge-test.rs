@@ -31,7 +31,10 @@ pub fn recipe() -> Recipe {
             },
             Step::WriteFile {
                 path: "{root}/test/probe.cc".into(),
-                content: "#include <cstdlib>\nint main() { void *p = std::malloc(1); std::free(p); return 0; }\n"
+                // Force symbols from libstdc++'s convenience archives into the
+                // static link. A malloc/free-only C++ probe can pass even when
+                // libtool silently omits std::string and related objects.
+                content: "#include <string>\nint main() { std::string value(\"bridge\"); return value.size() == 6 ? 0 : 1; }\n"
                     .into(),
                 exec: false,
             },
@@ -84,6 +87,13 @@ pub fn recipe() -> Recipe {
                     "{out}/result".into(),
                 ],
                 exec: false,
+            },
+            Step::Require {
+                paths: vec![
+                    "{root}/test/probe-c".into(),
+                    "{root}/test/probe-cxx".into(),
+                ],
+                exec: true,
             },
         ])
         .checks(vec![RecipeCheck::daily(

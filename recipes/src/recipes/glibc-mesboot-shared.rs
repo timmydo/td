@@ -46,6 +46,20 @@ pub fn recipe() -> Recipe {
         "s,^SHELL := /bin/sh,SHELL := {in:bash-mesboot}/bin/bash,",
         &["Makeconfig"],
     ));
+    // elf/Makefile asks the shell to expand build/*/stamp.os while generating
+    // librtld.mk. bash-mesboot cannot expand that non-terminal glob and passes
+    // the literal to fgrep, which emits an error line into librtld.mk and makes
+    // rtld-Rules fail with "missing separator". Have GNU make expand the same
+    // glob first; its wildcard function drops non-matches and preserves the
+    // exact list of existing stamp files without introducing a host tool.
+    steps.push(Step::substitute_text(
+        "{src}/elf/Makefile",
+        vec![TextEdit::new(
+            "$(common-objpfx)*/stamp.os",
+            "$(wildcard $(common-objpfx)*/stamp.os)",
+            1,
+        )],
+    ));
     // Host-gzip-free locale charmap install (re #469), the same fix glibc-mesboot0
     // and glibc-mesboot carry. This shared build runs the identical glibc 2.16.0
     // `make install`, whose localedata/Makefile installs each charmap uncompressed
