@@ -130,9 +130,8 @@ impl BuildInputs {
 const USAGE: &str =
     "usage: td-builder toolchain-recipe {x86_64-self}  (inputs via TDXS_* env)";
 
-/// `td-builder toolchain-recipe <name>`. (The rust-x86_64 relink is retired as a
-/// subcommand — it is now the first-class `rust-toolchain` recipe, buildSystem
-/// "rust-toolchain" / build::run_rust_toolchain; #380.)
+/// `td-builder toolchain-recipe <name>`. The downloaded Rust transform is a
+/// first-class, stage0-only recipe (`rust-stage0`); it is not a CLI subcommand.
 pub fn cli(args: &[String]) -> ExitCode {
     match args.get(2).map(String::as_str) {
         Some("x86_64-self") => {
@@ -207,29 +206,28 @@ pub fn run_self(inp: &BuildInputs) -> Result<String, String> {
     Ok(report)
 }
 
-// --- rust-toolchain: the pinned-upstream-Rust ELF-retarget transform (#380, #410) ------
+// --- rust-stage0: exact upstream bootstrap snapshot retarget transform -----------
 //
-// The engine phase runner for buildSystem "rust-toolchain" (recipes/src/recipes/
-// rust-toolchain.rs), fully in the recipe-graph model (#410). It UNPACKS the pinned
-// upstream Rust release tarball IN-SANDBOX (the declared tar/gzip inputs, as
-// ladder::unpack_into does — so the recipe's `.source()` is the raw tarball), co-locates
+// The engine phase runner for buildSystem "rust-stage0". It unpacks the exact
+// rustc/rust-std/Cargo component tarballs named by Rust source's src/stage0, co-locates
 // the /td/store runtime closure (glibc sonames + libgcc_s + libz, found via the UNCHANGED
 // upstream RUNPATH $ORIGIN/../lib — the portable, content-addressed-store-safe choice) and
 // RELINKS rustc/cargo's ELF interpreter — `crate::elf::set_interp`, GROWS the slot per
 // #258, NOT patchelf — onto the /td/store x86_64 glibc loader.
 //
-// It runs in the HERMETIC drv sandbox as td-builder Rust (fs copies + crate::elf) plus the
-// in-sandbox untar via the declared tar/gzip inputs.
+// It runs in the HERMETIC drv sandbox entirely as td-builder Rust: engine-native
+// archive readers, filesystem copies, and crate::elf; no unpacker subprocess runs.
 //
-//   TD_SRC        the pinned upstream Rust release TARBALL (rust-toolchain-source, Class::Source).
+//   TD_SRC        the exact upstream rustc component tarball (Class::Source).
 //   TD_INPUT_MAP  lock name -> /td/store path; the transform reads its inputs BY RECIPE NAME
-//                 (#410 — no gate-assembled rust-native-* lock):
+//                 and also resolves rust-std/Cargo source component tarballs:
+//                   rust-stage0-std-source
+//                   rust-stage0-cargo-source
 //                   glibc-x86-64       the x86_64 glibc 2.41 tree (interp + sonames), at its
 //                                      staged stage/td/store/glibc-2.41-x86_64 prefix
 //                   gcc-x86-64-stage2  the cross gcc final — libgcc_s.so.1 (found recursively)
 //                   zlib-x86-64        the td-built libz.so.1 tree
-//                   tar, gzip          the declared unpackers (base tools)
-//   out           the output tree (rustc/cargo relinked onto /td/store).
+//   out           the stage0-only rustc/rustdoc/Cargo/sysroot tree.
 //
 // The interp target is <glibc-x86-64 staged>/lib/ld-linux-x86-64.so.2 — the input's own
 // /td/store path. Same pinned source + same inputs => byte-identical tree (the `td-builder
@@ -243,10 +241,12 @@ const GLIBC_X86_64_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 const GCC_X86_64_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64";
 const ZLIB_X86_64_LIB: &str = "stage/td/store/zlib-1.3.1/lib";
 
-/// The resolved rust-toolchain transform inputs, read from the drv env.
-struct RustInputs {
-    /// The upstream Rust release, UNPACKED in-sandbox from TD_SRC (root: rustc/ cargo/ rust-std-…/).
-    src: PathBuf,
+/// The resolved stage0 transform inputs, read from the drv env.
+struct RustStage0Inputs {
+    /// Individually unpacked upstream component trees.
+    rustc_src: PathBuf,
+    cargo_src: PathBuf,
+    std_src: PathBuf,
     /// glibc-x86-64 (staged) — the x86_64 glibc 2.41 tree (interp target + co-located sonames).
     glibc: PathBuf,
     /// The dir under gcc-x86-64-stage2 holding `libgcc_s.so.1` (found recursively).
@@ -259,8 +259,8 @@ struct RustInputs {
     out: PathBuf,
 }
 
-impl RustInputs {
-    fn from_drv_env() -> Result<RustInputs, String> {
+impl RustStage0Inputs {
+    fn from_drv_env() -> Result<RustStage0Inputs, String> {
         let g = |k: &str| -> Result<String, String> {
             std::env::var(k).map_err(|_| format!("env {k} unset"))
         };
@@ -270,29 +270,39 @@ impl RustInputs {
             map.get(name)
                 .and_then(crate::json::Json::as_str)
                 .map(PathBuf::from)
-                .ok_or_else(|| format!("rust-toolchain: lock is missing the `{name}' input (needed by the transform)"))
+                .ok_or_else(|| format!("rust-stage0: lock is missing the `{name}' input (needed by the transform)"))
         };
         // #410: inputs resolved BY RECIPE NAME to their staged install prefixes — the
         // recipe-graph model (glibc/libgcc/libz are the rungs build-plan --auto chained).
         let glibc = pick("glibc-x86-64")?.join(GLIBC_X86_64_STAGE);
         let gcc = pick("gcc-x86-64-stage2")?.join(GCC_X86_64_STAGE);
         let libgcc = find_file(&gcc, "libgcc_s.so.1").ok_or_else(|| {
-            format!("rust-toolchain: no libgcc_s.so.1 under the gcc-x86-64-stage2 input {}", gcc.display())
+            format!("rust-stage0: no libgcc_s.so.1 under the gcc-x86-64-stage2 input {}", gcc.display())
         })?;
         let libgcc_dir = libgcc
             .parent()
-            .ok_or("rust-toolchain: libgcc_s.so.1 has no parent dir")?
+            .ok_or("rust-stage0: libgcc_s.so.1 has no parent dir")?
             .to_path_buf();
         let libz_dir = pick("zlib-x86-64")?.join(ZLIB_X86_64_LIB);
         let glibc_interp = format!("{}/lib/ld-linux-x86-64.so.2", glibc.display());
-        // unpack the pinned release tarball IN-SANDBOX (TD_SRC is the raw .tar.gz — the
-        // recipe's .source()) with the ENGINE's own readers: no unpacker inputs, no
-        // subprocess (tar/gzip left the host-tool tier with Step::Unpack, re #469).
-        let tarball = PathBuf::from(g("TD_SRC")?);
-        let extract = mktemp_dir("td-rust-src")?;
-        unpack_rust_release(&tarball, &extract)?;
-        Ok(RustInputs {
-            src: extract,
+        // Unpack all three exact snapshot components with the engine-native tar reader.
+        let rustc_tar = PathBuf::from(g("TD_SRC")?);
+        let std_tar = pick("rust-stage0-std-source")?;
+        let cargo_tar = pick("rust-stage0-cargo-source")?;
+        let rustc_src = mktemp_dir("td-rust-stage0-rustc")?;
+        let std_src = mktemp_dir("td-rust-stage0-std")?;
+        let cargo_src = mktemp_dir("td-rust-stage0-cargo")?;
+        unpack_rust_component(&rustc_tar, &rustc_src, "rustc/bin/rustc")?;
+        unpack_rust_component(
+            &std_tar,
+            &std_src,
+            "rust-std-x86_64-unknown-linux-gnu/lib/rustlib",
+        )?;
+        unpack_rust_component(&cargo_tar, &cargo_src, "cargo/bin/cargo")?;
+        Ok(RustStage0Inputs {
+            rustc_src,
+            cargo_src,
+            std_src,
             glibc,
             libgcc_dir,
             libz_dir,
@@ -313,25 +323,24 @@ impl RustInputs {
 /// `tar::MAX_TAR_ENTRY_BYTES` (256 MiB) — a limit host `tar` never imposed. Today's
 /// members are well under it; a future release with a >256 MiB member (a fat
 /// libLLVM/debuginfo blob) would red here, and the cap would need raising in lockstep.
-fn unpack_rust_release(tarball: &Path, dest: &Path) -> Result<(), String> {
+fn unpack_rust_component(
+    tarball: &Path,
+    dest: &Path,
+    required: &str,
+) -> Result<(), String> {
     crate::tar::unpack_archive(tarball, dest, false)?;
-    // Guard the layout: every consumed member must have landed (a release-layout drift
-    // would else surface three rungs later as a confusing "cp rustc" copy error).
-    for sub in ["rustc/bin/rustc", "cargo/bin/cargo"] {
-        if !dest.join(sub).exists() {
-            return Err(format!(
-                "unpack {}: extracted release is missing {sub} (release layout drift?)",
-                tarball.display()
-            ));
-        }
+    if !dest.join(required).exists() {
+        return Err(format!(
+            "unpack {}: extracted component is missing {required} (release layout drift?)",
+            tarball.display()
+        ));
     }
     Ok(())
 }
 
-/// `rust-toolchain-build` phase runner (#380): assemble + relink the /td/store rust tree
-/// into `$out` from the drv env. No compile; pure td-builder Rust (fs + crate::elf).
-pub fn run_rust_toolchain_build() -> Result<(), String> {
-    let inp = RustInputs::from_drv_env()?;
+/// Assemble and retarget the exact downloaded stage0 snapshot. No compilation.
+pub fn run_rust_stage0_build() -> Result<(), String> {
+    let inp = RustStage0Inputs::from_drv_env()?;
     assemble_rust_tree(&inp)?;
     relink_rust_interp(&inp.out, &inp.glibc_interp)?;
     Ok(())
@@ -339,16 +348,25 @@ pub fn run_rust_toolchain_build() -> Result<(), String> {
 
 /// Copy rustc/cargo + rustlib from the extracted release tree (TD_SRC), provenance-check,
 /// and co-locate the /td/store runtime closure into `<out>/lib`.
-fn assemble_rust_tree(inp: &RustInputs) -> Result<(), String> {
-    let rx = &inp.src; // the extracted release tree: rustc/ cargo/ rust-std-…/
+fn assemble_rust_tree(inp: &RustStage0Inputs) -> Result<(), String> {
     let tree = &inp.out;
     fs::create_dir_all(tree.join("bin")).map_err(ioerr("mkdir out/bin"))?;
     fs::create_dir_all(tree.join("lib")).map_err(ioerr("mkdir out/lib"))?;
-    fs::copy(rx.join("rustc/bin/rustc"), tree.join("bin/rustc")).map_err(ioerr("cp rustc"))?;
-    fs::copy(rx.join("cargo/bin/cargo"), tree.join("bin/cargo")).map_err(ioerr("cp cargo"))?;
+    for bin in ["rustc", "rustdoc"] {
+        fs::copy(
+            inp.rustc_src.join("rustc/bin").join(bin),
+            tree.join("bin").join(bin),
+        )
+        .map_err(ioerr("cp rustc component binary"))?;
+    }
+    fs::copy(inp.cargo_src.join("cargo/bin/cargo"), tree.join("bin/cargo"))
+        .map_err(ioerr("cp cargo"))?;
     // librustc_driver, libLLVM, libstd*.so, AND rustc's own rustlib/.
-    copy_tree_contents(&rx.join("rustc/lib"), &tree.join("lib")).map_err(ioerr("cp rustc/lib"))?;
-    let std_rustlib = rx.join("rust-std-x86_64-unknown-linux-gnu/lib/rustlib");
+    copy_tree_contents(&inp.rustc_src.join("rustc/lib"), &tree.join("lib"))
+        .map_err(ioerr("cp rustc/lib"))?;
+    let std_rustlib = inp
+        .std_src
+        .join("rust-std-x86_64-unknown-linux-gnu/lib/rustlib");
     if std_rustlib.is_dir() {
         copy_tree_contents(&std_rustlib, &tree.join("lib/rustlib")).map_err(ioerr("merge rustlib"))?;
     }
@@ -361,7 +379,11 @@ fn assemble_rust_tree(inp: &RustInputs) -> Result<(), String> {
     }
 
     // [provenance] the upstream binaries + librustc_driver carry NO /gnu/store bytes.
-    let mut provenance = vec![tree.join("bin/rustc"), tree.join("bin/cargo")];
+    let mut provenance = vec![
+        tree.join("bin/rustc"),
+        tree.join("bin/rustdoc"),
+        tree.join("bin/cargo"),
+    ];
     if let Some(drv) = glob_first_in(&tree.join("lib"), "librustc_driver-", ".so") {
         provenance.push(drv);
     }
@@ -383,18 +405,18 @@ fn assemble_rust_tree(inp: &RustInputs) -> Result<(), String> {
     copy_deref(&inp.libgcc_dir.join("libgcc_s.so.1"), &tree.join("lib/libgcc_s.so.1"))?;
     symlink_force("libgcc_s.so.1", &tree.join("lib/libgcc_s.so"))?;
     let libz = glob_first_in(&inp.libz_dir, "libz.so.1", "").ok_or_else(|| {
-        format!("rust-toolchain: no libz.so.1* under the zlib-x86-64 input {}", inp.libz_dir.display())
+        format!("rust-stage0: no libz.so.1* under the zlib-x86-64 input {}", inp.libz_dir.display())
     })?;
     copy_deref(&libz, &tree.join("lib/libz.so.1"))?;
     make_writable(tree).map_err(ioerr("chmod tree"))?;
     Ok(())
 }
 
-/// Relink rustc + cargo's ELF interpreter to `glibc_interp` (crate::elf::set_interp,
+/// Relink stage0 rustc, rustdoc, and Cargo's ELF interpreter to `glibc_interp`,
 /// GROWS the slot when the new path is longer per #258 — no patchelf), asserting each
 /// landed under /td/store.
 fn relink_rust_interp(tree: &Path, glibc_interp: &str) -> Result<(), String> {
-    for b in ["rustc", "cargo"] {
+    for b in ["rustc", "rustdoc", "cargo"] {
         let bin = tree.join("bin").join(b);
         crate::elf::set_interp(&bin, glibc_interp)?;
         let got = crate::elf::read_interp(&bin)?.unwrap_or_default();
@@ -983,7 +1005,7 @@ fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
 /// directory level the immediate files are checked in sorted order, then the subdirectories are
 /// recursed in sorted order (a files-first depth-first search). An unreadable subdirectory is
 /// SKIPPED, not fatal — so one bad dir cannot mask a match elsewhere in the tree (a `.ok()?` in
-/// the loop would abort the whole search). Determinism matters: the rust-toolchain transform
+/// the loop would abort the whole search). Determinism matters: the rust-stage0 transform
 /// co-locates the libgcc_s.so.1 this returns, so a filesystem-order pick would make the relinked
 /// tree non-reproducible when a gcc install ships more than one copy.
 fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
@@ -1103,7 +1125,7 @@ mod tests {
 
     // A minimal uncompressed ustar archive of `(path, contents)` members —
     // `unpack_archive` dispatches to its raw-tar reader when there is no
-    // compression magic, so this drives `unpack_rust_release` end to end with
+    // compression magic, so this drives `unpack_rust_component` end to end with
     // no gzip writer. One 512-byte header per member + content padded to 512,
     // then two zero blocks.
     fn ustar(members: &[(&str, &[u8])]) -> Vec<u8> {
@@ -1137,33 +1159,30 @@ mod tests {
         out
     }
 
-    // re #469 round-10 P2: PR-tier coverage for the engine-native rust unpack
-    // (the recipe check is daily-tier). A well-formed release strips its top
-    // dir and lands rustc/cargo; a release missing cargo reds at the guard
-    // instead of three rungs later.
+    // PR-tier coverage for the engine-native Rust component unpack. A
+    // well-formed component strips its top directory; a component missing its
+    // required member reds at this boundary instead of several rungs later.
     #[test]
-    fn unpack_rust_release_strips_top_and_guards_layout() {
+    fn unpack_rust_component_strips_top_and_guards_layout() {
         let d = tmp("td-rust-unpack");
-        let top = "rust-1.96.0-x86_64-unknown-linux-gnu";
+        let top = "rustc-1.95.0-x86_64-unknown-linux-gnu";
         let good = d.join("good.tar");
         fs::write(
             &good,
-            ustar(&[
-                (&format!("{top}/rustc/bin/rustc"), b"#!rustc\n"),
-                (&format!("{top}/cargo/bin/cargo"), b"#!cargo\n"),
-            ]),
+            ustar(&[(&format!("{top}/rustc/bin/rustc"), b"#!rustc\n")]),
         )
         .expect("write good tar");
         let out = d.join("good-out");
-        unpack_rust_release(&good, &out).expect("well-formed release unpacks");
+        unpack_rust_component(&good, &out, "rustc/bin/rustc")
+            .expect("well-formed component unpacks");
         assert!(out.join("rustc/bin/rustc").is_file(), "rustc not stripped into place");
-        assert!(out.join("cargo/bin/cargo").is_file(), "cargo not stripped into place");
 
-        // A release missing cargo reds at the existence guard.
+        // The same archive cannot masquerade as the separately pinned Cargo component.
         let bad = d.join("bad.tar");
         fs::write(&bad, ustar(&[(&format!("{top}/rustc/bin/rustc"), b"#!rustc\n")]))
             .expect("write bad tar");
-        let err = unpack_rust_release(&bad, &d.join("bad-out")).unwrap_err();
+        let err = unpack_rust_component(&bad, &d.join("bad-out"), "cargo/bin/cargo")
+            .unwrap_err();
         assert!(err.contains("missing cargo/bin/cargo"), "{err}");
         let _ = fs::remove_dir_all(&d);
     }

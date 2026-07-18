@@ -298,6 +298,23 @@ pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, String> {
 /// Fail-closed: without any of these the builder would link dynamically and leak
 /// its host `lib/` into every sandbox (re #469).
 pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, String> {
+    // The resolved lib dir travels through RUSTFLAGS as `-L <dir>` (static_rustflags
+    // / the recipe-eval shell), and cargo/rustc whitespace-SPLIT RUSTFLAGS — a dir
+    // containing whitespace cannot be expressed that way, so fail closed here
+    // rather than silently mis-link (Codex P2). Reject on Unicode `is_whitespace`
+    // (not just ASCII), matching cargo's `str::split_whitespace` splitter exactly,
+    // so a vertical-tab / non-breaking-space path can't slip past the guard yet
+    // split downstream (review PR #534, P3). Guix store paths never contain
+    // whitespace; only an explicit TD_GLIBC_STATIC_HOME could.
+    let finish = |dir: String| -> Result<String, String> {
+        if dir.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "static glibc lib dir {dir:?} contains whitespace — it cannot be passed through \
+                 RUSTFLAGS `-L`; move the static glibc to a whitespace-free path"
+            ));
+        }
+        Ok(dir)
+    };
     let has_static_libc =
         |lib: &Path| std::fs::metadata(lib.join("libc.a")).is_ok_and(|m| m.is_file());
     // 1. Explicitly provided static glibc.
@@ -308,7 +325,7 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
                 "TD_GLIBC_STATIC_HOME={home} has no lib/libc.a — not a glibc `static` output"
             ));
         }
-        return Ok(lib.to_string_lossy().into_owned());
+        return finish(lib.to_string_lossy().into_owned());
     }
     // Resolve the C toolchain ONCE — both the ask-cc leg (2) and the
     // matched-pair check (3) key off the same cc, so they can never disagree
@@ -350,7 +367,7 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
                 if libc_a.is_absolute() {
                     if let Some(dir) = libc_a.parent() {
                         if has_static_libc(dir) {
-                            return Ok(dir.to_string_lossy().into_owned());
+                            return finish(dir.to_string_lossy().into_owned());
                         }
                     }
                 }
@@ -372,7 +389,7 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
             .map(|p| Path::new(&p).join("lib"))
             .find(|lib| has_static_libc(lib))
         {
-            return Ok(lib.to_string_lossy().into_owned());
+            return finish(lib.to_string_lossy().into_owned());
         }
     }
     Err("no static glibc found — set TD_GLIBC_STATIC_HOME to a glibc `static` output (with \
@@ -381,6 +398,68 @@ pub(crate) fn provision_glibc_static(env: &ProvisionEnv) -> Result<String, Strin
          links statically: a dynamic builder drags its host glibc/libgcc lib/ into every build \
          sandbox, which the #469 boundary must deny (DESIGN §Provenance)"
         .to_string())
+}
+
+/// The RUSTFLAGS that statically link a pure-`std` control-plane binary against
+/// a MATCHED static glibc (`glibc_static_lib` = a glibc `static` output's `lib/`,
+/// as `provision_glibc_static` resolves): `+crt-static` pulls in `libc.a`/`libm.a`;
+/// the NON-pie relocation model dodges a static-PIE glibc startup crash; `-L`
+/// points the linker at the matched static glibc's archives (its crt objects come
+/// from the gcc driver — only the archives need the search path). Shared by every
+/// host-side control-plane build site (`bootstrap_stage0`, the recipe-eval gate,
+/// `tests/recipe-eval-tool.sh` via the `provision-glibc-static` verb) so each
+/// links IDENTICALLY: an empty runtime closure, no DT_RUNPATH into a mutable
+/// host/guix-home profile whose libgcc_s.so.1/libc.so.6 vanish mid-GC and flake
+/// the tool with exit 127 (re #469; fixes the daily backstop libgcc_s flake at
+/// the source rather than pinning a runpath).
+///
+/// `linker` pins the rustc linker driver (`-C linker=<cc>`) to the SAME gcc that
+/// owns the matched static glibc. A site that overlays onto an inherited
+/// environment passes `Some(cc)` so an ambient `CARGO_TARGET_<triple>_LINKER`
+/// cannot pair the static glibc's crt objects with a different driver (which links
+/// clean + passes `assert_static` yet SIGSEGVs at startup — review PR #534, Codex
+/// P2). `bootstrap_stage0` clears the environment, so nothing can be inherited and
+/// it passes `None`.
+pub(crate) fn static_rustflags(glibc_static_lib: &str, linker: Option<&str>) -> String {
+    let base =
+        format!("-C target-feature=+crt-static -C relocation-model=static -L {glibc_static_lib}");
+    match linker {
+        Some(l) => format!("{base} -C linker={l}"),
+        None => base,
+    }
+}
+
+/// The same static flags as `static_rustflags`, but in `CARGO_ENCODED_RUSTFLAGS`
+/// form: one rustc ARGUMENT per `\x1f`-separated field. Two properties the
+/// space-split `RUSTFLAGS` lacks, both flagged in review (PR #534). First, it is
+/// cargo's HIGHEST-precedence rustflags source, so an ambient `RUSTFLAGS` or
+/// `CARGO_ENCODED_RUSTFLAGS` on the build host cannot silently outrank it and drop
+/// the static flags (which would relink dynamic — caught by `assert_static`, but a
+/// spurious failure re-introducing an env-dependent flake). Second, the `-L`/linker
+/// fields are single units, so a path is never whitespace-split (belt-and-suspenders
+/// with `provision_glibc_static`'s no-whitespace guard).
+///
+/// `linker` pins the linker driver as in `static_rustflags`. This form is for the
+/// sites that overlay onto an inherited environment (the recipe-eval gate); the
+/// env_clear'd `bootstrap_stage0` and the `--target` per-target var in
+/// `host_cargo_bin` (which removes the higher-tier ambient vars and pins the linker
+/// via `CARGO_TARGET_<triple>_LINKER` itself) use the plain `static_rustflags`.
+pub(crate) fn static_encoded_rustflags(glibc_static_lib: &str, linker: Option<&str>) -> String {
+    let mut fields = vec![
+        "-C",
+        "target-feature=+crt-static",
+        "-C",
+        "relocation-model=static",
+        "-L",
+        glibc_static_lib,
+    ];
+    let linker_arg;
+    if let Some(l) = linker {
+        linker_arg = format!("linker={l}");
+        fields.push("-C");
+        fields.push(&linker_arg);
+    }
+    fields.join("\u{1f}")
 }
 
 /// A scratch dir under the system temp dir, unique per process (pid + a
@@ -450,14 +529,10 @@ pub(crate) fn bootstrap_stage0(
     // any ambient lookup.
     let cargo = find_in_path(&bootpath, "cargo")
         .ok_or_else(|| format!("no cargo on the provisioned toolchain PATH ({bootpath})"))?;
-    // Static link (re #469): `+crt-static` links glibc's `libc.a`/`libm.a`; the
-    // NON-pie relocation model dodges a static-PIE glibc startup crash; `-L`
-    // points the linker at the MATCHED static glibc (its crt objects come from
-    // the gcc driver — only the archives need the search path). RUSTFLAGS is
-    // added to the CLEARED env; it applies to the build script too, which then
-    // also links + runs static (proven fine with the non-pie model).
-    let rustflags =
-        format!("-C target-feature=+crt-static -C relocation-model=static -L {glibc_static_lib}");
+    // Static link (re #469) — see `static_rustflags`. RUSTFLAGS is added to the
+    // CLEARED env; it applies to the build script too, which then also links +
+    // runs static (proven fine with the non-pie model).
+    let rustflags = static_rustflags(glibc_static_lib, None);
     let build = Command::new(&cargo)
         .env_clear()
         .env("PATH", &bootpath)
@@ -786,6 +861,54 @@ mod tests {
             rust_version: "1.96.0".to_string(),
             search_path: String::new(),
         }
+    }
+
+    // Pin the exact `\x1f`-field layout of the encoded rustflags (review PR #534,
+    // P3): the loop/gate rely on cargo parsing one rustc argument per field, and a
+    // refactor that merged `-C` with its value (or a space-joined form) would
+    // silently mis-apply the static flags. Also assert `-C target-feature` and
+    // `-C` are SEPARATE fields, and the parity between the plain and encoded forms.
+    #[test]
+    fn static_encoded_rustflags_uses_one_rustc_arg_per_unit_separator_field() {
+        let enc = static_encoded_rustflags("/gnu/store/abc-glibc-static/lib", None);
+        assert_eq!(
+            enc.split('\u{1f}').collect::<Vec<_>>(),
+            vec![
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                "-L",
+                "/gnu/store/abc-glibc-static/lib",
+            ]
+        );
+        assert!(!enc.contains(' '), "no field may be space-joined");
+
+        // With a linker, two more fields (`-C`, `linker=<cc>`) are appended.
+        let enc_l = static_encoded_rustflags("/g/lib", Some("/g/bin/gcc"));
+        assert_eq!(
+            enc_l.split('\u{1f}').collect::<Vec<_>>(),
+            vec![
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                "-L",
+                "/g/lib",
+                "-C",
+                "linker=/g/bin/gcc",
+            ]
+        );
+
+        // The plain (space-joined RUSTFLAGS) form carries the same flags.
+        assert_eq!(
+            static_rustflags("/g/lib", None),
+            "-C target-feature=+crt-static -C relocation-model=static -L /g/lib"
+        );
+        assert_eq!(
+            static_rustflags("/g/lib", Some("/g/bin/gcc")),
+            "-C target-feature=+crt-static -C relocation-model=static -L /g/lib -C linker=/g/bin/gcc"
+        );
     }
 
     #[test]

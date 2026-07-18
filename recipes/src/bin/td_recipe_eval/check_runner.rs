@@ -1627,6 +1627,7 @@ mod tests {
             "flex-x86-64-test",
             "elfutils-x86-64-test",
             "linux-x86-64-test",
+            "hello-test",
         ] {
             if let Err(err) = ensure_targets_provenance(&[target]) {
                 panic!("{target}: expected host-free provenance to pass, got: {err}");

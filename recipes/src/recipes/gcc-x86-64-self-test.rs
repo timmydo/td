@@ -211,6 +211,9 @@ fn compile_step(compiler: &str, binutils: &str, source: &str, output: &str, cxx:
         output.into(),
         source.into(),
     ]);
+    if cxx {
+        argv.push("-latomic".into());
+    }
     Step::Run {
         argv,
         env: vec![("PATH".into(), binutils.into())],
@@ -250,9 +253,18 @@ int main(void) {
 
 fn cxx_probe_source() -> &'static str {
     r#"#include <unistd.h>
+#include <atomic>
+#include <mutex>
 #include <vector>
 
 int main(void) {
+    std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::atomic<unsigned __int128> wide(0);
+    unsigned __int128 expected = 0;
+    if (!wide.compare_exchange_strong(expected, 1)) {
+        return 12;
+    }
     std::vector<int> values;
     for (int i = 0; i < 64; ++i) {
         values.push_back(i);

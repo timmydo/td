@@ -60,6 +60,41 @@ independent of any working session. (A `systemd --user` timer is equivalent and 
 logout.) This touches the dev host's crontab, so it is enabled by the operator, not
 auto-installed.
 
+## Running the mechanical half as a GitHub Action (`.github/workflows/daily.yml`)
+
+The mechanical runner can also run on a schedule in GitHub Actions instead of (or
+alongside) the host cron. The `daily` workflow fires once a day (`17 11 * * *`
+UTC ≈ 04:17 PT, plus `workflow_dispatch` for on-demand runs), builds the engine,
+runs `td-builder daily`, and **publishes the verdict + run log as the
+`daily-verdict` artifact**. It is only the mechanical half — it never triages or
+opens a PR. The healing agent stays a **separate** run and consumes the Action's
+output:
+
+```
+# newest daily run + its verdict
+gh run list --workflow=daily.yml -L1 --json databaseId,conclusion
+gh run download <run-id> -n daily-verdict          # -> .td-daily-verdict, daily-run.log
+gh issue list --label daily-red --state open       # the real-regression backlog signal
+```
+
+On a **real** regression (exit bitfield 1–3) the workflow fails the job and opens
+(or comments on) a rolling **`daily-red`** tracking issue carrying the verdict, the
+run URL, and the triage prompt — so `gh issue list` (the agent's menu) surfaces it.
+The agent then does the triage + fix-or-revert PR exactly as above; close the
+`daily-red` issue when the fix/revert lands.
+
+Runner caveat (why this defaults to best-effort): a from-seed daily needs the warm
+loop prelude + a resolvable loop toolchain. A **cold github-hosted** runner has
+neither, so the run typically exits `10` (unprovisioned — a host setup gap, *not* a
+regression); the workflow treats `10` as a neutral pass and opens no issue, so the
+signal path is dormant until a provisioned runner is used. For an **authoritative**
+daily, set the repo/org variable **`DAILY_RUNNER`** to a warm self-hosted runner
+label (the box that already carries `.td-build-cache` and runs the host cron) — no
+workflow edit; `runs-on` falls back to `ubuntu-latest` when the variable is unset.
+Optionally give that runner `TD_SUBST_PRIVKEY` (a repo secret wired into the
+workflow) so an all-green daily also publishes substitutes, mirroring the host-cron
+runner.
+
 ## Session-local alternative (not recommended for permanence)
 
 A `CronCreate` job fires the prompt into the *current* Claude session and auto-expires

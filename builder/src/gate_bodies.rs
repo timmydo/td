@@ -1847,6 +1847,18 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
         crate::stage0::provision_cc(&penv).map_err(|e| format!("FAIL: provision-cc: {e}"))?;
     let cargo_bin = find_in_path_frags(&rustpath, "cargo")
         .ok_or_else(|| format!("FAIL: no cargo in provision-rust output ({rustpath})"))?;
+    // Pin the compiler and linker to the provisioned toolchain (Codex P2): the
+    // rustc the build actually uses, and the gcc that owns the matched static
+    // glibc, so no inherited RUSTC / CARGO_TARGET_<triple>_LINKER substitutes a
+    // different one and pairs the static glibc's crt objects with a mismatched
+    // driver (which links clean yet SIGSEGVs at startup).
+    let rustc_bin = find_in_path_frags(&rustpath, "rustc")
+        .ok_or_else(|| format!("FAIL: no rustc in provision-rust output ({rustpath})"))?;
+    let cc_bin = find_in_path_frags(&ccpath, "cc")
+        .or_else(|| find_in_path_frags(&ccpath, "gcc"))
+        .ok_or_else(|| format!("FAIL: no cc/gcc in provision-cc output ({ccpath})"))?;
+    let rustc_s = path_str(&rustc_bin)?;
+    let cc_s = path_str(&cc_bin)?;
 
     let scratch = fresh_scratch(root, ".recipe-rs-scratch")?;
     let cargo_home = scratch.join("home");
@@ -1861,10 +1873,40 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
 
     let old_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{rustpath}:{ccpath}:{old_path}");
-    let envs: [(&str, &str); 3] = [
+    // STATICALLY link the evaluator (and its cargo build-script/test binaries)
+    // against a MATCHED static glibc. A static binary has an EMPTY runtime closure
+    // — no DT_NEEDED, no DT_RUNPATH — so it can never load libgcc_s.so.1/libc.so.6
+    // from the MUTABLE ~/.guix-home/profile/lib that guix's gcc ld-wrapper would
+    // otherwise bake in as a runpath and that vanishes while guix-home reconfigures
+    // or GCs ("error while loading shared libraries: libgcc_s.so.1", exit 127),
+    // flaking this control-plane tool and reddening the daily backstop. Fixing it
+    // at the SOURCE (crt-static) supersedes pinning a runpath (re #469). The recipes
+    // crate is dependency-free (pure std, no proc-macros) so the flags apply
+    // cleanly to the whole build; see stage0::static_rustflags.
+    //
+    // Pass the flags via CARGO_ENCODED_RUSTFLAGS, not RUSTFLAGS: run_out_env
+    // OVERLAYS onto this gate's inherited environment, and cargo reads exactly
+    // ONE rustflags source (first-set wins, no merge). An ambient RUSTFLAGS or
+    // CARGO_ENCODED_RUSTFLAGS on the build host would otherwise outrank a
+    // tier-2 RUSTFLAGS we set here and drop the static flags — assert_static
+    // would then fail the gate (fail-closed, but a spurious env-dependent red,
+    // the very failure mode this PR removes). CARGO_ENCODED_RUSTFLAGS is cargo's
+    // highest-precedence source, so setting it here wins unconditionally, and it
+    // carries the linker pin (`-C linker=<cc>`); see stage0::static_encoded_rustflags.
+    // RUSTC pins the compiler; RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER are neutralized
+    // (empty = "no wrapper" to cargo) so no inherited rustc or sccache-style wrapper
+    // interposes on this control-plane build.
+    let glibc_static = crate::stage0::provision_glibc_static(&penv)
+        .map_err(|e| format!("FAIL: provision static glibc for a crt-static evaluator: {e}"))?;
+    let encoded_rustflags = crate::stage0::static_encoded_rustflags(&glibc_static, Some(&cc_s));
+    let envs: [(&str, &str); 7] = [
         ("PATH", &new_path),
+        ("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags),
         ("CARGO_HOME", &cargo_home_s),
         ("CARGO_TARGET_DIR", &cargo_target_s),
+        ("RUSTC", &rustc_s),
+        ("RUSTC_WRAPPER", ""),
+        ("RUSTC_WORKSPACE_WRAPPER", ""),
     ];
 
     println!(
@@ -1901,6 +1943,10 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
             eval.display()
         ));
     }
+    // Fail closed if the toolchain silently linked the evaluator dynamically: a
+    // dynamic control-plane binary drags a host runtime closure (and a mutable
+    // guix-home runpath) that the #469 sandbox boundary must deny.
+    crate::elf::assert_static(&eval)?;
     let eval_s = path_str(&eval)?;
 
     // CLI smoke: `cargo test` proves EVERY recipe's data is correct
