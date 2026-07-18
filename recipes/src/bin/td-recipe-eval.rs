@@ -352,6 +352,10 @@ mod tests {
             ("gcc-x86-64-native-test", 1),
             ("gcc-x86-64-self-test", 1),
             ("linux-x86-64-test", 1),
+            // Producer-carried behavioural check (QemuBoot), parallel to
+            // rust-toolchain above: linux-x86-64 boots its bzImage + initramfs
+            // under host qemu (re #529).
+            ("linux-x86-64", 1),
             ("flex-x86-64-test", 1),
             ("elfutils-x86-64-test", 1),
             ("hello-test", 1),

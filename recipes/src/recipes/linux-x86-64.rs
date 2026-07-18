@@ -1,7 +1,7 @@
 use crate::ladder::{
     mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH,
 };
-use crate::types::{Recipe, Step};
+use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // linux-x86-64 (Linux 7.1.4): the capstone of the x86_64 ladder (#529).
 // Source-builds the latest STABLE mainline kernel (not a longterm/LTS line) with
@@ -15,8 +15,17 @@ use crate::types::{Recipe, Step};
 // is the busybox gzip applet's `bin/gzip` link, which accepts the kernel's exact
 // `-n -f -9` directly (busybox gzip's options include `-n` and `-1..-9`).
 // CONFIG_KERNEL_GZIP is pinned so the compressor is always gzip (never xz/zstd,
-// which would need a different tool). A qemu boot of the bzImage is a separate
-// later rung (re #529, re #469).
+// which would need a different tool).
+//
+// BOOTABLE (re #529): the config also turns on the 8250 serial console
+// (SERIAL_8250 + SERIAL_8250_CONSOLE, PRINTK/TTY), ELF + #! exec (BINFMT_ELF,
+// BINFMT_SCRIPT), and initramfs load (BLK_DEV_INITRD), and the recipe packs a
+// tiny EXTERNAL initramfs (gen_init_cpio) holding the td-built STATIC busybox
+// plus a /init that prints a marker on ttyS0 and reboots. A THIRD {out} artifact
+// (initramfs.cpio) lands alongside vmlinux/bzImage. The sibling QemuBoot daily
+// check boots the bzImage + initramfs under host qemu (TCG, OUTSIDE the sandbox)
+// and asserts the userland marker reaches the console — the behavioural proof
+// that this source-built kernel actually boots to a real userland.
 //
 // A modern (>= 4.18) kernel needs host tools the 4.14 rung dodged; each is now a
 // td recipe (AGENTS.md directive 3, pre-authorized as part of this migration):
@@ -271,6 +280,11 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_KERNEL_LZO[ =]/d; \
                   /^#? *CONFIG_KERNEL_LZ4[ =]/d; \
                   /^#? *CONFIG_KERNEL_ZSTD[ =]/d; \
+                  /^#? *CONFIG_BINFMT_ELF[ =]/d; \
+                  /^#? *CONFIG_BINFMT_SCRIPT[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV_INITRD[ =]/d; \
+                  /^#? *CONFIG_SERIAL_8250[ =]/d; \
+                  /^#? *CONFIG_SERIAL_8250_CONSOLE[ =]/d; \
                   /^#? *CONFIG_INITRAMFS_SOURCE[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -284,6 +298,11 @@ pub fn recipe() -> Recipe {
                    '# CONFIG_GCC_PLUGINS is not set' \
                    '# CONFIG_IKHEADERS is not set' \
                    'CONFIG_KERNEL_GZIP=y' \
+                   'CONFIG_BINFMT_ELF=y' \
+                   'CONFIG_BINFMT_SCRIPT=y' \
+                   'CONFIG_BLK_DEV_INITRD=y' \
+                   'CONFIG_SERIAL_8250=y' \
+                   'CONFIG_SERIAL_8250_CONSOLE=y' \
                    'CONFIG_INITRAMFS_SOURCE=\"\"' >> .config",
             ],
         )
@@ -305,6 +324,12 @@ pub fn recipe() -> Recipe {
                 "-c",
                 "grep -q '^CONFIG_UNWINDER_FRAME_POINTER=y' .config || { echo 'frame-pointer unwinder not selected' >&2; exit 1; }; \
                  grep -q '^CONFIG_KERNEL_GZIP=y' .config || { echo 'gzip kernel compression not selected (bzImage would need another compressor)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BINFMT_ELF=y' .config || { echo 'BINFMT_ELF off — the kernel could not exec the busybox userland' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BINFMT_SCRIPT=y' .config || { echo 'BINFMT_SCRIPT off — the kernel could not exec the #! /init script' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLK_DEV_INITRD=y' .config || { echo 'BLK_DEV_INITRD off — the kernel could not load the initramfs' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SERIAL_8250_CONSOLE=y' .config || { echo '8250 serial console off — no ttyS0 boot output for the qemu check' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
+                 grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi",
             ],
@@ -336,7 +361,62 @@ pub fn recipe() -> Recipe {
         .env("MAKELEVEL", ""),
     );
 
-    // Land the uncompressed ELF + its symbol map + the bootable bzImage.
+    // ---- Bootable userland: a static-busybox initramfs (re #529) ----
+    // The kernel is now serial-console + initramfs capable (the config deltas
+    // above add the 8250 console, BINFMT_ELF/SCRIPT, and BLK_DEV_INITRD). Pack a
+    // tiny initramfs whose /init prints a marker on ttyS0 and reboots, so the
+    // sibling qemu boot check can prove the td-source-built kernel reaches a real
+    // userland. The initramfs is an EXTERNAL artifact (qemu -initrd), keeping
+    // bzImage a pure kernel — INITRAMFS_SOURCE stays "".
+    //
+    // gen_init_cpio (usr/gen_init_cpio, a HOSTCC hostprog) packs the newc cpio
+    // from a spec WITHOUT needing mknod privilege: the `nod /dev/console` entry
+    // is written straight into the archive, which the unprivileged host-free
+    // sandbox could not create on a real filesystem. busybox is the td-built
+    // STATIC busybox (CONFIG_STATIC=y), so the initramfs is self-contained — no
+    // glibc closure, no host bytes.
+
+    // The /init the kernel execs (rdinit=/init): a #! script (BINFMT_SCRIPT) that
+    // prints the marker the boot check greps for, then `reboot -f` so qemu
+    // (-no-reboot) exits cleanly. echo is a busybox-sh builtin, so the marker
+    // prints even if the reboot applet were unavailable (the boot check's
+    // wall-clock ceiling then bounds the run).
+    steps.push(Step::WriteFile {
+        path: "{root}/initramfs/init".into(),
+        content: "#!/bin/sh\necho TD-USERLAND-OK\nexec /bin/busybox reboot -f\n".into(),
+        exec: true,
+    });
+    // gen_init_cpio spec: /dev/console for init's stdio, the static busybox, a
+    // /bin/sh -> busybox multi-call symlink for the #! interpreter, and /init.
+    steps.push(Step::WriteFile {
+        path: "{root}/initramfs/spec".into(),
+        content: "dir /dev 0755 0 0\n\
+                  nod /dev/console 0600 0 0 c 5 1\n\
+                  dir /bin 0755 0 0\n\
+                  file /bin/busybox {in:busybox-x86-64}/bin/busybox 0755 0 0\n\
+                  slink /bin/sh /bin/busybox 0777 0 0\n\
+                  file /init {root}/initramfs/init 0755 0 0\n"
+            .into(),
+        exec: false,
+    });
+    // Build gen_init_cpio explicitly (idempotent — the bzImage run already built
+    // it to pack the empty INITRAMFS_SOURCE — but don't rely on that ordering).
+    steps.push(mk(&["usr/gen_init_cpio"]));
+    // Pack the initramfs; gen_init_cpio writes the newc cpio to stdout.
+    steps.push(
+        Step::run(
+            "{src}",
+            &[
+                SH,
+                "-c",
+                "'{src}/usr/gen_init_cpio' {root}/initramfs/spec > {root}/initramfs.cpio",
+            ],
+        )
+        .env("PATH", &mesboot0_path()),
+    );
+
+    // Land the uncompressed ELF + its symbol map + the bootable bzImage + the
+    // external busybox initramfs.
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
@@ -345,11 +425,16 @@ pub fn recipe() -> Recipe {
             "{src}/vmlinux".into(),
             "{src}/System.map".into(),
             "{src}/arch/x86/boot/bzImage".into(),
+            "{root}/initramfs.cpio".into(),
         ],
         dest: "{out}".into(),
     });
     steps.push(Step::Require {
-        paths: vec!["{out}/vmlinux".into(), "{out}/bzImage".into()],
+        paths: vec![
+            "{out}/vmlinux".into(),
+            "{out}/bzImage".into(),
+            "{out}/initramfs.cpio".into(),
+        ],
         exec: false,
     });
     // [native-arch] vmlinux must be an ELF64 x86-64 linked executable (EXEC, not a
@@ -393,6 +478,27 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &mesboot0_path()),
     );
+    // [initramfs] the packed userland must be a real newc cpio carrying the
+    // static busybox: the ASCII "070701" magic at offset 0, a size floor (the
+    // static busybox alone is ~1 MiB, so 64 KiB cleanly rejects a header-only or
+    // empty archive), and a `busybox` path entry. The sibling qemu boot check is
+    // the behavioural proof (it boots this cpio); this is the fast producer-rung
+    // shape check.
+    steps.push(
+        Step::run(
+            "{out}",
+            &[
+                SH,
+                "-c",
+                "sz=$(wc -c < '{out}/initramfs.cpio'); \
+                 [ \"$sz\" -ge 65536 ] || { echo \"initramfs.cpio: implausibly small ($sz bytes) — the static busybox alone is ~1 MiB\" >&2; exit 1; }; \
+                 set -- $(od -An -tx1 -N 6 '{out}/initramfs.cpio'); \
+                 [ \"$1$2$3$4$5$6\" = 303730373031 ] || { echo 'initramfs.cpio: missing the newc cpio magic 070701' >&2; exit 1; }; \
+                 grep -q -a busybox '{out}/initramfs.cpio' || { echo 'initramfs.cpio: no busybox entry — the userland is missing' >&2; exit 1; }",
+            ],
+        )
+        .env("PATH", &mesboot0_path()),
+    );
 
     Recipe::mesboot("linux-x86-64", "7.1.4")
         .source_input("linux-kernel-source")
@@ -409,4 +515,18 @@ pub fn recipe() -> Recipe {
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
+        // Behavioural boot check (daily): build the bzImage + busybox initramfs
+        // and boot them under HOST qemu (TCG), asserting the userland marker
+        // reaches ttyS0. qemu is a control-plane TEST tool run OUTSIDE the sandbox
+        // (parity with the RustToolchain check running the built rustc) — the
+        // kernel + userland it boots are 100% td-built and host-free. See
+        // checks/qemu_boot.rs for the trust model.
+        .checks(vec![RecipeCheck::daily(
+            r#"
+echo ">> recipe-check linux-x86-64 (qemu-boot): build the bzImage + static-busybox initramfs and boot them under host qemu (TCG), asserting the userland marker reaches ttyS0"
+: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+exec "$TD_RECIPE_EVAL" check-run linux-x86-64 daily 1
+"#,
+        )
+        .with_runner(CheckRunner::QemuBoot)])
 }

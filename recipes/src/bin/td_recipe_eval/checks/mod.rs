@@ -3,6 +3,7 @@ use td_recipe::types::CheckRunner;
 use crate::check_runner::RecipeCheckRunner;
 
 mod basic;
+mod qemu_boot;
 mod rust_toolchain;
 
 pub(crate) fn run(
@@ -13,5 +14,6 @@ pub(crate) fn run(
     match check_runner {
         CheckRunner::BuildOnly => basic::run_build_only(runner, stem),
         CheckRunner::RustToolchain => rust_toolchain::run(runner),
+        CheckRunner::QemuBoot => qemu_boot::run(runner),
     }
 }
