@@ -229,18 +229,33 @@ struct Watch {
     drain_grace: Duration,
 }
 
-/// Default phase bound: make can legitimately be silent for minutes while one
-/// big translation unit compiles; 30 minutes is comfortably past the corpus'
-/// worst single-file case (the /td/store bootstrap chain does NOT run through
-/// run_cmd — bootstrap.rs/toolchain_x86_64.rs have their own runners), while
-/// still bounding a truly-wedged phase. No COUNT repeat bound (`tar xf` repeats
-/// a warning per member); the `repeat_secs` DURATION bound (5 min of the same
-/// line still arriving) is the #339 make-nested chatty-spin catch — comfortably
-/// above any real burst (a tar of a huge tarball finishes in a minute or two,
-/// its warning does not keep arriving for five straight minutes) yet well under
-/// the 30-min silence backstop, so a broken sub-configure reds in minutes.
+/// Default phase bound: make can legitimately be silent for a long time while
+/// one big translation unit compiles. 4 hours is comfortably past the corpus'
+/// worst single-file case: GCC 14.3.0's final codegen builds machine-generated,
+/// multi-megabyte translation units (insn-recog.cc, insn-automata.cc,
+/// insn-dfatab.cc, insn-latencytab.cc) that emit NOTHING for the whole compile,
+/// and under the slow gcc-mesboot 4.9.4 bootstrap compiler on a loaded shared
+/// box a single one of those can stay silent well past half an hour — the old
+/// 30-minute bound false-killed it as "wedged" (~36 min observed). The
+/// /td/store bootstrap chain does NOT run through run_cmd — bootstrap.rs /
+/// toolchain_x86_64.rs have their own runners — so this bound governs the
+/// generic recipe phases. This backstop is DELIBERATELY generous because it is
+/// the ONLY guard that fires on a *silent* wedge; the chatty/spin wedges have
+/// their own tight bounds that this change does NOT touch (WATCH_CONFIGURE's
+/// 600s catches the #292 configure spin; the `repeat_secs` 300s below catches
+/// the #339 nested-make chatty spin) — both still red within minutes, so only a
+/// genuinely output-free hang waits out the 4 hours. No COUNT repeat bound
+/// (`tar xf` repeats a warning per member); the `repeat_secs` DURATION bound
+/// (5 min of the same line still arriving) is the #339 make-nested chatty-spin
+/// catch — comfortably above any real burst (a tar of a huge tarball finishes
+/// in a minute or two, its warning does not keep arriving for five straight
+/// minutes). Kept a COMPILED-IN constant, not an env knob (the sandbox clears
+/// the builder's env and a drv-env knob would poison the drv hash — see the
+/// Watch doc); re-tuning it is now cache-safe because the reuse key binds the
+/// builder's ABI identity, not its ELF bytes (see reuse_key_manifest_digest),
+/// so an output-neutral bump like this one does not invalidate the world.
 const WATCH_PHASE: Watch = Watch {
-    silence: Duration::from_secs(1800),
+    silence: Duration::from_secs(14400),
     repeat_limit: 0,
     repeat_secs: Duration::from_secs(300),
     drain_grace: Duration::from_secs(15),
