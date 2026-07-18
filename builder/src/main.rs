@@ -1567,24 +1567,31 @@ fn drv_declared_inputs(parsed: &drv::Derivation) -> Result<Vec<String>, String> 
 /// So the key digests ONLY the manifest entries whose path is in `closure` — the
 /// EXACT transitive input set `realize_drv` stages and enforces over, computed by
 /// the shared `stage_input_closure` at both the write site and every read site
-/// (identical routine ⇒ identical set ⇒ no asymmetry miss). `closure` is the
-/// PRE-builder-rekey closure, so its builder entry is still at the real builder's
-/// content path; when a placement db vouches that builder its `ControlPlaneBuilder`
-/// row is scoped in, and the drv's DECLARED ABI builder IDENTITY (`parsed.builder`,
-/// content-independent) is ALSO folded into the digest so the running builder — which
-/// is no manifest key — is bound by the SAME ABI identity the OUTPUT path keys on, not
-/// by its ELF bytes. An output-neutral builder recompile (same BUILDER_ABI) therefore
-/// does NOT move the key; a BUILDER_ABI bump does. A change to — or removal of — any
-/// real input still moves the
-/// key. ENFORCEMENT is deliberately left FULL-manifest (`enforce_realize_input_policy`
-/// runs over the un-scoped `manifest`): it only LOOKS UP each closure item, so a
-/// superset is correct — scoping it would instead drop the vouching rows the build
-/// stages. Scoping the KEY narrows what a cache hit must match; it does not weaken
-/// what a build may stage.
+/// (identical routine ⇒ identical set ⇒ no asymmetry miss) — with ONE exclusion: the
+/// builder's OWN `ControlPlaneBuilder` row (at `real_builder_cb`, the real content path
+/// the PRE-rekey `closure` names). That row's hash tracks the builder ELF, so scoping
+/// it in would move the key on every builder recompile — the precise bust this fix
+/// removes, and the one the ladder ALWAYS hits because it stages the builder as a
+/// content-addressed override (`TD_BUILDER_PATH`), which puts the builder in-closure and
+/// moves its nar_hash each build even though the ABI-keyed OUTPUT path does not. In its
+/// place the drv's DECLARED ABI builder IDENTITY (`parsed.builder`, content-independent)
+/// is folded in, so the builder is bound by the SAME ABI identity the OUTPUT path keys
+/// on, not by its ELF bytes. An output-neutral builder recompile (same BUILDER_ABI)
+/// therefore does NOT move the key whether the builder runs in-process (no manifest row)
+/// or is staged as an override (row excluded); a BUILDER_ABI bump moves BOTH the identity
+/// and the output path. A change to — or removal of — any OTHER real input still moves
+/// the key; the builder's runtime-linkage inputs (its libc etc.) are NOT the excluded
+/// row — they keep their rows and bind normally. ENFORCEMENT is deliberately left
+/// FULL-manifest (`enforce_realize_input_policy` runs over the un-scoped `manifest`,
+/// which KEEPS the real builder row): it only LOOKS UP each closure item, so a superset
+/// is correct — scoping it would instead drop the vouching rows the build stages.
+/// Scoping (and builder-excluding) the KEY narrows what a cache hit must match; it does
+/// not weaken what a build may stage or #469 enforces.
 fn reuse_key_manifest_digest(
     closure: &[String],
     manifest: &sandbox::StageManifest,
     builder_identity: &str,
+    real_builder_cb: Option<&str>,
 ) -> String {
     // The manifest is keyed by CANONICAL store path; each closure entry is
     // `canonical` or `canonical\ton-disk`, so scope by the canonical (left) half.
@@ -1594,23 +1601,31 @@ fn reuse_key_manifest_digest(
     }
     let mut scoped = sandbox::StageManifest::new();
     for (p, si) in manifest {
+        // EXCLUDE the builder's OWN content row (`real_builder_cb`): its hash tracks the
+        // builder ELF, and folding the ABI identity below is what binds the builder instead.
+        // Without this the ladder busts the key on every recompile — it stages the builder as
+        // a content-addressed override (`TD_BUILDER_PATH`), so this row is in-closure and its
+        // nar_hash moves each build even though the output path (ABI-keyed) does not. Only the
+        // builder's OWN row is dropped; its runtime-linkage inputs keep their rows and bind.
+        if real_builder_cb == Some(p.as_str()) {
+            continue;
+        }
         if paths.contains(p.as_str()) {
             scoped.insert(p.clone(), si.clone());
         }
     }
     let mut h = sha256::Sha256::new();
     h.update(manifest_digest(&scoped).as_bytes());
-    // Bind the drv's DECLARED builder IDENTITY (`parsed.builder`) — for a recipe drv the
-    // ABI-keyed `store::builder_identity_path()/bin/td-builder`, content-INDEPENDENT, the
-    // SAME string `ReceiptExpect.builder` records. NOT the resolved builder ELF: the output
-    // path already keys on this ABI identity (store::builder_identity_path), so the reuse
-    // key must too — else an output-neutral builder recompile (same BUILDER_ABI) would move
-    // the key, force a rebuild of an already-valid output, and, on a non-reproducible rung,
-    // collide with the cached tree (`commit_tree_checked` "Refusing to overwrite"). The
-    // running builder is no manifest key, so this leg is what binds its identity into the
-    // digest; a builder-override's real bytes are ADDITIONALLY bound via its scoped
-    // `ControlPlaneBuilder` manifest row. A BUILDER_ABI bump changes this identity and
-    // correctly moves the key (re #469).
+    // Bind the drv's DECLARED builder IDENTITY (`parsed.builder`) IN PLACE OF the excluded
+    // builder row — for a recipe drv the ABI-keyed `store::builder_identity_path()/bin/td-builder`,
+    // content-INDEPENDENT, the SAME string `ReceiptExpect.builder` records. The output path already
+    // keys on this ABI identity (store::builder_identity_path), so the reuse key must too — else an
+    // output-neutral builder recompile (same BUILDER_ABI) would move the key, force a rebuild of an
+    // already-valid output, and, on a non-reproducible rung, collide with the cached tree
+    // (`commit_tree_checked` "Refusing to overwrite"). This leg binds the builder identity whether it
+    // runs in-process (no manifest row) or as an override (row excluded above), so BOTH staging
+    // modes are recompile-stable. A BUILDER_ABI bump changes this identity and correctly moves the
+    // key (re #469).
     h.update(b"\nbuilder ");
     h.update(builder_identity.as_bytes());
     sha256::to_base16(&h.finalize())
@@ -2190,11 +2205,16 @@ fn daemon_realize_one(
     let ic = stage_input_closure(&parsed, &seed_dirs, &store::store_dir(), &extra_dbs, &[], ov.as_ref(), None)?;
     let expect = ReceiptExpect {
         drv_sha256: sha256_hex(&content),
-        // The reuse key folds the drv's DECLARED ABI builder identity (parsed.builder),
-        // NOT the resolved builder ELF (ic.builder_exec, which drives enforcement) — an
-        // output-neutral builder recompile must not move the key (see
-        // reuse_key_manifest_digest).
-        manifest_sha256: reuse_key_manifest_digest(&ic.closure, &manifest_now, &parsed.builder),
+        // The reuse key folds the drv's DECLARED ABI builder identity (parsed.builder) and
+        // EXCLUDES the builder's own content row (ic.real_builder_cb), NOT the resolved builder
+        // ELF (ic.builder_exec, which drives enforcement) — an output-neutral builder recompile
+        // must not move the key (see reuse_key_manifest_digest).
+        manifest_sha256: reuse_key_manifest_digest(
+            &ic.closure,
+            &manifest_now,
+            &parsed.builder,
+            ic.real_builder_cb.as_deref(),
+        ),
         builder: parsed.builder.clone(),
     };
     if let Some(regs) = cached_realization(&parsed, &scr, &expect)? {
@@ -3250,14 +3270,16 @@ fn realize_drv(
         self_store_path().ok().as_deref(),
     )?;
     // The reuse-key digest (re #469): scope the plan-wide `manifest` to THIS drv's own
-    // transitive input closure and fold in the drv's DECLARED ABI builder identity
-    // (parsed.builder — content-independent), NOT the resolved builder ELF (builder_exec,
-    // which stays the ENFORCEMENT input above). Computed here — over the PRE-re-key
-    // `closure`, whose builder entry is still at the real builder's content path the
-    // manifest vouches — so a later reuse re-derives the identical key, and an
-    // output-neutral builder recompile (same BUILDER_ABI) does not move it. The full
+    // transitive input closure, EXCLUDE the builder's own content row (real_builder_cb), and
+    // fold in the drv's DECLARED ABI builder identity (parsed.builder — content-independent),
+    // NOT the resolved builder ELF (builder_exec, which stays the ENFORCEMENT input above).
+    // Computed here — over the PRE-re-key `closure`, whose builder entry is still at the real
+    // builder's content path the manifest vouches, hence the exclusion — so a later reuse
+    // re-derives the identical key, and an output-neutral builder recompile (same BUILDER_ABI)
+    // does not move it whether the builder ran in-process or as an override. The full
     // `manifest` above stays the ENFORCEMENT input, untouched.
-    let reuse_manifest_sha256 = reuse_key_manifest_digest(&closure, &manifest, &parsed.builder);
+    let reuse_manifest_sha256 =
+        reuse_key_manifest_digest(&closure, &manifest, &parsed.builder, real_builder_cb.as_deref());
     // ABI: provenance is now enforced over the real builder path, so re-key the builder's
     // OWN closure entry from its real content path to the stable ABI identity path the drv
     // names (its runtime refs keep their real canonical paths). The sandbox binds the real
@@ -3466,11 +3488,16 @@ fn build_recipe(
     )?;
     let expect = ReceiptExpect {
         drv_sha256: sha256_hex(&drv_bytes),
-        // The reuse key folds the drv's DECLARED ABI builder identity (parsed.builder),
-        // NOT the resolved builder ELF (ic.builder_exec, which drives enforcement) — an
-        // output-neutral builder recompile must not move the key (see
-        // reuse_key_manifest_digest).
-        manifest_sha256: reuse_key_manifest_digest(&ic.closure, &manifest_now, &parsed.builder),
+        // The reuse key folds the drv's DECLARED ABI builder identity (parsed.builder) and
+        // EXCLUDES the builder's own content row (ic.real_builder_cb), NOT the resolved builder
+        // ELF (ic.builder_exec, which drives enforcement) — an output-neutral builder recompile
+        // must not move the key (see reuse_key_manifest_digest).
+        manifest_sha256: reuse_key_manifest_digest(
+            &ic.closure,
+            &manifest_now,
+            &parsed.builder,
+            ic.real_builder_cb.as_deref(),
+        ),
         builder: parsed.builder.clone(),
     };
     // Content-addressed build cache: if SCRATCH already holds a valid realization of
@@ -9522,9 +9549,12 @@ daemon build START (2/2 active)
             manifest_digest(&high),
             "the plan-wide digest drifts with unrelated seeds — the bug this scopes away"
         );
-        // The FIX: the closure-scoped reuse key is IDENTICAL across the two plans.
-        let low_key = reuse_key_manifest_digest(&closure, &low, &builder_identity);
-        let high_key = reuse_key_manifest_digest(&closure, &high, &builder_identity);
+        // The FIX: the closure-scoped reuse key is IDENTICAL across the two plans. The
+        // builder is staged as a content-addressed override (its row is in-closure), so
+        // real_builder_cb = the builder's content path — the row the digest EXCLUDES.
+        let rb = Some(builder.as_str());
+        let low_key = reuse_key_manifest_digest(&closure, &low, &builder_identity, rb);
+        let high_key = reuse_key_manifest_digest(&closure, &high, &builder_identity, rb);
         assert_eq!(
             low_key, high_key,
             "the reuse key must not drift with inputs outside the drv's own closure"
@@ -9537,16 +9567,17 @@ daemon build START (2/2 active)
         );
         assert_eq!(
             low_key,
-            reuse_key_manifest_digest(&closure, &plus_outside, &builder_identity),
+            reuse_key_manifest_digest(&closure, &plus_outside, &builder_identity, rb),
             "an input outside the closure must not move the key"
         );
 
-        // Binding preserved: CHANGING an in-closure input's hash moves the key.
+        // Binding preserved: CHANGING an in-closure NON-builder input's hash moves the key
+        // (the exclusion is PRECISE — only the builder's own row is dropped).
         let mut changed = low.clone();
         changed.insert(seed_a.clone(), si("ff", sandbox::InputOrigin::AuditedSeed));
         assert_ne!(
             low_key,
-            reuse_key_manifest_digest(&closure, &changed, &builder_identity),
+            reuse_key_manifest_digest(&closure, &changed, &builder_identity, rb),
             "a changed hash on an in-closure input must move the key"
         );
         // REMOVING an in-closure input moves the key too — the binding to real inputs stands.
@@ -9554,7 +9585,7 @@ daemon build START (2/2 active)
         removed.remove(seed_a.as_str());
         assert_ne!(
             low_key,
-            reuse_key_manifest_digest(&closure, &removed, &builder_identity),
+            reuse_key_manifest_digest(&closure, &removed, &builder_identity, rb),
             "dropping an in-closure input must move the key"
         );
 
@@ -9572,14 +9603,77 @@ daemon build START (2/2 active)
         let bumped_identity = format!("/td/store/{}-td-builder/bin/td-builder", "8".repeat(32));
         assert_ne!(
             low_key,
-            reuse_key_manifest_digest(&closure, &low, &bumped_identity),
+            reuse_key_manifest_digest(&closure, &low, &bumped_identity, rb),
             "a BUILDER_ABI-identity change must move the key"
         );
         let bare = vec![src.clone(), seed_a.clone()]; // no builder in the closure/manifest
         assert_ne!(
-            reuse_key_manifest_digest(&bare, &low, &builder_identity),
-            reuse_key_manifest_digest(&bare, &low, &bumped_identity),
+            reuse_key_manifest_digest(&bare, &low, &builder_identity, None),
+            reuse_key_manifest_digest(&bare, &low, &bumped_identity, None),
             "the builder ABI identity binds the key even when it is no manifest row"
+        );
+    }
+
+    // re #469 (P1#1, cross-model review): the LADDER stages the builder as a
+    // content-addressed OVERRIDE (`TD_BUILDER_PATH = place_stage0_builder(...)`), so the
+    // builder's own row IS in every recipe drv's closure and its nar_hash + store path move
+    // on EVERY builder recompile — even output-neutral ones. Folding parsed.builder alone
+    // did NOT fix that: the excluded-row leg is what makes an override recompile
+    // reuse-stable. This asserts the property the ladder actually needs — recompiling the
+    // builder (new content path AND new bytes) with the SAME ABI identity does NOT move the
+    // reuse key — and proves the exclusion is load-bearing (without it, the key WOULD move).
+    #[test]
+    fn reuse_key_is_stable_across_a_same_abi_builder_recompile() {
+        let src = format!("/td/store/{}-mes-source", "a".repeat(32));
+        let seed = format!("/td/store/{}-tinycc-seed", "b".repeat(32));
+        // The ABI-keyed identity path the drv NAMES — unchanged by a recompile (it is a pure
+        // function of BUILDER_ABI). Both builds fold this SAME string.
+        let identity = format!("/td/store/{}-td-builder/bin/td-builder", "9".repeat(32));
+
+        // Build v1 and v2 are the SAME builder recompiled: DIFFERENT content path (v1 vs v2)
+        // AND different bytes (nar_hash b1 vs b2), same ABI identity. This is exactly what
+        // `place_stage0_builder` produces across a rebuild of td-builder.
+        let builder_v1 = format!("/td/store/{}-td-builder", "1".repeat(32));
+        let builder_v2 = format!("/td/store/{}-td-builder", "2".repeat(32));
+
+        let si = |h: &str, o: sandbox::InputOrigin| sandbox::StagedInput {
+            nar_hash: format!("sha256:{h}"),
+            origin: o,
+        };
+        let mk = |bpath: &str, bhash: &str| {
+            // The drv's closure carries the builder at its real content path (pre-rekey),
+            // plus the drv's genuine inputs.
+            let closure = vec![src.clone(), seed.clone(), bpath.to_string()];
+            let mut m: sandbox::StageManifest = sandbox::StageManifest::new();
+            m.insert(src.clone(), si("11", sandbox::InputOrigin::AuditedSeed));
+            m.insert(seed.clone(), si("22", sandbox::InputOrigin::AuditedSeed));
+            m.insert(bpath.to_string(), si(bhash, sandbox::InputOrigin::ControlPlaneBuilder));
+            (closure, m)
+        };
+        let (cl1, m1) = mk(&builder_v1, "b1");
+        let (cl2, m2) = mk(&builder_v2, "b2");
+
+        // THE PROPERTY: recompiling the builder does NOT move the reuse key — the builder's
+        // own content row is excluded and the stable ABI identity binds it instead.
+        assert_eq!(
+            reuse_key_manifest_digest(&cl1, &m1, &identity, Some(&builder_v1)),
+            reuse_key_manifest_digest(&cl2, &m2, &identity, Some(&builder_v2)),
+            "an output-neutral builder recompile (override) must not move the reuse key"
+        );
+        // The exclusion is LOAD-BEARING: without it (passing None so the builder row is
+        // scoped in) the two keys WOULD differ — this is precisely the P1#1 bust.
+        assert_ne!(
+            reuse_key_manifest_digest(&cl1, &m1, &identity, None),
+            reuse_key_manifest_digest(&cl2, &m2, &identity, None),
+            "without the exclusion the builder's content row busts the key — the bug"
+        );
+        // The exclusion is PRECISE: a NON-builder input change still moves the key.
+        let mut m1b = m1.clone();
+        m1b.insert(seed.clone(), si("ff", sandbox::InputOrigin::AuditedSeed));
+        assert_ne!(
+            reuse_key_manifest_digest(&cl1, &m1, &identity, Some(&builder_v1)),
+            reuse_key_manifest_digest(&cl1, &m1b, &identity, Some(&builder_v1)),
+            "a real (non-builder) input change must still move the key"
         );
     }
 
