@@ -1871,17 +1871,23 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     // holding the toolchain's libc/libgcc_s — so resolution stays stable.
     let cc_libdirs = ccpath
         .split(':')
+        .filter(|d| !d.is_empty())
         .map(|d| match d.strip_suffix("/bin") {
             Some(base) => format!("{base}/lib"),
             None => d.to_string(),
         })
         .collect::<Vec<_>>()
         .join(":");
+    // Prepend the immutable toolchain lib dir(s), keeping any ambient
+    // LIBRARY_PATH as a lower-priority fallback: loader search is first-match,
+    // so libc/libgcc_s resolve from the immutable /lib and do not depend on the
+    // mutable guix-home profile. Guard the empty cases so the result never has a
+    // leading/lone ':' — LIBRARY_PATH reads an empty entry as the CWD.
     let old_library_path = std::env::var("LIBRARY_PATH").unwrap_or_default();
-    let new_library_path = if old_library_path.is_empty() {
-        cc_libdirs
-    } else {
-        format!("{cc_libdirs}:{old_library_path}")
+    let new_library_path = match (cc_libdirs.is_empty(), old_library_path.is_empty()) {
+        (true, _) => old_library_path,
+        (false, true) => cc_libdirs,
+        (false, false) => format!("{cc_libdirs}:{old_library_path}"),
     };
     let envs: [(&str, &str); 4] = [
         ("PATH", &new_path),

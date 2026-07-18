@@ -34,16 +34,24 @@ ccpath=`"$td" provision-cc` || { echo "recipe-eval-tool: could not provision a C
 # holding the toolchain's libc/libgcc_s, so the loaded libraries no longer
 # depend on the mutable guix-home profile being present.
 cclib=""
+old_ifs=$IFS
+set -f            # split $ccpath on ':' only — never glob these store paths
 IFS=:
 for _d in $ccpath; do
+  [ -n "$_d" ] || continue
   case $_d in */bin) _d="${_d%/bin}/lib" ;; esac
   cclib="${cclib:+$cclib:}$_d"
 done
-unset IFS
+IFS=$old_ifs
+set +f
 
 mkdir -p "$base/home" "$base/target"
+# Prepend the immutable toolchain lib dir(s), keeping any ambient LIBRARY_PATH as
+# a lower-priority fallback (loader search is first-match). Guard the empty case
+# so the value never has a leading ':', which LIBRARY_PATH reads as the CWD.
+libpath="${cclib:+$cclib${LIBRARY_PATH:+:}}${LIBRARY_PATH:-}"
 PATH="$rustpath:$ccpath:$PATH" \
-LIBRARY_PATH="${cclib}${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+LIBRARY_PATH="$libpath" \
 CARGO_HOME="$base/home" CARGO_TARGET_DIR="$base/target" \
   cargo build --release --frozen --manifest-path "$root/recipes/Cargo.toml" >"$base/build.log" 2>&1 \
   || { echo "recipe-eval-tool: cargo build failed:" >&2; tail -20 "$base/build.log" >&2; exit 1; }
