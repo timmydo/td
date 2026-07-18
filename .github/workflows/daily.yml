@@ -58,13 +58,35 @@ jobs:
     # from-seed proof, not a cache replay). Raise this if a fully-cold self-hosted
     # box needs the multi-hour first build.
     timeout-minutes: 120
+    # Force bash on every `run:` (the steps use bashisms — ${PIPESTATUS[0]},
+    # arrays). GitHub-hosted Linux defaults to bash, but a self-hosted runner
+    # might not, so pin it.
+    defaults:
+      run:
+        shell: bash
     steps:
       # SHA-pinned (= actions/checkout v4): matches this repo's pinned-inputs
       # posture (.github/workflows/ci.yml). Full history: the verdict's suspect
       # range and the healing agent's `git log <last-green>..main` triage need it.
+      # clean:false so checkout does NOT `git clean -ffdx` — that would wipe the
+      # ignored warm state (.td-build-cache/, .td-last-green) that makes a
+      # self-hosted daily fast and holds the last-green baseline. On an ephemeral
+      # hosted runner there is nothing to clean, so it is a no-op there.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
+          clean: false
+
+      # Pin the tree to FRESH origin/main. checkout lands on the event/ref SHA,
+      # but `td-builder daily` records the commit it fetches as origin/main — a
+      # queued or manually-dispatched run could otherwise TEST one commit while
+      # the verdict DECLARES another green. Reset (not clean) so the build tree is
+      # exactly origin/main while the warm ignored state above is preserved.
+      - name: pin the tree to fresh origin/main
+        run: |
+          git fetch origin main --quiet
+          git reset --hard origin/main
+          echo "testing origin/main at $(git rev-parse --short HEAD)"
 
       - name: build the engine (dependency-free, offline)
         # The builder crate carries zero crates (AGENTS.md), so --frozen
@@ -73,6 +95,12 @@ jobs:
 
       - name: run the daily backstop (capture the exit bitfield)
         id: daily
+        # TD_SUBST_PRIVKEY (a repo secret; empty when unset) lets an all-green
+        # daily publish substitutes, mirroring the host-cron runner. daily.rs
+        # SKIPs the publish when it is empty, so this is inert until the secret
+        # (and a td-subst) exist on a provisioned runner.
+        env:
+          TD_SUBST_PRIVKEY: ${{ secrets.TD_SUBST_PRIVKEY }}
         run: |
           set -uo pipefail
           jobs="$(nproc 2>/dev/null || echo 4)"
@@ -118,9 +146,20 @@ jobs:
 
           case "$rc" in
             0)
-              echo "ALL GREEN — main is clean at this run."
+              # Exit 0 is the bitfield 0 — but daily.rs also returns 0 for a
+              # PARTIAL run (a leg came back unprovisioned; nothing that ran is
+              # red, yet it is NOT a full-suite proof and .td-last-green is
+              # withheld). Distinguish the two from the verdict states so a
+              # partial is not mislabelled all-green.
+              if grep -qE '^(heavy|system)=unprovisioned' .td-daily-verdict 2>/dev/null; then
+                echo "PARTIAL — a tier was unprovisioned (not a full-suite proof); nothing that ran is red. Neutral, no signal."
+              else
+                echo "ALL GREEN — main is clean at this run."
+              fi
               ;;
-            1|2|3)
+            [1-7])
+              # Bitfield of REAL regressions (1 heavy, 2 system; harness bit 4 is
+              # retired but the range stays open for its return).
               echo "REAL REGRESSION (bitfield rc=$rc) — signalling via the daily-red issue."
               {
                 echo "The scheduled daily backstop is RED (\`td-builder daily\` exit $rc)."
@@ -136,8 +175,11 @@ jobs:
                 # instructions for the healing agent, not evaluated here.
                 echo 'Healing agent: triage `git log $(cat .td-last-green 2>/dev/null || echo origin/main~10)..origin/main`, reproduce the failing gate (the `*_fail` field names it) to confirm it is a real regression (not host contention), and open a FIX-OR-REVERT PR (no auto-merge — a human merges). Revert helper: `ci/revert-suspect.sh --ref <sha> --open-pr`. Close this issue when the fix/revert lands.'
               } > issue-body.md
-              # One rolling open issue: comment if present, else create.
-              existing="$(gh issue list --label daily-red --state open --json number --jq '.[0].number' 2>/dev/null || true)"
+              # One rolling open issue: comment if present, else create. `// empty`
+              # keeps `existing` genuinely empty on no-match (gh's embedded jq
+              # already prints nothing for a null scalar — verified — but this is
+              # explicit and robust to gh behaviour drift).
+              existing="$(gh issue list --label daily-red --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
               if [ -n "$existing" ]; then
                 gh issue comment "$existing" --body-file issue-body.md
               else
