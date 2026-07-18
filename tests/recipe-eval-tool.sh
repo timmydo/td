@@ -45,14 +45,29 @@ gstatic=`"$td" provision-glibc-static` || { echo "recipe-eval-tool: no matched s
 # Pin the compiler and linker to the provisioned toolchain (Codex P2): resolve the
 # gcc that owns the matched static glibc and pass it as `-C linker=` so an inherited
 # CARGO_TARGET_<triple>_LINKER cannot pair the static glibc's crt objects with a
-# mismatched driver (links clean, SIGSEGVs at startup). Unset RUSTC and any
-# rustc wrapper so the provisioned rustc (first on PATH) is what builds.
+# mismatched driver (links clean, SIGSEGVs at startup), and resolve the provisioned
+# rustc to an absolute path to PIN it.
 cc=`PATH="$ccpath" command -v cc 2>/dev/null || PATH="$ccpath" command -v gcc 2>/dev/null` \
   || { echo "recipe-eval-tool: no cc/gcc in provisioned C toolchain ($ccpath)" >&2; exit 1; }
+rustc=`PATH="$rustpath" command -v rustc 2>/dev/null` \
+  || { echo "recipe-eval-tool: no rustc in provisioned rust toolchain ($rustpath)" >&2; exit 1; }
+# `-C linker=$cc` rides in the space-split RUSTFLAGS below, so a whitespace cc path
+# (only reachable via a whitespace TD_CC_HOME) would split the argument. Fail closed
+# rather than mis-link, mirroring provision-glibc-static's guard on $gstatic (Codex
+# review, PR #534). The Rust recipe_rs gate uses the \x1f-encoded form and is immune.
+case "$cc" in
+  *[[:space:]]*) echo "recipe-eval-tool: cc path '$cc' contains whitespace — move the C toolchain to a whitespace-free path (TD_CC_HOME)" >&2; exit 1 ;;
+esac
 
 mkdir -p "$base/home" "$base/target"
-unset CARGO_ENCODED_RUSTFLAGS RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
+# Unset the tier-1 rustflags var so our RUSTFLAGS wins. PIN rustc (absolute) and
+# set the wrappers to "" rather than unsetting them: an unset RUSTC/RUSTC_WRAPPER
+# lets cargo read `build.rustc`/`build.rustc-wrapper` from a `.cargo/config.toml`
+# walked up from the manifest, whereas an explicit value overrides config (Agy
+# review, PR #534). "" means "no wrapper" to cargo.
+unset CARGO_ENCODED_RUSTFLAGS
 PATH="$rustpath:$ccpath:$PATH" \
+RUSTC="$rustc" RUSTC_WRAPPER="" RUSTC_WORKSPACE_WRAPPER="" \
 RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static -L $gstatic -C linker=$cc" \
 CARGO_HOME="$base/home" CARGO_TARGET_DIR="$base/target" \
   cargo build --release --frozen --manifest-path "$root/recipes/Cargo.toml" >"$base/build.log" 2>&1 \

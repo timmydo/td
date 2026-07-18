@@ -1233,9 +1233,12 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
         // Pin the compiler itself: an inherited RUSTC would build with a
         // different rustc than the one we read the triple from, and an inherited
         // RUSTC_WRAPPER (e.g. sccache) would interpose on the control-plane build.
+        // Set the wrappers to "" (not env_remove): an ABSENT var lets cargo fall
+        // back to a `.cargo/config.toml` `build.rustc-wrapper`, whereas an empty
+        // value means "no wrapper" regardless of config (Agy review, PR #534).
         .env("RUSTC", &rustc)
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
         .env("CC", &cc)
         .env("HOST_CC", &cc)
         .env("TARGET_CC", &cc)
