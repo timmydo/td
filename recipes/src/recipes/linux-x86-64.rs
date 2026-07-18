@@ -12,6 +12,13 @@ use crate::types::{Recipe, Step};
 // executable (the builder decompresses in-process), so bzImage + qemu boot are a
 // separate later rung (re #529, re #469).
 //
+// This builds 2018 source with a 2024 compiler: GCC 14's four new default-error
+// C warnings (implicit-function-declaration / implicit-int /
+// incompatible-pointer-types / int-conversion) are demoted back to warnings, and
+// GCC 10+'s -fno-common default is reverted with -fcommon, via the documented
+// `gcc14_relax` shim below (HOSTCC wrapper + kernel KCFLAGS). This relaxes only
+// the compiler's newly-strict defaults; it is not a blanket -w.
+//
 // ZERO new external dependency (AGENTS.md directive 3). A minimal `vmlinux` needs
 // exactly one host tool td did not already have — `bc`, which generates
 // include/generated/timeconst.h (kernel/time/Kbuild; no `_shipped` fallback) and
@@ -40,6 +47,20 @@ pub fn recipe() -> Recipe {
     let bb = "{in:busybox-x86-64}/bin/busybox";
     let path = format!("{nbin}:{{in:make-x86-64}}/bin:{}", mesboot0_path());
 
+    // GCC 14 promoted four long-standing C warnings to hard errors by default
+    // (-Werror=implicit-function-declaration / implicit-int /
+    // incompatible-pointer-types / int-conversion). Linux 4.14 (2017) predates
+    // those tightenings and its kernel + host C trips them under the 2024
+    // compiler, so demote exactly those four back to warnings. This relaxes only
+    // GCC's *default* -Werror=, it is not a blanket -w and hides no real breakage;
+    // the frame-pointer / no-modules config keeps the surface small enough that
+    // this is the whole GCC-14-on-4.14 shim. Applied to both HOSTCC (via the
+    // wrapper) and the kernel proper (via KCFLAGS on the vmlinux step).
+    let gcc14_relax = "-Wno-error=implicit-function-declaration \
+                       -Wno-error=implicit-int \
+                       -Wno-error=incompatible-pointer-types \
+                       -Wno-error=int-conversion";
+
     let mut steps = unpack_into("linux-source", "{src}");
 
     // Host sysroot for HOSTCC only (the Kbuild host programs are ordinary
@@ -60,17 +81,39 @@ pub fn recipe() -> Recipe {
         "/td/store/glibc-2.41-x86_64",
     ));
 
-    // The single new host tool: bc (busybox applet) for timeconst.h. `uname` is
-    // provided too so the top Makefile's parse-time `$(shell uname -m)` SUBARCH
-    // probe resolves (harmless when empty, since ARCH=x86_64 is explicit, but the
-    // real value is cleaner). BusyBox dispatches on argv[0], so a name→busybox
-    // symlink runs that applet.
+    // The single new host tool: bc (busybox applet) for timeconst.h, linked into
+    // the {tools} farm — which mesboot0_path() already lays on PATH, so Kbuild's
+    // parse-time `bc -q timeconst.bc` resolves it. BusyBox dispatches on argv[0],
+    // so a bc→busybox symlink runs the bc applet. No uname link: the top
+    // Makefile's `$(shell uname -m)` SUBARCH probe is cosmetic here (ARCH=x86_64
+    // is explicit), and coreutils-mesboot0 already provides uname on PATH anyway.
     steps.push(Step::ToolFarm {
-        links: vec![
-            ("bc".into(), bb.into()),
-            ("uname".into(), bb.into()),
-        ],
+        links: vec![("bc".into(), bb.into())],
     });
+
+    // Fail FAST if that bc cannot do what timeconst.h needs. Kbuild's
+    // filechk_gentimeconst pipes CONFIG_HZ into `bc -q timeconst.bc`, a script
+    // that uses read()/arithmetic/print/halt; a missing or POSIX-only bc silently
+    // yields an EMPTY timeconst.h and a confusing failure deep in the vmlinux
+    // build. Probe exactly those features here, resolving bc from {tools} on
+    // mesboot0_path() the same way the build will, so a bad bc reds up front.
+    steps.push(Step::WriteFile {
+        path: "{root}/bcprobe/probe.bc".into(),
+        content: "h = read()\nprint h * 3 + 1, \"\\n\"\nhalt\n".into(),
+        exec: false,
+    });
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                "out=$(printf '%s\\n' 7 | bc -q {root}/bcprobe/probe.bc) || { echo 'bc probe: bc failed to run (GNU-extension bc for timeconst.h unavailable)' >&2; exit 1; }; \
+                 [ \"$out\" = 22 ] || { echo \"bc probe: wrong result (got '$out', want 22) — bc is not the GNU-extension bc timeconst.h needs\" >&2; exit 1; }",
+            ],
+        )
+        .env("PATH", &mesboot0_path()),
+    );
 
     // Some glibc host helpers popen(3)/system(3) hardcode /bin/sh; the host-free
     // sandbox has none, so provide it from the declared bash input (busybox parity).
@@ -93,7 +136,7 @@ pub fn recipe() -> Recipe {
         path: "{root}/wb/hostcc".into(),
         content: format!(
             "#!{SH}\n\
-             exec \"{ngcc}\" -static -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib -L{{root}}/sysroot/lib \"$@\"\n"
+             exec \"{ngcc}\" -static {gcc14_relax} -idirafter {{root}}/sysroot/include -B{{root}}/sysroot/lib -L{{root}}/sysroot/lib \"$@\"\n"
         ),
         exec: true,
     });
@@ -225,6 +268,12 @@ pub fn recipe() -> Recipe {
                 &format!("STRIP={nbin}/strip"),
                 "SHELL={in:bash-mesboot}/bin/bash",
                 "CONFIG_SHELL={in:bash-mesboot}/bin/bash",
+                // GCC-14-on-4.14 shim for the kernel proper. KCFLAGS is *appended*
+                // to KBUILD_CFLAGS, so these win over any earlier -Werror=. -fcommon
+                // is added here (kernel only): GCC 10+ defaults to -fno-common, and
+                // 4.14 predates the tree-wide -fno-common cleanup, so tentative
+                // definitions in headers would otherwise collide at link.
+                &format!("KCFLAGS={gcc14_relax} -fcommon"),
                 "vmlinux",
             ],
         ))
