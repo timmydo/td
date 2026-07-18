@@ -1091,18 +1091,198 @@ fn newstore_bin(root: &Path, newstore_rel: &str, bin: &str) -> Option<PathBuf> {
 /// build fails, or it outlives the warm deadline (a hung cargo — e.g. a stale
 /// target-dir lock — must not stall the prelude; every warm is best-effort,
 /// the gates enforce presence).
+/// Resolve `bin` in a `:`-joined PATH fragment (the form `stage0::provision_*`
+/// return) to an absolute executable: the child runs under a provisioned
+/// toolchain PATH, so the binary must come from THERE, not an ambient lookup.
+fn find_in_frags(frags: &str, bin: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    frags.split(':').filter(|f| !f.is_empty()).find_map(|d| {
+        let p = Path::new(d).join(bin);
+        // Require the exec bit, matching stage0::find_in_path and
+        // gate_bodies::find_in_path_frags: a non-executable same-named file
+        // earlier on PATH must not shadow the real tool.
+        let ok = std::fs::metadata(&p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        ok.then_some(p)
+    })
+}
+
+/// Build a td network tool (`dir` = feed/fetch — the only tools this is called
+/// for) with the HOST cargo, STATICALLY linked (crt-static against a matched
+/// glibc), and return the binary. Best-effort: any missing piece (no toolchain,
+/// no static glibc, a non-static result) logs and returns `None` so the warm
+/// degrades to the td-built binary or is skipped — it never returns a
+/// DYNAMICALLY linked control-plane tool, which would drag a mutable
+/// host/guix-home runpath and flake with `libgcc_s.so.1` exit 127 (re #469).
+///
+/// Scope: td-feed/td-fetch run on the HOST (the warm's network prep), where NSS
+/// is present, so the static glibc's runtime `dlopen` of NSS modules during DNS
+/// resolves normally. `assert_static` proves an empty STARTUP closure (no
+/// PT_INTERP/DT_NEEDED/run-path — the flake fix), NOT that DNS needs zero runtime
+/// DSOs. td-subst is deliberately NOT built here: it is sourced ambiently
+/// (`TD_SUBST_BIN`/PATH, `daily::publish_substitutes`) and runs inside the
+/// NEWNET-isolated loop sandbox, so its name-resolution/NSS posture is a separate
+/// question (PR #534 discussion) — statically linking it is out of scope.
+///
+/// Unlike the pure-std tools, the network crates (ureq/rustls/ring) pull in
+/// PROC-MACROS that must compile for the host compiler, so `+crt-static` cannot
+/// go in a global RUSTFLAGS (it would try to statically link the proc-macro
+/// dylibs — "does not support these crate types"). Instead pass `--target
+/// <host-triple>` and set the PER-TARGET rustflags env: cargo then applies the
+/// static flags to the final binary + its normal deps only, leaving host-kind
+/// build scripts / proc-macros dynamic. Ambient RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS
+/// are removed so they cannot win over the per-target var (cargo's flag-source
+/// precedence) and silently defeat the static flags. The compiler is pinned too:
+/// RUSTC to the provisioned rustc (the one the triple was read from) and
+/// RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER removed, so no ambient rustc or wrapper
+/// interposes on the control-plane build. ring's `cc-rs` build script needs a `cc`
+/// (CC/HOST_CC/TARGET_CC and the per-target CC_<triple> forms → the gcc-toolchain's
+/// `gcc`, AR alongside — every form cc-rs consults is pinned so an ambient one
+/// cannot outrank them), and the rustc LINKER is pinned to that SAME gcc so the
+/// link uses the compiler matched with the static glibc — else a mismatched-glibc
+/// binary links + passes assert_static yet SIGSEGVs at startup (this path has no
+/// smoke-run to catch it).
 fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) -> Option<PathBuf> {
-    find_in_path("cargo")?;
-    let mut child = Command::new("cargo")
-        .args(["build", "--release", "--quiet"])
+    let penv = crate::stage0::ProvisionEnv::from_env(root);
+    let rustpath = match crate::stage0::provision_rust(&penv) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("td-builder check: static {bin}: no rust toolchain ({e}) — skipping host build");
+            return None;
+        }
+    };
+    let ccpath = match crate::stage0::provision_cc(&penv) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("td-builder check: static {bin}: no C toolchain ({e}) — skipping host build");
+            return None;
+        }
+    };
+    let glibc_static = match crate::stage0::provision_glibc_static(&penv) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "td-builder check: static {bin}: no matched static glibc ({e}) — skipping host build"
+            );
+            return None;
+        }
+    };
+    let Some(cargo) = find_in_frags(&rustpath, "cargo") else {
+        eprintln!("td-builder check: static {bin}: no cargo on the provisioned rust toolchain — skipping host build");
+        return None;
+    };
+    let Some(rustc) = find_in_frags(&rustpath, "rustc") else {
+        eprintln!("td-builder check: static {bin}: no rustc on the provisioned rust toolchain — skipping host build");
+        return None;
+    };
+    let Some(cc) = find_in_frags(&ccpath, "cc").or_else(|| find_in_frags(&ccpath, "gcc")) else {
+        eprintln!("td-builder check: static {bin}: no cc/gcc on the provisioned C toolchain — skipping host build");
+        return None;
+    };
+    let Some(ar) = find_in_frags(&ccpath, "ar") else {
+        eprintln!("td-builder check: static {bin}: no ar on the provisioned C toolchain — skipping host build");
+        return None;
+    };
+
+    // Host target triple from `rustc -vV`'s `host:` line, and the matching
+    // per-target env-var suffix (`<TRIPLE>` uppercased with '-' → '_').
+    let vv = match Command::new(&rustc).arg("-vV").stdin(Stdio::null()).output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("td-builder check: static {bin}: `rustc -vV` failed ({e}) — skipping host build");
+            return None;
+        }
+    };
+    let vv_text = String::from_utf8_lossy(&vv.stdout);
+    let Some(triple) = vv_text
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .map(str::trim)
+    else {
+        eprintln!("td-builder check: static {bin}: no `host:` line in `rustc -vV` — skipping host build");
+        return None;
+    };
+    let triple = triple.to_string();
+    // cargo normalizes BOTH `-` and `.` to `_` in the CARGO_TARGET_<triple>_* env
+    // var name (host triples are dot-free today, but match cargo's rule exactly).
+    let tvar = triple.to_uppercase().replace(['-', '.'], "_");
+    let target_flags_var = format!("CARGO_TARGET_{tvar}_RUSTFLAGS");
+    let target_linker_var = format!("CARGO_TARGET_{tvar}_LINKER");
+    // The rustc linker is pinned via target_linker_var below (not `-C linker` in
+    // the rustflags), so pass None here.
+    let rustflags = crate::stage0::static_rustflags(&glibc_static, None);
+    // cc-rs (ring's C build) resolves the compiler/archiver from the FIRST of
+    // several env forms, and the per-target-suffixed forms outrank the plain
+    // CC/HOST_CC/AR we set. Pin every form cc-rs consults to the matched
+    // toolchain so an ambient CC_<triple>/AR_<triple>/HOST_AR cannot slip a
+    // different compiler into a control-plane binary (review PR #534, Codex P2).
+    // cc-rs reads both the dash and underscore triple spellings.
+    let triple_us = triple.replace('-', "_");
+    let cc_target = format!("CC_{triple}");
+    let cc_target_us = format!("CC_{triple_us}");
+    let ar_target = format!("AR_{triple}");
+    let ar_target_us = format!("AR_{triple_us}");
+    let ambient_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{rustpath}:{ccpath}:{ambient_path}");
+
+    let child = Command::new(&cargo)
+        .args(["build", "--release", "--quiet", "--target", &triple])
         .current_dir(root.join(dir))
-        .spawn()
-        .ok()?;
+        .env("PATH", &new_path)
+        // Pin the compiler itself: an inherited RUSTC would build with a
+        // different rustc than the one we read the triple from, and an inherited
+        // RUSTC_WRAPPER (e.g. sccache) would interpose on the control-plane build.
+        // Set the wrappers to "" (not env_remove): an ABSENT var lets cargo fall
+        // back to a `.cargo/config.toml` `build.rustc-wrapper`, whereas an empty
+        // value means "no wrapper" regardless of config (Agy review, PR #534).
+        .env("RUSTC", &rustc)
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CC", &cc)
+        .env("HOST_CC", &cc)
+        .env("TARGET_CC", &cc)
+        .env(&cc_target, &cc)
+        .env(&cc_target_us, &cc)
+        .env("AR", &ar)
+        .env("HOST_AR", &ar)
+        .env("TARGET_AR", &ar)
+        .env(&ar_target, &ar)
+        .env(&ar_target_us, &ar)
+        .env(&target_linker_var, &cc)
+        .env(&target_flags_var, &rustflags)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .stdin(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("td-builder check: static {bin}: cannot spawn cargo ({e}) — skipping host build");
+            return None;
+        }
+    };
     if !wait_with_deadline(&mut child, deadline) {
         return None;
     }
-    let p = root.join(dir).join("target/release").join(bin);
-    p.is_file().then_some(p)
+    let p = root
+        .join(dir)
+        .join("target")
+        .join(&triple)
+        .join("release")
+        .join(bin);
+    if !p.is_file() {
+        return None;
+    }
+    // Fail closed on a non-static result rather than hand a dynamic control-plane
+    // binary to the warm (re #469).
+    if let Err(e) = crate::elf::assert_static(&p) {
+        eprintln!(
+            "td-builder check: static {bin}: host build produced a non-static binary ({e}) — skipping"
+        );
+        return None;
+    }
+    Some(p)
 }
 
 /// One `[[package]]` entry of a Cargo.lock that carries a checksum — `(name,

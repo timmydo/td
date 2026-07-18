@@ -7677,6 +7677,45 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-builder provision-glibc-static — resolve the MATCHED static glibc's
+        // `lib/` dir (holding `libc.a`) for a crt-static control-plane build. The
+        // shell recipe-eval-tool.sh consumes it as the RUSTFLAGS `-L` so the
+        // evaluator links statically (no host/guix-home runpath). Same
+        // operator-guidance contract as provision-{rust,cc}: exit 3 when nothing
+        // resolves (set TD_GLIBC_STATIC_HOME, a build-essential cc, or a lock pin).
+        Some("provision-glibc-static") if args.len() == 2 => {
+            let run = || -> Result<String, String> {
+                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+                stage0::provision_glibc_static(&stage0::ProvisionEnv::from_env(&root))
+            };
+            match run() {
+                Ok(frag) => {
+                    println!("{frag}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: provision-glibc-static: {e}");
+                    ExitCode::from(3)
+                }
+            }
+        }
+        // td-builder assert-static PATH — verify a host-built control-plane binary
+        // is FULLY static: no PT_INTERP, no DT_NEEDED, no run-path. The no-leakage
+        // invariant enforced at every host build site (re #469) so a dynamically
+        // linked control-plane tool can never drag its host glibc/libgcc closure —
+        // or a mutable guix-home runpath — into a build. Used by
+        // recipe-eval-tool.sh to fail closed if a toolchain silently linked the
+        // evaluator dynamically.
+        Some("assert-static") if args.len() == 3 => match elf::assert_static(Path::new(&args[2])) {
+            Ok(()) => {
+                println!("static ok: {}", args[2]);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("td-builder: assert-static: {e}");
+                ExitCode::FAILURE
+            }
+        },
         // td-builder seed-bless — record the DECLARED seed closure's hashes into a
         // td-owned store db (re #469): derive the roots ITSELF from the repo's
         // checked-in seed-lock declarations (`seed_lock_roots` over the cwd — the
@@ -8664,6 +8703,8 @@ fn main() -> ExitCode {
             eprintln!("       td-builder stage0-place BASEDIR        # compile+place the guix-free stage0 (memoized)");
             eprintln!("       td-builder provision-rust              # print the guix-free rust toolchain PATH fragment");
             eprintln!("       td-builder provision-cc                # print the guix-free C toolchain PATH fragment");
+            eprintln!("       td-builder provision-glibc-static      # print the matched static glibc lib dir (crt-static -L)");
+            eprintln!("       td-builder assert-static PATH          # fail unless PATH is a fully static binary");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             eprintln!("       td-builder rust-build        # as a derivation builder (cargo)");
             eprintln!("       td-builder cmake-build       # as a derivation builder (cmake)");
