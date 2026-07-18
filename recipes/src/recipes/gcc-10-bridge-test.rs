@@ -24,10 +24,15 @@ pub fn recipe() -> Recipe {
                 exec: false,
             },
             Step::WriteFile {
+                path: "{root}/test/headers.c".into(),
+                content: "#include <stdlib.h>\nint main(void) { void *p = malloc(1); free(p); return 0; }\n"
+                    .into(),
+                exec: false,
+            },
+            Step::WriteFile {
                 path: "{root}/test/probe.cc".into(),
-                content:
-                    "int main() { int *p = new int(7); int v = *p; delete p; return v != 7; }\n"
-                        .into(),
+                content: "#include <cstdlib>\nint main() { void *p = std::malloc(1); std::free(p); return 0; }\n"
+                    .into(),
                 exec: false,
             },
             Step::run(
@@ -63,7 +68,7 @@ pub fn recipe() -> Recipe {
                     "{root}/test/macros",
                 ],
             ),
-            compile_step(GCC, "{root}/test/probe.c", "{root}/test/probe-c"),
+            compile_step(GCC, "{root}/test/headers.c", "{root}/test/probe-c"),
             compile_step(GPP, "{root}/test/probe.cc", "{root}/test/probe-cxx"),
             Step::run("{root}/test", &["{root}/test/probe-c"]),
             Step::run("{root}/test", &["{root}/test/probe-cxx"]),
@@ -97,6 +102,8 @@ fn compile_step(compiler: &str, source: &str, output: &str) -> Step {
         &[
             compiler,
             "-static",
+            "-idirafter",
+            &format!("{LIBC}/include"),
             &format!("-B{BIN}/"),
             &format!("-B{LIBC}/lib/"),
             &format!("-L{LIBC}/lib"),

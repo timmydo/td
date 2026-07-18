@@ -179,6 +179,43 @@ pub fn libtool_extract_without_find(ltmain: &str) -> Step {
     )
 }
 
+/// Make GCC 14's libstdc++ stamp rules independent of the absent `date` tool.
+///
+/// The stamp contents are never read; make uses only each file's existence and
+/// mtime. A shell-builtin no-op plus redirection therefore preserves the rule's
+/// semantics without adding another bootstrap-userland executable. Patch both
+/// the ordinary convenience archive and the optional debug-tree stamp so every
+/// C++-enabled GCC 14 rung has the same host-free source shape.
+pub fn gcc14_libstdcxx_stamp_fixups() -> Step {
+    Step::substitute_text(
+        "{src}/libstdc++-v3/src/Makefile.in",
+        vec![
+            TextEdit::new(
+                "\tdate > stamp-libstdc++convenience;",
+                "\t: > stamp-libstdc++convenience;",
+                1,
+            ),
+            TextEdit::new("\tdate > stamp-debug;", "\t: > stamp-debug;", 1),
+        ],
+    )
+}
+
+/// Select GCC's cp-based include-tree installer when bootstrap `tar` is absent.
+///
+/// Modern GCC configure otherwise chooses `install-headers-tar` for the native
+/// i686/x86_64 hosts used by this ladder. The source ships an equivalent
+/// `install-headers-cp` target, backed by the already-declared mesboot coreutils.
+pub fn gcc_install_headers_without_tar() -> Step {
+    Step::substitute_text(
+        "{src}/gcc/Makefile.in",
+        vec![TextEdit::new(
+            "INSTALL_HEADERS_DIR = @build_install_headers_dir@",
+            "INSTALL_HEADERS_DIR = install-headers-cp",
+            1,
+        )],
+    )
+}
+
 /// The bash-mesboot `configure` fixups every modern GCC rung needs before its
 /// `configure` runs (re #469). bash 2.05b (mes libc) cannot expand the
 /// non-terminal `*/config-lang.in` globs configure uses to discover language

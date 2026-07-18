@@ -1,6 +1,7 @@
 use crate::ladder::{
-    gcc14_configure_fixups, gcc_disable_selftest, libtool_extract_without_find, link_bins,
-    mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+    gcc14_configure_fixups, gcc14_libstdcxx_stamp_fixups, gcc_disable_selftest,
+    gcc_install_headers_without_tar, libtool_extract_without_find, link_bins, mesboot0_inputs,
+    mesboot0_path, unpack_into, unpack_keep_top, SH,
 };
 use crate::types::{Recipe, Step};
 
@@ -17,7 +18,11 @@ pub fn recipe() -> Recipe {
         "{{in:gcc-10-bridge}}/bin:{{in:binutils-244}}/bin:{}",
         mesboot0_path()
     );
-    let cip = "{in:gcc-10-bridge}/lib/gcc/i686-unknown-linux-gnu/10.5.0/include:{root}/kh:{in:glibc-mesboot}/include:{src}/mpfr/src";
+    // Keep libc and kernel headers after GCC's C++ directories: putting them in
+    // CPLUS_INCLUDE_PATH makes them precede <cstdlib>, so its #include_next
+    // cannot find stdlib.h. The wrappers add those system directories with
+    // -idirafter; CIP is only for the in-tree MPFR build helpers.
+    let cip = "{src}/mpfr/src";
     let lp = "{in:glibc-mesboot}/lib:{in:gcc-10-bridge}/lib";
     let ldf = "-static -B{in:glibc-mesboot}/lib";
     let mut steps = unpack_into("gcc-14-source", "{src}");
@@ -47,13 +52,15 @@ pub fn recipe() -> Recipe {
     });
     steps.push(link_bins("binutils-244"));
     // Single-token static wrappers (see header): CC/CXX survive GCC's munging.
+    // -idirafter preserves libstdc++'s #include_next ordering while exposing
+    // only the declared glibc and kernel-header inputs to build-host programs.
     // The bridge ships a complete libstdc++, so no ABI-library tail or
     // optimization override is needed.
     for (name, real) in [("gcc", "gcc"), ("g++", "g++")] {
         steps.push(Step::WriteFile {
             path: format!("{{root}}/wb/{name}"),
             content: format!(
-                "#!{SH}\nexec \"{{in:gcc-10-bridge}}/bin/{real}\" -static -B{{in:glibc-mesboot}}/lib \"$@\"\n"
+                "#!{SH}\nexec \"{{in:gcc-10-bridge}}/bin/{real}\" -static -idirafter {{in:glibc-mesboot}}/include -idirafter {{root}}/kh -B{{in:glibc-mesboot}}/lib \"$@\"\n"
             ),
             exec: true,
         });
@@ -71,12 +78,14 @@ pub fn recipe() -> Recipe {
     // signal-name self-test and rely on the bridge regression plus the existing
     // x86_64 native/self behavioral checks.
     steps.push(gcc_disable_selftest());
+    steps.push(gcc_install_headers_without_tar());
     // Assemble this gcc's libstdc++.a WITHOUT `find` (re #469): the same libtool
     // convenience-archive `find` that broke gcc-mesboot's libstdc++.a would break
     // gcc-14's too, leaving it partial. gcc-14's i686 libstdc++ is what the C++
     // build-side generator programs of gcc-x86-64-stage1/stage2/native link
     // against (CXX_FOR_BUILD = this gcc-14 g++), so it must be complete.
     steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
+    steps.push(gcc14_libstdcxx_stamp_fixups());
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });

@@ -1,8 +1,9 @@
 use crate::ladder::{
-    gcc_configure_fixups, gcc_disable_selftest, libtool_extract_without_find, link_bins,
-    mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+    gcc_configure_fixups, gcc_disable_selftest, gcc_install_headers_without_tar,
+    libtool_extract_without_find, link_bins, mesboot0_inputs, mesboot0_path, unpack_into,
+    unpack_keep_top, SH,
 };
-use crate::types::{Recipe, Step, TextEdit};
+use crate::types::{Recipe, Step};
 
 // GCC 10.5.0 — the transient i686 bridge between gcc-mesboot 4.9.4 and
 // GCC 14.3.0. live-bootstrap uses the same release to cross from its old GCC
@@ -88,14 +89,7 @@ pub fn recipe() -> Recipe {
     steps.push(gcc_disable_selftest());
     // The mesboot userland has no tar. Select GCC's cp-based header installer,
     // as the earlier gcc-mesboot rungs do.
-    steps.push(Step::substitute_text(
-        "{src}/gcc/Makefile.in",
-        vec![TextEdit::new(
-            "INSTALL_HEADERS_DIR = @build_install_headers_dir@",
-            "INSTALL_HEADERS_DIR = install-headers-cp",
-            1,
-        )],
-    ));
+    steps.push(gcc_install_headers_without_tar());
     // libtool otherwise invokes the absent `find` and silently emits a partial
     // libstdc++.a. GCC 14's build-side C++ generators consume this archive.
     steps.push(libtool_extract_without_find("{src}/ltmain.sh"));

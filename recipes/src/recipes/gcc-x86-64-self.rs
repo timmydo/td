@@ -1,6 +1,7 @@
 use crate::ladder::{
-    gcc14_configure_fixups, gcc_disable_selftest, libtool_extract_without_find, mesboot0_inputs,
-    mesboot0_path, unpack_into, unpack_keep_top, SH,
+    gcc14_configure_fixups, gcc14_libstdcxx_stamp_fixups, gcc_disable_selftest,
+    gcc_install_headers_without_tar, libtool_extract_without_find, mesboot0_inputs, mesboot0_path,
+    unpack_into, unpack_keep_top, SH,
 };
 use crate::types::{Recipe, Step};
 
@@ -88,7 +89,9 @@ pub fn recipe() -> Recipe {
     });
     steps.extend(gcc14_configure_fixups());
     steps.push(gcc_disable_selftest());
+    steps.push(gcc_install_headers_without_tar());
     steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
+    steps.push(gcc14_libstdcxx_stamp_fixups());
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });
