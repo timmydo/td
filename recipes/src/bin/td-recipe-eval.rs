@@ -300,6 +300,28 @@ mod tests {
             1
         );
         assert_eq!(recipe_checks(&linux, None).len(), 1);
+
+        let flex = catalog::lookup("flex-x86-64-test").unwrap();
+        assert_eq!(
+            recipe_checks(&flex, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&flex, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&flex, None).len(), 1);
+
+        let elfutils = catalog::lookup("elfutils-x86-64-test").unwrap();
+        assert_eq!(
+            recipe_checks(&elfutils, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&elfutils, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&elfutils, None).len(), 1);
     }
 
     #[test]
@@ -319,6 +341,8 @@ mod tests {
             ("gcc-x86-64-native-test", 1),
             ("gcc-x86-64-self-test", 1),
             ("linux-x86-64-test", 1),
+            ("flex-x86-64-test", 1),
+            ("elfutils-x86-64-test", 1),
         ] {
             let recipe = catalog::lookup(stem).unwrap();
             let checks = recipe_checks(&recipe, Some(td_recipe::types::CheckTier::Daily));
@@ -349,8 +373,10 @@ mod tests {
         // provider's macro processor, re #469) + bison-3.8.2 (the glibc-rung
         // parser generator, re #469) + Python-3.11.1 (the glibc-rung python3,
         // re #469) + GCC 10.5.0 (the compatibility bridge between
-        // gcc-mesboot 4.9.4 and GCC 14.3.0).
-        assert_eq!(pins.len(), 44);
+        // gcc-mesboot 4.9.4 and GCC 14.3.0) + linux-6.18.39 (the current LTS
+        // kernel the linux-x86-64 rung builds) + flex-2.6.4 + elfutils-0.192
+        // (the modern-kernel host tools flex + libelf, re #529).
+        assert_eq!(pins.len(), 47);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-toolchain-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));

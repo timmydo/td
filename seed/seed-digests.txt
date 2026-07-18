@@ -13,6 +13,8 @@ bison-mesboot-source 091gccsyc4qcsnk4r6p99mqkk259f3ar-bison-mesboot-source
 busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
+elfutils-x86-64-source n4g2hjlg72jm5wn0lx9fxplvh2y82d0b-elfutils-x86-64-source
+flex-x86-64-source v1hf8a11jna03slg5iqr5zj5kfxshvwz-flex-x86-64-source
 gawk-mesboot-source 128bh62a669ds6v5q6v2sih5a1qk51wj-gawk-mesboot-source
 gawk-mesboot0-source zdx7nfqxa7pddqpip7bpa13d79d5p7q2-gawk-mesboot0-source
 gcc-10-bridge-source zy6cavi7zz0ay4z9x3r8128vrld0pvnb-gcc-10-bridge-source
@@ -29,7 +31,7 @@ gmp63 a1sfm9d525pjz2if348xssl3wprnr21f-gmp63
 grep-mesboot0-source 664n3hm5dz2hyn5py2frds5cc3r4nid4-grep-mesboot0-source
 linux-headers fy4caw4q7lsgdisqwz8dhfdgiwky9pxw-linux-headers
 linux-headers-x86-64 8makj3qb694bws0bdvqhm74az3i3ip58-linux-headers-x86-64
-linux-source m5p8ynv9vwp16vsv2gahv32zhcdcw6cz-linux-source
+linux-kernel-source 41iakhmbdaxq45p7ifh633l05x0yap80-linux-kernel-source
 m4-mesboot-source 6n6m3fhhqcdnmkf92nw1a1q8pakzflx5-m4-mesboot-source
 make-mesboot-source rsml6snylx4zpf1isi6h9mi1v3g6qya7-make-mesboot-source
 make-mesboot0-source prv2pgbxapfby18j22f39al25q2ava5i-make-mesboot0-source
