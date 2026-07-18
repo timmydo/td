@@ -166,6 +166,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("SHELL", SH)
         .env("CONFIG_SHELL", SH)
+        .env("SOURCE_DATE_EPOCH", "1")
         .env("C_INCLUDE_PATH", &cip)
         .env("LIBRARY_PATH", &lib),
     );
@@ -192,6 +193,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("SHELL", SH)
         .env("CONFIG_SHELL", SH)
+        .env("SOURCE_DATE_EPOCH", "1")
         .env("C_INCLUDE_PATH", &cip)
         .env("LIBRARY_PATH", &lib),
     );
@@ -215,6 +217,7 @@ pub fn recipe() -> Recipe {
         .env("MFLAGS", "")
         .env("GNUMAKEFLAGS", "")
         .env("MAKELEVEL", "")
+        .env("SOURCE_DATE_EPOCH", "1")
         .env("C_INCLUDE_PATH", &cip)
         .env("LIBRARY_PATH", &lib),
     );
@@ -248,7 +251,9 @@ pub fn recipe() -> Recipe {
                 "-c",
                 "h=$('{in:binutils-x86-64-native}/bin/readelf' -h '{out}/bin/busybox'); \
                  printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || { echo 'busybox is not ELF64' >&2; exit 1; }; \
-                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'busybox is not x86-64' >&2; exit 1; }",
+                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'busybox is not x86-64' >&2; exit 1; }; \
+                 b=$('{out}/bin/busybox' 2>&1); \
+                 printf '%s\\n' \"$b\" | grep -q '^BusyBox v1[.]37[.]0 (1970-01-01 00:00:01 UTC) multi-call binary[.]$' || { echo 'busybox banner is not reproducible' >&2; exit 1; }",
             ],
         )
         .env("PATH", &mesboot0_path()),
