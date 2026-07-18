@@ -1,5 +1,8 @@
-use crate::ladder::{SH, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top};
-use crate::types::{Recipe, Step, TextEdit};
+use crate::ladder::{
+    gcc_configure_fixups, gcc_install_headers_without_tar, libtool_extract_without_find, link_bins,
+    mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+};
+use crate::types::{Recipe, Step};
 
 // GCC 4.9.4 — rung 16 (#378, guix's gcc-mesboot): gcc-mesboot1 (4.6.4 c,c++) +
 // binutils-mesboot + the static glibc 2.16.0 build the final mesboot gcc.
@@ -59,19 +62,17 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
-    // Close the `tar` host-tool ingress in `make install`: config.build has no
-    // i686-*-linux-gnu arm, so INSTALL_HEADERS_DIR defaults to
-    // install-headers-tar (a `tar` pipeline); mesboot0 ships no tar. Repoint it
-    // at install-headers-cp (cp -p -r, coreutils-mesboot0) before configure —
-    // same fix as gcc-mesboot1.
-    steps.push(Step::substitute_text(
-        "{src}/gcc/Makefile.in",
-        vec![TextEdit::new(
-            "INSTALL_HEADERS_DIR = @build_install_headers_dir@",
-            "INSTALL_HEADERS_DIR = install-headers-cp",
-            1,
-        )],
-    ));
+    steps.extend(gcc_configure_fixups(&[
+        "ada", "c", "cp", "fortran", "go", "java", "lto", "objc", "objcp",
+    ]));
+    steps.push(gcc_install_headers_without_tar());
+    // Assemble libstdc++.a WITHOUT `find` (re #469, #477's retired-axis guard):
+    // libtool's convenience-archive merge enumerates the extracted objects with
+    // `find`, which the mesboot userland lacks, so it silently produces a partial
+    // libstdc++.a (only the eight compatibility*.o; no std::string/vector) that
+    // GCC 14's C++ generator programs fail to link against. See the helper for
+    // why a bash-mesboot terminal glob is an exact, host-free replacement.
+    steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });

@@ -1,4 +1,8 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{
+    gcc14_configure_fixups, gcc14_libstdcxx_stamp_fixups, gcc_disable_selftest,
+    gcc_install_headers_without_tar, libtool_extract_without_find, mesboot0_inputs, mesboot0_path,
+    unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0, NATIVE x86_64 (x86_64-toolchain rung X2, the port of the shell
@@ -105,7 +109,8 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            ("awk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
+            ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
@@ -113,6 +118,13 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    // Same bash-mesboot configure fixups as gcc-14, plus the libtool find fix so
+    // this stage's native x86_64 libstdc++.a is assembled complete (re #469).
+    steps.extend(gcc14_configure_fixups());
+    steps.push(gcc_disable_selftest());
+    steps.push(gcc_install_headers_without_tar());
+    steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
+    steps.push(gcc14_libstdcxx_stamp_fixups());
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });
@@ -213,6 +225,7 @@ pub fn recipe() -> Recipe {
             "binutils-x86-64-native",
             "binutils-x86-64",
             "glibc-x86-64",
+            "gawk-mesboot",
             "make-mesboot",
         ])
         .inputs_owned(mesboot0_inputs(&[

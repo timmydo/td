@@ -1,4 +1,7 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{
+    gcc14_configure_fixups, gcc_disable_selftest, gcc_install_headers_without_tar, mesboot0_inputs,
+    mesboot0_path, unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step};
 
 // GCC 14.3.0 cross STAGE1 (#378 slice 4, guix's cross gcc stage1): C only,
@@ -40,7 +43,8 @@ pub fn recipe() -> Recipe {
     ));
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            ("awk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
+            ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
@@ -58,6 +62,12 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    // Same bash-mesboot configure fixups as gcc-14 (this is the same GCC 14.3.0
+    // source configured under bash-mesboot). No libtool find fix: stage1 is
+    // --disable-libstdcxx (--enable-languages=c), so it builds no libstdc++.
+    steps.extend(gcc14_configure_fixups());
+    steps.push(gcc_disable_selftest());
+    steps.push(gcc_install_headers_without_tar());
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });
@@ -146,6 +156,7 @@ pub fn recipe() -> Recipe {
             "glibc-mesboot",
             "binutils-x86-64",
             "binutils-244",
+            "gawk-mesboot",
             "make-mesboot",
         ])
         .inputs_owned(mesboot0_inputs(&[

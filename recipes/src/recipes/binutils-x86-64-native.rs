@@ -1,4 +1,6 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_keep_top, unpack_into, SH};
+use crate::ladder::{
+    libtool_extract_without_find, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.44, NATIVE x86_64 (x86_64-toolchain rung X2, the port of the
@@ -14,7 +16,8 @@ use crate::types::{Recipe, Step};
 // (the x86_64 libc the static link pulls).
 // Host-free build tools: mesboot0 + make-mesboot; flex/bison dead (binutils-244-source). re #469.
 pub fn recipe() -> Recipe {
-    let xgcc = "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-gcc";
+    let xgcc =
+        "{in:gcc-x86-64-stage2}/stage/td/store/gcc-14.3.0-x86_64/bin/x86_64-pc-linux-gnu-gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let path = format!("{{in:binutils-x86-64}}/bin:{}", mesboot0_path());
     // glibc 2.41 headers + the x86_64 kernel UAPI headers (glibc headers #include
@@ -42,6 +45,10 @@ pub fn recipe() -> Recipe {
         ),
         exec: true,
     });
+    // Keep the same complete static libbfd shape as the cross binutils rung:
+    // its bundled libtool must enumerate extracted libsframe objects without
+    // relying on the retired find executable.
+    steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
     steps.push(
         Step::run(
             "{src}",
@@ -59,6 +66,10 @@ pub fn recipe() -> Recipe {
                 "--disable-plugins",
                 "--disable-gprofng",
                 "--disable-multilib",
+                // Keep libtool's model aligned with the static bootstrap
+                // executables so libbfd carries libsframe into gas/ld links.
+                "--disable-shared",
+                "--enable-static",
             ],
         )
         .env("PATH", &path)
@@ -129,7 +140,12 @@ pub fn recipe() -> Recipe {
     );
     Recipe::mesboot("binutils-x86-64-native", "2.44")
         .source_input("binutils-244-source")
-        .native_inputs(&["gcc-x86-64-stage2", "binutils-x86-64", "glibc-x86-64", "make-mesboot"])
+        .native_inputs(&[
+            "gcc-x86-64-stage2",
+            "binutils-x86-64",
+            "glibc-x86-64",
+            "make-mesboot",
+        ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
 }

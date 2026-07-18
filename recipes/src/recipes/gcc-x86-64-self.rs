@@ -1,4 +1,8 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{
+    gcc14_configure_fixups, gcc14_libstdcxx_stamp_fixups, gcc_disable_selftest,
+    gcc_install_headers_without_tar, libtool_extract_without_find, mesboot0_inputs, mesboot0_path,
+    unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{Recipe, Step};
 
 // Host-free build tools: mesboot0 + make-mesboot; flex/bison/m4 dead (gcc-14-source). re #469.
@@ -74,7 +78,8 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::ToolFarm {
         links: vec![
-            ("awk".into(), "{in:gawk-mesboot0}/bin/awk".into()),
+            ("awk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
+            ("gawk".into(), "{in:gawk-mesboot}/bin/gawk".into()),
             ("make".into(), "{in:make-mesboot}/bin/make".into()),
         ],
     });
@@ -82,6 +87,11 @@ pub fn recipe() -> Recipe {
         dir: "{src}".into(),
         shell: SH.into(),
     });
+    steps.extend(gcc14_configure_fixups());
+    steps.push(gcc_disable_selftest());
+    steps.push(gcc_install_headers_without_tar());
+    steps.push(libtool_extract_without_find("{src}/ltmain.sh"));
+    steps.push(gcc14_libstdcxx_stamp_fixups());
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
     });
@@ -183,6 +193,7 @@ pub fn recipe() -> Recipe {
             "binutils-x86-64-self",
             "binutils-x86-64-native",
             "glibc-x86-64",
+            "gawk-mesboot",
             "make-mesboot",
         ])
         .inputs_owned(mesboot0_inputs(&[

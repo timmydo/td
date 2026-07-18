@@ -12,7 +12,7 @@
 //! - Unpacking is ENGINE-NATIVE (`Step::Unpack` — td's own std-only
 //!   tar/gzip/bzip2/xz readers), so no rung declares an unpacker package.
 
-use crate::types::Step;
+use crate::types::{Step, TextEdit};
 
 /// The td-built bootstrap shell (catalog stem). `bash-mesboot` is bash 2.05b
 /// built from source with no host tools (baked Makefiles + engine-native
@@ -141,6 +141,213 @@ pub fn relocate_ld_scripts(stage: &str, store_prefix: &str) -> Step {
     }
 }
 
+/// Make libtool assemble a static library (e.g. libstdc++.a) from its
+/// convenience archives WITHOUT `find` (re #469, #477's retired-axis guard).
+///
+/// `ltmain.sh`'s `func_extract_archives` merges each per-language convenience
+/// archive (libc++11convenience.a &c.) into the final `.a` by `cd`-ing into a
+/// scratch dir, `ar x`-ing the members flat into it, then enumerating them with
+/// `find $my_xdir -name \*.o -print`. The mesboot userland ships no `find`
+/// (retired in #477), so that enumeration returns nothing, `ar rc` appends
+/// nothing, and the archive silently ends up with only its directly-compiled
+/// objects — a partial libstdc++.a missing std::string/std::vector/iostream.
+/// GCC's own C++ generators (gensupport, genattrtab under GCC 14) then fail to
+/// link against it.
+///
+/// `ar x` extracts object members flat, one level deep (libtool's own `ar t`
+/// pass aborts on duplicate member names within an archive), so a *terminal*
+/// glob over `$my_xdir` captures exactly what the recursive `find` would — and
+/// unlike a non-terminal glob it expands correctly under bash-mesboot (bash
+/// 2.05b on mes libc). `test -f` drops the no-match literal; `printf '%s\n'`
+/// prints one path per line, exactly like `find … -print`.
+///
+/// We replace only the `find` COMMAND, leaving libtool's surrounding backticks
+/// and its `| [sort |] $NL2SP` post-pipe intact: that command is byte-identical
+/// across the two libtool versions td builds (GCC 4.9.4 pipes `find … | $NL2SP`;
+/// GCC 14.3.0 pipes `find … | sort | $NL2SP` for a deterministic archive), so
+/// one edit serves both and 14.3.0 keeps its sort. The `count: 1` fail-closes if
+/// a future source bump drifts the line. This ELIMINATES the find need rather
+/// than satisfying it with a host/find provider.
+pub fn libtool_extract_without_find(ltmain: &str) -> Step {
+    Step::substitute_text(
+        ltmain,
+        vec![TextEdit::new(
+            "find $my_xdir -name \\*.$objext -print -o -name \\*.lo -print",
+            "for f in $my_xdir/*.$objext $my_xdir/*.lo; do test -f \"$f\" && printf '%s\\n' \"$f\"; done",
+            1,
+        )],
+    )
+}
+
+/// Make GCC 14's libstdc++ stamp rules independent of the absent `date` tool.
+///
+/// The stamp contents are never read; make uses only each file's existence and
+/// mtime. A shell-builtin no-op plus redirection therefore preserves the rule's
+/// semantics without adding another bootstrap-userland executable. Patch both
+/// the ordinary convenience archive and the optional debug-tree stamp so every
+/// C++-enabled GCC 14 rung has the same host-free source shape.
+pub fn gcc14_libstdcxx_stamp_fixups() -> Step {
+    Step::substitute_text(
+        "{src}/libstdc++-v3/src/Makefile.in",
+        vec![
+            TextEdit::new(
+                "\tdate > stamp-libstdc++convenience;",
+                "\t: > stamp-libstdc++convenience;",
+                1,
+            ),
+            TextEdit::new("\tdate > stamp-debug;", "\t: > stamp-debug;", 1),
+        ],
+    )
+}
+
+/// Select GCC's cp-based include-tree installer when bootstrap `tar` is absent.
+///
+/// Modern GCC configure otherwise chooses `install-headers-tar` for the native
+/// i686/x86_64 hosts used by this ladder. The source ships an equivalent
+/// `install-headers-cp` target, backed by the already-declared mesboot coreutils.
+pub fn gcc_install_headers_without_tar() -> Step {
+    Step::substitute_text(
+        "{src}/gcc/Makefile.in",
+        vec![TextEdit::new(
+            "INSTALL_HEADERS_DIR = @build_install_headers_dir@",
+            "INSTALL_HEADERS_DIR = install-headers-cp",
+            1,
+        )],
+    )
+}
+
+/// The bash-mesboot `configure` fixups every modern GCC rung needs before its
+/// `configure` runs (re #469). bash 2.05b (mes libc) cannot expand the
+/// non-terminal `*/config-lang.in` globs configure uses to discover language
+/// front-ends, and its automake dependency-style probe runs each depmode as
+/// `env $depcmd` but the mesboot userland ships no `env` (so every depmode exits
+/// 127 and the probe aborts with "no usable dependency style found"). `LANGS`
+/// is the exact, sorted set of language fragments shipped by the selected GCC
+/// tarball. Pre-expand both globs to that set (a working shell's expansion
+/// verbatim) and rewrite the probe to the POSIX builtin `eval "$depcmd"`.
+/// `--enable-languages` still selects only what each rung asks for. The edit
+/// counts fail-closed if a future source bump drifts.
+pub fn gcc_configure_fixups(langs: &[&str]) -> Vec<Step> {
+    let top = langs
+        .iter()
+        .map(|l| format!("${{srcdir}}/gcc/{l}/config-lang.in"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let gcc = langs
+        .iter()
+        .map(|l| format!("${{srcdir}}/{l}/config-lang.in"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec![
+        Step::substitute_text(
+            "{src}/configure",
+            vec![TextEdit::new("${srcdir}/gcc/*/config-lang.in", &top, 2)],
+        ),
+        Step::substitute_text(
+            "{src}/gcc/configure",
+            vec![TextEdit::new("${srcdir}/*/config-lang.in", &gcc, 2)],
+        ),
+        Step::substitute_text(
+            "{src}/gcc/configure",
+            vec![TextEdit::new("env $depcmd", "eval \"$depcmd\"", 1)],
+        ),
+        Step::substitute_text(
+            "{src}/libcpp/configure",
+            vec![TextEdit::new("env $depcmd", "eval \"$depcmd\"", 1)],
+        ),
+    ]
+}
+
+/// GCC 14.3.0 ships twelve language fragments. Every GCC 14 rung uses the same
+/// release tarball, so this wrapper keeps their call sites declarative while the
+/// shared implementation also serves the GCC 10.5.0 bridge.
+pub fn gcc14_configure_fixups() -> Vec<Step> {
+    gcc_configure_fixups(&[
+        "ada", "c", "cp", "d", "fortran", "go", "jit", "lto", "m2", "objc", "objcp", "rust",
+    ])
+}
+
+/// Disable GCC's build-host signal-name self-test. The bootstrap libc's
+/// `sys_siglist` is deliberately a stub, so executing this development-only
+/// diagnostic crashes even when the compiler itself is sound. Installed
+/// compiler behavior is covered by rung-specific checks and downstream builds.
+pub fn gcc_disable_selftest() -> Step {
+    Step::substitute_text(
+        "{src}/gcc/Makefile.in",
+        vec![TextEdit::new(
+            "all.internal: start.encap rest.encap doc selftest",
+            "all.internal: start.encap rest.encap doc",
+            1,
+        )],
+    )
+}
+
+/// Make glibc 2.41's architecture selection and syscall generation work with
+/// the mesboot shell/userland. Its configure asks bash-mesboot to expand the
+/// non-terminal `sysdeps/*/preconfigure` glob; that shell leaves it literal, so
+/// x86_64 never becomes x86_64/64 and the matching arch-syscall.h is omitted.
+/// Pre-expand the exact sorted fragment set shipped by the pinned release.
+///
+/// make-syscalls.sh also uses GNU grep's newer `-o` option to enumerate the
+/// byte offsets of `U` argument markers, while the declared grep-mesboot0 2.4
+/// predates that option. The awk loop emits the identical zero-based `N:U`
+/// records from the same colon-prefixed signature using the already-declared
+/// gawk provider. Finally, elf/Makefile repeats the non-terminal
+/// `build/*/stamp.os` glob while generating librtld.mk; GNU make's wildcard
+/// function supplies the same existing-file set without relying on the shell.
+pub fn glibc241_host_free_fixups() -> Vec<Step> {
+    let preconfigure = [
+        "aarch64",
+        "alpha",
+        "arc",
+        "arm",
+        "csky",
+        "hppa",
+        "i386",
+        "loongarch",
+        "m68k",
+        "microblaze",
+        "mips",
+        "or1k",
+        "powerpc",
+        "riscv",
+        "s390",
+        "sh",
+        "sparc",
+        "x86_64",
+    ]
+    .iter()
+    .map(|arch| format!("${{srcdir}}/sysdeps/{arch}/preconfigure"))
+    .collect::<Vec<_>>()
+    .join(" ");
+    vec![
+        Step::substitute_text(
+            "{src}/configure",
+            vec![TextEdit::new(
+                "$srcdir/sysdeps/*/preconfigure",
+                &preconfigure,
+                1,
+            )],
+        ),
+        Step::substitute_text(
+            "{src}/sysdeps/unix/make-syscalls.sh",
+            vec![TextEdit::new(
+                "grep -ob U",
+                r#"awk '{ for (i = 1; i <= length($0); ++i) if (substr($0, i, 1) == "U") print i - 1 ":U" }'"#,
+                1,
+            )],
+        ),
+        Step::substitute_text(
+            "{src}/elf/Makefile",
+            vec![TextEdit::new(
+                "$(common-objpfx)*/stamp.os",
+                "$(wildcard $(common-objpfx)*/stamp.os)",
+                1,
+            )],
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use crate::catalog;
@@ -157,11 +364,17 @@ mod tests {
     /// Every catalog-authored text of a step that becomes a command or an
     /// interpreted script/Makefile: Run argv, ANY WriteFile body (baked
     /// Makefiles/kaem scripts are written `exec: false` and then run over by a
-    /// Run step), ToolFarm links, and the literal SubstituteText edits (the
-    /// host-free `patch`/`sed` stand-in). Engine-native steps that carry only
-    /// paths (Unpack/CopyTree/Symlink/PatchShebangs/…) cannot invoke a tool, so
-    /// they contribute nothing. Shared by the catalog-walk guard and its
+    /// Run step), ToolFarm links, and the `to` side of the literal SubstituteText
+    /// edits (the host-free `patch`/`sed` stand-in). Engine-native steps that
+    /// carry only paths (Unpack/CopyTree/Symlink/PatchShebangs/…) cannot invoke a
+    /// tool, so they contribute nothing. Shared by the catalog-walk guard and its
     /// coverage test so both exercise exactly the same extraction.
+    ///
+    /// Only a SubstituteText's `to` is a command surface: `from` is the text being
+    /// REMOVED from a source file, so a `find`/`xargs` there is being deleted, not
+    /// invoked (e.g. the gcc-mesboot ltmain.sh edit that replaces libtool's
+    /// convenience-archive `find` with a bash-mesboot glob loop). Scanning `from`
+    /// would misfire on exactly the patches that eliminate a host-tool call.
     fn command_texts(step: &Step) -> Vec<&str> {
         match step {
             Step::Run { argv, .. } => argv.iter().map(String::as_str).collect(),
@@ -170,10 +383,7 @@ mod tests {
                 .iter()
                 .flat_map(|(a, b)| [a.as_str(), b.as_str()])
                 .collect(),
-            Step::SubstituteText { edits, .. } => edits
-                .iter()
-                .flat_map(|e| [e.from.as_str(), e.to.as_str()])
-                .collect(),
+            Step::SubstituteText { edits, .. } => edits.iter().map(|e| e.to.as_str()).collect(),
             _ => Vec::new(),
         }
     }
@@ -219,9 +429,9 @@ mod tests {
 
     /// Proof that `command_texts` — the extraction the guard above runs — covers
     /// the interpreted-text surfaces that are NOT a `Run` argv: a baked
-    /// Makefile/kaem script (`WriteFile`, `exec: false`) and a literal patch/sed
-    /// edit (`SubstituteText`). Without this, a `find`/`xargs` reintroduced in one
-    /// of those would slip past the guard.
+    /// Makefile/kaem script (`WriteFile`, `exec: false`) and the `to` side of a
+    /// literal patch/sed edit (`SubstituteText`). Without this, a `find`/`xargs`
+    /// reintroduced in one of those would slip past the guard.
     #[test]
     fn guard_scans_nonexec_writefile_and_substitutetext() {
         use crate::types::TextEdit;
@@ -241,5 +451,22 @@ mod tests {
                 "command_texts must scan this surface for `{cmd}'"
             );
         }
+    }
+
+    /// A SubstituteText's `from` is REMOVED text, not a command: a patch that
+    /// deletes a `find`/`xargs` call (like the real `libtool_extract_without_find`
+    /// ltmain.sh glob-loop swap) must not be flagged as reintroducing the tool.
+    /// The guard scans only `to`, so a `find` in `from` with a tool-free `to` is
+    /// allowed. Exercised against the actual helper so the two cannot drift.
+    #[test]
+    fn guard_ignores_find_on_the_removed_from_side() {
+        let removes_find = super::libtool_extract_without_find("{src}/ltmain.sh");
+        // The helper's `from` names `find`; its `to` (the glob loop) does not.
+        assert!(
+            !command_texts(&removes_find)
+                .iter()
+                .any(|t| invokes(t, "find")),
+            "a find on the removed `from' side must not be flagged as an invocation"
+        );
     }
 }

@@ -1,5 +1,7 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH};
-use crate::types::{Recipe, Step};
+use crate::ladder::{
+    mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH,
+};
+use crate::types::{Recipe, Step, TextEdit};
 
 // BusyBox 1.37.0, rung 2 of the #388 build userland: built FROM SOURCE by the
 // /td/store NATIVE x86_64 toolchain and driven by the td-built make-x86-64 rung.
@@ -21,6 +23,90 @@ pub fn recipe() -> Recipe {
     let lib = "{root}/sysroot/lib";
 
     let mut steps = unpack_into("busybox-x86-64-source", "{src}");
+    // BusyBox's top-level Makefile probes the build machine with uname even
+    // when ARCH is supplied, while gen_build_files.sh walks the pinned source
+    // tree with a tool that is intentionally absent from the bootstrap tier.
+    // Pin the known target and use a shell-only, sorted recursive glob walk.
+    steps.push(Step::substitute_text(
+        "{src}/Makefile",
+        vec![TextEdit::new(
+            "SUBARCH := $(shell uname -m)",
+            "SUBARCH := x86_64",
+            1,
+        )],
+    ));
+    steps.push(Step::substitute_text(
+        "{src}/scripts/gen_build_files.sh",
+        vec![TextEdit::new(
+            r#"{ cd -- "$srctree" && find . -type d ! '(' -name '.?*' -prune ')'; } \"#,
+            r#"walk_dirs()
+{
+	printf '%s\n' "$1"
+	for d in "$1"/*; do
+		test -d "$d" || continue
+		walk_dirs "$d"
+	done
+}
+{ cd -- "$srctree" && walk_dirs .; } \"#,
+            1,
+        )],
+    ));
+    // split-include's directory scan exists only to clear stale config headers.
+    // Every derivation starts from a fresh unpack, so feed that cleanup pass an
+    // empty list instead of spawning an unavailable external tree walker.
+    steps.push(Step::substitute_text(
+        "{src}/scripts/basic/split-include.c",
+        vec![TextEdit::new(
+            r#""find * -type f -name \"*.h\" -print""#,
+            r#""printf ''""#,
+            1,
+        )],
+    ));
+    // trylink uses xargs only to split, deduplicate, and rejoin a short library
+    // list. Express both transformations with the already-declared awk/sort
+    // providers so the final static link stays inside the recipe closure.
+    steps.push(Step::substitute_text(
+        "{src}/scripts/trylink",
+        vec![
+            TextEdit::new(
+                r#"LDLIBS=`echo "$LDLIBS" | xargs -n1 | sort | uniq | xargs`"#,
+                r#"LDLIBS=`echo "$LDLIBS" | awk '{ for (i = 1; i <= NF; ++i) print $i }' | sort -u | awk '{ if (NR > 1) printf " "; printf "%s", $0 } END { if (NR) print "" }'`"#,
+                1,
+            ),
+            TextEdit::new(
+                r#"without_one=`echo " $LDLIBS " | sed "s/ $one / /g" | xargs`"#,
+                r#"without_one=`echo " $LDLIBS " | sed "s/ $one / /g" | awk '{$1=$1; print}'`"#,
+                1,
+            ),
+        ],
+    ));
+    // Compressed build-config embedding is optional and would add a compressor
+    // solely as a build-time dependency. With that feature disabled below, the
+    // generated compressed array is unreachable; emit one deterministic byte
+    // through the existing od/sed pipeline instead.
+    steps.push(Step::substitute_text(
+        "{src}/scripts/mkconfigs",
+        vec![
+            TextEdit::new(
+                "bzip2 </dev/null >/dev/null\nif test $? != 0; then\n\techo 'bzip2 is not installed'\n\texit 1\nfi",
+                ":",
+                1,
+            ),
+            TextEdit::new(
+                "| bzip2 -1 | dd bs=2 skip=1 2>/dev/null \\",
+                "| awk 'BEGIN { printf \"000\"; exit }' | dd bs=2 skip=1 2>/dev/null \\",
+                1,
+            ),
+        ],
+    ));
+    steps.push(Step::substitute_text(
+        "{src}/applets/usage_compressed",
+        vec![TextEdit::new(
+            "| bzip2 -1 | $DD bs=2 skip=1 2>/dev/null | od -v -b \\",
+            "| awk 'BEGIN { printf \"000\"; exit }' | $DD bs=2 skip=1 2>/dev/null | od -v -b \\",
+            1,
+        )],
+    ));
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
@@ -39,7 +125,10 @@ pub fn recipe() -> Recipe {
         from: format!("{xglibc}/lib"),
         dest: "{root}/sysroot/lib".into(),
     });
-    steps.push(relocate_ld_scripts("{root}/sysroot", "/td/store/glibc-2.41-x86_64"));
+    steps.push(relocate_ld_scripts(
+        "{root}/sysroot",
+        "/td/store/glibc-2.41-x86_64",
+    ));
     // BusyBox's Kbuild builds host helpers, then runs them during the build. glibc
     // popen(3) in those helpers hardcodes /bin/sh, so provide it inside the
     // ephemeral build sandbox from the declared bash input.
@@ -77,6 +166,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("SHELL", SH)
         .env("CONFIG_SHELL", SH)
+        .env("SOURCE_DATE_EPOCH", "1")
         .env("C_INCLUDE_PATH", &cip)
         .env("LIBRARY_PATH", &lib),
     );
@@ -86,7 +176,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "{in:sed-mesboot0}/bin/sed -i -r '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d' .config && printf '%s\\n' 'CONFIG_STATIC=y' '# CONFIG_PIE is not set' 'CONFIG_EXTRA_LDFLAGS=\"-static\"' >> .config",
+                "{in:sed-mesboot0}/bin/sed -i -r '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_BBCONFIG[ =]/d; /^#? *CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_USAGE[ =]/d' .config && printf '%s\\n' 'CONFIG_STATIC=y' '# CONFIG_PIE is not set' 'CONFIG_EXTRA_LDFLAGS=\"-static\"' '# CONFIG_FEATURE_COMPRESS_BBCONFIG is not set' '# CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS is not set' '# CONFIG_FEATURE_COMPRESS_USAGE is not set' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -103,6 +193,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path)
         .env("SHELL", SH)
         .env("CONFIG_SHELL", SH)
+        .env("SOURCE_DATE_EPOCH", "1")
         .env("C_INCLUDE_PATH", &cip)
         .env("LIBRARY_PATH", &lib),
     );
@@ -126,6 +217,7 @@ pub fn recipe() -> Recipe {
         .env("MFLAGS", "")
         .env("GNUMAKEFLAGS", "")
         .env("MAKELEVEL", "")
+        .env("SOURCE_DATE_EPOCH", "1")
         .env("C_INCLUDE_PATH", &cip)
         .env("LIBRARY_PATH", &lib),
     );
@@ -142,7 +234,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "for a in sh ls sed grep awk tar gzip cat echo mkdir rm cp true false env printf sleep sort head tail basename dirname mktemp tee touch tr test pwd comm; do ln -sf busybox \"$a\"; done",
+                "for a in sh ls sed grep awk tar gzip cat echo mkdir rm cp chmod true false env printf sleep sort head tail basename dirname mktemp tee touch tr test pwd comm; do ln -sf busybox \"$a\"; done",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -159,7 +251,9 @@ pub fn recipe() -> Recipe {
                 "-c",
                 "h=$('{in:binutils-x86-64-native}/bin/readelf' -h '{out}/bin/busybox'); \
                  printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || { echo 'busybox is not ELF64' >&2; exit 1; }; \
-                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'busybox is not x86-64' >&2; exit 1; }",
+                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'busybox is not x86-64' >&2; exit 1; }; \
+                 b=$('{out}/bin/busybox' 2>&1); \
+                 printf '%s\\n' \"$b\" | grep -q '^BusyBox v1[.]37[.]0 (1970-01-01 00:00:01 UTC) multi-call binary[.]$' || { echo 'busybox banner is not reproducible' >&2; exit 1; }",
             ],
         )
         .env("PATH", &mesboot0_path()),

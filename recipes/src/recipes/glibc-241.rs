@@ -1,8 +1,8 @@
 use crate::ladder::{
-    SH, link_bins, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, sed_i,
-    unpack_into, unpack_keep_top,
+    SH, glibc241_host_free_fixups, link_bins, mesboot0_inputs, mesboot0_path,
+    relocate_ld_scripts, sed_i, unpack_into, unpack_keep_top,
 };
-use crate::types::{Recipe, Step};
+use crate::types::{Recipe, Step, TextEdit};
 
 // glibc 2.41 — rung 20, the top (#378, guix's glibc-final): gcc 14.3.0 +
 // binutils 2.44 build the MODERN shared libc against the kernel headers. CC
@@ -27,6 +27,7 @@ pub fn recipe() -> Recipe {
     // from here; the static build tools ignore it.
     let lp = "{in:glibc-mesboot-shared}/lib";
     let mut steps = unpack_into("glibc-241-source", "{src}");
+    steps.extend(glibc241_host_free_fixups());
     steps.extend(unpack_keep_top("linux-headers", "{root}/kh"));
     steps.push(Step::ToolFarm {
         links: vec![
@@ -63,6 +64,20 @@ pub fn recipe() -> Recipe {
     steps.push(sed_i(
         "s|subprocess\\.check_call(cmd, shell=True)|subprocess.check_call(cmd, shell=True, executable=\"{in:bash-mesboot}/bin/bash\")|g",
         &["scripts/glibcextract.py"],
+    ));
+    // Host-gzip-free locale charmap install (re #469), the same fix the mesboot
+    // glibc rungs carry. localedata/Makefile installs each charmap uncompressed to
+    // its raw name ($(INSTALL_DATA) $< $(@:.gz=)) then `gzip -9n`-s it onto the
+    // `.gz` target. td ships no gzip executable (the builder decompresses
+    // in-process), so drop the compress step to a no-op: the charmap stays under
+    // its raw, unsuffixed name, which glibc's charmap_open reads directly, and the
+    // `.gz` make target is bookkeeping only. glibc 2.41's rule is byte-identical to
+    // 2.16.0's (`gzip -9n $(@:.gz=)`, one occurrence). Do NOT install raw bytes
+    // under the `.gz` suffix -- localedef treats `.gz` as gzip. Charmaps are never
+    // read during the bootstrap.
+    steps.push(Step::substitute_text(
+        "{src}/localedata/Makefile",
+        vec![TextEdit::new("\tgzip -9n $(@:.gz=)", "\ttrue", 1)],
     ));
     steps.push(Step::MkDir {
         path: "{src}/bld".into(),
