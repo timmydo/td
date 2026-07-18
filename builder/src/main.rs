@@ -1481,19 +1481,23 @@ fn parse_registration_blocks(text: &str) -> Vec<OutputReg> {
 /// stores (re #469): the SHA-256 of the assembled `.drv` FILE BYTES (they cover
 /// inputs, builder path, args, env), the CLOSURE-SCOPED manifest digest
 /// (`reuse_key_manifest_digest` — the hash AND origin class of every input in
-/// THIS drv's own transitive input closure, plus the real builder), and the
-/// drv's builder path. A cache entry is reusable only if the receipt the ENGINE
+/// THIS drv's own transitive input closure, EXCEPT the builder's own driver row),
+/// and the drv's builder path. A cache entry is reusable only if the receipt the ENGINE
 /// wrote at build time matches ALL of these recomputed-now values — so metadata
 /// stored beside an output is never its own authority: a forged record must
 /// reproduce the exact identity the planner derives today, and a stale one
-/// (changed drv, changed input set, changed builder) can never hit. The digest
+/// (changed drv, changed input set, changed builder ABI) can never hit. The digest
 /// is scoped to the drv's OWN closure, NOT the plan-wide manifest union
 /// enforcement uses, so the SAME drv keys the same under any build target (a
 /// higher target's unrelated seeds do not drift the key); the builder is covered
 /// by folding the drv's DECLARED ABI builder IDENTITY into that digest —
 /// content-independent, so like the OUTPUT path the key moves only on a
-/// BUILDER_ABI bump, never on an output-neutral builder recompile (a vouched
-/// builder's `ControlPlaneBuilder` row additionally binds its real bytes).
+/// BUILDER_ABI bump, never on an output-neutral builder recompile. The builder's
+/// own `ControlPlaneBuilder` row is EXCLUDED from the reuse digest (its hash tracks
+/// the builder ELF, which the ABI identity deliberately decouples from output
+/// identity); ENFORCEMENT keeps that row and still binds the real builder bytes for
+/// #469 provenance — only the reuse KEY trusts the ABI identity, matching how the
+/// OUTPUT path already keys on it, not on the builder's content.
 /// Honest limit, stated: receipts live in the same
 /// user-writable cache as the outputs, so an attacker who can rewrite both and
 /// can read the current plan can still forge a hit — closing THAT requires a
@@ -1577,11 +1581,18 @@ fn drv_declared_inputs(parsed: &drv::Derivation) -> Result<Vec<String>, String> 
 /// place the drv's DECLARED ABI builder IDENTITY (`parsed.builder`, content-independent)
 /// is folded in, so the builder is bound by the SAME ABI identity the OUTPUT path keys
 /// on, not by its ELF bytes. An output-neutral builder recompile (same BUILDER_ABI)
-/// therefore does NOT move the key whether the builder runs in-process (no manifest row)
-/// or is staged as an override (row excluded); a BUILDER_ABI bump moves BOTH the identity
-/// and the output path. A change to — or removal of — any OTHER real input still moves
-/// the key; the builder's runtime-linkage inputs (its libc etc.) are NOT the excluded
-/// row — they keep their rows and bind normally. The digest is built CLOSURE-DRIVEN (it
+/// therefore does NOT move the key for an OVERRIDE-staged builder; a BUILDER_ABI bump moves
+/// BOTH the identity and the output path. This covers the CHECK-LADDER, whose `build_recipe`
+/// reuse cache is ONLY ever reached with a builder override (`TD_BUILDER_PATH`) — the reuse
+/// cache that used to bust on every recompile. SCOPE NOTE: the in-process / SELF_TREE case (a
+/// daemon started with no `TD_BUILDER_*` serving a bare drv, or a manual `build-recipe`) is NOT
+/// stabilized by this — there the builder is `self_store_path()`, content-scanned and vouched as
+/// `BlessedSeedClosure`/`AuditedSeed`, NOT `ControlPlaneBuilder`, so the origin gate does not
+/// exclude it and an in-process recompile still moves the key, exactly as before this change.
+/// The check-ladder never takes that path; stabilizing self-driven builds is a separate
+/// follow-up. A change to — or removal of — any OTHER real input still moves the key; the
+/// builder's runtime-linkage inputs (its libc etc.) are NOT the excluded row — they keep their
+/// rows and bind normally. The digest is built CLOSURE-DRIVEN (it
 /// iterates the closure and looks up each row), so a closure member with NO manifest row is
 /// recorded as `absent` and still moves the key — an unvouched member (a builder runtime dep
 /// a recompile pulled in) cannot yield a spurious hit at the read sites, which do not run
@@ -1657,10 +1668,10 @@ fn reuse_key_manifest_digest(
     // keys on this ABI identity (store::builder_identity_path), so the reuse key must too — else an
     // output-neutral builder recompile (same BUILDER_ABI) would move the key, force a rebuild of an
     // already-valid output, and, on a non-reproducible rung, collide with the cached tree
-    // (`commit_tree_checked` "Refusing to overwrite"). This leg binds the builder identity whether it
-    // runs in-process (no manifest row) or as an override (row excluded above), so BOTH staging
-    // modes are recompile-stable. A BUILDER_ABI bump changes this identity and correctly moves the
-    // key (re #469).
+    // (`commit_tree_checked` "Refusing to overwrite"). This leg binds the builder identity for the
+    // OVERRIDE-staged builder (row excluded above) — the check-ladder case. (In-process/SELF_TREE
+    // builds keep their non-ControlPlaneBuilder self row and are NOT stabilized; see the fn doc.)
+    // A BUILDER_ABI bump changes this identity and correctly moves the key (re #469).
     h.update(b"\nbuilder ");
     h.update(builder_identity.as_bytes());
     sha256::to_base16(&h.finalize())
@@ -9632,9 +9643,9 @@ daemon build START (2/2 active)
         // store::builder_identity_path, so the reuse key must too). A BUILDER_ABI bump
         // changes the identity → the key MOVES. (The call sites pass parsed.builder, NOT the
         // resolved builder_exec — that contract IS the fix; this function only sees, and
-        // binds, whatever identity it is handed.) The binding holds even for the RUNNING
-        // builder, which is no manifest key: with a closure carrying no builder row, the
-        // fold is the only leg that binds it.
+        // binds, whatever identity it is handed.) The `bare` case below ISOLATES the fold leg:
+        // handed a closure with no builder row at all, the identity fold alone still moves the
+        // key — proving the fold binds the identity independent of any manifest row.
         let bumped_identity = format!("/td/store/{}-td-builder/bin/td-builder", "8".repeat(32));
         assert_ne!(
             low_key,
@@ -9645,7 +9656,7 @@ daemon build START (2/2 active)
         assert_ne!(
             reuse_key_manifest_digest(&bare, &low, &builder_identity, None),
             reuse_key_manifest_digest(&bare, &low, &bumped_identity, None),
-            "the builder ABI identity binds the key even when it is no manifest row"
+            "the identity fold binds the key independent of any builder manifest row"
         );
     }
 
