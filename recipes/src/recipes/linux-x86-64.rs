@@ -295,8 +295,9 @@ pub fn recipe() -> Recipe {
         paths: vec!["{out}/vmlinux".into()],
         exec: false,
     });
-    // [native-arch] vmlinux must be an ELF64 x86-64 image — caught at the producer
-    // rung, parity with make-x86-64 / gcc-x86-64-native.
+    // [native-arch] vmlinux must be an ELF64 x86-64 linked executable (EXEC, not a
+    // stray relocatable .o) — caught at the producer rung, parity with
+    // make-x86-64 / gcc-x86-64-native.
     steps.push(
         Step::run(
             "{out}",
@@ -305,7 +306,8 @@ pub fn recipe() -> Recipe {
                 "-c",
                 "h=$('{in:binutils-x86-64-native}/bin/readelf' -h '{out}/vmlinux'); \
                  printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || { echo 'vmlinux is not ELF64' >&2; exit 1; }; \
-                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'vmlinux is not x86-64' >&2; exit 1; }",
+                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'vmlinux is not x86-64' >&2; exit 1; }; \
+                 printf '%s\\n' \"$h\" | grep -i 'type:'    | grep -qi 'EXEC'   || { echo 'vmlinux is not a linked ELF executable (EXEC)' >&2; exit 1; }",
             ],
         )
         .env("PATH", &mesboot0_path()),

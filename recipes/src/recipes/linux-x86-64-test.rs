@@ -6,7 +6,10 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // (it belongs with the later bzImage/qemu step); instead this asserts the artifact
 // is a well-formed x86-64 kernel image, per repo policy that recipes test their
 // output. Three checks over the built ELF:
-//   1. it is an ELF64 x86-64 object (native readelf),
+//   1. it is an ELF64 x86-64 *executable* (readelf: class ELF64, machine x86-64,
+//      type EXEC) — the EXEC assertion proves it was linked, so a stray
+//      relocatable `.o` (which would still be ELF64/x86-64 and carry the banner
+//      via init/version.o) cannot satisfy the check,
 //   2. it carries the `Linux version 4.14.67` banner (init/version.o's
 //      linux_banner[], always obj-y) — proof the kernel actually compiled and
 //      linked, not just that some ELF exists,
@@ -27,7 +30,8 @@ pub fn recipe() -> Recipe {
                 &format!(
                     "h=$('{readelf}' -h '{vmlinux}'); \
                      printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || {{ echo 'vmlinux is not ELF64' >&2; exit 1; }}; \
-                     printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || {{ echo 'vmlinux is not x86-64' >&2; exit 1; }}"
+                     printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || {{ echo 'vmlinux is not x86-64' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$h\" | grep -i 'type:'    | grep -qi 'EXEC'   || {{ echo 'vmlinux is not a linked ELF executable (EXEC) — a stray relocatable .o would still be ELF64/x86-64 and carry the banner' >&2; exit 1; }}"
                 ),
             ],
         )

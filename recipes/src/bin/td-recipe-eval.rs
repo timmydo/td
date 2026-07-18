@@ -289,6 +289,17 @@ mod tests {
             1
         );
         assert_eq!(recipe_checks(&x86_self, None).len(), 1);
+
+        let linux = catalog::lookup("linux-x86-64-test").unwrap();
+        assert_eq!(
+            recipe_checks(&linux, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&linux, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&linux, None).len(), 1);
     }
 
     #[test]
@@ -307,6 +318,7 @@ mod tests {
             ("gcc-x86-64-stage2-test", 1),
             ("gcc-x86-64-native-test", 1),
             ("gcc-x86-64-self-test", 1),
+            ("linux-x86-64-test", 1),
         ] {
             let recipe = catalog::lookup(stem).unwrap();
             let checks = recipe_checks(&recipe, Some(td_recipe::types::CheckTier::Daily));
