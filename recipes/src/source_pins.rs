@@ -91,6 +91,39 @@ const PINS: &[PinDef] = &[
         file: "diffutils-2.7.tar.gz",
     },
     PinDef {
+        key: "elfutils-x86-64-source",
+        aliases: &[],
+        // elfutils 0.192 — the source of `libelf`, which the modern Linux kernel's
+        // objtool host tool links against (re #529). objtool is force-selected on
+        // x86_64 in current kernels (7.x: HAVE_STATIC_CALL_INLINE +
+        // HAVE_UACCESS_VALIDATION both `select OBJTOOL` unconditionally), so libelf
+        // is not avoidable the way it was in the 4.14 rung. The `elfutils-x86-64` recipe builds ONLY libelf.a
+        // + headers from this tarball with td's native x86_64 toolchain; objtool
+        // tolerates old libelf (it defines LIBELF_USE_DEPRECATED), so the exact
+        // version is not load-bearing. 0.192 is a deliberate stable pin (a
+        // reviewed update bumps the version + hash together); newer 0.19x
+        // releases exist and any of them would serve — this is not a "latest"
+        // claim, and the build asserts nothing about the minor version.
+        url: "https://sourceware.org/elfutils/ftp/0.192/elfutils-0.192.tar.bz2",
+        sha256: "616099beae24aba11f9b63d86ca6cc8d566d968b802391334c91df54eab416b4",
+        file: "elfutils-0.192.tar.bz2",
+    },
+    PinDef {
+        key: "flex-x86-64-source",
+        aliases: &[],
+        // GNU flex 2.6.4 — the lexical-analyzer generator the modern Linux kernel
+        // (>= 4.18) requires for scripts/kconfig's lexer; the pre-generated
+        // `*_shipped` parsers the 4.14 rung relied on are gone from the current
+        // tree (re #529). The `flex-x86-64` recipe builds it static with td's
+        // native x86_64 toolchain. The release tarball ships the generated
+        // scanner/parser C (src/scan.c, src/parse.c), so no pre-existing flex or
+        // bison is needed to build it; it execs m4 (m4-mesboot, baked at configure)
+        // at scanner-generation time. Latest release.
+        url: "https://github.com/westes/flex/releases/download/v2.6.4/flex-2.6.4.tar.gz",
+        sha256: "e87aae032bf07c26f85ac0ed3250998c37621d95f8bd748b31f15b33c45ee995",
+        file: "flex-2.6.4.tar.gz",
+    },
+    PinDef {
         key: "gawk-mesboot-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/gawk/gawk-3.1.8.tar.gz",
@@ -230,10 +263,31 @@ const PINS: &[PinDef] = &[
     },
     PinDef {
         key: "linux-source",
+        // The 4.14.67 tree stays pinned ONLY as the source of the UAPI kernel
+        // headers (`linux-headers` / `linux-headers-x86-64`) that the whole
+        // glibc/gcc toolchain ladder builds against — a stable, ancient-glibc-safe
+        // header set. The bootable kernel is a SEPARATE, current pin
+        // (`linux-kernel-source`): bumping this one would rebuild the entire
+        // toolchain and risk breaking glibc 2.2.5 / 2.16.0 against modern headers.
         aliases: &["linux-headers", "linux-headers-x86-64"],
         url: "https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz",
         sha256: "3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba",
         file: "linux-4.14.67.tar.xz",
+    },
+    PinDef {
+        key: "linux-kernel-source",
+        aliases: &[],
+        // Linux 7.1.4 — the latest STABLE mainline kernel (not a longterm/LTS
+        // line) the `linux-x86-64` rung source-builds into a bootable x86_64
+        // `vmlinux` with td's native toolchain (re #529). DISTINCT from the
+        // `linux-source` pin above: this is the full kernel tree to compile, kept
+        // current; that one is the frozen 4.14 UAPI-header source for the
+        // toolchain. Keeping them separate confines a kernel bump to this one rung
+        // instead of the whole ladder. A reviewed update bumps version + sha256 +
+        // the seed-digests.txt row together.
+        url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.4.tar.xz",
+        sha256: "1c63922a119675d38e3ae0f8f6ee07f15c41a786ab9ed66563749bb8c9a08e2e",
+        file: "linux-7.1.4.tar.xz",
     },
     PinDef {
         key: "m4-mesboot-source",
@@ -444,9 +498,11 @@ mod tests {
         // bison-3.8.2 (the glibc-rung parser generator, re #469) +
         // Python-3.11.1 (the glibc-rung python3, re #469) + GCC 10.5.0 (the
         // compatibility bridge between gcc-mesboot 4.9.4 and GCC 14.3.0) +
-        // CMake 3.31.12 + Rust 1.96.0 source and its exact three-component
-        // Rust 1.95.0 bootstrap snapshot.
-        assert_eq!(all().len(), 48);
+        // the linux-x86-64 kernel source (separate from the 4.14 UAPI-header
+        // pin, re #529) + flex-2.6.4 and elfutils-0.192 (the modern-kernel host
+        // tools flex + libelf, re #529) + CMake 3.31.12 + Rust 1.96.0 source and
+        // its exact three-component Rust 1.95.0 bootstrap snapshot.
+        assert_eq!(all().len(), 51);
     }
 
     #[test]
