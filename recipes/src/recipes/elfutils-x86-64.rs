@@ -3,7 +3,7 @@ use crate::types::{Recipe, Step};
 
 // elfutils 0.192 — `libelf`, the ELF-access library the modern Linux kernel's
 // objtool host tool links against (re #529). objtool is force-selected on
-// x86_64 in Linux 6.18 (HAVE_STATIC_CALL_INLINE + HAVE_UACCESS_VALIDATION both
+// x86_64 in Linux 7.x (HAVE_STATIC_CALL_INLINE + HAVE_UACCESS_VALIDATION both
 // `select OBJTOOL` unconditionally), so unlike the 4.14 rung — which dodged
 // objtool with the frame-pointer unwinder — a modern x86_64 vmlinux cannot
 // avoid libelf. Built FROM SOURCE by td's OWN native x86_64 toolchain
