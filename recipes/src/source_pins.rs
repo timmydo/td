@@ -90,7 +90,10 @@ const PINS: &[PinDef] = &[
         // was in the 4.14 rung. The `elfutils-x86-64` recipe builds ONLY libelf.a
         // + headers from this tarball with td's native x86_64 toolchain; objtool
         // tolerates old libelf (it defines LIBELF_USE_DEPRECATED), so the exact
-        // version is not load-bearing. Latest release at pin time.
+        // version is not load-bearing. 0.192 is a deliberate stable pin (a
+        // reviewed update bumps the version + hash together); newer 0.19x
+        // releases exist and any of them would serve — this is not a "latest"
+        // claim, and the build asserts nothing about the minor version.
         url: "https://sourceware.org/elfutils/ftp/0.192/elfutils-0.192.tar.bz2",
         sha256: "616099beae24aba11f9b63d86ca6cc8d566d968b802391334c91df54eab416b4",
         file: "elfutils-0.192.tar.bz2",

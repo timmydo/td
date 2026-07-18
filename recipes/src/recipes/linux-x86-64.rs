@@ -132,32 +132,33 @@ pub fn recipe() -> Recipe {
     // query `$(HOSTPKG_CONFIG) libelf --cflags/--libs`). td's libelf is a set of
     // STATIC archives that are not self-contained, so answer `--libs` with the
     // full `-lelf -leu -lz` (libelf → libeu for eu_tsearch → zlib for the
-    // section-decompress path). Any non-libelf query fails, so kbuild's feature
-    // detection behaves as if that library is absent.
+    // section-decompress path). Kept faithful to real pkg-config so kbuild's
+    // feature detection behaves correctly regardless of how it phrases the query:
+    // flags accumulate (a combined `--cflags --libs` prints both), a query for
+    // `libelf` alone or `--exists libelf` succeeds silently (exit 0), and any
+    // OTHER module — including a multi-package query like `libelf zlib` — makes
+    // `$mod` != libelf and reports the package absent (exit 1).
     steps.push(Step::WriteFile {
         path: "{root}/wb/pkg-config".into(),
         content: format!(
             "#!{SH}\n\
-             mod=''; want=''\n\
+             mod=''; cflags=0; libs=0; modversion=0\n\
              for a in \"$@\"; do\n\
              \tcase \"$a\" in\n\
-             \t--cflags) want=cflags;;\n\
-             \t--libs) want=libs;;\n\
-             \t--modversion) want=modversion;;\n\
-             \t--exists) want=exists;;\n\
-             \t--atleast-version=*|--max-version=*|--exact-version=*) want=exists;;\n\
+             \t--cflags) cflags=1;;\n\
+             \t--libs) libs=1;;\n\
+             \t--modversion) modversion=1;;\n\
              \t-*) ;;\n\
-             \t*) mod=\"$a\";;\n\
+             \t*) mod=\"${{mod:+$mod }}$a\";;\n\
              \tesac\n\
              done\n\
              [ \"$mod\" = libelf ] || exit 1\n\
-             case \"$want\" in\n\
-             \tcflags) echo \"-I{elfinc}\";;\n\
-             \tlibs) echo \"-L{elflib} -lelf -leu -lz\";;\n\
-             \tmodversion) echo 0.192;;\n\
-             \texists) exit 0;;\n\
-             \t*) exit 1;;\n\
-             esac\n"
+             out=''\n\
+             [ \"$modversion\" = 1 ] && out=0.192\n\
+             [ \"$cflags\" = 1 ] && out=\"${{out:+$out }}-I{elfinc}\"\n\
+             [ \"$libs\" = 1 ] && out=\"${{out:+$out }}-L{elflib} -lelf -leu -lz\"\n\
+             [ -n \"$out\" ] && printf '%s\\n' \"$out\"\n\
+             exit 0\n"
         ),
         exec: true,
     });

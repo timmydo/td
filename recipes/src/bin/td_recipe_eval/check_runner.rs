@@ -1621,6 +1621,12 @@ mod tests {
             "gcc-x86-64-stage2-test",
             "gcc-x86-64-native-test",
             "gcc-x86-64-self-test",
+            // #529 modern-kernel rung + its two new host-tool dependency recipes;
+            // each -test pulls its producer's whole closure, so this also covers
+            // flex-x86-64, elfutils-x86-64, and linux-x86-64 transitively.
+            "flex-x86-64-test",
+            "elfutils-x86-64-test",
+            "linux-x86-64-test",
         ] {
             if let Err(err) = ensure_targets_provenance(&[target]) {
                 panic!("{target}: expected host-free provenance to pass, got: {err}");
