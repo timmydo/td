@@ -108,6 +108,14 @@ pub const EROFS_MARKER: &str = "TD-EROFS-RO-OK";
 /// (the /init script) name the same path.
 pub const EROFS_PROBE_SENTINEL: &str = "td-erofs-probe.ok";
 
+/// The exact CONTENT the probe writes into `EROFS_PROBE_SENTINEL`, which the guest
+/// `/init` reads back with `cat` and string-compares before printing `EROFS_MARKER`.
+/// Comparing the CONTENT (not just `test -f` on the name) forces the kernel to read
+/// the file's DATA blocks off the erofs image — proving the flat-plain data layout
+/// and block addressing, not merely that the inode/dirent parse. A single shell-safe
+/// token (no spaces/quotes/newline) so the `[ "$x" = "..." ]` compare stays trivial.
+pub const EROFS_PROBE_CONTENT: &str = "td-erofs-ro-readback-ok";
+
 /// Shell (for `sh -c`) asserting that `initramfs` is a COMPLETE, well-formed newc cpio
 /// carrying the bootable busybox userland. Shared by the `linux-x86-64` producer rung
 /// and the `linux-x86-64-test` rung so the two checks cannot drift.

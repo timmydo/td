@@ -29,8 +29,10 @@
 //! is absent the tool FAILS loudly rather than silently passing, so a green result
 //! always means a real boot happened.
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -56,6 +58,12 @@ const EROFS_MARKER: &str = td_recipe::ladder::EROFS_MARKER;
 /// The sentinel file the probe erofs image carries and the guest `/init` reads back;
 /// shared so the image the oracle builds and the path the /init reads never desync.
 const EROFS_PROBE_SENTINEL: &str = td_recipe::ladder::EROFS_PROBE_SENTINEL;
+
+/// The exact token the probe sentinel holds. The guest `/init` reads the file back
+/// with `cat` and string-COMPARES it (not merely `test -f`), so a green result
+/// proves the erofs DATA block is readable, not just that the inode exists. Shared so
+/// the bytes the oracle writes and the token the /init expects can never desync.
+const EROFS_PROBE_CONTENT: &str = td_recipe::ladder::EROFS_PROBE_CONTENT;
 
 /// Default wall-clock ceiling. A tiny allnoconfig kernel boots to userspace under
 /// TCG in a few seconds, but TCG on a loaded builder can be slow; 180s is
@@ -212,7 +220,11 @@ fn build_probe_image(runner: &RecipeCheckRunner) -> Result<PathBuf, String> {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
     let sentinel = root.join(EROFS_PROBE_SENTINEL);
-    fs::write(&sentinel, b"td read-only erofs probe\n")
+    // Write the shared content token (trailing newline is fine — the guest reads it
+    // via `$(cat …)`, which strips it before the string compare). Reading this exact
+    // token back in the guest is what makes EROFS_MARKER a DATA-read proof, not just
+    // an inode-exists check.
+    fs::write(&sentinel, format!("{EROFS_PROBE_CONTENT}\n"))
         .map_err(|e| format!("write {}: {e}", sentinel.display()))?;
 
     let img = scratch.join("erofs-probe.img");
@@ -357,8 +369,8 @@ fn boot(
     // Optional read-only erofs disk (re #549): if=none defines the backing store and
     // a separate virtio-blk-pci -device attaches it as /dev/vda in the guest.
     // readonly=on matches the immutable erofs root and lets qemu refuse any write.
-    // The image path is under our private scratch (no commas), so -drive's
-    // comma-separated key=value parse is unambiguous.
+    // drive_arg comma-doubles the image path so a scratch dir with a literal comma in
+    // its path can't be misparsed as an extra -drive key=value pair.
     if let Some(disk) = disk {
         cmd.arg("-drive").arg(drive_arg(disk));
         cmd.args(["-device", "virtio-blk-pci,drive=erofs0"]);
@@ -513,11 +525,25 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// `erofs0` id the `virtio-blk-pci` -device references. `readonly=on` matches the
 /// immutable erofs root (qemu refuses guest writes); `if=none` keeps qemu from
 /// auto-attaching it to an implicit controller so only the explicit -device wires it.
-fn drive_arg(disk: &Path) -> String {
-    format!(
-        "if=none,format=raw,readonly=on,id=erofs0,file={}",
-        disk.display()
-    )
+///
+/// qemu splits `-drive`'s key=value pairs on commas, so a literal comma in the image
+/// PATH (e.g. a repo cloned under `/home/user/code,td/…`) must be doubled (`,,`) or
+/// qemu would misparse the path tail as a spurious extra key. Only the path's commas
+/// are doubled — the option-separator commas in the fixed prefix stay single. Built
+/// byte-wise off the raw path bytes and returned as an `OsString` so a non-UTF-8 path
+/// survives without a lossy round-trip.
+fn drive_arg(disk: &Path) -> OsString {
+    let mut out = OsString::from("if=none,format=raw,readonly=on,id=erofs0,file=");
+    let path_bytes = disk.as_os_str().as_bytes();
+    let mut escaped: Vec<u8> = Vec::with_capacity(path_bytes.len());
+    for &b in path_bytes {
+        if b == b',' {
+            escaped.push(b',');
+        }
+        escaped.push(b);
+    }
+    out.push(OsString::from_vec(escaped));
+    out
 }
 
 /// Read at most the last `cap` bytes of `path`, decoded lossily — bounds memory
@@ -615,13 +641,29 @@ mod tests {
     #[test]
     fn drive_arg_is_readonly_raw_with_the_device_id() {
         let arg = drive_arg(Path::new("/scratch/erofs-probe.img"));
+        let s = arg.to_string_lossy();
         // The virtio-blk-pci -device references drive=erofs0, so the drive's id must match.
-        assert!(arg.contains("id=erofs0"), "missing id: {arg}");
+        assert!(s.contains("id=erofs0"), "missing id: {s}");
         // Read-only + raw + the exact backing file, and if=none (no implicit controller).
-        assert!(arg.contains("readonly=on"), "not read-only: {arg}");
-        assert!(arg.contains("format=raw"), "not raw: {arg}");
-        assert!(arg.contains("if=none"), "not if=none: {arg}");
-        assert!(arg.ends_with("file=/scratch/erofs-probe.img"), "wrong file: {arg}");
+        assert!(s.contains("readonly=on"), "not read-only: {s}");
+        assert!(s.contains("format=raw"), "not raw: {s}");
+        assert!(s.contains("if=none"), "not if=none: {s}");
+        // A comma-free path is passed through verbatim after file=.
+        assert!(s.ends_with("file=/scratch/erofs-probe.img"), "wrong file: {s}");
+    }
+
+    #[test]
+    fn drive_arg_doubles_only_the_image_path_commas() {
+        // A repo/scratch path containing a literal comma must not break -drive's
+        // key=value parse: qemu wants such commas doubled. Only the PATH's commas are
+        // doubled; the fixed option-separator commas in the prefix stay single.
+        let arg = drive_arg(Path::new("/sc,ratch/erofs,probe.img"));
+        let s = arg.to_string_lossy();
+        assert_eq!(
+            s,
+            "if=none,format=raw,readonly=on,id=erofs0,file=/sc,,ratch/erofs,,probe.img",
+            "path commas not doubled (or prefix separators mangled): {s}"
+        );
     }
 
     #[test]

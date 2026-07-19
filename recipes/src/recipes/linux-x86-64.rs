@@ -1,6 +1,6 @@
 use crate::ladder::{
     initramfs_cpio_shape_check, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into,
-    unpack_keep_top, EROFS_MARKER, EROFS_PROBE_SENTINEL, SH, USERLAND_MARKER,
+    unpack_keep_top, EROFS_MARKER, EROFS_PROBE_CONTENT, EROFS_PROBE_SENTINEL, SH, USERLAND_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -321,6 +321,16 @@ pub fn recipe() -> Recipe {
     //    off, but pinning off the symbols that would pull a new host tool
     //    (perl/openssl/pahole/cpio/kmod) hardens directive-1's no-undeclared-tool
     //    invariant against an allnoconfig default drift across sub-versions.
+    //
+    //    READ-ONLY ROOT menuconfig parents (re #549): three of the erofs-root leaves
+    //    sit under a PROMPTED `menuconfig` parent that `allnoconfig` forces off, so
+    //    the leaf alone is invisible and `olddefconfig` would silently drop it (unlike
+    //    e.g. SHMEM behind TMPFS, which has no prompt and keeps its `default y`). The
+    //    parents must therefore be set EXPLICITLY: CONFIG_VIRTIO_MENU (gates
+    //    VIRTIO_PCI), CONFIG_BLK_DEV (gates VIRTIO_BLK), CONFIG_MISC_FILESYSTEMS
+    //    (gates EROFS_FS). Do not drop them as "redundant" — the grep-verify guard on
+    //    the leaves (step 4) reds the whole producer build if a parent goes missing.
+    //    (OVERLAY_FS / PCI / BLOCK are directly selectable, no menuconfig parent.)
     steps.push(
         Step::run(
             "{src}",
@@ -356,10 +366,13 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_DEVTMPFS[ =]/d; \
                   /^#? *CONFIG_TMPFS[ =]/d; \
                   /^#? *CONFIG_BLOCK[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV[ =]/d; \
                   /^#? *CONFIG_PCI[ =]/d; \
                   /^#? *CONFIG_VIRTIO[ =]/d; \
+                  /^#? *CONFIG_VIRTIO_MENU[ =]/d; \
                   /^#? *CONFIG_VIRTIO_PCI[ =]/d; \
                   /^#? *CONFIG_VIRTIO_BLK[ =]/d; \
+                  /^#? *CONFIG_MISC_FILESYSTEMS[ =]/d; \
                   /^#? *CONFIG_EROFS_FS[ =]/d; \
                   /^#? *CONFIG_OVERLAY_FS[ =]/d' .config && \
                  printf '%s\\n' \
@@ -385,10 +398,13 @@ pub fn recipe() -> Recipe {
                    'CONFIG_DEVTMPFS=y' \
                    'CONFIG_TMPFS=y' \
                    'CONFIG_BLOCK=y' \
+                   'CONFIG_BLK_DEV=y' \
                    'CONFIG_PCI=y' \
                    'CONFIG_VIRTIO=y' \
+                   'CONFIG_VIRTIO_MENU=y' \
                    'CONFIG_VIRTIO_PCI=y' \
                    'CONFIG_VIRTIO_BLK=y' \
+                   'CONFIG_MISC_FILESYSTEMS=y' \
                    'CONFIG_EROFS_FS=y' \
                    'CONFIG_OVERLAY_FS=y' >> .config",
             ],
@@ -484,16 +500,25 @@ pub fn recipe() -> Recipe {
     // wall-clock ceiling then bounds the run).
     //
     // Applet reachability: this initramfs packs only /bin/busybox + a /bin/sh
-    // symlink (no per-applet symlinks) and busybox is NOT built standalone-shell,
-    // so `mount`/`test`/`mkdir`/`sleep`/`reboot` are reached as `/bin/busybox <applet>`
-    // explicitly, never bare (a bare `mount` would not resolve on PATH).
+    // symlink (no per-applet symlinks — the busybox recipe's own /bin symlink farm
+    // is NOT what gets packed here) and busybox is NOT built standalone-shell, so
+    // EVERY applet (`mkdir`/`mount`/`sleep`/`cat`/`test`/`reboot`) is reached as
+    // `/bin/busybox <applet>` explicitly, never bare (a bare `mount` would not
+    // resolve on PATH). Only `echo` is used bare — it is an ash SHELL BUILTIN, not
+    // an applet, so it needs no symlink. `test` is invoked via busybox (not the `[`
+    // builtin) so it does not depend on CONFIG_ASH_TEST being set in the busybox
+    // config.
     //
     // Disk probe (gated on /dev/vda so a diskless boot is unaffected — the plain
     // `qemu-boot` check kills qemu on USERLAND_MARKER, printed first, before this
     // runs): mount devtmpfs so the virtio-blk node appears, settle briefly for the
     // async probe, then mount /dev/vda READ-ONLY as erofs and read the sentinel the
-    // image was built with. EROFS_MARKER prints only when BOTH succeed, so it is a
-    // true read-only-erofs-mount proof. This is the seed of the #550 two-stage boot,
+    // image was built with. The sentinel's CONTENT is read back with `cat` and
+    // string-compared (not just `test -f`), so a corrupt/missing DATA block cannot
+    // green — EROFS_MARKER prints only when the mount AND the data read-back both
+    // succeed, making it a true read-only-erofs-mount proof. mount stderr is left on
+    // the console (no `2>/dev/null`) so a mount failure is visible in the boot
+    // oracle's captured serial log. This is the seed of the #550 two-stage boot,
     // where the `reboot -f` becomes the switch_root into the mounted root.
     steps.push(Step::WriteFile {
         path: "{root}/initramfs/init".into(),
@@ -501,12 +526,12 @@ pub fn recipe() -> Recipe {
             "#!/bin/sh\n\
              echo {USERLAND_MARKER}\n\
              /bin/busybox mkdir -p /mnt\n\
-             /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null\n\
+             /bin/busybox mount -t devtmpfs dev /dev\n\
              n=0\n\
-             while [ $n -lt 5 ] && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
+             while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
              if /bin/busybox test -b /dev/vda; then \
-             if /bin/busybox mount -t erofs -o ro /dev/vda /mnt 2>/dev/null; then \
-             if /bin/busybox test -f /mnt/{EROFS_PROBE_SENTINEL}; then echo {EROFS_MARKER}; fi; \
+             if /bin/busybox mount -t erofs -o ro /dev/vda /mnt; then \
+             if /bin/busybox test \"$(/bin/busybox cat /mnt/{EROFS_PROBE_SENTINEL})\" = {EROFS_PROBE_CONTENT}; then echo {EROFS_MARKER}; fi; \
              fi; \
              fi\n\
              exec /bin/busybox reboot -f\n"
