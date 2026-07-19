@@ -10,9 +10,11 @@
 //! never enters a target closure). The difference is the console: qemu_boot is a
 //! headless PASS/FAIL oracle that scans ttyS0 for a marker and kills qemu; this
 //! hands the guest a real terminal (`-nographic` wires ttyS0 <-> the operator's
-//! stdio) and does NOT scan, time out, or kill. The operator quits by powering off
-//! the guest (`-no-reboot` makes the guest `poweroff`/`reboot` exit qemu) or with
-//! qemu's own Ctrl-A X. Because it is interactive it is a host-side command, never
+//! stdio) and does NOT scan, time out, or kill. The operator quits with qemu's own
+//! Ctrl-A X: the auto-login user is unprivileged and busybox is not installed setuid,
+//! so `su`/`poweroff` cannot elevate and there is no in-guest shutdown from the greeter
+//! (`-no-reboot` still makes a guest reset exit qemu, e.g. if the image is retailored
+//! with a root auto-login). Because it is interactive it is a host-side command, never
 //! a gated check (a gate has no terminal, and the daily sandbox has no host qemu).
 use std::fs::File;
 use std::path::Path;
@@ -60,9 +62,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
 
     println!(
         "   [run] booting the td distro under {qemu} (TCG) - interactive serial console\n         \
-         kernel: {}\n         rootfs: {}\n         auto-login as the test user is enabled. To exit: press Ctrl-A then X to quit\n         \
-         qemu, or run `su -c poweroff` for a clean guest shutdown (root is passwordless;\n         \
-         the unprivileged test user cannot poweroff directly).\n",
+         kernel: {}\n         rootfs: {}\n         auto-login as the test user is enabled. To exit qemu: press Ctrl-A then X.\n         \
+         (The auto-logged-in test user is unprivileged and busybox is not installed setuid,\n         \
+         so `su`/`poweroff` cannot elevate; Ctrl-A X is the intended exit for this image.)\n",
         bzimage.display(),
         rootfs.display()
     );
@@ -72,8 +74,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
 
 /// Boot bzImage + initramfs under qemu with the guest's ttyS0 wired to THIS
 /// process's stdio (`-nographic`), inherited so the operator drives the console
-/// directly. No marker scan, no timeout, no kill — the guest owns the terminal
-/// until it powers off or the operator quits qemu. `-nic none` + `-no-user-config`
+/// directly. No marker scan, no timeout, no kill — the guest owns the terminal until
+/// the operator quits qemu with Ctrl-A X (the default image's auto-login user is
+/// unprivileged, so it has no in-guest poweroff). `-nic none` + `-no-user-config`
 /// keep the run offline and hermetic; `-no-reboot` makes a guest reset exit qemu.
 fn boot_interactive(qemu: &str, bzimage: &Path, rootfs: &Path) -> Result<(), String> {
     let append = "console=ttyS0 rdinit=/init";
