@@ -528,8 +528,21 @@ impl RecipeCheckRunner {
         // so a later REMOVAL of one is still detected as a change and wipes —
         // closing the remove-then-re-add-with-new-content hole. Under the
         // ladder lock, so no concurrent writer.
-        fs::write(&setup_ok, &manifest)
-            .map_err(|e| format!("write {}: {e}", setup_ok.display()))?;
+        //
+        // Atomic + symlink-safe: write a temp file, drop whatever is at
+        // setup-ok (a stray symlink or dir, or the old marker —
+        // remove_path_if_exists never follows a symlink), then rename into
+        // place. A crash can then leave only the OLD complete manifest or none
+        // (a safe wipe next run) — never a truncated PREFIX that setup_needs_wipe
+        // would misread as a subset — and the rewrite never writes THROUGH a
+        // symlink to another target (re #543 review).
+        let tmp = self.lw.join(format!("setup-ok.tmp.{}", process::id()));
+        fs::write(&tmp, &manifest).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        remove_path_if_exists(&setup_ok)?;
+        if let Err(e) = fs::rename(&tmp, &setup_ok) {
+            let _ = remove_path_if_exists(&tmp);
+            return Err(format!("place {}: {e}", setup_ok.display()));
+        }
         Ok(())
     }
 
@@ -586,17 +599,29 @@ impl RecipeCheckRunner {
     fn setup_manifest(&self) -> Result<String, String> {
         let mut lines: Vec<String> = Vec::new();
         for pin in source_pins::all() {
+            // Tab and newline are the manifest's field and line separators; a
+            // field carrying one could let two entries collapse into a single
+            // line and mask a needed wipe. Reject it loudly — the pins are
+            // reviewed compile-time constants, so a separator here is a catalog
+            // bug, not reachable input (re #543 review).
+            manifest_field_ok("pin key", &pin.key)?;
+            manifest_field_ok("pin url", &pin.url)?;
+            manifest_field_ok("pin sha256", &pin.sha256)?;
+            manifest_field_ok("pin file", &pin.file)?;
             lines.push(format!(
                 "pin\t{}\t{}\t{}\t{}",
                 pin.key, pin.url, pin.sha256, pin.file
             ));
         }
+        // One reused buffer across patches (off the hot path, AGENTS.md).
+        let mut bytes = Vec::new();
         for file in files_with_suffix(&self.root.join("seed/patches"), ".patch")? {
             let name = file
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| format!("seed patch has no UTF-8 name: {}", file.display()))?;
-            let mut bytes = Vec::new();
+            manifest_field_ok("patch name", name)?;
+            bytes.clear();
             append_file_bytes(&file, &mut bytes)?;
             lines.push(format!("patch\t{}\t{}", name, sha256sum(&bytes)));
         }
@@ -606,6 +631,13 @@ impl RecipeCheckRunner {
             out.push_str(line);
             out.push('\n');
         }
+        // Completeness footer: the entry count. A torn write (crash, kill,
+        // disk-full) loses or mismatches it, so `setup_needs_wipe` can reject an
+        // incomplete baseline (a safe wipe) instead of reading a truncated
+        // PREFIX as a valid "older subset" and skipping a required wipe
+        // (re #543 review). Kept out of the subset comparison — it legitimately
+        // differs whenever additions change the count.
+        out.push_str(&format!("entries\t{}\n", lines.len()));
         Ok(out)
     }
 
@@ -1304,22 +1336,68 @@ fn reconcile_seed_map_entry(
 /// Decide whether the ladder must cold-wipe given the PRIOR recorded setup
 /// manifest (`stored`) and the CURRENT one (`current`, from `setup_manifest`).
 ///
-/// Wipe iff any line `stored` recorded is no longer present VERBATIM in
-/// `current`: a changed pin (same key, new url/sha/file) or a removed pin/patch
-/// is a stored line absent from `current` and wipes; a pure ADDITION is a
-/// `current` line with no counterpart in `stored` and is ignored, so a new leaf
-/// recipe's new source pin keeps the warmed ladder (re #543).
+/// Wipe iff any ENTRY (`pin`/`patch` line) `stored` recorded is no longer
+/// present VERBATIM in `current`: a changed pin (same key, new url/sha/file) or
+/// a removed pin/patch is a stored entry absent from `current` and wipes; a
+/// pure ADDITION is a `current` entry with no counterpart in `stored` and is
+/// ignored, so a new leaf recipe's new source pin keeps the warmed ladder
+/// (re #543).
 ///
-/// The epoch header (`current`'s first line) must match `stored`'s first line;
-/// a missing, empty, corrupt, or pre-v9 record has no matching header and wipes
-/// once. This also guards the vacuous case where `stored` has no lines (an
-/// empty `setup-ok`), for which the "any missing" test would otherwise be false.
+/// Two guards protect the asymmetric (subset) comparison from a corrupt
+/// baseline:
+///  - the epoch header (`current`'s first line) must match `stored`'s first
+///    line; a missing, empty, or pre-v9 (bare-sha, no header) record fails this
+///    and wipes once on cutover; and
+///  - `stored` must be COMPLETE (`manifest_is_complete`) — its `entries <N>`
+///    footer must match the entries present. Without this, a torn write that
+///    left a header-matching PREFIX (a strict subset of `current`) would be
+///    read as "only additions since then" and skip a required wipe. An
+///    incomplete record wipes (`setup_manifest`'s write is atomic, so our own
+///    writer never leaves one; this defends against a crash or a foreign
+///    writer). This also covers the vacuous empty `stored`.
 fn setup_needs_wipe(stored: &str, current: &str) -> bool {
     if stored.lines().next() != current.lines().next() {
         return true;
     }
+    if !manifest_is_complete(stored) {
+        return true;
+    }
     let current_lines: HashSet<&str> = current.lines().collect();
-    stored.lines().any(|line| !current_lines.contains(line))
+    stored
+        .lines()
+        .filter(|l| is_manifest_entry(l))
+        .any(|line| !current_lines.contains(line))
+}
+
+/// A pin/patch entry line — not the epoch header or the `entries` footer.
+fn is_manifest_entry(line: &str) -> bool {
+    line.starts_with("pin\t") || line.starts_with("patch\t")
+}
+
+/// A setup manifest is complete iff its trailing `entries <N>` footer equals
+/// the number of entry lines actually present. This is what lets
+/// `setup_needs_wipe` treat a torn/truncated baseline as a cache miss (a safe
+/// wipe) rather than a valid older subset (re #543 review).
+fn manifest_is_complete(manifest: &str) -> bool {
+    let present = manifest.lines().filter(|l| is_manifest_entry(l)).count();
+    manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("entries\t"))
+        .and_then(|n| n.parse::<usize>().ok())
+        .map(|declared| declared == present)
+        .unwrap_or(false)
+}
+
+/// Reject a manifest field that carries the format's separators (tab or
+/// newline), which would make an entry line ambiguous (re #543 review).
+fn manifest_field_ok(what: &str, value: &str) -> Result<(), String> {
+    if value.contains('\t') || value.contains('\n') {
+        return Err(format!(
+            "ladder setup manifest: {what} {value:?} contains a tab or newline (the manifest's \
+             field/line separators) — refusing an ambiguous cache key (re #543)"
+        ));
+    }
+    Ok(())
 }
 
 fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
@@ -1733,56 +1811,86 @@ mod tests {
     // exists for — but NEVER on a pure ADDITION, so a new leaf recipe's new
     // source pin keeps the warmed ladder instead of rebuilding from stage0
     // (re #543). `setup_needs_wipe` is that decision, tested directly.
+    // A COMPLETE manifest the way `setup_manifest` writes it: epoch header,
+    // sorted entries, and the `entries <N>` completeness footer.
+    fn test_manifest(entries: &[&str]) -> String {
+        let mut s = String::from("ladder-setup-v9\n");
+        for e in entries {
+            s.push_str(e);
+            s.push('\n');
+        }
+        s.push_str(&format!("entries\t{}\n", entries.len()));
+        s
+    }
+
     #[test]
     fn setup_needs_wipe_ignores_additions_but_catches_changes_and_removals() {
-        let v9 = "ladder-setup-v9\n";
-        let base = format!(
-            "{v9}pin\tbusybox-source\thttps://b/x.tar\tsha-b\tx.tar\n\
-             pin\tmake-source\thttps://m/m.tar\tsha-m\tm.tar\n\
-             patch\tfix.patch\tsha-p\n"
-        );
+        let busybox = "pin\tbusybox-source\thttps://b/x.tar\tsha-b\tx.tar";
+        let make = "pin\tmake-source\thttps://m/m.tar\tsha-m\tm.tar";
+        let patch = "patch\tfix.patch\tsha-p";
+        let base = test_manifest(&[busybox, make, patch]);
 
         // Identical: warm.
         assert!(!setup_needs_wipe(&base, &base));
 
         // Pure ADDITION of an unrelated pin (a new leaf recipe's source): warm.
-        // Order is irrelevant — setup_manifest sorts — so drop the new line
-        // anywhere; the stored lines are all still present.
-        let added = format!("{base}pin\tuutils-source\thttps://u/u.tar\tsha-u\tu.tar\n");
+        let uutils = "pin\tuutils-source\thttps://u/u.tar\tsha-u\tu.tar";
+        let added = test_manifest(&[busybox, make, patch, uutils]);
         assert!(!setup_needs_wipe(&base, &added));
         // And the reverse (a rebuild that had the extra pin, now removed via a
-        // revert) is a REMOVAL of a recorded line ⇒ wipe.
+        // revert) is a REMOVAL of a recorded entry ⇒ wipe.
         assert!(setup_needs_wipe(&added, &base));
 
         // A recorded pin whose sha256 CHANGED (an honest bump): wipe.
-        let bumped = base.replace("sha-m", "sha-m2");
+        let make2 = "pin\tmake-source\thttps://m/m.tar\tsha-m2\tm.tar";
+        let bumped = test_manifest(&[busybox, make2, patch]);
         assert!(setup_needs_wipe(&base, &bumped));
 
-        // A recorded pin REMOVED (still in every already-built rung or not): wipe.
-        let removed = format!(
-            "{v9}pin\tbusybox-source\thttps://b/x.tar\tsha-b\tx.tar\n\
-             patch\tfix.patch\tsha-p\n"
-        );
+        // A recorded pin REMOVED: wipe.
+        let removed = test_manifest(&[busybox, patch]);
         assert!(setup_needs_wipe(&base, &removed));
 
         // A recorded seed patch whose CONTENT changed: wipe; a NEW patch: warm.
-        let patch_bumped = base.replace("sha-p", "sha-p2");
+        let patch2 = "patch\tfix.patch\tsha-p2";
+        let patch_bumped = test_manifest(&[busybox, make, patch2]);
         assert!(setup_needs_wipe(&base, &patch_bumped));
-        let patch_added = format!("{base}patch\tnew.patch\tsha-n\n");
+        let new_patch = "patch\tnew.patch\tsha-n";
+        let patch_added = test_manifest(&[busybox, make, patch, new_patch]);
         assert!(!setup_needs_wipe(&base, &patch_added));
     }
 
     #[test]
-    fn setup_needs_wipe_forces_a_one_time_wipe_on_a_missing_or_pre_v9_record() {
-        let current = "ladder-setup-v9\npin\ta\tu\ts\tf\n";
-        // No prior record (empty string, as `fs::read_to_string` of an absent
-        // file never reaches here, but an empty/truncated file can): wipe.
-        assert!(setup_needs_wipe("", current));
+    fn setup_needs_wipe_forces_a_wipe_on_a_missing_incomplete_or_pre_v9_record() {
+        let current = test_manifest(&["pin\ta\tu\ts\tf"]);
+        // No prior record (empty/truncated file): wipe.
+        assert!(setup_needs_wipe("", &current));
         // A pre-v9 `setup-ok` was a bare hex sha with no header line: wipe once.
-        let v8_sha = "3b1f...deadbeef";
-        assert!(setup_needs_wipe(v8_sha, current));
+        assert!(setup_needs_wipe("3b1f...deadbeef", &current));
         // A corrupt record whose header does not match the epoch: wipe.
-        assert!(setup_needs_wipe("ladder-setup-v8\npin\ta\tu\ts\tf\n", current));
+        assert!(setup_needs_wipe(
+            "ladder-setup-v8\npin\ta\tu\ts\tf\nentries\t1\n",
+            &current
+        ));
+        // A TORN write: the header matches and the surviving entry is a subset
+        // of current, but the completeness footer is missing (a header-only or
+        // truncated PREFIX) ⇒ wipe, never mistaken for a valid older subset.
+        assert!(setup_needs_wipe("ladder-setup-v9\n", &current));
+        assert!(setup_needs_wipe("ladder-setup-v9\npin\ta\tu\ts\tf\n", &current));
+        // A footer whose count disagrees with the entries present ⇒ incomplete
+        // ⇒ wipe.
+        assert!(setup_needs_wipe(
+            "ladder-setup-v9\npin\ta\tu\ts\tf\nentries\t2\n",
+            &current
+        ));
+        // ...and the complete single-entry baseline is warm against itself.
+        assert!(!setup_needs_wipe(&current, &current));
+    }
+
+    #[test]
+    fn manifest_field_ok_rejects_the_format_separators() {
+        assert!(manifest_field_ok("pin url", "https://ok/x.tar").is_ok());
+        assert!(manifest_field_ok("pin key", "a\tb").is_err());
+        assert!(manifest_field_ok("patch name", "a\nb.patch").is_err());
     }
 
     #[test]
