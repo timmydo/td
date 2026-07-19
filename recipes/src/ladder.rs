@@ -85,6 +85,47 @@ pub fn link_bins(binutils_rung: &str) -> Step {
 /// output, not a host bash.
 pub const SH: &str = "{in:bash-mesboot}/bin/bash";
 
+/// The exact line the bootable-kernel rung's busybox `/init` prints on ttyS0 once
+/// the kernel has reached userspace, and that the host-side `qemu-boot` tool asserts
+/// on. SINGLE SOURCE OF TRUTH shared by the `/init` script, both initramfs shape
+/// checks, and the boot tool (`checks/qemu_boot.rs`, via `td_recipe::ladder`), so the
+/// producer, the gated shape check, and the boot oracle can never silently desync.
+pub const USERLAND_MARKER: &str = "TD-USERLAND-OK";
+
+/// Shell (for `sh -c`) asserting that `initramfs` is a COMPLETE, well-formed newc cpio
+/// carrying the bootable busybox userland. Shared by the `linux-x86-64` producer rung
+/// and the `linux-x86-64-test` rung so the two checks cannot drift.
+///
+/// Uses `busybox cpio -t` for a REAL newc parse whose listing is exact MEMBER NAMES —
+/// unlike the previous payload greps (`grep -a TRAILER` / `grep -a busybox`), which are
+/// satisfied by strings EMBEDDED IN THE BUSYBOX BINARY itself (it contains both
+/// "TRAILER!!!" and "busybox"), so an archive truncated after the marker but before its
+/// real trailer passed every assertion. What actually guarantees COMPLETENESS is
+/// requiring EVERY expected member name in the listing: any truncation that drops a
+/// member (busybox, /init, …) reds on the missing name. `cpio -t`'s exit code is a
+/// secondary signal — it reds on a mid-record `short read`, but can still exit 0 on an
+/// archive truncated cleanly at a header boundary (no TRAILER), which is exactly why the
+/// member-name assertions, not the exit code, carry the load. The `{marker}` payload
+/// grep additionally proves the /init script's CONTENT (not just its name) is packed —
+/// cpio -t validates structure, not bytes.
+///
+/// `busybox` is the absolute path to the busybox multi-call binary; `grep`/`od`/`wc`
+/// come from the mesboot0 userland, so callers keep `PATH = mesboot0_path()`.
+pub fn initramfs_cpio_shape_check(initramfs: &str, busybox: &str) -> String {
+    let marker = USERLAND_MARKER;
+    format!(
+        "sz=$(wc -c < '{initramfs}'); \
+         [ \"$sz\" -ge 65536 ] || {{ echo \"initramfs.cpio: implausibly small ($sz bytes) — the static busybox alone is ~1 MiB\" >&2; exit 1; }}; \
+         set -- $(od -An -tx1 -N 6 '{initramfs}'); \
+         [ \"$1$2$3$4$5$6\" = 303730373031 ] || {{ echo 'initramfs.cpio: missing the newc cpio magic 070701' >&2; exit 1; }}; \
+         list=$('{busybox}' cpio -t < '{initramfs}' 2>/dev/null) || {{ echo 'initramfs.cpio: busybox cpio -t could not parse the archive (truncated/corrupt newc stream — no valid TRAILER)' >&2; exit 1; }}; \
+         for m in init bin/busybox bin/sh dev/console; do \
+             printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || {{ echo \"initramfs.cpio: cpio member '$m' missing — the bootable userland is incomplete\" >&2; exit 1; }}; \
+         done; \
+         grep -q -a {marker} '{initramfs}' || {{ echo 'initramfs.cpio: /init marker not packed — the boot script the qemu tool asserts on is missing' >&2; exit 1; }}"
+    )
+}
+
 /// Unpack tarball input NAME into DEST (top-level dir stripped) with the
 /// ENGINE's own readers — no unpacker packages in the sandbox.
 pub fn unpack_into(input: &str, dest: &str) -> Vec<Step> {

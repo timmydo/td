@@ -1,4 +1,4 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, SH};
+use crate::ladder::{initramfs_cpio_shape_check, mesboot0_inputs, mesboot0_path, SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // linux-x86-64-test: behavioral validation of the source-built kernel (#529).
@@ -22,9 +22,18 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      ships no dd) prove the boot-setup header; and the gzip magic `1f 8b 08`
 //      appears somewhere in the file, proving the CONFIG_KERNEL_GZIP payload was
 //      actually compressed and embedded — not just the raw ELF wrapped in a stub.
+//   5. initramfs.cpio is a real, COMPLETE newc cpio carrying the whole bootable
+//      userland — via the shared `initramfs_cpio_shape_check` helper (ladder.rs)
+//      that the producer rung runs too, so the two cannot drift. It parses the
+//      archive with busybox `cpio -t` (a real newc walk that reds on a truncated/
+//      corrupt stream) and asserts init/bin/busybox/bin/sh/dev/console are all
+//      present plus the `TD-USERLAND-OK` /init marker. The behavioural proof that it
+//      actually boots is the host-side `td-recipe-eval qemu-boot linux-x86-64` tool
+//      (host qemu), which cannot run in this host-free BuildOnly rung.
 pub fn recipe() -> Recipe {
     let vmlinux = "{in:linux-x86-64}/vmlinux";
     let bzimage = "{in:linux-x86-64}/bzImage";
+    let initramfs = "{in:linux-x86-64}/initramfs.cpio";
     let readelf = "{in:binutils-x86-64-native}/bin/readelf";
     let mut steps = Vec::new();
 
@@ -89,13 +98,18 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &mesboot0_path()),
     );
+    let initramfs_check =
+        initramfs_cpio_shape_check(initramfs, "{in:busybox-x86-64}/bin/busybox");
+    steps.push(
+        Step::run("{root}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()),
+    );
 
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Linux 7.1.4, source-built by the native /td/store x86_64 toolchain — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner, and bzImage carries the x86 boot-setup header (0xAA55 + HdrS)\n".into(),
+        content: "PASS: Linux 7.1.4, source-built by the native /td/store x86_64 toolchain — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner, bzImage carries the x86 boot-setup header (0xAA55 + HdrS), and initramfs.cpio is a newc cpio carrying the static busybox userland\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -104,12 +118,12 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("linux-x86-64-test", "1.0")
-        .native_inputs(&["linux-x86-64", "binutils-x86-64-native"])
+        .native_inputs(&["linux-x86-64", "binutils-x86-64-native", "busybox-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
         .checks(vec![RecipeCheck::daily(
             r#"
-echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux + bzImage, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner plus a bzImage carrying the x86 boot-setup header"
+echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux + bzImage + busybox initramfs, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner, a bzImage carrying the x86 boot-setup header, and a newc initramfs.cpio carrying the static busybox userland"
 : "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run linux-x86-64-test daily 1
 "#,

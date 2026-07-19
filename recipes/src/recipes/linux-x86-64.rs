@@ -1,5 +1,6 @@
 use crate::ladder::{
-    mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH,
+    initramfs_cpio_shape_check, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into,
+    unpack_keep_top, SH, USERLAND_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -8,15 +9,29 @@ use crate::types::{Recipe, Step};
 // td's OWN bootstrapped native toolchain — gcc-x86-64-native (GCC 14.3.0) as
 // `CC`, binutils-x86-64-native as `LD/AR/NM/OBJCOPY`, driven by make-x86-64 —
 // proving the GCC/glibc ladder produces a real, modern-kernel-capable compiler.
-// Two artifacts land in {out}: the uncompressed `vmlinux` ELF and the compressed,
-// bootable `bzImage`. bzImage's self-extracting payload is gzip-compressed
+// Three artifacts land in {out}: the uncompressed `vmlinux` ELF, the compressed,
+// bootable `bzImage`, and a tiny `initramfs.cpio` userland (see BOOTABLE below).
+// bzImage's self-extracting payload is gzip-compressed
 // (kbuild's `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz`); td ships no
 // gzip executable — the builder only DEcompresses, in-process — so the compressor
 // is the busybox gzip applet's `bin/gzip` link, which accepts the kernel's exact
 // `-n -f -9` directly (busybox gzip's options include `-n` and `-1..-9`).
 // CONFIG_KERNEL_GZIP is pinned so the compressor is always gzip (never xz/zstd,
-// which would need a different tool). A qemu boot of the bzImage is a separate
-// later rung (re #529, re #469).
+// which would need a different tool).
+//
+// BOOTABLE (re #529): the config also turns on the 8250 serial console
+// (SERIAL_8250 + SERIAL_8250_CONSOLE, PRINTK/TTY), ELF + #! exec (BINFMT_ELF,
+// BINFMT_SCRIPT), and initramfs load (BLK_DEV_INITRD), and the recipe packs a
+// tiny EXTERNAL initramfs (gen_init_cpio) holding the td-built STATIC busybox
+// plus a /init that prints a marker on ttyS0 and reboots. A THIRD {out} artifact
+// (initramfs.cpio) lands alongside vmlinux/bzImage. The behavioural proof that
+// this source-built kernel boots to a real userland is the HOST-SIDE tool
+// `td-recipe-eval qemu-boot linux-x86-64` (checks/qemu_boot.rs): it boots the
+// bzImage + initramfs under host qemu (TCG) and asserts the userland marker
+// reaches the console. It is host-side (not a daily gate check) because a qemu
+// boot needs host qemu, which the gate's host-free sandbox hides — see the note
+// at the Recipe builder below. In-sandbox CI coverage is the artifact shape
+// checks (this recipe's producer rung + linux-x86-64-test).
 //
 // A modern (>= 4.18) kernel needs host tools the 4.14 rung dodged; each is now a
 // td recipe (AGENTS.md directive 3, pre-authorized as part of this migration):
@@ -32,10 +47,12 @@ use crate::types::{Recipe, Step};
 //     the bundled static zlib).
 //   - bc (busybox-x86-64 applet): timeconst.h, as in the 4.14 rung.
 // Avoided by config (audited): perl (C recordmcount; ftrace off), openssl (no
-// module signing / trusted keys), pahole (BTF off), python/cpio/rsync (no
-// initramfs, no IKHEADERS, no modules). The ONE compressor used is gzip (busybox
-// applet) for the bzImage payload — CONFIG_KERNEL_GZIP pinned; xz/lzma/zstd and
-// their host tools stay off.
+// module signing / trusted keys), pahole (BTF off), python/cpio/rsync. The
+// initramfs below is packed by the in-tree gen_init_cpio HOSTCC hostprog (not the
+// external `cpio` tool), INITRAMFS_SOURCE stays "", and IKHEADERS/modules stay
+// off — so none of python, the `cpio` tool, or rsync is pulled in. The ONE
+// compressor used is gzip (busybox applet) for the bzImage payload —
+// CONFIG_KERNEL_GZIP pinned; xz/lzma/zstd and their host tools stay off.
 //
 // HOSTCC (the Kbuild host programs fixdep/conf/objtool/modpost — ordinary
 // userspace) is a STATIC wrapper over the native gcc against the x86_64 glibc
@@ -62,7 +79,15 @@ pub fn recipe() -> Recipe {
         mesboot0_path()
     );
 
-    let mut steps = unpack_into("linux-kernel-source", "{src}");
+    // A rung's own source lands in TD_INPUT_MAP under the LOCAL name `{name}-source`
+    // (`linux-x86-64-source`), synthesized from the recipe NAME — NOT under its
+    // `sourceInput` PIN KEY. When the two differ (this rung renames the shared
+    // `linux-kernel-source` pin locally, exactly as gcc-x86-64-native renames
+    // `gcc-14-source` / make-441 renames `make-x86-64-source`), steps MUST reference
+    // the local `{in:linux-x86-64-source}`; `{in:linux-kernel-source}` is not a map key
+    // and expands to nothing ("no input `linux-kernel-source' in TD_INPUT_MAP"). The
+    // pin key stays on `.source_input(...)` below, which is what gates/fetches the bytes.
+    let mut steps = unpack_into("linux-x86-64-source", "{src}");
 
     // Host sysroot for HOSTCC only (the Kbuild host programs are ordinary
     // userspace): the x86_64 glibc 2.41 headers + kernel UAPI headers overlaid
@@ -82,11 +107,38 @@ pub fn recipe() -> Recipe {
         "/td/store/glibc-2.41-x86_64",
     ));
 
-    // bc (busybox applet) for timeconst.h, linked into the {tools} farm that
-    // mesboot0_path() lays on PATH, so Kbuild's parse-time `bc -q timeconst.bc`
-    // resolves it (the top-level Kbuild in 7.x). BusyBox dispatches on argv[0].
+    // BusyBox applets the kernel's host build execs that neither mesboot0 nor the
+    // native toolchain provides, linked by name into the {tools} farm that
+    // mesboot0_path() lays on PATH (BusyBox dispatches on argv[0]). {tools} precedes
+    // coreutils-mesboot0 on PATH, so ONLY names ABSENT from coreutils-mesboot0 are
+    // farmed here — none of these shadow a mesboot0 tool:
+    //   - bc:     timeconst.h parse-time `bc -q timeconst.bc` (as in the 4.14 rung).
+    //   - xargs:  cmd_ar_builtin (scripts/Makefile.build) builds EVERY built-in.a via
+    //             `printf … | xargs $(AR) …`, and cmd_ld_multi links objtool — the
+    //             core of `make vmlinux`; xargs is findutils, absent from mesboot0.
+    //   - uname:  `uname -m` in scripts/subarch.include (every make) + objtool's
+    //             tools/scripts/Makefile.arch; coreutils-mesboot0 omits uname.
+    //   - mktemp: usr/gen_initramfs.sh runs `mktemp` under `set -e` for the default
+    //             (`-d`, empty INITRAMFS_SOURCE) embedded-initramfs list — a hard fail
+    //             without it; coreutils-mesboot0 omits mktemp.
+    //   - dd:     arch/x86/boot/Makefile's cmd_image pads setup.bin with `dd` when
+    //             assembling bzImage; coreutils-mesboot0 omits dd.
+    //   - find:   usr/gen_initramfs.sh print_mtime. Non-fatal for our empty source (it
+    //             sits in a `| sort | head` pipeline → blank mtime), and BusyBox find
+    //             lacks -printf, but farm it so the probe execs rather than erroring;
+    //             the -printf dir_filelist path is only reached by a DIRECTORY
+    //             INITRAMFS_SOURCE, which this rung does not use.
+    // Only `bc` is feature-probed below (a POSIX-only bc silently mis-builds
+    // timeconst.h); the rest fail loudly as "command not found" if the applet is gone.
     steps.push(Step::ToolFarm {
-        links: vec![("bc".into(), bb.into())],
+        links: vec![
+            ("bc".into(), bb.into()),
+            ("xargs".into(), bb.into()),
+            ("uname".into(), bb.into()),
+            ("mktemp".into(), bb.into()),
+            ("dd".into(), bb.into()),
+            ("find".into(), bb.into()),
+        ],
     });
     // Fail FAST if that bc cannot do what timeconst.h needs (read()/arithmetic/
     // print/halt); a missing/POSIX-only bc yields an EMPTY timeconst.h and a
@@ -271,6 +323,11 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_KERNEL_LZO[ =]/d; \
                   /^#? *CONFIG_KERNEL_LZ4[ =]/d; \
                   /^#? *CONFIG_KERNEL_ZSTD[ =]/d; \
+                  /^#? *CONFIG_BINFMT_ELF[ =]/d; \
+                  /^#? *CONFIG_BINFMT_SCRIPT[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV_INITRD[ =]/d; \
+                  /^#? *CONFIG_SERIAL_8250[ =]/d; \
+                  /^#? *CONFIG_SERIAL_8250_CONSOLE[ =]/d; \
                   /^#? *CONFIG_INITRAMFS_SOURCE[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -284,6 +341,11 @@ pub fn recipe() -> Recipe {
                    '# CONFIG_GCC_PLUGINS is not set' \
                    '# CONFIG_IKHEADERS is not set' \
                    'CONFIG_KERNEL_GZIP=y' \
+                   'CONFIG_BINFMT_ELF=y' \
+                   'CONFIG_BINFMT_SCRIPT=y' \
+                   'CONFIG_BLK_DEV_INITRD=y' \
+                   'CONFIG_SERIAL_8250=y' \
+                   'CONFIG_SERIAL_8250_CONSOLE=y' \
                    'CONFIG_INITRAMFS_SOURCE=\"\"' >> .config",
             ],
         )
@@ -305,6 +367,12 @@ pub fn recipe() -> Recipe {
                 "-c",
                 "grep -q '^CONFIG_UNWINDER_FRAME_POINTER=y' .config || { echo 'frame-pointer unwinder not selected' >&2; exit 1; }; \
                  grep -q '^CONFIG_KERNEL_GZIP=y' .config || { echo 'gzip kernel compression not selected (bzImage would need another compressor)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BINFMT_ELF=y' .config || { echo 'BINFMT_ELF off — the kernel could not exec the busybox userland' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BINFMT_SCRIPT=y' .config || { echo 'BINFMT_SCRIPT off — the kernel could not exec the #! /init script' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLK_DEV_INITRD=y' .config || { echo 'BLK_DEV_INITRD off — the kernel could not load the initramfs' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SERIAL_8250_CONSOLE=y' .config || { echo '8250 serial console off — no ttyS0 boot output for the qemu check' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
+                 grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi",
             ],
@@ -336,7 +404,67 @@ pub fn recipe() -> Recipe {
         .env("MAKELEVEL", ""),
     );
 
-    // Land the uncompressed ELF + its symbol map + the bootable bzImage.
+    // ---- Bootable userland: a static-busybox initramfs (re #529) ----
+    // The kernel is now serial-console + initramfs capable (the config deltas
+    // above add the 8250 console, BINFMT_ELF/SCRIPT, and BLK_DEV_INITRD). Pack a
+    // tiny initramfs whose /init prints a marker on ttyS0 and reboots, so the
+    // sibling qemu boot check can prove the td-source-built kernel reaches a real
+    // userland. The initramfs is an EXTERNAL artifact (qemu -initrd), keeping
+    // bzImage a pure kernel — INITRAMFS_SOURCE stays "".
+    //
+    // gen_init_cpio (usr/gen_init_cpio, a HOSTCC hostprog) packs the newc cpio
+    // from a spec WITHOUT needing mknod privilege: the `nod /dev/console` entry
+    // is written straight into the archive, which the unprivileged host-free
+    // sandbox could not create on a real filesystem. busybox is the td-built
+    // STATIC busybox (CONFIG_STATIC=y), so the initramfs is self-contained — no
+    // glibc closure, no host bytes.
+
+    // The /init the kernel execs (rdinit=/init): a #! script (BINFMT_SCRIPT) that
+    // prints the marker the boot check greps for, then `reboot -f` so qemu
+    // (-no-reboot) exits cleanly. echo is a busybox-sh builtin, so the marker
+    // prints even if the reboot applet were unavailable (the boot check's
+    // wall-clock ceiling then bounds the run).
+    steps.push(Step::WriteFile {
+        path: "{root}/initramfs/init".into(),
+        content: format!("#!/bin/sh\necho {USERLAND_MARKER}\nexec /bin/busybox reboot -f\n"),
+        exec: true,
+    });
+    // gen_init_cpio spec: /dev/console for init's stdio, the static busybox, a
+    // /bin/sh -> busybox multi-call symlink for the #! interpreter, and /init.
+    steps.push(Step::WriteFile {
+        path: "{root}/initramfs/spec".into(),
+        content: "dir /dev 0755 0 0\n\
+                  nod /dev/console 0600 0 0 c 5 1\n\
+                  dir /bin 0755 0 0\n\
+                  file /bin/busybox {in:busybox-x86-64}/bin/busybox 0755 0 0\n\
+                  slink /bin/sh /bin/busybox 0777 0 0\n\
+                  file /init {root}/initramfs/init 0755 0 0\n"
+            .into(),
+        exec: false,
+    });
+    // Build gen_init_cpio explicitly (idempotent — the bzImage run already built
+    // it to pack the empty INITRAMFS_SOURCE — but don't rely on that ordering).
+    steps.push(mk(&["usr/gen_init_cpio"]));
+    // Pack the initramfs; gen_init_cpio writes the newc cpio to stdout. `-t 1`
+    // pins a fixed mtime (1s past the epoch) on EVERY entry: without it,
+    // gen_init_cpio stamps each `file` with its source's stat mtime — and /init is
+    // written fresh by this build, so its mtime would be the wall-clock build time,
+    // making initramfs.cpio (a content-addressed /td/store artifact) differ across
+    // otherwise-identical builds. A fixed timestamp keeps the output reproducible.
+    steps.push(
+        Step::run(
+            "{src}",
+            &[
+                SH,
+                "-c",
+                "'{src}/usr/gen_init_cpio' -t 1 {root}/initramfs/spec > {root}/initramfs.cpio",
+            ],
+        )
+        .env("PATH", &mesboot0_path()),
+    );
+
+    // Land the uncompressed ELF + its symbol map + the bootable bzImage + the
+    // external busybox initramfs.
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
@@ -345,11 +473,16 @@ pub fn recipe() -> Recipe {
             "{src}/vmlinux".into(),
             "{src}/System.map".into(),
             "{src}/arch/x86/boot/bzImage".into(),
+            "{root}/initramfs.cpio".into(),
         ],
         dest: "{out}".into(),
     });
     steps.push(Step::Require {
-        paths: vec!["{out}/vmlinux".into(), "{out}/bzImage".into()],
+        paths: vec![
+            "{out}/vmlinux".into(),
+            "{out}/bzImage".into(),
+            "{out}/initramfs.cpio".into(),
+        ],
         exec: false,
     });
     // [native-arch] vmlinux must be an ELF64 x86-64 linked executable (EXEC, not a
@@ -393,6 +526,20 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &mesboot0_path()),
     );
+    // [initramfs] the packed userland must be a real, COMPLETE newc cpio carrying
+    // the whole bootable userland — not merely a well-formed header. The shared
+    // `initramfs_cpio_shape_check` helper (recipes/src/ladder.rs) parses the archive
+    // with busybox `cpio -t` — a real newc walk that reds on a truncated/corrupt
+    // stream and yields the exact member names — then asserts init/bin/busybox/
+    // bin/sh/dev/console are all present and the `TD-USERLAND-OK` /init marker is
+    // packed. The producer rung and the fast `linux-x86-64-test` tier run the SAME
+    // check so they cannot drift. The sibling qemu boot tool is the behavioural proof
+    // (it boots this cpio); this is the fast producer-rung shape check.
+    let initramfs_check =
+        initramfs_cpio_shape_check("{out}/initramfs.cpio", "{in:busybox-x86-64}/bin/busybox");
+    steps.push(
+        Step::run("{out}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()),
+    );
 
     Recipe::mesboot("linux-x86-64", "7.1.4")
         .source_input("linux-kernel-source")
@@ -409,4 +556,15 @@ pub fn recipe() -> Recipe {
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
+    // No behavioural boot check is registered here: a qemu boot needs HOST qemu,
+    // which the daily gate's host-free `pivot_root` sandbox deliberately hides (the
+    // sandbox exposes only td-built tools by absolute /td/store path — that is why
+    // the RustToolchain check can run the td-BUILT rustc, but a host binary like
+    // qemu is unreachable there). Wiring the boot as a sandboxed daily check would
+    // make it fail on `find_qemu` on every real runner — a permanently-red, green-
+    // washed check. The boot is instead a HOST-SIDE tool, `td-recipe-eval
+    // qemu-boot linux-x86-64` (checks/qemu_boot.rs), run OUTSIDE the sandbox by an
+    // operator or developer. Automated in-sandbox coverage is the shape checks
+    // above (producer rung) and the linux-x86-64-test BuildOnly daily check, which
+    // build the bzImage + initramfs and assert they are well-formed.
 }

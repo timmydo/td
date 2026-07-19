@@ -29,7 +29,15 @@ pub fn recipe() -> Recipe {
     let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let nbin = "{in:binutils-x86-64-native}/bin";
-    let path = format!("{nbin}:{}", mesboot0_path());
+    // make-x86-64 MUST be on PATH, not merely invoked by absolute path: flex's
+    // Makefiles recurse via `$(MAKE)` (Makefile `all-recursive`), and autoconf's
+    // AC_PROG_MAKE_SET probe at configure time runs a bare `make`. With no `make`
+    // on PATH the probe fails, autoconf bakes `MAKE = make` into the generated
+    // Makefiles, and `all-recursive` then execs a bare `make` that the host-free
+    // sandbox cannot resolve ("make: command not found", Makefile:533). The kernel
+    // rung already puts make-x86-64 on PATH for the same reason; flex did not,
+    // which broke its (only ever cold) build. re #529.
+    let path = format!("{nbin}:{{in:make-x86-64}}/bin:{}", mesboot0_path());
     // glibc 2.41 headers + the x86_64 kernel UAPI headers (flex is pure C; the
     // libstdc++ #include_next hazard that bars C_INCLUDE_PATH for g++ does not
     // apply). Mirrors make-x86-64.
