@@ -14,8 +14,9 @@
 //! silently passing — the daily runner is required to provide it.
 use std::env;
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -110,9 +111,17 @@ fn find_qemu() -> Result<String, String> {
 /// ceiling or the guest's own `reboot -f`. Returns the captured console (or, if
 /// the console is empty, qemu's own diagnostics so a spawn/args failure surfaces).
 fn boot(qemu: &str, bzimage: &Path, initramfs: &Path) -> Result<String, String> {
-    let pid = std::process::id();
-    let console_path = env::temp_dir().join(format!("td-qemu-console-{pid}.log"));
-    let diag_path = env::temp_dir().join(format!("td-qemu-diag-{pid}.log"));
+    // Per-invocation scratch dir, unique even under concurrent boots in one
+    // process (pid + a process-wide counter — pid alone collides between two
+    // simultaneous boots in the same process), and removed on EVERY exit path
+    // (success or an early `?`) by the Scratch drop guard.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = env::temp_dir().join(format!("td-qemu-{}-{seq}", std::process::id()));
+    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let _scratch = Scratch { dir: dir.clone() };
+    let console_path = dir.join("console.log");
+    let diag_path = dir.join("diag.log");
     let diag = File::create(&diag_path).map_err(|e| format!("create {}: {e}", diag_path.display()))?;
     let diag_err = diag.try_clone().map_err(|e| format!("clone diag fd: {e}"))?;
 
@@ -185,9 +194,22 @@ fn boot(qemu: &str, bzimage: &Path, initramfs: &Path) -> Result<String, String> 
             }
         }
     }
-    let _ = fs::remove_file(&console_path);
-    let _ = fs::remove_file(&diag_path);
+    // console_path/diag_path live under `dir`; the Scratch guard removes the whole
+    // directory on return (here and on every early `?` above).
     Ok(console)
+}
+
+/// Removes its scratch directory on drop, so `boot` leaves no temp files on ANY
+/// return path — the happy path, an early `?` (e.g. a failed `spawn`), or a
+/// mid-loop error return.
+struct Scratch {
+    dir: PathBuf,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// Last `n` lines, for error context.
