@@ -35,7 +35,18 @@ use crate::types::{Recipe, Step};
 // node still covers init's own stdio before that first sysinit line runs. The
 // output also EXPORTS the in-tree `gen_init_cpio` packer so the downstream
 // `system-x86-64` distro recipe can pack its own root-owned initramfs from the
-// same td-built tool. The behavioural proof that
+// same td-built tool.
+//
+// READ-ONLY ROOT (re #549): the config also turns on what the two-stage boot
+// needs to pivot from the initramfs onto a disk-backed, read-only erofs
+// `/td/store` root — the block layer (BLOCK), the PCI bus and virtio-over-PCI
+// transport the `-M pc` qemu machine exposes (PCI, VIRTIO, VIRTIO_PCI), the
+// virtio block device the erofs image rides (VIRTIO_BLK → /dev/vda), the erofs
+// filesystem itself (EROFS_FS, uncompressed — matching the `td-builder
+// mkfs-erofs` writer, #548), and OVERLAY_FS for the tmpfs overlays the read-only
+// root needs over its writable paths. BLK_DEV_INITRD stays on: the kernel still
+// boots via a minimal initramfs that then mounts and switch_roots into the erofs
+// disk (the switch_root itself is #550). The behavioural proof that
 // this source-built kernel boots to a real userland is the HOST-SIDE tool
 // `td-recipe-eval qemu-boot linux-x86-64` (checks/qemu_boot.rs): it boots the
 // bzImage + initramfs under host qemu (TCG) and asserts the userland marker
@@ -343,7 +354,14 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_PROC_FS[ =]/d; \
                   /^#? *CONFIG_SYSFS[ =]/d; \
                   /^#? *CONFIG_DEVTMPFS[ =]/d; \
-                  /^#? *CONFIG_TMPFS[ =]/d' .config && \
+                  /^#? *CONFIG_TMPFS[ =]/d; \
+                  /^#? *CONFIG_BLOCK[ =]/d; \
+                  /^#? *CONFIG_PCI[ =]/d; \
+                  /^#? *CONFIG_VIRTIO[ =]/d; \
+                  /^#? *CONFIG_VIRTIO_PCI[ =]/d; \
+                  /^#? *CONFIG_VIRTIO_BLK[ =]/d; \
+                  /^#? *CONFIG_EROFS_FS[ =]/d; \
+                  /^#? *CONFIG_OVERLAY_FS[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
                    '# CONFIG_UNWINDER_ORC is not set' \
@@ -365,7 +383,14 @@ pub fn recipe() -> Recipe {
                    'CONFIG_PROC_FS=y' \
                    'CONFIG_SYSFS=y' \
                    'CONFIG_DEVTMPFS=y' \
-                   'CONFIG_TMPFS=y' >> .config",
+                   'CONFIG_TMPFS=y' \
+                   'CONFIG_BLOCK=y' \
+                   'CONFIG_PCI=y' \
+                   'CONFIG_VIRTIO=y' \
+                   'CONFIG_VIRTIO_PCI=y' \
+                   'CONFIG_VIRTIO_BLK=y' \
+                   'CONFIG_EROFS_FS=y' \
+                   'CONFIG_OVERLAY_FS=y' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -394,6 +419,12 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off - a usable userland (ps/mount/init) needs /proc' >&2; exit 1; }; \
                  grep -q '^CONFIG_SYSFS=y' .config || { echo 'SYSFS off - a usable userland needs /sys' >&2; exit 1; }; \
                  grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off - a usable userland needs a writable /tmp,/run' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLOCK=y' .config || { echo 'BLOCK off - no block layer for the virtio-blk erofs disk' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PCI=y' .config || { echo 'PCI off - virtio-blk-pci (the -M pc transport) needs the PCI bus' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VIRTIO_PCI=y' .config || { echo 'VIRTIO_PCI off - no virtio transport on the -M pc PCI bus' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VIRTIO_BLK=y' .config || { echo 'VIRTIO_BLK off - the erofs disk (/dev/vda) would not appear' >&2; exit 1; }; \
+                 grep -q '^CONFIG_EROFS_FS=y' .config || { echo 'EROFS_FS off - the read-only erofs root could not be mounted' >&2; exit 1; }; \
+                 grep -q '^CONFIG_OVERLAY_FS=y' .config || { echo 'OVERLAY_FS off - no tmpfs overlay for writable paths over the read-only root' >&2; exit 1; }; \
                  grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
                  grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
