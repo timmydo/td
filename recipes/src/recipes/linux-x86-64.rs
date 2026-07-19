@@ -24,7 +24,15 @@ use crate::types::{Recipe, Step};
 // BINFMT_SCRIPT), and initramfs load (BLK_DEV_INITRD), and the recipe packs a
 // tiny EXTERNAL initramfs (gen_init_cpio) holding the td-built STATIC busybox
 // plus a /init that prints a marker on ttyS0 and reboots. A THIRD {out} artifact
-// (initramfs.cpio) lands alongside vmlinux/bzImage. The behavioural proof that
+// (initramfs.cpio) lands alongside vmlinux/bzImage.
+//
+// USABLE (re #541): the config also turns on the pseudo-filesystems a real
+// userland needs — PROC_FS (/proc), SYSFS (/sys), DEVTMPFS + DEVTMPFS_MOUNT (an
+// auto-populated /dev the kernel mounts BEFORE init, so /dev/console exists for
+// init's stdio without a hand-packed device node), and TMPFS (/tmp,/run). The
+// output also EXPORTS the in-tree `gen_init_cpio` packer so the downstream
+// `system-x86-64` distro recipe can pack its own root-owned initramfs from the
+// same td-built tool. The behavioural proof that
 // this source-built kernel boots to a real userland is the HOST-SIDE tool
 // `td-recipe-eval qemu-boot linux-x86-64` (checks/qemu_boot.rs): it boots the
 // bzImage + initramfs under host qemu (TCG) and asserts the userland marker
@@ -328,7 +336,12 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_BLK_DEV_INITRD[ =]/d; \
                   /^#? *CONFIG_SERIAL_8250[ =]/d; \
                   /^#? *CONFIG_SERIAL_8250_CONSOLE[ =]/d; \
-                  /^#? *CONFIG_INITRAMFS_SOURCE[ =]/d' .config && \
+                  /^#? *CONFIG_INITRAMFS_SOURCE[ =]/d; \
+                  /^#? *CONFIG_PROC_FS[ =]/d; \
+                  /^#? *CONFIG_SYSFS[ =]/d; \
+                  /^#? *CONFIG_DEVTMPFS[ =]/d; \
+                  /^#? *CONFIG_DEVTMPFS_MOUNT[ =]/d; \
+                  /^#? *CONFIG_TMPFS[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
                    '# CONFIG_UNWINDER_ORC is not set' \
@@ -346,7 +359,12 @@ pub fn recipe() -> Recipe {
                    'CONFIG_BLK_DEV_INITRD=y' \
                    'CONFIG_SERIAL_8250=y' \
                    'CONFIG_SERIAL_8250_CONSOLE=y' \
-                   'CONFIG_INITRAMFS_SOURCE=\"\"' >> .config",
+                   'CONFIG_INITRAMFS_SOURCE=\"\"' \
+                   'CONFIG_PROC_FS=y' \
+                   'CONFIG_SYSFS=y' \
+                   'CONFIG_DEVTMPFS=y' \
+                   'CONFIG_DEVTMPFS_MOUNT=y' \
+                   'CONFIG_TMPFS=y' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -371,6 +389,11 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_BINFMT_SCRIPT=y' .config || { echo 'BINFMT_SCRIPT off — the kernel could not exec the #! /init script' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_INITRD=y' .config || { echo 'BLK_DEV_INITRD off — the kernel could not load the initramfs' >&2; exit 1; }; \
                  grep -q '^CONFIG_SERIAL_8250_CONSOLE=y' .config || { echo '8250 serial console off — no ttyS0 boot output for the qemu check' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DEVTMPFS=y' .config || { echo 'DEVTMPFS off — no auto-populated /dev (init would have no console device)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DEVTMPFS_MOUNT=y' .config || { echo 'DEVTMPFS_MOUNT off — the kernel would not mount /dev before init, so /dev/console is absent' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off — a usable userland (ps/mount/init) needs /proc' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SYSFS=y' .config || { echo 'SYSFS off — a usable userland needs /sys' >&2; exit 1; }; \
+                 grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off — a usable userland needs a writable /tmp,/run' >&2; exit 1; }; \
                  grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
                  grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
@@ -474,6 +497,13 @@ pub fn recipe() -> Recipe {
             "{src}/System.map".into(),
             "{src}/arch/x86/boot/bzImage".into(),
             "{root}/initramfs.cpio".into(),
+            // Export the in-tree cpio packer so a downstream distro recipe
+            // (system-x86-64) can pack its OWN root-owned initramfs — with the
+            // unprivileged `nod` device-node trick and per-entry uid/gid 0 — from
+            // the SAME td-built gen_init_cpio this kernel already built and ran.
+            // Rebuilding it in the distro recipe would need the kernel source; this
+            // 3-line export avoids that.
+            "{src}/usr/gen_init_cpio".into(),
         ],
         dest: "{out}".into(),
     });
@@ -484,6 +514,10 @@ pub fn recipe() -> Recipe {
             "{out}/initramfs.cpio".into(),
         ],
         exec: false,
+    });
+    steps.push(Step::Require {
+        paths: vec!["{out}/gen_init_cpio".into()],
+        exec: true,
     });
     // [native-arch] vmlinux must be an ELF64 x86-64 linked executable (EXEC, not a
     // stray relocatable .o) — caught at the producer rung, parity with
