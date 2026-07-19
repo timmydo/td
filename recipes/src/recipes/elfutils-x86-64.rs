@@ -33,7 +33,13 @@ pub fn recipe() -> Recipe {
     let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let nbin = "{in:binutils-x86-64-native}/bin";
-    let path = format!("{nbin}:{}", mesboot0_path());
+    // make-x86-64 MUST be on PATH (not merely invoked by absolute path): autoconf's
+    // config.status bootstraps automake's dependency-tracking `.deps` fragments by
+    // running a bare `make`, and elfutils' Makefiles recurse via `$(MAKE)`. With no
+    // `make` on PATH the dep-tracking bootstrap dies ("Something went wrong
+    // bootstrapping makefile fragments ... consider re-running with MAKE=gmake").
+    // Mirrors the flex-x86-64 / kernel rungs. re #529.
+    let path = format!("{nbin}:{{in:make-x86-64}}/bin:{}", mesboot0_path());
     let cip = format!("{xglibc}/include:{{root}}/kh");
     // Staging prefix for the static zlib built below; elfutils links against it.
     let zstage = "{root}/zstage";
@@ -115,6 +121,17 @@ pub fn recipe() -> Recipe {
 
     // 2) Configure elfutils for a minimal libelf-only build (no debuginfod, no
     //    compression backends, no NLS, no demangler → no libstdc++/pkg-config).
+    //
+    //    ac_cv_tls=yes: elfutils' `__thread support` probe deliberately links its
+    //    conftest with `$dso_LDFLAGS` ("the same flags we use for our DSOs" —
+    //    -shared -Wl,-z,defs). Our `cc-elf` wrapper hardcodes -static (needed so
+    //    elfutils' AC_RUN_IFELSE probes produce loader-free static binaries the
+    //    host-free sandbox can execute), and -static + -shared is a contradictory
+    //    link that fails, so the probe reports "no" and configure aborts with
+    //    "__thread support required" — even though GCC 14 + glibc 2.41 fully
+    //    support TLS (libelf's own elf_errno IS __thread and links + runs fine).
+    //    Assert the genuinely-true capability via autoconf's cache override rather
+    //    than drop -static (which would break the run-probes). re #529.
     steps.push(
         Step::run(
             "{src}",
@@ -124,6 +141,10 @@ pub fn recipe() -> Recipe {
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
                 "--prefix=/td/store/elfutils-0.192-x86-64",
+                // A one-shot static-archive build has no use for automake's
+                // per-object .deps tracking, and its config.status bootstrap is the
+                // step that dies without make on PATH; disable it (as flex does).
+                "--disable-dependency-tracking",
                 "--disable-debuginfod",
                 "--disable-libdebuginfod",
                 "--without-bzlib",
@@ -137,7 +158,8 @@ pub fn recipe() -> Recipe {
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
         .env("CC", "{root}/wb/cc-elf")
-        .env("C_INCLUDE_PATH", &cip),
+        .env("C_INCLUDE_PATH", &cip)
+        .env("ac_cv_tls", "yes"),
     );
     // 3) Build ONLY libeu.a then libelf.a (libelf link-depends on libeu; build in
     //    that order). CFLAGS='-O2 -Wno-error' keeps -O2 while demoting elfutils'
