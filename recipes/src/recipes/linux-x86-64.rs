@@ -1,6 +1,6 @@
 use crate::ladder::{
     initramfs_cpio_shape_check, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into,
-    unpack_keep_top, SH, USERLAND_MARKER,
+    unpack_keep_top, EROFS_MARKER, EROFS_PROBE_CONTENT, EROFS_PROBE_SENTINEL, SH, USERLAND_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -35,7 +35,18 @@ use crate::types::{Recipe, Step};
 // node still covers init's own stdio before that first sysinit line runs. The
 // output also EXPORTS the in-tree `gen_init_cpio` packer so the downstream
 // `system-x86-64` distro recipe can pack its own root-owned initramfs from the
-// same td-built tool. The behavioural proof that
+// same td-built tool.
+//
+// READ-ONLY ROOT (re #549): the config also turns on what the two-stage boot
+// needs to pivot from the initramfs onto a disk-backed, read-only erofs
+// `/td/store` root — the block layer (BLOCK), the PCI bus and virtio-over-PCI
+// transport the `-M pc` qemu machine exposes (PCI, VIRTIO, VIRTIO_PCI), the
+// virtio block device the erofs image rides (VIRTIO_BLK → /dev/vda), the erofs
+// filesystem itself (EROFS_FS, uncompressed — matching the `td-builder
+// mkfs-erofs` writer, #548), and OVERLAY_FS for the tmpfs overlays the read-only
+// root needs over its writable paths. BLK_DEV_INITRD stays on: the kernel still
+// boots via a minimal initramfs that then mounts and switch_roots into the erofs
+// disk (the switch_root itself is #550). The behavioural proof that
 // this source-built kernel boots to a real userland is the HOST-SIDE tool
 // `td-recipe-eval qemu-boot linux-x86-64` (checks/qemu_boot.rs): it boots the
 // bzImage + initramfs under host qemu (TCG) and asserts the userland marker
@@ -310,6 +321,16 @@ pub fn recipe() -> Recipe {
     //    off, but pinning off the symbols that would pull a new host tool
     //    (perl/openssl/pahole/cpio/kmod) hardens directive-1's no-undeclared-tool
     //    invariant against an allnoconfig default drift across sub-versions.
+    //
+    //    READ-ONLY ROOT menuconfig parents (re #549): three of the erofs-root leaves
+    //    sit under a PROMPTED `menuconfig` parent that `allnoconfig` forces off, so
+    //    the leaf alone is invisible and `olddefconfig` would silently drop it (unlike
+    //    e.g. SHMEM behind TMPFS, which has no prompt and keeps its `default y`). The
+    //    parents must therefore be set EXPLICITLY: CONFIG_VIRTIO_MENU (gates
+    //    VIRTIO_PCI), CONFIG_BLK_DEV (gates VIRTIO_BLK), CONFIG_MISC_FILESYSTEMS
+    //    (gates EROFS_FS). Do not drop them as "redundant" — the grep-verify guard on
+    //    the leaves (step 4) reds the whole producer build if a parent goes missing.
+    //    (OVERLAY_FS / PCI / BLOCK are directly selectable, no menuconfig parent.)
     steps.push(
         Step::run(
             "{src}",
@@ -343,7 +364,17 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_PROC_FS[ =]/d; \
                   /^#? *CONFIG_SYSFS[ =]/d; \
                   /^#? *CONFIG_DEVTMPFS[ =]/d; \
-                  /^#? *CONFIG_TMPFS[ =]/d' .config && \
+                  /^#? *CONFIG_TMPFS[ =]/d; \
+                  /^#? *CONFIG_BLOCK[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV[ =]/d; \
+                  /^#? *CONFIG_PCI[ =]/d; \
+                  /^#? *CONFIG_VIRTIO[ =]/d; \
+                  /^#? *CONFIG_VIRTIO_MENU[ =]/d; \
+                  /^#? *CONFIG_VIRTIO_PCI[ =]/d; \
+                  /^#? *CONFIG_VIRTIO_BLK[ =]/d; \
+                  /^#? *CONFIG_MISC_FILESYSTEMS[ =]/d; \
+                  /^#? *CONFIG_EROFS_FS[ =]/d; \
+                  /^#? *CONFIG_OVERLAY_FS[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
                    '# CONFIG_UNWINDER_ORC is not set' \
@@ -365,7 +396,17 @@ pub fn recipe() -> Recipe {
                    'CONFIG_PROC_FS=y' \
                    'CONFIG_SYSFS=y' \
                    'CONFIG_DEVTMPFS=y' \
-                   'CONFIG_TMPFS=y' >> .config",
+                   'CONFIG_TMPFS=y' \
+                   'CONFIG_BLOCK=y' \
+                   'CONFIG_BLK_DEV=y' \
+                   'CONFIG_PCI=y' \
+                   'CONFIG_VIRTIO=y' \
+                   'CONFIG_VIRTIO_MENU=y' \
+                   'CONFIG_VIRTIO_PCI=y' \
+                   'CONFIG_VIRTIO_BLK=y' \
+                   'CONFIG_MISC_FILESYSTEMS=y' \
+                   'CONFIG_EROFS_FS=y' \
+                   'CONFIG_OVERLAY_FS=y' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -394,6 +435,12 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off - a usable userland (ps/mount/init) needs /proc' >&2; exit 1; }; \
                  grep -q '^CONFIG_SYSFS=y' .config || { echo 'SYSFS off - a usable userland needs /sys' >&2; exit 1; }; \
                  grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off - a usable userland needs a writable /tmp,/run' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLOCK=y' .config || { echo 'BLOCK off - no block layer for the virtio-blk erofs disk' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PCI=y' .config || { echo 'PCI off - virtio-blk-pci (the -M pc transport) needs the PCI bus' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VIRTIO_PCI=y' .config || { echo 'VIRTIO_PCI off - no virtio transport on the -M pc PCI bus' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VIRTIO_BLK=y' .config || { echo 'VIRTIO_BLK off - the erofs disk (/dev/vda) would not appear' >&2; exit 1; }; \
+                 grep -q '^CONFIG_EROFS_FS=y' .config || { echo 'EROFS_FS off - the read-only erofs root could not be mounted' >&2; exit 1; }; \
+                 grep -q '^CONFIG_OVERLAY_FS=y' .config || { echo 'OVERLAY_FS off - no tmpfs overlay for writable paths over the read-only root' >&2; exit 1; }; \
                  grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
                  grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
@@ -430,10 +477,12 @@ pub fn recipe() -> Recipe {
     // ---- Bootable userland: a static-busybox initramfs (re #529) ----
     // The kernel is now serial-console + initramfs capable (the config deltas
     // above add the 8250 console, BINFMT_ELF/SCRIPT, and BLK_DEV_INITRD). Pack a
-    // tiny initramfs whose /init prints a marker on ttyS0 and reboots, so the
-    // sibling qemu boot check can prove the td-source-built kernel reaches a real
-    // userland. The initramfs is an EXTERNAL artifact (qemu -initrd), keeping
-    // bzImage a pure kernel — INITRAMFS_SOURCE stays "".
+    // tiny initramfs whose /init prints a marker on ttyS0, optionally mounts an
+    // attached erofs disk read-only (re #549) and prints a second marker, then
+    // reboots — so the sibling qemu boot checks can prove the td-source-built
+    // kernel both reaches a real userland AND mounts the read-only erofs root. The
+    // initramfs is an EXTERNAL artifact (qemu -initrd), keeping bzImage a pure
+    // kernel — INITRAMFS_SOURCE stays "".
     //
     // gen_init_cpio (usr/gen_init_cpio, a HOSTCC hostprog) packs the newc cpio
     // from a spec WITHOUT needing mknod privilege: the `nod /dev/console` entry
@@ -443,13 +492,50 @@ pub fn recipe() -> Recipe {
     // glibc closure, no host bytes.
 
     // The /init the kernel execs (rdinit=/init): a #! script (BINFMT_SCRIPT) that
-    // prints the marker the boot check greps for, then `reboot -f` so qemu
-    // (-no-reboot) exits cleanly. echo is a busybox-sh builtin, so the marker
-    // prints even if the reboot applet were unavailable (the boot check's
+    // prints the userland marker the boot check greps for, THEN — if a virtio-blk
+    // erofs disk is attached (the `qemu-boot-erofs` tool, re #549) — mounts it
+    // read-only and prints a second marker on success, then `reboot -f` so qemu
+    // (-no-reboot) exits cleanly. echo is a busybox-sh builtin, so the userland
+    // marker prints even if the reboot applet were unavailable (the boot check's
     // wall-clock ceiling then bounds the run).
+    //
+    // Applet reachability: this initramfs packs only /bin/busybox + a /bin/sh
+    // symlink (no per-applet symlinks — the busybox recipe's own /bin symlink farm
+    // is NOT what gets packed here) and busybox is NOT built standalone-shell, so
+    // EVERY applet (`mkdir`/`mount`/`sleep`/`cat`/`test`/`reboot`) is reached as
+    // `/bin/busybox <applet>` explicitly, never bare (a bare `mount` would not
+    // resolve on PATH). Only `echo` is used bare — it is an ash SHELL BUILTIN, not
+    // an applet, so it needs no symlink. `test` is invoked via busybox (not the `[`
+    // builtin) so it does not depend on CONFIG_ASH_TEST being set in the busybox
+    // config.
+    //
+    // Disk probe (gated on /dev/vda so a diskless boot is unaffected — the plain
+    // `qemu-boot` check kills qemu on USERLAND_MARKER, printed first, before this
+    // runs): mount devtmpfs so the virtio-blk node appears, settle briefly for the
+    // async probe, then mount /dev/vda READ-ONLY as erofs and read the sentinel the
+    // image was built with. The sentinel's CONTENT is read back with `cat` and
+    // string-compared (not just `test -f`), so a corrupt/missing DATA block cannot
+    // green — EROFS_MARKER prints only when the mount AND the data read-back both
+    // succeed, making it a true read-only-erofs-mount proof. mount stderr is left on
+    // the console (no `2>/dev/null`) so a mount failure is visible in the boot
+    // oracle's captured serial log. This is the seed of the #550 two-stage boot,
+    // where the `reboot -f` becomes the switch_root into the mounted root.
     steps.push(Step::WriteFile {
         path: "{root}/initramfs/init".into(),
-        content: format!("#!/bin/sh\necho {USERLAND_MARKER}\nexec /bin/busybox reboot -f\n"),
+        content: format!(
+            "#!/bin/sh\n\
+             echo {USERLAND_MARKER}\n\
+             /bin/busybox mkdir -p /mnt\n\
+             /bin/busybox mount -t devtmpfs dev /dev\n\
+             n=0\n\
+             while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
+             if /bin/busybox test -b /dev/vda; then \
+             if /bin/busybox mount -t erofs -o ro /dev/vda /mnt; then \
+             if /bin/busybox test \"$(/bin/busybox cat /mnt/{EROFS_PROBE_SENTINEL})\" = {EROFS_PROBE_CONTENT}; then echo {EROFS_MARKER}; fi; \
+             fi; \
+             fi\n\
+             exec /bin/busybox reboot -f\n"
+        ),
         exec: true,
     });
     // gen_init_cpio spec: /dev/console for init's stdio, the static busybox, a

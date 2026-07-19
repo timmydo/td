@@ -92,6 +92,30 @@ pub const SH: &str = "{in:bash-mesboot}/bin/bash";
 /// producer, the gated shape check, and the boot oracle can never silently desync.
 pub const USERLAND_MARKER: &str = "TD-USERLAND-OK";
 
+/// The line the bootable-kernel rung's `/init` prints on ttyS0 AFTER it mounts the
+/// attached virtio-blk disk as READ-ONLY erofs and reads `EROFS_PROBE_SENTINEL`
+/// back — the success signal the host-side `qemu-boot-erofs` tool asserts on
+/// (re #549). Emitted only on a successful read-only mount + sentinel read, so
+/// seeing it proves the source-built kernel (EROFS_FS + VIRTIO_BLK) can mount a
+/// td-written erofs image. Distinct from `USERLAND_MARKER`, which the /init prints
+/// first (userspace reached) unconditionally. SINGLE SOURCE OF TRUTH shared by the
+/// `/init` script, the initramfs shape check, and the boot oracle.
+pub const EROFS_MARKER: &str = "TD-EROFS-RO-OK";
+
+/// The sentinel file the `qemu-boot-erofs` probe writes into the erofs image (via
+/// `td-builder mkfs-erofs`) and the guest `/init` reads back after mounting the
+/// disk read-only. Shared so the image producer (the boot oracle) and the consumer
+/// (the /init script) name the same path.
+pub const EROFS_PROBE_SENTINEL: &str = "td-erofs-probe.ok";
+
+/// The exact CONTENT the probe writes into `EROFS_PROBE_SENTINEL`, which the guest
+/// `/init` reads back with `cat` and string-compares before printing `EROFS_MARKER`.
+/// Comparing the CONTENT (not just `test -f` on the name) forces the kernel to read
+/// the file's DATA blocks off the erofs image — proving the flat-plain data layout
+/// and block addressing, not merely that the inode/dirent parse. A single shell-safe
+/// token (no spaces/quotes/newline) so the `[ "$x" = "..." ]` compare stays trivial.
+pub const EROFS_PROBE_CONTENT: &str = "td-erofs-ro-readback-ok";
+
 /// Shell (for `sh -c`) asserting that `initramfs` is a COMPLETE, well-formed newc cpio
 /// carrying the bootable busybox userland. Shared by the `linux-x86-64` producer rung
 /// and the `linux-x86-64-test` rung so the two checks cannot drift.
@@ -105,14 +129,16 @@ pub const USERLAND_MARKER: &str = "TD-USERLAND-OK";
 /// member (busybox, /init, …) reds on the missing name. `cpio -t`'s exit code is a
 /// secondary signal — it reds on a mid-record `short read`, but can still exit 0 on an
 /// archive truncated cleanly at a header boundary (no TRAILER), which is exactly why the
-/// member-name assertions, not the exit code, carry the load. The `{marker}` payload
-/// grep additionally proves the /init script's CONTENT (not just its name) is packed —
-/// cpio -t validates structure, not bytes.
+/// member-name assertions, not the exit code, carry the load. The `{marker}` and
+/// `{erofs_marker}` payload greps additionally prove the /init script's CONTENT (not
+/// just its name) is packed — cpio -t validates structure, not bytes — covering both
+/// the userland marker and the read-only-erofs probe marker the boot oracles assert on.
 ///
 /// `busybox` is the absolute path to the busybox multi-call binary; `grep`/`od`/`wc`
 /// come from the mesboot0 userland, so callers keep `PATH = mesboot0_path()`.
 pub fn initramfs_cpio_shape_check(initramfs: &str, busybox: &str) -> String {
     let marker = USERLAND_MARKER;
+    let erofs_marker = EROFS_MARKER;
     format!(
         "sz=$(wc -c < '{initramfs}'); \
          [ \"$sz\" -ge 65536 ] || {{ echo \"initramfs.cpio: implausibly small ($sz bytes) — the static busybox alone is ~1 MiB\" >&2; exit 1; }}; \
@@ -122,7 +148,8 @@ pub fn initramfs_cpio_shape_check(initramfs: &str, busybox: &str) -> String {
          for m in init bin/busybox bin/sh dev/console; do \
              printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || {{ echo \"initramfs.cpio: cpio member '$m' missing — the bootable userland is incomplete\" >&2; exit 1; }}; \
          done; \
-         grep -q -a {marker} '{initramfs}' || {{ echo 'initramfs.cpio: /init marker not packed — the boot script the qemu tool asserts on is missing' >&2; exit 1; }}"
+         grep -q -a {marker} '{initramfs}' || {{ echo 'initramfs.cpio: /init marker not packed — the boot script the qemu tool asserts on is missing' >&2; exit 1; }}; \
+         grep -q -a {erofs_marker} '{initramfs}' || {{ echo 'initramfs.cpio: /init erofs marker not packed — the read-only-root probe the qemu-boot-erofs tool asserts on is missing' >&2; exit 1; }}"
     )
 }
 

@@ -87,6 +87,37 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::run(&runner)
 }
 
+/// `td-recipe-eval qemu-boot-erofs [linux-x86-64]` — the read-only-root boot proof
+/// (re #549). Same host-side boot as `qemu-boot`, but it also builds a probe erofs
+/// image with the control-plane `mkfs-erofs` writer (#548) and attaches it as a
+/// read-only virtio-blk disk; the guest /init mounts it read-only and the tool
+/// asserts the erofs marker. Host-side (never a gated check) for the same reason
+/// `qemu-boot` is — the daily sandbox has no host qemu. See checks/qemu_boot.rs.
+pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "linux-x86-64";
+    let stem = args.first().map(String::as_str).unwrap_or(STEM);
+    if stem != STEM {
+        return Err(format!(
+            "qemu-boot-erofs only supports {STEM} (got '{stem}'); usage: qemu-boot-erofs [{STEM}]"
+        ));
+    }
+    if args.get(1).is_some() {
+        return Err(format!("usage: qemu-boot-erofs [{STEM}]"));
+    }
+    // Provenance planning FIRST — before the runner exists (re #469), matching
+    // `qemu_boot_cli`: a rejected graph spawns no subprocess.
+    ensure_targets_provenance(&[stem])?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
+    // a killed erofs boot's per-boot directories.
+    let scratch_name = scratch_name("qemu-boot", &[stem]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let _lock = lock_file(&runner.lock_path())?;
+    runner.setup()?;
+    crate::checks::qemu_boot::run_erofs(&runner)
+}
+
 /// `td-recipe-eval run [system-x86-64]` — the interactive distro runner (re #541).
 /// Builds the `system-x86-64` initramfs (its closure pulls in the `linux-x86-64`
 /// bzImage) and boots it under host qemu with an interactive serial console. Like
