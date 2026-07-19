@@ -16,8 +16,17 @@ use crate::types::{Recipe, Step};
 // Userland strategy (v0): busybox provides init/getty/login/ash/coreutils — all
 // present in its `defconfig`, all STATIC, so the initramfs is self-contained (no
 // glibc closure, no host bytes). This is an explicitly TRANSITIONAL start on the
-// AGENTS.md Rust-first path: each piece (coreutils -> uutils #539, the shell, the
-// init) can later swap to a Rust equivalent behind this same recipe.
+// AGENTS.md Rust-first path: each piece (coreutils -> uutils, the shell, the init)
+// can later swap to a Rust equivalent behind this same recipe. Swapping busybox
+// coreutils for the (dynamically-linked, Rust) uutils is its own atomic migration
+// PR (AGENTS.md directive 5): it needs the full Rust bootstrap plus a packed glibc
+// runtime closure, so it lands separately, not inline here.
+//
+// Layout: the image is STORE-NATIVE. The busybox binary is packed at its
+// content-addressed /td/store/<hash>-busybox-x86-64/bin path, and /bin is a thin
+// symlink farm whose entries (and /init) point straight into that store path. There
+// is no /usr and no /sbin: every command resolves through /td/store, so the only
+// real bytes live in the store rather than being copied across an FHS tree.
 //
 // Packing: the initramfs is built by the kernel's own `gen_init_cpio`, EXPORTED
 // from the `linux-x86-64` output. gen_init_cpio writes the newc cpio from a text
@@ -209,7 +218,9 @@ fn build_profile(sys: &SystemDef) -> String {
     // banner HERE via a literal here-doc so it shows exactly once regardless of
     // busybox login's own motd feature, and set a sane PATH/PS1.
     let mut s = String::new();
-    s.push_str("export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n");
+    // Just /bin — the store-native symlink farm. There is no /usr or /sbin in this image
+    // (every /bin entry resolves into /td/store), so keep PATH honest and minimal.
+    s.push_str("export PATH=/bin\n");
     s.push_str("export PS1='\\u@\\h:\\w\\$ '\n");
     s.push_str("cat <<'__TD_MOTD__'\n");
     s.push_str(sys.motd);
@@ -235,7 +246,11 @@ fn build_os_release(sys: &SystemDef) -> String {
 /// paths. Every entry is uid/gid 0 (root-owned) except the per-user home dirs.
 fn build_spec(sys: &SystemDef) -> String {
     let mut s = String::new();
-    // Directories first, parents before children.
+    // Base dirs, parents before children. This image is STORE-NATIVE: there is no /usr
+    // and no /sbin — /bin is a thin symlink farm and every command resolves into
+    // /td/store/<hash>-.../bin, so the only real bytes live under /td/store rather than
+    // scattered across /usr + /bin (re #541: "why is there /bin and /usr, not /td/store
+    // symlinks?"). PATH is just /bin (build_profile).
     let dirs: &[(&str, &str)] = &[
         ("/dev", "0755"),
         ("/proc", "0755"),
@@ -246,14 +261,21 @@ fn build_spec(sys: &SystemDef) -> String {
         ("/home", "0755"),
         ("/etc", "0755"),
         ("/bin", "0755"),
-        ("/sbin", "0755"),
-        ("/usr", "0755"),
-        ("/usr/bin", "0755"),
-        ("/usr/sbin", "0755"),
+        ("/td", "0755"),
+        ("/td/store", "0755"),
     ];
     for (d, m) in dirs {
         s.push_str(&format!("dir {d} {m} 0 0\n"));
     }
+    // The busybox store tree: pack the static busybox binary AT its content-addressed
+    // /td/store path. The {in:busybox-x86-64} token expands to /td/store/<hash>-busybox-x86-64
+    // in BOTH the member name and the source position, so gen_init_cpio reads the staged
+    // binary and writes it to the in-image store path its /bin symlinks point at. Only the
+    // binary is packed (busybox is static and self-contained); the output's own applet
+    // symlinks are not needed — the image supplies its own /bin farm below.
+    s.push_str("dir {in:busybox-x86-64} 0755 0 0\n");
+    s.push_str("dir {in:busybox-x86-64}/bin 0755 0 0\n");
+    s.push_str("file {in:busybox-x86-64}/bin/busybox {in:busybox-x86-64}/bin/busybox 0755 0 0\n");
     // Per-user home dirs, owned by the user (skip /root, already added above).
     for u in sys.users {
         if u.home != "/root" {
@@ -264,12 +286,17 @@ fn build_spec(sys: &SystemDef) -> String {
     // run the inittab's first sysinit line (which mounts devtmpfs on /dev, and devtmpfs
     // then provides the real nodes). This static node carries that pre-mount window.
     s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
-    // The static busybox + its applet symlinks, and /init = busybox init.
-    s.push_str("file /bin/busybox {in:busybox-x86-64}/bin/busybox 0755 0 0\n");
+    // /bin symlink farm: /bin/busybox and every applet resolve DIRECTLY into the store
+    // busybox, and so does /init. busybox dispatches on argv[0]'s basename, so the target
+    // need only BE the busybox binary; pointing each link straight at the store path makes
+    // `ls -l /bin` show every command coming from /td/store (the requested layout).
+    s.push_str("slink /bin/busybox {in:busybox-x86-64}/bin/busybox 0777 0 0\n");
     for app in APPLETS {
-        s.push_str(&format!("slink /bin/{app} /bin/busybox 0777 0 0\n"));
+        s.push_str(&format!(
+            "slink /bin/{app} {{in:busybox-x86-64}}/bin/busybox 0777 0 0\n"
+        ));
     }
-    s.push_str("slink /init /bin/busybox 0777 0 0\n");
+    s.push_str("slink /init {in:busybox-x86-64}/bin/busybox 0777 0 0\n");
     s.push_str("file /bin/autologin {root}/bin/autologin 0755 0 0\n");
     // The ttyS0 session wrapper (getty -> login, then reboot on exit); see
     // build_tty_session. inittab respawns it in place of a bare getty line.
@@ -308,6 +335,7 @@ fn shape_check() -> String {
      for m in init bin/busybox bin/sh bin/login bin/getty bin/autologin bin/tty-session etc/inittab etc/passwd; do \
          printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || { echo \"rootfs.cpio: cpio member '$m' missing - the bootable userland is incomplete\" >&2; exit 1; }; \
      done; \
+     printf '%s\\n' \"$list\" | grep -qE '^td/store/[^/]+/bin/busybox$' || { echo 'rootfs.cpio: the busybox binary is not packed under td/store/<hash>-busybox-x86-64/bin - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
      applets=$('{in:busybox-x86-64}/bin/busybox' --list 2>/dev/null) || { echo 'rootfs.cpio: busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
      for a in @APPLETS@; do \
          printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"rootfs.cpio: busybox does not implement applet '$a' (config drift) - its packed /bin/$a symlink would be a dead link\" >&2; exit 1; }; \
@@ -391,12 +419,11 @@ pub fn recipe() -> Recipe {
         // busybox: the packed userland + the `cpio -t` shape check (static binary).
         // linux-x86-64: the EXPORTED gen_init_cpio packer (verified STATICALLY linked:
         //   `ELF 64-bit ... statically linked`).
-        // glibc-x86-64: kept as a conservative native input. No build step here links
-        //   against the native glibc — gen_init_cpio and busybox are both static, and
-        //   the shape check runs the mesboot0 userland — so this is a candidate for a
-        //   build-verified removal (re #541, Codex review). Deferred rather than dropped
-        //   unverified: trimming a build input must be proven by a system-x86-64 build,
-        //   and the per-PR tier does not build it (that is daily-backstop territory).
+        // glibc-x86-64: no step in THIS (busybox) image links against the native glibc —
+        //   gen_init_cpio and busybox are both static and the shape check runs the mesboot0
+        //   userland — but it is already in the closure (busybox links libc.a from it) and
+        //   is the runtime closure the uutils follow-up will pack, so it is retained here
+        //   ahead of that migration rather than dropped and re-added (re #541).
         .native_inputs(&["busybox-x86-64", "linux-x86-64", "glibc-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
