@@ -453,6 +453,18 @@ mod tests {
         );
 
         let uutils = catalog::lookup("uutils").unwrap();
+        assert_eq!(uutils.no_default_features, Some(true));
+        let features = uutils.features.as_deref().unwrap();
+        for expected in [
+            "feat_Tier1",
+            "feat_require_unix_core",
+            "feat_require_unix_hostid",
+            "feat_require_unix_utmpx",
+        ] {
+            assert!(features.iter().any(|feature| feature == expected));
+        }
+        assert!(!features.iter().any(|feature| feature == "unix"));
+        assert!(!features.iter().any(|feature| feature == "stdbuf"));
         let pins = uutils.source_pins.unwrap();
         assert_eq!(pins.len(), 1);
         let pin = pins.first().unwrap();

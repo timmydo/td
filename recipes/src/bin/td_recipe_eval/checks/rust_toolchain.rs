@@ -204,8 +204,12 @@ fn prove_td_shell_userland(
          fd_out=$(\"$fd\" '^known-needle[.]txt$' /tmp/td-shell-userland)\n\
          case \"$fd_out\" in */known-needle.txt) ;; *) exit 92 ;; esac\n\
          uu_out=$(\"$uutils\" printf '%s:%s\\n' TD UUTILS)\n\
-         test \"$uu_out\" = TD:UUTILS\n\
-         test \"$(\"$uutils\" cat /tmp/td-shell-userland/sub/known-needle.txt)\" = TD-414-NEEDLE\n\
+         test \"$uu_out\" = TD:UUTILS || exit 95\n\
+         test \"$(\"$uutils\" cat /tmp/td-shell-userland/sub/known-needle.txt)\" = TD-414-NEEDLE || exit 96\n\
+         test \"$(\"$uutils\" uname -s)\" = Linux || exit 97\n\
+         uu_id=$(\"$uutils\" id -u)\n\
+         case \"$uu_id\" in ''|*[!0-9]*) exit 98 ;; esac\n\
+         if \"$uutils\" --list | grep -F -x stdbuf >/dev/null; then exit 99; fi\n\
          readelf='{binutils_path}/readelf'\n\
          \"$readelf\" -l \"$rg\" | grep -F '{interp}' >/dev/null\n\
          \"$readelf\" -l \"$fd\" | grep -F '{interp}' >/dev/null\n\

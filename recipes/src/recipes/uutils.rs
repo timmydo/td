@@ -1,8 +1,11 @@
 use crate::types::{Recipe, SourcePin};
 
-// uutils ships its coreutils implementation as one multicall binary. Enable the
-// Unix utility set while leaving optional ACL/SELinux/systemd integrations out:
-// those would add native libraries that are not part of td's final userland yet.
+// uutils ships its coreutils implementation as one multicall binary. The
+// published 0.9.0 `unix` aggregate cannot be used: it enables `stdbuf`, whose
+// crates.io archive lacks src/libstdbuf and therefore embeds an empty preload
+// library. Select the aggregate's Unix groups directly, excluding only stdbuf.
+// Optional ACL/SELinux/systemd integrations stay out too; their native libraries
+// are not part of td's final userland yet.
 pub fn recipe() -> Recipe {
     Recipe::rust("uutils", "0.9.0")
         .source_pin(SourcePin::new(
@@ -12,5 +15,11 @@ pub fn recipe() -> Recipe {
             "coreutils-0.9.0.crate",
         ))
         .bins(&["coreutils"])
-        .features(&["unix"])
+        .no_default_features()
+        .features(&[
+            "feat_Tier1",
+            "feat_require_unix_core",
+            "feat_require_unix_hostid",
+            "feat_require_unix_utmpx",
+        ])
 }
