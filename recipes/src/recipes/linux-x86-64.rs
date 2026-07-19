@@ -78,7 +78,15 @@ pub fn recipe() -> Recipe {
         mesboot0_path()
     );
 
-    let mut steps = unpack_into("linux-kernel-source", "{src}");
+    // A rung's own source lands in TD_INPUT_MAP under the LOCAL name `{name}-source`
+    // (`linux-x86-64-source`), synthesized from the recipe NAME — NOT under its
+    // `sourceInput` PIN KEY. When the two differ (this rung renames the shared
+    // `linux-kernel-source` pin locally, exactly as gcc-x86-64-native renames
+    // `gcc-14-source` / make-441 renames `make-x86-64-source`), steps MUST reference
+    // the local `{in:linux-x86-64-source}`; `{in:linux-kernel-source}` is not a map key
+    // and expands to nothing ("no input `linux-kernel-source' in TD_INPUT_MAP"). The
+    // pin key stays on `.source_input(...)` below, which is what gates/fetches the bytes.
+    let mut steps = unpack_into("linux-x86-64-source", "{src}");
 
     // Host sysroot for HOSTCC only (the Kbuild host programs are ordinary
     // userspace): the x86_64 glibc 2.41 headers + kernel UAPI headers overlaid
