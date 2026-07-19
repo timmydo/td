@@ -882,6 +882,7 @@ impl RecipeCheckRunner {
         let contents = fs::read_to_string(build_out)
             .map_err(|e| format!("read {}: {e}", build_out.display()))?;
         let mut dbs = Vec::new();
+        let mut seen = HashSet::new();
         for line in contents.lines() {
             let Some(rest) = line.strip_prefix("STEP ") else {
                 continue;
@@ -897,7 +898,9 @@ impl RecipeCheckRunner {
                     db.display()
                 ));
             }
-            dbs.push(db);
+            if seen.insert(name.to_string()) {
+                dbs.push(db);
+            }
         }
         if dbs.is_empty() {
             return Err(format!(

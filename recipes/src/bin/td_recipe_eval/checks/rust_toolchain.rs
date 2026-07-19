@@ -141,7 +141,7 @@ fn prove_td_shell_userland(
     let vendor_root = root.join(".td-build-cache/crate-vendor");
     for package in ["ripgrep", "fd"] {
         let package_root = vendor_root.join(package);
-        if !package_root.join("src").is_dir() || !package_root.join("vendor").is_dir() {
+        if !package_root.join("work").is_dir() || !package_root.join("vendor").is_dir() {
             return Err(format!(
                 "td shell Rust closure for `{package}' is not warm under {}",
                 package_root.display()
@@ -201,10 +201,10 @@ fn prove_td_shell_userland(
          readelf='{binutils_path}/readelf'\n\
          \"$readelf\" -l \"$rg\" | grep -F '{interp}' >/dev/null\n\
          \"$readelf\" -l \"$fd\" | grep -F '{interp}' >/dev/null\n\
-         ! grep -a -F /gnu/store \"$rg\" >/dev/null\n\
-         ! grep -a -F /gnu/store \"$fd\" >/dev/null\n\
-         ! grep -a -F '{stage0_base}' \"$rg\" >/dev/null\n\
-         ! grep -a -F '{stage0_base}' \"$fd\" >/dev/null\n\
+         for binary in \"$rg\" \"$fd\"; do\n\
+           if grep -a -F /gnu/store \"$binary\" >/dev/null; then exit 93; fi\n\
+           if grep -a -F '{stage0_base}' \"$binary\" >/dev/null; then exit 94; fi\n\
+         done\n\
          printf '%s\\n' TD-SHELL-USERLAND-OK\n"
     );
 

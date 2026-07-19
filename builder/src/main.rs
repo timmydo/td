@@ -4822,7 +4822,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         // native env so the build-recipe subprocess gets TD_RUST_STORE_* (and the
         // recipe-output store/db argv) for the vendored-rust case.
         let native_env = match provision_rust_inputs(pkg, &sd, &self_exe)? {
-            Some((seedlock, extra)) => {
+            Some((seedlock, source_lock, extra)) => {
                 let Some(nt) = &native else {
                     return Err(format!(
                         "build `{pkg}': a vendored rust build needs the native /td/store toolchain, \
@@ -4835,9 +4835,7 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                 // Add only the explicitly provisioned recipe outputs to the
                 // interned package source lock. No host or stage0 compiler line
                 // is inherited from a legacy package lock.
-                let body = std::fs::read_to_string(&seedlock)
-                    .map_err(|e| format!("read seed lock {seedlock}: {e}"))?;
-                let retargeted = recipe_toolchain_lock_body(&body, &nt.lock_lines)?;
+                let retargeted = recipe_toolchain_lock_body(&source_lock, &nt.lock_lines)?;
                 std::fs::write(&seedlock, &retargeted)
                     .map_err(|e| format!("write seed lock {seedlock}: {e}"))?;
                 bargs.push(seedlock);
@@ -4938,10 +4936,10 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
         .map_err(|e| format!("run `{prog}': {e}"))
 }
 
-/// Intern a source TREE into a td-OWNED store with td's OWN recursive add-to-store
-/// (`store-add-recursive`) — no `guix repl`, no guix-daemon. The shell sibling is
-/// `tests/intern-src.sh`. Returns the content-addressed `source` store path td computed
-/// from the tree's recursive NAR sha256 and restored under `store_dir` (+ `db`).
+/// Intern a source path into a td-OWNED store with td's OWN recursive add-to-store
+/// (`store-add-recursive`) — no `guix repl`, no guix-daemon. Returns the
+/// content-addressed `source` store path td computed from the path's recursive
+/// NAR sha256 and restored under `store_dir` (+ `db`).
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn run_store_add(
     self_exe: &str,
@@ -4983,6 +4981,88 @@ fn source_lock_body(sourcekey: &str, src_canonical: &str) -> String {
     format!("{sourcekey} {src_canonical} source\n")
 }
 
+struct ShellSourcePin {
+    key: String,
+    sha256: String,
+    file: String,
+}
+
+/// Resolve a package's recipe-owned fixed-output source pin. Keeping this
+/// lookup in td-recipe-eval means the builder does not duplicate package URLs
+/// or hashes, and final-userland pins do not enter the bootstrap seed table.
+fn shell_recipe_source_pin(pkg: &str) -> Result<ShellSourcePin, String> {
+    let eval = std::env::var("TD_RECIPE_EVAL").map_err(|_| {
+        "TD_RECIPE_EVAL must point at td's td-recipe-eval binary (source pin lookup)".to_string()
+    })?;
+    let out = Command::new(&eval)
+        .args(["source-pin", pkg])
+        .output()
+        .map_err(|e| format!("spawn td-recipe-eval ({eval}) for `{pkg}' source pin: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "td-recipe-eval source-pin `{pkg}' failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let pins = String::from_utf8(out.stdout)
+        .map_err(|e| format!("td-recipe-eval source pins are not UTF-8: {e}"))?;
+    parse_shell_source_pin(&pins)
+}
+
+fn parse_shell_source_pin(pins: &str) -> Result<ShellSourcePin, String> {
+    let mut found: Option<ShellSourcePin> = None;
+    for line in pins.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if found.is_some() {
+            return Err("td shell Rust recipe must declare exactly one fixed-output source pin".into());
+        }
+        let [pin_key, url, sha256, file] = fields.as_slice() else {
+            return Err(format!("malformed td shell recipe source pin: {line}"));
+        };
+        let key = *pin_key;
+        if key.is_empty() {
+            return Err("td shell recipe source pin has an empty key".into());
+        }
+        if url.is_empty() {
+            return Err(format!("recipe source pin `{key}' has an empty URL"));
+        }
+        if sha256.len() != 64
+            || !sha256
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            return Err(format!("recipe source pin `{key}' has a non-canonical sha256"));
+        }
+        if file.is_empty()
+            || Path::new(file).file_name().and_then(|name| name.to_str()) != Some(file)
+        {
+            return Err(format!("recipe source pin `{key}' has a non-basename file `{file}'"));
+        }
+        found = Some(ShellSourcePin {
+            key: key.to_string(),
+            sha256: (*sha256).to_string(),
+            file: (*file).to_string(),
+        });
+    }
+    found.ok_or_else(|| "td shell Rust recipe declares no fixed-output source pin".to_string())
+}
+
+fn verify_shell_source_archive(path: &Path, pin: &ShellSourcePin) -> Result<(), String> {
+    let got = sha256::sha256_file(path)
+        .map_err(|e| format!("read pinned source archive {}: {e}", path.display()))?;
+    if got != pin.sha256 {
+        return Err(format!(
+            "warmed source archive {} sha256 {got} != recipe source pin {} for `{}`",
+            path.display(), pin.sha256, pin.key
+        ));
+    }
+    Ok(())
+}
+
 /// Add the authenticated `/td/store` recipe-output build platform to an
 /// interned-source lock. This replaces the old mixed Guix/native retargeting:
 /// any `/gnu/store` line or downloaded `rust-stage0` input is now a hard error,
@@ -4992,10 +5072,11 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
     if source_lines.len() != 1 {
         return Err("td shell package source lock must contain exactly one source line".into());
     }
-    let source_fields: Vec<&str> = source_lines
+    let source_line = source_lines
         .first()
         .copied()
-        .unwrap_or_default()
+        .ok_or("td shell package source lock has no source line")?;
+    let source_fields: Vec<&str> = source_line
         .split_whitespace()
         .collect();
     if source_fields.len() != 3
@@ -5004,7 +5085,7 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
     {
         return Err(format!(
             "td shell package source lock is not one canonical /td/store source: {}",
-            source_lines.first().copied().unwrap_or_default()
+            source_line
         ));
     }
     let native = native_lines.trim_end_matches('\n');
@@ -5034,21 +5115,21 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
     Ok(out)
 }
 
-/// Provision a rust recipe's crate closure for `td shell`, GUIX-FREE — the product-command
-/// counterpart of the `tests/crate-free-build.sh` corpus harness, so `td shell ripgrep -- rg
-/// …` builds the REAL shipped userland the way a user types it (not a bespoke gate script).
+/// Provision a rust recipe's crate closure for `td shell`, GUIX-FREE, so
+/// `td shell ripgrep -- rg …` builds the real shipped userland through the
+/// product command rather than a bespoke gate harness.
 ///
-/// Source of the crates: a warmed tree at `$TD_SHELL_VENDOR_ROOT/<pkg>/{src/<one>,vendor}`
-/// (host PREP via `td-feed warm crate`, the cargo-proxy having verified each `.crate`
-/// sha256 == the crates.io sparse-index cksum — the upstream pin, NOT a guix artifact).
+/// Source of the crates: a warmed tree at `$TD_SHELL_VENDOR_ROOT/<pkg>/{work,vendor}`
+/// (host PREP via `td-feed warm crate`). The package source archive is verified again
+/// here against the recipe catalog's committed fixed-output SHA-256 before interning;
+/// dependency archives remain selected and checksum-verified by the pinned Cargo.lock.
 /// This:
-///   - clean-copies the source tree (dropping `target`/`vendor`/`.cargo` so a stray local
-///     build cannot perturb the source hash) and interns it with `store-add-recursive`,
+///   - verifies and interns the immutable source `.crate` with `store-add-recursive`,
 ///   - interns the crate SET the same way (a no-ref content-addressed tree),
 ///   - writes a lock containing only `<pkg>-source <interned-src>`; Cargo.lock
 ///     inside that source selects and verifies the separately interned crates,
 ///
-/// and returns `(seed-lock-path, [src-store, src-db, vendor-canonical, vendor-store,
+/// and returns `(seed-lock-path, seed-lock-body, [src-store, src-db, vendor-canonical, vendor-store,
 /// vendor-db])` — the extra positional args build-recipe's 11-arg form takes.
 ///
 /// Returns `Ok(None)` when no warmed closure exists for PKG (`TD_SHELL_VENDOR_ROOT` unset,
@@ -5059,54 +5140,20 @@ fn provision_rust_inputs(
     pkg: &str,
     sd: &str,
     self_exe: &str,
-) -> Result<Option<(String, [String; 5])>, String> {
+) -> Result<Option<(String, String, [String; 5])>, String> {
     let vendor_root = match std::env::var("TD_SHELL_VENDOR_ROOT") {
         Ok(v) if !v.is_empty() => v,
         _ => return Ok(None),
     };
     let pkg_root = Path::new(&vendor_root).join(pkg);
     let vendor = pkg_root.join("vendor");
-    let src_parent = pkg_root.join("src");
     // No warmed crate closure for this package here ⇒ not a vendored rust build.
-    if !vendor.is_dir() || !src_parent.is_dir() {
+    if !vendor.is_dir() {
         return Ok(None);
     }
-
-    // The single extracted source tree under src/ (e.g. ripgrep-14.1.1, fd-find-10.2.0):
-    // glob it so td shell needs no per-package crate-name table.
-    let mut subdirs: Vec<PathBuf> = std::fs::read_dir(&src_parent)
-        .map_err(|e| format!("read {}: {e}", src_parent.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir())
-        .collect();
-    subdirs.sort();
-    let srctree = match subdirs.as_slice() {
-        [one] => one.clone(),
-        [] => {
-            return Err(format!(
-                "warmed crate closure for `{pkg}' has no source tree under {} — re-run `td-feed warm crate'",
-                src_parent.display()
-            ))
-        }
-        _ => {
-            return Err(format!(
-                "warmed crate closure for `{pkg}' has multiple source trees under {} (expected exactly one)",
-                src_parent.display()
-            ))
-        }
-    };
-    if !srctree.join("Cargo.toml").is_file() {
-        return Err(format!(
-            "source tree {} ships no Cargo.toml — re-run `td-feed warm crate'",
-            srctree.display()
-        ));
-    }
-    if !srctree.join("Cargo.lock").is_file() {
-        return Err(format!(
-            "source tree {} ships no Cargo.lock — the offline dependency closure is not pinned",
-            srctree.display()
-        ));
-    }
+    let pin = shell_recipe_source_pin(pkg)?;
+    let source_archive = pkg_root.join("work").join(&pin.file);
+    verify_shell_source_archive(&source_archive, &pin)?;
     let ncrate = std::fs::read_dir(&vendor)
         .map_err(|e| format!("read {}: {e}", vendor.display()))?
         .filter_map(|e| e.ok())
@@ -5120,24 +5167,18 @@ fn provision_rust_inputs(
     }
 
     let work = Path::new(sd);
-    // --- intern the source tree (clean-copy dropping the build dirs) ---
-    let clean = work.join("srcclean");
-    let _ = std::fs::remove_dir_all(&clean);
-    std::fs::create_dir_all(&clean).map_err(|e| e.to_string())?;
-    for entry in std::fs::read_dir(&srctree).map_err(|e| format!("read {}: {e}", srctree.display()))? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.file_name();
-        let n = name.to_string_lossy();
-        if n == "target" || n == "vendor" || n == ".cargo" {
-            continue;
-        }
-        copy_canonical(&entry.path(), &clean.join(&name))?;
-    }
+    // --- intern the recipe-authenticated source archive ---
     let src_store = work.join("srcstore");
     let src_db = work.join("src.db");
     let _ = std::fs::remove_dir_all(&src_store);
     let _ = std::fs::remove_file(&src_db);
-    let src_canonical = run_store_add(self_exe, &format!("{pkg}-src"), &clean, &src_store, &src_db)?;
+    let src_canonical = run_store_add(
+        self_exe,
+        &format!("{pkg}-src"),
+        &source_archive,
+        &src_store,
+        &src_db,
+    )?;
 
     // --- intern the crate set ---
     let vendor_store = work.join("vendorstore");
@@ -5148,13 +5189,13 @@ fn provision_rust_inputs(
         run_store_add(self_exe, &format!("{pkg}-vendor"), &vendor, &vendor_store, &vendor_db)?;
 
     // --- source lock: exact interned package source only --------------------
-    let sourcekey = format!("{pkg}-source");
+    let sourcekey = pin.key;
     let seed = source_lock_body(&sourcekey, &src_canonical);
     let seedlock = work.join("seed.lock");
-    std::fs::write(&seedlock, &seed).map_err(|e| format!("write {}: {e}", seedlock.display()))?;
 
     Ok(Some((
         seedlock.to_string_lossy().into_owned(),
+        seed,
         [
             src_store.to_string_lossy().into_owned(),
             src_db.to_string_lossy().into_owned(),
@@ -5501,7 +5542,6 @@ fn applet_exit(name: &str, result: Result<i32, String>) -> ExitCode {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 struct RecipeOutputOptions {
     positional_len: usize,
     dbs: Vec<(String, sandbox::InputOrigin)>,
@@ -5542,6 +5582,7 @@ fn parse_recipe_output_options(args: &[String]) -> Result<RecipeOutputOptions, S
     })
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let applet = Path::new(args.first().map_or("", String::as_str))
@@ -8144,6 +8185,8 @@ fn main() -> ExitCode {
                     ),
                     (None, None) => match recipe_output_store.as_deref() {
                         Some(s) => (Vec::new(), store::store_dir(), Some(Path::new(s))),
+                        // Legacy callers without the explicit option still use
+                        // STORE-DIR as both physical and canonical input space.
                         None => (vec![store_dir.clone()], store_dir.clone(), None),
                     },
                     _ => return Err("TD_SEED_STORE/TD_SEED_DB must be set together".into()),
@@ -8832,6 +8875,31 @@ mod tests {
             lock,
             "ripgrep-source /td/store/zzz-ripgrep-src source\n"
         );
+    }
+
+    // A warmed extraction is mutable cache state, so td shell consumes only the
+    // archived bytes whose digest the recipe catalog commits. The second leg is
+    // the verified-red control: changing one source byte must reject the cache.
+    #[test]
+    fn shell_source_archive_must_match_the_recipe_pin() {
+        let pins = "ripgrep-source\thttps://example.invalid/ripgrep.crate\tba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\tripgrep.crate\n";
+        let pin = parse_shell_source_pin(pins).unwrap();
+        assert_eq!(pin.key, "ripgrep-source");
+        assert_eq!(pin.file, "ripgrep.crate");
+
+        let dir = std::env::temp_dir().join(format!(
+            "td-shell-source-pin-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("ripgrep.crate");
+        std::fs::write(&archive, b"abc").unwrap();
+        verify_shell_source_archive(&archive, &pin).unwrap();
+        std::fs::write(&archive, b"abd").unwrap();
+        let err = verify_shell_source_archive(&archive, &pin).unwrap_err();
+        assert!(err.contains("!= recipe source pin"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The product shell may add only current `/td/store` recipe outputs to

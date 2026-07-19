@@ -57,6 +57,14 @@ fn find_in_path(path: &str, name: &str) -> Option<String> {
     None
 }
 
+fn require_executable_file(path: &str, label: &str) -> Result<(), String> {
+    let meta = fs::metadata(path).map_err(|e| format!("stat {label} {path}: {e}"))?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return Err(format!("{label} is not an executable file: {path}"));
+    }
+    Ok(())
+}
+
 /// patch-source-shebangs (in Rust) — gnu-build-system rewrites `#!/bin/sh` (and
 /// friends) across the unpacked tree to a real interpreter, because the pure
 /// build sandbox has no /bin/sh. td does the same: any file whose shebang names
@@ -1259,9 +1267,7 @@ pub fn run_rust() -> Result<(), String> {
         .filter(|p| !p.is_empty())
         .or_else(|| find_in_path(&path, "gcc"))
         .ok_or("gcc not found in TD_INPUTS and TD_RUST_STORE_CC is unset (linker)")?;
-    if !Path::new(&gcc).is_file() {
-        return Err(format!("native Rust linker is not a file: {gcc}"));
-    }
+    require_executable_file(&gcc, "native Rust linker")?;
     // Optional C/C++ compiler for crates with C build scripts (the `cc` crate honors
     // CC/CXX). Absent for pure-Rust builds — harmless, since no C is compiled then.
     let gpp = env::var("TD_RUST_STORE_CXX")
@@ -1269,9 +1275,7 @@ pub fn run_rust() -> Result<(), String> {
         .filter(|p| !p.is_empty())
         .or_else(|| find_in_path(&path, "g++"));
     if let Some(cxx) = &gpp {
-        if !Path::new(cxx).is_file() {
-            return Err(format!("native Rust C++ compiler is not a file: {cxx}"));
-        }
+        require_executable_file(cxx, "native Rust C++ compiler")?;
     }
     if let Ok(extra) = env::var("TD_RUST_STORE_INCLUDE") {
         for dir in extra.split(':').filter(|p| !p.is_empty()) {

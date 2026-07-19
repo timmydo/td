@@ -777,8 +777,13 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     let srcparent = cv.join("src");
     let srcdir = srcparent.join(format!("{krate}-{ver}"));
     let vendor = cv.join("vendor");
+    let work = cv.join("work");
+    let srccrate = work.join(format!("{krate}-{ver}.crate"));
 
-    if srcdir.join("Cargo.toml").is_file() && count_crates(&vendor) >= 1 {
+    if srcdir.join("Cargo.toml").is_file()
+        && srccrate.is_file()
+        && count_crates(&vendor) >= 1
+    {
         eprintln!(
             "td-feed warm crate: {krate}-{ver} already warm ({} crates) in {}",
             count_crates(&vendor),
@@ -795,7 +800,6 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
         return;
     }
 
-    let work = cv.join("work");
     let _ = std::fs::remove_dir_all(&work);
     let proxy_store = work.join("proxy-store");
     let addr = match start_cargo_proxy(&proxy_store) {
@@ -820,7 +824,6 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
             return;
         }
     };
-    let srccrate = work.join(format!("{krate}-{ver}.crate"));
     if std::fs::create_dir_all(&work).is_err() || std::fs::write(&srccrate, &body).is_err() {
         eprintln!("td-feed warm crate: could not stage the source crate for {krate}-{ver}");
         return;

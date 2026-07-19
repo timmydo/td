@@ -19,6 +19,8 @@
 //!                         runner and print machine-readable local output paths
 //!   source-pins           print recipe-owned fixed-output source pins as:
 //!                         <key>\t<url>\t<sha256>\t<file>
+//!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
+//!                         in the same tab-separated form
 //! This is the loop tool the `recipe-rs` gate drives AND the corpus consumer
 //! entry (replacing `ts-emit` on the boa path). (The system-spec subcommands —
 //! list-specs/emit-spec/verify-spec — were retired with the guix-system museum
@@ -118,6 +120,19 @@ fn print_source_pins() {
     }
 }
 
+fn print_recipe_source_pins(stem: &str) {
+    let recipe = lookup_or_die(stem);
+    let Some(pins) = recipe.source_pins else {
+        die(&format!("recipe `{stem}' declares no fixed-output source pin"));
+    };
+    if pins.is_empty() {
+        die(&format!("recipe `{stem}' declares no fixed-output source pin"));
+    }
+    for pin in pins {
+        println!("{}\t{}\t{}\t{}", pin.key, pin.url, pin.sha256, pin.file);
+    }
+}
+
 fn check_index(arg: Option<&String>) -> Option<usize> {
     let s = arg?;
     let n = s
@@ -206,6 +221,13 @@ fn main() {
             }
             print_source_pins();
         }
+        Some("source-pin") => {
+            let stem = args.get(2).unwrap_or_else(|| die("usage: source-pin STEM"));
+            if args.get(3).is_some() {
+                die("usage: source-pin STEM");
+            }
+            print_recipe_source_pins(stem);
+        }
         Some("seed-digests") => {
             if args.get(2).is_some() {
                 die("usage: seed-digests");
@@ -214,7 +236,7 @@ fn main() {
                 die_runner(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|source-pins|seed-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|source-pins|source-pin|seed-digests ..."),
     }
 }
 
@@ -398,6 +420,27 @@ mod tests {
         assert!(pins.iter().any(|pin| pin.key == "rust-stage0-cargo-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
         assert!(pins.iter().any(|pin| pin.key == "bash-mesboot-source"));
+    }
+
+    #[test]
+    fn rust_userland_recipes_own_their_fixed_output_source_pins() {
+        let ripgrep = catalog::lookup("ripgrep").unwrap();
+        let pins = ripgrep.source_pins.unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].key, "ripgrep-source");
+        assert_eq!(
+            pins[0].sha256,
+            "f77b8032dc584527975f34aa5a897d0ef5a785573fda778771a614ff9da501d9"
+        );
+
+        let fd = catalog::lookup("fd").unwrap();
+        let pins = fd.source_pins.unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].key, "fd-source");
+        assert_eq!(
+            pins[0].sha256,
+            "de08defa195af894cc295a43bfc65ba28903e492fd5f32f7a24bf75eafd9bf34"
+        );
     }
 
     #[test]
