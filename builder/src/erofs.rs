@@ -46,13 +46,27 @@
 //! same staged tree always packs to byte-identical bytes. File modes are PRESERVED
 //! (including suid/sgid/sticky); symlinks carry the conventional `0777`.
 //!
+//! Fidelity: filenames and symlink targets are handled as raw bytes (erofs/Linux permit
+//! any non-NUL sequence, not just UTF-8). Multiply-linked regular files are DEDUPLICATED
+//! by source `(st_dev, st_ino)` — one inode, one copy of the data — and each inode's
+//! nlink is the number of directory entries that reference it, so hard links keep a
+//! single identity and are not silently duplicated.
+//!
+//! Scope: the whole image (and every file's bytes) is assembled in memory before it is
+//! written. That is fine for the trees packed here; streaming the image to keep peak
+//! memory bounded when packing the full multi-GB `/td/store` is a follow-up for the
+//! two-stage-boot increment (#550), which is the first consumer of a store-sized tree.
+//!
 //! Validation: the tests round-trip through an in-module reader (the decode side of the
-//! same format) and assert determinism, nesting, symlinks, mode/suid preservation, and
-//! the special-inode (FIFO) path. A real-kernel mount is the boot test in the
+//! same format) and assert determinism, nesting, symlinks, mode/suid preservation, hard
+//! links, and the special-inode (FIFO) path. A real-kernel mount is the boot test in the
 //! kernel-config increment (#549).
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -91,9 +105,10 @@ const FT_SYMLINK: u8 = 7;
 
 /// The per-node body captured while walking the staged tree.
 enum Body {
-    /// A directory: its sorted `(name, child-index)` entries plus the parent's index
-    /// (for the `..` dirent; the root's parent is itself).
-    Dir { children: Vec<(String, usize)>, parent: usize },
+    /// A directory: its sorted `(raw-name-bytes, child-index)` entries plus the parent's
+    /// index (for the `..` dirent; the root's parent is itself). Names are stored as raw
+    /// bytes — erofs and Linux permit any non-NUL byte sequence, not just UTF-8.
+    Dir { children: Vec<(Vec<u8>, usize)>, parent: usize },
     File { data: Vec<u8> },
     Symlink { target: Vec<u8> },
     /// FIFO / socket / char / block device — no data blocks; `rdev` is the encoded
@@ -149,40 +164,53 @@ fn new_encode_dev(rdev: u64) -> u32 {
 /// index. `parent` is the index of the containing directory (the root passes its own
 /// index). Reserving the index before recursing keeps a directory's nid below its
 /// children's — the order is irrelevant to correctness, only that it is deterministic.
-fn walk(path: &Path, parent: usize, nodes: &mut Vec<Node>) -> io::Result<usize> {
+///
+/// `hardlinks` maps a source `(st_dev, st_ino)` to the nid of the inode already emitted
+/// for it, so multiply-linked regular files share ONE inode (and its data) rather than
+/// being duplicated per pathname; each such file's on-disk nlink is derived later from
+/// the number of directory references to it.
+fn walk(
+    path: &Path,
+    parent: usize,
+    nodes: &mut Vec<Node>,
+    hardlinks: &mut HashMap<(u64, u64), usize>,
+) -> io::Result<usize> {
     let meta = fs::symlink_metadata(path)?;
     let ft = meta.file_type();
+
+    // Hard-link dedup: a regular file with more than one link that we have already packed
+    // is referenced by its existing nid — no second inode, no duplicated data.
+    let hl_key = if ft.is_file() && meta.nlink() > 1 {
+        let key = (meta.dev(), meta.ino());
+        if let Some(&existing) = hardlinks.get(&key) {
+            return Ok(existing);
+        }
+        Some(key)
+    } else {
+        None
+    };
+
     let my_idx = nodes.len();
     // Reserve this node's slot with a placeholder; filled in after recursion.
     nodes.push(Node { mode: 0, body: Body::Special { rdev: 0 } });
 
     let (mode, body) = if ft.is_dir() {
         let perm = (meta.mode() & 0o7777) as u16;
-        let mut names: Vec<String> = Vec::new();
+        let mut names: Vec<OsString> = Vec::new();
         for ent in fs::read_dir(path)? {
-            let name = ent?.file_name().into_string().map_err(|n| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("non-UTF8 filename under {}: {}", path.display(), n.to_string_lossy()),
-                )
-            })?;
-            names.push(name);
+            names.push(ent?.file_name());
         }
-        names.sort();
-        let mut children: Vec<(String, usize)> = Vec::with_capacity(names.len());
+        // Deterministic order; sort by raw bytes (the same order the dirents use).
+        names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut children: Vec<(Vec<u8>, usize)> = Vec::with_capacity(names.len());
         for name in names {
-            let child_idx = walk(&path.join(&name), my_idx, nodes)?;
-            children.push((name, child_idx));
+            let child_idx = walk(&path.join(&name), my_idx, nodes, hardlinks)?;
+            children.push((name.as_bytes().to_vec(), child_idx));
         }
         (S_IFDIR as u16 | perm, Body::Dir { children, parent })
     } else if ft.is_symlink() {
-        let target = fs::read_link(path)?;
-        let target = target.into_os_string().into_string().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("non-UTF8 symlink target at {}", path.display()),
-            )
-        })?;
+        // erofs/Linux allow any non-NUL byte sequence for a symlink target.
+        let target = fs::read_link(path)?.into_os_string().into_vec();
         // A symlink target must be non-empty and fit a single block (POSIX targets are
         // well under 4096); FLAT_PLAIN stores it as the inode's data.
         if target.is_empty() || target.len() > BLOCK_SIZE {
@@ -191,7 +219,7 @@ fn walk(path: &Path, parent: usize, nodes: &mut Vec<Node>) -> io::Result<usize> 
                 format!("symlink target at {} is empty or over one block", path.display()),
             ));
         }
-        (S_IFLNK as u16 | 0o777, Body::Symlink { target: target.into_bytes() })
+        (S_IFLNK as u16 | 0o777, Body::Symlink { target })
     } else if ft.is_file() {
         let data = fs::read(path)?;
         // Compact inodes carry a 32-bit i_size; a >=4 GiB file would need the extended
@@ -230,6 +258,10 @@ fn walk(path: &Path, parent: usize, nodes: &mut Vec<Node>) -> io::Result<usize> 
         }
         None => return Err(io::Error::other("internal: reserved inode slot vanished")),
     }
+    // Record the inode so any further hard link to the same source file reuses this nid.
+    if let Some(key) = hl_key {
+        hardlinks.insert(key, my_idx);
+    }
     Ok(my_idx)
 }
 
@@ -239,7 +271,7 @@ fn walk(path: &Path, parent: usize, nodes: &mut Vec<Node>) -> io::Result<usize> 
 fn build_dir_data(
     idx: usize,
     parent: usize,
-    children: &[(String, usize)],
+    children: &[(Vec<u8>, usize)],
     nodes: &[Node],
 ) -> io::Result<Vec<u8>> {
     // (name-bytes, nid, file_type)
@@ -253,7 +285,7 @@ fn build_dir_data(
                 return Err(io::Error::other("internal: dangling child index"))
             }
         };
-        entries.push((name.clone().into_bytes(), *cidx as u64, ft));
+        entries.push((name.clone(), *cidx as u64, ft));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -322,8 +354,9 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
         ));
     }
     let mut nodes: Vec<Node> = Vec::new();
+    let mut hardlinks: HashMap<(u64, u64), usize> = HashMap::new();
     // The root's parent is itself (its `..` points back to the root nid, 0).
-    walk(root, 0, &mut nodes)?;
+    walk(root, 0, &mut nodes, &mut hardlinks)?;
     let ninodes = nodes.len();
 
     // Pass 1: each node's raw data bytes (directories become dirent blocks).
@@ -335,7 +368,26 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
             Body::Symlink { target } => target.clone(),
             Body::Special { .. } => Vec::new(),
         };
+        // i_size is a 32-bit field in the compact inode. Files are checked at read time;
+        // this also covers a directory whose dirent blocks would exceed 4 GiB.
+        if d.len() > u32::MAX as usize {
+            return Err(io::Error::other("erofs: inode data exceeds the 32-bit i_size limit"));
+        }
         datas.push(d);
+    }
+
+    // How many directory entries across the whole tree reference each node. For a
+    // hard-linked regular file this is its in-image link count; a directory's nlink is
+    // computed separately (2 + subdir count), so its reference count is unused.
+    let mut ref_count: Vec<usize> = vec![0; ninodes];
+    for n in &nodes {
+        if let Body::Dir { children, .. } = &n.body {
+            for (_, cidx) in children {
+                if let Some(c) = ref_count.get_mut(*cidx) {
+                    *c += 1;
+                }
+            }
+        }
     }
 
     // Layout: block 0 = superblock; blocks [1 ..) = inode table; then data blocks.
@@ -352,10 +404,21 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
         if nblk == 0 {
             startblk.push(0);
         } else {
+            // `blocks_lo` and `startblk_lo` are 32-bit block addresses. Fail loud if the
+            // physical layout would exceed that (16 TiB) rather than silently wrapping and
+            // overlapping later nodes onto earlier data.
+            let next = u32::try_from(nblk)
+                .ok()
+                .and_then(|n| cursor.checked_add(n))
+                .ok_or_else(|| {
+                    io::Error::other("erofs image exceeds the 32-bit block-address capacity")
+                })?;
             startblk.push(cursor);
-            cursor = cursor.saturating_add(nblk as u32);
+            cursor = next;
         }
         let links = match &n.body {
+            // A directory links to itself (`.`), its parent links to it, and each
+            // subdirectory's `..` links back — so nlink = 2 + subdirectory count.
             Body::Dir { children, .. } => {
                 let subdirs = children
                     .iter()
@@ -363,10 +426,15 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
                         nodes.get(*cidx).is_some_and(|c| u32::from(c.mode) & S_IFMT == S_IFDIR)
                     })
                     .count();
-                (2 + subdirs).min(u16::MAX as usize) as u16
+                2 + subdirs
             }
-            _ => 1,
+            // Non-directories: the number of in-image directory references (>1 only for
+            // hard-linked files). Every packed node has at least its one parent entry.
+            _ => ref_count.get(idx).copied().unwrap_or(1).max(1),
         };
+        // i_nb (nlink) is a 16-bit field in the compact inode; reject rather than clamp.
+        let links = u16::try_from(links)
+            .map_err(|_| io::Error::other("erofs: link count exceeds the 16-bit i_nb limit"))?;
         nlink.push(links);
     }
     let total_blocks = cursor;
@@ -527,20 +595,56 @@ mod tests {
         img[base..base + ino.size as usize].to_vec()
     }
 
+    /// Like `read_dir`, but returns raw name bytes (for non-UTF8 names).
+    fn read_dir_bytes(img: &[u8], ino: &RInode) -> Vec<(Vec<u8>, u64, u8)> {
+        let mut out = Vec::new();
+        let nblocks = (ino.size as usize) / BLOCK_SIZE;
+        for b in 0..nblocks {
+            let base = (ino.u as usize + b) * BLOCK_SIZE;
+            let block = &img[base..base + BLOCK_SIZE];
+            let k = rd_u16(block, 8) as usize / DIRENT_SIZE;
+            for j in 0..k {
+                let de = j * DIRENT_SIZE;
+                let nid = rd_u64(block, de);
+                let nameoff = rd_u16(block, de + 8) as usize;
+                let ft = block[de + 10];
+                let nameend = if j + 1 < k {
+                    rd_u16(block, (j + 1) * DIRENT_SIZE + 8) as usize
+                } else {
+                    let mut e = nameoff;
+                    while e < BLOCK_SIZE && block[e] != 0 {
+                        e += 1;
+                    }
+                    e
+                };
+                out.push((block[nameoff..nameend].to_vec(), nid, ft));
+            }
+        }
+        out
+    }
+
     /// Resolve a path (slash-separated, no leading slash) from the root, returning its
     /// inode. Panics (test-only) if any component is missing.
     fn lookup(img: &[u8], parts: &[&str]) -> RInode {
+        let (nid, meta) = lookup_nid(img, parts);
+        read_inode(img, meta, nid)
+    }
+
+    /// Like `lookup`, but returns the resolved nid (and meta_blkaddr) so tests can assert
+    /// two paths share one inode (hard links).
+    fn lookup_nid(img: &[u8], parts: &[&str]) -> (u64, u32) {
         let (root_nid, _blocks, meta) = read_super(img);
-        let mut cur = read_inode(img, meta, u64::from(root_nid));
+        let mut nid = u64::from(root_nid);
         for part in parts {
+            let cur = read_inode(img, meta, nid);
             let entries = read_dir(img, &cur);
-            let (_, nid, _) = entries
+            let (_, found, _) = entries
                 .iter()
                 .find(|(n, _, _)| n == part)
                 .unwrap_or_else(|| panic!("component {part} not found in {entries:?}"));
-            cur = read_inode(img, meta, *nid);
+            nid = *found;
         }
-        cur
+        (nid, meta)
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
@@ -730,5 +834,66 @@ mod tests {
         // char 1:3 (/dev/null): (3) | (1<<8) == 0x0103.
         let raw2: u64 = (1u64 << 8) | 3;
         assert_eq!(new_encode_dev(raw2), 0x0103);
+    }
+
+    #[test]
+    fn hard_links_share_one_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmpdir("hardlink");
+        let root = d.join("r");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let a = root.join("bin/a");
+        fs::write(&a, b"shared-bytes").unwrap();
+        // Two more hard links to the same inode, in different directories.
+        fs::create_dir_all(root.join("sbin")).unwrap();
+        fs::hard_link(&a, root.join("bin/b")).unwrap();
+        fs::hard_link(&a, root.join("sbin/c")).unwrap();
+        assert!(fs::metadata(&a).unwrap().nlink() >= 3, "test setup: need >1 link");
+
+        let img = build_image(&root).unwrap();
+
+        // All three paths must resolve to the SAME nid (one inode, one data copy).
+        let (na, _) = lookup_nid(&img, &["bin", "a"]);
+        let (nb, _) = lookup_nid(&img, &["bin", "b"]);
+        let (nc, _) = lookup_nid(&img, &["sbin", "c"]);
+        assert_eq!(na, nb, "hard links must share a nid");
+        assert_eq!(na, nc, "hard links must share a nid across directories");
+
+        let ino = lookup(&img, &["bin", "a"]);
+        assert_eq!(ino.nlink, 3, "nlink must count the in-image references");
+        assert_eq!(read_file(&img, &ino), b"shared-bytes", "shared data must round-trip");
+
+        // Determinism holds with hard links present.
+        let b = d.join("r2");
+        fs::create_dir_all(b.join("bin")).unwrap();
+        fs::create_dir_all(b.join("sbin")).unwrap();
+        fs::write(b.join("bin/a"), b"shared-bytes").unwrap();
+        fs::hard_link(b.join("bin/a"), b.join("bin/b")).unwrap();
+        fs::hard_link(b.join("bin/a"), b.join("sbin/c")).unwrap();
+        assert_eq!(build_image(&b).unwrap(), img, "hard-linked tree must pack deterministically");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn non_utf8_name_roundtrips() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let d = tmpdir("nonutf8");
+        let root = d.join("r");
+        fs::create_dir_all(&root).unwrap();
+        // 0xFF is not valid UTF-8 but is a legal filename byte (only '/' and NUL are not).
+        let raw = b"caf\xe9\xff";
+        let name = OsStr::from_bytes(raw);
+        fs::write(root.join(name), b"z").unwrap();
+
+        let img = build_image(&root).unwrap();
+        let (root_nid, _b, meta) = read_super(&img);
+        let root_ino = read_inode(&img, meta, u64::from(root_nid));
+        let entries = read_dir_bytes(&img, &root_ino);
+        assert!(
+            entries.iter().any(|(n, _, _)| n.as_slice() == raw),
+            "non-UTF8 name must survive verbatim; got {entries:?}"
+        );
+        fs::remove_dir_all(&d).unwrap();
     }
 }
