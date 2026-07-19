@@ -10,8 +10,8 @@ use crate::types::{Recipe, Step};
 // meant to be EDITED (the `SYSTEM` const below) to tailor the distro: hostname,
 // users, the auto-login user, the login shell, and the applet set. Unlike the
 // kernel rung, it carries no heavy test suite — a producer-rung shape check on the
-// packed cpio is the only automated guard; the interactive `td-recipe-eval run
-// linux-x86-64` command boots it under host qemu so you can use it.
+// packed cpio is the only automated guard; the interactive `td-recipe-eval run`
+// command boots it under host qemu so you can use it.
 //
 // Userland strategy (v0): busybox provides init/getty/login/ash/coreutils — all
 // present in its `defconfig`, all STATIC, so the initramfs is self-contained (no
@@ -45,7 +45,7 @@ struct User {
 }
 
 /// The distro definition. EDIT THIS to tailor the system, then rebuild and
-/// `td-recipe-eval run linux-x86-64`.
+/// `td-recipe-eval run`.
 struct SystemDef {
     hostname: &'static str,
     os_name: &'static str,
@@ -258,7 +258,7 @@ fn build_spec(sys: &SystemDef) -> String {
 /// floor (static busybox alone is ~1 MiB), a `busybox cpio -t` parse (reds on a
 /// truncated/corrupt stream), and the presence of the key members that make it
 /// bootable. This is a build sanity assert, not a behavioural test — the boot is
-/// exercised interactively by `td-recipe-eval run linux-x86-64`.
+/// exercised interactively by `td-recipe-eval run`.
 fn shape_check() -> String {
     "sz=$(wc -c < '{out}/rootfs.cpio'); \
      [ \"$sz\" -ge 65536 ] || { echo \"rootfs.cpio: implausibly small ($sz bytes) — the static busybox alone is ~1 MiB\" >&2; exit 1; }; \
