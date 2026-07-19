@@ -65,6 +65,28 @@ const EROFS_PROBE_SENTINEL: &str = td_recipe::ladder::EROFS_PROBE_SENTINEL;
 /// the bytes the oracle writes and the token the /init expects can never desync.
 const EROFS_PROBE_CONTENT: &str = td_recipe::ladder::EROFS_PROBE_CONTENT;
 
+/// The greeter line the real-root login shell prints via `/etc/profile` once the
+/// two-stage boot (#550) has switch_root'ed into the erofs root and reached an
+/// interactive auto-login shell — the primary success criterion of `qemu-boot-system`.
+/// Shared with the recipe (system-x86-64.rs) via `td_recipe::ladder` so the printed
+/// line and the oracle key can never desync.
+const GREETER_MARKER: &str = td_recipe::ladder::GREETER_MARKER;
+
+/// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
+/// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
+/// the immutable erofs image, not a writable copy.
+const SYSTEM_ROOT_RO_MARKER: &str = td_recipe::ladder::SYSTEM_ROOT_RO_MARKER;
+
+/// The line `/etc/rootcheck` prints once it has confirmed the writable dirs
+/// (`/etc /var /run /tmp /home`) are tmpfs-backed and actually accept writes (re #550).
+/// Asserted by `qemu-boot-system` so a green result proves the overlays are live.
+const SYSTEM_WRITABLE_MARKER: &str = td_recipe::ladder::SYSTEM_WRITABLE_MARKER;
+
+/// The kernel-cmdline token `qemu-boot-system` appends so the greeter self-exits and
+/// the VM powers off — a headless "exit powers off" proof with no terminal to type
+/// into. Shared with the recipe's `/etc/profile` autotest gate via `td_recipe::ladder`.
+const AUTOTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::AUTOTEST_CMDLINE_TOKEN;
+
 /// Default wall-clock ceiling. A tiny allnoconfig kernel boots to userspace under
 /// TCG in a few seconds, but TCG on a loaded builder can be slow; 180s is
 /// generous. The poll loop kills qemu the instant the marker appears, so a healthy
@@ -106,6 +128,12 @@ enum EndReason {
 struct BootResult {
     /// The userland marker reached ttyS0 — the sole success criterion.
     marker: bool,
+    /// qemu terminated on its OWN with a success status: a clean guest-initiated
+    /// power-off under `-no-reboot`. Only meaningful when the boot was allowed to run
+    /// to the guest's own shutdown (`kill_on_marker = false`); the marker-killed modes
+    /// reap qemu themselves and leave this false. `qemu-boot-system` asserts it — "exit
+    /// powers off" means the VM terminated cleanly, not that the oracle killed it.
+    exited_clean: bool,
     /// How the boot loop ended, for a FAILED boot's error message.
     reason: String,
     /// Bounded, lossily-decoded tail of ttyS0 (or qemu's own diagnostics if ttyS0
@@ -129,7 +157,18 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         initramfs.display()
     );
 
-    let result = boot(&qemu, &bzimage, &initramfs, None, MARKER, runner.scratch_dir())?;
+    let result = boot(
+        &qemu,
+        &bzimage,
+        &initramfs,
+        BootPlan {
+            disk: None,
+            target_marker: MARKER,
+            kill_on_marker: true,
+            extra_append: "",
+        },
+        runner.scratch_dir(),
+    )?;
     if !result.marker {
         return Err(format!(
             "kernel did not reach the userland marker {MARKER:?} on ttyS0 — {} \
@@ -170,8 +209,12 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
         &qemu,
         &bzimage,
         &initramfs,
-        Some(&disk),
-        EROFS_MARKER,
+        BootPlan {
+            disk: Some(&disk),
+            target_marker: EROFS_MARKER,
+            kill_on_marker: true,
+            extra_append: "",
+        },
         runner.scratch_dir(),
     )?;
     if !result.marker {
@@ -186,6 +229,89 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
     println!(
         "PASS: linux-x86-64 mounts a td-written erofs image READ-ONLY over virtio-blk under qemu (TCG) — \
          the source-built EROFS_FS + VIRTIO_BLK kernel reads the store-shaped root back ({EROFS_MARKER} on ttyS0)"
+    );
+    Ok(())
+}
+
+/// `qemu-boot-system` (re #550): the headless end-to-end proof of the TWO-STAGE boot.
+/// The kernel (bzImage) comes from `linux-x86-64`; the stage-1 init-initramfs
+/// (`init.cpio`) and the real-root TREE come from `system-x86-64`. The oracle packs the
+/// tree into a read-only erofs image with the control-plane `td-builder mkfs-erofs`
+/// writer (#548), attaches it as `/dev/vda`, and boots stage-1 with the autotest token on
+/// the kernel cmdline. Stage-1 mounts the erofs root read-only, overlays tmpfs for the
+/// writable dirs, and `switch_root`s into it; the real-root init reaches the auto-login
+/// greeter, which (seeing the autotest token) exits so the VM powers off. A green result
+/// asserts, in order: the greeter was reached, `/` is a read-only erofs mount, the
+/// writable dirs are tmpfs-backed, and the VM powered off cleanly on `exit`.
+pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
+    // qemu first (fail fast if absent), then the kernel, then the system image, then the
+    // erofs root packed from its staged tree.
+    let qemu = find_qemu()?;
+    let (bzimage, _initramfs) = build_kernel(runner)?;
+    let (init_cpio, root_tree) = build_system(runner)?;
+    let disk = build_system_erofs(runner, &root_tree)?;
+
+    println!(
+        "   [qemu-boot-system] {qemu} boots the two-stage system image under TCG: init.cpio -> read-only erofs root over virtio-blk -> switch_root -> greeter\n              kernel:     {}\n              init.cpio:  {}\n              erofs root: {}",
+        bzimage.display(),
+        init_cpio.display(),
+        disk.display()
+    );
+
+    // kill_on_marker = false: the greeter marker is NOT the end — the guest prints it and
+    // then powers itself off, and we assert on that clean self-exit. AUTOTEST_CMDLINE_TOKEN
+    // drives the greeter's headless self-exit.
+    let result = boot(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        BootPlan {
+            disk: Some(&disk),
+            target_marker: GREETER_MARKER,
+            kill_on_marker: false,
+            extra_append: AUTOTEST_CMDLINE_TOKEN,
+        },
+        runner.scratch_dir(),
+    )?;
+    if !result.marker {
+        return Err(format!(
+            "the two-stage boot did not reach the greeter {GREETER_MARKER:?} on ttyS0 — {} \
+             (stage-1 could not mount the erofs root over virtio-blk, switch_root failed, or the \
+             real-root init never reached an auto-login shell). Last serial output:\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.console.contains(SYSTEM_ROOT_RO_MARKER) {
+        return Err(format!(
+            "the greeter was reached but /etc/rootcheck did not confirm a READ-ONLY erofs root \
+             ({SYSTEM_ROOT_RO_MARKER:?} absent from /proc/mounts) — `/` is not a read-only erofs mount \
+             after switch_root. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.console.contains(SYSTEM_WRITABLE_MARKER) {
+        return Err(format!(
+            "the greeter was reached but /etc/rootcheck did not confirm tmpfs-backed WRITABLE dirs \
+             ({SYSTEM_WRITABLE_MARKER:?} absent) — the /etc /var /run /tmp /home overlays are not \
+             tmpfs-backed or did not accept a write probe. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.exited_clean {
+        return Err(format!(
+            "the greeter was reached and both root checks passed, but the VM did not power off cleanly \
+             on the autotest `exit` — {} (the `exit`-powers-off path regressed: getty/login did not \
+             return 0, or `reboot -f` did not fire). Last serial output:\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
+    println!(
+        "PASS: system-x86-64 boots TWO-STAGE under qemu (TCG) — stage-1 mounts the td-written erofs root \
+         read-only over virtio-blk, switch_root enters it, and the real-root init reaches the greeter \
+         ({GREETER_MARKER}); `/` is a read-only erofs mount ({SYSTEM_ROOT_RO_MARKER}), the writable dirs \
+         are tmpfs-backed ({SYSTEM_WRITABLE_MARKER}), and `exit` powers the VM off cleanly"
     );
     Ok(())
 }
@@ -207,6 +333,33 @@ fn build_kernel(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String
         }
     }
     Ok((bzimage, initramfs))
+}
+
+/// Build the `system-x86-64` producer and return its `(init.cpio, root-tree)` — the
+/// stage-1 init-initramfs and the staged real-root TREE the oracle packs into the erofs
+/// root. Both are producer-rung artifacts under the recipe's `{out}` (`init.cpio` is a
+/// file, `root/` is a directory), guarded by the recipe's own shape check at build time;
+/// this re-checks their presence so a missing artifact reds here with a clear message
+/// rather than deep inside qemu.
+fn build_system(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String> {
+    runner.prepare_recipe_target("system-x86-64")?;
+    let build_out = runner.build_plan("system-x86-64")?;
+    let tree = runner.ladder_out_from(&build_out, "system-x86-64")?;
+    let init_cpio = tree.join("init.cpio");
+    let root_tree = tree.join("root");
+    if !init_cpio.is_file() {
+        return Err(format!(
+            "system-x86-64 output is missing init.cpio ({}) — the two-stage boot needs the stage-1 initramfs",
+            init_cpio.display()
+        ));
+    }
+    if !root_tree.is_dir() {
+        return Err(format!(
+            "system-x86-64 output is missing the real-root tree ({}) — the two-stage boot needs it to build the erofs root",
+            root_tree.display()
+        ));
+    }
+    Ok((init_cpio, root_tree))
 }
 
 /// Build a tiny probe erofs image with the control-plane `td-builder mkfs-erofs`
@@ -247,6 +400,40 @@ fn build_probe_image(runner: &RecipeCheckRunner) -> Result<PathBuf, String> {
     if !img.is_file() {
         return Err(format!(
             "td-builder mkfs-erofs reported success but did not produce {}",
+            img.display()
+        ));
+    }
+    Ok(img)
+}
+
+/// Pack the staged real-root TREE (`{out}/root` from the `system-x86-64` build) into a
+/// read-only erofs image with the control-plane `td-builder mkfs-erofs` writer (#548) —
+/// the `/dev/vda` root the two-stage boot switch_root's into. The recipe stages the tree
+/// (recipes cannot invoke the control-plane writer, which never sits on a recipe
+/// PATH/argv); the oracle packs it, exactly as the #549 probe path does. The image lands
+/// in the runner's per-invocation scratch, rebuilt fresh (any stale copy removed first) so
+/// a prior run's bytes can never be reused. The writer stamps uid/gid 0, so the whole root
+/// is root-owned — per-user home ownership is fixed at boot by `/etc/rootcheck`.
+fn build_system_erofs(runner: &RecipeCheckRunner, root_tree: &Path) -> Result<PathBuf, String> {
+    let scratch = runner.scratch_dir();
+    let img = scratch.join("system-root.img");
+    let _ = fs::remove_file(&img);
+    let status = runner
+        .builder_command()
+        .arg("mkfs-erofs")
+        .arg(root_tree)
+        .arg(&img)
+        .status()
+        .map_err(|e| format!("spawn td-builder mkfs-erofs: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "td-builder mkfs-erofs failed ({status}) building the erofs root from {}",
+            root_tree.display()
+        ));
+    }
+    if !img.is_file() {
+        return Err(format!(
+            "td-builder mkfs-erofs reported success but did not produce the erofs root image {}",
             img.display()
         ));
     }
@@ -304,17 +491,34 @@ fn parse_timeout(raw: Option<String>) -> Duration {
 /// console is read INCREMENTALLY into a bounded rolling buffer — decoded lossily
 /// so a non-UTF-8 serial byte can't empty the capture, and trimmed to the last
 /// CAP bytes so a flooding boot can't balloon memory or make the poll quadratic.
-/// Kill qemu the instant `target_marker` appears; otherwise bound it by the
-/// wall-clock ceiling or the guest's own `reboot -f`. `disk`, when set, attaches an
-/// erofs image as a read-only virtio-blk disk (/dev/vda in the guest); `None` boots
-/// diskless. `target_marker` lets the two boot modes key on different lines (the
-/// userland marker vs. the read-only-erofs marker printed only after a good mount).
+/// The per-mode boot parameters — everything that differs between the diskless kernel
+/// boot, the erofs-probe boot, and the two-stage system boot. Grouped into one struct so
+/// `boot` keeps a small, self-documenting signature: named fields at the call site
+/// (`kill_on_marker: false`) beat positional bools/strings.
+struct BootPlan<'a> {
+    /// A read-only erofs image to attach over virtio-blk (/dev/vda in the guest), or
+    /// `None` for a diskless boot.
+    disk: Option<&'a Path>,
+    /// The ttyS0 line whose appearance means the boot reached its target state; lets the
+    /// boot modes key on different lines (userland vs. read-only-erofs vs. greeter).
+    target_marker: &'a str,
+    /// `true`: kill qemu the instant the marker appears — the marker IS the end (the
+    /// diskless and erofs-probe modes). `false`: latch the marker but let the guest run to
+    /// its OWN power-off, so `exited_clean` records a clean shutdown (the two-stage
+    /// `qemu-boot-system` mode, whose success includes "exit powers off"). Either way the
+    /// boot is bounded by the wall-clock ceiling and the flood guard.
+    kill_on_marker: bool,
+    /// Extra kernel cmdline appended after the base (empty for none) — `qemu-boot-system`
+    /// passes the autotest token so the greeter self-exits headlessly.
+    extra_append: &'a str,
+}
+
+/// Boot `bzImage` + `initramfs` under qemu per `plan` (see `BootPlan`), capturing ttyS0.
 fn boot(
     qemu: &str,
     bzimage: &Path,
     initramfs: &Path,
-    disk: Option<&Path>,
-    target_marker: &str,
+    plan: BootPlan<'_>,
     scratch_base: &Path,
 ) -> Result<BootResult, String> {
     // Per-invocation console/diag dir created EXCLUSIVELY (mkdir, not mkdir -p)
@@ -355,7 +559,16 @@ fn boot(
     // exact path, correct even if the base dir contains a comma. (Do not "escape"
     // this.)
     let serial = format!("file:{}", console_path.display());
-    let append = "console=ttyS0 panic=-1 rdinit=/init";
+    // Base cmdline: ttyS0 console, panic-reboots (=> qemu exits), and rdinit=/init runs
+    // the stage-1 (or single-stage) init from the initramfs. `extra_append`, when set,
+    // appends caller cmdline (qemu-boot-system's autotest token that makes the greeter
+    // self-exit) after a single space.
+    let base_append = "console=ttyS0 panic=-1 rdinit=/init";
+    let append = if plan.extra_append.is_empty() {
+        base_append.to_string()
+    } else {
+        format!("{base_append} {}", plan.extra_append)
+    };
     let mut cmd = Command::new(qemu);
     cmd.args(["-M", "pc", "-accel", "tcg", "-m", "256", "-no-reboot"])
         .args(["-display", "none", "-monitor", "none"])
@@ -365,13 +578,13 @@ fn boot(
         .arg(bzimage)
         .arg("-initrd")
         .arg(initramfs)
-        .args(["-append", append]);
+        .args(["-append", &append]);
     // Optional read-only erofs disk (re #549): if=none defines the backing store and
     // a separate virtio-blk-pci -device attaches it as /dev/vda in the guest.
     // readonly=on matches the immutable erofs root and lets qemu refuse any write.
     // drive_arg comma-doubles the image path so a scratch dir with a literal comma in
     // its path can't be misparsed as an extra -drive key=value pair.
-    if let Some(disk) = disk {
+    if let Some(disk) = plan.disk {
         cmd.arg("-drive").arg(drive_arg(disk));
         cmd.args(["-device", "virtio-blk-pci,drive=erofs0"]);
     }
@@ -384,14 +597,14 @@ fn boot(
 
     let timeout = boot_timeout();
     let start = Instant::now();
-    let marker_bytes = target_marker.as_bytes();
+    let marker_bytes = plan.target_marker.as_bytes();
     let mut console_file: Option<File> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut marker = false;
     let mut end;
     loop {
         marker |= drain_console(&console_path, &mut console_file, &mut buf, marker_bytes);
-        if marker {
+        if marker && plan.kill_on_marker {
             let _ = child.kill();
             let _ = child.wait();
             end = EndReason::MarkerSeen;
@@ -433,6 +646,15 @@ fn boot(
         thread::sleep(POLL);
     }
 
+    // Whether qemu terminated on its OWN with a success status. Captured from the loop's
+    // terminating reason BEFORE the marker realignment below (which may relabel `end` to
+    // MarkerSeen for the reason string) so a clean self-exit is never erased: the
+    // qemu-boot-system guest prints its marker and THEN powers off, and that clean
+    // shutdown is the "exit powers off" proof. `matches!` on `&end` leaves `end` intact
+    // for the reason match below; the marker-killed modes never reach QemuExited, so this
+    // stays false for them.
+    let exited_clean = matches!(&end, EndReason::QemuExited(status) if status.success());
+
     // Drain any final bytes qemu flushed before it was reaped (e.g. the marker
     // line printed just before `reboot -f` made qemu exit). If the marker only
     // shows up in this final flush, realign `end` so it agrees with `marker`.
@@ -468,6 +690,7 @@ fn boot(
     };
     Ok(BootResult {
         marker,
+        exited_clean,
         reason,
         console,
     })
@@ -531,8 +754,9 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// qemu would misparse the path tail as a spurious extra key. Only the path's commas
 /// are doubled — the option-separator commas in the fixed prefix stay single. Built
 /// byte-wise off the raw path bytes and returned as an `OsString` so a non-UTF-8 path
-/// survives without a lossy round-trip.
-fn drive_arg(disk: &Path) -> OsString {
+/// survives without a lossy round-trip. Shared with the interactive `run` tool
+/// (checks/run.rs), which attaches the same read-only erofs root over virtio-blk.
+pub(crate) fn drive_arg(disk: &Path) -> OsString {
     let mut out = OsString::from("if=none,format=raw,readonly=on,id=erofs0,file=");
     let path_bytes = disk.as_os_str().as_bytes();
     let mut escaped: Vec<u8> = Vec::with_capacity(path_bytes.len());

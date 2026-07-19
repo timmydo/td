@@ -118,6 +118,41 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::run_erofs(&runner)
 }
 
+/// `td-recipe-eval qemu-boot-system [system-x86-64]` — the headless two-stage boot proof
+/// (re #550). Builds the `linux-x86-64` bzImage and the `system-x86-64` stage-1 init.cpio
+/// and real-root tree, packs the tree into a read-only erofs image with the control-plane
+/// `mkfs-erofs` writer (#548), and boots the two stages under host qemu with the autotest
+/// token on the kernel cmdline: stage-1 mounts the erofs root read-only over virtio-blk and
+/// `switch_root`s into it, the real-root init reaches the greeter, and the greeter self-
+/// exits so the VM powers off. It asserts the greeter, a read-only erofs `/`, tmpfs-backed
+/// writable dirs, and a clean power-off. UNLIKE `run`, this is a PASS/FAIL smoke test with
+/// no interactive terminal — host-side (never a gated check) for the same reason `qemu-boot`
+/// is: the daily sandbox has no host qemu. See checks/qemu_boot.rs.
+pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    let stem = args.first().map(String::as_str).unwrap_or(STEM);
+    if stem != STEM {
+        return Err(format!(
+            "qemu-boot-system only supports {STEM} (got '{stem}'); usage: qemu-boot-system [{STEM}]"
+        ));
+    }
+    if args.get(1).is_some() {
+        return Err(format!("usage: qemu-boot-system [{STEM}]"));
+    }
+    // Provenance planning FIRST — before the runner exists (re #469), matching
+    // `qemu_boot_cli`: a rejected graph spawns no subprocess.
+    ensure_targets_provenance(&[stem])?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
+    // a killed system boot's per-boot directories (it can hold a multi-GiB kernel build).
+    let scratch_name = scratch_name("qemu-boot", &[stem]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let _lock = lock_file(&runner.lock_path())?;
+    runner.setup()?;
+    crate::checks::qemu_boot::run_system(&runner)
+}
+
 /// `td-recipe-eval run [system-x86-64]` — the interactive distro runner (re #541).
 /// Builds the `system-x86-64` initramfs (its closure pulls in the `linux-x86-64`
 /// bzImage) and boots it under host qemu with an interactive serial console. Like
