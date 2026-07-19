@@ -781,6 +781,28 @@ mod tests {
     }
 
     #[test]
+    fn unpack_archive_keep_top_round_trips_an_uncompressed_tar() {
+        // The X3 toolchain path (toolchain_x86_64.rs) unpacks the host-free,
+        // UNCOMPRESSED kernel-headers seed via unpack_archive(keep_top=true) — magic-byte
+        // sniffing falls through to plain `extract_tar` for a non-gzip/bz2/xz magic. Lock
+        // that a plain tar with a top-level dir round-trips WITHOUT stripping that dir
+        // (keep_top=true == the old untar strip=0), the exact behavior that swap relies on.
+        let tmp = temp_dir("td-tar-keeptop");
+        let tar = tmp.join("plain.tar");
+        let out = tmp.join("out");
+        let mut bytes = Vec::new();
+        append_header(&mut bytes, "kh/asm/types.h", b'0', 0o644, 5, "");
+        append_data(&mut bytes, b"hello");
+        bytes.extend_from_slice(&[0u8; BLOCK * 2]);
+        fs::write(&tar, bytes).unwrap();
+
+        unpack_archive(&tar, &out, true).unwrap();
+
+        // Top-level "kh" dir preserved (no --strip-components), content intact.
+        assert_eq!(fs::read(out.join("kh/asm/types.h")).unwrap(), b"hello");
+    }
+
+    #[test]
     fn extracts_gnu_long_name_hardlinks_and_absolute_symlinks() {
         let tmp = temp_dir("td-tar-test");
         let tar = tmp.join("test.tar");
