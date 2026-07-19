@@ -117,7 +117,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         busybox_base,
     )?;
     println!(
-        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo contain no stage0 artifacts; td shell builds and runs ripgrep/fd against td GCC/glibc with /gnu/store absent"
+        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo contain no stage0 artifacts; td shell builds and runs ripgrep/fd/uutils against td GCC/glibc with /gnu/store absent"
     );
     Ok(())
 }
@@ -139,7 +139,7 @@ fn prove_td_shell_userland(
 ) -> Result<(), String> {
     let root = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let vendor_root = root.join(".td-build-cache/crate-vendor");
-    for package in ["ripgrep", "fd"] {
+    for package in ["ripgrep", "fd", "uutils"] {
         let package_root = vendor_root.join(package);
         if !package_root.join("work").is_dir() || !package_root.join("vendor").is_dir() {
             return Err(format!(
@@ -190,18 +190,32 @@ fn prove_td_shell_userland(
          for p in {TD_STORE_DIR}/*-fd-10.2.0/bin/fd; do\n\
            if test -x \"$p\"; then fd=$p; fi\n\
          done\n\
+         uutils=''\n\
+         for p in {TD_STORE_DIR}/*-uutils-0.9.0/bin/coreutils; do\n\
+           if test -x \"$p\"; then uutils=$p; fi\n\
+         done\n\
          test -n \"$rg\"\n\
          test -n \"$fd\"\n\
+         test -n \"$uutils\"\n\
          mkdir -p /tmp/td-shell-userland/sub\n\
          printf '%s\\n' TD-414-NEEDLE >/tmp/td-shell-userland/sub/known-needle.txt\n\
          rg_out=$(\"$rg\" --fixed-strings TD-414-NEEDLE /tmp/td-shell-userland)\n\
          case \"$rg_out\" in *TD-414-NEEDLE*) ;; *) exit 91 ;; esac\n\
          fd_out=$(\"$fd\" '^known-needle[.]txt$' /tmp/td-shell-userland)\n\
          case \"$fd_out\" in */known-needle.txt) ;; *) exit 92 ;; esac\n\
+         uu_out=$(\"$uutils\" printf '%s:%s\\n' TD UUTILS)\n\
+         test \"$uu_out\" = TD:UUTILS || exit 95\n\
+         test \"$(\"$uutils\" cat /tmp/td-shell-userland/sub/known-needle.txt)\" = TD-414-NEEDLE || exit 96\n\
+         test \"$(\"$uutils\" uname -s)\" = Linux || exit 97\n\
+         uu_id=$(\"$uutils\" id -u)\n\
+         case \"$uu_id\" in ''|*[!0-9]*) exit 98 ;; esac\n\
+         \"$uutils\" --list >/tmp/td-shell-userland/uutils-list || exit 99\n\
+         if grep -F -x stdbuf /tmp/td-shell-userland/uutils-list >/dev/null; then exit 100; fi\n\
          readelf='{binutils_path}/readelf'\n\
          \"$readelf\" -l \"$rg\" | grep -F '{interp}' >/dev/null\n\
          \"$readelf\" -l \"$fd\" | grep -F '{interp}' >/dev/null\n\
-         for binary in \"$rg\" \"$fd\"; do\n\
+         \"$readelf\" -l \"$uutils\" | grep -F '{interp}' >/dev/null\n\
+         for binary in \"$rg\" \"$fd\" \"$uutils\"; do\n\
            if grep -a -F /gnu/store \"$binary\" >/dev/null; then exit 93; fi\n\
            if grep -a -F '{stage0_base}' \"$binary\" >/dev/null; then exit 94; fi\n\
          done\n\
@@ -239,13 +253,13 @@ fn prove_td_shell_userland(
         .env("TD_SHELL_NATIVE_LOCK", lock_s)
         .env("TD_PERSIST_STORE", tdstore_s)
         .env("TD_PERSIST_DB", persist_db_s)
-        .args(["shell", "ripgrep", "fd", "--", store_ns_builder_s])
+        .args(["shell", "ripgrep", "fd", "uutils", "--", store_ns_builder_s])
         .arg("store-ns")
         .arg(tdstore_s)
         .args(["--", busybox_path, "sh", "-c", &script]);
     let output = cmd
         .output()
-        .map_err(|e| format!("spawn td shell ripgrep fd product proof: {e}"))?;
+        .map_err(|e| format!("spawn td shell ripgrep fd uutils product proof: {e}"))?;
     fs::write(product.join("stdout"), &output.stdout)
         .map_err(|e| format!("write td shell stdout: {e}"))?;
     fs::write(product.join("stderr"), &output.stderr)
@@ -253,7 +267,7 @@ fn prove_td_shell_userland(
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         return Err(format!(
-            "td shell ripgrep/fd product proof failed ({}):\nstdout:\n{}\nstderr:\n{}",
+            "td shell ripgrep/fd/uutils product proof failed ({}):\nstdout:\n{}\nstderr:\n{}",
             output.status,
             stdout.trim(),
             String::from_utf8_lossy(&output.stderr).trim()
@@ -261,12 +275,12 @@ fn prove_td_shell_userland(
     }
     if !stdout.lines().any(|line| line == "TD-SHELL-USERLAND-OK") {
         return Err(format!(
-            "td shell ripgrep/fd product proof emitted no success marker: {}",
+            "td shell ripgrep/fd/uutils product proof emitted no success marker: {}",
             stdout.trim()
         ));
     }
     println!(
-        "   [product] td shell built ripgrep 14.1.1 and fd 10.2.0 with source-built stage2 and ran both under own-root /td/store"
+        "   [product] td shell built ripgrep 14.1.1, fd 10.2.0, and uutils 0.9.0 with source-built stage2 and ran all three under own-root /td/store"
     );
     Ok(())
 }
