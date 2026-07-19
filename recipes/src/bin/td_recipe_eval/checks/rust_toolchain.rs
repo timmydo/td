@@ -209,7 +209,8 @@ fn prove_td_shell_userland(
          test \"$(\"$uutils\" uname -s)\" = Linux || exit 97\n\
          uu_id=$(\"$uutils\" id -u)\n\
          case \"$uu_id\" in ''|*[!0-9]*) exit 98 ;; esac\n\
-         if \"$uutils\" --list | grep -F -x stdbuf >/dev/null; then exit 99; fi\n\
+         \"$uutils\" --list >/tmp/td-shell-userland/uutils-list || exit 99\n\
+         if grep -F -x stdbuf /tmp/td-shell-userland/uutils-list >/dev/null; then exit 100; fi\n\
          readelf='{binutils_path}/readelf'\n\
          \"$readelf\" -l \"$rg\" | grep -F '{interp}' >/dev/null\n\
          \"$readelf\" -l \"$fd\" | grep -F '{interp}' >/dev/null\n\
