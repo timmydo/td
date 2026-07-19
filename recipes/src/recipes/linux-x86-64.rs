@@ -1,6 +1,6 @@
 use crate::ladder::{
     initramfs_cpio_shape_check, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into,
-    unpack_keep_top, SH, USERLAND_MARKER,
+    unpack_keep_top, EROFS_MARKER, EROFS_PROBE_SENTINEL, SH, USERLAND_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -461,10 +461,12 @@ pub fn recipe() -> Recipe {
     // ---- Bootable userland: a static-busybox initramfs (re #529) ----
     // The kernel is now serial-console + initramfs capable (the config deltas
     // above add the 8250 console, BINFMT_ELF/SCRIPT, and BLK_DEV_INITRD). Pack a
-    // tiny initramfs whose /init prints a marker on ttyS0 and reboots, so the
-    // sibling qemu boot check can prove the td-source-built kernel reaches a real
-    // userland. The initramfs is an EXTERNAL artifact (qemu -initrd), keeping
-    // bzImage a pure kernel — INITRAMFS_SOURCE stays "".
+    // tiny initramfs whose /init prints a marker on ttyS0, optionally mounts an
+    // attached erofs disk read-only (re #549) and prints a second marker, then
+    // reboots — so the sibling qemu boot checks can prove the td-source-built
+    // kernel both reaches a real userland AND mounts the read-only erofs root. The
+    // initramfs is an EXTERNAL artifact (qemu -initrd), keeping bzImage a pure
+    // kernel — INITRAMFS_SOURCE stays "".
     //
     // gen_init_cpio (usr/gen_init_cpio, a HOSTCC hostprog) packs the newc cpio
     // from a spec WITHOUT needing mknod privilege: the `nod /dev/console` entry
@@ -474,13 +476,41 @@ pub fn recipe() -> Recipe {
     // glibc closure, no host bytes.
 
     // The /init the kernel execs (rdinit=/init): a #! script (BINFMT_SCRIPT) that
-    // prints the marker the boot check greps for, then `reboot -f` so qemu
-    // (-no-reboot) exits cleanly. echo is a busybox-sh builtin, so the marker
-    // prints even if the reboot applet were unavailable (the boot check's
+    // prints the userland marker the boot check greps for, THEN — if a virtio-blk
+    // erofs disk is attached (the `qemu-boot-erofs` tool, re #549) — mounts it
+    // read-only and prints a second marker on success, then `reboot -f` so qemu
+    // (-no-reboot) exits cleanly. echo is a busybox-sh builtin, so the userland
+    // marker prints even if the reboot applet were unavailable (the boot check's
     // wall-clock ceiling then bounds the run).
+    //
+    // Applet reachability: this initramfs packs only /bin/busybox + a /bin/sh
+    // symlink (no per-applet symlinks) and busybox is NOT built standalone-shell,
+    // so `mount`/`test`/`mkdir`/`sleep`/`reboot` are reached as `/bin/busybox <applet>`
+    // explicitly, never bare (a bare `mount` would not resolve on PATH).
+    //
+    // Disk probe (gated on /dev/vda so a diskless boot is unaffected — the plain
+    // `qemu-boot` check kills qemu on USERLAND_MARKER, printed first, before this
+    // runs): mount devtmpfs so the virtio-blk node appears, settle briefly for the
+    // async probe, then mount /dev/vda READ-ONLY as erofs and read the sentinel the
+    // image was built with. EROFS_MARKER prints only when BOTH succeed, so it is a
+    // true read-only-erofs-mount proof. This is the seed of the #550 two-stage boot,
+    // where the `reboot -f` becomes the switch_root into the mounted root.
     steps.push(Step::WriteFile {
         path: "{root}/initramfs/init".into(),
-        content: format!("#!/bin/sh\necho {USERLAND_MARKER}\nexec /bin/busybox reboot -f\n"),
+        content: format!(
+            "#!/bin/sh\n\
+             echo {USERLAND_MARKER}\n\
+             /bin/busybox mkdir -p /mnt\n\
+             /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null\n\
+             n=0\n\
+             while [ $n -lt 5 ] && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
+             if /bin/busybox test -b /dev/vda; then \
+             if /bin/busybox mount -t erofs -o ro /dev/vda /mnt 2>/dev/null; then \
+             if /bin/busybox test -f /mnt/{EROFS_PROBE_SENTINEL}; then echo {EROFS_MARKER}; fi; \
+             fi; \
+             fi\n\
+             exec /bin/busybox reboot -f\n"
+        ),
         exec: true,
     });
     // gen_init_cpio spec: /dev/console for init's stdio, the static busybox, a

@@ -46,6 +46,17 @@ use crate::check_runner::{is_executable, RecipeCheckRunner};
 /// shape check (ladder.rs), and this boot oracle can never disagree on the string.
 const MARKER: &str = td_recipe::ladder::USERLAND_MARKER;
 
+/// The line the guest `/init` prints once it has mounted the attached virtio-blk
+/// disk as READ-ONLY erofs and read the sentinel back (re #549). The sole success
+/// criterion of the `qemu-boot-erofs` mode — seeing it proves the source-built
+/// kernel's EROFS_FS + VIRTIO_BLK config can mount a td-written erofs image
+/// read-only. Shared with the /init script and the shape check via `td_recipe::ladder`.
+const EROFS_MARKER: &str = td_recipe::ladder::EROFS_MARKER;
+
+/// The sentinel file the probe erofs image carries and the guest `/init` reads back;
+/// shared so the image the oracle builds and the path the /init reads never desync.
+const EROFS_PROBE_SENTINEL: &str = td_recipe::ladder::EROFS_PROBE_SENTINEL;
+
 /// Default wall-clock ceiling. A tiny allnoconfig kernel boots to userspace under
 /// TCG in a few seconds, but TCG on a loaded builder can be slow; 180s is
 /// generous. The poll loop kills qemu the instant the marker appears, so a healthy
@@ -102,19 +113,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
 
     // Build the kernel producer (its own stem, as RustToolchain builds
     // rust-toolchain) to get the bzImage + initramfs.cpio, then boot them.
-    runner.prepare_recipe_target("linux-x86-64")?;
-    let build_out = runner.build_plan("linux-x86-64")?;
-    let tree = runner.ladder_out_from(&build_out, "linux-x86-64")?;
-    let bzimage = tree.join("bzImage");
-    let initramfs = tree.join("initramfs.cpio");
-    for (label, path) in [("bzImage", &bzimage), ("initramfs.cpio", &initramfs)] {
-        if !path.is_file() {
-            return Err(format!(
-                "linux-x86-64 output is missing {label} ({}) — the boot check needs both the kernel and its userland",
-                path.display()
-            ));
-        }
-    }
+    let (bzimage, initramfs) = build_kernel(runner)?;
 
     println!(
         "   [qemu-boot] {qemu} boots the td-source-built bzImage under TCG with the busybox initramfs\n              kernel:    {}\n              initramfs: {}",
@@ -122,7 +121,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         initramfs.display()
     );
 
-    let result = boot(&qemu, &bzimage, &initramfs, runner.scratch_dir())?;
+    let result = boot(&qemu, &bzimage, &initramfs, None, MARKER, runner.scratch_dir())?;
     if !result.marker {
         return Err(format!(
             "kernel did not reach the userland marker {MARKER:?} on ttyS0 — {} \
@@ -137,6 +136,109 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          runs the static busybox userland ({MARKER} on ttyS0)"
     );
     Ok(())
+}
+
+/// `qemu-boot-erofs` (re #549): the same host-side boot, but with a READ-ONLY erofs
+/// disk attached over virtio-blk. Proves the source-built kernel's EROFS_FS +
+/// VIRTIO_BLK + VIRTIO_PCI config can mount a td-written erofs image read-only — the
+/// filesystem the two-stage boot (#550) pivots into. The probe image is built by the
+/// in-house `td-builder mkfs-erofs` writer (#548) from a one-file rootfs; the guest
+/// `/init` mounts `/dev/vda` read-only and prints `EROFS_MARKER` only after it also
+/// reads the sentinel back, so a green result is a true read-only-mount proof.
+pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
+    // qemu first (fail fast if absent), then the kernel, then the probe image.
+    let qemu = find_qemu()?;
+    let (bzimage, initramfs) = build_kernel(runner)?;
+    let disk = build_probe_image(runner)?;
+
+    println!(
+        "   [qemu-boot-erofs] {qemu} boots the td-source-built bzImage under TCG with a read-only erofs virtio-blk disk\n              kernel:    {}\n              initramfs: {}\n              erofs img: {}",
+        bzimage.display(),
+        initramfs.display(),
+        disk.display()
+    );
+
+    let result = boot(
+        &qemu,
+        &bzimage,
+        &initramfs,
+        Some(&disk),
+        EROFS_MARKER,
+        runner.scratch_dir(),
+    )?;
+    if !result.marker {
+        return Err(format!(
+            "kernel did not reach the read-only-erofs marker {EROFS_MARKER:?} on ttyS0 — {} \
+             (the initramfs could not mount /dev/vda as read-only erofs, the virtio-blk node did not \
+             appear, or the sentinel {EROFS_PROBE_SENTINEL:?} was unreadable). Last serial output:\n{}",
+            result.reason,
+            tail(&result.console, 60)
+        ));
+    }
+    println!(
+        "PASS: linux-x86-64 mounts a td-written erofs image READ-ONLY over virtio-blk under qemu (TCG) — \
+         the source-built EROFS_FS + VIRTIO_BLK kernel reads the store-shaped root back ({EROFS_MARKER} on ttyS0)"
+    );
+    Ok(())
+}
+
+/// Build the `linux-x86-64` producer and return its `(bzImage, initramfs.cpio)` —
+/// shared by both boot modes so they build the kernel identically.
+fn build_kernel(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String> {
+    runner.prepare_recipe_target("linux-x86-64")?;
+    let build_out = runner.build_plan("linux-x86-64")?;
+    let tree = runner.ladder_out_from(&build_out, "linux-x86-64")?;
+    let bzimage = tree.join("bzImage");
+    let initramfs = tree.join("initramfs.cpio");
+    for (label, path) in [("bzImage", &bzimage), ("initramfs.cpio", &initramfs)] {
+        if !path.is_file() {
+            return Err(format!(
+                "linux-x86-64 output is missing {label} ({}) — the boot check needs both the kernel and its userland",
+                path.display()
+            ));
+        }
+    }
+    Ok((bzimage, initramfs))
+}
+
+/// Build a tiny probe erofs image with the control-plane `td-builder mkfs-erofs`
+/// writer (#548): a one-file rootfs holding the sentinel the guest `/init` reads
+/// back. Returns the image path (raw erofs bytes) to attach as a virtio-blk disk.
+/// The rootfs and image live in the runner's per-invocation scratch and are rebuilt
+/// fresh (any stale copy removed first) so a prior run's bytes can never be reused.
+fn build_probe_image(runner: &RecipeCheckRunner) -> Result<PathBuf, String> {
+    let scratch = runner.scratch_dir();
+    let root = scratch.join("erofs-probe-root");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
+    let sentinel = root.join(EROFS_PROBE_SENTINEL);
+    fs::write(&sentinel, b"td read-only erofs probe\n")
+        .map_err(|e| format!("write {}: {e}", sentinel.display()))?;
+
+    let img = scratch.join("erofs-probe.img");
+    let _ = fs::remove_file(&img);
+    // `td-builder mkfs-erofs ROOTFS-DIR OUT.img` — a control-plane capability (never
+    // on a recipe PATH). builder_command() carries the runner's builder provenance.
+    let status = runner
+        .builder_command()
+        .arg("mkfs-erofs")
+        .arg(&root)
+        .arg(&img)
+        .status()
+        .map_err(|e| format!("spawn td-builder mkfs-erofs: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "td-builder mkfs-erofs failed ({status}) building the probe erofs image from {}",
+            root.display()
+        ));
+    }
+    if !img.is_file() {
+        return Err(format!(
+            "td-builder mkfs-erofs reported success but did not produce {}",
+            img.display()
+        ));
+    }
+    Ok(img)
 }
 
 /// Locate host `qemu-system-x86_64` (a control-plane test tool; see module doc).
@@ -190,12 +292,17 @@ fn parse_timeout(raw: Option<String>) -> Duration {
 /// console is read INCREMENTALLY into a bounded rolling buffer — decoded lossily
 /// so a non-UTF-8 serial byte can't empty the capture, and trimmed to the last
 /// CAP bytes so a flooding boot can't balloon memory or make the poll quadratic.
-/// Kill qemu the instant the marker appears; otherwise bound it by the wall-clock
-/// ceiling or the guest's own `reboot -f`.
+/// Kill qemu the instant `target_marker` appears; otherwise bound it by the
+/// wall-clock ceiling or the guest's own `reboot -f`. `disk`, when set, attaches an
+/// erofs image as a read-only virtio-blk disk (/dev/vda in the guest); `None` boots
+/// diskless. `target_marker` lets the two boot modes key on different lines (the
+/// userland marker vs. the read-only-erofs marker printed only after a good mount).
 fn boot(
     qemu: &str,
     bzimage: &Path,
     initramfs: &Path,
+    disk: Option<&Path>,
+    target_marker: &str,
     scratch_base: &Path,
 ) -> Result<BootResult, String> {
     // Per-invocation console/diag dir created EXCLUSIVELY (mkdir, not mkdir -p)
@@ -237,8 +344,8 @@ fn boot(
     // this.)
     let serial = format!("file:{}", console_path.display());
     let append = "console=ttyS0 panic=-1 rdinit=/init";
-    let mut child = Command::new(qemu)
-        .args(["-M", "pc", "-accel", "tcg", "-m", "256", "-no-reboot"])
+    let mut cmd = Command::new(qemu);
+    cmd.args(["-M", "pc", "-accel", "tcg", "-m", "256", "-no-reboot"])
         .args(["-display", "none", "-monitor", "none"])
         .args(["-nic", "none", "-no-user-config"])
         .args(["-serial", &serial])
@@ -246,7 +353,17 @@ fn boot(
         .arg(bzimage)
         .arg("-initrd")
         .arg(initramfs)
-        .args(["-append", append])
+        .args(["-append", append]);
+    // Optional read-only erofs disk (re #549): if=none defines the backing store and
+    // a separate virtio-blk-pci -device attaches it as /dev/vda in the guest.
+    // readonly=on matches the immutable erofs root and lets qemu refuse any write.
+    // The image path is under our private scratch (no commas), so -drive's
+    // comma-separated key=value parse is unambiguous.
+    if let Some(disk) = disk {
+        cmd.arg("-drive").arg(drive_arg(disk));
+        cmd.args(["-device", "virtio-blk-pci,drive=erofs0"]);
+    }
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::from(diag))
         .stderr(Stdio::from(diag_err))
@@ -255,12 +372,13 @@ fn boot(
 
     let timeout = boot_timeout();
     let start = Instant::now();
+    let marker_bytes = target_marker.as_bytes();
     let mut console_file: Option<File> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut marker = false;
     let mut end;
     loop {
-        marker |= drain_console(&console_path, &mut console_file, &mut buf);
+        marker |= drain_console(&console_path, &mut console_file, &mut buf, marker_bytes);
         if marker {
             let _ = child.kill();
             let _ = child.wait();
@@ -306,7 +424,7 @@ fn boot(
     // Drain any final bytes qemu flushed before it was reaped (e.g. the marker
     // line printed just before `reboot -f` made qemu exit). If the marker only
     // shows up in this final flush, realign `end` so it agrees with `marker`.
-    if drain_console(&console_path, &mut console_file, &mut buf) {
+    if drain_console(&console_path, &mut console_file, &mut buf, marker_bytes) {
         marker = true;
         end = EndReason::MarkerSeen;
     }
@@ -347,7 +465,7 @@ fn boot(
 /// it lazily (qemu creates it after spawn). Keeps only the last CAP bytes and
 /// returns whether the marker is now present. Bounded by DRAIN_BUDGET per call so
 /// a flooding guest can't starve the outer deadline check.
-fn drain_console(path: &Path, file: &mut Option<File>, buf: &mut Vec<u8>) -> bool {
+fn drain_console(path: &Path, file: &mut Option<File>, buf: &mut Vec<u8>, marker: &[u8]) -> bool {
     if file.is_none() {
         *file = File::open(path).ok();
     }
@@ -366,7 +484,7 @@ fn drain_console(path: &Path, file: &mut Option<File>, buf: &mut Vec<u8>) -> boo
                             let drop = buf.len() - CAP;
                             buf.drain(..drop);
                         }
-                        if contains(buf, MARKER.as_bytes()) {
+                        if contains(buf, marker) {
                             // Latch and stop: the caller kills qemu the moment this
                             // returns true, so draining further bytes only wastes work
                             // (and on a flooding-then-marker boot, could spin to
@@ -389,6 +507,17 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && needle.len() <= haystack.len()
         && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The `-drive` value attaching `disk` as a read-only raw backing store with the
+/// `erofs0` id the `virtio-blk-pci` -device references. `readonly=on` matches the
+/// immutable erofs root (qemu refuses guest writes); `if=none` keeps qemu from
+/// auto-attaching it to an implicit controller so only the explicit -device wires it.
+fn drive_arg(disk: &Path) -> String {
+    format!(
+        "if=none,format=raw,readonly=on,id=erofs0,file={}",
+        disk.display()
+    )
 }
 
 /// Read at most the last `cap` bytes of `path`, decoded lossily — bounds memory
@@ -481,6 +610,35 @@ mod tests {
         assert!(!contains(&buf, MARKER.as_bytes()));
         buf.extend_from_slice(b"LAND-OK...");
         assert!(contains(&buf, MARKER.as_bytes()));
+    }
+
+    #[test]
+    fn drive_arg_is_readonly_raw_with_the_device_id() {
+        let arg = drive_arg(Path::new("/scratch/erofs-probe.img"));
+        // The virtio-blk-pci -device references drive=erofs0, so the drive's id must match.
+        assert!(arg.contains("id=erofs0"), "missing id: {arg}");
+        // Read-only + raw + the exact backing file, and if=none (no implicit controller).
+        assert!(arg.contains("readonly=on"), "not read-only: {arg}");
+        assert!(arg.contains("format=raw"), "not raw: {arg}");
+        assert!(arg.contains("if=none"), "not if=none: {arg}");
+        assert!(arg.ends_with("file=/scratch/erofs-probe.img"), "wrong file: {arg}");
+    }
+
+    #[test]
+    fn erofs_marker_is_distinct_from_the_userland_marker() {
+        // Both boot modes must key on different lines: the plain check kills qemu on
+        // MARKER (printed first), the erofs check waits for EROFS_MARKER (printed only
+        // after a successful read-only mount). Identical strings would let a diskless
+        // boot satisfy the erofs check.
+        assert!(!MARKER.is_empty() && !EROFS_MARKER.is_empty());
+        assert_ne!(MARKER, EROFS_MARKER);
+        // drain_console keys on the passed marker, so EROFS_MARKER must be matchable
+        // the same substring way the userland marker is.
+        assert!(contains(
+            b"...booted... TD-EROFS-RO-OK ...done",
+            EROFS_MARKER.as_bytes()
+        ));
+        assert!(!contains(b"only TD-USERLAND-OK here", EROFS_MARKER.as_bytes()));
     }
 
     #[test]
