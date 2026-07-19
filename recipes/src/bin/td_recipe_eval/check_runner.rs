@@ -55,6 +55,38 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     crate::checks::run(check_runner, &runner, stem)
 }
 
+/// Host-side qemu boot validation (re #529). This is deliberately NOT a gated
+/// recipe check: booting the kernel requires HOST qemu, and the daily gate wraps
+/// every recipe check in a host-free `pivot_root` sandbox that exposes only
+/// td-built tools by absolute /td/store path — so host qemu is unreachable there
+/// (unlike the RustToolchain check, which runs the td-BUILT rustc). Registering it
+/// as a daily check would therefore fail on `find_qemu` on every real runner. So
+/// the boot is an explicit host-side command an operator or developer runs OUTSIDE
+/// the sandbox: it builds linux-x86-64 (bzImage + initramfs) and boots it under
+/// host qemu, asserting the userland marker reaches ttyS0.
+pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "linux-x86-64";
+    let stem = args.first().map(String::as_str).unwrap_or(STEM);
+    if stem != STEM {
+        return Err(format!(
+            "qemu-boot only supports {STEM} (got '{stem}'); usage: qemu-boot [{STEM}]"
+        ));
+    }
+    if args.get(1).is_some() {
+        return Err(format!("usage: qemu-boot [{STEM}]"));
+    }
+    // Provenance planning FIRST — before the runner exists, so a rejected graph
+    // spawns no subprocess at all (re #469), matching `cli`/`build_cli`.
+    ensure_targets_provenance(&[stem])?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let scratch_name = scratch_name("qemu-boot", &[stem]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let _lock = lock_file(&runner.lock_path())?;
+    runner.setup()?;
+    crate::checks::qemu_boot::run(&runner)
+}
+
 pub fn build_cli(args: &[String]) -> Result<(), String> {
     let target = args.first().ok_or_else(build_usage)?.as_str();
     if catalog::lookup(target).is_none() {

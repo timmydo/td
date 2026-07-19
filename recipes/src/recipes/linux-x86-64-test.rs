@@ -25,8 +25,8 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //   5. initramfs.cpio is a real newc cpio (ASCII "070701" magic at offset 0) big
 //      enough to carry the static busybox (>= 64 KiB) with a `busybox` path entry
 //      — the shape check for the bootable userland. The behavioural proof that it
-//      actually boots is the producer's QemuBoot check (host qemu, daily), which
-//      cannot run in this host-free BuildOnly rung.
+//      actually boots is the host-side `td-recipe-eval qemu-boot linux-x86-64`
+//      tool (host qemu), which cannot run in this host-free BuildOnly rung.
 pub fn recipe() -> Recipe {
     let vmlinux = "{in:linux-x86-64}/vmlinux";
     let bzimage = "{in:linux-x86-64}/bzImage";

@@ -1,15 +1,16 @@
 use crate::ladder::{
     mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH,
 };
-use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
+use crate::types::{Recipe, Step};
 
 // linux-x86-64 (Linux 7.1.4): the capstone of the x86_64 ladder (#529).
 // Source-builds the latest STABLE mainline kernel (not a longterm/LTS line) with
 // td's OWN bootstrapped native toolchain — gcc-x86-64-native (GCC 14.3.0) as
 // `CC`, binutils-x86-64-native as `LD/AR/NM/OBJCOPY`, driven by make-x86-64 —
 // proving the GCC/glibc ladder produces a real, modern-kernel-capable compiler.
-// Two artifacts land in {out}: the uncompressed `vmlinux` ELF and the compressed,
-// bootable `bzImage`. bzImage's self-extracting payload is gzip-compressed
+// Three artifacts land in {out}: the uncompressed `vmlinux` ELF, the compressed,
+// bootable `bzImage`, and a tiny `initramfs.cpio` userland (see BOOTABLE below).
+// bzImage's self-extracting payload is gzip-compressed
 // (kbuild's `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz`); td ships no
 // gzip executable — the builder only DEcompresses, in-process — so the compressor
 // is the busybox gzip applet's `bin/gzip` link, which accepts the kernel's exact
@@ -22,10 +23,14 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // BINFMT_SCRIPT), and initramfs load (BLK_DEV_INITRD), and the recipe packs a
 // tiny EXTERNAL initramfs (gen_init_cpio) holding the td-built STATIC busybox
 // plus a /init that prints a marker on ttyS0 and reboots. A THIRD {out} artifact
-// (initramfs.cpio) lands alongside vmlinux/bzImage. The sibling QemuBoot daily
-// check boots the bzImage + initramfs under host qemu (TCG, OUTSIDE the sandbox)
-// and asserts the userland marker reaches the console — the behavioural proof
-// that this source-built kernel actually boots to a real userland.
+// (initramfs.cpio) lands alongside vmlinux/bzImage. The behavioural proof that
+// this source-built kernel boots to a real userland is the HOST-SIDE tool
+// `td-recipe-eval qemu-boot linux-x86-64` (checks/qemu_boot.rs): it boots the
+// bzImage + initramfs under host qemu (TCG) and asserts the userland marker
+// reaches the console. It is host-side (not a daily gate check) because a qemu
+// boot needs host qemu, which the gate's host-free sandbox hides — see the note
+// at the Recipe builder below. In-sandbox CI coverage is the artifact shape
+// checks (this recipe's producer rung + linux-x86-64-test).
 //
 // A modern (>= 4.18) kernel needs host tools the 4.14 rung dodged; each is now a
 // td recipe (AGENTS.md directive 3, pre-authorized as part of this migration):
@@ -41,10 +46,12 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //     the bundled static zlib).
 //   - bc (busybox-x86-64 applet): timeconst.h, as in the 4.14 rung.
 // Avoided by config (audited): perl (C recordmcount; ftrace off), openssl (no
-// module signing / trusted keys), pahole (BTF off), python/cpio/rsync (no
-// initramfs, no IKHEADERS, no modules). The ONE compressor used is gzip (busybox
-// applet) for the bzImage payload — CONFIG_KERNEL_GZIP pinned; xz/lzma/zstd and
-// their host tools stay off.
+// module signing / trusted keys), pahole (BTF off), python/cpio/rsync. The
+// initramfs below is packed by the in-tree gen_init_cpio HOSTCC hostprog (not the
+// external `cpio` tool), INITRAMFS_SOURCE stays "", and IKHEADERS/modules stay
+// off — so none of python, the `cpio` tool, or rsync is pulled in. The ONE
+// compressor used is gzip (busybox applet) for the bzImage payload —
+// CONFIG_KERNEL_GZIP pinned; xz/lzma/zstd and their host tools stay off.
 //
 // HOSTCC (the Kbuild host programs fixdep/conf/objtool/modpost — ordinary
 // userspace) is a STATIC wrapper over the native gcc against the x86_64 glibc
@@ -402,14 +409,19 @@ pub fn recipe() -> Recipe {
     // Build gen_init_cpio explicitly (idempotent — the bzImage run already built
     // it to pack the empty INITRAMFS_SOURCE — but don't rely on that ordering).
     steps.push(mk(&["usr/gen_init_cpio"]));
-    // Pack the initramfs; gen_init_cpio writes the newc cpio to stdout.
+    // Pack the initramfs; gen_init_cpio writes the newc cpio to stdout. `-t 1`
+    // pins a fixed mtime (1s past the epoch) on EVERY entry: without it,
+    // gen_init_cpio stamps each `file` with its source's stat mtime — and /init is
+    // written fresh by this build, so its mtime would be the wall-clock build time,
+    // making initramfs.cpio (a content-addressed /td/store artifact) differ across
+    // otherwise-identical builds. A fixed timestamp keeps the output reproducible.
     steps.push(
         Step::run(
             "{src}",
             &[
                 SH,
                 "-c",
-                "'{src}/usr/gen_init_cpio' {root}/initramfs/spec > {root}/initramfs.cpio",
+                "'{src}/usr/gen_init_cpio' -t 1 {root}/initramfs/spec > {root}/initramfs.cpio",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -515,18 +527,15 @@ pub fn recipe() -> Recipe {
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
-        // Behavioural boot check (daily): build the bzImage + busybox initramfs
-        // and boot them under HOST qemu (TCG), asserting the userland marker
-        // reaches ttyS0. qemu is a control-plane TEST tool run OUTSIDE the sandbox
-        // (parity with the RustToolchain check running the built rustc) — the
-        // kernel + userland it boots are 100% td-built and host-free. See
-        // checks/qemu_boot.rs for the trust model.
-        .checks(vec![RecipeCheck::daily(
-            r#"
-echo ">> recipe-check linux-x86-64 (qemu-boot): build the bzImage + static-busybox initramfs and boot them under host qemu (TCG), asserting the userland marker reaches ttyS0"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run linux-x86-64 daily 1
-"#,
-        )
-        .with_runner(CheckRunner::QemuBoot)])
+    // No behavioural boot check is registered here: a qemu boot needs HOST qemu,
+    // which the daily gate's host-free `pivot_root` sandbox deliberately hides (the
+    // sandbox exposes only td-built tools by absolute /td/store path — that is why
+    // the RustToolchain check can run the td-BUILT rustc, but a host binary like
+    // qemu is unreachable there). Wiring the boot as a sandboxed daily check would
+    // make it fail on `find_qemu` on every real runner — a permanently-red, green-
+    // washed check. The boot is instead a HOST-SIDE tool, `td-recipe-eval
+    // qemu-boot linux-x86-64` (checks/qemu_boot.rs), run OUTSIDE the sandbox by an
+    // operator or developer. Automated in-sandbox coverage is the shape checks
+    // above (producer rung) and the linux-x86-64-test BuildOnly daily check, which
+    // build the bzImage + initramfs and assert they are well-formed.
 }

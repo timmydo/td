@@ -200,6 +200,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("qemu-boot") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::qemu_boot_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("source-pins") => {
             if args.get(2).is_some() {
                 die("usage: source-pins");
@@ -214,7 +220,7 @@ fn main() {
                 die_runner(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|source-pins|seed-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|qemu-boot|source-pins|seed-digests ..."),
     }
 }
 
@@ -352,10 +358,10 @@ mod tests {
             ("gcc-x86-64-native-test", 1),
             ("gcc-x86-64-self-test", 1),
             ("linux-x86-64-test", 1),
-            // Producer-carried behavioural check (QemuBoot), parallel to
-            // rust-toolchain above: linux-x86-64 boots its bzImage + initramfs
-            // under host qemu (re #529).
-            ("linux-x86-64", 1),
+            // linux-x86-64 itself registers NO daily check: its qemu boot is a
+            // host-side tool (`td-recipe-eval qemu-boot`), not a sandboxed gate
+            // check, because a qemu boot needs host qemu the gate sandbox hides
+            // (re #529). Its in-sandbox coverage is linux-x86-64-test above.
             ("flex-x86-64-test", 1),
             ("elfutils-x86-64-test", 1),
             ("hello-test", 1),

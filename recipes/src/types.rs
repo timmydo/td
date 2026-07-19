@@ -743,12 +743,6 @@ pub struct RecipeCheck {
 pub enum CheckRunner {
     BuildOnly,
     RustToolchain,
-    /// Build the linux-x86-64 bzImage + busybox initramfs and boot them under
-    /// HOST qemu (outside the host-free sandbox) — the kernel/userland artifact
-    /// is 100% td-built; qemu is a control-plane TEST tool, like the host Rust
-    /// toolchain is a control-plane seed. Asserts the userland marker reaches the
-    /// serial console (re #529).
-    QemuBoot,
 }
 
 impl RecipeCheck {
