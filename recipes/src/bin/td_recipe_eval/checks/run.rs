@@ -14,6 +14,7 @@
 //! the guest (`-no-reboot` makes the guest `poweroff`/`reboot` exit qemu) or with
 //! qemu's own Ctrl-A X. Because it is interactive it is a host-side command, never
 //! a gated check (a gate has no terminal, and the daily sandbox has no host qemu).
+use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 
@@ -25,7 +26,10 @@ use crate::checks::qemu_boot::find_qemu;
 const SYSTEM: &str = "system-x86-64";
 const KERNEL: &str = "linux-x86-64";
 
-pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
+/// `lock` is the ladder lock, acquired by the caller and held across `setup()` + the
+/// build below; we RELEASE it (drop) once the images exist and before the unbounded
+/// interactive boot, so other ladder builds/checks are not blocked for the whole session.
+pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> {
     // Locate host qemu FIRST, before the (potentially multi-minute) build: if qemu
     // is absent the tool can only fail, so fail fast rather than after a full build.
     let qemu = find_qemu()?;
@@ -41,15 +45,24 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     for (label, path) in [("bzImage", &bzimage), ("rootfs.cpio", &rootfs)] {
         if !path.is_file() {
             return Err(format!(
-                "distro build is missing {label} ({}) — the runner needs both the kernel and its rootfs",
+                "distro build is missing {label} ({}) - the runner needs both the kernel and its rootfs",
                 path.display()
             ));
         }
     }
 
+    // The build (which mutates the ladder) is done and both images exist. Release the
+    // ladder lock now, BEFORE the interactive boot: the boot only reads these two files,
+    // qemu loads -kernel/-initrd into guest memory at startup, and this process stays
+    // alive so the reaper never touches our scratch. Holding the lock across an unbounded
+    // interactive session would block every other ladder build/check the whole time.
+    drop(lock);
+
     println!(
-        "   [run] booting the td distro under {qemu} (TCG) — interactive serial console\n         \
-         kernel: {}\n         rootfs: {}\n         (auto-login is enabled; type `poweroff` to exit, or Ctrl-A then X to quit qemu)\n",
+        "   [run] booting the td distro under {qemu} (TCG) - interactive serial console\n         \
+         kernel: {}\n         rootfs: {}\n         auto-login as the test user is enabled. To exit: press Ctrl-A then X to quit\n         \
+         qemu, or run `su -c poweroff` for a clean guest shutdown (root is passwordless;\n         \
+         the unprivileged test user cannot poweroff directly).\n",
         bzimage.display(),
         rootfs.display()
     );
@@ -74,12 +87,17 @@ fn boot_interactive(qemu: &str, bzimage: &Path, rootfs: &Path) -> Result<(), Str
         .args(["-append", append])
         .status()
         .map_err(|e| format!("spawn {qemu}: {e}"))?;
-    // An interactive session ends many legitimate ways (guest poweroff, Ctrl-A X),
-    // so a non-zero status is not by itself a tool failure — qemu prints its own
-    // diagnostics to the inherited stderr. Only note it, so a genuine early failure
-    // (bad image, missing accelerator) is visible without masking a normal quit.
+    // The legitimate interactive exits all return 0: a guest `poweroff`/`reboot` under
+    // `-no-reboot` and a `Ctrl-A X` quit both make qemu exit successfully. So a non-zero
+    // status is a genuine failure (qemu could not start - bad image, missing accelerator,
+    // invalid option - or the guest died abnormally), not a normal quit; surface it as an
+    // error rather than swallowing it (re #541, Codex review). qemu's own diagnostics are
+    // already on the inherited stderr.
     if !status.success() {
-        println!("   [run] qemu exited with {status}");
+        return Err(format!(
+            "qemu exited with {status} (a normal guest poweroff or Ctrl-A X quit exits 0; \
+             see qemu's diagnostics on stderr above)"
+        ));
     }
     Ok(())
 }

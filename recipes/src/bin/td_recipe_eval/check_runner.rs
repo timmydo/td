@@ -110,9 +110,13 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("run", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?;
-    let _lock = lock_file(&runner.lock_path())?;
+    let lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
-    crate::checks::run::run(&runner)
+    // The interactive boot runs unbounded (until the operator quits qemu), so hand the
+    // ladder lock to the runner: it releases it after the build, before the boot, so the
+    // whole ladder is not blocked for the entire session (re #541, Codex review). setup()
+    // above and the build inside run() still hold it.
+    crate::checks::run::run(&runner, lock)
 }
 
 pub fn build_cli(args: &[String]) -> Result<(), String> {
@@ -309,16 +313,18 @@ fn pid_is_alive(pid: u32) -> bool {
 
 /// The pid of a reapable scratch tree, or None. A tree is reapable only if it is one of
 /// OUR trees — `scratch_name` emits `build-…-<pid>` / `check-…-<pid>` / `qemu-boot-…-<pid>`
-/// — AND ends in a numeric pid. The prefix guard means a coincidental sibling such as
-/// `gcc-14` or `glibc-241` can never be reaped (belt-and-braces: this dir holds only our
-/// scratch trees anyway). The `qemu-boot-` prefix is essential: the host-side qemu-boot
-/// tool creates per-boot scratch trees here too, and without it a crashed/killed boot's
-/// tree (which can hold a multi-GiB kernel build) would leak forever. Split out so the
-/// reaper's eligibility rule is unit-testable.
+/// / `run-…-<pid>` — AND ends in a numeric pid. The prefix guard means a coincidental
+/// sibling such as `gcc-14` or `glibc-241` can never be reaped (belt-and-braces: this dir
+/// holds only our scratch trees anyway). The `qemu-boot-` and `run-` prefixes are
+/// essential: the host-side qemu-boot and interactive `run` tools create per-boot scratch
+/// trees here too, and without them a crashed/killed boot's tree (which can hold a
+/// multi-GiB kernel build) would leak forever. Split out so the reaper's eligibility rule
+/// is unit-testable.
 fn reapable_dead_pid(name: &str) -> Option<u32> {
     if !name.starts_with("build-")
         && !name.starts_with("check-")
         && !name.starts_with("qemu-boot-")
+        && !name.starts_with("run-")
     {
         return None;
     }
@@ -1685,6 +1691,8 @@ mod tests {
         // ...including the host-side qemu-boot tool's per-boot scratch (a killed boot's
         // multi-GiB kernel-build tree would otherwise leak forever).
         assert_eq!(reapable_dead_pid("qemu-boot-linux-x86-64-22760"), Some(22760));
+        // ...and the interactive `run` tool's per-boot scratch (same multi-GiB leak risk).
+        assert_eq!(reapable_dead_pid("run-system-x86-64-31820"), Some(31820));
         // ...but a coincidental numeric-suffixed sibling is NEVER reaped.
         assert_eq!(reapable_dead_pid("gcc-14"), None);
         assert_eq!(reapable_dead_pid("glibc-241"), None);

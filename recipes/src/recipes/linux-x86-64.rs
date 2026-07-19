@@ -27,9 +27,12 @@ use crate::types::{Recipe, Step};
 // (initramfs.cpio) lands alongside vmlinux/bzImage.
 //
 // USABLE (re #541): the config also turns on the pseudo-filesystems a real
-// userland needs — PROC_FS (/proc), SYSFS (/sys), DEVTMPFS + DEVTMPFS_MOUNT (an
-// auto-populated /dev the kernel mounts BEFORE init, so /dev/console exists for
-// init's stdio without a hand-packed device node), and TMPFS (/tmp,/run). The
+// userland needs — PROC_FS (/proc), SYSFS (/sys), DEVTMPFS (the /dev filesystem
+// that init mounts to populate /dev with ttyS0/console/null/…), and TMPFS
+// (/tmp,/run). CONFIG_DEVTMPFS_MOUNT is deliberately NOT managed here: it does not
+// auto-mount /dev on an initramfs boot (only when the kernel mounts a real root),
+// so the `system-x86-64` init mounts devtmpfs itself; a hand-packed /dev/console
+// node still covers init's own stdio before that first sysinit line runs. The
 // output also EXPORTS the in-tree `gen_init_cpio` packer so the downstream
 // `system-x86-64` distro recipe can pack its own root-owned initramfs from the
 // same td-built tool. The behavioural proof that
@@ -340,7 +343,6 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_PROC_FS[ =]/d; \
                   /^#? *CONFIG_SYSFS[ =]/d; \
                   /^#? *CONFIG_DEVTMPFS[ =]/d; \
-                  /^#? *CONFIG_DEVTMPFS_MOUNT[ =]/d; \
                   /^#? *CONFIG_TMPFS[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -363,7 +365,6 @@ pub fn recipe() -> Recipe {
                    'CONFIG_PROC_FS=y' \
                    'CONFIG_SYSFS=y' \
                    'CONFIG_DEVTMPFS=y' \
-                   'CONFIG_DEVTMPFS_MOUNT=y' \
                    'CONFIG_TMPFS=y' >> .config",
             ],
         )
@@ -389,11 +390,10 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_BINFMT_SCRIPT=y' .config || { echo 'BINFMT_SCRIPT off — the kernel could not exec the #! /init script' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_INITRD=y' .config || { echo 'BLK_DEV_INITRD off — the kernel could not load the initramfs' >&2; exit 1; }; \
                  grep -q '^CONFIG_SERIAL_8250_CONSOLE=y' .config || { echo '8250 serial console off — no ttyS0 boot output for the qemu check' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DEVTMPFS=y' .config || { echo 'DEVTMPFS off — no auto-populated /dev (init would have no console device)' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DEVTMPFS_MOUNT=y' .config || { echo 'DEVTMPFS_MOUNT off — the kernel would not mount /dev before init, so /dev/console is absent' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off — a usable userland (ps/mount/init) needs /proc' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SYSFS=y' .config || { echo 'SYSFS off — a usable userland needs /sys' >&2; exit 1; }; \
-                 grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off — a usable userland needs a writable /tmp,/run' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DEVTMPFS=y' .config || { echo 'DEVTMPFS off - init cannot mount /dev, so the userland has no ttyS0/console devices' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off - a usable userland (ps/mount/init) needs /proc' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SYSFS=y' .config || { echo 'SYSFS off - a usable userland needs /sys' >&2; exit 1; }; \
+                 grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off - a usable userland needs a writable /tmp,/run' >&2; exit 1; }; \
                  grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
                  grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \

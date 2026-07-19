@@ -62,7 +62,10 @@ const SYSTEM: SystemDef = SystemDef {
     hostname: "td",
     os_name: "td",
     os_version: "0.1",
-    motd: "\n  Welcome to td — a source-built, Rust-first Linux.\n  \
+    // NOTE: keep motd (and every emitted /etc string) ASCII — td-builder's config
+    // reader is Latin-1 (builder/src/json.rs), so a multi-byte UTF-8 char here (e.g.
+    // an em-dash) is silently corrupted in the written file. Use '-', not the glyph.
+    motd: "\n  Welcome to td - a source-built, Rust-first Linux.\n  \
            Minimal busybox userland, booted from an initramfs under qemu.\n  \
            Edit recipes/src/recipes/system-x86-64.rs (the SYSTEM const) to tailor it.\n\n",
     autologin: "tester",
@@ -152,10 +155,15 @@ fn build_shadow(sys: &SystemDef) -> String {
 
 fn build_inittab() -> String {
     // busybox init: `<id>::<action>:<process>`. `id` names the tty init opens for
-    // the process; empty id => the system console. DEVTMPFS_MOUNT gives us a
-    // populated /dev before init runs, so we only mount /proc, /sys and a couple of
-    // tmpfs; getty auto-logs-in the console.
-    "::sysinit:/bin/mount -t proc proc /proc\n\
+    // the process; empty id => the system console. init must mount devtmpfs on /dev
+    // ITSELF, FIRST: CONFIG_DEVTMPFS_MOUNT does NOT auto-mount /dev on an
+    // initramfs/initrd boot (it fires only when the kernel mounts a real root), so
+    // without this line /dev holds only the packed /dev/console node and the respawn
+    // getty below cannot open /dev/ttyS0 — auto-login would never start. With
+    // devtmpfs up, /dev is populated (ttyS0, null, …) before getty runs. /proc, /sys
+    // and the tmpfs mounts follow; then getty auto-logs-in the serial console.
+    "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
+     ::sysinit:/bin/mount -t proc proc /proc\n\
      ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
      ::sysinit:/bin/mount -t tmpfs tmpfs /tmp\n\
      ::sysinit:/bin/mount -t tmpfs tmpfs /run\n\
@@ -256,17 +264,25 @@ fn build_spec(sys: &SystemDef) -> String {
 
 /// A producer-rung shape check on the packed initramfs: real newc magic, a size
 /// floor (static busybox alone is ~1 MiB), a `busybox cpio -t` parse (reds on a
-/// truncated/corrupt stream), and the presence of the key members that make it
-/// bootable. This is a build sanity assert, not a behavioural test — the boot is
-/// exercised interactively by `td-recipe-eval run`.
+/// truncated/corrupt stream), the presence of the key members that make it
+/// bootable, AND that busybox actually implements the applets those members
+/// symlink to (a config drift that dropped an applet would leave a dead symlink
+/// the cpio member check alone can't catch). All strings are ASCII: td-builder's
+/// config reader is Latin-1, so a UTF-8 glyph here would be corrupted in the
+/// executed step. This is a build sanity assert, not a behavioural test — the boot
+/// is exercised interactively by `td-recipe-eval run`.
 fn shape_check() -> String {
     "sz=$(wc -c < '{out}/rootfs.cpio'); \
-     [ \"$sz\" -ge 65536 ] || { echo \"rootfs.cpio: implausibly small ($sz bytes) — the static busybox alone is ~1 MiB\" >&2; exit 1; }; \
+     [ \"$sz\" -ge 65536 ] || { echo \"rootfs.cpio: implausibly small ($sz bytes) - the static busybox alone is ~1 MiB\" >&2; exit 1; }; \
      set -- $(od -An -tx1 -N 6 '{out}/rootfs.cpio'); \
      [ \"$1$2$3$4$5$6\" = 303730373031 ] || { echo 'rootfs.cpio: missing the newc cpio magic 070701' >&2; exit 1; }; \
      list=$('{in:busybox-x86-64}/bin/busybox' cpio -t < '{out}/rootfs.cpio' 2>/dev/null) || { echo 'rootfs.cpio: busybox cpio -t could not parse the archive (truncated/corrupt newc stream)' >&2; exit 1; }; \
      for m in init bin/busybox bin/sh bin/login bin/getty bin/autologin etc/inittab etc/passwd; do \
-         printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || { echo \"rootfs.cpio: cpio member '$m' missing — the bootable userland is incomplete\" >&2; exit 1; }; \
+         printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || { echo \"rootfs.cpio: cpio member '$m' missing - the bootable userland is incomplete\" >&2; exit 1; }; \
+     done; \
+     applets=$('{in:busybox-x86-64}/bin/busybox' --list 2>/dev/null) || { echo 'rootfs.cpio: busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
+     for a in sh getty login init mount umount; do \
+         printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"rootfs.cpio: busybox does not implement applet '$a' (config drift) - its packed symlink would be a dead link\" >&2; exit 1; }; \
      done"
         .into()
 }
@@ -321,7 +337,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "'{in:linux-x86-64}/gen_init_cpio' -t 1 {root}/rootfs.spec > {out}/rootfs.cpio",
+                "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/rootfs.spec' > '{out}/rootfs.cpio'",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -342,4 +358,43 @@ pub fn recipe() -> Recipe {
         .native_inputs(&["busybox-x86-64", "linux-x86-64", "glibc-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tailorable `SYSTEM` const is hand-edited to shape the distro; guard the
+    /// invariants a bad edit would otherwise surface only as a silent boot failure —
+    /// a getty respawn-looping on `login -f <missing-user>`, or a login shell that was
+    /// never packed into /bin.
+    #[test]
+    fn system_def_is_self_consistent() {
+        assert!(
+            SYSTEM.users.iter().any(|u| u.name == SYSTEM.autologin),
+            "autologin user '{}' is not defined in SYSTEM.users",
+            SYSTEM.autologin
+        );
+        for u in SYSTEM.users {
+            // Every login shell must be a busybox applet actually packed under /bin.
+            let shell_applet = u.shell.strip_prefix("/bin/").unwrap_or(u.shell);
+            assert!(
+                APPLETS.contains(&shell_applet),
+                "user '{}' login shell '{}' is not a packed /bin applet",
+                u.name,
+                u.shell
+            );
+        }
+    }
+
+    /// getty auto-logs-in via `-l /bin/autologin`, and login needs both applets; the
+    /// respawn line is inert without them. Belt-and-braces against an APPLETS edit that
+    /// drops one (the cpio shape check catches it at build time, this catches it at
+    /// `cargo test` time).
+    #[test]
+    fn greeter_applets_are_present() {
+        for a in ["sh", "getty", "login", "init", "mount", "umount"] {
+            assert!(APPLETS.contains(&a), "greeter applet '{a}' missing from APPLETS");
+        }
+    }
 }
