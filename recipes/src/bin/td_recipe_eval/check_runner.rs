@@ -103,17 +103,19 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     if args.get(1).is_some() {
         return Err(format!("usage: run [{STEM}]"));
     }
-    // `run` is INTERACTIVE: it hands the guest serial console to THIS terminal, and the
-    // default image's only exit is qemu's Ctrl-A X. With stdin not a terminal (piped,
-    // redirected, or backgrounded) qemu boots but cannot be driven or quit, so it would
-    // hang uncontrollably. Refuse before any planning or build (re #541, Codex review);
-    // a headless pass/fail boot smoke test is the `qemu-boot` check, not this.
+    // `run` is INTERACTIVE: it hands the guest serial console to THIS terminal so an
+    // operator can use the greeter and exit the guest (`exit`/Ctrl-D at the shell powers
+    // it off, or qemu's own Ctrl-A X). With stdin not a terminal (piped, redirected, or
+    // backgrounded) qemu boots but cannot be driven, so it would hang uncontrollably.
+    // Refuse before any planning or build (re #541, Codex review); a headless pass/fail
+    // boot smoke test is the `qemu-boot` check, not this.
     if !io::stdin().is_terminal() {
         return Err(format!(
             "`run {STEM}` is interactive and needs a terminal on stdin: it wires the guest \
-             serial console to this terminal and the default image exits only via qemu Ctrl-A X. \
-             Run it directly in a terminal (not piped, redirected, or backgrounded). For a \
-             headless pass/fail boot check, use the `qemu-boot` check instead."
+             serial console to this terminal so you can use the greeter and exit the guest \
+             (`exit`/Ctrl-D at the shell, or qemu Ctrl-A X). Run it directly in a terminal \
+             (not piped, redirected, or backgrounded). For a headless pass/fail boot check, \
+             use the `qemu-boot` check instead."
         ));
     }
     // Provenance planning FIRST — before the runner exists, so a rejected graph
@@ -517,6 +519,13 @@ impl RecipeCheckRunner {
     /// a private, non-shared path — no cross-user symlink pre-planting is possible.
     pub(crate) fn scratch_dir(&self) -> &Path {
         &self.scratch
+    }
+
+    /// The ladder work dir — the tree a concurrent force-cold `setup()` wipes. The
+    /// interactive runner uses this to refuse staging boot images anywhere inside it
+    /// (a `TMPDIR` pointed into the ladder), which a wipe could delete mid-boot.
+    pub(crate) fn ladder_work_dir(&self) -> &Path {
+        &self.lw
     }
 
     /// This ladder's dedicated build-output cache (store, db) — see `build_cache_paths`.

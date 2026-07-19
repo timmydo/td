@@ -51,8 +51,27 @@ impl TempImages {
     /// pid + a nanosecond seed + a counter; a collision just retries, so the first
     /// success is atomically ours, empty, and owner-only. `std::time` is fine here — this
     /// is host-side runtime code, not a resume-sensitive workflow script.
-    fn new() -> Result<Self, String> {
+    fn new(ladder_work_dir: &Path) -> Result<Self, String> {
         let base = std::env::temp_dir();
+        // Fail closed if the system temp dir is INSIDE the ladder work tree. The whole
+        // point of staging the boot images here is to survive a concurrent force-cold
+        // ladder wipe after the lock is released (see `run()`); if `TMPDIR` points into
+        // the ladder, these "private" copies would be wiped WITH it and qemu could read
+        // them out from under itself — the very race the copy-out closes. Refuse rather
+        // than boot from a wipe-exposed location (re #541, Codex review). Best-effort
+        // canonical comparison: if either path cannot be canonicalised we proceed (no
+        // worse than before this guard existed).
+        if let (Ok(cbase), Ok(clw)) = (base.canonicalize(), ladder_work_dir.canonicalize()) {
+            if cbase == clw || cbase.starts_with(&clw) {
+                return Err(format!(
+                    "the system temp dir ({}) is inside the ladder work tree ({}); a concurrent \
+                     ladder wipe could delete the staged boot images mid-boot. Set TMPDIR to a \
+                     directory outside the ladder and retry.",
+                    base.display(),
+                    ladder_work_dir.display()
+                ));
+            }
+        }
         let pid = std::process::id();
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -121,7 +140,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     // -kernel/-initrd into guest memory. Booting from private copies closes that race
     // entirely (re #541, Codex/subagent review). The copies are removed when `images`
     // drops — on every return path below.
-    let images = TempImages::new()?;
+    let images = TempImages::new(runner.ladder_work_dir())?;
     let boot_bzimage = images.stage(&bzimage, "bzImage")?;
     let boot_rootfs = images.stage(&rootfs, "rootfs.cpio")?;
 
@@ -137,8 +156,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
          kernel: {}\n         rootfs: {}\n         auto-login as the test user is enabled.\n         \
          To power off: type `exit` (or Ctrl-D) at the shell - the session wrapper reboots\n         \
          as root and qemu (-no-reboot) exits. To force-quit qemu at any time: Ctrl-A then X.\n",
-        bzimage.display(),
-        rootfs.display()
+        boot_bzimage.display(),
+        boot_rootfs.display()
     );
 
     boot_interactive(&qemu, &boot_bzimage, &boot_rootfs)

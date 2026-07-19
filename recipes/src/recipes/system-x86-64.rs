@@ -23,10 +23,12 @@ use crate::types::{Recipe, Step};
 // runtime closure, so it lands separately, not inline here.
 //
 // Layout: the image is STORE-NATIVE. The busybox binary is packed at its
-// content-addressed /td/store/<hash>-busybox-x86-64/bin path, and /bin is a thin
-// symlink farm whose entries (and /init) point straight into that store path. There
-// is no /usr and no /sbin: every command resolves through /td/store, so the only
-// real bytes live in the store rather than being copied across an FHS tree.
+// content-addressed /td/store/<hash>-busybox-x86-64/bin path, and /bin is a PURE
+// symlink farm whose every entry (and /init) points straight into that store path —
+// `ls -l /bin` shows only /td/store links. There is no /usr and no /sbin. The only
+// non-store files are generated system config under /etc (passwd/group/shadow/
+// inittab/os-release/profile, plus the two tiny login-glue scripts autologin and
+// tty-session, which getty/init reference by absolute path).
 //
 // Packing: the initramfs is built by the kernel's own `gen_init_cpio`, EXPORTED
 // from the `linux-x86-64` output. gen_init_cpio writes the newc cpio from a text
@@ -184,7 +186,7 @@ fn build_inittab() -> String {
      ::sysinit:/bin/mount -t tmpfs tmpfs /tmp\n\
      ::sysinit:/bin/mount -t tmpfs tmpfs /run\n\
      ::sysinit:/bin/hostname -F /etc/hostname\n\
-     ttyS0::respawn:/bin/tty-session\n\
+     ttyS0::respawn:/etc/tty-session\n\
      ::ctrlaltdel:/bin/reboot\n\
      ::shutdown:/bin/umount -a -r\n"
         .into()
@@ -200,10 +202,17 @@ fn build_inittab() -> String {
 /// exit path the kernel-boot test uses (`linux-x86-64-test`). An initramfs RAM
 /// rootfs has no disk to flush, so a direct reset is clean here (the orderly
 /// `::shutdown:` umount is skipped, which does not matter for tmpfs/devtmpfs).
+///
+/// The reboot is gated on `getty` SUCCEEDING (`&&`): getty sets up the tty and execs
+/// the login chain, returning the user shell's exit status, so a normal `exit`/Ctrl-D
+/// returns 0 -> power off. But if getty/login FAILS to start a session at all (e.g. it
+/// cannot open ttyS0), getty returns non-zero, the `&&` short-circuits, and the wrapper
+/// exits non-zero so init RESPAWNS it — a visible retry loop — rather than firing
+/// `reboot -f` and letting `-no-reboot` mask a broken greeter as a clean exit-0 shutdown
+/// (re #541, Codex review).
 fn build_tty_session() -> String {
     "#!/bin/sh\n\
-     /bin/getty -L -n -l /bin/autologin 115200 ttyS0 vt100\n\
-     exec /bin/reboot -f\n"
+     /bin/getty -L -n -l /etc/autologin 115200 ttyS0 vt100 && exec /bin/reboot -f\n"
         .into()
 }
 
@@ -297,10 +306,13 @@ fn build_spec(sys: &SystemDef) -> String {
         ));
     }
     s.push_str("slink /init {in:busybox-x86-64}/bin/busybox 0777 0 0\n");
-    s.push_str("file /bin/autologin {root}/bin/autologin 0755 0 0\n");
-    // The ttyS0 session wrapper (getty -> login, then reboot on exit); see
-    // build_tty_session. inittab respawns it in place of a bare getty line.
-    s.push_str("file /bin/tty-session {root}/bin/tty-session 0755 0 0\n");
+    // The two generated login-glue scripts live under /etc, NOT /bin: /bin is a pure
+    // store-symlink farm (every entry points into /td/store), while these are td-generated
+    // system config — like the rest of /etc below — with no store package of their own.
+    // getty/init reference them by absolute path, so /etc is fine. autologin execs the
+    // login flow; tty-session (see build_tty_session) is what inittab respawns on ttyS0.
+    s.push_str("file /etc/autologin {root}/etc/autologin 0755 0 0\n");
+    s.push_str("file /etc/tty-session {root}/etc/tty-session 0755 0 0\n");
     // Generated /etc, packed from the files written into {root}/etc below.
     let etc: &[(&str, &str)] = &[
         ("passwd", "0644"),
@@ -332,10 +344,12 @@ fn shape_check() -> String {
      set -- $(od -An -tx1 -N 6 '{out}/rootfs.cpio'); \
      [ \"$1$2$3$4$5$6\" = 303730373031 ] || { echo 'rootfs.cpio: missing the newc cpio magic 070701' >&2; exit 1; }; \
      list=$('{in:busybox-x86-64}/bin/busybox' cpio -t < '{out}/rootfs.cpio' 2>/dev/null) || { echo 'rootfs.cpio: busybox cpio -t could not parse the archive (truncated/corrupt newc stream)' >&2; exit 1; }; \
-     for m in init bin/busybox bin/sh bin/login bin/getty bin/autologin bin/tty-session etc/inittab etc/passwd; do \
+     for m in init bin/busybox bin/sh bin/login bin/getty etc/autologin etc/tty-session etc/inittab etc/passwd; do \
          printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || { echo \"rootfs.cpio: cpio member '$m' missing - the bootable userland is incomplete\" >&2; exit 1; }; \
      done; \
      printf '%s\\n' \"$list\" | grep -qE '^td/store/[^/]+/bin/busybox$' || { echo 'rootfs.cpio: the busybox binary is not packed under td/store/<hash>-busybox-x86-64/bin - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
+     verbose=$('{in:busybox-x86-64}/bin/busybox' cpio -tv < '{out}/rootfs.cpio' 2>/dev/null) || { echo 'rootfs.cpio: busybox cpio -tv could not parse the archive' >&2; exit 1; }; \
+     printf '%s\\n' \"$verbose\" | grep -E ' bin/sh -> ' | grep -q '/td/store/' || { echo 'rootfs.cpio: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed (member type/target check)' >&2; exit 1; }; \
      applets=$('{in:busybox-x86-64}/bin/busybox' --list 2>/dev/null) || { echo 'rootfs.cpio: busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
      for a in @APPLETS@; do \
          printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"rootfs.cpio: busybox does not implement applet '$a' (config drift) - its packed /bin/$a symlink would be a dead link\" >&2; exit 1; }; \
@@ -350,14 +364,13 @@ fn shape_check() -> String {
 pub fn recipe() -> Recipe {
     let mut steps = Vec::new();
 
-    // 1) Materialise the generated /etc + the autologin helper under {root}.
+    // 1) Materialise the generated /etc (config + the two login-glue scripts) under
+    //    {root}. There is no {root}/bin: /bin in the image is a pure store-symlink farm
+    //    written by the spec, so nothing is staged there.
     steps.push(Step::MkDir {
         path: "{root}/etc".into(),
     });
-    steps.push(Step::MkDir {
-        path: "{root}/bin".into(),
-    });
-    let etc_files: [(&str, String, bool); 7] = [
+    let etc_files: [(&str, String, bool); 9] = [
         ("etc/passwd", build_passwd(&SYSTEM), false),
         ("etc/group", build_group(&SYSTEM), false),
         ("etc/shadow", build_shadow(&SYSTEM), false),
@@ -365,6 +378,10 @@ pub fn recipe() -> Recipe {
         ("etc/os-release", build_os_release(&SYSTEM), false),
         ("etc/inittab", build_inittab(), false),
         ("etc/profile", build_profile(&SYSTEM), false),
+        // Executable login glue (mode 0755): getty execs autologin; init respawns
+        // tty-session. They live in /etc so /bin stays a pure store-symlink farm.
+        ("etc/autologin", build_autologin(&SYSTEM), true),
+        ("etc/tty-session", build_tty_session(), true),
     ];
     for (rel, content, exec) in etc_files {
         steps.push(Step::WriteFile {
@@ -373,16 +390,6 @@ pub fn recipe() -> Recipe {
             exec,
         });
     }
-    steps.push(Step::WriteFile {
-        path: "{root}/bin/autologin".into(),
-        content: build_autologin(&SYSTEM),
-        exec: true,
-    });
-    steps.push(Step::WriteFile {
-        path: "{root}/bin/tty-session".into(),
-        content: build_tty_session(),
-        exec: true,
-    });
 
     // 2) Write the gen_init_cpio spec.
     steps.push(Step::WriteFile {
@@ -492,13 +499,18 @@ mod tests {
     fn exit_powers_off_the_vm() {
         let inittab = build_inittab();
         assert!(
-            inittab.contains("ttyS0::respawn:/bin/tty-session"),
-            "inittab must respawn /bin/tty-session on ttyS0 (the getty -> reboot wrapper)"
+            inittab.contains("ttyS0::respawn:/etc/tty-session"),
+            "inittab must respawn /etc/tty-session on ttyS0 (the getty -> reboot wrapper)"
         );
         let session = build_tty_session();
+        // getty must gate the reboot (`&&`), so a FAILED session respawns rather than
+        // firing reboot -f and masking a broken greeter as a clean exit-0 shutdown.
         assert!(
-            session.contains("/bin/getty ") && session.contains("/bin/reboot -f"),
-            "tty-session must run getty then `reboot -f` so the greeter's exit stops the VM"
+            session.contains("/bin/getty ")
+                && session.contains("-l /etc/autologin ")
+                && session.contains("&& exec /bin/reboot -f"),
+            "tty-session must run getty (autologin at /etc/autologin) then, only on success, \
+             `reboot -f` so the greeter's exit stops the VM but a failure retries"
         );
     }
 }
