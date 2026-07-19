@@ -1,7 +1,8 @@
 //! SHA-256 (FIPS 180-4) for the recipe evaluator, pure `std`.
 //!
-//! The runner's cache keys hash small inputs (pinsum manifests, recipe
-//! bodies); it previously piped them through an ambient host `sha256sum`,
+//! The runner's cache keys hash small inputs (setup-manifest seed-patch
+//! digests, recipe bodies); it previously piped them through an ambient host
+//! `sha256sum`,
 //! which was the last host-binary lookup on the check path (re #469 —
 //! executable provenance). Hashing in-process deletes that lookup.
 //!

@@ -457,6 +457,28 @@ mod tests {
             pins[0].sha256,
             "de08defa195af894cc295a43bfc65ba28903e492fd5f32f7a24bf75eafd9bf34"
         );
+
+        let uutils = catalog::lookup("uutils").unwrap();
+        assert_eq!(uutils.no_default_features, Some(true));
+        let features = uutils.features.as_deref().unwrap();
+        for expected in [
+            "feat_Tier1",
+            "feat_require_unix_core",
+            "feat_require_unix_hostid",
+            "feat_require_unix_utmpx",
+        ] {
+            assert!(features.iter().any(|feature| feature == expected));
+        }
+        assert!(!features.iter().any(|feature| feature == "unix"));
+        assert!(!features.iter().any(|feature| feature == "stdbuf"));
+        let pins = uutils.source_pins.unwrap();
+        assert_eq!(pins.len(), 1);
+        let pin = pins.first().unwrap();
+        assert_eq!(pin.key, "uutils-source");
+        assert_eq!(
+            pin.sha256,
+            "b92df9b821533650f3797aadae46e547f72db281c1f8a27f381f36d54284d34b"
+        );
     }
 
     #[test]
