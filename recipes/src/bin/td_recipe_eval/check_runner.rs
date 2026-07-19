@@ -492,30 +492,44 @@ impl RecipeCheckRunner {
         // removed, so dead runs' trees accumulated (95 GB observed). We hold the ladder
         // lock here, so this is race-free (re #469 build speed).
         self.reap_dead_scratch();
-        let pinsum = self.setup_pinsum()?;
+        let manifest = self.setup_manifest()?;
         let setup_ok = self.lw.join("setup-ok");
-        let warm = fs::read_to_string(&setup_ok)
-            .map(|s| s == pinsum)
+        // Cold-wipe only when a pin/patch this ladder ALREADY recorded changed
+        // or was removed — never for a pure ADDITION (a new leaf recipe's new
+        // source pin, which is in no already-built rung's closure and cannot
+        // invalidate any content-addressed seed or output). `setup_needs_wipe`
+        // is the decision; see it and `setup_manifest` for the reasoning and
+        // the honest-bump auto-recovery this preserves (re #543).
+        let stored = fs::read_to_string(&setup_ok).ok();
+        let warm = stored
+            .as_deref()
+            .map(|s| !setup_needs_wipe(s, &manifest))
             .unwrap_or(false)
             && self.lw.join("srcs.map").is_file();
-        if warm {
-            return Ok(());
-        }
 
-        remove_path_if_exists(&self.store)?;
-        remove_path_if_exists(&self.db)?;
-        // Cold-wipe the dedicated build-output cache with the seeds: a pin change
-        // invalidates prior outputs, so stale reuse never survives a pin bump.
-        remove_path_if_exists(&self.lw.join("build-cache"))?;
-        remove_path_if_exists(&self.lw.join("srcs.map"))?;
-        // tools.map: nothing writes it anymore (the host-tool resolution it
-        // carried is deleted, re #469) — scrub the stale pre-v8 artifact.
-        remove_path_if_exists(&self.lw.join("tools.map"))?;
-        remove_path_if_exists(&setup_ok)?;
-        fs::create_dir_all(&self.store)
-            .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
-        File::create(self.lw.join("srcs.map")).map_err(|e| format!("create srcs.map: {e}"))?;
-        fs::write(&setup_ok, pinsum).map_err(|e| format!("write {}: {e}", setup_ok.display()))?;
+        if !warm {
+            remove_path_if_exists(&self.store)?;
+            remove_path_if_exists(&self.db)?;
+            // Cold-wipe the dedicated build-output cache with the seeds: a
+            // recorded pin's change invalidates prior outputs, so stale reuse
+            // never survives a pin bump.
+            remove_path_if_exists(&self.lw.join("build-cache"))?;
+            remove_path_if_exists(&self.lw.join("srcs.map"))?;
+            // tools.map: nothing writes it anymore (the host-tool resolution it
+            // carried is deleted, re #469) — scrub the stale pre-v8 artifact.
+            remove_path_if_exists(&self.lw.join("tools.map"))?;
+            fs::create_dir_all(&self.store)
+                .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
+            File::create(self.lw.join("srcs.map"))
+                .map_err(|e| format!("create srcs.map: {e}"))?;
+        }
+        // Record the current manifest on BOTH paths. Rewriting it on the warm
+        // path folds any newly ADDED pins/patches into the recorded baseline,
+        // so a later REMOVAL of one is still detected as a change and wipes —
+        // closing the remove-then-re-add-with-new-content hole. Under the
+        // ladder lock, so no concurrent writer.
+        fs::write(&setup_ok, &manifest)
+            .map_err(|e| format!("write {}: {e}", setup_ok.display()))?;
         Ok(())
     }
 
@@ -549,27 +563,50 @@ impl RecipeCheckRunner {
         }
     }
 
-    // v8: the seed-tools lock (and with it every host-tool ladder input) is
-    // DELETED — the pinsum keys only what the chain may consume: the pinned
-    // sources and the in-repo seed patches. The bump itself wipes every ladder
-    // store built with host scaffolding, so nothing tainted is grandfathered.
-    fn setup_pinsum(&self) -> Result<String, String> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"ladder-setup-v8\n");
+    /// The ladder's seed identity, as an order-independent PER-ENTRY manifest:
+    /// one sorted line per pinned source (`pin\t<key>\t<url>\t<sha256>\t<file>`)
+    /// and one per in-repo seed patch (`patch\t<name>\t<sha256-of-bytes>`). It
+    /// keys only what the chain may consume — the pinned sources and the
+    /// seed patches; a host-tool ladder input has been an inadmissible class
+    /// since v8 (re #469).
+    ///
+    /// Unlike the old single sha over ALL pins, this is compared entry-by-entry
+    /// (`setup_needs_wipe`): the ladder cold-wipes only when an entry it already
+    /// recorded CHANGED or was REMOVED — an honest pin bump, which the wipe
+    /// exists to auto-recover before the loud `reconcile_seed_map_entry` guard
+    /// fires. Pure ADDITIONS (a new leaf recipe's new source pin, in no
+    /// already-built rung's closure) leave the warmed ladder untouched, so a
+    /// leaf source addition no longer rebuilds the whole bootstrap from stage0
+    /// (re #543). Sorting makes the decision independent of PINS array order.
+    ///
+    /// The `ladder-setup-v9` header is the format epoch: bump it to force a
+    /// one-time wipe when the ladder's build semantics change in a way no pin
+    /// edit captures. A pre-v9 `setup-ok` (the v8 single sha) has no matching
+    /// header, so `setup_needs_wipe` treats it as a mismatch and wipes once.
+    fn setup_manifest(&self) -> Result<String, String> {
+        let mut lines: Vec<String> = Vec::new();
         for pin in source_pins::all() {
-            bytes.extend_from_slice(pin.key.as_bytes());
-            bytes.push(b'\t');
-            bytes.extend_from_slice(pin.url.as_bytes());
-            bytes.push(b'\t');
-            bytes.extend_from_slice(pin.sha256.as_bytes());
-            bytes.push(b'\t');
-            bytes.extend_from_slice(pin.file.as_bytes());
-            bytes.push(b'\n');
+            lines.push(format!(
+                "pin\t{}\t{}\t{}\t{}",
+                pin.key, pin.url, pin.sha256, pin.file
+            ));
         }
         for file in files_with_suffix(&self.root.join("seed/patches"), ".patch")? {
+            let name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| format!("seed patch has no UTF-8 name: {}", file.display()))?;
+            let mut bytes = Vec::new();
             append_file_bytes(&file, &mut bytes)?;
+            lines.push(format!("patch\t{}\t{}", name, sha256sum(&bytes)));
         }
-        Ok(sha256sum(&bytes))
+        lines.sort();
+        let mut out = String::from("ladder-setup-v9\n");
+        for line in &lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     fn intern_source(&self, intern_name: &str, pin: &SourcePin) -> Result<String, String> {
@@ -1264,6 +1301,27 @@ fn reconcile_seed_map_entry(
     }
 }
 
+/// Decide whether the ladder must cold-wipe given the PRIOR recorded setup
+/// manifest (`stored`) and the CURRENT one (`current`, from `setup_manifest`).
+///
+/// Wipe iff any line `stored` recorded is no longer present VERBATIM in
+/// `current`: a changed pin (same key, new url/sha/file) or a removed pin/patch
+/// is a stored line absent from `current` and wipes; a pure ADDITION is a
+/// `current` line with no counterpart in `stored` and is ignored, so a new leaf
+/// recipe's new source pin keeps the warmed ladder (re #543).
+///
+/// The epoch header (`current`'s first line) must match `stored`'s first line;
+/// a missing, empty, corrupt, or pre-v9 record has no matching header and wipes
+/// once. This also guards the vacuous case where `stored` has no lines (an
+/// empty `setup-ok`), for which the "any missing" test would otherwise be false.
+fn setup_needs_wipe(stored: &str, current: &str) -> bool {
+    if stored.lines().next() != current.lines().next() {
+        return true;
+    }
+    let current_lines: HashSet<&str> = current.lines().collect();
+    stored.lines().any(|line| !current_lines.contains(line))
+}
+
 fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("TD_BUILDER_SELF").map(PathBuf::from) {
         if is_executable(&path) {
@@ -1668,6 +1726,63 @@ mod tests {
             reapable_dead_pid(&scratch_name("build", &["oyacc"])),
             Some(process::id())
         );
+    }
+
+    // The ladder cold-wipe (setup) must fire on a CHANGE or REMOVAL of an
+    // already-recorded pin/patch — the honest-bump auto-recovery the wipe
+    // exists for — but NEVER on a pure ADDITION, so a new leaf recipe's new
+    // source pin keeps the warmed ladder instead of rebuilding from stage0
+    // (re #543). `setup_needs_wipe` is that decision, tested directly.
+    #[test]
+    fn setup_needs_wipe_ignores_additions_but_catches_changes_and_removals() {
+        let v9 = "ladder-setup-v9\n";
+        let base = format!(
+            "{v9}pin\tbusybox-source\thttps://b/x.tar\tsha-b\tx.tar\n\
+             pin\tmake-source\thttps://m/m.tar\tsha-m\tm.tar\n\
+             patch\tfix.patch\tsha-p\n"
+        );
+
+        // Identical: warm.
+        assert!(!setup_needs_wipe(&base, &base));
+
+        // Pure ADDITION of an unrelated pin (a new leaf recipe's source): warm.
+        // Order is irrelevant — setup_manifest sorts — so drop the new line
+        // anywhere; the stored lines are all still present.
+        let added = format!("{base}pin\tuutils-source\thttps://u/u.tar\tsha-u\tu.tar\n");
+        assert!(!setup_needs_wipe(&base, &added));
+        // And the reverse (a rebuild that had the extra pin, now removed via a
+        // revert) is a REMOVAL of a recorded line ⇒ wipe.
+        assert!(setup_needs_wipe(&added, &base));
+
+        // A recorded pin whose sha256 CHANGED (an honest bump): wipe.
+        let bumped = base.replace("sha-m", "sha-m2");
+        assert!(setup_needs_wipe(&base, &bumped));
+
+        // A recorded pin REMOVED (still in every already-built rung or not): wipe.
+        let removed = format!(
+            "{v9}pin\tbusybox-source\thttps://b/x.tar\tsha-b\tx.tar\n\
+             patch\tfix.patch\tsha-p\n"
+        );
+        assert!(setup_needs_wipe(&base, &removed));
+
+        // A recorded seed patch whose CONTENT changed: wipe; a NEW patch: warm.
+        let patch_bumped = base.replace("sha-p", "sha-p2");
+        assert!(setup_needs_wipe(&base, &patch_bumped));
+        let patch_added = format!("{base}patch\tnew.patch\tsha-n\n");
+        assert!(!setup_needs_wipe(&base, &patch_added));
+    }
+
+    #[test]
+    fn setup_needs_wipe_forces_a_one_time_wipe_on_a_missing_or_pre_v9_record() {
+        let current = "ladder-setup-v9\npin\ta\tu\ts\tf\n";
+        // No prior record (empty string, as `fs::read_to_string` of an absent
+        // file never reaches here, but an empty/truncated file can): wipe.
+        assert!(setup_needs_wipe("", current));
+        // A pre-v9 `setup-ok` was a bare hex sha with no header line: wipe once.
+        let v8_sha = "3b1f...deadbeef";
+        assert!(setup_needs_wipe(v8_sha, current));
+        // A corrupt record whose header does not match the epoch: wipe.
+        assert!(setup_needs_wipe("ladder-setup-v8\npin\ta\tu\ts\tf\n", current));
     }
 
     #[test]
