@@ -73,7 +73,8 @@ const SYSTEM: SystemDef = SystemDef {
     // an em-dash) is silently corrupted in the written file. Use '-', not the glyph.
     motd: "\n  Welcome to td - a source-built, Rust-first Linux.\n  \
            Minimal busybox userland, booted from an initramfs under qemu.\n  \
-           Edit recipes/src/recipes/system-x86-64.rs (the SYSTEM const) to tailor it.\n\n",
+           Edit recipes/src/recipes/system-x86-64.rs (the SYSTEM const) to tailor it.\n  \
+           Type 'exit' (or Ctrl-D) to power off the VM; Ctrl-A X quits qemu.\n\n",
     autologin: "tester",
     users: &[
         User {
@@ -174,9 +175,26 @@ fn build_inittab() -> String {
      ::sysinit:/bin/mount -t tmpfs tmpfs /tmp\n\
      ::sysinit:/bin/mount -t tmpfs tmpfs /run\n\
      ::sysinit:/bin/hostname -F /etc/hostname\n\
-     ttyS0::respawn:/bin/getty -L -n -l /bin/autologin 115200 ttyS0 vt100\n\
+     ttyS0::respawn:/bin/tty-session\n\
      ::ctrlaltdel:/bin/reboot\n\
      ::shutdown:/bin/umount -a -r\n"
+        .into()
+}
+
+/// The ttyS0 session wrapper, run by init AS ROOT (inittab `respawn`). It runs the
+/// normal getty -> autologin -> `login -f <user>` flow, then, when that session
+/// ENDS — the greeter user types `exit` / Ctrl-D — resets the machine so the VM
+/// stops. The auto-login user is UNPRIVILEGED and cannot shut the system down
+/// itself; this wrapper runs as root (init's child), so it does it on the user's
+/// behalf, making `exit` a clean way out of the VM. `reboot -f` calls `reboot(2)`
+/// directly and, under qemu's `-no-reboot`, makes qemu exit 0 — the exact proven
+/// exit path the kernel-boot test uses (`linux-x86-64-test`). An initramfs RAM
+/// rootfs has no disk to flush, so a direct reset is clean here (the orderly
+/// `::shutdown:` umount is skipped, which does not matter for tmpfs/devtmpfs).
+fn build_tty_session() -> String {
+    "#!/bin/sh\n\
+     /bin/getty -L -n -l /bin/autologin 115200 ttyS0 vt100\n\
+     exec /bin/reboot -f\n"
         .into()
 }
 
@@ -253,6 +271,9 @@ fn build_spec(sys: &SystemDef) -> String {
     }
     s.push_str("slink /init /bin/busybox 0777 0 0\n");
     s.push_str("file /bin/autologin {root}/bin/autologin 0755 0 0\n");
+    // The ttyS0 session wrapper (getty -> login, then reboot on exit); see
+    // build_tty_session. inittab respawns it in place of a bare getty line.
+    s.push_str("file /bin/tty-session {root}/bin/tty-session 0755 0 0\n");
     // Generated /etc, packed from the files written into {root}/etc below.
     let etc: &[(&str, &str)] = &[
         ("passwd", "0644"),
@@ -284,7 +305,7 @@ fn shape_check() -> String {
      set -- $(od -An -tx1 -N 6 '{out}/rootfs.cpio'); \
      [ \"$1$2$3$4$5$6\" = 303730373031 ] || { echo 'rootfs.cpio: missing the newc cpio magic 070701' >&2; exit 1; }; \
      list=$('{in:busybox-x86-64}/bin/busybox' cpio -t < '{out}/rootfs.cpio' 2>/dev/null) || { echo 'rootfs.cpio: busybox cpio -t could not parse the archive (truncated/corrupt newc stream)' >&2; exit 1; }; \
-     for m in init bin/busybox bin/sh bin/login bin/getty bin/autologin etc/inittab etc/passwd; do \
+     for m in init bin/busybox bin/sh bin/login bin/getty bin/autologin bin/tty-session etc/inittab etc/passwd; do \
          printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || { echo \"rootfs.cpio: cpio member '$m' missing - the bootable userland is incomplete\" >&2; exit 1; }; \
      done; \
      applets=$('{in:busybox-x86-64}/bin/busybox' --list 2>/dev/null) || { echo 'rootfs.cpio: busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
@@ -327,6 +348,11 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/bin/autologin".into(),
         content: build_autologin(&SYSTEM),
+        exec: true,
+    });
+    steps.push(Step::WriteFile {
+        path: "{root}/bin/tty-session".into(),
+        content: build_tty_session(),
         exec: true,
     });
 
@@ -420,13 +446,32 @@ mod tests {
     }
 
     /// getty auto-logs-in via `-l /bin/autologin`, and login needs both applets; the
-    /// respawn line is inert without them. Belt-and-braces against an APPLETS edit that
-    /// drops one (the cpio shape check catches it at build time, this catches it at
-    /// `cargo test` time).
+    /// respawn line is inert without them. `reboot` is what `tty-session` execs when the
+    /// greeter session ends (the in-guest power-off path), so it is greeter-critical too.
+    /// Belt-and-braces against an APPLETS edit that drops one (the cpio shape check
+    /// catches it at build time, this catches it at `cargo test` time).
     #[test]
     fn greeter_applets_are_present() {
-        for a in ["sh", "getty", "login", "init", "mount", "umount"] {
+        for a in ["sh", "getty", "login", "init", "mount", "umount", "reboot"] {
             assert!(APPLETS.contains(&a), "greeter applet '{a}' missing from APPLETS");
         }
+    }
+
+    /// The inittab must respawn `tty-session` (not a bare getty), and `tty-session` must
+    /// exec `reboot -f` after the login flow — that is the "exit / Ctrl-D powers off the
+    /// VM" path. A refactor that reverts the inittab to a bare getty, or drops the reboot
+    /// from tty-session, would silently strip the in-guest shutdown; red it here.
+    #[test]
+    fn exit_powers_off_the_vm() {
+        let inittab = build_inittab();
+        assert!(
+            inittab.contains("ttyS0::respawn:/bin/tty-session"),
+            "inittab must respawn /bin/tty-session on ttyS0 (the getty -> reboot wrapper)"
+        );
+        let session = build_tty_session();
+        assert!(
+            session.contains("/bin/getty ") && session.contains("/bin/reboot -f"),
+            "tty-session must run getty then `reboot -f` so the greeter's exit stops the VM"
+        );
     }
 }
