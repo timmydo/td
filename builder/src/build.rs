@@ -1199,9 +1199,13 @@ fn collect_vendor_crates(
 /// Inputs (env, set by `system td-build`):
 ///   out          the output store path.
 ///   TD_SRC       the crate source (a store directory or a source tarball).
-///   TD_INPUTS    ':'-joined input store paths (rustc, cargo, gcc-toolchain,
-///                coreutils, bash) — their bin/ dirs build PATH, lib/ build
+///   TD_INPUTS    ':'-joined input store paths (rustc, cargo, gcc, binutils,
+///                libc, build userland) — their bin/ dirs build PATH, lib/ build
 ///                LIBRARY_PATH.
+///   TD_RUST_STORE_CC / TD_RUST_STORE_CXX optional exact compilers nested in a
+///                recipe output whose top-level `bin/` is not the installed
+///                compiler prefix (the native GCC ladder output).
+///   TD_RUST_STORE_INCLUDE optional ':'-joined native include directories.
 ///   TD_RUST_BINS space-separated binary names to install into $out/bin.
 ///   TD_VENDOR_CRATES optional ':'-joined `.crate` STORE paths (the dependency closure
 ///                pinned by Cargo.lock; nv from the store-path basename). The guix-realized
@@ -1250,10 +1254,33 @@ pub fn run_rust() -> Result<(), String> {
     find_in_path(&path, "rustc").ok_or("rustc not found in TD_INPUTS")?;
     let cp = find_in_path(&path, "cp").ok_or("cp not found in TD_INPUTS")?;
     let chmod = find_in_path(&path, "chmod").ok_or("chmod not found in TD_INPUTS")?;
-    let gcc = find_in_path(&path, "gcc").ok_or("gcc not found in TD_INPUTS (linker)")?;
+    let gcc = env::var("TD_RUST_STORE_CC")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| find_in_path(&path, "gcc"))
+        .ok_or("gcc not found in TD_INPUTS and TD_RUST_STORE_CC is unset (linker)")?;
+    if !Path::new(&gcc).is_file() {
+        return Err(format!("native Rust linker is not a file: {gcc}"));
+    }
     // Optional C/C++ compiler for crates with C build scripts (the `cc` crate honors
     // CC/CXX). Absent for pure-Rust builds — harmless, since no C is compiled then.
-    let gpp = find_in_path(&path, "g++");
+    let gpp = env::var("TD_RUST_STORE_CXX")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| find_in_path(&path, "g++"));
+    if let Some(cxx) = &gpp {
+        if !Path::new(cxx).is_file() {
+            return Err(format!("native Rust C++ compiler is not a file: {cxx}"));
+        }
+    }
+    if let Ok(extra) = env::var("TD_RUST_STORE_INCLUDE") {
+        for dir in extra.split(':').filter(|p| !p.is_empty()) {
+            if !Path::new(dir).is_dir() {
+                return Err(format!("native Rust include directory does not exist: {dir}"));
+            }
+            cinc.push(dir.to_string());
+        }
+    }
 
     // Materialize a WRITABLE source tree (cargo writes target/). A store directory
     // (self-host) is copied; a tarball is unpacked, then its single subdir copied.
@@ -1290,6 +1317,9 @@ pub fn run_rust() -> Result<(), String> {
     if let Ok(interp) = env::var("TD_RUST_STORE_INTERP") {
         if !interp.is_empty() {
             rustflags.push_str(&format!(" -Clink-arg=-Wl,--dynamic-linker,{interp}"));
+            // The source-built native GCC is static, and final Rust applications
+            // must not acquire an undeclared shared libgcc runtime edge.
+            rustflags.push_str(" -Clink-arg=-static-libgcc");
             for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
                 rustflags.push_str(&format!(" -Clink-arg=-Wl,-rpath,{rp}"));
             }

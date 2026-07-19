@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
 use crate::sha256::Sha256;
@@ -101,10 +102,178 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             smoke_out.trim()
         ));
     }
+    prove_td_shell_userland(
+        runner,
+        &build_out,
+        &stage0_tree,
+        &gcc_path,
+        &binutils_path,
+        &glibc_path,
+        &busybox_path,
+        rust_base,
+        gcc_base,
+        binutils_base,
+        glibc_base,
+        busybox_base,
+    )?;
     println!(
-        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo contain no stage0 artifacts and compile, link, and run against td GCC/glibc with /gnu/store absent"
+        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo contain no stage0 artifacts; td shell builds and runs ripgrep/fd against td GCC/glibc with /gnu/store absent"
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_td_shell_userland(
+    runner: &RecipeCheckRunner,
+    build_out: &Path,
+    stage0_tree: &Path,
+    gcc_path: &str,
+    binutils_path: &str,
+    glibc_path: &str,
+    busybox_path: &str,
+    rust_base: &str,
+    gcc_base: &str,
+    binutils_base: &str,
+    glibc_base: &str,
+    busybox_base: &str,
+) -> Result<(), String> {
+    let root = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let vendor_root = root.join(".td-build-cache/crate-vendor");
+    for package in ["ripgrep", "fd"] {
+        let package_root = vendor_root.join(package);
+        if !package_root.join("src").is_dir() || !package_root.join("vendor").is_dir() {
+            return Err(format!(
+                "td shell Rust closure for `{package}' is not warm under {}",
+                package_root.display()
+            ));
+        }
+    }
+
+    let product = runner.product_scratch("td-shell-userland");
+    fs::create_dir_all(product.join("tmp"))
+        .map_err(|e| format!("create {}: {e}", product.display()))?;
+    let native_lock = product.join("native.lock");
+    let lock = format!(
+        "rust-toolchain {TD_STORE_DIR}/{rust_base} td-recipe-output\n\
+         gcc-x86-64-self {TD_STORE_DIR}/{gcc_base} td-recipe-output\n\
+         binutils-x86-64-self {TD_STORE_DIR}/{binutils_base} td-recipe-output\n\
+         glibc-x86-64 {TD_STORE_DIR}/{glibc_base} td-recipe-output\n\
+         busybox-x86-64 {TD_STORE_DIR}/{busybox_base} td-recipe-output\n"
+    );
+    fs::write(&native_lock, lock)
+        .map_err(|e| format!("write {}: {e}", native_lock.display()))?;
+
+    let dbs = runner.recipe_output_dbs(build_out)?;
+    let dbs = dbs
+        .iter()
+        .map(|path| {
+            path.to_str()
+                .ok_or_else(|| format!("non-UTF-8 recipe-output database: {}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join(":");
+    let tdstore = runner.tdstore_path();
+    let store_ns_builder = runner.control_builder_path();
+    let evaluator = std::env::current_exe()
+        .map_err(|e| format!("locate td-recipe-eval: {e}"))?;
+    let stage0_base = path_basename(stage0_tree)?;
+    let interp = format!("{glibc_path}/lib/ld-linux-x86-64.so.2");
+    let script = format!(
+        "set -eu\n\
+         test ! -e /gnu/store\n\
+         export PATH='{TD_STORE_DIR}/{busybox_base}/bin'\n\
+         rg=''\n\
+         for p in {TD_STORE_DIR}/*-ripgrep-14.1.1/bin/rg; do\n\
+           if test -x \"$p\"; then rg=$p; fi\n\
+         done\n\
+         fd=''\n\
+         for p in {TD_STORE_DIR}/*-fd-10.2.0/bin/fd; do\n\
+           if test -x \"$p\"; then fd=$p; fi\n\
+         done\n\
+         test -n \"$rg\"\n\
+         test -n \"$fd\"\n\
+         mkdir -p /tmp/td-shell-userland/sub\n\
+         printf '%s\\n' TD-414-NEEDLE >/tmp/td-shell-userland/sub/known-needle.txt\n\
+         rg_out=$(\"$rg\" --fixed-strings TD-414-NEEDLE /tmp/td-shell-userland)\n\
+         case \"$rg_out\" in *TD-414-NEEDLE*) ;; *) exit 91 ;; esac\n\
+         fd_out=$(\"$fd\" '^known-needle[.]txt$' /tmp/td-shell-userland)\n\
+         case \"$fd_out\" in */known-needle.txt) ;; *) exit 92 ;; esac\n\
+         readelf='{binutils_path}/readelf'\n\
+         \"$readelf\" -l \"$rg\" | grep -F '{interp}' >/dev/null\n\
+         \"$readelf\" -l \"$fd\" | grep -F '{interp}' >/dev/null\n\
+         ! grep -a -F /gnu/store \"$rg\" >/dev/null\n\
+         ! grep -a -F /gnu/store \"$fd\" >/dev/null\n\
+         ! grep -a -F '{stage0_base}' \"$rg\" >/dev/null\n\
+         ! grep -a -F '{stage0_base}' \"$fd\" >/dev/null\n\
+         printf '%s\\n' TD-SHELL-USERLAND-OK\n"
+    );
+
+    let tdstore_s = path_str(&tdstore)?;
+    let product_s = path_str(&product)?;
+    let tmp = product.join("tmp");
+    let tmp_s = path_str(&tmp)?;
+    let vendor_s = path_str(&vendor_root)?;
+    let lock_s = path_str(&native_lock)?;
+    let persist_db = product.join("products.db");
+    let persist_db_s = path_str(&persist_db)?;
+    let store_ns_builder_s = path_str(store_ns_builder)?;
+    let evaluator_s = path_str(&evaluator)?;
+    let mut cmd: Command = runner.clean_builder_command();
+    cmd.env("HOME", product_s)
+        .env("TMPDIR", tmp_s)
+        .env("PATH", "")
+        .env("TD_RECIPE_EVAL", evaluator_s)
+        .env("TD_SHELL_CACHE", product.join("packages"))
+        .env("TD_SHELL_VENDOR_ROOT", vendor_s)
+        .env("TD_SHELL_NATIVE_STORE", tdstore_s)
+        .env("TD_SHELL_NATIVE_EXTRA_DBS", dbs)
+        .env("TD_SHELL_NATIVE_INTERP", &interp)
+        .env("TD_SHELL_NATIVE_RPATH", format!("{glibc_path}/lib"))
+        .env(
+            "TD_SHELL_NATIVE_BDIR",
+            format!("{binutils_path}:{glibc_path}/lib"),
+        )
+        .env("TD_SHELL_NATIVE_CC", format!("{gcc_path}/bin/gcc"))
+        .env("TD_SHELL_NATIVE_CXX", format!("{gcc_path}/bin/g++"))
+        .env("TD_SHELL_NATIVE_INCLUDE", format!("{glibc_path}/include"))
+        .env("TD_SHELL_NATIVE_LOCK", lock_s)
+        .env("TD_PERSIST_STORE", tdstore_s)
+        .env("TD_PERSIST_DB", persist_db_s)
+        .args(["shell", "ripgrep", "fd", "--", store_ns_builder_s])
+        .arg("store-ns")
+        .arg(tdstore_s)
+        .args(["--", busybox_path, "sh", "-c", &script]);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("spawn td shell ripgrep fd product proof: {e}"))?;
+    fs::write(product.join("stdout"), &output.stdout)
+        .map_err(|e| format!("write td shell stdout: {e}"))?;
+    fs::write(product.join("stderr"), &output.stderr)
+        .map_err(|e| format!("write td shell stderr: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        return Err(format!(
+            "td shell ripgrep/fd product proof failed ({}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            stdout.trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if !stdout.lines().any(|line| line == "TD-SHELL-USERLAND-OK") {
+        return Err(format!(
+            "td shell ripgrep/fd product proof emitted no success marker: {}",
+            stdout.trim()
+        ));
+    }
+    println!(
+        "   [product] td shell built ripgrep 14.1.1 and fd 10.2.0 with source-built stage2 and ran both under own-root /td/store"
+    );
+    Ok(())
+}
+
+fn path_str(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))
 }
 
 fn path_basename(path: &Path) -> Result<&str, String> {
