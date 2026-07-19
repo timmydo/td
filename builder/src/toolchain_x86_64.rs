@@ -84,7 +84,8 @@ pub struct BuildInputs {
     pub mpfr_tar: PathBuf,
     /// mpc-1.3.1.tar.gz.
     pub mpc_tar: PathBuf,
-    /// The x86_64 kernel UAPI headers tarball (.tar.gz).
+    /// The x86_64 kernel UAPI headers tarball. Unpacked by magic-byte sniffing
+    /// (host-free uncompressed tar today; a compressed one still works).
     pub kernel_headers_tar: PathBuf,
     /// Where to build (the caller's scratch). Outputs land under here.
     pub out: PathBuf,
@@ -443,8 +444,12 @@ fn build_binutils_x86_64(inp: &BuildInputs) -> Result<PathBuf, String> {
     let csh = shell();
 
     // x86_64 kernel UAPI headers beside the glibc headers (glibc headers #include <linux/…>).
+    // Sniff the compression by magic bytes (crate::tar::unpack_archive) rather than forcing
+    // `tar -xzf`: the linux-headers seed is a host-free UNCOMPRESSED tar now (re #469), so a
+    // hard-coded gzip reader would fail on it. This is the SAME in-process extractor the recipe
+    // consumers use on this exact seed (`unpack_keep_top` -> `unpack_archive` with keep_top).
     let khd = mktemp_dir("td-xn-kh")?;
-    untar(&xz, &inp.kernel_headers_tar, &khd, 0, TarComp::Gz)?;
+    crate::tar::unpack_archive(&inp.kernel_headers_tar, &khd, true)?;
     let cip = format!("{}:{}", inp.glibc.join("include").display(), khd.display());
 
     // -shared-aware static wrapper (handles binutils' ld libdep.la shared module).
@@ -547,7 +552,9 @@ fn build_gcc_x86_64(inp: &BuildInputs, fresh_binutils: &Path) -> Result<PathBuf,
     fs::create_dir_all(sysroot.join("lib")).map_err(ioerr("mkdir sysroot/lib"))?;
     copy_tree_contents(&inp.glibc.join("include"), &sysroot.join("include"))
         .map_err(ioerr("stage glibc headers into the sysroot"))?;
-    untar(&xz, &inp.kernel_headers_tar, &sysroot.join("include"), 0, TarComp::Gz)?;
+    // Magic-byte-sniffed extraction (see the khd site above): the linux-headers seed is a
+    // host-free uncompressed tar, so it is unpacked by compression, not a forced `tar -xzf`.
+    crate::tar::unpack_archive(&inp.kernel_headers_tar, &sysroot.join("include"), true)?;
     copy_tree_contents(&inp.glibc.join("lib"), &sysroot.join("lib"))
         .map_err(ioerr("stage glibc libs into the sysroot"))?;
     // Relocate glibc's GNU ld scripts (libc.so, libm.so AND libm.a — the cross build

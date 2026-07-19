@@ -546,7 +546,7 @@ impl RecipeCheckRunner {
         let file = self
             .root
             .join(".td-build-cache/sources")
-            .join(format!("linux-headers-{version}-{arch}.tar.gz"));
+            .join(format!("linux-headers-{version}-{arch}.tar"));
         if !file.is_file() {
             return Err(format!(
                 "ladder: kernel-headers tarball not warm ({})",
