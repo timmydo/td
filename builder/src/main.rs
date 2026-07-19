@@ -24,6 +24,7 @@ mod check_loop;
 mod daily;
 mod drv;
 mod elf;
+mod erofs;
 // The comment-splice static guard (#300) is exercised only by its own `#[test]`
 // (the cargo-test tier) — gate it to test builds so it adds no dead-code surface
 // to the release binary or the clippy pass.
@@ -5868,6 +5869,30 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: oci-image: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // mkfs-erofs: pack a staged directory tree into a deterministic, uncompressed,
+        // read-only **erofs** image (see erofs.rs). Control-plane capability for the
+        // read-only-root arc (#548): the read-only `/td/store` real root the two-stage
+        // boot mounts and switch_roots into. Never a recipe tool.
+        // Usage: mkfs-erofs ROOTFS-DIR OUT.img
+        Some("mkfs-erofs") if args.len() == 4 => {
+            let (rootfs, out_file) = (&args[2], &args[3]);
+            let run = || -> Result<(), String> {
+                let img = erofs::build_image(Path::new(rootfs))
+                    .map_err(|e| format!("build erofs image from {rootfs}: {e}"))?;
+                std::fs::write(out_file, &img).map_err(|e| format!("write {out_file}: {e}"))?;
+                Ok(())
+            };
+            match run() {
+                Ok(()) => {
+                    println!("{out_file}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: mkfs-erofs: {e}");
                     ExitCode::FAILURE
                 }
             }
