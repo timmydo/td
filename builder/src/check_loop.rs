@@ -287,6 +287,15 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
     // already-provisioned userland. Best-effort (the recipe check enforces
     // presence).
     warm_td_crate_closure(root);
+    // …and produce the GENERATED kernel-headers seeds BEFORE the build-run that
+    // interns them. The heavy prelude's `warm sources` (heavy_warms) runs AFTER
+    // this provisioning, so it cannot supply them in time; and unlike the
+    // sha256-pinned fetches these seeds are host-produced, so a runner warmed
+    // before the seed's on-disk shape last changed carries none of the fresh
+    // `.tar`. Without this the loop reds at `build-run busybox-x86-64` with
+    // "kernel-headers tarball not warm" — issue #546, exposed when the seed went
+    // uncompressed (`.tar.gz` -> `.tar`, PR #536). Best-effort, idempotent.
+    warm_kernel_headers_seed(root);
     let mut cmd = Command::new(&eval);
     cmd.arg("build-run").arg("busybox-x86-64");
     for stem in LOOP_USERLAND_STEMS {
@@ -1433,6 +1442,57 @@ fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
 fn warm_td_crate_closure(root: &Path) {
     // td-fetch's own crate closure (its own warm — not the cargo-proxy).
     warm_crate_closure(root, "fetch/Cargo.lock", "td-fetch");
+}
+
+/// Produce the host-GENERATED Linux UAPI header seeds
+/// (`.td-build-cache/sources/linux-headers-<ver>-{i386,x86_64}.tar`) that the
+/// toolchain rungs intern as `linux-headers` / `linux-headers-x86-64`. This runs
+/// inside `provision_userland`, BEFORE the `build-run` whose planning interns
+/// them — the heavy prelude's `warm sources` (heavy_warms) only runs later, so it
+/// cannot supply a missing seed in time (issue #546). Unlike the sha256-pinned
+/// fetches, these seeds are produced on the host from the pinned linux source
+/// (`td-feed warm kernel-headers ARCH`), so a runner whose `.td-build-cache` was
+/// warmed before the seed's on-disk shape last changed (e.g. the `.tar.gz` ->
+/// `.tar` switch in PR #536) carries the stale name and none of the fresh `.tar`.
+/// Best-effort and idempotent (`warm kernel-headers` skips an already-produced
+/// `.tar`); the intern itself is the fail-closed enforcement if this could not run.
+fn warm_kernel_headers_seed(root: &Path) {
+    // Resolve ONE host td-feed binary: the gate's td-built one, else a host
+    // cargo build of feed/ — the same resolution heavy_warms uses.
+    let Some(tdfeed) = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed")
+        .or_else(|| host_cargo_bin(root, "feed", "td-feed", None))
+    else {
+        eprintln!(
+            "td-builder check: no td-feed binary to warm the kernel-headers seed (build feed/ \
+             with cargo) — skipping (best-effort; the loop intern enforces presence)"
+        );
+        return;
+    };
+    let tdfeed = tdfeed.display().to_string();
+    // `td-feed warm kernel-headers` reads the linux-source pin through
+    // tests/recipe-eval-tool.sh, which resolves its rust/cc via
+    // `$TD_BUILDER_SELF provision-{rust,cc}` — so this check's own executable must
+    // be on offer, exactly as the gate bodies export it. A missing current_exe
+    // leaves it empty (the warm then no-ops, best-effort).
+    let self_exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let envs = vec![
+        (s("TD_ROOT"), root.display().to_string()),
+        (s("TD_BUILDER_SELF"), self_exe),
+    ];
+    for arch in ["i386", "x86_64"] {
+        if !warm_status(
+            &[tdfeed.clone(), s("warm"), s("kernel-headers"), s(arch)],
+            root,
+            &envs,
+        ) {
+            eprintln!(
+                "td-builder check: kernel-headers seed warm (best-effort) failed/timed out \
+                 for {arch} — the loop intern will report if the seed is still absent"
+            );
+        }
+    }
 }
 
 fn heavy_warms(root: &Path) {
