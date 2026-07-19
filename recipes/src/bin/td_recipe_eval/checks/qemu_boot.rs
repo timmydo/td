@@ -41,9 +41,10 @@ use std::time::{Duration, Instant};
 use crate::check_runner::{is_executable, RecipeCheckRunner};
 
 /// The busybox /init prints this exact line on ttyS0 once the kernel has reached
-/// userspace and executed the static busybox userland. It must match the /init
-/// script's `echo` in recipes/src/recipes/linux-x86-64.rs.
-const MARKER: &str = "TD-USERLAND-OK";
+/// userspace and executed the static busybox userland. Sourced from the SHARED
+/// `ladder::USERLAND_MARKER` const so the /init script (linux-x86-64.rs), the cpio
+/// shape check (ladder.rs), and this boot oracle can never disagree on the string.
+const MARKER: &str = td_recipe::ladder::USERLAND_MARKER;
 
 /// Default wall-clock ceiling. A tiny allnoconfig kernel boots to userspace under
 /// TCG in a few seconds, but TCG on a loaded builder can be slow; 180s is
@@ -93,6 +94,11 @@ struct BootResult {
 }
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
+    // Locate host qemu FIRST, before the (potentially multi-minute) kernel build:
+    // if qemu is absent the tool can only fail, so fail fast rather than after a
+    // full source build. qemu is a control-plane test tool, never a target input.
+    let qemu = find_qemu()?;
+
     // Build the kernel producer (its own stem, as RustToolchain builds
     // rust-toolchain) to get the bzImage + initramfs.cpio, then boot them.
     runner.prepare_recipe_target("linux-x86-64")?;
@@ -109,7 +115,6 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         }
     }
 
-    let qemu = find_qemu()?;
     println!(
         "   [qemu-boot] {qemu} boots the td-source-built bzImage under TCG with the busybox initramfs\n              kernel:    {}\n              initramfs: {}",
         bzimage.display(),
@@ -221,7 +226,11 @@ fn boot(
     // console=ttyS0: kernel printk + the /init echo land on the 8250 UART.
     // panic=-1: on a kernel panic, reboot immediately (=> qemu exits) rather than
     //   wedge, so a failed boot reds promptly instead of riding out the ceiling.
-    let serial = format!("file:{}", console_path.display());
+    // qemu splits -serial file:PATH on commas (they separate sub-options), so any
+    // literal comma in the path must be doubled to be taken literally. The scratch
+    // path is ours (no commas today), but escape defensively so a future base dir
+    // with a comma can't silently corrupt the console route.
+    let serial = format!("file:{}", console_path.to_string_lossy().replace(',', ",,"));
     let append = "console=ttyS0 panic=-1 rdinit=/init";
     let mut child = Command::new(qemu)
         .args(["-M", "pc", "-accel", "tcg", "-m", "256", "-no-reboot"])
@@ -266,16 +275,19 @@ fn boot(
                 return Err(format!("wait on qemu: {e}"));
             }
         }
-        // Abort a guest that floods ttyS0 without panicking: the in-memory capture
-        // is trimmed to CAP, but `-serial file:` keeps appending to the file on
-        // disk, so bound the on-disk file too rather than let it fill the scratch fs.
-        if let Ok(meta) = fs::metadata(&console_path) {
-            if meta.len() > MAX_CONSOLE_BYTES {
-                let _ = child.kill();
-                let _ = child.wait();
-                end = EndReason::Flooded(meta.len());
-                break;
-            }
+        // Abort a guest that floods without panicking: the in-memory capture is
+        // trimmed to CAP, but BOTH on-disk sinks keep growing — `-serial file:`
+        // appends ttyS0 to console.log, and qemu's own stdout/stderr append to
+        // diag.log. Bound their COMBINED size so neither path can fill the scratch
+        // fs (a chatty-but-not-panicking guest floods ttyS0; a misconfigured qemu
+        // floods stderr).
+        let on_disk = fs::metadata(&console_path).map(|m| m.len()).unwrap_or(0)
+            + fs::metadata(&diag_path).map(|m| m.len()).unwrap_or(0);
+        if on_disk > MAX_CONSOLE_BYTES {
+            let _ = child.kill();
+            let _ = child.wait();
+            end = EndReason::Flooded(on_disk);
+            break;
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
@@ -345,12 +357,17 @@ fn drain_console(path: &Path, file: &mut Option<File>, buf: &mut Vec<u8>) -> boo
                     if let Some(slice) = chunk.get(..n) {
                         buf.extend_from_slice(slice);
                         drained += n;
-                        if contains(buf, MARKER.as_bytes()) {
-                            found = true;
-                        }
                         if buf.len() > CAP {
                             let drop = buf.len() - CAP;
                             buf.drain(..drop);
+                        }
+                        if contains(buf, MARKER.as_bytes()) {
+                            // Latch and stop: the caller kills qemu the moment this
+                            // returns true, so draining further bytes only wastes work
+                            // (and on a flooding-then-marker boot, could spin to
+                            // DRAIN_BUDGET before the outer loop reacts).
+                            found = true;
+                            break;
                         }
                     }
                 }

@@ -280,12 +280,18 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// The pid of a reapable scratch tree, or None. A tree is reapable only if it is one of
-/// OUR trees — `scratch_name` emits `build-…-<pid>` / `check-…-<pid>` — AND ends in a
-/// numeric pid. The prefix guard means a coincidental sibling such as `gcc-14` or
-/// `glibc-241` can never be reaped (belt-and-braces: this dir holds only our scratch
-/// trees anyway). Split out so the reaper's eligibility rule is unit-testable.
+/// OUR trees — `scratch_name` emits `build-…-<pid>` / `check-…-<pid>` / `qemu-boot-…-<pid>`
+/// — AND ends in a numeric pid. The prefix guard means a coincidental sibling such as
+/// `gcc-14` or `glibc-241` can never be reaped (belt-and-braces: this dir holds only our
+/// scratch trees anyway). The `qemu-boot-` prefix is essential: the host-side qemu-boot
+/// tool creates per-boot scratch trees here too, and without it a crashed/killed boot's
+/// tree (which can hold a multi-GiB kernel build) would leak forever. Split out so the
+/// reaper's eligibility rule is unit-testable.
 fn reapable_dead_pid(name: &str) -> Option<u32> {
-    if !name.starts_with("build-") && !name.starts_with("check-") {
+    if !name.starts_with("build-")
+        && !name.starts_with("check-")
+        && !name.starts_with("qemu-boot-")
+    {
         return None;
     }
     trailing_pid(name)
@@ -1580,6 +1586,9 @@ mod tests {
         // Our own trees are reapable...
         assert_eq!(reapable_dead_pid("build-oyacc-4059"), Some(4059));
         assert_eq!(reapable_dead_pid("check-make-test-daily-1-12345"), Some(12345));
+        // ...including the host-side qemu-boot tool's per-boot scratch (a killed boot's
+        // multi-GiB kernel-build tree would otherwise leak forever).
+        assert_eq!(reapable_dead_pid("qemu-boot-linux-x86-64-22760"), Some(22760));
         // ...but a coincidental numeric-suffixed sibling is NEVER reaped.
         assert_eq!(reapable_dead_pid("gcc-14"), None);
         assert_eq!(reapable_dead_pid("glibc-241"), None);

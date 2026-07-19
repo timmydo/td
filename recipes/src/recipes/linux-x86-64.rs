@@ -1,5 +1,6 @@
 use crate::ladder::{
-    mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH,
+    initramfs_cpio_shape_check, mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into,
+    unpack_keep_top, SH, USERLAND_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -425,7 +426,7 @@ pub fn recipe() -> Recipe {
     // wall-clock ceiling then bounds the run).
     steps.push(Step::WriteFile {
         path: "{root}/initramfs/init".into(),
-        content: "#!/bin/sh\necho TD-USERLAND-OK\nexec /bin/busybox reboot -f\n".into(),
+        content: format!("#!/bin/sh\necho {USERLAND_MARKER}\nexec /bin/busybox reboot -f\n"),
         exec: true,
     });
     // gen_init_cpio spec: /dev/console for init's stdio, the static busybox, a
@@ -526,31 +527,18 @@ pub fn recipe() -> Recipe {
         .env("PATH", &mesboot0_path()),
     );
     // [initramfs] the packed userland must be a real, COMPLETE newc cpio carrying
-    // the whole bootable userland — not merely a well-formed header. Checked, in
-    // order: the ASCII "070701" magic at offset 0; a size floor (the static busybox
-    // alone is ~1 MiB, so 64 KiB cleanly rejects a header-only or empty archive);
-    // the `TRAILER` sentinel of the final newc member (proves the stream was closed,
-    // so a truncated pack reds here); a `busybox` path entry (the userland binary);
-    // and the `TD-USERLAND-OK` marker string — literally the bytes of the packed
-    // /init, so this proves the boot script that qemu asserts on was actually
-    // included, not just the binary. The sibling qemu boot tool is the behavioural
-    // proof (it boots this cpio); this is the fast producer-rung shape check.
+    // the whole bootable userland — not merely a well-formed header. The shared
+    // `initramfs_cpio_shape_check` helper (recipes/src/ladder.rs) parses the archive
+    // with busybox `cpio -t` — a real newc walk that reds on a truncated/corrupt
+    // stream and yields the exact member names — then asserts init/bin/busybox/
+    // bin/sh/dev/console are all present and the `TD-USERLAND-OK` /init marker is
+    // packed. The producer rung and the fast `linux-x86-64-test` tier run the SAME
+    // check so they cannot drift. The sibling qemu boot tool is the behavioural proof
+    // (it boots this cpio); this is the fast producer-rung shape check.
+    let initramfs_check =
+        initramfs_cpio_shape_check("{out}/initramfs.cpio", "{in:busybox-x86-64}/bin/busybox");
     steps.push(
-        Step::run(
-            "{out}",
-            &[
-                SH,
-                "-c",
-                "sz=$(wc -c < '{out}/initramfs.cpio'); \
-                 [ \"$sz\" -ge 65536 ] || { echo \"initramfs.cpio: implausibly small ($sz bytes) — the static busybox alone is ~1 MiB\" >&2; exit 1; }; \
-                 set -- $(od -An -tx1 -N 6 '{out}/initramfs.cpio'); \
-                 [ \"$1$2$3$4$5$6\" = 303730373031 ] || { echo 'initramfs.cpio: missing the newc cpio magic 070701' >&2; exit 1; }; \
-                 grep -q -a TRAILER '{out}/initramfs.cpio' || { echo 'initramfs.cpio: no TRAILER member — the cpio stream is truncated/incomplete' >&2; exit 1; }; \
-                 grep -q -a busybox '{out}/initramfs.cpio' || { echo 'initramfs.cpio: no busybox entry — the userland is missing' >&2; exit 1; }; \
-                 grep -q -a TD-USERLAND-OK '{out}/initramfs.cpio' || { echo 'initramfs.cpio: /init marker not packed — the boot script the qemu tool asserts on is missing' >&2; exit 1; }",
-            ],
-        )
-        .env("PATH", &mesboot0_path()),
+        Step::run("{out}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()),
     );
 
     Recipe::mesboot("linux-x86-64", "7.1.4")

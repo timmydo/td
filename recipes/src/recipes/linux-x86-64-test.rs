@@ -1,4 +1,4 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, SH};
+use crate::ladder::{initramfs_cpio_shape_check, mesboot0_inputs, mesboot0_path, SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // linux-x86-64-test: behavioral validation of the source-built kernel (#529).
@@ -22,14 +22,14 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      ships no dd) prove the boot-setup header; and the gzip magic `1f 8b 08`
 //      appears somewhere in the file, proving the CONFIG_KERNEL_GZIP payload was
 //      actually compressed and embedded — not just the raw ELF wrapped in a stub.
-//   5. initramfs.cpio is a real, COMPLETE newc cpio (ASCII "070701" magic at
-//      offset 0) big enough to carry the static busybox (>= 64 KiB), with a closing
-//      `TRAILER` member (proves the stream is not truncated), a `busybox` path
-//      entry (the userland binary), and the `TD-USERLAND-OK` marker bytes of the
-//      packed /init (proves the boot script is included, not just the binary) — the
-//      shape check for the bootable userland. The behavioural proof that it actually
-//      boots is the host-side `td-recipe-eval qemu-boot linux-x86-64` tool (host
-//      qemu), which cannot run in this host-free BuildOnly rung.
+//   5. initramfs.cpio is a real, COMPLETE newc cpio carrying the whole bootable
+//      userland — via the shared `initramfs_cpio_shape_check` helper (ladder.rs)
+//      that the producer rung runs too, so the two cannot drift. It parses the
+//      archive with busybox `cpio -t` (a real newc walk that reds on a truncated/
+//      corrupt stream) and asserts init/bin/busybox/bin/sh/dev/console are all
+//      present plus the `TD-USERLAND-OK` /init marker. The behavioural proof that it
+//      actually boots is the host-side `td-recipe-eval qemu-boot linux-x86-64` tool
+//      (host qemu), which cannot run in this host-free BuildOnly rung.
 pub fn recipe() -> Recipe {
     let vmlinux = "{in:linux-x86-64}/vmlinux";
     let bzimage = "{in:linux-x86-64}/bzImage";
@@ -98,24 +98,10 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &mesboot0_path()),
     );
+    let initramfs_check =
+        initramfs_cpio_shape_check(initramfs, "{in:busybox-x86-64}/bin/busybox");
     steps.push(
-        Step::run(
-            "{root}",
-            &[
-                SH,
-                "-c",
-                &format!(
-                    "sz=$(wc -c < '{initramfs}'); \
-                     [ \"$sz\" -ge 65536 ] || {{ echo \"initramfs.cpio is implausibly small ($sz bytes) — the static busybox alone is ~1 MiB\" >&2; exit 1; }}; \
-                     set -- $(od -An -tx1 -N 6 '{initramfs}'); \
-                     [ \"$1$2$3$4$5$6\" = 303730373031 ] || {{ echo 'initramfs.cpio is missing the newc cpio magic 070701' >&2; exit 1; }}; \
-                     grep -q -a TRAILER '{initramfs}' || {{ echo 'initramfs.cpio has no TRAILER member — the cpio stream is truncated/incomplete' >&2; exit 1; }}; \
-                     grep -q -a busybox '{initramfs}' || {{ echo 'initramfs.cpio has no busybox entry — the bootable userland is missing' >&2; exit 1; }}; \
-                     grep -q -a TD-USERLAND-OK '{initramfs}' || {{ echo 'initramfs.cpio does not pack the /init marker — the boot script is missing' >&2; exit 1; }}"
-                ),
-            ],
-        )
-        .env("PATH", &mesboot0_path()),
+        Step::run("{root}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()),
     );
 
     steps.push(Step::MkDir {
@@ -132,7 +118,7 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("linux-x86-64-test", "1.0")
-        .native_inputs(&["linux-x86-64", "binutils-x86-64-native"])
+        .native_inputs(&["linux-x86-64", "binutils-x86-64-native", "busybox-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
         .checks(vec![RecipeCheck::daily(
